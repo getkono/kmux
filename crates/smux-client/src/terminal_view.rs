@@ -31,6 +31,8 @@ impl TerminalBuffer {
         let raw = String::from_utf8_lossy(data);
         // Simple ANSI escape sequence stripper: remove ESC[ ... m / ESC sequences
         let stripped = strip_ansi(&raw);
+        // Normalize PTY line endings: \r\n -> \n, then drop any remaining \r
+        let stripped = stripped.replace("\r\n", "\n").replace('\r', "");
         self.text.push_str(&stripped);
         // Keep buffer bounded to avoid unbounded memory growth
         const MAX_LINES: usize = 100_000;
@@ -115,5 +117,20 @@ mod tests {
     #[test]
     fn plain_text_unchanged() {
         assert_eq!(strip_ansi("hello world"), "hello world");
+    }
+
+    #[test]
+    fn push_bytes_normalizes_crlf() {
+        let mut buf = TerminalBuffer::new();
+        buf.push_bytes(b"line1\r\nline2\r\n");
+        assert_eq!(buf.text, "line1\nline2\n");
+    }
+
+    #[test]
+    fn push_bytes_strips_bare_cr() {
+        let mut buf = TerminalBuffer::new();
+        // Simulates a progress-bar style overwrite (\r moves cursor to line start)
+        buf.push_bytes(b"loading\rprompt$ ");
+        assert_eq!(buf.text, "loadingprompt$ ");
     }
 }

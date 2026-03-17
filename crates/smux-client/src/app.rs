@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use iced::futures::SinkExt as _;
 use iced::widget::{button, column, container, row, text, text_input};
-use iced::{Element, Length, Subscription, Task, Theme};
+use iced::{Element, Event, Length, Subscription, Task, Theme};
 use smux_protocol::messages::{ClientMessage, ServerMessage, SessionInfo, TermSize};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -216,12 +216,11 @@ impl SmuxApp {
             return Subscription::none();
         };
 
-        // Keyboard subscription for input forwarding (only in terminal screen)
+        // Keyboard subscription for input forwarding (only in terminal screen).
+        // Uses listen_with (not on_key_press) to intercept ALL keyboard events
+        // regardless of which widget currently holds focus.
         let kbd_sub = match self.screen {
-            Screen::Terminal => iced::keyboard::on_key_press(|key, modifiers| {
-                let bytes = key_to_bytes(key, modifiers)?;
-                Some(Message::KeyInput(bytes))
-            }),
+            Screen::Terminal => iced::event::listen_with(keyboard_filter),
             Screen::Connect => Subscription::none(),
         };
 
@@ -396,6 +395,22 @@ impl SmuxApp {
             .width(Length::Fill)
             .height(Length::Fill)
             .into()
+    }
+}
+
+/// Subscription filter for `listen_with`: receives ALL events (any status) and
+/// converts keyboard presses to PTY bytes, ignoring everything else.
+fn keyboard_filter(
+    event: Event,
+    _status: iced::event::Status,
+    _window: iced::window::Id,
+) -> Option<Message> {
+    match event {
+        Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
+            let bytes = key_to_bytes(key, modifiers)?;
+            Some(Message::KeyInput(bytes))
+        }
+        _ => None,
     }
 }
 
