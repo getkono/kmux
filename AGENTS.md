@@ -16,8 +16,11 @@ smux/
  .github/
     workflows/
         ci.yml
+ src/
+    main.rs
  .gitignore
  AGENTS.md
+ Cargo.toml
  CLAUDE.md -> AGENTS.md
  lefthook.yml
 ```
