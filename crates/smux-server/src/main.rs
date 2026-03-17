@@ -2,6 +2,7 @@ mod app;
 mod auth;
 mod connection;
 mod relay;
+mod scrollback;
 mod tls;
 
 use std::sync::Arc;
