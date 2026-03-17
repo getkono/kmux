@@ -2,7 +2,7 @@ use std::ffi::CString;
 use std::os::unix::io::{IntoRawFd, RawFd};
 
 use nix::pty::{ForkptyResult, forkpty};
-use nix::unistd::{Pid, execvpe};
+use nix::unistd::{Pid, execve};
 use tokio::sync::watch;
 
 use crate::config::{PtyConfig, WindowSize};
@@ -67,7 +67,7 @@ impl PtyProcess {
             ForkptyResult::Child => {
                 // In child: exec the target program.
                 // If exec fails, exit immediately to avoid double-cleanup.
-                let _ = execvpe(&program, &argv, &envp);
+                let _ = execve(&program, &argv, &envp);
                 // exec failed -- exit child with error code
                 unsafe { nix::libc::_exit(127) };
             }
