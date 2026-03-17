@@ -6,6 +6,7 @@ use crate::error::{Result, SmuxError};
 
 /// Rich exit status for a PTY child process.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ExitStatus {
     /// Process exited normally with the given exit code.
     Code(i32),

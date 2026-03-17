@@ -73,6 +73,7 @@ impl EnvBuilder {
 
 /// PTY window size.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct WindowSize {
     pub rows: u16,
     pub cols: u16,
