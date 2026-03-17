@@ -18,8 +18,8 @@ iced = { version = "0.13", features = ["tokio"] }
 alacritty_terminal = "0.25"
 tokio = { version = "1", features = ["full"] }
 tokio-tungstenite = "0.26"
-tokio-rustls = "0.26"
-rustls = { version = "0.23", features = ["ring"] }
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "logging", "tls12"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 webpki-roots = "0.26"
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
