@@ -1,0 +1,15 @@
+pre-commit:
+  commands:
+    format-fix:
+      run: cargo fmt
+    lint-fix:
+      run: cargo clippy --fix --allow-dirty --allow-staged
+
+pre-push:
+  commands:
+    format-check:
+      run: cargo fmt --check
+    lint-check:
+      run: cargo clippy -- -D warnings
+    test:
+      run: cargo test
