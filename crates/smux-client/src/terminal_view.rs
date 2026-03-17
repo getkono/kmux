@@ -33,7 +33,7 @@ impl TerminalBuffer {
         let stripped = strip_ansi(&raw);
         self.text.push_str(&stripped);
         // Keep buffer bounded to avoid unbounded memory growth
-        const MAX_LINES: usize = 10_000;
+        const MAX_LINES: usize = 100_000;
         let line_count = self.text.lines().count();
         if line_count > MAX_LINES {
             let skip = line_count - MAX_LINES;
@@ -58,7 +58,6 @@ pub fn view<'a>(buffer: &'a TerminalBuffer, _session: &'a str) -> Element<'a, Me
     scrollable(container(content).width(Length::Fill).padding(4))
         .width(Length::Fill)
         .height(Length::Fill)
-        .anchor_bottom()
         .into()
 }
 

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use smux::config::{PtyConfig, WindowSize};
 use smux::error::{Result, SmuxError};
@@ -11,6 +11,10 @@ use tokio::sync::{RwLock, broadcast};
 use tracing::warn;
 
 use crate::relay::session_read_loop;
+use crate::scrollback::ScrollbackBuffer;
+
+/// 10 MB scrollback buffer per session.
+const SCROLLBACK_CAPACITY: usize = 10 * 1024 * 1024;
 
 /// Per-session relay state.
 struct SessionRelay {
@@ -24,6 +28,8 @@ struct SessionRelay {
     program: String,
     /// Current terminal size.
     size: TermSize,
+    /// Ring buffer of recent PTY output, replayed to newly attaching clients.
+    scrollback: Arc<Mutex<ScrollbackBuffer>>,
 }
 
 /// Shared server state -- wrapped in `Arc` and cloned into each connection task.
@@ -66,9 +72,10 @@ impl ServerApp {
         let session = self.manager.get_session(name).await?;
         let (reader, writer) = session.split();
 
+        let scrollback = Arc::new(Mutex::new(ScrollbackBuffer::new(SCROLLBACK_CAPACITY)));
         let (output_tx, _) = broadcast::channel(256);
         let tx = output_tx.clone();
-        let task = tokio::spawn(session_read_loop(reader, tx));
+        let task = tokio::spawn(session_read_loop(reader, tx, scrollback.clone()));
 
         self.relays.write().await.insert(
             name.to_string(),
@@ -78,6 +85,7 @@ impl ServerApp {
                 _task: task,
                 program: prog,
                 size,
+                scrollback,
             },
         );
 
@@ -104,14 +112,25 @@ impl ServerApp {
             .collect()
     }
 
-    /// Subscribe to PTY output for a session.
+    /// Subscribe to PTY output for a session and return a snapshot of buffered
+    /// history for replay.
     ///
-    /// Returns a `broadcast::Receiver` that yields chunks of raw PTY output.
-    pub async fn attach(&self, name: &str) -> Result<broadcast::Receiver<Vec<u8>>> {
+    /// The snapshot is taken while holding the `relays` read-lock, then the
+    /// live receiver is subscribed. Because the relay loop writes to scrollback
+    /// *before* broadcasting, any chunk that arrives after the snapshot will be
+    /// delivered via the receiver -- guaranteeing no gap between history and
+    /// live output.
+    ///
+    /// Returns `(snapshot_bytes, live_receiver)`.
+    pub async fn attach(&self, name: &str) -> Result<(Vec<u8>, broadcast::Receiver<Vec<u8>>)> {
         let relays = self.relays.read().await;
         relays
             .get(name)
-            .map(|r| r.output_tx.subscribe())
+            .map(|r| {
+                let snapshot = r.scrollback.lock().unwrap().snapshot();
+                let rx = r.output_tx.subscribe();
+                (snapshot, rx)
+            })
             .ok_or_else(|| SmuxError::SessionNotFound {
                 name: name.to_string(),
             })

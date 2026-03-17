@@ -128,7 +128,19 @@ impl ClientState {
                     old.abort();
                 }
                 match self.app.attach(&session).await {
-                    Ok(mut rx) => {
+                    Ok((snapshot, mut rx)) => {
+                        // Replay scrollback history in 64 KB chunks before
+                        // starting the live forwarder. The mpsc channel is
+                        // FIFO, so these are guaranteed to arrive at the
+                        // client before any live output.
+                        const REPLAY_CHUNK: usize = 64 * 1024;
+                        for chunk in snapshot.chunks(REPLAY_CHUNK) {
+                            let _ = self.writer_tx.send(ServerMessage::PtyOutput {
+                                session: session.clone(),
+                                data: chunk.to_vec(),
+                            });
+                        }
+
                         let tx = self.writer_tx.clone();
                         let sess = session.clone();
                         let handle = tokio::spawn(async move {
