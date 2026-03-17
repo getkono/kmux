@@ -20,7 +20,9 @@ struct Inner {
 /// A detachable PTY session.
 ///
 /// Wraps `PtyProcess` behind `Arc<Mutex<...>>` so that reader and writer
-/// halves can be split off and used independently.
+/// halves can be split off and used independently. Cloning a `PtySession`
+/// produces a handle that shares the same underlying PTY process.
+#[derive(Clone)]
 pub struct PtySession {
     inner: Arc<Mutex<Inner>>,
     shutdown_grace: Option<Duration>,
@@ -68,6 +70,44 @@ impl PtySession {
     /// Check if the child process has exited.
     pub async fn is_exited(&self) -> bool {
         self.inner.lock().await.pty.is_exited()
+    }
+
+    /// Read bytes from the PTY output (child stdout).
+    ///
+    /// Holds the inner lock for the duration of the read. For concurrent
+    /// read + write access, prefer splitting via [`PtySession::split`].
+    pub async fn read_bytes(&self, buf: &mut [u8]) -> Result<usize> {
+        use tokio::io::AsyncReadExt;
+        self.inner
+            .lock()
+            .await
+            .pty
+            .io
+            .read(buf)
+            .await
+            .map_err(SmuxError::Io)
+    }
+
+    /// Write bytes to the PTY input (child stdin).
+    ///
+    /// Holds the inner lock for the duration of the write. For concurrent
+    /// read + write access, prefer splitting via [`PtySession::split`].
+    pub async fn write_bytes(&self, data: &[u8]) -> Result<()> {
+        use tokio::io::AsyncWriteExt;
+        self.inner
+            .lock()
+            .await
+            .pty
+            .io
+            .write_all(data)
+            .await
+            .map_err(SmuxError::Io)
+    }
+
+    /// Send a Unix signal to the child process.
+    pub async fn send_signal(&self, signal: nix::sys::signal::Signal) -> Result<()> {
+        let pid = self.inner.lock().await.pty.pid;
+        crate::shutdown::send_signal(pid, signal)
     }
 }
 

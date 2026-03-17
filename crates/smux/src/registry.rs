@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use tokio::sync::Mutex;
 
-use crate::config::PtyConfig;
+use crate::config::{PtyConfig, WindowSize};
 use crate::error::{Result, SmuxError};
 use crate::events::{EventBus, SessionEvent};
 use crate::process::ExitStatus;
@@ -86,6 +86,38 @@ impl SessionManager {
     /// Return true if there are no active sessions.
     pub async fn is_empty(&self) -> bool {
         self.sessions.lock().await.is_empty()
+    }
+
+    /// Get a clone of a named session handle for direct I/O.
+    ///
+    /// The returned `PtySession` shares the same underlying PTY process via
+    /// `Arc`. The session remains alive as long as at least one handle exists.
+    pub async fn get_session(&self, name: &str) -> Result<PtySession> {
+        self.sessions
+            .lock()
+            .await
+            .get(name)
+            .cloned()
+            .ok_or_else(|| SmuxError::SessionNotFound {
+                name: name.to_string(),
+            })
+    }
+
+    /// Resize the PTY window for a named session.
+    pub async fn resize(&self, name: &str, size: WindowSize) -> Result<()> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions
+            .get(name)
+            .ok_or_else(|| SmuxError::SessionNotFound {
+                name: name.to_string(),
+            })?;
+        session.resize(size).await?;
+        self.events.emit(SessionEvent::Resized {
+            name: name.to_string(),
+            rows: size.rows,
+            cols: size.cols,
+        });
+        Ok(())
     }
 }
 

@@ -4,6 +4,7 @@ use crate::process::ExitStatus;
 
 /// Events that can occur during the lifecycle of a PTY session.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum SessionEvent {
     /// The session was successfully created and the process spawned.
     Spawned { name: String },
@@ -19,6 +20,7 @@ pub enum SessionEvent {
 
 /// The kind of timeout that fired.
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum TimeoutKind {
     WallClock,
     Idle,

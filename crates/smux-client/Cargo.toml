@@ -1,0 +1,27 @@
+[package]
+name = "smux-client"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "smux-client"
+path = "src/main.rs"
+
+[dependencies]
+smux-protocol = { path = "../smux-protocol" }
+iced = { version = "0.13", features = ["tokio"] }
+# iced_term = "0.6"
+# NOTE: iced_term 0.6 only manages local PTY processes and does not expose
+# its backend::Command type publicly, making it impossible to feed remote PTY
+# bytes into its VT parser from outside the crate. Full VT rendering will be
+# added in a follow-up using alacritty_terminal + a custom iced canvas widget.
+alacritty_terminal = "0.25"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = "0.26"
+tokio-rustls = "0.26"
+rustls = { version = "0.23", features = ["ring"] }
+webpki-roots = "0.26"
+clap = { version = "4", features = ["derive"] }
+tracing = "0.1"
+tracing-subscriber = "0.3"
+futures-util = "0.3"
