@@ -447,8 +447,14 @@ fn keyboard_filter(
                 "keyboard_filter: received keyboard event"
             );
             match kbd_event {
-                iced::keyboard::Event::KeyPressed { key, modifiers, .. } => {
-                    let bytes = key_to_bytes(key.clone(), *modifiers);
+                iced::keyboard::Event::KeyPressed {
+                    key,
+                    modifiers,
+                    text,
+                    ..
+                } => {
+                    let text_owned = text.as_ref().map(|t| t.to_string());
+                    let bytes = key_to_bytes(key.clone(), *modifiers, text_owned);
                     match &bytes {
                         Some(b) => debug!(?key, ?b, "keyboard_filter: mapped to bytes"),
                         None => debug!(?key, "keyboard_filter: key_to_bytes returned None"),
@@ -464,7 +470,14 @@ fn keyboard_filter(
 
 /// Convert an iced keyboard key press into PTY input bytes.
 /// Returns `None` for modifier-only presses or unhandled keys.
-fn key_to_bytes(key: iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) -> Option<Vec<u8>> {
+///
+/// `text` is the composed text from the event (Shift/layout already applied).
+/// It is used for character input so that Shift+A -> "A", Shift+1 -> "!", etc.
+fn key_to_bytes(
+    key: iced::keyboard::Key,
+    modifiers: iced::keyboard::Modifiers,
+    text: Option<String>,
+) -> Option<Vec<u8>> {
     use iced::keyboard::Key;
     use iced::keyboard::key::Named;
 
@@ -472,7 +485,7 @@ fn key_to_bytes(key: iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) 
         Key::Character(c) => {
             let s = c.as_str();
             if modifiers.control() {
-                // Ctrl+A..Z -> bytes 1..26
+                // Ctrl+A..Z -> bytes 1..26 (use unmodified key for the letter)
                 if let Some(ch) = s.chars().next() {
                     let lower = ch.to_ascii_lowercase();
                     if lower.is_ascii_alphabetic() {
@@ -480,7 +493,13 @@ fn key_to_bytes(key: iced::keyboard::Key, modifiers: iced::keyboard::Modifiers) 
                     }
                 }
             }
-            Some(s.as_bytes().to_vec())
+            // Use composed text (Shift/layout applied) when available;
+            // fall back to the unmodified key character.
+            if let Some(t) = text {
+                Some(t.as_bytes().to_vec())
+            } else {
+                Some(s.as_bytes().to_vec())
+            }
         }
         Key::Named(named) => {
             let bytes: &[u8] = match named {
