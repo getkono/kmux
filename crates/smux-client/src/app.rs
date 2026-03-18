@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use iced::futures::SinkExt as _;
-use iced::widget::{button, column, container, row, text, text_input};
+use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Event, Length, Subscription, Task, Theme};
 use smux_protocol::messages::{ClientMessage, ServerMessage, SessionInfo, TermSize};
 use tokio::sync::mpsc;
@@ -157,15 +157,17 @@ impl SmuxApp {
                 Task::none()
             }
 
-            Message::ServerMsg(msg) => {
-                self.handle_server_message(msg);
-                Task::none()
-            }
+            Message::ServerMsg(msg) => self.handle_server_message(msg),
 
             // ── Session management ───────────────────────────────────
             Message::SelectSession(name) => {
                 if let Some(prev) = self.active_session.take() {
                     self.send_ws(ClientMessage::Detach { session: prev });
+                }
+                // Clear the buffer before re-attaching so the server's scrollback
+                // replay starts from a clean slate and doesn't double the output.
+                if let Some(buf) = self.buffers.get_mut(&name) {
+                    buf.clear();
                 }
                 self.active_session = Some(name.clone());
                 self.send_ws(ClientMessage::Attach { session: name });
@@ -173,8 +175,14 @@ impl SmuxApp {
             }
 
             Message::CreateSessionPressed => {
+                if self.ws_sender.is_none() {
+                    warn!("CreateSessionPressed: no active connection, ignoring");
+                    self.status_msg = "Not connected — cannot create session".to_string();
+                    return Task::none();
+                }
                 let rid = self.next_rid();
                 let name = format!("session-{rid}");
+                self.status_msg = "Creating session…".to_string();
                 self.send_ws(ClientMessage::SessionCreate {
                     request_id: rid,
                     name,
@@ -208,6 +216,8 @@ impl SmuxApp {
                     });
                 } else {
                     debug!("KeyInput: dropped (no active session)");
+                    self.status_msg =
+                        "No active session — press [+] to create one".to_string();
                 }
                 Task::none()
             }
@@ -280,7 +290,7 @@ impl SmuxApp {
 
     // ── Private helpers ───────────────────────────────────────────────────────
 
-    fn handle_server_message(&mut self, msg: ServerMessage) {
+    fn handle_server_message(&mut self, msg: ServerMessage) -> Task<Message> {
         match msg {
             ServerMessage::AuthResult { success, reason } => {
                 if !success {
@@ -290,6 +300,7 @@ impl SmuxApp {
                     self.ws_sender = None;
                     self.screen = Screen::Connect;
                 }
+                Task::none()
             }
 
             ServerMessage::SessionListResult { sessions, .. } => {
@@ -305,6 +316,7 @@ impl SmuxApp {
                         session: first.name.clone(),
                     });
                 }
+                Task::none()
             }
 
             ServerMessage::SessionCreated { name, .. } => {
@@ -320,7 +332,9 @@ impl SmuxApp {
                     self.send_ws(ClientMessage::Detach { session: prev });
                 }
                 self.active_session = Some(name.clone());
+                self.status_msg = format!("Session '{name}' created");
                 self.send_ws(ClientMessage::Attach { session: name });
+                Task::none()
             }
 
             ServerMessage::SessionClosed { name, .. } => {
@@ -332,24 +346,33 @@ impl SmuxApp {
                         self.send_ws(ClientMessage::Attach { session: sess });
                     }
                 }
+                Task::none()
             }
 
             ServerMessage::PtyOutput { session, data } => {
                 if let Some(buf) = self.buffers.get_mut(&session) {
                     buf.push_bytes(&data);
+                    // Auto-scroll to the bottom whenever new output arrives.
+                    return scrollable::snap_to(
+                        terminal_view::terminal_scroll_id(),
+                        scrollable::RelativeOffset { x: 0.0, y: 1.0 },
+                    );
                 }
+                Task::none()
             }
 
             ServerMessage::Event { event } => {
                 info!("Server event: {:?}", event);
+                Task::none()
             }
 
             ServerMessage::Error { message, .. } => {
                 warn!("Server error: {message}");
                 self.status_msg = format!("Error: {message}");
+                Task::none()
             }
 
-            _ => {}
+            _ => Task::none(),
         }
     }
 
