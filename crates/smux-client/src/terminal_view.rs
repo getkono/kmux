@@ -25,6 +25,11 @@ impl TerminalBuffer {
         }
     }
 
+    /// Clear all accumulated output (called before re-attaching so scrollback replay starts fresh).
+    pub fn clear(&mut self) {
+        self.text.clear();
+    }
+
     /// Feed raw PTY output bytes into the buffer.
     /// Strips ANSI/VT escape sequences for display.
     pub fn push_bytes(&mut self, data: &[u8]) {
@@ -51,6 +56,11 @@ impl Default for TerminalBuffer {
     }
 }
 
+/// Stable scrollable ID so `app.rs` can programmatically scroll to the bottom.
+pub fn terminal_scroll_id() -> iced::widget::scrollable::Id {
+    iced::widget::scrollable::Id::new("terminal-output")
+}
+
 /// Render the terminal buffer as a scrollable text widget.
 pub fn view<'a>(buffer: &'a TerminalBuffer, _session: &'a str) -> Element<'a, Message> {
     use iced::widget::{container, scrollable, text};
@@ -58,8 +68,12 @@ pub fn view<'a>(buffer: &'a TerminalBuffer, _session: &'a str) -> Element<'a, Me
     let content = text(&buffer.text).font(iced::Font::MONOSPACE).size(13);
 
     scrollable(container(content).width(Length::Fill).padding(4))
+        .id(terminal_scroll_id())
         .width(Length::Fill)
         .height(Length::Fill)
+        .direction(scrollable::Direction::Vertical(
+            scrollable::Scrollbar::default(),
+        ))
         .into()
 }
 
