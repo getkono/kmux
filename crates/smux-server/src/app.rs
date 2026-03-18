@@ -70,7 +70,7 @@ impl ServerApp {
         // Split the session: the reader goes to the relay task, the writer
         // is stored in the relay struct for `write_input` calls.
         let session = self.manager.get_session(name).await?;
-        let (reader, writer) = session.split();
+        let (reader, writer) = session.split().await?;
 
         let scrollback = Arc::new(Mutex::new(ScrollbackBuffer::new(SCROLLBACK_CAPACITY)));
         let (output_tx, _) = broadcast::channel(256);

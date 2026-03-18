@@ -17,7 +17,7 @@ use crate::scrollback::ScrollbackBuffer;
 /// Every chunk is also appended to `scrollback` so that reconnecting clients
 /// can receive a replay of recent output.
 pub async fn session_read_loop(
-    reader: PtyReader,
+    mut reader: PtyReader,
     tx: broadcast::Sender<Vec<u8>>,
     scrollback: Arc<Mutex<ScrollbackBuffer>>,
 ) {

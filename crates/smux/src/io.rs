@@ -54,6 +54,20 @@ impl PtyMasterIo {
     pub fn as_raw_fd(&self) -> RawFd {
         self.inner.as_raw_fd()
     }
+
+    /// Duplicate the PTY master fd for independent concurrent I/O.
+    ///
+    /// The kernel handles concurrent reads and writes on PTY master fds safely,
+    /// so giving reader and writer their own `AsyncFd` registrations eliminates
+    /// shared-Mutex contention across async await points.
+    pub fn try_clone(&self) -> io::Result<Self> {
+        let fd = self.as_raw_fd();
+        let new_fd = unsafe { nix::libc::dup(fd) };
+        if new_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Self::new(new_fd)
+    }
 }
 
 impl AsyncRead for PtyMasterIo {
