@@ -5,7 +5,7 @@ use iced::widget::{button, column, container, row, text, text_input};
 use iced::{Element, Event, Length, Subscription, Task, Theme};
 use smux_protocol::messages::{ClientMessage, ServerMessage, SessionInfo, TermSize};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use crate::terminal_view::TerminalBuffer;
 use crate::{connect, session_bar, terminal_view, theme};
@@ -90,7 +90,12 @@ impl SmuxApp {
 
     fn send_ws(&self, msg: ClientMessage) {
         if let Some(tx) = &self.ws_sender {
-            let _ = tx.send(msg);
+            match tx.send(msg) {
+                Ok(()) => debug!("send_ws: message sent"),
+                Err(e) => warn!("send_ws: channel send failed: {e}"),
+            }
+        } else {
+            debug!("send_ws: no ws_sender available, message dropped");
         }
     }
 
@@ -192,10 +197,17 @@ impl SmuxApp {
             // ── Keyboard input ───────────────────────────────────────
             Message::KeyInput(bytes) => {
                 if let Some(session) = &self.active_session {
+                    debug!(
+                        session,
+                        byte_count = bytes.len(),
+                        "KeyInput: forwarding to PTY"
+                    );
                     self.send_ws(ClientMessage::PtyInput {
                         session: session.clone(),
                         data: bytes,
                     });
+                } else {
+                    debug!("KeyInput: dropped (no active session)");
                 }
                 Task::none()
             }
@@ -402,13 +414,27 @@ impl SmuxApp {
 /// converts keyboard presses to PTY bytes, ignoring everything else.
 fn keyboard_filter(
     event: Event,
-    _status: iced::event::Status,
+    status: iced::event::Status,
     _window: iced::window::Id,
 ) -> Option<Message> {
     match event {
-        Event::Keyboard(iced::keyboard::Event::KeyPressed { key, modifiers, .. }) => {
-            let bytes = key_to_bytes(key, modifiers)?;
-            Some(Message::KeyInput(bytes))
+        Event::Keyboard(ref kbd_event) => {
+            debug!(
+                ?kbd_event,
+                ?status,
+                "keyboard_filter: received keyboard event"
+            );
+            match kbd_event {
+                iced::keyboard::Event::KeyPressed { key, modifiers, .. } => {
+                    let bytes = key_to_bytes(key.clone(), *modifiers);
+                    match &bytes {
+                        Some(b) => debug!(?key, ?b, "keyboard_filter: mapped to bytes"),
+                        None => debug!(?key, "keyboard_filter: key_to_bytes returned None"),
+                    }
+                    bytes.map(Message::KeyInput)
+                }
+                _ => None,
+            }
         }
         _ => None,
     }
