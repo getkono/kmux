@@ -61,7 +61,10 @@ impl ServerApp {
         args: Vec<String>,
         size: TermSize,
     ) -> Result<()> {
-        let prog = program.clone().unwrap_or_else(|| "/bin/bash".to_string());
+        let prog = match program {
+            Some(p) => p,
+            None => smux::shell::detect_shell()?,
+        };
 
         let config = PtyConfig::new(&prog).args(args).size(size.rows, size.cols);
 
