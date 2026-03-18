@@ -216,8 +216,7 @@ impl SmuxApp {
                     });
                 } else {
                     debug!("KeyInput: dropped (no active session)");
-                    self.status_msg =
-                        "No active session — press [+] to create one".to_string();
+                    self.status_msg = "No active session — press [+] to create one".to_string();
                 }
                 Task::none()
             }

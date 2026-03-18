@@ -39,16 +39,22 @@ impl PtySession {
     }
 
     /// Split into independent reader and writer halves.
-    pub fn split(self) -> (PtyReader, PtyWriter) {
-        let reader = PtyReader {
-            inner: Arc::clone(&self.inner),
-        };
-        let writer = PtyWriter {
-            inner: Arc::clone(&self.inner),
-        };
-        // Keep self alive via the cloned Arcs; original self is dropped here
-        // but the Arc refcount keeps Inner alive.
-        (reader, writer)
+    ///
+    /// Each half owns a dup'd copy of the PTY master fd, giving them independent
+    /// `AsyncFd` registrations. This eliminates shared-Mutex contention: the
+    /// reader can block on `poll_read` without preventing the writer from
+    /// completing `write_all`, and vice versa.
+    pub async fn split(self) -> Result<(PtyReader, PtyWriter)> {
+        let inner = self.inner.lock().await;
+        let reader_io = inner.pty.io.try_clone().map_err(SmuxError::Io)?;
+        let writer_io = inner.pty.io.try_clone().map_err(SmuxError::Io)?;
+        drop(inner);
+        Ok((
+            PtyReader { io: reader_io },
+            PtyWriter {
+                io: tokio::sync::Mutex::new(writer_io),
+            },
+        ))
     }
 
     /// Resize the PTY window.
@@ -112,24 +118,28 @@ impl PtySession {
 }
 
 /// Read half of a split `PtySession`.
+///
+/// Owns a dup'd PTY master fd; no shared Mutex with `PtyWriter`.
 pub struct PtyReader {
-    inner: Arc<Mutex<Inner>>,
+    io: crate::io::PtyMasterIo,
 }
 
 /// Write half of a split `PtySession`.
+///
+/// Owns a dup'd PTY master fd; the inner `Mutex` here is solely for interior
+/// mutability (AsyncWrite requires `&mut self`) and is never contested since
+/// only one task calls `write_all` at a time.
 pub struct PtyWriter {
-    inner: Arc<Mutex<Inner>>,
+    io: tokio::sync::Mutex<crate::io::PtyMasterIo>,
 }
 
 impl PtyWriter {
     /// Write bytes to the PTY (sends to child's stdin).
     pub async fn write_all(&self, data: &[u8]) -> Result<()> {
         use tokio::io::AsyncWriteExt;
-        self.inner
+        self.io
             .lock()
             .await
-            .pty
-            .io
             .write_all(data)
             .await
             .map_err(SmuxError::Io)
@@ -138,16 +148,9 @@ impl PtyWriter {
 
 impl PtyReader {
     /// Read available bytes from the PTY output.
-    pub async fn read(&self, buf: &mut [u8]) -> Result<usize> {
+    pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         use tokio::io::AsyncReadExt;
-        self.inner
-            .lock()
-            .await
-            .pty
-            .io
-            .read(buf)
-            .await
-            .map_err(SmuxError::Io)
+        self.io.read(buf).await.map_err(SmuxError::Io)
     }
 }
 
@@ -205,5 +208,66 @@ impl AsyncWrite for PtySession {
             }
         };
         Pin::new(&mut guard.pty.io).poll_shutdown(cx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::PtyConfig;
+
+    fn bash_config() -> PtyConfig {
+        PtyConfig::new("/bin/bash").args(["-c", "read line; echo \"got: $line\""])
+    }
+
+    /// Verify that reader and writer halves obtained from `split()` can operate
+    /// concurrently without deadlocking — the core regression test for the
+    /// shared-Mutex deadlock that was fixed by giving each half its own fd.
+    ///
+    /// Before the fix, `writer.write_all()` would block waiting on the inner
+    /// Mutex held by `reader.read()`, and `reader.read()` would never complete
+    /// because the shell never received the input. With independent dup'd fds
+    /// there is no shared Mutex, so both complete immediately.
+    #[tokio::test]
+    async fn split_reader_writer_concurrent() {
+        let session = PtySession::spawn(&bash_config()).expect("spawn failed");
+        let (mut reader, writer) = session.split().await.expect("split failed");
+
+        // Spawn writer task: send a line of input to the shell.
+        let write_task = tokio::spawn(async move {
+            writer.write_all(b"hello\n").await.expect("write failed");
+        });
+
+        // Read until we see the PTY echo of our input, or time out.
+        // The PTY echoes "hello\r\n" back to the reader — this is proof that
+        // the write reached the kernel and the read received output concurrently.
+        let read_task = tokio::spawn(async move {
+            let mut output = Vec::new();
+            let mut buf = [0u8; 256];
+            loop {
+                match tokio::time::timeout(std::time::Duration::from_secs(5), reader.read(&mut buf))
+                    .await
+                {
+                    Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
+                    Ok(Ok(n)) => {
+                        output.extend_from_slice(&buf[..n]);
+                        // PTY echoes our input back — that's enough to verify
+                        // concurrent operation worked end-to-end.
+                        if String::from_utf8_lossy(&output).contains("hello") {
+                            break;
+                        }
+                    }
+                }
+            }
+            output
+        });
+
+        write_task.await.expect("writer task panicked");
+        let output = read_task.await.expect("reader task panicked");
+        let text = String::from_utf8_lossy(&output);
+        assert!(
+            text.contains("hello"),
+            "expected PTY echo of input in output, got: {text:?}"
+        );
     }
 }
