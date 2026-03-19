@@ -9,7 +9,7 @@ path = "src/main.rs"
 
 [dependencies]
 smux-protocol = { path = "../smux-protocol" }
-iced = { version = "0.13", features = ["tokio"] }
+iced = { version = "0.13", features = ["tokio", "canvas"] }
 # iced_term = "0.6"
 # NOTE: iced_term 0.6 only manages local PTY processes and does not expose
 # its backend::Command type publicly, making it impossible to feed remote PTY

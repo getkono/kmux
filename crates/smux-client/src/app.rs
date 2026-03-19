@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 
 use iced::futures::SinkExt as _;
-use iced::widget::{button, column, container, row, scrollable, text, text_input};
+use iced::widget::{button, column, container, row, text, text_input};
 use iced::{Element, Event, Length, Subscription, Task, Theme};
 use smux_protocol::messages::{ClientMessage, ServerMessage, SessionInfo, SessionStatus, TermSize};
 use tokio::sync::mpsc;
@@ -47,8 +47,16 @@ pub enum Message {
     #[allow(dead_code)] // wired up via view buttons -- will be called once UI is built out
     CloseSession(String),
 
-    // Keyboard input forwarding to server
-    KeyInput(Vec<u8>),
+    // Raw keyboard event from subscription -- converted to bytes in update()
+    // so we have access to the active buffer's app-cursor mode.
+    RawKeyEvent {
+        key: iced::keyboard::Key,
+        modifiers: iced::keyboard::Modifiers,
+        text: Option<String>,
+    },
+
+    // Terminal canvas resize detected
+    TerminalResized { rows: u16, cols: u16 },
 }
 
 /// Top-level application state.
@@ -206,20 +214,51 @@ impl SmuxApp {
             }
 
             //  Keyboard input 
-            Message::KeyInput(bytes) => {
-                if let Some(session) = &self.active_session {
-                    debug!(
-                        session,
-                        byte_count = bytes.len(),
-                        "KeyInput: forwarding to PTY"
-                    );
-                    self.send_ws(ClientMessage::PtyInput {
-                        session: session.clone(),
-                        data: bytes,
+
+            // Raw keyboard event: look up app-cursor mode from the active buffer
+            // before converting to PTY bytes so vim arrow keys work correctly.
+            Message::RawKeyEvent { key, modifiers, text } => {
+                let app_cursor = self
+                    .active_session
+                    .as_ref()
+                    .and_then(|s| self.buffers.get(s))
+                    .map(|b| b.app_cursor())
+                    .unwrap_or(false);
+                let bytes = key_to_bytes(key, modifiers, text, app_cursor);
+                match &bytes {
+                    Some(b) => debug!(byte_count = b.len(), "RawKeyEvent: mapped to bytes"),
+                    None => debug!("RawKeyEvent: key_to_bytes returned None"),
+                }
+                if let Some(bytes) = bytes {
+                    if let Some(session) = &self.active_session {
+                        debug!(
+                            session,
+                            byte_count = bytes.len(),
+                            "RawKeyEvent: forwarding to PTY"
+                        );
+                        self.send_ws(ClientMessage::PtyInput {
+                            session: session.clone(),
+                            data: bytes,
+                        });
+                    } else {
+                        debug!("RawKeyEvent: dropped (no active session)");
+                        self.status_msg =
+                            "No active session -- press [+] to create one".to_string();
+                    }
+                }
+                Task::none()
+            }
+
+            //  Terminal resize 
+            Message::TerminalResized { rows, cols } => {
+                if let Some(name) = &self.active_session {
+                    if let Some(buf) = self.buffers.get_mut(name) {
+                        buf.resize(rows, cols);
+                    }
+                    self.send_ws(ClientMessage::Resize {
+                        session: name.clone(),
+                        size: TermSize { rows, cols },
                     });
-                } else {
-                    debug!("KeyInput: dropped (no active session)");
-                    self.status_msg = "No active session -- press [+] to create one".to_string();
                 }
                 Task::none()
             }
@@ -241,8 +280,7 @@ impl SmuxApp {
         };
 
         // Keyboard subscription for input forwarding (only in terminal screen).
-        // Uses listen_with (not on_key_press) to intercept ALL keyboard events
-        // regardless of which widget currently holds focus.
+        // Emits RawKeyEvent so update() can check app-cursor mode.
         let kbd_sub = match self.screen {
             Screen::Terminal => iced::event::listen_with(keyboard_filter),
             Screen::Connect => Subscription::none(),
@@ -365,11 +403,6 @@ impl SmuxApp {
             ServerMessage::PtyOutput { session, data, .. } => {
                 if let Some(buf) = self.buffers.get_mut(&session) {
                     buf.push_bytes(&data);
-                    // Auto-scroll to the bottom whenever new output arrives.
-                    return scrollable::snap_to(
-                        terminal_view::terminal_scroll_id(),
-                        scrollable::RelativeOffset { x: 0.0, y: 1.0 },
-                    );
                 }
                 Task::none()
             }
@@ -446,8 +479,11 @@ impl SmuxApp {
     }
 }
 
-/// Subscription filter for `listen_with`: receives ALL events (any status) and
-/// converts keyboard presses to PTY bytes, ignoring everything else.
+/// Subscription filter: converts keyboard events to `Message::RawKeyEvent`.
+///
+/// Using `RawKeyEvent` (rather than directly producing `KeyInput` bytes) defers
+/// the byte conversion to `update()` where we have access to app state, so we
+/// can check the active buffer's `app_cursor` mode for vim arrow key sequences.
 fn keyboard_filter(
     event: Event,
     status: iced::event::Status,
@@ -468,12 +504,11 @@ fn keyboard_filter(
                     ..
                 } => {
                     let text_owned = text.as_ref().map(|t| t.to_string());
-                    let bytes = key_to_bytes(key.clone(), *modifiers, text_owned);
-                    match &bytes {
-                        Some(b) => debug!(?key, ?b, "keyboard_filter: mapped to bytes"),
-                        None => debug!(?key, "keyboard_filter: key_to_bytes returned None"),
-                    }
-                    bytes.map(Message::KeyInput)
+                    Some(Message::RawKeyEvent {
+                        key: key.clone(),
+                        modifiers: *modifiers,
+                        text: text_owned,
+                    })
                 }
                 _ => None,
             }
@@ -485,12 +520,14 @@ fn keyboard_filter(
 /// Convert an iced keyboard key press into PTY input bytes.
 /// Returns `None` for modifier-only presses or unhandled keys.
 ///
-/// `text` is the composed text from the event (Shift/layout already applied).
-/// It is used for character input so that Shift+A -> "A", Shift+1 -> "!", etc.
+/// `app_cursor` controls whether arrow/Home/End emit application-mode sequences
+/// (`\x1bOA`) vs. normal-mode sequences (`\x1b[A`). Vim sets application mode
+/// when it launches; shells use normal mode.
 fn key_to_bytes(
     key: iced::keyboard::Key,
     modifiers: iced::keyboard::Modifiers,
     text: Option<String>,
+    app_cursor: bool,
 ) -> Option<Vec<u8>> {
     use iced::keyboard::Key;
     use iced::keyboard::key::Named;
@@ -522,12 +559,25 @@ fn key_to_bytes(
                 Named::Backspace => b"\x7f",
                 Named::Escape => b"\x1b",
                 Named::Delete => b"\x1b[3~",
-                Named::ArrowUp => b"\x1b[A",
-                Named::ArrowDown => b"\x1b[B",
-                Named::ArrowRight => b"\x1b[C",
-                Named::ArrowLeft => b"\x1b[D",
-                Named::Home => b"\x1b[H",
-                Named::End => b"\x1b[F",
+                // Arrow keys: application mode (\x1bOx) vs. normal mode (\x1b[x).
+                Named::ArrowUp => {
+                    if app_cursor { b"\x1bOA" } else { b"\x1b[A" }
+                }
+                Named::ArrowDown => {
+                    if app_cursor { b"\x1bOB" } else { b"\x1b[B" }
+                }
+                Named::ArrowRight => {
+                    if app_cursor { b"\x1bOC" } else { b"\x1b[C" }
+                }
+                Named::ArrowLeft => {
+                    if app_cursor { b"\x1bOD" } else { b"\x1b[D" }
+                }
+                Named::Home => {
+                    if app_cursor { b"\x1bOH" } else { b"\x1b[H" }
+                }
+                Named::End => {
+                    if app_cursor { b"\x1bOF" } else { b"\x1b[F" }
+                }
                 Named::PageUp => b"\x1b[5~",
                 Named::PageDown => b"\x1b[6~",
                 Named::F1 => b"\x1bOP",
