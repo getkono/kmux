@@ -71,7 +71,10 @@ pub async fn connect(
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<ClientMessage>();
 
     // Authenticate immediately
-    if let Ok(bytes) = encode_client(&ClientMessage::Auth { token }) {
+    if let Ok(bytes) = encode_client(&ClientMessage::Auth {
+        token,
+        protocol_version: smux_protocol::messages::PROTOCOL_VERSION,
+    }) {
         let _ = ws_sink.send(Message::Binary(bytes.into())).await;
     }
 

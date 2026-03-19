@@ -5,5 +5,5 @@ edition = "2024"
 
 [dependencies]
 serde = { version = "1", features = ["derive"] }
-rmp-serde = "1"
+postcard = { version = "1", features = ["alloc"] }
 thiserror = "2"
