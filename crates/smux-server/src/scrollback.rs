@@ -39,8 +39,8 @@ impl SeqnoBuffer {
             return;
         }
 
-        // Evict oldest chunks until there is room.
-        while self.total_bytes + len > self.capacity {
+        // Evict oldest chunks until there is room (keep strictly under capacity).
+        while self.total_bytes + len >= self.capacity {
             if let Some((_, old)) = self.chunks.pop_front() {
                 self.total_bytes -= old.len();
             } else {
@@ -84,6 +84,7 @@ impl SeqnoBuffer {
     }
 
     /// The newest sequence number still in the buffer, or `None` if empty.
+    #[allow(dead_code)]
     pub fn newest_seqno(&self) -> Option<SequenceNo> {
         self.chunks.back().map(|(seq, _)| *seq)
     }
