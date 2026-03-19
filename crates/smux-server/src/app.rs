@@ -304,6 +304,7 @@ impl ServerApp {
     }
 
     /// Mark a session as exited (called from event bus listener).
+    #[allow(dead_code)]
     pub async fn mark_session_exited(&self, name: &str, code: Option<i32>, signal: Option<i32>) {
         let mut relays = self.relays.write().await;
         if let Some(relay) = relays.get_mut(name) {
