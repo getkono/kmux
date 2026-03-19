@@ -1,37 +1,81 @@
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use smux::session::PtyReader;
-use tokio::sync::broadcast;
+use smux_protocol::messages::{SequenceNo, ServerMessage};
 use tracing::warn;
 
-use crate::scrollback::ScrollbackBuffer;
+use crate::app::ClientMap;
+use crate::scrollback::SeqnoBuffer;
 
-/// Read PTY output in a loop and broadcast every chunk to all attached clients.
+/// Read PTY output in a loop, tag each chunk with an incrementing sequence
+/// number, append to scrollback, and forward to every registered client.
 ///
-/// This task owns the `PtyReader` half of a split session. It runs until EOF
-/// or a read error, then exits silently. When all broadcast receivers are
-/// dropped (no attached clients) the channel's `send` will return an error but
-/// we continue reading -- the data is simply discarded until a new client
-/// attaches and creates a new receiver.
+/// Dead clients are detected when their `mpsc::Sender` returns `TryFull` or
+/// is dropped -- they are silently skipped; the connection task's cleanup will
+/// remove them from the map on disconnect.
 ///
-/// Every chunk is also appended to `scrollback` so that reconnecting clients
-/// can receive a replay of recent output.
+/// If a client's channel is full (`try_send` fails), we send them a `Lagged`
+/// notification the next time their channel has room (best-effort).
 pub async fn session_read_loop(
     mut reader: PtyReader,
-    tx: broadcast::Sender<Vec<u8>>,
-    scrollback: Arc<Mutex<ScrollbackBuffer>>,
+    session: String,
+    clients: ClientMap,
+    scrollback: Arc<Mutex<SeqnoBuffer>>,
 ) {
+    let seqno_counter = Arc::new(AtomicU64::new(1));
     let mut buf = vec![0u8; 4096];
+
     loop {
         match reader.read(&mut buf).await {
             Ok(0) => break, // EOF -- PTY closed
             Ok(n) => {
                 let chunk = buf[..n].to_vec();
-                // Write to scrollback before broadcasting so that a snapshot
-                // taken immediately after subscribe() cannot miss this chunk.
-                scrollback.lock().unwrap().push(&chunk);
-                // Ignore send errors -- no receivers attached is normal
-                let _ = tx.send(chunk);
+                let seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
+
+                // Append to scrollback before delivering so a snapshot taken
+                // immediately after attach cannot miss this chunk.
+                scrollback.lock().unwrap().push(seqno, chunk.clone());
+
+                // Deliver to each registered client independently.
+                let msg = ServerMessage::PtyOutput {
+                    session: session.clone(),
+                    data: chunk,
+                    seqno,
+                };
+
+                // Collect dead client IDs to remove after iteration.
+                let mut dead: Vec<smux_protocol::messages::ClientId> = Vec::new();
+
+                {
+                    let map = clients.lock().unwrap();
+                    for (&client_id, tx) in map.iter() {
+                        match tx.try_send(msg.clone()) {
+                            Ok(()) => {}
+                            Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
+                                // Channel is full; send Lagged notification if possible.
+                                let lag_msg = ServerMessage::Lagged {
+                                    session: session.clone(),
+                                    missed_count: 1,
+                                };
+                                // Best-effort: ignore if still full.
+                                let _ = tx.try_send(lag_msg);
+                                warn!("Client {:?} lagged on session '{session}'", client_id);
+                            }
+                            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                                dead.push(client_id);
+                            }
+                        }
+                    }
+                }
+
+                // Clean up dead clients outside the lock to avoid deadlock.
+                if !dead.is_empty() {
+                    let mut map = clients.lock().unwrap();
+                    for id in dead {
+                        map.remove(&id);
+                    }
+                }
             }
             Err(e) => {
                 warn!("PTY relay read error: {e}");

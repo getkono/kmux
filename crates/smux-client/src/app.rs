@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use iced::futures::SinkExt as _;
 use iced::widget::{button, column, container, row, scrollable, text, text_input};
 use iced::{Element, Event, Length, Subscription, Task, Theme};
-use smux_protocol::messages::{ClientMessage, ServerMessage, SessionInfo, TermSize};
+use smux_protocol::messages::{ClientMessage, ServerMessage, SessionInfo, SessionStatus, TermSize};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -170,7 +170,10 @@ impl SmuxApp {
                     buf.clear();
                 }
                 self.active_session = Some(name.clone());
-                self.send_ws(ClientMessage::Attach { session: name });
+                self.send_ws(ClientMessage::Attach {
+                    session: name,
+                    last_seqno: None,
+                });
                 Task::none()
             }
 
@@ -291,7 +294,9 @@ impl SmuxApp {
 
     fn handle_server_message(&mut self, msg: ServerMessage) -> Task<Message> {
         match msg {
-            ServerMessage::AuthResult { success, reason } => {
+            ServerMessage::AuthResult {
+                success, reason, ..
+            } => {
                 if !success {
                     warn!("Auth failed: {:?}", reason);
                     self.status_msg = format!("Auth failed: {}", reason.unwrap_or_default());
@@ -313,6 +318,7 @@ impl SmuxApp {
                     self.active_session = Some(first.name.clone());
                     self.send_ws(ClientMessage::Attach {
                         session: first.name.clone(),
+                        last_seqno: None,
                     });
                 }
                 Task::none()
@@ -326,13 +332,18 @@ impl SmuxApp {
                         name: name.clone(),
                         program: String::new(),
                         size,
+                        attached_clients: vec![],
+                        status: SessionStatus::Running,
                     });
                 if let Some(prev) = self.active_session.take() {
                     self.send_ws(ClientMessage::Detach { session: prev });
                 }
                 self.active_session = Some(name.clone());
                 self.status_msg = format!("Session '{name}' created");
-                self.send_ws(ClientMessage::Attach { session: name });
+                self.send_ws(ClientMessage::Attach {
+                    session: name,
+                    last_seqno: None,
+                });
                 Task::none()
             }
 
@@ -342,13 +353,16 @@ impl SmuxApp {
                 if self.active_session.as_deref() == Some(&name) {
                     self.active_session = self.session_list.first().map(|s| s.name.clone());
                     if let Some(sess) = self.active_session.clone() {
-                        self.send_ws(ClientMessage::Attach { session: sess });
+                        self.send_ws(ClientMessage::Attach {
+                            session: sess,
+                            last_seqno: None,
+                        });
                     }
                 }
                 Task::none()
             }
 
-            ServerMessage::PtyOutput { session, data } => {
+            ServerMessage::PtyOutput { session, data, .. } => {
                 if let Some(buf) = self.buffers.get_mut(&session) {
                     buf.push_bytes(&data);
                     // Auto-scroll to the bottom whenever new output arrives.

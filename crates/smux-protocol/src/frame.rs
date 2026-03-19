@@ -5,31 +5,28 @@ use crate::messages::{ClientMessage, ServerMessage};
 /// Errors that can occur during message encoding or decoding.
 #[derive(Debug, Error)]
 pub enum ProtocolError {
-    #[error("encode error: {0}")]
-    Encode(#[from] rmp_serde::encode::Error),
-
-    #[error("decode error: {0}")]
-    Decode(#[from] rmp_serde::decode::Error),
+    #[error("encode/decode error: {0}")]
+    Postcard(#[from] postcard::Error),
 }
 
-/// Encode a `ClientMessage` into a MessagePack byte vector.
+/// Encode a `ClientMessage` into a postcard byte vector.
 pub fn encode_client(msg: &ClientMessage) -> Result<Vec<u8>, ProtocolError> {
-    rmp_serde::to_vec_named(msg).map_err(ProtocolError::Encode)
+    postcard::to_allocvec(msg).map_err(ProtocolError::Postcard)
 }
 
-/// Decode a `ClientMessage` from a MessagePack byte slice.
+/// Decode a `ClientMessage` from a postcard byte slice.
 pub fn decode_client(data: &[u8]) -> Result<ClientMessage, ProtocolError> {
-    rmp_serde::from_slice(data).map_err(ProtocolError::Decode)
+    postcard::from_bytes(data).map_err(ProtocolError::Postcard)
 }
 
-/// Encode a `ServerMessage` into a MessagePack byte vector.
+/// Encode a `ServerMessage` into a postcard byte vector.
 pub fn encode_server(msg: &ServerMessage) -> Result<Vec<u8>, ProtocolError> {
-    rmp_serde::to_vec_named(msg).map_err(ProtocolError::Encode)
+    postcard::to_allocvec(msg).map_err(ProtocolError::Postcard)
 }
 
-/// Decode a `ServerMessage` from a MessagePack byte slice.
+/// Decode a `ServerMessage` from a postcard byte slice.
 pub fn decode_server(data: &[u8]) -> Result<ServerMessage, ProtocolError> {
-    rmp_serde::from_slice(data).map_err(ProtocolError::Decode)
+    postcard::from_bytes(data).map_err(ProtocolError::Postcard)
 }
 
 #[cfg(test)]
@@ -41,10 +38,11 @@ mod tests {
     fn roundtrip_client_auth() {
         let msg = ClientMessage::Auth {
             token: "secret".to_string(),
+            protocol_version: PROTOCOL_VERSION,
         };
         let bytes = encode_client(&msg).expect("encode");
         let decoded = decode_client(&bytes).expect("decode");
-        assert!(matches!(decoded, ClientMessage::Auth { token } if token == "secret"));
+        assert!(matches!(decoded, ClientMessage::Auth { token, .. } if token == "secret"));
     }
 
     #[test]
@@ -52,11 +50,13 @@ mod tests {
         let msg = ServerMessage::PtyOutput {
             session: "alpha".to_string(),
             data: b"hello\r\n".to_vec(),
+            seqno: SequenceNo(42),
         };
         let bytes = encode_server(&msg).expect("encode");
         let decoded = decode_server(&bytes).expect("decode");
         assert!(
-            matches!(&decoded, ServerMessage::PtyOutput { session, data } if session == "alpha" && data == b"hello\r\n")
+            matches!(&decoded, ServerMessage::PtyOutput { session, data, seqno }
+                if session == "alpha" && data == b"hello\r\n" && seqno.0 == 42)
         );
     }
 
@@ -92,6 +92,39 @@ mod tests {
             &decoded,
             ServerMessage::Error {
                 code: ErrorCode::SessionNotFound,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn roundtrip_client_attach_with_seqno() {
+        let msg = ClientMessage::Attach {
+            session: "s1".to_string(),
+            last_seqno: Some(SequenceNo(100)),
+        };
+        let bytes = encode_client(&msg).expect("encode");
+        let decoded = decode_client(&bytes).expect("decode");
+        assert!(
+            matches!(&decoded, ClientMessage::Attach { session, last_seqno: Some(SequenceNo(100)) }
+                if session == "s1")
+        );
+    }
+
+    #[test]
+    fn roundtrip_auth_result_with_client_id() {
+        let msg = ServerMessage::AuthResult {
+            success: true,
+            reason: None,
+            client_id: Some(ClientId(7)),
+        };
+        let bytes = encode_server(&msg).expect("encode");
+        let decoded = decode_server(&bytes).expect("decode");
+        assert!(matches!(
+            &decoded,
+            ServerMessage::AuthResult {
+                success: true,
+                client_id: Some(ClientId(7)),
                 ..
             }
         ));
