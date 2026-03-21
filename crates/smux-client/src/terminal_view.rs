@@ -1,16 +1,11 @@
 use alacritty_terminal::{
     event::VoidListener,
     grid::Dimensions,
-    term::{
-        Config, RenderableCursor, Term, TermMode,
-        cell::Flags,
-        color::Colors,
-    },
+    term::{Config, RenderableCursor, Term, TermMode, cell::Flags, color::Colors},
     vte::ansi::{Color, CursorShape, NamedColor, Processor},
 };
 use iced::{
-    Color as IcedColor, Element, Font, Length, Pixels,
-    Point as IcedPoint, Rectangle, Size,
+    Color as IcedColor, Element, Font, Length, Pixels, Point as IcedPoint, Rectangle, Size,
     alignment, mouse,
     widget::canvas::{self, Canvas, Frame, Text},
 };
@@ -58,7 +53,12 @@ impl TerminalBuffer {
         let cols = cols as usize;
         let dims = TermDims { rows, cols };
         let term = Term::new(Config::default(), &dims, VoidListener);
-        Self { term, processor: Processor::new(), rows, cols }
+        Self {
+            term,
+            processor: Processor::new(),
+            rows,
+            cols,
+        }
     }
 
     /// Feed raw PTY bytes into the VTE parser → grid state is updated in place.
@@ -75,7 +75,10 @@ impl TerminalBuffer {
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.rows = rows as usize;
         self.cols = cols as usize;
-        self.term.resize(TermDims { rows: self.rows, cols: self.cols });
+        self.term.resize(TermDims {
+            rows: self.rows,
+            cols: self.cols,
+        });
     }
 
     /// Whether the terminal is in application-cursor mode (vim arrow keys).
@@ -137,9 +140,15 @@ impl TerminalSnapshot {
             if row >= 0 && (row as usize) < rows && col < cols {
                 let cell = indexed.cell;
                 let (fg, bg) = if cell.flags.contains(Flags::INVERSE) {
-                    (resolve_color(cell.bg, colors), resolve_color(cell.fg, colors))
+                    (
+                        resolve_color(cell.bg, colors),
+                        resolve_color(cell.fg, colors),
+                    )
                 } else {
-                    (resolve_color(cell.fg, colors), resolve_color(cell.bg, colors))
+                    (
+                        resolve_color(cell.fg, colors),
+                        resolve_color(cell.bg, colors),
+                    )
                 };
                 cells[row as usize * cols + col] = SnapshotCell {
                     c: cell.c,
@@ -150,7 +159,13 @@ impl TerminalSnapshot {
             }
         }
 
-        Self { cells, cursor, display_offset, rows, cols }
+        Self {
+            cells,
+            cursor,
+            display_offset,
+            rows,
+            cols,
+        }
     }
 }
 
@@ -182,7 +197,10 @@ impl canvas::Program<Message> for TerminalSnapshot {
             state.cols = new_cols;
             return (
                 canvas::event::Status::Ignored,
-                Some(Message::TerminalResized { rows: new_rows, cols: new_cols }),
+                Some(Message::TerminalResized {
+                    rows: new_rows,
+                    cols: new_cols,
+                }),
             );
         }
         (canvas::event::Status::Ignored, None)
@@ -248,7 +266,12 @@ impl canvas::Program<Message> for TerminalSnapshot {
                         frame.fill_rectangle(
                             IcedPoint::new(x, y),
                             Size::new(CELL_WIDTH, CELL_HEIGHT),
-                            IcedColor { r: 1.0, g: 1.0, b: 1.0, a: 0.7 },
+                            IcedColor {
+                                r: 1.0,
+                                g: 1.0,
+                                b: 1.0,
+                                a: 0.7,
+                            },
                         );
                         // Re-draw character with inverted foreground color.
                         if let Some(cell) = self.cells.get(idx)
@@ -260,9 +283,9 @@ impl canvas::Program<Message> for TerminalSnapshot {
                                 position: IcedPoint::new(x, y),
                                 color: IcedColor::BLACK,
                                 size: Pixels(FONT_SIZE),
-                                line_height: iced::widget::text::LineHeight::Absolute(
-                                    Pixels(CELL_HEIGHT),
-                                ),
+                                line_height: iced::widget::text::LineHeight::Absolute(Pixels(
+                                    CELL_HEIGHT,
+                                )),
                                 font: Font::MONOSPACE,
                                 horizontal_alignment: alignment::Horizontal::Left,
                                 vertical_alignment: alignment::Vertical::Top,
@@ -311,17 +334,24 @@ impl canvas::Program<Message> for TerminalSnapshot {
 /// Render the terminal buffer as a fill-parent canvas widget.
 pub fn view<'a>(buffer: &'a TerminalBuffer, _session: &'a str) -> Element<'a, Message> {
     let snapshot = TerminalSnapshot::from_buffer(buffer);
-    Canvas::new(snapshot).width(Length::Fill).height(Length::Fill).into()
+    Canvas::new(snapshot)
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .into()
 }
 
 // ── Color resolution ──────────────────────────────────────────────────────────
 
 fn resolve_color(color: Color, colors: &Colors) -> IcedColor {
     match color {
-        Color::Named(name) => colors[name]
-            .map_or_else(|| default_named_color(name), |rgb| IcedColor::from_rgb8(rgb.r, rgb.g, rgb.b)),
-        Color::Indexed(idx) => colors[idx as usize]
-            .map_or_else(|| ansi_indexed_color(idx), |rgb| IcedColor::from_rgb8(rgb.r, rgb.g, rgb.b)),
+        Color::Named(name) => colors[name].map_or_else(
+            || default_named_color(name),
+            |rgb| IcedColor::from_rgb8(rgb.r, rgb.g, rgb.b),
+        ),
+        Color::Indexed(idx) => colors[idx as usize].map_or_else(
+            || ansi_indexed_color(idx),
+            |rgb| IcedColor::from_rgb8(rgb.r, rgb.g, rgb.b),
+        ),
         Color::Spec(rgb) => IcedColor::from_rgb8(rgb.r, rgb.g, rgb.b),
     }
 }
@@ -353,9 +383,9 @@ fn default_named_color(name: NamedColor) -> IcedColor {
         NamedColor::BrightMagenta => IcedColor::from_rgb8(0xc6, 0x78, 0xdd),
         NamedColor::BrightCyan => IcedColor::from_rgb8(0x56, 0xb6, 0xc2),
         NamedColor::BrightWhite => IcedColor::from_rgb8(0xff, 0xff, 0xff),
-        NamedColor::Foreground
-        | NamedColor::BrightForeground
-        | NamedColor::DimForeground => default_fg(),
+        NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::DimForeground => {
+            default_fg()
+        }
         NamedColor::Background => default_bg(),
         NamedColor::Cursor => IcedColor::from_rgb8(0x52, 0x8b, 0xff),
         NamedColor::DimBlack => IcedColor::from_rgb8(0x1e, 0x21, 0x27),
