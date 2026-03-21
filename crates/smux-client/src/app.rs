@@ -56,7 +56,10 @@ pub enum Message {
     },
 
     // Terminal canvas resize detected
-    TerminalResized { rows: u16, cols: u16 },
+    TerminalResized {
+        rows: u16,
+        cols: u16,
+    },
 }
 
 /// Top-level application state.
@@ -217,7 +220,11 @@ impl SmuxApp {
 
             // Raw keyboard event: look up app-cursor mode from the active buffer
             // before converting to PTY bytes so vim arrow keys work correctly.
-            Message::RawKeyEvent { key, modifiers, text } => {
+            Message::RawKeyEvent {
+                key,
+                modifiers,
+                text,
+            } => {
                 let app_cursor = self
                     .active_session
                     .as_ref()
@@ -242,8 +249,7 @@ impl SmuxApp {
                         });
                     } else {
                         debug!("RawKeyEvent: dropped (no active session)");
-                        self.status_msg =
-                            "No active session -- press [+] to create one".to_string();
+                        self.status_msg = "No active session -- press [+] to create one".to_string();
                     }
                 }
                 Task::none()
@@ -561,22 +567,46 @@ fn key_to_bytes(
                 Named::Delete => b"\x1b[3~",
                 // Arrow keys: application mode (\x1bOx) vs. normal mode (\x1b[x).
                 Named::ArrowUp => {
-                    if app_cursor { b"\x1bOA" } else { b"\x1b[A" }
+                    if app_cursor {
+                        b"\x1bOA"
+                    } else {
+                        b"\x1b[A"
+                    }
                 }
                 Named::ArrowDown => {
-                    if app_cursor { b"\x1bOB" } else { b"\x1b[B" }
+                    if app_cursor {
+                        b"\x1bOB"
+                    } else {
+                        b"\x1b[B"
+                    }
                 }
                 Named::ArrowRight => {
-                    if app_cursor { b"\x1bOC" } else { b"\x1b[C" }
+                    if app_cursor {
+                        b"\x1bOC"
+                    } else {
+                        b"\x1b[C"
+                    }
                 }
                 Named::ArrowLeft => {
-                    if app_cursor { b"\x1bOD" } else { b"\x1b[D" }
+                    if app_cursor {
+                        b"\x1bOD"
+                    } else {
+                        b"\x1b[D"
+                    }
                 }
                 Named::Home => {
-                    if app_cursor { b"\x1bOH" } else { b"\x1b[H" }
+                    if app_cursor {
+                        b"\x1bOH"
+                    } else {
+                        b"\x1b[H"
+                    }
                 }
                 Named::End => {
-                    if app_cursor { b"\x1bOF" } else { b"\x1b[F" }
+                    if app_cursor {
+                        b"\x1bOF"
+                    } else {
+                        b"\x1b[F"
+                    }
                 }
                 Named::PageUp => b"\x1b[5~",
                 Named::PageDown => b"\x1b[6~",
