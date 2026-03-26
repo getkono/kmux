@@ -7,7 +7,7 @@ use smux_protocol::messages::{ClientMessage, ServerMessage, SessionInfo, Session
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::terminal_view::TerminalBuffer;
+use crate::terminal_view::CellGrid;
 use crate::{connect, session_bar, terminal_view, theme};
 
 /// Connection parameters used as a subscription ID (triggers reconnect on change).
@@ -44,11 +44,10 @@ pub enum Message {
     // Session management
     SelectSession(String),
     CreateSessionPressed,
-    #[allow(dead_code)] // wired up via view buttons -- will be called once UI is built out
+    #[allow(dead_code)]
     CloseSession(String),
 
-    // Raw keyboard event from subscription -- converted to bytes in update()
-    // so we have access to the active buffer's app-cursor mode.
+    // Raw keyboard event from subscription
     RawKeyEvent {
         key: iced::keyboard::Key,
         modifiers: iced::keyboard::Modifiers,
@@ -66,13 +65,11 @@ pub enum Message {
 #[derive(Default)]
 pub struct SmuxApp {
     screen: Screen,
-    /// When Some, the subscription drives a connection to this server.
     connect_params: Option<ConnectParams>,
-    /// Sender for outbound WebSocket messages.
     ws_sender: Option<mpsc::UnboundedSender<ClientMessage>>,
 
-    /// Terminal output buffers, keyed by session name.
-    buffers: HashMap<String, TerminalBuffer>,
+    /// Terminal cell grids, keyed by session name.
+    buffers: HashMap<String, CellGrid>,
     active_session: Option<String>,
     session_list: Vec<SessionInfo>,
     next_request_id: u64,
@@ -175,8 +172,6 @@ impl SmuxApp {
                 if let Some(prev) = self.active_session.take() {
                     self.send_ws(ClientMessage::Detach { session: prev });
                 }
-                // Clear the buffer before re-attaching so the server's scrollback
-                // replay starts from a clean slate and doesn't double the output.
                 if let Some(buf) = self.buffers.get_mut(&name) {
                     buf.clear();
                 }
@@ -217,9 +212,6 @@ impl SmuxApp {
             }
 
             //  Keyboard input 
-
-            // Raw keyboard event: look up app-cursor mode from the active buffer
-            // before converting to PTY bytes so vim arrow keys work correctly.
             Message::RawKeyEvent {
                 key,
                 modifiers,
@@ -278,22 +270,16 @@ impl SmuxApp {
         }
     }
 
-    /// Subscribe to the server connection stream.
-    /// The subscription drives the whole connection lifecycle: connect -> auth -> forward messages.
     pub fn subscription(&self) -> Subscription<Message> {
         let Some(params) = self.connect_params.clone() else {
             return Subscription::none();
         };
 
-        // Keyboard subscription for input forwarding (only in terminal screen).
-        // Emits RawKeyEvent so update() can check app-cursor mode.
         let kbd_sub = match self.screen {
             Screen::Terminal => iced::event::listen_with(keyboard_filter),
             Screen::Connect => Subscription::none(),
         };
 
-        // Server connection subscription: identified by params so a change in params
-        // causes a reconnect.
         let conn_sub = Subscription::run_with_id(
             params.clone(),
             iced::stream::channel::<Message, _>(100, move |mut output| async move {
@@ -303,7 +289,7 @@ impl SmuxApp {
                     params.host.clone(),
                     params.port,
                     params.token.clone(),
-                    true, // accept self-signed certs
+                    true,
                     srv_tx,
                 )
                 .await;
@@ -406,9 +392,28 @@ impl SmuxApp {
                 Task::none()
             }
 
-            ServerMessage::PtyOutput { session, data, .. } => {
-                if let Some(buf) = self.buffers.get_mut(&session) {
-                    buf.push_bytes(&data);
+            // Server-side VT diff: apply snapshot or incremental update
+            ServerMessage::TerminalSnapshot {
+                session, snapshot, ..
+            } => {
+                let grid = self.buffers.entry(session).or_default();
+                grid.apply_snapshot(snapshot);
+                Task::none()
+            }
+
+            ServerMessage::TerminalUpdate { session, diff, .. } => {
+                if let Some(grid) = self.buffers.get_mut(&session) {
+                    grid.apply_diff(diff);
+                }
+                Task::none()
+            }
+
+            // Legacy PtyOutput -- keep for backwards compat during transition
+            ServerMessage::PtyOutput { .. } => Task::none(),
+
+            ServerMessage::SyncReset { session } => {
+                if let Some(grid) = self.buffers.get_mut(&session) {
+                    grid.clear();
                 }
                 Task::none()
             }
@@ -485,11 +490,6 @@ impl SmuxApp {
     }
 }
 
-/// Subscription filter: converts keyboard events to `Message::RawKeyEvent`.
-///
-/// Using `RawKeyEvent` (rather than directly producing `KeyInput` bytes) defers
-/// the byte conversion to `update()` where we have access to app state, so we
-/// can check the active buffer's `app_cursor` mode for vim arrow key sequences.
 fn keyboard_filter(
     event: Event,
     status: iced::event::Status,
@@ -523,12 +523,6 @@ fn keyboard_filter(
     }
 }
 
-/// Convert an iced keyboard key press into PTY input bytes.
-/// Returns `None` for modifier-only presses or unhandled keys.
-///
-/// `app_cursor` controls whether arrow/Home/End emit application-mode sequences
-/// (`\x1bOA`) vs. normal-mode sequences (`\x1b[A`). Vim sets application mode
-/// when it launches; shells use normal mode.
 fn key_to_bytes(
     key: iced::keyboard::Key,
     modifiers: iced::keyboard::Modifiers,
@@ -541,17 +535,14 @@ fn key_to_bytes(
     match key {
         Key::Character(c) => {
             let s = c.as_str();
-            if modifiers.control() {
-                // Ctrl+A..Z -> bytes 1..26 (use unmodified key for the letter)
-                if let Some(ch) = s.chars().next() {
-                    let lower = ch.to_ascii_lowercase();
-                    if lower.is_ascii_alphabetic() {
-                        return Some(vec![lower as u8 - b'a' + 1]);
-                    }
+            if modifiers.control()
+                && let Some(ch) = s.chars().next()
+            {
+                let lower = ch.to_ascii_lowercase();
+                if lower.is_ascii_alphabetic() {
+                    return Some(vec![lower as u8 - b'a' + 1]);
                 }
             }
-            // Use composed text (Shift/layout applied) when available;
-            // fall back to the unmodified key character.
             if let Some(t) = text {
                 Some(t.as_bytes().to_vec())
             } else {
@@ -565,7 +556,6 @@ fn key_to_bytes(
                 Named::Backspace => b"\x7f",
                 Named::Escape => b"\x1b",
                 Named::Delete => b"\x1b[3~",
-                // Arrow keys: application mode (\x1bOx) vs. normal mode (\x1b[x).
                 Named::ArrowUp => {
                     if app_cursor {
                         b"\x1bOA"

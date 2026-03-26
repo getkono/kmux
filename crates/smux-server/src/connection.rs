@@ -1,22 +1,17 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
+use quinn::Connection;
 use smux_protocol::messages::{
     ClientId, ClientMessage, ErrorCode, SequenceNo, ServerMessage, SessionEventMsg,
 };
-use smux_protocol::{decode_client, encode_server};
-use tokio::net::TcpStream;
+use smux_protocol::{decode_client, encode_server, read_frame, write_frame};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
-use tokio_tungstenite::WebSocketStream;
-use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, info, warn};
 
 use crate::app::{AttachResult, InputLockOutcome, ServerApp};
 use crate::auth::validate_token;
-
-type WsStream = WebSocketStream<tokio_rustls::server::TlsStream<TcpStream>>;
 
 /// Per-client output channel capacity (number of `ServerMessage` items buffered).
 const CLIENT_CHANNEL_CAPACITY: usize = 512;
@@ -27,23 +22,31 @@ struct ClientState {
     client_id: Option<ClientId>,
     /// Output-forwarding task handles, keyed by session name.
     attached: HashMap<String, AbortHandle>,
-    writer_tx: mpsc::UnboundedSender<ServerMessage>,
+    /// Sender for the control stream writer task.
+    ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+    /// QUIC connection handle -- used to open uni streams for session diffs.
+    conn: Connection,
     app: Arc<ServerApp>,
 }
 
 impl ClientState {
-    fn new(app: Arc<ServerApp>, writer_tx: mpsc::UnboundedSender<ServerMessage>) -> Self {
+    fn new(
+        app: Arc<ServerApp>,
+        ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+        conn: Connection,
+    ) -> Self {
         Self {
             authenticated: false,
             client_id: None,
             attached: HashMap::new(),
-            writer_tx,
+            ctrl_tx,
+            conn,
             app,
         }
     }
 
     fn send(&self, msg: ServerMessage) {
-        let _ = self.writer_tx.send(msg);
+        let _ = self.ctrl_tx.send(msg);
     }
 
     fn error(&self, req: Option<u64>, code: ErrorCode, message: impl Into<String>) {
@@ -56,7 +59,6 @@ impl ClientState {
 
     async fn handle(&mut self, msg: ClientMessage) {
         if !self.authenticated {
-            // Only Auth is allowed before authentication
             if let ClientMessage::Auth { token, .. } = msg {
                 if validate_token(&token, &self.app.auth_token) {
                     let id = self.app.next_client_id();
@@ -82,13 +84,10 @@ impl ClientState {
             return;
         }
 
-        // Authenticated clients always have a client_id assigned.
         let client_id = self.client_id.expect("authenticated without client_id");
 
         match msg {
-            ClientMessage::Auth { .. } => {
-                // Already authenticated -- ignore
-            }
+            ClientMessage::Auth { .. } => {}
 
             ClientMessage::SessionCreate {
                 request_id,
@@ -102,7 +101,6 @@ impl ClientState {
             },
 
             ClientMessage::SessionClose { request_id, name } => {
-                // Detach first if attached
                 if let Some(handle) = self.attached.remove(&name) {
                     handle.abort();
                 }
@@ -156,49 +154,23 @@ impl ClientState {
                     .await
                 {
                     Ok(result) => {
-                        // Replay scrollback before the live stream begins.
-                        const CHUNK: usize = 64 * 1024;
-                        match result {
-                            AttachResult::FullSnapshot(bytes) => {
-                                for chunk in bytes.chunks(CHUNK) {
-                                    let _ = self.writer_tx.send(ServerMessage::PtyOutput {
-                                        session: session.clone(),
-                                        data: chunk.to_vec(),
-                                        seqno: SequenceNo(0),
-                                    });
-                                }
+                        // Open a server-initiated unidirectional stream for this session's diffs.
+                        let uni_stream = match self.conn.open_uni().await {
+                            Ok(s) => s,
+                            Err(e) => {
+                                self.error(
+                                    None,
+                                    ErrorCode::InternalError,
+                                    format!("failed to open uni stream: {e}"),
+                                );
+                                return;
                             }
-                            AttachResult::Delta(chunks) => {
-                                for (seqno, data) in chunks {
-                                    let _ = self.writer_tx.send(ServerMessage::PtyOutput {
-                                        session: session.clone(),
-                                        data,
-                                        seqno,
-                                    });
-                                }
-                            }
-                            AttachResult::SyncReset(bytes) => {
-                                let _ = self.writer_tx.send(ServerMessage::SyncReset {
-                                    session: session.clone(),
-                                });
-                                for chunk in bytes.chunks(CHUNK) {
-                                    let _ = self.writer_tx.send(ServerMessage::PtyOutput {
-                                        session: session.clone(),
-                                        data: chunk.to_vec(),
-                                        seqno: SequenceNo(0),
-                                    });
-                                }
-                            }
-                        }
+                        };
 
-                        // Forward live output from the per-client channel to the writer.
-                        let tx = self.writer_tx.clone();
+                        let session_name = session.clone();
                         let handle = tokio::spawn(async move {
-                            while let Some(msg) = client_rx.recv().await {
-                                if tx.send(msg).is_err() {
-                                    break;
-                                }
-                            }
+                            session_uni_writer(uni_stream, result, session_name, &mut client_rx)
+                                .await;
                         })
                         .abort_handle();
                         self.attached.insert(session, handle);
@@ -236,7 +208,7 @@ impl ClientState {
             ClientMessage::ReleaseInputLock { session } => {
                 match self.app.release_input_lock(&session, client_id).await {
                     Ok(true) => self.send(ServerMessage::InputLockReleased { session }),
-                    Ok(false) => {} // Lock not held by this client; silently ignore
+                    Ok(false) => {}
                     Err(e) => self.error(None, classify_error(&e), e.to_string()),
                 }
             }
@@ -257,21 +229,85 @@ impl ClientState {
                 self.send(ServerMessage::Pong { seq });
             }
 
-            ClientMessage::Pong { .. } => {
-                // Server-initiated ping round-trip complete; nothing to do.
-            }
+            ClientMessage::Pong { .. } => {}
         }
     }
 }
 
 impl Drop for ClientState {
     fn drop(&mut self) {
-        // Abort all output-forwarding tasks when the connection closes.
-        // ClientMap cleanup is handled by `detach_client_all` called in `handle`.
         for (_, handle) in self.attached.drain() {
             handle.abort();
         }
     }
+}
+
+/// Write initial replay data + live diffs on a server-initiated unidirectional stream.
+async fn session_uni_writer(
+    mut uni: quinn::SendStream,
+    attach_result: AttachResult,
+    session: String,
+    client_rx: &mut mpsc::Receiver<ServerMessage>,
+) {
+    // Send initial replay data
+    match attach_result {
+        AttachResult::FullSnapshot(snapshot) => {
+            let msg = ServerMessage::TerminalSnapshot {
+                session: session.clone(),
+                snapshot,
+                seqno: SequenceNo(0),
+            };
+            if send_frame(&mut uni, &msg).await.is_err() {
+                return;
+            }
+        }
+        AttachResult::Delta(diffs) => {
+            for (seqno, diff) in diffs {
+                let msg = ServerMessage::TerminalUpdate {
+                    session: session.clone(),
+                    diff,
+                    seqno,
+                };
+                if send_frame(&mut uni, &msg).await.is_err() {
+                    return;
+                }
+            }
+        }
+        AttachResult::SyncReset(snapshot) => {
+            let reset_msg = ServerMessage::SyncReset {
+                session: session.clone(),
+            };
+            if send_frame(&mut uni, &reset_msg).await.is_err() {
+                return;
+            }
+            let msg = ServerMessage::TerminalSnapshot {
+                session: session.clone(),
+                snapshot,
+                seqno: SequenceNo(0),
+            };
+            if send_frame(&mut uni, &msg).await.is_err() {
+                return;
+            }
+        }
+    }
+
+    // Forward live diffs from the relay task
+    while let Some(msg) = client_rx.recv().await {
+        if send_frame(&mut uni, &msg).await.is_err() {
+            break;
+        }
+    }
+
+    let _ = uni.finish();
+}
+
+/// Encode a `ServerMessage` and write it as a length-prefixed frame.
+async fn send_frame(
+    stream: &mut quinn::SendStream,
+    msg: &ServerMessage,
+) -> Result<(), smux_protocol::ProtocolError> {
+    let bytes = encode_server(msg)?;
+    write_frame(stream, &bytes).await
 }
 
 /// Map smux errors to protocol error codes.
@@ -284,17 +320,42 @@ fn classify_error(e: &smux::error::SmuxError) -> ErrorCode {
     }
 }
 
-/// Handle a single WebSocket client connection.
-pub async fn handle(ws: WsStream, app: Arc<ServerApp>) {
-    let (ws_sink, mut ws_stream) = ws.split();
-    let (writer_tx, writer_rx) = mpsc::unbounded_channel::<ServerMessage>();
+/// Handle a single QUIC client connection.
+///
+/// Uses a multi-stream model:
+/// - Bidirectional stream 0 (control): client<->server control messages
+/// - Unidirectional streams (per-session): server->client terminal diffs
+pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
+    // Accept the first bidirectional stream as the control channel
+    let (ctrl_send, mut ctrl_recv) = match conn.accept_bi().await {
+        Ok(streams) => streams,
+        Err(e) => {
+            warn!("Failed to accept control stream: {e}");
+            return;
+        }
+    };
 
-    // Spawn a writer task that serialises ServerMessages onto the WebSocket
-    let writer_task = tokio::spawn(writer_loop(writer_rx, ws_sink));
+    let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-    // Forward lifecycle events from the global event bus to this client
+    // Control stream writer task
+    let writer_task = tokio::spawn(async move {
+        let mut ctrl_send = ctrl_send;
+        while let Some(msg) = ctrl_rx.recv().await {
+            match encode_server(&msg) {
+                Ok(bytes) => {
+                    if write_frame(&mut ctrl_send, &bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => warn!("Failed to encode server message: {e}"),
+            }
+        }
+        let _ = ctrl_send.finish();
+    });
+
+    // Forward lifecycle events to this client on the control stream
     let mut event_rx = app.subscribe_events();
-    let event_tx = writer_tx.clone();
+    let event_tx = ctrl_tx.clone();
     let event_task = tokio::spawn(async move {
         while let Ok(event) = event_rx.recv().await {
             let msg = session_event_to_msg(event);
@@ -302,37 +363,24 @@ pub async fn handle(ws: WsStream, app: Arc<ServerApp>) {
         }
     });
 
-    let mut state = ClientState::new(app.clone(), writer_tx);
+    let mut state = ClientState::new(app.clone(), ctrl_tx, conn);
 
-    // Main read loop
-    while let Some(frame) = ws_stream.next().await {
-        match frame {
-            Ok(Message::Binary(data)) => match decode_client(&data) {
+    // Main read loop on control stream
+    loop {
+        match read_frame(&mut ctrl_recv).await {
+            Ok(Some(data)) => match decode_client(&data) {
                 Ok(client_msg) => state.handle(client_msg).await,
                 Err(e) => {
                     warn!("Failed to decode client message: {e}");
                     state.error(None, ErrorCode::InvalidMessage, e.to_string());
                 }
             },
-            Ok(Message::Close(_)) => {
-                debug!("Client sent Close frame");
+            Ok(None) => {
+                debug!("Control stream closed");
                 break;
             }
-            Ok(Message::Ping(payload)) => {
-                // tungstenite auto-replies with Pong, but we handle it explicitly here
-                debug!("Received WebSocket Ping");
-                let _ = state.writer_tx.send(ServerMessage::Pong {
-                    seq: u64::from_le_bytes(
-                        payload
-                            .get(..8)
-                            .and_then(|b| b.try_into().ok())
-                            .unwrap_or([0; 8]),
-                    ),
-                });
-            }
-            Ok(_) => {} // Text, Pong -- ignore
             Err(e) => {
-                warn!("WebSocket error: {e}");
+                warn!("Control stream read error: {e}");
                 break;
             }
         }
@@ -340,32 +388,13 @@ pub async fn handle(ws: WsStream, app: Arc<ServerApp>) {
 
     event_task.abort();
 
-    // Remove this client from all session relay maps before dropping state.
     if let Some(client_id) = state.client_id {
         app.detach_client_all(client_id).await;
     }
 
-    drop(state); // aborts all attached output tasks via Drop impl
+    drop(state);
     writer_task.abort();
     info!("Connection closed");
-}
-
-/// Drain the writer channel and send each message as a WebSocket binary frame.
-async fn writer_loop(
-    mut rx: mpsc::UnboundedReceiver<ServerMessage>,
-    mut sink: futures_util::stream::SplitSink<WsStream, Message>,
-) {
-    while let Some(msg) = rx.recv().await {
-        match encode_server(&msg) {
-            Ok(bytes) => {
-                if sink.send(Message::Binary(bytes.into())).await.is_err() {
-                    break;
-                }
-            }
-            Err(e) => warn!("Failed to encode server message: {e}"),
-        }
-    }
-    let _ = sink.close().await;
 }
 
 fn session_event_to_msg(event: smux::events::SessionEvent) -> SessionEventMsg {

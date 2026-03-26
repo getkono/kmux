@@ -6,22 +6,20 @@ use smux_protocol::messages::{SequenceNo, ServerMessage};
 use tracing::warn;
 
 use crate::app::ClientMap;
-use crate::scrollback::SeqnoBuffer;
+use crate::scrollback::DiffBuffer;
+use crate::term_state::TermState;
 
-/// Read PTY output in a loop, tag each chunk with an incrementing sequence
-/// number, append to scrollback, and forward to every registered client.
+/// Read PTY output in a loop, feed bytes through server-side VT emulation,
+/// compute cell-level diffs, and forward `TerminalUpdate` messages to every
+/// registered client.
 ///
-/// Dead clients are detected when their `mpsc::Sender` returns `TryFull` or
-/// is dropped -- they are silently skipped; the connection task's cleanup will
-/// remove them from the map on disconnect.
-///
-/// If a client's channel is full (`try_send` fails), we send them a `Lagged`
-/// notification the next time their channel has room (best-effort).
-pub async fn session_read_loop(
+/// Empty diffs (no cell changes) are skipped to avoid unnecessary network traffic.
+pub async fn session_diff_loop(
     mut reader: PtyReader,
     session: String,
     clients: ClientMap,
-    scrollback: Arc<Mutex<SeqnoBuffer>>,
+    scrollback: Arc<Mutex<DiffBuffer>>,
+    term_state: Arc<Mutex<TermState>>,
 ) {
     let seqno_counter = Arc::new(AtomicU64::new(1));
     let mut buf = vec![0u8; 4096];
@@ -30,21 +28,32 @@ pub async fn session_read_loop(
         match reader.read(&mut buf).await {
             Ok(0) => break, // EOF -- PTY closed
             Ok(n) => {
-                let chunk = buf[..n].to_vec();
-                let seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
+                let chunk = &buf[..n];
 
-                // Append to scrollback before delivering so a snapshot taken
-                // immediately after attach cannot miss this chunk.
-                scrollback.lock().unwrap().push(seqno, chunk.clone());
+                // Feed bytes into the server-side VTE emulator and compute diff
+                let (diff, seqno) = {
+                    let mut ts = term_state.lock().unwrap();
+                    ts.feed(chunk);
+                    let diff = ts.compute_diff();
+                    let seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
+                    (diff, seqno)
+                };
 
-                // Deliver to each registered client independently.
-                let msg = ServerMessage::PtyOutput {
+                // Skip empty diffs (no visible changes)
+                if diff.ops.is_empty() {
+                    continue;
+                }
+
+                // Store in scrollback before delivering
+                scrollback.lock().unwrap().push(seqno, diff.clone());
+
+                let msg = ServerMessage::TerminalUpdate {
                     session: session.clone(),
-                    data: chunk,
+                    diff,
                     seqno,
                 };
 
-                // Collect dead client IDs to remove after iteration.
+                // Deliver to each registered client
                 let mut dead: Vec<smux_protocol::messages::ClientId> = Vec::new();
 
                 {
@@ -53,12 +62,10 @@ pub async fn session_read_loop(
                         match tx.try_send(msg.clone()) {
                             Ok(()) => {}
                             Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                                // Channel is full; send Lagged notification if possible.
                                 let lag_msg = ServerMessage::Lagged {
                                     session: session.clone(),
                                     missed_count: 1,
                                 };
-                                // Best-effort: ignore if still full.
                                 let _ = tx.try_send(lag_msg);
                                 warn!("Client {:?} lagged on session '{session}'", client_id);
                             }
@@ -69,7 +76,6 @@ pub async fn session_read_loop(
                     }
                 }
 
-                // Clean up dead clients outside the lock to avoid deadlock.
                 if !dead.is_empty() {
                     let mut map = clients.lock().unwrap();
                     for id in dead {

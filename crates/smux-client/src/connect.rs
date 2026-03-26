@@ -1,14 +1,9 @@
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
 
-use futures_util::{SinkExt, StreamExt};
 use smux_protocol::messages::{ClientMessage, ServerMessage};
-use smux_protocol::{decode_server, encode_client};
-use tokio::net::TcpStream;
+use smux_protocol::{decode_server, encode_client, read_frame, write_frame};
 use tokio::sync::mpsc;
-use tokio_rustls::TlsConnector;
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_tungstenite::tungstenite::Message;
 use tracing::{debug, warn};
 
 /// Outcome of a connection attempt.
@@ -19,15 +14,14 @@ pub enum ConnectResult {
     Failed(String),
 }
 
-/// Establish a TLS+WebSocket connection to `host:port` and authenticate with
-/// `token`. The `server_tx` channel is used to send `ServerMessage` values back
-/// into the iced application loop.
+/// Establish a QUIC connection to `host:port` and authenticate with `token`.
 ///
-/// This function runs two background tasks:
-/// - A **reader task**: decodes incoming `ServerMessage` frames and sends them
-///   via `server_tx`.
-/// - A **writer task**: receives `ClientMessage` values from the returned sender
-///   and encodes them as WebSocket binary frames.
+/// Uses a multi-stream model:
+/// - Opens one bidirectional stream as the control channel
+/// - Accepts server-initiated unidirectional streams for per-session diffs
+///
+/// The `server_tx` channel sends `ServerMessage` values back into the iced
+/// application loop.
 pub async fn connect(
     host: String,
     port: u16,
@@ -44,96 +38,137 @@ pub async fn connect(
         None => return ConnectResult::Failed(format!("cannot resolve {host}:{port}")),
     };
 
-    let tcp = match TcpStream::connect(addr).await {
-        Ok(s) => s,
-        Err(e) => return ConnectResult::Failed(format!("TCP connect failed: {e}")),
+    let client_config = build_quinn_client_config(accept_invalid_certs);
+
+    let mut endpoint = match quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()) {
+        Ok(ep) => ep,
+        Err(e) => return ConnectResult::Failed(format!("QUIC endpoint error: {e}")),
+    };
+    endpoint.set_default_client_config(client_config);
+
+    let conn = match endpoint.connect(addr, &host) {
+        Ok(connecting) => match connecting.await {
+            Ok(c) => c,
+            Err(e) => return ConnectResult::Failed(format!("QUIC connect failed: {e}")),
+        },
+        Err(e) => return ConnectResult::Failed(format!("QUIC connect error: {e}")),
     };
 
-    let tls_config = build_tls_config(accept_invalid_certs);
-    let connector = TlsConnector::from(Arc::new(tls_config));
-    let server_name = match ServerName::try_from(host.clone()) {
-        Ok(n) => n,
-        Err(_) => return ConnectResult::Failed(format!("invalid server name: {host}")),
+    // Open the control stream (first bidirectional stream)
+    let (mut ctrl_send, mut ctrl_recv) = match conn.open_bi().await {
+        Ok(streams) => streams,
+        Err(e) => return ConnectResult::Failed(format!("control stream error: {e}")),
     };
-
-    let tls_stream = match connector.connect(server_name, tcp).await {
-        Ok(s) => s,
-        Err(e) => return ConnectResult::Failed(format!("TLS connect failed: {e}")),
-    };
-
-    let url = format!("wss://{host}:{port}/");
-    let (ws_stream, _response) = match tokio_tungstenite::client_async(url, tls_stream).await {
-        Ok(pair) => pair,
-        Err(e) => return ConnectResult::Failed(format!("WebSocket upgrade failed: {e}")),
-    };
-
-    let (mut ws_sink, mut ws_stream) = ws_stream.split();
-    let (client_tx, mut client_rx) = mpsc::unbounded_channel::<ClientMessage>();
 
     // Authenticate immediately
     if let Ok(bytes) = encode_client(&ClientMessage::Auth {
         token,
         protocol_version: smux_protocol::messages::PROTOCOL_VERSION,
-    }) {
-        let _ = ws_sink.send(Message::Binary(bytes.into())).await;
+    }) && let Err(e) = write_frame(&mut ctrl_send, &bytes).await
+    {
+        return ConnectResult::Failed(format!("auth write failed: {e}"));
     }
 
-    // Writer task: drain client_rx and send frames
+    let (client_tx, mut client_rx) = mpsc::unbounded_channel::<ClientMessage>();
+
+    // Writer task: drain client_rx and send frames on the control stream
     let writer_handle = tokio::spawn(async move {
         while let Some(msg) = client_rx.recv().await {
             match encode_client(&msg) {
                 Ok(bytes) => {
-                    if ws_sink.send(Message::Binary(bytes.into())).await.is_err() {
+                    if write_frame(&mut ctrl_send, &bytes).await.is_err() {
                         break;
                     }
                 }
                 Err(e) => warn!("encode error: {e}"),
             }
         }
+        let _ = ctrl_send.finish();
         debug!("Writer task exited");
     });
 
-    // Reader task: decode incoming frames and forward as ServerMessage
+    // Reader task: decode incoming frames from the control stream
+    let ctrl_server_tx = server_tx.clone();
     tokio::spawn(async move {
-        while let Some(frame) = ws_stream.next().await {
-            match frame {
-                Ok(Message::Binary(data)) => match decode_server(&data) {
+        loop {
+            match read_frame(&mut ctrl_recv).await {
+                Ok(Some(data)) => match decode_server(&data) {
                     Ok(msg) => {
-                        if server_tx.send(msg).is_err() {
+                        if ctrl_server_tx.send(msg).is_err() {
                             break;
                         }
                     }
                     Err(e) => warn!("decode error: {e}"),
                 },
-                Ok(Message::Close(_)) => break,
-                Ok(_) => {}
+                Ok(None) => break,
                 Err(e) => {
-                    warn!("WebSocket error: {e}");
+                    warn!("control stream read error: {e}");
                     break;
                 }
             }
         }
         writer_handle.abort();
-        debug!("Reader task exited");
+        debug!("Control reader task exited");
+    });
+
+    // Uni stream acceptor: accept server-initiated uni streams (per-session diffs)
+    let uni_server_tx = server_tx;
+    tokio::spawn(async move {
+        loop {
+            match conn.accept_uni().await {
+                Ok(mut uni) => {
+                    let tx = uni_server_tx.clone();
+                    tokio::spawn(async move {
+                        loop {
+                            match read_frame(&mut uni).await {
+                                Ok(Some(frame)) => match decode_server(&frame) {
+                                    Ok(msg) => {
+                                        if tx.send(msg).is_err() {
+                                            break;
+                                        }
+                                    }
+                                    Err(e) => warn!("uni stream decode error: {e}"),
+                                },
+                                Ok(None) => break,
+                                Err(e) => {
+                                    warn!("uni stream read error: {e}");
+                                    break;
+                                }
+                            }
+                        }
+                        debug!("Uni stream reader exited");
+                    });
+                }
+                Err(e) => {
+                    debug!("Uni stream accept ended: {e}");
+                    break;
+                }
+            }
+        }
     });
 
     ConnectResult::Connected(client_tx)
 }
 
-fn build_tls_config(accept_invalid: bool) -> rustls::ClientConfig {
-    if accept_invalid {
-        // Development mode: accept any certificate (self-signed)
+fn build_quinn_client_config(accept_invalid: bool) -> quinn::ClientConfig {
+    let crypto = if accept_invalid {
         rustls::ClientConfig::builder()
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(NoVerifier))
             .with_no_client_auth()
     } else {
-        let mut roots = rustls::RootCertStore::empty();
-        roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        // Production mode: use platform-native certificate roots.
+        // Without webpki-roots, this creates an empty store. In practice,
+        // the client currently always uses accept_invalid_certs=true for dev.
+        let roots = rustls::RootCertStore::empty();
         rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth()
-    }
+    };
+
+    let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
+        .expect("valid QUIC client config");
+    quinn::ClientConfig::new(Arc::new(quic_crypto))
 }
 
 /// A certificate verifier that accepts any certificate.

@@ -3,12 +3,13 @@ mod auth;
 mod connection;
 mod relay;
 mod scrollback;
+mod term_state;
 mod tls;
 
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use clap::Parser;
-use tokio::net::TcpListener;
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -60,35 +61,30 @@ async fn main() -> anyhow::Result<()> {
         tls::load_tls_config(&cert_path, &key_path)?
     };
 
-    let acceptor = tls::make_acceptor(tls_config);
+    let quinn_config = tls::build_quinn_config(tls_config)?;
 
     let token = generate_token();
     println!("Auth token: {token}");
 
     let app = Arc::new(ServerApp::new(token));
 
-    let addr = format!("{}:{}", cli.bind, cli.port);
-    let listener = TcpListener::bind(&addr).await?;
-    info!("Listening on wss://{addr}");
+    let addr: SocketAddr = format!("{}:{}", cli.bind, cli.port).parse()?;
+    let endpoint = quinn::Endpoint::server(quinn_config, addr)?;
+    info!("Listening on quic://{addr}");
 
-    loop {
-        let (tcp_stream, peer_addr) = listener.accept().await?;
-        info!("TCP connection from {peer_addr}");
-
-        let acceptor = acceptor.clone();
+    while let Some(incoming) = endpoint.accept().await {
         let app = Arc::clone(&app);
-
         tokio::spawn(async move {
-            match acceptor.accept(tcp_stream).await {
-                Ok(tls_stream) => match tokio_tungstenite::accept_async(tls_stream).await {
-                    Ok(ws_stream) => {
-                        info!("WebSocket connection from {peer_addr}");
-                        connection::handle(ws_stream, app).await;
-                    }
-                    Err(e) => error!("WebSocket upgrade from {peer_addr} failed: {e}"),
-                },
-                Err(e) => error!("TLS handshake from {peer_addr} failed: {e}"),
+            match incoming.await {
+                Ok(conn) => {
+                    let remote = conn.remote_address();
+                    info!("QUIC connection from {remote}");
+                    connection::handle(conn, app).await;
+                }
+                Err(e) => error!("QUIC connection failed: {e}"),
             }
         });
     }
+
+    Ok(())
 }

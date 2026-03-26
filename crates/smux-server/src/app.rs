@@ -8,15 +8,17 @@ use smux::events::SessionEvent;
 use smux::registry::SessionManager;
 use smux::session::PtyWriter;
 use smux_protocol::messages::{
-    ClientId, InputMode, SequenceNo, ServerMessage, SessionInfo, SessionStatus, TermSize,
+    ClientId, GridSnapshot, InputMode, SequenceNo, ServerMessage, SessionInfo, SessionStatus,
+    TermSize, TerminalDiff,
 };
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::warn;
 
-use crate::relay::session_read_loop;
-use crate::scrollback::SeqnoBuffer;
+use crate::relay::session_diff_loop;
+use crate::scrollback::DiffBuffer;
+use crate::term_state::TermState;
 
-/// 10 MB scrollback buffer per session.
+/// 10 MB scrollback buffer per session (estimated diff size).
 const SCROLLBACK_CAPACITY: usize = 10 * 1024 * 1024;
 
 /// Shared map of per-client output senders for a single session.
@@ -34,8 +36,10 @@ pub struct SessionRelay {
     pub program: String,
     /// Current terminal size.
     pub size: TermSize,
-    /// Ring buffer of recent PTY output, keyed by sequence number.
-    pub scrollback: Arc<Mutex<SeqnoBuffer>>,
+    /// Ring buffer of recent diffs, keyed by sequence number.
+    pub scrollback: Arc<Mutex<DiffBuffer>>,
+    /// Server-side VT emulation state for this session.
+    pub term_state: Arc<Mutex<TermState>>,
     /// Input control mode for this session.
     pub input_mode: InputMode,
     /// Session lifecycle status (Running or Exited).
@@ -90,15 +94,16 @@ impl ServerApp {
         let session = self.manager.get_session(name).await?;
         let (reader, writer) = session.split().await?;
 
-        // Shared state between SessionRelay and relay task
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        let scrollback = Arc::new(Mutex::new(SeqnoBuffer::new(SCROLLBACK_CAPACITY)));
+        let scrollback = Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY)));
+        let term_state = Arc::new(Mutex::new(TermState::new(size.rows, size.cols)));
 
-        let task = tokio::spawn(session_read_loop(
+        let task = tokio::spawn(session_diff_loop(
             reader,
             name.to_string(),
             clients.clone(),
             scrollback.clone(),
+            term_state.clone(),
         ));
 
         self.relays.write().await.insert(
@@ -110,6 +115,7 @@ impl ServerApp {
                 program: prog,
                 size,
                 scrollback,
+                term_state,
                 input_mode: InputMode::Open,
                 status: SessionStatus::Running,
             },
@@ -144,10 +150,6 @@ impl ServerApp {
     }
 
     /// Register a client's output channel for a session and return replay data.
-    ///
-    /// Returns an `AttachResult` describing what scrollback to send, plus
-    /// inserts `client_tx` into the session's client map so the relay task
-    /// starts forwarding live output.
     pub async fn attach(
         &self,
         name: &str,
@@ -160,14 +162,20 @@ impl ServerApp {
             name: name.to_string(),
         })?;
 
-        let result = {
-            let buf = relay.scrollback.lock().unwrap();
-            match last_seqno {
-                None => AttachResult::FullSnapshot(buf.snapshot()),
-                Some(seq) => match buf.oldest_seqno() {
+        let result = match last_seqno {
+            None => {
+                let snapshot = relay.term_state.lock().unwrap().snapshot();
+                AttachResult::FullSnapshot(snapshot)
+            }
+            Some(seq) => {
+                let buf = relay.scrollback.lock().unwrap();
+                match buf.oldest_seqno() {
                     Some(oldest) if seq >= oldest => AttachResult::Delta(buf.since(seq)),
-                    _ => AttachResult::SyncReset(buf.snapshot()),
-                },
+                    _ => {
+                        let snapshot = relay.term_state.lock().unwrap().snapshot();
+                        AttachResult::SyncReset(snapshot)
+                    }
+                }
             }
         };
 
@@ -200,7 +208,6 @@ impl ServerApp {
     }
 
     /// Forward user input bytes to a named session's PTY stdin.
-    /// Enforces the session's `InputMode` -- returns `Err(EPERM)` if denied.
     pub async fn write_input(&self, name: &str, client_id: ClientId, data: Vec<u8>) -> Result<()> {
         let relays = self.relays.read().await;
         let relay = relays.get(name).ok_or_else(|| SmuxError::SessionNotFound {
@@ -218,7 +225,7 @@ impl ServerApp {
         relay.writer.write_all(&data).await
     }
 
-    /// Resize a named session's PTY.
+    /// Resize a named session's PTY and its server-side terminal emulator.
     pub async fn resize(&self, name: &str, size: TermSize) -> Result<()> {
         let ws = WindowSize {
             rows: size.rows,
@@ -227,6 +234,11 @@ impl ServerApp {
         self.manager.resize(name, ws).await?;
         if let Some(relay) = self.relays.write().await.get_mut(name) {
             relay.size = size;
+            relay
+                .term_state
+                .lock()
+                .unwrap()
+                .resize(size.rows, size.cols);
         } else {
             warn!(
                 "resize: relay for session '{}' not found after resize",
@@ -262,7 +274,7 @@ impl ServerApp {
                 Ok(InputLockOutcome::Granted)
             }
             InputMode::Locked(holder) if *holder == client_id => {
-                Ok(InputLockOutcome::Granted) // already held -- idempotent
+                Ok(InputLockOutcome::Granted) // idempotent
             }
             InputMode::Locked(holder) => Ok(InputLockOutcome::Denied(*holder)),
             InputMode::Disabled => Ok(InputLockOutcome::Denied(ClientId(0))),
@@ -270,7 +282,6 @@ impl ServerApp {
     }
 
     /// Release the input lock held by `client_id` on `session`.
-    /// Returns `true` if the lock was actually released.
     pub async fn release_input_lock(&self, name: &str, client_id: ClientId) -> Result<bool> {
         let mut relays = self.relays.write().await;
         let relay = relays
@@ -321,10 +332,10 @@ pub enum InputLockOutcome {
 
 /// Result of an attach operation describing what replay data to send.
 pub enum AttachResult {
-    /// Fresh attach or first-time connect: all scrollback bytes concatenated.
-    FullSnapshot(Vec<u8>),
-    /// Delta replay: only chunks with seqno > last_seqno.
-    Delta(Vec<(SequenceNo, Vec<u8>)>),
+    /// Fresh attach or first-time connect: full grid snapshot from TermState.
+    FullSnapshot(GridSnapshot),
+    /// Delta replay: only diffs with seqno > last_seqno.
+    Delta(Vec<(SequenceNo, TerminalDiff)>),
     /// Requested seqno was too old; full snapshot sent, client must reset state.
-    SyncReset(Vec<u8>),
+    SyncReset(GridSnapshot),
 }
