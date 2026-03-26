@@ -335,7 +335,7 @@ pub enum AttachResult {
     /// Fresh attach or first-time connect: full grid snapshot from TermState.
     FullSnapshot(GridSnapshot),
     /// Delta replay: only diffs with seqno > last_seqno.
-    Delta(Vec<(SequenceNo, TerminalDiff)>),
+    Delta(Vec<(SequenceNo, Arc<TerminalDiff>)>),
     /// Requested seqno was too old; full snapshot sent, client must reset state.
     SyncReset(GridSnapshot),
 }

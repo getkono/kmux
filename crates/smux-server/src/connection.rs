@@ -59,8 +59,25 @@ impl ClientState {
 
     async fn handle(&mut self, msg: ClientMessage) {
         if !self.authenticated {
-            if let ClientMessage::Auth { token, .. } = msg {
-                if validate_token(&token, &self.app.auth_token) {
+            if let ClientMessage::Auth {
+                token,
+                protocol_version,
+            } = msg
+            {
+                if protocol_version != smux_protocol::messages::PROTOCOL_VERSION {
+                    self.send(ServerMessage::AuthResult {
+                        success: false,
+                        reason: Some(format!(
+                            "protocol version mismatch: client={protocol_version}, server={}",
+                            smux_protocol::messages::PROTOCOL_VERSION
+                        )),
+                        client_id: None,
+                    });
+                    warn!(
+                        "Protocol version mismatch: client={protocol_version}, server={}",
+                        smux_protocol::messages::PROTOCOL_VERSION
+                    );
+                } else if validate_token(&token, &self.app.auth_token) {
                     let id = self.app.next_client_id();
                     self.client_id = Some(id);
                     self.authenticated = true;
@@ -265,7 +282,7 @@ async fn session_uni_writer(
             for (seqno, diff) in diffs {
                 let msg = ServerMessage::TerminalUpdate {
                     session: session.clone(),
-                    diff,
+                    diff: Arc::unwrap_or_clone(diff),
                     seqno,
                 };
                 if send_frame(&mut uni, &msg).await.is_err() {

@@ -1,7 +1,7 @@
 use alacritty_terminal::{
     event::VoidListener,
     grid::Dimensions,
-    term::{Config, Term, TermMode, cell::Flags},
+    term::{Config, RenderableCursor, Term, TermMode, cell::Flags},
     vte::ansi::{Color, CursorShape as AlacCursorShape, NamedColor, Processor},
 };
 use smux_protocol::messages::{
@@ -36,6 +36,8 @@ pub struct TermState {
     term: Term<VoidListener>,
     processor: Processor,
     prev_cells: Vec<CellState>,
+    /// Reusable scratch buffer — avoids allocation per `compute_diff()` call.
+    current_cells: Vec<CellState>,
     rows: u16,
     cols: u16,
 }
@@ -51,6 +53,7 @@ impl TermState {
             term,
             processor: Processor::new(),
             prev_cells: vec![blank; r * c],
+            current_cells: vec![blank; r * c],
             rows,
             cols,
         }
@@ -69,11 +72,11 @@ impl TermState {
 
         let content = self.term.renderable_content();
         let colors = content.colors;
+        let cursor = content.cursor;
         let display_offset = content.display_offset as i32;
 
-        // Build current frame
-        let blank = CellState::default();
-        let mut current = vec![blank; rows * cols];
+        // Reset scratch buffer and populate from grid
+        self.current_cells.fill(CellState::default());
 
         for indexed in content.display_iter {
             let row = indexed.point.line.0 + display_offset;
@@ -91,7 +94,7 @@ impl TermState {
                         resolve_color(cell.bg, colors),
                     )
                 };
-                current[row as usize * cols + col] = CellState {
+                self.current_cells[row as usize * cols + col] = CellState {
                     c: cell.c,
                     fg,
                     bg,
@@ -106,11 +109,10 @@ impl TermState {
             let base = r * cols;
             let mut c = 0;
             while c < cols {
-                if current[base + c] != self.prev_cells[base + c] {
-                    // Find the end of the changed run
+                if self.current_cells[base + c] != self.prev_cells[base + c] {
                     let start = c;
                     c += 1;
-                    while c < cols && current[base + c] != self.prev_cells[base + c] {
+                    while c < cols && self.current_cells[base + c] != self.prev_cells[base + c] {
                         c += 1;
                     }
                     let run_len = c - start;
@@ -118,13 +120,13 @@ impl TermState {
                         ops.push(DiffOp::Row {
                             row: r as u16,
                             start_col: start as u16,
-                            cells: current[base + start..base + c].to_vec(),
+                            cells: self.current_cells[base + start..base + c].to_vec(),
                         });
                     } else {
                         ops.push(DiffOp::Cell {
                             row: r as u16,
                             col: start as u16,
-                            cell: current[base + start],
+                            cell: self.current_cells[base + start],
                         });
                     }
                 } else {
@@ -133,13 +135,17 @@ impl TermState {
             }
         }
 
-        // Update prev_cells
-        self.prev_cells = current;
+        // Swap buffers: current becomes prev for next frame
+        std::mem::swap(&mut self.prev_cells, &mut self.current_cells);
 
-        let cursor = self.extract_cursor(display_offset);
+        let cursor_state = Self::convert_cursor(&cursor, display_offset);
         let modes = self.extract_modes();
 
-        TerminalDiff { ops, cursor, modes }
+        TerminalDiff {
+            ops,
+            cursor: cursor_state,
+            modes,
+        }
     }
 
     /// Take a full grid snapshot (for initial attach or post-resize).
@@ -149,6 +155,7 @@ impl TermState {
 
         let content = self.term.renderable_content();
         let colors = content.colors;
+        let cursor = content.cursor;
         let display_offset = content.display_offset as i32;
 
         let blank = CellState::default();
@@ -179,14 +186,14 @@ impl TermState {
             }
         }
 
-        let cursor = self.extract_cursor(display_offset);
+        let cursor_state = Self::convert_cursor(&cursor, display_offset);
         let modes = self.extract_modes();
 
         GridSnapshot {
             rows: self.rows,
             cols: self.cols,
             cells,
-            cursor,
+            cursor: cursor_state,
             modes,
         }
     }
@@ -199,12 +206,12 @@ impl TermState {
             rows: rows as usize,
             cols: cols as usize,
         });
-        self.prev_cells = vec![CellState::default(); rows as usize * cols as usize];
+        let n = rows as usize * cols as usize;
+        self.prev_cells = vec![CellState::default(); n];
+        self.current_cells = vec![CellState::default(); n];
     }
 
-    fn extract_cursor(&self, display_offset: i32) -> CursorState {
-        let content = self.term.renderable_content();
-        let cursor = content.cursor;
+    fn convert_cursor(cursor: &RenderableCursor, display_offset: i32) -> CursorState {
         let row = cursor.point.line.0 + display_offset;
         CursorState {
             row: row.max(0) as u16,

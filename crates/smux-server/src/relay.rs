@@ -31,25 +31,28 @@ pub async fn session_diff_loop(
                 let chunk = &buf[..n];
 
                 // Feed bytes into the server-side VTE emulator and compute diff
-                let (diff, seqno) = {
+                let diff = {
                     let mut ts = term_state.lock().unwrap();
                     ts.feed(chunk);
-                    let diff = ts.compute_diff();
-                    let seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
-                    (diff, seqno)
+                    ts.compute_diff()
                 };
 
-                // Skip empty diffs (no visible changes)
+                // Skip empty diffs (no visible changes).
+                // Seqno is assigned *after* this check so empty diffs don't
+                // create gaps in the sequence stream.
                 if diff.ops.is_empty() {
                     continue;
                 }
 
-                // Store in scrollback before delivering
-                scrollback.lock().unwrap().push(seqno, diff.clone());
+                let seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
+
+                // Wrap in Arc to avoid deep-cloning for scrollback storage
+                let diff = Arc::new(diff);
+                scrollback.lock().unwrap().push(seqno, Arc::clone(&diff));
 
                 let msg = ServerMessage::TerminalUpdate {
                     session: session.clone(),
-                    diff,
+                    diff: Arc::unwrap_or_clone(diff),
                     seqno,
                 };
 

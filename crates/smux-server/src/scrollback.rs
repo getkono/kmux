@@ -1,4 +1,5 @@
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 use smux_protocol::messages::{SequenceNo, TerminalDiff};
 
@@ -8,7 +9,7 @@ use smux_protocol::messages::{SequenceNo, TerminalDiff};
 /// evicted from the front. The live `TermState` surface is the authoritative
 /// snapshot — no keyframes are stored here.
 pub struct DiffBuffer {
-    diffs: VecDeque<(SequenceNo, TerminalDiff)>,
+    diffs: VecDeque<(SequenceNo, Arc<TerminalDiff>)>,
     total_estimated_size: usize,
     capacity: usize,
 }
@@ -23,7 +24,7 @@ impl DiffBuffer {
     }
 
     /// Append a diff tagged with `seqno`, evicting oldest entries as needed.
-    pub fn push(&mut self, seqno: SequenceNo, diff: TerminalDiff) {
+    pub fn push(&mut self, seqno: SequenceNo, diff: Arc<TerminalDiff>) {
         let size = estimate_diff_size(&diff);
 
         while self.total_estimated_size + size >= self.capacity {
@@ -39,7 +40,7 @@ impl DiffBuffer {
     }
 
     /// Return all diffs with `seqno > after` in order.
-    pub fn since(&self, after: SequenceNo) -> Vec<(SequenceNo, TerminalDiff)> {
+    pub fn since(&self, after: SequenceNo) -> Vec<(SequenceNo, Arc<TerminalDiff>)> {
         self.diffs
             .iter()
             .filter(|(seq, _)| *seq > after)
@@ -83,8 +84,8 @@ mod tests {
         SequenceNo(n)
     }
 
-    fn make_diff(n_cells: usize) -> TerminalDiff {
-        TerminalDiff {
+    fn make_diff(n_cells: usize) -> Arc<TerminalDiff> {
+        Arc::new(TerminalDiff {
             ops: (0..n_cells)
                 .map(|i| DiffOp::Cell {
                     row: 0,
@@ -94,7 +95,7 @@ mod tests {
                 .collect(),
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
-        }
+        })
     }
 
     #[test]
