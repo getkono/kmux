@@ -3,8 +3,11 @@ use std::sync::Arc;
 
 use smux_protocol::messages::{ClientMessage, ServerMessage};
 use smux_protocol::{decode_server, encode_client, read_frame, write_frame};
-use tokio::sync::mpsc;
+use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, warn};
+
+/// Maximum number of concurrent server-initiated uni streams (one per attached session).
+const MAX_UNI_STREAMS: usize = 64;
 
 /// Outcome of a connection attempt.
 pub enum ConnectResult {
@@ -111,14 +114,21 @@ pub async fn connect(
         debug!("Control reader task exited");
     });
 
-    // Uni stream acceptor: accept server-initiated uni streams (per-session diffs)
+    // Uni stream acceptor: accept server-initiated uni streams (per-session diffs).
+    // A semaphore limits concurrent stream handlers to prevent unbounded task growth.
     let uni_server_tx = server_tx;
+    let sem = Arc::new(Semaphore::new(MAX_UNI_STREAMS));
     tokio::spawn(async move {
         loop {
             match conn.accept_uni().await {
                 Ok(mut uni) => {
                     let tx = uni_server_tx.clone();
+                    let permit = match Arc::clone(&sem).acquire_owned().await {
+                        Ok(p) => p,
+                        Err(_) => break, // semaphore closed
+                    };
                     tokio::spawn(async move {
+                        let _permit = permit; // held until task exits
                         loop {
                             match read_frame(&mut uni).await {
                                 Ok(Some(frame)) => match decode_server(&frame) {
