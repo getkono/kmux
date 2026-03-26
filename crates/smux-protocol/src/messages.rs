@@ -1,7 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 /// Current wire protocol version. Increment when breaking changes are made.
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 pub type SessionId = String;
 pub type RequestId = u64;
@@ -97,6 +97,144 @@ pub enum ErrorCode {
     InternalError,
     InputLocked,
     InputDisabled,
+}
+
+// ── VT diff types ─────────────────────────────────────────────────────────────
+
+/// Portable cell color — resolved to RGB on the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl CellColor {
+    pub const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+}
+
+/// Packed attribute bitfield.
+///
+/// Bit layout: bold=0, italic=1, underline=2, strikethrough=3,
+/// inverse=4, hidden=5, dim=6, blink=7.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellAttrs(pub u16);
+
+impl CellAttrs {
+    pub const EMPTY: Self = Self(0);
+    pub const BOLD: u16 = 1 << 0;
+    pub const ITALIC: u16 = 1 << 1;
+    pub const UNDERLINE: u16 = 1 << 2;
+    pub const STRIKETHROUGH: u16 = 1 << 3;
+    pub const INVERSE: u16 = 1 << 4;
+    pub const HIDDEN: u16 = 1 << 5;
+    pub const DIM: u16 = 1 << 6;
+    pub const BLINK: u16 = 1 << 7;
+
+    pub fn contains(self, flag: u16) -> bool {
+        self.0 & flag != 0
+    }
+}
+
+/// State of a single terminal cell — character + colors + attributes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CellState {
+    pub c: char,
+    pub fg: CellColor,
+    pub bg: CellColor,
+    pub attrs: CellAttrs,
+}
+
+impl Default for CellState {
+    fn default() -> Self {
+        Self {
+            c: ' ',
+            fg: CellColor::new(0xab, 0xb2, 0xbf), // One Dark foreground
+            bg: CellColor::new(0x28, 0x2c, 0x34), // One Dark background
+            attrs: CellAttrs::EMPTY,
+        }
+    }
+}
+
+/// Cursor shape in the terminal.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CursorShape {
+    Block,
+    Underline,
+    Bar,
+    HollowBlock,
+    Hidden,
+}
+
+/// Cursor position and appearance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CursorState {
+    pub row: u16,
+    pub col: u16,
+    pub shape: CursorShape,
+    pub visible: bool,
+}
+
+impl Default for CursorState {
+    fn default() -> Self {
+        Self {
+            row: 0,
+            col: 0,
+            shape: CursorShape::Block,
+            visible: true,
+        }
+    }
+}
+
+/// Terminal mode flags sent alongside diffs.
+///
+/// Bit 0: APP_CURSOR (application cursor keys mode).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TermModes(pub u16);
+
+impl TermModes {
+    pub const EMPTY: Self = Self(0);
+    pub const APP_CURSOR: u16 = 1 << 0;
+
+    pub fn app_cursor(self) -> bool {
+        self.0 & Self::APP_CURSOR != 0
+    }
+}
+
+/// A single diff operation describing changed cells.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum DiffOp {
+    /// A single cell changed.
+    Cell { row: u16, col: u16, cell: CellState },
+    /// A contiguous run of cells changed on the same row.
+    Row {
+        row: u16,
+        start_col: u16,
+        cells: Vec<CellState>,
+    },
+    /// The entire screen was cleared.
+    Clear,
+}
+
+/// A set of cell changes + cursor/mode state for one frame.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TerminalDiff {
+    pub ops: Vec<DiffOp>,
+    pub cursor: CursorState,
+    pub modes: TermModes,
+}
+
+/// Full grid snapshot — sent on attach or after resize.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GridSnapshot {
+    pub rows: u16,
+    pub cols: u16,
+    /// Row-major cell data (length = rows * cols).
+    pub cells: Vec<CellState>,
+    pub cursor: CursorState,
+    pub modes: TermModes,
 }
 
 /// Messages sent from client → server.
@@ -230,6 +368,20 @@ pub enum ServerMessage {
 
     /// Response to client `Ping`.
     Pong { seq: u64 },
+
+    /// Server-side VT diff for an attached session.
+    TerminalUpdate {
+        session: SessionId,
+        diff: TerminalDiff,
+        seqno: SequenceNo,
+    },
+
+    /// Full grid snapshot for an attached session (sent on attach/resize).
+    TerminalSnapshot {
+        session: SessionId,
+        snapshot: GridSnapshot,
+        seqno: SequenceNo,
+    },
 
     /// Input lock granted to the requesting client.
     InputLockGranted { session: SessionId },

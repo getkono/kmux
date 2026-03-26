@@ -53,7 +53,11 @@ fn build_tls_config_from(
     Ok(config)
 }
 
-/// Wrap a `ServerConfig` in a `TlsAcceptor`.
-pub fn make_acceptor(config: ServerConfig) -> tokio_rustls::TlsAcceptor {
-    tokio_rustls::TlsAcceptor::from(Arc::new(config))
+/// Build a `quinn::ServerConfig` from a rustls `ServerConfig`.
+pub fn build_quinn_config(tls_config: ServerConfig) -> Result<quinn::ServerConfig> {
+    let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+        quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
+            .context("build QUIC server config from rustls config")?,
+    ));
+    Ok(server_config)
 }

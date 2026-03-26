@@ -1,13 +1,10 @@
-use alacritty_terminal::{
-    event::VoidListener,
-    grid::Dimensions,
-    term::{Config, RenderableCursor, Term, TermMode, cell::Flags, color::Colors},
-    vte::ansi::{Color, CursorShape, NamedColor, Processor},
-};
 use iced::{
     Color as IcedColor, Element, Font, Length, Pixels, Point as IcedPoint, Rectangle, Size,
     alignment, mouse,
     widget::canvas::{self, Canvas, Text},
+};
+use smux_protocol::messages::{
+    CellAttrs, CellState, CursorShape, CursorState, DiffOp, GridSnapshot, TermModes, TerminalDiff,
 };
 
 use crate::app::Message;
@@ -16,88 +13,102 @@ const CELL_WIDTH: f32 = 8.0;
 const CELL_HEIGHT: f32 = 16.0;
 const FONT_SIZE: f32 = 13.0;
 
-/// Grid dimensions wrapper implementing the alacritty `Dimensions` trait.
-struct TermDims {
-    rows: usize,
-    cols: usize,
-}
-
-impl Dimensions for TermDims {
-    fn total_lines(&self) -> usize {
-        self.rows
-    }
-
-    fn screen_lines(&self) -> usize {
-        self.rows
-    }
-
-    fn columns(&self) -> usize {
-        self.cols
-    }
-}
-
-/// Terminal state backed by `alacritty_terminal::Term`.
+/// Client-side grid state — receives pre-resolved cells from the server.
 ///
-/// All raw PTY bytes are fed through the VTE `Processor` which handles the
-/// full ANSI/VT escape sequence grammar and updates the grid in place.
-pub struct TerminalBuffer {
-    term: Term<VoidListener>,
-    processor: Processor,
+/// Unlike the old `TerminalBuffer` that wrapped `alacritty_terminal::Term`,
+/// this is a thin grid of `CellState` values. All VT parsing and color
+/// resolution happens on the server.
+pub struct CellGrid {
+    cells: Vec<CellState>,
+    cursor: CursorState,
+    modes: TermModes,
     pub rows: usize,
     pub cols: usize,
     generation: u64,
 }
 
-impl TerminalBuffer {
-    pub fn new(rows: u16, cols: u16) -> Self {
-        let rows = rows as usize;
-        let cols = cols as usize;
-        let dims = TermDims { rows, cols };
-        let term = Term::new(Config::default(), &dims, VoidListener);
+impl CellGrid {
+    pub fn new(rows: usize, cols: usize) -> Self {
         Self {
-            term,
-            processor: Processor::new(),
+            cells: vec![CellState::default(); rows * cols],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
             rows,
             cols,
             generation: 0,
         }
     }
 
-    /// Feed raw PTY bytes into the VTE parser → grid state is updated in place.
-    pub fn push_bytes(&mut self, data: &[u8]) {
-        self.processor.advance(&mut self.term, data);
+    /// Replace the entire grid from a server snapshot.
+    pub fn apply_snapshot(&mut self, snapshot: GridSnapshot) {
+        self.rows = snapshot.rows as usize;
+        self.cols = snapshot.cols as usize;
+        self.cells = snapshot.cells;
+        self.cursor = snapshot.cursor;
+        self.modes = snapshot.modes;
         self.generation += 1;
     }
 
-    /// Reset to a fresh terminal of the same dimensions.
-    pub fn clear(&mut self) {
-        let next_generation = self.generation + 1;
-        *self = Self::new(self.rows as u16, self.cols as u16);
-        self.generation = next_generation;
+    /// Apply a diff from the server — only changed cells are updated.
+    pub fn apply_diff(&mut self, diff: TerminalDiff) {
+        for op in diff.ops {
+            match op {
+                DiffOp::Cell { row, col, cell } => {
+                    let idx = row as usize * self.cols + col as usize;
+                    if idx < self.cells.len() {
+                        self.cells[idx] = cell;
+                    }
+                }
+                DiffOp::Row {
+                    row,
+                    start_col,
+                    cells,
+                } => {
+                    let base = row as usize * self.cols + start_col as usize;
+                    for (i, cell) in cells.into_iter().enumerate() {
+                        let idx = base + i;
+                        if idx < self.cells.len() {
+                            self.cells[idx] = cell;
+                        }
+                    }
+                }
+                DiffOp::Clear => {
+                    self.cells.fill(CellState::default());
+                }
+            }
+        }
+        self.cursor = diff.cursor;
+        self.modes = diff.modes;
+        self.generation += 1;
     }
 
-    /// Resize the terminal grid (called when the canvas widget size changes).
+    /// Whether the terminal is in application-cursor mode.
+    pub fn app_cursor(&self) -> bool {
+        self.modes.app_cursor()
+    }
+
+    /// Reset to blank cells.
+    pub fn clear(&mut self) {
+        self.cells.fill(CellState::default());
+        self.cursor = CursorState::default();
+        self.modes = TermModes::EMPTY;
+        self.generation += 1;
+    }
+
+    /// Resize the grid (server will send a fresh snapshot after resize).
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.rows = rows as usize;
         self.cols = cols as usize;
-        self.term.resize(TermDims {
-            rows: self.rows,
-            cols: self.cols,
-        });
+        self.cells = vec![CellState::default(); self.rows * self.cols];
         self.generation += 1;
     }
 
     pub fn generation(&self) -> u64 {
         self.generation
     }
-
-    /// Whether the terminal is in application-cursor mode (vim arrow keys).
-    pub fn app_cursor(&self) -> bool {
-        self.term.mode().contains(TermMode::APP_CURSOR)
-    }
 }
 
-impl Default for TerminalBuffer {
+impl Default for CellGrid {
     fn default() -> Self {
         Self::new(24, 80)
     }
@@ -105,84 +116,28 @@ impl Default for TerminalBuffer {
 
 // ── Canvas rendering ──────────────────────────────────────────────────────────
 
-/// Per-cell snapshot for rendering — fully owned, no lifetime ties to `Term`.
-struct SnapshotCell {
-    c: char,
-    fg: IcedColor,
-    bg: IcedColor,
-    hidden: bool,
-}
-
-/// Snapshot of terminal grid state used as the canvas `Program`.
-///
-/// Created from `&TerminalBuffer` on every frame by copying cell data.
-/// This keeps the iced widget tree free of lifetime complications.
-pub struct TerminalSnapshot {
-    cells: Vec<SnapshotCell>,
-    cursor: RenderableCursor,
-    display_offset: i32,
+/// Snapshot of the CellGrid used as the canvas `Program`.
+pub struct GridSnapshot2 {
+    cells: Vec<CellState>,
+    cursor: CursorState,
     rows: usize,
     cols: usize,
     generation: u64,
 }
 
-impl TerminalSnapshot {
-    fn from_buffer(buf: &TerminalBuffer) -> Self {
-        let content = buf.term.renderable_content();
-        let colors = content.colors;
-        let cursor = content.cursor;
-        let display_offset = content.display_offset as i32;
-        let rows = buf.rows;
-        let cols = buf.cols;
-
-        let mut cells: Vec<SnapshotCell> = (0..rows * cols)
-            .map(|_| SnapshotCell {
-                c: ' ',
-                fg: default_fg(),
-                bg: default_bg(),
-                hidden: false,
-            })
-            .collect();
-
-        for indexed in content.display_iter {
-            // Map the grid line (can be negative for scrollback) to a screen row.
-            let row = indexed.point.line.0 + display_offset;
-            let col = indexed.point.column.0;
-            if row >= 0 && (row as usize) < rows && col < cols {
-                let cell = indexed.cell;
-                let (fg, bg) = if cell.flags.contains(Flags::INVERSE) {
-                    (
-                        resolve_color(cell.bg, colors),
-                        resolve_color(cell.fg, colors),
-                    )
-                } else {
-                    (
-                        resolve_color(cell.fg, colors),
-                        resolve_color(cell.bg, colors),
-                    )
-                };
-                cells[row as usize * cols + col] = SnapshotCell {
-                    c: cell.c,
-                    fg,
-                    bg,
-                    hidden: cell.flags.contains(Flags::HIDDEN),
-                };
-            }
-        }
-
+impl GridSnapshot2 {
+    fn from_grid(grid: &CellGrid) -> Self {
         Self {
-            cells,
-            cursor,
-            display_offset,
-            rows,
-            cols,
-            generation: buf.generation(),
+            cells: grid.cells.clone(),
+            cursor: grid.cursor,
+            rows: grid.rows,
+            cols: grid.cols,
+            generation: grid.generation(),
         }
     }
 }
 
-/// State preserved across canvas redraws — used to detect grid-size changes
-/// and cache rendered geometry between frames.
+/// State preserved across canvas redraws.
 pub struct CanvasState {
     rows: u16,
     cols: u16,
@@ -201,13 +156,17 @@ impl Default for CanvasState {
     }
 }
 
-impl canvas::Program<Message> for TerminalSnapshot {
+fn cell_color_to_iced(c: smux_protocol::messages::CellColor) -> IcedColor {
+    IcedColor::from_rgb8(c.r, c.g, c.b)
+}
+
+fn default_bg() -> IcedColor {
+    IcedColor::from_rgb8(0x28, 0x2c, 0x34)
+}
+
+impl canvas::Program<Message> for GridSnapshot2 {
     type State = CanvasState;
 
-    /// Detect resize: compare canvas `bounds` to stored dims on every event.
-    ///
-    /// When the bounds change we emit `Message::TerminalResized` so `app.rs`
-    /// can update the `Term` grid and tell the server the new PTY size.
     fn update(
         &self,
         state: &mut CanvasState,
@@ -240,7 +199,6 @@ impl canvas::Program<Message> for TerminalSnapshot {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        // Invalidate cached geometry when terminal content has changed.
         if self.generation != state.last_generation.get() {
             state.last_generation.set(self.generation);
             state.cache.clear();
@@ -250,30 +208,26 @@ impl canvas::Program<Message> for TerminalSnapshot {
         let cols = self.cols;
         let rows = self.rows;
         let cursor = &self.cursor;
-        let display_offset = self.display_offset;
 
         let geom = state.cache.draw(renderer, bounds.size(), |frame| {
-            // Fill background first to avoid transparent gaps.
             frame.fill_rectangle(IcedPoint::ORIGIN, bounds.size(), default_bg());
 
-            // Draw each cell: background rectangle + character glyph.
             for (idx, cell) in cells.iter().enumerate() {
                 let row = idx / cols;
                 let col = idx % cols;
                 let x = col as f32 * CELL_WIDTH;
                 let y = row as f32 * CELL_HEIGHT;
 
-                frame.fill_rectangle(
-                    IcedPoint::new(x, y),
-                    Size::new(CELL_WIDTH, CELL_HEIGHT),
-                    cell.bg,
-                );
+                let bg = cell_color_to_iced(cell.bg);
+                frame.fill_rectangle(IcedPoint::new(x, y), Size::new(CELL_WIDTH, CELL_HEIGHT), bg);
 
-                if !cell.hidden && cell.c != ' ' {
+                let hidden = cell.attrs.contains(CellAttrs::HIDDEN);
+                if !hidden && cell.c != ' ' {
+                    let fg = cell_color_to_iced(cell.fg);
                     frame.fill_text(Text {
                         content: cell.c.to_string(),
                         position: IcedPoint::new(x, y),
-                        color: cell.fg,
+                        color: fg,
                         size: Pixels(FONT_SIZE),
                         line_height: iced::widget::text::LineHeight::Absolute(Pixels(CELL_HEIGHT)),
                         font: Font::MONOSPACE,
@@ -284,22 +238,17 @@ impl canvas::Program<Message> for TerminalSnapshot {
                 }
             }
 
-            // Draw cursor on top.
-            if cursor.shape != CursorShape::Hidden {
-                let cur_row = cursor.point.line.0 + display_offset;
-                let cur_col = cursor.point.column.0 as i32;
-                if cur_row >= 0
-                    && (cur_row as usize) < rows
-                    && cur_col >= 0
-                    && (cur_col as usize) < cols
-                {
+            // Draw cursor
+            if cursor.visible && cursor.shape != CursorShape::Hidden {
+                let cur_row = cursor.row as usize;
+                let cur_col = cursor.col as usize;
+                if cur_row < rows && cur_col < cols {
                     let x = cur_col as f32 * CELL_WIDTH;
                     let y = cur_row as f32 * CELL_HEIGHT;
-                    let idx = cur_row as usize * cols + cur_col as usize;
+                    let idx = cur_row * cols + cur_col;
 
                     match cursor.shape {
                         CursorShape::Block => {
-                            // Semi-transparent block so the character remains legible.
                             frame.fill_rectangle(
                                 IcedPoint::new(x, y),
                                 Size::new(CELL_WIDTH, CELL_HEIGHT),
@@ -310,9 +259,8 @@ impl canvas::Program<Message> for TerminalSnapshot {
                                     a: 0.7,
                                 },
                             );
-                            // Re-draw character with inverted foreground color.
                             if let Some(cell) = cells.get(idx)
-                                && !cell.hidden
+                                && !cell.attrs.contains(CellAttrs::HIDDEN)
                                 && cell.c != ' '
                             {
                                 frame.fill_text(Text {
@@ -337,14 +285,13 @@ impl canvas::Program<Message> for TerminalSnapshot {
                                 IcedColor::WHITE,
                             );
                         }
-                        CursorShape::Beam => {
+                        CursorShape::Bar => {
                             frame.fill_rectangle(
                                 IcedPoint::new(x, y),
                                 Size::new(2.0, CELL_HEIGHT),
                                 IcedColor::WHITE,
                             );
                         }
-                        // Hollow block: draw a thin border instead of a filled rectangle.
                         CursorShape::HollowBlock => {
                             for (ox, oy, w, h) in [
                                 (0.0, 0.0, CELL_WIDTH, 1.0),
@@ -369,157 +316,136 @@ impl canvas::Program<Message> for TerminalSnapshot {
     }
 }
 
-/// Render the terminal buffer as a fill-parent canvas widget.
-pub fn view<'a>(buffer: &'a TerminalBuffer, _session: &'a str) -> Element<'a, Message> {
-    let snapshot = TerminalSnapshot::from_buffer(buffer);
+/// Render the cell grid as a fill-parent canvas widget.
+pub fn view<'a>(grid: &'a CellGrid, _session: &'a str) -> Element<'a, Message> {
+    let snapshot = GridSnapshot2::from_grid(grid);
     Canvas::new(snapshot)
         .width(Length::Fill)
         .height(Length::Fill)
         .into()
 }
 
-// ── Color resolution ──────────────────────────────────────────────────────────
-
-fn resolve_color(color: Color, colors: &Colors) -> IcedColor {
-    match color {
-        Color::Named(name) => colors[name].map_or_else(
-            || default_named_color(name),
-            |rgb| IcedColor::from_rgb8(rgb.r, rgb.g, rgb.b),
-        ),
-        Color::Indexed(idx) => colors[idx as usize].map_or_else(
-            || ansi_indexed_color(idx),
-            |rgb| IcedColor::from_rgb8(rgb.r, rgb.g, rgb.b),
-        ),
-        Color::Spec(rgb) => IcedColor::from_rgb8(rgb.r, rgb.g, rgb.b),
-    }
-}
-
-fn default_fg() -> IcedColor {
-    IcedColor::from_rgb8(0xab, 0xb2, 0xbf)
-}
-
-fn default_bg() -> IcedColor {
-    IcedColor::from_rgb8(0x28, 0x2c, 0x34)
-}
-
-/// Dark terminal theme fallback colors (One Dark palette).
-fn default_named_color(name: NamedColor) -> IcedColor {
-    match name {
-        NamedColor::Black => IcedColor::from_rgb8(0x28, 0x2c, 0x34),
-        NamedColor::Red => IcedColor::from_rgb8(0xe0, 0x6c, 0x75),
-        NamedColor::Green => IcedColor::from_rgb8(0x98, 0xc3, 0x79),
-        NamedColor::Yellow => IcedColor::from_rgb8(0xe5, 0xc0, 0x7b),
-        NamedColor::Blue => IcedColor::from_rgb8(0x61, 0xaf, 0xef),
-        NamedColor::Magenta => IcedColor::from_rgb8(0xc6, 0x78, 0xdd),
-        NamedColor::Cyan => IcedColor::from_rgb8(0x56, 0xb6, 0xc2),
-        NamedColor::White => IcedColor::from_rgb8(0xab, 0xb2, 0xbf),
-        NamedColor::BrightBlack => IcedColor::from_rgb8(0x5c, 0x63, 0x70),
-        NamedColor::BrightRed => IcedColor::from_rgb8(0xe0, 0x6c, 0x75),
-        NamedColor::BrightGreen => IcedColor::from_rgb8(0x98, 0xc3, 0x79),
-        NamedColor::BrightYellow => IcedColor::from_rgb8(0xe5, 0xc0, 0x7b),
-        NamedColor::BrightBlue => IcedColor::from_rgb8(0x61, 0xaf, 0xef),
-        NamedColor::BrightMagenta => IcedColor::from_rgb8(0xc6, 0x78, 0xdd),
-        NamedColor::BrightCyan => IcedColor::from_rgb8(0x56, 0xb6, 0xc2),
-        NamedColor::BrightWhite => IcedColor::from_rgb8(0xff, 0xff, 0xff),
-        NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::DimForeground => {
-            default_fg()
-        }
-        NamedColor::Background => default_bg(),
-        NamedColor::Cursor => IcedColor::from_rgb8(0x52, 0x8b, 0xff),
-        NamedColor::DimBlack => IcedColor::from_rgb8(0x1e, 0x21, 0x27),
-        NamedColor::DimRed => IcedColor::from_rgb8(0xa8, 0x51, 0x58),
-        NamedColor::DimGreen => IcedColor::from_rgb8(0x72, 0x94, 0x5a),
-        NamedColor::DimYellow => IcedColor::from_rgb8(0xac, 0x90, 0x5c),
-        NamedColor::DimBlue => IcedColor::from_rgb8(0x49, 0x83, 0xb3),
-        NamedColor::DimMagenta => IcedColor::from_rgb8(0x95, 0x5a, 0xa5),
-        NamedColor::DimCyan => IcedColor::from_rgb8(0x40, 0x89, 0x91),
-        NamedColor::DimWhite => IcedColor::from_rgb8(0x80, 0x87, 0x8f),
-    }
-}
-
-/// Compute a color from the standard 256-color palette when the terminal
-/// hasn't overridden it in `Colors`.
-fn ansi_indexed_color(idx: u8) -> IcedColor {
-    match idx {
-        // Indices 0–15: map to named ANSI colors.
-        0..=15 => {
-            let name = match idx {
-                0 => NamedColor::Black,
-                1 => NamedColor::Red,
-                2 => NamedColor::Green,
-                3 => NamedColor::Yellow,
-                4 => NamedColor::Blue,
-                5 => NamedColor::Magenta,
-                6 => NamedColor::Cyan,
-                7 => NamedColor::White,
-                8 => NamedColor::BrightBlack,
-                9 => NamedColor::BrightRed,
-                10 => NamedColor::BrightGreen,
-                11 => NamedColor::BrightYellow,
-                12 => NamedColor::BrightBlue,
-                13 => NamedColor::BrightMagenta,
-                14 => NamedColor::BrightCyan,
-                15 => NamedColor::BrightWhite,
-                _ => unreachable!(),
-            };
-            default_named_color(name)
-        }
-        // Indices 16–231: 6×6×6 RGB color cube.
-        16..=231 => {
-            let i = idx - 16;
-            let r = (i / 36) % 6;
-            let g = (i / 6) % 6;
-            let b = i % 6;
-            let to_byte = |v: u8| if v == 0 { 0 } else { v * 40 + 55 };
-            IcedColor::from_rgb8(to_byte(r), to_byte(g), to_byte(b))
-        }
-        // Indices 232–255: 24-step grayscale ramp.
-        232..=255 => {
-            let v = (idx - 232) * 10 + 8;
-            IcedColor::from_rgb8(v, v, v)
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use alacritty_terminal::index::{Column, Line};
-
     use super::*;
+    use smux_protocol::messages::{CellColor, GridSnapshot};
 
     #[test]
-    fn push_bytes_renders_plain_text() {
-        let mut buf = TerminalBuffer::new(24, 80);
-        buf.push_bytes(b"hello");
-        let grid = buf.term.grid();
-        assert_eq!(grid[Line(0)][Column(0)].c, 'h');
-        assert_eq!(grid[Line(0)][Column(1)].c, 'e');
-        assert_eq!(grid[Line(0)][Column(2)].c, 'l');
+    fn apply_snapshot_sets_all_cells() {
+        let mut grid = CellGrid::default();
+        let cell_a = CellState {
+            c: 'A',
+            fg: CellColor::new(255, 0, 0),
+            bg: CellColor::new(0, 0, 0),
+            attrs: CellAttrs::EMPTY,
+        };
+        let snapshot = GridSnapshot {
+            rows: 2,
+            cols: 3,
+            cells: vec![cell_a; 6],
+            cursor: CursorState {
+                row: 1,
+                col: 2,
+                shape: CursorShape::Block,
+                visible: true,
+            },
+            modes: TermModes::EMPTY,
+        };
+        grid.apply_snapshot(snapshot);
+        assert_eq!(grid.rows, 2);
+        assert_eq!(grid.cols, 3);
+        assert_eq!(grid.cells.len(), 6);
+        assert_eq!(grid.cells[0].c, 'A');
+        assert_eq!(grid.cursor.row, 1);
+        assert_eq!(grid.cursor.col, 2);
     }
 
     #[test]
-    fn push_bytes_handles_color_escape() {
-        let mut buf = TerminalBuffer::new(24, 80);
-        buf.push_bytes(b"\x1b[31mred");
-        let cell = &buf.term.grid()[Line(0)][Column(0)];
-        assert_eq!(cell.c, 'r');
-        assert_eq!(cell.fg, Color::Named(NamedColor::Red));
+    fn apply_diff_cell_op() {
+        let mut grid = CellGrid::new(2, 3);
+        let cell_x = CellState {
+            c: 'X',
+            fg: CellColor::new(255, 255, 255),
+            bg: CellColor::new(0, 0, 0),
+            attrs: CellAttrs::EMPTY,
+        };
+        let diff = TerminalDiff {
+            ops: vec![DiffOp::Cell {
+                row: 0,
+                col: 1,
+                cell: cell_x,
+            }],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+        };
+        grid.apply_diff(diff);
+        assert_eq!(grid.cells[1].c, 'X');
+        assert_eq!(grid.cells[0].c, ' '); // unchanged
     }
 
     #[test]
-    fn clear_resets_terminal() {
-        let mut buf = TerminalBuffer::new(24, 80);
-        buf.push_bytes(b"hello");
-        buf.clear();
-        let cell = &buf.term.grid()[Line(0)][Column(0)];
-        assert_eq!(cell.c, ' ');
+    fn apply_diff_row_op() {
+        let mut grid = CellGrid::new(2, 5);
+        let cells = vec![
+            CellState {
+                c: 'H',
+                ..CellState::default()
+            },
+            CellState {
+                c: 'I',
+                ..CellState::default()
+            },
+        ];
+        let diff = TerminalDiff {
+            ops: vec![DiffOp::Row {
+                row: 1,
+                start_col: 2,
+                cells,
+            }],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+        };
+        grid.apply_diff(diff);
+        assert_eq!(grid.cells[1 * 5 + 2].c, 'H');
+        assert_eq!(grid.cells[1 * 5 + 3].c, 'I');
     }
 
     #[test]
-    fn resize_updates_dimensions() {
-        let mut buf = TerminalBuffer::new(24, 80);
-        buf.resize(40, 120);
-        assert_eq!(buf.rows, 40);
-        assert_eq!(buf.cols, 120);
+    fn apply_diff_clear_op() {
+        let mut grid = CellGrid::new(2, 3);
+        grid.cells[0].c = 'Z';
+        let diff = TerminalDiff {
+            ops: vec![DiffOp::Clear],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+        };
+        grid.apply_diff(diff);
+        assert_eq!(grid.cells[0].c, ' ');
+    }
+
+    #[test]
+    fn generation_increments() {
+        let mut grid = CellGrid::new(2, 3);
+        let g0 = grid.generation();
+        grid.apply_diff(TerminalDiff {
+            ops: vec![],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+        });
+        assert_eq!(grid.generation(), g0 + 1);
+        grid.clear();
+        assert_eq!(grid.generation(), g0 + 2);
+    }
+
+    #[test]
+    fn app_cursor_reflects_modes() {
+        let mut grid = CellGrid::new(2, 3);
+        assert!(!grid.app_cursor());
+        grid.apply_diff(TerminalDiff {
+            ops: vec![],
+            cursor: CursorState::default(),
+            modes: TermModes(TermModes::APP_CURSOR),
+        });
+        assert!(grid.app_cursor());
     }
 }
