@@ -7,7 +7,7 @@ use alacritty_terminal::{
 use iced::{
     Color as IcedColor, Element, Font, Length, Pixels, Point as IcedPoint, Rectangle, Size,
     alignment, mouse,
-    widget::canvas::{self, Canvas, Frame, Text},
+    widget::canvas::{self, Canvas, Text},
 };
 
 use crate::app::Message;
@@ -45,6 +45,7 @@ pub struct TerminalBuffer {
     processor: Processor,
     pub rows: usize,
     pub cols: usize,
+    generation: u64,
 }
 
 impl TerminalBuffer {
@@ -58,17 +59,21 @@ impl TerminalBuffer {
             processor: Processor::new(),
             rows,
             cols,
+            generation: 0,
         }
     }
 
     /// Feed raw PTY bytes into the VTE parser -> grid state is updated in place.
     pub fn push_bytes(&mut self, data: &[u8]) {
         self.processor.advance(&mut self.term, data);
+        self.generation += 1;
     }
 
     /// Reset to a fresh terminal of the same dimensions.
     pub fn clear(&mut self) {
+        let next_generation = self.generation + 1;
         *self = Self::new(self.rows as u16, self.cols as u16);
+        self.generation = next_generation;
     }
 
     /// Resize the terminal grid (called when the canvas widget size changes).
@@ -79,6 +84,11 @@ impl TerminalBuffer {
             rows: self.rows,
             cols: self.cols,
         });
+        self.generation += 1;
+    }
+
+    pub fn generation(&self) -> u64 {
+        self.generation
     }
 
     /// Whether the terminal is in application-cursor mode (vim arrow keys).
@@ -113,6 +123,7 @@ pub struct TerminalSnapshot {
     display_offset: i32,
     rows: usize,
     cols: usize,
+    generation: u64,
 }
 
 impl TerminalSnapshot {
@@ -165,15 +176,29 @@ impl TerminalSnapshot {
             display_offset,
             rows,
             cols,
+            generation: buf.generation(),
         }
     }
 }
 
-/// State preserved across canvas redraws -- used to detect grid-size changes.
-#[derive(Default)]
+/// State preserved across canvas redraws -- used to detect grid-size changes
+/// and cache rendered geometry between frames.
 pub struct CanvasState {
     rows: u16,
     cols: u16,
+    cache: canvas::Cache,
+    last_generation: std::cell::Cell<u64>,
+}
+
+impl Default for CanvasState {
+    fn default() -> Self {
+        Self {
+            rows: 0,
+            cols: 0,
+            cache: canvas::Cache::default(),
+            last_generation: std::cell::Cell::new(0),
+        }
+    }
 }
 
 impl canvas::Program<Message> for TerminalSnapshot {
@@ -195,6 +220,7 @@ impl canvas::Program<Message> for TerminalSnapshot {
         if state.rows != new_rows || state.cols != new_cols {
             state.rows = new_rows;
             state.cols = new_cols;
+            state.cache.clear();
             return (
                 canvas::event::Status::Ignored,
                 Some(Message::TerminalResized {
@@ -208,126 +234,138 @@ impl canvas::Program<Message> for TerminalSnapshot {
 
     fn draw(
         &self,
-        _state: &CanvasState,
+        state: &CanvasState,
         renderer: &iced::Renderer,
         _theme: &iced::Theme,
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        let mut frame = Frame::new(renderer, bounds.size());
-
-        // Fill background first to avoid transparent gaps.
-        frame.fill_rectangle(IcedPoint::ORIGIN, bounds.size(), default_bg());
-
-        // Draw each cell: background rectangle + character glyph.
-        for (idx, cell) in self.cells.iter().enumerate() {
-            let row = idx / self.cols;
-            let col = idx % self.cols;
-            let x = col as f32 * CELL_WIDTH;
-            let y = row as f32 * CELL_HEIGHT;
-
-            frame.fill_rectangle(
-                IcedPoint::new(x, y),
-                Size::new(CELL_WIDTH, CELL_HEIGHT),
-                cell.bg,
-            );
-
-            if !cell.hidden && cell.c != ' ' {
-                frame.fill_text(Text {
-                    content: cell.c.to_string(),
-                    position: IcedPoint::new(x, y),
-                    color: cell.fg,
-                    size: Pixels(FONT_SIZE),
-                    line_height: iced::widget::text::LineHeight::Absolute(Pixels(CELL_HEIGHT)),
-                    font: Font::MONOSPACE,
-                    horizontal_alignment: alignment::Horizontal::Left,
-                    vertical_alignment: alignment::Vertical::Top,
-                    shaping: iced::widget::text::Shaping::Basic,
-                });
-            }
+        // Invalidate cached geometry when terminal content has changed.
+        if self.generation != state.last_generation.get() {
+            state.last_generation.set(self.generation);
+            state.cache.clear();
         }
 
-        // Draw cursor on top.
-        if self.cursor.shape != CursorShape::Hidden {
-            let cur_row = self.cursor.point.line.0 + self.display_offset;
-            let cur_col = self.cursor.point.column.0 as i32;
-            if cur_row >= 0
-                && (cur_row as usize) < self.rows
-                && cur_col >= 0
-                && (cur_col as usize) < self.cols
-            {
-                let x = cur_col as f32 * CELL_WIDTH;
-                let y = cur_row as f32 * CELL_HEIGHT;
-                let idx = cur_row as usize * self.cols + cur_col as usize;
+        let cells = &self.cells;
+        let cols = self.cols;
+        let rows = self.rows;
+        let cursor = &self.cursor;
+        let display_offset = self.display_offset;
 
-                match self.cursor.shape {
-                    CursorShape::Block => {
-                        // Semi-transparent block so the character remains legible.
-                        frame.fill_rectangle(
-                            IcedPoint::new(x, y),
-                            Size::new(CELL_WIDTH, CELL_HEIGHT),
-                            IcedColor {
-                                r: 1.0,
-                                g: 1.0,
-                                b: 1.0,
-                                a: 0.7,
-                            },
-                        );
-                        // Re-draw character with inverted foreground color.
-                        if let Some(cell) = self.cells.get(idx)
-                            && !cell.hidden
-                            && cell.c != ' '
-                        {
-                            frame.fill_text(Text {
-                                content: cell.c.to_string(),
-                                position: IcedPoint::new(x, y),
-                                color: IcedColor::BLACK,
-                                size: Pixels(FONT_SIZE),
-                                line_height: iced::widget::text::LineHeight::Absolute(Pixels(
-                                    CELL_HEIGHT,
-                                )),
-                                font: Font::MONOSPACE,
-                                horizontal_alignment: alignment::Horizontal::Left,
-                                vertical_alignment: alignment::Vertical::Top,
-                                shaping: iced::widget::text::Shaping::Basic,
-                            });
-                        }
-                    }
-                    CursorShape::Underline => {
-                        frame.fill_rectangle(
-                            IcedPoint::new(x, y + CELL_HEIGHT - 2.0),
-                            Size::new(CELL_WIDTH, 2.0),
-                            IcedColor::WHITE,
-                        );
-                    }
-                    CursorShape::Beam => {
-                        frame.fill_rectangle(
-                            IcedPoint::new(x, y),
-                            Size::new(2.0, CELL_HEIGHT),
-                            IcedColor::WHITE,
-                        );
-                    }
-                    // Hollow block: draw a thin border instead of a filled rectangle.
-                    CursorShape::HollowBlock => {
-                        for (ox, oy, w, h) in [
-                            (0.0, 0.0, CELL_WIDTH, 1.0),
-                            (0.0, CELL_HEIGHT - 1.0, CELL_WIDTH, 1.0),
-                            (0.0, 0.0, 1.0, CELL_HEIGHT),
-                            (CELL_WIDTH - 1.0, 0.0, 1.0, CELL_HEIGHT),
-                        ] {
+        let geom = state.cache.draw(renderer, bounds.size(), |frame| {
+            // Fill background first to avoid transparent gaps.
+            frame.fill_rectangle(IcedPoint::ORIGIN, bounds.size(), default_bg());
+
+            // Draw each cell: background rectangle + character glyph.
+            for (idx, cell) in cells.iter().enumerate() {
+                let row = idx / cols;
+                let col = idx % cols;
+                let x = col as f32 * CELL_WIDTH;
+                let y = row as f32 * CELL_HEIGHT;
+
+                frame.fill_rectangle(
+                    IcedPoint::new(x, y),
+                    Size::new(CELL_WIDTH, CELL_HEIGHT),
+                    cell.bg,
+                );
+
+                if !cell.hidden && cell.c != ' ' {
+                    frame.fill_text(Text {
+                        content: cell.c.to_string(),
+                        position: IcedPoint::new(x, y),
+                        color: cell.fg,
+                        size: Pixels(FONT_SIZE),
+                        line_height: iced::widget::text::LineHeight::Absolute(Pixels(CELL_HEIGHT)),
+                        font: Font::MONOSPACE,
+                        horizontal_alignment: alignment::Horizontal::Left,
+                        vertical_alignment: alignment::Vertical::Top,
+                        shaping: iced::widget::text::Shaping::Basic,
+                    });
+                }
+            }
+
+            // Draw cursor on top.
+            if cursor.shape != CursorShape::Hidden {
+                let cur_row = cursor.point.line.0 + display_offset;
+                let cur_col = cursor.point.column.0 as i32;
+                if cur_row >= 0
+                    && (cur_row as usize) < rows
+                    && cur_col >= 0
+                    && (cur_col as usize) < cols
+                {
+                    let x = cur_col as f32 * CELL_WIDTH;
+                    let y = cur_row as f32 * CELL_HEIGHT;
+                    let idx = cur_row as usize * cols + cur_col as usize;
+
+                    match cursor.shape {
+                        CursorShape::Block => {
+                            // Semi-transparent block so the character remains legible.
                             frame.fill_rectangle(
-                                IcedPoint::new(x + ox, y + oy),
-                                Size::new(w, h),
+                                IcedPoint::new(x, y),
+                                Size::new(CELL_WIDTH, CELL_HEIGHT),
+                                IcedColor {
+                                    r: 1.0,
+                                    g: 1.0,
+                                    b: 1.0,
+                                    a: 0.7,
+                                },
+                            );
+                            // Re-draw character with inverted foreground color.
+                            if let Some(cell) = cells.get(idx)
+                                && !cell.hidden
+                                && cell.c != ' '
+                            {
+                                frame.fill_text(Text {
+                                    content: cell.c.to_string(),
+                                    position: IcedPoint::new(x, y),
+                                    color: IcedColor::BLACK,
+                                    size: Pixels(FONT_SIZE),
+                                    line_height: iced::widget::text::LineHeight::Absolute(Pixels(
+                                        CELL_HEIGHT,
+                                    )),
+                                    font: Font::MONOSPACE,
+                                    horizontal_alignment: alignment::Horizontal::Left,
+                                    vertical_alignment: alignment::Vertical::Top,
+                                    shaping: iced::widget::text::Shaping::Basic,
+                                });
+                            }
+                        }
+                        CursorShape::Underline => {
+                            frame.fill_rectangle(
+                                IcedPoint::new(x, y + CELL_HEIGHT - 2.0),
+                                Size::new(CELL_WIDTH, 2.0),
                                 IcedColor::WHITE,
                             );
                         }
+                        CursorShape::Beam => {
+                            frame.fill_rectangle(
+                                IcedPoint::new(x, y),
+                                Size::new(2.0, CELL_HEIGHT),
+                                IcedColor::WHITE,
+                            );
+                        }
+                        // Hollow block: draw a thin border instead of a filled rectangle.
+                        CursorShape::HollowBlock => {
+                            for (ox, oy, w, h) in [
+                                (0.0, 0.0, CELL_WIDTH, 1.0),
+                                (0.0, CELL_HEIGHT - 1.0, CELL_WIDTH, 1.0),
+                                (0.0, 0.0, 1.0, CELL_HEIGHT),
+                                (CELL_WIDTH - 1.0, 0.0, 1.0, CELL_HEIGHT),
+                            ] {
+                                frame.fill_rectangle(
+                                    IcedPoint::new(x + ox, y + oy),
+                                    Size::new(w, h),
+                                    IcedColor::WHITE,
+                                );
+                            }
+                        }
+                        CursorShape::Hidden => unreachable!(),
                     }
-                    CursorShape::Hidden => unreachable!(),
                 }
             }
-        }
+        });
 
-        vec![frame.into_geometry()]
+        vec![geom]
     }
 }
 
