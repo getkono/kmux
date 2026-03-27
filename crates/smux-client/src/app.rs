@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use iced::futures::SinkExt as _;
 use iced::widget::{button, column, container, row, text, text_input};
@@ -56,6 +57,11 @@ pub enum Message {
         text: Option<String>,
     },
 
+    // Connection lost / reconnect
+    Disconnected,
+    Reconnect,
+    DismissDisconnectToast,
+
     // Toggle the HUD overlay (F12)
     ToggleHud,
 
@@ -84,6 +90,10 @@ pub struct SmuxApp {
     port: String,
     token: String,
     status_msg: String,
+
+    // Reconnection state
+    last_connect_params: Option<ConnectParams>,
+    disconnect_toast: Option<std::time::Instant>,
 
     // Observability
     metrics: RenderMetrics,
@@ -264,6 +274,37 @@ impl SmuxApp {
                 Task::none()
             }
 
+            Message::Disconnected => {
+                self.ws_sender = None;
+                self.last_connect_params = self.connect_params.take();
+                self.status_msg = "Connection lost — reconnecting in 3s...".to_string();
+                self.disconnect_toast = Some(std::time::Instant::now());
+                warn!("Connection lost, scheduling reconnect");
+                Task::batch([
+                    Task::perform(
+                        async { tokio::time::sleep(Duration::from_secs(3)).await },
+                        |_| Message::Reconnect,
+                    ),
+                    Task::perform(
+                        async { tokio::time::sleep(Duration::from_secs(5)).await },
+                        |_| Message::DismissDisconnectToast,
+                    ),
+                ])
+            }
+
+            Message::Reconnect => {
+                if let Some(params) = self.last_connect_params.take() {
+                    self.connect_params = Some(params);
+                    self.status_msg = "Reconnecting...".to_string();
+                }
+                Task::none()
+            }
+
+            Message::DismissDisconnectToast => {
+                self.disconnect_toast = None;
+                Task::none()
+            }
+
             Message::ToggleHud => {
                 self.hud_visible = !self.hud_visible;
                 Task::none()
@@ -330,14 +371,13 @@ impl SmuxApp {
                                 break;
                             }
                         }
+                        // All senders dropped → connection lost
+                        let _ = output.send(Message::Disconnected).await;
                     }
                     connect::ConnectResult::Failed(e) => {
                         let _ = output.send(Message::ConnectionFailed(e)).await;
                     }
                 }
-
-                std::future::pending::<()>().await;
-                unreachable!()
             }),
         );
 
@@ -540,13 +580,32 @@ impl SmuxApp {
             text("No active session -- press [+] to create one").into()
         };
 
+        let mut content = column![bar, terminal_area]
+            .width(Length::Fill)
+            .height(Length::Fill);
+
+        if self.disconnect_toast.is_some() {
+            content = content.push(
+                container(
+                    text("Connection lost — reconnecting...")
+                        .size(14)
+                        .color(iced::Color::WHITE),
+                )
+                .width(Length::Fill)
+                .padding(8)
+                .style(|_theme: &Theme| container::Style {
+                    background: Some(iced::Background::Color(iced::Color::from_rgb(
+                        0.8, 0.2, 0.2,
+                    ))),
+                    ..Default::default()
+                }),
+            );
+        }
+
         let status = text(&self.status_msg).size(12);
         let disconnect = button("Disconnect").on_press(Message::DisconnectPressed);
 
-        column![bar, terminal_area, row![status, disconnect].spacing(8),]
-            .width(Length::Fill)
-            .height(Length::Fill)
-            .into()
+        content.push(row![status, disconnect].spacing(8)).into()
     }
 }
 
