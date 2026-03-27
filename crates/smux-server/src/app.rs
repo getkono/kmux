@@ -47,6 +47,8 @@ pub struct SessionRelay {
     pub scrollback: Arc<Mutex<DiffBuffer>>,
     /// Server-side VT emulation state for this session.
     pub term_state: Arc<Mutex<TermState>>,
+    /// Monotonic seqno counter shared with the relay diff loop.
+    pub seqno_counter: Arc<AtomicU64>,
     /// Input control mode for this session.
     pub input_mode: InputMode,
     /// Session lifecycle status (Running or Exited).
@@ -104,6 +106,7 @@ impl ServerApp {
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         let scrollback = Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY)));
         let term_state = Arc::new(Mutex::new(TermState::new(size.rows, size.cols)));
+        let seqno_counter = Arc::new(AtomicU64::new(1));
 
         let task = tokio::spawn(session_diff_loop(
             reader,
@@ -111,6 +114,7 @@ impl ServerApp {
             clients.clone(),
             scrollback.clone(),
             term_state.clone(),
+            seqno_counter.clone(),
         ));
 
         self.relays.write().await.insert(
@@ -123,6 +127,7 @@ impl ServerApp {
                 size,
                 scrollback,
                 term_state,
+                seqno_counter,
                 input_mode: InputMode::Open,
                 status: SessionStatus::Running,
             },
@@ -173,7 +178,15 @@ impl ServerApp {
         let result = match last_seqno {
             None => {
                 let snapshot = relay.term_state.lock().unwrap().snapshot();
-                AttachResult::FullSnapshot(snapshot)
+                // Capture seqno atomically: the last assigned seqno is counter - 1.
+                // If counter is still 1 (no diffs yet), snapshot seqno is 0.
+                let current_seqno = SequenceNo(
+                    relay
+                        .seqno_counter
+                        .load(Ordering::Relaxed)
+                        .saturating_sub(1),
+                );
+                AttachResult::FullSnapshot(snapshot, current_seqno)
             }
             Some(seq) => {
                 let buf = relay.scrollback.lock().unwrap();
@@ -181,7 +194,13 @@ impl ServerApp {
                     Some(oldest) if seq >= oldest => AttachResult::Delta(buf.since(seq)),
                     _ => {
                         let snapshot = relay.term_state.lock().unwrap().snapshot();
-                        AttachResult::SyncReset(snapshot)
+                        let current_seqno = SequenceNo(
+                            relay
+                                .seqno_counter
+                                .load(Ordering::Relaxed)
+                                .saturating_sub(1),
+                        );
+                        AttachResult::SyncReset(snapshot, current_seqno)
                     }
                 }
             }
@@ -345,9 +364,11 @@ pub enum InputLockOutcome {
 /// Result of an attach operation describing what replay data to send.
 pub enum AttachResult {
     /// Fresh attach or first-time connect: full grid snapshot from TermState.
-    FullSnapshot(GridSnapshot),
+    /// The `SequenceNo` is the current seqno at snapshot time — the client
+    /// should expect `seqno + 1` as the next diff.
+    FullSnapshot(GridSnapshot, SequenceNo),
     /// Delta replay: only diffs with seqno > last_seqno.
     Delta(Vec<(SequenceNo, Arc<TerminalDiff>)>),
     /// Requested seqno was too old; full snapshot sent, client must reset state.
-    SyncReset(GridSnapshot),
+    SyncReset(GridSnapshot, SequenceNo),
 }

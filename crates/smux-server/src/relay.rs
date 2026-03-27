@@ -32,8 +32,8 @@ pub async fn session_diff_loop(
     clients: ClientMap,
     scrollback: Arc<Mutex<DiffBuffer>>,
     term_state: Arc<Mutex<TermState>>,
+    seqno_counter: Arc<AtomicU64>,
 ) {
-    let seqno_counter = Arc::new(AtomicU64::new(1));
     let mut buf = vec![0u8; 4096];
     let mut accum: Vec<u8> = Vec::new();
     let mut deadline: Option<Instant> = None;

@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use quinn::Connection;
 use smux_protocol::messages::{
-    ClientId, ClientMessage, ErrorCode, SequenceNo, ServerMessage, SessionEventMsg, epoch_millis,
+    ClientId, ClientMessage, ErrorCode, ServerMessage, SessionEventMsg, epoch_millis,
 };
 use smux_protocol::{decode_client, encode_server, read_frame, write_frame};
 use tokio::sync::mpsc;
@@ -275,11 +275,11 @@ async fn session_uni_writer(
 ) {
     // Send initial replay data
     match attach_result {
-        AttachResult::FullSnapshot(snapshot) => {
+        AttachResult::FullSnapshot(snapshot, seqno) => {
             let msg = ServerMessage::TerminalSnapshot {
                 session: session.clone(),
                 snapshot,
-                seqno: SequenceNo(0),
+                seqno,
                 sent_at_ms: epoch_millis(),
             };
             if send_frame(&mut uni, &msg).await.is_err() {
@@ -299,7 +299,7 @@ async fn session_uni_writer(
                 }
             }
         }
-        AttachResult::SyncReset(snapshot) => {
+        AttachResult::SyncReset(snapshot, seqno) => {
             let reset_msg = ServerMessage::SyncReset {
                 session: session.clone(),
             };
@@ -309,7 +309,7 @@ async fn session_uni_writer(
             let msg = ServerMessage::TerminalSnapshot {
                 session: session.clone(),
                 snapshot,
-                seqno: SequenceNo(0),
+                seqno,
                 sent_at_ms: epoch_millis(),
             };
             if send_frame(&mut uni, &msg).await.is_err() {
