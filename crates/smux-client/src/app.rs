@@ -5,7 +5,9 @@ use std::time::Duration;
 use iced::futures::SinkExt as _;
 use iced::widget::{button, column, container, row, text, text_input};
 use iced::{Element, Event, Length, Subscription, Task, Theme};
-use smux_protocol::messages::{ClientMessage, ServerMessage, SessionInfo, SessionStatus, TermSize};
+use smux_protocol::messages::{
+    ClientMessage, SequenceNo, ServerMessage, SessionInfo, SessionStatus, TermSize,
+};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -72,6 +74,17 @@ pub enum Message {
     },
 }
 
+/// Per-session synchronisation state for ordering protection.
+#[derive(Default)]
+enum SessionSync {
+    /// Receiving diffs normally; `expected` is the next expected seqno.
+    Synced { expected: SequenceNo },
+    /// Awaiting a fresh `TerminalSnapshot`; discard any `TerminalUpdate` messages
+    /// (they may be stale leftovers from a previous uni stream).
+    #[default]
+    AwaitingSync,
+}
+
 /// Top-level application state.
 #[derive(Default)]
 pub struct SmuxApp {
@@ -84,6 +97,10 @@ pub struct SmuxApp {
     active_session: Option<String>,
     session_list: Vec<SessionInfo>,
     next_request_id: u64,
+
+    /// Per-session sync state: tracks expected seqno and whether we are
+    /// awaiting a fresh snapshot (discarding stale diffs from old streams).
+    session_sync: HashMap<String, SessionSync>,
 
     // Connect form
     host: String,
@@ -113,6 +130,16 @@ impl SmuxApp {
         let id = self.next_request_id;
         self.next_request_id += 1;
         id
+    }
+
+    /// Send `Attach { last_seqno: None }` and transition the session to `AwaitingSync`.
+    fn attach_fresh(&mut self, session: String) {
+        self.session_sync
+            .insert(session.clone(), SessionSync::AwaitingSync);
+        self.send_ws(ClientMessage::Attach {
+            session,
+            last_seqno: None,
+        });
     }
 
     fn send_ws(&self, msg: ClientMessage) {
@@ -160,6 +187,7 @@ impl SmuxApp {
                 self.buffers.clear();
                 self.active_session = None;
                 self.session_list.clear();
+                self.session_sync.clear();
                 self.status_msg = "Disconnected".to_string();
                 Task::none()
             }
@@ -202,10 +230,7 @@ impl SmuxApp {
                     buf.clear();
                 }
                 self.active_session = Some(name.clone());
-                self.send_ws(ClientMessage::Attach {
-                    session: name,
-                    last_seqno: None,
-                });
+                self.attach_fresh(name);
                 Task::none()
             }
 
@@ -414,10 +439,7 @@ impl SmuxApp {
                     && let Some(first) = sessions.first()
                 {
                     self.active_session = Some(first.name.clone());
-                    self.send_ws(ClientMessage::Attach {
-                        session: first.name.clone(),
-                        last_seqno: None,
-                    });
+                    self.attach_fresh(first.name.clone());
                 }
                 Task::none()
             }
@@ -438,23 +460,18 @@ impl SmuxApp {
                 }
                 self.active_session = Some(name.clone());
                 self.status_msg = format!("Session '{name}' created");
-                self.send_ws(ClientMessage::Attach {
-                    session: name,
-                    last_seqno: None,
-                });
+                self.attach_fresh(name);
                 Task::none()
             }
 
             ServerMessage::SessionClosed { name, .. } => {
                 self.buffers.remove(&name);
+                self.session_sync.remove(&name);
                 self.session_list.retain(|s| s.name != name);
                 if self.active_session.as_deref() == Some(&name) {
                     self.active_session = self.session_list.first().map(|s| s.name.clone());
                     if let Some(sess) = self.active_session.clone() {
-                        self.send_ws(ClientMessage::Attach {
-                            session: sess,
-                            last_seqno: None,
-                        });
+                        self.attach_fresh(sess);
                     }
                 }
                 Task::none()
@@ -464,12 +481,19 @@ impl SmuxApp {
             ServerMessage::TerminalSnapshot {
                 session,
                 snapshot,
+                seqno,
                 sent_at_ms,
-                ..
             } => {
                 let start = std::time::Instant::now();
-                let grid = self.buffers.entry(session).or_default();
+                let grid = self.buffers.entry(session.clone()).or_default();
                 grid.apply_snapshot(snapshot);
+                // Transition to Synced: next expected seqno is snapshot's seqno + 1
+                self.session_sync.insert(
+                    session,
+                    SessionSync::Synced {
+                        expected: SequenceNo(seqno.0 + 1),
+                    },
+                );
                 let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
                 self.metrics.record_apply(sent_at_ms, elapsed_ms);
                 Task::none()
@@ -478,13 +502,41 @@ impl SmuxApp {
             ServerMessage::TerminalUpdate {
                 session,
                 diff,
+                seqno,
                 sent_at_ms,
-                ..
             } => {
+                match self.session_sync.get(&session) {
+                    Some(SessionSync::AwaitingSync) => {
+                        // Stale diff from a previous uni stream — discard.
+                        debug!("Discarding stale TerminalUpdate for '{session}' (awaiting sync)");
+                        return Task::none();
+                    }
+                    Some(SessionSync::Synced { expected }) if seqno != *expected => {
+                        // Sequence gap detected — request full resync.
+                        warn!(
+                            "Seqno gap on '{session}': expected {:?}, got {:?} — re-attaching",
+                            expected, seqno
+                        );
+                        if let Some(grid) = self.buffers.get_mut(&session) {
+                            grid.clear();
+                        }
+                        self.attach_fresh(session);
+                        return Task::none();
+                    }
+                    _ => {}
+                }
+
                 let start = std::time::Instant::now();
                 if let Some(grid) = self.buffers.get_mut(&session) {
                     grid.apply_diff(Arc::unwrap_or_clone(diff));
                 }
+                // Advance expected seqno.
+                self.session_sync.insert(
+                    session,
+                    SessionSync::Synced {
+                        expected: SequenceNo(seqno.0 + 1),
+                    },
+                );
                 let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
                 self.metrics.record_apply(sent_at_ms, elapsed_ms);
                 Task::none()
@@ -497,6 +549,7 @@ impl SmuxApp {
                 if let Some(grid) = self.buffers.get_mut(&session) {
                     grid.clear();
                 }
+                self.session_sync.insert(session, SessionSync::AwaitingSync);
                 Task::none()
             }
 
@@ -510,10 +563,10 @@ impl SmuxApp {
                 missed_count,
             } => {
                 warn!("Lagged on session '{session}': missed {missed_count} diffs, re-attaching");
-                self.send_ws(ClientMessage::Attach {
-                    session,
-                    last_seqno: None,
-                });
+                if let Some(grid) = self.buffers.get_mut(&session) {
+                    grid.clear();
+                }
+                self.attach_fresh(session);
                 Task::none()
             }
 
