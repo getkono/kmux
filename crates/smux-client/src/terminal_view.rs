@@ -137,7 +137,7 @@ impl Default for CellGrid {
 ///
 /// Borrows cells from the grid (no clone) -- valid for the lifetime of a
 /// single `view()` call.
-pub struct GridSnapshot2<'a> {
+pub struct GridView<'a> {
     cells: &'a [CellState],
     cursor: CursorState,
     rows: usize,
@@ -145,7 +145,7 @@ pub struct GridSnapshot2<'a> {
     cells_generation: u64,
 }
 
-impl<'a> GridSnapshot2<'a> {
+impl<'a> GridView<'a> {
     fn from_grid(grid: &'a CellGrid) -> Self {
         Self {
             cells: &grid.cells,
@@ -165,6 +165,7 @@ pub struct CanvasState {
     rows: u16,
     cols: u16,
     cells_cache: canvas::Cache,
+    cursor_cache: canvas::Cache,
     last_cells_generation: std::cell::Cell<u64>,
 }
 
@@ -174,6 +175,7 @@ impl Default for CanvasState {
             rows: 0,
             cols: 0,
             cells_cache: canvas::Cache::default(),
+            cursor_cache: canvas::Cache::default(),
             last_cells_generation: std::cell::Cell::new(0),
         }
     }
@@ -187,7 +189,7 @@ fn default_bg() -> IcedColor {
     IcedColor::from_rgb8(0x28, 0x2c, 0x34)
 }
 
-impl<'a> canvas::Program<Message> for GridSnapshot2<'a> {
+impl<'a> canvas::Program<Message> for GridView<'a> {
     type State = CanvasState;
 
     fn update(
@@ -265,8 +267,9 @@ impl<'a> canvas::Program<Message> for GridSnapshot2<'a> {
             }
         });
 
-        // Layer 2: cursor (drawn fresh every frame -- cheap, just 1-2 rectangles)
-        let cursor_geom = canvas::Cache::default().draw(renderer, bounds.size(), |frame| {
+        // Layer 2: cursor (redrawn every frame -- always clear to pick up position changes)
+        state.cursor_cache.clear();
+        let cursor_geom = state.cursor_cache.draw(renderer, bounds.size(), |frame| {
             if cursor.visible && cursor.shape != CursorShape::Hidden {
                 let cur_row = cursor.row as usize;
                 let cur_col = cursor.col as usize;
@@ -346,7 +349,7 @@ impl<'a> canvas::Program<Message> for GridSnapshot2<'a> {
 
 /// Render the cell grid as a fill-parent canvas widget.
 pub fn view<'a>(grid: &'a CellGrid, _session: &'a str) -> Element<'a, Message> {
-    let snapshot = GridSnapshot2::from_grid(grid);
+    let snapshot = GridView::from_grid(grid);
     Canvas::new(snapshot)
         .width(Length::Fill)
         .height(Length::Fill)

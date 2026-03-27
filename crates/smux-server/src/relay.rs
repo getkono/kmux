@@ -130,7 +130,7 @@ fn flush_diff(
 
     let msg = ServerMessage::TerminalUpdate {
         session: session.to_string(),
-        diff: Arc::unwrap_or_clone(diff),
+        diff,
         seqno,
     };
 

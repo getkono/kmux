@@ -282,7 +282,7 @@ async fn session_uni_writer(
             for (seqno, diff) in diffs {
                 let msg = ServerMessage::TerminalUpdate {
                     session: session.clone(),
-                    diff: Arc::unwrap_or_clone(diff),
+                    diff,
                     seqno,
                 };
                 if send_frame(&mut uni, &msg).await.is_err() {

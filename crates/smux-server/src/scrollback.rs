@@ -9,7 +9,8 @@ use smux_protocol::messages::{SequenceNo, TerminalDiff};
 /// evicted from the front. The live `TermState` surface is the authoritative
 /// snapshot -- no keyframes are stored here.
 pub struct DiffBuffer {
-    diffs: VecDeque<(SequenceNo, Arc<TerminalDiff>)>,
+    /// Each entry stores (seqno, diff, cached_estimated_size).
+    diffs: VecDeque<(SequenceNo, Arc<TerminalDiff>, usize)>,
     total_estimated_size: usize,
     capacity: usize,
 }
@@ -28,35 +29,35 @@ impl DiffBuffer {
         let size = estimate_diff_size(&diff);
 
         while self.total_estimated_size + size >= self.capacity {
-            if let Some((_, old)) = self.diffs.pop_front() {
-                self.total_estimated_size -= estimate_diff_size(&old);
+            if let Some((_, _, old_size)) = self.diffs.pop_front() {
+                self.total_estimated_size -= old_size;
             } else {
                 break;
             }
         }
 
         self.total_estimated_size += size;
-        self.diffs.push_back((seqno, diff));
+        self.diffs.push_back((seqno, diff, size));
     }
 
     /// Return all diffs with `seqno > after` in order.
     pub fn since(&self, after: SequenceNo) -> Vec<(SequenceNo, Arc<TerminalDiff>)> {
         self.diffs
             .iter()
-            .filter(|(seq, _)| *seq > after)
-            .cloned()
+            .filter(|(seq, _, _)| *seq > after)
+            .map(|(seq, diff, _)| (*seq, Arc::clone(diff)))
             .collect()
     }
 
     /// The oldest sequence number still in the buffer, or `None` if empty.
     pub fn oldest_seqno(&self) -> Option<SequenceNo> {
-        self.diffs.front().map(|(seq, _)| *seq)
+        self.diffs.front().map(|(seq, _, _)| *seq)
     }
 
     /// The newest sequence number still in the buffer, or `None` if empty.
     #[allow(dead_code)]
     pub fn newest_seqno(&self) -> Option<SequenceNo> {
-        self.diffs.back().map(|(seq, _)| *seq)
+        self.diffs.back().map(|(seq, _, _)| *seq)
     }
 }
 

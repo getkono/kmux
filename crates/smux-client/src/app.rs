@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use iced::futures::SinkExt as _;
 use iced::widget::{button, column, container, row, text, text_input};
@@ -415,12 +416,12 @@ impl SmuxApp {
 
             ServerMessage::TerminalUpdate { session, diff, .. } => {
                 if let Some(grid) = self.buffers.get_mut(&session) {
-                    grid.apply_diff(diff);
+                    grid.apply_diff(Arc::unwrap_or_clone(diff));
                 }
                 Task::none()
             }
 
-            // Legacy PtyOutput -- keep for backwards compat during transition
+            #[allow(deprecated)]
             ServerMessage::PtyOutput { .. } => Task::none(),
 
             ServerMessage::SyncReset { session } => {

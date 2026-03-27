@@ -167,10 +167,12 @@ fn build_quinn_client_config(accept_invalid: bool) -> quinn::ClientConfig {
             .with_custom_certificate_verifier(Arc::new(NoVerifier))
             .with_no_client_auth()
     } else {
-        // Production mode: use platform-native certificate roots.
-        // Without webpki-roots, this creates an empty store. In practice,
-        // the client currently always uses accept_invalid_certs=true for dev.
-        let roots = rustls::RootCertStore::empty();
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_native_certs::load_native_certs().certs {
+            if let Err(e) = roots.add(cert) {
+                warn!("failed to add native cert: {e}");
+            }
+        }
         rustls::ClientConfig::builder()
             .with_root_certificates(roots)
             .with_no_client_auth()
