@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 /// Current wire protocol version. Increment when breaking changes are made.
@@ -338,6 +340,8 @@ pub enum ServerMessage {
     },
 
     /// PTY output chunk for an attached session, tagged with a sequence number.
+    /// Superseded by `TerminalUpdate`/`TerminalSnapshot` in protocol v3.
+    #[deprecated(note = "use TerminalUpdate/TerminalSnapshot instead")]
     PtyOutput {
         session: SessionId,
         data: Vec<u8>,
@@ -372,7 +376,7 @@ pub enum ServerMessage {
     /// Server-side VT diff for an attached session.
     TerminalUpdate {
         session: SessionId,
-        diff: TerminalDiff,
+        diff: Arc<TerminalDiff>,
         seqno: SequenceNo,
     },
 

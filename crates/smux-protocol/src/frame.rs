@@ -96,6 +96,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(deprecated)]
     fn roundtrip_server_pty_output() {
         let msg = ServerMessage::PtyOutput {
             session: "alpha".to_string(),
@@ -201,7 +202,7 @@ mod tests {
         };
         let msg = ServerMessage::TerminalUpdate {
             session: "test".to_string(),
-            diff,
+            diff: std::sync::Arc::new(diff),
             seqno: SequenceNo(1),
         };
         let bytes = encode_server(&msg).expect("encode");
@@ -265,7 +266,7 @@ mod tests {
         };
         let msg = ServerMessage::TerminalUpdate {
             session: "s".to_string(),
-            diff,
+            diff: std::sync::Arc::new(diff),
             seqno: SequenceNo(1),
         };
         let bytes = encode_server(&msg).expect("encode");

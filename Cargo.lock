@@ -3736,6 +3736,7 @@ dependencies = [
  "iced",
  "quinn",
  "rustls",
+ "rustls-native-certs",
  "smux-protocol",
  "tokio",
  "tracing",
