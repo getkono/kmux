@@ -25,6 +25,10 @@ pub struct CellGrid {
     pub rows: usize,
     pub cols: usize,
     generation: u64,
+    /// Incremented only when cell content changes (not cursor/mode-only diffs).
+    /// Used by the canvas to avoid clearing the expensive cell cache on
+    /// cursor-only updates.
+    cells_generation: u64,
 }
 
 impl CellGrid {
@@ -36,6 +40,7 @@ impl CellGrid {
             rows,
             cols,
             generation: 0,
+            cells_generation: 0,
         }
     }
 
@@ -47,10 +52,12 @@ impl CellGrid {
         self.cursor = snapshot.cursor;
         self.modes = snapshot.modes;
         self.generation += 1;
+        self.cells_generation += 1;
     }
 
     /// Apply a diff from the server — only changed cells are updated.
     pub fn apply_diff(&mut self, diff: TerminalDiff) {
+        let has_cell_ops = !diff.ops.is_empty();
         for op in diff.ops {
             match op {
                 DiffOp::Cell { row, col, cell } => {
@@ -80,6 +87,9 @@ impl CellGrid {
         self.cursor = diff.cursor;
         self.modes = diff.modes;
         self.generation += 1;
+        if has_cell_ops {
+            self.cells_generation += 1;
+        }
     }
 
     /// Whether the terminal is in application-cursor mode.
@@ -93,6 +103,7 @@ impl CellGrid {
         self.cursor = CursorState::default();
         self.modes = TermModes::EMPTY;
         self.generation += 1;
+        self.cells_generation += 1;
     }
 
     /// Resize the grid (server will send a fresh snapshot after resize).
@@ -101,10 +112,16 @@ impl CellGrid {
         self.cols = cols as usize;
         self.cells = vec![CellState::default(); self.rows * self.cols];
         self.generation += 1;
+        self.cells_generation += 1;
     }
 
+    #[cfg(test)]
     pub fn generation(&self) -> u64 {
         self.generation
+    }
+
+    pub fn cells_generation(&self) -> u64 {
+        self.cells_generation
     }
 }
 
@@ -116,33 +133,39 @@ impl Default for CellGrid {
 
 // ── Canvas rendering ──────────────────────────────────────────────────────────
 
-/// Snapshot of the CellGrid used as the canvas `Program`.
-pub struct GridSnapshot2 {
-    cells: Vec<CellState>,
+/// Borrowed snapshot of the CellGrid used as the canvas `Program`.
+///
+/// Borrows cells from the grid (no clone) — valid for the lifetime of a
+/// single `view()` call.
+pub struct GridSnapshot2<'a> {
+    cells: &'a [CellState],
     cursor: CursorState,
     rows: usize,
     cols: usize,
-    generation: u64,
+    cells_generation: u64,
 }
 
-impl GridSnapshot2 {
-    fn from_grid(grid: &CellGrid) -> Self {
+impl<'a> GridSnapshot2<'a> {
+    fn from_grid(grid: &'a CellGrid) -> Self {
         Self {
-            cells: grid.cells.clone(),
+            cells: &grid.cells,
             cursor: grid.cursor,
             rows: grid.rows,
             cols: grid.cols,
-            generation: grid.generation(),
+            cells_generation: grid.cells_generation(),
         }
     }
 }
 
 /// State preserved across canvas redraws.
+///
+/// Uses a dedicated `cells_cache` that is only cleared when cell content
+/// changes. Cursor-only diffs skip the expensive full-cell redraw.
 pub struct CanvasState {
     rows: u16,
     cols: u16,
-    cache: canvas::Cache,
-    last_generation: std::cell::Cell<u64>,
+    cells_cache: canvas::Cache,
+    last_cells_generation: std::cell::Cell<u64>,
 }
 
 impl Default for CanvasState {
@@ -150,8 +173,8 @@ impl Default for CanvasState {
         Self {
             rows: 0,
             cols: 0,
-            cache: canvas::Cache::default(),
-            last_generation: std::cell::Cell::new(0),
+            cells_cache: canvas::Cache::default(),
+            last_cells_generation: std::cell::Cell::new(0),
         }
     }
 }
@@ -164,7 +187,7 @@ fn default_bg() -> IcedColor {
     IcedColor::from_rgb8(0x28, 0x2c, 0x34)
 }
 
-impl canvas::Program<Message> for GridSnapshot2 {
+impl<'a> canvas::Program<Message> for GridSnapshot2<'a> {
     type State = CanvasState;
 
     fn update(
@@ -179,7 +202,7 @@ impl canvas::Program<Message> for GridSnapshot2 {
         if state.rows != new_rows || state.cols != new_cols {
             state.rows = new_rows;
             state.cols = new_cols;
-            state.cache.clear();
+            state.cells_cache.clear();
             return (
                 canvas::event::Status::Ignored,
                 Some(Message::TerminalResized {
@@ -199,17 +222,20 @@ impl canvas::Program<Message> for GridSnapshot2 {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
-        if self.generation != state.last_generation.get() {
-            state.last_generation.set(self.generation);
-            state.cache.clear();
+        // Only clear the cell cache when cell content actually changed.
+        // Cursor-only diffs skip this — the cached cell geometry stays valid.
+        if self.cells_generation != state.last_cells_generation.get() {
+            state.last_cells_generation.set(self.cells_generation);
+            state.cells_cache.clear();
         }
 
-        let cells = &self.cells;
+        let cells = self.cells;
         let cols = self.cols;
         let rows = self.rows;
         let cursor = &self.cursor;
 
-        let geom = state.cache.draw(renderer, bounds.size(), |frame| {
+        // Layer 1: cells (cached — redrawn only when cells change)
+        let cells_geom = state.cells_cache.draw(renderer, bounds.size(), |frame| {
             frame.fill_rectangle(IcedPoint::ORIGIN, bounds.size(), default_bg());
 
             for (idx, cell) in cells.iter().enumerate() {
@@ -237,8 +263,10 @@ impl canvas::Program<Message> for GridSnapshot2 {
                     });
                 }
             }
+        });
 
-            // Draw cursor
+        // Layer 2: cursor (drawn fresh every frame — cheap, just 1-2 rectangles)
+        let cursor_geom = canvas::Cache::default().draw(renderer, bounds.size(), |frame| {
             if cursor.visible && cursor.shape != CursorShape::Hidden {
                 let cur_row = cursor.row as usize;
                 let cur_col = cursor.col as usize;
@@ -312,7 +340,7 @@ impl canvas::Program<Message> for GridSnapshot2 {
             }
         });
 
-        vec![geom]
+        vec![cells_geom, cursor_geom]
     }
 }
 
@@ -447,5 +475,38 @@ mod tests {
             modes: TermModes(TermModes::APP_CURSOR),
         });
         assert!(grid.app_cursor());
+    }
+
+    #[test]
+    fn cells_generation_only_on_cell_ops() {
+        let mut grid = CellGrid::new(2, 3);
+        let cg0 = grid.cells_generation();
+
+        // Cursor-only diff: cells_generation unchanged
+        grid.apply_diff(TerminalDiff {
+            ops: vec![],
+            cursor: CursorState {
+                row: 1,
+                col: 1,
+                ..CursorState::default()
+            },
+            modes: TermModes::EMPTY,
+        });
+        assert_eq!(grid.cells_generation(), cg0);
+
+        // Diff with cell ops: cells_generation increments
+        grid.apply_diff(TerminalDiff {
+            ops: vec![DiffOp::Cell {
+                row: 0,
+                col: 0,
+                cell: CellState {
+                    c: 'A',
+                    ..CellState::default()
+                },
+            }],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+        });
+        assert_eq!(grid.cells_generation(), cg0 + 1);
     }
 }

@@ -39,7 +39,7 @@ pub enum Message {
     // Async connection events (emitted by subscription)
     Connected(mpsc::UnboundedSender<ClientMessage>),
     ConnectionFailed(String),
-    ServerMsg(ServerMessage),
+    ServerMsgBatch(Vec<ServerMessage>),
 
     // Session management
     SelectSession(String),
@@ -165,7 +165,13 @@ impl SmuxApp {
                 Task::none()
             }
 
-            Message::ServerMsg(msg) => self.handle_server_message(msg),
+            Message::ServerMsgBatch(msgs) => {
+                let tasks: Vec<Task<Message>> = msgs
+                    .into_iter()
+                    .map(|msg| self.handle_server_message(msg))
+                    .collect();
+                Task::batch(tasks)
+            }
 
             // ── Session management ───────────────────────────────────
             Message::SelectSession(name) => {
@@ -298,7 +304,13 @@ impl SmuxApp {
                     connect::ConnectResult::Connected(sender) => {
                         let _ = output.send(Message::Connected(sender)).await;
                         while let Some(msg) = srv_rx.recv().await {
-                            if output.send(Message::ServerMsg(msg)).await.is_err() {
+                            // Drain all pending messages into a single batch so iced
+                            // processes them in one update/view/draw cycle.
+                            let mut batch = vec![msg];
+                            while let Ok(msg) = srv_rx.try_recv() {
+                                batch.push(msg);
+                            }
+                            if output.send(Message::ServerMsgBatch(batch)).await.is_err() {
                                 break;
                             }
                         }
@@ -420,6 +432,18 @@ impl SmuxApp {
 
             ServerMessage::Event { event } => {
                 info!("Server event: {:?}", event);
+                Task::none()
+            }
+
+            ServerMessage::Lagged {
+                session,
+                missed_count,
+            } => {
+                warn!("Lagged on session '{session}': missed {missed_count} diffs, re-attaching");
+                self.send_ws(ClientMessage::Attach {
+                    session,
+                    last_seqno: None,
+                });
                 Task::none()
             }
 
@@ -551,6 +575,7 @@ fn key_to_bytes(
         }
         Key::Named(named) => {
             let bytes: &[u8] = match named {
+                Named::Space => b" ",
                 Named::Enter => b"\r",
                 Named::Tab => b"\t",
                 Named::Backspace => b"\x7f",

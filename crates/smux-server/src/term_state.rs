@@ -38,6 +38,11 @@ pub struct TermState {
     prev_cells: Vec<CellState>,
     /// Reusable scratch buffer — avoids allocation per `compute_diff()` call.
     current_cells: Vec<CellState>,
+    prev_cursor: CursorState,
+    prev_modes: TermModes,
+    /// Tracks which rows have non-default content in `prev_cells`, so
+    /// `compute_diff` can skip scanning rows that are blank in both buffers.
+    prev_nonempty_rows: Vec<bool>,
     rows: u16,
     cols: u16,
 }
@@ -54,6 +59,9 @@ impl TermState {
             processor: Processor::new(),
             prev_cells: vec![blank; r * c],
             current_cells: vec![blank; r * c],
+            prev_cursor: CursorState::default(),
+            prev_modes: TermModes::EMPTY,
+            prev_nonempty_rows: vec![false; r],
             rows,
             cols,
         }
@@ -66,7 +74,11 @@ impl TermState {
 
     /// Compute a diff between the current grid and `prev_cells`, then update
     /// `prev_cells` to match the current grid.
-    pub fn compute_diff(&mut self) -> TerminalDiff {
+    ///
+    /// Uses dirty-row tracking to skip scanning rows that are blank in both
+    /// the current and previous frame, reducing work for typical terminal
+    /// activity where only a few rows change per update.
+    pub fn compute_diff(&mut self) -> Option<TerminalDiff> {
         let rows = self.rows as usize;
         let cols = self.cols as usize;
 
@@ -75,6 +87,9 @@ impl TermState {
         let cursor = content.cursor;
         let display_offset = content.display_offset as i32;
 
+        // Track which rows are touched by display_iter (have non-default content now).
+        let mut touched_rows = vec![false; rows];
+
         // Reset scratch buffer and populate from grid
         self.current_cells.fill(CellState::default());
 
@@ -82,6 +97,7 @@ impl TermState {
             let row = indexed.point.line.0 + display_offset;
             let col = indexed.point.column.0;
             if row >= 0 && (row as usize) < rows && col < cols {
+                touched_rows[row as usize] = true;
                 let cell = indexed.cell;
                 let (fg, bg) = if cell.flags.contains(Flags::INVERSE) {
                     (
@@ -103,9 +119,18 @@ impl TermState {
             }
         }
 
-        // Diff current vs. prev
+        // Only compare rows that have content now OR had content previously.
+        // Rows that are blank in both frames cannot have changed.
         let mut ops = Vec::new();
-        for r in 0..rows {
+        for (r, (&touched, &prev_nonempty)) in touched_rows
+            .iter()
+            .zip(self.prev_nonempty_rows.iter())
+            .enumerate()
+            .take(rows)
+        {
+            if !touched && !prev_nonempty {
+                continue;
+            }
             let base = r * cols;
             let mut c = 0;
             while c < cols {
@@ -135,16 +160,29 @@ impl TermState {
             }
         }
 
+        // Update prev_nonempty_rows for next frame
+        self.prev_nonempty_rows.copy_from_slice(&touched_rows);
+
         // Swap buffers: current becomes prev for next frame
         std::mem::swap(&mut self.prev_cells, &mut self.current_cells);
 
         let cursor_state = Self::convert_cursor(&cursor, display_offset);
         let modes = self.extract_modes();
 
-        TerminalDiff {
-            ops,
-            cursor: cursor_state,
-            modes,
+        let has_changes =
+            !ops.is_empty() || cursor_state != self.prev_cursor || modes != self.prev_modes;
+
+        self.prev_cursor = cursor_state;
+        self.prev_modes = modes;
+
+        if has_changes {
+            Some(TerminalDiff {
+                ops,
+                cursor: cursor_state,
+                modes,
+            })
+        } else {
+            None
         }
     }
 
@@ -209,6 +247,9 @@ impl TermState {
         let n = rows as usize * cols as usize;
         self.prev_cells = vec![CellState::default(); n];
         self.current_cells = vec![CellState::default(); n];
+        self.prev_cursor = CursorState::default();
+        self.prev_modes = TermModes::EMPTY;
+        self.prev_nonempty_rows = vec![false; rows as usize];
     }
 
     fn convert_cursor(cursor: &RenderableCursor, display_offset: i32) -> CursorState {
@@ -363,7 +404,7 @@ mod tests {
     fn feed_hello_produces_5_cell_diff() {
         let mut ts = TermState::new(24, 80);
         ts.feed(b"hello");
-        let diff = ts.compute_diff();
+        let diff = ts.compute_diff().expect("expected Some diff");
         // "hello" is 5 chars on row 0 — should produce one Row op of length 5
         let total_cells: usize = diff
             .ops
@@ -384,7 +425,7 @@ mod tests {
     fn feed_red_text_has_red_fg() {
         let mut ts = TermState::new(24, 80);
         ts.feed(b"\x1b[31mred");
-        let diff = ts.compute_diff();
+        let diff = ts.compute_diff().expect("expected Some diff");
         // Find the 'r' cell
         let r_cell = diff
             .ops
@@ -399,14 +440,43 @@ mod tests {
     }
 
     #[test]
-    fn no_op_feed_produces_empty_diff() {
+    fn no_op_feed_produces_none() {
         let mut ts = TermState::new(24, 80);
         // Compute initial diff (all blank)
         let _ = ts.compute_diff();
         // Feed nothing
         ts.feed(b"");
-        let diff = ts.compute_diff();
-        assert!(diff.ops.is_empty());
+        assert!(ts.compute_diff().is_none());
+    }
+
+    #[test]
+    fn cursor_move_without_cell_change_produces_some() {
+        let mut ts = TermState::new(24, 80);
+        ts.feed(b"hello");
+        let _ = ts.compute_diff(); // consume first diff
+
+        // Move cursor home without changing cells (CSI H = cursor home)
+        ts.feed(b"\x1b[H");
+        let diff = ts
+            .compute_diff()
+            .expect("cursor-only move should produce Some");
+        assert!(diff.ops.is_empty(), "no cell changes expected");
+        assert_eq!(diff.cursor.row, 0);
+        assert_eq!(diff.cursor.col, 0);
+    }
+
+    #[test]
+    fn mode_change_without_cell_change_produces_some() {
+        let mut ts = TermState::new(24, 80);
+        let _ = ts.compute_diff(); // consume initial diff
+
+        // Enable application cursor keys mode (DECCKM)
+        ts.feed(b"\x1b[?1h");
+        let diff = ts
+            .compute_diff()
+            .expect("mode-only change should produce Some");
+        assert!(diff.ops.is_empty(), "no cell changes expected");
+        assert!(diff.modes.app_cursor());
     }
 
     #[test]
@@ -415,14 +485,12 @@ mod tests {
         ts.feed(b"hello");
         let _ = ts.compute_diff(); // consume initial diff
         ts.resize(30, 100);
-        let diff = ts.compute_diff();
-        // After resize, prev_cells is reset so the diff should reflect the new state.
-        // The old "hello" may or may not survive resize; the key thing is the grid
-        // dimensions changed and prev_cells was reset.
+        // After resize, prev_cells/cursor/modes are reset so the diff should
+        // reflect the new state.
         assert_eq!(ts.rows, 30);
         assert_eq!(ts.cols, 100);
-        // We don't assert ops length since resize behavior depends on alacritty
-        let _ = diff;
+        // We don't assert specific ops since resize behavior depends on alacritty
+        let _ = ts.compute_diff();
     }
 
     #[test]
@@ -455,7 +523,7 @@ mod tests {
         let _ = ts.compute_diff(); // consume first diff
 
         ts.feed(b" world");
-        let diff = ts.compute_diff();
+        let diff = ts.compute_diff().expect("expected Some diff");
         let total_cells: usize = diff
             .ops
             .iter()
