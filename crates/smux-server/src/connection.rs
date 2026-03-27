@@ -168,7 +168,13 @@ impl ClientState {
 
                 match self
                     .app
-                    .attach(&session, client_id, last_seqno, client_tx)
+                    .attach(
+                        &session,
+                        client_id,
+                        last_seqno,
+                        client_tx,
+                        self.ctrl_tx.clone(),
+                    )
                     .await
                 {
                     Ok(result) => {

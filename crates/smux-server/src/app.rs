@@ -21,8 +21,15 @@ use crate::term_state::TermState;
 /// 10 MB scrollback buffer per session (estimated diff size).
 const SCROLLBACK_CAPACITY: usize = 10 * 1024 * 1024;
 
+/// Per-client sender pair: bounded data channel (for diffs) + unbounded control
+/// channel (for notifications like `Lagged` that must never be dropped).
+pub struct ClientSender {
+    pub data_tx: mpsc::Sender<ServerMessage>,
+    pub ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+}
+
 /// Shared map of per-client output senders for a single session.
-pub type ClientMap = Arc<Mutex<HashMap<ClientId, mpsc::Sender<ServerMessage>>>>;
+pub type ClientMap = Arc<Mutex<HashMap<ClientId, ClientSender>>>;
 
 /// Per-session relay state.
 pub struct SessionRelay {
@@ -155,7 +162,8 @@ impl ServerApp {
         name: &str,
         client_id: ClientId,
         last_seqno: Option<SequenceNo>,
-        client_tx: mpsc::Sender<ServerMessage>,
+        data_tx: mpsc::Sender<ServerMessage>,
+        ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
     ) -> Result<AttachResult> {
         let relays = self.relays.read().await;
         let relay = relays.get(name).ok_or_else(|| SmuxError::SessionNotFound {
@@ -180,7 +188,11 @@ impl ServerApp {
         };
 
         // Register client -- relay task will now deliver live output to them.
-        relay.clients.lock().unwrap().insert(client_id, client_tx);
+        relay
+            .clients
+            .lock()
+            .unwrap()
+            .insert(client_id, ClientSender { data_tx, ctrl_tx });
 
         Ok(result)
     }

@@ -139,21 +139,31 @@ fn flush_diff(
 }
 
 /// Send a message to all registered clients, handling backpressure and dead clients.
+///
+/// When a client's data channel is full, send `Lagged` via the unbounded control
+/// channel (which never fails) and remove the data sender so the uni-stream writer
+/// exits cleanly. The client receives the `Lagged` notification reliably and can
+/// re-attach for a fresh snapshot.
 fn broadcast_to_clients(session: &str, msg: &ServerMessage, clients: &ClientMap) {
     let mut dead: Vec<ClientId> = Vec::new();
 
     {
         let map = clients.lock().unwrap();
-        for (&client_id, tx) in map.iter() {
-            match tx.try_send(msg.clone()) {
+        for (&client_id, sender) in map.iter() {
+            match sender.data_tx.try_send(msg.clone()) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    let lag_msg = ServerMessage::Lagged {
+                    // Send Lagged via the control channel (unbounded, never fails).
+                    let _ = sender.ctrl_tx.send(ServerMessage::Lagged {
                         session: session.to_string(),
                         missed_count: 1,
-                    };
-                    let _ = tx.try_send(lag_msg);
-                    warn!("Client {:?} lagged on session '{session}'", client_id);
+                    });
+                    // Remove data sender so uni-stream writer task exits cleanly.
+                    dead.push(client_id);
+                    warn!(
+                        "Client {:?} lagged on session '{session}', sending Lagged via ctrl",
+                        client_id
+                    );
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
                     dead.push(client_id);
@@ -167,5 +177,101 @@ fn broadcast_to_clients(session: &str, msg: &ServerMessage, clients: &ClientMap)
         for id in dead {
             map.remove(&id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::app::ClientSender;
+    use smux_protocol::messages::{CursorState, TermModes, TerminalDiff};
+    use tokio::sync::mpsc;
+
+    fn dummy_update(session: &str) -> ServerMessage {
+        ServerMessage::TerminalUpdate {
+            session: session.to_string(),
+            diff: Arc::new(TerminalDiff {
+                ops: vec![],
+                cursor: CursorState::default(),
+                modes: TermModes::EMPTY,
+            }),
+            seqno: SequenceNo(1),
+            sent_at_ms: 0,
+        }
+    }
+
+    #[test]
+    fn broadcast_sends_lagged_via_ctrl_when_data_full() {
+        // Create a data channel with capacity 1, and fill it.
+        let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+
+        // Fill the data channel
+        data_tx.try_send(dummy_update("test")).unwrap();
+
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        clients
+            .lock()
+            .unwrap()
+            .insert(ClientId(1), ClientSender { data_tx, ctrl_tx });
+
+        // Now broadcast — data channel is full
+        broadcast_to_clients("test", &dummy_update("test"), &clients);
+
+        // Lagged should arrive on the ctrl channel
+        let msg = ctrl_rx.try_recv().expect("should receive Lagged on ctrl");
+        assert!(
+            matches!(&msg, ServerMessage::Lagged { session, .. } if session == "test"),
+            "expected Lagged message, got {:?}",
+            msg
+        );
+    }
+
+    #[test]
+    fn broadcast_removes_client_after_full() {
+        let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
+        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+
+        // Fill the data channel
+        data_tx.try_send(dummy_update("test")).unwrap();
+
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        clients
+            .lock()
+            .unwrap()
+            .insert(ClientId(42), ClientSender { data_tx, ctrl_tx });
+
+        broadcast_to_clients("test", &dummy_update("test"), &clients);
+
+        // Client should be removed from the map
+        assert!(
+            clients.lock().unwrap().is_empty(),
+            "lagged client should be removed from map"
+        );
+    }
+
+    #[test]
+    fn broadcast_delivers_to_healthy_client() {
+        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
+        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        clients
+            .lock()
+            .unwrap()
+            .insert(ClientId(1), ClientSender { data_tx, ctrl_tx });
+
+        broadcast_to_clients("test", &dummy_update("test"), &clients);
+
+        // Message should arrive on data channel
+        let msg = data_rx
+            .try_recv()
+            .expect("should receive message on data channel");
+        assert!(matches!(msg, ServerMessage::TerminalUpdate { .. }));
+
+        // Client should still be in the map
+        assert_eq!(clients.lock().unwrap().len(), 1);
     }
 }
