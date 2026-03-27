@@ -1,19 +1,21 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use iced::futures::SinkExt as _;
-use iced::widget::{button, column, container, row, text, text_input};
-use iced::{Element, Event, Length, Subscription, Task, Theme};
+use iced::widget::{Space, button, column, container, row, text, text_input};
+use iced::{Element, Event, Font, Length, Subscription, Task, Theme};
 use smux_protocol::messages::{
-    ClientMessage, SequenceNo, ServerMessage, SessionInfo, SessionStatus, TermSize,
+    ClientId, ClientMessage, SequenceNo, ServerMessage, SessionEventMsg, SessionInfo,
+    SessionStatus, TermSize,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use crate::metrics::RenderMetrics;
+use crate::shortcut::{self, LEADER_TIMEOUT, LeaderState, ShortcutAction};
 use crate::terminal_view::CellGrid;
-use crate::{connect, session_bar, terminal_view, theme};
+use crate::{connect, session_bar, status_bar, terminal_view, theme};
 
 /// Connection parameters used as a subscription ID (triggers reconnect on change).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -49,7 +51,6 @@ pub enum Message {
     // Session management
     SelectSession(String),
     CreateSessionPressed,
-    #[allow(dead_code)]
     CloseSession(String),
 
     // Raw keyboard event from subscription
@@ -64,7 +65,8 @@ pub enum Message {
     Reconnect,
     DismissDisconnectToast,
 
-    // Toggle the HUD overlay (F12)
+    // Toggle the HUD overlay (F12) — dispatched internally via leader key
+    #[allow(dead_code)]
     ToggleHud,
 
     // Terminal canvas resize detected
@@ -72,6 +74,20 @@ pub enum Message {
         rows: u16,
         cols: u16,
     },
+
+    // Leader key system
+    LeaderTimeout,
+
+    // Rename
+    RenameInput(String),
+    RenameSubmit,
+
+    // Command palette
+    CommandPaletteInput(String),
+    CommandPaletteSelect,
+    CommandPaletteNavigate(i32),
+    #[allow(dead_code)]
+    CommandPaletteClose,
 }
 
 /// Per-session synchronisation state for ordering protection.
@@ -110,11 +126,20 @@ pub struct SmuxApp {
 
     // Reconnection state
     last_connect_params: Option<ConnectParams>,
-    disconnect_toast: Option<std::time::Instant>,
+    disconnect_toast: Option<Instant>,
 
     // Observability
     metrics: RenderMetrics,
     hud_visible: bool,
+
+    // Leader key state machine
+    leader_state: LeaderState,
+
+    // Per-session input lock tracking
+    input_locked: HashMap<String, bool>,
+
+    // Client identity assigned by server
+    client_id: Option<ClientId>,
 }
 
 impl SmuxApp {
@@ -153,6 +178,139 @@ impl SmuxApp {
         }
     }
 
+    /// Get the current terminal size for the active session.
+    fn active_term_size(&self) -> Option<(u16, u16)> {
+        self.active_session
+            .as_ref()
+            .and_then(|s| self.buffers.get(s))
+            .map(|b| (b.rows as u16, b.cols as u16))
+    }
+
+    /// Get the host:port string for display.
+    fn host_port_display(&self) -> String {
+        if let Some(p) = &self.connect_params {
+            format!("{}:{}", p.host, p.port)
+        } else if let Some(p) = &self.last_connect_params {
+            format!("{}:{}", p.host, p.port)
+        } else {
+            String::new()
+        }
+    }
+
+    /// Dispatch a ShortcutAction from the leader key system.
+    fn dispatch_action(&mut self, action: ShortcutAction) -> Task<Message> {
+        match action {
+            ShortcutAction::CreateSession => {
+                self.leader_state = LeaderState::Idle;
+                self.update(Message::CreateSessionPressed)
+            }
+            ShortcutAction::CloseSession => {
+                if let Some(session) = self.active_session.clone() {
+                    self.leader_state = LeaderState::ConfirmClose { session };
+                } else {
+                    self.leader_state = LeaderState::Idle;
+                }
+                Task::none()
+            }
+            ShortcutAction::NextSession => {
+                self.leader_state = LeaderState::Idle;
+                self.cycle_session(1)
+            }
+            ShortcutAction::PrevSession => {
+                self.leader_state = LeaderState::Idle;
+                self.cycle_session(-1)
+            }
+            ShortcutAction::JumpToSession(idx) => {
+                self.leader_state = LeaderState::Idle;
+                if idx < self.session_list.len() {
+                    let name = self.session_list[idx].name.clone();
+                    self.update(Message::SelectSession(name))
+                } else {
+                    Task::none()
+                }
+            }
+            ShortcutAction::RenameSession => {
+                if let Some(session) = self.active_session.clone() {
+                    self.leader_state = LeaderState::RenameEditing {
+                        buffer: session.clone(),
+                        session,
+                    };
+                    text_input::focus(session_bar::rename_input_id())
+                } else {
+                    self.leader_state = LeaderState::Idle;
+                    Task::none()
+                }
+            }
+            ShortcutAction::Disconnect => {
+                self.leader_state = LeaderState::Idle;
+                self.update(Message::DisconnectPressed)
+            }
+            ShortcutAction::ShowSignalMenu => {
+                if let Some(session) = self.active_session.clone() {
+                    self.leader_state = LeaderState::SignalMenu { session };
+                } else {
+                    self.leader_state = LeaderState::Idle;
+                }
+                Task::none()
+            }
+            ShortcutAction::ToggleInputLock => {
+                self.leader_state = LeaderState::Idle;
+                if let Some(session) = self.active_session.clone() {
+                    let locked = self.input_locked.get(&session).copied().unwrap_or(false);
+                    if locked {
+                        self.send_ws(ClientMessage::ReleaseInputLock { session });
+                    } else {
+                        self.send_ws(ClientMessage::RequestInputLock { session });
+                    }
+                }
+                Task::none()
+            }
+            ShortcutAction::ShowHelp => {
+                self.leader_state = LeaderState::HelpVisible;
+                Task::none()
+            }
+            ShortcutAction::ToggleHud => {
+                self.leader_state = LeaderState::Idle;
+                self.hud_visible = !self.hud_visible;
+                Task::none()
+            }
+            ShortcutAction::OpenCommandPalette => {
+                self.leader_state = LeaderState::CommandPalette {
+                    query: String::new(),
+                    selected: 0,
+                };
+                text_input::focus(command_palette_input_id())
+            }
+            ShortcutAction::SendLiteralLeader => {
+                self.leader_state = LeaderState::Idle;
+                // Send Ctrl+B (0x02) to PTY
+                if let Some(session) = &self.active_session {
+                    self.send_ws(ClientMessage::PtyInput {
+                        session: session.clone(),
+                        data: vec![0x02],
+                    });
+                }
+                Task::none()
+            }
+        }
+    }
+
+    /// Cycle to the next/prev session by offset.
+    fn cycle_session(&mut self, offset: i32) -> Task<Message> {
+        if self.session_list.is_empty() {
+            return Task::none();
+        }
+        let current_idx = self
+            .active_session
+            .as_ref()
+            .and_then(|name| self.session_list.iter().position(|s| &s.name == name))
+            .unwrap_or(0);
+        let len = self.session_list.len() as i32;
+        let new_idx = ((current_idx as i32 + offset).rem_euclid(len)) as usize;
+        let name = self.session_list[new_idx].name.clone();
+        self.update(Message::SelectSession(name))
+    }
+
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
             //  Connect form
@@ -188,6 +346,8 @@ impl SmuxApp {
                 self.active_session = None;
                 self.session_list.clear();
                 self.session_sync.clear();
+                self.input_locked.clear();
+                self.leader_state = LeaderState::Idle;
                 self.status_msg = "Disconnected".to_string();
                 Task::none()
             }
@@ -254,56 +414,23 @@ impl SmuxApp {
             }
 
             Message::CloseSession(name) => {
-                let rid = self.next_rid();
-                self.send_ws(ClientMessage::SessionClose {
-                    request_id: rid,
-                    name,
-                });
+                // Close button on tab triggers confirm flow
+                self.leader_state = LeaderState::ConfirmClose { session: name };
                 Task::none()
             }
 
-            //  Keyboard input
+            //  Keyboard input -- leader key interception
             Message::RawKeyEvent {
                 key,
                 modifiers,
                 text,
-            } => {
-                let app_cursor = self
-                    .active_session
-                    .as_ref()
-                    .and_then(|s| self.buffers.get(s))
-                    .map(|b| b.app_cursor())
-                    .unwrap_or(false);
-                let bytes = key_to_bytes(key, modifiers, text, app_cursor);
-                match &bytes {
-                    Some(b) => debug!(byte_count = b.len(), "RawKeyEvent: mapped to bytes"),
-                    None => debug!("RawKeyEvent: key_to_bytes returned None"),
-                }
-                if let Some(bytes) = bytes {
-                    if let Some(session) = &self.active_session {
-                        debug!(
-                            session,
-                            byte_count = bytes.len(),
-                            "RawKeyEvent: forwarding to PTY"
-                        );
-                        self.send_ws(ClientMessage::PtyInput {
-                            session: session.clone(),
-                            data: bytes,
-                        });
-                    } else {
-                        debug!("RawKeyEvent: dropped (no active session)");
-                        self.status_msg =
-                            "No active session -- press [+] to create one".to_string();
-                    }
-                }
-                Task::none()
-            }
+            } => self.handle_key_event(key, modifiers, text),
 
             Message::Disconnected => {
                 self.ws_sender = None;
                 self.last_connect_params = self.connect_params.take();
-                self.status_msg = "Connection lost — reconnecting in 3s...".to_string();
-                self.disconnect_toast = Some(std::time::Instant::now());
+                self.status_msg = "Connection lost \u{2014} reconnecting in 3s...".to_string();
+                self.disconnect_toast = Some(Instant::now());
                 warn!("Connection lost, scheduling reconnect");
                 Task::batch([
                     Task::perform(
@@ -348,7 +475,238 @@ impl SmuxApp {
                 }
                 Task::none()
             }
+
+            // Leader timeout check
+            Message::LeaderTimeout => {
+                if let LeaderState::AwaitingAction { entered_at } = &self.leader_state
+                    && entered_at.elapsed() >= LEADER_TIMEOUT
+                {
+                    self.leader_state = LeaderState::Idle;
+                }
+                Task::none()
+            }
+
+            // Rename
+            Message::RenameInput(new_val) => {
+                if let LeaderState::RenameEditing { buffer, .. } = &mut self.leader_state {
+                    *buffer = new_val;
+                }
+                Task::none()
+            }
+
+            Message::RenameSubmit => {
+                if let LeaderState::RenameEditing { buffer, session } =
+                    std::mem::replace(&mut self.leader_state, LeaderState::Idle)
+                {
+                    let new_name = buffer.trim().to_string();
+                    if !new_name.is_empty() && new_name != session {
+                        let rid = self.next_rid();
+                        self.send_ws(ClientMessage::SessionRename {
+                            request_id: rid,
+                            session,
+                            new_name,
+                        });
+                    }
+                }
+                Task::none()
+            }
+
+            // Command palette
+            Message::CommandPaletteInput(query) => {
+                if let LeaderState::CommandPalette { query: q, selected } = &mut self.leader_state {
+                    *q = query;
+                    *selected = 0;
+                }
+                Task::none()
+            }
+
+            Message::CommandPaletteNavigate(delta) => {
+                if let LeaderState::CommandPalette { query, selected } = &mut self.leader_state {
+                    let filtered = shortcut::filter_commands(query);
+                    if !filtered.is_empty() {
+                        let len = filtered.len() as i32;
+                        *selected = ((*selected as i32 + delta).rem_euclid(len)) as usize;
+                    }
+                }
+                Task::none()
+            }
+
+            Message::CommandPaletteSelect => {
+                if let LeaderState::CommandPalette { query, selected } =
+                    std::mem::replace(&mut self.leader_state, LeaderState::Idle)
+                {
+                    let filtered = shortcut::filter_commands(&query);
+                    if let Some(entry) = filtered.into_iter().nth(selected) {
+                        return self.dispatch_action(entry.action);
+                    }
+                }
+                Task::none()
+            }
+
+            Message::CommandPaletteClose => {
+                self.leader_state = LeaderState::Idle;
+                Task::none()
+            }
         }
+    }
+
+    /// Handle a raw key event with leader key interception.
+    fn handle_key_event(
+        &mut self,
+        key: iced::keyboard::Key,
+        modifiers: iced::keyboard::Modifiers,
+        text_val: Option<String>,
+    ) -> Task<Message> {
+        use iced::keyboard::Key;
+        use iced::keyboard::key::Named;
+
+        match &self.leader_state {
+            LeaderState::Idle => {
+                // F12 toggles HUD
+                if key == Key::Named(Named::F12) {
+                    self.hud_visible = !self.hud_visible;
+                    return Task::none();
+                }
+
+                // Ctrl+B → enter leader mode
+                if shortcut::is_leader_key(&key, modifiers) {
+                    self.leader_state = LeaderState::AwaitingAction {
+                        entered_at: Instant::now(),
+                    };
+                    return Task::none();
+                }
+
+                // Normal key → forward to PTY
+                self.forward_key_to_pty(key, modifiers, text_val)
+            }
+
+            LeaderState::AwaitingAction { .. } => {
+                if let Some(action) = shortcut::resolve_key(&key, modifiers) {
+                    self.dispatch_action(action)
+                } else {
+                    // Unrecognized key in leader mode → cancel and discard
+                    self.leader_state = LeaderState::Idle;
+                    Task::none()
+                }
+            }
+
+            LeaderState::RenameEditing { .. } => {
+                // Escape cancels rename
+                if key == Key::Named(Named::Escape) {
+                    self.leader_state = LeaderState::Idle;
+                    return Task::none();
+                }
+                // Enter and text input handled by iced text_input widget messages
+                Task::none()
+            }
+
+            LeaderState::ConfirmClose { .. } => {
+                let session = if let LeaderState::ConfirmClose { session } = &self.leader_state {
+                    session.clone()
+                } else {
+                    unreachable!()
+                };
+
+                match &key {
+                    Key::Character(c) if c.as_str() == "y" => {
+                        self.leader_state = LeaderState::Idle;
+                        let rid = self.next_rid();
+                        self.send_ws(ClientMessage::SessionClose {
+                            request_id: rid,
+                            name: session,
+                        });
+                        Task::none()
+                    }
+                    _ => {
+                        // Any other key (including 'n') cancels
+                        self.leader_state = LeaderState::Idle;
+                        Task::none()
+                    }
+                }
+            }
+
+            LeaderState::SignalMenu { .. } => {
+                let session = if let LeaderState::SignalMenu { session } = &self.leader_state {
+                    session.clone()
+                } else {
+                    unreachable!()
+                };
+
+                if key == Key::Named(Named::Escape) {
+                    self.leader_state = LeaderState::Idle;
+                    return Task::none();
+                }
+
+                if let Some(signal) = shortcut::resolve_signal_key(&key) {
+                    self.leader_state = LeaderState::Idle;
+                    self.send_ws(ClientMessage::Signal { session, signal });
+                } else {
+                    self.leader_state = LeaderState::Idle;
+                }
+                Task::none()
+            }
+
+            LeaderState::HelpVisible => {
+                // Any key closes help
+                self.leader_state = LeaderState::Idle;
+                Task::none()
+            }
+
+            LeaderState::CommandPalette { .. } => {
+                // Escape closes
+                if key == Key::Named(Named::Escape) {
+                    self.leader_state = LeaderState::Idle;
+                    return Task::none();
+                }
+                // Arrow keys navigate
+                if key == Key::Named(Named::ArrowUp) {
+                    return self.update(Message::CommandPaletteNavigate(-1));
+                }
+                if key == Key::Named(Named::ArrowDown) {
+                    return self.update(Message::CommandPaletteNavigate(1));
+                }
+                // Enter selects
+                if key == Key::Named(Named::Enter) {
+                    return self.update(Message::CommandPaletteSelect);
+                }
+                // Other keys are handled by the text_input widget
+                Task::none()
+            }
+        }
+    }
+
+    /// Forward a key to the PTY as bytes.
+    fn forward_key_to_pty(
+        &mut self,
+        key: iced::keyboard::Key,
+        modifiers: iced::keyboard::Modifiers,
+        text_val: Option<String>,
+    ) -> Task<Message> {
+        let app_cursor = self
+            .active_session
+            .as_ref()
+            .and_then(|s| self.buffers.get(s))
+            .map(|b| b.app_cursor())
+            .unwrap_or(false);
+        let bytes = key_to_bytes(key, modifiers, text_val, app_cursor);
+        if let Some(bytes) = bytes {
+            if let Some(session) = &self.active_session {
+                // Check input lock
+                let locked = self.input_locked.get(session).copied().unwrap_or(false);
+                if locked {
+                    self.status_msg = "Input locked on this session".to_string();
+                    return Task::none();
+                }
+                self.send_ws(ClientMessage::PtyInput {
+                    session: session.clone(),
+                    data: bytes,
+                });
+            } else {
+                self.status_msg =
+                    "No active session -- press Ctrl+B then c to create one".to_string();
+            }
+        }
+        Task::none()
     }
 
     pub fn view(&self) -> Element<'_, Message> {
@@ -386,8 +744,6 @@ impl SmuxApp {
                     connect::ConnectResult::Connected(sender) => {
                         let _ = output.send(Message::Connected(sender)).await;
                         while let Some(msg) = srv_rx.recv().await {
-                            // Drain all pending messages into a single batch so iced
-                            // processes them in one update/view/draw cycle.
                             let mut batch = vec![msg];
                             while let Ok(msg) = srv_rx.try_recv() {
                                 batch.push(msg);
@@ -396,7 +752,6 @@ impl SmuxApp {
                                 break;
                             }
                         }
-                        // All senders dropped → connection lost
                         let _ = output.send(Message::Disconnected).await;
                     }
                     connect::ConnectResult::Failed(e) => {
@@ -406,7 +761,14 @@ impl SmuxApp {
             }),
         );
 
-        Subscription::batch([conn_sub, kbd_sub])
+        // Leader timeout subscription: poll every 100ms when awaiting action
+        let leader_sub = if self.leader_state.is_awaiting_action() {
+            iced::time::every(Duration::from_millis(100)).map(|_| Message::LeaderTimeout)
+        } else {
+            Subscription::none()
+        };
+
+        Subscription::batch([conn_sub, kbd_sub, leader_sub])
     }
 
     pub fn theme(&self) -> Theme {
@@ -418,9 +780,13 @@ impl SmuxApp {
     fn handle_server_message(&mut self, msg: ServerMessage) -> Task<Message> {
         match msg {
             ServerMessage::AuthResult {
-                success, reason, ..
+                success,
+                reason,
+                client_id,
             } => {
-                if !success {
+                if success {
+                    self.client_id = client_id;
+                } else {
                     warn!("Auth failed: {:?}", reason);
                     self.status_msg = format!("Auth failed: {}", reason.unwrap_or_default());
                     self.connect_params = None;
@@ -467,6 +833,7 @@ impl SmuxApp {
             ServerMessage::SessionClosed { name, .. } => {
                 self.buffers.remove(&name);
                 self.session_sync.remove(&name);
+                self.input_locked.remove(&name);
                 self.session_list.retain(|s| s.name != name);
                 if self.active_session.as_deref() == Some(&name) {
                     self.active_session = self.session_list.first().map(|s| s.name.clone());
@@ -477,17 +844,15 @@ impl SmuxApp {
                 Task::none()
             }
 
-            // Server-side VT diff: apply snapshot or incremental update
             ServerMessage::TerminalSnapshot {
                 session,
                 snapshot,
                 seqno,
                 sent_at_ms,
             } => {
-                let start = std::time::Instant::now();
+                let start = Instant::now();
                 let grid = self.buffers.entry(session.clone()).or_default();
                 grid.apply_snapshot(snapshot);
-                // Transition to Synced: next expected seqno is snapshot's seqno + 1
                 self.session_sync.insert(
                     session,
                     SessionSync::Synced {
@@ -507,14 +872,12 @@ impl SmuxApp {
             } => {
                 match self.session_sync.get(&session) {
                     Some(SessionSync::AwaitingSync) => {
-                        // Stale diff from a previous uni stream — discard.
                         debug!("Discarding stale TerminalUpdate for '{session}' (awaiting sync)");
                         return Task::none();
                     }
                     Some(SessionSync::Synced { expected }) if seqno != *expected => {
-                        // Sequence gap detected — request full resync.
                         warn!(
-                            "Seqno gap on '{session}': expected {:?}, got {:?} — re-attaching",
+                            "Seqno gap on '{session}': expected {:?}, got {:?} \u{2014} re-attaching",
                             expected, seqno
                         );
                         if let Some(grid) = self.buffers.get_mut(&session) {
@@ -526,11 +889,10 @@ impl SmuxApp {
                     _ => {}
                 }
 
-                let start = std::time::Instant::now();
+                let start = Instant::now();
                 if let Some(grid) = self.buffers.get_mut(&session) {
                     grid.apply_diff(Arc::unwrap_or_clone(diff));
                 }
-                // Advance expected seqno.
                 self.session_sync.insert(
                     session,
                     SessionSync::Synced {
@@ -555,6 +917,10 @@ impl SmuxApp {
 
             ServerMessage::Event { event } => {
                 info!("Server event: {:?}", event);
+                // Handle rename events to update local state
+                if let SessionEventMsg::Renamed { old_name, new_name } = event {
+                    self.apply_rename(&old_name, &new_name);
+                }
                 Task::none()
             }
 
@@ -576,33 +942,118 @@ impl SmuxApp {
                 Task::none()
             }
 
+            ServerMessage::SessionRenamed { old_name, new_name } => {
+                self.apply_rename(&old_name, &new_name);
+                Task::none()
+            }
+
+            ServerMessage::InputLockGranted { session } => {
+                self.input_locked.insert(session.clone(), true);
+                self.status_msg = format!("Input lock acquired on '{session}'");
+                Task::none()
+            }
+
+            ServerMessage::InputLockDenied { session, holder } => {
+                self.status_msg = format!(
+                    "Input lock denied on '{session}' (held by client {:?})",
+                    holder
+                );
+                Task::none()
+            }
+
+            ServerMessage::InputLockReleased { session } => {
+                self.input_locked.insert(session.clone(), false);
+                self.status_msg = format!("Input lock released on '{session}'");
+                Task::none()
+            }
+
             _ => Task::none(),
         }
     }
 
+    /// Apply a session rename across all local state.
+    fn apply_rename(&mut self, old_name: &str, new_name: &str) {
+        if let Some(buf) = self.buffers.remove(old_name) {
+            self.buffers.insert(new_name.to_string(), buf);
+        }
+        if let Some(sync) = self.session_sync.remove(old_name) {
+            self.session_sync.insert(new_name.to_string(), sync);
+        }
+        if let Some(locked) = self.input_locked.remove(old_name) {
+            self.input_locked.insert(new_name.to_string(), locked);
+        }
+        for info in &mut self.session_list {
+            if info.name == old_name {
+                info.name = new_name.to_string();
+            }
+        }
+        if self.active_session.as_deref() == Some(old_name) {
+            self.active_session = Some(new_name.to_string());
+        }
+    }
+
     fn view_connect(&self) -> Element<'_, Message> {
+        let title = text("smux").size(28).color(theme::ACCENT).font(Font {
+            weight: iced::font::Weight::Bold,
+            ..Font::MONOSPACE
+        });
+        let subtitle = text("remote terminal v0.1.0").size(12).color(theme::FG_DIM);
+
         let form = column![
-            text("smux -- remote terminal").size(24),
-            text("Host"),
-            text_input("127.0.0.1", &self.host).on_input(Message::HostChanged),
-            text("Port"),
-            text_input("8443", &self.port).on_input(Message::PortChanged),
-            text("Auth Token"),
+            title,
+            subtitle,
+            Space::with_height(16),
+            text("Host").size(13).color(theme::FG),
+            text_input("127.0.0.1", &self.host)
+                .on_input(Message::HostChanged)
+                .style(theme::connect_input),
+            text("Port").size(13).color(theme::FG),
+            text_input("8443", &self.port)
+                .on_input(Message::PortChanged)
+                .style(theme::connect_input),
+            text("Auth Token").size(13).color(theme::FG),
             text_input("paste token here", &self.token)
                 .on_input(Message::TokenChanged)
-                .secure(true),
-            button("Connect").on_press(Message::ConnectPressed),
-            text(&self.status_msg),
+                .on_submit(Message::ConnectPressed)
+                .secure(true)
+                .style(theme::connect_input),
+            Space::with_height(8),
+            button(
+                text("Connect")
+                    .size(14)
+                    .width(Length::Fill)
+                    .align_x(iced::alignment::Horizontal::Center)
+            )
+            .style(theme::connect_button)
+            .on_press(Message::ConnectPressed)
+            .padding([8, 16])
+            .width(Length::Fill),
+            {
+                let msg_text = text(&self.status_msg).size(12);
+                if self.status_msg.starts_with("Connection failed")
+                    || self.status_msg.starts_with("Auth failed")
+                {
+                    msg_text.color(theme::RED)
+                } else {
+                    msg_text.color(theme::FG_DIM)
+                }
+            },
         ]
-        .spacing(8)
-        .padding(24)
-        .max_width(400);
+        .spacing(6)
+        .padding(32)
+        .max_width(380);
 
-        container(form)
+        let styled_form = container(form).style(theme::connect_container);
+
+        container(styled_form)
             .width(Length::Fill)
             .height(Length::Fill)
             .center_x(Length::Fill)
             .center_y(Length::Fill)
+            .style(|_theme: &Theme| container::Style {
+                background: Some(iced::Background::Color(theme::BG)),
+                ..Default::default()
+            })
             .into()
     }
 
@@ -610,11 +1061,23 @@ impl SmuxApp {
         let names: Vec<String> = self.session_list.iter().map(|s| s.name.clone()).collect();
         let active_ref = self.active_session.as_deref();
 
+        let rename_state =
+            if let LeaderState::RenameEditing { buffer, session } = &self.leader_state {
+                Some((session.as_str(), buffer.as_str()))
+            } else {
+                None
+            };
+
         let bar = session_bar::view(
             &names,
             active_ref,
+            self.leader_state.is_leader_active(),
+            rename_state,
             Message::SelectSession,
+            Message::CloseSession,
             Message::CreateSessionPressed,
+            Message::RenameInput,
+            Message::RenameSubmit,
         );
 
         let metrics = if self.hud_visible {
@@ -627,39 +1090,186 @@ impl SmuxApp {
             if let Some(buf) = self.buffers.get(name) {
                 terminal_view::view(buf, name, metrics)
             } else {
-                text("No output yet").into()
+                text("No output yet").color(theme::FG_DIM).into()
             }
         } else {
-            text("No active session -- press [+] to create one").into()
+            text("No active session -- press Ctrl+B then c to create one")
+                .color(theme::FG_DIM)
+                .into()
         };
 
-        let mut content = column![bar, terminal_area]
+        // Input lock status for active session
+        let input_locked = self
+            .active_session
+            .as_ref()
+            .and_then(|s| self.input_locked.get(s))
+            .copied()
+            .unwrap_or(false);
+
+        let status = status_bar::view(
+            &self.host_port_display(),
+            self.session_list.len(),
+            &self.leader_state,
+            input_locked,
+            self.active_term_size(),
+            Message::DisconnectPressed,
+        );
+
+        let mut content = column![bar, terminal_area, status]
             .width(Length::Fill)
             .height(Length::Fill);
 
+        // Disconnect toast
         if self.disconnect_toast.is_some() {
             content = content.push(
                 container(
-                    text("Connection lost — reconnecting...")
+                    text("Connection lost \u{2014} reconnecting...")
                         .size(14)
                         .color(iced::Color::WHITE),
                 )
                 .width(Length::Fill)
                 .padding(8)
-                .style(|_theme: &Theme| container::Style {
-                    background: Some(iced::Background::Color(iced::Color::from_rgb(
-                        0.8, 0.2, 0.2,
-                    ))),
-                    ..Default::default()
-                }),
+                .style(theme::toast_error),
             );
         }
 
-        let status = text(&self.status_msg).size(12);
-        let disconnect = button("Disconnect").on_press(Message::DisconnectPressed);
+        // Overlay: help, command palette
+        let base: Element<Message> = content.into();
 
-        content.push(row![status, disconnect].spacing(8)).into()
+        match &self.leader_state {
+            LeaderState::HelpVisible => {
+                let help = self.view_help_overlay();
+                iced::widget::stack![base, help].into()
+            }
+            LeaderState::CommandPalette { query, selected } => {
+                let palette = self.view_command_palette(query, *selected);
+                iced::widget::stack![base, palette].into()
+            }
+            _ => base,
+        }
     }
+
+    fn view_help_overlay(&self) -> Element<'_, Message> {
+        let entries = shortcut::shortcut_help_entries();
+
+        let mut col = column![
+            text("Keyboard Shortcuts")
+                .size(18)
+                .color(theme::ACCENT)
+                .font(Font {
+                    weight: iced::font::Weight::Bold,
+                    ..Font::MONOSPACE
+                }),
+            Space::with_height(12),
+        ]
+        .spacing(4);
+
+        for (key, desc) in &entries {
+            col = col.push(
+                row![
+                    text(format!("  {key:>10}"))
+                        .size(13)
+                        .color(theme::GREEN)
+                        .font(Font::MONOSPACE),
+                    text(format!("  {desc}")).size(13).color(theme::FG),
+                ]
+                .spacing(8),
+            );
+        }
+
+        col = col.push(Space::with_height(12));
+        col = col.push(text("Press any key to close").size(11).color(theme::FG_DIM));
+
+        let help_box = container(col.padding(24))
+            .style(theme::command_palette_container)
+            .max_width(480);
+
+        container(
+            container(help_box)
+                .width(Length::Fill)
+                .height(Length::Fill)
+                .center_x(Length::Fill)
+                .center_y(Length::Fill),
+        )
+        .width(Length::Fill)
+        .height(Length::Fill)
+        .style(theme::overlay_container)
+        .into()
+    }
+
+    fn view_command_palette(&self, query: &str, selected: usize) -> Element<'_, Message> {
+        let filtered = shortcut::filter_commands(query);
+
+        let input = text_input("Type a command...", query)
+            .on_input(Message::CommandPaletteInput)
+            .on_submit(Message::CommandPaletteSelect)
+            .size(14)
+            .style(theme::connect_input)
+            .id(command_palette_input_id());
+
+        let mut items_col = column![].spacing(0);
+        for (i, entry) in filtered.iter().take(10).enumerate() {
+            let is_selected = i == selected;
+            let style = if is_selected {
+                theme::command_palette_item_selected
+            } else {
+                theme::command_palette_item
+            };
+            let text_color = if is_selected {
+                iced::Color::WHITE
+            } else {
+                theme::FG
+            };
+            let hint_color = if is_selected {
+                iced::Color::from_rgba(1.0, 1.0, 1.0, 0.6)
+            } else {
+                theme::FG_DIM
+            };
+
+            let label = entry.label.clone();
+            let hint = entry.shortcut_hint.clone();
+            let item = container(
+                row![
+                    text(label).size(13).color(text_color),
+                    Space::with_width(Length::Fill),
+                    text(hint).size(11).color(hint_color),
+                ]
+                .padding([4, 8])
+                .width(Length::Fill),
+            )
+            .width(Length::Fill)
+            .style(style);
+
+            items_col = items_col.push(item);
+        }
+
+        let palette = column![input, items_col]
+            .spacing(4)
+            .padding(12)
+            .max_width(400);
+
+        let palette_box = container(palette).style(theme::command_palette_container);
+
+        // Position at top center
+        let positioned = column![
+            Space::with_height(60),
+            container(palette_box)
+                .width(Length::Fill)
+                .center_x(Length::Fill),
+        ]
+        .width(Length::Fill)
+        .height(Length::Fill);
+
+        container(positioned)
+            .width(Length::Fill)
+            .height(Length::Fill)
+            .style(theme::overlay_container)
+            .into()
+    }
+}
+
+fn command_palette_input_id() -> text_input::Id {
+    text_input::Id::new("command-palette-input")
 }
 
 fn keyboard_filter(
@@ -681,10 +1291,6 @@ fn keyboard_filter(
                     text,
                     ..
                 } => {
-                    // F12 toggles the HUD overlay -- don't forward to PTY.
-                    if *key == iced::keyboard::Key::Named(iced::keyboard::key::Named::F12) {
-                        return Some(Message::ToggleHud);
-                    }
                     let text_owned = text.as_ref().map(|t| t.to_string());
                     Some(Message::RawKeyEvent {
                         key: key.clone(),
