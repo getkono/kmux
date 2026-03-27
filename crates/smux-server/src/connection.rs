@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use quinn::Connection;
 use smux_protocol::messages::{
-    ClientId, ClientMessage, ErrorCode, SequenceNo, ServerMessage, SessionEventMsg,
+    ClientId, ClientMessage, ErrorCode, SequenceNo, ServerMessage, SessionEventMsg, epoch_millis,
 };
 use smux_protocol::{decode_client, encode_server, read_frame, write_frame};
 use tokio::sync::mpsc;
@@ -273,6 +273,7 @@ async fn session_uni_writer(
                 session: session.clone(),
                 snapshot,
                 seqno: SequenceNo(0),
+                sent_at_ms: epoch_millis(),
             };
             if send_frame(&mut uni, &msg).await.is_err() {
                 return;
@@ -284,6 +285,7 @@ async fn session_uni_writer(
                     session: session.clone(),
                     diff,
                     seqno,
+                    sent_at_ms: epoch_millis(),
                 };
                 if send_frame(&mut uni, &msg).await.is_err() {
                     return;
@@ -301,6 +303,7 @@ async fn session_uni_writer(
                 session: session.clone(),
                 snapshot,
                 seqno: SequenceNo(0),
+                sent_at_ms: epoch_millis(),
             };
             if send_frame(&mut uni, &msg).await.is_err() {
                 return;

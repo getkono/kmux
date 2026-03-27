@@ -271,7 +271,7 @@ impl TermState {
     }
 }
 
-//  Color resolution (moved from client) 
+//  Color resolution (moved from client)
 
 fn resolve_color(color: Color, colors: &alacritty_terminal::term::color::Colors) -> CellColor {
     match color {

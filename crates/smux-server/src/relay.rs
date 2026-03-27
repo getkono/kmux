@@ -2,7 +2,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use smux::session::PtyReader;
-use smux_protocol::messages::{ClientId, SequenceNo, ServerMessage};
+use smux_protocol::messages::{ClientId, SequenceNo, ServerMessage, epoch_millis};
 use tokio::time::{Duration, Instant};
 use tracing::warn;
 
@@ -132,6 +132,7 @@ fn flush_diff(
         session: session.to_string(),
         diff,
         seqno,
+        sent_at_ms: epoch_millis(),
     };
 
     broadcast_to_clients(session, &msg, clients);
