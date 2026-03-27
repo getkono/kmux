@@ -33,7 +33,7 @@ pub fn decode_server(data: &[u8]) -> Result<ServerMessage, ProtocolError> {
     postcard::from_bytes(data).map_err(ProtocolError::Postcard)
 }
 
-//  Length-prefixed framing for QUIC byte streams 
+//  Length-prefixed framing for QUIC byte streams
 
 /// Maximum frame size (16 MiB) -- prevents unbounded allocations from malformed data.
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
@@ -204,6 +204,7 @@ mod tests {
             session: "test".to_string(),
             diff: std::sync::Arc::new(diff),
             seqno: SequenceNo(1),
+            sent_at_ms: 0,
         };
         let bytes = encode_server(&msg).expect("encode");
         let decoded = decode_server(&bytes).expect("decode");
@@ -230,6 +231,7 @@ mod tests {
             session: "snap".to_string(),
             snapshot,
             seqno: SequenceNo(99),
+            sent_at_ms: 0,
         };
         let bytes = encode_server(&msg).expect("encode");
         let decoded = decode_server(&bytes).expect("decode");
@@ -268,6 +270,7 @@ mod tests {
             session: "s".to_string(),
             diff: std::sync::Arc::new(diff),
             seqno: SequenceNo(1),
+            sent_at_ms: 0,
         };
         let bytes = encode_server(&msg).expect("encode");
         let decoded = decode_server(&bytes).expect("decode");

@@ -3,7 +3,15 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// Current wire protocol version. Increment when breaking changes are made.
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
+
+/// Return the current wall-clock time as milliseconds since the Unix epoch.
+pub fn epoch_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
 
 pub type SessionId = String;
 pub type RequestId = u64;
@@ -101,7 +109,7 @@ pub enum ErrorCode {
     InputDisabled,
 }
 
-//  VT diff types 
+//  VT diff types
 
 /// Portable cell color -- resolved to RGB on the server.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -378,6 +386,8 @@ pub enum ServerMessage {
         session: SessionId,
         diff: Arc<TerminalDiff>,
         seqno: SequenceNo,
+        /// Wall-clock timestamp (ms since Unix epoch) when the server sent this message.
+        sent_at_ms: u64,
     },
 
     /// Full grid snapshot for an attached session (sent on attach/resize).
@@ -385,6 +395,8 @@ pub enum ServerMessage {
         session: SessionId,
         snapshot: GridSnapshot,
         seqno: SequenceNo,
+        /// Wall-clock timestamp (ms since Unix epoch) when the server sent this message.
+        sent_at_ms: u64,
     },
 
     /// Input lock granted to the requesting client.
