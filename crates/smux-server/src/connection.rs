@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use quinn::Connection;
 use smux_protocol::messages::{
@@ -383,6 +384,21 @@ pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
         }
     });
 
+    // Periodic application-level keepalive ping on the control stream
+    let ping_tx = ctrl_tx.clone();
+    let ping_task = tokio::spawn(async move {
+        let mut seq = 0u64;
+        let mut interval = tokio::time::interval(Duration::from_secs(30));
+        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            interval.tick().await;
+            if ping_tx.send(ServerMessage::Ping { seq }).is_err() {
+                break;
+            }
+            seq += 1;
+        }
+    });
+
     let mut state = ClientState::new(app.clone(), ctrl_tx, conn);
 
     // Main read loop on control stream
@@ -407,6 +423,7 @@ pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
     }
 
     event_task.abort();
+    ping_task.abort();
 
     if let Some(client_id) = state.client_id {
         app.detach_client_all(client_id).await;
