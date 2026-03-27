@@ -1,5 +1,6 @@
 mod app;
 mod connect;
+mod metrics;
 mod session_bar;
 mod terminal_view;
 mod theme;
