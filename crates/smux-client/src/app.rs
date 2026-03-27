@@ -892,6 +892,11 @@ impl SmuxApp {
                 let start = Instant::now();
                 if let Some(grid) = self.buffers.get_mut(&session) {
                     grid.apply_diff(Arc::unwrap_or_clone(diff));
+                    debug!(
+                        session,
+                        generation = grid.generation(),
+                        "TerminalUpdate applied"
+                    );
                 }
                 self.session_sync.insert(
                     session,

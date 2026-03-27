@@ -30,10 +30,6 @@ pub struct CellGrid {
     pub rows: usize,
     pub cols: usize,
     generation: u64,
-    /// Incremented only when cell content changes (not cursor/mode-only diffs).
-    /// Used by the canvas to avoid clearing the expensive cell cache on
-    /// cursor-only updates.
-    cells_generation: u64,
 }
 
 impl CellGrid {
@@ -45,7 +41,6 @@ impl CellGrid {
             rows,
             cols,
             generation: 0,
-            cells_generation: 0,
         }
     }
 
@@ -57,12 +52,10 @@ impl CellGrid {
         self.cursor = snapshot.cursor;
         self.modes = snapshot.modes;
         self.generation += 1;
-        self.cells_generation += 1;
     }
 
     /// Apply a diff from the server -- only changed cells are updated.
     pub fn apply_diff(&mut self, diff: TerminalDiff) {
-        let has_cell_ops = !diff.ops.is_empty();
         for op in diff.ops {
             match op {
                 DiffOp::Cell { row, col, cell } => {
@@ -92,9 +85,6 @@ impl CellGrid {
         self.cursor = diff.cursor;
         self.modes = diff.modes;
         self.generation += 1;
-        if has_cell_ops {
-            self.cells_generation += 1;
-        }
     }
 
     /// Whether the terminal is in application-cursor mode.
@@ -108,7 +98,6 @@ impl CellGrid {
         self.cursor = CursorState::default();
         self.modes = TermModes::EMPTY;
         self.generation += 1;
-        self.cells_generation += 1;
     }
 
     /// Resize the grid (server will send a fresh snapshot after resize).
@@ -117,16 +106,10 @@ impl CellGrid {
         self.cols = cols as usize;
         self.cells = vec![CellState::default(); self.rows * self.cols];
         self.generation += 1;
-        self.cells_generation += 1;
     }
 
-    #[cfg(test)]
     pub fn generation(&self) -> u64 {
         self.generation
-    }
-
-    pub fn cells_generation(&self) -> u64 {
-        self.cells_generation
     }
 }
 
@@ -147,7 +130,7 @@ pub struct GridView<'a> {
     cursor: CursorState,
     rows: usize,
     cols: usize,
-    cells_generation: u64,
+    generation: u64,
     metrics: Option<MetricsSnapshot>,
 }
 
@@ -158,7 +141,7 @@ impl<'a> GridView<'a> {
             cursor: grid.cursor,
             rows: grid.rows,
             cols: grid.cols,
-            cells_generation: grid.cells_generation(),
+            generation: grid.generation(),
             metrics,
         }
     }
@@ -166,8 +149,8 @@ impl<'a> GridView<'a> {
 
 /// State preserved across canvas redraws.
 ///
-/// Uses a dedicated `cells_cache` that is only cleared when cell content
-/// changes. Cursor-only diffs skip the expensive full-cell redraw.
+/// The `cells_cache` is cleared on every diff (tracked by `last_generation`)
+/// so that any server-side change always produces a fresh render.
 /// FPS measurement window in seconds.
 const FPS_WINDOW_SECS: f64 = 1.0;
 
@@ -176,7 +159,7 @@ pub struct CanvasState {
     cols: u16,
     cells_cache: canvas::Cache,
     cursor_cache: canvas::Cache,
-    last_cells_generation: Cell<u64>,
+    last_generation: Cell<u64>,
     draw_duration_ms: Cell<f64>,
     /// Circular buffer of draw timestamps for FPS calculation.
     draw_timestamps: std::cell::RefCell<std::collections::VecDeque<Instant>>,
@@ -189,7 +172,7 @@ impl Default for CanvasState {
             cols: 0,
             cells_cache: canvas::Cache::default(),
             cursor_cache: canvas::Cache::default(),
-            last_cells_generation: Cell::new(0),
+            last_generation: Cell::new(0),
             draw_duration_ms: Cell::new(0.0),
             draw_timestamps: std::cell::RefCell::new(std::collections::VecDeque::with_capacity(
                 128,
@@ -271,10 +254,10 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
     ) -> Vec<canvas::Geometry> {
         let draw_start = Instant::now();
 
-        // Only clear the cell cache when cell content actually changed.
-        // Cursor-only diffs skip this -- the cached cell geometry stays valid.
-        if self.cells_generation != state.last_cells_generation.get() {
-            state.last_cells_generation.set(self.cells_generation);
+        // Clear the cell cache on every diff so that any server-side change
+        // (cell, cursor, or mode) produces a fresh render.
+        if self.generation != state.last_generation.get() {
+            state.last_generation.set(self.generation);
             state.cells_cache.clear();
         }
 
@@ -606,11 +589,11 @@ mod tests {
     }
 
     #[test]
-    fn cells_generation_only_on_cell_ops() {
+    fn generation_increments_on_every_diff() {
         let mut grid = CellGrid::new(2, 3);
-        let cg0 = grid.cells_generation();
+        let g0 = grid.generation();
 
-        // Cursor-only diff: cells_generation unchanged
+        // Cursor-only diff: generation still increments
         grid.apply_diff(TerminalDiff {
             ops: vec![],
             cursor: CursorState {
@@ -620,9 +603,9 @@ mod tests {
             },
             modes: TermModes::EMPTY,
         });
-        assert_eq!(grid.cells_generation(), cg0);
+        assert_eq!(grid.generation(), g0 + 1);
 
-        // Diff with cell ops: cells_generation increments
+        // Diff with cell ops: generation increments
         grid.apply_diff(TerminalDiff {
             ops: vec![DiffOp::Cell {
                 row: 0,
@@ -635,6 +618,6 @@ mod tests {
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
         });
-        assert_eq!(grid.cells_generation(), cg0 + 1);
+        assert_eq!(grid.generation(), g0 + 2);
     }
 }

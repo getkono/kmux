@@ -4,7 +4,7 @@ use std::sync::{Arc, Mutex};
 use smux::session::PtyReader;
 use smux_protocol::messages::{ClientId, SequenceNo, ServerMessage, epoch_millis};
 use tokio::time::{Duration, Instant};
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::app::ClientMap;
 use crate::scrollback::DiffBuffer;
@@ -120,8 +120,22 @@ fn flush_diff(
     };
 
     let Some(diff) = diff else {
+        debug!(
+            session,
+            bytes = data.len(),
+            "flush_diff: no changes after feeding bytes"
+        );
         return;
     };
+
+    debug!(
+        session,
+        ops = diff.ops.len(),
+        cursor_row = diff.cursor.row,
+        cursor_col = diff.cursor.col,
+        bytes = data.len(),
+        "flush_diff: broadcasting diff"
+    );
 
     let seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
 

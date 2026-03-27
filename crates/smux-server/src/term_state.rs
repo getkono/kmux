@@ -584,6 +584,25 @@ mod tests {
     }
 
     #[test]
+    fn fzf_highlight_move_produces_cell_diff() {
+        let mut ts = TermState::new(24, 80);
+        // Simulate fzf: alternate screen, app cursor, hide cursor, items with one highlighted
+        ts.feed(b"\x1b[?1049h\x1b[?1h\x1b[?25l");
+        ts.feed(b"  item1\r\n");
+        ts.feed(b"\x1b[7m> item2\x1b[27m\r\n");
+        ts.feed(b"  item3\r\n");
+        let _ = ts.compute_diff(); // consume initial state
+
+        // Arrow up: move highlight from item2 to item1
+        ts.feed(b"\x1b[2;1H  item2"); // un-highlight old row
+        ts.feed(b"\x1b[1;1H\x1b[7m> item1\x1b[27m"); // highlight new row
+        let diff = ts
+            .compute_diff()
+            .expect("highlight move should produce diff");
+        assert!(!diff.ops.is_empty(), "highlight move must have cell ops");
+    }
+
+    #[test]
     fn hello_cursor_move_world_diffs_correctly_without_prev_nonempty() {
         // Verifies that removing prev_nonempty_rows doesn't change diff output
         let mut ts = TermState::new(24, 80);
