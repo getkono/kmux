@@ -1,5 +1,6 @@
 use std::net::ToSocketAddrs;
 use std::sync::Arc;
+use std::time::Duration;
 
 use smux_protocol::messages::{ClientMessage, ServerMessage};
 use smux_protocol::{decode_server, encode_client, read_frame, write_frame};
@@ -180,7 +181,17 @@ fn build_quinn_client_config(accept_invalid: bool) -> quinn::ClientConfig {
 
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .expect("valid QUIC client config");
-    quinn::ClientConfig::new(Arc::new(quic_crypto))
+
+    let mut config = quinn::ClientConfig::new(Arc::new(quic_crypto));
+
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_secs(300)).unwrap(),
+    ));
+    transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    config.transport_config(Arc::new(transport));
+
+    config
 }
 
 /// A certificate verifier that accepts any certificate.
