@@ -40,9 +40,6 @@ pub struct TermState {
     current_cells: Vec<CellState>,
     prev_cursor: CursorState,
     prev_modes: TermModes,
-    /// Tracks which rows have non-default content in `prev_cells`, so
-    /// `compute_diff` can skip scanning rows that are blank in both buffers.
-    prev_nonempty_rows: Vec<bool>,
     rows: u16,
     cols: u16,
 }
@@ -61,7 +58,6 @@ impl TermState {
             current_cells: vec![blank; r * c],
             prev_cursor: CursorState::default(),
             prev_modes: TermModes::EMPTY,
-            prev_nonempty_rows: vec![false; r],
             rows,
             cols,
         }
@@ -87,9 +83,6 @@ impl TermState {
         let cursor = content.cursor;
         let display_offset = content.display_offset as i32;
 
-        // Track which rows are touched by display_iter (have non-default content now).
-        let mut touched_rows = vec![false; rows];
-
         // Reset scratch buffer and populate from grid
         self.current_cells.fill(CellState::default());
 
@@ -97,7 +90,6 @@ impl TermState {
             let row = indexed.point.line.0 + display_offset;
             let col = indexed.point.column.0;
             if row >= 0 && (row as usize) < rows && col < cols {
-                touched_rows[row as usize] = true;
                 let cell = indexed.cell;
                 let (fg, bg) = if cell.flags.contains(Flags::INVERSE) {
                     (
@@ -119,18 +111,9 @@ impl TermState {
             }
         }
 
-        // Only compare rows that have content now OR had content previously.
-        // Rows that are blank in both frames cannot have changed.
+        // Compare all rows (display_iter yields all viewport cells in alacritty 0.25)
         let mut ops = Vec::new();
-        for (r, (&touched, &prev_nonempty)) in touched_rows
-            .iter()
-            .zip(self.prev_nonempty_rows.iter())
-            .enumerate()
-            .take(rows)
-        {
-            if !touched && !prev_nonempty {
-                continue;
-            }
+        for r in 0..rows {
             let base = r * cols;
             let mut c = 0;
             while c < cols {
@@ -160,8 +143,25 @@ impl TermState {
             }
         }
 
-        // Update prev_nonempty_rows for next frame
-        self.prev_nonempty_rows.copy_from_slice(&touched_rows);
+        // Detect full-screen clear: if all current cells are default and more
+        // than half the screen changed, collapse into a single DiffOp::Clear.
+        if !ops.is_empty() {
+            let total = rows * cols;
+            let changed: usize = ops
+                .iter()
+                .map(|op| match op {
+                    DiffOp::Cell { .. } => 1,
+                    DiffOp::Row { cells, .. } => cells.len(),
+                    DiffOp::Clear => total,
+                })
+                .sum();
+            let all_default = self.current_cells[..total]
+                .iter()
+                .all(|c| *c == CellState::default());
+            if all_default && changed > total / 2 {
+                ops = vec![DiffOp::Clear];
+            }
+        }
 
         // Swap buffers: current becomes prev for next frame
         std::mem::swap(&mut self.prev_cells, &mut self.current_cells);
@@ -249,7 +249,6 @@ impl TermState {
         self.current_cells = vec![CellState::default(); n];
         self.prev_cursor = CursorState::default();
         self.prev_modes = TermModes::EMPTY;
-        self.prev_nonempty_rows = vec![false; rows as usize];
     }
 
     fn convert_cursor(cursor: &RenderableCursor, display_offset: i32) -> CursorState {
@@ -537,6 +536,86 @@ mod tests {
         assert!(
             total_cells >= 5,
             "expected at least 5 changed cells, got {total_cells}"
+        );
+    }
+
+    #[test]
+    fn csi_2j_clear_screen_produces_clear_op() {
+        let mut ts = TermState::new(24, 80);
+        // Fill the screen with some content first
+        for _ in 0..24 {
+            ts.feed(
+                b"XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX",
+            );
+        }
+        let _ = ts.compute_diff(); // consume initial diff
+
+        // CSI 2J = erase entire display, CSI H = cursor home
+        ts.feed(b"\x1b[2J\x1b[H");
+        let diff = ts.compute_diff().expect("expected Some diff");
+        assert!(
+            matches!(diff.ops.as_slice(), [DiffOp::Clear]),
+            "expected single DiffOp::Clear, got {} ops: {:?}",
+            diff.ops.len(),
+            diff.ops
+                .iter()
+                .map(|op| match op {
+                    DiffOp::Cell { .. } => "Cell",
+                    DiffOp::Row { .. } => "Row",
+                    DiffOp::Clear => "Clear",
+                })
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn partial_clear_does_not_produce_clear_op() {
+        let mut ts = TermState::new(24, 80);
+        // Fill a few rows
+        ts.feed(b"hello\r\nworld\r\nfoo");
+        let _ = ts.compute_diff(); // consume initial diff
+
+        // Clear only the first line (CSI 2K = erase line), then move to row 0
+        ts.feed(b"\x1b[H\x1b[2K");
+        let diff = ts.compute_diff().expect("expected Some diff");
+        // Should NOT collapse to DiffOp::Clear because the screen isn't fully blank
+        let has_clear = diff.ops.iter().any(|op| matches!(op, DiffOp::Clear));
+        assert!(!has_clear, "partial erase should not produce DiffOp::Clear");
+    }
+
+    #[test]
+    fn hello_cursor_move_world_diffs_correctly_without_prev_nonempty() {
+        // Verifies that removing prev_nonempty_rows doesn't change diff output
+        let mut ts = TermState::new(24, 80);
+        ts.feed(b"hello");
+        let diff1 = ts.compute_diff().expect("first diff");
+        let cells1: usize = diff1
+            .ops
+            .iter()
+            .map(|op| match op {
+                DiffOp::Cell { .. } => 1,
+                DiffOp::Row { cells, .. } => cells.len(),
+                DiffOp::Clear => 0,
+            })
+            .sum();
+        assert!(cells1 >= 5);
+
+        // Move cursor to row 2, col 0 then write " world"
+        ts.feed(b"\x1b[3;1H world");
+        let diff2 = ts.compute_diff().expect("second diff");
+        let cells2: usize = diff2
+            .ops
+            .iter()
+            .map(|op| match op {
+                DiffOp::Cell { .. } => 1,
+                DiffOp::Row { cells, .. } => cells.len(),
+                DiffOp::Clear => 0,
+            })
+            .sum();
+        // " world" = 6 chars on row 2 (including the space), should diff correctly
+        assert!(
+            cells2 >= 5,
+            "expected at least 5 changed cells on second diff, got {cells2}"
         );
     }
 }
