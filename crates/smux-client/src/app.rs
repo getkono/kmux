@@ -8,6 +8,7 @@ use smux_protocol::messages::{ClientMessage, ServerMessage, SessionInfo, Session
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
+use crate::metrics::RenderMetrics;
 use crate::terminal_view::CellGrid;
 use crate::{connect, session_bar, terminal_view, theme};
 
@@ -55,6 +56,9 @@ pub enum Message {
         text: Option<String>,
     },
 
+    // Toggle the HUD overlay (F12)
+    ToggleHud,
+
     // Terminal canvas resize detected
     TerminalResized {
         rows: u16,
@@ -80,6 +84,10 @@ pub struct SmuxApp {
     port: String,
     token: String,
     status_msg: String,
+
+    // Observability
+    metrics: RenderMetrics,
+    hud_visible: bool,
 }
 
 impl SmuxApp {
@@ -110,7 +118,7 @@ impl SmuxApp {
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
         match message {
-            //  Connect form 
+            //  Connect form
             Message::HostChanged(v) => {
                 self.host = v;
                 Task::none()
@@ -146,7 +154,7 @@ impl SmuxApp {
                 Task::none()
             }
 
-            //  Async events 
+            //  Async events
             Message::Connected(sender) => {
                 self.ws_sender = Some(sender);
                 self.screen = Screen::Terminal;
@@ -167,6 +175,7 @@ impl SmuxApp {
             }
 
             Message::ServerMsgBatch(msgs) => {
+                self.metrics.record_batch(msgs.len());
                 let tasks: Vec<Task<Message>> = msgs
                     .into_iter()
                     .map(|msg| self.handle_server_message(msg))
@@ -174,7 +183,7 @@ impl SmuxApp {
                 Task::batch(tasks)
             }
 
-            //  Session management 
+            //  Session management
             Message::SelectSession(name) => {
                 if let Some(prev) = self.active_session.take() {
                     self.send_ws(ClientMessage::Detach { session: prev });
@@ -218,7 +227,7 @@ impl SmuxApp {
                 Task::none()
             }
 
-            //  Keyboard input 
+            //  Keyboard input
             Message::RawKeyEvent {
                 key,
                 modifiers,
@@ -248,13 +257,19 @@ impl SmuxApp {
                         });
                     } else {
                         debug!("RawKeyEvent: dropped (no active session)");
-                        self.status_msg = "No active session -- press [+] to create one".to_string();
+                        self.status_msg =
+                            "No active session -- press [+] to create one".to_string();
                     }
                 }
                 Task::none()
             }
 
-            //  Terminal resize 
+            Message::ToggleHud => {
+                self.hud_visible = !self.hud_visible;
+                Task::none()
+            }
+
+            //  Terminal resize
             Message::TerminalResized { rows, cols } => {
                 if let Some(name) = &self.active_session {
                     if let Some(buf) = self.buffers.get_mut(name) {
@@ -333,7 +348,7 @@ impl SmuxApp {
         theme::default()
     }
 
-    //  Private helpers 
+    //  Private helpers
 
     fn handle_server_message(&mut self, msg: ServerMessage) -> Task<Message> {
         match msg {
@@ -407,17 +422,31 @@ impl SmuxApp {
 
             // Server-side VT diff: apply snapshot or incremental update
             ServerMessage::TerminalSnapshot {
-                session, snapshot, ..
+                session,
+                snapshot,
+                sent_at_ms,
+                ..
             } => {
+                let start = std::time::Instant::now();
                 let grid = self.buffers.entry(session).or_default();
                 grid.apply_snapshot(snapshot);
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                self.metrics.record_apply(sent_at_ms, elapsed_ms);
                 Task::none()
             }
 
-            ServerMessage::TerminalUpdate { session, diff, .. } => {
+            ServerMessage::TerminalUpdate {
+                session,
+                diff,
+                sent_at_ms,
+                ..
+            } => {
+                let start = std::time::Instant::now();
                 if let Some(grid) = self.buffers.get_mut(&session) {
                     grid.apply_diff(Arc::unwrap_or_clone(diff));
                 }
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                self.metrics.record_apply(sent_at_ms, elapsed_ms);
                 Task::none()
             }
 
@@ -495,9 +524,15 @@ impl SmuxApp {
             Message::CreateSessionPressed,
         );
 
+        let metrics = if self.hud_visible {
+            Some(self.metrics.snapshot())
+        } else {
+            None
+        };
+
         let terminal_area: Element<Message> = if let Some(name) = &self.active_session {
             if let Some(buf) = self.buffers.get(name) {
-                terminal_view::view(buf, name)
+                terminal_view::view(buf, name, metrics)
             } else {
                 text("No output yet").into()
             }
@@ -534,6 +569,10 @@ fn keyboard_filter(
                     text,
                     ..
                 } => {
+                    // F12 toggles the HUD overlay -- don't forward to PTY.
+                    if *key == iced::keyboard::Key::Named(iced::keyboard::key::Named::F12) {
+                        return Some(Message::ToggleHud);
+                    }
                     let text_owned = text.as_ref().map(|t| t.to_string());
                     Some(Message::RawKeyEvent {
                         key: key.clone(),

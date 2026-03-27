@@ -1,3 +1,6 @@
+use std::cell::Cell;
+use std::time::Instant;
+
 use iced::{
     Color as IcedColor, Element, Font, Length, Pixels, Point as IcedPoint, Rectangle, Size,
     alignment, mouse,
@@ -6,6 +9,8 @@ use iced::{
 use smux_protocol::messages::{
     CellAttrs, CellState, CursorShape, CursorState, DiffOp, GridSnapshot, TermModes, TerminalDiff,
 };
+
+use crate::metrics::MetricsSnapshot;
 
 use crate::app::Message;
 
@@ -131,7 +136,7 @@ impl Default for CellGrid {
     }
 }
 
-//  Canvas rendering 
+//  Canvas rendering
 
 /// Borrowed snapshot of the CellGrid used as the canvas `Program`.
 ///
@@ -143,16 +148,18 @@ pub struct GridView<'a> {
     rows: usize,
     cols: usize,
     cells_generation: u64,
+    metrics: Option<MetricsSnapshot>,
 }
 
 impl<'a> GridView<'a> {
-    fn from_grid(grid: &'a CellGrid) -> Self {
+    fn from_grid(grid: &'a CellGrid, metrics: Option<MetricsSnapshot>) -> Self {
         Self {
             cells: &grid.cells,
             cursor: grid.cursor,
             rows: grid.rows,
             cols: grid.cols,
             cells_generation: grid.cells_generation(),
+            metrics,
         }
     }
 }
@@ -161,12 +168,18 @@ impl<'a> GridView<'a> {
 ///
 /// Uses a dedicated `cells_cache` that is only cleared when cell content
 /// changes. Cursor-only diffs skip the expensive full-cell redraw.
+/// FPS measurement window in seconds.
+const FPS_WINDOW_SECS: f64 = 1.0;
+
 pub struct CanvasState {
     rows: u16,
     cols: u16,
     cells_cache: canvas::Cache,
     cursor_cache: canvas::Cache,
-    last_cells_generation: std::cell::Cell<u64>,
+    last_cells_generation: Cell<u64>,
+    draw_duration_ms: Cell<f64>,
+    /// Circular buffer of draw timestamps for FPS calculation.
+    draw_timestamps: std::cell::RefCell<std::collections::VecDeque<Instant>>,
 }
 
 impl Default for CanvasState {
@@ -176,8 +189,40 @@ impl Default for CanvasState {
             cols: 0,
             cells_cache: canvas::Cache::default(),
             cursor_cache: canvas::Cache::default(),
-            last_cells_generation: std::cell::Cell::new(0),
+            last_cells_generation: Cell::new(0),
+            draw_duration_ms: Cell::new(0.0),
+            draw_timestamps: std::cell::RefCell::new(std::collections::VecDeque::with_capacity(
+                128,
+            )),
         }
+    }
+}
+
+impl CanvasState {
+    fn record_draw(&self, now: Instant) {
+        let mut ts = self.draw_timestamps.borrow_mut();
+        ts.push_back(now);
+        while let Some(&front) = ts.front() {
+            if now.duration_since(front).as_secs_f64() > FPS_WINDOW_SECS {
+                ts.pop_front();
+            } else {
+                break;
+            }
+        }
+    }
+
+    fn fps(&self) -> f64 {
+        let ts = self.draw_timestamps.borrow();
+        if ts.len() < 2 {
+            return 0.0;
+        }
+        let first = *ts.front().unwrap();
+        let last = *ts.back().unwrap();
+        let span = last.duration_since(first).as_secs_f64();
+        if span < 0.001 {
+            return 0.0;
+        }
+        (ts.len() - 1) as f64 / span
     }
 }
 
@@ -224,6 +269,8 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> Vec<canvas::Geometry> {
+        let draw_start = Instant::now();
+
         // Only clear the cell cache when cell content actually changed.
         // Cursor-only diffs skip this -- the cached cell geometry stays valid.
         if self.cells_generation != state.last_cells_generation.get() {
@@ -343,13 +390,91 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
             }
         });
 
-        vec![cells_geom, cursor_geom]
+        // Track draw duration and FPS (previous frame's value is shown in HUD).
+        let prev_draw_ms = state.draw_duration_ms.get();
+        state
+            .draw_duration_ms
+            .set(draw_start.elapsed().as_secs_f64() * 1000.0);
+        state.record_draw(draw_start);
+        let fps = state.fps();
+
+        // Layer 3: HUD overlay (never cached -- content changes every frame)
+        if let Some(metrics) = self.metrics {
+            let hud_geom = draw_hud(renderer, bounds, &metrics, prev_draw_ms, fps);
+            vec![cells_geom, cursor_geom, hud_geom]
+        } else {
+            vec![cells_geom, cursor_geom]
+        }
     }
 }
 
+/// Draw the HUD overlay as an uncached geometry layer.
+fn draw_hud(
+    renderer: &iced::Renderer,
+    bounds: Rectangle,
+    metrics: &MetricsSnapshot,
+    draw_ms: f64,
+    fps: f64,
+) -> canvas::Geometry {
+    const HUD_W: f32 = 280.0;
+    const HUD_H: f32 = 110.0;
+    const HUD_PAD: f32 = 8.0;
+    const LINE_H: f32 = 18.0;
+    const HUD_FONT_SIZE: f32 = 12.0;
+
+    let mut frame = canvas::Frame::new(renderer, bounds.size());
+
+    let hud_x = bounds.width - HUD_W - HUD_PAD;
+    let hud_y = HUD_PAD;
+
+    // Semi-transparent background
+    frame.fill_rectangle(
+        IcedPoint::new(hud_x, hud_y),
+        Size::new(HUD_W, HUD_H),
+        IcedColor {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.75,
+        },
+    );
+
+    let green = IcedColor::from_rgb8(0x50, 0xfa, 0x7b);
+    let lines = [
+        format!(
+            "Net+Apply: {:.1}ms avg / {:.1}ms max",
+            metrics.net_apply_avg_ms, metrics.net_apply_max_ms
+        ),
+        format!("Apply:     {:.2}ms avg", metrics.apply_avg_ms),
+        format!("Draw:      {:.1}ms (prev frame)", draw_ms),
+        format!("Batch:     {:.1} msgs avg", metrics.batch_avg),
+        format!("FPS:       {fps:.0}"),
+    ];
+
+    for (i, line) in lines.iter().enumerate() {
+        frame.fill_text(Text {
+            content: line.clone(),
+            position: IcedPoint::new(hud_x + 8.0, hud_y + 6.0 + i as f32 * LINE_H),
+            color: green,
+            size: Pixels(HUD_FONT_SIZE),
+            line_height: iced::widget::text::LineHeight::Absolute(Pixels(LINE_H)),
+            font: Font::MONOSPACE,
+            horizontal_alignment: alignment::Horizontal::Left,
+            vertical_alignment: alignment::Vertical::Top,
+            shaping: iced::widget::text::Shaping::Basic,
+        });
+    }
+
+    frame.into_geometry()
+}
+
 /// Render the cell grid as a fill-parent canvas widget.
-pub fn view<'a>(grid: &'a CellGrid, _session: &'a str) -> Element<'a, Message> {
-    let snapshot = GridView::from_grid(grid);
+pub fn view<'a>(
+    grid: &'a CellGrid,
+    _session: &'a str,
+    metrics: Option<MetricsSnapshot>,
+) -> Element<'a, Message> {
+    let snapshot = GridView::from_grid(grid, metrics);
     Canvas::new(snapshot)
         .width(Length::Fill)
         .height(Length::Fill)
