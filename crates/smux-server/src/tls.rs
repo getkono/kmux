@@ -1,6 +1,7 @@
 use std::fs;
 use std::io::BufReader;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use rcgen::generate_simple_self_signed;
@@ -55,9 +56,17 @@ fn build_tls_config_from(
 
 /// Build a `quinn::ServerConfig` from a rustls `ServerConfig`.
 pub fn build_quinn_config(tls_config: ServerConfig) -> Result<quinn::ServerConfig> {
-    let server_config = quinn::ServerConfig::with_crypto(Arc::new(
+    let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)
             .context("build QUIC server config from rustls config")?,
     ));
+
+    let mut transport = quinn::TransportConfig::default();
+    transport.max_idle_timeout(Some(
+        quinn::IdleTimeout::try_from(Duration::from_secs(300)).unwrap(),
+    ));
+    transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    server_config.transport_config(Arc::new(transport));
+
     Ok(server_config)
 }
