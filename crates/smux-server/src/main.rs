@@ -62,6 +62,7 @@ async fn main() -> anyhow::Result<()> {
 
     #[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
     {
+        info!(backend = term_state::BACKEND_NAME, "terminal backend");
         let cli = Cli::parse();
 
         let tls_config = if cli.self_signed {

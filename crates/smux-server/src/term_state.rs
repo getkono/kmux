@@ -16,6 +16,13 @@ pub type TermState = DiffEngine<AlacrittyBackend>;
 #[cfg(all(feature = "backend-termwiz", not(feature = "backend-alacritty")))]
 pub type TermState = DiffEngine<TermwizBackend>;
 
+/// Name of the active terminal backend (for logging).
+#[cfg(feature = "backend-alacritty")]
+pub const BACKEND_NAME: &str = "alacritty";
+
+#[cfg(all(feature = "backend-termwiz", not(feature = "backend-alacritty")))]
+pub const BACKEND_NAME: &str = "termwiz";
+
 /// Create a new `TermState` with the active backend for the given dimensions.
 #[cfg(feature = "backend-alacritty")]
 pub fn new_term_state(rows: u16, cols: u16) -> TermState {
