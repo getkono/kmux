@@ -7,11 +7,17 @@ edition = "2024"
 name = "smux-server"
 path = "src/main.rs"
 
+[features]
+default = ["backend-alacritty"]
+backend-alacritty = ["dep:alacritty_terminal"]
+backend-termwiz = ["dep:termwiz"]
+
 [dependencies]
 smux = { path = "../smux" }
 nix = { version = "0.31", features = ["process", "signal"] }
 smux-protocol = { path = "../smux-protocol", features = ["framing"] }
-alacritty_terminal = "0.25"
+alacritty_terminal = { version = "0.25", optional = true }
+termwiz = { version = "0.22", optional = true }
 tokio = { version = "1", features = ["full"] }
 quinn = "0.11"
 rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
