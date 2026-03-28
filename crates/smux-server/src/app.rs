@@ -16,7 +16,7 @@ use tracing::warn;
 
 use crate::relay::session_diff_loop;
 use crate::scrollback::DiffBuffer;
-use crate::term_state::{AlacrittyBackend, TermState};
+use crate::term_state::{TermState, new_term_state};
 
 /// 10 MB scrollback buffer per session (estimated diff size).
 const SCROLLBACK_CAPACITY: usize = 10 * 1024 * 1024;
@@ -105,9 +105,7 @@ impl ServerApp {
 
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         let scrollback = Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY)));
-        let term_state = Arc::new(Mutex::new(TermState::new(AlacrittyBackend::new(
-            size.rows, size.cols,
-        ))));
+        let term_state = Arc::new(Mutex::new(new_term_state(size.rows, size.cols)));
         let seqno_counter = Arc::new(AtomicU64::new(1));
 
         let task = tokio::spawn(session_diff_loop(

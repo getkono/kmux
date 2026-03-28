@@ -1,35 +1,35 @@
-#[cfg(feature = "backend-alacritty")]
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 mod app;
 mod auth;
 mod backend;
-#[cfg(feature = "backend-alacritty")]
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 mod connection;
 mod diff_engine;
-#[cfg(feature = "backend-alacritty")]
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 mod relay;
 mod scrollback;
-#[cfg(feature = "backend-alacritty")]
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 mod term_state;
-#[cfg(feature = "backend-alacritty")]
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 mod tls;
 
-#[cfg(feature = "backend-alacritty")]
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 use std::net::SocketAddr;
-#[cfg(feature = "backend-alacritty")]
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 use std::sync::Arc;
 
-#[cfg(feature = "backend-alacritty")]
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 use clap::Parser;
-#[cfg(feature = "backend-alacritty")]
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
-#[cfg(feature = "backend-alacritty")]
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 use app::ServerApp;
-#[cfg(feature = "backend-alacritty")]
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 use auth::generate_token;
 
-#[cfg(feature = "backend-alacritty")]
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 #[derive(Parser, Debug)]
 #[command(name = "smux-server", about = "smux remote terminal server")]
 struct Cli {
@@ -60,7 +60,7 @@ async fn main() -> anyhow::Result<()> {
         .with_env_filter(EnvFilter::from_default_env().add_directive("smux_server=info".parse()?))
         .init();
 
-    #[cfg(feature = "backend-alacritty")]
+    #[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
     {
         let cli = Cli::parse();
 
@@ -103,9 +103,11 @@ async fn main() -> anyhow::Result<()> {
         }
     }
 
-    #[cfg(not(feature = "backend-alacritty"))]
+    #[cfg(not(any(feature = "backend-alacritty", feature = "backend-termwiz")))]
     {
-        tracing::error!("smux-server requires the backend-alacritty feature to run");
+        tracing::error!(
+            "smux-server requires a backend feature: backend-alacritty or backend-termwiz"
+        );
         std::process::exit(1);
     }
 
