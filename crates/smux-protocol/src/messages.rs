@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// Current wire protocol version. Increment when breaking changes are made.
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// Return the current wall-clock time as milliseconds since the Unix epoch.
 pub fn epoch_millis() -> u64 {
@@ -396,6 +396,18 @@ pub enum ServerMessage {
         snapshot: GridSnapshot,
         seqno: SequenceNo,
         /// Wall-clock timestamp (ms since Unix epoch) when the server sent this message.
+        sent_at_ms: u64,
+    },
+
+    /// Cursor-only update for an attached session (no cell changes).
+    ///
+    /// Shares the same seqno space as `TerminalUpdate` so client gap
+    /// detection works unchanged.
+    CursorUpdate {
+        session: SessionId,
+        cursor: CursorState,
+        modes: TermModes,
+        seqno: SequenceNo,
         sent_at_ms: u64,
     },
 

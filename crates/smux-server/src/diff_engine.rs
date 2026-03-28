@@ -4,6 +4,21 @@ use smux_protocol::messages::{
 
 use crate::backend::TerminalBackend;
 
+/// Result of a diff computation, distinguishing between cell changes,
+/// cursor-only changes, and no changes at all.
+#[derive(Debug)]
+pub enum DiffResult {
+    /// At least one cell changed (may also include cursor/mode changes).
+    CellDiff(TerminalDiff),
+    /// No cells changed, but cursor position or terminal modes changed.
+    CursorOnly {
+        cursor: CursorState,
+        modes: TermModes,
+    },
+    /// Nothing changed since the last diff.
+    None,
+}
+
 /// Generic diff engine that wraps any [`TerminalBackend`] and computes
 /// frame-to-frame cell diffs.
 ///
@@ -43,7 +58,10 @@ impl<B: TerminalBackend> DiffEngine<B> {
 
     /// Compute a diff between the current grid and `prev_cells`, then update
     /// `prev_cells` to match the current grid.
-    pub fn compute_diff(&mut self) -> Option<TerminalDiff> {
+    ///
+    /// Returns a [`DiffResult`] that distinguishes between cell changes,
+    /// cursor-only changes, and no changes at all.
+    pub fn compute_diff(&mut self) -> DiffResult {
         let rows = self.rows as usize;
         let cols = self.cols as usize;
 
@@ -109,21 +127,36 @@ impl<B: TerminalBackend> DiffEngine<B> {
         let cursor_state = self.backend.cursor();
         let modes = self.backend.modes();
 
-        let has_changes =
-            !ops.is_empty() || cursor_state != self.prev_cursor || modes != self.prev_modes;
+        let cells_changed = !ops.is_empty();
+        let cursor_or_modes_changed = cursor_state != self.prev_cursor || modes != self.prev_modes;
 
         self.prev_cursor = cursor_state;
         self.prev_modes = modes;
 
-        if has_changes {
-            Some(TerminalDiff {
+        if cells_changed {
+            DiffResult::CellDiff(TerminalDiff {
                 ops,
                 cursor: cursor_state,
                 modes,
             })
+        } else if cursor_or_modes_changed {
+            DiffResult::CursorOnly {
+                cursor: cursor_state,
+                modes,
+            }
         } else {
-            None
+            DiffResult::None
         }
+    }
+
+    /// Current cursor state from the backend (does NOT call `fill_cells()`).
+    pub fn cursor(&self) -> CursorState {
+        self.backend.cursor()
+    }
+
+    /// Current terminal modes from the backend.
+    pub fn modes(&self) -> TermModes {
+        self.backend.modes()
     }
 
     /// Take a full grid snapshot (for initial attach or post-resize).
@@ -175,7 +208,7 @@ mod tests {
         let mut engine = mock_engine(24, 80);
         let _ = engine.compute_diff(); // consume initial (all blank)
         engine.feed(b"");
-        assert!(engine.compute_diff().is_none());
+        assert!(matches!(engine.compute_diff(), DiffResult::None));
     }
 
     #[test]
@@ -190,34 +223,34 @@ mod tests {
             bg: CellColor::new(0x28, 0x2c, 0x34),
             ..CellState::default()
         };
-        let diff = engine.compute_diff().expect("expected Some diff");
+        let DiffResult::CellDiff(diff) = engine.compute_diff() else {
+            panic!("expected CellDiff");
+        };
         assert!(!diff.ops.is_empty());
     }
 
     #[test]
-    fn cursor_move_without_cell_change_produces_some() {
+    fn cursor_move_without_cell_change_produces_cursor_only() {
         let mut engine = mock_engine(24, 80);
         let _ = engine.compute_diff(); // consume initial
 
         engine.backend.cursor_state.col = 5;
-        let diff = engine
-            .compute_diff()
-            .expect("cursor-only move should produce Some");
-        assert!(diff.ops.is_empty(), "no cell changes expected");
-        assert_eq!(diff.cursor.col, 5);
+        let DiffResult::CursorOnly { cursor, .. } = engine.compute_diff() else {
+            panic!("expected CursorOnly");
+        };
+        assert_eq!(cursor.col, 5);
     }
 
     #[test]
-    fn mode_change_without_cell_change_produces_some() {
+    fn mode_change_without_cell_change_produces_cursor_only() {
         let mut engine = mock_engine(24, 80);
         let _ = engine.compute_diff(); // consume initial
 
         engine.backend.mode_flags = TermModes(TermModes::APP_CURSOR);
-        let diff = engine
-            .compute_diff()
-            .expect("mode-only change should produce Some");
-        assert!(diff.ops.is_empty(), "no cell changes expected");
-        assert!(diff.modes.app_cursor());
+        let DiffResult::CursorOnly { modes, .. } = engine.compute_diff() else {
+            panic!("expected CursorOnly");
+        };
+        assert!(modes.app_cursor());
     }
 
     #[test]
@@ -236,7 +269,9 @@ mod tests {
         for cell in &mut engine.backend.cells {
             *cell = CellState::default();
         }
-        let diff = engine.compute_diff().expect("expected Some diff");
+        let DiffResult::CellDiff(diff) = engine.compute_diff() else {
+            panic!("expected CellDiff");
+        };
         assert!(
             matches!(diff.ops.as_slice(), [DiffOp::Clear]),
             "expected DiffOp::Clear, got {:?}",
@@ -260,7 +295,9 @@ mod tests {
         for c in 0..4 {
             engine.backend.cells[c] = CellState::default();
         }
-        let diff = engine.compute_diff().expect("expected Some diff");
+        let DiffResult::CellDiff(diff) = engine.compute_diff() else {
+            panic!("expected CellDiff");
+        };
         let has_clear = diff.ops.iter().any(|op| matches!(op, DiffOp::Clear));
         assert!(!has_clear, "partial erase should not produce DiffOp::Clear");
     }
@@ -302,5 +339,71 @@ mod tests {
         let mut engine = mock_engine(4, 4);
         engine.feed(b"hello");
         assert_eq!(engine.backend.fed_bytes, b"hello");
+    }
+
+    #[test]
+    fn cursor_only_returns_cursor_only_variant() {
+        let mut engine = mock_engine(4, 4);
+        let _ = engine.compute_diff(); // consume initial
+
+        engine.backend.cursor_state.row = 2;
+        engine.backend.cursor_state.col = 3;
+        assert!(matches!(
+            engine.compute_diff(),
+            DiffResult::CursorOnly { .. }
+        ));
+    }
+
+    #[test]
+    fn cell_change_returns_cell_diff_variant() {
+        let mut engine = mock_engine(4, 4);
+        let _ = engine.compute_diff(); // consume initial
+
+        engine.backend.cells[0] = CellState {
+            c: 'Z',
+            ..CellState::default()
+        };
+        assert!(matches!(engine.compute_diff(), DiffResult::CellDiff(_)));
+    }
+
+    #[test]
+    fn both_changes_returns_cell_diff() {
+        let mut engine = mock_engine(4, 4);
+        let _ = engine.compute_diff(); // consume initial
+
+        engine.backend.cells[0] = CellState {
+            c: 'Z',
+            ..CellState::default()
+        };
+        engine.backend.cursor_state.col = 1;
+        let DiffResult::CellDiff(diff) = engine.compute_diff() else {
+            panic!("expected CellDiff when both cells and cursor change");
+        };
+        assert!(!diff.ops.is_empty());
+        assert_eq!(diff.cursor.col, 1);
+    }
+
+    #[test]
+    fn no_change_returns_none() {
+        let mut engine = mock_engine(4, 4);
+        let _ = engine.compute_diff(); // consume initial
+        assert!(matches!(engine.compute_diff(), DiffResult::None));
+    }
+
+    #[test]
+    fn delegate_cursor_reads_backend() {
+        let mut engine = mock_engine(4, 4);
+        engine.backend.cursor_state.row = 3;
+        engine.backend.cursor_state.col = 7;
+        let c = engine.cursor();
+        assert_eq!(c.row, 3);
+        assert_eq!(c.col, 7);
+    }
+
+    #[test]
+    fn delegate_modes_reads_backend() {
+        let mut engine = mock_engine(4, 4);
+        engine.backend.mode_flags = TermModes(TermModes::APP_CURSOR);
+        assert!(engine.modes().app_cursor());
     }
 }

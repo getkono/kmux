@@ -29,7 +29,10 @@ pub struct CellGrid {
     modes: TermModes,
     pub rows: usize,
     pub cols: usize,
-    generation: u64,
+    /// Incremented only when cell ops are non-empty, or on snapshot/clear/resize.
+    cells_generation: u64,
+    /// Incremented on every update (cell, cursor-only, snapshot, clear, resize).
+    cursor_generation: u64,
 }
 
 impl CellGrid {
@@ -40,7 +43,8 @@ impl CellGrid {
             modes: TermModes::EMPTY,
             rows,
             cols,
-            generation: 0,
+            cells_generation: 0,
+            cursor_generation: 0,
         }
     }
 
@@ -51,11 +55,13 @@ impl CellGrid {
         self.cells = snapshot.cells;
         self.cursor = snapshot.cursor;
         self.modes = snapshot.modes;
-        self.generation += 1;
+        self.cells_generation += 1;
+        self.cursor_generation += 1;
     }
 
     /// Apply a diff from the server -- only changed cells are updated.
     pub fn apply_diff(&mut self, diff: TerminalDiff) {
+        let has_cell_ops = !diff.ops.is_empty();
         for op in diff.ops {
             match op {
                 DiffOp::Cell { row, col, cell } => {
@@ -84,7 +90,17 @@ impl CellGrid {
         }
         self.cursor = diff.cursor;
         self.modes = diff.modes;
-        self.generation += 1;
+        if has_cell_ops {
+            self.cells_generation += 1;
+        }
+        self.cursor_generation += 1;
+    }
+
+    /// Apply a cursor-only update (no cell changes).
+    pub fn apply_cursor_update(&mut self, cursor: CursorState, modes: TermModes) {
+        self.cursor = cursor;
+        self.modes = modes;
+        self.cursor_generation += 1;
     }
 
     /// Whether the terminal is in application-cursor mode.
@@ -97,7 +113,8 @@ impl CellGrid {
         self.cells.fill(CellState::default());
         self.cursor = CursorState::default();
         self.modes = TermModes::EMPTY;
-        self.generation += 1;
+        self.cells_generation += 1;
+        self.cursor_generation += 1;
     }
 
     /// Resize the grid (server will send a fresh snapshot after resize).
@@ -105,11 +122,18 @@ impl CellGrid {
         self.rows = rows as usize;
         self.cols = cols as usize;
         self.cells = vec![CellState::default(); self.rows * self.cols];
-        self.generation += 1;
+        self.cells_generation += 1;
+        self.cursor_generation += 1;
     }
 
+    /// Generation counter that changes on every update (used by iced to detect changes).
     pub fn generation(&self) -> u64 {
-        self.generation
+        self.cursor_generation
+    }
+
+    /// Generation counter that changes only when cells change (used for cache invalidation).
+    pub fn cells_generation(&self) -> u64 {
+        self.cells_generation
     }
 }
 
@@ -130,7 +154,7 @@ pub struct GridView<'a> {
     cursor: CursorState,
     rows: usize,
     cols: usize,
-    generation: u64,
+    cells_generation: u64,
     metrics: Option<MetricsSnapshot>,
 }
 
@@ -141,7 +165,7 @@ impl<'a> GridView<'a> {
             cursor: grid.cursor,
             rows: grid.rows,
             cols: grid.cols,
-            generation: grid.generation(),
+            cells_generation: grid.cells_generation(),
             metrics,
         }
     }
@@ -159,7 +183,7 @@ pub struct CanvasState {
     cols: u16,
     cells_cache: canvas::Cache,
     cursor_cache: canvas::Cache,
-    last_generation: Cell<u64>,
+    last_cells_generation: Cell<u64>,
     draw_duration_ms: Cell<f64>,
     /// Circular buffer of draw timestamps for FPS calculation.
     draw_timestamps: std::cell::RefCell<std::collections::VecDeque<Instant>>,
@@ -172,7 +196,7 @@ impl Default for CanvasState {
             cols: 0,
             cells_cache: canvas::Cache::default(),
             cursor_cache: canvas::Cache::default(),
-            last_generation: Cell::new(0),
+            last_cells_generation: Cell::new(0),
             draw_duration_ms: Cell::new(0.0),
             draw_timestamps: std::cell::RefCell::new(std::collections::VecDeque::with_capacity(
                 128,
@@ -254,10 +278,10 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
     ) -> Vec<canvas::Geometry> {
         let draw_start = Instant::now();
 
-        // Clear the cell cache on every diff so that any server-side change
-        // (cell, cursor, or mode) produces a fresh render.
-        if self.generation != state.last_generation.get() {
-            state.last_generation.set(self.generation);
+        // Clear the cell cache only when cells actually change.
+        // Cursor-only updates skip this, preserving the cached cell geometry.
+        if self.cells_generation != state.last_cells_generation.get() {
+            state.last_cells_generation.set(self.cells_generation);
             state.cells_cache.clear();
         }
 
@@ -567,7 +591,11 @@ mod tests {
         let mut grid = CellGrid::new(2, 3);
         let g0 = grid.generation();
         grid.apply_diff(TerminalDiff {
-            ops: vec![],
+            ops: vec![DiffOp::Cell {
+                row: 0,
+                col: 0,
+                cell: CellState::default(),
+            }],
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
         });
@@ -593,7 +621,7 @@ mod tests {
         let mut grid = CellGrid::new(2, 3);
         let g0 = grid.generation();
 
-        // Cursor-only diff: generation still increments
+        // Cursor-only diff: cursor_generation increments, cells_generation does not
         grid.apply_diff(TerminalDiff {
             ops: vec![],
             cursor: CursorState {
@@ -604,8 +632,9 @@ mod tests {
             modes: TermModes::EMPTY,
         });
         assert_eq!(grid.generation(), g0 + 1);
+        assert_eq!(grid.cells_generation(), 0);
 
-        // Diff with cell ops: generation increments
+        // Diff with cell ops: both generations increment
         grid.apply_diff(TerminalDiff {
             ops: vec![DiffOp::Cell {
                 row: 0,
@@ -619,5 +648,82 @@ mod tests {
             modes: TermModes::EMPTY,
         });
         assert_eq!(grid.generation(), g0 + 2);
+        assert_eq!(grid.cells_generation(), 1);
+    }
+
+    #[test]
+    fn cursor_update_does_not_bump_cells_generation() {
+        let mut grid = CellGrid::new(2, 3);
+        let cg0 = grid.cells_generation();
+        let g0 = grid.generation();
+
+        grid.apply_cursor_update(
+            CursorState {
+                row: 1,
+                col: 2,
+                ..CursorState::default()
+            },
+            TermModes::EMPTY,
+        );
+
+        assert_eq!(
+            grid.cells_generation(),
+            cg0,
+            "cells_generation should not change"
+        );
+        assert_eq!(
+            grid.generation(),
+            g0 + 1,
+            "cursor_generation should increment"
+        );
+        assert_eq!(grid.cursor.row, 1);
+        assert_eq!(grid.cursor.col, 2);
+    }
+
+    #[test]
+    fn cell_diff_bumps_both_generations() {
+        let mut grid = CellGrid::new(2, 3);
+        let cg0 = grid.cells_generation();
+        let g0 = grid.generation();
+
+        grid.apply_diff(TerminalDiff {
+            ops: vec![DiffOp::Cell {
+                row: 0,
+                col: 0,
+                cell: CellState {
+                    c: 'X',
+                    ..CellState::default()
+                },
+            }],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+        });
+
+        assert_eq!(grid.cells_generation(), cg0 + 1);
+        assert_eq!(grid.generation(), g0 + 1);
+    }
+
+    #[test]
+    fn empty_ops_diff_bumps_only_cursor_generation() {
+        let mut grid = CellGrid::new(2, 3);
+        let cg0 = grid.cells_generation();
+        let g0 = grid.generation();
+
+        grid.apply_diff(TerminalDiff {
+            ops: vec![],
+            cursor: CursorState {
+                row: 1,
+                col: 1,
+                ..CursorState::default()
+            },
+            modes: TermModes::EMPTY,
+        });
+
+        assert_eq!(
+            grid.cells_generation(),
+            cg0,
+            "cells_generation should not change for empty ops"
+        );
+        assert_eq!(grid.generation(), g0 + 1);
     }
 }

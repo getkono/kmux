@@ -909,6 +909,47 @@ impl SmuxApp {
                 Task::none()
             }
 
+            ServerMessage::CursorUpdate {
+                session,
+                cursor,
+                modes,
+                seqno,
+                sent_at_ms,
+            } => {
+                match self.session_sync.get(&session) {
+                    Some(SessionSync::AwaitingSync) => {
+                        debug!("Discarding stale CursorUpdate for '{session}' (awaiting sync)");
+                        return Task::none();
+                    }
+                    Some(SessionSync::Synced { expected }) if seqno != *expected => {
+                        warn!(
+                            "Seqno gap on '{session}': expected {:?}, got {:?} \u{2014} re-attaching",
+                            expected, seqno
+                        );
+                        if let Some(grid) = self.buffers.get_mut(&session) {
+                            grid.clear();
+                        }
+                        self.attach_fresh(session);
+                        return Task::none();
+                    }
+                    _ => {}
+                }
+
+                let start = Instant::now();
+                if let Some(grid) = self.buffers.get_mut(&session) {
+                    grid.apply_cursor_update(cursor, modes);
+                }
+                self.session_sync.insert(
+                    session,
+                    SessionSync::Synced {
+                        expected: SequenceNo(seqno.0 + 1),
+                    },
+                );
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                self.metrics.record_apply(sent_at_ms, elapsed_ms);
+                Task::none()
+            }
+
             #[allow(deprecated)]
             ServerMessage::PtyOutput { .. } => Task::none(),
 

@@ -537,14 +537,22 @@ fn ansi_indexed_color(idx: u8) -> CellColor {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diff_engine::DiffEngine;
+    use crate::diff_engine::{DiffEngine, DiffResult};
     use smux_protocol::messages::DiffOp;
+
+    /// Helper to extract a `TerminalDiff` from a `DiffResult::CellDiff`.
+    fn expect_cell_diff(result: DiffResult) -> smux_protocol::messages::TerminalDiff {
+        match result {
+            DiffResult::CellDiff(diff) => diff,
+            other => panic!("expected CellDiff, got {other:?}"),
+        }
+    }
 
     #[test]
     fn feed_hello_produces_cells() {
         let mut ts = DiffEngine::new(TermwizBackend::new(24, 80));
         ts.feed(b"hello");
-        let diff = ts.compute_diff().expect("expected Some diff");
+        let diff = expect_cell_diff(ts.compute_diff());
         let total_cells: usize = diff
             .ops
             .iter()
@@ -564,7 +572,7 @@ mod tests {
     fn feed_red_text_has_red_fg() {
         let mut ts = DiffEngine::new(TermwizBackend::new(24, 80));
         ts.feed(b"\x1b[31mred");
-        let diff = ts.compute_diff().expect("expected Some diff");
+        let diff = expect_cell_diff(ts.compute_diff());
         let r_cell = diff
             .ops
             .iter()
@@ -606,9 +614,11 @@ mod tests {
 
         // CSI H = cursor home (1;1)
         ts.feed(b"\x1b[H");
-        let diff = ts.compute_diff().expect("cursor move should produce diff");
-        assert_eq!(diff.cursor.row, 0);
-        assert_eq!(diff.cursor.col, 0);
+        let DiffResult::CursorOnly { cursor, .. } = ts.compute_diff() else {
+            panic!("expected CursorOnly for cursor-only move");
+        };
+        assert_eq!(cursor.row, 0);
+        assert_eq!(cursor.col, 0);
     }
 
     #[test]
@@ -618,8 +628,10 @@ mod tests {
 
         // DECCKM set
         ts.feed(b"\x1b[?1h");
-        let diff = ts.compute_diff().expect("mode change should produce diff");
-        assert!(diff.modes.app_cursor());
+        let DiffResult::CursorOnly { modes, .. } = ts.compute_diff() else {
+            panic!("expected CursorOnly for mode-only change");
+        };
+        assert!(modes.app_cursor());
     }
 
     #[test]
@@ -635,7 +647,7 @@ mod tests {
 
         // CSI 2J + CSI H
         ts.feed(b"\x1b[2J\x1b[H");
-        let diff = ts.compute_diff().expect("expected Some diff");
+        let diff = expect_cell_diff(ts.compute_diff());
         assert!(
             matches!(diff.ops.as_slice(), [DiffOp::Clear]),
             "expected DiffOp::Clear, got {:?}",
@@ -649,5 +661,61 @@ mod tests {
         ts.feed(b"\x1b[?25l");
         let snap = ts.snapshot();
         assert!(!snap.cursor.visible);
+    }
+
+    #[test]
+    fn fzf_cursor_hidden_state() {
+        let mut ts = DiffEngine::new(TermwizBackend::new(24, 80));
+        ts.feed(b"\x1b[?25l");
+        let snap = ts.snapshot();
+        assert!(
+            !snap.cursor.visible,
+            "cursor should be hidden after DECTCEM reset"
+        );
+    }
+
+    #[test]
+    fn fzf_highlight_move_produces_cell_diff() {
+        let mut ts = DiffEngine::new(TermwizBackend::new(24, 80));
+        ts.feed(b"\x1b[?1049h\x1b[?1h\x1b[?25l");
+        ts.feed(b"  item1\r\n");
+        ts.feed(b"\x1b[7m> item2\x1b[27m\r\n");
+        ts.feed(b"  item3\r\n");
+        let _ = ts.compute_diff();
+
+        ts.feed(b"\x1b[2;1H  item2");
+        ts.feed(b"\x1b[1;1H\x1b[7m> item1\x1b[27m");
+        let diff = expect_cell_diff(ts.compute_diff());
+        assert!(!diff.ops.is_empty(), "highlight move must have cell ops");
+    }
+
+    #[test]
+    fn fzf_rapid_navigation_cycle() {
+        let mut ts = DiffEngine::new(TermwizBackend::new(24, 80));
+        // Set up alt screen with 5 items, item1 highlighted
+        ts.feed(b"\x1b[?1049h\x1b[?25l");
+        ts.feed(b"\x1b[7m> item1\x1b[27m\r\n");
+        ts.feed(b"  item2\r\n");
+        ts.feed(b"  item3\r\n");
+        ts.feed(b"  item4\r\n");
+        ts.feed(b"  item5\r\n");
+        let _ = ts.compute_diff();
+
+        // Navigate down 3 times, then up 2 times
+        let moves = [
+            &b"\x1b[1;1H  item1\x1b[2;1H\x1b[7m> item2\x1b[27m"[..],
+            &b"\x1b[2;1H  item2\x1b[3;1H\x1b[7m> item3\x1b[27m"[..],
+            &b"\x1b[3;1H  item3\x1b[4;1H\x1b[7m> item4\x1b[27m"[..],
+            &b"\x1b[4;1H  item4\x1b[3;1H\x1b[7m> item3\x1b[27m"[..],
+            &b"\x1b[3;1H  item3\x1b[2;1H\x1b[7m> item2\x1b[27m"[..],
+        ];
+        for (i, data) in moves.iter().enumerate() {
+            ts.feed(data);
+            let diff = expect_cell_diff(ts.compute_diff());
+            assert!(
+                !diff.ops.is_empty(),
+                "navigation step {i} should produce cell ops"
+            );
+        }
     }
 }
