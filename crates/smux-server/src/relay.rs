@@ -13,10 +13,13 @@ use crate::diff_engine::DiffResult;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::TermState;
 
-/// Coalescing window: accumulate cell diffs for up to this long before
-/// flushing. Keeps interactive latency imperceptible (~4ms) while
-/// batching burst output into fewer, larger diffs.
-const COALESCE_WINDOW: Duration = Duration::from_millis(4);
+/// Short coalescing window: flush quickly for interactive apps (fzf, vim).
+/// On the first PTY read, wait only this long before flushing.
+const COALESCE_SHORT: Duration = Duration::from_micros(500);
+
+/// Long coalescing window: batch burst output (cat, make).
+/// Extended to this when a second PTY read arrives within the short window.
+const COALESCE_LONG: Duration = Duration::from_millis(4);
 
 /// Flush immediately if accumulated bytes since last cell diff exceed this.
 const COALESCE_MAX_BYTES: usize = 32_768;
@@ -43,6 +46,7 @@ pub async fn session_diff_loop(
     let mut cells_dirty = false;
     let mut deadline = Instant::now();
     let mut bytes_since_diff: usize = 0;
+    let mut extended = false;
     let mut prev_cursor = CursorState::default();
     let mut prev_modes = TermModes::EMPTY;
 
@@ -66,7 +70,7 @@ pub async fn session_diff_loop(
                     drop(ts);
                     cells_dirty = true;
                     bytes_since_diff = n;
-                    deadline = Instant::now() + COALESCE_WINDOW;
+                    deadline = Instant::now() + COALESCE_SHORT;
                 }
                 Err(e) => {
                     warn!("PTY relay read error: {e}");
@@ -108,6 +112,10 @@ pub async fn session_diff_loop(
                                 );
                                 cells_dirty = false;
                                 bytes_since_diff = 0;
+                                extended = false;
+                            } else if !extended {
+                                deadline = Instant::now() + COALESCE_LONG;
+                                extended = true;
                             }
                         }
                         Err(e) => {
@@ -130,6 +138,7 @@ pub async fn session_diff_loop(
                     );
                     cells_dirty = false;
                     bytes_since_diff = 0;
+                    extended = false;
                 }
             }
         }

@@ -7,7 +7,8 @@ use iced::{
     widget::canvas::{self, Canvas, Text},
 };
 use smux_protocol::messages::{
-    CellAttrs, CellState, CursorShape, CursorState, DiffOp, GridSnapshot, TermModes, TerminalDiff,
+    CellAttrs, CellColor, CellState, CursorShape, CursorState, DiffOp, GridSnapshot, TermModes,
+    TerminalDiff,
 };
 
 use crate::metrics::MetricsSnapshot;
@@ -17,6 +18,9 @@ use crate::app::Message;
 const CELL_WIDTH: f32 = 8.0;
 const CELL_HEIGHT: f32 = 16.0;
 const FONT_SIZE: f32 = 13.0;
+
+/// Default background color (One Dark). Matches `CellState::default().bg`.
+const DEFAULT_BG: CellColor = CellColor::new(0x28, 0x2c, 0x34);
 
 /// Client-side grid state -- receives pre-resolved cells from the server.
 ///
@@ -33,6 +37,10 @@ pub struct CellGrid {
     cells_generation: u64,
     /// Incremented on every update (cell, cursor-only, snapshot, clear, resize).
     cursor_generation: u64,
+    /// Per-row dirty flags — `true` means cells changed since last cache rebuild.
+    dirty_rows: Vec<bool>,
+    /// Set by `draw()` after a full cache rebuild (promotion); consumed by `apply_diff()`.
+    pub(crate) promoted: Cell<bool>,
 }
 
 impl CellGrid {
@@ -45,6 +53,8 @@ impl CellGrid {
             cols,
             cells_generation: 0,
             cursor_generation: 0,
+            dirty_rows: vec![false; rows],
+            promoted: Cell::new(false),
         }
     }
 
@@ -57,10 +67,17 @@ impl CellGrid {
         self.modes = snapshot.modes;
         self.cells_generation += 1;
         self.cursor_generation += 1;
+        self.dirty_rows = vec![true; self.rows];
+        self.promoted.set(false);
     }
 
     /// Apply a diff from the server -- only changed cells are updated.
     pub fn apply_diff(&mut self, diff: TerminalDiff) {
+        // If the last draw promoted (full cache rebuild), reset dirty tracking.
+        if self.promoted.get() {
+            self.dirty_rows.fill(false);
+            self.promoted.set(false);
+        }
         let has_cell_ops = !diff.ops.is_empty();
         for op in diff.ops {
             match op {
@@ -68,6 +85,9 @@ impl CellGrid {
                     let idx = row as usize * self.cols + col as usize;
                     if idx < self.cells.len() {
                         self.cells[idx] = cell;
+                    }
+                    if (row as usize) < self.dirty_rows.len() {
+                        self.dirty_rows[row as usize] = true;
                     }
                 }
                 DiffOp::Row {
@@ -82,9 +102,13 @@ impl CellGrid {
                             self.cells[idx] = cell;
                         }
                     }
+                    if (row as usize) < self.dirty_rows.len() {
+                        self.dirty_rows[row as usize] = true;
+                    }
                 }
                 DiffOp::Clear => {
                     self.cells.fill(CellState::default());
+                    self.dirty_rows.fill(true);
                 }
             }
         }
@@ -115,6 +139,8 @@ impl CellGrid {
         self.modes = TermModes::EMPTY;
         self.cells_generation += 1;
         self.cursor_generation += 1;
+        self.dirty_rows.fill(true);
+        self.promoted.set(false);
     }
 
     /// Resize the grid (server will send a fresh snapshot after resize).
@@ -124,6 +150,18 @@ impl CellGrid {
         self.cells = vec![CellState::default(); self.rows * self.cols];
         self.cells_generation += 1;
         self.cursor_generation += 1;
+        self.dirty_rows = vec![true; self.rows];
+        self.promoted.set(false);
+    }
+
+    /// Which rows have been modified since the last cache rebuild.
+    pub fn dirty_rows(&self) -> &[bool] {
+        &self.dirty_rows
+    }
+
+    /// Number of dirty rows since last cache rebuild.
+    pub fn dirty_row_count(&self) -> usize {
+        self.dirty_rows.iter().filter(|&&d| d).count()
     }
 
     /// Generation counter that changes on every update (used by iced to detect changes).
@@ -155,6 +193,8 @@ pub struct GridView<'a> {
     rows: usize,
     cols: usize,
     cells_generation: u64,
+    dirty_rows: &'a [bool],
+    promoted: &'a Cell<bool>,
     metrics: Option<MetricsSnapshot>,
 }
 
@@ -166,6 +206,8 @@ impl<'a> GridView<'a> {
             rows: grid.rows,
             cols: grid.cols,
             cells_generation: grid.cells_generation(),
+            dirty_rows: grid.dirty_rows(),
+            promoted: &grid.promoted,
             metrics,
         }
     }
@@ -187,6 +229,7 @@ pub struct CanvasState {
     draw_duration_ms: Cell<f64>,
     /// Circular buffer of draw timestamps for FPS calculation.
     draw_timestamps: std::cell::RefCell<std::collections::VecDeque<Instant>>,
+    last_cache_hit: Cell<bool>,
 }
 
 impl Default for CanvasState {
@@ -201,6 +244,7 @@ impl Default for CanvasState {
             draw_timestamps: std::cell::RefCell::new(std::collections::VecDeque::with_capacity(
                 128,
             )),
+            last_cache_hit: Cell::new(true),
         }
     }
 }
@@ -241,6 +285,61 @@ fn default_bg() -> IcedColor {
     IcedColor::from_rgb8(0x28, 0x2c, 0x34)
 }
 
+fn draw_cell(frame: &mut canvas::Frame, cell: &CellState, row: usize, col: usize) {
+    let x = col as f32 * CELL_WIDTH;
+    let y = row as f32 * CELL_HEIGHT;
+    if cell.bg != DEFAULT_BG {
+        frame.fill_rectangle(
+            IcedPoint::new(x, y),
+            Size::new(CELL_WIDTH, CELL_HEIGHT),
+            cell_color_to_iced(cell.bg),
+        );
+    }
+    if !cell.attrs.contains(CellAttrs::HIDDEN) && cell.c != ' ' {
+        frame.fill_text(Text {
+            content: cell.c.to_string(),
+            position: IcedPoint::new(x, y),
+            color: cell_color_to_iced(cell.fg),
+            size: Pixels(FONT_SIZE),
+            line_height: iced::widget::text::LineHeight::Absolute(Pixels(CELL_HEIGHT)),
+            font: Font::MONOSPACE,
+            horizontal_alignment: alignment::Horizontal::Left,
+            vertical_alignment: alignment::Vertical::Top,
+            shaping: iced::widget::text::Shaping::Basic,
+        });
+    }
+}
+
+/// Draw only the dirty rows as an uncached overlay that covers stale base pixels.
+fn draw_dirty_overlay(
+    renderer: &iced::Renderer,
+    bounds: Rectangle,
+    cells: &[CellState],
+    dirty_rows: &[bool],
+    cols: usize,
+) -> canvas::Geometry {
+    let mut frame = canvas::Frame::new(renderer, bounds.size());
+    for (row_idx, &dirty) in dirty_rows.iter().enumerate() {
+        if !dirty {
+            continue;
+        }
+        let y = row_idx as f32 * CELL_HEIGHT;
+        // Full-width background strip to cover stale base pixels
+        frame.fill_rectangle(
+            IcedPoint::new(0.0, y),
+            Size::new(cols as f32 * CELL_WIDTH, CELL_HEIGHT),
+            default_bg(),
+        );
+        let base = row_idx * cols;
+        for col_idx in 0..cols {
+            if let Some(cell) = cells.get(base + col_idx) {
+                draw_cell(&mut frame, cell, row_idx, col_idx);
+            }
+        }
+    }
+    frame.into_geometry()
+}
+
 impl<'a> canvas::Program<Message> for GridView<'a> {
     type State = CanvasState;
 
@@ -278,48 +377,47 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
     ) -> Vec<canvas::Geometry> {
         let draw_start = Instant::now();
 
-        // Clear the cell cache only when cells actually change.
-        // Cursor-only updates skip this, preserving the cached cell geometry.
+        // Decide: overlay mode (cheap, few dirty rows) or promotion (full cache rebuild)?
+        // Cursor-only updates skip this entirely, preserving the cached cell geometry.
+        let mut cache_hit = true;
         if self.cells_generation != state.last_cells_generation.get() {
             state.last_cells_generation.set(self.cells_generation);
-            state.cells_cache.clear();
+            let dirty_count = self.dirty_rows.iter().filter(|&&d| d).count();
+            if dirty_count > self.rows / 2 {
+                // Promotion: too many dirty rows — full cache rebuild
+                state.cells_cache.clear();
+                self.promoted.set(true);
+                cache_hit = false;
+            }
         }
+        state.last_cache_hit.set(cache_hit);
 
         let cells = self.cells;
         let cols = self.cols;
         let rows = self.rows;
         let cursor = &self.cursor;
 
-        // Layer 1: cells (cached -- redrawn only when cells change)
+        // Layer 1: Base cells (cached — survives across diffs until promotion)
         let cells_geom = state.cells_cache.draw(renderer, bounds.size(), |frame| {
             frame.fill_rectangle(IcedPoint::ORIGIN, bounds.size(), default_bg());
-
             for (idx, cell) in cells.iter().enumerate() {
-                let row = idx / cols;
-                let col = idx % cols;
-                let x = col as f32 * CELL_WIDTH;
-                let y = row as f32 * CELL_HEIGHT;
-
-                let bg = cell_color_to_iced(cell.bg);
-                frame.fill_rectangle(IcedPoint::new(x, y), Size::new(CELL_WIDTH, CELL_HEIGHT), bg);
-
-                let hidden = cell.attrs.contains(CellAttrs::HIDDEN);
-                if !hidden && cell.c != ' ' {
-                    let fg = cell_color_to_iced(cell.fg);
-                    frame.fill_text(Text {
-                        content: cell.c.to_string(),
-                        position: IcedPoint::new(x, y),
-                        color: fg,
-                        size: Pixels(FONT_SIZE),
-                        line_height: iced::widget::text::LineHeight::Absolute(Pixels(CELL_HEIGHT)),
-                        font: Font::MONOSPACE,
-                        horizontal_alignment: alignment::Horizontal::Left,
-                        vertical_alignment: alignment::Vertical::Top,
-                        shaping: iced::widget::text::Shaping::Basic,
-                    });
-                }
+                draw_cell(frame, cell, idx / cols, idx % cols);
             }
         });
+
+        // Layer 1.5: Dirty row overlay (uncached — only changed rows)
+        let has_dirty = self.dirty_rows.iter().any(|&d| d);
+        let overlay_geom = if has_dirty && !self.promoted.get() {
+            Some(draw_dirty_overlay(
+                renderer,
+                bounds,
+                cells,
+                self.dirty_rows,
+                cols,
+            ))
+        } else {
+            None
+        };
 
         // Layer 2: cursor (redrawn every frame -- always clear to pick up position changes)
         state.cursor_cache.clear();
@@ -405,13 +503,26 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
         state.record_draw(draw_start);
         let fps = state.fps();
 
+        // Assemble layers: base + overlay + cursor + optional HUD
+        let mut layers = vec![cells_geom];
+        if let Some(overlay) = overlay_geom {
+            layers.push(overlay);
+        }
+        layers.push(cursor_geom);
+
         // Layer 3: HUD overlay (never cached -- content changes every frame)
         if let Some(metrics) = self.metrics {
-            let hud_geom = draw_hud(renderer, bounds, &metrics, prev_draw_ms, fps);
-            vec![cells_geom, cursor_geom, hud_geom]
-        } else {
-            vec![cells_geom, cursor_geom]
+            let cache_hit = state.last_cache_hit.get();
+            layers.push(draw_hud(
+                renderer,
+                bounds,
+                &metrics,
+                prev_draw_ms,
+                fps,
+                cache_hit,
+            ));
         }
+        layers
     }
 }
 
@@ -422,9 +533,10 @@ fn draw_hud(
     metrics: &MetricsSnapshot,
     draw_ms: f64,
     fps: f64,
+    cache_hit: bool,
 ) -> canvas::Geometry {
     const HUD_W: f32 = 280.0;
-    const HUD_H: f32 = 110.0;
+    const HUD_H: f32 = 148.0;
     const HUD_PAD: f32 = 8.0;
     const LINE_H: f32 = 18.0;
     const HUD_FONT_SIZE: f32 = 12.0;
@@ -446,6 +558,11 @@ fn draw_hud(
         },
     );
 
+    let cache_label = if cache_hit {
+        "HIT (overlay)"
+    } else {
+        "MISS (rebuild)"
+    };
     let green = IcedColor::from_rgb8(0x50, 0xfa, 0x7b);
     let lines = [
         format!(
@@ -456,6 +573,11 @@ fn draw_hud(
         format!("Draw:      {:.1}ms (prev frame)", draw_ms),
         format!("Batch:     {:.1} msgs avg", metrics.batch_avg),
         format!("FPS:       {fps:.0}"),
+        format!(
+            "Diff:      {} ops, {} dirty rows",
+            metrics.last_diff_ops, metrics.last_dirty_rows
+        ),
+        format!("Cache:     {cache_label}"),
     ];
 
     for (i, line) in lines.iter().enumerate() {
@@ -725,5 +847,137 @@ mod tests {
             "cells_generation should not change for empty ops"
         );
         assert_eq!(grid.generation(), g0 + 1);
+    }
+
+    #[test]
+    fn dirty_rows_tracked_on_cell_diff() {
+        let mut grid = CellGrid::new(4, 5);
+        assert_eq!(grid.dirty_row_count(), 0);
+
+        grid.apply_diff(TerminalDiff {
+            ops: vec![
+                DiffOp::Cell {
+                    row: 1,
+                    col: 0,
+                    cell: CellState {
+                        c: 'A',
+                        ..CellState::default()
+                    },
+                },
+                DiffOp::Cell {
+                    row: 3,
+                    col: 2,
+                    cell: CellState {
+                        c: 'B',
+                        ..CellState::default()
+                    },
+                },
+            ],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+        });
+
+        assert_eq!(grid.dirty_row_count(), 2);
+        assert!(!grid.dirty_rows()[0]);
+        assert!(grid.dirty_rows()[1]);
+        assert!(!grid.dirty_rows()[2]);
+        assert!(grid.dirty_rows()[3]);
+    }
+
+    #[test]
+    fn dirty_rows_tracked_on_row_op() {
+        let mut grid = CellGrid::new(4, 5);
+        grid.apply_diff(TerminalDiff {
+            ops: vec![DiffOp::Row {
+                row: 2,
+                start_col: 0,
+                cells: vec![CellState::default(); 3],
+            }],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+        });
+
+        assert_eq!(grid.dirty_row_count(), 1);
+        assert!(grid.dirty_rows()[2]);
+    }
+
+    #[test]
+    fn dirty_rows_reset_after_promotion() {
+        let mut grid = CellGrid::new(4, 5);
+
+        // Mark row 0 dirty
+        grid.apply_diff(TerminalDiff {
+            ops: vec![DiffOp::Cell {
+                row: 0,
+                col: 0,
+                cell: CellState {
+                    c: 'X',
+                    ..CellState::default()
+                },
+            }],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+        });
+        assert_eq!(grid.dirty_row_count(), 1);
+
+        // Simulate draw() promoting (full cache rebuild)
+        grid.promoted.set(true);
+
+        // Next apply_diff sees promoted → clears dirty_rows, then marks row 2
+        grid.apply_diff(TerminalDiff {
+            ops: vec![DiffOp::Cell {
+                row: 2,
+                col: 0,
+                cell: CellState {
+                    c: 'Y',
+                    ..CellState::default()
+                },
+            }],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+        });
+
+        // Only row 2 should be dirty (row 0 was cleared by promotion reset)
+        assert_eq!(grid.dirty_row_count(), 1);
+        assert!(!grid.dirty_rows()[0]);
+        assert!(grid.dirty_rows()[2]);
+        assert!(!grid.promoted.get());
+    }
+
+    #[test]
+    fn snapshot_marks_all_dirty() {
+        let mut grid = CellGrid::new(2, 3);
+        assert_eq!(grid.dirty_row_count(), 0);
+
+        grid.apply_snapshot(GridSnapshot {
+            rows: 2,
+            cols: 3,
+            cells: vec![CellState::default(); 6],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+        });
+
+        // All rows marked dirty to trigger promotion on next draw
+        assert_eq!(grid.dirty_row_count(), 2);
+        assert!(!grid.promoted.get());
+    }
+
+    #[test]
+    fn clear_marks_all_dirty() {
+        let mut grid = CellGrid::new(3, 4);
+        grid.clear();
+
+        assert_eq!(grid.dirty_row_count(), 3);
+        assert!(!grid.promoted.get());
+    }
+
+    #[test]
+    fn resize_resets_dirty_rows() {
+        let mut grid = CellGrid::new(2, 3);
+        grid.resize(4, 5);
+
+        assert_eq!(grid.dirty_rows().len(), 4);
+        assert_eq!(grid.dirty_row_count(), 4);
+        assert!(!grid.promoted.get());
     }
 }

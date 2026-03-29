@@ -54,6 +54,8 @@ pub struct MetricsSnapshot {
     pub net_apply_max_ms: f64,
     pub apply_avg_ms: f64,
     pub batch_avg: f64,
+    pub last_diff_ops: usize,
+    pub last_dirty_rows: usize,
 }
 
 /// Collects client-side timing metrics.
@@ -61,6 +63,8 @@ pub struct RenderMetrics {
     network_apply_latency: RingBuffer,
     apply_duration: RingBuffer,
     batch_size: RingBuffer,
+    last_diff_ops: usize,
+    last_dirty_rows: usize,
 }
 
 impl RenderMetrics {
@@ -69,6 +73,8 @@ impl RenderMetrics {
             network_apply_latency: RingBuffer::new(DEFAULT_CAPACITY),
             apply_duration: RingBuffer::new(DEFAULT_CAPACITY),
             batch_size: RingBuffer::new(DEFAULT_CAPACITY),
+            last_diff_ops: 0,
+            last_dirty_rows: 0,
         }
     }
 
@@ -87,12 +93,20 @@ impl RenderMetrics {
         self.batch_size.push(size as f64);
     }
 
+    /// Record cell diff statistics for HUD display.
+    pub fn record_diff_stats(&mut self, ops: usize, dirty_rows: usize) {
+        self.last_diff_ops = ops;
+        self.last_dirty_rows = dirty_rows;
+    }
+
     pub fn snapshot(&self) -> MetricsSnapshot {
         MetricsSnapshot {
             net_apply_avg_ms: self.network_apply_latency.avg(),
             net_apply_max_ms: self.network_apply_latency.max(),
             apply_avg_ms: self.apply_duration.avg(),
             batch_avg: self.batch_size.avg(),
+            last_diff_ops: self.last_diff_ops,
+            last_dirty_rows: self.last_dirty_rows,
         }
     }
 }

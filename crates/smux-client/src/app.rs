@@ -890,8 +890,12 @@ impl SmuxApp {
                 }
 
                 let start = Instant::now();
+                let diff = Arc::unwrap_or_clone(diff);
+                let op_count = diff.ops.len();
                 if let Some(grid) = self.buffers.get_mut(&session) {
-                    grid.apply_diff(Arc::unwrap_or_clone(diff));
+                    grid.apply_diff(diff);
+                    self.metrics
+                        .record_diff_stats(op_count, grid.dirty_row_count());
                     debug!(
                         session,
                         generation = grid.generation(),
