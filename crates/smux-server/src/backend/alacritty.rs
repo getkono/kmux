@@ -178,6 +178,10 @@ impl TerminalBackend for AlacrittyBackend {
         });
     }
 
+    fn is_alt_screen(&self) -> bool {
+        self.term.mode().contains(TermMode::ALT_SCREEN)
+    }
+
     fn history_size(&self) -> usize {
         self.term.grid().history_size()
     }
@@ -562,6 +566,46 @@ mod tests {
                 !diff.ops.is_empty(),
                 "navigation step {i} should produce cell ops"
             );
+        }
+    }
+
+    #[test]
+    fn alt_screen_no_scrollback_duplication() {
+        let backend = AlacrittyBackend::new(4, 20);
+        let mut ts = DiffEngine::new(backend);
+
+        // Generate some scrollback by printing enough lines to overflow the 4-row screen.
+        for i in 0..8 {
+            ts.feed(format!("line {i}\r\n").as_bytes());
+        }
+        let diff = expect_cell_diff(ts.compute_diff());
+        assert!(
+            !diff.scrollback_lines.is_empty(),
+            "should have generated scrollback"
+        );
+
+        // Enter alt screen (SMCUP) and draw some content.
+        ts.feed(b"\x1b[?1049h");
+        ts.feed(b"fzf content");
+        let diff = expect_cell_diff(ts.compute_diff());
+        assert!(
+            diff.scrollback_lines.is_empty(),
+            "no scrollback on alt screen"
+        );
+
+        // Exit alt screen (RMCUP) -- should NOT re-send existing scrollback.
+        ts.feed(b"\x1b[?1049l");
+        let diff = ts.compute_diff();
+        match diff {
+            DiffResult::CellDiff(d) => {
+                assert!(
+                    d.scrollback_lines.is_empty(),
+                    "exiting alt screen should not re-send {} scrollback lines",
+                    d.scrollback_lines.len()
+                );
+            }
+            // CursorOnly or None are also acceptable.
+            _ => {}
         }
     }
 }

@@ -35,6 +35,9 @@ pub struct DiffEngine<B: TerminalBackend> {
     cols: u16,
     /// Backend history size at the end of the previous `compute_diff()` call.
     prev_history_size: usize,
+    /// Saved main-screen history size when entering the alternate screen buffer.
+    /// Used to avoid re-sending the entire scrollback when exiting alt screen.
+    saved_main_history_size: Option<usize>,
 }
 
 impl<B: TerminalBackend> DiffEngine<B> {
@@ -52,6 +55,7 @@ impl<B: TerminalBackend> DiffEngine<B> {
             rows,
             cols,
             prev_history_size,
+            saved_main_history_size: None,
         }
     }
 
@@ -131,15 +135,39 @@ impl<B: TerminalBackend> DiffEngine<B> {
         std::mem::swap(&mut self.prev_cells, &mut self.current_cells);
 
         // Extract scrollback lines that were pushed to history since last diff.
+        // Alt-screen transitions need special handling: entering alt screen drops
+        // history_size to 0, and exiting restores it to the previous value. Without
+        // tracking this, the exit would re-send the entire scrollback as "new."
+        let is_alt = self.backend.is_alt_screen();
         let current_history_size = self.backend.history_size();
-        let scrollback_lines = if current_history_size > self.prev_history_size {
+
+        let scrollback_lines = if is_alt {
+            // On alt screen: save main history size (first time only), emit nothing.
+            if self.saved_main_history_size.is_none() {
+                self.saved_main_history_size = Some(self.prev_history_size);
+            }
+            self.prev_history_size = current_history_size;
+            vec![]
+        } else if let Some(saved) = self.saved_main_history_size.take() {
+            // Just exited alt screen: only emit lines added since before alt entry.
+            let lines = if current_history_size > saved {
+                self.backend
+                    .read_history_lines(saved, current_history_size - saved, cols)
+            } else {
+                vec![]
+            };
+            self.prev_history_size = current_history_size;
+            lines
+        } else if current_history_size > self.prev_history_size {
+            // Normal operation: emit new scrollback lines.
             let new_count = current_history_size - self.prev_history_size;
-            self.backend
-                .read_history_lines(self.prev_history_size, new_count, cols)
+            let start = self.prev_history_size;
+            self.prev_history_size = current_history_size;
+            self.backend.read_history_lines(start, new_count, cols)
         } else {
+            self.prev_history_size = current_history_size;
             vec![]
         };
-        self.prev_history_size = current_history_size;
 
         let cells_changed = !ops.is_empty();
         let has_scrollback = !scrollback_lines.is_empty();
@@ -205,6 +233,7 @@ impl<B: TerminalBackend> DiffEngine<B> {
         self.prev_cursor = CursorState::default();
         self.prev_modes = TermModes::EMPTY;
         self.prev_history_size = self.backend.history_size();
+        self.saved_main_history_size = None;
     }
 }
 
@@ -420,5 +449,130 @@ mod tests {
         let mut engine = mock_engine(4, 4);
         engine.backend.mode_flags = TermModes(TermModes::APP_CURSOR);
         assert!(engine.modes().app_cursor());
+    }
+
+    /// Helper to build mock history lines for scrollback tests.
+    fn make_history_lines(count: usize, cols: usize) -> Vec<Vec<CellState>> {
+        (0..count)
+            .map(|i| {
+                let mut line = vec![CellState::default(); cols];
+                if !line.is_empty() {
+                    line[0].c = char::from(b'A' + (i as u8 % 26));
+                }
+                line
+            })
+            .collect()
+    }
+
+    #[test]
+    fn alt_screen_enter_exit_no_scrollback_duplication() {
+        let mut engine = mock_engine(4, 4);
+        // Simulate 5 lines of scrollback history on the main screen.
+        engine.backend.history_len = 5;
+        engine.backend.history_lines = make_history_lines(5, 4);
+        let _ = engine.compute_diff(); // sync prev_history_size = 5
+
+        // Enter alt screen: history drops to 0.
+        engine.backend.alt_screen = true;
+        engine.backend.history_len = 0;
+        engine.backend.cells[0].c = 'X'; // fzf draws something
+        let diff = engine.compute_diff();
+        match &diff {
+            DiffResult::CellDiff(d) => {
+                assert!(
+                    d.scrollback_lines.is_empty(),
+                    "no scrollback should be emitted on alt screen"
+                );
+            }
+            _ => panic!("expected CellDiff on alt screen entry"),
+        }
+
+        // Exit alt screen: history restored to 5.
+        engine.backend.alt_screen = false;
+        engine.backend.history_len = 5;
+        engine.backend.cells[0].c = ' '; // main screen restored
+        let diff = engine.compute_diff();
+        match &diff {
+            DiffResult::CellDiff(d) => {
+                assert!(
+                    d.scrollback_lines.is_empty(),
+                    "no scrollback duplication on alt screen exit, got {} lines",
+                    d.scrollback_lines.len()
+                );
+            }
+            _ => panic!("expected CellDiff on alt screen exit"),
+        }
+    }
+
+    #[test]
+    fn alt_screen_with_new_lines_after_exit() {
+        let mut engine = mock_engine(4, 4);
+        // Start with 3 lines of history.
+        engine.backend.history_len = 3;
+        engine.backend.history_lines = make_history_lines(3, 4);
+        let _ = engine.compute_diff(); // sync prev_history_size = 3
+
+        // Enter alt screen.
+        engine.backend.alt_screen = true;
+        engine.backend.history_len = 0;
+        engine.backend.cells[0].c = 'F';
+        let _ = engine.compute_diff();
+
+        // Exit alt screen with 5 lines of history (2 genuinely new).
+        engine.backend.alt_screen = false;
+        engine.backend.history_len = 5;
+        engine.backend.history_lines = make_history_lines(5, 4);
+        engine.backend.cells[0].c = ' ';
+        let diff = engine.compute_diff();
+        match diff {
+            DiffResult::CellDiff(d) => {
+                assert_eq!(
+                    d.scrollback_lines.len(),
+                    2,
+                    "should emit exactly 2 new scrollback lines"
+                );
+            }
+            _ => panic!("expected CellDiff with new scrollback lines"),
+        }
+    }
+
+    #[test]
+    fn normal_scrollback_unaffected() {
+        let mut engine = mock_engine(4, 4);
+        engine.backend.history_len = 0;
+        engine.backend.history_lines = Vec::new();
+        let _ = engine.compute_diff(); // sync
+
+        // Add 3 lines of scrollback (normal shell usage, no alt screen).
+        engine.backend.history_len = 3;
+        engine.backend.history_lines = make_history_lines(3, 4);
+        engine.backend.cells[0].c = 'A';
+        let diff = engine.compute_diff();
+        match diff {
+            DiffResult::CellDiff(d) => {
+                assert_eq!(
+                    d.scrollback_lines.len(),
+                    3,
+                    "should emit all 3 new scrollback lines"
+                );
+            }
+            _ => panic!("expected CellDiff with scrollback"),
+        }
+
+        // Add 2 more lines.
+        engine.backend.history_len = 5;
+        engine.backend.history_lines = make_history_lines(5, 4);
+        engine.backend.cells[0].c = 'B';
+        let diff = engine.compute_diff();
+        match diff {
+            DiffResult::CellDiff(d) => {
+                assert_eq!(
+                    d.scrollback_lines.len(),
+                    2,
+                    "should emit only the 2 new scrollback lines"
+                );
+            }
+            _ => panic!("expected CellDiff with scrollback"),
+        }
     }
 }

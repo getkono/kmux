@@ -152,6 +152,8 @@ pub fn shortcut_help_entries() -> Vec<(&'static str, &'static str)> {
         ("[", "Scroll page up"),
         ("]", "Scroll page down"),
         ("Shift+PgUp/Dn", "Scroll page (direct)"),
+        ("Cmd+C / Ctrl+Shift+C", "Copy selection"),
+        ("Cmd+V / Ctrl+Shift+V", "Paste from clipboard"),
         ("Ctrl+B", "Send literal Ctrl+B"),
     ]
 }

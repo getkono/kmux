@@ -19,9 +19,66 @@ use crate::metrics::MetricsSnapshot;
 
 use crate::app::Message;
 
-const CELL_WIDTH: f32 = 8.0;
-const CELL_HEIGHT: f32 = 16.0;
+pub const CELL_WIDTH: f32 = 8.0;
+pub const CELL_HEIGHT: f32 = 16.0;
 const FONT_SIZE: f32 = 13.0;
+
+// ── Selection types ──
+
+/// An absolute position in the terminal's combined scrollback + visible grid.
+/// Row 0 = oldest scrollback line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GridPos {
+    pub row: usize,
+    pub col: usize,
+}
+
+impl GridPos {
+    fn min(a: GridPos, b: GridPos) -> GridPos {
+        if (a.row, a.col) <= (b.row, b.col) {
+            a
+        } else {
+            b
+        }
+    }
+    fn max(a: GridPos, b: GridPos) -> GridPos {
+        if (a.row, a.col) >= (b.row, b.col) {
+            a
+        } else {
+            b
+        }
+    }
+}
+
+/// Selection mode based on click count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SelectionMode {
+    Normal,
+    Word,
+    Line,
+}
+
+/// A text selection range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Selection {
+    pub anchor: GridPos,
+    pub end: GridPos,
+    pub mode: SelectionMode,
+}
+
+impl Selection {
+    /// The earlier (top-left) position.
+    pub fn start(&self) -> GridPos {
+        GridPos::min(self.anchor, self.end)
+    }
+    /// The later (bottom-right) position.
+    pub fn end_pos(&self) -> GridPos {
+        GridPos::max(self.anchor, self.end)
+    }
+}
+
+/// Double/triple-click detection timeout.
+const MULTI_CLICK_TIMEOUT_MS: u128 = 400;
 
 /// Default background color (One Dark). Matches `CellState::default().bg`.
 const DEFAULT_BG: CellColor = CellColor::new(0x28, 0x2c, 0x34);
@@ -96,6 +153,8 @@ pub struct CellGrid {
     scrollback: ScrollbackBuffer,
     /// Scroll offset from the bottom (0 = live view, >0 = scrolled into history).
     scroll_offset: usize,
+    /// Current text selection, if any.
+    selection: Option<Selection>,
 }
 
 impl CellGrid {
@@ -110,6 +169,7 @@ impl CellGrid {
             cursor_generation: 0,
             scrollback: ScrollbackBuffer::default(),
             scroll_offset: 0,
+            selection: None,
         }
     }
 
@@ -122,6 +182,7 @@ impl CellGrid {
         self.modes = snapshot.modes;
         self.scrollback.clear();
         self.scroll_offset = 0;
+        self.selection = None;
         self.cells_generation += 1;
         self.cursor_generation += 1;
     }
@@ -130,7 +191,22 @@ impl CellGrid {
     pub fn apply_diff(&mut self, diff: TerminalDiff) {
         // Push scrollback lines before applying cell changes.
         if !diff.scrollback_lines.is_empty() {
+            let new_count = diff.scrollback_lines.len();
+            let old_len = self.scrollback.len();
             self.scrollback.push_lines(diff.scrollback_lines);
+            let actual_added = self.scrollback.len() - old_len + new_count.min(old_len);
+            // Evicted = lines that were dropped from the front of the ring buffer.
+            let evicted = new_count.saturating_sub(actual_added);
+            if let Some(sel) = &mut self.selection {
+                // Shift selection rows up by evicted lines, then down by new lines.
+                if evicted > 0 && sel.anchor.row < evicted {
+                    self.selection = None;
+                } else if let Some(sel) = &mut self.selection {
+                    let net = new_count - evicted;
+                    sel.anchor.row = sel.anchor.row.saturating_sub(evicted) + net;
+                    sel.end.row = sel.end.row.saturating_sub(evicted) + net;
+                }
+            }
         }
 
         let has_cell_ops = !diff.ops.is_empty();
@@ -187,6 +263,7 @@ impl CellGrid {
         self.modes = TermModes::EMPTY;
         self.scrollback.clear();
         self.scroll_offset = 0;
+        self.selection = None;
         self.cells_generation += 1;
         self.cursor_generation += 1;
     }
@@ -197,6 +274,7 @@ impl CellGrid {
         self.cols = cols as usize;
         self.cells = vec![CellState::default(); self.rows * self.cols];
         self.scroll_offset = 0;
+        self.selection = None;
         self.cells_generation += 1;
         self.cursor_generation += 1;
     }
@@ -252,6 +330,123 @@ impl CellGrid {
     pub fn scrollback_len(&self) -> usize {
         self.scrollback.len()
     }
+
+    // ── Selection ──
+
+    pub fn selection(&self) -> Option<&Selection> {
+        self.selection.as_ref()
+    }
+
+    pub fn set_selection(&mut self, sel: Option<Selection>) {
+        self.selection = sel;
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.selection = None;
+    }
+
+    /// Read the cell at an absolute grid position (scrollback + visible).
+    fn cell_at(&self, pos: GridPos) -> Option<&CellState> {
+        let sb_len = self.scrollback.len();
+        if pos.row < sb_len {
+            self.scrollback
+                .lines
+                .get(pos.row)
+                .and_then(|line| line.get(pos.col))
+        } else {
+            let grid_row = pos.row - sb_len;
+            if grid_row < self.rows && pos.col < self.cols {
+                self.cells.get(grid_row * self.cols + pos.col)
+            } else {
+                None
+            }
+        }
+    }
+
+    /// Find word boundaries around `pos` for double-click selection.
+    pub fn find_word_boundaries(&self, pos: GridPos) -> (GridPos, GridPos) {
+        let ch = self.cell_at(pos).map(|c| c.c).unwrap_or(' ');
+        let is_word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~');
+
+        if is_word(ch) {
+            let mut start_col = pos.col;
+            while start_col > 0 {
+                let prev = GridPos {
+                    row: pos.row,
+                    col: start_col - 1,
+                };
+                if self.cell_at(prev).map(|c| is_word(c.c)).unwrap_or(false) {
+                    start_col -= 1;
+                } else {
+                    break;
+                }
+            }
+            let max_col = self.cols.saturating_sub(1);
+            let mut end_col = pos.col;
+            while end_col < max_col {
+                let next = GridPos {
+                    row: pos.row,
+                    col: end_col + 1,
+                };
+                if self.cell_at(next).map(|c| is_word(c.c)).unwrap_or(false) {
+                    end_col += 1;
+                } else {
+                    break;
+                }
+            }
+            (
+                GridPos {
+                    row: pos.row,
+                    col: start_col,
+                },
+                GridPos {
+                    row: pos.row,
+                    col: end_col,
+                },
+            )
+        } else {
+            // Non-word: select just this character
+            (pos, pos)
+        }
+    }
+
+    /// Extract the text covered by the current selection.
+    pub fn selected_text(&self) -> Option<String> {
+        let sel = self.selection.as_ref()?;
+        let start = sel.start();
+        let end = sel.end_pos();
+        if start == end {
+            return None;
+        }
+
+        let mut result = String::new();
+        for row in start.row..=end.row {
+            let col_start = if row == start.row { start.col } else { 0 };
+            let col_end = if row == end.row {
+                end.col
+            } else {
+                self.cols.saturating_sub(1)
+            };
+
+            let mut line = String::new();
+            for col in col_start..=col_end {
+                let pos = GridPos { row, col };
+                if let Some(cell) = self.cell_at(pos) {
+                    if cell.attrs.contains(CellAttrs::WIDE_CHAR_SPACER) {
+                        continue;
+                    }
+                    line.push(cell.c);
+                }
+            }
+            // Trim trailing whitespace per line.
+            let trimmed = line.trim_end();
+            if row > start.row {
+                result.push('\n');
+            }
+            result.push_str(trimmed);
+        }
+        Some(result)
+    }
 }
 
 impl Default for CellGrid {
@@ -276,6 +471,7 @@ pub struct GridView<'a> {
     diag: Option<DiagSnapshot>,
     scroll_offset: usize,
     scrollback: &'a ScrollbackBuffer,
+    selection: Option<Selection>,
 }
 
 impl<'a> GridView<'a> {
@@ -294,7 +490,41 @@ impl<'a> GridView<'a> {
             diag,
             scroll_offset: grid.scroll_offset,
             scrollback: &grid.scrollback,
+            selection: grid.selection,
         }
+    }
+}
+
+// ── Coordinate conversion ──
+
+/// Convert a pixel position to an absolute grid position.
+fn pixel_to_grid_pos(
+    x: f32,
+    y: f32,
+    cols: usize,
+    rows: usize,
+    scroll_offset: usize,
+    scrollback_len: usize,
+) -> GridPos {
+    let col = (x / CELL_WIDTH).floor().max(0.0) as usize;
+    let col = col.min(cols.saturating_sub(1));
+    let viewport_row = (y / CELL_HEIGHT).floor().max(0.0) as usize;
+    let viewport_row = viewport_row.min(rows.saturating_sub(1));
+    let abs_row = scrollback_len.saturating_sub(scroll_offset) + viewport_row;
+    GridPos { row: abs_row, col }
+}
+
+/// Convert an absolute row to a viewport row. Returns None if off-screen.
+fn abs_row_to_viewport(
+    abs_row: usize,
+    scroll_offset: usize,
+    scrollback_len: usize,
+) -> Option<usize> {
+    let viewport_start = scrollback_len.saturating_sub(scroll_offset);
+    if abs_row >= viewport_start {
+        Some(abs_row - viewport_start)
+    } else {
+        None
     }
 }
 
@@ -316,6 +546,11 @@ pub struct CanvasState {
     /// Circular buffer of draw timestamps for FPS calculation.
     draw_timestamps: std::cell::RefCell<std::collections::VecDeque<Instant>>,
     last_cache_hit: Cell<bool>,
+    // Mouse tracking for selection
+    mouse_down: bool,
+    last_click_time: Option<Instant>,
+    last_click_pos: Option<GridPos>,
+    click_count: u8,
 }
 
 impl Default for CanvasState {
@@ -331,6 +566,10 @@ impl Default for CanvasState {
                 128,
             )),
             last_cache_hit: Cell::new(true),
+            mouse_down: false,
+            last_click_time: None,
+            last_click_pos: None,
+            click_count: 0,
         }
     }
 }
@@ -473,13 +712,13 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
         state: &mut CanvasState,
         event: canvas::Event,
         bounds: Rectangle,
-        _cursor: mouse::Cursor,
+        cursor: mouse::Cursor,
     ) -> (canvas::event::Status, Option<Message>) {
         // Mouse wheel scrolling (3 lines per notch).
         if let canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) = &event {
             let lines = match delta {
-                mouse::ScrollDelta::Lines { y, .. } => (*y * -3.0) as i32,
-                mouse::ScrollDelta::Pixels { y, .. } => -(*y / CELL_HEIGHT) as i32,
+                mouse::ScrollDelta::Lines { y, .. } => (*y * 3.0) as i32,
+                mouse::ScrollDelta::Pixels { y, .. } => (*y / CELL_HEIGHT) as i32,
             };
             if lines != 0 {
                 return (
@@ -487,6 +726,92 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
                     Some(Message::ScrollTerminal(lines)),
                 );
             }
+        }
+
+        // Mouse button pressed → start selection
+        if let canvas::Event::Mouse(mouse::Event::ButtonPressed(mouse::Button::Left)) = &event
+            && let Some(pos) = cursor.position_in(bounds)
+        {
+            let grid_pos = pixel_to_grid_pos(
+                pos.x,
+                pos.y,
+                self.cols,
+                self.rows,
+                self.scroll_offset,
+                self.scrollback.len(),
+            );
+
+            // Multi-click detection
+            let now = Instant::now();
+            let same_pos = state.last_click_pos.is_some_and(|p| p.row == grid_pos.row);
+            let quick = state
+                .last_click_time
+                .is_some_and(|t| now.duration_since(t).as_millis() < MULTI_CLICK_TIMEOUT_MS);
+            if quick && same_pos {
+                state.click_count = (state.click_count % 3) + 1;
+            } else {
+                state.click_count = 1;
+            }
+            state.last_click_time = Some(now);
+            state.last_click_pos = Some(grid_pos);
+            state.mouse_down = true;
+
+            let mode = match state.click_count {
+                2 => SelectionMode::Word,
+                3 => SelectionMode::Line,
+                _ => SelectionMode::Normal,
+            };
+            return (
+                canvas::event::Status::Captured,
+                Some(Message::SelectionStart {
+                    pos: grid_pos,
+                    mode,
+                }),
+            );
+        }
+
+        // Mouse move during drag → update selection
+        if let canvas::Event::Mouse(mouse::Event::CursorMoved { .. }) = &event
+            && state.mouse_down
+        {
+            if let Some(pos) = cursor.position_in(bounds) {
+                let grid_pos = pixel_to_grid_pos(
+                    pos.x,
+                    pos.y,
+                    self.cols,
+                    self.rows,
+                    self.scroll_offset,
+                    self.scrollback.len(),
+                );
+                return (
+                    canvas::event::Status::Captured,
+                    Some(Message::SelectionUpdate { pos: grid_pos }),
+                );
+            } else if let Some(pos) = cursor.position() {
+                // Cursor outside bounds during drag → auto-scroll
+                let rel_y = pos.y - bounds.y;
+                let direction = if rel_y < 0.0 {
+                    3 // scroll up (into history)
+                } else if rel_y > bounds.height {
+                    -3 // scroll down (toward live)
+                } else {
+                    0
+                };
+                if direction != 0 {
+                    return (
+                        canvas::event::Status::Captured,
+                        Some(Message::SelectionAutoScroll(direction)),
+                    );
+                }
+            }
+        }
+
+        // Mouse button released → end selection
+        if let canvas::Event::Mouse(mouse::Event::ButtonReleased(mouse::Button::Left)) = &event
+            && state.mouse_down
+        {
+            state.mouse_down = false;
+            return (canvas::event::Status::Captured, Some(Message::SelectionEnd));
         }
 
         let new_rows = (bounds.height / CELL_HEIGHT).floor().max(1.0) as u16;
@@ -504,6 +829,19 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
             );
         }
         (canvas::event::Status::Ignored, None)
+    }
+
+    fn mouse_interaction(
+        &self,
+        _state: &CanvasState,
+        bounds: Rectangle,
+        cursor: mouse::Cursor,
+    ) -> mouse::Interaction {
+        if cursor.is_over(bounds) {
+            mouse::Interaction::Text
+        } else {
+            mouse::Interaction::default()
+        }
     }
 
     fn draw(
@@ -674,8 +1012,25 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
         state.record_draw(draw_start);
         let fps = state.fps();
 
-        // Assemble layers: cells + cursor + optional scroll indicator + optional HUD
-        let mut layers = vec![cells_geom, cursor_geom];
+        // Layer 2.5: Selection overlay (uncached, cheap -- just rectangles)
+        let selection_geom = self.selection.map(|sel| {
+            draw_selection_overlay(
+                renderer,
+                bounds,
+                &sel,
+                cols,
+                rows,
+                scroll_offset,
+                scrollback.len(),
+            )
+        });
+
+        // Assemble layers: cells + selection + cursor + optional scroll indicator + optional HUD
+        let mut layers = vec![cells_geom];
+        if let Some(sel_geom) = selection_geom {
+            layers.push(sel_geom);
+        }
+        layers.push(cursor_geom);
 
         // Layer 3: Scroll position indicator (when scrolled)
         if scroll_offset > 0 {
@@ -702,6 +1057,57 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
         }
         layers
     }
+}
+
+/// Selection highlight color (One Dark ACCENT at 30% opacity).
+const SELECTION_BG: IcedColor = IcedColor {
+    r: 0x61 as f32 / 255.0,
+    g: 0xaf as f32 / 255.0,
+    b: 0xef as f32 / 255.0,
+    a: 0.3,
+};
+
+/// Draw the selection overlay as semi-transparent rectangles.
+fn draw_selection_overlay(
+    renderer: &iced::Renderer,
+    bounds: Rectangle,
+    sel: &Selection,
+    cols: usize,
+    rows: usize,
+    scroll_offset: usize,
+    scrollback_len: usize,
+) -> canvas::Geometry {
+    let mut frame = canvas::Frame::new(renderer, bounds.size());
+    let start = sel.start();
+    let end = sel.end_pos();
+
+    for abs_row in start.row..=end.row {
+        let Some(vr) = abs_row_to_viewport(abs_row, scroll_offset, scrollback_len) else {
+            continue;
+        };
+        if vr >= rows {
+            break;
+        }
+
+        let col_start = if abs_row == start.row { start.col } else { 0 };
+        let col_end = if abs_row == end.row {
+            end.col
+        } else {
+            cols.saturating_sub(1)
+        };
+
+        let x = col_start as f32 * CELL_WIDTH;
+        let y = vr as f32 * CELL_HEIGHT;
+        let w = (col_end - col_start + 1) as f32 * CELL_WIDTH;
+
+        frame.fill_rectangle(
+            IcedPoint::new(x, y),
+            Size::new(w, CELL_HEIGHT),
+            SELECTION_BG,
+        );
+    }
+
+    frame.into_geometry()
 }
 
 /// Draw a scroll position indicator at the top-right corner.

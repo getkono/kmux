@@ -43,6 +43,11 @@ pub trait TerminalBackend: Send + 'static {
         (self.cursor(), self.modes())
     }
 
+    /// Whether the terminal is currently on the alternate screen buffer.
+    fn is_alt_screen(&self) -> bool {
+        false
+    }
+
     /// Number of lines currently in the scrollback history.
     fn history_size(&self) -> usize {
         0

@@ -12,6 +12,9 @@ pub struct MockBackend {
     pub cursor_state: CursorState,
     pub mode_flags: TermModes,
     pub fed_bytes: Vec<u8>,
+    pub alt_screen: bool,
+    pub history_len: usize,
+    pub history_lines: Vec<Vec<CellState>>,
     rows: u16,
     cols: u16,
 }
@@ -24,6 +27,9 @@ impl MockBackend {
             cursor_state: CursorState::default(),
             mode_flags: TermModes::EMPTY,
             fed_bytes: Vec::new(),
+            alt_screen: false,
+            history_len: 0,
+            history_lines: Vec::new(),
             rows,
             cols,
         }
@@ -57,5 +63,22 @@ impl TerminalBackend for MockBackend {
         self.cols = cols;
         let n = rows as usize * cols as usize;
         self.cells.resize(n, CellState::default());
+    }
+
+    fn is_alt_screen(&self) -> bool {
+        self.alt_screen
+    }
+
+    fn history_size(&self) -> usize {
+        self.history_len
+    }
+
+    fn read_history_lines(&self, start: usize, count: usize, _cols: usize) -> Vec<Vec<CellState>> {
+        self.history_lines
+            .iter()
+            .skip(start)
+            .take(count)
+            .cloned()
+            .collect()
     }
 }

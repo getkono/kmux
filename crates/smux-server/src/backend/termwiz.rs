@@ -23,6 +23,7 @@ pub struct TermwizBackend {
     surface: Surface,
     app_cursor: bool,
     bracketed_paste: bool,
+    alt_screen: bool,
     rows: u16,
     cols: u16,
 }
@@ -35,6 +36,7 @@ impl TermwizBackend {
             surface,
             app_cursor: false,
             bracketed_paste: false,
+            alt_screen: false,
             rows,
             cols,
         }
@@ -338,6 +340,7 @@ impl TermwizBackend {
                 self.bracketed_paste = enable;
             }
             DecPrivateModeCode::ClearAndEnableAlternateScreen => {
+                self.alt_screen = enable;
                 if enable {
                     self.surface
                         .add_change(Change::ClearScreen(Default::default()));
@@ -462,6 +465,10 @@ impl TerminalBackend for TermwizBackend {
             shape,
             visible,
         }
+    }
+
+    fn is_alt_screen(&self) -> bool {
+        self.alt_screen
     }
 
     fn modes(&self) -> TermModes {

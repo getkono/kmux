@@ -53,6 +53,7 @@ pub async fn write_frame<W: tokio::io::AsyncWriteExt + Unpin>(
     }
     w.write_all(&len.to_be_bytes()).await?;
     w.write_all(data).await?;
+    w.flush().await?;
     Ok(())
 }
 

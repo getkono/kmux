@@ -99,6 +99,17 @@ pub enum Message {
 
     /// Clipboard contents received for paste.
     ClipboardPaste(Option<String>),
+
+    // Text selection
+    SelectionStart {
+        pos: crate::terminal_view::GridPos,
+        mode: crate::terminal_view::SelectionMode,
+    },
+    SelectionUpdate {
+        pos: crate::terminal_view::GridPos,
+    },
+    SelectionEnd,
+    SelectionAutoScroll(i32),
 }
 
 /// Per-session synchronisation state for ordering protection.
@@ -640,6 +651,121 @@ impl SmuxApp {
                 self.leader_state = LeaderState::Idle;
                 Task::none()
             }
+
+            // ── Text selection ──
+            Message::SelectionStart { pos, mode } => {
+                use crate::terminal_view::{GridPos, Selection, SelectionMode};
+                if let Some(name) = &self.active_session
+                    && let Some(grid) = self.buffers.get_mut(name)
+                {
+                    let sel = match mode {
+                        SelectionMode::Word => {
+                            let (start, end) = grid.find_word_boundaries(pos);
+                            Selection {
+                                anchor: start,
+                                end,
+                                mode,
+                            }
+                        }
+                        SelectionMode::Line => Selection {
+                            anchor: GridPos {
+                                row: pos.row,
+                                col: 0,
+                            },
+                            end: GridPos {
+                                row: pos.row,
+                                col: grid.cols.saturating_sub(1),
+                            },
+                            mode,
+                        },
+                        SelectionMode::Normal => Selection {
+                            anchor: pos,
+                            end: pos,
+                            mode,
+                        },
+                    };
+                    grid.set_selection(Some(sel));
+                }
+                Task::none()
+            }
+
+            Message::SelectionUpdate { pos } => {
+                use crate::terminal_view::{GridPos, SelectionMode};
+                if let Some(name) = &self.active_session
+                    && let Some(grid) = self.buffers.get_mut(name)
+                    && let Some(sel) = grid.selection().copied()
+                {
+                    let new_end = match sel.mode {
+                        SelectionMode::Word => {
+                            let (_, word_end) = grid.find_word_boundaries(pos);
+                            // Extend to the farther word boundary from anchor
+                            if (pos.row, pos.col) >= (sel.anchor.row, sel.anchor.col) {
+                                word_end
+                            } else {
+                                let (word_start, _) = grid.find_word_boundaries(pos);
+                                word_start
+                            }
+                        }
+                        SelectionMode::Line => {
+                            if pos.row >= sel.anchor.row {
+                                GridPos {
+                                    row: pos.row,
+                                    col: grid.cols.saturating_sub(1),
+                                }
+                            } else {
+                                GridPos {
+                                    row: pos.row,
+                                    col: 0,
+                                }
+                            }
+                        }
+                        SelectionMode::Normal => pos,
+                    };
+                    let mut updated = sel;
+                    updated.end = new_end;
+                    grid.set_selection(Some(updated));
+                }
+                Task::none()
+            }
+
+            Message::SelectionEnd => {
+                // Selection stays. Nothing to do.
+                Task::none()
+            }
+
+            Message::SelectionAutoScroll(direction) => {
+                if let Some(name) = &self.active_session
+                    && let Some(grid) = self.buffers.get_mut(name)
+                {
+                    if direction > 0 {
+                        grid.scroll_up(direction as usize);
+                    } else if direction < 0 {
+                        grid.scroll_down((-direction) as usize);
+                    }
+                    // Update selection end to viewport edge
+                    if let Some(sel) = grid.selection().copied() {
+                        use crate::terminal_view::GridPos;
+                        let sb_len = grid.scrollback_len();
+                        let new_end = if direction > 0 {
+                            // Scrolled up, extend to top of viewport
+                            GridPos {
+                                row: sb_len.saturating_sub(grid.scroll_offset()),
+                                col: 0,
+                            }
+                        } else {
+                            // Scrolled down, extend to bottom of viewport
+                            GridPos {
+                                row: sb_len.saturating_sub(grid.scroll_offset()) + grid.rows - 1,
+                                col: grid.cols.saturating_sub(1),
+                            }
+                        };
+                        let mut updated = sel;
+                        updated.end = new_end;
+                        grid.set_selection(Some(updated));
+                    }
+                }
+                Task::none()
+            }
         }
     }
 
@@ -691,6 +817,24 @@ impl SmuxApp {
                     return Task::none();
                 }
 
+                // Cmd+C (macOS) or Ctrl+Shift+C (Linux/Windows) → copy selection
+                if matches!(&key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("c")) {
+                    let is_copy = if cfg!(target_os = "macos") {
+                        modifiers.logo()
+                    } else {
+                        modifiers.control() && modifiers.shift()
+                    };
+                    if is_copy {
+                        if let Some(name) = &self.active_session
+                            && let Some(grid) = self.buffers.get(name)
+                            && let Some(text) = grid.selected_text()
+                        {
+                            return iced::clipboard::write(text);
+                        }
+                        return Task::none();
+                    }
+                }
+
                 // Ctrl+Shift+V (Linux/Windows) or Cmd+V (macOS) → clipboard paste
                 if matches!(&key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("v")) {
                     let is_paste = if cfg!(target_os = "macos") {
@@ -701,6 +845,14 @@ impl SmuxApp {
                     if is_paste {
                         return iced::clipboard::read().map(Message::ClipboardPaste);
                     }
+                }
+
+                // Escape clears selection (and still forwards to PTY below)
+                if key == Key::Named(Named::Escape)
+                    && let Some(name) = &self.active_session
+                    && let Some(grid) = self.buffers.get_mut(name)
+                {
+                    grid.clear_selection();
                 }
 
                 // Normal key → forward to PTY
@@ -1611,10 +1763,69 @@ fn key_to_bytes(
                 Named::F10 => b"\x1b[21~",
                 Named::F11 => b"\x1b[23~",
                 Named::F12 => b"\x1b[24~",
+                Named::Insert => b"\x1b[2~",
                 _ => return None,
             };
             Some(bytes.to_vec())
         }
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use iced::keyboard::key::Named;
+    use iced::keyboard::{Key, Modifiers};
+
+    fn no_mods() -> Modifiers {
+        Modifiers::empty()
+    }
+
+    #[test]
+    fn escape_produces_0x1b() {
+        let result = key_to_bytes(Key::Named(Named::Escape), no_mods(), None, false);
+        assert_eq!(result, Some(vec![0x1b]));
+    }
+
+    #[test]
+    fn insert_produces_csi_2_tilde() {
+        let result = key_to_bytes(Key::Named(Named::Insert), no_mods(), None, false);
+        assert_eq!(result, Some(b"\x1b[2~".to_vec()));
+    }
+
+    #[test]
+    fn arrow_up_normal_mode() {
+        let result = key_to_bytes(Key::Named(Named::ArrowUp), no_mods(), None, false);
+        assert_eq!(result, Some(b"\x1b[A".to_vec()));
+    }
+
+    #[test]
+    fn arrow_up_app_cursor_mode() {
+        let result = key_to_bytes(Key::Named(Named::ArrowUp), no_mods(), None, true);
+        assert_eq!(result, Some(b"\x1bOA".to_vec()));
+    }
+
+    #[test]
+    fn ctrl_c_produces_etx() {
+        let result = key_to_bytes(
+            Key::Character("c".into()),
+            Modifiers::CTRL,
+            None,
+            false,
+        );
+        assert_eq!(result, Some(vec![0x03]));
+    }
+
+    #[test]
+    fn enter_produces_cr() {
+        let result = key_to_bytes(Key::Named(Named::Enter), no_mods(), None, false);
+        assert_eq!(result, Some(vec![0x0d]));
+    }
+
+    #[test]
+    fn backspace_produces_del() {
+        let result = key_to_bytes(Key::Named(Named::Backspace), no_mods(), None, false);
+        assert_eq!(result, Some(vec![0x7f]));
     }
 }
