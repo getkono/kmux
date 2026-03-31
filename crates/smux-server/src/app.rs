@@ -26,6 +26,9 @@ const SCROLLBACK_CAPACITY: usize = 10 * 1024 * 1024;
 pub struct ClientSender {
     pub data_tx: mpsc::Sender<ServerMessage>,
     pub ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+    /// When true, the relay sends full `TerminalSnapshot` messages instead
+    /// of incremental `TerminalUpdate` diffs.
+    pub force_full_snapshot: bool,
 }
 
 /// Shared map of per-client output senders for a single session.
@@ -207,13 +210,27 @@ impl ServerApp {
         };
 
         // Register client -- relay task will now deliver live output to them.
-        relay
-            .clients
-            .lock()
-            .unwrap()
-            .insert(client_id, ClientSender { data_tx, ctrl_tx });
+        relay.clients.lock().unwrap().insert(
+            client_id,
+            ClientSender {
+                data_tx,
+                ctrl_tx,
+                force_full_snapshot: false,
+            },
+        );
 
         Ok(result)
+    }
+
+    /// Set the full-snapshot mode flag for a client across all attached sessions.
+    pub async fn set_snapshot_mode(&self, client_id: ClientId, enabled: bool) {
+        let relays = self.relays.read().await;
+        for relay in relays.values() {
+            let mut map = relay.clients.lock().unwrap();
+            if let Some(sender) = map.get_mut(&client_id) {
+                sender.force_full_snapshot = enabled;
+            }
+        }
     }
 
     /// Remove a client from a specific session and release any lock they hold.
@@ -254,6 +271,37 @@ impl ServerApp {
         }
 
         relay.writer.write_all(&data).await
+    }
+
+    /// Paste clipboard text into a session's PTY stdin.
+    ///
+    /// If the terminal has bracketed paste mode enabled (DEC 2004), the data
+    /// is wrapped in `\x1b[200~` ... `\x1b[201~` escape sequences.
+    pub async fn write_paste(&self, name: &str, client_id: ClientId, data: String) -> Result<()> {
+        let relays = self.relays.read().await;
+        let relay = relays.get(name).ok_or_else(|| SmuxError::SessionNotFound {
+            name: name.to_string(),
+        })?;
+
+        match &relay.input_mode {
+            InputMode::Open => {}
+            InputMode::Locked(holder) if *holder == client_id => {}
+            InputMode::Locked(_) | InputMode::Disabled => {
+                return Err(SmuxError::Pty(nix::Error::EPERM));
+            }
+        }
+
+        let bracketed = relay.term_state.lock().unwrap().modes().bracketed_paste();
+
+        if bracketed {
+            let mut buf = Vec::with_capacity(data.len() + 12);
+            buf.extend_from_slice(b"\x1b[200~");
+            buf.extend_from_slice(data.as_bytes());
+            buf.extend_from_slice(b"\x1b[201~");
+            relay.writer.write_all(&buf).await
+        } else {
+            relay.writer.write_all(data.as_bytes()).await
+        }
     }
 
     /// Resize a named session's PTY and its server-side terminal emulator.

@@ -1,6 +1,7 @@
 use alacritty_terminal::{
     event::VoidListener,
     grid::Dimensions,
+    index::{Column, Line},
     term::{Config, RenderableCursor, Term, TermMode, cell::Flags},
     vte::ansi::{Color, CursorShape as AlacCursorShape, NamedColor, Processor},
 };
@@ -10,6 +11,9 @@ use smux_protocol::messages::{
 
 use super::TerminalBackend;
 
+/// Scrollback capacity per session (lines above the visible area).
+const SCROLLBACK_LINES: usize = 50_000;
+
 /// Grid dimensions wrapper implementing the alacritty `Dimensions` trait.
 struct TermDims {
     rows: usize,
@@ -18,7 +22,7 @@ struct TermDims {
 
 impl Dimensions for TermDims {
     fn total_lines(&self) -> usize {
-        self.rows
+        self.rows + SCROLLBACK_LINES
     }
     fn screen_lines(&self) -> usize {
         self.rows
@@ -113,7 +117,56 @@ impl TerminalBackend for AlacrittyBackend {
         if self.term.mode().contains(TermMode::APP_CURSOR) {
             bits |= TermModes::APP_CURSOR;
         }
+        if self.term.mode().contains(TermMode::BRACKETED_PASTE) {
+            bits |= TermModes::BRACKETED_PASTE;
+        }
         TermModes(bits)
+    }
+
+    fn fill_cells_and_cursor(&self, out: &mut [CellState]) -> (CursorState, TermModes) {
+        let rows = self.rows as usize;
+        let cols = self.cols as usize;
+        let content = self.term.renderable_content();
+        let colors = content.colors;
+
+        // Extract cursor and modes from the same RenderableContent.
+        let cursor = Self::convert_cursor(&content.cursor, content.display_offset as i32);
+        let mut mode_bits: u16 = 0;
+        if content.mode.contains(TermMode::APP_CURSOR) {
+            mode_bits |= TermModes::APP_CURSOR;
+        }
+        if content.mode.contains(TermMode::BRACKETED_PASTE) {
+            mode_bits |= TermModes::BRACKETED_PASTE;
+        }
+        let modes = TermModes(mode_bits);
+
+        // Fill cells (same logic as fill_cells).
+        for indexed in content.display_iter {
+            let row = indexed.point.line.0 + content.display_offset as i32;
+            let col = indexed.point.column.0;
+            if row >= 0 && (row as usize) < rows && col < cols {
+                let cell = indexed.cell;
+                let (fg, bg) = if cell.flags.contains(Flags::INVERSE) {
+                    (
+                        resolve_color(cell.bg, colors),
+                        resolve_color(cell.fg, colors),
+                    )
+                } else {
+                    (
+                        resolve_color(cell.fg, colors),
+                        resolve_color(cell.bg, colors),
+                    )
+                };
+                out[row as usize * cols + col] = CellState {
+                    c: cell.c,
+                    fg,
+                    bg,
+                    attrs: convert_flags(cell.flags),
+                };
+            }
+        }
+
+        (cursor, modes)
     }
 
     fn resize(&mut self, rows: u16, cols: u16) {
@@ -123,6 +176,49 @@ impl TerminalBackend for AlacrittyBackend {
             rows: rows as usize,
             cols: cols as usize,
         });
+    }
+
+    fn history_size(&self) -> usize {
+        self.term.grid().history_size()
+    }
+
+    fn read_history_lines(&self, start: usize, count: usize, cols: usize) -> Vec<Vec<CellState>> {
+        let grid = self.term.grid();
+        let hist_size = grid.history_size();
+        let colors = self.term.colors();
+        let mut lines = Vec::with_capacity(count);
+
+        for i in start..start.saturating_add(count).min(hist_size) {
+            // History is indexed with negative Line values: Line(-1) is most
+            // recent, Line(-hist_size) is oldest.  Index `i` counts from the
+            // oldest, so map: line_idx = -(hist_size - i).
+            let line_idx = -((hist_size - i) as i32);
+            let row = &grid[Line(line_idx)];
+            let mut cells = Vec::with_capacity(cols);
+            for c in 0..cols {
+                let alac_cell = &row[Column(c)];
+                let (fg, bg) = if alac_cell.flags.contains(Flags::INVERSE) {
+                    (
+                        resolve_color(alac_cell.bg, colors),
+                        resolve_color(alac_cell.fg, colors),
+                    )
+                } else {
+                    (
+                        resolve_color(alac_cell.fg, colors),
+                        resolve_color(alac_cell.bg, colors),
+                    )
+                };
+                cells.push(CellState {
+                    c: alac_cell.c,
+                    fg,
+                    bg,
+                    attrs: convert_flags(alac_cell.flags),
+                });
+            }
+            lines.push(cells);
+        }
+
+        lines
     }
 }
 
@@ -237,6 +333,12 @@ fn convert_flags(flags: Flags) -> CellAttrs {
     }
     if flags.contains(Flags::DIM) {
         bits |= CellAttrs::DIM;
+    }
+    if flags.contains(Flags::WIDE_CHAR) {
+        bits |= CellAttrs::WIDE_CHAR;
+    }
+    if flags.contains(Flags::WIDE_CHAR_SPACER) {
+        bits |= CellAttrs::WIDE_CHAR_SPACER;
     }
     CellAttrs(bits)
 }
@@ -403,6 +505,31 @@ mod tests {
         assert!(
             !snap.cursor.visible,
             "cursor should be hidden after DECTCEM reset"
+        );
+    }
+
+    #[test]
+    fn bracketed_paste_mode_enable_disable() {
+        let mut ts = DiffEngine::new(AlacrittyBackend::new(24, 80));
+
+        // Initially off
+        assert!(
+            !ts.modes().bracketed_paste(),
+            "bracketed paste should be off by default"
+        );
+
+        // Enable DEC 2004
+        ts.feed(b"\x1b[?2004h");
+        assert!(
+            ts.modes().bracketed_paste(),
+            "bracketed paste should be on after \\e[?2004h"
+        );
+
+        // Disable DEC 2004
+        ts.feed(b"\x1b[?2004l");
+        assert!(
+            !ts.modes().bracketed_paste(),
+            "bracketed paste should be off after \\e[?2004l"
         );
     }
 

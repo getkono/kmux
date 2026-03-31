@@ -96,6 +96,7 @@ mod tests {
                 .collect(),
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
+            scrollback_lines: vec![],
         })
     }
 

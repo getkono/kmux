@@ -33,6 +33,8 @@ pub struct DiffEngine<B: TerminalBackend> {
     prev_modes: TermModes,
     rows: u16,
     cols: u16,
+    /// Backend history size at the end of the previous `compute_diff()` call.
+    prev_history_size: usize,
 }
 
 impl<B: TerminalBackend> DiffEngine<B> {
@@ -40,6 +42,7 @@ impl<B: TerminalBackend> DiffEngine<B> {
         let (rows, cols) = backend.size();
         let n = rows as usize * cols as usize;
         let blank = CellState::default();
+        let prev_history_size = backend.history_size();
         Self {
             backend,
             prev_cells: vec![blank; n],
@@ -48,6 +51,7 @@ impl<B: TerminalBackend> DiffEngine<B> {
             prev_modes: TermModes::EMPTY,
             rows,
             cols,
+            prev_history_size,
         }
     }
 
@@ -65,23 +69,36 @@ impl<B: TerminalBackend> DiffEngine<B> {
         let rows = self.rows as usize;
         let cols = self.cols as usize;
 
-        // Reset scratch buffer and populate from backend
+        // Reset scratch buffer and populate from backend (single renderable_content() call)
         self.current_cells.fill(CellState::default());
-        self.backend.fill_cells(&mut self.current_cells);
+        let (cursor_state, modes) = self.backend.fill_cells_and_cursor(&mut self.current_cells);
 
-        // Compare all rows
+        // Compare all rows, tracking clear-detection metadata inline to avoid
+        // a second O(rows*cols) scan.
+        let total = rows * cols;
         let mut ops = Vec::new();
+        let mut total_changed: usize = 0;
+        let mut all_current_default = true;
         for r in 0..rows {
             let base = r * cols;
             let mut c = 0;
             while c < cols {
                 if self.current_cells[base + c] != self.prev_cells[base + c] {
                     let start = c;
+                    if all_current_default && self.current_cells[base + c] != CellState::default() {
+                        all_current_default = false;
+                    }
                     c += 1;
                     while c < cols && self.current_cells[base + c] != self.prev_cells[base + c] {
+                        if all_current_default
+                            && self.current_cells[base + c] != CellState::default()
+                        {
+                            all_current_default = false;
+                        }
                         c += 1;
                     }
                     let run_len = c - start;
+                    total_changed += run_len;
                     if run_len >= 2 {
                         ops.push(DiffOp::Row {
                             row: r as u16,
@@ -96,6 +113,9 @@ impl<B: TerminalBackend> DiffEngine<B> {
                         });
                     }
                 } else {
+                    if all_current_default && self.current_cells[base + c] != CellState::default() {
+                        all_current_default = false;
+                    }
                     c += 1;
                 }
             }
@@ -103,41 +123,37 @@ impl<B: TerminalBackend> DiffEngine<B> {
 
         // Detect full-screen clear: if all current cells are default and more
         // than half the screen changed, collapse into a single DiffOp::Clear.
-        if !ops.is_empty() {
-            let total = rows * cols;
-            let changed: usize = ops
-                .iter()
-                .map(|op| match op {
-                    DiffOp::Cell { .. } => 1,
-                    DiffOp::Row { cells, .. } => cells.len(),
-                    DiffOp::Clear => total,
-                })
-                .sum();
-            let all_default = self.current_cells[..total]
-                .iter()
-                .all(|c| *c == CellState::default());
-            if all_default && changed > total / 2 {
-                ops = vec![DiffOp::Clear];
-            }
+        if !ops.is_empty() && all_current_default && total_changed > total / 2 {
+            ops = vec![DiffOp::Clear];
         }
 
         // Swap buffers: current becomes prev for next frame
         std::mem::swap(&mut self.prev_cells, &mut self.current_cells);
 
-        let cursor_state = self.backend.cursor();
-        let modes = self.backend.modes();
+        // Extract scrollback lines that were pushed to history since last diff.
+        let current_history_size = self.backend.history_size();
+        let scrollback_lines = if current_history_size > self.prev_history_size {
+            let new_count = current_history_size - self.prev_history_size;
+            self.backend
+                .read_history_lines(self.prev_history_size, new_count, cols)
+        } else {
+            vec![]
+        };
+        self.prev_history_size = current_history_size;
 
         let cells_changed = !ops.is_empty();
+        let has_scrollback = !scrollback_lines.is_empty();
         let cursor_or_modes_changed = cursor_state != self.prev_cursor || modes != self.prev_modes;
 
         self.prev_cursor = cursor_state;
         self.prev_modes = modes;
 
-        if cells_changed {
+        if cells_changed || has_scrollback {
             DiffResult::CellDiff(TerminalDiff {
                 ops,
                 cursor: cursor_state,
                 modes,
+                scrollback_lines,
             })
         } else if cursor_or_modes_changed {
             DiffResult::CursorOnly {
@@ -149,7 +165,8 @@ impl<B: TerminalBackend> DiffEngine<B> {
         }
     }
 
-    /// Current cursor state from the backend (does NOT call `fill_cells()`).
+    /// Current cursor state from the backend.
+    #[cfg(test)]
     pub fn cursor(&self) -> CursorState {
         self.backend.cursor()
     }
@@ -166,16 +183,13 @@ impl<B: TerminalBackend> DiffEngine<B> {
 
         let blank = CellState::default();
         let mut cells = vec![blank; rows * cols];
-        self.backend.fill_cells(&mut cells);
-
-        let cursor_state = self.backend.cursor();
-        let modes = self.backend.modes();
+        let (cursor, modes) = self.backend.fill_cells_and_cursor(&mut cells);
 
         GridSnapshot {
             rows: self.rows,
             cols: self.cols,
             cells,
-            cursor: cursor_state,
+            cursor,
             modes,
         }
     }
@@ -190,6 +204,7 @@ impl<B: TerminalBackend> DiffEngine<B> {
         self.current_cells = vec![CellState::default(); n];
         self.prev_cursor = CursorState::default();
         self.prev_modes = TermModes::EMPTY;
+        self.prev_history_size = self.backend.history_size();
     }
 }
 

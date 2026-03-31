@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// Current wire protocol version. Increment when breaking changes are made.
-pub const PROTOCOL_VERSION: u32 = 5;
+pub const PROTOCOL_VERSION: u32 = 8;
 
 /// Return the current wall-clock time as milliseconds since the Unix epoch.
 pub fn epoch_millis() -> u64 {
@@ -128,7 +128,7 @@ impl CellColor {
 /// Packed attribute bitfield.
 ///
 /// Bit layout: bold=0, italic=1, underline=2, strikethrough=3,
-/// inverse=4, hidden=5, dim=6, blink=7.
+/// inverse=4, hidden=5, dim=6, blink=7, wide_char=8, wide_char_spacer=9.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellAttrs(pub u16);
 
@@ -142,6 +142,8 @@ impl CellAttrs {
     pub const HIDDEN: u16 = 1 << 5;
     pub const DIM: u16 = 1 << 6;
     pub const BLINK: u16 = 1 << 7;
+    pub const WIDE_CHAR: u16 = 1 << 8;
+    pub const WIDE_CHAR_SPACER: u16 = 1 << 9;
 
     pub fn contains(self, flag: u16) -> bool {
         self.0 & flag != 0
@@ -201,15 +203,21 @@ impl Default for CursorState {
 /// Terminal mode flags sent alongside diffs.
 ///
 /// Bit 0: APP_CURSOR (application cursor keys mode).
+/// Bit 1: BRACKETED_PASTE (DEC private mode 2004).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TermModes(pub u16);
 
 impl TermModes {
     pub const EMPTY: Self = Self(0);
     pub const APP_CURSOR: u16 = 1 << 0;
+    pub const BRACKETED_PASTE: u16 = 1 << 1;
 
     pub fn app_cursor(self) -> bool {
         self.0 & Self::APP_CURSOR != 0
+    }
+
+    pub fn bracketed_paste(self) -> bool {
+        self.0 & Self::BRACKETED_PASTE != 0
     }
 }
 
@@ -234,6 +242,10 @@ pub struct TerminalDiff {
     pub ops: Vec<DiffOp>,
     pub cursor: CursorState,
     pub modes: TermModes,
+    /// Lines that scrolled off the top of the visible area during this frame.
+    /// Oldest first. Empty when no lines were pushed to scrollback.
+    #[serde(default)]
+    pub scrollback_lines: Vec<Vec<CellState>>,
 }
 
 /// Full grid snapshot -- sent on attach or after resize.
@@ -283,8 +295,12 @@ pub enum ClientMessage {
         new_name: String,
     },
 
-    /// Send bytes to the PTY master (user keystrokes, paste, etc.).
+    /// Send bytes to the PTY master (user keystrokes).
     PtyInput { session: SessionId, data: Vec<u8> },
+
+    /// Paste clipboard text into the PTY. The server handles bracketed-paste
+    /// wrapping when the terminal has enabled DEC private mode 2004.
+    PtyPaste { session: SessionId, data: String },
 
     /// Resize the PTY window.
     Resize { session: SessionId, size: TermSize },
@@ -309,6 +325,11 @@ pub enum ClientMessage {
 
     /// Release previously acquired input lock.
     ReleaseInputLock { session: SessionId },
+
+    /// Toggle full-snapshot mode for this client. When enabled, the server
+    /// sends `TerminalSnapshot` messages instead of incremental `TerminalUpdate`
+    /// diffs on every PTY output, bypassing the diff engine entirely.
+    SetSnapshotMode { enabled: bool },
 
     /// Keep-alive ping (client -> server).
     Ping { seq: u64 },
@@ -428,4 +449,82 @@ pub enum ServerMessage {
         old_name: SessionId,
         new_name: SessionId,
     },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cell_attrs_bits_no_overlap() {
+        let flags: &[u16] = &[
+            CellAttrs::BOLD,
+            CellAttrs::ITALIC,
+            CellAttrs::UNDERLINE,
+            CellAttrs::STRIKETHROUGH,
+            CellAttrs::INVERSE,
+            CellAttrs::HIDDEN,
+            CellAttrs::DIM,
+            CellAttrs::BLINK,
+            CellAttrs::WIDE_CHAR,
+            CellAttrs::WIDE_CHAR_SPACER,
+        ];
+        for (i, a) in flags.iter().enumerate() {
+            for (j, b) in flags.iter().enumerate() {
+                if i != j {
+                    assert_eq!(a & b, 0, "bit overlap between flag {i} and {j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn term_modes_bits_no_overlap() {
+        let flags: &[u16] = &[TermModes::APP_CURSOR, TermModes::BRACKETED_PASTE];
+        for (i, a) in flags.iter().enumerate() {
+            assert!(a.is_power_of_two(), "flag {i} is not a single bit: {a}");
+            for (j, b) in flags.iter().enumerate() {
+                if i != j {
+                    assert_eq!(a & b, 0, "bit overlap between flag {i} and {j}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn term_modes_accessors() {
+        let empty = TermModes::EMPTY;
+        assert!(!empty.app_cursor());
+        assert!(!empty.bracketed_paste());
+
+        let bp = TermModes(TermModes::BRACKETED_PASTE);
+        assert!(!bp.app_cursor());
+        assert!(bp.bracketed_paste());
+
+        let both = TermModes(TermModes::APP_CURSOR | TermModes::BRACKETED_PASTE);
+        assert!(both.app_cursor());
+        assert!(both.bracketed_paste());
+    }
+
+    #[test]
+    fn cell_attrs_each_flag_is_single_bit() {
+        let flags: &[u16] = &[
+            CellAttrs::BOLD,
+            CellAttrs::ITALIC,
+            CellAttrs::UNDERLINE,
+            CellAttrs::STRIKETHROUGH,
+            CellAttrs::INVERSE,
+            CellAttrs::HIDDEN,
+            CellAttrs::DIM,
+            CellAttrs::BLINK,
+            CellAttrs::WIDE_CHAR,
+            CellAttrs::WIDE_CHAR_SPACER,
+        ];
+        for (i, flag) in flags.iter().enumerate() {
+            assert!(
+                flag.is_power_of_two(),
+                "flag {i} is not a single bit: {flag}"
+            );
+        }
+    }
 }

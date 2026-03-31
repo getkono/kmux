@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use quinn::Connection;
 use smux_protocol::messages::{
@@ -147,6 +147,12 @@ impl ClientState {
                 }
             }
 
+            ClientMessage::PtyPaste { session, data } => {
+                if let Err(e) = self.app.write_paste(&session, client_id, data).await {
+                    self.error(None, classify_error(&e), e.to_string());
+                }
+            }
+
             ClientMessage::Resize { session, size } => {
                 if let Err(e) = self.app.resize(&session, size).await {
                     self.error(None, classify_error(&e), e.to_string());
@@ -249,6 +255,11 @@ impl ClientState {
                 Err(e) => self.error(Some(request_id), classify_error(&e), e.to_string()),
             },
 
+            ClientMessage::SetSnapshotMode { enabled } => {
+                self.app.set_snapshot_mode(client_id, enabled).await;
+                debug!("Client {client_id:?} snapshot mode = {enabled}");
+            }
+
             ClientMessage::Ping { seq } => {
                 self.send(ServerMessage::Pong { seq });
             }
@@ -320,8 +331,13 @@ async fn session_uni_writer(
 
     // Forward live diffs from the relay task
     while let Some(msg) = client_rx.recv().await {
+        let write_start = Instant::now();
         if send_frame(&mut uni, &msg).await.is_err() {
             break;
+        }
+        let write_us = write_start.elapsed().as_micros();
+        if write_us > 1000 {
+            debug!(session, write_us, "slow uni stream write");
         }
     }
 
@@ -334,6 +350,9 @@ async fn send_frame(
     msg: &ServerMessage,
 ) -> Result<(), smux_protocol::ProtocolError> {
     let bytes = encode_server(msg)?;
+    if bytes.len() > 4096 {
+        debug!(frame_bytes = bytes.len(), "large frame");
+    }
     write_frame(stream, &bytes).await
 }
 

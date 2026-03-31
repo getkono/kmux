@@ -199,6 +199,7 @@ mod tests {
             ],
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
+            scrollback_lines: vec![],
         };
         let msg = ServerMessage::TerminalUpdate {
             session: "test".to_string(),
@@ -265,6 +266,7 @@ mod tests {
             }],
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
+            scrollback_lines: vec![],
         };
         let msg = ServerMessage::TerminalUpdate {
             session: "s".to_string(),

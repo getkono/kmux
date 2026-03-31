@@ -2,6 +2,8 @@ use std::collections::VecDeque;
 
 use smux_protocol::messages::epoch_millis;
 
+use crate::event_log::{DiagCounters, DiagEvent, DiagSnapshot, EventLog};
+
 const DEFAULT_CAPACITY: usize = 128;
 
 /// Fixed-capacity ring buffer of `f64` samples.
@@ -55,7 +57,9 @@ pub struct MetricsSnapshot {
     pub apply_avg_ms: f64,
     pub batch_avg: f64,
     pub last_diff_ops: usize,
-    pub last_dirty_rows: usize,
+    pub last_large_diff_ms: f64,
+    pub counters: DiagCounters,
+    pub snapshot_mode: bool,
 }
 
 /// Collects client-side timing metrics.
@@ -64,7 +68,10 @@ pub struct RenderMetrics {
     apply_duration: RingBuffer,
     batch_size: RingBuffer,
     last_diff_ops: usize,
-    last_dirty_rows: usize,
+    /// End-to-end latency (sent_at → apply complete) for the most recent large diff (>100 ops).
+    last_large_diff_ms: f64,
+    counters: DiagCounters,
+    event_log: EventLog,
 }
 
 impl RenderMetrics {
@@ -74,7 +81,9 @@ impl RenderMetrics {
             apply_duration: RingBuffer::new(DEFAULT_CAPACITY),
             batch_size: RingBuffer::new(DEFAULT_CAPACITY),
             last_diff_ops: 0,
-            last_dirty_rows: 0,
+            last_large_diff_ms: 0.0,
+            counters: DiagCounters::default(),
+            event_log: EventLog::new(),
         }
     }
 
@@ -94,20 +103,66 @@ impl RenderMetrics {
     }
 
     /// Record cell diff statistics for HUD display.
-    pub fn record_diff_stats(&mut self, ops: usize, dirty_rows: usize) {
+    pub fn record_diff_stats(&mut self, ops: usize) {
         self.last_diff_ops = ops;
-        self.last_dirty_rows = dirty_rows;
     }
 
-    pub fn snapshot(&self) -> MetricsSnapshot {
+    /// Record a large diff event (>100 ops) with its end-to-end latency.
+    pub fn record_large_diff(&mut self, net_apply_ms: f64) {
+        self.last_large_diff_ms = net_apply_ms;
+    }
+
+    pub fn record_stale_discard(&mut self, session: &str) {
+        let event = DiagEvent::StaleDiscard {
+            session: session.to_owned(),
+        };
+        self.counters.increment(&event);
+        self.event_log.push(event);
+    }
+
+    pub fn record_seqno_gap(&mut self, session: &str, expected: u64, got: u64) {
+        let event = DiagEvent::SeqnoGap {
+            session: session.to_owned(),
+            expected,
+            got,
+        };
+        self.counters.increment(&event);
+        self.event_log.push(event);
+    }
+
+    pub fn record_lag(&mut self, session: &str, missed: u64) {
+        let event = DiagEvent::Lagged {
+            session: session.to_owned(),
+            missed,
+        };
+        self.counters.increment(&event);
+        self.event_log.push(event);
+    }
+
+    pub fn record_resync(&mut self, session: &str, reason: &str) {
+        let event = DiagEvent::Resync {
+            session: session.to_owned(),
+            reason: reason.to_owned(),
+        };
+        self.counters.increment(&event);
+        self.event_log.push(event);
+    }
+
+    pub fn snapshot(&self, snapshot_mode: bool) -> MetricsSnapshot {
         MetricsSnapshot {
             net_apply_avg_ms: self.network_apply_latency.avg(),
             net_apply_max_ms: self.network_apply_latency.max(),
             apply_avg_ms: self.apply_duration.avg(),
             batch_avg: self.batch_size.avg(),
             last_diff_ops: self.last_diff_ops,
-            last_dirty_rows: self.last_dirty_rows,
+            last_large_diff_ms: self.last_large_diff_ms,
+            counters: self.counters,
+            snapshot_mode,
         }
+    }
+
+    pub fn diag_snapshot(&self) -> DiagSnapshot {
+        DiagSnapshot::from_log(&self.event_log, 8)
     }
 }
 
@@ -160,7 +215,7 @@ mod tests {
         // Simulate: server sent 10ms ago, apply took 0.5ms
         let sent_at = epoch_millis() - 10;
         m.record_apply(sent_at, 0.5);
-        let snap = m.snapshot();
+        let snap = m.snapshot(false);
         assert!(snap.net_apply_avg_ms >= 9.0); // at least ~10ms of simulated latency
         assert!((snap.apply_avg_ms - 0.5).abs() < f64::EPSILON);
     }
@@ -170,7 +225,7 @@ mod tests {
         let mut m = RenderMetrics::new();
         m.record_batch(5);
         m.record_batch(3);
-        let snap = m.snapshot();
+        let snap = m.snapshot(false);
         assert_eq!(snap.batch_avg, 4.0);
     }
 }

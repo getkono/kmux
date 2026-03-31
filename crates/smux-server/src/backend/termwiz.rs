@@ -22,6 +22,7 @@ pub struct TermwizBackend {
     parser: Parser,
     surface: Surface,
     app_cursor: bool,
+    bracketed_paste: bool,
     rows: u16,
     cols: u16,
 }
@@ -33,6 +34,7 @@ impl TermwizBackend {
             parser: Parser::new(),
             surface,
             app_cursor: false,
+            bracketed_paste: false,
             rows,
             cols,
         }
@@ -332,6 +334,9 @@ impl TermwizBackend {
                     CursorVisibility::Hidden
                 }));
             }
+            DecPrivateModeCode::BracketedPaste => {
+                self.bracketed_paste = enable;
+            }
             DecPrivateModeCode::ClearAndEnableAlternateScreen => {
                 if enable {
                     self.surface
@@ -424,6 +429,12 @@ impl TerminalBackend for TermwizBackend {
                 if attrs.intensity() == Intensity::Half {
                     bits |= CellAttrs::DIM;
                 }
+                let width = cell_ref.width();
+                if width >= 2 {
+                    bits |= CellAttrs::WIDE_CHAR;
+                } else if width == 0 {
+                    bits |= CellAttrs::WIDE_CHAR_SPACER;
+                }
 
                 out[row_idx * cols + col_idx] = CellState {
                     c,
@@ -457,6 +468,9 @@ impl TerminalBackend for TermwizBackend {
         let mut bits: u16 = 0;
         if self.app_cursor {
             bits |= TermModes::APP_CURSOR;
+        }
+        if self.bracketed_paste {
+            bits |= TermModes::BRACKETED_PASTE;
         }
         TermModes(bits)
     }
@@ -687,6 +701,31 @@ mod tests {
         ts.feed(b"\x1b[1;1H\x1b[7m> item1\x1b[27m");
         let diff = expect_cell_diff(ts.compute_diff());
         assert!(!diff.ops.is_empty(), "highlight move must have cell ops");
+    }
+
+    #[test]
+    fn bracketed_paste_mode_enable_disable() {
+        let mut ts = DiffEngine::new(TermwizBackend::new(24, 80));
+
+        // Initially off
+        assert!(
+            !ts.modes().bracketed_paste(),
+            "bracketed paste should be off by default"
+        );
+
+        // Enable DEC 2004
+        ts.feed(b"\x1b[?2004h");
+        assert!(
+            ts.modes().bracketed_paste(),
+            "bracketed paste should be on after \\e[?2004h"
+        );
+
+        // Disable DEC 2004
+        ts.feed(b"\x1b[?2004l");
+        assert!(
+            !ts.modes().bracketed_paste(),
+            "bracketed paste should be off after \\e[?2004l"
+        );
     }
 
     #[test]

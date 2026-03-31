@@ -7,7 +7,7 @@ use iced::widget::{Space, button, column, container, row, text, text_input};
 use iced::{Element, Event, Font, Length, Subscription, Task, Theme};
 use smux_protocol::messages::{
     ClientId, ClientMessage, SequenceNo, ServerMessage, SessionEventMsg, SessionInfo,
-    SessionStatus, TermSize,
+    SessionStatus, TermSize, epoch_millis,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -69,6 +69,10 @@ pub enum Message {
     #[allow(dead_code)]
     ToggleHud,
 
+    // Toggle full-snapshot mode
+    #[allow(dead_code)]
+    ToggleSnapshotMode,
+
     // Terminal canvas resize detected
     TerminalResized {
         rows: u16,
@@ -88,6 +92,13 @@ pub enum Message {
     CommandPaletteNavigate(i32),
     #[allow(dead_code)]
     CommandPaletteClose,
+
+    /// Scroll the terminal by the given number of lines.
+    /// Positive = scroll up (into history), negative = scroll down.
+    ScrollTerminal(i32),
+
+    /// Clipboard contents received for paste.
+    ClipboardPaste(Option<String>),
 }
 
 /// Per-session synchronisation state for ordering protection.
@@ -131,6 +142,9 @@ pub struct SmuxApp {
     // Observability
     metrics: RenderMetrics,
     hud_visible: bool,
+
+    // Full-snapshot mode: server sends complete grid snapshots instead of diffs.
+    force_snapshot_mode: bool,
 
     // Leader key state machine
     leader_state: LeaderState,
@@ -274,6 +288,22 @@ impl SmuxApp {
                 self.hud_visible = !self.hud_visible;
                 Task::none()
             }
+            ShortcutAction::ToggleSnapshotMode => {
+                self.leader_state = LeaderState::Idle;
+                self.force_snapshot_mode = !self.force_snapshot_mode;
+                self.send_ws(ClientMessage::SetSnapshotMode {
+                    enabled: self.force_snapshot_mode,
+                });
+                info!(
+                    "Snapshot mode {}",
+                    if self.force_snapshot_mode {
+                        "enabled"
+                    } else {
+                        "disabled"
+                    }
+                );
+                Task::none()
+            }
             ShortcutAction::OpenCommandPalette => {
                 self.leader_state = LeaderState::CommandPalette {
                     query: String::new(),
@@ -289,6 +319,24 @@ impl SmuxApp {
                         session: session.clone(),
                         data: vec![0x02],
                     });
+                }
+                Task::none()
+            }
+            ShortcutAction::ScrollPageUp => {
+                self.leader_state = LeaderState::Idle;
+                if let Some(name) = &self.active_session
+                    && let Some(grid) = self.buffers.get_mut(name)
+                {
+                    grid.scroll_up(grid.rows);
+                }
+                Task::none()
+            }
+            ShortcutAction::ScrollPageDown => {
+                self.leader_state = LeaderState::Idle;
+                if let Some(name) = &self.active_session
+                    && let Some(grid) = self.buffers.get_mut(name)
+                {
+                    grid.scroll_down(grid.rows);
                 }
                 Task::none()
             }
@@ -462,6 +510,51 @@ impl SmuxApp {
                 Task::none()
             }
 
+            Message::ToggleSnapshotMode => {
+                self.force_snapshot_mode = !self.force_snapshot_mode;
+                self.send_ws(ClientMessage::SetSnapshotMode {
+                    enabled: self.force_snapshot_mode,
+                });
+                Task::none()
+            }
+
+            // Clipboard paste
+            Message::ClipboardPaste(contents) => {
+                if let Some(text) = contents
+                    && !text.is_empty()
+                {
+                    if let Some(session) = &self.active_session {
+                        let locked = self.input_locked.get(session).copied().unwrap_or(false);
+                        if locked {
+                            self.status_msg = "Input locked on this session".to_string();
+                            return Task::none();
+                        }
+                        self.send_ws(ClientMessage::PtyPaste {
+                            session: session.clone(),
+                            data: text,
+                        });
+                    } else {
+                        self.status_msg =
+                            "No active session -- press Ctrl+B then c to create one".to_string();
+                    }
+                }
+                Task::none()
+            }
+
+            //  Scroll terminal
+            Message::ScrollTerminal(delta) => {
+                if let Some(name) = &self.active_session
+                    && let Some(grid) = self.buffers.get_mut(name)
+                {
+                    if delta > 0 {
+                        grid.scroll_up(delta as usize);
+                    } else if delta < 0 {
+                        grid.scroll_down((-delta) as usize);
+                    }
+                }
+                Task::none()
+            }
+
             //  Terminal resize
             Message::TerminalResized { rows, cols } => {
                 if let Some(name) = &self.active_session {
@@ -562,8 +655,30 @@ impl SmuxApp {
 
         match &self.leader_state {
             LeaderState::Idle => {
-                // F12 toggles HUD
-                if key == Key::Named(Named::F12) {
+                // Shift+PageUp / Shift+PageDown scroll by one page.
+                if modifiers.shift() && key == Key::Named(Named::PageUp) {
+                    if let Some(name) = &self.active_session
+                        && let Some(grid) = self.buffers.get_mut(name)
+                    {
+                        grid.scroll_up(grid.rows);
+                    }
+                    return Task::none();
+                }
+                if modifiers.shift() && key == Key::Named(Named::PageDown) {
+                    if let Some(name) = &self.active_session
+                        && let Some(grid) = self.buffers.get_mut(name)
+                    {
+                        grid.scroll_down(grid.rows);
+                    }
+                    return Task::none();
+                }
+
+                // Ctrl+Shift+H or F12 toggles HUD
+                if key == Key::Named(Named::F12)
+                    || (matches!(&key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("h"))
+                        && modifiers.shift()
+                        && modifiers.control())
+                {
                     self.hud_visible = !self.hud_visible;
                     return Task::none();
                 }
@@ -576,11 +691,34 @@ impl SmuxApp {
                     return Task::none();
                 }
 
+                // Ctrl+Shift+V (Linux/Windows) or Cmd+V (macOS) → clipboard paste
+                if matches!(&key, Key::Character(c) if c.as_str().eq_ignore_ascii_case("v")) {
+                    let is_paste = if cfg!(target_os = "macos") {
+                        modifiers.logo()
+                    } else {
+                        modifiers.control() && modifiers.shift()
+                    };
+                    if is_paste {
+                        return iced::clipboard::read().map(Message::ClipboardPaste);
+                    }
+                }
+
                 // Normal key → forward to PTY
                 self.forward_key_to_pty(key, modifiers, text_val)
             }
 
             LeaderState::AwaitingAction { .. } => {
+                // Ignore modifier-only key presses (Shift, Ctrl, Alt, Super)
+                // so that shifted characters like '?' (Shift+/) work.
+                if matches!(
+                    key,
+                    Key::Named(
+                        Named::Shift | Named::Control | Named::Alt | Named::Super | Named::Meta
+                    )
+                ) {
+                    return Task::none();
+                }
+
                 if let Some(action) = shortcut::resolve_key(&key, modifiers) {
                     self.dispatch_action(action)
                 } else {
@@ -682,6 +820,13 @@ impl SmuxApp {
         modifiers: iced::keyboard::Modifiers,
         text_val: Option<String>,
     ) -> Task<Message> {
+        // Snap to bottom on any keypress while scrolled.
+        if let Some(session) = &self.active_session
+            && let Some(grid) = self.buffers.get_mut(session)
+        {
+            grid.scroll_to_bottom();
+        }
+
         let app_cursor = self
             .active_session
             .as_ref()
@@ -873,6 +1018,7 @@ impl SmuxApp {
                 match self.session_sync.get(&session) {
                     Some(SessionSync::AwaitingSync) => {
                         debug!("Discarding stale TerminalUpdate for '{session}' (awaiting sync)");
+                        self.metrics.record_stale_discard(&session);
                         return Task::none();
                     }
                     Some(SessionSync::Synced { expected }) if seqno != *expected => {
@@ -880,6 +1026,8 @@ impl SmuxApp {
                             "Seqno gap on '{session}': expected {:?}, got {:?} \u{2014} re-attaching",
                             expected, seqno
                         );
+                        self.metrics.record_seqno_gap(&session, expected.0, seqno.0);
+                        self.metrics.record_resync(&session, "seqno gap");
                         if let Some(grid) = self.buffers.get_mut(&session) {
                             grid.clear();
                         }
@@ -894,8 +1042,7 @@ impl SmuxApp {
                 let op_count = diff.ops.len();
                 if let Some(grid) = self.buffers.get_mut(&session) {
                     grid.apply_diff(diff);
-                    self.metrics
-                        .record_diff_stats(op_count, grid.dirty_row_count());
+                    self.metrics.record_diff_stats(op_count);
                     debug!(
                         session,
                         generation = grid.generation(),
@@ -909,7 +1056,17 @@ impl SmuxApp {
                     },
                 );
                 let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                let net_apply_ms = epoch_millis().saturating_sub(sent_at_ms) as f64;
                 self.metrics.record_apply(sent_at_ms, elapsed_ms);
+                if op_count > 100 {
+                    debug!(
+                        op_count,
+                        apply_ms = format!("{elapsed_ms:.2}"),
+                        net_apply_ms = format!("{net_apply_ms:.1}"),
+                        "large diff applied"
+                    );
+                    self.metrics.record_large_diff(net_apply_ms);
+                }
                 Task::none()
             }
 
@@ -923,6 +1080,7 @@ impl SmuxApp {
                 match self.session_sync.get(&session) {
                     Some(SessionSync::AwaitingSync) => {
                         debug!("Discarding stale CursorUpdate for '{session}' (awaiting sync)");
+                        self.metrics.record_stale_discard(&session);
                         return Task::none();
                     }
                     Some(SessionSync::Synced { expected }) if seqno != *expected => {
@@ -930,6 +1088,8 @@ impl SmuxApp {
                             "Seqno gap on '{session}': expected {:?}, got {:?} \u{2014} re-attaching",
                             expected, seqno
                         );
+                        self.metrics.record_seqno_gap(&session, expected.0, seqno.0);
+                        self.metrics.record_resync(&session, "seqno gap");
                         if let Some(grid) = self.buffers.get_mut(&session) {
                             grid.clear();
                         }
@@ -961,6 +1121,7 @@ impl SmuxApp {
                 if let Some(grid) = self.buffers.get_mut(&session) {
                     grid.clear();
                 }
+                self.metrics.record_resync(&session, "server sync reset");
                 self.session_sync.insert(session, SessionSync::AwaitingSync);
                 Task::none()
             }
@@ -979,6 +1140,8 @@ impl SmuxApp {
                 missed_count,
             } => {
                 warn!("Lagged on session '{session}': missed {missed_count} diffs, re-attaching");
+                self.metrics.record_lag(&session, missed_count);
+                self.metrics.record_resync(&session, "lagged");
                 if let Some(grid) = self.buffers.get_mut(&session) {
                     grid.clear();
                 }
@@ -1130,15 +1293,18 @@ impl SmuxApp {
             Message::RenameSubmit,
         );
 
-        let metrics = if self.hud_visible {
-            Some(self.metrics.snapshot())
+        let (metrics, diag) = if self.hud_visible {
+            (
+                Some(self.metrics.snapshot(self.force_snapshot_mode)),
+                Some(self.metrics.diag_snapshot()),
+            )
         } else {
-            None
+            (None, None)
         };
 
         let terminal_area: Element<Message> = if let Some(name) = &self.active_session {
             if let Some(buf) = self.buffers.get(name) {
-                terminal_view::view(buf, name, metrics)
+                terminal_view::view(buf, name, metrics, diag)
             } else {
                 text("No output yet").color(theme::FG_DIM).into()
             }

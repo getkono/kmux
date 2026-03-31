@@ -1,9 +1,12 @@
 use std::cell::Cell;
+use std::collections::VecDeque;
 use std::time::Instant;
 
 use iced::{
     Color as IcedColor, Element, Font, Length, Pixels, Point as IcedPoint, Rectangle, Size,
-    alignment, mouse,
+    alignment,
+    font::{Style, Weight},
+    mouse,
     widget::canvas::{self, Canvas, Text},
 };
 use smux_protocol::messages::{
@@ -11,6 +14,7 @@ use smux_protocol::messages::{
     TerminalDiff,
 };
 
+use crate::event_log::DiagSnapshot;
 use crate::metrics::MetricsSnapshot;
 
 use crate::app::Message;
@@ -22,11 +26,62 @@ const FONT_SIZE: f32 = 13.0;
 /// Default background color (One Dark). Matches `CellState::default().bg`.
 const DEFAULT_BG: CellColor = CellColor::new(0x28, 0x2c, 0x34);
 
+/// Maximum number of scrollback lines per session.
+const MAX_SCROLLBACK_LINES: usize = 50_000;
+
+/// Ring buffer of scrollback lines, stored oldest-first.
+pub struct ScrollbackBuffer {
+    lines: VecDeque<Vec<CellState>>,
+    max_lines: usize,
+}
+
+impl ScrollbackBuffer {
+    pub fn new(max_lines: usize) -> Self {
+        Self {
+            lines: VecDeque::new(),
+            max_lines,
+        }
+    }
+
+    /// Push new scrollback lines (oldest first).
+    pub fn push_lines(&mut self, new_lines: Vec<Vec<CellState>>) {
+        for line in new_lines {
+            if self.lines.len() >= self.max_lines {
+                self.lines.pop_front();
+            }
+            self.lines.push_back(line);
+        }
+    }
+
+    pub fn len(&self) -> usize {
+        self.lines.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.lines.is_empty()
+    }
+
+    /// Clear all scrollback.
+    pub fn clear(&mut self) {
+        self.lines.clear();
+    }
+}
+
+impl Default for ScrollbackBuffer {
+    fn default() -> Self {
+        Self::new(MAX_SCROLLBACK_LINES)
+    }
+}
+
 /// Client-side grid state -- receives pre-resolved cells from the server.
 ///
 /// Unlike the old `TerminalBuffer` that wrapped `alacritty_terminal::Term`,
 /// this is a thin grid of `CellState` values. All VT parsing and color
 /// resolution happens on the server.
+///
+/// Rendering uses generation-based cache invalidation: the canvas cache is
+/// rebuilt whenever `cells_generation` changes, guaranteeing that every
+/// server-side change is reflected in the render.
 pub struct CellGrid {
     cells: Vec<CellState>,
     cursor: CursorState,
@@ -37,10 +92,10 @@ pub struct CellGrid {
     cells_generation: u64,
     /// Incremented on every update (cell, cursor-only, snapshot, clear, resize).
     cursor_generation: u64,
-    /// Per-row dirty flags — `true` means cells changed since last cache rebuild.
-    dirty_rows: Vec<bool>,
-    /// Set by `draw()` after a full cache rebuild (promotion); consumed by `apply_diff()`.
-    pub(crate) promoted: Cell<bool>,
+    /// Lines that have scrolled off the top of the visible area.
+    scrollback: ScrollbackBuffer,
+    /// Scroll offset from the bottom (0 = live view, >0 = scrolled into history).
+    scroll_offset: usize,
 }
 
 impl CellGrid {
@@ -53,8 +108,8 @@ impl CellGrid {
             cols,
             cells_generation: 0,
             cursor_generation: 0,
-            dirty_rows: vec![false; rows],
-            promoted: Cell::new(false),
+            scrollback: ScrollbackBuffer::default(),
+            scroll_offset: 0,
         }
     }
 
@@ -65,19 +120,19 @@ impl CellGrid {
         self.cells = snapshot.cells;
         self.cursor = snapshot.cursor;
         self.modes = snapshot.modes;
+        self.scrollback.clear();
+        self.scroll_offset = 0;
         self.cells_generation += 1;
         self.cursor_generation += 1;
-        self.dirty_rows = vec![true; self.rows];
-        self.promoted.set(false);
     }
 
     /// Apply a diff from the server -- only changed cells are updated.
     pub fn apply_diff(&mut self, diff: TerminalDiff) {
-        // If the last draw promoted (full cache rebuild), reset dirty tracking.
-        if self.promoted.get() {
-            self.dirty_rows.fill(false);
-            self.promoted.set(false);
+        // Push scrollback lines before applying cell changes.
+        if !diff.scrollback_lines.is_empty() {
+            self.scrollback.push_lines(diff.scrollback_lines);
         }
+
         let has_cell_ops = !diff.ops.is_empty();
         for op in diff.ops {
             match op {
@@ -85,9 +140,6 @@ impl CellGrid {
                     let idx = row as usize * self.cols + col as usize;
                     if idx < self.cells.len() {
                         self.cells[idx] = cell;
-                    }
-                    if (row as usize) < self.dirty_rows.len() {
-                        self.dirty_rows[row as usize] = true;
                     }
                 }
                 DiffOp::Row {
@@ -102,13 +154,9 @@ impl CellGrid {
                             self.cells[idx] = cell;
                         }
                     }
-                    if (row as usize) < self.dirty_rows.len() {
-                        self.dirty_rows[row as usize] = true;
-                    }
                 }
                 DiffOp::Clear => {
                     self.cells.fill(CellState::default());
-                    self.dirty_rows.fill(true);
                 }
             }
         }
@@ -137,10 +185,10 @@ impl CellGrid {
         self.cells.fill(CellState::default());
         self.cursor = CursorState::default();
         self.modes = TermModes::EMPTY;
+        self.scrollback.clear();
+        self.scroll_offset = 0;
         self.cells_generation += 1;
         self.cursor_generation += 1;
-        self.dirty_rows.fill(true);
-        self.promoted.set(false);
     }
 
     /// Resize the grid (server will send a fresh snapshot after resize).
@@ -148,20 +196,9 @@ impl CellGrid {
         self.rows = rows as usize;
         self.cols = cols as usize;
         self.cells = vec![CellState::default(); self.rows * self.cols];
+        self.scroll_offset = 0;
         self.cells_generation += 1;
         self.cursor_generation += 1;
-        self.dirty_rows = vec![true; self.rows];
-        self.promoted.set(false);
-    }
-
-    /// Which rows have been modified since the last cache rebuild.
-    pub fn dirty_rows(&self) -> &[bool] {
-        &self.dirty_rows
-    }
-
-    /// Number of dirty rows since last cache rebuild.
-    pub fn dirty_row_count(&self) -> usize {
-        self.dirty_rows.iter().filter(|&&d| d).count()
     }
 
     /// Generation counter that changes on every update (used by iced to detect changes).
@@ -172,6 +209,48 @@ impl CellGrid {
     /// Generation counter that changes only when cells change (used for cache invalidation).
     pub fn cells_generation(&self) -> u64 {
         self.cells_generation
+    }
+
+    /// Scroll up by `n` lines into history.
+    pub fn scroll_up(&mut self, n: usize) {
+        let max_offset = self.scrollback.len();
+        let new_offset = (self.scroll_offset + n).min(max_offset);
+        if new_offset != self.scroll_offset {
+            self.scroll_offset = new_offset;
+            self.cells_generation += 1;
+        }
+    }
+
+    /// Scroll down by `n` lines toward live view.
+    pub fn scroll_down(&mut self, n: usize) {
+        let new_offset = self.scroll_offset.saturating_sub(n);
+        if new_offset != self.scroll_offset {
+            self.scroll_offset = new_offset;
+            self.cells_generation += 1;
+        }
+    }
+
+    /// Snap to the bottom (live view).
+    pub fn scroll_to_bottom(&mut self) {
+        if self.scroll_offset > 0 {
+            self.scroll_offset = 0;
+            self.cells_generation += 1;
+        }
+    }
+
+    /// Whether the view is scrolled up from live output.
+    pub fn is_scrolled(&self) -> bool {
+        self.scroll_offset > 0
+    }
+
+    /// Current scroll offset (0 = live, >0 = scrolled into history).
+    pub fn scroll_offset(&self) -> usize {
+        self.scroll_offset
+    }
+
+    /// Number of lines in scrollback history.
+    pub fn scrollback_len(&self) -> usize {
+        self.scrollback.len()
     }
 }
 
@@ -193,30 +272,36 @@ pub struct GridView<'a> {
     rows: usize,
     cols: usize,
     cells_generation: u64,
-    dirty_rows: &'a [bool],
-    promoted: &'a Cell<bool>,
     metrics: Option<MetricsSnapshot>,
+    diag: Option<DiagSnapshot>,
+    scroll_offset: usize,
+    scrollback: &'a ScrollbackBuffer,
 }
 
 impl<'a> GridView<'a> {
-    fn from_grid(grid: &'a CellGrid, metrics: Option<MetricsSnapshot>) -> Self {
+    fn from_grid(
+        grid: &'a CellGrid,
+        metrics: Option<MetricsSnapshot>,
+        diag: Option<DiagSnapshot>,
+    ) -> Self {
         Self {
             cells: &grid.cells,
             cursor: grid.cursor,
             rows: grid.rows,
             cols: grid.cols,
             cells_generation: grid.cells_generation(),
-            dirty_rows: grid.dirty_rows(),
-            promoted: &grid.promoted,
             metrics,
+            diag,
+            scroll_offset: grid.scroll_offset,
+            scrollback: &grid.scrollback,
         }
     }
 }
 
 /// State preserved across canvas redraws.
 ///
-/// The `cells_cache` is cleared on every diff (tracked by `last_generation`)
-/// so that any server-side change always produces a fresh render.
+/// The `cells_cache` is rebuilt whenever `cache_generation` falls behind the
+/// grid's `cells_generation`, guaranteeing every server-side change is rendered.
 /// FPS measurement window in seconds.
 const FPS_WINDOW_SECS: f64 = 1.0;
 
@@ -225,7 +310,8 @@ pub struct CanvasState {
     cols: u16,
     cells_cache: canvas::Cache,
     cursor_cache: canvas::Cache,
-    last_cells_generation: Cell<u64>,
+    /// Generation of cells data when `cells_cache` was last built.
+    cache_generation: Cell<u64>,
     draw_duration_ms: Cell<f64>,
     /// Circular buffer of draw timestamps for FPS calculation.
     draw_timestamps: std::cell::RefCell<std::collections::VecDeque<Instant>>,
@@ -239,7 +325,7 @@ impl Default for CanvasState {
             cols: 0,
             cells_cache: canvas::Cache::default(),
             cursor_cache: canvas::Cache::default(),
-            last_cells_generation: Cell::new(0),
+            cache_generation: Cell::new(0),
             draw_duration_ms: Cell::new(0.0),
             draw_timestamps: std::cell::RefCell::new(std::collections::VecDeque::with_capacity(
                 128,
@@ -288,56 +374,95 @@ fn default_bg() -> IcedColor {
 fn draw_cell(frame: &mut canvas::Frame, cell: &CellState, row: usize, col: usize) {
     let x = col as f32 * CELL_WIDTH;
     let y = row as f32 * CELL_HEIGHT;
+
+    // Wide-char spacer: paint background only, skip text/decorations.
+    if cell.attrs.contains(CellAttrs::WIDE_CHAR_SPACER) {
+        if cell.bg != DEFAULT_BG {
+            frame.fill_rectangle(
+                IcedPoint::new(x, y),
+                Size::new(CELL_WIDTH, CELL_HEIGHT),
+                cell_color_to_iced(cell.bg),
+            );
+        }
+        return;
+    }
+
+    // Wide chars span two columns.
+    let cell_w = if cell.attrs.contains(CellAttrs::WIDE_CHAR) {
+        CELL_WIDTH * 2.0
+    } else {
+        CELL_WIDTH
+    };
+
     if cell.bg != DEFAULT_BG {
         frame.fill_rectangle(
             IcedPoint::new(x, y),
-            Size::new(CELL_WIDTH, CELL_HEIGHT),
+            Size::new(cell_w, CELL_HEIGHT),
             cell_color_to_iced(cell.bg),
         );
     }
+
     if !cell.attrs.contains(CellAttrs::HIDDEN) && cell.c != ' ' {
+        // DIM: blend foreground halfway toward background.
+        let fg_color = if cell.attrs.contains(CellAttrs::DIM) {
+            let fg = cell_color_to_iced(cell.fg);
+            let bg = cell_color_to_iced(cell.bg);
+            IcedColor {
+                r: (fg.r + bg.r) * 0.5,
+                g: (fg.g + bg.g) * 0.5,
+                b: (fg.b + bg.b) * 0.5,
+                a: 1.0,
+            }
+        } else {
+            cell_color_to_iced(cell.fg)
+        };
+
+        // Bold / italic font selection.
+        let font = Font {
+            family: iced::font::Family::Monospace,
+            weight: if cell.attrs.contains(CellAttrs::BOLD) {
+                Weight::Bold
+            } else {
+                Weight::Normal
+            },
+            style: if cell.attrs.contains(CellAttrs::ITALIC) {
+                Style::Italic
+            } else {
+                Style::Normal
+            },
+            ..Font::MONOSPACE
+        };
+
         frame.fill_text(Text {
             content: cell.c.to_string(),
             position: IcedPoint::new(x, y),
-            color: cell_color_to_iced(cell.fg),
+            color: fg_color,
             size: Pixels(FONT_SIZE),
             line_height: iced::widget::text::LineHeight::Absolute(Pixels(CELL_HEIGHT)),
-            font: Font::MONOSPACE,
+            font,
             horizontal_alignment: alignment::Horizontal::Left,
             vertical_alignment: alignment::Vertical::Top,
-            shaping: iced::widget::text::Shaping::Basic,
+            shaping: iced::widget::text::Shaping::Advanced,
         });
-    }
-}
 
-/// Draw only the dirty rows as an uncached overlay that covers stale base pixels.
-fn draw_dirty_overlay(
-    renderer: &iced::Renderer,
-    bounds: Rectangle,
-    cells: &[CellState],
-    dirty_rows: &[bool],
-    cols: usize,
-) -> canvas::Geometry {
-    let mut frame = canvas::Frame::new(renderer, bounds.size());
-    for (row_idx, &dirty) in dirty_rows.iter().enumerate() {
-        if !dirty {
-            continue;
+        // Underline decoration.
+        if cell.attrs.contains(CellAttrs::UNDERLINE) {
+            frame.fill_rectangle(
+                IcedPoint::new(x, y + CELL_HEIGHT - 1.0),
+                Size::new(cell_w, 1.0),
+                fg_color,
+            );
         }
-        let y = row_idx as f32 * CELL_HEIGHT;
-        // Full-width background strip to cover stale base pixels
-        frame.fill_rectangle(
-            IcedPoint::new(0.0, y),
-            Size::new(cols as f32 * CELL_WIDTH, CELL_HEIGHT),
-            default_bg(),
-        );
-        let base = row_idx * cols;
-        for col_idx in 0..cols {
-            if let Some(cell) = cells.get(base + col_idx) {
-                draw_cell(&mut frame, cell, row_idx, col_idx);
-            }
+
+        // Strikethrough decoration.
+        if cell.attrs.contains(CellAttrs::STRIKETHROUGH) {
+            frame.fill_rectangle(
+                IcedPoint::new(x, y + CELL_HEIGHT * 0.5),
+                Size::new(cell_w, 1.0),
+                fg_color,
+            );
         }
     }
-    frame.into_geometry()
 }
 
 impl<'a> canvas::Program<Message> for GridView<'a> {
@@ -346,10 +471,24 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
     fn update(
         &self,
         state: &mut CanvasState,
-        _event: canvas::Event,
+        event: canvas::Event,
         bounds: Rectangle,
         _cursor: mouse::Cursor,
     ) -> (canvas::event::Status, Option<Message>) {
+        // Mouse wheel scrolling (3 lines per notch).
+        if let canvas::Event::Mouse(mouse::Event::WheelScrolled { delta }) = &event {
+            let lines = match delta {
+                mouse::ScrollDelta::Lines { y, .. } => (*y * -3.0) as i32,
+                mouse::ScrollDelta::Pixels { y, .. } => -(*y / CELL_HEIGHT) as i32,
+            };
+            if lines != 0 {
+                return (
+                    canvas::event::Status::Captured,
+                    Some(Message::ScrollTerminal(lines)),
+                );
+            }
+        }
+
         let new_rows = (bounds.height / CELL_HEIGHT).floor().max(1.0) as u16;
         let new_cols = (bounds.width / CELL_WIDTH).floor().max(1.0) as u16;
         if state.rows != new_rows || state.cols != new_cols {
@@ -377,18 +516,11 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
     ) -> Vec<canvas::Geometry> {
         let draw_start = Instant::now();
 
-        // Decide: overlay mode (cheap, few dirty rows) or promotion (full cache rebuild)?
-        // Cursor-only updates skip this entirely, preserving the cached cell geometry.
-        let mut cache_hit = true;
-        if self.cells_generation != state.last_cells_generation.get() {
-            state.last_cells_generation.set(self.cells_generation);
-            let dirty_count = self.dirty_rows.iter().filter(|&&d| d).count();
-            if dirty_count > self.rows / 2 {
-                // Promotion: too many dirty rows — full cache rebuild
-                state.cells_cache.clear();
-                self.promoted.set(true);
-                cache_hit = false;
-            }
+        // If cells changed since the cache was built, invalidate and rebuild.
+        let cache_hit = self.cells_generation == state.cache_generation.get();
+        if !cache_hit {
+            state.cells_cache.clear();
+            state.cache_generation.set(self.cells_generation);
         }
         state.last_cache_hit.set(cache_hit);
 
@@ -396,33 +528,48 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
         let cols = self.cols;
         let rows = self.rows;
         let cursor = &self.cursor;
+        let scroll_offset = self.scroll_offset;
+        let scrollback = self.scrollback;
 
-        // Layer 1: Base cells (cached — survives across diffs until promotion)
+        // Layer 1: All cells (cached until next cells_generation bump)
         let cells_geom = state.cells_cache.draw(renderer, bounds.size(), |frame| {
             frame.fill_rectangle(IcedPoint::ORIGIN, bounds.size(), default_bg());
-            for (idx, cell) in cells.iter().enumerate() {
-                draw_cell(frame, cell, idx / cols, idx % cols);
+            if scroll_offset == 0 {
+                // Normal mode: render the visible grid directly.
+                for (idx, cell) in cells.iter().enumerate() {
+                    draw_cell(frame, cell, idx / cols, idx % cols);
+                }
+            } else {
+                // Scroll mode: composite scrollback + visible grid.
+                let sb_len = scrollback.len();
+                for vr in 0..rows {
+                    if vr < scroll_offset {
+                        // This viewport row comes from scrollback.
+                        let sb_idx = sb_len.saturating_sub(scroll_offset) + vr;
+                        if let Some(line) = scrollback.lines.get(sb_idx) {
+                            for (col, cell) in line.iter().enumerate().take(cols) {
+                                draw_cell(frame, cell, vr, col);
+                            }
+                        }
+                    } else {
+                        // This viewport row comes from the visible grid.
+                        let grid_row = vr - scroll_offset;
+                        let base = grid_row * cols;
+                        for col in 0..cols {
+                            let idx = base + col;
+                            if idx < cells.len() {
+                                draw_cell(frame, &cells[idx], vr, col);
+                            }
+                        }
+                    }
+                }
             }
         });
-
-        // Layer 1.5: Dirty row overlay (uncached — only changed rows)
-        let has_dirty = self.dirty_rows.iter().any(|&d| d);
-        let overlay_geom = if has_dirty && !self.promoted.get() {
-            Some(draw_dirty_overlay(
-                renderer,
-                bounds,
-                cells,
-                self.dirty_rows,
-                cols,
-            ))
-        } else {
-            None
-        };
 
         // Layer 2: cursor (redrawn every frame -- always clear to pick up position changes)
         state.cursor_cache.clear();
         let cursor_geom = state.cursor_cache.draw(renderer, bounds.size(), |frame| {
-            if cursor.visible && cursor.shape != CursorShape::Hidden {
+            if scroll_offset == 0 && cursor.visible && cursor.shape != CursorShape::Hidden {
                 let cur_row = cursor.row as usize;
                 let cur_col = cursor.col as usize;
                 if cur_row < rows && cur_col < cols {
@@ -430,11 +577,21 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
                     let y = cur_row as f32 * CELL_HEIGHT;
                     let idx = cur_row * cols + cur_col;
 
+                    // Wide chars: cursor spans two columns.
+                    let cursor_w = if cells
+                        .get(idx)
+                        .is_some_and(|c| c.attrs.contains(CellAttrs::WIDE_CHAR))
+                    {
+                        CELL_WIDTH * 2.0
+                    } else {
+                        CELL_WIDTH
+                    };
+
                     match cursor.shape {
                         CursorShape::Block => {
                             frame.fill_rectangle(
                                 IcedPoint::new(x, y),
-                                Size::new(CELL_WIDTH, CELL_HEIGHT),
+                                Size::new(cursor_w, CELL_HEIGHT),
                                 IcedColor {
                                     r: 1.0,
                                     g: 1.0,
@@ -446,6 +603,20 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
                                 && !cell.attrs.contains(CellAttrs::HIDDEN)
                                 && cell.c != ' '
                             {
+                                let font = Font {
+                                    family: iced::font::Family::Monospace,
+                                    weight: if cell.attrs.contains(CellAttrs::BOLD) {
+                                        Weight::Bold
+                                    } else {
+                                        Weight::Normal
+                                    },
+                                    style: if cell.attrs.contains(CellAttrs::ITALIC) {
+                                        Style::Italic
+                                    } else {
+                                        Style::Normal
+                                    },
+                                    ..Font::MONOSPACE
+                                };
                                 frame.fill_text(Text {
                                     content: cell.c.to_string(),
                                     position: IcedPoint::new(x, y),
@@ -454,17 +625,17 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
                                     line_height: iced::widget::text::LineHeight::Absolute(Pixels(
                                         CELL_HEIGHT,
                                     )),
-                                    font: Font::MONOSPACE,
+                                    font,
                                     horizontal_alignment: alignment::Horizontal::Left,
                                     vertical_alignment: alignment::Vertical::Top,
-                                    shaping: iced::widget::text::Shaping::Basic,
+                                    shaping: iced::widget::text::Shaping::Advanced,
                                 });
                             }
                         }
                         CursorShape::Underline => {
                             frame.fill_rectangle(
                                 IcedPoint::new(x, y + CELL_HEIGHT - 2.0),
-                                Size::new(CELL_WIDTH, 2.0),
+                                Size::new(cursor_w, 2.0),
                                 IcedColor::WHITE,
                             );
                         }
@@ -477,10 +648,10 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
                         }
                         CursorShape::HollowBlock => {
                             for (ox, oy, w, h) in [
-                                (0.0, 0.0, CELL_WIDTH, 1.0),
-                                (0.0, CELL_HEIGHT - 1.0, CELL_WIDTH, 1.0),
+                                (0.0, 0.0, cursor_w, 1.0),
+                                (0.0, CELL_HEIGHT - 1.0, cursor_w, 1.0),
                                 (0.0, 0.0, 1.0, CELL_HEIGHT),
-                                (CELL_WIDTH - 1.0, 0.0, 1.0, CELL_HEIGHT),
+                                (cursor_w - 1.0, 0.0, 1.0, CELL_HEIGHT),
                             ] {
                                 frame.fill_rectangle(
                                     IcedPoint::new(x + ox, y + oy),
@@ -503,20 +674,27 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
         state.record_draw(draw_start);
         let fps = state.fps();
 
-        // Assemble layers: base + overlay + cursor + optional HUD
-        let mut layers = vec![cells_geom];
-        if let Some(overlay) = overlay_geom {
-            layers.push(overlay);
-        }
-        layers.push(cursor_geom);
+        // Assemble layers: cells + cursor + optional scroll indicator + optional HUD
+        let mut layers = vec![cells_geom, cursor_geom];
 
-        // Layer 3: HUD overlay (never cached -- content changes every frame)
+        // Layer 3: Scroll position indicator (when scrolled)
+        if scroll_offset > 0 {
+            layers.push(draw_scroll_indicator(
+                renderer,
+                bounds,
+                scroll_offset,
+                scrollback.len(),
+            ));
+        }
+
+        // Layer 4: HUD overlay (never cached -- content changes every frame)
         if let Some(metrics) = self.metrics {
             let cache_hit = state.last_cache_hit.get();
             layers.push(draw_hud(
                 renderer,
                 bounds,
                 &metrics,
+                self.diag.as_ref(),
                 prev_draw_ms,
                 fps,
                 cache_hit,
@@ -526,30 +704,149 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
     }
 }
 
+/// Draw a scroll position indicator at the top-right corner.
+fn draw_scroll_indicator(
+    renderer: &iced::Renderer,
+    bounds: Rectangle,
+    scroll_offset: usize,
+    scrollback_len: usize,
+) -> canvas::Geometry {
+    let mut frame = canvas::Frame::new(renderer, bounds.size());
+
+    let label = format!("[{}/{}]", scroll_offset, scrollback_len);
+    let pad = 8.0;
+    let font_size = 12.0;
+    // Approximate text width: ~7px per character at size 12.
+    let text_w = label.len() as f32 * 7.0;
+    let x = bounds.width - text_w - pad;
+    let y = pad;
+
+    // Semi-transparent background pill.
+    frame.fill_rectangle(
+        IcedPoint::new(x - 4.0, y - 2.0),
+        Size::new(text_w + 8.0, 18.0),
+        IcedColor {
+            r: 0.0,
+            g: 0.0,
+            b: 0.0,
+            a: 0.7,
+        },
+    );
+
+    frame.fill_text(Text {
+        content: label,
+        position: IcedPoint::new(x, y),
+        color: IcedColor::from_rgb8(0xf1, 0xfa, 0x8c), // amber
+        size: Pixels(font_size),
+        line_height: iced::widget::text::LineHeight::Absolute(Pixels(16.0)),
+        font: Font::MONOSPACE,
+        horizontal_alignment: alignment::Horizontal::Left,
+        vertical_alignment: alignment::Vertical::Top,
+        shaping: iced::widget::text::Shaping::Basic,
+    });
+
+    frame.into_geometry()
+}
+
 /// Draw the HUD overlay as an uncached geometry layer.
 fn draw_hud(
     renderer: &iced::Renderer,
     bounds: Rectangle,
     metrics: &MetricsSnapshot,
+    diag: Option<&DiagSnapshot>,
     draw_ms: f64,
     fps: f64,
     cache_hit: bool,
 ) -> canvas::Geometry {
-    const HUD_W: f32 = 280.0;
-    const HUD_H: f32 = 148.0;
+    const HUD_W: f32 = 320.0;
     const HUD_PAD: f32 = 8.0;
     const LINE_H: f32 = 18.0;
     const HUD_FONT_SIZE: f32 = 12.0;
+    const MAX_EVENTS: usize = 5;
 
     let mut frame = canvas::Frame::new(renderer, bounds.size());
 
     let hud_x = bounds.width - HUD_W - HUD_PAD;
     let hud_y = HUD_PAD;
 
-    // Semi-transparent background
+    let cache_label = if cache_hit {
+        "HIT (overlay)"
+    } else {
+        "MISS (rebuild)"
+    };
+    let green = IcedColor::from_rgb8(0x50, 0xfa, 0x7b);
+    let amber = IcedColor::from_rgb8(0xf1, 0xfa, 0x8c);
+    let dim = IcedColor::from_rgb8(0x88, 0x88, 0x88);
+
+    // Collect all HUD lines with their colors
+    let c = &metrics.counters;
+    let mut lines: Vec<(String, IcedColor)> = vec![
+        (
+            format!(
+                "Net+Apply: {:.1}ms avg / {:.1}ms max",
+                metrics.net_apply_avg_ms, metrics.net_apply_max_ms
+            ),
+            green,
+        ),
+        (
+            format!("Apply:     {:.2}ms avg", metrics.apply_avg_ms),
+            green,
+        ),
+        (format!("Draw:      {:.1}ms (prev frame)", draw_ms), green),
+        (
+            format!("Batch:     {:.1} msgs avg", metrics.batch_avg),
+            green,
+        ),
+        (format!("FPS:       {fps:.0}"), green),
+        (format!("Diff:      {} ops", metrics.last_diff_ops), green),
+        (
+            format!("LargeDiff: {:.1}ms", metrics.last_large_diff_ms),
+            if metrics.last_large_diff_ms > 16.0 {
+                amber
+            } else {
+                green
+            },
+        ),
+        (format!("Cache:     {cache_label}"), green),
+        (
+            format!(
+                "Snapshot:  {}",
+                if metrics.snapshot_mode {
+                    "FORCED"
+                } else {
+                    "off"
+                }
+            ),
+            if metrics.snapshot_mode { amber } else { green },
+        ),
+        ("--- Diagnostics ---".to_owned(), dim),
+        (
+            format!(
+                "Disc:{}  Gap:{}  Lag:{}  Sync:{}",
+                c.stale_discards, c.seqno_gaps, c.lag_events, c.resyncs
+            ),
+            amber,
+        ),
+    ];
+
+    // Recent events
+    if let Some(diag) = diag {
+        for (ts, text) in diag.events.iter().rev().take(MAX_EVENTS).rev() {
+            let ago = ts.elapsed().as_secs();
+            let label = if ago < 60 {
+                format!("[{ago}s ago] {text}")
+            } else {
+                format!("[{}m ago] {text}", ago / 60)
+            };
+            lines.push((label, amber));
+        }
+    }
+
+    // Semi-transparent background sized to actual content
+    let hud_h = 6.0 + lines.len() as f32 * LINE_H + 6.0;
     frame.fill_rectangle(
         IcedPoint::new(hud_x, hud_y),
-        Size::new(HUD_W, HUD_H),
+        Size::new(HUD_W, hud_h),
         IcedColor {
             r: 0.0,
             g: 0.0,
@@ -558,33 +855,11 @@ fn draw_hud(
         },
     );
 
-    let cache_label = if cache_hit {
-        "HIT (overlay)"
-    } else {
-        "MISS (rebuild)"
-    };
-    let green = IcedColor::from_rgb8(0x50, 0xfa, 0x7b);
-    let lines = [
-        format!(
-            "Net+Apply: {:.1}ms avg / {:.1}ms max",
-            metrics.net_apply_avg_ms, metrics.net_apply_max_ms
-        ),
-        format!("Apply:     {:.2}ms avg", metrics.apply_avg_ms),
-        format!("Draw:      {:.1}ms (prev frame)", draw_ms),
-        format!("Batch:     {:.1} msgs avg", metrics.batch_avg),
-        format!("FPS:       {fps:.0}"),
-        format!(
-            "Diff:      {} ops, {} dirty rows",
-            metrics.last_diff_ops, metrics.last_dirty_rows
-        ),
-        format!("Cache:     {cache_label}"),
-    ];
-
-    for (i, line) in lines.iter().enumerate() {
+    for (i, (content, color)) in lines.iter().enumerate() {
         frame.fill_text(Text {
-            content: line.clone(),
+            content: content.clone(),
             position: IcedPoint::new(hud_x + 8.0, hud_y + 6.0 + i as f32 * LINE_H),
-            color: green,
+            color: *color,
             size: Pixels(HUD_FONT_SIZE),
             line_height: iced::widget::text::LineHeight::Absolute(Pixels(LINE_H)),
             font: Font::MONOSPACE,
@@ -602,8 +877,9 @@ pub fn view<'a>(
     grid: &'a CellGrid,
     _session: &'a str,
     metrics: Option<MetricsSnapshot>,
+    diag: Option<DiagSnapshot>,
 ) -> Element<'a, Message> {
-    let snapshot = GridView::from_grid(grid, metrics);
+    let snapshot = GridView::from_grid(grid, metrics, diag);
     Canvas::new(snapshot)
         .width(Length::Fill)
         .height(Length::Fill)
@@ -662,6 +938,7 @@ mod tests {
             }],
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
+            scrollback_lines: vec![],
         };
         grid.apply_diff(diff);
         assert_eq!(grid.cells[1].c, 'X');
@@ -689,6 +966,7 @@ mod tests {
             }],
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
+            scrollback_lines: vec![],
         };
         grid.apply_diff(diff);
         assert_eq!(grid.cells[1 * 5 + 2].c, 'H');
@@ -703,6 +981,7 @@ mod tests {
             ops: vec![DiffOp::Clear],
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
+            scrollback_lines: vec![],
         };
         grid.apply_diff(diff);
         assert_eq!(grid.cells[0].c, ' ');
@@ -720,6 +999,7 @@ mod tests {
             }],
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
+            scrollback_lines: vec![],
         });
         assert_eq!(grid.generation(), g0 + 1);
         grid.clear();
@@ -734,6 +1014,7 @@ mod tests {
             ops: vec![],
             cursor: CursorState::default(),
             modes: TermModes(TermModes::APP_CURSOR),
+            scrollback_lines: vec![],
         });
         assert!(grid.app_cursor());
     }
@@ -752,6 +1033,7 @@ mod tests {
                 ..CursorState::default()
             },
             modes: TermModes::EMPTY,
+            scrollback_lines: vec![],
         });
         assert_eq!(grid.generation(), g0 + 1);
         assert_eq!(grid.cells_generation(), 0);
@@ -768,6 +1050,7 @@ mod tests {
             }],
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
+            scrollback_lines: vec![],
         });
         assert_eq!(grid.generation(), g0 + 2);
         assert_eq!(grid.cells_generation(), 1);
@@ -819,6 +1102,7 @@ mod tests {
             }],
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
+            scrollback_lines: vec![],
         });
 
         assert_eq!(grid.cells_generation(), cg0 + 1);
@@ -839,6 +1123,7 @@ mod tests {
                 ..CursorState::default()
             },
             modes: TermModes::EMPTY,
+            scrollback_lines: vec![],
         });
 
         assert_eq!(
@@ -850,104 +1135,41 @@ mod tests {
     }
 
     #[test]
-    fn dirty_rows_tracked_on_cell_diff() {
-        let mut grid = CellGrid::new(4, 5);
-        assert_eq!(grid.dirty_row_count(), 0);
+    fn rapid_diffs_all_reflected_in_generation() {
+        let mut grid = CellGrid::new(24, 80);
+        let g0 = grid.cells_generation();
 
-        grid.apply_diff(TerminalDiff {
-            ops: vec![
-                DiffOp::Cell {
-                    row: 1,
+        // Simulate 10 rapid diffs
+        for i in 0..10u8 {
+            grid.apply_diff(TerminalDiff {
+                ops: vec![DiffOp::Cell {
+                    row: (i % 24) as u16,
                     col: 0,
                     cell: CellState {
-                        c: 'A',
+                        c: (b'A' + i) as char,
                         ..CellState::default()
                     },
-                },
-                DiffOp::Cell {
-                    row: 3,
-                    col: 2,
-                    cell: CellState {
-                        c: 'B',
-                        ..CellState::default()
-                    },
-                },
-            ],
-            cursor: CursorState::default(),
-            modes: TermModes::EMPTY,
-        });
+                }],
+                cursor: CursorState::default(),
+                modes: TermModes::EMPTY,
+                scrollback_lines: vec![],
+            });
+        }
 
-        assert_eq!(grid.dirty_row_count(), 2);
-        assert!(!grid.dirty_rows()[0]);
-        assert!(grid.dirty_rows()[1]);
-        assert!(!grid.dirty_rows()[2]);
-        assert!(grid.dirty_rows()[3]);
+        // Every diff bumped the generation
+        assert_eq!(grid.cells_generation(), g0 + 10);
+
+        // All cells reflect their latest values
+        for i in 0..10u8 {
+            let row = (i % 24) as usize;
+            assert_eq!(grid.cells[row * 80].c, (b'A' + i) as char);
+        }
     }
 
     #[test]
-    fn dirty_rows_tracked_on_row_op() {
-        let mut grid = CellGrid::new(4, 5);
-        grid.apply_diff(TerminalDiff {
-            ops: vec![DiffOp::Row {
-                row: 2,
-                start_col: 0,
-                cells: vec![CellState::default(); 3],
-            }],
-            cursor: CursorState::default(),
-            modes: TermModes::EMPTY,
-        });
-
-        assert_eq!(grid.dirty_row_count(), 1);
-        assert!(grid.dirty_rows()[2]);
-    }
-
-    #[test]
-    fn dirty_rows_reset_after_promotion() {
-        let mut grid = CellGrid::new(4, 5);
-
-        // Mark row 0 dirty
-        grid.apply_diff(TerminalDiff {
-            ops: vec![DiffOp::Cell {
-                row: 0,
-                col: 0,
-                cell: CellState {
-                    c: 'X',
-                    ..CellState::default()
-                },
-            }],
-            cursor: CursorState::default(),
-            modes: TermModes::EMPTY,
-        });
-        assert_eq!(grid.dirty_row_count(), 1);
-
-        // Simulate draw() promoting (full cache rebuild)
-        grid.promoted.set(true);
-
-        // Next apply_diff sees promoted → clears dirty_rows, then marks row 2
-        grid.apply_diff(TerminalDiff {
-            ops: vec![DiffOp::Cell {
-                row: 2,
-                col: 0,
-                cell: CellState {
-                    c: 'Y',
-                    ..CellState::default()
-                },
-            }],
-            cursor: CursorState::default(),
-            modes: TermModes::EMPTY,
-        });
-
-        // Only row 2 should be dirty (row 0 was cleared by promotion reset)
-        assert_eq!(grid.dirty_row_count(), 1);
-        assert!(!grid.dirty_rows()[0]);
-        assert!(grid.dirty_rows()[2]);
-        assert!(!grid.promoted.get());
-    }
-
-    #[test]
-    fn snapshot_marks_all_dirty() {
+    fn snapshot_bumps_cells_generation() {
         let mut grid = CellGrid::new(2, 3);
-        assert_eq!(grid.dirty_row_count(), 0);
+        let cg0 = grid.cells_generation();
 
         grid.apply_snapshot(GridSnapshot {
             rows: 2,
@@ -957,27 +1179,84 @@ mod tests {
             modes: TermModes::EMPTY,
         });
 
-        // All rows marked dirty to trigger promotion on next draw
-        assert_eq!(grid.dirty_row_count(), 2);
-        assert!(!grid.promoted.get());
+        assert_eq!(grid.cells_generation(), cg0 + 1);
     }
 
     #[test]
-    fn clear_marks_all_dirty() {
+    fn clear_bumps_cells_generation() {
         let mut grid = CellGrid::new(3, 4);
+        let cg0 = grid.cells_generation();
         grid.clear();
-
-        assert_eq!(grid.dirty_row_count(), 3);
-        assert!(!grid.promoted.get());
+        assert_eq!(grid.cells_generation(), cg0 + 1);
     }
 
     #[test]
-    fn resize_resets_dirty_rows() {
+    fn resize_bumps_cells_generation() {
         let mut grid = CellGrid::new(2, 3);
+        let cg0 = grid.cells_generation();
         grid.resize(4, 5);
+        assert_eq!(grid.cells_generation(), cg0 + 1);
+        assert_eq!(grid.rows, 4);
+        assert_eq!(grid.cols, 5);
+    }
 
-        assert_eq!(grid.dirty_rows().len(), 4);
-        assert_eq!(grid.dirty_row_count(), 4);
-        assert!(!grid.promoted.get());
+    #[test]
+    fn wide_char_attrs_round_trip_through_diff() {
+        let mut grid = CellGrid::new(1, 4);
+        let wide_cell = CellState {
+            c: '中',
+            attrs: CellAttrs(CellAttrs::WIDE_CHAR),
+            ..CellState::default()
+        };
+        let spacer_cell = CellState {
+            c: ' ',
+            attrs: CellAttrs(CellAttrs::WIDE_CHAR_SPACER),
+            ..CellState::default()
+        };
+        let diff = TerminalDiff {
+            ops: vec![
+                DiffOp::Cell {
+                    row: 0,
+                    col: 0,
+                    cell: wide_cell,
+                },
+                DiffOp::Cell {
+                    row: 0,
+                    col: 1,
+                    cell: spacer_cell,
+                },
+            ],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            scrollback_lines: vec![],
+        };
+        grid.apply_diff(diff);
+        assert_eq!(grid.cells[0].c, '中');
+        assert!(grid.cells[0].attrs.contains(CellAttrs::WIDE_CHAR));
+        assert!(grid.cells[1].attrs.contains(CellAttrs::WIDE_CHAR_SPACER));
+    }
+
+    #[test]
+    fn bold_italic_attrs_preserved_through_diff() {
+        let mut grid = CellGrid::new(1, 2);
+        let bold_italic = CellState {
+            c: 'A',
+            attrs: CellAttrs(CellAttrs::BOLD | CellAttrs::ITALIC),
+            ..CellState::default()
+        };
+        let diff = TerminalDiff {
+            ops: vec![DiffOp::Cell {
+                row: 0,
+                col: 0,
+                cell: bold_italic,
+            }],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            scrollback_lines: vec![],
+        };
+        grid.apply_diff(diff);
+        assert!(grid.cells[0].attrs.contains(CellAttrs::BOLD));
+        assert!(grid.cells[0].attrs.contains(CellAttrs::ITALIC));
+        assert!(!grid.cells[0].attrs.contains(CellAttrs::UNDERLINE));
     }
 }

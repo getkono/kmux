@@ -17,8 +17,11 @@ pub enum ShortcutAction {
     ToggleInputLock,
     ShowHelp,
     ToggleHud,
+    ToggleSnapshotMode,
     OpenCommandPalette,
     SendLiteralLeader,
+    ScrollPageUp,
+    ScrollPageDown,
 }
 
 /// Leader key state machine.
@@ -94,7 +97,10 @@ pub fn resolve_key(
             "l" => Some(ShortcutAction::ToggleInputLock),
             "?" => Some(ShortcutAction::ShowHelp),
             "h" => Some(ShortcutAction::ToggleHud),
+            "f" => Some(ShortcutAction::ToggleSnapshotMode),
             ":" => Some(ShortcutAction::OpenCommandPalette),
+            "[" => Some(ShortcutAction::ScrollPageUp),
+            "]" => Some(ShortcutAction::ScrollPageDown),
             "0" => Some(ShortcutAction::JumpToSession(9)), // 0 = 10th session
             "1" => Some(ShortcutAction::JumpToSession(0)),
             "2" => Some(ShortcutAction::JumpToSession(1)),
@@ -141,7 +147,11 @@ pub fn shortcut_help_entries() -> Vec<(&'static str, &'static str)> {
         ("l", "Toggle input lock"),
         ("?", "Show this help"),
         ("h", "Toggle HUD metrics"),
+        ("f", "Toggle full-snapshot mode"),
         (":", "Command palette"),
+        ("[", "Scroll page up"),
+        ("]", "Scroll page down"),
+        ("Shift+PgUp/Dn", "Scroll page (direct)"),
         ("Ctrl+B", "Send literal Ctrl+B"),
     ]
 }
@@ -206,6 +216,11 @@ fn all_commands() -> Vec<CommandEntry> {
             label: "Toggle HUD".into(),
             shortcut_hint: "h".into(),
             action: ShortcutAction::ToggleHud,
+        },
+        CommandEntry {
+            label: "Toggle Snapshot Mode".into(),
+            shortcut_hint: "f".into(),
+            action: ShortcutAction::ToggleSnapshotMode,
         },
     ]
 }

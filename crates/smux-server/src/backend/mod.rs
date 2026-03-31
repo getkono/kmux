@@ -31,4 +31,33 @@ pub trait TerminalBackend: Send + 'static {
 
     /// Resize the underlying terminal emulator.
     fn resize(&mut self, rows: u16, cols: u16);
+
+    /// Populate cells AND return cursor+modes in a single pass.
+    ///
+    /// Backends where `fill_cells()` and `cursor()` share expensive
+    /// intermediate state (e.g. alacritty's `renderable_content()`)
+    /// should override this to avoid redundant work. The default calls
+    /// each method individually.
+    fn fill_cells_and_cursor(&self, out: &mut [CellState]) -> (CursorState, TermModes) {
+        self.fill_cells(out);
+        (self.cursor(), self.modes())
+    }
+
+    /// Number of lines currently in the scrollback history.
+    fn history_size(&self) -> usize {
+        0
+    }
+
+    /// Read `count` lines from the scrollback history starting at `start`.
+    ///
+    /// Index 0 is the oldest line in history. Each returned line is a
+    /// `Vec<CellState>` of length `cols`.
+    fn read_history_lines(
+        &self,
+        _start: usize,
+        _count: usize,
+        _cols: usize,
+    ) -> Vec<Vec<CellState>> {
+        vec![]
+    }
 }

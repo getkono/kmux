@@ -1,5 +1,6 @@
 mod app;
 mod connect;
+mod event_log;
 mod metrics;
 mod session_bar;
 mod shortcut;

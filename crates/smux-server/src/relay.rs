@@ -1,11 +1,11 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use smux::session::PtyReader;
 use smux_protocol::messages::{
     ClientId, CursorState, SequenceNo, ServerMessage, TermModes, TerminalDiff, epoch_millis,
 };
-use tokio::time::{Duration, Instant};
 use tracing::{debug, warn};
 
 use crate::app::ClientMap;
@@ -13,27 +13,8 @@ use crate::diff_engine::DiffResult;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::TermState;
 
-/// Short coalescing window: flush quickly for interactive apps (fzf, vim).
-/// On the first PTY read, wait only this long before flushing.
-const COALESCE_SHORT: Duration = Duration::from_micros(500);
-
-/// Long coalescing window: batch burst output (cat, make).
-/// Extended to this when a second PTY read arrives within the short window.
-const COALESCE_LONG: Duration = Duration::from_millis(4);
-
-/// Flush immediately if accumulated bytes since last cell diff exceed this.
-const COALESCE_MAX_BYTES: usize = 32_768;
-
-/// Read PTY output in a loop, feed bytes immediately through server-side
-/// VT emulation, send cursor-only updates on the fast-path, and coalesce
-/// cell diffs on a timer.
-///
-/// Key design points:
-/// - `feed()` is called on every PTY read (no byte accumulation)
-/// - Cursor/mode changes are detected after each `feed()` and broadcast
-///   immediately as `CursorUpdate` messages (fast-path)
-/// - Cell diffs are coalesced on a timer to batch burst output
-/// - No `biased` select — fair polling prevents timer starvation
+/// Read PTY output in a loop, feed bytes through server-side VT emulation,
+/// and immediately compute + broadcast cell diffs after each read.
 pub async fn session_diff_loop(
     mut reader: PtyReader,
     session: String,
@@ -43,151 +24,43 @@ pub async fn session_diff_loop(
     seqno_counter: Arc<AtomicU64>,
 ) {
     let mut buf = vec![0u8; 4096];
-    let mut cells_dirty = false;
-    let mut deadline = Instant::now();
-    let mut bytes_since_diff: usize = 0;
-    let mut extended = false;
     let mut prev_cursor = CursorState::default();
     let mut prev_modes = TermModes::EMPTY;
 
     loop {
-        if !cells_dirty {
-            // Nothing pending: block on PTY read
-            match reader.read(&mut buf).await {
-                Ok(0) => break,
-                Ok(n) => {
-                    let mut ts = term_state.lock().unwrap();
-                    ts.feed(&buf[..n]);
-                    check_and_send_cursor(
-                        &ts,
-                        &mut prev_cursor,
-                        &mut prev_modes,
-                        &session,
-                        &scrollback,
-                        &clients,
-                        &seqno_counter,
-                    );
-                    drop(ts);
-                    cells_dirty = true;
-                    bytes_since_diff = n;
-                    deadline = Instant::now() + COALESCE_SHORT;
-                }
-                Err(e) => {
-                    warn!("PTY relay read error: {e}");
-                    break;
-                }
+        match reader.read(&mut buf).await {
+            Ok(0) => break,
+            Ok(n) => {
+                let cycle_start = Instant::now();
+                let mut ts = term_state.lock().unwrap();
+                ts.feed(&buf[..n]);
+                drop(ts);
+                flush_cell_diff(
+                    &session,
+                    &term_state,
+                    &scrollback,
+                    &clients,
+                    &seqno_counter,
+                    &mut prev_cursor,
+                    &mut prev_modes,
+                );
+                let cycle_us = cycle_start.elapsed().as_micros();
+                debug!(
+                    session,
+                    bytes = n,
+                    cycle_us,
+                    "PTY read-diff-broadcast cycle"
+                );
             }
-        } else {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            tokio::select! {
-                result = reader.read(&mut buf) => {
-                    match result {
-                        Ok(0) => {
-                            flush_cell_diff(
-                                &session, &term_state, &scrollback,
-                                &clients, &seqno_counter,
-                                &mut prev_cursor, &mut prev_modes,
-                            );
-                            break;
-                        }
-                        Ok(n) => {
-                            let mut ts = term_state.lock().unwrap();
-                            ts.feed(&buf[..n]);
-                            check_and_send_cursor(
-                                &ts,
-                                &mut prev_cursor,
-                                &mut prev_modes,
-                                &session,
-                                &scrollback,
-                                &clients,
-                                &seqno_counter,
-                            );
-                            drop(ts);
-                            bytes_since_diff += n;
-                            if bytes_since_diff >= COALESCE_MAX_BYTES {
-                                flush_cell_diff(
-                                    &session, &term_state, &scrollback,
-                                    &clients, &seqno_counter,
-                                    &mut prev_cursor, &mut prev_modes,
-                                );
-                                cells_dirty = false;
-                                bytes_since_diff = 0;
-                                extended = false;
-                            } else if !extended {
-                                deadline = Instant::now() + COALESCE_LONG;
-                                extended = true;
-                            }
-                        }
-                        Err(e) => {
-                            warn!("PTY relay read error: {e}");
-                            flush_cell_diff(
-                                &session, &term_state, &scrollback,
-                                &clients, &seqno_counter,
-                                &mut prev_cursor, &mut prev_modes,
-                            );
-                            break;
-                        }
-                    }
-                }
-
-                _ = tokio::time::sleep(remaining) => {
-                    flush_cell_diff(
-                        &session, &term_state, &scrollback,
-                        &clients, &seqno_counter,
-                        &mut prev_cursor, &mut prev_modes,
-                    );
-                    cells_dirty = false;
-                    bytes_since_diff = 0;
-                    extended = false;
-                }
+            Err(e) => {
+                warn!("PTY relay read error: {e}");
+                break;
             }
         }
     }
 }
 
-/// Cursor fast-path: after each `feed()`, compare cursor/modes against
-/// tracked state and broadcast `CursorUpdate` if changed.
-///
-/// This does NOT call `fill_cells()` — it only reads `backend.cursor()`
-/// and `backend.modes()`, which is much cheaper.
-fn check_and_send_cursor(
-    ts: &TermState,
-    prev_cursor: &mut CursorState,
-    prev_modes: &mut TermModes,
-    session: &str,
-    scrollback: &Arc<Mutex<DiffBuffer>>,
-    clients: &ClientMap,
-    seqno_counter: &Arc<AtomicU64>,
-) {
-    let cursor = ts.cursor();
-    let modes = ts.modes();
-    if cursor != *prev_cursor || modes != *prev_modes {
-        *prev_cursor = cursor;
-        *prev_modes = modes;
-        let seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
-
-        // Store as an empty-ops TerminalDiff for scrollback replay
-        scrollback.lock().unwrap().push(
-            seqno,
-            Arc::new(TerminalDiff {
-                ops: vec![],
-                cursor,
-                modes,
-            }),
-        );
-
-        let msg = ServerMessage::CursorUpdate {
-            session: session.to_string(),
-            cursor,
-            modes,
-            seqno,
-            sent_at_ms: epoch_millis(),
-        };
-        broadcast_to_clients(session, &msg, clients);
-    }
-}
-
-/// Coalescing timer expired or byte threshold hit — compute full cell diff.
+/// Compute cell diff and broadcast to clients.
 fn flush_cell_diff(
     session: &str,
     term_state: &Arc<Mutex<TermState>>,
@@ -197,19 +70,23 @@ fn flush_cell_diff(
     prev_cursor: &mut CursorState,
     prev_modes: &mut TermModes,
 ) {
+    let diff_start = Instant::now();
     let result = {
         let mut ts = term_state.lock().unwrap();
         ts.compute_diff()
     };
+    let diff_us = diff_start.elapsed().as_micros();
 
     match result {
         DiffResult::CellDiff(diff) => {
             *prev_cursor = diff.cursor;
             *prev_modes = diff.modes;
 
+            let ops = diff.ops.len();
             debug!(
                 session,
-                ops = diff.ops.len(),
+                ops,
+                diff_us,
                 cursor_row = diff.cursor.row,
                 cursor_col = diff.cursor.col,
                 "flush_cell_diff: broadcasting cell diff"
@@ -225,10 +102,9 @@ fn flush_cell_diff(
                 seqno,
                 sent_at_ms: epoch_millis(),
             };
-            broadcast_to_clients(session, &msg, clients);
+            broadcast_to_clients(session, &msg, clients, term_state, seqno);
         }
         DiffResult::CursorOnly { cursor, modes } => {
-            // Cursor may have already been sent by fast-path; compare again
             if cursor != *prev_cursor || modes != *prev_modes {
                 *prev_cursor = cursor;
                 *prev_modes = modes;
@@ -239,6 +115,7 @@ fn flush_cell_diff(
                         ops: vec![],
                         cursor,
                         modes,
+                        scrollback_lines: vec![],
                     }),
                 );
                 let msg = ServerMessage::CursorUpdate {
@@ -248,7 +125,7 @@ fn flush_cell_diff(
                     seqno,
                     sent_at_ms: epoch_millis(),
                 };
-                broadcast_to_clients(session, &msg, clients);
+                broadcast_to_clients(session, &msg, clients, term_state, seqno);
             }
         }
         DiffResult::None => {
@@ -259,25 +136,49 @@ fn flush_cell_diff(
 
 /// Send a message to all registered clients, handling backpressure and dead clients.
 ///
+/// Clients with `force_full_snapshot` enabled receive a `TerminalSnapshot` instead
+/// of the incremental diff message. The snapshot is generated lazily (only when at
+/// least one forced client exists).
+///
 /// When a client's data channel is full, send `Lagged` via the unbounded control
 /// channel (which never fails) and remove the data sender so the uni-stream writer
 /// exits cleanly. The client receives the `Lagged` notification reliably and can
 /// re-attach for a fresh snapshot.
-fn broadcast_to_clients(session: &str, msg: &ServerMessage, clients: &ClientMap) {
+fn broadcast_to_clients(
+    session: &str,
+    msg: &ServerMessage,
+    clients: &ClientMap,
+    term_state: &Arc<Mutex<TermState>>,
+    seqno: SequenceNo,
+) {
     let mut dead: Vec<ClientId> = Vec::new();
+    // Lazily computed snapshot for clients in forced-snapshot mode.
+    let mut snapshot_msg: Option<ServerMessage> = None;
 
     {
         let map = clients.lock().unwrap();
         for (&client_id, sender) in map.iter() {
-            match sender.data_tx.try_send(msg.clone()) {
+            let outgoing = if sender.force_full_snapshot {
+                snapshot_msg.get_or_insert_with(|| {
+                    let snapshot = term_state.lock().unwrap().snapshot();
+                    ServerMessage::TerminalSnapshot {
+                        session: session.to_string(),
+                        snapshot,
+                        seqno,
+                        sent_at_ms: epoch_millis(),
+                    }
+                })
+            } else {
+                msg
+            };
+
+            match sender.data_tx.try_send(outgoing.clone()) {
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
-                    // Send Lagged via the control channel (unbounded, never fails).
                     let _ = sender.ctrl_tx.send(ServerMessage::Lagged {
                         session: session.to_string(),
                         missed_count: 1,
                     });
-                    // Remove data sender so uni-stream writer task exits cleanly.
                     dead.push(client_id);
                     warn!(
                         "Client {:?} lagged on session '{session}', sending Lagged via ctrl",
@@ -305,6 +206,7 @@ mod tests {
 
     use super::*;
     use crate::app::ClientSender;
+    use crate::term_state::new_term_state;
     use smux_protocol::messages::{CursorState, TermModes, TerminalDiff};
     use tokio::sync::mpsc;
 
@@ -315,10 +217,15 @@ mod tests {
                 ops: vec![],
                 cursor: CursorState::default(),
                 modes: TermModes::EMPTY,
+                scrollback_lines: vec![],
             }),
             seqno: SequenceNo(1),
             sent_at_ms: 0,
         }
+    }
+
+    fn test_term_state() -> Arc<Mutex<TermState>> {
+        Arc::new(Mutex::new(new_term_state(24, 80)))
     }
 
     #[test]
@@ -331,13 +238,18 @@ mod tests {
         data_tx.try_send(dummy_update("test")).unwrap();
 
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        clients
-            .lock()
-            .unwrap()
-            .insert(ClientId(1), ClientSender { data_tx, ctrl_tx });
+        clients.lock().unwrap().insert(
+            ClientId(1),
+            ClientSender {
+                data_tx,
+                ctrl_tx,
+                force_full_snapshot: false,
+            },
+        );
 
         // Now broadcast — data channel is full
-        broadcast_to_clients("test", &dummy_update("test"), &clients);
+        let ts = test_term_state();
+        broadcast_to_clients("test", &dummy_update("test"), &clients, &ts, SequenceNo(1));
 
         // Lagged should arrive on the ctrl channel
         let msg = ctrl_rx.try_recv().expect("should receive Lagged on ctrl");
@@ -357,12 +269,17 @@ mod tests {
         data_tx.try_send(dummy_update("test")).unwrap();
 
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        clients
-            .lock()
-            .unwrap()
-            .insert(ClientId(42), ClientSender { data_tx, ctrl_tx });
+        clients.lock().unwrap().insert(
+            ClientId(42),
+            ClientSender {
+                data_tx,
+                ctrl_tx,
+                force_full_snapshot: false,
+            },
+        );
 
-        broadcast_to_clients("test", &dummy_update("test"), &clients);
+        let ts = test_term_state();
+        broadcast_to_clients("test", &dummy_update("test"), &clients, &ts, SequenceNo(1));
 
         // Client should be removed from the map
         assert!(
@@ -377,12 +294,17 @@ mod tests {
         let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        clients
-            .lock()
-            .unwrap()
-            .insert(ClientId(1), ClientSender { data_tx, ctrl_tx });
+        clients.lock().unwrap().insert(
+            ClientId(1),
+            ClientSender {
+                data_tx,
+                ctrl_tx,
+                force_full_snapshot: false,
+            },
+        );
 
-        broadcast_to_clients("test", &dummy_update("test"), &clients);
+        let ts = test_term_state();
+        broadcast_to_clients("test", &dummy_update("test"), &clients, &ts, SequenceNo(1));
 
         // Message should arrive on data channel
         let msg = data_rx
