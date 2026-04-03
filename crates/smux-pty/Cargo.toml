@@ -1,0 +1,18 @@
+[package]
+name = "smux-pty"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+tracing = ["dep:tracing"]
+serde = ["dep:serde"]
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+nix = { version = "0.31", features = ["process", "signal", "term"] }
+thiserror = "2"
+tracing = { version = "0.1", optional = true }
+serde = { version = "1", features = ["derive"], optional = true }
+
+[dev-dependencies]
+tokio-test = "0.4"

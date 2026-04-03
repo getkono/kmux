@@ -17,7 +17,7 @@ smux/
     workflows/
         ci.yml
  crates/
-    smux/                   # Core async PTY library
+    smux-pty/               # Core async PTY library
        Cargo.toml
        src/
            lib.rs
@@ -53,7 +53,7 @@ smux/
            connection.rs
            relay.rs
            tls.rs
-    smux-client/            # Desktop GUI (iced + iced_term)
+    smux/                   # Desktop GUI (iced + iced_term)
         Cargo.toml
         src/
             main.rs
@@ -72,10 +72,10 @@ smux/
 ### Dependency Graph
 
 ```
-smux-server  -> smux (library)
+smux-server  -> smux-pty (library)
 smux-server  -> smux-protocol
-smux-client  -> smux-protocol
-smux-client     (does NOT depend on smux -- talks to server only)
+smux         -> smux-protocol
+smux            (does NOT depend on smux-pty -- talks to server only)
 ```
 
 ## Development
@@ -96,7 +96,7 @@ cargo run -p smux-server -- --self-signed
 ### Run (client)
 
 ```bash
-cargo run -p smux-client
+cargo run -p smux
 ```
 
 ### Test
@@ -136,11 +136,11 @@ cargo clippy --workspace --fix
 smux is a terminal multiplexer / session manager. The architecture is a
 server/client split:
 
-- **smux** (library): async PTY lifecycle management (spawn, I/O, resize, shutdown, events)
+- **smux-pty** (library): async PTY lifecycle management (spawn, I/O, resize, shutdown, events)
 - **smux-protocol**: shared wire protocol types, MessagePack serialization
 - **smux-server**: background daemon; manages PTY sessions, accepts WebSocket+TLS
   connections from clients, relays PTY I/O
-- **smux-client**: iced-based desktop GUI; connects to a remote smux-server,
+- **smux**: iced-based desktop GUI; connects to a remote smux-server,
   renders terminal output via iced_term (alacritty backend)
 
 ### Network Protocol

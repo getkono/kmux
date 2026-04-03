@@ -14,7 +14,7 @@ use tracing_subscriber::EnvFilter;
 use app::SmuxApp;
 
 #[derive(Parser, Debug)]
-#[command(name = "smux-client", about = "smux remote terminal client")]
+#[command(name = "smux", about = "smux remote terminal client")]
 struct Cli {
     /// Accept self-signed / invalid TLS certificates (enabled by default for dev)
     #[arg(long)]
@@ -24,7 +24,7 @@ struct Cli {
 fn main() -> iced::Result {
     tracing_subscriber::fmt()
         .with_env_filter(
-            EnvFilter::from_default_env().add_directive("smux_client=info".parse().unwrap()),
+            EnvFilter::from_default_env().add_directive("smux=info".parse().unwrap()),
         )
         .init();
 

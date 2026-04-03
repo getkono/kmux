@@ -13,7 +13,7 @@ backend-alacritty = ["dep:alacritty_terminal"]
 backend-termwiz = ["dep:termwiz"]
 
 [dependencies]
-smux = { path = "../smux" }
+smux-pty = { path = "../smux-pty" }
 nix = { version = "0.31", features = ["process", "signal"] }
 smux-protocol = { path = "../smux-protocol", features = ["framing"] }
 alacritty_terminal = { version = "0.25", optional = true }

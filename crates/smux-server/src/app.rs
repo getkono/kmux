@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use smux::config::{PtyConfig, WindowSize};
-use smux::error::{Result, SmuxError};
-use smux::events::SessionEvent;
-use smux::registry::SessionManager;
-use smux::session::PtyWriter;
+use smux_pty::config::{PtyConfig, WindowSize};
+use smux_pty::error::{Result, SmuxError};
+use smux_pty::events::SessionEvent;
+use smux_pty::registry::SessionManager;
+use smux_pty::session::PtyWriter;
 use smux_protocol::messages::{
     ClientId, GridSnapshot, InputMode, SequenceNo, ServerMessage, SessionInfo, SessionStatus,
     TermSize, TerminalDiff,
@@ -97,7 +97,7 @@ impl ServerApp {
     ) -> Result<()> {
         let prog = match program {
             Some(p) => p,
-            None => smux::shell::detect_shell()?,
+            None => smux_pty::shell::detect_shell()?,
         };
 
         let config = PtyConfig::new(&prog).args(args).size(size.rows, size.cols);

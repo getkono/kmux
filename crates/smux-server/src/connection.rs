@@ -357,11 +357,11 @@ async fn send_frame(
 }
 
 /// Map smux errors to protocol error codes.
-fn classify_error(e: &smux::error::SmuxError) -> ErrorCode {
+fn classify_error(e: &smux_pty::error::SmuxError) -> ErrorCode {
     match e {
-        smux::error::SmuxError::SessionNotFound { .. } => ErrorCode::SessionNotFound,
-        smux::error::SmuxError::SessionAlreadyExists { .. } => ErrorCode::SessionAlreadyExists,
-        smux::error::SmuxError::Pty(err) if *err == nix::Error::EPERM => ErrorCode::InputLocked,
+        smux_pty::error::SmuxError::SessionNotFound { .. } => ErrorCode::SessionNotFound,
+        smux_pty::error::SmuxError::SessionAlreadyExists { .. } => ErrorCode::SessionAlreadyExists,
+        smux_pty::error::SmuxError::Pty(err) if *err == nix::Error::EPERM => ErrorCode::InputLocked,
         _ => ErrorCode::InternalError,
     }
 }
@@ -459,21 +459,21 @@ pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
     info!("Connection closed");
 }
 
-fn session_event_to_msg(event: smux::events::SessionEvent) -> SessionEventMsg {
+fn session_event_to_msg(event: smux_pty::events::SessionEvent) -> SessionEventMsg {
     match event {
-        smux::events::SessionEvent::Spawned { name } => SessionEventMsg::Spawned { name },
-        smux::events::SessionEvent::Exited { name, status } => SessionEventMsg::Exited {
+        smux_pty::events::SessionEvent::Spawned { name } => SessionEventMsg::Spawned { name },
+        smux_pty::events::SessionEvent::Exited { name, status } => SessionEventMsg::Exited {
             name,
             code: status.code(),
             signal: match status {
-                smux::process::ExitStatus::Signal(s) => Some(s),
+                smux_pty::process::ExitStatus::Signal(s) => Some(s),
                 _ => None,
             },
         },
-        smux::events::SessionEvent::Resized { name, rows, cols } => {
+        smux_pty::events::SessionEvent::Resized { name, rows, cols } => {
             SessionEventMsg::Resized { name, rows, cols }
         }
-        smux::events::SessionEvent::Closed { name } => SessionEventMsg::Closed { name },
-        smux::events::SessionEvent::Timeout { name, .. } => SessionEventMsg::Closed { name },
+        smux_pty::events::SessionEvent::Closed { name } => SessionEventMsg::Closed { name },
+        smux_pty::events::SessionEvent::Timeout { name, .. } => SessionEventMsg::Closed { name },
     }
 }

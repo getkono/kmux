@@ -3970,18 +3970,6 @@ dependencies = [
 name = "smux"
 version = "0.1.0"
 dependencies = [
- "nix 0.31.2",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tracing",
-]
-
-[[package]]
-name = "smux-client"
-version = "0.1.0"
-dependencies = [
  "clap",
  "iced",
  "quinn",
@@ -4004,6 +3992,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "smux-pty"
+version = "0.1.0"
+dependencies = [
+ "nix 0.31.2",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
 name = "smux-server"
 version = "0.1.0"
 dependencies = [
@@ -4016,8 +4016,8 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
- "smux",
  "smux-protocol",
+ "smux-pty",
  "termwiz",
  "thiserror 2.0.18",
  "tokio",
