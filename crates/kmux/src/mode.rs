@@ -80,6 +80,9 @@ pub enum Action {
     ConnectChar(char),
     ConnectBackspace,
 
+    // Quit the application
+    Quit,
+
     // No-op
     None,
 }
@@ -151,6 +154,7 @@ fn resolve_mode_select(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
             "l" => (Some(Mode::Locked), Action::None),
             "h" => (Some(Mode::Normal), Action::ToggleHud),
             "?" => (Some(Mode::Help), Action::None),
+            "q" => (Some(Mode::Normal), Action::Quit),
             _ => (Some(Mode::Normal), Action::None),
         },
         Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::None),
@@ -282,6 +286,7 @@ pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
             ("l", "Lock"),
             ("h", "HUD"),
             ("?", "Help"),
+            ("q", "Quit"),
             ("Esc", "Cancel"),
         ],
         Mode::Session => vec![
@@ -342,6 +347,7 @@ pub fn help_entries() -> Vec<(&'static str, &'static str)> {
         ("l", "Locked mode (passthrough)"),
         ("h", "Toggle HUD metrics"),
         ("?", "This help"),
+        ("q", "Quit"),
         ("", ""),
         ("-- Session Mode --", ""),
         ("c", "Create new session"),

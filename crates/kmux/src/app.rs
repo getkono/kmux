@@ -555,6 +555,9 @@ impl App {
             Action::ExitToNormal => {
                 self.mode = Mode::Normal;
             }
+            Action::Quit => {
+                return true;
+            }
             Action::None => {}
         }
 
