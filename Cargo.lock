@@ -2054,6 +2054,7 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "tempfile",
  "termwiz",
  "thiserror 2.0.18",
  "tokio",

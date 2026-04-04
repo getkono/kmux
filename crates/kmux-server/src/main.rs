@@ -27,7 +27,7 @@ use tracing_subscriber::EnvFilter;
 #[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 use app::ServerApp;
 #[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
-use auth::generate_token;
+use auth::{generate_token, persist_token};
 
 #[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 #[derive(Parser, Debug)]
@@ -81,6 +81,10 @@ async fn main() -> anyhow::Result<()> {
         let quinn_config = tls::build_quinn_config(tls_config)?;
 
         let token = generate_token();
+        match persist_token(&token) {
+            Ok(path) => info!("Auth token persisted to {}", path.display()),
+            Err(e) => tracing::warn!("Failed to persist auth token: {e}"),
+        }
         println!("Auth token: {token}");
 
         let app = Arc::new(ServerApp::new(token));

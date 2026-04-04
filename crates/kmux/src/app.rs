@@ -17,6 +17,19 @@ use crate::shortcut::{self, LEADER_TIMEOUT, LeaderState, ShortcutAction};
 use crate::terminal_view::CellGrid;
 use crate::{connect, session_bar, status_bar, terminal_view, theme};
 
+/// Try to read the auth token from `$XDG_RUNTIME_DIR/kmux/token`.
+/// Returns `None` if the env var is unset, the file is missing, or any I/O error occurs.
+fn read_local_token() -> Option<String> {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
+    let path = std::path::Path::new(&runtime_dir)
+        .join("kmux")
+        .join("token");
+    std::fs::read_to_string(path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
 /// Connection parameters used as a subscription ID (triggers reconnect on change).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct ConnectParams {
@@ -172,6 +185,7 @@ impl kmuxApp {
         Self {
             host: "127.0.0.1".to_string(),
             port: "8443".to_string(),
+            token: read_local_token().unwrap_or_default(),
             ..Default::default()
         }
     }

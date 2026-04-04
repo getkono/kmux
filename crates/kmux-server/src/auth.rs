@@ -1,4 +1,33 @@
+use std::io::Write as _;
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use std::path::PathBuf;
+
 use rand::RngCore;
+
+/// Persist `token` to `$XDG_RUNTIME_DIR/kmux/token` with mode 0600.
+/// The directory is created with mode 0700 if it does not exist.
+/// Returns the path on success.
+pub fn persist_token(token: &str) -> anyhow::Result<PathBuf> {
+    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
+        .map_err(|_| anyhow::anyhow!("XDG_RUNTIME_DIR is not set"))?;
+
+    let token_dir = PathBuf::from(&runtime_dir).join("kmux");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&token_dir)?;
+
+    let token_path = token_dir.join("token");
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&token_path)?;
+    file.write_all(token.as_bytes())?;
+
+    Ok(token_path)
+}
 
 /// Generate a cryptographically-random auth token (32 bytes, hex-encoded = 64 chars).
 pub fn generate_token() -> String {
@@ -53,5 +82,30 @@ mod tests {
     #[test]
     fn validate_different_lengths() {
         assert!(!validate_token("short", "longer-token"));
+    }
+
+    #[test]
+    fn persist_and_read_token() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // SAFETY: single-threaded test, no concurrent env access
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+
+        let token = generate_token();
+        let path = persist_token(&token).expect("persist_token");
+
+        // Verify path
+        assert_eq!(path, tmp.path().join("kmux").join("token"));
+
+        // Verify contents
+        let contents = std::fs::read_to_string(&path).expect("read token");
+        assert_eq!(contents, token);
+
+        // Verify file permissions (mode 0600)
+        use std::os::unix::fs::PermissionsExt as _;
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600, "token file must be mode 0600");
     }
 }
