@@ -24,8 +24,7 @@ pub enum ConnectResult {
 /// - Opens one bidirectional stream as the control channel
 /// - Accepts server-initiated unidirectional streams for per-session diffs
 ///
-/// The `server_tx` channel sends `ServerMessage` values back into the iced
-/// application loop.
+/// The `server_tx` channel sends `ServerMessage` values back to the caller.
 pub async fn connect(
     host: String,
     port: u16,

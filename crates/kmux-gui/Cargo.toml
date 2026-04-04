@@ -1,21 +1,17 @@
 [package]
-name = "kmux"
+name = "kmux-gui"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "kmux"
+name = "kmux-gui"
 path = "src/main.rs"
 
 [dependencies]
 kmux-client = { path = "../kmux-client" }
 kmux-protocol = { path = "../kmux-protocol", features = ["framing"] }
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
+iced = { version = "0.13", features = ["tokio", "canvas"] }
 tokio = { version = "1", features = ["full"] }
 clap = { version = "4", features = ["derive"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-cli-clipboard = "0.4"
-futures = "0.3"
-anyhow = "1"
