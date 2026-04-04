@@ -4,6 +4,12 @@ A terminal multiplexer and session manager with remote desktop capabilities.
 Connect to persistent terminal sessions over encrypted QUIC connections
 from a native desktop GUI.
 
+## Features
+
+TODO
+
+- [x] Linux and macOS support (no Windows for now)
+
 ## Architecture
 
 smux uses a server/client split:
