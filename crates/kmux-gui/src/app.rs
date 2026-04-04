@@ -38,6 +38,7 @@ struct ConnectParams {
     host: String,
     port: u16,
     token: String,
+    accept_invalid_certs: bool,
 }
 
 /// Which screen is currently shown.
@@ -168,6 +169,7 @@ pub struct kmuxApp {
     host: String,
     port: String,
     token: String,
+    accept_invalid_certs: bool,
     status_msg: String,
 
     // Reconnection state
@@ -192,11 +194,12 @@ pub struct kmuxApp {
 }
 
 impl kmuxApp {
-    pub fn new() -> Self {
+    pub fn new(accept_invalid_certs: bool) -> Self {
         Self {
             host: "127.0.0.1".to_string(),
             port: "8443".to_string(),
             token: read_local_token().unwrap_or_default(),
+            accept_invalid_certs,
             ..Default::default()
         }
     }
@@ -417,6 +420,7 @@ impl kmuxApp {
                     host: self.host.clone(),
                     port,
                     token: self.token.clone(),
+                    accept_invalid_certs: self.accept_invalid_certs,
                 });
                 self.status_msg = "Connecting...".to_string();
                 Task::none()
@@ -1075,7 +1079,7 @@ impl kmuxApp {
                     params.host.clone(),
                     params.port,
                     params.token.clone(),
-                    true,
+                    params.accept_invalid_certs,
                     srv_tx,
                 )
                 .await;

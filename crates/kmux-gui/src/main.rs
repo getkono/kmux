@@ -25,11 +25,11 @@ fn main() -> iced::Result {
         )
         .init();
 
-    let _cli = Cli::parse();
+    let cli = Cli::parse();
 
     iced::application("kmux -- remote terminal", kmuxApp::update, kmuxApp::view)
         .subscription(kmuxApp::subscription)
         .theme(kmuxApp::theme)
         .window_size((1024.0, 768.0))
-        .run_with(|| (kmuxApp::new(), iced::Task::none()))
+        .run_with(move || (kmuxApp::new(cli.accept_invalid_certs), iced::Task::none()))
 }
