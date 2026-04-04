@@ -1,11 +1,11 @@
-# smux
+# kmux
 
 A terminal multiplexer / session manager with remote desktop capabilities.
 
 ## Commands
 
-- Run server: `cargo run -p smux-server -- --self-signed`
-- Run client: `cargo run -p smux`
+- Run server: `cargo run -p kmux-server -- --self-signed`
+- Run client: `cargo run -p kmux`
 - Run tests: `just test`
 - Lint: `just clippy`
 - Lint fix: `just clippy-fix`

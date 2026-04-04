@@ -1,6 +1,6 @@
 # Performance Optimization Roadmap
 
-Architectural optimizations to make smux competitive with ssh+tmux in
+Architectural optimizations to make kmux competitive with ssh+tmux in
 efficiency, ordered from highest to lowest estimated impact.
 
 ---
@@ -28,15 +28,15 @@ full-grid snapshot. Clients apply diffs directly to their local grid
 without VT parsing.
 
 **Estimated effort:** Large. Requires a new `ServerMessage::CellDiff`
-variant in `smux-protocol`, server-side `Term` instances in `app.rs` /
+variant in `kmux-protocol`, server-side `Term` instances in `app.rs` /
 `relay.rs`, a diff algorithm, and client-side diff application logic. The
 existing `TerminalBuffer` on the client would become a thin grid store
 rather than a full VT parser.
 
 **Relevant code:**
-- `crates/smux-server/src/relay.rs:29-45` -- raw byte read + fan-out
-- `crates/smux-client/src/terminal_view.rs:67-69` -- `push_bytes()` VT parsing
-- `crates/smux-protocol/src/messages.rs:203-207` -- `PtyOutput { data: Vec<u8> }`
+- `crates/kmux-server/src/relay.rs:29-45` -- raw byte read + fan-out
+- `crates/kmux-client/src/terminal_view.rs:67-69` -- `push_bytes()` VT parsing
+- `crates/kmux-protocol/src/messages.rs:203-207` -- `PtyOutput { data: Vec<u8> }`
 
 ---
 
@@ -50,7 +50,7 @@ as a raw WebSocket binary frame. The `data: Vec<u8>` field in
 **Why it's slow:** Terminal output is highly compressible -- repeated
 whitespace, ANSI escape sequences, and structured text (logs, code) see
 3-10x compression ratios. SSH achieves this with optional zlib compression.
-smux sends every byte uncompressed, wasting bandwidth especially over
+kmux sends every byte uncompressed, wasting bandwidth especially over
 WAN links.
 
 **Proposed change:** Add per-connection streaming compression negotiated
@@ -65,9 +65,9 @@ negotiation logic in `connection.rs:57-83` (auth handler), and wrapping the
 sink/stream in `writer_loop` (line 354-368) and the client's `connect.rs`.
 
 **Relevant code:**
-- `crates/smux-protocol/src/frame.rs:23-24` -- `encode_server` / `to_allocvec`
-- `crates/smux-server/src/connection.rs:354-368` -- `writer_loop` sends raw bytes
-- `crates/smux-protocol/src/messages.rs:106-110` -- `Auth` message (negotiation point)
+- `crates/kmux-protocol/src/frame.rs:23-24` -- `encode_server` / `to_allocvec`
+- `crates/kmux-server/src/connection.rs:354-368` -- `writer_loop` sends raw bytes
+- `crates/kmux-protocol/src/messages.rs:106-110` -- `Auth` message (negotiation point)
 
 ---
 
@@ -96,9 +96,9 @@ add a `BytesMut` accumulator and a `tokio::time::Instant` deadline. No
 protocol changes required.
 
 **Relevant code:**
-- `crates/smux-server/src/relay.rs:27` -- `buf = vec![0u8; 4096]`
-- `crates/smux-server/src/relay.rs:29-45` -- immediate fan-out loop
-- `crates/smux-server/src/relay.rs:51-53` -- per-message mutex lock + clone
+- `crates/kmux-server/src/relay.rs:27` -- `buf = vec![0u8; 4096]`
+- `crates/kmux-server/src/relay.rs:29-45` -- immediate fan-out loop
+- `crates/kmux-server/src/relay.rs:51-53` -- per-message mutex lock + clone
 
 ---
 
@@ -128,9 +128,9 @@ client can split batched messages. Alternatively, use `sink.feed()` +
 `sink.flush()` to let tungstenite batch at the WS layer.
 
 **Relevant code:**
-- `crates/smux-server/src/connection.rs:354-368` -- `writer_loop`
-- `crates/smux-server/src/connection.rs:358-363` -- single-message recv + send
-- `crates/smux-server/src/connection.rs:160-191` -- scrollback replay burst
+- `crates/kmux-server/src/connection.rs:354-368` -- `writer_loop`
+- `crates/kmux-server/src/connection.rs:358-363` -- single-message recv + send
+- `crates/kmux-server/src/connection.rs:160-191` -- scrollback replay burst
 
 ---
 
@@ -158,15 +158,15 @@ fan-out. Serialization still requires a copy, but the fan-out clones become
 free.
 
 **Estimated effort:** Medium. Requires adding `bytes` as a dependency to
-`smux-protocol`, changing the `data` field type in `messages.rs:205`,
+`kmux-protocol`, changing the `data` field type in `messages.rs:205`,
 updating `relay.rs`, and ensuring `postcard` can serialize `Bytes` (may
 need a `serde_bytes` attribute or custom serialization).
 
 **Relevant code:**
-- `crates/smux-server/src/relay.rs:33` -- `to_vec()` allocation
-- `crates/smux-server/src/relay.rs:38` -- `chunk.clone()` for scrollback
-- `crates/smux-server/src/relay.rs:53` -- `msg.clone()` per client
-- `crates/smux-protocol/src/messages.rs:205` -- `data: Vec<u8>`
+- `crates/kmux-server/src/relay.rs:33` -- `to_vec()` allocation
+- `crates/kmux-server/src/relay.rs:38` -- `chunk.clone()` for scrollback
+- `crates/kmux-server/src/relay.rs:53` -- `msg.clone()` per client
+- `crates/kmux-protocol/src/messages.rs:205` -- `data: Vec<u8>`
 
 ---
 
@@ -206,9 +206,9 @@ bytes, and a mechanism to notify iced of updates (e.g. `iced::Command`
 that polls the generation counter).
 
 **Relevant code:**
-- `crates/smux-client/src/app.rs:409-413` -- synchronous `push_bytes` call
-- `crates/smux-client/src/terminal_view.rs:67-69` -- `push_bytes` + `advance`
-- `crates/smux-client/src/terminal_view.rs:130-181` -- `from_buffer` snapshot
+- `crates/kmux-client/src/app.rs:409-413` -- synchronous `push_bytes` call
+- `crates/kmux-client/src/terminal_view.rs:67-69` -- `push_bytes` + `advance`
+- `crates/kmux-client/src/terminal_view.rs:130-181` -- `from_buffer` snapshot
 
 ---
 
@@ -241,10 +241,10 @@ tricky part is hooking into alacritty_terminal's internal cursor tracking
 to know which rows were touched.
 
 **Relevant code:**
-- `crates/smux-client/src/terminal_view.rs:130-181` -- `from_buffer()` full copy
-- `crates/smux-client/src/terminal_view.rs:138-145` -- full grid pre-allocation
-- `crates/smux-client/src/terminal_view.rs:244-247` -- cache invalidation check
-- `crates/smux-client/src/terminal_view.rs:374` -- unconditional snapshot in `view()`
+- `crates/kmux-client/src/terminal_view.rs:130-181` -- `from_buffer()` full copy
+- `crates/kmux-client/src/terminal_view.rs:138-145` -- full grid pre-allocation
+- `crates/kmux-client/src/terminal_view.rs:244-247` -- cache invalidation check
+- `crates/kmux-client/src/terminal_view.rs:374` -- unconditional snapshot in `view()`
 
 ---
 
@@ -275,24 +275,24 @@ other optimizations -- most overhead comes from the items above, not WS
 framing.
 
 **Relevant code:**
-- `crates/smux-server/src/connection.rs:19` -- `WsStream` type alias
-- `crates/smux-server/src/connection.rs:288-289` -- WebSocket split
-- `crates/smux-server/src/connection.rs:354-368` -- `writer_loop` WS send
-- `crates/smux-server/src/tls.rs` -- TLS acceptor setup
+- `crates/kmux-server/src/connection.rs:19` -- `WsStream` type alias
+- `crates/kmux-server/src/connection.rs:288-289` -- WebSocket split
+- `crates/kmux-server/src/connection.rs:354-368` -- `writer_loop` WS send
+- `crates/kmux-server/src/tls.rs` -- TLS acceptor setup
 
 ---
 
 ## Summary Matrix
 
-| # | Optimization | Bandwidth | Latency | CPU | Effort | Multi-client |
-|---|---|---|---|---|---|---|
-| 1 | Server-side VT + diffs | +++ | + | ++ | Large | +++ |
-| 2 | Streaming compression | +++ | - | - | Medium | ++ |
-| 3 | Output coalescing | + | - | ++ | Small | ++ |
-| 4 | WS frame batching | + | + | ++ | Small | + |
-| 5 | Zero-copy Bytes | -- | + | ++ | Medium | ++ |
-| 6 | Background VT parsing | -- | ++ | + | Medium | -- |
-| 7 | Incremental snapshots | -- | ++ | ++ | Small-Med | -- |
-| 8 | Raw TLS transport | + | + | + | Large | + |
+| #   | Optimization           | Bandwidth | Latency | CPU | Effort    | Multi-client |
+| --- | ---------------------- | --------- | ------- | --- | --------- | ------------ |
+| 1   | Server-side VT + diffs | +++       | +       | ++  | Large     | +++          |
+| 2   | Streaming compression  | +++       | -       | -   | Medium    | ++           |
+| 3   | Output coalescing      | +         | -       | ++  | Small     | ++           |
+| 4   | WS frame batching      | +         | +       | ++  | Small     | +            |
+| 5   | Zero-copy Bytes        | --        | +       | ++  | Medium    | ++           |
+| 6   | Background VT parsing  | --        | ++      | +   | Medium    | --           |
+| 7   | Incremental snapshots  | --        | ++      | ++  | Small-Med | --           |
+| 8   | Raw TLS transport      | +         | +       | +   | Large     | +            |
 
 Legend: `+++` major improvement, `++` moderate, `+` minor, `--` no change, `-` minor regression (e.g. compression adds CPU)

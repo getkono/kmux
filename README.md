@@ -1,4 +1,4 @@
-# smux
+# kmux
 
 A terminal multiplexer and session manager with remote desktop capabilities.
 Connect to persistent terminal sessions over encrypted QUIC connections
@@ -12,22 +12,22 @@ TODO
 
 ## Architecture
 
-smux uses a server/client split:
+kmux uses a server/client split:
 
-| Crate | Role |
-|-------|------|
-| [`smux-pty`](crates/smux-pty) | Async PTY lifecycle library (spawn, I/O, resize, shutdown) |
-| [`smux-protocol`](crates/smux-protocol) | Shared wire protocol with postcard serialization |
-| [`smux-server`](crates/smux-server) | Background daemon — manages PTY sessions, accepts QUIC+TLS connections |
-| [`smux`](crates/smux) | Desktop GUI client built on [iced](https://github.com/iced-rs/iced) |
+| Crate                                   | Role                                                                   |
+| --------------------------------------- | ---------------------------------------------------------------------- |
+| [`kmux-pty`](crates/kmux-pty)           | Async PTY lifecycle library (spawn, I/O, resize, shutdown)             |
+| [`kmux-protocol`](crates/kmux-protocol) | Shared wire protocol with postcard serialization                       |
+| [`kmux-server`](crates/kmux-server)     | Background daemon — manages PTY sessions, accepts QUIC+TLS connections |
+| [`kmux`](crates/kmux)                   | Desktop GUI client built on [iced](https://github.com/iced-rs/iced)    |
 
 ```
-smux-server  ->  smux-pty
-smux-server  ->  smux-protocol
-smux         ->  smux-protocol
+kmux-server  ->  kmux-pty
+kmux-server  ->  kmux-protocol
+kmux         ->  kmux-protocol
 ```
 
-The client talks to the server over QUIC+TLS. It does not depend on `smux-pty`
+The client talks to the server over QUIC+TLS. It does not depend on `kmux-pty`
 directly.
 
 ## Prerequisites
@@ -39,13 +39,13 @@ directly.
 Start the server with a self-signed certificate:
 
 ```bash
-$ cargo run -p smux-server -- --self-signed
+$ cargo run -p kmux-server -- --self-signed
 ```
 
 The server prints a shared auth token on startup. Connect the GUI client:
 
 ```bash
-$ cargo run -p smux
+$ cargo run -p kmux
 ```
 
 By default, the server binds to `0.0.0.0:8443`.

@@ -2003,6 +2003,65 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e2db585e1d738fc771bf08a151420d3ed193d9d895a36df7f6f8a9456b911ddc"
 
 [[package]]
+name = "kmux"
+version = "0.1.0"
+dependencies = [
+ "clap",
+ "iced",
+ "kmux-protocol",
+ "quinn",
+ "rustls",
+ "rustls-native-certs",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
+name = "kmux-protocol"
+version = "0.1.0"
+dependencies = [
+ "postcard",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
+name = "kmux-pty"
+version = "0.1.0"
+dependencies = [
+ "nix 0.31.2",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-test",
+ "tracing",
+]
+
+[[package]]
+name = "kmux-server"
+version = "0.1.0"
+dependencies = [
+ "alacritty_terminal",
+ "anyhow",
+ "clap",
+ "kmux-protocol",
+ "kmux-pty",
+ "nix 0.31.2",
+ "quinn",
+ "rand 0.9.2",
+ "rcgen",
+ "rustls",
+ "rustls-pemfile",
+ "termwiz",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kurbo"
 version = "0.10.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3964,65 +4023,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "dd538fb6910ac1099850255cf94a94df6551fbdd602454387d0adb2d1ca6dead"
 dependencies = [
  "serde",
-]
-
-[[package]]
-name = "smux"
-version = "0.1.0"
-dependencies = [
- "clap",
- "iced",
- "quinn",
- "rustls",
- "rustls-native-certs",
- "smux-protocol",
- "tokio",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
-name = "smux-protocol"
-version = "0.1.0"
-dependencies = [
- "postcard",
- "serde",
- "thiserror 2.0.18",
- "tokio",
-]
-
-[[package]]
-name = "smux-pty"
-version = "0.1.0"
-dependencies = [
- "nix 0.31.2",
- "serde",
- "thiserror 2.0.18",
- "tokio",
- "tokio-test",
- "tracing",
-]
-
-[[package]]
-name = "smux-server"
-version = "0.1.0"
-dependencies = [
- "alacritty_terminal",
- "anyhow",
- "clap",
- "nix 0.31.2",
- "quinn",
- "rand 0.9.2",
- "rcgen",
- "rustls",
- "rustls-pemfile",
- "smux-protocol",
- "smux-pty",
- "termwiz",
- "thiserror 2.0.18",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]
