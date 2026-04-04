@@ -2,10 +2,10 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
-use kmux_pty::session::PtyReader;
 use kmux_protocol::messages::{
     ClientId, CursorState, SequenceNo, ServerMessage, TermModes, TerminalDiff, epoch_millis,
 };
+use kmux_pty::session::PtyReader;
 use tracing::{debug, warn};
 
 use crate::app::ClientMap;

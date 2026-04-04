@@ -24,6 +24,10 @@ pub struct TermwizBackend {
     app_cursor: bool,
     bracketed_paste: bool,
     alt_screen: bool,
+    mouse_report_click: bool,
+    mouse_drag: bool,
+    mouse_motion: bool,
+    sgr_mouse: bool,
     rows: u16,
     cols: u16,
 }
@@ -37,6 +41,10 @@ impl TermwizBackend {
             app_cursor: false,
             bracketed_paste: false,
             alt_screen: false,
+            mouse_report_click: false,
+            mouse_drag: false,
+            mouse_motion: false,
+            sgr_mouse: false,
             rows,
             cols,
         }
@@ -346,6 +354,18 @@ impl TermwizBackend {
                         .add_change(Change::ClearScreen(Default::default()));
                 }
             }
+            DecPrivateModeCode::MouseTracking => {
+                self.mouse_report_click = enable;
+            }
+            DecPrivateModeCode::ButtonEventMouse => {
+                self.mouse_drag = enable;
+            }
+            DecPrivateModeCode::AnyEventMouse => {
+                self.mouse_motion = enable;
+            }
+            DecPrivateModeCode::SGRMouse => {
+                self.sgr_mouse = enable;
+            }
             _ => {}
         }
     }
@@ -478,6 +498,18 @@ impl TerminalBackend for TermwizBackend {
         }
         if self.bracketed_paste {
             bits |= TermModes::BRACKETED_PASTE;
+        }
+        if self.mouse_report_click {
+            bits |= TermModes::MOUSE_REPORT_CLICK;
+        }
+        if self.mouse_drag {
+            bits |= TermModes::MOUSE_DRAG;
+        }
+        if self.mouse_motion {
+            bits |= TermModes::MOUSE_MOTION;
+        }
+        if self.sgr_mouse {
+            bits |= TermModes::SGR_MOUSE;
         }
         TermModes(bits)
     }

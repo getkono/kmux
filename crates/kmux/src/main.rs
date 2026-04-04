@@ -23,9 +23,7 @@ struct Cli {
 
 fn main() -> iced::Result {
     tracing_subscriber::fmt()
-        .with_env_filter(
-            EnvFilter::from_default_env().add_directive("kmux=info".parse().unwrap()),
-        )
+        .with_env_filter(EnvFilter::from_default_env().add_directive("kmux=info".parse().unwrap()))
         .init();
 
     let _cli = Cli::parse();

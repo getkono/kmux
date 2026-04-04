@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// Current wire protocol version. Increment when breaking changes are made.
-pub const PROTOCOL_VERSION: u32 = 8;
+pub const PROTOCOL_VERSION: u32 = 9;
 
 /// Return the current wall-clock time as milliseconds since the Unix epoch.
 pub fn epoch_millis() -> u64 {
@@ -204,6 +204,10 @@ impl Default for CursorState {
 ///
 /// Bit 0: APP_CURSOR (application cursor keys mode).
 /// Bit 1: BRACKETED_PASTE (DEC private mode 2004).
+/// Bit 2: MOUSE_REPORT_CLICK (DEC mode 1000 — normal mouse tracking).
+/// Bit 3: MOUSE_DRAG (DEC mode 1002 — button-event tracking).
+/// Bit 4: MOUSE_MOTION (DEC mode 1003 — any-event tracking).
+/// Bit 5: SGR_MOUSE (DEC mode 1006 — SGR extended coordinates).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TermModes(pub u16);
 
@@ -211,6 +215,10 @@ impl TermModes {
     pub const EMPTY: Self = Self(0);
     pub const APP_CURSOR: u16 = 1 << 0;
     pub const BRACKETED_PASTE: u16 = 1 << 1;
+    pub const MOUSE_REPORT_CLICK: u16 = 1 << 2;
+    pub const MOUSE_DRAG: u16 = 1 << 3;
+    pub const MOUSE_MOTION: u16 = 1 << 4;
+    pub const SGR_MOUSE: u16 = 1 << 5;
 
     pub fn app_cursor(self) -> bool {
         self.0 & Self::APP_CURSOR != 0
@@ -218,6 +226,16 @@ impl TermModes {
 
     pub fn bracketed_paste(self) -> bool {
         self.0 & Self::BRACKETED_PASTE != 0
+    }
+
+    /// Whether any mouse reporting mode is active (1000, 1002, or 1003).
+    pub fn mouse_report(self) -> bool {
+        self.0 & (Self::MOUSE_REPORT_CLICK | Self::MOUSE_DRAG | Self::MOUSE_MOTION) != 0
+    }
+
+    /// Whether SGR extended mouse coordinates are active (mode 1006).
+    pub fn sgr_mouse(self) -> bool {
+        self.0 & Self::SGR_MOUSE != 0
     }
 }
 
@@ -480,7 +498,14 @@ mod tests {
 
     #[test]
     fn term_modes_bits_no_overlap() {
-        let flags: &[u16] = &[TermModes::APP_CURSOR, TermModes::BRACKETED_PASTE];
+        let flags: &[u16] = &[
+            TermModes::APP_CURSOR,
+            TermModes::BRACKETED_PASTE,
+            TermModes::MOUSE_REPORT_CLICK,
+            TermModes::MOUSE_DRAG,
+            TermModes::MOUSE_MOTION,
+            TermModes::SGR_MOUSE,
+        ];
         for (i, a) in flags.iter().enumerate() {
             assert!(a.is_power_of_two(), "flag {i} is not a single bit: {a}");
             for (j, b) in flags.iter().enumerate() {
@@ -504,6 +529,19 @@ mod tests {
         let both = TermModes(TermModes::APP_CURSOR | TermModes::BRACKETED_PASTE);
         assert!(both.app_cursor());
         assert!(both.bracketed_paste());
+
+        let mouse = TermModes(TermModes::MOUSE_REPORT_CLICK | TermModes::SGR_MOUSE);
+        assert!(mouse.mouse_report());
+        assert!(mouse.sgr_mouse());
+        assert!(!mouse.app_cursor());
+
+        let empty = TermModes::EMPTY;
+        assert!(!empty.mouse_report());
+        assert!(!empty.sgr_mouse());
+
+        let drag = TermModes(TermModes::MOUSE_DRAG);
+        assert!(drag.mouse_report());
+        assert!(!drag.sgr_mouse());
     }
 
     #[test]

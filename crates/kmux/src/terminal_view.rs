@@ -256,6 +256,11 @@ impl CellGrid {
         self.modes.app_cursor()
     }
 
+    /// Current terminal mode flags.
+    pub fn modes(&self) -> TermModes {
+        self.modes
+    }
+
     /// Reset to blank cells.
     pub fn clear(&mut self) {
         self.cells.fill(CellState::default());
@@ -472,6 +477,7 @@ pub struct GridView<'a> {
     scroll_offset: usize,
     scrollback: &'a ScrollbackBuffer,
     selection: Option<Selection>,
+    modes: TermModes,
 }
 
 impl<'a> GridView<'a> {
@@ -491,6 +497,7 @@ impl<'a> GridView<'a> {
             scroll_offset: grid.scroll_offset,
             scrollback: &grid.scrollback,
             selection: grid.selection,
+            modes: grid.modes,
         }
     }
 }
@@ -721,10 +728,29 @@ impl<'a> canvas::Program<Message> for GridView<'a> {
                 mouse::ScrollDelta::Pixels { y, .. } => (*y / CELL_HEIGHT) as i32,
             };
             if lines != 0 {
-                return (
-                    canvas::event::Status::Captured,
-                    Some(Message::ScrollTerminal(lines)),
-                );
+                if self.modes.mouse_report() {
+                    // Mouse reporting active: forward scroll to PTY as escape sequences.
+                    let (col, row) = if let Some(pos) = cursor.position_in(bounds) {
+                        let c = (pos.x / CELL_WIDTH).floor() as u16;
+                        let r = (pos.y / CELL_HEIGHT).floor() as u16;
+                        (
+                            c.min(self.cols as u16 - 1) + 1,
+                            r.min(self.rows as u16 - 1) + 1,
+                        )
+                    } else {
+                        (1, 1)
+                    };
+                    return (
+                        canvas::event::Status::Captured,
+                        Some(Message::ForwardMouseScroll { col, row, lines }),
+                    );
+                } else {
+                    // No mouse reporting: local scrollback navigation.
+                    return (
+                        canvas::event::Status::Captured,
+                        Some(Message::ScrollTerminal(lines)),
+                    );
+                }
             }
         }
 

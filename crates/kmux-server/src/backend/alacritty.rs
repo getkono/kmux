@@ -113,12 +113,25 @@ impl TerminalBackend for AlacrittyBackend {
     }
 
     fn modes(&self) -> TermModes {
+        let mode = self.term.mode();
         let mut bits: u16 = 0;
-        if self.term.mode().contains(TermMode::APP_CURSOR) {
+        if mode.contains(TermMode::APP_CURSOR) {
             bits |= TermModes::APP_CURSOR;
         }
-        if self.term.mode().contains(TermMode::BRACKETED_PASTE) {
+        if mode.contains(TermMode::BRACKETED_PASTE) {
             bits |= TermModes::BRACKETED_PASTE;
+        }
+        if mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+            bits |= TermModes::MOUSE_REPORT_CLICK;
+        }
+        if mode.contains(TermMode::MOUSE_DRAG) {
+            bits |= TermModes::MOUSE_DRAG;
+        }
+        if mode.contains(TermMode::MOUSE_MOTION) {
+            bits |= TermModes::MOUSE_MOTION;
+        }
+        if mode.contains(TermMode::SGR_MOUSE) {
+            bits |= TermModes::SGR_MOUSE;
         }
         TermModes(bits)
     }
@@ -137,6 +150,18 @@ impl TerminalBackend for AlacrittyBackend {
         }
         if content.mode.contains(TermMode::BRACKETED_PASTE) {
             mode_bits |= TermModes::BRACKETED_PASTE;
+        }
+        if content.mode.contains(TermMode::MOUSE_REPORT_CLICK) {
+            mode_bits |= TermModes::MOUSE_REPORT_CLICK;
+        }
+        if content.mode.contains(TermMode::MOUSE_DRAG) {
+            mode_bits |= TermModes::MOUSE_DRAG;
+        }
+        if content.mode.contains(TermMode::MOUSE_MOTION) {
+            mode_bits |= TermModes::MOUSE_MOTION;
+        }
+        if content.mode.contains(TermMode::SGR_MOUSE) {
+            mode_bits |= TermModes::SGR_MOUSE;
         }
         let modes = TermModes(mode_bits);
 
@@ -534,6 +559,42 @@ mod tests {
         assert!(
             !ts.modes().bracketed_paste(),
             "bracketed paste should be off after \\e[?2004l"
+        );
+    }
+
+    #[test]
+    fn mouse_report_click_mode_enable_disable() {
+        let mut ts = DiffEngine::new(AlacrittyBackend::new(24, 80));
+
+        assert!(
+            !ts.modes().mouse_report(),
+            "mouse reporting should be off by default"
+        );
+
+        // Enable DEC 1000 (normal mouse tracking)
+        ts.feed(b"\x1b[?1000h");
+        assert!(
+            ts.modes().mouse_report(),
+            "mouse reporting should be on after \\e[?1000h"
+        );
+        assert!(!ts.modes().sgr_mouse(), "SGR mouse should still be off");
+
+        // Enable SGR mouse (DEC 1006)
+        ts.feed(b"\x1b[?1006h");
+        assert!(
+            ts.modes().sgr_mouse(),
+            "SGR mouse should be on after \\e[?1006h"
+        );
+
+        // Disable both
+        ts.feed(b"\x1b[?1000l\x1b[?1006l");
+        assert!(
+            !ts.modes().mouse_report(),
+            "mouse reporting should be off after \\e[?1000l"
+        );
+        assert!(
+            !ts.modes().sgr_mouse(),
+            "SGR mouse should be off after \\e[?1006l"
         );
     }
 

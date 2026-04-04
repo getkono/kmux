@@ -2,11 +2,11 @@ use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use quinn::Connection;
 use kmux_protocol::messages::{
     ClientId, ClientMessage, ErrorCode, ServerMessage, SessionEventMsg, epoch_millis,
 };
 use kmux_protocol::{decode_client, encode_server, read_frame, write_frame};
+use quinn::Connection;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};

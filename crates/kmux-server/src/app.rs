@@ -2,15 +2,15 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use kmux_protocol::messages::{
+    ClientId, GridSnapshot, InputMode, SequenceNo, ServerMessage, SessionInfo, SessionStatus,
+    TermSize, TerminalDiff,
+};
 use kmux_pty::config::{PtyConfig, WindowSize};
 use kmux_pty::error::{Result, kmuxError};
 use kmux_pty::events::SessionEvent;
 use kmux_pty::registry::SessionManager;
 use kmux_pty::session::PtyWriter;
-use kmux_protocol::messages::{
-    ClientId, GridSnapshot, InputMode, SequenceNo, ServerMessage, SessionInfo, SessionStatus,
-    TermSize, TerminalDiff,
-};
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::warn;
 
