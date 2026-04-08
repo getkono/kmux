@@ -15,7 +15,10 @@ backend-termwiz = ["dep:termwiz"]
 [dependencies]
 kmux-pty.workspace = true
 kmux-protocol = { workspace = true, features = ["framing"] }
+daemonize.workspace = true
 nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 alacritty_terminal = { workspace = true, optional = true }
 termwiz = { workspace = true, optional = true }
 tokio.workspace = true

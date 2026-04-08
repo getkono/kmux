@@ -3,7 +3,7 @@ use std::time::Duration;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::time::timeout;
 
-use crate::error::{Result, kmuxError};
+use crate::error::{KmuxError, Result};
 use crate::session::PtySession;
 
 /// Expect-style helpers for interactive PTY sessions.
@@ -42,17 +42,17 @@ impl ExpectSession {
 
             let remaining = deadline.saturating_sub(start.elapsed());
             if remaining.is_zero() {
-                return Err(kmuxError::Timeout);
+                return Err(KmuxError::Timeout);
             }
 
             // Read more output
             let n = timeout(remaining, self.session.read(&mut read_buf))
                 .await
-                .map_err(|_| kmuxError::Timeout)?
-                .map_err(kmuxError::Io)?;
+                .map_err(|_| KmuxError::Timeout)?
+                .map_err(KmuxError::Io)?;
 
             if n == 0 {
-                return Err(kmuxError::Closed);
+                return Err(KmuxError::Closed);
             }
             self.buffer.extend_from_slice(&read_buf[..n]);
         }
@@ -62,12 +62,12 @@ impl ExpectSession {
     pub async fn send_line(&mut self, line: &str) -> Result<()> {
         let mut data = line.as_bytes().to_vec();
         data.extend_from_slice(b"\r\n");
-        self.session.write_all(&data).await.map_err(kmuxError::Io)
+        self.session.write_all(&data).await.map_err(KmuxError::Io)
     }
 
     /// Send raw bytes to the PTY.
     pub async fn send(&mut self, data: &[u8]) -> Result<()> {
-        self.session.write_all(data).await.map_err(kmuxError::Io)
+        self.session.write_all(data).await.map_err(KmuxError::Io)
     }
 
     /// Consume the `ExpectSession` and return the inner `PtySession`.

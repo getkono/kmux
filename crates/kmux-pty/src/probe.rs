@@ -2,7 +2,7 @@ use std::time::Duration;
 
 use tokio::time::timeout;
 
-use crate::error::{Result, kmuxError};
+use crate::error::{KmuxError, Result};
 
 /// A readiness probe that checks if some condition is met.
 ///
@@ -14,7 +14,7 @@ pub type ProbeFn<T> = Box<dyn Fn(&T) -> bool + Send + Sync>;
 /// - `probe`: called with `target` on each poll tick
 /// - `target`: the thing being probed (e.g., buffered output so far)
 /// - `poll_interval`: how often to poll
-/// - `deadline`: maximum time to wait before returning `Err(kmuxError::Timeout)`
+/// - `deadline`: maximum time to wait before returning `Err(KmuxError::Timeout)`
 pub async fn wait_until_ready<T: Send>(
     target: &T,
     probe: &ProbeFn<T>,
@@ -31,7 +31,7 @@ pub async fn wait_until_ready<T: Send>(
     })
     .await;
 
-    result.map_err(|_| kmuxError::Timeout)
+    result.map_err(|_| KmuxError::Timeout)
 }
 
 /// A string-match probe: ready when the output buffer contains `pattern`.
@@ -69,6 +69,6 @@ mod tests {
             Duration::from_millis(50),
         )
         .await;
-        assert!(matches!(result, Err(kmuxError::Timeout)));
+        assert!(matches!(result, Err(KmuxError::Timeout)));
     }
 }

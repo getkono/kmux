@@ -2,7 +2,7 @@ use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 use tokio::sync::watch;
 
-use crate::error::{Result, kmuxError};
+use crate::error::{KmuxError, Result};
 
 /// Rich exit status for a PTY child process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -57,7 +57,7 @@ pub fn blocking_wait(pid: Pid) -> Result<ExitStatus> {
             }
             Ok(_) => return Ok(ExitStatus::Unknown),
             Err(nix::Error::EINTR) => continue, // Interrupted, retry
-            Err(e) => return Err(kmuxError::Pty(e)),
+            Err(e) => return Err(KmuxError::Pty(e)),
         }
     }
 }

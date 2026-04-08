@@ -1,4 +1,4 @@
-use crate::error::{Result, kmuxError};
+use crate::error::{KmuxError, Result};
 use std::path::Path;
 
 /// Detect the user's preferred shell.
@@ -23,17 +23,17 @@ pub fn detect_shell() -> Result<String> {
 pub fn validate_shell(path: &str) -> Result<()> {
     let p = Path::new(path);
     if !p.exists() {
-        return Err(kmuxError::ShellNotFound {
+        return Err(KmuxError::ShellNotFound {
             path: path.to_string(),
         });
     }
     // Check execute permission via metadata
     use std::os::unix::fs::PermissionsExt;
-    let meta = std::fs::metadata(p).map_err(kmuxError::Io)?;
+    let meta = std::fs::metadata(p).map_err(KmuxError::Io)?;
     let mode = meta.permissions().mode();
     // Check owner/group/other execute bits (0o111)
     if mode & 0o111 == 0 {
-        return Err(kmuxError::ShellNotFound {
+        return Err(KmuxError::ShellNotFound {
             path: path.to_string(),
         });
     }

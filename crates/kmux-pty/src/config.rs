@@ -196,6 +196,6 @@ mod tests {
         assert_eq!(env.get("FOO").map(String::as_str), Some("bar"));
         // PATH should NOT be present since we didn't inherit
         // (unless the caller explicitly set it)
-        assert!(!env.contains_key("PATH") || env.get("FOO").is_some());
+        assert!(!env.contains_key("PATH") || env.contains_key("FOO"));
     }
 }

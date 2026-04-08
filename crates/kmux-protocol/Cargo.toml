@@ -7,7 +7,12 @@ edition = "2024"
 framing = ["dep:tokio"]
 
 [dependencies]
+anyhow.workspace = true
+nix = { workspace = true, features = ["user"] }
 serde.workspace = true
 postcard.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true

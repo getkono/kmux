@@ -6,7 +6,7 @@ use nix::unistd::{Pid, execve};
 use tokio::sync::watch;
 
 use crate::config::{PtyConfig, WindowSize};
-use crate::error::{Result, kmuxError};
+use crate::error::{KmuxError, Result};
 use crate::io::PtyMasterIo;
 use crate::platform::to_winsize;
 use crate::process::{ExitStatus, spawn_wait_task};
@@ -34,14 +34,14 @@ impl PtyProcess {
 
         // Prepare C strings for exec
         let program = CString::new(config.program.as_str())
-            .map_err(|_| kmuxError::Spawn("program name contains null byte".into()))?;
+            .map_err(|_| KmuxError::Spawn("program name contains null byte".into()))?;
 
         let mut argv: Vec<CString> = Vec::with_capacity(config.args.len() + 1);
         argv.push(program.clone());
         for arg in &config.args {
             argv.push(
                 CString::new(arg.as_str())
-                    .map_err(|_| kmuxError::Spawn(format!("arg contains null byte: {arg}")))?,
+                    .map_err(|_| KmuxError::Spawn(format!("arg contains null byte: {arg}")))?,
             );
         }
 
@@ -49,19 +49,19 @@ impl PtyProcess {
             .iter()
             .map(|(k, v)| {
                 CString::new(format!("{k}={v}").as_str())
-                    .map_err(|_| kmuxError::Spawn("env var contains null byte".into()))
+                    .map_err(|_| KmuxError::Spawn("env var contains null byte".into()))
             })
             .collect::<Result<Vec<_>>>()?;
 
         // Change working directory if specified
         if let Some(cwd) = &config.cwd {
-            std::env::set_current_dir(cwd).map_err(kmuxError::Io)?;
+            std::env::set_current_dir(cwd).map_err(KmuxError::Io)?;
         }
 
         // SAFETY: forkpty is unsafe; we uphold the contract by not using
         // tokio/threads in the child before exec, and by not sharing the
         // master fd across threads before returning from this function.
-        let fork_result = unsafe { forkpty(Some(&winsize), None) }.map_err(kmuxError::Pty)?;
+        let fork_result = unsafe { forkpty(Some(&winsize), None) }.map_err(KmuxError::Pty)?;
 
         match fork_result {
             ForkptyResult::Child => {
@@ -73,7 +73,7 @@ impl PtyProcess {
             }
             ForkptyResult::Parent { child, master } => {
                 let master_fd: RawFd = master.into_raw_fd();
-                let io = PtyMasterIo::new(master_fd).map_err(kmuxError::Io)?;
+                let io = PtyMasterIo::new(master_fd).map_err(KmuxError::Io)?;
                 let exit_rx = spawn_wait_task(child);
                 Ok(PtyProcess {
                     io,

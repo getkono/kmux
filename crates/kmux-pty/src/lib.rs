@@ -7,10 +7,10 @@
 //! # Quick start
 //!
 //! ```rust,no_run
-//! use kmux::{PtyConfig, oneshot};
+//! use kmux_pty::{PtyConfig, oneshot};
 //!
 //! #[tokio::main]
-//! async fn main() -> kmux::Result<()> {
+//! async fn main() -> kmux_pty::Result<()> {
 //!     let config = PtyConfig::new("/bin/echo").args(["hello, kmux!"]);
 //!     let output = oneshot::run(&config).await?;
 //!     println!("{}", output.stdout_str());
@@ -39,7 +39,7 @@ pub mod timeout;
 
 // Re-exports for ergonomic top-level usage
 pub use config::{EnvBuilder, EnvMode, PtyConfig, TimeoutConfig, WindowSize};
-pub use error::{Result, kmuxError};
+pub use error::{KmuxError, Result};
 pub use events::{EventBus, SessionEvent, TimeoutKind};
 pub use expect::ExpectSession;
 pub use mock::{MockPty, MockPtyHandle};

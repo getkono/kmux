@@ -6,7 +6,7 @@ use crate::platform::set_winsize;
 
 /// Resize a PTY by issuing `TIOCSWINSZ` on the master fd.
 pub fn resize_pty(fd: RawFd, size: WindowSize) -> Result<()> {
-    set_winsize(fd, size).map_err(crate::error::kmuxError::Pty)
+    set_winsize(fd, size).map_err(crate::error::KmuxError::Pty)
 }
 
 #[cfg(test)]

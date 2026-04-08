@@ -1004,6 +1004,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "daemonize"
+version = "0.5.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ab8bfdaacb3c887a54d41bdf48d3af8873b3f5566469f8ba21b92057509f116e"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "dark-light"
 version = "1.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2213,11 +2222,16 @@ dependencies = [
 name = "kmux-client"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "bitflags 2.11.0",
  "kmux-protocol",
+ "nix 0.31.2",
  "quinn",
  "rustls",
  "rustls-native-certs",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -2239,8 +2253,11 @@ dependencies = [
 name = "kmux-protocol"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
+ "nix 0.31.2",
  "postcard",
  "serde",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
 ]
@@ -2264,6 +2281,7 @@ dependencies = [
  "alacritty_terminal",
  "anyhow",
  "clap",
+ "daemonize",
  "kmux-protocol",
  "kmux-pty",
  "nix 0.31.2",
@@ -2272,6 +2290,8 @@ dependencies = [
  "rcgen",
  "rustls",
  "rustls-pemfile",
+ "serde",
+ "serde_json",
  "tempfile",
  "termwiz",
  "thiserror 2.0.18",

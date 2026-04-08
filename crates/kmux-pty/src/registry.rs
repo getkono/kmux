@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::Mutex;
 
 use crate::config::{PtyConfig, WindowSize};
-use crate::error::{Result, kmuxError};
+use crate::error::{KmuxError, Result};
 use crate::events::{EventBus, SessionEvent};
 use crate::process::ExitStatus;
 use crate::session::PtySession;
@@ -42,7 +42,7 @@ impl SessionManager {
         let name = name.into();
         let mut sessions = self.sessions.lock().await;
         if sessions.contains_key(&name) {
-            return Err(kmuxError::SessionAlreadyExists { name });
+            return Err(KmuxError::SessionAlreadyExists { name });
         }
         let session = PtySession::spawn(config)?;
         self.events
@@ -57,7 +57,7 @@ impl SessionManager {
             let mut sessions = self.sessions.lock().await;
             sessions
                 .remove(name)
-                .ok_or_else(|| kmuxError::SessionNotFound {
+                .ok_or_else(|| KmuxError::SessionNotFound {
                     name: name.to_string(),
                 })?
         };
@@ -98,7 +98,7 @@ impl SessionManager {
             .await
             .get(name)
             .cloned()
-            .ok_or_else(|| kmuxError::SessionNotFound {
+            .ok_or_else(|| KmuxError::SessionNotFound {
                 name: name.to_string(),
             })
     }
@@ -108,7 +108,7 @@ impl SessionManager {
         let sessions = self.sessions.lock().await;
         let session = sessions
             .get(name)
-            .ok_or_else(|| kmuxError::SessionNotFound {
+            .ok_or_else(|| KmuxError::SessionNotFound {
                 name: name.to_string(),
             })?;
         session.resize(size).await?;

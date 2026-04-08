@@ -1,23 +1,13 @@
 use std::io::Write as _;
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 
 use rand::RngCore;
 
-/// Persist `token` to `$XDG_RUNTIME_DIR/kmux/token` with mode 0600.
-/// The directory is created with mode 0700 if it does not exist.
+/// Persist `token` to the kmux runtime token file with mode 0600.
 /// Returns the path on success.
 pub fn persist_token(token: &str) -> anyhow::Result<PathBuf> {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR")
-        .map_err(|_| anyhow::anyhow!("XDG_RUNTIME_DIR is not set"))?;
-
-    let token_dir = PathBuf::from(&runtime_dir).join("kmux");
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(&token_dir)?;
-
-    let token_path = token_dir.join("token");
+    let token_path = kmux_protocol::dirs::token_path()?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)

@@ -1,4 +1,5 @@
 pub mod connect;
+pub mod daemon;
 pub mod event_log;
 pub mod grid;
 pub mod input;

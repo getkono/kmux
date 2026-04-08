@@ -657,16 +657,13 @@ mod tests {
         // Exit alt screen (RMCUP) -- should NOT re-send existing scrollback.
         ts.feed(b"\x1b[?1049l");
         let diff = ts.compute_diff();
-        match diff {
-            DiffResult::CellDiff(d) => {
-                assert!(
-                    d.scrollback_lines.is_empty(),
-                    "exiting alt screen should not re-send {} scrollback lines",
-                    d.scrollback_lines.len()
-                );
-            }
-            // CursorOnly or None are also acceptable.
-            _ => {}
+        if let DiffResult::CellDiff(d) = diff {
+            assert!(
+                d.scrollback_lines.is_empty(),
+                "exiting alt screen should not re-send {} scrollback lines",
+                d.scrollback_lines.len()
+            );
         }
+        // CursorOnly or None are also acceptable.
     }
 }

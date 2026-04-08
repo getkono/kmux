@@ -3,7 +3,7 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 use tokio::time;
 
-use crate::error::kmuxError;
+use crate::error::KmuxError;
 use crate::process::ExitStatus;
 
 /// Timeout enforcement for PTY sessions.
@@ -30,16 +30,16 @@ impl TimeoutEnforcer {
     }
 
     /// Check if any timeout has elapsed. Returns the appropriate error if so.
-    pub fn check(&self, started_at: Instant) -> Option<kmuxError> {
+    pub fn check(&self, started_at: Instant) -> Option<KmuxError> {
         if let Some(wall) = self.wall_clock
             && started_at.elapsed() >= wall
         {
-            return Some(kmuxError::Timeout);
+            return Some(KmuxError::Timeout);
         }
         if let Some(idle) = self.idle {
             let elapsed = self.last_activity.elapsed();
             if elapsed >= idle {
-                return Some(kmuxError::IdleTimeout {
+                return Some(KmuxError::IdleTimeout {
                     seconds: elapsed.as_secs(),
                 });
             }
@@ -55,7 +55,7 @@ impl TimeoutEnforcer {
         idle_duration: Option<Duration>,
         pid: nix::unistd::Pid,
         exit_rx: watch::Receiver<Option<ExitStatus>>,
-    ) -> watch::Receiver<Option<kmuxError>> {
+    ) -> watch::Receiver<Option<KmuxError>> {
         let (tx, rx) = watch::channel(None);
 
         tokio::spawn(async move {
@@ -76,7 +76,7 @@ impl TimeoutEnforcer {
                     && started.elapsed() >= wall
                 {
                     let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-                    let _ = tx.send(Some(kmuxError::Timeout));
+                    let _ = tx.send(Some(KmuxError::Timeout));
                     break;
                 }
 

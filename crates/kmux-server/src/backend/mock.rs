@@ -7,6 +7,7 @@ use super::TerminalBackend;
 /// `feed()` records input bytes for assertion but does not parse VTE.
 /// Set `cells`, `cursor_state`, and `mode_flags` directly to control
 /// what `DiffEngine` sees on the next `compute_diff()` call.
+#[allow(dead_code)]
 pub struct MockBackend {
     pub cells: Vec<CellState>,
     pub cursor_state: CursorState,
@@ -19,6 +20,7 @@ pub struct MockBackend {
     cols: u16,
 }
 
+#[allow(dead_code)]
 impl MockBackend {
     pub fn new(rows: u16, cols: u16) -> Self {
         let n = rows as usize * cols as usize;

@@ -7,7 +7,7 @@ use kmux_protocol::messages::{
     TermSize, TerminalDiff,
 };
 use kmux_pty::config::{PtyConfig, WindowSize};
-use kmux_pty::error::{Result, kmuxError};
+use kmux_pty::error::{KmuxError, Result};
 use kmux_pty::events::SessionEvent;
 use kmux_pty::registry::SessionManager;
 use kmux_pty::session::PtyWriter;
@@ -174,7 +174,7 @@ impl ServerApp {
         ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
     ) -> Result<AttachResult> {
         let relays = self.relays.read().await;
-        let relay = relays.get(name).ok_or_else(|| kmuxError::SessionNotFound {
+        let relay = relays.get(name).ok_or_else(|| KmuxError::SessionNotFound {
             name: name.to_string(),
         })?;
 
@@ -258,7 +258,7 @@ impl ServerApp {
     /// Forward user input bytes to a named session's PTY stdin.
     pub async fn write_input(&self, name: &str, client_id: ClientId, data: Vec<u8>) -> Result<()> {
         let relays = self.relays.read().await;
-        let relay = relays.get(name).ok_or_else(|| kmuxError::SessionNotFound {
+        let relay = relays.get(name).ok_or_else(|| KmuxError::SessionNotFound {
             name: name.to_string(),
         })?;
 
@@ -266,7 +266,7 @@ impl ServerApp {
             InputMode::Open => {}
             InputMode::Locked(holder) if *holder == client_id => {}
             InputMode::Locked(_) | InputMode::Disabled => {
-                return Err(kmuxError::Pty(nix::Error::EPERM));
+                return Err(KmuxError::Pty(nix::Error::EPERM));
             }
         }
 
@@ -279,7 +279,7 @@ impl ServerApp {
     /// is wrapped in `\x1b[200~` ... `\x1b[201~` escape sequences.
     pub async fn write_paste(&self, name: &str, client_id: ClientId, data: String) -> Result<()> {
         let relays = self.relays.read().await;
-        let relay = relays.get(name).ok_or_else(|| kmuxError::SessionNotFound {
+        let relay = relays.get(name).ok_or_else(|| KmuxError::SessionNotFound {
             name: name.to_string(),
         })?;
 
@@ -287,7 +287,7 @@ impl ServerApp {
             InputMode::Open => {}
             InputMode::Locked(holder) if *holder == client_id => {}
             InputMode::Locked(_) | InputMode::Disabled => {
-                return Err(kmuxError::Pty(nix::Error::EPERM));
+                return Err(KmuxError::Pty(nix::Error::EPERM));
             }
         }
 
@@ -331,7 +331,7 @@ impl ServerApp {
     pub async fn send_signal(&self, name: &str, signal: i32) -> Result<()> {
         use nix::sys::signal::Signal;
         let session = self.manager.get_session(name).await?;
-        let sig = Signal::try_from(signal).map_err(|_| kmuxError::Pty(nix::Error::EINVAL))?;
+        let sig = Signal::try_from(signal).map_err(|_| KmuxError::Pty(nix::Error::EINVAL))?;
         session.send_signal(sig).await
     }
 
@@ -344,7 +344,7 @@ impl ServerApp {
         let mut relays = self.relays.write().await;
         let relay = relays
             .get_mut(name)
-            .ok_or_else(|| kmuxError::SessionNotFound {
+            .ok_or_else(|| KmuxError::SessionNotFound {
                 name: name.to_string(),
             })?;
         match &relay.input_mode {
@@ -365,7 +365,7 @@ impl ServerApp {
         let mut relays = self.relays.write().await;
         let relay = relays
             .get_mut(name)
-            .ok_or_else(|| kmuxError::SessionNotFound {
+            .ok_or_else(|| KmuxError::SessionNotFound {
                 name: name.to_string(),
             })?;
         if relay.input_mode == InputMode::Locked(client_id) {
@@ -380,13 +380,13 @@ impl ServerApp {
     pub async fn rename_session(&self, old_name: &str, new_name: &str) -> Result<()> {
         let mut relays = self.relays.write().await;
         if relays.contains_key(new_name) {
-            return Err(kmuxError::SessionAlreadyExists {
+            return Err(KmuxError::SessionAlreadyExists {
                 name: new_name.to_string(),
             });
         }
         let relay = relays
             .remove(old_name)
-            .ok_or_else(|| kmuxError::SessionNotFound {
+            .ok_or_else(|| KmuxError::SessionNotFound {
                 name: old_name.to_string(),
             })?;
         relays.insert(new_name.to_string(), relay);

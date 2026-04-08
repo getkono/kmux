@@ -1,3 +1,4 @@
+pub mod dirs;
 pub mod frame;
 pub mod messages;
 

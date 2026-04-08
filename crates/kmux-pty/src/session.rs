@@ -7,7 +7,7 @@ use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::sync::Mutex;
 
 use crate::config::{PtyConfig, WindowSize};
-use crate::error::{Result, kmuxError};
+use crate::error::{KmuxError, Result};
 use crate::process::ExitStatus;
 use crate::pty::PtyProcess;
 use crate::shutdown::graceful_shutdown;
@@ -46,8 +46,8 @@ impl PtySession {
     /// completing `write_all`, and vice versa.
     pub async fn split(self) -> Result<(PtyReader, PtyWriter)> {
         let inner = self.inner.lock().await;
-        let reader_io = inner.pty.io.try_clone().map_err(kmuxError::Io)?;
-        let writer_io = inner.pty.io.try_clone().map_err(kmuxError::Io)?;
+        let reader_io = inner.pty.io.try_clone().map_err(KmuxError::Io)?;
+        let writer_io = inner.pty.io.try_clone().map_err(KmuxError::Io)?;
         drop(inner);
         Ok((
             PtyReader { io: reader_io },
@@ -91,7 +91,7 @@ impl PtySession {
             .io
             .read(buf)
             .await
-            .map_err(kmuxError::Io)
+            .map_err(KmuxError::Io)
     }
 
     /// Write bytes to the PTY input (child stdin).
@@ -107,7 +107,7 @@ impl PtySession {
             .io
             .write_all(data)
             .await
-            .map_err(kmuxError::Io)
+            .map_err(KmuxError::Io)
     }
 
     /// Send a Unix signal to the child process.
@@ -142,7 +142,7 @@ impl PtyWriter {
             .await
             .write_all(data)
             .await
-            .map_err(kmuxError::Io)
+            .map_err(KmuxError::Io)
     }
 }
 
@@ -150,7 +150,7 @@ impl PtyReader {
     /// Read available bytes from the PTY output.
     pub async fn read(&mut self, buf: &mut [u8]) -> Result<usize> {
         use tokio::io::AsyncReadExt;
-        self.io.read(buf).await.map_err(kmuxError::Io)
+        self.io.read(buf).await.map_err(KmuxError::Io)
     }
 }
 

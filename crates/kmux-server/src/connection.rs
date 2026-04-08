@@ -357,11 +357,11 @@ async fn send_frame(
 }
 
 /// Map kmux errors to protocol error codes.
-fn classify_error(e: &kmux_pty::error::kmuxError) -> ErrorCode {
+fn classify_error(e: &kmux_pty::error::KmuxError) -> ErrorCode {
     match e {
-        kmux_pty::error::kmuxError::SessionNotFound { .. } => ErrorCode::SessionNotFound,
-        kmux_pty::error::kmuxError::SessionAlreadyExists { .. } => ErrorCode::SessionAlreadyExists,
-        kmux_pty::error::kmuxError::Pty(err) if *err == nix::Error::EPERM => ErrorCode::InputLocked,
+        kmux_pty::error::KmuxError::SessionNotFound { .. } => ErrorCode::SessionNotFound,
+        kmux_pty::error::KmuxError::SessionAlreadyExists { .. } => ErrorCode::SessionAlreadyExists,
+        kmux_pty::error::KmuxError::Pty(err) if *err == nix::Error::EPERM => ErrorCode::InputLocked,
         _ => ErrorCode::InternalError,
     }
 }

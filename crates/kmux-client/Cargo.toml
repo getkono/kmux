@@ -5,9 +5,16 @@ edition = "2024"
 
 [dependencies]
 kmux-protocol = { workspace = true, features = ["framing"] }
+anyhow.workspace = true
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 tokio.workspace = true
 quinn.workspace = true
 rustls.workspace = true
 rustls-native-certs.workspace = true
 tracing.workspace = true
 bitflags.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

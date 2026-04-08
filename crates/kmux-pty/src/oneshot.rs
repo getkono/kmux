@@ -2,7 +2,7 @@ use tokio::io::AsyncReadExt;
 use tokio::time::timeout;
 
 use crate::config::PtyConfig;
-use crate::error::{Result, kmuxError};
+use crate::error::{KmuxError, Result};
 use crate::process::ExitStatus;
 use crate::pty::PtyProcess;
 
@@ -38,7 +38,7 @@ pub async fn run(config: &PtyConfig) -> Result<CommandOutput> {
     if let Some(deadline) = wall_clock {
         timeout(deadline, run_inner(config))
             .await
-            .map_err(|_| kmuxError::Timeout)?
+            .map_err(|_| KmuxError::Timeout)?
     } else {
         run_inner(config).await
     }
@@ -55,7 +55,7 @@ async fn run_inner(config: &PtyConfig) -> Result<CommandOutput> {
             Ok(0) => break,
             Ok(n) => output.extend_from_slice(&buf[..n]),
             Err(e) if is_eof_error(&e) => break,
-            Err(e) => return Err(kmuxError::Io(e)),
+            Err(e) => return Err(KmuxError::Io(e)),
         }
     }
 
@@ -103,7 +103,7 @@ mod tests {
             .wall_clock_timeout(Duration::from_millis(200));
         let result = run(&config).await;
         assert!(
-            matches!(result, Err(kmuxError::Timeout)),
+            matches!(result, Err(KmuxError::Timeout)),
             "expected Timeout, got {result:?}"
         );
     }

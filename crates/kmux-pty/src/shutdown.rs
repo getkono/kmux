@@ -5,7 +5,7 @@ use nix::sys::wait::{WaitPidFlag, waitpid};
 use nix::unistd::Pid;
 use tokio::time::timeout;
 
-use crate::error::{Result, kmuxError};
+use crate::error::{KmuxError, Result};
 use crate::process::ExitStatus;
 
 const DEFAULT_GRACE: Duration = Duration::from_secs(5);
@@ -65,7 +65,7 @@ async fn reap_blocking(pid: Pid) -> ExitStatus {
 
 /// Send a signal to a process.
 pub fn send_signal(pid: Pid, signal: Signal) -> Result<()> {
-    kill(pid, signal).map_err(kmuxError::Pty)
+    kill(pid, signal).map_err(KmuxError::Pty)
 }
 
 #[cfg(test)]

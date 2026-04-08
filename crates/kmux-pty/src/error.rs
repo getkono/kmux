@@ -2,7 +2,7 @@ use thiserror::Error;
 
 /// All errors that kmux can produce.
 #[derive(Debug, Error)]
-pub enum kmuxError {
+pub enum KmuxError {
     #[error("PTY syscall failed: {0}")]
     Pty(#[from] nix::Error),
 
@@ -40,4 +40,4 @@ pub enum kmuxError {
     UnsupportedPlatform { detail: String },
 }
 
-pub type Result<T> = std::result::Result<T, kmuxError>;
+pub type Result<T> = std::result::Result<T, KmuxError>;

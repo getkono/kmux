@@ -21,15 +21,15 @@ use kmux_client::token::read_local_token;
 #[derive(Parser, Debug)]
 #[command(name = "kmux", about = "kmux remote terminal client (TUI)")]
 struct Cli {
-    /// Server host
-    #[arg(long, default_value = "127.0.0.1")]
+    /// Server host (omit to auto-start and connect to a local daemon)
+    #[arg(long)]
     host: Option<String>,
 
-    /// Server port
-    #[arg(long, default_value = "8443")]
+    /// Server port (omit to auto-start and connect to a local daemon)
+    #[arg(long)]
     port: Option<u16>,
 
-    /// Auth token (reads from $XDG_RUNTIME_DIR/kmux/token if not provided)
+    /// Auth token (reads from runtime token file if not provided)
     #[arg(long)]
     token: Option<String>,
 
@@ -47,9 +47,20 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let host = cli.host.unwrap_or_else(|| "127.0.0.1".to_string());
-    let port = cli.port.unwrap_or(8443);
-    let token = cli.token.or_else(read_local_token).unwrap_or_default();
+    // When no explicit --host, --port, or --token is given, auto-start (or
+    // reuse) a local daemon and retrieve the connection parameters from it.
+    let is_local = cli.host.is_none() && cli.port.is_none() && cli.token.is_none();
+
+    let (host, port, token, accept_invalid_certs) = if is_local {
+        let status = kmux_client::daemon::ensure_daemon().await?;
+        // The daemon uses a self-signed cert, so accept-invalid-certs is implied.
+        ("127.0.0.1".to_string(), status.port, status.token, true)
+    } else {
+        let host = cli.host.unwrap_or_else(|| "127.0.0.1".to_string());
+        let port = cli.port.unwrap_or(8443);
+        let token = cli.token.or_else(read_local_token).unwrap_or_default();
+        (host, port, token, cli.accept_invalid_certs)
+    };
 
     // Setup terminal
     enable_raw_mode()?;
@@ -66,7 +77,7 @@ async fn main() -> anyhow::Result<()> {
         original_hook(panic_info);
     }));
 
-    let mut app = App::new(host, port, token, cli.accept_invalid_certs);
+    let mut app = App::new(host, port, token, accept_invalid_certs);
 
     let result = app.run(&mut terminal).await;
 
