@@ -8,14 +8,14 @@ name = "kmux"
 path = "src/main.rs"
 
 [dependencies]
-kmux-client = { path = "../kmux-client" }
-kmux-protocol = { path = "../kmux-protocol", features = ["framing"] }
-ratatui = "0.29"
-crossterm = { version = "0.28", features = ["event-stream"] }
-tokio = { version = "1", features = ["full"] }
-clap = { version = "4", features = ["derive"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-cli-clipboard = "0.4"
-futures = "0.3"
-anyhow = "1"
+kmux-client.workspace = true
+kmux-protocol = { workspace = true, features = ["framing"] }
+ratatui.workspace = true
+crossterm.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+cli-clipboard.workspace = true
+futures.workspace = true
+anyhow.workspace = true

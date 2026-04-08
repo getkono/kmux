@@ -8,10 +8,10 @@ name = "kmux-gui"
 path = "src/main.rs"
 
 [dependencies]
-kmux-client = { path = "../kmux-client" }
-kmux-protocol = { path = "../kmux-protocol", features = ["framing"] }
-iced = { version = "0.13", features = ["tokio", "canvas"] }
-tokio = { version = "1", features = ["full"] }
-clap = { version = "4", features = ["derive"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+kmux-client.workspace = true
+kmux-protocol = { workspace = true, features = ["framing"] }
+iced.workspace = true
+tokio.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

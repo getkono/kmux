@@ -7,7 +7,7 @@ edition = "2024"
 framing = ["dep:tokio"]
 
 [dependencies]
-serde = { version = "1", features = ["derive", "rc"] }
-postcard = { version = "1", features = ["alloc"] }
-thiserror = "2"
-tokio = { version = "1", features = ["io-util", "macros", "rt"], optional = true }
+serde.workspace = true
+postcard.workspace = true
+thiserror.workspace = true
+tokio = { workspace = true, optional = true }

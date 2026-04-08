@@ -8,11 +8,11 @@ tracing = ["dep:tracing"]
 serde = ["dep:serde"]
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-nix = { version = "0.31", features = ["process", "signal", "term"] }
-thiserror = "2"
-tracing = { version = "0.1", optional = true }
-serde = { version = "1", features = ["derive"], optional = true }
+tokio.workspace = true
+nix.workspace = true
+thiserror.workspace = true
+tracing = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
 
 [dev-dependencies]
-tokio-test = "0.4"
+tokio-test.workspace = true

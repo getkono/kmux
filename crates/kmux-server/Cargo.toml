@@ -13,22 +13,22 @@ backend-alacritty = ["dep:alacritty_terminal"]
 backend-termwiz = ["dep:termwiz"]
 
 [dependencies]
-kmux-pty = { path = "../kmux-pty" }
-nix = { version = "0.31", features = ["process", "signal"] }
-kmux-protocol = { path = "../kmux-protocol", features = ["framing"] }
-alacritty_terminal = { version = "0.25", optional = true }
-termwiz = { version = "0.22", optional = true }
-tokio = { version = "1", features = ["full"] }
-quinn = "0.11"
-rustls = { version = "0.23", default-features = false, features = ["ring", "logging", "std", "tls12"] }
-rustls-pemfile = "2"
-rcgen = "0.13"
-rand = "0.9"
-clap = { version = "4", features = ["derive"] }
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-thiserror = "2"
-anyhow = "1"
+kmux-pty.workspace = true
+kmux-protocol = { workspace = true, features = ["framing"] }
+nix.workspace = true
+alacritty_terminal = { workspace = true, optional = true }
+termwiz = { workspace = true, optional = true }
+tokio.workspace = true
+quinn.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+rcgen.workspace = true
+rand.workspace = true
+clap.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+thiserror.workspace = true
+anyhow.workspace = true
 
 [dev-dependencies]
-tempfile = "3"
+tempfile.workspace = true
