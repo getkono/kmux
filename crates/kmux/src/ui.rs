@@ -87,16 +87,16 @@ fn render_connect(f: &mut Frame, app: &App, active_field: &ConnectField) {
     }
 
     // Status message
+    let status_msg = app.mgr.status_msg();
     let status_y = form_y + 2 + 9;
-    let status_style = if app.status_msg.starts_with("Connection failed")
-        || app.status_msg.starts_with("Auth failed")
-    {
-        Style::default().fg(theme::RED)
-    } else {
-        Style::default().fg(theme::FG_DIM)
-    };
+    let status_style =
+        if status_msg.starts_with("Connection failed") || status_msg.starts_with("Auth failed") {
+            Style::default().fg(theme::RED)
+        } else {
+            Style::default().fg(theme::FG_DIM)
+        };
     f.render_widget(
-        Paragraph::new(Span::styled(&app.status_msg, status_style)),
+        Paragraph::new(Span::styled(status_msg, status_style)),
         Rect::new(form_x, status_y, form_width, 2),
     );
 
@@ -145,8 +145,8 @@ fn render_terminal(f: &mut Frame, app: &App) {
 fn render_session_bar(f: &mut Frame, app: &App, area: Rect) {
     let mut spans = Vec::new();
 
-    for info in app.session_list.iter() {
-        let is_active = app.active_session.as_deref() == Some(&info.name);
+    for info in app.mgr.session_list().iter() {
+        let is_active = app.mgr.active_session() == Some(info.name.as_str());
         let style = if is_active {
             Style::default()
                 .fg(theme::BG)
@@ -195,7 +195,7 @@ fn render_grid(f: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        let Some(name) = &app.active_session else {
+        let Some(name) = app.mgr.active_session() else {
             // No active session message
             let msg = "No active session -- press Ctrl+G then s, c to create one";
             let x = area.left() + area.width.saturating_sub(msg.len() as u16) / 2;
@@ -213,7 +213,7 @@ fn render_grid(f: &mut Frame, app: &App, area: Rect) {
             return;
         };
 
-        let Some(grid) = app.buffers.get(name) else {
+        let Some(grid) = app.mgr.buffer(name) else {
             return;
         };
 
@@ -342,7 +342,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     let mut spans = Vec::new();
 
     // Connection info
-    let host_port = app.host_port_display();
+    let host_port = app.mgr.host_port_display();
     if !host_port.is_empty() {
         spans.push(Span::styled(
             format!(" {} ", host_port),
@@ -356,13 +356,13 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 
     // Session count
     spans.push(Span::styled(
-        format!("{} sessions", app.session_list.len()),
+        format!("{} sessions", app.mgr.session_list().len()),
         Style::default().fg(theme::FG).bg(theme::STATUS_BG),
     ));
 
     // Input lock
-    if let Some(session) = &app.active_session
-        && app.input_locked.get(session).copied().unwrap_or(false)
+    if let Some(session) = app.mgr.active_session()
+        && app.mgr.is_input_locked(session)
     {
         spans.push(Span::styled(
             " | ",
@@ -378,7 +378,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Size
-    if let Some((rows, cols)) = app.active_term_size() {
+    if let Some((rows, cols)) = app.mgr.active_term_size() {
         spans.push(Span::styled(
             " | ",
             Style::default().fg(theme::FG_DIM).bg(theme::STATUS_BG),
@@ -390,9 +390,10 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     }
 
     // Status message (right-aligned)
-    if !app.status_msg.is_empty() {
+    let status_msg = app.mgr.status_msg();
+    if !status_msg.is_empty() {
         let used: usize = spans.iter().map(|s| s.content.len()).sum();
-        let msg_len = app.status_msg.len() + 2;
+        let msg_len = status_msg.len() + 2;
         let gap = (area.width as usize).saturating_sub(used + msg_len);
         if gap > 0 {
             spans.push(Span::styled(
@@ -401,7 +402,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
             ));
         }
         spans.push(Span::styled(
-            format!(" {} ", app.status_msg),
+            format!(" {} ", status_msg),
             Style::default().fg(theme::FG_DIM).bg(theme::STATUS_BG),
         ));
     }
@@ -595,7 +596,7 @@ fn render_rename_overlay(f: &mut Frame, area: Rect, session: &str, buffer: &str)
 }
 
 fn render_hud(f: &mut Frame, app: &App, area: Rect) {
-    let snap = app.metrics.snapshot(app.force_snapshot_mode);
+    let snap = app.mgr.metrics.snapshot(app.force_snapshot_mode);
     let c = &snap.counters;
 
     let lines = vec![

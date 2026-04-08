@@ -1,36 +1,20 @@
-use std::collections::HashMap;
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use iced::futures::SinkExt as _;
 use iced::widget::{Space, button, column, container, row, text, text_input};
 use iced::{Element, Event, Font, Length, Subscription, Task, Theme};
-use kmux_protocol::messages::{
-    ClientId, ClientMessage, SequenceNo, ServerMessage, SessionEventMsg, SessionInfo,
-    SessionStatus, TermSize, epoch_millis,
-};
+use kmux_protocol::messages::{ClientMessage, ServerMessage};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
 use kmux_client::connect;
-use kmux_client::grid::{CellGrid, GridPos, Selection, SelectionMode};
-use kmux_client::metrics::RenderMetrics;
+use kmux_client::grid::{GridPos, Selection, SelectionMode};
+use kmux_client::input::encode_mouse_scroll;
+use kmux_client::session_manager::{SessionEvent, SessionManager};
+use kmux_client::token::read_local_token;
 
 use crate::shortcut::{self, LEADER_TIMEOUT, LeaderState, ShortcutAction};
 use crate::{session_bar, status_bar, terminal_view, theme};
-
-/// Try to read the auth token from `$XDG_RUNTIME_DIR/kmux/token`.
-/// Returns `None` if the env var is unset, the file is missing, or any I/O error occurs.
-fn read_local_token() -> Option<String> {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
-    let path = std::path::Path::new(&runtime_dir)
-        .join("kmux")
-        .join("token");
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
-}
 
 /// Connection parameters used as a subscription ID (triggers reconnect on change).
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -136,48 +120,24 @@ pub enum Message {
     SelectionAutoScroll(i32),
 }
 
-/// Per-session synchronisation state for ordering protection.
-#[derive(Default)]
-enum SessionSync {
-    /// Receiving diffs normally; `expected` is the next expected seqno.
-    Synced { expected: SequenceNo },
-    /// Awaiting a fresh `TerminalSnapshot`; discard any `TerminalUpdate` messages
-    /// (they may be stale leftovers from a previous uni stream).
-    #[default]
-    AwaitingSync,
-}
-
 /// Top-level application state.
-#[derive(Default)]
 #[allow(non_camel_case_types)]
 pub struct kmuxApp {
+    mgr: SessionManager,
     screen: Screen,
     connect_params: Option<ConnectParams>,
-    ws_sender: Option<mpsc::UnboundedSender<ClientMessage>>,
 
-    /// Terminal cell grids, keyed by session name.
-    buffers: HashMap<String, CellGrid>,
-    active_session: Option<String>,
-    session_list: Vec<SessionInfo>,
-    next_request_id: u64,
-
-    /// Per-session sync state: tracks expected seqno and whether we are
-    /// awaiting a fresh snapshot (discarding stale diffs from old streams).
-    session_sync: HashMap<String, SessionSync>,
-
-    // Connect form
+    // Connect form fields (kept for iced text_input widgets)
     host: String,
     port: String,
     token: String,
     accept_invalid_certs: bool,
-    status_msg: String,
 
     // Reconnection state
     last_connect_params: Option<ConnectParams>,
     disconnect_toast: Option<Instant>,
 
     // Observability
-    metrics: RenderMetrics,
     hud_visible: bool,
 
     // Full-snapshot mode: server sends complete grid snapshots instead of diffs.
@@ -185,12 +145,6 @@ pub struct kmuxApp {
 
     // Leader key state machine
     leader_state: LeaderState,
-
-    // Per-session input lock tracking
-    input_locked: HashMap<String, bool>,
-
-    // Client identity assigned by server
-    client_id: Option<ClientId>,
 }
 
 impl kmuxApp {
@@ -200,54 +154,25 @@ impl kmuxApp {
             port: "8443".to_string(),
             token: read_local_token().unwrap_or_default(),
             accept_invalid_certs,
-            ..Default::default()
+            mgr: SessionManager::new(
+                "127.0.0.1".to_string(),
+                8443,
+                String::new(),
+                accept_invalid_certs,
+            ),
+            screen: Screen::Connect,
+            connect_params: None,
+            last_connect_params: None,
+            disconnect_toast: None,
+            hud_visible: false,
+            force_snapshot_mode: false,
+            leader_state: LeaderState::Idle,
         }
-    }
-
-    fn next_rid(&mut self) -> u64 {
-        let id = self.next_request_id;
-        self.next_request_id += 1;
-        id
-    }
-
-    /// Send `Attach { last_seqno: None }` and transition the session to `AwaitingSync`.
-    fn attach_fresh(&mut self, session: String) {
-        self.session_sync
-            .insert(session.clone(), SessionSync::AwaitingSync);
-        self.send_ws(ClientMessage::Attach {
-            session,
-            last_seqno: None,
-        });
-    }
-
-    fn send_ws(&self, msg: ClientMessage) {
-        if let Some(tx) = &self.ws_sender {
-            match tx.send(msg) {
-                Ok(()) => debug!("send_ws: message sent"),
-                Err(e) => warn!("send_ws: channel send failed: {e}"),
-            }
-        } else {
-            debug!("send_ws: no ws_sender available, message dropped");
-        }
-    }
-
-    /// Get the current terminal size for the active session.
-    fn active_term_size(&self) -> Option<(u16, u16)> {
-        self.active_session
-            .as_ref()
-            .and_then(|s| self.buffers.get(s))
-            .map(|b| (b.rows as u16, b.cols as u16))
     }
 
     /// Get the host:port string for display.
     fn host_port_display(&self) -> String {
-        if let Some(p) = &self.connect_params {
-            format!("{}:{}", p.host, p.port)
-        } else if let Some(p) = &self.last_connect_params {
-            format!("{}:{}", p.host, p.port)
-        } else {
-            String::new()
-        }
+        self.mgr.host_port_display()
     }
 
     /// Dispatch a ShortcutAction from the leader key system.
@@ -258,7 +183,7 @@ impl kmuxApp {
                 self.update(Message::CreateSessionPressed)
             }
             ShortcutAction::CloseSession => {
-                if let Some(session) = self.active_session.clone() {
+                if let Some(session) = self.mgr.active_session().map(|s| s.to_string()) {
                     self.leader_state = LeaderState::ConfirmClose { session };
                 } else {
                     self.leader_state = LeaderState::Idle;
@@ -267,23 +192,25 @@ impl kmuxApp {
             }
             ShortcutAction::NextSession => {
                 self.leader_state = LeaderState::Idle;
-                self.cycle_session(1)
+                self.mgr.cycle_session(1);
+                Task::none()
             }
             ShortcutAction::PrevSession => {
                 self.leader_state = LeaderState::Idle;
-                self.cycle_session(-1)
+                self.mgr.cycle_session(-1);
+                Task::none()
             }
             ShortcutAction::JumpToSession(idx) => {
                 self.leader_state = LeaderState::Idle;
-                if idx < self.session_list.len() {
-                    let name = self.session_list[idx].name.clone();
+                if idx < self.mgr.session_list().len() {
+                    let name = self.mgr.session_list()[idx].name.clone();
                     self.update(Message::SelectSession(name))
                 } else {
                     Task::none()
                 }
             }
             ShortcutAction::RenameSession => {
-                if let Some(session) = self.active_session.clone() {
+                if let Some(session) = self.mgr.active_session().map(|s| s.to_string()) {
                     self.leader_state = LeaderState::RenameEditing {
                         buffer: session.clone(),
                         session,
@@ -299,7 +226,7 @@ impl kmuxApp {
                 self.update(Message::DisconnectPressed)
             }
             ShortcutAction::ShowSignalMenu => {
-                if let Some(session) = self.active_session.clone() {
+                if let Some(session) = self.mgr.active_session().map(|s| s.to_string()) {
                     self.leader_state = LeaderState::SignalMenu { session };
                 } else {
                     self.leader_state = LeaderState::Idle;
@@ -308,14 +235,7 @@ impl kmuxApp {
             }
             ShortcutAction::ToggleInputLock => {
                 self.leader_state = LeaderState::Idle;
-                if let Some(session) = self.active_session.clone() {
-                    let locked = self.input_locked.get(&session).copied().unwrap_or(false);
-                    if locked {
-                        self.send_ws(ClientMessage::ReleaseInputLock { session });
-                    } else {
-                        self.send_ws(ClientMessage::RequestInputLock { session });
-                    }
-                }
+                self.mgr.toggle_input_lock();
                 Task::none()
             }
             ShortcutAction::ShowHelp => {
@@ -330,9 +250,7 @@ impl kmuxApp {
             ShortcutAction::ToggleSnapshotMode => {
                 self.leader_state = LeaderState::Idle;
                 self.force_snapshot_mode = !self.force_snapshot_mode;
-                self.send_ws(ClientMessage::SetSnapshotMode {
-                    enabled: self.force_snapshot_mode,
-                });
+                self.mgr.set_snapshot_mode(self.force_snapshot_mode);
                 info!(
                     "Snapshot mode {}",
                     if self.force_snapshot_mode {
@@ -353,49 +271,24 @@ impl kmuxApp {
             ShortcutAction::SendLiteralLeader => {
                 self.leader_state = LeaderState::Idle;
                 // Send Ctrl+B (0x02) to PTY
-                if let Some(session) = &self.active_session {
-                    self.send_ws(ClientMessage::PtyInput {
-                        session: session.clone(),
-                        data: vec![0x02],
-                    });
-                }
+                self.mgr.send_input(vec![0x02]);
                 Task::none()
             }
             ShortcutAction::ScrollPageUp => {
                 self.leader_state = LeaderState::Idle;
-                if let Some(name) = &self.active_session
-                    && let Some(grid) = self.buffers.get_mut(name)
-                {
+                if let Some(grid) = self.mgr.active_grid_mut() {
                     grid.scroll_up(grid.rows);
                 }
                 Task::none()
             }
             ShortcutAction::ScrollPageDown => {
                 self.leader_state = LeaderState::Idle;
-                if let Some(name) = &self.active_session
-                    && let Some(grid) = self.buffers.get_mut(name)
-                {
+                if let Some(grid) = self.mgr.active_grid_mut() {
                     grid.scroll_down(grid.rows);
                 }
                 Task::none()
             }
         }
-    }
-
-    /// Cycle to the next/prev session by offset.
-    fn cycle_session(&mut self, offset: i32) -> Task<Message> {
-        if self.session_list.is_empty() {
-            return Task::none();
-        }
-        let current_idx = self
-            .active_session
-            .as_ref()
-            .and_then(|name| self.session_list.iter().position(|s| &s.name == name))
-            .unwrap_or(0);
-        let len = self.session_list.len() as i32;
-        let new_idx = ((current_idx as i32 + offset).rem_euclid(len)) as usize;
-        let name = self.session_list[new_idx].name.clone();
-        self.update(Message::SelectSession(name))
     }
 
     pub fn update(&mut self, message: Message) -> Task<Message> {
@@ -422,82 +315,67 @@ impl kmuxApp {
                     token: self.token.clone(),
                     accept_invalid_certs: self.accept_invalid_certs,
                 });
-                self.status_msg = "Connecting...".to_string();
+                self.mgr
+                    .set_connection_params(self.host.clone(), port, self.token.clone());
+                self.mgr.set_status_msg("Connecting...".to_string());
                 Task::none()
             }
 
             Message::DisconnectPressed => {
                 self.connect_params = None;
-                self.ws_sender = None;
                 self.screen = Screen::Connect;
-                self.buffers.clear();
-                self.active_session = None;
-                self.session_list.clear();
-                self.session_sync.clear();
-                self.input_locked.clear();
                 self.leader_state = LeaderState::Idle;
-                self.status_msg = "Disconnected".to_string();
+                self.mgr.disconnect();
                 Task::none()
             }
 
             //  Async events
             Message::Connected(sender) => {
-                self.ws_sender = Some(sender);
                 self.screen = Screen::Terminal;
+                self.mgr.set_ws_sender(sender);
+                self.mgr.request_session_list();
                 if let Some(p) = &self.connect_params {
-                    self.status_msg = format!("Connected to {}:{}", p.host, p.port);
+                    self.mgr
+                        .set_status_msg(format!("Connected to {}:{}", p.host, p.port));
                 }
                 info!("Connected to kmux-server");
-                let rid = self.next_rid();
-                self.send_ws(ClientMessage::SessionList { request_id: rid });
                 Task::none()
             }
 
             Message::ConnectionFailed(reason) => {
                 self.connect_params = None;
-                self.ws_sender = None;
-                self.status_msg = format!("Connection failed: {reason}");
+                self.mgr
+                    .set_status_msg(format!("Connection failed: {reason}"));
                 Task::none()
             }
 
             Message::ServerMsgBatch(msgs) => {
-                self.metrics.record_batch(msgs.len());
+                self.mgr.metrics.record_batch(msgs.len());
                 let tasks: Vec<Task<Message>> = msgs
                     .into_iter()
-                    .map(|msg| self.handle_server_message(msg))
+                    .map(|msg| {
+                        let events = self.mgr.handle_server_message(msg);
+                        self.handle_session_events(events)
+                    })
                     .collect();
                 Task::batch(tasks)
             }
 
             //  Session management
             Message::SelectSession(name) => {
-                if let Some(prev) = self.active_session.take() {
-                    self.send_ws(ClientMessage::Detach { session: prev });
-                }
-                if let Some(buf) = self.buffers.get_mut(&name) {
-                    buf.clear();
-                }
-                self.active_session = Some(name.clone());
-                self.attach_fresh(name);
+                self.mgr.select_session(name);
                 Task::none()
             }
 
             Message::CreateSessionPressed => {
-                if self.ws_sender.is_none() {
+                if !self.mgr.is_connected() {
                     warn!("CreateSessionPressed: no active connection, ignoring");
-                    self.status_msg = "Not connected -- cannot create session".to_string();
+                    self.mgr
+                        .set_status_msg("Not connected -- cannot create session".to_string());
                     return Task::none();
                 }
-                let rid = self.next_rid();
-                let name = format!("session-{rid}");
-                self.status_msg = "Creating session...".to_string();
-                self.send_ws(ClientMessage::SessionCreate {
-                    request_id: rid,
-                    name,
-                    program: None,
-                    args: vec![],
-                    size: TermSize { rows: 24, cols: 80 },
-                });
+                self.mgr.set_status_msg("Creating session...".to_string());
+                self.mgr.create_session();
                 Task::none()
             }
 
@@ -515,9 +393,10 @@ impl kmuxApp {
             } => self.handle_key_event(key, modifiers, text),
 
             Message::Disconnected => {
-                self.ws_sender = None;
+                self.mgr.mark_connection_lost();
                 self.last_connect_params = self.connect_params.take();
-                self.status_msg = "Connection lost \u{2014} reconnecting in 3s...".to_string();
+                self.mgr
+                    .set_status_msg("Connection lost \u{2014} reconnecting in 3s...".to_string());
                 self.disconnect_toast = Some(Instant::now());
                 warn!("Connection lost, scheduling reconnect");
                 Task::batch([
@@ -534,8 +413,13 @@ impl kmuxApp {
 
             Message::Reconnect => {
                 if let Some(params) = self.last_connect_params.take() {
+                    self.mgr.set_connection_params(
+                        params.host.clone(),
+                        params.port,
+                        params.token.clone(),
+                    );
                     self.connect_params = Some(params);
-                    self.status_msg = "Reconnecting...".to_string();
+                    self.mgr.set_status_msg("Reconnecting...".to_string());
                 }
                 Task::none()
             }
@@ -552,9 +436,7 @@ impl kmuxApp {
 
             Message::ToggleSnapshotMode => {
                 self.force_snapshot_mode = !self.force_snapshot_mode;
-                self.send_ws(ClientMessage::SetSnapshotMode {
-                    enabled: self.force_snapshot_mode,
-                });
+                self.mgr.set_snapshot_mode(self.force_snapshot_mode);
                 Task::none()
             }
 
@@ -563,19 +445,12 @@ impl kmuxApp {
                 if let Some(text) = contents
                     && !text.is_empty()
                 {
-                    if let Some(session) = &self.active_session {
-                        let locked = self.input_locked.get(session).copied().unwrap_or(false);
-                        if locked {
-                            self.status_msg = "Input locked on this session".to_string();
-                            return Task::none();
-                        }
-                        self.send_ws(ClientMessage::PtyPaste {
-                            session: session.clone(),
-                            data: text,
-                        });
+                    if self.mgr.active_session().is_some() {
+                        self.mgr.send_paste(text);
                     } else {
-                        self.status_msg =
-                            "No active session -- press Ctrl+B then c to create one".to_string();
+                        self.mgr.set_status_msg(
+                            "No active session -- press Ctrl+B then c to create one".to_string(),
+                        );
                     }
                 }
                 Task::none()
@@ -583,9 +458,7 @@ impl kmuxApp {
 
             //  Scroll terminal
             Message::ScrollTerminal(delta) => {
-                if let Some(name) = &self.active_session
-                    && let Some(grid) = self.buffers.get_mut(name)
-                {
+                if let Some(grid) = self.mgr.active_grid_mut() {
                     if delta > 0 {
                         grid.scroll_up(delta as usize);
                     } else if delta < 0 {
@@ -597,19 +470,13 @@ impl kmuxApp {
 
             // Forward mouse scroll to PTY
             Message::ForwardMouseScroll { col, row, lines } => {
-                if let Some(name) = &self.active_session
-                    && let Some(grid) = self.buffers.get(name)
+                if let Some(name) = self.mgr.active_session().map(|s| s.to_string())
+                    && let Some(grid) = self.mgr.buffer(&name)
                 {
                     let sgr = grid.modes().sgr_mouse();
                     let bytes = encode_mouse_scroll(col, row, lines, sgr);
                     if !bytes.is_empty() {
-                        let locked = self.input_locked.get(name).copied().unwrap_or(false);
-                        if !locked {
-                            self.send_ws(ClientMessage::PtyInput {
-                                session: name.clone(),
-                                data: bytes,
-                            });
-                        }
+                        self.mgr.send_input(bytes);
                     }
                 }
                 Task::none()
@@ -617,14 +484,8 @@ impl kmuxApp {
 
             //  Terminal resize
             Message::TerminalResized { rows, cols } => {
-                if let Some(name) = &self.active_session {
-                    if let Some(buf) = self.buffers.get_mut(name) {
-                        buf.resize(rows, cols);
-                    }
-                    self.send_ws(ClientMessage::Resize {
-                        session: name.clone(),
-                        size: TermSize { rows, cols },
-                    });
+                if let Some(name) = self.mgr.active_session().map(|s| s.to_string()) {
+                    self.mgr.send_resize(&name, rows, cols);
                 }
                 Task::none()
             }
@@ -652,14 +513,7 @@ impl kmuxApp {
                     std::mem::replace(&mut self.leader_state, LeaderState::Idle)
                 {
                     let new_name = buffer.trim().to_string();
-                    if !new_name.is_empty() && new_name != session {
-                        let rid = self.next_rid();
-                        self.send_ws(ClientMessage::SessionRename {
-                            request_id: rid,
-                            session,
-                            new_name,
-                        });
-                    }
+                    self.mgr.rename_session(&session, &new_name);
                 }
                 Task::none()
             }
@@ -703,9 +557,7 @@ impl kmuxApp {
 
             // ── Text selection ──
             Message::SelectionStart { pos, mode } => {
-                if let Some(name) = &self.active_session
-                    && let Some(grid) = self.buffers.get_mut(name)
-                {
+                if let Some(grid) = self.mgr.active_grid_mut() {
                     let sel = match mode {
                         SelectionMode::Word => {
                             let (start, end) = grid.find_word_boundaries(pos);
@@ -738,8 +590,7 @@ impl kmuxApp {
             }
 
             Message::SelectionUpdate { pos } => {
-                if let Some(name) = &self.active_session
-                    && let Some(grid) = self.buffers.get_mut(name)
+                if let Some(grid) = self.mgr.active_grid_mut()
                     && let Some(sel) = grid.selection().copied()
                 {
                     let new_end = match sel.mode {
@@ -781,9 +632,7 @@ impl kmuxApp {
             }
 
             Message::SelectionAutoScroll(direction) => {
-                if let Some(name) = &self.active_session
-                    && let Some(grid) = self.buffers.get_mut(name)
-                {
+                if let Some(grid) = self.mgr.active_grid_mut() {
                     if direction > 0 {
                         grid.scroll_up(direction as usize);
                     } else if direction < 0 {
@@ -791,7 +640,6 @@ impl kmuxApp {
                     }
                     // Update selection end to viewport edge
                     if let Some(sel) = grid.selection().copied() {
-                        use GridPos;
                         let sb_len = grid.scrollback_len();
                         let new_end = if direction > 0 {
                             // Scrolled up, extend to top of viewport
@@ -816,6 +664,23 @@ impl kmuxApp {
         }
     }
 
+    /// React to `SessionEvent`s returned from `SessionManager::handle_server_message`.
+    fn handle_session_events(&mut self, events: Vec<SessionEvent>) -> Task<Message> {
+        for event in events {
+            match event {
+                SessionEvent::AuthFailed { .. } => {
+                    self.connect_params = None;
+                    self.screen = Screen::Connect;
+                }
+                SessionEvent::AuthOk => {
+                    info!("Auth succeeded");
+                }
+                _ => {}
+            }
+        }
+        Task::none()
+    }
+
     /// Handle a raw key event with leader key interception.
     fn handle_key_event(
         &mut self,
@@ -830,17 +695,13 @@ impl kmuxApp {
             LeaderState::Idle => {
                 // Shift+PageUp / Shift+PageDown scroll by one page.
                 if modifiers.shift() && key == Key::Named(Named::PageUp) {
-                    if let Some(name) = &self.active_session
-                        && let Some(grid) = self.buffers.get_mut(name)
-                    {
+                    if let Some(grid) = self.mgr.active_grid_mut() {
                         grid.scroll_up(grid.rows);
                     }
                     return Task::none();
                 }
                 if modifiers.shift() && key == Key::Named(Named::PageDown) {
-                    if let Some(name) = &self.active_session
-                        && let Some(grid) = self.buffers.get_mut(name)
-                    {
+                    if let Some(grid) = self.mgr.active_grid_mut() {
                         grid.scroll_down(grid.rows);
                     }
                     return Task::none();
@@ -872,8 +733,7 @@ impl kmuxApp {
                         modifiers.control() && modifiers.shift()
                     };
                     if is_copy {
-                        if let Some(name) = &self.active_session
-                            && let Some(grid) = self.buffers.get(name)
+                        if let Some(grid) = self.mgr.active_grid()
                             && let Some(text) = grid.selected_text()
                         {
                             return iced::clipboard::write(text);
@@ -896,8 +756,7 @@ impl kmuxApp {
 
                 // Escape clears selection (and still forwards to PTY below)
                 if key == Key::Named(Named::Escape)
-                    && let Some(name) = &self.active_session
-                    && let Some(grid) = self.buffers.get_mut(name)
+                    && let Some(grid) = self.mgr.active_grid_mut()
                 {
                     grid.clear_selection();
                 }
@@ -947,11 +806,7 @@ impl kmuxApp {
                 match &key {
                     Key::Character(c) if c.as_str() == "y" => {
                         self.leader_state = LeaderState::Idle;
-                        let rid = self.next_rid();
-                        self.send_ws(ClientMessage::SessionClose {
-                            request_id: rid,
-                            name: session,
-                        });
+                        self.mgr.close_session(&session);
                         Task::none()
                     }
                     _ => {
@@ -976,7 +831,7 @@ impl kmuxApp {
 
                 if let Some(signal) = shortcut::resolve_signal_key(&key) {
                     self.leader_state = LeaderState::Idle;
-                    self.send_ws(ClientMessage::Signal { session, signal });
+                    self.mgr.send_signal(&session, signal);
                 } else {
                     self.leader_state = LeaderState::Idle;
                 }
@@ -1020,34 +875,25 @@ impl kmuxApp {
         text_val: Option<String>,
     ) -> Task<Message> {
         // Snap to bottom on any keypress while scrolled.
-        if let Some(session) = &self.active_session
-            && let Some(grid) = self.buffers.get_mut(session)
-        {
+        if let Some(grid) = self.mgr.active_grid_mut() {
             grid.scroll_to_bottom();
         }
 
         let app_cursor = self
-            .active_session
-            .as_ref()
-            .and_then(|s| self.buffers.get(s))
+            .mgr
+            .active_grid()
             .map(|b| b.app_cursor())
             .unwrap_or(false);
         let bytes = key_to_bytes(key, modifiers, text_val, app_cursor);
         if let Some(bytes) = bytes {
-            if let Some(session) = &self.active_session {
-                // Check input lock
-                let locked = self.input_locked.get(session).copied().unwrap_or(false);
-                if locked {
-                    self.status_msg = "Input locked on this session".to_string();
-                    return Task::none();
+            if self.mgr.active_session().is_some() {
+                if !self.mgr.send_input(bytes) {
+                    // input_locked; status_msg already updated by mgr
                 }
-                self.send_ws(ClientMessage::PtyInput {
-                    session: session.clone(),
-                    data: bytes,
-                });
             } else {
-                self.status_msg =
-                    "No active session -- press Ctrl+B then c to create one".to_string();
+                self.mgr.set_status_msg(
+                    "No active session -- press Ctrl+B then c to create one".to_string(),
+                );
             }
         }
         Task::none()
@@ -1121,289 +967,6 @@ impl kmuxApp {
 
     //  Private helpers
 
-    fn handle_server_message(&mut self, msg: ServerMessage) -> Task<Message> {
-        match msg {
-            ServerMessage::AuthResult {
-                success,
-                reason,
-                client_id,
-            } => {
-                if success {
-                    self.client_id = client_id;
-                } else {
-                    warn!("Auth failed: {:?}", reason);
-                    self.status_msg = format!("Auth failed: {}", reason.unwrap_or_default());
-                    self.connect_params = None;
-                    self.ws_sender = None;
-                    self.screen = Screen::Connect;
-                }
-                Task::none()
-            }
-
-            ServerMessage::SessionListResult { sessions, .. } => {
-                self.session_list = sessions.clone();
-                for info in &sessions {
-                    self.buffers.entry(info.name.clone()).or_default();
-                }
-                if self.active_session.is_none()
-                    && let Some(first) = sessions.first()
-                {
-                    self.active_session = Some(first.name.clone());
-                    self.attach_fresh(first.name.clone());
-                }
-                Task::none()
-            }
-
-            ServerMessage::SessionCreated { name, .. } => {
-                let size = TermSize::default();
-                self.buffers.entry(name.clone()).or_default();
-                self.session_list
-                    .push(kmux_protocol::messages::SessionInfo {
-                        name: name.clone(),
-                        program: String::new(),
-                        size,
-                        attached_clients: vec![],
-                        status: SessionStatus::Running,
-                    });
-                if let Some(prev) = self.active_session.take() {
-                    self.send_ws(ClientMessage::Detach { session: prev });
-                }
-                self.active_session = Some(name.clone());
-                self.status_msg = format!("Session '{name}' created");
-                self.attach_fresh(name);
-                Task::none()
-            }
-
-            ServerMessage::SessionClosed { name, .. } => {
-                self.buffers.remove(&name);
-                self.session_sync.remove(&name);
-                self.input_locked.remove(&name);
-                self.session_list.retain(|s| s.name != name);
-                if self.active_session.as_deref() == Some(&name) {
-                    self.active_session = self.session_list.first().map(|s| s.name.clone());
-                    if let Some(sess) = self.active_session.clone() {
-                        self.attach_fresh(sess);
-                    }
-                }
-                Task::none()
-            }
-
-            ServerMessage::TerminalSnapshot {
-                session,
-                snapshot,
-                seqno,
-                sent_at_ms,
-            } => {
-                let start = Instant::now();
-                let grid = self.buffers.entry(session.clone()).or_default();
-                grid.apply_snapshot(snapshot);
-                self.session_sync.insert(
-                    session,
-                    SessionSync::Synced {
-                        expected: SequenceNo(seqno.0 + 1),
-                    },
-                );
-                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                self.metrics.record_apply(sent_at_ms, elapsed_ms);
-                Task::none()
-            }
-
-            ServerMessage::TerminalUpdate {
-                session,
-                diff,
-                seqno,
-                sent_at_ms,
-            } => {
-                match self.session_sync.get(&session) {
-                    Some(SessionSync::AwaitingSync) => {
-                        debug!("Discarding stale TerminalUpdate for '{session}' (awaiting sync)");
-                        self.metrics.record_stale_discard(&session);
-                        return Task::none();
-                    }
-                    Some(SessionSync::Synced { expected }) if seqno != *expected => {
-                        warn!(
-                            "Seqno gap on '{session}': expected {:?}, got {:?} \u{2014} re-attaching",
-                            expected, seqno
-                        );
-                        self.metrics.record_seqno_gap(&session, expected.0, seqno.0);
-                        self.metrics.record_resync(&session, "seqno gap");
-                        if let Some(grid) = self.buffers.get_mut(&session) {
-                            grid.clear();
-                        }
-                        self.attach_fresh(session);
-                        return Task::none();
-                    }
-                    _ => {}
-                }
-
-                let start = Instant::now();
-                let diff = Arc::unwrap_or_clone(diff);
-                let op_count = diff.ops.len();
-                if let Some(grid) = self.buffers.get_mut(&session) {
-                    grid.apply_diff(diff);
-                    self.metrics.record_diff_stats(op_count);
-                    debug!(
-                        session,
-                        generation = grid.generation(),
-                        "TerminalUpdate applied"
-                    );
-                }
-                self.session_sync.insert(
-                    session,
-                    SessionSync::Synced {
-                        expected: SequenceNo(seqno.0 + 1),
-                    },
-                );
-                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                let net_apply_ms = epoch_millis().saturating_sub(sent_at_ms) as f64;
-                self.metrics.record_apply(sent_at_ms, elapsed_ms);
-                if op_count > 100 {
-                    debug!(
-                        op_count,
-                        apply_ms = format!("{elapsed_ms:.2}"),
-                        net_apply_ms = format!("{net_apply_ms:.1}"),
-                        "large diff applied"
-                    );
-                    self.metrics.record_large_diff(net_apply_ms);
-                }
-                Task::none()
-            }
-
-            ServerMessage::CursorUpdate {
-                session,
-                cursor,
-                modes,
-                seqno,
-                sent_at_ms,
-            } => {
-                match self.session_sync.get(&session) {
-                    Some(SessionSync::AwaitingSync) => {
-                        debug!("Discarding stale CursorUpdate for '{session}' (awaiting sync)");
-                        self.metrics.record_stale_discard(&session);
-                        return Task::none();
-                    }
-                    Some(SessionSync::Synced { expected }) if seqno != *expected => {
-                        warn!(
-                            "Seqno gap on '{session}': expected {:?}, got {:?} \u{2014} re-attaching",
-                            expected, seqno
-                        );
-                        self.metrics.record_seqno_gap(&session, expected.0, seqno.0);
-                        self.metrics.record_resync(&session, "seqno gap");
-                        if let Some(grid) = self.buffers.get_mut(&session) {
-                            grid.clear();
-                        }
-                        self.attach_fresh(session);
-                        return Task::none();
-                    }
-                    _ => {}
-                }
-
-                let start = Instant::now();
-                if let Some(grid) = self.buffers.get_mut(&session) {
-                    grid.apply_cursor_update(cursor, modes);
-                }
-                self.session_sync.insert(
-                    session,
-                    SessionSync::Synced {
-                        expected: SequenceNo(seqno.0 + 1),
-                    },
-                );
-                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                self.metrics.record_apply(sent_at_ms, elapsed_ms);
-                Task::none()
-            }
-
-            #[allow(deprecated)]
-            ServerMessage::PtyOutput { .. } => Task::none(),
-
-            ServerMessage::SyncReset { session } => {
-                if let Some(grid) = self.buffers.get_mut(&session) {
-                    grid.clear();
-                }
-                self.metrics.record_resync(&session, "server sync reset");
-                self.session_sync.insert(session, SessionSync::AwaitingSync);
-                Task::none()
-            }
-
-            ServerMessage::Event { event } => {
-                info!("Server event: {:?}", event);
-                // Handle rename events to update local state
-                if let SessionEventMsg::Renamed { old_name, new_name } = event {
-                    self.apply_rename(&old_name, &new_name);
-                }
-                Task::none()
-            }
-
-            ServerMessage::Lagged {
-                session,
-                missed_count,
-            } => {
-                warn!("Lagged on session '{session}': missed {missed_count} diffs, re-attaching");
-                self.metrics.record_lag(&session, missed_count);
-                self.metrics.record_resync(&session, "lagged");
-                if let Some(grid) = self.buffers.get_mut(&session) {
-                    grid.clear();
-                }
-                self.attach_fresh(session);
-                Task::none()
-            }
-
-            ServerMessage::Error { message, .. } => {
-                warn!("Server error: {message}");
-                self.status_msg = format!("Error: {message}");
-                Task::none()
-            }
-
-            ServerMessage::SessionRenamed { old_name, new_name } => {
-                self.apply_rename(&old_name, &new_name);
-                Task::none()
-            }
-
-            ServerMessage::InputLockGranted { session } => {
-                self.input_locked.insert(session.clone(), true);
-                self.status_msg = format!("Input lock acquired on '{session}'");
-                Task::none()
-            }
-
-            ServerMessage::InputLockDenied { session, holder } => {
-                self.status_msg = format!(
-                    "Input lock denied on '{session}' (held by client {:?})",
-                    holder
-                );
-                Task::none()
-            }
-
-            ServerMessage::InputLockReleased { session } => {
-                self.input_locked.insert(session.clone(), false);
-                self.status_msg = format!("Input lock released on '{session}'");
-                Task::none()
-            }
-
-            _ => Task::none(),
-        }
-    }
-
-    /// Apply a session rename across all local state.
-    fn apply_rename(&mut self, old_name: &str, new_name: &str) {
-        if let Some(buf) = self.buffers.remove(old_name) {
-            self.buffers.insert(new_name.to_string(), buf);
-        }
-        if let Some(sync) = self.session_sync.remove(old_name) {
-            self.session_sync.insert(new_name.to_string(), sync);
-        }
-        if let Some(locked) = self.input_locked.remove(old_name) {
-            self.input_locked.insert(new_name.to_string(), locked);
-        }
-        for info in &mut self.session_list {
-            if info.name == old_name {
-                info.name = new_name.to_string();
-            }
-        }
-        if self.active_session.as_deref() == Some(old_name) {
-            self.active_session = Some(new_name.to_string());
-        }
-    }
-
     fn view_connect(&self) -> Element<'_, Message> {
         let title = text("kmux").size(28).color(theme::ACCENT).font(Font {
             weight: iced::font::Weight::Bold,
@@ -1411,6 +974,7 @@ impl kmuxApp {
         });
         let subtitle = text("remote terminal v0.1.0").size(12).color(theme::FG_DIM);
 
+        let status_msg = self.mgr.status_msg();
         let form = column![
             title,
             subtitle,
@@ -1441,9 +1005,9 @@ impl kmuxApp {
             .padding([8, 16])
             .width(Length::Fill),
             {
-                let msg_text = text(&self.status_msg).size(12);
-                if self.status_msg.starts_with("Connection failed")
-                    || self.status_msg.starts_with("Auth failed")
+                let msg_text = text(status_msg).size(12);
+                if status_msg.starts_with("Connection failed")
+                    || status_msg.starts_with("Auth failed")
                 {
                     msg_text.color(theme::RED)
                 } else {
@@ -1470,8 +1034,13 @@ impl kmuxApp {
     }
 
     fn view_terminal(&self) -> Element<'_, Message> {
-        let names: Vec<String> = self.session_list.iter().map(|s| s.name.clone()).collect();
-        let active_ref = self.active_session.as_deref();
+        let names: Vec<String> = self
+            .mgr
+            .session_list()
+            .iter()
+            .map(|s| s.name.clone())
+            .collect();
+        let active_ref = self.mgr.active_session();
 
         let rename_state =
             if let LeaderState::RenameEditing { buffer, session } = &self.leader_state {
@@ -1494,15 +1063,15 @@ impl kmuxApp {
 
         let (metrics, diag) = if self.hud_visible {
             (
-                Some(self.metrics.snapshot(self.force_snapshot_mode)),
-                Some(self.metrics.diag_snapshot()),
+                Some(self.mgr.metrics.snapshot(self.force_snapshot_mode)),
+                Some(self.mgr.metrics.diag_snapshot()),
             )
         } else {
             (None, None)
         };
 
-        let terminal_area: Element<Message> = if let Some(name) = &self.active_session {
-            if let Some(buf) = self.buffers.get(name) {
+        let terminal_area: Element<Message> = if let Some(name) = self.mgr.active_session() {
+            if let Some(buf) = self.mgr.buffer(name) {
                 terminal_view::view(buf, name, metrics, diag)
             } else {
                 text("No output yet").color(theme::FG_DIM).into()
@@ -1513,20 +1082,12 @@ impl kmuxApp {
                 .into()
         };
 
-        // Input lock status for active session
-        let input_locked = self
-            .active_session
-            .as_ref()
-            .and_then(|s| self.input_locked.get(s))
-            .copied()
-            .unwrap_or(false);
-
         let status = status_bar::view(
             &self.host_port_display(),
-            self.session_list.len(),
+            self.mgr.session_list().len(),
             &self.leader_state,
-            input_locked,
-            self.active_term_size(),
+            self.mgr.active_input_locked(),
+            self.mgr.active_term_size(),
             Message::DisconnectPressed,
         );
 
@@ -1720,34 +1281,6 @@ fn keyboard_filter(
     }
 }
 
-/// Encode mouse scroll events as terminal escape sequences.
-///
-/// `col` and `row` are 1-based terminal coordinates.
-/// `lines` > 0 means scroll up, < 0 means scroll down.
-/// Each line generates one escape sequence (matching xterm behavior).
-fn encode_mouse_scroll(col: u16, row: u16, lines: i32, sgr: bool) -> Vec<u8> {
-    let mut out = Vec::new();
-    let count = lines.unsigned_abs() as usize;
-    // Button 64 = scroll up, 65 = scroll down (xterm convention).
-    let button: u8 = if lines > 0 { 64 } else { 65 };
-
-    for _ in 0..count.min(255) {
-        if sgr {
-            // SGR format: \x1b[<{button};{col};{row}M
-            let seq = format!("\x1b[<{};{};{}M", button, col, row);
-            out.extend_from_slice(seq.as_bytes());
-        } else {
-            // Legacy X10/normal format: \x1b[M{cb}{cx}{cy}
-            // cb = button + 32, cx = col + 32, cy = row + 32
-            let cb = button + 32;
-            let cx = (col as u8).saturating_add(32);
-            let cy = (row as u8).saturating_add(32);
-            out.extend_from_slice(&[0x1b, b'[', b'M', cb, cx, cy]);
-        }
-    }
-    out
-}
-
 fn key_to_bytes(
     key: iced::keyboard::Key,
     modifiers: iced::keyboard::Modifiers,
@@ -1897,43 +1430,5 @@ mod tests {
     fn backspace_produces_del() {
         let result = key_to_bytes(Key::Named(Named::Backspace), no_mods(), None, false);
         assert_eq!(result, Some(vec![0x7f]));
-    }
-
-    #[test]
-    fn sgr_scroll_up() {
-        let bytes = encode_mouse_scroll(10, 5, 1, true);
-        assert_eq!(bytes, b"\x1b[<64;10;5M");
-    }
-
-    #[test]
-    fn sgr_scroll_down() {
-        let bytes = encode_mouse_scroll(10, 5, -1, true);
-        assert_eq!(bytes, b"\x1b[<65;10;5M");
-    }
-
-    #[test]
-    fn legacy_scroll_up() {
-        let bytes = encode_mouse_scroll(10, 5, 1, false);
-        // cb = 64+32 = 96, cx = 10+32 = 42, cy = 5+32 = 37
-        assert_eq!(bytes, &[0x1b, b'[', b'M', 96, 42, 37]);
-    }
-
-    #[test]
-    fn legacy_scroll_down() {
-        let bytes = encode_mouse_scroll(10, 5, -1, false);
-        // cb = 65+32 = 97, cx = 10+32 = 42, cy = 5+32 = 37
-        assert_eq!(bytes, &[0x1b, b'[', b'M', 97, 42, 37]);
-    }
-
-    #[test]
-    fn multiple_lines_generate_multiple_sequences() {
-        let bytes = encode_mouse_scroll(1, 1, 3, true);
-        assert_eq!(bytes, b"\x1b[<64;1;1M\x1b[<64;1;1M\x1b[<64;1;1M");
-    }
-
-    #[test]
-    fn zero_lines_produces_empty() {
-        let bytes = encode_mouse_scroll(1, 1, 0, true);
-        assert!(bytes.is_empty());
     }
 }

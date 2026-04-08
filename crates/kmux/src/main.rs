@@ -16,6 +16,7 @@ use ratatui::prelude::CrosstermBackend;
 use tracing_subscriber::EnvFilter;
 
 use app::App;
+use kmux_client::token::read_local_token;
 
 #[derive(Parser, Debug)]
 #[command(name = "kmux", about = "kmux remote terminal client (TUI)")]
@@ -35,17 +36,6 @@ struct Cli {
     /// Accept self-signed / invalid TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
-}
-
-fn read_local_token() -> Option<String> {
-    let runtime_dir = std::env::var("XDG_RUNTIME_DIR").ok()?;
-    let path = std::path::Path::new(&runtime_dir)
-        .join("kmux")
-        .join("token");
-    std::fs::read_to_string(path)
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
 
 #[tokio::main]
