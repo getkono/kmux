@@ -36,3 +36,11 @@ doc-check:
 # Run doc tests
 doc-test:
     cargo test --doc --all-features
+
+# Tail the client log (kmux / kmux-gui)
+tail-client-log:
+    tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/kmux/client.log"
+
+# Tail the daemon log (kmuxd)
+tail-daemon-log:
+    tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/kmux/daemon.log"

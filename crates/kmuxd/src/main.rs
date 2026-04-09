@@ -26,7 +26,9 @@ use std::time::Instant;
 #[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 use clap::Parser;
 #[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
-use tracing::{error, info};
+use rand::RngCore;
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
+use tracing::{Instrument, error, info};
 use tracing_subscriber::EnvFilter;
 
 #[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
@@ -73,18 +75,40 @@ fn main() -> anyhow::Result<()> {
         if cli.daemon {
             let pid_path = kmux_protocol::dirs::pid_path()?;
             daemon::daemonize_process(&pid_path)?;
-            // After this point we are in the daemonized child process.
-            // Logging to a file would be set up here in a production system;
-            // for now we rely on tracing going to /dev/null (stdio is closed).
+            // After this point we are in the daemonized child process with fresh fds.
         }
 
         // Initialize tracing after daemonize (child process has fresh fds).
-        tracing_subscriber::fmt()
-            .with_env_filter(EnvFilter::from_default_env().add_directive("kmuxd=info".parse()?))
-            .init();
+        // Log to a persistent file; fall back to stderr if the path can't be opened.
+        let instance_id = generate_instance_id();
+        match kmux_protocol::dirs::daemon_log_path().and_then(|p| {
+            Ok(std::fs::OpenOptions::new()
+                .create(true)
+                .append(true)
+                .open(p)?)
+        }) {
+            Ok(file) => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(
+                        EnvFilter::from_default_env().add_directive("kmuxd=info".parse()?),
+                    )
+                    .with_writer(std::sync::Mutex::new(file))
+                    .init();
+            }
+            Err(_) => {
+                tracing_subscriber::fmt()
+                    .with_env_filter(
+                        EnvFilter::from_default_env().add_directive("kmuxd=info".parse()?),
+                    )
+                    .init();
+            }
+        }
+        tracing::info!(instance_id = %instance_id, "kmuxd started");
 
         let rt = tokio::runtime::Runtime::new()?;
-        rt.block_on(async_main(cli))?;
+        rt.block_on(
+            async_main(cli).instrument(tracing::info_span!("instance", id = %instance_id)),
+        )?;
     }
 
     #[cfg(not(any(feature = "backend-alacritty", feature = "backend-termwiz")))]
@@ -138,6 +162,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let pid_path = kmux_protocol::dirs::pid_path()?;
         let start_time = Instant::now();
         let token_clone = token.clone();
+        let app_clone = Arc::clone(&app);
         tokio::spawn(async move {
             daemon::serve_control_socket(
                 socket_path,
@@ -145,6 +170,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 actual_port,
                 token_clone,
                 start_time,
+                app_clone,
             )
             .await;
         });
@@ -165,4 +191,11 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
+fn generate_instance_id() -> String {
+    let mut bytes = [0u8; 4];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

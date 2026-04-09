@@ -19,3 +19,4 @@ tracing-subscriber.workspace = true
 cli-clipboard.workspace = true
 futures.workspace = true
 anyhow.workspace = true
+rand.workspace = true
