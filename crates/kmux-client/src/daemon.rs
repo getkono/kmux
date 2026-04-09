@@ -102,7 +102,7 @@ fn cleanup_stale_daemon() {
     }
 }
 
-/// Spawn `kmux-server --daemon --self-signed --bind 127.0.0.1 --port 0`.
+/// Spawn `kmuxd --daemon --self-signed --bind 127.0.0.1 --port 0`.
 ///
 /// The server binary handles double-fork daemonization internally via `--daemon`.
 /// We use `LOCK_EX | LOCK_NB` on the pid file to prevent concurrent starts.
@@ -136,7 +136,7 @@ fn start_daemon() -> anyhow::Result<()> {
         ));
     }
 
-    // Resolve the server binary path. In development `kmux-server` is a
+    // Resolve the server binary path. In development `kmuxd` is a
     // sibling binary; in an installed layout it must be on PATH.
     let server_bin = find_server_binary()?;
 
@@ -206,7 +206,7 @@ pub async fn ensure_daemon() -> anyhow::Result<DaemonStatus> {
 
     Err(anyhow::anyhow!(
         "timed out waiting for local daemon to start; \
-         check that kmux-server is on PATH or in the same directory as kmux"
+         check that kmuxd is on PATH or in the same directory as kmux"
     ))
 }
 
@@ -228,7 +228,7 @@ fn find_server_binary() -> anyhow::Result<std::path::PathBuf> {
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
     {
-        let candidate = dir.join("kmux-server");
+        let candidate = dir.join("kmuxd");
         if candidate.exists() {
             return Ok(candidate);
         }
@@ -240,19 +240,19 @@ fn find_server_binary() -> anyhow::Result<std::path::PathBuf> {
     }
 
     Err(anyhow::anyhow!(
-        "could not find kmux-server binary; ensure it is installed alongside kmux or on PATH"
+        "could not find kmuxd binary; ensure it is installed alongside kmux or on PATH"
     ))
 }
 
 fn which_server() -> anyhow::Result<std::path::PathBuf> {
     let path_var = std::env::var("PATH").unwrap_or_default();
     for dir in path_var.split(':') {
-        let candidate = std::path::Path::new(dir).join("kmux-server");
+        let candidate = std::path::Path::new(dir).join("kmuxd");
         if candidate.exists() {
             return Ok(candidate);
         }
     }
-    Err(anyhow::anyhow!("kmux-server not found on PATH"))
+    Err(anyhow::anyhow!("kmuxd not found on PATH"))
 }
 
 #[cfg(test)]

@@ -18,12 +18,12 @@ kmux uses a server/client split:
 | --------------------------------------- | ---------------------------------------------------------------------- |
 | [`kmux-pty`](crates/kmux-pty)           | Async PTY lifecycle library (spawn, I/O, resize, shutdown)             |
 | [`kmux-protocol`](crates/kmux-protocol) | Shared wire protocol with postcard serialization                       |
-| [`kmux-server`](crates/kmux-server)     | Background daemon — manages PTY sessions, accepts QUIC+TLS connections |
+| [`kmuxd`](crates/kmuxd)     | Background daemon — manages PTY sessions, accepts QUIC+TLS connections |
 | [`kmux`](crates/kmux)                   | Desktop GUI client built on [iced](https://github.com/iced-rs/iced)    |
 
 ```
-kmux-server  ->  kmux-pty
-kmux-server  ->  kmux-protocol
+kmuxd  ->  kmux-pty
+kmuxd  ->  kmux-protocol
 kmux         ->  kmux-protocol
 ```
 
@@ -39,7 +39,7 @@ directly.
 Start the server with a self-signed certificate:
 
 ```bash
-$ cargo run -p kmux-server -- --self-signed
+$ cargo run -p kmuxd -- --self-signed
 ```
 
 The server prints a shared auth token on startup. Connect the GUI client:

@@ -36,7 +36,7 @@ use auth::{generate_token, persist_token};
 
 #[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 #[derive(Parser, Debug)]
-#[command(name = "kmux-server", about = "kmux remote terminal server")]
+#[command(name = "kmuxd", about = "kmux remote terminal server")]
 struct Cli {
     /// Address to bind (default: all interfaces)
     #[arg(long, default_value = "0.0.0.0")]
@@ -80,9 +80,7 @@ fn main() -> anyhow::Result<()> {
 
         // Initialize tracing after daemonize (child process has fresh fds).
         tracing_subscriber::fmt()
-            .with_env_filter(
-                EnvFilter::from_default_env().add_directive("kmux_server=info".parse()?),
-            )
+            .with_env_filter(EnvFilter::from_default_env().add_directive("kmuxd=info".parse()?))
             .init();
 
         let rt = tokio::runtime::Runtime::new()?;
@@ -94,9 +92,7 @@ fn main() -> anyhow::Result<()> {
         tracing_subscriber::fmt()
             .with_env_filter(EnvFilter::from_default_env())
             .init();
-        tracing::error!(
-            "kmux-server requires a backend feature: backend-alacritty or backend-termwiz"
-        );
+        tracing::error!("kmuxd requires a backend feature: backend-alacritty or backend-termwiz");
         std::process::exit(1);
     }
 

@@ -338,7 +338,7 @@ impl kmuxApp {
                     self.mgr
                         .set_status_msg(format!("Connected to {}:{}", p.host, p.port));
                 }
-                info!("Connected to kmux-server");
+                info!("Connected to kmuxd");
                 Task::none()
             }
 

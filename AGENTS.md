@@ -4,7 +4,7 @@ A terminal multiplexer / session manager with remote desktop capabilities.
 
 ## Commands
 
-- Run server: `cargo run -p kmux-server -- --self-signed`
+- Run server: `cargo run -p kmuxd -- --self-signed`
 - Run TUI client: `cargo run -p kmux`
 - Run GUI client: `cargo run -p kmux-gui`
 - Run tests: `just test`

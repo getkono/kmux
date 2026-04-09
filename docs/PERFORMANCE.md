@@ -34,7 +34,7 @@ existing `TerminalBuffer` on the client would become a thin grid store
 rather than a full VT parser.
 
 **Relevant code:**
-- `crates/kmux-server/src/relay.rs:29-45` -- raw byte read + fan-out
+- `crates/kmuxd/src/relay.rs:29-45` -- raw byte read + fan-out
 - `crates/kmux-client/src/terminal_view.rs:67-69` -- `push_bytes()` VT parsing
 - `crates/kmux-protocol/src/messages.rs:203-207` -- `PtyOutput { data: Vec<u8> }`
 
@@ -66,7 +66,7 @@ sink/stream in `writer_loop` (line 354-368) and the client's `connect.rs`.
 
 **Relevant code:**
 - `crates/kmux-protocol/src/frame.rs:23-24` -- `encode_server` / `to_allocvec`
-- `crates/kmux-server/src/connection.rs:354-368` -- `writer_loop` sends raw bytes
+- `crates/kmuxd/src/connection.rs:354-368` -- `writer_loop` sends raw bytes
 - `crates/kmux-protocol/src/messages.rs:106-110` -- `Auth` message (negotiation point)
 
 ---
@@ -96,9 +96,9 @@ add a `BytesMut` accumulator and a `tokio::time::Instant` deadline. No
 protocol changes required.
 
 **Relevant code:**
-- `crates/kmux-server/src/relay.rs:27` -- `buf = vec![0u8; 4096]`
-- `crates/kmux-server/src/relay.rs:29-45` -- immediate fan-out loop
-- `crates/kmux-server/src/relay.rs:51-53` -- per-message mutex lock + clone
+- `crates/kmuxd/src/relay.rs:27` -- `buf = vec![0u8; 4096]`
+- `crates/kmuxd/src/relay.rs:29-45` -- immediate fan-out loop
+- `crates/kmuxd/src/relay.rs:51-53` -- per-message mutex lock + clone
 
 ---
 
@@ -128,9 +128,9 @@ client can split batched messages. Alternatively, use `sink.feed()` +
 `sink.flush()` to let tungstenite batch at the WS layer.
 
 **Relevant code:**
-- `crates/kmux-server/src/connection.rs:354-368` -- `writer_loop`
-- `crates/kmux-server/src/connection.rs:358-363` -- single-message recv + send
-- `crates/kmux-server/src/connection.rs:160-191` -- scrollback replay burst
+- `crates/kmuxd/src/connection.rs:354-368` -- `writer_loop`
+- `crates/kmuxd/src/connection.rs:358-363` -- single-message recv + send
+- `crates/kmuxd/src/connection.rs:160-191` -- scrollback replay burst
 
 ---
 
@@ -163,9 +163,9 @@ updating `relay.rs`, and ensuring `postcard` can serialize `Bytes` (may
 need a `serde_bytes` attribute or custom serialization).
 
 **Relevant code:**
-- `crates/kmux-server/src/relay.rs:33` -- `to_vec()` allocation
-- `crates/kmux-server/src/relay.rs:38` -- `chunk.clone()` for scrollback
-- `crates/kmux-server/src/relay.rs:53` -- `msg.clone()` per client
+- `crates/kmuxd/src/relay.rs:33` -- `to_vec()` allocation
+- `crates/kmuxd/src/relay.rs:38` -- `chunk.clone()` for scrollback
+- `crates/kmuxd/src/relay.rs:53` -- `msg.clone()` per client
 - `crates/kmux-protocol/src/messages.rs:205` -- `data: Vec<u8>`
 
 ---
@@ -275,10 +275,10 @@ other optimizations -- most overhead comes from the items above, not WS
 framing.
 
 **Relevant code:**
-- `crates/kmux-server/src/connection.rs:19` -- `WsStream` type alias
-- `crates/kmux-server/src/connection.rs:288-289` -- WebSocket split
-- `crates/kmux-server/src/connection.rs:354-368` -- `writer_loop` WS send
-- `crates/kmux-server/src/tls.rs` -- TLS acceptor setup
+- `crates/kmuxd/src/connection.rs:19` -- `WsStream` type alias
+- `crates/kmuxd/src/connection.rs:288-289` -- WebSocket split
+- `crates/kmuxd/src/connection.rs:354-368` -- `writer_loop` WS send
+- `crates/kmuxd/src/tls.rs` -- TLS acceptor setup
 
 ---
 

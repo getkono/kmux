@@ -129,7 +129,7 @@ impl SessionManager {
                 self.status_msg = format!("Connected to {}:{}", self.host, self.port);
                 self.last_host = self.host.clone();
                 self.last_port = self.port;
-                info!("Connected to kmux-server");
+                info!("Connected to kmuxd");
 
                 let rid = self.next_rid();
                 self.send_ws(ClientMessage::SessionList { request_id: rid });
@@ -150,7 +150,7 @@ impl SessionManager {
         self.status_msg = format!("Connected to {}:{}", self.host, self.port);
         self.last_host = self.host.clone();
         self.last_port = self.port;
-        info!("Connected to kmux-server (external sender)");
+        info!("Connected to kmuxd (external sender)");
     }
 
     pub fn request_session_list(&mut self) {

@@ -1,10 +1,10 @@
 [package]
-name = "kmux-server"
+name = "kmuxd"
 version = "0.1.0"
 edition = "2024"
 
 [[bin]]
-name = "kmux-server"
+name = "kmuxd"
 path = "src/main.rs"
 
 [features]
