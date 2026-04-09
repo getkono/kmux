@@ -4,7 +4,7 @@ use crossterm::event::{Event, EventStream, KeyEvent, MouseEvent, MouseEventKind}
 use futures::StreamExt;
 use kmux_client::input::{encode_mouse_scroll, key_to_bytes};
 use kmux_client::session_manager::{SessionEvent, SessionManager};
-use kmux_protocol::messages::ServerMessage;
+use kmux_protocol::messages::{ServerMessage, SessionEntry};
 use ratatui::Terminal;
 use ratatui::prelude::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -44,6 +44,7 @@ pub struct App {
 
     // Directory picker state (remote connections)
     pub dir_picker_buffer: String,
+    pub dir_picker_selected: usize,
 
     // Auto-session selection context
     pub is_local: bool,
@@ -90,6 +91,7 @@ impl App {
             session_picker_selected: 0,
             session_picker_search: String::new(),
             dir_picker_buffer: String::new(),
+            dir_picker_selected: 0,
             is_local,
             initial_cwd,
             did_auto_select: false,
@@ -246,6 +248,16 @@ impl App {
                 _ => {}
             }
         }
+    }
+
+    /// Returns sessions whose CWD contains the current `dir_picker_buffer` text (case-insensitive).
+    pub fn dir_picker_matches(&self) -> Vec<&SessionEntry> {
+        let lower = self.dir_picker_buffer.to_lowercase();
+        self.mgr
+            .session_list()
+            .iter()
+            .filter(|e| lower.is_empty() || e.meta.cwd.to_lowercase().contains(&lower))
+            .collect()
     }
 
     /// Handle a key event. Returns the appropriate `KeyResult` for the event loop.
@@ -514,17 +526,34 @@ impl App {
             }
             Action::DirPickerChar(ch) => {
                 self.dir_picker_buffer.push(ch);
+                self.dir_picker_selected = 0;
             }
             Action::DirPickerBackspace => {
                 self.dir_picker_buffer.pop();
+                self.dir_picker_selected = 0;
+            }
+            Action::DirPickerUp => {
+                self.dir_picker_selected = self.dir_picker_selected.saturating_sub(1);
+            }
+            Action::DirPickerDown => {
+                let count = self.dir_picker_matches().len();
+                if count > 0 && self.dir_picker_selected + 1 < count {
+                    self.dir_picker_selected += 1;
+                }
             }
             Action::DirPickerSubmit => {
-                let cwd = self.dir_picker_buffer.trim().to_string();
-                if !cwd.is_empty() {
-                    if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
-                        self.mgr.select_session(word_id);
-                    } else {
-                        self.mgr.create_session_with_cwd(&cwd);
+                let matches = self.dir_picker_matches();
+                if let Some(entry) = matches.get(self.dir_picker_selected) {
+                    let word_id = entry.meta.word_id.clone();
+                    self.mgr.select_session(word_id);
+                } else {
+                    let cwd = self.dir_picker_buffer.trim().to_string();
+                    if !cwd.is_empty() {
+                        if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
+                            self.mgr.select_session(word_id);
+                        } else {
+                            self.mgr.create_session_with_cwd(&cwd);
+                        }
                     }
                 }
             }
