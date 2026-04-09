@@ -1,4 +1,5 @@
 mod app;
+mod config;
 mod key_convert;
 mod mode;
 mod theme;
@@ -39,6 +40,12 @@ struct Cli {
     /// Accept self-signed / invalid TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
+
+    /// Color theme: built-in name (one-dark, catppuccin-latte, catppuccin-frappe,
+    /// catppuccin-macchiato, catppuccin-mocha, dracula) or a custom theme name
+    /// from ~/.config/kmux/themes/<name>.toml
+    #[arg(long)]
+    theme: Option<String>,
 }
 
 #[tokio::main]
@@ -99,6 +106,8 @@ async fn main() -> anyhow::Result<()> {
         original_hook(panic_info);
     }));
 
+    let theme = config::resolve_theme(cli.theme.as_deref());
+
     let mut app = App::new(
         host,
         port,
@@ -106,6 +115,7 @@ async fn main() -> anyhow::Result<()> {
         accept_invalid_certs,
         is_local,
         initial_cwd,
+        theme,
     );
 
     let result = app.run(&mut terminal).await;

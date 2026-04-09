@@ -12,6 +12,7 @@ use tracing::info;
 
 use crate::key_convert;
 use crate::mode::{self, Action, ConnectField, Mode};
+use crate::theme::Theme;
 use crate::ui;
 
 /// What `handle_key` returns to the event loop.
@@ -26,6 +27,7 @@ pub struct App {
     pub mgr: SessionManager,
 
     // TUI-specific state
+    pub theme: Theme,
     pub mode: Mode,
     pub hud_visible: bool,
     pub force_snapshot_mode: bool,
@@ -65,6 +67,7 @@ impl App {
         accept_invalid_certs: bool,
         is_local: bool,
         initial_cwd: String,
+        theme: Theme,
     ) -> Self {
         let connect_host = host.clone();
         let connect_port = port.to_string();
@@ -80,6 +83,7 @@ impl App {
 
         Self {
             mgr: SessionManager::new(host, port, token, accept_invalid_certs),
+            theme,
             mode: initial_mode,
             hud_visible: false,
             force_snapshot_mode: false,

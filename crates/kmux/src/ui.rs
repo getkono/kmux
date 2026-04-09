@@ -7,7 +7,7 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
 use crate::app::App;
 use crate::mode::{self, ConnectField, Mode};
-use crate::theme;
+use crate::theme::{self, Theme};
 
 pub fn render(f: &mut Frame, app: &mut App) {
     match app.mode.clone() {
@@ -17,8 +17,9 @@ pub fn render(f: &mut Frame, app: &mut App) {
 }
 
 fn render_connect(f: &mut Frame, app: &App, active_field: &ConnectField) {
+    let theme = &app.theme;
     let area = f.area();
-    f.render_widget(Block::default().style(Style::default().bg(theme::BG)), area);
+    f.render_widget(Block::default().style(Style::default().bg(theme.bg)), area);
 
     let center_y = area.height / 2;
     let center_x = area.width / 2;
@@ -30,10 +31,10 @@ fn render_connect(f: &mut Frame, app: &App, active_field: &ConnectField) {
         Span::styled(
             "kmux",
             Style::default()
-                .fg(theme::ACCENT)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(" remote terminal", Style::default().fg(theme::FG_DIM)),
+        Span::styled(" remote terminal", Style::default().fg(theme.fg_dim)),
     ]);
     f.render_widget(
         Paragraph::new(title),
@@ -50,7 +51,7 @@ fn render_connect(f: &mut Frame, app: &App, active_field: &ConnectField) {
         let y = form_y + 2 + (i as u16 * 3);
         let is_active = active_field == field;
 
-        let label_style = Style::default().fg(theme::FG);
+        let label_style = Style::default().fg(theme.fg);
         f.render_widget(
             Paragraph::new(Span::styled(*label, label_style)),
             Rect::new(form_x, y, form_width, 1),
@@ -63,9 +64,9 @@ fn render_connect(f: &mut Frame, app: &App, active_field: &ConnectField) {
         };
 
         let border_color = if is_active {
-            theme::ACCENT
+            theme.accent
         } else {
-            theme::FG_DIM
+            theme.fg_dim
         };
         let input_block = Block::default()
             .borders(Borders::ALL)
@@ -91,9 +92,9 @@ fn render_connect(f: &mut Frame, app: &App, active_field: &ConnectField) {
     let status_y = form_y + 2 + 9;
     let status_style =
         if status_msg.starts_with("Connection failed") || status_msg.starts_with("Auth failed") {
-            Style::default().fg(theme::RED)
+            Style::default().fg(theme.red)
         } else {
-            Style::default().fg(theme::FG_DIM)
+            Style::default().fg(theme.fg_dim)
         };
     f.render_widget(
         Paragraph::new(Span::styled(status_msg, status_style)),
@@ -105,7 +106,7 @@ fn render_connect(f: &mut Frame, app: &App, active_field: &ConnectField) {
     f.render_widget(
         Paragraph::new(Span::styled(
             "Tab: next field  Enter: connect",
-            Style::default().fg(theme::FG_DIM),
+            Style::default().fg(theme.fg_dim),
         )),
         Rect::new(form_x, hint_y, form_width, 1),
     );
@@ -131,9 +132,13 @@ fn render_terminal(f: &mut Frame, app: &mut App) {
     // Overlays — clone mode to avoid borrow conflict with app
     let mode_snap = app.mode.clone();
     match &mode_snap {
-        Mode::Help => render_help_overlay(f, area),
-        Mode::ConfirmCloseSession { word_id } => render_confirm_overlay(f, area, word_id),
-        Mode::RenameSession { buffer, word_id } => render_rename_overlay(f, area, word_id, buffer),
+        Mode::Help => render_help_overlay(f, area, &app.theme),
+        Mode::ConfirmCloseSession { word_id } => {
+            render_confirm_overlay(f, area, word_id, &app.theme)
+        }
+        Mode::RenameSession { buffer, word_id } => {
+            render_rename_overlay(f, area, word_id, buffer, &app.theme)
+        }
         Mode::SessionPicker => render_session_picker_overlay(f, area, app),
         Mode::DirectoryPicker => render_dir_picker_overlay(f, area, app),
         _ => {}
@@ -146,6 +151,7 @@ fn render_terminal(f: &mut Frame, app: &mut App) {
 }
 
 fn render_session_bar(f: &mut Frame, app: &mut App, area: Rect) {
+    let theme = &app.theme;
     let mut spans = Vec::new();
 
     // Left: session badge (clickable, opens session picker)
@@ -162,13 +168,13 @@ fn render_session_bar(f: &mut Frame, app: &mut App, area: Rect) {
     spans.push(Span::styled(
         badge_text,
         Style::default()
-            .fg(theme::BG)
-            .bg(theme::ACCENT)
+            .fg(theme.bg)
+            .bg(theme.accent)
             .add_modifier(Modifier::BOLD),
     ));
 
     // Separator
-    spans.push(Span::styled(" ", Style::default().bg(theme::STATUS_BG)));
+    spans.push(Span::styled(" ", Style::default().bg(theme.status_bg)));
 
     // Right: pane tabs for the active session
     let active_pane = app.mgr.active_pane_id().map(|s| s.to_string());
@@ -182,7 +188,7 @@ fn render_session_bar(f: &mut Frame, app: &mut App, area: Rect) {
     if panes.is_empty() {
         spans.push(Span::styled(
             " — ",
-            Style::default().fg(theme::FG_DIM).bg(theme::STATUS_BG),
+            Style::default().fg(theme.fg_dim).bg(theme.status_bg),
         ));
     } else {
         for (pane_id, pane_index) in &panes {
@@ -194,14 +200,14 @@ fn render_session_bar(f: &mut Frame, app: &mut App, area: Rect) {
             };
             let style = if is_active {
                 Style::default()
-                    .fg(theme::BG)
-                    .bg(theme::GREEN)
+                    .fg(theme.bg)
+                    .bg(theme.green)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::FG).bg(theme::STATUS_BG)
+                Style::default().fg(theme.fg).bg(theme.status_bg)
             };
             spans.push(Span::styled(label, style));
-            spans.push(Span::styled(" ", Style::default().bg(theme::STATUS_BG)));
+            spans.push(Span::styled(" ", Style::default().bg(theme.status_bg)));
         }
     }
 
@@ -210,7 +216,7 @@ fn render_session_bar(f: &mut Frame, app: &mut App, area: Rect) {
     if used < area.width as usize {
         spans.push(Span::styled(
             " ".repeat(area.width as usize - used),
-            Style::default().bg(theme::STATUS_BG),
+            Style::default().bg(theme.status_bg),
         ));
     }
 
@@ -218,6 +224,7 @@ fn render_session_bar(f: &mut Frame, app: &mut App, area: Rect) {
 }
 
 fn render_grid(f: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
     // Track cursor position to set after buffer operations
     let mut cursor_pos: Option<(u16, u16)> = None;
 
@@ -229,8 +236,8 @@ fn render_grid(f: &mut Frame, app: &App, area: Rect) {
             for x in area.left()..area.right() {
                 let cell = &mut buf[(x, y)];
                 cell.set_char(' ');
-                cell.set_bg(theme::BG);
-                cell.set_fg(theme::FG);
+                cell.set_bg(theme.bg);
+                cell.set_fg(theme.fg);
             }
         }
 
@@ -245,7 +252,7 @@ fn render_grid(f: &mut Frame, app: &App, area: Rect) {
                     if px < area.right() {
                         let cell = &mut buf[(px, y)];
                         cell.set_char(ch);
-                        cell.set_fg(theme::FG_DIM);
+                        cell.set_fg(theme.fg_dim);
                     }
                 }
             }
@@ -292,8 +299,18 @@ fn render_grid(f: &mut Frame, app: &App, area: Rect) {
                     }
 
                     ratatui_cell.set_char(cs.c);
-                    ratatui_cell.set_fg(theme::cell_color(cs.fg));
-                    ratatui_cell.set_bg(theme::cell_color(cs.bg));
+                    let display_fg = if cs.attrs.contains(CellAttrs::DEFAULT_FG) {
+                        theme.fg
+                    } else {
+                        theme::cell_color(cs.fg)
+                    };
+                    let display_bg = if cs.attrs.contains(CellAttrs::DEFAULT_BG) {
+                        theme.bg
+                    } else {
+                        theme::cell_color(cs.bg)
+                    };
+                    ratatui_cell.set_fg(display_fg);
+                    ratatui_cell.set_bg(display_bg);
 
                     let mut modifier = Modifier::empty();
                     if cs.attrs.contains(CellAttrs::BOLD) {
@@ -364,7 +381,7 @@ fn render_grid(f: &mut Frame, app: &App, area: Rect) {
                     if px < area.right() {
                         let cell = &mut buf[(px, y)];
                         cell.set_char(ch);
-                        cell.set_fg(theme::YELLOW);
+                        cell.set_fg(theme.yellow);
                         cell.set_bg(Color::Rgb(0, 0, 0));
                     }
                 }
@@ -378,6 +395,7 @@ fn render_grid(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
     let mut spans = Vec::new();
 
     // Connection info
@@ -385,31 +403,31 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     if !host_port.is_empty() {
         spans.push(Span::styled(
             format!(" {} ", host_port),
-            Style::default().fg(theme::GREEN).bg(theme::STATUS_BG),
+            Style::default().fg(theme.green).bg(theme.status_bg),
         ));
         spans.push(Span::styled(
             " | ",
-            Style::default().fg(theme::FG_DIM).bg(theme::STATUS_BG),
+            Style::default().fg(theme.fg_dim).bg(theme.status_bg),
         ));
     }
 
     // Session count
     spans.push(Span::styled(
         format!("{} sessions", app.mgr.session_list().len()),
-        Style::default().fg(theme::FG).bg(theme::STATUS_BG),
+        Style::default().fg(theme.fg).bg(theme.status_bg),
     ));
 
     // Input lock
     if app.mgr.active_input_locked() {
         spans.push(Span::styled(
             " | ",
-            Style::default().fg(theme::FG_DIM).bg(theme::STATUS_BG),
+            Style::default().fg(theme.fg_dim).bg(theme.status_bg),
         ));
         spans.push(Span::styled(
             "LOCKED",
             Style::default()
-                .fg(theme::RED)
-                .bg(theme::STATUS_BG)
+                .fg(theme.red)
+                .bg(theme.status_bg)
                 .add_modifier(Modifier::BOLD),
         ));
     }
@@ -418,11 +436,11 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     if let Some((rows, cols)) = app.mgr.active_term_size() {
         spans.push(Span::styled(
             " | ",
-            Style::default().fg(theme::FG_DIM).bg(theme::STATUS_BG),
+            Style::default().fg(theme.fg_dim).bg(theme.status_bg),
         ));
         spans.push(Span::styled(
             format!("{cols}x{rows}"),
-            Style::default().fg(theme::FG_DIM).bg(theme::STATUS_BG),
+            Style::default().fg(theme.fg_dim).bg(theme.status_bg),
         ));
     }
 
@@ -435,12 +453,12 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         if gap > 0 {
             spans.push(Span::styled(
                 " ".repeat(gap),
-                Style::default().bg(theme::STATUS_BG),
+                Style::default().bg(theme.status_bg),
             ));
         }
         spans.push(Span::styled(
             format!(" {} ", status_msg),
-            Style::default().fg(theme::FG_DIM).bg(theme::STATUS_BG),
+            Style::default().fg(theme.fg_dim).bg(theme.status_bg),
         ));
     }
 
@@ -449,7 +467,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     if used < area.width as usize {
         spans.push(Span::styled(
             " ".repeat(area.width as usize - used),
-            Style::default().bg(theme::STATUS_BG),
+            Style::default().bg(theme.status_bg),
         ));
     }
 
@@ -457,29 +475,30 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
     let hints = mode::mode_hints(&app.mode);
     let mode_name = mode::mode_name(&app.mode);
 
     let mut spans = vec![Span::styled(
         format!(" {} ", mode_name),
         Style::default()
-            .fg(theme::BG)
-            .bg(mode_color(&app.mode))
+            .fg(theme.bg)
+            .bg(mode_color(&app.mode, theme))
             .add_modifier(Modifier::BOLD),
     )];
 
     for (key, desc) in &hints {
-        spans.push(Span::styled(" ", Style::default().bg(theme::BG)));
+        spans.push(Span::styled(" ", Style::default().bg(theme.bg)));
         spans.push(Span::styled(
             format!(" {key} "),
             Style::default()
-                .fg(theme::BG)
-                .bg(theme::FG_DIM)
+                .fg(theme.bg)
+                .bg(theme.fg_dim)
                 .add_modifier(Modifier::BOLD),
         ));
         spans.push(Span::styled(
             format!(" {desc}"),
-            Style::default().fg(theme::FG).bg(theme::BG),
+            Style::default().fg(theme.fg).bg(theme.bg),
         ));
     }
 
@@ -488,31 +507,32 @@ fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
     if used < area.width as usize {
         spans.push(Span::styled(
             " ".repeat(area.width as usize - used),
-            Style::default().bg(theme::BG),
+            Style::default().bg(theme.bg),
         ));
     }
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
-fn mode_color(mode: &Mode) -> Color {
+fn mode_color(mode: &Mode, theme: &Theme) -> Color {
     match mode {
-        Mode::Normal => theme::GREEN,
-        Mode::Locked => theme::RED,
-        Mode::Select => theme::ACCENT,
-        Mode::Session => theme::PURPLE,
-        Mode::Scroll => theme::YELLOW,
-        Mode::Signal => theme::RED,
-        Mode::ConfirmCloseSession { .. } => theme::RED,
-        Mode::RenameSession { .. } => theme::ORANGE,
-        Mode::SessionPicker => theme::ACCENT,
-        Mode::Help => theme::ACCENT,
-        Mode::Connect { .. } => theme::ACCENT,
-        Mode::DirectoryPicker => theme::ACCENT,
+        Mode::Normal => theme.green,
+        Mode::Locked => theme.red,
+        Mode::Select => theme.accent,
+        Mode::Session => theme.purple,
+        Mode::Scroll => theme.yellow,
+        Mode::Signal => theme.red,
+        Mode::ConfirmCloseSession { .. } => theme.red,
+        Mode::RenameSession { .. } => theme.orange,
+        Mode::SessionPicker => theme.accent,
+        Mode::Help => theme.accent,
+        Mode::Connect { .. } => theme.accent,
+        Mode::DirectoryPicker => theme.accent,
     }
 }
 
 fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
     let search = &app.session_picker_search;
     let search_lower = search.to_lowercase();
 
@@ -543,26 +563,23 @@ fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
 
     // Search line
     lines.push(Line::from(vec![
-        Span::styled(
-            " Search: ",
-            Style::default().fg(theme::FG_DIM).bg(theme::BG),
-        ),
+        Span::styled(" Search: ", Style::default().fg(theme.fg_dim).bg(theme.bg)),
         Span::styled(
             format!("{search}_"),
-            Style::default().fg(theme::FG).bg(theme::BG),
+            Style::default().fg(theme.fg).bg(theme.bg),
         ),
     ]));
 
     // Separator
     lines.push(Line::from(Span::styled(
         "\u{2500}".repeat(inner_width),
-        Style::default().fg(theme::FG_DIM).bg(theme::BG),
+        Style::default().fg(theme.fg_dim).bg(theme.bg),
     )));
 
     if matches.is_empty() {
         lines.push(Line::from(Span::styled(
             " (no results) ",
-            Style::default().fg(theme::FG_DIM).bg(theme::BG),
+            Style::default().fg(theme.fg_dim).bg(theme.bg),
         )));
     } else {
         for (i, entry) in matches.iter().enumerate() {
@@ -583,11 +600,11 @@ fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
 
             let style = if is_selected {
                 Style::default()
-                    .fg(theme::BG)
-                    .bg(theme::ACCENT)
+                    .fg(theme.bg)
+                    .bg(theme.accent)
                     .add_modifier(Modifier::BOLD)
             } else {
-                Style::default().fg(theme::FG).bg(theme::BG)
+                Style::default().fg(theme.fg).bg(theme.bg)
             };
             lines.push(Line::from(Span::styled(row_text, style)));
         }
@@ -595,19 +612,20 @@ fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT))
+        .border_style(Style::default().fg(theme.accent))
         .title(Span::styled(
             " Sessions ",
             Style::default()
-                .fg(theme::ACCENT)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ))
-        .style(Style::default().bg(theme::BG));
+        .style(Style::default().bg(theme.bg));
 
     f.render_widget(Paragraph::new(lines).block(block), overlay_area);
 }
 
 fn render_dir_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
     let buffer = &app.dir_picker_buffer;
     let buffer_lower = buffer.to_lowercase();
 
@@ -637,24 +655,24 @@ fn render_dir_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
     lines.push(Line::from(vec![
         Span::styled(
             " Directory: ",
-            Style::default().fg(theme::FG_DIM).bg(theme::BG),
+            Style::default().fg(theme.fg_dim).bg(theme.bg),
         ),
         Span::styled(
             format!("{buffer}_"),
-            Style::default().fg(theme::FG).bg(theme::BG),
+            Style::default().fg(theme.fg).bg(theme.bg),
         ),
     ]));
 
     // Separator
     lines.push(Line::from(Span::styled(
         "\u{2500}".repeat(inner_width),
-        Style::default().fg(theme::FG_DIM).bg(theme::BG),
+        Style::default().fg(theme.fg_dim).bg(theme.bg),
     )));
 
     if matches.is_empty() {
         lines.push(Line::from(Span::styled(
             " (no existing sessions — Enter to create new) ",
-            Style::default().fg(theme::FG_DIM).bg(theme::BG),
+            Style::default().fg(theme.fg_dim).bg(theme.bg),
         )));
     } else {
         for entry in matches.iter().take(6) {
@@ -668,26 +686,26 @@ fn render_dir_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
                 .collect();
             lines.push(Line::from(Span::styled(
                 row_text,
-                Style::default().fg(theme::FG).bg(theme::BG),
+                Style::default().fg(theme.fg).bg(theme.bg),
             )));
         }
     }
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT))
+        .border_style(Style::default().fg(theme.accent))
         .title(Span::styled(
             " Open Session ",
             Style::default()
-                .fg(theme::ACCENT)
+                .fg(theme.accent)
                 .add_modifier(Modifier::BOLD),
         ))
-        .style(Style::default().bg(theme::BG));
+        .style(Style::default().bg(theme.bg));
 
     f.render_widget(Paragraph::new(lines).block(block), overlay_area);
 }
 
-fn render_help_overlay(f: &mut Frame, area: Rect) {
+fn render_help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {
     let entries = mode::help_entries();
 
     let width = 50u16.min(area.width.saturating_sub(4));
@@ -701,7 +719,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     let mut lines = vec![Line::from(vec![Span::styled(
         " Keyboard Shortcuts ",
         Style::default()
-            .fg(theme::ACCENT)
+            .fg(theme.accent)
             .add_modifier(Modifier::BOLD),
     )])];
 
@@ -714,13 +732,13 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
             lines.push(Line::from(Span::styled(
                 *key,
                 Style::default()
-                    .fg(theme::ACCENT)
+                    .fg(theme.accent)
                     .add_modifier(Modifier::BOLD),
             )));
         } else {
             lines.push(Line::from(vec![
-                Span::styled(format!("{:>14}", key), Style::default().fg(theme::GREEN)),
-                Span::styled(format!("  {}", desc), Style::default().fg(theme::FG)),
+                Span::styled(format!("{:>14}", key), Style::default().fg(theme.green)),
+                Span::styled(format!("  {}", desc), Style::default().fg(theme.fg)),
             ]));
         }
     }
@@ -728,13 +746,13 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled(
         " Press any key to close ",
-        Style::default().fg(theme::FG_DIM),
+        Style::default().fg(theme.fg_dim),
     )));
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ACCENT))
-        .style(Style::default().bg(theme::BG));
+        .border_style(Style::default().fg(theme.accent))
+        .style(Style::default().bg(theme.bg));
 
     f.render_widget(
         Paragraph::new(lines)
@@ -744,7 +762,7 @@ fn render_help_overlay(f: &mut Frame, area: Rect) {
     );
 }
 
-fn render_confirm_overlay(f: &mut Frame, area: Rect, session: &str) {
+fn render_confirm_overlay(f: &mut Frame, area: Rect, session: &str, theme: &Theme) {
     let width = 40u16.min(area.width.saturating_sub(4));
     let height = 5;
     let x = area.width.saturating_sub(width) / 2;
@@ -758,23 +776,23 @@ fn render_confirm_overlay(f: &mut Frame, area: Rect, session: &str) {
         Line::from(vec![
             Span::styled(
                 " Close session ",
-                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+                Style::default().fg(theme.red).add_modifier(Modifier::BOLD),
             ),
-            Span::styled(format!("'{session}'"), Style::default().fg(theme::FG)),
-            Span::styled("? (y/n)", Style::default().fg(theme::FG_DIM)),
+            Span::styled(format!("'{session}'"), Style::default().fg(theme.fg)),
+            Span::styled("? (y/n)", Style::default().fg(theme.fg_dim)),
         ]),
         Line::from(""),
     ];
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::RED))
-        .style(Style::default().bg(theme::BG));
+        .border_style(Style::default().fg(theme.red))
+        .style(Style::default().bg(theme.bg));
 
     f.render_widget(Paragraph::new(lines).block(block), overlay_area);
 }
 
-fn render_rename_overlay(f: &mut Frame, area: Rect, session: &str, buffer: &str) {
+fn render_rename_overlay(f: &mut Frame, area: Rect, session: &str, buffer: &str, theme: &Theme) {
     let width = 40u16.min(area.width.saturating_sub(4));
     let height = 5;
     let x = area.width.saturating_sub(width) / 2;
@@ -787,17 +805,17 @@ fn render_rename_overlay(f: &mut Frame, area: Rect, session: &str, buffer: &str)
         Line::from(Span::styled(
             format!(" Rename '{session}' "),
             Style::default()
-                .fg(theme::ORANGE)
+                .fg(theme.orange)
                 .add_modifier(Modifier::BOLD),
         )),
         Line::from(""),
-        Line::from(Span::styled(buffer, Style::default().fg(theme::FG))),
+        Line::from(Span::styled(buffer, Style::default().fg(theme.fg))),
     ];
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::ORANGE))
-        .style(Style::default().bg(theme::BG));
+        .border_style(Style::default().fg(theme.orange))
+        .style(Style::default().bg(theme.bg));
 
     f.render_widget(Paragraph::new(lines).block(block), overlay_area);
 
@@ -810,6 +828,7 @@ fn render_rename_overlay(f: &mut Frame, area: Rect, session: &str, buffer: &str)
 }
 
 fn render_hud(f: &mut Frame, app: &App, area: Rect) {
+    let theme = &app.theme;
     let snap = app.mgr.metrics.snapshot(app.force_snapshot_mode);
     let c = &snap.counters;
 
@@ -819,26 +838,26 @@ fn render_hud(f: &mut Frame, app: &App, area: Rect) {
                 "Net+Apply: {:.1}ms avg / {:.1}ms max",
                 snap.net_apply_avg_ms, snap.net_apply_max_ms
             ),
-            Style::default().fg(theme::GREEN),
+            Style::default().fg(theme.green),
         )),
         Line::from(Span::styled(
             format!("Apply:     {:.2}ms avg", snap.apply_avg_ms),
-            Style::default().fg(theme::GREEN),
+            Style::default().fg(theme.green),
         )),
         Line::from(Span::styled(
             format!("Batch:     {:.1} msgs avg", snap.batch_avg),
-            Style::default().fg(theme::GREEN),
+            Style::default().fg(theme.green),
         )),
         Line::from(Span::styled(
             format!("Diff:      {} ops", snap.last_diff_ops),
-            Style::default().fg(theme::GREEN),
+            Style::default().fg(theme.green),
         )),
         Line::from(Span::styled(
             format!("LargeDiff: {:.1}ms", snap.last_large_diff_ms),
             Style::default().fg(if snap.last_large_diff_ms > 16.0 {
-                theme::YELLOW
+                theme.yellow
             } else {
-                theme::GREEN
+                theme.green
             }),
         )),
         Line::from(Span::styled(
@@ -847,9 +866,9 @@ fn render_hud(f: &mut Frame, app: &App, area: Rect) {
                 if snap.snapshot_mode { "FORCED" } else { "off" }
             ),
             Style::default().fg(if snap.snapshot_mode {
-                theme::YELLOW
+                theme.yellow
             } else {
-                theme::GREEN
+                theme.green
             }),
         )),
         Line::from(Span::styled(
@@ -857,7 +876,7 @@ fn render_hud(f: &mut Frame, app: &App, area: Rect) {
                 "Disc:{}  Gap:{}  Lag:{}  Sync:{}",
                 c.stale_discards, c.seqno_gaps, c.lag_events, c.resyncs
             ),
-            Style::default().fg(theme::YELLOW),
+            Style::default().fg(theme.yellow),
         )),
     ];
 
@@ -871,11 +890,11 @@ fn render_hud(f: &mut Frame, app: &App, area: Rect) {
 
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::FG_DIM))
+        .border_style(Style::default().fg(theme.fg_dim))
         .title(" HUD ")
         .title_style(
             Style::default()
-                .fg(theme::GREEN)
+                .fg(theme.green)
                 .add_modifier(Modifier::BOLD),
         )
         .style(Style::default().bg(Color::Rgb(0x1a, 0x1d, 0x23)));

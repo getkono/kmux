@@ -418,16 +418,13 @@ impl TerminalBackend for TermwizBackend {
                 let attrs = cell_ref.attrs();
                 let c = cell_ref.str().chars().next().unwrap_or(' ');
 
-                let (fg, bg) = if attrs.reverse() {
-                    (
-                        resolve_bg_color(attrs.background()),
-                        resolve_fg_color(attrs.foreground()),
-                    )
+                let is_reverse = attrs.reverse();
+                let orig_fg = attrs.foreground();
+                let orig_bg = attrs.background();
+                let (fg, bg) = if is_reverse {
+                    (resolve_bg_color(orig_bg), resolve_fg_color(orig_fg))
                 } else {
-                    (
-                        resolve_fg_color(attrs.foreground()),
-                        resolve_bg_color(attrs.background()),
-                    )
+                    (resolve_fg_color(orig_fg), resolve_bg_color(orig_bg))
                 };
 
                 let mut bits: u16 = 0;
@@ -443,7 +440,7 @@ impl TerminalBackend for TermwizBackend {
                 if attrs.strikethrough() {
                     bits |= CellAttrs::STRIKETHROUGH;
                 }
-                if attrs.reverse() {
+                if is_reverse {
                     bits |= CellAttrs::INVERSE;
                 }
                 if attrs.invisible() {
@@ -457,6 +454,25 @@ impl TerminalBackend for TermwizBackend {
                     bits |= CellAttrs::WIDE_CHAR;
                 } else if width == 0 {
                     bits |= CellAttrs::WIDE_CHAR_SPACER;
+                }
+
+                // Mark cells whose displayed colours come from the terminal default.
+                let is_default_orig_fg = matches!(orig_fg, ColorAttribute::Default);
+                let is_default_orig_bg = matches!(orig_bg, ColorAttribute::Default);
+                if is_reverse {
+                    if is_default_orig_bg {
+                        bits |= CellAttrs::DEFAULT_FG;
+                    }
+                    if is_default_orig_fg {
+                        bits |= CellAttrs::DEFAULT_BG;
+                    }
+                } else {
+                    if is_default_orig_fg {
+                        bits |= CellAttrs::DEFAULT_FG;
+                    }
+                    if is_default_orig_bg {
+                        bits |= CellAttrs::DEFAULT_BG;
+                    }
                 }
 
                 out[row_idx * cols + col_idx] = CellState {
