@@ -1,10 +1,13 @@
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tracing::{error, info, warn};
+
+use crate::app::ServerApp;
 
 /// Daemonize the current process (double-fork) and write the child PID to `pid_path`.
 ///
@@ -37,6 +40,13 @@ struct StatusResponse {
     token: String,
     pid: u32,
     uptime_secs: u64,
+    session_count: usize,
+}
+
+/// JSON response for the stop command.
+#[derive(Serialize)]
+struct StopResponse {
+    status: &'static str,
 }
 
 /// Bind the Unix control socket and serve status queries.
@@ -52,6 +62,7 @@ pub async fn serve_control_socket(
     port: u16,
     token: String,
     start_time: Instant,
+    app: Arc<ServerApp>,
 ) {
     // Remove stale socket if it exists from a previous run.
     if socket_path.exists() {
@@ -94,8 +105,9 @@ pub async fn serve_control_socket(
                 match accept_result {
                     Ok((stream, _)) => {
                         let token = token.clone();
+                        let app = Arc::clone(&app);
                         tokio::spawn(async move {
-                            handle_control_connection(stream, port, &token, start_time).await;
+                            handle_control_connection(stream, port, &token, start_time, app).await;
                         });
                     }
                     Err(e) => {
@@ -121,6 +133,7 @@ async fn handle_control_connection(
     port: u16,
     token: &str,
     start_time: Instant,
+    app: Arc<ServerApp>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -139,30 +152,49 @@ async fn handle_control_connection(
         }
     };
 
-    if req.command != "status" {
-        warn!("Unknown control command: {}", req.command);
-        return;
-    }
-
-    let response = StatusResponse {
-        status: "running",
-        port,
-        token: token.to_string(),
-        pid: std::process::id(),
-        uptime_secs: start_time.elapsed().as_secs(),
-    };
-
-    let mut json = match serde_json::to_string(&response) {
-        Ok(s) => s,
-        Err(e) => {
-            warn!("Failed to serialize status response: {e}");
-            return;
+    match req.command.as_str() {
+        "status" => {
+            let session_count = app.list_sessions().await.len();
+            let response = StatusResponse {
+                status: "running",
+                port,
+                token: token.to_string(),
+                pid: std::process::id(),
+                uptime_secs: start_time.elapsed().as_secs(),
+                session_count,
+            };
+            let mut json = match serde_json::to_string(&response) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to serialize status response: {e}");
+                    return;
+                }
+            };
+            json.push('\n');
+            if let Err(e) = write_half.write_all(json.as_bytes()).await {
+                warn!("Control socket write error: {e}");
+            }
         }
-    };
-    json.push('\n');
-
-    if let Err(e) = write_half.write_all(json.as_bytes()).await {
-        warn!("Control socket write error: {e}");
+        "stop" => {
+            let response = StopResponse { status: "ok" };
+            let mut json = match serde_json::to_string(&response) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to serialize stop response: {e}");
+                    return;
+                }
+            };
+            json.push('\n');
+            if let Err(e) = write_half.write_all(json.as_bytes()).await {
+                warn!("Control socket write error: {e}");
+            }
+            info!("Received stop command, sending SIGTERM to self");
+            let _ =
+                nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM);
+        }
+        other => {
+            warn!("Unknown control command: {other}");
+        }
     }
 }
 

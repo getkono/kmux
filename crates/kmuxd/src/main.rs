@@ -162,6 +162,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
         let pid_path = kmux_protocol::dirs::pid_path()?;
         let start_time = Instant::now();
         let token_clone = token.clone();
+        let app_clone = Arc::clone(&app);
         tokio::spawn(async move {
             daemon::serve_control_socket(
                 socket_path,
@@ -169,6 +170,7 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 actual_port,
                 token_clone,
                 start_time,
+                app_clone,
             )
             .await;
         });
