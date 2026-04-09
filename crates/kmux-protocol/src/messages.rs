@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// Current wire protocol version. Increment when breaking changes are made.
-pub const PROTOCOL_VERSION: u32 = 9;
+pub const PROTOCOL_VERSION: u32 = 10;
 
 /// Return the current wall-clock time as milliseconds since the Unix epoch.
 pub fn epoch_millis() -> u64 {
@@ -13,14 +13,21 @@ pub fn epoch_millis() -> u64 {
         .as_millis() as u64
 }
 
-pub type SessionId = String;
 pub type RequestId = u64;
+
+/// Unique word-based session identifier (a single word from the EFF long wordlist).
+/// Example: `"eagle"`, `"falcon"`.
+pub type WordId = String;
+
+/// Pane identifier: `"{word_id}/{pane_index}"`.
+/// Example: `"eagle/0"`, `"eagle/1"`.
+pub type PaneId = String;
 
 /// Opaque client identity assigned by the server on successful authentication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClientId(pub u64);
 
-/// Monotonic sequence number attached to each PTY output chunk per session.
+/// Monotonic sequence number attached to each PTY output chunk per pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SequenceNo(pub u64);
 
@@ -47,19 +54,43 @@ pub enum SessionStatus {
     },
 }
 
-/// Snapshot of a session as reported by the server.
+/// Immutable session-level metadata.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SessionInfo {
-    pub name: SessionId,
+pub struct SessionMeta {
+    /// Chronological creation index (0-based, monotonically increasing).
+    pub index: u32,
+    /// Unique word-based identifier (e.g. `"eagle"`).
+    pub word_id: WordId,
+    /// Human-readable display name (default: `basename(cwd)`).
+    pub name: String,
+    /// Server-side working directory associated with this session.
+    pub cwd: String,
+}
+
+/// Snapshot of a single pane within a session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PaneInfo {
+    /// Full pane identifier: `"{word_id}/{pane_index}"`.
+    pub pane_id: PaneId,
+    /// Zero-based index within the session (monotonically increasing per session).
+    pub pane_index: u32,
+    /// Shell or program running inside this pane.
     pub program: String,
     pub size: TermSize,
     /// IDs of currently attached clients.
     pub attached_clients: Vec<ClientId>,
-    /// Whether the session's child process is still running.
+    /// Whether the pane's child process is still running.
     pub status: SessionStatus,
 }
 
-/// Input control mode for a session.
+/// Full session listing entry returned by `SessionList` and related messages.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SessionEntry {
+    pub meta: SessionMeta,
+    pub panes: Vec<PaneInfo>,
+}
+
+/// Input control mode for a pane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputMode {
     /// Any authenticated client may send input.
@@ -73,27 +104,29 @@ pub enum InputMode {
 /// Lifecycle event relayed from the server's event bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum SessionEventMsg {
-    Spawned {
-        name: SessionId,
-    },
-    Exited {
-        name: SessionId,
+    /// A new session (with its initial pane) was created.
+    SessionCreated { word_id: WordId },
+    /// A session and all its panes were closed.
+    SessionClosed { word_id: WordId },
+    /// A session was renamed.
+    SessionRenamed { word_id: WordId, new_name: String },
+
+    /// A new pane was spawned inside a session.
+    PaneSpawned { pane_id: PaneId },
+    /// A pane's child process exited.
+    PaneExited {
+        pane_id: PaneId,
         code: Option<i32>,
         signal: Option<i32>,
     },
-    Resized {
-        name: SessionId,
+    /// A pane was resized.
+    PaneResized {
+        pane_id: PaneId,
         rows: u16,
         cols: u16,
     },
-    Closed {
-        name: SessionId,
-    },
-    /// Session was renamed.
-    Renamed {
-        old_name: SessionId,
-        new_name: SessionId,
-    },
+    /// A pane was closed.
+    PaneClosed { pane_id: PaneId },
 }
 
 /// Error codes for structured error responses.
@@ -107,6 +140,10 @@ pub enum ErrorCode {
     InternalError,
     InputLocked,
     InputDisabled,
+    /// The daemon has reached the 1000 active session limit.
+    SessionLimitReached,
+    /// The specified pane was not found.
+    PaneNotFound,
 }
 
 //  VT diff types
@@ -287,62 +324,83 @@ pub enum ClientMessage {
         protocol_version: u32,
     },
 
-    /// Request creation of a new named PTY session.
+    /// Request creation of a new session (with one initial pane).
+    /// The server assigns the `word_id` automatically.
     SessionCreate {
         request_id: RequestId,
-        name: SessionId,
+        /// Optional display name; defaults to `basename(cwd)` if `None`.
+        name: Option<String>,
+        /// Working directory for the session (server-side path).
+        /// Defaults to the server's home directory if `None`.
+        cwd: Option<String>,
+        /// Shell or program to run in the initial pane; defaults to system shell if `None`.
+        program: Option<String>,
+        args: Vec<String>,
+        size: TermSize,
+    },
+
+    /// Request graceful close of an entire session (all panes).
+    SessionClose {
+        request_id: RequestId,
+        word_id: WordId,
+    },
+
+    /// Request a list of all active sessions.
+    SessionList { request_id: RequestId },
+
+    /// Rename an existing session's display name.
+    SessionRename {
+        request_id: RequestId,
+        word_id: WordId,
+        new_name: String,
+    },
+
+    /// Create a new pane inside an existing session.
+    PaneCreate {
+        request_id: RequestId,
+        word_id: WordId,
         /// Shell or program to run; defaults to system shell if `None`.
         program: Option<String>,
         args: Vec<String>,
         size: TermSize,
     },
 
-    /// Request graceful close of a session.
-    SessionClose {
+    /// Request graceful close of a single pane.
+    PaneClose {
         request_id: RequestId,
-        name: SessionId,
-    },
-
-    /// Request a list of all active sessions.
-    SessionList { request_id: RequestId },
-
-    /// Rename an existing session.
-    SessionRename {
-        request_id: RequestId,
-        session: SessionId,
-        new_name: String,
+        pane_id: PaneId,
     },
 
     /// Send bytes to the PTY master (user keystrokes).
-    PtyInput { session: SessionId, data: Vec<u8> },
+    PtyInput { pane_id: PaneId, data: Vec<u8> },
 
     /// Paste clipboard text into the PTY. The server handles bracketed-paste
     /// wrapping when the terminal has enabled DEC private mode 2004.
-    PtyPaste { session: SessionId, data: String },
+    PtyPaste { pane_id: PaneId, data: String },
 
     /// Resize the PTY window.
-    Resize { session: SessionId, size: TermSize },
+    Resize { pane_id: PaneId, size: TermSize },
 
-    /// Subscribe to PTY output for a session.
+    /// Subscribe to PTY output for a pane.
     ///
     /// `last_seqno = None`       -> send full snapshot (first attach or full resync)
     /// `last_seqno = Some(n)`    -> replay only chunks with seqno > n (reconnect)
     Attach {
-        session: SessionId,
+        pane_id: PaneId,
         last_seqno: Option<SequenceNo>,
     },
 
-    /// Unsubscribe from PTY output for a session.
-    Detach { session: SessionId },
+    /// Unsubscribe from PTY output for a pane.
+    Detach { pane_id: PaneId },
 
     /// Send a Unix signal to the PTY child process.
-    Signal { session: SessionId, signal: i32 },
+    Signal { pane_id: PaneId, signal: i32 },
 
-    /// Request exclusive input rights for a session.
-    RequestInputLock { session: SessionId },
+    /// Request exclusive input rights for a pane.
+    RequestInputLock { pane_id: PaneId },
 
     /// Release previously acquired input lock.
-    ReleaseInputLock { session: SessionId },
+    ReleaseInputLock { pane_id: PaneId },
 
     /// Toggle full-snapshot mode for this client. When enabled, the server
     /// sends `TerminalSnapshot` messages instead of incremental `TerminalUpdate`
@@ -367,42 +425,44 @@ pub enum ServerMessage {
         client_id: Option<ClientId>,
     },
 
-    /// Confirmation that a session was created.
+    /// Confirmation that a session (with initial pane) was created.
     SessionCreated {
         request_id: RequestId,
-        name: SessionId,
+        entry: SessionEntry,
     },
 
     /// Confirmation that a session was closed.
     SessionClosed {
         request_id: RequestId,
-        name: SessionId,
+        word_id: WordId,
         exit_code: Option<i32>,
     },
 
     /// Response to `SessionList`.
     SessionListResult {
         request_id: RequestId,
-        sessions: Vec<SessionInfo>,
+        sessions: Vec<SessionEntry>,
     },
 
-    /// PTY output chunk for an attached session, tagged with a sequence number.
-    /// Superseded by `TerminalUpdate`/`TerminalSnapshot` in protocol v3.
-    #[deprecated(note = "use TerminalUpdate/TerminalSnapshot instead")]
-    PtyOutput {
-        session: SessionId,
-        data: Vec<u8>,
-        seqno: SequenceNo,
+    /// Confirmation that a new pane was created.
+    PaneCreated {
+        request_id: RequestId,
+        pane_id: PaneId,
+        session_word_id: WordId,
+    },
+
+    /// Confirmation that a pane was closed.
+    PaneClosed {
+        request_id: RequestId,
+        pane_id: PaneId,
+        exit_code: Option<i32>,
     },
 
     /// The client fell too far behind and missed output. Re-attach with `last_seqno`.
-    Lagged {
-        session: SessionId,
-        missed_count: u64,
-    },
+    Lagged { pane_id: PaneId, missed_count: u64 },
 
     /// Full snapshot was sent because the requested seqno is no longer in the buffer.
-    SyncReset { session: SessionId },
+    SyncReset { pane_id: PaneId },
 
     /// Asynchronous lifecycle event.
     Event { event: SessionEventMsg },
@@ -420,30 +480,30 @@ pub enum ServerMessage {
     /// Response to client `Ping`.
     Pong { seq: u64 },
 
-    /// Server-side VT diff for an attached session.
+    /// Server-side VT diff for an attached pane.
     TerminalUpdate {
-        session: SessionId,
+        pane_id: PaneId,
         diff: Arc<TerminalDiff>,
         seqno: SequenceNo,
         /// Wall-clock timestamp (ms since Unix epoch) when the server sent this message.
         sent_at_ms: u64,
     },
 
-    /// Full grid snapshot for an attached session (sent on attach/resize).
+    /// Full grid snapshot for an attached pane (sent on attach/resize).
     TerminalSnapshot {
-        session: SessionId,
+        pane_id: PaneId,
         snapshot: GridSnapshot,
         seqno: SequenceNo,
         /// Wall-clock timestamp (ms since Unix epoch) when the server sent this message.
         sent_at_ms: u64,
     },
 
-    /// Cursor-only update for an attached session (no cell changes).
+    /// Cursor-only update for an attached pane (no cell changes).
     ///
     /// Shares the same seqno space as `TerminalUpdate` so client gap
     /// detection works unchanged.
     CursorUpdate {
-        session: SessionId,
+        pane_id: PaneId,
         cursor: CursorState,
         modes: TermModes,
         seqno: SequenceNo,
@@ -451,22 +511,16 @@ pub enum ServerMessage {
     },
 
     /// Input lock granted to the requesting client.
-    InputLockGranted { session: SessionId },
+    InputLockGranted { pane_id: PaneId },
 
     /// Input lock request denied; another client holds it.
-    InputLockDenied {
-        session: SessionId,
-        holder: ClientId,
-    },
+    InputLockDenied { pane_id: PaneId, holder: ClientId },
 
-    /// The input lock for a session was released.
-    InputLockReleased { session: SessionId },
+    /// The input lock for a pane was released.
+    InputLockReleased { pane_id: PaneId },
 
     /// Confirmation that a session was renamed.
-    SessionRenamed {
-        old_name: SessionId,
-        new_name: SessionId,
-    },
+    SessionRenamed { word_id: WordId, new_name: String },
 }
 
 #[cfg(test)]
@@ -564,5 +618,19 @@ mod tests {
                 "flag {i} is not a single bit: {flag}"
             );
         }
+    }
+
+    #[test]
+    fn pane_id_format() {
+        let word_id = "eagle".to_string();
+        let pane_index = 0u32;
+        let pane_id = format!("{word_id}/{pane_index}");
+        assert_eq!(pane_id, "eagle/0");
+
+        // Parse back
+        let (w, idx_str) = pane_id.rsplit_once('/').unwrap();
+        let idx: u32 = idx_str.parse().unwrap();
+        assert_eq!(w, "eagle");
+        assert_eq!(idx, 0);
     }
 }

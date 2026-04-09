@@ -9,9 +9,9 @@ use crate::app::App;
 use crate::mode::{self, ConnectField, Mode};
 use crate::theme;
 
-pub fn render(f: &mut Frame, app: &App) {
-    match &app.mode {
-        Mode::Connect { field } => render_connect(f, app, field),
+pub fn render(f: &mut Frame, app: &mut App) {
+    match app.mode.clone() {
+        Mode::Connect { field } => render_connect(f, app, &field),
         _ => render_terminal(f, app),
     }
 }
@@ -111,7 +111,7 @@ fn render_connect(f: &mut Frame, app: &App, active_field: &ConnectField) {
     );
 }
 
-fn render_terminal(f: &mut Frame, app: &App) {
+fn render_terminal(f: &mut Frame, app: &mut App) {
     let area = f.area();
 
     // Layout: session bar (1) | terminal (fill) | status bar (1) | hint bar (1)
@@ -128,11 +128,13 @@ fn render_terminal(f: &mut Frame, app: &App) {
     render_status_bar(f, app, chunks[2]);
     render_hint_bar(f, app, chunks[3]);
 
-    // Overlays
-    match &app.mode {
+    // Overlays — clone mode to avoid borrow conflict with app
+    let mode_snap = app.mode.clone();
+    match &mode_snap {
         Mode::Help => render_help_overlay(f, area),
-        Mode::ConfirmClose { session } => render_confirm_overlay(f, area, session),
-        Mode::Rename { buffer, session } => render_rename_overlay(f, area, session, buffer),
+        Mode::ConfirmCloseSession { word_id } => render_confirm_overlay(f, area, word_id),
+        Mode::RenameSession { buffer, word_id } => render_rename_overlay(f, area, word_id, buffer),
+        Mode::SessionPicker => render_session_picker_overlay(f, area, app),
         _ => {}
     }
 
@@ -142,28 +144,64 @@ fn render_terminal(f: &mut Frame, app: &App) {
     }
 }
 
-fn render_session_bar(f: &mut Frame, app: &App, area: Rect) {
+fn render_session_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let mut spans = Vec::new();
 
-    for info in app.mgr.session_list().iter() {
-        let is_active = app.mgr.active_session() == Some(info.name.as_str());
-        let style = if is_active {
-            Style::default()
-                .fg(theme::BG)
-                .bg(theme::ACCENT)
-                .add_modifier(Modifier::BOLD)
-        } else {
-            Style::default().fg(theme::FG).bg(theme::STATUS_BG)
-        };
-        spans.push(Span::styled(format!(" {} ", info.name), style));
-        spans.push(Span::styled(" ", Style::default().bg(theme::STATUS_BG)));
-    }
+    // Left: session badge (clickable, opens session picker)
+    let badge_text = if let Some(word_id) = app.mgr.active_session() {
+        let name = app.mgr.display_name_for(word_id);
+        format!(" \u{25b6} {name} ")
+    } else {
+        " No sessions ".to_string()
+    };
+    let badge_width = badge_text.len() as u16;
+    // Store badge width for mouse click detection
+    app.session_badge_cols = badge_width;
 
-    if spans.is_empty() {
+    spans.push(Span::styled(
+        badge_text,
+        Style::default()
+            .fg(theme::BG)
+            .bg(theme::ACCENT)
+            .add_modifier(Modifier::BOLD),
+    ));
+
+    // Separator
+    spans.push(Span::styled(" ", Style::default().bg(theme::STATUS_BG)));
+
+    // Right: pane tabs for the active session
+    let active_pane = app.mgr.active_pane_id().map(|s| s.to_string());
+    let panes: Vec<_> = app
+        .mgr
+        .active_session_panes()
+        .iter()
+        .map(|p| (p.pane_id.clone(), p.pane_index))
+        .collect();
+
+    if panes.is_empty() {
         spans.push(Span::styled(
-            " No sessions ",
+            " — ",
             Style::default().fg(theme::FG_DIM).bg(theme::STATUS_BG),
         ));
+    } else {
+        for (pane_id, pane_index) in &panes {
+            let is_active = active_pane.as_deref() == Some(pane_id.as_str());
+            let label = if is_active {
+                format!(" \u{2022}{pane_index} ")
+            } else {
+                format!(" {pane_index} ")
+            };
+            let style = if is_active {
+                Style::default()
+                    .fg(theme::BG)
+                    .bg(theme::GREEN)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::FG).bg(theme::STATUS_BG)
+            };
+            spans.push(Span::styled(label, style));
+            spans.push(Span::styled(" ", Style::default().bg(theme::STATUS_BG)));
+        }
     }
 
     // Pad the rest
@@ -195,8 +233,8 @@ fn render_grid(f: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        let Some(name) = app.mgr.active_session() else {
-            // No active session message
+        let Some(name) = app.mgr.active_pane_id() else {
+            // No active pane message
             let msg = "No active session -- press Ctrl+G then s, c to create one";
             let x = area.left() + area.width.saturating_sub(msg.len() as u16) / 2;
             let y = area.top() + area.height / 2;
@@ -361,9 +399,7 @@ fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
     ));
 
     // Input lock
-    if let Some(session) = app.mgr.active_session()
-        && app.mgr.is_input_locked(session)
-    {
+    if app.mgr.active_input_locked() {
         spans.push(Span::styled(
             " | ",
             Style::default().fg(theme::FG_DIM).bg(theme::STATUS_BG),
@@ -466,11 +502,107 @@ fn mode_color(mode: &Mode) -> Color {
         Mode::Session => theme::PURPLE,
         Mode::Scroll => theme::YELLOW,
         Mode::Signal => theme::RED,
-        Mode::ConfirmClose { .. } => theme::RED,
-        Mode::Rename { .. } => theme::ORANGE,
+        Mode::ConfirmCloseSession { .. } => theme::RED,
+        Mode::RenameSession { .. } => theme::ORANGE,
+        Mode::SessionPicker => theme::ACCENT,
         Mode::Help => theme::ACCENT,
         Mode::Connect { .. } => theme::ACCENT,
     }
+}
+
+fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
+    let search = &app.session_picker_search;
+    let search_lower = search.to_lowercase();
+
+    let matches: Vec<_> = app
+        .mgr
+        .session_list()
+        .iter()
+        .filter(|e| {
+            search_lower.is_empty()
+                || e.meta.name.to_lowercase().contains(&search_lower)
+                || e.meta.word_id.to_lowercase().contains(&search_lower)
+        })
+        .collect();
+
+    let visible_rows = matches.len().min(8) as u16;
+    let width = 52u16.min(area.width.saturating_sub(4));
+    // search row + separator + entries + border
+    let height = (visible_rows + 4).min(area.height.saturating_sub(2));
+    let x = area.width.saturating_sub(width) / 2;
+    let y = area.height.saturating_sub(height) / 2;
+    let overlay_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, overlay_area);
+
+    let inner_width = width.saturating_sub(2) as usize;
+
+    let mut lines = vec![];
+
+    // Search line
+    lines.push(Line::from(vec![
+        Span::styled(
+            " Search: ",
+            Style::default().fg(theme::FG_DIM).bg(theme::BG),
+        ),
+        Span::styled(
+            format!("{search}_"),
+            Style::default().fg(theme::FG).bg(theme::BG),
+        ),
+    ]));
+
+    // Separator
+    lines.push(Line::from(Span::styled(
+        "\u{2500}".repeat(inner_width),
+        Style::default().fg(theme::FG_DIM).bg(theme::BG),
+    )));
+
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (no results) ",
+            Style::default().fg(theme::FG_DIM).bg(theme::BG),
+        )));
+    } else {
+        for (i, entry) in matches.iter().enumerate() {
+            if i >= 8 {
+                break;
+            }
+            let is_selected = i == app.session_picker_selected;
+            let cursor = if is_selected { ">" } else { " " };
+            let name = app.mgr.display_name_for(&entry.meta.word_id);
+            let cwd = &entry.meta.cwd;
+            let pane_count = entry.panes.len();
+
+            let row_text = format!("{cursor} {name:<20} {pane_count}p  {cwd}");
+            let row_text: String = row_text
+                .chars()
+                .take(inner_width.saturating_sub(1))
+                .collect();
+
+            let style = if is_selected {
+                Style::default()
+                    .fg(theme::BG)
+                    .bg(theme::ACCENT)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::FG).bg(theme::BG)
+            };
+            lines.push(Line::from(Span::styled(row_text, style)));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .title(Span::styled(
+            " Sessions ",
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme::BG));
+
+    f.render_widget(Paragraph::new(lines).block(block), overlay_area);
 }
 
 fn render_help_overlay(f: &mut Frame, area: Rect) {

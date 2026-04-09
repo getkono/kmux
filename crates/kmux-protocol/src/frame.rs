@@ -97,26 +97,11 @@ mod tests {
     }
 
     #[test]
-    #[allow(deprecated)]
-    fn roundtrip_server_pty_output() {
-        let msg = ServerMessage::PtyOutput {
-            session: "alpha".to_string(),
-            data: b"hello\r\n".to_vec(),
-            seqno: SequenceNo(42),
-        };
-        let bytes = encode_server(&msg).expect("encode");
-        let decoded = decode_server(&bytes).expect("decode");
-        assert!(
-            matches!(&decoded, ServerMessage::PtyOutput { session, data, seqno }
-                if session == "alpha" && data == b"hello\r\n" && seqno.0 == 42)
-        );
-    }
-
-    #[test]
     fn roundtrip_client_session_create() {
         let msg = ClientMessage::SessionCreate {
             request_id: 42,
-            name: "my-session".to_string(),
+            name: Some("my-session".to_string()),
+            cwd: None,
             program: Some("/bin/bash".to_string()),
             args: vec![],
             size: TermSize {
@@ -127,7 +112,8 @@ mod tests {
         let bytes = encode_client(&msg).expect("encode");
         let decoded = decode_client(&bytes).expect("decode");
         assert!(
-            matches!(&decoded, ClientMessage::SessionCreate { request_id: 42, name, .. } if name == "my-session")
+            matches!(&decoded, ClientMessage::SessionCreate { request_id: 42, name, .. }
+                if name.as_deref() == Some("my-session"))
         );
     }
 
@@ -152,14 +138,14 @@ mod tests {
     #[test]
     fn roundtrip_client_attach_with_seqno() {
         let msg = ClientMessage::Attach {
-            session: "s1".to_string(),
+            pane_id: "eagle/0".to_string(),
             last_seqno: Some(SequenceNo(100)),
         };
         let bytes = encode_client(&msg).expect("encode");
         let decoded = decode_client(&bytes).expect("decode");
         assert!(
-            matches!(&decoded, ClientMessage::Attach { session, last_seqno: Some(SequenceNo(100)) }
-                if session == "s1")
+            matches!(&decoded, ClientMessage::Attach { pane_id, last_seqno: Some(SequenceNo(100)) }
+                if pane_id == "eagle/0")
         );
     }
 
@@ -203,7 +189,7 @@ mod tests {
             scrollback_lines: vec![],
         };
         let msg = ServerMessage::TerminalUpdate {
-            session: "test".to_string(),
+            pane_id: "eagle/0".to_string(),
             diff: std::sync::Arc::new(diff),
             seqno: SequenceNo(1),
             sent_at_ms: 0,
@@ -211,7 +197,7 @@ mod tests {
         let bytes = encode_server(&msg).expect("encode");
         let decoded = decode_server(&bytes).expect("decode");
         assert!(
-            matches!(&decoded, ServerMessage::TerminalUpdate { session, .. } if session == "test")
+            matches!(&decoded, ServerMessage::TerminalUpdate { pane_id, .. } if pane_id == "eagle/0")
         );
     }
 
@@ -230,7 +216,7 @@ mod tests {
             modes: TermModes(TermModes::APP_CURSOR),
         };
         let msg = ServerMessage::TerminalSnapshot {
-            session: "snap".to_string(),
+            pane_id: "eagle/0".to_string(),
             snapshot,
             seqno: SequenceNo(99),
             sent_at_ms: 0,
@@ -239,9 +225,9 @@ mod tests {
         let decoded = decode_server(&bytes).expect("decode");
         match &decoded {
             ServerMessage::TerminalSnapshot {
-                session, snapshot, ..
+                pane_id, snapshot, ..
             } => {
-                assert_eq!(session, "snap");
+                assert_eq!(pane_id, "eagle/0");
                 assert_eq!(snapshot.rows, 2);
                 assert_eq!(snapshot.cols, 3);
                 assert_eq!(snapshot.cells.len(), 6);
@@ -270,7 +256,7 @@ mod tests {
             scrollback_lines: vec![],
         };
         let msg = ServerMessage::TerminalUpdate {
-            session: "s".to_string(),
+            pane_id: "eagle/0".to_string(),
             diff: std::sync::Arc::new(diff),
             seqno: SequenceNo(1),
             sent_at_ms: 0,

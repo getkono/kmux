@@ -203,7 +203,7 @@ impl kmuxApp {
             ShortcutAction::JumpToSession(idx) => {
                 self.leader_state = LeaderState::Idle;
                 if idx < self.mgr.session_list().len() {
-                    let name = self.mgr.session_list()[idx].name.clone();
+                    let name = self.mgr.session_list()[idx].meta.name.clone();
                     self.update(Message::SelectSession(name))
                 } else {
                     Task::none()
@@ -1038,7 +1038,7 @@ impl kmuxApp {
             .mgr
             .session_list()
             .iter()
-            .map(|s| s.name.clone())
+            .map(|s| s.meta.name.clone())
             .collect();
         let active_ref = self.mgr.active_session();
 

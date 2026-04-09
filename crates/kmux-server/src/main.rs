@@ -13,6 +13,8 @@ mod scrollback;
 mod term_state;
 #[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 mod tls;
+#[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
+mod wordlist;
 
 #[cfg(any(feature = "backend-alacritty", feature = "backend-termwiz"))]
 use std::net::SocketAddr;

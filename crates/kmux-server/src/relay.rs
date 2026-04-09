@@ -17,7 +17,7 @@ use crate::term_state::TermState;
 /// and immediately compute + broadcast cell diffs after each read.
 pub async fn session_diff_loop(
     mut reader: PtyReader,
-    session: String,
+    pane_id: String,
     clients: ClientMap,
     scrollback: Arc<Mutex<DiffBuffer>>,
     term_state: Arc<Mutex<TermState>>,
@@ -36,7 +36,7 @@ pub async fn session_diff_loop(
                 ts.feed(&buf[..n]);
                 drop(ts);
                 flush_cell_diff(
-                    &session,
+                    &pane_id,
                     &term_state,
                     &scrollback,
                     &clients,
@@ -46,7 +46,7 @@ pub async fn session_diff_loop(
                 );
                 let cycle_us = cycle_start.elapsed().as_micros();
                 debug!(
-                    session,
+                    pane_id,
                     bytes = n,
                     cycle_us,
                     "PTY read-diff-broadcast cycle"
@@ -62,7 +62,7 @@ pub async fn session_diff_loop(
 
 /// Compute cell diff and broadcast to clients.
 fn flush_cell_diff(
-    session: &str,
+    pane_id: &str,
     term_state: &Arc<Mutex<TermState>>,
     scrollback: &Arc<Mutex<DiffBuffer>>,
     clients: &ClientMap,
@@ -84,7 +84,7 @@ fn flush_cell_diff(
 
             let ops = diff.ops.len();
             debug!(
-                session,
+                pane_id,
                 ops,
                 diff_us,
                 cursor_row = diff.cursor.row,
@@ -97,12 +97,12 @@ fn flush_cell_diff(
             scrollback.lock().unwrap().push(seqno, Arc::clone(&diff));
 
             let msg = ServerMessage::TerminalUpdate {
-                session: session.to_string(),
+                pane_id: pane_id.to_string(),
                 diff,
                 seqno,
                 sent_at_ms: epoch_millis(),
             };
-            broadcast_to_clients(session, &msg, clients, term_state, seqno);
+            broadcast_to_clients(pane_id, &msg, clients, term_state, seqno);
         }
         DiffResult::CursorOnly { cursor, modes } => {
             if cursor != *prev_cursor || modes != *prev_modes {
@@ -119,40 +119,30 @@ fn flush_cell_diff(
                     }),
                 );
                 let msg = ServerMessage::CursorUpdate {
-                    session: session.to_string(),
+                    pane_id: pane_id.to_string(),
                     cursor,
                     modes,
                     seqno,
                     sent_at_ms: epoch_millis(),
                 };
-                broadcast_to_clients(session, &msg, clients, term_state, seqno);
+                broadcast_to_clients(pane_id, &msg, clients, term_state, seqno);
             }
         }
         DiffResult::None => {
-            debug!(session, "flush_cell_diff: no changes");
+            debug!(pane_id, "flush_cell_diff: no changes");
         }
     }
 }
 
 /// Send a message to all registered clients, handling backpressure and dead clients.
-///
-/// Clients with `force_full_snapshot` enabled receive a `TerminalSnapshot` instead
-/// of the incremental diff message. The snapshot is generated lazily (only when at
-/// least one forced client exists).
-///
-/// When a client's data channel is full, send `Lagged` via the unbounded control
-/// channel (which never fails) and remove the data sender so the uni-stream writer
-/// exits cleanly. The client receives the `Lagged` notification reliably and can
-/// re-attach for a fresh snapshot.
 fn broadcast_to_clients(
-    session: &str,
+    pane_id: &str,
     msg: &ServerMessage,
     clients: &ClientMap,
     term_state: &Arc<Mutex<TermState>>,
     seqno: SequenceNo,
 ) {
     let mut dead: Vec<ClientId> = Vec::new();
-    // Lazily computed snapshot for clients in forced-snapshot mode.
     let mut snapshot_msg: Option<ServerMessage> = None;
 
     {
@@ -162,7 +152,7 @@ fn broadcast_to_clients(
                 snapshot_msg.get_or_insert_with(|| {
                     let snapshot = term_state.lock().unwrap().snapshot();
                     ServerMessage::TerminalSnapshot {
-                        session: session.to_string(),
+                        pane_id: pane_id.to_string(),
                         snapshot,
                         seqno,
                         sent_at_ms: epoch_millis(),
@@ -176,12 +166,12 @@ fn broadcast_to_clients(
                 Ok(()) => {}
                 Err(tokio::sync::mpsc::error::TrySendError::Full(_)) => {
                     let _ = sender.ctrl_tx.send(ServerMessage::Lagged {
-                        session: session.to_string(),
+                        pane_id: pane_id.to_string(),
                         missed_count: 1,
                     });
                     dead.push(client_id);
                     warn!(
-                        "Client {:?} lagged on session '{session}', sending Lagged via ctrl",
+                        "Client {:?} lagged on pane '{pane_id}', sending Lagged via ctrl",
                         client_id
                     );
                 }
@@ -210,9 +200,9 @@ mod tests {
     use kmux_protocol::messages::{CursorState, TermModes, TerminalDiff};
     use tokio::sync::mpsc;
 
-    fn dummy_update(session: &str) -> ServerMessage {
+    fn dummy_update(pane_id: &str) -> ServerMessage {
         ServerMessage::TerminalUpdate {
-            session: session.to_string(),
+            pane_id: pane_id.to_string(),
             diff: Arc::new(TerminalDiff {
                 ops: vec![],
                 cursor: CursorState::default(),
@@ -230,12 +220,10 @@ mod tests {
 
     #[test]
     fn broadcast_sends_lagged_via_ctrl_when_data_full() {
-        // Create a data channel with capacity 1, and fill it.
         let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
         let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-        // Fill the data channel
-        data_tx.try_send(dummy_update("test")).unwrap();
+        data_tx.try_send(dummy_update("eagle/0")).unwrap();
 
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         clients.lock().unwrap().insert(
@@ -247,14 +235,18 @@ mod tests {
             },
         );
 
-        // Now broadcast — data channel is full
         let ts = test_term_state();
-        broadcast_to_clients("test", &dummy_update("test"), &clients, &ts, SequenceNo(1));
+        broadcast_to_clients(
+            "eagle/0",
+            &dummy_update("eagle/0"),
+            &clients,
+            &ts,
+            SequenceNo(1),
+        );
 
-        // Lagged should arrive on the ctrl channel
         let msg = ctrl_rx.try_recv().expect("should receive Lagged on ctrl");
         assert!(
-            matches!(&msg, ServerMessage::Lagged { session, .. } if session == "test"),
+            matches!(&msg, ServerMessage::Lagged { pane_id, .. } if pane_id == "eagle/0"),
             "expected Lagged message, got {:?}",
             msg
         );
@@ -265,8 +257,7 @@ mod tests {
         let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
         let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-        // Fill the data channel
-        data_tx.try_send(dummy_update("test")).unwrap();
+        data_tx.try_send(dummy_update("eagle/0")).unwrap();
 
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         clients.lock().unwrap().insert(
@@ -279,9 +270,14 @@ mod tests {
         );
 
         let ts = test_term_state();
-        broadcast_to_clients("test", &dummy_update("test"), &clients, &ts, SequenceNo(1));
+        broadcast_to_clients(
+            "eagle/0",
+            &dummy_update("eagle/0"),
+            &clients,
+            &ts,
+            SequenceNo(1),
+        );
 
-        // Client should be removed from the map
         assert!(
             clients.lock().unwrap().is_empty(),
             "lagged client should be removed from map"
@@ -304,15 +300,19 @@ mod tests {
         );
 
         let ts = test_term_state();
-        broadcast_to_clients("test", &dummy_update("test"), &clients, &ts, SequenceNo(1));
+        broadcast_to_clients(
+            "eagle/0",
+            &dummy_update("eagle/0"),
+            &clients,
+            &ts,
+            SequenceNo(1),
+        );
 
-        // Message should arrive on data channel
         let msg = data_rx
             .try_recv()
             .expect("should receive message on data channel");
         assert!(matches!(msg, ServerMessage::TerminalUpdate { .. }));
 
-        // Client should still be in the map
         assert_eq!(clients.lock().unwrap().len(), 1);
     }
 }

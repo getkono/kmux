@@ -21,11 +21,11 @@ const CLIENT_CHANNEL_CAPACITY: usize = 512;
 struct ClientState {
     authenticated: bool,
     client_id: Option<ClientId>,
-    /// Output-forwarding task handles, keyed by session name.
+    /// Output-forwarding task handles, keyed by pane_id.
     attached: HashMap<String, AbortHandle>,
     /// Sender for the control stream writer task.
     ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
-    /// QUIC connection handle -- used to open uni streams for session diffs.
+    /// QUIC connection handle -- used to open uni streams for pane diffs.
     conn: Connection,
     app: Arc<ServerApp>,
 }
@@ -110,23 +110,73 @@ impl ClientState {
             ClientMessage::SessionCreate {
                 request_id,
                 name,
+                cwd,
                 program,
                 args,
                 size,
-            } => match self.app.create_session(&name, program, args, size).await {
-                Ok(()) => self.send(ServerMessage::SessionCreated { request_id, name }),
+            } => match self
+                .app
+                .create_session(name, cwd, program, args, size)
+                .await
+            {
+                Ok(entry) => self.send(ServerMessage::SessionCreated { request_id, entry }),
                 Err(e) => self.error(Some(request_id), classify_error(&e), e.to_string()),
             },
 
-            ClientMessage::SessionClose { request_id, name } => {
-                if let Some(handle) = self.attached.remove(&name) {
-                    handle.abort();
+            ClientMessage::SessionClose {
+                request_id,
+                word_id,
+            } => {
+                // Detach from all panes in this session
+                let pane_ids: Vec<String> = self
+                    .attached
+                    .keys()
+                    .filter(|k| k.starts_with(&format!("{word_id}/")))
+                    .cloned()
+                    .collect();
+                for pane_id in &pane_ids {
+                    if let Some(handle) = self.attached.remove(pane_id) {
+                        handle.abort();
+                    }
+                    self.app.detach_from_pane(pane_id, client_id).await;
                 }
-                self.app.detach_from_session(&name, client_id).await;
-                match self.app.close_session(&name).await {
+                match self.app.close_session(&word_id).await {
                     Ok(exit_code) => self.send(ServerMessage::SessionClosed {
                         request_id,
-                        name,
+                        word_id,
+                        exit_code,
+                    }),
+                    Err(e) => self.error(Some(request_id), classify_error(&e), e.to_string()),
+                }
+            }
+
+            ClientMessage::PaneCreate {
+                request_id,
+                word_id,
+                program,
+                args,
+                size,
+            } => match self.app.create_pane(&word_id, program, args, size).await {
+                Ok(pane_id) => self.send(ServerMessage::PaneCreated {
+                    request_id,
+                    pane_id,
+                    session_word_id: word_id,
+                }),
+                Err(e) => self.error(Some(request_id), classify_error(&e), e.to_string()),
+            },
+
+            ClientMessage::PaneClose {
+                request_id,
+                pane_id,
+            } => {
+                if let Some(handle) = self.attached.remove(&pane_id) {
+                    handle.abort();
+                }
+                self.app.detach_from_pane(&pane_id, client_id).await;
+                match self.app.close_pane(&pane_id).await {
+                    Ok(exit_code) => self.send(ServerMessage::PaneClosed {
+                        request_id,
+                        pane_id,
                         exit_code,
                     }),
                     Err(e) => self.error(Some(request_id), classify_error(&e), e.to_string()),
@@ -141,32 +191,32 @@ impl ClientState {
                 });
             }
 
-            ClientMessage::PtyInput { session, data } => {
-                if let Err(e) = self.app.write_input(&session, client_id, data).await {
+            ClientMessage::PtyInput { pane_id, data } => {
+                if let Err(e) = self.app.write_input(&pane_id, client_id, data).await {
                     self.error(None, classify_error(&e), e.to_string());
                 }
             }
 
-            ClientMessage::PtyPaste { session, data } => {
-                if let Err(e) = self.app.write_paste(&session, client_id, data).await {
+            ClientMessage::PtyPaste { pane_id, data } => {
+                if let Err(e) = self.app.write_paste(&pane_id, client_id, data).await {
                     self.error(None, classify_error(&e), e.to_string());
                 }
             }
 
-            ClientMessage::Resize { session, size } => {
-                if let Err(e) = self.app.resize(&session, size).await {
+            ClientMessage::Resize { pane_id, size } => {
+                if let Err(e) = self.app.resize(&pane_id, size).await {
                     self.error(None, classify_error(&e), e.to_string());
                 }
             }
 
             ClientMessage::Attach {
-                session,
+                pane_id,
                 last_seqno,
             } => {
                 // If already attached, detach first.
-                if let Some(old) = self.attached.remove(&session) {
+                if let Some(old) = self.attached.remove(&pane_id) {
                     old.abort();
-                    self.app.detach_from_session(&session, client_id).await;
+                    self.app.detach_from_pane(&pane_id, client_id).await;
                 }
 
                 let (client_tx, mut client_rx) =
@@ -175,7 +225,7 @@ impl ClientState {
                 match self
                     .app
                     .attach(
-                        &session,
+                        &pane_id,
                         client_id,
                         last_seqno,
                         client_tx,
@@ -184,7 +234,6 @@ impl ClientState {
                     .await
                 {
                     Ok(result) => {
-                        // Open a server-initiated unidirectional stream for this session's diffs.
                         let uni_stream = match self.conn.open_uni().await {
                             Ok(s) => s,
                             Err(e) => {
@@ -197,47 +246,47 @@ impl ClientState {
                             }
                         };
 
-                        let session_name = session.clone();
+                        let pane_id_clone = pane_id.clone();
                         let handle = tokio::spawn(async move {
-                            session_uni_writer(uni_stream, result, session_name, &mut client_rx)
+                            pane_uni_writer(uni_stream, result, pane_id_clone, &mut client_rx)
                                 .await;
                         })
                         .abort_handle();
-                        self.attached.insert(session, handle);
+                        self.attached.insert(pane_id, handle);
                     }
                     Err(e) => self.error(None, classify_error(&e), e.to_string()),
                 }
             }
 
-            ClientMessage::Detach { session } => {
-                if let Some(handle) = self.attached.remove(&session) {
+            ClientMessage::Detach { pane_id } => {
+                if let Some(handle) = self.attached.remove(&pane_id) {
                     handle.abort();
-                    self.app.detach_from_session(&session, client_id).await;
-                    debug!("Detached from session '{session}'");
+                    self.app.detach_from_pane(&pane_id, client_id).await;
+                    debug!("Detached from pane '{pane_id}'");
                 }
             }
 
-            ClientMessage::Signal { session, signal } => {
-                if let Err(e) = self.app.send_signal(&session, signal).await {
+            ClientMessage::Signal { pane_id, signal } => {
+                if let Err(e) = self.app.send_signal(&pane_id, signal).await {
                     self.error(None, classify_error(&e), e.to_string());
                 }
             }
 
-            ClientMessage::RequestInputLock { session } => {
-                match self.app.request_input_lock(&session, client_id).await {
+            ClientMessage::RequestInputLock { pane_id } => {
+                match self.app.request_input_lock(&pane_id, client_id).await {
                     Ok(InputLockOutcome::Granted) => {
-                        self.send(ServerMessage::InputLockGranted { session });
+                        self.send(ServerMessage::InputLockGranted { pane_id });
                     }
                     Ok(InputLockOutcome::Denied(holder)) => {
-                        self.send(ServerMessage::InputLockDenied { session, holder });
+                        self.send(ServerMessage::InputLockDenied { pane_id, holder });
                     }
                     Err(e) => self.error(None, classify_error(&e), e.to_string()),
                 }
             }
 
-            ClientMessage::ReleaseInputLock { session } => {
-                match self.app.release_input_lock(&session, client_id).await {
-                    Ok(true) => self.send(ServerMessage::InputLockReleased { session }),
+            ClientMessage::ReleaseInputLock { pane_id } => {
+                match self.app.release_input_lock(&pane_id, client_id).await {
+                    Ok(true) => self.send(ServerMessage::InputLockReleased { pane_id }),
                     Ok(false) => {}
                     Err(e) => self.error(None, classify_error(&e), e.to_string()),
                 }
@@ -245,13 +294,10 @@ impl ClientState {
 
             ClientMessage::SessionRename {
                 request_id,
-                session,
+                word_id,
                 new_name,
-            } => match self.app.rename_session(&session, &new_name).await {
-                Ok(()) => self.send(ServerMessage::SessionRenamed {
-                    old_name: session,
-                    new_name,
-                }),
+            } => match self.app.rename_session(&word_id, &new_name).await {
+                Ok(()) => self.send(ServerMessage::SessionRenamed { word_id, new_name }),
                 Err(e) => self.error(Some(request_id), classify_error(&e), e.to_string()),
             },
 
@@ -278,17 +324,16 @@ impl Drop for ClientState {
 }
 
 /// Write initial replay data + live diffs on a server-initiated unidirectional stream.
-async fn session_uni_writer(
+async fn pane_uni_writer(
     mut uni: quinn::SendStream,
     attach_result: AttachResult,
-    session: String,
+    pane_id: String,
     client_rx: &mut mpsc::Receiver<ServerMessage>,
 ) {
-    // Send initial replay data
     match attach_result {
         AttachResult::FullSnapshot(snapshot, seqno) => {
             let msg = ServerMessage::TerminalSnapshot {
-                session: session.clone(),
+                pane_id: pane_id.clone(),
                 snapshot,
                 seqno,
                 sent_at_ms: epoch_millis(),
@@ -300,7 +345,7 @@ async fn session_uni_writer(
         AttachResult::Delta(diffs) => {
             for (seqno, diff) in diffs {
                 let msg = ServerMessage::TerminalUpdate {
-                    session: session.clone(),
+                    pane_id: pane_id.clone(),
                     diff,
                     seqno,
                     sent_at_ms: epoch_millis(),
@@ -312,13 +357,13 @@ async fn session_uni_writer(
         }
         AttachResult::SyncReset(snapshot, seqno) => {
             let reset_msg = ServerMessage::SyncReset {
-                session: session.clone(),
+                pane_id: pane_id.clone(),
             };
             if send_frame(&mut uni, &reset_msg).await.is_err() {
                 return;
             }
             let msg = ServerMessage::TerminalSnapshot {
-                session: session.clone(),
+                pane_id: pane_id.clone(),
                 snapshot,
                 seqno,
                 sent_at_ms: epoch_millis(),
@@ -329,7 +374,6 @@ async fn session_uni_writer(
         }
     }
 
-    // Forward live diffs from the relay task
     while let Some(msg) = client_rx.recv().await {
         let write_start = Instant::now();
         if send_frame(&mut uni, &msg).await.is_err() {
@@ -337,14 +381,13 @@ async fn session_uni_writer(
         }
         let write_us = write_start.elapsed().as_micros();
         if write_us > 1000 {
-            debug!(session, write_us, "slow uni stream write");
+            debug!(pane_id, write_us, "slow uni stream write");
         }
     }
 
     let _ = uni.finish();
 }
 
-/// Encode a `ServerMessage` and write it as a length-prefixed frame.
 async fn send_frame(
     stream: &mut quinn::SendStream,
     msg: &ServerMessage,
@@ -356,7 +399,6 @@ async fn send_frame(
     write_frame(stream, &bytes).await
 }
 
-/// Map kmux errors to protocol error codes.
 fn classify_error(e: &kmux_pty::error::KmuxError) -> ErrorCode {
     match e {
         kmux_pty::error::KmuxError::SessionNotFound { .. } => ErrorCode::SessionNotFound,
@@ -367,12 +409,7 @@ fn classify_error(e: &kmux_pty::error::KmuxError) -> ErrorCode {
 }
 
 /// Handle a single QUIC client connection.
-///
-/// Uses a multi-stream model:
-/// - Bidirectional stream 0 (control): client<->server control messages
-/// - Unidirectional streams (per-session): server->client terminal diffs
 pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
-    // Accept the first bidirectional stream as the control channel
     let (ctrl_send, mut ctrl_recv) = match conn.accept_bi().await {
         Ok(streams) => streams,
         Err(e) => {
@@ -383,7 +420,6 @@ pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
 
     let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-    // Control stream writer task
     let writer_task = tokio::spawn(async move {
         let mut ctrl_send = ctrl_send;
         while let Some(msg) = ctrl_rx.recv().await {
@@ -399,17 +435,15 @@ pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
         let _ = ctrl_send.finish();
     });
 
-    // Forward lifecycle events to this client on the control stream
     let mut event_rx = app.subscribe_events();
     let event_tx = ctrl_tx.clone();
     let event_task = tokio::spawn(async move {
         while let Ok(event) = event_rx.recv().await {
-            let msg = session_event_to_msg(event);
+            let msg = pty_event_to_msg(event);
             let _ = event_tx.send(ServerMessage::Event { event: msg });
         }
     });
 
-    // Periodic application-level keepalive ping on the control stream
     let ping_tx = ctrl_tx.clone();
     let ping_task = tokio::spawn(async move {
         let mut seq = 0u64;
@@ -426,7 +460,6 @@ pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
 
     let mut state = ClientState::new(app.clone(), ctrl_tx, conn);
 
-    // Main read loop on control stream
     loop {
         match read_frame(&mut ctrl_recv).await {
             Ok(Some(data)) => match decode_client(&data) {
@@ -459,11 +492,15 @@ pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
     info!("Connection closed");
 }
 
-fn session_event_to_msg(event: kmux_pty::events::SessionEvent) -> SessionEventMsg {
+/// Translate a kmux-pty lifecycle event into a protocol `SessionEventMsg`.
+/// The pty registry uses `pane_id` as the session name.
+fn pty_event_to_msg(event: kmux_pty::events::SessionEvent) -> SessionEventMsg {
     match event {
-        kmux_pty::events::SessionEvent::Spawned { name } => SessionEventMsg::Spawned { name },
-        kmux_pty::events::SessionEvent::Exited { name, status } => SessionEventMsg::Exited {
-            name,
+        kmux_pty::events::SessionEvent::Spawned { name } => {
+            SessionEventMsg::PaneSpawned { pane_id: name }
+        }
+        kmux_pty::events::SessionEvent::Exited { name, status } => SessionEventMsg::PaneExited {
+            pane_id: name,
             code: status.code(),
             signal: match status {
                 kmux_pty::process::ExitStatus::Signal(s) => Some(s),
@@ -471,9 +508,17 @@ fn session_event_to_msg(event: kmux_pty::events::SessionEvent) -> SessionEventMs
             },
         },
         kmux_pty::events::SessionEvent::Resized { name, rows, cols } => {
-            SessionEventMsg::Resized { name, rows, cols }
+            SessionEventMsg::PaneResized {
+                pane_id: name,
+                rows,
+                cols,
+            }
         }
-        kmux_pty::events::SessionEvent::Closed { name } => SessionEventMsg::Closed { name },
-        kmux_pty::events::SessionEvent::Timeout { name, .. } => SessionEventMsg::Closed { name },
+        kmux_pty::events::SessionEvent::Closed { name } => {
+            SessionEventMsg::PaneClosed { pane_id: name }
+        }
+        kmux_pty::events::SessionEvent::Timeout { name, .. } => {
+            SessionEventMsg::PaneClosed { pane_id: name }
+        }
     }
 }

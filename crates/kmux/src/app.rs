@@ -38,6 +38,14 @@ pub struct App {
     // Reconnection bookkeeping
     pub disconnect_at: Option<Instant>,
 
+    // Session picker state
+    pub session_picker_selected: usize,
+    pub session_picker_search: String,
+
+    /// Width (in columns) of the session badge in the top bar, used to detect
+    /// mouse clicks that should open the session picker.
+    pub session_badge_cols: u16,
+
     needs_render: bool,
 }
 
@@ -64,6 +72,9 @@ impl App {
             connect_port,
             connect_token,
             disconnect_at: None,
+            session_picker_selected: 0,
+            session_picker_search: String::new(),
+            session_badge_cols: 0,
             needs_render: true,
         }
     }
@@ -231,51 +242,116 @@ impl App {
             Action::CreateSession => {
                 self.mgr.create_session();
             }
+            Action::CreatePane => {
+                self.mgr.create_pane();
+            }
             Action::CloseSession => {
-                if let Some(session) = self.mgr.active_session().map(|s| s.to_string()) {
-                    self.mode = Mode::ConfirmClose { session };
+                if let Some(word_id) = self.mgr.active_session().map(|s| s.to_string()) {
+                    self.mode = Mode::ConfirmCloseSession { word_id };
                 }
             }
+            Action::ClosePane => {
+                self.mgr.close_pane();
+            }
             Action::ConfirmCloseYes => {
-                if let Mode::ConfirmClose { session } =
+                if let Mode::ConfirmCloseSession { word_id } =
                     std::mem::replace(&mut self.mode, Mode::Normal)
                 {
-                    self.mgr.close_session(&session);
+                    self.mgr.close_session(&word_id);
                 }
             }
             Action::NextSession => self.mgr.cycle_session(1),
             Action::PrevSession => self.mgr.cycle_session(-1),
+            Action::NextPane => self.mgr.cycle_pane(1),
+            Action::PrevPane => self.mgr.cycle_pane(-1),
             Action::JumpToSession(idx) => {
                 if idx < self.mgr.session_list().len() {
-                    let name = self.mgr.session_list()[idx].name.clone();
-                    self.mgr.select_session(name);
+                    let word_id = self.mgr.session_list()[idx].meta.word_id.clone();
+                    self.mgr.select_session(word_id);
                 }
             }
             Action::RenameSession => {
-                if let Some(session) = self.mgr.active_session().map(|s| s.to_string()) {
-                    self.mode = Mode::Rename {
-                        buffer: session.clone(),
-                        session,
+                if let Some(word_id) = self.mgr.active_session().map(|s| s.to_string()) {
+                    let current_name = self
+                        .mgr
+                        .session_list()
+                        .iter()
+                        .find(|e| e.meta.word_id == word_id)
+                        .map(|e| e.meta.name.clone())
+                        .unwrap_or_default();
+                    self.mode = Mode::RenameSession {
+                        buffer: current_name,
+                        word_id,
                     };
                 }
             }
             Action::RenameChar(ch) => {
-                if let Mode::Rename { buffer, .. } = &mut self.mode {
+                if let Mode::RenameSession { buffer, .. } = &mut self.mode {
                     buffer.push(ch);
                 }
             }
             Action::RenameBackspace => {
-                if let Mode::Rename { buffer, .. } = &mut self.mode {
+                if let Mode::RenameSession { buffer, .. } = &mut self.mode {
                     buffer.pop();
                 }
             }
             Action::RenameSubmit => {
-                if let Mode::Rename { buffer, session } =
+                if let Mode::RenameSession { buffer, word_id } =
                     std::mem::replace(&mut self.mode, Mode::Normal)
                 {
                     let new_name = buffer.trim().to_string();
-                    self.mgr.rename_session(&session, &new_name);
+                    self.mgr.rename_session(&word_id, &new_name);
                 }
+            }
+            Action::CloseSessionPicker => {
+                self.mode = Mode::Normal;
+            }
+            Action::SelectPickerEntry => {
+                let search = self.session_picker_search.to_lowercase();
+                let matches: Vec<_> = self
+                    .mgr
+                    .session_list()
+                    .iter()
+                    .filter(|e| {
+                        search.is_empty()
+                            || e.meta.name.to_lowercase().contains(&search)
+                            || e.meta.word_id.to_lowercase().contains(&search)
+                    })
+                    .map(|e| e.meta.word_id.clone())
+                    .collect();
+                if let Some(word_id) = matches.get(self.session_picker_selected) {
+                    self.mgr.select_session(word_id.clone());
+                }
+                self.mode = Mode::Normal;
+            }
+            Action::PickerUp => {
+                if self.session_picker_selected > 0 {
+                    self.session_picker_selected -= 1;
+                }
+            }
+            Action::PickerDown => {
+                let count = self
+                    .mgr
+                    .session_list()
+                    .iter()
+                    .filter(|e| {
+                        let s = self.session_picker_search.to_lowercase();
+                        s.is_empty()
+                            || e.meta.name.to_lowercase().contains(&s)
+                            || e.meta.word_id.to_lowercase().contains(&s)
+                    })
+                    .count();
+                if count > 0 && self.session_picker_selected + 1 < count {
+                    self.session_picker_selected += 1;
+                }
+            }
+            Action::PickerSearchChar(ch) => {
+                self.session_picker_search.push(ch);
+                self.session_picker_selected = 0;
+            }
+            Action::PickerSearchBackspace => {
+                self.session_picker_search.pop();
+                self.session_picker_selected = 0;
             }
             Action::Disconnect => {
                 self.mgr.disconnect();
@@ -284,8 +360,8 @@ impl App {
                 };
             }
             Action::SendSignal(signal) => {
-                if let Some(session) = self.mgr.active_session().map(|s| s.to_string()) {
-                    self.mgr.send_signal(&session, signal);
+                if let Some(pane_id) = self.mgr.active_pane_id().map(|s| s.to_string()) {
+                    self.mgr.send_signal(&pane_id, signal);
                 }
             }
             Action::ScrollUp(n) => {
@@ -410,14 +486,25 @@ impl App {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) {
-        let Some(name) = self.mgr.active_session().map(|s| s.to_string()) else {
+        // Click on the session badge row opens the session picker
+        if event.row == 0
+            && event.column < self.session_badge_cols
+            && matches!(event.kind, MouseEventKind::Down(_))
+        {
+            self.session_picker_selected = 0;
+            self.session_picker_search.clear();
+            self.mode = Mode::SessionPicker;
+            return;
+        }
+
+        let Some(pane_id) = self.mgr.active_pane_id().map(|s| s.to_string()) else {
             return;
         };
         match event.kind {
             MouseEventKind::ScrollUp => {
                 let use_pty = self
                     .mgr
-                    .buffer(&name)
+                    .buffer(&pane_id)
                     .map(|g| g.modes().mouse_report())
                     .unwrap_or(false);
                 if use_pty {
@@ -425,21 +512,21 @@ impl App {
                     let row = event.row + 1;
                     let sgr = self
                         .mgr
-                        .buffer(&name)
+                        .buffer(&pane_id)
                         .map(|g| g.modes().sgr_mouse())
                         .unwrap_or(false);
                     let bytes = encode_mouse_scroll(col, row, 3, sgr);
                     if !bytes.is_empty() {
                         self.mgr.send_input(bytes);
                     }
-                } else if let Some(grid) = self.mgr.buffer_mut(&name) {
+                } else if let Some(grid) = self.mgr.buffer_mut(&pane_id) {
                     grid.scroll_up(3);
                 }
             }
             MouseEventKind::ScrollDown => {
                 let use_pty = self
                     .mgr
-                    .buffer(&name)
+                    .buffer(&pane_id)
                     .map(|g| g.modes().mouse_report())
                     .unwrap_or(false);
                 if use_pty {
@@ -447,14 +534,14 @@ impl App {
                     let row = event.row + 1;
                     let sgr = self
                         .mgr
-                        .buffer(&name)
+                        .buffer(&pane_id)
                         .map(|g| g.modes().sgr_mouse())
                         .unwrap_or(false);
                     let bytes = encode_mouse_scroll(col, row, -3, sgr);
                     if !bytes.is_empty() {
                         self.mgr.send_input(bytes);
                     }
-                } else if let Some(grid) = self.mgr.buffer_mut(&name) {
+                } else if let Some(grid) = self.mgr.buffer_mut(&pane_id) {
                     grid.scroll_down(3);
                 }
             }
@@ -467,8 +554,8 @@ impl App {
         let term_rows = rows.saturating_sub(3);
         let term_cols = cols;
 
-        if let Some(name) = self.mgr.active_session().map(|s| s.to_string()) {
-            self.mgr.send_resize(&name, term_rows, term_cols);
+        if let Some(pane_id) = self.mgr.active_pane_id().map(|s| s.to_string()) {
+            self.mgr.send_resize(&pane_id, term_rows, term_cols);
         }
     }
 }

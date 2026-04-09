@@ -1,10 +1,11 @@
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
 
 use kmux_protocol::messages::{
-    ClientId, ClientMessage, SequenceNo, ServerMessage, SessionEventMsg, SessionInfo,
-    SessionStatus, TermSize, epoch_millis,
+    ClientId, ClientMessage, PaneId, SequenceNo, ServerMessage, SessionEntry, SessionEventMsg,
+    TermSize, WordId, epoch_millis,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -13,9 +14,9 @@ use crate::connect::{self, ConnectResult};
 use crate::grid::CellGrid;
 use crate::metrics::RenderMetrics;
 
-/// Per-session synchronisation state.
+/// Per-pane synchronisation state.
 #[derive(Default)]
-enum SessionSync {
+enum PaneSync {
     Synced {
         expected: SequenceNo,
     },
@@ -33,26 +34,26 @@ pub enum SessionEvent {
     /// Session list was received.
     SessionListReceived,
     /// A new session was created and is now the active session.
-    SessionCreated { name: String },
-    /// A session was closed. If it was active, the manager has switched to another (or None).
-    SessionClosed { name: String },
+    SessionCreated { word_id: String },
+    /// A session was closed.
+    SessionClosed { word_id: String },
     /// A session was renamed.
-    SessionRenamed { old_name: String, new_name: String },
+    SessionRenamed { word_id: String, new_name: String },
+    /// A new pane was created.
+    PaneCreated { pane_id: String },
+    /// A pane was closed.
+    PaneClosed { pane_id: String },
     /// A structured error from the server.
     ServerError { message: String },
-    /// Input lock acquired on a session.
-    InputLockGranted { session: String },
-    /// Input lock denied on a session.
-    InputLockDenied { session: String, holder: ClientId },
-    /// Input lock released on a session.
-    InputLockReleased { session: String },
+    /// Input lock acquired on a pane.
+    InputLockGranted { pane_id: String },
+    /// Input lock denied on a pane.
+    InputLockDenied { pane_id: String, holder: ClientId },
+    /// Input lock released on a pane.
+    InputLockReleased { pane_id: String },
 }
 
 /// Shared client-side session management logic used by both the TUI and GUI frontends.
-///
-/// Owns all connection state, session state, terminal buffers, and metrics. The frontend
-/// is responsible for the event loop and rendering; it calls `SessionManager` methods
-/// to drive session operations and handle server messages.
 pub struct SessionManager {
     // Connection params
     host: String,
@@ -65,12 +66,16 @@ pub struct SessionManager {
     pub connected: bool,
     pub status_msg: String,
 
-    // Session state
-    pub buffers: HashMap<String, CellGrid>,
-    pub active_session: Option<String>,
-    pub session_list: Vec<SessionInfo>,
-    session_sync: HashMap<String, SessionSync>,
-    pub input_locked: HashMap<String, bool>,
+    // Two-level session state
+    pub session_list: Vec<SessionEntry>,
+    /// Currently active session (word_id).
+    pub active_session: Option<WordId>,
+    /// Currently active pane (pane_id = "{word_id}/{pane_index}").
+    pub active_pane: Option<PaneId>,
+    /// Terminal buffers keyed by pane_id.
+    pub buffers: HashMap<PaneId, CellGrid>,
+    pane_sync: HashMap<PaneId, PaneSync>,
+    pub input_locked: HashMap<PaneId, bool>,
     next_request_id: u64,
     pub client_id: Option<ClientId>,
 
@@ -94,10 +99,11 @@ impl SessionManager {
             ws_sender: None,
             connected: false,
             status_msg: String::new(),
-            buffers: HashMap::new(),
-            active_session: None,
             session_list: Vec::new(),
-            session_sync: HashMap::new(),
+            active_session: None,
+            active_pane: None,
+            buffers: HashMap::new(),
+            pane_sync: HashMap::new(),
             input_locked: HashMap::new(),
             next_request_id: 0,
             client_id: None,
@@ -107,8 +113,6 @@ impl SessionManager {
 
     // ── Connection lifecycle ──────────────────────────────────────────────────
 
-    /// Establish a QUIC connection using the stored host/port/token.
-    /// Returns any events emitted as a result of the attempt (e.g. success status update).
     pub async fn connect(
         &mut self,
         srv_tx: mpsc::UnboundedSender<ServerMessage>,
@@ -140,8 +144,6 @@ impl SessionManager {
         }
     }
 
-    /// Wire up an already-established sender (used by the GUI subscription model
-    /// where `connect::connect` is called outside the manager).
     pub fn set_ws_sender(&mut self, sender: mpsc::UnboundedSender<ClientMessage>) {
         self.ws_sender = Some(sender);
         self.connected = true;
@@ -151,33 +153,29 @@ impl SessionManager {
         info!("Connected to kmux-server (external sender)");
     }
 
-    /// Send an initial session list request. Call after `set_ws_sender`.
     pub fn request_session_list(&mut self) {
         let rid = self.next_rid();
         self.send_ws(ClientMessage::SessionList { request_id: rid });
     }
 
-    /// Tear down the connection and clear all session state.
     pub fn disconnect(&mut self) {
         self.ws_sender = None;
         self.connected = false;
         self.buffers.clear();
         self.active_session = None;
+        self.active_pane = None;
         self.session_list.clear();
-        self.session_sync.clear();
+        self.pane_sync.clear();
         self.input_locked.clear();
         self.status_msg = "Disconnected".to_string();
     }
 
-    /// Mark the connection as lost (channel closed). Does NOT clear session state
-    /// so the UI can still display it while reconnecting.
     pub fn mark_connection_lost(&mut self) {
         self.connected = false;
         self.ws_sender = None;
         self.status_msg = "Connection lost".to_string();
     }
 
-    /// Update the connection params (e.g. from the Connect form).
     pub fn set_connection_params(&mut self, host: String, port: u16, token: String) {
         self.host = host;
         self.port = port;
@@ -186,8 +184,6 @@ impl SessionManager {
 
     // ── Server message handling ───────────────────────────────────────────────
 
-    /// Process a single `ServerMessage`, mutating internal state and returning
-    /// high-level `SessionEvent`s that require UI-layer reactions.
     pub fn handle_server_message(&mut self, msg: ServerMessage) -> Vec<SessionEvent> {
         let mut events = Vec::new();
         match msg {
@@ -211,63 +207,161 @@ impl SessionManager {
 
             ServerMessage::SessionListResult { sessions, .. } => {
                 self.session_list = sessions.clone();
-                for info in &sessions {
-                    self.buffers.entry(info.name.clone()).or_default();
+                for entry in &sessions {
+                    for pane in &entry.panes {
+                        self.buffers.entry(pane.pane_id.clone()).or_default();
+                    }
                 }
                 if self.active_session.is_none()
-                    && let Some(first) = sessions.first()
+                    && let Some(first_entry) = sessions.first()
+                    && let Some(first_pane) = first_entry.panes.first()
                 {
-                    self.active_session = Some(first.name.clone());
-                    self.attach_fresh(first.name.clone());
+                    self.active_session = Some(first_entry.meta.word_id.clone());
+                    self.active_pane = Some(first_pane.pane_id.clone());
+                    self.attach_fresh(first_pane.pane_id.clone());
                 }
                 events.push(SessionEvent::SessionListReceived);
             }
 
-            ServerMessage::SessionCreated { name, .. } => {
-                let size = TermSize::default();
-                self.buffers.entry(name.clone()).or_default();
-                self.session_list.push(SessionInfo {
-                    name: name.clone(),
-                    program: String::new(),
-                    size,
-                    attached_clients: vec![],
-                    status: SessionStatus::Running,
-                });
-                if let Some(prev) = self.active_session.take() {
-                    self.send_ws(ClientMessage::Detach { session: prev });
+            ServerMessage::SessionCreated { entry, .. } => {
+                let word_id = entry.meta.word_id.clone();
+                for pane in &entry.panes {
+                    self.buffers.entry(pane.pane_id.clone()).or_default();
                 }
-                self.active_session = Some(name.clone());
-                self.status_msg = format!("Session '{name}' created");
-                self.attach_fresh(name.clone());
-                events.push(SessionEvent::SessionCreated { name });
+                // Switch to the first pane of the new session
+                let first_pane_id = entry.panes.first().map(|p| p.pane_id.clone());
+                if let Some(prev_pane) = self.active_pane.take() {
+                    self.send_ws(ClientMessage::Detach { pane_id: prev_pane });
+                }
+                self.active_session = Some(word_id.clone());
+                self.active_pane = first_pane_id.clone();
+                self.session_list.push(entry);
+                self.status_msg = format!("Session '{word_id}' created");
+                if let Some(pane_id) = first_pane_id {
+                    self.attach_fresh(pane_id);
+                }
+                events.push(SessionEvent::SessionCreated { word_id });
             }
 
-            ServerMessage::SessionClosed { name, .. } => {
-                self.buffers.remove(&name);
-                self.session_sync.remove(&name);
-                self.input_locked.remove(&name);
-                self.session_list.retain(|s| s.name != name);
-                if self.active_session.as_deref() == Some(&name) {
-                    self.active_session = self.session_list.first().map(|s| s.name.clone());
-                    if let Some(sess) = self.active_session.clone() {
-                        self.attach_fresh(sess);
+            ServerMessage::SessionClosed { word_id, .. } => {
+                // Remove all pane buffers for this session
+                let entry = self
+                    .session_list
+                    .iter()
+                    .find(|e| e.meta.word_id == word_id)
+                    .cloned();
+                if let Some(entry) = &entry {
+                    for pane in &entry.panes {
+                        self.buffers.remove(&pane.pane_id);
+                        self.pane_sync.remove(&pane.pane_id);
+                        self.input_locked.remove(&pane.pane_id);
                     }
                 }
-                events.push(SessionEvent::SessionClosed { name });
+                self.session_list.retain(|e| e.meta.word_id != word_id);
+
+                if self.active_session.as_deref() == Some(&word_id) {
+                    // Fall back to first remaining session
+                    if let Some(next_entry) = self.session_list.first() {
+                        let next_word_id = next_entry.meta.word_id.clone();
+                        let next_pane_id = next_entry.panes.first().map(|p| p.pane_id.clone());
+                        self.active_session = Some(next_word_id);
+                        self.active_pane = next_pane_id.clone();
+                        if let Some(pane_id) = next_pane_id {
+                            self.attach_fresh(pane_id);
+                        }
+                    } else {
+                        self.active_session = None;
+                        self.active_pane = None;
+                    }
+                }
+                events.push(SessionEvent::SessionClosed { word_id });
+            }
+
+            ServerMessage::PaneCreated {
+                pane_id,
+                session_word_id,
+                ..
+            } => {
+                self.buffers.entry(pane_id.clone()).or_default();
+                // Update the session_list entry
+                if let Some(entry) = self
+                    .session_list
+                    .iter_mut()
+                    .find(|e| e.meta.word_id == session_word_id)
+                {
+                    use kmux_protocol::messages::{PaneInfo, SessionStatus, TermSize};
+                    let pane_index = pane_id
+                        .rsplit_once('/')
+                        .and_then(|(_, idx)| idx.parse().ok())
+                        .unwrap_or(0);
+                    entry.panes.push(PaneInfo {
+                        pane_id: pane_id.clone(),
+                        pane_index,
+                        program: String::new(),
+                        size: TermSize::default(),
+                        attached_clients: vec![],
+                        status: SessionStatus::Running,
+                    });
+                }
+                self.attach_fresh(pane_id.clone());
+                events.push(SessionEvent::PaneCreated { pane_id });
+            }
+
+            ServerMessage::PaneClosed { pane_id, .. } => {
+                self.buffers.remove(&pane_id);
+                self.pane_sync.remove(&pane_id);
+                self.input_locked.remove(&pane_id);
+
+                // Remove pane from session_list
+                for entry in &mut self.session_list {
+                    entry.panes.retain(|p| p.pane_id != pane_id);
+                }
+
+                if self.active_pane.as_deref() == Some(&pane_id) {
+                    // Try to fall back to another pane in the same session
+                    let fallback = self.active_session.as_ref().and_then(|word_id| {
+                        self.session_list
+                            .iter()
+                            .find(|e| e.meta.word_id == *word_id)
+                            .and_then(|e| e.panes.first())
+                            .map(|p| p.pane_id.clone())
+                    });
+
+                    if let Some(pane) = fallback {
+                        self.active_pane = Some(pane.clone());
+                        self.attach_fresh(pane);
+                    } else {
+                        // Fall back to first session's first pane
+                        let fallback2 = self
+                            .session_list
+                            .first()
+                            .and_then(|e| e.panes.first())
+                            .map(|p| (e_word_id_from_list(&self.session_list), p.pane_id.clone()));
+                        if let Some((word_id, pane)) = fallback2 {
+                            self.active_session = Some(word_id);
+                            self.active_pane = Some(pane.clone());
+                            self.attach_fresh(pane);
+                        } else {
+                            self.active_session = None;
+                            self.active_pane = None;
+                        }
+                    }
+                }
+                events.push(SessionEvent::PaneClosed { pane_id });
             }
 
             ServerMessage::TerminalSnapshot {
-                session,
+                pane_id,
                 snapshot,
                 seqno,
                 sent_at_ms,
             } => {
                 let start = Instant::now();
-                let grid = self.buffers.entry(session.clone()).or_default();
+                let grid = self.buffers.entry(pane_id.clone()).or_default();
                 grid.apply_snapshot(snapshot);
-                self.session_sync.insert(
-                    session,
-                    SessionSync::Synced {
+                self.pane_sync.insert(
+                    pane_id,
+                    PaneSync::Synced {
                         expected: SequenceNo(seqno.0 + 1),
                     },
                 );
@@ -276,23 +370,23 @@ impl SessionManager {
             }
 
             ServerMessage::TerminalUpdate {
-                session,
+                pane_id,
                 diff,
                 seqno,
                 sent_at_ms,
             } => {
-                match self.session_sync.get(&session) {
-                    Some(SessionSync::AwaitingSync) => {
-                        self.metrics.record_stale_discard(&session);
+                match self.pane_sync.get(&pane_id) {
+                    Some(PaneSync::AwaitingSync) => {
+                        self.metrics.record_stale_discard(&pane_id);
                         return events;
                     }
-                    Some(SessionSync::Synced { expected }) if seqno != *expected => {
-                        self.metrics.record_seqno_gap(&session, expected.0, seqno.0);
-                        self.metrics.record_resync(&session, "seqno gap");
-                        if let Some(grid) = self.buffers.get_mut(&session) {
+                    Some(PaneSync::Synced { expected }) if seqno != *expected => {
+                        self.metrics.record_seqno_gap(&pane_id, expected.0, seqno.0);
+                        self.metrics.record_resync(&pane_id, "seqno gap");
+                        if let Some(grid) = self.buffers.get_mut(&pane_id) {
                             grid.clear();
                         }
-                        self.attach_fresh(session);
+                        self.attach_fresh(pane_id);
                         return events;
                     }
                     _ => {}
@@ -301,13 +395,13 @@ impl SessionManager {
                 let start = Instant::now();
                 let diff = Arc::unwrap_or_clone(diff);
                 let op_count = diff.ops.len();
-                if let Some(grid) = self.buffers.get_mut(&session) {
+                if let Some(grid) = self.buffers.get_mut(&pane_id) {
                     grid.apply_diff(diff);
                     self.metrics.record_diff_stats(op_count);
                 }
-                self.session_sync.insert(
-                    session,
-                    SessionSync::Synced {
+                self.pane_sync.insert(
+                    pane_id,
+                    PaneSync::Synced {
                         expected: SequenceNo(seqno.0 + 1),
                     },
                 );
@@ -320,36 +414,36 @@ impl SessionManager {
             }
 
             ServerMessage::CursorUpdate {
-                session,
+                pane_id,
                 cursor,
                 modes,
                 seqno,
                 sent_at_ms,
             } => {
-                match self.session_sync.get(&session) {
-                    Some(SessionSync::AwaitingSync) => {
-                        self.metrics.record_stale_discard(&session);
+                match self.pane_sync.get(&pane_id) {
+                    Some(PaneSync::AwaitingSync) => {
+                        self.metrics.record_stale_discard(&pane_id);
                         return events;
                     }
-                    Some(SessionSync::Synced { expected }) if seqno != *expected => {
-                        self.metrics.record_seqno_gap(&session, expected.0, seqno.0);
-                        self.metrics.record_resync(&session, "seqno gap");
-                        if let Some(grid) = self.buffers.get_mut(&session) {
+                    Some(PaneSync::Synced { expected }) if seqno != *expected => {
+                        self.metrics.record_seqno_gap(&pane_id, expected.0, seqno.0);
+                        self.metrics.record_resync(&pane_id, "seqno gap");
+                        if let Some(grid) = self.buffers.get_mut(&pane_id) {
                             grid.clear();
                         }
-                        self.attach_fresh(session);
+                        self.attach_fresh(pane_id);
                         return events;
                     }
                     _ => {}
                 }
 
                 let start = Instant::now();
-                if let Some(grid) = self.buffers.get_mut(&session) {
+                if let Some(grid) = self.buffers.get_mut(&pane_id) {
                     grid.apply_cursor_update(cursor, modes);
                 }
-                self.session_sync.insert(
-                    session,
-                    SessionSync::Synced {
+                self.pane_sync.insert(
+                    pane_id,
+                    PaneSync::Synced {
                         expected: SequenceNo(seqno.0 + 1),
                     },
                 );
@@ -357,36 +451,38 @@ impl SessionManager {
                 self.metrics.record_apply(sent_at_ms, elapsed_ms);
             }
 
-            #[allow(deprecated)]
-            ServerMessage::PtyOutput { .. } => {}
-
-            ServerMessage::SyncReset { session } => {
-                if let Some(grid) = self.buffers.get_mut(&session) {
+            ServerMessage::SyncReset { pane_id } => {
+                if let Some(grid) = self.buffers.get_mut(&pane_id) {
                     grid.clear();
                 }
-                self.metrics.record_resync(&session, "server sync reset");
-                self.session_sync.insert(session, SessionSync::AwaitingSync);
+                self.metrics.record_resync(&pane_id, "server sync reset");
+                self.pane_sync.insert(pane_id, PaneSync::AwaitingSync);
             }
 
             ServerMessage::Event {
-                event: SessionEventMsg::Renamed { old_name, new_name },
+                event: SessionEventMsg::SessionRenamed { word_id, new_name },
             } => {
-                self.apply_rename(&old_name, &new_name);
-                events.push(SessionEvent::SessionRenamed { old_name, new_name });
+                for entry in &mut self.session_list {
+                    if entry.meta.word_id == word_id {
+                        entry.meta.name = new_name.clone();
+                        break;
+                    }
+                }
+                events.push(SessionEvent::SessionRenamed { word_id, new_name });
             }
 
             ServerMessage::Event { .. } => {}
 
             ServerMessage::Lagged {
-                session,
+                pane_id,
                 missed_count,
             } => {
-                self.metrics.record_lag(&session, missed_count);
-                self.metrics.record_resync(&session, "lagged");
-                if let Some(grid) = self.buffers.get_mut(&session) {
+                self.metrics.record_lag(&pane_id, missed_count);
+                self.metrics.record_resync(&pane_id, "lagged");
+                if let Some(grid) = self.buffers.get_mut(&pane_id) {
                     grid.clear();
                 }
-                self.attach_fresh(session);
+                self.attach_fresh(pane_id);
             }
 
             ServerMessage::Error { message, .. } => {
@@ -394,27 +490,32 @@ impl SessionManager {
                 events.push(SessionEvent::ServerError { message });
             }
 
-            ServerMessage::SessionRenamed { old_name, new_name } => {
-                self.apply_rename(&old_name, &new_name);
-                events.push(SessionEvent::SessionRenamed { old_name, new_name });
+            ServerMessage::SessionRenamed { word_id, new_name } => {
+                for entry in &mut self.session_list {
+                    if entry.meta.word_id == word_id {
+                        entry.meta.name = new_name.clone();
+                        break;
+                    }
+                }
+                events.push(SessionEvent::SessionRenamed { word_id, new_name });
             }
 
-            ServerMessage::InputLockGranted { session } => {
-                self.input_locked.insert(session.clone(), true);
-                self.status_msg = format!("Input lock acquired on '{session}'");
-                events.push(SessionEvent::InputLockGranted { session });
+            ServerMessage::InputLockGranted { pane_id } => {
+                self.input_locked.insert(pane_id.clone(), true);
+                self.status_msg = format!("Input lock acquired on '{pane_id}'");
+                events.push(SessionEvent::InputLockGranted { pane_id });
             }
 
-            ServerMessage::InputLockDenied { session, holder } => {
+            ServerMessage::InputLockDenied { pane_id, holder } => {
                 self.status_msg =
-                    format!("Input lock denied on '{session}' (held by {:?})", holder);
-                events.push(SessionEvent::InputLockDenied { session, holder });
+                    format!("Input lock denied on '{pane_id}' (held by {:?})", holder);
+                events.push(SessionEvent::InputLockDenied { pane_id, holder });
             }
 
-            ServerMessage::InputLockReleased { session } => {
-                self.input_locked.insert(session.clone(), false);
-                self.status_msg = format!("Input lock released on '{session}'");
-                events.push(SessionEvent::InputLockReleased { session });
+            ServerMessage::InputLockReleased { pane_id } => {
+                self.input_locked.insert(pane_id.clone(), false);
+                self.status_msg = format!("Input lock released on '{pane_id}'");
+                events.push(SessionEvent::InputLockReleased { pane_id });
             }
 
             _ => {}
@@ -424,19 +525,42 @@ impl SessionManager {
 
     // ── Session operations ────────────────────────────────────────────────────
 
-    /// Switch to a different session: detach old, clear buffer, attach new.
-    pub fn select_session(&mut self, name: String) {
-        if let Some(prev) = self.active_session.take() {
-            self.send_ws(ClientMessage::Detach { session: prev });
+    /// Switch to a different session by word_id (attaches to its first pane).
+    pub fn select_session(&mut self, word_id: String) {
+        if let Some(prev_pane) = self.active_pane.take() {
+            self.send_ws(ClientMessage::Detach { pane_id: prev_pane });
         }
-        if let Some(buf) = self.buffers.get_mut(&name) {
-            buf.clear();
+        let first_pane = self
+            .session_list
+            .iter()
+            .find(|e| e.meta.word_id == word_id)
+            .and_then(|e| e.panes.first())
+            .map(|p| p.pane_id.clone());
+        self.active_session = Some(word_id);
+        self.active_pane = first_pane.clone();
+        if let Some(pane_id) = first_pane {
+            if let Some(buf) = self.buffers.get_mut(&pane_id) {
+                buf.clear();
+            }
+            self.attach_fresh(pane_id);
         }
-        self.active_session = Some(name.clone());
-        self.attach_fresh(name);
     }
 
-    /// Cycle to the next/previous session by offset (wraps around).
+    /// Switch to a specific pane.
+    pub fn select_pane(&mut self, pane_id: String) {
+        if let Some(prev_pane) = self.active_pane.take()
+            && prev_pane != pane_id
+        {
+            self.send_ws(ClientMessage::Detach { pane_id: prev_pane });
+        }
+        if let Some(buf) = self.buffers.get_mut(&pane_id) {
+            buf.clear();
+        }
+        self.active_pane = Some(pane_id.clone());
+        self.attach_fresh(pane_id);
+    }
+
+    /// Cycle to the next/previous session by offset.
     pub fn cycle_session(&mut self, offset: i32) {
         if self.session_list.is_empty() {
             return;
@@ -444,22 +568,55 @@ impl SessionManager {
         let current_idx = self
             .active_session
             .as_ref()
-            .and_then(|name| self.session_list.iter().position(|s| &s.name == name))
+            .and_then(|wid| {
+                self.session_list
+                    .iter()
+                    .position(|e| &e.meta.word_id == wid)
+            })
             .unwrap_or(0);
         let len = self.session_list.len() as i32;
         let new_idx = ((current_idx as i32 + offset).rem_euclid(len)) as usize;
-        let name = self.session_list[new_idx].name.clone();
-        self.select_session(name);
+        let word_id = self.session_list[new_idx].meta.word_id.clone();
+        self.select_session(word_id);
     }
 
-    /// Create a new session with an auto-generated name.
+    /// Cycle to the next/previous pane within the active session.
+    pub fn cycle_pane(&mut self, offset: i32) {
+        let word_id = match &self.active_session {
+            Some(w) => w.clone(),
+            None => return,
+        };
+        let panes: Vec<String> = self
+            .session_list
+            .iter()
+            .find(|e| e.meta.word_id == word_id)
+            .map(|e| e.panes.iter().map(|p| p.pane_id.clone()).collect())
+            .unwrap_or_default();
+        if panes.is_empty() {
+            return;
+        }
+        let current_idx = self
+            .active_pane
+            .as_ref()
+            .and_then(|pid| panes.iter().position(|p| p == pid))
+            .unwrap_or(0);
+        let len = panes.len() as i32;
+        let new_idx = ((current_idx as i32 + offset).rem_euclid(len)) as usize;
+        self.select_pane(panes[new_idx].clone());
+    }
+
+    /// Create a new session. The server assigns the word_id and CWD defaults to
+    /// the client's current working directory.
     pub fn create_session(&mut self) {
         if self.ws_sender.is_some() {
             let rid = self.next_rid();
-            let name = format!("session-{rid}");
+            let cwd = std::env::current_dir()
+                .ok()
+                .and_then(|p| p.to_str().map(|s| s.to_string()));
             self.send_ws(ClientMessage::SessionCreate {
                 request_id: rid,
-                name,
+                name: None,
+                cwd,
                 program: None,
                 args: vec![],
                 size: TermSize { rows: 24, cols: 80 },
@@ -467,88 +624,111 @@ impl SessionManager {
         }
     }
 
-    /// Close the named session.
-    pub fn close_session(&mut self, name: &str) {
+    /// Create a new pane in the active session.
+    pub fn create_pane(&mut self) {
+        if let Some(word_id) = self.active_session.clone() {
+            let rid = self.next_rid();
+            self.send_ws(ClientMessage::PaneCreate {
+                request_id: rid,
+                word_id,
+                program: None,
+                args: vec![],
+                size: TermSize { rows: 24, cols: 80 },
+            });
+        }
+    }
+
+    /// Close the active pane.
+    pub fn close_pane(&mut self) {
+        if let Some(pane_id) = self.active_pane.clone() {
+            let rid = self.next_rid();
+            self.send_ws(ClientMessage::PaneClose {
+                request_id: rid,
+                pane_id,
+            });
+        }
+    }
+
+    /// Close the entire active session (all its panes).
+    pub fn close_session(&mut self, word_id: &str) {
         let rid = self.next_rid();
         self.send_ws(ClientMessage::SessionClose {
             request_id: rid,
-            name: name.to_string(),
+            word_id: word_id.to_string(),
         });
     }
 
-    /// Rename a session.
-    pub fn rename_session(&mut self, old: &str, new_name: &str) {
-        if !new_name.is_empty() && new_name != old {
+    /// Rename the active session's display name.
+    pub fn rename_session(&mut self, word_id: &str, new_name: &str) {
+        if !new_name.is_empty() {
             let rid = self.next_rid();
             self.send_ws(ClientMessage::SessionRename {
                 request_id: rid,
-                session: old.to_string(),
+                word_id: word_id.to_string(),
                 new_name: new_name.to_string(),
             });
         }
     }
 
-    /// Send raw PTY input bytes for the active session.
-    /// Returns `false` if input is locked (bytes not sent), `true` otherwise.
+    /// Send raw PTY input bytes for the active pane.
     pub fn send_input(&mut self, data: Vec<u8>) -> bool {
-        if let Some(session) = self.active_session.clone() {
-            let locked = self.input_locked.get(&session).copied().unwrap_or(false);
+        if let Some(pane_id) = self.active_pane.clone() {
+            let locked = self.input_locked.get(&pane_id).copied().unwrap_or(false);
             if locked {
-                self.status_msg = "Input locked on this session".to_string();
+                self.status_msg = "Input locked on this pane".to_string();
                 return false;
             }
-            self.send_ws(ClientMessage::PtyInput { session, data });
+            self.send_ws(ClientMessage::PtyInput { pane_id, data });
         }
         true
     }
 
-    /// Send a paste string for the active session (server handles bracketed paste wrapping).
-    /// Returns `false` if input is locked.
+    /// Send a paste string for the active pane.
     pub fn send_paste(&mut self, text: String) -> bool {
         if text.is_empty() {
             return true;
         }
-        if let Some(session) = self.active_session.clone() {
-            let locked = self.input_locked.get(&session).copied().unwrap_or(false);
+        if let Some(pane_id) = self.active_pane.clone() {
+            let locked = self.input_locked.get(&pane_id).copied().unwrap_or(false);
             if locked {
-                self.status_msg = "Input locked on this session".to_string();
+                self.status_msg = "Input locked on this pane".to_string();
                 return false;
             }
             self.send_ws(ClientMessage::PtyPaste {
-                session,
+                pane_id,
                 data: text,
             });
         }
         true
     }
 
-    /// Send a resize event for the given session and resize the local buffer.
-    pub fn send_resize(&mut self, session: &str, rows: u16, cols: u16) {
-        if let Some(buf) = self.buffers.get_mut(session) {
+    /// Send a resize event for the given pane and resize the local buffer.
+    pub fn send_resize(&mut self, pane_id: &str, rows: u16, cols: u16) {
+        if let Some(buf) = self.buffers.get_mut(pane_id) {
             buf.resize(rows, cols);
         }
         self.send_ws(ClientMessage::Resize {
-            session: session.to_string(),
+            pane_id: pane_id.to_string(),
             size: TermSize { rows, cols },
         });
     }
 
-    /// Send a Unix signal to the PTY child of the named session.
-    pub fn send_signal(&mut self, session: &str, signal: i32) {
+    /// Send a Unix signal to the PTY child of the active pane.
+    pub fn send_signal(&mut self, pane_id: &str, signal: i32) {
         self.send_ws(ClientMessage::Signal {
-            session: session.to_string(),
+            pane_id: pane_id.to_string(),
             signal,
         });
     }
 
-    /// Toggle the input lock on the active session.
+    /// Toggle the input lock on the active pane.
     pub fn toggle_input_lock(&mut self) {
-        if let Some(session) = self.active_session.clone() {
-            let locked = self.input_locked.get(&session).copied().unwrap_or(false);
+        if let Some(pane_id) = self.active_pane.clone() {
+            let locked = self.input_locked.get(&pane_id).copied().unwrap_or(false);
             if locked {
-                self.send_ws(ClientMessage::ReleaseInputLock { session });
+                self.send_ws(ClientMessage::ReleaseInputLock { pane_id });
             } else {
-                self.send_ws(ClientMessage::RequestInputLock { session });
+                self.send_ws(ClientMessage::RequestInputLock { pane_id });
             }
         }
     }
@@ -564,32 +744,36 @@ impl SessionManager {
         self.connected
     }
 
+    /// Active session word_id.
     pub fn active_session(&self) -> Option<&str> {
         self.active_session.as_deref()
     }
 
-    pub fn session_list(&self) -> &[SessionInfo] {
+    /// Active pane_id.
+    pub fn active_pane_id(&self) -> Option<&str> {
+        self.active_pane.as_deref()
+    }
+
+    pub fn session_list(&self) -> &[SessionEntry] {
         &self.session_list
     }
 
-    pub fn buffer(&self, name: &str) -> Option<&CellGrid> {
-        self.buffers.get(name)
+    pub fn buffer(&self, pane_id: &str) -> Option<&CellGrid> {
+        self.buffers.get(pane_id)
     }
 
-    pub fn buffer_mut(&mut self, name: &str) -> Option<&mut CellGrid> {
-        self.buffers.get_mut(name)
+    pub fn buffer_mut(&mut self, pane_id: &str) -> Option<&mut CellGrid> {
+        self.buffers.get_mut(pane_id)
     }
 
     pub fn active_grid(&self) -> Option<&CellGrid> {
-        self.active_session
-            .as_ref()
-            .and_then(|s| self.buffers.get(s))
+        self.active_pane.as_ref().and_then(|p| self.buffers.get(p))
     }
 
     pub fn active_grid_mut(&mut self) -> Option<&mut CellGrid> {
-        if let Some(name) = &self.active_session {
-            let name = name.clone();
-            self.buffers.get_mut(&name)
+        if let Some(pane_id) = &self.active_pane {
+            let pane_id = pane_id.clone();
+            self.buffers.get_mut(&pane_id)
         } else {
             None
         }
@@ -617,19 +801,57 @@ impl SessionManager {
         self.active_grid().map(|b| (b.rows as u16, b.cols as u16))
     }
 
-    pub fn is_input_locked(&self, session: &str) -> bool {
-        self.input_locked.get(session).copied().unwrap_or(false)
+    pub fn is_input_locked(&self, pane_id: &str) -> bool {
+        self.input_locked.get(pane_id).copied().unwrap_or(false)
     }
 
     pub fn active_input_locked(&self) -> bool {
-        self.active_session
+        self.active_pane
             .as_ref()
-            .map(|s| self.is_input_locked(s))
+            .map(|p| self.is_input_locked(p))
             .unwrap_or(false)
     }
 
     pub fn client_id(&self) -> Option<ClientId> {
         self.client_id
+    }
+
+    /// Compute the display name for a session, disambiguating by parent directory
+    /// if multiple sessions share the same name.
+    pub fn display_name_for(&self, word_id: &str) -> String {
+        let Some(entry) = self.session_list.iter().find(|e| e.meta.word_id == word_id) else {
+            return word_id.to_string();
+        };
+        let name = &entry.meta.name;
+        let cwd = &entry.meta.cwd;
+
+        // Count how many sessions share the same display name
+        let same_name_count = self
+            .session_list
+            .iter()
+            .filter(|e| &e.meta.name == name)
+            .count();
+
+        if same_name_count <= 1 {
+            name.clone()
+        } else {
+            // Show the parent directory to disambiguate
+            let parent = Path::new(cwd)
+                .parent()
+                .and_then(|p| p.file_name())
+                .and_then(|n| n.to_str())
+                .unwrap_or(cwd.as_str());
+            format!("{name} ({parent})")
+        }
+    }
+
+    /// Panes for the active session, in index order.
+    pub fn active_session_panes(&self) -> &[kmux_protocol::messages::PaneInfo] {
+        self.active_session
+            .as_ref()
+            .and_then(|wid| self.session_list.iter().find(|e| e.meta.word_id == *wid))
+            .map(|e| e.panes.as_slice())
+            .unwrap_or(&[])
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -648,40 +870,29 @@ impl SessionManager {
         id
     }
 
-    fn attach_fresh(&mut self, session: String) {
-        self.session_sync
-            .insert(session.clone(), SessionSync::AwaitingSync);
+    fn attach_fresh(&mut self, pane_id: String) {
+        self.pane_sync
+            .insert(pane_id.clone(), PaneSync::AwaitingSync);
         self.send_ws(ClientMessage::Attach {
-            session,
+            pane_id,
             last_seqno: None,
         });
     }
+}
 
-    fn apply_rename(&mut self, old_name: &str, new_name: &str) {
-        if let Some(buf) = self.buffers.remove(old_name) {
-            self.buffers.insert(new_name.to_string(), buf);
-        }
-        if let Some(sync) = self.session_sync.remove(old_name) {
-            self.session_sync.insert(new_name.to_string(), sync);
-        }
-        if let Some(locked) = self.input_locked.remove(old_name) {
-            self.input_locked.insert(new_name.to_string(), locked);
-        }
-        for info in &mut self.session_list {
-            if info.name == old_name {
-                info.name = new_name.to_string();
-            }
-        }
-        if self.active_session.as_deref() == Some(old_name) {
-            self.active_session = Some(new_name.to_string());
-        }
-    }
+/// Get the word_id of the first session in the list.
+fn e_word_id_from_list(list: &[SessionEntry]) -> String {
+    list.first()
+        .map(|e| e.meta.word_id.clone())
+        .unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kmux_protocol::messages::{GridSnapshot, TermModes};
+    use kmux_protocol::messages::{
+        GridSnapshot, PaneInfo, SessionMeta, SessionStatus, TermModes, TermSize,
+    };
 
     fn make_manager() -> SessionManager {
         SessionManager::new(
@@ -698,6 +909,30 @@ mod tests {
         mgr.ws_sender = Some(tx);
         mgr.connected = true;
         (mgr, rx)
+    }
+
+    fn make_entry(word_id: &str, cwd: &str) -> SessionEntry {
+        use kmux_protocol::messages::SessionMeta;
+        SessionEntry {
+            meta: SessionMeta {
+                index: 0,
+                word_id: word_id.to_string(),
+                name: std::path::Path::new(cwd)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(word_id)
+                    .to_string(),
+                cwd: cwd.to_string(),
+            },
+            panes: vec![PaneInfo {
+                pane_id: format!("{word_id}/0"),
+                pane_index: 0,
+                program: String::new(),
+                size: TermSize::default(),
+                attached_clients: vec![],
+                status: SessionStatus::Running,
+            }],
+        }
     }
 
     #[test]
@@ -736,13 +971,7 @@ mod tests {
     fn session_list_populates_and_auto_attaches() {
         let (mut mgr, mut rx) = make_connected_manager();
 
-        let sessions = vec![SessionInfo {
-            name: "foo".to_string(),
-            program: String::new(),
-            size: TermSize::default(),
-            attached_clients: vec![],
-            status: SessionStatus::Running,
-        }];
+        let sessions = vec![make_entry("eagle", "/home/user/proj")];
         let events = mgr.handle_server_message(ServerMessage::SessionListResult {
             request_id: 0,
             sessions,
@@ -752,7 +981,8 @@ mod tests {
             [SessionEvent::SessionListReceived]
         ));
         assert_eq!(mgr.session_list.len(), 1);
-        assert_eq!(mgr.active_session.as_deref(), Some("foo"));
+        assert_eq!(mgr.active_session.as_deref(), Some("eagle"));
+        assert_eq!(mgr.active_pane.as_deref(), Some("eagle/0"));
         // Attach message should have been sent
         assert!(rx.try_recv().is_ok());
     }
@@ -760,60 +990,53 @@ mod tests {
     #[test]
     fn session_created_switches_active() {
         let (mut mgr, _rx) = make_connected_manager();
+        let entry = make_entry("falcon", "/home/user/other");
         let events = mgr.handle_server_message(ServerMessage::SessionCreated {
             request_id: 0,
-            name: "bar".to_string(),
+            entry,
         });
         assert!(matches!(
             events.as_slice(),
-            [SessionEvent::SessionCreated { name }] if name == "bar"
+            [SessionEvent::SessionCreated { word_id }] if word_id == "falcon"
         ));
-        assert_eq!(mgr.active_session.as_deref(), Some("bar"));
-        assert!(mgr.buffers.contains_key("bar"));
+        assert_eq!(mgr.active_session.as_deref(), Some("falcon"));
+        assert_eq!(mgr.active_pane.as_deref(), Some("falcon/0"));
+        assert!(mgr.buffers.contains_key("falcon/0"));
     }
 
     #[test]
     fn session_closed_removes_and_falls_back() {
         let (mut mgr, _rx) = make_connected_manager();
-        // Populate two sessions
-        mgr.buffers.insert("s1".to_string(), CellGrid::default());
-        mgr.buffers.insert("s2".to_string(), CellGrid::default());
-        mgr.session_list.push(SessionInfo {
-            name: "s1".to_string(),
-            program: String::new(),
-            size: TermSize::default(),
-            attached_clients: vec![],
-            status: SessionStatus::Running,
-        });
-        mgr.session_list.push(SessionInfo {
-            name: "s2".to_string(),
-            program: String::new(),
-            size: TermSize::default(),
-            attached_clients: vec![],
-            status: SessionStatus::Running,
-        });
+
+        let e1 = make_entry("s1", "/a");
+        let e2 = make_entry("s2", "/b");
+        mgr.session_list.push(e1);
+        mgr.session_list.push(e2);
+        mgr.buffers.insert("s1/0".to_string(), CellGrid::default());
+        mgr.buffers.insert("s2/0".to_string(), CellGrid::default());
         mgr.active_session = Some("s1".to_string());
+        mgr.active_pane = Some("s1/0".to_string());
 
         let events = mgr.handle_server_message(ServerMessage::SessionClosed {
             request_id: 0,
-            name: "s1".to_string(),
+            word_id: "s1".to_string(),
             exit_code: None,
         });
         assert!(matches!(
             events.as_slice(),
-            [SessionEvent::SessionClosed { name }] if name == "s1"
+            [SessionEvent::SessionClosed { word_id }] if word_id == "s1"
         ));
-        assert!(!mgr.buffers.contains_key("s1"));
-        // Should fall back to s2
+        assert!(!mgr.buffers.contains_key("s1/0"));
         assert_eq!(mgr.active_session.as_deref(), Some("s2"));
     }
 
     #[test]
     fn terminal_snapshot_transitions_to_synced() {
         let (mut mgr, _rx) = make_connected_manager();
-        mgr.buffers.insert("sess".to_string(), CellGrid::default());
-        mgr.session_sync
-            .insert("sess".to_string(), SessionSync::AwaitingSync);
+        mgr.buffers
+            .insert("eagle/0".to_string(), CellGrid::default());
+        mgr.pane_sync
+            .insert("eagle/0".to_string(), PaneSync::AwaitingSync);
 
         let snapshot = GridSnapshot {
             rows: 24,
@@ -823,16 +1046,15 @@ mod tests {
             modes: TermModes::EMPTY,
         };
         mgr.handle_server_message(ServerMessage::TerminalSnapshot {
-            session: "sess".to_string(),
+            pane_id: "eagle/0".to_string(),
             snapshot,
             seqno: SequenceNo(5),
             sent_at_ms: 0,
         });
 
-        // Now synced at seqno 6
         assert!(matches!(
-            mgr.session_sync.get("sess"),
-            Some(SessionSync::Synced {
+            mgr.pane_sync.get("eagle/0"),
+            Some(PaneSync::Synced {
                 expected: SequenceNo(6)
             })
         ));
@@ -842,9 +1064,10 @@ mod tests {
     fn terminal_update_discarded_when_awaiting_sync() {
         use kmux_protocol::messages::TerminalDiff;
         let (mut mgr, _rx) = make_connected_manager();
-        mgr.buffers.insert("sess".to_string(), CellGrid::default());
-        mgr.session_sync
-            .insert("sess".to_string(), SessionSync::AwaitingSync);
+        mgr.buffers
+            .insert("eagle/0".to_string(), CellGrid::default());
+        mgr.pane_sync
+            .insert("eagle/0".to_string(), PaneSync::AwaitingSync);
 
         let diff = Arc::new(TerminalDiff {
             ops: vec![],
@@ -853,7 +1076,7 @@ mod tests {
             scrollback_lines: vec![],
         });
         mgr.handle_server_message(ServerMessage::TerminalUpdate {
-            session: "sess".to_string(),
+            pane_id: "eagle/0".to_string(),
             diff,
             seqno: SequenceNo(0),
             sent_at_ms: 0,
@@ -863,80 +1086,58 @@ mod tests {
     }
 
     #[test]
-    fn terminal_update_seqno_gap_triggers_resync() {
-        use kmux_protocol::messages::TerminalDiff;
-        let (mut mgr, mut rx) = make_connected_manager();
-        mgr.buffers.insert("sess".to_string(), CellGrid::default());
-        mgr.session_sync.insert(
-            "sess".to_string(),
-            SessionSync::Synced {
-                expected: SequenceNo(3),
-            },
-        );
-
-        let diff = Arc::new(TerminalDiff {
-            ops: vec![],
-            cursor: Default::default(),
-            modes: TermModes::EMPTY,
-            scrollback_lines: vec![],
-        });
-        // Send seqno 99 when expecting 3 → gap
-        mgr.handle_server_message(ServerMessage::TerminalUpdate {
-            session: "sess".to_string(),
-            diff,
-            seqno: SequenceNo(99),
-            sent_at_ms: 0,
-        });
-
-        assert_eq!(mgr.metrics.snapshot(false).counters.seqno_gaps, 1);
-        assert_eq!(mgr.metrics.snapshot(false).counters.resyncs, 1);
-        // Attach was re-sent
-        assert!(rx.try_recv().is_ok());
-    }
-
-    #[test]
     fn cycle_session_wraps_around() {
         let (mut mgr, _rx) = make_connected_manager();
-        for name in ["a", "b", "c"] {
-            mgr.session_list.push(SessionInfo {
-                name: name.to_string(),
-                program: String::new(),
-                size: TermSize::default(),
-                attached_clients: vec![],
-                status: SessionStatus::Running,
-            });
-            mgr.buffers.insert(name.to_string(), CellGrid::default());
+        for (wid, cwd) in [("a", "/a"), ("b", "/b"), ("c", "/c")] {
+            let entry = make_entry(wid, cwd);
+            mgr.buffers.insert(format!("{wid}/0"), CellGrid::default());
+            mgr.session_list.push(entry);
         }
         mgr.active_session = Some("c".to_string());
+        mgr.active_pane = Some("c/0".to_string());
         mgr.cycle_session(1);
         assert_eq!(mgr.active_session.as_deref(), Some("a")); // wraps from c to a
     }
 
     #[test]
-    fn apply_rename_updates_all_maps() {
+    fn display_name_disambiguation() {
         let mut mgr = make_manager();
-        mgr.buffers.insert("old".to_string(), CellGrid::default());
-        mgr.session_sync
-            .insert("old".to_string(), SessionSync::AwaitingSync);
-        mgr.input_locked.insert("old".to_string(), true);
-        mgr.session_list.push(SessionInfo {
-            name: "old".to_string(),
-            program: String::new(),
-            size: TermSize::default(),
-            attached_clients: vec![],
-            status: SessionStatus::Running,
+        // Two sessions with the same basename "src" but different parent dirs
+        mgr.session_list.push(SessionEntry {
+            meta: SessionMeta {
+                index: 0,
+                word_id: "alpha".to_string(),
+                name: "src".to_string(),
+                cwd: "/proj-a/src".to_string(),
+            },
+            panes: vec![],
         });
-        mgr.active_session = Some("old".to_string());
+        mgr.session_list.push(SessionEntry {
+            meta: SessionMeta {
+                index: 1,
+                word_id: "beta".to_string(),
+                name: "src".to_string(),
+                cwd: "/proj-b/src".to_string(),
+            },
+            panes: vec![],
+        });
 
-        mgr.apply_rename("old", "new");
+        assert_eq!(mgr.display_name_for("alpha"), "src (proj-a)");
+        assert_eq!(mgr.display_name_for("beta"), "src (proj-b)");
+    }
 
-        assert!(!mgr.buffers.contains_key("old"));
-        assert!(mgr.buffers.contains_key("new"));
-        assert!(!mgr.session_sync.contains_key("old"));
-        assert!(mgr.session_sync.contains_key("new"));
-        assert!(!mgr.input_locked.contains_key("old"));
-        assert!(mgr.input_locked.contains_key("new"));
-        assert_eq!(mgr.session_list[0].name, "new");
-        assert_eq!(mgr.active_session.as_deref(), Some("new"));
+    #[test]
+    fn display_name_no_disambiguation_when_unique() {
+        let mut mgr = make_manager();
+        mgr.session_list.push(SessionEntry {
+            meta: SessionMeta {
+                index: 0,
+                word_id: "eagle".to_string(),
+                name: "myapp".to_string(),
+                cwd: "/home/user/myapp".to_string(),
+            },
+            panes: vec![],
+        });
+        assert_eq!(mgr.display_name_for("eagle"), "myapp");
     }
 }

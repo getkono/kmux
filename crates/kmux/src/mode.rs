@@ -10,16 +10,19 @@ pub enum Mode {
     Locked,
     /// Mode selector shown at bottom. Single key picks a mode.
     Select,
-    /// Session management: c=create, x=close, n/p=next/prev, 0-9=jump, r=rename, d=disconnect
+    /// Session management: c=create session, p=create pane, X=close session,
+    /// x=close pane, n=next session, Tab/j/k=pane nav, r=rename, d=disconnect
     Session,
     /// Scroll through history: Up/Down/PgUp/PgDn, Esc to exit
     Scroll,
     /// Signal menu: k=SIGKILL, t=SIGTERM, s=SIGSTOP, c=SIGCONT
     Signal,
     /// Confirm close session (y/n)
-    ConfirmClose { session: String },
+    ConfirmCloseSession { word_id: String },
     /// Rename session (typing new name)
-    Rename { session: String, buffer: String },
+    RenameSession { word_id: String, buffer: String },
+    /// Floating session picker with search
+    SessionPicker,
     /// Help overlay
     Help,
     /// Connect screen (typing host/port/token)
@@ -48,6 +51,20 @@ pub enum Action {
     RenameBackspace,
     RenameSubmit,
     Disconnect,
+
+    // Pane management
+    CreatePane,
+    ClosePane,
+    NextPane,
+    PrevPane,
+
+    // Session picker
+    CloseSessionPicker,
+    SelectPickerEntry,
+    PickerUp,
+    PickerDown,
+    PickerSearchChar(char),
+    PickerSearchBackspace,
 
     // Signals
     SendSignal(i32),
@@ -101,8 +118,9 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::Session => resolve_session(key, mods),
         Mode::Scroll => resolve_scroll(key, mods),
         Mode::Signal => resolve_signal(key, mods),
-        Mode::ConfirmClose { .. } => resolve_confirm_close(key),
-        Mode::Rename { .. } => resolve_rename(key, mods),
+        Mode::ConfirmCloseSession { .. } => resolve_confirm_close(key),
+        Mode::RenameSession { .. } => resolve_rename(key, mods),
+        Mode::SessionPicker => resolve_session_picker(key, mods),
         Mode::Help => resolve_help(key),
         Mode::Connect { field } => resolve_connect(key, mods, field),
     }
@@ -166,9 +184,12 @@ fn resolve_session(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     match key {
         Key::Character(c) => match c.as_str() {
             "c" => (Some(Mode::Normal), Action::CreateSession),
-            "x" => (None, Action::CloseSession),
+            "p" => (Some(Mode::Normal), Action::CreatePane),
+            "X" => (None, Action::CloseSession),
+            "x" => (Some(Mode::Normal), Action::ClosePane),
             "n" => (None, Action::NextSession),
-            "p" => (None, Action::PrevSession),
+            "j" => (None, Action::NextPane),
+            "k" => (None, Action::PrevPane),
             "r" => (None, Action::RenameSession),
             "d" => (Some(Mode::Normal), Action::Disconnect),
             "l" => (None, Action::ToggleInputLock),
@@ -185,8 +206,11 @@ fn resolve_session(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
             "9" => (Some(Mode::Normal), Action::JumpToSession(8)),
             _ => (None, Action::None),
         },
+        Key::Named(NamedKey::Tab) => (None, Action::NextPane),
         Key::Named(NamedKey::ArrowRight) => (None, Action::NextSession),
         Key::Named(NamedKey::ArrowLeft) => (None, Action::PrevSession),
+        Key::Named(NamedKey::ArrowDown) => (None, Action::NextPane),
+        Key::Named(NamedKey::ArrowUp) => (None, Action::PrevPane),
         Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::None),
         _ => (None, Action::None),
     }
@@ -246,6 +270,24 @@ fn resolve_rename(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     }
 }
 
+fn resolve_session_picker(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+    match key {
+        Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::CloseSessionPicker),
+        Key::Named(NamedKey::Enter) => (Some(Mode::Normal), Action::SelectPickerEntry),
+        Key::Named(NamedKey::ArrowUp) => (None, Action::PickerUp),
+        Key::Named(NamedKey::ArrowDown) => (None, Action::PickerDown),
+        Key::Named(NamedKey::Backspace) => (None, Action::PickerSearchBackspace),
+        Key::Character(c) => {
+            if let Some(ch) = c.chars().next() {
+                (None, Action::PickerSearchChar(ch))
+            } else {
+                (None, Action::None)
+            }
+        }
+        _ => (None, Action::None),
+    }
+}
+
 fn resolve_help(key: &Key) -> (Option<Mode>, Action) {
     // Any key exits help
     let _ = key;
@@ -290,14 +332,14 @@ pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
             ("Esc", "Cancel"),
         ],
         Mode::Session => vec![
-            ("c", "Create"),
-            ("x", "Close"),
-            ("n/p", "Next/Prev"),
+            ("c", "New session"),
+            ("p", "New pane"),
+            ("X", "Close session"),
+            ("x", "Close pane"),
+            ("n/\u{2190}\u{2192}", "Sessions"),
+            ("Tab/j/k", "Panes"),
             ("r", "Rename"),
             ("d", "Disconnect"),
-            ("l", "Lock input"),
-            ("f", "Snapshot"),
-            ("0-9", "Jump"),
             ("Esc", "Back"),
         ],
         Mode::Scroll => vec![
@@ -312,8 +354,13 @@ pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
             ("c", "SIGCONT"),
             ("Esc", "Cancel"),
         ],
-        Mode::ConfirmClose { session: _ } => vec![("y", "Confirm close"), ("any", "Cancel")],
-        Mode::Rename { .. } => vec![("Enter", "Submit"), ("Esc", "Cancel")],
+        Mode::ConfirmCloseSession { .. } => vec![("y", "Confirm close"), ("any", "Cancel")],
+        Mode::RenameSession { .. } => vec![("Enter", "Submit"), ("Esc", "Cancel")],
+        Mode::SessionPicker => vec![
+            ("\u{2191}/\u{2193}", "Navigate"),
+            ("Enter", "Select"),
+            ("Esc", "Cancel"),
+        ],
         Mode::Help => vec![("any key", "Close")],
         Mode::Connect { .. } => vec![("Tab", "Next field"), ("Enter", "Connect")],
     }
@@ -328,8 +375,9 @@ pub fn mode_name(mode: &Mode) -> &'static str {
         Mode::Session => "SESSION",
         Mode::Scroll => "SCROLL",
         Mode::Signal => "SIGNAL",
-        Mode::ConfirmClose { .. } => "CONFIRM CLOSE",
-        Mode::Rename { .. } => "RENAME",
+        Mode::ConfirmCloseSession { .. } => "CONFIRM CLOSE",
+        Mode::RenameSession { .. } => "RENAME",
+        Mode::SessionPicker => "SESSION PICKER",
         Mode::Help => "HELP",
         Mode::Connect { .. } => "CONNECT",
     }
@@ -351,9 +399,13 @@ pub fn help_entries() -> Vec<(&'static str, &'static str)> {
         ("", ""),
         ("-- Session Mode --", ""),
         ("c", "Create new session"),
-        ("x", "Close current session"),
+        ("p", "Create new pane"),
+        ("X", "Close current session"),
+        ("x", "Close current pane"),
         ("n / \u{2192}", "Next session"),
-        ("p / \u{2190}", "Previous session"),
+        ("\u{2190}", "Previous session"),
+        ("Tab / j", "Next pane"),
+        ("k", "Previous pane"),
         ("0-9", "Jump to session"),
         ("r", "Rename session"),
         ("d", "Disconnect"),
@@ -394,7 +446,7 @@ mod tests {
     }
 
     #[test]
-    fn session_c_creates() {
+    fn session_c_creates_session() {
         let (mode, action) = resolve(
             &Mode::Session,
             &Key::Character("c".into()),
@@ -402,6 +454,47 @@ mod tests {
         );
         assert_eq!(mode, Some(Mode::Normal));
         assert_eq!(action, Action::CreateSession);
+    }
+
+    #[test]
+    fn session_p_creates_pane() {
+        let (mode, action) = resolve(
+            &Mode::Session,
+            &Key::Character("p".into()),
+            Modifiers::empty(),
+        );
+        assert_eq!(mode, Some(Mode::Normal));
+        assert_eq!(action, Action::CreatePane);
+    }
+
+    #[test]
+    fn session_x_closes_pane() {
+        let (_, action) = resolve(
+            &Mode::Session,
+            &Key::Character("x".into()),
+            Modifiers::empty(),
+        );
+        assert_eq!(action, Action::ClosePane);
+    }
+
+    #[test]
+    fn session_shift_x_closes_session() {
+        let (_, action) = resolve(
+            &Mode::Session,
+            &Key::Character("X".into()),
+            Modifiers::empty(),
+        );
+        assert_eq!(action, Action::CloseSession);
+    }
+
+    #[test]
+    fn session_tab_next_pane() {
+        let (_, action) = resolve(
+            &Mode::Session,
+            &Key::Named(NamedKey::Tab),
+            Modifiers::empty(),
+        );
+        assert_eq!(action, Action::NextPane);
     }
 
     #[test]
@@ -440,5 +533,27 @@ mod tests {
             Modifiers::empty(),
         );
         assert_eq!(mode, Some(Mode::Normal));
+    }
+
+    #[test]
+    fn session_picker_esc_closes() {
+        let (mode, action) = resolve(
+            &Mode::SessionPicker,
+            &Key::Named(NamedKey::Escape),
+            Modifiers::empty(),
+        );
+        assert_eq!(mode, Some(Mode::Normal));
+        assert_eq!(action, Action::CloseSessionPicker);
+    }
+
+    #[test]
+    fn session_picker_enter_selects() {
+        let (mode, action) = resolve(
+            &Mode::SessionPicker,
+            &Key::Named(NamedKey::Enter),
+            Modifiers::empty(),
+        );
+        assert_eq!(mode, Some(Mode::Normal));
+        assert_eq!(action, Action::SelectPickerEntry);
     }
 }
