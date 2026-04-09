@@ -27,6 +27,8 @@ pub enum Mode {
     Help,
     /// Connect screen (typing host/port/token)
     Connect { field: ConnectField },
+    /// Directory picker for remote connections: type a path to open/create a session
+    DirectoryPicker,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -97,6 +99,12 @@ pub enum Action {
     ConnectChar(char),
     ConnectBackspace,
 
+    // Directory picker (remote connection)
+    DirPickerChar(char),
+    DirPickerBackspace,
+    DirPickerSubmit,
+    DirPickerCancel,
+
     // Quit the application
     Quit,
 
@@ -123,6 +131,7 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::SessionPicker => resolve_session_picker(key, mods),
         Mode::Help => resolve_help(key),
         Mode::Connect { field } => resolve_connect(key, mods, field),
+        Mode::DirectoryPicker => resolve_dir_picker(key),
     }
 }
 
@@ -294,6 +303,22 @@ fn resolve_help(key: &Key) -> (Option<Mode>, Action) {
     (Some(Mode::Normal), Action::None)
 }
 
+fn resolve_dir_picker(key: &Key) -> (Option<Mode>, Action) {
+    match key {
+        Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::DirPickerCancel),
+        Key::Named(NamedKey::Enter) => (Some(Mode::Normal), Action::DirPickerSubmit),
+        Key::Named(NamedKey::Backspace) => (None, Action::DirPickerBackspace),
+        Key::Character(c) => {
+            if let Some(ch) = c.chars().next() {
+                (None, Action::DirPickerChar(ch))
+            } else {
+                (None, Action::None)
+            }
+        }
+        _ => (None, Action::None),
+    }
+}
+
 fn resolve_connect(key: &Key, mods: Modifiers, _field: &ConnectField) -> (Option<Mode>, Action) {
     match key {
         Key::Named(NamedKey::Enter) => (None, Action::ConnectSubmit),
@@ -363,6 +388,7 @@ pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
         ],
         Mode::Help => vec![("any key", "Close")],
         Mode::Connect { .. } => vec![("Tab", "Next field"), ("Enter", "Connect")],
+        Mode::DirectoryPicker => vec![("Enter", "Open/create session"), ("Esc", "Cancel")],
     }
 }
 
@@ -380,6 +406,7 @@ pub fn mode_name(mode: &Mode) -> &'static str {
         Mode::SessionPicker => "SESSION PICKER",
         Mode::Help => "HELP",
         Mode::Connect { .. } => "CONNECT",
+        Mode::DirectoryPicker => "OPEN SESSION",
     }
 }
 

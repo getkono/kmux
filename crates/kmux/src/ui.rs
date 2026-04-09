@@ -135,6 +135,7 @@ fn render_terminal(f: &mut Frame, app: &mut App) {
         Mode::ConfirmCloseSession { word_id } => render_confirm_overlay(f, area, word_id),
         Mode::RenameSession { buffer, word_id } => render_rename_overlay(f, area, word_id, buffer),
         Mode::SessionPicker => render_session_picker_overlay(f, area, app),
+        Mode::DirectoryPicker => render_dir_picker_overlay(f, area, app),
         _ => {}
     }
 
@@ -507,6 +508,7 @@ fn mode_color(mode: &Mode) -> Color {
         Mode::SessionPicker => theme::ACCENT,
         Mode::Help => theme::ACCENT,
         Mode::Connect { .. } => theme::ACCENT,
+        Mode::DirectoryPicker => theme::ACCENT,
     }
 }
 
@@ -596,6 +598,86 @@ fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
         .border_style(Style::default().fg(theme::ACCENT))
         .title(Span::styled(
             " Sessions ",
+            Style::default()
+                .fg(theme::ACCENT)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme::BG));
+
+    f.render_widget(Paragraph::new(lines).block(block), overlay_area);
+}
+
+fn render_dir_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
+    let buffer = &app.dir_picker_buffer;
+    let buffer_lower = buffer.to_lowercase();
+
+    // Show existing sessions whose CWD contains the typed text
+    let matches: Vec<_> = app
+        .mgr
+        .session_list()
+        .iter()
+        .filter(|e| buffer_lower.is_empty() || e.meta.cwd.to_lowercase().contains(&buffer_lower))
+        .collect();
+
+    let visible_rows = matches.len().min(6) as u16;
+    let width = 60u16.min(area.width.saturating_sub(4));
+    // input row + separator + entries + border
+    let height = (visible_rows + 5).min(area.height.saturating_sub(2));
+    let x = area.width.saturating_sub(width) / 2;
+    let y = area.height.saturating_sub(height) / 2;
+    let overlay_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, overlay_area);
+
+    let inner_width = width.saturating_sub(2) as usize;
+
+    let mut lines = vec![];
+
+    // Input line
+    lines.push(Line::from(vec![
+        Span::styled(
+            " Directory: ",
+            Style::default().fg(theme::FG_DIM).bg(theme::BG),
+        ),
+        Span::styled(
+            format!("{buffer}_"),
+            Style::default().fg(theme::FG).bg(theme::BG),
+        ),
+    ]));
+
+    // Separator
+    lines.push(Line::from(Span::styled(
+        "\u{2500}".repeat(inner_width),
+        Style::default().fg(theme::FG_DIM).bg(theme::BG),
+    )));
+
+    if matches.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (no existing sessions — Enter to create new) ",
+            Style::default().fg(theme::FG_DIM).bg(theme::BG),
+        )));
+    } else {
+        for entry in matches.iter().take(6) {
+            let name = app.mgr.display_name_for(&entry.meta.word_id);
+            let cwd = &entry.meta.cwd;
+            let marker = if entry.meta.cwd == *buffer { ">" } else { " " };
+            let row_text = format!("{marker} {name:<16} {cwd}");
+            let row_text: String = row_text
+                .chars()
+                .take(inner_width.saturating_sub(1))
+                .collect();
+            lines.push(Line::from(Span::styled(
+                row_text,
+                Style::default().fg(theme::FG).bg(theme::BG),
+            )));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::ACCENT))
+        .title(Span::styled(
+            " Open Session ",
             Style::default()
                 .fg(theme::ACCENT)
                 .add_modifier(Modifier::BOLD),

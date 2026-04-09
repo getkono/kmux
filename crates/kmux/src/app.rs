@@ -42,6 +42,14 @@ pub struct App {
     pub session_picker_selected: usize,
     pub session_picker_search: String,
 
+    // Directory picker state (remote connections)
+    pub dir_picker_buffer: String,
+
+    // Auto-session selection context
+    pub is_local: bool,
+    pub initial_cwd: String,
+    did_auto_select: bool,
+
     /// Width (in columns) of the session badge in the top bar, used to detect
     /// mouse clicks that should open the session picker.
     pub session_badge_cols: u16,
@@ -50,7 +58,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(host: String, port: u16, token: String, accept_invalid_certs: bool) -> Self {
+    pub fn new(
+        host: String,
+        port: u16,
+        token: String,
+        accept_invalid_certs: bool,
+        is_local: bool,
+        initial_cwd: String,
+    ) -> Self {
         let connect_host = host.clone();
         let connect_port = port.to_string();
         let connect_token = token.clone();
@@ -74,6 +89,10 @@ impl App {
             disconnect_at: None,
             session_picker_selected: 0,
             session_picker_search: String::new(),
+            dir_picker_buffer: String::new(),
+            is_local,
+            initial_cwd,
+            did_auto_select: false,
             session_badge_cols: 0,
             needs_render: true,
         }
@@ -206,6 +225,23 @@ impl App {
                         self.mode = Mode::Normal;
                     }
                     info!("Auth succeeded");
+                }
+                SessionEvent::SessionListReceived => {
+                    if !self.did_auto_select {
+                        self.did_auto_select = true;
+                        if self.is_local {
+                            let cwd = self.initial_cwd.clone();
+                            if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
+                                self.mgr.select_session(word_id);
+                            } else {
+                                self.mgr.create_session_with_cwd(&cwd);
+                            }
+                        } else {
+                            // Remote: show directory picker pre-filled with local CWD
+                            self.dir_picker_buffer = self.initial_cwd.clone();
+                            self.mode = Mode::DirectoryPicker;
+                        }
+                    }
                 }
                 _ => {}
             }
@@ -476,6 +512,23 @@ impl App {
             Action::ExitToNormal => {
                 self.mode = Mode::Normal;
             }
+            Action::DirPickerChar(ch) => {
+                self.dir_picker_buffer.push(ch);
+            }
+            Action::DirPickerBackspace => {
+                self.dir_picker_buffer.pop();
+            }
+            Action::DirPickerSubmit => {
+                let cwd = self.dir_picker_buffer.trim().to_string();
+                if !cwd.is_empty() {
+                    if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
+                        self.mgr.select_session(word_id);
+                    } else {
+                        self.mgr.create_session_with_cwd(&cwd);
+                    }
+                }
+            }
+            Action::DirPickerCancel => {}
             Action::Quit => {
                 return KeyResult::Quit;
             }

@@ -21,11 +21,14 @@ use kmux_client::token::read_local_token;
 #[derive(Parser, Debug)]
 #[command(name = "kmux", about = "kmux remote terminal client (TUI)")]
 struct Cli {
-    /// Server host (omit to auto-start and connect to a local daemon)
+    /// Remote server host (omit to auto-start and connect to the local daemon)
+    server: Option<String>,
+
+    /// Server host (overridden by positional server argument if given)
     #[arg(long)]
     host: Option<String>,
 
-    /// Server port (omit to auto-start and connect to a local daemon)
+    /// Server port
     #[arg(long)]
     port: Option<u16>,
 
@@ -47,17 +50,36 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // When no explicit --host, --port, or --token is given, auto-start (or
-    // reuse) a local daemon and retrieve the connection parameters from it.
-    let is_local = cli.host.is_none() && cli.port.is_none() && cli.token.is_none();
+    // Capture the client's working directory before doing anything else.
+    let initial_cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(|s| s.to_string()))
+        .unwrap_or_default();
+
+    // When no positional server, --host, --port, or --token is given, auto-start
+    // (or reuse) a local daemon and retrieve the connection parameters from it.
+    let is_local =
+        cli.server.is_none() && cli.host.is_none() && cli.port.is_none() && cli.token.is_none();
 
     let (host, port, token, accept_invalid_certs) = if is_local {
         let status = kmux_client::daemon::ensure_daemon().await?;
         // The daemon uses a self-signed cert, so accept-invalid-certs is implied.
         ("127.0.0.1".to_string(), status.port, status.token, true)
     } else {
-        let host = cli.host.unwrap_or_else(|| "127.0.0.1".to_string());
-        let port = cli.port.unwrap_or(8443);
+        // Positional `server` arg takes precedence over `--host`. It may be
+        // "host" or "host:port".
+        let (host, port) = if let Some(server) = cli.server {
+            if let Some((h, p_str)) = server.rsplit_once(':') {
+                let p = p_str.parse().unwrap_or(8443);
+                (h.to_string(), cli.port.unwrap_or(p))
+            } else {
+                (server, cli.port.unwrap_or(8443))
+            }
+        } else {
+            let host = cli.host.unwrap_or_else(|| "127.0.0.1".to_string());
+            let port = cli.port.unwrap_or(8443);
+            (host, port)
+        };
         let token = cli.token.or_else(read_local_token).unwrap_or_default();
         (host, port, token, cli.accept_invalid_certs)
     };
@@ -77,7 +99,14 @@ async fn main() -> anyhow::Result<()> {
         original_hook(panic_info);
     }));
 
-    let mut app = App::new(host, port, token, accept_invalid_certs);
+    let mut app = App::new(
+        host,
+        port,
+        token,
+        accept_invalid_certs,
+        is_local,
+        initial_cwd,
+    );
 
     let result = app.run(&mut terminal).await;
 

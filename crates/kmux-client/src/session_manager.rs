@@ -624,6 +624,29 @@ impl SessionManager {
         }
     }
 
+    /// Create a new session with an explicit working directory.
+    pub fn create_session_with_cwd(&mut self, cwd: &str) {
+        if self.ws_sender.is_some() {
+            let rid = self.next_rid();
+            self.send_ws(ClientMessage::SessionCreate {
+                request_id: rid,
+                name: None,
+                cwd: Some(cwd.to_string()),
+                program: None,
+                args: vec![],
+                size: TermSize { rows: 24, cols: 80 },
+            });
+        }
+    }
+
+    /// Find the first session whose CWD exactly matches `cwd`, returning its word_id.
+    pub fn find_session_by_cwd(&self, cwd: &str) -> Option<String> {
+        self.session_list
+            .iter()
+            .find(|e| e.meta.cwd == cwd)
+            .map(|e| e.meta.word_id.clone())
+    }
+
     /// Create a new pane in the active session.
     pub fn create_pane(&mut self) {
         if let Some(word_id) = self.active_session.clone() {
@@ -1139,5 +1162,48 @@ mod tests {
             panes: vec![],
         });
         assert_eq!(mgr.display_name_for("eagle"), "myapp");
+    }
+
+    #[test]
+    fn find_session_by_cwd_returns_matching_word_id() {
+        let mut mgr = make_manager();
+        mgr.session_list
+            .push(make_entry("eagle", "/home/user/proj"));
+        mgr.session_list
+            .push(make_entry("falcon", "/home/user/other"));
+
+        assert_eq!(
+            mgr.find_session_by_cwd("/home/user/proj"),
+            Some("eagle".to_string())
+        );
+        assert_eq!(
+            mgr.find_session_by_cwd("/home/user/other"),
+            Some("falcon".to_string())
+        );
+        assert_eq!(mgr.find_session_by_cwd("/nonexistent"), None);
+    }
+
+    #[test]
+    fn find_session_by_cwd_exact_match_only() {
+        let mut mgr = make_manager();
+        mgr.session_list
+            .push(make_entry("eagle", "/home/user/proj"));
+
+        // Prefix or suffix should not match
+        assert_eq!(mgr.find_session_by_cwd("/home/user"), None);
+        assert_eq!(mgr.find_session_by_cwd("/home/user/proj/sub"), None);
+    }
+
+    #[test]
+    fn create_session_with_cwd_sends_correct_message() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.create_session_with_cwd("/my/custom/dir");
+
+        match rx.try_recv().expect("message sent") {
+            ClientMessage::SessionCreate { cwd, .. } => {
+                assert_eq!(cwd, Some("/my/custom/dir".to_string()));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
     }
 }
