@@ -155,6 +155,7 @@ mod tests {
             success: true,
             reason: None,
             client_id: Some(ClientId(7)),
+            server_version: Some("0.1.0".to_string()),
         };
         let bytes = encode_server(&msg).expect("encode");
         let decoded = decode_server(&bytes).expect("decode");

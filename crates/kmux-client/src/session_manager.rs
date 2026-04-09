@@ -85,6 +85,9 @@ pub struct SessionManager {
     // Last-successful connection info for display / reconnect
     last_host: String,
     last_port: u16,
+
+    /// Server binary version reported in `AuthResult`; populated on successful auth.
+    pub server_version: Option<String>,
 }
 
 impl SessionManager {
@@ -108,6 +111,7 @@ impl SessionManager {
             next_request_id: 0,
             client_id: None,
             metrics: RenderMetrics::new(),
+            server_version: None,
         }
     }
 
@@ -182,6 +186,14 @@ impl SessionManager {
         self.token = token;
     }
 
+    pub fn host(&self) -> &str {
+        &self.host
+    }
+
+    pub fn port(&self) -> u16 {
+        self.port
+    }
+
     // ── Server message handling ───────────────────────────────────────────────
 
     pub fn handle_server_message(&mut self, msg: ServerMessage) -> Vec<SessionEvent> {
@@ -191,9 +203,11 @@ impl SessionManager {
                 success,
                 reason,
                 client_id,
+                server_version,
             } => {
                 if success {
                     self.client_id = client_id;
+                    self.server_version = server_version;
                     events.push(SessionEvent::AuthOk);
                 } else {
                     warn!("Auth failed: {:?}", reason);
@@ -965,6 +979,7 @@ mod tests {
             success: true,
             reason: None,
             client_id: Some(ClientId(42)),
+            server_version: Some("0.1.0".to_string()),
         });
         assert!(matches!(events.as_slice(), [SessionEvent::AuthOk]));
         assert_eq!(mgr.client_id, Some(ClientId(42)));
@@ -981,6 +996,7 @@ mod tests {
             success: false,
             reason: Some("bad token".to_string()),
             client_id: None,
+            server_version: None,
         });
         assert!(matches!(
             events.as_slice(),

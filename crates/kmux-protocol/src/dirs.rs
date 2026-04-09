@@ -41,6 +41,54 @@ pub fn token_path() -> anyhow::Result<PathBuf> {
     Ok(runtime_dir()?.join("token"))
 }
 
+/// Returns the kmux state directory for persistent data (logs, etc.), creating it if necessary.
+///
+/// Uses `$XDG_STATE_HOME/kmux` per the XDG Base Directory Specification, falling back to
+/// `$HOME/.local/state/kmux` when `XDG_STATE_HOME` is unset.
+pub fn state_dir() -> anyhow::Result<PathBuf> {
+    let base = match std::env::var("XDG_STATE_HOME") {
+        Ok(val) => PathBuf::from(val),
+        Err(_) => {
+            let home = std::env::var("HOME").map(PathBuf::from).or_else(|_| {
+                nix::unistd::User::from_uid(getuid())
+                    .ok()
+                    .flatten()
+                    .map(|u| u.dir)
+                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))
+            })?;
+            home.join(".local").join("state")
+        }
+    };
+    let dir = base.join("kmux");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .create(&dir)
+        .map_err(|e| anyhow::anyhow!("failed to create state dir {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Path to the client log file (appended to by all kmux/kmux-gui instances).
+pub fn client_log_path() -> anyhow::Result<PathBuf> {
+    Ok(state_dir()?.join("client.log"))
+}
+
+/// Path to the daemon log file (appended to by kmuxd).
+pub fn daemon_log_path() -> anyhow::Result<PathBuf> {
+    Ok(state_dir()?.join("daemon.log"))
+}
+
+/// Path to the per-connection log file for the given instance ID.
+///
+/// Each client startup writes its connection metadata here upon successful authentication.
+pub fn connection_log_path(instance_id: &str) -> anyhow::Result<PathBuf> {
+    let dir = state_dir()?.join("connections");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .create(&dir)
+        .map_err(|e| anyhow::anyhow!("failed to create connections dir {}: {e}", dir.display()))?;
+    Ok(dir.join(format!("{instance_id}.log")))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -70,5 +118,29 @@ mod tests {
         assert!(socket_path().unwrap().ends_with("daemon.sock"));
         assert!(pid_path().unwrap().ends_with("daemon.pid"));
         assert!(token_path().unwrap().ends_with("token"));
+    }
+
+    #[test]
+    fn state_dir_xdg() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let dir = state_dir().unwrap();
+        assert_eq!(dir, tmp.path().join("kmux"));
+        assert!(dir.exists());
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    #[test]
+    fn state_path_helpers() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        assert!(client_log_path().unwrap().ends_with("client.log"));
+        assert!(daemon_log_path().unwrap().ends_with("daemon.log"));
+        let conn_path = connection_log_path("abc123ef").unwrap();
+        assert!(conn_path.ends_with("abc123ef.log"));
+        assert!(conn_path.parent().unwrap().ends_with("connections"));
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 }

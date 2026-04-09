@@ -12,7 +12,9 @@ use crossterm::{
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
+use rand::RngCore;
 use ratatui::prelude::CrosstermBackend;
+use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
 use app::App;
@@ -43,10 +45,33 @@ struct Cli {
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(EnvFilter::from_default_env().add_directive("kmux=info".parse().unwrap()))
-        .with_writer(std::io::stderr)
-        .init();
+    let instance_id = generate_instance_id();
+
+    // Log to a persistent file; fall back to stderr if the path can't be opened.
+    match kmux_protocol::dirs::client_log_path().and_then(|p| {
+        Ok(std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(p)?)
+    }) {
+        Ok(file) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::from_default_env().add_directive("kmux=info".parse().unwrap()),
+                )
+                .with_writer(std::sync::Mutex::new(file))
+                .init();
+        }
+        Err(_) => {
+            tracing_subscriber::fmt()
+                .with_env_filter(
+                    EnvFilter::from_default_env().add_directive("kmux=info".parse().unwrap()),
+                )
+                .with_writer(std::io::stderr)
+                .init();
+        }
+    }
+    tracing::info!(instance_id = %instance_id, "kmux started");
 
     let cli = Cli::parse();
 
@@ -106,9 +131,13 @@ async fn main() -> anyhow::Result<()> {
         accept_invalid_certs,
         is_local,
         initial_cwd,
+        instance_id.clone(),
     );
 
-    let result = app.run(&mut terminal).await;
+    let result = app
+        .run(&mut terminal)
+        .instrument(tracing::info_span!("instance", id = %instance_id))
+        .await;
 
     // Restore terminal
     disable_raw_mode()?;
@@ -120,4 +149,10 @@ async fn main() -> anyhow::Result<()> {
     terminal.show_cursor()?;
 
     result
+}
+
+fn generate_instance_id() -> String {
+    let mut bytes = [0u8; 4];
+    rand::rng().fill_bytes(&mut bytes);
+    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }
