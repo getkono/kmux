@@ -73,6 +73,7 @@ impl ClientState {
                             kmux_protocol::messages::PROTOCOL_VERSION
                         )),
                         client_id: None,
+                        server_version: None,
                     });
                     warn!(
                         "Protocol version mismatch: client={protocol_version}, server={}",
@@ -86,6 +87,7 @@ impl ClientState {
                         success: true,
                         reason: None,
                         client_id: Some(id),
+                        server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                     });
                     info!("Client {id:?} authenticated");
                 } else {
@@ -93,6 +95,7 @@ impl ClientState {
                         success: false,
                         reason: Some("invalid token".to_string()),
                         client_id: None,
+                        server_version: None,
                     });
                     warn!("Authentication failed");
                 }

@@ -627,15 +627,9 @@ fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
 fn render_dir_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let buffer = &app.dir_picker_buffer;
-    let buffer_lower = buffer.to_lowercase();
 
-    // Show existing sessions whose CWD contains the typed text
-    let matches: Vec<_> = app
-        .mgr
-        .session_list()
-        .iter()
-        .filter(|e| buffer_lower.is_empty() || e.meta.cwd.to_lowercase().contains(&buffer_lower))
-        .collect();
+    let matches = app.dir_picker_matches();
+    let selected = app.dir_picker_selected.min(matches.len().saturating_sub(1));
 
     let visible_rows = matches.len().min(6) as u16;
     let width = 60u16.min(area.width.saturating_sub(4));
@@ -675,10 +669,10 @@ fn render_dir_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
             Style::default().fg(theme.fg_dim).bg(theme.bg),
         )));
     } else {
-        for entry in matches.iter().take(6) {
+        for (i, entry) in matches.iter().take(6).enumerate() {
             let name = app.mgr.display_name_for(&entry.meta.word_id);
             let cwd = &entry.meta.cwd;
-            let marker = if entry.meta.cwd == *buffer { ">" } else { " " };
+            let marker = if i == selected { ">" } else { " " };
             let row_text = format!("{marker} {name:<16} {cwd}");
             let row_text: String = row_text
                 .chars()

@@ -102,6 +102,8 @@ pub enum Action {
     // Directory picker (remote connection)
     DirPickerChar(char),
     DirPickerBackspace,
+    DirPickerUp,
+    DirPickerDown,
     DirPickerSubmit,
     DirPickerCancel,
 
@@ -308,6 +310,8 @@ fn resolve_dir_picker(key: &Key) -> (Option<Mode>, Action) {
         Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::DirPickerCancel),
         Key::Named(NamedKey::Enter) => (Some(Mode::Normal), Action::DirPickerSubmit),
         Key::Named(NamedKey::Backspace) => (None, Action::DirPickerBackspace),
+        Key::Named(NamedKey::ArrowUp) => (None, Action::DirPickerUp),
+        Key::Named(NamedKey::ArrowDown) => (None, Action::DirPickerDown),
         Key::Character(c) => {
             if let Some(ch) = c.chars().next() {
                 (None, Action::DirPickerChar(ch))
@@ -388,7 +392,11 @@ pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
         ],
         Mode::Help => vec![("any key", "Close")],
         Mode::Connect { .. } => vec![("Tab", "Next field"), ("Enter", "Connect")],
-        Mode::DirectoryPicker => vec![("Enter", "Open/create session"), ("Esc", "Cancel")],
+        Mode::DirectoryPicker => vec![
+            ("\u{2191}/\u{2193}", "Navigate"),
+            ("Enter", "Open/create"),
+            ("Esc", "Cancel"),
+        ],
     }
 }
 

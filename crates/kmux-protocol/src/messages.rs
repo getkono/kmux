@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// Current wire protocol version. Increment when breaking changes are made.
-pub const PROTOCOL_VERSION: u32 = 10;
+pub const PROTOCOL_VERSION: u32 = 11;
 
 /// Return the current wall-clock time as milliseconds since the Unix epoch.
 pub fn epoch_millis() -> u64 {
@@ -437,6 +437,8 @@ pub enum ServerMessage {
         reason: Option<String>,
         /// Assigned on success; `None` on failure.
         client_id: Option<ClientId>,
+        /// Server binary version (e.g. `"0.1.0"`); `None` on failure.
+        server_version: Option<String>,
     },
 
     /// Confirmation that a session (with initial pane) was created.
