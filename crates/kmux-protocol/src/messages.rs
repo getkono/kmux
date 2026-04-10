@@ -165,7 +165,15 @@ impl CellColor {
 /// Packed attribute bitfield.
 ///
 /// Bit layout: bold=0, italic=1, underline=2, strikethrough=3,
-/// inverse=4, hidden=5, dim=6, blink=7, wide_char=8, wide_char_spacer=9.
+/// inverse=4, hidden=5, dim=6, blink=7, wide_char=8, wide_char_spacer=9,
+/// default_fg=10, default_bg=11.
+///
+/// `DEFAULT_FG` means the displayed foreground came from the terminal's
+/// "default foreground" colour (i.e. no explicit colour was set).  Clients
+/// should substitute their theme's foreground colour.  Likewise for
+/// `DEFAULT_BG`.  Both flags account for `INVERSE`-mode cells: if INVERSE
+/// is set by the server the fg/bg values in `CellState` are already swapped,
+/// and the DEFAULT_* flags refer to the *displayed* position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CellAttrs(pub u16);
 
@@ -181,6 +189,10 @@ impl CellAttrs {
     pub const BLINK: u16 = 1 << 7;
     pub const WIDE_CHAR: u16 = 1 << 8;
     pub const WIDE_CHAR_SPACER: u16 = 1 << 9;
+    /// Displayed foreground uses the terminal's default foreground colour.
+    pub const DEFAULT_FG: u16 = 1 << 10;
+    /// Displayed background uses the terminal's default background colour.
+    pub const DEFAULT_BG: u16 = 1 << 11;
 
     pub fn contains(self, flag: u16) -> bool {
         self.0 & flag != 0
@@ -200,9 +212,11 @@ impl Default for CellState {
     fn default() -> Self {
         Self {
             c: ' ',
-            fg: CellColor::new(0xab, 0xb2, 0xbf), // One Dark foreground
-            bg: CellColor::new(0x28, 0x2c, 0x34), // One Dark background
-            attrs: CellAttrs::EMPTY,
+            // Fallback RGB values; clients should use their theme colours instead
+            // when DEFAULT_FG / DEFAULT_BG are set (see CellAttrs).
+            fg: CellColor::new(0xab, 0xb2, 0xbf),
+            bg: CellColor::new(0x28, 0x2c, 0x34),
+            attrs: CellAttrs(CellAttrs::DEFAULT_FG | CellAttrs::DEFAULT_BG),
         }
     }
 }
@@ -542,6 +556,8 @@ mod tests {
             CellAttrs::BLINK,
             CellAttrs::WIDE_CHAR,
             CellAttrs::WIDE_CHAR_SPACER,
+            CellAttrs::DEFAULT_FG,
+            CellAttrs::DEFAULT_BG,
         ];
         for (i, a) in flags.iter().enumerate() {
             for (j, b) in flags.iter().enumerate() {
@@ -613,6 +629,8 @@ mod tests {
             CellAttrs::BLINK,
             CellAttrs::WIDE_CHAR,
             CellAttrs::WIDE_CHAR_SPACER,
+            CellAttrs::DEFAULT_FG,
+            CellAttrs::DEFAULT_BG,
         ];
         for (i, flag) in flags.iter().enumerate() {
             assert!(

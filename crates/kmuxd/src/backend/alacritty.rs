@@ -86,7 +86,8 @@ impl TerminalBackend for AlacrittyBackend {
             let col = indexed.point.column.0;
             if row >= 0 && (row as usize) < rows && col < cols {
                 let cell = indexed.cell;
-                let (fg, bg) = if cell.flags.contains(Flags::INVERSE) {
+                let is_inverse = cell.flags.contains(Flags::INVERSE);
+                let (fg, bg) = if is_inverse {
                     (
                         resolve_color(cell.bg, colors),
                         resolve_color(cell.fg, colors),
@@ -97,11 +98,13 @@ impl TerminalBackend for AlacrittyBackend {
                         resolve_color(cell.bg, colors),
                     )
                 };
+                let mut attrs = convert_flags(cell.flags);
+                attrs.0 |= default_color_flags(is_inverse, cell.fg, cell.bg);
                 out[row as usize * cols + col] = CellState {
                     c: cell.c,
                     fg,
                     bg,
-                    attrs: convert_flags(cell.flags),
+                    attrs,
                 };
             }
         }
@@ -171,7 +174,8 @@ impl TerminalBackend for AlacrittyBackend {
             let col = indexed.point.column.0;
             if row >= 0 && (row as usize) < rows && col < cols {
                 let cell = indexed.cell;
-                let (fg, bg) = if cell.flags.contains(Flags::INVERSE) {
+                let is_inverse = cell.flags.contains(Flags::INVERSE);
+                let (fg, bg) = if is_inverse {
                     (
                         resolve_color(cell.bg, colors),
                         resolve_color(cell.fg, colors),
@@ -182,11 +186,13 @@ impl TerminalBackend for AlacrittyBackend {
                         resolve_color(cell.bg, colors),
                     )
                 };
+                let mut attrs = convert_flags(cell.flags);
+                attrs.0 |= default_color_flags(is_inverse, cell.fg, cell.bg);
                 out[row as usize * cols + col] = CellState {
                     c: cell.c,
                     fg,
                     bg,
-                    attrs: convert_flags(cell.flags),
+                    attrs,
                 };
             }
         }
@@ -226,7 +232,8 @@ impl TerminalBackend for AlacrittyBackend {
             let mut cells = Vec::with_capacity(cols);
             for c in 0..cols {
                 let alac_cell = &row[Column(c)];
-                let (fg, bg) = if alac_cell.flags.contains(Flags::INVERSE) {
+                let is_inverse = alac_cell.flags.contains(Flags::INVERSE);
+                let (fg, bg) = if is_inverse {
                     (
                         resolve_color(alac_cell.bg, colors),
                         resolve_color(alac_cell.fg, colors),
@@ -237,11 +244,13 @@ impl TerminalBackend for AlacrittyBackend {
                         resolve_color(alac_cell.bg, colors),
                     )
                 };
+                let mut attrs = convert_flags(alac_cell.flags);
+                attrs.0 |= default_color_flags(is_inverse, alac_cell.fg, alac_cell.bg);
                 cells.push(CellState {
                     c: alac_cell.c,
                     fg,
                     bg,
-                    attrs: convert_flags(alac_cell.flags),
+                    attrs,
                 });
             }
             lines.push(cells);
@@ -338,6 +347,38 @@ fn ansi_indexed_color(idx: u8) -> CellColor {
             CellColor::new(v, v, v)
         }
     }
+}
+
+/// Returns the DEFAULT_FG / DEFAULT_BG bits for a cell.
+///
+/// `is_inverse` indicates that fg and bg have already been swapped for
+/// display, so the "default" semantics are flipped accordingly.
+fn default_color_flags(is_inverse: bool, cell_fg: Color, cell_bg: Color) -> u16 {
+    let is_default_fg = matches!(
+        cell_fg,
+        Color::Named(
+            NamedColor::Foreground | NamedColor::BrightForeground | NamedColor::DimForeground
+        )
+    );
+    let is_default_bg = matches!(cell_bg, Color::Named(NamedColor::Background));
+    let mut bits = 0u16;
+    if is_inverse {
+        // After INVERSE swap: displayed fg came from original bg, and vice versa.
+        if is_default_bg {
+            bits |= CellAttrs::DEFAULT_FG;
+        }
+        if is_default_fg {
+            bits |= CellAttrs::DEFAULT_BG;
+        }
+    } else {
+        if is_default_fg {
+            bits |= CellAttrs::DEFAULT_FG;
+        }
+        if is_default_bg {
+            bits |= CellAttrs::DEFAULT_BG;
+        }
+    }
+    bits
 }
 
 fn convert_flags(flags: Flags) -> CellAttrs {
