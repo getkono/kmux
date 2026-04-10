@@ -9,7 +9,6 @@ kmux-protocol = { path = "crates/kmux-protocol" }
 kmux-client = { path = "crates/kmux-client" }
 
 # External dependencies
-alacritty_terminal = "0.25"
 anyhow = "1"
 bitflags = "2"
 clap = { version = "4", features = ["derive"] }
@@ -29,7 +28,8 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "logg
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive", "rc"] }
-termwiz = "0.22"
+tattoy-wezterm-term = "0.1.0-fork.5"
+tattoy-wezterm-surface = "0.1.0-fork.2"
 thiserror = "2"
 tokio = { version = "1", features = ["full"] }
 tracing = "0.1"

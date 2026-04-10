@@ -7,11 +7,6 @@ edition = "2024"
 name = "kmuxd"
 path = "src/main.rs"
 
-[features]
-default = ["backend-alacritty"]
-backend-alacritty = ["dep:alacritty_terminal"]
-backend-termwiz = ["dep:termwiz"]
-
 [dependencies]
 kmux-pty.workspace = true
 kmux-protocol = { workspace = true, features = ["framing"] }
@@ -19,8 +14,8 @@ daemonize.workspace = true
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-alacritty_terminal = { workspace = true, optional = true }
-termwiz = { workspace = true, optional = true }
+tattoy-wezterm-term.workspace = true
+tattoy-wezterm-surface.workspace = true
 tokio.workspace = true
 quinn.workspace = true
 rustls.workspace = true

@@ -1,10 +1,7 @@
 use kmux_protocol::messages::{CellState, CursorState, TermModes};
 
-#[cfg(feature = "backend-alacritty")]
-pub mod alacritty;
 pub mod mock;
-#[cfg(feature = "backend-termwiz")]
-pub mod termwiz;
+pub mod wezterm;
 
 /// Abstraction over a VT emulator backend.
 ///
@@ -35,9 +32,8 @@ pub trait TerminalBackend: Send + 'static {
     /// Populate cells AND return cursor+modes in a single pass.
     ///
     /// Backends where `fill_cells()` and `cursor()` share expensive
-    /// intermediate state (e.g. alacritty's `renderable_content()`)
-    /// should override this to avoid redundant work. The default calls
-    /// each method individually.
+    /// intermediate state should override this to avoid redundant work.
+    /// The default calls each method individually.
     fn fill_cells_and_cursor(&self, out: &mut [CellState]) -> (CursorState, TermModes) {
         self.fill_cells(out);
         (self.cursor(), self.modes())
