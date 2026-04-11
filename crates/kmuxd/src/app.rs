@@ -1,13 +1,13 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kmux_protocol::messages::{
-    ClientId, GridSnapshot, InputMode, PaneId, PaneInfo, SequenceNo, ServerMessage, SessionEntry,
-    SessionMeta, SessionStatus, TermSize, TerminalDiff, WordId,
+    ClientCapabilities, ClientId, GridSnapshot, InputMode, PaneId, PaneInfo, SequenceNo,
+    ServerMessage, SessionEntry, SessionMeta, SessionStatus, TermSize, TerminalDiff, WordId,
 };
-use kmux_pty::config::{PtyConfig, WindowSize};
+use kmux_pty::config::{EnvBuilder, PtyConfig, WindowSize};
 use kmux_pty::error::{KmuxError, Result};
 use kmux_pty::events::SessionEvent;
 use kmux_pty::registry::SessionManager as PtyRegistry;
@@ -16,6 +16,7 @@ use rand::SeedableRng;
 use tokio::sync::{RwLock, broadcast, mpsc};
 use tracing::warn;
 
+use crate::capability::{intersect_for_atomics, pane_spawn_env};
 use crate::relay::session_diff_loop;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::{TermState, new_term_state};
@@ -35,6 +36,8 @@ pub struct ClientSender {
     /// When true, the relay sends full `TerminalSnapshot` messages instead
     /// of incremental `TerminalUpdate` diffs.
     pub force_full_snapshot: bool,
+    /// Rendering capabilities declared by this client at Auth time.
+    pub capabilities: ClientCapabilities,
 }
 
 /// Shared map of per-client output senders for a single pane.
@@ -62,6 +65,28 @@ pub struct PaneRelay {
     pub input_mode: InputMode,
     /// Pane lifecycle status (Running or Exited).
     pub status: SessionStatus,
+    /// Live toggle for kitty graphics protocol in the backend emulator.
+    /// Shared with `WezTermBackend`; updated on every client attach/detach.
+    pub kitty_graphics_enabled: Arc<AtomicBool>,
+    /// Live toggle for kitty keyboard protocol in the backend emulator.
+    /// Shared with `WezTermBackend`; updated on every client attach/detach.
+    pub kitty_keyboard_enabled: Arc<AtomicBool>,
+}
+
+impl PaneRelay {
+    /// Recompute the live kitty feature flags as the AND (intersection) of all
+    /// currently-attached clients' declared capabilities, then store the result
+    /// into the shared atomics read by the VT emulator backend.
+    ///
+    /// Call this after every `clients` insert or remove.
+    pub fn recompute_live_capabilities(&self) {
+        let clients = self.clients.lock().unwrap();
+        let (graphics, keyboard) = intersect_for_atomics(clients.values().map(|s| &s.capabilities));
+        self.kitty_graphics_enabled
+            .store(graphics, Ordering::Relaxed);
+        self.kitty_keyboard_enabled
+            .store(keyboard, Ordering::Relaxed);
+    }
 }
 
 /// State for one session: its metadata plus all its panes.
@@ -123,6 +148,7 @@ impl ServerApp {
         program: Option<String>,
         args: Vec<String>,
         size: TermSize,
+        seed_caps: &ClientCapabilities,
     ) -> Result<SessionEntry> {
         // Check the session limit
         {
@@ -173,7 +199,14 @@ impl ServerApp {
         let pane_index = 0u32;
         let pane_id = format!("{word_id}/{pane_index}");
         let relay = self
-            .spawn_pane_relay(&pane_id, program, args, size, Some(&resolved_cwd))
+            .spawn_pane_relay(
+                &pane_id,
+                program,
+                args,
+                size,
+                Some(&resolved_cwd),
+                seed_caps,
+            )
             .await?;
 
         let pane_info = PaneInfo {
@@ -209,6 +242,7 @@ impl ServerApp {
         program: Option<String>,
         args: Vec<String>,
         size: TermSize,
+        seed_caps: &ClientCapabilities,
     ) -> Result<PaneId> {
         let mut sessions = self.sessions.write().await;
         let state = sessions
@@ -232,10 +266,19 @@ impl ServerApp {
         let resolved_cwd_clone = effective_cwd.clone();
         drop(sessions);
 
+        let (kg_init, kk_init) = intersect_for_atomics([seed_caps]);
+        let kitty_graphics_enabled = Arc::new(AtomicBool::new(kg_init));
+        let kitty_keyboard_enabled = Arc::new(AtomicBool::new(kk_init));
+
         let config = PtyConfig::new(&prog)
             .args(args.clone())
             .size(size.rows, size.cols)
-            .cwd(resolved_cwd_clone);
+            .cwd(resolved_cwd_clone)
+            .env(
+                EnvBuilder::new()
+                    .auto_term(false)
+                    .extend(pane_spawn_env(seed_caps)),
+            );
         self.manager.spawn(&pane_id, &config).await?;
 
         let session = self.manager.get_session(&pane_id).await?;
@@ -243,7 +286,12 @@ impl ServerApp {
 
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         let scrollback = Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY)));
-        let term_state = Arc::new(Mutex::new(new_term_state(size.rows, size.cols)));
+        let term_state = Arc::new(Mutex::new(new_term_state(
+            size.rows,
+            size.cols,
+            kitty_graphics_enabled.clone(),
+            kitty_keyboard_enabled.clone(),
+        )));
         let seqno_counter = Arc::new(AtomicU64::new(1));
 
         let task = tokio::spawn(session_diff_loop(
@@ -266,6 +314,8 @@ impl ServerApp {
             seqno_counter,
             input_mode: InputMode::Open,
             status: SessionStatus::Running,
+            kitty_graphics_enabled,
+            kitty_keyboard_enabled,
         };
 
         let mut sessions = self.sessions.write().await;
@@ -407,6 +457,7 @@ impl ServerApp {
         last_seqno: Option<SequenceNo>,
         data_tx: mpsc::Sender<ServerMessage>,
         ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+        capabilities: ClientCapabilities,
     ) -> Result<AttachResult> {
         let (word_id, pane_index) =
             parse_pane_id(pane_id).ok_or_else(|| KmuxError::SessionNotFound {
@@ -461,8 +512,10 @@ impl ServerApp {
                 data_tx,
                 ctrl_tx,
                 force_full_snapshot: false,
+                capabilities,
             },
         );
+        relay.recompute_live_capabilities();
 
         Ok(result)
     }
@@ -490,6 +543,7 @@ impl ServerApp {
             && let Some(relay) = state.panes.get_mut(&pane_index)
         {
             relay.clients.lock().unwrap().remove(&client_id);
+            relay.recompute_live_capabilities();
             if relay.input_mode == InputMode::Locked(client_id) {
                 relay.input_mode = InputMode::Open;
             }
@@ -502,6 +556,7 @@ impl ServerApp {
         for state in sessions.values_mut() {
             for relay in state.panes.values_mut() {
                 relay.clients.lock().unwrap().remove(&client_id);
+                relay.recompute_live_capabilities();
                 if relay.input_mode == InputMode::Locked(client_id) {
                     relay.input_mode = InputMode::Open;
                 }
@@ -695,13 +750,25 @@ impl ServerApp {
         args: Vec<String>,
         size: TermSize,
         cwd: Option<&Path>,
+        seed_caps: &ClientCapabilities,
     ) -> Result<PaneRelay> {
         let prog = match program {
             Some(p) => p,
             None => kmux_pty::shell::detect_shell()?,
         };
 
-        let mut config = PtyConfig::new(&prog).args(args).size(size.rows, size.cols);
+        let (kg_init, kk_init) = intersect_for_atomics([seed_caps]);
+        let kitty_graphics_enabled = Arc::new(AtomicBool::new(kg_init));
+        let kitty_keyboard_enabled = Arc::new(AtomicBool::new(kk_init));
+
+        let mut config = PtyConfig::new(&prog)
+            .args(args)
+            .size(size.rows, size.cols)
+            .env(
+                EnvBuilder::new()
+                    .auto_term(false)
+                    .extend(pane_spawn_env(seed_caps)),
+            );
         if let Some(cwd_path) = cwd {
             config = config.cwd(cwd_path);
         }
@@ -712,7 +779,12 @@ impl ServerApp {
 
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         let scrollback = Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY)));
-        let term_state = Arc::new(Mutex::new(new_term_state(size.rows, size.cols)));
+        let term_state = Arc::new(Mutex::new(new_term_state(
+            size.rows,
+            size.cols,
+            kitty_graphics_enabled.clone(),
+            kitty_keyboard_enabled.clone(),
+        )));
         let seqno_counter = Arc::new(AtomicU64::new(1));
 
         let task = tokio::spawn(session_diff_loop(
@@ -735,6 +807,8 @@ impl ServerApp {
             seqno_counter,
             input_mode: InputMode::Open,
             status: SessionStatus::Running,
+            kitty_graphics_enabled,
+            kitty_keyboard_enabled,
         })
     }
 }

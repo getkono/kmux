@@ -90,6 +90,7 @@ mod tests {
         let msg = ClientMessage::Auth {
             token: "secret".to_string(),
             protocol_version: PROTOCOL_VERSION,
+            capabilities: ClientCapabilities::default(),
         };
         let bytes = encode_client(&msg).expect("encode");
         let decoded = decode_client(&bytes).expect("decode");

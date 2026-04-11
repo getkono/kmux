@@ -1,5 +1,6 @@
 mod app;
 mod config;
+mod host_caps;
 mod key_convert;
 mod mode;
 mod theme;

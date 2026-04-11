@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// Current wire protocol version. Increment when breaking changes are made.
-pub const PROTOCOL_VERSION: u32 = 11;
+pub const PROTOCOL_VERSION: u32 = 12;
 
 /// Return the current wall-clock time as milliseconds since the Unix epoch.
 pub fn epoch_millis() -> u64 {
@@ -22,6 +22,27 @@ pub type WordId = String;
 /// Pane identifier: `"{word_id}/{pane_index}"`.
 /// Example: `"eagle/0"`, `"eagle/1"`.
 pub type PaneId = String;
+
+/// Rendering capabilities self-declared by a client at Auth time.
+///
+/// The daemon uses these to decide which PTY environment variables to set
+/// for spawned shells and which features to enable in the server-side VT
+/// emulator (currently `tattoy-wezterm-term`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ClientCapabilities {
+    /// Client can render kitty graphics protocol image data.
+    pub kitty_graphics: bool,
+    /// Client can encode keyboard input using the kitty keyboard protocol.
+    pub kitty_keyboard: bool,
+    /// Client can display 24-bit (truecolor) RGB cells directly.
+    /// The daemon always sets `COLORTERM=truecolor` today, but this field
+    /// is reserved for future per-client downgrade in the forwarding layer.
+    pub truecolor: bool,
+    /// Client's native host `$TERM` (informational; not used for `TERM` selection).
+    pub term: Option<String>,
+    /// Client's self-reported `$TERM_PROGRAM` (informational).
+    pub term_program: Option<String>,
+}
 
 /// Opaque client identity assigned by the server on successful authentication.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -331,11 +352,15 @@ pub struct GridSnapshot {
 /// Messages sent from client -> server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ClientMessage {
-    /// First message: authenticate with a shared token.
+    /// First message: authenticate with a shared token and declare capabilities.
     Auth {
         token: String,
         /// Must equal `PROTOCOL_VERSION`; server rejects mismatches.
         protocol_version: u32,
+        /// Rendering capabilities of this client.  The daemon uses these to
+        /// set an appropriate shell environment and to configure the
+        /// server-side VT emulator feature flags for each pane.
+        capabilities: ClientCapabilities,
     },
 
     /// Request creation of a new session (with one initial pane).

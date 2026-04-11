@@ -1,6 +1,7 @@
 mod app;
 mod auth;
 mod backend;
+mod capability;
 mod connection;
 mod daemon;
 mod diff_engine;

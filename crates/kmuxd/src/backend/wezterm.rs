@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use kmux_protocol::messages::{
     CellAttrs, CellColor, CellState, CursorShape, CursorState, TermModes,
@@ -13,9 +14,21 @@ use super::TerminalBackend;
 
 const SCROLLBACK_LINES: usize = 50_000;
 
-/// Minimal terminal configuration for the kmux server-side emulator.
+/// Terminal configuration for the kmux server-side emulator.
+///
+/// The kitty feature flags are backed by shared atomics so that the daemon
+/// can update them at any time (e.g. when a client attaches or detaches)
+/// without rebuilding the backend.  wezterm-term queries these flags on every
+/// relevant escape-sequence handler, so changes take effect immediately.
 #[derive(Debug)]
-struct KmuxTerminalConfig;
+struct KmuxTerminalConfig {
+    /// Whether to accept kitty graphics protocol sequences.
+    /// Defaults to `false` until an attached client declares support.
+    kitty_graphics: Arc<AtomicBool>,
+    /// Whether to accept kitty keyboard enhancement sequences.
+    /// Defaults to `false` until an attached client declares support.
+    kitty_keyboard: Arc<AtomicBool>,
+}
 
 impl TerminalConfiguration for KmuxTerminalConfig {
     fn scrollback_size(&self) -> usize {
@@ -30,14 +43,16 @@ impl TerminalConfiguration for KmuxTerminalConfig {
     }
 
     fn enable_kitty_graphics(&self) -> bool {
-        // Accept kitty image protocol sequences.  Image data lands in cell
-        // attributes (attrs.images()) but is NOT forwarded to clients in
-        // phase A — see the TODO(images) comment in fill_cells_and_cursor.
-        true
+        // Queried per escape-sequence by wezterm-term, so changes to the
+        // underlying atomic take effect on the very next advance_bytes call.
+        // Phase A: image data is dropped in fill_cells_inner (TODO(images)).
+        // We default this to false so we don't silently consume sequences that
+        // no currently-attached client can render.
+        self.kitty_graphics.load(Ordering::Relaxed)
     }
 
     fn enable_kitty_keyboard(&self) -> bool {
-        false
+        self.kitty_keyboard.load(Ordering::Relaxed)
     }
 }
 
@@ -49,7 +64,18 @@ pub struct WezTermBackend {
 }
 
 impl WezTermBackend {
-    pub fn new(rows: u16, cols: u16) -> Self {
+    /// Create a new backend.
+    ///
+    /// `kitty_graphics` and `kitty_keyboard` are live atomics shared with the
+    /// [`PaneRelay`][crate::app::PaneRelay].  The daemon updates them whenever
+    /// the set of attached clients changes, and wezterm-term reads them on
+    /// every relevant escape-sequence handler, so no rebuild is needed.
+    pub fn new(
+        rows: u16,
+        cols: u16,
+        kitty_graphics: Arc<AtomicBool>,
+        kitty_keyboard: Arc<AtomicBool>,
+    ) -> Self {
         let size = TerminalSize {
             rows: rows as usize,
             cols: cols as usize,
@@ -59,7 +85,10 @@ impl WezTermBackend {
         };
         let term = Terminal::new(
             size,
-            Arc::new(KmuxTerminalConfig),
+            Arc::new(KmuxTerminalConfig {
+                kitty_graphics,
+                kitty_keyboard,
+            }),
             "kmux",
             env!("CARGO_PKG_VERSION"),
             Box::new(std::io::sink()),
@@ -332,9 +361,19 @@ mod tests {
         }
     }
 
+    /// Construct a [`WezTermBackend`] for tests with both kitty flags off.
+    fn test_backend(rows: u16, cols: u16) -> WezTermBackend {
+        WezTermBackend::new(
+            rows,
+            cols,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
+
     #[test]
     fn feed_hello_produces_5_cell_diff() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"hello");
         let diff = expect_cell_diff(ts.compute_diff());
         let total_cells: usize = diff
@@ -354,7 +393,7 @@ mod tests {
 
     #[test]
     fn feed_red_text_has_correct_red_fg() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
         // ANSI red (colour index 1) — resolved via the default palette.
         ts.feed(b"\x1b[31mred");
         let diff = expect_cell_diff(ts.compute_diff());
@@ -383,7 +422,7 @@ mod tests {
 
     #[test]
     fn feed_truecolor_text() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
         // CSI 38;2;255;128;0 m — truecolor orange
         ts.feed(b"\x1b[38;2;255;128;0mX");
         let diff = expect_cell_diff(ts.compute_diff());
@@ -405,7 +444,7 @@ mod tests {
 
     #[test]
     fn snapshot_captures_full_grid() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"ABC");
         let snap = ts.snapshot();
         assert_eq!(snap.rows, 24);
@@ -418,7 +457,7 @@ mod tests {
 
     #[test]
     fn cursor_tracks_position() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"hello");
         let snap = ts.snapshot();
         assert_eq!(snap.cursor.row, 0);
@@ -427,7 +466,7 @@ mod tests {
 
     #[test]
     fn second_feed_only_diffs_new_chars() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"hello");
         let _ = ts.compute_diff();
         ts.feed(b" world");
@@ -449,7 +488,7 @@ mod tests {
 
     #[test]
     fn fzf_highlight_move_produces_cell_diff() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"\x1b[?1049h\x1b[?1h\x1b[?25l");
         ts.feed(b"  item1\r\n");
         ts.feed(b"\x1b[7m> item2\x1b[27m\r\n");
@@ -464,7 +503,7 @@ mod tests {
 
     #[test]
     fn hello_cursor_move_world_diffs_correctly() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"hello");
         let diff1 = expect_cell_diff(ts.compute_diff());
         let cells1: usize = diff1
@@ -497,7 +536,7 @@ mod tests {
 
     #[test]
     fn fzf_cursor_hidden_state() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"\x1b[?25l");
         let snap = ts.snapshot();
         assert!(
@@ -508,7 +547,7 @@ mod tests {
 
     #[test]
     fn bracketed_paste_mode_enable_disable() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
 
         assert!(
             !ts.modes().bracketed_paste(),
@@ -530,7 +569,7 @@ mod tests {
 
     #[test]
     fn mouse_report_click_mode_enable_disable() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
 
         assert!(
             !ts.modes().mouse_report(),
@@ -552,7 +591,7 @@ mod tests {
 
     #[test]
     fn fzf_rapid_navigation_cycle() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"\x1b[?1049h\x1b[?25l");
         ts.feed(b"\x1b[7m> item1\x1b[27m\r\n");
         ts.feed(b"  item2\r\n");
@@ -580,7 +619,7 @@ mod tests {
 
     #[test]
     fn alt_screen_no_scrollback_duplication() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(4, 20));
+        let mut ts = DiffEngine::new(test_backend(4, 20));
 
         for i in 0..8 {
             ts.feed(format!("line {i}\r\n").as_bytes());
@@ -612,7 +651,7 @@ mod tests {
 
     #[test]
     fn default_fg_bg_flags_on_plain_text() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"A");
         let diff = expect_cell_diff(ts.compute_diff());
         let a_cell = diff
@@ -636,7 +675,7 @@ mod tests {
 
     #[test]
     fn bold_text_sets_bold_flag() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"\x1b[1mB");
         let diff = expect_cell_diff(ts.compute_diff());
         let b_cell = diff
@@ -656,7 +695,7 @@ mod tests {
 
     #[test]
     fn wide_char_marks_spacer() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
         // U+4e2d (中) is a CJK wide character
         ts.feed("中".as_bytes());
         let snap = ts.snapshot();
@@ -673,7 +712,7 @@ mod tests {
 
     #[test]
     fn resize_changes_grid_dimensions() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(24, 80));
+        let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"hello");
         ts.resize(30, 120);
         let snap = ts.snapshot();
@@ -683,7 +722,7 @@ mod tests {
 
     #[test]
     fn scrollback_lines_accumulated() {
-        let mut ts = DiffEngine::new(WezTermBackend::new(4, 20));
+        let mut ts = DiffEngine::new(test_backend(4, 20));
         for i in 0..8 {
             ts.feed(format!("line{i}\r\n").as_bytes());
         }

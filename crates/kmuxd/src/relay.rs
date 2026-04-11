@@ -215,7 +215,13 @@ mod tests {
     }
 
     fn test_term_state() -> Arc<Mutex<TermState>> {
-        Arc::new(Mutex::new(new_term_state(24, 80)))
+        use std::sync::atomic::AtomicBool;
+        Arc::new(Mutex::new(new_term_state(
+            24,
+            80,
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(AtomicBool::new(false)),
+        )))
     }
 
     #[test]
@@ -232,6 +238,7 @@ mod tests {
                 data_tx,
                 ctrl_tx,
                 force_full_snapshot: false,
+                capabilities: Default::default(),
             },
         );
 
@@ -266,6 +273,7 @@ mod tests {
                 data_tx,
                 ctrl_tx,
                 force_full_snapshot: false,
+                capabilities: Default::default(),
             },
         );
 
@@ -296,6 +304,7 @@ mod tests {
                 data_tx,
                 ctrl_tx,
                 force_full_snapshot: false,
+                capabilities: Default::default(),
             },
         );
 

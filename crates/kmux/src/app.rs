@@ -87,8 +87,10 @@ impl App {
             Mode::Normal
         };
 
+        let capabilities = crate::host_caps::detect();
+
         Self {
-            mgr: SessionManager::new(host, port, token, accept_invalid_certs),
+            mgr: SessionManager::new(host, port, token, accept_invalid_certs, capabilities),
             theme,
             mode: initial_mode,
             hud_visible: false,

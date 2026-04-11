@@ -4,8 +4,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kmux_protocol::messages::{
-    ClientId, ClientMessage, PaneId, SequenceNo, ServerMessage, SessionEntry, SessionEventMsg,
-    TermSize, WordId, epoch_millis,
+    ClientCapabilities, ClientId, ClientMessage, PaneId, SequenceNo, ServerMessage, SessionEntry,
+    SessionEventMsg, TermSize, WordId, epoch_millis,
 };
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -60,6 +60,8 @@ pub struct SessionManager {
     port: u16,
     token: String,
     accept_invalid_certs: bool,
+    /// Rendering capabilities declared to the daemon at Auth time.
+    capabilities: ClientCapabilities,
 
     // Live connection
     ws_sender: Option<mpsc::UnboundedSender<ClientMessage>>,
@@ -91,7 +93,13 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
-    pub fn new(host: String, port: u16, token: String, accept_invalid_certs: bool) -> Self {
+    pub fn new(
+        host: String,
+        port: u16,
+        token: String,
+        accept_invalid_certs: bool,
+        capabilities: ClientCapabilities,
+    ) -> Self {
         Self {
             last_host: host.clone(),
             last_port: port,
@@ -99,6 +107,7 @@ impl SessionManager {
             port,
             token,
             accept_invalid_certs,
+            capabilities,
             ws_sender: None,
             connected: false,
             status_msg: String::new(),
@@ -126,7 +135,16 @@ impl SessionManager {
         let token = self.token.clone();
         let accept_invalid = self.accept_invalid_certs;
 
-        match connect::connect(host, port, token, accept_invalid, srv_tx).await {
+        match connect::connect(
+            host,
+            port,
+            token,
+            accept_invalid,
+            srv_tx,
+            self.capabilities.clone(),
+        )
+        .await
+        {
             ConnectResult::Connected(sender) => {
                 self.ws_sender = Some(sender);
                 self.connected = true;
@@ -937,6 +955,7 @@ mod tests {
             8443,
             "test-token".to_string(),
             false,
+            ClientCapabilities::default(),
         )
     }
 

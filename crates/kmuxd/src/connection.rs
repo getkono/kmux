@@ -3,7 +3,8 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use kmux_protocol::messages::{
-    ClientId, ClientMessage, ErrorCode, ServerMessage, SessionEventMsg, epoch_millis,
+    ClientCapabilities, ClientId, ClientMessage, ErrorCode, ServerMessage, SessionEventMsg,
+    epoch_millis,
 };
 use kmux_protocol::{decode_client, encode_server, read_frame, write_frame};
 use quinn::Connection;
@@ -21,6 +22,8 @@ const CLIENT_CHANNEL_CAPACITY: usize = 512;
 struct ClientState {
     authenticated: bool,
     client_id: Option<ClientId>,
+    /// Rendering capabilities declared by this client at Auth time.
+    capabilities: ClientCapabilities,
     /// Output-forwarding task handles, keyed by pane_id.
     attached: HashMap<String, AbortHandle>,
     /// Sender for the control stream writer task.
@@ -39,6 +42,7 @@ impl ClientState {
         Self {
             authenticated: false,
             client_id: None,
+            capabilities: ClientCapabilities::default(),
             attached: HashMap::new(),
             ctrl_tx,
             conn,
@@ -63,6 +67,7 @@ impl ClientState {
             if let ClientMessage::Auth {
                 token,
                 protocol_version,
+                capabilities,
             } = msg
             {
                 if protocol_version != kmux_protocol::messages::PROTOCOL_VERSION {
@@ -82,6 +87,7 @@ impl ClientState {
                 } else if validate_token(&token, &self.app.auth_token) {
                     let id = self.app.next_client_id();
                     self.client_id = Some(id);
+                    self.capabilities = capabilities;
                     self.authenticated = true;
                     self.send(ServerMessage::AuthResult {
                         success: true,
@@ -119,7 +125,7 @@ impl ClientState {
                 size,
             } => match self
                 .app
-                .create_session(name, cwd, program, args, size)
+                .create_session(name, cwd, program, args, size, &self.capabilities)
                 .await
             {
                 Ok(entry) => self.send(ServerMessage::SessionCreated { request_id, entry }),
@@ -159,7 +165,11 @@ impl ClientState {
                 program,
                 args,
                 size,
-            } => match self.app.create_pane(&word_id, program, args, size).await {
+            } => match self
+                .app
+                .create_pane(&word_id, program, args, size, &self.capabilities)
+                .await
+            {
                 Ok(pane_id) => self.send(ServerMessage::PaneCreated {
                     request_id,
                     pane_id,
@@ -233,6 +243,7 @@ impl ClientState {
                         last_seqno,
                         client_tx,
                         self.ctrl_tx.clone(),
+                        self.capabilities.clone(),
                     )
                     .await
                 {

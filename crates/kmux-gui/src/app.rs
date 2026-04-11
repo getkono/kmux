@@ -3,7 +3,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use iced::futures::SinkExt as _;
 use iced::widget::{Space, button, column, container, row, text, text_input};
 use iced::{Element, Event, Font, Length, Subscription, Task, Theme};
-use kmux_protocol::messages::{ClientMessage, PROTOCOL_VERSION, ServerMessage};
+use kmux_protocol::messages::{ClientCapabilities, ClientMessage, PROTOCOL_VERSION, ServerMessage};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -150,6 +150,20 @@ pub struct kmuxApp {
     instance_id: String,
 }
 
+/// Static capability profile for the GUI client.
+///
+/// - `truecolor`: always true — iced renders with full 24-bit RGB.
+/// - `kitty_graphics`/`kitty_keyboard`: false — not yet wired through the cell grid.
+fn gui_capabilities() -> ClientCapabilities {
+    ClientCapabilities {
+        truecolor: true,
+        kitty_graphics: false,
+        kitty_keyboard: false,
+        term: None,
+        term_program: Some("kmux-gui".into()),
+    }
+}
+
 impl kmuxApp {
     pub fn new(accept_invalid_certs: bool, instance_id: String) -> Self {
         Self {
@@ -162,6 +176,7 @@ impl kmuxApp {
                 8443,
                 String::new(),
                 accept_invalid_certs,
+                gui_capabilities(),
             ),
             screen: Screen::Connect,
             connect_params: None,
@@ -932,6 +947,7 @@ impl kmuxApp {
                     params.token.clone(),
                     params.accept_invalid_certs,
                     srv_tx,
+                    gui_capabilities(),
                 )
                 .await;
 
