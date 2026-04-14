@@ -4,7 +4,7 @@ use crossterm::event::{Event, EventStream, KeyEvent, MouseEvent, MouseEventKind}
 use futures::StreamExt;
 use kmux_client::input::{encode_mouse_scroll, key_to_bytes};
 use kmux_client::session_manager::{SessionEvent, SessionManager};
-use kmux_protocol::messages::{PROTOCOL_VERSION, ServerMessage, SessionEntry};
+use kmux_protocol::messages::{PROTOCOL_VERSION, ServerMessage, SessionEntry, TermSize};
 use ratatui::Terminal;
 use ratatui::prelude::CrosstermBackend;
 use tokio::sync::mpsc;
@@ -246,7 +246,7 @@ impl App {
                             if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
                                 self.mgr.select_session(word_id);
                             } else {
-                                self.mgr.create_session_with_cwd(&cwd);
+                                self.mgr.create_session_with_cwd(&cwd, Self::current_term_size());
                             }
                         } else {
                             // Remote: show directory picker pre-filled with local CWD
@@ -298,10 +298,10 @@ impl App {
                 }
             }
             Action::CreateSession => {
-                self.mgr.create_session();
+                self.mgr.create_session(Self::current_term_size());
             }
             Action::CreatePane => {
-                self.mgr.create_pane();
+                self.mgr.create_pane(Self::current_term_size());
             }
             Action::CloseSession => {
                 if let Some(word_id) = self.mgr.active_session().map(|s| s.to_string()) {
@@ -562,7 +562,7 @@ impl App {
                         if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
                             self.mgr.select_session(word_id);
                         } else {
-                            self.mgr.create_session_with_cwd(&cwd);
+                            self.mgr.create_session_with_cwd(&cwd, Self::current_term_size());
                         }
                     }
                 }
@@ -648,6 +648,15 @@ impl App {
 
         if let Some(pane_id) = self.mgr.active_pane_id().map(|s| s.to_string()) {
             self.mgr.send_resize(&pane_id, term_rows, term_cols);
+        }
+    }
+
+    /// Query the current terminal size, accounting for UI chrome (3 rows).
+    fn current_term_size() -> TermSize {
+        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
+        TermSize {
+            rows: rows.saturating_sub(3),
+            cols,
         }
     }
 
