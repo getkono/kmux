@@ -5,6 +5,7 @@ use std::time::Instant;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
+use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
 use crate::app::ServerApp;
@@ -63,6 +64,7 @@ pub async fn serve_control_socket(
     token: String,
     start_time: Instant,
     app: Arc<ServerApp>,
+    shutdown: Arc<Notify>,
 ) {
     // Remove stale socket if it exists from a previous run.
     if socket_path.exists() {
@@ -106,8 +108,9 @@ pub async fn serve_control_socket(
                     Ok((stream, _)) => {
                         let token = token.clone();
                         let app = Arc::clone(&app);
+                        let shutdown = Arc::clone(&shutdown);
                         tokio::spawn(async move {
-                            handle_control_connection(stream, port, &token, start_time, app).await;
+                            handle_control_connection(stream, port, &token, start_time, app, shutdown).await;
                         });
                     }
                     Err(e) => {
@@ -117,10 +120,12 @@ pub async fn serve_control_socket(
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received SIGINT, shutting down daemon");
+                shutdown.notify_waiters();
                 break;
             }
             _ = sigterm.recv() => {
                 info!("Received SIGTERM, shutting down daemon");
+                shutdown.notify_waiters();
                 break;
             }
         }
@@ -134,6 +139,7 @@ async fn handle_control_connection(
     token: &str,
     start_time: Instant,
     app: Arc<ServerApp>,
+    shutdown: Arc<Notify>,
 ) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
@@ -188,9 +194,8 @@ async fn handle_control_connection(
             if let Err(e) = write_half.write_all(json.as_bytes()).await {
                 warn!("Control socket write error: {e}");
             }
-            info!("Received stop command, sending SIGTERM to self");
-            let _ =
-                nix::sys::signal::kill(nix::unistd::Pid::this(), nix::sys::signal::Signal::SIGTERM);
+            info!("Received stop command, shutting down daemon");
+            shutdown.notify_waiters();
         }
         other => {
             warn!("Unknown control command: {other}");

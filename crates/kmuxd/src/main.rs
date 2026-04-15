@@ -15,6 +15,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Instant;
 
+use tokio::sync::Notify;
+
 use clap::Parser;
 use rand::RngCore;
 use tracing::{Instrument, error, info};
@@ -124,12 +126,15 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
     let actual_port = actual_addr.port();
     info!("Listening on quic://{actual_addr}");
 
+    let shutdown = Arc::new(Notify::new());
+
     if cli.daemon {
         let socket_path = kmux_protocol::dirs::socket_path()?;
         let pid_path = kmux_protocol::dirs::pid_path()?;
         let start_time = Instant::now();
         let token_clone = token.clone();
         let app_clone = Arc::clone(&app);
+        let shutdown_clone = Arc::clone(&shutdown);
         tokio::spawn(async move {
             daemon::serve_control_socket(
                 socket_path,
@@ -138,25 +143,51 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 token_clone,
                 start_time,
                 app_clone,
+                shutdown_clone,
             )
             .await;
         });
     }
 
-    while let Some(incoming) = endpoint.accept().await {
-        let app = Arc::clone(&app);
-        tokio::spawn(async move {
-            match incoming.await {
-                Ok(conn) => {
-                    let remote = conn.remote_address();
-                    info!("QUIC connection from {remote}");
-                    connection::handle(conn, app).await;
+    // Install signal handlers for the foreground (non-daemon) case.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    loop {
+        tokio::select! {
+            incoming = endpoint.accept() => {
+                match incoming {
+                    Some(incoming) => {
+                        let app = Arc::clone(&app);
+                        tokio::spawn(async move {
+                            match incoming.await {
+                                Ok(conn) => {
+                                    let remote = conn.remote_address();
+                                    info!("QUIC connection from {remote}");
+                                    connection::handle(conn, app).await;
+                                }
+                                Err(e) => error!("QUIC connection failed: {e}"),
+                            }
+                        });
+                    }
+                    None => break,
                 }
-                Err(e) => error!("QUIC connection failed: {e}"),
             }
-        });
+            _ = tokio::signal::ctrl_c() => {
+                info!("Received SIGINT, shutting down");
+                break;
+            }
+            _ = sigterm.recv() => {
+                info!("Received SIGTERM, shutting down");
+                break;
+            }
+            _ = shutdown.notified() => {
+                info!("Shutdown requested via control socket");
+                break;
+            }
+        }
     }
 
+    endpoint.close(0u32.into(), b"shutdown");
     Ok(())
 }
 

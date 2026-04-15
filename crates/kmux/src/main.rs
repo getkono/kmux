@@ -236,8 +236,17 @@ async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
         DaemonAction::Restart => {
             // Stop (ignore "not running").
             let _ = kmux_client::daemon::stop_daemon().await;
-            // Wait briefly for the process to exit.
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            // Poll until the old daemon is confirmed dead (up to 3 seconds).
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+            loop {
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                if kmux_client::daemon::query_daemon().await.is_none() {
+                    break;
+                }
+                if tokio::time::Instant::now() >= deadline {
+                    anyhow::bail!("timed out waiting for daemon to stop");
+                }
+            }
             let status = kmux_client::daemon::ensure_daemon().await?;
             println!(
                 "Daemon restarted — PID {}, port {}",
