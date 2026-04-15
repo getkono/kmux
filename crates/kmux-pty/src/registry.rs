@@ -51,6 +51,23 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Register an already-constructed `PtySession` under a name.
+    ///
+    /// Used when restoring a session from a checkpoint: the `PtySession` was
+    /// built from [`PtyProcess::reattach`] and needs to be tracked by the
+    /// registry so that `get_session`, `resize`, and `close` work normally.
+    pub async fn register(&self, name: impl Into<String>, session: PtySession) -> Result<()> {
+        let name = name.into();
+        let mut sessions = self.sessions.lock().await;
+        if sessions.contains_key(&name) {
+            return Err(KmuxError::SessionAlreadyExists { name });
+        }
+        self.events
+            .emit(SessionEvent::Spawned { name: name.clone() });
+        sessions.insert(name, session);
+        Ok(())
+    }
+
     /// Close and remove a named session.
     pub async fn close(&self, name: &str) -> Result<ExitStatus> {
         let session = {
@@ -118,6 +135,28 @@ impl SessionManager {
             cols: size.cols,
         });
         Ok(())
+    }
+
+    /// Return the PID of the child process for a named session.
+    ///
+    /// Returns `None` if the session does not exist.
+    pub async fn child_pid(&self, name: &str) -> Option<nix::unistd::Pid> {
+        let sessions = self.sessions.lock().await;
+        match sessions.get(name) {
+            Some(session) => Some(session.child_pid().await),
+            None => None,
+        }
+    }
+
+    /// Set keep-alive mode on all active sessions.
+    ///
+    /// Called on clean daemon shutdown so that child PTY processes remain
+    /// alive for reattachment when the daemon restarts.
+    pub async fn set_all_keep_alive(&self, val: bool) {
+        let sessions = self.sessions.lock().await;
+        for session in sessions.values() {
+            session.set_keep_alive(val).await;
+        }
     }
 }
 

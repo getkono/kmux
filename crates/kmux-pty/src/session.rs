@@ -1,3 +1,4 @@
+use std::os::fd::IntoRawFd;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::task::{Context, Poll};
@@ -36,6 +37,17 @@ impl PtySession {
             inner: Arc::new(Mutex::new(Inner { pty })),
             shutdown_grace: config.timeouts.shutdown_grace,
         })
+    }
+
+    /// Wrap an already-spawned (or reattached) `PtyProcess` in a session.
+    ///
+    /// Used when restoring a session from a checkpoint: the `PtyProcess` was
+    /// created via [`PtyProcess::reattach`] against a still-alive child.
+    pub fn from_process(pty: PtyProcess) -> Self {
+        Self {
+            inner: Arc::new(Mutex::new(Inner { pty })),
+            shutdown_grace: None,
+        }
     }
 
     /// Split into independent reader and writer halves.
@@ -115,6 +127,19 @@ impl PtySession {
         let pid = self.inner.lock().await.pty.pid;
         crate::shutdown::send_signal(pid, signal)
     }
+
+    /// Return the PID of the child process.
+    pub async fn child_pid(&self) -> nix::unistd::Pid {
+        self.inner.lock().await.pty.pid
+    }
+
+    /// Enable or disable keep-alive mode.
+    ///
+    /// When `true`, dropping the underlying `PtyProcess` will not send SIGKILL
+    /// to the child — it remains alive for reattachment after a daemon restart.
+    pub async fn set_keep_alive(&self, val: bool) {
+        self.inner.lock().await.pty.set_keep_alive(val);
+    }
 }
 
 /// Read half of a split `PtySession`.
@@ -143,6 +168,34 @@ impl PtyWriter {
             .write_all(data)
             .await
             .map_err(KmuxError::Io)
+    }
+
+    /// Create a no-op write handle backed by a pipe.
+    ///
+    /// Used to construct a `PaneRelay` for a dead (restored-but-exited)
+    /// session where there is no live PTY to write to. Writes succeed but
+    /// the data is silently discarded (the read end of the pipe is dropped).
+    ///
+    /// Pipes are epoll-able so this works with tokio's `AsyncFd`, unlike
+    /// `/dev/null` which is not a pollable fd and would cause `EPERM` when
+    /// registered with epoll.
+    pub fn sink() -> Result<Self> {
+        // Create a pipe; keep the write end, drop the read end immediately.
+        // Writes to the write end will succeed until the kernel pipe buffer
+        // fills up. Since nobody reads, we make the write end non-blocking so
+        // that writes return `EAGAIN` rather than blocking when the buffer is
+        // full — PtyWriter::write_all ignores errors for dead panes anyway.
+        let (read_fd, write_fd) =
+            nix::unistd::pipe().map_err(|e| KmuxError::Io(std::io::Error::from(e)))?;
+
+        // Drop the read end immediately; the write end can still be written to.
+        drop(read_fd);
+
+        let write_raw = write_fd.into_raw_fd();
+        let io = crate::io::PtyMasterIo::new(write_raw).map_err(KmuxError::Io)?;
+        Ok(Self {
+            io: tokio::sync::Mutex::new(io),
+        })
     }
 }
 

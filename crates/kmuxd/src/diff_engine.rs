@@ -193,6 +193,51 @@ impl<B: TerminalBackend> DiffEngine<B> {
         }
     }
 
+    /// Construct a `DiffEngine` with its previous-frame state seeded from a
+    /// [`GridSnapshot`].
+    ///
+    /// Initialises `prev_cells` to match the snapshot so the next
+    /// `compute_diff()` call produces no spurious full-screen diff.
+    #[cfg(test)]
+    pub fn from_snapshot(backend: B, snapshot: &GridSnapshot) -> Self {
+        let rows = snapshot.rows;
+        let cols = snapshot.cols;
+        let n = rows as usize * cols as usize;
+
+        // Pad or truncate to exactly rows*cols (handles snapshot/backend size mismatches).
+        let mut prev_cells = vec![CellState::default(); n];
+        let copy_len = snapshot.cells.len().min(n);
+        prev_cells[..copy_len].copy_from_slice(&snapshot.cells[..copy_len]);
+
+        let prev_history_size = backend.history_size();
+
+        Self {
+            backend,
+            prev_cells,
+            current_cells: vec![CellState::default(); n],
+            prev_cursor: snapshot.cursor,
+            prev_modes: snapshot.modes,
+            rows,
+            cols,
+            prev_history_size,
+            saved_main_history_size: None,
+        }
+    }
+
+    /// Number of lines currently in the backend's scrollback history.
+    pub fn history_size(&self) -> usize {
+        self.backend.history_size()
+    }
+
+    /// Read scrollback history lines from the backend.
+    ///
+    /// `start` is the oldest-first index; `count` is the number of lines to
+    /// return. Each returned line has `self.cols` cells.
+    pub fn read_history_lines(&self, start: usize, count: usize) -> Vec<Vec<CellState>> {
+        self.backend
+            .read_history_lines(start, count, self.cols as usize)
+    }
+
     /// Current cursor state from the backend.
     #[cfg(test)]
     pub fn cursor(&self) -> CursorState {
@@ -534,6 +579,66 @@ mod tests {
             }
             _ => panic!("expected CellDiff with new scrollback lines"),
         }
+    }
+
+    #[test]
+    fn from_snapshot_no_spurious_diff() {
+        // Seed a snapshot with a non-default cell at (0,0).
+        let snap = {
+            let rows = 4u16;
+            let cols = 4u16;
+            let mut cells = vec![CellState::default(); (rows * cols) as usize];
+            cells[0] = CellState {
+                c: 'Z',
+                fg: CellColor::new(0xff, 0x00, 0x00),
+                bg: CellColor::new(0x28, 0x2c, 0x34),
+                ..CellState::default()
+            };
+            GridSnapshot {
+                rows,
+                cols,
+                cells,
+                cursor: CursorState::default(),
+                modes: TermModes::EMPTY,
+            }
+        };
+
+        // Build a fresh MockBackend matching the snapshot.
+        let mut backend = MockBackend::new(4, 4);
+        backend.cells[0] = CellState {
+            c: 'Z',
+            fg: CellColor::new(0xff, 0x00, 0x00),
+            bg: CellColor::new(0x28, 0x2c, 0x34),
+            ..CellState::default()
+        };
+
+        let mut engine = DiffEngine::from_snapshot(backend, &snap);
+
+        // The first compute_diff should see no change (prev == current).
+        let result = engine.compute_diff();
+        assert!(
+            matches!(result, DiffResult::None),
+            "from_snapshot should seed prev_cells so there is no spurious diff; got {result:?}"
+        );
+    }
+
+    #[test]
+    fn history_size_and_read_delegate_to_backend() {
+        let mut engine = mock_engine(4, 4);
+        assert_eq!(engine.history_size(), 0);
+
+        // Inject history into the mock.
+        engine.backend.history_len = 3;
+        engine.backend.history_lines = make_history_lines(3, 4);
+
+        assert_eq!(engine.history_size(), 3);
+
+        let lines = engine.read_history_lines(0, 3);
+        assert_eq!(lines.len(), 3);
+        // First cell of each line should be 'A', 'B', 'C' per make_history_lines.
+        assert_eq!(lines[0][0].c, 'A');
+        assert_eq!(lines[1][0].c, 'B');
+        assert_eq!(lines[2][0].c, 'C');
     }
 
     #[test]

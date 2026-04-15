@@ -45,6 +45,23 @@ impl WordlistSampler {
         }
     }
 
+    /// Remove a specific word from the available pool, marking it as in use.
+    ///
+    /// Used when restoring persisted sessions: the word IDs that were active at
+    /// checkpoint time need to be reserved so the daemon does not hand them out
+    /// to new sessions.
+    ///
+    /// Returns `true` if the word was found and removed, `false` if it was
+    /// already absent (already reserved or not a valid wordlist entry).
+    pub fn reserve(&mut self, word: &str) -> bool {
+        if let Some(pos) = self.available.iter().position(|&w| w == word) {
+            self.available.swap_remove(pos);
+            true
+        } else {
+            false
+        }
+    }
+
     /// Number of words still available for allocation.
     #[cfg(test)]
     pub fn available_count(&self) -> usize {

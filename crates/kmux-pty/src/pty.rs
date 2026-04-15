@@ -1,5 +1,6 @@
 use std::ffi::CString;
 use std::os::unix::io::{IntoRawFd, RawFd};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::pty::{ForkptyResult, forkpty};
 use nix::unistd::{Pid, execve};
@@ -14,7 +15,8 @@ use crate::process::{ExitStatus, spawn_wait_task};
 /// A spawned PTY process.
 ///
 /// Owns the master fd (wrapped in `PtyMasterIo`) and the child PID.
-/// Dropping this struct triggers async cleanup (SIGKILL + fd close).
+/// Dropping this struct triggers async cleanup (SIGKILL + fd close)
+/// unless [`PtyProcess::set_keep_alive`] has been called to suppress it.
 pub struct PtyProcess {
     /// Async I/O handle over the PTY master fd.
     pub io: PtyMasterIo,
@@ -24,6 +26,11 @@ pub struct PtyProcess {
     pub exit_rx: watch::Receiver<Option<ExitStatus>>,
     /// Current window size.
     pub size: WindowSize,
+    /// When `true`, the `Drop` impl skips SIGKILL so the child remains alive.
+    ///
+    /// Set this before dropping (e.g. on clean daemon shutdown) when the child
+    /// PTY process should survive for reattachment on the next daemon start.
+    keep_alive: AtomicBool,
 }
 
 impl PtyProcess {
@@ -80,6 +87,7 @@ impl PtyProcess {
                     pid: child,
                     exit_rx,
                     size: config.size,
+                    keep_alive: AtomicBool::new(false),
                 })
             }
         }
@@ -114,10 +122,73 @@ impl PtyProcess {
     pub fn master_fd(&self) -> RawFd {
         self.io.as_raw_fd()
     }
+
+    /// When `true`, dropping this `PtyProcess` will NOT send SIGKILL to the
+    /// child. The child process remains alive, allowing the next daemon
+    /// instance to reattach via [`PtyProcess::reattach`].
+    pub fn set_keep_alive(&self, val: bool) {
+        self.keep_alive.store(val, Ordering::Relaxed);
+    }
+
+    /// Whether keep-alive mode is enabled.
+    pub fn is_keep_alive(&self) -> bool {
+        self.keep_alive.load(Ordering::Relaxed)
+    }
+
+    /// Reattach to an existing child process by reopening its PTY master fd
+    /// from `/proc/<pid>/fd/<master_fd>`.
+    ///
+    /// Used after a clean daemon restart when the child process was kept alive
+    /// via [`PtyProcess::set_keep_alive`]. Fails if the process has exited or
+    /// if `/proc/<pid>/fd/<master_fd>` is not accessible.
+    pub fn reattach(pid: Pid, master_fd_num: RawFd, size: WindowSize) -> Result<Self> {
+        let proc_fd_path = format!("/proc/{}/fd/{}", pid.as_raw(), master_fd_num);
+
+        // Open the existing PTY master fd via /proc.
+        // O_RDWR | O_NOCTTY: read/write without making it a controlling terminal.
+        let new_fd: RawFd = nix::fcntl::open(
+            proc_fd_path.as_str(),
+            nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY,
+            nix::sys::stat::Mode::empty(),
+        )
+        .map_err(KmuxError::Pty)?
+        .into_raw_fd();
+
+        let io = PtyMasterIo::new(new_fd).map_err(KmuxError::Io)?;
+        let exit_rx = spawn_wait_task(pid);
+
+        Ok(PtyProcess {
+            io,
+            pid,
+            exit_rx,
+            size,
+            keep_alive: AtomicBool::new(false),
+        })
+    }
 }
 
 impl Drop for PtyProcess {
     fn drop(&mut self) {
+        if self.keep_alive.load(Ordering::Relaxed) {
+            // Duplicate the PTY master fd before `PtyMasterIo` closes it.
+            //
+            // When the master fd closes the child receives SIGHUP (loss of
+            // controlling terminal) which would kill it. Duplicating the fd
+            // keeps the file description alive in the OS fd table so the child
+            // can be reattached by the next daemon instance. The duplicate is
+            // intentionally leaked (held open until this process exits), which
+            // is safe since the daemon is shutting down immediately after.
+            let raw = self.io.as_raw_fd();
+            // SAFETY: `raw` is a valid, open fd owned by `self.io`.
+            let dup_fd = unsafe { nix::libc::dup(raw) };
+            // `dup_fd` is a plain i32 with no Drop impl, so it is intentionally
+            // leaked — the fd stays open in the fd table.
+            let _ = dup_fd;
+            // Allow PtyMasterIo to drop (closes the original fd) without
+            // sending SIGKILL. The dup above keeps the terminal alive.
+            return;
+        }
+
         if !self.is_exited() {
             // Spawn a detached cleanup task: send SIGKILL, reap zombie
             let pid = self.pid;
@@ -137,6 +208,10 @@ mod tests {
 
     fn echo_config() -> PtyConfig {
         PtyConfig::new("/bin/echo").args(["hello"])
+    }
+
+    fn sleep_config() -> PtyConfig {
+        PtyConfig::new("/bin/sleep").args(["30"])
     }
 
     #[tokio::test]
@@ -167,5 +242,27 @@ mod tests {
             text.contains("hello"),
             "expected 'hello' in output, got: {text:?}"
         );
+    }
+
+    /// Verify that setting `keep_alive` prevents the Drop impl from sending
+    /// SIGKILL: the child process should still be running after the
+    /// `PtyProcess` is dropped with `keep_alive = true`.
+    #[tokio::test]
+    async fn keep_alive_prevents_sigkill_on_drop() {
+        let pty = PtyProcess::spawn(&sleep_config()).expect("spawn failed");
+        let pid = pty.pid;
+
+        pty.set_keep_alive(true);
+        drop(pty);
+
+        // Give the tokio runtime a moment to process any drop task.
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+
+        // The process should still be alive: kill(pid, 0) succeeds.
+        let alive = nix::sys::signal::kill(pid, None).is_ok();
+        assert!(alive, "process should still be alive after keep_alive drop");
+
+        // Clean up: kill the process ourselves.
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
     }
 }

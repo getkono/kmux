@@ -89,6 +89,23 @@ pub fn connection_log_path(instance_id: &str) -> anyhow::Result<PathBuf> {
     Ok(dir.join(format!("{instance_id}.log")))
 }
 
+/// Returns the directory where session state is persisted, creating it if necessary.
+///
+/// Lives under the state directory: `$XDG_STATE_HOME/kmux/sessions/`.
+pub fn sessions_dir() -> anyhow::Result<PathBuf> {
+    let dir = state_dir()?.join("sessions");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .create(&dir)
+        .map_err(|e| anyhow::anyhow!("failed to create sessions dir {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Path to the daemon session state file used for persistence across restarts.
+pub fn session_state_path() -> anyhow::Result<PathBuf> {
+    Ok(sessions_dir()?.join("state.bin"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -141,6 +158,28 @@ mod tests {
         let conn_path = connection_log_path("abc123ef").unwrap();
         assert!(conn_path.ends_with("abc123ef.log"));
         assert!(conn_path.parent().unwrap().ends_with("connections"));
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    #[test]
+    fn sessions_dir_created() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let dir = sessions_dir().unwrap();
+        assert!(dir.exists());
+        assert!(dir.ends_with("sessions"));
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    #[test]
+    fn session_state_path_is_in_sessions_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let path = session_state_path().unwrap();
+        assert!(path.ends_with("state.bin"));
+        assert!(path.parent().unwrap().ends_with("sessions"));
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 }

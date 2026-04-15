@@ -5,6 +5,7 @@ mod capability;
 mod connection;
 mod daemon;
 mod diff_engine;
+mod persist;
 mod relay;
 mod scrollback;
 mod term_state;
@@ -13,13 +14,13 @@ mod wordlist;
 
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
 
 use clap::Parser;
 use rand::RngCore;
-use tracing::{Instrument, error, info};
+use tracing::{Instrument, error, info, warn};
 use tracing_subscriber::EnvFilter;
 
 use app::ServerApp;
@@ -120,6 +121,47 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
 
     let app = Arc::new(ServerApp::new(token.clone()));
 
+    // Restore persisted sessions from the previous daemon instance, if any.
+    if let Ok(path) = kmux_protocol::dirs::session_state_path()
+        && path.exists()
+    {
+        match persist::restore::read_checkpoint(&path) {
+            Ok(state) => {
+                let report = app.restore_from(state).await;
+                info!(
+                    restored = report.restored,
+                    alive = report.alive,
+                    dead = report.dead,
+                    "session restore complete"
+                );
+            }
+            Err(e) => warn!("failed to restore sessions from checkpoint: {e}"),
+        }
+    }
+
+    // Periodic checkpoint task: saves session state every 30 seconds for
+    // crash recovery. Does NOT set keep_alive (children may still be killed
+    // by the kernel if the daemon crashes).
+    {
+        let persist_app = Arc::clone(&app);
+        tokio::spawn(async move {
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let state = persist_app.checkpoint_state().await;
+                match kmux_protocol::dirs::session_state_path() {
+                    Ok(path) => {
+                        if let Err(e) = persist::checkpoint::write_checkpoint(&state, &path) {
+                            warn!("periodic checkpoint failed: {e}");
+                        }
+                    }
+                    Err(e) => warn!("could not determine checkpoint path: {e}"),
+                }
+            }
+        });
+    }
+
     let addr: SocketAddr = format!("{}:{}", cli.bind, cli.port).parse()?;
     let endpoint = quinn::Endpoint::server(quinn_config, addr)?;
     let actual_addr = endpoint.local_addr()?;
@@ -185,6 +227,20 @@ async fn async_main(cli: Cli) -> anyhow::Result<()> {
                 break;
             }
         }
+    }
+
+    // Clean shutdown: checkpoint the full session state so the next daemon
+    // start can replay the visual content as preamble in fresh shells.
+    let shutdown_state = app.checkpoint_state().await;
+    match kmux_protocol::dirs::session_state_path() {
+        Ok(path) => {
+            if let Err(e) = persist::checkpoint::write_checkpoint(&shutdown_state, &path) {
+                warn!("shutdown checkpoint failed: {e}");
+            } else {
+                info!("session state checkpointed on shutdown");
+            }
+        }
+        Err(e) => warn!("could not determine checkpoint path on shutdown: {e}"),
     }
 
     endpoint.close(0u32.into(), b"shutdown");

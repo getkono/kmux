@@ -27,6 +27,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
+postcard.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
