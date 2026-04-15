@@ -144,6 +144,8 @@ enum OutputFormat {
 struct ResolvedConnection {
     host: String,
     port: u16,
+    /// TCP port for headless commands (list-sessions). Falls back to `port` if unset.
+    tcp_port: Option<u16>,
     token: String,
     accept_invalid_certs: bool,
     is_local: bool,
@@ -201,6 +203,7 @@ async fn resolve_connection(
                 Ok(ResolvedConnection {
                     host,
                     port,
+                    tcp_port: None,
                     token,
                     accept_invalid_certs: true,
                     is_local: false,
@@ -219,6 +222,7 @@ async fn resolve_connection(
         Ok(ResolvedConnection {
             host: "127.0.0.1".to_string(),
             port: status.port,
+            tcp_port: Some(status.tcp_port),
             token: status.token,
             accept_invalid_certs: true,
             is_local: true,
@@ -247,6 +251,7 @@ async fn resolve_connection(
         Ok(ResolvedConnection {
             host,
             port,
+            tcp_port: None,
             token,
             accept_invalid_certs,
             is_local: false,
@@ -513,9 +518,10 @@ async fn run_list_sessions(
     use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
     use tokio::net::TcpStream;
 
-    let stream = TcpStream::connect(format!("{}:{}", conn.host, conn.port))
+    let tcp_port = conn.tcp_port.unwrap_or(conn.port);
+    let stream = TcpStream::connect(format!("{}:{}", conn.host, tcp_port))
         .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to {}:{}: {e}", conn.host, conn.port))?;
+        .map_err(|e| anyhow::anyhow!("Failed to connect to {}:{}: {e}", conn.host, tcp_port))?;
 
     let (mut read_half, mut write_half) = stream.into_split();
 
