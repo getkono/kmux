@@ -1,0 +1,57 @@
+use ratatui::Frame;
+
+use crate::app::App;
+use crate::mode::Mode;
+
+mod bars;
+mod connect;
+mod grid;
+mod overlays;
+
+pub fn render(f: &mut Frame, app: &mut App) {
+    match app.mode.clone() {
+        Mode::Connect { field } => connect::render_connect(f, app, &field),
+        _ => render_terminal(f, app),
+    }
+}
+
+fn render_terminal(f: &mut Frame, app: &mut App) {
+    use ratatui::layout::{Constraint, Layout};
+
+    let area = f.area();
+
+    // Layout: session bar (1) | terminal (fill) | status bar (1) | hint bar (1)
+    let chunks = Layout::vertical([
+        Constraint::Length(1), // session bar
+        Constraint::Min(1),    // terminal
+        Constraint::Length(1), // status bar
+        Constraint::Length(1), // hint bar
+    ])
+    .split(area);
+
+    bars::render_session_bar(f, app, chunks[0]);
+    grid::render_grid(f, app, chunks[1]);
+    bars::render_status_bar(f, app, chunks[2]);
+    bars::render_hint_bar(f, app, chunks[3]);
+
+    // Overlays — clone mode to avoid borrow conflict with app
+    let mode_snap = app.mode.clone();
+    match &mode_snap {
+        Mode::Help => overlays::render_help_overlay(f, area, &app.theme),
+        Mode::ConfirmCloseSession { word_id } => {
+            overlays::render_confirm_overlay(f, area, word_id, &app.theme)
+        }
+        Mode::RenameSession { buffer, word_id } => {
+            overlays::render_rename_overlay(f, area, word_id, buffer, &app.theme)
+        }
+        Mode::SessionPicker => overlays::render_session_picker_overlay(f, area, app),
+        Mode::ServerPicker => overlays::render_server_picker_overlay(f, area, app),
+        Mode::DirectoryPicker => overlays::render_dir_picker_overlay(f, area, app),
+        _ => {}
+    }
+
+    // HUD overlay
+    if app.hud_visible {
+        overlays::render_hud(f, app, chunks[1]);
+    }
+}
