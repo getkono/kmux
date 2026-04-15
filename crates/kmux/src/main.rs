@@ -8,7 +8,7 @@ mod ui;
 
 use std::io;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use crossterm::{
     event::{DisableMouseCapture, EnableMouseCapture},
     execute,
@@ -20,7 +20,7 @@ use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
 use app::App;
-use kmux_client::ssh;
+use kmux_client::ssh::{self, ParsedServer, RemoteTarget, SshSession};
 use kmux_client::token::read_local_token;
 
 #[derive(Parser, Debug)]
@@ -29,38 +29,55 @@ struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
 
-    /// Remote server host (omit to auto-start and connect to the local daemon)
+    #[command(flatten)]
+    connect: ConnectArgs,
+
+    /// Color theme: built-in name (one-dark, catppuccin-latte, catppuccin-frappe,
+    /// catppuccin-macchiato, catppuccin-mocha, dracula) or a custom theme name
+    /// from ~/.config/kmux/themes/<name>.toml
+    #[arg(long, global = true)]
+    theme: Option<String>,
+}
+
+/// Arguments for connecting to a server (the default action).
+#[derive(Args, Debug)]
+struct ConnectArgs {
+    /// Remote server: user@host, user@host:/path, user@host:port, alias
+    /// (omit to auto-start and connect to the local daemon)
     server: Option<String>,
 
-    /// Server host (overridden by positional server argument if given)
-    #[arg(long)]
-    host: Option<String>,
+    /// Auto-attach to a named session (by display name or word_id)
+    #[arg(short, long)]
+    session: Option<String>,
 
-    /// Server port
+    /// Working directory for a new session (used with --session or user@host:/path)
     #[arg(long)]
-    port: Option<u16>,
-
-    /// Auth token (reads from runtime token file if not provided)
-    #[arg(long)]
-    token: Option<String>,
-
-    /// Accept self-signed / invalid TLS certificates
-    #[arg(long)]
-    accept_invalid_certs: bool,
+    cwd: Option<String>,
 
     /// SSH port to use when connecting to a remote target (overrides hosts.toml)
     #[arg(long)]
     ssh_port: Option<u16>,
 
-    /// Skip SSH tunneling; connect directly via QUIC (backward-compatible mode)
-    #[arg(long)]
+    // ── Hidden legacy/advanced flags ─────────────────────────────────────────
+    /// Server host (prefer positional server argument)
+    #[arg(long, hide = true)]
+    host: Option<String>,
+
+    /// Server port (prefer user@host:port or host:port syntax)
+    #[arg(long, hide = true)]
+    port: Option<u16>,
+
+    /// Auth token (reads from runtime token file if not provided)
+    #[arg(long, hide = true)]
+    token: Option<String>,
+
+    /// Skip SSH tunneling; connect directly via QUIC
+    #[arg(long, hide = true)]
     no_ssh: bool,
 
-    /// Color theme: built-in name (one-dark, catppuccin-latte, catppuccin-frappe,
-    /// catppuccin-macchiato, catppuccin-mocha, dracula) or a custom theme name
-    /// from ~/.config/kmux/themes/<name>.toml
-    #[arg(long)]
-    theme: Option<String>,
+    /// Accept self-signed / invalid TLS certificates
+    #[arg(long, hide = true)]
+    accept_invalid_certs: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -69,6 +86,33 @@ enum Command {
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
+    },
+
+    /// List sessions on a server without launching the TUI
+    #[command(alias = "ls")]
+    ListSessions {
+        /// Remote server (user@host, alias from hosts.toml; omit for local daemon)
+        server: Option<String>,
+
+        /// SSH port override
+        #[arg(long)]
+        ssh_port: Option<u16>,
+
+        /// Output format
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+
+        // Hidden advanced flags for list-sessions
+        #[arg(long, hide = true)]
+        host: Option<String>,
+        #[arg(long, hide = true)]
+        port: Option<u16>,
+        #[arg(long, hide = true)]
+        token: Option<String>,
+        #[arg(long, hide = true)]
+        no_ssh: bool,
+        #[arg(long, hide = true)]
+        accept_invalid_certs: bool,
     },
 }
 
@@ -88,6 +132,129 @@ enum DaemonAction {
         #[arg(short, long)]
         follow: bool,
     },
+}
+
+#[derive(Debug, Clone, ValueEnum)]
+enum OutputFormat {
+    Table,
+    Json,
+}
+
+/// Resolved connection parameters ready for use.
+struct ResolvedConnection {
+    host: String,
+    port: u16,
+    token: String,
+    accept_invalid_certs: bool,
+    is_local: bool,
+    ssh_session: Option<SshSession>,
+    ssh_target: Option<RemoteTarget>,
+    parsed_server: Option<ParsedServer>,
+}
+
+/// Resolve connection parameters from CLI arguments.
+///
+/// Handles three modes: local daemon, SSH negotiation, or direct QUIC.
+async fn resolve_connection(
+    server: Option<&str>,
+    ssh_port_override: Option<u16>,
+    no_ssh: bool,
+    host_override: Option<&str>,
+    port_override: Option<u16>,
+    token_override: Option<&str>,
+    accept_invalid_certs: bool,
+) -> anyhow::Result<ResolvedConnection> {
+    let is_local = server.is_none()
+        && host_override.is_none()
+        && port_override.is_none()
+        && token_override.is_none();
+
+    let parsed = server.map(ssh::parse_server_string);
+
+    // Detect SSH mode: server has a user or matches a hosts.toml alias with a user,
+    // and --no-ssh is not given.
+    let ssh_target = if !no_ssh {
+        parsed
+            .as_ref()
+            .and_then(ssh::resolve_remote_target)
+            .map(|mut t| {
+                if let Some(p) = ssh_port_override {
+                    t.ssh_port = Some(p);
+                }
+                t
+            })
+    } else {
+        None
+    };
+
+    if let Some(target) = ssh_target {
+        tracing::info!(
+            host = %target.host,
+            user = ?target.user,
+            "SSH negotiation starting"
+        );
+        match ssh::negotiate(&target).await {
+            Ok(session) => {
+                let host = "127.0.0.1".to_string();
+                let port = session.local_tcp_port;
+                let token = session.token.clone();
+                Ok(ResolvedConnection {
+                    host,
+                    port,
+                    token,
+                    accept_invalid_certs: true,
+                    is_local: false,
+                    ssh_session: Some(session),
+                    ssh_target: Some(target),
+                    parsed_server: parsed,
+                })
+            }
+            Err(e) => {
+                eprintln!("SSH negotiation failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else if is_local {
+        let status = kmux_client::daemon::ensure_daemon().await?;
+        Ok(ResolvedConnection {
+            host: "127.0.0.1".to_string(),
+            port: status.port,
+            token: status.token,
+            accept_invalid_certs: true,
+            is_local: true,
+            ssh_session: None,
+            ssh_target: None,
+            parsed_server: parsed,
+        })
+    } else {
+        // Direct QUIC: positional server (host:port) or explicit --host/--port.
+        let (host, port) = if let Some(ref parsed) = parsed {
+            (
+                parsed.host.clone(),
+                port_override.or(parsed.port).unwrap_or(8443),
+            )
+        } else {
+            let host = host_override
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| "127.0.0.1".to_string());
+            let port = port_override.unwrap_or(8443);
+            (host, port)
+        };
+        let token = token_override
+            .map(|s| s.to_string())
+            .or_else(read_local_token)
+            .unwrap_or_default();
+        Ok(ResolvedConnection {
+            host,
+            port,
+            token,
+            accept_invalid_certs,
+            is_local: false,
+            ssh_session: None,
+            ssh_target: None,
+            parsed_server: parsed,
+        })
+    }
 }
 
 #[tokio::main]
@@ -122,10 +289,35 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    // Handle daemon subcommands before any TUI setup.
-    if let Some(Command::Daemon { action }) = cli.command {
-        return run_daemon_command(action).await;
+    // Handle subcommands before any TUI setup.
+    match cli.command {
+        Some(Command::Daemon { action }) => return run_daemon_command(action).await,
+        Some(Command::ListSessions {
+            server,
+            ssh_port,
+            format,
+            host,
+            port,
+            token,
+            no_ssh,
+            accept_invalid_certs,
+        }) => {
+            return run_list_sessions(
+                server.as_deref(),
+                ssh_port,
+                format,
+                host.as_deref(),
+                port,
+                token.as_deref(),
+                no_ssh,
+                accept_invalid_certs,
+            )
+            .await;
+        }
+        None => {}
     }
+
+    // ── Default: connect and launch TUI ─────────���────────────────────────────
 
     // Capture the client's working directory before doing anything else.
     let initial_cwd = std::env::current_dir()
@@ -133,78 +325,22 @@ async fn main() -> anyhow::Result<()> {
         .and_then(|p| p.to_str().map(|s| s.to_string()))
         .unwrap_or_default();
 
-    // When no positional server, --host, --port, or --token is given, auto-start
-    // (or reuse) a local daemon and retrieve the connection parameters from it.
-    let is_local =
-        cli.server.is_none() && cli.host.is_none() && cli.port.is_none() && cli.token.is_none();
+    let conn = resolve_connection(
+        cli.connect.server.as_deref(),
+        cli.connect.ssh_port,
+        cli.connect.no_ssh,
+        cli.connect.host.as_deref(),
+        cli.connect.port,
+        cli.connect.token.as_deref(),
+        cli.connect.accept_invalid_certs,
+    )
+    .await?;
 
-    // Detect SSH mode: `server` contains '@' or matches a hosts.toml alias with a user,
-    // and `--no-ssh` is not given.
-    let ssh_target = if !cli.no_ssh {
-        cli.server
-            .as_deref()
-            .and_then(ssh::parse_remote_target)
-            .map(|mut t| {
-                if let Some(p) = cli.ssh_port {
-                    t.ssh_port = Some(p);
-                }
-                t
-            })
-    } else {
-        None
-    };
-
-    // For SSH mode, negotiate before setting up the terminal so we can print
-    // errors cleanly if SSH negotiation fails.
-    let mut app_ssh_target: Option<kmux_client::ssh::RemoteTarget> = None;
-
-    let (ssh_session, host, port, token, accept_invalid_certs) = if let Some(target) = ssh_target {
-        tracing::info!(
-            host = %target.host,
-            user = ?target.user,
-            "SSH negotiation starting"
-        );
-        match ssh::negotiate(&target).await {
-            Ok(session) => {
-                let host = "127.0.0.1".to_string();
-                let port = session.local_tcp_port;
-                let token = session.token.clone();
-                app_ssh_target = Some(target);
-                (Some(session), host, port, token, true)
-            }
-            Err(e) => {
-                eprintln!("SSH negotiation failed: {e}");
-                std::process::exit(1);
-            }
-        }
-    } else if is_local {
-        let status = kmux_client::daemon::ensure_daemon().await?;
-        // The daemon uses a self-signed cert, so accept-invalid-certs is implied.
-        (
-            None,
-            "127.0.0.1".to_string(),
-            status.port,
-            status.token,
-            true,
-        )
-    } else {
-        // Positional `server` arg takes precedence over `--host`. It may be
-        // "host" or "host:port".
-        let (host, port) = if let Some(server) = cli.server {
-            if let Some((h, p_str)) = server.rsplit_once(':') {
-                let p = p_str.parse().unwrap_or(8443);
-                (h.to_string(), cli.port.unwrap_or(p))
-            } else {
-                (server, cli.port.unwrap_or(8443))
-            }
-        } else {
-            let host = cli.host.unwrap_or_else(|| "127.0.0.1".to_string());
-            let port = cli.port.unwrap_or(8443);
-            (host, port)
-        };
-        let token = cli.token.or_else(read_local_token).unwrap_or_default();
-        (None, host, port, token, cli.accept_invalid_certs)
-    };
+    // Compute effective cwd: explicit --cwd > :path from server string > local cwd
+    let auto_cwd = cli
+        .connect
+        .cwd
+        .or_else(|| conn.parsed_server.as_ref().and_then(|p| p.path.clone()));
 
     // Setup terminal
     enable_raw_mode()?;
@@ -224,16 +360,18 @@ async fn main() -> anyhow::Result<()> {
     let theme = config::resolve_theme(cli.theme.as_deref());
 
     let mut app = App::new(
-        host,
-        port,
-        token,
-        accept_invalid_certs,
-        is_local,
+        conn.host,
+        conn.port,
+        conn.token,
+        conn.accept_invalid_certs,
+        conn.is_local,
         initial_cwd,
         theme,
         instance_id.clone(),
-        ssh_session,
-        app_ssh_target,
+        conn.ssh_session,
+        conn.ssh_target,
+        cli.connect.session,
+        auto_cwd,
     );
 
     let result = app
@@ -344,6 +482,126 @@ async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_list_sessions(
+    server: Option<&str>,
+    ssh_port: Option<u16>,
+    format: OutputFormat,
+    host_override: Option<&str>,
+    port_override: Option<u16>,
+    token_override: Option<&str>,
+    no_ssh: bool,
+    accept_invalid_certs: bool,
+) -> anyhow::Result<()> {
+    let conn = resolve_connection(
+        server,
+        ssh_port,
+        no_ssh,
+        host_override,
+        port_override,
+        token_override,
+        accept_invalid_certs,
+    )
+    .await?;
+
+    // Connect headlessly via TCP, send auth + SessionList, print results.
+    use kmux_protocol::messages::{
+        ClientCapabilities, ClientMessage, PROTOCOL_VERSION, ServerMessage,
+    };
+    use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
+    use tokio::net::TcpStream;
+
+    let stream = TcpStream::connect(format!("{}:{}", conn.host, conn.port))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to {}:{}: {e}", conn.host, conn.port))?;
+
+    let (mut read_half, mut write_half) = stream.into_split();
+
+    // Authenticate.
+    let auth_msg = ClientMessage::Auth {
+        token: conn.token,
+        protocol_version: PROTOCOL_VERSION,
+        capabilities: ClientCapabilities::default(),
+        connection_id: None,
+    };
+    let auth_bytes = encode_client(&auth_msg)?;
+    write_frame(&mut write_half, &auth_bytes).await?;
+
+    // Wait for AuthResult.
+    loop {
+        let data = read_frame(&mut read_half)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Connection closed before auth response"))?;
+        let msg = decode_server(&data)?;
+        match msg {
+            ServerMessage::AuthResult {
+                success: true,
+                client_id,
+                ..
+            } => {
+                tracing::debug!(?client_id, "Authenticated for list-sessions");
+                break;
+            }
+            ServerMessage::AuthResult {
+                success: false,
+                reason,
+                ..
+            } => {
+                anyhow::bail!(
+                    "Authentication failed: {}",
+                    reason.unwrap_or_else(|| "unknown error".into())
+                );
+            }
+            _ => continue,
+        }
+    }
+
+    // Request session list.
+    let list_msg = ClientMessage::SessionList { request_id: 1 };
+    let list_bytes = encode_client(&list_msg)?;
+    write_frame(&mut write_half, &list_bytes).await?;
+
+    // Wait for SessionListResult.
+    loop {
+        let data = read_frame(&mut read_half)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Connection closed before session list"))?;
+        let msg = decode_server(&data)?;
+        match msg {
+            ServerMessage::SessionListResult { sessions, .. } => {
+                print_sessions(&sessions, &format);
+                return Ok(());
+            }
+            _ => continue,
+        }
+    }
+}
+
+fn print_sessions(sessions: &[kmux_protocol::messages::SessionEntry], format: &OutputFormat) {
+    match format {
+        OutputFormat::Table => {
+            if sessions.is_empty() {
+                println!("No active sessions");
+                return;
+            }
+            println!("{:<16} {:<10} {:<40} {:<6}", "NAME", "ID", "CWD", "PANES");
+            for entry in sessions {
+                println!(
+                    "{:<16} {:<10} {:<40} {:<6}",
+                    entry.meta.name,
+                    entry.meta.word_id,
+                    entry.meta.cwd,
+                    entry.panes.len(),
+                );
+            }
+        }
+        OutputFormat::Json => {
+            let json = serde_json::to_string_pretty(sessions).expect("sessions are serializable");
+            println!("{json}");
+        }
+    }
 }
 
 fn format_uptime(secs: u64) -> String {

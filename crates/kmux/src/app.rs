@@ -58,6 +58,11 @@ pub struct App {
     pub initial_cwd: String,
     did_auto_select: bool,
 
+    /// CLI `--session` flag: auto-attach to a session by name or word_id.
+    auto_session: Option<String>,
+    /// Effective cwd from `--cwd` or `:path` in server string.
+    auto_cwd: Option<String>,
+
     /// Width (in columns) of the session badge in the top bar, used to detect
     /// mouse clicks that should open the session picker.
     pub session_badge_cols: u16,
@@ -91,6 +96,8 @@ impl App {
         instance_id: String,
         ssh_session: Option<SshSession>,
         ssh_target: Option<RemoteTarget>,
+        auto_session: Option<String>,
+        auto_cwd: Option<String>,
     ) -> Self {
         let connect_host = host.clone();
         let connect_port = port.to_string();
@@ -128,6 +135,8 @@ impl App {
             instance_id,
             ssh_session,
             ssh_target,
+            auto_session,
+            auto_cwd,
             reconnect_attempt: 0,
         }
     }
@@ -490,23 +499,49 @@ impl App {
                 SessionEvent::SessionListReceived => {
                     if !self.did_auto_select {
                         self.did_auto_select = true;
-                        if self.is_local {
-                            let cwd = self.initial_cwd.clone();
-                            if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
-                                self.mgr.select_session(word_id);
-                            } else {
-                                self.mgr
-                                    .create_session_with_cwd(&cwd, Self::current_term_size());
-                            }
-                        } else {
-                            // Remote: show directory picker pre-filled with local CWD
-                            self.dir_picker_buffer = self.initial_cwd.clone();
-                            self.mode = Mode::DirectoryPicker;
-                        }
+                        self.auto_select_session();
                     }
                 }
                 _ => {}
             }
+        }
+    }
+
+    /// Auto-select or create a session based on CLI flags (--session, --cwd, :path).
+    fn auto_select_session(&mut self) {
+        let size = Self::current_term_size();
+
+        if let Some(session_name) = self.auto_session.take() {
+            // --session was given: find by name/word_id or create.
+            if let Some(word_id) = self.mgr.find_session_by_name(&session_name) {
+                self.mgr.select_session(word_id);
+            } else {
+                let cwd = self
+                    .auto_cwd
+                    .take()
+                    .unwrap_or_else(|| self.initial_cwd.clone());
+                self.mgr
+                    .create_session_with_name_and_cwd(&session_name, &cwd, size);
+            }
+        } else if let Some(cwd) = self.auto_cwd.take() {
+            // :path or --cwd was given without --session.
+            if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
+                self.mgr.select_session(word_id);
+            } else {
+                self.mgr.create_session_with_cwd(&cwd, size);
+            }
+        } else if self.is_local {
+            // Local mode: match by cwd or create.
+            let cwd = self.initial_cwd.clone();
+            if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
+                self.mgr.select_session(word_id);
+            } else {
+                self.mgr.create_session_with_cwd(&cwd, size);
+            }
+        } else {
+            // Remote without --session or path: show directory picker.
+            self.dir_picker_buffer = self.initial_cwd.clone();
+            self.mode = Mode::DirectoryPicker;
         }
     }
 

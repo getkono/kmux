@@ -749,6 +749,29 @@ impl SessionManager {
             .map(|e| e.meta.word_id.clone())
     }
 
+    /// Find the first session whose display name or word_id matches `name`.
+    pub fn find_session_by_name(&self, name: &str) -> Option<String> {
+        self.session_list
+            .iter()
+            .find(|e| e.meta.name == name || e.meta.word_id == name)
+            .map(|e| e.meta.word_id.clone())
+    }
+
+    /// Create a new session with an explicit name and working directory.
+    pub fn create_session_with_name_and_cwd(&mut self, name: &str, cwd: &str, size: TermSize) {
+        if self.ws_sender.is_some() {
+            let rid = self.next_rid();
+            self.send_ws(ClientMessage::SessionCreate {
+                request_id: rid,
+                name: Some(name.to_string()),
+                cwd: Some(cwd.to_string()),
+                program: None,
+                args: vec![],
+                size,
+            });
+        }
+    }
+
     /// Create a new pane in the active session.
     pub fn create_pane(&mut self, size: TermSize) {
         if let Some(word_id) = self.active_session.clone() {
@@ -1309,6 +1332,45 @@ mod tests {
         match rx.try_recv().expect("message sent") {
             ClientMessage::SessionCreate { cwd, .. } => {
                 assert_eq!(cwd, Some("/my/custom/dir".to_string()));
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn find_session_by_name_matches_display_name() {
+        let mut mgr = make_manager();
+        mgr.session_list
+            .push(make_entry("eagle", "/home/user/proj"));
+        // make_entry sets name to basename of cwd
+        assert_eq!(mgr.find_session_by_name("proj"), Some("eagle".to_string()));
+    }
+
+    #[test]
+    fn find_session_by_name_matches_word_id() {
+        let mut mgr = make_manager();
+        mgr.session_list
+            .push(make_entry("eagle", "/home/user/proj"));
+        assert_eq!(mgr.find_session_by_name("eagle"), Some("eagle".to_string()));
+    }
+
+    #[test]
+    fn find_session_by_name_returns_none_for_no_match() {
+        let mut mgr = make_manager();
+        mgr.session_list
+            .push(make_entry("eagle", "/home/user/proj"));
+        assert_eq!(mgr.find_session_by_name("nonexistent"), None);
+    }
+
+    #[test]
+    fn create_session_with_name_and_cwd_sends_correct_message() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.create_session_with_name_and_cwd("myapp", "/opt/app", TermSize::default());
+
+        match rx.try_recv().expect("message sent") {
+            ClientMessage::SessionCreate { name, cwd, .. } => {
+                assert_eq!(name, Some("myapp".to_string()));
+                assert_eq!(cwd, Some("/opt/app".to_string()));
             }
             other => panic!("unexpected message: {other:?}"),
         }
