@@ -639,7 +639,7 @@ impl SessionManager {
 
     /// Create a new session. The server assigns the word_id and CWD defaults to
     /// the client's current working directory.
-    pub fn create_session(&mut self) {
+    pub fn create_session(&mut self, size: TermSize) {
         if self.ws_sender.is_some() {
             let rid = self.next_rid();
             let cwd = std::env::current_dir()
@@ -651,13 +651,13 @@ impl SessionManager {
                 cwd,
                 program: None,
                 args: vec![],
-                size: TermSize { rows: 24, cols: 80 },
+                size,
             });
         }
     }
 
     /// Create a new session with an explicit working directory.
-    pub fn create_session_with_cwd(&mut self, cwd: &str) {
+    pub fn create_session_with_cwd(&mut self, cwd: &str, size: TermSize) {
         if self.ws_sender.is_some() {
             let rid = self.next_rid();
             self.send_ws(ClientMessage::SessionCreate {
@@ -666,7 +666,7 @@ impl SessionManager {
                 cwd: Some(cwd.to_string()),
                 program: None,
                 args: vec![],
-                size: TermSize { rows: 24, cols: 80 },
+                size,
             });
         }
     }
@@ -680,7 +680,7 @@ impl SessionManager {
     }
 
     /// Create a new pane in the active session.
-    pub fn create_pane(&mut self) {
+    pub fn create_pane(&mut self, size: TermSize) {
         if let Some(word_id) = self.active_session.clone() {
             let rid = self.next_rid();
             self.send_ws(ClientMessage::PaneCreate {
@@ -688,7 +688,7 @@ impl SessionManager {
                 word_id,
                 program: None,
                 args: vec![],
-                size: TermSize { rows: 24, cols: 80 },
+                size,
             });
         }
     }
@@ -1232,7 +1232,7 @@ mod tests {
     #[test]
     fn create_session_with_cwd_sends_correct_message() {
         let (mut mgr, mut rx) = make_connected_manager();
-        mgr.create_session_with_cwd("/my/custom/dir");
+        mgr.create_session_with_cwd("/my/custom/dir", TermSize::default());
 
         match rx.try_recv().expect("message sent") {
             ClientMessage::SessionCreate { cwd, .. } => {

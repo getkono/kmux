@@ -70,6 +70,24 @@ impl PtyMasterIo {
     }
 }
 
+impl PtyMasterIo {
+    /// Non-blocking read without interacting with the async reactor.
+    ///
+    /// Returns `Ok(n)` if data was available, or `Err` with `WouldBlock` if
+    /// the kernel buffer is empty. Intended for coalescing burst output after
+    /// an async read has already returned data.
+    pub fn try_read_raw(&self, buf: &mut [u8]) -> io::Result<usize> {
+        let fd = self.inner.as_raw_fd();
+        let n =
+            unsafe { nix::libc::read(fd, buf.as_mut_ptr() as *mut nix::libc::c_void, buf.len()) };
+        if n < 0 {
+            Err(io::Error::last_os_error())
+        } else {
+            Ok(n as usize)
+        }
+    }
+}
+
 impl AsyncRead for PtyMasterIo {
     fn poll_read(
         self: Pin<&mut Self>,

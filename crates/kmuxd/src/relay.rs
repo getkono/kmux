@@ -23,7 +23,7 @@ pub async fn session_diff_loop(
     term_state: Arc<Mutex<TermState>>,
     seqno_counter: Arc<AtomicU64>,
 ) {
-    let mut buf = vec![0u8; 4096];
+    let mut buf = vec![0u8; 65536];
     let mut prev_cursor = CursorState::default();
     let mut prev_modes = TermModes::EMPTY;
 
@@ -32,8 +32,22 @@ pub async fn session_diff_loop(
             Ok(0) => break,
             Ok(n) => {
                 let cycle_start = Instant::now();
+                let mut total_bytes = n;
                 let mut ts = term_state.lock().unwrap();
                 ts.feed(&buf[..n]);
+                // Coalesce: drain all immediately-available PTY output before
+                // computing the diff, so burst output (e.g. vim exit, large
+                // cat) produces a single diff instead of many intermediate ones.
+                loop {
+                    match reader.try_read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(m) => {
+                            ts.feed(&buf[..m]);
+                            total_bytes += m;
+                        }
+                        Err(_) => break, // WouldBlock or error
+                    }
+                }
                 drop(ts);
                 flush_cell_diff(
                     &pane_id,
@@ -47,7 +61,7 @@ pub async fn session_diff_loop(
                 let cycle_us = cycle_start.elapsed().as_micros();
                 debug!(
                     pane_id,
-                    bytes = n,
+                    bytes = total_bytes,
                     cycle_us,
                     "PTY read-diff-broadcast cycle"
                 );

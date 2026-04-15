@@ -205,6 +205,13 @@ impl PtyReader {
         use tokio::io::AsyncReadExt;
         self.io.read(buf).await.map_err(KmuxError::Io)
     }
+
+    /// Non-blocking read for output coalescing.
+    ///
+    /// Returns `Err(WouldBlock)` when no data is immediately available.
+    pub fn try_read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.io.try_read_raw(buf)
+    }
 }
 
 // AsyncRead impl for PtySession (non-split use)

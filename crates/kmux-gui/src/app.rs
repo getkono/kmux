@@ -3,7 +3,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use iced::futures::SinkExt as _;
 use iced::widget::{Space, button, column, container, row, text, text_input};
 use iced::{Element, Event, Font, Length, Subscription, Task, Theme};
-use kmux_protocol::messages::{ClientCapabilities, ClientMessage, PROTOCOL_VERSION, ServerMessage};
+use kmux_protocol::messages::{
+    ClientCapabilities, ClientMessage, PROTOCOL_VERSION, ServerMessage, TermSize,
+};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -148,6 +150,10 @@ pub struct kmuxApp {
 
     /// Unique ID for this client process, written to the connection log on auth success.
     instance_id: String,
+
+    /// Last known terminal dimensions from the canvas widget.
+    last_term_rows: u16,
+    last_term_cols: u16,
 }
 
 /// Static capability profile for the GUI client.
@@ -186,12 +192,26 @@ impl kmuxApp {
             force_snapshot_mode: false,
             leader_state: LeaderState::Idle,
             instance_id,
+            last_term_rows: 0,
+            last_term_cols: 0,
         }
     }
 
     /// Get the host:port string for display.
     fn host_port_display(&self) -> String {
         self.mgr.host_port_display()
+    }
+
+    /// Return the last known terminal size from the canvas, or a default fallback.
+    fn current_term_size(&self) -> TermSize {
+        if self.last_term_rows > 0 && self.last_term_cols > 0 {
+            TermSize {
+                rows: self.last_term_rows,
+                cols: self.last_term_cols,
+            }
+        } else {
+            TermSize::default()
+        }
     }
 
     /// Dispatch a ShortcutAction from the leader key system.
@@ -394,7 +414,7 @@ impl kmuxApp {
                     return Task::none();
                 }
                 self.mgr.set_status_msg("Creating session...".to_string());
-                self.mgr.create_session();
+                self.mgr.create_session(self.current_term_size());
                 Task::none()
             }
 
@@ -503,8 +523,10 @@ impl kmuxApp {
 
             //  Terminal resize
             Message::TerminalResized { rows, cols } => {
-                if let Some(name) = self.mgr.active_session().map(|s| s.to_string()) {
-                    self.mgr.send_resize(&name, rows, cols);
+                self.last_term_rows = rows;
+                self.last_term_cols = cols;
+                if let Some(pane_id) = self.mgr.active_pane_id().map(|s| s.to_string()) {
+                    self.mgr.send_resize(&pane_id, rows, cols);
                 }
                 Task::none()
             }
