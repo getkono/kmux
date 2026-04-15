@@ -65,7 +65,9 @@ impl ClientState {
         });
     }
 
-    async fn handle(&mut self, msg: ClientMessage) {
+    /// Handle a single client message. Returns `true` to keep reading, `false`
+    /// to signal the caller to close the connection (e.g. after version mismatch).
+    async fn handle(&mut self, msg: ClientMessage) -> bool {
         if !self.authenticated {
             if let ClientMessage::Auth {
                 token,
@@ -82,13 +84,14 @@ impl ClientState {
                             kmux_protocol::messages::PROTOCOL_VERSION
                         )),
                         client_id: None,
-                        server_version: None,
+                        server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                         connection_id: None,
                     });
                     warn!(
                         "Protocol version mismatch: client={protocol_version}, server={}",
                         kmux_protocol::messages::PROTOCOL_VERSION
                     );
+                    return false;
                 } else if validate_token(&token, &self.app.auth_token) {
                     let (client_id, conn_id) = self.app.register_client(incoming_conn_id).await;
                     self.client_id = Some(client_id);
@@ -116,7 +119,7 @@ impl ClientState {
             } else {
                 self.error(None, ErrorCode::NotAuthenticated, "send Auth first");
             }
-            return;
+            return true;
         }
 
         let client_id = self.client_id.expect("authenticated without client_id");
@@ -277,7 +280,7 @@ impl ClientState {
                                     ErrorCode::InternalError,
                                     format!("failed to open uni stream: {e}"),
                                 );
-                                return;
+                                return true;
                             }
                         };
 
@@ -347,6 +350,8 @@ impl ClientState {
 
             ClientMessage::Pong { .. } => {}
         }
+
+        true
     }
 }
 
@@ -498,7 +503,11 @@ pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
     loop {
         match read_frame(&mut ctrl_recv).await {
             Ok(Some(data)) => match decode_client(&data) {
-                Ok(client_msg) => state.handle(client_msg).await,
+                Ok(client_msg) => {
+                    if !state.handle(client_msg).await {
+                        break;
+                    }
+                }
                 Err(e) => {
                     warn!("Failed to decode client message: {e}");
                     state.error(None, ErrorCode::InvalidMessage, e.to_string());

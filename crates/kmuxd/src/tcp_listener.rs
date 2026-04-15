@@ -89,7 +89,9 @@ impl TcpClientState {
         });
     }
 
-    async fn handle(&mut self, msg: ClientMessage) {
+    /// Handle a single client message. Returns `true` to keep reading, `false`
+    /// to signal the caller to close the connection (e.g. after version mismatch).
+    async fn handle(&mut self, msg: ClientMessage) -> bool {
         if !self.authenticated {
             if let ClientMessage::Auth {
                 token,
@@ -106,13 +108,14 @@ impl TcpClientState {
                             kmux_protocol::messages::PROTOCOL_VERSION
                         )),
                         client_id: None,
-                        server_version: None,
+                        server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                         connection_id: None,
                     });
                     warn!(
                         "Protocol version mismatch: client={protocol_version}, server={}",
                         kmux_protocol::messages::PROTOCOL_VERSION
                     );
+                    return false;
                 } else if validate_token(&token, &self.app.auth_token) {
                     let (client_id, conn_id) = self.app.register_client(incoming_conn_id).await;
                     self.client_id = Some(client_id);
@@ -140,7 +143,7 @@ impl TcpClientState {
             } else {
                 self.error(None, ErrorCode::NotAuthenticated, "send Auth first");
             }
-            return;
+            return true;
         }
 
         let client_id = self.client_id.expect("authenticated without client_id");
@@ -358,6 +361,8 @@ impl TcpClientState {
 
             ClientMessage::Pong { .. } => {}
         }
+
+        true
     }
 }
 
@@ -472,7 +477,11 @@ async fn handle_tcp(stream: TcpStream, app: Arc<ServerApp>) {
     loop {
         match read_frame(&mut read_half).await {
             Ok(Some(data)) => match decode_client(&data) {
-                Ok(client_msg) => state.handle(client_msg).await,
+                Ok(client_msg) => {
+                    if !state.handle(client_msg).await {
+                        break;
+                    }
+                }
                 Err(e) => {
                     warn!("TCP decode error: {e}");
                     state.error(None, ErrorCode::InvalidMessage, e.to_string());

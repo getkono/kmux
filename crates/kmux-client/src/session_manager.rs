@@ -292,7 +292,12 @@ impl SessionManager {
                 } else {
                     warn!("Auth failed: {:?}", reason);
                     let reason_str = reason.unwrap_or_default();
-                    self.status_msg = format!("Auth failed: {reason_str}");
+                    let hint = kmux_protocol::messages::version_mismatch_hint(&reason_str);
+                    if hint.is_empty() {
+                        self.status_msg = format!("Auth failed: {reason_str}");
+                    } else {
+                        self.status_msg = format!("Auth failed: {reason_str} | {hint}");
+                    }
                     self.ws_sender = None;
                     self.connected = false;
                     events.push(SessionEvent::AuthFailed { reason: reason_str });

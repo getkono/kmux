@@ -28,7 +28,7 @@ use app::ServerApp;
 use auth::{generate_token, persist_token};
 
 #[derive(Parser, Debug)]
-#[command(name = "kmuxd", about = "kmux remote terminal server")]
+#[command(name = "kmuxd", about = "kmux remote terminal server", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -112,7 +112,12 @@ fn main() -> anyhow::Result<()> {
                 .init();
         }
     }
-    tracing::info!(instance_id = %instance_id, "kmuxd started");
+    tracing::info!(
+        instance_id = %instance_id,
+        version = env!("CARGO_PKG_VERSION"),
+        protocol_version = kmux_protocol::messages::PROTOCOL_VERSION,
+        "kmuxd started"
+    );
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(async_main(cli).instrument(tracing::info_span!("instance", id = %instance_id)))?;

@@ -8,5 +8,5 @@ pub use frame::{read_frame, write_frame};
 pub use messages::{
     CellAttrs, CellColor, CellState, ClientId, ClientMessage, CursorShape, CursorState, DiffOp,
     ErrorCode, GridSnapshot, PaneId, PaneInfo, RequestId, ServerMessage, SessionEntry,
-    SessionEventMsg, SessionMeta, TermModes, TermSize, TerminalDiff, WordId,
+    SessionEventMsg, SessionMeta, TermModes, TermSize, TerminalDiff, WordId, version_mismatch_hint,
 };

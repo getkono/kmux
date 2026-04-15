@@ -2,8 +2,44 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-/// Current wire protocol version. Increment when breaking changes are made.
+/// Current wire protocol version. Bump when the wire format changes.
+///
+/// The client sends this in `ClientMessage::Auth` and the server rejects
+/// connections whose version does not match exactly. Because the wire codec
+/// (postcard) is positional, any field addition, removal, or reordering in
+/// `ClientMessage` or `ServerMessage` is a breaking change that requires a
+/// bump.
+///
+/// # When to bump
+///
+/// - Adding, removing, or reordering fields in any message variant.
+/// - Adding new enum variants (postcard encodes variant index as a varint).
+/// - Changing the semantics of an existing field in a way that old code would
+///   misinterpret.
+///
+/// You do **not** need to bump for purely behavioural changes that leave the
+/// wire format unchanged (e.g. changing server-side timeout values).
 pub const PROTOCOL_VERSION: u32 = 13;
+
+/// Parse a version-mismatch reason string and return an actionable upgrade
+/// hint, or an empty string if the reason is not a version mismatch.
+///
+/// Expected format: `"protocol version mismatch: client=X, server=Y"`.
+pub fn version_mismatch_hint(reason: &str) -> &'static str {
+    if let Some(rest) = reason.strip_prefix("protocol version mismatch: client=") {
+        let parts: Vec<&str> = rest.splitn(2, ", server=").collect();
+        if parts.len() == 2
+            && let (Ok(client_v), Ok(server_v)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>())
+        {
+            return if client_v < server_v {
+                "Hint: your client is older than the server. Update kmux to match."
+            } else {
+                "Hint: your client is newer than the server. Update kmuxd to match."
+            };
+        }
+    }
+    ""
+}
 
 /// Return the current wall-clock time as milliseconds since the Unix epoch.
 pub fn epoch_millis() -> u64 {
@@ -775,5 +811,52 @@ mod tests {
             crate::decode_server(&bytes).unwrap(),
             ServerMessage::ChannelSwitched { .. }
         ));
+    }
+
+    #[test]
+    fn version_mismatch_auth_result_roundtrip() {
+        let msg = ServerMessage::AuthResult {
+            success: false,
+            reason: Some("protocol version mismatch: client=12, server=13".to_string()),
+            client_id: None,
+            server_version: Some("0.1.0".to_string()),
+            connection_id: None,
+        };
+        let bytes = crate::encode_server(&msg).unwrap();
+        let decoded = crate::decode_server(&bytes).unwrap();
+        match decoded {
+            ServerMessage::AuthResult {
+                success,
+                reason,
+                server_version,
+                ..
+            } => {
+                assert!(!success);
+                assert_eq!(
+                    reason.as_deref(),
+                    Some("protocol version mismatch: client=12, server=13")
+                );
+                assert_eq!(server_version.as_deref(), Some("0.1.0"));
+            }
+            _ => panic!("expected AuthResult"),
+        }
+    }
+
+    #[test]
+    fn version_mismatch_hint_older_client() {
+        let hint = version_mismatch_hint("protocol version mismatch: client=12, server=13");
+        assert!(hint.contains("client is older"));
+    }
+
+    #[test]
+    fn version_mismatch_hint_newer_client() {
+        let hint = version_mismatch_hint("protocol version mismatch: client=14, server=13");
+        assert!(hint.contains("client is newer"));
+    }
+
+    #[test]
+    fn version_mismatch_hint_not_a_mismatch() {
+        let hint = version_mismatch_hint("invalid token");
+        assert!(hint.is_empty());
     }
 }

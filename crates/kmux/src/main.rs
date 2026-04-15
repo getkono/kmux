@@ -25,7 +25,7 @@ use kmux_client::ssh::{self, ParsedServer, RemoteTarget, SshSession};
 use kmux_client::token::read_local_token;
 
 #[derive(Parser, Debug)]
-#[command(name = "kmux", about = "kmux remote terminal client (TUI)")]
+#[command(name = "kmux", about = "kmux remote terminal client (TUI)", version)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -291,7 +291,12 @@ async fn main() -> anyhow::Result<()> {
                 .init();
         }
     }
-    tracing::info!(instance_id = %instance_id, "kmux started");
+    tracing::info!(
+        instance_id = %instance_id,
+        version = env!("CARGO_PKG_VERSION"),
+        protocol_version = kmux_protocol::messages::PROTOCOL_VERSION,
+        "kmux started"
+    );
 
     let cli = Cli::parse();
 
@@ -514,7 +519,7 @@ async fn run_list_sessions(
 
     // Connect headlessly via TCP, send auth + SessionList, print results.
     use kmux_protocol::messages::{
-        ClientCapabilities, ClientMessage, PROTOCOL_VERSION, ServerMessage,
+        ClientCapabilities, ClientMessage, PROTOCOL_VERSION, ServerMessage, version_mismatch_hint,
     };
     use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
     use tokio::net::TcpStream;
@@ -556,10 +561,13 @@ async fn run_list_sessions(
                 reason,
                 ..
             } => {
-                anyhow::bail!(
-                    "Authentication failed: {}",
-                    reason.unwrap_or_else(|| "unknown error".into())
-                );
+                let reason_str = reason.unwrap_or_else(|| "unknown error".into());
+                let hint = version_mismatch_hint(&reason_str);
+                if hint.is_empty() {
+                    anyhow::bail!("Authentication failed: {reason_str}");
+                } else {
+                    anyhow::bail!("Authentication failed: {reason_str}\n{hint}");
+                }
             }
             _ => continue,
         }
