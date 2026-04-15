@@ -133,31 +133,6 @@ pub fn resolve_signal_key(key: &iced::keyboard::Key) -> Option<i32> {
     }
 }
 
-/// Entry in the help overlay.
-pub fn shortcut_help_entries() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("c", "Create new session"),
-        ("x", "Close current session"),
-        ("n / \u{2192}", "Next session"),
-        ("p / \u{2190}", "Previous session"),
-        ("0-9", "Jump to session by index"),
-        (",", "Rename current session"),
-        ("d", "Disconnect from server"),
-        ("k", "Signal menu"),
-        ("l", "Toggle input lock"),
-        ("?", "Show this help"),
-        ("h", "Toggle HUD metrics"),
-        ("f", "Toggle full-snapshot mode"),
-        (":", "Command palette"),
-        ("[", "Scroll page up"),
-        ("]", "Scroll page down"),
-        ("Shift+PgUp/Dn", "Scroll page (direct)"),
-        ("Cmd+C / Ctrl+Shift+C", "Copy selection"),
-        ("Cmd+V / Ctrl+Shift+V", "Paste from clipboard"),
-        ("Ctrl+B", "Send literal Ctrl+B"),
-    ]
-}
-
 /// A command palette entry.
 #[derive(Debug, Clone)]
 pub struct CommandEntry {
@@ -166,65 +141,134 @@ pub struct CommandEntry {
     pub action: ShortcutAction,
 }
 
-/// All commands available in the command palette.
+/// Single source of truth for all leader-key shortcuts that appear in both
+/// the command palette and the help overlay.
+struct ShortcutDef {
+    /// Short key shown in the command palette (e.g. `"n"`).
+    palette_key: &'static str,
+    /// Key label shown in the help overlay (may include aliases, e.g. `"n / →"`).
+    help_key: &'static str,
+    /// Title-case label for the command palette.
+    label: &'static str,
+    /// Lower-case description for the help overlay.
+    help_desc: &'static str,
+    action: ShortcutAction,
+}
+
+static SHORTCUTS: &[ShortcutDef] = &[
+    ShortcutDef {
+        palette_key: "c",
+        help_key: "c",
+        label: "Create Session",
+        help_desc: "Create new session",
+        action: ShortcutAction::CreateSession,
+    },
+    ShortcutDef {
+        palette_key: "x",
+        help_key: "x",
+        label: "Close Session",
+        help_desc: "Close current session",
+        action: ShortcutAction::CloseSession,
+    },
+    ShortcutDef {
+        palette_key: "n",
+        help_key: "n / \u{2192}",
+        label: "Next Session",
+        help_desc: "Next session",
+        action: ShortcutAction::NextSession,
+    },
+    ShortcutDef {
+        palette_key: "p",
+        help_key: "p / \u{2190}",
+        label: "Previous Session",
+        help_desc: "Previous session",
+        action: ShortcutAction::PrevSession,
+    },
+    ShortcutDef {
+        palette_key: ",",
+        help_key: ",",
+        label: "Rename Session",
+        help_desc: "Rename current session",
+        action: ShortcutAction::RenameSession,
+    },
+    ShortcutDef {
+        palette_key: "d",
+        help_key: "d",
+        label: "Disconnect",
+        help_desc: "Disconnect from server",
+        action: ShortcutAction::Disconnect,
+    },
+    ShortcutDef {
+        palette_key: "k",
+        help_key: "k",
+        label: "Signal Menu",
+        help_desc: "Signal menu",
+        action: ShortcutAction::ShowSignalMenu,
+    },
+    ShortcutDef {
+        palette_key: "l",
+        help_key: "l",
+        label: "Toggle Input Lock",
+        help_desc: "Toggle input lock",
+        action: ShortcutAction::ToggleInputLock,
+    },
+    ShortcutDef {
+        palette_key: "?",
+        help_key: "?",
+        label: "Show Help",
+        help_desc: "Show this help",
+        action: ShortcutAction::ShowHelp,
+    },
+    ShortcutDef {
+        palette_key: "h",
+        help_key: "h",
+        label: "Toggle HUD",
+        help_desc: "Toggle HUD metrics",
+        action: ShortcutAction::ToggleHud,
+    },
+    ShortcutDef {
+        palette_key: "f",
+        help_key: "f",
+        label: "Toggle Snapshot Mode",
+        help_desc: "Toggle full-snapshot mode",
+        action: ShortcutAction::ToggleSnapshotMode,
+    },
+];
+
+/// Help-only entries that have no command-palette action.
+const HELP_ONLY: &[(&str, &str)] = &[
+    ("0-9", "Jump to session by index"),
+    (":", "Command palette"),
+    ("[", "Scroll page up"),
+    ("]", "Scroll page down"),
+    ("Shift+PgUp/Dn", "Scroll page (direct)"),
+    ("Cmd+C / Ctrl+Shift+C", "Copy selection"),
+    ("Cmd+V / Ctrl+Shift+V", "Paste from clipboard"),
+    ("Ctrl+B", "Send literal Ctrl+B"),
+];
+
+/// Entry in the help overlay. Derived from [`SHORTCUTS`] plus [`HELP_ONLY`].
+pub fn shortcut_help_entries() -> Vec<(&'static str, &'static str)> {
+    let mut entries: Vec<(&'static str, &'static str)> = SHORTCUTS
+        .iter()
+        .map(|s| (s.help_key, s.help_desc))
+        .collect();
+    // Insert the "0-9" jump entry after PrevSession (index 3).
+    entries.insert(4, ("0-9", "Jump to session by index"));
+    entries.extend_from_slice(&HELP_ONLY[1..]); // skip "0-9" already inserted
+    entries
+}
+
+/// All commands available in the command palette. Derived from [`SHORTCUTS`].
 fn all_commands() -> Vec<CommandEntry> {
-    vec![
-        CommandEntry {
-            label: "Create Session".into(),
-            shortcut_hint: "c".into(),
-            action: ShortcutAction::CreateSession,
-        },
-        CommandEntry {
-            label: "Close Session".into(),
-            shortcut_hint: "x".into(),
-            action: ShortcutAction::CloseSession,
-        },
-        CommandEntry {
-            label: "Next Session".into(),
-            shortcut_hint: "n".into(),
-            action: ShortcutAction::NextSession,
-        },
-        CommandEntry {
-            label: "Previous Session".into(),
-            shortcut_hint: "p".into(),
-            action: ShortcutAction::PrevSession,
-        },
-        CommandEntry {
-            label: "Rename Session".into(),
-            shortcut_hint: ",".into(),
-            action: ShortcutAction::RenameSession,
-        },
-        CommandEntry {
-            label: "Disconnect".into(),
-            shortcut_hint: "d".into(),
-            action: ShortcutAction::Disconnect,
-        },
-        CommandEntry {
-            label: "Signal Menu".into(),
-            shortcut_hint: "k".into(),
-            action: ShortcutAction::ShowSignalMenu,
-        },
-        CommandEntry {
-            label: "Toggle Input Lock".into(),
-            shortcut_hint: "l".into(),
-            action: ShortcutAction::ToggleInputLock,
-        },
-        CommandEntry {
-            label: "Show Help".into(),
-            shortcut_hint: "?".into(),
-            action: ShortcutAction::ShowHelp,
-        },
-        CommandEntry {
-            label: "Toggle HUD".into(),
-            shortcut_hint: "h".into(),
-            action: ShortcutAction::ToggleHud,
-        },
-        CommandEntry {
-            label: "Toggle Snapshot Mode".into(),
-            shortcut_hint: "f".into(),
-            action: ShortcutAction::ToggleSnapshotMode,
-        },
-    ]
+    SHORTCUTS
+        .iter()
+        .map(|s| CommandEntry {
+            label: s.label.to_string(),
+            shortcut_hint: s.palette_key.to_string(),
+            action: s.action.clone(),
+        })
+        .collect()
 }
 
 /// Filter and score commands by a fuzzy query.

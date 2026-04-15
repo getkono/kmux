@@ -19,6 +19,8 @@ use crate::ui;
 mod helpers;
 mod key_handler;
 
+const MAX_RECONNECT_ATTEMPTS: u32 = 5;
+
 /// What `handle_key` returns to the event loop.
 pub(super) enum KeyResult {
     Continue,
@@ -396,10 +398,9 @@ impl App {
                             if self.mgr.connected {
                                 self.mgr.mark_connection_lost();
                                 self.disconnect_at = Some(Instant::now());
-                                const MAX_ATTEMPTS: u32 = 5;
-                                if self.reconnect_attempt >= MAX_ATTEMPTS {
+                                if self.reconnect_attempt >= MAX_RECONNECT_ATTEMPTS {
                                     self.mgr.set_status_msg(format!(
-                                        "Connection lost. Gave up after {MAX_ATTEMPTS} attempts."
+                                        "Connection lost. Gave up after {MAX_RECONNECT_ATTEMPTS} attempts."
                                     ));
                                 } else {
                                     let delay = helpers::backoff_delay(self.reconnect_attempt);
@@ -410,7 +411,7 @@ impl App {
                                         "Connection lost. Reconnecting in {}s… (attempt {}/{})",
                                         delay.as_secs(),
                                         self.reconnect_attempt,
-                                        MAX_ATTEMPTS
+                                        MAX_RECONNECT_ATTEMPTS
                                     ));
                                 }
                                 self.needs_render = true;
@@ -447,8 +448,7 @@ impl App {
                                     .await;
                                 if conn_id_tx.is_none() {
                                     // connect_via_ssh_session failed; schedule next retry.
-                                    const MAX_ATTEMPTS: u32 = 5;
-                                    if self.reconnect_attempt < MAX_ATTEMPTS {
+                                    if self.reconnect_attempt < MAX_RECONNECT_ATTEMPTS {
                                         let delay = helpers::backoff_delay(self.reconnect_attempt);
                                         self.reconnect_attempt += 1;
                                         reconnect_timer =
@@ -482,14 +482,13 @@ impl App {
                         info!("SSH tunnel process exited; triggering reconnect");
                         self.mgr.mark_connection_lost();
                         self.disconnect_at = Some(Instant::now());
-                        const MAX_ATTEMPTS: u32 = 5;
-                        if self.reconnect_attempt < MAX_ATTEMPTS {
+                        if self.reconnect_attempt < MAX_RECONNECT_ATTEMPTS {
                             let delay = helpers::backoff_delay(self.reconnect_attempt);
                             self.reconnect_attempt += 1;
                             reconnect_timer = Some(tokio::time::Instant::now() + delay);
                             self.mgr.set_status_msg(format!(
                                 "SSH tunnel died. Reconnecting in {}s… (attempt {}/{})",
-                                delay.as_secs(), self.reconnect_attempt, MAX_ATTEMPTS
+                                delay.as_secs(), self.reconnect_attempt, MAX_RECONNECT_ATTEMPTS
                             ));
                         } else {
                             self.mgr.set_status_msg(

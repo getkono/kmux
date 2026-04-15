@@ -18,20 +18,13 @@ pub struct Cli {
     pub theme: Option<String>,
 }
 
-/// Arguments for connecting to a server (the default action).
+/// Server addressing arguments shared by the default connect action and
+/// the `list-sessions` subcommand.
 #[derive(Args, Debug)]
-pub struct ConnectArgs {
+pub struct ServerArgs {
     /// Remote server: user@host, user@host:/path, user@host:port, alias
     /// (omit to auto-start and connect to the local daemon)
     pub server: Option<String>,
-
-    /// Auto-attach to a named session (by display name or word_id)
-    #[arg(short, long)]
-    pub session: Option<String>,
-
-    /// Working directory for a new session (used with --session or user@host:/path)
-    #[arg(long)]
-    pub cwd: Option<String>,
 
     /// SSH port to use when connecting to a remote target (overrides hosts.toml)
     #[arg(long)]
@@ -59,6 +52,21 @@ pub struct ConnectArgs {
     pub accept_invalid_certs: bool,
 }
 
+/// Arguments for connecting to a server (the default action).
+#[derive(Args, Debug)]
+pub struct ConnectArgs {
+    #[command(flatten)]
+    pub server_args: ServerArgs,
+
+    /// Auto-attach to a named session (by display name or word_id)
+    #[arg(short, long)]
+    pub session: Option<String>,
+
+    /// Working directory for a new session (used with --session or user@host:/path)
+    #[arg(long)]
+    pub cwd: Option<String>,
+}
+
 #[derive(Subcommand, Debug)]
 pub enum Command {
     /// Manage the local kmux daemon
@@ -70,28 +78,12 @@ pub enum Command {
     /// List sessions on a server without launching the TUI
     #[command(alias = "ls")]
     ListSessions {
-        /// Remote server (user@host, alias from hosts.toml; omit for local daemon)
-        server: Option<String>,
-
-        /// SSH port override
-        #[arg(long)]
-        ssh_port: Option<u16>,
+        #[command(flatten)]
+        server_args: ServerArgs,
 
         /// Output format
         #[arg(long, default_value = "table")]
         format: OutputFormat,
-
-        // Hidden advanced flags for list-sessions
-        #[arg(long, hide = true)]
-        host: Option<String>,
-        #[arg(long, hide = true)]
-        port: Option<u16>,
-        #[arg(long, hide = true)]
-        token: Option<String>,
-        #[arg(long, hide = true)]
-        no_ssh: bool,
-        #[arg(long, hide = true)]
-        accept_invalid_certs: bool,
     },
 }
 

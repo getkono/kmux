@@ -70,24 +70,18 @@ async fn async_main() -> anyhow::Result<()> {
     match cli.command {
         Some(Command::Daemon { action }) => return run_daemon_command(action).await,
         Some(Command::ListSessions {
-            server,
-            ssh_port,
+            server_args,
             format,
-            host,
-            port,
-            token,
-            no_ssh,
-            accept_invalid_certs,
         }) => {
             return run_list_sessions(
-                server.as_deref(),
-                ssh_port,
+                server_args.server.as_deref(),
+                server_args.ssh_port,
                 format,
-                host.as_deref(),
-                port,
-                token.as_deref(),
-                no_ssh,
-                accept_invalid_certs,
+                server_args.host.as_deref(),
+                server_args.port,
+                server_args.token.as_deref(),
+                server_args.no_ssh,
+                server_args.accept_invalid_certs,
             )
             .await;
         }
@@ -103,13 +97,13 @@ async fn async_main() -> anyhow::Result<()> {
         .unwrap_or_default();
 
     let conn = resolve_connection(
-        cli.connect.server.as_deref(),
-        cli.connect.ssh_port,
-        cli.connect.no_ssh,
-        cli.connect.host.as_deref(),
-        cli.connect.port,
-        cli.connect.token.as_deref(),
-        cli.connect.accept_invalid_certs,
+        cli.connect.server_args.server.as_deref(),
+        cli.connect.server_args.ssh_port,
+        cli.connect.server_args.no_ssh,
+        cli.connect.server_args.host.as_deref(),
+        cli.connect.server_args.port,
+        cli.connect.server_args.token.as_deref(),
+        cli.connect.server_args.accept_invalid_certs,
     )
     .await?;
 

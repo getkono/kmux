@@ -39,6 +39,28 @@ pub enum SessionEvent {
 }
 
 impl SessionManager {
+    /// Check that the pane's sequence number is in sync. Returns `true` if
+    /// processing should continue, `false` if the update was discarded/resynced
+    /// (the caller should return immediately on `false`).
+    fn check_pane_sync(&mut self, pane_id: &str, seqno: SequenceNo) -> bool {
+        match self.pane_sync.get(pane_id) {
+            Some(PaneSync::AwaitingSync) => {
+                self.metrics.record_stale_discard(pane_id);
+                false
+            }
+            Some(PaneSync::Synced { expected }) if seqno != *expected => {
+                self.metrics.record_seqno_gap(pane_id, expected.0, seqno.0);
+                self.metrics.record_resync(pane_id, "seqno gap");
+                if let Some(grid) = self.buffers.get_mut(pane_id) {
+                    grid.clear();
+                }
+                self.attach_fresh(pane_id.to_string());
+                false
+            }
+            _ => true,
+        }
+    }
+
     pub fn handle_server_message(&mut self, msg: ServerMessage) -> Vec<SessionEvent> {
         let mut events = Vec::new();
         match msg {
@@ -246,23 +268,9 @@ impl SessionManager {
                 seqno,
                 sent_at_ms,
             } => {
-                match self.pane_sync.get(&pane_id) {
-                    Some(PaneSync::AwaitingSync) => {
-                        self.metrics.record_stale_discard(&pane_id);
-                        return events;
-                    }
-                    Some(PaneSync::Synced { expected }) if seqno != *expected => {
-                        self.metrics.record_seqno_gap(&pane_id, expected.0, seqno.0);
-                        self.metrics.record_resync(&pane_id, "seqno gap");
-                        if let Some(grid) = self.buffers.get_mut(&pane_id) {
-                            grid.clear();
-                        }
-                        self.attach_fresh(pane_id);
-                        return events;
-                    }
-                    _ => {}
+                if !self.check_pane_sync(&pane_id, seqno) {
+                    return events;
                 }
-
                 let start = Instant::now();
                 let diff = Arc::unwrap_or_clone(diff);
                 let op_count = diff.ops.len();
@@ -291,23 +299,9 @@ impl SessionManager {
                 seqno,
                 sent_at_ms,
             } => {
-                match self.pane_sync.get(&pane_id) {
-                    Some(PaneSync::AwaitingSync) => {
-                        self.metrics.record_stale_discard(&pane_id);
-                        return events;
-                    }
-                    Some(PaneSync::Synced { expected }) if seqno != *expected => {
-                        self.metrics.record_seqno_gap(&pane_id, expected.0, seqno.0);
-                        self.metrics.record_resync(&pane_id, "seqno gap");
-                        if let Some(grid) = self.buffers.get_mut(&pane_id) {
-                            grid.clear();
-                        }
-                        self.attach_fresh(pane_id);
-                        return events;
-                    }
-                    _ => {}
+                if !self.check_pane_sync(&pane_id, seqno) {
+                    return events;
                 }
-
                 let start = Instant::now();
                 if let Some(grid) = self.buffers.get_mut(&pane_id) {
                     grid.apply_cursor_update(cursor, modes);
@@ -332,7 +326,8 @@ impl SessionManager {
 
             ServerMessage::Event {
                 event: SessionEventMsg::SessionRenamed { word_id, new_name },
-            } => {
+            }
+            | ServerMessage::SessionRenamed { word_id, new_name } => {
                 for entry in &mut self.session_list {
                     if entry.meta.word_id == word_id {
                         entry.meta.name = new_name.clone();
@@ -359,16 +354,6 @@ impl SessionManager {
             ServerMessage::Error { message, .. } => {
                 self.status_msg = format!("Error: {message}");
                 events.push(SessionEvent::ServerError { message });
-            }
-
-            ServerMessage::SessionRenamed { word_id, new_name } => {
-                for entry in &mut self.session_list {
-                    if entry.meta.word_id == word_id {
-                        entry.meta.name = new_name.clone();
-                        break;
-                    }
-                }
-                events.push(SessionEvent::SessionRenamed { word_id, new_name });
             }
 
             ServerMessage::InputLockGranted { pane_id } => {
