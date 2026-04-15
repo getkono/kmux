@@ -123,80 +123,31 @@ impl ServerApp {
         size: TermSize,
         seed_caps: &ClientCapabilities,
     ) -> Result<PaneId> {
-        let mut sessions = self.sessions.write().await;
-        let state = sessions
-            .get_mut(word_id)
-            .ok_or_else(|| KmuxError::SessionNotFound {
-                name: word_id.to_string(),
-            })?;
-
-        let pane_index = state.next_pane_index;
-        state.next_pane_index += 1;
-        let pane_id = format!("{word_id}/{pane_index}");
-
-        let cwd = PathBuf::from(&state.meta.cwd);
-        let effective_cwd = resolve_cwd(&cwd);
-
-        // Drop the write lock before spawning (IO)
-        let prog = match program {
-            Some(ref p) => p.clone(),
-            None => kmux_pty::shell::detect_shell()?,
+        // Grab pane index and CWD with a short write lock, then drop it before IO.
+        let (pane_index, pane_id, effective_cwd) = {
+            let mut sessions = self.sessions.write().await;
+            let state = sessions
+                .get_mut(word_id)
+                .ok_or_else(|| KmuxError::SessionNotFound {
+                    name: word_id.to_string(),
+                })?;
+            let pane_index = state.next_pane_index;
+            state.next_pane_index += 1;
+            let pane_id = format!("{word_id}/{pane_index}");
+            let effective_cwd = resolve_cwd(&PathBuf::from(&state.meta.cwd));
+            (pane_index, pane_id, effective_cwd)
         };
-        let resolved_cwd_clone = effective_cwd.clone();
-        drop(sessions);
 
-        let (kg_init, kk_init) = intersect_for_atomics([seed_caps]);
-        let kitty_graphics_enabled = Arc::new(AtomicBool::new(kg_init));
-        let kitty_keyboard_enabled = Arc::new(AtomicBool::new(kk_init));
-
-        let config = PtyConfig::new(&prog)
-            .args(args.clone())
-            .size(size.rows, size.cols)
-            .cwd(resolved_cwd_clone)
-            .env(
-                EnvBuilder::new()
-                    .auto_term(false)
-                    .extend(pane_spawn_env(seed_caps)),
-            );
-        self.manager.spawn(&pane_id, &config).await?;
-
-        let session = self.manager.get_session(&pane_id).await?;
-        let (reader, writer) = session.split().await?;
-
-        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        let scrollback = Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY)));
-        let term_state = Arc::new(Mutex::new(new_term_state(
-            size.rows,
-            size.cols,
-            kitty_graphics_enabled.clone(),
-            kitty_keyboard_enabled.clone(),
-        )));
-        let seqno_counter = Arc::new(AtomicU64::new(1));
-
-        let task = tokio::spawn(session_diff_loop(
-            reader,
-            pane_id.clone(),
-            clients.clone(),
-            scrollback.clone(),
-            term_state.clone(),
-            seqno_counter.clone(),
-        ));
-
-        let relay = PaneRelay {
-            clients,
-            writer,
-            _task: task,
-            program: prog,
-            args: args.clone(),
-            size,
-            scrollback,
-            term_state,
-            seqno_counter,
-            input_mode: InputMode::Open,
-            status: SessionStatus::Running,
-            kitty_graphics_enabled,
-            kitty_keyboard_enabled,
-        };
+        let relay = self
+            .spawn_pane_relay(
+                &pane_id,
+                program,
+                args,
+                size,
+                Some(&effective_cwd),
+                seed_caps,
+            )
+            .await?;
 
         let mut sessions = self.sessions.write().await;
         let state = sessions

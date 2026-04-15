@@ -8,6 +8,80 @@ use crate::app::App;
 use crate::mode;
 use crate::theme::Theme;
 
+/// Centre a `width × height` popup within `area`.
+fn centered_overlay(area: Rect, width: u16, height: u16) -> Rect {
+    let x = area.width.saturating_sub(width) / 2;
+    let y = area.height.saturating_sub(height) / 2;
+    Rect::new(x, y, width, height)
+}
+
+/// Pre-formatted item for `render_list_picker`.
+struct PickerItem {
+    text: String,
+    style: Style,
+}
+
+/// Render a generic search-input + list picker overlay.
+///
+/// Clears the overlay area, draws an input line (`input_label` + `input_text` + cursor),
+/// a separator, the item list (or `empty_msg` when empty), and a titled border.
+#[allow(clippy::too_many_arguments)]
+fn render_list_picker(
+    f: &mut Frame,
+    overlay_area: Rect,
+    theme: &Theme,
+    title: &str,
+    border_color: Color,
+    input_label: &str,
+    input_text: &str,
+    items: &[PickerItem],
+    empty_msg: &str,
+) {
+    f.render_widget(Clear, overlay_area);
+    let inner_width = overlay_area.width.saturating_sub(2) as usize;
+
+    let mut lines = vec![];
+    lines.push(Line::from(vec![
+        Span::styled(input_label, Style::default().fg(theme.fg_dim).bg(theme.bg)),
+        Span::styled(
+            format!("{input_text}_"),
+            Style::default().fg(theme.fg).bg(theme.bg),
+        ),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "\u{2500}".repeat(inner_width),
+        Style::default().fg(theme.fg_dim).bg(theme.bg),
+    )));
+    if items.is_empty() {
+        lines.push(Line::from(Span::styled(
+            empty_msg,
+            Style::default().fg(theme.fg_dim).bg(theme.bg),
+        )));
+    } else {
+        for item in items {
+            let text: String = item
+                .text
+                .chars()
+                .take(inner_width.saturating_sub(1))
+                .collect();
+            lines.push(Line::from(Span::styled(text, item.style)));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(Span::styled(
+            title,
+            Style::default()
+                .fg(border_color)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg));
+
+    f.render_widget(Paragraph::new(lines).block(block), overlay_area);
+}
+
 pub(super) fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let search = &app.session_picker_search;
@@ -24,167 +98,92 @@ pub(super) fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &App
         })
         .collect();
 
-    let visible_rows = matches.len().min(8) as u16;
     let width = 52u16.min(area.width.saturating_sub(4));
-    // search row + separator + entries + border
-    let height = (visible_rows + 4).min(area.height.saturating_sub(2));
-    let x = area.width.saturating_sub(width) / 2;
-    let y = area.height.saturating_sub(height) / 2;
-    let overlay_area = Rect::new(x, y, width, height);
+    let height = (matches.len().min(8) as u16 + 4).min(area.height.saturating_sub(2));
+    let overlay_area = centered_overlay(area, width, height);
 
-    f.render_widget(Clear, overlay_area);
-
-    let inner_width = width.saturating_sub(2) as usize;
-
-    let mut lines = vec![];
-
-    // Search line
-    lines.push(Line::from(vec![
-        Span::styled(" Search: ", Style::default().fg(theme.fg_dim).bg(theme.bg)),
-        Span::styled(
-            format!("{search}_"),
-            Style::default().fg(theme.fg).bg(theme.bg),
-        ),
-    ]));
-
-    // Separator
-    lines.push(Line::from(Span::styled(
-        "\u{2500}".repeat(inner_width),
-        Style::default().fg(theme.fg_dim).bg(theme.bg),
-    )));
-
-    if matches.is_empty() {
-        lines.push(Line::from(Span::styled(
-            " (no results) ",
-            Style::default().fg(theme.fg_dim).bg(theme.bg),
-        )));
-    } else {
-        for (i, entry) in matches.iter().enumerate() {
-            if i >= 8 {
-                break;
-            }
+    let items: Vec<PickerItem> = matches
+        .iter()
+        .take(8)
+        .enumerate()
+        .map(|(i, entry)| {
             let is_selected = i == app.session_picker_selected;
             let cursor = if is_selected { ">" } else { " " };
             let name = app.mgr.display_name_for(&entry.meta.word_id);
-            let cwd = &entry.meta.cwd;
             let pane_count = entry.panes.len();
+            PickerItem {
+                text: format!("{cursor} {name:<20} {pane_count}p  {}", entry.meta.cwd),
+                style: if is_selected {
+                    Style::default()
+                        .fg(theme.bg)
+                        .bg(theme.accent)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.fg).bg(theme.bg)
+                },
+            }
+        })
+        .collect();
 
-            let row_text = format!("{cursor} {name:<20} {pane_count}p  {cwd}");
-            let row_text: String = row_text
-                .chars()
-                .take(inner_width.saturating_sub(1))
-                .collect();
-
-            let style = if is_selected {
-                Style::default()
-                    .fg(theme.bg)
-                    .bg(theme.accent)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.fg).bg(theme.bg)
-            };
-            lines.push(Line::from(Span::styled(row_text, style)));
-        }
-    }
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .title(Span::styled(
-            " Sessions ",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().bg(theme.bg));
-
-    f.render_widget(Paragraph::new(lines).block(block), overlay_area);
+    render_list_picker(
+        f,
+        overlay_area,
+        theme,
+        " Sessions ",
+        theme.accent,
+        " Search: ",
+        search,
+        &items,
+        " (no results) ",
+    );
 }
 
 pub(super) fn render_server_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let search = &app.server_picker_search;
-    let search_lower = search.to_lowercase();
 
     let servers = app.filtered_servers();
-    let visible_rows = servers.len().min(8) as u16;
     let width = 60u16.min(area.width.saturating_sub(4));
-    // search row + separator + entries + border
-    let height = (visible_rows + 4).min(area.height.saturating_sub(2));
-    let x = area.width.saturating_sub(width) / 2;
-    let y = area.height.saturating_sub(height) / 2;
-    let overlay_area = Rect::new(x, y, width, height);
+    let height = (servers.len().min(8) as u16 + 4).min(area.height.saturating_sub(2));
+    let overlay_area = centered_overlay(area, width, height);
 
-    f.render_widget(Clear, overlay_area);
-
-    let inner_width = width.saturating_sub(2) as usize;
-    let _ = search_lower; // search filtering already done in filtered_servers()
-
-    let mut lines = vec![];
-
-    // Search line
-    lines.push(Line::from(vec![
-        Span::styled(" Search: ", Style::default().fg(theme.fg_dim).bg(theme.bg)),
-        Span::styled(
-            format!("{search}_"),
-            Style::default().fg(theme.fg).bg(theme.bg),
-        ),
-    ]));
-
-    // Separator
-    lines.push(Line::from(Span::styled(
-        "\u{2500}".repeat(inner_width),
-        Style::default().fg(theme.fg_dim).bg(theme.bg),
-    )));
-
-    if servers.is_empty() {
-        lines.push(Line::from(Span::styled(
-            " (no recent servers) ",
-            Style::default().fg(theme.fg_dim).bg(theme.bg),
-        )));
-    } else {
-        for (i, server) in servers.iter().enumerate() {
-            if i >= 8 {
-                break;
-            }
+    let items: Vec<PickerItem> = servers
+        .iter()
+        .take(8)
+        .enumerate()
+        .map(|(i, server)| {
             let is_selected = i == app.server_picker_selected;
             let cursor = if is_selected { ">" } else { " " };
-            let session_count = server.sessions.len();
-            let time_ago = server.time_ago();
+            PickerItem {
+                text: format!(
+                    "{cursor} {:<28} {}s  {}",
+                    server.display,
+                    server.sessions.len(),
+                    server.time_ago()
+                ),
+                style: if is_selected {
+                    Style::default()
+                        .fg(theme.bg)
+                        .bg(theme.purple)
+                        .add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(theme.fg).bg(theme.bg)
+                },
+            }
+        })
+        .collect();
 
-            let row_text = format!(
-                "{cursor} {:<28} {}s  {}",
-                server.display, session_count, time_ago
-            );
-            let row_text: String = row_text
-                .chars()
-                .take(inner_width.saturating_sub(1))
-                .collect();
-
-            let style = if is_selected {
-                Style::default()
-                    .fg(theme.bg)
-                    .bg(theme.purple)
-                    .add_modifier(Modifier::BOLD)
-            } else {
-                Style::default().fg(theme.fg).bg(theme.bg)
-            };
-            lines.push(Line::from(Span::styled(row_text, style)));
-        }
-    }
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.purple))
-        .title(Span::styled(
-            " Servers ",
-            Style::default()
-                .fg(theme.purple)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().bg(theme.bg));
-
-    f.render_widget(Paragraph::new(lines).block(block), overlay_area);
+    render_list_picker(
+        f,
+        overlay_area,
+        theme,
+        " Servers ",
+        theme.purple,
+        " Search: ",
+        search,
+        &items,
+        " (no recent servers) ",
+    );
 }
 
 pub(super) fn render_dir_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
@@ -194,72 +193,35 @@ pub(super) fn render_dir_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
     let matches = app.dir_picker_matches();
     let selected = app.dir_picker_selected.min(matches.len().saturating_sub(1));
 
-    let visible_rows = matches.len().min(6) as u16;
     let width = 60u16.min(area.width.saturating_sub(4));
-    // input row + separator + entries + border
-    let height = (visible_rows + 5).min(area.height.saturating_sub(2));
-    let x = area.width.saturating_sub(width) / 2;
-    let y = area.height.saturating_sub(height) / 2;
-    let overlay_area = Rect::new(x, y, width, height);
+    let height = (matches.len().min(6) as u16 + 5).min(area.height.saturating_sub(2));
+    let overlay_area = centered_overlay(area, width, height);
 
-    f.render_widget(Clear, overlay_area);
-
-    let inner_width = width.saturating_sub(2) as usize;
-
-    let mut lines = vec![];
-
-    // Input line
-    lines.push(Line::from(vec![
-        Span::styled(
-            " Directory: ",
-            Style::default().fg(theme.fg_dim).bg(theme.bg),
-        ),
-        Span::styled(
-            format!("{buffer}_"),
-            Style::default().fg(theme.fg).bg(theme.bg),
-        ),
-    ]));
-
-    // Separator
-    lines.push(Line::from(Span::styled(
-        "\u{2500}".repeat(inner_width),
-        Style::default().fg(theme.fg_dim).bg(theme.bg),
-    )));
-
-    if matches.is_empty() {
-        lines.push(Line::from(Span::styled(
-            " (no existing sessions — Enter to create new) ",
-            Style::default().fg(theme.fg_dim).bg(theme.bg),
-        )));
-    } else {
-        for (i, entry) in matches.iter().take(6).enumerate() {
+    let items: Vec<PickerItem> = matches
+        .iter()
+        .take(6)
+        .enumerate()
+        .map(|(i, entry)| {
             let name = app.mgr.display_name_for(&entry.meta.word_id);
-            let cwd = &entry.meta.cwd;
             let marker = if i == selected { ">" } else { " " };
-            let row_text = format!("{marker} {name:<16} {cwd}");
-            let row_text: String = row_text
-                .chars()
-                .take(inner_width.saturating_sub(1))
-                .collect();
-            lines.push(Line::from(Span::styled(
-                row_text,
-                Style::default().fg(theme.fg).bg(theme.bg),
-            )));
-        }
-    }
+            PickerItem {
+                text: format!("{marker} {name:<16} {}", entry.meta.cwd),
+                style: Style::default().fg(theme.fg).bg(theme.bg),
+            }
+        })
+        .collect();
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme.accent))
-        .title(Span::styled(
-            " Open Session ",
-            Style::default()
-                .fg(theme.accent)
-                .add_modifier(Modifier::BOLD),
-        ))
-        .style(Style::default().bg(theme.bg));
-
-    f.render_widget(Paragraph::new(lines).block(block), overlay_area);
+    render_list_picker(
+        f,
+        overlay_area,
+        theme,
+        " Open Session ",
+        theme.accent,
+        " Directory: ",
+        buffer,
+        &items,
+        " (no existing sessions — Enter to create new) ",
+    );
 }
 
 pub(super) fn render_help_overlay(f: &mut Frame, area: Rect, theme: &Theme) {

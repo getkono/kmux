@@ -85,48 +85,22 @@ impl SessionManager {
         self.select_pane(panes[new_idx].clone());
     }
 
-    /// Create a new session. The server assigns the word_id and CWD defaults to
-    /// the client's current working directory.
-    pub fn create_session(&mut self, size: TermSize) {
+    /// Create a new session.
+    ///
+    /// `name` — optional display name; defaults to the basename of `cwd`.
+    /// `cwd`  — optional working directory; defaults to the client's current directory.
+    pub fn create_session(&mut self, name: Option<&str>, cwd: Option<&str>, size: TermSize) {
         if self.ws_sender.is_some() {
             let rid = self.next_rid();
-            let cwd = std::env::current_dir()
-                .ok()
-                .and_then(|p| p.to_str().map(|s| s.to_string()));
-            self.send_ws(ClientMessage::SessionCreate {
-                request_id: rid,
-                name: None,
-                cwd,
-                program: None,
-                args: vec![],
-                size,
+            let resolved_cwd = cwd.map(|c| c.to_string()).or_else(|| {
+                std::env::current_dir()
+                    .ok()
+                    .and_then(|p| p.to_str().map(|s| s.to_string()))
             });
-        }
-    }
-
-    /// Create a new session with an explicit working directory.
-    pub fn create_session_with_cwd(&mut self, cwd: &str, size: TermSize) {
-        if self.ws_sender.is_some() {
-            let rid = self.next_rid();
             self.send_ws(ClientMessage::SessionCreate {
                 request_id: rid,
-                name: None,
-                cwd: Some(cwd.to_string()),
-                program: None,
-                args: vec![],
-                size,
-            });
-        }
-    }
-
-    /// Create a new session with an explicit name and working directory.
-    pub fn create_session_with_name_and_cwd(&mut self, name: &str, cwd: &str, size: TermSize) {
-        if self.ws_sender.is_some() {
-            let rid = self.next_rid();
-            self.send_ws(ClientMessage::SessionCreate {
-                request_id: rid,
-                name: Some(name.to_string()),
-                cwd: Some(cwd.to_string()),
+                name: name.map(|n| n.to_string()),
+                cwd: resolved_cwd,
                 program: None,
                 args: vec![],
                 size,

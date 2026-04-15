@@ -1,8 +1,16 @@
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use kmux_client::connect::ConnectResult;
+use kmux_client::quic_probe;
 use kmux_client::session_manager::SessionEvent;
-use kmux_protocol::messages::{PROTOCOL_VERSION, SessionEntry, TermSize};
-use tracing::info;
+use kmux_client::ssh::SshSession;
+use kmux_client::tcp_connect;
+use kmux_client::transport::TransportKind;
+use kmux_protocol::messages::{
+    ConnectionId, PROTOCOL_VERSION, ServerMessage, SessionEntry, TermSize,
+};
+use tokio::sync::mpsc;
+use tracing::{info, warn};
 
 use crate::mode::{ConnectField, Mode};
 use crate::recent_servers::RecentServer;
@@ -64,14 +72,14 @@ impl App {
                     .take()
                     .unwrap_or_else(|| self.initial_cwd.clone());
                 self.mgr
-                    .create_session_with_name_and_cwd(&session_name, &cwd, size);
+                    .create_session(Some(&session_name), Some(&cwd), size);
             }
         } else if let Some(cwd) = self.auto_cwd.take() {
             // :path or --cwd was given without --session.
             if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
                 self.mgr.select_session(word_id);
             } else {
-                self.mgr.create_session_with_cwd(&cwd, size);
+                self.mgr.create_session(None, Some(&cwd), size);
             }
         } else if self.is_local {
             // Local mode: match by cwd or create.
@@ -79,7 +87,7 @@ impl App {
             if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
                 self.mgr.select_session(word_id);
             } else {
-                self.mgr.create_session_with_cwd(&cwd, size);
+                self.mgr.create_session(None, Some(&cwd), size);
             }
         } else {
             // Remote without --session or path: show directory picker.
@@ -111,6 +119,82 @@ impl App {
             .iter()
             .filter(|e| lower.is_empty() || e.meta.cwd.to_lowercase().contains(&lower))
             .collect()
+    }
+
+    /// Connect to kmuxd via an already-negotiated SSH tunnel.
+    ///
+    /// Calls `tcp_connect::connect_tcp`, and on success:
+    /// - sets the WebSocket sender and transport kind to TCP
+    /// - spawns a tunnel health monitor task
+    /// - spawns a background QUIC upgrade probe
+    ///
+    /// Returns the oneshot sender used to deliver the `ConnectionId` to the QUIC
+    /// probe once TCP auth completes, or `None` if the TCP connection failed.
+    pub(super) async fn connect_via_ssh_session(
+        &mut self,
+        ssh: SshSession,
+        srv_tx: mpsc::UnboundedSender<ServerMessage>,
+        upgrade_tx: mpsc::Sender<quic_probe::UpgradeReady>,
+        tunnel_died_tx: mpsc::Sender<()>,
+        connection_id: Option<ConnectionId>,
+    ) -> Option<tokio::sync::oneshot::Sender<ConnectionId>> {
+        let tcp_result = tcp_connect::connect_tcp(
+            "127.0.0.1".to_string(),
+            ssh.local_tcp_port,
+            ssh.token.clone(),
+            srv_tx.clone(),
+            self.mgr.capabilities().clone(),
+            connection_id,
+        )
+        .await;
+
+        match tcp_result {
+            ConnectResult::Connected(sender) => {
+                self.mgr.set_ws_sender(sender);
+                self.mgr.current_transport = TransportKind::Tcp;
+                info!("Connected via SSH tunnel (TCP transport)");
+
+                // Spawn tunnel health monitor.
+                let mut tunnel_proc = ssh.tunnel_process;
+                let monitor_died_tx = tunnel_died_tx.clone();
+                tokio::spawn(async move {
+                    let _ = tunnel_proc.wait().await;
+                    let _ = monitor_died_tx.send(()).await;
+                });
+
+                // Spawn QUIC upgrade probe.
+                let quic_host = ssh.remote_host.clone();
+                let quic_port = ssh.quic_port;
+                let token = ssh.token.clone();
+                let capabilities = self.mgr.capabilities().clone();
+                let accept_invalid = self.mgr.accept_invalid_certs();
+                let (conn_id_tx, conn_id_rx) = tokio::sync::oneshot::channel::<ConnectionId>();
+                tokio::spawn(async move {
+                    if let Ok(conn_id) = conn_id_rx.await {
+                        quic_probe::quic_upgrade_loop(quic_probe::QuicProbeParams {
+                            remote_host: quic_host,
+                            quic_port,
+                            token,
+                            connection_id: conn_id,
+                            capabilities,
+                            accept_invalid_certs: accept_invalid,
+                            srv_tx,
+                            upgrade_tx,
+                            max_failures: 10,
+                        })
+                        .await;
+                    }
+                });
+
+                Some(conn_id_tx)
+            }
+            ConnectResult::Failed(e) => {
+                warn!("SSH TCP connection failed: {e}");
+                self.mgr
+                    .set_status_msg(format!("SSH connection failed: {e}"));
+                None
+            }
+        }
     }
 
     /// Query the current terminal size, accounting for UI chrome (3 rows).

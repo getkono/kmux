@@ -5,7 +5,7 @@ use tracing::warn;
 
 use super::ServerApp;
 use super::attach::InputLockOutcome;
-use super::helpers::parse_pane_id;
+use super::helpers::{get_pane_relay, get_pane_relay_mut};
 
 impl ServerApp {
     /// Forward user input bytes to a pane's PTY stdin.
@@ -15,22 +15,8 @@ impl ServerApp {
         client_id: ClientId,
         data: Vec<u8>,
     ) -> Result<()> {
-        let (word_id, pane_index) =
-            parse_pane_id(pane_id).ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
         let sessions = self.sessions.read().await;
-        let state = sessions
-            .get(word_id)
-            .ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
-        let relay = state
-            .panes
-            .get(&pane_index)
-            .ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
+        let relay = get_pane_relay(&sessions, pane_id)?;
         match &relay.input_mode {
             InputMode::Open => {}
             InputMode::Locked(holder) if *holder == client_id => {}
@@ -48,22 +34,8 @@ impl ServerApp {
         client_id: ClientId,
         data: String,
     ) -> Result<()> {
-        let (word_id, pane_index) =
-            parse_pane_id(pane_id).ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
         let sessions = self.sessions.read().await;
-        let state = sessions
-            .get(word_id)
-            .ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
-        let relay = state
-            .panes
-            .get(&pane_index)
-            .ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
+        let relay = get_pane_relay(&sessions, pane_id)?;
         match &relay.input_mode {
             InputMode::Open => {}
             InputMode::Locked(holder) if *holder == client_id => {}
@@ -91,22 +63,17 @@ impl ServerApp {
         };
         self.manager.resize(pane_id, ws).await?;
 
-        let (word_id, pane_index) =
-            parse_pane_id(pane_id).ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
         let mut sessions = self.sessions.write().await;
-        if let Some(state) = sessions.get_mut(word_id) {
-            if let Some(relay) = state.panes.get_mut(&pane_index) {
+        match get_pane_relay_mut(&mut sessions, pane_id) {
+            Ok(relay) => {
                 relay.size = size;
                 relay
                     .term_state
                     .lock()
                     .unwrap()
                     .resize(size.rows, size.cols);
-            } else {
-                warn!("resize: pane '{pane_id}' not found after resize");
             }
+            Err(_) => warn!("resize: pane '{pane_id}' not found after resize"),
         }
         Ok(())
     }
@@ -125,22 +92,8 @@ impl ServerApp {
         pane_id: &str,
         client_id: ClientId,
     ) -> Result<InputLockOutcome> {
-        let (word_id, pane_index) =
-            parse_pane_id(pane_id).ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
         let mut sessions = self.sessions.write().await;
-        let state = sessions
-            .get_mut(word_id)
-            .ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
-        let relay = state
-            .panes
-            .get_mut(&pane_index)
-            .ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
+        let relay = get_pane_relay_mut(&mut sessions, pane_id)?;
         match &relay.input_mode {
             InputMode::Open => {
                 relay.input_mode = InputMode::Locked(client_id);
@@ -156,22 +109,8 @@ impl ServerApp {
 
     /// Release the input lock held by `client_id` on `pane_id`.
     pub async fn release_input_lock(&self, pane_id: &str, client_id: ClientId) -> Result<bool> {
-        let (word_id, pane_index) =
-            parse_pane_id(pane_id).ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
         let mut sessions = self.sessions.write().await;
-        let state = sessions
-            .get_mut(word_id)
-            .ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
-        let relay = state
-            .panes
-            .get_mut(&pane_index)
-            .ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
+        let relay = get_pane_relay_mut(&mut sessions, pane_id)?;
         if relay.input_mode == InputMode::Locked(client_id) {
             relay.input_mode = InputMode::Open;
             Ok(true)

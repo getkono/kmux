@@ -292,16 +292,27 @@ fn resolve_rename(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     }
 }
 
-fn resolve_session_picker(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+/// Generic picker key resolver. `close`, `select`, `up`, `down`, `backspace`
+/// produce the mode transition / action for those keys. `char_action` maps typed
+/// characters to their picker-specific action variant.
+fn resolve_picker(
+    key: &Key,
+    close: Action,
+    select: Action,
+    up: Action,
+    down: Action,
+    backspace: Action,
+    char_action: fn(char) -> Action,
+) -> (Option<Mode>, Action) {
     match key {
-        Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::CloseSessionPicker),
-        Key::Named(NamedKey::Enter) => (Some(Mode::Normal), Action::SelectPickerEntry),
-        Key::Named(NamedKey::ArrowUp) => (None, Action::PickerUp),
-        Key::Named(NamedKey::ArrowDown) => (None, Action::PickerDown),
-        Key::Named(NamedKey::Backspace) => (None, Action::PickerSearchBackspace),
+        Key::Named(NamedKey::Escape) => (Some(Mode::Normal), close),
+        Key::Named(NamedKey::Enter) => (Some(Mode::Normal), select),
+        Key::Named(NamedKey::ArrowUp) => (None, up),
+        Key::Named(NamedKey::ArrowDown) => (None, down),
+        Key::Named(NamedKey::Backspace) => (None, backspace),
         Key::Character(c) => {
             if let Some(ch) = c.chars().next() {
-                (None, Action::PickerSearchChar(ch))
+                (None, char_action(ch))
             } else {
                 (None, Action::None)
             }
@@ -310,22 +321,28 @@ fn resolve_session_picker(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action)
     }
 }
 
+fn resolve_session_picker(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+    resolve_picker(
+        key,
+        Action::CloseSessionPicker,
+        Action::SelectPickerEntry,
+        Action::PickerUp,
+        Action::PickerDown,
+        Action::PickerSearchBackspace,
+        Action::PickerSearchChar,
+    )
+}
+
 fn resolve_server_picker(key: &Key) -> (Option<Mode>, Action) {
-    match key {
-        Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::ServerPickerClose),
-        Key::Named(NamedKey::Enter) => (Some(Mode::Normal), Action::ServerPickerSelect),
-        Key::Named(NamedKey::ArrowUp) => (None, Action::ServerPickerUp),
-        Key::Named(NamedKey::ArrowDown) => (None, Action::ServerPickerDown),
-        Key::Named(NamedKey::Backspace) => (None, Action::ServerPickerBackspace),
-        Key::Character(c) => {
-            if let Some(ch) = c.chars().next() {
-                (None, Action::ServerPickerChar(ch))
-            } else {
-                (None, Action::None)
-            }
-        }
-        _ => (None, Action::None),
-    }
+    resolve_picker(
+        key,
+        Action::ServerPickerClose,
+        Action::ServerPickerSelect,
+        Action::ServerPickerUp,
+        Action::ServerPickerDown,
+        Action::ServerPickerBackspace,
+        Action::ServerPickerChar,
+    )
 }
 
 fn resolve_help(key: &Key) -> (Option<Mode>, Action) {
@@ -335,21 +352,15 @@ fn resolve_help(key: &Key) -> (Option<Mode>, Action) {
 }
 
 fn resolve_dir_picker(key: &Key) -> (Option<Mode>, Action) {
-    match key {
-        Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::DirPickerCancel),
-        Key::Named(NamedKey::Enter) => (Some(Mode::Normal), Action::DirPickerSubmit),
-        Key::Named(NamedKey::Backspace) => (None, Action::DirPickerBackspace),
-        Key::Named(NamedKey::ArrowUp) => (None, Action::DirPickerUp),
-        Key::Named(NamedKey::ArrowDown) => (None, Action::DirPickerDown),
-        Key::Character(c) => {
-            if let Some(ch) = c.chars().next() {
-                (None, Action::DirPickerChar(ch))
-            } else {
-                (None, Action::None)
-            }
-        }
-        _ => (None, Action::None),
-    }
+    resolve_picker(
+        key,
+        Action::DirPickerCancel,
+        Action::DirPickerSubmit,
+        Action::DirPickerUp,
+        Action::DirPickerDown,
+        Action::DirPickerBackspace,
+        Action::DirPickerChar,
+    )
 }
 
 fn resolve_connect(key: &Key, mods: Modifiers, _field: &ConnectField) -> (Option<Mode>, Action) {

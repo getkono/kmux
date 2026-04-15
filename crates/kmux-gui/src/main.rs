@@ -1,4 +1,5 @@
 mod app;
+mod key_convert;
 mod session_bar;
 mod shortcut;
 mod status_bar;

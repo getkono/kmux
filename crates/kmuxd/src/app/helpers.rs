@@ -1,4 +1,53 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+
+use kmux_pty::error::{KmuxError, Result};
+
+use super::{PaneRelay, SessionState};
+
+/// Look up a pane relay by `pane_id` in a read-locked sessions map.
+pub(super) fn get_pane_relay<'a>(
+    sessions: &'a HashMap<String, SessionState>,
+    pane_id: &str,
+) -> Result<&'a PaneRelay> {
+    let (word_id, pane_index) =
+        parse_pane_id(pane_id).ok_or_else(|| KmuxError::SessionNotFound {
+            name: pane_id.to_string(),
+        })?;
+    let state = sessions
+        .get(word_id)
+        .ok_or_else(|| KmuxError::SessionNotFound {
+            name: pane_id.to_string(),
+        })?;
+    state
+        .panes
+        .get(&pane_index)
+        .ok_or_else(|| KmuxError::SessionNotFound {
+            name: pane_id.to_string(),
+        })
+}
+
+/// Look up a pane relay mutably by `pane_id` in a write-locked sessions map.
+pub(super) fn get_pane_relay_mut<'a>(
+    sessions: &'a mut HashMap<String, SessionState>,
+    pane_id: &str,
+) -> Result<&'a mut PaneRelay> {
+    let (word_id, pane_index) =
+        parse_pane_id(pane_id).ok_or_else(|| KmuxError::SessionNotFound {
+            name: pane_id.to_string(),
+        })?;
+    let state = sessions
+        .get_mut(word_id)
+        .ok_or_else(|| KmuxError::SessionNotFound {
+            name: pane_id.to_string(),
+        })?;
+    state
+        .panes
+        .get_mut(&pane_index)
+        .ok_or_else(|| KmuxError::SessionNotFound {
+            name: pane_id.to_string(),
+        })
+}
 
 /// Parse a pane ID `"{word_id}/{pane_index}"` into its components.
 pub fn parse_pane_id(pane_id: &str) -> Option<(&str, u32)> {

@@ -36,7 +36,8 @@ impl App {
                 }
             }
             Action::CreateSession => {
-                self.mgr.create_session(Self::current_term_size());
+                self.mgr
+                    .create_session(None, None, Self::current_term_size());
             }
             Action::CreatePane => {
                 self.mgr.create_pane(Self::current_term_size());
@@ -342,7 +343,7 @@ impl App {
                             self.mgr.select_session(word_id);
                         } else {
                             self.mgr
-                                .create_session_with_cwd(&cwd, Self::current_term_size());
+                                .create_session(None, Some(&cwd), Self::current_term_size());
                         }
                     }
                 }

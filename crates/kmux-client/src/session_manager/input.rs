@@ -3,17 +3,29 @@ use kmux_protocol::messages::{ClientMessage, TermSize};
 use super::SessionManager;
 
 impl SessionManager {
+    /// Returns `Ok(pane_id)` if input is allowed on the active pane, or sets
+    /// `status_msg` and returns `Err(false)` if the pane is locked.
+    fn active_pane_unlocked(&mut self) -> Result<String, bool> {
+        let pane_id = match self.active_pane.clone() {
+            Some(p) => p,
+            None => return Err(true),
+        };
+        if self.input_locked.get(&pane_id).copied().unwrap_or(false) {
+            self.status_msg = "Input locked on this pane".to_string();
+            return Err(false);
+        }
+        Ok(pane_id)
+    }
+
     /// Send raw PTY input bytes for the active pane.
     pub fn send_input(&mut self, data: Vec<u8>) -> bool {
-        if let Some(pane_id) = self.active_pane.clone() {
-            let locked = self.input_locked.get(&pane_id).copied().unwrap_or(false);
-            if locked {
-                self.status_msg = "Input locked on this pane".to_string();
-                return false;
+        match self.active_pane_unlocked() {
+            Ok(pane_id) => {
+                self.send_ws(ClientMessage::PtyInput { pane_id, data });
+                true
             }
-            self.send_ws(ClientMessage::PtyInput { pane_id, data });
+            Err(ok) => ok,
         }
-        true
     }
 
     /// Send a paste string for the active pane.
@@ -21,18 +33,16 @@ impl SessionManager {
         if text.is_empty() {
             return true;
         }
-        if let Some(pane_id) = self.active_pane.clone() {
-            let locked = self.input_locked.get(&pane_id).copied().unwrap_or(false);
-            if locked {
-                self.status_msg = "Input locked on this pane".to_string();
-                return false;
+        match self.active_pane_unlocked() {
+            Ok(pane_id) => {
+                self.send_ws(ClientMessage::PtyPaste {
+                    pane_id,
+                    data: text,
+                });
+                true
             }
-            self.send_ws(ClientMessage::PtyPaste {
-                pane_id,
-                data: text,
-            });
+            Err(ok) => ok,
         }
-        true
     }
 
     /// Send a resize event for the given pane and resize the local buffer.

@@ -98,7 +98,8 @@ impl kmuxApp {
                     return Task::none();
                 }
                 self.mgr.set_status_msg("Creating session...".to_string());
-                self.mgr.create_session(self.current_term_size());
+                self.mgr
+                    .create_session(None, None, self.current_term_size());
                 Task::none()
             }
 

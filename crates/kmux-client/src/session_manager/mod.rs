@@ -540,7 +540,7 @@ mod tests {
     #[test]
     fn create_session_with_cwd_sends_correct_message() {
         let (mut mgr, mut rx) = make_connected_manager();
-        mgr.create_session_with_cwd("/my/custom/dir", TermSize::default());
+        mgr.create_session(None, Some("/my/custom/dir"), TermSize::default());
 
         match rx.try_recv().expect("message sent") {
             ClientMessage::SessionCreate { cwd, .. } => {
@@ -578,7 +578,7 @@ mod tests {
     #[test]
     fn create_session_with_name_and_cwd_sends_correct_message() {
         let (mut mgr, mut rx) = make_connected_manager();
-        mgr.create_session_with_name_and_cwd("myapp", "/opt/app", TermSize::default());
+        mgr.create_session(Some("myapp"), Some("/opt/app"), TermSize::default());
 
         match rx.try_recv().expect("message sent") {
             ClientMessage::SessionCreate { name, cwd, .. } => {
