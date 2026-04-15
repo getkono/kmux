@@ -23,6 +23,8 @@ pub enum Mode {
     RenameSession { word_id: String, buffer: String },
     /// Floating session picker with search
     SessionPicker,
+    /// Floating server picker with search (recent servers)
+    ServerPicker,
     /// Help overlay
     Help,
     /// Connect screen (typing host/port/token)
@@ -67,6 +69,14 @@ pub enum Action {
     PickerDown,
     PickerSearchChar(char),
     PickerSearchBackspace,
+
+    // Server picker
+    ServerPickerChar(char),
+    ServerPickerBackspace,
+    ServerPickerUp,
+    ServerPickerDown,
+    ServerPickerSelect,
+    ServerPickerClose,
 
     // Signals
     SendSignal(i32),
@@ -131,6 +141,7 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::ConfirmCloseSession { .. } => resolve_confirm_close(key),
         Mode::RenameSession { .. } => resolve_rename(key, mods),
         Mode::SessionPicker => resolve_session_picker(key, mods),
+        Mode::ServerPicker => resolve_server_picker(key),
         Mode::Help => resolve_help(key),
         Mode::Connect { field } => resolve_connect(key, mods, field),
         Mode::DirectoryPicker => resolve_dir_picker(key),
@@ -299,6 +310,24 @@ fn resolve_session_picker(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action)
     }
 }
 
+fn resolve_server_picker(key: &Key) -> (Option<Mode>, Action) {
+    match key {
+        Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::ServerPickerClose),
+        Key::Named(NamedKey::Enter) => (Some(Mode::Normal), Action::ServerPickerSelect),
+        Key::Named(NamedKey::ArrowUp) => (None, Action::ServerPickerUp),
+        Key::Named(NamedKey::ArrowDown) => (None, Action::ServerPickerDown),
+        Key::Named(NamedKey::Backspace) => (None, Action::ServerPickerBackspace),
+        Key::Character(c) => {
+            if let Some(ch) = c.chars().next() {
+                (None, Action::ServerPickerChar(ch))
+            } else {
+                (None, Action::None)
+            }
+        }
+        _ => (None, Action::None),
+    }
+}
+
 fn resolve_help(key: &Key) -> (Option<Mode>, Action) {
     // Any key exits help
     let _ = key;
@@ -390,6 +419,11 @@ pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
             ("Enter", "Select"),
             ("Esc", "Cancel"),
         ],
+        Mode::ServerPicker => vec![
+            ("\u{2191}/\u{2193}", "Navigate"),
+            ("Enter", "Connect"),
+            ("Esc", "Cancel"),
+        ],
         Mode::Help => vec![("any key", "Close")],
         Mode::Connect { .. } => vec![("Tab", "Next field"), ("Enter", "Connect")],
         Mode::DirectoryPicker => vec![
@@ -412,6 +446,7 @@ pub fn mode_name(mode: &Mode) -> &'static str {
         Mode::ConfirmCloseSession { .. } => "CONFIRM CLOSE",
         Mode::RenameSession { .. } => "RENAME",
         Mode::SessionPicker => "SESSION PICKER",
+        Mode::ServerPicker => "SERVER PICKER",
         Mode::Help => "HELP",
         Mode::Connect { .. } => "CONNECT",
         Mode::DirectoryPicker => "OPEN SESSION",

@@ -3,6 +3,7 @@ mod config;
 mod host_caps;
 mod key_convert;
 mod mode;
+mod recent_servers;
 mod theme;
 mod ui;
 

@@ -17,6 +17,7 @@ use tracing::{info, warn};
 
 use crate::key_convert;
 use crate::mode::{self, Action, ConnectField, Mode};
+use crate::recent_servers::{RecentServersCache, ServerKind};
 use crate::theme::Theme;
 use crate::ui;
 
@@ -26,6 +27,15 @@ enum KeyResult {
     Quit,
     /// User submitted the Connect form; the event loop must replace `srv_rx`.
     Reconnect,
+    /// User selected a server from the server picker.
+    SwitchServer(SwitchTarget),
+}
+
+/// Destination chosen from the server picker.
+enum SwitchTarget {
+    Local,
+    Ssh(kmux_client::ssh::RemoteTarget),
+    Direct { host: String, port: u16 },
 }
 
 pub struct App {
@@ -63,9 +73,28 @@ pub struct App {
     /// Effective cwd from `--cwd` or `:path` in server string.
     auto_cwd: Option<String>,
 
+    /// Width (in columns) of the server badge in the top bar.
+    pub server_badge_cols: u16,
+
     /// Width (in columns) of the session badge in the top bar, used to detect
     /// mouse clicks that should open the session picker.
     pub session_badge_cols: u16,
+
+    /// Human-readable label for the current server shown in the server badge.
+    pub server_display: String,
+
+    /// Cache key for the current server (empty for local).
+    server_string: String,
+
+    /// Connection kind for the current server (used for reconnect routing).
+    server_kind: ServerKind,
+
+    // Server picker state
+    pub server_picker_selected: usize,
+    pub server_picker_search: String,
+
+    /// Persisted recent-servers cache.
+    pub recent_servers: RecentServersCache,
 
     needs_render: bool,
 
@@ -113,6 +142,32 @@ impl App {
 
         let capabilities = crate::host_caps::detect();
 
+        // Compute server display label and cache key from connection parameters.
+        let (server_display, server_string, server_kind) = if is_local {
+            ("localhost".to_string(), String::new(), ServerKind::Local)
+        } else if let Some(ref t) = ssh_target {
+            let display = match &t.user {
+                Some(u) => format!("{}@{}", u, t.host),
+                None => t.host.clone(),
+            };
+            let kind = ServerKind::Ssh {
+                user: t.user.clone(),
+                host: t.host.clone(),
+                ssh_port: t.ssh_port,
+            };
+            (display.clone(), display, kind)
+        } else {
+            let s = format!("{}:{}", host, port);
+            (
+                s.clone(),
+                s,
+                ServerKind::Direct {
+                    host: host.clone(),
+                    port,
+                },
+            )
+        };
+
         Self {
             mgr: SessionManager::new(host, port, token, accept_invalid_certs, capabilities),
             theme,
@@ -130,7 +185,14 @@ impl App {
             is_local,
             initial_cwd,
             did_auto_select: false,
+            server_badge_cols: 0,
             session_badge_cols: 0,
+            server_display,
+            server_string,
+            server_kind,
+            server_picker_selected: 0,
+            server_picker_search: String::new(),
+            recent_servers: RecentServersCache::load(),
             needs_render: true,
             instance_id,
             ssh_session,
@@ -259,6 +321,128 @@ impl App {
                                     self.mgr.set_status_msg("Connecting...".to_string());
                                     let events = self.mgr.connect(new_tx).await;
                                     self.handle_session_events(events);
+                                }
+                                KeyResult::SwitchServer(target) => {
+                                    let (new_tx, new_rx) = mpsc::unbounded_channel();
+                                    srv_rx = new_rx;
+                                    self.did_auto_select = false;
+                                    self.mgr.disconnect();
+                                    match target {
+                                        SwitchTarget::Local => {
+                                            self.mgr.set_status_msg("Connecting to local daemon…".to_string());
+                                            match kmux_client::daemon::ensure_daemon().await {
+                                                Ok(status) => {
+                                                    self.is_local = true;
+                                                    self.ssh_target = None;
+                                                    self.server_display = "localhost".to_string();
+                                                    self.server_string = String::new();
+                                                    self.server_kind = ServerKind::Local;
+                                                    self.mgr.set_connection_params(
+                                                        "127.0.0.1".to_string(),
+                                                        status.port,
+                                                        status.token,
+                                                    );
+                                                    let events = self.mgr.connect(new_tx).await;
+                                                    self.handle_session_events(events);
+                                                }
+                                                Err(e) => {
+                                                    self.mgr.set_status_msg(format!("Daemon start failed: {e}"));
+                                                }
+                                            }
+                                        }
+                                        SwitchTarget::Ssh(ref target) => {
+                                            let display = match &target.user {
+                                                Some(u) => format!("{}@{}", u, target.host),
+                                                None => target.host.clone(),
+                                            };
+                                            self.server_display = display.clone();
+                                            self.server_string = display;
+                                            self.server_kind = ServerKind::Ssh {
+                                                user: target.user.clone(),
+                                                host: target.host.clone(),
+                                                ssh_port: target.ssh_port,
+                                            };
+                                            self.is_local = false;
+                                            self.ssh_target = Some(target.clone());
+                                            self.mgr.set_status_msg("Connecting via SSH…".to_string());
+                                            match ssh::negotiate(target).await {
+                                                Ok(new_ssh) => {
+                                                    let tcp_result = tcp_connect::connect_tcp(
+                                                        "127.0.0.1".to_string(),
+                                                        new_ssh.local_tcp_port,
+                                                        new_ssh.token.clone(),
+                                                        new_tx.clone(),
+                                                        self.mgr.capabilities().clone(),
+                                                        None,
+                                                    )
+                                                    .await;
+                                                    match tcp_result {
+                                                        ConnectResult::Connected(sender) => {
+                                                            self.mgr.set_ws_sender(sender);
+                                                            self.mgr.current_transport = TransportKind::Tcp;
+                                                            let mut tunnel_proc = new_ssh.tunnel_process;
+                                                            let quic_host = new_ssh.remote_host.clone();
+                                                            let quic_port = new_ssh.quic_port;
+                                                            let token = new_ssh.token.clone();
+                                                            let monitor_died_tx = tunnel_died_tx.clone();
+                                                            tokio::spawn(async move {
+                                                                let _ = tunnel_proc.wait().await;
+                                                                let _ = monitor_died_tx.send(()).await;
+                                                            });
+                                                            let caps = self.mgr.capabilities().clone();
+                                                            let accept_invalid = self.mgr.accept_invalid_certs();
+                                                            let probe_srv_tx = new_tx.clone();
+                                                            let upg_tx = upgrade_tx.clone();
+                                                            let (conn_id_tx, conn_id_rx) =
+                                                                tokio::sync::oneshot::channel::<kmux_protocol::messages::ConnectionId>();
+                                                            quic_probe_conn_id_tx = Some(conn_id_tx);
+                                                            tokio::spawn(async move {
+                                                                if let Ok(cid) = conn_id_rx.await {
+                                                                    quic_probe::quic_upgrade_loop(
+                                                                        quic_probe::QuicProbeParams {
+                                                                            remote_host: quic_host,
+                                                                            quic_port,
+                                                                            token,
+                                                                            connection_id: cid,
+                                                                            capabilities: caps,
+                                                                            accept_invalid_certs: accept_invalid,
+                                                                            srv_tx: probe_srv_tx,
+                                                                            upgrade_tx: upg_tx,
+                                                                            max_failures: 10,
+                                                                        },
+                                                                    )
+                                                                    .await;
+                                                                }
+                                                            });
+                                                        }
+                                                        ConnectResult::Failed(e) => {
+                                                            warn!("SSH switch TCP failed: {e}");
+                                                            self.mgr.set_status_msg(format!("SSH connection failed: {e}"));
+                                                        }
+                                                    }
+                                                }
+                                                Err(e) => {
+                                                    warn!("SSH switch negotiation failed: {e}");
+                                                    self.mgr.set_status_msg(format!("SSH negotiation failed: {e}"));
+                                                }
+                                            }
+                                        }
+                                        SwitchTarget::Direct { host, port } => {
+                                            // For direct connections we don't have the token,
+                                            // so pre-fill the Connect form for the user to enter it.
+                                            self.connect_host = host.clone();
+                                            self.connect_port = port.to_string();
+                                            self.connect_token.clear();
+                                            self.ssh_target = None;
+                                            self.is_local = false;
+                                            self.server_display = format!("{}:{}", host, port);
+                                            self.server_string = self.server_display.clone();
+                                            self.server_kind = ServerKind::Direct { host, port };
+                                            self.mode = Mode::Connect {
+                                                field: ConnectField::Token,
+                                            };
+                                        }
+                                    }
                                 }
                                 KeyResult::Continue => {}
                             }
@@ -495,8 +679,21 @@ impl App {
                     }
                     info!("Auth succeeded");
                     self.write_connection_log();
+                    // Record this server as recently used.
+                    self.recent_servers.record_connection(
+                        &self.server_string.clone(),
+                        &self.server_display.clone(),
+                        self.server_kind.clone(),
+                    );
                 }
                 SessionEvent::SessionListReceived => {
+                    // Update cached session list for current server (self-healing: stale
+                    // sessions that no longer exist on the server are silently dropped).
+                    let live_sessions = self.mgr.session_list().to_vec();
+                    let server_string = self.server_string.clone();
+                    self.recent_servers
+                        .update_sessions(&server_string, &live_sessions);
+
                     if !self.did_auto_select {
                         self.did_auto_select = true;
                         self.auto_select_session();
@@ -543,6 +740,21 @@ impl App {
             self.dir_picker_buffer = self.initial_cwd.clone();
             self.mode = Mode::DirectoryPicker;
         }
+    }
+
+    /// Returns recent servers filtered by the current `server_picker_search` text.
+    pub fn filtered_servers(&self) -> Vec<crate::recent_servers::RecentServer> {
+        let lower = self.server_picker_search.to_lowercase();
+        self.recent_servers
+            .servers()
+            .iter()
+            .filter(|s| {
+                lower.is_empty()
+                    || s.display.to_lowercase().contains(&lower)
+                    || s.server_string.to_lowercase().contains(&lower)
+            })
+            .cloned()
+            .collect()
     }
 
     /// Returns sessions whose CWD contains the current `dir_picker_buffer` text (case-insensitive).
@@ -695,6 +907,47 @@ impl App {
             Action::PickerSearchBackspace => {
                 self.session_picker_search.pop();
                 self.session_picker_selected = 0;
+            }
+            Action::ServerPickerChar(ch) => {
+                self.server_picker_search.push(ch);
+                self.server_picker_selected = 0;
+            }
+            Action::ServerPickerBackspace => {
+                self.server_picker_search.pop();
+                self.server_picker_selected = 0;
+            }
+            Action::ServerPickerUp => {
+                self.server_picker_selected = self.server_picker_selected.saturating_sub(1);
+            }
+            Action::ServerPickerDown => {
+                let count = self.filtered_servers().len();
+                if count > 0 && self.server_picker_selected + 1 < count {
+                    self.server_picker_selected += 1;
+                }
+            }
+            Action::ServerPickerClose => {}
+            Action::ServerPickerSelect => {
+                let servers = self.filtered_servers();
+                if let Some(server) = servers.get(self.server_picker_selected).cloned() {
+                    // If already connected to this server, just close the picker.
+                    if server.server_string == self.server_string {
+                        return KeyResult::Continue;
+                    }
+                    let target = match server.kind {
+                        ServerKind::Local => SwitchTarget::Local,
+                        ServerKind::Ssh {
+                            user,
+                            host,
+                            ssh_port,
+                        } => SwitchTarget::Ssh(kmux_client::ssh::RemoteTarget {
+                            user,
+                            host,
+                            ssh_port,
+                        }),
+                        ServerKind::Direct { host, port } => SwitchTarget::Direct { host, port },
+                    };
+                    return KeyResult::SwitchServer(target);
+                }
             }
             Action::Disconnect => {
                 self.mgr.disconnect();
@@ -864,15 +1117,25 @@ impl App {
     }
 
     fn handle_mouse(&mut self, event: MouseEvent) {
-        // Click on the session badge row opens the session picker
-        if event.row == 0
-            && event.column < self.session_badge_cols
-            && matches!(event.kind, MouseEventKind::Down(_))
-        {
-            self.session_picker_selected = 0;
-            self.session_picker_search.clear();
-            self.mode = Mode::SessionPicker;
-            return;
+        // Clicks on row 0 open the server picker (server badge) or session picker (session badge).
+        if event.row == 0 && matches!(event.kind, MouseEventKind::Down(_)) {
+            // Server badge occupies [0, server_badge_cols).
+            if event.column < self.server_badge_cols {
+                self.server_picker_selected = 0;
+                self.server_picker_search.clear();
+                self.mode = Mode::ServerPicker;
+                return;
+            }
+            // Session badge occupies [server_badge_cols + 1, server_badge_cols + 1 + session_badge_cols).
+            // (+1 accounts for the separator span between the two badges.)
+            let session_start = self.server_badge_cols + 1;
+            let session_end = session_start + self.session_badge_cols;
+            if event.column >= session_start && event.column < session_end {
+                self.session_picker_selected = 0;
+                self.session_picker_search.clear();
+                self.mode = Mode::SessionPicker;
+                return;
+            }
         }
 
         let Some(pane_id) = self.mgr.active_pane_id().map(|s| s.to_string()) else {

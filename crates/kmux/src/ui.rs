@@ -140,6 +140,7 @@ fn render_terminal(f: &mut Frame, app: &mut App) {
             render_rename_overlay(f, area, word_id, buffer, &app.theme)
         }
         Mode::SessionPicker => render_session_picker_overlay(f, area, app),
+        Mode::ServerPicker => render_server_picker_overlay(f, area, app),
         Mode::DirectoryPicker => render_dir_picker_overlay(f, area, app),
         _ => {}
     }
@@ -153,6 +154,19 @@ fn render_terminal(f: &mut Frame, app: &mut App) {
 fn render_session_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let theme = &app.theme;
     let mut spans = Vec::new();
+
+    // Far left: server badge (clickable, opens server picker)
+    let server_text = format!(" {} ", app.server_display);
+    let server_width = server_text.len() as u16;
+    app.server_badge_cols = server_width;
+    spans.push(Span::styled(
+        server_text,
+        Style::default()
+            .fg(theme.bg)
+            .bg(theme.purple)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(" ", Style::default().bg(theme.status_bg)));
 
     // Left: session badge (clickable, opens session picker)
     let badge_text = if let Some(word_id) = app.mgr.active_session() {
@@ -525,6 +539,7 @@ fn mode_color(mode: &Mode, theme: &Theme) -> Color {
         Mode::ConfirmCloseSession { .. } => theme.red,
         Mode::RenameSession { .. } => theme.orange,
         Mode::SessionPicker => theme.accent,
+        Mode::ServerPicker => theme.purple,
         Mode::Help => theme.accent,
         Mode::Connect { .. } => theme.accent,
         Mode::DirectoryPicker => theme.accent,
@@ -617,6 +632,92 @@ fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
             " Sessions ",
             Style::default()
                 .fg(theme.accent)
+                .add_modifier(Modifier::BOLD),
+        ))
+        .style(Style::default().bg(theme.bg));
+
+    f.render_widget(Paragraph::new(lines).block(block), overlay_area);
+}
+
+fn render_server_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
+    let theme = &app.theme;
+    let search = &app.server_picker_search;
+    let search_lower = search.to_lowercase();
+
+    let servers = app.filtered_servers();
+    let visible_rows = servers.len().min(8) as u16;
+    let width = 60u16.min(area.width.saturating_sub(4));
+    // search row + separator + entries + border
+    let height = (visible_rows + 4).min(area.height.saturating_sub(2));
+    let x = area.width.saturating_sub(width) / 2;
+    let y = area.height.saturating_sub(height) / 2;
+    let overlay_area = Rect::new(x, y, width, height);
+
+    f.render_widget(Clear, overlay_area);
+
+    let inner_width = width.saturating_sub(2) as usize;
+    let _ = search_lower; // search filtering already done in filtered_servers()
+
+    let mut lines = vec![];
+
+    // Search line
+    lines.push(Line::from(vec![
+        Span::styled(" Search: ", Style::default().fg(theme.fg_dim).bg(theme.bg)),
+        Span::styled(
+            format!("{search}_"),
+            Style::default().fg(theme.fg).bg(theme.bg),
+        ),
+    ]));
+
+    // Separator
+    lines.push(Line::from(Span::styled(
+        "\u{2500}".repeat(inner_width),
+        Style::default().fg(theme.fg_dim).bg(theme.bg),
+    )));
+
+    if servers.is_empty() {
+        lines.push(Line::from(Span::styled(
+            " (no recent servers) ",
+            Style::default().fg(theme.fg_dim).bg(theme.bg),
+        )));
+    } else {
+        for (i, server) in servers.iter().enumerate() {
+            if i >= 8 {
+                break;
+            }
+            let is_selected = i == app.server_picker_selected;
+            let cursor = if is_selected { ">" } else { " " };
+            let session_count = server.sessions.len();
+            let time_ago = server.time_ago();
+
+            let row_text = format!(
+                "{cursor} {:<28} {}s  {}",
+                server.display, session_count, time_ago
+            );
+            let row_text: String = row_text
+                .chars()
+                .take(inner_width.saturating_sub(1))
+                .collect();
+
+            let style = if is_selected {
+                Style::default()
+                    .fg(theme.bg)
+                    .bg(theme.purple)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme.fg).bg(theme.bg)
+            };
+            lines.push(Line::from(Span::styled(row_text, style)));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.purple))
+        .title(Span::styled(
+            " Servers ",
+            Style::default()
+                .fg(theme.purple)
                 .add_modifier(Modifier::BOLD),
         ))
         .style(Style::default().bg(theme.bg));
