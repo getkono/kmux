@@ -38,6 +38,7 @@ struct ControlRequest {
 struct StatusResponse {
     status: &'static str,
     port: u16,
+    tcp_port: u16,
     token: String,
     pid: u32,
     uptime_secs: u64,
@@ -57,10 +58,12 @@ struct StopResponse {
 ///
 /// Run this as a `tokio::spawn`ed background task after the QUIC endpoint is
 /// bound and the actual port is known.
+#[allow(clippy::too_many_arguments)]
 pub async fn serve_control_socket(
     socket_path: PathBuf,
     pid_path: PathBuf,
     port: u16,
+    tcp_port: u16,
     token: String,
     start_time: Instant,
     app: Arc<ServerApp>,
@@ -110,7 +113,7 @@ pub async fn serve_control_socket(
                         let app = Arc::clone(&app);
                         let shutdown = Arc::clone(&shutdown);
                         tokio::spawn(async move {
-                            handle_control_connection(stream, port, &token, start_time, app, shutdown).await;
+                            handle_control_connection(stream, port, tcp_port, &token, start_time, app, shutdown).await;
                         });
                     }
                     Err(e) => {
@@ -136,6 +139,7 @@ pub async fn serve_control_socket(
 async fn handle_control_connection(
     stream: tokio::net::UnixStream,
     port: u16,
+    tcp_port: u16,
     token: &str,
     start_time: Instant,
     app: Arc<ServerApp>,
@@ -164,6 +168,7 @@ async fn handle_control_connection(
             let response = StatusResponse {
                 status: "running",
                 port,
+                tcp_port,
                 token: token.to_string(),
                 pid: std::process::id(),
                 uptime_secs: start_time.elapsed().as_secs(),

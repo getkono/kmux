@@ -17,7 +17,7 @@ crossterm = { version = "0.28", features = ["event-stream"] }
 futures = "0.3"
 iced = { version = "0.13", features = ["tokio", "canvas"] }
 daemonize = "0.5"
-nix = { version = "0.31", features = ["fs", "process", "signal", "term", "user"] }
+nix = { version = "0.31", features = ["fs", "net", "process", "signal", "term", "user"] }
 serde_json = "1"
 postcard = { version = "1", features = ["alloc"] }
 quinn = "0.11"

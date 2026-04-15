@@ -9,6 +9,7 @@ use tokio::net::UnixStream;
 /// Connection parameters returned by the running daemon.
 pub struct DaemonStatus {
     pub port: u16,
+    pub tcp_port: u16,
     pub token: String,
     pub pid: u32,
     pub uptime_secs: u64,
@@ -18,6 +19,8 @@ pub struct DaemonStatus {
 #[derive(Deserialize)]
 struct StatusResponse {
     port: u16,
+    #[serde(default)]
+    tcp_port: u16,
     token: String,
     pid: u32,
     #[serde(default)]
@@ -61,6 +64,7 @@ pub async fn query_daemon() -> Option<DaemonStatus> {
 
     Some(DaemonStatus {
         port: resp.port,
+        tcp_port: resp.tcp_port,
         token: resp.token,
         pid: resp.pid,
         uptime_secs: resp.uptime_secs,

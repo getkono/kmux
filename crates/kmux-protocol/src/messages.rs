@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 /// Current wire protocol version. Increment when breaking changes are made.
-pub const PROTOCOL_VERSION: u32 = 12;
+pub const PROTOCOL_VERSION: u32 = 13;
 
 /// Return the current wall-clock time as milliseconds since the Unix epoch.
 pub fn epoch_millis() -> u64 {
@@ -14,6 +14,14 @@ pub fn epoch_millis() -> u64 {
 }
 
 pub type RequestId = u64;
+
+/// Opaque connection identity assigned by the server on first authentication.
+///
+/// Survives transport switches: when a client re-authenticates on a new channel
+/// (QUIC ↔ TCP) it passes its `ConnectionId` so the server can transfer all
+/// pane attachments to the new transport without the client needing to re-attach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct ConnectionId(pub u64);
 
 /// Unique word-based session identifier (a single word from the EFF long wordlist).
 /// Example: `"eagle"`, `"falcon"`.
@@ -361,7 +369,17 @@ pub enum ClientMessage {
         /// set an appropriate shell environment and to configure the
         /// server-side VT emulator feature flags for each pane.
         capabilities: ClientCapabilities,
+        /// When switching transports (QUIC ↔ TCP), pass the existing
+        /// `ConnectionId` to resume the session on the new channel.
+        /// `None` for a fresh connection.
+        #[serde(default)]
+        connection_id: Option<ConnectionId>,
     },
+
+    /// Signal to the server that this channel is ready to become the primary
+    /// transport. Sent after a successful channel-switch `Auth`. The server
+    /// responds with `ChannelSwitched` and then closes the old channel.
+    ChannelReady,
 
     /// Request creation of a new session (with one initial pane).
     /// The server assigns the `word_id` automatically.
@@ -464,6 +482,19 @@ pub enum ServerMessage {
         client_id: Option<ClientId>,
         /// Server binary version (e.g. `"0.1.0"`); `None` on failure.
         server_version: Option<String>,
+        /// Connection identity assigned (or reconfirmed) by the server.
+        /// Always `Some` on success. The client must store this and pass it
+        /// when re-authenticating on a new transport channel.
+        #[serde(default)]
+        connection_id: Option<ConnectionId>,
+    },
+
+    /// Confirmation that the channel switch is complete. Sent in response to
+    /// `ChannelReady` on the new transport. The client should close the old
+    /// transport after receiving this.
+    ChannelSwitched {
+        /// Human-readable name of the transport that was replaced ("quic" or "tcp").
+        old_transport: String,
     },
 
     /// Confirmation that a session (with initial pane) was created.
@@ -677,5 +708,72 @@ mod tests {
         let idx: u32 = idx_str.parse().unwrap();
         assert_eq!(w, "eagle");
         assert_eq!(idx, 0);
+    }
+
+    #[test]
+    fn connection_id_serialization_roundtrip() {
+        let id = ConnectionId(0xdeadbeef_u64);
+        // Use postcard (the wire codec) for the roundtrip.
+        let bytes = postcard::to_allocvec(&id).unwrap();
+        let decoded: ConnectionId = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(id, decoded);
+    }
+
+    #[test]
+    fn auth_message_roundtrip_with_connection_id() {
+        let msg = ClientMessage::Auth {
+            token: "tok".to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: ClientCapabilities::default(),
+            connection_id: Some(ConnectionId(42)),
+        };
+        let bytes = crate::encode_client(&msg).unwrap();
+        let decoded = crate::decode_client(&bytes).unwrap();
+        assert!(matches!(
+            decoded,
+            ClientMessage::Auth {
+                connection_id: Some(ConnectionId(42)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn auth_result_roundtrip_with_connection_id() {
+        let msg = ServerMessage::AuthResult {
+            success: true,
+            reason: None,
+            client_id: None,
+            server_version: None,
+            connection_id: Some(ConnectionId(99)),
+        };
+        let bytes = crate::encode_server(&msg).unwrap();
+        let decoded = crate::decode_server(&bytes).unwrap();
+        assert!(matches!(
+            decoded,
+            ServerMessage::AuthResult {
+                connection_id: Some(ConnectionId(99)),
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn channel_ready_and_switched_roundtrip() {
+        let ready = ClientMessage::ChannelReady;
+        let bytes = crate::encode_client(&ready).unwrap();
+        assert!(matches!(
+            crate::decode_client(&bytes).unwrap(),
+            ClientMessage::ChannelReady
+        ));
+
+        let switched = ServerMessage::ChannelSwitched {
+            old_transport: "tcp".to_string(),
+        };
+        let bytes = crate::encode_server(&switched).unwrap();
+        assert!(matches!(
+            crate::decode_server(&bytes).unwrap(),
+            ServerMessage::ChannelSwitched { .. }
+        ));
     }
 }

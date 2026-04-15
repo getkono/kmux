@@ -91,6 +91,7 @@ mod tests {
             token: "secret".to_string(),
             protocol_version: PROTOCOL_VERSION,
             capabilities: ClientCapabilities::default(),
+            connection_id: None,
         };
         let bytes = encode_client(&msg).expect("encode");
         let decoded = decode_client(&bytes).expect("decode");
@@ -157,6 +158,7 @@ mod tests {
             reason: None,
             client_id: Some(ClientId(7)),
             server_version: Some("0.1.0".to_string()),
+            connection_id: None,
         };
         let bytes = encode_server(&msg).expect("encode");
         let decoded = decode_server(&bytes).expect("decode");

@@ -2,7 +2,7 @@ use std::net::ToSocketAddrs;
 use std::sync::Arc;
 use std::time::Duration;
 
-use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ServerMessage};
+use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ConnectionId, ServerMessage};
 use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, warn};
@@ -32,6 +32,7 @@ pub async fn connect(
     accept_invalid_certs: bool,
     server_tx: mpsc::UnboundedSender<ServerMessage>,
     capabilities: ClientCapabilities,
+    connection_id: Option<ConnectionId>,
 ) -> ConnectResult {
     let addr = match format!("{host}:{port}")
         .to_socket_addrs()
@@ -69,6 +70,7 @@ pub async fn connect(
         token,
         protocol_version: kmux_protocol::messages::PROTOCOL_VERSION,
         capabilities,
+        connection_id,
     }) {
         Ok(bytes) => bytes,
         Err(e) => return ConnectResult::Failed(format!("auth encode failed: {e}")),

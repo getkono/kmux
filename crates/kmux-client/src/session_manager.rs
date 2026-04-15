@@ -10,9 +10,12 @@ use kmux_protocol::messages::{
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use kmux_protocol::messages::ConnectionId;
+
 use crate::connect::{self, ConnectResult};
 use crate::grid::CellGrid;
 use crate::metrics::RenderMetrics;
+use crate::transport::TransportKind;
 
 /// Per-pane synchronisation state.
 #[derive(Default)]
@@ -90,6 +93,13 @@ pub struct SessionManager {
 
     /// Server binary version reported in `AuthResult`; populated on successful auth.
     pub server_version: Option<String>,
+
+    /// Connection identity assigned by the server. Persists across transport switches
+    /// (QUIC ↔ TCP) so the daemon can transfer pane attachments to the new channel.
+    pub connection_id: Option<ConnectionId>,
+
+    /// The active transport kind (QUIC or TCP).
+    pub current_transport: TransportKind,
 }
 
 impl SessionManager {
@@ -121,6 +131,8 @@ impl SessionManager {
             client_id: None,
             metrics: RenderMetrics::new(),
             server_version: None,
+            connection_id: None,
+            current_transport: TransportKind::Quic,
         }
     }
 
@@ -142,6 +154,7 @@ impl SessionManager {
             accept_invalid,
             srv_tx,
             self.capabilities.clone(),
+            self.connection_id,
         )
         .await
         {
@@ -212,6 +225,53 @@ impl SessionManager {
         self.port
     }
 
+    pub fn capabilities(&self) -> &ClientCapabilities {
+        &self.capabilities
+    }
+
+    pub fn accept_invalid_certs(&self) -> bool {
+        self.accept_invalid_certs
+    }
+
+    // ── Channel switching ─────────────────────────────────────────────────────
+
+    /// Attempt to switch the active transport to QUIC.
+    ///
+    /// Called when the QUIC upgrade probe in `quic_probe::quic_upgrade_loop`
+    /// signals success.  The new QUIC sender must already be authenticated
+    /// (i.e., the server has received `Auth { connection_id: Some(...) }` and
+    /// sent back `AuthResult { success: true }`).
+    ///
+    /// The caller is responsible for sending `ClientMessage::ChannelReady` on
+    /// the new sender before calling this method.
+    pub fn apply_quic_upgrade(&mut self, new_sender: mpsc::UnboundedSender<ClientMessage>) {
+        let old_transport = self.current_transport;
+        // Drop the old sender, closing the old transport channel.
+        let _ = self.ws_sender.replace(new_sender);
+        self.current_transport = TransportKind::Quic;
+        info!(
+            "Transport channel upgraded: {} -> {}",
+            old_transport,
+            TransportKind::Quic
+        );
+    }
+
+    /// Switch the active transport to TCP (fallback).
+    ///
+    /// Called when QUIC drops and a TCP-over-SSH tunnel has been re-established.
+    /// `new_sender` must already be authenticated on the TCP transport with the
+    /// existing `connection_id`.
+    pub fn apply_tcp_fallback(&mut self, new_sender: mpsc::UnboundedSender<ClientMessage>) {
+        let old_transport = self.current_transport;
+        let _ = self.ws_sender.replace(new_sender);
+        self.current_transport = TransportKind::Tcp;
+        info!(
+            "Transport channel fell back: {} -> {}",
+            old_transport,
+            TransportKind::Tcp
+        );
+    }
+
     // ── Server message handling ───────────────────────────────────────────────
 
     pub fn handle_server_message(&mut self, msg: ServerMessage) -> Vec<SessionEvent> {
@@ -222,10 +282,12 @@ impl SessionManager {
                 reason,
                 client_id,
                 server_version,
+                connection_id,
             } => {
                 if success {
                     self.client_id = client_id;
                     self.server_version = server_version;
+                    self.connection_id = connection_id;
                     events.push(SessionEvent::AuthOk);
                 } else {
                     warn!("Auth failed: {:?}", reason);
@@ -235,6 +297,14 @@ impl SessionManager {
                     self.connected = false;
                     events.push(SessionEvent::AuthFailed { reason: reason_str });
                 }
+            }
+
+            ServerMessage::ChannelSwitched { old_transport } => {
+                let new_transport = self.current_transport;
+                info!(
+                    "Transport channel switched: {} -> {}",
+                    old_transport, new_transport
+                );
             }
 
             ServerMessage::SessionListResult { sessions, .. } => {
@@ -999,6 +1069,7 @@ mod tests {
             reason: None,
             client_id: Some(ClientId(42)),
             server_version: Some("0.1.0".to_string()),
+            connection_id: None,
         });
         assert!(matches!(events.as_slice(), [SessionEvent::AuthOk]));
         assert_eq!(mgr.client_id, Some(ClientId(42)));
@@ -1016,6 +1087,7 @@ mod tests {
             reason: Some("bad token".to_string()),
             client_id: None,
             server_version: None,
+            connection_id: None,
         });
         assert!(matches!(
             events.as_slice(),

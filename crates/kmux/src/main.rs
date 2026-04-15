@@ -20,6 +20,7 @@ use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
 use app::App;
+use kmux_client::ssh;
 use kmux_client::token::read_local_token;
 
 #[derive(Parser, Debug)]
@@ -46,6 +47,14 @@ struct Cli {
     /// Accept self-signed / invalid TLS certificates
     #[arg(long)]
     accept_invalid_certs: bool,
+
+    /// SSH port to use when connecting to a remote target (overrides hosts.toml)
+    #[arg(long)]
+    ssh_port: Option<u16>,
+
+    /// Skip SSH tunneling; connect directly via QUIC (backward-compatible mode)
+    #[arg(long)]
+    no_ssh: bool,
 
     /// Color theme: built-in name (one-dark, catppuccin-latte, catppuccin-frappe,
     /// catppuccin-macchiato, catppuccin-mocha, dracula) or a custom theme name
@@ -129,10 +138,55 @@ async fn main() -> anyhow::Result<()> {
     let is_local =
         cli.server.is_none() && cli.host.is_none() && cli.port.is_none() && cli.token.is_none();
 
-    let (host, port, token, accept_invalid_certs) = if is_local {
+    // Detect SSH mode: `server` contains '@' or matches a hosts.toml alias with a user,
+    // and `--no-ssh` is not given.
+    let ssh_target = if !cli.no_ssh {
+        cli.server
+            .as_deref()
+            .and_then(ssh::parse_remote_target)
+            .map(|mut t| {
+                if let Some(p) = cli.ssh_port {
+                    t.ssh_port = Some(p);
+                }
+                t
+            })
+    } else {
+        None
+    };
+
+    // For SSH mode, negotiate before setting up the terminal so we can print
+    // errors cleanly if SSH negotiation fails.
+    let mut app_ssh_target: Option<kmux_client::ssh::RemoteTarget> = None;
+
+    let (ssh_session, host, port, token, accept_invalid_certs) = if let Some(target) = ssh_target {
+        tracing::info!(
+            host = %target.host,
+            user = ?target.user,
+            "SSH negotiation starting"
+        );
+        match ssh::negotiate(&target).await {
+            Ok(session) => {
+                let host = "127.0.0.1".to_string();
+                let port = session.local_tcp_port;
+                let token = session.token.clone();
+                app_ssh_target = Some(target);
+                (Some(session), host, port, token, true)
+            }
+            Err(e) => {
+                eprintln!("SSH negotiation failed: {e}");
+                std::process::exit(1);
+            }
+        }
+    } else if is_local {
         let status = kmux_client::daemon::ensure_daemon().await?;
         // The daemon uses a self-signed cert, so accept-invalid-certs is implied.
-        ("127.0.0.1".to_string(), status.port, status.token, true)
+        (
+            None,
+            "127.0.0.1".to_string(),
+            status.port,
+            status.token,
+            true,
+        )
     } else {
         // Positional `server` arg takes precedence over `--host`. It may be
         // "host" or "host:port".
@@ -149,7 +203,7 @@ async fn main() -> anyhow::Result<()> {
             (host, port)
         };
         let token = cli.token.or_else(read_local_token).unwrap_or_default();
-        (host, port, token, cli.accept_invalid_certs)
+        (None, host, port, token, cli.accept_invalid_certs)
     };
 
     // Setup terminal
@@ -178,6 +232,8 @@ async fn main() -> anyhow::Result<()> {
         initial_cwd,
         theme,
         instance_id.clone(),
+        ssh_session,
+        app_ssh_target,
     );
 
     let result = app

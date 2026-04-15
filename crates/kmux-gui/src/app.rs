@@ -970,6 +970,7 @@ impl kmuxApp {
                     params.accept_invalid_certs,
                     srv_tx,
                     gui_capabilities(),
+                    None,
                 )
                 .await;
 

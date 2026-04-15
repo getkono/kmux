@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, GridSnapshot, InputMode, PaneId, PaneInfo, SequenceNo,
-    ServerMessage, SessionEntry, SessionMeta, SessionStatus, TermSize, TerminalDiff, WordId,
+    ClientCapabilities, ClientId, ConnectionId, GridSnapshot, InputMode, PaneId, PaneInfo,
+    SequenceNo, ServerMessage, SessionEntry, SessionMeta, SessionStatus, TermSize, TerminalDiff,
+    WordId,
 };
 use kmux_pty::config::{EnvBuilder, PtyConfig, WindowSize};
 use kmux_pty::error::{KmuxError, Result};
@@ -111,6 +112,28 @@ pub struct SessionState {
     pub next_pane_index: u32,
 }
 
+/// Active transport kind for a connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TransportKind {
+    Quic,
+    Tcp,
+}
+
+impl std::fmt::Display for TransportKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            TransportKind::Quic => write!(f, "quic"),
+            TransportKind::Tcp => write!(f, "tcp"),
+        }
+    }
+}
+
+/// Per-connection state tracked by `ServerApp` for channel switching.
+struct ConnectionState {
+    client_id: ClientId,
+    transport: TransportKind,
+}
+
 /// Shared server state -- wrapped in `Arc` and cloned into each connection task.
 pub struct ServerApp {
     /// PTY registry for spawning and managing child processes.
@@ -122,6 +145,10 @@ pub struct ServerApp {
     session_index_counter: AtomicU32,
     /// Monotonic client ID counter.
     next_client_id: AtomicU64,
+    /// Monotonic connection ID counter.
+    next_connection_id: AtomicU64,
+    /// Map of ConnectionId -> ConnectionState for channel switching.
+    connections: RwLock<HashMap<u64, ConnectionState>>,
     /// Word pool for assigning unique session IDs.
     wordlist: Mutex<WordlistSampler>,
     /// RNG for word selection (seeded once at startup).
@@ -136,14 +163,67 @@ impl ServerApp {
             sessions: RwLock::new(HashMap::new()),
             session_index_counter: AtomicU32::new(0),
             next_client_id: AtomicU64::new(1),
+            next_connection_id: AtomicU64::new(1),
+            connections: RwLock::new(HashMap::new()),
             wordlist: Mutex::new(WordlistSampler::new()),
             rng: Mutex::new(rand::rngs::SmallRng::from_os_rng()),
         }
     }
 
-    /// Assign a fresh monotonic `ClientId`.
-    pub fn next_client_id(&self) -> ClientId {
-        ClientId(self.next_client_id.fetch_add(1, Ordering::Relaxed))
+    /// Register a client connection, returning a `(ClientId, ConnectionId)` pair.
+    ///
+    /// If `incoming_conn_id` is `Some`, the client is resuming an existing
+    /// connection (channel switch). The old transport entry is updated in-place.
+    /// If `None`, a fresh `ClientId` and `ConnectionId` are assigned.
+    pub async fn register_client(
+        &self,
+        incoming_conn_id: Option<ConnectionId>,
+    ) -> (ClientId, ConnectionId) {
+        if let Some(conn_id) = incoming_conn_id {
+            // Resume an existing connection (channel switch in progress).
+            let mut conns = self.connections.write().await;
+            if let Some(state) = conns.get_mut(&conn_id.0) {
+                // Mark this as the new active transport (TCP default; QUIC upgrade handled via
+                // complete_channel_switch).
+                state.transport = TransportKind::Tcp;
+                return (state.client_id, conn_id);
+            }
+            // Unknown ConnectionId — treat as a fresh connection.
+        }
+        let client_id = ClientId(self.next_client_id.fetch_add(1, Ordering::Relaxed));
+        let conn_id = ConnectionId(self.next_connection_id.fetch_add(1, Ordering::Relaxed));
+        self.connections.write().await.insert(
+            conn_id.0,
+            ConnectionState {
+                client_id,
+                transport: TransportKind::Tcp,
+            },
+        );
+        (client_id, conn_id)
+    }
+
+    /// Mark a channel switch as complete. Called when the new channel sends
+    /// `ChannelReady`. Returns the old transport name for the `ChannelSwitched`
+    /// response, or `None` if the connection ID is unknown.
+    pub async fn complete_channel_switch(
+        &self,
+        conn_id: ConnectionId,
+        _client_id: ClientId,
+    ) -> Option<String> {
+        let mut conns = self.connections.write().await;
+        if let Some(state) = conns.get_mut(&conn_id.0) {
+            let old_name = state.transport.to_string();
+            // The QUIC upgrade probe sends ChannelReady after a successful QUIC auth;
+            // update transport to Quic.
+            state.transport = TransportKind::Quic;
+            return Some(old_name);
+        }
+        None
+    }
+
+    /// Remove the connection entry when a client disconnects.
+    pub async fn unregister_client(&self, conn_id: ConnectionId) {
+        self.connections.write().await.remove(&conn_id.0);
     }
 
     /// Subscribe to the PTY lifecycle event bus.
