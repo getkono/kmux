@@ -123,9 +123,14 @@ fn config_dir() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Mutex;
+
     use ratatui::style::Color;
 
     use super::*;
+
+    // Serialise all tests that mutate XDG_CONFIG_HOME to avoid races.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
     fn test_resolve_cli_builtin() {
@@ -136,27 +141,29 @@ mod tests {
 
     #[test]
     fn test_resolve_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // With XDG_CONFIG_HOME pointing somewhere empty, no config file exists.
         let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: test-only, single-threaded context for this assertion.
         unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
         let theme = resolve_theme(None);
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         // catppuccin-macchiato bg = #24273a
         assert_eq!(theme.bg, Color::Rgb(0x24, 0x27, 0x3a));
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
     #[test]
     fn test_resolve_unknown_falls_back_to_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
         let theme = resolve_theme(Some("does-not-exist"));
-        assert_eq!(theme.bg, Color::Rgb(0x24, 0x27, 0x3a));
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert_eq!(theme.bg, Color::Rgb(0x24, 0x27, 0x3a));
     }
 
     #[test]
     fn test_resolve_custom_theme_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let themes_dir = tmp.path().join("kmux").join("themes");
         std::fs::create_dir_all(&themes_dir).unwrap();
@@ -176,9 +183,9 @@ status_bg = "#111111"
         std::fs::write(themes_dir.join("my-theme.toml"), toml).unwrap();
         unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
         let theme = resolve_theme(Some("my-theme"));
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         assert_eq!(theme.bg, Color::Rgb(0xff, 0x00, 0x00));
         assert_eq!(theme.fg, Color::Rgb(0x00, 0xff, 0x00));
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
     }
 
     #[test]
