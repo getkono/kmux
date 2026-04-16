@@ -1,7 +1,9 @@
 mod dispatch;
 mod events;
+mod session;
 pub use dispatch::handle_message;
 pub use events::pty_event_to_msg;
+pub use session::{build_attach_replay, run_client_session};
 
 use std::collections::HashMap;
 

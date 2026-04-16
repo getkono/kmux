@@ -1,6 +1,7 @@
 use kmux_protocol::messages::{ClientId, InputMode, TermSize};
-use kmux_pty::config::WindowSize;
 use kmux_pty::error::{KmuxError, Result};
+
+use crate::conversions::term_size_to_window;
 use tracing::warn;
 
 use super::ServerApp;
@@ -57,11 +58,9 @@ impl ServerApp {
 
     /// Resize a pane's PTY and its server-side terminal emulator.
     pub async fn resize(&self, pane_id: &str, size: TermSize) -> Result<()> {
-        let ws = WindowSize {
-            rows: size.rows,
-            cols: size.cols,
-        };
-        self.manager.resize(pane_id, ws).await?;
+        self.manager
+            .resize(pane_id, term_size_to_window(size))
+            .await?;
 
         let mut sessions = self.sessions.write().await;
         match get_pane_relay_mut(&mut sessions, pane_id) {

@@ -1,3 +1,5 @@
+use kmux_client::input::signal_from_key;
+
 use super::{CommandEntry, SHORTCUTS, ShortcutAction, is_leader_key};
 
 /// In AwaitingAction state, resolve a key press to a `ShortcutAction`.
@@ -50,13 +52,7 @@ pub fn resolve_key(
 /// Map a signal menu key to a Unix signal number.
 pub fn resolve_signal_key(key: &iced::keyboard::Key) -> Option<i32> {
     match key {
-        iced::keyboard::Key::Character(c) => match c.as_str() {
-            "k" => Some(9),  // SIGKILL
-            "t" => Some(15), // SIGTERM
-            "s" => Some(19), // SIGSTOP
-            "c" => Some(18), // SIGCONT
-            _ => None,
-        },
+        iced::keyboard::Key::Character(c) => signal_from_key(c.as_str()),
         _ => None,
     }
 }

@@ -4,6 +4,7 @@ mod backend;
 mod capability;
 mod client_handler;
 mod connection;
+mod conversions;
 mod daemon;
 mod diff_engine;
 mod persist;

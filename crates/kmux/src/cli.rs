@@ -1,6 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use kmux_client::ssh::{ParsedServer, RemoteTarget, SshSession};
-use rand::RngCore;
 
 #[derive(Parser, Debug)]
 #[command(name = "kmux", about = "kmux remote terminal client (TUI)", version)]
@@ -123,10 +122,4 @@ pub struct ResolvedConnection {
     pub ssh_session: Option<SshSession>,
     pub ssh_target: Option<RemoteTarget>,
     pub parsed_server: Option<ParsedServer>,
-}
-
-pub fn generate_instance_id() -> String {
-    let mut bytes = [0u8; 4];
-    rand::rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

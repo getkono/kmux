@@ -7,7 +7,7 @@ mod terminal_view;
 mod theme;
 
 use clap::Parser;
-use rand::RngCore;
+use kmux_client::generate_instance_id;
 use tracing_subscriber::EnvFilter;
 
 use app::kmuxApp;
@@ -62,10 +62,4 @@ fn main() -> iced::Result {
                 iced::Task::none(),
             )
         })
-}
-
-fn generate_instance_id() -> String {
-    let mut bytes = [0u8; 4];
-    rand::rng().fill_bytes(&mut bytes);
-    bytes.iter().map(|b| format!("{b:02x}")).collect()
 }

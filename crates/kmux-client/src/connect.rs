@@ -192,9 +192,12 @@ fn build_quinn_client_config(accept_invalid: bool) -> quinn::ClientConfig {
 
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(300)).unwrap(),
+        quinn::IdleTimeout::try_from(Duration::from_secs(kmux_protocol::QUIC_IDLE_TIMEOUT_SECS))
+            .unwrap(),
     ));
-    transport.keep_alive_interval(Some(Duration::from_secs(15)));
+    transport.keep_alive_interval(Some(Duration::from_secs(
+        kmux_protocol::QUIC_KEEP_ALIVE_SECS,
+    )));
     config.transport_config(Arc::new(transport));
 
     config

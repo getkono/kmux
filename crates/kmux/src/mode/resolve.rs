@@ -1,3 +1,4 @@
+use kmux_client::input::signal_from_key;
 use kmux_client::key::{Key, Modifiers, NamedKey};
 
 use super::{Action, ConnectField, Mode, is_mode_key};
@@ -109,12 +110,9 @@ pub fn resolve_scroll(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
 pub fn resolve_signal(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     match key {
         Key::Character(c) => {
-            let action = match c.as_str() {
-                "k" => Action::SendSignal(9),  // SIGKILL
-                "t" => Action::SendSignal(15), // SIGTERM
-                "s" => Action::SendSignal(19), // SIGSTOP
-                "c" => Action::SendSignal(18), // SIGCONT
-                _ => Action::None,
+            let action = match signal_from_key(c.as_str()) {
+                Some(sig) => Action::SendSignal(sig),
+                None => Action::None,
             };
             (Some(Mode::Normal), action)
         }

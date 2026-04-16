@@ -1,15 +1,15 @@
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
-use kmux_protocol::messages::{ErrorCode, ServerMessage, epoch_millis};
-use kmux_protocol::{decode_client, encode_server, read_frame, write_frame};
+use kmux_protocol::messages::{ErrorCode, ServerMessage};
+use kmux_protocol::{encode_server, write_frame};
 use quinn::Connection;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
-use tracing::{debug, info, warn};
+use tracing::{debug, warn};
 
 use crate::app::{AttachResult, ServerApp};
-use crate::client_handler::{PaneAttacher, SharedClientState, handle_message, pty_event_to_msg};
+use crate::client_handler::{PaneAttacher, build_attach_replay, run_client_session};
 
 pub fn classify_error(e: &kmux_pty::error::KmuxError) -> ErrorCode {
     match e {
@@ -58,47 +58,9 @@ async fn pane_uni_writer(
     pane_id: String,
     client_rx: &mut mpsc::Receiver<ServerMessage>,
 ) {
-    match attach_result {
-        AttachResult::FullSnapshot(snapshot, seqno) => {
-            let msg = ServerMessage::TerminalSnapshot {
-                pane_id: pane_id.clone(),
-                snapshot,
-                seqno,
-                sent_at_ms: epoch_millis(),
-            };
-            if send_frame(&mut uni, &msg).await.is_err() {
-                return;
-            }
-        }
-        AttachResult::Delta(diffs) => {
-            for (seqno, diff) in diffs {
-                let msg = ServerMessage::TerminalUpdate {
-                    pane_id: pane_id.clone(),
-                    diff,
-                    seqno,
-                    sent_at_ms: epoch_millis(),
-                };
-                if send_frame(&mut uni, &msg).await.is_err() {
-                    return;
-                }
-            }
-        }
-        AttachResult::SyncReset(snapshot, seqno) => {
-            let reset_msg = ServerMessage::SyncReset {
-                pane_id: pane_id.clone(),
-            };
-            if send_frame(&mut uni, &reset_msg).await.is_err() {
-                return;
-            }
-            let msg = ServerMessage::TerminalSnapshot {
-                pane_id: pane_id.clone(),
-                snapshot,
-                seqno,
-                sent_at_ms: epoch_millis(),
-            };
-            if send_frame(&mut uni, &msg).await.is_err() {
-                return;
-            }
+    for msg in build_attach_replay(attach_result, &pane_id) {
+        if send_frame(&mut uni, &msg).await.is_err() {
+            return;
         }
     }
 
@@ -131,7 +93,7 @@ async fn send_frame(
 
 /// Handle a single QUIC client connection.
 pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
-    let (ctrl_send, mut ctrl_recv) = match conn.accept_bi().await {
+    let (ctrl_send, ctrl_recv) = match conn.accept_bi().await {
         Ok(streams) => streams,
         Err(e) => {
             warn!("Failed to accept control stream: {e}");
@@ -139,84 +101,12 @@ pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
         }
     };
 
-    let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
-
-    let writer_task = tokio::spawn(async move {
-        let mut ctrl_send = ctrl_send;
-        while let Some(msg) = ctrl_rx.recv().await {
-            match encode_server(&msg) {
-                Ok(bytes) => {
-                    if write_frame(&mut ctrl_send, &bytes).await.is_err() {
-                        break;
-                    }
-                }
-                Err(e) => warn!("Failed to encode server message: {e}"),
-            }
-        }
-        let _ = ctrl_send.finish();
-    });
-
-    let mut event_rx = app.subscribe_events();
-    let event_tx = ctrl_tx.clone();
-    let event_task = tokio::spawn(async move {
-        while let Ok(event) = event_rx.recv().await {
-            let msg = pty_event_to_msg(event);
-            let _ = event_tx.send(ServerMessage::Event { event: msg });
-        }
-    });
-
-    let ping_tx = ctrl_tx.clone();
-    let ping_task = tokio::spawn(async move {
-        let mut seq = 0u64;
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            if ping_tx.send(ServerMessage::Ping { seq }).is_err() {
-                break;
-            }
-            seq += 1;
-        }
-    });
-
-    let attacher = QuicAttacher { conn: conn.clone() };
-    let mut state = SharedClientState::new(app.clone(), ctrl_tx, "");
-
-    loop {
-        match read_frame(&mut ctrl_recv).await {
-            Ok(Some(data)) => match decode_client(&data) {
-                Ok(client_msg) => {
-                    if !handle_message(&mut state, client_msg, &attacher).await {
-                        break;
-                    }
-                }
-                Err(e) => {
-                    warn!("Failed to decode client message: {e}");
-                    state.error(None, ErrorCode::InvalidMessage, e.to_string());
-                }
-            },
-            Ok(None) => {
-                debug!("Control stream closed");
-                break;
-            }
-            Err(e) => {
-                warn!("Control stream read error: {e}");
-                break;
-            }
-        }
-    }
-
-    event_task.abort();
-    ping_task.abort();
-
-    if let Some(client_id) = state.client_id {
-        app.detach_client_all(client_id).await;
-    }
-    if let Some(conn_id) = state.connection_id {
-        app.unregister_client(conn_id).await;
-    }
-
-    drop(state);
-    writer_task.abort();
-    info!("Connection closed");
+    run_client_session(
+        ctrl_recv,
+        ctrl_send,
+        app,
+        |_| QuicAttacher { conn: conn.clone() },
+        "",
+    )
+    .await;
 }

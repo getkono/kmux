@@ -99,6 +99,19 @@ pub fn key_to_bytes(
     }
 }
 
+/// Map a signal menu key character to a Unix signal number.
+///
+/// Returns `None` for unrecognised keys.
+pub fn signal_from_key(key: &str) -> Option<i32> {
+    match key {
+        "k" => Some(9),  // SIGKILL
+        "t" => Some(15), // SIGTERM
+        "s" => Some(19), // SIGSTOP
+        "c" => Some(18), // SIGCONT
+        _ => None,
+    }
+}
+
 /// Encode mouse scroll events as terminal escape sequences.
 ///
 /// `col` and `row` are 1-based terminal coordinates.

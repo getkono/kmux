@@ -1,3 +1,23 @@
+use std::fmt;
+
+/// The active transport channel between client and daemon.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportKind {
+    /// QUIC/UDP transport (preferred; lower latency, multiplexed streams).
+    Quic,
+    /// TCP transport (fallback; tunnels through SSH or other TCP proxies).
+    Tcp,
+}
+
+impl fmt::Display for TransportKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            TransportKind::Quic => write!(f, "QUIC"),
+            TransportKind::Tcp => write!(f, "TCP"),
+        }
+    }
+}
+
 /// Current wire protocol version. Bump when the wire format changes.
 ///
 /// The client sends this in `ClientMessage::Auth` and the server rejects
@@ -43,4 +63,26 @@ pub fn epoch_millis() -> u64 {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_millis() as u64
+}
+
+/// Convert a Unix timestamp (seconds since epoch) to `(year, month, day, hour, minute, second)`
+/// UTC without any external dependencies.
+pub fn epoch_secs_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
+    let days = secs / 86400;
+    let time = secs % 86400;
+    let h = (time / 3600) as u32;
+    let mi = ((time % 3600) / 60) as u32;
+    let s = (time % 60) as u32;
+
+    let z = days + 719468;
+    let era = z / 146097;
+    let doe = z % 146097;
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+    let y = yoe + era * 400;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let mo = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
+    let y = if mo <= 2 { y + 1 } else { y } as u32;
+    (y, mo, d, h, mi, s)
 }

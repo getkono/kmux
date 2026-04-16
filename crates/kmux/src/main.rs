@@ -22,7 +22,8 @@ use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
 use app::App;
-use cli::{Cli, Command, generate_instance_id};
+use cli::{Cli, Command};
+use kmux_client::generate_instance_id;
 use subcommands::{resolve_connection, run_daemon_command, run_list_sessions};
 
 #[tokio::main]

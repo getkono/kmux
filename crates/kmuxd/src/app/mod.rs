@@ -13,6 +13,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use kmux_protocol::TransportKind;
 use kmux_protocol::messages::{
     ClientCapabilities, ClientId, ConnectionId, InputMode, SessionStatus, TermSize,
 };
@@ -103,22 +104,6 @@ pub struct SessionState {
     pub panes: HashMap<u32, PaneRelay>,
     /// Next pane index to assign (monotonically increasing within this session).
     pub next_pane_index: u32,
-}
-
-/// Active transport kind for a connection.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransportKind {
-    Quic,
-    Tcp,
-}
-
-impl std::fmt::Display for TransportKind {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            TransportKind::Quic => write!(f, "quic"),
-            TransportKind::Tcp => write!(f, "tcp"),
-        }
-    }
 }
 
 /// Per-connection state tracked by `ServerApp` for channel switching.
