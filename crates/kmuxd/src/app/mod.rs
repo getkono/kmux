@@ -1,8 +1,11 @@
+pub(super) mod ansi_emit;
 mod attach;
 mod crud;
 mod helpers;
 mod io;
+mod pane_crud;
 mod persistence;
+pub(super) mod restore;
 
 pub use attach::{AttachResult, InputLockOutcome};
 

@@ -1,99 +1,12 @@
-//! Shared client message dispatch logic used by both the QUIC and TCP transports.
-//!
-//! Each transport implements [`PaneAttacher`] to handle the transport-specific
-//! part of `ClientMessage::Attach` (opening a QUIC uni-stream vs. forwarding
-//! over the shared TCP control channel).  Everything else is handled here in
-//! [`handle_message`].
-
-use std::collections::HashMap;
-
-use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ClientMessage, ConnectionId, ErrorCode, ServerMessage,
-    SessionEventMsg,
-};
+use kmux_protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
 use tokio::sync::mpsc;
-use tokio::task::AbortHandle;
 use tracing::{debug, info, warn};
 
-use crate::app::{AttachResult, InputLockOutcome, ServerApp};
+use crate::app::InputLockOutcome;
 use crate::auth::validate_token;
 use crate::connection::classify_error;
 
-/// Per-client output channel capacity (number of `ServerMessage` items buffered).
-pub const CLIENT_CHANNEL_CAPACITY: usize = 512;
-
-// ─── PaneAttacher trait ───────────────────────────────────────────────────────
-
-/// Abstracts the transport-specific part of a pane `Attach`: given the
-/// `AttachResult` from the app layer and a receiver of live `ServerMessage`
-/// frames, start a background task that streams pane diffs to the client and
-/// return its [`AbortHandle`].
-pub trait PaneAttacher: Send + Sync {
-    fn start_pane_stream(
-        &self,
-        pane_id: String,
-        result: AttachResult,
-        client_rx: mpsc::Receiver<ServerMessage>,
-    ) -> impl std::future::Future<Output = Result<AbortHandle, String>> + Send;
-}
-
-// ─── Shared client state ──────────────────────────────────────────────────────
-
-/// Transport-independent state for a connected client.
-pub struct SharedClientState {
-    pub authenticated: bool,
-    pub client_id: Option<ClientId>,
-    pub connection_id: Option<ConnectionId>,
-    pub capabilities: ClientCapabilities,
-    /// Output-forwarding task handles, keyed by pane_id.
-    pub attached: HashMap<String, AbortHandle>,
-    /// Sender for the control-stream writer task.
-    pub ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
-    pub app: std::sync::Arc<ServerApp>,
-    /// Short label used in log messages, e.g. `""` (QUIC) or `"TCP "`.
-    pub transport_label: &'static str,
-}
-
-impl SharedClientState {
-    pub fn new(
-        app: std::sync::Arc<ServerApp>,
-        ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
-        transport_label: &'static str,
-    ) -> Self {
-        Self {
-            authenticated: false,
-            client_id: None,
-            connection_id: None,
-            capabilities: ClientCapabilities::default(),
-            attached: HashMap::new(),
-            ctrl_tx,
-            app,
-            transport_label,
-        }
-    }
-
-    pub fn send(&self, msg: ServerMessage) {
-        let _ = self.ctrl_tx.send(msg);
-    }
-
-    pub fn error(&self, req: Option<u64>, code: ErrorCode, message: impl Into<String>) {
-        self.send(ServerMessage::Error {
-            request_id: req,
-            code,
-            message: message.into(),
-        });
-    }
-}
-
-impl Drop for SharedClientState {
-    fn drop(&mut self) {
-        for (_, handle) in self.attached.drain() {
-            handle.abort();
-        }
-    }
-}
-
-// ─── Message dispatch ─────────────────────────────────────────────────────────
+use super::{CLIENT_CHANNEL_CAPACITY, PaneAttacher, SharedClientState};
 
 /// Dispatch a single [`ClientMessage`] for a connected client.
 ///
@@ -381,38 +294,4 @@ pub async fn handle_message<A: PaneAttacher>(
     }
 
     true
-}
-
-// ─── Shared helpers ───────────────────────────────────────────────────────────
-
-/// Translate a kmux-pty lifecycle event into a protocol [`SessionEventMsg`].
-///
-/// The pty registry uses `pane_id` as the session name.
-pub fn pty_event_to_msg(event: kmux_pty::events::SessionEvent) -> SessionEventMsg {
-    match event {
-        kmux_pty::events::SessionEvent::Spawned { name } => {
-            SessionEventMsg::PaneSpawned { pane_id: name }
-        }
-        kmux_pty::events::SessionEvent::Exited { name, status } => SessionEventMsg::PaneExited {
-            pane_id: name,
-            code: status.code(),
-            signal: match status {
-                kmux_pty::process::ExitStatus::Signal(s) => Some(s),
-                _ => None,
-            },
-        },
-        kmux_pty::events::SessionEvent::Resized { name, rows, cols } => {
-            SessionEventMsg::PaneResized {
-                pane_id: name,
-                rows,
-                cols,
-            }
-        }
-        kmux_pty::events::SessionEvent::Closed { name } => {
-            SessionEventMsg::PaneClosed { pane_id: name }
-        }
-        kmux_pty::events::SessionEvent::Timeout { name, .. } => {
-            SessionEventMsg::PaneClosed { pane_id: name }
-        }
-    }
 }

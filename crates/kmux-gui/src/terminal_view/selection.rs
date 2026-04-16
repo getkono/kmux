@@ -12,7 +12,7 @@ const SELECTION_BG: IcedColor = IcedColor {
 };
 
 /// Draw the selection overlay as semi-transparent rectangles.
-pub(super) fn draw_selection_overlay(
+pub fn draw_selection_overlay(
     renderer: &iced::Renderer,
     bounds: Rectangle,
     sel: &Selection,

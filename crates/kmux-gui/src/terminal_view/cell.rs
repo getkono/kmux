@@ -13,7 +13,7 @@ pub(super) fn cell_color_to_iced(c: kmux_protocol::messages::CellColor) -> IcedC
     IcedColor::from_rgb8(c.r, c.g, c.b)
 }
 
-pub(super) fn default_bg() -> IcedColor {
+pub fn default_bg() -> IcedColor {
     IcedColor::from_rgb8(0x28, 0x2c, 0x34)
 }
 

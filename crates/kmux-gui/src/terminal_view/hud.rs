@@ -7,7 +7,7 @@ use kmux_client::event_log::DiagSnapshot;
 use kmux_client::metrics::MetricsSnapshot;
 
 /// Draw a scroll position indicator at the top-right corner.
-pub(super) fn draw_scroll_indicator(
+pub fn draw_scroll_indicator(
     renderer: &iced::Renderer,
     bounds: Rectangle,
     scroll_offset: usize,
@@ -51,7 +51,7 @@ pub(super) fn draw_scroll_indicator(
 }
 
 /// Draw the HUD overlay as an uncached geometry layer.
-pub(super) fn draw_hud(
+pub fn draw_hud(
     renderer: &iced::Renderer,
     bounds: Rectangle,
     metrics: &MetricsSnapshot,

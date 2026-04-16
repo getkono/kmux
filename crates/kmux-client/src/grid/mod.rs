@@ -1,123 +1,14 @@
-use std::collections::VecDeque;
+mod scrollback;
+mod selection;
+pub use scrollback::ScrollbackBuffer;
+pub use selection::{DEFAULT_BG, GridPos, MULTI_CLICK_TIMEOUT_MS, Selection, SelectionMode};
 
 use kmux_protocol::messages::{
-    CellAttrs, CellColor, CellState, CursorState, DiffOp, GridSnapshot, TermModes, TerminalDiff,
+    CellAttrs, CellState, CursorState, DiffOp, GridSnapshot, TermModes, TerminalDiff,
 };
 
 pub const CELL_WIDTH: f32 = 8.0;
 pub const CELL_HEIGHT: f32 = 16.0;
-
-// ── Selection types ──
-
-/// An absolute position in the terminal's combined scrollback + visible grid.
-/// Row 0 = oldest scrollback line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GridPos {
-    pub row: usize,
-    pub col: usize,
-}
-
-impl GridPos {
-    pub fn min(a: GridPos, b: GridPos) -> GridPos {
-        if (a.row, a.col) <= (b.row, b.col) {
-            a
-        } else {
-            b
-        }
-    }
-    pub fn max(a: GridPos, b: GridPos) -> GridPos {
-        if (a.row, a.col) >= (b.row, b.col) {
-            a
-        } else {
-            b
-        }
-    }
-}
-
-/// Selection mode based on click count.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SelectionMode {
-    Normal,
-    Word,
-    Line,
-}
-
-/// A text selection range.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct Selection {
-    pub anchor: GridPos,
-    pub end: GridPos,
-    pub mode: SelectionMode,
-}
-
-impl Selection {
-    /// The earlier (top-left) position.
-    pub fn start(&self) -> GridPos {
-        GridPos::min(self.anchor, self.end)
-    }
-    /// The later (bottom-right) position.
-    pub fn end_pos(&self) -> GridPos {
-        GridPos::max(self.anchor, self.end)
-    }
-}
-
-/// Double/triple-click detection timeout.
-pub const MULTI_CLICK_TIMEOUT_MS: u128 = 400;
-
-/// Default background color (One Dark). Matches `CellState::default().bg`.
-pub const DEFAULT_BG: CellColor = CellColor::new(0x28, 0x2c, 0x34);
-
-/// Maximum number of scrollback lines per session.
-const MAX_SCROLLBACK_LINES: usize = 50_000;
-
-/// Ring buffer of scrollback lines, stored oldest-first.
-pub struct ScrollbackBuffer {
-    lines: VecDeque<Vec<CellState>>,
-    max_lines: usize,
-}
-
-impl ScrollbackBuffer {
-    pub fn new(max_lines: usize) -> Self {
-        Self {
-            lines: VecDeque::new(),
-            max_lines,
-        }
-    }
-
-    /// Push new scrollback lines (oldest first).
-    pub fn push_lines(&mut self, new_lines: Vec<Vec<CellState>>) {
-        for line in new_lines {
-            if self.lines.len() >= self.max_lines {
-                self.lines.pop_front();
-            }
-            self.lines.push_back(line);
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.lines.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.lines.is_empty()
-    }
-
-    /// Get a scrollback line by index.
-    pub fn get(&self, index: usize) -> Option<&Vec<CellState>> {
-        self.lines.get(index)
-    }
-
-    /// Clear all scrollback.
-    pub fn clear(&mut self) {
-        self.lines.clear();
-    }
-}
-
-impl Default for ScrollbackBuffer {
-    fn default() -> Self {
-        Self::new(MAX_SCROLLBACK_LINES)
-    }
-}
 
 /// Client-side grid state -- receives pre-resolved cells from the server.
 ///

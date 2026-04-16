@@ -1,66 +1,21 @@
+mod config;
+mod convert;
+
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::AtomicBool;
 
-use kmux_protocol::messages::{
-    CellAttrs, CellColor, CellState, CursorShape, CursorState, TermModes,
-};
-use tattoy_wezterm_surface::{CursorShape as WezCursorShape, CursorVisibility};
-use tattoy_wezterm_term::{
-    Blink, CursorPosition, Intensity, Terminal, TerminalConfiguration, TerminalSize, Underline,
-    color::{ColorAttribute, ColorPalette, SrgbaTuple},
-};
+use kmux_protocol::messages::{CellAttrs, CellState, CursorState, TermModes};
+use tattoy_wezterm_term::{Terminal, TerminalSize};
 
-use super::TerminalBackend;
-
-const SCROLLBACK_LINES: usize = 50_000;
-
-/// Terminal configuration for the kmux server-side emulator.
-///
-/// The kitty feature flags are backed by shared atomics so that the daemon
-/// can update them at any time (e.g. when a client attaches or detaches)
-/// without rebuilding the backend.  wezterm-term queries these flags on every
-/// relevant escape-sequence handler, so changes take effect immediately.
-#[derive(Debug)]
-struct KmuxTerminalConfig {
-    /// Whether to accept kitty graphics protocol sequences.
-    /// Defaults to `false` until an attached client declares support.
-    kitty_graphics: Arc<AtomicBool>,
-    /// Whether to accept kitty keyboard enhancement sequences.
-    /// Defaults to `false` until an attached client declares support.
-    kitty_keyboard: Arc<AtomicBool>,
-}
-
-impl TerminalConfiguration for KmuxTerminalConfig {
-    fn scrollback_size(&self) -> usize {
-        SCROLLBACK_LINES
-    }
-
-    fn color_palette(&self) -> ColorPalette {
-        // Use the default (xterm-256) palette. The server resolves all named /
-        // indexed colours to RGB before sending to clients.  Clients then
-        // substitute their own theme for cells that carried DEFAULT_FG/DEFAULT_BG.
-        ColorPalette::default()
-    }
-
-    fn enable_kitty_graphics(&self) -> bool {
-        // Queried per escape-sequence by wezterm-term, so changes to the
-        // underlying atomic take effect on the very next advance_bytes call.
-        // Phase A: image data is dropped in fill_cells_inner (TODO(images)).
-        // We default this to false so we don't silently consume sequences that
-        // no currently-attached client can render.
-        self.kitty_graphics.load(Ordering::Relaxed)
-    }
-
-    fn enable_kitty_keyboard(&self) -> bool {
-        self.kitty_keyboard.load(Ordering::Relaxed)
-    }
-}
+use crate::backend::TerminalBackend;
+use config::KmuxTerminalConfig;
+use convert::{cell_state_from_attrs, convert_cursor};
 
 /// VT emulator backend powered by `tattoy-wezterm-term`.
 pub struct WezTermBackend {
-    term: Terminal,
-    rows: u16,
-    cols: u16,
+    pub(super) term: Terminal,
+    pub(super) rows: u16,
+    pub(super) cols: u16,
 }
 
 impl WezTermBackend {
@@ -244,115 +199,12 @@ impl WezTermBackend {
     }
 }
 
-// ─── Conversion helpers ───────────────────────────────────────────────────────
-
-fn convert_cursor(pos: &CursorPosition) -> CursorState {
-    let visible = pos.visibility == CursorVisibility::Visible;
-    CursorState {
-        row: pos.y.max(0) as u16,
-        col: pos.x as u16,
-        shape: if !visible {
-            CursorShape::Hidden
-        } else {
-            convert_cursor_shape(pos.shape)
-        },
-        visible,
-    }
-}
-
-fn convert_cursor_shape(shape: WezCursorShape) -> CursorShape {
-    match shape {
-        WezCursorShape::Default | WezCursorShape::BlinkingBlock | WezCursorShape::SteadyBlock => {
-            CursorShape::Block
-        }
-        WezCursorShape::BlinkingUnderline | WezCursorShape::SteadyUnderline => {
-            CursorShape::Underline
-        }
-        WezCursorShape::BlinkingBar | WezCursorShape::SteadyBar => CursorShape::Bar,
-    }
-}
-
-fn cell_state_from_attrs(
-    c: char,
-    width: usize,
-    attrs: &tattoy_wezterm_term::CellAttributes,
-    palette: &ColorPalette,
-) -> CellState {
-    let is_inverse = attrs.reverse();
-
-    // Resolve fg and bg, swapping if INVERSE is set.
-    let (fg_attr, bg_attr) = if is_inverse {
-        (attrs.background(), attrs.foreground())
-    } else {
-        (attrs.foreground(), attrs.background())
-    };
-
-    let fg = resolve_color(fg_attr, palette);
-    let bg = resolve_color(bg_attr, palette);
-
-    // Determine DEFAULT_FG / DEFAULT_BG after accounting for the swap.
-    let orig_fg_is_default = attrs.foreground() == ColorAttribute::Default;
-    let orig_bg_is_default = attrs.background() == ColorAttribute::Default;
-    let (displayed_fg_is_default, displayed_bg_is_default) = if is_inverse {
-        (orig_bg_is_default, orig_fg_is_default)
-    } else {
-        (orig_fg_is_default, orig_bg_is_default)
-    };
-
-    let mut bits: u16 = 0;
-    // Intensity
-    match attrs.intensity() {
-        Intensity::Bold => bits |= CellAttrs::BOLD,
-        Intensity::Half => bits |= CellAttrs::DIM,
-        Intensity::Normal => {}
-    }
-    if attrs.italic() {
-        bits |= CellAttrs::ITALIC;
-    }
-    if attrs.underline() != Underline::None {
-        bits |= CellAttrs::UNDERLINE;
-    }
-    if attrs.strikethrough() {
-        bits |= CellAttrs::STRIKETHROUGH;
-    }
-    if is_inverse {
-        bits |= CellAttrs::INVERSE;
-    }
-    if attrs.invisible() {
-        bits |= CellAttrs::HIDDEN;
-    }
-    if attrs.blink() != Blink::None {
-        bits |= CellAttrs::BLINK;
-    }
-    if width > 1 {
-        bits |= CellAttrs::WIDE_CHAR;
-    }
-    if displayed_fg_is_default {
-        bits |= CellAttrs::DEFAULT_FG;
-    }
-    if displayed_bg_is_default {
-        bits |= CellAttrs::DEFAULT_BG;
-    }
-
-    CellState {
-        c,
-        fg,
-        bg,
-        attrs: CellAttrs(bits),
-    }
-}
-
-fn resolve_color(attr: ColorAttribute, palette: &ColorPalette) -> CellColor {
-    let srgba: SrgbaTuple = palette.resolve_fg(attr);
-    let (r, g, b, _) = srgba.as_rgba_u8();
-    CellColor::new(r, g, b)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::diff_engine::{DiffEngine, DiffResult};
-    use kmux_protocol::messages::DiffOp;
+    use kmux_protocol::messages::{CellColor, DiffOp};
+    use std::sync::atomic::AtomicBool;
 
     fn expect_cell_diff(result: DiffResult) -> kmux_protocol::messages::TerminalDiff {
         match result {

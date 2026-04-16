@@ -1,154 +1,8 @@
 use kmux_client::key::{Key, Modifiers, NamedKey};
 
-/// Zellij-style mode for the TUI.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
-pub enum Mode {
-    /// Keys pass through to PTY. Only Ctrl+G is intercepted.
-    #[default]
-    Normal,
-    /// Everything passes through. Ctrl+G to unlock.
-    Locked,
-    /// Mode selector shown at bottom. Single key picks a mode.
-    Select,
-    /// Session management: c=create session, p=create pane, X=close session,
-    /// x=close pane, n=next session, Tab/j/k=pane nav, r=rename, d=disconnect
-    Session,
-    /// Scroll through history: Up/Down/PgUp/PgDn, Esc to exit
-    Scroll,
-    /// Signal menu: k=SIGKILL, t=SIGTERM, s=SIGSTOP, c=SIGCONT
-    Signal,
-    /// Confirm close session (y/n)
-    ConfirmCloseSession { word_id: String },
-    /// Rename session (typing new name)
-    RenameSession { word_id: String, buffer: String },
-    /// Floating session picker with search
-    SessionPicker,
-    /// Floating server picker with search (recent servers)
-    ServerPicker,
-    /// Help overlay
-    Help,
-    /// Connect screen (typing host/port/token)
-    Connect { field: ConnectField },
-    /// Directory picker for remote connections: type a path to open/create a session
-    DirectoryPicker,
-}
+use super::{Action, ConnectField, Mode, is_mode_key};
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConnectField {
-    Host,
-    Port,
-    Token,
-}
-
-/// Actions that the app should perform in response to key input.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Action {
-    // Session management
-    CreateSession,
-    CloseSession,
-    ConfirmCloseYes,
-    NextSession,
-    PrevSession,
-    JumpToSession(usize),
-    RenameSession,
-    RenameChar(char),
-    RenameBackspace,
-    RenameSubmit,
-    Disconnect,
-
-    // Pane management
-    CreatePane,
-    ClosePane,
-    NextPane,
-    PrevPane,
-
-    // Session picker
-    CloseSessionPicker,
-    SelectPickerEntry,
-    PickerUp,
-    PickerDown,
-    PickerSearchChar(char),
-    PickerSearchBackspace,
-
-    // Server picker
-    ServerPickerChar(char),
-    ServerPickerBackspace,
-    ServerPickerUp,
-    ServerPickerDown,
-    ServerPickerSelect,
-    ServerPickerClose,
-
-    // Signals
-    SendSignal(i32),
-
-    // Scroll
-    ScrollUp(usize),
-    ScrollDown(usize),
-    ScrollPageUp,
-    ScrollPageDown,
-
-    // HUD / modes
-    ToggleHud,
-    ToggleSnapshotMode,
-    ToggleInputLock,
-
-    // Clipboard
-    CopySelection,
-    Paste,
-
-    // Input
-    ForwardKey,
-
-    // Mode transitions
-    ExitToNormal,
-
-    // Connect screen
-    ConnectSubmit,
-    ConnectNextField,
-    ConnectPrevField,
-    ConnectChar(char),
-    ConnectBackspace,
-
-    // Directory picker (remote connection)
-    DirPickerChar(char),
-    DirPickerBackspace,
-    DirPickerUp,
-    DirPickerDown,
-    DirPickerSubmit,
-    DirPickerCancel,
-
-    // Quit the application
-    Quit,
-
-    // No-op
-    None,
-}
-
-/// The Ctrl+G mode switch key.
-fn is_mode_key(key: &Key, mods: Modifiers) -> bool {
-    mods.contains(Modifiers::CTRL) && matches!(key, Key::Character(c) if c == "g")
-}
-
-/// Resolve a key press in the current mode into a (new_mode, action) pair.
-pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
-    match mode {
-        Mode::Normal => resolve_normal(key, mods),
-        Mode::Locked => resolve_locked(key, mods),
-        Mode::Select => resolve_mode_select(key, mods),
-        Mode::Session => resolve_session(key, mods),
-        Mode::Scroll => resolve_scroll(key, mods),
-        Mode::Signal => resolve_signal(key, mods),
-        Mode::ConfirmCloseSession { .. } => resolve_confirm_close(key),
-        Mode::RenameSession { .. } => resolve_rename(key, mods),
-        Mode::SessionPicker => resolve_session_picker(key, mods),
-        Mode::ServerPicker => resolve_server_picker(key),
-        Mode::Help => resolve_help(key),
-        Mode::Connect { field } => resolve_connect(key, mods, field),
-        Mode::DirectoryPicker => resolve_dir_picker(key),
-    }
-}
-
-fn resolve_normal(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+pub fn resolve_normal(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     if is_mode_key(key, mods) {
         return (Some(Mode::Select), Action::None);
     }
@@ -177,7 +31,7 @@ fn resolve_normal(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     (None, Action::ForwardKey)
 }
 
-fn resolve_locked(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+pub fn resolve_locked(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     if is_mode_key(key, mods) {
         return (Some(Mode::Normal), Action::None);
     }
@@ -185,7 +39,7 @@ fn resolve_locked(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     (None, Action::ForwardKey)
 }
 
-fn resolve_mode_select(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+pub fn resolve_mode_select(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     match key {
         Key::Character(c) => match c.as_str() {
             "s" => (Some(Mode::Session), Action::None),
@@ -202,7 +56,7 @@ fn resolve_mode_select(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     }
 }
 
-fn resolve_session(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+pub fn resolve_session(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     match key {
         Key::Character(c) => match c.as_str() {
             "c" => (Some(Mode::Normal), Action::CreateSession),
@@ -238,7 +92,7 @@ fn resolve_session(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     }
 }
 
-fn resolve_scroll(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+pub fn resolve_scroll(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     match key {
         Key::Named(NamedKey::ArrowUp) => (None, Action::ScrollUp(1)),
         Key::Named(NamedKey::ArrowDown) => (None, Action::ScrollDown(1)),
@@ -252,7 +106,7 @@ fn resolve_scroll(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     }
 }
 
-fn resolve_signal(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+pub fn resolve_signal(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     match key {
         Key::Character(c) => {
             let action = match c.as_str() {
@@ -269,14 +123,14 @@ fn resolve_signal(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     }
 }
 
-fn resolve_confirm_close(key: &Key) -> (Option<Mode>, Action) {
+pub fn resolve_confirm_close(key: &Key) -> (Option<Mode>, Action) {
     match key {
         Key::Character(c) if c == "y" => (Some(Mode::Normal), Action::ConfirmCloseYes),
         _ => (Some(Mode::Normal), Action::None),
     }
 }
 
-fn resolve_rename(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+pub fn resolve_rename(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     match key {
         Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::None),
         Key::Named(NamedKey::Enter) => (Some(Mode::Normal), Action::RenameSubmit),
@@ -321,7 +175,7 @@ fn resolve_picker(
     }
 }
 
-fn resolve_session_picker(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+pub fn resolve_session_picker(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     resolve_picker(
         key,
         Action::CloseSessionPicker,
@@ -333,7 +187,7 @@ fn resolve_session_picker(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action)
     )
 }
 
-fn resolve_server_picker(key: &Key) -> (Option<Mode>, Action) {
+pub fn resolve_server_picker(key: &Key) -> (Option<Mode>, Action) {
     resolve_picker(
         key,
         Action::ServerPickerClose,
@@ -345,13 +199,13 @@ fn resolve_server_picker(key: &Key) -> (Option<Mode>, Action) {
     )
 }
 
-fn resolve_help(key: &Key) -> (Option<Mode>, Action) {
+pub fn resolve_help(key: &Key) -> (Option<Mode>, Action) {
     // Any key exits help
     let _ = key;
     (Some(Mode::Normal), Action::None)
 }
 
-fn resolve_dir_picker(key: &Key) -> (Option<Mode>, Action) {
+pub fn resolve_dir_picker(key: &Key) -> (Option<Mode>, Action) {
     resolve_picker(
         key,
         Action::DirPickerCancel,
@@ -363,7 +217,11 @@ fn resolve_dir_picker(key: &Key) -> (Option<Mode>, Action) {
     )
 }
 
-fn resolve_connect(key: &Key, mods: Modifiers, _field: &ConnectField) -> (Option<Mode>, Action) {
+pub fn resolve_connect(
+    key: &Key,
+    mods: Modifiers,
+    _field: &ConnectField,
+) -> (Option<Mode>, Action) {
     match key {
         Key::Named(NamedKey::Enter) => (None, Action::ConnectSubmit),
         Key::Named(NamedKey::Tab) => {
@@ -385,129 +243,11 @@ fn resolve_connect(key: &Key, mods: Modifiers, _field: &ConnectField) -> (Option
     }
 }
 
-/// Returns hint bar entries for a given mode: (key_label, description).
-pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
-    match mode {
-        Mode::Normal => vec![("Ctrl+G", "Mode select")],
-        Mode::Locked => vec![("Ctrl+G", "Unlock")],
-        Mode::Select => vec![
-            ("s", "Session"),
-            ("o", "Scroll"),
-            ("k", "Signal"),
-            ("l", "Lock"),
-            ("h", "HUD"),
-            ("?", "Help"),
-            ("q", "Quit"),
-            ("Esc", "Cancel"),
-        ],
-        Mode::Session => vec![
-            ("c", "New session"),
-            ("p", "New pane"),
-            ("X", "Close session"),
-            ("x", "Close pane"),
-            ("n/\u{2190}\u{2192}", "Sessions"),
-            ("Tab/j/k", "Panes"),
-            ("r", "Rename"),
-            ("d", "Disconnect"),
-            ("Esc", "Back"),
-        ],
-        Mode::Scroll => vec![
-            ("\u{2191}/\u{2193}", "Scroll"),
-            ("PgUp/Dn", "Page"),
-            ("q/Esc", "Exit"),
-        ],
-        Mode::Signal => vec![
-            ("k", "SIGKILL"),
-            ("t", "SIGTERM"),
-            ("s", "SIGSTOP"),
-            ("c", "SIGCONT"),
-            ("Esc", "Cancel"),
-        ],
-        Mode::ConfirmCloseSession { .. } => vec![("y", "Confirm close"), ("any", "Cancel")],
-        Mode::RenameSession { .. } => vec![("Enter", "Submit"), ("Esc", "Cancel")],
-        Mode::SessionPicker => vec![
-            ("\u{2191}/\u{2193}", "Navigate"),
-            ("Enter", "Select"),
-            ("Esc", "Cancel"),
-        ],
-        Mode::ServerPicker => vec![
-            ("\u{2191}/\u{2193}", "Navigate"),
-            ("Enter", "Connect"),
-            ("Esc", "Cancel"),
-        ],
-        Mode::Help => vec![("any key", "Close")],
-        Mode::Connect { .. } => vec![("Tab", "Next field"), ("Enter", "Connect")],
-        Mode::DirectoryPicker => vec![
-            ("\u{2191}/\u{2193}", "Navigate"),
-            ("Enter", "Open/create"),
-            ("Esc", "Cancel"),
-        ],
-    }
-}
-
-/// Display name for the mode (shown in status bar).
-pub fn mode_name(mode: &Mode) -> &'static str {
-    match mode {
-        Mode::Normal => "NORMAL",
-        Mode::Locked => "LOCKED",
-        Mode::Select => "SELECT MODE",
-        Mode::Session => "SESSION",
-        Mode::Scroll => "SCROLL",
-        Mode::Signal => "SIGNAL",
-        Mode::ConfirmCloseSession { .. } => "CONFIRM CLOSE",
-        Mode::RenameSession { .. } => "RENAME",
-        Mode::SessionPicker => "SESSION PICKER",
-        Mode::ServerPicker => "SERVER PICKER",
-        Mode::Help => "HELP",
-        Mode::Connect { .. } => "CONNECT",
-        Mode::DirectoryPicker => "OPEN SESSION",
-    }
-}
-
-/// Help entries for the full help overlay.
-pub fn help_entries() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("Ctrl+G", "Enter mode selector"),
-        ("", ""),
-        ("-- Mode Select --", ""),
-        ("s", "Session mode"),
-        ("o", "Scroll mode"),
-        ("k", "Signal mode"),
-        ("l", "Locked mode (passthrough)"),
-        ("h", "Toggle HUD metrics"),
-        ("?", "This help"),
-        ("q", "Quit"),
-        ("", ""),
-        ("-- Session Mode --", ""),
-        ("c", "Create new session"),
-        ("p", "Create new pane"),
-        ("X", "Close current session"),
-        ("x", "Close current pane"),
-        ("n / \u{2192}", "Next session"),
-        ("\u{2190}", "Previous session"),
-        ("Tab / j", "Next pane"),
-        ("k", "Previous pane"),
-        ("0-9", "Jump to session"),
-        ("r", "Rename session"),
-        ("d", "Disconnect"),
-        ("l", "Toggle input lock"),
-        ("f", "Toggle snapshot mode"),
-        ("", ""),
-        ("-- Scroll Mode --", ""),
-        ("\u{2191}/\u{2193}", "Scroll line"),
-        ("PgUp/PgDn", "Scroll page"),
-        ("q / Esc", "Exit scroll"),
-        ("", ""),
-        ("-- Global --", ""),
-        ("Shift+PgUp/Dn", "Quick scroll"),
-        ("Ctrl+Shift+C", "Copy selection"),
-        ("Ctrl+Shift+V", "Paste"),
-    ]
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use kmux_client::key::{Key, Modifiers, NamedKey};
+
+    use crate::mode::{Action, Mode, resolve};
 
     #[test]
     fn ctrl_g_enters_mode_select() {

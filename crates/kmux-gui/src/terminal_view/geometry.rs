@@ -1,7 +1,7 @@
 use kmux_client::grid::{CELL_HEIGHT, CELL_WIDTH, GridPos};
 
 /// Convert a pixel position to an absolute grid position.
-pub(super) fn pixel_to_grid_pos(
+pub fn pixel_to_grid_pos(
     x: f32,
     y: f32,
     cols: usize,
