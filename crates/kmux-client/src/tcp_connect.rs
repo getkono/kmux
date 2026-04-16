@@ -1,4 +1,8 @@
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+
 use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ConnectionId, ServerMessage};
+use kmux_protocol::tls::{TofuStore, TofuVerifier};
 use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
@@ -90,6 +94,215 @@ pub async fn connect_tcp(
     });
 
     ConnectResult::Connected(client_tx)
+}
+
+/// Establish a TLS-over-TCP connection to `host:port` and authenticate with `token`.
+///
+/// Certificate verification uses TOFU (`known_hosts.toml`).  The `tofu_key`
+/// parameter lets callers separate the connection address from the TOFU identity:
+/// for SSH-tunnel connections pass `"remote_host:remote_port"` so the pin is
+/// keyed to the actual server, not the ephemeral loopback port.
+#[allow(clippy::too_many_arguments)]
+pub async fn connect_tcp_tls(
+    host: String,
+    port: u16,
+    tofu_key: String,
+    token: String,
+    server_tx: mpsc::UnboundedSender<ServerMessage>,
+    capabilities: ClientCapabilities,
+    connection_id: Option<ConnectionId>,
+    accept_invalid: bool,
+) -> ConnectResult {
+    use rustls::pki_types::ServerName;
+    use tokio_rustls::TlsConnector;
+
+    // Load (or create) TOFU store from known_hosts.toml.
+    let store = load_tofu_store();
+    let verifier = TofuVerifier::new(tofu_key, "tcp+tls", store, accept_invalid);
+    let client_config = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
+    let connector = TlsConnector::from(Arc::new(client_config));
+
+    let server_name = match ServerName::try_from(host.as_str()) {
+        Ok(n) => n.to_owned(),
+        Err(e) => return ConnectResult::Failed(format!("invalid server name '{host}': {e}")),
+    };
+
+    let stream = match TcpStream::connect(format!("{host}:{port}")).await {
+        Ok(s) => s,
+        Err(e) => {
+            return ConnectResult::Failed(format!("TCP connect to {host}:{port} failed: {e}"));
+        }
+    };
+    if let Err(e) = set_tcp_keepalive(&stream) {
+        warn!("Failed to set TCP keepalive: {e}");
+    }
+
+    let tls_stream = match connector.connect(server_name, stream).await {
+        Ok(s) => s,
+        Err(e) => {
+            return ConnectResult::Failed(format!("TLS handshake with {host}:{port} failed: {e}"));
+        }
+    };
+
+    let (mut read_half, mut write_half) = tokio::io::split(tls_stream);
+
+    let auth_bytes = match encode_client(&ClientMessage::Auth {
+        token,
+        protocol_version: kmux_protocol::messages::PROTOCOL_VERSION,
+        capabilities,
+        connection_id,
+    }) {
+        Ok(bytes) => bytes,
+        Err(e) => return ConnectResult::Failed(format!("TCP+TLS auth encode failed: {e}")),
+    };
+    if let Err(e) = write_frame(&mut write_half, &auth_bytes).await {
+        return ConnectResult::Failed(format!("TCP+TLS auth write failed: {e}"));
+    }
+
+    let (client_tx, mut client_rx) = mpsc::unbounded_channel::<ClientMessage>();
+
+    let writer_handle = tokio::spawn(async move {
+        while let Some(msg) = client_rx.recv().await {
+            match encode_client(&msg) {
+                Ok(bytes) => {
+                    if write_frame(&mut write_half, &bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => warn!("TCP+TLS encode error: {e}"),
+            }
+        }
+        debug!("TCP+TLS writer task exited");
+    });
+
+    tokio::spawn(async move {
+        loop {
+            match read_frame(&mut read_half).await {
+                Ok(Some(data)) => match decode_server(&data) {
+                    Ok(msg) => {
+                        if server_tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => warn!("TCP+TLS decode error: {e}"),
+                },
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("TCP+TLS read error: {e}");
+                    break;
+                }
+            }
+        }
+        writer_handle.abort();
+        debug!("TCP+TLS reader task exited");
+    });
+
+    ConnectResult::Connected(client_tx)
+}
+
+/// Establish a Unix domain socket connection to `socket_path` and authenticate.
+///
+/// No TLS is used — UDS connections are local and the OS enforces ownership
+/// via socket permissions (0600) and optionally peer-credential checks.
+pub async fn connect_uds(
+    socket_path: impl AsRef<Path>,
+    token: String,
+    server_tx: mpsc::UnboundedSender<ServerMessage>,
+    capabilities: ClientCapabilities,
+    connection_id: Option<ConnectionId>,
+) -> ConnectResult {
+    let socket_path = socket_path.as_ref();
+
+    let stream = match tokio::net::UnixStream::connect(socket_path).await {
+        Ok(s) => s,
+        Err(e) => {
+            return ConnectResult::Failed(format!(
+                "UDS connect to {} failed: {e}",
+                socket_path.display()
+            ));
+        }
+    };
+
+    let (mut read_half, mut write_half) = tokio::io::split(stream);
+
+    let auth_bytes = match encode_client(&ClientMessage::Auth {
+        token,
+        protocol_version: kmux_protocol::messages::PROTOCOL_VERSION,
+        capabilities,
+        connection_id,
+    }) {
+        Ok(bytes) => bytes,
+        Err(e) => return ConnectResult::Failed(format!("UDS auth encode failed: {e}")),
+    };
+    if let Err(e) = write_frame(&mut write_half, &auth_bytes).await {
+        return ConnectResult::Failed(format!("UDS auth write failed: {e}"));
+    }
+
+    let (client_tx, mut client_rx) = mpsc::unbounded_channel::<ClientMessage>();
+
+    let writer_handle = tokio::spawn(async move {
+        while let Some(msg) = client_rx.recv().await {
+            match encode_client(&msg) {
+                Ok(bytes) => {
+                    if write_frame(&mut write_half, &bytes).await.is_err() {
+                        break;
+                    }
+                }
+                Err(e) => warn!("UDS encode error: {e}"),
+            }
+        }
+        debug!("UDS writer task exited");
+    });
+
+    tokio::spawn(async move {
+        loop {
+            match read_frame(&mut read_half).await {
+                Ok(Some(data)) => match decode_server(&data) {
+                    Ok(msg) => {
+                        if server_tx.send(msg).is_err() {
+                            break;
+                        }
+                    }
+                    Err(e) => warn!("UDS decode error: {e}"),
+                },
+                Ok(None) => break,
+                Err(e) => {
+                    warn!("UDS read error: {e}");
+                    break;
+                }
+            }
+        }
+        writer_handle.abort();
+        debug!("UDS reader task exited");
+    });
+
+    ConnectResult::Connected(client_tx)
+}
+
+/// Load the TOFU store from `known_hosts.toml`, or fall back to a temp-file
+/// backed in-memory store for this process run.
+fn load_tofu_store() -> Arc<Mutex<TofuStore>> {
+    let path = kmux_protocol::dirs::known_hosts_path()
+        .inspect_err(|e| warn!("cannot determine known_hosts path: {e}"))
+        .ok();
+    let store = path.and_then(|p| {
+        TofuStore::load(p)
+            .inspect_err(|e| warn!("failed to load known_hosts: {e}"))
+            .ok()
+    });
+    match store {
+        Some(s) => Arc::new(Mutex::new(s)),
+        None => {
+            let tmp = std::env::temp_dir().join(format!("kmux-tofu-{}.toml", std::process::id()));
+            Arc::new(Mutex::new(TofuStore::load(tmp).unwrap_or_else(|_| {
+                TofuStore::load(std::env::temp_dir().join("kmux-tofu-fallback.toml"))
+                    .unwrap_or_else(|_| unreachable!("TOFU load from fallback path"))
+            })))
+        }
+    }
 }
 
 fn set_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {

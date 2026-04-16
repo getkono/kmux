@@ -1,12 +1,13 @@
 use std::time::Duration;
 
 use kmux_client::connect::ConnectResult;
-use kmux_client::quic_probe;
 use kmux_client::session_manager::SessionEvent;
 use kmux_client::ssh::SshSession;
+use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
 use kmux_client::tcp_connect;
 use kmux_client::transport::TransportKind;
 use kmux_protocol::messages::{ConnectionId, ServerMessage, SessionEntry, TermSize};
+use kmux_protocol::transport::bootstrap::EndpointAdvert;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -121,36 +122,41 @@ impl App {
 
     /// Connect to kmuxd via an already-negotiated SSH tunnel.
     ///
-    /// Calls `tcp_connect::connect_tcp`, and on success:
-    /// - sets the WebSocket sender and transport kind to TCP
+    /// Calls `tcp_connect::connect_tcp_tls`, and on success:
+    /// - sets the active sender and transport kind to TCP+TLS
     /// - spawns a tunnel health monitor task
-    /// - spawns a background QUIC upgrade probe
+    /// - spawns a background `TransportSupervisor` upgrade probe
     ///
-    /// Returns the oneshot sender used to deliver the `ConnectionId` to the QUIC
-    /// probe once TCP auth completes, or `None` if the TCP connection failed.
+    /// Returns the oneshot sender used to deliver the `ConnectionId` to the
+    /// supervisor once TCP+TLS auth completes, or `None` if the connection failed.
     pub(super) async fn connect_via_ssh_session(
         &mut self,
         ssh: SshSession,
         srv_tx: mpsc::UnboundedSender<ServerMessage>,
-        upgrade_tx: mpsc::Sender<quic_probe::UpgradeReady>,
+        upgrade_tx: mpsc::Sender<UpgradeSignal>,
         tunnel_died_tx: mpsc::Sender<()>,
         connection_id: Option<ConnectionId>,
     ) -> Option<tokio::sync::oneshot::Sender<ConnectionId>> {
-        let tcp_result = tcp_connect::connect_tcp(
+        // TOFU key is remote_host:remote_port (not the local tunnel port) so
+        // the pin identifies the actual server across different tunnel sessions.
+        let tofu_key = format!("{}:{}", ssh.remote_host, ssh.remote_tcp_port);
+        let tcp_result = tcp_connect::connect_tcp_tls(
             "127.0.0.1".to_string(),
             ssh.local_tcp_port,
+            tofu_key,
             ssh.token.clone(),
             srv_tx.clone(),
             self.mgr.capabilities().clone(),
             connection_id,
+            self.mgr.accept_invalid_certs(),
         )
         .await;
 
         match tcp_result {
             ConnectResult::Connected(sender) => {
                 self.mgr.set_ws_sender(sender);
-                self.mgr.current_transport = TransportKind::Tcp;
-                info!("Connected via SSH tunnel (TCP transport)");
+                self.mgr.current_transport = TransportKind::TcpTls;
+                info!("Connected via SSH tunnel (TCP+TLS transport)");
 
                 // Spawn tunnel health monitor.
                 let mut tunnel_proc = ssh.tunnel_process;
@@ -160,7 +166,9 @@ impl App {
                     let _ = monitor_died_tx.send(()).await;
                 });
 
-                // Spawn QUIC upgrade probe.
+                // Spawn TransportSupervisor to probe for QUIC or other upgrades.
+                // The supervisor needs the ConnectionId which is only available after
+                // AuthResult, so we deliver it via a oneshot channel.
                 let quic_host = ssh.remote_host.clone();
                 let quic_port = ssh.quic_port;
                 let token = ssh.token.clone();
@@ -168,20 +176,26 @@ impl App {
                 let accept_invalid = self.mgr.accept_invalid_certs();
                 let (conn_id_tx, conn_id_rx) = tokio::sync::oneshot::channel::<ConnectionId>();
                 tokio::spawn(async move {
-                    if let Ok(conn_id) = conn_id_rx.await {
-                        quic_probe::quic_upgrade_loop(quic_probe::QuicProbeParams {
-                            remote_host: quic_host,
-                            quic_port,
-                            token,
-                            connection_id: conn_id,
-                            capabilities,
-                            accept_invalid_certs: accept_invalid,
-                            srv_tx,
-                            upgrade_tx,
-                            max_failures: 10,
-                        })
-                        .await;
-                    }
+                    let Ok(conn_id) = conn_id_rx.await else {
+                        return;
+                    };
+                    // Build endpoint list: probe direct QUIC on the remote host.
+                    let endpoints = vec![EndpointAdvert {
+                        kind: TransportKind::Quic,
+                        address: format!("{quic_host}:{quic_port}"),
+                    }];
+                    let supervisor = TransportSupervisor::new(SupervisorParams {
+                        endpoints,
+                        connection_id: conn_id,
+                        token,
+                        capabilities,
+                        accept_invalid_certs: accept_invalid,
+                        active_transport: TransportKind::TcpTls,
+                        is_local: false,
+                        server_tx: srv_tx,
+                        upgrade_tx,
+                    });
+                    supervisor.run().await;
                 });
 
                 Some(conn_id_tx)

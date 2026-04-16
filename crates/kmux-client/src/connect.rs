@@ -1,8 +1,9 @@
 use std::net::ToSocketAddrs;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ConnectionId, ServerMessage};
+use kmux_protocol::tls::{TofuStore, TofuVerifier};
 use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
 use tokio::sync::{Semaphore, mpsc};
 use tracing::{debug, warn};
@@ -43,7 +44,7 @@ pub async fn connect(
         None => return ConnectResult::Failed(format!("cannot resolve {host}:{port}")),
     };
 
-    let client_config = build_quinn_client_config(accept_invalid_certs);
+    let client_config = build_quinn_client_config(&host, port, accept_invalid_certs);
 
     let mut endpoint = match quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()) {
         Ok(ep) => ep,
@@ -167,23 +168,41 @@ pub async fn connect(
     ConnectResult::Connected(client_tx)
 }
 
-fn build_quinn_client_config(accept_invalid: bool) -> quinn::ClientConfig {
-    let crypto = if accept_invalid {
-        rustls::ClientConfig::builder()
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(NoVerifier))
-            .with_no_client_auth()
-    } else {
-        let mut roots = rustls::RootCertStore::empty();
-        for cert in rustls_native_certs::load_native_certs().certs {
-            if let Err(e) = roots.add(cert) {
-                warn!("failed to add native cert: {e}");
+fn build_quinn_client_config(host: &str, port: u16, accept_invalid: bool) -> quinn::ClientConfig {
+    let addr_key = format!("{host}:{port}");
+
+    // Load (or create empty) TOFU store from known_hosts.toml.
+    let store = {
+        let path = kmux_protocol::dirs::known_hosts_path()
+            .inspect_err(|e| warn!("cannot determine known_hosts path: {e}"))
+            .ok();
+        let store = path.and_then(|p| {
+            TofuStore::load(p)
+                .inspect_err(|e| warn!("failed to load known_hosts: {e}"))
+                .ok()
+        });
+        // Fall back to a temp-file-backed store if loading fails — still persists within
+        // this process run but won't survive across restarts.
+        match store {
+            Some(s) => Arc::new(Mutex::new(s)),
+            None => {
+                // Can't get a usable path; use an ephemeral in-memory store.
+                let tmp =
+                    std::env::temp_dir().join(format!("kmux-tofu-{}.toml", std::process::id()));
+                Arc::new(Mutex::new(TofuStore::load(tmp).unwrap_or_else(|_| {
+                    TofuStore::load(std::env::temp_dir().join("kmux-tofu-fallback.toml"))
+                        .unwrap_or_else(|_| unreachable!("empty TOFU store"))
+                })))
             }
         }
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth()
     };
+
+    let verifier = TofuVerifier::new(addr_key, "quic", store, accept_invalid);
+
+    let crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(verifier))
+        .with_no_client_auth();
 
     let quic_crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto)
         .expect("valid QUIC client config");
@@ -201,46 +220,4 @@ fn build_quinn_client_config(accept_invalid: bool) -> quinn::ClientConfig {
     config.transport_config(Arc::new(transport));
 
     config
-}
-
-/// A certificate verifier that accepts any certificate.
-/// Use ONLY in development environments with self-signed certificates.
-#[derive(Debug)]
-struct NoVerifier;
-
-impl rustls::client::danger::ServerCertVerifier for NoVerifier {
-    fn verify_server_cert(
-        &self,
-        _end_entity: &rustls::pki_types::CertificateDer<'_>,
-        _intermediates: &[rustls::pki_types::CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
-        _ocsp_response: &[u8],
-        _now: rustls::pki_types::UnixTime,
-    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        Ok(rustls::client::danger::ServerCertVerified::assertion())
-    }
-
-    fn verify_tls12_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dh_params: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn verify_tls13_signature(
-        &self,
-        _message: &[u8],
-        _cert: &rustls::pki_types::CertificateDer<'_>,
-        _dh_params: &rustls::DigitallySignedStruct,
-    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
-    }
-
-    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
-        rustls::crypto::CryptoProvider::get_default()
-            .map(|p| p.signature_verification_algorithms.supported_schemes())
-            .unwrap_or_default()
-    }
 }

@@ -2,9 +2,9 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{Event, EventStream};
 use futures::StreamExt;
-use kmux_client::quic_probe;
 use kmux_client::session_manager::SessionEvent;
 use kmux_client::ssh;
+use kmux_client::supervisor::UpgradeSignal;
 use kmux_client::transport::TransportKind;
 use kmux_protocol::messages::ServerMessage;
 use ratatui::Terminal;
@@ -28,8 +28,8 @@ impl App {
         let mut event_stream = EventStream::new();
         let (srv_tx, mut srv_rx) = mpsc::unbounded_channel::<ServerMessage>();
         let mut reconnect_timer: Option<tokio::time::Instant> = None;
-        // Receives the new QUIC sender when a background upgrade probe succeeds.
-        let (upgrade_tx, mut upgrade_rx) = mpsc::channel::<quic_probe::UpgradeReady>(1);
+        // Receives a better transport when the background supervisor probe succeeds.
+        let (upgrade_tx, mut upgrade_rx) = mpsc::channel::<UpgradeSignal>(1);
         // SSH tunnel health: signals when the SSH tunnel process exits unexpectedly.
         let (tunnel_died_tx, mut tunnel_died_rx) = mpsc::channel::<()>(1);
         // When in SSH mode, this sender is used to deliver the ConnectionId to the
@@ -293,7 +293,7 @@ impl App {
                 }
                 tunnel_died = tunnel_died_rx.recv() => {
                     if tunnel_died.is_some() && self.mgr.connected
-                        && self.mgr.current_transport == TransportKind::Tcp
+                        && self.mgr.current_transport == TransportKind::TcpTls
                     {
                         info!("SSH tunnel process exited; triggering reconnect");
                         self.mgr.mark_connection_lost();
@@ -315,10 +315,10 @@ impl App {
                     }
                 }
                 upgrade = upgrade_rx.recv() => {
-                    if let Some(ready) = upgrade {
-                        // Signal the new QUIC channel is ready to become primary.
-                        ready.sender.send(kmux_protocol::messages::ClientMessage::ChannelReady).ok();
-                        self.mgr.apply_quic_upgrade(ready.sender);
+                    if let Some(signal) = upgrade {
+                        // Signal the new channel is ready, then apply the transport swap.
+                        signal.sender.send(kmux_protocol::messages::ClientMessage::ChannelReady).ok();
+                        self.mgr.apply_transport_upgrade(signal.sender, signal.new_kind);
                         self.needs_render = true;
                     }
                 }

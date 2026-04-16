@@ -89,10 +89,10 @@ impl SessionManager {
 
     /// Attempt to switch the active transport to QUIC.
     ///
-    /// Called when the QUIC upgrade probe in `quic_probe::quic_upgrade_loop`
-    /// signals success.  The new QUIC sender must already be authenticated
-    /// (i.e., the server has received `Auth { connection_id: Some(...) }` and
-    /// sent back `AuthResult { success: true }`).
+    /// Called when the `TransportSupervisor` signals a successful QUIC probe.
+    /// The new QUIC sender must already be authenticated (i.e., the server has
+    /// received `Auth { connection_id: Some(...) }` and sent back
+    /// `AuthResult { success: true }`).
     ///
     /// The caller is responsible for sending `ClientMessage::ChannelReady` on
     /// the new sender before calling this method.
@@ -108,19 +108,37 @@ impl SessionManager {
         );
     }
 
-    /// Switch the active transport to TCP (fallback).
+    /// Switch the active transport to TCP+TLS (fallback).
     ///
-    /// Called when QUIC drops and a TCP-over-SSH tunnel has been re-established.
-    /// `new_sender` must already be authenticated on the TCP transport with the
+    /// Called when QUIC drops and a TCP+TLS-over-SSH tunnel has been re-established.
+    /// `new_sender` must already be authenticated on the TCP+TLS transport with the
     /// existing `connection_id`.
     pub fn apply_tcp_fallback(&mut self, new_sender: mpsc::UnboundedSender<ClientMessage>) {
         let old_transport = self.current_transport;
         let _ = self.ws_sender.replace(new_sender);
-        self.current_transport = TransportKind::Tcp;
+        self.current_transport = TransportKind::TcpTls;
         info!(
             "Transport channel fell back: {} -> {}",
             old_transport,
-            TransportKind::Tcp
+            TransportKind::TcpTls
+        );
+    }
+
+    /// Apply any transport upgrade, choosing the correct method based on `kind`.
+    ///
+    /// Used by the `TransportSupervisor` so it can signal upgrades without
+    /// knowing which specific method to call.
+    pub fn apply_transport_upgrade(
+        &mut self,
+        new_sender: mpsc::UnboundedSender<ClientMessage>,
+        new_kind: TransportKind,
+    ) {
+        let old_transport = self.current_transport;
+        let _ = self.ws_sender.replace(new_sender);
+        self.current_transport = new_kind;
+        info!(
+            "Transport channel switched: {} -> {}",
+            old_transport, new_kind
         );
     }
 }

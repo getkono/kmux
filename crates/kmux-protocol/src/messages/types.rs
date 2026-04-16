@@ -1,12 +1,20 @@
 use std::fmt;
 
 /// The active transport channel between client and daemon.
+///
+/// This enum is **not** serialised in wire messages (only used as `String` in
+/// `ChannelSwitched.old_transport`), so adding variants here is source-only and
+/// does not require a `PROTOCOL_VERSION` bump.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TransportKind {
     /// QUIC/UDP transport (preferred; lower latency, multiplexed streams).
     Quic,
-    /// TCP transport (fallback; tunnels through SSH or other TCP proxies).
+    /// Plain TCP transport (legacy fallback; used only inside SSH tunnels before Phase 4).
     Tcp,
+    /// TCP with mandatory TLS (LAN, UDP-blocked internet, SSH `-L` forwarding).
+    TcpTls,
+    /// Unix domain socket (local same-host IPC; lowest overhead).
+    Uds,
 }
 
 impl fmt::Display for TransportKind {
@@ -14,6 +22,8 @@ impl fmt::Display for TransportKind {
         match self {
             TransportKind::Quic => write!(f, "QUIC"),
             TransportKind::Tcp => write!(f, "TCP"),
+            TransportKind::TcpTls => write!(f, "TCP+TLS"),
+            TransportKind::Uds => write!(f, "UDS"),
         }
     }
 }

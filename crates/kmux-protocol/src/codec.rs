@@ -33,7 +33,7 @@ pub fn decode_server(data: &[u8]) -> Result<ServerMessage, ProtocolError> {
     postcard::from_bytes(data).map_err(ProtocolError::Postcard)
 }
 
-//  Length-prefixed framing for QUIC byte streams
+//  Length-prefixed framing for async byte streams
 
 /// Maximum frame size (16 MiB) -- prevents unbounded allocations from malformed data.
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
@@ -289,7 +289,7 @@ mod framing_tests {
 
     #[tokio::test]
     async fn frame_roundtrip() {
-        let data = b"hello, QUIC!";
+        let data = b"hello, framing!";
         let mut buf = Vec::new();
         write_frame(&mut buf, data).await.expect("write");
         assert_eq!(buf.len(), 4 + data.len());

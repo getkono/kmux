@@ -1,35 +1,44 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
-
 use tracing::{info, warn};
+
+use crate::config::{ListenKind, ServerConfig};
+use crate::tls::{CertMaterial, build_server_config};
+use kmux_protocol::messages::TransportKind;
+use kmux_protocol::transport::quic::QuicListener;
+use kmux_protocol::transport::tcp_tls::TlsTcpListener;
+use kmux_protocol::transport::uds::UdsListener;
+use kmux_protocol::transport::{AcceptError, IncomingSession, Listener};
 
 use crate::app::ServerApp;
 use crate::auth::{generate_token, persist_token};
 use crate::term_state;
 use crate::tls;
 
-use super::Cli;
-
-pub async fn async_main(cli: Cli) -> anyhow::Result<()> {
+pub async fn async_main(daemon: bool, cfg: ServerConfig) -> anyhow::Result<()> {
     info!(backend = term_state::BACKEND_NAME, "terminal backend");
+    info!(
+        runtime_dir = %cfg.runtime_dir,
+        allow_peer_cred = cfg.auth.allow_peer_cred,
+        "effective configuration loaded"
+    );
 
-    let tls_config = if cli.self_signed {
-        let (cert, key) = tls::generate_self_signed()?;
-        tls::build_tls_config(cert, key)?
+    // ── TLS material ───────────────────────────────────────────────────────────
+    let material = if cfg.tls.self_signed {
+        CertMaterial::self_signed()?
     } else {
-        let cert_path = cli
-            .cert
-            .ok_or_else(|| anyhow::anyhow!("--cert is required without --self-signed"))?;
-        let key_path = cli
-            .key
-            .ok_or_else(|| anyhow::anyhow!("--key is required without --self-signed"))?;
-        tls::load_tls_config(&cert_path, &key_path)?
+        let cert_path = cfg.tls.cert.ok_or_else(|| {
+            anyhow::anyhow!(
+                "TLS cert path required (set [tls] cert in kmuxd.toml or use --self-signed)"
+            )
+        })?;
+        let key_path = cfg.tls.key.ok_or_else(|| {
+            anyhow::anyhow!("TLS key path required (set [tls] key in kmuxd.toml)")
+        })?;
+        CertMaterial::from_files(&cert_path, &key_path)?
     };
-
-    let quinn_config = tls::build_quinn_config(tls_config)?;
 
     let token = generate_token();
     match persist_token(&token) {
@@ -58,9 +67,7 @@ pub async fn async_main(cli: Cli) -> anyhow::Result<()> {
         }
     }
 
-    // Periodic checkpoint task: saves session state every 30 seconds for
-    // crash recovery. Does NOT set keep_alive (children may still be killed
-    // by the kernel if the daemon crashes).
+    // Periodic checkpoint task.
     {
         let persist_app = Arc::clone(&app);
         tokio::spawn(async move {
@@ -82,78 +89,119 @@ pub async fn async_main(cli: Cli) -> anyhow::Result<()> {
         });
     }
 
-    let addr: SocketAddr = format!("{}:{}", cli.bind, cli.port).parse()?;
-    let endpoint = quinn::Endpoint::server(quinn_config, addr)?;
-    let actual_addr = endpoint.local_addr()?;
-    let actual_port = actual_addr.port();
-    info!("Listening on quic://{actual_addr}");
+    // ── Build and bind all configured listeners ────────────────────────────────
+    // Track resolved listener configs with actual bound ports (replacing port=0).
+    let mut resolved_listeners = cfg.listeners.clone();
+    let mut bound_listeners: Vec<Box<dyn Listener>> = Vec::new();
+    // Track QUIC endpoints so we can close them on shutdown.
+    let mut quic_endpoints: Vec<quinn::Endpoint> = Vec::new();
+    // Ports for the daemon control socket (first QUIC + first TCP+TLS).
+    let mut quic_port: u16 = 0;
+    let mut tcp_port: u16 = 0;
 
-    // Start the TCP fallback/tunnel transport listener.
-    let tcp_bind: SocketAddr = format!("{}:{}", cli.bind, cli.tcp_port).parse()?;
-    let tcp_port = crate::tcp_listener::serve_tcp(tcp_bind, Arc::clone(&app)).await?;
-
-    let shutdown = Arc::new(Notify::new());
-
-    if cli.daemon {
-        let socket_path = kmux_protocol::dirs::socket_path()?;
-        let pid_path = kmux_protocol::dirs::pid_path()?;
-        let start_time = Instant::now();
-        let token_clone = token.clone();
-        let app_clone = Arc::clone(&app);
-        let shutdown_clone = Arc::clone(&shutdown);
-        tokio::spawn(async move {
-            crate::daemon::serve_control_socket(
-                socket_path,
-                pid_path,
-                actual_port,
-                tcp_port,
-                token_clone,
-                start_time,
-                app_clone,
-                shutdown_clone,
-            )
-            .await;
-        });
-    }
-
-    // Install signal handlers for the foreground (non-daemon) case.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
-
-    loop {
-        tokio::select! {
-            incoming = endpoint.accept() => {
-                match incoming {
-                    Some(incoming) => {
-                        let app = Arc::clone(&app);
-                        tokio::spawn(async move {
-                            match incoming.await {
-                                Ok(conn) => {
-                                    crate::connection::handle(conn, app).await;
-                                }
-                                Err(e) => tracing::error!("QUIC connection failed: {e}"),
-                            }
-                        });
-                    }
-                    None => break,
+    for (i, listener_cfg) in cfg.listeners.iter().enumerate() {
+        if !listener_cfg.enabled {
+            continue;
+        }
+        match listener_cfg.kind {
+            ListenKind::Quic => {
+                let addr: std::net::SocketAddr =
+                    format!("{}:{}", listener_cfg.bind, listener_cfg.port).parse()?;
+                let quinn_config = tls::build_quinn_config(build_server_config(material.clone())?)?;
+                let endpoint = quinn::Endpoint::server(quinn_config, addr)?;
+                let actual_addr = endpoint.local_addr()?;
+                info!("Listening on quic://{actual_addr}");
+                if quic_port == 0 {
+                    quic_port = actual_addr.port();
                 }
+                resolved_listeners[i].port = actual_addr.port();
+                quic_endpoints.push(endpoint.clone());
+                bound_listeners.push(Box::new(QuicListener::new(endpoint)));
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received SIGINT, shutting down");
-                break;
+            ListenKind::TcpTls => {
+                let addr: std::net::SocketAddr =
+                    format!("{}:{}", listener_cfg.bind, listener_cfg.port).parse()?;
+                let tcp_cfg = build_server_config(material.clone())?;
+                let tls_listener = TlsTcpListener::bind(addr, tcp_cfg).await?;
+                let actual_addr = tls_listener.local_addr()?;
+                info!("Listening on tcp+tls://{actual_addr}");
+                if tcp_port == 0 {
+                    tcp_port = actual_addr.port();
+                }
+                resolved_listeners[i].port = actual_addr.port();
+                bound_listeners.push(Box::new(tls_listener));
             }
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM, shutting down");
-                break;
-            }
-            _ = shutdown.notified() => {
-                info!("Shutdown requested via control socket");
-                break;
+            ListenKind::Unix => {
+                let path = if listener_cfg.path == "auto" {
+                    kmux_protocol::dirs::data_socket_path()?
+                } else {
+                    std::path::PathBuf::from(&listener_cfg.path)
+                };
+                let uds_listener = UdsListener::bind(&path)?;
+                // Resolve "auto" in the config so announce.rs has the real path.
+                resolved_listeners[i].path = path.to_string_lossy().into_owned();
+                info!("Listening on unix://{}", path.display());
+                bound_listeners.push(Box::new(uds_listener));
             }
         }
     }
 
-    // Clean shutdown: checkpoint the full session state so the next daemon
-    // start can replay the visual content as preamble in fresh shells.
+    // ── Spawn one accept-loop task per listener ────────────────────────────────
+    let mut listener_handles = Vec::new();
+    for mut listener in bound_listeners {
+        let app = Arc::clone(&app);
+        let handle = tokio::spawn(async move {
+            loop {
+                match listener.accept().await {
+                    Ok(session) => {
+                        let app = Arc::clone(&app);
+                        tokio::spawn(async move {
+                            dispatch_session(session, app).await;
+                        });
+                    }
+                    Err(AcceptError::Closed) => break,
+                    Err(e) => warn!("accept error on {} listener: {e}", listener.kind()),
+                }
+            }
+        });
+        listener_handles.push(handle);
+    }
+
+    let shutdown = Arc::new(Notify::new());
+
+    if daemon {
+        let params = crate::daemon::ControlSocketParams {
+            socket_path: kmux_protocol::dirs::socket_path()?,
+            pid_path: kmux_protocol::dirs::pid_path()?,
+            quic_port,
+            tcp_port,
+            token: token.clone(),
+            start_time: Instant::now(),
+            app: Arc::clone(&app),
+            shutdown: Arc::clone(&shutdown),
+            listeners: resolved_listeners,
+            public_host: cfg.advertise.public_host.clone(),
+        };
+        tokio::spawn(async move {
+            crate::daemon::serve_control_socket(params).await;
+        });
+    }
+
+    // Install signal handlers and wait for any shutdown signal.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
+
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => { info!("Received SIGINT, shutting down"); }
+        _ = sigterm.recv() => { info!("Received SIGTERM, shutting down"); }
+        _ = shutdown.notified() => { info!("Shutdown requested via control socket"); }
+    }
+
+    // Abort listener tasks.
+    for handle in listener_handles {
+        handle.abort();
+    }
+
+    // Clean shutdown: checkpoint the full session state.
     let shutdown_state = app.checkpoint_state().await;
     match kmux_protocol::dirs::session_state_path() {
         Ok(path) => {
@@ -166,6 +214,36 @@ pub async fn async_main(cli: Cli) -> anyhow::Result<()> {
         Err(e) => warn!("could not determine checkpoint path on shutdown: {e}"),
     }
 
-    endpoint.close(0u32.into(), b"shutdown");
+    for endpoint in quic_endpoints {
+        endpoint.close(0u32.into(), b"shutdown");
+    }
     Ok(())
+}
+
+/// Dispatch a newly accepted session to the appropriate transport handler.
+async fn dispatch_session(session: IncomingSession, app: Arc<ServerApp>) {
+    use tracing::Instrument;
+    let span = session.span.clone();
+    match session.kind {
+        TransportKind::Quic => {
+            let conn = *session
+                .extra
+                .downcast::<quinn::Connection>()
+                .expect("QUIC IncomingSession must carry quinn::Connection in extra");
+            crate::connection::handle_with_io(session.read, session.write, conn, app, span.clone())
+                .instrument(span)
+                .await;
+        }
+        TransportKind::Tcp | TransportKind::TcpTls => {
+            crate::tcp_listener::handle_tcp_io(session.read, session.write, app, span.clone())
+                .instrument(span)
+                .await;
+        }
+        TransportKind::Uds => {
+            // UDS sessions use the same single-stream mux as TCP.
+            crate::tcp_listener::handle_tcp_io(session.read, session.write, app, span.clone())
+                .instrument(span)
+                .await;
+        }
+    }
 }

@@ -119,6 +119,10 @@ pub enum SshError {
     TunnelFailed(String),
     #[error("SSH process exited unexpectedly")]
     SshProcessDied,
+    #[error(
+        "protocol version mismatch: client={client}, server={server} — update kmuxd or kmux to the same version"
+    )]
+    VersionMismatch { client: u32, server: u32 },
 }
 
 /// Parse `server` into a `RemoteTarget`.

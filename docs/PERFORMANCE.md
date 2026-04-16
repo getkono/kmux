@@ -3,6 +3,10 @@
 Architectural optimizations to make kmux competitive with ssh+tmux in
 efficiency, ordered from highest to lowest estimated impact.
 
+For transport selection and latency scoring behavior, see
+[connection.md](connection.md) — specifically the `TransportSupervisor` scorer
+formula, EWMA constants, and the oscillation hysteresis window.
+
 ---
 
 ## 1. Server-Side VT Parsing + Diff-Based Output

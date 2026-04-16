@@ -6,7 +6,7 @@ use kmux_protocol::{encode_server, write_frame};
 use quinn::Connection;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
-use tracing::{Instrument, debug, info, warn};
+use tracing::{Instrument, debug};
 
 use crate::app::{AttachResult, ServerApp};
 use crate::client_handler::{PaneAttacher, build_attach_replay, run_client_session};
@@ -91,29 +91,24 @@ async fn send_frame(
 
 // ─── QUIC connection handler ──────────────────────────────────────────────────
 
-/// Handle a single QUIC client connection.
-pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
-    let remote = conn.remote_address();
-    let conn_span = tracing::info_span!(
-        "connection",
-        transport = "quic",
-        remote = %remote,
-        conn_id = tracing::field::Empty,
-        client_id = tracing::field::Empty,
-    );
-    info!(parent: &conn_span, "QUIC connection from {remote}");
-
-    let (ctrl_send, ctrl_recv) = match conn.accept_bi().await {
-        Ok(streams) => streams,
-        Err(e) => {
-            warn!(parent: &conn_span, "Failed to accept control stream: {e}");
-            return;
-        }
-    };
-
+/// Run a QUIC client session on pre-accepted I/O halves.
+///
+/// Called by `startup.rs` after `QuicListener` accepts a connection and splits
+/// the control stream.  The `conn` is captured by `QuicAttacher` for per-pane
+/// unidirectional streams.
+pub async fn handle_with_io<R, W>(
+    reader: R,
+    writer: W,
+    conn: Connection,
+    app: Arc<ServerApp>,
+    conn_span: tracing::Span,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     run_client_session(
-        ctrl_recv,
-        ctrl_send,
+        reader,
+        writer,
         app,
         |_| QuicAttacher { conn: conn.clone() },
         conn_span.clone(),

@@ -8,7 +8,9 @@ use tokio::net::UnixListener;
 use tokio::sync::Notify;
 use tracing::{error, info, warn};
 
+use crate::announce::{BootstrapPath, build_endpoint_list};
 use crate::app::ServerApp;
+use crate::config::ListenConfig;
 
 /// Daemonize the current process (double-fork) and write the child PID to `pid_path`.
 ///
@@ -43,12 +45,51 @@ struct StatusResponse {
     pid: u32,
     uptime_secs: u64,
     session_count: usize,
+    protocol_version: u32,
+    kmuxd_version: &'static str,
+    endpoints: Vec<EndpointEntry>,
+}
+
+#[derive(Serialize)]
+struct EndpointEntry {
+    kind: String,
+    address: String,
 }
 
 /// JSON response for the stop command.
 #[derive(Serialize)]
 struct StopResponse {
     status: &'static str,
+}
+
+/// Shared state used to respond to each control socket request.
+#[derive(Clone)]
+struct RequestCtx {
+    quic_port: u16,
+    tcp_port: u16,
+    token: String,
+    start_time: Instant,
+    app: Arc<ServerApp>,
+    shutdown: Arc<Notify>,
+    listeners: Vec<ListenConfig>,
+    public_host: Option<String>,
+}
+
+/// Parameters for the Unix control socket server.
+pub struct ControlSocketParams {
+    pub socket_path: PathBuf,
+    pub pid_path: PathBuf,
+    /// Actual bound QUIC port (0 = not listening).
+    pub quic_port: u16,
+    /// Actual bound TCP+TLS port (0 = not listening).
+    pub tcp_port: u16,
+    pub token: String,
+    pub start_time: Instant,
+    pub app: Arc<ServerApp>,
+    pub shutdown: Arc<Notify>,
+    /// Resolved listener configs (with actual bound ports filled in).
+    pub listeners: Vec<ListenConfig>,
+    pub public_host: Option<String>,
 }
 
 /// Bind the Unix control socket and serve status queries.
@@ -58,17 +99,30 @@ struct StopResponse {
 ///
 /// Run this as a `tokio::spawn`ed background task after the QUIC endpoint is
 /// bound and the actual port is known.
-#[allow(clippy::too_many_arguments)]
-pub async fn serve_control_socket(
-    socket_path: PathBuf,
-    pid_path: PathBuf,
-    port: u16,
-    tcp_port: u16,
-    token: String,
-    start_time: Instant,
-    app: Arc<ServerApp>,
-    shutdown: Arc<Notify>,
-) {
+pub async fn serve_control_socket(params: ControlSocketParams) {
+    let ControlSocketParams {
+        socket_path,
+        pid_path,
+        quic_port,
+        tcp_port,
+        token,
+        start_time,
+        app,
+        shutdown,
+        listeners,
+        public_host,
+    } = params;
+
+    let ctx = RequestCtx {
+        quic_port,
+        tcp_port,
+        token,
+        start_time,
+        app,
+        shutdown: Arc::clone(&shutdown),
+        listeners,
+        public_host,
+    };
     // Remove stale socket if it exists from a previous run.
     if socket_path.exists() {
         let _ = std::fs::remove_file(&socket_path);
@@ -109,11 +163,9 @@ pub async fn serve_control_socket(
             accept_result = listener.accept() => {
                 match accept_result {
                     Ok((stream, _)) => {
-                        let token = token.clone();
-                        let app = Arc::clone(&app);
-                        let shutdown = Arc::clone(&shutdown);
+                        let ctx = ctx.clone();
                         tokio::spawn(async move {
-                            handle_control_connection(stream, port, tcp_port, &token, start_time, app, shutdown).await;
+                            handle_control_connection(stream, ctx).await;
                         });
                     }
                     Err(e) => {
@@ -123,12 +175,12 @@ pub async fn serve_control_socket(
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("Received SIGINT, shutting down daemon");
-                shutdown.notify_waiters();
+                ctx.shutdown.notify_waiters();
                 break;
             }
             _ = sigterm.recv() => {
                 info!("Received SIGTERM, shutting down daemon");
-                shutdown.notify_waiters();
+                ctx.shutdown.notify_waiters();
                 break;
             }
         }
@@ -136,15 +188,7 @@ pub async fn serve_control_socket(
     // _guard drops here, cleaning up socket and pid files.
 }
 
-async fn handle_control_connection(
-    stream: tokio::net::UnixStream,
-    port: u16,
-    tcp_port: u16,
-    token: &str,
-    start_time: Instant,
-    app: Arc<ServerApp>,
-    shutdown: Arc<Notify>,
-) {
+async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestCtx) {
     let (read_half, mut write_half) = stream.into_split();
     let mut reader = BufReader::new(read_half);
     let mut line = String::new();
@@ -164,15 +208,30 @@ async fn handle_control_connection(
 
     match req.command.as_str() {
         "status" => {
-            let session_count = app.list_sessions().await.len();
+            let session_count = ctx.app.list_sessions().await.len();
+            let adverts = build_endpoint_list(
+                &ctx.listeners,
+                BootstrapPath::Uds,
+                ctx.public_host.as_deref(),
+            );
+            let endpoints = adverts
+                .into_iter()
+                .map(|a| EndpointEntry {
+                    kind: format!("{}", a.kind),
+                    address: a.address,
+                })
+                .collect();
             let response = StatusResponse {
                 status: "running",
-                port,
-                tcp_port,
-                token: token.to_string(),
+                port: ctx.quic_port,
+                tcp_port: ctx.tcp_port,
+                token: ctx.token.clone(),
                 pid: std::process::id(),
-                uptime_secs: start_time.elapsed().as_secs(),
+                uptime_secs: ctx.start_time.elapsed().as_secs(),
                 session_count,
+                protocol_version: kmux_protocol::messages::PROTOCOL_VERSION,
+                kmuxd_version: env!("CARGO_PKG_VERSION"),
+                endpoints,
             };
             let mut json = match serde_json::to_string(&response) {
                 Ok(s) => s,
@@ -200,7 +259,7 @@ async fn handle_control_connection(
                 warn!("Control socket write error: {e}");
             }
             info!("Received stop command, shutting down daemon");
-            shutdown.notify_waiters();
+            ctx.shutdown.notify_waiters();
         }
         other => {
             warn!("Unknown control command: {other}");

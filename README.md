@@ -14,21 +14,23 @@ TODO
 
 kmux uses a server/client split:
 
-| Crate                                   | Role                                                                   |
-| --------------------------------------- | ---------------------------------------------------------------------- |
-| [`kmux-pty`](crates/kmux-pty)           | Async PTY lifecycle library (spawn, I/O, resize, shutdown)             |
-| [`kmux-protocol`](crates/kmux-protocol) | Shared wire protocol with postcard serialization                       |
-| [`kmuxd`](crates/kmuxd)     | Background daemon — manages PTY sessions, accepts QUIC+TLS connections |
-| [`kmux`](crates/kmux)                   | Desktop GUI client built on [iced](https://github.com/iced-rs/iced)    |
+| Crate                                   | Role                                                                       |
+| --------------------------------------- | -------------------------------------------------------------------------- |
+| [`kmux-pty`](crates/kmux-pty)           | Async PTY lifecycle library (spawn, I/O, resize, shutdown)                 |
+| [`kmux-protocol`](crates/kmux-protocol) | Shared wire protocol, transport traits, TOFU TLS, endpoint URL parser      |
+| [`kmuxd`](crates/kmuxd)                 | Background daemon — manages PTY sessions, multi-transport listener         |
+| [`kmux`](crates/kmux)                   | TUI client — connects over QUIC, TCP+TLS, or UDS with automatic fallback   |
 
 ```
 kmuxd  ->  kmux-pty
 kmuxd  ->  kmux-protocol
-kmux         ->  kmux-protocol
+kmux   ->  kmux-protocol
 ```
 
-The client talks to the server over QUIC+TLS. It does not depend on `kmux-pty`
-directly.
+The client connects to the server over QUIC (preferred), TCP+TLS (fallback), or
+UDS (local). See [docs/connection.md](docs/connection.md) for a full description
+of the two-phase connection model, transport selection, and `kmuxd.toml`
+configuration.
 
 ## Prerequisites
 
@@ -50,18 +52,28 @@ $ cargo run -p kmux
 
 By default, the server binds to `0.0.0.0:8443`.
 
-## Server options
+## Server configuration
+
+Configure `kmuxd` with a TOML file (see [docs/connection.md](docs/connection.md)
+for the full schema):
 
 ```
---bind <addr>       Bind address (default: 0.0.0.0)
---port <port>       Bind port (default: 8443)
---cert <path>       TLS certificate (PEM)
---key <path>        TLS private key (PEM)
---self-signed       Generate a self-signed certificate
+$XDG_CONFIG_HOME/kmuxd/kmuxd.toml    (user)
+/etc/kmuxd/kmuxd.toml                (system)
 ```
 
-Provide `--cert` and `--key` for production use. Use `--self-signed` for
-local development.
+Use `--config <path>` to specify a custom path, or `print-config` to dump
+effective defaults:
+
+```bash
+$ cargo run -p kmuxd -- print-config
+```
+
+For development with a self-signed certificate, the legacy flag still works:
+
+```bash
+$ cargo run -p kmuxd -- --self-signed
+```
 
 ## Development
 

@@ -26,9 +26,17 @@ pub fn runtime_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Path to the daemon Unix domain socket.
+/// Path to the daemon Unix domain socket (control channel).
 pub fn socket_path() -> anyhow::Result<PathBuf> {
     Ok(runtime_dir()?.join("daemon.sock"))
+}
+
+/// Path to the daemon Unix domain socket for data connections.
+///
+/// Distinct from `socket_path()` (the control socket) — this socket accepts
+/// full client sessions using the same framing protocol as TCP/QUIC.
+pub fn data_socket_path() -> anyhow::Result<PathBuf> {
+    Ok(runtime_dir()?.join("daemon-data.sock"))
 }
 
 /// Path to the daemon PID file.
@@ -39,6 +47,47 @@ pub fn pid_path() -> anyhow::Result<PathBuf> {
 /// Path to the auth token file.
 pub fn token_path() -> anyhow::Result<PathBuf> {
     Ok(runtime_dir()?.join("token"))
+}
+
+/// Returns the kmux configuration directory, creating it if necessary.
+///
+/// Uses `$XDG_CONFIG_HOME/kmux` per the XDG Base Directory Specification, falling back to
+/// `$HOME/.config/kmux` when `XDG_CONFIG_HOME` is unset.
+pub fn config_dir() -> anyhow::Result<PathBuf> {
+    let base = match std::env::var("XDG_CONFIG_HOME") {
+        Ok(val) => PathBuf::from(val),
+        Err(_) => {
+            let home = std::env::var("HOME").map(PathBuf::from).or_else(|_| {
+                nix::unistd::User::from_uid(getuid())
+                    .ok()
+                    .flatten()
+                    .map(|u| u.dir)
+                    .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))
+            })?;
+            home.join(".config")
+        }
+    };
+    let dir = base.join("kmux");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .create(&dir)
+        .map_err(|e| anyhow::anyhow!("failed to create config dir {}: {e}", dir.display()))?;
+    Ok(dir)
+}
+
+/// Path to the TOFU known-hosts file used for TLS certificate pinning.
+pub fn known_hosts_path() -> anyhow::Result<PathBuf> {
+    Ok(config_dir()?.join("known_hosts.toml"))
+}
+
+/// Directory where cached TLS certificates are stored (e.g. auto-generated self-signed certs).
+pub fn tls_cert_dir() -> anyhow::Result<PathBuf> {
+    let dir = config_dir()?.join("tls");
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .create(&dir)
+        .map_err(|e| anyhow::anyhow!("failed to create TLS cert dir {}: {e}", dir.display()))?;
+    Ok(dir)
 }
 
 /// Returns the kmux state directory for persistent data (logs, etc.), creating it if necessary.

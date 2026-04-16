@@ -1,43 +1,12 @@
-use std::net::SocketAddr;
 use std::sync::Arc;
 
 use kmux_protocol::messages::ServerMessage;
-use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
-use tracing::{Instrument, info, warn};
+use tracing::Instrument;
 
 use crate::app::{AttachResult, ServerApp};
 use crate::client_handler::{PaneAttacher, build_attach_replay, run_client_session};
-
-/// Bind a TCP listener and accept connections in a loop.
-///
-/// Each accepted connection is handled in its own task using the same
-/// `ClientMessage` / `ServerMessage` protocol as the QUIC transport, but over a
-/// single TCP byte stream with length-prefixed postcard frames.
-pub async fn serve_tcp(addr: SocketAddr, app: Arc<ServerApp>) -> anyhow::Result<u16> {
-    let listener = TcpListener::bind(addr).await?;
-    let actual_port = listener.local_addr()?.port();
-    info!("TCP transport listening on {}", listener.local_addr()?);
-
-    tokio::spawn(async move {
-        loop {
-            match listener.accept().await {
-                Ok((stream, _)) => {
-                    let app = Arc::clone(&app);
-                    tokio::spawn(async move {
-                        handle_tcp(stream, app).await;
-                    });
-                }
-                Err(e) => {
-                    warn!("TCP accept error: {e}");
-                }
-            }
-        }
-    });
-
-    Ok(actual_port)
-}
 
 // ─── TCP-specific PaneAttacher ────────────────────────────────────────────────
 
@@ -45,8 +14,8 @@ pub async fn serve_tcp(addr: SocketAddr, app: Arc<ServerApp>) -> anyhow::Result<
 /// (`ctrl_tx`).  All messages are interleaved on the single TCP byte stream;
 /// the client demultiplexes them by the `pane_id` field carried in each
 /// `ServerMessage` variant.
-struct TcpAttacher {
-    ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+pub(crate) struct TcpAttacher {
+    pub ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
 }
 
 impl PaneAttacher for TcpAttacher {
@@ -76,43 +45,28 @@ impl PaneAttacher for TcpAttacher {
     }
 }
 
-// ─── TCP connection handler ───────────────────────────────────────────────────
+// ─── TCP session handler ──────────────────────────────────────────────────────
 
-/// Handle a single TCP client connection.
-async fn handle_tcp(stream: TcpStream, app: Arc<ServerApp>) {
-    let remote = stream.peer_addr().ok();
-    let conn_span = tracing::info_span!(
-        "connection",
-        transport = "tcp",
-        remote = ?remote,
-        conn_id = tracing::field::Empty,
-        client_id = tracing::field::Empty,
-    );
-    info!(parent: &conn_span, remote = ?remote, "TCP connection accepted");
-
-    let (read_half, write_half) = tokio::io::split(stream);
+/// Run a TCP/UDS client session on pre-split I/O halves.
+///
+/// Called by `startup.rs` after `PlainTcpListener` (or `TlsTcpListener` in
+/// Phase 4) accepts a connection and wraps the stream in boxed I/O.
+pub async fn handle_tcp_io<R, W>(
+    reader: R,
+    writer: W,
+    app: Arc<ServerApp>,
+    conn_span: tracing::Span,
+) where
+    R: tokio::io::AsyncRead + Unpin + Send,
+    W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+{
     run_client_session(
-        read_half,
-        write_half,
+        reader,
+        writer,
         app,
         |ctrl_tx| TcpAttacher { ctrl_tx },
         conn_span.clone(),
     )
     .instrument(conn_span)
     .await;
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use std::net::SocketAddr;
-
-    /// Verify that the TCP listener binds successfully on port 0 (random).
-    #[tokio::test]
-    async fn tcp_listener_binds_random_port() {
-        let app = Arc::new(ServerApp::new("test-token".to_string()));
-        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
-        let port = serve_tcp(addr, app).await.expect("should bind");
-        assert!(port > 0, "expected a non-zero port");
-    }
 }
