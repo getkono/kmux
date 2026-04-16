@@ -67,7 +67,7 @@ pub fn state_dir() -> anyhow::Result<PathBuf> {
     Ok(dir)
 }
 
-/// Path to the client log file (appended to by all kmux/kmux-gui instances).
+/// Path to the client log file (appended to by all kmux instances).
 pub fn client_log_path() -> anyhow::Result<PathBuf> {
     Ok(state_dir()?.join("client.log"))
 }

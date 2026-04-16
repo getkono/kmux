@@ -6,7 +6,6 @@ A terminal multiplexer / session manager with remote desktop capabilities.
 
 - Run server: `cargo run -p kmuxd -- --self-signed`
 - Run TUI client: `cargo run -p kmux`
-- Run GUI client: `cargo run -p kmux-gui`
 - Run tests: `just test`
 - Lint: `just clippy`
 - Lint fix: `just clippy-fix`

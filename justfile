@@ -37,7 +37,7 @@ doc-check:
 doc-test:
     cargo test --doc --all-features
 
-# Tail the client log (kmux / kmux-gui)
+# Tail the client log (kmux)
 tail-client-log:
     tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/kmux/client.log"
 
