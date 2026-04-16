@@ -5,7 +5,7 @@ use kmux_protocol::messages::{ErrorCode, ServerMessage, epoch_millis};
 use kmux_protocol::{decode_client, encode_server, read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+use tracing::{Instrument, Span, debug, info, warn};
 
 use crate::app::{AttachResult, ServerApp};
 use crate::client_handler::{PaneAttacher, SharedClientState, handle_message, pty_event_to_msg};
@@ -57,14 +57,17 @@ pub fn build_attach_replay(attach_result: AttachResult, pane_id: &str) -> Vec<Se
 /// that transport-specific attachers (e.g. `TcpAttacher`) can share the
 /// same output channel as the writer task.
 ///
-/// `transport_label` is prepended to log messages (e.g. `""` for QUIC,
-/// `"TCP "` for TCP).
+/// `conn_span` is the per-connection tracing span (created by the caller with
+/// transport/remote/conn_id/client_id fields).  It is cloned onto each spawned
+/// task so that every log line carries the connection context.  The caller must
+/// also `.instrument(conn_span)` the returned future so the main loop itself
+/// runs within the span.
 pub async fn run_client_session<R, W, A, F>(
     mut reader: R,
     writer: W,
     app: Arc<ServerApp>,
     make_attacher: F,
-    transport_label: &'static str,
+    conn_span: Span,
 ) where
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send + 'static,
@@ -73,47 +76,56 @@ pub async fn run_client_session<R, W, A, F>(
 {
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
-    let writer_task = tokio::spawn(async move {
-        let mut ctrl_rx = ctrl_rx;
-        let mut writer = writer;
-        while let Some(msg) = ctrl_rx.recv().await {
-            match encode_server(&msg) {
-                Ok(bytes) => {
-                    if write_frame(&mut writer, &bytes).await.is_err() {
-                        break;
+    let writer_task = tokio::spawn(
+        async move {
+            let mut ctrl_rx = ctrl_rx;
+            let mut writer = writer;
+            while let Some(msg) = ctrl_rx.recv().await {
+                match encode_server(&msg) {
+                    Ok(bytes) => {
+                        if write_frame(&mut writer, &bytes).await.is_err() {
+                            break;
+                        }
                     }
+                    Err(e) => warn!("encode error: {e}"),
                 }
-                Err(e) => warn!("{transport_label}encode error: {e}"),
             }
+            let _ = writer.shutdown().await;
         }
-        let _ = writer.shutdown().await;
-    });
+        .instrument(conn_span.clone()),
+    );
 
     let mut event_rx = app.subscribe_events();
     let event_tx = ctrl_tx.clone();
-    let event_task = tokio::spawn(async move {
-        while let Ok(event) = event_rx.recv().await {
-            let msg = pty_event_to_msg(event);
-            let _ = event_tx.send(ServerMessage::Event { event: msg });
+    let event_task = tokio::spawn(
+        async move {
+            while let Ok(event) = event_rx.recv().await {
+                let msg = pty_event_to_msg(event);
+                let _ = event_tx.send(ServerMessage::Event { event: msg });
+            }
         }
-    });
+        .instrument(conn_span.clone()),
+    );
 
     let ping_tx = ctrl_tx.clone();
-    let ping_task = tokio::spawn(async move {
-        let mut seq = 0u64;
-        let mut interval = tokio::time::interval(Duration::from_secs(30));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            interval.tick().await;
-            if ping_tx.send(ServerMessage::Ping { seq }).is_err() {
-                break;
+    let ping_task = tokio::spawn(
+        async move {
+            let mut seq = 0u64;
+            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                if ping_tx.send(ServerMessage::Ping { seq }).is_err() {
+                    break;
+                }
+                seq += 1;
             }
-            seq += 1;
         }
-    });
+        .instrument(conn_span.clone()),
+    );
 
     let attacher = make_attacher(ctrl_tx.clone());
-    let mut state = SharedClientState::new(app.clone(), ctrl_tx, transport_label);
+    let mut state = SharedClientState::new(app.clone(), ctrl_tx, conn_span);
 
     loop {
         match read_frame(&mut reader).await {
@@ -124,16 +136,16 @@ pub async fn run_client_session<R, W, A, F>(
                     }
                 }
                 Err(e) => {
-                    warn!("{transport_label}decode error: {e}");
+                    warn!(conn_id = ?state.connection_id.map(|c| c.0), "decode error: {e}");
                     state.error(None, ErrorCode::InvalidMessage, e.to_string());
                 }
             },
             Ok(None) => {
-                debug!("{transport_label}control stream closed");
+                debug!(conn_id = ?state.connection_id.map(|c| c.0), "control stream closed");
                 break;
             }
             Err(e) => {
-                warn!("{transport_label}read error: {e}");
+                warn!(conn_id = ?state.connection_id.map(|c| c.0), "read error: {e}");
                 break;
             }
         }
@@ -142,6 +154,7 @@ pub async fn run_client_session<R, W, A, F>(
     event_task.abort();
     ping_task.abort();
 
+    let log_conn_id = state.connection_id.map(|c| c.0);
     if let Some(client_id) = state.client_id {
         app.detach_client_all(client_id).await;
     }
@@ -151,5 +164,5 @@ pub async fn run_client_session<R, W, A, F>(
 
     drop(state);
     writer_task.abort();
-    info!("{transport_label}connection closed");
+    info!(conn_id = ?log_conn_id, "connection closed");
 }

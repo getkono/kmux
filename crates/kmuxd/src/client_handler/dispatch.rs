@@ -47,6 +47,8 @@ pub async fn handle_message<A: PaneAttacher>(
                 state.connection_id = Some(conn_id);
                 state.capabilities = capabilities;
                 state.authenticated = true;
+                state.conn_span.record("conn_id", conn_id.0);
+                state.conn_span.record("client_id", client_id.0);
                 state.send(ServerMessage::AuthResult {
                     success: true,
                     reason: None,
@@ -55,8 +57,9 @@ pub async fn handle_message<A: PaneAttacher>(
                     connection_id: Some(conn_id),
                 });
                 info!(
-                    "{}client {client_id:?} authenticated (conn={conn_id:?})",
-                    state.transport_label
+                    conn_id = conn_id.0,
+                    client_id = client_id.0,
+                    "client authenticated"
                 );
             } else {
                 state.send(ServerMessage::AuthResult {
@@ -66,7 +69,7 @@ pub async fn handle_message<A: PaneAttacher>(
                     server_version: None,
                     connection_id: None,
                 });
-                warn!("{}authentication failed", state.transport_label);
+                warn!("authentication failed");
             }
         } else {
             state.error(None, ErrorCode::NotAuthenticated, "send Auth first");
@@ -239,7 +242,7 @@ pub async fn handle_message<A: PaneAttacher>(
             if let Some(handle) = state.attached.remove(&pane_id) {
                 handle.abort();
                 state.app.detach_from_pane(&pane_id, client_id).await;
-                debug!("{}detached from pane '{pane_id}'", state.transport_label);
+                debug!("detached from pane '{pane_id}'");
             }
         }
 
@@ -280,10 +283,7 @@ pub async fn handle_message<A: PaneAttacher>(
 
         ClientMessage::SetSnapshotMode { enabled } => {
             state.app.set_snapshot_mode(client_id, enabled).await;
-            debug!(
-                "{}client {client_id:?} snapshot mode = {enabled}",
-                state.transport_label
-            );
+            debug!("client {client_id:?} snapshot mode = {enabled}");
         }
 
         ClientMessage::Ping { seq } => {

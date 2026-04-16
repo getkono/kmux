@@ -12,6 +12,7 @@ use kmux_protocol::messages::{
 };
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
+use tracing::Span;
 
 use crate::app::{AttachResult, ServerApp};
 
@@ -46,15 +47,16 @@ pub struct SharedClientState {
     /// Sender for the control-stream writer task.
     pub ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
     pub app: std::sync::Arc<ServerApp>,
-    /// Short label used in log messages, e.g. `""` (QUIC) or `"TCP "`.
-    pub transport_label: &'static str,
+    /// Connection-scoped tracing span; conn_id and client_id are recorded into
+    /// it once authentication completes so every subsequent log line carries them.
+    pub conn_span: Span,
 }
 
 impl SharedClientState {
     pub fn new(
         app: std::sync::Arc<ServerApp>,
         ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
-        transport_label: &'static str,
+        conn_span: Span,
     ) -> Self {
         Self {
             authenticated: false,
@@ -64,7 +66,7 @@ impl SharedClientState {
             attached: HashMap::new(),
             ctrl_tx,
             app,
-            transport_label,
+            conn_span,
         }
     }
 

@@ -6,7 +6,7 @@ use kmux_protocol::{encode_server, write_frame};
 use quinn::Connection;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
-use tracing::{debug, warn};
+use tracing::{Instrument, debug, info, warn};
 
 use crate::app::{AttachResult, ServerApp};
 use crate::client_handler::{PaneAttacher, build_attach_replay, run_client_session};
@@ -93,10 +93,20 @@ async fn send_frame(
 
 /// Handle a single QUIC client connection.
 pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
+    let remote = conn.remote_address();
+    let conn_span = tracing::info_span!(
+        "connection",
+        transport = "quic",
+        remote = %remote,
+        conn_id = tracing::field::Empty,
+        client_id = tracing::field::Empty,
+    );
+    info!(parent: &conn_span, "QUIC connection from {remote}");
+
     let (ctrl_send, ctrl_recv) = match conn.accept_bi().await {
         Ok(streams) => streams,
         Err(e) => {
-            warn!("Failed to accept control stream: {e}");
+            warn!(parent: &conn_span, "Failed to accept control stream: {e}");
             return;
         }
     };
@@ -106,7 +116,8 @@ pub async fn handle(conn: Connection, app: Arc<ServerApp>) {
         ctrl_send,
         app,
         |_| QuicAttacher { conn: conn.clone() },
-        "",
+        conn_span.clone(),
     )
+    .instrument(conn_span)
     .await;
 }

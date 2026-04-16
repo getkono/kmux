@@ -5,7 +5,7 @@ use kmux_protocol::messages::ServerMessage;
 use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
-use tracing::{info, warn};
+use tracing::{Instrument, info, warn};
 
 use crate::app::{AttachResult, ServerApp};
 use crate::client_handler::{PaneAttacher, build_attach_replay, run_client_session};
@@ -23,8 +23,7 @@ pub async fn serve_tcp(addr: SocketAddr, app: Arc<ServerApp>) -> anyhow::Result<
     tokio::spawn(async move {
         loop {
             match listener.accept().await {
-                Ok((stream, peer)) => {
-                    info!("TCP connection from {peer}");
+                Ok((stream, _)) => {
                     let app = Arc::clone(&app);
                     tokio::spawn(async move {
                         handle_tcp(stream, app).await;
@@ -81,14 +80,25 @@ impl PaneAttacher for TcpAttacher {
 
 /// Handle a single TCP client connection.
 async fn handle_tcp(stream: TcpStream, app: Arc<ServerApp>) {
+    let remote = stream.peer_addr().ok();
+    let conn_span = tracing::info_span!(
+        "connection",
+        transport = "tcp",
+        remote = ?remote,
+        conn_id = tracing::field::Empty,
+        client_id = tracing::field::Empty,
+    );
+    info!(parent: &conn_span, remote = ?remote, "TCP connection accepted");
+
     let (read_half, write_half) = tokio::io::split(stream);
     run_client_session(
         read_half,
         write_half,
         app,
         |ctrl_tx| TcpAttacher { ctrl_tx },
-        "TCP ",
+        conn_span.clone(),
     )
+    .instrument(conn_span)
     .await;
 }
 

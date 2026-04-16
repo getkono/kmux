@@ -128,8 +128,6 @@ pub async fn async_main(cli: Cli) -> anyhow::Result<()> {
                         tokio::spawn(async move {
                             match incoming.await {
                                 Ok(conn) => {
-                                    let remote = conn.remote_address();
-                                    info!("QUIC connection from {remote}");
                                     crate::connection::handle(conn, app).await;
                                 }
                                 Err(e) => tracing::error!("QUIC connection failed: {e}"),
