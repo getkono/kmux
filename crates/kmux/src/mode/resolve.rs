@@ -121,7 +121,9 @@ pub fn resolve_signal(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
 
 pub fn resolve_confirm_close(key: &Key) -> (Option<Mode>, Action) {
     match key {
-        Key::Character(c) if c == "y" => (Some(Mode::Normal), Action::ConfirmCloseYes),
+        // Return None for mode: the action handler owns the transition so it
+        // can extract word_id via mem::replace before setting Mode::Normal.
+        Key::Character(c) if c == "y" => (None, Action::ConfirmCloseYes),
         _ => (Some(Mode::Normal), Action::None),
     }
 }
@@ -129,7 +131,9 @@ pub fn resolve_confirm_close(key: &Key) -> (Option<Mode>, Action) {
 pub fn resolve_rename(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     match key {
         Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::None),
-        Key::Named(NamedKey::Enter) => (Some(Mode::Normal), Action::RenameSubmit),
+        // Return None for mode: the action handler owns the transition so it
+        // can extract word_id/buffer via mem::replace before setting Mode::Normal.
+        Key::Named(NamedKey::Enter) => (None, Action::RenameSubmit),
         Key::Named(NamedKey::Backspace) => (None, Action::RenameBackspace),
         Key::Character(c) => {
             if let Some(ch) = c.chars().next() {
@@ -372,5 +376,64 @@ mod tests {
         );
         assert_eq!(mode, Some(Mode::Normal));
         assert_eq!(action, Action::SelectPickerEntry);
+    }
+
+    // Regression tests: confirm-close and rename-submit must NOT pre-transition
+    // the mode so that the action handler can extract data via mem::replace.
+
+    #[test]
+    fn confirm_close_y_does_not_change_mode() {
+        let (mode, action) = resolve(
+            &Mode::ConfirmCloseSession {
+                word_id: "abc".into(),
+            },
+            &Key::Character("y".into()),
+            Modifiers::empty(),
+        );
+        // mode must be None so the action handler can mem::replace the ConfirmCloseSession
+        assert_eq!(mode, None);
+        assert_eq!(action, Action::ConfirmCloseYes);
+    }
+
+    #[test]
+    fn confirm_close_other_key_cancels() {
+        let (mode, action) = resolve(
+            &Mode::ConfirmCloseSession {
+                word_id: "abc".into(),
+            },
+            &Key::Character("n".into()),
+            Modifiers::empty(),
+        );
+        assert_eq!(mode, Some(Mode::Normal));
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn rename_enter_does_not_change_mode() {
+        let (mode, action) = resolve(
+            &Mode::RenameSession {
+                word_id: "abc".into(),
+                buffer: "new name".into(),
+            },
+            &Key::Named(NamedKey::Enter),
+            Modifiers::empty(),
+        );
+        // mode must be None so the action handler can mem::replace the RenameSession
+        assert_eq!(mode, None);
+        assert_eq!(action, Action::RenameSubmit);
+    }
+
+    #[test]
+    fn rename_escape_cancels() {
+        let (mode, action) = resolve(
+            &Mode::RenameSession {
+                word_id: "abc".into(),
+                buffer: String::new(),
+            },
+            &Key::Named(NamedKey::Escape),
+            Modifiers::empty(),
+        );
+        assert_eq!(mode, Some(Mode::Normal));
+        assert_eq!(action, Action::None);
     }
 }
