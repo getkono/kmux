@@ -357,9 +357,12 @@ impl SessionManager {
                 events.push(SessionEvent::InputLockReleased { pane_id });
             }
 
-            other => {
-                warn!("unhandled server message: {other:?}");
+            ServerMessage::Ping { seq } => {
+                self.send_ws(ClientMessage::Pong { seq });
             }
+
+            // Response to a client-initiated Ping; nothing to do.
+            ServerMessage::Pong { .. } => {}
         }
         events
     }
