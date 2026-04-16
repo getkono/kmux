@@ -291,7 +291,10 @@ mod tests {
     #[tokio::test]
     async fn split_reader_writer_concurrent() {
         let session = PtySession::spawn(&bash_config()).expect("spawn failed");
-        let (mut reader, writer) = session.split().await.expect("split failed");
+        // Clone before splitting: `split()` consumes its receiver, which would
+        // drop the only Arc reference and SIGKILL the child.  Keeping `session`
+        // alive mirrors production usage where the registry holds its own clone.
+        let (mut reader, writer) = session.clone().split().await.expect("split failed");
 
         // Spawn writer task: send a line of input to the shell.
         let write_task = tokio::spawn(async move {
