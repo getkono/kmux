@@ -1,7 +1,7 @@
 mod daemon_cmd;
 mod list;
 pub use daemon_cmd::run_daemon_command;
-pub use list::run_list_sessions;
+pub use list::{ListSessionsConfig, run_list_sessions};
 
 use kmux_client::ssh;
 use kmux_client::token::read_local_token;
@@ -66,10 +66,7 @@ pub async fn resolve_connection(
                     parsed_server: parsed,
                 })
             }
-            Err(e) => {
-                eprintln!("SSH negotiation failed: {e}");
-                std::process::exit(1);
-            }
+            Err(e) => Err(anyhow::anyhow!("SSH negotiation failed: {e}")),
         }
     } else if is_local {
         let status = kmux_client::daemon::ensure_daemon().await?;

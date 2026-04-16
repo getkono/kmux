@@ -24,7 +24,7 @@ use tracing_subscriber::EnvFilter;
 use app::App;
 use cli::{Cli, Command};
 use kmux_client::generate_instance_id;
-use subcommands::{resolve_connection, run_daemon_command, run_list_sessions};
+use subcommands::{ListSessionsConfig, resolve_connection, run_daemon_command, run_list_sessions};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -74,16 +74,16 @@ async fn async_main() -> anyhow::Result<()> {
             server_args,
             format,
         }) => {
-            return run_list_sessions(
-                server_args.server.as_deref(),
-                server_args.ssh_port,
+            return run_list_sessions(ListSessionsConfig {
+                server: server_args.server.as_deref(),
+                ssh_port: server_args.ssh_port,
                 format,
-                server_args.host.as_deref(),
-                server_args.port,
-                server_args.token.as_deref(),
-                server_args.no_ssh,
-                server_args.accept_invalid_certs,
-            )
+                host_override: server_args.host.as_deref(),
+                port_override: server_args.port,
+                token_override: server_args.token.as_deref(),
+                no_ssh: server_args.no_ssh,
+                accept_invalid_certs: server_args.accept_invalid_certs,
+            })
             .await;
         }
         None => {}

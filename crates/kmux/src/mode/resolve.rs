@@ -99,10 +99,8 @@ pub fn resolve_scroll(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
         Key::Named(NamedKey::ArrowDown) => (None, Action::ScrollDown(1)),
         Key::Named(NamedKey::PageUp) => (None, Action::ScrollPageUp),
         Key::Named(NamedKey::PageDown) => (None, Action::ScrollPageDown),
-        Key::Named(NamedKey::Escape) | Key::Character(_) if matches!(key, Key::Character(c) if c == "q") => {
-            (Some(Mode::Normal), Action::ExitToNormal)
-        }
         Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::ExitToNormal),
+        Key::Character(c) if c == "q" => (Some(Mode::Normal), Action::ExitToNormal),
         _ => (None, Action::None),
     }
 }

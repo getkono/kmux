@@ -1,5 +1,6 @@
 use kmux_protocol::messages::{CellState, CursorState, TermModes};
 
+#[cfg(test)]
 pub mod mock;
 pub mod wezterm;
 

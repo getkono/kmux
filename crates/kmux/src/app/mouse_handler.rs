@@ -33,50 +33,37 @@ impl App {
         };
         match event.kind {
             MouseEventKind::ScrollUp => {
-                let use_pty = self
-                    .mgr
-                    .buffer(&pane_id)
-                    .map(|g| g.modes().mouse_report())
-                    .unwrap_or(false);
-                if use_pty {
-                    let col = event.column + 1;
-                    let row = event.row + 1;
-                    let sgr = self
-                        .mgr
-                        .buffer(&pane_id)
-                        .map(|g| g.modes().sgr_mouse())
-                        .unwrap_or(false);
-                    let bytes = encode_mouse_scroll(col, row, 3, sgr);
-                    if !bytes.is_empty() {
-                        self.mgr.send_input(bytes);
-                    }
-                } else if let Some(grid) = self.mgr.buffer_mut(&pane_id) {
-                    grid.scroll_up(3);
-                }
+                self.scroll_pane(&pane_id, event.column, event.row, 3);
             }
             MouseEventKind::ScrollDown => {
-                let use_pty = self
-                    .mgr
-                    .buffer(&pane_id)
-                    .map(|g| g.modes().mouse_report())
-                    .unwrap_or(false);
-                if use_pty {
-                    let col = event.column + 1;
-                    let row = event.row + 1;
-                    let sgr = self
-                        .mgr
-                        .buffer(&pane_id)
-                        .map(|g| g.modes().sgr_mouse())
-                        .unwrap_or(false);
-                    let bytes = encode_mouse_scroll(col, row, -3, sgr);
-                    if !bytes.is_empty() {
-                        self.mgr.send_input(bytes);
-                    }
-                } else if let Some(grid) = self.mgr.buffer_mut(&pane_id) {
-                    grid.scroll_down(3);
-                }
+                self.scroll_pane(&pane_id, event.column, event.row, -3);
             }
             _ => {}
+        }
+    }
+
+    fn scroll_pane(&mut self, pane_id: &str, col: u16, row: u16, lines: i32) {
+        let use_pty = self
+            .mgr
+            .buffer(pane_id)
+            .map(|g| g.modes().mouse_report())
+            .unwrap_or(false);
+        if use_pty {
+            let sgr = self
+                .mgr
+                .buffer(pane_id)
+                .map(|g| g.modes().sgr_mouse())
+                .unwrap_or(false);
+            let bytes = encode_mouse_scroll(col + 1, row + 1, lines, sgr);
+            if !bytes.is_empty() {
+                self.mgr.send_input(bytes);
+            }
+        } else if let Some(grid) = self.mgr.buffer_mut(pane_id) {
+            if lines > 0 {
+                grid.scroll_up(lines as usize);
+            } else {
+                grid.scroll_down((-lines) as usize);
+            }
         }
     }
 

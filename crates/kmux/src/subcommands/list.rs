@@ -2,27 +2,29 @@ use crate::cli::OutputFormat;
 
 use super::{print_sessions, resolve_connection};
 
-#[allow(clippy::too_many_arguments)]
-pub async fn run_list_sessions(
-    server: Option<&str>,
-    ssh_port: Option<u16>,
-    format: OutputFormat,
-    host_override: Option<&str>,
-    port_override: Option<u16>,
-    token_override: Option<&str>,
-    no_ssh: bool,
-    accept_invalid_certs: bool,
-) -> anyhow::Result<()> {
+pub struct ListSessionsConfig<'a> {
+    pub server: Option<&'a str>,
+    pub ssh_port: Option<u16>,
+    pub format: OutputFormat,
+    pub host_override: Option<&'a str>,
+    pub port_override: Option<u16>,
+    pub token_override: Option<&'a str>,
+    pub no_ssh: bool,
+    pub accept_invalid_certs: bool,
+}
+
+pub async fn run_list_sessions(cfg: ListSessionsConfig<'_>) -> anyhow::Result<()> {
     let conn = resolve_connection(
-        server,
-        ssh_port,
-        no_ssh,
-        host_override,
-        port_override,
-        token_override,
-        accept_invalid_certs,
+        cfg.server,
+        cfg.ssh_port,
+        cfg.no_ssh,
+        cfg.host_override,
+        cfg.port_override,
+        cfg.token_override,
+        cfg.accept_invalid_certs,
     )
     .await?;
+    let format = cfg.format;
 
     // Connect headlessly via TCP, send auth + SessionList, print results.
     use kmux_protocol::messages::{

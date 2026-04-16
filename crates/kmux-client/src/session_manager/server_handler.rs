@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kmux_protocol::messages::{
-    ClientId, ClientMessage, PaneInfo, SequenceNo, ServerMessage, SessionEntry, SessionEventMsg,
-    SessionStatus, TermSize, epoch_millis,
+    ClientId, ClientMessage, PaneInfo, SequenceNo, ServerMessage, SessionEventMsg, SessionStatus,
+    TermSize, epoch_millis,
 };
 use tracing::{info, warn};
 
@@ -211,30 +211,13 @@ impl SessionManager {
                 }
 
                 if self.active_pane.as_deref() == Some(&pane_id) {
-                    // Try to fall back to another pane in the same session
-                    let fallback = self.active_session.as_ref().and_then(|word_id| {
-                        self.session_list
-                            .iter()
-                            .find(|e| e.meta.word_id == *word_id)
-                            .and_then(|e| e.panes.first())
-                            .map(|p| p.pane_id.clone())
-                    });
-
-                    if let Some(pane) = fallback {
-                        self.active_pane = Some(pane.clone());
-                        self.attach_fresh(pane);
-                    } else {
-                        // Fall back to first session's first pane
-                        let fallback2 = self
-                            .session_list
-                            .first()
-                            .and_then(|e| e.panes.first())
-                            .map(|p| (e_word_id_from_list(&self.session_list), p.pane_id.clone()));
-                        if let Some((word_id, pane)) = fallback2 {
+                    match self.find_fallback_pane() {
+                        Some((word_id, pane)) => {
                             self.active_session = Some(word_id);
                             self.active_pane = Some(pane.clone());
                             self.attach_fresh(pane);
-                        } else {
+                        }
+                        None => {
                             self.active_session = None;
                             self.active_pane = None;
                         }
@@ -374,15 +357,36 @@ impl SessionManager {
                 events.push(SessionEvent::InputLockReleased { pane_id });
             }
 
-            _ => {}
+            other => {
+                warn!("unhandled server message: {other:?}");
+            }
         }
         events
     }
 }
 
-/// Get the word_id of the first session in the list.
-fn e_word_id_from_list(list: &[SessionEntry]) -> String {
-    list.first()
-        .map(|e| e.meta.word_id.clone())
-        .unwrap_or_default()
+impl SessionManager {
+    /// Find the best fallback pane after the active pane closes.
+    ///
+    /// Priority: another pane in the same session → first pane of any session.
+    /// Returns `(word_id, pane_id)` or `None` if no panes remain.
+    fn find_fallback_pane(&self) -> Option<(String, String)> {
+        // 1. Try another pane in the same session.
+        if let Some(word_id) = &self.active_session
+            && let Some(pane_id) = self
+                .session_list
+                .iter()
+                .find(|e| e.meta.word_id == *word_id)
+                .and_then(|e| e.panes.first())
+                .map(|p| p.pane_id.clone())
+        {
+            return Some((word_id.clone(), pane_id));
+        }
+        // 2. Fall back to the first pane of any session.
+        self.session_list.first().and_then(|e| {
+            e.panes
+                .first()
+                .map(|p| (e.meta.word_id.clone(), p.pane_id.clone()))
+        })
+    }
 }

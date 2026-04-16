@@ -35,20 +35,19 @@ impl ServerApp {
             for (&pane_index, relay) in session_state.panes.iter() {
                 let pane_id = format!("{word_id}/{pane_index}");
 
-                // Snapshot grid state (backend-agnostic via DiffEngine).
-                let grid = relay.term_state.lock().unwrap().snapshot();
-
-                // Extract scrollback from the backend.
-                let scrollback_lines = {
+                // Snapshot grid state and extract scrollback in one lock scope.
+                let (grid, scrollback_lines) = {
                     let ts = relay.term_state.lock().unwrap();
+                    let grid = ts.snapshot();
                     let size = ts.history_size();
                     let start = size.saturating_sub(MAX_SCROLLBACK_LINES);
                     let count = size - start;
-                    if count > 0 {
+                    let scrollback_lines = if count > 0 {
                         ts.read_history_lines(start, count)
                     } else {
                         vec![]
-                    }
+                    };
+                    (grid, scrollback_lines)
                 };
 
                 // Get child PID from the PTY registry.

@@ -55,7 +55,7 @@ impl DiffBuffer {
     }
 
     /// The newest sequence number still in the buffer, or `None` if empty.
-    #[allow(dead_code)]
+    #[cfg(test)]
     pub fn newest_seqno(&self) -> Option<SequenceNo> {
         self.diffs.back().map(|(seq, _, _)| *seq)
     }

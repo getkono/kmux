@@ -61,20 +61,23 @@ pub(super) fn emit_cells_line(out: &mut Vec<u8>, cells: &[CellState]) {
         .map(|i| i + 1)
         .unwrap_or(0);
 
+    #[derive(PartialEq)]
+    struct StyleKey {
+        fg: (u8, u8, u8),
+        bg: (u8, u8, u8),
+        attrs: u16,
+    }
+
     if last_content > 0 {
-        let mut prev_key: Option<(u8, u8, u8, u8, u8, u8, u16)> = None;
+        let mut prev_key: Option<StyleKey> = None;
 
         for cell in &cells[..last_content] {
-            let style_key = (
-                cell.fg.r,
-                cell.fg.g,
-                cell.fg.b,
-                cell.bg.r,
-                cell.bg.g,
-                cell.bg.b,
-                cell.attrs.0,
-            );
-            if prev_key != Some(style_key) {
+            let style_key = StyleKey {
+                fg: (cell.fg.r, cell.fg.g, cell.fg.b),
+                bg: (cell.bg.r, cell.bg.g, cell.bg.b),
+                attrs: cell.attrs.0,
+            };
+            if prev_key.as_ref() != Some(&style_key) {
                 prev_key = Some(style_key);
                 let mut sgr = String::from("\x1b[0");
                 if cell.attrs.contains(CellAttrs::BOLD) {
