@@ -458,6 +458,109 @@ Client                          Server
 
 ---
 
+## Liveness and Recovery
+
+The data plane is kept honest by a bidirectional application-layer
+ping/pong — **no ICMP, no TCP keepalives**. This matches the server-
+announces principle: everything runs over the real protocol, so we
+observe the same failure modes the user observes.
+
+### Ping cadence
+
+Both endpoints mirror the same policy (`crates/kmux-client/src/liveness.rs`,
+`crates/kmuxd/src/client_handler/session.rs`):
+
+| Direction | Interval | Timeout |
+|-----------|----------|---------|
+| server → client `Ping` | 5 s | — |
+| client → server `Ping` | 5 s | 15 s silence → declare dead |
+
+The client resets its timeout on *any* inbound frame (not just `Pong`),
+so a chatty session never spuriously times out. `client_ping_due` on
+the liveness tracker is sampled every second from the event loop —
+timers are cheap and the loop is already running for rendering.
+Worst-case detection of a hung daemon (kill -STOP, blackholed path) is
+bounded at ~15 s.
+
+### ConnectionState machine
+
+```
+          ┌─────┐
+          │Idle │──── initial connect ───▶┐
+          └─────┘                         │
+                                          ▼
+                              ┌─────────────────┐
+                              │   Handshaking   │
+                              └─────────────────┘
+                                  │         │
+                     auth ok      │         │ bootstrap failed
+                                  ▼         ▼
+                    ┌───────────────────┐  ┌──────────────────┐
+                    │Connected{transport}│  │Disconnected{...}│
+                    └───────────────────┘  └──────────────────┘
+                          │       ▲                ▲
+        liveness timeout /│       │                │ user chooses y/Enter
+        server close /    │       │                │
+        tunnel died       │       │                │
+                          ▼       │                │
+                    ┌──────────────────┐           │
+                    │Disconnected{...} │───────────┘
+                    └──────────────────┘
+```
+
+There is exactly one source of truth (`ConnectionState`); the TUI
+badge, the session manager's legacy `connected: bool`, and the disconnect
+overlay all read from it.
+
+### Freeze-and-confirm UX
+
+When a drop is detected (channel closed, ping timeout, SSH tunnel died)
+the event loop does **not** auto-retry. Instead:
+
+1. `SessionManager::mark_connection_lost_with(reason)` moves the state
+   to `Disconnected { reason }`.
+2. `Mode::Disconnected { reason }` is set in the TUI. The event loop
+   continues to render, but key input stops forwarding to PTYs — only
+   `y` / `Enter` (confirm reconnect) and `q` (quit) are handled.
+3. A centred overlay shows the reason and the prompt. Pressing `y`
+   calls `App::attempt_reconnect`, which re-runs the original bootstrap
+   flow (SSH re-negotiation + `connect_via_ssh_session`, or a fresh
+   `mgr.connect` for direct/local targets).
+
+`Ctrl+Alt+R` from `Mode::Normal` triggers the same reconnect path
+without waiting for the liveness timeout — useful when the link feels
+degraded but has not yet tripped the 60 s timer.
+
+### "Server is down" case
+
+The issue originally asked for ICMP-based "restart daemon over SSH."
+That is replaced by two existing pieces:
+
+- If the user originally connected via SSH (`self.ssh_target` is set),
+  reconnect re-runs `ssh::negotiate`, which invokes `kmuxd
+  probe-or-start` on the remote host. `probe-or-start` starts the
+  daemon if it is missing, matching the issue's intent.
+- If the user connected directly and the server is gone, the bootstrap
+  race fails and the overlay reason reads `reconnect failed: …`. The
+  user must fix the daemon manually or use the server picker to switch
+  to an SSH target. This is deliberate — we never silently initiate
+  OS-level actions the user did not authorise.
+
+### Tracing
+
+Disconnect and reconnect events are emitted with structured fields on
+the connection span:
+
+```
+WARN connection dropped connection_id=… transport=QUIC reason="ping timeout"
+INFO reconnect requested connection_id=…
+```
+
+Filter with `RUST_LOG=kmux_client=debug,kmux=info` to watch the
+lifecycle.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Likely cause | Fix |

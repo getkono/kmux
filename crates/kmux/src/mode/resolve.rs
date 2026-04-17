@@ -8,6 +8,15 @@ pub fn resolve_normal(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
         return (Some(Mode::Select), Action::None);
     }
 
+    // Ctrl+Alt+R: force a reconnect even without dropping first. Useful when
+    // the link is degraded but has not yet tripped the liveness timeout.
+    if mods.contains(Modifiers::CTRL)
+        && mods.contains(Modifiers::ALT)
+        && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("r"))
+    {
+        return (None, Action::Reconnect);
+    }
+
     // Shift+PageUp/Down for scrollback
     if mods.contains(Modifiers::SHIFT) {
         if matches!(key, Key::Named(NamedKey::PageUp)) {
@@ -125,6 +134,17 @@ pub fn resolve_confirm_close(key: &Key) -> (Option<Mode>, Action) {
         // can extract word_id via mem::replace before setting Mode::Normal.
         Key::Character(c) if c == "y" => (None, Action::ConfirmCloseYes),
         _ => (Some(Mode::Normal), Action::None),
+    }
+}
+
+/// Keys accepted while disconnected. Everything else is dropped (so pane
+/// input is effectively frozen) and the overlay stays up.
+pub fn resolve_disconnected(key: &Key) -> (Option<Mode>, Action) {
+    match key {
+        Key::Character(c) if c == "y" || c == "Y" => (None, Action::Reconnect),
+        Key::Named(NamedKey::Enter) => (None, Action::Reconnect),
+        Key::Character(c) if c == "q" || c == "Q" => (None, Action::Quit),
+        _ => (None, Action::None),
     }
 }
 

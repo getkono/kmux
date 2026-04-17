@@ -47,6 +47,9 @@ fn render_terminal(f: &mut Frame, app: &mut App) {
         Mode::SessionPicker => overlays::render_session_picker_overlay(f, area, app),
         Mode::ServerPicker => overlays::render_server_picker_overlay(f, area, app),
         Mode::DirectoryPicker => overlays::render_dir_picker_overlay(f, area, app),
+        Mode::Disconnected { reason } => {
+            overlays::render_disconnect_overlay(f, area, &app.theme, reason)
+        }
         _ => {}
     }
 

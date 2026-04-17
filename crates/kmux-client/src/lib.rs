@@ -1,6 +1,7 @@
 pub mod bootstrap;
 pub mod connect;
 pub mod connection_log;
+pub mod connection_state;
 
 use rand::RngCore;
 
@@ -16,7 +17,9 @@ pub mod grid;
 pub mod hosts;
 pub mod input;
 pub mod key;
+pub mod liveness;
 pub mod metrics;
+pub mod recovery;
 pub mod session_manager;
 pub mod ssh;
 pub mod supervisor;

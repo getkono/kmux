@@ -1,8 +1,11 @@
+use std::time::Instant;
+
 use kmux_protocol::messages::{ClientMessage, ServerMessage};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::connect::{self, ConnectResult};
+use crate::connection_state::{ConnectionState, DisconnectReason};
 use crate::transport::TransportKind;
 
 use super::SessionManager;
@@ -17,6 +20,8 @@ impl SessionManager {
         let token = self.token.clone();
         let accept_invalid = self.accept_invalid_certs;
 
+        self.set_connection_state(ConnectionState::Handshaking);
+
         match connect::connect(
             host,
             port,
@@ -30,10 +35,13 @@ impl SessionManager {
         {
             ConnectResult::Connected(sender) => {
                 self.ws_sender = Some(sender);
-                self.connected = true;
-                self.status_msg = format!("Connected to {}:{}", self.host, self.port);
                 self.last_host = self.host.clone();
                 self.last_port = self.port;
+                self.current_transport = TransportKind::Quic;
+                self.set_connection_state(ConnectionState::Connected {
+                    transport: TransportKind::Quic,
+                });
+                self.liveness.reset(Instant::now());
                 info!("Connected to kmuxd");
 
                 let rid = self.next_rid();
@@ -42,8 +50,10 @@ impl SessionManager {
                 vec![]
             }
             ConnectResult::Failed(e) => {
-                self.status_msg = format!("Connection failed: {e}");
                 warn!("Connection failed: {e}");
+                self.set_connection_state(ConnectionState::Disconnected {
+                    reason: DisconnectReason::BootstrapFailed(e),
+                });
                 vec![]
             }
         }
@@ -51,10 +61,12 @@ impl SessionManager {
 
     pub fn set_ws_sender(&mut self, sender: mpsc::UnboundedSender<ClientMessage>) {
         self.ws_sender = Some(sender);
-        self.connected = true;
-        self.status_msg = format!("Connected to {}:{}", self.host, self.port);
         self.last_host = self.host.clone();
         self.last_port = self.port;
+        self.set_connection_state(ConnectionState::Connected {
+            transport: self.current_transport,
+        });
+        self.liveness.reset(Instant::now());
         info!("Connected to kmuxd (external sender)");
     }
 
@@ -65,20 +77,26 @@ impl SessionManager {
 
     pub fn disconnect(&mut self) {
         self.ws_sender = None;
-        self.connected = false;
         self.buffers.clear();
         self.active_session = None;
         self.active_pane = None;
         self.session_list.clear();
         self.pane_sync.clear();
         self.input_locked.clear();
-        self.status_msg = "Disconnected".to_string();
+        self.set_connection_state(ConnectionState::Disconnected {
+            reason: DisconnectReason::UserInitiated,
+        });
     }
 
+    /// Transition to `Disconnected` with an explicit reason. The old
+    /// variant (zero-arg) is preserved as a default-reason helper.
     pub fn mark_connection_lost(&mut self) {
-        self.connected = false;
+        self.mark_connection_lost_with(DisconnectReason::ServerClosed);
+    }
+
+    pub fn mark_connection_lost_with(&mut self, reason: DisconnectReason) {
         self.ws_sender = None;
-        self.status_msg = "Connection lost".to_string();
+        self.set_connection_state(ConnectionState::Disconnected { reason });
     }
 
     pub fn set_connection_params(&mut self, host: String, port: u16, token: String) {
@@ -101,6 +119,10 @@ impl SessionManager {
         // Drop the old sender, closing the old transport channel.
         let _ = self.ws_sender.replace(new_sender);
         self.current_transport = TransportKind::Quic;
+        self.set_connection_state(ConnectionState::Connected {
+            transport: TransportKind::Quic,
+        });
+        self.liveness.reset(Instant::now());
         info!(
             "Transport channel upgraded: {} -> {}",
             old_transport,
@@ -117,6 +139,10 @@ impl SessionManager {
         let old_transport = self.current_transport;
         let _ = self.ws_sender.replace(new_sender);
         self.current_transport = TransportKind::TcpTls;
+        self.set_connection_state(ConnectionState::Connected {
+            transport: TransportKind::TcpTls,
+        });
+        self.liveness.reset(Instant::now());
         info!(
             "Transport channel fell back: {} -> {}",
             old_transport,
@@ -136,6 +162,10 @@ impl SessionManager {
         let old_transport = self.current_transport;
         let _ = self.ws_sender.replace(new_sender);
         self.current_transport = new_kind;
+        self.set_connection_state(ConnectionState::Connected {
+            transport: new_kind,
+        });
+        self.liveness.reset(Instant::now());
         info!(
             "Transport channel switched: {} -> {}",
             old_transport, new_kind

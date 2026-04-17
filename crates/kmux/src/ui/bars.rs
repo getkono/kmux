@@ -1,3 +1,4 @@
+use kmux_client::connection_state::ConnectionState;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -21,6 +22,19 @@ pub(super) fn render_session_bar(f: &mut Frame, app: &mut App, area: Rect) {
         Style::default()
             .fg(theme.bg)
             .bg(theme.purple)
+            .add_modifier(Modifier::BOLD),
+    ));
+    spans.push(Span::styled(" ", Style::default().bg(theme.status_bg)));
+
+    // Connection status badge — green/yellow/red by state.
+    let state = app.mgr.connection_state();
+    let (badge_bg, label) = connection_badge_style(state, theme);
+    let badge_text = format!(" {label} ");
+    spans.push(Span::styled(
+        badge_text,
+        Style::default()
+            .fg(theme.bg)
+            .bg(badge_bg)
             .add_modifier(Modifier::BOLD),
     ));
     spans.push(Span::styled(" ", Style::default().bg(theme.status_bg)));
@@ -214,6 +228,18 @@ pub(super) fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
     f.render_widget(Paragraph::new(Line::from(spans)), area);
 }
 
+/// Map a `ConnectionState` to a (bg color, label) pair for the top-bar badge.
+fn connection_badge_style(state: &ConnectionState, theme: &Theme) -> (Color, String) {
+    let label = state.badge_label();
+    let color = match state {
+        ConnectionState::Connected { .. } => theme.green,
+        ConnectionState::Handshaking | ConnectionState::Reconnecting { .. } => theme.yellow,
+        ConnectionState::Disconnected { .. } => theme.red,
+        ConnectionState::Idle => theme.fg_dim,
+    };
+    (color, label)
+}
+
 pub(super) fn mode_color(mode: &Mode, theme: &Theme) -> Color {
     match mode {
         Mode::Normal => theme.green,
@@ -229,5 +255,6 @@ pub(super) fn mode_color(mode: &Mode, theme: &Theme) -> Color {
         Mode::Help => theme.accent,
         Mode::Connect { .. } => theme.accent,
         Mode::DirectoryPicker => theme.accent,
+        Mode::Disconnected { .. } => theme.red,
     }
 }

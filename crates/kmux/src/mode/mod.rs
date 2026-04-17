@@ -37,6 +37,9 @@ pub enum Mode {
     Connect { field: ConnectField },
     /// Directory picker for remote connections: type a path to open/create a session
     DirectoryPicker,
+    /// Connection dropped. Input to panes is frozen; the overlay asks the
+    /// user to confirm a reconnect.
+    Disconnected { reason: String },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -126,6 +129,9 @@ pub enum Action {
     // Quit the application
     Quit,
 
+    // Request a full reconnect via `recovery::ReconnectContext::run`.
+    Reconnect,
+
     // No-op
     None,
 }
@@ -151,5 +157,6 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::Help => resolve_help(key),
         Mode::Connect { field } => resolve_connect(key, mods, field),
         Mode::DirectoryPicker => resolve_dir_picker(key),
+        Mode::Disconnected { .. } => resolve_disconnected(key),
     }
 }

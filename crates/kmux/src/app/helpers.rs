@@ -1,5 +1,3 @@
-use std::time::Duration;
-
 use kmux_client::connect::ConnectResult;
 use kmux_client::session_manager::SessionEvent;
 use kmux_client::ssh::SshSession;
@@ -228,17 +226,4 @@ impl App {
             self.mgr.port(),
         );
     }
-}
-
-/// Returns the reconnect delay for the given attempt number.
-/// Sequence: 1s, 2s, 4s, 8s, 30s (capped).
-pub(super) fn backoff_delay(attempt: u32) -> Duration {
-    let secs = match attempt {
-        0 => 1,
-        1 => 2,
-        2 => 4,
-        3 => 8,
-        _ => 30,
-    };
-    Duration::from_secs(secs)
 }

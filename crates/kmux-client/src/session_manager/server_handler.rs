@@ -63,6 +63,12 @@ impl SessionManager {
 
     pub fn handle_server_message(&mut self, msg: ServerMessage) -> Vec<SessionEvent> {
         let mut events = Vec::new();
+
+        // Any decoded frame is proof the server is alive. Refreshing the
+        // liveness timer here — in one place — means every transport gets
+        // timeout detection for free.
+        self.liveness.observe_inbound(Instant::now());
+
         match msg {
             ServerMessage::AuthResult {
                 success,
@@ -80,13 +86,17 @@ impl SessionManager {
                     warn!("Auth failed: {:?}", reason);
                     let reason_str = reason.unwrap_or_default();
                     let hint = kmux_protocol::messages::version_mismatch_hint(&reason_str);
-                    if hint.is_empty() {
-                        self.status_msg = format!("Auth failed: {reason_str}");
+                    let msg = if hint.is_empty() {
+                        format!("Auth failed: {reason_str}")
                     } else {
-                        self.status_msg = format!("Auth failed: {reason_str} | {hint}");
-                    }
+                        format!("Auth failed: {reason_str} | {hint}")
+                    };
                     self.ws_sender = None;
-                    self.connected = false;
+                    self.set_connection_state(
+                        crate::connection_state::ConnectionState::Disconnected {
+                            reason: crate::connection_state::DisconnectReason::AuthFailed(msg),
+                        },
+                    );
                     events.push(SessionEvent::AuthFailed { reason: reason_str });
                 }
             }
@@ -361,8 +371,13 @@ impl SessionManager {
                 self.send_ws(ClientMessage::Pong { seq });
             }
 
-            // Response to a client-initiated Ping; nothing to do.
-            ServerMessage::Pong { .. } => {}
+            // Response to a client-initiated Ping; the liveness tracker
+            // also refreshes on this (in addition to the general
+            // `observe_inbound` at the top of this fn) so outstanding
+            // ping seqs are cleared.
+            ServerMessage::Pong { seq } => {
+                self.liveness.on_pong(seq, Instant::now());
+            }
         }
         events
     }

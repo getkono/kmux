@@ -111,7 +111,7 @@ pub async fn run_client_session<R, W, A, F>(
     let ping_task = tokio::spawn(
         async move {
             let mut seq = 0u64;
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;

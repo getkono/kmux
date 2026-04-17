@@ -97,9 +97,6 @@ pub struct App {
 
     /// SSH target stored for re-negotiation when the tunnel dies (SSH mode only).
     pub(super) ssh_target: Option<RemoteTarget>,
-
-    /// Consecutive reconnect failures. Reset on successful auth. Used for exponential backoff.
-    pub(super) reconnect_attempt: u32,
 }
 
 impl App {
@@ -191,7 +188,6 @@ impl App {
             ssh_target,
             auto_session,
             auto_cwd,
-            reconnect_attempt: 0,
         }
     }
 }

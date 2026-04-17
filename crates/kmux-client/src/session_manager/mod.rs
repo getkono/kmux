@@ -7,6 +7,7 @@ mod session_ops;
 pub use server_handler::SessionEvent;
 
 use std::collections::HashMap;
+use std::time::Instant;
 
 use kmux_protocol::messages::{
     ClientCapabilities, ClientId, ClientMessage, PaneId, SequenceNo, SessionEntry, WordId,
@@ -16,7 +17,9 @@ use tracing::warn;
 
 use kmux_protocol::messages::ConnectionId;
 
+use crate::connection_state::ConnectionState;
 use crate::grid::CellGrid;
+use crate::liveness::Liveness;
 use crate::metrics::RenderMetrics;
 use crate::transport::TransportKind;
 
@@ -74,6 +77,14 @@ pub struct SessionManager {
 
     /// The active transport kind (QUIC or TCP).
     pub current_transport: TransportKind,
+
+    /// High-level connection state surfaced to the TUI badge + overlay.
+    /// `connected` and `status_msg` are derived from this on every transition.
+    pub(super) connection_state: ConnectionState,
+
+    /// Tracks inbound/outbound ping traffic so we can declare the
+    /// connection dead proactively when the server stops responding.
+    pub(super) liveness: Liveness,
 }
 
 impl SessionManager {
@@ -107,7 +118,47 @@ impl SessionManager {
             server_version: None,
             connection_id: None,
             current_transport: TransportKind::Quic,
+            connection_state: ConnectionState::Idle,
+            liveness: Liveness::new(Instant::now()),
         }
+    }
+
+    /// Current connection state. This is the single source of truth for the
+    /// TUI badge and the disconnect overlay.
+    pub fn connection_state(&self) -> &ConnectionState {
+        &self.connection_state
+    }
+
+    /// Internal transition helper. Mirrors state into `connected` and
+    /// `status_msg` so older code paths keep working.
+    pub(super) fn set_connection_state(&mut self, new_state: ConnectionState) {
+        self.connected = new_state.is_live();
+        self.status_msg = new_state.badge_label();
+        self.connection_state = new_state;
+    }
+
+    /// If the outbound ping cadence has elapsed, put a `Ping` on the wire.
+    /// Called by the frontend on a timer tick.
+    pub fn maybe_send_client_ping(&mut self, now: Instant) {
+        if !self.connection_state.is_live() {
+            return;
+        }
+        if let Some(msg) = self.liveness.client_ping_due(now) {
+            self.send_ws(msg);
+        }
+    }
+
+    /// True once no inbound frame has been seen for the liveness timeout.
+    pub fn is_liveness_timed_out(&self, now: Instant) -> bool {
+        self.connection_state.is_live() && self.liveness.is_timed_out(now)
+    }
+
+    /// Next instant at which the frontend must wake up for ping / timeout
+    /// evaluation. `None` if not currently connected.
+    pub fn liveness_next_wakeup(&self) -> Option<Instant> {
+        self.connection_state
+            .is_live()
+            .then(|| self.liveness.next_wakeup())
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────

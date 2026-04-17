@@ -352,6 +352,9 @@ impl App {
             Action::Quit => {
                 return KeyResult::Quit;
             }
+            Action::Reconnect => {
+                return KeyResult::Reconnect;
+            }
             Action::None => {}
         }
 
