@@ -99,6 +99,15 @@ impl SessionManager {
         self.set_connection_state(ConnectionState::Disconnected { reason });
     }
 
+    /// Prepare for a fresh bootstrap: drop the dead sender and flip the state
+    /// to `Handshaking` so the TUI badge updates immediately. `connection_id`
+    /// is intentionally preserved so the server can transfer pane streams to
+    /// the new channel.
+    pub fn prepare_reconnect(&mut self) {
+        self.ws_sender = None;
+        self.set_connection_state(ConnectionState::Handshaking);
+    }
+
     pub fn set_connection_params(&mut self, host: String, port: u16, token: String) {
         self.host = host;
         self.port = port;

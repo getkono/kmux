@@ -182,7 +182,12 @@ impl App {
                         _ => {}
                     }
                 }
-                msg = srv_rx.recv() => {
+                // Only poll the server channel while we still expect to
+                // receive frames. After a drop the channel is closed and
+                // `recv()` resolves synchronously on every poll, which would
+                // starve `event_stream.next()` and leave the overlay keys
+                // unresponsive.
+                msg = srv_rx.recv(), if !matches!(self.mode, Mode::Disconnected { .. }) => {
                     match msg {
                         Some(msg) => {
                             // Drain all available messages
@@ -286,12 +291,18 @@ impl App {
             connection_id = self.mgr.connection_id.map(|c| c.0),
             "reconnect requested",
         );
-        self.mgr.set_connection_params(
-            self.connect_host.clone(),
-            self.connect_port.parse().unwrap_or(8443),
-            self.connect_token.clone(),
-        );
+        // Drop any lingering connection state (ws_sender, buffers) so the
+        // fresh handshake starts from a clean slate. `connection_id` is
+        // preserved inside SessionManager for server-side session resumption.
+        self.mgr.prepare_reconnect();
+        // Show the intermediate state immediately so the user knows the
+        // keypress registered even before the handshake completes.
+        self.mode = Mode::Normal;
+        self.needs_render = true;
 
+        // Refresh the target before bootstrap so we don't dial a stale
+        // port/token (e.g. a `kmuxd --self-signed` that restarted on a new
+        // random port, or an SSH tunnel whose ephemeral local port moved).
         let ssh_target = self.ssh_target.clone();
         if let Some(target) = ssh_target {
             self.mgr.set_status_msg("Reconnecting via SSH…".to_string());
@@ -311,8 +322,6 @@ impl App {
                         self.enter_disconnected(DisconnectReason::BootstrapFailed(
                             "SSH TCP tunnel failed".into(),
                         ));
-                    } else {
-                        self.mode = Mode::Normal;
                     }
                     conn_id_tx
                 }
@@ -322,23 +331,59 @@ impl App {
                     None
                 }
             }
+        } else if self.is_local {
+            // Local daemon may have restarted on a different random port;
+            // re-query the control socket for the live port/token before
+            // dialling.
+            self.mgr
+                .set_status_msg("Reconnecting to local daemon…".to_string());
+            match kmux_client::daemon::ensure_daemon().await {
+                Ok(status) => {
+                    self.mgr.set_connection_params(
+                        "127.0.0.1".to_string(),
+                        status.port,
+                        status.token,
+                    );
+                    info!(port = status.port, "local daemon port refreshed");
+                    let events = self.mgr.connect(new_tx).await;
+                    self.handle_session_events(events);
+                    self.reflect_bootstrap_outcome();
+                }
+                Err(e) => {
+                    self.enter_disconnected(DisconnectReason::BootstrapFailed(format!(
+                        "daemon start failed: {e}"
+                    )));
+                }
+            }
+            None
         } else {
+            self.mgr.set_connection_params(
+                self.connect_host.clone(),
+                self.connect_port.parse().unwrap_or(8443),
+                self.connect_token.clone(),
+            );
             self.mgr.set_status_msg("Reconnecting…".to_string());
             let events = self.mgr.connect(new_tx).await;
             self.handle_session_events(events);
-            if self.mgr.connection_state().is_live() {
-                self.mode = Mode::Normal;
-            } else if !matches!(self.mode, Mode::Disconnected { .. }) {
-                // mgr.connect already set Disconnected{BootstrapFailed}; reflect that in UI mode.
-                let reason = match self.mgr.connection_state() {
-                    kmux_client::connection_state::ConnectionState::Disconnected { reason } => {
-                        reason.to_string()
-                    }
-                    _ => "bootstrap failed".into(),
-                };
-                self.mode = Mode::Disconnected { reason };
-            }
+            self.reflect_bootstrap_outcome();
             None
+        }
+    }
+
+    /// After `mgr.connect()` settles, mirror the manager's connection state
+    /// into the TUI mode. On failure, show the disconnect overlay again with
+    /// the bootstrap error that `mgr.connect` recorded.
+    fn reflect_bootstrap_outcome(&mut self) {
+        if self.mgr.connection_state().is_live() {
+            self.mode = Mode::Normal;
+        } else {
+            let reason = match self.mgr.connection_state() {
+                kmux_client::connection_state::ConnectionState::Disconnected { reason } => {
+                    reason.to_string()
+                }
+                other => format!("bootstrap failed: {}", other.badge_label()),
+            };
+            self.mode = Mode::Disconnected { reason };
         }
     }
 }
