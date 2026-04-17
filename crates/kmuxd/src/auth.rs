@@ -84,7 +84,12 @@ mod tests {
         let path = persist_token(&token).expect("persist_token");
 
         // Verify path
-        assert_eq!(path, tmp.path().join("kmux").join("token"));
+        assert_eq!(
+            path,
+            tmp.path()
+                .join(kmux_protocol::dirs::RUNTIME_SUBDIR)
+                .join("token")
+        );
 
         // Verify contents
         let contents = std::fs::read_to_string(&path).expect("read token");

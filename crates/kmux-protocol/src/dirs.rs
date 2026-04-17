@@ -2,10 +2,22 @@ use std::path::PathBuf;
 
 use nix::unistd::getuid;
 
+/// Subdirectory name under `$XDG_RUNTIME_DIR` (or `/tmp/kmux-<uid>`) that
+/// holds the daemon socket, PID, and auth token.
+///
+/// Debug builds use `kmux-debug` so a `cargo run` daemon can coexist with an
+/// installed release daemon on the same machine without colliding on the UDS
+/// path or PID lockfile.
+#[cfg(debug_assertions)]
+pub const RUNTIME_SUBDIR: &str = "kmux-debug";
+#[cfg(not(debug_assertions))]
+pub const RUNTIME_SUBDIR: &str = "kmux";
+
 /// Returns the kmux runtime directory, creating it if necessary.
 ///
-/// Prefers `$XDG_RUNTIME_DIR/kmux` — a per-user, in-memory directory set by
-/// systemd/logind on Linux with tight permissions (mode 0700).
+/// Prefers `$XDG_RUNTIME_DIR/{RUNTIME_SUBDIR}` — a per-user, in-memory
+/// directory set by systemd/logind on Linux with tight permissions (mode
+/// 0700).
 ///
 /// Falls back to `/tmp/kmux-<uid>` when `XDG_RUNTIME_DIR` is unset (macOS,
 /// BSDs, containers, minimal Linux environments). The UID suffix prevents
@@ -18,7 +30,7 @@ pub fn runtime_dir() -> anyhow::Result<PathBuf> {
             PathBuf::from(format!("/tmp/kmux-{uid}"))
         }
     };
-    let dir = base.join("kmux");
+    let dir = base.join(RUNTIME_SUBDIR);
     std::fs::DirBuilder::new()
         .recursive(true)
         .create(&dir)
@@ -180,7 +192,7 @@ mod tests {
         // while this guard is held.
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
         let dir = runtime_dir().unwrap();
-        assert_eq!(dir, tmp.path().join("kmux"));
+        assert_eq!(dir, tmp.path().join(RUNTIME_SUBDIR));
         assert!(dir.exists());
     }
 

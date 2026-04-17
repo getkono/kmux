@@ -113,7 +113,7 @@ Error handling during the race:
 ### Strategy 1: UdsLocalBootstrap
 
 - Calls `daemon::ensure_daemon()` to start the local daemon process if it is not already running.
-- Connects to the data socket at `$XDG_RUNTIME_DIR/kmux/daemon-data.sock`.
+- Connects to the data socket at `$XDG_RUNTIME_DIR/kmux/daemon-data.sock`. Debug builds (`cfg(debug_assertions)`) resolve this subdirectory to `kmux-debug/` instead, so a `cargo run` daemon can coexist with an installed release daemon on the same machine. Applies to every file under the runtime dir — control socket, data socket, PID, and auth token.
 - Wins in microseconds when the daemon is already running locally.
 - Returns `NotAvailable` when the target is not the local host.
 
