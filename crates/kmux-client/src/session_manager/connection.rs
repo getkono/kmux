@@ -42,6 +42,7 @@ impl SessionManager {
                     transport: TransportKind::Quic,
                 });
                 self.liveness.reset(Instant::now());
+                self.tag_transport(TransportKind::Quic);
                 info!("Connected to kmuxd");
 
                 let rid = self.next_rid();
@@ -67,6 +68,7 @@ impl SessionManager {
             transport: self.current_transport,
         });
         self.liveness.reset(Instant::now());
+        self.tag_transport(self.current_transport);
         info!("Connected to kmuxd (external sender)");
     }
 
@@ -132,6 +134,7 @@ impl SessionManager {
             transport: TransportKind::Quic,
         });
         self.liveness.reset(Instant::now());
+        self.tag_transport(TransportKind::Quic);
         info!(
             "Transport channel upgraded: {} -> {}",
             old_transport,
@@ -152,6 +155,7 @@ impl SessionManager {
             transport: TransportKind::TcpTls,
         });
         self.liveness.reset(Instant::now());
+        self.tag_transport(TransportKind::TcpTls);
         info!(
             "Transport channel fell back: {} -> {}",
             old_transport,
@@ -175,6 +179,7 @@ impl SessionManager {
             transport: new_kind,
         });
         self.liveness.reset(Instant::now());
+        self.tag_transport(new_kind);
         info!(
             "Transport channel switched: {} -> {}",
             old_transport, new_kind

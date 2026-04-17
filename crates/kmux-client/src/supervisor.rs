@@ -201,6 +201,17 @@ pub struct UpgradeSignal {
     pub sender: mpsc::UnboundedSender<ClientMessage>,
 }
 
+// ─── RttSample ────────────────────────────────────────────────────────────────
+
+/// One RTT observation forwarded from the `SessionManager` (on every `Pong`)
+/// into the supervisor so the scorer operates on live measurements instead
+/// of `LATENCY_UNKNOWN_MS` for the currently-active transport.
+#[derive(Debug, Clone, Copy)]
+pub struct RttSample {
+    pub kind: TransportKind,
+    pub rtt_ms: f64,
+}
+
 // ─── SupervisorParams ─────────────────────────────────────────────────────────
 
 /// Parameters for `TransportSupervisor::new`.
@@ -218,6 +229,10 @@ pub struct SupervisorParams {
     pub is_local: bool,
     pub server_tx: mpsc::UnboundedSender<ServerMessage>,
     pub upgrade_tx: mpsc::Sender<UpgradeSignal>,
+    /// Stream of RTT observations pushed by the `SessionManager` on every
+    /// `Pong`. When `None`, the supervisor falls back to `LATENCY_UNKNOWN_MS`
+    /// for all endpoints.
+    pub rtt_rx: Option<mpsc::UnboundedReceiver<RttSample>>,
 }
 
 // ─── TransportSupervisor ─────────────────────────────────────────────────────
@@ -237,6 +252,7 @@ pub struct TransportSupervisor {
     scorer: TransportScorer,
     server_tx: mpsc::UnboundedSender<ServerMessage>,
     upgrade_tx: mpsc::Sender<UpgradeSignal>,
+    rtt_rx: Option<mpsc::UnboundedReceiver<RttSample>>,
 }
 
 impl TransportSupervisor {
@@ -252,6 +268,16 @@ impl TransportSupervisor {
             scorer: TransportScorer::new(params.is_local),
             server_tx: params.server_tx,
             upgrade_tx: params.upgrade_tx,
+            rtt_rx: params.rtt_rx,
+        }
+    }
+
+    /// Apply a single RTT observation for the endpoint matching `sample.kind`.
+    /// Only updates the active transport — other kinds only get measurements
+    /// when they themselves become active after a swap.
+    fn apply_rtt(&mut self, sample: RttSample) {
+        if let Some(ep) = self.endpoints.iter_mut().find(|e| e.kind == sample.kind) {
+            ep.record_rtt(sample.rtt_ms);
         }
     }
 
@@ -261,7 +287,28 @@ impl TransportSupervisor {
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            interval.tick().await;
+            // Wait for the next probe tick while concurrently draining
+            // RTT samples. The RTT stream never cancels the tick — both
+            // can make progress in the same iteration.
+            loop {
+                match self.rtt_rx.as_mut() {
+                    Some(rx) => tokio::select! {
+                        _ = interval.tick() => break,
+                        maybe_sample = rx.recv() => match maybe_sample {
+                            Some(s) => self.apply_rtt(s),
+                            None => {
+                                // Sender dropped: disable RTT ingress and
+                                // continue on pure tick cadence.
+                                self.rtt_rx = None;
+                            }
+                        }
+                    },
+                    None => {
+                        interval.tick().await;
+                        break;
+                    }
+                }
+            }
 
             if self.upgrade_tx.is_closed() {
                 debug!("Supervisor: upgrade_tx closed, stopping");
@@ -583,8 +630,55 @@ mod tests {
             is_local: false,
             server_tx: srv_tx,
             upgrade_tx: up_tx,
+            rtt_rx: None,
         });
         assert_eq!(sup.endpoints.len(), 2);
         assert_eq!(sup.active_transport, TransportKind::Quic);
+    }
+
+    // ── apply_rtt ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn apply_rtt_updates_matching_endpoint_only() {
+        let (srv_tx, _srv_rx) = mpsc::unbounded_channel();
+        let (up_tx, _up_rx) = mpsc::channel(1);
+        let adverts = vec![
+            EndpointAdvert {
+                kind: TransportKind::Quic,
+                address: "host:8443".into(),
+            },
+            EndpointAdvert {
+                kind: TransportKind::TcpTls,
+                address: "host:8444".into(),
+            },
+        ];
+        let mut sup = TransportSupervisor::new(SupervisorParams {
+            endpoints: adverts,
+            connection_id: ConnectionId(1),
+            token: "tok".into(),
+            capabilities: ClientCapabilities::default(),
+            accept_invalid_certs: false,
+            active_transport: TransportKind::Quic,
+            is_local: false,
+            server_tx: srv_tx,
+            upgrade_tx: up_tx,
+            rtt_rx: None,
+        });
+        sup.apply_rtt(RttSample {
+            kind: TransportKind::Quic,
+            rtt_ms: 42.0,
+        });
+        let quic = sup
+            .endpoints
+            .iter()
+            .find(|e| e.kind == TransportKind::Quic)
+            .unwrap();
+        let tcp = sup
+            .endpoints
+            .iter()
+            .find(|e| e.kind == TransportKind::TcpTls)
+            .unwrap();
+        assert_eq!(quic.rtt_ewma_ms, Some(42.0));
+        assert!(tcp.rtt_ewma_ms.is_none());
     }
 }

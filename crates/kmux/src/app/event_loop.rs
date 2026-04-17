@@ -21,6 +21,9 @@ use super::{App, KeyResult, SwitchTarget};
 
 /// How often to re-check liveness (ping cadence + timeout evaluation).
 const LIVENESS_TICK: Duration = Duration::from_secs(1);
+/// How often to append one metrics sample to the rolling JSONL file.
+/// Must match the cadence documented in `docs/metrics.md`.
+const METRICS_FLUSH_TICK: Duration = Duration::from_secs(10);
 
 impl App {
     pub async fn run(
@@ -63,6 +66,8 @@ impl App {
         render_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut liveness_tick = tokio::time::interval(LIVENESS_TICK);
         liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut metrics_flush_tick = tokio::time::interval(METRICS_FLUSH_TICK);
+        metrics_flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
             // Render if needed
@@ -254,6 +259,12 @@ impl App {
                 _ = render_tick.tick() => {
                     // Periodic render for animations (cursor blink, HUD updates)
                     self.needs_render = true;
+                }
+                _ = metrics_flush_tick.tick() => {
+                    // Append one delta sample to the rolling JSONL sink.
+                    // No-op if persistence is disabled.
+                    let conn_id = self.mgr.connection_id;
+                    self.mgr.metrics.flush_sample(conn_id);
                 }
             }
         }

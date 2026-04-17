@@ -69,10 +69,14 @@ impl Liveness {
 
     /// Record a `ServerMessage::Pong { seq }` we received for one of our
     /// own pings. Drops the matching outstanding entry (and any older ones
-    /// — if seq N came back, N-1 is also effectively alive).
-    pub fn on_pong(&mut self, seq: u64, now: Instant) {
+    /// — if seq N came back, N-1 is also effectively alive). Returns the
+    /// RTT observed on the matched entry, if any, so the caller can feed
+    /// it to the metrics/supervisor layer.
+    pub fn on_pong(&mut self, seq: u64, now: Instant) -> Option<Duration> {
         self.last_inbound = now;
+        let sent_at = self.outstanding.get(&seq).copied();
         self.outstanding.retain(|&k, _| k > seq);
+        sent_at.map(|t| now.saturating_duration_since(t))
     }
 
     /// If the outbound ping cadence has elapsed, return the ping message
@@ -166,8 +170,14 @@ mod tests {
         assert_eq!(l.outstanding_count(), 2);
 
         // Pong for the later seq drops both (older ones are implicitly acked).
-        l.on_pong(1, start + Duration::from_secs(61));
+        let rtt = l.on_pong(1, start + Duration::from_secs(61));
         assert_eq!(l.outstanding_count(), 0);
+        // seq=1 was issued at +60s, Pong arrived at +61s → 1s RTT.
+        assert_eq!(rtt, Some(Duration::from_secs(1)));
+
+        // A Pong for a seq we never issued should return None without
+        // touching outstanding.
+        assert!(l.on_pong(99, start + Duration::from_secs(62)).is_none());
 
         // Inbound was refreshed — 59s later we are still alive.
         assert!(!l.is_timed_out(start + Duration::from_secs(119)));

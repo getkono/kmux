@@ -57,4 +57,9 @@ fn render_terminal(f: &mut Frame, app: &mut App) {
     if app.hud_visible {
         overlays::render_hud(f, app, chunks[1]);
     }
+
+    // Metrics overlay (toggled via Ctrl+G m).
+    if app.metrics_overlay_visible {
+        overlays::render_metrics_overlay(f, area, app);
+    }
 }

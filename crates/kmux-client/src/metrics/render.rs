@@ -1,3 +1,8 @@
+//! Client-side rendering metrics: network+apply latency, apply duration,
+//! batch size, diff stats, and diagnostic counters. Pre-existing module
+//! moved verbatim out of `metrics.rs` when the metrics subsystem grew
+//! additional collectors (`network`, `rtt`, `jsonl`).
+
 use std::collections::VecDeque;
 
 use kmux_protocol::messages::epoch_millis;
@@ -164,6 +169,16 @@ impl RenderMetrics {
 
     pub fn diag_snapshot(&self) -> DiagSnapshot {
         DiagSnapshot::from_log(&self.event_log, 8)
+    }
+
+    /// Exposed so [`super::MetricsStore::snapshot`] can populate a combined sample
+    /// without re-computing averages twice.
+    pub(super) fn net_apply_avg(&self) -> f64 {
+        self.network_apply_latency.avg()
+    }
+
+    pub(super) fn net_apply_max(&self) -> f64 {
+        self.network_apply_latency.max()
     }
 }
 

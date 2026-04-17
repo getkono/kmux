@@ -227,6 +227,9 @@ impl App {
             Action::ToggleHud => {
                 self.hud_visible = !self.hud_visible;
             }
+            Action::ToggleMetrics => {
+                self.metrics_overlay_visible = !self.metrics_overlay_visible;
+            }
             Action::ToggleSnapshotMode => {
                 self.force_snapshot_mode = !self.force_snapshot_mode;
                 self.mgr.set_snapshot_mode(self.force_snapshot_mode);

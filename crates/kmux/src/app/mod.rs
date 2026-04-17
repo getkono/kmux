@@ -35,6 +35,7 @@ pub struct App {
     pub theme: Theme,
     pub mode: crate::mode::Mode,
     pub hud_visible: bool,
+    pub metrics_overlay_visible: bool,
     pub force_snapshot_mode: bool,
 
     // Connect form input fields
@@ -157,11 +158,15 @@ impl App {
             )
         };
 
+        let mut mgr = SessionManager::new(host, port, token, accept_invalid_certs, capabilities);
+        mgr.enable_metrics_persistence();
+
         Self {
-            mgr: SessionManager::new(host, port, token, accept_invalid_certs, capabilities),
+            mgr,
             theme,
             mode: initial_mode,
             hud_visible: false,
+            metrics_overlay_visible: false,
             force_snapshot_mode: false,
             connect_host,
             connect_port,

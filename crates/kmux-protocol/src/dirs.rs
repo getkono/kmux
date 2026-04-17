@@ -138,6 +138,14 @@ pub fn connection_log_path(instance_id: &str) -> anyhow::Result<PathBuf> {
     Ok(dir.join(format!("{instance_id}.log")))
 }
 
+/// Path to the rolling JSONL file where client metrics samples are appended.
+///
+/// Shared across concurrent `kmux` processes via advisory file locking
+/// (`flock`); see `kmux_client::metrics::jsonl::JsonlSink`.
+pub fn metrics_log_path() -> anyhow::Result<PathBuf> {
+    Ok(state_dir()?.join("metrics.jsonl"))
+}
+
 /// Returns the directory where session state is persisted, creating it if necessary.
 ///
 /// Lives under the state directory: `$XDG_STATE_HOME/kmux/sessions/`.
@@ -207,6 +215,17 @@ mod tests {
         let conn_path = connection_log_path("abc123ef").unwrap();
         assert!(conn_path.ends_with("abc123ef.log"));
         assert!(conn_path.parent().unwrap().ends_with("connections"));
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    #[test]
+    fn metrics_log_path_in_state_dir() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let path = metrics_log_path().unwrap();
+        assert!(path.ends_with("metrics.jsonl"));
+        assert!(path.parent().unwrap().ends_with("kmux"));
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 

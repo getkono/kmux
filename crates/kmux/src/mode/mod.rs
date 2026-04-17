@@ -98,6 +98,7 @@ pub enum Action {
 
     // HUD / modes
     ToggleHud,
+    ToggleMetrics,
     ToggleSnapshotMode,
     ToggleInputLock,
 

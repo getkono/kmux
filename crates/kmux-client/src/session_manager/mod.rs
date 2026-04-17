@@ -20,7 +20,8 @@ use kmux_protocol::messages::ConnectionId;
 use crate::connection_state::ConnectionState;
 use crate::grid::CellGrid;
 use crate::liveness::Liveness;
-use crate::metrics::RenderMetrics;
+use crate::metrics::{JsonlSink, MetricsStore};
+use crate::supervisor::RttSample;
 use crate::transport::TransportKind;
 
 /// Per-pane synchronisation state.
@@ -62,7 +63,7 @@ pub struct SessionManager {
     pub client_id: Option<ClientId>,
 
     // Observability
-    pub metrics: RenderMetrics,
+    pub metrics: MetricsStore,
 
     // Last-successful connection info for display / reconnect
     pub(super) last_host: String,
@@ -85,6 +86,11 @@ pub struct SessionManager {
     /// Tracks inbound/outbound ping traffic so we can declare the
     /// connection dead proactively when the server stops responding.
     pub(super) liveness: Liveness,
+
+    /// Optional sink for RTT observations. Set by the caller when a
+    /// `TransportSupervisor` is spawned so the scorer operates on live
+    /// measurements. `None` when no supervisor exists (direct QUIC path).
+    pub(super) rtt_tx: Option<mpsc::UnboundedSender<RttSample>>,
 }
 
 impl SessionManager {
@@ -114,12 +120,31 @@ impl SessionManager {
             input_locked: HashMap::new(),
             next_request_id: 0,
             client_id: None,
-            metrics: RenderMetrics::new(),
+            metrics: MetricsStore::in_memory(),
             server_version: None,
             connection_id: None,
             current_transport: TransportKind::Quic,
             connection_state: ConnectionState::Idle,
             liveness: Liveness::new(Instant::now()),
+            rtt_tx: None,
+        }
+    }
+
+    /// Wire the session manager to a `TransportSupervisor`'s RTT sink.
+    /// Called by the caller that spawns the supervisor so RTT observations
+    /// feed the scorer's EWMA.
+    pub fn set_rtt_sink(&mut self, tx: mpsc::UnboundedSender<RttSample>) {
+        self.rtt_tx = Some(tx);
+    }
+
+    /// Forward an RTT observation to the supervisor (if any) tagged with
+    /// the currently-active transport.
+    pub(super) fn record_rtt_to_supervisor(&self, rtt_ms: f64) {
+        if let Some(tx) = self.rtt_tx.as_ref() {
+            let _ = tx.send(RttSample {
+                kind: self.current_transport,
+                rtt_ms,
+            });
         }
     }
 
@@ -163,12 +188,44 @@ impl SessionManager {
 
     // ── Internal helpers ──────────────────────────────────────────────────────
 
-    pub(super) fn send_ws(&self, msg: ClientMessage) {
-        if let Some(tx) = &self.ws_sender
-            && let Err(e) = tx.send(msg)
-        {
+    pub(super) fn send_ws(&mut self, msg: ClientMessage) {
+        let Some(tx) = self.ws_sender.as_ref() else {
+            return;
+        };
+        let bytes = kmux_protocol::encode_client(&msg)
+            .map(|b| b.len())
+            .unwrap_or(0);
+        if let Err(e) = tx.send(msg) {
             warn!("send_ws failed: {e}");
+            return;
         }
+        if bytes > 0 {
+            self.metrics.record_outbound(bytes);
+        }
+    }
+
+    /// Enable rolling-JSONL persistence for this session's metrics. Called
+    /// by the TUI after construction so tests stay filesystem-free.
+    pub fn enable_metrics_persistence(&mut self) {
+        match kmux_protocol::dirs::metrics_log_path() {
+            Ok(path) => {
+                self.metrics = MetricsStore::new(Some(JsonlSink::new(path)));
+            }
+            Err(e) => warn!("metrics persistence disabled: {e}"),
+        }
+    }
+
+    /// The `host:port` string used as the metrics-layer address for the
+    /// currently-pointed endpoint. UDS connections still key off the
+    /// user-visible target so the overlay stays understandable.
+    fn metrics_address(&self) -> String {
+        format!("{}:{}", self.host, self.port)
+    }
+
+    /// Tag the metrics layer with the currently active transport.
+    pub(super) fn tag_transport(&mut self, kind: TransportKind) {
+        let addr = self.metrics_address();
+        self.metrics.on_transport_active(kind, addr);
     }
 
     pub(super) fn next_rid(&mut self) -> u64 {

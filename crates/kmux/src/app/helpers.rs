@@ -173,6 +173,8 @@ impl App {
                 let capabilities = self.mgr.capabilities().clone();
                 let accept_invalid = self.mgr.accept_invalid_certs();
                 let (conn_id_tx, conn_id_rx) = tokio::sync::oneshot::channel::<ConnectionId>();
+                let (rtt_tx, rtt_rx) = mpsc::unbounded_channel();
+                self.mgr.set_rtt_sink(rtt_tx);
                 tokio::spawn(async move {
                     let Ok(conn_id) = conn_id_rx.await else {
                         return;
@@ -192,6 +194,7 @@ impl App {
                         is_local: false,
                         server_tx: srv_tx,
                         upgrade_tx,
+                        rtt_rx: Some(rtt_rx),
                     });
                     supervisor.run().await;
                 });

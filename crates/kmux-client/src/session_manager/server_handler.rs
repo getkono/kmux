@@ -69,6 +69,16 @@ impl SessionManager {
         // timeout detection for free.
         self.liveness.observe_inbound(Instant::now());
 
+        // Attribute the wire cost of this frame to the currently tagged
+        // transport. We re-encode for the byte count; postcard is cheap
+        // enough that this is negligible next to decoding.
+        let inbound_bytes = kmux_protocol::encode_server(&msg)
+            .map(|b| b.len())
+            .unwrap_or(0);
+        if inbound_bytes > 0 {
+            self.metrics.record_inbound(inbound_bytes);
+        }
+
         match msg {
             ServerMessage::AuthResult {
                 success,
@@ -376,7 +386,11 @@ impl SessionManager {
             // `observe_inbound` at the top of this fn) so outstanding
             // ping seqs are cleared.
             ServerMessage::Pong { seq } => {
-                self.liveness.on_pong(seq, Instant::now());
+                if let Some(rtt) = self.liveness.on_pong(seq, Instant::now()) {
+                    let rtt_ms = rtt.as_secs_f64() * 1000.0;
+                    self.metrics.observe_rtt(rtt_ms);
+                    self.record_rtt_to_supervisor(rtt_ms);
+                }
             }
         }
         events

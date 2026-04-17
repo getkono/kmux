@@ -57,6 +57,7 @@ pub fn resolve_mode_select(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action
             "k" => (Some(Mode::Signal), Action::None),
             "l" => (Some(Mode::Locked), Action::None),
             "h" => (Some(Mode::Normal), Action::ToggleHud),
+            "m" => (Some(Mode::Normal), Action::ToggleMetrics),
             "?" => (Some(Mode::Help), Action::None),
             "q" => (Some(Mode::Normal), Action::Quit),
             _ => (Some(Mode::Normal), Action::None),

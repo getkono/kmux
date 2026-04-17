@@ -5,7 +5,7 @@ use std::fmt;
 /// This enum is **not** serialised in wire messages (only used as `String` in
 /// `ChannelSwitched.old_transport`), so adding variants here is source-only and
 /// does not require a `PROTOCOL_VERSION` bump.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportKind {
     /// QUIC/UDP transport (preferred; lower latency, multiplexed streams).
     Quic,
