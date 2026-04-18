@@ -12,16 +12,9 @@ A terminal multiplexer / session manager with remote desktop capabilities.
 - Format: `just fmt`
 - Format check: `just fmt-check`
 
-## Architecture
-
-- See [docs/connection.md](docs/connection.md) for a full description of the
-  two-phase connection model, transport selection, supervisor scoring,
-  `kmuxd.toml` configuration, and the SSH bootstrap flow.
-- See [docs/PERFORMANCE.md](docs/PERFORMANCE.md) for latency measurement and
-  scorer behavior notes.
-
 ## Conventions
 
+- Any architectural detail/change should be documented in `docs/` directory.
 - Use strict Rust -- no `#[allow(unused)]` without justification
 - Write tests for all new functionality
 - Use conventional commits (`type: description`)
