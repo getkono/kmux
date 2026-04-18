@@ -16,6 +16,7 @@ use crate::mode::Mode;
 use crate::recent_servers::ServerKind;
 use crate::ui;
 
+use super::helpers::BootstrapPhase;
 use super::{App, KeyResult, SwitchTarget};
 
 /// How often to re-check liveness (ping cadence + timeout evaluation).
@@ -45,26 +46,14 @@ impl App {
                 _ => true,
             };
             if actionable {
-                self.mgr.set_status_msg("Connecting…".to_string());
-                match self
-                    .mgr
-                    .connect(srv_tx.clone(), target, &NoopObserver)
-                    .await
-                {
-                    Ok(Some(ctx)) => {
-                        self.launch_ssh_supervisor(
-                            ctx,
-                            srv_tx.clone(),
-                            upgrade_tx.clone(),
-                            tunnel_died_tx.clone(),
-                        );
-                    }
-                    Ok(None) => {}
-                    Err(e) => {
-                        warn!("initial bootstrap failed: {e}");
-                        self.enter_disconnected(DisconnectReason::BootstrapFailed(e.to_string()));
-                    }
-                }
+                self.run_bootstrap(
+                    target,
+                    srv_tx.clone(),
+                    upgrade_tx.clone(),
+                    tunnel_died_tx.clone(),
+                    BootstrapPhase::Initial,
+                )
+                .await;
             }
         }
 
@@ -271,7 +260,7 @@ impl App {
 
     /// Transition to `Mode::Disconnected`, record the reason in the session
     /// manager, and emit a structured tracing event.
-    fn enter_disconnected(&mut self, reason: DisconnectReason) {
+    pub(super) fn enter_disconnected(&mut self, reason: DisconnectReason) {
         let reason_str = reason.to_string();
         tracing::warn!(
             connection_id = self.mgr.connection_id.map(|c| c.0),
@@ -293,43 +282,21 @@ impl App {
         upgrade_tx: mpsc::Sender<UpgradeSignal>,
         tunnel_died_tx: mpsc::Sender<()>,
     ) {
-        info!(
-            connection_id = self.mgr.connection_id.map(|c| c.0),
-            "reconnect requested",
-        );
-        self.mgr.prepare_reconnect();
-        self.mode = Mode::Normal;
-        self.needs_render = true;
-
         let target = self.current_target();
-        let status_msg = match &target {
-            ResolvedTarget::Ssh { .. } => "Reconnecting via SSH…",
-            ResolvedTarget::LocalDaemon => "Reconnecting to local daemon…",
-            ResolvedTarget::Direct { .. } => "Reconnecting…",
-        };
-        self.mgr.set_status_msg(status_msg.to_string());
-
-        match self
-            .mgr
-            .connect(new_tx.clone(), target, &NoopObserver)
-            .await
-        {
-            Ok(Some(ctx)) => {
-                self.launch_ssh_supervisor(ctx, new_tx, upgrade_tx, tunnel_died_tx);
-                self.reflect_bootstrap_outcome();
-            }
-            Ok(None) => self.reflect_bootstrap_outcome(),
-            Err(e) => {
-                warn!("reconnect bootstrap failed: {e}");
-                self.enter_disconnected(DisconnectReason::BootstrapFailed(e.to_string()));
-            }
-        }
+        self.run_bootstrap(
+            target,
+            new_tx,
+            upgrade_tx,
+            tunnel_died_tx,
+            BootstrapPhase::Reconnect,
+        )
+        .await;
     }
 
     /// After `mgr.connect()` settles, mirror the manager's connection state
     /// into the TUI mode. On failure, show the disconnect overlay again with
     /// the bootstrap error that `mgr.connect` recorded.
-    fn reflect_bootstrap_outcome(&mut self) {
+    pub(super) fn reflect_bootstrap_outcome(&mut self) {
         if self.mgr.connection_state().is_live() {
             self.mode = Mode::Normal;
         } else {

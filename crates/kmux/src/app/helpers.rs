@@ -1,15 +1,22 @@
-use kmux_client::pipeline::SshContext;
+use kmux_client::connection_state::DisconnectReason;
+use kmux_client::pipeline::{NoopObserver, ResolvedTarget, SshContext};
 use kmux_client::session_manager::SessionEvent;
 use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
 use kmux_client::transport::TransportKind;
 use kmux_protocol::messages::{ServerMessage, SessionEntry, TermSize};
 use tokio::sync::mpsc;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::mode::{ConnectField, Mode};
 use crate::recent_servers::RecentServer;
 
 use super::App;
+
+#[derive(Debug)]
+pub(super) enum BootstrapPhase {
+    Initial,
+    Reconnect,
+}
 
 impl App {
     /// React to `SessionEvent`s returned from `SessionManager::handle_server_message`.
@@ -184,6 +191,57 @@ impl App {
             self.mgr.host(),
             self.mgr.port(),
         );
+    }
+
+    /// Canonical bootstrap sequence shared by initial connect and reconnect.
+    ///
+    /// Both callers reduce to this single path so any future change (new status
+    /// message, observer swap, extra prep step) only needs to be made once.
+    pub(super) async fn run_bootstrap(
+        &mut self,
+        target: ResolvedTarget,
+        srv_tx: mpsc::UnboundedSender<ServerMessage>,
+        upgrade_tx: mpsc::Sender<UpgradeSignal>,
+        tunnel_died_tx: mpsc::Sender<()>,
+        phase: BootstrapPhase,
+    ) {
+        if matches!(phase, BootstrapPhase::Reconnect) {
+            info!(
+                connection_id = self.mgr.connection_id.map(|c| c.0),
+                "reconnect requested",
+            );
+            self.mgr.prepare_reconnect();
+        }
+
+        self.mode = Mode::Normal;
+        self.needs_render = true;
+
+        let connecting = matches!(phase, BootstrapPhase::Initial);
+        let status = match &target {
+            ResolvedTarget::Ssh { .. } if connecting => "Connecting via SSH…",
+            ResolvedTarget::Ssh { .. } => "Reconnecting via SSH…",
+            ResolvedTarget::LocalDaemon if connecting => "Connecting to local daemon…",
+            ResolvedTarget::LocalDaemon => "Reconnecting to local daemon…",
+            ResolvedTarget::Direct { .. } if connecting => "Connecting…",
+            ResolvedTarget::Direct { .. } => "Reconnecting…",
+        };
+        self.mgr.set_status_msg(status.to_string());
+
+        match self
+            .mgr
+            .connect(srv_tx.clone(), target, &NoopObserver)
+            .await
+        {
+            Ok(Some(ctx)) => {
+                self.launch_ssh_supervisor(ctx, srv_tx, upgrade_tx, tunnel_died_tx);
+                self.reflect_bootstrap_outcome();
+            }
+            Ok(None) => self.reflect_bootstrap_outcome(),
+            Err(e) => {
+                warn!(phase = ?phase, "bootstrap failed: {e}");
+                self.enter_disconnected(DisconnectReason::BootstrapFailed(e.to_string()));
+            }
+        }
     }
 
     /// Build the target to bootstrap against from current App state.
