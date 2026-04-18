@@ -4,7 +4,7 @@ use kmux_protocol::messages::{ClientMessage, ErrorCode, ServerMessage, epoch_mil
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::app::InputLockOutcome;
+use crate::app::{AttachParams, InputLockOutcome};
 use crate::auth::validate_token;
 use crate::connection::classify_error;
 
@@ -158,6 +158,7 @@ pub async fn handle_message<A: PaneAttacher>(
                 request_id,
                 pane_id,
                 session_word_id: word_id,
+                size,
             }),
             Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
         },
@@ -201,7 +202,7 @@ pub async fn handle_message<A: PaneAttacher>(
         }
 
         ClientMessage::Resize { pane_id, size } => {
-            if let Err(e) = state.app.resize(&pane_id, size).await {
+            if let Err(e) = state.app.resize(&pane_id, client_id, size).await {
                 state.error(None, classify_error(&e), e.to_string());
             }
         }
@@ -209,6 +210,7 @@ pub async fn handle_message<A: PaneAttacher>(
         ClientMessage::Attach {
             pane_id,
             last_seqno,
+            size,
         } => {
             // If already attached, detach first.
             if let Some(old) = state.attached.remove(&pane_id) {
@@ -220,14 +222,15 @@ pub async fn handle_message<A: PaneAttacher>(
 
             match state
                 .app
-                .attach(
-                    &pane_id,
+                .attach(AttachParams {
+                    pane_id: pane_id.clone(),
                     client_id,
                     last_seqno,
-                    client_tx,
-                    state.ctrl_tx.clone(),
-                    state.capabilities.clone(),
-                )
+                    size,
+                    data_tx: client_tx,
+                    ctrl_tx: state.ctrl_tx.clone(),
+                    capabilities: state.capabilities.clone(),
+                })
                 .await
             {
                 Ok(result) => {

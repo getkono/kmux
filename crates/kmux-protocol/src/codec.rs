@@ -109,6 +109,8 @@ mod tests {
             size: TermSize {
                 rows: 40,
                 cols: 120,
+                pixel_width: 0,
+                pixel_height: 0,
             },
         };
         let bytes = encode_client(&msg).expect("encode");
@@ -142,13 +144,46 @@ mod tests {
         let msg = ClientMessage::Attach {
             pane_id: "eagle/0".to_string(),
             last_seqno: Some(SequenceNo(100)),
+            size: TermSize::default(),
         };
         let bytes = encode_client(&msg).expect("encode");
         let decoded = decode_client(&bytes).expect("decode");
         assert!(
-            matches!(&decoded, ClientMessage::Attach { pane_id, last_seqno: Some(SequenceNo(100)) }
+            matches!(&decoded, ClientMessage::Attach { pane_id, last_seqno: Some(SequenceNo(100)), .. }
                 if pane_id == "eagle/0")
         );
+    }
+
+    #[test]
+    fn attach_roundtrip_with_size() {
+        let size = TermSize {
+            rows: 40,
+            cols: 132,
+            pixel_width: 1056,
+            pixel_height: 640,
+        };
+        let msg = ClientMessage::Attach {
+            pane_id: "eagle/0".to_string(),
+            last_seqno: None,
+            size,
+        };
+        let bytes = encode_client(&msg).expect("encode");
+        let decoded = decode_client(&bytes).expect("decode");
+        match decoded {
+            ClientMessage::Attach {
+                pane_id,
+                last_seqno,
+                size: decoded_size,
+            } => {
+                assert_eq!(pane_id, "eagle/0");
+                assert!(last_seqno.is_none());
+                assert_eq!(decoded_size.rows, 40);
+                assert_eq!(decoded_size.cols, 132);
+                assert_eq!(decoded_size.pixel_width, 1056);
+                assert_eq!(decoded_size.pixel_height, 640);
+            }
+            _ => panic!("expected Attach"),
+        }
     }
 
     #[test]

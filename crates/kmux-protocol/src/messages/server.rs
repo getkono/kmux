@@ -56,6 +56,8 @@ pub enum ServerMessage {
         request_id: RequestId,
         pane_id: PaneId,
         session_word_id: WordId,
+        /// Terminal dimensions the server assigned to the new pane.
+        size: super::session::TermSize,
     },
 
     /// Confirmation that a pane was closed.

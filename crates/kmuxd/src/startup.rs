@@ -18,7 +18,7 @@ use crate::term_state;
 use crate::tls;
 
 pub async fn async_main(daemon: bool, cfg: ServerConfig) -> anyhow::Result<()> {
-    info!(backend = term_state::BACKEND_NAME, "terminal backend");
+    info!(backend = term_state::backend_name(), "terminal backend");
     info!(
         runtime_dir = %cfg.runtime_dir,
         allow_peer_cred = cfg.auth.allow_peer_cred,

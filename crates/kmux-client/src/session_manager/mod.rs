@@ -10,7 +10,7 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ClientMessage, PaneId, SequenceNo, SessionEntry, WordId,
+    ClientCapabilities, ClientId, ClientMessage, PaneId, SequenceNo, SessionEntry, TermSize, WordId,
 };
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -79,6 +79,10 @@ pub struct SessionManager {
     /// The active transport kind (QUIC or TCP).
     pub current_transport: TransportKind,
 
+    /// Last terminal size reported by the client (rows/cols after UI chrome subtraction).
+    /// Sent with every `Attach` so the daemon can apply smallest-wins negotiation.
+    pub(super) last_term_size: TermSize,
+
     /// High-level connection state surfaced to the TUI badge + overlay.
     /// `connected` and `status_msg` are derived from this on every transition.
     pub(super) connection_state: ConnectionState,
@@ -124,6 +128,7 @@ impl SessionManager {
             server_version: None,
             connection_id: None,
             current_transport: TransportKind::Quic,
+            last_term_size: TermSize::default(),
             connection_state: ConnectionState::Idle,
             liveness: Liveness::new(Instant::now()),
             rtt_tx: None,
@@ -240,7 +245,22 @@ impl SessionManager {
         self.send_ws(ClientMessage::Attach {
             pane_id,
             last_seqno: None,
+            size: self.last_term_size,
         });
+    }
+
+    /// Update the stored terminal size and send a `Resize` to every attached pane.
+    pub fn update_term_size(&mut self, size: TermSize) {
+        self.last_term_size = size;
+        let attached: Vec<String> = self
+            .buffers
+            .keys()
+            .filter(|pid| self.pane_sync.contains_key(*pid))
+            .cloned()
+            .collect();
+        for pane_id in attached {
+            self.send_ws(ClientMessage::Resize { pane_id, size });
+        }
     }
 }
 
@@ -594,5 +614,96 @@ mod tests {
             }
             other => panic!("unexpected message: {other:?}"),
         }
+    }
+
+    #[test]
+    fn attach_sends_current_size() {
+        // When a pane is attached, the Attach message carries the last stored
+        // terminal size rather than the zero default.
+        let (mut mgr, mut rx) = make_connected_manager();
+        let size = TermSize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        mgr.last_term_size = size;
+        mgr.buffers
+            .insert("eagle/0".to_string(), CellGrid::default());
+        mgr.attach_fresh("eagle/0".to_string());
+
+        match rx.try_recv().expect("Attach message sent") {
+            ClientMessage::Attach {
+                pane_id,
+                size: sent_size,
+                ..
+            } => {
+                assert_eq!(pane_id, "eagle/0");
+                assert_eq!(sent_size, size);
+            }
+            other => panic!("unexpected message: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn update_term_size_resizes_attached_panes() {
+        // update_term_size sends a Resize to every pane tracked in pane_sync.
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.buffers.insert("s1/0".to_string(), CellGrid::default());
+        mgr.buffers.insert("s2/0".to_string(), CellGrid::default());
+        mgr.pane_sync
+            .insert("s1/0".to_string(), PaneSync::AwaitingSync);
+        mgr.pane_sync
+            .insert("s2/0".to_string(), PaneSync::AwaitingSync);
+
+        let size = TermSize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        mgr.update_term_size(size);
+        assert_eq!(mgr.last_term_size, size);
+
+        // Both attached panes should receive a Resize.
+        let mut resized_panes: Vec<String> = (0..2)
+            .map(|_| match rx.try_recv().expect("Resize sent") {
+                ClientMessage::Resize { pane_id, size: s } => {
+                    assert_eq!(s, size);
+                    pane_id
+                }
+                other => panic!("unexpected: {other:?}"),
+            })
+            .collect();
+        resized_panes.sort();
+        assert_eq!(resized_panes, ["s1/0", "s2/0"]);
+    }
+
+    #[test]
+    fn pane_resized_event_resizes_cellgrid() {
+        use kmux_protocol::messages::SessionEventMsg;
+        // PaneResized event must resize the local CellGrid buffer so it matches
+        // the daemon's new effective size before the forced TerminalSnapshot arrives.
+        let (mut mgr, _rx) = make_connected_manager();
+        let mut grid = CellGrid::default();
+        grid.resize(24, 80);
+        mgr.buffers.insert("eagle/0".to_string(), grid);
+
+        let new_size = TermSize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneResized {
+                pane_id: "eagle/0".to_string(),
+                size: new_size,
+            },
+        });
+
+        let grid = mgr.buffers.get("eagle/0").expect("buffer exists");
+        assert_eq!(grid.rows, 40);
+        assert_eq!(grid.cols, 120);
     }
 }

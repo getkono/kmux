@@ -87,9 +87,14 @@ pub enum ClientMessage {
     ///
     /// `last_seqno = None`       -> send full snapshot (first attach or full resync)
     /// `last_seqno = Some(n)`    -> replay only chunks with seqno > n (reconnect)
+    ///
+    /// `size` is the client's current terminal size.  The server uses this to
+    /// compute the effective pane size across all attached clients (smallest-wins).
     Attach {
         pane_id: PaneId,
         last_seqno: Option<SequenceNo>,
+        /// Client's current terminal dimensions.
+        size: TermSize,
     },
 
     /// Unsubscribe from PTY output for a pane.

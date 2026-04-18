@@ -15,6 +15,7 @@ use tracing::{info, warn};
 use crate::mode::Mode;
 use crate::recent_servers::ServerKind;
 use crate::ui;
+use kmux_protocol::messages::TermSize;
 
 use super::helpers::BootstrapPhase;
 use super::{App, KeyResult, SwitchTarget};
@@ -24,6 +25,10 @@ const LIVENESS_TICK: Duration = Duration::from_secs(1);
 /// How often to append one metrics sample to the rolling JSONL file.
 /// Must match the cadence documented in `docs/metrics.md`.
 const METRICS_FLUSH_TICK: Duration = Duration::from_secs(10);
+/// Debounce window for terminal resize events. SIGWINCH fires continuously
+/// during a window drag; coalescing into one resize after the burst settles
+/// avoids flooding the server with snapshot fan-outs.
+const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
 
 impl App {
     pub async fn run(
@@ -36,6 +41,10 @@ impl App {
         let (upgrade_tx, mut upgrade_rx) = mpsc::channel::<UpgradeSignal>(1);
         // SSH tunnel health: signals when the SSH tunnel process exits unexpectedly.
         let (tunnel_died_tx, mut tunnel_died_rx) = mpsc::channel::<()>(1);
+
+        // Seed the session manager with the initial terminal size so the first
+        // Attach carries the real dimensions rather than the default 24×80.
+        self.mgr.update_term_size(Self::current_term_size());
 
         // Initial bootstrap: if the parsed target is actionable, run the pipeline.
         // Direct-without-token leaves `pending_target` set but enters the Connect
@@ -64,6 +73,10 @@ impl App {
         liveness_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         let mut metrics_flush_tick = tokio::time::interval(METRICS_FLUSH_TICK);
         metrics_flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
+        // Debounce state: last resize seen, deadline after which it is applied.
+        let mut pending_resize: Option<TermSize> = None;
+        let mut resize_deadline: Option<tokio::time::Instant> = None;
 
         loop {
             if self.needs_render {
@@ -188,7 +201,8 @@ impl App {
                             self.needs_render = true;
                         }
                         Some(Ok(Event::Resize(cols, rows))) => {
-                            self.handle_resize(rows, cols);
+                            pending_resize = Some(App::compute_pane_size(rows, cols));
+                            resize_deadline = Some(tokio::time::Instant::now() + RESIZE_DEBOUNCE);
                             self.needs_render = true;
                         }
                         Some(Err(_)) | None => break,
@@ -247,6 +261,18 @@ impl App {
                 }
                 _ = render_tick.tick() => {
                     self.needs_render = true;
+                }
+                _ = async {
+                    match resize_deadline {
+                        Some(d) => tokio::time::sleep_until(d).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Some(size) = pending_resize.take() {
+                        self.mgr.update_term_size(size);
+                        self.needs_render = true;
+                    }
+                    resize_deadline = None;
                 }
                 _ = metrics_flush_tick.tick() => {
                     let conn_id = self.mgr.connection_id;

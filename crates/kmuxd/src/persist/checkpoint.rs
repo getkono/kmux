@@ -29,9 +29,10 @@ pub fn write_checkpoint(state: &PersistedDaemonState, path: &Path) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::persist::PersistedTermSize;
     use crate::persist::STATE_VERSION;
     use kmux_protocol::messages::{
-        CursorState, GridSnapshot, SessionMeta, SessionStatus, TermModes, TermSize,
+        CursorState, GridSnapshot, SessionMeta, SessionStatus, TermModes,
     };
 
     fn empty_state() -> PersistedDaemonState {
@@ -60,7 +61,7 @@ mod tests {
                     pane_index: 0,
                     program: "/bin/sh".to_string(),
                     args: vec![],
-                    size: TermSize { rows: 24, cols: 80 },
+                    size: PersistedTermSize { rows: 24, cols: 80 },
                     status: SessionStatus::Running,
                     child_pid: None,
                     grid: GridSnapshot {

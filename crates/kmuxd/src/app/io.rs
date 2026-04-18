@@ -57,23 +57,44 @@ impl ServerApp {
     }
 
     /// Resize a pane's PTY and its server-side terminal emulator.
-    pub async fn resize(&self, pane_id: &str, size: TermSize) -> Result<()> {
-        self.manager
-            .resize(pane_id, term_size_to_window(size))
-            .await?;
+    ///
+    /// The effective pane size is the minimum of all attached clients'
+    /// dimensions (smallest-wins).  The PTY TIOCSWINSZ is issued after the
+    /// emulator resize and the sessions lock is released so that the async
+    /// syscall doesn't hold the write guard.
+    pub async fn resize(&self, pane_id: &str, client_id: ClientId, size: TermSize) -> Result<()> {
+        let resize_to = {
+            let mut sessions = self.sessions.write().await;
+            let relay = get_pane_relay_mut(&mut sessions, pane_id)?;
 
-        let mut sessions = self.sessions.write().await;
-        match get_pane_relay_mut(&mut sessions, pane_id) {
-            Ok(relay) => {
-                relay.size = size;
-                relay
-                    .term_state
-                    .lock()
-                    .unwrap()
-                    .resize(size.rows, size.cols);
+            // Update this client's declared size.
+            if let Some(sender) = relay.clients.lock().unwrap().get_mut(&client_id) {
+                sender.size = size;
             }
-            Err(_) => warn!("resize: pane '{pane_id}' not found after resize"),
+
+            // Compute effective (smallest-wins) size; apply if changed.
+            let seqno = relay
+                .seqno_counter
+                .load(std::sync::atomic::Ordering::Relaxed)
+                .saturating_sub(1);
+            if let Some(new_size) = relay.apply_effective_size() {
+                relay.broadcast_resize(pane_id, new_size, seqno);
+                Some(new_size)
+            } else {
+                None
+            }
+        }; // sessions write lock released here
+
+        // Issue the kernel PTY resize outside the lock (async syscall).
+        if let Some(new_size) = resize_to
+            && let Err(e) = self
+                .manager
+                .resize(pane_id, term_size_to_window(new_size))
+                .await
+        {
+            warn!("resize: PTY ioctl failed for '{pane_id}': {e}");
         }
+
         Ok(())
     }
 

@@ -57,7 +57,7 @@ impl ServerApp {
                     pane_index,
                     program: relay.program.clone(),
                     args: relay.args.clone(),
-                    size: relay.size,
+                    size: relay.size.into(),
                     status: relay.status.clone(),
                     child_pid,
                     grid,

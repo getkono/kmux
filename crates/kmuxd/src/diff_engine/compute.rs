@@ -255,7 +255,12 @@ mod tests {
         };
         let _ = engine.compute_diff();
 
-        engine.resize(30, 100);
+        engine.resize(crate::backend::BackendSize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
         assert_eq!(engine.rows, 30);
         assert_eq!(engine.cols, 100);
         // After resize, prev state is reset

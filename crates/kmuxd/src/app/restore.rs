@@ -7,6 +7,9 @@ use kmux_protocol::messages::{InputMode, SessionStatus};
 use kmux_pty::config::{EnvBuilder, PtyConfig};
 use tracing::warn;
 
+use crate::backend::{
+    BackendConfig, BackendSize, CapabilityHandles, DEFAULT_SCROLLBACK, NullEventSink,
+};
 use crate::relay::session_diff_loop;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::new_term_state;
@@ -50,7 +53,7 @@ impl ServerApp {
             for persisted_pane in persisted_session.panes {
                 let pane_index = persisted_pane.pane_index;
                 let pane_id = format!("{word_id}/{pane_index}");
-                let size = persisted_pane.size;
+                let size = persisted_pane.size.to_term_size();
 
                 // Spawn a fresh shell using the persisted program and args.
                 let config = PtyConfig::new(&persisted_pane.program)
@@ -84,12 +87,15 @@ impl ServerApp {
                 let kitty_keyboard_enabled = Arc::new(AtomicBool::new(false));
                 let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
                 let scrollback = Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY)));
-                let term_state = Arc::new(Mutex::new(new_term_state(
-                    size.rows,
-                    size.cols,
-                    kitty_graphics_enabled.clone(),
-                    kitty_keyboard_enabled.clone(),
-                )));
+                let term_state = Arc::new(Mutex::new(new_term_state(BackendConfig {
+                    size: BackendSize::from(size),
+                    capabilities: CapabilityHandles {
+                        kitty_graphics: kitty_graphics_enabled.clone(),
+                        kitty_keyboard: kitty_keyboard_enabled.clone(),
+                    },
+                    events: Arc::new(NullEventSink),
+                    scrollback: DEFAULT_SCROLLBACK,
+                })));
                 let seqno_counter = Arc::new(AtomicU64::new(1));
 
                 // Pre-feed the old scrollback history + visible grid as ANSI

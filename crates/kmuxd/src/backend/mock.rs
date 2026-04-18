@@ -1,6 +1,6 @@
 use kmux_protocol::messages::{CellState, CursorState, TermModes};
 
-use super::TerminalBackend;
+use super::{BackendConfig, BackendSize, TerminalBackend};
 
 /// A mock terminal backend for testing the diff engine in isolation.
 ///
@@ -15,11 +15,11 @@ pub struct MockBackend {
     pub alt_screen: bool,
     pub history_len: usize,
     pub history_lines: Vec<Vec<CellState>>,
-    rows: u16,
-    cols: u16,
+    size: BackendSize,
 }
 
 impl MockBackend {
+    /// Convenience constructor for tests that don't need pixel dims or capabilities.
     pub fn new(rows: u16, cols: u16) -> Self {
         let n = rows as usize * cols as usize;
         Self {
@@ -30,19 +30,45 @@ impl MockBackend {
             alt_screen: false,
             history_len: 0,
             history_lines: Vec::new(),
-            rows,
-            cols,
+            size: BackendSize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
         }
     }
 }
 
 impl TerminalBackend for MockBackend {
+    fn new(cfg: BackendConfig) -> Self {
+        let size = cfg.size;
+        let n = size.rows as usize * size.cols as usize;
+        Self {
+            cells: vec![CellState::default(); n],
+            cursor_state: CursorState::default(),
+            mode_flags: TermModes::EMPTY,
+            fed_bytes: Vec::new(),
+            alt_screen: false,
+            history_len: 0,
+            history_lines: Vec::new(),
+            size,
+        }
+    }
+
+    fn name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "mock"
+    }
+
     fn feed(&mut self, data: &[u8]) {
         self.fed_bytes.extend_from_slice(data);
     }
 
-    fn size(&self) -> (u16, u16) {
-        (self.rows, self.cols)
+    fn size(&self) -> BackendSize {
+        self.size
     }
 
     fn fill_cells(&self, out: &mut [CellState]) {
@@ -58,10 +84,9 @@ impl TerminalBackend for MockBackend {
         self.mode_flags
     }
 
-    fn resize(&mut self, rows: u16, cols: u16) {
-        self.rows = rows;
-        self.cols = cols;
-        let n = rows as usize * cols as usize;
+    fn resize(&mut self, size: BackendSize) {
+        self.size = size;
+        let n = size.rows as usize * size.cols as usize;
         self.cells.resize(n, CellState::default());
     }
 

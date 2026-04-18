@@ -19,8 +19,12 @@ pub fn pty_event_to_msg(event: kmux_pty::events::SessionEvent) -> SessionEventMs
         kmux_pty::events::SessionEvent::Resized { name, rows, cols } => {
             SessionEventMsg::PaneResized {
                 pane_id: name,
-                rows,
-                cols,
+                size: kmux_protocol::messages::TermSize {
+                    rows,
+                    cols,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
             }
         }
         kmux_pty::events::SessionEvent::Closed { name } => {

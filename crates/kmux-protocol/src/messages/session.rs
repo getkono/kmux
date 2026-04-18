@@ -47,16 +47,30 @@ pub struct ClientId(pub u64);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SequenceNo(pub u64);
 
-/// Terminal dimensions (rows x columns).
+/// Terminal dimensions (rows × columns × optional pixel extent).
+///
+/// `pixel_width` and `pixel_height` represent the total drawable area of the
+/// terminal window in physical pixels.  A value of `0` means the client does
+/// not know (or the platform does not expose) the pixel dimensions — backends
+/// must treat `0` as "unknown" and fall back to cell-only sizing.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TermSize {
     pub rows: u16,
     pub cols: u16,
+    /// Total window width in physical pixels; `0` = unknown.
+    pub pixel_width: u16,
+    /// Total window height in physical pixels; `0` = unknown.
+    pub pixel_height: u16,
 }
 
 impl Default for TermSize {
     fn default() -> Self {
-        Self { rows: 24, cols: 80 }
+        Self {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
     }
 }
 
@@ -136,13 +150,62 @@ pub enum SessionEventMsg {
         signal: Option<i32>,
     },
     /// A pane was resized.
-    PaneResized {
-        pane_id: PaneId,
-        rows: u16,
-        cols: u16,
-    },
+    PaneResized { pane_id: PaneId, size: TermSize },
     /// A pane was closed.
     PaneClosed { pane_id: PaneId },
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn term_size_pixel_fields_roundtrip() {
+        let size = TermSize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 1920,
+            pixel_height: 1080,
+        };
+        let bytes = postcard::to_allocvec(&size).expect("serialize");
+        let decoded: TermSize = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded.rows, 40);
+        assert_eq!(decoded.cols, 120);
+        assert_eq!(decoded.pixel_width, 1920);
+        assert_eq!(decoded.pixel_height, 1080);
+    }
+
+    #[test]
+    fn term_size_default_has_zero_pixel_dims() {
+        let d = TermSize::default();
+        assert_eq!(d.rows, 24);
+        assert_eq!(d.cols, 80);
+        assert_eq!(d.pixel_width, 0);
+        assert_eq!(d.pixel_height, 0);
+    }
+
+    #[test]
+    fn pane_resized_carries_term_size() {
+        let msg = SessionEventMsg::PaneResized {
+            pane_id: "eagle/0".to_string(),
+            size: TermSize {
+                rows: 30,
+                cols: 100,
+                pixel_width: 1000,
+                pixel_height: 600,
+            },
+        };
+        let bytes = postcard::to_allocvec(&msg).expect("serialize");
+        let decoded: SessionEventMsg = postcard::from_bytes(&bytes).expect("deserialize");
+        match decoded {
+            SessionEventMsg::PaneResized { pane_id, size } => {
+                assert_eq!(pane_id, "eagle/0");
+                assert_eq!(size.rows, 30);
+                assert_eq!(size.pixel_width, 1000);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
 }
 
 /// Error codes for structured error responses.

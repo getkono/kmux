@@ -19,6 +19,39 @@ use serde::{Deserialize, Serialize};
 /// - `version > STATE_VERSION`: refuse (written by a newer daemon).
 pub const STATE_VERSION: u32 = 2;
 
+/// On-disk terminal size representation.
+///
+/// Intentionally decoupled from the wire [`TermSize`] type so that adding
+/// pixel-dimension fields to the protocol does not break existing checkpoints.
+/// `pixel_width` / `pixel_height` are not persisted — they are transient values
+/// supplied by the attaching client and reconstructed at attach time.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct PersistedTermSize {
+    pub rows: u16,
+    pub cols: u16,
+}
+
+impl PersistedTermSize {
+    /// Lift the on-disk size into the wire type, padding pixel dims to 0.
+    pub fn to_term_size(self) -> TermSize {
+        TermSize {
+            rows: self.rows,
+            cols: self.cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+}
+
+impl From<TermSize> for PersistedTermSize {
+    fn from(t: TermSize) -> Self {
+        Self {
+            rows: t.rows,
+            cols: t.cols,
+        }
+    }
+}
+
 /// Top-level persisted daemon state.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedDaemonState {
@@ -56,7 +89,7 @@ pub struct PersistedPane {
     /// Arguments passed to the program at spawn time.
     pub args: Vec<String>,
     /// Terminal dimensions at checkpoint time.
-    pub size: TermSize,
+    pub size: PersistedTermSize,
     /// Pane lifecycle status at checkpoint time.
     pub status: SessionStatus,
     /// Child process PID at checkpoint time (`None` if already exited).
@@ -101,7 +134,7 @@ mod tests {
                     pane_index: 0,
                     program: "/bin/bash".to_string(),
                     args: vec![],
-                    size: TermSize { rows: 24, cols: 80 },
+                    size: PersistedTermSize { rows: 24, cols: 80 },
                     status: SessionStatus::Running,
                     child_pid: Some(12345),
                     grid: GridSnapshot {
@@ -188,5 +221,46 @@ mod tests {
             "exited status not preserved"
         );
         assert_eq!(decoded.sessions[0].panes[0].child_pid, None);
+    }
+
+    #[test]
+    fn persisted_term_size_on_disk_is_two_u16s() {
+        // PersistedTermSize must serialise as exactly 2 varints (rows, cols) so
+        // that existing v2 checkpoint files remain readable after the wire
+        // TermSize gained pixel fields.
+        let size = PersistedTermSize { rows: 24, cols: 80 };
+        let bytes = postcard::to_allocvec(&size).expect("serialize");
+        // Two u16 values 24 and 80, encoded as postcard varints.
+        let expected = postcard::to_allocvec(&(24u16, 80u16)).expect("serialize tuple");
+        assert_eq!(
+            bytes, expected,
+            "PersistedTermSize wire layout must match two bare u16 values"
+        );
+    }
+
+    #[test]
+    fn persisted_term_size_to_term_size_pads_pixel_dims() {
+        let pts = PersistedTermSize {
+            rows: 30,
+            cols: 120,
+        };
+        let ts = pts.to_term_size();
+        assert_eq!(ts.rows, 30);
+        assert_eq!(ts.cols, 120);
+        assert_eq!(ts.pixel_width, 0);
+        assert_eq!(ts.pixel_height, 0);
+    }
+
+    #[test]
+    fn term_size_into_persisted_drops_pixel_dims() {
+        let ts = kmux_protocol::messages::TermSize {
+            rows: 40,
+            cols: 132,
+            pixel_width: 1920,
+            pixel_height: 1080,
+        };
+        let pts: PersistedTermSize = ts.into();
+        assert_eq!(pts.rows, 40);
+        assert_eq!(pts.cols, 132);
     }
 }

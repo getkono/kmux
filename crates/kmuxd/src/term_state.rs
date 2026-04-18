@@ -1,28 +1,20 @@
-use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
-
-pub use crate::backend::wezterm::WezTermBackend;
+use crate::backend::{BackendConfig, TerminalBackend as _};
 pub use crate::diff_engine::DiffEngine;
 
-pub type TermState = DiffEngine<WezTermBackend>;
+#[cfg(feature = "backend-wezterm")]
+pub use crate::backend::wezterm::WezTermBackend;
 
-/// Name of the active terminal backend (for logging).
-pub const BACKEND_NAME: &str = "wezterm";
+#[cfg(feature = "backend-wezterm")]
+pub type ActiveBackend = WezTermBackend;
 
-/// Create a new `TermState` for the given dimensions.
-///
-/// `kitty_graphics` and `kitty_keyboard` are live atomics shared with the
-/// calling `PaneRelay`; the daemon updates them on client attach/detach.
-pub fn new_term_state(
-    rows: u16,
-    cols: u16,
-    kitty_graphics: Arc<AtomicBool>,
-    kitty_keyboard: Arc<AtomicBool>,
-) -> TermState {
-    DiffEngine::new(WezTermBackend::new(
-        rows,
-        cols,
-        kitty_graphics,
-        kitty_keyboard,
-    ))
+pub type TermState = DiffEngine<ActiveBackend>;
+
+/// Human-readable name of the active terminal backend.
+pub fn backend_name() -> &'static str {
+    ActiveBackend::name()
+}
+
+/// Create a new `TermState` from a [`BackendConfig`].
+pub fn new_term_state(cfg: BackendConfig) -> TermState {
+    DiffEngine::new(ActiveBackend::new(cfg))
 }

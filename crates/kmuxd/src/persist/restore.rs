@@ -78,7 +78,8 @@ fn migrate_v1_to_v2(v1: v1::PersistedDaemonState) -> PersistedDaemonState {
 
 /// v1 schema types — used only for migration (and test fixtures).
 mod v1 {
-    use kmux_protocol::messages::{CellState, GridSnapshot, SessionMeta, SessionStatus, TermSize};
+    use crate::persist::PersistedTermSize;
+    use kmux_protocol::messages::{CellState, GridSnapshot, SessionMeta, SessionStatus};
     use serde::{Deserialize, Serialize};
 
     #[derive(Serialize, Deserialize)]
@@ -100,7 +101,7 @@ mod v1 {
     pub struct PersistedPane {
         pub pane_index: u32,
         pub program: String,
-        pub size: TermSize,
+        pub size: PersistedTermSize,
         pub status: SessionStatus,
         pub child_pid: Option<i32>,
         pub grid: GridSnapshot,
@@ -197,8 +198,9 @@ mod tests {
 
     #[test]
     fn migrate_v1_checkpoint_to_v2() {
+        use crate::persist::PersistedTermSize;
         use kmux_protocol::messages::{
-            CursorState, GridSnapshot, SessionMeta, SessionStatus, TermModes, TermSize,
+            CursorState, GridSnapshot, SessionMeta, SessionStatus, TermModes,
         };
 
         let tmp = tempfile::tempdir().unwrap();
@@ -220,7 +222,7 @@ mod tests {
                 panes: vec![v1::PersistedPane {
                     pane_index: 0,
                     program: "/bin/zsh".to_string(),
-                    size: TermSize { rows: 24, cols: 80 },
+                    size: PersistedTermSize { rows: 24, cols: 80 },
                     status: SessionStatus::Running,
                     child_pid: Some(999),
                     grid: GridSnapshot {

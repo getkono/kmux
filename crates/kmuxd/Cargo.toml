@@ -7,6 +7,11 @@ edition = "2024"
 name = "kmuxd"
 path = "src/main.rs"
 
+[features]
+default = ["backend-wezterm"]
+backend-wezterm = ["dep:tattoy-wezterm-term", "dep:tattoy-wezterm-surface"]
+backend-ghostty = []
+
 [dependencies]
 kmux-pty.workspace = true
 kmux-protocol = { workspace = true, features = ["framing", "tls", "quic", "tcp-tls", "uds"] }
@@ -14,8 +19,8 @@ daemonize.workspace = true
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tattoy-wezterm-term.workspace = true
-tattoy-wezterm-surface.workspace = true
+tattoy-wezterm-term = { workspace = true, optional = true }
+tattoy-wezterm-surface = { workspace = true, optional = true }
 tokio.workspace = true
 quinn.workspace = true
 rustls.workspace = true

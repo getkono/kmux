@@ -2,75 +2,87 @@ mod config;
 mod convert;
 
 use std::sync::Arc;
-use std::sync::atomic::AtomicBool;
 
 use kmux_protocol::messages::{CellAttrs, CellState, CursorState, TermModes};
-use tattoy_wezterm_term::{Terminal, TerminalSize};
+use tattoy_wezterm_term::{Terminal, TerminalSize, terminal::Alert};
 
-use crate::backend::TerminalBackend;
+use crate::backend::{BackendConfig, BackendEventSink, BackendSize, TerminalBackend};
 use config::KmuxTerminalConfig;
 use convert::{cell_state_from_attrs, convert_cursor};
 
 /// VT emulator backend powered by `tattoy-wezterm-term`.
 pub struct WezTermBackend {
     pub(super) term: Terminal,
-    pub(super) rows: u16,
-    pub(super) cols: u16,
+    pub(super) size: BackendSize,
 }
 
-impl WezTermBackend {
-    /// Create a new backend.
-    ///
-    /// `kitty_graphics` and `kitty_keyboard` are live atomics shared with the
-    /// [`PaneRelay`][crate::app::PaneRelay].  The daemon updates them whenever
-    /// the set of attached clients changes, and wezterm-term reads them on
-    /// every relevant escape-sequence handler, so no rebuild is needed.
-    pub fn new(
-        rows: u16,
-        cols: u16,
-        kitty_graphics: Arc<AtomicBool>,
-        kitty_keyboard: Arc<AtomicBool>,
-    ) -> Self {
-        let size = TerminalSize {
-            rows: rows as usize,
-            cols: cols as usize,
-            pixel_width: 0,
-            pixel_height: 0,
-            dpi: 0,
-        };
-        let term = Terminal::new(
-            size,
+/// Bridge from wezterm's `AlertHandler` to our `BackendEventSink`.
+///
+/// Holds a shared reference to the sink so the alert handler and the backend
+/// struct can both reach the same sink.  Calls from wezterm are synchronous
+/// inside `advance_bytes`; the sink MUST NOT block.
+struct WezTermAlertBridge(Arc<dyn BackendEventSink>);
+
+impl tattoy_wezterm_term::terminal::AlertHandler for WezTermAlertBridge {
+    fn alert(&mut self, alert: Alert) {
+        match alert {
+            Alert::Bell => self.0.on_bell(),
+            Alert::WindowTitleChanged(title) => self.0.on_title(&title),
+            Alert::IconTitleChanged(Some(title)) => self.0.on_title(&title),
+            _ => {}
+        }
+    }
+}
+
+fn make_wezterm_size(size: BackendSize) -> TerminalSize {
+    TerminalSize {
+        rows: size.rows as usize,
+        cols: size.cols as usize,
+        pixel_width: size.pixel_width as usize,
+        pixel_height: size.pixel_height as usize,
+        dpi: 0,
+    }
+}
+
+impl TerminalBackend for WezTermBackend {
+    fn new(cfg: BackendConfig) -> Self {
+        let wez_size = make_wezterm_size(cfg.size);
+        let mut term = Terminal::new(
+            wez_size,
             Arc::new(KmuxTerminalConfig {
-                kitty_graphics,
-                kitty_keyboard,
+                kitty_graphics: cfg.capabilities.kitty_graphics,
+                kitty_keyboard: cfg.capabilities.kitty_keyboard,
+                scrollback: cfg.scrollback,
             }),
             "kmux",
             env!("CARGO_PKG_VERSION"),
             Box::new(std::io::sink()),
         );
-        Self { term, rows, cols }
+        term.set_notification_handler(Box::new(WezTermAlertBridge(cfg.events)));
+        Self {
+            term,
+            size: cfg.size,
+        }
     }
-}
 
-impl TerminalBackend for WezTermBackend {
+    fn name() -> &'static str
+    where
+        Self: Sized,
+    {
+        "wezterm"
+    }
+
     fn feed(&mut self, data: &[u8]) {
         self.term.advance_bytes(data);
     }
 
-    fn size(&self) -> (u16, u16) {
-        (self.rows, self.cols)
+    fn size(&self) -> BackendSize {
+        self.size
     }
 
-    fn resize(&mut self, rows: u16, cols: u16) {
-        self.rows = rows;
-        self.cols = cols;
-        self.term.resize(TerminalSize {
-            rows: rows as usize,
-            cols: cols as usize,
-            pixel_width: 0,
-            pixel_height: 0,
-            dpi: 0,
-        });
+    fn resize(&mut self, size: BackendSize) {
+        self.size = size;
+        self.term.resize(make_wezterm_size(size));
     }
 
     fn cursor(&self) -> CursorState {
@@ -79,22 +91,17 @@ impl TerminalBackend for WezTermBackend {
 
     fn modes(&self) -> TermModes {
         let mut bits: u16 = 0;
-        // APP_CURSOR (DEC 1): wezterm exposes this via TerminalState directly.
-        // bracketed_paste_enabled() covers DEC 2004.
         if self.term.bracketed_paste_enabled() {
             bits |= TermModes::BRACKETED_PASTE;
         }
         // is_mouse_grabbed() returns true when any mouse tracking mode is active
-        // (DEC 1000/1002/1003).  We set MOUSE_REPORT_CLICK as a conservative proxy;
-        // MOUSE_DRAG and MOUSE_MOTION are not individually distinguishable via the
-        // public API in this version.
+        // (DEC 1000/1002/1003).  MOUSE_REPORT_CLICK is used as a conservative
+        // proxy; individual mouse mode bits are not distinguishable in this API.
         //
         // TODO: file upstream PR to expose individual mouse mode bits.
         if self.term.is_mouse_grabbed() {
             bits |= TermModes::MOUSE_REPORT_CLICK;
         }
-        // SGR mouse (DEC 1006) is also not separately accessible; the combined
-        // is_mouse_grabbed() flag covers it at the reporting level clients care about.
         TermModes(bits)
     }
 
@@ -160,8 +167,8 @@ impl WezTermBackend {
     fn fill_cells_inner(&self, out: &mut [CellState]) {
         let screen = self.term.screen();
         let palette = self.term.palette();
-        let cols = self.cols as usize;
-        let rows = self.rows as usize;
+        let cols = self.size.cols as usize;
+        let rows = self.size.rows as usize;
 
         for cell in out.iter_mut() {
             *cell = CellState::default();
@@ -189,7 +196,6 @@ impl WezTermBackend {
                         attrs,
                         &palette,
                     );
-                    // Mark the trailing half of a wide character.
                     if cr.width() > 1 && col + 1 < cols {
                         out[idx + 1].attrs.0 |= CellAttrs::WIDE_CHAR_SPACER;
                     }
@@ -201,10 +207,14 @@ impl WezTermBackend {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+    use std::sync::atomic::AtomicBool;
+    use std::sync::{Mutex, OnceLock};
+
     use super::*;
+    use crate::backend::{BackendEventSink, CapabilityHandles, NullEventSink};
     use crate::diff_engine::{DiffEngine, DiffResult};
     use kmux_protocol::messages::{CellColor, DiffOp};
-    use std::sync::atomic::AtomicBool;
 
     fn expect_cell_diff(result: DiffResult) -> kmux_protocol::messages::TerminalDiff {
         match result {
@@ -213,14 +223,25 @@ mod tests {
         }
     }
 
-    /// Construct a [`WezTermBackend`] for tests with both kitty flags off.
+    fn test_cfg(rows: u16, cols: u16) -> BackendConfig {
+        BackendConfig {
+            size: BackendSize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            capabilities: CapabilityHandles {
+                kitty_graphics: Arc::new(AtomicBool::new(false)),
+                kitty_keyboard: Arc::new(AtomicBool::new(false)),
+            },
+            events: Arc::new(NullEventSink),
+            scrollback: 1_000,
+        }
+    }
+
     fn test_backend(rows: u16, cols: u16) -> WezTermBackend {
-        WezTermBackend::new(
-            rows,
-            cols,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        )
+        WezTermBackend::new(test_cfg(rows, cols))
     }
 
     #[test]
@@ -246,7 +267,6 @@ mod tests {
     #[test]
     fn feed_red_text_has_correct_red_fg() {
         let mut ts = DiffEngine::new(test_backend(24, 80));
-        // ANSI red (colour index 1) — resolved via the default palette.
         ts.feed(b"\x1b[31mred");
         let diff = expect_cell_diff(ts.compute_diff());
         let r_cell = diff
@@ -258,8 +278,6 @@ mod tests {
                 _ => None,
             })
             .expect("should find 'r' cell");
-        // The default palette maps colour 1 to ANSI red.
-        // We only assert it is non-zero and not full white.
         assert_ne!(
             r_cell.fg,
             CellColor::new(0xff, 0xff, 0xff),
@@ -275,7 +293,6 @@ mod tests {
     #[test]
     fn feed_truecolor_text() {
         let mut ts = DiffEngine::new(test_backend(24, 80));
-        // CSI 38;2;255;128;0 m — truecolor orange
         ts.feed(b"\x1b[38;2;255;128;0mX");
         let diff = expect_cell_diff(ts.compute_diff());
         let x_cell = diff
@@ -548,7 +565,6 @@ mod tests {
     #[test]
     fn wide_char_marks_spacer() {
         let mut ts = DiffEngine::new(test_backend(24, 80));
-        // U+4e2d (中) is a CJK wide character
         ts.feed("中".as_bytes());
         let snap = ts.snapshot();
         assert_eq!(snap.cells[0].c, '中');
@@ -566,7 +582,12 @@ mod tests {
     fn resize_changes_grid_dimensions() {
         let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"hello");
-        ts.resize(30, 120);
+        ts.resize(BackendSize {
+            rows: 30,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        });
         let snap = ts.snapshot();
         assert_eq!(snap.rows, 30);
         assert_eq!(snap.cols, 120);
@@ -582,6 +603,61 @@ mod tests {
         assert!(
             !diff.scrollback_lines.is_empty(),
             "should have scrollback after printing past screen height"
+        );
+    }
+
+    #[test]
+    fn resize_with_pixel_dims_roundtrip() {
+        let mut ts = DiffEngine::new(test_backend(24, 80));
+        let new_size = BackendSize {
+            rows: 40,
+            cols: 132,
+            pixel_width: 1056,
+            pixel_height: 640,
+        };
+        ts.resize(new_size);
+        let reported = ts.backend.size();
+        assert_eq!(reported.rows, 40);
+        assert_eq!(reported.cols, 132);
+        assert_eq!(reported.pixel_width, 1056);
+        assert_eq!(reported.pixel_height, 640);
+    }
+
+    /// Verifies that the event sink receives title changes from OSC-0 sequences.
+    #[test]
+    fn event_sink_receives_title() {
+        struct TitleCapture(Mutex<Vec<String>>);
+        impl BackendEventSink for TitleCapture {
+            fn on_title(&self, title: &str) {
+                self.0.lock().unwrap().push(title.to_string());
+            }
+        }
+
+        static SINK: OnceLock<Arc<TitleCapture>> = OnceLock::new();
+        let sink = SINK.get_or_init(|| Arc::new(TitleCapture(Mutex::new(vec![]))));
+
+        let cfg = BackendConfig {
+            size: BackendSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            capabilities: CapabilityHandles {
+                kitty_graphics: Arc::new(AtomicBool::new(false)),
+                kitty_keyboard: Arc::new(AtomicBool::new(false)),
+            },
+            events: Arc::clone(sink) as Arc<dyn BackendEventSink>,
+            scrollback: 1_000,
+        };
+
+        let mut backend = WezTermBackend::new(cfg);
+        backend.feed(b"\x1b]0;My Terminal Title\x07");
+
+        let titles = sink.0.lock().unwrap();
+        assert!(
+            titles.iter().any(|t| t.contains("My Terminal Title")),
+            "expected title event for 'My Terminal Title', got: {titles:?}"
         );
     }
 }

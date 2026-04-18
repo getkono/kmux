@@ -2,13 +2,25 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, GridSnapshot, InputMode, SequenceNo, ServerMessage, TerminalDiff,
+    ClientCapabilities, ClientId, GridSnapshot, InputMode, SequenceNo, ServerMessage, TermSize,
+    TerminalDiff,
 };
 use kmux_pty::error::{KmuxError, Result};
 use tokio::sync::mpsc;
 
 use super::helpers::parse_pane_id;
 use super::{ClientSender, ServerApp};
+
+/// Parameters for [`ServerApp::attach`].
+pub struct AttachParams {
+    pub pane_id: String,
+    pub client_id: ClientId,
+    pub last_seqno: Option<SequenceNo>,
+    pub size: TermSize,
+    pub data_tx: mpsc::Sender<ServerMessage>,
+    pub ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+    pub capabilities: ClientCapabilities,
+}
 
 /// Result of an attach operation describing what replay data to send.
 pub enum AttachResult {
@@ -28,29 +40,31 @@ pub enum InputLockOutcome {
 
 impl ServerApp {
     /// Register a client's output channel for a pane and return replay data.
-    pub async fn attach(
-        &self,
-        pane_id: &str,
-        client_id: ClientId,
-        last_seqno: Option<SequenceNo>,
-        data_tx: mpsc::Sender<ServerMessage>,
-        ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
-        capabilities: ClientCapabilities,
-    ) -> Result<AttachResult> {
+    pub async fn attach(&self, params: AttachParams) -> Result<AttachResult> {
+        let AttachParams {
+            pane_id,
+            client_id,
+            last_seqno,
+            size,
+            data_tx,
+            ctrl_tx,
+            capabilities,
+        } = params;
         let (word_id, pane_index) =
-            parse_pane_id(pane_id).ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
+            parse_pane_id(&pane_id).ok_or_else(|| KmuxError::SessionNotFound {
+                name: pane_id.clone(),
             })?;
 
-        let sessions = self.sessions.read().await;
+        // Write lock needed so we can update relay.size via apply_effective_size.
+        let mut sessions = self.sessions.write().await;
         let state = sessions
-            .get(word_id)
+            .get_mut(word_id)
             .ok_or_else(|| KmuxError::SessionNotFound {
                 name: pane_id.to_string(),
             })?;
         let relay = state
             .panes
-            .get(&pane_index)
+            .get_mut(&pane_index)
             .ok_or_else(|| KmuxError::SessionNotFound {
                 name: pane_id.to_string(),
             })?;
@@ -91,9 +105,19 @@ impl ServerApp {
                 ctrl_tx,
                 force_full_snapshot: false,
                 capabilities,
+                size,
             },
         );
         relay.recompute_live_capabilities();
+
+        // Reconcile effective size after new client joined.
+        let seqno = relay
+            .seqno_counter
+            .load(Ordering::Relaxed)
+            .saturating_sub(1);
+        if let Some(new_size) = relay.apply_effective_size() {
+            relay.broadcast_resize(pane_id.as_str(), new_size, seqno);
+        }
 
         Ok(result)
     }
@@ -125,6 +149,14 @@ impl ServerApp {
             if relay.input_mode == InputMode::Locked(client_id) {
                 relay.input_mode = InputMode::Open;
             }
+            // Reconcile effective size; no clients left → keep current size.
+            let seqno = relay
+                .seqno_counter
+                .load(Ordering::Relaxed)
+                .saturating_sub(1);
+            if let Some(new_size) = relay.apply_effective_size() {
+                relay.broadcast_resize(pane_id, new_size, seqno);
+            }
         }
     }
 
@@ -132,11 +164,19 @@ impl ServerApp {
     pub async fn detach_client_all(&self, client_id: ClientId) {
         let mut sessions = self.sessions.write().await;
         for state in sessions.values_mut() {
-            for relay in state.panes.values_mut() {
+            for (pane_index, relay) in state.panes.iter_mut() {
+                let pane_id = format!("{}/{}", state.meta.word_id, pane_index);
                 relay.clients.lock().unwrap().remove(&client_id);
                 relay.recompute_live_capabilities();
                 if relay.input_mode == InputMode::Locked(client_id) {
                     relay.input_mode = InputMode::Open;
+                }
+                let seqno = relay
+                    .seqno_counter
+                    .load(Ordering::Relaxed)
+                    .saturating_sub(1);
+                if let Some(new_size) = relay.apply_effective_size() {
+                    relay.broadcast_resize(pane_id.as_str(), new_size, seqno);
                 }
             }
         }

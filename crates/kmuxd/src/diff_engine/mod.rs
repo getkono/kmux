@@ -2,7 +2,7 @@ mod compute;
 
 use kmux_protocol::messages::{CellState, CursorState, GridSnapshot, TermModes};
 
-use crate::backend::TerminalBackend;
+use crate::backend::{BackendSize, TerminalBackend};
 
 /// Result of a diff computation, distinguishing between cell changes,
 /// cursor-only changes, and no changes at all.
@@ -42,7 +42,9 @@ pub struct DiffEngine<B: TerminalBackend> {
 
 impl<B: TerminalBackend> DiffEngine<B> {
     pub fn new(backend: B) -> Self {
-        let (rows, cols) = backend.size();
+        let sz = backend.size();
+        let rows = sz.rows;
+        let cols = sz.cols;
         let n = rows as usize * cols as usize;
         let blank = CellState::default();
         let prev_history_size = backend.history_size();
@@ -139,11 +141,11 @@ impl<B: TerminalBackend> DiffEngine<B> {
     }
 
     /// Resize the terminal. Resets `prev_cells` so the next diff is full-grid.
-    pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.rows = rows;
-        self.cols = cols;
-        self.backend.resize(rows, cols);
-        let n = rows as usize * cols as usize;
+    pub fn resize(&mut self, size: BackendSize) {
+        self.rows = size.rows;
+        self.cols = size.cols;
+        self.backend.resize(size);
+        let n = size.rows as usize * size.cols as usize;
         self.prev_cells = vec![CellState::default(); n];
         self.current_cells = vec![CellState::default(); n];
         self.prev_cursor = CursorState::default();

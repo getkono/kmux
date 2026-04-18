@@ -66,14 +66,4 @@ impl App {
             }
         }
     }
-
-    pub(super) fn handle_resize(&mut self, rows: u16, cols: u16) {
-        // Account for session bar (1 row) + status bar (1 row) + hint bar (1 row)
-        let term_rows = rows.saturating_sub(3);
-        let term_cols = cols;
-
-        if let Some(pane_id) = self.mgr.active_pane_id().map(|s| s.to_string()) {
-            self.mgr.send_resize(&pane_id, term_rows, term_cols);
-        }
-    }
 }

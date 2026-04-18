@@ -3,7 +3,7 @@ use std::time::Instant;
 
 use kmux_protocol::messages::{
     ClientId, ClientMessage, PaneInfo, SequenceNo, ServerMessage, SessionEventMsg, SessionStatus,
-    TermSize, epoch_millis,
+    epoch_millis,
 };
 use tracing::{info, warn};
 
@@ -194,6 +194,7 @@ impl SessionManager {
             ServerMessage::PaneCreated {
                 pane_id,
                 session_word_id,
+                size,
                 ..
             } => {
                 self.buffers.entry(pane_id.clone()).or_default();
@@ -211,7 +212,7 @@ impl SessionManager {
                         pane_id: pane_id.clone(),
                         pane_index,
                         program: String::new(),
-                        size: TermSize::default(),
+                        size,
                         attached_clients: vec![],
                         status: SessionStatus::Running,
                     });
@@ -338,6 +339,14 @@ impl SessionManager {
                     }
                 }
                 events.push(SessionEvent::SessionRenamed { word_id, new_name });
+            }
+
+            ServerMessage::Event {
+                event: SessionEventMsg::PaneResized { pane_id, size },
+            } => {
+                if let Some(grid) = self.buffers.get_mut(&pane_id) {
+                    grid.resize(size.rows, size.cols);
+                }
             }
 
             ServerMessage::Event { .. } => {}

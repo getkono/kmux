@@ -7,7 +7,7 @@ mod pane_crud;
 mod persistence;
 pub(super) mod restore;
 
-pub use attach::{AttachResult, InputLockOutcome};
+pub use attach::{AttachParams, AttachResult, InputLockOutcome};
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -46,6 +46,8 @@ pub struct ClientSender {
     pub force_full_snapshot: bool,
     /// Rendering capabilities declared by this client at Auth time.
     pub capabilities: ClientCapabilities,
+    /// Terminal size reported by this client at attach time (updated on `Resize`).
+    pub size: TermSize,
 }
 
 /// Shared map of per-client output senders for a single pane.
@@ -96,6 +98,73 @@ impl PaneRelay {
             .store(graphics, Ordering::Relaxed);
         self.kitty_keyboard_enabled
             .store(keyboard, Ordering::Relaxed);
+    }
+
+    /// Compute the effective pane size: smallest rows and cols across all
+    /// attached clients with non-zero dimensions.  Returns `None` when no
+    /// clients are attached (caller keeps the last known size).
+    pub fn effective_size(&self) -> Option<TermSize> {
+        let map = self.clients.lock().unwrap();
+        let rows = map.values().map(|s| s.size.rows).filter(|&r| r > 0).min()?;
+        let cols = map.values().map(|s| s.size.cols).filter(|&c| c > 0).min()?;
+        // Pixel dims from the client that determines the winning cell dimensions.
+        let (pixel_width, pixel_height) = map
+            .values()
+            .find(|s| s.size.rows == rows && s.size.cols == cols)
+            .map(|s| (s.size.pixel_width, s.size.pixel_height))
+            .unwrap_or((0, 0));
+        Some(TermSize {
+            rows,
+            cols,
+            pixel_width,
+            pixel_height,
+        })
+    }
+
+    /// Resize the emulator and update `self.size` if the effective size has
+    /// changed.  Returns the new `TermSize` if a resize actually happened.
+    ///
+    /// Does NOT touch the PTY — the caller must call `manager.resize()` after
+    /// releasing any locks that would prevent async execution.
+    pub fn apply_effective_size(&mut self) -> Option<TermSize> {
+        let new_size = self.effective_size()?;
+        if new_size.rows == self.size.rows && new_size.cols == self.size.cols {
+            return None;
+        }
+        self.term_state
+            .lock()
+            .unwrap()
+            .resize(crate::backend::BackendSize::from(new_size));
+        self.size = new_size;
+        Some(new_size)
+    }
+
+    /// Send a `PaneResized` event + a forced `TerminalSnapshot` to every
+    /// attached client after a size change.
+    ///
+    /// `ctrl_tx` channels are unbounded; `data_tx` sends are best-effort
+    /// (dropped silently if the channel is full — the next diff will repaint).
+    pub fn broadcast_resize(&self, pane_id: &str, new_size: TermSize, seqno: u64) {
+        use kmux_protocol::messages::{SequenceNo, SessionEventMsg, epoch_millis};
+        let event_msg = kmux_protocol::messages::ServerMessage::Event {
+            event: SessionEventMsg::PaneResized {
+                pane_id: pane_id.to_string(),
+                size: new_size,
+            },
+        };
+        let snapshot = self.term_state.lock().unwrap().snapshot();
+        let snap_msg = kmux_protocol::messages::ServerMessage::TerminalSnapshot {
+            pane_id: pane_id.to_string(),
+            snapshot,
+            seqno: SequenceNo(seqno),
+            sent_at_ms: epoch_millis(),
+        };
+
+        let map = self.clients.lock().unwrap();
+        for sender in map.values() {
+            let _ = sender.ctrl_tx.send(event_msg.clone());
+            let _ = sender.data_tx.try_send(snap_msg.clone());
+        }
     }
 }
 
@@ -434,5 +503,142 @@ mod tests {
         let snap = app.snapshot_sessions_with_connections().await;
         assert_eq!(snap.unattached.len(), 1);
         assert_eq!(snap.unattached[0].transport, "UDS");
+    }
+
+    // ─── Size negotiation unit tests ──────────────────────────────────────────
+
+    use kmux_protocol::messages::{ClientCapabilities, ClientId, TermSize};
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicU64;
+    use tokio::sync::mpsc;
+
+    use crate::app::{ClientSender, PaneRelay, SCROLLBACK_CAPACITY};
+    use crate::backend::{
+        BackendConfig, BackendSize, CapabilityHandles, DEFAULT_SCROLLBACK, NullEventSink,
+    };
+    use crate::scrollback::DiffBuffer;
+    use crate::term_state::new_term_state;
+
+    fn make_client(rows: u16, cols: u16) -> (ClientId, ClientSender) {
+        let (data_tx, _data_rx) = mpsc::channel::<kmux_protocol::messages::ServerMessage>(16);
+        let (ctrl_tx, _ctrl_rx) =
+            mpsc::unbounded_channel::<kmux_protocol::messages::ServerMessage>();
+        let id = ClientId(rows as u64 * 1000 + cols as u64);
+        let sender = ClientSender {
+            data_tx,
+            ctrl_tx,
+            force_full_snapshot: false,
+            capabilities: ClientCapabilities::default(),
+            size: TermSize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        };
+        (id, sender)
+    }
+
+    fn make_relay(rows: u16, cols: u16) -> PaneRelay {
+        use kmux_pty::session::PtyWriter;
+        use std::sync::atomic::AtomicBool;
+        let cfg = BackendConfig {
+            size: BackendSize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            capabilities: CapabilityHandles {
+                kitty_graphics: Arc::new(AtomicBool::new(false)),
+                kitty_keyboard: Arc::new(AtomicBool::new(false)),
+            },
+            events: Arc::new(NullEventSink),
+            scrollback: DEFAULT_SCROLLBACK,
+        };
+        let term_state = Arc::new(Mutex::new(new_term_state(cfg)));
+        let kitty_graphics_enabled = Arc::new(AtomicBool::new(false));
+        let kitty_keyboard_enabled = Arc::new(AtomicBool::new(false));
+        PaneRelay {
+            clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            writer: PtyWriter::sink().unwrap(),
+            _task: tokio::task::spawn(async {}),
+            program: "/bin/sh".to_string(),
+            args: vec![],
+            size: TermSize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            scrollback: Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY))),
+            term_state,
+            seqno_counter: Arc::new(AtomicU64::new(1)),
+            input_mode: kmux_protocol::messages::InputMode::Open,
+            status: kmux_protocol::messages::SessionStatus::Running,
+            kitty_graphics_enabled,
+            kitty_keyboard_enabled,
+        }
+    }
+
+    #[tokio::test]
+    async fn effective_size_min_wins() {
+        let relay = make_relay(24, 80);
+        let (id_a, sender_a) = make_client(24, 80);
+        let (id_b, sender_b) = make_client(40, 120);
+        relay.clients.lock().unwrap().insert(id_a, sender_a);
+        relay.clients.lock().unwrap().insert(id_b, sender_b);
+
+        let eff = relay.effective_size().unwrap();
+        assert_eq!(eff.rows, 24, "min rows should win");
+        assert_eq!(eff.cols, 80, "min cols should win");
+    }
+
+    #[tokio::test]
+    async fn effective_size_no_clients_returns_none() {
+        let relay = make_relay(24, 80);
+        assert!(relay.effective_size().is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_effective_size_returns_none_when_unchanged() {
+        let mut relay = make_relay(24, 80);
+        let (id, sender) = make_client(24, 80);
+        relay.clients.lock().unwrap().insert(id, sender);
+        // effective == current → no resize
+        assert!(relay.apply_effective_size().is_none());
+    }
+
+    #[tokio::test]
+    async fn apply_effective_size_resizes_emulator_when_changed() {
+        let mut relay = make_relay(24, 80);
+        let (id, sender) = make_client(40, 120);
+        relay.clients.lock().unwrap().insert(id, sender);
+        // effective (40×120) differs from relay.size (24×80)
+        let new_size = relay.apply_effective_size().expect("should resize");
+        assert_eq!(new_size.rows, 40);
+        assert_eq!(new_size.cols, 120);
+        assert_eq!(relay.size.rows, 40);
+        assert_eq!(relay.size.cols, 120);
+    }
+
+    #[tokio::test]
+    async fn detach_keeps_last_effective_size() {
+        let mut relay = make_relay(80, 200);
+        let (id_a, sender_a) = make_client(24, 80);
+        let (id_b, sender_b) = make_client(40, 120);
+        relay.clients.lock().unwrap().insert(id_a, sender_a);
+        relay.clients.lock().unwrap().insert(id_b, sender_b);
+        // Effective = 24×80; apply it.
+        relay.apply_effective_size();
+        assert_eq!(relay.size.rows, 24);
+
+        // Now remove all clients.
+        relay.clients.lock().unwrap().clear();
+        // effective_size returns None (no clients), so apply_effective_size is a no-op.
+        assert!(relay.apply_effective_size().is_none());
+        // Size stays at 24×80, not back to 80×200.
+        assert_eq!(relay.size.rows, 24);
+        assert_eq!(relay.size.cols, 80);
     }
 }

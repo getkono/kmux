@@ -52,7 +52,12 @@ impl SessionManager {
         }
         self.send_ws(ClientMessage::Resize {
             pane_id: pane_id.to_string(),
-            size: TermSize { rows, cols },
+            size: TermSize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
         });
     }
 

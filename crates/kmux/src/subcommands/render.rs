@@ -298,7 +298,12 @@ mod tests {
                 pane_id: "eagle/0".to_string(),
                 pane_index: 0,
                 program: "zsh".to_string(),
-                size: TermSize { rows: 24, cols: 80 },
+                size: TermSize {
+                    rows: 24,
+                    cols: 80,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
                 attached_clients: vec![],
                 status: SessionStatus::Running,
             }],

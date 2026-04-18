@@ -229,13 +229,24 @@ mod tests {
     }
 
     fn test_term_state() -> Arc<Mutex<TermState>> {
-        use std::sync::atomic::AtomicBool;
-        Arc::new(Mutex::new(new_term_state(
-            24,
-            80,
-            Arc::new(AtomicBool::new(false)),
-            Arc::new(AtomicBool::new(false)),
-        )))
+        use crate::backend::{
+            BackendConfig, BackendSize, CapabilityHandles, DEFAULT_SCROLLBACK, NullEventSink,
+        };
+        use std::sync::Arc;
+        Arc::new(Mutex::new(new_term_state(BackendConfig {
+            size: BackendSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            capabilities: CapabilityHandles {
+                kitty_graphics: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+                kitty_keyboard: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            },
+            events: Arc::new(NullEventSink),
+            scrollback: DEFAULT_SCROLLBACK,
+        })))
     }
 
     #[test]
@@ -253,6 +264,7 @@ mod tests {
                 ctrl_tx,
                 force_full_snapshot: false,
                 capabilities: Default::default(),
+                size: Default::default(),
             },
         );
 
@@ -288,6 +300,7 @@ mod tests {
                 ctrl_tx,
                 force_full_snapshot: false,
                 capabilities: Default::default(),
+                size: Default::default(),
             },
         );
 
@@ -319,6 +332,7 @@ mod tests {
                 ctrl_tx,
                 force_full_snapshot: false,
                 capabilities: Default::default(),
+                size: Default::default(),
             },
         );
 
