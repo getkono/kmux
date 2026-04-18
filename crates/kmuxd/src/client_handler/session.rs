@@ -1,13 +1,15 @@
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::Duration;
 
+use kmux_protocol::TransportKind;
 use kmux_protocol::messages::{ErrorCode, ServerMessage, epoch_millis};
 use kmux_protocol::{decode_client, encode_server, read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::mpsc;
 use tracing::{Instrument, Span, debug, info, warn};
 
-use crate::app::{AttachResult, ServerApp};
+use crate::app::{AttachResult, ConnectionMetrics, ServerApp};
 use crate::client_handler::{PaneAttacher, SharedClientState, handle_message, pty_event_to_msg};
 
 /// Build the initial replay messages for a pane attach result.
@@ -66,6 +68,7 @@ pub async fn run_client_session<R, W, A, F>(
     mut reader: R,
     writer: W,
     app: Arc<ServerApp>,
+    transport: TransportKind,
     make_attacher: F,
     conn_span: Span,
 ) where
@@ -74,8 +77,11 @@ pub async fn run_client_session<R, W, A, F>(
     A: PaneAttacher,
     F: FnOnce(mpsc::UnboundedSender<ServerMessage>) -> A,
 {
+    let metrics = Arc::new(ConnectionMetrics::new());
+
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
+    let writer_metrics = Arc::clone(&metrics);
     let writer_task = tokio::spawn(
         async move {
             let mut ctrl_rx = ctrl_rx;
@@ -86,6 +92,11 @@ pub async fn run_client_session<R, W, A, F>(
                         if write_frame(&mut writer, &bytes).await.is_err() {
                             break;
                         }
+                        // 4-byte length prefix + payload
+                        writer_metrics
+                            .bytes_out
+                            .fetch_add(4 + bytes.len() as u64, Ordering::Relaxed);
+                        writer_metrics.msgs_out.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => warn!("encode error: {e}"),
                 }
@@ -108,6 +119,7 @@ pub async fn run_client_session<R, W, A, F>(
     );
 
     let ping_tx = ctrl_tx.clone();
+    let ping_metrics = Arc::clone(&metrics);
     let ping_task = tokio::spawn(
         async move {
             let mut seq = 0u64;
@@ -115,6 +127,10 @@ pub async fn run_client_session<R, W, A, F>(
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
+                // Record send time before enqueueing so RTT calculation is not
+                // inflated by writer-task queue depth.
+                *ping_metrics.last_ping_sent.lock().unwrap() =
+                    Some((seq, std::time::Instant::now()));
                 if ping_tx.send(ServerMessage::Ping { seq }).is_err() {
                     break;
                 }
@@ -125,21 +141,38 @@ pub async fn run_client_session<R, W, A, F>(
     );
 
     let attacher = make_attacher(ctrl_tx.clone());
-    let mut state = SharedClientState::new(app.clone(), ctrl_tx, conn_span);
+    let mut state = SharedClientState::new(
+        app.clone(),
+        ctrl_tx,
+        conn_span,
+        transport,
+        Arc::clone(&metrics),
+    );
 
     loop {
         match read_frame(&mut reader).await {
-            Ok(Some(data)) => match decode_client(&data) {
-                Ok(client_msg) => {
-                    if !handle_message(&mut state, client_msg, &attacher).await {
-                        break;
+            Ok(Some(data)) => {
+                // Instrument inbound bytes on every frame, before auth.
+                metrics
+                    .bytes_in
+                    .fetch_add(4 + data.len() as u64, Ordering::Relaxed);
+                metrics.msgs_in.fetch_add(1, Ordering::Relaxed);
+                metrics
+                    .last_activity_ms
+                    .store(epoch_millis(), Ordering::Relaxed);
+
+                match decode_client(&data) {
+                    Ok(client_msg) => {
+                        if !handle_message(&mut state, client_msg, &attacher).await {
+                            break;
+                        }
+                    }
+                    Err(e) => {
+                        warn!(conn_id = ?state.connection_id.map(|c| c.0), "decode error: {e}");
+                        state.error(None, ErrorCode::InvalidMessage, e.to_string());
                     }
                 }
-                Err(e) => {
-                    warn!(conn_id = ?state.connection_id.map(|c| c.0), "decode error: {e}");
-                    state.error(None, ErrorCode::InvalidMessage, e.to_string());
-                }
-            },
+            }
             Ok(None) => {
                 debug!(conn_id = ?state.connection_id.map(|c| c.0), "control stream closed");
                 break;

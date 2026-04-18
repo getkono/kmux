@@ -2,7 +2,6 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
 
-use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
@@ -11,6 +10,7 @@ use tracing::{error, info, warn};
 use crate::announce::{BootstrapPath, build_endpoint_list};
 use crate::app::ServerApp;
 use crate::config::ListenConfig;
+use kmux_protocol::control_rpc::{ControlRequest, EndpointEntry, StatusResponse, StopResponse};
 
 /// Daemonize the current process (double-fork) and write the child PID to `pid_path`.
 ///
@@ -27,39 +27,6 @@ pub fn daemonize_process(pid_path: &Path) -> anyhow::Result<()> {
         .map_err(|e| anyhow::anyhow!("daemonize failed: {e}"))?;
 
     Ok(())
-}
-
-/// JSON request from a control socket client.
-#[derive(Deserialize)]
-struct ControlRequest {
-    command: String,
-}
-
-/// JSON response sent back to a control socket client.
-#[derive(Serialize)]
-struct StatusResponse {
-    status: &'static str,
-    port: u16,
-    tcp_port: u16,
-    token: String,
-    pid: u32,
-    uptime_secs: u64,
-    session_count: usize,
-    protocol_version: u32,
-    kmuxd_version: &'static str,
-    endpoints: Vec<EndpointEntry>,
-}
-
-#[derive(Serialize)]
-struct EndpointEntry {
-    kind: String,
-    address: String,
-}
-
-/// JSON response for the stop command.
-#[derive(Serialize)]
-struct StopResponse {
-    status: &'static str,
 }
 
 /// Shared state used to respond to each control socket request.
@@ -222,7 +189,7 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
                 })
                 .collect();
             let response = StatusResponse {
-                status: "running",
+                status: "running".to_string(),
                 port: ctx.quic_port,
                 tcp_port: ctx.tcp_port,
                 token: ctx.token.clone(),
@@ -230,7 +197,7 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
                 uptime_secs: ctx.start_time.elapsed().as_secs(),
                 session_count,
                 protocol_version: kmux_protocol::messages::PROTOCOL_VERSION,
-                kmuxd_version: env!("CARGO_PKG_VERSION"),
+                kmuxd_version: env!("CARGO_PKG_VERSION").to_string(),
                 endpoints,
             };
             let mut json = match serde_json::to_string(&response) {
@@ -246,7 +213,9 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
             }
         }
         "stop" => {
-            let response = StopResponse { status: "ok" };
+            let response = StopResponse {
+                status: "ok".to_string(),
+            };
             let mut json = match serde_json::to_string(&response) {
                 Ok(s) => s,
                 Err(e) => {
@@ -260,6 +229,20 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
             }
             info!("Received stop command, shutting down daemon");
             ctx.shutdown.notify_waiters();
+        }
+        "sessions" => {
+            let resp = ctx.app.snapshot_sessions_with_connections().await;
+            let mut json = match serde_json::to_string(&resp) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to serialize sessions response: {e}");
+                    return;
+                }
+            };
+            json.push('\n');
+            if let Err(e) = write_half.write_all(json.as_bytes()).await {
+                warn!("Control socket write error: {e}");
+            }
         }
         other => {
             warn!("Unknown control command: {other}");
@@ -277,5 +260,70 @@ impl Drop for SocketGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_file(&self.socket_path);
         let _ = std::fs::remove_file(&self.pid_path);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+    use std::time::Instant;
+
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixStream;
+    use tokio::sync::Notify;
+
+    use kmux_protocol::control_rpc::SessionsResponse;
+
+    use super::{ControlSocketParams, serve_control_socket};
+    use crate::app::ServerApp;
+
+    #[tokio::test]
+    async fn sessions_command_roundtrips_empty_response() {
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_path = tmp.path().join("ctrl.sock");
+        let pid_path = tmp.path().join("daemon.pid");
+
+        let app = Arc::new(ServerApp::new("test-token".to_string()));
+        let shutdown = Arc::new(Notify::new());
+
+        let params = ControlSocketParams {
+            socket_path: socket_path.clone(),
+            pid_path: pid_path.clone(),
+            quic_port: 0,
+            tcp_port: 0,
+            token: "test-token".to_string(),
+            start_time: Instant::now(),
+            app,
+            shutdown: Arc::clone(&shutdown),
+            listeners: vec![],
+            public_host: None,
+        };
+
+        tokio::spawn(serve_control_socket(params));
+        // Allow the socket task to bind before connecting.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+
+        let stream = UnixStream::connect(&socket_path).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        write_half
+            .write_all(b"{\"command\":\"sessions\"}\n")
+            .await
+            .unwrap();
+
+        let mut reader = BufReader::new(read_half);
+        let mut line = String::new();
+        tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            reader.read_line(&mut line),
+        )
+        .await
+        .expect("timed out")
+        .unwrap();
+
+        let resp: SessionsResponse = serde_json::from_str(line.trim()).unwrap();
+        assert!(resp.sessions.is_empty());
+        assert!(resp.unattached.is_empty());
+
+        shutdown.notify_waiters();
     }
 }

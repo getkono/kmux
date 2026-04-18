@@ -1,6 +1,6 @@
-use crate::cli::DaemonAction;
+use crate::cli::{DaemonAction, OutputFormat};
 
-use super::format_uptime;
+use super::render;
 
 pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
     match action {
@@ -29,7 +29,7 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
                 println!("Status:   running");
                 println!("PID:      {}", status.pid);
                 println!("Port:     {}", status.port);
-                println!("Uptime:   {}", format_uptime(status.uptime_secs));
+                println!("Uptime:   {}", render::format_uptime(status.uptime_secs));
                 println!("Sessions: {}", status.session_count);
             }
             None => {
@@ -57,6 +57,22 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
                 "Daemon restarted — PID {}, port {}",
                 status.pid, status.port
             );
+        }
+
+        DaemonAction::Sessions { all, format } => {
+            match kmux_client::daemon::query_daemon_sessions().await {
+                Ok(resp) => match format {
+                    OutputFormat::Json => render::render_json(&resp),
+                    OutputFormat::Table => {
+                        let rows = render::daemon_session_rows(&resp, all);
+                        render::render(&rows, &format, "No active connections");
+                    }
+                },
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            }
         }
 
         DaemonAction::Logs { follow } => {

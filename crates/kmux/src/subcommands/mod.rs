@@ -1,6 +1,7 @@
 mod daemon_cmd;
 mod dry_run;
 mod list;
+pub mod render;
 pub use daemon_cmd::run_daemon_command;
 pub use dry_run::run_dry_run;
 pub use list::{ListSessionsConfig, run_list_sessions};
@@ -9,7 +10,7 @@ use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::ssh::{self, ParsedServer};
 use kmux_client::token::read_local_token;
 
-use crate::cli::{OutputFormat, ResolvedConnection};
+use crate::cli::ResolvedConnection;
 
 /// Resolve CLI args to a [`ResolvedTarget`] without any network I/O.
 ///
@@ -162,43 +163,5 @@ pub async fn resolve_connection(
             tcp_port: None,
             token,
         })
-    }
-}
-
-pub fn print_sessions(sessions: &[kmux_protocol::messages::SessionEntry], format: &OutputFormat) {
-    match format {
-        OutputFormat::Table => {
-            if sessions.is_empty() {
-                println!("No active sessions");
-                return;
-            }
-            println!("{:<16} {:<10} {:<40} {:<6}", "NAME", "ID", "CWD", "PANES");
-            for entry in sessions {
-                println!(
-                    "{:<16} {:<10} {:<40} {:<6}",
-                    entry.meta.name,
-                    entry.meta.word_id,
-                    entry.meta.cwd,
-                    entry.panes.len(),
-                );
-            }
-        }
-        OutputFormat::Json => {
-            let json = serde_json::to_string_pretty(sessions).expect("sessions are serializable");
-            println!("{json}");
-        }
-    }
-}
-
-pub fn format_uptime(secs: u64) -> String {
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    if h > 0 {
-        format!("{h}h {m}m {s}s")
-    } else if m > 0 {
-        format!("{m}m {s}s")
-    } else {
-        format!("{s}s")
     }
 }

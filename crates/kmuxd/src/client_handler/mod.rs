@@ -6,7 +6,9 @@ pub use events::pty_event_to_msg;
 pub use session::{build_attach_replay, run_client_session};
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
+use kmux_protocol::TransportKind;
 use kmux_protocol::messages::{
     ClientCapabilities, ClientId, ConnectionId, ErrorCode, ServerMessage,
 };
@@ -14,7 +16,7 @@ use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tracing::Span;
 
-use crate::app::{AttachResult, ServerApp};
+use crate::app::{AttachResult, ConnectionMetrics, ServerApp};
 
 /// Per-client output channel capacity (number of `ServerMessage` items buffered).
 pub const CLIENT_CHANNEL_CAPACITY: usize = 512;
@@ -46,17 +48,23 @@ pub struct SharedClientState {
     pub attached: HashMap<String, AbortHandle>,
     /// Sender for the control-stream writer task.
     pub ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
-    pub app: std::sync::Arc<ServerApp>,
+    pub app: Arc<ServerApp>,
     /// Connection-scoped tracing span; conn_id and client_id are recorded into
     /// it once authentication completes so every subsequent log line carries them.
     pub conn_span: Span,
+    /// Transport kind that accepted this connection.
+    pub transport: TransportKind,
+    /// Live per-connection byte/activity counters shared with the I/O tasks.
+    pub metrics: Arc<ConnectionMetrics>,
 }
 
 impl SharedClientState {
     pub fn new(
-        app: std::sync::Arc<ServerApp>,
+        app: Arc<ServerApp>,
         ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
         conn_span: Span,
+        transport: TransportKind,
+        metrics: Arc<ConnectionMetrics>,
     ) -> Self {
         Self {
             authenticated: false,
@@ -67,6 +75,8 @@ impl SharedClientState {
             ctrl_tx,
             app,
             conn_span,
+            transport,
+            metrics,
         }
     }
 

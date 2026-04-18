@@ -101,6 +101,7 @@ pub async fn handle_with_io<R, W>(
     writer: W,
     conn: Connection,
     app: Arc<ServerApp>,
+    transport: kmux_protocol::TransportKind,
     conn_span: tracing::Span,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send,
@@ -110,6 +111,7 @@ pub async fn handle_with_io<R, W>(
         reader,
         writer,
         app,
+        transport,
         |_| QuicAttacher { conn: conn.clone() },
         conn_span.clone(),
     )

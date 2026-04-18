@@ -1,4 +1,6 @@
-use kmux_protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
+use std::sync::atomic::Ordering;
+
+use kmux_protocol::messages::{ClientMessage, ErrorCode, ServerMessage, epoch_millis};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -42,7 +44,14 @@ pub async fn handle_message<A: PaneAttacher>(
                 );
                 return false;
             } else if validate_token(&token, &state.app.auth_token) {
-                let (client_id, conn_id) = state.app.register_client(incoming_conn_id).await;
+                let (client_id, conn_id, _metrics) = state
+                    .app
+                    .register_client(
+                        state.transport,
+                        std::sync::Arc::clone(&state.metrics),
+                        incoming_conn_id,
+                    )
+                    .await;
                 state.client_id = Some(client_id);
                 state.connection_id = Some(conn_id);
                 state.capabilities = capabilities;
@@ -290,7 +299,19 @@ pub async fn handle_message<A: PaneAttacher>(
             state.send(ServerMessage::Pong { seq });
         }
 
-        ClientMessage::Pong { .. } => {}
+        ClientMessage::Pong { seq } => {
+            let sent = *state.metrics.last_ping_sent.lock().unwrap();
+            if let Some((sent_seq, sent_at)) = sent
+                && sent_seq == seq
+            {
+                let rtt_ms = sent_at.elapsed().as_millis() as u64;
+                state.metrics.last_rtt_ms.store(rtt_ms, Ordering::Relaxed);
+                state
+                    .metrics
+                    .last_pong_ms
+                    .store(epoch_millis(), Ordering::Relaxed);
+            }
+        }
     }
 
     true

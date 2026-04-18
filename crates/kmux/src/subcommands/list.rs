@@ -1,6 +1,6 @@
 use crate::cli::OutputFormat;
 
-use super::{print_sessions, resolve_connection};
+use super::{render, resolve_connection};
 
 pub struct ListSessionsConfig<'a> {
     pub server: Option<&'a str>,
@@ -95,7 +95,13 @@ pub async fn run_list_sessions(cfg: ListSessionsConfig<'_>) -> anyhow::Result<()
         let msg = decode_server(&data)?;
         match msg {
             ServerMessage::SessionListResult { sessions, .. } => {
-                print_sessions(&sessions, &format);
+                match format {
+                    OutputFormat::Table => {
+                        let rows = render::session_rows(&sessions);
+                        render::render(&rows, &format, "No active sessions");
+                    }
+                    OutputFormat::Json => render::render_json(&sessions),
+                }
                 return Ok(());
             }
             _ => continue,

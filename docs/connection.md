@@ -33,9 +33,11 @@ This document is the technical reference for the kmux connection subsystem as im
 12. [ConnectionId and Session Resumption](#connectionid-and-session-resumption)
 13. [Explicit Decision Table](#explicit-decision-table)
 14. [Sequence Diagrams](#sequence-diagrams)
-15. [Troubleshooting](#troubleshooting)
+15. [Per-Connection Metrics](#per-connection-metrics)
+    - [`kmux daemon sessions`](#kmux-daemon-sessions)
+16. [Troubleshooting](#troubleshooting)
     - [Dry-run diagnostics (`--dry-run`, `--test`)](#dry-run-diagnostics---dry-run---test)
-16. [Key File Index](#key-file-index)
+17. [Key File Index](#key-file-index)
 
 ---
 
@@ -610,6 +612,50 @@ breaking existing consumers — the enum is `#[non_exhaustive]`.
 
 ---
 
+## Per-Connection Metrics
+
+Every connection that completes auth is given an `Arc<ConnectionMetrics>` allocated in `run_client_session` before the first frame arrives. Counters are `AtomicU64` and updated on the hot path — no locks, no allocation after creation.
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `bytes_in` | `AtomicU64` | Total bytes read from the client (4-byte length prefix included). |
+| `bytes_out` | `AtomicU64` | Total bytes written to the client (4-byte length prefix included). |
+| `msgs_in` | `AtomicU64` | Number of complete frames received from the client. |
+| `msgs_out` | `AtomicU64` | Number of complete frames sent to the client. |
+| `last_activity_ms` | `AtomicU64` | Epoch-ms timestamp of the last received frame; `0` means no frame yet. |
+| `last_pong_ms` | `AtomicU64` | Epoch-ms timestamp of the last `Pong` received from this client; `0` = never. |
+| `last_rtt_ms` | `AtomicU64` | Most recent round-trip time in ms; `u64::MAX` = no measurement yet. |
+| `last_ping_sent` | `Mutex<Option<(u64, Instant)>>` | The `(seq, sent_at)` of the last `Ping` sent, used to match the next `Pong`. |
+
+**Metric continuity across channel switches.** When a client reconnects on a new transport (e.g. the `TransportSupervisor` upgrades UDS → QUIC), `ServerApp::register_client` is called with the existing `ConnectionId`. The daemon finds the existing `ConnectionState`, updates its `transport` label, and returns the *original* `Arc<ConnectionMetrics>` — so `bytes_in`/`bytes_out` keep counting as if the switch never happened. The new `Arc<ConnectionMetrics>` passed by the caller is discarded.
+
+**Where counters accumulate.** `bytes_in` and `msgs_in` are incremented in the `run_client_session` read loop immediately after each `read_frame` returns. `bytes_out` and `msgs_out` are incremented in the writer task after each `write_frame` succeeds. `last_activity_ms` is stamped to `epoch_millis()` on every inbound frame. `last_rtt_ms` and `last_pong_ms` are updated in the Pong dispatch branch when the received sequence number matches `last_ping_sent`.
+
+### `kmux daemon sessions`
+
+```
+kmux daemon sessions [--all] [--format <table|json>]
+```
+
+Queries the daemon's Unix control socket (`{"command":"sessions"}`) and renders a live view of all sessions with their attached connections:
+
+```
+SESSION   ID      CONN  TRANSPORT  UPTIME    LAST PING  RTT      IN        OUT
+work      eagle   #5    QUIC       12m 3s    2s         1.8ms    1.2 MiB   45.6 MiB
+work      eagle   #9    UDS        4m 10s    1s         0.2ms    210 KiB   8.1 MiB
+research  hippo   -     -          -         -          -        -         -
+```
+
+- Without `--all`, only sessions with at least one active connection are shown. Auth'd-but-not-yet-attached connections appear in a separate `(unattached)` bucket at the bottom.
+- `--all` also shows sessions with zero attached connections (connection columns show `-`).
+- `--format json` prints the full `SessionsResponse` struct as pretty-printed JSON.
+
+Each row in the table is one *connection* (not one session). A session with multiple attached clients (e.g. the same pane viewed from two terminals) produces multiple rows with the same `SESSION`/`ID` values.
+
+**Implementation.** `ServerApp::snapshot_sessions_with_connections` holds both the sessions and connections read locks simultaneously to avoid tearing, then joins them: it builds a `ClientId → ConnectionInfo` map from the connections table, iterates session panes to collect attached `ClientId`s, and groups `ConnectionInfo`s per session. Any `ClientId` not found in any pane appears in `unattached`.
+
+---
+
 ## Key File Index
 
 | File | Role |
@@ -622,11 +668,15 @@ breaking existing consumers — the enum is `#[non_exhaustive]`.
 | `crates/kmux-protocol/src/tls/tofu.rs` | TOFU certificate pinning |
 | `crates/kmux-protocol/src/endpoint.rs` | `Endpoint` URL parser |
 | `crates/kmux-protocol/src/codec.rs` | `read_frame`/`write_frame` (postcard + length-prefix) |
+| `crates/kmux-protocol/src/control_rpc.rs` | Shared control-socket RPC types (`StatusResponse`, `SessionsResponse`, `ConnectionInfo`, …) |
 | `crates/kmux-client/src/bootstrap.rs` | Bootstrap strategies and `bootstrap_race` |
 | `crates/kmux-client/src/supervisor.rs` | `TransportSupervisor`, `TransportScorer`, `UpgradeSignal` |
 | `crates/kmux-client/src/ssh/negotiate.rs` | SSH `probe-or-start` and tunnel setup |
+| `crates/kmux-client/src/daemon/mod.rs` | Control-socket client helpers (`query_daemon`, `stop_daemon`, `query_daemon_sessions`) |
 | `crates/kmuxd/src/config.rs` | `kmuxd.toml` schema and `ServerConfig::resolve()` |
 | `crates/kmuxd/src/announce.rs` | Audience-aware endpoint advertisement |
 | `crates/kmuxd/src/startup.rs` | Listener loop over `ServerConfig.listeners` |
-| `crates/kmuxd/src/daemon.rs` | Control socket server and `StatusResponse` |
-| `crates/kmuxd/src/client_handler/session.rs` | `run_client_session` (generic over all transports) |
+| `crates/kmuxd/src/app/mod.rs` | `ServerApp`, `ConnectionMetrics`, `snapshot_sessions_with_connections` |
+| `crates/kmuxd/src/daemon.rs` | Control socket server (`serve_control_socket`, status/stop/sessions commands) |
+| `crates/kmuxd/src/client_handler/session.rs` | `run_client_session` (generic over all transports; byte/activity instrumentation) |
+| `crates/kmux/src/subcommands/render.rs` | Centralised `tabled`-based table/JSON rendering for all CLI list output |

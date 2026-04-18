@@ -112,6 +112,15 @@ pub enum DaemonAction {
         #[arg(short, long)]
         follow: bool,
     },
+    /// List sessions and their active connections
+    Sessions {
+        /// Show all sessions, including those with no active connections
+        #[arg(short, long)]
+        all: bool,
+        /// Output format
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
 }
 
 #[derive(Debug, Clone, ValueEnum)]

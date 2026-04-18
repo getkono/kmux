@@ -230,20 +230,27 @@ async fn dispatch_session(session: IncomingSession, app: Arc<ServerApp>) {
                 .extra
                 .downcast::<quinn::Connection>()
                 .expect("QUIC IncomingSession must carry quinn::Connection in extra");
-            crate::connection::handle_with_io(session.read, session.write, conn, app, span.clone())
-                .instrument(span)
-                .await;
+            crate::connection::handle_with_io(
+                session.read,
+                session.write,
+                conn,
+                app,
+                TransportKind::Quic,
+                span.clone(),
+            )
+            .instrument(span)
+            .await;
         }
-        TransportKind::Tcp | TransportKind::TcpTls => {
-            crate::tcp_listener::handle_tcp_io(session.read, session.write, app, span.clone())
-                .instrument(span)
-                .await;
-        }
-        TransportKind::Uds => {
-            // UDS sessions use the same single-stream mux as TCP.
-            crate::tcp_listener::handle_tcp_io(session.read, session.write, app, span.clone())
-                .instrument(span)
-                .await;
+        kind @ (TransportKind::Tcp | TransportKind::TcpTls | TransportKind::Uds) => {
+            crate::tcp_listener::handle_tcp_io(
+                session.read,
+                session.write,
+                app,
+                kind,
+                span.clone(),
+            )
+            .instrument(span)
+            .await;
         }
     }
 }

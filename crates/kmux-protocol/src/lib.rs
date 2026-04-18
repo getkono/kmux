@@ -1,5 +1,6 @@
 pub mod auth;
 pub mod codec;
+pub mod control_rpc;
 pub mod dirs;
 pub mod endpoint;
 pub mod messages;

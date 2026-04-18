@@ -55,6 +55,7 @@ pub async fn handle_tcp_io<R, W>(
     reader: R,
     writer: W,
     app: Arc<ServerApp>,
+    transport: kmux_protocol::TransportKind,
     conn_span: tracing::Span,
 ) where
     R: tokio::io::AsyncRead + Unpin + Send,
@@ -64,6 +65,7 @@ pub async fn handle_tcp_io<R, W>(
         reader,
         writer,
         app,
+        transport,
         |ctrl_tx| TcpAttacher { ctrl_tx },
         conn_span.clone(),
     )
