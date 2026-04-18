@@ -8,7 +8,7 @@ name = "kmuxd"
 path = "src/main.rs"
 
 [features]
-default = ["backend-wezterm"]
+default = ["backend-ghostty"]
 backend-wezterm = ["dep:tattoy-wezterm-term", "dep:tattoy-wezterm-surface"]
 backend-ghostty = ["dep:kmux-ghostty"]
 
