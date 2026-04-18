@@ -3,8 +3,11 @@ use std::sync::atomic::AtomicBool;
 
 use kmux_protocol::messages::{CellState, CursorState, TermModes, TermSize};
 
+#[cfg(feature = "backend-ghostty")]
+pub mod ghostty;
 #[cfg(test)]
 pub mod mock;
+#[cfg(feature = "backend-wezterm")]
 pub mod wezterm;
 
 /// Default maximum scrollback lines retained by the terminal emulator.
@@ -53,6 +56,15 @@ impl From<BackendSize> for TermSize {
 /// The daemon writes to these atomics on every client attach/detach; the
 /// backend reads them on every relevant escape-sequence handler without
 /// rebuilding the terminal state.
+///
+/// Reader coverage depends on which backend feature is active: wezterm
+/// consults them via `KmuxTerminalConfig`; the current ghostty-vt wrapper
+/// parses unconditionally and never reads these. The fields are therefore
+/// marked `#[allow(dead_code)]` at the `backend-ghostty`-only cfg.
+#[cfg_attr(
+    all(feature = "backend-ghostty", not(feature = "backend-wezterm")),
+    allow(dead_code)
+)]
 pub struct CapabilityHandles {
     pub kitty_graphics: Arc<AtomicBool>,
     pub kitty_keyboard: Arc<AtomicBool>,
@@ -81,6 +93,12 @@ impl BackendEventSink for NullEventSink {}
 /// Configuration passed to [`TerminalBackend::new`].
 pub struct BackendConfig {
     pub size: BackendSize,
+    /// Live kitty-graphics/keyboard toggles. Read by wezterm; ghostty-vt
+    /// ignores them today (parse-unconditionally model).
+    #[cfg_attr(
+        all(feature = "backend-ghostty", not(feature = "backend-wezterm")),
+        allow(dead_code)
+    )]
     pub capabilities: CapabilityHandles,
     /// Event sink for title/bell/OSC callbacks from the terminal emulator.
     pub events: Arc<dyn BackendEventSink>,

@@ -1512,6 +1512,7 @@ dependencies = [
  "anyhow",
  "clap",
  "daemonize",
+ "kmux-ghostty",
  "kmux-protocol",
  "kmux-pty",
  "nix 0.31.2",

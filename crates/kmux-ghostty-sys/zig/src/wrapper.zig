@@ -526,7 +526,9 @@ export fn kmux_ghostty_is_alt_screen(wrapper: *const Wrapper) callconv(.c) bool 
 
 export fn kmux_ghostty_history_size(wrapper: *const Wrapper) callconv(.c) usize {
     const pages = &wrapper.terminal.screens.active.pages;
-    const total: usize = pages.rows;
+    // `total_rows` tracks every row currently held across all pages (active +
+    // scrollback); `rows` on the PageList is just the active-viewport height.
+    const total: usize = pages.total_rows;
     const visible: usize = wrapper.terminal.rows;
     return if (total > visible) total - visible else 0;
 }

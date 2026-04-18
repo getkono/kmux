@@ -10,7 +10,7 @@ path = "src/main.rs"
 [features]
 default = ["backend-wezterm"]
 backend-wezterm = ["dep:tattoy-wezterm-term", "dep:tattoy-wezterm-surface"]
-backend-ghostty = []
+backend-ghostty = ["dep:kmux-ghostty"]
 
 [dependencies]
 kmux-pty.workspace = true
@@ -21,6 +21,7 @@ serde.workspace = true
 serde_json.workspace = true
 tattoy-wezterm-term = { workspace = true, optional = true }
 tattoy-wezterm-surface = { workspace = true, optional = true }
+kmux-ghostty = { workspace = true, optional = true }
 tokio.workspace = true
 quinn.workspace = true
 rustls.workspace = true
