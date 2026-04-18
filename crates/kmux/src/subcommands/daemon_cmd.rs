@@ -7,13 +7,23 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
         DaemonAction::Start => {
             // Check if already running.
             if let Some(status) = kmux_client::daemon::query_daemon().await {
+                use kmux_protocol::messages::PROTOCOL_VERSION;
+                if status.protocol_version != 0 && status.protocol_version != PROTOCOL_VERSION {
+                    anyhow::bail!(
+                        "Daemon is running (PID {}) with protocol version {} but this client \
+                         uses {}. Run `kmux daemon restart` to restart it.",
+                        status.pid,
+                        status.protocol_version,
+                        PROTOCOL_VERSION
+                    );
+                }
                 println!(
                     "Daemon already running — PID {}, port {}",
                     status.pid, status.port
                 );
                 return Ok(());
             }
-            let status = kmux_client::daemon::ensure_daemon().await?;
+            let status = kmux_client::daemon::ensure_compatible_daemon().await?;
             println!("Daemon started — PID {}, port {}", status.pid, status.port);
         }
 
@@ -26,11 +36,20 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
 
         DaemonAction::Status => match kmux_client::daemon::query_daemon().await {
             Some(status) => {
+                use kmux_protocol::messages::PROTOCOL_VERSION;
                 println!("Status:   running");
                 println!("PID:      {}", status.pid);
                 println!("Port:     {}", status.port);
                 println!("Uptime:   {}", render::format_uptime(status.uptime_secs));
                 println!("Sessions: {}", status.session_count);
+                println!("Protocol: {}", status.protocol_version);
+                println!("Version:  {}", status.kmuxd_version);
+                if status.protocol_version != 0 && status.protocol_version != PROTOCOL_VERSION {
+                    println!(
+                        "Warning:  protocol version mismatch (client={PROTOCOL_VERSION}). \
+                         Run `kmux daemon restart`."
+                    );
+                }
             }
             None => {
                 println!("Status:   not running");
@@ -52,7 +71,7 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
                     anyhow::bail!("timed out waiting for daemon to stop");
                 }
             }
-            let status = kmux_client::daemon::ensure_daemon().await?;
+            let status = kmux_client::daemon::ensure_compatible_daemon().await?;
             println!(
                 "Daemon restarted — PID {}, port {}",
                 status.pid, status.port

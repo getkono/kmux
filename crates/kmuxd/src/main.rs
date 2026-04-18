@@ -380,14 +380,7 @@ fn cleanup_and_start_daemon() -> anyhow::Result<()> {
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("kmuxd"));
 
     std::process::Command::new(&exe)
-        .args([
-            "--daemon",
-            "--self-signed",
-            "--bind",
-            "127.0.0.1",
-            "--port",
-            "0",
-        ])
+        .args(kmux_protocol::control_rpc::DAEMON_BOOT_ARGS)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

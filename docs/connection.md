@@ -37,7 +37,9 @@ This document is the technical reference for the kmux connection subsystem as im
     - [`kmux daemon sessions`](#kmux-daemon-sessions)
 16. [Troubleshooting](#troubleshooting)
     - [Dry-run diagnostics (`--dry-run`, `--test`)](#dry-run-diagnostics---dry-run---test)
-17. [Key File Index](#key-file-index)
+17. [Daemon Binary Resolution](#daemon-binary-resolution)
+18. [Idle Shutdown](#idle-shutdown)
+19. [Key File Index](#key-file-index)
 
 ---
 
@@ -653,6 +655,83 @@ research  hippo   -     -          -         -          -        -         -
 Each row in the table is one *connection* (not one session). A session with multiple attached clients (e.g. the same pane viewed from two terminals) produces multiple rows with the same `SESSION`/`ID` values.
 
 **Implementation.** `ServerApp::snapshot_sessions_with_connections` holds both the sessions and connections read locks simultaneously to avoid tearing, then joins them: it builds a `ClientId → ConnectionInfo` map from the connections table, iterates session panes to collect attached `ClientId`s, and groups `ConnectionInfo`s per session. Any `ClientId` not found in any pane appears in `unattached`.
+
+---
+
+## Daemon Binary Resolution
+
+Every place that spawns `kmuxd` uses one of two strategies. They are intentionally different because the caller's context differs.
+
+### Client-side (`kmux`, `kmux daemon start/restart`, auto-spawn)
+
+`find_server_binary()` in `crates/kmux-client/src/daemon/lifecycle.rs`:
+
+1. **Sibling of the running `kmux` executable** — `current_exe().parent() / "kmuxd"`. This is the primary path in all normal layouts.
+2. **`$PATH` walk** — iterates `PATH` components looking for `kmuxd`. Fallback for unusual install layouts.
+3. Error if neither resolves.
+
+| Build mode | `kmux` location | `kmuxd` resolved from |
+|------------|-----------------|----------------------|
+| Debug (`cargo run -p kmux`) | `target/debug/kmux` | `target/debug/kmuxd` (sibling) |
+| Prod install | `/usr/local/bin/kmux` (or wherever) | `/usr/local/bin/kmuxd` (sibling) |
+| Custom layout | anywhere | sibling, then `$PATH` |
+
+Once the binary is located, `start_daemon()` spawns it with the canonical argv:
+
+```
+kmuxd --daemon --self-signed --bind 127.0.0.1 --port 0
+```
+
+This constant is defined in `crates/kmux-protocol/src/control_rpc.rs::DAEMON_BOOT_ARGS` and is the single source of truth for every spawn site.
+
+### Server-side (`kmuxd probe-or-start`)
+
+When the SSH bootstrap invokes `kmuxd probe-or-start` on a remote host and the daemon is not running, `cleanup_and_start_daemon()` in `crates/kmuxd/src/main.rs` re-execs the same binary that SSH found:
+
+```rust
+std::env::current_exe()   // the running kmuxd binary
+```
+
+This means `probe-or-start` always restarts the exact binary that was already on the remote `$PATH`. No additional lookup is performed. It uses the same `DAEMON_BOOT_ARGS` argv.
+
+The remote `kmuxd` must be on the login `$PATH`. Non-interactive SSH sessions typically receive only `/usr/bin:/bin` (plus whatever `/etc/ssh/sshrc` or PAM adds). If `kmuxd` is installed at `~/.local/bin/kmuxd`, ensure the remote `/etc/environment` or `~/.profile` exports that path.
+
+### justfile (`just restart-daemon`, `just start-daemon`)
+
+These targets now delegate to `kmux daemon restart` / `kmux daemon start` via `cargo run -p kmux`, which uses `find_server_binary()` as above. The debug build's `target/debug/kmux` picks up `target/debug/kmuxd` as its sibling. No separate binary resolution logic exists in the justfile itself.
+
+### Runtime directory isolation
+
+Debug builds use `$XDG_RUNTIME_DIR/kmux-debug/` for all runtime files (control socket, data socket, PID, token). Release builds use `$XDG_RUNTIME_DIR/kmux/`. This prevents a debug daemon from conflicting with a simultaneously running release daemon on the same machine.
+
+---
+
+## Idle Shutdown
+
+`kmuxd` exits automatically when no clients have been connected for `idle_shutdown_secs` seconds (default: 30). This is configured in `kmuxd.toml`:
+
+```toml
+[daemon]
+# Set to 0 to disable idle shutdown (daemon runs until explicitly stopped).
+idle_shutdown_secs = 30
+```
+
+### Mechanism
+
+`ServerApp` maintains a `tokio::sync::watch` channel that broadcasts the live connection count. `startup.rs` spawns an idle-watcher task that:
+
+1. Waits for the count to change.
+2. When the count drops to 0, starts a debounce timer of `idle_shutdown_secs`.
+3. If a client connects before the timer fires, the timer is cancelled and the loop restarts.
+4. If the timer fires, the watcher signals the shared `shutdown` `Notify` — the same one used by SIGINT, SIGTERM, and the `stop` control command. The daemon exits cleanly (session-state checkpoint included).
+
+### Debounce rationale
+
+The two-phase connection model has a brief gap between bootstrap and data-plane transport selection. The 30 s debounce is long enough for any reconnect flow to complete, but short enough to prevent orphaned daemons accumulating on a shared machine. Disable it (`idle_shutdown_secs = 0`) only when running `kmuxd` as a long-lived service that must survive temporary client disconnects without restarting.
+
+### Session persistence
+
+Sessions are checkpointed to `$XDG_STATE_HOME/kmux/session_state.bin` (or `$HOME/.local/state/kmux/`) on idle shutdown (same path as the periodic 30 s checkpoint). A freshly started daemon reads this checkpoint and restores any live PTY processes, so session state is preserved across idle restarts.
 
 ---
 

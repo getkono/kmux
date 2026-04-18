@@ -49,6 +49,10 @@ pub struct ConfigFile {
     /// Auth configuration.
     #[serde(default)]
     pub auth: AuthConfig,
+
+    /// Daemon lifecycle settings.
+    #[serde(default)]
+    pub daemon: DaemonConfig,
 }
 
 impl Default for ConfigFile {
@@ -61,8 +65,34 @@ impl Default for ConfigFile {
             listen: default_listen(),
             advertise: AdvertiseConfig::default(),
             auth: AuthConfig::default(),
+            daemon: DaemonConfig::default(),
         }
     }
+}
+
+/// Daemon lifecycle settings (`[daemon]` in `kmuxd.toml`).
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DaemonConfig {
+    /// Exit when no clients have been connected for this many seconds.
+    /// `0` disables idle shutdown (daemon runs until explicitly stopped).
+    ///
+    /// Note: the debounce applies per-transport-disconnect. A 30 s window
+    /// is long enough for clients to reconnect across transport switches.
+    #[serde(default = "default_idle_shutdown_secs")]
+    pub idle_shutdown_secs: u64,
+}
+
+impl Default for DaemonConfig {
+    fn default() -> Self {
+        Self {
+            idle_shutdown_secs: default_idle_shutdown_secs(),
+        }
+    }
+}
+
+fn default_idle_shutdown_secs() -> u64 {
+    30
 }
 
 fn default_config_version() -> u32 {
@@ -227,6 +257,8 @@ pub struct ServerConfig {
     pub advertise: AdvertiseConfig,
     pub auth: AuthConfig,
     pub runtime_dir: String,
+    /// Seconds of inactivity (zero clients) before the daemon exits. `0` = disabled.
+    pub idle_shutdown_secs: u64,
 }
 
 impl ServerConfig {
@@ -254,6 +286,7 @@ impl ServerConfig {
             advertise: file.advertise,
             auth: file.auth,
             runtime_dir: file.runtime_dir,
+            idle_shutdown_secs: file.daemon.idle_shutdown_secs,
         })
     }
 }
@@ -482,5 +515,27 @@ self_signed = true
         let content = std::fs::read_to_string(&path).unwrap();
         let cfg: ConfigFile = toml::from_str(&content).unwrap();
         assert_eq!(cfg.version, 1);
+    }
+
+    #[test]
+    fn daemon_idle_shutdown_parses() {
+        let toml = r#"
+[tls]
+self_signed = true
+
+[daemon]
+idle_shutdown_secs = 60
+"#;
+        let cfg: ConfigFile = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.daemon.idle_shutdown_secs, 60);
+        let resolved = ServerConfig::resolve(cfg).unwrap();
+        assert_eq!(resolved.idle_shutdown_secs, 60);
+    }
+
+    #[test]
+    fn daemon_idle_shutdown_default_is_30() {
+        // Only test the ConfigFile default — resolve() requires TLS when QUIC/TCP+TLS are enabled.
+        let cfg = ConfigFile::default();
+        assert_eq!(cfg.daemon.idle_shutdown_secs, 30);
     }
 }

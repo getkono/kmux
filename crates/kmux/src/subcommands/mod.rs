@@ -133,7 +133,7 @@ pub async fn resolve_connection(
             Err(e) => Err(anyhow::anyhow!("SSH negotiation failed: {e}")),
         }
     } else if is_local {
-        let status = kmux_client::daemon::ensure_daemon().await?;
+        let status = kmux_client::daemon::ensure_compatible_daemon().await?;
         Ok(ResolvedConnection {
             host: "127.0.0.1".to_string(),
             port: status.port,

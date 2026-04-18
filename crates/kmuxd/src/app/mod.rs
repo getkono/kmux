@@ -23,7 +23,7 @@ use kmux_pty::events::SessionEvent;
 use kmux_pty::registry::SessionManager as PtyRegistry;
 use kmux_pty::session::PtyWriter;
 use rand::SeedableRng;
-use tokio::sync::{RwLock, broadcast, mpsc};
+use tokio::sync::{RwLock, broadcast, mpsc, watch};
 
 use crate::capability::intersect_for_atomics;
 use crate::scrollback::DiffBuffer;
@@ -243,10 +243,13 @@ pub struct ServerApp {
     pub(super) wordlist: Mutex<WordlistSampler>,
     /// RNG for word selection (seeded once at startup).
     pub(super) rng: Mutex<rand::rngs::SmallRng>,
+    /// Broadcasts the live connection count; used for idle-shutdown tracking.
+    conn_count_tx: watch::Sender<usize>,
 }
 
 impl ServerApp {
     pub fn new(token: String) -> Self {
+        let (conn_count_tx, _) = watch::channel(0usize);
         Self {
             manager: Arc::new(PtyRegistry::new()),
             auth_token: token,
@@ -257,7 +260,13 @@ impl ServerApp {
             connections: RwLock::new(HashMap::new()),
             wordlist: Mutex::new(WordlistSampler::new()),
             rng: Mutex::new(rand::rngs::SmallRng::from_os_rng()),
+            conn_count_tx,
         }
+    }
+
+    /// Subscribe to live connection-count changes for idle-shutdown tracking.
+    pub fn conn_count_rx(&self) -> watch::Receiver<usize> {
+        self.conn_count_tx.subscribe()
     }
 
     /// Register a client connection, returning a `(ClientId, ConnectionId)` pair
@@ -287,14 +296,19 @@ impl ServerApp {
         }
         let client_id = ClientId(self.next_client_id.fetch_add(1, Ordering::Relaxed));
         let conn_id = ConnectionId(self.next_connection_id.fetch_add(1, Ordering::Relaxed));
-        self.connections.write().await.insert(
-            conn_id.0,
-            ConnectionState {
-                client_id,
-                transport,
-                metrics: Arc::clone(&new_metrics),
-            },
-        );
+        let count = {
+            let mut conns = self.connections.write().await;
+            conns.insert(
+                conn_id.0,
+                ConnectionState {
+                    client_id,
+                    transport,
+                    metrics: Arc::clone(&new_metrics),
+                },
+            );
+            conns.len()
+        };
+        let _ = self.conn_count_tx.send(count);
         (client_id, conn_id, new_metrics)
     }
 
@@ -317,7 +331,12 @@ impl ServerApp {
 
     /// Remove the connection entry when a client disconnects.
     pub async fn unregister_client(&self, conn_id: ConnectionId) {
-        self.connections.write().await.remove(&conn_id.0);
+        let count = {
+            let mut conns = self.connections.write().await;
+            conns.remove(&conn_id.0);
+            conns.len()
+        };
+        let _ = self.conn_count_tx.send(count);
     }
 
     /// Snapshot all sessions and their attached connections for the `"sessions"`
@@ -436,6 +455,35 @@ mod tests {
     use kmux_protocol::TransportKind;
 
     use super::{ConnectionMetrics, ServerApp};
+
+    #[tokio::test]
+    async fn conn_count_watch_tracks_register_and_unregister() {
+        let app = ServerApp::new("tok".to_string());
+        let mut rx = app.conn_count_rx();
+
+        // Initially 0.
+        assert_eq!(*rx.borrow(), 0);
+
+        let m1 = Arc::new(ConnectionMetrics::new());
+        let (_, c1, _) = app
+            .register_client(TransportKind::Uds, Arc::clone(&m1), None)
+            .await;
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), 1);
+
+        let m2 = Arc::new(ConnectionMetrics::new());
+        let (_, c2, _) = app.register_client(TransportKind::Tcp, m2, None).await;
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), 2);
+
+        app.unregister_client(c1).await;
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), 1);
+
+        app.unregister_client(c2).await;
+        rx.changed().await.unwrap();
+        assert_eq!(*rx.borrow(), 0);
+    }
 
     #[tokio::test]
     async fn register_client_assigns_fresh_ids_and_stores_metrics() {

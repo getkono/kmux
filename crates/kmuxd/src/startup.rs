@@ -169,6 +169,47 @@ pub async fn async_main(daemon: bool, cfg: ServerConfig) -> anyhow::Result<()> {
 
     let shutdown = Arc::new(Notify::new());
 
+    // Spawn idle-shutdown watcher when configured.
+    if cfg.idle_shutdown_secs > 0 {
+        let idle_secs = cfg.idle_shutdown_secs;
+        let mut count_rx = app.conn_count_rx();
+        let shutdown_idle = Arc::clone(&shutdown);
+        tokio::spawn(async move {
+            use std::time::Duration;
+            loop {
+                // Wait for any connection-count change.
+                if count_rx.changed().await.is_err() {
+                    break; // sender dropped → daemon shutting down
+                }
+                let count = *count_rx.borrow();
+                if count == 0 {
+                    // Debounce: wait idle_secs, but cancel if a client connects.
+                    let idle = tokio::time::sleep(Duration::from_secs(idle_secs));
+                    tokio::pin!(idle);
+                    loop {
+                        tokio::select! {
+                            () = &mut idle => {
+                                info!(idle_secs, "idle shutdown: no clients for {idle_secs}s");
+                                shutdown_idle.notify_waiters();
+                                return;
+                            }
+                            changed = count_rx.changed() => {
+                                if changed.is_err() { return; }
+                                if *count_rx.borrow() > 0 {
+                                    break; // client reconnected; restart outer loop
+                                }
+                                // count changed but still 0 (spurious); reset debounce
+                                idle.as_mut().reset(
+                                    tokio::time::Instant::now() + Duration::from_secs(idle_secs)
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    }
+
     if daemon {
         let params = crate::daemon::ControlSocketParams {
             socket_path: kmux_protocol::dirs::socket_path()?,

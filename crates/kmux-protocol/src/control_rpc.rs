@@ -2,6 +2,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::messages::SessionMeta;
 
+/// Canonical argv appended when the client spawns a local daemon.
+///
+/// Any site that shells out to `kmuxd` must use this constant so that the
+/// args, bind address, and port are never duplicated or allowed to drift.
+pub const DAEMON_BOOT_ARGS: &[&str] = &[
+    "--daemon",
+    "--self-signed",
+    "--bind",
+    "127.0.0.1",
+    "--port",
+    "0",
+];
+
 /// JSON request sent to the daemon control socket.
 #[derive(Deserialize)]
 pub struct ControlRequest {

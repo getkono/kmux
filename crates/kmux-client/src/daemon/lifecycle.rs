@@ -86,14 +86,7 @@ pub(crate) fn start_daemon() -> anyhow::Result<()> {
     let server_bin = find_server_binary()?;
 
     std::process::Command::new(&server_bin)
-        .args([
-            "--daemon",
-            "--self-signed",
-            "--bind",
-            "127.0.0.1",
-            "--port",
-            "0",
-        ])
+        .args(kmux_protocol::control_rpc::DAEMON_BOOT_ARGS)
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())

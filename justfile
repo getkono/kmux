@@ -45,23 +45,18 @@ tail-client-log:
 tail-daemon-log:
     tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/kmux/daemon.log"
 
-# Stop any running kmuxd (debug), rebuild, and restart it
+# Rebuild kmux + kmuxd (debug) and restart the daemon via `kmux daemon restart`.
+# Binary resolution: kmux at target/debug/kmux picks up its sibling kmuxd at
+# target/debug/kmuxd, spawning it with the same argv as any auto-spawn.
 restart-daemon:
-    #!/usr/bin/env bash
-    set -euo pipefail
-    PID_FILE="${XDG_RUNTIME_DIR:-/tmp}/kmux-debug/daemon.pid"
-    if [[ -f "$PID_FILE" ]]; then
-        PID=$(cat "$PID_FILE")
-        if kill -0 "$PID" 2>/dev/null; then
-            echo "Stopping kmuxd (pid $PID)..."
-            kill "$PID"
-            for i in $(seq 1 20); do
-                kill -0 "$PID" 2>/dev/null || break
-                sleep 0.1
-            done
-            kill -0 "$PID" 2>/dev/null && kill -9 "$PID" || true
-        fi
-        rm -f "$PID_FILE"
-    fi
-    cargo build -p kmuxd
-    exec cargo run -p kmuxd -- --self-signed
+    cargo build -p kmux -p kmuxd
+    cargo run -p kmux -- daemon restart
+
+# Start the local daemon (debug build) via the same primitive as auto-spawn.
+start-daemon:
+    cargo build -p kmux -p kmuxd
+    cargo run -p kmux -- daemon start
+
+# Stop the local daemon (debug build).
+stop-daemon:
+    cargo run -p kmux -- daemon stop

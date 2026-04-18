@@ -15,6 +15,7 @@ use tokio::net::UnixStream;
 use kmux_protocol::control_rpc::{SessionsResponse, StatusResponse};
 
 /// Connection parameters returned by the running daemon.
+#[derive(Debug)]
 pub struct DaemonStatus {
     pub port: u16,
     pub tcp_port: u16,
@@ -22,6 +23,8 @@ pub struct DaemonStatus {
     pub pid: u32,
     pub uptime_secs: u64,
     pub session_count: usize,
+    pub protocol_version: u32,
+    pub kmuxd_version: String,
 }
 
 /// Send a single JSON command to the daemon control socket and parse the response.
@@ -74,7 +77,40 @@ pub async fn query_daemon() -> Option<DaemonStatus> {
         pid: resp.pid,
         uptime_secs: resp.uptime_secs,
         session_count: resp.session_count,
+        protocol_version: resp.protocol_version,
+        kmuxd_version: resp.kmuxd_version,
     })
+}
+
+/// Ensure a local daemon is running and that its protocol version matches ours.
+///
+/// Starts the daemon if it is not running, then verifies the version reported
+/// via the control socket. Returns `Err` immediately when there is a version
+/// mismatch — the caller must not attempt a data-plane connection.
+///
+/// Use this instead of `ensure_daemon()` for every connection path that talks
+/// to the local daemon.
+pub async fn ensure_compatible_daemon() -> anyhow::Result<DaemonStatus> {
+    use kmux_protocol::messages::PROTOCOL_VERSION;
+
+    let status = lifecycle::ensure_daemon().await?;
+
+    if status.protocol_version != 0 && status.protocol_version != PROTOCOL_VERSION {
+        let hint = if status.protocol_version < PROTOCOL_VERSION {
+            "Hint: the running kmuxd is older than kmux. Run `kmux daemon restart` to update it."
+        } else {
+            "Hint: the running kmuxd is newer than kmux. Update the kmux client to match."
+        };
+        anyhow::bail!(
+            "protocol version mismatch: client={}, daemon={} ({})\n{}",
+            PROTOCOL_VERSION,
+            status.protocol_version,
+            status.kmuxd_version,
+            hint
+        );
+    }
+
+    Ok(status)
 }
 
 /// Send a stop command to the running daemon via its Unix control socket.
@@ -119,7 +155,9 @@ mod tests {
                 let _ = reader.read_line(&mut line).await;
                 let response = format!(
                     "{{\"status\":\"running\",\"port\":9999,\"token\":\"tok\",\
-                     \"pid\":{my_pid},\"uptime_secs\":42,\"session_count\":3}}\n"
+                     \"pid\":{my_pid},\"uptime_secs\":42,\"session_count\":3,\
+                     \"protocol_version\":{},\"kmuxd_version\":\"0.0.0\"}}\n",
+                    kmux_protocol::messages::PROTOCOL_VERSION
                 );
                 write_half.write_all(response.as_bytes()).await.unwrap();
             }
@@ -165,6 +203,50 @@ mod tests {
         let resp = query_daemon_sessions().await.expect("should parse");
         assert!(resp.sessions.is_empty());
         assert!(resp.unattached.is_empty());
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ensure_compatible_daemon_rejects_version_mismatch() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+
+        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let my_pid = std::process::id();
+        // Respond with a mismatched protocol_version.
+        let stale_version = kmux_protocol::messages::PROTOCOL_VERSION.wrapping_sub(1);
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                let response = format!(
+                    "{{\"status\":\"running\",\"port\":9999,\"token\":\"tok\",\
+                     \"pid\":{my_pid},\"uptime_secs\":0,\"session_count\":0,\
+                     \"protocol_version\":{stale_version},\"kmuxd_version\":\"0.0.0\"}}\n"
+                );
+                write_half.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        // ensure_compatible_daemon must error, not return Ok.
+        let result = super::ensure_compatible_daemon().await;
+        assert!(result.is_err(), "expected Err on version mismatch");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("protocol version mismatch"),
+            "error should mention mismatch: {msg}"
+        );
     }
 
     #[tokio::test]

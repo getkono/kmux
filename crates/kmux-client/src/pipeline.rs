@@ -101,6 +101,8 @@ pub struct BootstrapOutcome {
 pub enum BootstrapError {
     #[error("daemon start failed: {0}")]
     DaemonStart(String),
+    #[error("protocol version mismatch: client={client}, daemon={server}")]
+    VersionMismatch { client: u32, server: u32 },
     #[error("SSH negotiation failed: {0}")]
     Ssh(#[from] SshError),
     #[error("{strategy} connect failed: {error}")]
@@ -387,6 +389,14 @@ async fn prepare_local_daemon(
         .await
         .map_err(|e| BootstrapError::DaemonStart(e.to_string()))?;
 
+    // Version gate: refuse before opening the data socket.
+    if status.protocol_version != 0 && status.protocol_version != PROTOCOL_VERSION {
+        return Err(BootstrapError::VersionMismatch {
+            client: PROTOCOL_VERSION,
+            server: status.protocol_version,
+        });
+    }
+
     if existing.is_none() {
         observer.on_event(&BootstrapEvent::DaemonReady {
             pid: status.pid,
@@ -616,7 +626,17 @@ async fn establish(
                 server_version: None,
                 reason: Some(&reason),
             });
-            Err(BootstrapError::Auth(reason))
+            // Detect server-side version mismatch (belt-and-suspenders: the
+            // pre-flight version gate in prepare_local_daemon should catch it
+            // first, but remote/direct transports go through this path only).
+            if reason.starts_with("protocol version mismatch:") {
+                Err(BootstrapError::VersionMismatch {
+                    client: PROTOCOL_VERSION,
+                    server: 0,
+                })
+            } else {
+                Err(BootstrapError::Auth(reason))
+            }
         }
         Ok(Err(_)) => Err(BootstrapError::Auth(
             "auth forwarder dropped before AuthResult".into(),

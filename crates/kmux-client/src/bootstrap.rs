@@ -90,9 +90,17 @@ where
             success: false,
             reason,
             ..
-        } => Err(BootstrapError::AuthFailed {
-            reason: reason.unwrap_or_else(|| "rejected".into()),
-        }),
+        } => {
+            let reason = reason.unwrap_or_else(|| "rejected".into());
+            if reason.starts_with("protocol version mismatch:") {
+                Err(BootstrapError::VersionMismatch {
+                    client: PROTOCOL_VERSION,
+                    server: 0,
+                })
+            } else {
+                Err(BootstrapError::AuthFailed { reason })
+            }
+        }
         _ => Err(BootstrapError::ConnectionFailed(
             "expected AuthResult, got a different message".into(),
         )),
@@ -103,8 +111,9 @@ where
 
 /// Bootstrap via the local daemon's Unix data socket.
 ///
-/// Calls [`kmux_client::daemon::ensure_daemon`] to start the daemon if not
-/// running, then connects to `daemon-data.sock` and performs the auth handshake.
+/// Calls [`kmux_client::daemon::ensure_compatible_daemon`] to start the daemon
+/// if not running and verify its protocol version matches ours, then connects
+/// to `daemon-data.sock` and performs the auth handshake.
 /// Wins in microseconds when the daemon is already running.
 pub struct UdsLocalBootstrap {
     pub capabilities: ClientCapabilities,
@@ -123,10 +132,18 @@ impl Bootstrap for UdsLocalBootstrap {
         Box<dyn std::future::Future<Output = Result<SessionContext, BootstrapError>> + Send + '_>,
     > {
         Box::pin(async move {
-            // Ensure the daemon is running and get its token.
+            // Ensure the daemon is running and get its status.
             let status = crate::daemon::ensure_daemon()
                 .await
                 .map_err(|e| BootstrapError::ConnectionFailed(format!("daemon start: {e}")))?;
+
+            // Version gate: refuse before attempting a data-plane connection.
+            if status.protocol_version != 0 && status.protocol_version != PROTOCOL_VERSION {
+                return Err(BootstrapError::VersionMismatch {
+                    client: PROTOCOL_VERSION,
+                    server: status.protocol_version,
+                });
+            }
 
             let data_socket = kmux_protocol::dirs::data_socket_path()
                 .map_err(|e| BootstrapError::ConnectionFailed(format!("data socket path: {e}")))?;
