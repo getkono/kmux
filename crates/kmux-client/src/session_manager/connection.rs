@@ -2,62 +2,82 @@ use std::time::Instant;
 
 use kmux_protocol::messages::{ClientMessage, ServerMessage};
 use tokio::sync::mpsc;
-use tracing::{info, warn};
+use tracing::info;
 
-use crate::connect::{self, ConnectResult};
 use crate::connection_state::{ConnectionState, DisconnectReason};
+use crate::pipeline::{
+    self, BootstrapError, BootstrapObserver, BootstrapOutcome, ResolvedTarget, SshContext,
+};
 use crate::transport::TransportKind;
 
 use super::SessionManager;
 
 impl SessionManager {
+    /// Run the bootstrap pipeline for `target` and, on success, wire the
+    /// resulting data-plane sender into this session manager.
+    ///
+    /// The same code path is used by `--dry-run` / `--test` (with a
+    /// `ConsoleObserver`) so a successful dry-run proves the real flow
+    /// works. Callers handle the returned `SshContext` — spawning the
+    /// tunnel-death monitor and the `TransportSupervisor` — because
+    /// those live in the frontend, not the client library.
     pub async fn connect(
         &mut self,
         srv_tx: mpsc::UnboundedSender<ServerMessage>,
-    ) -> Vec<super::server_handler::SessionEvent> {
-        let host = self.host.clone();
-        let port = self.port;
-        let token = self.token.clone();
-        let accept_invalid = self.accept_invalid_certs;
-
+        target: ResolvedTarget,
+        observer: &dyn BootstrapObserver,
+    ) -> Result<Option<SshContext>, BootstrapError> {
         self.set_connection_state(ConnectionState::Handshaking);
 
-        match connect::connect(
-            host,
-            port,
-            token,
-            accept_invalid,
-            srv_tx,
+        match pipeline::run_bootstrap(
+            target,
             self.capabilities.clone(),
             self.connection_id,
+            srv_tx,
+            observer,
         )
         .await
         {
-            ConnectResult::Connected(sender) => {
-                self.ws_sender = Some(sender);
-                self.last_host = self.host.clone();
-                self.last_port = self.port;
-                self.current_transport = TransportKind::Quic;
-                self.set_connection_state(ConnectionState::Connected {
-                    transport: TransportKind::Quic,
-                });
-                self.liveness.reset(Instant::now());
-                self.tag_transport(TransportKind::Quic);
-                info!("Connected to kmuxd");
-
-                let rid = self.next_rid();
-                self.send_ws(ClientMessage::SessionList { request_id: rid });
-
-                vec![]
-            }
-            ConnectResult::Failed(e) => {
-                warn!("Connection failed: {e}");
+            Ok(outcome) => Ok(self.apply_outcome(outcome)),
+            Err(e) => {
                 self.set_connection_state(ConnectionState::Disconnected {
-                    reason: DisconnectReason::BootstrapFailed(e),
+                    reason: DisconnectReason::BootstrapFailed(e.to_string()),
                 });
-                vec![]
+                Err(e)
             }
         }
+    }
+
+    /// Consume a successful [`BootstrapOutcome`] and update all
+    /// connection-derived state. Returns the SSH context (if any) so the
+    /// caller can spawn the tunnel-death monitor + supervisor.
+    pub fn apply_outcome(&mut self, outcome: BootstrapOutcome) -> Option<SshContext> {
+        self.ws_sender = Some(outcome.client_tx);
+        self.host = outcome.host.clone();
+        self.port = outcome.port;
+        self.last_host = outcome.host;
+        self.last_port = outcome.port;
+        self.token = outcome.token;
+        self.accept_invalid_certs = outcome.accept_invalid_certs;
+        self.current_transport = outcome.transport;
+        self.connection_id = Some(outcome.connection_id);
+        if outcome.server_version.is_some() {
+            self.server_version = outcome.server_version;
+        }
+        self.set_connection_state(ConnectionState::Connected {
+            transport: outcome.transport,
+        });
+        self.liveness.reset(Instant::now());
+        self.tag_transport(outcome.transport);
+        info!(
+            transport = %outcome.transport,
+            connection_id = outcome.connection_id.0,
+            "Connected to kmuxd",
+        );
+
+        self.request_session_list();
+
+        outcome.ssh_context
     }
 
     pub fn set_ws_sender(&mut self, sender: mpsc::UnboundedSender<ClientMessage>) {

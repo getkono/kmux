@@ -1,5 +1,6 @@
 mod lifecycle;
 pub use lifecycle::ensure_daemon;
+pub(crate) use lifecycle::find_server_binary;
 
 /// Protects XDG_RUNTIME_DIR mutations — shared across all daemon tests.
 #[cfg(test)]

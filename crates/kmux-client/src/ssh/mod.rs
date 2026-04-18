@@ -103,6 +103,11 @@ pub struct SshSession {
     pub remote_host: String,
     /// Background SSH `-L -N` process; must stay alive for the tunnel to work.
     pub tunnel_process: tokio::process::Child,
+    /// Raw JSON response from `kmuxd probe-or-start`. Kept so diagnostic
+    /// observers (e.g. `--dry-run`) can print the unredacted server reply.
+    /// The field is present on every session; the token is redacted by the
+    /// observer at print time, not in this value.
+    pub probe_json: String,
 }
 
 #[derive(Debug, thiserror::Error)]

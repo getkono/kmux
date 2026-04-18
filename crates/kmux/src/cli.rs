@@ -1,5 +1,4 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use kmux_client::ssh::{ParsedServer, RemoteTarget, SshSession};
 
 #[derive(Parser, Debug)]
 #[command(name = "kmux", about = "kmux remote terminal client (TUI)", version)]
@@ -64,6 +63,17 @@ pub struct ConnectArgs {
     /// Working directory for a new session (used with --session or user@host:/path)
     #[arg(long)]
     pub cwd: Option<String>,
+
+    /// Trace connection setup end-to-end, verify with one ping, print a
+    /// report, and exit without launching the TUI.
+    #[arg(long, short = 'n')]
+    pub dry_run: bool,
+
+    /// Superset of `--dry-run`: also run the `TransportSupervisor` live for
+    /// ~10 seconds so transport scoring and any hot-swap upgrade are
+    /// visible. Implies `--dry-run`.
+    #[arg(long)]
+    pub test: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -110,16 +120,11 @@ pub enum OutputFormat {
     Json,
 }
 
-/// Resolved connection parameters ready for use.
+/// Resolved connection parameters for headless subcommands (e.g. list-sessions).
 pub struct ResolvedConnection {
     pub host: String,
     pub port: u16,
-    /// TCP port for headless commands (list-sessions). Falls back to `port` if unset.
+    /// TCP port for headless commands. Falls back to `port` if unset.
     pub tcp_port: Option<u16>,
     pub token: String,
-    pub accept_invalid_certs: bool,
-    pub is_local: bool,
-    pub ssh_session: Option<SshSession>,
-    pub ssh_target: Option<RemoteTarget>,
-    pub parsed_server: Option<ParsedServer>,
 }

@@ -51,7 +51,7 @@ pub(super) fn cleanup_stale_daemon() {
 ///
 /// The server binary handles double-fork daemonization internally via `--daemon`.
 /// We use `LOCK_EX | LOCK_NB` on the pid file to prevent concurrent starts.
-pub(super) fn start_daemon() -> anyhow::Result<()> {
+pub(crate) fn start_daemon() -> anyhow::Result<()> {
     use std::os::unix::fs::OpenOptionsExt;
 
     cleanup_stale_daemon();
@@ -168,7 +168,7 @@ pub(super) fn read_pid_file(path: &std::path::Path) -> Option<u32> {
         .ok()
 }
 
-pub(super) fn find_server_binary() -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn find_server_binary() -> anyhow::Result<std::path::PathBuf> {
     // 1. Same directory as the running executable (typical installed layout).
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()

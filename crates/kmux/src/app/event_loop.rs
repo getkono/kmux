@@ -3,8 +3,7 @@ use std::time::{Duration, Instant};
 use crossterm::event::{Event, EventStream};
 use futures::StreamExt;
 use kmux_client::connection_state::DisconnectReason;
-use kmux_client::session_manager::SessionEvent;
-use kmux_client::ssh;
+use kmux_client::pipeline::{NoopObserver, ResolvedTarget};
 use kmux_client::supervisor::UpgradeSignal;
 use kmux_client::transport::TransportKind;
 use kmux_protocol::messages::ServerMessage;
@@ -36,29 +35,37 @@ impl App {
         let (upgrade_tx, mut upgrade_rx) = mpsc::channel::<UpgradeSignal>(1);
         // SSH tunnel health: signals when the SSH tunnel process exits unexpectedly.
         let (tunnel_died_tx, mut tunnel_died_rx) = mpsc::channel::<()>(1);
-        // When in SSH mode, this sender is used to deliver the ConnectionId to the
-        // QUIC upgrade probe task once auth completes.
-        let mut quic_probe_conn_id_tx: Option<
-            tokio::sync::oneshot::Sender<kmux_protocol::messages::ConnectionId>,
-        > = None;
 
-        if let Some(ssh) = self.ssh_session.take() {
-            // SSH mode: connect via TCP tunnel, then spawn background QUIC upgrade probe.
-            self.mgr
-                .set_status_msg("Connecting via SSH tunnel...".to_string());
-            quic_probe_conn_id_tx = self
-                .connect_via_ssh_session(
-                    ssh,
-                    srv_tx.clone(),
-                    upgrade_tx.clone(),
-                    tunnel_died_tx.clone(),
-                    None,
-                )
-                .await;
-        } else if !self.connect_token.is_empty() {
-            // Normal QUIC mode.
-            self.mgr.set_status_msg("Connecting...".to_string());
-            self.mgr.connect(srv_tx.clone()).await;
+        // Initial bootstrap: if the parsed target is actionable, run the pipeline.
+        // Direct-without-token leaves `pending_target` set but enters the Connect
+        // form; the user submits that to produce a `Reconnect`.
+        if let Some(target) = self.pending_target.take() {
+            let actionable = match &target {
+                ResolvedTarget::Direct { token, .. } => !token.is_empty(),
+                _ => true,
+            };
+            if actionable {
+                self.mgr.set_status_msg("Connecting…".to_string());
+                match self
+                    .mgr
+                    .connect(srv_tx.clone(), target, &NoopObserver)
+                    .await
+                {
+                    Ok(Some(ctx)) => {
+                        self.launch_ssh_supervisor(
+                            ctx,
+                            srv_tx.clone(),
+                            upgrade_tx.clone(),
+                            tunnel_died_tx.clone(),
+                        );
+                    }
+                    Ok(None) => {}
+                    Err(e) => {
+                        warn!("initial bootstrap failed: {e}");
+                        self.enter_disconnected(DisconnectReason::BootstrapFailed(e.to_string()));
+                    }
+                }
+            }
         }
 
         let render_interval = Duration::from_millis(33); // ~30 FPS
@@ -70,7 +77,6 @@ impl App {
         metrics_flush_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
         loop {
-            // Render if needed
             if self.needs_render {
                 terminal.draw(|f| ui::render(f, self))?;
                 self.needs_render = false;
@@ -85,13 +91,12 @@ impl App {
                                 KeyResult::Reconnect => {
                                     let (new_tx, new_rx) = mpsc::unbounded_channel();
                                     srv_rx = new_rx;
-                                    quic_probe_conn_id_tx = self
-                                        .attempt_reconnect(
-                                            new_tx,
-                                            upgrade_tx.clone(),
-                                            tunnel_died_tx.clone(),
-                                        )
-                                        .await;
+                                    self.attempt_reconnect(
+                                        new_tx,
+                                        upgrade_tx.clone(),
+                                        tunnel_died_tx.clone(),
+                                    )
+                                    .await;
                                 }
                                 KeyResult::SwitchServer(target) => {
                                     let (new_tx, new_rx) = mpsc::unbounded_channel();
@@ -100,25 +105,26 @@ impl App {
                                     self.mgr.disconnect();
                                     match target {
                                         SwitchTarget::Local => {
-                                            self.mgr.set_status_msg("Connecting to local daemon…".to_string());
-                                            match kmux_client::daemon::ensure_daemon().await {
-                                                Ok(status) => {
-                                                    self.is_local = true;
-                                                    self.ssh_target = None;
-                                                    self.server_display = "localhost".to_string();
-                                                    self.server_string = String::new();
-                                                    self.server_kind = ServerKind::Local;
-                                                    self.mgr.set_connection_params(
-                                                        "127.0.0.1".to_string(),
-                                                        status.port,
-                                                        status.token,
-                                                    );
-                                                    let events = self.mgr.connect(new_tx).await;
-                                                    self.handle_session_events(events);
-                                                }
-                                                Err(e) => {
-                                                    self.mgr.set_status_msg(format!("Daemon start failed: {e}"));
-                                                }
+                                            self.is_local = true;
+                                            self.ssh_target = None;
+                                            self.server_display = "localhost".to_string();
+                                            self.server_string = String::new();
+                                            self.server_kind = ServerKind::Local;
+                                            self.mgr
+                                                .set_status_msg("Connecting to local daemon…".to_string());
+                                            match self
+                                                .mgr
+                                                .connect(
+                                                    new_tx.clone(),
+                                                    ResolvedTarget::LocalDaemon,
+                                                    &NoopObserver,
+                                                )
+                                                .await
+                                            {
+                                                Ok(_) => self.reflect_bootstrap_outcome(),
+                                                Err(e) => self.enter_disconnected(
+                                                    DisconnectReason::BootstrapFailed(e.to_string()),
+                                                ),
                                             }
                                         }
                                         SwitchTarget::Ssh(target) => {
@@ -136,27 +142,40 @@ impl App {
                                             self.is_local = false;
                                             self.ssh_target = Some(target.clone());
                                             self.mgr.set_status_msg("Connecting via SSH…".to_string());
-                                            match ssh::negotiate(&target).await {
-                                                Ok(new_ssh) => {
-                                                    quic_probe_conn_id_tx = self
-                                                        .connect_via_ssh_session(
-                                                            new_ssh,
-                                                            new_tx.clone(),
-                                                            upgrade_tx.clone(),
-                                                            tunnel_died_tx.clone(),
-                                                            None,
-                                                        )
-                                                        .await;
+                                            let accept_invalid_certs = self.mgr.accept_invalid_certs();
+                                            match self
+                                                .mgr
+                                                .connect(
+                                                    new_tx.clone(),
+                                                    ResolvedTarget::Ssh {
+                                                        target,
+                                                        accept_invalid_certs,
+                                                    },
+                                                    &NoopObserver,
+                                                )
+                                                .await
+                                            {
+                                                Ok(Some(ctx)) => {
+                                                    self.launch_ssh_supervisor(
+                                                        ctx,
+                                                        new_tx.clone(),
+                                                        upgrade_tx.clone(),
+                                                        tunnel_died_tx.clone(),
+                                                    );
+                                                    self.reflect_bootstrap_outcome();
                                                 }
+                                                Ok(None) => self.reflect_bootstrap_outcome(),
                                                 Err(e) => {
-                                                    warn!("SSH switch negotiation failed: {e}");
-                                                    self.mgr.set_status_msg(format!("SSH negotiation failed: {e}"));
+                                                    warn!("SSH switch failed: {e}");
+                                                    self.enter_disconnected(
+                                                        DisconnectReason::BootstrapFailed(
+                                                            e.to_string(),
+                                                        ),
+                                                    );
                                                 }
                                             }
                                         }
                                         SwitchTarget::Direct { host, port } => {
-                                            // For direct connections we don't have the token,
-                                            // so pre-fill the Connect form for the user to enter it.
                                             self.connect_host = host.clone();
                                             self.connect_port = port.to_string();
                                             self.connect_token.clear();
@@ -187,15 +206,9 @@ impl App {
                         _ => {}
                     }
                 }
-                // Only poll the server channel while we still expect to
-                // receive frames. After a drop the channel is closed and
-                // `recv()` resolves synchronously on every poll, which would
-                // starve `event_stream.next()` and leave the overlay keys
-                // unresponsive.
                 msg = srv_rx.recv(), if !matches!(self.mode, Mode::Disconnected { .. }) => {
                     match msg {
                         Some(msg) => {
-                            // Drain all available messages
                             let mut batch = vec![msg];
                             while let Ok(m) = srv_rx.try_recv() {
                                 batch.push(m);
@@ -203,16 +216,6 @@ impl App {
                             self.mgr.metrics.record_batch(batch.len());
                             for m in batch {
                                 let events = self.mgr.handle_server_message(m);
-                                // If auth succeeded and we have a QUIC upgrade probe
-                                // waiting for the ConnectionId, deliver it now.
-                                for ev in &events {
-                                    if matches!(ev, SessionEvent::AuthOk)
-                                        && let (Some(tx), Some(conn_id)) =
-                                            (quic_probe_conn_id_tx.take(), self.mgr.connection_id)
-                                    {
-                                        let _ = tx.send(conn_id);
-                                    }
-                                }
                                 self.handle_session_events(events);
                             }
                             self.needs_render = true;
@@ -237,7 +240,6 @@ impl App {
                 }
                 upgrade = upgrade_rx.recv() => {
                     if let Some(signal) = upgrade {
-                        // Signal the new channel is ready, then apply the transport swap.
                         signal.sender.send(kmux_protocol::messages::ClientMessage::ChannelReady).ok();
                         self.mgr.apply_transport_upgrade(signal.sender, signal.new_kind);
                         self.needs_render = true;
@@ -245,9 +247,7 @@ impl App {
                 }
                 _ = liveness_tick.tick() => {
                     let now = Instant::now();
-                    // Send periodic client ping (no-op unless connected + due).
                     self.mgr.maybe_send_client_ping(now);
-                    // Declare timeout when the server stops responding.
                     if self.mgr.is_liveness_timed_out(now)
                         && !matches!(self.mode, Mode::Disconnected { .. })
                     {
@@ -257,12 +257,9 @@ impl App {
                     }
                 }
                 _ = render_tick.tick() => {
-                    // Periodic render for animations (cursor blink, HUD updates)
                     self.needs_render = true;
                 }
                 _ = metrics_flush_tick.tick() => {
-                    // Append one delta sample to the rolling JSONL sink.
-                    // No-op if persistence is disabled.
                     let conn_id = self.mgr.connection_id;
                     self.mgr.metrics.flush_sample(conn_id);
                 }
@@ -288,96 +285,44 @@ impl App {
     }
 
     /// Attempt to restore the connection using the current target (local,
-    /// SSH, or direct). Returns the oneshot sender carrying the
-    /// `ConnectionId` to the supervisor when SSH bootstrap set one up,
-    /// otherwise `None`. On failure, transitions to `Mode::Disconnected`
+    /// SSH, or direct). On failure, transitions to `Mode::Disconnected`
     /// with a bootstrap-failed reason.
     async fn attempt_reconnect(
         &mut self,
         new_tx: mpsc::UnboundedSender<ServerMessage>,
         upgrade_tx: mpsc::Sender<UpgradeSignal>,
         tunnel_died_tx: mpsc::Sender<()>,
-    ) -> Option<tokio::sync::oneshot::Sender<kmux_protocol::messages::ConnectionId>> {
+    ) {
         info!(
             connection_id = self.mgr.connection_id.map(|c| c.0),
             "reconnect requested",
         );
-        // Drop any lingering connection state (ws_sender, buffers) so the
-        // fresh handshake starts from a clean slate. `connection_id` is
-        // preserved inside SessionManager for server-side session resumption.
         self.mgr.prepare_reconnect();
-        // Show the intermediate state immediately so the user knows the
-        // keypress registered even before the handshake completes.
         self.mode = Mode::Normal;
         self.needs_render = true;
 
-        // Refresh the target before bootstrap so we don't dial a stale
-        // port/token (e.g. a `kmuxd --self-signed` that restarted on a new
-        // random port, or an SSH tunnel whose ephemeral local port moved).
-        let ssh_target = self.ssh_target.clone();
-        if let Some(target) = ssh_target {
-            self.mgr.set_status_msg("Reconnecting via SSH…".to_string());
-            match ssh::negotiate(&target).await {
-                Ok(new_ssh) => {
-                    let connection_id = self.mgr.connection_id;
-                    let conn_id_tx = self
-                        .connect_via_ssh_session(
-                            new_ssh,
-                            new_tx,
-                            upgrade_tx,
-                            tunnel_died_tx,
-                            connection_id,
-                        )
-                        .await;
-                    if conn_id_tx.is_none() {
-                        self.enter_disconnected(DisconnectReason::BootstrapFailed(
-                            "SSH TCP tunnel failed".into(),
-                        ));
-                    }
-                    conn_id_tx
-                }
-                Err(e) => {
-                    warn!("SSH re-negotiation failed: {e}");
-                    self.enter_disconnected(DisconnectReason::BootstrapFailed(format!("SSH: {e}")));
-                    None
-                }
+        let target = self.current_target();
+        let status_msg = match &target {
+            ResolvedTarget::Ssh { .. } => "Reconnecting via SSH…",
+            ResolvedTarget::LocalDaemon => "Reconnecting to local daemon…",
+            ResolvedTarget::Direct { .. } => "Reconnecting…",
+        };
+        self.mgr.set_status_msg(status_msg.to_string());
+
+        match self
+            .mgr
+            .connect(new_tx.clone(), target, &NoopObserver)
+            .await
+        {
+            Ok(Some(ctx)) => {
+                self.launch_ssh_supervisor(ctx, new_tx, upgrade_tx, tunnel_died_tx);
+                self.reflect_bootstrap_outcome();
             }
-        } else if self.is_local {
-            // Local daemon may have restarted on a different random port;
-            // re-query the control socket for the live port/token before
-            // dialling.
-            self.mgr
-                .set_status_msg("Reconnecting to local daemon…".to_string());
-            match kmux_client::daemon::ensure_daemon().await {
-                Ok(status) => {
-                    self.mgr.set_connection_params(
-                        "127.0.0.1".to_string(),
-                        status.port,
-                        status.token,
-                    );
-                    info!(port = status.port, "local daemon port refreshed");
-                    let events = self.mgr.connect(new_tx).await;
-                    self.handle_session_events(events);
-                    self.reflect_bootstrap_outcome();
-                }
-                Err(e) => {
-                    self.enter_disconnected(DisconnectReason::BootstrapFailed(format!(
-                        "daemon start failed: {e}"
-                    )));
-                }
+            Ok(None) => self.reflect_bootstrap_outcome(),
+            Err(e) => {
+                warn!("reconnect bootstrap failed: {e}");
+                self.enter_disconnected(DisconnectReason::BootstrapFailed(e.to_string()));
             }
-            None
-        } else {
-            self.mgr.set_connection_params(
-                self.connect_host.clone(),
-                self.connect_port.parse().unwrap_or(8443),
-                self.connect_token.clone(),
-            );
-            self.mgr.set_status_msg("Reconnecting…".to_string());
-            let events = self.mgr.connect(new_tx).await;
-            self.handle_session_events(events);
-            self.reflect_bootstrap_outcome();
-            None
         }
     }
 

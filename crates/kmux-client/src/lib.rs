@@ -19,6 +19,7 @@ pub mod input;
 pub mod key;
 pub mod liveness;
 pub mod metrics;
+pub mod pipeline;
 pub mod recovery;
 pub mod session_manager;
 pub mod ssh;

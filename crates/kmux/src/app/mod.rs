@@ -1,7 +1,8 @@
 use std::time::Instant;
 
+use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::session_manager::SessionManager;
-use kmux_client::ssh::{RemoteTarget, SshSession};
+use kmux_client::ssh::RemoteTarget;
 
 use crate::recent_servers::{RecentServersCache, ServerKind};
 use crate::theme::Theme;
@@ -92,47 +93,71 @@ pub struct App {
     /// Unique ID for this client process, written to the connection log on auth success.
     pub(super) instance_id: String,
 
-    /// Active SSH session (tunnel process + connection metadata) when in SSH mode.
-    /// Kept alive as long as the TCP transport is in use; dropped on QUIC upgrade.
-    pub(super) ssh_session: Option<SshSession>,
-
     /// SSH target stored for re-negotiation when the tunnel dies (SSH mode only).
     pub(super) ssh_target: Option<RemoteTarget>,
+
+    /// Target for the initial bootstrap. Consumed on the first connect.
+    pub(super) pending_target: Option<ResolvedTarget>,
 }
 
 impl App {
-    #[allow(clippy::too_many_arguments)]
     pub fn new(
-        host: String,
-        port: u16,
-        token: String,
-        accept_invalid_certs: bool,
-        is_local: bool,
+        target: ResolvedTarget,
         initial_cwd: String,
         theme: Theme,
         instance_id: String,
-        ssh_session: Option<SshSession>,
-        ssh_target: Option<RemoteTarget>,
         auto_session: Option<String>,
         auto_cwd: Option<String>,
     ) -> Self {
         use crate::mode::{ConnectField, Mode};
 
-        let connect_host = host.clone();
-        let connect_port = port.to_string();
-        let connect_token = token.clone();
+        let (is_local, connect_host, connect_port, connect_token, accept_invalid_certs, ssh_target) =
+            match &target {
+                ResolvedTarget::LocalDaemon => (
+                    true,
+                    "127.0.0.1".to_string(),
+                    String::new(),
+                    String::new(),
+                    true,
+                    None,
+                ),
+                ResolvedTarget::Direct {
+                    host,
+                    port,
+                    token,
+                    accept_invalid_certs,
+                } => (
+                    false,
+                    host.clone(),
+                    port.to_string(),
+                    token.clone(),
+                    *accept_invalid_certs,
+                    None,
+                ),
+                ResolvedTarget::Ssh {
+                    target,
+                    accept_invalid_certs,
+                } => (
+                    false,
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    *accept_invalid_certs,
+                    Some(target.clone()),
+                ),
+            };
 
-        let initial_mode = if token.is_empty() {
-            Mode::Connect {
+        // Direct-with-no-token is the only case that needs the Connect form;
+        // every other path (Local, SSH, Direct with token) is ready to bootstrap.
+        let initial_mode = match &target {
+            ResolvedTarget::Direct { token, .. } if token.is_empty() => Mode::Connect {
                 field: ConnectField::Host,
-            }
-        } else {
-            Mode::Normal
+            },
+            _ => Mode::Normal,
         };
 
         let capabilities = crate::host_caps::detect();
 
-        // Compute server display label and cache key from connection parameters.
         let (server_display, server_string, server_kind) = if is_local {
             ("localhost".to_string(), String::new(), ServerKind::Local)
         } else if let Some(ref t) = ssh_target {
@@ -147,18 +172,28 @@ impl App {
             };
             (display.clone(), display, kind)
         } else {
-            let s = format!("{}:{}", host, port);
+            let port_num: u16 = connect_port.parse().unwrap_or(8443);
+            let s = format!("{}:{}", connect_host, port_num);
             (
                 s.clone(),
                 s,
                 ServerKind::Direct {
-                    host: host.clone(),
-                    port,
+                    host: connect_host.clone(),
+                    port: port_num,
                 },
             )
         };
 
-        let mut mgr = SessionManager::new(host, port, token, accept_invalid_certs, capabilities);
+        // Seed SessionManager with placeholder host/port/token. `apply_outcome`
+        // overwrites these when the bootstrap completes.
+        let port_num: u16 = connect_port.parse().unwrap_or(0);
+        let mut mgr = SessionManager::new(
+            connect_host.clone(),
+            port_num,
+            connect_token.clone(),
+            accept_invalid_certs,
+            capabilities,
+        );
         mgr.enable_metrics_persistence();
 
         Self {
@@ -189,8 +224,8 @@ impl App {
             recent_servers: RecentServersCache::load(),
             needs_render: true,
             instance_id,
-            ssh_session,
             ssh_target,
+            pending_target: Some(target),
             auto_session,
             auto_cwd,
         }

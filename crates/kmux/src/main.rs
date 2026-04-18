@@ -24,7 +24,9 @@ use tracing_subscriber::EnvFilter;
 use app::App;
 use cli::{Cli, Command};
 use kmux_client::generate_instance_id;
-use subcommands::{ListSessionsConfig, resolve_connection, run_daemon_command, run_list_sessions};
+use subcommands::{
+    ListSessionsConfig, parse_target, run_daemon_command, run_dry_run, run_list_sessions,
+};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -89,6 +91,14 @@ async fn async_main() -> anyhow::Result<()> {
         None => {}
     }
 
+    // Diagnostic modes short-circuit TUI setup entirely.
+    if cli.connect.dry_run && cli.connect.test {
+        eprintln!("warning: --test implies --dry-run; running in --test mode.");
+    }
+    if cli.connect.dry_run || cli.connect.test {
+        return run_dry_run(&cli.connect.server_args, cli.connect.test).await;
+    }
+
     // ── Default: connect and launch TUI ──────────────────────────────────────
 
     // Capture the client's working directory before doing anything else.
@@ -97,7 +107,7 @@ async fn async_main() -> anyhow::Result<()> {
         .and_then(|p| p.to_str().map(|s| s.to_string()))
         .unwrap_or_default();
 
-    let conn = resolve_connection(
+    let (target, parsed_server) = parse_target(
         cli.connect.server_args.server.as_deref(),
         cli.connect.server_args.ssh_port,
         cli.connect.server_args.no_ssh,
@@ -105,14 +115,13 @@ async fn async_main() -> anyhow::Result<()> {
         cli.connect.server_args.port,
         cli.connect.server_args.token.as_deref(),
         cli.connect.server_args.accept_invalid_certs,
-    )
-    .await?;
+    );
 
     // Compute effective cwd: explicit --cwd > :path from server string > local cwd
     let auto_cwd = cli
         .connect
         .cwd
-        .or_else(|| conn.parsed_server.as_ref().and_then(|p| p.path.clone()));
+        .or_else(|| parsed_server.as_ref().and_then(|p| p.path.clone()));
 
     // Setup terminal
     enable_raw_mode()?;
@@ -132,16 +141,10 @@ async fn async_main() -> anyhow::Result<()> {
     let theme = config::resolve_theme(cli.theme.as_deref());
 
     let mut app = App::new(
-        conn.host,
-        conn.port,
-        conn.token,
-        conn.accept_invalid_certs,
-        conn.is_local,
+        target,
         initial_cwd,
         theme,
         instance_id.clone(),
-        conn.ssh_session,
-        conn.ssh_target,
         cli.connect.session,
         auto_cwd,
     );

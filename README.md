@@ -9,6 +9,7 @@ from a native desktop GUI.
 TODO
 
 - [x] Linux and macOS support (no Windows for now)
+- [x] `--dry-run` / `--test` connection diagnostics — trace the real bootstrap, verify with ping, exit. See [docs/connection.md](docs/connection.md#dry-run-diagnostics---dry-run---test).
 
 ## Architecture
 

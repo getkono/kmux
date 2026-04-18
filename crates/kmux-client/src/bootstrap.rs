@@ -38,7 +38,7 @@ use tracing::{debug, info, warn};
 /// 4. On success: forward the full `AuthResult` intact via `server_tx` so that
 ///    `SessionManager` sees `client_id`, `server_version`, and `connection_id`.
 /// 5. Return `(connection_id, server_endpoints)`.
-async fn do_auth_handshake_forward<W, R>(
+pub(crate) async fn perform_auth_handshake<W, R>(
     write_half: &mut W,
     read_half: &mut R,
     token: String,
@@ -142,7 +142,7 @@ impl Bootstrap for UdsLocalBootstrap {
 
             let (mut read_half, mut write_half) = tokio::io::split(stream);
 
-            let (conn_id, server_endpoints) = do_auth_handshake_forward(
+            let (conn_id, server_endpoints) = perform_auth_handshake(
                 &mut write_half,
                 &mut read_half,
                 status.token.clone(),

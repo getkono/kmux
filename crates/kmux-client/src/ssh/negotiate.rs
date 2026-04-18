@@ -35,7 +35,8 @@ pub async fn negotiate(target: &RemoteTarget) -> Result<SshSession, SshError> {
     }
 
     let stdout = String::from_utf8_lossy(&probe_output.stdout);
-    let info: ProbeInfo = serde_json::from_str(stdout.trim())
+    let probe_json = stdout.trim().to_string();
+    let info: ProbeInfo = serde_json::from_str(&probe_json)
         .map_err(|e| SshError::DaemonStartFailed(format!("bad JSON from probe-or-start: {e}")))?;
 
     // Version gate: if the server reports its protocol_version, it must match.
@@ -105,6 +106,7 @@ pub async fn negotiate(target: &RemoteTarget) -> Result<SshSession, SshError> {
         local_tcp_port: local_port,
         remote_host: target.host.clone(),
         tunnel_process: tunnel,
+        probe_json,
     })
 }
 

@@ -34,6 +34,7 @@ This document is the technical reference for the kmux connection subsystem as im
 13. [Explicit Decision Table](#explicit-decision-table)
 14. [Sequence Diagrams](#sequence-diagrams)
 15. [Troubleshooting](#troubleshooting)
+    - [Dry-run diagnostics (`--dry-run`, `--test`)](#dry-run-diagnostics---dry-run---test)
 16. [Key File Index](#key-file-index)
 
 ---
@@ -572,6 +573,40 @@ lifecycle.
 | TLS fingerprint mismatch | Server cert rotated | Delete the stale entry from `~/.config/kmux/known_hosts.toml` |
 | All transports fail | No network path | Check firewall; verify `kmuxd` is listening on correct ports |
 | Sessions lost after restart | Checkpoint failed | Check disk space; `$XDG_DATA_HOME/kmux/session_state.bin` |
+
+### Dry-run diagnostics (`--dry-run`, `--test`)
+
+When a connection misbehaves, re-run with one of these flags to print a
+step-by-step trace of the bootstrap on stdout and exit. Both flags run the
+*same* [`run_bootstrap`](../crates/kmux-client/src/pipeline.rs) code path
+that the TUI uses — a successful `--dry-run` therefore proves the real
+flow works, and a failure shows exactly which step failed.
+
+| Flag | Behavior |
+|------|----------|
+| `--dry-run` / `-n` | Runs the bootstrap, sends one `Ping`, expects `Pong` within 5 s, prints `[RESULT]`, exits. |
+| `--test` | Superset of `--dry-run`: additionally runs the live `TransportSupervisor` for 10 s so transport scoring and any hot-swap upgrade are observable. |
+| `--dry-run --test` | Prints `warning: --test implies --dry-run` on stderr and behaves as `--test`. |
+
+Sample output for `kmux --dry-run` against a local daemon:
+
+```
+kmux dry-run for local-daemon
+[PARSE     ] target=local-daemon (0.00s)
+[DAEMON    ] querying control socket /run/user/1000/kmux/daemon.sock (0.00s)
+[DAEMON    ] already running pid=12345 quic_port=8443 tcp_port=8444 (0.00s)
+[HANDSHAKE ] quic 127.0.0.1:8443 (0.01s)
+[AUTH     ] Auth sent (protocol=13, conn_id=None) (0.02s)
+[AUTH     ] AuthResult success=true conn_id=42 server_version=0.1.0 (0.03s)
+[PING     ] seq=0; waiting up to 5s (0.03s)
+[PING     ] OK - RTT 0.42 ms (0.03s)
+[RESULT   ] connected via quic; bootstrap 32 ms, ping 0.42 ms (0.03s)
+```
+
+The raw `kmuxd probe-or-start` JSON is printed verbatim for SSH targets,
+with `"token":"..."` automatically redacted to `"token":"***"`. New
+observer events can be added at `pipeline::BootstrapEvent` without
+breaking existing consumers — the enum is `#[non_exhaustive]`.
 
 ---
 

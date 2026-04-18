@@ -99,6 +99,10 @@ impl SessionManager {
         self.accept_invalid_certs
     }
 
+    pub fn token(&self) -> &str {
+        &self.token
+    }
+
     pub fn active_session_panes(&self) -> &[PaneInfo] {
         self.active_session
             .as_ref()
