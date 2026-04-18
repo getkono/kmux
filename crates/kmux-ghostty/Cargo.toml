@@ -1,0 +1,12 @@
+[package]
+name = "kmux-ghostty"
+version = "0.1.0"
+edition = "2024"
+description = "Safe Rust façade over libkmux_ghostty (Zig-based libghostty-vt wrapper)."
+publish = false
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+kmux-ghostty-sys.workspace = true

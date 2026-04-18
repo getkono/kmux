@@ -1,0 +1,15 @@
+[package]
+name = "kmux-ghostty-sys"
+version = "0.1.0"
+edition = "2024"
+description = "Raw FFI bindings to libkmux_ghostty (Zig wrapper over libghostty-vt)."
+publish = false
+links = "kmux_ghostty"
+build = "build.rs"
+
+[lib]
+path = "src/lib.rs"
+
+[dependencies]
+
+[build-dependencies]

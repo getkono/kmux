@@ -7,6 +7,8 @@ resolver = "2"
 kmux-pty = { path = "crates/kmux-pty" }
 kmux-protocol = { path = "crates/kmux-protocol" }
 kmux-client = { path = "crates/kmux-client" }
+kmux-ghostty-sys = { path = "crates/kmux-ghostty-sys" }
+kmux-ghostty = { path = "crates/kmux-ghostty" }
 
 # External dependencies
 anyhow = "1"

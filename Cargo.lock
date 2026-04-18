@@ -1458,6 +1458,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmux-ghostty"
+version = "0.1.0"
+dependencies = [
+ "kmux-ghostty-sys",
+]
+
+[[package]]
+name = "kmux-ghostty-sys"
+version = "0.1.0"
+
+[[package]]
 name = "kmux-protocol"
 version = "0.1.0"
 dependencies = [

@@ -18,3 +18,9 @@ target
 # Added by cargo
 
 /target
+
+# === Zig ===
+# Build caches produced by `zig build` outside of $OUT_DIR (e.g. when the
+# wrapper is invoked manually from crates/kmux-ghostty-sys/zig/ for spikes).
+.zig-cache/
+zig-out/
