@@ -303,7 +303,12 @@ impl BootstrapObserver for ConsoleObserver {
                 host,
                 port,
             } => {
-                self.line("HANDSHAKE", format!("{} {}:{}", transport, host, port));
+                let addr = if *port > 0 {
+                    format!("{}:{}", host, port)
+                } else {
+                    host.to_string()
+                };
+                self.line("HANDSHAKE", format!("{} {}", transport, addr));
             }
             BootstrapEvent::HandshakeAuthSent {
                 protocol_version,

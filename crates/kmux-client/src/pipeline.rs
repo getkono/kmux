@@ -397,7 +397,7 @@ async fn prepare_local_daemon(
     }
 
     Ok(ConnectPlan {
-        transport: TransportKind::Quic,
+        transport: TransportKind::Uds,
         host: "127.0.0.1".to_string(),
         port: status.port,
         token: status.token,
@@ -471,10 +471,19 @@ async fn establish(
     outer_tx: mpsc::UnboundedSender<ServerMessage>,
     observer: &dyn BootstrapObserver,
 ) -> Result<(mpsc::UnboundedSender<ClientMessage>, AuthOutcome), BootstrapError> {
+    let uds_path_str;
+    let (hs_host, hs_port): (&str, u16) = if plan.transport == TransportKind::Uds {
+        uds_path_str = kmux_protocol::dirs::data_socket_path()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|_| "?".to_string());
+        (&uds_path_str, 0)
+    } else {
+        (&plan.host, plan.port)
+    };
     observer.on_event(&BootstrapEvent::HandshakeStarting {
         transport: plan.transport,
-        host: &plan.host,
-        port: plan.port,
+        host: hs_host,
+        port: hs_port,
     });
 
     let (intercept_tx, mut intercept_rx) = mpsc::unbounded_channel::<ServerMessage>();
