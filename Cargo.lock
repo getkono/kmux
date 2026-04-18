@@ -1462,6 +1462,9 @@ name = "kmux-ghostty"
 version = "0.1.0"
 dependencies = [
  "kmux-ghostty-sys",
+ "kmux-protocol",
+ "static_assertions",
+ "thiserror 2.0.18",
 ]
 
 [[package]]

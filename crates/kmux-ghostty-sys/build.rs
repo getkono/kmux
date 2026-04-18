@@ -31,9 +31,15 @@ fn main() {
     let zig = resolve_zig();
     verify_zig_version(&zig);
 
+    // The Zig side is vendored dependency code (libghostty-vt + SIMD C++),
+    // not kmux application logic. Building it in `Debug` pulls in the UBSan
+    // runtime (`__ubsan_handle_divrem_overflow`, etc.) which rust-lld then
+    // fails to resolve. Use `ReleaseSafe` for dev builds (keeps runtime
+    // safety checks but drops the UBSan handler dependency) and `ReleaseFast`
+    // for release builds.
     let optimize = match env::var("PROFILE").as_deref() {
         Ok("release") => "ReleaseFast",
-        _ => "Debug",
+        _ => "ReleaseSafe",
     };
 
     let install_prefix = out_dir.join("install");
@@ -57,11 +63,21 @@ fn main() {
         panic!("`zig build` for libkmux_ghostty failed (exit: {status:?})");
     }
 
-    println!(
-        "cargo:rustc-link-search=native={}",
-        install_prefix.join("lib").display()
-    );
-    println!("cargo:rustc-link-lib=static=kmux_ghostty");
+    let lib_dir = install_prefix.join("lib");
+    println!("cargo:rustc-link-search=native={}", lib_dir.display());
+    println!("cargo:rustc-link-lib=dylib=kmux_ghostty");
+
+    // Embed the install `lib` dir as an rpath so downstream binaries (kmuxd,
+    // tests) find `libkmux_ghostty.so` without `LD_LIBRARY_PATH`. Note that
+    // this path lives under `target/<profile>/build/.../out/install/lib` —
+    // it stays valid for local development, CI, and `cargo test`. Release
+    // packaging must re-link against the shipped `.so` location.
+    println!("cargo:rustc-link-arg=-Wl,-rpath,{}", lib_dir.display());
+
+    // Re-export the library path so integration tests and downstream crates
+    // (e.g. kmuxd unit tests) can locate it if they bypass cargo's rpath
+    // plumbing. Consumed only by dev tooling.
+    println!("cargo:lib_dir={}", lib_dir.display());
 }
 
 fn require_submodule(ghostty_dir: &Path) {
