@@ -82,13 +82,23 @@ impl RecentServersCache {
         Some(Self { servers })
     }
 
-    /// Persist the cache to disk (errors are silently ignored).
+    /// Persist the cache to disk without blocking the caller.
+    ///
+    /// Errors are silently ignored — cache loss is non-fatal.
     pub fn save(&self) {
-        if let Ok(path) = kmux_protocol::dirs::state_dir().map(|d| d.join(CACHE_FILE))
-            && let Ok(data) = serde_json::to_string_pretty(&self.servers)
-        {
+        let path = match kmux_protocol::dirs::state_dir().map(|d| d.join(CACHE_FILE)) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::trace!("Cache error {e:?}");
+                return;
+            }
+        };
+        let Ok(data) = serde_json::to_string_pretty(&self.servers) else {
+            return;
+        };
+        tokio::task::spawn_blocking(move || {
             let _ = std::fs::write(path, data);
-        }
+        });
     }
 
     /// Record a successful connection. Upserts by `server_string`, bumps `last_used`,

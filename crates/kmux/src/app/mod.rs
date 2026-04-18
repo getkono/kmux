@@ -3,12 +3,16 @@ use std::time::Instant;
 use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::session_manager::SessionManager;
 use kmux_client::ssh::RemoteTarget;
+use kmux_protocol::messages::ServerMessage;
+use tokio::sync::{mpsc, oneshot};
 
 use crate::recent_servers::{RecentServersCache, ServerKind};
 use crate::theme::Theme;
 
+mod event_batch;
 mod event_loop;
 mod helpers;
+mod input_coalesce;
 mod key_handler;
 mod mouse_handler;
 
@@ -89,6 +93,17 @@ pub struct App {
     pub recent_servers: RecentServersCache,
 
     pub(super) needs_render: bool,
+
+    /// Sender side of the paste channel; wired up by `App::run`.
+    /// Clipboard reads run on a blocking thread and result arrives here.
+    pub(super) paste_tx: Option<mpsc::UnboundedSender<String>>,
+
+    /// Drop to cancel an in-progress background bootstrap.
+    pub(super) cancel_tx: Option<oneshot::Sender<()>>,
+
+    /// Clone of the server-message sender for the active bootstrap channel.
+    /// Used by `launch_ssh_supervisor` after a successful SSH bootstrap.
+    pub(super) pending_srv_tx: Option<mpsc::UnboundedSender<ServerMessage>>,
 
     /// Unique ID for this client process, written to the connection log on auth success.
     pub(super) instance_id: String,
@@ -223,6 +238,9 @@ impl App {
             server_picker_search: String::new(),
             recent_servers: RecentServersCache::load(),
             needs_render: true,
+            paste_tx: None,
+            cancel_tx: None,
+            pending_srv_tx: None,
             instance_id,
             ssh_target,
             pending_target: Some(target),

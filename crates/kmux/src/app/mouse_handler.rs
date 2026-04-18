@@ -42,6 +42,18 @@ impl App {
         }
     }
 
+    /// Apply a signed scroll delta to a pane in local scrollback mode.
+    /// Positive = scroll up (towards history), negative = scroll down.
+    pub(super) fn apply_local_scroll_delta(&mut self, pane_id: &str, delta: i32) {
+        if let Some(grid) = self.mgr.buffer_mut(pane_id) {
+            if delta > 0 {
+                grid.scroll_up(delta as usize);
+            } else if delta < 0 {
+                grid.scroll_down((-delta) as usize);
+            }
+        }
+    }
+
     fn scroll_pane(&mut self, pane_id: &str, col: u16, row: u16, lines: i32) {
         let use_pty = self
             .mgr

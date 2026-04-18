@@ -239,12 +239,18 @@ impl App {
             }
             Action::CopySelection => {
                 if let Some(text) = self.mgr.active_grid().and_then(|g| g.selected_text()) {
-                    let _ = cli_clipboard::set_contents(text);
+                    tokio::task::spawn_blocking(move || {
+                        let _ = cli_clipboard::set_contents(text);
+                    });
                 }
             }
             Action::Paste => {
-                if let Ok(text) = cli_clipboard::get_contents() {
-                    self.mgr.send_paste(text);
+                if let Some(tx) = self.paste_tx.clone() {
+                    tokio::task::spawn_blocking(move || {
+                        if let Ok(text) = cli_clipboard::get_contents() {
+                            let _ = tx.send(text);
+                        }
+                    });
                 }
             }
             Action::ConnectSubmit => {
@@ -352,6 +358,11 @@ impl App {
                 }
             }
             Action::DirPickerCancel => {}
+            Action::CancelBootstrap => {
+                // Dropping the sender triggers the oneshot in the bootstrap task,
+                // which causes it to abort. The outcome arm handles the None.
+                let _ = self.cancel_tx.take();
+            }
             Action::Quit => {
                 return KeyResult::Quit;
             }

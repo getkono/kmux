@@ -1,9 +1,11 @@
 use std::time::{Duration, Instant};
 
-use crossterm::event::{Event, EventStream};
+use super::input_coalesce;
+
+use crossterm::event::EventStream;
 use futures::StreamExt;
 use kmux_client::connection_state::DisconnectReason;
-use kmux_client::pipeline::{NoopObserver, ResolvedTarget};
+use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::supervisor::UpgradeSignal;
 use kmux_client::transport::TransportKind;
 use kmux_protocol::messages::ServerMessage;
@@ -17,7 +19,7 @@ use crate::recent_servers::ServerKind;
 use crate::ui;
 use kmux_protocol::messages::TermSize;
 
-use super::helpers::BootstrapPhase;
+use super::helpers::{BootstrapPhase, BootstrapTaskResult};
 use super::{App, KeyResult, SwitchTarget};
 
 /// How often to re-check liveness (ping cadence + timeout evaluation).
@@ -25,10 +27,13 @@ const LIVENESS_TICK: Duration = Duration::from_secs(1);
 /// How often to append one metrics sample to the rolling JSONL file.
 /// Must match the cadence documented in `docs/metrics.md`.
 const METRICS_FLUSH_TICK: Duration = Duration::from_secs(10);
-/// Debounce window for terminal resize events. SIGWINCH fires continuously
-/// during a window drag; coalescing into one resize after the burst settles
-/// avoids flooding the server with snapshot fan-outs.
-const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
+/// Minimum interval between redraws. Caps effective render rate at ~60 FPS and
+/// prevents individual input events from each blocking behind a full `terminal.draw`.
+const RENDER_MIN_INTERVAL: Duration = Duration::from_millis(16);
+/// Debounce window for terminal resize events; must match `event_batch::RESIZE_DEBOUNCE_MS`.
+/// SIGWINCH fires continuously during a window drag; coalescing into one resize after the
+/// burst settles avoids flooding the server with snapshot fan-outs.
+pub(super) const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
 
 impl App {
     pub async fn run(
@@ -41,12 +46,19 @@ impl App {
         let (upgrade_tx, mut upgrade_rx) = mpsc::channel::<UpgradeSignal>(1);
         // SSH tunnel health: signals when the SSH tunnel process exits unexpectedly.
         let (tunnel_died_tx, mut tunnel_died_rx) = mpsc::channel::<()>(1);
+        // Clipboard reads run on spawn_blocking; paste text arrives here.
+        let (paste_tx, mut paste_rx) = mpsc::unbounded_channel::<String>();
+        self.paste_tx = Some(paste_tx);
 
         // Seed the session manager with the initial terminal size so the first
         // Attach carries the real dimensions rather than the default 24×80.
         self.mgr.update_term_size(Self::current_term_size());
 
-        // Initial bootstrap: if the parsed target is actionable, run the pipeline.
+        // Bootstrap outcome channel — replaced whenever a new bootstrap is kicked off.
+        // `None` pends forever so the select! arm is dormant when no bootstrap is running.
+        let mut bootstrap_rx: Option<mpsc::UnboundedReceiver<BootstrapTaskResult>> = None;
+
+        // Initial bootstrap: if the parsed target is actionable, spawn the pipeline.
         // Direct-without-token leaves `pending_target` set but enters the Connect
         // form; the user submits that to produce a `Reconnect`.
         if let Some(target) = self.pending_target.take() {
@@ -55,14 +67,9 @@ impl App {
                 _ => true,
             };
             if actionable {
-                self.run_bootstrap(
-                    target,
-                    srv_tx.clone(),
-                    upgrade_tx.clone(),
-                    tunnel_died_tx.clone(),
-                    BootstrapPhase::Initial,
-                )
-                .await;
+                let (bs_tx, bs_rx) = mpsc::unbounded_channel();
+                bootstrap_rx = Some(bs_rx);
+                self.start_bootstrap(target, srv_tx.clone(), BootstrapPhase::Initial, bs_tx);
             }
         }
 
@@ -78,27 +85,48 @@ impl App {
         let mut pending_resize: Option<TermSize> = None;
         let mut resize_deadline: Option<tokio::time::Instant> = None;
 
+        // Allow the first frame to draw immediately.
+        let mut last_draw = Instant::now()
+            .checked_sub(RENDER_MIN_INTERVAL)
+            .unwrap_or_else(Instant::now);
+
         loop {
-            if self.needs_render {
+            if self.needs_render && last_draw.elapsed() >= RENDER_MIN_INTERVAL {
                 terminal.draw(|f| ui::render(f, self))?;
                 self.needs_render = false;
+                last_draw = Instant::now();
             }
 
             tokio::select! {
                 event = event_stream.next() => {
                     match event {
-                        Some(Ok(Event::Key(key_event))) => {
-                            match self.handle_key(key_event).await {
+                        Some(Ok(first_event)) => {
+                            let batch = input_coalesce::drain_events(
+                                &mut event_stream,
+                                first_event,
+                            );
+                            let result = self
+                                .process_input_batch(
+                                    batch,
+                                    &mut pending_resize,
+                                    &mut resize_deadline,
+                                )
+                                .await;
+                            match result {
                                 KeyResult::Quit => return Ok(()),
                                 KeyResult::Reconnect => {
                                     let (new_tx, new_rx) = mpsc::unbounded_channel();
                                     srv_rx = new_rx;
-                                    self.attempt_reconnect(
+                                    let (bs_tx, bs_rx) = mpsc::unbounded_channel();
+                                    bootstrap_rx = Some(bs_rx);
+                                    let target = self.current_target();
+                                    self.start_bootstrap(
+                                        target,
                                         new_tx,
-                                        upgrade_tx.clone(),
-                                        tunnel_died_tx.clone(),
-                                    )
-                                    .await;
+                                        BootstrapPhase::Reconnect,
+                                        bs_tx,
+                                    );
+                                    self.needs_render = true;
                                 }
                                 KeyResult::SwitchServer(target) => {
                                     let (new_tx, new_rx) = mpsc::unbounded_channel();
@@ -112,22 +140,14 @@ impl App {
                                             self.server_display = "localhost".to_string();
                                             self.server_string = String::new();
                                             self.server_kind = ServerKind::Local;
-                                            self.mgr
-                                                .set_status_msg("Connecting to local daemon…".to_string());
-                                            match self
-                                                .mgr
-                                                .connect(
-                                                    new_tx.clone(),
-                                                    ResolvedTarget::LocalDaemon,
-                                                    &NoopObserver,
-                                                )
-                                                .await
-                                            {
-                                                Ok(_) => self.reflect_bootstrap_outcome(),
-                                                Err(e) => self.enter_disconnected(
-                                                    DisconnectReason::BootstrapFailed(e.to_string()),
-                                                ),
-                                            }
+                                            let (bs_tx, bs_rx) = mpsc::unbounded_channel();
+                                            bootstrap_rx = Some(bs_rx);
+                                            self.start_bootstrap(
+                                                ResolvedTarget::LocalDaemon,
+                                                new_tx,
+                                                BootstrapPhase::Initial,
+                                                bs_tx,
+                                            );
                                         }
                                         SwitchTarget::Ssh(target) => {
                                             let display = match &target.user {
@@ -143,39 +163,19 @@ impl App {
                                             };
                                             self.is_local = false;
                                             self.ssh_target = Some(target.clone());
-                                            self.mgr.set_status_msg("Connecting via SSH…".to_string());
-                                            let accept_invalid_certs = self.mgr.accept_invalid_certs();
-                                            match self
-                                                .mgr
-                                                .connect(
-                                                    new_tx.clone(),
-                                                    ResolvedTarget::Ssh {
-                                                        target,
-                                                        accept_invalid_certs,
-                                                    },
-                                                    &NoopObserver,
-                                                )
-                                                .await
-                                            {
-                                                Ok(Some(ctx)) => {
-                                                    self.launch_ssh_supervisor(
-                                                        ctx,
-                                                        new_tx.clone(),
-                                                        upgrade_tx.clone(),
-                                                        tunnel_died_tx.clone(),
-                                                    );
-                                                    self.reflect_bootstrap_outcome();
-                                                }
-                                                Ok(None) => self.reflect_bootstrap_outcome(),
-                                                Err(e) => {
-                                                    warn!("SSH switch failed: {e}");
-                                                    self.enter_disconnected(
-                                                        DisconnectReason::BootstrapFailed(
-                                                            e.to_string(),
-                                                        ),
-                                                    );
-                                                }
-                                            }
+                                            let accept_invalid_certs =
+                                                self.mgr.accept_invalid_certs();
+                                            let (bs_tx, bs_rx) = mpsc::unbounded_channel();
+                                            bootstrap_rx = Some(bs_rx);
+                                            self.start_bootstrap(
+                                                ResolvedTarget::Ssh {
+                                                    target,
+                                                    accept_invalid_certs,
+                                                },
+                                                new_tx,
+                                                BootstrapPhase::Initial,
+                                                bs_tx,
+                                            );
                                         }
                                         SwitchTarget::Direct { host, port } => {
                                             self.connect_host = host.clone();
@@ -191,22 +191,14 @@ impl App {
                                             };
                                         }
                                     }
+                                    self.needs_render = true;
                                 }
-                                KeyResult::Continue => {}
+                                KeyResult::Continue => {
+                                    // needs_render already set by process_input_batch
+                                }
                             }
-                            self.needs_render = true;
-                        }
-                        Some(Ok(Event::Mouse(mouse_event))) => {
-                            self.handle_mouse(mouse_event);
-                            self.needs_render = true;
-                        }
-                        Some(Ok(Event::Resize(cols, rows))) => {
-                            pending_resize = Some(App::compute_pane_size(rows, cols));
-                            resize_deadline = Some(tokio::time::Instant::now() + RESIZE_DEBOUNCE);
-                            self.needs_render = true;
                         }
                         Some(Err(_)) | None => break,
-                        _ => {}
                     }
                 }
                 msg = srv_rx.recv(), if !matches!(self.mode, Mode::Disconnected { .. }) => {
@@ -224,10 +216,57 @@ impl App {
                             self.needs_render = true;
                         }
                         None => {
-                            if !matches!(self.mode, Mode::Disconnected { .. }) {
+                            // In Connecting mode the bootstrap task handles failures;
+                            // don't double-transition to Disconnected here.
+                            if !matches!(self.mode, Mode::Disconnected { .. } | Mode::Connecting { .. }) {
                                 self.enter_disconnected(DisconnectReason::ServerClosed);
                                 self.needs_render = true;
                             }
+                        }
+                    }
+                }
+                bootstrap_result = async {
+                    match bootstrap_rx.as_mut() {
+                        Some(rx) => rx.recv().await,
+                        None => std::future::pending().await,
+                    }
+                }, if matches!(self.mode, Mode::Connecting { .. }) => {
+                    match bootstrap_result {
+                        Some(BootstrapTaskResult::Success(outcome)) => {
+                            self.cancel_tx = None;
+                            let ssh_ctx = self.mgr.apply_outcome(*outcome);
+                            if let Some(ctx) = ssh_ctx {
+                                let srv_tx_clone = self.pending_srv_tx.take()
+                                    .expect("pending_srv_tx set in start_bootstrap");
+                                self.launch_ssh_supervisor(
+                                    ctx,
+                                    srv_tx_clone,
+                                    upgrade_tx.clone(),
+                                    tunnel_died_tx.clone(),
+                                );
+                            } else {
+                                self.pending_srv_tx = None;
+                            }
+                            self.reflect_bootstrap_outcome();
+                            bootstrap_rx = None;
+                            self.needs_render = true;
+                        }
+                        Some(BootstrapTaskResult::Failed(reason)) => {
+                            self.cancel_tx = None;
+                            self.pending_srv_tx = None;
+                            bootstrap_rx = None;
+                            self.enter_disconnected(DisconnectReason::BootstrapFailed(reason));
+                            self.needs_render = true;
+                        }
+                        None => {
+                            // Bootstrap was cancelled (cancel_tx dropped) or unexpected close.
+                            self.cancel_tx = None;
+                            self.pending_srv_tx = None;
+                            bootstrap_rx = None;
+                            self.enter_disconnected(DisconnectReason::BootstrapFailed(
+                                "cancelled".to_string(),
+                            ));
+                            self.needs_render = true;
                         }
                     }
                 }
@@ -248,11 +287,20 @@ impl App {
                         self.needs_render = true;
                     }
                 }
+                paste_text = paste_rx.recv() => {
+                    if let Some(text) = paste_text {
+                        self.mgr.send_paste(text);
+                        self.needs_render = true;
+                    }
+                }
                 _ = liveness_tick.tick() => {
                     let now = Instant::now();
                     self.mgr.maybe_send_client_ping(now);
                     if self.mgr.is_liveness_timed_out(now)
-                        && !matches!(self.mode, Mode::Disconnected { .. })
+                        && !matches!(
+                            self.mode,
+                            Mode::Disconnected { .. } | Mode::Connecting { .. }
+                        )
                     {
                         warn!("Liveness timeout; freezing session");
                         self.enter_disconnected(DisconnectReason::PingTimeout);
@@ -299,27 +347,7 @@ impl App {
         self.mode = Mode::Disconnected { reason: reason_str };
     }
 
-    /// Attempt to restore the connection using the current target (local,
-    /// SSH, or direct). On failure, transitions to `Mode::Disconnected`
-    /// with a bootstrap-failed reason.
-    async fn attempt_reconnect(
-        &mut self,
-        new_tx: mpsc::UnboundedSender<ServerMessage>,
-        upgrade_tx: mpsc::Sender<UpgradeSignal>,
-        tunnel_died_tx: mpsc::Sender<()>,
-    ) {
-        let target = self.current_target();
-        self.run_bootstrap(
-            target,
-            new_tx,
-            upgrade_tx,
-            tunnel_died_tx,
-            BootstrapPhase::Reconnect,
-        )
-        .await;
-    }
-
-    /// After `mgr.connect()` settles, mirror the manager's connection state
+    /// After the bootstrap outcome arm settles, mirror the manager's connection state
     /// into the TUI mode. On failure, show the disconnect overlay again with
     /// the bootstrap error that `mgr.connect` recorded.
     pub(super) fn reflect_bootstrap_outcome(&mut self) {

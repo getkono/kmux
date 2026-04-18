@@ -37,6 +37,8 @@ pub enum Mode {
     Connect { field: ConnectField },
     /// Directory picker for remote connections: type a path to open/create a session
     DirectoryPicker,
+    /// Background bootstrap in progress. Input is held; Esc cancels.
+    Connecting { target_display: String },
     /// Connection dropped. Input to panes is frozen; the overlay asks the
     /// user to confirm a reconnect.
     Disconnected { reason: String },
@@ -127,6 +129,9 @@ pub enum Action {
     DirPickerSubmit,
     DirPickerCancel,
 
+    // Cancel an in-progress background bootstrap.
+    CancelBootstrap,
+
     // Quit the application
     Quit,
 
@@ -158,6 +163,7 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::Help => resolve_help(key),
         Mode::Connect { field } => resolve_connect(key, mods, field),
         Mode::DirectoryPicker => resolve_dir_picker(key),
+        Mode::Connecting { .. } => resolve_connecting(key, mods),
         Mode::Disconnected { .. } => resolve_disconnected(key),
     }
 }

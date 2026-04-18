@@ -2,7 +2,7 @@ mod disconnect;
 mod help;
 mod metrics;
 mod pickers;
-pub(super) use disconnect::render_disconnect_overlay;
+pub(super) use disconnect::{render_connecting_overlay, render_disconnect_overlay};
 pub(super) use help::{
     render_confirm_overlay, render_help_overlay, render_hud, render_rename_overlay,
 };

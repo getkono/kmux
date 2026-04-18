@@ -1,5 +1,4 @@
-use kmux_client::connection_state::DisconnectReason;
-use kmux_client::pipeline::{NoopObserver, ResolvedTarget, SshContext};
+use kmux_client::pipeline::{self, BootstrapOutcome, NoopObserver, ResolvedTarget, SshContext};
 use kmux_client::session_manager::SessionEvent;
 use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
 use kmux_client::transport::TransportKind;
@@ -7,7 +6,8 @@ use kmux_protocol::messages::{ServerMessage, SessionEntry, TermSize};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::mode::{ConnectField, Mode};
+use crate::mode::ConnectField;
+use crate::mode::Mode;
 use crate::recent_servers::RecentServer;
 
 use super::App;
@@ -16,6 +16,12 @@ use super::App;
 pub(super) enum BootstrapPhase {
     Initial,
     Reconnect,
+}
+
+/// Result sent from the background bootstrap task to the event loop.
+pub(super) enum BootstrapTaskResult {
+    Success(Box<BootstrapOutcome>),
+    Failed(String),
 }
 
 impl App {
@@ -204,55 +210,96 @@ impl App {
         );
     }
 
-    /// Canonical bootstrap sequence shared by initial connect and reconnect.
+    /// Spawn a background bootstrap task and enter `Mode::Connecting`.
     ///
-    /// Both callers reduce to this single path so any future change (new status
-    /// message, observer swap, extra prep step) only needs to be made once.
-    pub(super) async fn run_bootstrap(
+    /// The bootstrap task calls `pipeline::run_bootstrap` and sends the
+    /// `BootstrapTaskResult` back via `outcome_tx`. The event loop's
+    /// `bootstrap_rx` arm handles the outcome so the UI task stays free
+    /// during the entire network handshake.
+    ///
+    /// Dropping `self.cancel_tx` (set here) causes the spawned task to
+    /// abort via a oneshot-receiver drop.
+    pub(super) fn start_bootstrap(
         &mut self,
         target: ResolvedTarget,
         srv_tx: mpsc::UnboundedSender<ServerMessage>,
-        upgrade_tx: mpsc::Sender<UpgradeSignal>,
-        tunnel_died_tx: mpsc::Sender<()>,
         phase: BootstrapPhase,
+        outcome_tx: mpsc::UnboundedSender<BootstrapTaskResult>,
     ) {
         if matches!(phase, BootstrapPhase::Reconnect) {
             info!(
                 connection_id = self.mgr.connection_id.map(|c| c.0),
                 "reconnect requested",
             );
-            self.mgr.prepare_reconnect();
         }
+        self.mgr.prepare_reconnect();
 
-        self.mode = Mode::Normal;
+        let target_display = match (&target, &phase) {
+            (ResolvedTarget::LocalDaemon, BootstrapPhase::Initial) => {
+                "Connecting to local daemon…".to_string()
+            }
+            (ResolvedTarget::LocalDaemon, BootstrapPhase::Reconnect) => {
+                "Reconnecting to local daemon…".to_string()
+            }
+            (ResolvedTarget::Ssh { target, .. }, BootstrapPhase::Initial) => {
+                let h = match &target.user {
+                    Some(u) => format!("{u}@{}", target.host),
+                    None => target.host.clone(),
+                };
+                format!("Connecting via SSH to {h}…")
+            }
+            (ResolvedTarget::Ssh { target, .. }, BootstrapPhase::Reconnect) => {
+                let h = match &target.user {
+                    Some(u) => format!("{u}@{}", target.host),
+                    None => target.host.clone(),
+                };
+                format!("Reconnecting via SSH to {h}…")
+            }
+            (ResolvedTarget::Direct { host, port, .. }, BootstrapPhase::Initial) => {
+                format!("Connecting to {host}:{port}…")
+            }
+            (ResolvedTarget::Direct { host, port, .. }, BootstrapPhase::Reconnect) => {
+                format!("Reconnecting to {host}:{port}…")
+            }
+        };
+
+        self.mode = Mode::Connecting { target_display };
         self.needs_render = true;
 
-        let connecting = matches!(phase, BootstrapPhase::Initial);
-        let status = match &target {
-            ResolvedTarget::Ssh { .. } if connecting => "Connecting via SSH…",
-            ResolvedTarget::Ssh { .. } => "Reconnecting via SSH…",
-            ResolvedTarget::LocalDaemon if connecting => "Connecting to local daemon…",
-            ResolvedTarget::LocalDaemon => "Reconnecting to local daemon…",
-            ResolvedTarget::Direct { .. } if connecting => "Connecting…",
-            ResolvedTarget::Direct { .. } => "Reconnecting…",
-        };
-        self.mgr.set_status_msg(status.to_string());
+        // Store a clone of the sender so the event loop's outcome arm can
+        // pass it to `launch_ssh_supervisor` for SSH targets.
+        self.pending_srv_tx = Some(srv_tx.clone());
 
-        match self
-            .mgr
-            .connect(srv_tx.clone(), target, &NoopObserver)
-            .await
-        {
-            Ok(Some(ctx)) => {
-                self.launch_ssh_supervisor(ctx, srv_tx, upgrade_tx, tunnel_died_tx);
-                self.reflect_bootstrap_outcome();
+        // Cancel any prior in-flight bootstrap by dropping the old sender.
+        let _ = self.cancel_tx.take();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        self.cancel_tx = Some(cancel_tx);
+
+        let capabilities = self.mgr.capabilities().clone();
+        let connection_id = self.mgr.connection_id;
+
+        tokio::spawn(async move {
+            tokio::select! {
+                // Sender dropped → oneshot resolves to Err; either way we abort.
+                _ = cancel_rx => {}
+                result = pipeline::run_bootstrap(
+                    target,
+                    capabilities,
+                    connection_id,
+                    srv_tx,
+                    &NoopObserver,
+                ) => {
+                    let task_result = match result {
+                        Ok(outcome) => BootstrapTaskResult::Success(Box::new(outcome)),
+                        Err(e) => {
+                            warn!("bootstrap failed: {e}");
+                            BootstrapTaskResult::Failed(e.to_string())
+                        }
+                    };
+                    let _ = outcome_tx.send(task_result);
+                }
             }
-            Ok(None) => self.reflect_bootstrap_outcome(),
-            Err(e) => {
-                warn!(phase = ?phase, "bootstrap failed: {e}");
-                self.enter_disconnected(DisconnectReason::BootstrapFailed(e.to_string()));
-            }
-        }
+        });
     }
 
     /// Build the target to bootstrap against from current App state.

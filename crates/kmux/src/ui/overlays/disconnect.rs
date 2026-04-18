@@ -7,6 +7,43 @@ use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 use super::centered_overlay;
 use crate::theme::Theme;
 
+pub fn render_connecting_overlay(f: &mut Frame, area: Rect, theme: &Theme, target_display: &str) {
+    let width = 60u16.min(area.width.saturating_sub(4));
+    let height = 7u16.min(area.height.saturating_sub(4));
+    let overlay_area = centered_overlay(area, width, height);
+
+    f.render_widget(Clear, overlay_area);
+
+    let lines = vec![
+        Line::from(""),
+        Line::from(Span::styled(
+            " Connecting… ",
+            Style::default()
+                .fg(theme.yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(Span::styled(target_display, Style::default().fg(theme.fg))),
+        Line::from(""),
+        Line::from(Span::styled(
+            "[Esc] cancel",
+            Style::default().fg(theme.fg_dim),
+        )),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme.yellow))
+        .style(Style::default().bg(theme.bg));
+
+    f.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        overlay_area,
+    );
+}
+
 pub fn render_disconnect_overlay(f: &mut Frame, area: Rect, theme: &Theme, reason: &str) {
     let width = 56u16.min(area.width.saturating_sub(4));
     let height = 9u16.min(area.height.saturating_sub(4));

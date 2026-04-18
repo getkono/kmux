@@ -238,6 +238,17 @@ pub fn resolve_dir_picker(key: &Key) -> (Option<Mode>, Action) {
     )
 }
 
+/// Esc or Ctrl+C cancels the in-progress background bootstrap.
+pub fn resolve_connecting(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+    if matches!(key, Key::Named(NamedKey::Escape)) {
+        return (None, Action::CancelBootstrap);
+    }
+    if mods.contains(Modifiers::CTRL) && matches!(key, Key::Character(c) if c == "c") {
+        return (None, Action::CancelBootstrap);
+    }
+    (None, Action::None)
+}
+
 pub fn resolve_connect(
     key: &Key,
     mods: Modifiers,
