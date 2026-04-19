@@ -691,4 +691,83 @@ mod tests {
         assert_eq!(relay.size.rows, 24);
         assert_eq!(relay.size.cols, 80);
     }
+
+    #[tokio::test]
+    async fn broadcast_resize_emits_snapshot_before_diff() {
+        use kmux_protocol::messages::{
+            CursorState, SequenceNo, ServerMessage, SessionEventMsg, TermModes, TerminalDiff,
+        };
+
+        let mut relay = make_relay(24, 80);
+        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let id = ClientId(1);
+        relay.clients.lock().unwrap().insert(
+            id,
+            ClientSender {
+                data_tx: data_tx.clone(),
+                ctrl_tx,
+                force_full_snapshot: false,
+                capabilities: ClientCapabilities::default(),
+                size: TermSize {
+                    rows: 40,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            },
+        );
+
+        let new_size = relay.apply_effective_size().expect("size must change");
+        relay.broadcast_resize("pane-1", new_size, 42);
+
+        // Simulate the next diff arriving on the same data_tx (as the relay's
+        // flush_cell_diff would enqueue it). FIFO guarantees it lands after
+        // the snapshot.
+        let followup = ServerMessage::TerminalUpdate {
+            pane_id: "pane-1".to_string(),
+            diff: Arc::new(TerminalDiff {
+                ops: vec![],
+                cursor: CursorState::default(),
+                modes: TermModes::EMPTY,
+                scrollback_lines: vec![],
+            }),
+            seqno: SequenceNo(43),
+            sent_at_ms: 0,
+        };
+        data_tx.try_send(followup).expect("send follow-up diff");
+
+        // ctrl_rx gets the PaneResized event.
+        let ev = ctrl_rx.try_recv().expect("PaneResized on ctrl_tx");
+        assert!(
+            matches!(
+                ev,
+                ServerMessage::Event {
+                    event: SessionEventMsg::PaneResized { .. },
+                }
+            ),
+            "expected PaneResized event, got {ev:?}"
+        );
+
+        // data_rx: snapshot first, then the diff.
+        let first = data_rx.try_recv().expect("snapshot on data_tx");
+        match first {
+            ServerMessage::TerminalSnapshot {
+                ref pane_id,
+                ref snapshot,
+                ..
+            } => {
+                assert_eq!(pane_id, "pane-1");
+                assert_eq!(snapshot.rows, new_size.rows);
+                assert_eq!(snapshot.cols, new_size.cols);
+            }
+            other => panic!("expected TerminalSnapshot, got {other:?}"),
+        }
+
+        let second = data_rx.try_recv().expect("follow-up diff on data_tx");
+        assert!(
+            matches!(second, ServerMessage::TerminalUpdate { .. }),
+            "follow-up diff must arrive after the snapshot, got {second:?}"
+        );
+    }
 }

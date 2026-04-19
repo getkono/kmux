@@ -73,13 +73,17 @@ impl CellGrid {
     // ── State updates ──
 
     /// Replace the entire grid from a server snapshot.
+    ///
+    /// Rewrites the live viewport, cursor, and modes. Scrollback persists —
+    /// snapshots are sent on attach and after resize, and in both cases the
+    /// client's accumulated scrollback is still valid. Only an explicit reset
+    /// (see `clear()`) wipes it.
     pub fn apply_snapshot(&mut self, snapshot: GridSnapshot) {
         self.rows = snapshot.rows as usize;
         self.cols = snapshot.cols as usize;
         self.cells = snapshot.cells;
         self.cursor = snapshot.cursor;
         self.modes = snapshot.modes;
-        self.scrollback.clear();
         self.scroll_offset = 0;
         self.selection = None;
         self.cells_generation += 1;
@@ -173,6 +177,11 @@ impl CellGrid {
     }
 
     /// Resize the grid (server will send a fresh snapshot after resize).
+    ///
+    /// Scrollback is intentionally preserved across resize. The viewport is
+    /// zeroed and the incoming snapshot will populate it; previously-captured
+    /// scrollback lines remain at the width they were captured and are
+    /// wrap-rendered to the new viewport width.
     pub fn resize(&mut self, rows: u16, cols: u16) {
         self.rows = rows as usize;
         self.cols = cols as usize;
@@ -355,5 +364,86 @@ impl CellGrid {
 impl Default for CellGrid {
     fn default() -> Self {
         Self::new(24, 80)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kmux_protocol::messages::CellColor;
+
+    fn cell(c: char) -> CellState {
+        CellState {
+            c,
+            fg: CellColor::new(0xff, 0xff, 0xff),
+            bg: CellColor::new(0, 0, 0),
+            attrs: CellAttrs::EMPTY,
+        }
+    }
+
+    fn line(text: &str) -> Vec<CellState> {
+        text.chars().map(cell).collect()
+    }
+
+    fn snapshot(rows: u16, cols: u16) -> GridSnapshot {
+        GridSnapshot {
+            rows,
+            cols,
+            cells: vec![CellState::default(); rows as usize * cols as usize],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+        }
+    }
+
+    fn diff_with_scrollback(lines: Vec<Vec<CellState>>) -> TerminalDiff {
+        TerminalDiff {
+            ops: vec![],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            scrollback_lines: lines,
+        }
+    }
+
+    #[test]
+    fn apply_snapshot_preserves_scrollback() {
+        let mut grid = CellGrid::new(24, 80);
+        grid.apply_diff(diff_with_scrollback(vec![line("hello"), line("world")]));
+        assert_eq!(grid.scrollback_len(), 2);
+
+        grid.apply_snapshot(snapshot(24, 80));
+        assert_eq!(
+            grid.scrollback_len(),
+            2,
+            "snapshot must not wipe scrollback"
+        );
+        let first = grid.scrollback().get(0).expect("line 0 present");
+        assert_eq!(first.len(), 5);
+        assert_eq!(first[0].c, 'h');
+    }
+
+    #[test]
+    fn resize_preserves_scrollback() {
+        let mut grid = CellGrid::new(24, 80);
+        grid.apply_diff(diff_with_scrollback(vec![line("hello")]));
+        assert_eq!(grid.scrollback_len(), 1);
+
+        grid.resize(40, 120);
+        assert_eq!(grid.scrollback_len(), 1, "resize must not wipe scrollback");
+        assert_eq!(grid.rows, 40);
+        assert_eq!(grid.cols, 120);
+    }
+
+    #[test]
+    fn clear_wipes_scrollback() {
+        let mut grid = CellGrid::new(24, 80);
+        grid.apply_diff(diff_with_scrollback(vec![line("hello")]));
+        assert_eq!(grid.scrollback_len(), 1);
+
+        grid.clear();
+        assert_eq!(
+            grid.scrollback_len(),
+            0,
+            "explicit clear() still wipes scrollback"
+        );
     }
 }

@@ -1,10 +1,65 @@
-use kmux_protocol::messages::{CellAttrs, CursorShape};
+use kmux_protocol::messages::{CellAttrs, CellState, CursorShape};
 use ratatui::Frame;
+use ratatui::buffer::Cell;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
 
 use crate::app::App;
-use crate::theme;
+use crate::theme::{self, Theme};
+
+/// Apply a single protocol cell to a ratatui buffer cell.
+///
+/// `WIDE_CHAR_SPACER` cells (the second half of a double-width glyph) are
+/// written with an empty symbol per ratatui convention — the preceding wide
+/// cell owns the glyph that visually spans both columns. Anything else leaves
+/// a stray ' ' next to every wide character.
+fn apply_cell(ratatui_cell: &mut Cell, cs: &CellState, theme: &Theme) {
+    if cs.attrs.contains(CellAttrs::WIDE_CHAR_SPACER) {
+        ratatui_cell.set_symbol("");
+        let spacer_bg = if cs.attrs.contains(CellAttrs::DEFAULT_BG) {
+            theme.bg
+        } else {
+            theme::cell_color(cs.bg)
+        };
+        ratatui_cell.set_bg(spacer_bg);
+        return;
+    }
+
+    ratatui_cell.set_char(cs.c);
+    let display_fg = if cs.attrs.contains(CellAttrs::DEFAULT_FG) {
+        theme.fg
+    } else {
+        theme::cell_color(cs.fg)
+    };
+    let display_bg = if cs.attrs.contains(CellAttrs::DEFAULT_BG) {
+        theme.bg
+    } else {
+        theme::cell_color(cs.bg)
+    };
+    ratatui_cell.set_fg(display_fg);
+    ratatui_cell.set_bg(display_bg);
+
+    let mut modifier = Modifier::empty();
+    if cs.attrs.contains(CellAttrs::BOLD) {
+        modifier |= Modifier::BOLD;
+    }
+    if cs.attrs.contains(CellAttrs::ITALIC) {
+        modifier |= Modifier::ITALIC;
+    }
+    if cs.attrs.contains(CellAttrs::UNDERLINE) {
+        modifier |= Modifier::UNDERLINED;
+    }
+    if cs.attrs.contains(CellAttrs::STRIKETHROUGH) {
+        modifier |= Modifier::CROSSED_OUT;
+    }
+    if cs.attrs.contains(CellAttrs::DIM) {
+        modifier |= Modifier::DIM;
+    }
+    if cs.attrs.contains(CellAttrs::HIDDEN) {
+        modifier |= Modifier::HIDDEN;
+    }
+    ratatui_cell.set_style(Style::default().add_modifier(modifier));
+}
 
 pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
@@ -75,46 +130,7 @@ pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
                 };
 
                 if let Some(cs) = cell_state {
-                    let ratatui_cell = &mut buf[(screen_x, screen_y)];
-
-                    if cs.attrs.contains(CellAttrs::WIDE_CHAR_SPACER) {
-                        continue;
-                    }
-
-                    ratatui_cell.set_char(cs.c);
-                    let display_fg = if cs.attrs.contains(CellAttrs::DEFAULT_FG) {
-                        theme.fg
-                    } else {
-                        theme::cell_color(cs.fg)
-                    };
-                    let display_bg = if cs.attrs.contains(CellAttrs::DEFAULT_BG) {
-                        theme.bg
-                    } else {
-                        theme::cell_color(cs.bg)
-                    };
-                    ratatui_cell.set_fg(display_fg);
-                    ratatui_cell.set_bg(display_bg);
-
-                    let mut modifier = Modifier::empty();
-                    if cs.attrs.contains(CellAttrs::BOLD) {
-                        modifier |= Modifier::BOLD;
-                    }
-                    if cs.attrs.contains(CellAttrs::ITALIC) {
-                        modifier |= Modifier::ITALIC;
-                    }
-                    if cs.attrs.contains(CellAttrs::UNDERLINE) {
-                        modifier |= Modifier::UNDERLINED;
-                    }
-                    if cs.attrs.contains(CellAttrs::STRIKETHROUGH) {
-                        modifier |= Modifier::CROSSED_OUT;
-                    }
-                    if cs.attrs.contains(CellAttrs::DIM) {
-                        modifier |= Modifier::DIM;
-                    }
-                    if cs.attrs.contains(CellAttrs::HIDDEN) {
-                        modifier |= Modifier::HIDDEN;
-                    }
-                    ratatui_cell.set_style(Style::default().add_modifier(modifier));
+                    apply_cell(&mut buf[(screen_x, screen_y)], cs, theme);
                 }
             }
         }
@@ -174,5 +190,69 @@ pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
 
     if let Some((cx, cy)) = cursor_pos {
         f.set_cursor_position((cx, cy));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kmux_protocol::messages::{CellAttrs, CellColor};
+
+    fn wide_spacer(bg: CellColor) -> CellState {
+        CellState {
+            c: ' ',
+            fg: CellColor::new(0, 0, 0),
+            bg,
+            attrs: CellAttrs(CellAttrs::WIDE_CHAR_SPACER),
+        }
+    }
+
+    #[test]
+    fn wide_char_spacer_emits_empty_symbol() {
+        let theme = theme::default_theme();
+        let mut cell = Cell::default();
+        // Simulate the background pre-fill that render_grid applies before
+        // walking the logical cell grid.
+        cell.set_char(' ');
+
+        apply_cell(&mut cell, &wide_spacer(CellColor::new(0, 0, 0)), &theme);
+
+        assert_eq!(
+            cell.symbol(),
+            "",
+            "spacer cell must carry an empty symbol, not ' '",
+        );
+    }
+
+    #[test]
+    fn wide_char_spacer_default_bg_uses_theme_bg() {
+        let theme = theme::default_theme();
+        let mut cell = Cell::default();
+        cell.set_char(' ');
+        let mut cs = wide_spacer(CellColor::new(12, 34, 56));
+        cs.attrs = CellAttrs(CellAttrs::WIDE_CHAR_SPACER | CellAttrs::DEFAULT_BG);
+
+        apply_cell(&mut cell, &cs, &theme);
+
+        assert_eq!(cell.symbol(), "");
+        assert_eq!(cell.bg, theme.bg);
+    }
+
+    #[test]
+    fn non_spacer_sets_char_and_colors() {
+        let theme = theme::default_theme();
+        let mut cell = Cell::default();
+        let cs = CellState {
+            c: 'X',
+            fg: CellColor::new(255, 0, 0),
+            bg: CellColor::new(0, 255, 0),
+            attrs: CellAttrs::EMPTY,
+        };
+
+        apply_cell(&mut cell, &cs, &theme);
+
+        assert_eq!(cell.symbol(), "X");
+        assert_eq!(cell.fg, Color::Rgb(255, 0, 0));
+        assert_eq!(cell.bg, Color::Rgb(0, 255, 0));
     }
 }
