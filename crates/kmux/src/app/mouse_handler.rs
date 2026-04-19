@@ -63,6 +63,10 @@ impl App {
                 self.mgr.select_pane(pane_id);
                 None
             }
+            TopBarAction::CreatePane => {
+                self.mgr.create_pane(App::current_term_size());
+                None
+            }
         }
     }
 

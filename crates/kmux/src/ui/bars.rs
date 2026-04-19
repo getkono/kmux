@@ -112,6 +112,7 @@ fn build_session_bar_segments(app: &App) -> Vec<TopBarSegment> {
     // Pane tabs — one per pane, each clickable to select that pane.
     let active_pane = app.mgr.active_pane_id().map(|s| s.to_string());
     let panes = app.mgr.active_session_panes();
+    let has_session = app.mgr.active_session().is_some();
     if panes.is_empty() {
         segs.push(TopBarSegment::new(
             " \u{2014} ".to_string(),
@@ -142,6 +143,17 @@ fn build_session_bar_segments(app: &App) -> Vec<TopBarSegment> {
                 Some(TopBarAction::SelectPane(pane.pane_id.clone())),
             ));
         }
+    }
+
+    // Mouse-only `+` button to spawn a new pane. Deliberately understated so
+    // it does not read as a keyboard-accessible tab — there is already a
+    // keybinding for this action, and the hint bar advertises it.
+    if has_session {
+        segs.push(TopBarSegment::new(
+            " + ".to_string(),
+            Style::default().fg(theme.fg_dim).bg(theme.status_bg),
+            Some(TopBarAction::CreatePane),
+        ));
     }
 
     segs
@@ -532,6 +544,39 @@ mod tests {
             text.contains("DEBUG"),
             "badge must spell DEBUG, got {text:?}"
         );
+    }
+
+    /// The `+` button must sit to the right of the last pane tab and register
+    /// its own `CreatePane` hit-box.
+    #[test]
+    fn create_pane_button_follows_tabs_and_is_clickable() {
+        let regions = layout(vec![
+            seg(" \u{25b6} main ", Some(TopBarAction::OpenSessionPicker)),
+            seg(" \u{2022}0 ", Some(TopBarAction::SelectPane("p0".into()))),
+            seg(" 1 ", Some(TopBarAction::SelectPane("p1".into()))),
+            seg(" + ", Some(TopBarAction::CreatePane)),
+        ]);
+        let plus = regions
+            .iter()
+            .find(|(_, a)| *a == TopBarAction::CreatePane)
+            .expect("`+` button must register a hit-box");
+        let last_tab = regions
+            .iter()
+            .rev()
+            .find(|(_, a)| matches!(a, TopBarAction::SelectPane(_)))
+            .unwrap();
+        assert!(
+            plus.0.start > last_tab.0.end,
+            "`+` must sit after last pane tab: last={:?} plus={:?}",
+            last_tab.0,
+            plus.0,
+        );
+
+        let hits = TopBarHits {
+            regions: regions.clone(),
+        };
+        let col = plus.0.start + 1;
+        assert_eq!(hits.action_at(col), Some(&TopBarAction::CreatePane));
     }
 
     #[test]

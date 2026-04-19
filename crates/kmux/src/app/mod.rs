@@ -27,6 +27,9 @@ pub enum TopBarAction {
     Reconnect,
     OpenSessionPicker,
     SelectPane(String),
+    /// Mouse-only affordance rendered as a `+` at the right of the tab list.
+    /// Spawns a new pane in the active session.
+    CreatePane,
 }
 
 /// Column ranges recorded by `render_session_bar` so the mouse handler can
