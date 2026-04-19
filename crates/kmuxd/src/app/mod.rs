@@ -54,23 +54,29 @@ pub struct ClientSender {
 pub type ClientMap = Arc<Mutex<HashMap<ClientId, ClientSender>>>;
 
 /// Backend event sink that owns the canonical title string for a pane and
-/// broadcasts `PaneTitleChanged` events to every currently-attached client
-/// whenever the VT emulator reports a new OSC 0/2 title.
+/// broadcasts `PaneTitleChanged` to all connected clients via the server-wide
+/// VT events channel whenever the VT emulator reports a new OSC 0/2 title.
 ///
-/// The `on_title` callback is invoked from the VT parser loop, so sends use
-/// non-blocking channel operations only.
+/// The `on_title` callback is invoked from the VT parser loop, so the send
+/// uses a non-blocking operation only. Broadcasting server-wide (rather than
+/// only to clients attached to this specific pane) ensures that the tab bar
+/// reflects live title updates for all panes, not just the active one.
 pub struct PaneTitleSink {
     pane_id: String,
     title: Arc<Mutex<String>>,
-    clients: ClientMap,
+    vt_events: broadcast::Sender<kmux_protocol::messages::ServerMessage>,
 }
 
 impl PaneTitleSink {
-    pub fn new(pane_id: String, title: Arc<Mutex<String>>, clients: ClientMap) -> Self {
+    pub fn new(
+        pane_id: String,
+        title: Arc<Mutex<String>>,
+        vt_events: broadcast::Sender<kmux_protocol::messages::ServerMessage>,
+    ) -> Self {
         Self {
             pane_id,
             title,
-            clients,
+            vt_events,
         }
     }
 }
@@ -90,10 +96,8 @@ impl crate::backend::BackendEventSink for PaneTitleSink {
                 title: title.to_string(),
             },
         };
-        let map = self.clients.lock().unwrap();
-        for sender in map.values() {
-            let _ = sender.ctrl_tx.send(event.clone());
-        }
+        // Ignore error: no receivers means no clients are currently connected.
+        let _ = self.vt_events.send(event);
     }
 }
 
@@ -294,11 +298,16 @@ pub struct ServerApp {
     pub(super) rng: Mutex<rand::rngs::SmallRng>,
     /// Broadcasts the live connection count; used for idle-shutdown tracking.
     conn_count_tx: watch::Sender<usize>,
+    /// Server-wide broadcast channel for VT-derived events (e.g. title changes).
+    /// Every connected client subscribes so that tab-bar titles update for all
+    /// panes, not only the one the client is currently attached to.
+    vt_events_tx: broadcast::Sender<kmux_protocol::messages::ServerMessage>,
 }
 
 impl ServerApp {
     pub fn new(token: String) -> Self {
         let (conn_count_tx, _) = watch::channel(0usize);
+        let (vt_events_tx, _) = broadcast::channel(512);
         Self {
             manager: Arc::new(PtyRegistry::new()),
             auth_token: token,
@@ -310,7 +319,16 @@ impl ServerApp {
             wordlist: Mutex::new(WordlistSampler::new()),
             rng: Mutex::new(rand::rngs::SmallRng::from_rng(&mut rand::rng())),
             conn_count_tx,
+            vt_events_tx,
         }
+    }
+
+    /// Subscribe to VT-derived events (e.g. `PaneTitleChanged`) that are
+    /// broadcast server-wide to all connected clients.
+    pub fn subscribe_vt_events(
+        &self,
+    ) -> broadcast::Receiver<kmux_protocol::messages::ServerMessage> {
+        self.vt_events_tx.subscribe()
     }
 
     /// Subscribe to live connection-count changes for idle-shutdown tracking.

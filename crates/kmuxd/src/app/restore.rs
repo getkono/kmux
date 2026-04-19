@@ -89,7 +89,7 @@ impl ServerApp {
                 let title_sink = Arc::new(PaneTitleSink::new(
                     pane_id.clone(),
                     title.clone(),
-                    clients.clone(),
+                    self.vt_events_tx.clone(),
                 ));
                 let term_state = Arc::new(Mutex::new(new_term_state(BackendConfig {
                     size: BackendSize::from(size),

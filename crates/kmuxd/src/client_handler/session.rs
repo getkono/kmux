@@ -6,7 +6,7 @@ use kmux_protocol::TransportKind;
 use kmux_protocol::messages::{ErrorCode, ServerMessage, epoch_millis};
 use kmux_protocol::{decode_client, encode_server, read_frame, write_frame};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::mpsc;
+use tokio::sync::{broadcast, mpsc};
 use tracing::{Instrument, Span, debug, info, warn};
 
 use crate::app::{AttachResult, ConnectionMetrics, ServerApp};
@@ -118,6 +118,23 @@ pub async fn run_client_session<R, W, A, F>(
         .instrument(conn_span.clone()),
     );
 
+    let mut vt_rx = app.subscribe_vt_events();
+    let vt_tx = ctrl_tx.clone();
+    let vt_task = tokio::spawn(
+        async move {
+            loop {
+                match vt_rx.recv().await {
+                    Ok(msg) => {
+                        let _ = vt_tx.send(msg);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+        .instrument(conn_span.clone()),
+    );
+
     let ping_tx = ctrl_tx.clone();
     let ping_metrics = Arc::clone(&metrics);
     let ping_task = tokio::spawn(
@@ -186,6 +203,7 @@ pub async fn run_client_session<R, W, A, F>(
 
     event_task.abort();
     ping_task.abort();
+    vt_task.abort();
 
     let log_conn_id = state.connection_id.map(|c| c.0);
     if let Some(client_id) = state.client_id {
