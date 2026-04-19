@@ -48,7 +48,14 @@ fn render_terminal(f: &mut Frame, app: &mut App) {
         Mode::ServerPicker => overlays::render_server_picker_overlay(f, area, app),
         Mode::DirectoryPicker => overlays::render_dir_picker_overlay(f, area, app),
         Mode::Connecting { target_display } => {
-            overlays::render_connecting_overlay(f, area, &app.theme, target_display)
+            // Defensive: if the connection is already live, the mode is stale
+            // and the overlay would spuriously cover the live grid. The
+            // bootstrap_result arm should have cleared Connecting, but an async
+            // race could leave the mode lagging behind the state machine for a
+            // frame or two — skip the overlay rather than smudge the terminal.
+            if !app.mgr.connection_state().is_live() {
+                overlays::render_connecting_overlay(f, area, &app.theme, target_display);
+            }
         }
         Mode::Disconnected { reason } => {
             overlays::render_disconnect_overlay(f, area, &app.theme, reason)
