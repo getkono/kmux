@@ -7,7 +7,7 @@ use nix::unistd::Pid;
 
 use super::{DaemonStatus, query_daemon};
 
-/// Maximum bytes of the boot log to include in a failure error.
+/// Maximum bytes of each log file to include in a failure error.
 const BOOT_LOG_TAIL_MAX: u64 = 8 * 1024;
 
 /// Remove stale daemon artifacts (zombie prevention).
@@ -166,6 +166,53 @@ fn format_boot_log_hint() -> String {
     )
 }
 
+/// Return the current byte length of the daemon log, or 0 if it does not exist.
+///
+/// Call this before spawning so `format_daemon_log_tail` can show only the new
+/// entries written by this particular spawn attempt.
+fn daemon_log_size() -> u64 {
+    kmux_protocol::dirs::daemon_log_path()
+        .ok()
+        .and_then(|p| std::fs::metadata(&p).ok())
+        .map(|m| m.len())
+        .unwrap_or(0)
+}
+
+/// Read daemon.log from `from_offset` to the end and format it as an error suffix.
+///
+/// Only shows content written after `from_offset` so old runtime log entries
+/// from a previous daemon instance do not appear in startup failure messages.
+fn format_daemon_log_tail(from_offset: u64) -> String {
+    let Ok(path) = kmux_protocol::dirs::daemon_log_path() else {
+        return String::new();
+    };
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return String::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len <= from_offset {
+        return String::new();
+    }
+    let read_from = if len - from_offset > BOOT_LOG_TAIL_MAX {
+        len - BOOT_LOG_TAIL_MAX
+    } else {
+        from_offset
+    };
+    if file.seek(SeekFrom::Start(read_from)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    let tail = String::from_utf8_lossy(&bytes);
+    let trimmed = tail.trim_end();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!("\n\n--- kmuxd daemon log (new since start): ---\n{trimmed}")
+}
+
 /// Ensure exactly one local daemon is running and return its connection params.
 ///
 /// Fast path: if a daemon is already responding, return immediately.
@@ -181,9 +228,14 @@ pub async fn ensure_daemon() -> anyhow::Result<DaemonStatus> {
         return Ok(status);
     }
 
+    // Snapshot daemon log position so we only surface entries written by
+    // this spawn attempt, not leftover lines from a previous daemon run.
+    let daemon_log_offset = daemon_log_size();
+
     // Slow path — start a new daemon. `None` means another process is already
     // starting one; we just poll in that case.
     let mut spawned = start_daemon()?;
+    let mut ever_spawned = spawned.is_some();
 
     // Poll until the daemon is ready.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -218,15 +270,33 @@ pub async fn ensure_daemon() -> anyhow::Result<DaemonStatus> {
         if !retry_start && tokio::time::Instant::now() >= (deadline - Duration::from_secs(2)) {
             retry_start = true;
             cleanup_stale_daemon();
-            spawned = start_daemon().ok().flatten();
+            if let Some(s) = start_daemon().ok().flatten() {
+                spawned = Some(s);
+                ever_spawned = true;
+            }
         }
     }
 
-    Err(anyhow::anyhow!(
-        "timed out waiting for local daemon to start; \
-         check that kmuxd is on PATH or in the same directory as kmux{}",
-        format_boot_log_hint()
-    ))
+    // Build a diagnostic hint: boot log (stderr captured during spawn) plus
+    // any new daemon.log lines written by the grandchild after daemonizing.
+    let boot_hint = format_boot_log_hint();
+    let daemon_hint = if ever_spawned {
+        format_daemon_log_tail(daemon_log_offset)
+    } else {
+        String::new()
+    };
+    let hint = format!("{boot_hint}{daemon_hint}");
+
+    if ever_spawned && !hint.is_empty() {
+        // The binary was found and started — the logs tell the user what went
+        // wrong, so skip the misleading PATH suggestion.
+        Err(anyhow::anyhow!("local daemon failed to start{hint}"))
+    } else {
+        Err(anyhow::anyhow!(
+            "timed out waiting for local daemon to start; \
+             check that kmuxd is on PATH or in the same directory as kmux{hint}"
+        ))
+    }
 }
 
 pub(super) fn pid_alive(pid: u32) -> bool {
@@ -314,6 +384,65 @@ mod tests {
         // No socket present — stop should return an error.
         let result = crate::daemon::stop_daemon().await;
         assert!(result.is_err(), "expected error when daemon is not running");
+    }
+
+    #[test]
+    fn daemon_log_size_returns_zero_for_missing_file() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        // No daemon.log — should not panic, should return 0.
+        assert_eq!(daemon_log_size(), 0);
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    #[test]
+    fn format_daemon_log_tail_empty_when_no_new_content() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+
+        let log_path = kmux_protocol::dirs::daemon_log_path().unwrap();
+        std::fs::write(&log_path, b"old line\n").unwrap();
+        let offset = std::fs::metadata(&log_path).unwrap().len();
+
+        // Nothing written after the offset — should return empty.
+        assert_eq!(format_daemon_log_tail(offset), String::new());
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+    }
+
+    #[test]
+    fn format_daemon_log_tail_returns_only_new_content() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+
+        let log_path = kmux_protocol::dirs::daemon_log_path().unwrap();
+        std::fs::write(&log_path, b"old log line\n").unwrap();
+        let offset = std::fs::metadata(&log_path).unwrap().len();
+
+        // Append a new line after the snapshot.
+        use std::io::Write;
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .unwrap();
+        writeln!(f, "Error: failed to bind port 8443: address already in use").unwrap();
+
+        let tail = format_daemon_log_tail(offset);
+        assert!(
+            tail.contains("failed to bind port 8443"),
+            "should include new daemon log line: {tail}"
+        );
+        assert!(
+            !tail.contains("old log line"),
+            "must not include pre-snapshot content: {tail}"
+        );
+        assert!(
+            tail.contains("daemon log"),
+            "should label the section: {tail}"
+        );
+        unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 
     /// Simulates the exact regression we just hit: kmuxd crashes before it can

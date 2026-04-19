@@ -17,12 +17,18 @@ use kmux_protocol::control_rpc::{ControlRequest, EndpointEntry, StatusResponse, 
 /// This MUST be called before any tokio runtime is created — fork and async
 /// runtimes do not mix safely.
 pub fn daemonize_process(pid_path: &Path) -> anyhow::Result<()> {
-    use daemonize::Daemonize;
+    use daemonize::{Daemonize, Stdio};
 
+    // Keep inherited stdout/stderr so errors that occur in the daemonized
+    // grandchild (e.g. port bind failure, TLS setup error) are written to the
+    // boot log that kmux-client opened for us, making them visible in the
+    // failure hint instead of disappearing into /dev/null.
     Daemonize::new()
         .pid_file(pid_path)
         .working_directory("/")
         .umask(0o077)
+        .stdout(Stdio::keep())
+        .stderr(Stdio::keep())
         .start()
         .map_err(|e| anyhow::anyhow!("daemonize failed: {e}"))?;
 
