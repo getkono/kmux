@@ -386,6 +386,42 @@ impl SessionManager {
                 events.push(SessionEvent::InputLockReleased { pane_id });
             }
 
+            ServerMessage::ScrollbackAppend {
+                pane_id,
+                first_index,
+                lines,
+                seqno,
+                sent_at_ms,
+            } => {
+                if !self.check_pane_sync(&pane_id, seqno) {
+                    return events;
+                }
+                let start = Instant::now();
+                if let Some(grid) = self.buffers.get_mut(&pane_id) {
+                    grid.apply_scrollback_append(first_index, lines);
+                }
+                self.pane_sync.insert(
+                    pane_id,
+                    PaneSync::Synced {
+                        expected: SequenceNo(seqno.0 + 1),
+                    },
+                );
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                self.metrics.record_apply(sent_at_ms, elapsed_ms);
+            }
+
+            ServerMessage::HistoryLines {
+                pane_id,
+                first_index,
+                lines,
+                history_total,
+                ..
+            } => {
+                if let Some(grid) = self.buffers.get_mut(&pane_id) {
+                    grid.apply_history_lines(first_index, lines, history_total);
+                }
+            }
+
             ServerMessage::Ping { seq } => {
                 self.send_ws(ClientMessage::Pong { seq });
             }

@@ -437,6 +437,8 @@ mod tests {
             cells: vec![],
             cursor: Default::default(),
             modes: TermModes::EMPTY,
+            history_total: 0,
+            scrollback_tail: Vec::new(),
         };
         mgr.handle_server_message(ServerMessage::TerminalSnapshot {
             pane_id: "eagle/0".to_string(),
@@ -467,6 +469,7 @@ mod tests {
             cursor: Default::default(),
             modes: TermModes::EMPTY,
             scrollback_lines: vec![],
+            history_total: 0,
         });
         mgr.handle_server_message(ServerMessage::TerminalUpdate {
             pane_id: "eagle/0".to_string(),

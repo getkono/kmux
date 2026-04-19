@@ -110,6 +110,15 @@ impl<B: TerminalBackend> DiffEngine<B> {
             vec![]
         };
 
+        // Mirror every scrollback line before anything else touches it. This
+        // makes the mirror authoritative: later we read `history_total` from
+        // it and the relay can emit `ScrollbackAppend` referencing absolute
+        // indices derived from `(first_index, count)`.
+        if !scrollback_lines.is_empty() {
+            self.mirror.append(scrollback_lines.clone());
+        }
+        let history_total = self.mirror.history_total();
+
         let cells_changed = !ops.is_empty();
         let has_scrollback = !scrollback_lines.is_empty();
         let cursor_or_modes_changed = cursor_state != self.prev_cursor || modes != self.prev_modes;
@@ -123,11 +132,13 @@ impl<B: TerminalBackend> DiffEngine<B> {
                 cursor: cursor_state,
                 modes,
                 scrollback_lines,
+                history_total,
             })
         } else if cursor_or_modes_changed {
             DiffResult::CursorOnly {
                 cursor: cursor_state,
                 modes,
+                history_total,
             }
         } else {
             DiffResult::None
@@ -460,6 +471,8 @@ mod tests {
                 cells,
                 cursor: Default::default(),
                 modes: TermModes::EMPTY,
+                history_total: 0,
+                scrollback_tail: Vec::new(),
             }
         };
 

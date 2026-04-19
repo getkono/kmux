@@ -107,8 +107,21 @@ pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
         let scroll_offset = grid.scroll_offset();
         let scrollback = grid.scrollback();
 
-        // Render cells
+        // Render cells. `scroll_offset` is measured in **display rows**; when
+        // a scrollback line is wider than `cols` it wraps across multiple
+        // viewport rows. Viewport rows below `scroll_offset` show the live
+        // grid, scrolled upward by `scroll_offset` logical rows.
         for vr in 0..rows.min(area.height as usize) {
+            let sb_row = if scroll_offset > 0 && vr < scroll_offset {
+                // Top `scroll_offset` viewport rows are scrollback.
+                // `vr = 0` is the topmost (oldest visible) display row;
+                // convert to rev-offset from newest.
+                let rev = scroll_offset - 1 - vr;
+                kmux_client::grid::scrollback_display_row_at(scrollback, cols, rev)
+            } else {
+                None
+            };
+
             for vc in 0..cols.min(area.width as usize) {
                 let screen_x = area.left() + vc as u16;
                 let screen_y = area.top() + vr as u16;
@@ -116,17 +129,15 @@ pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
                     continue;
                 }
 
-                let cell_state = if scroll_offset > 0 && vr < scroll_offset {
-                    let sb_len = scrollback.len();
-                    let sb_idx = sb_len.saturating_sub(scroll_offset) + vr;
-                    scrollback.get(sb_idx).and_then(|line| line.get(vc))
-                } else {
-                    let grid_row = if scroll_offset > 0 {
-                        vr - scroll_offset
-                    } else {
-                        vr
-                    };
+                let cell_state = if let Some((line_idx, col_start)) = sb_row {
+                    scrollback
+                        .get(line_idx)
+                        .and_then(|line| line.get(col_start + vc))
+                } else if scroll_offset > 0 {
+                    let grid_row = vr - scroll_offset;
                     cells.get(grid_row * cols + vc)
+                } else {
+                    cells.get(vr * cols + vc)
                 };
 
                 if let Some(cs) = cell_state {
@@ -169,9 +180,13 @@ pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        // Scroll indicator
+        // Scroll indicator (display-row units, matching scroll_offset).
         if scroll_offset > 0 {
-            let label = format!("[{}/{}]", scroll_offset, scrollback.len());
+            let label = format!(
+                "[{}/{}]",
+                scroll_offset,
+                grid.total_scrollback_display_rows()
+            );
             let x = area.right().saturating_sub(label.len() as u16 + 1);
             let y = area.top();
             if y < area.bottom() {

@@ -161,6 +161,154 @@ smallest-wins at attach time rather than waiting for the first `Resize`.
 
 `SessionEventMsg::PaneResized` also carries `TermSize` (was `rows, cols`).
 
+## Scrollback: absolute indices, daemon mirror, and rendering
+
+### Problem it solves
+
+Two scrollback regressions surfaced after the libghostty-vt port:
+
+1. Resizes blew away the client's scrollback because `apply_snapshot` wiped it
+   and every resize ships a snapshot.
+2. libghostty-vt reflows on resize: lines it reports as visible history before
+   resize can be evicted or restructured during the resize call itself. From
+   the daemon's point of view history just "shrank", so no delta was ever
+   streamed and the lines were silently lost.
+
+The fix layers an authoritative, backend-independent history record inside
+the daemon and addresses each line by a monotonic absolute index that both
+sides share. Phase B (protocol v15) added the mirror and the indexing;
+Phase C will drop inline `scrollback_lines` from `TerminalDiff` entirely
+and move to lazy fetch.
+
+### Invariants
+
+1. **Snapshots never wipe scrollback.** `apply_snapshot` rewrites only the
+   viewport; scrollback persists across resize and reattach. Explicit
+   `SyncReset` or session restart are the only paths that clear history.
+2. **Every scrollback line has an absolute `u64` index.** The index is
+   monotonic for the life of the pane and shared end-to-end. An `append` at
+   `first_index = N` asserts `N == current base + len()`; a mismatch is a
+   gap, not a logic error.
+3. **Daemon owns the source of truth.** `ScrollbackMirror` is independent of
+   libghostty-vt's own scrollback ring. The mirror outlives the backend's
+   resize reflow and alt-screen transitions.
+4. **Lines are stored at capture width.** No truncation on insert; clients
+   render them by wrapping, not clipping, when the viewport is narrower.
+5. **`WIDE_CHAR_SPACER` slots are empty symbols.** The second half of a
+   double-width glyph writes `set_symbol("")` — ratatui convention — not a
+   trailing space.
+
+### `ScrollbackMirror` (daemon)
+
+Located at `crates/kmuxd/src/diff_engine/mirror.rs`.
+
+```rust
+pub struct ScrollbackMirror {
+    base_index: u64,                  // oldest index still stored
+    lines: VecDeque<Vec<CellState>>,  // bounded ring
+    cap: usize,                       // MIRROR_CAPACITY = 10_000
+}
+```
+
+Addressable API: `append`, `history_total`, `base_index`, `range(start, count)`,
+`tail(n)`, `tail_first_index(n)`. When the ring is full, the oldest line is
+evicted and `base_index` advances. Indices below `base_index` are
+unrecoverable from the mirror; a client that asks for them gets a clamped
+response starting at `base_index`.
+
+### Wire changes (v15)
+
+`PROTOCOL_VERSION` = **15**. Added fields/messages:
+
+- `TerminalDiff` gains `history_total: u64` (monotonic count of lines ever
+  scrolled off, as of this frame). `scrollback_lines` still present in v15
+  for backwards compatibility with clients that don't track
+  `ScrollbackAppend`; removed in v16.
+- `GridSnapshot` gains `history_total: u64` and `scrollback_tail:
+  Vec<Vec<CellState>>` (the last `SNAPSHOT_TAIL_LINES = 500` lines of the
+  mirror). Reattaching clients render scrollback immediately without a
+  round-trip.
+- New `ServerMessage::ScrollbackAppend { pane_id, first_index, lines, seqno,
+  sent_at_ms }`. Shares the `seqno` space with `TerminalUpdate` so the
+  client applies them in order.
+- New `ClientMessage::FetchHistory { request_id, pane_id, start_index: u64,
+  count: u32 }` and reply `ServerMessage::HistoryLines { request_id,
+  pane_id, first_index: u64, lines, history_total: u64 }`. Wired in v15;
+  exercised on the client in Phase C.
+
+Postcard is not self-describing — any struct field or enum variant change
+is a wire break, which is why v14 → v15 → v16 each bump the version.
+
+### Daemon flow (per diff)
+
+```
+PTY bytes ──► backend.feed() ──► backend.history_size() vs prev
+                                      │
+                              new scrollback lines
+                                      │
+                           mirror.append(lines) ──► (first_index, count)
+                                      │
+                     TerminalDiff { ..., history_total }  ──► TerminalUpdate
+                                      │
+                     ScrollbackAppend { first_index, lines }  (separate msg)
+```
+
+`DiffEngine::resize` drains any backend-held history beyond our mirror's
+head **before** calling `backend.resize()`; libghostty may reflow or evict
+during the call. Post-resize, `prev_history_size` is re-synced to the
+backend's new value so the next diff cycle only picks up genuinely new
+lines — the mirror itself keeps everything ever seen.
+
+### Client flow
+
+Located at `crates/kmux-client/src/grid/scrollback.rs` and `grid/mod.rs`.
+
+```rust
+pub struct ScrollbackBuffer {
+    lines: VecDeque<Vec<CellState>>,
+    max_lines: usize,
+    base_index: u64,
+}
+```
+
+- `seed_tail(history_total, tail)` — called from `apply_snapshot`; sets
+  `base_index = history_total - tail.len()` and replaces the ring with the
+  tail slice.
+- `append_with_index(first_index, lines) -> bool` — returns `false` on gap.
+  On gap the buffer is cleared and the client will re-seed from the next
+  snapshot (Phase B) or issue `FetchHistory` (Phase C).
+- `get_absolute(idx)` — O(1) lookup by absolute index.
+
+`apply_diff` derives `first_index = history_total - scrollback_lines.len()`
+and calls `append_with_index`. `apply_scrollback_append` handles the
+out-of-band variant. `apply_history_lines` fills gaps at the current head
+(skips lines the buffer already has).
+
+### Wrap-aware rendering
+
+A scrollback line captured at 200 cols and rendered in an 80-col viewport
+must span multiple viewport rows, not get clipped. `crates/kmux/src/ui/grid.rs`
+and the helpers in `crates/kmux-client/src/grid/mod.rs` implement this:
+
+- `effective_line_len(line)` — cells up to the last non-blank.
+- `display_rows_for_line(line, cols)` — `max(1, ceil(effective / cols))`.
+- `scrollback_display_row_at(scrollback, cols, rev_offset) -> (line_idx, col_start)`
+  — walks from newest backwards to find the logical line and column window
+  that owns a given display row.
+
+`scroll_offset` is denominated in **display rows**, not logical lines.
+`scroll_up(n)` caps at `total_scrollback_display_rows()` so users can scroll
+through every captured row even if lines are wider than the viewport.
+
+### What isn't in Phase B
+
+- `scrollback_lines` is still on `TerminalDiff` (dropped in v16).
+- The client does not yet issue `FetchHistory` on scroll-into-gap (Phase C).
+- Daemon-restart persistence of the mirror is not implemented but the
+  layout (bounded VecDeque + `base_index`) is chosen so a later change can
+  flush it to `$XDG_STATE_HOME/kmux/sessions/<word_id>/pane-<n>.scrollback`
+  without reshaping the API.
+
 ## Persistence decoupling
 
 Disk format uses `PersistedTermSize { rows: u16, cols: u16 }` (no pixel fields).

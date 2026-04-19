@@ -106,6 +106,26 @@ fn flush_cell_diff(
                 "flush_cell_diff: broadcasting cell diff"
             );
 
+            // Emit an out-of-band `ScrollbackAppend` for any scrollback in
+            // this diff, referencing absolute indices derived from
+            // `history_total`. The inline `scrollback_lines` field is still
+            // populated on the `TerminalDiff` (kept in v15 for back-compat;
+            // Phase C drops it entirely). Clients reconcile via
+            // `FetchHistory` if a `ScrollbackAppend` is lost.
+            if !diff.scrollback_lines.is_empty() {
+                let sb_len = diff.scrollback_lines.len() as u64;
+                let first_index = diff.history_total.saturating_sub(sb_len);
+                let sb_seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
+                let sb_msg = ServerMessage::ScrollbackAppend {
+                    pane_id: pane_id.to_string(),
+                    first_index,
+                    lines: diff.scrollback_lines.clone(),
+                    seqno: sb_seqno,
+                    sent_at_ms: epoch_millis(),
+                };
+                broadcast_to_clients(pane_id, &sb_msg, clients, term_state, sb_seqno);
+            }
+
             let seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
             let diff = Arc::new(diff);
             scrollback.lock().unwrap().push(seqno, Arc::clone(&diff));
@@ -118,7 +138,11 @@ fn flush_cell_diff(
             };
             broadcast_to_clients(pane_id, &msg, clients, term_state, seqno);
         }
-        DiffResult::CursorOnly { cursor, modes } => {
+        DiffResult::CursorOnly {
+            cursor,
+            modes,
+            history_total,
+        } => {
             if cursor != *prev_cursor || modes != *prev_modes {
                 *prev_cursor = cursor;
                 *prev_modes = modes;
@@ -130,6 +154,7 @@ fn flush_cell_diff(
                         cursor,
                         modes,
                         scrollback_lines: vec![],
+                        history_total,
                     }),
                 );
                 let msg = ServerMessage::CursorUpdate {
@@ -222,6 +247,7 @@ mod tests {
                 cursor: CursorState::default(),
                 modes: TermModes::EMPTY,
                 scrollback_lines: vec![],
+                history_total: 0,
             }),
             seqno: SequenceNo(1),
             sent_at_ms: 0,

@@ -4,7 +4,7 @@ use super::session::{
     ClientId, ConnectionId, ErrorCode, PaneId, RequestId, SequenceNo, SessionEntry,
     SessionEventMsg, WordId,
 };
-use super::vt::{CursorState, GridSnapshot, TermModes, TerminalDiff};
+use super::vt::{CellState, CursorState, GridSnapshot, TermModes, TerminalDiff};
 
 /// Messages sent from server -> client.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -116,6 +116,36 @@ pub enum ServerMessage {
         cursor: CursorState,
         modes: TermModes,
         seqno: SequenceNo,
+        sent_at_ms: u64,
+    },
+
+    /// Notification that `lines` have been appended to the daemon's
+    /// scrollback mirror for this pane, starting at absolute index
+    /// `first_index`. Shares seqno space with `TerminalUpdate` so the client
+    /// can detect gaps and issue `FetchHistory` for anything it missed.
+    ScrollbackAppend {
+        pane_id: PaneId,
+        /// Absolute index of the first line in `lines`.
+        first_index: u64,
+        /// Appended lines, oldest first. Each line is stored at the column
+        /// width it had when captured.
+        lines: Vec<Vec<CellState>>,
+        seqno: SequenceNo,
+        sent_at_ms: u64,
+    },
+
+    /// Response to `FetchHistory`. Returns `lines` starting at absolute
+    /// index `first_index`. `history_total` echoes the mirror's current size
+    /// so the client can detect eviction since it issued the request.
+    HistoryLines {
+        request_id: RequestId,
+        pane_id: PaneId,
+        /// Absolute index of the first returned line.
+        first_index: u64,
+        lines: Vec<Vec<CellState>>,
+        /// Mirror's absolute line count at reply time. The oldest available
+        /// line is at `history_total - mirror_capacity` (conceptually).
+        history_total: u64,
         sent_at_ms: u64,
     },
 

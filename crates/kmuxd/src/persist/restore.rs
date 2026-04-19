@@ -231,6 +231,8 @@ mod tests {
                         cells: vec![Default::default(); 24 * 80],
                         cursor: CursorState::default(),
                         modes: TermModes::EMPTY,
+                        history_total: 0,
+                        scrollback_tail: Vec::new(),
                     },
                     scrollback_lines: vec![],
                     cwd: "/tmp".to_string(),

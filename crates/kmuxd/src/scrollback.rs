@@ -97,6 +97,7 @@ mod tests {
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
             scrollback_lines: vec![],
+            history_total: 0,
         })
     }
 

@@ -298,6 +298,25 @@ pub async fn handle_message<A: PaneAttacher>(
             debug!("client {client_id:?} snapshot mode = {enabled}");
         }
 
+        ClientMessage::FetchHistory {
+            request_id,
+            pane_id,
+            start_index,
+            count,
+        } => match state.app.fetch_history(&pane_id, start_index, count).await {
+            Ok((first_index, lines, history_total)) => {
+                state.send(ServerMessage::HistoryLines {
+                    request_id,
+                    pane_id,
+                    first_index,
+                    lines,
+                    history_total,
+                    sent_at_ms: kmux_protocol::messages::epoch_millis(),
+                });
+            }
+            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
+        },
+
         ClientMessage::Ping { seq } => {
             state.send(ServerMessage::Pong { seq });
         }

@@ -1,8 +1,23 @@
 mod compute;
+mod mirror;
+
+pub use mirror::ScrollbackMirror;
 
 use kmux_protocol::messages::{CellState, CursorState, GridSnapshot, TermModes};
 
 use crate::backend::{BackendSize, TerminalBackend};
+
+/// Maximum number of scrollback lines kept in the daemon's per-pane mirror.
+///
+/// When the mirror is full, the oldest line is evicted and `base_index` is
+/// bumped. Clients that ask for indices below `base_index` receive an empty
+/// or truncated response -- at that point the line is gone for good.
+pub const MIRROR_CAPACITY: usize = 10_000;
+
+/// Number of tail lines included in `GridSnapshot::scrollback_tail` so a
+/// reattaching client can render scrollback immediately without a round-trip
+/// for `FetchHistory`.
+pub const SNAPSHOT_TAIL_LINES: usize = 500;
 
 /// Result of a diff computation, distinguishing between cell changes,
 /// cursor-only changes, and no changes at all.
@@ -14,6 +29,10 @@ pub enum DiffResult {
     CursorOnly {
         cursor: CursorState,
         modes: TermModes,
+        /// Mirror's `history_total` as of this diff. Carried so the relay
+        /// can stamp replay-placeholder `TerminalDiff`s with a monotonic
+        /// value without reaching back into the engine.
+        history_total: u64,
     },
     /// Nothing changed since the last diff.
     None,
@@ -38,6 +57,11 @@ pub struct DiffEngine<B: TerminalBackend> {
     /// Saved main-screen history size when entering the alternate screen buffer.
     /// Used to avoid re-sending the entire scrollback when exiting alt screen.
     pub(super) saved_main_history_size: Option<usize>,
+    /// Bounded mirror of scrollback lines with absolute `u64` indices,
+    /// independent of the backend's own scrollback. Survives resize reflows
+    /// and alt-screen transitions, so reattaching clients can render
+    /// scrollback without waiting on the backend's volatile state.
+    pub(super) mirror: ScrollbackMirror,
 }
 
 impl<B: TerminalBackend> DiffEngine<B> {
@@ -58,6 +82,7 @@ impl<B: TerminalBackend> DiffEngine<B> {
             cols,
             prev_history_size,
             saved_main_history_size: None,
+            mirror: ScrollbackMirror::new(MIRROR_CAPACITY),
         }
     }
 
@@ -94,7 +119,21 @@ impl<B: TerminalBackend> DiffEngine<B> {
             cols,
             prev_history_size,
             saved_main_history_size: None,
+            mirror: ScrollbackMirror::new(MIRROR_CAPACITY),
         }
+    }
+
+    /// Absolute number of lines ever scrolled off the top of this pane, as
+    /// tracked by the mirror. Monotonically non-decreasing across resizes.
+    pub fn history_total(&self) -> u64 {
+        self.mirror.history_total()
+    }
+
+    /// Fetch up to `count` scrollback lines from the mirror starting at the
+    /// given absolute index. Returns `(first_index, lines)` where
+    /// `first_index >= start` (clamped to `base_index` if `start` is older).
+    pub fn mirror_range(&self, start: u64, count: u32) -> (u64, Vec<Vec<CellState>>) {
+        self.mirror.range(start, count)
     }
 
     /// Number of lines currently in the backend's scrollback history.
@@ -123,6 +162,10 @@ impl<B: TerminalBackend> DiffEngine<B> {
     }
 
     /// Take a full grid snapshot (for initial attach or post-resize).
+    ///
+    /// Includes a tail slice of the mirror (up to [`SNAPSHOT_TAIL_LINES`])
+    /// and the absolute `history_total`, so reattaching clients can render
+    /// scrollback immediately without an extra `FetchHistory` round-trip.
     pub fn snapshot(&self) -> GridSnapshot {
         let rows = self.rows as usize;
         let cols = self.cols as usize;
@@ -131,17 +174,40 @@ impl<B: TerminalBackend> DiffEngine<B> {
         let mut cells = vec![blank; rows * cols];
         let (cursor, modes) = self.backend.fill_cells_and_cursor(&mut cells);
 
+        let scrollback_tail = self.mirror.tail(SNAPSHOT_TAIL_LINES);
+        let history_total = self.mirror.history_total();
+
         GridSnapshot {
             rows: self.rows,
             cols: self.cols,
             cells,
             cursor,
             modes,
+            history_total,
+            scrollback_tail,
         }
     }
 
-    /// Resize the terminal. Resets `prev_cells` so the next diff is full-grid.
+    /// Resize the terminal. Resets viewport comparison state so the next
+    /// diff is full-grid, but preserves the scrollback mirror -- any lines
+    /// the backend still carries beyond our last-seen head are appended
+    /// before we forget them.
     pub fn resize(&mut self, size: BackendSize) {
+        // Drain any still-visible scrollback the backend holds beyond what we
+        // last mirrored, BEFORE resizing (the backend may drop or reflow
+        // lines during `resize()`).
+        let current_history_size = self.backend.history_size();
+        if !self.backend.is_alt_screen() && current_history_size > self.prev_history_size {
+            let new_count = current_history_size - self.prev_history_size;
+            let start = self.prev_history_size;
+            let lines = self
+                .backend
+                .read_history_lines(start, new_count, self.cols as usize);
+            if !lines.is_empty() {
+                self.mirror.append(lines);
+            }
+        }
+
         self.rows = size.rows;
         self.cols = size.cols;
         self.backend.resize(size);
@@ -150,6 +216,10 @@ impl<B: TerminalBackend> DiffEngine<B> {
         self.current_cells = vec![CellState::default(); n];
         self.prev_cursor = CursorState::default();
         self.prev_modes = TermModes::EMPTY;
+        // NOTE: do NOT reset `prev_history_size` to the post-resize backend
+        // value; that would mask any lines the backend evicted during reflow.
+        // The next `compute_diff()` re-reads `backend.history_size()` and
+        // appends the delta to the mirror.
         self.prev_history_size = self.backend.history_size();
         self.saved_main_history_size = None;
     }
