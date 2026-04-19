@@ -223,6 +223,21 @@ impl SessionManager {
                         title: String::new(),
                     });
                 }
+                // `PaneCreated` is the direct reply to this client's own
+                // `PaneCreate` request, so switch focus to the new pane —
+                // mirrors `select_pane` semantics. Broadcasts to other clients
+                // use `SessionEventMsg::PaneSpawned`, which is not handled
+                // here and therefore does not steal focus.
+                if let Some(prev) = self.active_pane.take()
+                    && prev != pane_id
+                {
+                    self.send_ws(ClientMessage::Detach { pane_id: prev });
+                }
+                self.active_session = Some(session_word_id);
+                self.active_pane = Some(pane_id.clone());
+                if let Some(buf) = self.buffers.get_mut(&pane_id) {
+                    buf.clear();
+                }
                 self.attach_fresh(pane_id.clone());
                 events.push(SessionEvent::PaneCreated { pane_id });
             }

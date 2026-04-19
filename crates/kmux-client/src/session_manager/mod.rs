@@ -438,6 +438,54 @@ mod tests {
     }
 
     #[test]
+    fn pane_created_switches_active_and_detaches_previous() {
+        use super::server_handler::SessionEvent;
+        let (mut mgr, mut rx) = make_connected_manager();
+
+        mgr.session_list
+            .push(make_entry("eagle", "/home/user/proj"));
+        mgr.active_session = Some("eagle".to_string());
+        mgr.active_pane = Some("eagle/0".to_string());
+        mgr.buffers
+            .insert("eagle/0".to_string(), CellGrid::default());
+        // Drain anything pending so we can inspect only the messages emitted
+        // by the PaneCreated handler.
+        while rx.try_recv().is_ok() {}
+
+        let events = mgr.handle_server_message(ServerMessage::PaneCreated {
+            request_id: 0,
+            pane_id: "eagle/1".to_string(),
+            session_word_id: "eagle".to_string(),
+            size: TermSize::default(),
+        });
+
+        assert!(matches!(
+            events.as_slice(),
+            [SessionEvent::PaneCreated { pane_id }] if pane_id == "eagle/1"
+        ));
+        assert_eq!(mgr.active_session.as_deref(), Some("eagle"));
+        assert_eq!(mgr.active_pane.as_deref(), Some("eagle/1"));
+        assert!(mgr.buffers.contains_key("eagle/1"));
+
+        // Expect a `Detach eagle/0` followed by an `Attach eagle/1`.
+        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                ClientMessage::Detach { pane_id } if pane_id == "eagle/0"
+            )),
+            "previous pane must be detached: {msgs:?}",
+        );
+        assert!(
+            msgs.iter().any(|m| matches!(
+                m,
+                ClientMessage::Attach { pane_id, .. } if pane_id == "eagle/1"
+            )),
+            "new pane must be attached: {msgs:?}",
+        );
+    }
+
+    #[test]
     fn session_closed_removes_and_falls_back() {
         use super::server_handler::SessionEvent;
         let (mut mgr, _rx) = make_connected_manager();
