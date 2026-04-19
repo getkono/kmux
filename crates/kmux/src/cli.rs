@@ -1,7 +1,21 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
 
 #[derive(Parser, Debug)]
-#[command(name = "kmux", about = "kmux remote terminal client (TUI)", version)]
+#[command(
+    name = "kmux",
+    about = "kmux remote terminal client (TUI)",
+    version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("BUILD_GIT_SHA"),
+        env!("BUILD_GIT_DIRTY_SUFFIX"),
+        ", ",
+        env!("BUILD_DATE"),
+        ", ",
+        env!("BUILD_PROFILE"),
+        ")"
+    )
+)]
 pub struct Cli {
     #[command(subcommand)]
     pub command: Option<Command>,
