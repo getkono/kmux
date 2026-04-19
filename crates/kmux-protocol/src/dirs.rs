@@ -17,6 +17,40 @@ pub const KMUX_DIR_NAME: &str = "kmux-debug";
 #[cfg(not(debug_assertions))]
 pub const KMUX_DIR_NAME: &str = "kmux";
 
+/// Cargo build profile of a kmux binary.
+///
+/// Advertised by `kmuxd` in its status response and checked by `kmux` during
+/// the control-socket handshake: a mismatch means the client and the daemon
+/// resolved different runtime dirs (`kmux-debug/` vs `kmux/`), so the client
+/// would have silently attached to the wrong instance — we refuse.
+#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum BuildProfile {
+    Debug,
+    Release,
+}
+
+impl BuildProfile {
+    /// Profile the current crate was compiled with.
+    #[cfg(debug_assertions)]
+    pub const CURRENT: Self = Self::Debug;
+    #[cfg(not(debug_assertions))]
+    pub const CURRENT: Self = Self::Release;
+
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Debug => "debug",
+            Self::Release => "release",
+        }
+    }
+}
+
+impl std::fmt::Display for BuildProfile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Returns the kmux runtime directory, creating it if necessary.
 ///
 /// Prefers `$XDG_RUNTIME_DIR/{KMUX_DIR_NAME}` — a per-user, in-memory

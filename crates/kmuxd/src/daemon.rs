@@ -204,6 +204,7 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
                 session_count,
                 protocol_version: kmux_protocol::messages::PROTOCOL_VERSION,
                 kmuxd_version: env!("CARGO_PKG_VERSION").to_string(),
+                build_profile: Some(kmux_protocol::dirs::BuildProfile::CURRENT),
                 endpoints,
             };
             let mut json = match serde_json::to_string(&response) {

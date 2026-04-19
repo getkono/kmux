@@ -34,28 +34,61 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
             println!("Daemon stopped");
         }
 
-        DaemonAction::Status => match kmux_client::daemon::query_daemon().await {
-            Some(status) => {
-                use kmux_protocol::messages::PROTOCOL_VERSION;
-                println!("Status:   running");
-                println!("PID:      {}", status.pid);
-                println!("Port:     {}", status.port);
-                println!("Uptime:   {}", render::format_uptime(status.uptime_secs));
-                println!("Sessions: {}", status.session_count);
-                println!("Protocol: {}", status.protocol_version);
-                println!("Version:  {}", status.kmuxd_version);
-                if status.protocol_version != 0 && status.protocol_version != PROTOCOL_VERSION {
+        DaemonAction::Status => {
+            use kmux_protocol::dirs::BuildProfile;
+            use kmux_protocol::messages::PROTOCOL_VERSION;
+
+            let socket_display = kmux_protocol::dirs::socket_path()
+                .map(|p| p.display().to_string())
+                .unwrap_or_else(|e| format!("<error: {e}>"));
+
+            match kmux_client::daemon::query_daemon().await {
+                Some(status) => {
+                    let daemon_profile = status
+                        .build_profile
+                        .map(|p| p.as_str())
+                        .unwrap_or("<unknown>");
+                    let protocol_mismatch =
+                        status.protocol_version != 0 && status.protocol_version != PROTOCOL_VERSION;
+                    let profile_mismatch = status.build_profile != Some(BuildProfile::CURRENT);
+
+                    println!("Status:   running");
+                    println!("Socket:   {socket_display}");
+                    println!("PID:      {}", status.pid);
+                    println!("Port:     {}", status.port);
+                    println!("Uptime:   {}", render::format_uptime(status.uptime_secs));
+                    println!("Sessions: {}", status.session_count);
+                    println!("Protocol: {}", status.protocol_version);
+                    println!("Version:  {}", status.kmuxd_version);
                     println!(
-                        "Warning:  protocol version mismatch (client={PROTOCOL_VERSION}). \
-                         Run `kmux daemon restart`."
+                        "Profile:  daemon={daemon_profile} client={client}",
+                        client = BuildProfile::CURRENT,
                     );
+                    if protocol_mismatch {
+                        println!(
+                            "Error:    protocol version mismatch (client={PROTOCOL_VERSION}). \
+                             Run `kmux daemon restart`."
+                        );
+                    }
+                    if profile_mismatch {
+                        println!(
+                            "Error:    build profile mismatch — kmux refuses to attach. \
+                             Debug and release builds use separate runtime dirs; run the \
+                             matching `kmux` binary or restart the daemon with a matching build."
+                        );
+                    }
+                    if protocol_mismatch || profile_mismatch {
+                        std::process::exit(1);
+                    }
+                }
+                None => {
+                    println!("Status:   not running");
+                    println!("Socket:   {socket_display}");
+                    println!("Profile:  client={}", BuildProfile::CURRENT);
+                    std::process::exit(1);
                 }
             }
-            None => {
-                println!("Status:   not running");
-                std::process::exit(1);
-            }
-        },
+        }
 
         DaemonAction::Restart => {
             // Stop (ignore "not running").

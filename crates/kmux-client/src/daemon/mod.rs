@@ -13,6 +13,7 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
 use kmux_protocol::control_rpc::{SessionsResponse, StatusResponse};
+use kmux_protocol::dirs::BuildProfile;
 
 /// Connection parameters returned by the running daemon.
 #[derive(Debug)]
@@ -25,6 +26,9 @@ pub struct DaemonStatus {
     pub session_count: usize,
     pub protocol_version: u32,
     pub kmuxd_version: String,
+    /// `None` when the daemon predates this field — treated as
+    /// unverifiable and therefore rejected by `ensure_compatible_daemon`.
+    pub build_profile: Option<BuildProfile>,
 }
 
 /// Send a single JSON command to the daemon control socket and parse the response.
@@ -79,6 +83,7 @@ pub async fn query_daemon() -> Option<DaemonStatus> {
         session_count: resp.session_count,
         protocol_version: resp.protocol_version,
         kmuxd_version: resp.kmuxd_version,
+        build_profile: resp.build_profile,
     })
 }
 
@@ -108,6 +113,31 @@ pub async fn ensure_compatible_daemon() -> anyhow::Result<DaemonStatus> {
             status.kmuxd_version,
             hint
         );
+    }
+
+    let socket = || {
+        kmux_protocol::dirs::socket_path()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| "<unknown>".to_string())
+    };
+    match status.build_profile {
+        Some(p) if p == BuildProfile::CURRENT => {}
+        Some(p) => anyhow::bail!(
+            "build profile mismatch: kmux is {client} but the daemon answering on \
+             {socket} is {daemon}. Debug and release builds keep separate runtime \
+             dirs, so the two never share sockets — run the matching kmux binary \
+             or restart the daemon with a matching build.",
+            client = BuildProfile::CURRENT,
+            daemon = p,
+            socket = socket(),
+        ),
+        None => anyhow::bail!(
+            "daemon on {socket} did not report a build profile; refusing to attach \
+             because we cannot verify it matches kmux ({client}). Restart the \
+             daemon with a current kmuxd build.",
+            client = BuildProfile::CURRENT,
+            socket = socket(),
+        ),
     }
 
     Ok(status)
@@ -246,6 +276,55 @@ mod tests {
         assert!(
             msg.contains("protocol version mismatch"),
             "error should mention mismatch: {msg}"
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ensure_compatible_daemon_rejects_build_profile_mismatch() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+
+        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        let my_pid = std::process::id();
+        // Flip the profile so it never matches whatever the test binary was
+        // compiled with.
+        let wrong_profile = match BuildProfile::CURRENT {
+            BuildProfile::Debug => "release",
+            BuildProfile::Release => "debug",
+        };
+        let proto = kmux_protocol::messages::PROTOCOL_VERSION;
+
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                let response = format!(
+                    "{{\"status\":\"running\",\"port\":9999,\"token\":\"tok\",\
+                     \"pid\":{my_pid},\"uptime_secs\":0,\"session_count\":0,\
+                     \"protocol_version\":{proto},\"kmuxd_version\":\"0.0.0\",\
+                     \"build_profile\":\"{wrong_profile}\"}}\n"
+                );
+                write_half.write_all(response.as_bytes()).await.unwrap();
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        let result = super::ensure_compatible_daemon().await;
+        assert!(result.is_err(), "expected Err on build profile mismatch");
+        let msg = result.unwrap_err().to_string();
+        assert!(
+            msg.contains("build profile mismatch"),
+            "error should mention build profile mismatch: {msg}"
         );
     }
 

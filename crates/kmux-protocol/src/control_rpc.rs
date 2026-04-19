@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 
+use crate::dirs::BuildProfile;
 use crate::messages::SessionMeta;
 
 /// Canonical argv appended when the client spawns a local daemon.
@@ -38,6 +39,12 @@ pub struct StatusResponse {
     pub protocol_version: u32,
     #[serde(default)]
     pub kmuxd_version: String,
+    /// Cargo profile `kmuxd` was compiled with.
+    ///
+    /// `None` only when the peer predates this field — the client treats that
+    /// as a refused handshake because an unknown profile cannot be verified.
+    #[serde(default)]
+    pub build_profile: Option<BuildProfile>,
     #[serde(default)]
     pub endpoints: Vec<EndpointEntry>,
 }
