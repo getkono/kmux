@@ -73,7 +73,7 @@ impl CertMaterial {
             generate_simple_self_signed(subject_alt_names).context("rcgen self-signed cert")?;
 
         let certs = vec![CertificateDer::from(cert.cert.der().to_vec())];
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.key_pair.serialize_der()));
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(cert.signing_key.serialize_der()));
 
         Ok(Self { certs, key })
     }

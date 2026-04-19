@@ -22,7 +22,7 @@ use kmux_protocol::messages::{
 use kmux_pty::events::SessionEvent;
 use kmux_pty::registry::SessionManager as PtyRegistry;
 use kmux_pty::session::PtyWriter;
-use rand::SeedableRng;
+use rand::SeedableRng as _;
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 
 use crate::capability::intersect_for_atomics;
@@ -261,7 +261,7 @@ impl ServerApp {
             next_connection_id: AtomicU64::new(1),
             connections: RwLock::new(HashMap::new()),
             wordlist: Mutex::new(WordlistSampler::new()),
-            rng: Mutex::new(rand::rngs::SmallRng::from_os_rng()),
+            rng: Mutex::new(rand::rngs::SmallRng::from_rng(&mut rand::rng())),
             conn_count_tx,
         }
     }

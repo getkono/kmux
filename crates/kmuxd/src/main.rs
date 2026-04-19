@@ -19,7 +19,7 @@ mod tls;
 mod wordlist;
 
 use clap::Parser;
-use rand::RngCore;
+use rand::Rng;
 use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 

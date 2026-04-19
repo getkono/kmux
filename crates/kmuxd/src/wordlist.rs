@@ -1,4 +1,4 @@
-use rand::Rng;
+use rand::{Rng, RngExt};
 
 const WORDLIST_RAW: &str = include_str!("eff_long_wordlist.txt");
 

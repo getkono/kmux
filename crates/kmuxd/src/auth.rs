@@ -2,7 +2,7 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 
-use rand::RngCore;
+use rand::Rng;
 
 /// Persist `token` to the kmux runtime token file with mode 0600.
 /// Returns the path on success.

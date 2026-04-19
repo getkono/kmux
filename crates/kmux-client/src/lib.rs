@@ -3,7 +3,7 @@ pub mod connect;
 pub mod connection_log;
 pub mod connection_state;
 
-use rand::RngCore;
+use rand::Rng;
 
 /// Generate a random 4-byte hex instance identifier.
 pub fn generate_instance_id() -> String {

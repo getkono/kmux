@@ -59,8 +59,13 @@ pub fn render_metrics_overlay(f: &mut Frame, area: Rect, app: &App) {
 
     // Collect per-transport totals for card headers.
     let mut by_transport = metrics.network.snapshot_by_transport();
-    by_transport
-        .sort_by(|a, b| transport_sort_order(a.0.kind).cmp(&transport_sort_order(b.0.kind)));
+    // Stable order: by kind first, then by address so same-kind transports
+    // don't shuffle with HashMap iteration order on each frame.
+    by_transport.sort_by(|a, b| {
+        transport_sort_order(a.0.kind)
+            .cmp(&transport_sort_order(b.0.kind))
+            .then_with(|| a.0.address.cmp(&b.0.address))
+    });
 
     // Collect per-category breakdown for sub-rows.
     let all_buckets = metrics.network.snapshot();
@@ -255,6 +260,47 @@ mod tests {
         );
         assert!(
             transport_sort_order(TransportKind::Quic) < transport_sort_order(TransportKind::TcpTls)
+        );
+    }
+
+    #[test]
+    fn same_kind_transports_sort_deterministically_by_address() {
+        use kmux_client::metrics::TransportKey;
+
+        // Two same-kind entries: the overlay sort must pin them by address,
+        // otherwise HashMap iteration order causes them to swap each frame.
+        let mut entries = [
+            (
+                TransportKey::new(TransportKind::Quic, "zeta.example:8443"),
+                TransportCounters::default(),
+            ),
+            (
+                TransportKey::new(TransportKind::Quic, "alpha.example:8443"),
+                TransportCounters::default(),
+            ),
+            (
+                TransportKey::new(TransportKind::Uds, "/tmp/b.sock"),
+                TransportCounters::default(),
+            ),
+            (
+                TransportKey::new(TransportKind::Uds, "/tmp/a.sock"),
+                TransportCounters::default(),
+            ),
+        ];
+        entries.sort_by(|a, b| {
+            transport_sort_order(a.0.kind)
+                .cmp(&transport_sort_order(b.0.kind))
+                .then_with(|| a.0.address.cmp(&b.0.address))
+        });
+        let addrs: Vec<&str> = entries.iter().map(|(k, _)| k.address.as_str()).collect();
+        assert_eq!(
+            addrs,
+            vec![
+                "/tmp/a.sock",
+                "/tmp/b.sock",
+                "alpha.example:8443",
+                "zeta.example:8443",
+            ],
         );
     }
 
