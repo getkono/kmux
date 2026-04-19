@@ -88,6 +88,7 @@ impl ServerApp {
             size: relay.size,
             attached_clients: vec![],
             status: SessionStatus::Running,
+            title: relay.title.lock().unwrap().clone(),
         };
 
         let mut panes = HashMap::new();
@@ -158,6 +159,7 @@ impl ServerApp {
                             size: relay.size,
                             attached_clients,
                             status: relay.status.clone(),
+                            title: relay.title.lock().unwrap().clone(),
                         }
                     })
                     .collect();

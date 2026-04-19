@@ -28,6 +28,36 @@ impl TopBarSegment {
     }
 }
 
+/// Maximum codepoints of title shown inside a pane tab. Longer titles are
+/// truncated with an ellipsis so the tab bar does not push later tabs
+/// off-screen on narrow terminals.
+const TAB_TITLE_MAX_CHARS: usize = 20;
+
+/// Collapse interior whitespace and truncate the title for display inside a
+/// pane tab. Returns an empty string when the title is empty or whitespace
+/// only. Newlines inside titles are flattened to a single space since tabs
+/// render on one line.
+fn truncate_tab_title(title: &str) -> String {
+    let cleaned: String = title
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    let char_count = trimmed.chars().count();
+    if char_count <= TAB_TITLE_MAX_CHARS {
+        return trimmed.to_string();
+    }
+    let mut out: String = trimmed
+        .chars()
+        .take(TAB_TITLE_MAX_CHARS.saturating_sub(1))
+        .collect();
+    out.push('\u{2026}');
+    out
+}
+
 pub(super) fn render_session_bar(f: &mut Frame, app: &mut App, area: Rect) {
     let segments = build_session_bar_segments(app);
     let sep_style = Style::default().bg(app.theme.status_bg);
@@ -91,10 +121,12 @@ fn build_session_bar_segments(app: &App) -> Vec<TopBarSegment> {
     } else {
         for pane in panes.iter() {
             let is_active = active_pane.as_deref() == Some(pane.pane_id.as_str());
-            let label = if is_active {
-                format!(" \u{2022}{} ", pane.pane_index)
-            } else {
-                format!(" {} ", pane.pane_index)
+            let title = truncate_tab_title(&pane.title);
+            let label = match (is_active, title.is_empty()) {
+                (true, true) => format!(" \u{2022}{} ", pane.pane_index),
+                (true, false) => format!(" \u{2022}{} {} ", pane.pane_index, title),
+                (false, true) => format!(" {} ", pane.pane_index),
+                (false, false) => format!(" {} {} ", pane.pane_index, title),
             };
             let style = if is_active {
                 Style::default()
@@ -432,6 +464,58 @@ mod tests {
             hits.action_at(col).unwrap(),
             TopBarAction::OpenSessionPicker
         ));
+    }
+
+    #[test]
+    fn tab_title_empty_yields_empty_string() {
+        assert_eq!(truncate_tab_title(""), "");
+        assert_eq!(truncate_tab_title("   "), "");
+    }
+
+    #[test]
+    fn tab_title_short_kept_verbatim() {
+        assert_eq!(truncate_tab_title("nvim"), "nvim");
+    }
+
+    #[test]
+    fn tab_title_long_truncated_with_ellipsis() {
+        let long = "a".repeat(50);
+        let out = truncate_tab_title(&long);
+        assert_eq!(out.chars().count(), TAB_TITLE_MAX_CHARS);
+        assert!(
+            out.ends_with('\u{2026}'),
+            "truncated title must end with ellipsis, got {out:?}"
+        );
+    }
+
+    #[test]
+    fn tab_title_control_chars_flattened() {
+        assert_eq!(truncate_tab_title("nvim\r\nfoo"), "nvim  foo");
+    }
+
+    /// Regression: a title containing a multi-byte glyph still measures to the
+    /// correct display column count so later tabs remain clickable.
+    #[test]
+    fn tab_with_multibyte_title_has_correct_hitbox_width() {
+        let regions = layout(vec![
+            seg(" \u{25b6} main ", Some(TopBarAction::OpenSessionPicker)),
+            seg(
+                " \u{2022}0 \u{65e5}\u{672c} ",
+                Some(TopBarAction::SelectPane("p0".into())),
+            ),
+        ]);
+        assert_eq!(regions.len(), 2);
+        let pane = regions
+            .iter()
+            .find(|(_, a)| matches!(a, TopBarAction::SelectPane(id) if id == "p0"))
+            .unwrap();
+        // " •0 日本 " is 8 display columns (• and 日/本 each count as wide
+        // glyphs via ratatui's unicode-width).
+        assert!(
+            pane.0.end > pane.0.start,
+            "multibyte tab must have non-zero hit-box: {:?}",
+            pane.0,
+        );
     }
 
     #[test]

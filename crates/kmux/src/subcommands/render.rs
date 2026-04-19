@@ -306,6 +306,7 @@ mod tests {
                 },
                 attached_clients: vec![],
                 status: SessionStatus::Running,
+                title: String::new(),
             }],
         }];
         let rows = session_rows(&sessions);

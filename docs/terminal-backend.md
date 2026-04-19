@@ -239,6 +239,18 @@ response starting at `base_index`.
 Postcard is not self-describing — any struct field or enum variant change
 is a wire break, which is why v14 → v15 → v16 each bump the version.
 
+### Wire changes (v17)
+
+`PROTOCOL_VERSION` = **17**. Added fields/messages:
+
+- `PaneInfo` gains `title: String` (latest OSC 0/2 window title; empty until
+  the program emits one). Populated by the daemon from `PaneRelay.title`.
+- New `SessionEventMsg::PaneTitleChanged { pane_id, title }` broadcast by the
+  daemon whenever the pane's VT emulator reports a new title. Production
+  pane relays install a `PaneTitleSink` as the backend's event sink; the
+  sink stores the title on the relay and pushes the event to every attached
+  client on the unbounded control channel (non-blocking; VT-parser-safe).
+
 ### Daemon flow (per diff)
 
 ```

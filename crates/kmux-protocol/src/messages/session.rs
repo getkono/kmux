@@ -111,6 +111,9 @@ pub struct PaneInfo {
     pub attached_clients: Vec<ClientId>,
     /// Whether the pane's child process is still running.
     pub status: SessionStatus,
+    /// Latest window title reported by the pane's program via OSC 0/2.
+    /// Empty until the program emits a title sequence.
+    pub title: String,
 }
 
 /// Full session listing entry returned by `SessionList` and related messages.
@@ -151,6 +154,8 @@ pub enum SessionEventMsg {
     },
     /// A pane was resized.
     PaneResized { pane_id: PaneId, size: TermSize },
+    /// A pane's program reported a new window title (OSC 0/2).
+    PaneTitleChanged { pane_id: PaneId, title: String },
     /// A pane was closed.
     PaneClosed { pane_id: PaneId },
 }
@@ -182,6 +187,23 @@ mod tests {
         assert_eq!(d.cols, 80);
         assert_eq!(d.pixel_width, 0);
         assert_eq!(d.pixel_height, 0);
+    }
+
+    #[test]
+    fn pane_title_changed_roundtrips() {
+        let msg = SessionEventMsg::PaneTitleChanged {
+            pane_id: "eagle/0".to_string(),
+            title: "~/dev/kmux".to_string(),
+        };
+        let bytes = postcard::to_allocvec(&msg).expect("serialize");
+        let decoded: SessionEventMsg = postcard::from_bytes(&bytes).expect("deserialize");
+        match decoded {
+            SessionEventMsg::PaneTitleChanged { pane_id, title } => {
+                assert_eq!(pane_id, "eagle/0");
+                assert_eq!(title, "~/dev/kmux");
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 
     #[test]

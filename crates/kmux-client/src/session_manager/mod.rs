@@ -355,6 +355,7 @@ mod tests {
                 size: TermSize::default(),
                 attached_clients: vec![],
                 status: SessionStatus::Running,
+                title: String::new(),
             }],
         }
     }

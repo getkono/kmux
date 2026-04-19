@@ -7,16 +7,14 @@ use kmux_protocol::messages::{ClientCapabilities, InputMode, PaneId, SessionStat
 use kmux_pty::config::{EnvBuilder, PtyConfig};
 use kmux_pty::error::Result;
 
-use crate::backend::{
-    BackendConfig, BackendSize, CapabilityHandles, DEFAULT_SCROLLBACK, NullEventSink,
-};
+use crate::backend::{BackendConfig, BackendSize, CapabilityHandles, DEFAULT_SCROLLBACK};
 use crate::capability::{intersect_for_atomics, pane_spawn_env};
 use crate::relay::session_diff_loop;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::new_term_state;
 
 use super::helpers::resolve_cwd;
-use super::{ClientMap, PaneRelay, SCROLLBACK_CAPACITY, ServerApp};
+use super::{ClientMap, PaneRelay, PaneTitleSink, SCROLLBACK_CAPACITY, ServerApp};
 
 impl ServerApp {
     /// Add a new pane to an existing session.
@@ -144,13 +142,19 @@ impl ServerApp {
 
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         let scrollback = Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY)));
+        let title = Arc::new(Mutex::new(String::new()));
+        let title_sink = Arc::new(PaneTitleSink::new(
+            pane_id.to_string(),
+            title.clone(),
+            clients.clone(),
+        ));
         let term_state = Arc::new(Mutex::new(new_term_state(BackendConfig {
             size: BackendSize::from(size),
             capabilities: CapabilityHandles {
                 kitty_graphics: kitty_graphics_enabled.clone(),
                 kitty_keyboard: kitty_keyboard_enabled.clone(),
             },
-            events: Arc::new(NullEventSink),
+            events: title_sink,
             scrollback: DEFAULT_SCROLLBACK,
         })));
         let seqno_counter = Arc::new(AtomicU64::new(1));
@@ -178,6 +182,7 @@ impl ServerApp {
             status: SessionStatus::Running,
             kitty_graphics_enabled,
             kitty_keyboard_enabled,
+            title,
         })
     }
 }

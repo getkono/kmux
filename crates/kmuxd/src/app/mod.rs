@@ -53,6 +53,50 @@ pub struct ClientSender {
 /// Shared map of per-client output senders for a single pane.
 pub type ClientMap = Arc<Mutex<HashMap<ClientId, ClientSender>>>;
 
+/// Backend event sink that owns the canonical title string for a pane and
+/// broadcasts `PaneTitleChanged` events to every currently-attached client
+/// whenever the VT emulator reports a new OSC 0/2 title.
+///
+/// The `on_title` callback is invoked from the VT parser loop, so sends use
+/// non-blocking channel operations only.
+pub struct PaneTitleSink {
+    pane_id: String,
+    title: Arc<Mutex<String>>,
+    clients: ClientMap,
+}
+
+impl PaneTitleSink {
+    pub fn new(pane_id: String, title: Arc<Mutex<String>>, clients: ClientMap) -> Self {
+        Self {
+            pane_id,
+            title,
+            clients,
+        }
+    }
+}
+
+impl crate::backend::BackendEventSink for PaneTitleSink {
+    fn on_title(&self, title: &str) {
+        {
+            let mut current = self.title.lock().unwrap();
+            if *current == title {
+                return;
+            }
+            *current = title.to_string();
+        }
+        let event = kmux_protocol::messages::ServerMessage::Event {
+            event: kmux_protocol::messages::SessionEventMsg::PaneTitleChanged {
+                pane_id: self.pane_id.clone(),
+                title: title.to_string(),
+            },
+        };
+        let map = self.clients.lock().unwrap();
+        for sender in map.values() {
+            let _ = sender.ctrl_tx.send(event.clone());
+        }
+    }
+}
+
 /// Per-pane relay state (formerly `SessionRelay`).
 pub struct PaneRelay {
     /// Per-client output senders, shared with the relay task.
@@ -85,6 +129,9 @@ pub struct PaneRelay {
     /// Shared with the active terminal backend via `CapabilityHandles`;
     /// updated on every client attach/detach.
     pub kitty_keyboard_enabled: Arc<AtomicBool>,
+    /// Latest window title reported by the pane via OSC 0/2. Shared with the
+    /// backend event sink, which updates it and broadcasts to clients.
+    pub title: Arc<Mutex<String>>,
 }
 
 impl PaneRelay {
@@ -628,6 +675,7 @@ mod tests {
             status: kmux_protocol::messages::SessionStatus::Running,
             kitty_graphics_enabled,
             kitty_keyboard_enabled,
+            title: Arc::new(Mutex::new(String::new())),
         }
     }
 

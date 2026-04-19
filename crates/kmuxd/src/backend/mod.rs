@@ -80,8 +80,12 @@ pub trait BackendEventSink: Send + Sync + 'static {
     fn on_hyperlink(&self, _id: Option<&str>, _uri: &str) {}
 }
 
-/// A no-op event sink used when the host does not need backend events.
+/// A no-op event sink used in tests that do not need backend events.
+/// Production pane relays install a real sink (`PaneTitleSink`) so OSC 0/2
+/// titles flow through to clients.
+#[cfg(test)]
 pub struct NullEventSink;
+#[cfg(test)]
 impl BackendEventSink for NullEventSink {}
 
 /// Configuration passed to [`TerminalBackend::new`].

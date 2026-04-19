@@ -28,6 +28,8 @@ pub enum SessionEvent {
     PaneCreated { pane_id: String },
     /// A pane was closed.
     PaneClosed { pane_id: String },
+    /// A pane's window title changed (OSC 0/2).
+    PaneTitleChanged { pane_id: String, title: String },
     /// A structured error from the server.
     ServerError { message: String },
     /// Input lock acquired on a pane.
@@ -218,6 +220,7 @@ impl SessionManager {
                         size,
                         attached_clients: vec![],
                         status: SessionStatus::Running,
+                        title: String::new(),
                     });
                 }
                 self.attach_fresh(pane_id.clone());
@@ -353,6 +356,18 @@ impl SessionManager {
                 if let Some(grid) = self.buffers.get_mut(&pane_id) {
                     grid.resize(size.rows, size.cols);
                 }
+            }
+
+            ServerMessage::Event {
+                event: SessionEventMsg::PaneTitleChanged { pane_id, title },
+            } => {
+                for entry in &mut self.session_list {
+                    if let Some(pane) = entry.panes.iter_mut().find(|p| p.pane_id == pane_id) {
+                        pane.title = title.clone();
+                        break;
+                    }
+                }
+                events.push(SessionEvent::PaneTitleChanged { pane_id, title });
             }
 
             ServerMessage::Event { .. } => {}
