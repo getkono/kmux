@@ -1,4 +1,5 @@
 use kmux_client::connection_state::ConnectionState;
+use kmux_protocol::dirs::BuildProfile;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Color, Modifier, Style};
@@ -198,32 +199,53 @@ pub(super) fn render_status_bar(f: &mut Frame, app: &App, area: Rect) {
         ));
     }
 
+    let mut right_spans: Vec<Span<'static>> = Vec::new();
     let status_msg = app.mgr.status_msg();
     if !status_msg.is_empty() {
-        let used: usize = spans.iter().map(|s| s.width()).sum();
-        let msg_len = status_msg.chars().count() + 2;
-        let gap = (area.width as usize).saturating_sub(used + msg_len);
-        if gap > 0 {
-            spans.push(Span::styled(
-                " ".repeat(gap),
-                Style::default().bg(theme.status_bg),
-            ));
-        }
-        spans.push(Span::styled(
+        right_spans.push(Span::styled(
             format!(" {} ", status_msg),
             Style::default().fg(theme.fg_dim).bg(theme.status_bg),
         ));
     }
+    if let Some(badge) = profile_badge(BuildProfile::CURRENT, theme) {
+        right_spans.extend(badge);
+    }
 
-    let used: usize = spans.iter().map(|s| s.width()).sum();
-    if used < area.width as usize {
+    let left_width: usize = spans.iter().map(|s| s.width()).sum();
+    let right_width: usize = right_spans.iter().map(|s| s.width()).sum();
+    let gap = (area.width as usize).saturating_sub(left_width + right_width);
+    if gap > 0 {
         spans.push(Span::styled(
-            " ".repeat(area.width as usize - used),
+            " ".repeat(gap),
             Style::default().bg(theme.status_bg),
         ));
     }
+    spans.extend(right_spans);
 
     f.render_widget(Paragraph::new(Line::from(spans)), area);
+}
+
+/// "DEBUG" badge pinned to the far right of the status bar on debug builds so
+/// it is hard to miss that a `cargo run`/`cargo build` binary is attached
+/// rather than an installed release. Release builds render nothing.
+///
+/// Takes `profile` as a parameter (rather than reading `BuildProfile::CURRENT`
+/// directly) so tests can exercise both branches regardless of which profile
+/// the test binary was compiled with.
+fn profile_badge(profile: BuildProfile, theme: &Theme) -> Option<Vec<Span<'static>>> {
+    match profile {
+        BuildProfile::Debug => Some(vec![
+            Span::styled(" ", Style::default().bg(theme.status_bg)),
+            Span::styled(
+                " DEBUG ",
+                Style::default()
+                    .fg(theme.bg)
+                    .bg(theme.orange)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        BuildProfile::Release => None,
+    }
 }
 
 pub(super) fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
@@ -410,6 +432,22 @@ mod tests {
             hits.action_at(col).unwrap(),
             TopBarAction::OpenSessionPicker
         ));
+    }
+
+    #[test]
+    fn profile_badge_renders_only_on_debug_builds() {
+        let theme = crate::theme::default_theme();
+        let debug = profile_badge(BuildProfile::Debug, &theme).expect("debug yields badge");
+        let release = profile_badge(BuildProfile::Release, &theme);
+
+        assert!(release.is_none(), "release builds must not show the badge");
+        let width: usize = debug.iter().map(|s| s.width()).sum();
+        assert_eq!(width, 8, "badge is a 1-col gutter plus ' DEBUG ' (7 cols)");
+        let text: String = debug.iter().map(|s| s.content.as_ref()).collect();
+        assert!(
+            text.contains("DEBUG"),
+            "badge must spell DEBUG, got {text:?}"
+        );
     }
 
     #[test]
