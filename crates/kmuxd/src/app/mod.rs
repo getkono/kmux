@@ -78,10 +78,12 @@ pub struct PaneRelay {
     /// Pane lifecycle status (Running or Exited).
     pub status: SessionStatus,
     /// Live toggle for kitty graphics protocol in the backend emulator.
-    /// Shared with `WezTermBackend`; updated on every client attach/detach.
+    /// Shared with the active terminal backend via `CapabilityHandles`;
+    /// updated on every client attach/detach.
     pub kitty_graphics_enabled: Arc<AtomicBool>,
     /// Live toggle for kitty keyboard protocol in the backend emulator.
-    /// Shared with `WezTermBackend`; updated on every client attach/detach.
+    /// Shared with the active terminal backend via `CapabilityHandles`;
+    /// updated on every client attach/detach.
     pub kitty_keyboard_enabled: Arc<AtomicBool>,
 }
 

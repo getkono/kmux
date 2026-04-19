@@ -12,7 +12,7 @@ kmux uses a **server-authoritative VT rendering model**.  Only the daemon
 (`kmuxd`) runs a VT emulator; clients receive pre-resolved cell data.
 
 ```
-PTY stdout ──bytes──▶ WezTermBackend (tattoy-wezterm-term)
+PTY stdout ──bytes──▶ GhosttyBackend (libghostty-vt)
                               │
                               ▼
                        DiffEngine<B>   ← frame-to-frame diffing
@@ -22,17 +22,21 @@ PTY stdout ──bytes──▶ WezTermBackend (tattoy-wezterm-term)
                     ServerMessage::TerminalUpdate ──wire──▶ thin clients
 ```
 
-The backend (`crates/kmuxd/src/backend/wezterm/`) parses raw PTY bytes through
-`tattoy-wezterm-term`, resolves all named/indexed colours to RGB, and emits
-`CellState` structs containing `(char, fg_rgb, bg_rgb, CellAttrs)`.  Clients
-never touch raw escape sequences.  This means:
+The backend (`crates/kmuxd/src/backend/ghostty/`) parses raw PTY bytes through
+`libghostty-vt` (accessed via the `kmux-ghostty` safe façade over a kmux-owned
+C ABI in `crates/kmux-ghostty-sys/zig/src/wrapper.zig`), resolves all
+named/indexed colours to RGB, and emits `CellState` structs containing
+`(char, fg_rgb, bg_rgb, CellAttrs)`.  Clients never touch raw escape
+sequences.  This means:
 
 - **Colour handling is always authoritative** — the xterm-256 palette is
   resolved on the server; clients always receive 24-bit RGB.
-- **Feature flags gate what the PTY sees** — e.g. `kitty_keyboard` toggles
-  whether the emulator advertises the kitty keyboard protocol to the shell.
+- **Feature flags are advisory today** — `kitty_graphics` / `kitty_keyboard`
+  atomics are recomputed on every client attach/detach, but libghostty-vt
+  parses every supported sequence unconditionally, so no parse-time gating
+  is applied.
 - **The wire protocol is the limiting factor** — if a feature is parsed by
-  `tattoy-wezterm-term` but has no field in `kmux-protocol::messages`, clients
+  `libghostty-vt` but has no field in `kmux-protocol::messages`, clients
   cannot act on it.
 
 ### Status legend
@@ -52,7 +56,7 @@ Shells inside kmux panes always receive:
 
 | Variable | Value | Rationale |
 |----------|-------|-----------|
-| `TERM` | `xterm-256color` | `tattoy-wezterm-term` is an xterm-family parser; advertising a non-xterm TERM risks sequences the parser cannot handle |
+| `TERM` | `xterm-256color` | `libghostty-vt` is an xterm-family parser; advertising a non-xterm TERM risks sequences the parser cannot handle |
 | `COLORTERM` | `truecolor` | The emulator parses 24-bit SGR unconditionally; RGB is always transmitted on the wire |
 | `TERM_PROGRAM` | `kmux` | Prevents the launching terminal's `$TERM_PROGRAM` from leaking into panes |
 | `TERM_PROGRAM_VERSION` | `<cargo version>` | Stable identity for feature-sniffers (Starship, bat, etc.) |
@@ -83,7 +87,7 @@ These are single-byte sequences handled directly by the VT parser.
 
 | Sequence | Name | Status | Notes |
 |----------|------|--------|-------|
-| `ESC c` | RIS — Reset to Initial State | **Stable** | Full terminal reset via wezterm-term |
+| `ESC c` | RIS — Reset to Initial State | **Stable** | Full terminal reset via libghostty-vt |
 | `ESC 7` | DECSC — Save cursor | **Stable** | Saves position, attributes, charset |
 | `ESC 8` | DECRC — Restore cursor | **Stable** | |
 | `ESC M` | RI — Reverse Index (scroll down) | **Stable** | |
@@ -145,7 +149,7 @@ These are single-byte sequences handled directly by the VT parser.
 
 ### SGR — Select Graphic Rendition
 
-All SGR attributes are parsed by `tattoy-wezterm-term`, resolved to the
+All SGR attributes are parsed by `libghostty-vt`, resolved to the
 `CellAttrs` bitfield, and forwarded over the wire.  The table below captures
 what the wire protocol (`kmux-protocol::messages::CellAttrs`) can represent.
 
@@ -171,8 +175,8 @@ what the wire protocol (`kmux-protocol::messages::CellAttrs`) can represent.
 | `SGR 21` | Double underline (or Bold off, terminal-dependent) | `UNDERLINE` | **Partial** | Parsed; interpretation varies by terminal emulator |
 | `SGR 22` | Normal intensity (clear bold/dim) | — | **Stable** | |
 | `SGR 23–29` | Individual attribute resets | — | **Stable** | |
-| `SGR 53` | Overline | — | **Unimplemented** | Parsed by wezterm-term; no wire bit; clients cannot render it |
-| `SGR 58;2;…` | Underline colour (RGB) | — | **Unimplemented** | Parsed by wezterm-term; wire has no underline-colour field |
+| `SGR 53` | Overline | — | **Unimplemented** | Parsed by libghostty-vt; no wire bit; clients cannot render it |
+| `SGR 58;2;…` | Underline colour (RGB) | — | **Unimplemented** | Parsed by libghostty-vt; wire has no underline-colour field |
 | `SGR 58;5;n` | Underline colour (indexed) | — | **Unimplemented** | Same as above |
 | `SGR 73/74/75` | Superscript / subscript / reset | — | **Not planned** | |
 
@@ -197,7 +201,7 @@ triple for every cell's foreground and background.
 
 ### Cursor shape — DECSCUSR (`CSI Ps SP q`)
 
-wezterm-term tracks all six variants.  The wire protocol (`CursorShape`) has
+libghostty-vt tracks all six variants.  The wire protocol (`CursorShape`) has
 five variants: `Block`, `Underline`, `Bar`, `HollowBlock`, `Hidden`.  The
 blinking vs. steady distinction is **collapsed** — clients see the shape but
 not the requested blink state.
@@ -223,14 +227,14 @@ alternative backends.
 | `?1` | DECCKM — Application cursor keys | **Stable** | `TermModes::APP_CURSOR`; client reads this flag and encodes arrows as `SS3 O[ABCD]` vs. `CSI [ABCD]` |
 | `?3` | DECCOLM — 132-column mode | **Not planned** | |
 | `?5` | DECSCNM — Reverse video (screen) | **Partial** | Parsed by emulator; no dedicated wire flag; effect is absorbed into per-cell INVERSE via the diff |
-| `?6` | DECOM — Origin mode | **Stable** | Handled by wezterm-term |
-| `?7` | DECAWM — Auto-wrap mode | **Stable** | Handled by wezterm-term |
+| `?6` | DECOM — Origin mode | **Stable** | Handled by libghostty-vt |
+| `?7` | DECAWM — Auto-wrap mode | **Stable** | Handled by libghostty-vt |
 | `?12` | AT&T 610 cursor blink | **Partial** | Parsed; blink state not forwarded on wire |
 | `?25` | DECTCEM — Cursor visibility | **Stable** | `CursorState::visible`; tested in `fzf_cursor_hidden_state` |
-| `?47` | Alternate screen buffer (old) | **Stable** | Handled by wezterm-term |
-| `?1000` | X10 / normal mouse tracking | **Partial** | Detected via `is_mouse_grabbed()` which returns true for any of 1000/1002/1003; exposed as `MOUSE_REPORT_CLICK` proxy.  Individual mode bits are indistinguishable pending an upstream fix. |
-| `?1002` | Button-event mouse tracking | **Partial** | See `?1000`; `MOUSE_DRAG` bit defined in wire but never set by current backend |
-| `?1003` | Any-event mouse tracking | **Partial** | See `?1000`; `MOUSE_MOTION` bit defined but never set |
+| `?47` | Alternate screen buffer (old) | **Stable** | Handled by libghostty-vt |
+| `?1000` | X10 / normal mouse tracking | **Stable** | `MOUSE_REPORT_CLICK` set whenever any of 1000/1002/1003 is active |
+| `?1002` | Button-event mouse tracking | **Stable** | `MOUSE_DRAG` set; tested in `mouse_drag_mode_enable_disable` |
+| `?1003` | Any-event mouse tracking | **Stable** | `MOUSE_MOTION` set; tested in `mouse_motion_mode_enable_disable` |
 | `?1004` | Focus-in/focus-out reporting | **Unimplemented** | Events not forwarded to PTY |
 | `?1005` | UTF-8 mouse encoding | **Not planned** | Superseded by SGR mode |
 | `?1006` | SGR extended mouse coordinates | **Stable** | `TermModes::SGR_MOUSE`; client reads this to choose between SGR and legacy X10 encoding for scroll events |
@@ -251,13 +255,13 @@ alternative backends.
 | `OSC 0 … BEL/ST` | Set window title and icon title | **Stable** | Forwarded via `BackendEventSink::on_title()`; tested in `event_sink_receives_title` |
 | `OSC 1 … BEL/ST` | Set icon title | **Stable** | Mapped to `on_title()` (same as OSC 0) |
 | `OSC 2 … BEL/ST` | Set window title | **Stable** | |
-| `OSC 4 ; c ; spec BEL/ST` | Set/query colour palette entry | **Partial** | Parsed by wezterm-term; colour changes affect resolved RGB but palette queries are not replied to clients |
+| `OSC 4 ; c ; spec BEL/ST` | Set/query colour palette entry | **Partial** | Parsed by libghostty-vt; colour changes affect resolved RGB but palette queries are not replied to clients |
 | `OSC 7 … BEL/ST` | Set current working directory | **Unimplemented** | URI not extracted or forwarded |
 | `OSC 8 ; … ; uri BEL/ST` | Hyperlink | **Unimplemented** | `BackendEventSink::on_hyperlink()` seam exists; no forwarding yet |
 | `OSC 10 / 11 BEL/ST` | Query default fg/bg colour | **Partial** | Parsed; query responses not implemented (no back-channel to the application from the emulator) |
 | `OSC 52 ; … BEL/ST` | Clipboard read/write | **Unimplemented** | `BackendEventSink::on_osc52_copy()` seam exists; no forwarding yet |
 | `OSC 133 / 633` | Shell integration / semantic zones | **Not planned** | |
-| `OSC 1337` | iTerm2 inline images | **Unimplemented** | Parsed by wezterm-term; image data dropped silently (Phase A) |
+| `OSC 1337` | iTerm2 inline images | **Unimplemented** | Parsed by libghostty-vt; image data dropped silently (Phase A) |
 | `OSC 9` | iTerm2 / Windows Terminal growl notification | **Not planned** | |
 
 ---
@@ -266,9 +270,9 @@ alternative backends.
 
 | Sequence | Name | Status | Notes |
 |----------|------|--------|-------|
-| `DCS Ps;Ps;Ps q … ST` | Sixel graphics | **Unimplemented** | wezterm-term delivers image data via `attrs.images()`; Phase A drops it silently.  Phase B will extract and forward via an extended `CellState`. |
-| `DCS $ q Pt ST` | DECRQSS — Request Selection or Setting | **Stable** | Handled internally by wezterm-term |
-| `DCS + q Pt ST` | XTGETTCAP — Query terminfo capability | **Partial** | Parsed by wezterm-term; responses go back to the PTY but are not relayed to the wire client |
+| `DCS Ps;Ps;Ps q … ST` | Sixel graphics | **Unimplemented** | libghostty-vt parses sixel payloads; Phase A drops them at the `GhosttyBackend` boundary.  Phase B will extract and forward via an extended `CellState`. |
+| `DCS $ q Pt ST` | DECRQSS — Request Selection or Setting | **Stable** | Handled internally by libghostty-vt |
+| `DCS + q Pt ST` | XTGETTCAP — Query terminfo capability | **Partial** | Parsed by libghostty-vt; responses go back to the PTY but are not relayed to the wire client |
 | `DCS + p Pt ST` | XTSETTCAP | **Partial** | Same as XTGETTCAP |
 
 ---
@@ -277,7 +281,7 @@ alternative backends.
 
 | Sequence | Name | Status | Notes |
 |----------|------|--------|-------|
-| `APC G … ST` | Kitty graphics protocol | **Unimplemented** | `enable_kitty_graphics()` is wired up via `Arc<AtomicBool>` and the `TerminalConfiguration` trait; image payloads reach wezterm-term only when at least one attached client declares `kitty_graphics: true`.  The TUI client (`crates/kmux`) currently hardcodes `kitty_graphics: false`.  When enabled by a future client, Phase A still drops image data silently. |
+| `APC G … ST` | Kitty graphics protocol | **Unimplemented** | libghostty-vt parses APC G payloads unconditionally; the `kitty_graphics` capability atomic is recomputed on every attach/detach but not consulted at parse time today.  Phase A drops image data at the `GhosttyBackend` boundary.  The TUI client (`crates/kmux`) currently hardcodes `kitty_graphics: false`. |
 
 ---
 
@@ -289,9 +293,9 @@ The server reports mouse mode state in `TermModes` sent with each diff.
 
 | Mode flag | Meaning | Status |
 |-----------|---------|--------|
-| `MOUSE_REPORT_CLICK` | Any mouse tracking mode active (1000/1002/1003 union) | **Partial** — proxy because `is_mouse_grabbed()` cannot distinguish individual modes |
-| `MOUSE_DRAG` | Button-event mode (DEC 1002) | **Partial** — bit defined; never set by current backend |
-| `MOUSE_MOTION` | Any-event mode (DEC 1003) | **Partial** — bit defined; never set by current backend |
+| `MOUSE_REPORT_CLICK` | Any mouse tracking mode active (1000/1002/1003 union) | **Stable** |
+| `MOUSE_DRAG` | Button-event mode (DEC 1002) | **Stable** |
+| `MOUSE_MOTION` | Any-event mode (DEC 1003) | **Stable** |
 | `SGR_MOUSE` | SGR extended coordinates (DEC 1006) | **Stable** |
 
 ### Input encoding (client → PTY)
@@ -336,7 +340,7 @@ encoding (`crates/kmux/src/app/mouse_handler.rs`).
 | `F13–F24` | — | **Not planned** | |
 | `Alt+key` | `ESC {key-bytes}` | **Partial** | The `ALT` modifier is captured from crossterm; the ESC prefix is **not** explicitly added in `key_to_bytes` for character keys.  Behaviour depends on whether the host terminal delivers Alt+char as two events (ESC + char) or as a single event with the modifier flag set.  Works reliably when the host terminal pre-encodes the ESC prefix; may silently drop the modifier otherwise. |
 | `Shift+modifier combos` | `CSI 1 ; Ps [ABCD]` etc. | **Unimplemented** | Modifier-encoded sequences (xterm `modifyOtherKeys` style) not generated |
-| Kitty keyboard protocol | `CSI = Ps u` | **Unimplemented** | `enable_kitty_keyboard()` is wired via `Arc<AtomicBool>`; the TUI client hardcodes `kitty_keyboard: false`, so the protocol is never advertised to shells today |
+| Kitty keyboard protocol | `CSI = Ps u` | **Unimplemented** | `kitty_keyboard` capability atomic is wired through to the backend; libghostty-vt parses the query sequence unconditionally.  The TUI client hardcodes `kitty_keyboard: false`, so no encoder emits the protocol on input today |
 | xterm `modifyOtherKeys` | `CSI 27 ; mod ; code ~` | **Not planned** | |
 
 ---
@@ -346,9 +350,9 @@ encoding (`crates/kmux/src/app/mouse_handler.rs`).
 | Feature | Status | Notes |
 |---------|--------|-------|
 | UTF-8 input | **Stable** | Raw UTF-8 bytes forwarded to PTY |
-| UTF-8 output | **Stable** | wezterm-term decodes UTF-8; the `char` field in `CellState` is a Rust `char` |
+| UTF-8 output | **Stable** | libghostty-vt decodes UTF-8; the `char` field in `CellState` is a Rust `char` |
 | Wide characters (CJK, emoji) | **Stable** | `CellAttrs::WIDE_CHAR` set on the primary cell; `CellAttrs::WIDE_CHAR_SPACER` set on the following placeholder cell; tested with `'中'` |
-| Combining characters | **Partial** | wezterm-term handles most combining sequences; the wire protocol stores one `char` per cell — combining codepoints are merged by the emulator before serialisation |
+| Combining characters | **Partial** | libghostty-vt handles most combining sequences; the wire protocol stores one `char` per cell — combining codepoints are merged by the emulator before serialisation |
 | Bidirectional text (BiDi) | **Not planned** | Cell-grid model is left-to-right only |
 
 ---
@@ -391,8 +395,8 @@ encoding (`crates/kmux/src/app/mouse_handler.rs`).
 
 | Protocol | Status | Notes |
 |----------|--------|-------|
-| Sixel (DCS) | **Unimplemented** | Phase A: dropped silently.  Phase B: extract from `attrs.images()` and forward via extended wire protocol |
-| Kitty graphics (APC) | **Unimplemented** | Phase A: same; `enable_kitty_graphics()` wired but TUI client hardcodes `false`; see APC section above |
+| Sixel (DCS) | **Unimplemented** | Phase A: dropped silently at the `GhosttyBackend` boundary.  Phase B: extract from libghostty-vt and forward via extended wire protocol |
+| Kitty graphics (APC) | **Unimplemented** | Phase A: same; capability atomic is wired but the TUI client hardcodes `false`; see APC section above |
 | iTerm2 inline images (OSC 1337) | **Unimplemented** | Parsed; dropped silently |
 
 ---
@@ -404,8 +408,8 @@ Client capabilities are declared at auth time in `ClientCapabilities`:
 | Field | Current TUI client value | Effect |
 |-------|--------------------------|--------|
 | `truecolor` | Detected from `$COLORTERM` / `$TERM` | Reserved for future per-client colour downgrade (today server always sends RGB) |
-| `kitty_graphics` | `false` (hardcoded) | Controls `enable_kitty_graphics()` on the backend |
-| `kitty_keyboard` | `false` (hardcoded) | Controls `enable_kitty_keyboard()` on the backend |
+| `kitty_graphics` | `false` (hardcoded) | Drives the `kitty_graphics` atomic in `CapabilityHandles` (reserved for future parse-time gating) |
+| `kitty_keyboard` | `false` (hardcoded) | Drives the `kitty_keyboard` atomic in `CapabilityHandles` (reserved for future parse-time gating) |
 | `term` | `$TERM` (informational) | Logged; not used for `TERM` selection |
 | `term_program` | `$TERM_PROGRAM` (informational) | Logged; not used |
 
@@ -417,47 +421,40 @@ sequences every attached client can handle (`capability::intersect_for_atomics`)
 
 ## Known limitations and planned work
 
-1. **Individual mouse mode bits** (`crates/kmuxd/src/backend/wezterm/mod.rs` line 101)
-   `is_mouse_grabbed()` returns `true` for any active mouse tracking mode
-   (1000, 1002, or 1003) but cannot distinguish between them.  `MOUSE_DRAG`
-   and `MOUSE_MOTION` bits in `TermModes` are defined but never set.  A
-   contribution to `tattoy-wezterm-term` to expose individual mode flags is
-   needed.
-
-2. **Mouse click/drag forwarding** — only scroll events are currently forwarded
+1. **Mouse click/drag forwarding** — only scroll events are currently forwarded
    to the PTY.  Click and drag events consumed by the TUI (e.g. badge clicks)
    are not passed through even when the application requests any-event tracking.
 
-3. **Image protocols (Phase B)** — `attrs.images()` in wezterm-term carries
-   kitty, sixel, and iTerm2 pixel data.  Forwarding this to clients requires
-   extending `kmux-protocol::messages::CellState` and the diff serialisation
-   format.
+2. **Image protocols (Phase B)** — libghostty-vt parses kitty (APC G), sixel
+   (DCS), and iTerm2 (OSC 1337) image payloads; Phase A discards them at the
+   wrapper boundary.  Forwarding to clients requires extending
+   `kmux-protocol::messages::CellState` and the diff serialisation format.
 
-4. **Cursor blink state** — wezterm-term tracks `BlinkingBlock`, `BlinkingBar`,
-   `BlinkingUnderline` separately from their steady counterparts, but the wire
-   `CursorShape` enum collapses these.  A dedicated `blink: bool` field would
-   allow clients to render the requested cadence.
+3. **Cursor blink state** — libghostty-vt tracks blinking vs. steady variants
+   of each cursor shape, but the wire `CursorShape` enum collapses them.  A
+   dedicated `blink: bool` field would allow clients to render the requested
+   cadence.
 
-5. **Underline variants and colour** — the wire protocol has a single
+4. **Underline variants and colour** — the wire protocol has a single
    `UNDERLINE` bit.  Adding an `underline_style: UnderlineStyle` field and an
    `underline_color: CellColor` field would expose the full SGR 4:n / SGR 58
    repertoire.
 
-6. **Overline** — `SGR 53` is parsed; a corresponding `OVERLINE` bit in
+5. **Overline** — `SGR 53` is parsed; a corresponding `OVERLINE` bit in
    `CellAttrs` would complete the standard decoration set.
 
-7. **Alt+key encoding** — `key_to_bytes` does not explicitly emit the ESC
+6. **Alt+key encoding** — `key_to_bytes` does not explicitly emit the ESC
    prefix for Alt+character combinations; see the Keyboard table for details.
 
-8. **Kitty keyboard protocol (input)** — the server-side emulator is gated
-   behind `enable_kitty_keyboard()` which is properly wired; the TUI client
-   needs to opt in and a matching encoder in `key_to_bytes` is needed.
+7. **Kitty keyboard protocol (input)** — the capability atomic is wired
+   through to the backend; the TUI client needs to opt in (currently
+   hardcoded `false`) and `key_to_bytes` needs a matching encoder.
 
-9. **OSC 52 clipboard** — the `on_osc52_copy` seam in `BackendEventSink`
+8. **OSC 52 clipboard** — the `on_osc52_copy` seam in `BackendEventSink`
    exists; full implementation requires a client-to-server clipboard channel.
 
-10. **OSC 7 (current directory)** — forwarding this would let the client update
-    its session CWD display without a separate RPC.
+9. **OSC 7 (current directory)** — forwarding this would let the client update
+   its session CWD display without a separate RPC.
 
-11. **Synchronized output (`?2026`)** — would allow flicker-free redraws; needs
+10. **Synchronized output (`?2026`)** — would allow flicker-free redraws; needs
     the diff engine to defer emission until the closing ST.

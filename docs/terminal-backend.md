@@ -8,12 +8,28 @@ ships pre-resolved `CellState` diffs to thin clients. Clients never touch raw
 escape sequences — they render what the server tells them.
 
 ```
-PTY ──bytes──► TerminalBackend (wezterm / future ghostty)
+PTY ──bytes──► TerminalBackend (libghostty-vt, via GhosttyBackend)
                      │
               DiffEngine<B>   ← computes frame-to-frame CellState diffs
                      │
          ServerMessage::TerminalUpdate  ──► (fan-out) ──► all attached clients
 ```
+
+The VT emulator is **libghostty-vt v1.3.1**, vendored at `vendor/ghostty/`
+as a git submodule.  Ghostty exposes the `Terminal` / `Stream(Handler)` /
+`Screen` types only as an unstable Zig module, so kmux ships a small Zig
+wrapper that pins a **kmux-owned, stable C ABI** over those types.  The
+wrapper lives at `crates/kmux-ghostty-sys/zig/src/wrapper.zig`; Rust
+consumes it through two crates:
+
+- `kmux-ghostty-sys` — `#[repr(C)]` structs and `extern "C"` declarations;
+  the crate's `build.rs` drives `zig build` and emits a single
+  `libkmux_ghostty.so` that ships with the daemon.
+- `kmux-ghostty` — safe Rust façade: `GhosttyTerm` owning the opaque
+  handle, `EventSink` trampolines, `Send` assertion, typed errors.
+
+`GhosttyBackend` in `crates/kmuxd/src/backend/ghostty/mod.rs` wraps
+`GhosttyTerm` with the kmuxd `TerminalBackend` trait.
 
 ## `TerminalBackend` trait
 
@@ -92,8 +108,9 @@ pub trait BackendEventSink: Send + Sync + 'static {
 parser loop (`feed()`).  Any I/O must be pushed to an unbounded `mpsc` channel
 and drained from a separate task.
 
-`NullEventSink` (no-op) is used in production today.  The ghostty backend will
-install a real sink that forwards title/bell events to the host UI.
+`GhosttyBackend` installs a thin adapter that forwards libghostty-vt events to
+whichever `Arc<dyn BackendEventSink>` the host passes in.  `NullEventSink`
+(no-op) is used in code paths that do not need backend events.
 
 ## Multi-client size negotiation (smallest-wins)
 
@@ -155,26 +172,26 @@ The first `Attach` from a live client after daemon restart will carry the real
 terminal dimensions, trigger `reconcile_size`, and update both the emulator and
 the PTY to match.
 
-## Feature flags
+## FFI invariants (`kmux-ghostty-sys` ↔ Zig wrapper)
 
-```toml
-[features]
-default = ["backend-wezterm"]
-backend-wezterm = ["dep:tattoy-wezterm-term", "dep:tattoy-wezterm-surface"]
-backend-ghostty = []   # reserved; no implementation yet
-```
+The Zig wrapper is single-threaded under the kmuxd `Arc<Mutex<DiffEngine<_>>>`
+held at every `new_term_state` call site.  `GhosttyBackend` is asserted `Send`
+and explicitly `!Sync` via `static_assertions`.  Safety rules exchanged across
+the boundary:
 
-`backend-ghostty` is declared but produces no code.  The `ActiveBackend` type
-alias in `term_state.rs` is gated on `cfg(feature = "backend-wezterm")`:
+- **No ownership transfer.** All `uint8_t*` / `kmux_cell*` buffers are borrowed;
+  valid only for the duration of the call (callbacks) or written into
+  caller-allocated memory (fill functions).
+- **Event callbacks must not retain pointers.** The Rust trampoline copies title
+  / hyperlink bytes to an owned `&str` via `str::from_utf8` (silently drops on
+  invalid UTF-8) before handing them to the sink.
+- **Kitty toggles are borrowed atomics.** Rust holds the `Arc<AtomicBool>`s;
+  Zig stores `*const std.atomic.Value(bool)` and does an acquire load per hit.
+  `GhosttyBackend` guarantees the `Arc`s outlive the opaque term handle.
+- **ABI version check on construction.** `kmux_ghostty_abi_version()` is
+  compared against a compile-time constant on both sides; mismatch panics.
 
-```rust
-#[cfg(feature = "backend-wezterm")]
-pub type ActiveBackend = WezTermBackend;
-
-pub type TermState = DiffEngine<ActiveBackend>;
-```
-
-## `BackendFactory` — reserved for runtime selection
+## Reserved: runtime backend selection
 
 ```rust
 #[allow(dead_code)]
@@ -183,43 +200,22 @@ pub trait BackendFactory: Send + Sync + 'static {
 }
 ```
 
-Not wired to anything today.  If runtime backend switching is ever needed (e.g.
-a daemon that supports both wezterm and ghostty simultaneously), a factory
-registry can use this trait to construct backends by name without changing the
-`DiffEngine<B>` static-dispatch path.
+Not wired to anything today.  If runtime backend switching is ever needed, a
+factory registry can use this trait to construct backends by name without
+changing the `DiffEngine<B>` static-dispatch path.
 
-## Adding a new backend (e.g. libghostty)
+## Adding a second backend
 
-1. **Enable the feature.** In `kmuxd/Cargo.toml` add the libghostty dep under
-   `backend-ghostty`:
-   ```toml
-   backend-ghostty = ["dep:ghostty-sys"]
-   ```
+The public surface below is what any new backend has to satisfy.  Nothing on
+the daemon or wire side assumes libghostty-vt specifically — adding a second
+backend is a self-contained change to a new `backend/<name>/` submodule plus
+a type swap in `term_state.rs`.
 
-2. **Create `backend/ghostty/mod.rs`** with a `GhosttyBackend` struct that
-   implements `TerminalBackend`.  Wire `BackendConfig.events` to the libghostty
-   surface callback so title/bell push to the `BackendEventSink` without
-   blocking.
-
-3. **Declare `ActiveBackend` for the feature** in `term_state.rs`:
-   ```rust
-   #[cfg(feature = "backend-ghostty")]
-   pub use crate::backend::ghostty::GhosttyBackend;
-   #[cfg(feature = "backend-ghostty")]
-   pub type ActiveBackend = GhosttyBackend;
-   ```
-   Enforce mutual exclusivity with a `compile_error!` if both features are
-   enabled simultaneously.
-
-4. **Update `backend/mod.rs`** to declare the ghostty submodule under
-   `#[cfg(feature = "backend-ghostty")]`.
-
-5. **Tests.** Add a `MockBackend`-style test in `backend/ghostty/mod.rs` for
-   the new trait implementation.  The existing `DiffEngine` tests in
-   `diff_engine/compute.rs` stay backend-agnostic because they use `MockBackend`.
-
-Files a ghostty PR touches (and nothing else):
-- `kmuxd/Cargo.toml` — dep + feature activation
-- `crates/kmuxd/src/backend/ghostty/mod.rs` — new file
-- `crates/kmuxd/src/backend/mod.rs` — `pub mod ghostty` declaration
-- `crates/kmuxd/src/term_state.rs` — `ActiveBackend` alias
+1. Implement `TerminalBackend` in `crates/kmuxd/src/backend/<name>/mod.rs`.
+   Wire `BackendConfig.events` to the backend's title/bell/OSC callbacks
+   without blocking.
+2. Port the behavioural suite in `backend/ghostty/mod.rs` verbatim — those
+   tests are the contract every backend must meet.
+3. Repoint `ActiveBackend` in `term_state.rs` (or add a `BackendFactory`-based
+   registry if you want both compiled in).
+4. Update this document.

@@ -3,12 +3,9 @@ use std::sync::atomic::AtomicBool;
 
 use kmux_protocol::messages::{CellState, CursorState, TermModes, TermSize};
 
-#[cfg(feature = "backend-ghostty")]
 pub mod ghostty;
 #[cfg(test)]
 pub mod mock;
-#[cfg(feature = "backend-wezterm")]
-pub mod wezterm;
 
 /// Default maximum scrollback lines retained by the terminal emulator.
 pub const DEFAULT_SCROLLBACK: usize = 50_000;
@@ -53,18 +50,14 @@ impl From<BackendSize> for TermSize {
 
 /// Live-updateable feature toggles shared with the pane relay.
 ///
-/// The daemon writes to these atomics on every client attach/detach; the
-/// backend reads them on every relevant escape-sequence handler without
-/// rebuilding the terminal state.
-///
-/// Reader coverage depends on which backend feature is active: wezterm
-/// consults them via `KmuxTerminalConfig`; the current ghostty-vt wrapper
-/// parses unconditionally and never reads these. The fields are therefore
-/// marked `#[allow(dead_code)]` at the `backend-ghostty`-only cfg.
-#[cfg_attr(
-    all(feature = "backend-ghostty", not(feature = "backend-wezterm")),
-    allow(dead_code)
-)]
+/// The daemon writes to these atomics on every client attach/detach so that
+/// the backend could gate sequence-parsing behaviour on the intersected
+/// capabilities of attached clients.  libghostty-vt parses every supported
+/// escape sequence unconditionally and therefore does not read these today;
+/// the atomics are still populated because the kmux-protocol capability
+/// negotiation contract requires them and a future backend (or wire-level
+/// gating) may consume them.
+#[allow(dead_code)]
 pub struct CapabilityHandles {
     pub kitty_graphics: Arc<AtomicBool>,
     pub kitty_keyboard: Arc<AtomicBool>,
@@ -78,8 +71,9 @@ pub struct CapabilityHandles {
 pub trait BackendEventSink: Send + Sync + 'static {
     fn on_title(&self, _title: &str) {}
     fn on_bell(&self) {}
-    // Seams for future backends (e.g. GhosttyBackend): called when the
-    // backend processes an OSC 52 copy or hyperlink sequence.
+    // Called when the backend processes an OSC 52 copy or hyperlink
+    // sequence. libghostty-vt surfaces both; no production sink consumes
+    // them yet, so the default implementation drops silently.
     #[allow(dead_code)]
     fn on_osc52_copy(&self, _selection: &str, _base64_data: &str) {}
     #[allow(dead_code)]
@@ -91,14 +85,12 @@ pub struct NullEventSink;
 impl BackendEventSink for NullEventSink {}
 
 /// Configuration passed to [`TerminalBackend::new`].
+#[allow(dead_code)]
 pub struct BackendConfig {
     pub size: BackendSize,
-    /// Live kitty-graphics/keyboard toggles. Read by wezterm; ghostty-vt
-    /// ignores them today (parse-unconditionally model).
-    #[cfg_attr(
-        all(feature = "backend-ghostty", not(feature = "backend-wezterm")),
-        allow(dead_code)
-    )]
+    /// Live kitty-graphics/keyboard toggles. Populated on every
+    /// attach/detach; libghostty-vt parses these sequences unconditionally,
+    /// but see [`CapabilityHandles`] for the full rationale.
     pub capabilities: CapabilityHandles,
     /// Event sink for title/bell/OSC callbacks from the terminal emulator.
     pub events: Arc<dyn BackendEventSink>,
@@ -125,7 +117,7 @@ pub trait TerminalBackend: Send + 'static {
     where
         Self: Sized;
 
-    /// Human-readable name of this backend (e.g. `"wezterm"`, `"ghostty"`).
+    /// Human-readable name of this backend (e.g. `"ghostty"`).
     fn name() -> &'static str
     where
         Self: Sized;

@@ -108,7 +108,7 @@ impl TerminalBackend for GhosttyBackend {
         // Per `kmux_ghostty::GhosttyTerm::feed`, `Err(Feed)` is only returned
         // when the VT parser encounters an internal error — in practice this
         // means our Zig handler returned an error. Treat it as a soft failure:
-        // log and drop, matching the wezterm backend's silent-failure policy.
+        // log and drop so one bad sequence never tears down a pane.
         if let Err(e) = self.term.feed(data) {
             tracing::warn!(error = %e, "ghostty: feed failed");
         }
@@ -223,7 +223,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // Ported from backend/wezterm/mod.rs — ghostty MUST pass every test.
+    // Behavioural tests for the libghostty-vt backend; each assertion
+    // guards a VT feature kmux relies on end-to-end.
     // -------------------------------------------------------------------
 
     #[test]
@@ -572,8 +573,8 @@ mod tests {
     }
 
     // -------------------------------------------------------------------
-    // New tests enabled by ghostty's per-mode resolution (wezterm collapses
-    // these into a single mouse-grabbed bit).
+    // Per-mode mouse bits: libghostty-vt exposes 1002 / 1003 / 1006 as
+    // distinct flags so the wire protocol can report them independently.
     // -------------------------------------------------------------------
 
     #[test]
