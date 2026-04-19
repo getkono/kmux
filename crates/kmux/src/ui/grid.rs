@@ -9,13 +9,15 @@ use crate::theme::{self, Theme};
 
 /// Apply a single protocol cell to a ratatui buffer cell.
 ///
-/// `WIDE_CHAR_SPACER` cells (the second half of a double-width glyph) are
-/// written with an empty symbol per ratatui convention — the preceding wide
-/// cell owns the glyph that visually spans both columns. Anything else leaves
-/// a stray ' ' next to every wide character.
+/// The cell must already be in its background-fill state (reset + theme
+/// colors).  Control characters are skipped because printing them via
+/// crossterm desynchronises the backend's cursor tracker from the real
+/// terminal cursor, smearing the rest of the row.
 fn apply_cell(ratatui_cell: &mut Cell, cs: &CellState, theme: &Theme) {
     if cs.attrs.contains(CellAttrs::WIDE_CHAR_SPACER) {
-        ratatui_cell.set_symbol("");
+        // Continuation half of a double-width glyph.  Keep the background-fill
+        // symbol (" ") — an empty symbol would not advance the cursor if this
+        // cell ever appears in the diff output.  Only patch the bg colour.
         let spacer_bg = if cs.attrs.contains(CellAttrs::DEFAULT_BG) {
             theme.bg
         } else {
@@ -25,7 +27,15 @@ fn apply_cell(ratatui_cell: &mut Cell, cs: &CellState, theme: &Theme) {
         return;
     }
 
+    // Control characters have no visible width but crossterm still prints
+    // them, causing the real cursor to lag behind the tracked position.
+    // Leave the cell in its background-fill state (a normal space).
+    if cs.c.is_control() {
+        return;
+    }
+
     ratatui_cell.set_char(cs.c);
+
     let display_fg = if cs.attrs.contains(CellAttrs::DEFAULT_FG) {
         theme.fg
     } else {
@@ -58,29 +68,30 @@ fn apply_cell(ratatui_cell: &mut Cell, cs: &CellState, theme: &Theme) {
     if cs.attrs.contains(CellAttrs::HIDDEN) {
         modifier |= Modifier::HIDDEN;
     }
-    ratatui_cell.set_style(Style::default().add_modifier(modifier));
+    if !modifier.is_empty() {
+        ratatui_cell.set_style(Style::default().add_modifier(modifier));
+    }
 }
 
 pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
-    // Track cursor position to set after buffer operations
     let mut cursor_pos: Option<(u16, u16)> = None;
 
     {
         let buf = f.buffer_mut();
 
-        // Fill background
+        // Fill background — reset() clears symbol, modifiers, skip, and
+        // underline_color so no stale state from a prior frame leaks through.
         for y in area.top()..area.bottom() {
             for x in area.left()..area.right() {
                 let cell = &mut buf[(x, y)];
-                cell.set_char(' ');
+                cell.reset();
                 cell.set_bg(theme.bg);
                 cell.set_fg(theme.fg);
             }
         }
 
         let Some(name) = app.mgr.active_pane_id() else {
-            // No active pane message
             let msg = "No active session -- press Ctrl+G then s, c to create one";
             let x = area.left() + area.width.saturating_sub(msg.len() as u16) / 2;
             let y = area.top() + area.height / 2;
@@ -101,21 +112,15 @@ pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
             return;
         };
 
+        // ── Cells ──
         let cells = grid.cells();
         let rows = grid.rows;
         let cols = grid.cols;
         let scroll_offset = grid.scroll_offset();
         let scrollback = grid.scrollback();
 
-        // Render cells. `scroll_offset` is measured in **display rows**; when
-        // a scrollback line is wider than `cols` it wraps across multiple
-        // viewport rows. Viewport rows below `scroll_offset` show the live
-        // grid, scrolled upward by `scroll_offset` logical rows.
         for vr in 0..rows.min(area.height as usize) {
             let sb_row = if scroll_offset > 0 && vr < scroll_offset {
-                // Top `scroll_offset` viewport rows are scrollback.
-                // `vr = 0` is the topmost (oldest visible) display row;
-                // convert to rev-offset from newest.
                 let rev = scroll_offset - 1 - vr;
                 kmux_client::grid::scrollback_display_row_at(scrollback, cols, rev)
             } else {
@@ -146,7 +151,7 @@ pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        // Render cursor
+        // ── Cursor ──
         let cursor = grid.cursor();
         if scroll_offset == 0 && cursor.visible && cursor.shape != CursorShape::Hidden {
             let cur_row = cursor.row as usize;
@@ -180,7 +185,7 @@ pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
             }
         }
 
-        // Scroll indicator (display-row units, matching scroll_offset).
+        // ── Scroll indicator ──
         if scroll_offset > 0 {
             let label = format!(
                 "[{}/{}]",
@@ -223,19 +228,17 @@ mod tests {
     }
 
     #[test]
-    fn wide_char_spacer_emits_empty_symbol() {
+    fn wide_char_spacer_preserves_space_symbol() {
         let theme = theme::default_theme();
         let mut cell = Cell::default();
-        // Simulate the background pre-fill that render_grid applies before
-        // walking the logical cell grid.
         cell.set_char(' ');
 
         apply_cell(&mut cell, &wide_spacer(CellColor::new(0, 0, 0)), &theme);
 
         assert_eq!(
             cell.symbol(),
-            "",
-            "spacer cell must carry an empty symbol, not ' '",
+            " ",
+            "spacer cell must keep ' ' so crossterm advances the cursor",
         );
     }
 
@@ -249,7 +252,7 @@ mod tests {
 
         apply_cell(&mut cell, &cs, &theme);
 
-        assert_eq!(cell.symbol(), "");
+        assert_eq!(cell.symbol(), " ");
         assert_eq!(cell.bg, theme.bg);
     }
 
@@ -269,5 +272,43 @@ mod tests {
         assert_eq!(cell.symbol(), "X");
         assert_eq!(cell.fg, Color::Rgb(255, 0, 0));
         assert_eq!(cell.bg, Color::Rgb(0, 255, 0));
+    }
+
+    #[test]
+    fn control_char_leaves_cell_unchanged() {
+        let theme = theme::default_theme();
+        let mut cell = Cell::default();
+        cell.set_char(' ');
+        cell.set_fg(theme.fg);
+        cell.set_bg(theme.bg);
+        let cs = CellState {
+            c: '\0',
+            fg: CellColor::new(255, 0, 0),
+            bg: CellColor::new(0, 255, 0),
+            attrs: CellAttrs::EMPTY,
+        };
+
+        apply_cell(&mut cell, &cs, &theme);
+
+        assert_eq!(cell.symbol(), " ", "control char must not be written");
+        assert_eq!(cell.fg, theme.fg, "fg must stay at background-fill value");
+        assert_eq!(cell.bg, theme.bg, "bg must stay at background-fill value");
+    }
+
+    #[test]
+    fn modifiers_applied() {
+        let theme = theme::default_theme();
+        let mut cell = Cell::default();
+        let cs = CellState {
+            c: 'B',
+            fg: CellColor::new(0, 0, 0),
+            bg: CellColor::new(0, 0, 0),
+            attrs: CellAttrs(CellAttrs::BOLD | CellAttrs::ITALIC),
+        };
+
+        apply_cell(&mut cell, &cs, &theme);
+
+        assert!(cell.modifier.contains(Modifier::BOLD));
+        assert!(cell.modifier.contains(Modifier::ITALIC));
     }
 }

@@ -58,6 +58,7 @@ pub fn resolve_mode_select(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action
             "l" => (Some(Mode::Locked), Action::None),
             "h" => (Some(Mode::Normal), Action::ToggleHud),
             "m" => (Some(Mode::Normal), Action::ToggleMetrics),
+            "r" => (Some(Mode::Normal), Action::ForceRedraw),
             "?" => (Some(Mode::Help), Action::None),
             "q" => (Some(Mode::Normal), Action::Quit),
             _ => (Some(Mode::Normal), Action::None),

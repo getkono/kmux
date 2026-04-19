@@ -91,6 +91,11 @@ impl App {
             .unwrap_or_else(Instant::now);
 
         loop {
+            if self.force_clear {
+                terminal.clear()?;
+                self.force_clear = false;
+                self.needs_render = true;
+            }
             if self.needs_render && last_draw.elapsed() >= RENDER_MIN_INTERVAL {
                 terminal.draw(|f| ui::render(f, self))?;
                 self.needs_render = false;

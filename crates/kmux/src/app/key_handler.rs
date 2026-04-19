@@ -369,6 +369,9 @@ impl App {
             Action::Reconnect => {
                 return KeyResult::Reconnect;
             }
+            Action::ForceRedraw => {
+                self.force_clear = true;
+            }
             Action::None => {}
         }
 
