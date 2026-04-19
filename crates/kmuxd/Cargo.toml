@@ -2,15 +2,11 @@
 name = "kmuxd"
 version = "0.1.0"
 edition = "2024"
+build = "build.rs"
 
 [[bin]]
 name = "kmuxd"
 path = "src/main.rs"
-
-[features]
-default = ["backend-wezterm"]
-backend-wezterm = ["dep:tattoy-wezterm-term", "dep:tattoy-wezterm-surface"]
-backend-ghostty = []
 
 [dependencies]
 kmux-pty.workspace = true
@@ -19,8 +15,10 @@ daemonize.workspace = true
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tattoy-wezterm-term = { workspace = true, optional = true }
-tattoy-wezterm-surface = { workspace = true, optional = true }
+kmux-ghostty.workspace = true
+# Direct dep (rather than only transitive via kmux-ghostty) so this crate's
+# build.rs receives `DEP_KMUX_GHOSTTY_LIB_DIR` and can embed the rpath.
+kmux-ghostty-sys.workspace = true
 tokio.workspace = true
 quinn.workspace = true
 rustls.workspace = true

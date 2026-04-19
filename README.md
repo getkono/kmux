@@ -36,6 +36,10 @@ configuration.
 ## Prerequisites
 
 - Rust toolchain (edition 2024) via [rustup](https://rustup.rs)
+- Zig `0.15.2`, managed via [mise](https://mise.jdx.dev) (`mise install` reads
+  `mise.toml`); required to build the bundled libghostty-vt wrapper.
+- Ghostty sources as a git submodule: after cloning, run
+  `git submodule update --init` once to populate `vendor/ghostty/`.
 
 ## Quick start
 

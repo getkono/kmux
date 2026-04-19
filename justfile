@@ -1,3 +1,5 @@
+set shell := ["bash", "-euo", "pipefail", "-c"]
+
 default:
     @just --list
 
@@ -60,3 +62,8 @@ start-daemon:
 # Stop the local daemon (debug build).
 stop-daemon:
     cargo run -p kmux -- daemon stop
+
+# Install kmux and kmuxd to ~/.cargo/bin (release build)
+install:
+    cargo install --path crates/kmux
+    cargo install --path crates/kmuxd

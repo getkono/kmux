@@ -92,7 +92,10 @@ fn flush_cell_diff(
     let diff_us = diff_start.elapsed().as_micros();
 
     match result {
-        DiffResult::CellDiff(diff) => {
+        DiffResult::CellDiff {
+            diff,
+            scrollback_lines,
+        } => {
             *prev_cursor = diff.cursor;
             *prev_modes = diff.modes;
 
@@ -106,6 +109,24 @@ fn flush_cell_diff(
                 "flush_cell_diff: broadcasting cell diff"
             );
 
+            // Emit scrollback out-of-band, referencing absolute indices
+            // derived from `history_total`. In v16 `TerminalDiff` no longer
+            // carries the lines inline; clients reconcile any gap via
+            // `FetchHistory`.
+            if !scrollback_lines.is_empty() {
+                let sb_len = scrollback_lines.len() as u64;
+                let first_index = diff.history_total.saturating_sub(sb_len);
+                let sb_seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
+                let sb_msg = ServerMessage::ScrollbackAppend {
+                    pane_id: pane_id.to_string(),
+                    first_index,
+                    lines: scrollback_lines,
+                    seqno: sb_seqno,
+                    sent_at_ms: epoch_millis(),
+                };
+                broadcast_to_clients(pane_id, &sb_msg, clients, term_state, sb_seqno);
+            }
+
             let seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
             let diff = Arc::new(diff);
             scrollback.lock().unwrap().push(seqno, Arc::clone(&diff));
@@ -118,7 +139,11 @@ fn flush_cell_diff(
             };
             broadcast_to_clients(pane_id, &msg, clients, term_state, seqno);
         }
-        DiffResult::CursorOnly { cursor, modes } => {
+        DiffResult::CursorOnly {
+            cursor,
+            modes,
+            history_total,
+        } => {
             if cursor != *prev_cursor || modes != *prev_modes {
                 *prev_cursor = cursor;
                 *prev_modes = modes;
@@ -129,7 +154,7 @@ fn flush_cell_diff(
                         ops: vec![],
                         cursor,
                         modes,
-                        scrollback_lines: vec![],
+                        history_total,
                     }),
                 );
                 let msg = ServerMessage::CursorUpdate {
@@ -221,7 +246,7 @@ mod tests {
                 ops: vec![],
                 cursor: CursorState::default(),
                 modes: TermModes::EMPTY,
-                scrollback_lines: vec![],
+                history_total: 0,
             }),
             seqno: SequenceNo(1),
             sent_at_ms: 0,

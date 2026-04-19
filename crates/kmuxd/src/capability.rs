@@ -31,13 +31,13 @@ pub fn intersect_for_atomics<'a>(
 /// Build the environment variable overrides that should be applied to every
 /// shell spawned inside a kmux pane.
 ///
-/// These vars reflect what the server-side VT emulator (wezterm-term) parses,
+/// These vars reflect what the server-side VT emulator (libghostty-vt) parses,
 /// not the launching daemon's own terminal identity:
 ///
-/// - `TERM=xterm-256color` — always, because wezterm-term is an xterm-family
+/// - `TERM=xterm-256color` — always, because libghostty-vt is an xterm-family
 ///   parser.  Claiming the client's native TERM would cause the shell to emit
 ///   sequences the parser might not handle.
-/// - `COLORTERM=truecolor` — always, because wezterm-term parses 24-bit SGR
+/// - `COLORTERM=truecolor` — always, because libghostty-vt parses 24-bit SGR
 ///   unconditionally and kmux forwards RGB cells on the wire.
 /// - `TERM_PROGRAM=kmux` / `TERM_PROGRAM_VERSION=<version>` — override
 ///   launcher leakage so that feature-sniffers (Starship, bat, etc.) see a

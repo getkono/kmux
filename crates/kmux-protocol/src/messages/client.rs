@@ -114,6 +114,19 @@ pub enum ClientMessage {
     /// diffs on every PTY output, bypassing the diff engine entirely.
     SetSnapshotMode { enabled: bool },
 
+    /// Ask the daemon for a range of scrollback lines starting at the given
+    /// absolute index. Used to fill gaps (missed `ScrollbackAppend` frames)
+    /// or lazily hydrate older history when the user scrolls past the
+    /// client's cache.
+    FetchHistory {
+        request_id: RequestId,
+        pane_id: PaneId,
+        /// Absolute index of the first requested line.
+        start_index: u64,
+        /// Maximum number of lines to return.
+        count: u32,
+    },
+
     /// Keep-alive ping (client -> server).
     Ping { seq: u64 },
 

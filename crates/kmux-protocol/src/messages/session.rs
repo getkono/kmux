@@ -22,7 +22,7 @@ pub type PaneId = String;
 ///
 /// The daemon uses these to decide which PTY environment variables to set
 /// for spawned shells and which features to enable in the server-side VT
-/// emulator (currently `tattoy-wezterm-term`).
+/// emulator (currently libghostty-vt).
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ClientCapabilities {
     /// Client can render kitty graphics protocol image data.

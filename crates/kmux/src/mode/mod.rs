@@ -138,6 +138,9 @@ pub enum Action {
     // Request a full reconnect via `recovery::ReconnectContext::run`.
     Reconnect,
 
+    // Force a full terminal clear + redraw (diagnostic).
+    ForceRedraw,
+
     // No-op
     None,
 }

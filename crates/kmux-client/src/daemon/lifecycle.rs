@@ -1,9 +1,14 @@
+use std::io::{Read, Seek, SeekFrom};
+use std::path::PathBuf;
 use std::time::Duration;
 
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
 use super::{DaemonStatus, query_daemon};
+
+/// Maximum bytes of the boot log to include in a failure error.
+const BOOT_LOG_TAIL_MAX: u64 = 8 * 1024;
 
 /// Remove stale daemon artifacts (zombie prevention).
 ///
@@ -47,11 +52,31 @@ pub(super) fn cleanup_stale_daemon() {
     }
 }
 
+/// Path to the file that captures kmuxd's stdout+stderr across a spawn attempt.
+///
+/// Lives in the runtime dir alongside the socket/pid file so the user can tail
+/// it manually, and so we can include its contents in a startup-failure error.
+fn boot_log_path() -> anyhow::Result<PathBuf> {
+    Ok(kmux_protocol::dirs::runtime_dir()?.join("kmuxd-boot.log"))
+}
+
 /// Spawn `kmuxd --daemon --self-signed --bind 127.0.0.1 --port 0`.
 ///
 /// The server binary handles double-fork daemonization internally via `--daemon`.
 /// We use `LOCK_EX | LOCK_NB` on the pid file to prevent concurrent starts.
-pub(crate) fn start_daemon() -> anyhow::Result<()> {
+///
+/// kmuxd's stdout and stderr are redirected to `kmuxd-boot.log` in the runtime
+/// dir so a crash before it becomes ready (e.g. linker error, bind failure) is
+/// visible to the caller instead of silently vanishing into `/dev/null`.
+///
+/// Returns:
+/// - `Ok(Some(child))` after a successful spawn — the caller should retain the
+///   handle so it can `try_wait()` to detect pre-daemonization crashes and reap
+///   the double-fork's top-level process without leaking a zombie.
+/// - `Ok(None)` if another process already holds the pid-file lock (the caller
+///   should just poll `query_daemon()`).
+/// - `Err(_)` for any other failure (bad binary, filesystem error, …).
+pub(crate) fn start_daemon() -> anyhow::Result<Option<std::process::Child>> {
     use std::os::unix::fs::OpenOptionsExt;
 
     cleanup_stale_daemon();
@@ -76,49 +101,89 @@ pub(crate) fn start_daemon() -> anyhow::Result<()> {
     {
         // Another process is in the middle of starting a daemon — let the
         // caller retry query_daemon() rather than starting a second one.
-        return Err(anyhow::anyhow!(
-            "another process is already starting the daemon"
-        ));
+        return Ok(None);
     }
 
     // Resolve the server binary path. In development `kmuxd` is a
     // sibling binary; in an installed layout it must be on PATH.
     let server_bin = find_server_binary()?;
 
-    std::process::Command::new(&server_bin)
+    // Capture kmuxd's stdio so a crash during boot leaves a trail.
+    let log_path = boot_log_path()?;
+    let log_file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(true)
+        .mode(0o600)
+        .open(&log_path)
+        .map_err(|e| anyhow::anyhow!("failed to open boot log {}: {e}", log_path.display()))?;
+    let stderr_file = log_file.try_clone()?;
+
+    let child = std::process::Command::new(&server_bin)
         .args(kmux_protocol::control_rpc::DAEMON_BOOT_ARGS)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(std::process::Stdio::from(log_file))
+        .stderr(std::process::Stdio::from(stderr_file))
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", server_bin.display()))?;
 
     // Release the flock — the daemonized child will write its own PID file.
     // The lock_file is dropped here.
-    Ok(())
+    Ok(Some(child))
+}
+
+/// Read the tail of the boot log and format it as an error suffix.
+///
+/// Returns `""` when the log is missing or empty. Capped at
+/// `BOOT_LOG_TAIL_MAX` bytes so a runaway log doesn't overwhelm the error.
+fn format_boot_log_hint() -> String {
+    let Ok(path) = boot_log_path() else {
+        return String::new();
+    };
+    let Ok(mut file) = std::fs::File::open(&path) else {
+        return String::new();
+    };
+    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    if len == 0 {
+        return String::new();
+    }
+    let start = len.saturating_sub(BOOT_LOG_TAIL_MAX);
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return String::new();
+    }
+    let mut bytes = Vec::new();
+    if file.read_to_end(&mut bytes).is_err() {
+        return String::new();
+    }
+    let tail = String::from_utf8_lossy(&bytes);
+    let trimmed = tail.trim_end();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+    format!(
+        "\n\n--- kmuxd output (tail of {}): ---\n{trimmed}",
+        path.display()
+    )
 }
 
 /// Ensure exactly one local daemon is running and return its connection params.
 ///
 /// Fast path: if a daemon is already responding, return immediately.
 /// Slow path: start a new daemon and poll until it responds (up to 5 seconds).
+///
+/// While polling, we also `try_wait()` on the spawned child: a non-zero exit
+/// before the daemon goes live is a hard failure and we surface it immediately
+/// with the captured stdio, instead of waiting out the full timeout. A clean
+/// `exit(0)` is normal after the double-fork daemonization completes.
 pub async fn ensure_daemon() -> anyhow::Result<DaemonStatus> {
     // Fast path — existing daemon.
     if let Some(status) = query_daemon().await {
         return Ok(status);
     }
 
-    // Slow path — start a new daemon.
-    match start_daemon() {
-        Ok(()) => {}
-        Err(e)
-            if e.to_string()
-                .contains("another process is already starting") =>
-        {
-            // Race: another concurrent kmux is starting a daemon. Just poll.
-        }
-        Err(e) => return Err(e),
-    }
+    // Slow path — start a new daemon. `None` means another process is already
+    // starting one; we just poll in that case.
+    let mut spawned = start_daemon()?;
 
     // Poll until the daemon is ready.
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -130,6 +195,21 @@ pub async fn ensure_daemon() -> anyhow::Result<DaemonStatus> {
             return Ok(status);
         }
 
+        // Detect and surface a crash that happened before kmuxd daemonized.
+        if let Some(child) = spawned.as_mut()
+            && let Ok(Some(exit)) = child.try_wait()
+        {
+            if !exit.success() {
+                return Err(anyhow::anyhow!(
+                    "kmuxd exited with status {exit} before becoming ready{}",
+                    format_boot_log_hint()
+                ));
+            }
+            // exit(0) → daemonize()'s top-level process completed normally;
+            // the grandchild is now detached. Stop tracking the handle.
+            spawned = None;
+        }
+
         if tokio::time::Instant::now() >= deadline {
             break;
         }
@@ -138,13 +218,14 @@ pub async fn ensure_daemon() -> anyhow::Result<DaemonStatus> {
         if !retry_start && tokio::time::Instant::now() >= (deadline - Duration::from_secs(2)) {
             retry_start = true;
             cleanup_stale_daemon();
-            let _ = start_daemon();
+            spawned = start_daemon().ok().flatten();
         }
     }
 
     Err(anyhow::anyhow!(
         "timed out waiting for local daemon to start; \
-         check that kmuxd is on PATH or in the same directory as kmux"
+         check that kmuxd is on PATH or in the same directory as kmux{}",
+        format_boot_log_hint()
     ))
 }
 
@@ -233,5 +314,50 @@ mod tests {
         // No socket present — stop should return an error.
         let result = crate::daemon::stop_daemon().await;
         assert!(result.is_err(), "expected error when daemon is not running");
+    }
+
+    /// Simulates the exact regression we just hit: kmuxd crashes before it can
+    /// daemonize (e.g. missing `.so`) and the client should surface stderr,
+    /// not a generic timeout.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn ensure_daemon_surfaces_crash_stderr() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+
+        // Place a stub "kmuxd" on PATH that prints a crash message and exits
+        // non-zero without ever binding a socket.
+        let fake_dir = tmp.path().join("bin");
+        std::fs::create_dir_all(&fake_dir).unwrap();
+        let fake_kmuxd = fake_dir.join("kmuxd");
+        std::fs::write(
+            &fake_kmuxd,
+            "#!/bin/sh\n\
+             echo 'error while loading shared libraries: libkmux_ghostty.so' >&2\n\
+             exit 127\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&fake_kmuxd, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let old_path = std::env::var("PATH").unwrap_or_default();
+        unsafe { std::env::set_var("PATH", fake_dir.as_os_str()) };
+
+        let result = ensure_daemon().await;
+
+        unsafe { std::env::set_var("PATH", &old_path) };
+
+        let err = result.expect_err("fake kmuxd should not produce a live daemon");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("libkmux_ghostty.so"),
+            "error must include captured stderr tail: {msg}"
+        );
+        assert!(
+            msg.contains("kmuxd output"),
+            "error must label the captured output section: {msg}"
+        );
     }
 }

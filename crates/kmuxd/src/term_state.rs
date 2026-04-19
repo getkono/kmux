@@ -1,11 +1,9 @@
 use crate::backend::{BackendConfig, TerminalBackend as _};
 pub use crate::diff_engine::DiffEngine;
 
-#[cfg(feature = "backend-wezterm")]
-pub use crate::backend::wezterm::WezTermBackend;
+pub use crate::backend::ghostty::GhosttyBackend;
 
-#[cfg(feature = "backend-wezterm")]
-pub type ActiveBackend = WezTermBackend;
+pub type ActiveBackend = GhosttyBackend;
 
 pub type TermState = DiffEngine<ActiveBackend>;
 

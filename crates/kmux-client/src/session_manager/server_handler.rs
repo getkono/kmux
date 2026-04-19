@@ -54,6 +54,7 @@ impl SessionManager {
                 if let Some(grid) = self.buffers.get_mut(pane_id) {
                     grid.clear();
                 }
+                self.in_flight_history_fetches.remove(pane_id);
                 self.attach_fresh(pane_id.to_string());
                 false
             }
@@ -169,6 +170,7 @@ impl SessionManager {
                         self.buffers.remove(&pane.pane_id);
                         self.pane_sync.remove(&pane.pane_id);
                         self.input_locked.remove(&pane.pane_id);
+                        self.in_flight_history_fetches.remove(&pane.pane_id);
                     }
                 }
                 self.session_list.retain(|e| e.meta.word_id != word_id);
@@ -225,6 +227,7 @@ impl SessionManager {
                 self.buffers.remove(&pane_id);
                 self.pane_sync.remove(&pane_id);
                 self.input_locked.remove(&pane_id);
+                self.in_flight_history_fetches.remove(&pane_id);
 
                 // Remove pane from session_list
                 for entry in &mut self.session_list {
@@ -283,7 +286,7 @@ impl SessionManager {
                     self.metrics.record_diff_stats(op_count);
                 }
                 self.pane_sync.insert(
-                    pane_id,
+                    pane_id.clone(),
                     PaneSync::Synced {
                         expected: SequenceNo(seqno.0 + 1),
                     },
@@ -294,6 +297,7 @@ impl SessionManager {
                     let net_apply_ms = epoch_millis().saturating_sub(sent_at_ms) as f64;
                     self.metrics.record_large_diff(net_apply_ms);
                 }
+                self.maybe_fetch_history(&pane_id);
             }
 
             ServerMessage::CursorUpdate {
@@ -324,6 +328,7 @@ impl SessionManager {
                 if let Some(grid) = self.buffers.get_mut(&pane_id) {
                     grid.clear();
                 }
+                self.in_flight_history_fetches.remove(&pane_id);
                 self.metrics.record_resync(&pane_id, "server sync reset");
                 self.pane_sync.insert(pane_id, PaneSync::AwaitingSync);
             }
@@ -360,6 +365,7 @@ impl SessionManager {
                 if let Some(grid) = self.buffers.get_mut(&pane_id) {
                     grid.clear();
                 }
+                self.in_flight_history_fetches.remove(&pane_id);
                 self.attach_fresh(pane_id);
             }
 
@@ -384,6 +390,55 @@ impl SessionManager {
                 self.input_locked.insert(pane_id.clone(), false);
                 self.status_msg = format!("Input lock released on '{pane_id}'");
                 events.push(SessionEvent::InputLockReleased { pane_id });
+            }
+
+            ServerMessage::ScrollbackAppend {
+                pane_id,
+                first_index,
+                lines,
+                seqno,
+                sent_at_ms,
+            } => {
+                if !self.check_pane_sync(&pane_id, seqno) {
+                    return events;
+                }
+                let start = Instant::now();
+                if let Some(grid) = self.buffers.get_mut(&pane_id) {
+                    grid.apply_scrollback_append(first_index, lines);
+                }
+                self.pane_sync.insert(
+                    pane_id.clone(),
+                    PaneSync::Synced {
+                        expected: SequenceNo(seqno.0 + 1),
+                    },
+                );
+                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+                self.metrics.record_apply(sent_at_ms, elapsed_ms);
+                self.maybe_fetch_history(&pane_id);
+            }
+
+            ServerMessage::HistoryLines {
+                request_id,
+                pane_id,
+                first_index,
+                lines,
+                history_total,
+                ..
+            } => {
+                if let Some(grid) = self.buffers.get_mut(&pane_id) {
+                    grid.apply_history_lines(first_index, lines, history_total);
+                }
+                // Clear only if this reply matches the in-flight request for
+                // this pane; otherwise a stale reply from a prior attach could
+                // unblock a fresher request.
+                if self
+                    .in_flight_history_fetches
+                    .get(&pane_id)
+                    .is_some_and(|rid| *rid == request_id)
+                {
+                    self.in_flight_history_fetches.remove(&pane_id);
+                }
+                self.maybe_fetch_history(&pane_id);
             }
 
             ServerMessage::Ping { seq } => {

@@ -1,64 +1,96 @@
-mod config;
-mod convert;
+//! Terminal backend powered by libghostty-vt (via `kmux-ghostty`).
+//!
+//! Wraps [`kmux_ghostty::GhosttyTerm`] in the [`TerminalBackend`] trait used
+//! by [`DiffEngine`](crate::diff_engine::DiffEngine). Cell/cursor/modes data
+//! is copied once per FFI crossing into caller-owned buffers — no heap churn
+//! on the hot path beyond the scratch `Vec` inside [`GhosttyTerm::fill_cells`].
 
 use std::sync::Arc;
 
-use kmux_protocol::messages::{CellAttrs, CellState, CursorState, TermModes};
-use tattoy_wezterm_term::{Terminal, TerminalSize, terminal::Alert};
+use kmux_ghostty::{EventSink, GhosttyError, GhosttyTerm, TermSize};
+use kmux_protocol::messages::{CellState, CursorState, TermModes};
 
 use crate::backend::{BackendConfig, BackendEventSink, BackendSize, TerminalBackend};
-use config::KmuxTerminalConfig;
-use convert::{cell_state_from_attrs, convert_cursor};
 
-/// VT emulator backend powered by `tattoy-wezterm-term`.
-pub struct WezTermBackend {
-    pub(super) term: Terminal,
-    pub(super) size: BackendSize,
-}
+/// Safe adapter: presents the kmuxd-level [`BackendEventSink`] to
+/// `kmux-ghostty` as its crate-local [`EventSink`]. Both traits share the same
+/// synchronous, non-blocking contract; this type exists only to bridge the
+/// crate boundary without making `kmux-ghostty` depend on kmuxd.
+struct EventSinkAdapter(Arc<dyn BackendEventSink>);
 
-/// Bridge from wezterm's `AlertHandler` to our `BackendEventSink`.
-///
-/// Holds a shared reference to the sink so the alert handler and the backend
-/// struct can both reach the same sink.  Calls from wezterm are synchronous
-/// inside `advance_bytes`; the sink MUST NOT block.
-struct WezTermAlertBridge(Arc<dyn BackendEventSink>);
+impl EventSink for EventSinkAdapter {
+    fn on_title(&self, title: &str) {
+        self.0.on_title(title);
+    }
 
-impl tattoy_wezterm_term::terminal::AlertHandler for WezTermAlertBridge {
-    fn alert(&mut self, alert: Alert) {
-        match alert {
-            Alert::Bell => self.0.on_bell(),
-            Alert::WindowTitleChanged(title) => self.0.on_title(&title),
-            Alert::IconTitleChanged(Some(title)) => self.0.on_title(&title),
-            _ => {}
+    fn on_bell(&self) {
+        self.0.on_bell();
+    }
+
+    fn on_osc52(&self, selection: u8, base64: &[u8]) {
+        // OSC 52 selection targets are ASCII letters (`c`/`p`/`s`/...);
+        // fall back to `"c"` if the terminal emitted garbage.
+        let sel = match selection {
+            b'c' => "c",
+            b'p' => "p",
+            b's' => "s",
+            b'0'..=b'7' => match selection {
+                b'0' => "0",
+                b'1' => "1",
+                b'2' => "2",
+                b'3' => "3",
+                b'4' => "4",
+                b'5' => "5",
+                b'6' => "6",
+                _ => "7",
+            },
+            _ => "c",
+        };
+        // `base64` is the still-encoded OSC 52 payload. Decoding is done
+        // downstream (client-side) so the kmuxd just needs a printable copy.
+        if let Ok(s) = std::str::from_utf8(base64) {
+            self.0.on_osc52_copy(sel, s);
         }
     }
-}
 
-fn make_wezterm_size(size: BackendSize) -> TerminalSize {
-    TerminalSize {
-        rows: size.rows as usize,
-        cols: size.cols as usize,
-        pixel_width: size.pixel_width as usize,
-        pixel_height: size.pixel_height as usize,
-        dpi: 0,
+    fn on_hyperlink(&self, id: Option<&str>, uri: &str) {
+        self.0.on_hyperlink(id, uri);
     }
 }
 
-impl TerminalBackend for WezTermBackend {
+/// VT emulator backend powered by libghostty-vt v1.3.1.
+///
+/// Thread-safety: `GhosttyTerm` is `Send` but not `Sync`; the `DiffEngine`
+/// wrapping it in kmuxd is already protected by `Arc<Mutex<…>>` so only one
+/// thread holds `&mut self` at a time.
+pub struct GhosttyBackend {
+    term: GhosttyTerm,
+    size: BackendSize,
+}
+
+impl std::fmt::Debug for GhosttyBackend {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GhosttyBackend")
+            .field("size", &self.size)
+            .finish()
+    }
+}
+
+fn to_term_size(s: BackendSize) -> TermSize {
+    TermSize {
+        rows: s.rows,
+        cols: s.cols,
+        pixel_width: s.pixel_width,
+        pixel_height: s.pixel_height,
+    }
+}
+
+impl TerminalBackend for GhosttyBackend {
     fn new(cfg: BackendConfig) -> Self {
-        let wez_size = make_wezterm_size(cfg.size);
-        let mut term = Terminal::new(
-            wez_size,
-            Arc::new(KmuxTerminalConfig {
-                kitty_graphics: cfg.capabilities.kitty_graphics,
-                kitty_keyboard: cfg.capabilities.kitty_keyboard,
-                scrollback: cfg.scrollback,
-            }),
-            "kmux",
-            env!("CARGO_PKG_VERSION"),
-            Box::new(std::io::sink()),
-        );
-        term.set_notification_handler(Box::new(WezTermAlertBridge(cfg.events)));
+        let scrollback = u32::try_from(cfg.scrollback).unwrap_or(u32::MAX);
+        let sink: Arc<dyn EventSink> = Arc::new(EventSinkAdapter(cfg.events));
+        let term = GhosttyTerm::new(to_term_size(cfg.size), scrollback, sink)
+            .expect("ghostty: failed to construct Terminal (invalid size?)");
         Self {
             term,
             size: cfg.size,
@@ -69,11 +101,17 @@ impl TerminalBackend for WezTermBackend {
     where
         Self: Sized,
     {
-        "wezterm"
+        "ghostty"
     }
 
     fn feed(&mut self, data: &[u8]) {
-        self.term.advance_bytes(data);
+        // Per `kmux_ghostty::GhosttyTerm::feed`, `Err(Feed)` is only returned
+        // when the VT parser encounters an internal error — in practice this
+        // means our Zig handler returned an error. Treat it as a soft failure:
+        // log and drop so one bad sequence never tears down a pane.
+        if let Err(e) = self.term.feed(data) {
+            tracing::warn!(error = %e, "ghostty: feed failed");
+        }
     }
 
     fn size(&self) -> BackendSize {
@@ -82,128 +120,68 @@ impl TerminalBackend for WezTermBackend {
 
     fn resize(&mut self, size: BackendSize) {
         self.size = size;
-        self.term.resize(make_wezterm_size(size));
+        if let Err(e) = self.term.resize(to_term_size(size)) {
+            tracing::warn!(error = %e, "ghostty: resize failed");
+        }
     }
 
     fn cursor(&self) -> CursorState {
-        convert_cursor(&self.term.cursor_pos())
+        self.term.cursor()
     }
 
     fn modes(&self) -> TermModes {
-        let mut bits: u16 = 0;
-        if self.term.bracketed_paste_enabled() {
-            bits |= TermModes::BRACKETED_PASTE;
-        }
-        // is_mouse_grabbed() returns true when any mouse tracking mode is active
-        // (DEC 1000/1002/1003).  MOUSE_REPORT_CLICK is used as a conservative
-        // proxy; individual mouse mode bits are not distinguishable in this API.
-        //
-        // TODO: file upstream PR to expose individual mouse mode bits.
-        if self.term.is_mouse_grabbed() {
-            bits |= TermModes::MOUSE_REPORT_CLICK;
-        }
-        TermModes(bits)
+        self.term.modes()
     }
 
     fn is_alt_screen(&self) -> bool {
-        self.term.is_alt_screen_active()
+        self.term.is_alt_screen()
     }
 
     fn fill_cells(&self, out: &mut [CellState]) {
-        self.fill_cells_inner(out);
-    }
-
-    fn fill_cells_and_cursor(&self, out: &mut [CellState]) -> (CursorState, TermModes) {
-        self.fill_cells_inner(out);
-        (self.cursor(), self.modes())
-    }
-
-    fn history_size(&self) -> usize {
-        let screen = self.term.screen();
-        screen
-            .scrollback_rows()
-            .saturating_sub(screen.physical_rows)
-    }
-
-    fn read_history_lines(&self, start: usize, count: usize, cols: usize) -> Vec<Vec<CellState>> {
-        let screen = self.term.screen();
-        let palette = self.term.palette();
-        let hist_size = screen
-            .scrollback_rows()
-            .saturating_sub(screen.physical_rows);
-        let end = (start + count).min(hist_size);
-        if start >= end {
-            return vec![];
-        }
-        let mut result = Vec::with_capacity(end - start);
-        screen.with_phys_lines(start..end, |lines| {
-            for line in lines {
-                let mut row = vec![CellState::default(); cols];
-                for cr in line.visible_cells() {
-                    let col = cr.cell_index();
-                    if col >= cols {
-                        break;
-                    }
-                    let attrs = cr.attrs();
-                    let cell_state = cell_state_from_attrs(
-                        cr.str().chars().next().unwrap_or(' '),
-                        cr.width(),
-                        attrs,
-                        &palette,
-                    );
-                    row[col] = cell_state;
-                    if cr.width() > 1 && col + 1 < cols {
-                        row[col + 1].attrs.0 |= CellAttrs::WIDE_CHAR_SPACER;
-                    }
-                }
-                result.push(row);
-            }
-        });
-        result
-    }
-}
-
-impl WezTermBackend {
-    fn fill_cells_inner(&self, out: &mut [CellState]) {
-        let screen = self.term.screen();
-        let palette = self.term.palette();
-        let cols = self.size.cols as usize;
-        let rows = self.size.rows as usize;
-
+        // Pre-fill; the wrapper blanks unvisited cells itself, but the trait
+        // guarantees the pre-fill invariant for callers that read `out` on
+        // partial writes.
         for cell in out.iter_mut() {
             *cell = CellState::default();
         }
+        if let Err(e) = self.term.fill_cells(out) {
+            tracing::warn!(error = %e, "ghostty: fill_cells failed");
+        }
+    }
 
-        let start = screen.phys_row(0);
-        screen.with_phys_lines(start..start + rows, |lines| {
-            for (row, line) in lines.iter().enumerate() {
-                for cr in line.visible_cells() {
-                    let col = cr.cell_index();
-                    if col >= cols {
-                        break;
-                    }
-                    let idx = row * cols + col;
-                    if idx >= out.len() {
-                        break;
-                    }
-                    let attrs = cr.attrs();
-                    // TODO(images): attrs.images() carries kitty/sixel/iTerm2 image data.
-                    // Phase A drops it silently; Phase B will extract and forward via wire
-                    // protocol (requires extending kmux-protocol::messages::CellState).
-                    out[idx] = cell_state_from_attrs(
-                        cr.str().chars().next().unwrap_or(' '),
-                        cr.width(),
-                        attrs,
-                        &palette,
-                    );
-                    if cr.width() > 1 && col + 1 < cols {
-                        out[idx + 1].attrs.0 |= CellAttrs::WIDE_CHAR_SPACER;
-                    }
-                }
+    fn fill_cells_and_cursor(&self, out: &mut [CellState]) -> (CursorState, TermModes) {
+        for cell in out.iter_mut() {
+            *cell = CellState::default();
+        }
+        match self.term.fill_cells_and_cursor(out) {
+            Ok((cursor, modes)) => (cursor, modes),
+            Err(e) => {
+                tracing::warn!(error = %e, "ghostty: fill_cells_and_cursor failed");
+                (self.term.cursor(), self.term.modes())
             }
-        });
+        }
+    }
+
+    fn history_size(&self) -> usize {
+        self.term.history_size()
+    }
+
+    fn read_history_lines(&self, start: usize, count: usize, cols: usize) -> Vec<Vec<CellState>> {
+        match self.term.read_history(start, count, cols) {
+            Ok(rows) => rows,
+            Err(e) => {
+                tracing::warn!(error = %e, "ghostty: read_history failed");
+                Vec::new()
+            }
+        }
     }
 }
+
+// Acknowledge that `GhosttyError::Feed` is intentionally unused in the warm
+// path; keeping the variant lets callers of `kmux-ghostty` differentiate.
+const _: fn() = || {
+    let _ = std::mem::size_of::<GhosttyError>();
+};
 
 #[cfg(test)]
 mod tests {
@@ -214,11 +192,26 @@ mod tests {
     use super::*;
     use crate::backend::{BackendEventSink, CapabilityHandles, NullEventSink};
     use crate::diff_engine::{DiffEngine, DiffResult};
-    use kmux_protocol::messages::{CellColor, DiffOp};
+    use kmux_protocol::messages::{CellAttrs, CellColor, DiffOp};
 
     fn expect_cell_diff(result: DiffResult) -> kmux_protocol::messages::TerminalDiff {
         match result {
-            DiffResult::CellDiff(diff) => diff,
+            DiffResult::CellDiff { diff, .. } => diff,
+            other => panic!("expected CellDiff, got {other:?}"),
+        }
+    }
+
+    fn expect_cell_diff_with_scrollback(
+        result: DiffResult,
+    ) -> (
+        kmux_protocol::messages::TerminalDiff,
+        Vec<Vec<kmux_protocol::messages::CellState>>,
+    ) {
+        match result {
+            DiffResult::CellDiff {
+                diff,
+                scrollback_lines,
+            } => (diff, scrollback_lines),
             other => panic!("expected CellDiff, got {other:?}"),
         }
     }
@@ -240,9 +233,14 @@ mod tests {
         }
     }
 
-    fn test_backend(rows: u16, cols: u16) -> WezTermBackend {
-        WezTermBackend::new(test_cfg(rows, cols))
+    fn test_backend(rows: u16, cols: u16) -> GhosttyBackend {
+        GhosttyBackend::new(test_cfg(rows, cols))
     }
+
+    // -------------------------------------------------------------------
+    // Behavioural tests for the libghostty-vt backend; each assertion
+    // guards a VT feature kmux relies on end-to-end.
+    // -------------------------------------------------------------------
 
     #[test]
     fn feed_hello_produces_5_cell_diff() {
@@ -260,7 +258,7 @@ mod tests {
             .sum();
         assert!(
             total_cells >= 5,
-            "expected at least 5 changed cells, got {total_cells}"
+            "expected >=5 changed cells, got {total_cells}"
         );
     }
 
@@ -278,16 +276,8 @@ mod tests {
                 _ => None,
             })
             .expect("should find 'r' cell");
-        assert_ne!(
-            r_cell.fg,
-            CellColor::new(0xff, 0xff, 0xff),
-            "'r' cell should not be white"
-        );
-        assert_ne!(
-            r_cell.fg,
-            CellColor::new(0, 0, 0),
-            "'r' cell should not be black"
-        );
+        assert_ne!(r_cell.fg, CellColor::new(0xff, 0xff, 0xff));
+        assert_ne!(r_cell.fg, CellColor::new(0, 0, 0));
     }
 
     #[test]
@@ -304,11 +294,7 @@ mod tests {
                 _ => None,
             })
             .expect("should find 'X' cell");
-        assert_eq!(
-            x_cell.fg,
-            CellColor::new(255, 128, 0),
-            "truecolor should pass through"
-        );
+        assert_eq!(x_cell.fg, CellColor::new(255, 128, 0));
     }
 
     #[test]
@@ -349,10 +335,7 @@ mod tests {
                 DiffOp::Clear => 0,
             })
             .sum();
-        assert!(
-            total_cells >= 5,
-            "expected at least 5 changed cells, got {total_cells}"
-        );
+        assert!(total_cells >= 5);
     }
 
     #[test]
@@ -375,7 +358,7 @@ mod tests {
         let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"hello");
         let diff1 = expect_cell_diff(ts.compute_diff());
-        let cells1: usize = diff1
+        let c1: usize = diff1
             .ops
             .iter()
             .map(|op| match op {
@@ -384,11 +367,11 @@ mod tests {
                 DiffOp::Clear => 0,
             })
             .sum();
-        assert!(cells1 >= 5);
+        assert!(c1 >= 5);
 
         ts.feed(b"\x1b[3;1H world");
         let diff2 = expect_cell_diff(ts.compute_diff());
-        let cells2: usize = diff2
+        let c2: usize = diff2
             .ops
             .iter()
             .map(|op| match op {
@@ -397,10 +380,7 @@ mod tests {
                 DiffOp::Clear => 0,
             })
             .sum();
-        assert!(
-            cells2 >= 5,
-            "expected at least 5 changed cells on second diff, got {cells2}"
-        );
+        assert!(c2 >= 5);
     }
 
     #[test]
@@ -408,54 +388,27 @@ mod tests {
         let mut ts = DiffEngine::new(test_backend(24, 80));
         ts.feed(b"\x1b[?25l");
         let snap = ts.snapshot();
-        assert!(
-            !snap.cursor.visible,
-            "cursor should be hidden after DECTCEM reset"
-        );
+        assert!(!snap.cursor.visible);
     }
 
     #[test]
     fn bracketed_paste_mode_enable_disable() {
         let mut ts = DiffEngine::new(test_backend(24, 80));
-
-        assert!(
-            !ts.modes().bracketed_paste(),
-            "bracketed paste should be off by default"
-        );
-
+        assert!(!ts.modes().bracketed_paste());
         ts.feed(b"\x1b[?2004h");
-        assert!(
-            ts.modes().bracketed_paste(),
-            "bracketed paste should be on after \\e[?2004h"
-        );
-
+        assert!(ts.modes().bracketed_paste());
         ts.feed(b"\x1b[?2004l");
-        assert!(
-            !ts.modes().bracketed_paste(),
-            "bracketed paste should be off after \\e[?2004l"
-        );
+        assert!(!ts.modes().bracketed_paste());
     }
 
     #[test]
     fn mouse_report_click_mode_enable_disable() {
         let mut ts = DiffEngine::new(test_backend(24, 80));
-
-        assert!(
-            !ts.modes().mouse_report(),
-            "mouse reporting should be off by default"
-        );
-
+        assert!(!ts.modes().mouse_report());
         ts.feed(b"\x1b[?1000h");
-        assert!(
-            ts.modes().mouse_report(),
-            "mouse reporting should be on after \\e[?1000h"
-        );
-
+        assert!(ts.modes().mouse_report());
         ts.feed(b"\x1b[?1000l");
-        assert!(
-            !ts.modes().mouse_report(),
-            "mouse reporting should be off after \\e[?1000l"
-        );
+        assert!(!ts.modes().mouse_report());
     }
 
     #[test]
@@ -489,32 +442,24 @@ mod tests {
     #[test]
     fn alt_screen_no_scrollback_duplication() {
         let mut ts = DiffEngine::new(test_backend(4, 20));
-
         for i in 0..8 {
             ts.feed(format!("line {i}\r\n").as_bytes());
         }
-        let diff = expect_cell_diff(ts.compute_diff());
-        assert!(
-            !diff.scrollback_lines.is_empty(),
-            "should have generated scrollback"
-        );
+        let (_, sb) = expect_cell_diff_with_scrollback(ts.compute_diff());
+        assert!(!sb.is_empty());
 
         ts.feed(b"\x1b[?1049h");
         ts.feed(b"fzf content");
-        let diff = expect_cell_diff(ts.compute_diff());
-        assert!(
-            diff.scrollback_lines.is_empty(),
-            "no scrollback on alt screen"
-        );
+        let (_, sb) = expect_cell_diff_with_scrollback(ts.compute_diff());
+        assert!(sb.is_empty(), "no scrollback on alt screen");
 
         ts.feed(b"\x1b[?1049l");
         let diff = ts.compute_diff();
-        if let DiffResult::CellDiff(d) = diff {
-            assert!(
-                d.scrollback_lines.is_empty(),
-                "exiting alt screen should not re-send {} scrollback lines",
-                d.scrollback_lines.len()
-            );
+        if let DiffResult::CellDiff {
+            scrollback_lines, ..
+        } = diff
+        {
+            assert!(scrollback_lines.is_empty());
         }
     }
 
@@ -532,14 +477,8 @@ mod tests {
                 _ => None,
             })
             .expect("should find 'A' cell");
-        assert!(
-            a_cell.attrs.0 & CellAttrs::DEFAULT_FG != 0,
-            "plain text should have DEFAULT_FG set"
-        );
-        assert!(
-            a_cell.attrs.0 & CellAttrs::DEFAULT_BG != 0,
-            "plain text should have DEFAULT_BG set"
-        );
+        assert!(a_cell.attrs.0 & CellAttrs::DEFAULT_FG != 0);
+        assert!(a_cell.attrs.0 & CellAttrs::DEFAULT_BG != 0);
     }
 
     #[test]
@@ -556,10 +495,7 @@ mod tests {
                 _ => None,
             })
             .expect("should find 'B' cell");
-        assert!(
-            b_cell.attrs.0 & CellAttrs::BOLD != 0,
-            "bold escape should set BOLD flag"
-        );
+        assert!(b_cell.attrs.0 & CellAttrs::BOLD != 0);
     }
 
     #[test]
@@ -568,14 +504,8 @@ mod tests {
         ts.feed("中".as_bytes());
         let snap = ts.snapshot();
         assert_eq!(snap.cells[0].c, '中');
-        assert!(
-            snap.cells[0].attrs.0 & CellAttrs::WIDE_CHAR != 0,
-            "wide char should have WIDE_CHAR flag"
-        );
-        assert!(
-            snap.cells[1].attrs.0 & CellAttrs::WIDE_CHAR_SPACER != 0,
-            "cell after wide char should have WIDE_CHAR_SPACER flag"
-        );
+        assert!(snap.cells[0].attrs.0 & CellAttrs::WIDE_CHAR != 0);
+        assert!(snap.cells[1].attrs.0 & CellAttrs::WIDE_CHAR_SPACER != 0);
     }
 
     #[test]
@@ -599,11 +529,8 @@ mod tests {
         for i in 0..8 {
             ts.feed(format!("line{i}\r\n").as_bytes());
         }
-        let diff = expect_cell_diff(ts.compute_diff());
-        assert!(
-            !diff.scrollback_lines.is_empty(),
-            "should have scrollback after printing past screen height"
-        );
+        let (_, sb) = expect_cell_diff_with_scrollback(ts.compute_diff());
+        assert!(!sb.is_empty());
     }
 
     #[test]
@@ -623,7 +550,6 @@ mod tests {
         assert_eq!(reported.pixel_height, 640);
     }
 
-    /// Verifies that the event sink receives title changes from OSC-0 sequences.
     #[test]
     fn event_sink_receives_title() {
         struct TitleCapture(Mutex<Vec<String>>);
@@ -651,13 +577,59 @@ mod tests {
             scrollback: 1_000,
         };
 
-        let mut backend = WezTermBackend::new(cfg);
+        let mut backend = GhosttyBackend::new(cfg);
         backend.feed(b"\x1b]0;My Terminal Title\x07");
 
         let titles = sink.0.lock().unwrap();
         assert!(
             titles.iter().any(|t| t.contains("My Terminal Title")),
-            "expected title event for 'My Terminal Title', got: {titles:?}"
+            "expected title event, got: {titles:?}"
         );
+    }
+
+    // -------------------------------------------------------------------
+    // Per-mode mouse bits: libghostty-vt exposes 1002 / 1003 / 1006 as
+    // distinct flags so the wire protocol can report them independently.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn mouse_drag_mode_enable_disable() {
+        // DEC 1002 — button-event tracking.
+        let mut ts = DiffEngine::new(test_backend(24, 80));
+        assert_eq!(ts.modes().0 & TermModes::MOUSE_DRAG, 0);
+        ts.feed(b"\x1b[?1002h");
+        assert_ne!(
+            ts.modes().0 & TermModes::MOUSE_DRAG,
+            0,
+            "MOUSE_DRAG should be set after \\e[?1002h"
+        );
+        ts.feed(b"\x1b[?1002l");
+        assert_eq!(
+            ts.modes().0 & TermModes::MOUSE_DRAG,
+            0,
+            "MOUSE_DRAG should be cleared after \\e[?1002l"
+        );
+    }
+
+    #[test]
+    fn mouse_motion_mode_enable_disable() {
+        // DEC 1003 — any-event tracking (motion reports even without button).
+        let mut ts = DiffEngine::new(test_backend(24, 80));
+        assert_eq!(ts.modes().0 & TermModes::MOUSE_MOTION, 0);
+        ts.feed(b"\x1b[?1003h");
+        assert_ne!(ts.modes().0 & TermModes::MOUSE_MOTION, 0);
+        ts.feed(b"\x1b[?1003l");
+        assert_eq!(ts.modes().0 & TermModes::MOUSE_MOTION, 0);
+    }
+
+    #[test]
+    fn sgr_mouse_mode_enable_disable() {
+        // DEC 1006 — SGR extended coordinates.
+        let mut ts = DiffEngine::new(test_backend(24, 80));
+        assert!(!ts.modes().sgr_mouse());
+        ts.feed(b"\x1b[?1006h");
+        assert!(ts.modes().sgr_mouse());
+        ts.feed(b"\x1b[?1006l");
+        assert!(!ts.modes().sgr_mouse());
     }
 }

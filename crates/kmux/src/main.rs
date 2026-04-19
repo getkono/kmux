@@ -62,7 +62,17 @@ async fn async_main() -> anyhow::Result<()> {
     }
     tracing::info!(
         instance_id = %instance_id,
-        version = env!("CARGO_PKG_VERSION"),
+        version = concat!(
+            env!("CARGO_PKG_VERSION"),
+            " (",
+            env!("BUILD_GIT_SHA"),
+            env!("BUILD_GIT_DIRTY_SUFFIX"),
+            ", ",
+            env!("BUILD_DATE"),
+            ", ",
+            env!("BUILD_PROFILE"),
+            ")"
+        ),
         protocol_version = kmux_protocol::messages::PROTOCOL_VERSION,
         "kmux started"
     );

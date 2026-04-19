@@ -342,7 +342,7 @@ spawn_pane_relay(pane_id, program, args, size, cwd, capabilities):
   - Create PaneRelay:
       clients: Arc<Mutex<ClientMap>>       // empty; filled on Attach
       writer:  PtyWriter
-      term_state: Arc<Mutex<TermState>>   // wezterm VT emulator
+      term_state: Arc<Mutex<TermState>>   // libghostty-vt VT emulator
       scrollback: Arc<Mutex<DiffBuffer>>  // 10 MB ring buffer of diffs
       seqno_counter: Arc<AtomicU64>       // starts at 1
       kitty_graphics_enabled / kitty_keyboard_enabled: Arc<AtomicBool>
@@ -550,7 +550,7 @@ daemons.
 | `ClientMap`         | `app/mod.rs`          | `Arc<Mutex<HashMap<ClientId, ClientSender>>>` per pane |
 | `SharedClientState` | `client_handler/mod.rs` | Per-connection: auth flag, client_id, conn_id, capabilities |
 | `ConnectionMetrics` | `app/mod.rs`          | Per-connection: bytes/msgs in+out, RTT, last_activity_ms |
-| `TermState`         | `term_state.rs`       | Server-side VT emulator (wezterm backend) |
+| `TermState`         | `term_state.rs`       | Server-side VT emulator (libghostty-vt backend) |
 | `DiffBuffer`        | `scrollback.rs`       | Ring buffer of `(seqno, TerminalDiff)` bounded by byte capacity |
 | `WordlistSampler`   | `wordlist.rs`         | Draws unique session IDs; tracks reserved words across restarts |
 | `PersistedDaemonState` | `persist/mod.rs`   | Serialized checkpoint (postcard, versioned) |

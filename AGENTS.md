@@ -20,3 +20,7 @@ A terminal multiplexer / session manager with remote desktop capabilities.
 - Use conventional commits (`type: description`)
 - Keep functions small and focused
 - Prefer `thiserror` for error types, `anyhow` for application-level errors
+
+## Correctness (IMPORTANT!)
+
+- Every component that interacts with external dependencies is versioned. For instance, the data protocol is versioned so `kmux` refuses to talk to `kmuxd` instance unless it matches.

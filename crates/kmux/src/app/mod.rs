@@ -93,6 +93,7 @@ pub struct App {
     pub recent_servers: RecentServersCache,
 
     pub(super) needs_render: bool,
+    pub(super) force_clear: bool,
 
     /// Sender side of the paste channel; wired up by `App::run`.
     /// Clipboard reads run on a blocking thread and result arrives here.
@@ -238,6 +239,7 @@ impl App {
             server_picker_search: String::new(),
             recent_servers: RecentServersCache::load(),
             needs_render: true,
+            force_clear: false,
             paste_tx: None,
             cancel_tx: None,
             pending_srv_tx: None,

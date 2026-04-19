@@ -2,7 +2,7 @@
 //! sessions survive daemon restarts and crashes.
 //!
 //! All types in this module use only `kmux-protocol` message types to ensure
-//! zero coupling to the wezterm backend. When the backend is swapped, the
+//! zero coupling to the terminal backend. When the backend is swapped, the
 //! persistence layer requires no changes.
 
 pub mod checkpoint;
@@ -151,6 +151,8 @@ mod tests {
                         ],
                         cursor: CursorState::default(),
                         modes: TermModes::EMPTY,
+                        history_total: 0,
+                        scrollback_tail: Vec::new(),
                     },
                     scrollback_lines: vec![vec![kmux_protocol::messages::CellState::default(); 80]],
                     cwd: "/home/user/project".to_string(),

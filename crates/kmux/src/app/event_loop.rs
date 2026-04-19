@@ -91,6 +91,11 @@ impl App {
             .unwrap_or_else(Instant::now);
 
         loop {
+            if self.force_clear {
+                terminal.clear()?;
+                self.force_clear = false;
+                self.needs_render = true;
+            }
             if self.needs_render && last_draw.elapsed() >= RENDER_MIN_INTERVAL {
                 terminal.draw(|f| ui::render(f, self))?;
                 self.needs_render = false;
@@ -230,7 +235,7 @@ impl App {
                         Some(rx) => rx.recv().await,
                         None => std::future::pending().await,
                     }
-                }, if matches!(self.mode, Mode::Connecting { .. }) => {
+                } => {
                     match bootstrap_result {
                         Some(BootstrapTaskResult::Success(outcome)) => {
                             self.cancel_tx = None;
@@ -350,7 +355,14 @@ impl App {
     /// After the bootstrap outcome arm settles, mirror the manager's connection state
     /// into the TUI mode. On failure, show the disconnect overlay again with
     /// the bootstrap error that `mgr.connect` recorded.
+    ///
+    /// Only transitions *out of* `Mode::Connecting`; any other mode (e.g.
+    /// `DirectoryPicker` picked while bootstrap was in flight) is preserved so
+    /// an async bootstrap settling doesn't clobber user-initiated navigation.
     pub(super) fn reflect_bootstrap_outcome(&mut self) {
+        if !matches!(self.mode, Mode::Connecting { .. }) {
+            return;
+        }
         if self.mgr.connection_state().is_live() {
             self.mode = Mode::Normal;
         } else {

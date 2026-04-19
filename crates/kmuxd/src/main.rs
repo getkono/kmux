@@ -24,7 +24,21 @@ use tracing::Instrument;
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser, Debug)]
-#[command(name = "kmuxd", about = "kmux remote terminal server", version)]
+#[command(
+    name = "kmuxd",
+    about = "kmux remote terminal server",
+    version = concat!(
+        env!("CARGO_PKG_VERSION"),
+        " (",
+        env!("BUILD_GIT_SHA"),
+        env!("BUILD_GIT_DIRTY_SUFFIX"),
+        ", ",
+        env!("BUILD_DATE"),
+        ", ",
+        env!("BUILD_PROFILE"),
+        ")"
+    )
+)]
 struct Cli {
     #[command(subcommand)]
     command: Option<Command>,
@@ -140,7 +154,17 @@ fn main() -> anyhow::Result<()> {
     }
     tracing::info!(
         instance_id = %instance_id,
-        version = env!("CARGO_PKG_VERSION"),
+        version = concat!(
+            env!("CARGO_PKG_VERSION"),
+            " (",
+            env!("BUILD_GIT_SHA"),
+            env!("BUILD_GIT_DIRTY_SUFFIX"),
+            ", ",
+            env!("BUILD_DATE"),
+            ", ",
+            env!("BUILD_PROFILE"),
+            ")"
+        ),
         protocol_version = kmux_protocol::messages::PROTOCOL_VERSION,
         "kmuxd started"
     );

@@ -1,4 +1,4 @@
-use kmux_protocol::messages::{ClientId, InputMode, TermSize};
+use kmux_protocol::messages::{CellState, ClientId, InputMode, TermSize};
 use kmux_pty::error::{KmuxError, Result};
 
 use crate::conversions::term_size_to_window;
@@ -137,5 +137,23 @@ impl ServerApp {
         } else {
             Ok(false)
         }
+    }
+
+    /// Fetch `count` scrollback lines starting at absolute `start` for
+    /// `pane_id`. Returns `(first_index, lines, history_total)` where
+    /// `first_index` may be greater than `start` if requested lines were
+    /// evicted. An empty `lines` means the range is fully beyond the mirror.
+    pub async fn fetch_history(
+        &self,
+        pane_id: &str,
+        start: u64,
+        count: u32,
+    ) -> Result<(u64, Vec<Vec<CellState>>, u64)> {
+        let sessions = self.sessions.read().await;
+        let relay = get_pane_relay(&sessions, pane_id)?;
+        let ts = relay.term_state.lock().unwrap();
+        let (first_index, lines) = ts.mirror_range(start, count);
+        let history_total = ts.history_total();
+        Ok((first_index, lines, history_total))
     }
 }

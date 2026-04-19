@@ -60,6 +60,10 @@ pub struct SessionManager {
     pub(super) pane_sync: HashMap<PaneId, PaneSync>,
     pub input_locked: HashMap<PaneId, bool>,
     pub(super) next_request_id: u64,
+    /// Panes with an outstanding `FetchHistory` request; maps `pane_id` to the
+    /// `request_id` of the in-flight query so we can coalesce (never issue a
+    /// second request while the first is pending) and reconcile responses.
+    pub(super) in_flight_history_fetches: HashMap<PaneId, u64>,
     pub client_id: Option<ClientId>,
 
     // Observability
@@ -123,6 +127,7 @@ impl SessionManager {
             pane_sync: HashMap::new(),
             input_locked: HashMap::new(),
             next_request_id: 0,
+            in_flight_history_fetches: HashMap::new(),
             client_id: None,
             metrics: MetricsStore::in_memory(),
             server_version: None,
@@ -239,9 +244,43 @@ impl SessionManager {
         id
     }
 
+    /// Maximum number of scrollback lines a single `FetchHistory` asks for.
+    /// Keeps the reply small enough to render promptly while still making
+    /// good progress on catching up to the server's `history_total`.
+    const FETCH_HISTORY_CHUNK: u32 = 500;
+
+    /// If this pane has a known scrollback gap and no in-flight fetch,
+    /// issue a bounded `FetchHistory` to close the gap. Coalesces: at most
+    /// one request per pane is in flight at any time.
+    pub(super) fn maybe_fetch_history(&mut self, pane_id: &str) {
+        if self.in_flight_history_fetches.contains_key(pane_id) {
+            return;
+        }
+        let Some(grid) = self.buffers.get(pane_id) else {
+            return;
+        };
+        let Some((have, want)) = grid.pending_history_gap() else {
+            return;
+        };
+        let count = (want - have).min(Self::FETCH_HISTORY_CHUNK as u64) as u32;
+        if count == 0 {
+            return;
+        }
+        let request_id = self.next_rid();
+        self.in_flight_history_fetches
+            .insert(pane_id.to_string(), request_id);
+        self.send_ws(ClientMessage::FetchHistory {
+            request_id,
+            pane_id: pane_id.to_string(),
+            start_index: have,
+            count,
+        });
+    }
+
     pub(super) fn attach_fresh(&mut self, pane_id: String) {
         self.pane_sync
             .insert(pane_id.clone(), PaneSync::AwaitingSync);
+        self.in_flight_history_fetches.remove(&pane_id);
         self.send_ws(ClientMessage::Attach {
             pane_id,
             last_seqno: None,
@@ -437,6 +476,8 @@ mod tests {
             cells: vec![],
             cursor: Default::default(),
             modes: TermModes::EMPTY,
+            history_total: 0,
+            scrollback_tail: Vec::new(),
         };
         mgr.handle_server_message(ServerMessage::TerminalSnapshot {
             pane_id: "eagle/0".to_string(),
@@ -466,7 +507,7 @@ mod tests {
             ops: vec![],
             cursor: Default::default(),
             modes: TermModes::EMPTY,
-            scrollback_lines: vec![],
+            history_total: 0,
         });
         mgr.handle_server_message(ServerMessage::TerminalUpdate {
             pane_id: "eagle/0".to_string(),
@@ -677,6 +718,89 @@ mod tests {
             .collect();
         resized_panes.sort();
         assert_eq!(resized_panes, ["s1/0", "s2/0"]);
+    }
+
+    #[test]
+    fn terminal_update_with_history_gap_issues_fetch_history() {
+        // A TerminalUpdate that reports a non-zero `history_total` above what
+        // the client has should trigger a single `FetchHistory`. A second
+        // update while the first is in flight must not issue another.
+        use kmux_protocol::messages::TerminalDiff;
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.buffers
+            .insert("eagle/0".to_string(), CellGrid::default());
+        mgr.pane_sync.insert(
+            "eagle/0".to_string(),
+            PaneSync::Synced {
+                expected: SequenceNo(0),
+            },
+        );
+
+        let make_diff = |history_total: u64| {
+            Arc::new(TerminalDiff {
+                ops: vec![],
+                cursor: Default::default(),
+                modes: TermModes::EMPTY,
+                history_total,
+            })
+        };
+
+        mgr.handle_server_message(ServerMessage::TerminalUpdate {
+            pane_id: "eagle/0".to_string(),
+            diff: make_diff(10),
+            seqno: SequenceNo(0),
+            sent_at_ms: 0,
+        });
+
+        // Exactly one FetchHistory on the wire.
+        match rx.try_recv().expect("FetchHistory sent") {
+            ClientMessage::FetchHistory {
+                pane_id,
+                start_index,
+                count,
+                ..
+            } => {
+                assert_eq!(pane_id, "eagle/0");
+                assert_eq!(start_index, 0);
+                assert_eq!(count, 10);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Second diff while still waiting: must not re-issue.
+        mgr.handle_server_message(ServerMessage::TerminalUpdate {
+            pane_id: "eagle/0".to_string(),
+            diff: make_diff(20),
+            seqno: SequenceNo(1),
+            sent_at_ms: 0,
+        });
+        assert!(rx.try_recv().is_err(), "coalesced: no second FetchHistory");
+
+        // Reply clears the in-flight marker; remaining gap prompts a fresh request.
+        let request_id = *mgr
+            .in_flight_history_fetches
+            .get("eagle/0")
+            .expect("in-flight recorded");
+        let lines: Vec<Vec<kmux_protocol::messages::CellState>> =
+            (0..10).map(|_| Vec::new()).collect();
+        mgr.handle_server_message(ServerMessage::HistoryLines {
+            request_id,
+            pane_id: "eagle/0".to_string(),
+            first_index: 0,
+            lines,
+            history_total: 20,
+            sent_at_ms: 0,
+        });
+
+        match rx.try_recv().expect("follow-up FetchHistory sent") {
+            ClientMessage::FetchHistory {
+                start_index, count, ..
+            } => {
+                assert_eq!(start_index, 10);
+                assert_eq!(count, 10);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]
