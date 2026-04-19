@@ -36,6 +36,10 @@ pub(super) struct PickerItem {
 ///
 /// Clears the overlay area, draws an input line (`input_label` + `input_text` + cursor),
 /// a separator, the item list (or `empty_msg` when empty), and a titled border.
+///
+/// Returns the absolute screen row of the first rendered item, so callers can
+/// register per-item click/hover hit-boxes. When `items` is empty, returns
+/// `None` (the overlay shows `empty_msg` instead of item rows).
 #[allow(clippy::too_many_arguments)]
 pub(super) fn render_list_picker(
     f: &mut Frame,
@@ -47,7 +51,7 @@ pub(super) fn render_list_picker(
     input_text: &str,
     items: &[PickerItem],
     empty_msg: &str,
-) {
+) -> Option<u16> {
     f.render_widget(Clear, overlay_area);
     let inner_width = overlay_area.width.saturating_sub(2) as usize;
 
@@ -92,4 +96,11 @@ pub(super) fn render_list_picker(
         .style(Style::default().bg(theme.bg));
 
     f.render_widget(Paragraph::new(lines).block(block), overlay_area);
+
+    // The items start on overlay row: border (1) + input line (1) + separator (1) = 3.
+    if items.is_empty() {
+        None
+    } else {
+        Some(overlay_area.y + 3)
+    }
 }

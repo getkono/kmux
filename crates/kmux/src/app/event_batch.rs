@@ -125,7 +125,10 @@ impl App {
                             if let Some((sp, delta)) = local_scroll.take() {
                                 self.apply_local_scroll_delta(&sp, delta);
                             }
-                            self.handle_mouse(mouse_event);
+                            if let Some(result) = self.handle_mouse(mouse_event) {
+                                self.needs_render = true;
+                                return result;
+                            }
                         }
                     }
                 }

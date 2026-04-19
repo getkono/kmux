@@ -2,11 +2,11 @@ use ratatui::Frame;
 use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 
-use crate::app::App;
+use crate::app::{App, PickerHits};
 
 use super::{PickerItem, centered_overlay, render_list_picker};
 
-pub fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
+pub fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let search = &app.session_picker_search;
     let search_lower = search.to_lowercase();
@@ -49,7 +49,8 @@ pub fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    render_list_picker(
+    let item_count = items.len();
+    let first_row = render_list_picker(
         f,
         overlay_area,
         theme,
@@ -60,9 +61,11 @@ pub fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
         &items,
         " (no results) ",
     );
+
+    app.picker_hits = picker_hits(overlay_area, first_row, item_count);
 }
 
-pub fn render_server_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
+pub fn render_server_picker_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let search = &app.server_picker_search;
 
@@ -97,7 +100,8 @@ pub fn render_server_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    render_list_picker(
+    let item_count = items.len();
+    let first_row = render_list_picker(
         f,
         overlay_area,
         theme,
@@ -108,9 +112,11 @@ pub fn render_server_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
         &items,
         " (no recent servers) ",
     );
+
+    app.picker_hits = picker_hits(overlay_area, first_row, item_count);
 }
 
-pub fn render_dir_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
+pub fn render_dir_picker_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let buffer = &app.dir_picker_buffer;
 
@@ -135,7 +141,8 @@ pub fn render_dir_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
         })
         .collect();
 
-    render_list_picker(
+    let item_count = items.len();
+    let first_row = render_list_picker(
         f,
         overlay_area,
         theme,
@@ -146,4 +153,17 @@ pub fn render_dir_picker_overlay(f: &mut Frame, area: Rect, app: &App) {
         &items,
         " (no existing sessions — Enter to create new) ",
     );
+
+    app.picker_hits = picker_hits(overlay_area, first_row, item_count);
+}
+
+fn picker_hits(rect: Rect, first_row: Option<u16>, item_count: usize) -> PickerHits {
+    let item_rows = match first_row {
+        Some(start) => (0..item_count as u16).map(|i| start + i).collect(),
+        None => Vec::new(),
+    };
+    PickerHits {
+        rect: Some(rect),
+        item_rows,
+    }
 }

@@ -34,6 +34,15 @@ fn render_terminal(f: &mut Frame, app: &mut App) {
     bars::render_status_bar(f, app, chunks[2]);
     bars::render_hint_bar(f, app, chunks[3]);
 
+    // Drop stale picker hit-boxes whenever no picker is being rendered this frame;
+    // the picker render fns overwrite this below if one is active.
+    if !matches!(
+        app.mode,
+        Mode::SessionPicker | Mode::ServerPicker | Mode::DirectoryPicker,
+    ) {
+        app.picker_hits = crate::app::PickerHits::default();
+    }
+
     // Overlays — clone mode to avoid borrow conflict with app
     let mode_snap = app.mode.clone();
     match &mode_snap {

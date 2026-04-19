@@ -1,9 +1,11 @@
+use std::ops::Range;
 use std::time::Instant;
 
 use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::session_manager::SessionManager;
 use kmux_client::ssh::RemoteTarget;
 use kmux_protocol::messages::ServerMessage;
+use ratatui::layout::Rect;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::recent_servers::{RecentServersCache, ServerKind};
@@ -15,6 +17,44 @@ mod helpers;
 mod input_coalesce;
 mod key_handler;
 mod mouse_handler;
+
+/// Action to take when the user clicks the top-bar region at a given column.
+/// Each clickable segment on the top bar carries one of these so the mouse
+/// handler's only job is to find the segment under the cursor.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TopBarAction {
+    OpenServerPicker,
+    Reconnect,
+    OpenSessionPicker,
+    SelectPane(String),
+}
+
+/// Column ranges recorded by `render_session_bar` so the mouse handler can
+/// hit-test clicks on row 0 without duplicating render-layout math. Stored in
+/// left-to-right order — purely display, mouse logic just scans for the first
+/// range containing the cursor.
+#[derive(Default)]
+pub struct TopBarHits {
+    pub regions: Vec<(Range<u16>, TopBarAction)>,
+}
+
+impl TopBarHits {
+    pub fn action_at(&self, col: u16) -> Option<&TopBarAction> {
+        self.regions
+            .iter()
+            .find(|(r, _)| r.contains(&col))
+            .map(|(_, a)| a)
+    }
+}
+
+/// Rects recorded by the active picker overlay so the mouse handler can
+/// support hover-to-highlight, click-to-select, and outside-click dismissal.
+#[derive(Default)]
+pub struct PickerHits {
+    pub rect: Option<Rect>,
+    /// Absolute screen row of each rendered item, in filtered-list order.
+    pub item_rows: Vec<u16>,
+}
 
 /// What `handle_key` returns to the event loop.
 pub(super) enum KeyResult {
@@ -69,12 +109,12 @@ pub struct App {
     /// Effective cwd from `--cwd` or `:path` in server string.
     pub(super) auto_cwd: Option<String>,
 
-    /// Width (in columns) of the server badge in the top bar.
-    pub server_badge_cols: u16,
+    /// Clickable regions on the top bar (row 0), refreshed every render.
+    pub top_bar_hits: TopBarHits,
 
-    /// Width (in columns) of the session badge in the top bar, used to detect
-    /// mouse clicks that should open the session picker.
-    pub session_badge_cols: u16,
+    /// Clickable regions for the currently rendered picker overlay, refreshed
+    /// every render. Empty when no picker is open.
+    pub picker_hits: PickerHits,
 
     /// Human-readable label for the current server shown in the server badge.
     pub server_display: String,
@@ -230,8 +270,8 @@ impl App {
             is_local,
             initial_cwd,
             did_auto_select: false,
-            server_badge_cols: 0,
-            session_badge_cols: 0,
+            top_bar_hits: TopBarHits::default(),
+            picker_hits: PickerHits::default(),
             server_display,
             server_string,
             server_kind,

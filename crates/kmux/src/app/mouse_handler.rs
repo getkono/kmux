@@ -2,35 +2,34 @@ use crossterm::event::{MouseEvent, MouseEventKind};
 use kmux_client::input::encode_mouse_scroll;
 
 use crate::mode::Mode;
+use crate::recent_servers::ServerKind;
 
-use super::App;
+use super::{App, KeyResult, SwitchTarget, TopBarAction};
 
 impl App {
-    pub(super) fn handle_mouse(&mut self, event: MouseEvent) {
-        // Clicks on row 0 open the server picker (server badge) or session picker (session badge).
-        if event.row == 0 && matches!(event.kind, MouseEventKind::Down(_)) {
-            // Server badge occupies [0, server_badge_cols).
-            if event.column < self.server_badge_cols {
-                self.server_picker_selected = 0;
-                self.server_picker_search.clear();
-                self.mode = Mode::ServerPicker;
-                return;
-            }
-            // Session badge occupies [server_badge_cols + 1, server_badge_cols + 1 + session_badge_cols).
-            // (+1 accounts for the separator span between the two badges.)
-            let session_start = self.server_badge_cols + 1;
-            let session_end = session_start + self.session_badge_cols;
-            if event.column >= session_start && event.column < session_end {
-                self.session_picker_selected = 0;
-                self.session_picker_search.clear();
-                self.mode = Mode::SessionPicker;
-                return;
-            }
+    /// Handle a mouse event. Returns a `KeyResult` when the mouse action
+    /// should propagate to the event loop (Reconnect, SwitchServer); otherwise
+    /// `None` for a purely local state change that the next redraw covers.
+    pub(super) fn handle_mouse(&mut self, event: MouseEvent) -> Option<KeyResult> {
+        // Picker overlays consume mouse input first: hover to highlight,
+        // click on an item to select, click outside to dismiss.
+        if matches!(
+            self.mode,
+            Mode::SessionPicker | Mode::ServerPicker | Mode::DirectoryPicker
+        ) && let Some(result) = self.handle_picker_mouse(&event)
+        {
+            return result;
         }
 
-        let Some(pane_id) = self.mgr.active_pane_id().map(|s| s.to_string()) else {
-            return;
-        };
+        // Row 0 is the top bar. Dispatch Down clicks via the single hit-box
+        // list recorded during the last render.
+        if event.row == 0 && matches!(event.kind, MouseEventKind::Down(_)) {
+            return self.dispatch_top_bar_click(event.column);
+        }
+
+        // Scroll wheel inside a pane: either forward to the PTY (when mouse
+        // reporting is on) or scroll the local scrollback.
+        let pane_id = self.mgr.active_pane_id().map(|s| s.to_string())?;
         match event.kind {
             MouseEventKind::ScrollUp => {
                 self.scroll_pane(&pane_id, event.column, event.row, 3);
@@ -39,6 +38,141 @@ impl App {
                 self.scroll_pane(&pane_id, event.column, event.row, -3);
             }
             _ => {}
+        }
+        None
+    }
+
+    /// Translate a top-bar click at `col` into the corresponding action.
+    fn dispatch_top_bar_click(&mut self, col: u16) -> Option<KeyResult> {
+        let action = self.top_bar_hits.action_at(col).cloned()?;
+        match action {
+            TopBarAction::OpenServerPicker => {
+                self.server_picker_selected = 0;
+                self.server_picker_search.clear();
+                self.mode = Mode::ServerPicker;
+                None
+            }
+            TopBarAction::Reconnect => Some(KeyResult::Reconnect),
+            TopBarAction::OpenSessionPicker => {
+                self.session_picker_selected = 0;
+                self.session_picker_search.clear();
+                self.mode = Mode::SessionPicker;
+                None
+            }
+            TopBarAction::SelectPane(pane_id) => {
+                self.mgr.select_pane(pane_id);
+                None
+            }
+        }
+    }
+
+    /// Returns `Some(result)` when the event was handled by the picker layer.
+    /// The outer option distinguishes "handled" from "not handled"; the inner
+    /// `Option<KeyResult>` carries the optional propagation target.
+    fn handle_picker_mouse(&mut self, event: &MouseEvent) -> Option<Option<KeyResult>> {
+        let rect = self.picker_hits.rect?;
+        let col = event.column;
+        let row = event.row;
+        let inside = col >= rect.x
+            && col < rect.x + rect.width
+            && row >= rect.y
+            && row < rect.y + rect.height;
+
+        match event.kind {
+            MouseEventKind::Moved => {
+                if inside && let Some(idx) = self.picker_item_at_row(row) {
+                    self.set_picker_selected(idx);
+                }
+                Some(None)
+            }
+            MouseEventKind::Down(_) => {
+                if !inside {
+                    // Click outside the overlay dismisses the picker.
+                    self.mode = Mode::Normal;
+                    return Some(None);
+                }
+                if let Some(idx) = self.picker_item_at_row(row) {
+                    self.set_picker_selected(idx);
+                    return Some(self.activate_picker_selection());
+                }
+                Some(None)
+            }
+            // Scroll/other events pass through so the underlying grid's scroll
+            // handling still works while a picker is open.
+            _ => None,
+        }
+    }
+
+    fn picker_item_at_row(&self, row: u16) -> Option<usize> {
+        self.picker_hits.item_rows.iter().position(|&r| r == row)
+    }
+
+    fn set_picker_selected(&mut self, idx: usize) {
+        match self.mode {
+            Mode::SessionPicker => self.session_picker_selected = idx,
+            Mode::ServerPicker => self.server_picker_selected = idx,
+            Mode::DirectoryPicker => self.dir_picker_selected = idx,
+            _ => {}
+        }
+    }
+
+    /// Dispatch the same side effects as pressing Enter on the current picker
+    /// selection. Mirrors the logic in `key_handler.rs` for
+    /// `SelectPickerEntry`, `ServerPickerSelect`, and `DirPickerSubmit`.
+    fn activate_picker_selection(&mut self) -> Option<KeyResult> {
+        match self.mode {
+            Mode::SessionPicker => {
+                let search = self.session_picker_search.to_lowercase();
+                let word_id = self
+                    .mgr
+                    .session_list()
+                    .iter()
+                    .filter(|e| {
+                        search.is_empty()
+                            || e.meta.name.to_lowercase().contains(&search)
+                            || e.meta.word_id.to_lowercase().contains(&search)
+                    })
+                    .nth(self.session_picker_selected)
+                    .map(|e| e.meta.word_id.clone());
+                if let Some(word_id) = word_id {
+                    self.mgr.select_session(word_id);
+                }
+                self.mode = Mode::Normal;
+                None
+            }
+            Mode::ServerPicker => {
+                let servers = self.filtered_servers();
+                let choice = servers.get(self.server_picker_selected).cloned();
+                self.mode = Mode::Normal;
+                let server = choice?;
+                if server.server_string == self.server_string {
+                    return None;
+                }
+                let target = match server.kind {
+                    ServerKind::Local => SwitchTarget::Local,
+                    ServerKind::Ssh {
+                        user,
+                        host,
+                        ssh_port,
+                    } => SwitchTarget::Ssh(kmux_client::ssh::RemoteTarget {
+                        user,
+                        host,
+                        ssh_port,
+                    }),
+                    ServerKind::Direct { host, port } => SwitchTarget::Direct { host, port },
+                };
+                Some(KeyResult::SwitchServer(target))
+            }
+            Mode::DirectoryPicker => {
+                let matches = self.dir_picker_matches();
+                if let Some(entry) = matches.get(self.dir_picker_selected) {
+                    let word_id = entry.meta.word_id.clone();
+                    self.mgr.select_session(word_id);
+                }
+                self.mode = Mode::Normal;
+                None
+            }
+            _ => None,
         }
     }
 
