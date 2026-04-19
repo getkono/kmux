@@ -1,3 +1,4 @@
+use super::category::MessageCategory;
 use super::session::{
     ClientCapabilities, ConnectionId, PaneId, RequestId, SequenceNo, TermSize, WordId,
 };
@@ -134,6 +135,33 @@ pub enum ClientMessage {
     Pong { seq: u64 },
 }
 
+impl ClientMessage {
+    /// Classify this message into a [`MessageCategory`] for metrics attribution.
+    /// The match is exhaustive — adding a new variant without updating this
+    /// function is a compile error.
+    pub fn category(&self) -> MessageCategory {
+        match self {
+            Self::PtyInput { .. } | Self::PtyPaste { .. } => MessageCategory::Shell,
+            Self::FetchHistory { .. } => MessageCategory::Scrollback,
+            Self::Ping { .. } | Self::Pong { .. } => MessageCategory::Liveness,
+            Self::SessionCreate { .. }
+            | Self::SessionClose { .. }
+            | Self::SessionList { .. }
+            | Self::SessionRename { .. }
+            | Self::PaneCreate { .. }
+            | Self::PaneClose { .. }
+            | Self::Resize { .. }
+            | Self::Attach { .. }
+            | Self::Detach { .. }
+            | Self::Signal { .. }
+            | Self::RequestInputLock { .. }
+            | Self::ReleaseInputLock { .. }
+            | Self::SetSnapshotMode { .. } => MessageCategory::Control,
+            Self::Auth { .. } | Self::ChannelReady => MessageCategory::Bootstrap,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::super::server::ServerMessage;
@@ -244,5 +272,143 @@ mod tests {
     fn version_mismatch_hint_not_a_mismatch() {
         let hint = version_mismatch_hint("invalid token");
         assert!(hint.is_empty());
+    }
+
+    #[test]
+    fn category_covers_every_client_variant() {
+        use super::super::session::TermSize;
+        // One representative per variant — ensures the exhaustive match compiles
+        // and each variant maps to a specific category.
+        let cases: &[(ClientMessage, MessageCategory)] = &[
+            (
+                ClientMessage::PtyInput {
+                    pane_id: "p".into(),
+                    data: vec![b'a'],
+                },
+                MessageCategory::Shell,
+            ),
+            (
+                ClientMessage::PtyPaste {
+                    pane_id: "p".into(),
+                    data: "x".into(),
+                },
+                MessageCategory::Shell,
+            ),
+            (
+                ClientMessage::FetchHistory {
+                    request_id: 0,
+                    pane_id: "p".into(),
+                    start_index: 0,
+                    count: 10,
+                },
+                MessageCategory::Scrollback,
+            ),
+            (ClientMessage::Ping { seq: 1 }, MessageCategory::Liveness),
+            (ClientMessage::Pong { seq: 1 }, MessageCategory::Liveness),
+            (
+                ClientMessage::SessionCreate {
+                    request_id: 0,
+                    name: None,
+                    cwd: None,
+                    program: None,
+                    args: vec![],
+                    size: TermSize::default(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::SessionClose {
+                    request_id: 0,
+                    word_id: "w".into(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::SessionList { request_id: 0 },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::SessionRename {
+                    request_id: 0,
+                    word_id: "w".into(),
+                    new_name: "n".into(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::PaneCreate {
+                    request_id: 0,
+                    word_id: "w".into(),
+                    program: None,
+                    args: vec![],
+                    size: TermSize::default(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::PaneClose {
+                    request_id: 0,
+                    pane_id: "p".into(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::Resize {
+                    pane_id: "p".into(),
+                    size: TermSize::default(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::Attach {
+                    pane_id: "p".into(),
+                    last_seqno: None,
+                    size: TermSize::default(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::Detach {
+                    pane_id: "p".into(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::Signal {
+                    pane_id: "p".into(),
+                    signal: 15,
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::RequestInputLock {
+                    pane_id: "p".into(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::ReleaseInputLock {
+                    pane_id: "p".into(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::SetSnapshotMode { enabled: false },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::Auth {
+                    token: "t".into(),
+                    protocol_version: PROTOCOL_VERSION,
+                    capabilities: ClientCapabilities::default(),
+                    connection_id: None,
+                },
+                MessageCategory::Bootstrap,
+            ),
+            (ClientMessage::ChannelReady, MessageCategory::Bootstrap),
+        ];
+        for (msg, expected) in cases {
+            assert_eq!(msg.category(), *expected, "wrong category for {msg:?}");
+        }
     }
 }

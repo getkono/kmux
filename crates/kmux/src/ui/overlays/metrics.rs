@@ -11,8 +11,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use kmux_client::metrics::{MetricsStore, TransportKey};
-use kmux_protocol::messages::TransportKind;
+use kmux_client::metrics::{MetricsStore, TransportCounters, TransportKey};
+use kmux_protocol::messages::{MessageCategory, TransportKind};
 
 use crate::app::App;
 use crate::theme::Theme;
@@ -23,8 +23,8 @@ pub fn render_metrics_overlay(f: &mut Frame, area: Rect, app: &App) {
     let theme = &app.theme;
     let metrics = &app.mgr.metrics;
 
-    let width = 70u16.min(area.width.saturating_sub(4));
-    let height = 24u16.min(area.height.saturating_sub(2));
+    let width = 72u16.min(area.width.saturating_sub(4));
+    let height = 36u16.min(area.height.saturating_sub(2));
     let overlay_area = centered_overlay(area, width, height);
 
     f.render_widget(Clear, overlay_area);
@@ -56,20 +56,27 @@ pub fn render_metrics_overlay(f: &mut Frame, area: Rect, app: &App) {
 
     // Per-transport breakdown.
     let active = metrics.active_transport().cloned();
-    let mut per_transport = metrics.network.snapshot();
-    per_transport
+
+    // Collect per-transport totals for card headers.
+    let mut by_transport = metrics.network.snapshot_by_transport();
+    by_transport
         .sort_by(|a, b| transport_sort_order(a.0.kind).cmp(&transport_sort_order(b.0.kind)));
 
-    if per_transport.is_empty() {
+    // Collect per-category breakdown for sub-rows.
+    let all_buckets = metrics.network.snapshot();
+
+    if by_transport.is_empty() {
         lines.push(Line::from(Span::styled(
             " (no transport traffic yet)",
             Style::default().fg(theme.fg_dim),
         )));
     } else {
-        for (key, counters) in &per_transport {
+        for (key, totals) in &by_transport {
             let is_active = active.as_ref().map(|a| a == key).unwrap_or(false);
             let title_color = if is_active { theme.green } else { theme.fg };
             let marker = if is_active { "●" } else { " " };
+
+            // Transport card header with aggregate totals.
             lines.push(Line::from(vec![
                 Span::styled(format!(" {marker} "), Style::default().fg(theme.green)),
                 Span::styled(
@@ -83,20 +90,28 @@ pub fn render_metrics_overlay(f: &mut Frame, area: Rect, app: &App) {
                 Span::styled("     ", Style::default()),
                 Span::styled(
                     format!(
-                        "bytes  in {}  out {}",
-                        fmt_bytes(counters.bytes_in),
-                        fmt_bytes(counters.bytes_out),
+                        "total  in {}  out {}   msgs {}/{}",
+                        fmt_bytes(totals.bytes_in),
+                        fmt_bytes(totals.bytes_out),
+                        totals.msgs_in,
+                        totals.msgs_out,
                     ),
                     Style::default().fg(theme.fg),
                 ),
             ]));
-            lines.push(Line::from(vec![
-                Span::styled("     ", Style::default()),
-                Span::styled(
-                    format!("msgs   in {}  out {}", counters.msgs_in, counters.msgs_out,),
-                    Style::default().fg(theme.fg),
-                ),
-            ]));
+
+            // Per-category sub-rows (non-zero only, stable order).
+            let mut cat_rows: Vec<(MessageCategory, &TransportCounters)> = all_buckets
+                .iter()
+                .filter(|(k, _, _)| k == key)
+                .map(|(_, cat, c)| (*cat, c))
+                .collect();
+            cat_rows.sort_by_key(|(cat, _)| cat.as_sort_key());
+
+            for (cat, c) in &cat_rows {
+                lines.push(category_line(*cat, c, theme));
+            }
+
             lines.push(rtt_line(metrics, key, theme));
             lines.push(Line::from(""));
         }
@@ -158,6 +173,23 @@ pub fn render_metrics_overlay(f: &mut Frame, area: Rect, app: &App) {
     );
 }
 
+fn category_line<'a>(cat: MessageCategory, c: &TransportCounters, theme: &Theme) -> Line<'a> {
+    Line::from(vec![
+        Span::styled("     ", Style::default()),
+        Span::styled(
+            format!(
+                "{:<10} in {}  out {}   msgs {}/{}",
+                cat.to_string(),
+                fmt_bytes(c.bytes_in),
+                fmt_bytes(c.bytes_out),
+                c.msgs_in,
+                c.msgs_out,
+            ),
+            Style::default().fg(theme.fg_dim),
+        ),
+    ])
+}
+
 fn rtt_line(metrics: &MetricsStore, key: &TransportKey, theme: &Theme) -> Line<'static> {
     let summary = metrics.rtt.summary(key);
     let body = match summary {
@@ -204,6 +236,9 @@ fn transport_sort_order(kind: TransportKind) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use kmux_client::metrics::TransportCounters;
+    use kmux_protocol::messages::{MessageCategory, TransportKind};
+
     use super::*;
 
     #[test]
@@ -221,5 +256,21 @@ mod tests {
         assert!(
             transport_sort_order(TransportKind::Quic) < transport_sort_order(TransportKind::TcpTls)
         );
+    }
+
+    #[test]
+    fn category_line_renders_nonzero_bucket() {
+        let theme = crate::theme::default_theme();
+        let counters = TransportCounters {
+            bytes_in: 1024,
+            bytes_out: 512,
+            msgs_in: 4,
+            msgs_out: 2,
+        };
+        let line = category_line(MessageCategory::Shell, &counters, &theme);
+        let text: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+        assert!(text.contains("Shell"));
+        assert!(text.contains("1.0 KiB"));
+        assert!(text.contains("512 B"));
     }
 }

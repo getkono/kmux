@@ -11,6 +11,12 @@
 //! `metrics.jsonl.1` (overwriting any prior generation) and a fresh file
 //! is started. One-generation rotation is deliberate: deeper history would
 //! warrant a real time-series store, not an ever-growing append log.
+//!
+//! # Schema history
+//! - v1: per-transport aggregates only; no `category` field.
+//! - v2: one row per `(transport, category)` with non-zero delta; adds
+//!   `category` field. v1 rows in an existing file are silently skipped by
+//!   `read_history` (they fail to parse against `Sample`).
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, BufRead, BufReader, Seek, SeekFrom, Write};
@@ -26,10 +32,11 @@ use super::network::{TransportCounters, TransportKey};
 use super::rtt::RttSummary;
 
 const ROTATE_BYTES: u64 = 10 * 1024 * 1024;
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
 
-/// One row appended to the metrics JSONL file. Stable schema — bump
-/// `schema` on any incompatible change.
+/// One row appended to the metrics JSONL file. Each row covers a single
+/// `(transport, category)` bucket for the interval since the previous flush.
+/// Stable schema — bump `schema` on any incompatible change.
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub struct Sample {
     pub schema: u32,
@@ -41,6 +48,10 @@ pub struct Sample {
     pub transport: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub endpoint: Option<String>,
+    /// Message category (Shell / Scrollback / Liveness / Control / Sync / Bootstrap).
+    /// Present in schema v2+; v1 rows omit this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub msgs_in: u64,
@@ -54,31 +65,33 @@ pub struct Sample {
 }
 
 impl Sample {
-    /// Build a sample from the individual collectors' current state.
-    pub fn build(
+    /// Construct a sample for one `(transport, category)` delta bucket.
+    /// `net_apply` is `(avg_ms, max_ms)` from the render metrics.
+    pub(crate) fn from_bucket(
         ts_ms: u64,
         conn_id: Option<u64>,
-        transport: Option<&TransportKey>,
+        transport: &TransportKey,
+        category: &str,
         counters: TransportCounters,
         rtt: Option<RttSummary>,
-        net_apply_avg_ms: f64,
-        net_apply_max_ms: f64,
+        net_apply: (f64, f64),
     ) -> Self {
         Self {
             schema: SCHEMA_VERSION,
             ts_ms,
             pid: std::process::id(),
             conn_id,
-            transport: transport.map(|t| t.kind.to_string()),
-            endpoint: transport.map(|t| t.address.clone()),
+            transport: Some(transport.kind.to_string()),
+            endpoint: Some(transport.address.clone()),
+            category: Some(category.to_string()),
             bytes_in: counters.bytes_in,
             bytes_out: counters.bytes_out,
             msgs_in: counters.msgs_in,
             msgs_out: counters.msgs_out,
             rtt_ewma_ms: rtt.and_then(|r| r.ewma_ms),
             rtt_recent_max_ms: rtt.map(|r| r.recent_max_ms).filter(|v| *v > 0.0),
-            net_apply_avg_ms,
-            net_apply_max_ms,
+            net_apply_avg_ms: net_apply.0,
+            net_apply_max_ms: net_apply.1,
         }
     }
 }
@@ -200,7 +213,7 @@ mod tests {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    use kmux_protocol::messages::TransportKind;
+    use kmux_protocol::messages::{MessageCategory, TransportKind};
 
     use super::*;
 
@@ -212,6 +225,7 @@ mod tests {
             conn_id: Some(n),
             transport: Some("QUIC".into()),
             endpoint: Some("1.2.3.4:8443".into()),
+            category: Some("Shell".into()),
             bytes_in: n,
             bytes_out: n * 2,
             msgs_in: 1,
@@ -293,7 +307,7 @@ mod tests {
     }
 
     #[test]
-    fn build_populates_transport_fields() {
+    fn build_populates_transport_and_category_fields() {
         let key = TransportKey::new(TransportKind::Uds, "/run/sock");
         let counters = TransportCounters {
             bytes_in: 10,
@@ -307,9 +321,18 @@ mod tests {
             recent_max_ms: 9.0,
             sample_count: 4,
         };
-        let s = Sample::build(1_000, Some(42), Some(&key), counters, Some(rtt), 1.2, 4.5);
+        let s = Sample::from_bucket(
+            1_000,
+            Some(42),
+            &key,
+            &MessageCategory::Shell.to_string(),
+            counters,
+            Some(rtt),
+            (1.2, 4.5),
+        );
         assert_eq!(s.transport.as_deref(), Some("UDS"));
         assert_eq!(s.endpoint.as_deref(), Some("/run/sock"));
+        assert_eq!(s.category.as_deref(), Some("Shell"));
         assert_eq!(s.bytes_in, 10);
         assert_eq!(s.rtt_ewma_ms, Some(5.5));
         assert_eq!(s.rtt_recent_max_ms, Some(9.0));

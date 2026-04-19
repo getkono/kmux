@@ -5,7 +5,7 @@
 //!
 //! - [`render::RenderMetrics`] — frame-apply latency, batch size, diag
 //!   counters (pre-existing; unchanged).
-//! - [`network::NetworkMetrics`] — per-(transport, endpoint) byte/msg counts.
+//! - [`network::NetworkMetrics`] — per-(transport, category) byte/msg counts.
 //! - [`rtt::RttTracker`] — Ping/Pong round-trip samples per transport.
 //! - [`jsonl::JsonlSink`] — optional rolling persistence so multiple
 //!   concurrent `kmux` processes can share a metrics log.
@@ -22,7 +22,7 @@ pub use network::{NetworkMetrics, TransportCounters, TransportKey};
 pub use render::{MetricsSnapshot, RenderMetrics, RingBuffer};
 pub use rtt::{RttSummary, RttTracker};
 
-use kmux_protocol::messages::{ConnectionId, TransportKind, epoch_millis};
+use kmux_protocol::messages::{ConnectionId, MessageCategory, TransportKind, epoch_millis};
 
 use crate::event_log::DiagSnapshot;
 
@@ -80,12 +80,12 @@ impl MetricsStore {
 
     // ── Byte/message counting ────────────────────────────────────────────
 
-    pub fn record_outbound(&mut self, bytes: usize) {
-        self.network.record_outbound(bytes);
+    pub fn record_outbound(&mut self, bytes: usize, category: MessageCategory) {
+        self.network.record_outbound(bytes, category);
     }
 
-    pub fn record_inbound(&mut self, bytes: usize) {
-        self.network.record_inbound(bytes);
+    pub fn record_inbound(&mut self, bytes: usize, category: MessageCategory) {
+        self.network.record_inbound(bytes, category);
     }
 
     // ── RenderMetrics delegations ────────────────────────────────────────
@@ -134,27 +134,34 @@ impl MetricsStore {
 
     // ── Persistence ──────────────────────────────────────────────────────
 
-    /// Append one sample to the JSONL sink (if enabled). The sample carries
-    /// the *delta* since the previous flush for the active transport so
-    /// concurrent clients don't each write cumulative totals.
+    /// Append one sample per active `(transport, category)` bucket that has
+    /// non-zero delta since the previous flush. RTT and render fields are
+    /// replicated on every row (they describe the transport, not the category).
+    /// Nothing is written when no traffic moved since the last flush.
     pub fn flush_sample(&mut self, conn_id: Option<ConnectionId>) {
         let Some(sink) = &self.sink else { return };
-        let delta = self.network.take_delta_for_active();
-        let (transport, counters) = match delta.as_ref() {
-            Some((k, c)) => (Some(k), *c),
-            None => (None, TransportCounters::default()),
-        };
-        let rtt = transport.and_then(|k| self.rtt.summary(k));
-        let sample = Sample::build(
-            epoch_millis(),
-            conn_id.map(|c| c.0),
-            transport,
-            counters,
-            rtt,
-            self.render.net_apply_avg(),
-            self.render.net_apply_max(),
-        );
-        sink.append(&sample);
+        let deltas = self.network.take_deltas_for_active();
+        if deltas.is_empty() {
+            return;
+        }
+
+        let ts_ms = epoch_millis();
+        let net_apply_avg = self.render.net_apply_avg();
+        let net_apply_max = self.render.net_apply_max();
+
+        for (transport_key, category, counters) in &deltas {
+            let rtt = self.rtt.summary(transport_key);
+            let sample = Sample::from_bucket(
+                ts_ms,
+                conn_id.map(|c| c.0),
+                transport_key,
+                &category.to_string(),
+                *counters,
+                rtt,
+                (net_apply_avg, net_apply_max),
+            );
+            sink.append(&sample);
+        }
     }
 
     /// Path where samples are persisted, if a sink is configured.
@@ -174,15 +181,27 @@ mod tests {
     use super::*;
 
     #[test]
-    fn outbound_attributes_to_active_transport() {
+    fn outbound_attributes_to_active_transport_and_category() {
         let mut s = MetricsStore::in_memory();
         s.on_transport_active(TransportKind::Uds, "/run/sock");
-        s.record_outbound(128);
-        s.record_inbound(256);
+        s.record_outbound(128, MessageCategory::Shell);
+        s.record_inbound(256, MessageCategory::Shell);
         let snap = s.network.snapshot();
         assert_eq!(snap.len(), 1);
-        assert_eq!(snap[0].1.bytes_out, 128);
-        assert_eq!(snap[0].1.bytes_in, 256);
+        let (_, cat, c) = &snap[0];
+        assert_eq!(*cat, MessageCategory::Shell);
+        assert_eq!(c.bytes_out, 128);
+        assert_eq!(c.bytes_in, 256);
+    }
+
+    #[test]
+    fn multiple_categories_produce_separate_buckets() {
+        let mut s = MetricsStore::in_memory();
+        s.on_transport_active(TransportKind::Uds, "/run/sock");
+        s.record_outbound(10, MessageCategory::Shell);
+        s.record_outbound(5, MessageCategory::Liveness);
+        let snap = s.network.snapshot();
+        assert_eq!(snap.len(), 2);
     }
 
     #[test]
@@ -201,9 +220,38 @@ mod tests {
     fn flush_sample_without_sink_is_noop() {
         let mut s = MetricsStore::in_memory();
         s.on_transport_active(TransportKind::Uds, "/x");
-        s.record_outbound(10);
+        s.record_outbound(10, MessageCategory::Shell);
         // Should not panic or block.
         s.flush_sample(Some(ConnectionId(7)));
+    }
+
+    #[test]
+    fn flush_sample_noop_when_no_traffic() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.jsonl");
+        let mut s = MetricsStore::new(Some(JsonlSink::new(path.clone())));
+        s.on_transport_active(TransportKind::Uds, "/x");
+        // No records — flush should not write anything.
+        s.flush_sample(Some(ConnectionId(1)));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn flush_sample_emits_one_row_per_category() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("m.jsonl");
+        let mut s = MetricsStore::new(Some(JsonlSink::new(path.clone())));
+        s.on_transport_active(TransportKind::Uds, "/x");
+        s.record_outbound(100, MessageCategory::Shell);
+        s.record_inbound(50, MessageCategory::Liveness);
+        s.flush_sample(Some(ConnectionId(1)));
+
+        let sink = JsonlSink::new(path);
+        let rows = sink.read_history(100).unwrap();
+        assert_eq!(rows.len(), 2);
+        let cats: Vec<_> = rows.iter().map(|r| r.category.as_deref()).collect();
+        assert!(cats.contains(&Some("Shell")));
+        assert!(cats.contains(&Some("Liveness")));
     }
 
     #[test]

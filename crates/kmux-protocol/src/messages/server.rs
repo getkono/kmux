@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use super::category::MessageCategory;
 use super::session::{
     ClientId, ConnectionId, ErrorCode, PaneId, RequestId, SequenceNo, SessionEntry,
     SessionEventMsg, WordId,
@@ -160,4 +161,248 @@ pub enum ServerMessage {
 
     /// Confirmation that a session was renamed.
     SessionRenamed { word_id: WordId, new_name: String },
+}
+
+impl ServerMessage {
+    /// Classify this message into a [`MessageCategory`] for metrics attribution.
+    /// The match is exhaustive — adding a new variant without updating this
+    /// function is a compile error.
+    pub fn category(&self) -> MessageCategory {
+        match self {
+            Self::TerminalUpdate { .. }
+            | Self::TerminalSnapshot { .. }
+            | Self::CursorUpdate { .. } => MessageCategory::Shell,
+            Self::ScrollbackAppend { .. } | Self::HistoryLines { .. } => {
+                MessageCategory::Scrollback
+            }
+            Self::Ping { .. } | Self::Pong { .. } => MessageCategory::Liveness,
+            Self::SessionCreated { .. }
+            | Self::SessionClosed { .. }
+            | Self::SessionListResult { .. }
+            | Self::SessionRenamed { .. }
+            | Self::PaneCreated { .. }
+            | Self::PaneClosed { .. }
+            | Self::Event { .. }
+            | Self::Error { .. }
+            | Self::InputLockGranted { .. }
+            | Self::InputLockDenied { .. }
+            | Self::InputLockReleased { .. } => MessageCategory::Control,
+            Self::Lagged { .. } | Self::SyncReset { .. } => MessageCategory::Sync,
+            Self::AuthResult { .. } | Self::ChannelSwitched { .. } => MessageCategory::Bootstrap,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::super::session::{
+        ClientId, ErrorCode, SessionEntry, SessionEventMsg, SessionMeta, TermSize,
+    };
+    use super::super::vt::{CursorState, GridSnapshot, TermModes, TerminalDiff};
+    use super::*;
+
+    fn dummy_session_entry() -> SessionEntry {
+        SessionEntry {
+            meta: SessionMeta {
+                index: 0,
+                word_id: "w".into(),
+                name: "n".into(),
+                cwd: "/".into(),
+            },
+            panes: vec![],
+        }
+    }
+
+    fn dummy_terminal_diff() -> TerminalDiff {
+        TerminalDiff {
+            ops: vec![],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            history_total: 0,
+        }
+    }
+
+    fn dummy_grid_snapshot() -> GridSnapshot {
+        GridSnapshot {
+            rows: 24,
+            cols: 80,
+            cells: vec![],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            history_total: 0,
+            scrollback_tail: vec![],
+        }
+    }
+
+    #[test]
+    fn category_covers_every_server_variant() {
+        let cases: Vec<(ServerMessage, MessageCategory)> = vec![
+            (
+                ServerMessage::TerminalUpdate {
+                    pane_id: "p".into(),
+                    diff: Arc::new(dummy_terminal_diff()),
+                    seqno: SequenceNo(1),
+                    sent_at_ms: 0,
+                },
+                MessageCategory::Shell,
+            ),
+            (
+                ServerMessage::TerminalSnapshot {
+                    pane_id: "p".into(),
+                    snapshot: dummy_grid_snapshot(),
+                    seqno: SequenceNo(1),
+                    sent_at_ms: 0,
+                },
+                MessageCategory::Shell,
+            ),
+            (
+                ServerMessage::CursorUpdate {
+                    pane_id: "p".into(),
+                    cursor: CursorState::default(),
+                    modes: TermModes::EMPTY,
+                    seqno: SequenceNo(1),
+                    sent_at_ms: 0,
+                },
+                MessageCategory::Shell,
+            ),
+            (
+                ServerMessage::ScrollbackAppend {
+                    pane_id: "p".into(),
+                    first_index: 0,
+                    lines: vec![],
+                    seqno: SequenceNo(1),
+                    sent_at_ms: 0,
+                },
+                MessageCategory::Scrollback,
+            ),
+            (
+                ServerMessage::HistoryLines {
+                    request_id: 0,
+                    pane_id: "p".into(),
+                    first_index: 0,
+                    lines: vec![],
+                    history_total: 0,
+                    sent_at_ms: 0,
+                },
+                MessageCategory::Scrollback,
+            ),
+            (ServerMessage::Ping { seq: 1 }, MessageCategory::Liveness),
+            (ServerMessage::Pong { seq: 1 }, MessageCategory::Liveness),
+            (
+                ServerMessage::SessionCreated {
+                    request_id: 0,
+                    entry: dummy_session_entry(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::SessionClosed {
+                    request_id: 0,
+                    word_id: "w".into(),
+                    exit_code: None,
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::SessionListResult {
+                    request_id: 0,
+                    sessions: vec![],
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::SessionRenamed {
+                    word_id: "w".into(),
+                    new_name: "n".into(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::PaneCreated {
+                    request_id: 0,
+                    pane_id: "p".into(),
+                    session_word_id: "w".into(),
+                    size: TermSize::default(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::PaneClosed {
+                    request_id: 0,
+                    pane_id: "p".into(),
+                    exit_code: None,
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::Event {
+                    event: SessionEventMsg::SessionCreated {
+                        word_id: "w".into(),
+                    },
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::Error {
+                    request_id: None,
+                    code: ErrorCode::InternalError,
+                    message: "e".into(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::InputLockGranted {
+                    pane_id: "p".into(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::InputLockDenied {
+                    pane_id: "p".into(),
+                    holder: ClientId(1),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::InputLockReleased {
+                    pane_id: "p".into(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::Lagged {
+                    pane_id: "p".into(),
+                    missed_count: 1,
+                },
+                MessageCategory::Sync,
+            ),
+            (
+                ServerMessage::SyncReset {
+                    pane_id: "p".into(),
+                },
+                MessageCategory::Sync,
+            ),
+            (
+                ServerMessage::AuthResult {
+                    success: true,
+                    reason: None,
+                    client_id: None,
+                    server_version: None,
+                    connection_id: None,
+                },
+                MessageCategory::Bootstrap,
+            ),
+            (
+                ServerMessage::ChannelSwitched {
+                    old_transport: "tcp".into(),
+                },
+                MessageCategory::Bootstrap,
+            ),
+        ];
+        for (msg, expected) in &cases {
+            assert_eq!(msg.category(), *expected, "wrong category for {msg:?}");
+        }
+    }
 }

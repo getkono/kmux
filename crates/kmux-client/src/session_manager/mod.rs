@@ -205,12 +205,13 @@ impl SessionManager {
         let bytes = kmux_protocol::encode_client(&msg)
             .map(|b| b.len())
             .unwrap_or(0);
+        let category = msg.category();
         if let Err(e) = tx.send(msg) {
             warn!("send_ws failed: {e}");
             return;
         }
         if bytes > 0 {
-            self.metrics.record_outbound(bytes);
+            self.metrics.record_outbound(bytes, category);
         }
     }
 

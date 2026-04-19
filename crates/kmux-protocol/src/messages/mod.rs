@@ -1,3 +1,4 @@
+pub mod category;
 pub mod session;
 pub mod vt;
 
@@ -5,6 +6,7 @@ mod client;
 mod server;
 mod types;
 
+pub use category::MessageCategory;
 pub use client::*;
 pub use server::*;
 pub use session::*;

@@ -76,8 +76,9 @@ impl SessionManager {
         let inbound_bytes = kmux_protocol::encode_server(&msg)
             .map(|b| b.len())
             .unwrap_or(0);
+        let inbound_category = msg.category();
         if inbound_bytes > 0 {
-            self.metrics.record_inbound(inbound_bytes);
+            self.metrics.record_inbound(inbound_bytes, inbound_category);
         }
 
         match msg {
