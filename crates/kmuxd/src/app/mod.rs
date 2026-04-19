@@ -730,7 +730,6 @@ mod tests {
                 ops: vec![],
                 cursor: CursorState::default(),
                 modes: TermModes::EMPTY,
-                scrollback_lines: vec![],
                 history_total: 0,
             }),
             seqno: SequenceNo(43),

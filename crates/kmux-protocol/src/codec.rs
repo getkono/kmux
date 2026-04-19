@@ -225,7 +225,6 @@ mod tests {
             ],
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
-            scrollback_lines: vec![],
             history_total: 0,
         };
         let msg = ServerMessage::TerminalUpdate {
@@ -295,7 +294,6 @@ mod tests {
             }],
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
-            scrollback_lines: vec![],
             history_total: 0,
         };
         let msg = ServerMessage::TerminalUpdate {

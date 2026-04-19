@@ -112,8 +112,7 @@ impl<B: TerminalBackend> DiffEngine<B> {
 
         // Mirror every scrollback line before anything else touches it. This
         // makes the mirror authoritative: later we read `history_total` from
-        // it and the relay can emit `ScrollbackAppend` referencing absolute
-        // indices derived from `(first_index, count)`.
+        // it and the relay emits the lines out-of-band as `ScrollbackAppend`.
         if !scrollback_lines.is_empty() {
             self.mirror.append(scrollback_lines.clone());
         }
@@ -127,13 +126,15 @@ impl<B: TerminalBackend> DiffEngine<B> {
         self.prev_modes = modes;
 
         if cells_changed || has_scrollback {
-            DiffResult::CellDiff(TerminalDiff {
-                ops,
-                cursor: cursor_state,
-                modes,
+            DiffResult::CellDiff {
+                diff: TerminalDiff {
+                    ops,
+                    cursor: cursor_state,
+                    modes,
+                    history_total,
+                },
                 scrollback_lines,
-                history_total,
-            })
+            }
         } else if cursor_or_modes_changed {
             DiffResult::CursorOnly {
                 cursor: cursor_state,
@@ -178,7 +179,7 @@ mod tests {
             bg: CellColor::new(0x28, 0x2c, 0x34),
             ..CellState::default()
         };
-        let DiffResult::CellDiff(diff) = engine.compute_diff() else {
+        let DiffResult::CellDiff { diff, .. } = engine.compute_diff() else {
             panic!("expected CellDiff");
         };
         assert!(!diff.ops.is_empty());
@@ -224,7 +225,7 @@ mod tests {
         for cell in &mut engine.backend.cells {
             *cell = CellState::default();
         }
-        let DiffResult::CellDiff(diff) = engine.compute_diff() else {
+        let DiffResult::CellDiff { diff, .. } = engine.compute_diff() else {
             panic!("expected CellDiff");
         };
         assert!(
@@ -250,7 +251,7 @@ mod tests {
         for c in 0..4 {
             engine.backend.cells[c] = CellState::default();
         }
-        let DiffResult::CellDiff(diff) = engine.compute_diff() else {
+        let DiffResult::CellDiff { diff, .. } = engine.compute_diff() else {
             panic!("expected CellDiff");
         };
         let has_clear = diff.ops.iter().any(|op| matches!(op, DiffOp::Clear));
@@ -323,7 +324,7 @@ mod tests {
             c: 'Z',
             ..CellState::default()
         };
-        assert!(matches!(engine.compute_diff(), DiffResult::CellDiff(_)));
+        assert!(matches!(engine.compute_diff(), DiffResult::CellDiff { .. }));
     }
 
     #[test]
@@ -336,7 +337,7 @@ mod tests {
             ..CellState::default()
         };
         engine.backend.cursor_state.col = 1;
-        let DiffResult::CellDiff(diff) = engine.compute_diff() else {
+        let DiffResult::CellDiff { diff, .. } = engine.compute_diff() else {
             panic!("expected CellDiff when both cells and cursor change");
         };
         assert!(!diff.ops.is_empty());
@@ -393,10 +394,12 @@ mod tests {
         engine.backend.history_len = 0;
         engine.backend.cells[0].c = 'X'; // fzf draws something
         let diff = engine.compute_diff();
-        match &diff {
-            DiffResult::CellDiff(d) => {
+        match diff {
+            DiffResult::CellDiff {
+                scrollback_lines, ..
+            } => {
                 assert!(
-                    d.scrollback_lines.is_empty(),
+                    scrollback_lines.is_empty(),
                     "no scrollback should be emitted on alt screen"
                 );
             }
@@ -408,12 +411,14 @@ mod tests {
         engine.backend.history_len = 5;
         engine.backend.cells[0].c = ' '; // main screen restored
         let diff = engine.compute_diff();
-        match &diff {
-            DiffResult::CellDiff(d) => {
+        match diff {
+            DiffResult::CellDiff {
+                scrollback_lines, ..
+            } => {
                 assert!(
-                    d.scrollback_lines.is_empty(),
+                    scrollback_lines.is_empty(),
                     "no scrollback duplication on alt screen exit, got {} lines",
-                    d.scrollback_lines.len()
+                    scrollback_lines.len()
                 );
             }
             _ => panic!("expected CellDiff on alt screen exit"),
@@ -441,9 +446,11 @@ mod tests {
         engine.backend.cells[0].c = ' ';
         let diff = engine.compute_diff();
         match diff {
-            DiffResult::CellDiff(d) => {
+            DiffResult::CellDiff {
+                scrollback_lines, ..
+            } => {
                 assert_eq!(
-                    d.scrollback_lines.len(),
+                    scrollback_lines.len(),
                     2,
                     "should emit exactly 2 new scrollback lines"
                 );
@@ -527,9 +534,11 @@ mod tests {
         engine.backend.cells[0].c = 'A';
         let diff = engine.compute_diff();
         match diff {
-            DiffResult::CellDiff(d) => {
+            DiffResult::CellDiff {
+                scrollback_lines, ..
+            } => {
                 assert_eq!(
-                    d.scrollback_lines.len(),
+                    scrollback_lines.len(),
                     3,
                     "should emit all 3 new scrollback lines"
                 );
@@ -543,9 +552,11 @@ mod tests {
         engine.backend.cells[0].c = 'B';
         let diff = engine.compute_diff();
         match diff {
-            DiffResult::CellDiff(d) => {
+            DiffResult::CellDiff {
+                scrollback_lines, ..
+            } => {
                 assert_eq!(
-                    d.scrollback_lines.len(),
+                    scrollback_lines.len(),
                     2,
                     "should emit only the 2 new scrollback lines"
                 );

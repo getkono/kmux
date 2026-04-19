@@ -158,18 +158,16 @@ pub enum DiffOp {
 }
 
 /// A set of cell changes + cursor/mode state for one frame.
+///
+/// Scrollback lines are delivered out-of-band via
+/// `ServerMessage::ScrollbackAppend`, keyed by absolute index. Clients fetch
+/// gaps lazily with `ClientMessage::FetchHistory` instead of receiving every
+/// line inline.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TerminalDiff {
     pub ops: Vec<DiffOp>,
     pub cursor: CursorState,
     pub modes: TermModes,
-    /// Lines that scrolled off the top of the visible area during this frame.
-    /// Oldest first. Empty when no lines were pushed to scrollback.
-    ///
-    /// In v15 these are duplicated out-of-band via `ScrollbackAppend`; a
-    /// future version may drop this field entirely in favour of lazy fetch.
-    #[serde(default)]
-    pub scrollback_lines: Vec<Vec<CellState>>,
     /// Absolute number of lines ever scrolled off (mirror's `history_total()`
     /// as of this frame). Clients assert monotonic growth.
     #[serde(default)]

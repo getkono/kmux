@@ -92,7 +92,10 @@ fn flush_cell_diff(
     let diff_us = diff_start.elapsed().as_micros();
 
     match result {
-        DiffResult::CellDiff(diff) => {
+        DiffResult::CellDiff {
+            diff,
+            scrollback_lines,
+        } => {
             *prev_cursor = diff.cursor;
             *prev_modes = diff.modes;
 
@@ -106,20 +109,18 @@ fn flush_cell_diff(
                 "flush_cell_diff: broadcasting cell diff"
             );
 
-            // Emit an out-of-band `ScrollbackAppend` for any scrollback in
-            // this diff, referencing absolute indices derived from
-            // `history_total`. The inline `scrollback_lines` field is still
-            // populated on the `TerminalDiff` (kept in v15 for back-compat;
-            // Phase C drops it entirely). Clients reconcile via
-            // `FetchHistory` if a `ScrollbackAppend` is lost.
-            if !diff.scrollback_lines.is_empty() {
-                let sb_len = diff.scrollback_lines.len() as u64;
+            // Emit scrollback out-of-band, referencing absolute indices
+            // derived from `history_total`. In v16 `TerminalDiff` no longer
+            // carries the lines inline; clients reconcile any gap via
+            // `FetchHistory`.
+            if !scrollback_lines.is_empty() {
+                let sb_len = scrollback_lines.len() as u64;
                 let first_index = diff.history_total.saturating_sub(sb_len);
                 let sb_seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
                 let sb_msg = ServerMessage::ScrollbackAppend {
                     pane_id: pane_id.to_string(),
                     first_index,
-                    lines: diff.scrollback_lines.clone(),
+                    lines: scrollback_lines,
                     seqno: sb_seqno,
                     sent_at_ms: epoch_millis(),
                 };
@@ -153,7 +154,6 @@ fn flush_cell_diff(
                         ops: vec![],
                         cursor,
                         modes,
-                        scrollback_lines: vec![],
                         history_total,
                     }),
                 );
@@ -246,7 +246,6 @@ mod tests {
                 ops: vec![],
                 cursor: CursorState::default(),
                 modes: TermModes::EMPTY,
-                scrollback_lines: vec![],
                 history_total: 0,
             }),
             seqno: SequenceNo(1),

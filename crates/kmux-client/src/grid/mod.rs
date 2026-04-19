@@ -84,6 +84,11 @@ pub struct CellGrid {
     scroll_offset: usize,
     /// Current text selection, if any.
     selection: Option<Selection>,
+    /// Highest `history_total` the server has reported. When greater than
+    /// `scrollback.history_total()`, there are scrollback lines the client has
+    /// not yet received — the session manager will issue `FetchHistory` to
+    /// fill the gap. Cleared when the gap closes.
+    pending_history_total: Option<u64>,
 }
 
 impl CellGrid {
@@ -99,7 +104,17 @@ impl CellGrid {
             scrollback: ScrollbackBuffer::default(),
             scroll_offset: 0,
             selection: None,
+            pending_history_total: None,
         }
+    }
+
+    /// Absolute `history_total` reported by the server but not yet satisfied
+    /// by `ScrollbackAppend`/`HistoryLines`. `None` when the client is caught
+    /// up. Sessions poll this to decide when to issue `FetchHistory`.
+    pub fn pending_history_gap(&self) -> Option<(u64, u64)> {
+        let have = self.scrollback.history_total();
+        self.pending_history_total
+            .and_then(|want| (want > have).then_some((have, want)))
     }
 
     // ── Public accessors for renderers ──
@@ -139,6 +154,12 @@ impl CellGrid {
             self.scrollback
                 .seed_tail(snapshot.history_total, snapshot.scrollback_tail);
         }
+        if self
+            .pending_history_total
+            .is_some_and(|want| want <= self.scrollback.history_total())
+        {
+            self.pending_history_total = None;
+        }
         self.scroll_offset = 0;
         self.selection = None;
         self.cells_generation += 1;
@@ -146,33 +167,15 @@ impl CellGrid {
     }
 
     /// Apply a diff from the server -- only changed cells are updated.
+    ///
+    /// Scrollback no longer travels with the diff (v16); it arrives out-of-band
+    /// as `ScrollbackAppend`. `diff.history_total` is still used for
+    /// monotonicity checks: if the server reports more history than the client
+    /// has seen, we record the gap so the session manager can issue a
+    /// `FetchHistory` request.
     pub fn apply_diff(&mut self, diff: TerminalDiff) {
-        // Push scrollback lines before applying cell changes.
-        if !diff.scrollback_lines.is_empty() {
-            let new_count = diff.scrollback_lines.len();
-            let first_index = diff.history_total.saturating_sub(new_count as u64);
-            let old_len = self.scrollback.len();
-            let ok = self
-                .scrollback
-                .append_with_index(first_index, diff.scrollback_lines);
-            if !ok {
-                // Gap detected; clear and let the next snapshot reseed.
-                self.scrollback.clear();
-                self.selection = None;
-            } else {
-                let new_len = self.scrollback.len();
-                // Evicted = front-drops: (old_len + new_count) - new_len.
-                let evicted = (old_len + new_count).saturating_sub(new_len);
-                if let Some(sel) = &mut self.selection {
-                    if evicted > 0 && sel.anchor.row < evicted {
-                        self.selection = None;
-                    } else if let Some(sel) = &mut self.selection {
-                        let net = new_count - evicted;
-                        sel.anchor.row = sel.anchor.row.saturating_sub(evicted) + net;
-                        sel.end.row = sel.end.row.saturating_sub(evicted) + net;
-                    }
-                }
-            }
+        if diff.history_total > self.scrollback.history_total() {
+            self.pending_history_total = Some(diff.history_total);
         }
 
         let has_cell_ops = !diff.ops.is_empty();
@@ -221,16 +224,36 @@ impl CellGrid {
     ///
     /// `first_index` is the absolute index of the first line in `lines`. If
     /// the client's buffer has a gap (its `history_total()` is less than
-    /// `first_index`), the buffer is cleared and will be reseeded by the
-    /// next snapshot or `HistoryLines` reply.
+    /// `first_index`), the buffer is cleared and a `FetchHistory` round-trip
+    /// (driven by the session manager) will reseed it.
     pub fn apply_scrollback_append(&mut self, first_index: u64, lines: Vec<Vec<CellState>>) {
         if lines.is_empty() {
             return;
         }
+        let new_count = lines.len();
+        let old_len = self.scrollback.len();
         let ok = self.scrollback.append_with_index(first_index, lines);
         if !ok {
             self.scrollback.clear();
             self.selection = None;
+        } else {
+            let new_len = self.scrollback.len();
+            let evicted = (old_len + new_count).saturating_sub(new_len);
+            if let Some(sel) = &mut self.selection {
+                if evicted > 0 && sel.anchor.row < evicted {
+                    self.selection = None;
+                } else if let Some(sel) = &mut self.selection {
+                    let net = new_count - evicted;
+                    sel.anchor.row = sel.anchor.row.saturating_sub(evicted) + net;
+                    sel.end.row = sel.end.row.saturating_sub(evicted) + net;
+                }
+            }
+        }
+        if self
+            .pending_history_total
+            .is_some_and(|want| want <= self.scrollback.history_total())
+        {
+            self.pending_history_total = None;
         }
         self.cells_generation += 1;
     }
@@ -265,6 +288,12 @@ impl CellGrid {
         }
         // Else: reply is entirely older or duplicate; nothing to do until
         // back-fill support lands in Phase C.
+        if self
+            .pending_history_total
+            .is_some_and(|want| want <= self.scrollback.history_total())
+        {
+            self.pending_history_total = None;
+        }
     }
 
     /// Whether the terminal is in application-cursor mode.
@@ -285,6 +314,7 @@ impl CellGrid {
         self.scrollback.clear();
         self.scroll_offset = 0;
         self.selection = None;
+        self.pending_history_total = None;
         self.cells_generation += 1;
         self.cursor_generation += 1;
     }
@@ -526,21 +556,15 @@ mod tests {
         }
     }
 
-    fn diff_with_scrollback(lines: Vec<Vec<CellState>>) -> TerminalDiff {
-        let history_total = lines.len() as u64;
-        TerminalDiff {
-            ops: vec![],
-            cursor: CursorState::default(),
-            modes: TermModes::EMPTY,
-            scrollback_lines: lines,
-            history_total,
-        }
+    fn push_scrollback(grid: &mut CellGrid, lines: Vec<Vec<CellState>>) {
+        let first_index = grid.scrollback().history_total();
+        grid.apply_scrollback_append(first_index, lines);
     }
 
     #[test]
     fn apply_snapshot_preserves_scrollback() {
         let mut grid = CellGrid::new(24, 80);
-        grid.apply_diff(diff_with_scrollback(vec![line("hello"), line("world")]));
+        push_scrollback(&mut grid, vec![line("hello"), line("world")]);
         assert_eq!(grid.scrollback_len(), 2);
 
         grid.apply_snapshot(snapshot(24, 80));
@@ -557,7 +581,7 @@ mod tests {
     #[test]
     fn resize_preserves_scrollback() {
         let mut grid = CellGrid::new(24, 80);
-        grid.apply_diff(diff_with_scrollback(vec![line("hello")]));
+        push_scrollback(&mut grid, vec![line("hello")]);
         assert_eq!(grid.scrollback_len(), 1);
 
         grid.resize(40, 120);
@@ -569,7 +593,7 @@ mod tests {
     #[test]
     fn clear_wipes_scrollback() {
         let mut grid = CellGrid::new(24, 80);
-        grid.apply_diff(diff_with_scrollback(vec![line("hello")]));
+        push_scrollback(&mut grid, vec![line("hello")]);
         assert_eq!(grid.scrollback_len(), 1);
 
         grid.clear();
@@ -578,6 +602,25 @@ mod tests {
             0,
             "explicit clear() still wipes scrollback"
         );
+    }
+
+    #[test]
+    fn apply_diff_flags_pending_history_gap() {
+        let mut grid = CellGrid::new(24, 80);
+        let diff = TerminalDiff {
+            ops: vec![],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            history_total: 5,
+        };
+        grid.apply_diff(diff);
+        assert_eq!(grid.pending_history_gap(), Some((0, 5)));
+
+        grid.apply_scrollback_append(
+            0,
+            vec![line("a"), line("b"), line("c"), line("d"), line("e")],
+        );
+        assert_eq!(grid.pending_history_gap(), None);
     }
 
     #[test]
@@ -600,7 +643,7 @@ mod tests {
         let mut grid = CellGrid::new(24, 40);
         // Two logical lines; first wraps into 3 display rows at cols=40.
         let wide = line(&"X".repeat(100));
-        grid.apply_diff(diff_with_scrollback(vec![wide, line("tail")]));
+        push_scrollback(&mut grid, vec![wide, line("tail")]);
 
         assert_eq!(grid.total_scrollback_display_rows(), 4);
 
@@ -626,10 +669,7 @@ mod tests {
     #[test]
     fn scroll_up_caps_to_display_rows_not_logical_lines() {
         let mut grid = CellGrid::new(24, 40);
-        grid.apply_diff(diff_with_scrollback(vec![
-            line(&"X".repeat(100)),
-            line("tail"),
-        ]));
+        push_scrollback(&mut grid, vec![line(&"X".repeat(100)), line("tail")]);
         grid.scroll_up(100);
         // Total = 4 display rows (3 for wrapped + 1 for tail); scroll cap = 4.
         assert_eq!(grid.scroll_offset(), 4);

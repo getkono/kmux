@@ -196,7 +196,22 @@ mod tests {
 
     fn expect_cell_diff(result: DiffResult) -> kmux_protocol::messages::TerminalDiff {
         match result {
-            DiffResult::CellDiff(diff) => diff,
+            DiffResult::CellDiff { diff, .. } => diff,
+            other => panic!("expected CellDiff, got {other:?}"),
+        }
+    }
+
+    fn expect_cell_diff_with_scrollback(
+        result: DiffResult,
+    ) -> (
+        kmux_protocol::messages::TerminalDiff,
+        Vec<Vec<kmux_protocol::messages::CellState>>,
+    ) {
+        match result {
+            DiffResult::CellDiff {
+                diff,
+                scrollback_lines,
+            } => (diff, scrollback_lines),
             other => panic!("expected CellDiff, got {other:?}"),
         }
     }
@@ -430,21 +445,21 @@ mod tests {
         for i in 0..8 {
             ts.feed(format!("line {i}\r\n").as_bytes());
         }
-        let diff = expect_cell_diff(ts.compute_diff());
-        assert!(!diff.scrollback_lines.is_empty());
+        let (_, sb) = expect_cell_diff_with_scrollback(ts.compute_diff());
+        assert!(!sb.is_empty());
 
         ts.feed(b"\x1b[?1049h");
         ts.feed(b"fzf content");
-        let diff = expect_cell_diff(ts.compute_diff());
-        assert!(
-            diff.scrollback_lines.is_empty(),
-            "no scrollback on alt screen"
-        );
+        let (_, sb) = expect_cell_diff_with_scrollback(ts.compute_diff());
+        assert!(sb.is_empty(), "no scrollback on alt screen");
 
         ts.feed(b"\x1b[?1049l");
         let diff = ts.compute_diff();
-        if let DiffResult::CellDiff(d) = diff {
-            assert!(d.scrollback_lines.is_empty());
+        if let DiffResult::CellDiff {
+            scrollback_lines, ..
+        } = diff
+        {
+            assert!(scrollback_lines.is_empty());
         }
     }
 
@@ -514,8 +529,8 @@ mod tests {
         for i in 0..8 {
             ts.feed(format!("line{i}\r\n").as_bytes());
         }
-        let diff = expect_cell_diff(ts.compute_diff());
-        assert!(!diff.scrollback_lines.is_empty());
+        let (_, sb) = expect_cell_diff_with_scrollback(ts.compute_diff());
+        assert!(!sb.is_empty());
     }
 
     #[test]

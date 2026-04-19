@@ -21,10 +21,20 @@ pub const SNAPSHOT_TAIL_LINES: usize = 500;
 
 /// Result of a diff computation, distinguishing between cell changes,
 /// cursor-only changes, and no changes at all.
+///
+/// Scrollback lines appended during this frame travel alongside `CellDiff`
+/// in `scrollback_lines`; the relay emits them as a separate
+/// `ScrollbackAppend` message and never bundles them into `TerminalDiff`.
 #[derive(Debug)]
 pub enum DiffResult {
-    /// At least one cell changed (may also include cursor/mode changes).
-    CellDiff(kmux_protocol::messages::TerminalDiff),
+    /// At least one cell changed, or scrollback was appended (possibly with
+    /// no viewport changes), optionally combined with cursor/mode changes.
+    CellDiff {
+        diff: kmux_protocol::messages::TerminalDiff,
+        /// Lines newly appended to the mirror during this frame, oldest
+        /// first. Empty if only viewport cells changed.
+        scrollback_lines: Vec<Vec<kmux_protocol::messages::CellState>>,
+    },
     /// No cells changed, but cursor position or terminal modes changed.
     CursorOnly {
         cursor: CursorState,

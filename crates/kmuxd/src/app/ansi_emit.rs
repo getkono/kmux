@@ -131,7 +131,7 @@ pub(super) fn seed_pane_with_preamble(
         let mut ts = term_state.lock().unwrap();
         ts.feed(preamble);
         match ts.compute_diff() {
-            DiffResult::CellDiff(d) => Some(d),
+            DiffResult::CellDiff { diff: d, .. } => Some(d),
             _ => None,
         }
     };
