@@ -926,6 +926,7 @@ dependencies = [
  "clap",
  "daemonize",
  "kmux-ghostty",
+ "kmux-ghostty-sys",
  "kmux-protocol",
  "kmux-pty",
  "nix 0.31.2",
