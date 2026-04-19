@@ -87,7 +87,7 @@ mod tests {
         assert_eq!(
             path,
             tmp.path()
-                .join(kmux_protocol::dirs::RUNTIME_SUBDIR)
+                .join(kmux_protocol::dirs::KMUX_DIR_NAME)
                 .join("token")
         );
 

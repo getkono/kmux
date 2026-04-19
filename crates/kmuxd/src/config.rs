@@ -9,7 +9,7 @@
 //! 2. `$XDG_CONFIG_HOME/kmuxd/kmuxd.toml`
 //! 3. `/etc/kmuxd/kmuxd.toml`
 //!
-//! Missing file → built-in defaults (QUIC on `[::]:8443`, TLS-TCP on `[::]:8444`, UDS auto).
+//! Missing file → built-in defaults (QUIC on `[::]:0`, TLS-TCP on `[::]:0`, UDS auto).
 
 use std::path::{Path, PathBuf};
 
@@ -127,8 +127,10 @@ pub struct ListenConfig {
     pub bind: String,
 
     /// Port to listen on (ignored for `kind = "unix"`).
-    /// `0` means "pick a random available port".
-    #[serde(default)]
+    /// Always `0` (ephemeral) unless overridden by the `--port` / `--tcp-port`
+    /// CLI flags. Not configurable via `kmuxd.toml` — ports are assigned by the
+    /// kernel and announced to clients so that they never need a fixed value.
+    #[serde(skip, default)]
     pub port: u16,
 
     /// Whether this listener is enabled (admin can disable without removing the block).
@@ -163,7 +165,7 @@ fn default_listen() -> Vec<ListenConfig> {
         ListenConfig {
             kind: ListenKind::Quic,
             bind: "::".to_string(),
-            port: 8443,
+            port: 0,
             enabled: true,
             path: "auto".to_string(),
             audience: Audience::Any,
@@ -172,7 +174,7 @@ fn default_listen() -> Vec<ListenConfig> {
         ListenConfig {
             kind: ListenKind::TcpTls,
             bind: "::".to_string(),
-            port: 8444,
+            port: 0,
             enabled: true,
             path: "auto".to_string(),
             audience: Audience::Any,
@@ -366,7 +368,6 @@ key  = "/etc/kmuxd/key.pem"
 [[listen]]
 kind = "quic"
 bind = "::"
-port = 8443
 enabled = true
 audience = "any"
 priority = 0
@@ -374,7 +375,6 @@ priority = 0
 [[listen]]
 kind = "tcp+tls"
 bind = "127.0.0.1"
-port = 8444
 enabled = true
 audience = "ssh-only"
 priority = 0
@@ -408,7 +408,7 @@ allow_peer_cred = true
         // Listeners
         assert_eq!(cfg.listen.len(), 3);
         assert_eq!(cfg.listen[0].kind, ListenKind::Quic);
-        assert_eq!(cfg.listen[0].port, 8443);
+        assert_eq!(cfg.listen[0].port, 0);
         assert_eq!(cfg.listen[0].audience, Audience::Any);
 
         assert_eq!(cfg.listen[1].kind, ListenKind::TcpTls);
@@ -436,7 +436,7 @@ allow_peer_cred = true
         assert!(!cfg.tls.self_signed);
         assert_eq!(cfg.listen.len(), 3);
         assert_eq!(cfg.listen[0].kind, ListenKind::Quic);
-        assert_eq!(cfg.listen[0].port, 8443);
+        assert_eq!(cfg.listen[0].port, 0);
         assert_eq!(cfg.listen[2].audience, Audience::Local); // UDS is local
         assert!(cfg.auth.allow_peer_cred);
     }
@@ -446,7 +446,6 @@ allow_peer_cred = true
         let toml = r#"
 [[listen]]
 kind = "tcp+tls"
-port = 8444
 audience = "ssh-only"
 "#;
         let cfg: ConfigFile = toml::from_str(toml).unwrap();
@@ -483,7 +482,7 @@ self_signed = true
             listen: vec![ListenConfig {
                 kind: ListenKind::Quic,
                 bind: "::".into(),
-                port: 8443,
+                port: 0,
                 enabled: true,
                 path: "auto".into(),
                 audience: Audience::Any,
@@ -537,5 +536,28 @@ idle_shutdown_secs = 60
         // Only test the ConfigFile default — resolve() requires TLS when QUIC/TCP+TLS are enabled.
         let cfg = ConfigFile::default();
         assert_eq!(cfg.daemon.idle_shutdown_secs, 30);
+    }
+
+    #[test]
+    fn port_field_rejected_by_toml() {
+        // port is #[serde(skip)] so deny_unknown_fields must reject it in TOML.
+        let toml = r#"
+[[listen]]
+kind = "quic"
+port = 8443
+"#;
+        assert!(toml::from_str::<ConfigFile>(toml).is_err());
+    }
+
+    #[test]
+    fn written_default_config_has_no_port_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kmuxd.toml");
+        write_default_config(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains("port"),
+            "default config must not contain a port field"
+        );
     }
 }

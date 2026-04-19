@@ -2,20 +2,24 @@ use std::path::PathBuf;
 
 use nix::unistd::getuid;
 
-/// Subdirectory name under `$XDG_RUNTIME_DIR` (or `/tmp/kmux-<uid>`) that
-/// holds the daemon socket, PID, and auth token.
+/// Subdirectory name appended to `$XDG_RUNTIME_DIR`, `$XDG_STATE_HOME`, and
+/// their respective fallback roots to isolate the two profiles.
 ///
-/// Debug builds use `kmux-debug` so a `cargo run` daemon can coexist with an
-/// installed release daemon on the same machine without colliding on the UDS
-/// path or PID lockfile.
+/// Debug builds use `kmux-debug` so a `cargo run` instance can coexist with an
+/// installed release instance on the same machine without colliding on sockets,
+/// PID files, logs, metrics, or session checkpoints.
+///
+/// Config files (`$XDG_CONFIG_HOME/kmux/` and `$XDG_CONFIG_HOME/kmuxd/`) are
+/// intentionally *shared* across profiles — they represent user intent, not
+/// runtime state.
 #[cfg(debug_assertions)]
-pub const RUNTIME_SUBDIR: &str = "kmux-debug";
+pub const KMUX_DIR_NAME: &str = "kmux-debug";
 #[cfg(not(debug_assertions))]
-pub const RUNTIME_SUBDIR: &str = "kmux";
+pub const KMUX_DIR_NAME: &str = "kmux";
 
 /// Returns the kmux runtime directory, creating it if necessary.
 ///
-/// Prefers `$XDG_RUNTIME_DIR/{RUNTIME_SUBDIR}` — a per-user, in-memory
+/// Prefers `$XDG_RUNTIME_DIR/{KMUX_DIR_NAME}` — a per-user, in-memory
 /// directory set by systemd/logind on Linux with tight permissions (mode
 /// 0700).
 ///
@@ -30,7 +34,7 @@ pub fn runtime_dir() -> anyhow::Result<PathBuf> {
             PathBuf::from(format!("/tmp/kmux-{uid}"))
         }
     };
-    let dir = base.join(RUNTIME_SUBDIR);
+    let dir = base.join(KMUX_DIR_NAME);
     std::fs::DirBuilder::new()
         .recursive(true)
         .create(&dir)
@@ -120,7 +124,7 @@ pub fn state_dir() -> anyhow::Result<PathBuf> {
             home.join(".local").join("state")
         }
     };
-    let dir = base.join("kmux");
+    let dir = base.join(KMUX_DIR_NAME);
     std::fs::DirBuilder::new()
         .recursive(true)
         .create(&dir)
@@ -192,7 +196,7 @@ mod tests {
         // while this guard is held.
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
         let dir = runtime_dir().unwrap();
-        assert_eq!(dir, tmp.path().join(RUNTIME_SUBDIR));
+        assert_eq!(dir, tmp.path().join(KMUX_DIR_NAME));
         assert!(dir.exists());
     }
 
@@ -212,7 +216,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
         let dir = state_dir().unwrap();
-        assert_eq!(dir, tmp.path().join("kmux"));
+        assert_eq!(dir, tmp.path().join(KMUX_DIR_NAME));
         assert!(dir.exists());
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
@@ -237,7 +241,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
         let path = metrics_log_path().unwrap();
         assert!(path.ends_with("metrics.jsonl"));
-        assert!(path.parent().unwrap().ends_with("kmux"));
+        assert!(path.parent().unwrap().ends_with(KMUX_DIR_NAME));
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 

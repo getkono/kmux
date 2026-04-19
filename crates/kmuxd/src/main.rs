@@ -49,27 +49,25 @@ struct Cli {
     config: Option<std::path::PathBuf>,
 
     /// Address to bind (default: all interfaces).
-    /// Deprecated: prefer `[[listen]] bind = "..."` in kmuxd.toml.
     #[arg(long, default_value = "0.0.0.0")]
     bind: String,
 
-    /// Port to listen on (0 = pick a random available port).
-    /// Deprecated: prefer `[[listen]] port = N` in kmuxd.toml.
-    #[arg(long, default_value_t = 8443)]
+    /// QUIC port to listen on (0 = ephemeral; the kernel picks a free port).
+    #[arg(long, default_value_t = 0)]
     port: u16,
 
     /// Path to a PEM certificate file (required unless --self-signed).
-    /// Deprecated: prefer `[tls] cert = "..."` in kmuxd.toml.
+    /// Prefer `[tls] cert = "..."` in kmuxd.toml for persistent configuration.
     #[arg(long)]
     cert: Option<String>,
 
     /// Path to a PEM private key file (required unless --self-signed).
-    /// Deprecated: prefer `[tls] key = "..."` in kmuxd.toml.
+    /// Prefer `[tls] key = "..."` in kmuxd.toml for persistent configuration.
     #[arg(long)]
     key: Option<String>,
 
     /// Generate an in-memory self-signed certificate (for development).
-    /// Deprecated: prefer `[tls] self_signed = true` in kmuxd.toml.
+    /// Prefer `[tls] self_signed = true` in kmuxd.toml for persistent configuration.
     #[arg(long)]
     self_signed: bool,
 
@@ -78,8 +76,7 @@ struct Cli {
     #[arg(long)]
     daemon: bool,
 
-    /// TCP port for the fallback/tunnel transport (0 = pick a random available port).
-    /// Deprecated: prefer `[[listen]] kind = "tcp+tls"` in kmuxd.toml.
+    /// TCP+TLS port (0 = ephemeral; the kernel picks a free port).
     #[arg(long, default_value_t = 0)]
     tcp_port: u16,
 }
