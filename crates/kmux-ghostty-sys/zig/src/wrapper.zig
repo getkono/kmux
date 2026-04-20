@@ -118,6 +118,8 @@ const KmuxEventSink = extern struct {
 const Handler = struct {
     terminal: *Terminal,
     sink: *const KmuxEventSink,
+    title_buf: *[1024]u8,
+    title_len: *usize,
 
     pub fn deinit(self: *Handler) void {
         _ = self;
@@ -130,6 +132,12 @@ const Handler = struct {
     ) !void {
         switch (action) {
             .window_title => {
+                // Store in the Wrapper-owned buffer so callers can pull the
+                // current title at any time via kmux_ghostty_get_title.
+                const n = @min(value.title.len, self.title_buf.len);
+                @memcpy(self.title_buf[0..n], value.title[0..n]);
+                self.title_len.* = n;
+                // Also fire the callback for push-based consumers.
                 if (self.sink.on_title) |cb| {
                     if (self.sink.user) |u| {
                         cb(u, value.title.ptr, value.title.len);
@@ -183,6 +191,8 @@ const Wrapper = struct {
     pixel_width: u16,
     pixel_height: u16,
     sink: KmuxEventSink,
+    title_buf: [1024]u8,
+    title_len: usize,
 
     fn create(alloc: std.mem.Allocator, size: KmuxSize, scrollback: u32, sink: KmuxEventSink) !*Wrapper {
         if (size.rows == 0 or size.cols == 0) return error.InvalidSize;
@@ -197,6 +207,8 @@ const Wrapper = struct {
             .pixel_width = size.pixel_width,
             .pixel_height = size.pixel_height,
             .sink = sink,
+            .title_buf = undefined,
+            .title_len = 0,
         };
 
         self.terminal = try Terminal.init(alloc, .{
@@ -209,6 +221,8 @@ const Wrapper = struct {
         self.stream = HandlerStream.initAlloc(alloc, .{
             .terminal = &self.terminal,
             .sink = &self.sink,
+            .title_buf = &self.title_buf,
+            .title_len = &self.title_len,
         });
 
         return self;
@@ -449,6 +463,19 @@ export fn kmux_ghostty_new(
 
 export fn kmux_ghostty_free(wrapper: ?*Wrapper) callconv(.c) void {
     if (wrapper) |w| w.destroy();
+}
+
+/// Copy the current window title into `out[0..buf_len]`.
+/// Returns the number of bytes written (0 means no title has been set yet).
+/// Does NOT NUL-terminate; the Rust side uses the returned length.
+export fn kmux_ghostty_get_title(
+    wrapper: *const Wrapper,
+    out: [*]u8,
+    buf_len: usize,
+) callconv(.c) usize {
+    const n = @min(wrapper.title_len, buf_len);
+    @memcpy(out[0..n], wrapper.title_buf[0..n]);
+    return n;
 }
 
 export fn kmux_ghostty_feed(

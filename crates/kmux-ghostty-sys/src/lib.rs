@@ -187,6 +187,14 @@ unsafe extern "C" {
     /// True iff the alternate screen is currently active.
     pub fn kmux_ghostty_is_alt_screen(term: *const kmux_ghostty_term) -> bool;
 
+    /// Copy the current window title into `out[0..buf_len]`.
+    /// Returns bytes written (0 = no title set yet). Does NOT NUL-terminate.
+    pub fn kmux_ghostty_get_title(
+        term: *const kmux_ghostty_term,
+        out: *mut u8,
+        buf_len: usize,
+    ) -> usize;
+
     /// Number of rows currently held in scrollback (not counting the viewport).
     pub fn kmux_ghostty_history_size(term: *const kmux_ghostty_term) -> usize;
 

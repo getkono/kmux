@@ -1,77 +1,124 @@
+use std::os::unix::io::RawFd;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kmux_protocol::messages::{
     ClientId, CursorState, SequenceNo, ServerMessage, TermModes, TerminalDiff, epoch_millis,
 };
 use kmux_pty::session::PtyReader;
+use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
 use crate::app::ClientMap;
+use crate::backend::BackendEventSink;
 use crate::diff_engine::DiffResult;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::TermState;
 
 /// Read PTY output in a loop, feed bytes through server-side VT emulation,
 /// and immediately compute + broadcast cell diffs after each read.
+///
+/// Also polls the foreground process name every 500 ms via `tcgetpgrp` so
+/// pane titles update as the user switches between commands, even when the
+/// shell does not emit OSC 0/2 sequences.
 pub async fn session_diff_loop(
     mut reader: PtyReader,
     pane_id: String,
+    title_sink: Arc<dyn BackendEventSink>,
     clients: ClientMap,
     scrollback: Arc<Mutex<DiffBuffer>>,
     term_state: Arc<Mutex<TermState>>,
     seqno_counter: Arc<AtomicU64>,
 ) {
+    let master_fd = reader.as_raw_fd();
     let mut buf = vec![0u8; 65536];
     let mut prev_cursor = CursorState::default();
     let mut prev_modes = TermModes::EMPTY;
+    let mut last_fg_name = String::new();
+
+    let mut poll_interval = tokio::time::interval(Duration::from_millis(500));
+    poll_interval.set_missed_tick_behavior(MissedTickBehavior::Skip);
+    // Skip the first tick (fires immediately at t=0).
+    poll_interval.tick().await;
 
     loop {
-        match reader.read(&mut buf).await {
-            Ok(0) => break,
-            Ok(n) => {
-                let cycle_start = Instant::now();
-                let mut total_bytes = n;
-                let mut ts = term_state.lock().unwrap();
-                ts.feed(&buf[..n]);
-                // Coalesce: drain all immediately-available PTY output before
-                // computing the diff, so burst output (e.g. vim exit, large
-                // cat) produces a single diff instead of many intermediate ones.
-                loop {
-                    match reader.try_read(&mut buf) {
-                        Ok(0) => break,
-                        Ok(m) => {
-                            ts.feed(&buf[..m]);
-                            total_bytes += m;
+        tokio::select! {
+            result = reader.read(&mut buf) => {
+                match result {
+                    Ok(0) => break,
+                    Ok(n) => {
+                        let cycle_start = Instant::now();
+                        let mut total_bytes = n;
+                        let mut ts = term_state.lock().unwrap();
+                        ts.feed(&buf[..n]);
+                        // Coalesce: drain all immediately-available PTY output before
+                        // computing the diff, so burst output (e.g. vim exit, large
+                        // cat) produces a single diff instead of many intermediate ones.
+                        loop {
+                            match reader.try_read(&mut buf) {
+                                Ok(0) => break,
+                                Ok(m) => {
+                                    ts.feed(&buf[..m]);
+                                    total_bytes += m;
+                                }
+                                Err(_) => break, // WouldBlock or error
+                            }
                         }
-                        Err(_) => break, // WouldBlock or error
+                        drop(ts);
+                        flush_cell_diff(
+                            &pane_id,
+                            &term_state,
+                            &scrollback,
+                            &clients,
+                            &seqno_counter,
+                            &mut prev_cursor,
+                            &mut prev_modes,
+                        );
+                        let cycle_us = cycle_start.elapsed().as_micros();
+                        debug!(
+                            pane_id,
+                            bytes = total_bytes,
+                            cycle_us,
+                            "PTY read-diff-broadcast cycle"
+                        );
+                    }
+                    Err(e) => {
+                        warn!("PTY relay read error: {e}");
+                        break;
                     }
                 }
-                drop(ts);
-                flush_cell_diff(
-                    &pane_id,
-                    &term_state,
-                    &scrollback,
-                    &clients,
-                    &seqno_counter,
-                    &mut prev_cursor,
-                    &mut prev_modes,
-                );
-                let cycle_us = cycle_start.elapsed().as_micros();
-                debug!(
-                    pane_id,
-                    bytes = total_bytes,
-                    cycle_us,
-                    "PTY read-diff-broadcast cycle"
-                );
             }
-            Err(e) => {
-                warn!("PTY relay read error: {e}");
-                break;
+            _ = poll_interval.tick() => {
+                if let Some(name) = foreground_process_name(master_fd)
+                    && name != last_fg_name
+                {
+                    last_fg_name = name.clone();
+                    title_sink.on_title(&name);
+                }
             }
         }
     }
+}
+
+/// Return the name of the foreground process running on the PTY.
+///
+/// Uses `tcgetpgrp(master_fd)` to find the foreground process group, then
+/// reads `/proc/<pgid>/comm` for the command name. Returns `None` when the
+/// PTY has no foreground process or the name cannot be read.
+fn foreground_process_name(master_fd: RawFd) -> Option<String> {
+    // SAFETY: master_fd is a dup'd PTY fd owned by PtyReader for the
+    // lifetime of session_diff_loop; BorrowedFd is used only during
+    // this synchronous call and not retained.
+    let fd = unsafe { std::os::fd::BorrowedFd::borrow_raw(master_fd) };
+    let pgid = nix::unistd::tcgetpgrp(fd).ok()?.as_raw();
+    if pgid <= 0 {
+        return None;
+    }
+    std::fs::read_to_string(format!("/proc/{pgid}/comm"))
+        .ok()
+        .map(|s| s.trim_end().to_string())
+        .filter(|s| !s.is_empty())
 }
 
 /// Compute cell diff and broadcast to clients.

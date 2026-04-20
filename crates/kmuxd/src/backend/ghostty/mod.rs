@@ -66,6 +66,8 @@ impl EventSink for EventSinkAdapter {
 pub struct GhosttyBackend {
     term: GhosttyTerm,
     size: BackendSize,
+    events: Arc<dyn BackendEventSink>,
+    last_title: String,
 }
 
 impl std::fmt::Debug for GhosttyBackend {
@@ -88,12 +90,15 @@ fn to_term_size(s: BackendSize) -> TermSize {
 impl TerminalBackend for GhosttyBackend {
     fn new(cfg: BackendConfig) -> Self {
         let scrollback = u32::try_from(cfg.scrollback).unwrap_or(u32::MAX);
+        let events = Arc::clone(&cfg.events);
         let sink: Arc<dyn EventSink> = Arc::new(EventSinkAdapter(cfg.events));
         let term = GhosttyTerm::new(to_term_size(cfg.size), scrollback, sink)
             .expect("ghostty: failed to construct Terminal (invalid size?)");
         Self {
             term,
             size: cfg.size,
+            events,
+            last_title: String::new(),
         }
     }
 
@@ -111,6 +116,16 @@ impl TerminalBackend for GhosttyBackend {
         // log and drop so one bad sequence never tears down a pane.
         if let Err(e) = self.term.feed(data) {
             tracing::warn!(error = %e, "ghostty: feed failed");
+        }
+        // Pull the current title from the VT state after every feed. This
+        // ensures the title is captured even when the push callback fires
+        // before a client subscribes to the broadcast channel. PaneTitleSink
+        // checks for change before broadcasting, so double-firing is a no-op.
+        if let Some(title) = self.term.title()
+            && title != self.last_title
+        {
+            self.last_title = title.clone();
+            self.events.on_title(&title);
         }
     }
 

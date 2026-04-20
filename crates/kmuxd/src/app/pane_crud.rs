@@ -148,6 +148,7 @@ impl ServerApp {
             title.clone(),
             self.vt_events_tx.clone(),
         ));
+        let relay_sink = Arc::clone(&title_sink) as Arc<dyn crate::backend::BackendEventSink>;
         let term_state = Arc::new(Mutex::new(new_term_state(BackendConfig {
             size: BackendSize::from(size),
             capabilities: CapabilityHandles {
@@ -162,6 +163,7 @@ impl ServerApp {
         let task = tokio::spawn(session_diff_loop(
             reader,
             pane_id.to_string(),
+            relay_sink,
             clients.clone(),
             scrollback.clone(),
             term_state.clone(),

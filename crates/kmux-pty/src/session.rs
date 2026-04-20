@@ -212,6 +212,13 @@ impl PtyReader {
     pub fn try_read(&self, buf: &mut [u8]) -> std::io::Result<usize> {
         self.io.try_read_raw(buf)
     }
+
+    /// Raw PTY master file descriptor. Valid for the lifetime of this reader.
+    ///
+    /// Used for `tcgetpgrp` polling to derive the foreground process name.
+    pub fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.io.as_raw_fd()
+    }
 }
 
 // AsyncRead impl for PtySession (non-split use)

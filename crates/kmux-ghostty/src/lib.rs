@@ -370,6 +370,22 @@ impl GhosttyTerm {
         unsafe { sys::kmux_ghostty_history_size(self.handle.as_ptr()) }
     }
 
+    /// Return the current window title set via OSC 0/2, or `None` if no title
+    /// has been received yet. Uses a 1 KiB stack buffer — sufficient for any
+    /// real terminal title.
+    #[must_use]
+    pub fn title(&self) -> Option<String> {
+        let mut buf = [0u8; 1024];
+        let n = unsafe {
+            sys::kmux_ghostty_get_title(self.handle.as_ptr(), buf.as_mut_ptr(), buf.len())
+        };
+        if n == 0 {
+            None
+        } else {
+            String::from_utf8(buf[..n].to_vec()).ok()
+        }
+    }
+
     /// Read `count` rows of scrollback starting at `start` (0 = oldest).
     /// Returns one `Vec<CellState>` per row; `cols` is the row width.
     pub fn read_history(
@@ -512,6 +528,17 @@ mod tests {
         term.feed(b"\x1b]0;hello-world\x07").unwrap();
         let titles = rec.0.lock().unwrap().clone();
         assert_eq!(titles, vec!["hello-world".to_owned()]);
+    }
+
+    #[test]
+    fn title_getter_returns_none_before_osc_and_value_after() {
+        let mut term = GhosttyTerm::new(size(4, 20), 100, Arc::new(NullSink)).unwrap();
+        assert_eq!(term.title(), None);
+        term.feed(b"\x1b]0;My Title\x07").unwrap();
+        assert_eq!(term.title().as_deref(), Some("My Title"));
+        // OSC 2 also sets the title.
+        term.feed(b"\x1b]2;Updated\x07").unwrap();
+        assert_eq!(term.title().as_deref(), Some("Updated"));
     }
 
     #[derive(Default)]
