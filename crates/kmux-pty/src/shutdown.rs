@@ -63,6 +63,25 @@ async fn reap_blocking(pid: Pid) -> ExitStatus {
     wait_for_exit(pid).await
 }
 
+/// Gracefully shut down a child process without blocking.
+///
+/// Sends SIGTERM immediately, then spawns a detached background task that
+/// escalates to SIGKILL after `grace` if the process has not exited.
+/// Returns immediately; callers do not wait for process exit.
+pub fn graceful_shutdown_nowait(pid: Pid, grace: Option<Duration>) {
+    let grace = grace.unwrap_or(DEFAULT_GRACE);
+    let _ = kill(pid, Signal::SIGTERM);
+    tokio::spawn(async move {
+        match timeout(grace, wait_for_exit(pid)).await {
+            Ok(_) => {}
+            Err(_elapsed) => {
+                let _ = kill(pid, Signal::SIGKILL);
+                reap_blocking(pid).await;
+            }
+        }
+    });
+}
+
 /// Send a signal to a process.
 pub fn send_signal(pid: Pid, signal: Signal) -> Result<()> {
     kill(pid, signal).map_err(KmuxError::Pty)
@@ -72,6 +91,29 @@ pub fn send_signal(pid: Pid, signal: Signal) -> Result<()> {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn graceful_shutdown_nowait_eventually_kills_process() {
+        use crate::config::PtyConfig;
+        use crate::pty::PtyProcess;
+
+        let config = PtyConfig::new("/bin/sleep").args(["999"]);
+        let pty = PtyProcess::spawn(&config).expect("spawn");
+        let pid = pty.pid;
+        std::mem::forget(pty);
+
+        graceful_shutdown_nowait(pid, Some(Duration::from_millis(200)));
+
+        // Give the background task time to send SIGTERM and reap
+        tokio::time::sleep(Duration::from_millis(400)).await;
+
+        // Process should be dead: kill(pid, 0) returns ESRCH
+        let alive = nix::sys::signal::kill(pid, None).is_ok();
+        assert!(
+            !alive,
+            "process should be dead after graceful_shutdown_nowait"
+        );
+    }
 
     #[tokio::test]
     async fn sigterm_exits_cleanly() {

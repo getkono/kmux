@@ -85,6 +85,26 @@ impl SessionManager {
         Ok(status)
     }
 
+    /// Remove a named session and initiate graceful shutdown in the background.
+    ///
+    /// Returns immediately without waiting for the process to exit. The process
+    /// receives SIGTERM and will be SIGKILLed after the grace period if needed.
+    pub async fn close_nowait(&self, name: &str) -> Result<()> {
+        let session = {
+            let mut sessions = self.sessions.lock().await;
+            sessions
+                .remove(name)
+                .ok_or_else(|| KmuxError::SessionNotFound {
+                    name: name.to_string(),
+                })?
+        };
+        session.close_nowait().await;
+        self.events.emit(SessionEvent::Closed {
+            name: name.to_string(),
+        });
+        Ok(())
+    }
+
     /// List all active session names.
     pub async fn list(&self) -> Vec<String> {
         self.sessions.lock().await.keys().cloned().collect()
@@ -195,6 +215,33 @@ mod tests {
     async fn close_nonexistent_errors() {
         let mgr = SessionManager::new();
         let result = mgr.close("ghost").await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn close_nowait_removes_session_immediately() {
+        let mgr = SessionManager::new();
+        let config = PtyConfig::new("/bin/sleep").args(["999"]);
+        mgr.spawn("gamma", &config).await.expect("spawn");
+        assert!(mgr.exists("gamma").await);
+
+        let start = std::time::Instant::now();
+        mgr.close_nowait("gamma").await.expect("close_nowait");
+        let elapsed = start.elapsed();
+
+        // Should return well under the 5-second grace period
+        assert!(
+            elapsed < std::time::Duration::from_millis(200),
+            "close_nowait took {:?}, expected < 200ms",
+            elapsed
+        );
+        assert!(!mgr.exists("gamma").await, "session should be removed");
+    }
+
+    #[tokio::test]
+    async fn close_nowait_nonexistent_errors() {
+        let mgr = SessionManager::new();
+        let result = mgr.close_nowait("ghost").await;
         assert!(result.is_err());
     }
 }

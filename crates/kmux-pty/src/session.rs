@@ -85,6 +85,20 @@ impl PtySession {
         graceful_shutdown(pid, self.shutdown_grace).await
     }
 
+    /// Initiate graceful shutdown without waiting for the process to exit.
+    ///
+    /// Sends SIGTERM and spawns a background task to SIGKILL + reap after the
+    /// grace period. Sets keep-alive on the inner `PtyProcess` so its `Drop`
+    /// impl does not race with the background task. Returns immediately.
+    pub async fn close_nowait(self) {
+        let (pid, grace) = {
+            let inner = self.inner.lock().await;
+            (inner.pty.pid, self.shutdown_grace)
+        };
+        self.set_keep_alive(true).await;
+        crate::shutdown::graceful_shutdown_nowait(pid, grace);
+    }
+
     /// Check if the child process has exited.
     pub async fn is_exited(&self) -> bool {
         self.inner.lock().await.pty.is_exited()

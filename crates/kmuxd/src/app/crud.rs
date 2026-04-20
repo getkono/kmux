@@ -123,11 +123,8 @@ impl ServerApp {
                 .unwrap_or_default()
         };
 
-        let mut last_exit = None;
         for (_, pane_id) in &pane_ids {
-            if let Ok(code) = self.manager.close(pane_id).await {
-                last_exit = code.code();
-            }
+            let _ = self.manager.close_nowait(pane_id).await;
         }
 
         // Remove session state
@@ -137,7 +134,7 @@ impl ServerApp {
         // Return word to pool
         self.wordlist.lock().unwrap().release(word_id);
 
-        Ok(last_exit)
+        Ok(None)
     }
 
     /// List all active sessions with their pane metadata.

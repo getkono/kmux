@@ -88,8 +88,7 @@ impl ServerApp {
             }
         }
 
-        let status = self.manager.close(pane_id).await?;
-        let exit_code = status.code();
+        self.manager.close_nowait(pane_id).await?;
 
         // Remove pane from session; remove session if empty
         let mut sessions = self.sessions.write().await;
@@ -102,7 +101,7 @@ impl ServerApp {
             }
         }
 
-        Ok(exit_code)
+        Ok(None)
     }
 
     /// Spawn a PTY process and create a `PaneRelay` for it.
