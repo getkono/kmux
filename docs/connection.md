@@ -138,17 +138,59 @@ Error handling during the race:
 
 ### Strategy 4: SshBootstrap
 
-This strategy is the escalation path when direct transports are unreachable or when the target is only reachable via SSH.
+This strategy is the escalation path when direct transports are unreachable or when the target is only reachable via SSH. Implemented in `crates/kmux-client/src/ssh/negotiate.rs`.
 
-1. Runs `ssh user@host kmuxd probe-or-start` to obtain a JSON connection info blob (token, endpoints, protocol version).
-2. Verifies `protocol_version` from the JSON response (see [Protocol Version Gate](#protocol-version-gate)).
-3. Establishes an SSH `-L` tunnel: `ssh -L 0:127.0.0.1:{tcp_port} -N user@host`.
-4. Detects the allocated local port from SSH stderr by matching the pattern:
-   `debug1: Local forwarding listening on 127.0.0.1 port NNNNN.`
-5. Connects TLS-TCP to `127.0.0.1:{local_port}`. Plaintext is never used inside SSH tunnels.
-6. Sends `Auth` with the token and obtains `AuthResult`.
+1. Run `ssh user@host kmuxd probe-or-start` to obtain a JSON blob (token, endpoints, protocol version, daemon version).
+2. Verify `protocol_version` from the JSON response (see [Protocol Version Gate](#protocol-version-gate)).
+3. **Pre-allocate a free local TCP port** by binding `127.0.0.1:0`, capturing the port, and dropping the listener. The kernel-chosen port is then passed verbatim to `-L`.
+4. Spawn `ssh -L <localport>:127.0.0.1:<remoteport> -N user@host` with `-o ExitOnForwardFailure=yes` so the process exits immediately if the remote forward can't be established.
+5. **Verify the tunnel by TCP-connecting to the local port** with exponential-backoff retries (40 ms → 500 ms cap, 15 s deadline). Concurrently watch the ssh child for an early exit; if it dies before the local port becomes connectable, surface the captured stderr.
+6. Connect TLS-TCP to `127.0.0.1:<localport>`. Plaintext is never used inside SSH tunnels.
+7. Send `Auth` with the token and obtain `AuthResult`.
 
-SSH bootstrap has a 10-second budget to start and respond. If `probe-or-start` starts a stopped daemon, it polls the control socket with 200 ms retries up to 50 times before giving up.
+#### Why we don't parse `ssh -v` stderr
+
+Earlier revisions read `debug1: Local forwarding listening on 127.0.0.1 port NNNNN.` out of the tunnel's stderr to learn the local port (the spec used `-L 0:127.0.0.1:<remote>` to let the kernel pick). That parser scanned for the substring `port <digits>` line-by-line — but `ssh -v` emits `debug1: Connecting to <host> [<ip>] port 22.` *before* the forwarding line, so the parser returned `22`. The TUI then TLS-handshook against the local sshd, which produced an opaque "ssh negotiation" error and no log entry on the daemon. Pre-allocating the port and probing TCP for readiness eliminates the entire class of fragile-stderr-scraping bugs.
+
+#### Stderr capture
+
+Tunnel stderr is always piped and drained off-thread into a 50-line ring buffer, mirrored to `tracing::debug!`. Every `SshError` variant that involves an ssh subprocess (`ProbeFailed`, `TunnelDiedEarly`, `TunnelUnreachable`) embeds the captured stderr tail directly in its `Display` so the user sees `Permission denied (publickey)`, `Host key verification failed`, `Connection timed out`, etc. without needing `RUST_LOG=debug`.
+
+#### Error classification
+
+`ProbeFailureKind` classifies probe-stage exits by ssh's exit code:
+
+| Exit code | Kind | Meaning |
+|-----------|------|---------|
+| 127 | `RemoteDaemonNotInstalled` | Remote shell could not exec `kmuxd` (PATH issue or not installed). |
+| 255 | `SshFailed` | ssh-internal failure: auth, network, host-key, host-down. The captured stderr disambiguates these. |
+| any other | `RemoteDaemonStartFailed` | kmuxd ran but probe-or-start exited non-zero. |
+
+#### SSH option set
+
+The shared `build_ssh_cmd` helper applies these options to every probe and tunnel invocation:
+
+| Option | Why |
+|--------|-----|
+| `BatchMode=yes` | Fail fast instead of prompting; the kmux client owns no terminal at this point. Auth must be configured via ssh-agent / key files. |
+| `StrictHostKeyChecking=accept-new` | TOFU on first connection, refuse on mismatch. Mirrors the data-plane TOFU model. |
+| `ConnectTimeout=10` | Bound network failures so unreachable hosts surface a clear error instead of hanging. |
+
+Tunnel-only options:
+
+| Option | Why |
+|--------|-----|
+| `ExitOnForwardFailure=yes` | Tunnel process exits immediately if the remote forward can't be set up. |
+| `ServerAliveInterval=15` / `ServerAliveCountMax=3` | Keepalive so the tunnel detects black-holed networks within ~45 s instead of sitting idle. |
+
+#### Timeouts
+
+| Phase | Timeout |
+|-------|---------|
+| `kmuxd probe-or-start` (whole invocation) | 20 s |
+| Local-tunnel-port readiness | 15 s |
+
+`kmuxd probe-or-start` itself polls its control socket for up to 10 s waiting for a fresh daemon to come up; the 20 s ssh-side cap leaves room for SSH handshake and authentication.
 
 ---
 
@@ -568,11 +610,18 @@ lifecycle.
 
 ## Troubleshooting
 
+All `SshError` variants render with multi-line context (argv, exit, stderr tail). On launch, the TUI also re-prints the bootstrap error to stderr after the alternate-screen overlay tears down — so `kmux user@host` failures are visible after exit without consulting `~/.local/state/kmux/client.log`.
+
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
 | `VersionMismatch { client: X, server: Y }` | `kmuxd` and `kmux` versions mismatch | Update both to the same version |
-| `RemoteNotInstalled` | `kmuxd` not in `$PATH` on remote | Install `kmuxd` on the remote host |
-| SSH bootstrap times out (10s) | Daemon fails to start | Check `~/.local/share/kmux/kmuxd.log` on the remote |
+| `kmuxd not found on remote host` (exit 127) | `kmuxd` not in `$PATH` on remote | Install `kmuxd` on the remote host |
+| `SSH connection failed` with stderr `Permission denied (publickey)` | Key not available to ssh-agent / wrong identity | Add the key to `ssh-agent` or configure `IdentityFile` in `~/.ssh/config` |
+| `SSH connection failed` with stderr `Host key verification failed` | Remote host key changed | Update `~/.ssh/known_hosts` (e.g. `ssh-keygen -R host`) |
+| `SSH connection failed` with stderr `Connection timed out` | Host unreachable / firewall | Check network; verify the host is accessible |
+| `SSH tunnel exited before becoming ready` with `Permission denied` | Same as auth above, but the probe succeeded and tunnel auth failed (e.g. agent expired) | Re-add identity to ssh-agent |
+| `SSH tunnel never accepted a local connection` | sshd-side restriction (`AllowTcpForwarding no`, `PermitOpen` mismatch) | Adjust sshd config on remote |
+| `remote daemon returned malformed JSON` | Old kmuxd or kmuxd printed to stdout | Update kmuxd; check `~/.local/state/kmux/kmuxd.log` on remote |
 | QUIC connection refused, TLS-TCP works | UDP blocked by firewall | Normal; `TransportSupervisor` will stick with TLS-TCP |
 | TLS fingerprint mismatch | Server cert rotated | Delete the stale entry from `~/.config/kmux/known_hosts.toml` |
 | All transports fail | No network path | Check firewall; verify `kmuxd` is listening on correct ports |

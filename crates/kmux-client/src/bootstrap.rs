@@ -384,7 +384,10 @@ impl Bootstrap for SshBootstrap {
             let ssh = crate::ssh::negotiate(&self.target)
                 .await
                 .map_err(|e| match e {
-                    crate::ssh::SshError::DaemonNotInstalled => BootstrapError::RemoteNotInstalled,
+                    crate::ssh::SshError::ProbeFailed {
+                        kind: crate::ssh::ProbeFailureKind::RemoteDaemonNotInstalled,
+                        ..
+                    } => BootstrapError::RemoteNotInstalled,
                     crate::ssh::SshError::VersionMismatch { client, server } => {
                         BootstrapError::VersionMismatch { client, server }
                     }

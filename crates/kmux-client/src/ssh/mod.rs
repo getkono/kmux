@@ -110,24 +110,102 @@ pub struct SshSession {
     pub probe_json: String,
 }
 
+/// Why a single `ssh ... kmuxd probe-or-start` invocation failed.
+///
+/// SSH's own non-zero exit codes are highly overloaded (255 covers auth,
+/// network, and host-key failures all at once), so we only classify
+/// the *layer* of the failure and rely on the captured stderr inside
+/// [`SshError::ProbeFailed`] to tell the user what specifically broke.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProbeFailureKind {
+    /// Exit 127: the remote shell could not exec `kmuxd`. The user needs
+    /// to install kmuxd or fix their `PATH` on the remote.
+    RemoteDaemonNotInstalled,
+    /// Exit 255: ssh itself failed (auth, network, host-key, host down).
+    /// Captured stderr disambiguates between these.
+    SshFailed,
+    /// Any other non-zero exit: kmuxd ran but probe-or-start failed.
+    RemoteDaemonStartFailed,
+}
+
+impl std::fmt::Display for ProbeFailureKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::RemoteDaemonNotInstalled => f.write_str("kmuxd not found on remote host"),
+            Self::SshFailed => f.write_str("SSH connection failed"),
+            Self::RemoteDaemonStartFailed => {
+                f.write_str("kmuxd probe-or-start failed on remote host")
+            }
+        }
+    }
+}
+
+/// Errors from [`negotiate`]. Every variant carries enough context that
+/// the user can act on it without enabling debug tracing — the captured
+/// `argv`, `exit_code`, and `stderr` are formatted directly into the
+/// `Display` representation, so a plain `eprintln!("{e}")` is enough.
 #[derive(Debug, thiserror::Error)]
 pub enum SshError {
-    #[error("SSH connection failed: {0}")]
-    ConnectionFailed(String),
-    #[error("kmuxd is not installed on the remote host")]
-    DaemonNotInstalled,
-    #[error("failed to start remote daemon: {0}")]
-    DaemonStartFailed(String),
-    #[error("timed out waiting for the remote daemon to start")]
-    DaemonTimeout,
-    #[error("SSH tunnel setup failed: {0}")]
-    TunnelFailed(String),
-    #[error("SSH process exited unexpectedly")]
-    SshProcessDied,
+    /// Could not invoke `ssh` at all (binary missing, fork failed).
+    #[error("could not run `{program}`: {source}")]
+    Spawn {
+        program: String,
+        #[source]
+        source: std::io::Error,
+    },
+
+    /// `ssh ... kmuxd probe-or-start` failed. `kind` says at which layer;
+    /// `stderr` is what the user needs to see to fix it.
     #[error(
-        "protocol version mismatch: client={client}, server={server} — update kmuxd or kmux to the same version"
+        "{kind}\n  ssh dest: {dest}\n  argv:     {argv}\n  exit:     {exit_code}\n  stderr:\n{stderr}"
+    )]
+    ProbeFailed {
+        kind: ProbeFailureKind,
+        dest: String,
+        argv: String,
+        exit_code: String,
+        stderr: String,
+    },
+
+    /// `kmuxd probe-or-start` returned successfully but the JSON wasn't parseable.
+    /// Either an old daemon predating the JSON contract, or a daemon crash that
+    /// printed text to stdout.
+    #[error("remote daemon returned malformed JSON: {error}\n  raw output:\n    {raw}")]
+    BadProbeJson { error: String, raw: String },
+
+    /// Protocol-version gate: client and remote daemon don't agree.
+    #[error(
+        "protocol version mismatch: client={client}, server={server} \
+         — update kmuxd or kmux to the same version"
     )]
     VersionMismatch { client: u32, server: u32 },
+
+    /// Could not pre-allocate a free local TCP port for the `-L` tunnel.
+    #[error("could not allocate a local port for the SSH tunnel: {0}")]
+    LocalPortAllocFailed(String),
+
+    /// `ssh -L -N` exited before the local forward came up.
+    #[error(
+        "SSH tunnel exited before becoming ready\n  ssh dest: {dest}\n  argv:     {argv}\n  exit:     {exit_code}\n  stderr:\n{stderr}"
+    )]
+    TunnelDiedEarly {
+        dest: String,
+        argv: String,
+        exit_code: String,
+        stderr: String,
+    },
+
+    /// We could not connect to the local end of the `-L` tunnel within the
+    /// readiness timeout. The ssh process is still alive but isn't forwarding.
+    #[error(
+        "SSH tunnel never accepted a local connection\n  ssh dest:   {dest}\n  argv:       {argv}\n  local_port: {local_port}\n  stderr:\n{stderr}"
+    )]
+    TunnelUnreachable {
+        dest: String,
+        argv: String,
+        local_port: u16,
+        stderr: String,
+    },
 }
 
 /// Parse `server` into a `RemoteTarget`.

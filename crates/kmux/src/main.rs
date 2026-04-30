@@ -173,5 +173,14 @@ async fn async_main() -> anyhow::Result<()> {
     )?;
     terminal.show_cursor()?;
 
+    // The TUI alternate-screen overlay swallows error text on exit. If the
+    // bootstrap (e.g. SSH negotiation) failed, the App stashed the full
+    // multi-line diagnostic for us to surface here, after raw-mode is off.
+    // Without this, the user only sees the brief disconnect badge and has
+    // to dig in `~/.local/state/kmux/client.log` to find out what happened.
+    if let Some(err) = app.last_exit_error.take() {
+        eprintln!("kmux: connection failed:\n{err}");
+    }
+
     result
 }

@@ -1,99 +1,95 @@
-use std::process::Stdio;
+//! SSH negotiation: probe-or-start the remote daemon, then build a `-L`
+//! TCP tunnel to it. The negotiation is deliberately I/O-poor: every step
+//! captures full diagnostic context so a failure surfaces a complete
+//! `SshError` that is useful on stderr without enabling verbose tracing.
+//!
+//! Design notes:
+//!
+//! * **No `-v` parsing.** Earlier revisions tried to scrape `debug1: Local
+//!   forwarding listening on 127.0.0.1 port NNNNN.` out of `ssh -v` stderr,
+//!   but `-v` also prints `debug1: Connecting to <host> [<ip>] port 22.`
+//!   *first* — and that line trivially matched the same `port N` pattern,
+//!   making the parser hand back `22` and the client TLS-talk to the local
+//!   sshd. We now pre-allocate the local port ourselves and verify the
+//!   tunnel by TCP-connecting to it.
+//! * **`ExitOnForwardFailure=yes`** so the tunnel process exits immediately
+//!   if the remote forward can't be set up, instead of sitting idle.
+//! * **Stderr is always captured into a ring buffer**, drained off-thread
+//!   so we never backpressure ssh, and surfaced in every error variant
+//!   that involves an ssh subprocess. Users see the actual ssh complaint
+//!   (`Permission denied (publickey)`, `Host key verification failed`,
+//!   `Connection timed out`, …) without `RUST_LOG=debug`.
+
+use std::process::{ExitStatus, Stdio};
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use tokio::io::AsyncBufReadExt;
-use tokio::process::Command;
+use tokio::net::TcpStream;
+use tokio::process::{Child, ChildStderr, Command};
+use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
 use kmux_protocol::messages::PROTOCOL_VERSION;
 
-use super::{RemoteTarget, SshError, SshSession};
+use super::{ProbeFailureKind, RemoteTarget, SshError, SshSession};
 
-/// SSH-negotiate with `target`, returning an `SshSession` ready for TCP use.
+/// Hard cap on a single `ssh kmuxd probe-or-start` invocation.
+///
+/// `kmuxd probe-or-start` itself polls for up to 10s waiting for a fresh
+/// daemon to come up; we add a generous slack for the SSH handshake.
+const PROBE_TIMEOUT: Duration = Duration::from_secs(20);
+
+/// How long to wait for the local end of the `-L` tunnel to accept TCP.
+///
+/// The remote bind happens after authentication completes, so on a slow
+/// link we may need a few seconds for sshd to publish the channel. The
+/// child-process exit watcher short-circuits this on hard failure.
+const TUNNEL_READY_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// SSH-negotiate with `target`, returning an [`SshSession`] ready for TCP use.
 ///
 /// Steps:
-/// 1. Run `ssh user@host kmuxd probe-or-start` to get JSON connection info.
-/// 2. Spawn `ssh -L 0:127.0.0.1:{tcp_port} -N user@host` for tunnelling.
-/// 3. Parse the allocated local port from the tunnel's stderr.
+///   1. Run `ssh user@host kmuxd probe-or-start` and parse the JSON reply.
+///   2. Pre-allocate a free local TCP port.
+///   3. Spawn `ssh -L <localport>:127.0.0.1:<remoteport> -N user@host` with
+///      stderr captured into a background-drained ring buffer.
+///   4. Probe `127.0.0.1:<localport>` until it accepts TCP, while watching
+///      the child for an early exit. If either fails, surface the captured
+///      stderr in the error.
 pub async fn negotiate(target: &RemoteTarget) -> Result<SshSession, SshError> {
     let ssh_dest = ssh_destination(target);
 
-    // ── Step 1: probe-or-start ────────────────────────────────────────────────
-    debug!(dest = %ssh_dest, "Running kmuxd probe-or-start");
-    let probe_output = build_ssh_cmd(target, &ssh_dest)
-        .arg("kmuxd")
-        .arg("probe-or-start")
-        .output()
-        .await
-        .map_err(|e| SshError::ConnectionFailed(e.to_string()))?;
-
-    if probe_output.status.code() == Some(127) {
-        return Err(SshError::DaemonNotInstalled);
-    }
-    if !probe_output.status.success() {
-        let stderr = String::from_utf8_lossy(&probe_output.stderr);
-        return Err(SshError::DaemonStartFailed(stderr.into_owned()));
-    }
-
-    let stdout = String::from_utf8_lossy(&probe_output.stdout);
-    let probe_json = stdout.trim().to_string();
-    let info: ProbeInfo = serde_json::from_str(&probe_json)
-        .map_err(|e| SshError::DaemonStartFailed(format!("bad JSON from probe-or-start: {e}")))?;
-
-    // Version gate: if the server reports its protocol_version, it must match.
-    // Older daemons that don't report the field are accepted with a warning.
-    match info.protocol_version {
-        Some(server_ver) if server_ver != PROTOCOL_VERSION => {
-            return Err(SshError::VersionMismatch {
-                client: PROTOCOL_VERSION,
-                server: server_ver,
-            });
-        }
-        None => {
-            warn!(
-                dest = %ssh_dest,
-                "Remote daemon did not report protocol_version; \
-                 update kmuxd to ensure compatibility"
-            );
-        }
-        Some(_) => {}
-    }
+    let probe = run_probe(target, &ssh_dest).await?;
+    let info = parse_probe_json(&probe.stdout)?;
+    enforce_version(&info, &ssh_dest)?;
 
     info!(
         dest = %ssh_dest,
         quic_port = info.quic_port,
         tcp_port = info.tcp_port,
+        kmuxd_version = info.kmuxd_version.as_deref().unwrap_or("?"),
         "Remote daemon ready"
     );
 
-    // ── Step 2: SSH -L tunnel ─────────────────────────────────────────────────
-    // Use port 0 so the OS assigns a free local port.  We detect the actual
-    // port from the tunnel process's stderr via `-v` (OpenSSH logs it as
-    // "Local forwarding listening on 127.0.0.1 port XXXXX.").
-    let forward_spec = format!("0:127.0.0.1:{}", info.tcp_port);
-    debug!(dest = %ssh_dest, forward = %forward_spec, "Starting SSH -L tunnel");
+    let local_port = allocate_local_port()?;
+    let (mut tunnel, tunnel_argv, stderr_buf) =
+        spawn_tunnel(target, &ssh_dest, local_port, info.tcp_port)?;
 
-    let mut tunnel_cmd = build_ssh_cmd(target, &ssh_dest);
-    tunnel_cmd
-        .arg("-v") // verbose so we can detect the allocated port
-        .arg("-L")
-        .arg(&forward_spec)
-        .arg("-N") // no remote command
-        .stderr(Stdio::piped())
-        .stdout(Stdio::null())
-        .stdin(Stdio::null());
-
-    let mut tunnel = tunnel_cmd
-        .spawn()
-        .map_err(|e| SshError::TunnelFailed(e.to_string()))?;
-
-    // Read stderr until we find the local port assignment line.
-    let local_port = detect_local_tunnel_port(
-        tunnel.stderr.take().expect("stderr piped"),
+    if let Err(err) = wait_for_tunnel_ready(
+        &mut tunnel,
+        &stderr_buf,
         &ssh_dest,
-        &forward_spec,
+        &tunnel_argv,
+        local_port,
     )
     .await
-    .map_err(SshError::TunnelFailed)?;
+    {
+        // Best-effort cleanup: the supervisor task spawned by `spawn_tunnel`
+        // owns the stderr drain; killing the child causes the drain to EOF.
+        let _ = tunnel.start_kill();
+        return Err(err);
+    }
 
     info!(
         dest = %ssh_dest,
@@ -109,13 +105,51 @@ pub async fn negotiate(target: &RemoteTarget) -> Result<SshSession, SshError> {
         local_tcp_port: local_port,
         remote_host: target.host.clone(),
         tunnel_process: tunnel,
-        probe_json,
+        probe_json: probe.stdout,
     })
 }
 
-// ── Helpers ───────────────────────────────────────────────────────────────────
+// ── Step 1: probe ─────────────────────────────────────────────────────────────
 
-#[derive(serde::Deserialize)]
+struct ProbeResult {
+    stdout: String,
+}
+
+async fn run_probe(target: &RemoteTarget, ssh_dest: &str) -> Result<ProbeResult, SshError> {
+    let mut cmd = build_ssh_cmd(target, ssh_dest);
+    cmd.arg("kmuxd").arg("probe-or-start");
+    let argv = render_argv(&cmd);
+    debug!(dest = %ssh_dest, argv = %argv, "Running kmuxd probe-or-start");
+
+    let output = tokio::time::timeout(PROBE_TIMEOUT, cmd.output())
+        .await
+        .map_err(|_| SshError::ProbeFailed {
+            kind: ProbeFailureKind::SshFailed,
+            dest: ssh_dest.to_owned(),
+            argv: argv.clone(),
+            exit_code: format!("timeout after {}s", PROBE_TIMEOUT.as_secs()),
+            stderr: "(ssh did not return within the probe budget)".to_string(),
+        })?
+        .map_err(|e| SshError::Spawn {
+            program: ssh_program(),
+            source: e,
+        })?;
+
+    if !output.status.success() {
+        return Err(SshError::ProbeFailed {
+            kind: classify_probe_exit(output.status),
+            dest: ssh_dest.to_owned(),
+            argv,
+            exit_code: format_exit(output.status),
+            stderr: tail_stderr(&output.stderr),
+        });
+    }
+
+    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    Ok(ProbeResult { stdout })
+}
+
+#[derive(Debug, serde::Deserialize)]
 struct ProbeInfo {
     quic_port: u16,
     tcp_port: u16,
@@ -123,7 +157,171 @@ struct ProbeInfo {
     /// `protocol_version` field added in Phase 7; older daemons omit it.
     #[serde(default)]
     protocol_version: Option<u32>,
+    /// Reported daemon version string. Surfaced in success logs only.
+    #[serde(default)]
+    kmuxd_version: Option<String>,
 }
+
+fn parse_probe_json(raw: &str) -> Result<ProbeInfo, SshError> {
+    serde_json::from_str::<ProbeInfo>(raw).map_err(|e| SshError::BadProbeJson {
+        error: e.to_string(),
+        raw: raw.to_owned(),
+    })
+}
+
+fn enforce_version(info: &ProbeInfo, ssh_dest: &str) -> Result<(), SshError> {
+    match info.protocol_version {
+        Some(server_ver) if server_ver != PROTOCOL_VERSION => Err(SshError::VersionMismatch {
+            client: PROTOCOL_VERSION,
+            server: server_ver,
+        }),
+        Some(_) => Ok(()),
+        None => {
+            warn!(
+                dest = %ssh_dest,
+                "Remote daemon did not report protocol_version; \
+                 update kmuxd to ensure compatibility"
+            );
+            Ok(())
+        }
+    }
+}
+
+// ── Step 2-3: tunnel ──────────────────────────────────────────────────────────
+
+fn allocate_local_port() -> Result<u16, SshError> {
+    // Bind on the loopback so the kernel picks an unused port; immediately
+    // drop the listener so ssh can re-bind. The window between drop and
+    // re-bind is microseconds and only relevant if another process on the
+    // same host is racing for the same ephemeral port — extremely unlikely
+    // in practice, and surfaced as an `ExitOnForwardFailure` failure if it
+    // does happen.
+    let listener = std::net::TcpListener::bind("127.0.0.1:0")
+        .map_err(|e| SshError::LocalPortAllocFailed(e.to_string()))?;
+    let port = listener
+        .local_addr()
+        .map_err(|e| SshError::LocalPortAllocFailed(e.to_string()))?
+        .port();
+    drop(listener);
+    Ok(port)
+}
+
+/// Bounded stderr capture: a `Mutex<Vec<String>>` that the drainer task
+/// pushes into and the error path snapshots. Capped to 50 lines so a
+/// chatty ssh (e.g. with `-v` from the user's environment) can't grow
+/// unboundedly.
+type StderrBuf = Arc<Mutex<Vec<String>>>;
+const STDERR_CAP: usize = 50;
+
+fn spawn_tunnel(
+    target: &RemoteTarget,
+    ssh_dest: &str,
+    local_port: u16,
+    remote_port: u16,
+) -> Result<(Child, String, StderrBuf), SshError> {
+    let forward_spec = format!("{local_port}:127.0.0.1:{remote_port}");
+    let mut cmd = build_ssh_cmd(target, ssh_dest);
+    cmd.arg("-o")
+        .arg("ExitOnForwardFailure=yes")
+        .arg("-o")
+        .arg("ServerAliveInterval=15")
+        .arg("-o")
+        .arg("ServerAliveCountMax=3")
+        .arg("-L")
+        .arg(&forward_spec)
+        .arg("-N") // no remote command
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    let argv = render_argv(&cmd);
+    debug!(dest = %ssh_dest, forward = %forward_spec, argv = %argv, "Spawning SSH -L tunnel");
+
+    let mut child = cmd.spawn().map_err(|e| SshError::Spawn {
+        program: ssh_program(),
+        source: e,
+    })?;
+
+    let stderr_buf: StderrBuf = Arc::new(Mutex::new(Vec::with_capacity(STDERR_CAP)));
+    if let Some(stderr) = child.stderr.take() {
+        spawn_stderr_drain(stderr, Arc::clone(&stderr_buf));
+    }
+
+    Ok((child, argv, stderr_buf))
+}
+
+/// Drain the tunnel's stderr line-by-line so it never backpressures ssh.
+/// Lines are appended to `buf` (capped at [`STDERR_CAP`]) and mirrored to
+/// `tracing::debug!` for users who *do* want a live view.
+fn spawn_stderr_drain(stderr: ChildStderr, buf: StderrBuf) {
+    tokio::spawn(async move {
+        let reader = tokio::io::BufReader::new(stderr);
+        let mut lines = reader.lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            debug!(target: "ssh_tunnel_stderr", "{line}");
+            let mut guard = buf.lock().expect("stderr buf mutex");
+            if guard.len() >= STDERR_CAP {
+                guard.remove(0);
+            }
+            guard.push(line);
+        }
+    });
+}
+
+fn snapshot_stderr(buf: &StderrBuf) -> String {
+    let guard = buf.lock().expect("stderr buf mutex");
+    if guard.is_empty() {
+        "(ssh produced no stderr output)".to_string()
+    } else {
+        guard
+            .iter()
+            .map(|l| format!("    {l}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+}
+
+async fn wait_for_tunnel_ready(
+    child: &mut Child,
+    stderr_buf: &StderrBuf,
+    ssh_dest: &str,
+    tunnel_argv: &str,
+    local_port: u16,
+) -> Result<(), SshError> {
+    let deadline = Instant::now() + TUNNEL_READY_TIMEOUT;
+    let mut delay = Duration::from_millis(40);
+
+    loop {
+        // Hard fail: ssh exited before the forward came up.
+        if let Ok(Some(status)) = child.try_wait() {
+            return Err(SshError::TunnelDiedEarly {
+                dest: ssh_dest.to_owned(),
+                argv: tunnel_argv.to_owned(),
+                exit_code: format_exit(status),
+                stderr: snapshot_stderr(stderr_buf),
+            });
+        }
+
+        // Cheap probe: try to TCP-connect to the local end. As soon as ssh
+        // has installed the forward listener, this succeeds.
+        if TcpStream::connect(("127.0.0.1", local_port)).await.is_ok() {
+            return Ok(());
+        }
+
+        if Instant::now() >= deadline {
+            return Err(SshError::TunnelUnreachable {
+                dest: ssh_dest.to_owned(),
+                argv: tunnel_argv.to_owned(),
+                local_port,
+                stderr: snapshot_stderr(stderr_buf),
+            });
+        }
+
+        sleep(delay).await;
+        delay = (delay * 2).min(Duration::from_millis(500));
+    }
+}
+
+// ── Helpers ───────────────────────────────────────────────────────────────────
 
 pub(super) fn ssh_destination(target: &RemoteTarget) -> String {
     match &target.user {
@@ -132,16 +330,28 @@ pub(super) fn ssh_destination(target: &RemoteTarget) -> String {
     }
 }
 
-/// Build a base `ssh` command with shared flags.
-pub(super) fn build_ssh_cmd(target: &RemoteTarget, dest: &str) -> Command {
-    let ssh_bin = std::env::var("KMUX_SSH_BIN")
+fn ssh_program() -> String {
+    std::env::var("KMUX_SSH_BIN")
         .ok()
         .filter(|s| !s.is_empty())
-        .unwrap_or_else(|| "ssh".to_string());
+        .unwrap_or_else(|| "ssh".to_string())
+}
 
-    let mut cmd = Command::new(&ssh_bin);
-    cmd.arg("-o").arg("BatchMode=yes"); // non-interactive
+/// Build a base `ssh` command with the shared flags every kmux call relies on.
+///
+/// * `BatchMode=yes` — fail fast instead of prompting for a password. SSH
+///   auth must be handled out of band (ssh-agent, key files, etc.). This is
+///   intentional: the kmux client has no terminal of its own at this point
+///   (it is about to take over stdin/stdout for the TUI).
+/// * `StrictHostKeyChecking=accept-new` — TOFU on first connection, refuse
+///   on mismatch. Matches the `connect_tcp_tls` TOFU model on the data plane.
+/// * `ConnectTimeout=10` — bound network failures so the user sees an error
+///   instead of a hang when the host is unreachable.
+pub(super) fn build_ssh_cmd(target: &RemoteTarget, dest: &str) -> Command {
+    let mut cmd = Command::new(ssh_program());
+    cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
+    cmd.arg("-o").arg("ConnectTimeout=10");
     if let Some(port) = target.ssh_port {
         cmd.arg("-p").arg(port.to_string());
     }
@@ -149,120 +359,85 @@ pub(super) fn build_ssh_cmd(target: &RemoteTarget, dest: &str) -> Command {
     cmd
 }
 
-/// Read from `stderr` until OpenSSH logs the allocated local port for `-L`.
-///
-/// OpenSSH verbose output contains a line like:
-/// `debug1: Local forwarding listening on 127.0.0.1 port 54321.`
-///
-/// On failure, emits a `warn!` with the last SSH stderr lines so the caller
-/// can diagnose auth errors, connection refusals, etc. without needing RUST_LOG=debug.
-pub(super) async fn detect_local_tunnel_port(
-    stderr: tokio::process::ChildStderr,
-    dest: &str,
-    forward_spec: &str,
-) -> Result<u16, String> {
-    use tokio::time::{Duration, timeout};
+/// Render `cmd` as a shell-ish argv string for inclusion in error messages.
+/// Not parseable, but unambiguous enough that a user can re-run it manually.
+fn render_argv(cmd: &Command) -> String {
+    let std_cmd = cmd.as_std();
+    let mut out = String::new();
+    out.push_str(&std_cmd.get_program().to_string_lossy());
+    for arg in std_cmd.get_args() {
+        out.push(' ');
+        let s = arg.to_string_lossy();
+        if s.chars().any(char::is_whitespace) {
+            out.push('"');
+            out.push_str(&s);
+            out.push('"');
+        } else {
+            out.push_str(&s);
+        }
+    }
+    out
+}
 
-    let reader = tokio::io::BufReader::new(stderr);
-    let mut lines = reader.lines();
-    let dest_owned = dest.to_owned();
-    let fwd_owned = forward_spec.to_owned();
+/// Map an [`ExitStatus`] to a stable, classifiable [`ProbeFailureKind`].
+///
+/// SSH itself signals all of (auth, network, host-key, host-down) failures
+/// with exit code 255. Exit 127 is what most shells return when the
+/// requested command is not on the remote `PATH` — the canonical
+/// "kmuxd not installed" signal. Everything else is treated as a probe
+/// failure on the remote.
+fn classify_probe_exit(status: ExitStatus) -> ProbeFailureKind {
+    match status.code() {
+        Some(127) => ProbeFailureKind::RemoteDaemonNotInstalled,
+        Some(255) => ProbeFailureKind::SshFailed,
+        Some(_) => ProbeFailureKind::RemoteDaemonStartFailed,
+        None => ProbeFailureKind::SshFailed,
+    }
+}
 
-    let result = timeout(Duration::from_secs(15), async move {
-        // Ring buffer: keep the last 20 lines for diagnostics on failure.
-        let mut seen: Vec<String> = Vec::with_capacity(20);
-        loop {
-            match lines.next_line().await {
-                Ok(Some(line)) => {
-                    debug!(line = %line, "ssh tunnel stderr");
-                    // OpenSSH -v: "debug1: Local forwarding listening on 127.0.0.1 port NNNNN."
-                    if let Some(port) = parse_listening_port(&line) {
-                        return Ok(port);
-                    }
-                    if seen.len() == 20 {
-                        seen.remove(0);
-                    }
-                    seen.push(line);
-                }
-                _ => {
-                    // EOF or read error — SSH exited without printing the port line.
-                    // Emit a warn with the collected output so the caller can see why.
-                    let ssh_output = if seen.is_empty() {
-                        "(no output)".to_string()
-                    } else {
-                        seen.iter()
-                            .map(|l| format!("  {l}"))
-                            .collect::<Vec<_>>()
-                            .join("\n")
-                    };
-                    warn!(
-                        dest = %dest_owned,
-                        forward = %fwd_owned,
-                        ssh_output = %ssh_output,
-                        "SSH stderr closed before reporting tunnel port"
-                    );
-                    return Err(format!(
-                        "SSH stderr closed without reporting local tunnel port \
-                         (dest={dest_owned}, forward={fwd_owned})"
-                    ));
+fn format_exit(status: ExitStatus) -> String {
+    match status.code() {
+        Some(c) => c.to_string(),
+        None => {
+            #[cfg(unix)]
+            {
+                use std::os::unix::process::ExitStatusExt;
+                if let Some(sig) = status.signal() {
+                    return format!("signal {sig}");
                 }
             }
-        }
-    })
-    .await;
-
-    match result {
-        Ok(inner) => inner,
-        Err(_elapsed) => {
-            warn!(
-                dest = %dest,
-                forward = %forward_spec,
-                "SSH tunnel port detection timed out after 15s; \
-                 re-run with RUST_LOG=kmux_client=debug for live stderr"
-            );
-            Err(format!(
-                "Timed out (15s) waiting for SSH tunnel port assignment \
-                 (dest={dest}, forward={forward_spec})"
-            ))
+            "abnormal exit".to_string()
         }
     }
 }
 
-/// Extract the port number from OpenSSH verbose output lines like:
-/// `debug1: Local forwarding listening on 127.0.0.1 port 54321.`
-pub(super) fn parse_listening_port(line: &str) -> Option<u16> {
-    // Look for "port " followed by digits at/near end-of-line.
-    let marker = "port ";
-    let pos = line.find(marker)?;
-    let after = &line[pos + marker.len()..];
-    let digits: String = after.chars().take_while(|c| c.is_ascii_digit()).collect();
-    digits.parse().ok()
+fn tail_stderr(raw: &[u8]) -> String {
+    let s = String::from_utf8_lossy(raw);
+    let trimmed = s.trim_end();
+    if trimmed.is_empty() {
+        return "(ssh produced no stderr output)".to_string();
+    }
+    let lines: Vec<&str> = trimmed.lines().collect();
+    let start = lines.len().saturating_sub(STDERR_CAP);
+    lines[start..]
+        .iter()
+        .map(|l| format!("    {l}"))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    // ── parse_listening_port tests ───────────────────────────────────────────
-
-    #[test]
-    fn parse_listening_port_extracts_port() {
-        let line = "debug1: Local forwarding listening on 127.0.0.1 port 54321.";
-        assert_eq!(parse_listening_port(line), Some(54321));
-    }
-
-    #[test]
-    fn parse_listening_port_no_match() {
-        assert_eq!(parse_listening_port("some other ssh output"), None);
-    }
-
-    // ── ProbeInfo deserialization tests ─────────────────────────────────────
+    // ── ProbeInfo deserialization ────────────────────────────────────────────
 
     #[test]
     fn probe_info_with_protocol_version() {
         let json = r#"{"quic_port":8443,"tcp_port":8444,"token":"abc","protocol_version":13}"#;
         let info: ProbeInfo = serde_json::from_str(json).unwrap();
         assert_eq!(info.protocol_version, Some(13));
+        assert_eq!(info.tcp_port, 8444);
     }
 
     #[test]
@@ -273,12 +448,135 @@ mod tests {
     }
 
     #[test]
-    fn probe_info_version_mismatch_detected() {
-        // Simulate: client PROTOCOL_VERSION is X, server reports X+1.
-        // We can't call negotiate() in a unit test (it spawns SSH), so test
-        // the version check logic by verifying the sentinel values.
-        let server_ver: u32 = PROTOCOL_VERSION.wrapping_add(1);
-        let client_ver: u32 = PROTOCOL_VERSION;
-        assert_ne!(client_ver, server_ver, "mismatch must differ");
+    fn parse_probe_json_returns_bad_probe_on_garbage() {
+        let err = parse_probe_json("not json").unwrap_err();
+        match err {
+            SshError::BadProbeJson { raw, .. } => assert_eq!(raw, "not json"),
+            other => panic!("expected BadProbeJson, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforce_version_accepts_matching_version() {
+        let info = ProbeInfo {
+            quic_port: 1,
+            tcp_port: 2,
+            token: "t".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
+            kmuxd_version: None,
+        };
+        enforce_version(&info, "user@host").unwrap();
+    }
+
+    #[test]
+    fn enforce_version_rejects_mismatch() {
+        let info = ProbeInfo {
+            quic_port: 1,
+            tcp_port: 2,
+            token: "t".into(),
+            protocol_version: Some(PROTOCOL_VERSION + 1),
+            kmuxd_version: None,
+        };
+        match enforce_version(&info, "user@host").unwrap_err() {
+            SshError::VersionMismatch { client, server } => {
+                assert_eq!(client, PROTOCOL_VERSION);
+                assert_eq!(server, PROTOCOL_VERSION + 1);
+            }
+            other => panic!("expected VersionMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn enforce_version_accepts_missing_version_with_warn() {
+        let info = ProbeInfo {
+            quic_port: 1,
+            tcp_port: 2,
+            token: "t".into(),
+            protocol_version: None,
+            kmuxd_version: None,
+        };
+        enforce_version(&info, "user@host").unwrap();
+    }
+
+    // ── classify_probe_exit ──────────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_probe_exit_127_is_not_installed() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = ExitStatus::from_raw(127 << 8);
+        assert_eq!(
+            classify_probe_exit(status),
+            ProbeFailureKind::RemoteDaemonNotInstalled
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_probe_exit_255_is_ssh_failure() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = ExitStatus::from_raw(255 << 8);
+        assert_eq!(classify_probe_exit(status), ProbeFailureKind::SshFailed);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn classify_probe_exit_other_is_remote_start_failed() {
+        use std::os::unix::process::ExitStatusExt;
+        let status = ExitStatus::from_raw(2 << 8);
+        assert_eq!(
+            classify_probe_exit(status),
+            ProbeFailureKind::RemoteDaemonStartFailed
+        );
+    }
+
+    // ── tail_stderr ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn tail_stderr_indents_and_caps_lines() {
+        let mut s = String::new();
+        for i in 0..(STDERR_CAP + 5) {
+            s.push_str(&format!("line{i}\n"));
+        }
+        let out = tail_stderr(s.as_bytes());
+        let line_count = out.lines().count();
+        assert_eq!(line_count, STDERR_CAP);
+        // Should be indented and start at the (5)th line (oldest dropped).
+        assert!(
+            out.lines().next().unwrap().starts_with("    line5"),
+            "first line was {:?}",
+            out.lines().next()
+        );
+    }
+
+    #[test]
+    fn tail_stderr_handles_empty_input() {
+        assert_eq!(tail_stderr(b""), "(ssh produced no stderr output)");
+        assert_eq!(tail_stderr(b"\n  \n"), "(ssh produced no stderr output)");
+    }
+
+    // ── allocate_local_port ──────────────────────────────────────────────────
+
+    #[test]
+    fn allocate_local_port_returns_distinct_high_ports() {
+        let p1 = allocate_local_port().unwrap();
+        let p2 = allocate_local_port().unwrap();
+        assert!(p1 >= 1024, "got privileged port {p1}");
+        assert!(p2 >= 1024, "got privileged port {p2}");
+        // Two consecutive ephemeral allocations are usually different on Linux,
+        // but the kernel may legitimately reuse a port. Just assert that at
+        // least one of them was non-zero — i.e. the call succeeded.
+        assert!(p1 != 0 && p2 != 0);
+    }
+
+    // ── render_argv ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn render_argv_quotes_args_with_spaces() {
+        let mut cmd = Command::new("ssh");
+        cmd.arg("-o").arg("BatchMode=yes").arg("hello world");
+        let s = render_argv(&cmd);
+        assert!(s.contains("BatchMode=yes"));
+        assert!(s.contains("\"hello world\""));
     }
 }

@@ -157,6 +157,12 @@ pub struct App {
 
     /// Target for the initial bootstrap. Consumed on the first connect.
     pub(super) pending_target: Option<ResolvedTarget>,
+
+    /// Last fatal error to be surfaced *after* the terminal has been
+    /// restored — typically a bootstrap failure on a fresh launch where
+    /// the alternate-screen overlay would otherwise eat it on exit.
+    /// `main.rs` reads this and prints it to stderr.
+    pub last_exit_error: Option<String>,
 }
 
 impl App {
@@ -291,6 +297,7 @@ impl App {
             pending_target: Some(target),
             auto_session,
             auto_cwd,
+            last_exit_error: None,
         }
     }
 }

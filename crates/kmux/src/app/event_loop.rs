@@ -239,6 +239,9 @@ impl App {
                     match bootstrap_result {
                         Some(BootstrapTaskResult::Success(outcome)) => {
                             self.cancel_tx = None;
+                            // A later success clears any stashed bootstrap error so we
+                            // don't re-print a stale failure when the user finally quits.
+                            self.last_exit_error = None;
                             let ssh_ctx = self.mgr.apply_outcome(*outcome);
                             if let Some(ctx) = ssh_ctx {
                                 let srv_tx_clone = self.pending_srv_tx.take()
@@ -260,6 +263,11 @@ impl App {
                             self.cancel_tx = None;
                             self.pending_srv_tx = None;
                             bootstrap_rx = None;
+                            // Stash the multi-line error so it survives terminal teardown
+                            // and is re-printed to stderr after the TUI exits. The TUI
+                            // disconnect overlay still shows the same text, so an
+                            // interactive user can also read it without leaving.
+                            self.last_exit_error = Some(reason.clone());
                             self.enter_disconnected(DisconnectReason::BootstrapFailed(reason));
                             self.needs_render = true;
                         }
