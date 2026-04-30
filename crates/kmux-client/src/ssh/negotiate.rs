@@ -87,10 +87,13 @@ pub async fn negotiate(target: &RemoteTarget) -> Result<SshSession, SshError> {
         .map_err(|e| SshError::TunnelFailed(e.to_string()))?;
 
     // Read stderr until we find the local port assignment line.
-    let local_port =
-        detect_local_tunnel_port(tunnel.stderr.take().expect("stderr piped"), info.tcp_port)
-            .await
-            .map_err(SshError::TunnelFailed)?;
+    let local_port = detect_local_tunnel_port(
+        tunnel.stderr.take().expect("stderr piped"),
+        &ssh_dest,
+        &forward_spec,
+    )
+    .await
+    .map_err(SshError::TunnelFailed)?;
 
     info!(
         dest = %ssh_dest,
@@ -150,29 +153,79 @@ pub(super) fn build_ssh_cmd(target: &RemoteTarget, dest: &str) -> Command {
 ///
 /// OpenSSH verbose output contains a line like:
 /// `debug1: Local forwarding listening on 127.0.0.1 port 54321.`
+///
+/// On failure, emits a `warn!` with the last SSH stderr lines so the caller
+/// can diagnose auth errors, connection refusals, etc. without needing RUST_LOG=debug.
 pub(super) async fn detect_local_tunnel_port(
     stderr: tokio::process::ChildStderr,
-    _remote_port: u16,
+    dest: &str,
+    forward_spec: &str,
 ) -> Result<u16, String> {
     use tokio::time::{Duration, timeout};
 
     let reader = tokio::io::BufReader::new(stderr);
     let mut lines = reader.lines();
+    let dest_owned = dest.to_owned();
+    let fwd_owned = forward_spec.to_owned();
 
-    let deadline = Duration::from_secs(15);
-
-    timeout(deadline, async {
-        while let Ok(Some(line)) = lines.next_line().await {
-            debug!(line = %line, "ssh tunnel stderr");
-            // OpenSSH -v outputs: "debug1: Local forwarding listening on 127.0.0.1 port NNNNN."
-            if let Some(port) = parse_listening_port(&line) {
-                return Ok(port);
+    let result = timeout(Duration::from_secs(15), async move {
+        // Ring buffer: keep the last 20 lines for diagnostics on failure.
+        let mut seen: Vec<String> = Vec::with_capacity(20);
+        loop {
+            match lines.next_line().await {
+                Ok(Some(line)) => {
+                    debug!(line = %line, "ssh tunnel stderr");
+                    // OpenSSH -v: "debug1: Local forwarding listening on 127.0.0.1 port NNNNN."
+                    if let Some(port) = parse_listening_port(&line) {
+                        return Ok(port);
+                    }
+                    if seen.len() == 20 {
+                        seen.remove(0);
+                    }
+                    seen.push(line);
+                }
+                _ => {
+                    // EOF or read error — SSH exited without printing the port line.
+                    // Emit a warn with the collected output so the caller can see why.
+                    let ssh_output = if seen.is_empty() {
+                        "(no output)".to_string()
+                    } else {
+                        seen.iter()
+                            .map(|l| format!("  {l}"))
+                            .collect::<Vec<_>>()
+                            .join("\n")
+                    };
+                    warn!(
+                        dest = %dest_owned,
+                        forward = %fwd_owned,
+                        ssh_output = %ssh_output,
+                        "SSH stderr closed before reporting tunnel port"
+                    );
+                    return Err(format!(
+                        "SSH stderr closed without reporting local tunnel port \
+                         (dest={dest_owned}, forward={fwd_owned})"
+                    ));
+                }
             }
         }
-        Err("SSH stderr closed without reporting local tunnel port".to_string())
     })
-    .await
-    .map_err(|_| "Timed out waiting for SSH tunnel port assignment".to_string())?
+    .await;
+
+    match result {
+        Ok(inner) => inner,
+        Err(_elapsed) => {
+            warn!(
+                dest = %dest,
+                forward = %forward_spec,
+                "SSH tunnel port detection timed out after 15s; \
+                 re-run with RUST_LOG=kmux_client=debug for live stderr"
+            );
+            Err(format!(
+                "Timed out (15s) waiting for SSH tunnel port assignment \
+                 (dest={dest}, forward={forward_spec})"
+            ))
+        }
+    }
 }
 
 /// Extract the port number from OpenSSH verbose output lines like:
