@@ -63,7 +63,12 @@ fn boot_log_path() -> anyhow::Result<PathBuf> {
 /// Spawn `kmuxd --daemon --self-signed --bind 127.0.0.1 --port 0`.
 ///
 /// The server binary handles double-fork daemonization internally via `--daemon`.
-/// We use `LOCK_EX | LOCK_NB` on the pid file to prevent concurrent starts.
+/// We use `LOCK_EX | LOCK_NB` on `daemon.spawn.lock` (a dedicated client-side
+/// lock file, *not* `daemon.pid`) to prevent concurrent starts. The pid file
+/// itself is owned by kmuxd's `daemonize` grandchild, which flocks it from a
+/// process the client cannot observe — sharing one file with the client would
+/// race the client's drop against the grandchild's flock and surface as
+/// `EWOULDBLOCK` ("unable to lock pid file, errno 35").
 ///
 /// kmuxd's stdout and stderr are redirected to `kmuxd-boot.log` in the runtime
 /// dir so a crash before it becomes ready (e.g. linker error, bind failure) is
@@ -73,7 +78,7 @@ fn boot_log_path() -> anyhow::Result<PathBuf> {
 /// - `Ok(Some(child))` after a successful spawn — the caller should retain the
 ///   handle so it can `try_wait()` to detect pre-daemonization crashes and reap
 ///   the double-fork's top-level process without leaking a zombie.
-/// - `Ok(None)` if another process already holds the pid-file lock (the caller
+/// - `Ok(None)` if another process already holds the spawn lock (the caller
 ///   should just poll `query_daemon()`).
 /// - `Err(_)` for any other failure (bad binary, filesystem error, …).
 pub(crate) fn start_daemon() -> anyhow::Result<Option<std::process::Child>> {
@@ -81,15 +86,15 @@ pub(crate) fn start_daemon() -> anyhow::Result<Option<std::process::Child>> {
 
     cleanup_stale_daemon();
 
-    // Acquire a non-blocking exclusive flock on the pid file to serialize
+    // Acquire a non-blocking exclusive flock on the spawn lock to serialize
     // concurrent kmux invocations that all try to start a daemon at once.
-    let pid_path = kmux_protocol::dirs::pid_path()?;
+    let spawn_lock_path = kmux_protocol::dirs::spawn_lock_path()?;
     let lock_file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .mode(0o600)
-        .open(&pid_path)?;
+        .open(&spawn_lock_path)?;
 
     // LOCK_EX | LOCK_NB: fail immediately if another process holds the lock.
     #[allow(deprecated)]
@@ -127,8 +132,7 @@ pub(crate) fn start_daemon() -> anyhow::Result<Option<std::process::Child>> {
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", server_bin.display()))?;
 
-    // Release the flock — the daemonized child will write its own PID file.
-    // The lock_file is dropped here.
+    // lock_file is dropped at end of scope, releasing the spawn lock.
     Ok(Some(child))
 }
 
@@ -373,6 +377,47 @@ mod tests {
         // no one is listening — connect will fail.
         std::fs::write(&socket_path, b"").unwrap();
         assert!(query_daemon().await.is_none());
+    }
+
+    #[test]
+    fn start_daemon_returns_none_when_spawn_lock_held() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+
+        let lock_path = kmux_protocol::dirs::spawn_lock_path().unwrap();
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&lock_path)
+            .unwrap();
+        #[allow(deprecated)]
+        nix::fcntl::flock(
+            held.as_raw_fd(),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .unwrap();
+
+        // Spawn lock contended → start_daemon must short-circuit to Ok(None)
+        // without spawning kmuxd or touching the pid file.
+        let result = start_daemon().expect("expected Ok, got Err");
+        assert!(
+            result.is_none(),
+            "expected Ok(None) when spawn lock is held"
+        );
+
+        let pid_path = kmux_protocol::dirs::pid_path().unwrap();
+        assert!(
+            !pid_path.exists(),
+            "start_daemon must not touch daemon.pid when contended"
+        );
+
+        drop(held);
     }
 
     #[tokio::test]

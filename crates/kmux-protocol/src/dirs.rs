@@ -94,6 +94,16 @@ pub fn pid_path() -> anyhow::Result<PathBuf> {
     Ok(runtime_dir()?.join("daemon.pid"))
 }
 
+/// Path to the client-side spawn lock.
+///
+/// `kmux-client` flocks this file (LOCK_EX | LOCK_NB) to gate concurrent
+/// `kmux` invocations from racing to spawn a daemon. Distinct from
+/// `pid_path()` because `daemonize` also flocks the pid file from inside
+/// kmuxd's grandchild — sharing one file would self-deadlock.
+pub fn spawn_lock_path() -> anyhow::Result<PathBuf> {
+    Ok(runtime_dir()?.join("daemon.spawn.lock"))
+}
+
 /// Path to the auth token file.
 pub fn token_path() -> anyhow::Result<PathBuf> {
     Ok(runtime_dir()?.join("token"))
@@ -241,6 +251,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
         assert!(socket_path().unwrap().ends_with("daemon.sock"));
         assert!(pid_path().unwrap().ends_with("daemon.pid"));
+        assert!(spawn_lock_path().unwrap().ends_with("daemon.spawn.lock"));
         assert!(token_path().unwrap().ends_with("token"));
     }
 
