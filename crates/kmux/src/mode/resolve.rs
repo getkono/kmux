@@ -50,6 +50,17 @@ pub fn resolve_locked(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
 }
 
 pub fn resolve_mode_select(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+    // Command palette: bare `/` (or Ctrl+/ which kitty/Ghostty deliver as the
+    // same `Char('/')`) or the legacy `\x1f` byte some terminals emit for
+    // Ctrl+/. Either form lands here regardless of the CTRL modifier.
+    let is_command_trigger = matches!(key, Key::Character(c) if c == "/")
+        || matches!(key, Key::Character(c) if c == "\u{1f}");
+    if is_command_trigger {
+        return (
+            Some(Mode::Command(super::CommandState::default())),
+            Action::None,
+        );
+    }
     match key {
         Key::Character(c) => match c.as_str() {
             "s" => (Some(Mode::Session), Action::None),
@@ -248,6 +259,53 @@ pub fn resolve_connecting(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) 
         return (None, Action::CancelBootstrap);
     }
     (None, Action::None)
+}
+
+pub fn resolve_command(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+    // Esc cancels and restores Normal mode. CommandState is dropped.
+    if matches!(key, Key::Named(NamedKey::Escape)) {
+        return (Some(Mode::Normal), Action::None);
+    }
+    // Ctrl+C also cancels (familiar from shells).
+    if mods.contains(Modifiers::CTRL) && matches!(key, Key::Character(c) if c == "c") {
+        return (Some(Mode::Normal), Action::None);
+    }
+    // Ctrl+U: clear the line.
+    if mods.contains(Modifiers::CTRL) && matches!(key, Key::Character(c) if c == "u") {
+        return (None, Action::CommandClearLine);
+    }
+    // Ctrl+W: delete the previous word.
+    if mods.contains(Modifiers::CTRL) && matches!(key, Key::Character(c) if c == "w") {
+        return (None, Action::CommandDeleteWordBack);
+    }
+    match key {
+        // Submit: stay in mode so the action handler can `mem::replace` to extract
+        // CommandState before transitioning to Normal.
+        Key::Named(NamedKey::Enter) => (None, Action::CommandSubmit),
+        Key::Named(NamedKey::Tab) => (None, Action::CommandComplete),
+        Key::Named(NamedKey::Backspace) => (None, Action::CommandBackspace),
+        Key::Named(NamedKey::ArrowLeft) => (None, Action::CommandLeft),
+        Key::Named(NamedKey::ArrowRight) => (None, Action::CommandRight),
+        Key::Named(NamedKey::ArrowUp) => (None, Action::CommandHintUp),
+        Key::Named(NamedKey::ArrowDown) => (None, Action::CommandHintDown),
+        Key::Named(NamedKey::Home) => (None, Action::CommandHome),
+        Key::Named(NamedKey::End) => (None, Action::CommandEnd),
+        Key::Character(c) => {
+            if let Some(ch) = c.chars().next() {
+                // Filter out the legacy Ctrl+/ byte and other control characters
+                // that arrive with no CTRL modifier set — they would otherwise
+                // be inserted as garbage. Only insert printable chars.
+                if ch.is_control() {
+                    (None, Action::None)
+                } else {
+                    (None, Action::CommandChar(ch))
+                }
+            } else {
+                (None, Action::None)
+            }
+        }
+        _ => (None, Action::None),
+    }
 }
 
 pub fn resolve_connect(
@@ -454,6 +512,109 @@ mod tests {
         // mode must be None so the action handler can mem::replace the RenameSession
         assert_eq!(mode, None);
         assert_eq!(action, Action::RenameSubmit);
+    }
+
+    // ── Command palette ──────────────────────────────────────────────────
+
+    fn assert_enters_command(key: Key, mods: Modifiers) {
+        let (mode, action) = resolve(&Mode::Select, &key, mods);
+        assert!(
+            matches!(mode, Some(Mode::Command(_))),
+            "expected Mode::Command, got {mode:?}"
+        );
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn ctrl_slash_in_select_enters_command_mode() {
+        assert_enters_command(Key::Character("/".into()), Modifiers::CTRL);
+    }
+
+    #[test]
+    fn bare_slash_in_select_enters_command_mode() {
+        assert_enters_command(Key::Character("/".into()), Modifiers::empty());
+    }
+
+    #[test]
+    fn legacy_us_byte_in_select_enters_command_mode() {
+        // Some terminals encode Ctrl+/ as the raw `\x1f` byte without a
+        // CONTROL modifier. The activation must still fire.
+        assert_enters_command(Key::Character("\u{1f}".into()), Modifiers::empty());
+    }
+
+    #[test]
+    fn esc_cancels_command_mode() {
+        let (mode, action) = resolve(
+            &Mode::Command(crate::mode::CommandState::default()),
+            &Key::Named(NamedKey::Escape),
+            Modifiers::empty(),
+        );
+        assert_eq!(mode, Some(Mode::Normal));
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn ctrl_c_cancels_command_mode() {
+        let (mode, _) = resolve(
+            &Mode::Command(crate::mode::CommandState::default()),
+            &Key::Character("c".into()),
+            Modifiers::CTRL,
+        );
+        assert_eq!(mode, Some(Mode::Normal));
+    }
+
+    #[test]
+    fn enter_in_command_mode_emits_submit_without_pre_transition() {
+        let (mode, action) = resolve(
+            &Mode::Command(crate::mode::CommandState::default()),
+            &Key::Named(NamedKey::Enter),
+            Modifiers::empty(),
+        );
+        // Mode must be None so the action handler can mem::replace the state.
+        assert_eq!(mode, None);
+        assert_eq!(action, Action::CommandSubmit);
+    }
+
+    #[test]
+    fn tab_in_command_mode_emits_complete() {
+        let (_, action) = resolve(
+            &Mode::Command(crate::mode::CommandState::default()),
+            &Key::Named(NamedKey::Tab),
+            Modifiers::empty(),
+        );
+        assert_eq!(action, Action::CommandComplete);
+    }
+
+    #[test]
+    fn char_in_command_mode_emits_command_char() {
+        let (_, action) = resolve(
+            &Mode::Command(crate::mode::CommandState::default()),
+            &Key::Character("a".into()),
+            Modifiers::empty(),
+        );
+        assert_eq!(action, Action::CommandChar('a'));
+    }
+
+    #[test]
+    fn control_char_in_command_mode_does_not_insert() {
+        // The legacy US byte that re-arrives mid-command must not be inserted
+        // as garbage — it should be filtered.
+        let (_, action) = resolve(
+            &Mode::Command(crate::mode::CommandState::default()),
+            &Key::Character("\u{1f}".into()),
+            Modifiers::empty(),
+        );
+        assert_eq!(action, Action::None);
+    }
+
+    #[test]
+    fn ctrl_u_clears_line_in_command_mode() {
+        let (_, action) = resolve(
+            &Mode::Command(crate::mode::CommandState::default()),
+            &Key::Character("u".into()),
+            Modifiers::CTRL,
+        );
+        assert_eq!(action, Action::CommandClearLine);
     }
 
     #[test]

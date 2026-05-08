@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::ops::Range;
 use std::time::Instant;
 
@@ -60,7 +61,7 @@ pub struct PickerHits {
 }
 
 /// What `handle_key` returns to the event loop.
-pub(super) enum KeyResult {
+pub(crate) enum KeyResult {
     Continue,
     Quit,
     /// User submitted the Connect form; the event loop must replace `srv_rx`.
@@ -69,8 +70,10 @@ pub(super) enum KeyResult {
     SwitchServer(SwitchTarget),
 }
 
-/// Destination chosen from the server picker.
-pub(super) enum SwitchTarget {
+/// Destination chosen from the server picker. `pub(crate)` so the command
+/// palette in [`crate::cmd`] can return one through `CommandSuccess`.
+#[derive(Debug)]
+pub enum SwitchTarget {
     Local,
     Ssh(kmux_client::ssh::RemoteTarget),
     Direct { host: String, port: u16 },
@@ -163,7 +166,14 @@ pub struct App {
     /// the alternate-screen overlay would otherwise eat it on exit.
     /// `main.rs` reads this and prints it to stderr.
     pub last_exit_error: Option<String>,
+
+    /// Most-recently-submitted command-palette buffers (oldest first). Capped
+    /// at `COMMAND_HISTORY_CAP`. Used by ↑/↓ recall while command mode is open.
+    pub command_history: VecDeque<String>,
 }
+
+/// Maximum entries kept in `App::command_history`.
+pub const COMMAND_HISTORY_CAP: usize = 100;
 
 impl App {
     pub fn new(
@@ -298,6 +308,7 @@ impl App {
             auto_session,
             auto_cwd,
             last_exit_error: None,
+            command_history: VecDeque::new(),
         }
     }
 }

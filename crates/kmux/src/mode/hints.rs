@@ -61,6 +61,12 @@ pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
         ],
         Mode::Connecting { .. } => vec![("Esc", "Cancel")],
         Mode::Disconnected { .. } => vec![("y/Enter", "Reconnect"), ("q", "Quit")],
+        Mode::Command(_) => vec![
+            ("Tab", "Complete"),
+            ("\u{2191}/\u{2193}", "Hint"),
+            ("Enter", "Run"),
+            ("Esc", "Cancel"),
+        ],
     }
 }
 
@@ -82,6 +88,7 @@ pub fn mode_name(mode: &Mode) -> &'static str {
         Mode::DirectoryPicker => "OPEN SESSION",
         Mode::Connecting { .. } => "CONNECTING",
         Mode::Disconnected { .. } => "DISCONNECTED",
+        Mode::Command(_) => "COMMAND",
     }
 }
 

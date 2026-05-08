@@ -69,6 +69,7 @@ fn render_terminal(f: &mut Frame, app: &mut App) {
         Mode::Disconnected { reason } => {
             overlays::render_disconnect_overlay(f, area, &app.theme, reason)
         }
+        Mode::Command(_) => overlays::render_command_overlay(f, area, app),
         _ => {}
     }
 

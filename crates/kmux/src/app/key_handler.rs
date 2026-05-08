@@ -1,11 +1,12 @@
 use crossterm::event::KeyEvent;
 use kmux_client::input::key_to_bytes;
 
+use crate::cmd;
 use crate::key_convert;
 use crate::mode::{self, Action, ConnectField, Mode};
 use crate::recent_servers::ServerKind;
 
-use super::{App, KeyResult, SwitchTarget};
+use super::{App, COMMAND_HISTORY_CAP, KeyResult, SwitchTarget};
 
 impl App {
     /// Handle a key event. Returns the appropriate `KeyResult` for the event loop.
@@ -17,8 +18,28 @@ impl App {
             self.mode = m;
         }
 
+        self.dispatch_action(action, Some(&key_event)).await
+    }
+
+    /// Apply an `Action` to the app. Used both by the key path and by the
+    /// command palette so a single source of truth governs behavior.
+    ///
+    /// `src_event` is only used by `Action::ForwardKey` for raw byte encoding;
+    /// command-issued actions pass `None`.
+    pub(crate) async fn dispatch_action(
+        &mut self,
+        action: Action,
+        src_event: Option<&KeyEvent>,
+    ) -> KeyResult {
         match action {
             Action::ForwardKey => {
+                // ForwardKey requires the original event to encode bytes; it is
+                // only emitted from the key path, so `src_event` must be Some.
+                let Some(key_event) = src_event else {
+                    return KeyResult::Continue;
+                };
+                let (key, mods) = key_convert::convert(key_event);
+
                 // Snap to bottom on keypress
                 if let Some(grid) = self.mgr.active_grid_mut() {
                     grid.scroll_to_bottom();
@@ -29,7 +50,7 @@ impl App {
                     .active_grid()
                     .map(|b| b.app_cursor())
                     .unwrap_or(false);
-                let text = key_convert::text_from_event(&key_event);
+                let text = key_convert::text_from_event(key_event);
                 let bytes = key_to_bytes(&key, mods, text.as_deref(), app_cursor);
                 if let Some(bytes) = bytes {
                     self.mgr.send_input(bytes);
@@ -372,9 +393,252 @@ impl App {
             Action::ForceRedraw => {
                 self.force_clear = true;
             }
+
+            // ── Command palette editing ──────────────────────────────────────
+            Action::CommandChar(ch) => {
+                if let Mode::Command(state) = &mut self.mode {
+                    let pos = state.cursor.min(state.buffer.len());
+                    state.buffer.insert(pos, ch);
+                    state.cursor = pos + ch.len_utf8();
+                    state.selected = 0;
+                    state.history_pos = None;
+                }
+            }
+            Action::CommandBackspace => {
+                if let Mode::Command(state) = &mut self.mode {
+                    let pos = state.cursor.min(state.buffer.len());
+                    if pos > 0 {
+                        // Find the previous char boundary so we delete a full
+                        // grapheme rather than splitting a multi-byte char.
+                        let mut new_pos = pos - 1;
+                        while !state.buffer.is_char_boundary(new_pos) && new_pos > 0 {
+                            new_pos -= 1;
+                        }
+                        state.buffer.replace_range(new_pos..pos, "");
+                        state.cursor = new_pos;
+                        state.selected = 0;
+                        state.history_pos = None;
+                    }
+                }
+            }
+            Action::CommandLeft => {
+                if let Mode::Command(state) = &mut self.mode
+                    && state.cursor > 0
+                {
+                    let mut new_pos = state.cursor - 1;
+                    while !state.buffer.is_char_boundary(new_pos) && new_pos > 0 {
+                        new_pos -= 1;
+                    }
+                    state.cursor = new_pos;
+                }
+            }
+            Action::CommandRight => {
+                if let Mode::Command(state) = &mut self.mode
+                    && state.cursor < state.buffer.len()
+                {
+                    let mut new_pos = state.cursor + 1;
+                    while new_pos < state.buffer.len() && !state.buffer.is_char_boundary(new_pos) {
+                        new_pos += 1;
+                    }
+                    state.cursor = new_pos;
+                }
+            }
+            Action::CommandHome => {
+                if let Mode::Command(state) = &mut self.mode {
+                    state.cursor = 0;
+                }
+            }
+            Action::CommandEnd => {
+                if let Mode::Command(state) = &mut self.mode {
+                    state.cursor = state.buffer.len();
+                }
+            }
+            Action::CommandHintUp => {
+                self.command_hint_up();
+            }
+            Action::CommandHintDown => {
+                self.command_hint_down();
+            }
+            Action::CommandClearLine => {
+                if let Mode::Command(state) = &mut self.mode {
+                    state.buffer.clear();
+                    state.cursor = 0;
+                    state.selected = 0;
+                    state.history_pos = None;
+                }
+            }
+            Action::CommandDeleteWordBack => {
+                if let Mode::Command(state) = &mut self.mode {
+                    let mut end = state.cursor.min(state.buffer.len());
+                    // Skip trailing whitespace.
+                    while end > 0 {
+                        let prev = state.buffer[..end].chars().next_back();
+                        match prev {
+                            Some(c) if c.is_whitespace() => {
+                                end -= c.len_utf8();
+                            }
+                            _ => break,
+                        }
+                    }
+                    let mut start = end;
+                    while start > 0 {
+                        let prev = state.buffer[..start].chars().next_back();
+                        match prev {
+                            Some(c) if !c.is_whitespace() => {
+                                start -= c.len_utf8();
+                            }
+                            _ => break,
+                        }
+                    }
+                    state.buffer.replace_range(start..state.cursor, "");
+                    state.cursor = start;
+                    state.selected = 0;
+                    state.history_pos = None;
+                }
+            }
+            Action::CommandComplete => {
+                self.command_apply_completion();
+            }
+            Action::CommandSubmit => {
+                // Compute hints BEFORE we extract the state — they depend on
+                // the live `Mode::Command` and we'll fall back to the selected
+                // hint if the typed buffer doesn't parse cleanly.
+                let hints = cmd::hint::build_hints(self);
+                let state =
+                    if let Mode::Command(s) = std::mem::replace(&mut self.mode, Mode::Normal) {
+                        s
+                    } else {
+                        return KeyResult::Continue;
+                    };
+                let typed = state.buffer.trim().to_string();
+                if typed.is_empty() {
+                    return KeyResult::Continue;
+                }
+                // Pick the buffer to actually run. If the typed text already
+                // resolves to a known command, run it. Otherwise, if there's a
+                // highlighted hint that completes a command name, apply it
+                // (matches user expectation: "press Enter on the highlighted
+                // suggestion"). Falls back to typed on no hints.
+                let parses_cleanly = cmd::parse::parse(&typed, cmd::registry::ALL).is_ok();
+                let buf = if parses_cleanly {
+                    typed.clone()
+                } else if let Some(hint) =
+                    hints.get(state.selected.min(hints.len().saturating_sub(1)))
+                {
+                    apply_hint_to_buffer(&state.buffer, hint).trim().to_string()
+                } else {
+                    typed.clone()
+                };
+                // Push the *typed* form into history (so users can recall what
+                // they actually pressed, not the auto-completed expansion).
+                if self.command_history.back().map(|s| s.as_str()) != Some(typed.as_str()) {
+                    self.command_history.push_back(typed.clone());
+                    while self.command_history.len() > COMMAND_HISTORY_CAP {
+                        self.command_history.pop_front();
+                    }
+                }
+                let outcome = cmd::exec::run(self, &buf);
+                match outcome {
+                    cmd::exec::Outcome::Continue => {}
+                    cmd::exec::Outcome::Quit => return KeyResult::Quit,
+                    cmd::exec::Outcome::Reconnect => return KeyResult::Reconnect,
+                    cmd::exec::Outcome::SwitchServer(t) => return KeyResult::SwitchServer(t),
+                }
+            }
+
             Action::None => {}
         }
 
         KeyResult::Continue
+    }
+
+    fn command_hint_up(&mut self) {
+        let state = match &mut self.mode {
+            Mode::Command(s) => s,
+            _ => return,
+        };
+        if state.selected > 0 {
+            state.selected -= 1;
+        }
+    }
+
+    fn command_hint_down(&mut self) {
+        let count = cmd::hint::build_hints(self).len();
+        if let Mode::Command(state) = &mut self.mode
+            && count > 0
+            && state.selected + 1 < count
+        {
+            state.selected += 1;
+        }
+    }
+
+    fn command_apply_completion(&mut self) {
+        let hints = cmd::hint::build_hints(self);
+        let Mode::Command(state) = &mut self.mode else {
+            return;
+        };
+        let idx = state.selected.min(hints.len().saturating_sub(1));
+        let Some(hint) = hints.get(idx) else {
+            return;
+        };
+        state.buffer = apply_hint_to_buffer(&state.buffer, hint);
+        state.cursor = state.buffer.len();
+        state.selected = 0;
+        state.history_pos = None;
+    }
+}
+
+/// Apply a hint's replacement to a buffer, returning the resulting buffer.
+/// Shared by Tab (live edit) and Enter (submit-with-fallback when the typed
+/// buffer doesn't parse to a known command).
+fn apply_hint_to_buffer(buffer: &str, hint: &cmd::hint::Hint) -> String {
+    let split = hint.replace_from.min(buffer.len());
+    let head = &buffer[..split];
+    if hint.append_space {
+        format!("{head}{} ", hint.replacement)
+    } else {
+        format!("{head}{}", hint.replacement)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::cmd::hint::Hint;
+
+    #[test]
+    fn apply_hint_replaces_trailing_token() {
+        let h = Hint {
+            display: String::new(),
+            summary: "",
+            replacement: "session new".into(),
+            replace_from: 0,
+            append_space: true,
+        };
+        assert_eq!(apply_hint_to_buffer("sess", &h), "session new ");
+    }
+
+    #[test]
+    fn apply_hint_at_end_of_buffer() {
+        let h = Hint {
+            display: String::new(),
+            summary: "",
+            replacement: "dracula".into(),
+            replace_from: 6, // after "theme "
+            append_space: true,
+        };
+        assert_eq!(apply_hint_to_buffer("theme ", &h), "theme dracula ");
+    }
+
+    #[test]
+    fn apply_hint_no_trailing_space_when_append_false() {
+        let h = Hint {
+            display: String::new(),
+            summary: "",
+            replacement: "quit".into(),
+            replace_from: 0,
+            append_space: false,
+        };
+        assert_eq!(apply_hint_to_buffer("qu", &h), "quit");
     }
 }
