@@ -7,11 +7,18 @@ use crate::messages::SessionMeta;
 ///
 /// Any site that shells out to `kmuxd` must use this constant so that the
 /// args, bind address, and port are never duplicated or allowed to drift.
+///
+/// Binds to `0.0.0.0` (not `127.0.0.1`) because remote daemons spawned over
+/// SSH must accept QUIC datagrams arriving on the host's external interface
+/// — a loopback bind makes QUIC unreachable to any non-local client and
+/// silently locks in TCP+TLS forever (TCP+TLS happens to work despite a
+/// loopback bind because the SSH `-L` tunnel terminates on the remote's
+/// loopback; QUIC has no such tunnel).
 pub const DAEMON_BOOT_ARGS: &[&str] = &[
     "--daemon",
     "--self-signed",
     "--bind",
-    "127.0.0.1",
+    "0.0.0.0",
     "--port",
     "0",
 ];

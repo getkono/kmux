@@ -151,7 +151,13 @@ pub struct ListenConfig {
 }
 
 fn default_bind() -> String {
-    "::".to_string()
+    // Bind to all IPv4 interfaces by default. We previously used "::" for
+    // IPv6 dual-stack, but on hosts where `net.ipv6.bindv6only=1` (some
+    // distro defaults) the listener silently drops IPv4 traffic — making
+    // QUIC unreachable from typical IPv4 networks (Tailscale, LANs).
+    // `0.0.0.0` is unambiguously usable from every IPv4-reachable client.
+    // Operators who need IPv6 can set `bind = "::"` explicitly.
+    "0.0.0.0".to_string()
 }
 fn default_true() -> bool {
     true

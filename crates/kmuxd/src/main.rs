@@ -48,13 +48,17 @@ struct Cli {
     #[arg(long)]
     config: Option<std::path::PathBuf>,
 
-    /// Address to bind (default: all interfaces).
-    #[arg(long, default_value = "0.0.0.0")]
-    bind: String,
+    /// Address to bind (deprecated; prefer `[[listen]] bind = "..."` in
+    /// `kmuxd.toml`). When omitted, the per-listener `bind` from the config
+    /// file (or its built-in default of `0.0.0.0`) is used; passing this
+    /// flag overrides every QUIC and TCP+TLS listener.
+    #[arg(long)]
+    bind: Option<String>,
 
-    /// QUIC port to listen on (0 = ephemeral; the kernel picks a free port).
-    #[arg(long, default_value_t = 0)]
-    port: u16,
+    /// QUIC port to listen on (0 = ephemeral). Overrides every QUIC listener
+    /// when set; absent leaves each listener's configured port intact.
+    #[arg(long)]
+    port: Option<u16>,
 
     /// Path to a PEM certificate file (required unless --self-signed).
     /// Prefer `[tls] cert = "..."` in kmuxd.toml for persistent configuration.
@@ -76,9 +80,10 @@ struct Cli {
     #[arg(long)]
     daemon: bool,
 
-    /// TCP+TLS port (0 = ephemeral; the kernel picks a free port).
-    #[arg(long, default_value_t = 0)]
-    tcp_port: u16,
+    /// TCP+TLS port (0 = ephemeral). Overrides every TCP+TLS listener when
+    /// set; absent leaves each listener's configured port intact.
+    #[arg(long)]
+    tcp_port: Option<u16>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -195,21 +200,34 @@ fn main() -> anyhow::Result<()> {
     if let Some(key) = cli.key {
         cfg_file.tls.key = Some(key);
     }
-    // Apply bind/port overrides to all matching listeners (deprecated flags).
+    // Apply bind/port overrides only when the user explicitly passed the
+    // corresponding flag. Previously these were eager-defaulted on the CLI
+    // (`--bind 0.0.0.0`, `--port 0`), so every invocation silently rewrote
+    // every listener's bind+port — making `[[listen]] bind = "..."` in
+    // kmuxd.toml impossible to honour.
     for l in &mut cfg_file.listen {
         use config::ListenKind;
+        if !l.enabled {
+            continue;
+        }
         match l.kind {
-            ListenKind::Quic if l.enabled => {
-                l.bind = cli.bind.clone();
-                l.port = cli.port;
-            }
-            ListenKind::TcpTls if l.enabled => {
-                l.bind = cli.bind.clone();
-                if cli.tcp_port != 0 {
-                    l.port = cli.tcp_port;
+            ListenKind::Quic => {
+                if let Some(bind) = &cli.bind {
+                    l.bind = bind.clone();
+                }
+                if let Some(port) = cli.port {
+                    l.port = port;
                 }
             }
-            _ => {}
+            ListenKind::TcpTls => {
+                if let Some(bind) = &cli.bind {
+                    l.bind = bind.clone();
+                }
+                if let Some(port) = cli.tcp_port {
+                    l.port = port;
+                }
+            }
+            ListenKind::Unix => {}
         }
     }
 

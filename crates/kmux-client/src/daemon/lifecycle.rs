@@ -60,7 +60,8 @@ fn boot_log_path() -> anyhow::Result<PathBuf> {
     Ok(kmux_protocol::dirs::runtime_dir()?.join("kmuxd-boot.log"))
 }
 
-/// Spawn `kmuxd --daemon --self-signed --bind 127.0.0.1 --port 0`.
+/// Spawn `kmuxd` with [`kmux_protocol::control_rpc::DAEMON_BOOT_ARGS`]
+/// (`--daemon --self-signed --bind 0.0.0.0 --port 0`).
 ///
 /// The server binary handles double-fork daemonization internally via `--daemon`.
 /// We use `LOCK_EX | LOCK_NB` on `daemon.spawn.lock` (a dedicated client-side
