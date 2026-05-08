@@ -44,7 +44,7 @@ pub async fn handle_message<A: PaneAttacher>(
                 );
                 return false;
             } else if validate_token(&token, &state.app.auth_token) {
-                let (client_id, conn_id, _metrics) = state
+                let (client_id, conn_id, _metrics, previous_transport) = state
                     .app
                     .register_client(
                         state.transport,
@@ -56,6 +56,7 @@ pub async fn handle_message<A: PaneAttacher>(
                 state.connection_id = Some(conn_id);
                 state.capabilities = capabilities;
                 state.authenticated = true;
+                state.pending_swap_from = previous_transport;
                 state.conn_span.record("conn_id", conn_id.0);
                 state.conn_span.record("client_id", client_id.0);
                 state.send(ServerMessage::AuthResult {
@@ -92,12 +93,17 @@ pub async fn handle_message<A: PaneAttacher>(
         ClientMessage::Auth { .. } => {}
 
         ClientMessage::ChannelReady => {
-            let old = state
-                .app
-                .complete_channel_switch(state.connection_id.unwrap(), client_id)
-                .await;
-            if let Some(old_transport) = old {
-                state.send(ServerMessage::ChannelSwitched { old_transport });
+            // The previous transport was captured in `state.pending_swap_from`
+            // by the Auth handler at the moment register_client swapped it
+            // out. Consuming it here ensures the `ChannelSwitched` reply
+            // names the genuine prior transport, even if the registry's
+            // recorded transport has since changed (e.g. a third channel
+            // arrived). `take` clears the field so a stray duplicate
+            // ChannelReady doesn't re-emit a stale switch event.
+            if let Some(old) = state.pending_swap_from.take() {
+                state.send(ServerMessage::ChannelSwitched {
+                    old_transport: old.to_string(),
+                });
             }
         }
 

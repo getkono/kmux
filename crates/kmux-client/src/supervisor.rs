@@ -47,6 +47,13 @@ pub const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// would otherwise look like a successful upgrade and silently disconnect
 /// the live channel when the rejected `AuthResult` arrives).
 const PROBE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+/// Hard cap on the underlying connect call. Quinn's handshake otherwise
+/// respects `QUIC_IDLE_TIMEOUT_SECS` (300 s), so a port that silently
+/// drops UDP would block the supervisor loop for five minutes per probe
+/// — long enough that no second scorer log ever reaches the user. With
+/// this timeout, a stuck probe surfaces as a `warn!` within ~10 s and
+/// the next 30 s tick gets a chance to run.
+const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ─── EndpointHealth ──────────────────────────────────────────────────────────
 
@@ -346,6 +353,34 @@ impl TransportSupervisor {
                 continue;
             };
 
+            // Avoid endlessly probing a candidate the scorer has already
+            // demoted below the active transport. We still allow the *first*
+            // probe of an unmeasured candidate (no RTT and no failures yet)
+            // so we have a chance to measure it — otherwise the candidate's
+            // unknown-latency penalty would lock it out forever even when
+            // it's actually faster.
+            let candidate_score = self.scorer.score(&self.endpoints[target_idx]);
+            let active_score = self
+                .endpoints
+                .iter()
+                .find(|e| e.kind == self.active_transport)
+                .map(|e| self.scorer.score(e));
+            let candidate_measured = self.endpoints[target_idx].rtt_ewma_ms.is_some()
+                || self.endpoints[target_idx].failure_count > 0;
+            if let Some(active_score) = active_score
+                && candidate_measured
+                && candidate_score <= active_score
+            {
+                debug!(
+                    transport = %self.endpoints[target_idx].kind,
+                    candidate_score,
+                    active = %self.active_transport,
+                    active_score,
+                    "Supervisor: skipping probe (candidate scores no better than active)",
+                );
+                continue;
+            }
+
             let kind = self.endpoints[target_idx].kind;
             let address = self.endpoints[target_idx].address.clone();
 
@@ -491,49 +526,68 @@ async fn probe_transport(
 
     let (intercept_tx, auth_rx) = spawn_auth_intercept(server_tx);
 
-    let connect_result = match kind {
-        TransportKind::Quic => {
-            let (host, port) = parse_host_port(address)
-                .ok_or_else(|| format!("cannot parse QUIC address: {address}"))?;
-            crate::connect::connect(
-                host,
-                port,
-                token.to_string(),
-                accept_invalid_certs,
-                intercept_tx,
-                capabilities.clone(),
-                Some(connection_id),
-            )
-            .await
+    let token = token.to_string();
+    let address = address.to_string();
+    let capabilities = capabilities.clone();
+    let connect_fut = async move {
+        match kind {
+            TransportKind::Quic => {
+                let (host, port) = parse_host_port(&address)
+                    .ok_or_else(|| format!("cannot parse QUIC address: {address}"))?;
+                Ok(crate::connect::connect(
+                    host,
+                    port,
+                    token,
+                    accept_invalid_certs,
+                    intercept_tx,
+                    capabilities,
+                    Some(connection_id),
+                )
+                .await)
+            }
+            TransportKind::TcpTls => {
+                let (host, port) = parse_host_port(&address)
+                    .ok_or_else(|| format!("cannot parse TCP+TLS address: {address}"))?;
+                let tofu_key = format!("{host}:{port}");
+                Ok(crate::tcp_connect::connect_tcp_tls(
+                    host,
+                    port,
+                    tofu_key,
+                    token,
+                    intercept_tx,
+                    capabilities,
+                    Some(connection_id),
+                    accept_invalid_certs,
+                )
+                .await)
+            }
+            TransportKind::Uds => {
+                // For UDS the address is the socket path.
+                Ok(crate::tcp_connect::connect_uds(
+                    std::path::Path::new(&address),
+                    token,
+                    intercept_tx,
+                    capabilities,
+                    Some(connection_id),
+                )
+                .await)
+            }
+            TransportKind::Tcp => Err("plain TCP is not supported; use TCP+TLS".to_string()),
         }
-        TransportKind::TcpTls => {
-            let (host, port) = parse_host_port(address)
-                .ok_or_else(|| format!("cannot parse TCP+TLS address: {address}"))?;
-            let tofu_key = format!("{host}:{port}");
-            crate::tcp_connect::connect_tcp_tls(
-                host,
-                port,
-                tofu_key,
-                token.to_string(),
-                intercept_tx,
-                capabilities.clone(),
-                Some(connection_id),
-                accept_invalid_certs,
-            )
-            .await
+    };
+
+    // Cap the connect call so a stuck handshake (e.g. UDP filtered between
+    // client and server) surfaces as a probe failure instead of stalling
+    // the supervisor for quinn's idle-timeout window.
+    let connect_result = match timeout(PROBE_CONNECT_TIMEOUT, connect_fut).await {
+        Ok(Ok(r)) => r,
+        Ok(Err(e)) => return Err(e),
+        Err(_) => {
+            return Err(format!(
+                "connect did not complete within {}s",
+                PROBE_CONNECT_TIMEOUT.as_secs()
+            ));
         }
-        TransportKind::Uds => {
-            // For UDS the address is the socket path.
-            crate::tcp_connect::connect_uds(
-                std::path::Path::new(address),
-                token.to_string(),
-                intercept_tx,
-                capabilities.clone(),
-                Some(connection_id),
-            )
-            .await
-        }
-        TransportKind::Tcp => return Err("plain TCP is not supported; use TCP+TLS".into()),
     };
 
     let sender = match connect_result {

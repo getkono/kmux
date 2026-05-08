@@ -56,6 +56,12 @@ pub struct SharedClientState {
     pub transport: TransportKind,
     /// Live per-connection byte/activity counters shared with the I/O tasks.
     pub metrics: Arc<ConnectionMetrics>,
+    /// When this connection resumes an existing `conn_id` (channel switch in
+    /// progress), holds the *previous* transport that was attached to that
+    /// `conn_id`. Consumed when `ChannelReady` arrives so the server can send
+    /// `ChannelSwitched { old_transport }` with the genuinely-old name. `None`
+    /// for fresh connections that aren't a channel switch.
+    pub pending_swap_from: Option<TransportKind>,
 }
 
 impl SharedClientState {
@@ -77,6 +83,7 @@ impl SharedClientState {
             conn_span,
             transport,
             metrics,
+            pending_swap_from: None,
         }
     }
 

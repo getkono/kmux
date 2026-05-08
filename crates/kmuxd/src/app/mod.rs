@@ -345,19 +345,33 @@ impl ServerApp {
     /// across transport switches.  `new_metrics` is discarded in that case.
     /// If `None`, a fresh `ClientId` and `ConnectionId` are assigned and
     /// `new_metrics` is stored.
+    /// Register a freshly-connected client or resume an existing connection
+    /// after a channel switch.
+    ///
+    /// Returns `(client_id, conn_id, metrics, previous_transport)`. The last
+    /// element is `Some(old)` when a channel switch is in progress (the
+    /// caller must remember this and send it back in `ChannelSwitched`
+    /// once the new channel signals `ChannelReady`); `None` when this is
+    /// the first connection for the conn_id.
     pub async fn register_client(
         &self,
         transport: TransportKind,
         new_metrics: Arc<ConnectionMetrics>,
         incoming_conn_id: Option<ConnectionId>,
-    ) -> (ClientId, ConnectionId, Arc<ConnectionMetrics>) {
+    ) -> (
+        ClientId,
+        ConnectionId,
+        Arc<ConnectionMetrics>,
+        Option<TransportKind>,
+    ) {
         if let Some(conn_id) = incoming_conn_id {
             // Resume an existing connection (channel switch in progress).
             let mut conns = self.connections.write().await;
             if let Some(state) = conns.get_mut(&conn_id.0) {
+                let previous = state.transport;
                 state.transport = transport;
                 let metrics = Arc::clone(&state.metrics);
-                return (state.client_id, conn_id, metrics);
+                return (state.client_id, conn_id, metrics, Some(previous));
             }
             // Unknown ConnectionId — treat as a fresh connection.
         }
@@ -376,24 +390,7 @@ impl ServerApp {
             conns.len()
         };
         let _ = self.conn_count_tx.send(count);
-        (client_id, conn_id, new_metrics)
-    }
-
-    /// Mark a channel switch as complete. Called when the new channel sends
-    /// `ChannelReady`. Returns the old transport name for the `ChannelSwitched`
-    /// response, or `None` if the connection ID is unknown.
-    pub async fn complete_channel_switch(
-        &self,
-        conn_id: ConnectionId,
-        _client_id: ClientId,
-    ) -> Option<String> {
-        let mut conns = self.connections.write().await;
-        if let Some(state) = conns.get_mut(&conn_id.0) {
-            let old_name = state.transport.to_string();
-            state.transport = TransportKind::Quic;
-            return Some(old_name);
-        }
-        None
+        (client_id, conn_id, new_metrics, None)
     }
 
     /// Remove the connection entry when a client disconnects.
@@ -532,14 +529,14 @@ mod tests {
         assert_eq!(*rx.borrow(), 0);
 
         let m1 = Arc::new(ConnectionMetrics::new());
-        let (_, c1, _) = app
+        let (_, c1, _, _) = app
             .register_client(TransportKind::Uds, Arc::clone(&m1), None)
             .await;
         rx.changed().await.unwrap();
         assert_eq!(*rx.borrow(), 1);
 
         let m2 = Arc::new(ConnectionMetrics::new());
-        let (_, c2, _) = app.register_client(TransportKind::Tcp, m2, None).await;
+        let (_, c2, _, _) = app.register_client(TransportKind::Tcp, m2, None).await;
         rx.changed().await.unwrap();
         assert_eq!(*rx.borrow(), 2);
 
@@ -558,50 +555,59 @@ mod tests {
         let metrics = Arc::new(ConnectionMetrics::new());
         metrics.bytes_in.store(42, Ordering::Relaxed);
 
-        let (client_id, conn_id, returned_metrics) = app
+        let (client_id, conn_id, returned_metrics, previous) = app
             .register_client(TransportKind::Uds, Arc::clone(&metrics), None)
             .await;
 
         // IDs start at 1.
         assert_eq!(client_id.0, 1);
         assert_eq!(conn_id.0, 1);
+        // Fresh registration carries no previous transport.
+        assert!(previous.is_none());
         // The same Arc is returned, so counter mutations are visible.
         returned_metrics.bytes_in.fetch_add(8, Ordering::Relaxed);
         assert_eq!(metrics.bytes_in.load(Ordering::Relaxed), 50);
     }
 
     #[tokio::test]
-    async fn channel_switch_reuses_existing_metrics() {
+    async fn channel_switch_reuses_existing_metrics_and_reports_previous_transport() {
         let app = ServerApp::new("tok".to_string());
         let original_metrics = Arc::new(ConnectionMetrics::new());
         original_metrics.bytes_in.store(100, Ordering::Relaxed);
 
-        let (_, conn_id, _) = app
+        let (_, conn_id, _, first_previous) = app
             .register_client(TransportKind::Tcp, Arc::clone(&original_metrics), None)
             .await;
+        // Fresh registration has no previous transport.
+        assert!(first_previous.is_none());
 
         // Simulate a channel switch: re-register with a new metrics Arc.
         let new_metrics = Arc::new(ConnectionMetrics::new());
-        let (_, same_conn_id, reused_metrics) = app
+        let (_, same_conn_id, reused_metrics, swap_previous) = app
             .register_client(TransportKind::Quic, Arc::clone(&new_metrics), Some(conn_id))
             .await;
 
         assert_eq!(same_conn_id, conn_id);
         // Should return the *original* metrics, not the new one.
         assert_eq!(reused_metrics.bytes_in.load(Ordering::Relaxed), 100);
+        // The genuinely-old transport must come back so the caller can
+        // emit `ChannelSwitched { old_transport: Tcp }` later. Previously
+        // this was silently overwritten with `Quic` regardless of the
+        // actual prior transport.
+        assert_eq!(swap_previous, Some(TransportKind::Tcp));
 
-        // complete_channel_switch should report the old transport and flip to Quic.
-        let client_id = kmux_protocol::messages::ClientId(1); // placeholder
-        let old = app.complete_channel_switch(conn_id, client_id).await;
-        // Transport is now Quic after channel switch.
-        assert_eq!(old, Some("QUIC".to_string()));
+        // The recorded transport for the connection now reflects the new
+        // channel.
+        let snap = app.snapshot_sessions_with_connections().await;
+        assert_eq!(snap.unattached.len(), 1);
+        assert_eq!(snap.unattached[0].transport, "QUIC");
     }
 
     #[tokio::test]
     async fn unregister_removes_connection() {
         let app = ServerApp::new("tok".to_string());
         let metrics = Arc::new(ConnectionMetrics::new());
-        let (_, conn_id, _) = app.register_client(TransportKind::Uds, metrics, None).await;
+        let (_, conn_id, _, _) = app.register_client(TransportKind::Uds, metrics, None).await;
         app.unregister_client(conn_id).await;
 
         // After unregister, snapshot_sessions_with_connections returns no unattached.
