@@ -359,6 +359,7 @@ pub(super) fn mode_color(mode: &Mode, theme: &Theme) -> Color {
         Mode::DirectoryPicker => theme.accent,
         Mode::Connecting { .. } => theme.yellow,
         Mode::Disconnected { .. } => theme.red,
+        Mode::Command(_) => theme.accent,
     }
 }
 

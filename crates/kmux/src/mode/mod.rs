@@ -42,6 +42,25 @@ pub enum Mode {
     /// Connection dropped. Input to panes is frozen; the overlay asks the
     /// user to confirm a reconnect.
     Disconnected { reason: String },
+    /// Command palette: type `/<command> [args]` with autocomplete hints.
+    /// Activated by Ctrl+G then Ctrl+/ (or `/`).
+    Command(CommandState),
+}
+
+/// Editing state for `Mode::Command`. The leading `/` is rendered as static
+/// chrome by the overlay and is **not** stored in `buffer`.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CommandState {
+    /// Raw command text, without the leading `/`.
+    pub buffer: String,
+    /// Byte offset of the caret within `buffer`.
+    pub cursor: usize,
+    /// Index of the highlighted hint in the dropdown.
+    pub selected: usize,
+    /// `Some(i)` when the buffer was recalled from history; `None` while
+    /// freely editing. Lets ↑/↓ scroll history without losing the in-progress
+    /// buffer if the user changes their mind.
+    pub history_pos: Option<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -132,6 +151,20 @@ pub enum Action {
     // Cancel an in-progress background bootstrap.
     CancelBootstrap,
 
+    // Command palette editing
+    CommandChar(char),
+    CommandBackspace,
+    CommandLeft,
+    CommandRight,
+    CommandHome,
+    CommandEnd,
+    CommandHintUp,
+    CommandHintDown,
+    CommandComplete,
+    CommandSubmit,
+    CommandClearLine,
+    CommandDeleteWordBack,
+
     // Quit the application
     Quit,
 
@@ -168,5 +201,6 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::DirectoryPicker => resolve_dir_picker(key),
         Mode::Connecting { .. } => resolve_connecting(key, mods),
         Mode::Disconnected { .. } => resolve_disconnected(key),
+        Mode::Command(_) => resolve_command(key, mods),
     }
 }

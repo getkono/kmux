@@ -213,7 +213,7 @@ impl App {
     }
 
     /// Query the current terminal size, accounting for UI chrome.
-    pub(super) fn current_term_size() -> TermSize {
+    pub(crate) fn current_term_size() -> TermSize {
         let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         Self::compute_pane_size(rows, cols)
     }

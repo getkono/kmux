@@ -1,5 +1,6 @@
 mod app;
 mod cli;
+mod cmd;
 mod config;
 mod host_caps;
 mod key_convert;
