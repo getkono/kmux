@@ -19,6 +19,7 @@ use kmux_client::pipeline::{
 };
 use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
 use kmux_protocol::messages::{ClientMessage, ServerMessage};
+use kmux_protocol::transport::bootstrap::EndpointAdvert;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -121,7 +122,7 @@ async fn run_supervisor_phase(
     mut srv_rx: mpsc::UnboundedReceiver<ServerMessage>,
     observer: &ConsoleObserver,
 ) -> anyhow::Result<()> {
-    let endpoints = match &outcome.ssh_context {
+    let mut endpoints = match &outcome.ssh_context {
         Some(ctx) => ctx.endpoints.clone(),
         None => {
             observer.line(
@@ -135,6 +136,22 @@ async fn run_supervisor_phase(
             Vec::new()
         }
     };
+
+    // Mirror the production launch_ssh_supervisor: include the active
+    // transport in the endpoint set so the scoreboard log shows both
+    // transports being compared, not just the upgrade candidate.
+    if !endpoints.is_empty() {
+        let active_address = format!("{}:{}", outcome.host, outcome.port);
+        if !endpoints
+            .iter()
+            .any(|e| e.kind == outcome.transport && e.address == active_address)
+        {
+            endpoints.push(EndpointAdvert {
+                kind: outcome.transport,
+                address: active_address,
+            });
+        }
+    }
 
     if endpoints.is_empty() {
         let _ = tokio::time::timeout(TEST_DURATION, async {

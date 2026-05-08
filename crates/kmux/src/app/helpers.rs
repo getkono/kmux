@@ -3,6 +3,7 @@ use kmux_client::session_manager::SessionEvent;
 use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
 use kmux_client::transport::TransportKind;
 use kmux_protocol::messages::{ServerMessage, SessionEntry, TermSize};
+use kmux_protocol::transport::bootstrap::EndpointAdvert;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -162,9 +163,27 @@ impl App {
         let (rtt_tx, rtt_rx) = mpsc::unbounded_channel();
         self.mgr.set_rtt_sink(rtt_tx);
 
+        // Compose the supervisor's endpoint set: every probable transport
+        // including the currently-active one. Without the active TCP+TLS
+        // entry the scorer scoreboard would only show the QUIC candidate,
+        // which is misleading (the user can't tell whether QUIC's score
+        // actually beats TCP+TLS's) and leaves no fallback registered if
+        // QUIC ever becomes the active and then dies.
+        let mut endpoints = ctx.endpoints;
+        let active_address = format!("{}:{}", self.mgr.host(), self.mgr.port());
+        if !endpoints
+            .iter()
+            .any(|e| e.kind == TransportKind::TcpTls && e.address == active_address)
+        {
+            endpoints.push(EndpointAdvert {
+                kind: TransportKind::TcpTls,
+                address: active_address,
+            });
+        }
+
         tokio::spawn(async move {
             let supervisor = TransportSupervisor::new(SupervisorParams {
-                endpoints: ctx.endpoints,
+                endpoints,
                 connection_id: conn_id,
                 token,
                 capabilities,

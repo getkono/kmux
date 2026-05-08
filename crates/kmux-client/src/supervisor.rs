@@ -24,8 +24,9 @@ use kmux_protocol::messages::{
     ClientCapabilities, ClientMessage, ConnectionId, ServerMessage, TransportKind,
 };
 use kmux_protocol::transport::bootstrap::EndpointAdvert;
-use tokio::sync::mpsc;
-use tracing::{debug, info};
+use tokio::sync::{mpsc, oneshot};
+use tokio::time::timeout;
+use tracing::{debug, info, warn};
 
 // ─── Scoring constants ────────────────────────────────────────────────────────
 
@@ -39,6 +40,13 @@ const OSCILLATION_PENALTY: i32 = 200;
 const FAILURE_WINDOW: Duration = Duration::from_secs(300); // 5 min
 const OSCILLATION_WINDOW: Duration = Duration::from_secs(60); // 60 s
 pub const PROBE_INTERVAL: Duration = Duration::from_secs(30);
+/// How long a probe waits for `AuthResult` after the underlying connect call
+/// returns. The probe is considered successful only after the server has
+/// affirmatively authenticated on the new transport — opening the stream is
+/// not enough (a misconfigured server, expired token, or auth mismatch
+/// would otherwise look like a successful upgrade and silently disconnect
+/// the live channel when the rejected `AuthResult` arrives).
+const PROBE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ─── EndpointHealth ──────────────────────────────────────────────────────────
 
@@ -163,7 +171,15 @@ impl TransportScorer {
     /// Score all endpoints and return `(score, index)` pairs sorted best-first.
     ///
     /// Logs the full scoreboard at `info` for transparency (no hidden states).
-    pub fn rank(&self, endpoints: &[EndpointHealth]) -> Vec<(i32, usize)> {
+    /// `active` is the transport currently carrying traffic; it is included
+    /// in the log so readers can tell apart "scorer's preference" from
+    /// "what's actually in use right now". The two only converge after a
+    /// successful probe + upgrade.
+    pub fn rank(
+        &self,
+        endpoints: &[EndpointHealth],
+        active: TransportKind,
+    ) -> Vec<(i32, usize)> {
         let mut scored: Vec<(i32, usize)> = endpoints
             .iter()
             .enumerate()
@@ -171,17 +187,19 @@ impl TransportScorer {
             .collect();
         scored.sort_by(|a, b| b.0.cmp(&a.0)); // descending
 
+        let top_ranked = scored
+            .first()
+            .map(|(_, i)| endpoints[*i].kind.to_string())
+            .unwrap_or_default();
         info!(
             target: "kmux::transport::scorer",
             scores = ?scored
                 .iter()
                 .map(|(s, i)| format!("{}:{s}", endpoints[*i].kind))
                 .collect::<Vec<_>>(),
-            chosen = %scored
-                .first()
-                .map(|(_, i)| endpoints[*i].kind.to_string())
-                .unwrap_or_default(),
-            "scorer decision"
+            top_ranked = %top_ranked,
+            active = %active,
+            "scorer ranking (top_ranked is the candidate to probe; active is the live transport)"
         );
 
         scored
@@ -315,7 +333,7 @@ impl TransportSupervisor {
                 return;
             }
 
-            let ranked = self.scorer.rank(&self.endpoints);
+            let ranked = self.scorer.rank(&self.endpoints, self.active_transport);
 
             // Find the best non-active endpoint to probe.
             let probe_idx = ranked
@@ -378,8 +396,32 @@ impl TransportSupervisor {
                     tokio::time::sleep(PROBE_INTERVAL * 2).await;
                 }
                 Err(e) => {
-                    debug!(transport = %kind, error = %e, "Supervisor: probe failed");
+                    let prior_failures = self.endpoints[target_idx].failure_count;
                     self.endpoints[target_idx].record_failure();
+                    // Surface the *first* failure of a fresh streak at warn so
+                    // users can see why an upgrade isn't happening, without
+                    // spamming the log every 30s while the condition persists.
+                    // After 5 retries we re-warn so a user who tails the log
+                    // mid-session still sees it.
+                    let new_count = self.endpoints[target_idx].failure_count;
+                    if prior_failures == 0 || new_count.is_multiple_of(5) {
+                        warn!(
+                            transport = %kind,
+                            address = %address,
+                            error = %e,
+                            attempt = new_count,
+                            "Supervisor: transport upgrade probe failed; staying on {}",
+                            self.active_transport,
+                        );
+                    } else {
+                        debug!(
+                            transport = %kind,
+                            error = %e,
+                            attempt = new_count,
+                            "Supervisor: probe failed (suppressed; will warn again at attempt {})",
+                            new_count.next_multiple_of(5),
+                        );
+                    }
                 }
             }
         }
@@ -388,7 +430,52 @@ impl TransportSupervisor {
 
 // ─── probe_transport ─────────────────────────────────────────────────────────
 
-/// Attempt a connection on `kind` using the given address and return the sender.
+/// Spawn a forwarding task that captures the first `AuthResult` arriving on
+/// the new transport's `server_tx`, then forwards every server message
+/// (including the captured `AuthResult`) to `outer_tx`.
+///
+/// Returns the wrapped sender to hand to the connect call and a oneshot
+/// receiver that resolves with the auth outcome (`Ok` on success,
+/// `Err(reason)` on auth failure). The forwarder exits when the underlying
+/// transport's reader task drops its sender.
+fn spawn_auth_intercept(
+    outer_tx: mpsc::UnboundedSender<ServerMessage>,
+) -> (
+    mpsc::UnboundedSender<ServerMessage>,
+    oneshot::Receiver<Result<(), String>>,
+) {
+    let (intercept_tx, mut intercept_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let (auth_tx, auth_rx) = oneshot::channel::<Result<(), String>>();
+
+    tokio::spawn(async move {
+        let mut auth_tx = Some(auth_tx);
+        while let Some(msg) = intercept_rx.recv().await {
+            if let (Some(_), ServerMessage::AuthResult { .. }) = (&auth_tx, &msg) {
+                let captured = match &msg {
+                    ServerMessage::AuthResult { success: true, .. } => Ok(()),
+                    ServerMessage::AuthResult {
+                        success: false,
+                        reason,
+                        ..
+                    } => Err(reason.clone().unwrap_or_else(|| "rejected".into())),
+                    _ => unreachable!("matched AuthResult above"),
+                };
+                if let Some(tx) = auth_tx.take() {
+                    let _ = tx.send(captured);
+                }
+            }
+            if outer_tx.send(msg).is_err() {
+                break;
+            }
+        }
+    });
+
+    (intercept_tx, auth_rx)
+}
+
+/// Attempt a connection on `kind` using the given address and return the
+/// sender. The probe is only considered successful after `AuthResult { success: true }`
+/// is observed on the new transport — opening the stream alone is not enough.
 ///
 /// `address` is `"host:port"` for QUIC/TCP+TLS or an absolute path for UDS.
 async fn probe_transport(
@@ -402,61 +489,78 @@ async fn probe_transport(
 ) -> Result<mpsc::UnboundedSender<ClientMessage>, String> {
     use crate::connect::ConnectResult;
 
-    match kind {
+    let (intercept_tx, auth_rx) = spawn_auth_intercept(server_tx);
+
+    let connect_result = match kind {
         TransportKind::Quic => {
             let (host, port) = parse_host_port(address)
                 .ok_or_else(|| format!("cannot parse QUIC address: {address}"))?;
-            match crate::connect::connect(
+            crate::connect::connect(
                 host,
                 port,
                 token.to_string(),
                 accept_invalid_certs,
-                server_tx,
+                intercept_tx,
                 capabilities.clone(),
                 Some(connection_id),
             )
             .await
-            {
-                ConnectResult::Connected(s) => Ok(s),
-                ConnectResult::Failed(e) => Err(e),
-            }
         }
         TransportKind::TcpTls => {
             let (host, port) = parse_host_port(address)
                 .ok_or_else(|| format!("cannot parse TCP+TLS address: {address}"))?;
             let tofu_key = format!("{host}:{port}");
-            match crate::tcp_connect::connect_tcp_tls(
+            crate::tcp_connect::connect_tcp_tls(
                 host,
                 port,
                 tofu_key,
                 token.to_string(),
-                server_tx,
+                intercept_tx,
                 capabilities.clone(),
                 Some(connection_id),
                 accept_invalid_certs,
             )
             .await
-            {
-                ConnectResult::Connected(s) => Ok(s),
-                ConnectResult::Failed(e) => Err(e),
-            }
         }
         TransportKind::Uds => {
             // For UDS the address is the socket path.
-            match crate::tcp_connect::connect_uds(
+            crate::tcp_connect::connect_uds(
                 std::path::Path::new(address),
                 token.to_string(),
-                server_tx,
+                intercept_tx,
                 capabilities.clone(),
                 Some(connection_id),
             )
             .await
-            {
-                ConnectResult::Connected(s) => Ok(s),
-                ConnectResult::Failed(e) => Err(e),
-            }
         }
-        TransportKind::Tcp => Err("plain TCP is not supported; use TCP+TLS".into()),
+        TransportKind::Tcp => return Err("plain TCP is not supported; use TCP+TLS".into()),
+    };
+
+    let sender = match connect_result {
+        ConnectResult::Connected(s) => s,
+        ConnectResult::Failed(e) => return Err(e),
+    };
+
+    // Wait for the server to confirm authentication on the new channel.
+    // Dropping `sender` on Err closes the new transport's writer task, which
+    // in turn lets the reader task exit cleanly so no resources leak.
+    match timeout(PROBE_AUTH_TIMEOUT, auth_rx).await {
+        Ok(Ok(Ok(()))) => Ok(sender),
+        Ok(Ok(Err(reason))) => {
+            drop(sender);
+            Err(format!("auth rejected: {reason}"))
+        }
+        Ok(Err(_)) => {
+            drop(sender);
+            Err("auth forwarder dropped before AuthResult".into())
+        }
+        Err(_) => {
+            drop(sender);
+            Err(format!(
+                "no AuthResult within {}s",
+                PROBE_AUTH_TIMEOUT.as_secs()
+            ))
+        }
     }
 }
 
@@ -574,7 +678,7 @@ mod tests {
             make_health(TransportKind::Quic),
             make_health(TransportKind::Uds),
         ];
-        let ranked = scorer.rank(&endpoints);
+        let ranked = scorer.rank(&endpoints, TransportKind::TcpTls);
         // UDS should be first for local target.
         assert_eq!(endpoints[ranked[0].1].kind, TransportKind::Uds);
     }
@@ -680,5 +784,82 @@ mod tests {
             .unwrap();
         assert_eq!(quic.rtt_ewma_ms, Some(42.0));
         assert!(tcp.rtt_ewma_ms.is_none());
+    }
+
+    // ── spawn_auth_intercept ───────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn auth_intercept_signals_success_and_forwards_msg() {
+        let (outer_tx, mut outer_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (intercept_tx, auth_rx) = spawn_auth_intercept(outer_tx);
+
+        intercept_tx
+            .send(ServerMessage::AuthResult {
+                success: true,
+                reason: None,
+                client_id: None,
+                server_version: None,
+                connection_id: None,
+            })
+            .unwrap();
+
+        // Auth oneshot resolves Ok.
+        assert!(matches!(auth_rx.await, Ok(Ok(()))));
+        // The AuthResult is also forwarded to the outer channel so the
+        // SessionManager continues to see every server message.
+        assert!(matches!(
+            outer_rx.recv().await,
+            Some(ServerMessage::AuthResult { success: true, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn auth_intercept_signals_failure_with_reason() {
+        let (outer_tx, _outer_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (intercept_tx, auth_rx) = spawn_auth_intercept(outer_tx);
+
+        intercept_tx
+            .send(ServerMessage::AuthResult {
+                success: false,
+                reason: Some("bad token".into()),
+                client_id: None,
+                server_version: None,
+                connection_id: None,
+            })
+            .unwrap();
+
+        match auth_rx.await {
+            Ok(Err(reason)) => assert_eq!(reason, "bad token"),
+            other => panic!("expected Err(bad token), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn auth_intercept_resolves_only_first_auth_result() {
+        // The supervisor's probe contract: only the *first* AuthResult counts.
+        // Any subsequent server message (including a stray second AuthResult)
+        // must keep being forwarded but must not re-fire the auth oneshot.
+        let (outer_tx, mut outer_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (intercept_tx, auth_rx) = spawn_auth_intercept(outer_tx);
+
+        intercept_tx
+            .send(ServerMessage::AuthResult {
+                success: true,
+                reason: None,
+                client_id: None,
+                server_version: None,
+                connection_id: None,
+            })
+            .unwrap();
+        assert!(matches!(auth_rx.await, Ok(Ok(()))));
+
+        // A subsequent non-AuthResult message must still be forwarded.
+        intercept_tx.send(ServerMessage::Ping { seq: 1 }).unwrap();
+        // Drain the first AuthResult that was forwarded.
+        outer_rx.recv().await.unwrap();
+        assert!(matches!(
+            outer_rx.recv().await,
+            Some(ServerMessage::Ping { seq: 1 })
+        ));
     }
 }
