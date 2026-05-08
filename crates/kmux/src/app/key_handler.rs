@@ -261,14 +261,18 @@ impl App {
             Action::CopySelection => {
                 if let Some(text) = self.mgr.active_grid().and_then(|g| g.selected_text()) {
                     tokio::task::spawn_blocking(move || {
-                        let _ = cli_clipboard::set_contents(text);
+                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                            let _ = cb.set_text(text);
+                        }
                     });
                 }
             }
             Action::Paste => {
                 if let Some(tx) = self.paste_tx.clone() {
                     tokio::task::spawn_blocking(move || {
-                        if let Ok(text) = cli_clipboard::get_contents() {
+                        if let Ok(mut cb) = arboard::Clipboard::new()
+                            && let Ok(text) = cb.get_text()
+                        {
                             let _ = tx.send(text);
                         }
                     });
