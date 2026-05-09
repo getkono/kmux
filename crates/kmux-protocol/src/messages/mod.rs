@@ -1,4 +1,5 @@
 pub mod category;
+pub mod key;
 pub mod session;
 pub mod vt;
 
@@ -8,6 +9,7 @@ mod types;
 
 pub use category::MessageCategory;
 pub use client::*;
+pub use key::*;
 pub use server::*;
 pub use session::*;
 pub use types::*;

@@ -171,6 +171,12 @@ impl<B: TerminalBackend> DiffEngine<B> {
         self.backend.modes()
     }
 
+    /// Encode a structured key event into terminal escape bytes using the
+    /// backend's live mode state (DECCKM, kitty kbd flags, modifyOtherKeys, …).
+    pub fn encode_key_event(&self, event: &kmux_protocol::messages::KeyEvent) -> Vec<u8> {
+        self.backend.encode_key_event(event)
+    }
+
     /// Take a full grid snapshot (for initial attach or post-resize).
     ///
     /// Includes a tail slice of the mirror (up to [`SNAPSHOT_TAIL_LINES`])

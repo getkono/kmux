@@ -24,7 +24,7 @@ const Action = gvt.StreamAction;
 // ABI constants
 // -----------------------------------------------------------------------------
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
 // Result codes. Must match the values `kmux-ghostty-sys::error` expects.
 const OK: i32 = 0;
@@ -33,6 +33,15 @@ const ERR_INVALID_SIZE: i32 = -2;
 const ERR_FEED: i32 = -3;
 const ERR_RESIZE: i32 = -4;
 const ERR_BAD_BUFFER: i32 = -5;
+
+// Key encoding result codes. Distinct namespace so the existing wrapper
+// errors stay backward-compatible.
+const ENC_OK: i32 = 0;
+/// Output buffer too small; `out_written` contains the required size.
+const ENC_OUT_OF_MEMORY: i32 = -10;
+/// `key` ordinal does not map to any `gvt.input.Key` value, or `action`
+/// ordinal is not 0/1/2.
+const ENC_INVALID_ENUM: i32 = -11;
 
 // Attr bits. Keep in lock-step with `CellAttrs::*` in `kmux-protocol`.
 const ATTR_BOLD: u16 = 1 << 0;
@@ -100,6 +109,87 @@ const KmuxCursor = extern struct {
 const KmuxModes = extern struct {
     bits: u16,
 };
+
+/// C-ABI struct mirroring `gvt.input.KeyEncodeOptions`. All booleans are
+/// represented as `u8` (0 = false, non-zero = true) so the layout is
+/// compiler-stable across Rust/Zig.  `kitty_flags` is the packed bitfield
+/// (`KittyFlags` is `packed struct(u5)`); top three bits are ignored.
+const KmuxKeyEncodeOptions = extern struct {
+    cursor_key_application: u8,
+    keypad_key_application: u8,
+    ignore_keypad_with_numlock: u8,
+    alt_esc_prefix: u8,
+    modify_other_keys_state_2: u8,
+    kitty_flags: u8,
+    _pad: [2]u8,
+};
+
+/// Stable kmux-owned key ordinal.  Translates to `gvt.input.Key` via the
+/// `kmuxKeyToGvt` switch below; new entries here require a switch entry.
+///
+/// We do NOT directly expose `gvt.input.Key`'s ordinals over FFI because
+/// that enum's order is owned by Ghostty and would silently change kmux's
+/// wire ABI any time upstream renumbered.  By owning the ordinals here we
+/// can re-pin the mapping with a Zig compile error rather than a crash.
+const KmuxKey = enum(u16) {
+    unidentified = 0,
+    // Letters
+    a, b, c, d, e, f, g, h, i, j, k, l, m, n, o, p, q, r, s, t, u, v, w, x, y, z,
+    // Digits
+    digit_0, digit_1, digit_2, digit_3, digit_4, digit_5, digit_6, digit_7, digit_8, digit_9,
+    // Punctuation that has its own physical key
+    backquote, backslash, bracket_left, bracket_right, comma,
+    equal, minus, period, quote, semicolon, slash,
+    // Functional keys
+    enter, tab, space, backspace, escape,
+    // Editing keys
+    insert, delete, home, end, page_up, page_down,
+    // Arrows
+    arrow_up, arrow_down, arrow_left, arrow_right,
+    // Function keys
+    f1, f2, f3, f4, f5, f6, f7, f8, f9, f10, f11, f12,
+    // Modifier keys (rarely sent — the Kitty protocol reports them when
+    // `report_all` is on; harmless otherwise).
+    shift_left, shift_right,
+    control_left, control_right,
+    alt_left, alt_right,
+    meta_left, meta_right,
+    caps_lock,
+};
+
+fn kmuxKeyToGvt(k: KmuxKey) gvt.input.Key {
+    return switch (k) {
+        .unidentified => .unidentified,
+        .a => .key_a, .b => .key_b, .c => .key_c, .d => .key_d, .e => .key_e,
+        .f => .key_f, .g => .key_g, .h => .key_h, .i => .key_i, .j => .key_j,
+        .k => .key_k, .l => .key_l, .m => .key_m, .n => .key_n, .o => .key_o,
+        .p => .key_p, .q => .key_q, .r => .key_r, .s => .key_s, .t => .key_t,
+        .u => .key_u, .v => .key_v, .w => .key_w, .x => .key_x, .y => .key_y, .z => .key_z,
+        .digit_0 => .digit_0, .digit_1 => .digit_1, .digit_2 => .digit_2,
+        .digit_3 => .digit_3, .digit_4 => .digit_4, .digit_5 => .digit_5,
+        .digit_6 => .digit_6, .digit_7 => .digit_7, .digit_8 => .digit_8,
+        .digit_9 => .digit_9,
+        .backquote => .backquote, .backslash => .backslash,
+        .bracket_left => .bracket_left, .bracket_right => .bracket_right,
+        .comma => .comma, .equal => .equal, .minus => .minus,
+        .period => .period, .quote => .quote, .semicolon => .semicolon,
+        .slash => .slash,
+        .enter => .enter, .tab => .tab, .space => .space,
+        .backspace => .backspace, .escape => .escape,
+        .insert => .insert, .delete => .delete, .home => .home, .end => .end,
+        .page_up => .page_up, .page_down => .page_down,
+        .arrow_up => .arrow_up, .arrow_down => .arrow_down,
+        .arrow_left => .arrow_left, .arrow_right => .arrow_right,
+        .f1 => .f1, .f2 => .f2, .f3 => .f3, .f4 => .f4, .f5 => .f5,
+        .f6 => .f6, .f7 => .f7, .f8 => .f8, .f9 => .f9, .f10 => .f10,
+        .f11 => .f11, .f12 => .f12,
+        .shift_left => .shift_left, .shift_right => .shift_right,
+        .control_left => .control_left, .control_right => .control_right,
+        .alt_left => .alt_left, .alt_right => .alt_right,
+        .meta_left => .meta_left, .meta_right => .meta_right,
+        .caps_lock => .caps_lock,
+    };
+}
 
 const KmuxEventSink = extern struct {
     user: ?*anyopaque,
@@ -633,11 +723,218 @@ export fn kmux_ghostty_read_history(
 }
 
 // -----------------------------------------------------------------------------
+// Key encoding
+// -----------------------------------------------------------------------------
+
+/// Read the kitty keyboard protocol flags currently active on the inner
+/// terminal (the `screens.active.kitty_keyboard.current()` value).  Returns
+/// the packed `KittyFlags` u5 widened to u8 so it can travel as a stable
+/// scalar across FFI.  Bits: 0=disambiguate, 1=report_events,
+/// 2=report_alternates, 3=report_all, 4=report_associated.
+export fn kmux_ghostty_kitty_flags(wrapper: *const Wrapper) callconv(.c) u8 {
+    const flags = wrapper.terminal.screens.active.kitty_keyboard.current();
+    return @intCast(flags.int());
+}
+
+/// Encode a single key event into terminal escape bytes using Ghostty's
+/// `key_encode.encode`. Self-contained — the caller passes raw key/mods/
+/// utf8/options as primitives and gets bytes back, no opaque encoder or
+/// event handles needed.
+///
+/// `key`: ordinal of `KmuxKey` (kmux-stable enum, translated internally).
+/// `action`: 0=release, 1=press, 2=repeat (`gvt.input.KeyAction`).
+/// `mods`: packed `gvt.input.KeyMods` bits — bit 0=shift, 1=ctrl, 2=alt,
+///   3=super, 4=caps_lock, 5=num_lock.
+/// `utf8`: layout-dependent text the keystroke would produce when typed
+///   in a plain text field. May be empty.
+/// `unshifted_codepoint`: codepoint when no shift is applied (used by
+///   kitty alternates). 0 if unknown.
+/// `out_buf` / `out_buf_len`: caller's output buffer.
+/// `out_written`: bytes written on success, or required size on
+///   `ENC_OUT_OF_MEMORY`.
+///
+/// Returns `ENC_OK`, `ENC_OUT_OF_MEMORY`, or `ENC_INVALID_ENUM`.
+export fn kmux_ghostty_encode_key(
+    opts_in: *const KmuxKeyEncodeOptions,
+    key: u16,
+    mods: u16,
+    action: u8,
+    utf8_ptr: ?[*]const u8,
+    utf8_len: usize,
+    unshifted_codepoint: u32,
+    out_buf: ?[*]u8,
+    out_buf_len: usize,
+    out_written: *usize,
+) callconv(.c) i32 {
+    out_written.* = 0;
+
+    // Validate enum ordinals before unsafe casts.  Out-of-range values would
+    // otherwise UB-cast to nonsense enum values that crash the encoder.
+    const kmux_key = std.meta.intToEnum(KmuxKey, key) catch return ENC_INVALID_ENUM;
+    const action_enum = std.meta.intToEnum(gvt.input.KeyAction, action) catch return ENC_INVALID_ENUM;
+    const key_enum = kmuxKeyToGvt(kmux_key);
+
+    // Build options.  KittyFlags is `packed struct(u5)`, so we truncate
+    // any high bits the caller may have passed by mistake.
+    const kitty_bits: u5 = @truncate(opts_in.kitty_flags);
+    const opts: gvt.input.KeyEncodeOptions = .{
+        .cursor_key_application = opts_in.cursor_key_application != 0,
+        .keypad_key_application = opts_in.keypad_key_application != 0,
+        .ignore_keypad_with_numlock = opts_in.ignore_keypad_with_numlock != 0,
+        .alt_esc_prefix = opts_in.alt_esc_prefix != 0,
+        .modify_other_keys_state_2 = opts_in.modify_other_keys_state_2 != 0,
+        .kitty_flags = @bitCast(kitty_bits),
+        .macos_option_as_alt = .false,
+    };
+
+    const utf8: []const u8 = if (utf8_ptr) |p| p[0..utf8_len] else &.{};
+
+    const event: gvt.input.KeyEvent = .{
+        .action = action_enum,
+        .key = key_enum,
+        .mods = @bitCast(mods),
+        .composing = false,
+        .utf8 = utf8,
+        .unshifted_codepoint = @intCast(unshifted_codepoint),
+    };
+
+    // Try direct write to the caller's buffer.
+    const out_slice: []u8 = if (out_buf) |p| p[0..out_buf_len] else &.{};
+    var writer: std.Io.Writer = .fixed(out_slice);
+    gvt.input.encodeKey(&writer, event, opts) catch |err| switch (err) {
+        // No space — re-encode into a discarding writer to compute the
+        // required size and report it via `out_written`.
+        error.WriteFailed => {
+            var discarding: std.Io.Writer.Discarding = .init(&.{});
+            gvt.input.encodeKey(&discarding.writer, event, opts) catch unreachable;
+            out_written.* = @intCast(discarding.count);
+            return ENC_OUT_OF_MEMORY;
+        },
+    };
+
+    out_written.* = writer.end;
+    return ENC_OK;
+}
+
+// -----------------------------------------------------------------------------
 // Tests (Zig-side sanity — Rust carries the exhaustive suite.)
 // -----------------------------------------------------------------------------
 
 test "abi version is positive" {
     try std.testing.expect(ABI_VERSION > 0);
+}
+
+test "encode plain enter without kitty flags is CR" {
+    const opts: KmuxKeyEncodeOptions = .{
+        .cursor_key_application = 0,
+        .keypad_key_application = 0,
+        .ignore_keypad_with_numlock = 0,
+        .alt_esc_prefix = 0,
+        .modify_other_keys_state_2 = 0,
+        .kitty_flags = 0,
+        ._pad = .{ 0, 0 },
+    };
+    var buf: [16]u8 = undefined;
+    var written: usize = 0;
+    const rc = kmux_ghostty_encode_key(
+        &opts,
+        @intFromEnum(KmuxKey.enter),
+        0,
+        @intFromEnum(gvt.input.KeyAction.press),
+        null,
+        0,
+        0,
+        &buf,
+        buf.len,
+        &written,
+    );
+    try std.testing.expectEqual(ENC_OK, rc);
+    try std.testing.expectEqualStrings("\r", buf[0..written]);
+}
+
+test "encode shift+enter with kitty disambiguate is CSI 13;2u" {
+    const opts: KmuxKeyEncodeOptions = .{
+        .cursor_key_application = 0,
+        .keypad_key_application = 0,
+        .ignore_keypad_with_numlock = 0,
+        .alt_esc_prefix = 0,
+        .modify_other_keys_state_2 = 0,
+        .kitty_flags = 0b1, // disambiguate
+        ._pad = .{ 0, 0 },
+    };
+    var buf: [32]u8 = undefined;
+    var written: usize = 0;
+    const shift_only: u16 = 0b1; // Mods{ .shift = true } — bit 0
+    const rc = kmux_ghostty_encode_key(
+        &opts,
+        @intFromEnum(KmuxKey.enter),
+        shift_only,
+        @intFromEnum(gvt.input.KeyAction.press),
+        null,
+        0,
+        0,
+        &buf,
+        buf.len,
+        &written,
+    );
+    try std.testing.expectEqual(ENC_OK, rc);
+    try std.testing.expectEqualStrings("\x1b[13;2u", buf[0..written]);
+}
+
+test "encode shift+tab without kitty is CSI Z" {
+    const opts: KmuxKeyEncodeOptions = .{
+        .cursor_key_application = 0,
+        .keypad_key_application = 0,
+        .ignore_keypad_with_numlock = 0,
+        .alt_esc_prefix = 0,
+        .modify_other_keys_state_2 = 0,
+        .kitty_flags = 0,
+        ._pad = .{ 0, 0 },
+    };
+    var buf: [16]u8 = undefined;
+    var written: usize = 0;
+    const shift_only: u16 = 0b1;
+    const rc = kmux_ghostty_encode_key(
+        &opts,
+        @intFromEnum(KmuxKey.tab),
+        shift_only,
+        @intFromEnum(gvt.input.KeyAction.press),
+        null,
+        0,
+        0,
+        &buf,
+        buf.len,
+        &written,
+    );
+    try std.testing.expectEqual(ENC_OK, rc);
+    try std.testing.expectEqualStrings("\x1b[Z", buf[0..written]);
+}
+
+test "encode invalid key ordinal returns INVALID_ENUM" {
+    const opts: KmuxKeyEncodeOptions = .{
+        .cursor_key_application = 0,
+        .keypad_key_application = 0,
+        .ignore_keypad_with_numlock = 0,
+        .alt_esc_prefix = 0,
+        .modify_other_keys_state_2 = 0,
+        .kitty_flags = 0,
+        ._pad = .{ 0, 0 },
+    };
+    var buf: [16]u8 = undefined;
+    var written: usize = 0;
+    const rc = kmux_ghostty_encode_key(
+        &opts,
+        65000,
+        0,
+        @intFromEnum(gvt.input.KeyAction.press),
+        null,
+        0,
+        0,
+        &buf,
+        buf.len,
+        &written,
+    );
+    try std.testing.expectEqual(ENC_INVALID_ENUM, rc);
 }
 
 test "wrapper roundtrip: feed hello, read cells" {

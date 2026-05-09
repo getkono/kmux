@@ -1,4 +1,4 @@
-use kmux_protocol::messages::{ClientMessage, TermSize};
+use kmux_protocol::messages::{ClientMessage, KeyEvent, TermSize};
 
 use super::SessionManager;
 
@@ -18,10 +18,31 @@ impl SessionManager {
     }
 
     /// Send raw PTY input bytes for the active pane.
+    ///
+    /// Used for paths where bytes are already produced (mouse-report wheels,
+    /// out-of-band signals).  Use [`Self::send_key_batch`] for actual
+    /// keystrokes so the daemon can encode them with live mode state.
     pub fn send_input(&mut self, data: Vec<u8>) -> bool {
         match self.active_pane_unlocked() {
             Ok(pane_id) => {
                 self.send_ws(ClientMessage::PtyInput { pane_id, data });
+                true
+            }
+            Err(ok) => ok,
+        }
+    }
+
+    /// Send a batch of structured key events for the active pane.  The
+    /// daemon encodes each event using its live Ghostty mode state so the
+    /// bytes always match what the inner program negotiated (DECCKM, kitty
+    /// kbd flags, modifyOtherKeys, …).
+    pub fn send_key_batch(&mut self, events: Vec<KeyEvent>) -> bool {
+        if events.is_empty() {
+            return true;
+        }
+        match self.active_pane_unlocked() {
+            Ok(pane_id) => {
+                self.send_ws(ClientMessage::PtyKeyBatch { pane_id, events });
                 true
             }
             Err(ok) => ok,

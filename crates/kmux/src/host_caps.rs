@@ -6,10 +6,10 @@ use kmux_protocol::messages::ClientCapabilities;
 /// - `truecolor`: true if `$COLORTERM` is "truecolor" or "24bit", or `$TERM` ends with
 ///   "-direct" or "-truecolor".
 /// - `kitty_graphics`: always false — the TUI renderer (`CellGrid`) has no image support.
-/// - `kitty_keyboard`: always false — input is read via crossterm, which does not use the
-///   kitty keyboard protocol.
+/// - `kitty_keyboard`: from `kitty_keyboard_supported` — set by `main.rs` after a
+///   successful `crossterm::event::PushKeyboardEnhancementFlags`.
 /// - `term`/`term_program`: informational, forwarded as-is for server-side logging.
-pub fn detect() -> ClientCapabilities {
+pub fn detect(kitty_keyboard_supported: bool) -> ClientCapabilities {
     let term = std::env::var("TERM").ok();
     let colorterm = std::env::var("COLORTERM").unwrap_or_default();
     let term_program = std::env::var("TERM_PROGRAM").ok();
@@ -23,7 +23,7 @@ pub fn detect() -> ClientCapabilities {
     ClientCapabilities {
         truecolor,
         kitty_graphics: false,
-        kitty_keyboard: false,
+        kitty_keyboard: kitty_keyboard_supported,
         term,
         term_program,
     }
@@ -40,7 +40,7 @@ mod tests {
             std::env::set_var("COLORTERM", "truecolor");
             std::env::remove_var("TERM");
         }
-        let caps = detect();
+        let caps = detect(false);
         assert!(caps.truecolor);
         assert!(!caps.kitty_graphics);
         assert!(!caps.kitty_keyboard);
@@ -52,7 +52,7 @@ mod tests {
             std::env::set_var("COLORTERM", "24bit");
             std::env::remove_var("TERM");
         }
-        let caps = detect();
+        let caps = detect(false);
         assert!(caps.truecolor);
     }
 
@@ -62,7 +62,7 @@ mod tests {
             std::env::remove_var("COLORTERM");
             std::env::set_var("TERM", "xterm-direct");
         }
-        let caps = detect();
+        let caps = detect(false);
         assert!(caps.truecolor);
     }
 
@@ -72,7 +72,17 @@ mod tests {
             std::env::set_var("COLORTERM", "");
             std::env::set_var("TERM", "xterm-256color");
         }
-        let caps = detect();
+        let caps = detect(false);
         assert!(!caps.truecolor);
+    }
+
+    #[test]
+    fn kitty_keyboard_param_is_honored() {
+        unsafe {
+            std::env::set_var("COLORTERM", "");
+            std::env::set_var("TERM", "xterm-256color");
+        }
+        assert!(detect(true).kitty_keyboard);
+        assert!(!detect(false).kitty_keyboard);
     }
 }

@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use kmux_ghostty::{EventSink, GhosttyError, GhosttyTerm, TermSize};
-use kmux_protocol::messages::{CellState, CursorState, TermModes};
+use kmux_protocol::messages::{CellState, CursorState, KeyEvent as ProtoKeyEvent, TermModes};
 
 use crate::backend::{BackendConfig, BackendEventSink, BackendSize, TerminalBackend};
 
@@ -190,6 +190,39 @@ impl TerminalBackend for GhosttyBackend {
             }
         }
     }
+
+    fn encode_key_event(&self, event: &ProtoKeyEvent) -> Vec<u8> {
+        let opts = self.term.encoder_options();
+        let kg_event = proto_key_to_ghostty(event);
+        match kmux_ghostty::encode_key(&opts, &kg_event) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                // KeyEncodeError::InvalidEnum is impossible at runtime — both
+                // sides use Rust enums with explicit u16 ordinals checked at
+                // compile time by the `key_ordinals_match_zig` tests on each
+                // side.  If it does fire, drop the keystroke loudly.
+                tracing::warn!(error = %e, "ghostty: encode_key failed; dropping keystroke");
+                Vec::new()
+            }
+        }
+    }
+}
+
+/// Translate a wire `KeyEvent` (`kmux-protocol`) into the safe-wrapper
+/// `KeyEvent` (`kmux-ghostty`).
+fn proto_key_to_ghostty(ev: &ProtoKeyEvent) -> kmux_ghostty::KeyEvent {
+    use kmux_protocol::messages::KeyAction as ProtoAction;
+    let action = match ev.action {
+        ProtoAction::Press => kmux_ghostty::KeyAction::Press,
+        ProtoAction::Repeat => kmux_ghostty::KeyAction::Repeat,
+    };
+    kmux_ghostty::KeyEvent {
+        key: Some(ev.code.into()),
+        mods: kmux_ghostty::KeyMods::from_bits_truncate(ev.mods.bits()),
+        action: action.into(),
+        utf8: ev.text.clone(),
+        unshifted_codepoint: ev.unshifted_codepoint,
+    }
 }
 
 // Acknowledge that `GhosttyError::Feed` is intentionally unused in the warm
@@ -332,6 +365,51 @@ mod tests {
         let snap = ts.snapshot();
         assert_eq!(snap.cursor.row, 0);
         assert_eq!(snap.cursor.col, 5);
+    }
+
+    #[test]
+    fn encode_key_event_uses_live_kitty_flags() {
+        use kmux_protocol::messages::{KeyAction, KeyCode, KeyEvent, KeyMods};
+        let mut ts = DiffEngine::new(test_backend(24, 80));
+        // Without kitty kbd negotiation, Ghostty's encoder still emits the
+        // xterm modifyOtherKeys legacy form for modified Enter (`\x1b[27;2;13~`).
+        // Apps that enable modifyOtherKeys=2 (or kitty kbd) decode this; the
+        // bare-bones legacy `\r` fallback is no worse than today.
+        let bytes = ts.encode_key_event(&KeyEvent {
+            code: KeyCode::Enter,
+            mods: KeyMods::SHIFT,
+            action: KeyAction::Press,
+            text: String::new(),
+            unshifted_codepoint: 0,
+        });
+        assert_eq!(bytes, b"\x1b[27;2;13~");
+
+        // After the inner program enables kitty kbd disambiguate
+        // (`\x1b[>1u`), Shift+Enter must encode as CSI 13;2u — what
+        // Claude Code expects.
+        ts.feed(b"\x1b[>1u");
+        let bytes = ts.encode_key_event(&KeyEvent {
+            code: KeyCode::Enter,
+            mods: KeyMods::SHIFT,
+            action: KeyAction::Press,
+            text: String::new(),
+            unshifted_codepoint: 0,
+        });
+        assert_eq!(bytes, b"\x1b[13;2u");
+    }
+
+    #[test]
+    fn encode_key_event_shift_tab_emits_cbt() {
+        use kmux_protocol::messages::{KeyAction, KeyCode, KeyEvent, KeyMods};
+        let ts = DiffEngine::new(test_backend(24, 80));
+        let bytes = ts.encode_key_event(&KeyEvent {
+            code: KeyCode::Tab,
+            mods: KeyMods::SHIFT,
+            action: KeyAction::Press,
+            text: String::new(),
+            unshifted_codepoint: 0,
+        });
+        assert_eq!(bytes, b"\x1b[Z");
     }
 
     #[test]

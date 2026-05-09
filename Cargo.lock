@@ -185,6 +185,9 @@ name = "bitflags"
 version = "2.11.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c4512299f36f043ab09a583e57bceb5a5aab7a73db1805848e8fef3c9e8c78b3"
+dependencies = [
+ "serde_core",
+]
 
 [[package]]
 name = "block-buffer"
@@ -1159,6 +1162,7 @@ dependencies = [
 name = "kmux-ghostty"
 version = "0.1.0"
 dependencies = [
+ "bitflags 2.11.1",
  "kmux-ghostty-sys",
  "kmux-protocol",
  "static_assertions",
@@ -1174,6 +1178,7 @@ name = "kmux-protocol"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bitflags 2.11.1",
  "nix 0.31.2",
  "postcard",
  "quinn",

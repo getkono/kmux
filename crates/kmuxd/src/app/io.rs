@@ -1,4 +1,4 @@
-use kmux_protocol::messages::{CellState, ClientId, InputMode, TermSize};
+use kmux_protocol::messages::{CellState, ClientId, InputMode, KeyEvent, TermSize};
 use kmux_pty::error::{KmuxError, Result};
 
 use crate::conversions::term_size_to_window;
@@ -26,6 +26,59 @@ impl ServerApp {
             }
         }
         relay.writer.write_all(&data).await
+    }
+
+    /// Encode a single structured key event with the pane's live Ghostty
+    /// mode state (DECCKM, kitty kbd flags, modifyOtherKeys, …) and write
+    /// the result to the PTY.  See [`ClientMessage::PtyKey`] for the wire
+    /// motivation.
+    pub async fn write_key_event(
+        &self,
+        pane_id: &str,
+        client_id: ClientId,
+        event: KeyEvent,
+    ) -> Result<()> {
+        self.write_key_batch(pane_id, client_id, &[event]).await
+    }
+
+    /// Encode a batch of key events in order using the pane's live Ghostty
+    /// mode state and concatenate the encoded bytes into a single PTY
+    /// write.  Each event sees the state left by the previous event in the
+    /// batch — important for sequences that toggle modes mid-batch (e.g.
+    /// pressing the key that disables modifyOtherKeys then a follow-up).
+    pub async fn write_key_batch(
+        &self,
+        pane_id: &str,
+        client_id: ClientId,
+        events: &[KeyEvent],
+    ) -> Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        let sessions = self.sessions.read().await;
+        let relay = get_pane_relay(&sessions, pane_id)?;
+        match &relay.input_mode {
+            InputMode::Open => {}
+            InputMode::Locked(holder) if *holder == client_id => {}
+            InputMode::Locked(_) | InputMode::Disabled => {
+                return Err(KmuxError::Pty(nix::Error::EPERM));
+            }
+        }
+        // Encode each event under the lock so mode-mutating sequences
+        // emitted by an earlier event in the batch are visible to later
+        // ones.  Most encodings are < 32 bytes; reserve enough up front
+        // to fit a typical run without re-allocating.
+        let mut bytes = Vec::with_capacity(events.len() * 32);
+        {
+            let term_state = relay.term_state.lock().unwrap();
+            for ev in events {
+                bytes.extend_from_slice(&term_state.encode_key_event(ev));
+            }
+        }
+        if bytes.is_empty() {
+            return Ok(());
+        }
+        relay.writer.write_all(&bytes).await
     }
 
     /// Paste clipboard text into a pane's PTY stdin.

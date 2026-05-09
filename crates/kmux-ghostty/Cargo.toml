@@ -9,6 +9,7 @@ publish = false
 path = "src/lib.rs"
 
 [dependencies]
+bitflags.workspace = true
 kmux-ghostty-sys.workspace = true
 kmux-protocol.workspace = true
 static_assertions = "1"

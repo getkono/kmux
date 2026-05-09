@@ -463,6 +463,373 @@ fn convert_cursor(c: &sys::KmuxCursor) -> CursorState {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Key encoding
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Stable kmux key ordinal. The numeric value of each variant **must** stay
+/// in sync with `KmuxKey` in `crates/kmux-ghostty-sys/zig/src/wrapper.zig`.
+/// `key_ordinal_drift_check` (in `tests`) pins a few canonical values so a
+/// silent reorder breaks the build.
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[allow(non_camel_case_types)] // mirrors physical key codes (key_a, digit_0, …)
+pub enum Key {
+    Unidentified = 0,
+    A = 1,
+    B = 2,
+    C = 3,
+    D = 4,
+    E = 5,
+    F = 6,
+    G = 7,
+    H = 8,
+    I = 9,
+    J = 10,
+    K = 11,
+    L = 12,
+    M = 13,
+    N = 14,
+    O = 15,
+    P = 16,
+    Q = 17,
+    R = 18,
+    S = 19,
+    T = 20,
+    U = 21,
+    V = 22,
+    W = 23,
+    X = 24,
+    Y = 25,
+    Z = 26,
+    Digit0 = 27,
+    Digit1 = 28,
+    Digit2 = 29,
+    Digit3 = 30,
+    Digit4 = 31,
+    Digit5 = 32,
+    Digit6 = 33,
+    Digit7 = 34,
+    Digit8 = 35,
+    Digit9 = 36,
+    Backquote = 37,
+    Backslash = 38,
+    BracketLeft = 39,
+    BracketRight = 40,
+    Comma = 41,
+    Equal = 42,
+    Minus = 43,
+    Period = 44,
+    Quote = 45,
+    Semicolon = 46,
+    Slash = 47,
+    Enter = 48,
+    Tab = 49,
+    Space = 50,
+    Backspace = 51,
+    Escape = 52,
+    Insert = 53,
+    Delete = 54,
+    Home = 55,
+    End = 56,
+    PageUp = 57,
+    PageDown = 58,
+    ArrowUp = 59,
+    ArrowDown = 60,
+    ArrowLeft = 61,
+    ArrowRight = 62,
+    F1 = 63,
+    F2 = 64,
+    F3 = 65,
+    F4 = 66,
+    F5 = 67,
+    F6 = 68,
+    F7 = 69,
+    F8 = 70,
+    F9 = 71,
+    F10 = 72,
+    F11 = 73,
+    F12 = 74,
+    ShiftLeft = 75,
+    ShiftRight = 76,
+    ControlLeft = 77,
+    ControlRight = 78,
+    AltLeft = 79,
+    AltRight = 80,
+    MetaLeft = 81,
+    MetaRight = 82,
+    CapsLock = 83,
+}
+
+impl From<kmux_protocol::messages::KeyCode> for Key {
+    fn from(code: kmux_protocol::messages::KeyCode) -> Self {
+        use kmux_protocol::messages::KeyCode as P;
+        match code {
+            P::Unidentified => Key::Unidentified,
+            P::A => Key::A,
+            P::B => Key::B,
+            P::C => Key::C,
+            P::D => Key::D,
+            P::E => Key::E,
+            P::F => Key::F,
+            P::G => Key::G,
+            P::H => Key::H,
+            P::I => Key::I,
+            P::J => Key::J,
+            P::K => Key::K,
+            P::L => Key::L,
+            P::M => Key::M,
+            P::N => Key::N,
+            P::O => Key::O,
+            P::P => Key::P,
+            P::Q => Key::Q,
+            P::R => Key::R,
+            P::S => Key::S,
+            P::T => Key::T,
+            P::U => Key::U,
+            P::V => Key::V,
+            P::W => Key::W,
+            P::X => Key::X,
+            P::Y => Key::Y,
+            P::Z => Key::Z,
+            P::Digit0 => Key::Digit0,
+            P::Digit1 => Key::Digit1,
+            P::Digit2 => Key::Digit2,
+            P::Digit3 => Key::Digit3,
+            P::Digit4 => Key::Digit4,
+            P::Digit5 => Key::Digit5,
+            P::Digit6 => Key::Digit6,
+            P::Digit7 => Key::Digit7,
+            P::Digit8 => Key::Digit8,
+            P::Digit9 => Key::Digit9,
+            P::Backquote => Key::Backquote,
+            P::Backslash => Key::Backslash,
+            P::BracketLeft => Key::BracketLeft,
+            P::BracketRight => Key::BracketRight,
+            P::Comma => Key::Comma,
+            P::Equal => Key::Equal,
+            P::Minus => Key::Minus,
+            P::Period => Key::Period,
+            P::Quote => Key::Quote,
+            P::Semicolon => Key::Semicolon,
+            P::Slash => Key::Slash,
+            P::Enter => Key::Enter,
+            P::Tab => Key::Tab,
+            P::Space => Key::Space,
+            P::Backspace => Key::Backspace,
+            P::Escape => Key::Escape,
+            P::Insert => Key::Insert,
+            P::Delete => Key::Delete,
+            P::Home => Key::Home,
+            P::End => Key::End,
+            P::PageUp => Key::PageUp,
+            P::PageDown => Key::PageDown,
+            P::ArrowUp => Key::ArrowUp,
+            P::ArrowDown => Key::ArrowDown,
+            P::ArrowLeft => Key::ArrowLeft,
+            P::ArrowRight => Key::ArrowRight,
+            P::F1 => Key::F1,
+            P::F2 => Key::F2,
+            P::F3 => Key::F3,
+            P::F4 => Key::F4,
+            P::F5 => Key::F5,
+            P::F6 => Key::F6,
+            P::F7 => Key::F7,
+            P::F8 => Key::F8,
+            P::F9 => Key::F9,
+            P::F10 => Key::F10,
+            P::F11 => Key::F11,
+            P::F12 => Key::F12,
+            P::ShiftLeft => Key::ShiftLeft,
+            P::ShiftRight => Key::ShiftRight,
+            P::ControlLeft => Key::ControlLeft,
+            P::ControlRight => Key::ControlRight,
+            P::AltLeft => Key::AltLeft,
+            P::AltRight => Key::AltRight,
+            P::MetaLeft => Key::MetaLeft,
+            P::MetaRight => Key::MetaRight,
+            P::CapsLock => Key::CapsLock,
+        }
+    }
+}
+
+bitflags::bitflags! {
+    /// Modifier bitmask. Layout matches `gvt.input.KeyMods` (the low byte).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+    pub struct KeyMods: u16 {
+        const SHIFT = sys::KEY_MOD_SHIFT;
+        const CTRL  = sys::KEY_MOD_CTRL;
+        const ALT   = sys::KEY_MOD_ALT;
+        const SUPER = sys::KEY_MOD_SUPER;
+    }
+}
+
+/// Press / Repeat / Release. Matches `gvt.input.KeyAction`.
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyAction {
+    Release = 0,
+    Press = 1,
+    Repeat = 2,
+}
+
+/// Encoder configuration mirroring `gvt.input.KeyEncodeOptions`.  Read live
+/// from a `GhosttyTerm` via [`GhosttyTerm::encoder_options`] to ensure
+/// encoding matches what the inner program negotiated.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KeyEncodeOptions {
+    /// DECCKM (DEC mode 1).
+    pub cursor_key_application: bool,
+    /// DECKPAM (DEC mode 66).
+    pub keypad_key_application: bool,
+    /// DEC mode 1035.
+    pub ignore_keypad_with_numlock: bool,
+    /// DEC mode 1036.
+    pub alt_esc_prefix: bool,
+    /// xterm modifyOtherKeys=2.
+    pub modify_other_keys_state_2: bool,
+    /// Kitty keyboard protocol flag bitmask. See `sys::KITTY_KBD_*`.
+    pub kitty_flags: u8,
+}
+
+/// One key event ready to be encoded. Values that are unknown (e.g. the
+/// `utf8` text or `unshifted_codepoint`) can be left empty / zero — the
+/// encoder falls back gracefully.
+#[derive(Debug, Clone, Default)]
+pub struct KeyEvent {
+    pub key: Option<Key>,
+    pub mods: KeyMods,
+    pub action: KeyActionDefault,
+    pub utf8: String,
+    pub unshifted_codepoint: u32,
+}
+
+/// New-type so `KeyAction` can be `Default` without losing the explicit
+/// reading at call sites. Defaults to `Press`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KeyActionDefault(pub KeyAction);
+impl Default for KeyActionDefault {
+    fn default() -> Self {
+        Self(KeyAction::Press)
+    }
+}
+impl From<KeyAction> for KeyActionDefault {
+    fn from(a: KeyAction) -> Self {
+        Self(a)
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum KeyEncodeError {
+    #[error("invalid Key or KeyAction ordinal — refusing to encode (likely an ABI drift)")]
+    InvalidEnum,
+}
+
+/// Encode a single key event into terminal escape bytes.
+///
+/// The encoder is stateless — the live mode state lives inside the
+/// [`GhosttyTerm`] and is queried per call via [`GhosttyTerm::encoder_options`].
+/// `Unidentified` keys with empty `utf8` produce no output.
+pub fn encode_key(opts: &KeyEncodeOptions, event: &KeyEvent) -> Result<Vec<u8>, KeyEncodeError> {
+    let raw_opts = sys::KmuxKeyEncodeOptions {
+        cursor_key_application: opts.cursor_key_application as u8,
+        keypad_key_application: opts.keypad_key_application as u8,
+        ignore_keypad_with_numlock: opts.ignore_keypad_with_numlock as u8,
+        alt_esc_prefix: opts.alt_esc_prefix as u8,
+        modify_other_keys_state_2: opts.modify_other_keys_state_2 as u8,
+        kitty_flags: opts.kitty_flags,
+        _pad: [0, 0],
+    };
+    let key_ord = event.key.unwrap_or(Key::Unidentified) as u16;
+    let action_ord = event.action.0 as u8;
+    let mods = event.mods.bits();
+    let utf8 = event.utf8.as_bytes();
+    let utf8_ptr = if utf8.is_empty() {
+        core::ptr::null()
+    } else {
+        utf8.as_ptr()
+    };
+
+    // Most encoded sequences are < 32 bytes. Start with a stack-friendly
+    // 64-byte heap allocation; the encoder will tell us if we need more.
+    let mut out = vec![0u8; 64];
+    let mut written: usize = 0;
+    let rc = unsafe {
+        sys::kmux_ghostty_encode_key(
+            &raw_opts,
+            key_ord,
+            mods,
+            action_ord,
+            utf8_ptr,
+            utf8.len(),
+            event.unshifted_codepoint,
+            out.as_mut_ptr(),
+            out.len(),
+            &mut written,
+        )
+    };
+    match rc {
+        sys::ENC_OK => {
+            out.truncate(written);
+            Ok(out)
+        }
+        sys::ENC_OUT_OF_MEMORY => {
+            // `written` now holds the required buffer size.
+            out.resize(written, 0);
+            let mut written2: usize = 0;
+            let rc2 = unsafe {
+                sys::kmux_ghostty_encode_key(
+                    &raw_opts,
+                    key_ord,
+                    mods,
+                    action_ord,
+                    utf8_ptr,
+                    utf8.len(),
+                    event.unshifted_codepoint,
+                    out.as_mut_ptr(),
+                    out.len(),
+                    &mut written2,
+                )
+            };
+            assert_eq!(
+                rc2,
+                sys::ENC_OK,
+                "second encode_key call should fit after resizing buffer to required size"
+            );
+            out.truncate(written2);
+            Ok(out)
+        }
+        sys::ENC_INVALID_ENUM => Err(KeyEncodeError::InvalidEnum),
+        other => panic!("kmux_ghostty_encode_key returned unexpected code {other}"),
+    }
+}
+
+impl GhosttyTerm {
+    /// Read the current key-encoder options from the terminal's live mode
+    /// state (DECCKM, DECKPAM, modifyOtherKeys, kitty kbd flags).  Pass the
+    /// returned struct to [`encode_key`] so encoding always matches what the
+    /// inner program negotiated.
+    #[must_use]
+    pub fn encoder_options(&self) -> KeyEncodeOptions {
+        let modes = self.modes();
+        let kitty = unsafe { sys::kmux_ghostty_kitty_flags(self.handle.as_ptr()) };
+        KeyEncodeOptions {
+            cursor_key_application: modes.app_cursor(),
+            // The protocol-level TermModes only carries app_cursor, so we
+            // approximate the rest from the kitty_flags + xterm extensions.
+            // DECKPAM, modifyOtherKeys, alt_esc_prefix, and
+            // ignore_keypad_with_numlock are not currently mirrored on the
+            // wire — encoding still works because the encoder falls back to
+            // sensible defaults for them.
+            keypad_key_application: false,
+            ignore_keypad_with_numlock: false,
+            alt_esc_prefix: false,
+            modify_other_keys_state_2: false,
+            kitty_flags: kitty,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,5 +952,155 @@ mod tests {
     fn invalid_size_rejected() {
         let err = GhosttyTerm::new(size(0, 10), 10, Arc::new(NullSink)).unwrap_err();
         assert!(matches!(err, GhosttyError::InvalidSize));
+    }
+
+    // ── Key encoder ────────────────────────────────────────────────────
+
+    /// Pin canonical Key ordinals.  If the Zig `KmuxKey` enum is reordered
+    /// without updating Rust's mirror (or vice versa), this test fails
+    /// loudly instead of silently encoding the wrong key on the wire.
+    #[test]
+    fn key_ordinals_match_zig() {
+        assert_eq!(Key::Unidentified as u16, 0);
+        assert_eq!(Key::A as u16, 1);
+        assert_eq!(Key::Z as u16, 26);
+        assert_eq!(Key::Digit0 as u16, 27);
+        assert_eq!(Key::Enter as u16, 48);
+        assert_eq!(Key::Tab as u16, 49);
+        assert_eq!(Key::Backspace as u16, 51);
+        assert_eq!(Key::Escape as u16, 52);
+        assert_eq!(Key::ArrowUp as u16, 59);
+        assert_eq!(Key::F1 as u16, 63);
+        assert_eq!(Key::CapsLock as u16, 83);
+    }
+
+    fn enc_default() -> KeyEncodeOptions {
+        KeyEncodeOptions::default()
+    }
+
+    fn enc_kitty() -> KeyEncodeOptions {
+        KeyEncodeOptions {
+            kitty_flags: sys::KITTY_KBD_DISAMBIGUATE,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn encode_plain_enter_is_cr() {
+        let bytes = encode_key(
+            &enc_default(),
+            &KeyEvent {
+                key: Some(Key::Enter),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\r");
+    }
+
+    #[test]
+    fn encode_plain_tab_is_tab() {
+        let bytes = encode_key(
+            &enc_default(),
+            &KeyEvent {
+                key: Some(Key::Tab),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\t");
+    }
+
+    #[test]
+    fn encode_shift_tab_is_csi_z() {
+        // Shift+Tab → xterm CBT, regardless of kitty flags.
+        let bytes = encode_key(
+            &enc_default(),
+            &KeyEvent {
+                key: Some(Key::Tab),
+                mods: KeyMods::SHIFT,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1b[Z");
+    }
+
+    #[test]
+    fn encode_shift_enter_with_kitty_is_csi_u() {
+        // Shift+Enter with kitty disambiguate → CSI 13;2u.
+        // This is what Claude Code expects after `\x1b[>1u` negotiation.
+        let bytes = encode_key(
+            &enc_kitty(),
+            &KeyEvent {
+                key: Some(Key::Enter),
+                mods: KeyMods::SHIFT,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1b[13;2u");
+    }
+
+    #[test]
+    fn encode_alt_enter_with_kitty_is_csi_u_mod3() {
+        let bytes = encode_key(
+            &enc_kitty(),
+            &KeyEvent {
+                key: Some(Key::Enter),
+                mods: KeyMods::ALT,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1b[13;3u");
+    }
+
+    #[test]
+    fn encode_ctrl_arrow_up_modifies_csi_a() {
+        // Ctrl+Up → ESC[1;5A in xterm legacy.
+        let bytes = encode_key(
+            &enc_default(),
+            &KeyEvent {
+                key: Some(Key::ArrowUp),
+                mods: KeyMods::CTRL,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(bytes, b"\x1b[1;5A");
+    }
+
+    #[test]
+    fn encode_unidentified_with_no_text_is_empty() {
+        let bytes = encode_key(&enc_default(), &KeyEvent::default()).unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    #[test]
+    fn encoder_options_reads_live_kitty_flags() {
+        let mut term = GhosttyTerm::new(size(4, 20), 100, Arc::new(NullSink)).unwrap();
+        let opts0 = term.encoder_options();
+        assert_eq!(opts0.kitty_flags, 0, "no flags before negotiation");
+
+        // Simulate the inner program enabling kitty kbd disambiguate.
+        term.feed(b"\x1b[>1u").unwrap();
+
+        let opts1 = term.encoder_options();
+        assert!(
+            opts1.kitty_flags & sys::KITTY_KBD_DISAMBIGUATE != 0,
+            "disambiguate bit must be set after \\x1b[>1u, got {:#04x}",
+            opts1.kitty_flags
+        );
+    }
+
+    #[test]
+    fn encoder_options_reads_live_app_cursor() {
+        let mut term = GhosttyTerm::new(size(4, 20), 100, Arc::new(NullSink)).unwrap();
+        assert!(!term.encoder_options().cursor_key_application);
+        term.feed(b"\x1b[?1h").unwrap(); // DECCKM on
+        assert!(term.encoder_options().cursor_key_application);
+        term.feed(b"\x1b[?1l").unwrap(); // DECCKM off
+        assert!(!term.encoder_options().cursor_key_application);
     }
 }

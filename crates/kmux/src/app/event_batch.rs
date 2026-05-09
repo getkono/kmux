@@ -1,6 +1,6 @@
-use crossterm::event::{Event, MouseEventKind};
-use kmux_client::input::{encode_mouse_scroll, key_to_bytes};
-use kmux_protocol::messages::TermSize;
+use crossterm::event::{Event, KeyEventKind, MouseEventKind};
+use kmux_client::input::encode_mouse_scroll;
+use kmux_protocol::messages::{KeyEvent as ProtoKeyEvent, TermSize};
 
 use crate::{key_convert, mode::Action};
 
@@ -8,10 +8,10 @@ use super::{App, KeyResult, event_loop::RESIZE_DEBOUNCE};
 
 impl App {
     /// Process a batch of crossterm events, coalescing compatible runs to reduce
-    /// redundant `send_input` calls and grid mutations before a single redraw.
+    /// redundant network round-trips and grid mutations before a single redraw.
     ///
     /// Coalescing rules:
-    /// - Consecutive `ForwardKey` events → bytes concatenated, single `send_input`.
+    /// - Consecutive `ForwardKey` events → batched into one `send_key_batch`.
     /// - Consecutive local-scroll (mouse wheel, mouse-report OFF) on the same pane →
     ///   summed into one `scroll_up`/`scroll_down`.
     /// - PTY-scroll events (mouse-report ON) → sent individually (position matters).
@@ -25,12 +25,18 @@ impl App {
         pending_resize: &mut Option<TermSize>,
         resize_deadline: &mut Option<tokio::time::Instant>,
     ) -> KeyResult {
-        let mut fwd_bytes: Vec<u8> = Vec::new();
+        let mut fwd_keys: Vec<ProtoKeyEvent> = Vec::new();
         let mut local_scroll: Option<(String, i32)> = None;
 
         for event in batch {
             match event {
                 Event::Key(key_event) => {
+                    // Drop key-release events.  Forwarding them would
+                    // double-fire every keystroke through mode::resolve.
+                    if matches!(key_event.kind, KeyEventKind::Release) {
+                        continue;
+                    }
+
                     let (key, mods) = key_convert::convert(&key_event);
                     let (_, action) = crate::mode::resolve(&self.mode, &key, mods);
 
@@ -38,23 +44,17 @@ impl App {
                         if let Some((pane_id, delta)) = local_scroll.take() {
                             self.apply_local_scroll_delta(&pane_id, delta);
                         }
-                        let app_cursor = self
-                            .mgr
-                            .active_grid()
-                            .map(|b| b.app_cursor())
-                            .unwrap_or(false);
-                        let text = key_convert::text_from_event(&key_event);
-                        if let Some(bytes) = key_to_bytes(&key, mods, text.as_deref(), app_cursor) {
-                            if fwd_bytes.is_empty()
+                        if let Some(proto) = key_convert::convert_to_protocol_key(&key_event) {
+                            if fwd_keys.is_empty()
                                 && let Some(grid) = self.mgr.active_grid_mut()
                             {
                                 grid.scroll_to_bottom();
                             }
-                            fwd_bytes.extend_from_slice(&bytes);
+                            fwd_keys.push(proto);
                         }
                     } else {
-                        if !fwd_bytes.is_empty() {
-                            self.mgr.send_input(std::mem::take(&mut fwd_bytes));
+                        if !fwd_keys.is_empty() {
+                            self.mgr.send_key_batch(std::mem::take(&mut fwd_keys));
                         }
                         if let Some((pane_id, delta)) = local_scroll.take() {
                             self.apply_local_scroll_delta(&pane_id, delta);
@@ -68,8 +68,8 @@ impl App {
                 }
 
                 Event::Mouse(mouse_event) => {
-                    if !fwd_bytes.is_empty() {
-                        self.mgr.send_input(std::mem::take(&mut fwd_bytes));
+                    if !fwd_keys.is_empty() {
+                        self.mgr.send_key_batch(std::mem::take(&mut fwd_keys));
                     }
                     match mouse_event.kind {
                         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => {
@@ -142,8 +142,8 @@ impl App {
             }
         }
 
-        if !fwd_bytes.is_empty() {
-            self.mgr.send_input(fwd_bytes);
+        if !fwd_keys.is_empty() {
+            self.mgr.send_key_batch(fwd_keys);
         }
         if let Some((pane_id, delta)) = local_scroll {
             self.apply_local_scroll_delta(&pane_id, delta);
