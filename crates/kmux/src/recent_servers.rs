@@ -125,7 +125,7 @@ impl RecentServersCache {
                 kind,
             });
         }
-        self.servers.sort_by(|a, b| b.last_used.cmp(&a.last_used));
+        self.servers.sort_by_key(|e| std::cmp::Reverse(e.last_used));
         self.servers.truncate(MAX_SERVERS);
         self.save();
     }
