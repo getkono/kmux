@@ -7,6 +7,17 @@ use ratatui::style::{Color, Modifier, Style};
 use crate::app::App;
 use crate::theme::{self, Theme};
 
+/// Glyph drawn in the cursor cell when the inner pane requests a Bar shape
+/// (DECSCUSR `\x1b[5 q`). U+258F LEFT ONE EIGHTH BLOCK gives a thin vertical
+/// bar at the leading edge of the cell that matches what most native
+/// terminals draw for a bar cursor.
+const BAR_CURSOR_GLYPH: &str = "\u{258f}";
+
+/// Glyph drawn in the cursor cell when the inner pane requests an Underline
+/// shape (DECSCUSR `\x1b[3 q`). U+2581 LOWER ONE EIGHTH BLOCK draws a thin
+/// horizontal bar across the bottom of the cell.
+const UNDERLINE_CURSOR_GLYPH: &str = "\u{2581}";
+
 /// Apply a single protocol cell to a ratatui buffer cell.
 ///
 /// The cell must already be in its background-fill state (reset + theme
@@ -73,9 +84,40 @@ fn apply_cell(ratatui_cell: &mut Cell, cs: &CellState, theme: &Theme) {
     }
 }
 
+/// Paint the inner-pane cursor into a single ratatui cell.
+///
+/// Bar and Underline are drawn as cell glyphs (`▏`, `▁`) instead of being
+/// delegated to the host terminal's hardware cursor — the host cursor is
+/// often hidden in alternate-screen mode or has the wrong shape, leaving
+/// users with an invisible cursor in apps like Claude Code that request a
+/// bar shape via DECSCUSR.  Drawing in-cell is reliable across every host.
+fn paint_cursor_cell(cell: &mut Cell, shape: CursorShape, theme: &Theme) {
+    match shape {
+        CursorShape::Block => {
+            cell.set_bg(theme.cursor_bg);
+            cell.set_fg(theme.cursor_fg);
+        }
+        CursorShape::Bar => {
+            cell.set_symbol(BAR_CURSOR_GLYPH);
+            cell.set_fg(theme.cursor_bg);
+        }
+        CursorShape::Underline => {
+            cell.set_symbol(UNDERLINE_CURSOR_GLYPH);
+            cell.set_fg(theme.cursor_bg);
+        }
+        CursorShape::HollowBlock => {
+            cell.set_style(
+                Style::default()
+                    .fg(theme.cursor_bg)
+                    .add_modifier(Modifier::SLOW_BLINK),
+            );
+        }
+        CursorShape::Hidden => {}
+    }
+}
+
 pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
     let theme = &app.theme;
-    let mut cursor_pos: Option<(u16, u16)> = None;
 
     {
         let buf = f.buffer_mut();
@@ -152,6 +194,15 @@ pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
         }
 
         // ── Cursor ──
+        //
+        // Every cursor shape is drawn directly into the cell buffer.  We do
+        // *not* delegate to ratatui's `Frame::set_cursor_position` for
+        // Bar/Underline because that just shows the host terminal's hardware
+        // cursor — which has the user's default shape (often a block), can be
+        // hidden by some terminals in alternate-screen mode, and can sit
+        // underneath the painted cell content invisibly.  Drawing the cursor
+        // in-cell makes it visible everywhere regardless of host terminal
+        // behaviour.
         let cursor = grid.cursor();
         if scroll_offset == 0 && cursor.visible && cursor.shape != CursorShape::Hidden {
             let cur_row = cursor.row as usize;
@@ -160,27 +211,7 @@ pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
                 let cx = area.left() + cur_col as u16;
                 let cy = area.top() + cur_row as u16;
                 if cx < area.right() && cy < area.bottom() {
-                    match cursor.shape {
-                        CursorShape::Block => {
-                            let cell = &mut buf[(cx, cy)];
-                            let fg = cell.bg;
-                            let bg = Color::White;
-                            cell.set_fg(fg);
-                            cell.set_bg(bg);
-                        }
-                        CursorShape::Underline | CursorShape::Bar => {
-                            cursor_pos = Some((cx, cy));
-                        }
-                        CursorShape::HollowBlock => {
-                            let cell = &mut buf[(cx, cy)];
-                            cell.set_style(
-                                Style::default()
-                                    .fg(Color::White)
-                                    .add_modifier(Modifier::SLOW_BLINK),
-                            );
-                        }
-                        CursorShape::Hidden => {}
-                    }
+                    paint_cursor_cell(&mut buf[(cx, cy)], cursor.shape, theme);
                 }
             }
         }
@@ -207,10 +238,6 @@ pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
             }
         }
     } // buf borrow ends here
-
-    if let Some((cx, cy)) = cursor_pos {
-        f.set_cursor_position((cx, cy));
-    }
 }
 
 #[cfg(test)]
@@ -293,6 +320,84 @@ mod tests {
         assert_eq!(cell.symbol(), " ", "control char must not be written");
         assert_eq!(cell.fg, theme.fg, "fg must stay at background-fill value");
         assert_eq!(cell.bg, theme.bg, "bg must stay at background-fill value");
+    }
+
+    fn fill_cell(cell: &mut Cell, ch: char, theme: &Theme) {
+        cell.set_char(ch);
+        cell.set_fg(theme.fg);
+        cell.set_bg(theme.bg);
+    }
+
+    #[test]
+    fn block_cursor_uses_theme_cursor_colors() {
+        // Regression: the previous implementation hardcoded `Color::White`
+        // for the bg, which could be invisible on light themes.  After the
+        // fix, the cursor must use `theme.cursor_bg` / `theme.cursor_fg`
+        // so contrast is theme-driven.
+        let theme = theme::default_theme();
+        let mut cell = Cell::default();
+        fill_cell(&mut cell, 'a', &theme);
+
+        paint_cursor_cell(&mut cell, CursorShape::Block, &theme);
+
+        assert_eq!(cell.bg, theme.cursor_bg);
+        assert_eq!(cell.fg, theme.cursor_fg);
+        assert_ne!(cell.bg, Color::White, "must not hardcode Color::White");
+        // Underlying glyph stays — Block sits on top of it.
+        assert_eq!(cell.symbol(), "a");
+    }
+
+    #[test]
+    fn bar_cursor_writes_left_bar_glyph() {
+        let theme = theme::default_theme();
+        let mut cell = Cell::default();
+        fill_cell(&mut cell, 'a', &theme);
+
+        paint_cursor_cell(&mut cell, CursorShape::Bar, &theme);
+
+        assert_eq!(cell.symbol(), "\u{258f}", "Bar must paint U+258F");
+        assert_eq!(cell.fg, theme.cursor_bg);
+    }
+
+    #[test]
+    fn underline_cursor_writes_underline_glyph() {
+        let theme = theme::default_theme();
+        let mut cell = Cell::default();
+        fill_cell(&mut cell, 'a', &theme);
+
+        paint_cursor_cell(&mut cell, CursorShape::Underline, &theme);
+
+        assert_eq!(cell.symbol(), "\u{2581}", "Underline must paint U+2581");
+        assert_eq!(cell.fg, theme.cursor_bg);
+    }
+
+    #[test]
+    fn hollow_block_cursor_uses_theme_color_and_blinks() {
+        let theme = theme::default_theme();
+        let mut cell = Cell::default();
+        fill_cell(&mut cell, 'a', &theme);
+
+        paint_cursor_cell(&mut cell, CursorShape::HollowBlock, &theme);
+
+        assert_eq!(cell.fg, theme.cursor_bg);
+        assert!(cell.modifier.contains(Modifier::SLOW_BLINK));
+        assert_ne!(cell.fg, Color::White, "must not hardcode Color::White");
+    }
+
+    #[test]
+    fn hidden_cursor_does_not_modify_cell() {
+        let theme = theme::default_theme();
+        let mut cell = Cell::default();
+        fill_cell(&mut cell, 'a', &theme);
+        let before_fg = cell.fg;
+        let before_bg = cell.bg;
+        let before_sym = cell.symbol().to_string();
+
+        paint_cursor_cell(&mut cell, CursorShape::Hidden, &theme);
+
+        assert_eq!(cell.symbol(), before_sym);
+        assert_eq!(cell.fg, before_fg);
+        assert_eq!(cell.bg, before_bg);
     }
 
     #[test]

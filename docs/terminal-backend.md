@@ -112,6 +112,29 @@ and drained from a separate task.
 whichever `Arc<dyn BackendEventSink>` the host passes in.  `NullEventSink`
 (no-op) is used in code paths that do not need backend events.
 
+## Cursor rendering (in-cell)
+
+The kmux client paints the inner-pane cursor **directly into the cell buffer**
+— it does not delegate Bar/Underline shapes to the host terminal's hardware
+cursor via `Frame::set_cursor_position`.  The host cursor's shape comes from
+the user's terminal settings (often a Block, never updated by DECSCUSR), can
+be hidden in alternate-screen mode, and may sit beneath painted content
+invisibly.  In-cell rendering makes the cursor visible everywhere regardless
+of the host.
+
+| Shape | Rendering |
+|---|---|
+| `Block` | Cell bg ← `theme.cursor_bg`, fg ← `theme.cursor_fg`; underlying glyph kept |
+| `Bar` | Cell symbol ← `▏` (U+258F), fg ← `theme.cursor_bg` |
+| `Underline` | Cell symbol ← `▁` (U+2581), fg ← `theme.cursor_bg` |
+| `HollowBlock` | fg ← `theme.cursor_bg`, `Modifier::SLOW_BLINK` |
+| `Hidden` | no-op |
+
+Themes default `cursor_bg = fg` and `cursor_fg = bg` so contrast is good on
+every theme without per-theme tuning; both are overridable in `themes/*.toml`.
+
+The painter lives at `crates/kmux/src/ui/grid.rs::paint_cursor_cell`.
+
 ## Multi-client size negotiation (smallest-wins)
 
 **Policy.** Effective pane size = `min(rows) × min(cols)` across all currently

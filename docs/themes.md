@@ -66,6 +66,13 @@ yellow    = "#eed49f"       # scroll indicator, warnings in HUD
 purple    = "#c6a0f6"       # session mode indicator
 orange    = "#f5a97f"       # rename mode indicator
 status_bg = "#1e2030"       # background of the status and session bars
+
+# Optional. The inner-pane cursor is rendered in-cell (kmux does not
+# delegate to the host terminal's hardware cursor), so these colors
+# control how it looks regardless of host terminal cursor settings.
+# cursor_bg defaults to `fg`, cursor_fg defaults to `bg`.
+cursor_bg = "#cad3f5"       # Block cursor bg + Bar/Underline glyph color
+cursor_fg = "#24273a"       # text on top of the Block cursor
 ```
 
 The canonical theme definitions are in the [`themes/`](../themes/) directory at
