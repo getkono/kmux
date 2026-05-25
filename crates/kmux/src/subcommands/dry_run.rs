@@ -49,7 +49,8 @@ pub async fn run_dry_run(args: &ServerArgs, test_mode: bool) -> anyhow::Result<(
     observer.header(&target);
 
     let (srv_tx, mut srv_rx) = mpsc::unbounded_channel::<ServerMessage>();
-    let capabilities = host_caps::detect();
+    // Dry-run path: no TUI, so no kitty kbd push. Always advertise false.
+    let capabilities = host_caps::detect(false);
 
     let started = Instant::now();
     let outcome = run_bootstrap(target, capabilities, None, srv_tx, &observer)

@@ -183,6 +183,7 @@ impl App {
         instance_id: String,
         auto_session: Option<String>,
         auto_cwd: Option<String>,
+        kitty_keyboard_supported: bool,
     ) -> Self {
         use crate::mode::{ConnectField, Mode};
 
@@ -231,7 +232,7 @@ impl App {
             _ => Mode::Normal,
         };
 
-        let capabilities = crate::host_caps::detect();
+        let capabilities = crate::host_caps::detect(kitty_keyboard_supported);
 
         let (server_display, server_string, server_kind) = if is_local {
             ("localhost".to_string(), String::new(), ServerKind::Local)

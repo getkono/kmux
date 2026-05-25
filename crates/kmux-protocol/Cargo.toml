@@ -28,6 +28,7 @@ server = []
 
 [dependencies]
 anyhow.workspace = true
+bitflags = { workspace = true, features = ["serde"] }
 nix = { workspace = true, features = ["net", "user"] }
 tokio-rustls = { workspace = true, optional = true }
 serde.workspace = true

@@ -20,7 +20,7 @@ use core::ffi::c_void;
 /// ABI version expected by this Rust crate. The Zig wrapper exports the same
 /// constant via [`kmux_ghostty_abi_version`]. Mismatch is a build-time
 /// inconsistency — safe wrappers must panic on mismatch.
-pub const EXPECTED_ABI_VERSION: u32 = 1;
+pub const EXPECTED_ABI_VERSION: u32 = 2;
 
 // Result codes returned by the Zig wrapper. `OK` is 0; everything else is
 // a negative error code. Kept in sync with `src/wrapper.zig`.
@@ -30,6 +30,31 @@ pub const KMUX_ERR_INVALID_SIZE: i32 = -2;
 pub const KMUX_ERR_FEED: i32 = -3;
 pub const KMUX_ERR_RESIZE: i32 = -4;
 pub const KMUX_ERR_BAD_BUFFER: i32 = -5;
+
+// Key encoder result codes (separate namespace; introduced in ABI v2).
+pub const ENC_OK: i32 = 0;
+pub const ENC_OUT_OF_MEMORY: i32 = -10;
+pub const ENC_INVALID_ENUM: i32 = -11;
+
+// Kitty keyboard protocol flag bits (matches Ghostty's `KittyFlags` packed
+// struct).  Returned by `kmux_ghostty_kitty_flags` and accepted by the
+// `kitty_flags` field of `KmuxKeyEncodeOptions`.
+pub const KITTY_KBD_DISAMBIGUATE: u8 = 1 << 0;
+pub const KITTY_KBD_REPORT_EVENTS: u8 = 1 << 1;
+pub const KITTY_KBD_REPORT_ALTERNATES: u8 = 1 << 2;
+pub const KITTY_KBD_REPORT_ALL: u8 = 1 << 3;
+pub const KITTY_KBD_REPORT_ASSOCIATED: u8 = 1 << 4;
+
+// Key event modifier bits (matches Ghostty's `Mods` packed struct, low byte).
+pub const KEY_MOD_SHIFT: u16 = 1 << 0;
+pub const KEY_MOD_CTRL: u16 = 1 << 1;
+pub const KEY_MOD_ALT: u16 = 1 << 2;
+pub const KEY_MOD_SUPER: u16 = 1 << 3;
+
+// Key action ordinals (matches Ghostty's `Action` enum(c_int)).
+pub const KEY_ACTION_RELEASE: u8 = 0;
+pub const KEY_ACTION_PRESS: u8 = 1;
+pub const KEY_ACTION_REPEAT: u8 = 2;
 
 // Cell attr bits (see `CellAttrs` in kmux-protocol; lock-stepped with
 // wrapper.zig's `ATTR_*` constants).
@@ -102,6 +127,21 @@ pub struct KmuxCursor {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct KmuxModes {
     pub bits: u16,
+}
+
+/// Options forwarded to `gvt.input.encodeKey` for a single key event.
+/// Fields mirror Ghostty's `KeyEncodeOptions`.  All booleans are `u8`
+/// (0 = false, non-zero = true) so the layout is stable across Rust/Zig.
+#[repr(C)]
+#[derive(Debug, Clone, Copy, Default)]
+pub struct KmuxKeyEncodeOptions {
+    pub cursor_key_application: u8,
+    pub keypad_key_application: u8,
+    pub ignore_keypad_with_numlock: u8,
+    pub alt_esc_prefix: u8,
+    pub modify_other_keys_state_2: u8,
+    pub kitty_flags: u8,
+    pub _pad: [u8; 2],
 }
 
 /// Event-sink vtable. All callbacks fire synchronously inside `kmux_ghostty_feed`.
@@ -209,6 +249,44 @@ unsafe extern "C" {
         cells_len: usize,
         out_rows_filled: *mut usize,
     ) -> i32;
+
+    /// Current Kitty keyboard protocol flags as set via `\x1b[>Nu` /
+    /// `\x1b[<Nu` push/pop sequences. Returns the packed `KittyFlags` u5
+    /// widened to u8 (`KITTY_KBD_*` constants).  Always 0 if the inner
+    /// program never enabled the protocol.
+    pub fn kmux_ghostty_kitty_flags(term: *const kmux_ghostty_term) -> u8;
+
+    /// Encode a single key event into terminal escape bytes.
+    ///
+    /// `key`: ordinal of the kmux-stable `KmuxKey` enum (translated to
+    ///   `gvt.input.Key` inside the Zig wrapper). See `kmux_ghostty::Key`
+    ///   for the safe Rust mirror.
+    /// `mods`: packed `KEY_MOD_*` bits.
+    /// `action`: `KEY_ACTION_PRESS` / `KEY_ACTION_REPEAT` / `KEY_ACTION_RELEASE`.
+    /// `utf8` / `utf8_len`: optional UTF-8 text the keystroke would produce
+    ///   in a plain text field. May be NULL/0 for unmapped named keys.
+    /// `unshifted_codepoint`: codepoint when no shift is applied (0 = unknown).
+    /// `out_buf` / `out_buf_len`: caller's output buffer; may be NULL/0 to
+    ///   query the required size — the call returns `ENC_OUT_OF_MEMORY` and
+    ///   writes the required size into `out_written`.
+    /// `out_written`: bytes written on `ENC_OK`, or required size on
+    ///   `ENC_OUT_OF_MEMORY`.
+    ///
+    /// Returns `ENC_OK`, `ENC_OUT_OF_MEMORY`, or `ENC_INVALID_ENUM` (on
+    /// out-of-range `key` or `action` ordinals).
+    #[allow(clippy::too_many_arguments)]
+    pub fn kmux_ghostty_encode_key(
+        opts: *const KmuxKeyEncodeOptions,
+        key: u16,
+        mods: u16,
+        action: u8,
+        utf8: *const u8,
+        utf8_len: usize,
+        unshifted_codepoint: u32,
+        out_buf: *mut u8,
+        out_buf_len: usize,
+        out_written: *mut usize,
+    ) -> i32;
 }
 
 #[cfg(test)]
@@ -232,6 +310,55 @@ mod tests {
         assert_eq!(core::mem::size_of::<KmuxCell>(), 16);
         assert_eq!(core::mem::size_of::<KmuxCursor>(), 8);
         assert_eq!(core::mem::size_of::<KmuxModes>(), 2);
+        assert_eq!(core::mem::size_of::<KmuxKeyEncodeOptions>(), 8);
+    }
+
+    /// Out-of-range ordinals must not segfault — the Zig wrapper validates
+    /// `key` and `action` before any unsafe enum cast.  Per-key encoding
+    /// behaviour is exercised in the safe `kmux_ghostty::KeyEncoder` tests
+    /// where Rust owns the `gvt.input.Key` ordinal mapping.
+    #[test]
+    fn encode_invalid_key_returns_invalid_enum() {
+        let opts = KmuxKeyEncodeOptions::default();
+        let mut out = [0u8; 16];
+        let mut written: usize = 0;
+        let rc = unsafe {
+            kmux_ghostty_encode_key(
+                &opts,
+                65000, // out of range for KmuxKey
+                0,
+                KEY_ACTION_PRESS,
+                core::ptr::null(),
+                0,
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+                &mut written,
+            )
+        };
+        assert_eq!(rc, ENC_INVALID_ENUM);
+    }
+
+    #[test]
+    fn encode_invalid_action_returns_invalid_enum() {
+        let opts = KmuxKeyEncodeOptions::default();
+        let mut out = [0u8; 16];
+        let mut written: usize = 0;
+        let rc = unsafe {
+            kmux_ghostty_encode_key(
+                &opts,
+                0,
+                0,
+                99, // not 0/1/2
+                core::ptr::null(),
+                0,
+                0,
+                out.as_mut_ptr(),
+                out.len(),
+                &mut written,
+            )
+        };
+        assert_eq!(rc, ENC_INVALID_ENUM);
     }
 
     #[test]

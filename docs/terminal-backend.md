@@ -112,6 +112,19 @@ and drained from a separate task.
 whichever `Arc<dyn BackendEventSink>` the host passes in.  `NullEventSink`
 (no-op) is used in code paths that do not need backend events.
 
+## Key encoding (server-side)
+
+The daemon encodes user keystrokes into terminal escape bytes via Ghostty's
+`gvt.input.encodeKey`, fed with the live mode state of the per-pane Ghostty
+terminal (DECCKM, kitty kbd flags, modifyOtherKeys, …).  The client sends
+structured `KeyEvent`s on the wire; the daemon's `Backend::encode_key_event`
+hands each one to the encoder and writes the bytes to the PTY.
+
+This guarantees that modifier-encoded keys (Shift+Enter, Alt+Enter,
+Shift+Tab, Ctrl+Arrow) match the protocol the inner program negotiated at
+runtime.  See [`docs/keyboard.md`](keyboard.md) for the full architecture
+and per-keystroke encoding examples.
+
 ## Multi-client size negotiation (smallest-wins)
 
 **Policy.** Effective pane size = `min(rows) × min(cols)` across all currently

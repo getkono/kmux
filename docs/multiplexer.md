@@ -338,10 +338,10 @@ encoding (`crates/kmux/src/app/mouse_handler.rs`).
 | `F1–F4` | `ESC O P–S` | **Stable** | |
 | `F5–F12` | `ESC [ 15–24 ~` | **Stable** | `F6=17`, `F7=18`, `F8=19`, `F9=20`, `F10=21`, `F11=23`, `F12=24` |
 | `F13–F24` | — | **Not planned** | |
-| `Alt+key` | `ESC {key-bytes}` | **Partial** | The `ALT` modifier is captured from crossterm; the ESC prefix is **not** explicitly added in `key_to_bytes` for character keys.  Behaviour depends on whether the host terminal delivers Alt+char as two events (ESC + char) or as a single event with the modifier flag set.  Works reliably when the host terminal pre-encodes the ESC prefix; may silently drop the modifier otherwise. |
-| `Shift+modifier combos` | `CSI 1 ; Ps [ABCD]` etc. | **Unimplemented** | Modifier-encoded sequences (xterm `modifyOtherKeys` style) not generated |
-| Kitty keyboard protocol | `CSI = Ps u` | **Unimplemented** | `kitty_keyboard` capability atomic is wired through to the backend; libghostty-vt parses the query sequence unconditionally.  The TUI client hardcodes `kitty_keyboard: false`, so no encoder emits the protocol on input today |
-| xterm `modifyOtherKeys` | `CSI 27 ; mod ; code ~` | **Not planned** | |
+| `Alt+key` | `ESC {key-bytes}` | **Stable** | Encoded server-side via Ghostty's `key_encode`. |
+| `Shift+modifier combos` | `CSI 1 ; Ps [ABCD]` etc. | **Stable** | Encoded server-side via Ghostty's `key_encode`. |
+| Kitty keyboard protocol | `CSI > N u` push, `CSI < N u` pop, `CSI N ; M u` modifier reports | **Stable** | Inner program enables via DECSET; daemon's `kmux_ghostty_kitty_flags` getter feeds the flags into `KeyEncodeOptions` per encode call. |
+| xterm `modifyOtherKeys` | `CSI 27 ; mod ; code ~` | **Stable** | Default fallback when kitty kbd is not negotiated; Ghostty's `key_encode.legacy` emits this for modified Enter/Backspace/etc. |
 
 ---
 
@@ -409,7 +409,7 @@ Client capabilities are declared at auth time in `ClientCapabilities`:
 |-------|--------------------------|--------|
 | `truecolor` | Detected from `$COLORTERM` / `$TERM` | Reserved for future per-client colour downgrade (today server always sends RGB) |
 | `kitty_graphics` | `false` (hardcoded) | Drives the `kitty_graphics` atomic in `CapabilityHandles` (reserved for future parse-time gating) |
-| `kitty_keyboard` | `false` (hardcoded) | Drives the `kitty_keyboard` atomic in `CapabilityHandles` (reserved for future parse-time gating) |
+| `kitty_keyboard` | Set when `crossterm::terminal::supports_keyboard_enhancement()` returns true and `PushKeyboardEnhancementFlags` succeeds | Reported to the daemon for future parse-time gating; the *encoding* path uses the live `kitty_keyboard.current()` flags read from the pane's Ghostty terminal each `encode_key_event` call (see `docs/keyboard.md`) |
 | `term` | `$TERM` (informational) | Logged; not used for `TERM` selection |
 | `term_program` | `$TERM_PROGRAM` (informational) | Logged; not used |
 
@@ -443,18 +443,11 @@ sequences every attached client can handle (`capability::intersect_for_atomics`)
 5. **Overline** — `SGR 53` is parsed; a corresponding `OVERLINE` bit in
    `CellAttrs` would complete the standard decoration set.
 
-6. **Alt+key encoding** — `key_to_bytes` does not explicitly emit the ESC
-   prefix for Alt+character combinations; see the Keyboard table for details.
-
-7. **Kitty keyboard protocol (input)** — the capability atomic is wired
-   through to the backend; the TUI client needs to opt in (currently
-   hardcoded `false`) and `key_to_bytes` needs a matching encoder.
-
-8. **OSC 52 clipboard** — the `on_osc52_copy` seam in `BackendEventSink`
+6. **OSC 52 clipboard** — the `on_osc52_copy` seam in `BackendEventSink`
    exists; full implementation requires a client-to-server clipboard channel.
 
-9. **OSC 7 (current directory)** — forwarding this would let the client update
+7. **OSC 7 (current directory)** — forwarding this would let the client update
    its session CWD display without a separate RPC.
 
-10. **Synchronized output (`?2026`)** — would allow flicker-free redraws; needs
-    the diff engine to defer emission until the closing ST.
+8. **Synchronized output (`?2026`)** — would allow flicker-free redraws; needs
+   the diff engine to defer emission until the closing ST.

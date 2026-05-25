@@ -13,7 +13,7 @@ kmux-client.workspace = true
 kmux-protocol = { workspace = true, features = ["framing"] }
 anyhow.workspace = true
 clap.workspace = true
-cli-clipboard.workspace = true
+arboard.workspace = true
 crossterm.workspace = true
 ratatui.workspace = true
 tokio.workspace = true

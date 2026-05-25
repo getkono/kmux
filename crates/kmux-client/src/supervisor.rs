@@ -182,17 +182,13 @@ impl TransportScorer {
     /// in the log so readers can tell apart "scorer's preference" from
     /// "what's actually in use right now". The two only converge after a
     /// successful probe + upgrade.
-    pub fn rank(
-        &self,
-        endpoints: &[EndpointHealth],
-        active: TransportKind,
-    ) -> Vec<(i32, usize)> {
+    pub fn rank(&self, endpoints: &[EndpointHealth], active: TransportKind) -> Vec<(i32, usize)> {
         let mut scored: Vec<(i32, usize)> = endpoints
             .iter()
             .enumerate()
             .map(|(i, h)| (self.score(h), i))
             .collect();
-        scored.sort_by(|a, b| b.0.cmp(&a.0)); // descending
+        scored.sort_by_key(|s| std::cmp::Reverse(s.0));
 
         let top_ranked = scored
             .first()

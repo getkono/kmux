@@ -1,5 +1,4 @@
-use crossterm::event::KeyEvent;
-use kmux_client::input::key_to_bytes;
+use crossterm::event::{KeyEvent, KeyEventKind};
 
 use crate::cmd;
 use crate::key_convert;
@@ -11,6 +10,14 @@ use super::{App, COMMAND_HISTORY_CAP, KeyResult, SwitchTarget};
 impl App {
     /// Handle a key event. Returns the appropriate `KeyResult` for the event loop.
     pub(super) async fn handle_key(&mut self, key_event: KeyEvent) -> KeyResult {
+        // Drop key-release events.  These appear when the host terminal has
+        // kitty `report_events` enabled (we don't enable it ourselves but
+        // some terminals are sticky).  Forwarding them would double-fire
+        // every keystroke through the resolver.
+        if matches!(key_event.kind, KeyEventKind::Release) {
+            return KeyResult::Continue;
+        }
+
         let (key, mods) = key_convert::convert(&key_event);
         let (new_mode, action) = mode::resolve(&self.mode, &key, mods);
 
@@ -33,27 +40,19 @@ impl App {
     ) -> KeyResult {
         match action {
             Action::ForwardKey => {
-                // ForwardKey requires the original event to encode bytes; it is
-                // only emitted from the key path, so `src_event` must be Some.
+                // ForwardKey requires the original event so the daemon can
+                // encode it under the live Ghostty mode state.
                 let Some(key_event) = src_event else {
                     return KeyResult::Continue;
                 };
-                let (key, mods) = key_convert::convert(key_event);
 
-                // Snap to bottom on keypress
+                // Snap to bottom on keypress.
                 if let Some(grid) = self.mgr.active_grid_mut() {
                     grid.scroll_to_bottom();
                 }
 
-                let app_cursor = self
-                    .mgr
-                    .active_grid()
-                    .map(|b| b.app_cursor())
-                    .unwrap_or(false);
-                let text = key_convert::text_from_event(key_event);
-                let bytes = key_to_bytes(&key, mods, text.as_deref(), app_cursor);
-                if let Some(bytes) = bytes {
-                    self.mgr.send_input(bytes);
+                if let Some(proto) = key_convert::convert_to_protocol_key(key_event) {
+                    self.mgr.send_key_batch(vec![proto]);
                 }
             }
             Action::CreateSession => {
@@ -261,14 +260,18 @@ impl App {
             Action::CopySelection => {
                 if let Some(text) = self.mgr.active_grid().and_then(|g| g.selected_text()) {
                     tokio::task::spawn_blocking(move || {
-                        let _ = cli_clipboard::set_contents(text);
+                        if let Ok(mut cb) = arboard::Clipboard::new() {
+                            let _ = cb.set_text(text);
+                        }
                     });
                 }
             }
             Action::Paste => {
                 if let Some(tx) = self.paste_tx.clone() {
                     tokio::task::spawn_blocking(move || {
-                        if let Ok(text) = cli_clipboard::get_contents() {
+                        if let Ok(mut cb) = arboard::Clipboard::new()
+                            && let Ok(text) = cb.get_text()
+                        {
                             let _ = tx.send(text);
                         }
                     });

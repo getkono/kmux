@@ -207,6 +207,22 @@ pub async fn handle_message<A: PaneAttacher>(
             }
         }
 
+        ClientMessage::PtyKey { pane_id, event } => {
+            if let Err(e) = state.app.write_key_event(&pane_id, client_id, event).await {
+                state.error(None, classify_error(&e), e.to_string());
+            }
+        }
+
+        ClientMessage::PtyKeyBatch { pane_id, events } => {
+            if let Err(e) = state
+                .app
+                .write_key_batch(&pane_id, client_id, &events)
+                .await
+            {
+                state.error(None, classify_error(&e), e.to_string());
+            }
+        }
+
         ClientMessage::Resize { pane_id, size } => {
             if let Err(e) = state.app.resize(&pane_id, client_id, size).await {
                 state.error(None, classify_error(&e), e.to_string());

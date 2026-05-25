@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use kmux_protocol::messages::{CellState, CursorState, TermModes, TermSize};
+use kmux_protocol::messages::{CellState, CursorState, KeyEvent, TermModes, TermSize};
 
 pub mod ghostty;
 #[cfg(test)]
@@ -177,6 +177,15 @@ pub trait TerminalBackend: Send + 'static {
         _cols: usize,
     ) -> Vec<Vec<CellState>> {
         vec![]
+    }
+
+    /// Encode a structured key event into terminal escape bytes using the
+    /// backend's live state (DECCKM, kitty kbd flags, modifyOtherKeys, …).
+    ///
+    /// Default returns an empty `Vec` — backends that do not implement key
+    /// encoding (e.g. test stubs) silently drop key events.
+    fn encode_key_event(&self, _event: &KeyEvent) -> Vec<u8> {
+        Vec::new()
     }
 }
 
