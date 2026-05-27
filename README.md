@@ -33,6 +33,27 @@ UDS (local). See [docs/connection.md](docs/connection.md) for a full description
 of the two-phase connection model, transport selection, and `kmuxd.toml`
 configuration.
 
+## Terminology
+
+| Term | Meaning |
+| --- | --- |
+| **Daemon** (`kmuxd`) | Background server that owns PTYs, runs the VT emulator, persists state, and serves clients. |
+| **Client** (`kmux`) | TUI front-end that connects to a daemon and renders the terminal grid. |
+| **Session** | Top-level container holding one or more panes; identified by a stable word ID and survives client disconnects. |
+| **Pane** | A single shell process inside a session, backed by its own PTY and scrollback. |
+| **PTY** | Pseudo-terminal — the OS device pair that backs every running shell. |
+| **Word ID** | Human-readable identifier auto-assigned to each session (e.g. `eagle`, `hippo`); persists across daemon restarts. |
+| **Scrollback** | Server-side ring buffer of past terminal output (default 50,000 lines) that clients scroll into on demand. |
+| **Checkpoint** | Periodic on-disk snapshot of sessions, panes, and scrollback so state survives daemon restart. |
+| **Transport** | Network channel between client and daemon: QUIC (preferred), TCP+TLS (fallback), or UDS (local). |
+| **Endpoint** | A single network address (host:port or UDS path) advertised by the daemon for a given transport. |
+| **Audience** | Visibility filter on an endpoint (`any`, `lan`, `local`, `ssh-only`) that controls which callers see it. |
+| **Bootstrap** | Phase A of connecting: authenticate and fetch the audience-filtered endpoint catalog (via SSH, QUIC, TCP+TLS, or UDS). |
+| **Transport upgrade** | Phase B of connecting: continuously score available transports by RTT/reliability and switch to the best one. |
+| **TOFU TLS** | Trust-On-First-Use certificate pinning — self-signed or private-CA certs are accepted on first connect and pinned for later connects. |
+| **Command mode** | `/`-prefixed floating overlay (activated with **Ctrl+G** then `/`) for running TUI commands such as switching sessions or attaching to servers. |
+| **Terminal backend** | The VT emulator running inside the daemon (currently [`libghostty-vt`](vendor/ghostty)); clients receive resolved cell data, never raw escape sequences. |
+
 ## Prerequisites
 
 - Rust toolchain (edition 2024) via [rustup](https://rustup.rs)
