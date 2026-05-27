@@ -32,36 +32,20 @@ pub struct Cli {
 
 /// Server addressing arguments shared by the default connect action and
 /// the `list-sessions` subcommand.
+///
+/// Every port in the server string is the **SSH** port. Daemon data-plane
+/// ports (QUIC, TCP+TLS) are ephemeral and exchanged in-band via the
+/// authenticated SSH handshake — they never appear on the command line.
 #[derive(Args, Debug)]
 pub struct ServerArgs {
-    /// Remote server: user@host, user@host:/path, user@host:port, alias
-    /// (omit to auto-start and connect to the local daemon)
+    /// Remote SSH target: `[user@]host[:ssh-port][:/path]` or a `hosts.toml`
+    /// alias. Omit to connect to the local daemon.
     pub server: Option<String>,
 
-    /// SSH port to use when connecting to a remote target (overrides hosts.toml)
+    /// Override the SSH port for the target (also settable via `host:port`
+    /// in the server string or `ssh_port` in `hosts.toml`).
     #[arg(long)]
     pub ssh_port: Option<u16>,
-
-    // ── Hidden legacy/advanced flags ─────────────────────────────────────────
-    /// Server host (prefer positional server argument)
-    #[arg(long, hide = true)]
-    pub host: Option<String>,
-
-    /// Server port (prefer user@host:port or host:port syntax)
-    #[arg(long, hide = true)]
-    pub port: Option<u16>,
-
-    /// Auth token (reads from runtime token file if not provided)
-    #[arg(long, hide = true)]
-    pub token: Option<String>,
-
-    /// Skip SSH tunneling; connect directly via QUIC
-    #[arg(long, hide = true)]
-    pub no_ssh: bool,
-
-    /// Accept self-signed / invalid TLS certificates
-    #[arg(long, hide = true)]
-    pub accept_invalid_certs: bool,
 }
 
 /// Arguments for connecting to a server (the default action).

@@ -8,74 +8,32 @@ pub use list::{ListSessionsConfig, run_list_sessions};
 
 use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::ssh::{self, ParsedServer};
-use kmux_client::token::read_local_token;
 
 use crate::cli::ResolvedConnection;
 
 /// Resolve CLI args to a [`ResolvedTarget`] without any network I/O.
 ///
-/// All I/O (daemon probe, SSH negotiation, TLS/QUIC handshake) happens
-/// inside [`kmux_client::pipeline::run_bootstrap`]. This function is a
-/// pure parser so the resulting target can be handed to either the TUI
-/// or `--dry-run` without divergence.
+/// `server == None` selects the local daemon (UDS). Any non-empty string
+/// resolves to an SSH target — there is no direct-QUIC CLI surface. All I/O
+/// (daemon probe, SSH negotiation, handshake) happens inside
+/// [`kmux_client::pipeline::run_bootstrap`].
 pub fn parse_target(
     server: Option<&str>,
     ssh_port_override: Option<u16>,
-    no_ssh: bool,
-    host_override: Option<&str>,
-    port_override: Option<u16>,
-    token_override: Option<&str>,
-    accept_invalid_certs: bool,
 ) -> (ResolvedTarget, Option<ParsedServer>) {
-    let is_local = server.is_none()
-        && host_override.is_none()
-        && port_override.is_none()
-        && token_override.is_none();
-
     let parsed = server.map(ssh::parse_server_string);
 
-    let ssh_target = if !no_ssh {
-        parsed
-            .as_ref()
-            .and_then(ssh::resolve_remote_target)
-            .map(|mut t| {
-                if let Some(p) = ssh_port_override {
-                    t.ssh_port = Some(p);
-                }
-                t
-            })
-    } else {
-        None
-    };
-
-    let target = if let Some(target) = ssh_target {
-        ResolvedTarget::Ssh {
-            target,
-            accept_invalid_certs: true,
+    let target = match parsed.as_ref().and_then(ssh::resolve_remote_target) {
+        Some(mut t) => {
+            if let Some(p) = ssh_port_override {
+                t.ssh_port = Some(p);
+            }
+            ResolvedTarget::Ssh {
+                target: t,
+                accept_invalid_certs: true,
+            }
         }
-    } else if is_local {
-        ResolvedTarget::LocalDaemon
-    } else {
-        let (host, port) = if let Some(ref p) = parsed {
-            (p.host.clone(), port_override.or(p.port).unwrap_or(8443))
-        } else {
-            (
-                host_override
-                    .map(|s| s.to_string())
-                    .unwrap_or_else(|| "127.0.0.1".to_string()),
-                port_override.unwrap_or(8443),
-            )
-        };
-        let token = token_override
-            .map(|s| s.to_string())
-            .or_else(read_local_token)
-            .unwrap_or_default();
-        ResolvedTarget::Direct {
-            host,
-            port,
-            token,
-            accept_invalid_certs,
-        }
+        None => ResolvedTarget::LocalDaemon,
     };
 
     (target, parsed)
@@ -83,39 +41,24 @@ pub fn parse_target(
 
 /// Resolve connection parameters for headless subcommands (`list-sessions`).
 ///
-/// Handles three modes: local daemon, SSH negotiation, or direct. Unlike the
-/// TUI path (which uses `parse_target` and defers all I/O to the pipeline),
-/// this performs SSH negotiation / daemon ensure up front because `list.rs`
-/// speaks raw TCP rather than going through [`kmux_client::pipeline`].
+/// Two modes: local daemon (UDS-mediated TCP token) or SSH (full negotiation
+/// plus tunnel). Unlike the TUI path, this performs negotiation up front
+/// because list.rs speaks raw TCP rather than going through the bootstrap
+/// pipeline.
 pub async fn resolve_connection(
     server: Option<&str>,
     ssh_port_override: Option<u16>,
-    no_ssh: bool,
-    host_override: Option<&str>,
-    port_override: Option<u16>,
-    token_override: Option<&str>,
-    _accept_invalid_certs: bool,
 ) -> anyhow::Result<ResolvedConnection> {
-    let is_local = server.is_none()
-        && host_override.is_none()
-        && port_override.is_none()
-        && token_override.is_none();
-
     let parsed = server.map(ssh::parse_server_string);
-
-    let ssh_target = if !no_ssh {
-        parsed
-            .as_ref()
-            .and_then(ssh::resolve_remote_target)
-            .map(|mut t| {
-                if let Some(p) = ssh_port_override {
-                    t.ssh_port = Some(p);
-                }
-                t
-            })
-    } else {
-        None
-    };
+    let ssh_target = parsed
+        .as_ref()
+        .and_then(ssh::resolve_remote_target)
+        .map(|mut t| {
+            if let Some(p) = ssh_port_override {
+                t.ssh_port = Some(p);
+            }
+            t
+        });
 
     if let Some(target) = ssh_target {
         tracing::info!(
@@ -123,16 +66,16 @@ pub async fn resolve_connection(
             user = ?target.user,
             "SSH negotiation starting"
         );
-        match ssh::negotiate(&target).await {
-            Ok(session) => Ok(ResolvedConnection {
-                host: "127.0.0.1".to_string(),
-                port: session.local_tcp_port,
-                tcp_port: None,
-                token: session.token,
-            }),
-            Err(e) => Err(anyhow::anyhow!("SSH negotiation failed: {e}")),
-        }
-    } else if is_local {
+        let session = ssh::negotiate(&target)
+            .await
+            .map_err(|e| anyhow::anyhow!("SSH negotiation failed: {e}"))?;
+        Ok(ResolvedConnection {
+            host: "127.0.0.1".to_string(),
+            port: session.local_tcp_port,
+            tcp_port: None,
+            token: session.token,
+        })
+    } else {
         let status = kmux_client::daemon::ensure_compatible_daemon().await?;
         Ok(ResolvedConnection {
             host: "127.0.0.1".to_string(),
@@ -140,28 +83,57 @@ pub async fn resolve_connection(
             tcp_port: Some(status.tcp_port),
             token: status.token,
         })
-    } else {
-        let (host, port) = if let Some(ref parsed) = parsed {
-            (
-                parsed.host.clone(),
-                port_override.or(parsed.port).unwrap_or(8443),
-            )
-        } else {
-            let host = host_override
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| "127.0.0.1".to_string());
-            let port = port_override.unwrap_or(8443);
-            (host, port)
-        };
-        let token = token_override
-            .map(|s| s.to_string())
-            .or_else(read_local_token)
-            .unwrap_or_default();
-        Ok(ResolvedConnection {
-            host,
-            port,
-            tcp_port: None,
-            token,
-        })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn no_server_is_local_daemon() {
+        let (target, parsed) = parse_target(None, None);
+        assert!(matches!(target, ResolvedTarget::LocalDaemon));
+        assert!(parsed.is_none());
+    }
+
+    #[test]
+    fn bare_hostname_is_ssh() {
+        // The historical bug: `kmux focalors` parsed to a Direct target with
+        // an empty token, dropping the user into the unrecoverable Connect
+        // form. After the SSH-strict change every non-empty server string
+        // resolves to an Ssh target.
+        let (target, _) = parse_target(Some("focalors"), None);
+        match target {
+            ResolvedTarget::Ssh { target, .. } => {
+                assert_eq!(target.host, "focalors");
+                assert!(target.ssh_port.is_none());
+            }
+            other => panic!("expected Ssh target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn host_colon_port_is_ssh_port() {
+        // `host:port` (no `@`) is the SSH port, not a daemon data-plane port.
+        let (target, _) = parse_target(Some("focalors:2222"), None);
+        match target {
+            ResolvedTarget::Ssh { target, .. } => {
+                assert_eq!(target.host, "focalors");
+                assert_eq!(target.ssh_port, Some(2222));
+            }
+            other => panic!("expected Ssh target, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn ssh_port_flag_overrides_server_string() {
+        let (target, _) = parse_target(Some("focalors:2222"), Some(2223));
+        match target {
+            ResolvedTarget::Ssh { target, .. } => {
+                assert_eq!(target.ssh_port, Some(2223));
+            }
+            other => panic!("expected Ssh target, got {other:?}"),
+        }
     }
 }

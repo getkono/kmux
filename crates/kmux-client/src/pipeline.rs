@@ -34,17 +34,15 @@ const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Target to bootstrap against, resolved from CLI arguments but without
 /// any network or filesystem I/O having been performed yet. All I/O
 /// happens inside `run_bootstrap`.
+///
+/// Remote targets are always SSH — there is no direct-transport bootstrap
+/// surface. After successful SSH auth the `TransportSupervisor` may swap
+/// the data plane to direct QUIC for performance, but the *handshake*
+/// always flows through SSH.
 #[derive(Debug, Clone)]
 pub enum ResolvedTarget {
     /// Connect to the local daemon. Starts one on demand if not running.
     LocalDaemon,
-    /// Direct transport to `host:port` with an explicit token (no SSH).
-    Direct {
-        host: String,
-        port: u16,
-        token: String,
-        accept_invalid_certs: bool,
-    },
     /// SSH negotiation, then TLS-TCP over the resulting `-L` tunnel.
     Ssh {
         target: RemoteTarget,
@@ -56,7 +54,6 @@ impl ResolvedTarget {
     pub fn label(&self) -> String {
         match self {
             ResolvedTarget::LocalDaemon => "local-daemon".to_string(),
-            ResolvedTarget::Direct { host, port, .. } => format!("direct {host}:{port}"),
             ResolvedTarget::Ssh { target, .. } => match &target.user {
                 Some(u) => format!("ssh {u}@{}", target.host),
                 None => format!("ssh {}", target.host),
@@ -318,20 +315,6 @@ pub async fn run_bootstrap(
 
     let plan = match target {
         ResolvedTarget::LocalDaemon => prepare_local_daemon(observer).await?,
-        ResolvedTarget::Direct {
-            host,
-            port,
-            token,
-            accept_invalid_certs,
-        } => ConnectPlan {
-            transport: TransportKind::Quic,
-            host,
-            port,
-            token,
-            accept_invalid_certs,
-            is_local: false,
-            ssh_context: None,
-        },
         ResolvedTarget::Ssh {
             target,
             accept_invalid_certs,
@@ -661,14 +644,6 @@ mod tests {
     #[test]
     fn resolved_target_label_formats_each_variant() {
         assert_eq!(ResolvedTarget::LocalDaemon.label(), "local-daemon");
-
-        let d = ResolvedTarget::Direct {
-            host: "example.com".into(),
-            port: 8443,
-            token: "t".into(),
-            accept_invalid_certs: false,
-        };
-        assert_eq!(d.label(), "direct example.com:8443");
 
         let s = ResolvedTarget::Ssh {
             target: RemoteTarget {

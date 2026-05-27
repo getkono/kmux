@@ -22,32 +22,45 @@ pub fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &mut App) {
         })
         .collect();
 
+    // Index 0 is a synthetic "[+] New session" affordance that transitions
+    // to the directory picker on select. Real sessions occupy indices 1..N+1.
+    let total_rows = matches.len() + 1;
+    let visible = total_rows.min(8);
     let width = 52u16.min(area.width.saturating_sub(4));
-    let height = (matches.len().min(8) as u16 + 4).min(area.height.saturating_sub(2));
+    let height = (visible as u16 + 4).min(area.height.saturating_sub(2));
     let overlay_area = centered_overlay(area, width, height);
 
-    let items: Vec<PickerItem> = matches
-        .iter()
-        .take(8)
-        .enumerate()
-        .map(|(i, entry)| {
-            let is_selected = i == app.session_picker_selected;
-            let cursor = if is_selected { ">" } else { " " };
-            let name = app.mgr.display_name_for(&entry.meta.word_id);
-            let pane_count = entry.panes.len();
-            PickerItem {
-                text: format!("{cursor} {name:<20} {pane_count}p  {}", entry.meta.cwd),
-                style: if is_selected {
-                    Style::default()
-                        .fg(theme.bg)
-                        .bg(theme.accent)
-                        .add_modifier(Modifier::BOLD)
-                } else {
-                    Style::default().fg(theme.fg).bg(theme.bg)
-                },
-            }
-        })
-        .collect();
+    let style_for = |is_selected: bool| {
+        if is_selected {
+            Style::default()
+                .fg(theme.bg)
+                .bg(theme.accent)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme.fg).bg(theme.bg)
+        }
+    };
+
+    let mut items: Vec<PickerItem> = Vec::with_capacity(visible);
+    {
+        let is_selected = app.session_picker_selected == 0;
+        let cursor = if is_selected { ">" } else { " " };
+        items.push(PickerItem {
+            text: format!("{cursor} [+] New session…"),
+            style: style_for(is_selected),
+        });
+    }
+    for (i, entry) in matches.iter().take(visible.saturating_sub(1)).enumerate() {
+        let row = i + 1;
+        let is_selected = row == app.session_picker_selected;
+        let cursor = if is_selected { ">" } else { " " };
+        let name = app.mgr.display_name_for(&entry.meta.word_id);
+        let pane_count = entry.panes.len();
+        items.push(PickerItem {
+            text: format!("{cursor} {name:<20} {pane_count}p  {}", entry.meta.cwd),
+            style: style_for(is_selected),
+        });
+    }
 
     let item_count = items.len();
     let first_row = render_list_picker(

@@ -7,6 +7,11 @@ const MAX_SERVERS: usize = 10;
 const CACHE_FILE: &str = "recent_servers.json";
 
 /// How the client connects to this server.
+///
+/// Cache entries written by older builds may contain a `Direct { host, port }`
+/// variant. Those entries fail to deserialize; the loader falls back to an
+/// empty cache, which is harmless — the user simply loses their recent-servers
+/// list and rebuilds it on next use.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerKind {
     Local,
@@ -14,10 +19,6 @@ pub enum ServerKind {
         user: Option<String>,
         host: String,
         ssh_port: Option<u16>,
-    },
-    Direct {
-        host: String,
-        port: u16,
     },
 }
 

@@ -58,19 +58,12 @@ impl App {
         // `None` pends forever so the select! arm is dormant when no bootstrap is running.
         let mut bootstrap_rx: Option<mpsc::UnboundedReceiver<BootstrapTaskResult>> = None;
 
-        // Initial bootstrap: if the parsed target is actionable, spawn the pipeline.
-        // Direct-without-token leaves `pending_target` set but enters the Connect
-        // form; the user submits that to produce a `Reconnect`.
+        // Initial bootstrap: every actionable target (LocalDaemon / Ssh) goes
+        // straight to the pipeline. No interactive form gates this anymore.
         if let Some(target) = self.pending_target.take() {
-            let actionable = match &target {
-                ResolvedTarget::Direct { token, .. } => !token.is_empty(),
-                _ => true,
-            };
-            if actionable {
-                let (bs_tx, bs_rx) = mpsc::unbounded_channel();
-                bootstrap_rx = Some(bs_rx);
-                self.start_bootstrap(target, srv_tx.clone(), BootstrapPhase::Initial, bs_tx);
-            }
+            let (bs_tx, bs_rx) = mpsc::unbounded_channel();
+            bootstrap_rx = Some(bs_rx);
+            self.start_bootstrap(target, srv_tx.clone(), BootstrapPhase::Initial, bs_tx);
         }
 
         let render_interval = Duration::from_millis(33); // ~30 FPS
@@ -181,19 +174,6 @@ impl App {
                                                 BootstrapPhase::Initial,
                                                 bs_tx,
                                             );
-                                        }
-                                        SwitchTarget::Direct { host, port } => {
-                                            self.connect_host = host.clone();
-                                            self.connect_port = port.to_string();
-                                            self.connect_token.clear();
-                                            self.ssh_target = None;
-                                            self.is_local = false;
-                                            self.server_display = format!("{}:{}", host, port);
-                                            self.server_string = self.server_display.clone();
-                                            self.server_kind = ServerKind::Direct { host, port };
-                                            self.mode = Mode::Connect {
-                                                field: crate::mode::ConnectField::Token,
-                                            };
                                         }
                                     }
                                     self.needs_render = true;

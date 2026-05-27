@@ -97,11 +97,6 @@ async fn async_main() -> anyhow::Result<()> {
                 server: server_args.server.as_deref(),
                 ssh_port: server_args.ssh_port,
                 format,
-                host_override: server_args.host.as_deref(),
-                port_override: server_args.port,
-                token_override: server_args.token.as_deref(),
-                no_ssh: server_args.no_ssh,
-                accept_invalid_certs: server_args.accept_invalid_certs,
             })
             .await;
         }
@@ -127,11 +122,6 @@ async fn async_main() -> anyhow::Result<()> {
     let (target, parsed_server) = parse_target(
         cli.connect.server_args.server.as_deref(),
         cli.connect.server_args.ssh_port,
-        cli.connect.server_args.no_ssh,
-        cli.connect.server_args.host.as_deref(),
-        cli.connect.server_args.port,
-        cli.connect.server_args.token.as_deref(),
-        cli.connect.server_args.accept_invalid_certs,
     );
 
     // Compute effective cwd: explicit --cwd > :path from server string > local cwd

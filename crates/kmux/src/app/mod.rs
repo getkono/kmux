@@ -76,7 +76,6 @@ pub(crate) enum KeyResult {
 pub enum SwitchTarget {
     Local,
     Ssh(kmux_client::ssh::RemoteTarget),
-    Direct { host: String, port: u16 },
 }
 
 pub struct App {
@@ -88,11 +87,6 @@ pub struct App {
     pub hud_visible: bool,
     pub metrics_overlay_visible: bool,
     pub force_snapshot_mode: bool,
-
-    // Connect form input fields
-    pub connect_host: String,
-    pub connect_port: String,
-    pub connect_token: String,
 
     // Reconnection bookkeeping
     pub disconnect_at: Option<Instant>,
@@ -185,58 +179,24 @@ impl App {
         auto_cwd: Option<String>,
         kitty_keyboard_supported: bool,
     ) -> Self {
-        use crate::mode::{ConnectField, Mode};
+        use crate::mode::Mode;
 
-        let (is_local, connect_host, connect_port, connect_token, accept_invalid_certs, ssh_target) =
-            match &target {
-                ResolvedTarget::LocalDaemon => (
-                    true,
-                    "127.0.0.1".to_string(),
-                    String::new(),
-                    String::new(),
-                    true,
-                    None,
-                ),
-                ResolvedTarget::Direct {
-                    host,
-                    port,
-                    token,
-                    accept_invalid_certs,
-                } => (
-                    false,
-                    host.clone(),
-                    port.to_string(),
-                    token.clone(),
-                    *accept_invalid_certs,
-                    None,
-                ),
-                ResolvedTarget::Ssh {
-                    target,
-                    accept_invalid_certs,
-                } => (
-                    false,
-                    String::new(),
-                    String::new(),
-                    String::new(),
-                    *accept_invalid_certs,
-                    Some(target.clone()),
-                ),
-            };
-
-        // Direct-with-no-token is the only case that needs the Connect form;
-        // every other path (Local, SSH, Direct with token) is ready to bootstrap.
-        let initial_mode = match &target {
-            ResolvedTarget::Direct { token, .. } if token.is_empty() => Mode::Connect {
-                field: ConnectField::Host,
-            },
-            _ => Mode::Normal,
+        let (is_local, accept_invalid_certs, ssh_target) = match &target {
+            ResolvedTarget::LocalDaemon => (true, true, None),
+            ResolvedTarget::Ssh {
+                target,
+                accept_invalid_certs,
+            } => (false, *accept_invalid_certs, Some(target.clone())),
         };
 
         let capabilities = crate::host_caps::detect(kitty_keyboard_supported);
 
         let (server_display, server_string, server_kind) = if is_local {
             ("localhost".to_string(), String::new(), ServerKind::Local)
-        } else if let Some(ref t) = ssh_target {
+        } else {
+            let t = ssh_target
+                .as_ref()
+                .expect("ssh_target must be Some when not local");
             let display = match &t.user {
                 Some(u) => format!("{}@{}", u, t.host),
                 None => t.host.clone(),
@@ -247,26 +207,14 @@ impl App {
                 ssh_port: t.ssh_port,
             };
             (display.clone(), display, kind)
-        } else {
-            let port_num: u16 = connect_port.parse().unwrap_or(8443);
-            let s = format!("{}:{}", connect_host, port_num);
-            (
-                s.clone(),
-                s,
-                ServerKind::Direct {
-                    host: connect_host.clone(),
-                    port: port_num,
-                },
-            )
         };
 
         // Seed SessionManager with placeholder host/port/token. `apply_outcome`
         // overwrites these when the bootstrap completes.
-        let port_num: u16 = connect_port.parse().unwrap_or(0);
         let mut mgr = SessionManager::new(
-            connect_host.clone(),
-            port_num,
-            connect_token.clone(),
+            "127.0.0.1".to_string(),
+            0,
+            String::new(),
             accept_invalid_certs,
             capabilities,
         );
@@ -275,13 +223,10 @@ impl App {
         Self {
             mgr,
             theme,
-            mode: initial_mode,
+            mode: Mode::Normal,
             hud_visible: false,
             metrics_overlay_visible: false,
             force_snapshot_mode: false,
-            connect_host,
-            connect_port,
-            connect_token,
             disconnect_at: None,
             session_picker_selected: 0,
             session_picker_search: String::new(),

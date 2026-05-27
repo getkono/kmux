@@ -53,7 +53,6 @@ pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
             ("Esc", "Cancel"),
         ],
         Mode::Help => vec![("any key", "Close")],
-        Mode::Connect { .. } => vec![("Tab", "Next field"), ("Enter", "Connect")],
         Mode::DirectoryPicker => vec![
             ("\u{2191}/\u{2193}", "Navigate"),
             ("Enter", "Open/create"),
@@ -84,7 +83,6 @@ pub fn mode_name(mode: &Mode) -> &'static str {
         Mode::SessionPicker => "SESSION PICKER",
         Mode::ServerPicker => "SERVER PICKER",
         Mode::Help => "HELP",
-        Mode::Connect { .. } => "CONNECT",
         Mode::DirectoryPicker => "OPEN SESSION",
         Mode::Connecting { .. } => "CONNECTING",
         Mode::Disconnected { .. } => "DISCONNECTED",

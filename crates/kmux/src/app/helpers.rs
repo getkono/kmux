@@ -7,7 +7,6 @@ use kmux_protocol::transport::bootstrap::EndpointAdvert;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::mode::ConnectField;
 use crate::mode::Mode;
 use crate::recent_servers::RecentServer;
 
@@ -31,12 +30,15 @@ impl App {
         for event in events {
             match event {
                 SessionEvent::AuthFailed { .. } => {
-                    self.mode = Mode::Connect {
-                        field: ConnectField::Host,
+                    // SSH-only architecture: auth failure on the data plane
+                    // means the SSH tunnel is up but the daemon rejected the
+                    // token. Surface as a disconnect; the user can reconnect.
+                    self.mode = Mode::Disconnected {
+                        reason: "authentication failed".into(),
                     };
                 }
                 SessionEvent::AuthOk => {
-                    if matches!(self.mode, Mode::Connect { .. }) {
+                    if matches!(self.mode, Mode::Connecting { .. }) {
                         self.mode = Mode::Normal;
                     }
                     info!("Auth succeeded");
@@ -97,10 +99,19 @@ impl App {
             } else {
                 self.mgr.create_session(None, Some(&cwd), size);
             }
-        } else {
-            // Remote without --session or path: show directory picker.
+        } else if self.mgr.session_list().is_empty() {
+            // Remote, no active sessions: pick a path for the first session.
             self.dir_picker_buffer = self.initial_cwd.clone();
             self.mode = Mode::DirectoryPicker;
+        } else {
+            // Remote with active sessions: let the user pick one (or hit the
+            // synthetic "[+] New session" entry to open the directory picker).
+            // Start with the first real session highlighted, not the new-session
+            // affordance, so the common case (resume an existing session) is
+            // one Enter away.
+            self.session_picker_selected = 1;
+            self.session_picker_search.clear();
+            self.mode = Mode::SessionPicker;
         }
     }
 
@@ -274,12 +285,6 @@ impl App {
                 };
                 format!("Reconnecting via SSH to {h}…")
             }
-            (ResolvedTarget::Direct { host, port, .. }, BootstrapPhase::Initial) => {
-                format!("Connecting to {host}:{port}…")
-            }
-            (ResolvedTarget::Direct { host, port, .. }, BootstrapPhase::Reconnect) => {
-                format!("Reconnecting to {host}:{port}…")
-            }
         };
 
         self.mode = Mode::Connecting { target_display };
@@ -322,6 +327,9 @@ impl App {
     }
 
     /// Build the target to bootstrap against from current App state.
+    ///
+    /// The app is always in one of two states: local daemon (UDS) or a
+    /// remote SSH target. There is no direct-transport bootstrap surface.
     pub(super) fn current_target(&self) -> kmux_client::pipeline::ResolvedTarget {
         use kmux_client::pipeline::ResolvedTarget;
         if let Some(target) = &self.ssh_target {
@@ -330,15 +338,6 @@ impl App {
                 accept_invalid_certs: self.mgr.accept_invalid_certs(),
             };
         }
-        if self.is_local {
-            return ResolvedTarget::LocalDaemon;
-        }
-        let port = self.connect_port.parse().unwrap_or(8443);
-        ResolvedTarget::Direct {
-            host: self.connect_host.clone(),
-            port,
-            token: self.connect_token.clone(),
-            accept_invalid_certs: self.mgr.accept_invalid_certs(),
-        }
+        ResolvedTarget::LocalDaemon
     }
 }

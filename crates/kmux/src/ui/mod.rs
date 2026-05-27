@@ -4,15 +4,11 @@ use crate::app::App;
 use crate::mode::Mode;
 
 mod bars;
-mod connect;
 mod grid;
 mod overlays;
 
 pub fn render(f: &mut Frame, app: &mut App) {
-    match app.mode.clone() {
-        Mode::Connect { field } => connect::render_connect(f, app, &field),
-        _ => render_terminal(f, app),
-    }
+    render_terminal(f, app);
 }
 
 fn render_terminal(f: &mut Frame, app: &mut App) {

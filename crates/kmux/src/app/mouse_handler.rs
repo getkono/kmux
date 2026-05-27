@@ -126,22 +126,30 @@ impl App {
     fn activate_picker_selection(&mut self) -> Option<KeyResult> {
         match self.mode {
             Mode::SessionPicker => {
-                let search = self.session_picker_search.to_lowercase();
-                let word_id = self
-                    .mgr
-                    .session_list()
-                    .iter()
-                    .filter(|e| {
-                        search.is_empty()
-                            || e.meta.name.to_lowercase().contains(&search)
-                            || e.meta.word_id.to_lowercase().contains(&search)
-                    })
-                    .nth(self.session_picker_selected)
-                    .map(|e| e.meta.word_id.clone());
-                if let Some(word_id) = word_id {
-                    self.mgr.select_session(word_id);
+                // Mirror key_handler::Action::SelectPickerEntry. Index 0 is the
+                // synthetic "[+] New session" affordance.
+                if self.session_picker_selected == 0 {
+                    self.dir_picker_buffer = self.initial_cwd.clone();
+                    self.dir_picker_selected = 0;
+                    self.mode = Mode::DirectoryPicker;
+                } else {
+                    let search = self.session_picker_search.to_lowercase();
+                    let word_id = self
+                        .mgr
+                        .session_list()
+                        .iter()
+                        .filter(|e| {
+                            search.is_empty()
+                                || e.meta.name.to_lowercase().contains(&search)
+                                || e.meta.word_id.to_lowercase().contains(&search)
+                        })
+                        .nth(self.session_picker_selected - 1)
+                        .map(|e| e.meta.word_id.clone());
+                    if let Some(word_id) = word_id {
+                        self.mgr.select_session(word_id);
+                    }
+                    self.mode = Mode::Normal;
                 }
-                self.mode = Mode::Normal;
                 None
             }
             Mode::ServerPicker => {
@@ -163,7 +171,6 @@ impl App {
                         host,
                         ssh_port,
                     }),
-                    ServerKind::Direct { host, port } => SwitchTarget::Direct { host, port },
                 };
                 Some(KeyResult::SwitchServer(target))
             }

@@ -33,8 +33,6 @@ pub enum Mode {
     ServerPicker,
     /// Help overlay
     Help,
-    /// Connect screen (typing host/port/token)
-    Connect { field: ConnectField },
     /// Directory picker for remote connections: type a path to open/create a session
     DirectoryPicker,
     /// Background bootstrap in progress. Input is held; Esc cancels.
@@ -61,13 +59,6 @@ pub struct CommandState {
     /// freely editing. Lets ↑/↓ scroll history without losing the in-progress
     /// buffer if the user changes their mind.
     pub history_pos: Option<usize>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ConnectField {
-    Host,
-    Port,
-    Token,
 }
 
 /// Actions that the app should perform in response to key input.
@@ -133,13 +124,6 @@ pub enum Action {
     // Mode transitions
     ExitToNormal,
 
-    // Connect screen
-    ConnectSubmit,
-    ConnectNextField,
-    ConnectPrevField,
-    ConnectChar(char),
-    ConnectBackspace,
-
     // Directory picker (remote connection)
     DirPickerChar(char),
     DirPickerBackspace,
@@ -195,10 +179,9 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::ConfirmCloseSession { .. } => resolve_confirm_close(key),
         Mode::RenameSession { .. } => resolve_rename(key, mods),
         Mode::SessionPicker => resolve_session_picker(key, mods),
-        Mode::ServerPicker => resolve_server_picker(key),
+        Mode::ServerPicker => resolve_server_picker(key, mods),
         Mode::Help => resolve_help(key),
-        Mode::Connect { field } => resolve_connect(key, mods, field),
-        Mode::DirectoryPicker => resolve_dir_picker(key),
+        Mode::DirectoryPicker => resolve_dir_picker(key, mods),
         Mode::Connecting { .. } => resolve_connecting(key, mods),
         Mode::Disconnected { .. } => resolve_disconnected(key),
         Mode::Command(_) => resolve_command(key, mods),

@@ -35,15 +35,7 @@ const TEST_DURATION: Duration = Duration::from_secs(10);
 ///
 /// If both flags are set, `test_mode` is true and a warning is printed.
 pub async fn run_dry_run(args: &ServerArgs, test_mode: bool) -> anyhow::Result<()> {
-    let (target, _) = parse_target(
-        args.server.as_deref(),
-        args.ssh_port,
-        args.no_ssh,
-        args.host.as_deref(),
-        args.port,
-        args.token.as_deref(),
-        args.accept_invalid_certs,
-    );
+    let (target, _) = parse_target(args.server.as_deref(), args.ssh_port);
 
     let observer = ConsoleObserver::new(Instant::now());
     observer.header(&target);

@@ -1,7 +1,13 @@
 use kmux_client::input::signal_from_key;
 use kmux_client::key::{Key, Modifiers, NamedKey};
 
-use super::{Action, ConnectField, Mode, is_mode_key};
+use super::{Action, Mode, is_mode_key};
+
+/// True for the Ctrl+C cancel chord used by every text-input mode as a
+/// defense-in-depth exit hatch (alongside Esc).
+fn is_ctrl_c(key: &Key, mods: Modifiers) -> bool {
+    mods.contains(Modifiers::CTRL) && matches!(key, Key::Character(c) if c == "c")
+}
 
 pub fn resolve_normal(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     if is_mode_key(key, mods) {
@@ -161,7 +167,10 @@ pub fn resolve_disconnected(key: &Key) -> (Option<Mode>, Action) {
     }
 }
 
-pub fn resolve_rename(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+pub fn resolve_rename(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+    if is_ctrl_c(key, mods) {
+        return (Some(Mode::Normal), Action::None);
+    }
     match key {
         Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::None),
         // Return None for mode: the action handler owns the transition so it
@@ -182,8 +191,13 @@ pub fn resolve_rename(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
 /// Generic picker key resolver. `close`, `select`, `up`, `down`, `backspace`
 /// produce the mode transition / action for those keys. `char_action` maps typed
 /// characters to their picker-specific action variant.
+///
+/// Both Esc and Ctrl+C exit via the `close` action. Ctrl+C is mandatory as a
+/// defense against text-input modes accidentally swallowing the chord.
+#[allow(clippy::too_many_arguments)]
 fn resolve_picker(
     key: &Key,
+    mods: Modifiers,
     close: Action,
     select: Action,
     up: Action,
@@ -191,6 +205,9 @@ fn resolve_picker(
     backspace: Action,
     char_action: fn(char) -> Action,
 ) -> (Option<Mode>, Action) {
+    if is_ctrl_c(key, mods) {
+        return (Some(Mode::Normal), close);
+    }
     match key {
         Key::Named(NamedKey::Escape) => (Some(Mode::Normal), close),
         Key::Named(NamedKey::Enter) => (Some(Mode::Normal), select),
@@ -208,9 +225,10 @@ fn resolve_picker(
     }
 }
 
-pub fn resolve_session_picker(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+pub fn resolve_session_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     resolve_picker(
         key,
+        mods,
         Action::CloseSessionPicker,
         Action::SelectPickerEntry,
         Action::PickerUp,
@@ -220,9 +238,10 @@ pub fn resolve_session_picker(key: &Key, _mods: Modifiers) -> (Option<Mode>, Act
     )
 }
 
-pub fn resolve_server_picker(key: &Key) -> (Option<Mode>, Action) {
+pub fn resolve_server_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     resolve_picker(
         key,
+        mods,
         Action::ServerPickerClose,
         Action::ServerPickerSelect,
         Action::ServerPickerUp,
@@ -238,9 +257,10 @@ pub fn resolve_help(key: &Key) -> (Option<Mode>, Action) {
     (Some(Mode::Normal), Action::None)
 }
 
-pub fn resolve_dir_picker(key: &Key) -> (Option<Mode>, Action) {
+pub fn resolve_dir_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     resolve_picker(
         key,
+        mods,
         Action::DirPickerCancel,
         Action::DirPickerSubmit,
         Action::DirPickerUp,
@@ -300,32 +320,6 @@ pub fn resolve_command(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
                 } else {
                     (None, Action::CommandChar(ch))
                 }
-            } else {
-                (None, Action::None)
-            }
-        }
-        _ => (None, Action::None),
-    }
-}
-
-pub fn resolve_connect(
-    key: &Key,
-    mods: Modifiers,
-    _field: &ConnectField,
-) -> (Option<Mode>, Action) {
-    match key {
-        Key::Named(NamedKey::Enter) => (None, Action::ConnectSubmit),
-        Key::Named(NamedKey::Tab) => {
-            if mods.contains(Modifiers::SHIFT) {
-                (None, Action::ConnectPrevField)
-            } else {
-                (None, Action::ConnectNextField)
-            }
-        }
-        Key::Named(NamedKey::Backspace) => (None, Action::ConnectBackspace),
-        Key::Character(c) => {
-            if let Some(ch) = c.chars().next() {
-                (None, Action::ConnectChar(ch))
             } else {
                 (None, Action::None)
             }
@@ -423,6 +417,52 @@ mod tests {
     #[test]
     fn locked_ctrl_g_unlocks() {
         let (mode, _) = resolve(&Mode::Locked, &Key::Character("g".into()), Modifiers::CTRL);
+        assert_eq!(mode, Some(Mode::Normal));
+    }
+
+    #[test]
+    fn ctrl_c_cancels_session_picker() {
+        let (mode, action) = resolve(
+            &Mode::SessionPicker,
+            &Key::Character("c".into()),
+            Modifiers::CTRL,
+        );
+        assert_eq!(mode, Some(Mode::Normal));
+        assert_eq!(action, Action::CloseSessionPicker);
+    }
+
+    #[test]
+    fn ctrl_c_cancels_directory_picker() {
+        let (mode, action) = resolve(
+            &Mode::DirectoryPicker,
+            &Key::Character("c".into()),
+            Modifiers::CTRL,
+        );
+        assert_eq!(mode, Some(Mode::Normal));
+        assert_eq!(action, Action::DirPickerCancel);
+    }
+
+    #[test]
+    fn ctrl_c_cancels_server_picker() {
+        let (mode, action) = resolve(
+            &Mode::ServerPicker,
+            &Key::Character("c".into()),
+            Modifiers::CTRL,
+        );
+        assert_eq!(mode, Some(Mode::Normal));
+        assert_eq!(action, Action::ServerPickerClose);
+    }
+
+    #[test]
+    fn ctrl_c_cancels_rename_mode() {
+        let (mode, _) = resolve(
+            &Mode::RenameSession {
+                word_id: "abc".into(),
+                buffer: "x".into(),
+            },
+            &Key::Character("c".into()),
+            Modifiers::CTRL,
+        );
         assert_eq!(mode, Some(Mode::Normal));
     }
 

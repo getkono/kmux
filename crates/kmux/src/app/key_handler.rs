@@ -2,7 +2,7 @@ use crossterm::event::{KeyEvent, KeyEventKind};
 
 use crate::cmd;
 use crate::key_convert;
-use crate::mode::{self, Action, ConnectField, Mode};
+use crate::mode::{self, Action, Mode};
 use crate::recent_servers::ServerKind;
 
 use super::{App, COMMAND_HISTORY_CAP, KeyResult, SwitchTarget};
@@ -124,22 +124,31 @@ impl App {
                 self.mode = Mode::Normal;
             }
             Action::SelectPickerEntry => {
-                let search = self.session_picker_search.to_lowercase();
-                let matches: Vec<_> = self
-                    .mgr
-                    .session_list()
-                    .iter()
-                    .filter(|e| {
-                        search.is_empty()
-                            || e.meta.name.to_lowercase().contains(&search)
-                            || e.meta.word_id.to_lowercase().contains(&search)
-                    })
-                    .map(|e| e.meta.word_id.clone())
-                    .collect();
-                if let Some(word_id) = matches.get(self.session_picker_selected) {
-                    self.mgr.select_session(word_id.clone());
+                // Index 0 is the synthetic "[+] New session" affordance — hand
+                // off to the directory picker so the user picks a path for the
+                // new session. Real sessions occupy indices 1..N+1.
+                if self.session_picker_selected == 0 {
+                    self.dir_picker_buffer = self.initial_cwd.clone();
+                    self.dir_picker_selected = 0;
+                    self.mode = Mode::DirectoryPicker;
+                } else {
+                    let search = self.session_picker_search.to_lowercase();
+                    let matches: Vec<_> = self
+                        .mgr
+                        .session_list()
+                        .iter()
+                        .filter(|e| {
+                            search.is_empty()
+                                || e.meta.name.to_lowercase().contains(&search)
+                                || e.meta.word_id.to_lowercase().contains(&search)
+                        })
+                        .map(|e| e.meta.word_id.clone())
+                        .collect();
+                    if let Some(word_id) = matches.get(self.session_picker_selected - 1) {
+                        self.mgr.select_session(word_id.clone());
+                    }
+                    self.mode = Mode::Normal;
                 }
-                self.mode = Mode::Normal;
             }
             Action::PickerUp => {
                 if self.session_picker_selected > 0 {
@@ -158,7 +167,9 @@ impl App {
                             || e.meta.word_id.to_lowercase().contains(&s)
                     })
                     .count();
-                if count > 0 && self.session_picker_selected + 1 < count {
+                // total rows = 1 ("[+] New session") + filtered sessions.
+                let total = count + 1;
+                if self.session_picker_selected + 1 < total {
                     self.session_picker_selected += 1;
                 }
             }
@@ -206,16 +217,13 @@ impl App {
                             host,
                             ssh_port,
                         }),
-                        ServerKind::Direct { host, port } => SwitchTarget::Direct { host, port },
                     };
                     return KeyResult::SwitchServer(target);
                 }
             }
             Action::Disconnect => {
                 self.mgr.disconnect();
-                self.mode = Mode::Connect {
-                    field: ConnectField::Host,
-                };
+                self.mode = Mode::Normal;
             }
             Action::SendSignal(signal) => {
                 if let Some(pane_id) = self.mgr.active_pane_id().map(|s| s.to_string()) {
@@ -275,73 +283,6 @@ impl App {
                             let _ = tx.send(text);
                         }
                     });
-                }
-            }
-            Action::ConnectSubmit => {
-                return KeyResult::Reconnect;
-            }
-            Action::ConnectNextField => {
-                self.mode = match &self.mode {
-                    Mode::Connect {
-                        field: ConnectField::Host,
-                    } => Mode::Connect {
-                        field: ConnectField::Port,
-                    },
-                    Mode::Connect {
-                        field: ConnectField::Port,
-                    } => Mode::Connect {
-                        field: ConnectField::Token,
-                    },
-                    Mode::Connect {
-                        field: ConnectField::Token,
-                    } => Mode::Connect {
-                        field: ConnectField::Host,
-                    },
-                    other => other.clone(),
-                };
-            }
-            Action::ConnectPrevField => {
-                self.mode = match &self.mode {
-                    Mode::Connect {
-                        field: ConnectField::Host,
-                    } => Mode::Connect {
-                        field: ConnectField::Token,
-                    },
-                    Mode::Connect {
-                        field: ConnectField::Port,
-                    } => Mode::Connect {
-                        field: ConnectField::Host,
-                    },
-                    Mode::Connect {
-                        field: ConnectField::Token,
-                    } => Mode::Connect {
-                        field: ConnectField::Port,
-                    },
-                    other => other.clone(),
-                };
-            }
-            Action::ConnectChar(ch) => {
-                if let Mode::Connect { field } = &self.mode {
-                    match field {
-                        ConnectField::Host => self.connect_host.push(ch),
-                        ConnectField::Port => self.connect_port.push(ch),
-                        ConnectField::Token => self.connect_token.push(ch),
-                    }
-                }
-            }
-            Action::ConnectBackspace => {
-                if let Mode::Connect { field } = &self.mode {
-                    match field {
-                        ConnectField::Host => {
-                            self.connect_host.pop();
-                        }
-                        ConnectField::Port => {
-                            self.connect_port.pop();
-                        }
-                        ConnectField::Token => {
-                            self.connect_token.pop();
-                        }
-                    }
                 }
             }
             Action::ExitToNormal => {

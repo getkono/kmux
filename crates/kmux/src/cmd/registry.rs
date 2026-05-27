@@ -6,7 +6,7 @@
 //! 3. (Optional) Add a hint test in `cmd::hint::tests` if it has a non-trivial completer.
 
 use crate::app::App;
-use crate::mode::{ConnectField, Mode};
+use crate::mode::Mode;
 use crate::theme;
 
 use super::spec::{ArgSpec, CommandResult, CommandSpec, CommandSuccess, Completer};
@@ -139,9 +139,7 @@ fn cmd_clear_history(app: &mut App, _args: &[String]) -> CommandResult {
 
 fn cmd_disconnect(app: &mut App, _args: &[String]) -> CommandResult {
     app.mgr.disconnect();
-    app.mode = Mode::Connect {
-        field: ConnectField::Host,
-    };
+    app.mode = Mode::Normal;
     Ok(CommandSuccess::Ok)
 }
 
@@ -602,9 +600,6 @@ mod tests {
             hud_visible: false,
             metrics_overlay_visible: false,
             force_snapshot_mode: false,
-            connect_host: String::new(),
-            connect_port: String::new(),
-            connect_token: String::new(),
             disconnect_at: None,
             session_picker_selected: 0,
             session_picker_search: String::new(),

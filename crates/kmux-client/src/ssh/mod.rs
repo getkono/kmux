@@ -16,10 +16,13 @@ pub struct ParsedServer {
 ///
 /// Supported formats:
 /// - `user@host:/path`  — SSH with remote path (`:` + `/` = path, not port)
-/// - `user@host:2222`   — SSH with explicit port (`:` + digits = port)
+/// - `user@host:2222`   — SSH with explicit SSH port (`:` + digits = port)
 /// - `user@host`        — SSH with default port
-/// - `host:port`        — direct QUIC (no `@`)
-/// - `alias`            — hosts.toml lookup
+/// - `host:port`        — SSH on `port` with default user (`$USER`)
+/// - `host`             — SSH with default user and port (or `hosts.toml` alias)
+///
+/// Every port appearing in a server string is the **SSH** port. Daemon
+/// data-plane ports (QUIC, TCP+TLS) are ephemeral and exchanged in-band.
 pub fn parse_server_string(server: &str) -> ParsedServer {
     if let Some((user, rest)) = server.split_once('@') {
         if let Some((host, after_colon)) = rest.split_once(':') {
@@ -210,46 +213,40 @@ pub enum SshError {
 
 /// Parse `server` into a `RemoteTarget`.
 ///
-/// Returns `Some` when the string looks like a remote target (contains `@`,
-/// or matches a hosts.toml alias that has a `user` configured).
-/// Returns `None` for bare `host:port` strings (legacy direct-QUIC mode).
+/// Every non-empty server string resolves to an SSH target — there is no
+/// direct-QUIC path. The user is taken from (in order): explicit `user@…`,
+/// matching `hosts.toml` entry, `$USER` env var, or finally `None` (lets
+/// the `ssh` CLI fall through to `~/.ssh/config` / OS default).
 pub fn parse_remote_target(server: &str) -> Option<RemoteTarget> {
     let parsed = parse_server_string(server);
     resolve_remote_target(&parsed)
 }
 
-/// Resolve a `ParsedServer` into a `RemoteTarget` for SSH mode.
+/// Resolve a `ParsedServer` into an SSH `RemoteTarget`.
 ///
-/// Returns `Some` when the parsed server looks like an SSH target (has a user,
-/// or matches a hosts.toml alias with a user). Returns `None` for direct-QUIC.
+/// Returns `Some` for every parsed server with a non-empty host. The user is
+/// resolved from the explicit `user@` prefix, then `hosts.toml`, then `$USER`.
+/// If none of those produces a value the field is left `None` and `ssh` will
+/// fall through to its own defaults (`~/.ssh/config`, then OS user).
 pub fn resolve_remote_target(parsed: &ParsedServer) -> Option<RemoteTarget> {
-    if parsed.user.is_some() {
-        // Explicit user — apply hosts.toml overrides.
-        let config = HostsConfig::load();
-        let entry = config.get(&parsed.host).cloned().unwrap_or_default();
-        return Some(RemoteTarget {
-            user: parsed.user.clone(),
-            host: entry.hostname.unwrap_or_else(|| parsed.host.clone()),
-            ssh_port: parsed.port.or(entry.ssh_port),
-        });
+    if parsed.host.is_empty() {
+        return None;
     }
 
-    // No user in string — check hosts.toml alias.
     let config = HostsConfig::load();
-    if let Some(entry) = config.get(&parsed.host)
-        && entry.user.is_some()
-    {
-        return Some(RemoteTarget {
-            user: entry.user.clone(),
-            host: entry
-                .hostname
-                .clone()
-                .unwrap_or_else(|| parsed.host.clone()),
-            ssh_port: parsed.port.or(entry.ssh_port),
-        });
-    }
+    let entry = config.get(&parsed.host).cloned().unwrap_or_default();
 
-    None
+    let user = parsed
+        .user
+        .clone()
+        .or_else(|| entry.user.clone())
+        .or_else(|| std::env::var("USER").ok().filter(|s| !s.is_empty()));
+
+    Some(RemoteTarget {
+        user,
+        host: entry.hostname.unwrap_or_else(|| parsed.host.clone()),
+        ssh_port: parsed.port.or(entry.ssh_port),
+    })
 }
 
 /// Apply per-host overrides from `hosts.toml` (ssh_port, user, hostname).
@@ -377,10 +374,21 @@ mod tests {
     }
 
     #[test]
-    fn parse_remote_target_bare_host_no_ssh() {
-        // No '@', no hosts.toml entry → should return None
-        let result = parse_remote_target("192.168.1.1:7777");
-        assert!(result.is_none());
+    fn parse_remote_target_host_colon_port_is_ssh_port() {
+        // No '@' — falls back to $USER (or ssh defaults if USER is unset).
+        // The colon-port is interpreted as the SSH port, not a data-plane port.
+        let t = parse_remote_target("192.168.1.1:7777").unwrap();
+        assert_eq!(t.host, "192.168.1.1");
+        assert_eq!(t.ssh_port, Some(7777));
+    }
+
+    #[test]
+    fn parse_remote_target_bare_host_uses_default_user() {
+        let t = parse_remote_target("focalors").unwrap();
+        assert_eq!(t.host, "focalors");
+        assert!(t.ssh_port.is_none());
+        // Either $USER was set (Some), or ssh will use its own defaults (None);
+        // both are acceptable. The point is it resolves to an SSH target.
     }
 
     #[test]

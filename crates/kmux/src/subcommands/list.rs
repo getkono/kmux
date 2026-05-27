@@ -6,24 +6,10 @@ pub struct ListSessionsConfig<'a> {
     pub server: Option<&'a str>,
     pub ssh_port: Option<u16>,
     pub format: OutputFormat,
-    pub host_override: Option<&'a str>,
-    pub port_override: Option<u16>,
-    pub token_override: Option<&'a str>,
-    pub no_ssh: bool,
-    pub accept_invalid_certs: bool,
 }
 
 pub async fn run_list_sessions(cfg: ListSessionsConfig<'_>) -> anyhow::Result<()> {
-    let conn = resolve_connection(
-        cfg.server,
-        cfg.ssh_port,
-        cfg.no_ssh,
-        cfg.host_override,
-        cfg.port_override,
-        cfg.token_override,
-        cfg.accept_invalid_certs,
-    )
-    .await?;
+    let conn = resolve_connection(cfg.server, cfg.ssh_port).await?;
     let format = cfg.format;
 
     // Connect headlessly via TCP, send auth + SessionList, print results.

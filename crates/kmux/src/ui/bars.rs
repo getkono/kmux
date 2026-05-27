@@ -355,7 +355,6 @@ pub(super) fn mode_color(mode: &Mode, theme: &Theme) -> Color {
         Mode::SessionPicker => theme.accent,
         Mode::ServerPicker => theme.purple,
         Mode::Help => theme.accent,
-        Mode::Connect { .. } => theme.accent,
         Mode::DirectoryPicker => theme.accent,
         Mode::Connecting { .. } => theme.yellow,
         Mode::Disconnected { .. } => theme.red,
