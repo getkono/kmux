@@ -3,11 +3,12 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use kmux_protocol::messages::{InputMode, SessionStatus};
+use kmux_protocol::messages::{ClientCapabilities, InputMode, SessionStatus};
 use kmux_pty::config::{EnvBuilder, PtyConfig};
 use tracing::warn;
 
 use crate::backend::{BackendConfig, BackendSize, CapabilityHandles, DEFAULT_SCROLLBACK};
+use crate::capability::pane_spawn_env;
 use crate::relay::session_diff_loop;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::new_term_state;
@@ -54,11 +55,21 @@ impl ServerApp {
                 let size = persisted_pane.size.to_term_size();
 
                 // Spawn a fresh shell using the persisted program and args.
+                // Apply the same canonical env (`TERM`, `COLORTERM`,
+                // `TERM_PROGRAM`, `TERM_PROGRAM_VERSION`) that `spawn_pane_relay`
+                // uses for fresh panes — without this, restored shells would
+                // inherit whatever the daemon process happened to be launched
+                // with. The seed caps are the default because `pane_spawn_env`
+                // ignores them today; restored panes have no live client.
                 let config = PtyConfig::new(&persisted_pane.program)
                     .args(persisted_pane.args.clone())
                     .size(size.rows, size.cols)
                     .cwd(&effective_cwd)
-                    .env(EnvBuilder::new().auto_term(false));
+                    .env(
+                        EnvBuilder::new()
+                            .auto_term(false)
+                            .extend(pane_spawn_env(&ClientCapabilities::default())),
+                    );
 
                 if let Err(e) = self.manager.spawn(&pane_id, &config).await {
                     warn!("restore: failed to spawn fresh shell for {pane_id}: {e}");

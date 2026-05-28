@@ -43,6 +43,13 @@ pub fn intersect_for_atomics<'a>(
 ///   launcher leakage so that feature-sniffers (Starship, bat, etc.) see a
 ///   consistent identity.
 ///
+/// This is the "feature check" required by issue #19: TERM/COLORTERM are
+/// always safe to set because the PTY's immediate consumer is libghostty-vt,
+/// whose support for both is an architectural invariant rather than a runtime
+/// probe. Per-client downgrade for terminals that cannot render 24-bit RGB
+/// belongs in the forwarding layer (RGB→256), tracked under issue #32, and is
+/// the reason `ClientCapabilities.truecolor` exists on the wire today.
+///
 /// The `_seed_caps` parameter is kept for future use (e.g. per-capability
 /// TERM selection if the backend becomes configurable).
 pub fn pane_spawn_env(_seed_caps: &ClientCapabilities) -> HashMap<String, String> {
@@ -99,6 +106,24 @@ mod tests {
     fn pane_spawn_env_has_required_keys() {
         let c = caps(false, false, false);
         let env = pane_spawn_env(&c);
+        assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
+        assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
+        assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("kmux"));
+        assert!(env.contains_key("TERM_PROGRAM_VERSION"));
+    }
+
+    /// Mirrors the `EnvBuilder` pattern used by both `spawn_pane_relay`
+    /// (fresh panes) and the daemon's session-restore path. Guards against a
+    /// regression where the restore path silently dropped `pane_spawn_env`
+    /// and let restored shells inherit the daemon process's own TERM/COLORTERM.
+    #[test]
+    fn env_builder_pattern_for_pane_spawn_emits_canonical_vars() {
+        use kmux_pty::config::EnvBuilder;
+
+        let env = EnvBuilder::new()
+            .auto_term(false)
+            .extend(pane_spawn_env(&ClientCapabilities::default()))
+            .build();
         assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
         assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
         assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("kmux"));
