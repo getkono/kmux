@@ -1,5 +1,5 @@
-//! Drives the Zig build that produces `libkmux_ghostty.a` (a static archive
-//! wrapping libghostty-vt v1.3.1) and instructs Cargo to link it.
+//! Drives the Zig build that produces `libkmux_ghostty` (a shared library
+//! wrapping libghostty-vt v1.3.1) and instructs Cargo to link it dynamically.
 //!
 //! Build-time invariants:
 //! - The `vendor/ghostty` git submodule must be initialised before this runs.

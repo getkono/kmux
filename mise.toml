@@ -2,3 +2,8 @@
 # Pinned to ghostty v1.3.1's minimum_zig_version (build.zig.zon).
 zig = "0.15.2"
 rust = "stable"
+# `just release` regenerates CHANGELOG.md from conventional commits via git-cliff,
+# and the release workflow shells out to `just package`. Pinning both here means
+# local dev and CI runners resolve identical versions.
+"aqua:orhun/git-cliff" = "2.13.1"
+just = "1.50.0"
