@@ -1113,7 +1113,7 @@ dependencies = [
 
 [[package]]
 name = "kmux"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "arboard",
@@ -1137,7 +1137,7 @@ dependencies = [
 
 [[package]]
 name = "kmux-client"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bitflags 2.11.1",
@@ -1160,7 +1160,7 @@ dependencies = [
 
 [[package]]
 name = "kmux-ghostty"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "bitflags 2.11.1",
  "kmux-ghostty-sys",
@@ -1171,11 +1171,11 @@ dependencies = [
 
 [[package]]
 name = "kmux-ghostty-sys"
-version = "0.1.0"
+version = "0.2.0"
 
 [[package]]
 name = "kmux-protocol"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "bitflags 2.11.1",
@@ -1198,7 +1198,7 @@ dependencies = [
 
 [[package]]
 name = "kmux-pty"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "nix 0.31.2",
  "serde",
@@ -1210,7 +1210,7 @@ dependencies = [
 
 [[package]]
 name = "kmuxd"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "clap",

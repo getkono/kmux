@@ -3,10 +3,11 @@
 All notable changes to kmux are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
-## [Unreleased]
+## [0.2.0](https://github.com/getkono/kmux/releases/tag/v0.2.0) - 2026-05-28
 
 ### Features
 
+- **release:** Add just release and package recipes ([da64914](https://github.com/getkono/kmux/commit/da649143fe1440c6c4496cb420ec4fcaadd1f41b))
 - Enforce SSH-only remote connections, remove direct mode ([2a71211](https://github.com/getkono/kmux/commit/2a71211cc6107271aaa1ff27d6919fd45ead4689))
 - **input:** Structured key events with server-side Ghostty encoder ([a5a3580](https://github.com/getkono/kmux/commit/a5a358084f644fc9c9a2245fe635daac46365328))
 - **kmux:** Add command palette mode (Ctrl+G,Ctrl+/) ([290bcd8](https://github.com/getkono/kmux/commit/290bcd83a193041263eb4ef1c943202aaf89ee79))
@@ -142,6 +143,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- Document the release process ([5de619b](https://github.com/getkono/kmux/commit/5de619ba72974d5393bf192803245c599939c011))
 - Add terminology section in README ([9177082](https://github.com/getkono/kmux/commit/9177082a93e3359a0cd6dc8117afd4220f88d558))
 - Add correctness section on external dependency versioning ([4ed1944](https://github.com/getkono/kmux/commit/4ed19447fbf84d5d9044c52c6f2c735af98b5938))
 - Add VT sequence and terminal feature reference ([991d1d9](https://github.com/getkono/kmux/commit/991d1d9c804c1478ec34112c8303875bb82ff9c6))
@@ -152,6 +154,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Build System
 
+- **release:** Add git-cliff changelog tooling ([b4021de](https://github.com/getkono/kmux/commit/b4021de23421f630dbdc699ffbca8586a84d65b5))
 - Add just install and enforce bash -euo pipefail ([5277497](https://github.com/getkono/kmux/commit/5277497ac8525322e3b207c0c7519c71a76c0610))
 - Scaffold kmux-ghostty(-sys) crates with abi_version probe ([9b50149](https://github.com/getkono/kmux/commit/9b50149eaf3cce76e328dc6a6c58a36da01e8a90))
 - Vendor ghostty v1.3.1 and pin toolchains via mise ([d33378f](https://github.com/getkono/kmux/commit/d33378fb39e53065ac8ac127b040786090547696))
