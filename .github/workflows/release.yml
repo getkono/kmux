@@ -1,0 +1,162 @@
+name: Release
+
+# Cut a release with `just release <ver>` (bumps the version, tags v<ver>, pushes).
+# Pushing the tag fires this workflow, which builds native binaries for every
+# target and publishes them to the GitHub Release. Re-running on an existing tag
+# (push --force, or the workflow_dispatch button) replaces the assets in place.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to (re)build and publish, e.g. v0.2.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  # Resolve the tag once and guard that the tagged Cargo.toml version matches it.
+  prepare:
+    name: Prepare
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.resolve.outputs.tag }}
+      version: ${{ steps.resolve.outputs.version }}
+    steps:
+      - id: resolve
+        run: |
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${{ inputs.tag }}"
+          else
+            tag="${{ github.ref_name }}"
+          fi
+          echo "tag=$tag" >>"$GITHUB_OUTPUT"
+          echo "version=${tag#v}" >>"$GITHUB_OUTPUT"
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ steps.resolve.outputs.tag }}
+
+      - name: Verify Cargo.toml version matches tag
+        run: |
+          want="${{ steps.resolve.outputs.version }}"
+          have=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -n1)
+          if [[ "$have" != "$want" ]]; then
+            echo "::error::tag ${{ steps.resolve.outputs.tag }} expects workspace version '$want' but Cargo.toml has '$have'"
+            exit 1
+          fi
+          echo "workspace version '$have' matches tag '${{ steps.resolve.outputs.tag }}'"
+
+  # Native build per target (no cross-compilation: the Zig/Ghostty FFI build is
+  # easiest to keep correct on its own host). Mirrors ci.yml's submodule + mise +
+  # cache setup. fail-fast: false so one target's failure leaves the others' assets.
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
+          - target: aarch64-apple-darwin
+            os: macos-14 # Apple Silicon
+          - target: x86_64-apple-darwin
+            os: macos-15-intel # Intel (macos-13 runners were retired)
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Install toolchains (mise)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ matrix.target }}-cargo-release-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache zig build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            vendor/ghostty/.zig-cache
+          key: ${{ matrix.target }}-zig-${{ hashFiles('vendor/ghostty/build.zig', 'vendor/ghostty/build.zig.zon', 'crates/kmux-ghostty-sys/zig/**') }}
+          restore-keys: |
+            ${{ matrix.target }}-zig-
+
+      # `just package` needs patchelf on Linux to repoint kmuxd's rpath to $ORIGIN.
+      # macOS uses install_name_tool, which ships with the Xcode command line tools.
+      - name: Install patchelf (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y patchelf
+
+      - name: Package
+        run: just package
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kmux-${{ matrix.target }}
+          path: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          if-no-files-found: error
+
+  # Generate the release notes from git-cliff and publish all artifacts. Re-running
+  # updates the existing release and replaces same-named assets (overwrite_files).
+  release:
+    name: Publish
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # git-cliff needs the full history + the tag
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Install toolchains (mise)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - name: Generate release notes
+        run: |
+          # --current = the section for the tag at HEAD (we checked out the tag).
+          git cliff --current --strip all -o RELEASE_NOTES.md
+          test -s RELEASE_NOTES.md || git cliff --latest --strip all -o RELEASE_NOTES.md
+          test -s RELEASE_NOTES.md || git cliff --unreleased --strip all -o RELEASE_NOTES.md
+          echo "----- release notes -----"; cat RELEASE_NOTES.md
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2.6.2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: ${{ needs.prepare.outputs.tag }}
+          body_path: RELEASE_NOTES.md
+          files: |
+            dist/*.tar.gz
+            dist/*.tar.gz.sha256
+          fail_on_unmatched_files: true
+          overwrite_files: true
