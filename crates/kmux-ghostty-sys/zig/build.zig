@@ -1,9 +1,10 @@
-//! Builds `libkmux_ghostty.a` — the Zig wrapper that exposes a kmux-owned
-//! C ABI around libghostty-vt.
+//! Builds `libkmux_ghostty` — the Zig wrapper that exposes a kmux-owned
+//! C ABI around libghostty-vt. It is emitted as a shared library (see the
+//! `.linkage = .dynamic` note below).
 //!
 //! Cargo's `build.rs` invokes this via `zig build` with `--prefix`, the zig
 //! cache dirs, and `-Doptimize=...`. The installed artifact is linked by Rust
-//! as `static=kmux_ghostty`.
+//! as `dylib=kmux_ghostty`.
 
 const std = @import("std");
 
