@@ -24,3 +24,11 @@ target
 # wrapper is invoked manually from crates/kmux-ghostty-sys/zig/ for spikes).
 .zig-cache/
 zig-out/
+
+# === Release ===
+# `just package` stages tarballs here; the release workflow uploads them.
+/dist/
+# Release notes scratch file produced by `git cliff` in the release workflow.
+/RELEASE_NOTES.md
+# Backup left by the in-place version bump in `just release`.
+/Cargo.toml.bak
