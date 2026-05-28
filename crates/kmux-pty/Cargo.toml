@@ -1,7 +1,12 @@
 [package]
 name = "kmux-pty"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "PTY management for kmux."
 
 [features]
 tracing = ["dep:tracing"]

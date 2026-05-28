@@ -1,9 +1,12 @@
 [package]
 name = "kmux-ghostty"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
 description = "Safe Rust façade over libkmux_ghostty (Zig-based libghostty-vt wrapper)."
-publish = false
 
 [lib]
 path = "src/lib.rs"
@@ -12,5 +15,5 @@ path = "src/lib.rs"
 bitflags.workspace = true
 kmux-ghostty-sys.workspace = true
 kmux-protocol.workspace = true
-static_assertions = "1"
+static_assertions.workspace = true
 thiserror.workspace = true

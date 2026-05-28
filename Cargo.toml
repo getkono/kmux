@@ -2,6 +2,14 @@
 members = ["crates/*"]
 resolver = "2"
 
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+authors = ["Justin Chung <noreply@justinchung.net>"]
+license = "LicenseRef-Proprietary"
+repository = "https://github.com/getkono/kmux"
+publish = false
+
 [workspace.dependencies]
 # Internal crates
 kmux-pty = { path = "crates/kmux-pty" }
@@ -31,6 +39,7 @@ rustls = { version = "0.23.28", default-features = false, features = ["ring", "l
 rustls-native-certs = "0.8"
 rustls-pemfile = "2"
 serde = { version = "1", features = ["derive", "rc"] }
+static_assertions = "1"
 thiserror = "2"
 tokio = { version = "1.52.1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
