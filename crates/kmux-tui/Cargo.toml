@@ -17,6 +17,7 @@ name = "kmux"
 path = "src/main.rs"
 
 [dependencies]
+kmux-app.workspace = true
 kmux-client.workspace = true
 kmux-protocol = { workspace = true, features = ["framing"] }
 anyhow.workspace = true

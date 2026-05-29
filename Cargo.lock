@@ -1202,6 +1202,7 @@ dependencies = [
  "clap",
  "crossterm",
  "futures",
+ "kmux-app",
  "kmux-client",
  "kmux-protocol",
  "rand 0.10.1",

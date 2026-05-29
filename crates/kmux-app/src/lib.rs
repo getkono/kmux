@@ -17,4 +17,8 @@
 //! `AppCore` — `AppCore` is a passive state machine, it never owns the run loop.
 //!
 //! Modules are introduced incrementally as logic is extracted from the TUI
-//! binary (see the migration plan); this crate starts intentionally empty.
+//! binary (see the migration plan).
+
+/// Modal keymap (`Mode`), the [`mode::Action`] vocabulary, and key → action
+/// resolution. Toolkit-agnostic: depends only on `kmux_client::key`.
+pub mod mode;

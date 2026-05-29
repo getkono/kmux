@@ -4,11 +4,14 @@ mod cmd;
 mod config;
 mod host_caps;
 mod key_convert;
-mod mode;
 mod recent_servers;
 mod subcommands;
 mod theme;
 mod ui;
+
+// The modal keymap / action model now lives in kmux-app (frontend-agnostic).
+// Re-export it at the crate root so existing `crate::mode::*` paths resolve.
+use kmux_app::mode;
 
 use std::io;
 
