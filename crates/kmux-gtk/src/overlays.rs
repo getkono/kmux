@@ -16,6 +16,7 @@ use gtk4::{
     Orientation, Overlay,
 };
 
+use kmux_app::cmd;
 use kmux_app::core::{AppCore, KeyResult};
 use kmux_app::mode::{Action, Mode};
 
@@ -100,11 +101,64 @@ pub fn sync(ov: &Overlays, fe: &Rc<RefCell<Frontend>>, app: &Application, drawin
             dir_picker(&ov.modal, fe, app, drawing);
             ov.modal.set_visible(true);
         }
-        // Command palette, help, confirm, rename, HUD, and metrics follow.
+        Mode::Command(_) => {
+            ov.modal.set_size_request(560, -1);
+            command_palette(&ov.modal, fe);
+            ov.modal.set_visible(true);
+        }
+        // Help, confirm, rename, HUD, and metrics follow.
         _ => {
             ov.modal.set_size_request(-1, -1);
             ov.modal.set_visible(false);
         }
+    }
+}
+
+/// The `/`-command palette: the prompt + buffer with a caret at `state.cursor`,
+/// and the hint dropdown from `cmd::hint::build_hints` with `state.selected`
+/// highlighted. Keyboard-driven (no buttons), mirroring the TUI palette.
+fn command_palette(modal: &GtkBox, fe: &Rc<RefCell<Frontend>>) {
+    let f = fe.borrow();
+    let core = &f.core;
+    let Mode::Command(state) = &core.mode else {
+        return;
+    };
+
+    let row = GtkBox::new(Orientation::Horizontal, 0);
+    row.set_halign(Align::Start);
+    row.append(&label("/", "kmux-overlay-caret"));
+    // Split the buffer at the caret (cursor is kept on a char boundary by
+    // dispatch; clamp defensively so a stray value can't panic the slice).
+    let cur = {
+        let c = state.cursor.min(state.buffer.len());
+        if state.buffer.is_char_boundary(c) {
+            c
+        } else {
+            state.buffer.len()
+        }
+    };
+    let before = Label::new(Some(&state.buffer[..cur]));
+    before.set_halign(Align::Start);
+    row.append(&before);
+    row.append(&label("\u{258f}", "kmux-overlay-caret"));
+    let after = Label::new(Some(&state.buffer[cur..]));
+    after.set_halign(Align::Start);
+    row.append(&after);
+    modal.append(&row);
+
+    for (i, h) in cmd::hint::build_hints(core).iter().enumerate().take(10) {
+        let r = GtkBox::new(Orientation::Horizontal, 12);
+        r.add_css_class("kmux-overlay-row");
+        if i == state.selected {
+            r.add_css_class("selected");
+        }
+        let disp = Label::new(Some(h.display.as_str()));
+        disp.set_halign(Align::Start);
+        disp.set_hexpand(true);
+        disp.set_xalign(0.0);
+        r.append(&disp);
+        r.append(&label(h.summary, "kmux-overlay-dim"));
+        modal.append(&r);
     }
 }
 
