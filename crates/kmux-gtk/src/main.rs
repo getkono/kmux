@@ -12,6 +12,8 @@
 
 mod chrome;
 mod convert;
+mod css;
+mod overlays;
 mod render;
 
 use std::cell::RefCell;
@@ -225,6 +227,13 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     vbox.append(&bars.hint);
     let overlay = Overlay::new();
     overlay.set_child(Some(&vbox));
+    let overlays = Rc::new(overlays::build(&overlay));
+
+    // Theme the chrome + overlays from the active palette (libadwaita window
+    // styling + reload-on-/theme build on this later).
+    if let Some(display) = gdk::Display::default() {
+        css::install(&display, &plan.theme);
+    }
 
     let window = ApplicationWindow::builder()
         .application(app)
@@ -276,17 +285,19 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     }
     window.add_controller(key_ctl);
 
-    // Populate the bars once so they aren't blank until the first pump tick.
+    // Populate chrome + overlays once so they aren't blank until the first tick.
     chrome::sync(&bars, &fe, app, &drawing);
+    overlays::sync(&overlays, &fe, app, &drawing);
 
-    // The pump: drain network channels, tick timers, sync chrome, redraw.
+    // The pump: drain network channels, tick timers, sync chrome/overlays, redraw.
     {
         let fe = fe.clone();
         let drawing = drawing.clone();
         let bars = bars.clone();
+        let overlays = overlays.clone();
         let app = app.clone();
         glib::timeout_add_local(PUMP_INTERVAL, move || {
-            pump(&fe, &drawing, &bars, &app);
+            pump(&fe, &drawing, &bars, &overlays, &app);
             glib::ControlFlow::Continue
         });
     }
@@ -305,7 +316,13 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
 /// One pump tick. Mirrors the arms of the TUI `tokio::select!` loop: settled
 /// resize, server messages, bootstrap outcome, transport upgrade, tunnel death,
 /// liveness, and metrics flush.
-fn pump(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea, bars: &chrome::Bars, app: &Application) {
+fn pump(
+    fe: &Rc<RefCell<Frontend>>,
+    drawing: &DrawingArea,
+    bars: &chrome::Bars,
+    overlays: &overlays::Overlays,
+    app: &Application,
+) {
     let redraw = {
         let mut fe = fe.borrow_mut();
         let mut dirty = false;
@@ -463,6 +480,7 @@ fn pump(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea, bars: &chrome::Bars, 
     // and repaint the grid.
     if redraw {
         chrome::sync(bars, fe, app, drawing);
+        overlays::sync(overlays, fe, app, drawing);
         drawing.queue_draw();
     }
 }
