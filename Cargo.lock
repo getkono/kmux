@@ -1117,7 +1117,11 @@ version = "0.2.0"
 dependencies = [
  "kmux-client",
  "kmux-protocol",
+ "serde",
  "tempfile",
+ "thiserror 2.0.18",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

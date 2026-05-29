@@ -22,3 +22,10 @@
 /// Modal keymap (`Mode`), the [`mode::Action`] vocabulary, and key → action
 /// resolution. Toolkit-agnostic: depends only on `kmux_client::key`.
 pub mod mode;
+
+/// Toolkit-neutral color palette ([`theme::Rgb`], [`theme::Theme`]) and the
+/// built-in theme TOML parsing.
+pub mod theme;
+
+/// Client config file + theme resolution (returns the toolkit-neutral theme).
+pub mod config;

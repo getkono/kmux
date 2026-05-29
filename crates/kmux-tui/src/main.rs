@@ -1,7 +1,6 @@
 mod app;
 mod cli;
 mod cmd;
-mod config;
 mod host_caps;
 mod key_convert;
 mod recent_servers;
@@ -9,9 +8,10 @@ mod subcommands;
 mod theme;
 mod ui;
 
-// The modal keymap / action model now lives in kmux-app (frontend-agnostic).
-// Re-export it at the crate root so existing `crate::mode::*` paths resolve.
-use kmux_app::mode;
+// The modal keymap / action model and config/theme resolution now live in
+// kmux-app (frontend-agnostic). Re-export them at the crate root so existing
+// `crate::mode::*` / `crate::config::*` paths keep resolving.
+use kmux_app::{config, mode};
 
 use std::io;
 
@@ -173,7 +173,9 @@ async fn async_main() -> anyhow::Result<()> {
         original_hook(panic_info);
     }));
 
-    let theme = config::resolve_theme(cli.theme.as_deref());
+    // resolve_theme yields the toolkit-neutral palette; convert to the TUI's
+    // ratatui-typed Theme at this boundary.
+    let theme: crate::theme::Theme = config::resolve_theme(cli.theme.as_deref()).into();
 
     let mut app = App::new(
         target,

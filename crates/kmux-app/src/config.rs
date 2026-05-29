@@ -1,4 +1,7 @@
-use std::path::PathBuf;
+//! Client configuration file and theme resolution.
+//!
+//! Frontend-agnostic: [`resolve_theme`] returns a toolkit-neutral
+//! [`crate::theme::Theme`] which each frontend converts to its own color type.
 
 use serde::Deserialize;
 use tracing::error;
@@ -45,14 +48,20 @@ pub fn resolve_theme(cli_theme: Option<&str>) -> Theme {
 
 /// Try to load a theme by name.
 ///
-/// Looks up built-in themes first, then `~/.config/kmux/themes/<name>.toml`.
+/// Looks up built-in themes first, then `<config_dir>/themes/<name>.toml`.
 /// Returns `None` (and logs an error) if the theme cannot be found or parsed.
 fn load_theme_spec(name: &str) -> Option<Theme> {
     if let Some(t) = theme::builtin_theme(name) {
         return Some(t);
     }
 
-    let path = themes_dir().join(format!("{name}.toml"));
+    let path = match kmux_protocol::dirs::config_dir() {
+        Ok(dir) => dir.join("themes").join(format!("{name}.toml")),
+        Err(e) => {
+            error!("could not resolve config dir for theme '{name}': {e}");
+            return None;
+        }
+    };
     match std::fs::read_to_string(&path) {
         Ok(contents) => match theme::parse_theme_toml(&contents) {
             Ok(t) => return Some(t),
@@ -76,11 +85,17 @@ fn load_theme_spec(name: &str) -> Option<Theme> {
     None
 }
 
-/// Load `~/.config/kmux/config.toml` if it exists.
+/// Load `<config_dir>/config.toml` if it exists.
 ///
 /// Logs and returns `None` on parse errors; silently returns `None` if missing.
 fn load_config_file() -> Option<KmuxConfig> {
-    let path = config_path();
+    let path = match kmux_protocol::dirs::config_dir() {
+        Ok(dir) => dir.join("config.toml"),
+        Err(e) => {
+            error!("could not resolve config dir: {e}");
+            return None;
+        }
+    };
     if !path.exists() {
         return None;
     }
@@ -99,35 +114,12 @@ fn load_config_file() -> Option<KmuxConfig> {
     }
 }
 
-/// Path to `~/.config/kmux/config.toml`, honouring `XDG_CONFIG_HOME`.
-fn config_path() -> PathBuf {
-    config_dir().join("config.toml")
-}
-
-/// Path to `~/.config/kmux/themes/`, honouring `XDG_CONFIG_HOME`.
-fn themes_dir() -> PathBuf {
-    config_dir().join("themes")
-}
-
-/// Base kmux config directory (`~/.config/kmux` or `$XDG_CONFIG_HOME/kmux`).
-fn config_dir() -> PathBuf {
-    let base = std::env::var("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| {
-            std::env::var("HOME")
-                .map(|h| PathBuf::from(h).join(".config"))
-                .unwrap_or_else(|_| PathBuf::from(".config"))
-        });
-    base.join("kmux")
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::Mutex;
 
-    use ratatui::style::Color;
-
     use super::*;
+    use crate::theme::Rgb;
 
     // Serialise all tests that mutate XDG_CONFIG_HOME to avoid races.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
@@ -136,7 +128,7 @@ mod tests {
     fn test_resolve_cli_builtin() {
         let theme = resolve_theme(Some("dracula"));
         // dracula bg = #282a36
-        assert_eq!(theme.bg, Color::Rgb(0x28, 0x2a, 0x36));
+        assert_eq!(theme.bg, Rgb::new(0x28, 0x2a, 0x36));
     }
 
     #[test]
@@ -148,7 +140,7 @@ mod tests {
         let theme = resolve_theme(None);
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         // catppuccin-macchiato bg = #24273a
-        assert_eq!(theme.bg, Color::Rgb(0x24, 0x27, 0x3a));
+        assert_eq!(theme.bg, Rgb::new(0x24, 0x27, 0x3a));
     }
 
     #[test]
@@ -158,7 +150,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
         let theme = resolve_theme(Some("does-not-exist"));
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert_eq!(theme.bg, Color::Rgb(0x24, 0x27, 0x3a));
+        assert_eq!(theme.bg, Rgb::new(0x24, 0x27, 0x3a));
     }
 
     #[test]
@@ -184,8 +176,8 @@ status_bg = "#111111"
         unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
         let theme = resolve_theme(Some("my-theme"));
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert_eq!(theme.bg, Color::Rgb(0xff, 0x00, 0x00));
-        assert_eq!(theme.fg, Color::Rgb(0x00, 0xff, 0x00));
+        assert_eq!(theme.bg, Rgb::new(0xff, 0x00, 0x00));
+        assert_eq!(theme.fg, Rgb::new(0x00, 0xff, 0x00));
     }
 
     #[test]
