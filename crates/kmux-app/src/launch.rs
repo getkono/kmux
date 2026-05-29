@@ -34,6 +34,9 @@ pub struct Plan {
     pub auto_cwd: Option<String>,
     pub auto_session: Option<String>,
     pub theme: Theme,
+    /// GUI font (Pango font-description string). The GUI frontend derives its
+    /// cell metrics from this; the TUI ignores it.
+    pub font: String,
     pub instance_id: String,
 }
 
@@ -128,6 +131,7 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         .cwd
         .or_else(|| parsed_server.as_ref().and_then(|p| p.path.clone()));
     let theme = config::resolve_theme(cli.theme.as_deref());
+    let font = config::resolve_font(cli.font.as_deref());
 
     Ok(Launch::Interactive(Plan {
         target,
@@ -135,6 +139,7 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         auto_cwd,
         auto_session: cli.connect.session,
         theme,
+        font,
         instance_id,
     }))
 }

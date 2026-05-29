@@ -16,7 +16,14 @@ pub struct KmuxConfig {
     /// Theme ID: a built-in name or a custom theme filename (without `.toml`)
     /// located in `~/.config/kmux/themes/`.
     pub theme: Option<String>,
+    /// GUI font as a Pango font-description string (e.g. `"JetBrains Mono 12"`).
+    /// GUI-only; the TUI renders in the host terminal's font and ignores this.
+    pub font: Option<String>,
 }
+
+/// Default GUI font (a Pango font-description string) used when neither the
+/// `--font` flag nor the config `font` key is set.
+pub const DEFAULT_FONT: &str = "monospace 11";
 
 /// Resolve the active theme.
 ///
@@ -44,6 +51,26 @@ pub fn resolve_theme(cli_theme: Option<&str>) -> Theme {
     // load_theme_spec already logged any error; fall through to default
 
     theme::default_theme()
+}
+
+/// Resolve the active GUI font (a Pango font-description string).
+///
+/// Priority order (mirrors [`resolve_theme`]):
+/// 1. `--font` CLI flag (`cli_font`)
+/// 2. `font` key in `~/.config/kmux/config.toml`
+/// 3. [`DEFAULT_FONT`]
+///
+/// Blank values are ignored so they fall through to the next source.
+pub fn resolve_font(cli_font: Option<&str>) -> String {
+    if let Some(font) = cli_font.map(str::trim).filter(|s| !s.is_empty()) {
+        return font.to_string();
+    }
+    if let Some(cfg) = load_config_file()
+        && let Some(font) = cfg.font.as_deref().map(str::trim).filter(|s| !s.is_empty())
+    {
+        return font.to_string();
+    }
+    DEFAULT_FONT.to_string()
 }
 
 /// Try to load a theme by name.
@@ -190,5 +217,49 @@ status_bg = "#111111"
     fn test_config_file_missing_theme_field() {
         let cfg: KmuxConfig = toml::from_str("").unwrap();
         assert!(cfg.theme.is_none());
+    }
+
+    #[test]
+    fn font_cli_flag_wins() {
+        assert_eq!(resolve_font(Some("JetBrains Mono 12")), "JetBrains Mono 12");
+    }
+
+    #[test]
+    fn font_blank_flag_falls_through_to_default() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        let font = resolve_font(Some("   "));
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert_eq!(font, DEFAULT_FONT);
+    }
+
+    #[test]
+    fn font_defaults_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        let font = resolve_font(None);
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert_eq!(font, DEFAULT_FONT);
+    }
+
+    #[test]
+    fn font_from_config_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let kmux_dir = tmp.path().join("kmux");
+        std::fs::create_dir_all(&kmux_dir).unwrap();
+        std::fs::write(kmux_dir.join("config.toml"), "font = \"Fira Code 13\"\n").unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        let font = resolve_font(None);
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert_eq!(font, "Fira Code 13");
+    }
+
+    #[test]
+    fn config_file_parses_font_field() {
+        let cfg: KmuxConfig = toml::from_str(r#"font = "Fira Code 13""#).unwrap();
+        assert_eq!(cfg.font.as_deref(), Some("Fira Code 13"));
     }
 }
