@@ -173,9 +173,9 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
 
     {
         let fe = fe.clone();
-        drawing.set_draw_func(move |area, cr, _w, _h| {
+        drawing.set_draw_func(move |area, cr, w, h| {
             let fe = fe.borrow();
-            render::render(&fe.core, cr, &area.pango_context(), &fe.metrics);
+            render::render(&fe.core, cr, &area.pango_context(), &fe.metrics, w, h);
         });
     }
 
