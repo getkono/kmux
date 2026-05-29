@@ -9,18 +9,10 @@ use super::{PickerItem, centered_overlay, render_list_picker};
 pub fn render_session_picker_overlay(f: &mut Frame, area: Rect, app: &mut App) {
     let theme = &app.theme;
     let search = &app.session_picker_search;
-    let search_lower = search.to_lowercase();
 
-    let matches: Vec<_> = app
-        .mgr
-        .session_list()
-        .iter()
-        .filter(|e| {
-            search_lower.is_empty()
-                || e.meta.name.to_lowercase().contains(&search_lower)
-                || e.meta.word_id.to_lowercase().contains(&search_lower)
-        })
-        .collect();
+    // Filter shared with the action layer (`AppCore::session_picker_matches`)
+    // so the overlay, its navigation bounds, and selection never drift.
+    let matches = app.session_picker_matches();
 
     // Index 0 is a synthetic "[+] New session" affordance that transitions
     // to the directory picker on select. Real sessions occupy indices 1..N+1.

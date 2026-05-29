@@ -98,19 +98,8 @@ impl AppCore {
                 }
             }
             Action::PickerDown => {
-                let count = self
-                    .mgr
-                    .session_list()
-                    .iter()
-                    .filter(|e| {
-                        let s = self.session_picker_search.to_lowercase();
-                        s.is_empty()
-                            || e.meta.name.to_lowercase().contains(&s)
-                            || e.meta.word_id.to_lowercase().contains(&s)
-                    })
-                    .count();
                 // total rows = 1 ("[+] New session") + filtered sessions.
-                let total = count + 1;
+                let total = self.session_picker_matches().len() + 1;
                 if self.session_picker_selected + 1 < total {
                     self.session_picker_selected += 1;
                 }
@@ -465,17 +454,9 @@ impl AppCore {
             self.mode = Mode::DirectoryPicker;
             return;
         }
-        let search = self.session_picker_search.to_lowercase();
         let word_id = self
-            .mgr
-            .session_list()
-            .iter()
-            .filter(|e| {
-                search.is_empty()
-                    || e.meta.name.to_lowercase().contains(&search)
-                    || e.meta.word_id.to_lowercase().contains(&search)
-            })
-            .nth(self.session_picker_selected - 1)
+            .session_picker_matches()
+            .get(self.session_picker_selected - 1)
             .map(|e| e.meta.word_id.clone());
         if let Some(word_id) = word_id {
             self.mgr.select_session(word_id);

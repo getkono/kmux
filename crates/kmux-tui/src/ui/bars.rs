@@ -301,7 +301,7 @@ pub(super) fn render_hint_bar(f: &mut Frame, app: &App, area: Rect) {
         format!(" {} ", mode_name),
         Style::default()
             .fg(theme.bg)
-            .bg(mode_color(&app.mode, theme))
+            .bg(mode_color(&app.mode, &app.palette))
             .add_modifier(Modifier::BOLD),
     )];
 
@@ -342,24 +342,12 @@ fn connection_badge_style(state: &ConnectionState, theme: &Theme) -> (Color, Str
     (color, label)
 }
 
-pub(super) fn mode_color(mode: &Mode, theme: &Theme) -> Color {
-    match mode {
-        Mode::Normal => theme.green,
-        Mode::Locked => theme.red,
-        Mode::Select => theme.accent,
-        Mode::Session => theme.purple,
-        Mode::Scroll => theme.yellow,
-        Mode::Signal => theme.red,
-        Mode::ConfirmCloseSession { .. } => theme.red,
-        Mode::RenameSession { .. } => theme.orange,
-        Mode::SessionPicker => theme.accent,
-        Mode::ServerPicker => theme.purple,
-        Mode::Help => theme.accent,
-        Mode::DirectoryPicker => theme.accent,
-        Mode::Connecting { .. } => theme.yellow,
-        Mode::Disconnected { .. } => theme.red,
-        Mode::Command(_) => theme.accent,
-    }
+/// The hint-bar mode badge color. The mode→color mapping is shared with the GUI
+/// frontend via `kmux_app::mode::mode_rgb` (over the toolkit-neutral palette);
+/// this converts the resulting `Rgb` to a ratatui `Color` at the render leaf.
+pub(super) fn mode_color(mode: &Mode, palette: &kmux_app::theme::Theme) -> Color {
+    let c = mode::mode_rgb(mode, palette);
+    Color::Rgb(c.r, c.g, c.b)
 }
 
 #[cfg(test)]

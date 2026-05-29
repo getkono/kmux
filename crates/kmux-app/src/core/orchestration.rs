@@ -147,6 +147,23 @@ impl AppCore {
             .collect()
     }
 
+    /// Returns sessions matching the current `session_picker_search` text
+    /// (case-insensitive on display name or word_id). An empty search matches
+    /// every session. Shared by the session-picker overlay, its navigation
+    /// bounds, and the Enter/click selection so the filter has one definition.
+    pub fn session_picker_matches(&self) -> Vec<&SessionEntry> {
+        let lower = self.session_picker_search.to_lowercase();
+        self.mgr
+            .session_list()
+            .iter()
+            .filter(|e| {
+                lower.is_empty()
+                    || e.meta.name.to_lowercase().contains(&lower)
+                    || e.meta.word_id.to_lowercase().contains(&lower)
+            })
+            .collect()
+    }
+
     /// Spawn the tunnel-death monitor and `TransportSupervisor` for a
     /// just-completed SSH bootstrap.
     ///
