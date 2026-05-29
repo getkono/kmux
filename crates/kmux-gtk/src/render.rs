@@ -135,6 +135,47 @@ pub fn render(
         }
     }
 
+    // Selection wash: a translucent accent tint over selected cells (live
+    // screen only — selection is anchored in absolute coords where row 0 is the
+    // oldest scrollback line, so a visible row is `abs_row - scrollback_len`).
+    if scroll_offset == 0
+        && let Some(sel) = grid.selection()
+    {
+        let start = sel.start();
+        let end = sel.end_pos();
+        if start != end {
+            let a = palette.accent;
+            cr.set_source_rgba(
+                a.r as f64 / 255.0,
+                a.g as f64 / 255.0,
+                a.b as f64 / 255.0,
+                0.30,
+            );
+            let sb = grid.scrollback_len();
+            for abs_row in start.row..=end.row {
+                let Some(vr) = abs_row.checked_sub(sb) else {
+                    continue;
+                };
+                if vr >= rows {
+                    break;
+                }
+                let c0 = if abs_row == start.row { start.col } else { 0 };
+                let c1 = if abs_row == end.row {
+                    end.col
+                } else {
+                    cols.saturating_sub(1)
+                };
+                if c1 < c0 {
+                    continue;
+                }
+                let x = c0 as f64 * metrics.cell_w;
+                let w = (c1 + 1 - c0) as f64 * metrics.cell_w;
+                cr.rectangle(x, vr as f64 * metrics.cell_h, w, metrics.cell_h);
+                let _ = cr.fill();
+            }
+        }
+    }
+
     // Cursor only renders against the live screen (not while scrolled back).
     if scroll_offset == 0 {
         let cursor = grid.cursor();
