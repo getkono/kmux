@@ -1,16 +1,14 @@
 mod app;
-mod cli;
-mod host_caps;
 mod key_convert;
-mod subcommands;
 mod theme;
 mod ui;
 
-// The modal keymap / action model, command palette, config/theme resolution,
-// and recent-servers cache now live in kmux-app (frontend-agnostic). Re-export
-// them at the crate root so existing `crate::mode::*` / `crate::cmd::*` /
-// `crate::config::*` / `crate::recent_servers::*` paths keep resolving.
-use kmux_app::{cmd, config, mode, recent_servers};
+// Everything frontend-free now lives in kmux-app: the modal keymap / action
+// model, command palette, config/theme resolution, recent-servers cache, the
+// CLI definitions, terminal-capability detection, and the non-interactive
+// subcommands. Re-export them at the crate root so existing `crate::*` paths
+// (e.g. `crate::cli`, `crate::host_caps`, `crate::subcommands`) keep resolving.
+use kmux_app::{cli, cmd, config, host_caps, mode, recent_servers, subcommands};
 
 use std::io;
 

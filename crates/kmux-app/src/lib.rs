@@ -36,6 +36,15 @@ pub mod recent_servers;
 /// The `/`-command palette: registry, parsing, completion hints, execution.
 pub mod cmd;
 
+/// CLI argument definitions (clap).
+pub mod cli;
+
+/// Terminal capability detection (env-based; frontend-agnostic).
+pub mod host_caps;
+
+/// Non-interactive subcommands (`ls`, `daemon`, `--dry-run`) and target parsing.
+pub mod subcommands;
+
 /// The frontend-agnostic client view-model ([`core::AppCore`]) and the
 /// connection/session orchestration that drives it.
 pub mod core;

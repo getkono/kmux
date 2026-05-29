@@ -1406,10 +1406,13 @@ dependencies = [
 name = "kmux-app"
 version = "0.2.0"
 dependencies = [
+ "anyhow",
+ "clap",
  "kmux-client",
  "kmux-protocol",
  "serde",
  "serde_json",
+ "tabled",
  "tempfile",
  "thiserror 2.0.18",
  "tokio",
@@ -1516,15 +1519,8 @@ dependencies = [
  "kmux-app",
  "kmux-client",
  "kmux-protocol",
- "rand 0.10.1",
  "ratatui",
- "serde",
- "serde_json",
- "tabled",
- "tempfile",
- "thiserror 2.0.18",
  "tokio",
- "toml",
  "tracing",
  "tracing-subscriber",
 ]
