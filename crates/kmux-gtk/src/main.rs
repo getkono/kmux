@@ -11,15 +11,14 @@
 //! `tokio::select!` loop (`kmux-tui/src/app/event_loop.rs`).
 
 mod convert;
+mod render;
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
-use gtk4::{
-    Application, ApplicationWindow, DrawingArea, EventControllerKey, cairo, gdk, gio, glib,
-};
+use gtk4::{Application, ApplicationWindow, DrawingArea, EventControllerKey, gdk, gio, glib};
 
 use kmux_app::core::{AppCore, BootstrapPhase, BootstrapTaskResult, KeyResult, SwitchTarget};
 use kmux_app::launch::{Launch, Plan, run_cli};
@@ -33,11 +32,6 @@ use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
 
 const APP_ID: &str = "dev.getkono.kmux";
-// Cell metrics (must match the monospace font size below). Mirrors the
-// server-side CELL_WIDTH/CELL_HEIGHT used for pixel geometry.
-const CELL_W: f64 = 8.0;
-const CELL_H: f64 = 16.0;
-const FONT_SIZE: f64 = 13.0;
 
 /// Pump cadence: drain network channels + tick timers (~60 Hz).
 const PUMP_INTERVAL: Duration = Duration::from_millis(16);
@@ -65,6 +59,9 @@ struct Frontend {
     /// SSH tunnel-death signal (the tunnel process exited unexpectedly).
     tunnel_died_rx: mpsc::Receiver<()>,
     tunnel_died_tx: mpsc::Sender<()>,
+    /// Cell geometry derived from the configured font; recomputed on scale
+    /// change. Drives the grid render and the resize → cols/rows mapping.
+    metrics: render::Metrics,
     /// Timer bookkeeping: the glib pump fires on one interval, so we track each
     /// cadence's last-fire / deadline ourselves.
     last_liveness: Instant,
@@ -148,6 +145,16 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         bootstrap_rx = None;
     }
 
+    let drawing = DrawingArea::new();
+    drawing.set_hexpand(true);
+    drawing.set_vexpand(true);
+
+    // Derive cell geometry from the configured font (the widget's PangoContext
+    // carries the display font map + scale). Recomputed on scale-factor change.
+    let font = render::font_from_str(&plan.font);
+    let metrics = render::Metrics::measure(&drawing.pango_context(), font);
+    let (cell_w, cell_h) = (metrics.cell_w, metrics.cell_h);
+
     let now = Instant::now();
     let fe = Rc::new(RefCell::new(Frontend {
         core,
@@ -157,19 +164,18 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         upgrade_tx,
         tunnel_died_rx,
         tunnel_died_tx,
+        metrics,
         last_liveness: now,
         last_metrics_flush: now,
         pending_resize: None,
         resize_deadline: None,
     }));
 
-    let drawing = DrawingArea::new();
-    drawing.set_hexpand(true);
-    drawing.set_vexpand(true);
     {
         let fe = fe.clone();
-        drawing.set_draw_func(move |_area, cr, w, h| {
-            render(&fe.borrow().core, cr, w, h);
+        drawing.set_draw_func(move |area, cr, _w, _h| {
+            let fe = fe.borrow();
+            render::render(&fe.core, cr, &area.pango_context(), &fe.metrics);
         });
     }
 
@@ -179,8 +185,7 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         let fe = fe.clone();
         drawing.connect_resize(move |_area, w, h| {
             let mut fe = fe.borrow_mut();
-            let cols = (w as f64 / CELL_W).floor().max(1.0) as u16;
-            let rows = (h as f64 / CELL_H).floor().max(1.0) as u16;
+            let (cols, rows) = fe.metrics.cols_rows(w, h);
             fe.pending_resize = Some(TermSize {
                 rows,
                 cols,
@@ -191,11 +196,26 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         });
     }
 
+    // Re-measure cells when the display scale factor changes (e.g. dragging the
+    // window between a 1× and a 2× monitor).
+    {
+        let fe = fe.clone();
+        drawing.connect_scale_factor_notify(move |area| {
+            {
+                let mut fe = fe.borrow_mut();
+                let font = fe.metrics.font.clone();
+                fe.metrics = render::Metrics::measure(&area.pango_context(), font);
+            }
+            area.queue_resize();
+            area.queue_draw();
+        });
+    }
+
     let window = ApplicationWindow::builder()
         .application(app)
         .title("kmux")
-        .default_width(80 * CELL_W as i32)
-        .default_height(24 * CELL_H as i32)
+        .default_width((80.0 * cell_w) as i32)
+        .default_height((24.0 * cell_h) as i32)
         .build();
     window.set_child(Some(&drawing));
 
@@ -486,82 +506,4 @@ fn switch_server(fe: &mut Frontend, target: SwitchTarget) {
     fe.core
         .start_bootstrap(resolved, srv_tx, BootstrapPhase::Initial, bs_tx);
     fe.core.needs_render = true;
-}
-
-/// Render the active grid (proof-of-seam; not optimized — repaints every cell).
-fn render(core: &AppCore, cr: &cairo::Context, _w: i32, _h: i32) {
-    let bg = core.palette.bg;
-    cr.set_source_rgb(
-        bg.r as f64 / 255.0,
-        bg.g as f64 / 255.0,
-        bg.b as f64 / 255.0,
-    );
-    let _ = cr.paint();
-
-    cr.select_font_face(
-        "monospace",
-        cairo::FontSlant::Normal,
-        cairo::FontWeight::Normal,
-    );
-    cr.set_font_size(FONT_SIZE);
-
-    let Some(grid) = core.mgr.active_grid() else {
-        let fg = core.palette.fg;
-        cr.set_source_rgb(
-            fg.r as f64 / 255.0,
-            fg.g as f64 / 255.0,
-            fg.b as f64 / 255.0,
-        );
-        cr.move_to(16.0, 28.0);
-        let _ = cr.show_text("kmux — connecting to local daemon…");
-        return;
-    };
-
-    let cells = grid.cells();
-    let cols = grid.cols;
-    for row in 0..grid.rows {
-        for col in 0..cols {
-            let Some(cell) = cells.get(row * cols + col) else {
-                continue;
-            };
-            let x = col as f64 * CELL_W;
-            let y = row as f64 * CELL_H;
-
-            cr.set_source_rgb(
-                cell.bg.r as f64 / 255.0,
-                cell.bg.g as f64 / 255.0,
-                cell.bg.b as f64 / 255.0,
-            );
-            cr.rectangle(x, y, CELL_W, CELL_H);
-            let _ = cr.fill();
-
-            if cell.c != ' ' && cell.c != '\0' {
-                cr.set_source_rgb(
-                    cell.fg.r as f64 / 255.0,
-                    cell.fg.g as f64 / 255.0,
-                    cell.fg.b as f64 / 255.0,
-                );
-                cr.move_to(x, y + CELL_H - 3.0);
-                let _ = cr.show_text(&cell.c.to_string());
-            }
-        }
-    }
-
-    let cur = grid.cursor();
-    if cur.visible {
-        let fg = core.palette.fg;
-        cr.set_source_rgba(
-            fg.r as f64 / 255.0,
-            fg.g as f64 / 255.0,
-            fg.b as f64 / 255.0,
-            0.6,
-        );
-        cr.rectangle(
-            cur.col as f64 * CELL_W,
-            cur.row as f64 * CELL_H,
-            CELL_W,
-            CELL_H,
-        );
-        let _ = cr.fill();
-    }
 }
