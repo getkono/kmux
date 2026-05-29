@@ -1,3 +1,11 @@
+//! kmux-tui — the terminal (ratatui/crossterm) frontend for kmux.
+//!
+//! **Deprecated.** The GTK GUI (`kmux`, from the `kmux-gtk` crate) is the
+//! primary client and has reached feature parity. `kmux-tui` is retained for
+//! SSH/headless and no-display use; it stays compiling and tested (it is the
+//! regression oracle for the shared `kmux-app` interaction layer) but is no
+//! longer the focus of new feature work.
+
 mod app;
 mod key_convert;
 mod theme;

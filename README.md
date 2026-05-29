@@ -22,8 +22,8 @@ kmux uses a server/client split:
 | [`kmuxd`](crates/kmuxd)                 | Background daemon — manages PTY sessions, multi-transport listener         |
 | [`kmux-client`](crates/kmux-client)     | Client mechanism — session manager, transports/bootstrap, terminal grid    |
 | [`kmux-app`](crates/kmux-app)           | Toolkit-agnostic interaction layer — `AppCore`, command palette, CLI       |
-| [`kmux-tui`](crates/kmux-tui)           | TUI frontend (ratatui/crossterm); ships the `kmux-tui` binary              |
-| [`kmux-gtk`](crates/kmux-gtk)           | GTK4 GUI frontend (Linux); ships the `kmux` binary                         |
+| [`kmux-gtk`](crates/kmux-gtk)           | GTK4 GUI frontend (Linux), **primary**; ships the `kmux` binary            |
+| [`kmux-tui`](crates/kmux-tui)           | TUI frontend (ratatui/crossterm), *deprecated*; ships the `kmux-tui` binary |
 
 ```
 kmuxd     ->  kmux-pty,  kmux-protocol
@@ -46,7 +46,7 @@ configuration.
 | Term | Meaning |
 | --- | --- |
 | **Daemon** (`kmuxd`) | Background server that owns PTYs, runs the VT emulator, persists state, and serves clients. |
-| **Client** (`kmux`) | TUI front-end that connects to a daemon and renders the terminal grid. |
+| **Client** (`kmux`) | The GTK GUI front-end (Linux, primary) that connects to a daemon and renders the terminal grid. `kmux-tui` is the deprecated terminal front-end, kept for SSH/headless use. |
 | **Session** | Top-level container holding one or more panes; identified by a stable word ID and survives client disconnects. |
 | **Pane** | A single shell process inside a session, backed by its own PTY and scrollback. |
 | **PTY** | Pseudo-terminal — the OS device pair that backs every running shell. |

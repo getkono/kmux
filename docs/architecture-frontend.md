@@ -145,26 +145,41 @@ icon into the XDG data dirs; `just package` stages the GUI binary + desktop
 files into the release tarball under `share/`. The GUI is the primary `kmux`
 command on Linux; preferences (theme + font) open with **Ctrl+,**.
 
-## Status and what's next
+## Status
 
-Done: the full extraction (everything frontend-free is in `kmux-app`),
-`AppCore` as the GUI-ready seam, the shared `run_cli` front door, the
-`kmux`(GUI)/`kmux-tui`(TUI) binary split, and a GTK scaffold that proves the
-seam end to end.
+The GTK GUI (`kmux`) has reached feature parity with the TUI and is the
+**primary** client on Linux. It drives `AppCore` through the same contract as
+the TUI; only the pump and the render/input leaves are GTK-specific:
 
-Open items (not blockers — the architecture is complete):
+- Full Pango grid rendering — text attributes, wide chars, cursor shapes, and
+  scrollback — at font-derived cell metrics (`kmux-gtk/src/render.rs`).
+- Structured key forwarding (the daemon's Ghostty encoder), and a `glib` pump
+  that mirrors every arm of the TUI's `tokio::select!`: reconnect, server
+  switch, SSH supervisor, transport upgrade, tunnel death, liveness ping +
+  timeout, metrics flush, resize debounce, plus async clipboard paste.
+- Native chrome (session/status/hint bars) and overlays (session/server/dir
+  pickers, command palette, help, confirm-close, rename, connecting/
+  disconnected, HUD, metrics) as views of `AppCore` state.
+- Mouse scroll-wheel (PTY mouse-report or local scrollback) and drag text
+  selection with copy.
+- libadwaita window styling with palette-driven CSS (reloaded on `/theme`) and
+  a preferences window for theme + font, opened with **Ctrl+,**.
 
-- **GUI maturity.** `kmux-gtk` is a scaffold: it renders the active grid via
-  cairo (whole-grid repaint, no damage tracking), forwards keys with a
-  best-effort byte encoding (not the Ghostty-mode-aware encoder), and wires
-  only the `Quit`/`CopyToClipboard` effects. Scrollback, mouse, paste,
-  resize-debounce, liveness, and the pickers/overlays (which the TUI renders)
-  are not yet drawn.
+`kmux-tui` is **deprecated** but kept building and tested: it remains the
+headless/SSH client and the regression oracle for the shared `kmux-app`
+interaction layer. No new feature work targets it.
+
+### Future
+
 - **In-process frontend selection.** Today you run `kmux` (GUI) or `kmux-tui`
   (TUI) as separate binaries. A `kmux --tui` flag could launch the terminal
-  frontend in-process from the GUI binary.
+  frontend in-process from the GUI binary when there is no display.
 - **Other platforms.** macOS/Windows native frontends (e.g. `kmux-cocoa`) would
   each provide the `kmux` binary for their platform, built per-target. The
   Unix-only client paths (`flock`, UDS, daemon spawn) need cfg-gating for a
   Windows client — see `kmux-protocol/src/dirs.rs` for the path resolvers that
   would gain `#[cfg(windows)]` branches.
+- **GTK render polish.** Partial damage tracking (`queue_draw_area`, keyed off
+  `CellGrid::cells_generation`) and same-attr run batching in the Pango
+  renderer if profiling shows need; selection within scrolled-back history; and
+  the per-category + RTT detail in the metrics overlay.
