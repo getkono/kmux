@@ -1,0 +1,16 @@
+[package]
+name = "kmux-app"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Frontend-agnostic interaction layer for the kmux client, shared by the TUI and GUI frontends."
+
+[dependencies]
+kmux-client.workspace = true
+kmux-protocol = { workspace = true, features = ["framing"] }
+
+[dev-dependencies]
+tempfile.workspace = true

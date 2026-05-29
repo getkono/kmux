@@ -18,6 +18,7 @@ kmux-client = { path = "crates/kmux-client" }
 kmux-ghostty-sys = { path = "crates/kmux-ghostty-sys" }
 kmux-ghostty = { path = "crates/kmux-ghostty" }
 kmux-tui = { path = "crates/kmux-tui" }
+kmux-app = { path = "crates/kmux-app" }
 
 # External dependencies
 anyhow = "1"

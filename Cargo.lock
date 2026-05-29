@@ -1112,6 +1112,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmux-app"
+version = "0.2.0"
+dependencies = [
+ "kmux-client",
+ "kmux-protocol",
+ "tempfile",
+]
+
+[[package]]
 name = "kmux-client"
 version = "0.2.0"
 dependencies = [
