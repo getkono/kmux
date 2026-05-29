@@ -53,21 +53,21 @@ tail-daemon-log:
 # Binary resolution: kmux at target/debug/kmux picks up its sibling kmuxd at
 # target/debug/kmuxd, spawning it with the same argv as any auto-spawn.
 restart-daemon:
-    cargo build -p kmux -p kmuxd
-    cargo run -p kmux -- daemon restart
+    cargo build -p kmux-tui -p kmuxd
+    cargo run -p kmux-tui -- daemon restart
 
 # Start the local daemon (debug build) via the same primitive as auto-spawn.
 start-daemon:
-    cargo build -p kmux -p kmuxd
-    cargo run -p kmux -- daemon start
+    cargo build -p kmux-tui -p kmuxd
+    cargo run -p kmux-tui -- daemon start
 
 # Stop the local daemon (debug build).
 stop-daemon:
-    cargo run -p kmux -- daemon stop
+    cargo run -p kmux-tui -- daemon stop
 
 # Install kmux and kmuxd to ~/.cargo/bin (release build)
 install:
-    cargo install --path crates/kmux
+    cargo install --path crates/kmux-tui
     cargo install --path crates/kmuxd
 
 # Stage a distributable release tarball for the host target into dist/.
@@ -83,7 +83,7 @@ package:
     target=$(rustc -vV | sed -n 's/^host: //p')
     stage="kmux-${ver}-${target}"
     echo "==> building release binaries (${target})"
-    cargo build --release -p kmux -p kmuxd
+    cargo build --release -p kmux-tui -p kmuxd
     rm -rf "dist/${stage}"
     mkdir -p "dist/${stage}"
     cp target/release/kmux target/release/kmuxd README.md "dist/${stage}/"

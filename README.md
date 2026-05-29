@@ -20,12 +20,12 @@ kmux uses a server/client split:
 | [`kmux-pty`](crates/kmux-pty)           | Async PTY lifecycle library (spawn, I/O, resize, shutdown)                 |
 | [`kmux-protocol`](crates/kmux-protocol) | Shared wire protocol, transport traits, TOFU TLS, endpoint URL parser      |
 | [`kmuxd`](crates/kmuxd)                 | Background daemon — manages PTY sessions, multi-transport listener         |
-| [`kmux`](crates/kmux)                   | TUI client — connects over QUIC, TCP+TLS, or UDS with automatic fallback   |
+| [`kmux-tui`](crates/kmux-tui)           | TUI client — connects over QUIC, TCP+TLS, or UDS with automatic fallback   |
 
 ```
-kmuxd  ->  kmux-pty
-kmuxd  ->  kmux-protocol
-kmux   ->  kmux-protocol
+kmuxd     ->  kmux-pty
+kmuxd     ->  kmux-protocol
+kmux-tui  ->  kmux-protocol
 ```
 
 The client connects to the server over QUIC (preferred), TCP+TLS (fallback), or
@@ -70,10 +70,10 @@ Start the server with a self-signed certificate:
 $ cargo run -p kmuxd -- --self-signed
 ```
 
-The server prints a shared auth token on startup. Connect the GUI client:
+The server prints a shared auth token on startup. Connect the TUI client:
 
 ```bash
-$ cargo run -p kmux
+$ cargo run -p kmux-tui
 ```
 
 By default, the server binds to `0.0.0.0:8443`.

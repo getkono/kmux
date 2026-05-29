@@ -1112,30 +1112,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "kmux"
-version = "0.2.0"
-dependencies = [
- "anyhow",
- "arboard",
- "clap",
- "crossterm",
- "futures",
- "kmux-client",
- "kmux-protocol",
- "rand 0.10.1",
- "ratatui",
- "serde",
- "serde_json",
- "tabled",
- "tempfile",
- "thiserror 2.0.18",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "kmux-client"
 version = "0.2.0"
 dependencies = [
@@ -1206,6 +1182,30 @@ dependencies = [
  "tokio",
  "tokio-test",
  "tracing",
+]
+
+[[package]]
+name = "kmux-tui"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "arboard",
+ "clap",
+ "crossterm",
+ "futures",
+ "kmux-client",
+ "kmux-protocol",
+ "rand 0.10.1",
+ "ratatui",
+ "serde",
+ "serde_json",
+ "tabled",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

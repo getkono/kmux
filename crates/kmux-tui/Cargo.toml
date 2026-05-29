@@ -1,14 +1,17 @@
 [package]
-name = "kmux"
+name = "kmux-tui"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Terminal multiplexer and session manager client with remote desktop capabilities."
+description = "Terminal (TUI) frontend for the kmux client."
 build = "build.rs"
 
+# NOTE: the binary is still named `kmux` during the TUI→GUI migration so the
+# justfile daemon targets and existing workflows keep working. P7 introduces the
+# `kmux` launcher crate and renames this bin to `kmux-tui`.
 [[bin]]
 name = "kmux"
 path = "src/main.rs"
