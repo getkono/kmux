@@ -9,9 +9,7 @@ use crate::theme::Theme;
 // The frontend-agnostic view-model and the types the frontend shares with it
 // now live in kmux-app. Re-export them at `crate::app::*` so existing call
 // sites (event loop, key/mouse handlers, command palette) keep resolving.
-pub use kmux_app::core::{
-    AppCore, BootstrapPhase, BootstrapTaskResult, KeyResult, SwitchTarget, TopBarAction,
-};
+pub use kmux_app::core::{AppCore, BootstrapPhase, BootstrapTaskResult, KeyResult, TopBarAction};
 
 mod event_batch;
 mod event_loop;

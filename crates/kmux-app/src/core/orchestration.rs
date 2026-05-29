@@ -15,9 +15,9 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::mode::Mode;
-use crate::recent_servers::RecentServer;
+use crate::recent_servers::{RecentServer, ServerKind};
 
-use super::AppCore;
+use super::{AppCore, SwitchTarget};
 
 #[derive(Debug)]
 pub enum BootstrapPhase {
@@ -343,6 +343,48 @@ impl AppCore {
         ResolvedTarget::LocalDaemon
     }
 
+    /// Apply the state change for switching to a server chosen from the server
+    /// picker, returning the [`ResolvedTarget`] the frontend should bootstrap.
+    ///
+    /// This is the shared half of `KeyResult::SwitchServer` handling — the
+    /// server identity, ssh target, auto-select reset, and disconnect of the
+    /// old connection. The frontend owns the toolkit-coupled remainder (replace
+    /// the server-message channel, then `start_bootstrap` with the returned
+    /// target) so both the TUI and the GUI run loops drive it identically.
+    pub fn prepare_switch(&mut self, target: &SwitchTarget) -> ResolvedTarget {
+        self.did_auto_select = false;
+        self.mgr.disconnect();
+        match target {
+            SwitchTarget::Local => {
+                self.is_local = true;
+                self.ssh_target = None;
+                self.server_display = "localhost".to_string();
+                self.server_string = String::new();
+                self.server_kind = ServerKind::Local;
+                ResolvedTarget::LocalDaemon
+            }
+            SwitchTarget::Ssh(target) => {
+                let display = match &target.user {
+                    Some(u) => format!("{}@{}", u, target.host),
+                    None => target.host.clone(),
+                };
+                self.server_display = display.clone();
+                self.server_string = display;
+                self.server_kind = ServerKind::Ssh {
+                    user: target.user.clone(),
+                    host: target.host.clone(),
+                    ssh_port: target.ssh_port,
+                };
+                self.is_local = false;
+                self.ssh_target = Some(target.clone());
+                ResolvedTarget::Ssh {
+                    target: target.clone(),
+                    accept_invalid_certs: self.mgr.accept_invalid_certs(),
+                }
+            }
+        }
+    }
+
     /// Transition to `Mode::Disconnected`, record the reason in the session
     /// manager, and emit a structured tracing event.
     pub fn enter_disconnected(&mut self, reason: DisconnectReason) {
@@ -378,5 +420,75 @@ impl AppCore {
             };
             self.mode = Mode::Disconnected { reason };
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kmux_client::session_manager::SessionManager;
+    use kmux_client::ssh::RemoteTarget;
+    use kmux_protocol::messages::ClientCapabilities;
+
+    fn fixture_core() -> AppCore {
+        let mgr = SessionManager::new(
+            "127.0.0.1".into(),
+            0,
+            String::new(),
+            true,
+            ClientCapabilities::default(),
+        );
+        AppCore::for_test(mgr)
+    }
+
+    #[test]
+    fn prepare_switch_local_resets_identity_to_localhost() {
+        let mut core = fixture_core();
+        // Pretend we were connected to a remote server.
+        core.is_local = false;
+        core.ssh_target = Some(RemoteTarget {
+            user: Some("u".into()),
+            host: "h".into(),
+            ssh_port: None,
+        });
+        core.server_display = "u@h".into();
+        core.server_string = "u@h".into();
+        core.did_auto_select = true;
+
+        let resolved = core.prepare_switch(&SwitchTarget::Local);
+
+        assert!(matches!(resolved, ResolvedTarget::LocalDaemon));
+        assert!(core.is_local);
+        assert!(core.ssh_target.is_none());
+        assert_eq!(core.server_display, "localhost");
+        assert!(core.server_string.is_empty());
+        assert!(matches!(core.server_kind, ServerKind::Local));
+        assert!(!core.did_auto_select, "auto-select must reset on switch");
+    }
+
+    #[test]
+    fn prepare_switch_ssh_sets_identity_and_returns_target() {
+        let mut core = fixture_core();
+        let target = RemoteTarget {
+            user: Some("alice".into()),
+            host: "example.com".into(),
+            ssh_port: Some(2222),
+        };
+
+        let resolved = core.prepare_switch(&SwitchTarget::Ssh(target));
+
+        match resolved {
+            ResolvedTarget::Ssh { target: t, .. } => {
+                assert_eq!(t.host, "example.com");
+                assert_eq!(t.user.as_deref(), Some("alice"));
+                assert_eq!(t.ssh_port, Some(2222));
+            }
+            _ => panic!("expected Ssh target"),
+        }
+        assert!(!core.is_local);
+        assert_eq!(core.server_display, "alice@example.com");
+        assert_eq!(core.server_string, "alice@example.com");
+        assert!(core.ssh_target.is_some());
+        assert!(matches!(core.server_kind, ServerKind::Ssh { .. }));
     }
 }

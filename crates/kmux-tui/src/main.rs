@@ -5,7 +5,7 @@ mod ui;
 
 // Frontend-free logic lives in kmux-app; re-export the bits the app/ui modules
 // reach via `crate::*`.
-use kmux_app::{cmd, host_caps, mode, recent_servers};
+use kmux_app::{cmd, host_caps, mode};
 
 use std::io;
 
