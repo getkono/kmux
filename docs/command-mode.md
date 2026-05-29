@@ -67,28 +67,40 @@ Files:
 
 | File | Responsibility |
 |---|---|
-| `crates/kmux/src/mode/mod.rs` | `Mode::Command(CommandState)` and the `Action::Command*` editing variants |
-| `crates/kmux/src/mode/resolve.rs` | `resolve_command`: keys → editing actions; chord activation in `resolve_mode_select` |
-| `crates/kmux/src/cmd/spec.rs` | `CommandSpec`, `ArgSpec`, `Completer`, `CommandSuccess`, `CommandResult` |
-| `crates/kmux/src/cmd/parse.rs` | tokenizer (with `"…"` / `'…'` quoting) + buffer→`Parsed` resolver |
-| `crates/kmux/src/cmd/hint.rs` | `build_hints(&App)`: pure ranked dropdown contents |
-| `crates/kmux/src/cmd/registry.rs` | `static ALL: &[CommandSpec]` plus the command bodies |
-| `crates/kmux/src/cmd/exec.rs` | `run(&mut App, buffer)` glue between submit and registry |
-| `crates/kmux/src/app/key_handler.rs` | `dispatch_action` (the unified action handler) and command-edit arms |
-| `crates/kmux/src/ui/overlays/command.rs` | floating overlay; reuses `render_list_picker` |
+| `crates/kmux-app/src/mode/mod.rs` | `Mode::Command(CommandState)` and the `Action::Command*` editing variants |
+| `crates/kmux-app/src/mode/resolve.rs` | `resolve_command`: keys → editing actions; chord activation in `resolve_mode_select` |
+| `crates/kmux-app/src/cmd/spec.rs` | `CommandSpec`, `ArgSpec`, `Completer`, `CommandSuccess`, `CommandResult` |
+| `crates/kmux-app/src/cmd/parse.rs` | tokenizer (with `"…"` / `'…'` quoting) + buffer→`Parsed` resolver |
+| `crates/kmux-app/src/cmd/hint.rs` | `build_hints(&AppCore)`: pure ranked dropdown contents |
+| `crates/kmux-app/src/cmd/registry.rs` | `static ALL: &[CommandSpec]` plus the command bodies (`fn(&mut AppCore, …)`) |
+| `crates/kmux-app/src/cmd/exec.rs` | `run(&mut AppCore, buffer)` glue between submit and registry |
+| `crates/kmux-app/src/core/dispatch.rs` | `AppCore::dispatch_action` (the unified action handler) and command-edit arms |
+| `crates/kmux-tui/src/ui/overlays/command.rs` | floating overlay; reuses `render_list_picker` (TUI render leaf) |
+
+The command palette, mode model, and action dispatch are all frontend-agnostic
+and live in `kmux-app` (see [architecture-frontend.md](architecture-frontend.md));
+only the overlay's ratatui rendering stays in `kmux-tui`.
 
 ## Refactor seam: `dispatch_action`
 
-Previously `App::handle_key` resolved a key into an `Action` and then matched
-on the `Action` inline. The match body has been extracted to
-`App::dispatch_action(action, src_event)`. The key path is unchanged from a
-caller's perspective (`handle_key` resolves and forwards). The command path
-calls into `App` methods directly from registry handlers — both routes end up
-mutating the same fields.
+A key resolves into an `Action`; applying that `Action` is the single source of
+truth in `AppCore::dispatch_action(action)` (toolkit-agnostic, in
+`kmux-app/src/core/dispatch.rs`). The key path and the command palette both
+funnel through it: a frontend converts its toolkit key event, calls
+`mode::resolve`, then `core.dispatch_action`; the command palette's
+`CommandSubmit` arm runs `cmd::exec::run`, whose handlers mutate the same
+`AppCore`.
 
 This was a deliberate de-duplication ("ruthless refactor, no drift"): a
 parallel command dispatcher would have invited two definitions of "what
 Quit/CreateSession/etc. mean" that drift over time.
+
+Two arms are *not* in the core dispatch because they require toolkit I/O:
+`Action::ForwardKey` (the frontend encodes the keystroke to PTY bytes under the
+live terminal-mode state) and clipboard copy/paste (emitted as
+`KeyResult::CopyToClipboard` / `RequestPaste` effects the frontend performs).
+`dispatch_action` therefore takes no raw key event — the frontend handles
+`ForwardKey` before calling it.
 
 ## Commands
 
