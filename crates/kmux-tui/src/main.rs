@@ -32,7 +32,7 @@ async fn main() -> anyhow::Result<()> {
     let instance_id = generate_instance_id();
     match run_cli(instance_id).await? {
         Launch::Done => Ok(()),
-        Launch::Interactive(plan) => run_tui(plan).await,
+        Launch::Interactive(plan) => run_tui(*plan).await,
     }
 }
 

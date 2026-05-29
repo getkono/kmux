@@ -53,7 +53,7 @@ fn main() -> anyhow::Result<()> {
             // Enter the runtime on the main thread so the tokio spawns from glib
             // callbacks land on it; the glib loop itself runs on this thread.
             let _guard = rt.enter();
-            run_gui(plan)
+            run_gui(*plan)
         }
     }
 }

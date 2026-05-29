@@ -22,8 +22,9 @@ use crate::theme::Theme;
 pub enum Launch {
     /// A non-interactive subcommand handled everything; the process should exit.
     Done,
-    /// Launch an interactive session with these parameters.
-    Interactive(Plan),
+    /// Launch an interactive session with these parameters. Boxed so the small
+    /// `Done` variant doesn't pad this enum out to `Plan`'s size.
+    Interactive(Box<Plan>),
 }
 
 /// Frontend-agnostic interactive launch parameters. Each frontend builds its own
@@ -133,7 +134,7 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
     let theme = config::resolve_theme(cli.theme.as_deref());
     let font = config::resolve_font(cli.font.as_deref());
 
-    Ok(Launch::Interactive(Plan {
+    Ok(Launch::Interactive(Box::new(Plan {
         target,
         initial_cwd,
         auto_cwd,
@@ -141,5 +142,5 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         theme,
         font,
         instance_id,
-    }))
+    })))
 }
