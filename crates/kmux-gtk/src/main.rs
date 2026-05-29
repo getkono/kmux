@@ -10,23 +10,23 @@
 //! leaves are GTK-specific. The pump mirrors the arms of the TUI's
 //! `tokio::select!` loop (`kmux-tui/src/app/event_loop.rs`).
 
-mod chrome;
 mod convert;
 mod css;
+mod header;
 mod input;
 mod overlays;
 mod prefs;
 mod render;
+mod shell;
+mod sidebar;
+mod tabs;
 
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use adw::prelude::*;
-use gtk4::{
-    Application, Box as GtkBox, DrawingArea, EventControllerKey, Orientation, Overlay, gdk, gio,
-    glib,
-};
+use gtk4::{Application, DrawingArea, EventControllerKey, gdk, gio, glib};
 
 use kmux_app::core::{AppCore, BootstrapPhase, BootstrapTaskResult, KeyResult, SwitchTarget};
 use kmux_app::launch::{Launch, Plan, run_cli};
@@ -171,7 +171,6 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     // carries the display font map + scale). Recomputed on scale-factor change.
     let font = render::font_from_str(&plan.font);
     let metrics = render::Metrics::measure(&drawing.pango_context(), font);
-    let (cell_w, cell_h) = (metrics.cell_w, metrics.cell_h);
 
     // Theme the chrome + overlays from the active palette, and match the
     // libadwaita window styling (light/dark) to the theme. Both are refreshed
@@ -239,25 +238,14 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         });
     }
 
-    // Native chrome: session bar | grid | status bar | hint bar, inside an
-    // overlay that later hosts the picker/command/dialog overlays.
-    let bars = Rc::new(chrome::build());
-    let vbox = GtkBox::new(Orientation::Vertical, 0);
-    vbox.append(&bars.session);
-    vbox.append(&drawing);
-    vbox.append(&bars.status);
-    vbox.append(&bars.hint);
-    let overlay = Overlay::new();
-    overlay.set_child(Some(&vbox));
-    let overlays = Rc::new(overlays::build(&overlay));
-
-    let window = adw::ApplicationWindow::builder()
-        .application(app)
-        .title("kmux")
-        .default_width((80.0 * cell_w) as i32)
-        .default_height((26.0 * cell_h) as i32)
-        .build();
-    window.set_content(Some(&overlay));
+    // Native shell: header bar + sessions sidebar + a pane tab strip hosting the
+    // shared grid. The modal overlays + HUD ride the shell's inner overlay until
+    // they become native dialogs.
+    let shell = shell::build(app, &drawing);
+    let overlays = Rc::new(overlays::build(&shell.overlay));
+    header::wire(&shell, &fe, app);
+    tabs::wire(&shell, &fe, app);
+    sidebar::wire(&shell, &fe, app);
 
     // Key input: GDK → agnostic key → resolve → dispatch (or structured forward).
     let key_ctl = EventControllerKey::new();
@@ -305,24 +293,25 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
             glib::Propagation::Stop
         });
     }
-    window.add_controller(key_ctl);
+    shell.window.add_controller(key_ctl);
 
     // Mouse: scroll-wheel (PTY mouse-report or local scrollback).
     input::attach(&drawing, &fe);
 
-    // Populate chrome + overlays once so they aren't blank until the first tick.
-    chrome::sync(&bars, &fe, app, &drawing);
+    // Populate the shell + overlays once so they aren't blank until the first tick.
+    header::sync(&shell, &fe);
+    tabs::sync(&shell, &fe);
+    sidebar::sync(&shell, &fe);
     overlays::sync(&overlays, &fe, app, &drawing);
 
-    // The pump: drain network channels, tick timers, sync chrome/overlays, redraw.
+    // The pump: drain network channels, tick timers, sync the shell/overlays, redraw.
     {
         let fe = fe.clone();
-        let drawing = drawing.clone();
-        let bars = bars.clone();
+        let shell = shell.clone();
         let overlays = overlays.clone();
         let app = app.clone();
         glib::timeout_add_local(PUMP_INTERVAL, move || {
-            pump(&fe, &drawing, &bars, &overlays, &app);
+            pump(&fe, &shell, &overlays, &app);
             glib::ControlFlow::Continue
         });
     }
@@ -335,7 +324,7 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         });
     }
 
-    window.present();
+    shell.window.present();
 }
 
 /// One pump tick. Mirrors the arms of the TUI `tokio::select!` loop: settled
@@ -343,8 +332,7 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
 /// liveness, and metrics flush.
 fn pump(
     fe: &Rc<RefCell<Frontend>>,
-    drawing: &DrawingArea,
-    bars: &chrome::Bars,
+    shell: &Rc<shell::Shell>,
     overlays: &overlays::Overlays,
     app: &Application,
 ) {
@@ -514,12 +502,14 @@ fn pump(
         fe.core.needs_render = false;
         redraw
     };
-    // The borrow is released; rebuild chrome (cheap when state is unchanged)
-    // and repaint the grid.
+    // The borrow is released; reconcile the native shell + overlays (cheap when
+    // state is unchanged) and repaint the grid.
     if redraw {
-        chrome::sync(bars, fe, app, drawing);
-        overlays::sync(overlays, fe, app, drawing);
-        drawing.queue_draw();
+        header::sync(shell, fe);
+        tabs::sync(shell, fe);
+        sidebar::sync(shell, fe);
+        overlays::sync(overlays, fe, app, &shell.drawing);
+        shell.drawing.queue_draw();
     }
 }
 
