@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=kmux
+GenericName=Terminal Multiplexer
+Comment=Terminal multiplexer and remote desktop client
+Exec=kmux
+Icon=dev.getkono.kmux
+Terminal=false
+Categories=System;TerminalEmulator;
+Keywords=terminal;multiplexer;session;remote;tmux;
+StartupNotify=true

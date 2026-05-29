@@ -119,12 +119,19 @@ work on either binary; only the interactive presentation differs.
   renders the active session, forwards keystrokes. Proof-of-seam GTK scaffold.
 - TUI: `cargo run -p kmux-tui` (binary `kmux-tui`).
 
-### Building `kmux-gtk` and the system pkg-config
+### Building and running `kmux-gtk`
 
-`kmux-gtk` links the system GTK4 via `gtk4-rs`. On a machine where another
-`pkg-config` (e.g. a Homebrew/linuxbrew one) shadows the system one in `PATH`,
-gtk4 resolution fails on transitive X11 `.pc` files. Point cargo at the system
-pkg-config for any build that includes `kmux-gtk`:
+`kmux-gtk` links the system **GTK4** and **libadwaita** via `gtk4-rs` /
+`libadwaita-rs`. These are build *and* runtime dependencies — they are linked
+dynamically and are **not** bundled in the release tarball (unlike `kmuxd`'s
+`libkmux_ghostty`, which is). Install them from your distro:
+
+- Debian/Ubuntu: `libgtk-4-dev libadwaita-1-dev`
+- Fedora: `gtk4-devel libadwaita-devel`
+
+On a machine where another `pkg-config` (e.g. a Homebrew/linuxbrew one) shadows
+the system one in `PATH`, gtk4 resolution fails on transitive X11 `.pc` files.
+Point cargo at the system pkg-config for any build that includes `kmux-gtk`:
 
 ```
 PKG_CONFIG=/usr/bin/pkg-config cargo build -p kmux-gtk
@@ -132,6 +139,11 @@ PKG_CONFIG=/usr/bin/pkg-config cargo build -p kmux-gtk
 
 This is a machine `PATH` quirk, not a repo setting; on a standard install the
 default `pkg-config` resolves gtk4 directly.
+
+`just install` installs the `kmux` GUI (Linux) plus its `.desktop` entry and
+icon into the XDG data dirs; `just package` stages the GUI binary + desktop
+files into the release tarball under `share/`. The GUI is the primary `kmux`
+command on Linux; preferences (theme + font) open with **Ctrl+,**.
 
 ## Status and what's next
 
