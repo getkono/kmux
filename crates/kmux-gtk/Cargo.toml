@@ -1,0 +1,19 @@
+[package]
+name = "kmux-gtk"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "GTK4 native GUI frontend for the kmux client (Linux)."
+
+[dependencies]
+kmux-app.workspace = true
+kmux-client.workspace = true
+kmux-protocol = { workspace = true, features = ["framing"] }
+anyhow.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+futures.workspace = true
+gtk4 = "0.9"
