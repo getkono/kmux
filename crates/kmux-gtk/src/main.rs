@@ -13,6 +13,7 @@
 mod chrome;
 mod convert;
 mod css;
+mod input;
 mod overlays;
 mod render;
 
@@ -284,6 +285,9 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         });
     }
     window.add_controller(key_ctl);
+
+    // Mouse: scroll-wheel (PTY mouse-report or local scrollback).
+    input::attach(&drawing, &fe);
 
     // Populate chrome + overlays once so they aren't blank until the first tick.
     chrome::sync(&bars, &fe, app, &drawing);
