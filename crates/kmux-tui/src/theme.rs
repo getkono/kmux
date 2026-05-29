@@ -56,6 +56,11 @@ pub fn default_theme() -> Theme {
 }
 
 /// Returns the named built-in theme as ratatui colors, or `None`.
+///
+/// Test-only: theme selection (`/theme`) now lives in `kmux_app` against the
+/// agnostic palette; this binary only converts. Ungate if a non-test caller
+/// appears (e.g. when kmux-tui gains a library target in P7).
+#[cfg(test)]
 pub fn builtin_theme(name: &str) -> Option<Theme> {
     app_theme::builtin_theme(name).map(Into::into)
 }

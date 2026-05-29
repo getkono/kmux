@@ -33,6 +33,9 @@ pub mod config;
 /// Persisted recent-servers cache (frontend-agnostic).
 pub mod recent_servers;
 
+/// The `/`-command palette: registry, parsing, completion hints, execution.
+pub mod cmd;
+
 /// The frontend-agnostic client view-model ([`core::AppCore`]) and the
 /// connection/session orchestration that drives it.
 pub mod core;

@@ -89,6 +89,9 @@ impl App {
                 self.needs_render = true;
             }
             if self.needs_render && last_draw.elapsed() >= RENDER_MIN_INTERVAL {
+                // Refresh the ratatui-typed palette mirror from the core's
+                // agnostic theme (the `/theme` command mutates the core copy).
+                self.theme = crate::theme::Theme::from(self.core.theme.clone());
                 terminal.draw(|f| ui::render(f, self))?;
                 self.needs_render = false;
                 last_draw = Instant::now();
@@ -180,6 +183,10 @@ impl App {
                                 KeyResult::Continue => {
                                     // needs_render already set by process_input_batch
                                 }
+                                // Clipboard effects are handled inside
+                                // `handle_key` (toolkit-specific I/O) and never
+                                // escape to here; arm kept for exhaustiveness.
+                                KeyResult::CopyToClipboard(_) | KeyResult::RequestPaste => {}
                             }
                         }
                         Some(Err(_)) | None => break,

@@ -1,17 +1,16 @@
 mod app;
 mod cli;
-mod cmd;
 mod host_caps;
 mod key_convert;
 mod subcommands;
 mod theme;
 mod ui;
 
-// The modal keymap / action model, config/theme resolution, and recent-servers
-// cache now live in kmux-app (frontend-agnostic). Re-export them at the crate
-// root so existing `crate::mode::*` / `crate::config::*` /
-// `crate::recent_servers::*` paths keep resolving.
-use kmux_app::{config, mode, recent_servers};
+// The modal keymap / action model, command palette, config/theme resolution,
+// and recent-servers cache now live in kmux-app (frontend-agnostic). Re-export
+// them at the crate root so existing `crate::mode::*` / `crate::cmd::*` /
+// `crate::config::*` / `crate::recent_servers::*` paths keep resolving.
+use kmux_app::{cmd, config, mode, recent_servers};
 
 use std::io;
 
@@ -173,9 +172,9 @@ async fn async_main() -> anyhow::Result<()> {
         original_hook(panic_info);
     }));
 
-    // resolve_theme yields the toolkit-neutral palette; convert to the TUI's
-    // ratatui-typed Theme at this boundary.
-    let theme: crate::theme::Theme = config::resolve_theme(cli.theme.as_deref()).into();
+    // resolve_theme yields the toolkit-neutral palette; App::new keeps the
+    // agnostic copy on the core and derives the TUI's ratatui-typed mirror.
+    let theme = config::resolve_theme(cli.theme.as_deref());
 
     let mut app = App::new(
         target,

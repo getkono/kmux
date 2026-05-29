@@ -163,7 +163,7 @@ mod tests {
     use super::super::spec::{ArgSpec, CommandSpec, Completer};
     use super::*;
 
-    fn noop(_: &mut crate::app::App, _: &[String]) -> super::super::spec::CommandResult {
+    fn noop(_: &mut crate::core::AppCore, _: &[String]) -> super::super::spec::CommandResult {
         Ok(super::super::spec::CommandSuccess::Ok)
     }
 

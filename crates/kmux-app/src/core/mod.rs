@@ -20,7 +20,9 @@ use tokio::sync::{mpsc, oneshot};
 
 use crate::mode::Mode;
 use crate::recent_servers::{RecentServersCache, ServerKind};
+use crate::theme::Theme;
 
+mod dispatch;
 mod orchestration;
 
 pub use orchestration::{BootstrapPhase, BootstrapTaskResult};
@@ -40,6 +42,12 @@ pub enum KeyResult {
     Reconnect,
     /// User selected a server from the server picker.
     SwitchServer(SwitchTarget),
+    /// Core requests the frontend copy this text to the system clipboard.
+    /// Clipboard access is toolkit-specific, so it is performed frontend-side.
+    CopyToClipboard(String),
+    /// Core requests the frontend read the system clipboard and feed it back as
+    /// a paste (the frontend forwards the text to `mgr.send_paste`).
+    RequestPaste,
 }
 
 /// Destination chosen from the server picker.
@@ -65,6 +73,11 @@ pub enum TopBarAction {
 /// Frontend-agnostic client view-model. See the module docs.
 pub struct AppCore {
     pub mgr: SessionManager,
+
+    /// Active color palette (toolkit-neutral). The source of truth that the
+    /// `/theme` command mutates; each frontend converts it to its own color
+    /// type at the render boundary.
+    pub theme: Theme,
 
     /// Current interaction mode (modal keymap state).
     pub mode: Mode,
@@ -143,6 +156,7 @@ impl AppCore {
     /// Build the core view-model for a target. `capabilities` is detected by
     /// the frontend (it is terminal/toolkit-specific) and `term_size` is the
     /// frontend's initial content size.
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         target: ResolvedTarget,
         initial_cwd: String,
@@ -150,6 +164,7 @@ impl AppCore {
         auto_session: Option<String>,
         auto_cwd: Option<String>,
         capabilities: ClientCapabilities,
+        theme: Theme,
         term_size: TermSize,
     ) -> Self {
         let (is_local, accept_invalid_certs, ssh_target) = match &target {
@@ -193,6 +208,7 @@ impl AppCore {
 
         Self {
             mgr,
+            theme,
             mode: Mode::Normal,
             term_size,
             hud_visible: false,
@@ -240,6 +256,7 @@ impl AppCore {
     pub fn for_test(mgr: SessionManager) -> Self {
         Self {
             mgr,
+            theme: crate::theme::default_theme(),
             mode: Mode::Normal,
             term_size: TermSize {
                 rows: 24,

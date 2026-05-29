@@ -6,7 +6,7 @@
 //! It is recomputed at every render and after every editing keystroke that
 //! could affect ranking; nothing is cached on `App`.
 
-use crate::app::App;
+use crate::core::AppCore;
 use crate::mode::Mode;
 
 use super::parse::{completer_values, tokenize};
@@ -37,7 +37,7 @@ pub const MAX_HINTS: usize = 8;
 
 /// Compute the current dropdown contents for the buffer in `app.mode`.
 /// Returns an empty vec if `app.mode` is not `Mode::Command`.
-pub fn build_hints(app: &App) -> Vec<Hint> {
+pub fn build_hints(app: &AppCore) -> Vec<Hint> {
     let buffer = match &app.mode {
         Mode::Command(s) => &s.buffer,
         _ => return Vec::new(),
@@ -176,7 +176,7 @@ fn command_name_hints(buffer: &str, leading_ws: usize) -> Vec<Hint> {
 }
 
 fn arg_value_hints(
-    app: &App,
+    app: &AppCore,
     buffer: &str,
     tokens: &[String],
     used: usize,
@@ -261,9 +261,9 @@ mod tests {
     use kmux_client::session_manager::SessionManager;
     use kmux_protocol::messages::ClientCapabilities;
 
-    fn empty_app(buffer: &str) -> App {
-        // Cheaply build an App-shaped fixture without booting the runtime.
-        // We only set the fields the hint engine reads.
+    fn empty_app(buffer: &str) -> AppCore {
+        // Cheaply build a core fixture without booting the runtime. We only set
+        // the fields the hint engine reads.
         let mgr = SessionManager::new(
             "127.0.0.1".into(),
             8443,
@@ -271,20 +271,14 @@ mod tests {
             true,
             ClientCapabilities::default(),
         );
-        let mut core = crate::app::AppCore::for_test(mgr);
+        let mut core = AppCore::for_test(mgr);
         core.mode = Mode::Command(crate::mode::CommandState {
             buffer: buffer.to_string(),
             cursor: buffer.len(),
             selected: 0,
             history_pos: None,
         });
-        App {
-            core,
-            theme: crate::theme::default_theme(),
-            top_bar_hits: crate::app::TopBarHits::default(),
-            picker_hits: crate::app::PickerHits::default(),
-            paste_tx: None,
-        }
+        core
     }
 
     #[test]

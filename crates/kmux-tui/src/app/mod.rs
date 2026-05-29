@@ -10,8 +10,7 @@ use crate::theme::Theme;
 // now live in kmux-app. Re-export them at `crate::app::*` so existing call
 // sites (event loop, key/mouse handlers, command palette) keep resolving.
 pub use kmux_app::core::{
-    AppCore, BootstrapPhase, BootstrapTaskResult, COMMAND_HISTORY_CAP, KeyResult, SwitchTarget,
-    TopBarAction,
+    AppCore, BootstrapPhase, BootstrapTaskResult, KeyResult, SwitchTarget, TopBarAction,
 };
 
 mod event_batch;
@@ -93,13 +92,16 @@ impl App {
     pub fn new(
         target: ResolvedTarget,
         initial_cwd: String,
-        theme: Theme,
+        theme: kmux_app::theme::Theme,
         instance_id: String,
         auto_session: Option<String>,
         auto_cwd: Option<String>,
         kitty_keyboard_supported: bool,
     ) -> Self {
         let capabilities = crate::host_caps::detect(kitty_keyboard_supported);
+        // The core owns the agnostic palette; the TUI keeps a ratatui-typed
+        // mirror (refreshed before each draw — see `run`).
+        let tui_theme = Theme::from(theme.clone());
         let core = AppCore::new(
             target,
             initial_cwd,
@@ -107,12 +109,13 @@ impl App {
             auto_session,
             auto_cwd,
             capabilities,
+            theme,
             Self::current_term_size(),
         );
 
         Self {
             core,
-            theme,
+            theme: tui_theme,
             top_bar_hits: TopBarHits::default(),
             picker_hits: PickerHits::default(),
             paste_tx: None,

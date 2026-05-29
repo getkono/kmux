@@ -1,6 +1,6 @@
 //! Glue between `Mode::Command` submission and the registered command bodies.
 
-use crate::app::{App, SwitchTarget};
+use crate::core::{AppCore, SwitchTarget};
 
 use super::parse::{ParseError, parse};
 use super::registry;
@@ -17,7 +17,7 @@ pub enum Outcome {
 
 /// Parse `buffer` against the registry and execute it. Sets `app.mgr.status_msg`
 /// for status / error messages so the existing bottom-bar render shows them.
-pub fn run(app: &mut App, buffer: &str) -> Outcome {
+pub fn run(app: &mut AppCore, buffer: &str) -> Outcome {
     let parsed = match parse(buffer, registry::ALL) {
         Ok(p) => p,
         Err(e) => {
