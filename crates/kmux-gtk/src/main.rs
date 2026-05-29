@@ -10,6 +10,7 @@
 //! leaves are GTK-specific. The pump mirrors the arms of the TUI's
 //! `tokio::select!` loop (`kmux-tui/src/app/event_loop.rs`).
 
+mod chrome;
 mod convert;
 mod render;
 
@@ -18,7 +19,10 @@ use std::rc::Rc;
 use std::time::{Duration, Instant};
 
 use gtk4::prelude::*;
-use gtk4::{Application, ApplicationWindow, DrawingArea, EventControllerKey, gdk, gio, glib};
+use gtk4::{
+    Application, ApplicationWindow, Box as GtkBox, DrawingArea, EventControllerKey, Orientation,
+    Overlay, gdk, gio, glib,
+};
 
 use kmux_app::core::{AppCore, BootstrapPhase, BootstrapTaskResult, KeyResult, SwitchTarget};
 use kmux_app::launch::{Launch, Plan, run_cli};
@@ -211,13 +215,24 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         });
     }
 
+    // Native chrome: session bar | grid | status bar | hint bar, inside an
+    // overlay that later hosts the picker/command/dialog overlays.
+    let bars = Rc::new(chrome::build());
+    let vbox = GtkBox::new(Orientation::Vertical, 0);
+    vbox.append(&bars.session);
+    vbox.append(&drawing);
+    vbox.append(&bars.status);
+    vbox.append(&bars.hint);
+    let overlay = Overlay::new();
+    overlay.set_child(Some(&vbox));
+
     let window = ApplicationWindow::builder()
         .application(app)
         .title("kmux")
         .default_width((80.0 * cell_w) as i32)
-        .default_height((24.0 * cell_h) as i32)
+        .default_height((26.0 * cell_h) as i32)
         .build();
-    window.set_child(Some(&drawing));
+    window.set_child(Some(&overlay));
 
     // Key input: GDK → agnostic key → resolve → dispatch (or structured forward).
     let key_ctl = EventControllerKey::new();
@@ -261,12 +276,17 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     }
     window.add_controller(key_ctl);
 
-    // The pump: drain network channels, tick timers, request a redraw.
+    // Populate the bars once so they aren't blank until the first pump tick.
+    chrome::sync(&bars, &fe, app, &drawing);
+
+    // The pump: drain network channels, tick timers, sync chrome, redraw.
     {
         let fe = fe.clone();
         let drawing = drawing.clone();
+        let bars = bars.clone();
+        let app = app.clone();
         glib::timeout_add_local(PUMP_INTERVAL, move || {
-            pump(&fe, &drawing);
+            pump(&fe, &drawing, &bars, &app);
             glib::ControlFlow::Continue
         });
     }
@@ -285,155 +305,164 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
 /// One pump tick. Mirrors the arms of the TUI `tokio::select!` loop: settled
 /// resize, server messages, bootstrap outcome, transport upgrade, tunnel death,
 /// liveness, and metrics flush.
-fn pump(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea) {
-    let mut fe = fe.borrow_mut();
-    let mut dirty = false;
-    let now = Instant::now();
+fn pump(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea, bars: &chrome::Bars, app: &Application) {
+    let redraw = {
+        let mut fe = fe.borrow_mut();
+        let mut dirty = false;
+        let now = Instant::now();
 
-    // ── Apply a settled resize (debounced in `connect_resize`). ──
-    if let Some(deadline) = fe.resize_deadline
-        && now >= deadline
-    {
-        if let Some(size) = fe.pending_resize.take() {
-            fe.core.set_term_size(size);
-            dirty = true;
+        // ── Apply a settled resize (debounced in `connect_resize`). ──
+        if let Some(deadline) = fe.resize_deadline
+            && now >= deadline
+        {
+            if let Some(size) = fe.pending_resize.take() {
+                fe.core.set_term_size(size);
+                dirty = true;
+            }
+            fe.resize_deadline = None;
         }
-        fe.resize_deadline = None;
-    }
 
-    // ── Server messages (batched; skipped once disconnected). ──
-    if !matches!(fe.core.mode, Mode::Disconnected { .. }) {
-        let mut batch = Vec::new();
-        let mut closed = false;
-        loop {
-            match fe.srv_rx.try_recv() {
-                Ok(m) => batch.push(m),
-                Err(TryRecvError::Empty) => break,
-                Err(TryRecvError::Disconnected) => {
-                    closed = true;
-                    break;
+        // ── Server messages (batched; skipped once disconnected). ──
+        if !matches!(fe.core.mode, Mode::Disconnected { .. }) {
+            let mut batch = Vec::new();
+            let mut closed = false;
+            loop {
+                match fe.srv_rx.try_recv() {
+                    Ok(m) => batch.push(m),
+                    Err(TryRecvError::Empty) => break,
+                    Err(TryRecvError::Disconnected) => {
+                        closed = true;
+                        break;
+                    }
                 }
             }
-        }
-        if !batch.is_empty() {
-            fe.core.mgr.metrics.record_batch(batch.len());
-            for m in batch {
-                let events = fe.core.mgr.handle_server_message(m);
-                fe.core.handle_session_events(events);
+            if !batch.is_empty() {
+                fe.core.mgr.metrics.record_batch(batch.len());
+                for m in batch {
+                    let events = fe.core.mgr.handle_server_message(m);
+                    fe.core.handle_session_events(events);
+                }
+                dirty = true;
             }
-            dirty = true;
+            // Channel closed while live → the connection dropped.
+            if closed
+                && !matches!(
+                    fe.core.mode,
+                    Mode::Connecting { .. } | Mode::Disconnected { .. }
+                )
+            {
+                fe.core.enter_disconnected(DisconnectReason::ServerClosed);
+                dirty = true;
+            }
         }
-        // Channel closed while live → the connection dropped.
-        if closed
-            && !matches!(
-                fe.core.mode,
-                Mode::Connecting { .. } | Mode::Disconnected { .. }
-            )
-        {
-            fe.core.enter_disconnected(DisconnectReason::ServerClosed);
-            dirty = true;
-        }
-    }
 
-    // ── Bootstrap outcome (at most one per bootstrap). ──
-    let outcome = fe.bootstrap_rx.as_mut().and_then(|rx| match rx.try_recv() {
-        Ok(o) => Some(Ok(o)),
-        Err(TryRecvError::Empty) => None,
-        Err(TryRecvError::Disconnected) => Some(Err(())),
-    });
-    match outcome {
-        Some(Ok(BootstrapTaskResult::Success(o))) => {
-            fe.core.cancel_tx = None;
-            // A later success clears any stashed failure so we don't re-print a
-            // stale error when the user finally quits.
-            fe.core.last_exit_error = None;
-            let ssh_ctx = fe.core.mgr.apply_outcome(*o);
-            if let Some(ctx) = ssh_ctx {
-                let srv_tx = fe
-                    .core
-                    .pending_srv_tx
-                    .take()
-                    .expect("pending_srv_tx set in start_bootstrap");
-                let upgrade_tx = fe.upgrade_tx.clone();
-                let tunnel_died_tx = fe.tunnel_died_tx.clone();
-                fe.core
-                    .launch_ssh_supervisor(ctx, srv_tx, upgrade_tx, tunnel_died_tx);
-            } else {
+        // ── Bootstrap outcome (at most one per bootstrap). ──
+        let outcome = fe.bootstrap_rx.as_mut().and_then(|rx| match rx.try_recv() {
+            Ok(o) => Some(Ok(o)),
+            Err(TryRecvError::Empty) => None,
+            Err(TryRecvError::Disconnected) => Some(Err(())),
+        });
+        match outcome {
+            Some(Ok(BootstrapTaskResult::Success(o))) => {
+                fe.core.cancel_tx = None;
+                // A later success clears any stashed failure so we don't re-print a
+                // stale error when the user finally quits.
+                fe.core.last_exit_error = None;
+                let ssh_ctx = fe.core.mgr.apply_outcome(*o);
+                if let Some(ctx) = ssh_ctx {
+                    let srv_tx = fe
+                        .core
+                        .pending_srv_tx
+                        .take()
+                        .expect("pending_srv_tx set in start_bootstrap");
+                    let upgrade_tx = fe.upgrade_tx.clone();
+                    let tunnel_died_tx = fe.tunnel_died_tx.clone();
+                    fe.core
+                        .launch_ssh_supervisor(ctx, srv_tx, upgrade_tx, tunnel_died_tx);
+                } else {
+                    fe.core.pending_srv_tx = None;
+                }
+                fe.core.reflect_bootstrap_outcome();
+                fe.bootstrap_rx = None;
+                dirty = true;
+            }
+            Some(Ok(BootstrapTaskResult::Failed(reason))) => {
+                fe.core.cancel_tx = None;
                 fe.core.pending_srv_tx = None;
-            }
-            fe.core.reflect_bootstrap_outcome();
-            fe.bootstrap_rx = None;
-            dirty = true;
-        }
-        Some(Ok(BootstrapTaskResult::Failed(reason))) => {
-            fe.core.cancel_tx = None;
-            fe.core.pending_srv_tx = None;
-            // Stash so it survives teardown and is re-printed to stderr; the
-            // disconnect overlay shows the same text in-window.
-            fe.core.last_exit_error = Some(reason.clone());
-            fe.core
-                .enter_disconnected(DisconnectReason::BootstrapFailed(reason));
-            fe.bootstrap_rx = None;
-            dirty = true;
-        }
-        Some(Err(())) => {
-            // Channel closed with no result → the bootstrap was cancelled
-            // (cancel_tx dropped via Action::CancelBootstrap).
-            fe.core.cancel_tx = None;
-            fe.core.pending_srv_tx = None;
-            if matches!(fe.core.mode, Mode::Connecting { .. }) {
+                // Stash so it survives teardown and is re-printed to stderr; the
+                // disconnect overlay shows the same text in-window.
+                fe.core.last_exit_error = Some(reason.clone());
                 fe.core
-                    .enter_disconnected(DisconnectReason::BootstrapFailed("cancelled".to_string()));
+                    .enter_disconnected(DisconnectReason::BootstrapFailed(reason));
+                fe.bootstrap_rx = None;
+                dirty = true;
             }
-            fe.bootstrap_rx = None;
+            Some(Err(())) => {
+                // Channel closed with no result → the bootstrap was cancelled
+                // (cancel_tx dropped via Action::CancelBootstrap).
+                fe.core.cancel_tx = None;
+                fe.core.pending_srv_tx = None;
+                if matches!(fe.core.mode, Mode::Connecting { .. }) {
+                    fe.core
+                        .enter_disconnected(DisconnectReason::BootstrapFailed(
+                            "cancelled".to_string(),
+                        ));
+                }
+                fe.bootstrap_rx = None;
+                dirty = true;
+            }
+            None => {}
+        }
+
+        // ── Transport upgrade (a better transport was found by the probe). ──
+        while let Ok(signal) = fe.upgrade_rx.try_recv() {
+            let _ = signal.sender.send(ClientMessage::ChannelReady);
+            fe.core
+                .mgr
+                .apply_transport_upgrade(signal.sender, signal.new_kind);
             dirty = true;
         }
-        None => {}
-    }
 
-    // ── Transport upgrade (a better transport was found by the probe). ──
-    while let Ok(signal) = fe.upgrade_rx.try_recv() {
-        let _ = signal.sender.send(ClientMessage::ChannelReady);
-        fe.core
-            .mgr
-            .apply_transport_upgrade(signal.sender, signal.new_kind);
-        dirty = true;
-    }
-
-    // ── SSH tunnel death (freeze if we're on the tunnelled transport). ──
-    while fe.tunnel_died_rx.try_recv().is_ok() {
-        if fe.core.mgr.current_transport == TransportKind::TcpTls
-            && !matches!(fe.core.mode, Mode::Disconnected { .. })
-        {
-            fe.core.enter_disconnected(DisconnectReason::SshTunnelDied);
-            dirty = true;
+        // ── SSH tunnel death (freeze if we're on the tunnelled transport). ──
+        while fe.tunnel_died_rx.try_recv().is_ok() {
+            if fe.core.mgr.current_transport == TransportKind::TcpTls
+                && !matches!(fe.core.mode, Mode::Disconnected { .. })
+            {
+                fe.core.enter_disconnected(DisconnectReason::SshTunnelDied);
+                dirty = true;
+            }
         }
-    }
 
-    // ── Liveness ping + timeout (1 s). ──
-    if now.duration_since(fe.last_liveness) >= LIVENESS_TICK {
-        fe.last_liveness = now;
-        fe.core.mgr.maybe_send_client_ping(now);
-        if fe.core.mgr.is_liveness_timed_out(now)
-            && !matches!(
-                fe.core.mode,
-                Mode::Disconnected { .. } | Mode::Connecting { .. }
-            )
-        {
-            fe.core.enter_disconnected(DisconnectReason::PingTimeout);
-            dirty = true;
+        // ── Liveness ping + timeout (1 s). ──
+        if now.duration_since(fe.last_liveness) >= LIVENESS_TICK {
+            fe.last_liveness = now;
+            fe.core.mgr.maybe_send_client_ping(now);
+            if fe.core.mgr.is_liveness_timed_out(now)
+                && !matches!(
+                    fe.core.mode,
+                    Mode::Disconnected { .. } | Mode::Connecting { .. }
+                )
+            {
+                fe.core.enter_disconnected(DisconnectReason::PingTimeout);
+                dirty = true;
+            }
         }
-    }
 
-    // ── Metrics JSONL flush (10 s). ──
-    if now.duration_since(fe.last_metrics_flush) >= METRICS_FLUSH_TICK {
-        fe.last_metrics_flush = now;
-        let conn_id = fe.core.mgr.connection_id;
-        fe.core.mgr.metrics.flush_sample(conn_id);
-    }
+        // ── Metrics JSONL flush (10 s). ──
+        if now.duration_since(fe.last_metrics_flush) >= METRICS_FLUSH_TICK {
+            fe.last_metrics_flush = now;
+            let conn_id = fe.core.mgr.connection_id;
+            fe.core.mgr.metrics.flush_sample(conn_id);
+        }
 
-    if dirty || fe.core.needs_render {
+        let redraw = dirty || fe.core.needs_render;
         fe.core.needs_render = false;
+        redraw
+    };
+    // The borrow is released; rebuild chrome (cheap when state is unchanged)
+    // and repaint the grid.
+    if redraw {
+        chrome::sync(bars, fe, app, drawing);
         drawing.queue_draw();
     }
 }
