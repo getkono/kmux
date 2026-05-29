@@ -3,7 +3,7 @@
 //! Frontend-agnostic: [`resolve_theme`] returns a toolkit-neutral
 //! [`crate::theme::Theme`] which each frontend converts to its own color type.
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use tracing::error;
 
 use crate::theme::{self, Theme};
@@ -11,14 +11,31 @@ use crate::theme::{self, Theme};
 /// Top-level kmux configuration file (`~/.config/kmux/config.toml`).
 ///
 /// The file is optional; its absence is not an error.
-#[derive(Debug, Deserialize, Default)]
+#[derive(Debug, Deserialize, Serialize, Default)]
 pub struct KmuxConfig {
     /// Theme ID: a built-in name or a custom theme filename (without `.toml`)
     /// located in `~/.config/kmux/themes/`.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
     /// GUI font as a Pango font-description string (e.g. `"JetBrains Mono 12"`).
     /// GUI-only; the TUI renders in the host terminal's font and ignores this.
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub font: Option<String>,
+}
+
+/// Load `config.toml`, returning defaults if it is missing or unparseable.
+pub fn load() -> KmuxConfig {
+    load_config_file().unwrap_or_default()
+}
+
+/// Persist `cfg` to `<config_dir>/config.toml`, creating the directory if
+/// needed. Used by the GUI preferences window.
+pub fn save(cfg: &KmuxConfig) -> anyhow::Result<()> {
+    let dir = kmux_protocol::dirs::config_dir()?;
+    std::fs::create_dir_all(&dir)?;
+    let path = dir.join("config.toml");
+    std::fs::write(&path, toml::to_string_pretty(cfg)?)?;
+    Ok(())
 }
 
 /// Default GUI font (a Pango font-description string) used when neither the
@@ -261,5 +278,22 @@ status_bg = "#111111"
     fn config_file_parses_font_field() {
         let cfg: KmuxConfig = toml::from_str(r#"font = "Fira Code 13""#).unwrap();
         assert_eq!(cfg.font.as_deref(), Some("Fira Code 13"));
+    }
+
+    #[test]
+    fn save_then_load_round_trips() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        let cfg = KmuxConfig {
+            theme: Some("dracula".into()),
+            font: Some("Fira Code 13".into()),
+        };
+        let saved = save(&cfg);
+        let loaded = load();
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        saved.unwrap();
+        assert_eq!(loaded.theme.as_deref(), Some("dracula"));
+        assert_eq!(loaded.font.as_deref(), Some("Fira Code 13"));
     }
 }

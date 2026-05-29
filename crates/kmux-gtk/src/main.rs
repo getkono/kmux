@@ -15,6 +15,7 @@ mod convert;
 mod css;
 mod input;
 mod overlays;
+mod prefs;
 mod render;
 
 use std::cell::RefCell;
@@ -265,6 +266,12 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         let drawing = drawing.clone();
         let app = app.clone();
         key_ctl.connect_key_pressed(move |_ctl, keyval, _code, gdk_mods| {
+            // GUI shortcut: Ctrl+, opens Preferences. Intercepted before the
+            // resolve→PTY path so it never reaches the terminal.
+            if gdk_mods.contains(gdk::ModifierType::CONTROL_MASK) && keyval == gdk::Key::comma {
+                prefs::open(&fe, &drawing);
+                return glib::Propagation::Stop;
+            }
             let Some((key, mods)) = convert::convert(keyval, gdk_mods) else {
                 return glib::Propagation::Proceed;
             };
