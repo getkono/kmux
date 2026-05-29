@@ -472,6 +472,10 @@ fn pump(
             fe.core.mgr.metrics.flush_sample(conn_id);
         }
 
+        // Keep the HUD / metrics overlay refreshing while either is shown.
+        if fe.core.hud_visible || fe.core.metrics_overlay_visible {
+            dirty = true;
+        }
         let redraw = dirty || fe.core.needs_render;
         fe.core.needs_render = false;
         redraw

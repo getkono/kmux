@@ -64,6 +64,8 @@ pub fn stylesheet(p: &Theme) -> String {
 .kmux-overlay-row {{ padding: 1px 6px; border-radius: 4px; }}
 .kmux-overlay-row.selected {{ background: {accent}; color: {bg}; }}
 .kmux-overlay-caret {{ color: {accent}; font-weight: bold; }}
+.kmux-hud {{ padding: 6px 10px; }}
+.kmux-hud-line {{ color: {green}; }}
 "
     )
 }
