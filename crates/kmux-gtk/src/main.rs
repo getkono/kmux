@@ -21,15 +21,16 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
-use gtk4::prelude::*;
+use adw::prelude::*;
 use gtk4::{
-    Application, ApplicationWindow, Box as GtkBox, DrawingArea, EventControllerKey, Orientation,
-    Overlay, gdk, gio, glib,
+    Application, Box as GtkBox, DrawingArea, EventControllerKey, Orientation, Overlay, gdk, gio,
+    glib,
 };
 
 use kmux_app::core::{AppCore, BootstrapPhase, BootstrapTaskResult, KeyResult, SwitchTarget};
 use kmux_app::launch::{Launch, Plan, run_cli};
 use kmux_app::mode::{self, Action, Mode};
+use kmux_app::theme::Theme;
 use kmux_client::connection_state::DisconnectReason;
 use kmux_client::generate_instance_id;
 use kmux_client::supervisor::UpgradeSignal;
@@ -69,6 +70,10 @@ struct Frontend {
     /// Cell geometry derived from the configured font; recomputed on scale
     /// change. Drives the grid render and the resize → cols/rows mapping.
     metrics: render::Metrics,
+    /// The CSS provider for the chrome/overlay theme, reloaded when the palette
+    /// changes (`/theme`). The last palette applied to it, for change detection.
+    css_provider: gtk4::CssProvider,
+    last_palette: Theme,
     /// Timer bookkeeping: the glib pump fires on one interval, so we track each
     /// cadence's last-fire / deadline ourselves.
     last_liveness: Instant,
@@ -100,6 +105,11 @@ fn run_gui(plan: Plan) -> anyhow::Result<()> {
     // A fatal bootstrap error is shown in-window (disconnect overlay) and also
     // surfaced to stderr after teardown, mirroring the TUI's stashed-error path.
     let exit_error: Rc<RefCell<Option<String>>> = Rc::new(RefCell::new(None));
+    // Initialize libadwaita once gtk is up (we keep a gtk4::Application rather
+    // than adw::Application to avoid threading adw types through every helper).
+    app.connect_startup(|_| {
+        adw::init().expect("failed to initialize libadwaita");
+    });
     {
         let exit_error = exit_error.clone();
         app.connect_activate(move |app| build_ui(app, &plan, exit_error.clone()));
@@ -162,6 +172,14 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     let metrics = render::Metrics::measure(&drawing.pango_context(), font);
     let (cell_w, cell_h) = (metrics.cell_w, metrics.cell_h);
 
+    // Theme the chrome + overlays from the active palette, and match the
+    // libadwaita window styling (light/dark) to the theme. Both are refreshed
+    // by the pump when `/theme` changes the palette.
+    let css_provider = gdk::Display::default()
+        .map(|d| css::install(&d, &plan.theme))
+        .unwrap_or_default();
+    adw::StyleManager::default().set_color_scheme(scheme_for(&plan.theme));
+
     let now = Instant::now();
     let fe = Rc::new(RefCell::new(Frontend {
         core,
@@ -172,6 +190,8 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         tunnel_died_rx,
         tunnel_died_tx,
         metrics,
+        css_provider,
+        last_palette: plan.theme.clone(),
         last_liveness: now,
         last_metrics_flush: now,
         pending_resize: None,
@@ -230,19 +250,13 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     overlay.set_child(Some(&vbox));
     let overlays = Rc::new(overlays::build(&overlay));
 
-    // Theme the chrome + overlays from the active palette (libadwaita window
-    // styling + reload-on-/theme build on this later).
-    if let Some(display) = gdk::Display::default() {
-        css::install(&display, &plan.theme);
-    }
-
-    let window = ApplicationWindow::builder()
+    let window = adw::ApplicationWindow::builder()
         .application(app)
         .title("kmux")
         .default_width((80.0 * cell_w) as i32)
         .default_height((26.0 * cell_h) as i32)
         .build();
-    window.set_child(Some(&overlay));
+    window.set_content(Some(&overlay));
 
     // Key input: GDK → agnostic key → resolve → dispatch (or structured forward).
     let key_ctl = EventControllerKey::new();
@@ -331,6 +345,15 @@ fn pump(
         let mut fe = fe.borrow_mut();
         let mut dirty = false;
         let now = Instant::now();
+
+        // ── Reflect a `/theme` palette change onto the chrome CSS + window
+        // light/dark styling (the cairo grid reads the palette live). ──
+        if !palette_eq(&fe.core.palette, &fe.last_palette) {
+            css::reload(&fe.css_provider, &fe.core.palette);
+            adw::StyleManager::default().set_color_scheme(scheme_for(&fe.core.palette));
+            fe.last_palette = fe.core.palette.clone();
+            dirty = true;
+        }
 
         // ── Apply a settled resize (debounced in `connect_resize`). ──
         if let Some(deadline) = fe.resize_deadline
@@ -561,4 +584,30 @@ fn switch_server(fe: &mut Frontend, target: SwitchTarget) {
     fe.core
         .start_bootstrap(resolved, srv_tx, BootstrapPhase::Initial, bs_tx);
     fe.core.needs_render = true;
+}
+
+/// Pick the libadwaita color scheme matching a theme's background luminance, so
+/// the window frame / unstyled chrome follows the active kmux theme.
+fn scheme_for(t: &Theme) -> adw::ColorScheme {
+    let bg = t.bg;
+    let lum = 0.299 * bg.r as f64 + 0.587 * bg.g as f64 + 0.114 * bg.b as f64;
+    if lum < 128.0 {
+        adw::ColorScheme::PreferDark
+    } else {
+        adw::ColorScheme::PreferLight
+    }
+}
+
+/// Whether two palettes are identical. `Theme` is not `PartialEq`, but `Rgb` is.
+fn palette_eq(a: &Theme, b: &Theme) -> bool {
+    a.bg == b.bg
+        && a.fg == b.fg
+        && a.fg_dim == b.fg_dim
+        && a.accent == b.accent
+        && a.green == b.green
+        && a.red == b.red
+        && a.yellow == b.yellow
+        && a.purple == b.purple
+        && a.orange == b.orange
+        && a.status_bg == b.status_bg
 }

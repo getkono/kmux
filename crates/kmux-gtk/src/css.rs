@@ -81,3 +81,8 @@ pub fn install(display: &gdk::Display, palette: &Theme) -> gtk4::CssProvider {
     );
     provider
 }
+
+/// Re-render the stylesheet onto an existing provider (e.g. after `/theme`).
+pub fn reload(provider: &gtk4::CssProvider, palette: &Theme) {
+    provider.load_from_data(&stylesheet(palette));
+}
