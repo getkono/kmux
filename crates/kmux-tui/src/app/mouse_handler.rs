@@ -2,9 +2,8 @@ use crossterm::event::{MouseEvent, MouseEventKind};
 use kmux_client::input::encode_mouse_scroll;
 
 use crate::mode::Mode;
-use crate::recent_servers::ServerKind;
 
-use super::{App, KeyResult, SwitchTarget, TopBarAction};
+use super::{App, KeyResult};
 
 impl App {
     /// Handle a mouse event. Returns a `KeyResult` when the mouse action
@@ -42,32 +41,12 @@ impl App {
         None
     }
 
-    /// Translate a top-bar click at `col` into the corresponding action.
+    /// Translate a top-bar click at `col` into its action and apply it. The
+    /// hit-box geometry is TUI-specific; the action policy lives on `AppCore`
+    /// ([`AppCore::apply_top_bar_action`]) so the GUI frontend shares it.
     fn dispatch_top_bar_click(&mut self, col: u16) -> Option<KeyResult> {
         let action = self.top_bar_hits.action_at(col).cloned()?;
-        match action {
-            TopBarAction::OpenServerPicker => {
-                self.server_picker_selected = 0;
-                self.server_picker_search.clear();
-                self.mode = Mode::ServerPicker;
-                None
-            }
-            TopBarAction::Reconnect => Some(KeyResult::Reconnect),
-            TopBarAction::OpenSessionPicker => {
-                self.session_picker_selected = 0;
-                self.session_picker_search.clear();
-                self.mode = Mode::SessionPicker;
-                None
-            }
-            TopBarAction::SelectPane(pane_id) => {
-                self.mgr.select_pane(pane_id);
-                None
-            }
-            TopBarAction::CreatePane => {
-                self.mgr.create_pane(App::current_term_size());
-                None
-            }
-        }
+        self.apply_top_bar_action(action)
     }
 
     /// Returns `Some(result)` when the event was handled by the picker layer.
@@ -109,82 +88,6 @@ impl App {
 
     fn picker_item_at_row(&self, row: u16) -> Option<usize> {
         self.picker_hits.item_rows.iter().position(|&r| r == row)
-    }
-
-    fn set_picker_selected(&mut self, idx: usize) {
-        match self.mode {
-            Mode::SessionPicker => self.session_picker_selected = idx,
-            Mode::ServerPicker => self.server_picker_selected = idx,
-            Mode::DirectoryPicker => self.dir_picker_selected = idx,
-            _ => {}
-        }
-    }
-
-    /// Dispatch the same side effects as pressing Enter on the current picker
-    /// selection. Mirrors the logic in `key_handler.rs` for
-    /// `SelectPickerEntry`, `ServerPickerSelect`, and `DirPickerSubmit`.
-    fn activate_picker_selection(&mut self) -> Option<KeyResult> {
-        match self.mode {
-            Mode::SessionPicker => {
-                // Mirror key_handler::Action::SelectPickerEntry. Index 0 is the
-                // synthetic "[+] New session" affordance.
-                if self.session_picker_selected == 0 {
-                    self.dir_picker_buffer = self.initial_cwd.clone();
-                    self.dir_picker_selected = 0;
-                    self.mode = Mode::DirectoryPicker;
-                } else {
-                    let search = self.session_picker_search.to_lowercase();
-                    let word_id = self
-                        .mgr
-                        .session_list()
-                        .iter()
-                        .filter(|e| {
-                            search.is_empty()
-                                || e.meta.name.to_lowercase().contains(&search)
-                                || e.meta.word_id.to_lowercase().contains(&search)
-                        })
-                        .nth(self.session_picker_selected - 1)
-                        .map(|e| e.meta.word_id.clone());
-                    if let Some(word_id) = word_id {
-                        self.mgr.select_session(word_id);
-                    }
-                    self.mode = Mode::Normal;
-                }
-                None
-            }
-            Mode::ServerPicker => {
-                let servers = self.filtered_servers();
-                let choice = servers.get(self.server_picker_selected).cloned();
-                self.mode = Mode::Normal;
-                let server = choice?;
-                if server.server_string == self.server_string {
-                    return None;
-                }
-                let target = match server.kind {
-                    ServerKind::Local => SwitchTarget::Local,
-                    ServerKind::Ssh {
-                        user,
-                        host,
-                        ssh_port,
-                    } => SwitchTarget::Ssh(kmux_client::ssh::RemoteTarget {
-                        user,
-                        host,
-                        ssh_port,
-                    }),
-                };
-                Some(KeyResult::SwitchServer(target))
-            }
-            Mode::DirectoryPicker => {
-                let matches = self.dir_picker_matches();
-                if let Some(entry) = matches.get(self.dir_picker_selected) {
-                    let word_id = entry.meta.word_id.clone();
-                    self.mgr.select_session(word_id);
-                }
-                self.mode = Mode::Normal;
-                None
-            }
-            _ => None,
-        }
     }
 
     /// Apply a signed scroll delta to a pane in local scrollback mode.
