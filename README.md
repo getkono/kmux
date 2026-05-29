@@ -20,13 +20,21 @@ kmux uses a server/client split:
 | [`kmux-pty`](crates/kmux-pty)           | Async PTY lifecycle library (spawn, I/O, resize, shutdown)                 |
 | [`kmux-protocol`](crates/kmux-protocol) | Shared wire protocol, transport traits, TOFU TLS, endpoint URL parser      |
 | [`kmuxd`](crates/kmuxd)                 | Background daemon — manages PTY sessions, multi-transport listener         |
-| [`kmux-tui`](crates/kmux-tui)           | TUI client — connects over QUIC, TCP+TLS, or UDS with automatic fallback   |
+| [`kmux-client`](crates/kmux-client)     | Client mechanism — session manager, transports/bootstrap, terminal grid    |
+| [`kmux-app`](crates/kmux-app)           | Toolkit-agnostic interaction layer — `AppCore`, command palette, CLI       |
+| [`kmux-tui`](crates/kmux-tui)           | TUI frontend (ratatui/crossterm); ships the `kmux-tui` binary              |
+| [`kmux-gtk`](crates/kmux-gtk)           | GTK4 GUI frontend (Linux); ships the `kmux` binary                         |
 
 ```
-kmuxd     ->  kmux-pty
-kmuxd     ->  kmux-protocol
-kmux-tui  ->  kmux-protocol
+kmuxd     ->  kmux-pty,  kmux-protocol
+kmux-client ->  kmux-protocol
+kmux-app  ->  kmux-client, kmux-protocol
+kmux-tui  ->  kmux-app          (ratatui/crossterm)
+kmux-gtk  ->  kmux-app          (gtk4)
 ```
+
+The client is layered so one toolkit-agnostic core (`kmux-app`'s `AppCore`)
+drives both frontends. See [docs/architecture-frontend.md](docs/architecture-frontend.md).
 
 The client connects to the server over QUIC (preferred), TCP+TLS (fallback), or
 UDS (local). See [docs/connection.md](docs/connection.md) for a full description
@@ -70,10 +78,12 @@ Start the server with a self-signed certificate:
 $ cargo run -p kmuxd -- --self-signed
 ```
 
-The server prints a shared auth token on startup. Connect the TUI client:
+The server prints a shared auth token on startup. Connect a client — the GTK
+GUI (`kmux`, Linux) or the terminal UI (`kmux-tui`):
 
 ```bash
-$ cargo run -p kmux-tui
+$ cargo run -p kmux-gtk   # GUI  (binary: kmux)   — needs system GTK4
+$ cargo run -p kmux-tui   # TUI  (binary: kmux-tui)
 ```
 
 By default, the server binds to `0.0.0.0:8443`.

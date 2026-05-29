@@ -9,11 +9,8 @@ publish.workspace = true
 description = "Terminal (TUI) frontend for the kmux client."
 build = "build.rs"
 
-# NOTE: the binary is still named `kmux` during the TUI→GUI migration so the
-# justfile daemon targets and existing workflows keep working. P7 introduces the
-# `kmux` launcher crate and renames this bin to `kmux-tui`.
 [[bin]]
-name = "kmux"
+name = "kmux-tui"
 path = "src/main.rs"
 
 [dependencies]

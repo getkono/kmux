@@ -89,13 +89,35 @@ and renderers reach core state (`self.mgr`, `self.mode`, …) directly — a
 deliberate newtype-wrapper ergonomic. A native GUI frontend wraps the same
 `AppCore` the same way (or holds it directly, as `kmux-gtk` does).
 
+## Binaries and the shared CLI front door
+
+The naming is: **`kmux`** is the GUI (the `kmux-gtk` crate's binary, Linux);
+**`kmux-tui`** is the terminal client (the `kmux-tui` crate's binary, kept for
+SSH/headless use); **`kmuxd`** is the daemon.
+
+Both client binaries share one CLI front door — `kmux_app::launch::run_cli`. It
+initializes logging, parses the CLI, runs any non-interactive subcommand
+(`ls`, `daemon`, `--dry-run`) and returns `Launch::Done`, or returns
+`Launch::Interactive(Plan)` — a frontend-agnostic description of the session to
+launch. Each binary's `main` is then thin:
+
+```rust
+match run_cli(instance_id).await? {
+    Launch::Done => Ok(()),
+    Launch::Interactive(plan) => frontend::run(plan),  // builds AppCore + runs
+}
+```
+
+The frontend builds its own `AppCore` from the `Plan` (supplying its own
+capabilities — the TUI probes the terminal; the GUI declares truecolor) and
+runs its pump. So `kmux daemon start`, `kmux ls`, `kmux --server …`, etc. all
+work on either binary; only the interactive presentation differs.
+
 ## Running
 
-- TUI: `cargo run -p kmux-tui` (the binary is still named `kmux` during the
-  migration; see the launcher note below).
-- GTK scaffold: `cargo run -p kmux-gtk` — opens a window, connects to the local
-  daemon, renders the active session, forwards keystrokes. Proof-of-seam, not a
-  finished GUI.
+- GUI: `cargo run -p kmux-gtk` (binary `kmux`) — opens a window, connects,
+  renders the active session, forwards keystrokes. Proof-of-seam GTK scaffold.
+- TUI: `cargo run -p kmux-tui` (binary `kmux-tui`).
 
 ### Building `kmux-gtk` and the system pkg-config
 
@@ -111,17 +133,26 @@ PKG_CONFIG=/usr/bin/pkg-config cargo build -p kmux-gtk
 This is a machine `PATH` quirk, not a repo setting; on a standard install the
 default `pkg-config` resolves gtk4 directly.
 
-## Remaining: the `kmux` launcher (not yet implemented)
+## Status and what's next
 
-The intended end state is a thin `kmux` launcher binary that:
+Done: the full extraction (everything frontend-free is in `kmux-app`),
+`AppCore` as the GUI-ready seam, the shared `run_cli` front door, the
+`kmux`(GUI)/`kmux-tui`(TUI) binary split, and a GTK scaffold that proves the
+seam end to end.
 
-1. parses the CLI and runs the non-interactive subcommands (`ls`, `daemon`,
-   `--dry-run`) — these already live in `kmux-app` (frontend-free);
-2. for the interactive path, builds an `AppCore` and launches the
-   cfg-selected native frontend — GTK on Linux by default, `--tui` (or a build
-   feature) for the terminal frontend.
+Open items (not blockers — the architecture is complete):
 
-At that point the user-facing `kmux` command becomes the GUI and the terminal
-client is the standalone `kmux-tui` binary (kept for SSH/headless use). The
-shared CLI front door means neither binary needs the other's toolkit. Until the
-launcher lands, `kmux-tui` and `kmux-gtk` are run as separate binaries.
+- **GUI maturity.** `kmux-gtk` is a scaffold: it renders the active grid via
+  cairo (whole-grid repaint, no damage tracking), forwards keys with a
+  best-effort byte encoding (not the Ghostty-mode-aware encoder), and wires
+  only the `Quit`/`CopyToClipboard` effects. Scrollback, mouse, paste,
+  resize-debounce, liveness, and the pickers/overlays (which the TUI renders)
+  are not yet drawn.
+- **In-process frontend selection.** Today you run `kmux` (GUI) or `kmux-tui`
+  (TUI) as separate binaries. A `kmux --tui` flag could launch the terminal
+  frontend in-process from the GUI binary.
+- **Other platforms.** macOS/Windows native frontends (e.g. `kmux-cocoa`) would
+  each provide the `kmux` binary for their platform, built per-target. The
+  Unix-only client paths (`flock`, UDS, daemon spawn) need cfg-gating for a
+  Windows client — see `kmux-protocol/src/dirs.rs` for the path resolvers that
+  would gain `#[cfg(windows)]` branches.

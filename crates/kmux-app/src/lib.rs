@@ -45,6 +45,9 @@ pub mod host_caps;
 /// Non-interactive subcommands (`ls`, `daemon`, `--dry-run`) and target parsing.
 pub mod subcommands;
 
+/// Shared CLI front door (`run_cli`) used by every frontend binary.
+pub mod launch;
+
 /// The frontend-agnostic client view-model ([`core::AppCore`]) and the
 /// connection/session orchestration that drives it.
 pub mod core;

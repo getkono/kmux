@@ -20,9 +20,9 @@ use gtk4::prelude::*;
 use gtk4::{Application, ApplicationWindow, DrawingArea, EventControllerKey, cairo, gdk, glib};
 
 use kmux_app::core::{AppCore, BootstrapPhase, BootstrapTaskResult, KeyResult};
+use kmux_app::launch::{Launch, Plan, run_cli};
 use kmux_app::mode::{self, Action};
 use kmux_client::generate_instance_id;
-use kmux_client::pipeline::ResolvedTarget;
 use kmux_protocol::messages::{ClientCapabilities, ServerMessage, TermSize};
 use tokio::sync::mpsc;
 
@@ -44,20 +44,32 @@ struct Frontend {
 
 fn main() -> anyhow::Result<()> {
     // A tokio runtime backs AppCore's async orchestration (start_bootstrap spawns
-    // tasks). Enter it on the main thread so the spawns from glib callbacks land
-    // on the runtime; the glib loop itself runs on this thread.
+    // tasks) and the CLI front door's daemon/subcommand network calls.
     let rt = tokio::runtime::Runtime::new()?;
-    let _guard = rt.enter();
+    let instance_id = generate_instance_id();
+    match rt.block_on(run_cli(instance_id))? {
+        Launch::Done => Ok(()),
+        Launch::Interactive(plan) => {
+            // Enter the runtime on the main thread so the tokio spawns from glib
+            // callbacks land on it; the glib loop itself runs on this thread.
+            let _guard = rt.enter();
+            run_gui(plan)
+        }
+    }
+}
 
+/// Run the GTK application for an interactive session built from `plan`.
+fn run_gui(plan: Plan) -> anyhow::Result<()> {
     let app = Application::builder().application_id(APP_ID).build();
-    app.connect_activate(build_ui);
+    let plan = std::rc::Rc::new(plan);
+    app.connect_activate(move |app| build_ui(app, &plan));
     app.run();
     Ok(())
 }
 
-fn build_ui(app: &Application) {
-    // Build the shared core for the local daemon. GUI capabilities differ from a
-    // terminal's: truecolor on, no kitty keyboard/graphics concept.
+fn build_ui(app: &Application, plan: &Plan) {
+    // GUI capabilities differ from a terminal's: truecolor on, no kitty
+    // keyboard/graphics concept.
     let capabilities = ClientCapabilities {
         truecolor: true,
         kitty_graphics: false,
@@ -65,10 +77,6 @@ fn build_ui(app: &Application) {
         term: None,
         term_program: Some("kmux-gtk".to_string()),
     };
-    let cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_default();
     let term_size = TermSize {
         rows: 24,
         cols: 80,
@@ -76,13 +84,13 @@ fn build_ui(app: &Application) {
         pixel_height: 0,
     };
     let mut core = AppCore::new(
-        ResolvedTarget::LocalDaemon,
-        cwd,
-        generate_instance_id(),
-        None,
-        None,
+        plan.target.clone(),
+        plan.initial_cwd.clone(),
+        plan.instance_id.clone(),
+        plan.auto_session.clone(),
+        plan.auto_cwd.clone(),
         capabilities,
-        kmux_app::theme::default_theme(),
+        plan.theme.clone(),
         term_size,
     );
 

@@ -8,6 +8,12 @@ repository.workspace = true
 publish.workspace = true
 description = "GTK4 native GUI frontend for the kmux client (Linux)."
 
+# The GUI is the primary `kmux` command on Linux. The terminal frontend ships
+# as the separate `kmux-tui` binary.
+[[bin]]
+name = "kmux"
+path = "src/main.rs"
+
 [dependencies]
 kmux-app.workspace = true
 kmux-client.workspace = true

@@ -3,16 +3,12 @@ mod key_convert;
 mod theme;
 mod ui;
 
-// Everything frontend-free now lives in kmux-app: the modal keymap / action
-// model, command palette, config/theme resolution, recent-servers cache, the
-// CLI definitions, terminal-capability detection, and the non-interactive
-// subcommands. Re-export them at the crate root so existing `crate::*` paths
-// (e.g. `crate::cli`, `crate::host_caps`, `crate::subcommands`) keep resolving.
-use kmux_app::{cli, cmd, config, host_caps, mode, recent_servers, subcommands};
+// Frontend-free logic lives in kmux-app; re-export the bits the app/ui modules
+// reach via `crate::*`.
+use kmux_app::{cmd, host_caps, mode, recent_servers};
 
 use std::io;
 
-use clap::Parser;
 use crossterm::{
     event::{
         DisableMouseCapture, EnableMouseCapture, KeyboardEnhancementFlags,
@@ -26,109 +22,24 @@ use crossterm::{
 };
 use ratatui::prelude::CrosstermBackend;
 use tracing::Instrument;
-use tracing_subscriber::EnvFilter;
 
 use app::App;
-use cli::{Cli, Command};
+use kmux_app::launch::{Launch, Plan, run_cli};
 use kmux_client::generate_instance_id;
-use subcommands::{
-    ListSessionsConfig, parse_target, run_daemon_command, run_dry_run, run_list_sessions,
-};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    async_main().await
+    let instance_id = generate_instance_id();
+    match run_cli(instance_id).await? {
+        Launch::Done => Ok(()),
+        Launch::Interactive(plan) => run_tui(plan).await,
+    }
 }
 
-async fn async_main() -> anyhow::Result<()> {
-    let instance_id = generate_instance_id();
-
-    // Log to a persistent file; fall back to stderr if the path can't be opened.
-    match kmux_protocol::dirs::client_log_path().and_then(|p| {
-        Ok(std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(p)?)
-    }) {
-        Ok(file) => {
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    EnvFilter::from_default_env().add_directive("kmux=info".parse().unwrap()),
-                )
-                .with_writer(std::sync::Mutex::new(file))
-                .init();
-        }
-        Err(_) => {
-            tracing_subscriber::fmt()
-                .with_env_filter(
-                    EnvFilter::from_default_env().add_directive("kmux=info".parse().unwrap()),
-                )
-                .with_writer(std::io::stderr)
-                .init();
-        }
-    }
-    tracing::info!(
-        instance_id = %instance_id,
-        version = concat!(
-            env!("CARGO_PKG_VERSION"),
-            " (",
-            env!("BUILD_GIT_SHA"),
-            env!("BUILD_GIT_DIRTY_SUFFIX"),
-            ", ",
-            env!("BUILD_DATE"),
-            ", ",
-            env!("BUILD_PROFILE"),
-            ")"
-        ),
-        protocol_version = kmux_protocol::messages::PROTOCOL_VERSION,
-        "kmux started"
-    );
-
-    let cli = Cli::parse();
-
-    // Handle subcommands before any TUI setup.
-    match cli.command {
-        Some(Command::Daemon { action }) => return run_daemon_command(action).await,
-        Some(Command::ListSessions {
-            server_args,
-            format,
-        }) => {
-            return run_list_sessions(ListSessionsConfig {
-                server: server_args.server.as_deref(),
-                ssh_port: server_args.ssh_port,
-                format,
-            })
-            .await;
-        }
-        None => {}
-    }
-
-    // Diagnostic modes short-circuit TUI setup entirely.
-    if cli.connect.dry_run && cli.connect.test {
-        eprintln!("warning: --test implies --dry-run; running in --test mode.");
-    }
-    if cli.connect.dry_run || cli.connect.test {
-        return run_dry_run(&cli.connect.server_args, cli.connect.test).await;
-    }
-
-    // ── Default: connect and launch TUI ──────────────────────────────────────
-
-    // Capture the client's working directory before doing anything else.
-    let initial_cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(|s| s.to_string()))
-        .unwrap_or_default();
-
-    let (target, parsed_server) = parse_target(
-        cli.connect.server_args.server.as_deref(),
-        cli.connect.server_args.ssh_port,
-    );
-
-    // Compute effective cwd: explicit --cwd > :path from server string > local cwd
-    let auto_cwd = cli
-        .connect
-        .cwd
-        .or_else(|| parsed_server.as_ref().and_then(|p| p.path.clone()));
+/// Drive the terminal frontend for an interactive session: set up the terminal,
+/// build the `App` from the launch plan, run the event loop, and restore.
+async fn run_tui(plan: Plan) -> anyhow::Result<()> {
+    let instance_id = plan.instance_id.clone();
 
     // Setup terminal
     enable_raw_mode()?;
@@ -170,17 +81,13 @@ async fn async_main() -> anyhow::Result<()> {
         original_hook(panic_info);
     }));
 
-    // resolve_theme yields the toolkit-neutral palette; App::new keeps the
-    // agnostic copy on the core and derives the TUI's ratatui-typed mirror.
-    let theme = config::resolve_theme(cli.theme.as_deref());
-
     let mut app = App::new(
-        target,
-        initial_cwd,
-        theme,
-        instance_id.clone(),
-        cli.connect.session,
-        auto_cwd,
+        plan.target,
+        plan.initial_cwd,
+        plan.theme,
+        plan.instance_id,
+        plan.auto_session,
+        plan.auto_cwd,
         kitty_kbd_supported,
     );
 
@@ -204,8 +111,6 @@ async fn async_main() -> anyhow::Result<()> {
     // The TUI alternate-screen overlay swallows error text on exit. If the
     // bootstrap (e.g. SSH negotiation) failed, the App stashed the full
     // multi-line diagnostic for us to surface here, after raw-mode is off.
-    // Without this, the user only sees the brief disconnect badge and has
-    // to dig in `~/.local/state/kmux/client.log` to find out what happened.
     if let Some(err) = app.last_exit_error.take() {
         eprintln!("kmux: connection failed:\n{err}");
     }
