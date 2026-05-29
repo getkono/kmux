@@ -3,15 +3,15 @@ mod cli;
 mod cmd;
 mod host_caps;
 mod key_convert;
-mod recent_servers;
 mod subcommands;
 mod theme;
 mod ui;
 
-// The modal keymap / action model and config/theme resolution now live in
-// kmux-app (frontend-agnostic). Re-export them at the crate root so existing
-// `crate::mode::*` / `crate::config::*` paths keep resolving.
-use kmux_app::{config, mode};
+// The modal keymap / action model, config/theme resolution, and recent-servers
+// cache now live in kmux-app (frontend-agnostic). Re-export them at the crate
+// root so existing `crate::mode::*` / `crate::config::*` /
+// `crate::recent_servers::*` paths keep resolving.
+use kmux_app::{config, mode, recent_servers};
 
 use std::io;
 

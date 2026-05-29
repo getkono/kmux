@@ -29,3 +29,10 @@ pub mod theme;
 
 /// Client config file + theme resolution (returns the toolkit-neutral theme).
 pub mod config;
+
+/// Persisted recent-servers cache (frontend-agnostic).
+pub mod recent_servers;
+
+/// The frontend-agnostic client view-model ([`core::AppCore`]) and the
+/// connection/session orchestration that drives it.
+pub mod core;

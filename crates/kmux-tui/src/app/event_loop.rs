@@ -19,8 +19,7 @@ use crate::recent_servers::ServerKind;
 use crate::ui;
 use kmux_protocol::messages::TermSize;
 
-use super::helpers::{BootstrapPhase, BootstrapTaskResult};
-use super::{App, KeyResult, SwitchTarget};
+use super::{App, BootstrapPhase, BootstrapTaskResult, KeyResult, SwitchTarget};
 
 /// How often to re-check liveness (ping cadence + timeout evaluation).
 const LIVENESS_TICK: Duration = Duration::from_secs(1);
@@ -50,9 +49,9 @@ impl App {
         let (paste_tx, mut paste_rx) = mpsc::unbounded_channel::<String>();
         self.paste_tx = Some(paste_tx);
 
-        // Seed the session manager with the initial terminal size so the first
-        // Attach carries the real dimensions rather than the default 24×80.
-        self.mgr.update_term_size(Self::current_term_size());
+        // Seed the core (and session manager) with the initial terminal size so
+        // the first Attach carries the real dimensions rather than 24×80.
+        self.set_term_size(Self::current_term_size());
 
         // Bootstrap outcome channel — replaced whenever a new bootstrap is kicked off.
         // `None` pends forever so the select! arm is dormant when no bootstrap is running.
@@ -310,7 +309,7 @@ impl App {
                     }
                 } => {
                     if let Some(size) = pending_resize.take() {
-                        self.mgr.update_term_size(size);
+                        self.set_term_size(size);
                         self.needs_render = true;
                     }
                     resize_deadline = None;
@@ -323,44 +322,5 @@ impl App {
         }
 
         Ok(())
-    }
-
-    /// Transition to `Mode::Disconnected`, record the reason in the session
-    /// manager, and emit a structured tracing event.
-    pub(super) fn enter_disconnected(&mut self, reason: DisconnectReason) {
-        let reason_str = reason.to_string();
-        tracing::warn!(
-            connection_id = self.mgr.connection_id.map(|c| c.0),
-            transport = %self.mgr.current_transport,
-            reason = %reason_str,
-            "connection dropped",
-        );
-        self.mgr.mark_connection_lost_with(reason);
-        self.disconnect_at = Some(Instant::now());
-        self.mode = Mode::Disconnected { reason: reason_str };
-    }
-
-    /// After the bootstrap outcome arm settles, mirror the manager's connection state
-    /// into the TUI mode. On failure, show the disconnect overlay again with
-    /// the bootstrap error that `mgr.connect` recorded.
-    ///
-    /// Only transitions *out of* `Mode::Connecting`; any other mode (e.g.
-    /// `DirectoryPicker` picked while bootstrap was in flight) is preserved so
-    /// an async bootstrap settling doesn't clobber user-initiated navigation.
-    pub(super) fn reflect_bootstrap_outcome(&mut self) {
-        if !matches!(self.mode, Mode::Connecting { .. }) {
-            return;
-        }
-        if self.mgr.connection_state().is_live() {
-            self.mode = Mode::Normal;
-        } else {
-            let reason = match self.mgr.connection_state() {
-                kmux_client::connection_state::ConnectionState::Disconnected { reason } => {
-                    reason.to_string()
-                }
-                other => format!("bootstrap failed: {}", other.badge_label()),
-            };
-            self.mode = Mode::Disconnected { reason };
-        }
     }
 }

@@ -260,7 +260,11 @@ impl App {
             }
             Action::ToggleSnapshotMode => {
                 self.force_snapshot_mode = !self.force_snapshot_mode;
-                self.mgr.set_snapshot_mode(self.force_snapshot_mode);
+                // Read into a local first: `self.mgr` (DerefMut) and
+                // `self.force_snapshot_mode` (Deref) can't be borrowed together
+                // through the App→AppCore deref bridge in one expression.
+                let snapshot = self.force_snapshot_mode;
+                self.mgr.set_snapshot_mode(snapshot);
             }
             Action::ToggleInputLock => {
                 self.mgr.toggle_input_lock();

@@ -1,0 +1,365 @@
+//! Connection/session orchestration methods on [`AppCore`]. Moved verbatim from
+//! the TUI's `app/helpers.rs` and `app/event_loop.rs` (the pure-core parts);
+//! the only behavioural change is reading the cached `self.term_size` instead
+//! of querying the terminal directly (frontends report their geometry).
+
+use kmux_client::connection_state::{ConnectionState, DisconnectReason};
+use kmux_client::pipeline::{self, BootstrapOutcome, NoopObserver, ResolvedTarget, SshContext};
+use kmux_client::session_manager::SessionEvent;
+use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
+use kmux_client::transport::TransportKind;
+use kmux_protocol::messages::{ServerMessage, SessionEntry};
+use kmux_protocol::transport::bootstrap::EndpointAdvert;
+use std::time::Instant;
+use tokio::sync::mpsc;
+use tracing::{info, warn};
+
+use crate::mode::Mode;
+use crate::recent_servers::RecentServer;
+
+use super::AppCore;
+
+#[derive(Debug)]
+pub enum BootstrapPhase {
+    Initial,
+    Reconnect,
+}
+
+/// Result sent from the background bootstrap task to the frontend's run loop.
+pub enum BootstrapTaskResult {
+    Success(Box<BootstrapOutcome>),
+    Failed(String),
+}
+
+impl AppCore {
+    /// React to `SessionEvent`s returned from `SessionManager::handle_server_message`.
+    pub fn handle_session_events(&mut self, events: Vec<SessionEvent>) {
+        for event in events {
+            match event {
+                SessionEvent::AuthFailed { .. } => {
+                    // SSH-only architecture: auth failure on the data plane
+                    // means the SSH tunnel is up but the daemon rejected the
+                    // token. Surface as a disconnect; the user can reconnect.
+                    self.mode = Mode::Disconnected {
+                        reason: "authentication failed".into(),
+                    };
+                }
+                SessionEvent::AuthOk => {
+                    if matches!(self.mode, Mode::Connecting { .. }) {
+                        self.mode = Mode::Normal;
+                    }
+                    info!("Auth succeeded");
+                    self.write_connection_log();
+                    // Record this server as recently used.
+                    self.recent_servers.record_connection(
+                        &self.server_string.clone(),
+                        &self.server_display.clone(),
+                        self.server_kind.clone(),
+                    );
+                }
+                SessionEvent::SessionListReceived => {
+                    // Update cached session list for current server (self-healing: stale
+                    // sessions that no longer exist on the server are silently dropped).
+                    let live_sessions = self.mgr.session_list().to_vec();
+                    let server_string = self.server_string.clone();
+                    self.recent_servers
+                        .update_sessions(&server_string, &live_sessions);
+
+                    if !self.did_auto_select {
+                        self.did_auto_select = true;
+                        self.auto_select_session();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    /// Auto-select or create a session based on CLI flags (--session, --cwd, :path).
+    pub fn auto_select_session(&mut self) {
+        let size = self.term_size;
+
+        if let Some(session_name) = self.auto_session.take() {
+            // --session was given: find by name/word_id or create.
+            if let Some(word_id) = self.mgr.find_session_by_name(&session_name) {
+                self.mgr.select_session(word_id);
+            } else {
+                let cwd = self
+                    .auto_cwd
+                    .take()
+                    .unwrap_or_else(|| self.initial_cwd.clone());
+                self.mgr
+                    .create_session(Some(&session_name), Some(&cwd), size);
+            }
+        } else if let Some(cwd) = self.auto_cwd.take() {
+            // :path or --cwd was given without --session.
+            if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
+                self.mgr.select_session(word_id);
+            } else {
+                self.mgr.create_session(None, Some(&cwd), size);
+            }
+        } else if self.is_local {
+            // Local mode: match by cwd or create.
+            let cwd = self.initial_cwd.clone();
+            if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
+                self.mgr.select_session(word_id);
+            } else {
+                self.mgr.create_session(None, Some(&cwd), size);
+            }
+        } else if self.mgr.session_list().is_empty() {
+            // Remote, no active sessions: pick a path for the first session.
+            self.dir_picker_buffer = self.initial_cwd.clone();
+            self.mode = Mode::DirectoryPicker;
+        } else {
+            // Remote with active sessions: let the user pick one (or hit the
+            // synthetic "[+] New session" entry to open the directory picker).
+            // Start with the first real session highlighted, not the new-session
+            // affordance, so the common case (resume an existing session) is
+            // one Enter away.
+            self.session_picker_selected = 1;
+            self.session_picker_search.clear();
+            self.mode = Mode::SessionPicker;
+        }
+    }
+
+    /// Returns recent servers filtered by the current `server_picker_search` text.
+    pub fn filtered_servers(&self) -> Vec<RecentServer> {
+        let lower = self.server_picker_search.to_lowercase();
+        self.recent_servers
+            .servers()
+            .iter()
+            .filter(|s| {
+                lower.is_empty()
+                    || s.display.to_lowercase().contains(&lower)
+                    || s.server_string.to_lowercase().contains(&lower)
+            })
+            .cloned()
+            .collect()
+    }
+
+    /// Returns sessions whose CWD contains the current `dir_picker_buffer` text (case-insensitive).
+    pub fn dir_picker_matches(&self) -> Vec<&SessionEntry> {
+        let lower = self.dir_picker_buffer.to_lowercase();
+        self.mgr
+            .session_list()
+            .iter()
+            .filter(|e| lower.is_empty() || e.meta.cwd.to_lowercase().contains(&lower))
+            .collect()
+    }
+
+    /// Spawn the tunnel-death monitor and `TransportSupervisor` for a
+    /// just-completed SSH bootstrap.
+    ///
+    /// Must be called immediately after `SessionManager::apply_outcome` so
+    /// the supervisor sees the correct `ConnectionId` and the tunnel
+    /// process is owned by the monitor task (not leaked).
+    pub fn launch_ssh_supervisor(
+        &mut self,
+        ctx: SshContext,
+        srv_tx: mpsc::UnboundedSender<ServerMessage>,
+        upgrade_tx: mpsc::Sender<UpgradeSignal>,
+        tunnel_died_tx: mpsc::Sender<()>,
+    ) {
+        // Tunnel-death monitor: if the SSH `-L -N` subprocess exits we
+        // must signal the run loop so it can surface the disconnect.
+        let mut tunnel_proc = ctx.tunnel_process;
+        let monitor_tx = tunnel_died_tx;
+        tokio::spawn(async move {
+            let _ = tunnel_proc.wait().await;
+            let _ = monitor_tx.send(()).await;
+        });
+
+        let Some(conn_id) = self.mgr.connection_id else {
+            // apply_outcome always sets connection_id on success; missing
+            // here implies a misordered caller. Skip supervisor rather
+            // than panic so the TCP+TLS path keeps working.
+            return;
+        };
+        let token = self.mgr.token().to_string();
+        let capabilities = self.mgr.capabilities().clone();
+        let accept_invalid = self.mgr.accept_invalid_certs();
+        let (rtt_tx, rtt_rx) = mpsc::unbounded_channel();
+        self.mgr.set_rtt_sink(rtt_tx);
+
+        // Compose the supervisor's endpoint set: every probable transport
+        // including the currently-active one. Without the active TCP+TLS
+        // entry the scorer scoreboard would only show the QUIC candidate,
+        // which is misleading (the user can't tell whether QUIC's score
+        // actually beats TCP+TLS's) and leaves no fallback registered if
+        // QUIC ever becomes the active and then dies.
+        let mut endpoints = ctx.endpoints;
+        let active_address = format!("{}:{}", self.mgr.host(), self.mgr.port());
+        if !endpoints
+            .iter()
+            .any(|e| e.kind == TransportKind::TcpTls && e.address == active_address)
+        {
+            endpoints.push(EndpointAdvert {
+                kind: TransportKind::TcpTls,
+                address: active_address,
+            });
+        }
+
+        tokio::spawn(async move {
+            let supervisor = TransportSupervisor::new(SupervisorParams {
+                endpoints,
+                connection_id: conn_id,
+                token,
+                capabilities,
+                accept_invalid_certs: accept_invalid,
+                active_transport: TransportKind::TcpTls,
+                is_local: false,
+                server_tx: srv_tx,
+                upgrade_tx,
+                rtt_rx: Some(rtt_rx),
+            });
+            supervisor.run().await;
+        });
+    }
+
+    /// Write a per-connection metadata log on first successful authentication.
+    pub fn write_connection_log(&self) {
+        kmux_client::connection_log::write_connection_log(
+            &self.instance_id,
+            env!("CARGO_PKG_VERSION"),
+            self.mgr.server_version.as_deref(),
+            self.mgr.host(),
+            self.mgr.port(),
+        );
+    }
+
+    /// Spawn a background bootstrap task and enter `Mode::Connecting`.
+    ///
+    /// The bootstrap task calls `pipeline::run_bootstrap` and sends the
+    /// `BootstrapTaskResult` back via `outcome_tx`. The run loop's bootstrap
+    /// arm handles the outcome so the frontend stays free during the handshake.
+    ///
+    /// Dropping `self.cancel_tx` (set here) causes the spawned task to
+    /// abort via a oneshot-receiver drop.
+    pub fn start_bootstrap(
+        &mut self,
+        target: ResolvedTarget,
+        srv_tx: mpsc::UnboundedSender<ServerMessage>,
+        phase: BootstrapPhase,
+        outcome_tx: mpsc::UnboundedSender<BootstrapTaskResult>,
+    ) {
+        if matches!(phase, BootstrapPhase::Reconnect) {
+            info!(
+                connection_id = self.mgr.connection_id.map(|c| c.0),
+                "reconnect requested",
+            );
+        }
+        self.mgr.prepare_reconnect();
+
+        let target_display = match (&target, &phase) {
+            (ResolvedTarget::LocalDaemon, BootstrapPhase::Initial) => {
+                "Connecting to local daemon…".to_string()
+            }
+            (ResolvedTarget::LocalDaemon, BootstrapPhase::Reconnect) => {
+                "Reconnecting to local daemon…".to_string()
+            }
+            (ResolvedTarget::Ssh { target, .. }, BootstrapPhase::Initial) => {
+                let h = match &target.user {
+                    Some(u) => format!("{u}@{}", target.host),
+                    None => target.host.clone(),
+                };
+                format!("Connecting via SSH to {h}…")
+            }
+            (ResolvedTarget::Ssh { target, .. }, BootstrapPhase::Reconnect) => {
+                let h = match &target.user {
+                    Some(u) => format!("{u}@{}", target.host),
+                    None => target.host.clone(),
+                };
+                format!("Reconnecting via SSH to {h}…")
+            }
+        };
+
+        self.mode = Mode::Connecting { target_display };
+        self.needs_render = true;
+
+        // Store a clone of the sender so the run loop's outcome arm can
+        // pass it to `launch_ssh_supervisor` for SSH targets.
+        self.pending_srv_tx = Some(srv_tx.clone());
+
+        // Cancel any prior in-flight bootstrap by dropping the old sender.
+        let _ = self.cancel_tx.take();
+        let (cancel_tx, cancel_rx) = tokio::sync::oneshot::channel::<()>();
+        self.cancel_tx = Some(cancel_tx);
+
+        let capabilities = self.mgr.capabilities().clone();
+        let connection_id = self.mgr.connection_id;
+
+        tokio::spawn(async move {
+            tokio::select! {
+                // Sender dropped → oneshot resolves to Err; either way we abort.
+                _ = cancel_rx => {}
+                result = pipeline::run_bootstrap(
+                    target,
+                    capabilities,
+                    connection_id,
+                    srv_tx,
+                    &NoopObserver,
+                ) => {
+                    let task_result = match result {
+                        Ok(outcome) => BootstrapTaskResult::Success(Box::new(outcome)),
+                        Err(e) => {
+                            warn!("bootstrap failed: {e}");
+                            BootstrapTaskResult::Failed(e.to_string())
+                        }
+                    };
+                    let _ = outcome_tx.send(task_result);
+                }
+            }
+        });
+    }
+
+    /// Build the target to bootstrap against from current state.
+    ///
+    /// The app is always in one of two states: local daemon (UDS) or a
+    /// remote SSH target. There is no direct-transport bootstrap surface.
+    pub fn current_target(&self) -> ResolvedTarget {
+        if let Some(target) = &self.ssh_target {
+            return ResolvedTarget::Ssh {
+                target: target.clone(),
+                accept_invalid_certs: self.mgr.accept_invalid_certs(),
+            };
+        }
+        ResolvedTarget::LocalDaemon
+    }
+
+    /// Transition to `Mode::Disconnected`, record the reason in the session
+    /// manager, and emit a structured tracing event.
+    pub fn enter_disconnected(&mut self, reason: DisconnectReason) {
+        let reason_str = reason.to_string();
+        warn!(
+            connection_id = self.mgr.connection_id.map(|c| c.0),
+            transport = %self.mgr.current_transport,
+            reason = %reason_str,
+            "connection dropped",
+        );
+        self.mgr.mark_connection_lost_with(reason);
+        self.disconnect_at = Some(Instant::now());
+        self.mode = Mode::Disconnected { reason: reason_str };
+    }
+
+    /// After the bootstrap outcome arm settles, mirror the manager's connection
+    /// state into the interaction mode. On failure, show the disconnect overlay
+    /// again with the bootstrap error that `mgr.connect` recorded.
+    ///
+    /// Only transitions *out of* `Mode::Connecting`; any other mode (e.g.
+    /// `DirectoryPicker` picked while bootstrap was in flight) is preserved so
+    /// an async bootstrap settling doesn't clobber user-initiated navigation.
+    pub fn reflect_bootstrap_outcome(&mut self) {
+        if !matches!(self.mode, Mode::Connecting { .. }) {
+            return;
+        }
+        if self.mgr.connection_state().is_live() {
+            self.mode = Mode::Normal;
+        } else {
+            let reason = match self.mgr.connection_state() {
+                ConnectionState::Disconnected { reason } => reason.to_string(),
+                other => format!("bootstrap failed: {}", other.badge_label()),
+            };
+            self.mode = Mode::Disconnected { reason };
+        }
+    }
+}
