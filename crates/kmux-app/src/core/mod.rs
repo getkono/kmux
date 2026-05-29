@@ -76,8 +76,9 @@ pub struct AppCore {
 
     /// Active color palette (toolkit-neutral). The source of truth that the
     /// `/theme` command mutates; each frontend converts it to its own color
-    /// type at the render boundary.
-    pub theme: Theme,
+    /// type at the render boundary. Named `palette` (not `theme`) so it does
+    /// not shadow a frontend's own rendered-theme field through a deref.
+    pub palette: Theme,
 
     /// Current interaction mode (modal keymap state).
     pub mode: Mode,
@@ -208,7 +209,7 @@ impl AppCore {
 
         Self {
             mgr,
-            theme,
+            palette: theme,
             mode: Mode::Normal,
             term_size,
             hud_visible: false,
@@ -256,7 +257,7 @@ impl AppCore {
     pub fn for_test(mgr: SessionManager) -> Self {
         Self {
             mgr,
-            theme: crate::theme::default_theme(),
+            palette: crate::theme::default_theme(),
             mode: Mode::Normal,
             term_size: TermSize {
                 rows: 24,

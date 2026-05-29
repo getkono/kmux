@@ -116,7 +116,7 @@ fn cmd_theme(app: &mut AppCore, args: &[String]) -> CommandResult {
     let name = require_arg(args, 0, "name")?;
     match theme::builtin_theme(name) {
         Some(t) => {
-            app.theme = t;
+            app.palette = t;
             Ok(CommandSuccess::Status(format!("theme: {name}")))
         }
         None => Err(format!("unknown theme '{name}'")),
@@ -716,9 +716,9 @@ mod tests {
     #[test]
     fn theme_changes_palette() {
         let mut app = fixture_core();
-        let original_bg = app.theme.bg;
+        let original_bg = app.palette.bg;
         let _ = run(&mut app, "theme dracula");
-        assert_ne!(app.theme.bg, original_bg, "theme should change");
+        assert_ne!(app.palette.bg, original_bg, "theme should change");
     }
 
     #[test]

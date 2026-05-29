@@ -47,20 +47,21 @@ pub struct PickerHits {
     pub item_rows: Vec<u16>,
 }
 
-/// The TUI application: the shared [`AppCore`] view-model plus the ratatui /
-/// crossterm-specific presentation state (color palette, mouse hit-boxes, the
-/// clipboard channel).
+/// The TUI application: a thin presentation wrapper around the shared
+/// [`AppCore`] view-model, adding the ratatui / crossterm-specific state (the
+/// rendered color theme, mouse hit-boxes, the clipboard channel).
 ///
-/// `App` derefs to `AppCore` so the event loop, command palette, and renderers
-/// reach core state (`self.mgr`, `self.mode`, …) and orchestration methods
-/// transparently. This bridge is intentionally temporary — P6 replaces it with
-/// explicit `self.core.*` access once the dispatch/command logic has also moved
-/// into `AppCore`.
+/// `App` derefs to `AppCore` so the event loop and renderers reach core state
+/// (`self.mgr`, `self.mode`, …) and orchestration methods directly — a
+/// deliberate newtype-wrapper ergonomic. The frontend's own fields shadow
+/// nothing on the core: the core's agnostic palette is named `palette`, and
+/// this `theme` is its ratatui-typed mirror. A native GUI frontend wraps the
+/// same `AppCore` the same way.
 pub struct App {
     pub core: AppCore,
 
-    /// Color palette as ratatui colors (converted from the agnostic `kmux_app`
-    /// palette at the `main.rs` boundary).
+    /// The active palette as ratatui colors — the rendered mirror of
+    /// `core.palette`, refreshed before each draw (see `run`).
     pub theme: Theme,
 
     /// Clickable regions on the top bar (row 0), refreshed every render.

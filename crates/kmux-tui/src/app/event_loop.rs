@@ -89,9 +89,9 @@ impl App {
                 self.needs_render = true;
             }
             if self.needs_render && last_draw.elapsed() >= RENDER_MIN_INTERVAL {
-                // Refresh the ratatui-typed palette mirror from the core's
-                // agnostic theme (the `/theme` command mutates the core copy).
-                self.theme = crate::theme::Theme::from(self.core.theme.clone());
+                // Refresh the ratatui-typed theme from the core's agnostic
+                // palette (the `/theme` command mutates the core copy).
+                self.theme = crate::theme::Theme::from(self.core.palette.clone());
                 terminal.draw(|f| ui::render(f, self))?;
                 self.needs_render = false;
                 last_draw = Instant::now();
