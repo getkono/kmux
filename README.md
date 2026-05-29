@@ -69,6 +69,17 @@ configuration.
   `mise.toml`); required to build the bundled libghostty-vt wrapper.
 - Ghostty sources as a git submodule: after cloning, run
   `git submodule update --init` once to populate `vendor/ghostty/`.
+- **GTK4 development libraries** — required only to build the `kmux` GUI binary
+  (`kmux-gtk`). The `kmux-tui` and `kmuxd` binaries do not need them.
+  - Fedora: `sudo dnf install gtk4-devel`
+  - Debian / Ubuntu: `sudo apt install libgtk-4-dev`
+  - Arch: `sudo pacman -S gtk4`
+  - macOS: `brew install gtk4`
+  - If another `pkg-config` (e.g. a Homebrew/linuxbrew one) shadows the system
+    one in `PATH`, GTK4 resolution fails on transitive `.pc` files. Point cargo
+    at the system pkg-config for any build that includes `kmux-gtk`:
+    `PKG_CONFIG=/usr/bin/pkg-config cargo run --bin kmux`. See
+    [docs/architecture-frontend.md](docs/architecture-frontend.md#building-kmux-gtk-and-the-system-pkg-config).
 
 ## Quick start
 
@@ -82,9 +93,15 @@ The server prints a shared auth token on startup. Connect a client — the GTK
 GUI (`kmux`, Linux) or the terminal UI (`kmux-tui`):
 
 ```bash
-$ cargo run -p kmux-gtk   # GUI  (binary: kmux)   — needs system GTK4
+$ cargo run --bin kmux    # GUI  (kmux-gtk)   — needs system GTK4 dev libs
 $ cargo run -p kmux-tui   # TUI  (binary: kmux-tui)
 ```
+
+> If `cargo run --bin kmux` fails with a `pkg-config` error about
+> `graphene-gobject-1.0` (or similar) not being found, your `PATH` has a
+> non-system `pkg-config` shadowing `/usr/bin/pkg-config`. Re-run as
+> `PKG_CONFIG=/usr/bin/pkg-config cargo run --bin kmux`. See
+> [Prerequisites](#prerequisites).
 
 By default, the server binds to `0.0.0.0:8443`.
 
