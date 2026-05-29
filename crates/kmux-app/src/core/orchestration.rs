@@ -1,32 +1,39 @@
+//! Connection/session orchestration methods on [`AppCore`]. Moved verbatim from
+//! the TUI's `app/helpers.rs` and `app/event_loop.rs` (the pure-core parts);
+//! the only behavioural change is reading the cached `self.term_size` instead
+//! of querying the terminal directly (frontends report their geometry).
+
+use kmux_client::connection_state::{ConnectionState, DisconnectReason};
 use kmux_client::pipeline::{self, BootstrapOutcome, NoopObserver, ResolvedTarget, SshContext};
 use kmux_client::session_manager::SessionEvent;
 use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
 use kmux_client::transport::TransportKind;
-use kmux_protocol::messages::{ServerMessage, SessionEntry, TermSize};
+use kmux_protocol::messages::{ServerMessage, SessionEntry};
 use kmux_protocol::transport::bootstrap::EndpointAdvert;
+use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::mode::Mode;
 use crate::recent_servers::RecentServer;
 
-use super::App;
+use super::AppCore;
 
 #[derive(Debug)]
-pub(super) enum BootstrapPhase {
+pub enum BootstrapPhase {
     Initial,
     Reconnect,
 }
 
-/// Result sent from the background bootstrap task to the event loop.
-pub(super) enum BootstrapTaskResult {
+/// Result sent from the background bootstrap task to the frontend's run loop.
+pub enum BootstrapTaskResult {
     Success(Box<BootstrapOutcome>),
     Failed(String),
 }
 
-impl App {
+impl AppCore {
     /// React to `SessionEvent`s returned from `SessionManager::handle_server_message`.
-    pub(super) fn handle_session_events(&mut self, events: Vec<SessionEvent>) {
+    pub fn handle_session_events(&mut self, events: Vec<SessionEvent>) {
         for event in events {
             match event {
                 SessionEvent::AuthFailed { .. } => {
@@ -69,8 +76,8 @@ impl App {
     }
 
     /// Auto-select or create a session based on CLI flags (--session, --cwd, :path).
-    pub(super) fn auto_select_session(&mut self) {
-        let size = Self::current_term_size();
+    pub fn auto_select_session(&mut self) {
+        let size = self.term_size;
 
         if let Some(session_name) = self.auto_session.take() {
             // --session was given: find by name/word_id or create.
@@ -146,7 +153,7 @@ impl App {
     /// Must be called immediately after `SessionManager::apply_outcome` so
     /// the supervisor sees the correct `ConnectionId` and the tunnel
     /// process is owned by the monitor task (not leaked).
-    pub(super) fn launch_ssh_supervisor(
+    pub fn launch_ssh_supervisor(
         &mut self,
         ctx: SshContext,
         srv_tx: mpsc::UnboundedSender<ServerMessage>,
@@ -154,7 +161,7 @@ impl App {
         tunnel_died_tx: mpsc::Sender<()>,
     ) {
         // Tunnel-death monitor: if the SSH `-L -N` subprocess exits we
-        // must signal the event loop so it can surface the disconnect.
+        // must signal the run loop so it can surface the disconnect.
         let mut tunnel_proc = ctx.tunnel_process;
         let monitor_tx = tunnel_died_tx;
         tokio::spawn(async move {
@@ -209,28 +216,8 @@ impl App {
         });
     }
 
-    /// Subtract UI chrome (3 rows) from raw terminal dimensions.
-    ///
-    /// The 3 rows are: session bar (1) + status bar (1) + hint bar (1).
-    /// This is the single place that knows the chrome height so future
-    /// layout changes only need to be made here.
-    pub(super) fn compute_pane_size(rows: u16, cols: u16) -> TermSize {
-        TermSize {
-            rows: rows.saturating_sub(3),
-            cols,
-            pixel_width: 0,
-            pixel_height: 0,
-        }
-    }
-
-    /// Query the current terminal size, accounting for UI chrome.
-    pub(crate) fn current_term_size() -> TermSize {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
-        Self::compute_pane_size(rows, cols)
-    }
-
     /// Write a per-connection metadata log on first successful authentication.
-    pub(super) fn write_connection_log(&self) {
+    pub fn write_connection_log(&self) {
         kmux_client::connection_log::write_connection_log(
             &self.instance_id,
             env!("CARGO_PKG_VERSION"),
@@ -243,13 +230,12 @@ impl App {
     /// Spawn a background bootstrap task and enter `Mode::Connecting`.
     ///
     /// The bootstrap task calls `pipeline::run_bootstrap` and sends the
-    /// `BootstrapTaskResult` back via `outcome_tx`. The event loop's
-    /// `bootstrap_rx` arm handles the outcome so the UI task stays free
-    /// during the entire network handshake.
+    /// `BootstrapTaskResult` back via `outcome_tx`. The run loop's bootstrap
+    /// arm handles the outcome so the frontend stays free during the handshake.
     ///
     /// Dropping `self.cancel_tx` (set here) causes the spawned task to
     /// abort via a oneshot-receiver drop.
-    pub(super) fn start_bootstrap(
+    pub fn start_bootstrap(
         &mut self,
         target: ResolvedTarget,
         srv_tx: mpsc::UnboundedSender<ServerMessage>,
@@ -290,7 +276,7 @@ impl App {
         self.mode = Mode::Connecting { target_display };
         self.needs_render = true;
 
-        // Store a clone of the sender so the event loop's outcome arm can
+        // Store a clone of the sender so the run loop's outcome arm can
         // pass it to `launch_ssh_supervisor` for SSH targets.
         self.pending_srv_tx = Some(srv_tx.clone());
 
@@ -326,12 +312,11 @@ impl App {
         });
     }
 
-    /// Build the target to bootstrap against from current App state.
+    /// Build the target to bootstrap against from current state.
     ///
     /// The app is always in one of two states: local daemon (UDS) or a
     /// remote SSH target. There is no direct-transport bootstrap surface.
-    pub(super) fn current_target(&self) -> kmux_client::pipeline::ResolvedTarget {
-        use kmux_client::pipeline::ResolvedTarget;
+    pub fn current_target(&self) -> ResolvedTarget {
         if let Some(target) = &self.ssh_target {
             return ResolvedTarget::Ssh {
                 target: target.clone(),
@@ -339,5 +324,42 @@ impl App {
             };
         }
         ResolvedTarget::LocalDaemon
+    }
+
+    /// Transition to `Mode::Disconnected`, record the reason in the session
+    /// manager, and emit a structured tracing event.
+    pub fn enter_disconnected(&mut self, reason: DisconnectReason) {
+        let reason_str = reason.to_string();
+        warn!(
+            connection_id = self.mgr.connection_id.map(|c| c.0),
+            transport = %self.mgr.current_transport,
+            reason = %reason_str,
+            "connection dropped",
+        );
+        self.mgr.mark_connection_lost_with(reason);
+        self.disconnect_at = Some(Instant::now());
+        self.mode = Mode::Disconnected { reason: reason_str };
+    }
+
+    /// After the bootstrap outcome arm settles, mirror the manager's connection
+    /// state into the interaction mode. On failure, show the disconnect overlay
+    /// again with the bootstrap error that `mgr.connect` recorded.
+    ///
+    /// Only transitions *out of* `Mode::Connecting`; any other mode (e.g.
+    /// `DirectoryPicker` picked while bootstrap was in flight) is preserved so
+    /// an async bootstrap settling doesn't clobber user-initiated navigation.
+    pub fn reflect_bootstrap_outcome(&mut self) {
+        if !matches!(self.mode, Mode::Connecting { .. }) {
+            return;
+        }
+        if self.mgr.connection_state().is_live() {
+            self.mode = Mode::Normal;
+        } else {
+            let reason = match self.mgr.connection_state() {
+                ConnectionState::Disconnected { reason } => reason.to_string(),
+                other => format!("bootstrap failed: {}", other.badge_label()),
+            };
+            self.mode = Mode::Disconnected { reason };
+        }
     }
 }

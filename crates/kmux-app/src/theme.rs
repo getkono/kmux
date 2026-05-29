@@ -1,4 +1,10 @@
-use ratatui::style::Color;
+//! Toolkit-agnostic color palette (theme) model and loading.
+//!
+//! This is the single source of truth for kmux themes. Colors are stored as a
+//! plain [`Rgb`] triple; each frontend converts to its own color type at the
+//! render boundary (e.g. `kmux-tui` maps `Rgb` to `ratatui::style::Color`, a
+//! future `kmux-gtk` to `gdk::RGBA`). Nothing here depends on a UI toolkit.
+
 use serde::Deserialize;
 
 const ONE_DARK_TOML: &str = include_str!("../../../themes/one-dark.toml");
@@ -8,19 +14,33 @@ const CATPPUCCIN_MACCHIATO_TOML: &str = include_str!("../../../themes/catppuccin
 const CATPPUCCIN_MOCHA_TOML: &str = include_str!("../../../themes/catppuccin-mocha.toml");
 const DRACULA_TOML: &str = include_str!("../../../themes/dracula.toml");
 
-/// Runtime color palette used throughout the TUI.
+/// A 24-bit RGB color. Toolkit-neutral; frontends convert at the render leaf.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Rgb {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl Rgb {
+    pub const fn new(r: u8, g: u8, b: u8) -> Self {
+        Self { r, g, b }
+    }
+}
+
+/// Runtime color palette. Frontend-agnostic.
 #[derive(Debug, Clone)]
 pub struct Theme {
-    pub bg: Color,
-    pub fg: Color,
-    pub fg_dim: Color,
-    pub accent: Color,
-    pub green: Color,
-    pub red: Color,
-    pub yellow: Color,
-    pub purple: Color,
-    pub orange: Color,
-    pub status_bg: Color,
+    pub bg: Rgb,
+    pub fg: Rgb,
+    pub fg_dim: Rgb,
+    pub accent: Rgb,
+    pub green: Rgb,
+    pub red: Rgb,
+    pub yellow: Rgb,
+    pub purple: Rgb,
+    pub orange: Rgb,
+    pub status_bg: Rgb,
 }
 
 /// Deserialisation shape for `themes/*.toml` files.
@@ -48,7 +68,7 @@ pub enum ThemeError {
     Toml(#[from] toml::de::Error),
 }
 
-fn parse_hex(field: &'static str, s: &str) -> Result<Color, ThemeError> {
+fn parse_hex(field: &'static str, s: &str) -> Result<Rgb, ThemeError> {
     let s = s.trim_start_matches('#');
     if s.len() != 6 {
         return Err(ThemeError::InvalidColor {
@@ -68,7 +88,7 @@ fn parse_hex(field: &'static str, s: &str) -> Result<Color, ThemeError> {
         field,
         value: s.to_string(),
     })?;
-    Ok(Color::Rgb(r, g, b))
+    Ok(Rgb { r, g, b })
 }
 
 impl ThemeFile {
@@ -95,6 +115,16 @@ fn parse_builtin(toml_str: &str) -> Theme {
         .expect("built-in theme has invalid colors")
 }
 
+/// The set of built-in theme names, in display order. Used to drive completion.
+pub const BUILTIN_THEMES: &[&str] = &[
+    "one-dark",
+    "catppuccin-latte",
+    "catppuccin-frappe",
+    "catppuccin-macchiato",
+    "catppuccin-mocha",
+    "dracula",
+];
+
 /// Returns the named built-in theme, or `None` if `name` is not recognised.
 pub fn builtin_theme(name: &str) -> Option<Theme> {
     let toml_str = match name {
@@ -120,25 +150,13 @@ pub fn parse_theme_toml(toml_str: &str) -> Result<Theme, ThemeError> {
     file.into_theme()
 }
 
-/// Maps a protocol `CellColor` to a ratatui `Color`.
-pub fn cell_color(c: kmux_protocol::messages::CellColor) -> Color {
-    Color::Rgb(c.r, c.g, c.b)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_all_builtins_parse() {
-        for name in &[
-            "one-dark",
-            "catppuccin-latte",
-            "catppuccin-frappe",
-            "catppuccin-macchiato",
-            "catppuccin-mocha",
-            "dracula",
-        ] {
+        for name in BUILTIN_THEMES {
             assert!(
                 builtin_theme(name).is_some(),
                 "built-in theme '{name}' failed to parse"
@@ -154,13 +172,13 @@ mod tests {
     #[test]
     fn test_hex_parse_valid() {
         let color = parse_hex("bg", "#24273a").unwrap();
-        assert_eq!(color, Color::Rgb(0x24, 0x27, 0x3a));
+        assert_eq!(color, Rgb::new(0x24, 0x27, 0x3a));
     }
 
     #[test]
     fn test_hex_parse_valid_no_hash() {
         let color = parse_hex("bg", "24273a").unwrap();
-        assert_eq!(color, Color::Rgb(0x24, 0x27, 0x3a));
+        assert_eq!(color, Rgb::new(0x24, 0x27, 0x3a));
     }
 
     #[test]
@@ -183,6 +201,6 @@ mod tests {
     fn test_default_theme_is_macchiato() {
         let theme = default_theme();
         // bg = #24273a
-        assert_eq!(theme.bg, Color::Rgb(0x24, 0x27, 0x3a));
+        assert_eq!(theme.bg, Rgb::new(0x24, 0x27, 0x3a));
     }
 }

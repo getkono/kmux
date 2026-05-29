@@ -1,19 +1,20 @@
 [package]
-name = "kmux"
+name = "kmux-tui"
 version.workspace = true
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Terminal multiplexer and session manager client with remote desktop capabilities."
+description = "Terminal (TUI) frontend for the kmux client."
 build = "build.rs"
 
 [[bin]]
-name = "kmux"
+name = "kmux-tui"
 path = "src/main.rs"
 
 [dependencies]
+kmux-app.workspace = true
 kmux-client.workspace = true
 kmux-protocol = { workspace = true, features = ["framing"] }
 anyhow.workspace = true
@@ -25,12 +26,3 @@ tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 futures.workspace = true
-rand.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-thiserror.workspace = true
-toml.workspace = true
-tabled.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

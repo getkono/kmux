@@ -1,6 +1,6 @@
 //! Data types for the command-palette registry.
 
-use crate::app::App;
+use crate::core::AppCore;
 
 /// The result a command body returns. Mirrors the small set of things keys can
 /// do — most commands simply mutate `App` and return `Ok`. Quit/Reconnect/
@@ -21,14 +21,14 @@ pub enum CommandSuccess {
     /// Force a reconnect.
     Reconnect,
     /// Switch to another server.
-    SwitchServer(crate::app::SwitchTarget),
+    SwitchServer(crate::core::SwitchTarget),
 }
 
 /// Function pointer signature for command bodies.
 ///
 /// `args` excludes the command name itself; e.g. for `/session new myproj /tmp`
 /// args is `["myproj", "/tmp"]`.
-pub type CommandFn = fn(&mut App, args: &[String]) -> CommandResult;
+pub type CommandFn = fn(&mut AppCore, args: &[String]) -> CommandResult;
 
 /// Metadata + handler for one command.
 #[derive(Clone, Copy)]

@@ -70,3 +70,12 @@ status_bg = "#1e2030"       # background of the status and session bars
 
 The canonical theme definitions are in the [`themes/`](../themes/) directory at
 the repository root, which you can use as reference when authoring custom themes.
+
+## Implementation
+
+Theme parsing and resolution are frontend-agnostic and live in `kmux-app`
+(`kmux_app::theme` and `kmux_app::config::resolve_theme`). The palette is stored
+as a toolkit-neutral `Rgb` triple — `kmux_app::theme::Rgb` — and the active
+palette lives on `AppCore.palette`. Each frontend converts to its own color type
+at the render boundary (the TUI to `ratatui::style::Color`, the GTK frontend to
+cairo colors). See [architecture-frontend.md](architecture-frontend.md).

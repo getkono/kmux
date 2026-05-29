@@ -49,25 +49,25 @@ tail-client-log:
 tail-daemon-log:
     tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/kmux/daemon.log"
 
-# Rebuild kmux + kmuxd (debug) and restart the daemon via `kmux daemon restart`.
-# Binary resolution: kmux at target/debug/kmux picks up its sibling kmuxd at
-# target/debug/kmuxd, spawning it with the same argv as any auto-spawn.
+# Rebuild kmux-tui + kmuxd (debug) and restart the daemon via `kmux-tui daemon restart`.
+# Binary resolution: the client at target/debug/kmux-tui picks up its sibling
+# kmuxd at target/debug/kmuxd, spawning it with the same argv as any auto-spawn.
 restart-daemon:
-    cargo build -p kmux -p kmuxd
-    cargo run -p kmux -- daemon restart
+    cargo build -p kmux-tui -p kmuxd
+    cargo run -p kmux-tui -- daemon restart
 
 # Start the local daemon (debug build) via the same primitive as auto-spawn.
 start-daemon:
-    cargo build -p kmux -p kmuxd
-    cargo run -p kmux -- daemon start
+    cargo build -p kmux-tui -p kmuxd
+    cargo run -p kmux-tui -- daemon start
 
 # Stop the local daemon (debug build).
 stop-daemon:
-    cargo run -p kmux -- daemon stop
+    cargo run -p kmux-tui -- daemon stop
 
 # Install kmux and kmuxd to ~/.cargo/bin (release build)
 install:
-    cargo install --path crates/kmux
+    cargo install --path crates/kmux-tui
     cargo install --path crates/kmuxd
 
 # Stage a distributable release tarball for the host target into dist/.
@@ -83,10 +83,10 @@ package:
     target=$(rustc -vV | sed -n 's/^host: //p')
     stage="kmux-${ver}-${target}"
     echo "==> building release binaries (${target})"
-    cargo build --release -p kmux -p kmuxd
+    cargo build --release -p kmux-tui -p kmuxd
     rm -rf "dist/${stage}"
     mkdir -p "dist/${stage}"
-    cp target/release/kmux target/release/kmuxd README.md "dist/${stage}/"
+    cp target/release/kmux-tui target/release/kmuxd README.md "dist/${stage}/"
     if [[ "$(uname -s)" == "Darwin" ]]; then
         # Resolve the dylib from kmuxd's baked rpath (authoritative — it is where
         # the binary was linked to look), then ship it and repoint to @loader_path.
@@ -96,14 +96,14 @@ package:
         oldref=$(otool -L "dist/${stage}/kmuxd" | awk '/libkmux_ghostty/{print $1; exit}')
         install_name_tool -change "$oldref" @rpath/libkmux_ghostty.dylib "dist/${stage}/kmuxd"
         install_name_tool -add_rpath @loader_path "dist/${stage}/kmuxd"
-        strip -x "dist/${stage}/kmux" "dist/${stage}/kmuxd"
+        strip -x "dist/${stage}/kmux-tui" "dist/${stage}/kmuxd"
     else
         command -v patchelf >/dev/null || { echo "error: patchelf is required to package on Linux (e.g. 'dnf install patchelf' / 'apt-get install patchelf')" >&2; exit 1; }
         libdir=$(patchelf --print-rpath target/release/kmuxd | tr ':' '\n' | grep -m1 kmux-ghostty-sys || true)
         [[ -n "$libdir" && -f "$libdir/libkmux_ghostty.so" ]] || { echo "error: could not locate libkmux_ghostty.so (rpath: ${libdir:-none})" >&2; exit 1; }
         cp "$libdir/libkmux_ghostty.so" "dist/${stage}/"
         patchelf --set-rpath '$ORIGIN' "dist/${stage}/kmuxd"
-        strip "dist/${stage}/kmux" "dist/${stage}/kmuxd"
+        strip "dist/${stage}/kmux-tui" "dist/${stage}/kmuxd"
     fi
     tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
     ( cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256" )

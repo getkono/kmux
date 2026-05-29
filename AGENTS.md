@@ -5,7 +5,8 @@ A terminal multiplexer / session manager with remote desktop capabilities.
 ## Commands
 
 - Run server: `cargo run -p kmuxd -- --self-signed`
-- Run TUI client: `cargo run -p kmux`
+- Run TUI client: `cargo run -p kmux-tui`
+- Run GTK GUI (scaffold): `cargo run -p kmux-gtk` (needs system GTK4 dev libs; if another `pkg-config` shadows the system one, prefix `PKG_CONFIG=/usr/bin/pkg-config`)
 - Run tests: `just test`
 - Lint: `just clippy`
 - Lint fix: `just clippy-fix`
@@ -14,6 +15,7 @@ A terminal multiplexer / session manager with remote desktop capabilities.
 
 ## Conventions
 
+- The client is layered for multiple frontends: `kmux-protocol` → `kmux-client` (mechanism) → `kmux-app` (toolkit-agnostic interaction policy + `AppCore`) → frontends (`kmux-tui` ratatui, `kmux-gtk` GTK4). Nothing at or below `kmux-app` may depend on a UI toolkit. See [docs/architecture-frontend.md](docs/architecture-frontend.md).
 - Any architectural detail/change should be documented in `docs/` directory.
 - Use strict Rust -- no `#[allow(unused)]` without justification
 - Write tests for all new functionality

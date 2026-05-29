@@ -1,66 +1,32 @@
-use crossterm::event::{KeyEvent, KeyEventKind};
+//! Action dispatch on [`AppCore`]: the single source of truth for how a
+//! resolved [`Action`] mutates client state, shared by the key path and the
+//! command palette. Moved from the TUI's `app/key_handler.rs`.
+//!
+//! Two arms that require toolkit I/O are *not* here: `Action::ForwardKey`
+//! (needs the raw crossterm event to encode under live Ghostty mode state —
+//! the frontend handles it before calling dispatch) and clipboard copy/paste
+//! (emitted as [`KeyResult::CopyToClipboard`] / [`KeyResult::RequestPaste`]
+//! effects that the frontend performs).
 
 use crate::cmd;
-use crate::key_convert;
-use crate::mode::{self, Action, Mode};
+use crate::mode::{Action, Mode};
 use crate::recent_servers::ServerKind;
 
-use super::{App, COMMAND_HISTORY_CAP, KeyResult, SwitchTarget};
+use super::{AppCore, COMMAND_HISTORY_CAP, KeyResult, SwitchTarget};
 
-impl App {
-    /// Handle a key event. Returns the appropriate `KeyResult` for the event loop.
-    pub(super) async fn handle_key(&mut self, key_event: KeyEvent) -> KeyResult {
-        // Drop key-release events.  These appear when the host terminal has
-        // kitty `report_events` enabled (we don't enable it ourselves but
-        // some terminals are sticky).  Forwarding them would double-fire
-        // every keystroke through the resolver.
-        if matches!(key_event.kind, KeyEventKind::Release) {
-            return KeyResult::Continue;
-        }
-
-        let (key, mods) = key_convert::convert(&key_event);
-        let (new_mode, action) = mode::resolve(&self.mode, &key, mods);
-
-        if let Some(m) = new_mode {
-            self.mode = m;
-        }
-
-        self.dispatch_action(action, Some(&key_event)).await
-    }
-
-    /// Apply an `Action` to the app. Used both by the key path and by the
+impl AppCore {
+    /// Apply an [`Action`] to the core. Used both by the key path and by the
     /// command palette so a single source of truth governs behavior.
-    ///
-    /// `src_event` is only used by `Action::ForwardKey` for raw byte encoding;
-    /// command-issued actions pass `None`.
-    pub(crate) async fn dispatch_action(
-        &mut self,
-        action: Action,
-        src_event: Option<&KeyEvent>,
-    ) -> KeyResult {
+    pub async fn dispatch_action(&mut self, action: Action) -> KeyResult {
         match action {
-            Action::ForwardKey => {
-                // ForwardKey requires the original event so the daemon can
-                // encode it under the live Ghostty mode state.
-                let Some(key_event) = src_event else {
-                    return KeyResult::Continue;
-                };
-
-                // Snap to bottom on keypress.
-                if let Some(grid) = self.mgr.active_grid_mut() {
-                    grid.scroll_to_bottom();
-                }
-
-                if let Some(proto) = key_convert::convert_to_protocol_key(key_event) {
-                    self.mgr.send_key_batch(vec![proto]);
-                }
-            }
+            // ForwardKey is handled frontend-side (it needs the raw toolkit
+            // event); it never reaches the core dispatch.
+            Action::ForwardKey => {}
             Action::CreateSession => {
-                self.mgr
-                    .create_session(None, None, Self::current_term_size());
+                self.mgr.create_session(None, None, self.term_size);
             }
             Action::CreatePane => {
-                self.mgr.create_pane(Self::current_term_size());
+                self.mgr.create_pane(self.term_size);
             }
             Action::CloseSession => {
                 if let Some(word_id) = self.mgr.active_session().map(|s| s.to_string()) {
@@ -267,23 +233,11 @@ impl App {
             }
             Action::CopySelection => {
                 if let Some(text) = self.mgr.active_grid().and_then(|g| g.selected_text()) {
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(mut cb) = arboard::Clipboard::new() {
-                            let _ = cb.set_text(text);
-                        }
-                    });
+                    return KeyResult::CopyToClipboard(text);
                 }
             }
             Action::Paste => {
-                if let Some(tx) = self.paste_tx.clone() {
-                    tokio::task::spawn_blocking(move || {
-                        if let Ok(mut cb) = arboard::Clipboard::new()
-                            && let Ok(text) = cb.get_text()
-                        {
-                            let _ = tx.send(text);
-                        }
-                    });
-                }
+                return KeyResult::RequestPaste;
             }
             Action::ExitToNormal => {
                 self.mode = Mode::Normal;
@@ -316,8 +270,7 @@ impl App {
                         if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
                             self.mgr.select_session(word_id);
                         } else {
-                            self.mgr
-                                .create_session(None, Some(&cwd), Self::current_term_size());
+                            self.mgr.create_session(None, Some(&cwd), self.term_size);
                         }
                     }
                 }
@@ -535,7 +488,7 @@ impl App {
 /// Apply a hint's replacement to a buffer, returning the resulting buffer.
 /// Shared by Tab (live edit) and Enter (submit-with-fallback when the typed
 /// buffer doesn't parse to a known command).
-fn apply_hint_to_buffer(buffer: &str, hint: &cmd::hint::Hint) -> String {
+pub(crate) fn apply_hint_to_buffer(buffer: &str, hint: &cmd::hint::Hint) -> String {
     let split = hint.replace_from.min(buffer.len());
     let head = &buffer[..split];
     if hint.append_space {

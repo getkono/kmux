@@ -1,11 +1,11 @@
 //! The static list of built-in commands.
 //!
 //! Adding a command:
-//! 1. Write a `cmd_xxx` function below with signature `fn(&mut App, &[String]) -> CommandResult`.
+//! 1. Write a `cmd_xxx` function below with signature `fn(&mut AppCore, &[String]) -> CommandResult`.
 //! 2. Append a [`CommandSpec`] entry to [`ALL`].
 //! 3. (Optional) Add a hint test in `cmd::hint::tests` if it has a non-trivial completer.
 
-use crate::app::App;
+use crate::core::AppCore;
 use crate::mode::Mode;
 use crate::theme;
 
@@ -22,7 +22,7 @@ fn require_arg<'a>(args: &'a [String], idx: usize, name: &str) -> Result<&'a str
 /// Most session/pane operations are no-ops when the daemon is unreachable.
 /// Convert that into an explicit error so the user sees a status message
 /// instead of silent inaction.
-fn require_connected(app: &App) -> Result<(), String> {
+fn require_connected(app: &AppCore) -> Result<(), String> {
     if app.mgr.is_connected() {
         Ok(())
     } else {
@@ -48,27 +48,23 @@ fn signal_from_name(s: &str) -> Result<i32, String> {
     }
 }
 
-fn current_term_size() -> kmux_protocol::messages::TermSize {
-    App::current_term_size()
-}
-
 // ── Client / TUI controls ────────────────────────────────────────────────────
 
-fn cmd_quit(_app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_quit(_app: &mut AppCore, _args: &[String]) -> CommandResult {
     Ok(CommandSuccess::Quit)
 }
 
-fn cmd_redraw(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_redraw(app: &mut AppCore, _args: &[String]) -> CommandResult {
     app.force_clear = true;
     Ok(CommandSuccess::Status("redraw queued".into()))
 }
 
-fn cmd_help(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_help(app: &mut AppCore, _args: &[String]) -> CommandResult {
     app.mode = Mode::Help;
     Ok(CommandSuccess::Ok)
 }
 
-fn cmd_hud(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_hud(app: &mut AppCore, _args: &[String]) -> CommandResult {
     app.hud_visible = !app.hud_visible;
     Ok(CommandSuccess::Status(format!(
         "hud: {}",
@@ -76,7 +72,7 @@ fn cmd_hud(app: &mut App, _args: &[String]) -> CommandResult {
     )))
 }
 
-fn cmd_metrics(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_metrics(app: &mut AppCore, _args: &[String]) -> CommandResult {
     app.metrics_overlay_visible = !app.metrics_overlay_visible;
     Ok(CommandSuccess::Status(format!(
         "metrics: {}",
@@ -88,7 +84,7 @@ fn cmd_metrics(app: &mut App, _args: &[String]) -> CommandResult {
     )))
 }
 
-fn cmd_lock(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_lock(app: &mut AppCore, _args: &[String]) -> CommandResult {
     if app.mgr.active_pane_id().is_none() {
         return Err("no active pane".into());
     }
@@ -103,7 +99,7 @@ fn cmd_lock(app: &mut App, _args: &[String]) -> CommandResult {
     )))
 }
 
-fn cmd_snapshot(app: &mut App, args: &[String]) -> CommandResult {
+fn cmd_snapshot(app: &mut AppCore, args: &[String]) -> CommandResult {
     let arg = require_arg(args, 0, "on|off")?;
     let val = parse_on_off(arg, "on|off")?;
     app.force_snapshot_mode = val;
@@ -116,18 +112,18 @@ fn cmd_snapshot(app: &mut App, args: &[String]) -> CommandResult {
     )))
 }
 
-fn cmd_theme(app: &mut App, args: &[String]) -> CommandResult {
+fn cmd_theme(app: &mut AppCore, args: &[String]) -> CommandResult {
     let name = require_arg(args, 0, "name")?;
     match theme::builtin_theme(name) {
         Some(t) => {
-            app.theme = t;
+            app.palette = t;
             Ok(CommandSuccess::Status(format!("theme: {name}")))
         }
         None => Err(format!("unknown theme '{name}'")),
     }
 }
 
-fn cmd_clear_history(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_clear_history(app: &mut AppCore, _args: &[String]) -> CommandResult {
     let n = app.command_history.len();
     app.command_history.clear();
     Ok(CommandSuccess::Status(format!(
@@ -137,43 +133,43 @@ fn cmd_clear_history(app: &mut App, _args: &[String]) -> CommandResult {
 
 // ── Connection / server ──────────────────────────────────────────────────────
 
-fn cmd_disconnect(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_disconnect(app: &mut AppCore, _args: &[String]) -> CommandResult {
     app.mgr.disconnect();
     app.mode = Mode::Normal;
     Ok(CommandSuccess::Ok)
 }
 
-fn cmd_reconnect(_app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_reconnect(_app: &mut AppCore, _args: &[String]) -> CommandResult {
     Ok(CommandSuccess::Reconnect)
 }
 
-fn cmd_server(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_server(app: &mut AppCore, _args: &[String]) -> CommandResult {
     app.mode = Mode::ServerPicker;
     app.server_picker_search.clear();
     app.server_picker_selected = 0;
     Ok(CommandSuccess::Ok)
 }
 
-fn cmd_local(_app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_local(_app: &mut AppCore, _args: &[String]) -> CommandResult {
     Ok(CommandSuccess::SwitchServer(
-        crate::app::SwitchTarget::Local,
+        crate::core::SwitchTarget::Local,
     ))
 }
 
 // ── Sessions ─────────────────────────────────────────────────────────────────
 
-fn cmd_session_new(app: &mut App, args: &[String]) -> CommandResult {
+fn cmd_session_new(app: &mut AppCore, args: &[String]) -> CommandResult {
     require_connected(app)?;
     let name = args.first().map(String::as_str);
     let cwd = args.get(1).map(String::as_str);
-    app.mgr.create_session(name, cwd, current_term_size());
+    app.mgr.create_session(name, cwd, app.term_size);
     Ok(CommandSuccess::Status(match name {
         Some(n) => format!("creating session '{n}'…"),
         None => "creating session…".into(),
     }))
 }
 
-fn cmd_session_close(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_session_close(app: &mut AppCore, _args: &[String]) -> CommandResult {
     require_connected(app)?;
     let Some(word_id) = app.mgr.active_session().map(|s| s.to_string()) else {
         return Err("no active session".into());
@@ -182,7 +178,7 @@ fn cmd_session_close(app: &mut App, _args: &[String]) -> CommandResult {
     Ok(CommandSuccess::Ok)
 }
 
-fn cmd_session_rename(app: &mut App, args: &[String]) -> CommandResult {
+fn cmd_session_rename(app: &mut AppCore, args: &[String]) -> CommandResult {
     require_connected(app)?;
     let new_name = require_arg(args, 0, "name")?.trim();
     if new_name.is_empty() {
@@ -195,7 +191,7 @@ fn cmd_session_rename(app: &mut App, args: &[String]) -> CommandResult {
     Ok(CommandSuccess::Status(format!("renamed to '{new_name}'")))
 }
 
-fn cmd_session_next(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_session_next(app: &mut AppCore, _args: &[String]) -> CommandResult {
     require_connected(app)?;
     if app.mgr.session_list().is_empty() {
         return Err("no sessions".into());
@@ -204,7 +200,7 @@ fn cmd_session_next(app: &mut App, _args: &[String]) -> CommandResult {
     Ok(CommandSuccess::Ok)
 }
 
-fn cmd_session_prev(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_session_prev(app: &mut AppCore, _args: &[String]) -> CommandResult {
     require_connected(app)?;
     if app.mgr.session_list().is_empty() {
         return Err("no sessions".into());
@@ -213,7 +209,7 @@ fn cmd_session_prev(app: &mut App, _args: &[String]) -> CommandResult {
     Ok(CommandSuccess::Ok)
 }
 
-fn cmd_session_switch(app: &mut App, args: &[String]) -> CommandResult {
+fn cmd_session_switch(app: &mut AppCore, args: &[String]) -> CommandResult {
     require_connected(app)?;
     let query = require_arg(args, 0, "query")?;
     if app.mgr.session_list().is_empty() {
@@ -244,7 +240,7 @@ fn cmd_session_switch(app: &mut App, args: &[String]) -> CommandResult {
     Err(format!("no session matches '{query}'"))
 }
 
-fn cmd_session_list(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_session_list(app: &mut AppCore, _args: &[String]) -> CommandResult {
     app.mode = Mode::SessionPicker;
     app.session_picker_search.clear();
     app.session_picker_selected = 0;
@@ -253,16 +249,16 @@ fn cmd_session_list(app: &mut App, _args: &[String]) -> CommandResult {
 
 // ── Panes ────────────────────────────────────────────────────────────────────
 
-fn cmd_pane_new(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_pane_new(app: &mut AppCore, _args: &[String]) -> CommandResult {
     require_connected(app)?;
     if app.mgr.active_session().is_none() {
         return Err("no active session".into());
     }
-    app.mgr.create_pane(current_term_size());
+    app.mgr.create_pane(app.term_size);
     Ok(CommandSuccess::Status("creating pane…".into()))
 }
 
-fn cmd_pane_close(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_pane_close(app: &mut AppCore, _args: &[String]) -> CommandResult {
     require_connected(app)?;
     if app.mgr.active_pane_id().is_none() {
         return Err("no active pane".into());
@@ -271,7 +267,7 @@ fn cmd_pane_close(app: &mut App, _args: &[String]) -> CommandResult {
     Ok(CommandSuccess::Status("closing pane…".into()))
 }
 
-fn cmd_pane_next(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_pane_next(app: &mut AppCore, _args: &[String]) -> CommandResult {
     require_connected(app)?;
     if app.mgr.active_pane_id().is_none() {
         return Err("no active pane".into());
@@ -280,7 +276,7 @@ fn cmd_pane_next(app: &mut App, _args: &[String]) -> CommandResult {
     Ok(CommandSuccess::Ok)
 }
 
-fn cmd_pane_prev(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_pane_prev(app: &mut AppCore, _args: &[String]) -> CommandResult {
     require_connected(app)?;
     if app.mgr.active_pane_id().is_none() {
         return Err("no active pane".into());
@@ -289,7 +285,7 @@ fn cmd_pane_prev(app: &mut App, _args: &[String]) -> CommandResult {
     Ok(CommandSuccess::Ok)
 }
 
-fn cmd_signal(app: &mut App, args: &[String]) -> CommandResult {
+fn cmd_signal(app: &mut AppCore, args: &[String]) -> CommandResult {
     require_connected(app)?;
     let name = require_arg(args, 0, "signal")?;
     let signum = signal_from_name(name)?;
@@ -305,7 +301,7 @@ fn cmd_signal(app: &mut App, args: &[String]) -> CommandResult {
 
 // ── Daemon ───────────────────────────────────────────────────────────────────
 
-fn cmd_daemon_status(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_daemon_status(app: &mut AppCore, _args: &[String]) -> CommandResult {
     let server = if app.server_display.is_empty() {
         "(local)"
     } else {
@@ -323,7 +319,7 @@ fn cmd_daemon_status(app: &mut App, _args: &[String]) -> CommandResult {
     )))
 }
 
-fn cmd_daemon_ping(app: &mut App, _args: &[String]) -> CommandResult {
+fn cmd_daemon_ping(app: &mut AppCore, _args: &[String]) -> CommandResult {
     require_connected(app)?;
     // SessionManager keeps wire-level Ping/Pong internal to the liveness layer;
     // a `request_session_list` is the most-similar user-triggerable round-trip
@@ -582,7 +578,7 @@ mod tests {
     use kmux_client::session_manager::SessionManager;
     use kmux_protocol::messages::ClientCapabilities;
 
-    fn fixture_app() -> App {
+    fn fixture_core() -> AppCore {
         let mut mgr = SessionManager::new(
             "127.0.0.1".into(),
             8443,
@@ -593,83 +589,50 @@ mod tests {
         // Pretend the daemon is connected so commands that gate on
         // `is_connected` reach their real error paths in tests.
         mgr.connected = true;
-        App {
-            mgr,
-            theme: theme::default_theme(),
-            mode: Mode::Command(CommandState::default()),
-            hud_visible: false,
-            metrics_overlay_visible: false,
-            force_snapshot_mode: false,
-            disconnect_at: None,
-            session_picker_selected: 0,
-            session_picker_search: String::new(),
-            dir_picker_buffer: String::new(),
-            dir_picker_selected: 0,
-            is_local: true,
-            initial_cwd: String::new(),
-            did_auto_select: false,
-            auto_session: None,
-            auto_cwd: None,
-            top_bar_hits: crate::app::TopBarHits::default(),
-            picker_hits: crate::app::PickerHits::default(),
-            server_display: String::new(),
-            server_string: String::new(),
-            server_kind: crate::recent_servers::ServerKind::Local,
-            server_picker_selected: 0,
-            server_picker_search: String::new(),
-            recent_servers: crate::recent_servers::RecentServersCache::load(),
-            needs_render: true,
-            force_clear: false,
-            paste_tx: None,
-            cancel_tx: None,
-            pending_srv_tx: None,
-            instance_id: String::new(),
-            ssh_target: None,
-            pending_target: None,
-            last_exit_error: None,
-            command_history: std::collections::VecDeque::new(),
-        }
+        let mut core = AppCore::for_test(mgr);
+        core.mode = Mode::Command(CommandState::default());
+        core
     }
 
     /// Drives the full submit pipeline as `dispatch_action` would: starts in
     /// `Mode::Command(buffer)`, fires `Action::CommandSubmit`, returns the
     /// `KeyResult` that the event loop would observe.
-    async fn submit(buffer: &str, app: &mut App) -> crate::app::KeyResult {
+    async fn submit(buffer: &str, app: &mut AppCore) -> crate::core::KeyResult {
         app.mode = Mode::Command(CommandState {
             buffer: buffer.to_string(),
             cursor: buffer.len(),
             selected: 0,
             history_pos: None,
         });
-        app.dispatch_action(crate::mode::Action::CommandSubmit, None)
+        app.dispatch_action(crate::mode::Action::CommandSubmit)
             .await
     }
 
     #[tokio::test]
     async fn submit_quit_returns_keyresult_quit() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let kr = submit("quit", &mut app).await;
-        assert!(matches!(kr, crate::app::KeyResult::Quit));
+        assert!(matches!(kr, crate::core::KeyResult::Quit));
     }
 
     #[tokio::test]
     async fn submit_redraw_via_dispatch_sets_force_clear() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let kr = submit("redraw", &mut app).await;
-        assert!(matches!(kr, crate::app::KeyResult::Continue));
+        assert!(matches!(kr, crate::core::KeyResult::Continue));
         assert!(app.force_clear);
     }
 
     #[tokio::test]
     async fn submit_help_via_dispatch_changes_mode() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let _ = submit("help", &mut app).await;
         assert!(matches!(app.mode, Mode::Help));
     }
 
     #[tokio::test]
     async fn submit_resets_mode_back_to_normal_on_status_only() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let _ = submit("hud", &mut app).await;
         // hud doesn't change mode; mem::replace should have already set Normal.
         assert!(matches!(app.mode, Mode::Normal));
@@ -678,9 +641,9 @@ mod tests {
 
     #[tokio::test]
     async fn submit_empty_buffer_is_noop() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let kr = submit("", &mut app).await;
-        assert!(matches!(kr, crate::app::KeyResult::Continue));
+        assert!(matches!(kr, crate::core::KeyResult::Continue));
         assert_eq!(app.command_history.len(), 0);
     }
 
@@ -689,10 +652,10 @@ mod tests {
         // User types `qu` (a partial command name) and hits Enter without
         // pressing Tab first. The dropdown's top hint resolves to /quit, so
         // Enter should run /quit instead of failing with "unknown command".
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let kr = submit("qu", &mut app).await;
         assert!(
-            matches!(kr, crate::app::KeyResult::Quit),
+            matches!(kr, crate::core::KeyResult::Quit),
             "expected fallback to /quit; status: {:?}",
             app.mgr.status_msg()
         );
@@ -700,26 +663,26 @@ mod tests {
 
     #[tokio::test]
     async fn submit_records_history() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let _ = submit("hud", &mut app).await;
         assert_eq!(app.command_history.back().map(|s| s.as_str()), Some("hud"));
     }
 
     #[test]
     fn quit_returns_quit_outcome() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         assert!(matches!(run(&mut app, "quit"), Outcome::Quit));
     }
 
     #[test]
     fn quit_alias_q_returns_quit() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         assert!(matches!(run(&mut app, "q"), Outcome::Quit));
     }
 
     #[test]
     fn redraw_sets_force_clear() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         assert!(!app.force_clear);
         let _ = run(&mut app, "redraw");
         assert!(app.force_clear, "force_clear should be set");
@@ -727,14 +690,14 @@ mod tests {
 
     #[test]
     fn help_changes_mode_to_help() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let _ = run(&mut app, "help");
         assert!(matches!(app.mode, Mode::Help));
     }
 
     #[test]
     fn hud_toggles() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         assert!(!app.hud_visible);
         let _ = run(&mut app, "hud");
         assert!(app.hud_visible);
@@ -744,7 +707,7 @@ mod tests {
 
     #[test]
     fn metrics_toggles() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         assert!(!app.metrics_overlay_visible);
         let _ = run(&mut app, "metrics");
         assert!(app.metrics_overlay_visible);
@@ -752,15 +715,15 @@ mod tests {
 
     #[test]
     fn theme_changes_palette() {
-        let mut app = fixture_app();
-        let original_bg = app.theme.bg;
+        let mut app = fixture_core();
+        let original_bg = app.palette.bg;
         let _ = run(&mut app, "theme dracula");
-        assert_ne!(app.theme.bg, original_bg, "theme should change");
+        assert_ne!(app.palette.bg, original_bg, "theme should change");
     }
 
     #[test]
     fn theme_unknown_sets_status() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let _ = run(&mut app, "theme nonsense");
         assert!(
             app.mgr.status_msg().contains("unknown theme"),
@@ -771,28 +734,28 @@ mod tests {
 
     #[test]
     fn snapshot_on_sets_force_snapshot() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let _ = run(&mut app, "snapshot on");
         assert!(app.force_snapshot_mode);
     }
 
     #[test]
     fn server_opens_picker_mode() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let _ = run(&mut app, "server");
         assert!(matches!(app.mode, Mode::ServerPicker));
     }
 
     #[test]
     fn session_list_opens_picker_mode() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let _ = run(&mut app, "session list");
         assert!(matches!(app.mode, Mode::SessionPicker));
     }
 
     #[test]
     fn session_alias_s_list_opens_picker_mode() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let _ = run(&mut app, "s list");
         assert!(matches!(app.mode, Mode::SessionPicker));
     }
@@ -801,7 +764,7 @@ mod tests {
     fn pane_alias_p_new_dispatches() {
         // Without an active session, create_pane returns silently — but the
         // command must still resolve and run (no "unknown command" status).
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let _ = run(&mut app, "p new");
         // No "unknown command" or parse error written to status.
         assert!(
@@ -813,7 +776,7 @@ mod tests {
 
     #[test]
     fn signal_with_no_active_pane_sets_error_status() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let _ = run(&mut app, "signal kill");
         assert!(
             app.mgr.status_msg().contains("no active pane"),
@@ -824,7 +787,7 @@ mod tests {
 
     #[test]
     fn signal_unknown_name_errors() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let _ = run(&mut app, "signal foo");
         assert!(
             app.mgr.status_msg().contains("unknown signal"),
@@ -835,7 +798,7 @@ mod tests {
 
     #[test]
     fn disconnected_session_new_reports_status() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         app.mgr.connected = false;
         let _ = run(&mut app, "session new");
         assert!(
@@ -847,7 +810,7 @@ mod tests {
 
     #[test]
     fn disconnected_signal_reports_status() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         app.mgr.connected = false;
         let _ = run(&mut app, "signal kill");
         assert!(
@@ -859,7 +822,7 @@ mod tests {
 
     #[test]
     fn pane_new_with_no_session_reports_status() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         // Connected, but no active session.
         let _ = run(&mut app, "pane new");
         assert!(
@@ -871,7 +834,7 @@ mod tests {
 
     #[test]
     fn unknown_command_writes_status() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let _ = run(&mut app, "nopecommand");
         assert!(
             app.mgr.status_msg().contains("unknown command"),
@@ -882,7 +845,7 @@ mod tests {
 
     #[test]
     fn rename_with_no_active_session_errors() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         let _ = run(&mut app, "session rename foo");
         assert!(
             app.mgr.status_msg().contains("no active session"),
@@ -893,22 +856,22 @@ mod tests {
 
     #[test]
     fn local_returns_switch_server_outcome() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         assert!(matches!(
             run(&mut app, "local"),
-            Outcome::SwitchServer(crate::app::SwitchTarget::Local)
+            Outcome::SwitchServer(crate::core::SwitchTarget::Local)
         ));
     }
 
     #[test]
     fn reconnect_returns_reconnect_outcome() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         assert!(matches!(run(&mut app, "reconnect"), Outcome::Reconnect));
     }
 
     #[test]
     fn clear_history_drains_history() {
-        let mut app = fixture_app();
+        let mut app = fixture_core();
         app.command_history.push_back("foo".into());
         app.command_history.push_back("bar".into());
         let _ = run(&mut app, "clear-history");

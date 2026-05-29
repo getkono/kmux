@@ -20,13 +20,21 @@ kmux uses a server/client split:
 | [`kmux-pty`](crates/kmux-pty)           | Async PTY lifecycle library (spawn, I/O, resize, shutdown)                 |
 | [`kmux-protocol`](crates/kmux-protocol) | Shared wire protocol, transport traits, TOFU TLS, endpoint URL parser      |
 | [`kmuxd`](crates/kmuxd)                 | Background daemon — manages PTY sessions, multi-transport listener         |
-| [`kmux`](crates/kmux)                   | TUI client — connects over QUIC, TCP+TLS, or UDS with automatic fallback   |
+| [`kmux-client`](crates/kmux-client)     | Client mechanism — session manager, transports/bootstrap, terminal grid    |
+| [`kmux-app`](crates/kmux-app)           | Toolkit-agnostic interaction layer — `AppCore`, command palette, CLI       |
+| [`kmux-tui`](crates/kmux-tui)           | TUI frontend (ratatui/crossterm); ships the `kmux-tui` binary              |
+| [`kmux-gtk`](crates/kmux-gtk)           | GTK4 GUI frontend (Linux); ships the `kmux` binary                         |
 
 ```
-kmuxd  ->  kmux-pty
-kmuxd  ->  kmux-protocol
-kmux   ->  kmux-protocol
+kmuxd     ->  kmux-pty,  kmux-protocol
+kmux-client ->  kmux-protocol
+kmux-app  ->  kmux-client, kmux-protocol
+kmux-tui  ->  kmux-app          (ratatui/crossterm)
+kmux-gtk  ->  kmux-app          (gtk4)
 ```
+
+The client is layered so one toolkit-agnostic core (`kmux-app`'s `AppCore`)
+drives both frontends. See [docs/architecture-frontend.md](docs/architecture-frontend.md).
 
 The client connects to the server over QUIC (preferred), TCP+TLS (fallback), or
 UDS (local). See [docs/connection.md](docs/connection.md) for a full description
@@ -61,6 +69,17 @@ configuration.
   `mise.toml`); required to build the bundled libghostty-vt wrapper.
 - Ghostty sources as a git submodule: after cloning, run
   `git submodule update --init` once to populate `vendor/ghostty/`.
+- **GTK4 development libraries** — required only to build the `kmux` GUI binary
+  (`kmux-gtk`). The `kmux-tui` and `kmuxd` binaries do not need them.
+  - Fedora: `sudo dnf install gtk4-devel`
+  - Debian / Ubuntu: `sudo apt install libgtk-4-dev`
+  - Arch: `sudo pacman -S gtk4`
+  - macOS: `brew install gtk4`
+  - If another `pkg-config` (e.g. a Homebrew/linuxbrew one) shadows the system
+    one in `PATH`, GTK4 resolution fails on transitive `.pc` files. Point cargo
+    at the system pkg-config for any build that includes `kmux-gtk`:
+    `PKG_CONFIG=/usr/bin/pkg-config cargo run --bin kmux`. See
+    [docs/architecture-frontend.md](docs/architecture-frontend.md#building-kmux-gtk-and-the-system-pkg-config).
 
 ## Quick start
 
@@ -70,11 +89,19 @@ Start the server with a self-signed certificate:
 $ cargo run -p kmuxd -- --self-signed
 ```
 
-The server prints a shared auth token on startup. Connect the GUI client:
+The server prints a shared auth token on startup. Connect a client — the GTK
+GUI (`kmux`, Linux) or the terminal UI (`kmux-tui`):
 
 ```bash
-$ cargo run -p kmux
+$ cargo run --bin kmux    # GUI  (kmux-gtk)   — needs system GTK4 dev libs
+$ cargo run -p kmux-tui   # TUI  (binary: kmux-tui)
 ```
+
+> If `cargo run --bin kmux` fails with a `pkg-config` error about
+> `graphene-gobject-1.0` (or similar) not being found, your `PATH` has a
+> non-system `pkg-config` shadowing `/usr/bin/pkg-config`. Re-run as
+> `PKG_CONFIG=/usr/bin/pkg-config cargo run --bin kmux`. See
+> [Prerequisites](#prerequisites).
 
 By default, the server binds to `0.0.0.0:8443`.
 
