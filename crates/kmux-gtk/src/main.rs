@@ -142,12 +142,14 @@ fn build_ui(app: &Application, plan: &Plan) {
                 fe.core.mode = m;
             }
             if matches!(action, Action::ForwardKey) {
+                // Snap to bottom on keypress, then forward the key as a
+                // structured event so the daemon's Ghostty encoder produces the
+                // right bytes under the live terminal mode state.
                 if let Some(grid) = fe.core.mgr.active_grid_mut() {
                     grid.scroll_to_bottom();
                 }
-                let bytes = convert::forward_bytes(&key, mods);
-                if !bytes.is_empty() {
-                    fe.core.mgr.send_input(bytes);
+                if let Some(proto) = convert::convert_to_protocol_key(keyval, gdk_mods) {
+                    fe.core.mgr.send_key_batch(vec![proto]);
                 }
             } else {
                 // dispatch_action is async but performs no awaits; block_on
