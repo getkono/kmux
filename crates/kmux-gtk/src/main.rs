@@ -252,6 +252,16 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     tabs::wire(&shell, &fe, app);
     sidebar::wire(&shell, &fe, app);
 
+    // The disconnect banner's only button reconnects.
+    {
+        let fe = fe.clone();
+        let shell2 = shell.clone();
+        let app = app.clone();
+        shell.banner.connect_button_clicked(move |_| {
+            handle_effect(&fe, KeyResult::Reconnect, &app, &shell2.drawing);
+        });
+    }
+
     actions::install(&shell, &fe, app);
 
     // Key input: the controller lives on the focused terminal `DrawingArea`, so
@@ -482,8 +492,9 @@ fn pump(
             fe.core.mgr.metrics.flush_sample(conn_id);
         }
 
-        // Keep the HUD / metrics overlay refreshing while either is shown.
-        if fe.core.hud_visible || fe.core.metrics_overlay_visible {
+        // Keep the HUD refreshing while it is shown (the metrics dialog is a
+        // snapshot taken when it opens, so it doesn't need a per-frame tick).
+        if fe.core.hud_visible {
             dirty = true;
         }
         let redraw = dirty || fe.core.needs_render;

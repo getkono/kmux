@@ -28,8 +28,12 @@ pub struct Shell {
     pub tab_bar: adw::TabBar,
     /// Swaps between the tab content ("panes") and an empty-state page ("empty").
     pub content_stack: Stack,
-    /// Hosts the HUD OSD over the grid (and, transitionally, the modal overlays).
+    /// Hosts the HUD OSD over the grid.
     pub overlay: Overlay,
+    /// Connecting/disconnected banner above the content.
+    pub banner: adw::Banner,
+    /// Hosts transient status-message toasts.
+    pub toasts: adw::ToastOverlay,
     /// The single shared terminal grid, reparented into the active pane's tab.
     pub drawing: DrawingArea,
 
@@ -165,6 +169,8 @@ pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
         tab_bar,
         content_stack,
         overlay,
+        banner,
+        toasts,
         drawing: drawing.clone(),
         title,
         server_btn,

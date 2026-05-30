@@ -75,13 +75,10 @@ struct LiveDialog {
     list: Option<ListBox>,
 }
 
-/// Persistent overlay boxes (transitional) + the live native dialog.
+/// The live native dialog plus the HUD OSD and the transient-state trackers.
 pub struct Dialogs {
-    /// Connecting / disconnected box (still hand-drawn until the banner lands).
-    modal: GtkBox,
+    /// Performance HUD (live OSD ticker over the grid).
     hud: GtkBox,
-    metrics: GtkBox,
-    modal_sig: RefCell<Option<String>>,
     current: RefCell<Option<LiveDialog>>,
     /// Content signature for the live list dialog so we only rebuild rows on a
     /// real change (not every frame of terminal output).
@@ -89,40 +86,34 @@ pub struct Dialogs {
     /// Set while we mutate the list selection programmatically, so the row's
     /// `selected` callback doesn't echo back.
     syncing: Cell<bool>,
+    /// Last banner state shown, to avoid re-setting it every frame.
+    banner_sig: RefCell<Option<String>>,
+    /// Last status message turned into a toast.
+    last_status: RefCell<String>,
+    /// The metrics inspector dialog, while open.
+    metrics_dialog: RefCell<Option<adw::Dialog>>,
 }
 
-/// Build the transitional overlay boxes and add them to the shell overlay.
+/// Build the HUD overlay and add it to the shell overlay.
 pub fn build(overlay: &gtk4::Overlay) -> Dialogs {
-    let modal = GtkBox::new(Orientation::Vertical, 6);
-    modal.add_css_class("kmux-overlay");
-    modal.set_halign(Align::Center);
-    modal.set_valign(Align::Center);
-    modal.set_visible(false);
-    overlay.add_overlay(&modal);
-
     let hud = GtkBox::new(Orientation::Vertical, 0);
-    hud.add_css_class("kmux-overlay");
+    hud.add_css_class("osd");
     hud.add_css_class("kmux-hud");
     hud.set_halign(Align::End);
     hud.set_valign(Align::Start);
+    hud.set_margin_top(8);
+    hud.set_margin_end(8);
     hud.set_visible(false);
     overlay.add_overlay(&hud);
 
-    let metrics = GtkBox::new(Orientation::Vertical, 0);
-    metrics.add_css_class("kmux-overlay");
-    metrics.set_halign(Align::Center);
-    metrics.set_valign(Align::Center);
-    metrics.set_visible(false);
-    overlay.add_overlay(&metrics);
-
     Dialogs {
-        modal,
         hud,
-        metrics,
-        modal_sig: RefCell::new(None),
         current: RefCell::new(None),
         list_sig: RefCell::new(None),
         syncing: Cell::new(false),
+        banner_sig: RefCell::new(None),
+        last_status: RefCell::new(String::new()),
+        metrics_dialog: RefCell::new(None),
     }
 }
 
@@ -134,11 +125,10 @@ pub fn sync(
     app: &gtk4::Application,
 ) {
     reconcile_native(dialogs, shell, fe, app);
-
-    let f = fe.borrow();
-    update_modal_box(dialogs, &f.core, fe, shell, app);
-    update_hud(&dialogs.hud, &f.core);
-    update_metrics(&dialogs.metrics, &f.core);
+    update_banner(dialogs, shell, fe);
+    update_toast(dialogs, shell, fe);
+    update_metrics_dialog(dialogs, shell, fe);
+    update_hud(&dialogs.hud, &fe.borrow().core);
 }
 
 /// Open/close/refresh the live native dialog to match `core.mode`.
@@ -664,70 +654,57 @@ fn open_help(shell: &Rc<Shell>) -> LiveDialog {
     }
 }
 
-// ── Transitional overlay boxes (connecting / disconnected) ──
-
 fn clear(b: &GtkBox) {
     while let Some(child) = b.first_child() {
         b.remove(&child);
     }
 }
 
-fn update_modal_box(
-    dialogs: &Rc<Dialogs>,
-    core: &AppCore,
-    fe: &Rc<RefCell<Frontend>>,
-    shell: &Rc<Shell>,
-    app: &gtk4::Application,
-) {
-    let sig = format!("{:?}", core.mode);
-    if dialogs.modal_sig.borrow().as_deref() == Some(sig.as_str()) {
+// ── Connection banner + status toasts ──
+
+/// Drive the connecting/disconnected banner from the connection mode. The
+/// banner's button (reconnect) is wired once in `main::build_ui`.
+fn update_banner(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
+    let (sig, title, button, revealed) = {
+        let core = &fe.borrow().core;
+        match &core.mode {
+            Mode::Connecting { target_display } => (
+                format!("c|{target_display}"),
+                format!("Connecting to {target_display}…"),
+                None,
+                true,
+            ),
+            Mode::Disconnected { reason } => (
+                format!("d|{reason}"),
+                format!("Disconnected — {reason}"),
+                Some("Reconnect"),
+                true,
+            ),
+            _ => ("n".to_string(), String::new(), None, false),
+        }
+    };
+    if dialogs.banner_sig.borrow().as_deref() == Some(sig.as_str()) {
         return;
     }
-    *dialogs.modal_sig.borrow_mut() = Some(sig);
+    *dialogs.banner_sig.borrow_mut() = Some(sig);
+    shell.banner.set_title(&title);
+    shell.banner.set_button_label(button);
+    shell.banner.set_revealed(revealed);
+}
 
-    clear(&dialogs.modal);
-    match &core.mode {
-        Mode::Connecting { target_display } => {
-            dialogs
-                .modal
-                .append(&label("Connecting…", "kmux-overlay-title"));
-            dialogs
-                .modal
-                .append(&label(target_display, "kmux-overlay-dim"));
-            dialogs.modal.set_visible(true);
-        }
-        Mode::Disconnected { reason } => {
-            dialogs
-                .modal
-                .append(&label("Disconnected", "kmux-overlay-title"));
-            dialogs.modal.append(&label(reason, "kmux-overlay-error"));
-            let row = GtkBox::new(Orientation::Horizontal, 8);
-            let reconnect = gtk4::Button::with_label("Reconnect");
-            {
-                let fe = fe.clone();
-                let shell = shell.clone();
-                let app = app.clone();
-                reconnect.connect_clicked(move |_| {
-                    handle_effect(&fe, KeyResult::Reconnect, &app, &shell.drawing);
-                });
-            }
-            let quit = gtk4::Button::with_label("Quit");
-            {
-                let app = app.clone();
-                quit.connect_clicked(move |_| app.quit());
-            }
-            row.append(&reconnect);
-            row.append(&quit);
-            dialogs.modal.append(&row);
-            dialogs.modal.set_visible(true);
-        }
-        _ => {
-            dialogs.modal.set_visible(false);
-        }
+/// Surface a newly-set status message as a transient toast.
+fn update_toast(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
+    let msg = fe.borrow().core.mgr.status_msg().to_string();
+    if msg == *dialogs.last_status.borrow() {
+        return;
+    }
+    *dialogs.last_status.borrow_mut() = msg.clone();
+    if !msg.is_empty() {
+        shell.toasts.add_toast(adw::Toast::new(&msg));
     }
 }
 
-// ── HUD + metrics overlays (carried unchanged) ──
+// ── HUD ticker + metrics inspector dialog ──
 
 fn update_hud(hud: &GtkBox, core: &AppCore) {
     if !core.hud_visible {
@@ -761,16 +738,47 @@ fn update_hud(hud: &GtkBox, core: &AppCore) {
     hud.set_visible(true);
 }
 
-fn update_metrics(card: &GtkBox, core: &AppCore) {
-    if !core.metrics_overlay_visible {
-        card.set_visible(false);
-        return;
+/// Open/close the metrics inspector dialog from `metrics_overlay_visible`. The
+/// content is a snapshot at open time (the HUD is the live ticker); closing the
+/// dialog clears the flag.
+fn update_metrics_dialog(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
+    let show = fe.borrow().core.metrics_overlay_visible;
+    let open = dialogs.metrics_dialog.borrow().is_some();
+    if show && !open {
+        let dialog = adw::Dialog::builder()
+            .title("Metrics")
+            .content_width(560)
+            .content_height(440)
+            .build();
+        dialog.set_child(Some(&metrics_content(&fe.borrow().core)));
+        {
+            let fe = fe.clone();
+            let shell = shell.clone();
+            dialog.connect_closed(move |_| {
+                fe.borrow_mut().core.metrics_overlay_visible = false;
+                shell.drawing.grab_focus();
+            });
+        }
+        dialog.present(Some(&shell.window));
+        *dialogs.metrics_dialog.borrow_mut() = Some(dialog);
+    } else if !show
+        && open
+        && let Some(d) = dialogs.metrics_dialog.borrow_mut().take()
+    {
+        d.close();
     }
-    card.set_size_request(640, -1);
-    clear(card);
+}
+
+/// The metrics inspector body: connection identity, per-transport traffic, and
+/// the render summary, in a scrolled list using stock GTK style classes.
+fn metrics_content(core: &AppCore) -> ScrolledWindow {
+    let card = GtkBox::new(Orientation::Vertical, 4);
+    card.set_margin_top(12);
+    card.set_margin_bottom(12);
+    card.set_margin_start(12);
+    card.set_margin_end(12);
     let mgr = &core.mgr;
     let metrics = &mgr.metrics;
-    card.append(&label(" Metrics ", "kmux-overlay-title"));
 
     let conn = mgr
         .connection_id
@@ -778,23 +786,20 @@ fn update_metrics(card: &GtkBox, core: &AppCore) {
         .unwrap_or_else(|| "-".into());
     card.append(&label(
         &format!("pid {}   connection {conn}", std::process::id()),
-        "kmux-overlay-dim",
+        "dim-label",
     ));
     let sink = match metrics.sink_path() {
         Some(p) => format!("sink: {}", p.display()),
         None => "sink: (disabled)".to_string(),
     };
-    card.append(&label(&sink, "kmux-overlay-dim"));
+    card.append(&label(&sink, "dim-label"));
 
     let by_transport = metrics.network.snapshot_by_transport();
     if by_transport.is_empty() {
-        card.append(&label("(no transport traffic yet)", "kmux-overlay-dim"));
+        card.append(&label("(no transport traffic yet)", "dim-label"));
     } else {
         for (key, totals) in &by_transport {
-            card.append(&label(
-                &format!("{} {}", key.kind, key.address),
-                "kmux-overlay-title",
-            ));
+            card.append(&label(&format!("{} {}", key.kind, key.address), "heading"));
             card.append(&label(
                 &format!(
                     "   in {}  out {}   msgs {}/{}",
@@ -803,7 +808,7 @@ fn update_metrics(card: &GtkBox, core: &AppCore) {
                     totals.msgs_in,
                     totals.msgs_out,
                 ),
-                "kmux-hud-line",
+                "monospace",
             ));
         }
     }
@@ -815,16 +820,20 @@ fn update_metrics(card: &GtkBox, core: &AppCore) {
             "Render: net+apply {:.1}/{:.1}ms  apply {:.2}ms  batch {:.1}",
             snap.net_apply_avg_ms, snap.net_apply_max_ms, snap.apply_avg_ms, snap.batch_avg
         ),
-        "kmux-hud-line",
+        "monospace",
     ));
     card.append(&label(
         &format!(
             "Disc:{} Gap:{} Lag:{} Sync:{}",
             c.stale_discards, c.seqno_gaps, c.lag_events, c.resyncs
         ),
-        "kmux-hud-line",
+        "monospace",
     ));
-    card.set_visible(true);
+
+    let scroll = ScrolledWindow::new();
+    scroll.set_vexpand(true);
+    scroll.set_child(Some(&card));
+    scroll
 }
 
 fn fmt_bytes(n: u64) -> String {
