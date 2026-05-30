@@ -12,9 +12,9 @@
 
 mod convert;
 mod css;
+mod dialogs;
 mod header;
 mod input;
-mod overlays;
 mod prefs;
 mod render;
 mod shell;
@@ -242,7 +242,7 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     // shared grid. The modal overlays + HUD ride the shell's inner overlay until
     // they become native dialogs.
     let shell = shell::build(app, &drawing);
-    let overlays = Rc::new(overlays::build(&shell.overlay));
+    let dialogs = Rc::new(dialogs::build(&shell.overlay));
     header::wire(&shell, &fe, app);
     tabs::wire(&shell, &fe, app);
     sidebar::wire(&shell, &fe, app);
@@ -302,16 +302,16 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     header::sync(&shell, &fe);
     tabs::sync(&shell, &fe);
     sidebar::sync(&shell, &fe);
-    overlays::sync(&overlays, &fe, app, &drawing);
+    dialogs::sync(&dialogs, &shell, &fe, app);
 
-    // The pump: drain network channels, tick timers, sync the shell/overlays, redraw.
+    // The pump: drain network channels, tick timers, sync the shell/dialogs, redraw.
     {
         let fe = fe.clone();
         let shell = shell.clone();
-        let overlays = overlays.clone();
+        let dialogs = dialogs.clone();
         let app = app.clone();
         glib::timeout_add_local(PUMP_INTERVAL, move || {
-            pump(&fe, &shell, &overlays, &app);
+            pump(&fe, &shell, &dialogs, &app);
             glib::ControlFlow::Continue
         });
     }
@@ -333,7 +333,7 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
 fn pump(
     fe: &Rc<RefCell<Frontend>>,
     shell: &Rc<shell::Shell>,
-    overlays: &overlays::Overlays,
+    dialogs: &Rc<dialogs::Dialogs>,
     app: &Application,
 ) {
     let redraw = {
@@ -508,7 +508,7 @@ fn pump(
         header::sync(shell, fe);
         tabs::sync(shell, fe);
         sidebar::sync(shell, fe);
-        overlays::sync(overlays, fe, app, &shell.drawing);
+        dialogs::sync(dialogs, shell, fe, app);
         shell.drawing.queue_draw();
     }
 }

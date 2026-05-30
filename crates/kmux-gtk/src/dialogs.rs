@@ -1,0 +1,847 @@
+//! Native dialogs driven by `core.mode`.
+//!
+//! Each interactive modal is a real GTK/libadwaita widget rather than a
+//! hand-drawn box: the session/server/directory pickers and the `/`-command
+//! palette are `adw::Dialog`s hosting a `GtkSearchEntry` + `GtkListBox`;
+//! confirm-close and rename are `adw::AlertDialog`s; help is an `adw::Dialog`.
+//! `core.mode` stays the single source of truth: [`sync`] opens the dialog that
+//! matches the mode, reconciles its list against the picker query/activate
+//! methods, and closes it when the mode changes. Native text editing and list
+//! navigation replace the per-character action path.
+//!
+//! Connecting/disconnected and the HUD/metrics overlays are still drawn as boxes
+//! on the shell's overlay here; they become an `adw::Banner` / toast / metrics
+//! dialog in a later pass.
+
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use adw::prelude::*;
+use gtk4::{
+    Align, Box as GtkBox, Entry, EventControllerKey, Label, ListBox, ListBoxRow, Orientation,
+    ScrolledWindow, SearchEntry, SelectionMode, gdk, glib,
+};
+
+use kmux_app::core::{AppCore, KeyResult};
+use kmux_app::mode::{Action, Mode};
+use kmux_app::{cmd, mode};
+
+use crate::shell::Shell;
+use crate::{Frontend, handle_effect};
+
+/// Which native dialog corresponds to the current mode (the list-style ones
+/// share an `adw::Dialog` shape).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DialogKind {
+    SessionPicker,
+    ServerPicker,
+    DirPicker,
+    Command,
+    Confirm,
+    Rename,
+    Help,
+}
+
+impl DialogKind {
+    /// List-style dialogs (search entry + reconciled list) vs one-shot alerts.
+    fn is_list(self) -> bool {
+        matches!(
+            self,
+            DialogKind::SessionPicker
+                | DialogKind::ServerPicker
+                | DialogKind::DirPicker
+                | DialogKind::Command
+        )
+    }
+
+    fn from_mode(mode: &Mode) -> Option<Self> {
+        match mode {
+            Mode::SessionPicker => Some(DialogKind::SessionPicker),
+            Mode::ServerPicker => Some(DialogKind::ServerPicker),
+            Mode::DirectoryPicker => Some(DialogKind::DirPicker),
+            Mode::Command(_) => Some(DialogKind::Command),
+            Mode::ConfirmCloseSession { .. } => Some(DialogKind::Confirm),
+            Mode::RenameSession { .. } => Some(DialogKind::Rename),
+            Mode::Help => Some(DialogKind::Help),
+            _ => None,
+        }
+    }
+}
+
+/// A live native dialog plus the handles [`sync`] updates between ticks.
+struct LiveDialog {
+    kind: DialogKind,
+    dialog: adw::Dialog,
+    list: Option<ListBox>,
+}
+
+/// Persistent overlay boxes (transitional) + the live native dialog.
+pub struct Dialogs {
+    /// Connecting / disconnected box (still hand-drawn until the banner lands).
+    modal: GtkBox,
+    hud: GtkBox,
+    metrics: GtkBox,
+    modal_sig: RefCell<Option<String>>,
+    current: RefCell<Option<LiveDialog>>,
+    /// Content signature for the live list dialog so we only rebuild rows on a
+    /// real change (not every frame of terminal output).
+    list_sig: RefCell<Option<String>>,
+    /// Set while we mutate the list selection programmatically, so the row's
+    /// `selected` callback doesn't echo back.
+    syncing: Cell<bool>,
+}
+
+/// Build the transitional overlay boxes and add them to the shell overlay.
+pub fn build(overlay: &gtk4::Overlay) -> Dialogs {
+    let modal = GtkBox::new(Orientation::Vertical, 6);
+    modal.add_css_class("kmux-overlay");
+    modal.set_halign(Align::Center);
+    modal.set_valign(Align::Center);
+    modal.set_visible(false);
+    overlay.add_overlay(&modal);
+
+    let hud = GtkBox::new(Orientation::Vertical, 0);
+    hud.add_css_class("kmux-overlay");
+    hud.add_css_class("kmux-hud");
+    hud.set_halign(Align::End);
+    hud.set_valign(Align::Start);
+    hud.set_visible(false);
+    overlay.add_overlay(&hud);
+
+    let metrics = GtkBox::new(Orientation::Vertical, 0);
+    metrics.add_css_class("kmux-overlay");
+    metrics.set_halign(Align::Center);
+    metrics.set_valign(Align::Center);
+    metrics.set_visible(false);
+    overlay.add_overlay(&metrics);
+
+    Dialogs {
+        modal,
+        hud,
+        metrics,
+        modal_sig: RefCell::new(None),
+        current: RefCell::new(None),
+        list_sig: RefCell::new(None),
+        syncing: Cell::new(false),
+    }
+}
+
+/// Reconcile every dialog/overlay against `core`.
+pub fn sync(
+    dialogs: &Rc<Dialogs>,
+    shell: &Rc<Shell>,
+    fe: &Rc<RefCell<Frontend>>,
+    app: &gtk4::Application,
+) {
+    reconcile_native(dialogs, shell, fe, app);
+
+    let f = fe.borrow();
+    update_modal_box(dialogs, &f.core, fe, shell, app);
+    update_hud(&dialogs.hud, &f.core);
+    update_metrics(&dialogs.metrics, &f.core);
+}
+
+/// Open/close/refresh the live native dialog to match `core.mode`.
+fn reconcile_native(
+    dialogs: &Rc<Dialogs>,
+    shell: &Rc<Shell>,
+    fe: &Rc<RefCell<Frontend>>,
+    app: &gtk4::Application,
+) {
+    let target = DialogKind::from_mode(&fe.borrow().core.mode);
+    let cur = dialogs.current.borrow().as_ref().map(|d| d.kind);
+
+    if cur != target {
+        if let Some(live) = dialogs.current.borrow_mut().take() {
+            live.dialog.close();
+        }
+        dialogs.list_sig.borrow_mut().take();
+        if let Some(kind) = target {
+            let live = open_dialog(kind, dialogs, shell, fe, app);
+            *dialogs.current.borrow_mut() = Some(live);
+        }
+    }
+
+    // Refresh the list contents of a live picker/command dialog on change.
+    let is_list = dialogs
+        .current
+        .borrow()
+        .as_ref()
+        .is_some_and(|d| d.kind.is_list());
+    if is_list {
+        let sig = list_signature(&fe.borrow().core);
+        if dialogs.list_sig.borrow().as_deref() != Some(sig.as_str()) {
+            *dialogs.list_sig.borrow_mut() = Some(sig);
+            populate_list(dialogs, fe);
+        }
+    }
+}
+
+/// Build + present the dialog for `kind`.
+fn open_dialog(
+    kind: DialogKind,
+    dialogs: &Rc<Dialogs>,
+    shell: &Rc<Shell>,
+    fe: &Rc<RefCell<Frontend>>,
+    app: &gtk4::Application,
+) -> LiveDialog {
+    match kind {
+        DialogKind::Confirm => open_confirm(shell, fe),
+        DialogKind::Rename => open_rename(shell, fe),
+        DialogKind::Help => open_help(shell),
+        _ => open_list_dialog(kind, dialogs, shell, fe, app),
+    }
+}
+
+/// The shared picker/command dialog: a search entry over a scrolled list.
+fn open_list_dialog(
+    kind: DialogKind,
+    dialogs: &Rc<Dialogs>,
+    shell: &Rc<Shell>,
+    fe: &Rc<RefCell<Frontend>>,
+    app: &gtk4::Application,
+) -> LiveDialog {
+    let (title, placeholder, initial) = {
+        let core = &fe.borrow().core;
+        match kind {
+            DialogKind::SessionPicker => (
+                "Sessions",
+                "Filter sessions",
+                core.session_picker_search.clone(),
+            ),
+            DialogKind::ServerPicker => (
+                "Servers",
+                "Filter servers",
+                core.server_picker_search.clone(),
+            ),
+            DialogKind::DirPicker => ("Open session", "Directory…", core.dir_picker_buffer.clone()),
+            DialogKind::Command => ("Command", "Type a command", command_buffer(core)),
+            _ => unreachable!(),
+        }
+    };
+
+    let search = SearchEntry::new();
+    search.set_placeholder_text(Some(placeholder));
+    search.set_text(&initial);
+    // Keep the caret at the end so the seeded text is editable, not selected.
+    search.set_position(-1);
+
+    let list = ListBox::new();
+    list.set_selection_mode(SelectionMode::Single);
+    list.set_activate_on_single_click(true);
+    list.add_css_class("boxed-list");
+
+    let scroll = ScrolledWindow::new();
+    scroll.set_min_content_height(280);
+    scroll.set_vexpand(true);
+    scroll.set_child(Some(&list));
+
+    let content = GtkBox::new(Orientation::Vertical, 8);
+    content.set_margin_top(8);
+    content.set_margin_bottom(8);
+    content.set_margin_start(8);
+    content.set_margin_end(8);
+    content.append(&search);
+    content.append(&scroll);
+
+    let dialog = adw::Dialog::builder()
+        .title(title)
+        .content_width(460)
+        .content_height(420)
+        .build();
+    dialog.set_child(Some(&content));
+
+    // Search text → core filter (the pump repopulates the list).
+    {
+        let fe = fe.clone();
+        let shell = shell.clone();
+        search.connect_search_changed(move |e| {
+            let text = e.text().to_string();
+            {
+                let mut f = fe.borrow_mut();
+                set_search(&mut f.core, text);
+                f.core.needs_render = true;
+            }
+            shell.drawing.queue_draw();
+        });
+    }
+
+    // Up/Down move the selection; Enter activates; Esc closes (default).
+    {
+        let fe = fe.clone();
+        let shell = shell.clone();
+        let app = app.clone();
+        let keys = EventControllerKey::new();
+        keys.connect_key_pressed(move |_c, keyval, _code, _mods| {
+            let nav = match keyval {
+                gdk::Key::Up => Some(false),
+                gdk::Key::Down => Some(true),
+                _ => None,
+            };
+            if let Some(down) = nav {
+                let mut f = fe.borrow_mut();
+                move_selection(&mut f.core, down);
+                f.core.needs_render = true;
+                return glib::Propagation::Stop;
+            }
+            if matches!(keyval, gdk::Key::Return | gdk::Key::KP_Enter) {
+                activate_current(&fe, &shell, &app);
+                return glib::Propagation::Stop;
+            }
+            glib::Propagation::Proceed
+        });
+        search.add_controller(keys);
+    }
+
+    // Click a row → select + activate.
+    {
+        let fe = fe.clone();
+        let shell = shell.clone();
+        let app = app.clone();
+        let dialogs = dialogs.clone();
+        list.connect_row_activated(move |_lb, row| {
+            if dialogs.syncing.get() {
+                return;
+            }
+            let idx = row.index();
+            if idx < 0 {
+                return;
+            }
+            {
+                let mut f = fe.borrow_mut();
+                f.core.set_picker_selected(idx as usize);
+            }
+            activate_current(&fe, &shell, &app);
+        });
+    }
+
+    // Dismissed (Esc / click-away) → return the mode to Normal so AppCore stays
+    // in sync; guard against the close we trigger ourselves on activation.
+    {
+        let fe = fe.clone();
+        let shell = shell.clone();
+        dialog.connect_closed(move |_| {
+            let mut f = fe.borrow_mut();
+            if DialogKind::from_mode(&f.core.mode).is_some_and(|k| k.is_list()) {
+                f.core.mode = Mode::Normal;
+                f.core.needs_render = true;
+            }
+            drop(f);
+            shell.drawing.queue_draw();
+        });
+    }
+
+    dialog.present(Some(&shell.window));
+    search.grab_focus();
+    LiveDialog {
+        kind,
+        dialog: dialog.clone(),
+        list: Some(list),
+    }
+}
+
+/// Rebuild the live list dialog's rows + selection from `core`.
+fn populate_list(dialogs: &Rc<Dialogs>, fe: &Rc<RefCell<Frontend>>) {
+    let cur = dialogs.current.borrow();
+    let Some(live) = cur.as_ref() else {
+        return;
+    };
+    let Some(list) = &live.list else {
+        return;
+    };
+    let (rows, selected) = {
+        let core = &fe.borrow().core;
+        list_rows(live.kind, core)
+    };
+
+    dialogs.syncing.set(true);
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    for label in &rows {
+        let row = ListBoxRow::new();
+        let lbl = Label::new(Some(label));
+        lbl.set_halign(Align::Start);
+        lbl.set_xalign(0.0);
+        lbl.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+        lbl.set_margin_top(4);
+        lbl.set_margin_bottom(4);
+        lbl.set_margin_start(8);
+        lbl.set_margin_end(8);
+        row.set_child(Some(&lbl));
+        list.append(&row);
+    }
+    if let Some(row) = list.row_at_index(selected as i32) {
+        list.select_row(Some(&row));
+    }
+    dialogs.syncing.set(false);
+}
+
+/// Row labels + selected index for a list dialog.
+fn list_rows(kind: DialogKind, core: &AppCore) -> (Vec<String>, usize) {
+    match kind {
+        DialogKind::SessionPicker => {
+            let mut rows = vec!["＋  New session…".to_string()];
+            for e in core.session_picker_matches().iter().take(50) {
+                let name = core.mgr.display_name_for(&e.meta.word_id);
+                rows.push(format!("{name}    {}p    {}", e.panes.len(), e.meta.cwd));
+            }
+            let sel = core
+                .session_picker_selected
+                .min(rows.len().saturating_sub(1));
+            (rows, sel)
+        }
+        DialogKind::ServerPicker => {
+            let rows: Vec<String> = core
+                .filtered_servers()
+                .iter()
+                .take(50)
+                .map(|s| format!("{}    {}s    {}", s.display, s.sessions.len(), s.time_ago()))
+                .collect();
+            let sel = core
+                .server_picker_selected
+                .min(rows.len().saturating_sub(1));
+            (rows, sel)
+        }
+        DialogKind::DirPicker => {
+            let rows: Vec<String> = core
+                .dir_picker_matches()
+                .iter()
+                .take(50)
+                .map(|e| {
+                    let name = core.mgr.display_name_for(&e.meta.word_id);
+                    format!("{name}    {}", e.meta.cwd)
+                })
+                .collect();
+            let sel = core.dir_picker_selected.min(rows.len().saturating_sub(1));
+            (rows, sel)
+        }
+        DialogKind::Command => {
+            let hints = cmd::hint::build_hints(core);
+            let sel = command_selected(core).min(hints.len().saturating_sub(1));
+            let rows = hints
+                .iter()
+                .map(|h| format!("{}    {}", h.display.trim_end(), h.summary))
+                .collect();
+            (rows, sel)
+        }
+        _ => (Vec::new(), 0),
+    }
+}
+
+/// Signature of the list dialog's contents (mode buffer + selection + matches).
+fn list_signature(core: &AppCore) -> String {
+    match DialogKind::from_mode(&core.mode) {
+        Some(DialogKind::SessionPicker) => format!(
+            "se|{}|{}|{}",
+            core.session_picker_search,
+            core.session_picker_selected,
+            core.session_picker_matches().len()
+        ),
+        Some(DialogKind::ServerPicker) => format!(
+            "sv|{}|{}|{}",
+            core.server_picker_search,
+            core.server_picker_selected,
+            core.filtered_servers().len()
+        ),
+        Some(DialogKind::DirPicker) => format!(
+            "dir|{}|{}|{}",
+            core.dir_picker_buffer,
+            core.dir_picker_selected,
+            core.dir_picker_matches().len()
+        ),
+        Some(DialogKind::Command) => {
+            format!("cmd|{}|{}", command_buffer(core), command_selected(core))
+        }
+        _ => String::new(),
+    }
+}
+
+/// Set the active filter text for the open list dialog.
+fn set_search(core: &mut AppCore, text: String) {
+    if matches!(core.mode, Mode::Command(_)) {
+        set_command_buffer(core, text);
+    } else {
+        core.set_picker_search(text);
+    }
+}
+
+/// Move the selection in the open list dialog (true = down).
+fn move_selection(core: &mut AppCore, down: bool) {
+    let action = match (DialogKind::from_mode(&core.mode), down) {
+        (Some(DialogKind::SessionPicker), true) => Action::PickerDown,
+        (Some(DialogKind::SessionPicker), false) => Action::PickerUp,
+        (Some(DialogKind::ServerPicker), true) => Action::ServerPickerDown,
+        (Some(DialogKind::ServerPicker), false) => Action::ServerPickerUp,
+        (Some(DialogKind::DirPicker), true) => Action::DirPickerDown,
+        (Some(DialogKind::DirPicker), false) => Action::DirPickerUp,
+        (Some(DialogKind::Command), true) => Action::CommandHintDown,
+        (Some(DialogKind::Command), false) => Action::CommandHintUp,
+        _ => return,
+    };
+    let _ = futures::executor::block_on(core.dispatch_action(action));
+}
+
+/// Activate the current selection of the open list dialog.
+fn activate_current(fe: &Rc<RefCell<Frontend>>, shell: &Rc<Shell>, app: &gtk4::Application) {
+    let result = {
+        let mut f = fe.borrow_mut();
+        let r = match f.core.mode {
+            Mode::DirectoryPicker => {
+                futures::executor::block_on(f.core.dispatch_action(Action::DirPickerSubmit))
+            }
+            Mode::Command(_) => {
+                futures::executor::block_on(f.core.dispatch_action(Action::CommandSubmit))
+            }
+            _ => f
+                .core
+                .activate_picker_selection()
+                .unwrap_or(KeyResult::Continue),
+        };
+        f.core.needs_render = true;
+        r
+    };
+    handle_effect(fe, result, app, &shell.drawing);
+    shell.drawing.queue_draw();
+}
+
+// ── Command-buffer helpers (the buffer lives in Mode::Command(state)) ──
+
+fn command_buffer(core: &AppCore) -> String {
+    match &core.mode {
+        Mode::Command(s) => s.buffer.clone(),
+        _ => String::new(),
+    }
+}
+
+fn command_selected(core: &AppCore) -> usize {
+    match &core.mode {
+        Mode::Command(s) => s.selected,
+        _ => 0,
+    }
+}
+
+/// Replace the command buffer from a native entry (no per-char actions).
+fn set_command_buffer(core: &mut AppCore, text: String) {
+    if let Mode::Command(s) = &mut core.mode {
+        s.cursor = text.len();
+        s.buffer = text;
+        s.selected = 0;
+        s.history_pos = None;
+    }
+}
+
+// ── One-shot alert dialogs ──
+
+fn open_confirm(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
+    let name = {
+        let core = &fe.borrow().core;
+        match &core.mode {
+            Mode::ConfirmCloseSession { word_id } => core.mgr.display_name_for(word_id),
+            _ => String::new(),
+        }
+    };
+    let dialog = adw::AlertDialog::new(
+        Some("Close session?"),
+        Some(&format!("“{name}” and all its panes will be closed.")),
+    );
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("close", "Close");
+    dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    {
+        let fe = fe.clone();
+        let shell = shell.clone();
+        dialog.connect_response(None, move |_d, resp| {
+            let action = if resp == "close" {
+                Action::ConfirmCloseYes
+            } else {
+                Action::ExitToNormal
+            };
+            {
+                let mut f = fe.borrow_mut();
+                let _ = futures::executor::block_on(f.core.dispatch_action(action));
+                f.core.needs_render = true;
+            }
+            shell.drawing.queue_draw();
+        });
+    }
+    dialog.present(Some(&shell.window));
+    LiveDialog {
+        kind: DialogKind::Confirm,
+        dialog: dialog.upcast(),
+        list: None,
+    }
+}
+
+fn open_rename(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
+    let current = {
+        let core = &fe.borrow().core;
+        match &core.mode {
+            Mode::RenameSession { buffer, .. } => buffer.clone(),
+            _ => String::new(),
+        }
+    };
+    let entry = Entry::new();
+    entry.set_text(&current);
+    entry.set_activates_default(true);
+
+    let dialog = adw::AlertDialog::new(Some("Rename session"), None);
+    dialog.set_extra_child(Some(&entry));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("rename", "Rename");
+    dialog.set_response_appearance("rename", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("rename"));
+    dialog.set_close_response("cancel");
+    {
+        let fe = fe.clone();
+        let shell = shell.clone();
+        let entry = entry.clone();
+        dialog.connect_response(None, move |_d, resp| {
+            {
+                let mut f = fe.borrow_mut();
+                if resp == "rename" {
+                    if let Mode::RenameSession { buffer, .. } = &mut f.core.mode {
+                        *buffer = entry.text().to_string();
+                    }
+                    let _ =
+                        futures::executor::block_on(f.core.dispatch_action(Action::RenameSubmit));
+                } else {
+                    let _ =
+                        futures::executor::block_on(f.core.dispatch_action(Action::ExitToNormal));
+                }
+                f.core.needs_render = true;
+            }
+            shell.drawing.queue_draw();
+        });
+    }
+    dialog.present(Some(&shell.window));
+    LiveDialog {
+        kind: DialogKind::Rename,
+        dialog: dialog.upcast(),
+        list: None,
+    }
+}
+
+fn open_help(shell: &Rc<Shell>) -> LiveDialog {
+    let text: String = mode::help_entries()
+        .iter()
+        .map(|(k, d)| {
+            if d.is_empty() {
+                format!("{k}\n")
+            } else {
+                format!("  {k:<16}{d}\n")
+            }
+        })
+        .collect();
+    let body = Label::new(Some(text.trim_end()));
+    body.set_halign(Align::Start);
+    body.set_valign(Align::Start);
+    body.set_xalign(0.0);
+    body.add_css_class("monospace");
+    body.set_margin_top(12);
+    body.set_margin_bottom(12);
+    body.set_margin_start(12);
+    body.set_margin_end(12);
+    let scroll = ScrolledWindow::new();
+    scroll.set_vexpand(true);
+    scroll.set_child(Some(&body));
+
+    let dialog = adw::Dialog::builder()
+        .title("Help")
+        .content_width(560)
+        .content_height(520)
+        .build();
+    dialog.set_child(Some(&scroll));
+    dialog.present(Some(&shell.window));
+    LiveDialog {
+        kind: DialogKind::Help,
+        dialog: dialog.upcast(),
+        list: None,
+    }
+}
+
+// ── Transitional overlay boxes (connecting / disconnected) ──
+
+fn clear(b: &GtkBox) {
+    while let Some(child) = b.first_child() {
+        b.remove(&child);
+    }
+}
+
+fn update_modal_box(
+    dialogs: &Rc<Dialogs>,
+    core: &AppCore,
+    fe: &Rc<RefCell<Frontend>>,
+    shell: &Rc<Shell>,
+    app: &gtk4::Application,
+) {
+    let sig = format!("{:?}", core.mode);
+    if dialogs.modal_sig.borrow().as_deref() == Some(sig.as_str()) {
+        return;
+    }
+    *dialogs.modal_sig.borrow_mut() = Some(sig);
+
+    clear(&dialogs.modal);
+    match &core.mode {
+        Mode::Connecting { target_display } => {
+            dialogs
+                .modal
+                .append(&label("Connecting…", "kmux-overlay-title"));
+            dialogs
+                .modal
+                .append(&label(target_display, "kmux-overlay-dim"));
+            dialogs.modal.set_visible(true);
+        }
+        Mode::Disconnected { reason } => {
+            dialogs
+                .modal
+                .append(&label("Disconnected", "kmux-overlay-title"));
+            dialogs.modal.append(&label(reason, "kmux-overlay-error"));
+            let row = GtkBox::new(Orientation::Horizontal, 8);
+            let reconnect = gtk4::Button::with_label("Reconnect");
+            {
+                let fe = fe.clone();
+                let shell = shell.clone();
+                let app = app.clone();
+                reconnect.connect_clicked(move |_| {
+                    handle_effect(&fe, KeyResult::Reconnect, &app, &shell.drawing);
+                });
+            }
+            let quit = gtk4::Button::with_label("Quit");
+            {
+                let app = app.clone();
+                quit.connect_clicked(move |_| app.quit());
+            }
+            row.append(&reconnect);
+            row.append(&quit);
+            dialogs.modal.append(&row);
+            dialogs.modal.set_visible(true);
+        }
+        _ => {
+            dialogs.modal.set_visible(false);
+        }
+    }
+}
+
+// ── HUD + metrics overlays (carried unchanged) ──
+
+fn update_hud(hud: &GtkBox, core: &AppCore) {
+    if !core.hud_visible {
+        hud.set_visible(false);
+        return;
+    }
+    clear(hud);
+    let snap = core.mgr.metrics.snapshot(core.force_snapshot_mode);
+    let c = &snap.counters;
+    let lines = [
+        format!(
+            "Net+Apply: {:.1}ms avg / {:.1}ms max",
+            snap.net_apply_avg_ms, snap.net_apply_max_ms
+        ),
+        format!("Apply:     {:.2}ms avg", snap.apply_avg_ms),
+        format!("Batch:     {:.1} msgs avg", snap.batch_avg),
+        format!("Diff:      {} ops", snap.last_diff_ops),
+        format!("LargeDiff: {:.1}ms", snap.last_large_diff_ms),
+        format!(
+            "Snapshot:  {}",
+            if snap.snapshot_mode { "FORCED" } else { "off" }
+        ),
+        format!(
+            "Disc:{} Gap:{} Lag:{} Sync:{}",
+            c.stale_discards, c.seqno_gaps, c.lag_events, c.resyncs
+        ),
+    ];
+    for line in lines {
+        hud.append(&label(&line, "kmux-hud-line"));
+    }
+    hud.set_visible(true);
+}
+
+fn update_metrics(card: &GtkBox, core: &AppCore) {
+    if !core.metrics_overlay_visible {
+        card.set_visible(false);
+        return;
+    }
+    card.set_size_request(640, -1);
+    clear(card);
+    let mgr = &core.mgr;
+    let metrics = &mgr.metrics;
+    card.append(&label(" Metrics ", "kmux-overlay-title"));
+
+    let conn = mgr
+        .connection_id
+        .map(|c| c.0.to_string())
+        .unwrap_or_else(|| "-".into());
+    card.append(&label(
+        &format!("pid {}   connection {conn}", std::process::id()),
+        "kmux-overlay-dim",
+    ));
+    let sink = match metrics.sink_path() {
+        Some(p) => format!("sink: {}", p.display()),
+        None => "sink: (disabled)".to_string(),
+    };
+    card.append(&label(&sink, "kmux-overlay-dim"));
+
+    let by_transport = metrics.network.snapshot_by_transport();
+    if by_transport.is_empty() {
+        card.append(&label("(no transport traffic yet)", "kmux-overlay-dim"));
+    } else {
+        for (key, totals) in &by_transport {
+            card.append(&label(
+                &format!("{} {}", key.kind, key.address),
+                "kmux-overlay-title",
+            ));
+            card.append(&label(
+                &format!(
+                    "   in {}  out {}   msgs {}/{}",
+                    fmt_bytes(totals.bytes_in),
+                    fmt_bytes(totals.bytes_out),
+                    totals.msgs_in,
+                    totals.msgs_out,
+                ),
+                "kmux-hud-line",
+            ));
+        }
+    }
+
+    let snap = metrics.snapshot(core.force_snapshot_mode);
+    let c = &snap.counters;
+    card.append(&label(
+        &format!(
+            "Render: net+apply {:.1}/{:.1}ms  apply {:.2}ms  batch {:.1}",
+            snap.net_apply_avg_ms, snap.net_apply_max_ms, snap.apply_avg_ms, snap.batch_avg
+        ),
+        "kmux-hud-line",
+    ));
+    card.append(&label(
+        &format!(
+            "Disc:{} Gap:{} Lag:{} Sync:{}",
+            c.stale_discards, c.seqno_gaps, c.lag_events, c.resyncs
+        ),
+        "kmux-hud-line",
+    ));
+    card.set_visible(true);
+}
+
+fn fmt_bytes(n: u64) -> String {
+    const K: f64 = 1024.0;
+    let n = n as f64;
+    if n < K {
+        format!("{n:.0}B")
+    } else if n < K * K {
+        format!("{:.1}KB", n / K)
+    } else if n < K * K * K {
+        format!("{:.1}MB", n / (K * K))
+    } else {
+        format!("{:.1}GB", n / (K * K * K))
+    }
+}
+
+fn label(text: &str, css: &str) -> Label {
+    let l = Label::new(Some(text));
+    l.add_css_class(css);
+    l.set_halign(Align::Start);
+    l
+}

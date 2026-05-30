@@ -531,6 +531,29 @@ impl AppCore {
         }
     }
 
+    /// Set the active picker's search/filter text in one shot (from a native text
+    /// entry that owns its own editing), resetting the selection to the first row
+    /// — the same reset the per-keystroke `PickerSearchChar`/`DirPickerChar`
+    /// actions perform. No-op when no picker is open. Lets a GUI drive the
+    /// pickers without routing every character through the action path.
+    pub fn set_picker_search(&mut self, text: String) {
+        match self.mode {
+            Mode::SessionPicker => {
+                self.session_picker_search = text;
+                self.session_picker_selected = 0;
+            }
+            Mode::ServerPicker => {
+                self.server_picker_search = text;
+                self.server_picker_selected = 0;
+            }
+            Mode::DirectoryPicker => {
+                self.dir_picker_buffer = text;
+                self.dir_picker_selected = 0;
+            }
+            _ => {}
+        }
+    }
+
     /// Activate the current picker's selection (a click on a list item). Mirrors
     /// the keyboard Enter path but performs its own mode transition because it
     /// does not pass through `mode::resolve`. Returns a [`KeyResult`] only for
@@ -684,6 +707,39 @@ mod tests {
         core.set_picker_selected(9);
         assert_eq!(core.session_picker_selected, 2);
         assert_eq!(core.server_picker_selected, 3);
+    }
+
+    #[test]
+    fn set_picker_search_targets_active_picker_and_resets_selection() {
+        let mut core = fixture_core();
+
+        core.mode = Mode::SessionPicker;
+        core.session_picker_selected = 5;
+        core.set_picker_search("foo".into());
+        assert_eq!(core.session_picker_search, "foo");
+        assert_eq!(core.session_picker_selected, 0);
+
+        core.mode = Mode::ServerPicker;
+        core.server_picker_selected = 3;
+        core.set_picker_search("bar".into());
+        assert_eq!(core.server_picker_search, "bar");
+        assert_eq!(core.server_picker_selected, 0);
+
+        core.mode = Mode::DirectoryPicker;
+        core.dir_picker_selected = 2;
+        core.set_picker_search("/tmp".into());
+        assert_eq!(core.dir_picker_buffer, "/tmp");
+        assert_eq!(core.dir_picker_selected, 0);
+    }
+
+    #[test]
+    fn set_picker_search_is_noop_outside_a_picker() {
+        let mut core = fixture_core();
+        core.mode = Mode::Normal;
+        core.set_picker_search("x".into());
+        assert!(core.session_picker_search.is_empty());
+        assert!(core.server_picker_search.is_empty());
+        assert!(core.dir_picker_buffer.is_empty());
     }
 
     #[test]
