@@ -90,6 +90,11 @@ pub struct CursorState {
     pub col: u16,
     pub shape: CursorShape,
     pub visible: bool,
+    /// Whether the inner program requested a blinking cursor (DECSCUSR
+    /// `blinking_*` / DEC private mode 12). Rendering the blink is the
+    /// frontend's job; this only carries the request so a steady cursor
+    /// (DECSCUSR `steady_*`) is not blinked.
+    pub blink: bool,
 }
 
 impl Default for CursorState {
@@ -99,6 +104,7 @@ impl Default for CursorState {
             col: 0,
             shape: CursorShape::Block,
             visible: true,
+            blink: false,
         }
     }
 }

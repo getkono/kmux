@@ -95,6 +95,7 @@ pub fn render(
     metrics: &Metrics,
     width: i32,
     height: i32,
+    cursor_phase: bool,
 ) {
     let palette = &core.palette;
     src(cr, palette.bg.r, palette.bg.g, palette.bg.b);
@@ -177,9 +178,12 @@ pub fn render(
     }
 
     // Cursor only renders against the live screen (not while scrolled back).
+    // A blinking cursor (DECSCUSR `blinking_*`) is shown only on the "on" half
+    // of the blink cycle; a steady cursor is always shown.
     if scroll_offset == 0 {
         let cursor = grid.cursor();
-        if cursor.visible && cursor.shape != CursorShape::Hidden {
+        if cursor.visible && cursor.shape != CursorShape::Hidden && (!cursor.blink || cursor_phase)
+        {
             draw_cursor(cr, &layout, metrics, palette, cells, cols, rows, cursor);
         }
     }

@@ -460,6 +460,7 @@ fn convert_cursor(c: &sys::KmuxCursor) -> CursorState {
         col: c.col,
         shape,
         visible: c.visible != 0,
+        blink: c.blink != 0,
     }
 }
 
@@ -859,6 +860,21 @@ mod tests {
         term.fill_cells(&mut out).unwrap();
         let s: String = out[..5].iter().map(|c| c.c).collect();
         assert_eq!(s, "hello");
+    }
+
+    #[test]
+    fn cursor_reports_decscusr_blink_request() {
+        let mut term = GhosttyTerm::new(size(4, 20), 1000, Arc::new(NullSink)).unwrap();
+        // Blinking bar (DECSCUSR 5): bar shape, blink requested.
+        term.feed(b"\x1b[5 q").unwrap();
+        let c = term.cursor();
+        assert_eq!(c.shape, CursorShape::Bar);
+        assert!(c.blink, "DECSCUSR 5 should request a blinking cursor");
+        // Steady bar (DECSCUSR 6): bar shape, no blink.
+        term.feed(b"\x1b[6 q").unwrap();
+        let c = term.cursor();
+        assert_eq!(c.shape, CursorShape::Bar);
+        assert!(!c.blink, "DECSCUSR 6 should request a steady cursor");
     }
 
     #[test]

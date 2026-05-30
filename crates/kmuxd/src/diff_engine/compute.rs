@@ -198,6 +198,20 @@ mod tests {
     }
 
     #[test]
+    fn blink_change_without_cell_change_produces_cursor_only() {
+        let mut engine = mock_engine(24, 80);
+        let _ = engine.compute_diff(); // consume initial (blink defaults to false)
+
+        // A bare DECSCUSR steady→blinking toggle changes only the blink flag;
+        // it must still reach the client as a cursor-only diff.
+        engine.backend.cursor_state.blink = true;
+        let DiffResult::CursorOnly { cursor, .. } = engine.compute_diff() else {
+            panic!("expected CursorOnly");
+        };
+        assert!(cursor.blink, "blink flag propagates in a cursor-only diff");
+    }
+
+    #[test]
     fn mode_change_without_cell_change_produces_cursor_only() {
         let mut engine = mock_engine(24, 80);
         let _ = engine.compute_diff(); // consume initial
