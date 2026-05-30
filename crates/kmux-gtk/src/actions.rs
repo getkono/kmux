@@ -20,10 +20,11 @@ use kmux_app::mode::{Action, CommandState, Mode};
 use crate::shell::Shell;
 use crate::{Frontend, handle_effect, prefs};
 
-/// Install every action + accelerator + the primary menu. Called once.
-pub fn install(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application) {
-    // Actions that dispatch a shared `Action` verbatim, with their accelerators.
-    let dispatched: &[(&str, Action, &[&str])] = &[
+/// The (`win.` name, dispatched `Action`, accelerators) table for the actions
+/// that map straight onto a shared [`Action`]. Pure data, shared by [`install`]
+/// and the tests. Reserved combos avoid keys the inner terminal needs.
+fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
+    vec![
         ("new-pane", Action::CreatePane, &["<Ctrl><Shift>t"]),
         ("close-pane", Action::ClosePane, &["<Ctrl><Shift>q"]),
         ("next-pane", Action::NextPane, &["<Ctrl><Shift>Right"]),
@@ -60,9 +61,18 @@ pub fn install(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application)
         ("signal-kill", Action::SendSignal(9), &[]),
         ("signal-stop", Action::SendSignal(19), &[]),
         ("signal-cont", Action::SendSignal(18), &[]),
-    ];
-    for (name, action, accels) in dispatched {
-        add_dispatch(shell, fe, app, name, action.clone());
+    ]
+}
+
+/// The `Action` a `jump-session-N` accelerator dispatches (N is 1-based).
+fn jump_action(n: u8) -> Action {
+    Action::JumpToSession(n.saturating_sub(1) as usize)
+}
+
+/// Install every action + accelerator + the primary menu. Called once.
+pub fn install(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application) {
+    for (name, action, accels) in dispatched_specs() {
+        add_dispatch(shell, fe, app, name, action);
         if !accels.is_empty() {
             app.set_accels_for_action(&format!("win.{name}"), accels);
         }
@@ -71,13 +81,7 @@ pub fn install(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application)
     // Jump to session 1..9.
     for n in 1..=9u8 {
         let name = format!("jump-session-{n}");
-        add_dispatch(
-            shell,
-            fe,
-            app,
-            &name,
-            Action::JumpToSession((n - 1) as usize),
-        );
+        add_dispatch(shell, fe, app, &name, jump_action(n));
         let accel = format!("<Ctrl>{n}");
         app.set_accels_for_action(&format!("win.{name}"), &[&accel]);
     }
@@ -291,3 +295,55 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
   </object>
 </interface>
 "#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Look up the `Action` a dispatched accelerator maps to.
+    fn action_for(name: &str) -> Option<Action> {
+        dispatched_specs()
+            .into_iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, a, _)| a)
+    }
+
+    #[test]
+    fn signal_actions_use_posix_numbers() {
+        assert_eq!(action_for("signal-term"), Some(Action::SendSignal(15)));
+        assert_eq!(action_for("signal-kill"), Some(Action::SendSignal(9)));
+        assert_eq!(action_for("signal-stop"), Some(Action::SendSignal(19)));
+        assert_eq!(action_for("signal-cont"), Some(Action::SendSignal(18)));
+    }
+
+    #[test]
+    fn jump_session_accelerator_is_zero_based() {
+        assert_eq!(jump_action(1), Action::JumpToSession(0));
+        assert_eq!(jump_action(3), Action::JumpToSession(2));
+        assert_eq!(jump_action(9), Action::JumpToSession(8));
+    }
+
+    #[test]
+    fn core_commands_are_registered_with_expected_actions() {
+        assert_eq!(action_for("new-pane"), Some(Action::CreatePane));
+        assert_eq!(action_for("close-pane"), Some(Action::ClosePane));
+        assert_eq!(action_for("next-session"), Some(Action::NextSession));
+        assert_eq!(action_for("copy"), Some(Action::CopySelection));
+        assert_eq!(action_for("paste"), Some(Action::Paste));
+        assert_eq!(action_for("reconnect"), Some(Action::Reconnect));
+    }
+
+    #[test]
+    fn every_dispatched_action_has_a_unique_name() {
+        let specs = dispatched_specs();
+        let mut names: Vec<&str> = specs.iter().map(|(n, _, _)| *n).collect();
+        names.sort_unstable();
+        let count = names.len();
+        names.dedup();
+        assert_eq!(
+            names.len(),
+            count,
+            "duplicate action name in dispatched_specs"
+        );
+    }
+}

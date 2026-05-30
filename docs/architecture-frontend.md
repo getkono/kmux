@@ -42,12 +42,17 @@ loop, a terminal, or a widget. Each frontend *pumps* it.
 
 The contract a frontend implements:
 
-- **Input in** (toolkit-agnostic): `handle_key`-style flow — convert the
-  toolkit's key event to `kmux_client::key::{Key, Modifiers}`, call
-  `kmux_app::mode::resolve(&core.mode, &key, mods)` to get the next `Mode` +
-  `Action`, then `core.dispatch_action(action)`. Plus `core.set_term_size(size)`
-  whenever the content area resizes (the frontend reports its geometry — the
-  core never queries a terminal).
+- **Input in** (toolkit-agnostic): the frontend produces an `Action` and calls
+  `core.dispatch_action(action)` — the single entry point. *How* a frontend
+  produces actions is its own choice. The TUI uses the modal keymap: convert the
+  crossterm event to `kmux_client::key::{Key, Modifiers}`, call
+  `kmux_app::mode::resolve(&core.mode, &key, mods)` for the next `Mode` +
+  `Action`. The GTK frontend is **accelerators-only**: native GTK accelerators,
+  menu items, and widgets bind straight to `Action`s / `TopBarAction`s (it does
+  *not* call `mode::resolve`), and any key the accelerators don't claim is
+  forwarded to the PTY. Plus `core.set_term_size(size)` whenever the content
+  area resizes (the frontend reports its geometry — the core never queries a
+  terminal).
 - **State out** (no toolkit types): read `core.mode`, `core.palette` (convert to
   your color type at the render leaf), `core.mgr.active_grid()` (the `CellGrid`
   to paint), `core.hud_visible`, the picker fields, etc.
@@ -64,7 +69,9 @@ The contract a frontend implements:
 
 The TUI pumps `AppCore` from a `tokio::select!` loop (`kmux-tui/src/app/
 event_loop.rs`); the GTK frontend pumps it from a `glib` timeout
-(`kmux-gtk/src/main.rs::pump`). Only the pump and the render leaf differ.
+(`kmux-gtk/src/main.rs::pump`). The pump, the render leaf, and how each frontend
+produces `Action`s (modal keymap vs. native accelerators/widgets) differ; the
+core is identical.
 
 ## Theme: one palette, per-frontend colors
 
@@ -147,23 +154,47 @@ command on Linux; preferences (theme + font) open with **Ctrl+,**.
 
 ## Status
 
-The GTK GUI (`kmux`) has reached feature parity with the TUI and is the
-**primary** client on Linux. It drives `AppCore` through the same contract as
-the TUI; only the pump and the render/input leaves are GTK-specific:
+The GTK GUI (`kmux`) is the **primary** client on Linux and is a *native*
+libadwaita app — only the terminal panes are drawn like a terminal; everything
+around them uses native widgets. It drives `AppCore` through the same contract
+as the TUI; the GTK-specific parts are the pump, the render leaf, and the native
+widget mapping:
 
 - Full Pango grid rendering — text attributes, wide chars, cursor shapes, and
-  scrollback — at font-derived cell metrics (`kmux-gtk/src/render.rs`).
-- Structured key forwarding (the daemon's Ghostty encoder), and a `glib` pump
-  that mirrors every arm of the TUI's `tokio::select!`: reconnect, server
-  switch, SSH supervisor, transport upgrade, tunnel death, liveness ping +
-  timeout, metrics flush, resize debounce, plus async clipboard paste.
-- Native chrome (session/status/hint bars) and overlays (session/server/dir
-  pickers, command palette, help, confirm-close, rename, connecting/
-  disconnected, HUD, metrics) as views of `AppCore` state.
+  scrollback — at font-derived cell metrics (`render.rs`). One shared
+  `DrawingArea` is reparented into the active pane's tab.
+- **Native chrome** (`shell.rs`): an `adw::HeaderBar` (server/session title,
+  connection-status indicator, server-switch, command-palette, primary menu); a
+  collapsible **sessions sidebar** (`adw::OverlaySplitView` + `GtkListBox`,
+  `sidebar.rs`); and a **pane tab strip** (`adw::TabBar`/`TabView`, `tabs.rs`).
+  Sessions and panes are reconciled against `AppCore` each pump tick (cheap
+  per-region signatures); selecting/closing routes through `TopBarAction` /
+  `Action`. Panes map to tabs because the protocol streams only the active grid.
+- **Accelerators-only keyboard** (`actions.rs`): every command the TUI reaches
+  via `Ctrl+G` chords is a `gio` action bound to a reserved accelerator
+  (`Ctrl+Shift+…`, function keys, `Ctrl+digit`), surfaced in a hamburger menu
+  and a `GtkShortcutsWindow`; the key controller on the focused terminal
+  forwards everything the accelerators don't claim to the PTY. The modal chord
+  path is not used in the GUI (the TUI keeps it as the regression oracle).
+- **Native dialogs** (`dialogs.rs`), all driven by `core.mode`: session/server/
+  directory pickers and the `/`-command palette as `adw::Dialog`s (search entry
+  + reconciled list); confirm-close/rename as `adw::AlertDialog`s; connecting/
+  disconnected as an `adw::Banner`; status messages as `adw::Toast`s; the
+  metrics inspector as an `adw::Dialog`; and the performance HUD as a live
+  `.osd` ticker.
+- A `glib` pump that mirrors every arm of the TUI's `tokio::select!`: reconnect,
+  server switch, SSH supervisor, transport upgrade, tunnel death, liveness ping
+  + timeout, metrics flush, resize debounce, plus async clipboard paste.
 - Mouse scroll-wheel (PTY mouse-report or local scrollback) and drag text
   selection with copy.
-- libadwaita window styling with palette-driven CSS (reloaded on `/theme`) and
-  a preferences window for theme + font, opened with **Ctrl+,**.
+- libadwaita styling: the kmux palette feeds libadwaita's `accent_*` named
+  colors (reloaded on `/theme`), so the chrome follows the active theme with
+  stock styling; preferences (theme + font) open with **Ctrl+,**.
+
+The one toolkit-agnostic addition this required was `AppCore::set_picker_search`
+(a sibling of `set_picker_selected`) so a native search entry can drive a picker
+filter in one shot; everything else reused the existing `Action` / dispatch /
+picker-query surface.
 
 `kmux-tui` is **deprecated** but kept building and tested: it remains the
 headless/SSH client and the regression oracle for the shared `kmux-app`

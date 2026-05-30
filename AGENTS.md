@@ -5,8 +5,8 @@ A terminal multiplexer / session manager with remote desktop capabilities.
 ## Commands
 
 - Run server: `cargo run -p kmuxd -- --self-signed`
-- Run TUI client: `cargo run -p kmux-tui`
-- Run GTK GUI (scaffold): `cargo run -p kmux-gtk` (needs system GTK4 dev libs; if another `pkg-config` shadows the system one, prefix `PKG_CONFIG=/usr/bin/pkg-config`)
+- Run TUI client: `cargo run -p kmux-tui` (deprecated; headless/SSH + regression oracle)
+- Run GTK GUI (primary `kmux` client): `cargo run -p kmux-gtk` (needs system GTK4 + libadwaita dev libs; if another `pkg-config` shadows the system one, prefix `PKG_CONFIG=/usr/bin/pkg-config`)
 - Run tests: `just test`
 - Lint: `just clippy`
 - Lint fix: `just clippy-fix`
