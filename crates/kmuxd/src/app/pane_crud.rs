@@ -14,7 +14,7 @@ use crate::scrollback::DiffBuffer;
 use crate::term_state::new_term_state;
 
 use super::helpers::resolve_cwd;
-use super::{ClientMap, PaneRelay, PaneTitleSink, SCROLLBACK_CAPACITY, ServerApp};
+use super::{ClientMap, PaneEventSink, PaneRelay, SCROLLBACK_CAPACITY, ServerApp};
 
 impl ServerApp {
     /// Add a new pane to an existing session.
@@ -142,7 +142,7 @@ impl ServerApp {
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         let scrollback = Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY)));
         let title = Arc::new(Mutex::new(String::new()));
-        let title_sink = Arc::new(PaneTitleSink::new(
+        let title_sink = Arc::new(PaneEventSink::new(
             pane_id.to_string(),
             title.clone(),
             self.vt_events_tx.clone(),

@@ -30,6 +30,14 @@ pub enum SessionEvent {
     PaneClosed { pane_id: String },
     /// A pane's window title changed (OSC 0/2).
     PaneTitleChanged { pane_id: String, title: String },
+    /// A pane's program wrote the clipboard via OSC 52. `data` is the still
+    /// base64-encoded payload; the app layer decodes and applies it (subject to
+    /// the active-pane policy) at the frontend's clipboard leaf.
+    ClipboardCopy {
+        pane_id: String,
+        selection: String,
+        data: String,
+    },
     /// A structured error from the server.
     ServerError { message: String },
     /// Input lock acquired on a pane.
@@ -383,6 +391,23 @@ impl SessionManager {
                     }
                 }
                 events.push(SessionEvent::PaneTitleChanged { pane_id, title });
+            }
+
+            ServerMessage::Event {
+                event:
+                    SessionEventMsg::PaneClipboardCopy {
+                        pane_id,
+                        selection,
+                        data,
+                    },
+            } => {
+                // Pure relay: the app layer applies the active-pane policy and
+                // decodes the base64 payload at the clipboard leaf.
+                events.push(SessionEvent::ClipboardCopy {
+                    pane_id,
+                    selection,
+                    data,
+                });
             }
 
             ServerMessage::Event { .. } => {}

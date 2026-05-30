@@ -156,6 +156,14 @@ pub enum SessionEventMsg {
     PaneResized { pane_id: PaneId, size: TermSize },
     /// A pane's program reported a new window title (OSC 0/2).
     PaneTitleChanged { pane_id: PaneId, title: String },
+    /// A pane's program wrote the clipboard via OSC 52. `selection` is the
+    /// normalized target ("c"/"p"/"s"/"0".."7"); `data` is the still
+    /// base64-encoded payload (decoded client-side at the clipboard leaf).
+    PaneClipboardCopy {
+        pane_id: PaneId,
+        selection: String,
+        data: String,
+    },
     /// A pane was closed.
     PaneClosed { pane_id: PaneId },
 }
@@ -201,6 +209,29 @@ mod tests {
             SessionEventMsg::PaneTitleChanged { pane_id, title } => {
                 assert_eq!(pane_id, "eagle/0");
                 assert_eq!(title, "~/dev/kmux");
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn pane_clipboard_copy_roundtrips() {
+        let msg = SessionEventMsg::PaneClipboardCopy {
+            pane_id: "eagle/0".to_string(),
+            selection: "c".to_string(),
+            data: "aGVsbG8=".to_string(),
+        };
+        let bytes = postcard::to_allocvec(&msg).expect("serialize");
+        let decoded: SessionEventMsg = postcard::from_bytes(&bytes).expect("deserialize");
+        match decoded {
+            SessionEventMsg::PaneClipboardCopy {
+                pane_id,
+                selection,
+                data,
+            } => {
+                assert_eq!(pane_id, "eagle/0");
+                assert_eq!(selection, "c");
+                assert_eq!(data, "aGVsbG8=");
             }
             _ => panic!("wrong variant"),
         }
