@@ -90,6 +90,32 @@ pub fn mode_name(mode: &Mode) -> &'static str {
     }
 }
 
+/// The accent color a mode is badged with, as a toolkit-neutral [`Rgb`] drawn
+/// from the active palette. Each frontend converts the result to its own color
+/// type at the render boundary (the TUI to a ratatui `Color`, the GUI to a
+/// cairo/CSS color), so the mode→color mapping has one source of truth.
+///
+/// [`Rgb`]: crate::theme::Rgb
+pub fn mode_rgb(mode: &Mode, theme: &crate::theme::Theme) -> crate::theme::Rgb {
+    match mode {
+        Mode::Normal => theme.green,
+        Mode::Locked => theme.red,
+        Mode::Select => theme.accent,
+        Mode::Session => theme.purple,
+        Mode::Scroll => theme.yellow,
+        Mode::Signal => theme.red,
+        Mode::ConfirmCloseSession { .. } => theme.red,
+        Mode::RenameSession { .. } => theme.orange,
+        Mode::SessionPicker => theme.accent,
+        Mode::ServerPicker => theme.purple,
+        Mode::Help => theme.accent,
+        Mode::DirectoryPicker => theme.accent,
+        Mode::Connecting { .. } => theme.yellow,
+        Mode::Disconnected { .. } => theme.red,
+        Mode::Command(_) => theme.accent,
+    }
+}
+
 /// Help entries for the full help overlay.
 pub fn help_entries() -> Vec<(&'static str, &'static str)> {
     vec![

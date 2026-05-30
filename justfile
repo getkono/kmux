@@ -65,10 +65,22 @@ start-daemon:
 stop-daemon:
     cargo run -p kmux-tui -- daemon stop
 
-# Install kmux and kmuxd to ~/.cargo/bin (release build)
+# Install the clients + daemon to ~/.cargo/bin (release build). The GTK GUI
+# (`kmux`) is Linux-only; its desktop entry + icon are installed there too.
 install:
+    #!/usr/bin/env bash
+    set -euo pipefail
     cargo install --path crates/kmux-tui
     cargo install --path crates/kmuxd
+    if [[ "$(uname -s)" == "Linux" ]]; then
+        cargo install --path crates/kmux-gtk
+        apps="${XDG_DATA_HOME:-$HOME/.local/share}/applications"
+        icons="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps"
+        mkdir -p "$apps" "$icons"
+        cp crates/kmux-gtk/data/dev.getkono.kmux.desktop "$apps/"
+        cp crates/kmux-gtk/data/icons/dev.getkono.kmux.svg "$icons/"
+        echo "==> installed the kmux GUI + desktop entry (GTK4 + libadwaita are runtime deps)"
+    fi
 
 # Stage a distributable release tarball for the host target into dist/.
 package:
@@ -104,6 +116,18 @@ package:
         cp "$libdir/libkmux_ghostty.so" "dist/${stage}/"
         patchelf --set-rpath '$ORIGIN' "dist/${stage}/kmuxd"
         strip "dist/${stage}/kmux-tui" "dist/${stage}/kmuxd"
+        # The GTK GUI (`kmux`) is Linux-only. It dynamically links the system
+        # GTK4 + libadwaita (NOT bundled, unlike libkmux_ghostty) — they are
+        # runtime deps the user installs from their distro. Ship the binary plus
+        # its desktop entry + icon under share/.
+        echo "==> building + staging the kmux GUI"
+        cargo build --release -p kmux-gtk
+        cp target/release/kmux "dist/${stage}/"
+        strip "dist/${stage}/kmux"
+        mkdir -p "dist/${stage}/share/applications" \
+                 "dist/${stage}/share/icons/hicolor/scalable/apps"
+        cp crates/kmux-gtk/data/dev.getkono.kmux.desktop "dist/${stage}/share/applications/"
+        cp crates/kmux-gtk/data/icons/dev.getkono.kmux.svg "dist/${stage}/share/icons/hicolor/scalable/apps/"
     fi
     tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
     ( cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256" )

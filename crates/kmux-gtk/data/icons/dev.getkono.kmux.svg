@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <!-- Terminal window -->
+  <rect x="10" y="18" width="108" height="92" rx="14" fill="#24273a"/>
+  <rect x="10" y="18" width="108" height="22" rx="14" fill="#363a4f"/>
+  <rect x="10" y="30" width="108" height="10" fill="#363a4f"/>
+  <!-- Title-bar dots -->
+  <circle cx="24" cy="29" r="4" fill="#ed8796"/>
+  <circle cx="38" cy="29" r="4" fill="#eed49f"/>
+  <circle cx="52" cy="29" r="4" fill="#a6da95"/>
+  <!-- Prompt: > with a blinking-style caret -->
+  <path d="M28 60 L48 76 L28 92" fill="none" stroke="#a6da95" stroke-width="8"
+        stroke-linecap="round" stroke-linejoin="round"/>
+  <rect x="58" y="84" width="34" height="8" rx="4" fill="#8aadf4"/>
+</svg>

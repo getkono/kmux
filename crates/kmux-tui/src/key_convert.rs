@@ -87,7 +87,7 @@ pub fn convert_to_protocol_key(event: &KeyEvent) -> Option<ProtoKeyEvent> {
     }
 
     let (code, text, unshifted_codepoint) = match event.code {
-        KeyCode::Char(c) => char_to_proto_key(c),
+        KeyCode::Char(c) => kmux_client::input::char_to_proto_key(c),
         KeyCode::Enter => (ProtoKey::Enter, String::new(), 0),
         KeyCode::Tab => (ProtoKey::Tab, String::new(), 0),
         KeyCode::Backspace => (ProtoKey::Backspace, String::new(), 0),
@@ -127,57 +127,6 @@ pub fn convert_to_protocol_key(event: &KeyEvent) -> Option<ProtoKeyEvent> {
         text,
         unshifted_codepoint,
     })
-}
-
-/// Map a typed character to a (physical-key, text, unshifted-codepoint)
-/// triple.  Letters and digits get their dedicated physical keys so kitty
-/// kbd encoding includes the right ordinal; everything else falls back to
-/// `Unidentified` with the text and lets the encoder handle it.
-fn char_to_proto_key(c: char) -> (ProtoKey, String, u32) {
-    let text = c.to_string();
-    let lower = c.to_ascii_lowercase();
-    let key = match lower {
-        'a' => ProtoKey::A,
-        'b' => ProtoKey::B,
-        'c' => ProtoKey::C,
-        'd' => ProtoKey::D,
-        'e' => ProtoKey::E,
-        'f' => ProtoKey::F,
-        'g' => ProtoKey::G,
-        'h' => ProtoKey::H,
-        'i' => ProtoKey::I,
-        'j' => ProtoKey::J,
-        'k' => ProtoKey::K,
-        'l' => ProtoKey::L,
-        'm' => ProtoKey::M,
-        'n' => ProtoKey::N,
-        'o' => ProtoKey::O,
-        'p' => ProtoKey::P,
-        'q' => ProtoKey::Q,
-        'r' => ProtoKey::R,
-        's' => ProtoKey::S,
-        't' => ProtoKey::T,
-        'u' => ProtoKey::U,
-        'v' => ProtoKey::V,
-        'w' => ProtoKey::W,
-        'x' => ProtoKey::X,
-        'y' => ProtoKey::Y,
-        'z' => ProtoKey::Z,
-        '0' => ProtoKey::Digit0,
-        '1' => ProtoKey::Digit1,
-        '2' => ProtoKey::Digit2,
-        '3' => ProtoKey::Digit3,
-        '4' => ProtoKey::Digit4,
-        '5' => ProtoKey::Digit5,
-        '6' => ProtoKey::Digit6,
-        '7' => ProtoKey::Digit7,
-        '8' => ProtoKey::Digit8,
-        '9' => ProtoKey::Digit9,
-        ' ' => ProtoKey::Space,
-        _ => ProtoKey::Unidentified,
-    };
-    let unshifted = if lower.is_ascii() { lower as u32 } else { 0 };
-    (key, text, unshifted)
 }
 
 #[cfg(test)]

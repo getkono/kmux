@@ -1,3 +1,11 @@
+//! kmux-tui — the terminal (ratatui/crossterm) frontend for kmux.
+//!
+//! **Deprecated.** The GTK GUI (`kmux`, from the `kmux-gtk` crate) is the
+//! primary client and has reached feature parity. `kmux-tui` is retained for
+//! SSH/headless and no-display use; it stays compiling and tested (it is the
+//! regression oracle for the shared `kmux-app` interaction layer) but is no
+//! longer the focus of new feature work.
+
 mod app;
 mod key_convert;
 mod theme;
@@ -5,7 +13,7 @@ mod ui;
 
 // Frontend-free logic lives in kmux-app; re-export the bits the app/ui modules
 // reach via `crate::*`.
-use kmux_app::{cmd, host_caps, mode, recent_servers};
+use kmux_app::{cmd, host_caps, mode};
 
 use std::io;
 
@@ -32,7 +40,7 @@ async fn main() -> anyhow::Result<()> {
     let instance_id = generate_instance_id();
     match run_cli(instance_id).await? {
         Launch::Done => Ok(()),
-        Launch::Interactive(plan) => run_tui(plan).await,
+        Launch::Interactive(plan) => run_tui(*plan).await,
     }
 }
 

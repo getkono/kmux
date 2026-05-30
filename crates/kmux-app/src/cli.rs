@@ -28,6 +28,12 @@ pub struct Cli {
     /// from ~/.config/kmux/themes/<name>.toml
     #[arg(long, global = true)]
     pub theme: Option<String>,
+
+    /// GUI font as a Pango font-description string (e.g. "JetBrains Mono 12").
+    /// GUI only — the TUI uses the host terminal's font. Falls back to the
+    /// `font` key in ~/.config/kmux/config.toml, then "monospace 11".
+    #[arg(long, global = true)]
+    pub font: Option<String>,
 }
 
 /// Server addressing arguments shared by the default connect action and

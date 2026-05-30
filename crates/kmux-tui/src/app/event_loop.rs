@@ -5,7 +5,6 @@ use super::input_coalesce;
 use crossterm::event::EventStream;
 use futures::StreamExt;
 use kmux_client::connection_state::DisconnectReason;
-use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::supervisor::UpgradeSignal;
 use kmux_client::transport::TransportKind;
 use kmux_protocol::messages::ServerMessage;
@@ -15,11 +14,10 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::mode::Mode;
-use crate::recent_servers::ServerKind;
 use crate::ui;
 use kmux_protocol::messages::TermSize;
 
-use super::{App, BootstrapPhase, BootstrapTaskResult, KeyResult, SwitchTarget};
+use super::{App, BootstrapPhase, BootstrapTaskResult, KeyResult};
 
 /// How often to re-check liveness (ping cadence + timeout evaluation).
 const LIVENESS_TICK: Duration = Duration::from_secs(1);
@@ -129,55 +127,21 @@ impl App {
                                     self.needs_render = true;
                                 }
                                 KeyResult::SwitchServer(target) => {
+                                    // AppCore owns the state change (server
+                                    // identity, ssh target, disconnect) and
+                                    // hands back the target; the run loop owns
+                                    // the channel rebuild + bootstrap.
                                     let (new_tx, new_rx) = mpsc::unbounded_channel();
                                     srv_rx = new_rx;
-                                    self.did_auto_select = false;
-                                    self.mgr.disconnect();
-                                    match target {
-                                        SwitchTarget::Local => {
-                                            self.is_local = true;
-                                            self.ssh_target = None;
-                                            self.server_display = "localhost".to_string();
-                                            self.server_string = String::new();
-                                            self.server_kind = ServerKind::Local;
-                                            let (bs_tx, bs_rx) = mpsc::unbounded_channel();
-                                            bootstrap_rx = Some(bs_rx);
-                                            self.start_bootstrap(
-                                                ResolvedTarget::LocalDaemon,
-                                                new_tx,
-                                                BootstrapPhase::Initial,
-                                                bs_tx,
-                                            );
-                                        }
-                                        SwitchTarget::Ssh(target) => {
-                                            let display = match &target.user {
-                                                Some(u) => format!("{}@{}", u, target.host),
-                                                None => target.host.clone(),
-                                            };
-                                            self.server_display = display.clone();
-                                            self.server_string = display;
-                                            self.server_kind = ServerKind::Ssh {
-                                                user: target.user.clone(),
-                                                host: target.host.clone(),
-                                                ssh_port: target.ssh_port,
-                                            };
-                                            self.is_local = false;
-                                            self.ssh_target = Some(target.clone());
-                                            let accept_invalid_certs =
-                                                self.mgr.accept_invalid_certs();
-                                            let (bs_tx, bs_rx) = mpsc::unbounded_channel();
-                                            bootstrap_rx = Some(bs_rx);
-                                            self.start_bootstrap(
-                                                ResolvedTarget::Ssh {
-                                                    target,
-                                                    accept_invalid_certs,
-                                                },
-                                                new_tx,
-                                                BootstrapPhase::Initial,
-                                                bs_tx,
-                                            );
-                                        }
-                                    }
+                                    let resolved = self.prepare_switch(&target);
+                                    let (bs_tx, bs_rx) = mpsc::unbounded_channel();
+                                    bootstrap_rx = Some(bs_rx);
+                                    self.start_bootstrap(
+                                        resolved,
+                                        new_tx,
+                                        BootstrapPhase::Initial,
+                                        bs_tx,
+                                    );
                                     self.needs_render = true;
                                 }
                                 KeyResult::Continue => {
