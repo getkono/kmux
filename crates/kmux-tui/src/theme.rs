@@ -21,6 +21,8 @@ pub struct Theme {
     pub purple: Color,
     pub orange: Color,
     pub status_bg: Color,
+    pub cursor_bg: Color,
+    pub cursor_fg: Color,
 }
 
 fn rgb(c: app_theme::Rgb) -> Color {
@@ -40,6 +42,8 @@ impl From<app_theme::Theme> for Theme {
             purple: rgb(t.purple),
             orange: rgb(t.orange),
             status_bg: rgb(t.status_bg),
+            cursor_bg: rgb(t.cursor_bg),
+            cursor_fg: rgb(t.cursor_fg),
         }
     }
 }

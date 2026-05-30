@@ -88,6 +88,11 @@ it). Each frontend converts to its toolkit's color type at the render boundary:
 The field is named `palette` (not `theme`) so it does not shadow a frontend's
 own rendered-theme field through the `App: Deref<Target = AppCore>` wrapper.
 
+The palette includes `cursor_bg` / `cursor_fg` (optional in `themes/*.toml`,
+defaulting to `fg` / `bg`). Both frontends draw the inner-pane cursor themselves
+and honor these colors — the TUI paints it in-cell, the GTK frontend draws it via
+cairo. See [terminal-backend.md](terminal-backend.md#cursor-rendering-in-cell).
+
 ## The TUI `App` wrapper
 
 `kmux-tui`'s `App` is a thin presentation wrapper: `{ core: AppCore, theme

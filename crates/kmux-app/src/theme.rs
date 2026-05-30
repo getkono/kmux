@@ -41,6 +41,13 @@ pub struct Theme {
     pub purple: Rgb,
     pub orange: Rgb,
     pub status_bg: Rgb,
+    /// Background of the inner-pane cursor for shapes that fill the cell
+    /// (Block, HollowBlock); also used as the foreground glyph color for
+    /// Bar/Underline. Defaults to `fg` for high contrast against `bg`.
+    pub cursor_bg: Rgb,
+    /// Text color drawn on top of the Block cursor's background. Defaults to
+    /// `bg` so the underlying glyph stays readable.
+    pub cursor_fg: Rgb,
 }
 
 /// Deserialisation shape for `themes/*.toml` files.
@@ -58,6 +65,12 @@ struct ThemeFile {
     purple: String,
     orange: String,
     status_bg: String,
+    /// Optional. Defaults to `fg` if omitted.
+    #[serde(default)]
+    cursor_bg: Option<String>,
+    /// Optional. Defaults to `bg` if omitted.
+    #[serde(default)]
+    cursor_fg: Option<String>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -93,9 +106,19 @@ fn parse_hex(field: &'static str, s: &str) -> Result<Rgb, ThemeError> {
 
 impl ThemeFile {
     fn into_theme(self) -> Result<Theme, ThemeError> {
+        let bg = parse_hex("bg", &self.bg)?;
+        let fg = parse_hex("fg", &self.fg)?;
+        let cursor_bg = match self.cursor_bg.as_deref() {
+            Some(s) => parse_hex("cursor_bg", s)?,
+            None => fg,
+        };
+        let cursor_fg = match self.cursor_fg.as_deref() {
+            Some(s) => parse_hex("cursor_fg", s)?,
+            None => bg,
+        };
         Ok(Theme {
-            bg: parse_hex("bg", &self.bg)?,
-            fg: parse_hex("fg", &self.fg)?,
+            bg,
+            fg,
             fg_dim: parse_hex("fg_dim", &self.fg_dim)?,
             accent: parse_hex("accent", &self.accent)?,
             green: parse_hex("green", &self.green)?,
@@ -104,6 +127,8 @@ impl ThemeFile {
             purple: parse_hex("purple", &self.purple)?,
             orange: parse_hex("orange", &self.orange)?,
             status_bg: parse_hex("status_bg", &self.status_bg)?,
+            cursor_bg,
+            cursor_fg,
         })
     }
 }
@@ -202,5 +227,60 @@ mod tests {
         let theme = default_theme();
         // bg = #24273a
         assert_eq!(theme.bg, Rgb::new(0x24, 0x27, 0x3a));
+    }
+
+    #[test]
+    fn cursor_colors_default_to_fg_and_bg() {
+        // A theme TOML with no cursor_* keys should fall back to fg/bg so every
+        // theme has a high-contrast cursor without per-theme tuning.
+        let toml = r##"
+name = "test"
+bg = "#000000"
+fg = "#ffffff"
+fg_dim = "#888888"
+accent = "#0000ff"
+green = "#00ff00"
+red = "#ff0000"
+yellow = "#ffff00"
+purple = "#ff00ff"
+orange = "#ff8800"
+status_bg = "#222222"
+"##;
+        let theme = parse_theme_toml(toml).unwrap();
+        assert_eq!(theme.cursor_bg, theme.fg);
+        assert_eq!(theme.cursor_fg, theme.bg);
+    }
+
+    #[test]
+    fn cursor_colors_can_be_overridden_in_toml() {
+        let toml = r##"
+name = "test"
+bg = "#000000"
+fg = "#ffffff"
+fg_dim = "#888888"
+accent = "#0000ff"
+green = "#00ff00"
+red = "#ff0000"
+yellow = "#ffff00"
+purple = "#ff00ff"
+orange = "#ff8800"
+status_bg = "#222222"
+cursor_bg = "#abcdef"
+cursor_fg = "#123456"
+"##;
+        let theme = parse_theme_toml(toml).unwrap();
+        assert_eq!(theme.cursor_bg, Rgb::new(0xab, 0xcd, 0xef));
+        assert_eq!(theme.cursor_fg, Rgb::new(0x12, 0x34, 0x56));
+    }
+
+    #[test]
+    fn all_builtins_have_cursor_colors() {
+        // Built-in themes omit the cursor_* keys, so they should default to
+        // fg/bg — never an unset/zeroed value.
+        for name in BUILTIN_THEMES {
+            let theme = builtin_theme(name).unwrap();
+            assert_eq!(theme.cursor_bg, theme.fg, "{name} cursor_bg should be fg");
+            assert_eq!(theme.cursor_fg, theme.bg, "{name} cursor_fg should be bg");
+        }
     }
 }
