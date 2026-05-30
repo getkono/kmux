@@ -102,6 +102,8 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
         let area = drawing.clone();
         let anchor = anchor.clone();
         click.connect_pressed(move |_g, n_press, x, y| {
+            // Clicking the terminal takes keyboard focus back from the sidebar.
+            area.grab_focus();
             let sel = {
                 let f = fe.borrow();
                 let Some(pos) = pos_at(&f, x, y) else {

@@ -70,6 +70,8 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, _app: &Application) {
                 );
                 f.core.needs_render = true;
             }
+            // Return focus to the terminal so typing goes to the session.
+            s.drawing.grab_focus();
             s.drawing.queue_draw();
         });
     }

@@ -10,6 +10,7 @@
 //! leaves are GTK-specific. The pump mirrors the arms of the TUI's
 //! `tokio::select!` loop (`kmux-tui/src/app/event_loop.rs`).
 
+mod actions;
 mod convert;
 mod css;
 mod dialogs;
@@ -30,7 +31,7 @@ use gtk4::{Application, DrawingArea, EventControllerKey, gdk, gio, glib};
 
 use kmux_app::core::{AppCore, BootstrapPhase, BootstrapTaskResult, KeyResult, SwitchTarget};
 use kmux_app::launch::{Launch, Plan, run_cli};
-use kmux_app::mode::{self, Action, Mode};
+use kmux_app::mode::Mode;
 use kmux_app::theme::Theme;
 use kmux_client::connection_state::DisconnectReason;
 use kmux_client::generate_instance_id;
@@ -166,6 +167,10 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     let drawing = DrawingArea::new();
     drawing.set_hexpand(true);
     drawing.set_vexpand(true);
+    // Focusable so it can hold keyboard focus; clicking it (and selecting a
+    // session/pane) returns focus here so typing goes to the terminal rather
+    // than the sidebar list.
+    drawing.set_focusable(true);
 
     // Derive cell geometry from the configured font (the widget's PangoContext
     // carries the display font map + scale). Recomputed on scale-factor change.
@@ -247,48 +252,31 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     tabs::wire(&shell, &fe, app);
     sidebar::wire(&shell, &fe, app);
 
-    // Key input: GDK → agnostic key → resolve → dispatch (or structured forward).
+    actions::install(&shell, &fe, app);
+
+    // Key input: window/app accelerators are evaluated in the capture phase
+    // before this bubble-phase window controller, so any key reaching here is
+    // meant for the terminal — forward it to the PTY (the daemon's Ghostty
+    // encoder emits the right bytes under the live terminal mode state). There
+    // is no modal-chord path in the GUI; commands are accelerators (see
+    // actions.rs).
     let key_ctl = EventControllerKey::new();
     {
         let fe = fe.clone();
         let drawing = drawing.clone();
-        let app = app.clone();
         key_ctl.connect_key_pressed(move |_ctl, keyval, _code, gdk_mods| {
-            // GUI shortcut: Ctrl+, opens Preferences. Intercepted before the
-            // resolve→PTY path so it never reaches the terminal.
-            if gdk_mods.contains(gdk::ModifierType::CONTROL_MASK) && keyval == gdk::Key::comma {
-                prefs::open(&fe, &drawing);
-                return glib::Propagation::Stop;
-            }
-            let Some((key, mods)) = convert::convert(keyval, gdk_mods) else {
+            let mut f = fe.borrow_mut();
+            // While a dialog / connection overlay owns the UI, leave input to it.
+            if !matches!(f.core.mode, Mode::Normal) {
                 return glib::Propagation::Proceed;
-            };
-            // Resolve + dispatch under a scoped borrow, then drop it before
-            // handling the effect (reconnect/switch re-borrow `fe`).
-            let result = {
-                let mut fe = fe.borrow_mut();
-                let (new_mode, action) = mode::resolve(&fe.core.mode, &key, mods);
-                if let Some(m) = new_mode {
-                    fe.core.mode = m;
-                }
-                if matches!(action, Action::ForwardKey) {
-                    // Snap to bottom on keypress, then forward as a structured
-                    // event so the daemon's Ghostty encoder emits the right
-                    // bytes under the live terminal mode state.
-                    if let Some(grid) = fe.core.mgr.active_grid_mut() {
-                        grid.scroll_to_bottom();
-                    }
-                    if let Some(proto) = convert::convert_to_protocol_key(keyval, gdk_mods) {
-                        fe.core.mgr.send_key_batch(vec![proto]);
-                    }
-                    KeyResult::Continue
-                } else {
-                    // dispatch_action is async but performs no awaits; block_on
-                    // resolves it immediately without touching the runtime.
-                    futures::executor::block_on(fe.core.dispatch_action(action))
-                }
-            };
-            handle_effect(&fe, result, &app, &drawing);
+            }
+            if let Some(grid) = f.core.mgr.active_grid_mut() {
+                grid.scroll_to_bottom();
+            }
+            if let Some(proto) = convert::convert_to_protocol_key(keyval, gdk_mods) {
+                f.core.mgr.send_key_batch(vec![proto]);
+            }
+            drop(f);
             drawing.queue_draw();
             glib::Propagation::Stop
         });

@@ -69,6 +69,7 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, _app: &Application) {
                 f.core.needs_render = true;
             }
             show_in_page(&s, &page);
+            s.drawing.grab_focus();
             s.drawing.queue_draw();
         });
     }
@@ -151,6 +152,9 @@ pub fn sync(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
         return;
     }
 
+    // First pane appearing (empty → panes) takes keyboard focus so typing works
+    // without a click.
+    let was_empty = shell.content_stack.visible_child_name().as_deref() != Some("panes");
     shell.content_stack.set_visible_child_name("panes");
     shell.tab_bar.set_visible(true);
 
@@ -203,6 +207,9 @@ pub fn sync(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
     if let Some(page) = active_page {
         shell.tab_view.set_selected_page(&page);
         show_in_page(shell, &page);
+        if was_empty {
+            shell.drawing.grab_focus();
+        }
     }
 
     shell.tabs.syncing.set(false);

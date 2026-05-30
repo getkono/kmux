@@ -12,8 +12,8 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk4::{
-    Application, Box as GtkBox, Button, DrawingArea, Label, ListBox, Orientation, Overlay,
-    ScrolledWindow, SelectionMode, Stack,
+    Application, Box as GtkBox, Button, DrawingArea, Label, ListBox, MenuButton, Orientation,
+    Overlay, ScrolledWindow, SelectionMode, Stack,
 };
 
 use crate::sidebar::SidebarState;
@@ -23,6 +23,7 @@ use crate::tabs::TabState;
 /// signal handlers touch. Held in an `Rc` and shared across closures.
 pub struct Shell {
     pub window: adw::ApplicationWindow,
+    pub split: adw::OverlaySplitView,
     pub tab_view: adw::TabView,
     pub tab_bar: adw::TabBar,
     /// Swaps between the tab content ("panes") and an empty-state page ("empty").
@@ -37,6 +38,7 @@ pub struct Shell {
     pub server_btn: Button,
     pub conn_btn: Button,
     pub lock_btn: Button,
+    pub menu_btn: MenuButton,
     pub header_sig: RefCell<Option<String>>,
 
     // Sidebar
@@ -50,10 +52,14 @@ pub struct Shell {
 
 /// Build the window shell around the (already-created) shared `drawing`.
 pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
-    // ── Header ──
+    // ── Header ── (interactive buttons route through `win.*` gio actions)
     let title = adw::WindowTitle::new("kmux", "");
     let sidebar_toggle = Button::from_icon_name("sidebar-show-symbolic");
     sidebar_toggle.set_tooltip_text(Some("Toggle sidebar (F9)"));
+    sidebar_toggle.set_action_name(Some("win.toggle-sidebar"));
+    let command_btn = Button::from_icon_name("system-search-symbolic");
+    command_btn.set_tooltip_text(Some("Command palette (Ctrl+Shift+P)"));
+    command_btn.set_action_name(Some("win.command"));
     let server_btn = Button::from_icon_name("network-server-symbolic");
     server_btn.set_tooltip_text(Some("Switch server"));
     let conn_btn = Button::from_icon_name("network-idle-symbolic");
@@ -61,13 +67,18 @@ pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
     lock_btn.set_tooltip_text(Some("Input is locked"));
     lock_btn.add_css_class("warning");
     lock_btn.set_visible(false);
+    let menu_btn = MenuButton::new();
+    menu_btn.set_icon_name("open-menu-symbolic");
+    menu_btn.set_tooltip_text(Some("Main menu"));
 
     let header = adw::HeaderBar::new();
     header.set_title_widget(Some(&title));
     header.pack_start(&sidebar_toggle);
+    header.pack_start(&command_btn);
+    header.pack_end(&menu_btn);
     header.pack_end(&conn_btn);
-    header.pack_end(&server_btn);
     header.pack_end(&lock_btn);
+    header.pack_end(&server_btn);
 
     // ── Pane tab strip + view ──
     let tab_view = adw::TabView::new();
@@ -135,13 +146,6 @@ pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
     split.set_show_sidebar(true);
     split.set_max_sidebar_width(280.0);
 
-    {
-        let split = split.clone();
-        sidebar_toggle.connect_clicked(move |_| {
-            split.set_show_sidebar(!split.shows_sidebar());
-        });
-    }
-
     let toolbar = adw::ToolbarView::new();
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&split));
@@ -156,6 +160,7 @@ pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
 
     Rc::new(Shell {
         window,
+        split,
         tab_view,
         tab_bar,
         content_stack,
@@ -165,6 +170,7 @@ pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
         server_btn,
         conn_btn,
         lock_btn,
+        menu_btn,
         header_sig: RefCell::new(None),
         new_session_btn,
         sidebar_list,
