@@ -254,12 +254,12 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
 
     actions::install(&shell, &fe, app);
 
-    // Key input: window/app accelerators are evaluated in the capture phase
-    // before this bubble-phase window controller, so any key reaching here is
-    // meant for the terminal — forward it to the PTY (the daemon's Ghostty
-    // encoder emits the right bytes under the live terminal mode state). There
-    // is no modal-chord path in the GUI; commands are accelerators (see
-    // actions.rs).
+    // Key input: the controller lives on the focused terminal `DrawingArea`, so
+    // window/app accelerators (capture phase, at the window) are always evaluated
+    // first; only keys the accelerators don't claim reach here and are forwarded
+    // to the PTY (the daemon's Ghostty encoder emits the right bytes under the
+    // live terminal mode state). There is no modal-chord path in the GUI;
+    // commands are accelerators (see actions.rs).
     let key_ctl = EventControllerKey::new();
     {
         let fe = fe.clone();
@@ -281,7 +281,7 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
             glib::Propagation::Stop
         });
     }
-    shell.window.add_controller(key_ctl);
+    drawing.add_controller(key_ctl);
 
     // Mouse: scroll-wheel (PTY mouse-report or local scrollback).
     input::attach(&drawing, &fe);

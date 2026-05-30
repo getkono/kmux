@@ -327,6 +327,8 @@ fn open_list_dialog(
                 f.core.needs_render = true;
             }
             drop(f);
+            // Return focus to the terminal so typing resumes there.
+            shell.drawing.grab_focus();
             shell.drawing.queue_draw();
         });
     }
