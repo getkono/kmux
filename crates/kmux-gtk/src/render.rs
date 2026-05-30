@@ -323,13 +323,16 @@ fn draw_cursor(
     }
     let x = cx as f64 * m.cell_w;
     let y = cy as f64 * m.cell_h;
-    let fg = palette.fg;
+    // Theme-driven cursor color. `cursor_bg` defaults to `fg` (see
+    // `kmux_app::theme`), so the default look is unchanged, but a theme can
+    // override it independently of the text foreground.
+    let cur = palette.cursor_bg;
 
     match cursor.shape {
         CursorShape::Block => {
-            // Inverted block: fill with the cursor color, redraw the glyph in the
-            // cell's background color so it stays legible.
-            src(cr, fg.r, fg.g, fg.b);
+            // Inverted block: fill with the cursor color, redraw the glyph in
+            // the theme's `cursor_fg` (defaults to `bg`) so it stays legible.
+            src(cr, cur.r, cur.g, cur.b);
             cr.rectangle(x, y, m.cell_w, m.cell_h);
             let _ = cr.fill();
             if let Some(cs) = cells.get(cy * cols + cx)
@@ -338,8 +341,8 @@ fn draw_cursor(
                 && !cs.c.is_control()
                 && !cs.attrs.contains(CellAttrs::WIDE_CHAR_SPACER)
             {
-                let (r, g, b) = cell_bg(cs, palette);
-                src(cr, r, g, b);
+                let fg = palette.cursor_fg;
+                src(cr, fg.r, fg.g, fg.b);
                 layout.set_font_description(Some(&m.font));
                 let mut buf = [0u8; 4];
                 layout.set_text(cs.c.encode_utf8(&mut buf));
@@ -348,18 +351,18 @@ fn draw_cursor(
             }
         }
         CursorShape::HollowBlock => {
-            src(cr, fg.r, fg.g, fg.b);
+            src(cr, cur.r, cur.g, cur.b);
             cr.set_line_width(1.0);
             cr.rectangle(x + 0.5, y + 0.5, m.cell_w - 1.0, m.cell_h - 1.0);
             let _ = cr.stroke();
         }
         CursorShape::Underline => {
-            src(cr, fg.r, fg.g, fg.b);
+            src(cr, cur.r, cur.g, cur.b);
             cr.rectangle(x, y + m.cell_h - 2.0, m.cell_w, 2.0);
             let _ = cr.fill();
         }
         CursorShape::Bar => {
-            src(cr, fg.r, fg.g, fg.b);
+            src(cr, cur.r, cur.g, cur.b);
             cr.rectangle(x, y, 2.0, m.cell_h);
             let _ = cr.fill();
         }

@@ -51,8 +51,9 @@ kmux --theme my-theme
 
 ## Theme file schema
 
-Every theme file is a flat TOML document. All fields are required. Colors must
-be 6-digit hex strings prefixed with `#`.
+Every theme file is a flat TOML document. All fields are required except
+`cursor_bg` / `cursor_fg`, which are optional. Colors must be 6-digit hex
+strings prefixed with `#`.
 
 ```toml
 name      = "my-theme"      # human-readable identifier (required)
@@ -66,6 +67,13 @@ yellow    = "#eed49f"       # scroll indicator, warnings in HUD
 purple    = "#c6a0f6"       # session mode indicator
 orange    = "#f5a97f"       # rename mode indicator
 status_bg = "#1e2030"       # background of the status and session bars
+
+# Optional. The inner-pane cursor is rendered by kmux itself (the TUI paints it
+# in-cell rather than delegating to the host terminal's hardware cursor), so
+# these control how it looks regardless of host terminal cursor settings.
+# cursor_bg defaults to `fg`, cursor_fg defaults to `bg`.
+cursor_bg = "#cad3f5"       # Block cursor bg + Bar/Underline glyph color
+cursor_fg = "#24273a"       # text drawn on top of the Block cursor
 ```
 
 The canonical theme definitions are in the [`themes/`](../themes/) directory at

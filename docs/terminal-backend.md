@@ -112,6 +112,31 @@ and drained from a separate task.
 whichever `Arc<dyn BackendEventSink>` the host passes in.  `NullEventSink`
 (no-op) is used in code paths that do not need backend events.
 
+## Cursor rendering (in-cell)
+
+Both frontends paint the inner-pane cursor **themselves** — the TUI does *not*
+delegate Bar/Underline shapes to the host terminal's hardware cursor via
+`Frame::set_cursor_position`. The host cursor's shape comes from the user's
+terminal settings (often a Block, never updated by DECSCUSR), can be hidden in
+alternate-screen mode, and may sit beneath painted content invisibly. In-cell
+rendering makes the cursor visible everywhere regardless of the host. Modern
+TUIs such as Claude Code request a Bar via DECSCUSR `\x1b[5 q`; before this the
+bar was invisible inside kmux.
+
+| Shape | TUI (`kmux-tui`) | GTK (`kmux-gtk`) |
+|---|---|---|
+| `Block` | bg ← `cursor_bg`, fg ← `cursor_fg`; glyph kept | filled rect in `cursor_bg`, glyph redrawn in `cursor_fg` |
+| `Bar` | symbol ← `▏` (U+258F), fg ← `cursor_bg` | 2px vertical bar in `cursor_bg` |
+| `Underline` | symbol ← `▁` (U+2581), fg ← `cursor_bg` | 2px bottom bar in `cursor_bg` |
+| `HollowBlock` | fg ← `cursor_bg`, `Modifier::SLOW_BLINK` | 1px outline in `cursor_bg` |
+| `Hidden` | no-op | no-op |
+
+Themes default `cursor_bg = fg` and `cursor_fg = bg` so contrast is good on every
+theme without per-theme tuning; both are overridable in `themes/*.toml` (see
+[themes.md](themes.md)). The TUI painter is
+`crates/kmux-tui/src/ui/grid.rs::paint_cursor_cell`; the GTK painter is
+`crates/kmux-gtk/src/render.rs::draw_cursor`.
+
 ## Key encoding (server-side)
 
 The daemon encodes user keystrokes into terminal escape bytes via Ghostty's
