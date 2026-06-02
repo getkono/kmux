@@ -5,6 +5,25 @@ set positional-arguments
 default:
     @just --list
 
+# Maximal debugging: full panic + library backtraces, verbose kmux logs, and
+# GLib/GTK diagnostics. Logs stream to stderr (the terminal) so a crash shows
+# the live trace next to its backtrace. Each env var below is overridable:
+#   just start                         # launch the GUI
+#   just start --dry-run myhost        # forward args to the binary
+#   RUST_LOG=trace just start          # override the default log filter
+#   KMUX_LOG_STDERR=0 just start       # log to the client log file instead
+# Run the kmux GUI (debug build), forwarding any args to the `kmux` binary.
+start *args:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export RUST_BACKTRACE="${RUST_BACKTRACE:-full}"
+    export RUST_LIB_BACKTRACE="${RUST_LIB_BACKTRACE:-1}"
+    export RUST_LOG="${RUST_LOG:-kmux=debug,kmux_app=debug,kmux_client=debug,kmux_protocol=debug,kmux_gtk=debug}"
+    export KMUX_LOG_STDERR="${KMUX_LOG_STDERR:-1}"
+    export G_MESSAGES_DEBUG="${G_MESSAGES_DEBUG:-all}"
+    export RUST_LOG_STYLE="${RUST_LOG_STYLE:-always}"
+    cargo run --bin kmux -- "$@"
+
 # Format all code
 fmt:
     cargo fmt --all
