@@ -91,7 +91,12 @@ fn apply_cell(ratatui_cell: &mut Cell, cs: &CellState, theme: &Theme) {
 /// hidden in alternate-screen mode or has the wrong shape, leaving users with
 /// an invisible cursor in apps like Claude Code that request a bar shape via
 /// DECSCUSR. Drawing in-cell is reliable across every host.
-fn paint_cursor_cell(cell: &mut Cell, shape: CursorShape, theme: &Theme) {
+///
+/// `blink` carries the DECSCUSR `blinking_*` request: when set we add
+/// `Modifier::SLOW_BLINK` so the host terminal blinks the cursor cell. This
+/// mirrors the GTK frontend honoring the blink request rather than blinking
+/// every cursor, so a steady cursor (`steady_*`) stays solid.
+fn paint_cursor_cell(cell: &mut Cell, shape: CursorShape, blink: bool, theme: &Theme) {
     match shape {
         CursorShape::Block => {
             cell.set_bg(theme.cursor_bg);
@@ -112,7 +117,10 @@ fn paint_cursor_cell(cell: &mut Cell, shape: CursorShape, theme: &Theme) {
                     .add_modifier(Modifier::SLOW_BLINK),
             );
         }
-        CursorShape::Hidden => {}
+        CursorShape::Hidden => return,
+    }
+    if blink {
+        cell.modifier.insert(Modifier::SLOW_BLINK);
     }
 }
 
@@ -210,7 +218,7 @@ pub(super) fn render_grid(f: &mut Frame, app: &App, area: Rect) {
                 let cx = area.left() + cur_col as u16;
                 let cy = area.top() + cur_row as u16;
                 if cx < area.right() && cy < area.bottom() {
-                    paint_cursor_cell(&mut buf[(cx, cy)], cursor.shape, theme);
+                    paint_cursor_cell(&mut buf[(cx, cy)], cursor.shape, cursor.blink, theme);
                 }
             }
         }
@@ -354,13 +362,15 @@ mod tests {
         let mut cell = Cell::default();
         fill_cell(&mut cell, 'a', &theme);
 
-        paint_cursor_cell(&mut cell, CursorShape::Block, &theme);
+        paint_cursor_cell(&mut cell, CursorShape::Block, false, &theme);
 
         assert_eq!(cell.bg, theme.cursor_bg);
         assert_eq!(cell.fg, theme.cursor_fg);
         assert_ne!(cell.bg, Color::White, "must not hardcode Color::White");
         // Underlying glyph stays — Block sits on top of it.
         assert_eq!(cell.symbol(), "a");
+        // Steady (non-blink) request must not blink.
+        assert!(!cell.modifier.contains(Modifier::SLOW_BLINK));
     }
 
     #[test]
@@ -369,7 +379,7 @@ mod tests {
         let mut cell = Cell::default();
         fill_cell(&mut cell, 'a', &theme);
 
-        paint_cursor_cell(&mut cell, CursorShape::Bar, &theme);
+        paint_cursor_cell(&mut cell, CursorShape::Bar, false, &theme);
 
         assert_eq!(cell.symbol(), "\u{258f}", "Bar must paint U+258F");
         assert_eq!(cell.fg, theme.cursor_bg);
@@ -381,7 +391,7 @@ mod tests {
         let mut cell = Cell::default();
         fill_cell(&mut cell, 'a', &theme);
 
-        paint_cursor_cell(&mut cell, CursorShape::Underline, &theme);
+        paint_cursor_cell(&mut cell, CursorShape::Underline, false, &theme);
 
         assert_eq!(cell.symbol(), "\u{2581}", "Underline must paint U+2581");
         assert_eq!(cell.fg, theme.cursor_bg);
@@ -393,7 +403,7 @@ mod tests {
         let mut cell = Cell::default();
         fill_cell(&mut cell, 'a', &theme);
 
-        paint_cursor_cell(&mut cell, CursorShape::HollowBlock, &theme);
+        paint_cursor_cell(&mut cell, CursorShape::HollowBlock, false, &theme);
 
         assert_eq!(cell.fg, theme.cursor_bg);
         assert!(cell.modifier.contains(Modifier::SLOW_BLINK));
@@ -409,10 +419,28 @@ mod tests {
         let before_bg = cell.bg;
         let before_sym = cell.symbol().to_string();
 
-        paint_cursor_cell(&mut cell, CursorShape::Hidden, &theme);
+        paint_cursor_cell(&mut cell, CursorShape::Hidden, false, &theme);
 
         assert_eq!(cell.symbol(), before_sym);
         assert_eq!(cell.fg, before_fg);
         assert_eq!(cell.bg, before_bg);
+    }
+
+    #[test]
+    fn blinking_request_adds_slow_blink_modifier() {
+        // A blinking bar (DECSCUSR 5) is painted in-cell and carries
+        // SLOW_BLINK so the host terminal blinks it; a steady bar does not.
+        let theme = theme::default_theme();
+
+        let mut blinking = Cell::default();
+        fill_cell(&mut blinking, 'a', &theme);
+        paint_cursor_cell(&mut blinking, CursorShape::Bar, true, &theme);
+        assert_eq!(blinking.symbol(), "\u{258f}");
+        assert!(blinking.modifier.contains(Modifier::SLOW_BLINK));
+
+        let mut steady = Cell::default();
+        fill_cell(&mut steady, 'a', &theme);
+        paint_cursor_cell(&mut steady, CursorShape::Bar, false, &theme);
+        assert!(!steady.modifier.contains(Modifier::SLOW_BLINK));
     }
 }

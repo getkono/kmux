@@ -251,6 +251,7 @@ mod tests {
                 col: 2,
                 shape: CursorShape::Bar,
                 visible: true,
+                blink: true,
             },
             modes: TermModes(TermModes::APP_CURSOR),
             history_total: 0,
@@ -273,6 +274,10 @@ mod tests {
                 assert_eq!(snapshot.cols, 3);
                 assert_eq!(snapshot.cells.len(), 6);
                 assert!(snapshot.modes.app_cursor());
+                // Cursor shape, position, and blink survive the wire round-trip.
+                assert_eq!(snapshot.cursor.shape, CursorShape::Bar);
+                assert_eq!((snapshot.cursor.row, snapshot.cursor.col), (1, 2));
+                assert!(snapshot.cursor.blink);
             }
             _ => panic!("expected TerminalSnapshot"),
         }
