@@ -1,14 +1,17 @@
 //! GTK4 frontend for kmux.
 //!
-//! The toolkit-agnostic [`kmux_app::core::AppCore`] drives this native GTK
-//! frontend exactly as it drives the TUI: a glib main-loop *pump* polls the
-//! core's network channels and ticks its timers, a `DrawingArea` renders
-//! `AppCore`'s active grid, and GDK key events are converted to the shared key
-//! model and fed through `mode::resolve` → `AppCore::dispatch_action`.
+//! The toolkit-agnostic [`kmux_app::driver::FrontendDriver`] owns the run-loop
+//! orchestration (network channels, bootstrap, liveness, metrics, resize
+//! debounce, cursor blink) that used to live inline here. This frontend is now
+//! just the GTK leaves around it: a glib timeout *pump* calls
+//! [`FrontendDriver::tick`] each frame and acts on the returned
+//! [`FrontendEffect`]s, a `DrawingArea` renders the driver's active grid, and
+//! GDK key events are converted to the shared key model and forwarded to the
+//! PTY (window/app accelerators bind straight to `Action`s; see `actions.rs`).
 //!
-//! `AppCore` is *driven, not driving* — only the pump and the render/input
-//! leaves are GTK-specific. The pump mirrors the arms of the TUI's
-//! `tokio::select!` loop (`kmux-tui/src/app/event_loop.rs`).
+//! `AppCore` is *driven, not driving* — only the pump cadence and the
+//! render/input leaves are GTK-specific. The same `FrontendDriver` is what a
+//! non-Rust frontend (e.g. the SwiftUI macOS app, via `kmux-ffi`) drives too.
 
 mod actions;
 mod convert;
@@ -22,82 +25,45 @@ mod shell;
 mod sidebar;
 mod tabs;
 
-use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use adw::prelude::*;
 use gtk4::{Application, DrawingArea, EventControllerKey, gdk, gio, glib};
 
-use kmux_app::core::{AppCore, BootstrapPhase, BootstrapTaskResult, KeyResult, SwitchTarget};
+use kmux_app::core::AppCore;
+use kmux_app::driver::{FrontendDriver, FrontendEffect};
 use kmux_app::launch::{Launch, Plan, run_cli};
 use kmux_app::mode::Mode;
 use kmux_app::theme::Theme;
-use kmux_client::connection_state::DisconnectReason;
 use kmux_client::generate_instance_id;
-use kmux_client::supervisor::UpgradeSignal;
-use kmux_client::transport::TransportKind;
-use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ServerMessage, TermSize};
-use tokio::sync::mpsc;
-use tokio::sync::mpsc::error::TryRecvError;
+use kmux_protocol::messages::{ClientCapabilities, TermSize};
 
 const APP_ID: &str = "dev.getkono.kmux";
 
-/// Pump cadence: drain network channels + tick timers (~60 Hz).
+/// Pump cadence: drain the driver + tick timers (~60 Hz).
 const PUMP_INTERVAL: Duration = Duration::from_millis(16);
-/// Liveness ping + timeout evaluation cadence (matches the TUI).
-const LIVENESS_TICK: Duration = Duration::from_secs(1);
-/// Metrics JSONL flush cadence (matches the TUI / `docs/metrics.md`).
-const METRICS_FLUSH_TICK: Duration = Duration::from_secs(10);
-/// Debounce window for window-resize bursts; GTK fires many size-allocations
-/// during a drag, so coalesce them into one `set_term_size`.
-const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
-/// Cursor blink half-period (on→off or off→on). Matches GTK's default
-/// `gtk-cursor-blink-time` (1200 ms full cycle) / 2.
-const CURSOR_BLINK_HALF: Duration = Duration::from_millis(600);
 
-/// Shared frontend state pumped by the glib loop. The receivers are the same
-/// channels the TUI's event loop owns; here the glib pump drains them instead
-/// of a `tokio::select!`.
+/// Shared frontend state. The toolkit-agnostic run loop lives in `core`
+/// ([`FrontendDriver`], which wraps `AppCore`); the GTK leaves keep only the
+/// render geometry and the chrome CSS provider.
 struct Frontend {
-    core: AppCore,
-    /// Server messages for the live connection. Replaced on reconnect / server
-    /// switch (the old receiver is dropped, closing the stale channel).
-    srv_rx: mpsc::UnboundedReceiver<ServerMessage>,
-    /// Outcome channel for the in-flight bootstrap; `None` while idle.
-    bootstrap_rx: Option<mpsc::UnboundedReceiver<BootstrapTaskResult>>,
-    /// Better-transport signals from the background supervisor probe.
-    upgrade_rx: mpsc::Receiver<UpgradeSignal>,
-    upgrade_tx: mpsc::Sender<UpgradeSignal>,
-    /// SSH tunnel-death signal (the tunnel process exited unexpectedly).
-    tunnel_died_rx: mpsc::Receiver<()>,
-    tunnel_died_tx: mpsc::Sender<()>,
+    /// The toolkit-agnostic driver wrapping `AppCore`. Named `core` so the GTK
+    /// modules reach `AppCore` state through it via `Deref` (`f.core.mgr`,
+    /// `f.core.mode`, `f.core.palette`, …) exactly as before.
+    core: FrontendDriver,
     /// Cell geometry derived from the configured font; recomputed on scale
     /// change. Drives the grid render and the resize → cols/rows mapping.
     metrics: render::Metrics,
-    /// The CSS provider for the chrome/overlay theme, reloaded when the palette
-    /// changes (`/theme`). The last palette applied to it, for change detection.
+    /// The CSS provider for the chrome/overlay theme, reloaded when the driver
+    /// reports a palette change (`/theme`).
     css_provider: gtk4::CssProvider,
-    last_palette: Theme,
-    /// Timer bookkeeping: the glib pump fires on one interval, so we track each
-    /// cadence's last-fire / deadline ourselves.
-    last_liveness: Instant,
-    last_metrics_flush: Instant,
-    pending_resize: Option<TermSize>,
-    resize_deadline: Option<Instant>,
-    /// Cursor-blink phase: `true` shows the cursor, `false` hides it on the
-    /// "off" half of a blink cycle. Only a cursor that requested blinking
-    /// (DECSCUSR `blinking_*`) is toggled; a steady cursor stays solid.
-    blink_on: bool,
-    /// When the current blink half-cycle started; advanced every
-    /// [`CURSOR_BLINK_HALF`]. Reset on keypress so typing shows a solid cursor.
-    blink_phase_start: Instant,
 }
 
 fn main() -> anyhow::Result<()> {
-    // A tokio runtime backs AppCore's async orchestration (start_bootstrap spawns
-    // tasks) and the CLI front door's daemon/subcommand network calls.
+    // A tokio runtime backs the driver's async orchestration (start_bootstrap
+    // spawns tasks) and the CLI front door's daemon/subcommand network calls.
     let rt = tokio::runtime::Runtime::new()?;
     let instance_id = generate_instance_id();
     match rt.block_on(run_cli(instance_id))? {
@@ -150,7 +116,7 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         pixel_width: 0,
         pixel_height: 0,
     };
-    let mut core = AppCore::new(
+    let core = AppCore::new(
         plan.target.clone(),
         plan.initial_cwd.clone(),
         plan.instance_id.clone(),
@@ -161,19 +127,10 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         term_size,
     );
 
-    // The frontend owns the network channels (as the TUI's run loop does) and
-    // kicks off the initial bootstrap. The upgrade / tunnel-death channels live
-    // for the whole session; their senders are cloned into the SSH supervisor.
-    let (srv_tx, srv_rx) = mpsc::unbounded_channel::<ServerMessage>();
-    let (bs_tx, bootstrap_rx) = mpsc::unbounded_channel::<BootstrapTaskResult>();
-    let (upgrade_tx, upgrade_rx) = mpsc::channel::<UpgradeSignal>(1);
-    let (tunnel_died_tx, tunnel_died_rx) = mpsc::channel::<()>(1);
-    let mut bootstrap_rx = Some(bootstrap_rx);
-    if let Some(target) = core.pending_target.take() {
-        core.start_bootstrap(target, srv_tx, BootstrapPhase::Initial, bs_tx);
-    } else {
-        bootstrap_rx = None;
-    }
+    // The driver owns the network channels and kicks off the initial bootstrap
+    // (from `core.pending_target`). We are inside the tokio runtime (entered in
+    // `main`), so its `start_bootstrap` spawn lands on it.
+    let driver = FrontendDriver::new(core);
 
     let drawing = DrawingArea::new();
     drawing.set_hexpand(true);
@@ -196,24 +153,10 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         .unwrap_or_default();
     adw::StyleManager::default().set_color_scheme(scheme_for(&plan.theme));
 
-    let now = Instant::now();
     let fe = Rc::new(RefCell::new(Frontend {
-        core,
-        srv_rx,
-        bootstrap_rx,
-        upgrade_rx,
-        upgrade_tx,
-        tunnel_died_rx,
-        tunnel_died_tx,
+        core: driver,
         metrics,
         css_provider,
-        last_palette: plan.theme.clone(),
-        last_liveness: now,
-        last_metrics_flush: now,
-        pending_resize: None,
-        resize_deadline: None,
-        blink_on: true,
-        blink_phase_start: now,
     }));
 
     {
@@ -227,25 +170,24 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
                 &fe.metrics,
                 w,
                 h,
-                fe.blink_on,
+                fe.core.blink_on(),
             );
         });
     }
 
     // Window-resize → debounced term-size update. Event-driven (like the TUI's
-    // SIGWINCH) rather than polled; the pump applies it once the burst settles.
+    // SIGWINCH) rather than polled; the driver applies it once the burst settles.
     {
         let fe = fe.clone();
         drawing.connect_resize(move |_area, w, h| {
             let mut fe = fe.borrow_mut();
             let (cols, rows) = fe.metrics.cols_rows(w, h);
-            fe.pending_resize = Some(TermSize {
+            fe.core.request_resize(TermSize {
                 rows,
                 cols,
                 pixel_width: w.max(0) as u16,
                 pixel_height: h.max(0) as u16,
             });
-            fe.resize_deadline = Some(Instant::now() + RESIZE_DEBOUNCE);
         });
     }
 
@@ -277,9 +219,9 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     {
         let fe = fe.clone();
         let shell2 = shell.clone();
-        let app = app.clone();
         shell.banner.connect_button_clicked(move |_| {
-            handle_effect(&fe, KeyResult::Reconnect, &app, &shell2.drawing);
+            fe.borrow_mut().core.reconnect();
+            shell2.drawing.queue_draw();
         });
     }
 
@@ -301,14 +243,11 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
             if !matches!(f.core.mode, Mode::Normal) {
                 return glib::Propagation::Proceed;
             }
-            if let Some(grid) = f.core.mgr.active_grid_mut() {
-                grid.scroll_to_bottom();
-            }
+            f.core.scroll_to_bottom();
             if let Some(proto) = convert::convert_to_protocol_key(keyval, gdk_mods) {
-                f.core.mgr.send_key_batch(vec![proto]);
-                // Typing shows a solid cursor: restart the blink cycle.
-                f.blink_on = true;
-                f.blink_phase_start = Instant::now();
+                // `send_keys` forwards to the PTY and restarts the blink cycle so
+                // typing shows a solid cursor.
+                f.core.send_keys(vec![proto]);
             }
             drop(f);
             drawing.queue_draw();
@@ -326,7 +265,7 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     sidebar::sync(&shell, &fe);
     dialogs::sync(&dialogs, &shell, &fe, app);
 
-    // The pump: drain network channels, tick timers, sync the shell/dialogs, redraw.
+    // The pump: tick the driver, apply effects, sync the shell/dialogs, redraw.
     {
         let fe = fe.clone();
         let shell = shell.clone();
@@ -349,204 +288,17 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     shell.window.present();
 }
 
-/// One pump tick. Mirrors the arms of the TUI `tokio::select!` loop: settled
-/// resize, server messages, bootstrap outcome, transport upgrade, tunnel death,
-/// liveness, and metrics flush.
+/// One pump tick: advance the driver, apply the toolkit-specific effects it
+/// returns, and — if anything changed — reconcile the native shell + overlays
+/// and repaint the grid.
 fn pump(
     fe: &Rc<RefCell<Frontend>>,
     shell: &Rc<shell::Shell>,
     dialogs: &Rc<dialogs::Dialogs>,
     app: &Application,
 ) {
-    let redraw = {
-        let mut fe = fe.borrow_mut();
-        let mut dirty = false;
-        let now = Instant::now();
-
-        // ── Reflect a `/theme` palette change onto the chrome CSS + window
-        // light/dark styling (the cairo grid reads the palette live). ──
-        if !palette_eq(&fe.core.palette, &fe.last_palette) {
-            css::reload(&fe.css_provider, &fe.core.palette);
-            adw::StyleManager::default().set_color_scheme(scheme_for(&fe.core.palette));
-            fe.last_palette = fe.core.palette.clone();
-            dirty = true;
-        }
-
-        // ── Apply a settled resize (debounced in `connect_resize`). ──
-        if let Some(deadline) = fe.resize_deadline
-            && now >= deadline
-        {
-            if let Some(size) = fe.pending_resize.take() {
-                fe.core.set_term_size(size);
-                dirty = true;
-            }
-            fe.resize_deadline = None;
-        }
-
-        // ── Server messages (batched; skipped once disconnected). ──
-        if !matches!(fe.core.mode, Mode::Disconnected { .. }) {
-            let mut batch = Vec::new();
-            let mut closed = false;
-            loop {
-                match fe.srv_rx.try_recv() {
-                    Ok(m) => batch.push(m),
-                    Err(TryRecvError::Empty) => break,
-                    Err(TryRecvError::Disconnected) => {
-                        closed = true;
-                        break;
-                    }
-                }
-            }
-            if !batch.is_empty() {
-                fe.core.mgr.metrics.record_batch(batch.len());
-                for m in batch {
-                    let events = fe.core.mgr.handle_server_message(m);
-                    // Server-originated effects (OSC 52 clipboard writes) are
-                    // applied here with the frontend's own clipboard API.
-                    for eff in fe.core.handle_session_events(events) {
-                        if let KeyResult::CopyToClipboard(text) = eff {
-                            copy_to_clipboard(&text);
-                        }
-                    }
-                }
-                dirty = true;
-            }
-            // Channel closed while live → the connection dropped.
-            if closed
-                && !matches!(
-                    fe.core.mode,
-                    Mode::Connecting { .. } | Mode::Disconnected { .. }
-                )
-            {
-                fe.core.enter_disconnected(DisconnectReason::ServerClosed);
-                dirty = true;
-            }
-        }
-
-        // ── Bootstrap outcome (at most one per bootstrap). ──
-        let outcome = fe.bootstrap_rx.as_mut().and_then(|rx| match rx.try_recv() {
-            Ok(o) => Some(Ok(o)),
-            Err(TryRecvError::Empty) => None,
-            Err(TryRecvError::Disconnected) => Some(Err(())),
-        });
-        match outcome {
-            Some(Ok(BootstrapTaskResult::Success(o))) => {
-                fe.core.cancel_tx = None;
-                // A later success clears any stashed failure so we don't re-print a
-                // stale error when the user finally quits.
-                fe.core.last_exit_error = None;
-                let ssh_ctx = fe.core.mgr.apply_outcome(*o);
-                if let Some(ctx) = ssh_ctx {
-                    let srv_tx = fe
-                        .core
-                        .pending_srv_tx
-                        .take()
-                        .expect("pending_srv_tx set in start_bootstrap");
-                    let upgrade_tx = fe.upgrade_tx.clone();
-                    let tunnel_died_tx = fe.tunnel_died_tx.clone();
-                    fe.core
-                        .launch_ssh_supervisor(ctx, srv_tx, upgrade_tx, tunnel_died_tx);
-                } else {
-                    fe.core.pending_srv_tx = None;
-                }
-                fe.core.reflect_bootstrap_outcome();
-                fe.bootstrap_rx = None;
-                dirty = true;
-            }
-            Some(Ok(BootstrapTaskResult::Failed(reason))) => {
-                fe.core.cancel_tx = None;
-                fe.core.pending_srv_tx = None;
-                // Stash so it survives teardown and is re-printed to stderr; the
-                // disconnect overlay shows the same text in-window.
-                fe.core.last_exit_error = Some(reason.clone());
-                fe.core
-                    .enter_disconnected(DisconnectReason::BootstrapFailed(reason));
-                fe.bootstrap_rx = None;
-                dirty = true;
-            }
-            Some(Err(())) => {
-                // Channel closed with no result → the bootstrap was cancelled
-                // (cancel_tx dropped via Action::CancelBootstrap).
-                fe.core.cancel_tx = None;
-                fe.core.pending_srv_tx = None;
-                if matches!(fe.core.mode, Mode::Connecting { .. }) {
-                    fe.core
-                        .enter_disconnected(DisconnectReason::BootstrapFailed(
-                            "cancelled".to_string(),
-                        ));
-                }
-                fe.bootstrap_rx = None;
-                dirty = true;
-            }
-            None => {}
-        }
-
-        // ── Transport upgrade (a better transport was found by the probe). ──
-        while let Ok(signal) = fe.upgrade_rx.try_recv() {
-            let _ = signal.sender.send(ClientMessage::ChannelReady);
-            fe.core
-                .mgr
-                .apply_transport_upgrade(signal.sender, signal.new_kind);
-            dirty = true;
-        }
-
-        // ── SSH tunnel death (freeze if we're on the tunnelled transport). ──
-        while fe.tunnel_died_rx.try_recv().is_ok() {
-            if fe.core.mgr.current_transport == TransportKind::TcpTls
-                && !matches!(fe.core.mode, Mode::Disconnected { .. })
-            {
-                fe.core.enter_disconnected(DisconnectReason::SshTunnelDied);
-                dirty = true;
-            }
-        }
-
-        // ── Liveness ping + timeout (1 s). ──
-        if now.duration_since(fe.last_liveness) >= LIVENESS_TICK {
-            fe.last_liveness = now;
-            fe.core.mgr.maybe_send_client_ping(now);
-            if fe.core.mgr.is_liveness_timed_out(now)
-                && !matches!(
-                    fe.core.mode,
-                    Mode::Disconnected { .. } | Mode::Connecting { .. }
-                )
-            {
-                fe.core.enter_disconnected(DisconnectReason::PingTimeout);
-                dirty = true;
-            }
-        }
-
-        // ── Metrics JSONL flush (10 s). ──
-        if now.duration_since(fe.last_metrics_flush) >= METRICS_FLUSH_TICK {
-            fe.last_metrics_flush = now;
-            let conn_id = fe.core.mgr.connection_id;
-            fe.core.mgr.metrics.flush_sample(conn_id);
-        }
-
-        // Keep the HUD refreshing while it is shown (the metrics dialog is a
-        // snapshot taken when it opens, so it doesn't need a per-frame tick).
-        if fe.core.hud_visible {
-            dirty = true;
-        }
-        // ── Cursor blink. Drive the cycle off the pump: a cursor that requested
-        // blinking (DECSCUSR `blinking_*`) toggles every CURSOR_BLINK_HALF; a
-        // steady cursor stays solid. (Shape == Hidden ⇒ !visible, so checking
-        // `visible && blink` already excludes hidden cursors.) ──
-        let cursor_blinks = fe.core.mgr.active_grid().is_some_and(|g| {
-            let c = g.cursor();
-            c.visible && c.blink
-        });
-        let (blink_on, blink_start, blink_changed) =
-            advance_blink(fe.blink_on, fe.blink_phase_start, cursor_blinks, now);
-        fe.blink_on = blink_on;
-        fe.blink_phase_start = blink_start;
-        dirty |= blink_changed;
-
-        let redraw = dirty || fe.core.needs_render;
-        fe.core.needs_render = false;
-        redraw
-    };
-    // The borrow is released; reconcile the native shell + overlays (cheap when
-    // state is unchanged) and repaint the grid.
+    let effects = fe.borrow_mut().core.tick();
+    let redraw = apply_effects(fe, effects, app, &shell.drawing);
     if redraw {
         header::sync(shell, fe);
         tabs::sync(shell, fe);
@@ -556,125 +308,63 @@ fn pump(
     }
 }
 
-/// Advance the cursor-blink phase for one pump tick.
-///
-/// Given the current phase (`blink_on`), when the current half-cycle started
-/// (`phase_start`), whether the active cursor is currently *requesting* blink
-/// (`cursor_blinks`), and `now`, returns `(new_blink_on, new_phase_start,
-/// changed)`. `changed` drives a redraw.
-///
-/// - A blinking cursor toggles once a full [`CURSOR_BLINK_HALF`] has elapsed.
-/// - A non-blinking (steady) cursor is pinned solid; if it was mid-"off" the
-///   pin counts as a change so the solid cursor repaints immediately.
-fn advance_blink(
-    blink_on: bool,
-    phase_start: Instant,
-    cursor_blinks: bool,
-    now: Instant,
-) -> (bool, Instant, bool) {
-    if cursor_blinks {
-        if now.duration_since(phase_start) >= CURSOR_BLINK_HALF {
-            (!blink_on, now, true)
-        } else {
-            (blink_on, phase_start, false)
-        }
-    } else if !blink_on {
-        (true, phase_start, true)
-    } else {
-        (blink_on, phase_start, false)
-    }
-}
-
-/// Write `text` to the system clipboard. Shared by the user-initiated copy
-/// effect (`handle_effect`) and server-originated OSC 52 writes.
-///
-/// `Clipboard::set_text` converts the string to a C string and aborts the
-/// process on an interior NUL byte (a non-unwinding FFI trampoline, so the
-/// panic cannot be caught). Terminal selections and OSC 52 payloads can both
-/// carry `\0` (empty grid cells, raw byte streams), so strip NULs first.
-fn copy_to_clipboard(text: &str) {
-    if let Some(display) = gdk::Display::default() {
-        match sanitize_clipboard_text(text) {
-            Cow::Borrowed(s) => display.clipboard().set_text(s),
-            Cow::Owned(s) => display.clipboard().set_text(&s),
-        }
-    }
-}
-
-/// Remove interior NUL bytes that would make `Clipboard::set_text` abort.
-/// Returns the input untouched (borrowed) in the common NUL-free case.
-fn sanitize_clipboard_text(text: &str) -> Cow<'_, str> {
-    if text.contains('\0') {
-        Cow::Owned(text.chars().filter(|&c| c != '\0').collect())
-    } else {
-        Cow::Borrowed(text)
-    }
-}
-
-/// Perform the toolkit-specific follow-up for a dispatch result: quit, clipboard
-/// copy/paste, and the reconnect / server-switch channel rebuilds.
-fn handle_effect(
+/// Perform the toolkit-specific follow-up for a batch of [`FrontendEffect`]s
+/// (from [`FrontendDriver::tick`] or an input dispatch). Returns whether a
+/// repaint is needed. Reconnect / server-switch are handled inside the driver
+/// and never reach here.
+pub(crate) fn apply_effects(
     fe: &Rc<RefCell<Frontend>>,
-    result: KeyResult,
+    effects: Vec<FrontendEffect>,
     app: &Application,
     drawing: &DrawingArea,
-) {
-    match result {
-        KeyResult::Continue => {}
-        KeyResult::Quit => app.quit(),
-        KeyResult::CopyToClipboard(text) => copy_to_clipboard(&text),
-        KeyResult::RequestPaste => {
-            let Some(display) = gdk::Display::default() else {
-                return;
-            };
-            // Clipboard reads are async in GTK; feed the text back when it lands.
-            let fe = fe.clone();
-            let drawing = drawing.clone();
-            display
-                .clipboard()
-                .read_text_async(gio::Cancellable::NONE, move |res| {
-                    if let Ok(Some(text)) = res {
-                        fe.borrow_mut().core.mgr.send_paste(text.to_string());
-                        drawing.queue_draw();
-                    }
-                });
+) -> bool {
+    let mut redraw = false;
+    for eff in effects {
+        match eff {
+            FrontendEffect::NeedsRender | FrontendEffect::ForceClear => redraw = true,
+            FrontendEffect::PaletteChanged => {
+                // Reflect a `/theme` palette change onto the chrome CSS + window
+                // light/dark styling (the cairo grid reads the palette live).
+                let f = fe.borrow();
+                css::reload(&f.css_provider, &f.core.palette);
+                let scheme = scheme_for(&f.core.palette);
+                drop(f);
+                adw::StyleManager::default().set_color_scheme(scheme);
+                redraw = true;
+            }
+            FrontendEffect::CopyToClipboard(text) => copy_to_clipboard(&text),
+            FrontendEffect::RequestPaste => request_paste(fe, drawing),
+            FrontendEffect::Quit => app.quit(),
         }
-        KeyResult::Reconnect => {
-            reconnect(&mut fe.borrow_mut());
-            drawing.queue_draw();
-        }
-        KeyResult::SwitchServer(target) => {
-            switch_server(&mut fe.borrow_mut(), target);
-            drawing.queue_draw();
-        }
+    }
+    redraw
+}
+
+/// Write `text` to the system clipboard. The driver already strips interior NUL
+/// bytes (which would make `Clipboard::set_text` — a non-unwinding FFI
+/// trampoline — abort the process), so we can write the payload directly.
+fn copy_to_clipboard(text: &str) {
+    if let Some(display) = gdk::Display::default() {
+        display.clipboard().set_text(text);
     }
 }
 
-/// Rebuild the server + bootstrap channels and start a fresh bootstrap to the
-/// current target. The SSH supervisor (if any) is launched from the pump when
-/// the bootstrap completes, using the senders stored on `Frontend`.
-fn reconnect(fe: &mut Frontend) {
-    let (srv_tx, srv_rx) = mpsc::unbounded_channel();
-    fe.srv_rx = srv_rx;
-    let (bs_tx, bs_rx) = mpsc::unbounded_channel();
-    fe.bootstrap_rx = Some(bs_rx);
-    let target = fe.core.current_target();
-    fe.core
-        .start_bootstrap(target, srv_tx, BootstrapPhase::Reconnect, bs_tx);
-    fe.core.needs_render = true;
-}
-
-/// Apply a server-picker selection: AppCore mutates the server identity and
-/// returns the target; the frontend rebuilds channels and bootstraps it.
-fn switch_server(fe: &mut Frontend, target: SwitchTarget) {
-    let (srv_tx, srv_rx) = mpsc::unbounded_channel();
-    fe.srv_rx = srv_rx;
-    let resolved = fe.core.prepare_switch(&target);
-    let (bs_tx, bs_rx) = mpsc::unbounded_channel();
-    fe.bootstrap_rx = Some(bs_rx);
-    fe.core
-        .start_bootstrap(resolved, srv_tx, BootstrapPhase::Initial, bs_tx);
-    fe.core.needs_render = true;
+/// Read the system clipboard asynchronously and feed it back as a paste once it
+/// lands (clipboard reads are async in GTK).
+fn request_paste(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea) {
+    let Some(display) = gdk::Display::default() else {
+        return;
+    };
+    let fe = fe.clone();
+    let drawing = drawing.clone();
+    display
+        .clipboard()
+        .read_text_async(gio::Cancellable::NONE, move |res| {
+            if let Ok(Some(text)) = res {
+                fe.borrow_mut().core.feed_paste(text.to_string());
+                drawing.queue_draw();
+            }
+        });
 }
 
 /// Pick the libadwaita color scheme matching a theme's background luminance, so
@@ -686,92 +376,5 @@ fn scheme_for(t: &Theme) -> adw::ColorScheme {
         adw::ColorScheme::PreferDark
     } else {
         adw::ColorScheme::PreferLight
-    }
-}
-
-/// Whether two palettes are identical. `Theme` is not `PartialEq`, but `Rgb` is.
-fn palette_eq(a: &Theme, b: &Theme) -> bool {
-    a.bg == b.bg
-        && a.fg == b.fg
-        && a.fg_dim == b.fg_dim
-        && a.accent == b.accent
-        && a.green == b.green
-        && a.red == b.red
-        && a.yellow == b.yellow
-        && a.purple == b.purple
-        && a.orange == b.orange
-        && a.status_bg == b.status_bg
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn sanitize_passes_through_nul_free_text() {
-        // No allocation: NUL-free input is borrowed unchanged.
-        assert!(matches!(
-            sanitize_clipboard_text("hello world"),
-            Cow::Borrowed("hello world")
-        ));
-    }
-
-    #[test]
-    fn sanitize_strips_interior_nuls() {
-        // A terminal selection over empty grid cells yields interior NULs,
-        // which would otherwise abort Clipboard::set_text.
-        assert_eq!(sanitize_clipboard_text("ab\0cd\0").as_ref(), "abcd");
-    }
-
-    #[test]
-    fn sanitize_handles_all_nul_input() {
-        assert_eq!(sanitize_clipboard_text("\0\0\0").as_ref(), "");
-    }
-
-    #[test]
-    fn sanitize_preserves_unicode() {
-        assert_eq!(sanitize_clipboard_text("café\0🦀").as_ref(), "café🦀");
-    }
-
-    #[test]
-    fn blinking_cursor_holds_phase_until_half_elapsed() {
-        let t0 = Instant::now();
-        // Just shy of the half-period: no toggle.
-        let (on, start, changed) = advance_blink(true, t0, true, t0 + CURSOR_BLINK_HALF / 2);
-        assert!(on, "still on");
-        assert_eq!(start, t0, "phase start unchanged");
-        assert!(!changed, "no redraw before the half-period");
-    }
-
-    #[test]
-    fn blinking_cursor_toggles_after_half_period() {
-        let t0 = Instant::now();
-        let (on, start, changed) = advance_blink(true, t0, true, t0 + CURSOR_BLINK_HALF);
-        assert!(!on, "toggled off");
-        assert_eq!(start, t0 + CURSOR_BLINK_HALF, "phase restarts at now");
-        assert!(changed, "toggle forces a redraw");
-        // And back on after another half-period.
-        let (on2, _, changed2) = advance_blink(on, start, true, start + CURSOR_BLINK_HALF);
-        assert!(on2, "toggled back on");
-        assert!(changed2);
-    }
-
-    #[test]
-    fn steady_cursor_stays_solid_and_never_toggles() {
-        let t0 = Instant::now();
-        // Already on + not blinking → no change even long after the period.
-        let (on, _, changed) = advance_blink(true, t0, false, t0 + CURSOR_BLINK_HALF * 10);
-        assert!(on);
-        assert!(!changed, "a steady cursor must not blink");
-    }
-
-    #[test]
-    fn switching_to_steady_mid_off_restores_solid_cursor() {
-        let t0 = Instant::now();
-        // Cursor was mid-"off" (blink_on=false) and is no longer blinking →
-        // restore solid and force one redraw.
-        let (on, _, changed) = advance_blink(false, t0, false, t0);
-        assert!(on, "restored to solid");
-        assert!(changed, "repaint the now-solid cursor");
     }
 }

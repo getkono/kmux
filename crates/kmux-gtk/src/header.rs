@@ -13,7 +13,7 @@ use kmux_app::core::TopBarAction;
 use kmux_client::connection_state::ConnectionState;
 
 use crate::shell::Shell;
-use crate::{Frontend, handle_effect};
+use crate::{Frontend, apply_effects};
 
 /// CSS classes the connection indicator toggles between (libadwaita semantic
 /// colors), cleared before applying the current one.
@@ -41,15 +41,13 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application) {
         let fe = fe.clone();
         let app = app.clone();
         shell.conn_btn.connect_clicked(move |_| {
-            let result = {
+            let effects = {
                 let mut f = fe.borrow_mut();
-                let r = f.core.apply_top_bar_action(TopBarAction::Reconnect);
+                let e = f.core.apply_top_bar_action(TopBarAction::Reconnect);
                 f.core.needs_render = true;
-                r
+                e
             };
-            if let Some(result) = result {
-                handle_effect(&fe, result, &app, &s.drawing);
-            }
+            apply_effects(&fe, effects, &app, &s.drawing);
             s.drawing.queue_draw();
         });
     }

@@ -22,12 +22,12 @@ use gtk4::{
     ScrolledWindow, SearchEntry, SelectionMode, gdk, glib,
 };
 
-use kmux_app::core::{AppCore, KeyResult};
+use kmux_app::core::AppCore;
 use kmux_app::mode::{Action, Mode};
 use kmux_app::{cmd, mode};
 
 use crate::shell::Shell;
-use crate::{Frontend, handle_effect};
+use crate::{Frontend, apply_effects};
 
 /// Which native dialog corresponds to the current mode (the list-style ones
 /// share an `adw::Dialog` shape).
@@ -476,24 +476,21 @@ fn move_selection(core: &mut AppCore, down: bool) {
 
 /// Activate the current selection of the open list dialog.
 fn activate_current(fe: &Rc<RefCell<Frontend>>, shell: &Rc<Shell>, app: &gtk4::Application) {
-    let result = {
+    let effects = {
         let mut f = fe.borrow_mut();
-        let r = match f.core.mode {
+        let e = match f.core.mode {
             Mode::DirectoryPicker => {
                 futures::executor::block_on(f.core.dispatch_action(Action::DirPickerSubmit))
             }
             Mode::Command(_) => {
                 futures::executor::block_on(f.core.dispatch_action(Action::CommandSubmit))
             }
-            _ => f
-                .core
-                .activate_picker_selection()
-                .unwrap_or(KeyResult::Continue),
+            _ => f.core.activate_picker_selection(),
         };
         f.core.needs_render = true;
-        r
+        e
     };
-    handle_effect(fe, result, app, &shell.drawing);
+    apply_effects(fe, effects, app, &shell.drawing);
     shell.drawing.queue_draw();
 }
 

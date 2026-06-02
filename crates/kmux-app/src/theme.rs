@@ -29,7 +29,11 @@ impl Rgb {
 }
 
 /// Runtime color palette. Frontend-agnostic.
-#[derive(Debug, Clone)]
+///
+/// `PartialEq`/`Eq` lets frontends detect a `/theme` palette change cheaply
+/// (e.g. to reload chrome styling). It compares *every* field — including
+/// `cursor_bg`/`cursor_fg` — so a cursor-only theme change is not missed.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Theme {
     pub bg: Rgb,
     pub fg: Rgb,
@@ -271,6 +275,26 @@ cursor_fg = "#123456"
         let theme = parse_theme_toml(toml).unwrap();
         assert_eq!(theme.cursor_bg, Rgb::new(0xab, 0xcd, 0xef));
         assert_eq!(theme.cursor_fg, Rgb::new(0x12, 0x34, 0x56));
+    }
+
+    #[test]
+    fn themes_differing_only_in_cursor_color_are_unequal() {
+        // Regression: the GTK frontend's old hand-written `palette_eq` omitted
+        // `cursor_bg`/`cursor_fg`, so a `/theme` change to only the cursor color
+        // never triggered a chrome reload. The derived `PartialEq` compares all
+        // fields, so two palettes differing only in the cursor must compare
+        // unequal (and a frontend will reload on the change).
+        let base = default_theme();
+        let mut cursor_changed = base.clone();
+        cursor_changed.cursor_bg = Rgb::new(1, 2, 3);
+        assert_ne!(base, cursor_changed);
+
+        let mut cursor_fg_changed = base.clone();
+        cursor_fg_changed.cursor_fg = Rgb::new(4, 5, 6);
+        assert_ne!(base, cursor_fg_changed);
+
+        // An identical clone compares equal (no spurious reloads).
+        assert_eq!(base, base.clone());
     }
 
     #[test]

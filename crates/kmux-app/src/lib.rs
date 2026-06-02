@@ -51,3 +51,7 @@ pub mod launch;
 /// The frontend-agnostic client view-model ([`core::AppCore`]) and the
 /// connection/session orchestration that drives it.
 pub mod core;
+
+/// The toolkit-agnostic run-loop driver ([`driver::FrontendDriver`]) that owns
+/// the network channels + pump shared by every frontend.
+pub mod driver;
