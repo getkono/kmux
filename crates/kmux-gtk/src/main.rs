@@ -22,6 +22,7 @@ mod shell;
 mod sidebar;
 mod tabs;
 
+use std::borrow::Cow;
 use std::cell::RefCell;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
@@ -586,9 +587,27 @@ fn advance_blink(
 
 /// Write `text` to the system clipboard. Shared by the user-initiated copy
 /// effect (`handle_effect`) and server-originated OSC 52 writes.
+///
+/// `Clipboard::set_text` converts the string to a C string and aborts the
+/// process on an interior NUL byte (a non-unwinding FFI trampoline, so the
+/// panic cannot be caught). Terminal selections and OSC 52 payloads can both
+/// carry `\0` (empty grid cells, raw byte streams), so strip NULs first.
 fn copy_to_clipboard(text: &str) {
     if let Some(display) = gdk::Display::default() {
-        display.clipboard().set_text(text);
+        match sanitize_clipboard_text(text) {
+            Cow::Borrowed(s) => display.clipboard().set_text(s),
+            Cow::Owned(s) => display.clipboard().set_text(&s),
+        }
+    }
+}
+
+/// Remove interior NUL bytes that would make `Clipboard::set_text` abort.
+/// Returns the input untouched (borrowed) in the common NUL-free case.
+fn sanitize_clipboard_text(text: &str) -> Cow<'_, str> {
+    if text.contains('\0') {
+        Cow::Owned(text.chars().filter(|&c| c != '\0').collect())
+    } else {
+        Cow::Borrowed(text)
     }
 }
 
@@ -686,8 +705,33 @@ fn palette_eq(a: &Theme, b: &Theme) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::{CURSOR_BLINK_HALF, advance_blink};
-    use std::time::Instant;
+    use super::*;
+
+    #[test]
+    fn sanitize_passes_through_nul_free_text() {
+        // No allocation: NUL-free input is borrowed unchanged.
+        assert!(matches!(
+            sanitize_clipboard_text("hello world"),
+            Cow::Borrowed("hello world")
+        ));
+    }
+
+    #[test]
+    fn sanitize_strips_interior_nuls() {
+        // A terminal selection over empty grid cells yields interior NULs,
+        // which would otherwise abort Clipboard::set_text.
+        assert_eq!(sanitize_clipboard_text("ab\0cd\0").as_ref(), "abcd");
+    }
+
+    #[test]
+    fn sanitize_handles_all_nul_input() {
+        assert_eq!(sanitize_clipboard_text("\0\0\0").as_ref(), "");
+    }
+
+    #[test]
+    fn sanitize_preserves_unicode() {
+        assert_eq!(sanitize_clipboard_text("café\0🦀").as_ref(), "café🦀");
+    }
 
     #[test]
     fn blinking_cursor_holds_phase_until_half_elapsed() {

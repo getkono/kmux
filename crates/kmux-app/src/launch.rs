@@ -44,20 +44,38 @@ pub struct Plan {
 /// Initialize tracing to the client log file (falling back to stderr) and log a
 /// startup line with the build/protocol versions.
 pub fn init_logging(instance_id: &str) {
-    let filter = || EnvFilter::from_default_env().add_directive("kmux=info".parse().unwrap());
-    match kmux_protocol::dirs::client_log_path().and_then(|p| {
-        Ok(std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(p)?)
-    }) {
-        Ok(file) => {
+    // Honor `RUST_LOG` verbatim when it is set (so e.g. `RUST_LOG=kmux=trace`
+    // raises the binary's own logs — an `add_directive("kmux=info")` would
+    // override that). Fall back to `kmux=info` only when `RUST_LOG` is unset.
+    let filter = || match std::env::var(EnvFilter::DEFAULT_ENV) {
+        Ok(rust_log) if !rust_log.trim().is_empty() => EnvFilter::new(rust_log),
+        _ => EnvFilter::new("kmux=info"),
+    };
+    // `KMUX_LOG_STDERR=1` forces logs to stderr instead of the client log file,
+    // so crash debugging (e.g. `just start`) shows the live trace in the
+    // terminal alongside any panic backtrace.
+    let force_stderr = std::env::var_os("KMUX_LOG_STDERR")
+        .is_some_and(|v| !v.is_empty() && v != "0" && v != "false");
+    let log_file = if force_stderr {
+        None
+    } else {
+        kmux_protocol::dirs::client_log_path()
+            .and_then(|p| {
+                Ok(std::fs::OpenOptions::new()
+                    .create(true)
+                    .append(true)
+                    .open(p)?)
+            })
+            .ok()
+    };
+    match log_file {
+        Some(file) => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter())
                 .with_writer(std::sync::Mutex::new(file))
                 .init();
         }
-        Err(_) => {
+        None => {
             tracing_subscriber::fmt()
                 .with_env_filter(filter())
                 .with_writer(std::io::stderr)
