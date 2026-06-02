@@ -53,6 +53,9 @@ const METRICS_FLUSH_TICK: Duration = Duration::from_secs(10);
 /// Debounce window for window-resize bursts; GTK fires many size-allocations
 /// during a drag, so coalesce them into one `set_term_size`.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
+/// Cursor blink half-period (on→off or off→on). Matches GTK's default
+/// `gtk-cursor-blink-time` (1200 ms full cycle) / 2.
+const CURSOR_BLINK_HALF: Duration = Duration::from_millis(600);
 
 /// Shared frontend state pumped by the glib loop. The receivers are the same
 /// channels the TUI's event loop owns; here the glib pump drains them instead
@@ -83,6 +86,13 @@ struct Frontend {
     last_metrics_flush: Instant,
     pending_resize: Option<TermSize>,
     resize_deadline: Option<Instant>,
+    /// Cursor-blink phase: `true` shows the cursor, `false` hides it on the
+    /// "off" half of a blink cycle. Only a cursor that requested blinking
+    /// (DECSCUSR `blinking_*`) is toggled; a steady cursor stays solid.
+    blink_on: bool,
+    /// When the current blink half-cycle started; advanced every
+    /// [`CURSOR_BLINK_HALF`]. Reset on keypress so typing shows a solid cursor.
+    blink_phase_start: Instant,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -202,13 +212,23 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         last_metrics_flush: now,
         pending_resize: None,
         resize_deadline: None,
+        blink_on: true,
+        blink_phase_start: now,
     }));
 
     {
         let fe = fe.clone();
         drawing.set_draw_func(move |area, cr, w, h| {
             let fe = fe.borrow();
-            render::render(&fe.core, cr, &area.pango_context(), &fe.metrics, w, h);
+            render::render(
+                &fe.core,
+                cr,
+                &area.pango_context(),
+                &fe.metrics,
+                w,
+                h,
+                fe.blink_on,
+            );
         });
     }
 
@@ -286,6 +306,9 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
             }
             if let Some(proto) = convert::convert_to_protocol_key(keyval, gdk_mods) {
                 f.core.mgr.send_key_batch(vec![proto]);
+                // Typing shows a solid cursor: restart the blink cycle.
+                f.blink_on = true;
+                f.blink_phase_start = Instant::now();
             }
             drop(f);
             drawing.queue_draw();
@@ -504,6 +527,20 @@ fn pump(
         if fe.core.hud_visible {
             dirty = true;
         }
+        // ── Cursor blink. Drive the cycle off the pump: a cursor that requested
+        // blinking (DECSCUSR `blinking_*`) toggles every CURSOR_BLINK_HALF; a
+        // steady cursor stays solid. (Shape == Hidden ⇒ !visible, so checking
+        // `visible && blink` already excludes hidden cursors.) ──
+        let cursor_blinks = fe.core.mgr.active_grid().is_some_and(|g| {
+            let c = g.cursor();
+            c.visible && c.blink
+        });
+        let (blink_on, blink_start, blink_changed) =
+            advance_blink(fe.blink_on, fe.blink_phase_start, cursor_blinks, now);
+        fe.blink_on = blink_on;
+        fe.blink_phase_start = blink_start;
+        dirty |= blink_changed;
+
         let redraw = dirty || fe.core.needs_render;
         fe.core.needs_render = false;
         redraw
@@ -516,6 +553,35 @@ fn pump(
         sidebar::sync(shell, fe);
         dialogs::sync(dialogs, shell, fe, app);
         shell.drawing.queue_draw();
+    }
+}
+
+/// Advance the cursor-blink phase for one pump tick.
+///
+/// Given the current phase (`blink_on`), when the current half-cycle started
+/// (`phase_start`), whether the active cursor is currently *requesting* blink
+/// (`cursor_blinks`), and `now`, returns `(new_blink_on, new_phase_start,
+/// changed)`. `changed` drives a redraw.
+///
+/// - A blinking cursor toggles once a full [`CURSOR_BLINK_HALF`] has elapsed.
+/// - A non-blinking (steady) cursor is pinned solid; if it was mid-"off" the
+///   pin counts as a change so the solid cursor repaints immediately.
+fn advance_blink(
+    blink_on: bool,
+    phase_start: Instant,
+    cursor_blinks: bool,
+    now: Instant,
+) -> (bool, Instant, bool) {
+    if cursor_blinks {
+        if now.duration_since(phase_start) >= CURSOR_BLINK_HALF {
+            (!blink_on, now, true)
+        } else {
+            (blink_on, phase_start, false)
+        }
+    } else if !blink_on {
+        (true, phase_start, true)
+    } else {
+        (blink_on, phase_start, false)
     }
 }
 
@@ -665,5 +731,47 @@ mod tests {
     #[test]
     fn sanitize_preserves_unicode() {
         assert_eq!(sanitize_clipboard_text("café\0🦀").as_ref(), "café🦀");
+    }
+
+    #[test]
+    fn blinking_cursor_holds_phase_until_half_elapsed() {
+        let t0 = Instant::now();
+        // Just shy of the half-period: no toggle.
+        let (on, start, changed) = advance_blink(true, t0, true, t0 + CURSOR_BLINK_HALF / 2);
+        assert!(on, "still on");
+        assert_eq!(start, t0, "phase start unchanged");
+        assert!(!changed, "no redraw before the half-period");
+    }
+
+    #[test]
+    fn blinking_cursor_toggles_after_half_period() {
+        let t0 = Instant::now();
+        let (on, start, changed) = advance_blink(true, t0, true, t0 + CURSOR_BLINK_HALF);
+        assert!(!on, "toggled off");
+        assert_eq!(start, t0 + CURSOR_BLINK_HALF, "phase restarts at now");
+        assert!(changed, "toggle forces a redraw");
+        // And back on after another half-period.
+        let (on2, _, changed2) = advance_blink(on, start, true, start + CURSOR_BLINK_HALF);
+        assert!(on2, "toggled back on");
+        assert!(changed2);
+    }
+
+    #[test]
+    fn steady_cursor_stays_solid_and_never_toggles() {
+        let t0 = Instant::now();
+        // Already on + not blinking → no change even long after the period.
+        let (on, _, changed) = advance_blink(true, t0, false, t0 + CURSOR_BLINK_HALF * 10);
+        assert!(on);
+        assert!(!changed, "a steady cursor must not blink");
+    }
+
+    #[test]
+    fn switching_to_steady_mid_off_restores_solid_cursor() {
+        let t0 = Instant::now();
+        // Cursor was mid-"off" (blink_on=false) and is no longer blinking →
+        // restore solid and force one redraw.
+        let (on, _, changed) = advance_blink(false, t0, false, t0);
+        assert!(on, "restored to solid");
+        assert!(changed, "repaint the now-solid cursor");
     }
 }

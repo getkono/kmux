@@ -63,7 +63,7 @@ pub struct BackendConfig {
 | `feed(&mut self, data: &[u8])` | Push raw PTY bytes into the parser |
 | `size(&self) -> BackendSize` | Current grid dimensions |
 | `fill_cells(&self, out: &mut [CellState])` | Snapshot the grid |
-| `cursor(&self) -> CursorState` | Cursor position and shape |
+| `cursor(&self) -> CursorState` | Cursor position, shape, visibility, and blink |
 | `modes(&self) -> TermModes` | Terminal mode flags |
 | `resize(&mut self, size: BackendSize)` | Resize the emulator |
 
@@ -136,6 +136,23 @@ theme without per-theme tuning; both are overridable in `themes/*.toml` (see
 [themes.md](themes.md)). The TUI painter is
 `crates/kmux-tui/src/ui/grid.rs::paint_cursor_cell`; the GTK painter is
 `crates/kmux-gtk/src/render.rs::draw_cursor`.
+
+### Blink
+
+`CursorState.blink` carries the inner program's DECSCUSR blink request (DEC
+private mode 12 `cursor_blinking`; `blinking_*` → `true`, `steady_*` → `false`),
+read from libghostty-vt by the Zig wrapper's `readCursor`. Frontends **honor**
+the request rather than blinking every cursor, so a steady cursor stays solid:
+
+- **GTK** drives a blink phase off the 60 Hz pump (`advance_blink` in
+  `main.rs`), toggling a blinking cursor every `CURSOR_BLINK_HALF` (600 ms,
+  GTK's default `gtk-cursor-blink-time` / 2) and resetting to solid on keypress;
+  `render` skips the cursor on the "off" half.
+- **TUI** adds `Modifier::SLOW_BLINK` to the painted cursor cell so the host
+  terminal blinks it.
+
+This is the second half of issue #50: the GTK bar cursor was visible but never
+blinked, even though Claude Code requests a *blinking* bar (`\x1b[5 q`).
 
 ## Key encoding (server-side)
 
@@ -288,6 +305,17 @@ is a wire break, which is why v14 → v15 → v16 each bump the version.
   pane relays install a `PaneTitleSink` as the backend's event sink; the
   sink stores the title on the relay and pushes the event to every attached
   client on the unbounded control channel (non-blocking; VT-parser-safe).
+
+### Wire changes (v19)
+
+`PROTOCOL_VERSION` = **19** (builds on v18, which added structured key input —
+`PtyKey` / `PtyKeyBatch`). Added field:
+
+- `CursorState` gains `blink: bool` — the inner program's DECSCUSR blink request
+  (see [Blink](#blink)). The FFI `KmuxCursor` carries it too, so the
+  `kmux-ghostty` ABI version is bumped **2 → 3**. A bare `steady → blinking`
+  DECSCUSR toggle with no cell change still reaches clients as a `CursorOnly`
+  diff (the diff engine compares the whole `CursorState`).
 
 ### Daemon flow (per diff)
 

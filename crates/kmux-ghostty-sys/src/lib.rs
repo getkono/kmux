@@ -20,7 +20,7 @@ use core::ffi::c_void;
 /// ABI version expected by this Rust crate. The Zig wrapper exports the same
 /// constant via [`kmux_ghostty_abi_version`]. Mismatch is a build-time
 /// inconsistency — safe wrappers must panic on mismatch.
-pub const EXPECTED_ABI_VERSION: u32 = 2;
+pub const EXPECTED_ABI_VERSION: u32 = 3;
 
 // Result codes returned by the Zig wrapper. `OK` is 0; everything else is
 // a negative error code. Kept in sync with `src/wrapper.zig`.
@@ -120,7 +120,10 @@ pub struct KmuxCursor {
     pub col: u16,
     pub shape: u8,
     pub visible: u8,
-    pub _pad: [u8; 2],
+    /// 1 if the inner program requested a blinking cursor (DECSCUSR
+    /// `blinking_*` / DEC mode 12 `cursor_blinking`), 0 for steady.
+    pub blink: u8,
+    pub _pad: [u8; 1],
 }
 
 #[repr(C)]

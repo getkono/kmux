@@ -24,7 +24,7 @@ const Action = gvt.StreamAction;
 // ABI constants
 // -----------------------------------------------------------------------------
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
 // Result codes. Must match the values `kmux-ghostty-sys::error` expects.
 const OK: i32 = 0;
@@ -103,7 +103,11 @@ const KmuxCursor = extern struct {
     col: u16,
     shape: u8,
     visible: u8,
-    _pad: [2]u8,
+    /// 1 if the cursor should blink (DECSCUSR blinking_* / mode `cursor_blinking`),
+    /// 0 for a steady cursor.  Rendering is the client's job; this only reports
+    /// the inner program's request.
+    blink: u8,
+    _pad: [1]u8,
 };
 
 const KmuxModes = extern struct {
@@ -493,6 +497,9 @@ fn readCursor(wrapper: *const Wrapper, out: *KmuxCursor) void {
     const term: *const Terminal = &wrapper.terminal;
     const cur = term.screens.active.cursor;
     const visible = term.modes.get(.cursor_visible);
+    // DECSCUSR blink request is tracked as DEC private mode 12 (`cursor_blinking`),
+    // set by the stream handler from blinking_* / steady_* style requests.
+    const blink = term.modes.get(.cursor_blinking);
     const shape: u8 = if (!visible) SHAPE_HIDDEN else switch (cur.cursor_style) {
         .block => SHAPE_BLOCK,
         .block_hollow => SHAPE_HOLLOW_BLOCK,
@@ -504,7 +511,8 @@ fn readCursor(wrapper: *const Wrapper, out: *KmuxCursor) void {
         .col = cur.x,
         .shape = shape,
         .visible = @intFromBool(visible),
-        ._pad = .{ 0, 0 },
+        .blink = @intFromBool(blink),
+        ._pad = .{0},
     };
 }
 
@@ -958,6 +966,33 @@ test "wrapper roundtrip: feed hello, read cells" {
     try std.testing.expectEqual(@as(u32, 'l'), buf[2].codepoint);
     try std.testing.expectEqual(@as(u32, 'l'), buf[3].codepoint);
     try std.testing.expectEqual(@as(u32, 'o'), buf[4].codepoint);
+}
+
+test "readCursor reports DECSCUSR blink request" {
+    const alloc = std.testing.allocator;
+    const sink: KmuxEventSink = .{
+        .user = null,
+        .on_title = null,
+        .on_bell = null,
+        .on_osc52 = null,
+        .on_hyperlink = null,
+    };
+    const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
+    defer w.destroy();
+
+    var cur: KmuxCursor = undefined;
+
+    // Blinking bar (DECSCUSR 5) → bar shape, blink set.
+    try w.stream.nextSlice("\x1b[5 q");
+    kmux_ghostty_cursor(w, &cur);
+    try std.testing.expectEqual(SHAPE_BAR, cur.shape);
+    try std.testing.expectEqual(@as(u8, 1), cur.blink);
+
+    // Steady bar (DECSCUSR 6) → bar shape, blink cleared.
+    try w.stream.nextSlice("\x1b[6 q");
+    kmux_ghostty_cursor(w, &cur);
+    try std.testing.expectEqual(SHAPE_BAR, cur.shape);
+    try std.testing.expectEqual(@as(u8, 0), cur.blink);
 }
 
 comptime {
