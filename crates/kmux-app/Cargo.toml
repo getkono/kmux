@@ -14,6 +14,7 @@ build = "build.rs"
 kmux-client.workspace = true
 kmux-protocol = { workspace = true, features = ["framing"] }
 anyhow.workspace = true
+base64.workspace = true
 clap.workspace = true
 tabled.workspace = true
 serde.workspace = true

@@ -22,6 +22,7 @@ kmux-app = { path = "crates/kmux-app" }
 
 # External dependencies
 anyhow = "1"
+base64 = "0.22"
 bitflags = "2.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
 arboard = { version = "3", default-features = false }

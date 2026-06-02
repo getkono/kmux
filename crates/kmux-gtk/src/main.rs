@@ -377,7 +377,13 @@ fn pump(
                 fe.core.mgr.metrics.record_batch(batch.len());
                 for m in batch {
                     let events = fe.core.mgr.handle_server_message(m);
-                    fe.core.handle_session_events(events);
+                    // Server-originated effects (OSC 52 clipboard writes) are
+                    // applied here with the frontend's own clipboard API.
+                    for eff in fe.core.handle_session_events(events) {
+                        if let KeyResult::CopyToClipboard(text) = eff {
+                            copy_to_clipboard(&text);
+                        }
+                    }
                 }
                 dirty = true;
             }
@@ -512,6 +518,14 @@ fn pump(
     }
 }
 
+/// Write `text` to the system clipboard. Shared by the user-initiated copy
+/// effect (`handle_effect`) and server-originated OSC 52 writes.
+fn copy_to_clipboard(text: &str) {
+    if let Some(display) = gdk::Display::default() {
+        display.clipboard().set_text(text);
+    }
+}
+
 /// Perform the toolkit-specific follow-up for a dispatch result: quit, clipboard
 /// copy/paste, and the reconnect / server-switch channel rebuilds.
 fn handle_effect(
@@ -523,11 +537,7 @@ fn handle_effect(
     match result {
         KeyResult::Continue => {}
         KeyResult::Quit => app.quit(),
-        KeyResult::CopyToClipboard(text) => {
-            if let Some(display) = gdk::Display::default() {
-                display.clipboard().set_text(&text);
-            }
-        }
+        KeyResult::CopyToClipboard(text) => copy_to_clipboard(&text),
         KeyResult::RequestPaste => {
             let Some(display) = gdk::Display::default() else {
                 return;

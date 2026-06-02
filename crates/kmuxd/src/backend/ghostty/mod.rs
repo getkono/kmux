@@ -119,7 +119,7 @@ impl TerminalBackend for GhosttyBackend {
         }
         // Pull the current title from the VT state after every feed. This
         // ensures the title is captured even when the push callback fires
-        // before a client subscribes to the broadcast channel. PaneTitleSink
+        // before a client subscribes to the broadcast channel. PaneEventSink
         // checks for change before broadcasting, so double-firing is a no-op.
         if let Some(title) = self.term.title()
             && title != self.last_title

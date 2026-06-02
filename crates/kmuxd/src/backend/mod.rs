@@ -71,18 +71,20 @@ pub struct CapabilityHandles {
 pub trait BackendEventSink: Send + Sync + 'static {
     fn on_title(&self, _title: &str) {}
     fn on_bell(&self) {}
-    // Called when the backend processes an OSC 52 copy or hyperlink
-    // sequence. libghostty-vt surfaces both; no production sink consumes
-    // them yet, so the default implementation drops silently.
-    #[allow(dead_code)]
+    /// Called when the backend processes an OSC 52 clipboard write.
+    /// `selection` is the normalized target ("c"/"p"/"s"/"0".."7") and
+    /// `base64_data` is the still-encoded payload. `PaneEventSink` broadcasts
+    /// this to clients, which decode and apply it at their clipboard leaf.
     fn on_osc52_copy(&self, _selection: &str, _base64_data: &str) {}
+    // libghostty-vt also surfaces OSC 8 hyperlinks; no production sink consumes
+    // them yet, so the default implementation drops silently.
     #[allow(dead_code)]
     fn on_hyperlink(&self, _id: Option<&str>, _uri: &str) {}
 }
 
 /// A no-op event sink used in tests that do not need backend events.
-/// Production pane relays install a real sink (`PaneTitleSink`) so OSC 0/2
-/// titles flow through to clients.
+/// Production pane relays install a real sink (`PaneEventSink`) so OSC 0/2
+/// titles and OSC 52 clipboard writes flow through to clients.
 #[cfg(test)]
 pub struct NullEventSink;
 #[cfg(test)]

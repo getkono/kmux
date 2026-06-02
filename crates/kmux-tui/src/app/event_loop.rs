@@ -166,7 +166,12 @@ impl App {
                             self.mgr.metrics.record_batch(batch.len());
                             for m in batch {
                                 let events = self.mgr.handle_server_message(m);
-                                self.handle_session_events(events);
+                                // Server-originated effects (OSC 52 clipboard
+                                // writes) are applied via the same arboard path
+                                // as user-initiated copies.
+                                for eff in self.handle_session_events(events) {
+                                    self.apply_clipboard_effect(eff);
+                                }
                             }
                             self.needs_render = true;
                         }
