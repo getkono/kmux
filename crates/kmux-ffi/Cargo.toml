@@ -1,0 +1,33 @@
+[package]
+name = "kmux-ffi"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "uniffi bindings exposing kmux_app::FrontendDriver to non-Rust frontends (e.g. the SwiftUI macOS app)."
+
+[lib]
+# `cdylib`/`staticlib` for linking into the Swift app; `lib` so the
+# uniffi-bindgen binary (library mode) can introspect the crate.
+crate-type = ["lib", "staticlib", "cdylib"]
+
+# Swift bindings are generated from the built cdylib in library mode:
+#   cargo build -p kmux-ffi
+#   cargo run  -p kmux-ffi --bin uniffi-bindgen -- \
+#     generate --library target/debug/libkmux_ffi.dylib --language swift \
+#     --out-dir <out>
+[[bin]]
+name = "uniffi-bindgen"
+path = "src/bin/uniffi-bindgen.rs"
+
+[dependencies]
+kmux-app.workspace = true
+kmux-client.workspace = true
+kmux-protocol = { workspace = true, features = ["framing"] }
+tokio.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+# `cli` provides `uniffi_bindgen_main` for the `uniffi-bindgen` binary above.
+uniffi = { workspace = true, features = ["cli"] }

@@ -144,10 +144,14 @@ private mode 12 `cursor_blinking`; `blinking_*` → `true`, `steady_*` → `fals
 read from libghostty-vt by the Zig wrapper's `readCursor`. Frontends **honor**
 the request rather than blinking every cursor, so a steady cursor stays solid:
 
-- **GTK** drives a blink phase off the 60 Hz pump (`advance_blink` in
-  `main.rs`), toggling a blinking cursor every `CURSOR_BLINK_HALF` (600 ms,
-  GTK's default `gtk-cursor-blink-time` / 2) and resetting to solid on keypress;
-  `render` skips the cursor on the "off" half.
+- **GTK** (and any frontend on the shared run loop) drives a blink phase off the
+  60 Hz pump via `kmux_app::driver::blink::advance_blink`, toggling a blinking
+  cursor every `CURSOR_BLINK_HALF` (600 ms, the common desktop
+  `gtk-cursor-blink-time` / 2) and resetting to solid on keypress;
+  `FrontendDriver::blink_on()` reports the current phase and `render` skips the
+  cursor on the "off" half. (The blink state machine moved from `kmux-gtk` into
+  `kmux-app` when the run loop was shared; the FFI `grid_snapshot` carries the
+  same `blink` bit and `blink_on()` so a SwiftUI renderer blinks identically.)
 - **TUI** adds `Modifier::SLOW_BLINK` to the painted cursor cell so the host
   terminal blinks it.
 
@@ -416,6 +420,19 @@ the boundary:
   `GhosttyBackend` guarantees the `Arc`s outlive the opaque term handle.
 - **ABI version check on construction.** `kmux_ghostty_abi_version()` is
   compared against a compile-time constant on both sides; mismatch panics.
+
+### Client-side FFI (`kmux-ffi` ↔ Swift)
+
+A *separate*, client-side FFI exposes the grid to a non-Rust frontend (the
+SwiftUI macOS app); it is unrelated to the daemon↔Zig boundary above but shares
+the same `CellAttrs` bit layout end to end. `kmux-ffi`'s `grid_snapshot` packs
+each cell into `PACKED_CELL_LEN` (16) little-endian bytes — codepoint `u32`, fg
+RGBA, bg RGBA, the `CellAttrs` bits (`u16`), width, reserved — with
+`DEFAULT_FG`/`DEFAULT_BG` resolved against the active palette in Rust so Swift
+never needs the theme to paint a cell. It is generation-gated (`grid_info`
+exposes `generation` + `cells_generation`) so the renderer re-fetches only
+changed frames, and versioned via `KMUX_FFI_ABI_VERSION`. See
+[architecture-frontend.md](architecture-frontend.md) and `kmux-ffi/src/cells.rs`.
 
 ## Reserved: runtime backend selection
 

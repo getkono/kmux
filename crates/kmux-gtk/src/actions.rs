@@ -18,7 +18,7 @@ use kmux_app::core::TopBarAction;
 use kmux_app::mode::{Action, CommandState, Mode};
 
 use crate::shell::Shell;
-use crate::{Frontend, handle_effect, prefs};
+use crate::{Frontend, apply_effects, prefs};
 
 /// The (`win.` name, dispatched `Action`, accelerators) table for the actions
 /// that map straight onto a shared [`Action`]. Pure data, shared by [`install`]
@@ -115,13 +115,13 @@ fn add_dispatch(
     let s = shell.clone();
     let app = app.clone();
     act.connect_activate(move |_, _| {
-        let result = {
+        let effects = {
             let mut f = fe.borrow_mut();
-            let r = futures::executor::block_on(f.core.dispatch_action(action.clone()));
+            let e = futures::executor::block_on(f.core.dispatch_action(action.clone()));
             f.core.needs_render = true;
-            r
+            e
         };
-        handle_effect(&fe, result, &app, &s.drawing);
+        apply_effects(&fe, effects, &app, &s.drawing);
         s.drawing.queue_draw();
     });
     shell.window.add_action(&act);

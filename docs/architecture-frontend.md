@@ -18,11 +18,12 @@ kmux-app        INTERACTION POLICY (toolkit-agnostic): Mode/Action + resolve,
       │         the /-command palette, AppCore view-model + dispatch +
       │         connection orchestration, theme palette (Rgb) + config,
       │         recent-servers, and the non-interactive CLI subcommands
-      ├───────────────┬─────────────────
-      ▼               ▼
-kmux-tui          kmux-gtk            FRONTENDS (presentation only)
-(ratatui +        (GTK4 + glib +
- crossterm)        cairo)
+      │         + the FrontendDriver (the shared run loop)
+      ├───────────────┬─────────────────┬─────────────────
+      ▼               ▼                 ▼
+kmux-tui          kmux-gtk          kmux-ffi            FRONTENDS
+(ratatui +        (GTK4 + glib +    (uniffi C ABI →     (presentation only)
+ crossterm)        cairo)            SwiftUI macOS app)
 ```
 
 **Hard rule:** nothing at or below `kmux-app` may depend on a UI toolkit.
@@ -75,10 +76,54 @@ The contract a frontend implements:
   `core.start_bootstrap(...)`, and drains the receivers in its own loop.
 
 The TUI pumps `AppCore` from a `tokio::select!` loop (`kmux-tui/src/app/
-event_loop.rs`); the GTK frontend pumps it from a `glib` timeout
-(`kmux-gtk/src/main.rs::pump`). The pump, the render leaf, and how each frontend
-produces `Action`s (modal keymap vs. native accelerators/widgets) differ; the
-core is identical.
+event_loop.rs`); the GTK frontend and `kmux-ffi` pump it through the
+**`FrontendDriver`** (below). The render leaf and how each frontend produces
+`Action`s (modal keymap vs. native accelerators/widgets) differ; the core is
+identical.
+
+## `FrontendDriver`: the shared run loop
+
+Driving `AppCore` has always meant the same arm-for-arm orchestration: own the
+four network channels (server messages, bootstrap outcome, transport upgrade,
+tunnel death), drain server messages → `mgr.handle_server_message` →
+`handle_session_events`, settle a debounced resize, handle the bootstrap outcome
+(and launch the SSH supervisor), apply a transport upgrade, react to a tunnel
+death, tick the liveness ping + metrics flush, and advance the cursor blink.
+That loop is **not** UI-specific, yet it used to be duplicated inside each
+frontend — and for a non-Rust frontend reaching `AppCore` across an FFI boundary
+(Swift cannot hold tokio channels, await receivers, or match `KeyResult`), it
+could not be expressed at all.
+
+`kmux_app::driver::FrontendDriver` lifts that orchestration into `kmux-app`. It
+owns the `AppCore`, the four channels, the liveness/metrics timers, the resize
+debounce, the blink phase, and the `/theme` change detection. A frontend:
+
+- builds an `AppCore` (with its own capabilities), wraps it with
+  `FrontendDriver::new` (which creates the channels and starts the initial
+  bootstrap),
+- calls `driver.tick()` once per frame from its own loop (a `glib` timeout, a
+  `CVDisplayLink`, …) and acts on the returned `FrontendEffect`s
+  (`NeedsRender`, `ForceClear`, `PaletteChanged`, `CopyToClipboard`,
+  `RequestPaste`, `Quit`) — clipboard payloads arrive already NUL-sanitized,
+- feeds input via `dispatch_action` / `apply_top_bar_action` /
+  `activate_picker_selection` (these now return `Vec<FrontendEffect>` and apply
+  reconnect / server-switch **internally** — the channel rebuild no longer lives
+  in the frontend), plus `send_keys`, `send_input`, `feed_paste`,
+  `request_resize` / `set_term_size`, `reconnect`,
+- reads state out via `Deref<Target = AppCore>` (`driver.mgr`, `driver.mode`,
+  `driver.palette`, …) plus `driver.active_grid()` and `driver.blink_on()`.
+
+It owns no run loop and no runtime — it assumes an *ambient* tokio runtime (its
+spawning paths use the current `Handle`), so the caller keeps control of the
+loop and the runtime. The toolkit-agnostic helpers that used to live in the GTK
+crate now live with it: `driver::blink::advance_blink` (the cursor-blink state
+machine) and `driver::clipboard::sanitize_clipboard_text` (NUL stripping).
+
+`kmux-gtk` is migrated onto the driver: its `Frontend` is now just
+`{ driver, metrics, css_provider }`, and `pump` is `driver.tick()` + apply
+effects + reconcile chrome + redraw. `kmux-tui` is intentionally **not** migrated
+— it keeps its own `tokio::select!` loop as the regression oracle (the driver
+has its own unit tests in `kmux-app/src/driver/`).
 
 ## Theme: one palette, per-frontend colors
 
@@ -194,9 +239,12 @@ widget mapping:
   disconnected as an `adw::Banner`; status messages as `adw::Toast`s; the
   metrics inspector as an `adw::Dialog`; and the performance HUD as a live
   `.osd` ticker.
-- A `glib` pump that mirrors every arm of the TUI's `tokio::select!`: reconnect,
+- A `glib` pump that calls `FrontendDriver::tick` each frame and applies the
+  returned `FrontendEffect`s; the orchestration it used to inline (reconnect,
   server switch, SSH supervisor, transport upgrade, tunnel death, liveness ping
-  + timeout, metrics flush, resize debounce, plus async clipboard paste.
+  + timeout, metrics flush, resize debounce, cursor blink) now lives in the
+  shared driver. Async clipboard paste (a `RequestPaste` effect → GDK async read
+  → `driver.feed_paste`) stays GTK-side.
 - Mouse scroll-wheel (PTY mouse-report or local scrollback) and drag text
   selection with copy.
 - libadwaita styling: the kmux palette feeds libadwaita's `accent_*` named
@@ -217,11 +265,24 @@ interaction layer. No new feature work targets it.
 - **In-process frontend selection.** Today you run `kmux` (GUI) or `kmux-tui`
   (TUI) as separate binaries. A `kmux --tui` flag could launch the terminal
   frontend in-process from the GUI binary when there is no display.
-- **Other platforms.** macOS/Windows native frontends (e.g. `kmux-cocoa`) would
-  each provide the `kmux` binary for their platform, built per-target. The
-  Unix-only client paths (`flock`, UDS, daemon spawn) need cfg-gating for a
-  Windows client — see `kmux-protocol/src/dirs.rs` for the path resolvers that
-  would gain `#[cfg(windows)]` branches.
+- **Native macOS (SwiftUI).** The `kmux-ffi` crate is the language boundary: a
+  `staticlib`/`cdylib` that wraps `FrontendDriver` in an opaque, thread-confined
+  `KmuxDriver` handle and exports a small **uniffi** surface (lifecycle + `tick`
+  → `FfiEffect`s, a generation-gated packed-cell `grid_snapshot` for a
+  CoreText/Metal renderer, `theme`/`mode`/`connection`/`sessions` getters, and
+  `dispatch`/`send_input`/`feed_paste`/`resize` input). The handle owns the
+  tokio runtime; all calls come from one thread (the Swift main thread). The
+  surface is versioned (`KMUX_FFI_ABI_VERSION`, asserted on the Swift side on top
+  of uniffi's binding-checksum check). Generate the Swift package from the built
+  cdylib in uniffi *library mode* — see `kmux-ffi/src/bin/uniffi-bindgen.rs`. The
+  Xcode/SwiftUI app and the Metal/CoreText grid renderer are the remaining work;
+  they consume `kmux-ffi`. The grid is encoded as a flat byte buffer
+  (`PACKED_CELL_LEN`-byte cells, `DEFAULT_FG`/`DEFAULT_BG` resolved against the
+  palette in Rust) so Swift reinterprets one buffer per *changed* frame.
+- **Windows.** A native Windows frontend would also drive `FrontendDriver`. The
+  Unix-only client paths (`flock`, UDS, daemon spawn) need cfg-gating — see
+  `kmux-protocol/src/dirs.rs` for the path resolvers that would gain
+  `#[cfg(windows)]` branches.
 - **GTK render polish.** Partial damage tracking (`queue_draw_area`, keyed off
   `CellGrid::cells_generation`) and same-attr run batching in the Pango
   renderer if profiling shows need; selection within scrolled-back history; and

@@ -1,0 +1,555 @@
+//! uniffi bindings exposing the kmux client to non-Rust frontends.
+//!
+//! This crate is the language boundary for a native GUI written in another
+//! language — concretely, the SwiftUI macOS app. It wraps the toolkit-agnostic
+//! [`kmux_app::driver::FrontendDriver`] in an opaque, thread-confined
+//! [`KmuxDriver`] handle and re-exports a small, flat, uniffi-friendly surface:
+//!
+//! - **Lifecycle**: [`KmuxDriver::new`] builds an `AppCore` (resolving the
+//!   server target / theme exactly as the CLI front door does), wraps it in a
+//!   `FrontendDriver`, and owns the tokio runtime the driver's background tasks
+//!   run on.
+//! - **Pump**: [`KmuxDriver::tick`] runs one driver iteration and returns the
+//!   [`FfiEffect`]s the frontend must act on. The Swift app calls this each
+//!   frame (e.g. from a `CVDisplayLink`).
+//! - **Render (hot path)**: [`KmuxDriver::grid_info`] /
+//!   [`KmuxDriver::grid_snapshot`] expose the active grid as a generation-gated,
+//!   packed byte buffer (see [`cells`]) so the renderer copies only changed
+//!   frames; plus [`KmuxDriver::theme`], [`KmuxDriver::mode`],
+//!   [`KmuxDriver::connection`], [`KmuxDriver::sessions`], and
+//!   [`KmuxDriver::blink_on`].
+//! - **Input**: [`KmuxDriver::dispatch`] (a curated [`FfiAction`] set),
+//!   [`KmuxDriver::send_input`] (raw PTY bytes), [`KmuxDriver::feed_paste`],
+//!   [`KmuxDriver::set_term_size`] / [`KmuxDriver::request_resize`].
+//!
+//! ## Threading
+//!
+//! All `KmuxDriver` methods are expected to be called from a single thread (the
+//! Swift main thread). Background tokio tasks communicate with the driver only
+//! through the four mpsc channels it owns; the `Mutex<FrontendDriver>` makes the
+//! handle `Send + Sync` for uniffi, and `tick` (under the lock) is the sole
+//! place `AppCore` is mutated, so there is no shared mutable cross-thread
+//! access. Off-main-thread calls are not part of the contract yet.
+
+mod cells;
+
+use std::sync::{Arc, Mutex};
+
+use tokio::runtime::Runtime;
+
+use kmux_app::config;
+use kmux_app::core::AppCore;
+use kmux_app::driver::{FrontendDriver, FrontendEffect};
+use kmux_app::mode::{Action, Mode};
+use kmux_app::subcommands::parse_target;
+use kmux_app::theme::{Rgb, Theme};
+use kmux_client::connection_state::ConnectionState;
+use kmux_client::generate_instance_id;
+use kmux_protocol::messages::{ClientCapabilities, TermSize};
+
+uniffi::setup_scaffolding!();
+
+/// ABI version of this FFI surface. Bumped on any breaking change to the
+/// exported types/functions, mirroring the repo's other versioned boundaries
+/// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
+/// The Swift wrapper asserts this on startup, on top of uniffi's built-in
+/// binding-checksum check.
+pub const KMUX_FFI_ABI_VERSION: u32 = 1;
+
+/// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
+/// check it before constructing a driver.
+#[uniffi::export]
+pub fn kmux_ffi_abi_version() -> u32 {
+    KMUX_FFI_ABI_VERSION
+}
+
+/// Failure constructing a [`KmuxDriver`].
+#[derive(Debug, thiserror::Error, uniffi::Error)]
+pub enum FfiError {
+    #[error("failed to initialize kmux: {message}")]
+    Init { message: String },
+}
+
+/// Parameters for [`KmuxDriver::new`]. Mirrors the CLI front door's launch plan:
+/// `server` is `None` for the local daemon or `"[user@]host"` for SSH; `theme`
+/// is a built-in theme name (defaulting when `None`); `rows`/`cols` and the
+/// pixel size are the initial content geometry.
+#[derive(uniffi::Record)]
+pub struct DriverConfig {
+    pub server: Option<String>,
+    pub ssh_port: Option<u16>,
+    pub cwd: Option<String>,
+    pub session: Option<String>,
+    pub theme: Option<String>,
+    pub rows: u16,
+    pub cols: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+}
+
+/// What a [`KmuxDriver::tick`] / [`KmuxDriver::dispatch`] asks the frontend to
+/// do. Mirrors [`FrontendEffect`]; reconnect / server-switch are handled inside
+/// the driver and never surface.
+#[derive(uniffi::Enum)]
+pub enum FfiEffect {
+    NeedsRender,
+    ForceClear,
+    PaletteChanged,
+    CopyToClipboard { text: String },
+    RequestPaste,
+    Quit,
+}
+
+impl From<FrontendEffect> for FfiEffect {
+    fn from(e: FrontendEffect) -> Self {
+        match e {
+            FrontendEffect::NeedsRender => FfiEffect::NeedsRender,
+            FrontendEffect::ForceClear => FfiEffect::ForceClear,
+            FrontendEffect::PaletteChanged => FfiEffect::PaletteChanged,
+            FrontendEffect::CopyToClipboard(text) => FfiEffect::CopyToClipboard { text },
+            FrontendEffect::RequestPaste => FfiEffect::RequestPaste,
+            FrontendEffect::Quit => FfiEffect::Quit,
+        }
+    }
+}
+
+/// A curated, toolkit-agnostic [`Action`] the frontend can dispatch by name.
+/// (The full `Action` vocabulary — per-character command-palette editing, modal
+/// keymap actions, … — is internal; a GUI binds widgets/accelerators to these.)
+#[derive(uniffi::Enum)]
+pub enum FfiAction {
+    CreateSession,
+    CloseSession,
+    NextSession,
+    PrevSession,
+    JumpToSession { index: u32 },
+    CreatePane,
+    ClosePane,
+    NextPane,
+    PrevPane,
+    ScrollUp { lines: u32 },
+    ScrollDown { lines: u32 },
+    ScrollPageUp,
+    ScrollPageDown,
+    ToggleHud,
+    ToggleMetrics,
+    ToggleInputLock,
+    CopySelection,
+    Paste,
+    Quit,
+    Reconnect,
+}
+
+impl From<FfiAction> for Action {
+    fn from(a: FfiAction) -> Self {
+        match a {
+            FfiAction::CreateSession => Action::CreateSession,
+            FfiAction::CloseSession => Action::CloseSession,
+            FfiAction::NextSession => Action::NextSession,
+            FfiAction::PrevSession => Action::PrevSession,
+            FfiAction::JumpToSession { index } => Action::JumpToSession(index as usize),
+            FfiAction::CreatePane => Action::CreatePane,
+            FfiAction::ClosePane => Action::ClosePane,
+            FfiAction::NextPane => Action::NextPane,
+            FfiAction::PrevPane => Action::PrevPane,
+            FfiAction::ScrollUp { lines } => Action::ScrollUp(lines as usize),
+            FfiAction::ScrollDown { lines } => Action::ScrollDown(lines as usize),
+            FfiAction::ScrollPageUp => Action::ScrollPageUp,
+            FfiAction::ScrollPageDown => Action::ScrollPageDown,
+            FfiAction::ToggleHud => Action::ToggleHud,
+            FfiAction::ToggleMetrics => Action::ToggleMetrics,
+            FfiAction::ToggleInputLock => Action::ToggleInputLock,
+            FfiAction::CopySelection => Action::CopySelection,
+            FfiAction::Paste => Action::Paste,
+            FfiAction::Quit => Action::Quit,
+            FfiAction::Reconnect => Action::Reconnect,
+        }
+    }
+}
+
+/// Cheap grid identity for change detection: the frontend re-fetches
+/// [`KmuxDriver::grid_snapshot`] only when a generation differs. `generation`
+/// changes on *any* update (cursor move or cell change); `cells_generation`
+/// changes only when cells change (so the renderer can skip re-packing cells
+/// when only the cursor moved).
+#[derive(uniffi::Record)]
+pub struct GridInfo {
+    pub rows: u32,
+    pub cols: u32,
+    pub generation: u64,
+    pub cells_generation: u64,
+}
+
+/// Cursor position + appearance. `shape`: 0=block, 1=underline, 2=bar,
+/// 3=hollow-block, 4=hidden.
+#[derive(uniffi::Record)]
+pub struct FfiCursor {
+    pub row: u32,
+    pub col: u32,
+    pub shape: u8,
+    pub visible: bool,
+    pub blink: bool,
+}
+
+/// The active grid as a packed cell buffer (see [`cells`]) plus dimensions and
+/// cursor. `cells` is `rows * cols * 16` bytes, row-major.
+#[derive(uniffi::Record)]
+pub struct GridSnapshot {
+    pub rows: u32,
+    pub cols: u32,
+    pub cursor: FfiCursor,
+    pub cells: Vec<u8>,
+}
+
+/// An RGB palette color.
+#[derive(uniffi::Record)]
+pub struct FfiColor {
+    pub r: u8,
+    pub g: u8,
+    pub b: u8,
+}
+
+impl From<Rgb> for FfiColor {
+    fn from(c: Rgb) -> Self {
+        Self {
+            r: c.r,
+            g: c.g,
+            b: c.b,
+        }
+    }
+}
+
+/// The active toolkit-neutral palette.
+#[derive(uniffi::Record)]
+pub struct FfiTheme {
+    pub bg: FfiColor,
+    pub fg: FfiColor,
+    pub fg_dim: FfiColor,
+    pub accent: FfiColor,
+    pub green: FfiColor,
+    pub red: FfiColor,
+    pub yellow: FfiColor,
+    pub purple: FfiColor,
+    pub orange: FfiColor,
+    pub status_bg: FfiColor,
+    pub cursor_bg: FfiColor,
+    pub cursor_fg: FfiColor,
+}
+
+impl From<&Theme> for FfiTheme {
+    fn from(t: &Theme) -> Self {
+        Self {
+            bg: t.bg.into(),
+            fg: t.fg.into(),
+            fg_dim: t.fg_dim.into(),
+            accent: t.accent.into(),
+            green: t.green.into(),
+            red: t.red.into(),
+            yellow: t.yellow.into(),
+            purple: t.purple.into(),
+            orange: t.orange.into(),
+            status_bg: t.status_bg.into(),
+            cursor_bg: t.cursor_bg.into(),
+            cursor_fg: t.cursor_fg.into(),
+        }
+    }
+}
+
+/// Connection lifecycle state (for the connection badge / disconnect overlay).
+#[derive(uniffi::Enum)]
+pub enum FfiConnStatus {
+    Idle,
+    Handshaking,
+    Connected,
+    Reconnecting,
+    Disconnected,
+}
+
+impl From<&ConnectionState> for FfiConnStatus {
+    fn from(s: &ConnectionState) -> Self {
+        match s {
+            ConnectionState::Idle => FfiConnStatus::Idle,
+            ConnectionState::Handshaking => FfiConnStatus::Handshaking,
+            ConnectionState::Connected { .. } => FfiConnStatus::Connected,
+            ConnectionState::Reconnecting { .. } => FfiConnStatus::Reconnecting,
+            ConnectionState::Disconnected { .. } => FfiConnStatus::Disconnected,
+        }
+    }
+}
+
+/// Connection state + a human-readable badge label.
+#[derive(uniffi::Record)]
+pub struct FfiConnInfo {
+    pub status: FfiConnStatus,
+    pub label: String,
+}
+
+/// One session in the session list.
+#[derive(uniffi::Record)]
+pub struct FfiSession {
+    pub word_id: String,
+    pub name: String,
+    pub cwd: String,
+    pub active: bool,
+}
+
+/// Which interaction mode / overlay is active. Carries the text the matching
+/// overlay needs (connecting label, disconnect reason); list contents are read
+/// via the dedicated getters.
+#[derive(uniffi::Enum)]
+pub enum FfiMode {
+    Normal,
+    Locked,
+    SessionPicker,
+    ServerPicker,
+    DirectoryPicker,
+    Help,
+    Command,
+    Connecting { label: String },
+    Disconnected { reason: String },
+    Other,
+}
+
+fn mode_to_ffi(mode: &Mode) -> FfiMode {
+    match mode {
+        Mode::Normal => FfiMode::Normal,
+        Mode::Locked => FfiMode::Locked,
+        Mode::SessionPicker => FfiMode::SessionPicker,
+        Mode::ServerPicker => FfiMode::ServerPicker,
+        Mode::DirectoryPicker => FfiMode::DirectoryPicker,
+        Mode::Help => FfiMode::Help,
+        Mode::Command(_) => FfiMode::Command,
+        Mode::Connecting { target_display } => FfiMode::Connecting {
+            label: target_display.clone(),
+        },
+        Mode::Disconnected { reason } => FfiMode::Disconnected {
+            reason: reason.clone(),
+        },
+        _ => FfiMode::Other,
+    }
+}
+
+/// Build an [`AppCore`] from a [`DriverConfig`], resolving the server target and
+/// theme exactly as `kmux_app::launch::run_cli` does for the Rust frontends.
+fn build_core(config: &DriverConfig) -> AppCore {
+    let (target, parsed_server) = parse_target(config.server.as_deref(), config.ssh_port);
+    let auto_cwd = config
+        .cwd
+        .clone()
+        .or_else(|| parsed_server.as_ref().and_then(|p| p.path.clone()));
+    let theme = config::resolve_theme(config.theme.as_deref());
+    let initial_cwd = std::env::current_dir()
+        .ok()
+        .and_then(|p| p.to_str().map(String::from))
+        .unwrap_or_default();
+    // GUI capabilities: truecolor on, no kitty keyboard/graphics concept.
+    let capabilities = ClientCapabilities {
+        truecolor: true,
+        kitty_graphics: false,
+        kitty_keyboard: false,
+        term: None,
+        term_program: Some("kmux-macos".to_string()),
+    };
+    let term_size = TermSize {
+        rows: config.rows,
+        cols: config.cols,
+        pixel_width: config.pixel_width,
+        pixel_height: config.pixel_height,
+    };
+    AppCore::new(
+        target,
+        initial_cwd,
+        generate_instance_id(),
+        config.session.clone(),
+        auto_cwd,
+        capabilities,
+        theme,
+        term_size,
+    )
+}
+
+/// Opaque, thread-confined handle wrapping a [`FrontendDriver`] and the tokio
+/// runtime its background tasks run on. See the module docs for the threading
+/// contract.
+#[derive(uniffi::Object)]
+pub struct KmuxDriver {
+    rt: Runtime,
+    inner: Mutex<FrontendDriver>,
+}
+
+#[uniffi::export]
+impl KmuxDriver {
+    /// Build a driver and kick off the initial connection (per `config`).
+    #[uniffi::constructor]
+    pub fn new(config: DriverConfig) -> Result<Arc<Self>, FfiError> {
+        let rt = Runtime::new().map_err(|e| FfiError::Init {
+            message: e.to_string(),
+        })?;
+        let core = build_core(&config);
+        // `FrontendDriver::new` spawns the initial bootstrap, so build it with
+        // the runtime entered.
+        let driver = {
+            let _guard = rt.enter();
+            FrontendDriver::new(core)
+        };
+        Ok(Arc::new(Self {
+            rt,
+            inner: Mutex::new(driver),
+        }))
+    }
+
+    /// The ABI version this library was built with (see [`KMUX_FFI_ABI_VERSION`]).
+    pub fn abi_version(&self) -> u32 {
+        KMUX_FFI_ABI_VERSION
+    }
+
+    /// Run one pump iteration and return the effects to act on. Call once per
+    /// frame. The runtime is entered so the driver's outcome arm can spawn the
+    /// SSH supervisor.
+    pub fn tick(&self) -> Vec<FfiEffect> {
+        let _guard = self.rt.enter();
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.tick().into_iter().map(FfiEffect::from).collect()
+    }
+
+    /// Dispatch a curated action; returns any resulting effects. Reconnect /
+    /// server-switch are applied internally by the driver.
+    pub fn dispatch(&self, action: FfiAction) -> Vec<FfiEffect> {
+        let act = Action::from(action);
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        // `dispatch_action` is async; `block_on` drives it to completion and
+        // provides the runtime context its internal spawns need. (Not combined
+        // with `rt.enter()`, which would make `block_on` panic.)
+        self.rt
+            .block_on(d.dispatch_action(act))
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// Rebuild the connection channels and reconnect to the current target.
+    pub fn reconnect(&self) {
+        let _guard = self.rt.enter();
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .reconnect();
+    }
+
+    /// Forward raw bytes to the active pane's PTY.
+    pub fn send_input(&self, bytes: Vec<u8>) {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .send_input(bytes);
+    }
+
+    /// Feed clipboard text back as a paste (in response to
+    /// [`FfiEffect::RequestPaste`]).
+    pub fn feed_paste(&self, text: String) {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .feed_paste(text);
+    }
+
+    /// Report a new content size immediately (no debounce).
+    pub fn set_term_size(&self, rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .set_term_size(TermSize {
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+            });
+    }
+
+    /// Report a new content size, debounced (applied from a later [`tick`]).
+    ///
+    /// [`tick`]: KmuxDriver::tick
+    pub fn request_resize(&self, rows: u16, cols: u16, pixel_width: u16, pixel_height: u16) {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .request_resize(TermSize {
+                rows,
+                cols,
+                pixel_width,
+                pixel_height,
+            });
+    }
+
+    /// Cheap grid identity for change detection (`None` if no active pane).
+    pub fn grid_info(&self) -> Option<GridInfo> {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        d.active_grid().map(|g| GridInfo {
+            rows: g.rows as u32,
+            cols: g.cols as u32,
+            generation: g.generation(),
+            cells_generation: g.cells_generation(),
+        })
+    }
+
+    /// The active grid packed for rendering (`None` if no active pane).
+    pub fn grid_snapshot(&self) -> Option<GridSnapshot> {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let grid = d.active_grid()?;
+        let cells = cells::encode_cells(grid, &d.palette);
+        let c = grid.cursor();
+        Some(GridSnapshot {
+            rows: grid.rows as u32,
+            cols: grid.cols as u32,
+            cursor: FfiCursor {
+                row: c.row as u32,
+                col: c.col as u32,
+                shape: cells::cursor_shape_code(c.shape),
+                visible: c.visible,
+                blink: c.blink,
+            },
+            cells,
+        })
+    }
+
+    /// The active palette (for the renderer + native chrome).
+    pub fn theme(&self) -> FfiTheme {
+        FfiTheme::from(&self.inner.lock().expect("driver mutex poisoned").palette)
+    }
+
+    /// The current connection state + badge label.
+    pub fn connection(&self) -> FfiConnInfo {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let state = d.mgr.connection_state();
+        FfiConnInfo {
+            status: FfiConnStatus::from(state),
+            label: state.badge_label(),
+        }
+    }
+
+    /// The session list, with the active session flagged.
+    pub fn sessions(&self) -> Vec<FfiSession> {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let active = d.mgr.active_session().map(|s| s.to_string());
+        d.mgr
+            .session_list()
+            .iter()
+            .map(|e| FfiSession {
+                active: active.as_deref() == Some(e.meta.word_id.as_str()),
+                word_id: e.meta.word_id.clone(),
+                name: e.meta.name.clone(),
+                cwd: e.meta.cwd.clone(),
+            })
+            .collect()
+    }
+
+    /// Whether the cursor is shown on the current frame (blink phase).
+    pub fn blink_on(&self) -> bool {
+        self.inner.lock().expect("driver mutex poisoned").blink_on()
+    }
+
+    /// Which interaction mode / overlay is active.
+    pub fn mode(&self) -> FfiMode {
+        mode_to_ffi(&self.inner.lock().expect("driver mutex poisoned").mode)
+    }
+}

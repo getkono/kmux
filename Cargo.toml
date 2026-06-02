@@ -49,6 +49,7 @@ toml = "1.1.2"
 tabled = "0.20.0"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+uniffi = "0.28"
 
 # Dev dependencies
 tempfile = "3"

@@ -32,3 +32,8 @@ zig-out/
 /RELEASE_NOTES.md
 # Backup left by the in-place version bump in `just release`.
 /Cargo.toml.bak
+
+# === kmux-ffi ===
+# Generated uniffi Swift bindings (regenerated from the built cdylib; see
+# crates/kmux-ffi/src/bin/uniffi-bindgen.rs).
+/crates/kmux-ffi/bindings/
