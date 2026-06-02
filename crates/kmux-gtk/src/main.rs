@@ -312,7 +312,7 @@ fn pump(
 /// (from [`FrontendDriver::tick`] or an input dispatch). Returns whether a
 /// repaint is needed. Reconnect / server-switch are handled inside the driver
 /// and never reach here.
-pub fn apply_effects(
+pub(crate) fn apply_effects(
     fe: &Rc<RefCell<Frontend>>,
     effects: Vec<FrontendEffect>,
     app: &Application,
