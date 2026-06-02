@@ -16,7 +16,7 @@ use crate::term_state::new_term_state;
 use super::ansi_emit::{seed_pane_with_preamble, snapshot_to_ansi};
 use super::helpers::resolve_cwd;
 use super::persistence::RestoreReport;
-use super::{ClientMap, PaneRelay, PaneTitleSink, SCROLLBACK_CAPACITY, ServerApp, SessionState};
+use super::{ClientMap, PaneEventSink, PaneRelay, SCROLLBACK_CAPACITY, ServerApp, SessionState};
 
 impl ServerApp {
     /// Restore sessions from a [`PersistedDaemonState`].
@@ -97,7 +97,7 @@ impl ServerApp {
                 let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
                 let scrollback = Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY)));
                 let title = Arc::new(Mutex::new(String::new()));
-                let title_sink = Arc::new(PaneTitleSink::new(
+                let title_sink = Arc::new(PaneEventSink::new(
                     pane_id.clone(),
                     title.clone(),
                     self.vt_events_tx.clone(),

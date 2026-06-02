@@ -46,10 +46,11 @@ impl App {
     }
 
     /// Perform the toolkit-specific clipboard I/O for the clipboard effects the
-    /// core emits. These are handled here (using `arboard`) and collapsed to
-    /// `Continue` so they never reach the event loop. A GUI frontend would
-    /// implement the same two effects with its own clipboard API.
-    fn apply_clipboard_effect(&mut self, result: KeyResult) -> KeyResult {
+    /// core emits — both user-initiated copies (from `handle_key`) and
+    /// server-originated OSC 52 writes (from the event loop). Handled here using
+    /// `arboard` and collapsed to `Continue` so they never reach the event loop.
+    /// A GUI frontend implements the same effects with its own clipboard API.
+    pub(super) fn apply_clipboard_effect(&mut self, result: KeyResult) -> KeyResult {
         match result {
             KeyResult::CopyToClipboard(text) => {
                 tokio::task::spawn_blocking(move || {

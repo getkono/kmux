@@ -14,10 +14,12 @@ use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
+use base64::Engine;
+
 use crate::mode::Mode;
 use crate::recent_servers::{RecentServer, ServerKind};
 
-use super::{AppCore, SwitchTarget};
+use super::{AppCore, KeyResult, SwitchTarget};
 
 #[derive(Debug)]
 pub enum BootstrapPhase {
@@ -31,9 +33,36 @@ pub enum BootstrapTaskResult {
     Failed(String),
 }
 
+/// Map an OSC 52 clipboard-write event to a clipboard effect, applying the
+/// active-pane policy. Returns `None` when the event is from a non-focused pane
+/// or the base64 payload is invalid, so a background pane cannot clobber the
+/// local clipboard. In v1 every selection target is written to the system
+/// clipboard; primary-vs-clipboard routing is future work.
+fn osc52_clipboard_effect(
+    active_pane: Option<&str>,
+    pane_id: &str,
+    _selection: &str,
+    data: &str,
+) -> Option<KeyResult> {
+    if active_pane != Some(pane_id) {
+        return None;
+    }
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(data)
+        .ok()?;
+    Some(KeyResult::CopyToClipboard(
+        String::from_utf8_lossy(&bytes).into_owned(),
+    ))
+}
+
 impl AppCore {
     /// React to `SessionEvent`s returned from `SessionManager::handle_server_message`.
-    pub fn handle_session_events(&mut self, events: Vec<SessionEvent>) {
+    ///
+    /// Returns the toolkit-specific effects the frontend must perform — currently
+    /// only `CopyToClipboard`, from OSC 52 writes honored by the active-pane
+    /// policy. The frontend applies them with its own clipboard API.
+    pub fn handle_session_events(&mut self, events: Vec<SessionEvent>) -> Vec<KeyResult> {
+        let mut effects = Vec::new();
         for event in events {
             match event {
                 SessionEvent::AuthFailed { .. } => {
@@ -70,9 +99,24 @@ impl AppCore {
                         self.auto_select_session();
                     }
                 }
+                SessionEvent::ClipboardCopy {
+                    pane_id,
+                    selection,
+                    data,
+                } => {
+                    if let Some(eff) = osc52_clipboard_effect(
+                        self.mgr.active_pane_id(),
+                        &pane_id,
+                        &selection,
+                        &data,
+                    ) {
+                        effects.push(eff);
+                    }
+                }
                 _ => {}
             }
         }
+        effects
     }
 
     /// Auto-select or create a session based on CLI flags (--session, --cwd, :path).
@@ -490,5 +534,32 @@ mod tests {
         assert_eq!(core.server_string, "alice@example.com");
         assert!(core.ssh_target.is_some());
         assert!(matches!(core.server_kind, ServerKind::Ssh { .. }));
+    }
+
+    #[test]
+    fn osc52_from_active_pane_decodes_to_clipboard_effect() {
+        // "aGVsbG8=" is base64 for "hello".
+        let eff = osc52_clipboard_effect(Some("eagle/0"), "eagle/0", "c", "aGVsbG8=");
+        match eff {
+            Some(KeyResult::CopyToClipboard(text)) => assert_eq!(text, "hello"),
+            _ => panic!("expected CopyToClipboard"),
+        }
+    }
+
+    #[test]
+    fn osc52_from_background_pane_is_ignored() {
+        // Active pane differs from the originating pane → no clipboard write.
+        let eff = osc52_clipboard_effect(Some("eagle/0"), "eagle/1", "c", "aGVsbG8=");
+        assert!(eff.is_none());
+
+        // No active pane at all is likewise ignored.
+        let eff = osc52_clipboard_effect(None, "eagle/0", "c", "aGVsbG8=");
+        assert!(eff.is_none());
+    }
+
+    #[test]
+    fn osc52_invalid_base64_is_ignored() {
+        let eff = osc52_clipboard_effect(Some("eagle/0"), "eagle/0", "c", "not valid base64!");
+        assert!(eff.is_none());
     }
 }

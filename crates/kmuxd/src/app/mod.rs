@@ -53,21 +53,23 @@ pub struct ClientSender {
 /// Shared map of per-client output senders for a single pane.
 pub type ClientMap = Arc<Mutex<HashMap<ClientId, ClientSender>>>;
 
-/// Backend event sink that owns the canonical title string for a pane and
-/// broadcasts `PaneTitleChanged` to all connected clients via the server-wide
-/// VT events channel whenever the VT emulator reports a new OSC 0/2 title.
+/// Backend event sink for a single pane. Owns the canonical title string and
+/// broadcasts VT-originated events (`PaneTitleChanged` for OSC 0/2,
+/// `PaneClipboardCopy` for OSC 52) to all connected clients via the server-wide
+/// VT events channel whenever the VT emulator reports them.
 ///
-/// The `on_title` callback is invoked from the VT parser loop, so the send
-/// uses a non-blocking operation only. Broadcasting server-wide (rather than
-/// only to clients attached to this specific pane) ensures that the tab bar
-/// reflects live title updates for all panes, not just the active one.
-pub struct PaneTitleSink {
+/// The callbacks are invoked from the VT parser loop, so each send uses a
+/// non-blocking operation only. Broadcasting server-wide (rather than only to
+/// clients attached to this specific pane) keeps the tab bar's titles live for
+/// every pane; per-client policy (e.g. only honoring OSC 52 from the focused
+/// pane) is applied on the client side.
+pub struct PaneEventSink {
     pane_id: String,
     title: Arc<Mutex<String>>,
     vt_events: broadcast::Sender<kmux_protocol::messages::ServerMessage>,
 }
 
-impl PaneTitleSink {
+impl PaneEventSink {
     pub fn new(
         pane_id: String,
         title: Arc<Mutex<String>>,
@@ -81,7 +83,7 @@ impl PaneTitleSink {
     }
 }
 
-impl crate::backend::BackendEventSink for PaneTitleSink {
+impl crate::backend::BackendEventSink for PaneEventSink {
     fn on_title(&self, title: &str) {
         {
             let mut current = self.title.lock().unwrap();
@@ -94,6 +96,18 @@ impl crate::backend::BackendEventSink for PaneTitleSink {
             event: kmux_protocol::messages::SessionEventMsg::PaneTitleChanged {
                 pane_id: self.pane_id.clone(),
                 title: title.to_string(),
+            },
+        };
+        // Ignore error: no receivers means no clients are currently connected.
+        let _ = self.vt_events.send(event);
+    }
+
+    fn on_osc52_copy(&self, selection: &str, base64_data: &str) {
+        let event = kmux_protocol::messages::ServerMessage::Event {
+            event: kmux_protocol::messages::SessionEventMsg::PaneClipboardCopy {
+                pane_id: self.pane_id.clone(),
+                selection: selection.to_string(),
+                data: base64_data.to_string(),
             },
         };
         // Ignore error: no receivers means no clients are currently connected.
@@ -547,6 +561,41 @@ mod tests {
         app.unregister_client(c2).await;
         rx.changed().await.unwrap();
         assert_eq!(*rx.borrow(), 0);
+    }
+
+    #[test]
+    fn pane_event_sink_broadcasts_osc52_copy() {
+        use std::sync::Mutex;
+
+        use kmux_protocol::messages::{ServerMessage, SessionEventMsg};
+        use tokio::sync::broadcast;
+
+        use crate::backend::BackendEventSink;
+
+        let (tx, mut rx) = broadcast::channel(8);
+        let sink = super::PaneEventSink::new(
+            "eagle/0".to_string(),
+            Arc::new(Mutex::new(String::new())),
+            tx,
+        );
+
+        sink.on_osc52_copy("c", "aGVsbG8=");
+
+        match rx.try_recv().expect("event broadcast") {
+            ServerMessage::Event {
+                event:
+                    SessionEventMsg::PaneClipboardCopy {
+                        pane_id,
+                        selection,
+                        data,
+                    },
+            } => {
+                assert_eq!(pane_id, "eagle/0");
+                assert_eq!(selection, "c");
+                assert_eq!(data, "aGVsbG8=");
+            }
+            other => panic!("expected PaneClipboardCopy, got {other:?}"),
+        }
     }
 
     #[tokio::test]

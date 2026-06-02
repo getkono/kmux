@@ -62,6 +62,13 @@ The contract a frontend implements:
   specific, so the *frontend* performs it. `ForwardKey` (sending a keystroke to
   the PTY under the live terminal-mode state) also stays frontend-side, because
   the byte/escape encoding is toolkit-specific.
+  - The same effect channel carries *server-originated* clipboard writes:
+    `handle_session_events(events)` returns `Vec<KeyResult>` so an **OSC 52**
+    copy from a remote pane (`SessionEventMsg::PaneClipboardCopy`) reaches the
+    local clipboard. The *policy* lives in the core — it honors the write only
+    when it came from the client's active pane and base64-decodes the payload —
+    while the *mechanism* (the actual `set_text`) stays in the frontend, reusing
+    the `CopyToClipboard` path. So a background pane can't clobber your clipboard.
 - **Channels**: `AppCore` owns the tokio mpsc channels for *network* events
   (server messages, bootstrap outcome, transport upgrade, tunnel death) — those
   are core concerns. The frontend creates the channels, hands the senders to
