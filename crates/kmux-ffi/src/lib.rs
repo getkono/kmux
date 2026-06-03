@@ -426,7 +426,13 @@ pub struct FfiScrollInfo {
 /// Convert a *visible* viewport cell to the grid's absolute coordinate space
 /// (row 0 = oldest scrollback line), clamping to the viewport. Mirrors the GTK
 /// frontend's `pos_at`; only valid at the live bottom (`scroll_offset == 0`).
-fn visible_to_abs(scrollback_len: usize, rows: usize, cols: usize, vrow: u32, vcol: u32) -> GridPos {
+fn visible_to_abs(
+    scrollback_len: usize,
+    rows: usize,
+    cols: usize,
+    vrow: u32,
+    vcol: u32,
+) -> GridPos {
     GridPos {
         row: scrollback_len + (vrow as usize).min(rows.saturating_sub(1)),
         col: (vcol as usize).min(cols.saturating_sub(1)),
@@ -1163,7 +1169,10 @@ impl KmuxDriver {
 
     /// The built-in theme names (for a Preferences theme picker).
     pub fn available_themes(&self) -> Vec<String> {
-        theme::BUILTIN_THEMES.iter().map(|s| s.to_string()).collect()
+        theme::BUILTIN_THEMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
     }
 
     /// Switch the active palette to a built-in theme by name (no-op if unknown).
