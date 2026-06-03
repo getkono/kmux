@@ -70,7 +70,7 @@ just macos-test    # gen bindings + swift test
 ## Install
 
 ```sh
-just install       # release build → ~/Applications/kmux.app + CLIs in ~/.cargo/bin
+just install       # release build → ~/Applications/kmux.app + CLIs & `kmux` in ~/.cargo/bin
 ```
 
 `just install` is the macOS counterpart of the Linux GTK install. It:
@@ -83,7 +83,14 @@ just install       # release build → ~/Applications/kmux.app + CLIs in ~/.carg
    `kmuxd` beside it, `Contents/Resources/kmux.icns`, and a versioned
    `Contents/Info.plist` (from [`kmux-swift/macos/`](../kmux-swift/macos/)) — so
    the app appears in Launchpad / Spotlight / Dock with its icon. This is the
-   macOS analog of kmux-gtk's `.desktop` entry + icon on Linux.
+   macOS analog of kmux-gtk's `.desktop` entry + icon on Linux, then
+4. installs a `kmux` launcher ([`kmux-swift/macos/kmux`](../kmux-swift/macos/kmux))
+   into the cargo bin dir (`~/.cargo/bin`, beside the CLIs). It execs the
+   bundle's `kmux-swift` executable, so typing `kmux` in a terminal starts the
+   GUI — the macOS analog of the Linux `kmux` (GTK) binary. Running the
+   in-bundle Mach-O directly (vs. `open`ing the bundle) forwards args + stdio and
+   runs in the foreground; macOS still applies the bundle's icon/menu because it
+   finds `Contents/Info.plist` above the executable.
 
 `kmuxd` is bundled *beside* the app exe because `find_server_binary()` checks the
 running exe's own directory before `PATH`: a Finder/Spotlight launch gets the

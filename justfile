@@ -129,12 +129,14 @@ install:
     #!/usr/bin/env bash
     set -euo pipefail
     # The CLI binaries (kmux-tui, kmuxd) go to ~/.cargo/bin on every platform; the
-    # GUI is installed the platform-native way with its launcher entry + icon:
+    # GUI is installed the platform-native way with its launcher entry + icon, and
+    # in both cases `kmux` on PATH starts the GUI:
     #   - Linux: the GTK GUI (`kmux`) to ~/.cargo/bin, plus its .desktop entry +
     #            icon into the XDG data dirs (Activities / app grid).
     #   - macOS: the SwiftUI app assembled into ~/Applications/kmux.app (Launchpad
     #            / Spotlight / Dock), bundling kmuxd beside it so a Finder-launched
-    #            app can auto-spawn the local daemon.
+    #            app can auto-spawn the local daemon, plus a `kmux` launcher in the
+    #            cargo bin dir that execs the bundle so `kmux` starts the GUI too.
     cargo install --path crates/kmux-tui
     cargo install --path crates/kmuxd
     if [[ "$(uname -s)" == "Linux" ]]; then
@@ -172,7 +174,17 @@ install:
         # Refresh Launch Services so Finder/Spotlight pick up the new bundle + icon.
         touch "$app"
         /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app" 2>/dev/null || true
-        echo "==> installed kmux.app to ~/Applications (launch from Launchpad/Spotlight)"
+        # Install a `kmux` launcher on PATH (the macOS analog of the Linux GTK
+        # `kmux` binary): exec the bundle so `kmux` from a terminal starts the
+        # GUI. Goes in the same cargo bin dir as the CLIs installed above.
+        if [[ -n "${CARGO_INSTALL_ROOT:-}" ]]; then
+            bindir="$CARGO_INSTALL_ROOT/bin"
+        else
+            bindir="${CARGO_HOME:-$HOME/.cargo}/bin"
+        fi
+        mkdir -p "$bindir"
+        install -m 0755 kmux-swift/macos/kmux "$bindir/kmux"
+        echo "==> installed kmux.app to ~/Applications (launch from Launchpad/Spotlight) + 'kmux' launcher to $bindir"
     fi
 
 # Stage a distributable release tarball for the host target into dist/.
