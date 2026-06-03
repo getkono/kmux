@@ -14,8 +14,10 @@ struct KmuxSwiftApp: App {
         WindowGroup {
             ContentView(model: model, ui: ui)
                 .onAppear {
-                    // Launched from a terminal (no app bundle), so claim regular
-                    // app status and come to the foreground.
+                    // Claim regular foreground-app status and come to the front.
+                    // Needed when launched as a bare executable from a terminal
+                    // (`swift run` / `just macos-run`); harmless + idempotent when
+                    // launched from the installed `~/Applications/kmux.app` bundle.
                     NSApplication.shared.setActivationPolicy(.regular)
                     NSApplication.shared.activate(ignoringOtherApps: true)
                     model.start()

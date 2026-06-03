@@ -67,6 +67,31 @@ just macos-test    # gen bindings + swift test
 (or directly: `swift build --package-path kmux-swift`, etc., after
 `just gen-ffi-bindings`).
 
+## Install
+
+```sh
+just install       # release build → ~/Applications/kmux.app + CLIs in ~/.cargo/bin
+```
+
+`just install` is the macOS counterpart of the Linux GTK install. It:
+
+1. installs the CLIs (`kmux-tui`, `kmuxd`) to `~/.cargo/bin` (release), then
+2. builds the release `kmux-ffi` staticlib + matching Swift bindings
+   (`just gen-ffi-bindings release`) and the app in release, linking that
+   archive (via `KMUX_FFI_LIB`, which overrides `Package.swift`'s debug default),
+3. assembles `~/Applications/kmux.app` — `Contents/MacOS/kmux-swift`, a copy of
+   `kmuxd` beside it, `Contents/Resources/kmux.icns`, and a versioned
+   `Contents/Info.plist` (from [`kmux-swift/macos/`](../kmux-swift/macos/)) — so
+   the app appears in Launchpad / Spotlight / Dock with its icon. This is the
+   macOS analog of kmux-gtk's `.desktop` entry + icon on Linux.
+
+`kmuxd` is bundled *beside* the app exe because `find_server_binary()` checks the
+running exe's own directory before `PATH`: a Finder/Spotlight launch gets the
+minimal launchd `PATH` (no `~/.cargo/bin`), so without the sibling copy the app
+couldn't auto-spawn the local daemon. Both that copy and the `~/.cargo/bin` one
+resolve `libkmux_ghostty` via the rpath baked into the build tree (a from-source
+dev install, like `cargo install`), not a bundled dylib.
+
 ## End-to-end test against a local daemon
 
 ```sh
@@ -95,8 +120,10 @@ toolchain nor submodules.
 
 ## Notes / limitations
 
-- The app builds/runs as a SwiftPM executable, not yet a codesigned `.app`
-  bundle. Launched from a terminal it sets `NSApplication` to a regular
-  foreground app.
+- `just install` assembles an `~/Applications/kmux.app` bundle, but it is **not
+  codesigned or notarized** yet (fine for a local from-source install; a
+  Gatekeeper-distributable build is a follow-up). Run via `swift run` /
+  `just macos-run` it launches as a bare SwiftPM executable, setting
+  `NSApplication` to a regular foreground app via the `onAppear` hook.
 - The renderer uses the system monospaced face; a configurable font in
   Preferences is a follow-up.

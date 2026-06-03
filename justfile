@@ -54,14 +54,23 @@ test:
 # (gated like `install`/`package`); on Linux the GTK GUI (`kmux`) is the client.
 
 # Generate the uniffi Swift bindings from the built kmux-ffi cdylib (library mode).
-gen-ffi-bindings:
+gen-ffi-bindings profile="debug":
     #!/usr/bin/env bash
     set -euo pipefail
+    # The profile (debug|release) selects which built cdylib to introspect;
+    # `just install` passes "release" so the bindings match the release staticlib
+    # it links. The generated Swift is identical across profiles (it is derived
+    # from the crate metadata), so the default debug profile is fine for dev builds.
     [[ "$(uname -s)" == "Darwin" ]] || { echo "error: gen-ffi-bindings is macOS-only (the Swift app is macOS-only)" >&2; exit 1; }
-    cargo build -p kmux-ffi
+    case "{{profile}}" in
+        debug)   relflag="" ;;
+        release) relflag="--release" ;;
+        *) echo "error: profile must be 'debug' or 'release' (got '{{profile}}')" >&2; exit 1 ;;
+    esac
+    cargo build $relflag -p kmux-ffi
     out=$(mktemp -d)
     cargo run -p kmux-ffi --bin uniffi-bindgen -- \
-        generate --library target/debug/libkmux_ffi.dylib --language swift --out-dir "$out"
+        generate --library target/{{profile}}/libkmux_ffi.dylib --language swift --out-dir "$out"
     mkdir -p kmux-swift/Sources/kmux_ffiFFI kmux-swift/Sources/KmuxBindings
     cp "$out/kmux_ffiFFI.h"  kmux-swift/Sources/kmux_ffiFFI/kmux_ffiFFI.h
     cp "$out/kmux_ffi.swift" kmux-swift/Sources/KmuxBindings/kmux_ffi.swift
@@ -115,11 +124,17 @@ start-daemon:
 stop-daemon:
     cargo run -p kmux-tui -- daemon stop
 
-# Install the clients + daemon to ~/.cargo/bin (release build). The GTK GUI
-# (`kmux`) is Linux-only; its desktop entry + icon are installed there too.
+# Install the clients + daemon for the host platform (release build).
 install:
     #!/usr/bin/env bash
     set -euo pipefail
+    # The CLI binaries (kmux-tui, kmuxd) go to ~/.cargo/bin on every platform; the
+    # GUI is installed the platform-native way with its launcher entry + icon:
+    #   - Linux: the GTK GUI (`kmux`) to ~/.cargo/bin, plus its .desktop entry +
+    #            icon into the XDG data dirs (Activities / app grid).
+    #   - macOS: the SwiftUI app assembled into ~/Applications/kmux.app (Launchpad
+    #            / Spotlight / Dock), bundling kmuxd beside it so a Finder-launched
+    #            app can auto-spawn the local daemon.
     cargo install --path crates/kmux-tui
     cargo install --path crates/kmuxd
     if [[ "$(uname -s)" == "Linux" ]]; then
@@ -130,6 +145,34 @@ install:
         cp crates/kmux-gtk/data/dev.getkono.kmux.desktop "$apps/"
         cp crates/kmux-gtk/data/icons/dev.getkono.kmux.svg "$icons/"
         echo "==> installed the kmux GUI + desktop entry (GTK4 + libadwaita are runtime deps)"
+    elif [[ "$(uname -s)" == "Darwin" ]]; then
+        # Build the release FFI staticlib + matching Swift bindings, then the app
+        # in release linking that archive (KMUX_FFI_LIB overrides Package.swift's
+        # debug default to an absolute release path).
+        just gen-ffi-bindings release
+        KMUX_FFI_LIB="$PWD/target/release/libkmux_ffi.a" \
+            swift build -c release --package-path kmux-swift
+        exe="kmux-swift/.build/release/kmux-swift"
+        [[ -x "$exe" ]] || { echo "error: swift build did not produce $exe" >&2; exit 1; }
+        ver=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -n1)
+        # Assemble the kmux.app bundle in ~/Applications (user-level, no sudo) —
+        # the macOS analog of the Linux .desktop entry + icon.
+        app="$HOME/Applications/kmux.app"
+        rm -rf "$app"
+        mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
+        cp "$exe" "$app/Contents/MacOS/kmux-swift"
+        # Bundle kmuxd beside the GUI exe: find_server_binary() looks in the
+        # running exe's own dir first, so a Finder/Spotlight launch (which gets
+        # the minimal launchd PATH, without ~/.cargo/bin) can still auto-spawn
+        # the local daemon. Its rpath points back into the build tree for
+        # libkmux_ghostty, same as the ~/.cargo/bin/kmuxd from `cargo install`.
+        cp target/release/kmuxd "$app/Contents/MacOS/kmuxd"
+        cp kmux-swift/macos/kmux.icns "$app/Contents/Resources/kmux.icns"
+        sed "s/__VERSION__/${ver}/g" kmux-swift/macos/Info.plist > "$app/Contents/Info.plist"
+        # Refresh Launch Services so Finder/Spotlight pick up the new bundle + icon.
+        touch "$app"
+        /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app" 2>/dev/null || true
+        echo "==> installed kmux.app to ~/Applications (launch from Launchpad/Spotlight)"
     fi
 
 # Stage a distributable release tarball for the host target into dist/.

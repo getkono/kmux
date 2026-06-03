@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Info.plist for the kmux.app bundle assembled by `just install` (macOS). This
+  is the macOS analog of kmux-gtk's dev.getkono.kmux.desktop entry on Linux:
+  it makes the SwiftUI app a first-class GUI app (Launchpad / Spotlight / Dock
+  with an icon), not a bare CLI executable. `__VERSION__` is substituted with
+  the workspace version at install time.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleName</key>
+    <string>kmux</string>
+    <key>CFBundleDisplayName</key>
+    <string>kmux</string>
+    <key>CFBundleIdentifier</key>
+    <string>dev.getkono.kmux</string>
+    <key>CFBundleExecutable</key>
+    <string>kmux-swift</string>
+    <key>CFBundleIconFile</key>
+    <string>kmux</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>__VERSION__</string>
+    <key>CFBundleVersion</key>
+    <string>__VERSION__</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>14.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+</dict>
+</plist>

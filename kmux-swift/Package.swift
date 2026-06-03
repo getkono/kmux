@@ -13,7 +13,15 @@
 // The generated sources (`kmux_ffiFFI.h`, `kmux_ffi.swift`) and the Rust
 // staticlib are produced by `just gen-ffi-bindings` (see the repo justfile);
 // they are gitignored. Build with `just macos-app` / run with `just macos-run`.
+import Foundation
 import PackageDescription
+
+// The prebuilt Rust staticlib to static-link. Defaults to the debug archive
+// (what `just macos-app` / `macos-run` / `macos-test` build); `just install`
+// overrides it via KMUX_FFI_LIB to link the optimized release archive into the
+// installed kmux.app. Path is relative to this package dir unless absolute.
+let kmuxFfiLib = ProcessInfo.processInfo.environment["KMUX_FFI_LIB"]
+    ?? "../target/debug/libkmux_ffi.a"
 
 let package = Package(
     name: "kmux-swift",
@@ -33,14 +41,14 @@ let package = Package(
             dependencies: ["kmux_ffiFFI"]
         ),
 
-        // The SwiftUI app. Links the prebuilt Rust staticlib by absolute archive
-        // path (forces static inclusion) plus the system frameworks the Rust
-        // crate graph (rustls / ring / tokio) needs at final link.
+        // The SwiftUI app. Links the prebuilt Rust staticlib by archive path
+        // (`kmuxFfiLib`, forces static inclusion) plus the system frameworks the
+        // Rust crate graph (rustls / ring / tokio) needs at final link.
         .executableTarget(
             name: "KmuxApp",
             dependencies: ["KmuxBindings"],
             linkerSettings: [
-                .unsafeFlags(["../target/debug/libkmux_ffi.a"]),
+                .unsafeFlags([kmuxFfiLib]),
                 .linkedFramework("Security"),
                 .linkedFramework("SystemConfiguration"),
                 .linkedFramework("CoreFoundation"),
@@ -54,7 +62,7 @@ let package = Package(
             // The test bundle also pulls in FFI symbols, so it needs the same
             // staticlib + framework link as the executable.
             linkerSettings: [
-                .unsafeFlags(["../target/debug/libkmux_ffi.a"]),
+                .unsafeFlags([kmuxFfiLib]),
                 .linkedFramework("Security"),
                 .linkedFramework("SystemConfiguration"),
                 .linkedFramework("CoreFoundation"),

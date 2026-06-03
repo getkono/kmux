@@ -206,9 +206,11 @@ This is a machine `PATH` quirk, not a repo setting; on a standard install the
 default `pkg-config` resolves gtk4 directly.
 
 `just install` installs the `kmux` GUI (Linux) plus its `.desktop` entry and
-icon into the XDG data dirs; `just package` stages the GUI binary + desktop
-files into the release tarball under `share/`. The GUI is the primary `kmux`
-command on Linux; preferences (theme + font) open with **Ctrl+,**.
+icon into the XDG data dirs (on macOS it instead assembles `~/Applications/kmux.app`
+— see [the native macOS frontend](#the-native-macos-frontend-kmux-swift) and
+[building-macos.md](building-macos.md#install)); `just package` stages the GUI
+binary + desktop files into the release tarball under `share/`. The GUI is the
+primary `kmux` command on Linux; preferences (theme + font) open with **Ctrl+,**.
 
 ## The native macOS frontend (`kmux-swift`)
 
@@ -318,8 +320,10 @@ interaction layer. No new feature work targets it.
   functional and at feature parity with `kmux-gtk`. Remaining polish: a Metal
   renderer + same-attr run batching if profiling shows need; a configurable font
   in Preferences (the renderer currently uses the system monospaced face); a
-  packaged, codesigned `.app` bundle (today it builds/runs as a SwiftPM
-  executable); and selection within scrolled-back history.
+  **codesigned + notarized** `.app` bundle (`just install` already assembles an
+  unsigned `~/Applications/kmux.app` — see
+  [building-macos.md](building-macos.md#install)); and selection within
+  scrolled-back history.
 - **Windows.** A native Windows frontend would also drive `FrontendDriver`. The
   Unix-only client paths (`flock`, UDS, daemon spawn) need cfg-gating — see
   `kmux-protocol/src/dirs.rs` for the path resolvers that would gain
