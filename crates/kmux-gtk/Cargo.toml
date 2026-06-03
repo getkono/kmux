@@ -22,6 +22,12 @@ anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 futures.workspace = true
+
+# The GTK4 + libadwaita stack is Linux-only. Gating it here (rather than
+# excluding the crate from the workspace) keeps `cargo build/test --workspace`
+# green on macOS, where `kmux-gtk` compiles to a tiny stub binary that points
+# users at the native SwiftUI app (`kmux-swift`); see `src/main.rs`.
+[target.'cfg(target_os = "linux")'.dependencies]
 gtk4 = "0.9"
 adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
 pangocairo = "0.20"

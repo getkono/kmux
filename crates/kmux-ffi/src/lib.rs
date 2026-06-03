@@ -10,17 +10,26 @@
 //!   `FrontendDriver`, and owns the tokio runtime the driver's background tasks
 //!   run on.
 //! - **Pump**: [`KmuxDriver::tick`] runs one driver iteration and returns the
-//!   [`FfiEffect`]s the frontend must act on. The Swift app calls this each
-//!   frame (e.g. from a `CVDisplayLink`).
+//!   [`FfiEffect`]s the frontend must act on. The Swift app calls this each frame
+//!   (a main-thread timer, the analog of the GTK `glib` timeout).
 //! - **Render (hot path)**: [`KmuxDriver::grid_info`] /
 //!   [`KmuxDriver::grid_snapshot`] expose the active grid as a generation-gated,
 //!   packed byte buffer (see [`cells`]) so the renderer copies only changed
-//!   frames; plus [`KmuxDriver::theme`], [`KmuxDriver::mode`],
-//!   [`KmuxDriver::connection`], [`KmuxDriver::sessions`], and
-//!   [`KmuxDriver::blink_on`].
-//! - **Input**: [`KmuxDriver::dispatch`] (a curated [`FfiAction`] set),
-//!   [`KmuxDriver::send_input`] (raw PTY bytes), [`KmuxDriver::feed_paste`],
+//!   frames; plus [`KmuxDriver::theme`], [`KmuxDriver::blink_on`],
+//!   [`KmuxDriver::selection`], and [`KmuxDriver::scroll_info`].
+//! - **Input**: structured **mode-aware** keys ([`KmuxDriver::send_char`] /
+//!   [`KmuxDriver::send_named_key`], encoded by the daemon — not hand-rolled
+//!   here), [`KmuxDriver::dispatch`] (a curated [`FfiAction`] set),
+//!   [`KmuxDriver::send_input`] (raw PTY bytes), [`KmuxDriver::feed_paste`], the
+//!   mouse helpers ([`KmuxDriver::scroll_at`] + the selection setters), and
 //!   [`KmuxDriver::set_term_size`] / [`KmuxDriver::request_resize`].
+//! - **Chrome / overlays**: [`KmuxDriver::connection`], [`KmuxDriver::sessions`],
+//!   [`KmuxDriver::panes`] / [`KmuxDriver::select_pane`], [`KmuxDriver::mode`],
+//!   the command palette ([`KmuxDriver::command_hints`] /
+//!   [`KmuxDriver::run_command`]), the [`KmuxDriver::picker`] getter + drivers,
+//!   session [`KmuxDriver::rename_session`] / [`KmuxDriver::close_session`],
+//!   [`KmuxDriver::metrics`], and [`KmuxDriver::available_themes`] /
+//!   [`KmuxDriver::set_theme`].
 //!
 //! ## Threading
 //!
@@ -37,15 +46,20 @@ use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Runtime;
 
+use kmux_app::cmd;
 use kmux_app::config;
-use kmux_app::core::AppCore;
+use kmux_app::core::{AppCore, TopBarAction};
 use kmux_app::driver::{FrontendDriver, FrontendEffect};
-use kmux_app::mode::{Action, Mode};
+use kmux_app::mode::{Action, CommandState, Mode};
 use kmux_app::subcommands::parse_target;
-use kmux_app::theme::{Rgb, Theme};
+use kmux_app::theme::{self, Rgb, Theme};
 use kmux_client::connection_state::ConnectionState;
 use kmux_client::generate_instance_id;
-use kmux_protocol::messages::{ClientCapabilities, TermSize};
+use kmux_client::grid::{GridPos, Selection, SelectionMode};
+use kmux_client::input::{char_to_proto_key, encode_mouse_scroll};
+use kmux_protocol::messages::{
+    ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, TermSize,
+};
 
 uniffi::setup_scaffolding!();
 
@@ -163,6 +177,94 @@ impl From<FfiAction> for Action {
             FfiAction::Paste => Action::Paste,
             FfiAction::Quit => Action::Quit,
             FfiAction::Reconnect => Action::Reconnect,
+        }
+    }
+}
+
+/// Keyboard modifier state for a structured key event. Maps to [`KeyMods`].
+#[derive(uniffi::Record)]
+pub struct FfiKeyMods {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    /// The Command (⌘) key on macOS; maps to `KeyMods::SUPER`.
+    pub command: bool,
+}
+
+impl FfiKeyMods {
+    fn to_proto(&self) -> KeyMods {
+        let mut m = KeyMods::empty();
+        m.set(KeyMods::SHIFT, self.shift);
+        m.set(KeyMods::CTRL, self.ctrl);
+        m.set(KeyMods::ALT, self.alt);
+        m.set(KeyMods::SUPER, self.command);
+        m
+    }
+}
+
+/// A non-printable key the frontend forwards by name; printable keys go through
+/// [`KmuxDriver::send_char`]. Mirrors the named arm of the GTK frontend's
+/// `convert_to_protocol_key`. The daemon turns the resulting [`KeyEvent`] into
+/// bytes under the live terminal mode (DECCKM, kitty kbd, modifyOtherKeys).
+#[derive(uniffi::Enum)]
+pub enum FfiNamedKey {
+    Enter,
+    Tab,
+    Backspace,
+    Escape,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Delete,
+    Insert,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+}
+
+impl FfiNamedKey {
+    fn to_code(&self) -> KeyCode {
+        match self {
+            FfiNamedKey::Enter => KeyCode::Enter,
+            FfiNamedKey::Tab => KeyCode::Tab,
+            FfiNamedKey::Backspace => KeyCode::Backspace,
+            FfiNamedKey::Escape => KeyCode::Escape,
+            FfiNamedKey::ArrowUp => KeyCode::ArrowUp,
+            FfiNamedKey::ArrowDown => KeyCode::ArrowDown,
+            FfiNamedKey::ArrowLeft => KeyCode::ArrowLeft,
+            FfiNamedKey::ArrowRight => KeyCode::ArrowRight,
+            FfiNamedKey::PageUp => KeyCode::PageUp,
+            FfiNamedKey::PageDown => KeyCode::PageDown,
+            FfiNamedKey::Home => KeyCode::Home,
+            FfiNamedKey::End => KeyCode::End,
+            FfiNamedKey::Delete => KeyCode::Delete,
+            FfiNamedKey::Insert => KeyCode::Insert,
+            FfiNamedKey::F1 => KeyCode::F1,
+            FfiNamedKey::F2 => KeyCode::F2,
+            FfiNamedKey::F3 => KeyCode::F3,
+            FfiNamedKey::F4 => KeyCode::F4,
+            FfiNamedKey::F5 => KeyCode::F5,
+            FfiNamedKey::F6 => KeyCode::F6,
+            FfiNamedKey::F7 => KeyCode::F7,
+            FfiNamedKey::F8 => KeyCode::F8,
+            FfiNamedKey::F9 => KeyCode::F9,
+            FfiNamedKey::F10 => KeyCode::F10,
+            FfiNamedKey::F11 => KeyCode::F11,
+            FfiNamedKey::F12 => KeyCode::F12,
         }
     }
 }
@@ -291,6 +393,114 @@ pub struct FfiSession {
     pub name: String,
     pub cwd: String,
     pub active: bool,
+}
+
+/// One pane (tab) in the active session.
+#[derive(uniffi::Record)]
+pub struct FfiPane {
+    pub id: String,
+    /// Display label: the pane title, or `"pane N"` (1-based) when untitled.
+    pub label: String,
+    pub active: bool,
+}
+
+/// Tab label: the pane title, falling back to its 1-based index (mirrors the
+/// GTK frontend's `pane_label`).
+fn pane_label(index: u32, title: &str) -> String {
+    if title.trim().is_empty() {
+        format!("pane {}", index + 1)
+    } else {
+        title.to_string()
+    }
+}
+
+/// A selection span in *visible viewport* cell coordinates (row 0 = top visible
+/// row). Returned by [`KmuxDriver::selection`] for the renderer's selection wash.
+#[derive(uniffi::Record)]
+pub struct FfiSelection {
+    pub start_row: u32,
+    pub start_col: u32,
+    pub end_row: u32,
+    pub end_col: u32,
+}
+
+/// Scrollback position for the scroll indicator: `offset` lines back from the
+/// live bottom, out of `total` scrollback display rows.
+#[derive(uniffi::Record)]
+pub struct FfiScrollInfo {
+    pub offset: u32,
+    pub total: u32,
+}
+
+/// Convert a *visible* viewport cell to the grid's absolute coordinate space
+/// (row 0 = oldest scrollback line), clamping to the viewport. Mirrors the GTK
+/// frontend's `pos_at`; only valid at the live bottom (`scroll_offset == 0`).
+fn visible_to_abs(
+    scrollback_len: usize,
+    rows: usize,
+    cols: usize,
+    vrow: u32,
+    vcol: u32,
+) -> GridPos {
+    GridPos {
+        row: scrollback_len + (vrow as usize).min(rows.saturating_sub(1)),
+        col: (vcol as usize).min(cols.saturating_sub(1)),
+    }
+}
+
+/// One autocomplete row for the `/`-command palette. Mirrors `cmd::hint::Hint`;
+/// the internal `replace_from` byte offset is omitted (a native text field
+/// re-queries [`KmuxDriver::command_hints`] on each change instead of editing
+/// char-by-char).
+#[derive(uniffi::Record)]
+pub struct FfiCommandHint {
+    pub display: String,
+    pub summary: String,
+    pub replacement: String,
+    pub append_space: bool,
+}
+
+/// Which picker overlay is open.
+#[derive(uniffi::Enum)]
+pub enum FfiPickerKind {
+    Session,
+    Server,
+    Directory,
+}
+
+/// One row in a picker list.
+#[derive(uniffi::Record)]
+pub struct FfiPickerEntry {
+    pub label: String,
+    pub detail: String,
+}
+
+/// The open picker's full state, for generic native rendering. Driven via
+/// `set_picker_search` / `set_picker_selected` / `activate_picker` /
+/// `submit_directory` / `cancel_picker`.
+#[derive(uniffi::Record)]
+pub struct FfiPicker {
+    pub kind: FfiPickerKind,
+    pub query: String,
+    pub selected: u32,
+    pub entries: Vec<FfiPickerEntry>,
+}
+
+/// Client-side performance counters for the HUD ticker / metrics inspector.
+/// Mirrors `kmux_client::metrics::MetricsSnapshot` + its `DiagCounters`.
+#[derive(uniffi::Record)]
+pub struct FfiMetrics {
+    pub net_apply_avg_ms: f64,
+    pub net_apply_max_ms: f64,
+    pub apply_avg_ms: f64,
+    pub batch_avg: f64,
+    pub last_diff_ops: u64,
+    pub last_large_diff_ms: f64,
+    pub snapshot_mode: bool,
+    pub stale_discards: u64,
+    pub seqno_gaps: u64,
+    pub lag_events: u64,
+    pub resyncs: u64,
 }
 
 /// Which interaction mode / overlay is active. Carries the text the matching
@@ -444,6 +654,37 @@ impl KmuxDriver {
             .send_input(bytes);
     }
 
+    /// Send a printable character as a structured key event. `text` is the
+    /// character the keystroke produces (e.g. macOS `charactersIgnoringModifiers`);
+    /// `mods` carries the active modifiers. The daemon encodes the bytes under the
+    /// live terminal mode, so the frontend never hand-rolls escape sequences.
+    /// No-op for empty `text`.
+    pub fn send_char(&self, text: String, mods: FfiKeyMods) {
+        let Some(ch) = text.chars().next() else {
+            return;
+        };
+        let (code, text, unshifted_codepoint) = char_to_proto_key(ch);
+        self.send_key_event(KeyEvent {
+            code,
+            mods: mods.to_proto(),
+            action: KeyAction::Press,
+            text,
+            unshifted_codepoint,
+        });
+    }
+
+    /// Send a named key (Enter, arrows, function keys, …) as a structured key
+    /// event. See [`send_char`](Self::send_char) for the encoding contract.
+    pub fn send_named_key(&self, key: FfiNamedKey, mods: FfiKeyMods) {
+        self.send_key_event(KeyEvent {
+            code: key.to_code(),
+            mods: mods.to_proto(),
+            action: KeyAction::Press,
+            text: String::new(),
+            unshifted_codepoint: 0,
+        });
+    }
+
     /// Feed clipboard text back as a paste (in response to
     /// [`FfiEffect::RequestPaste`]).
     pub fn feed_paste(&self, text: String) {
@@ -543,6 +784,417 @@ impl KmuxDriver {
             .collect()
     }
 
+    /// The panes (tabs) of the active session, with the active pane flagged.
+    pub fn panes(&self) -> Vec<FfiPane> {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let active = d.mgr.active_pane_id().map(|s| s.to_string());
+        d.mgr
+            .active_session_panes()
+            .iter()
+            .map(|p| FfiPane {
+                active: active.as_deref() == Some(p.pane_id.as_str()),
+                id: p.pane_id.clone(),
+                label: pane_label(p.pane_index, &p.title),
+            })
+            .collect()
+    }
+
+    /// Focus a pane by id (a tab click). Returns any resulting effects.
+    pub fn select_pane(&self, id: String) -> Vec<FfiEffect> {
+        let _guard = self.rt.enter();
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.apply_top_bar_action(TopBarAction::SelectPane(id))
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// Set a normal (drag) selection between two *visible* viewport cells. No-op
+    /// when scrolled into history (selection is live-screen only, like GTK).
+    pub fn set_selection(&self, anchor_row: u32, anchor_col: u32, end_row: u32, end_col: u32) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        if let Some(grid) = d.mgr.active_grid_mut() {
+            if grid.scroll_offset() != 0 {
+                return;
+            }
+            let (sb, rows, cols) = (grid.scrollback_len(), grid.rows, grid.cols);
+            let anchor = visible_to_abs(sb, rows, cols, anchor_row, anchor_col);
+            let end = visible_to_abs(sb, rows, cols, end_row, end_col);
+            grid.set_selection(Some(Selection {
+                anchor,
+                end,
+                mode: SelectionMode::Normal,
+            }));
+        }
+    }
+
+    /// Select the word at a *visible* viewport cell (double-click).
+    pub fn select_word_at(&self, row: u32, col: u32) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        if let Some(grid) = d.mgr.active_grid_mut() {
+            if grid.scroll_offset() != 0 {
+                return;
+            }
+            let (sb, rows, cols) = (grid.scrollback_len(), grid.rows, grid.cols);
+            let pos = visible_to_abs(sb, rows, cols, row, col);
+            let (anchor, end) = grid.find_word_boundaries(pos);
+            grid.set_selection(Some(Selection {
+                anchor,
+                end,
+                mode: SelectionMode::Word,
+            }));
+        }
+    }
+
+    /// Select the whole line at a *visible* viewport row (triple-click).
+    pub fn select_line_at(&self, row: u32) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        if let Some(grid) = d.mgr.active_grid_mut() {
+            if grid.scroll_offset() != 0 {
+                return;
+            }
+            let (sb, rows, cols) = (grid.scrollback_len(), grid.rows, grid.cols);
+            let abs_row = sb + (row as usize).min(rows.saturating_sub(1));
+            grid.set_selection(Some(Selection {
+                anchor: GridPos {
+                    row: abs_row,
+                    col: 0,
+                },
+                end: GridPos {
+                    row: abs_row,
+                    col: cols.saturating_sub(1),
+                },
+                mode: SelectionMode::Line,
+            }));
+        }
+    }
+
+    /// Clear the active selection.
+    pub fn clear_selection(&self) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        if let Some(grid) = d.mgr.active_grid_mut() {
+            grid.clear_selection();
+        }
+    }
+
+    /// The active selection in *visible* viewport coordinates (for the selection
+    /// wash), or `None` when empty or scrolled into history.
+    pub fn selection(&self) -> Option<FfiSelection> {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let grid = d.mgr.active_grid()?;
+        if grid.scroll_offset() != 0 {
+            return None;
+        }
+        let sel = grid.selection()?;
+        let (start, end) = (sel.start(), sel.end_pos());
+        if start == end {
+            return None;
+        }
+        let sb = grid.scrollback_len();
+        Some(FfiSelection {
+            start_row: start.row.saturating_sub(sb) as u32,
+            start_col: start.col as u32,
+            end_row: end.row.saturating_sub(sb) as u32,
+            end_col: end.col as u32,
+        })
+    }
+
+    /// Mouse-wheel scroll at a *visible* viewport cell. Forwards an SGR/X10 wheel
+    /// event to the PTY when the pane has mouse reporting on; otherwise scrolls
+    /// local scrollback. `lines` > 0 scrolls up (into history). Mirrors the GTK
+    /// frontend's `scroll_pane`.
+    pub fn scroll_at(&self, col: u32, row: u32, lines: i32) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let Some(pane_id) = d.mgr.active_pane_id().map(|s| s.to_string()) else {
+            return;
+        };
+        let use_pty = d
+            .mgr
+            .buffer(&pane_id)
+            .map(|g| g.modes().mouse_report())
+            .unwrap_or(false);
+        if use_pty {
+            let sgr = d
+                .mgr
+                .buffer(&pane_id)
+                .map(|g| g.modes().sgr_mouse())
+                .unwrap_or(false);
+            let bytes = encode_mouse_scroll(col as u16 + 1, row as u16 + 1, lines, sgr);
+            if !bytes.is_empty() {
+                d.send_input(bytes);
+            }
+        } else if let Some(grid) = d.mgr.buffer_mut(&pane_id) {
+            if lines > 0 {
+                grid.scroll_up(lines as usize);
+            } else {
+                grid.scroll_down((-lines) as usize);
+            }
+        }
+    }
+
+    /// Scrollback position for the scroll indicator.
+    pub fn scroll_info(&self) -> FfiScrollInfo {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        match d.mgr.active_grid() {
+            Some(g) => FfiScrollInfo {
+                offset: g.scroll_offset() as u32,
+                total: g.total_scrollback_display_rows() as u32,
+            },
+            None => FfiScrollInfo {
+                offset: 0,
+                total: 0,
+            },
+        }
+    }
+
+    /// Autocomplete hints for an arbitrary `/`-command-palette input, without
+    /// changing the current mode. For a native palette that owns its own text
+    /// field instead of driving `Mode::Command` char-by-char.
+    pub fn command_hints(&self, input: String) -> Vec<FfiCommandHint> {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        // Hints are computed from the buffer in `Mode::Command`; flip into it
+        // transiently (atomic under the lock) and restore so this is a pure query.
+        let prev = std::mem::replace(
+            &mut core.mode,
+            Mode::Command(CommandState {
+                buffer: input.clone(),
+                cursor: input.len(),
+                ..CommandState::default()
+            }),
+        );
+        let hints = cmd::hint::build_hints(core);
+        core.mode = prev;
+        hints
+            .into_iter()
+            .map(|h| FfiCommandHint {
+                display: h.display,
+                summary: h.summary.to_string(),
+                replacement: h.replacement,
+                append_space: h.append_space,
+            })
+            .collect()
+    }
+
+    /// Parse and execute a `/`-command line in one shot (reconnect / server
+    /// switch applied internally), returning any resulting effects.
+    pub fn run_command(&self, input: String) -> Vec<FfiEffect> {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.core_mut().mode = Mode::Command(CommandState {
+            buffer: input.clone(),
+            cursor: input.len(),
+            ..CommandState::default()
+        });
+        self.rt
+            .block_on(d.dispatch_action(Action::CommandSubmit))
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// The currently open picker (session / server / directory), or `None`.
+    pub fn picker(&self) -> Option<FfiPicker> {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core();
+        match core.mode {
+            Mode::SessionPicker => {
+                let mut entries = vec![FfiPickerEntry {
+                    label: "[+] New session".to_string(),
+                    detail: String::new(),
+                }];
+                for e in core.session_picker_matches() {
+                    entries.push(FfiPickerEntry {
+                        label: core.mgr.display_name_for(&e.meta.word_id),
+                        detail: e.meta.cwd.clone(),
+                    });
+                }
+                Some(FfiPicker {
+                    kind: FfiPickerKind::Session,
+                    query: core.session_picker_search.clone(),
+                    selected: core.session_picker_selected as u32,
+                    entries,
+                })
+            }
+            Mode::ServerPicker => {
+                let entries = core
+                    .filtered_servers()
+                    .into_iter()
+                    .map(|s| {
+                        // time_ago() borrows all of `s`, so compute it before
+                        // moving `display` out.
+                        let detail = s.time_ago();
+                        FfiPickerEntry {
+                            label: s.display,
+                            detail,
+                        }
+                    })
+                    .collect();
+                Some(FfiPicker {
+                    kind: FfiPickerKind::Server,
+                    query: core.server_picker_search.clone(),
+                    selected: core.server_picker_selected as u32,
+                    entries,
+                })
+            }
+            Mode::DirectoryPicker => {
+                let entries = core
+                    .dir_picker_matches()
+                    .into_iter()
+                    .map(|e| FfiPickerEntry {
+                        label: core.mgr.display_name_for(&e.meta.word_id),
+                        detail: e.meta.cwd.clone(),
+                    })
+                    .collect();
+                Some(FfiPicker {
+                    kind: FfiPickerKind::Directory,
+                    query: core.dir_picker_buffer.clone(),
+                    selected: core.dir_picker_selected as u32,
+                    entries,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Open the recent-servers picker.
+    pub fn open_server_picker(&self) -> Vec<FfiEffect> {
+        let _guard = self.rt.enter();
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.apply_top_bar_action(TopBarAction::OpenServerPicker)
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// Open the session picker.
+    pub fn open_session_picker(&self) -> Vec<FfiEffect> {
+        let _guard = self.rt.enter();
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.apply_top_bar_action(TopBarAction::OpenSessionPicker)
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// Set the open picker's search/filter text (resets the selection to row 0).
+    pub fn set_picker_search(&self, text: String) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.set_picker_search(text);
+        core.needs_render = true;
+    }
+
+    /// Set the open picker's highlighted row (hover/click).
+    pub fn set_picker_selected(&self, index: u32) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.set_picker_selected(index as usize);
+        core.needs_render = true;
+    }
+
+    /// Activate the open picker's current selection (click / Enter). May switch
+    /// servers (server picker) or select a session.
+    pub fn activate_picker(&self) -> Vec<FfiEffect> {
+        let _guard = self.rt.enter();
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.activate_picker_selection()
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// Submit the directory picker's typed path: select the matching session or
+    /// create a new one at that path (the create-from-typed-path path that a
+    /// plain `activate_picker` click does not cover).
+    pub fn submit_directory(&self) -> Vec<FfiEffect> {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        self.rt
+            .block_on(d.dispatch_action(Action::DirPickerSubmit))
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// Close any open picker / overlay (back to normal interaction).
+    pub fn cancel_picker(&self) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.mode = Mode::Normal;
+        core.needs_render = true;
+    }
+
+    /// Rename a session by word id (trims surrounding whitespace).
+    pub fn rename_session(&self, word_id: String, name: String) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.mgr.rename_session(&word_id, name.trim());
+        core.needs_render = true;
+    }
+
+    /// Close a session by word id.
+    pub fn close_session(&self, word_id: String) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.mgr.close_session(&word_id);
+        core.needs_render = true;
+    }
+
+    /// Whether the performance HUD ticker is shown.
+    pub fn hud_visible(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .hud_visible
+    }
+
+    /// Whether the metrics inspector overlay is open.
+    pub fn metrics_visible(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .metrics_overlay_visible
+    }
+
+    /// A snapshot of the client-side performance metrics.
+    pub fn metrics(&self) -> FfiMetrics {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core();
+        let snap = core.mgr.metrics.snapshot(core.force_snapshot_mode);
+        let c = &snap.counters;
+        FfiMetrics {
+            net_apply_avg_ms: snap.net_apply_avg_ms,
+            net_apply_max_ms: snap.net_apply_max_ms,
+            apply_avg_ms: snap.apply_avg_ms,
+            batch_avg: snap.batch_avg,
+            last_diff_ops: snap.last_diff_ops as u64,
+            last_large_diff_ms: snap.last_large_diff_ms,
+            snapshot_mode: snap.snapshot_mode,
+            stale_discards: c.stale_discards,
+            seqno_gaps: c.seqno_gaps,
+            lag_events: c.lag_events,
+            resyncs: c.resyncs,
+        }
+    }
+
+    /// The built-in theme names (for a Preferences theme picker).
+    pub fn available_themes(&self) -> Vec<String> {
+        theme::BUILTIN_THEMES
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// Switch the active palette to a built-in theme by name (no-op if unknown).
+    /// The driver emits `PaletteChanged` from the next [`tick`](Self::tick).
+    pub fn set_theme(&self, name: String) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        if let Some(t) = theme::builtin_theme(&name) {
+            let core = d.core_mut();
+            core.palette = t;
+            core.needs_render = true;
+        }
+    }
+
     /// Whether the cursor is shown on the current frame (blink phase).
     pub fn blink_on(&self) -> bool {
         self.inner.lock().expect("driver mutex poisoned").blink_on()
@@ -551,5 +1203,89 @@ impl KmuxDriver {
     /// Which interaction mode / overlay is active.
     pub fn mode(&self) -> FfiMode {
         mode_to_ffi(&self.inner.lock().expect("driver mutex poisoned").mode)
+    }
+}
+
+impl KmuxDriver {
+    /// Forward one structured key event and reset the blink phase, snapping the
+    /// viewport to the live bottom first (mirrors the GTK key handler). Not
+    /// exported: `send_char` / `send_named_key` are the public entry points.
+    fn send_key_event(&self, ev: KeyEvent) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.scroll_to_bottom();
+        d.send_keys(vec![ev]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_key_codes_match_protocol() {
+        assert_eq!(FfiNamedKey::Enter.to_code(), KeyCode::Enter);
+        assert_eq!(FfiNamedKey::Tab.to_code(), KeyCode::Tab);
+        assert_eq!(FfiNamedKey::Backspace.to_code(), KeyCode::Backspace);
+        assert_eq!(FfiNamedKey::Escape.to_code(), KeyCode::Escape);
+        assert_eq!(FfiNamedKey::ArrowUp.to_code(), KeyCode::ArrowUp);
+        assert_eq!(FfiNamedKey::ArrowRight.to_code(), KeyCode::ArrowRight);
+        assert_eq!(FfiNamedKey::PageDown.to_code(), KeyCode::PageDown);
+        assert_eq!(FfiNamedKey::F5.to_code(), KeyCode::F5);
+        assert_eq!(FfiNamedKey::F12.to_code(), KeyCode::F12);
+    }
+
+    #[test]
+    fn key_mods_map_to_proto_bits() {
+        let none = FfiKeyMods {
+            shift: false,
+            ctrl: false,
+            alt: false,
+            command: false,
+        };
+        assert_eq!(none.to_proto(), KeyMods::empty());
+
+        let all = FfiKeyMods {
+            shift: true,
+            ctrl: true,
+            alt: true,
+            command: true,
+        };
+        assert_eq!(
+            all.to_proto(),
+            KeyMods::SHIFT | KeyMods::CTRL | KeyMods::ALT | KeyMods::SUPER
+        );
+
+        let ctrl = FfiKeyMods {
+            shift: false,
+            ctrl: true,
+            alt: false,
+            command: false,
+        };
+        assert_eq!(ctrl.to_proto(), KeyMods::CTRL);
+    }
+
+    #[test]
+    fn pane_label_falls_back_to_index() {
+        assert_eq!(pane_label(0, ""), "pane 1");
+        assert_eq!(pane_label(3, "   "), "pane 4");
+        assert_eq!(pane_label(0, "vim"), "vim");
+    }
+
+    #[test]
+    fn visible_to_abs_offsets_by_scrollback_and_clamps() {
+        // The row is shifted by the scrollback length; both axes clamp to the
+        // viewport (mirroring `pos_at`).
+        assert_eq!(
+            visible_to_abs(100, 24, 80, 0, 0),
+            GridPos { row: 100, col: 0 }
+        );
+        assert_eq!(
+            visible_to_abs(100, 24, 80, 5, 10),
+            GridPos { row: 105, col: 10 }
+        );
+        assert_eq!(
+            visible_to_abs(0, 24, 80, 99, 999),
+            GridPos { row: 23, col: 79 }
+        );
     }
 }

@@ -1,0 +1,4 @@
+module kmux_ffiFFI {
+    header "kmux_ffiFFI.h"
+    export *
+}

@@ -12,42 +12,86 @@
 //! `AppCore` is *driven, not driving* — only the pump cadence and the
 //! render/input leaves are GTK-specific. The same `FrontendDriver` is what a
 //! non-Rust frontend (e.g. the SwiftUI macOS app, via `kmux-ffi`) drives too.
+//!
+//! ## Platform gating
+//!
+//! GTK4 + libadwaita are Linux-only, so the entire implementation below is
+//! `#[cfg(target_os = "linux")]` (and the GTK crates are target-gated in
+//! `Cargo.toml`). On other targets this binary is a stub that points users at
+//! the native macOS client (the SwiftUI app in `kmux-swift`, driving `kmux-ffi`).
+//! Keeping the crate buildable everywhere means `cargo build/test --workspace`
+//! stays green on macOS without excluding it from the workspace.
 
+#[cfg(not(target_os = "linux"))]
+fn main() {
+    eprintln!(
+        "kmux: the GTK GUI is only supported on Linux. On macOS, use the native \
+         kmux app (the SwiftUI frontend in `kmux-swift`, built on `kmux-ffi`)."
+    );
+    std::process::exit(1);
+}
+
+#[cfg(target_os = "linux")]
 mod actions;
+#[cfg(target_os = "linux")]
 mod convert;
+#[cfg(target_os = "linux")]
 mod css;
+#[cfg(target_os = "linux")]
 mod dialogs;
+#[cfg(target_os = "linux")]
 mod header;
+#[cfg(target_os = "linux")]
 mod input;
+#[cfg(target_os = "linux")]
 mod prefs;
+#[cfg(target_os = "linux")]
 mod render;
+#[cfg(target_os = "linux")]
 mod shell;
+#[cfg(target_os = "linux")]
 mod sidebar;
+#[cfg(target_os = "linux")]
 mod tabs;
 
+#[cfg(target_os = "linux")]
 use std::cell::RefCell;
+#[cfg(target_os = "linux")]
 use std::rc::Rc;
+#[cfg(target_os = "linux")]
 use std::time::Duration;
 
+#[cfg(target_os = "linux")]
 use adw::prelude::*;
+#[cfg(target_os = "linux")]
 use gtk4::{Application, DrawingArea, EventControllerKey, gdk, gio, glib};
 
+#[cfg(target_os = "linux")]
 use kmux_app::core::AppCore;
+#[cfg(target_os = "linux")]
 use kmux_app::driver::{FrontendDriver, FrontendEffect};
+#[cfg(target_os = "linux")]
 use kmux_app::launch::{Launch, Plan, run_cli};
+#[cfg(target_os = "linux")]
 use kmux_app::mode::Mode;
+#[cfg(target_os = "linux")]
 use kmux_app::theme::Theme;
+#[cfg(target_os = "linux")]
 use kmux_client::generate_instance_id;
+#[cfg(target_os = "linux")]
 use kmux_protocol::messages::{ClientCapabilities, TermSize};
 
+#[cfg(target_os = "linux")]
 const APP_ID: &str = "dev.getkono.kmux";
 
 /// Pump cadence: drain the driver + tick timers (~60 Hz).
+#[cfg(target_os = "linux")]
 const PUMP_INTERVAL: Duration = Duration::from_millis(16);
 
 /// Shared frontend state. The toolkit-agnostic run loop lives in `core`
 /// ([`FrontendDriver`], which wraps `AppCore`); the GTK leaves keep only the
 /// render geometry and the chrome CSS provider.
+#[cfg(target_os = "linux")]
 struct Frontend {
     /// The toolkit-agnostic driver wrapping `AppCore`. Named `core` so the GTK
     /// modules reach `AppCore` state through it via `Deref` (`f.core.mgr`,
@@ -61,6 +105,7 @@ struct Frontend {
     css_provider: gtk4::CssProvider,
 }
 
+#[cfg(target_os = "linux")]
 fn main() -> anyhow::Result<()> {
     // A tokio runtime backs the driver's async orchestration (start_bootstrap
     // spawns tasks) and the CLI front door's daemon/subcommand network calls.
@@ -78,6 +123,7 @@ fn main() -> anyhow::Result<()> {
 }
 
 /// Run the GTK application for an interactive session built from `plan`.
+#[cfg(target_os = "linux")]
 fn run_gui(plan: Plan) -> anyhow::Result<()> {
     let app = Application::builder().application_id(APP_ID).build();
     let plan = Rc::new(plan);
@@ -100,6 +146,7 @@ fn run_gui(plan: Plan) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
 fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String>>>) {
     // GUI capabilities differ from a terminal's: truecolor on, no kitty
     // keyboard/graphics concept.
@@ -291,6 +338,7 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
 /// One pump tick: advance the driver, apply the toolkit-specific effects it
 /// returns, and — if anything changed — reconcile the native shell + overlays
 /// and repaint the grid.
+#[cfg(target_os = "linux")]
 fn pump(
     fe: &Rc<RefCell<Frontend>>,
     shell: &Rc<shell::Shell>,
@@ -312,6 +360,7 @@ fn pump(
 /// (from [`FrontendDriver::tick`] or an input dispatch). Returns whether a
 /// repaint is needed. Reconnect / server-switch are handled inside the driver
 /// and never reach here.
+#[cfg(target_os = "linux")]
 pub(crate) fn apply_effects(
     fe: &Rc<RefCell<Frontend>>,
     effects: Vec<FrontendEffect>,
@@ -343,6 +392,7 @@ pub(crate) fn apply_effects(
 /// Write `text` to the system clipboard. The driver already strips interior NUL
 /// bytes (which would make `Clipboard::set_text` — a non-unwinding FFI
 /// trampoline — abort the process), so we can write the payload directly.
+#[cfg(target_os = "linux")]
 fn copy_to_clipboard(text: &str) {
     if let Some(display) = gdk::Display::default() {
         display.clipboard().set_text(text);
@@ -351,6 +401,7 @@ fn copy_to_clipboard(text: &str) {
 
 /// Read the system clipboard asynchronously and feed it back as a paste once it
 /// lands (clipboard reads are async in GTK).
+#[cfg(target_os = "linux")]
 fn request_paste(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea) {
     let Some(display) = gdk::Display::default() else {
         return;
@@ -369,6 +420,7 @@ fn request_paste(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea) {
 
 /// Pick the libadwaita color scheme matching a theme's background luminance, so
 /// the window frame / unstyled chrome follows the active kmux theme.
+#[cfg(target_os = "linux")]
 fn scheme_for(t: &Theme) -> adw::ColorScheme {
     let bg = t.bg;
     let lum = 0.299 * bg.r as f64 + 0.587 * bg.g as f64 + 0.114 * bg.b as f64;

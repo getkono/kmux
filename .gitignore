@@ -37,3 +37,11 @@ zig-out/
 # Generated uniffi Swift bindings (regenerated from the built cdylib; see
 # crates/kmux-ffi/src/bin/uniffi-bindgen.rs).
 /crates/kmux-ffi/bindings/
+
+# === kmux-swift (native macOS app) ===
+# SwiftPM build products + the generated uniffi bindings (produced by
+# `just gen-ffi-bindings`; the runtime ABI assert + uniffi checksum guard drift).
+/kmux-swift/.build/
+/kmux-swift/.swiftpm/
+/kmux-swift/Sources/kmux_ffiFFI/kmux_ffiFFI.h
+/kmux-swift/Sources/KmuxBindings/kmux_ffi.swift
