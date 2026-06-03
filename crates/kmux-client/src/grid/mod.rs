@@ -417,6 +417,81 @@ impl CellGrid {
         self.selection = None;
     }
 
+    /// For a visible display row `vr`, the absolute logical row it shows and the
+    /// column offset of that display row within the logical line.
+    ///
+    /// While scrolled into history (`scroll_offset > 0`), the top rows show
+    /// scrollback (a wide logical line wraps across several display rows, each
+    /// with a different `base_col`); the rest show the live grid. Mirrors the
+    /// row resolution in the renderers (`render.rs` / `ui/grid.rs`).
+    fn abs_row_base_at_visible(&self, vr: usize) -> (usize, usize) {
+        if self.scroll_offset > 0
+            && vr < self.scroll_offset
+            && let Some((line_idx, col_start)) =
+                scrollback_display_row_at(&self.scrollback, self.cols, self.scroll_offset - 1 - vr)
+        {
+            return (line_idx, col_start);
+        }
+        let grid_row = vr.saturating_sub(self.scroll_offset);
+        (self.scrollback.len() + grid_row, 0)
+    }
+
+    /// Map a *visible* viewport cell to an absolute [`GridPos`], accounting for
+    /// the current scroll offset and scrollback line wrapping. Clamps `vr`/`vc`
+    /// to the grid. This is the single source of truth for pointer → grid
+    /// mapping across frontends (GTK `pos_at`, the FFI selection methods).
+    pub fn visible_to_abs(&self, vr: usize, vc: usize) -> GridPos {
+        let vr = vr.min(self.rows.saturating_sub(1));
+        let vc = vc.min(self.cols.saturating_sub(1));
+        let (row, base_col) = self.abs_row_base_at_visible(vr);
+        GridPos {
+            row,
+            col: base_col + vc,
+        }
+    }
+
+    /// The selected column span on each *visible* display row, as
+    /// `(visible_row, col_start, col_end)` (inclusive, viewport columns).
+    ///
+    /// Intersects the active selection (in absolute coordinates) with each
+    /// visible row's `(abs_row, base_col)` mapping, so it handles scrolled views
+    /// and wrapped scrollback lines uniformly. Empty when there is no selection
+    /// or it is degenerate (anchor == end). The single source of truth for the
+    /// selection wash on every frontend.
+    pub fn visible_selection_spans(&self) -> Vec<(u16, u16, u16)> {
+        let Some(sel) = self.selection.as_ref() else {
+            return Vec::new();
+        };
+        let (start, end) = (sel.start(), sel.end_pos());
+        if start == end || self.cols == 0 {
+            return Vec::new();
+        }
+        let mut spans = Vec::new();
+        for vr in 0..self.rows {
+            let (abs_row, base_col) = self.abs_row_base_at_visible(vr);
+            if abs_row < start.row || abs_row > end.row {
+                continue;
+            }
+            let row_first = base_col;
+            let row_last = base_col + self.cols - 1;
+            let lo = if abs_row == start.row {
+                start.col.max(row_first)
+            } else {
+                row_first
+            };
+            let hi = if abs_row == end.row {
+                end.col.min(row_last)
+            } else {
+                row_last
+            };
+            if hi < lo {
+                continue;
+            }
+            spans.push((vr as u16, (lo - base_col) as u16, (hi - base_col) as u16));
+        }
+        spans
+    }
+
     /// Read the cell at an absolute grid position (scrollback + visible).
     pub fn cell_at(&self, pos: GridPos) -> Option<&CellState> {
         let sb_len = self.scrollback.len();
@@ -490,11 +565,20 @@ impl CellGrid {
             return None;
         }
 
+        let sb_len = self.scrollback.len();
         let mut result = String::new();
         for row in start.row..=end.row {
             let col_start = if row == start.row { start.col } else { 0 };
+            // A non-terminal row spans its full width: for a (possibly wrapped)
+            // scrollback line that is the logical line's effective length, so
+            // wide lines copy whole; for a live row it is the viewport width.
             let col_end = if row == end.row {
                 end.col
+            } else if row < sb_len {
+                self.scrollback
+                    .get(row)
+                    .map(|l| effective_line_len(l).saturating_sub(1))
+                    .unwrap_or(0)
             } else {
                 self.cols.saturating_sub(1)
             };
@@ -673,5 +757,104 @@ mod tests {
         grid.scroll_up(100);
         // Total = 4 display rows (3 for wrapped + 1 for tail); scroll cap = 4.
         assert_eq!(grid.scroll_offset(), 4);
+    }
+
+    fn pos(row: usize, col: usize) -> GridPos {
+        GridPos { row, col }
+    }
+
+    fn select(grid: &mut CellGrid, anchor: GridPos, end: GridPos) {
+        grid.set_selection(Some(Selection {
+            anchor,
+            end,
+            mode: SelectionMode::Normal,
+        }));
+    }
+
+    #[test]
+    fn visible_to_abs_live_view() {
+        let mut grid = CellGrid::new(3, 4);
+        push_scrollback(&mut grid, vec![line("aaaa"), line("bbbb")]);
+        // scroll_offset == 0: visible row vr maps to live row sb_len + vr.
+        assert_eq!(grid.visible_to_abs(0, 0), pos(2, 0));
+        assert_eq!(grid.visible_to_abs(2, 3), pos(4, 3));
+        // Clamps out-of-range vr/vc to the grid.
+        assert_eq!(grid.visible_to_abs(99, 99), pos(4, 3));
+    }
+
+    #[test]
+    fn visible_to_abs_scrolled_plain_lines() {
+        let mut grid = CellGrid::new(3, 4);
+        push_scrollback(
+            &mut grid,
+            vec![line("00"), line("11"), line("22"), line("33")],
+        );
+        grid.scroll_up(2);
+        assert_eq!(grid.scroll_offset(), 2);
+        // Top two rows show scrollback lines 2 and 3; third row is live row 0.
+        assert_eq!(grid.visible_to_abs(0, 0), pos(2, 0));
+        assert_eq!(grid.visible_to_abs(1, 1), pos(3, 1));
+        assert_eq!(grid.visible_to_abs(2, 0), pos(4, 0));
+    }
+
+    #[test]
+    fn visible_to_abs_scrolled_wrapped_line() {
+        let mut grid = CellGrid::new(3, 4);
+        // "ABCDEFGH" wraps into 2 display rows at cols=4; "tail" is 1 row.
+        push_scrollback(&mut grid, vec![line("ABCDEFGH"), line("tail")]);
+        grid.scroll_up(3);
+        assert_eq!(grid.scroll_offset(), 3);
+        // vr0/vr1 are the two slices of the wide logical line (index 0); the
+        // column offset accumulates across the wrap (base 0, then base 4).
+        assert_eq!(grid.visible_to_abs(0, 2), pos(0, 2));
+        assert_eq!(grid.visible_to_abs(1, 1), pos(0, 5));
+        // vr2 is the "tail" logical line (index 1).
+        assert_eq!(grid.visible_to_abs(2, 3), pos(1, 3));
+    }
+
+    #[test]
+    fn visible_selection_spans_across_scrollback_and_live() {
+        let mut grid = CellGrid::new(3, 4);
+        push_scrollback(
+            &mut grid,
+            vec![line("0000"), line("1111"), line("2222"), line("3333")],
+        );
+        grid.scroll_up(2);
+        // Selection from scrollback line 2 col 1 into live row 0 col 2.
+        select(&mut grid, pos(2, 1), pos(4, 2));
+        assert_eq!(
+            grid.visible_selection_spans(),
+            vec![(0, 1, 3), (1, 0, 3), (2, 0, 2)]
+        );
+    }
+
+    #[test]
+    fn visible_selection_spans_within_wrapped_line() {
+        let mut grid = CellGrid::new(3, 4);
+        push_scrollback(&mut grid, vec![line("ABCDEFGH"), line("tail")]);
+        grid.scroll_up(3);
+        // Select columns 2..=6 of the wide logical line; spans split per slice.
+        select(&mut grid, pos(0, 2), pos(0, 6));
+        assert_eq!(grid.visible_selection_spans(), vec![(0, 2, 3), (1, 0, 2)]);
+    }
+
+    #[test]
+    fn visible_selection_spans_empty_without_selection() {
+        let mut grid = CellGrid::new(3, 4);
+        push_scrollback(&mut grid, vec![line("0000")]);
+        assert!(grid.visible_selection_spans().is_empty());
+        // Degenerate (anchor == end) selections produce no spans.
+        select(&mut grid, pos(1, 0), pos(1, 0));
+        assert!(grid.visible_selection_spans().is_empty());
+    }
+
+    #[test]
+    fn selected_text_copies_full_wrapped_scrollback_lines() {
+        let mut grid = CellGrid::new(3, 4);
+        push_scrollback(&mut grid, vec![line("ABCDEFGH"), line("WXYZ")]);
+        // A non-terminal scrollback row copies its whole logical line, not just
+        // the viewport width.
+        select(&mut grid, pos(0, 0), pos(1, 3));
+        assert_eq!(grid.selected_text().as_deref(), Some("ABCDEFGH\nWXYZ"));
     }
 }

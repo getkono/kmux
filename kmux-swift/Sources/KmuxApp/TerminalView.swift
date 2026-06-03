@@ -25,6 +25,10 @@ final class TerminalNSView: NSView {
     private(set) var metrics: TerminalMetrics
     /// Anchor cell (visible coords) of an in-progress single-click drag selection.
     var dragAnchor: (col: Int, row: Int)?
+    /// Last pointer location (view coords) during a drag; drives auto-scroll.
+    var dragLast: NSPoint?
+    /// Repeating timer that auto-scrolls while a drag sits at the viewport edge.
+    var autoScrollTimer: Timer?
 
     init(model: KmuxModel) {
         self.model = model
@@ -185,21 +189,19 @@ final class TerminalNSView: NSView {
     }
 
     private func drawSelection(_ ctx: CGContext, theme: FfiTheme, metrics m: TerminalMetrics) {
-        guard let sel = model.selection, let snap = model.snapshot else { return }
-        let cols = Int(snap.cols)
+        let spans = model.selection
+        guard !spans.isEmpty else { return }
         let a = theme.accent
         ctx.setFillColor(
             CGColor(
                 srgbRed: CGFloat(a.r) / 255.0, green: CGFloat(a.g) / 255.0,
                 blue: CGFloat(a.b) / 255.0, alpha: 0.30))
 
-        let startRow = Int(sel.startRow)
-        let endRow = Int(sel.endRow)
-        guard endRow >= startRow else { return }
-        for row in startRow...endRow {
-            let cStart = row == startRow ? Int(sel.startCol) : 0
-            let cEnd = row == endRow ? Int(sel.endCol) : cols - 1
-            guard cEnd >= cStart else { continue }
+        // One wash rect per visible-row span (already scroll- and wrap-aware).
+        for span in spans {
+            let row = Int(span.row)
+            let cStart = Int(span.colStart)
+            let cEnd = Int(span.colEnd)
             ctx.fill(
                 CGRect(
                     x: CGFloat(cStart) * m.cellWidth,

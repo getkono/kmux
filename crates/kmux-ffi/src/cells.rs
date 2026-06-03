@@ -10,7 +10,7 @@
 //! theme to paint a cell.
 
 use kmux_app::theme::Theme;
-use kmux_client::grid::CellGrid;
+use kmux_client::grid::{CellGrid, scrollback_display_row_at};
 use kmux_protocol::messages::{CellAttrs, CellState, CursorShape};
 
 /// Bytes per packed cell. Little-endian layout:
@@ -61,13 +61,44 @@ pub fn encode_cell(out: &mut Vec<u8>, cell: &CellState, theme: &Theme) {
     out.push(0); // reserved
 }
 
-/// Pack the grid's visible cells row-major into a flat buffer
+/// Pack the grid's *displayed* cells row-major into a flat buffer
 /// (`rows * cols * PACKED_CELL_LEN` bytes).
+///
+/// When scrolled into history (`scroll_offset > 0`) this composites scrollback
+/// lines into the top rows exactly like the GTK renderer (`render.rs::cell_at` +
+/// [`scrollback_display_row_at`]), so the Swift frontend renders scrollback
+/// content while scrolled — not just the live viewport. At the live bottom the
+/// output is identical to packing `grid.cells()` directly. Positions with no
+/// backing cell (a short scrollback slice) encode as a blank, palette-background
+/// cell so the row still tiles fully.
 pub fn encode_cells(grid: &CellGrid, theme: &Theme) -> Vec<u8> {
+    let cols = grid.cols;
+    let rows = grid.rows;
+    let scroll_offset = grid.scroll_offset();
+    let scrollback = grid.scrollback();
     let cells = grid.cells();
-    let mut out = Vec::with_capacity(cells.len() * PACKED_CELL_LEN);
-    for cell in cells {
-        encode_cell(&mut out, cell, theme);
+    let blank = CellState::default();
+
+    let mut out = Vec::with_capacity(rows * cols * PACKED_CELL_LEN);
+    for vr in 0..rows {
+        let sb_row = if scroll_offset > 0 && vr < scroll_offset {
+            scrollback_display_row_at(scrollback, cols, scroll_offset - 1 - vr)
+        } else {
+            None
+        };
+        for vc in 0..cols {
+            let cell = if let Some((line_idx, col_start)) = sb_row {
+                scrollback
+                    .get(line_idx)
+                    .and_then(|line| line.get(col_start + vc))
+            } else if scroll_offset > 0 {
+                vr.checked_sub(scroll_offset)
+                    .and_then(|grid_row| cells.get(grid_row * cols + vc))
+            } else {
+                cells.get(vr * cols + vc)
+            };
+            encode_cell(&mut out, cell.unwrap_or(&blank), theme);
+        }
     }
     out
 }
@@ -167,5 +198,49 @@ mod tests {
         assert_eq!(cursor_shape_code(CursorShape::Bar), 2);
         assert_eq!(cursor_shape_code(CursorShape::HollowBlock), 3);
         assert_eq!(cursor_shape_code(CursorShape::Hidden), 4);
+    }
+
+    fn line(text: &str) -> Vec<CellState> {
+        text.chars()
+            .map(|c| CellState {
+                c,
+                fg: CellColor::new(0xff, 0xff, 0xff),
+                bg: CellColor::new(0, 0, 0),
+                attrs: CellAttrs::EMPTY,
+            })
+            .collect()
+    }
+
+    fn char_at(packed: &[u8], cols: usize, vr: usize, vc: usize) -> char {
+        let off = (vr * cols + vc) * PACKED_CELL_LEN;
+        let code = u32::from_le_bytes(packed[off..off + 4].try_into().unwrap());
+        char::from_u32(code).unwrap()
+    }
+
+    #[test]
+    fn encode_cells_composites_scrollback_when_scrolled() {
+        let mut grid = CellGrid::new(2, 4);
+        grid.apply_scrollback_append(0, vec![line("AAAA"), line("BBBB")]);
+        grid.scroll_up(1); // top row shows the newest scrollback line ("BBBB")
+        let packed = encode_cells(&grid, &theme());
+        assert_eq!(packed.len(), 2 * 4 * PACKED_CELL_LEN);
+        // Row 0 is composited from scrollback; row 1 is live grid row 0 (blank).
+        assert_eq!(char_at(&packed, 4, 0, 0), 'B');
+        assert_eq!(char_at(&packed, 4, 0, 3), 'B');
+        assert_eq!(char_at(&packed, 4, 1, 0), ' ');
+    }
+
+    #[test]
+    fn encode_cells_live_view_matches_raw_cells() {
+        let mut grid = CellGrid::new(2, 4);
+        grid.apply_scrollback_append(0, vec![line("AAAA")]);
+        // At the live bottom (no scroll), output equals packing grid.cells().
+        let t = theme();
+        let packed = encode_cells(&grid, &t);
+        let mut expected = Vec::new();
+        for cell in grid.cells() {
+            encode_cell(&mut expected, cell, &t);
+        }
+        assert_eq!(packed, expected);
     }
 }

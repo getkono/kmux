@@ -23,7 +23,9 @@ final class KmuxModel: ObservableObject {
 
     // ── Grid render state (read by the terminal view each `draw`) ──
     private(set) var snapshot: GridSnapshot?
-    private(set) var selection: FfiSelection?
+    /// Selection wash as per-visible-row spans (scroll- and wrap-aware); empty
+    /// when there is no selection.
+    private(set) var selection: [FfiSelectionSpan] = []
     private(set) var scrollInfo = FfiScrollInfo(offset: 0, total: 0)
     private(set) var blinkOn = true
 
@@ -42,7 +44,7 @@ final class KmuxModel: ObservableObject {
         // Assert the ABI the bindings were generated against, on top of uniffi's
         // built-in binding-checksum check. Mirrors kmux-ghostty-sys's ABI guard.
         precondition(
-            kmuxFfiAbiVersion() == 1,
+            kmuxFfiAbiVersion() == 2,
             "kmux-ffi ABI mismatch: regenerate the Swift bindings (just gen-ffi-bindings)"
         )
         let config = DriverConfig(
@@ -153,6 +155,19 @@ final class KmuxModel: ObservableObject {
         }
 
         refreshChrome()
+    }
+
+    /// Re-read pointer-driven grid state from the driver and repaint. Selection
+    /// and local scrolling bump only the cells generation, not the (cursor)
+    /// generation the pump gates on, so the pump won't pick them up — the mouse
+    /// handlers call this after mutating the driver. The snapshot is refetched
+    /// because it now composites scrollback (so it depends on the scroll
+    /// position).
+    func refreshGridView() {
+        snapshot = driver.gridSnapshot()
+        selection = driver.selection()
+        scrollInfo = driver.scrollInfo()
+        terminalView?.needsDisplay = true
     }
 
     /// Perform the toolkit-specific follow-up for one effect (clipboard, paste,

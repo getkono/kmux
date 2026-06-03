@@ -68,7 +68,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 1;
+pub const KMUX_FFI_ABI_VERSION: u32 = 2;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -414,14 +414,16 @@ fn pane_label(index: u32, title: &str) -> String {
     }
 }
 
-/// A selection span in *visible viewport* cell coordinates (row 0 = top visible
-/// row). Returned by [`KmuxDriver::selection`] for the renderer's selection wash.
+/// One selected span on a *visible* display row (row 0 = top visible row), in
+/// viewport cell coordinates (`col_start..=col_end` inclusive). Returned by
+/// [`KmuxDriver::selection`] — one per visible row the selection covers,
+/// computed scroll- and wrap-aware by `CellGrid`, so the wash paints over
+/// scrollback rows too while scrolled into history.
 #[derive(uniffi::Record)]
-pub struct FfiSelection {
-    pub start_row: u32,
-    pub start_col: u32,
-    pub end_row: u32,
-    pub end_col: u32,
+pub struct FfiSelectionSpan {
+    pub row: u32,
+    pub col_start: u32,
+    pub col_end: u32,
 }
 
 /// Scrollback position for the scroll indicator: `offset` lines back from the
@@ -430,22 +432,6 @@ pub struct FfiSelection {
 pub struct FfiScrollInfo {
     pub offset: u32,
     pub total: u32,
-}
-
-/// Convert a *visible* viewport cell to the grid's absolute coordinate space
-/// (row 0 = oldest scrollback line), clamping to the viewport. Mirrors the GTK
-/// frontend's `pos_at`; only valid at the live bottom (`scroll_offset == 0`).
-fn visible_to_abs(
-    scrollback_len: usize,
-    rows: usize,
-    cols: usize,
-    vrow: u32,
-    vcol: u32,
-) -> GridPos {
-    GridPos {
-        row: scrollback_len + (vrow as usize).min(rows.saturating_sub(1)),
-        col: (vcol as usize).min(cols.saturating_sub(1)),
-    }
 }
 
 /// One autocomplete row for the `/`-command palette. Mirrors `cmd::hint::Hint`;
@@ -809,17 +795,13 @@ impl KmuxDriver {
             .collect()
     }
 
-    /// Set a normal (drag) selection between two *visible* viewport cells. No-op
-    /// when scrolled into history (selection is live-screen only, like GTK).
+    /// Set a normal (drag) selection between two *visible* viewport cells. The
+    /// cells are mapped scroll-aware, so this works while scrolled into history.
     pub fn set_selection(&self, anchor_row: u32, anchor_col: u32, end_row: u32, end_col: u32) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         if let Some(grid) = d.mgr.active_grid_mut() {
-            if grid.scroll_offset() != 0 {
-                return;
-            }
-            let (sb, rows, cols) = (grid.scrollback_len(), grid.rows, grid.cols);
-            let anchor = visible_to_abs(sb, rows, cols, anchor_row, anchor_col);
-            let end = visible_to_abs(sb, rows, cols, end_row, end_col);
+            let anchor = grid.visible_to_abs(anchor_row as usize, anchor_col as usize);
+            let end = grid.visible_to_abs(end_row as usize, end_col as usize);
             grid.set_selection(Some(Selection {
                 anchor,
                 end,
@@ -832,11 +814,7 @@ impl KmuxDriver {
     pub fn select_word_at(&self, row: u32, col: u32) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         if let Some(grid) = d.mgr.active_grid_mut() {
-            if grid.scroll_offset() != 0 {
-                return;
-            }
-            let (sb, rows, cols) = (grid.scrollback_len(), grid.rows, grid.cols);
-            let pos = visible_to_abs(sb, rows, cols, row, col);
+            let pos = grid.visible_to_abs(row as usize, col as usize);
             let (anchor, end) = grid.find_word_boundaries(pos);
             grid.set_selection(Some(Selection {
                 anchor,
@@ -850,11 +828,8 @@ impl KmuxDriver {
     pub fn select_line_at(&self, row: u32) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         if let Some(grid) = d.mgr.active_grid_mut() {
-            if grid.scroll_offset() != 0 {
-                return;
-            }
-            let (sb, rows, cols) = (grid.scrollback_len(), grid.rows, grid.cols);
-            let abs_row = sb + (row as usize).min(rows.saturating_sub(1));
+            let cols = grid.cols;
+            let abs_row = grid.visible_to_abs(row as usize, 0).row;
             grid.set_selection(Some(Selection {
                 anchor: GridPos {
                     row: abs_row,
@@ -877,26 +852,22 @@ impl KmuxDriver {
         }
     }
 
-    /// The active selection in *visible* viewport coordinates (for the selection
-    /// wash), or `None` when empty or scrolled into history.
-    pub fn selection(&self) -> Option<FfiSelection> {
+    /// The active selection as per-visible-row spans (for the selection wash),
+    /// empty when there is no selection. Scroll- and wrap-aware, so the wash
+    /// paints over scrollback rows while scrolled into history.
+    pub fn selection(&self) -> Vec<FfiSelectionSpan> {
         let d = self.inner.lock().expect("driver mutex poisoned");
-        let grid = d.mgr.active_grid()?;
-        if grid.scroll_offset() != 0 {
-            return None;
-        }
-        let sel = grid.selection()?;
-        let (start, end) = (sel.start(), sel.end_pos());
-        if start == end {
-            return None;
-        }
-        let sb = grid.scrollback_len();
-        Some(FfiSelection {
-            start_row: start.row.saturating_sub(sb) as u32,
-            start_col: start.col as u32,
-            end_row: end.row.saturating_sub(sb) as u32,
-            end_col: end.col as u32,
-        })
+        let Some(grid) = d.mgr.active_grid() else {
+            return Vec::new();
+        };
+        grid.visible_selection_spans()
+            .into_iter()
+            .map(|(row, col_start, col_end)| FfiSelectionSpan {
+                row: row as u32,
+                col_start: col_start as u32,
+                col_end: col_end as u32,
+            })
+            .collect()
     }
 
     /// Mouse-wheel scroll at a *visible* viewport cell. Forwards an SGR/X10 wheel
@@ -924,6 +895,22 @@ impl KmuxDriver {
                 d.send_input(bytes);
             }
         } else if let Some(grid) = d.mgr.buffer_mut(&pane_id) {
+            if lines > 0 {
+                grid.scroll_up(lines as usize);
+            } else {
+                grid.scroll_down((-lines) as usize);
+            }
+        }
+    }
+
+    /// Scroll the active pane's *local* scrollback by `lines` display rows
+    /// (`> 0` = up into history). Unlike [`KmuxDriver::scroll_at`] this never
+    /// forwards to the PTY — used for drag auto-scroll, which must reveal
+    /// scrollback for selection regardless of PTY mouse reporting (mirrors the
+    /// GTK frontend's direct `grid.scroll_up/scroll_down`).
+    pub fn scroll_lines(&self, lines: i32) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        if let Some(grid) = d.mgr.active_grid_mut() {
             if lines > 0 {
                 grid.scroll_up(lines as usize);
             } else {
@@ -1269,23 +1256,5 @@ mod tests {
         assert_eq!(pane_label(0, ""), "pane 1");
         assert_eq!(pane_label(3, "   "), "pane 4");
         assert_eq!(pane_label(0, "vim"), "vim");
-    }
-
-    #[test]
-    fn visible_to_abs_offsets_by_scrollback_and_clamps() {
-        // The row is shifted by the scrollback length; both axes clamp to the
-        // viewport (mirroring `pos_at`).
-        assert_eq!(
-            visible_to_abs(100, 24, 80, 0, 0),
-            GridPos { row: 100, col: 0 }
-        );
-        assert_eq!(
-            visible_to_abs(100, 24, 80, 5, 10),
-            GridPos { row: 105, col: 10 }
-        );
-        assert_eq!(
-            visible_to_abs(0, 24, 80, 99, 999),
-            GridPos { row: 23, col: 79 }
-        );
     }
 }
