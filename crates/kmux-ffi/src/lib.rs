@@ -37,10 +37,11 @@ use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Runtime;
 
+use kmux_app::cmd;
 use kmux_app::config;
 use kmux_app::core::{AppCore, TopBarAction};
 use kmux_app::driver::{FrontendDriver, FrontendEffect};
-use kmux_app::mode::{Action, Mode};
+use kmux_app::mode::{Action, CommandState, Mode};
 use kmux_app::subcommands::parse_target;
 use kmux_app::theme::{Rgb, Theme};
 use kmux_client::connection_state::ConnectionState;
@@ -430,6 +431,44 @@ fn visible_to_abs(scrollback_len: usize, rows: usize, cols: usize, vrow: u32, vc
         row: scrollback_len + (vrow as usize).min(rows.saturating_sub(1)),
         col: (vcol as usize).min(cols.saturating_sub(1)),
     }
+}
+
+/// One autocomplete row for the `/`-command palette. Mirrors `cmd::hint::Hint`;
+/// the internal `replace_from` byte offset is omitted (a native text field
+/// re-queries [`KmuxDriver::command_hints`] on each change instead of editing
+/// char-by-char).
+#[derive(uniffi::Record)]
+pub struct FfiCommandHint {
+    pub display: String,
+    pub summary: String,
+    pub replacement: String,
+    pub append_space: bool,
+}
+
+/// Which picker overlay is open.
+#[derive(uniffi::Enum)]
+pub enum FfiPickerKind {
+    Session,
+    Server,
+    Directory,
+}
+
+/// One row in a picker list.
+#[derive(uniffi::Record)]
+pub struct FfiPickerEntry {
+    pub label: String,
+    pub detail: String,
+}
+
+/// The open picker's full state, for generic native rendering. Driven via
+/// `set_picker_search` / `set_picker_selected` / `activate_picker` /
+/// `submit_directory` / `cancel_picker`.
+#[derive(uniffi::Record)]
+pub struct FfiPicker {
+    pub kind: FfiPickerKind,
+    pub query: String,
+    pub selected: u32,
+    pub entries: Vec<FfiPickerEntry>,
 }
 
 /// Which interaction mode / overlay is active. Carries the text the matching
@@ -874,6 +913,198 @@ impl KmuxDriver {
                 total: 0,
             },
         }
+    }
+
+    /// Autocomplete hints for an arbitrary `/`-command-palette input, without
+    /// changing the current mode. For a native palette that owns its own text
+    /// field instead of driving `Mode::Command` char-by-char.
+    pub fn command_hints(&self, input: String) -> Vec<FfiCommandHint> {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        // Hints are computed from the buffer in `Mode::Command`; flip into it
+        // transiently (atomic under the lock) and restore so this is a pure query.
+        let prev = std::mem::replace(
+            &mut core.mode,
+            Mode::Command(CommandState {
+                buffer: input.clone(),
+                cursor: input.len(),
+                ..CommandState::default()
+            }),
+        );
+        let hints = cmd::hint::build_hints(core);
+        core.mode = prev;
+        hints
+            .into_iter()
+            .map(|h| FfiCommandHint {
+                display: h.display,
+                summary: h.summary.to_string(),
+                replacement: h.replacement,
+                append_space: h.append_space,
+            })
+            .collect()
+    }
+
+    /// Parse and execute a `/`-command line in one shot (reconnect / server
+    /// switch applied internally), returning any resulting effects.
+    pub fn run_command(&self, input: String) -> Vec<FfiEffect> {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.core_mut().mode = Mode::Command(CommandState {
+            buffer: input.clone(),
+            cursor: input.len(),
+            ..CommandState::default()
+        });
+        self.rt
+            .block_on(d.dispatch_action(Action::CommandSubmit))
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// The currently open picker (session / server / directory), or `None`.
+    pub fn picker(&self) -> Option<FfiPicker> {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core();
+        match core.mode {
+            Mode::SessionPicker => {
+                let mut entries = vec![FfiPickerEntry {
+                    label: "[+] New session".to_string(),
+                    detail: String::new(),
+                }];
+                for e in core.session_picker_matches() {
+                    entries.push(FfiPickerEntry {
+                        label: core.mgr.display_name_for(&e.meta.word_id),
+                        detail: e.meta.cwd.clone(),
+                    });
+                }
+                Some(FfiPicker {
+                    kind: FfiPickerKind::Session,
+                    query: core.session_picker_search.clone(),
+                    selected: core.session_picker_selected as u32,
+                    entries,
+                })
+            }
+            Mode::ServerPicker => {
+                let entries = core
+                    .filtered_servers()
+                    .into_iter()
+                    .map(|s| {
+                        // time_ago() borrows all of `s`, so compute it before
+                        // moving `display` out.
+                        let detail = s.time_ago();
+                        FfiPickerEntry {
+                            label: s.display,
+                            detail,
+                        }
+                    })
+                    .collect();
+                Some(FfiPicker {
+                    kind: FfiPickerKind::Server,
+                    query: core.server_picker_search.clone(),
+                    selected: core.server_picker_selected as u32,
+                    entries,
+                })
+            }
+            Mode::DirectoryPicker => {
+                let entries = core
+                    .dir_picker_matches()
+                    .into_iter()
+                    .map(|e| FfiPickerEntry {
+                        label: core.mgr.display_name_for(&e.meta.word_id),
+                        detail: e.meta.cwd.clone(),
+                    })
+                    .collect();
+                Some(FfiPicker {
+                    kind: FfiPickerKind::Directory,
+                    query: core.dir_picker_buffer.clone(),
+                    selected: core.dir_picker_selected as u32,
+                    entries,
+                })
+            }
+            _ => None,
+        }
+    }
+
+    /// Open the recent-servers picker.
+    pub fn open_server_picker(&self) -> Vec<FfiEffect> {
+        let _guard = self.rt.enter();
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.apply_top_bar_action(TopBarAction::OpenServerPicker)
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// Open the session picker.
+    pub fn open_session_picker(&self) -> Vec<FfiEffect> {
+        let _guard = self.rt.enter();
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.apply_top_bar_action(TopBarAction::OpenSessionPicker)
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// Set the open picker's search/filter text (resets the selection to row 0).
+    pub fn set_picker_search(&self, text: String) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.set_picker_search(text);
+        core.needs_render = true;
+    }
+
+    /// Set the open picker's highlighted row (hover/click).
+    pub fn set_picker_selected(&self, index: u32) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.set_picker_selected(index as usize);
+        core.needs_render = true;
+    }
+
+    /// Activate the open picker's current selection (click / Enter). May switch
+    /// servers (server picker) or select a session.
+    pub fn activate_picker(&self) -> Vec<FfiEffect> {
+        let _guard = self.rt.enter();
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.activate_picker_selection()
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// Submit the directory picker's typed path: select the matching session or
+    /// create a new one at that path (the create-from-typed-path path that a
+    /// plain `activate_picker` click does not cover).
+    pub fn submit_directory(&self) -> Vec<FfiEffect> {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        self.rt
+            .block_on(d.dispatch_action(Action::DirPickerSubmit))
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// Close any open picker / overlay (back to normal interaction).
+    pub fn cancel_picker(&self) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.mode = Mode::Normal;
+        core.needs_render = true;
+    }
+
+    /// Rename a session by word id (trims surrounding whitespace).
+    pub fn rename_session(&self, word_id: String, name: String) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.mgr.rename_session(&word_id, name.trim());
+        core.needs_render = true;
+    }
+
+    /// Close a session by word id.
+    pub fn close_session(&self, word_id: String) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.mgr.close_session(&word_id);
+        core.needs_render = true;
     }
 
     /// Whether the cursor is shown on the current frame (blink phase).
