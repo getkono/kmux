@@ -30,6 +30,8 @@ final class KmuxModel: ObservableObject {
     private var timer: Timer?
     private var lastGeneration: UInt64 = .max
     private var lastBlinkOn = true
+    /// Set by a `ForceClear` effect; forces a grid re-pack on the next pump.
+    private var forceRefetch = false
 
     /// Pump cadence (~60 Hz), matching the GTK frontend's 16 ms timeout.
     private static let pumpInterval = 1.0 / 60.0
@@ -76,35 +78,34 @@ final class KmuxModel: ObservableObject {
         timer = nil
     }
 
+    // MARK: - Input entry points (apply the returned effects)
+
+    /// Dispatch a curated action and apply its effects.
+    func dispatch(_ action: FfiAction) {
+        apply(driver.dispatch(action: action))
+    }
+
+    /// Run a `/`-command line and apply its effects.
+    func runCommand(_ input: String) {
+        apply(driver.runCommand(input: input))
+    }
+
+    private func apply(_ effects: [FfiEffect]) {
+        for effect in effects { handle(effect) }
+        terminalView?.needsDisplay = true
+    }
+
     // MARK: - Pump
 
     private func pump() {
-        var refetch = false
-        var repaint = false
-        for effect in driver.tick() {
-            switch effect {
-            case .needsRender:
-                repaint = true
-            case .forceClear:
-                refetch = true
-                repaint = true
-            case .paletteChanged:
-                theme = driver.theme()
-                repaint = true
-            case .copyToClipboard(let text):
-                writeClipboard(text)
-            case .requestPaste:
-                if let text = readClipboard() {
-                    driver.feedPaste(text: text)
-                }
-            case .quit:
-                NSApplication.shared.terminate(nil)
-            }
-        }
+        forceRefetch = false
+        for effect in driver.tick() { handle(effect) }
 
         // Generation-gated grid re-pack: only re-fetch the packed cells when the
-        // grid actually changed; cursor-blink toggles repaint the cached frame.
+        // grid changed; cursor-blink toggles repaint the cached frame.
         let generation = driver.gridInfo()?.generation ?? 0
+        var refetch = forceRefetch
+        var repaint = forceRefetch
         if generation != lastGeneration {
             lastGeneration = generation
             refetch = true
@@ -117,9 +118,7 @@ final class KmuxModel: ObservableObject {
             repaint = true
         }
 
-        if refetch {
-            snapshot = driver.gridSnapshot()
-        }
+        if refetch { snapshot = driver.gridSnapshot() }
         if repaint {
             selection = driver.selection()
             scrollInfo = driver.scrollInfo()
@@ -127,6 +126,26 @@ final class KmuxModel: ObservableObject {
         }
 
         refreshChrome()
+    }
+
+    /// Perform the toolkit-specific follow-up for one effect (clipboard, paste,
+    /// palette reload, quit). Grid repaint is decided by the pump's generation
+    /// check, so `NeedsRender`/`ForceClear` only flag a re-pack here.
+    private func handle(_ effect: FfiEffect) {
+        switch effect {
+        case .needsRender:
+            break
+        case .forceClear:
+            forceRefetch = true
+        case .paletteChanged:
+            theme = driver.theme()
+        case .copyToClipboard(let text):
+            writeClipboard(text)
+        case .requestPaste:
+            if let text = readClipboard() { driver.feedPaste(text: text) }
+        case .quit:
+            NSApplication.shared.terminate(nil)
+        }
     }
 
     /// Refresh the published chrome state, assigning only on change so SwiftUI

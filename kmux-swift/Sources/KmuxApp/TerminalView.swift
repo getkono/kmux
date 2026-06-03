@@ -23,6 +23,8 @@ struct TerminalView: NSViewRepresentable {
 final class TerminalNSView: NSView {
     let model: KmuxModel
     private(set) var metrics: TerminalMetrics
+    /// Anchor cell (visible coords) of an in-progress single-click drag selection.
+    var dragAnchor: (col: Int, row: Int)?
 
     init(model: KmuxModel) {
         self.model = model
