@@ -43,7 +43,7 @@ use kmux_app::core::{AppCore, TopBarAction};
 use kmux_app::driver::{FrontendDriver, FrontendEffect};
 use kmux_app::mode::{Action, CommandState, Mode};
 use kmux_app::subcommands::parse_target;
-use kmux_app::theme::{Rgb, Theme};
+use kmux_app::theme::{self, Rgb, Theme};
 use kmux_client::connection_state::ConnectionState;
 use kmux_client::generate_instance_id;
 use kmux_client::grid::{GridPos, Selection, SelectionMode};
@@ -469,6 +469,23 @@ pub struct FfiPicker {
     pub query: String,
     pub selected: u32,
     pub entries: Vec<FfiPickerEntry>,
+}
+
+/// Client-side performance counters for the HUD ticker / metrics inspector.
+/// Mirrors `kmux_client::metrics::MetricsSnapshot` + its `DiagCounters`.
+#[derive(uniffi::Record)]
+pub struct FfiMetrics {
+    pub net_apply_avg_ms: f64,
+    pub net_apply_max_ms: f64,
+    pub apply_avg_ms: f64,
+    pub batch_avg: f64,
+    pub last_diff_ops: u64,
+    pub last_large_diff_ms: f64,
+    pub snapshot_mode: bool,
+    pub stale_discards: u64,
+    pub seqno_gaps: u64,
+    pub lag_events: u64,
+    pub resyncs: u64,
 }
 
 /// Which interaction mode / overlay is active. Carries the text the matching
@@ -1105,6 +1122,59 @@ impl KmuxDriver {
         let core = d.core_mut();
         core.mgr.close_session(&word_id);
         core.needs_render = true;
+    }
+
+    /// Whether the performance HUD ticker is shown.
+    pub fn hud_visible(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .hud_visible
+    }
+
+    /// Whether the metrics inspector overlay is open.
+    pub fn metrics_visible(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .metrics_overlay_visible
+    }
+
+    /// A snapshot of the client-side performance metrics.
+    pub fn metrics(&self) -> FfiMetrics {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core();
+        let snap = core.mgr.metrics.snapshot(core.force_snapshot_mode);
+        let c = &snap.counters;
+        FfiMetrics {
+            net_apply_avg_ms: snap.net_apply_avg_ms,
+            net_apply_max_ms: snap.net_apply_max_ms,
+            apply_avg_ms: snap.apply_avg_ms,
+            batch_avg: snap.batch_avg,
+            last_diff_ops: snap.last_diff_ops as u64,
+            last_large_diff_ms: snap.last_large_diff_ms,
+            snapshot_mode: snap.snapshot_mode,
+            stale_discards: c.stale_discards,
+            seqno_gaps: c.seqno_gaps,
+            lag_events: c.lag_events,
+            resyncs: c.resyncs,
+        }
+    }
+
+    /// The built-in theme names (for a Preferences theme picker).
+    pub fn available_themes(&self) -> Vec<String> {
+        theme::BUILTIN_THEMES.iter().map(|s| s.to_string()).collect()
+    }
+
+    /// Switch the active palette to a built-in theme by name (no-op if unknown).
+    /// The driver emits `PaletteChanged` from the next [`tick`](Self::tick).
+    pub fn set_theme(&self, name: String) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        if let Some(t) = theme::builtin_theme(&name) {
+            let core = d.core_mut();
+            core.palette = t;
+            core.needs_render = true;
+        }
     }
 
     /// Whether the cursor is shown on the current frame (blink phase).
