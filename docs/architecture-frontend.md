@@ -1,10 +1,11 @@
 # Client frontend architecture
 
-This document describes how the kmux **client** is layered so that the same
-core can drive multiple frontends — the terminal UI (`kmux-tui`) and a native
-GUI (`kmux-gtk`, GTK4 on Linux; other platforms later). It is the result of the
-TUI→GUI extraction: pulling everything that is *not* terminal-specific out of
-the TUI binary into a shared, toolkit-agnostic core.
+This document describes how the kmux **client** is layered so that the same core
+can drive multiple frontends — the terminal UI (`kmux-tui`), a native GTK4 GUI
+(`kmux-gtk`, Linux), and a native SwiftUI app (`kmux-swift`, macOS, via the
+`kmux-ffi` uniffi boundary). It is the result of the TUI→GUI extraction: pulling
+everything that is *not* terminal-specific out of the TUI binary into a shared,
+toolkit-agnostic core.
 
 ## Layering
 
@@ -209,6 +210,54 @@ icon into the XDG data dirs; `just package` stages the GUI binary + desktop
 files into the release tarball under `share/`. The GUI is the primary `kmux`
 command on Linux; preferences (theme + font) open with **Ctrl+,**.
 
+## The native macOS frontend (`kmux-swift`)
+
+On macOS the native client is **`kmux-swift`**, a SwiftUI app that drives the
+same `FrontendDriver` as `kmux-gtk` — across the **`kmux-ffi`** uniffi C-ABI
+boundary (Swift cannot hold tokio channels, await receivers, or match
+`KeyResult`, so it reaches `AppCore` only through the driver). It lives in
+`kmux-swift/` as a SwiftPM package *outside* the cargo workspace (so `cargo`
+ignores it) and links the `kmux-ffi` staticlib.
+
+- **The seam (`kmux-ffi`).** An opaque, thread-confined `KmuxDriver` wraps
+  `FrontendDriver` and owns the tokio runtime its background tasks run on. All
+  calls come from the Swift main thread. The surface is versioned
+  (`KMUX_FFI_ABI_VERSION`, asserted on the Swift side on top of uniffi's
+  binding-checksum check). Beyond lifecycle + `tick` → `FfiEffect`s it exposes: a
+  generation-gated packed-cell `grid_snapshot` (16-byte cells, `DEFAULT_*`
+  resolved against the palette in Rust — see `kmux-ffi/src/cells.rs`); structured
+  **mode-aware** key input (`send_char` / `send_named_key`, routed through the
+  daemon's Ghostty encoder via `send_keys`, so no escape sequences are
+  hand-rolled); the pane list + `select_pane`; text selection + `scroll_at`; the
+  `/`-command palette (`command_hints` / `run_command`); a generic `picker`
+  getter + drivers for the session/server/directory pickers; session
+  `rename`/`close`; metrics + HUD visibility; and `theme` get/set. Every addition
+  maps to an existing toolkit-agnostic `AppCore` capability `kmux-gtk` already
+  uses — exposure across the boundary, not new policy.
+- **The app (`kmux-swift`).** A SwiftPM package with three targets: the
+  uniffi-generated C header (`kmux_ffiFFI`, a systemLibrary), the generated Swift
+  bindings (`KmuxBindings`), and the app (`KmuxApp`). A main-thread timer pumps
+  `KmuxDriver::tick` ~60 Hz (the analog of the GTK `glib` timeout) and acts on the
+  returned `FfiEffect`s. The terminal grid is a flipped `NSView` CoreText/
+  CoreGraphics renderer (the analog of the cairo/Pango `render.rs`: cell bg +
+  glyph passes, text attributes, wide chars, the four cursor shapes + blink,
+  selection wash, scroll indicator). Everything around it is native SwiftUI — a
+  sessions sidebar, a pane tab strip, a header with the connection badge, the
+  command palette, the pickers, session rename/close, preferences (theme), and
+  the performance HUD/metrics — each driven by the FFI getters/dispatch,
+  file-for-file parallel to `kmux-gtk`'s `sidebar.rs`/`tabs.rs`/`header.rs`/
+  `dialogs.rs`/`prefs.rs`.
+- **Platform gating.** `kmux-gtk`'s GTK4/libadwaita deps are target-gated to
+  Linux and its `main.rs` compiles to a stub on other targets (so
+  `cargo build/test --workspace` stays green on macOS); `kmux-ffi` is pure Rust
+  and builds everywhere, while the Swift app is macOS-only by nature (SwiftPM +
+  macOS CI / justfile guards).
+
+Build + run (bindings generation, linking, the macOS CI path) are in
+[building-macos.md](building-macos.md). The generated bindings are not committed;
+`just gen-ffi-bindings` produces them (the ABI assert + uniffi checksum guard
+drift).
+
 ## Status
 
 The GTK GUI (`kmux`) is the **primary** client on Linux and is a *native*
@@ -265,20 +314,12 @@ interaction layer. No new feature work targets it.
 - **In-process frontend selection.** Today you run `kmux` (GUI) or `kmux-tui`
   (TUI) as separate binaries. A `kmux --tui` flag could launch the terminal
   frontend in-process from the GUI binary when there is no display.
-- **Native macOS (SwiftUI).** The `kmux-ffi` crate is the language boundary: a
-  `staticlib`/`cdylib` that wraps `FrontendDriver` in an opaque, thread-confined
-  `KmuxDriver` handle and exports a small **uniffi** surface (lifecycle + `tick`
-  → `FfiEffect`s, a generation-gated packed-cell `grid_snapshot` for a
-  CoreText/Metal renderer, `theme`/`mode`/`connection`/`sessions` getters, and
-  `dispatch`/`send_input`/`feed_paste`/`resize` input). The handle owns the
-  tokio runtime; all calls come from one thread (the Swift main thread). The
-  surface is versioned (`KMUX_FFI_ABI_VERSION`, asserted on the Swift side on top
-  of uniffi's binding-checksum check). Generate the Swift package from the built
-  cdylib in uniffi *library mode* — see `kmux-ffi/src/bin/uniffi-bindgen.rs`. The
-  Xcode/SwiftUI app and the Metal/CoreText grid renderer are the remaining work;
-  they consume `kmux-ffi`. The grid is encoded as a flat byte buffer
-  (`PACKED_CELL_LEN`-byte cells, `DEFAULT_FG`/`DEFAULT_BG` resolved against the
-  palette in Rust) so Swift reinterprets one buffer per *changed* frame.
+- **Native macOS polish.** The `kmux-swift` app (see the section above) is
+  functional and at feature parity with `kmux-gtk`. Remaining polish: a Metal
+  renderer + same-attr run batching if profiling shows need; a configurable font
+  in Preferences (the renderer currently uses the system monospaced face); a
+  packaged, codesigned `.app` bundle (today it builds/runs as a SwiftPM
+  executable); and selection within scrolled-back history.
 - **Windows.** A native Windows frontend would also drive `FrontendDriver`. The
   Unix-only client paths (`flock`, UDS, daemon spawn) need cfg-gating — see
   `kmux-protocol/src/dirs.rs` for the path resolvers that would gain

@@ -10,17 +10,26 @@
 //!   `FrontendDriver`, and owns the tokio runtime the driver's background tasks
 //!   run on.
 //! - **Pump**: [`KmuxDriver::tick`] runs one driver iteration and returns the
-//!   [`FfiEffect`]s the frontend must act on. The Swift app calls this each
-//!   frame (e.g. from a `CVDisplayLink`).
+//!   [`FfiEffect`]s the frontend must act on. The Swift app calls this each frame
+//!   (a main-thread timer, the analog of the GTK `glib` timeout).
 //! - **Render (hot path)**: [`KmuxDriver::grid_info`] /
 //!   [`KmuxDriver::grid_snapshot`] expose the active grid as a generation-gated,
 //!   packed byte buffer (see [`cells`]) so the renderer copies only changed
-//!   frames; plus [`KmuxDriver::theme`], [`KmuxDriver::mode`],
-//!   [`KmuxDriver::connection`], [`KmuxDriver::sessions`], and
-//!   [`KmuxDriver::blink_on`].
-//! - **Input**: [`KmuxDriver::dispatch`] (a curated [`FfiAction`] set),
-//!   [`KmuxDriver::send_input`] (raw PTY bytes), [`KmuxDriver::feed_paste`],
+//!   frames; plus [`KmuxDriver::theme`], [`KmuxDriver::blink_on`],
+//!   [`KmuxDriver::selection`], and [`KmuxDriver::scroll_info`].
+//! - **Input**: structured **mode-aware** keys ([`KmuxDriver::send_char`] /
+//!   [`KmuxDriver::send_named_key`], encoded by the daemon — not hand-rolled
+//!   here), [`KmuxDriver::dispatch`] (a curated [`FfiAction`] set),
+//!   [`KmuxDriver::send_input`] (raw PTY bytes), [`KmuxDriver::feed_paste`], the
+//!   mouse helpers ([`KmuxDriver::scroll_at`] + the selection setters), and
 //!   [`KmuxDriver::set_term_size`] / [`KmuxDriver::request_resize`].
+//! - **Chrome / overlays**: [`KmuxDriver::connection`], [`KmuxDriver::sessions`],
+//!   [`KmuxDriver::panes`] / [`KmuxDriver::select_pane`], [`KmuxDriver::mode`],
+//!   the command palette ([`KmuxDriver::command_hints`] /
+//!   [`KmuxDriver::run_command`]), the [`KmuxDriver::picker`] getter + drivers,
+//!   session [`KmuxDriver::rename_session`] / [`KmuxDriver::close_session`],
+//!   [`KmuxDriver::metrics`], and [`KmuxDriver::available_themes`] /
+//!   [`KmuxDriver::set_theme`].
 //!
 //! ## Threading
 //!
