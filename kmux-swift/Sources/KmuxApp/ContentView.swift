@@ -54,7 +54,6 @@ struct ContentView: View {
             }
             ZStack(alignment: .top) {
                 TerminalView(model: model)
-                    .ignoresSafeArea()
                 ConnectionBanner(model: model)
                 HudOverlay(model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
