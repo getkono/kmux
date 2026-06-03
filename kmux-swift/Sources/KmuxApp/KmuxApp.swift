@@ -8,10 +8,11 @@ import SwiftUI
 @main
 struct KmuxSwiftApp: App {
     @StateObject private var model = KmuxModel()
+    @StateObject private var ui = UIState()
 
     var body: some Scene {
         WindowGroup {
-            ContentView(model: model)
+            ContentView(model: model, ui: ui)
                 .onAppear {
                     // Launched from a terminal (no app bundle), so claim regular
                     // app status and come to the foreground.
@@ -21,18 +22,14 @@ struct KmuxSwiftApp: App {
                 }
         }
         .windowResizability(.contentMinSize)
-    }
-}
+        .commands {
+            // Native menu accelerators (the analog of kmux-gtk's actions.rs).
+            KmuxCommands(model: model, ui: ui)
+        }
 
-/// Root view. For now just the terminal; the native chrome (sidebar / tabs /
-/// header / overlays) is layered on in later commits.
-struct ContentView: View {
-    @ObservedObject var model: KmuxModel
-
-    var body: some View {
-        TerminalView(model: model)
-            .frame(minWidth: 640, minHeight: 384)
-            .preferredColorScheme(model.theme.isDark ? .dark : .light)
-            .ignoresSafeArea()
+        // ⌘, opens Preferences (theme + font), like kmux-gtk's prefs.rs.
+        Settings {
+            PreferencesView(model: model)
+        }
     }
 }

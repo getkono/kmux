@@ -18,6 +18,8 @@ final class KmuxModel: ObservableObject {
     @Published private(set) var panes: [FfiPane] = []
     @Published private(set) var mode: FfiMode = .normal
     @Published private(set) var picker: FfiPicker?
+    @Published private(set) var hudVisible = false
+    @Published private(set) var metricsVisible = false
 
     // ── Grid render state (read by the terminal view each `draw`) ──
     private(set) var snapshot: GridSnapshot?
@@ -88,6 +90,31 @@ final class KmuxModel: ObservableObject {
     /// Run a `/`-command line and apply its effects.
     func runCommand(_ input: String) {
         apply(driver.runCommand(input: input))
+    }
+
+    /// Focus a pane (tab click), applying its effects.
+    func selectPane(_ id: String) {
+        apply(driver.selectPane(id: id))
+    }
+
+    /// Open the recent-servers picker.
+    func openServerPicker() {
+        apply(driver.openServerPicker())
+    }
+
+    /// Open the session picker.
+    func openSessionPicker() {
+        apply(driver.openSessionPicker())
+    }
+
+    /// Activate the open picker's selection (click / Enter).
+    func activatePicker() {
+        apply(driver.activatePicker())
+    }
+
+    /// Submit the directory picker's typed path.
+    func submitDirectory() {
+        apply(driver.submitDirectory())
     }
 
     private func apply(_ effects: [FfiEffect]) {
@@ -161,6 +188,10 @@ final class KmuxModel: ObservableObject {
         if md != mode { mode = md }
         let pk = driver.picker()
         if pk != picker { picker = pk }
+        let hud = driver.hudVisible()
+        if hud != hudVisible { hudVisible = hud }
+        let met = driver.metricsVisible()
+        if met != metricsVisible { metricsVisible = met }
     }
 
     // MARK: - Clipboard
