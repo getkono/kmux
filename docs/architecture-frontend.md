@@ -227,10 +227,13 @@ ignores it) and links the `kmux-ffi` staticlib.
   (`KMUX_FFI_ABI_VERSION`, asserted on the Swift side on top of uniffi's
   binding-checksum check). Beyond lifecycle + `tick` → `FfiEffect`s it exposes: a
   generation-gated packed-cell `grid_snapshot` (16-byte cells, `DEFAULT_*`
-  resolved against the palette in Rust — see `kmux-ffi/src/cells.rs`); structured
+  resolved against the palette in Rust, scrollback composited into the visible
+  rows when scrolled — see `kmux-ffi/src/cells.rs`); structured
   **mode-aware** key input (`send_char` / `send_named_key`, routed through the
   daemon's Ghostty encoder via `send_keys`, so no escape sequences are
-  hand-rolled); the pane list + `select_pane`; text selection + `scroll_at`; the
+  hand-rolled); the pane list + `select_pane`; scroll- and wrap-aware text
+  selection (per-visible-row wash spans, working while scrolled into history) +
+  `scroll_at`/`scroll_lines`; the
   `/`-command palette (`command_hints` / `run_command`); a generic `picker`
   getter + drivers for the session/server/directory pickers; session
   `rename`/`close`; metrics + HUD visibility; and `theme` get/set. Every addition
@@ -270,7 +273,11 @@ widget mapping:
 
 - Full Pango grid rendering — text attributes, wide chars, cursor shapes, and
   scrollback — at font-derived cell metrics (`render.rs`). One shared
-  `DrawingArea` is reparented into the active pane's tab.
+  `DrawingArea` is reparented into the active pane's tab. The selection wash and
+  pointer→cell mapping are scroll- and wrap-aware via the shared
+  `CellGrid::visible_selection_spans` / `visible_to_abs` primitives, so they work
+  identically while scrolled into history — the same primitives back the Swift
+  renderer and the FFI selection getters.
 - **Native chrome** (`shell.rs`): an `adw::HeaderBar` (server/session title,
   connection-status indicator, server-switch, command-palette, primary menu); a
   collapsible **sessions sidebar** (`adw::OverlaySplitView` + `GtkListBox`,
@@ -297,7 +304,8 @@ widget mapping:
   shared driver. Async clipboard paste (a `RequestPaste` effect → GDK async read
   → `driver.feed_paste`) stays GTK-side.
 - Mouse scroll-wheel (PTY mouse-report or local scrollback) and drag text
-  selection with copy.
+  selection with copy — selection works while scrolled into history, and a drag
+  held at the top/bottom edge auto-scrolls so it can span more than one screen.
 - libadwaita styling: the kmux palette feeds libadwaita's `accent_*` named
   colors (reloaded on `/theme`), so the chrome follows the active theme with
   stock styling; preferences (theme + font) open with **Ctrl+,**.
@@ -322,13 +330,12 @@ interaction layer. No new feature work targets it.
   in Preferences (the renderer currently uses the system monospaced face); a
   **codesigned + notarized** `.app` bundle (`just install` already assembles an
   unsigned `~/Applications/kmux.app` — see
-  [building-macos.md](building-macos.md#install)); and selection within
-  scrolled-back history.
+  [building-macos.md](building-macos.md#install)).
 - **Windows.** A native Windows frontend would also drive `FrontendDriver`. The
   Unix-only client paths (`flock`, UDS, daemon spawn) need cfg-gating — see
   `kmux-protocol/src/dirs.rs` for the path resolvers that would gain
   `#[cfg(windows)]` branches.
 - **GTK render polish.** Partial damage tracking (`queue_draw_area`, keyed off
   `CellGrid::cells_generation`) and same-attr run batching in the Pango
-  renderer if profiling shows need; selection within scrolled-back history; and
+  renderer if profiling shows need; and
   the per-category + RTT detail in the metrics overlay.

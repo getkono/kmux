@@ -4,6 +4,7 @@
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::time::Duration;
 
 use gtk4::prelude::*;
 use gtk4::{
@@ -17,6 +18,17 @@ use crate::Frontend;
 
 /// Lines scrolled per wheel notch (matches the TUI).
 const SCROLL_LINES: i32 = 3;
+
+/// Distance (logical px) from the top/bottom grid edge within which a held drag
+/// starts auto-scrolling so the selection can run past the viewport.
+const AUTO_SCROLL_MARGIN: f64 = 8.0;
+
+/// Display rows scrolled per auto-scroll tick (~60 Hz → a brisk but controllable
+/// drag-scroll).
+const AUTO_SCROLL_LINES: usize = 2;
+
+/// Auto-scroll cadence, matching the render pump's 16 ms.
+const AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(16);
 
 /// Attach the pointer controllers (scroll wheel + drag selection) to the grid.
 pub fn attach(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
@@ -60,21 +72,26 @@ fn attach_scroll(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
     drawing.add_controller(scroll);
 }
 
-/// Map a pointer pixel to an absolute [`GridPos`] on the *live* screen. Returns
-/// `None` while scrolled back (selecting history is a follow-up) or with no
-/// active grid. Row 0 of the absolute coordinate space is the oldest scrollback
-/// line, so a visible row maps to `scrollback_len() + visible_row`.
+/// Map a pointer pixel to an absolute [`GridPos`], accounting for the current
+/// scroll position so selection works while scrolled into history. Returns
+/// `None` only when there is no active grid. Pixels outside the grid are clamped
+/// to the nearest edge cell by `CellGrid::visible_to_abs`.
 fn pos_at(f: &Frontend, x: f64, y: f64) -> Option<GridPos> {
     let grid = f.core.mgr.active_grid()?;
-    if grid.scroll_offset() != 0 {
-        return None;
-    }
-    let col = ((x / f.metrics.cell_w).floor().max(0.0) as usize).min(grid.cols.saturating_sub(1));
-    let vr = ((y / f.metrics.cell_h).floor().max(0.0) as usize).min(grid.rows.saturating_sub(1));
-    Some(GridPos {
-        row: grid.scrollback_len() + vr,
-        col,
-    })
+    let col = (x / f.metrics.cell_w).floor().max(0.0) as usize;
+    let vr = (y / f.metrics.cell_h).floor().max(0.0) as usize;
+    Some(grid.visible_to_abs(vr, col))
+}
+
+/// In-progress single-click drag: the fixed anchor plus the last pointer
+/// position. The position lets a held drag past the viewport edge keep
+/// auto-scrolling from the last known location even after motion events stop
+/// firing (the pointer left the widget).
+#[derive(Clone, Copy)]
+struct Drag {
+    anchor: GridPos,
+    last_x: f64,
+    last_y: f64,
 }
 
 /// Set the active grid's selection and repaint.
@@ -89,30 +106,36 @@ fn set_selection(fe: &Rc<RefCell<Frontend>>, area: &DrawingArea, sel: Option<Sel
 }
 
 /// Left-button drag selection: single-click anchors and drags to extend,
-/// double-click selects the word, triple-click selects the line. Copy is the
-/// existing Ctrl+Shift+C path (`CopySelection` → `selected_text`).
+/// double-click selects the word, triple-click selects the line. A drag held at
+/// the top/bottom edge auto-scrolls so a selection can span more than one
+/// screen. Copy is the existing Ctrl+Shift+C path (`CopySelection` →
+/// `selected_text`).
 fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
-    // The drag anchor is `Some` only while a single-click drag is in progress.
-    let anchor: Rc<Cell<Option<GridPos>>> = Rc::new(Cell::new(None));
+    // `Some` only while a single-click drag is in progress.
+    let drag: Rc<Cell<Option<Drag>>> = Rc::new(Cell::new(None));
 
     let click = GestureClick::new();
     click.set_button(gdk::BUTTON_PRIMARY);
     {
         let fe = fe.clone();
         let area = drawing.clone();
-        let anchor = anchor.clone();
+        let drag = drag.clone();
         click.connect_pressed(move |_g, n_press, x, y| {
             // Clicking the terminal takes keyboard focus back from the sidebar.
             area.grab_focus();
             let sel = {
                 let f = fe.borrow();
                 let Some(pos) = pos_at(&f, x, y) else {
-                    anchor.set(None);
+                    drag.set(None);
                     return;
                 };
                 match n_press {
                     1 => {
-                        anchor.set(Some(pos));
+                        drag.set(Some(Drag {
+                            anchor: pos,
+                            last_x: x,
+                            last_y: y,
+                        }));
                         Selection {
                             anchor: pos,
                             end: pos,
@@ -120,7 +143,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                         }
                     }
                     2 => {
-                        anchor.set(None);
+                        drag.set(None);
                         let (s, e) = f
                             .core
                             .mgr
@@ -134,7 +157,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                         }
                     }
                     _ => {
-                        anchor.set(None);
+                        drag.set(None);
                         let cols = f.core.mgr.active_grid().map(|g| g.cols).unwrap_or(1);
                         Selection {
                             anchor: GridPos {
@@ -154,20 +177,25 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
         });
     }
     {
-        let anchor = anchor.clone();
-        click.connect_released(move |_g, _n, _x, _y| anchor.set(None));
+        let drag = drag.clone();
+        click.connect_released(move |_g, _n, _x, _y| drag.set(None));
     }
     drawing.add_controller(click);
 
-    // Extend the selection while a single-click drag is active.
+    // Extend the selection — and record the pointer position for auto-scroll —
+    // while a single-click drag is active.
     let motion = EventControllerMotion::new();
     {
         let fe = fe.clone();
         let area = drawing.clone();
+        let drag = drag.clone();
         motion.connect_motion(move |_m, x, y| {
-            let Some(a) = anchor.get() else {
+            let Some(mut d) = drag.get() else {
                 return;
             };
+            d.last_x = x;
+            d.last_y = y;
+            drag.set(Some(d));
             let end = {
                 let f = fe.borrow();
                 pos_at(&f, x, y)
@@ -177,7 +205,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                     &fe,
                     &area,
                     Some(Selection {
-                        anchor: a,
+                        anchor: d.anchor,
                         end,
                         mode: SelectionMode::Normal,
                     }),
@@ -186,6 +214,53 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
         });
     }
     drawing.add_controller(motion);
+
+    // Auto-scroll pump: always-on but cheap (a no-op unless a drag sits at an
+    // edge), mirroring the render pump. A single persistent timer avoids the
+    // double-fire hazard of per-drag timers.
+    {
+        let fe = fe.clone();
+        let area = drawing.clone();
+        glib::timeout_add_local(AUTO_SCROLL_INTERVAL, move || {
+            autoscroll_tick(&fe, &area, &drag);
+            glib::ControlFlow::Continue
+        });
+    }
+}
+
+/// One auto-scroll step: if a drag sits within [`AUTO_SCROLL_MARGIN`] of the
+/// top/bottom grid edge, scroll the active grid and extend the selection to the
+/// edge cell under the pointer's last column.
+fn autoscroll_tick(fe: &Rc<RefCell<Frontend>>, area: &DrawingArea, drag: &Rc<Cell<Option<Drag>>>) {
+    let Some(d) = drag.get() else {
+        return;
+    };
+    let height = area.height() as f64;
+    let mut f = fe.borrow_mut();
+    let cell_w = f.metrics.cell_w;
+    let Some(grid) = f.core.mgr.active_grid_mut() else {
+        return;
+    };
+    let cols = grid.cols;
+    let rows = grid.rows;
+    let col = ((d.last_x / cell_w).floor().max(0.0) as usize).min(cols.saturating_sub(1));
+    let edge_vr = if d.last_y < AUTO_SCROLL_MARGIN {
+        grid.scroll_up(AUTO_SCROLL_LINES);
+        0
+    } else if d.last_y > height - AUTO_SCROLL_MARGIN {
+        grid.scroll_down(AUTO_SCROLL_LINES);
+        rows.saturating_sub(1)
+    } else {
+        return;
+    };
+    let end = grid.visible_to_abs(edge_vr, col);
+    grid.set_selection(Some(Selection {
+        anchor: d.anchor,
+        end,
+        mode: SelectionMode::Normal,
+    }));
+    drop(f);
+    area.queue_draw();
 }
 
 /// Apply a wheel scroll to the active pane (port of the TUI `scroll_pane`).
