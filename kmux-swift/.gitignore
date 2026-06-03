@@ -1,0 +1,8 @@
+# SwiftPM build products
+.build/
+.swiftpm/
+
+# uniffi-generated bindings (produced by `just gen-ffi-bindings`; the runtime
+# ABI assert + uniffi binding-checksum guard against drift).
+Sources/kmux_ffiFFI/kmux_ffiFFI.h
+Sources/KmuxBindings/kmux_ffi.swift
