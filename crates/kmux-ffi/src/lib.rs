@@ -45,7 +45,8 @@ use kmux_app::subcommands::parse_target;
 use kmux_app::theme::{Rgb, Theme};
 use kmux_client::connection_state::ConnectionState;
 use kmux_client::generate_instance_id;
-use kmux_client::input::char_to_proto_key;
+use kmux_client::grid::{GridPos, Selection, SelectionMode};
+use kmux_client::input::{char_to_proto_key, encode_mouse_scroll};
 use kmux_protocol::messages::{
     ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, TermSize,
 };
@@ -403,6 +404,34 @@ fn pane_label(index: u32, title: &str) -> String {
     }
 }
 
+/// A selection span in *visible viewport* cell coordinates (row 0 = top visible
+/// row). Returned by [`KmuxDriver::selection`] for the renderer's selection wash.
+#[derive(uniffi::Record)]
+pub struct FfiSelection {
+    pub start_row: u32,
+    pub start_col: u32,
+    pub end_row: u32,
+    pub end_col: u32,
+}
+
+/// Scrollback position for the scroll indicator: `offset` lines back from the
+/// live bottom, out of `total` scrollback display rows.
+#[derive(uniffi::Record)]
+pub struct FfiScrollInfo {
+    pub offset: u32,
+    pub total: u32,
+}
+
+/// Convert a *visible* viewport cell to the grid's absolute coordinate space
+/// (row 0 = oldest scrollback line), clamping to the viewport. Mirrors the GTK
+/// frontend's `pos_at`; only valid at the live bottom (`scroll_offset == 0`).
+fn visible_to_abs(scrollback_len: usize, rows: usize, cols: usize, vrow: u32, vcol: u32) -> GridPos {
+    GridPos {
+        row: scrollback_len + (vrow as usize).min(rows.saturating_sub(1)),
+        col: (vcol as usize).min(cols.saturating_sub(1)),
+    }
+}
+
 /// Which interaction mode / overlay is active. Carries the text the matching
 /// overlay needs (connecting label, disconnect reason); list contents are read
 /// via the dedicated getters.
@@ -709,6 +738,144 @@ impl KmuxDriver {
             .collect()
     }
 
+    /// Set a normal (drag) selection between two *visible* viewport cells. No-op
+    /// when scrolled into history (selection is live-screen only, like GTK).
+    pub fn set_selection(&self, anchor_row: u32, anchor_col: u32, end_row: u32, end_col: u32) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        if let Some(grid) = d.mgr.active_grid_mut() {
+            if grid.scroll_offset() != 0 {
+                return;
+            }
+            let (sb, rows, cols) = (grid.scrollback_len(), grid.rows, grid.cols);
+            let anchor = visible_to_abs(sb, rows, cols, anchor_row, anchor_col);
+            let end = visible_to_abs(sb, rows, cols, end_row, end_col);
+            grid.set_selection(Some(Selection {
+                anchor,
+                end,
+                mode: SelectionMode::Normal,
+            }));
+        }
+    }
+
+    /// Select the word at a *visible* viewport cell (double-click).
+    pub fn select_word_at(&self, row: u32, col: u32) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        if let Some(grid) = d.mgr.active_grid_mut() {
+            if grid.scroll_offset() != 0 {
+                return;
+            }
+            let (sb, rows, cols) = (grid.scrollback_len(), grid.rows, grid.cols);
+            let pos = visible_to_abs(sb, rows, cols, row, col);
+            let (anchor, end) = grid.find_word_boundaries(pos);
+            grid.set_selection(Some(Selection {
+                anchor,
+                end,
+                mode: SelectionMode::Word,
+            }));
+        }
+    }
+
+    /// Select the whole line at a *visible* viewport row (triple-click).
+    pub fn select_line_at(&self, row: u32) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        if let Some(grid) = d.mgr.active_grid_mut() {
+            if grid.scroll_offset() != 0 {
+                return;
+            }
+            let (sb, rows, cols) = (grid.scrollback_len(), grid.rows, grid.cols);
+            let abs_row = sb + (row as usize).min(rows.saturating_sub(1));
+            grid.set_selection(Some(Selection {
+                anchor: GridPos {
+                    row: abs_row,
+                    col: 0,
+                },
+                end: GridPos {
+                    row: abs_row,
+                    col: cols.saturating_sub(1),
+                },
+                mode: SelectionMode::Line,
+            }));
+        }
+    }
+
+    /// Clear the active selection.
+    pub fn clear_selection(&self) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        if let Some(grid) = d.mgr.active_grid_mut() {
+            grid.clear_selection();
+        }
+    }
+
+    /// The active selection in *visible* viewport coordinates (for the selection
+    /// wash), or `None` when empty or scrolled into history.
+    pub fn selection(&self) -> Option<FfiSelection> {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let grid = d.mgr.active_grid()?;
+        if grid.scroll_offset() != 0 {
+            return None;
+        }
+        let sel = grid.selection()?;
+        let (start, end) = (sel.start(), sel.end_pos());
+        if start == end {
+            return None;
+        }
+        let sb = grid.scrollback_len();
+        Some(FfiSelection {
+            start_row: start.row.saturating_sub(sb) as u32,
+            start_col: start.col as u32,
+            end_row: end.row.saturating_sub(sb) as u32,
+            end_col: end.col as u32,
+        })
+    }
+
+    /// Mouse-wheel scroll at a *visible* viewport cell. Forwards an SGR/X10 wheel
+    /// event to the PTY when the pane has mouse reporting on; otherwise scrolls
+    /// local scrollback. `lines` > 0 scrolls up (into history). Mirrors the GTK
+    /// frontend's `scroll_pane`.
+    pub fn scroll_at(&self, col: u32, row: u32, lines: i32) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let Some(pane_id) = d.mgr.active_pane_id().map(|s| s.to_string()) else {
+            return;
+        };
+        let use_pty = d
+            .mgr
+            .buffer(&pane_id)
+            .map(|g| g.modes().mouse_report())
+            .unwrap_or(false);
+        if use_pty {
+            let sgr = d
+                .mgr
+                .buffer(&pane_id)
+                .map(|g| g.modes().sgr_mouse())
+                .unwrap_or(false);
+            let bytes = encode_mouse_scroll(col as u16 + 1, row as u16 + 1, lines, sgr);
+            if !bytes.is_empty() {
+                d.send_input(bytes);
+            }
+        } else if let Some(grid) = d.mgr.buffer_mut(&pane_id) {
+            if lines > 0 {
+                grid.scroll_up(lines as usize);
+            } else {
+                grid.scroll_down((-lines) as usize);
+            }
+        }
+    }
+
+    /// Scrollback position for the scroll indicator.
+    pub fn scroll_info(&self) -> FfiScrollInfo {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        match d.mgr.active_grid() {
+            Some(g) => FfiScrollInfo {
+                offset: g.scroll_offset() as u32,
+                total: g.total_scrollback_display_rows() as u32,
+            },
+            None => FfiScrollInfo {
+                offset: 0,
+                total: 0,
+            },
+        }
+    }
+
     /// Whether the cursor is shown on the current frame (blink phase).
     pub fn blink_on(&self) -> bool {
         self.inner.lock().expect("driver mutex poisoned").blink_on()
@@ -783,5 +950,23 @@ mod tests {
         assert_eq!(pane_label(0, ""), "pane 1");
         assert_eq!(pane_label(3, "   "), "pane 4");
         assert_eq!(pane_label(0, "vim"), "vim");
+    }
+
+    #[test]
+    fn visible_to_abs_offsets_by_scrollback_and_clamps() {
+        // The row is shifted by the scrollback length; both axes clamp to the
+        // viewport (mirroring `pos_at`).
+        assert_eq!(
+            visible_to_abs(100, 24, 80, 0, 0),
+            GridPos { row: 100, col: 0 }
+        );
+        assert_eq!(
+            visible_to_abs(100, 24, 80, 5, 10),
+            GridPos { row: 105, col: 10 }
+        );
+        assert_eq!(
+            visible_to_abs(0, 24, 80, 99, 999),
+            GridPos { row: 23, col: 79 }
+        );
     }
 }
