@@ -48,6 +48,37 @@ build:
 test:
     cargo test
 
+# ── Native macOS app (kmux-swift) ────────────────────────────────────────────
+# The SwiftUI macOS client lives in kmux-swift/ (a SwiftPM package, outside the
+# cargo workspace) and links the kmux-ffi staticlib. These recipes are macOS-only
+# (gated like `install`/`package`); on Linux the GTK GUI (`kmux`) is the client.
+
+# Generate the uniffi Swift bindings from the built kmux-ffi cdylib (library mode).
+gen-ffi-bindings:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    [[ "$(uname -s)" == "Darwin" ]] || { echo "error: gen-ffi-bindings is macOS-only (the Swift app is macOS-only)" >&2; exit 1; }
+    cargo build -p kmux-ffi
+    out=$(mktemp -d)
+    cargo run -p kmux-ffi --bin uniffi-bindgen -- \
+        generate --library target/debug/libkmux_ffi.dylib --language swift --out-dir "$out"
+    mkdir -p kmux-swift/Sources/kmux_ffiFFI kmux-swift/Sources/KmuxBindings
+    cp "$out/kmux_ffiFFI.h"  kmux-swift/Sources/kmux_ffiFFI/kmux_ffiFFI.h
+    cp "$out/kmux_ffi.swift" kmux-swift/Sources/KmuxBindings/kmux_ffi.swift
+    echo "==> generated Swift bindings into kmux-swift/Sources/"
+
+# Build the native macOS app (kmux-swift). Regenerates bindings first.
+macos-app: gen-ffi-bindings
+    swift build --package-path kmux-swift
+
+# Run the native macOS app (kmux-swift).
+macos-run: gen-ffi-bindings
+    swift run --package-path kmux-swift
+
+# Test the native macOS app (kmux-swift).
+macos-test: gen-ffi-bindings
+    swift test --package-path kmux-swift
+
 # Generate docs
 doc:
     cargo doc --no-deps --open
