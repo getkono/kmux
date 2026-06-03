@@ -38,14 +38,17 @@ use std::sync::{Arc, Mutex};
 use tokio::runtime::Runtime;
 
 use kmux_app::config;
-use kmux_app::core::AppCore;
+use kmux_app::core::{AppCore, TopBarAction};
 use kmux_app::driver::{FrontendDriver, FrontendEffect};
 use kmux_app::mode::{Action, Mode};
 use kmux_app::subcommands::parse_target;
 use kmux_app::theme::{Rgb, Theme};
 use kmux_client::connection_state::ConnectionState;
 use kmux_client::generate_instance_id;
-use kmux_protocol::messages::{ClientCapabilities, TermSize};
+use kmux_client::input::char_to_proto_key;
+use kmux_protocol::messages::{
+    ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, TermSize,
+};
 
 uniffi::setup_scaffolding!();
 
@@ -163,6 +166,94 @@ impl From<FfiAction> for Action {
             FfiAction::Paste => Action::Paste,
             FfiAction::Quit => Action::Quit,
             FfiAction::Reconnect => Action::Reconnect,
+        }
+    }
+}
+
+/// Keyboard modifier state for a structured key event. Maps to [`KeyMods`].
+#[derive(uniffi::Record)]
+pub struct FfiKeyMods {
+    pub shift: bool,
+    pub ctrl: bool,
+    pub alt: bool,
+    /// The Command (⌘) key on macOS; maps to `KeyMods::SUPER`.
+    pub command: bool,
+}
+
+impl FfiKeyMods {
+    fn to_proto(&self) -> KeyMods {
+        let mut m = KeyMods::empty();
+        m.set(KeyMods::SHIFT, self.shift);
+        m.set(KeyMods::CTRL, self.ctrl);
+        m.set(KeyMods::ALT, self.alt);
+        m.set(KeyMods::SUPER, self.command);
+        m
+    }
+}
+
+/// A non-printable key the frontend forwards by name; printable keys go through
+/// [`KmuxDriver::send_char`]. Mirrors the named arm of the GTK frontend's
+/// `convert_to_protocol_key`. The daemon turns the resulting [`KeyEvent`] into
+/// bytes under the live terminal mode (DECCKM, kitty kbd, modifyOtherKeys).
+#[derive(uniffi::Enum)]
+pub enum FfiNamedKey {
+    Enter,
+    Tab,
+    Backspace,
+    Escape,
+    ArrowUp,
+    ArrowDown,
+    ArrowLeft,
+    ArrowRight,
+    PageUp,
+    PageDown,
+    Home,
+    End,
+    Delete,
+    Insert,
+    F1,
+    F2,
+    F3,
+    F4,
+    F5,
+    F6,
+    F7,
+    F8,
+    F9,
+    F10,
+    F11,
+    F12,
+}
+
+impl FfiNamedKey {
+    fn to_code(&self) -> KeyCode {
+        match self {
+            FfiNamedKey::Enter => KeyCode::Enter,
+            FfiNamedKey::Tab => KeyCode::Tab,
+            FfiNamedKey::Backspace => KeyCode::Backspace,
+            FfiNamedKey::Escape => KeyCode::Escape,
+            FfiNamedKey::ArrowUp => KeyCode::ArrowUp,
+            FfiNamedKey::ArrowDown => KeyCode::ArrowDown,
+            FfiNamedKey::ArrowLeft => KeyCode::ArrowLeft,
+            FfiNamedKey::ArrowRight => KeyCode::ArrowRight,
+            FfiNamedKey::PageUp => KeyCode::PageUp,
+            FfiNamedKey::PageDown => KeyCode::PageDown,
+            FfiNamedKey::Home => KeyCode::Home,
+            FfiNamedKey::End => KeyCode::End,
+            FfiNamedKey::Delete => KeyCode::Delete,
+            FfiNamedKey::Insert => KeyCode::Insert,
+            FfiNamedKey::F1 => KeyCode::F1,
+            FfiNamedKey::F2 => KeyCode::F2,
+            FfiNamedKey::F3 => KeyCode::F3,
+            FfiNamedKey::F4 => KeyCode::F4,
+            FfiNamedKey::F5 => KeyCode::F5,
+            FfiNamedKey::F6 => KeyCode::F6,
+            FfiNamedKey::F7 => KeyCode::F7,
+            FfiNamedKey::F8 => KeyCode::F8,
+            FfiNamedKey::F9 => KeyCode::F9,
+            FfiNamedKey::F10 => KeyCode::F10,
+            FfiNamedKey::F11 => KeyCode::F11,
+            FfiNamedKey::F12 => KeyCode::F12,
         }
     }
 }
@@ -291,6 +382,25 @@ pub struct FfiSession {
     pub name: String,
     pub cwd: String,
     pub active: bool,
+}
+
+/// One pane (tab) in the active session.
+#[derive(uniffi::Record)]
+pub struct FfiPane {
+    pub id: String,
+    /// Display label: the pane title, or `"pane N"` (1-based) when untitled.
+    pub label: String,
+    pub active: bool,
+}
+
+/// Tab label: the pane title, falling back to its 1-based index (mirrors the
+/// GTK frontend's `pane_label`).
+fn pane_label(index: u32, title: &str) -> String {
+    if title.trim().is_empty() {
+        format!("pane {}", index + 1)
+    } else {
+        title.to_string()
+    }
 }
 
 /// Which interaction mode / overlay is active. Carries the text the matching
@@ -444,6 +554,37 @@ impl KmuxDriver {
             .send_input(bytes);
     }
 
+    /// Send a printable character as a structured key event. `text` is the
+    /// character the keystroke produces (e.g. macOS `charactersIgnoringModifiers`);
+    /// `mods` carries the active modifiers. The daemon encodes the bytes under the
+    /// live terminal mode, so the frontend never hand-rolls escape sequences.
+    /// No-op for empty `text`.
+    pub fn send_char(&self, text: String, mods: FfiKeyMods) {
+        let Some(ch) = text.chars().next() else {
+            return;
+        };
+        let (code, text, unshifted_codepoint) = char_to_proto_key(ch);
+        self.send_key_event(KeyEvent {
+            code,
+            mods: mods.to_proto(),
+            action: KeyAction::Press,
+            text,
+            unshifted_codepoint,
+        });
+    }
+
+    /// Send a named key (Enter, arrows, function keys, …) as a structured key
+    /// event. See [`send_char`](Self::send_char) for the encoding contract.
+    pub fn send_named_key(&self, key: FfiNamedKey, mods: FfiKeyMods) {
+        self.send_key_event(KeyEvent {
+            code: key.to_code(),
+            mods: mods.to_proto(),
+            action: KeyAction::Press,
+            text: String::new(),
+            unshifted_codepoint: 0,
+        });
+    }
+
     /// Feed clipboard text back as a paste (in response to
     /// [`FfiEffect::RequestPaste`]).
     pub fn feed_paste(&self, text: String) {
@@ -543,6 +684,31 @@ impl KmuxDriver {
             .collect()
     }
 
+    /// The panes (tabs) of the active session, with the active pane flagged.
+    pub fn panes(&self) -> Vec<FfiPane> {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let active = d.mgr.active_pane_id().map(|s| s.to_string());
+        d.mgr
+            .active_session_panes()
+            .iter()
+            .map(|p| FfiPane {
+                active: active.as_deref() == Some(p.pane_id.as_str()),
+                id: p.pane_id.clone(),
+                label: pane_label(p.pane_index, &p.title),
+            })
+            .collect()
+    }
+
+    /// Focus a pane by id (a tab click). Returns any resulting effects.
+    pub fn select_pane(&self, id: String) -> Vec<FfiEffect> {
+        let _guard = self.rt.enter();
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.apply_top_bar_action(TopBarAction::SelectPane(id))
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
     /// Whether the cursor is shown on the current frame (blink phase).
     pub fn blink_on(&self) -> bool {
         self.inner.lock().expect("driver mutex poisoned").blink_on()
@@ -551,5 +717,71 @@ impl KmuxDriver {
     /// Which interaction mode / overlay is active.
     pub fn mode(&self) -> FfiMode {
         mode_to_ffi(&self.inner.lock().expect("driver mutex poisoned").mode)
+    }
+}
+
+impl KmuxDriver {
+    /// Forward one structured key event and reset the blink phase, snapping the
+    /// viewport to the live bottom first (mirrors the GTK key handler). Not
+    /// exported: `send_char` / `send_named_key` are the public entry points.
+    fn send_key_event(&self, ev: KeyEvent) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.scroll_to_bottom();
+        d.send_keys(vec![ev]);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn named_key_codes_match_protocol() {
+        assert_eq!(FfiNamedKey::Enter.to_code(), KeyCode::Enter);
+        assert_eq!(FfiNamedKey::Tab.to_code(), KeyCode::Tab);
+        assert_eq!(FfiNamedKey::Backspace.to_code(), KeyCode::Backspace);
+        assert_eq!(FfiNamedKey::Escape.to_code(), KeyCode::Escape);
+        assert_eq!(FfiNamedKey::ArrowUp.to_code(), KeyCode::ArrowUp);
+        assert_eq!(FfiNamedKey::ArrowRight.to_code(), KeyCode::ArrowRight);
+        assert_eq!(FfiNamedKey::PageDown.to_code(), KeyCode::PageDown);
+        assert_eq!(FfiNamedKey::F5.to_code(), KeyCode::F5);
+        assert_eq!(FfiNamedKey::F12.to_code(), KeyCode::F12);
+    }
+
+    #[test]
+    fn key_mods_map_to_proto_bits() {
+        let none = FfiKeyMods {
+            shift: false,
+            ctrl: false,
+            alt: false,
+            command: false,
+        };
+        assert_eq!(none.to_proto(), KeyMods::empty());
+
+        let all = FfiKeyMods {
+            shift: true,
+            ctrl: true,
+            alt: true,
+            command: true,
+        };
+        assert_eq!(
+            all.to_proto(),
+            KeyMods::SHIFT | KeyMods::CTRL | KeyMods::ALT | KeyMods::SUPER
+        );
+
+        let ctrl = FfiKeyMods {
+            shift: false,
+            ctrl: true,
+            alt: false,
+            command: false,
+        };
+        assert_eq!(ctrl.to_proto(), KeyMods::CTRL);
+    }
+
+    #[test]
+    fn pane_label_falls_back_to_index() {
+        assert_eq!(pane_label(0, ""), "pane 1");
+        assert_eq!(pane_label(3, "   "), "pane 4");
+        assert_eq!(pane_label(0, "vim"), "vim");
     }
 }
