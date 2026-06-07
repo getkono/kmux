@@ -11,8 +11,8 @@ use gtk4::{Application, Label};
 
 use kmux_app::mode::Action;
 
-use crate::Frontend;
-use crate::shell::Shell;
+use super::Frontend;
+use super::shell::Shell;
 
 /// Row→session mapping (row index == `session_list` index), a re-entrancy guard
 /// so programmatic selection doesn't echo back as a jump, and a signature.

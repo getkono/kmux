@@ -14,7 +14,7 @@ use gtk4::{
 
 use kmux_client::grid::{GridPos, Selection, SelectionMode};
 
-use crate::Frontend;
+use super::Frontend;
 
 /// Lines scrolled per wheel notch (matches the TUI).
 const SCROLL_LINES: i32 = 3;

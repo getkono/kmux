@@ -26,8 +26,8 @@ use kmux_app::core::AppCore;
 use kmux_app::mode::{Action, Mode};
 use kmux_app::{cmd, mode};
 
-use crate::shell::Shell;
-use crate::{Frontend, apply_effects};
+use super::shell::Shell;
+use super::{Frontend, apply_effects};
 
 /// Which native dialog corresponds to the current mode (the list-style ones
 /// share an `adw::Dialog` shape).

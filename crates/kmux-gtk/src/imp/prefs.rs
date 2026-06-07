@@ -12,7 +12,7 @@ use gtk4::{DrawingArea, StringList};
 
 use kmux_app::{config, theme};
 
-use crate::{Frontend, render};
+use super::{Frontend, render};
 
 /// Build and present the preferences window.
 pub fn open(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea) {

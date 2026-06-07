@@ -12,8 +12,8 @@ use gtk4::Application;
 use kmux_app::core::TopBarAction;
 use kmux_client::connection_state::ConnectionState;
 
-use crate::shell::Shell;
-use crate::{Frontend, apply_effects};
+use super::shell::Shell;
+use super::{Frontend, apply_effects};
 
 /// CSS classes the connection indicator toggles between (libadwaita semantic
 /// colors), cleared before applying the current one.

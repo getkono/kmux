@@ -17,8 +17,8 @@ use gtk4::{Application, Box as GtkBox, Orientation, glib};
 use kmux_app::core::TopBarAction;
 use kmux_app::mode::Action;
 
-use crate::Frontend;
-use crate::shell::Shell;
+use super::Frontend;
+use super::shell::Shell;
 
 /// `pane_id` ↔ `TabPage` mapping plus a re-entrancy guard so the page changes we
 /// make programmatically don't echo back as `SelectPane`/`ClosePane`, and a

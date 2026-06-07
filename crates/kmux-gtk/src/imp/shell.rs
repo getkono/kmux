@@ -16,8 +16,8 @@ use gtk4::{
     Overlay, ScrolledWindow, SelectionMode, Stack,
 };
 
-use crate::sidebar::SidebarState;
-use crate::tabs::TabState;
+use super::sidebar::SidebarState;
+use super::tabs::TabState;
 
 /// All persistent widgets plus the per-region reconcile state that the pump and
 /// signal handlers touch. Held in an `Rc` and shared across closures.

@@ -17,8 +17,8 @@ use gtk4::{Application, Builder, ShortcutsWindow, gio};
 use kmux_app::core::TopBarAction;
 use kmux_app::mode::{Action, CommandState, Mode};
 
-use crate::shell::Shell;
-use crate::{Frontend, apply_effects, prefs};
+use super::shell::Shell;
+use super::{Frontend, apply_effects, prefs};
 
 /// The (`win.` name, dispatched `Action`, accelerators) table for the actions
 /// that map straight onto a shared [`Action`]. Pure data, shared by [`install`]
