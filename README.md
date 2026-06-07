@@ -70,6 +70,15 @@ configuration.
 - Rust toolchain (edition 2024) via [rustup](https://rustup.rs)
 - Zig `0.15.2`, managed via [mise](https://mise.jdx.dev) (`mise install` reads
   `mise.toml`); required to build the bundled libghostty-vt wrapper.
+  - The `kmux-ghostty-sys` build pins zig to exactly `0.15.2` and aborts on any
+    other version. If mise is **not** activated in your shell (no
+    `mise activate` in your shell rc, so no shims on `PATH`), a different `zig`
+    (e.g. a Homebrew one) may be used instead of the pinned one and builds may fail with a version
+    mismatch. The `just` recipes resolve the mise-pinned zig automatically
+    (they export `$ZIG`, which `build.rs` honors), so `just install` / `just
+    build` work regardless. For a raw `cargo build`/`cargo install`, either
+    activate mise, run it under `mise exec -- cargo …`, or pass
+    `ZIG="$(mise which zig)" cargo …`.
 - Ghostty sources as a git submodule: after cloning, run
   `git submodule update --init` once to populate `vendor/ghostty/`.
 - **GTK4 development libraries** — required only to build the GTK GUI binary

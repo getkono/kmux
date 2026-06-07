@@ -2,6 +2,13 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 # Pass recipe arguments as $1, $2, ... so the release recipe can quote them safely.
 set positional-arguments
 
+# Point every recipe at the mise-pinned zig (0.15.2; see mise.toml) so the
+# kmux-ghostty-sys build picks it up even when mise is NOT activated in the
+# caller's shell (no `mise activate`/shims on PATH) and a different `zig` (e.g.
+# a Homebrew one) shadows it. build.rs honors $ZIG; we resolve it via mise and
+# fall back to bare `zig` (PATH lookup) when mise can't provide it.
+export ZIG := `mise which zig 2>/dev/null || echo zig`
+
 default:
     @just --list
 

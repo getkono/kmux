@@ -125,8 +125,10 @@ fn verify_zig_version(zig: &str) {
     let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
     if version != EXPECTED_ZIG_VERSION {
         panic!(
-            "zig version mismatch: expected {EXPECTED_ZIG_VERSION}, found {version}.\n\
-             Run `mise install` to align with the pin in mise.toml.",
+            "zig version mismatch: expected {EXPECTED_ZIG_VERSION}, found {version} (resolved `{zig}`).\n\
+             Run `mise install` to install the pinned zig. If it is already installed, \
+             a different `zig` (e.g. a Homebrew one) is shadowing it because mise is not \
+             active in this shell: build via `just`, or set ZIG=\"$(mise which zig)\".",
         );
     }
 }
