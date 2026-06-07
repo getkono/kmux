@@ -8,10 +8,11 @@ repository.workspace = true
 publish.workspace = true
 description = "GTK4 native GUI frontend for the kmux client (Linux)."
 
-# The GUI is the primary `kmux` command on Linux. The terminal frontend ships
-# as the separate `kmux-tui` binary.
+# The GTK frontend ships as its own `kmux-gtk` binary: the default + official
+# client on Linux, also runnable on macOS. The unified `kmux` entrypoint (the
+# `kmux` crate) execs it; the terminal frontend is the separate `kmux-tui` binary.
 [[bin]]
-name = "kmux"
+name = "kmux-gtk"
 path = "src/main.rs"
 
 [dependencies]
@@ -23,11 +24,11 @@ tokio.workspace = true
 tracing.workspace = true
 futures.workspace = true
 
-# The GTK4 + libadwaita stack is Linux-only. Gating it here (rather than
-# excluding the crate from the workspace) keeps `cargo build/test --workspace`
-# green on macOS, where `kmux-gtk` compiles to a tiny stub binary that points
-# users at the native SwiftUI app (`kmux-swift`); see `src/main.rs`.
-[target.'cfg(target_os = "linux")'.dependencies]
+# The GTK4 + libadwaita stack is the desktop frontend on Linux (system packages)
+# and macOS (Homebrew: `brew install gtk4 libadwaita`). Gating the deps to those
+# two targets keeps the crate buildable on other OSes, where `src/main.rs`
+# compiles to a tiny stub binary.
+[target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
 gtk4 = "0.9"
 adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
 pangocairo = "0.20"

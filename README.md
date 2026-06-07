@@ -22,19 +22,22 @@ kmux uses a server/client split:
 | [`kmuxd`](crates/kmuxd)                 | Background daemon — manages PTY sessions, multi-transport listener         |
 | [`kmux-client`](crates/kmux-client)     | Client mechanism — session manager, transports/bootstrap, terminal grid    |
 | [`kmux-app`](crates/kmux-app)           | Toolkit-agnostic interaction layer — `AppCore`, command palette, CLI       |
-| [`kmux-gtk`](crates/kmux-gtk)           | GTK4 GUI frontend (Linux), **primary**; ships the `kmux` binary            |
-| [`kmux-tui`](crates/kmux-tui)           | TUI frontend (ratatui/crossterm), *deprecated*; ships the `kmux-tui` binary |
+| [`kmux`](crates/kmux)                   | Entrypoint binary (`kmux`) — CLI + execs the platform desktop app          |
+| [`kmux-gtk`](crates/kmux-gtk)           | GTK4 GUI frontend (Linux **primary**, also macOS); ships the `kmux-gtk` binary |
+| [`kmux-tui`](crates/kmux-tui)           | TUI frontend (ratatui/crossterm), *deprecated*; ships `kmux-tui` (run directly) |
 
 ```
 kmuxd     ->  kmux-pty,  kmux-protocol
 kmux-client ->  kmux-protocol
 kmux-app  ->  kmux-client, kmux-protocol
-kmux-tui  ->  kmux-app          (ratatui/crossterm)
-kmux-gtk  ->  kmux-app          (gtk4)
+kmux      ->  kmux-app          (entrypoint; execs kmux-gtk / kmux.app)
+kmux-tui  ->  kmux-app          (ratatui/crossterm; run directly)
+kmux-gtk  ->  kmux-app          (gtk4; Linux + macOS)
 ```
 
 The client is layered so one toolkit-agnostic core (`kmux-app`'s `AppCore`)
-drives both frontends. See [docs/architecture-frontend.md](docs/architecture-frontend.md).
+drives the frontends, and the toolkit-free `kmux` entrypoint launches the
+platform desktop app. See [docs/architecture-frontend.md](docs/architecture-frontend.md).
 
 The client connects to the server over QUIC (preferred), TCP+TLS (fallback), or
 UDS (local). See [docs/connection.md](docs/connection.md) for a full description
@@ -46,7 +49,7 @@ configuration.
 | Term | Meaning |
 | --- | --- |
 | **Daemon** (`kmuxd`) | Background server that owns PTYs, runs the VT emulator, persists state, and serves clients. |
-| **Client** (`kmux`) | The GTK GUI front-end (Linux, primary) that connects to a daemon and renders the terminal grid. `kmux-tui` is the deprecated terminal front-end, kept for SSH/headless use. |
+| **Client** (`kmux`) | The entrypoint command: it offers the CLI and opens the platform desktop app — `kmux-gtk` (GTK GUI; Linux default, also macOS) or `kmux-swift` (native macOS app). `kmux-tui` is the deprecated terminal front-end (SSH/headless), reachable only by running its package. |
 | **Session** | Top-level container holding one or more panes; identified by a stable word ID and survives client disconnects. |
 | **Pane** | A single shell process inside a session, backed by its own PTY and scrollback. |
 | **PTY** | Pseudo-terminal — the OS device pair that backs every running shell. |
@@ -69,17 +72,18 @@ configuration.
   `mise.toml`); required to build the bundled libghostty-vt wrapper.
 - Ghostty sources as a git submodule: after cloning, run
   `git submodule update --init` once to populate `vendor/ghostty/`.
-- **GTK4 development libraries** — required only to build the `kmux` GUI binary
-  (`kmux-gtk`). The `kmux-tui` and `kmuxd` binaries do not need them.
-  - Fedora: `sudo dnf install gtk4-devel`
-  - Debian / Ubuntu: `sudo apt install libgtk-4-dev`
-  - Arch: `sudo pacman -S gtk4`
-  - macOS: `brew install gtk4`
+- **GTK4 development libraries** — required only to build the GTK GUI binary
+  (`kmux-gtk`). The `kmux` entrypoint, `kmux-tui`, and `kmuxd` binaries do not
+  need them.
+  - Fedora: `sudo dnf install gtk4-devel libadwaita-devel`
+  - Debian / Ubuntu: `sudo apt install libgtk-4-dev libadwaita-1-dev`
+  - Arch: `sudo pacman -S gtk4 libadwaita`
+  - macOS: `brew install gtk4 libadwaita`
   - If another `pkg-config` (e.g. a Homebrew/linuxbrew one) shadows the system
     one in `PATH`, GTK4 resolution fails on transitive `.pc` files. Point cargo
     at the system pkg-config for any build that includes `kmux-gtk`:
-    `PKG_CONFIG=/usr/bin/pkg-config cargo run --bin kmux`. See
-    [docs/architecture-frontend.md](docs/architecture-frontend.md#building-kmux-gtk-and-the-system-pkg-config).
+    `PKG_CONFIG=/usr/bin/pkg-config cargo run -p kmux-gtk`. See
+    [docs/architecture-frontend.md](docs/architecture-frontend.md#building-and-running-kmux-gtk).
 
 ## Quick start
 
@@ -89,18 +93,22 @@ Start the server with a self-signed certificate:
 $ cargo run -p kmuxd -- --self-signed
 ```
 
-The server prints a shared auth token on startup. Connect a client — the GTK
-GUI (`kmux`, Linux) or the terminal UI (`kmux-tui`):
+The server prints a shared auth token on startup. Connect with `kmux` (the
+entrypoint opens the platform desktop app), or run a frontend directly:
 
 ```bash
-$ cargo run --bin kmux    # GUI  (kmux-gtk)   — needs system GTK4 dev libs
-$ cargo run -p kmux-tui   # TUI  (binary: kmux-tui)
+$ cargo run -p kmux        # entrypoint → opens the platform desktop app
+$ cargo run -p kmux-gtk    # GTK GUI directly (Linux default, also macOS) — needs GTK4 dev libs
+$ cargo run -p kmux-tui    # TUI directly (deprecated; SSH/headless)
 ```
 
-> If `cargo run --bin kmux` fails with a `pkg-config` error about
+`cargo run -p kmux` execs the frontend binary, so for a dev GUI run build it too
+(or use `just start`, which builds `kmux` + `kmux-gtk` then runs `kmux`).
+
+> If a `kmux-gtk` build fails with a `pkg-config` error about
 > `graphene-gobject-1.0` (or similar) not being found, your `PATH` has a
 > non-system `pkg-config` shadowing `/usr/bin/pkg-config`. Re-run as
-> `PKG_CONFIG=/usr/bin/pkg-config cargo run --bin kmux`. See
+> `PKG_CONFIG=/usr/bin/pkg-config cargo run -p kmux-gtk`. See
 > [Prerequisites](#prerequisites).
 
 By default, the server binds to `0.0.0.0:8443`.

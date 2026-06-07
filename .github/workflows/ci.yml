@@ -53,15 +53,20 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  # macOS path: build/test kmux-ffi + the client stack it wraps, and the native
-  # SwiftUI app (kmux-swift). kmux-ffi has no Zig/ghostty dependency, so this
-  # needs neither submodules nor the Zig toolchain — it is the macOS-specific
-  # counterpart to the Linux GTK build above.
+  # macOS path: build/test kmux-ffi + the client stack it wraps, build the `kmux`
+  # entrypoint and the GTK frontend (`kmux-gtk`) natively against Homebrew GTK,
+  # and build/test the native SwiftUI app (kmux-swift). kmux-ffi has no Zig/ghostty
+  # dependency, so this needs neither submodules nor the Zig toolchain — it is the
+  # macOS counterpart to the Linux GTK build above (linting is on the Linux
+  # `cargo clippy --workspace`; macOS only proves kmux-gtk builds natively here).
   macos:
     name: Check (macOS)
     runs-on: macos-14 # Apple Silicon
     steps:
       - uses: actions/checkout@v4
+
+      - name: Install GTK4 + libadwaita (Homebrew)
+        run: brew install gtk4 libadwaita
 
       - name: Install toolchains (mise)
         uses: jdx/mise-action@v2
@@ -81,11 +86,11 @@ jobs:
       - name: Format check
         run: cargo fmt --check --all
 
-      - name: Clippy (kmux-ffi + the client stack it wraps)
-        run: cargo clippy -p kmux-ffi -p kmux-app -p kmux-client -p kmux-protocol -- -D warnings
+      - name: Clippy (kmux entrypoint + kmux-ffi + the client stack it wraps)
+        run: cargo clippy -p kmux -p kmux-ffi -p kmux-app -p kmux-client -p kmux-protocol -- -D warnings
 
-      - name: Build kmux-gtk stub (proves the Linux gate compiles on macOS)
-        run: cargo build -p kmux-gtk
+      - name: Build kmux + kmux-gtk (native GTK on macOS)
+        run: cargo build -p kmux -p kmux-gtk
 
       - name: Test (kmux-ffi + the client stack it wraps)
         run: cargo test -p kmux-ffi -p kmux-app -p kmux-client -p kmux-protocol

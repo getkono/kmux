@@ -103,8 +103,8 @@ jobs:
 
       # `just package` needs patchelf on Linux to repoint kmuxd's rpath to $ORIGIN.
       # macOS uses install_name_tool, which ships with the Xcode command line tools.
-      # `just package` builds the GTK GUI (`kmux`) on Linux, which links GTK4 +
-      # libadwaita; patchelf repoints kmuxd's rpath to $ORIGIN.
+      # `just package` builds the GTK frontend (`kmux-gtk`) on Linux, which links
+      # GTK4 + libadwaita; patchelf repoints kmuxd's rpath to $ORIGIN.
       - name: Install GTK4 + libadwaita + patchelf (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y patchelf libgtk-4-dev libadwaita-1-dev

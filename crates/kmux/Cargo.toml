@@ -1,0 +1,23 @@
+[package]
+name = "kmux"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "kmux entrypoint: CLI front door + launcher for the platform desktop client."
+
+# The unified `kmux` command on every supported platform. It is intentionally
+# toolkit-agnostic (no GTK / Swift deps): it runs the shared CLI subcommands and,
+# for an interactive launch, execs the platform desktop frontend — `kmux-gtk` on
+# Linux, the native Swift `kmux.app` bundle on macOS.
+[[bin]]
+name = "kmux"
+path = "src/main.rs"
+
+[dependencies]
+kmux-app.workspace = true
+kmux-client.workspace = true
+anyhow.workspace = true
+tokio.workspace = true

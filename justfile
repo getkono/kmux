@@ -12,7 +12,8 @@ default:
 #   just start --dry-run myhost        # forward args to the binary
 #   RUST_LOG=trace just start          # override the default log filter
 #   KMUX_LOG_STDERR=0 just start       # log to the client log file instead
-# Run the kmux GUI (debug build), forwarding any args to the `kmux` binary.
+# The `kmux` entrypoint execs its sibling `kmux-gtk` in target/debug, so build both.
+# Run the kmux GUI (debug build) via the `kmux` entrypoint, forwarding any args.
 start *args:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -22,7 +23,8 @@ start *args:
     export KMUX_LOG_STDERR="${KMUX_LOG_STDERR:-1}"
     export G_MESSAGES_DEBUG="${G_MESSAGES_DEBUG:-all}"
     export RUST_LOG_STYLE="${RUST_LOG_STYLE:-always}"
-    cargo run --bin kmux -- "$@"
+    cargo build -p kmux -p kmux-gtk
+    cargo run -p kmux -- "$@"
 
 # Format all code
 fmt:
@@ -51,7 +53,7 @@ test:
 # ── Native macOS app (kmux-swift) ────────────────────────────────────────────
 # The SwiftUI macOS client lives in kmux-swift/ (a SwiftPM package, outside the
 # cargo workspace) and links the kmux-ffi staticlib. These recipes are macOS-only
-# (gated like `install`/`package`); on Linux the GTK GUI (`kmux`) is the client.
+# (gated like `install`/`package`); on Linux the GTK GUI (`kmux-gtk`) is the client.
 
 # Generate the uniffi Swift bindings from the built kmux-ffi cdylib (library mode).
 gen-ffi-bindings profile="debug":
@@ -108,36 +110,39 @@ tail-client-log:
 tail-daemon-log:
     tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/kmux/daemon.log"
 
-# Rebuild kmux-tui + kmuxd (debug) and restart the daemon via `kmux-tui daemon restart`.
-# Binary resolution: the client at target/debug/kmux-tui picks up its sibling
-# kmuxd at target/debug/kmuxd, spawning it with the same argv as any auto-spawn.
+# Binary resolution: the toolkit-free `kmux` client at target/debug/kmux picks up
+# its sibling kmuxd at target/debug/kmuxd, spawning it with the same argv as any
+# auto-spawn. `kmux daemon …` never loads a UI toolkit.
+# Rebuild kmux + kmuxd (debug) and restart the daemon via `kmux daemon restart`.
 restart-daemon:
-    cargo build -p kmux-tui -p kmuxd
-    cargo run -p kmux-tui -- daemon restart
+    cargo build -p kmux -p kmuxd
+    cargo run -p kmux -- daemon restart
 
 # Start the local daemon (debug build) via the same primitive as auto-spawn.
 start-daemon:
-    cargo build -p kmux-tui -p kmuxd
-    cargo run -p kmux-tui -- daemon start
+    cargo build -p kmux -p kmuxd
+    cargo run -p kmux -- daemon start
 
 # Stop the local daemon (debug build).
 stop-daemon:
-    cargo run -p kmux-tui -- daemon stop
+    cargo run -p kmux -- daemon stop
 
 # Install the clients + daemon for the host platform (release build).
 install:
     #!/usr/bin/env bash
     set -euo pipefail
-    # The CLI binaries (kmux-tui, kmuxd) go to ~/.cargo/bin on every platform; the
-    # GUI is installed the platform-native way with its launcher entry + icon, and
-    # in both cases `kmux` on PATH starts the GUI:
-    #   - Linux: the GTK GUI (`kmux`) to ~/.cargo/bin, plus its .desktop entry +
-    #            icon into the XDG data dirs (Activities / app grid).
+    # The `kmux` entrypoint + the `kmuxd` daemon go to ~/.cargo/bin on every
+    # platform; the desktop GUI is installed the platform-native way and `kmux`
+    # (no args) opens it. `kmux-tui` is NOT installed — it is reachable only via
+    # `cargo run -p kmux-tui`.
+    #   - Linux: the GTK frontend `kmux-gtk` to ~/.cargo/bin (the entrypoint execs
+    #            it), plus its .desktop entry + icon into the XDG data dirs
+    #            (Activities / app grid).
     #   - macOS: the SwiftUI app assembled into ~/Applications/kmux.app (Launchpad
     #            / Spotlight / Dock), bundling kmuxd beside it so a Finder-launched
-    #            app can auto-spawn the local daemon, plus a `kmux` launcher in the
-    #            cargo bin dir that execs the bundle so `kmux` starts the GUI too.
-    cargo install --path crates/kmux-tui
+    #            app can auto-spawn the local daemon; the `kmux` entrypoint execs
+    #            the bundle so `kmux` from a terminal starts the GUI too.
+    cargo install --path crates/kmux
     cargo install --path crates/kmuxd
     if [[ "$(uname -s)" == "Linux" ]]; then
         cargo install --path crates/kmux-gtk
@@ -146,7 +151,7 @@ install:
         mkdir -p "$apps" "$icons"
         cp crates/kmux-gtk/data/dev.getkono.kmux.desktop "$apps/"
         cp crates/kmux-gtk/data/icons/dev.getkono.kmux.svg "$icons/"
-        echo "==> installed the kmux GUI + desktop entry (GTK4 + libadwaita are runtime deps)"
+        echo "==> installed kmux + the kmux-gtk GUI + desktop entry (GTK4 + libadwaita are runtime deps)"
     elif [[ "$(uname -s)" == "Darwin" ]]; then
         # Build the release FFI staticlib + matching Swift bindings, then the app
         # in release linking that archive (KMUX_FFI_LIB overrides Package.swift's
@@ -174,17 +179,10 @@ install:
         # Refresh Launch Services so Finder/Spotlight pick up the new bundle + icon.
         touch "$app"
         /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app" 2>/dev/null || true
-        # Install a `kmux` launcher on PATH (the macOS analog of the Linux GTK
-        # `kmux` binary): exec the bundle so `kmux` from a terminal starts the
-        # GUI. Goes in the same cargo bin dir as the CLIs installed above.
-        if [[ -n "${CARGO_INSTALL_ROOT:-}" ]]; then
-            bindir="$CARGO_INSTALL_ROOT/bin"
-        else
-            bindir="${CARGO_HOME:-$HOME/.cargo}/bin"
-        fi
-        mkdir -p "$bindir"
-        install -m 0755 kmux-swift/macos/kmux "$bindir/kmux"
-        echo "==> installed kmux.app to ~/Applications (launch from Launchpad/Spotlight) + 'kmux' launcher to $bindir"
+        # No separate launcher script: the `kmux` entrypoint installed above
+        # (cargo install --path crates/kmux) execs this bundle, so `kmux` from a
+        # terminal starts the GUI.
+        echo "==> installed kmux.app to ~/Applications (launch from Launchpad/Spotlight); the 'kmux' entrypoint execs it"
     fi
 
 # Stage a distributable release tarball for the host target into dist/.
@@ -200,10 +198,10 @@ package:
     target=$(rustc -vV | sed -n 's/^host: //p')
     stage="kmux-${ver}-${target}"
     echo "==> building release binaries (${target})"
-    cargo build --release -p kmux-tui -p kmuxd
+    cargo build --release -p kmux -p kmuxd
     rm -rf "dist/${stage}"
     mkdir -p "dist/${stage}"
-    cp target/release/kmux-tui target/release/kmuxd README.md "dist/${stage}/"
+    cp target/release/kmux target/release/kmuxd README.md "dist/${stage}/"
     if [[ "$(uname -s)" == "Darwin" ]]; then
         # Resolve the dylib from kmuxd's baked rpath (authoritative — it is where
         # the binary was linked to look), then ship it and repoint to @loader_path.
@@ -213,22 +211,23 @@ package:
         oldref=$(otool -L "dist/${stage}/kmuxd" | awk '/libkmux_ghostty/{print $1; exit}')
         install_name_tool -change "$oldref" @rpath/libkmux_ghostty.dylib "dist/${stage}/kmuxd"
         install_name_tool -add_rpath @loader_path "dist/${stage}/kmuxd"
-        strip -x "dist/${stage}/kmux-tui" "dist/${stage}/kmuxd"
+        strip -x "dist/${stage}/kmux" "dist/${stage}/kmuxd"
     else
         command -v patchelf >/dev/null || { echo "error: patchelf is required to package on Linux (e.g. 'dnf install patchelf' / 'apt-get install patchelf')" >&2; exit 1; }
         libdir=$(patchelf --print-rpath target/release/kmuxd | tr ':' '\n' | grep -m1 kmux-ghostty-sys || true)
         [[ -n "$libdir" && -f "$libdir/libkmux_ghostty.so" ]] || { echo "error: could not locate libkmux_ghostty.so (rpath: ${libdir:-none})" >&2; exit 1; }
         cp "$libdir/libkmux_ghostty.so" "dist/${stage}/"
         patchelf --set-rpath '$ORIGIN' "dist/${stage}/kmuxd"
-        strip "dist/${stage}/kmux-tui" "dist/${stage}/kmuxd"
-        # The GTK GUI (`kmux`) is Linux-only. It dynamically links the system
+        strip "dist/${stage}/kmux" "dist/${stage}/kmuxd"
+        # The GTK frontend (`kmux-gtk`) is the default client on Linux; the `kmux`
+        # entrypoint (shipped above) execs it. It dynamically links the system
         # GTK4 + libadwaita (NOT bundled, unlike libkmux_ghostty) — they are
         # runtime deps the user installs from their distro. Ship the binary plus
         # its desktop entry + icon under share/.
-        echo "==> building + staging the kmux GUI"
+        echo "==> building + staging the kmux-gtk GUI"
         cargo build --release -p kmux-gtk
-        cp target/release/kmux "dist/${stage}/"
-        strip "dist/${stage}/kmux"
+        cp target/release/kmux-gtk "dist/${stage}/"
+        strip "dist/${stage}/kmux-gtk"
         mkdir -p "dist/${stage}/share/applications" \
                  "dist/${stage}/share/icons/hicolor/scalable/apps"
         cp crates/kmux-gtk/data/dev.getkono.kmux.desktop "dist/${stage}/share/applications/"

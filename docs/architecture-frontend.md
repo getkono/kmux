@@ -2,14 +2,18 @@
 
 This document describes how the kmux **client** is layered so that the same core
 can drive multiple frontends — the terminal UI (`kmux-tui`), a native GTK4 GUI
-(`kmux-gtk`, Linux), and a native SwiftUI app (`kmux-swift`, macOS, via the
-`kmux-ffi` uniffi boundary). It is the result of the TUI→GUI extraction: pulling
+(`kmux-gtk`, Linux + macOS), and a native SwiftUI app (`kmux-swift`, macOS, via the
+`kmux-ffi` uniffi boundary) — all fronted by one toolkit-agnostic entrypoint
+binary, `kmux`. It is the result of the TUI→GUI extraction: pulling
 everything that is *not* terminal-specific out of the TUI binary into a shared,
 toolkit-agnostic core.
 
 ## Layering
 
 ```
+kmux            ENTRYPOINT binary (toolkit-agnostic): shares run_cli; runs the
+      ╎         subcommands, else execs the platform desktop app — kmux-gtk on
+      ╎ (execs) Linux, the Swift kmux.app on macOS. Depends only on kmux-app.
 kmux-protocol   wire protocol, transport traits, dirs/paths, auth
       │
 kmux-client     MECHANISM: SessionManager, terminal grid model (CellGrid),
@@ -18,13 +22,14 @@ kmux-client     MECHANISM: SessionManager, terminal grid model (CellGrid),
 kmux-app        INTERACTION POLICY (toolkit-agnostic): Mode/Action + resolve,
       │         the /-command palette, AppCore view-model + dispatch +
       │         connection orchestration, theme palette (Rgb) + config,
-      │         recent-servers, and the non-interactive CLI subcommands
+      │         recent-servers, the shared CLI front door (run_cli)
       │         + the FrontendDriver (the shared run loop)
       ├───────────────┬─────────────────┬─────────────────
       ▼               ▼                 ▼
 kmux-tui          kmux-gtk          kmux-ffi            FRONTENDS
 (ratatui +        (GTK4 + glib +    (uniffi C ABI →     (presentation only)
- crossterm)        cairo)            SwiftUI macOS app)
+ crossterm;        cairo;            SwiftUI macOS app)
+ direct-run only)  Linux + macOS)
 ```
 
 **Hard rule:** nothing at or below `kmux-app` may depend on a UI toolkit.
@@ -156,15 +161,19 @@ deliberate newtype-wrapper ergonomic. A native GUI frontend wraps the same
 
 ## Binaries and the shared CLI front door
 
-The naming is: **`kmux`** is the GUI (the `kmux-gtk` crate's binary, Linux);
-**`kmux-tui`** is the terminal client (the `kmux-tui` crate's binary, kept for
-SSH/headless use); **`kmuxd`** is the daemon.
+The naming is: **`kmux`** is the entrypoint (the `kmux` crate's binary) on both
+Linux and macOS — it offers the CLI and opens the platform desktop app;
+**`kmux-gtk`** is the GTK frontend (the `kmux-gtk` crate's binary — the default +
+official client on Linux, also runnable on macOS); **`kmux-tui`** is the terminal
+client (the `kmux-tui` crate's binary, kept for SSH/headless use, reachable only
+by running its package directly); **`kmux-swift`** is the native macOS app; and
+**`kmuxd`** is the daemon.
 
-Both client binaries share one CLI front door — `kmux_app::launch::run_cli`. It
-initializes logging, parses the CLI, runs any non-interactive subcommand
+`kmux` and the frontends all share one CLI front door — `kmux_app::launch::run_cli`.
+It initializes logging, parses the CLI, runs any non-interactive subcommand
 (`ls`, `daemon`, `--dry-run`) and returns `Launch::Done`, or returns
 `Launch::Interactive(Plan)` — a frontend-agnostic description of the session to
-launch. Each binary's `main` is then thin:
+launch. A frontend's `main` is then thin:
 
 ```rust
 match run_cli(instance_id).await? {
@@ -173,16 +182,30 @@ match run_cli(instance_id).await? {
 }
 ```
 
-The frontend builds its own `AppCore` from the `Plan` (supplying its own
-capabilities — the TUI probes the terminal; the GUI declares truecolor) and
-runs its pump. So `kmux daemon start`, `kmux ls`, `kmux --server …`, etc. all
-work on either binary; only the interactive presentation differs.
+Each frontend builds its own `AppCore` from the `Plan` (supplying its own
+capabilities — the TUI probes the terminal; the GUI declares truecolor) and runs
+its pump.
+
+The **`kmux` entrypoint** is the same front door minus the in-process GUI: it
+runs `run_cli` and, on `Launch::Interactive`, *execs* the platform desktop binary
+(`kmux-gtk` on Linux, the Swift `kmux.app` bundle on macOS — located next to the
+running executable, then on `PATH`, mirroring `find_server_binary` for `kmuxd`),
+forwarding argv. The spawned frontend re-runs `run_cli` and rebuilds the same
+`Plan` (a benign double-parse). `kmux` itself depends only on `kmux-app` (no UI
+toolkit), so `kmux daemon start`, `kmux ls`, `kmux --server …` work identically
+on both platforms without loading GTK — only the interactive presentation is
+delegated to the per-platform frontend. The TUI is deliberately **not** reachable
+from `kmux`.
 
 ## Running
 
-- GUI: `cargo run -p kmux-gtk` (binary `kmux`) — opens a window, connects,
-  renders the active session, forwards keystrokes. Proof-of-seam GTK scaffold.
-- TUI: `cargo run -p kmux-tui` (binary `kmux-tui`).
+- Entrypoint: `cargo run -p kmux` (binary `kmux`) — runs the CLI subcommands and,
+  for an interactive launch, execs the platform desktop app. For a dev GUI run,
+  build the frontend too so the exec target exists (`just start` builds
+  `kmux` + `kmux-gtk` then runs `kmux`).
+- GUI directly: `cargo run -p kmux-gtk` (binary `kmux-gtk`) — opens a window,
+  connects, renders the active session, forwards keystrokes (Linux + macOS).
+- TUI: `cargo run -p kmux-tui` (binary `kmux-tui`) — the only way to reach the TUI.
 
 ### Building and running `kmux-gtk`
 
@@ -193,6 +216,8 @@ dynamically and are **not** bundled in the release tarball (unlike `kmuxd`'s
 
 - Debian/Ubuntu: `libgtk-4-dev libadwaita-1-dev`
 - Fedora: `gtk4-devel libadwaita-devel`
+- macOS (Homebrew): `brew install gtk4 libadwaita` — `kmux-gtk` is the Linux
+  default but also runs on macOS, where the native default frontend is `kmux-swift`
 
 On a machine where another `pkg-config` (e.g. a Homebrew/linuxbrew one) shadows
 the system one in `PATH`, gtk4 resolution fails on transitive X11 `.pc` files.
@@ -205,12 +230,14 @@ PKG_CONFIG=/usr/bin/pkg-config cargo build -p kmux-gtk
 This is a machine `PATH` quirk, not a repo setting; on a standard install the
 default `pkg-config` resolves gtk4 directly.
 
-`just install` installs the `kmux` GUI (Linux) plus its `.desktop` entry and
-icon into the XDG data dirs (on macOS it instead assembles `~/Applications/kmux.app`
-— see [the native macOS frontend](#the-native-macos-frontend-kmux-swift) and
-[building-macos.md](building-macos.md#install)); `just package` stages the GUI
-binary + desktop files into the release tarball under `share/`. The GUI is the
-primary `kmux` command on Linux; preferences (theme + font) open with **Ctrl+,**.
+`just install` installs the `kmux` entrypoint + the `kmux-gtk` GUI (Linux) plus
+its `.desktop` entry and icon into the XDG data dirs (on macOS it installs `kmux`
+and instead assembles `~/Applications/kmux.app` — see [the native macOS
+frontend](#the-native-macos-frontend-kmux-swift) and
+[building-macos.md](building-macos.md#install)); `just package` stages `kmux` +
+the `kmux-gtk` binary + desktop files into the release tarball under `share/`.
+`kmux-gtk` is the default client on Linux, launched by the `kmux` entrypoint;
+preferences (theme + font) open with **Ctrl+,**.
 
 ## The native macOS frontend (`kmux-swift`)
 
@@ -253,10 +280,13 @@ ignores it) and links the `kmux-ffi` staticlib.
   file-for-file parallel to `kmux-gtk`'s `sidebar.rs`/`tabs.rs`/`header.rs`/
   `dialogs.rs`/`prefs.rs`.
 - **Platform gating.** `kmux-gtk`'s GTK4/libadwaita deps are target-gated to
-  Linux and its `main.rs` compiles to a stub on other targets (so
-  `cargo build/test --workspace` stays green on macOS); `kmux-ffi` is pure Rust
-  and builds everywhere, while the Swift app is macOS-only by nature (SwiftPM +
-  macOS CI / justfile guards).
+  Linux **and macOS** (macOS needs Homebrew GTK: `brew install gtk4 libadwaita`),
+  and its `main.rs` compiles to a stub only on other targets. `kmux-ffi` is pure
+  Rust and builds everywhere; the `kmux` entrypoint is toolkit-free and builds
+  everywhere; the Swift app is macOS-only by nature (SwiftPM + macOS CI /
+  justfile guards). Note: a full `cargo build --workspace` on macOS now requires
+  Homebrew GTK (because `kmux-gtk` is a real target there); the macOS CI job is
+  selective rather than `--workspace`.
 
 Build + run (bindings generation, linking, the macOS CI path) are in
 [building-macos.md](building-macos.md). The generated bindings are not committed;
@@ -265,7 +295,7 @@ drift).
 
 ## Status
 
-The GTK GUI (`kmux`) is the **primary** client on Linux and is a *native*
+The GTK GUI (`kmux-gtk`) is the **primary** client on Linux and is a *native*
 libadwaita app — only the terminal panes are drawn like a terminal; everything
 around them uses native widgets. It drives `AppCore` through the same contract
 as the TUI; the GTK-specific parts are the pump, the render leaf, and the native
@@ -321,9 +351,14 @@ interaction layer. No new feature work targets it.
 
 ### Future
 
-- **In-process frontend selection.** Today you run `kmux` (GUI) or `kmux-tui`
-  (TUI) as separate binaries. A `kmux --tui` flag could launch the terminal
-  frontend in-process from the GUI binary when there is no display.
+- **Frontend selection from `kmux`.** The `kmux` entrypoint launches the platform
+  desktop app by `exec`. A future flag (e.g. `kmux --gtk` on macOS, or a `--tui`
+  opt-in) could let it pick a non-default frontend, and a no-display fallback
+  could select the terminal frontend automatically.
+- **macOS interactive args.** `kmux` forwards argv to the Swift `kmux.app`, but
+  the Swift app currently ignores connect flags (`--server`/`--theme`/…) and uses
+  defaults; honoring them there (parsing argv into a `DriverConfig`) is a
+  follow-up. CLI subcommands (`daemon`/`ls`/`--dry-run`) already work via `kmux`.
 - **Native macOS polish.** The `kmux-swift` app (see the section above) is
   functional and at feature parity with `kmux-gtk`. Remaining polish: a Metal
   renderer + same-attr run batching if profiling shows need; a configurable font

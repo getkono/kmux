@@ -3,7 +3,7 @@ use clap::{Args, Parser, Subcommand, ValueEnum};
 #[derive(Parser, Debug)]
 #[command(
     name = "kmux",
-    about = "kmux remote terminal client (TUI)",
+    about = "kmux remote terminal client",
     version = concat!(
         env!("CARGO_PKG_VERSION"),
         " (",

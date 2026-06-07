@@ -70,12 +70,17 @@ just macos-test    # gen bindings + swift test
 ## Install
 
 ```sh
-just install       # release build → ~/Applications/kmux.app + CLIs & `kmux` in ~/.cargo/bin
+just install       # release build → ~/Applications/kmux.app + `kmux` & `kmuxd` in ~/.cargo/bin
 ```
 
 `just install` is the macOS counterpart of the Linux GTK install. It:
 
-1. installs the CLIs (`kmux-tui`, `kmuxd`) to `~/.cargo/bin` (release), then
+1. installs the `kmux` entrypoint + the `kmuxd` daemon to `~/.cargo/bin`
+   (release). `kmux` is toolkit-free; for an interactive launch it execs the app
+   bundle's `kmux-swift` executable (below), so typing `kmux` in a terminal
+   starts the GUI — and `kmux daemon …` / `kmux ls` run the CLI directly. (The
+   former `kmux-swift/macos/kmux` shell launcher is gone — the `kmux` binary
+   replaces it.) `kmux-tui` is **not** installed. Then it:
 2. builds the release `kmux-ffi` staticlib + matching Swift bindings
    (`just gen-ffi-bindings release`) and the app in release, linking that
    archive (via `KMUX_FFI_LIB`, which overrides `Package.swift`'s debug default),
@@ -83,14 +88,12 @@ just install       # release build → ~/Applications/kmux.app + CLIs & `kmux` i
    `kmuxd` beside it, `Contents/Resources/kmux.icns`, and a versioned
    `Contents/Info.plist` (from [`kmux-swift/macos/`](../kmux-swift/macos/)) — so
    the app appears in Launchpad / Spotlight / Dock with its icon. This is the
-   macOS analog of kmux-gtk's `.desktop` entry + icon on Linux, then
-4. installs a `kmux` launcher ([`kmux-swift/macos/kmux`](../kmux-swift/macos/kmux))
-   into the cargo bin dir (`~/.cargo/bin`, beside the CLIs). It execs the
-   bundle's `kmux-swift` executable, so typing `kmux` in a terminal starts the
-   GUI — the macOS analog of the Linux `kmux` (GTK) binary. Running the
-   in-bundle Mach-O directly (vs. `open`ing the bundle) forwards args + stdio and
-   runs in the foreground; macOS still applies the bundle's icon/menu because it
-   finds `Contents/Info.plist` above the executable.
+   macOS analog of kmux-gtk's `.desktop` entry + icon on Linux.
+
+`kmux` execs the in-bundle Mach-O directly (vs. `open`ing the bundle) so the GUI
+forwards args + stdio and runs in the foreground; macOS still applies the
+bundle's icon/menu because it finds `Contents/Info.plist` above the executable.
+`KMUX_APP` overrides the bundle location (default `~/Applications/kmux.app`).
 
 `kmuxd` is bundled *beside* the app exe because `find_server_binary()` checks the
 running exe's own directory before `PATH`: a Finder/Spotlight launch gets the
@@ -103,7 +106,7 @@ dev install, like `cargo install`), not a bundled dylib.
 
 ```sh
 # In one shell: start a local daemon (this build needs Zig for ghostty).
-cargo run -p kmuxd -- --self-signed     # or: kmux-tui daemon start
+cargo run -p kmuxd -- --self-signed     # or: kmux daemon start
 
 # In another: launch the app — it connects to the local daemon over the UDS,
 # renders the active session, and forwards keystrokes.
@@ -120,10 +123,10 @@ blink, and the connection badge + reconnect.
 ## CI
 
 The `macos` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
-fmt-checks, clippies + tests `kmux-ffi` and the client stack it wraps, builds the
-`kmux-gtk` Linux-gate stub (proving the gate compiles on macOS), then runs
-`just gen-ffi-bindings` + `swift build` + `swift test`. It needs neither the Zig
-toolchain nor submodules.
+fmt-checks, clippies + tests `kmux` + `kmux-ffi` and the client stack it wraps,
+builds `kmux` and the GTK frontend `kmux-gtk` natively against Homebrew GTK
+(`brew install gtk4 libadwaita`), then runs `just gen-ffi-bindings` +
+`swift build` + `swift test`. It needs neither the Zig toolchain nor submodules.
 
 ## Notes / limitations
 

@@ -5,9 +5,10 @@ A terminal multiplexer / session manager with remote desktop capabilities.
 ## Commands
 
 - Run server: `cargo run -p kmuxd -- --self-signed`
-- Run TUI client: `cargo run -p kmux-tui` (deprecated; headless/SSH + regression oracle)
-- Run GTK GUI (primary `kmux` client on Linux): `cargo run -p kmux-gtk` (needs system GTK4 + libadwaita dev libs; if another `pkg-config` shadows the system one, prefix `PKG_CONFIG=/usr/bin/pkg-config`)
-- Run native macOS app (`kmux-swift`): `just macos-run` (macOS only; needs Xcode — the GTK GUI is Linux-only). See [docs/building-macos.md](docs/building-macos.md)
+- Run `kmux` (the entrypoint — CLI + opens the platform desktop app): `cargo run -p kmux`. Toolkit-free; handles `daemon`/`ls`/`--dry-run` itself and, for an interactive launch, execs `kmux-gtk` (Linux) or the Swift `kmux.app` (macOS). For a dev GUI run also build the frontend so the exec target exists (`just start`, which builds `kmux` + `kmux-gtk`).
+- Run GTK GUI directly (`kmux-gtk` — the default + official client on Linux, also runnable on macOS): `cargo run -p kmux-gtk` (needs GTK4 + libadwaita dev libs: system packages on Linux, `brew install gtk4 libadwaita` on macOS; if another `pkg-config` shadows the system one, prefix `PKG_CONFIG=/usr/bin/pkg-config`)
+- Run native macOS app (`kmux-swift` — the default GUI `kmux` opens on macOS): `just macos-run` (macOS only; needs Xcode). See [docs/building-macos.md](docs/building-macos.md)
+- Run TUI client directly (`kmux-tui`, deprecated; headless/SSH + regression oracle — **not** reachable via `kmux`, only by running its package): `cargo run -p kmux-tui`
 - Run tests: `just test`
 - Lint: `just clippy`
 - Lint fix: `just clippy-fix`
@@ -16,7 +17,7 @@ A terminal multiplexer / session manager with remote desktop capabilities.
 
 ## Conventions
 
-- The client is layered for multiple frontends: `kmux-protocol` → `kmux-client` (mechanism) → `kmux-app` (toolkit-agnostic interaction policy + `AppCore` + the `FrontendDriver` shared run loop) → frontends: `kmux-tui` (ratatui), `kmux-gtk` (GTK4, **Linux-only**), and `kmux-swift` (native SwiftUI, **macOS-only**) — the last drives `FrontendDriver` across the `kmux-ffi` uniffi C-ABI boundary. `kmux-gtk`'s GTK deps are target-gated to Linux (a stub binary elsewhere); `kmux-swift` is a SwiftPM package outside the cargo workspace. Nothing at or below `kmux-app` may depend on a UI toolkit. See [docs/architecture-frontend.md](docs/architecture-frontend.md).
+- The client is layered for multiple frontends: `kmux-protocol` → `kmux-client` (mechanism) → `kmux-app` (toolkit-agnostic interaction policy + `AppCore` + the `FrontendDriver` shared run loop + the shared CLI front door `run_cli`) → frontends: `kmux-tui` (ratatui), `kmux-gtk` (GTK4, **Linux + macOS**), and `kmux-swift` (native SwiftUI, **macOS-only**) — the last drives `FrontendDriver` across the `kmux-ffi` uniffi C-ABI boundary. Above the frontends sits **`kmux`**, the toolkit-agnostic entrypoint binary (CLI + launcher): it runs the shared subcommands and, for an interactive launch, execs the platform desktop app (`kmux-gtk` on Linux, the Swift `kmux.app` on macOS). `kmux-gtk`'s GTK deps are target-gated to Linux + macOS (a stub binary on other OSes; macOS needs Homebrew GTK4 + libadwaita); `kmux-swift` is a SwiftPM package outside the cargo workspace. `kmux-tui` is reachable only by running its package directly. Nothing at or below `kmux-app` may depend on a UI toolkit (`kmux` sits above it and stays toolkit-free regardless). See [docs/architecture-frontend.md](docs/architecture-frontend.md).
 - Any architectural detail/change should be documented in `docs/` directory.
 - Use strict Rust -- no `#[allow(unused)]` without justification
 - Write tests for all new functionality

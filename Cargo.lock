@@ -1520,6 +1520,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmux"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "kmux-app",
+ "kmux-client",
+ "tokio",
+]
+
+[[package]]
 name = "kmux-app"
 version = "0.2.0"
 dependencies = [
