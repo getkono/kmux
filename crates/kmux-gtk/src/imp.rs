@@ -36,6 +36,7 @@ mod render;
 mod shell;
 mod sidebar;
 mod tabs;
+mod tiles;
 
 use std::cell::RefCell;
 use std::rc::Rc;
@@ -177,7 +178,7 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         let fe = fe.clone();
         drawing.set_draw_func(move |area, cr, w, h| {
             let fe = fe.borrow();
-            render::render(
+            render::render_tiled(
                 &fe.core,
                 cr,
                 &area.pango_context(),
@@ -318,6 +319,12 @@ fn pump(
         tabs::sync(shell, fe);
         sidebar::sync(shell, fe);
         dialogs::sync(dialogs, shell, fe, app);
+        // Keep each visible pane's PTY sized to its resolved tile (no-op when no
+        // tile's size changed). Skipped until the drawing has been allocated.
+        let (w, h) = (shell.drawing.width(), shell.drawing.height());
+        if w > 0 && h > 0 {
+            tiles::push_sizes(fe, w, h);
+        }
         shell.drawing.queue_draw();
     }
 }

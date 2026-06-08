@@ -10,9 +10,14 @@ use gtk4::cairo;
 use gtk4::pango;
 
 use kmux_app::core::AppCore;
+use kmux_app::layout::{LayoutConfig, resolve_layout};
 use kmux_app::theme::Theme as Palette;
-use kmux_client::grid::{ScrollbackBuffer, scrollback_display_row_at};
+use kmux_client::grid::{CellGrid, ScrollbackBuffer, scrollback_display_row_at};
 use kmux_protocol::messages::{CellAttrs, CellState, CursorShape};
+
+/// Divider thickness (cells) between tiled panes — must match the value the
+/// client uses when computing per-pane sizes (`tiles::push_sizes`).
+pub const GUTTER: u16 = 1;
 
 /// Cell geometry derived from the configured font. Recomputed when the font or
 /// the display scale factor changes.
@@ -85,10 +90,12 @@ fn cell_at<'a>(
     }
 }
 
-/// Paint the active grid into `cr`. `width`/`height` are the content area's
-/// logical pixel size (used to center the no-session message and place the
-/// scroll indicator).
-pub fn render(
+/// Lay out the active tab's panes and paint each into its sub-rectangle, with a
+/// focus border around the focused pane when more than one is visible. Falls
+/// back to a single full-area grid (or the placeholder) when there's no tab.
+///
+/// `width`/`height` are the content area's logical pixel size.
+pub fn render_tiled(
     core: &AppCore,
     cr: &cairo::Context,
     ctx: &pango::Context,
@@ -98,13 +105,93 @@ pub fn render(
     cursor_phase: bool,
 ) {
     let palette = &core.palette;
+    // Window background shows in the gutters between tiles.
     src(cr, palette.bg.r, palette.bg.g, palette.bg.b);
     let _ = cr.paint();
 
-    let Some(grid) = core.mgr.active_grid() else {
-        placeholder(cr, ctx, metrics, palette, width, height);
+    let Some(layout) = core.mgr.active_layout().cloned() else {
+        // No tab: single active grid, or the no-session placeholder.
+        match core.mgr.active_grid() {
+            Some(grid) => paint_grid(grid, cr, ctx, metrics, palette, width, height, cursor_phase),
+            None => placeholder(cr, ctx, metrics, palette, width, height),
+        }
         return;
     };
+
+    let (cols, rows) = metrics.cols_rows(width, height);
+    let cfg = LayoutConfig {
+        gutter_cols: GUTTER,
+        gutter_rows: GUTTER,
+        min_cols: 1,
+        min_rows: 1,
+    };
+    let rects = resolve_layout(&layout, cols, rows, &cfg);
+    let multi = rects.len() > 1;
+    let focused = core
+        .mgr
+        .active_pane_id()
+        .and_then(|p| p.rsplit_once('/'))
+        .and_then(|(_, i)| i.parse::<u32>().ok());
+    let word = core.mgr.active_session().unwrap_or("").to_string();
+
+    for r in &rects {
+        let px = r.col as f64 * metrics.cell_w;
+        let py = r.row as f64 * metrics.cell_h;
+        let pw = r.cols as f64 * metrics.cell_w;
+        let ph = r.rows as f64 * metrics.cell_h;
+        let pane_id = format!("{word}/{}", r.pane_index);
+        if let Some(grid) = core.mgr.buffer(&pane_id) {
+            let _ = cr.save();
+            cr.rectangle(px, py, pw, ph);
+            cr.clip();
+            cr.translate(px, py);
+            paint_grid(
+                grid,
+                cr,
+                ctx,
+                metrics,
+                palette,
+                pw as i32,
+                ph as i32,
+                cursor_phase,
+            );
+            let _ = cr.restore();
+        }
+        if multi {
+            // Accent border on the focused pane; a dim divider on the others.
+            let (c, lw) = if Some(r.pane_index) == focused {
+                (palette.accent, 2.0)
+            } else {
+                (palette.status_bg, 1.0)
+            };
+            src(cr, c.r, c.g, c.b);
+            cr.set_line_width(lw);
+            cr.rectangle(
+                px + lw / 2.0,
+                py + lw / 2.0,
+                (pw - lw).max(0.0),
+                (ph - lw).max(0.0),
+            );
+            let _ = cr.stroke();
+        }
+    }
+}
+
+/// Paint a single `grid` filling the current cairo target (origin at `(0,0)`).
+/// `width`/`height` are the target's logical pixel size.
+#[allow(clippy::too_many_arguments)]
+fn paint_grid(
+    grid: &CellGrid,
+    cr: &cairo::Context,
+    ctx: &pango::Context,
+    metrics: &Metrics,
+    palette: &Palette,
+    width: i32,
+    _height: i32,
+    cursor_phase: bool,
+) {
+    src(cr, palette.bg.r, palette.bg.g, palette.bg.b);
+    let _ = cr.paint();
 
     let layout = pango::Layout::new(ctx);
     let cells = grid.cells();

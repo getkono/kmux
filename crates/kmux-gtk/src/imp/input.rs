@@ -28,10 +28,33 @@ const AUTO_SCROLL_LINES: usize = 2;
 /// Auto-scroll cadence, matching the render pump's 16 ms.
 const AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(16);
 
-/// Attach the pointer controllers (scroll wheel + drag selection) to the grid.
+/// Attach the pointer controllers (scroll wheel + drag selection + click-to-
+/// focus) to the grid.
 pub fn attach(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
+    attach_focus_click(drawing, fe);
     attach_scroll(drawing, fe);
     attach_selection(drawing, fe);
+}
+
+/// Click-to-focus: a primary-button press focuses the tiled pane under the
+/// pointer. Does not claim the event, so drag-selection still starts. No-op for
+/// a single-pane tab (the click already lands on the only pane).
+fn attach_focus_click(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
+    let click = GestureClick::new();
+    let fe = fe.clone();
+    let area = drawing.clone();
+    click.connect_pressed(move |_g, _n, x, y| {
+        let (w, h) = (area.width(), area.height());
+        if let Some(pane_id) = super::tiles::pane_at(&fe, x, y, w, h) {
+            let mut f = fe.borrow_mut();
+            if f.core.mgr.active_pane_id() != Some(pane_id.as_str()) {
+                f.core.mgr.focus_pane(pane_id);
+                f.core.needs_render = true;
+            }
+        }
+        area.grab_focus();
+    });
+    drawing.add_controller(click);
 }
 
 /// Scroll wheel. Like the TUI: when the inner program enabled mouse reporting,

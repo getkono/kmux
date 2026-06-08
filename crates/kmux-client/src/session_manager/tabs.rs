@@ -240,8 +240,14 @@ impl SessionManager {
 
     /// Close the active tab.
     pub fn close_tab(&mut self) {
-        let (Some(word_id), Some(tab_index)) = (self.active_session.clone(), self.active_tab)
-        else {
+        if let Some(tab_index) = self.active_tab {
+            self.close_tab_index(tab_index);
+        }
+    }
+
+    /// Close a specific tab of the active session by index.
+    pub fn close_tab_index(&mut self, tab_index: u32) {
+        let Some(word_id) = self.active_session.clone() else {
             return;
         };
         let rid = self.next_rid();

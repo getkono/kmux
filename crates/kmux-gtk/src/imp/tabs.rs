@@ -1,12 +1,11 @@
-//! Pane tabs: an `adw::TabView` + `adw::TabBar` reconciled against the active
-//! session's panes. One tab per pane.
+//! Tab strip: an `adw::TabView` + `adw::TabBar` reconciled against the active
+//! session's **tabs** (Session → Tab → Pane). One GTK tab page per kmux tab.
 //!
-//! The protocol streams only the *active* pane's grid (`mgr.active_grid()`), so a
-//! single shared `DrawingArea` is reparented into the selected page rather than
-//! one grid per page. Selecting a tab applies [`TopBarAction::SelectPane`];
-//! closing one dispatches [`Action::ClosePane`] and lets the server confirm the
-//! removal (the reconcile drops the page when the pane leaves the session), so
-//! there is never a tab without a live pane behind it.
+//! The active tab's panes are drawn tiled into the single shared `DrawingArea`
+//! (see `render::render_tiled`), which is reparented into the selected page.
+//! Selecting a tab calls `select_tab`; closing one closes the tab server-side
+//! and vetoes the immediate GTK removal (the reconcile drops the page once the
+//! tab is gone), so there is never a page without a live tab behind it.
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -14,15 +13,13 @@ use std::rc::Rc;
 use adw::prelude::*;
 use gtk4::{Application, Box as GtkBox, Orientation, glib};
 
-use kmux_app::core::TopBarAction;
-use kmux_app::mode::Action;
-
 use super::Frontend;
 use super::shell::Shell;
 
-/// `pane_id` ↔ `TabPage` mapping plus a re-entrancy guard so the page changes we
-/// make programmatically don't echo back as `SelectPane`/`ClosePane`, and a
-/// signature so terminal output doesn't churn the tab strip every frame.
+/// `tab_index` ↔ `TabPage` mapping (the index stringified) plus a re-entrancy
+/// guard so the page changes we make programmatically don't echo back as a
+/// select/close, and a signature so terminal output doesn't churn the strip
+/// every frame.
 pub struct TabState {
     map: RefCell<Vec<(String, adw::TabPage)>>,
     syncing: Cell<bool>,
@@ -39,9 +36,19 @@ impl TabState {
     }
 }
 
+/// Look up the `tab_index` mapped to `page`.
+fn tab_index_for(s: &Shell, page: &adw::TabPage) -> Option<u32> {
+    s.tabs
+        .map
+        .borrow()
+        .iter()
+        .find(|(_, p)| p.eq(page))
+        .and_then(|(id, _)| id.parse::<u32>().ok())
+}
+
 /// Connect the `TabView` signals to the shared interaction policy. Called once.
 pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, _app: &Application) {
-    // Selecting a tab → make that pane active (the server then streams its grid).
+    // Selecting a tab → view that tab (attach its pane set, focus its pane).
     {
         let s = shell.clone();
         let fe = fe.clone();
@@ -52,20 +59,12 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, _app: &Application) {
             let Some(page) = tv.selected_page() else {
                 return;
             };
-            let pane_id = s
-                .tabs
-                .map
-                .borrow()
-                .iter()
-                .find(|(_, p)| p.eq(&page))
-                .map(|(id, _)| id.clone());
-            let Some(pane_id) = pane_id else {
+            let Some(tab_index) = tab_index_for(&s, &page) else {
                 return;
             };
             {
                 let mut f = fe.borrow_mut();
-                f.core
-                    .apply_top_bar_action(TopBarAction::SelectPane(pane_id));
+                f.core.mgr.select_tab(tab_index);
                 f.core.needs_render = true;
             }
             show_in_page(&s, &page);
@@ -74,8 +73,8 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, _app: &Application) {
         });
     }
 
-    // Closing a tab → close the pane server-side and veto the immediate GTK
-    // removal; the reconcile removes the page once the pane is gone.
+    // Closing a tab → close it server-side and veto the immediate GTK removal;
+    // the reconcile removes the page once the tab is gone.
     {
         let s = shell.clone();
         let fe = fe.clone();
@@ -85,38 +84,29 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, _app: &Application) {
                 tv.close_page_finish(page, true);
                 return glib::Propagation::Stop;
             }
-            let pane_id = s
-                .tabs
-                .map
-                .borrow()
-                .iter()
-                .find(|(_, p)| p.eq(page))
-                .map(|(id, _)| id.clone());
-            if let Some(pane_id) = pane_id {
+            if let Some(tab_index) = tab_index_for(&s, page) {
                 let mut f = fe.borrow_mut();
-                f.core
-                    .apply_top_bar_action(TopBarAction::SelectPane(pane_id));
-                let _ = futures::executor::block_on(f.core.dispatch_action(Action::ClosePane));
+                f.core.mgr.close_tab_index(tab_index);
                 f.core.needs_render = true;
             }
-            // Server-authoritative: keep the tab until the pane actually closes.
+            // Server-authoritative: keep the page until the tab actually closes.
             tv.close_page_finish(page, false);
             glib::Propagation::Stop
         });
     }
 }
 
-/// Reconcile the tab strip against `mgr.active_session_panes()`. Cheap no-op when
-/// the pane set + active pane are unchanged.
+/// Reconcile the tab strip against `mgr.active_session_tabs()`. Cheap no-op when
+/// the tab set + active tab are unchanged.
 pub fn sync(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
     let (sig, want, active_pane) = {
         let f = fe.borrow();
         let mgr = &f.core.mgr;
-        let active = mgr.active_pane_id().unwrap_or("").to_string();
+        let active = mgr.active_tab().map(|t| t.to_string()).unwrap_or_default();
         let want: Vec<(String, String)> = mgr
-            .active_session_panes()
+            .active_session_tabs()
             .iter()
-            .map(|p| (p.pane_id.clone(), pane_label(p.pane_index, &p.title)))
+            .map(|t| (t.tab_index.to_string(), tab_label(t.tab_index, &t.name)))
             .collect();
         let sig = format!(
             "{active}|{}",
@@ -215,12 +205,12 @@ pub fn sync(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
     shell.tabs.syncing.set(false);
 }
 
-/// Tab title: the pane title, falling back to its 1-based index.
-fn pane_label(index: u32, title: &str) -> String {
-    if title.trim().is_empty() {
-        format!("pane {}", index + 1)
+/// Tab title: the tab's name, falling back to its 1-based index.
+fn tab_label(index: u32, name: &str) -> String {
+    if name.trim().is_empty() {
+        format!("{}", index + 1)
     } else {
-        title.to_string()
+        name.to_string()
     }
 }
 

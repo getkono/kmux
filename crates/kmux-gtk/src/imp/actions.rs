@@ -29,6 +29,17 @@ fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
         ("close-pane", Action::ClosePane, &["<Ctrl><Shift>q"]),
         ("next-pane", Action::NextPane, &["<Ctrl><Shift>Right"]),
         ("prev-pane", Action::PrevPane, &["<Ctrl><Shift>Left"]),
+        // Tiling: split the focused pane and move focus between tiled panes.
+        (
+            "split-right",
+            Action::SplitRight,
+            &["<Ctrl><Shift>backslash"],
+        ),
+        ("split-down", Action::SplitDown, &["<Ctrl><Shift>minus"]),
+        ("focus-left", Action::FocusLeft, &["<Ctrl><Alt>Left"]),
+        ("focus-right", Action::FocusRight, &["<Ctrl><Alt>Right"]),
+        ("focus-up", Action::FocusUp, &["<Ctrl><Alt>Up"]),
+        ("focus-down", Action::FocusDown, &["<Ctrl><Alt>Down"]),
         ("new-session", Action::CreateSession, &["<Ctrl><Shift>n"]),
         ("close-session", Action::CloseSession, &["<Ctrl><Shift>w"]),
         ("rename-session", Action::RenameSession, &["F2"]),
