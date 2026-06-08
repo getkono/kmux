@@ -239,7 +239,11 @@ ignores it) and links the `kmux-ffi` staticlib.
   rows when scrolled — see `kmux-ffi/src/cells.rs`); structured
   **mode-aware** key input (`send_char` / `send_named_key`, routed through the
   daemon's Ghostty encoder via `send_keys`, so no escape sequences are
-  hand-rolled); the pane list + `select_pane`; scroll- and wrap-aware text
+  hand-rolled); the **tiling surface** — `tabs()` + `select_tab`, `layout(area)`
+  (the shared resolver's per-pane rects), per-pane `grid_snapshot_for` /
+  `selection_for` / `scroll_info_for`, `focus_pane`, `set_pane_sizes`, and the
+  split/focus/resize/swap/scheme/zoom `FfiAction`s (see [layout.md](layout.md));
+  scroll- and wrap-aware text
   selection (per-visible-row wash spans, working while scrolled into history) +
   `scroll_at`/`scroll_lines`; the
   `/`-command palette (`command_hints` / `run_command`); a generic `picker`
@@ -254,8 +258,11 @@ ignores it) and links the `kmux-ffi` staticlib.
   returned `FfiEffect`s. The terminal grid is a flipped `NSView` CoreText/
   CoreGraphics renderer (the analog of the cairo/Pango `render.rs`: cell bg +
   glyph passes, text attributes, wide chars, the four cursor shapes + blink,
-  selection wash, scroll indicator). Everything around it is native SwiftUI — a
-  sessions sidebar, a pane tab strip, a header with the connection badge, the
+  selection wash, scroll indicator). Like the GTK leaf it **tiles** the active
+  tab's panes from `layout()` (clip + translate per pane, focus border,
+  click-to-focus). Everything around it is native SwiftUI — a
+  sessions sidebar, a tab strip (from `tabs()`), a header with the connection
+  badge, the
   command palette, the pickers, session rename/close, preferences (theme), and
   the performance HUD/metrics — each driven by the FFI getters/dispatch,
   file-for-file parallel to `kmux-gtk`'s `sidebar.rs`/`tabs.rs`/`header.rs`/
@@ -284,7 +291,10 @@ mapping:
 
 - Full Pango grid rendering — text attributes, wide chars, cursor shapes, and
   scrollback — at font-derived cell metrics (`render.rs`). One shared
-  `DrawingArea` is reparented into the active pane's tab. The selection wash and
+  `DrawingArea` **tiles** the active tab's panes: it resolves the tab's shared
+  `LayoutNode` tree against its pixel size via the toolkit-agnostic
+  `kmux-app/layout` resolver, then clips + translates per pane and accent-borders
+  the focused one (`render_tiled` + `tiles.rs`). The selection wash and
   pointer→cell mapping are scroll- and wrap-aware via the shared
   `CellGrid::visible_selection_spans` / `visible_to_abs` primitives, so they work
   identically while scrolled into history — the same primitives back the Swift
@@ -292,10 +302,12 @@ mapping:
 - **Native chrome** (`shell.rs`): an `adw::HeaderBar` (server/session title,
   connection-status indicator, server-switch, command-palette, primary menu); a
   collapsible **sessions sidebar** (`adw::OverlaySplitView` + `GtkListBox`,
-  `sidebar.rs`); and a **pane tab strip** (`adw::TabBar`/`TabView`, `tabs.rs`).
-  Sessions and panes are reconciled against `AppCore` each pump tick (cheap
+  `sidebar.rs`); and a **tab strip** (`adw::TabBar`/`TabView`, `tabs.rs`).
+  Sessions and tabs are reconciled against `AppCore` each pump tick (cheap
   per-region signatures); selecting/closing routes through `TopBarAction` /
-  `Action`. Panes map to tabs because the protocol streams only the active grid.
+  `Action`. Under the **Session → Tab → Pane** model the strip shows *tabs* (each
+  a tiled layout of one or more panes), not individual panes — see
+  [layout.md](layout.md).
 - **Accelerators-only keyboard** (`actions.rs`): each command is a `gio` action
   bound to a reserved accelerator (`Ctrl+Shift+…`, function keys, `Ctrl+digit`),
   surfaced in a hamburger menu and a `GtkShortcutsWindow`; the key controller on

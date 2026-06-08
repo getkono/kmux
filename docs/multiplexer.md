@@ -39,6 +39,12 @@ sequences.  This means:
   `libghostty-vt` but has no field in `kmux-protocol::messages`, clients
   cannot act on it.
 
+> **Multi-pane tiling.** Simultaneously-visible tiled panes (splits, focus,
+> resize, swap, preset layouts, zoom) under the **Session → Tab → Pane** model
+> are documented separately in [layout.md](layout.md): the shared layout tree,
+> the deterministic resolver, the server-authoritative mutation/broadcast flow,
+> and the keymap.
+
 ### Status legend
 
 | Symbol | Meaning |

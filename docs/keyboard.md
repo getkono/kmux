@@ -93,6 +93,13 @@ called — they never reach the daemon and never become `PtyKey` events.
 Mode-internal Tab/Enter (command palette completion, connect-form field
 navigation) are similarly consumed locally.
 
+## Multi-pane tiling keys
+
+The split / focus / resize / swap / tab / preset-layout / zoom accelerators
+(GTK) and ⌘-shortcuts (macOS) are catalogued in [layout.md](layout.md#keymap).
+Like every kmux accelerator they are intercepted before the encoder, so they
+never reach the daemon or the inner program.
+
 ## Backwards compatibility
 
 The protocol bumped from `PROTOCOL_VERSION = 17` to `18` when `PtyKey` /
