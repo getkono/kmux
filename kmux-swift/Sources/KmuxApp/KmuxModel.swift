@@ -15,25 +15,38 @@ final class KmuxModel: ObservableObject {
     @Published private(set) var theme: FfiTheme
     @Published private(set) var connection: FfiConnInfo
     @Published private(set) var sessions: [FfiSession] = []
-    @Published private(set) var panes: [FfiPane] = []
+    /// Tabs of the active session (Session → Tab → Pane) for the tab strip.
+    @Published private(set) var tabs: [FfiTab] = []
     @Published private(set) var mode: FfiMode = .normal
     @Published private(set) var picker: FfiPicker?
     @Published private(set) var hudVisible = false
     @Published private(set) var metricsVisible = false
 
-    // ── Grid render state (read by the terminal view each `draw`) ──
-    private(set) var snapshot: GridSnapshot?
-    /// Selection wash as per-visible-row spans (scroll- and wrap-aware); empty
-    /// when there is no selection.
+    // ── Tiling render state (read by the terminal view each `draw`) ──
+    /// The active tab's resolved pane rectangles (cells), recomputed each pump
+    /// from the view's content area via the shared resolver.
+    private(set) var layout: [FfiPaneRect] = []
+    /// Each visible pane's packed grid snapshot, keyed by pane id.
+    private(set) var paneSnapshots: [String: GridSnapshot] = [:]
+    /// The focused pane id (the input + selection target within the tab).
+    private(set) var focusedPaneId: String?
+    /// Focused pane's selection wash (per-visible-row spans), scroll position,
+    /// and a back-compat single snapshot (used by the drag auto-scroll).
     private(set) var selection: [FfiSelectionSpan] = []
     private(set) var scrollInfo = FfiScrollInfo(offset: 0, total: 0)
+    private(set) var snapshot: GridSnapshot?
     private(set) var blinkOn = true
+
+    /// The focused pane's rect (offset/extent), for mapping pointer coordinates
+    /// into pane-local cells.
+    var focusedPaneRect: FfiPaneRect? { layout.first { $0.paneId == focusedPaneId } }
 
     weak var terminalView: TerminalNSView?
 
     private var timer: Timer?
-    private var lastGeneration: UInt64 = .max
     private var lastBlinkOn = true
+    /// Per-pane grid generation, so each tile re-packs only when its grid changed.
+    private var lastGenByPane: [String: UInt64] = [:]
     /// Set by a `ForceClear` effect; forces a grid re-pack on the next pump.
     private var forceRefetch = false
 
@@ -94,9 +107,17 @@ final class KmuxModel: ObservableObject {
         apply(driver.runCommand(input: input))
     }
 
-    /// Focus a pane (tab click), applying its effects.
-    func selectPane(_ id: String) {
-        apply(driver.selectPane(id: id))
+    /// View a tab of the active session (tab-strip click).
+    func selectTab(_ index: UInt32) {
+        apply(driver.selectTab(tabIndex: index))
+    }
+
+    /// Focus a tiled pane within the active tab (a click on a tile). Updates the
+    /// focused id optimistically so pointer coordinates map to the new pane right
+    /// away; the next pump reconciles to the authoritative focus.
+    func focusPane(_ id: String) {
+        focusedPaneId = id
+        apply(driver.focusPane(paneId: id))
     }
 
     /// Open the recent-servers picker.
@@ -129,44 +150,86 @@ final class KmuxModel: ObservableObject {
     private func pump() {
         forceRefetch = false
         for effect in driver.tick() { handle(effect) }
-
-        // Generation-gated grid re-pack: only re-fetch the packed cells when the
-        // grid changed; cursor-blink toggles repaint the cached frame.
-        let generation = driver.gridInfo()?.generation ?? 0
-        var refetch = forceRefetch
-        var repaint = forceRefetch
-        if generation != lastGeneration {
-            lastGeneration = generation
-            refetch = true
-            repaint = true
-        }
-        let blink = driver.blinkOn()
-        if blink != lastBlinkOn {
-            lastBlinkOn = blink
-            blinkOn = blink
-            repaint = true
-        }
-
-        if refetch { snapshot = driver.gridSnapshot() }
-        if repaint {
-            selection = driver.selection()
-            scrollInfo = driver.scrollInfo()
-            terminalView?.needsDisplay = true
-        }
-
+        refreshTiles()
         refreshChrome()
     }
 
-    /// Re-read pointer-driven grid state from the driver and repaint. Selection
-    /// and local scrolling bump only the cells generation, not the (cursor)
-    /// generation the pump gates on, so the pump won't pick them up — the mouse
-    /// handlers call this after mutating the driver. The snapshot is refetched
-    /// because it now composites scrollback (so it depends on the scroll
-    /// position).
+    /// Resolve the active tab's layout against the view's content area, push the
+    /// per-pane sizes (the analog of GTK `tiles::push_sizes`), and re-pack each
+    /// visible pane's grid (generation-gated, per pane).
+    private func refreshTiles() {
+        guard let view = terminalView else { return }
+        let size = view.bounds.size
+        guard size.width > 0, size.height > 0 else { return }
+        let m = view.metrics
+        let (cols, rows) = m.colsRows(width: size.width, height: size.height)
+        let rects = driver.layout(areaCols: cols, areaRows: rows)
+        layout = rects
+
+        // Push each pane's resolved sub-rect size so its PTY sizes to the tile,
+        // not the whole window. Pixels are proportional (cells × cell size).
+        let scale = view.window?.backingScaleFactor ?? 2.0
+        let sizes = rects.map { r in
+            FfiPaneSize(
+                paneId: r.paneId,
+                rows: UInt16(r.rows),
+                cols: UInt16(r.cols),
+                pixelWidth: clampU16(CGFloat(r.cols) * m.cellWidth * scale),
+                pixelHeight: clampU16(CGFloat(r.rows) * m.cellHeight * scale)
+            )
+        }
+        driver.setPaneSizes(sizes: sizes)
+
+        let blink = driver.blinkOn()
+        var repaint = forceRefetch || blink != lastBlinkOn
+        lastBlinkOn = blink
+        blinkOn = blink
+
+        var live = Set<String>()
+        for r in rects {
+            live.insert(r.paneId)
+            let gen = driver.gridInfoFor(paneId: r.paneId)?.generation ?? 0
+            if forceRefetch || gen != (lastGenByPane[r.paneId] ?? .max) {
+                lastGenByPane[r.paneId] = gen
+                paneSnapshots[r.paneId] = driver.gridSnapshotFor(paneId: r.paneId)
+                repaint = true
+            }
+        }
+        // Drop state for panes that are no longer visible.
+        for key in paneSnapshots.keys where !live.contains(key) {
+            paneSnapshots[key] = nil
+            lastGenByPane[key] = nil
+        }
+
+        let focused = rects.first(where: { $0.focused })?.paneId
+        if focused != focusedPaneId {
+            focusedPaneId = focused
+            repaint = true
+        }
+        if let f = focused {
+            selection = driver.selectionFor(paneId: f)
+            scrollInfo = driver.scrollInfoFor(paneId: f)
+            snapshot = paneSnapshots[f]
+        } else {
+            selection = []
+            scrollInfo = FfiScrollInfo(offset: 0, total: 0)
+            snapshot = nil
+        }
+
+        if repaint { view.needsDisplay = true }
+    }
+
+    /// Re-read the focused pane's pointer-driven grid state (selection / scroll)
+    /// and repaint. The mouse handlers call this after mutating the driver, since
+    /// selection/local-scroll bump only the cells generation, which the pump's
+    /// per-pane gate skips. The snapshot is refetched because it composites
+    /// scrollback (so it depends on the scroll position).
     func refreshGridView() {
-        snapshot = driver.gridSnapshot()
-        selection = driver.selection()
-        scrollInfo = driver.scrollInfo()
+        guard let f = focusedPaneId else { return }
+        paneSnapshots[f] = driver.gridSnapshotFor(paneId: f)
+        snapshot = paneSnapshots[f]
+        selection = driver.selectionFor(paneId: f)
+        scrollInfo = driver.scrollInfoFor(paneId: f)
         terminalView?.needsDisplay = true
     }
 
@@ -197,8 +260,8 @@ final class KmuxModel: ObservableObject {
         if conn != connection { connection = conn }
         let sess = driver.sessions()
         if sess != sessions { sessions = sess }
-        let pn = driver.panes()
-        if pn != panes { panes = pn }
+        let tb = driver.tabs()
+        if tb != tabs { tabs = tb }
         let md = driver.mode()
         if md != mode { mode = md }
         let pk = driver.picker()
@@ -220,4 +283,9 @@ final class KmuxModel: ObservableObject {
     private func readClipboard() -> String? {
         NSPasteboard.general.string(forType: .string)
     }
+}
+
+/// Clamp a pixel dimension to a `UInt16`, never below 0.
+private func clampU16(_ v: CGFloat) -> UInt16 {
+    UInt16(min(max(Int(v), 0), Int(UInt16.max)))
 }

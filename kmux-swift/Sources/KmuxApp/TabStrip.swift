@@ -2,24 +2,25 @@ import SwiftUI
 
 import KmuxBindings
 
-/// The pane tab strip above the terminal — the analog of kmux-gtk's `tabs.rs`
-/// (`adw::TabBar`). Tabs come from `panes()`; selecting routes through
-/// `select_pane`, and the `+` spawns a pane (`CreatePane`).
+/// The tab strip above the terminal — the analog of kmux-gtk's `tabs.rs`
+/// (`adw::TabBar`). Tabs come from `tabs()` (Session → Tab → Pane); selecting
+/// routes through `select_tab`, and the `+` creates a tab (`CreatePane`, which
+/// the server maps to a new tab).
 struct TabStrip: View {
     @ObservedObject var model: KmuxModel
 
     var body: some View {
         HStack(spacing: 4) {
-            ForEach(model.panes) { pane in
+            ForEach(model.tabs, id: \.tabIndex) { tab in
                 Button {
-                    model.selectPane(pane.id)
+                    model.selectTab(tab.tabIndex)
                 } label: {
-                    Text(pane.label)
+                    Text(tab.name)
                         .lineLimit(1)
                         .padding(.horizontal, 10)
                         .padding(.vertical, 4)
                         .background(
-                            pane.active ? model.theme.accent.color.opacity(0.25) : Color.clear
+                            tab.active ? model.theme.accent.color.opacity(0.25) : Color.clear
                         )
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                 }

@@ -73,21 +73,53 @@ final class TerminalNSView: NSView {
         let theme = model.theme
         ctx.setFillColor(theme.bg.cgColor)
         ctx.fill(bounds)
+        let m = metrics
 
-        guard let snap = model.snapshot, snap.rows > 0, snap.cols > 0 else {
+        let rects = model.layout
+        if rects.isEmpty {
             drawPlaceholder(theme: theme)
             return
         }
 
-        let m = metrics
-        let rows = Int(snap.rows)
-        let cols = Int(snap.cols)
+        // Tile each visible pane into its resolved sub-rect (clip + translate,
+        // mirroring kmux-gtk's `render_tiled`).
+        for rect in rects {
+            guard let snap = model.paneSnapshots[rect.paneId], snap.rows > 0, snap.cols > 0 else {
+                continue
+            }
+            drawPane(snap, rect: rect, theme: theme, metrics: m, ctx: ctx)
+        }
 
+        // Accent border on the focused pane (only when there's more than one).
+        if rects.count > 1, let focused = rects.first(where: { $0.focused }) {
+            ctx.setStrokeColor(theme.accent.cgColor)
+            ctx.setLineWidth(1)
+            ctx.stroke(pixelRect(focused, metrics: m).insetBy(dx: 0.5, dy: 0.5))
+        }
+    }
+
+    /// Render one pane's grid into its sub-rect. Backgrounds then glyphs, clipped
+    /// and translated to the pane's pixel origin so the per-cell helpers run in
+    /// pane-local coordinates. The focused pane also gets the selection wash, the
+    /// cursor, and a scroll indicator (its state lives in `model.selection` /
+    /// `model.scrollInfo` / `model.snapshot`).
+    private func drawPane(
+        _ snap: GridSnapshot, rect: FfiPaneRect, theme: FfiTheme,
+        metrics m: TerminalMetrics, ctx: CGContext
+    ) {
+        let px = pixelRect(rect, metrics: m)
+        ctx.saveGState()
+        ctx.clip(to: px)
+        ctx.translateBy(x: px.minX, y: px.minY)
+
+        let stride = Int(snap.cols)
+        let rows = min(Int(snap.rows), Int(rect.rows))
+        let cols = min(Int(snap.cols), Int(rect.cols))
         snap.cells.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
             // Pass 1: cell backgrounds (so a wide glyph can overdraw its spacer).
             for r in 0..<rows {
                 for c in 0..<cols {
-                    let cell = PackedCellLayout.decode(raw, r * cols + c)
+                    let cell = PackedCellLayout.decode(raw, r * stride + c)
                     ctx.setFillColor(cgRGB(cell.bg))
                     ctx.fill(cellRect(row: r, col: c, metrics: m))
                 }
@@ -95,7 +127,7 @@ final class TerminalNSView: NSView {
             // Pass 2: glyphs.
             for r in 0..<rows {
                 for c in 0..<cols {
-                    let cell = PackedCellLayout.decode(raw, r * cols + c)
+                    let cell = PackedCellLayout.decode(raw, r * stride + c)
                     if cell.isSpacer { continue }
                     guard let ch = cell.character else { continue }
                     drawGlyph(ch, cell: cell, row: r, col: c, theme: theme, metrics: m)
@@ -103,17 +135,29 @@ final class TerminalNSView: NSView {
             }
         }
 
-        // Translucent selection tint over the glyphs (live screen only).
-        drawSelection(ctx, theme: theme, metrics: m)
-
-        // Cursor (hidden while scrolled into history, like the GTK frontend).
-        if model.scrollInfo.offset == 0 {
-            drawCursor(snap.cursor, theme: theme, metrics: m)
+        if rect.focused {
+            // Translucent selection tint over the glyphs (live screen only).
+            drawSelection(ctx, theme: theme, metrics: m)
+            // Cursor (hidden while scrolled into history, like the GTK frontend).
+            if model.scrollInfo.offset == 0 {
+                drawCursor(snap.cursor, theme: theme, metrics: m)
+            }
+            if model.scrollInfo.offset > 0 {
+                drawScrollIndicator(width: px.width, height: px.height, theme: theme, metrics: m)
+            }
         }
 
-        if model.scrollInfo.offset > 0 {
-            drawScrollIndicator(theme: theme, metrics: m)
-        }
+        ctx.restoreGState()
+    }
+
+    /// A pane rect's pixel rectangle in view coordinates.
+    func pixelRect(_ rect: FfiPaneRect, metrics m: TerminalMetrics) -> CGRect {
+        CGRect(
+            x: CGFloat(rect.col) * m.cellWidth,
+            y: CGFloat(rect.row) * m.cellHeight,
+            width: CGFloat(rect.cols) * m.cellWidth,
+            height: CGFloat(rect.rows) * m.cellHeight
+        )
     }
 
     private func cellRect(row: Int, col: Int, metrics m: TerminalMetrics) -> CGRect {
@@ -211,7 +255,12 @@ final class TerminalNSView: NSView {
         }
     }
 
-    private func drawScrollIndicator(theme: FfiTheme, metrics m: TerminalMetrics) {
+    /// Draw the focused pane's scroll indicator at its local bottom-right. Called
+    /// inside the pane's translated context, so `width`/`height` are the pane's
+    /// pixel extent (not the whole view's).
+    private func drawScrollIndicator(
+        width: CGFloat, height: CGFloat, theme: FfiTheme, metrics m: TerminalMetrics
+    ) {
         let label = "[\(model.scrollInfo.offset)/\(model.scrollInfo.total)]"
         let s = NSAttributedString(
             string: label,
@@ -221,7 +270,7 @@ final class TerminalNSView: NSView {
                 .backgroundColor: theme.statusBg.nsColor,
             ])
         let size = s.size()
-        s.draw(at: CGPoint(x: bounds.width - size.width - 4, y: bounds.height - size.height - 2))
+        s.draw(at: CGPoint(x: width - size.width - 4, y: height - size.height - 2))
     }
 
     private func drawPlaceholder(theme: FfiTheme) {

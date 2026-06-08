@@ -49,7 +49,7 @@ struct ContentView: View {
 
     @ViewBuilder private var detail: some View {
         VStack(spacing: 0) {
-            if model.panes.count > 1 {
+            if model.tabs.count > 1 {
                 TabStrip(model: model)
             }
             ZStack(alignment: .top) {
@@ -122,7 +122,7 @@ struct KmuxCommands: Commands {
         CommandGroup(replacing: .newItem) {
             Button("New Session") { model.dispatch(.createSession) }
                 .keyboardShortcut("n")
-            Button("New Pane") { model.dispatch(.createPane) }
+            Button("New Tab") { model.dispatch(.createPane) }
                 .keyboardShortcut("t")
         }
         CommandMenu("Session") {
@@ -135,10 +135,11 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut("]", modifiers: [.command, .shift])
             Button("Previous Session") { model.dispatch(.prevSession) }
                 .keyboardShortcut("[", modifiers: [.command, .shift])
-            Button("Next Pane") { model.dispatch(.nextPane) }
+            Button("Next Tab") { model.dispatch(.nextPane) }
                 .keyboardShortcut("]", modifiers: [.command, .option])
-            Button("Previous Pane") { model.dispatch(.prevPane) }
+            Button("Previous Tab") { model.dispatch(.prevPane) }
                 .keyboardShortcut("[", modifiers: [.command, .option])
+            Button("Close Tab") { model.dispatch(.closeTab) }
             Divider()
             Button("Reconnect") { model.dispatch(.reconnect) }
                 .keyboardShortcut("r")
@@ -146,6 +147,40 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut("h", modifiers: [.command, .shift])
             Toggle("Metrics Inspector", isOn: metricsBinding)
                 .keyboardShortcut("m", modifiers: [.command, .shift])
+        }
+        // Tiling: split the focused pane, move focus, resize, swap (the analog of
+        // kmux-gtk's tiling accelerators). iTerm2-style split shortcuts; ⌘⌥ moves
+        // focus, ⌘⌃ resizes / reorders.
+        CommandMenu("Pane") {
+            Button("Split Right") { model.dispatch(.splitRight) }
+                .keyboardShortcut("d", modifiers: .command)
+            Button("Split Down") { model.dispatch(.splitDown) }
+                .keyboardShortcut("d", modifiers: [.command, .shift])
+            Divider()
+            Button("Focus Left") { model.dispatch(.focusLeft) }
+                .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
+            Button("Focus Right") { model.dispatch(.focusRight) }
+                .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
+            Button("Focus Up") { model.dispatch(.focusUp) }
+                .keyboardShortcut(.upArrow, modifiers: [.command, .option])
+            Button("Focus Down") { model.dispatch(.focusDown) }
+                .keyboardShortcut(.downArrow, modifiers: [.command, .option])
+            Divider()
+            Button("Resize Left") { model.dispatch(.resizeLeft) }
+                .keyboardShortcut(.leftArrow, modifiers: [.command, .control])
+            Button("Resize Right") { model.dispatch(.resizeRight) }
+                .keyboardShortcut(.rightArrow, modifiers: [.command, .control])
+            Button("Resize Up") { model.dispatch(.resizeUp) }
+                .keyboardShortcut(.upArrow, modifiers: [.command, .control])
+            Button("Resize Down") { model.dispatch(.resizeDown) }
+                .keyboardShortcut(.downArrow, modifiers: [.command, .control])
+            Divider()
+            Button("Move Pane Forward") { model.dispatch(.swapNext) }
+                .keyboardShortcut("]", modifiers: [.command, .control])
+            Button("Move Pane Back") { model.dispatch(.swapPrev) }
+                .keyboardShortcut("[", modifiers: [.command, .control])
+            Button("Close Pane") { model.dispatch(.closePane) }
+                .keyboardShortcut("w", modifiers: [.command, .shift])
         }
         CommandGroup(replacing: .help) {
             Button("kmux Help") { ui.help = true }

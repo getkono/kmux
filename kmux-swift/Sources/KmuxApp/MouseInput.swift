@@ -34,6 +34,11 @@ extension TerminalNSView {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        // Click-to-focus: a press in a non-focused tile focuses it first, so the
+        // selection (and its pane-local coordinates) land in the right pane.
+        if let pid = paneIdAt(event), pid != model.focusedPaneId {
+            model.focusPane(pid)
+        }
         let (col, row) = cellLocation(of: event)
         switch event.clickCount {
         case 2:
@@ -67,13 +72,30 @@ extension TerminalNSView {
         endDrag()
     }
 
-    /// The visible cell under a mouse event. The FFI clamps to the grid and maps
-    /// to absolute coordinates, so out-of-bounds values here are harmless.
+    /// The visible cell under a mouse event, in the focused pane's local
+    /// coordinates (the FFI selection setters act on the focused grid). The FFI
+    /// clamps to the grid, so out-of-bounds values here are harmless.
     func cellLocation(of event: NSEvent) -> (col: Int, row: Int) {
         let p = convert(event.locationInWindow, from: nil)
-        let col = max(0, Int(p.x / metrics.cellWidth))
-        let row = max(0, Int(p.y / metrics.cellHeight))
-        return (col, row)
+        let gcol = max(0, Int(p.x / metrics.cellWidth))
+        let grow = max(0, Int(p.y / metrics.cellHeight))
+        if let rect = model.focusedPaneRect {
+            return (max(0, gcol - Int(rect.col)), max(0, grow - Int(rect.row)))
+        }
+        return (gcol, grow)
+    }
+
+    /// The pane id whose tile contains a mouse event, if any (for click-to-focus).
+    func paneIdAt(_ event: NSEvent) -> String? {
+        let p = convert(event.locationInWindow, from: nil)
+        let gcol = Int(p.x / metrics.cellWidth)
+        let grow = Int(p.y / metrics.cellHeight)
+        for r in model.layout
+        where gcol >= Int(r.col) && gcol < Int(r.col + r.cols)
+            && grow >= Int(r.row) && grow < Int(r.row + r.rows) {
+            return r.paneId
+        }
+        return nil
     }
 
     // MARK: - Auto-scroll while dragging past the edge
@@ -114,7 +136,8 @@ extension TerminalNSView {
         } else {
             return
         }
-        let col = max(0, Int(last.x / metrics.cellWidth))
+        let gcol = max(0, Int(last.x / metrics.cellWidth))
+        let col = model.focusedPaneRect.map { max(0, gcol - Int($0.col)) } ?? gcol
         model.driver.setSelection(
             anchorRow: UInt32(anchor.row), anchorCol: UInt32(anchor.col),
             endRow: UInt32(edgeRow), endCol: UInt32(col))
