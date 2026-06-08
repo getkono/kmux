@@ -61,7 +61,7 @@ impl DialogKind {
             Mode::DirectoryPicker => Some(DialogKind::DirPicker),
             Mode::Command(_) => Some(DialogKind::Command),
             Mode::ConfirmCloseSession { .. } => Some(DialogKind::Confirm),
-            Mode::RenameSession { .. } => Some(DialogKind::Rename),
+            Mode::RenameSession { .. } | Mode::RenameTab { .. } => Some(DialogKind::Rename),
             Mode::Help => Some(DialogKind::Help),
             _ => None,
         }
@@ -565,18 +565,19 @@ fn open_confirm(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
 }
 
 fn open_rename(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
-    let current = {
+    let (current, title) = {
         let core = &fe.borrow().core;
         match &core.mode {
-            Mode::RenameSession { buffer, .. } => buffer.clone(),
-            _ => String::new(),
+            Mode::RenameSession { buffer, .. } => (buffer.clone(), "Rename session"),
+            Mode::RenameTab { buffer, .. } => (buffer.clone(), "Rename tab"),
+            _ => (String::new(), "Rename"),
         }
     };
     let entry = Entry::new();
     entry.set_text(&current);
     entry.set_activates_default(true);
 
-    let dialog = adw::AlertDialog::new(Some("Rename session"), None);
+    let dialog = adw::AlertDialog::new(Some(title), None);
     dialog.set_extra_child(Some(&entry));
     dialog.add_response("cancel", "Cancel");
     dialog.add_response("rename", "Rename");
@@ -591,7 +592,9 @@ fn open_rename(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
             {
                 let mut f = fe.borrow_mut();
                 if resp == "rename" {
-                    if let Mode::RenameSession { buffer, .. } = &mut f.core.mode {
+                    if let Mode::RenameSession { buffer, .. } | Mode::RenameTab { buffer, .. } =
+                        &mut f.core.mode
+                    {
                         *buffer = entry.text().to_string();
                     }
                     let _ =

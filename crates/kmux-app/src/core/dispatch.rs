@@ -47,6 +47,20 @@ impl AppCore {
             Action::PrevSession => self.mgr.cycle_session(-1),
             Action::NextPane => self.mgr.cycle_tab(1),
             Action::PrevPane => self.mgr.cycle_tab(-1),
+            Action::CloseTab => self.mgr.close_tab(),
+            Action::RenameTab => {
+                if let (Some(word_id), Some(tab_index)) = (
+                    self.mgr.active_session().map(|s| s.to_string()),
+                    self.mgr.active_tab(),
+                ) {
+                    let buffer = self.mgr.active_tab_name().unwrap_or_default();
+                    self.mode = Mode::RenameTab {
+                        word_id,
+                        tab_index,
+                        buffer,
+                    };
+                }
+            }
             Action::SplitRight => self
                 .mgr
                 .split_focused(kmux_protocol::messages::SplitDir::Horizontal),
@@ -85,23 +99,34 @@ impl AppCore {
                 }
             }
             Action::RenameChar(ch) => {
-                if let Mode::RenameSession { buffer, .. } = &mut self.mode {
+                if let Mode::RenameSession { buffer, .. } | Mode::RenameTab { buffer, .. } =
+                    &mut self.mode
+                {
                     buffer.push(ch);
                 }
             }
             Action::RenameBackspace => {
-                if let Mode::RenameSession { buffer, .. } = &mut self.mode {
+                if let Mode::RenameSession { buffer, .. } | Mode::RenameTab { buffer, .. } =
+                    &mut self.mode
+                {
                     buffer.pop();
                 }
             }
-            Action::RenameSubmit => {
-                if let Mode::RenameSession { buffer, word_id } =
-                    std::mem::replace(&mut self.mode, Mode::Normal)
-                {
+            Action::RenameSubmit => match std::mem::replace(&mut self.mode, Mode::Normal) {
+                Mode::RenameSession { buffer, word_id } => {
                     let new_name = buffer.trim().to_string();
                     self.mgr.rename_session(&word_id, &new_name);
                 }
-            }
+                Mode::RenameTab {
+                    tab_index, buffer, ..
+                } => {
+                    let new_name = buffer.trim().to_string();
+                    if !new_name.is_empty() {
+                        self.mgr.rename_tab(tab_index, &new_name);
+                    }
+                }
+                _ => {}
+            },
             Action::CloseSessionPicker => {
                 self.mode = Mode::Normal;
             }
@@ -681,6 +706,34 @@ mod tests {
             ClientCapabilities::default(),
         );
         AppCore::for_test(mgr)
+    }
+
+    #[tokio::test]
+    async fn rename_tab_mode_edits_buffer_and_submits_to_normal() {
+        let mut core = fixture_core();
+        core.mode = Mode::RenameTab {
+            word_id: "w".into(),
+            tab_index: 3,
+            buffer: String::new(),
+        };
+        core.dispatch_action(Action::RenameChar('h')).await;
+        core.dispatch_action(Action::RenameChar('i')).await;
+        match &core.mode {
+            Mode::RenameTab {
+                buffer, tab_index, ..
+            } => {
+                assert_eq!(buffer, "hi");
+                assert_eq!(*tab_index, 3);
+            }
+            other => panic!("expected RenameTab, got {other:?}"),
+        }
+        core.dispatch_action(Action::RenameBackspace).await;
+        if let Mode::RenameTab { buffer, .. } = &core.mode {
+            assert_eq!(buffer, "h");
+        }
+        // Submitting a non-empty name leaves the rename mode for Normal.
+        core.dispatch_action(Action::RenameSubmit).await;
+        assert_eq!(core.mode, Mode::Normal);
     }
 
     #[test]

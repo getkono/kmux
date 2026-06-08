@@ -32,6 +32,15 @@ impl SessionManager {
         self.tab_layout(word, tab)
     }
 
+    /// The display name of the active tab, if any (for pre-filling a rename).
+    pub fn active_tab_name(&self) -> Option<String> {
+        let tab = self.active_tab?;
+        self.active_session_tabs()
+            .iter()
+            .find(|t| t.tab_index == tab)
+            .map(|t| t.name.clone())
+    }
+
     /// The tabs of the active session.
     pub fn active_session_tabs(&self) -> &[TabInfo] {
         self.active_session
@@ -292,6 +301,20 @@ impl SessionManager {
             program: None,
             args: vec![],
             size: self.last_term_size,
+        });
+    }
+
+    /// Rename a tab of the active session.
+    pub fn rename_tab(&mut self, tab_index: u32, new_name: &str) {
+        let Some(word_id) = self.active_session.clone() else {
+            return;
+        };
+        let rid = self.next_rid();
+        self.send_ws(ClientMessage::TabRename {
+            request_id: rid,
+            word_id,
+            tab_index,
+            new_name: new_name.to_string(),
         });
     }
 

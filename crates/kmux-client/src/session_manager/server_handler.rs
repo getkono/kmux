@@ -473,6 +473,26 @@ impl SessionManager {
                 events.push(SessionEvent::SessionRenamed { word_id, new_name });
             }
 
+            // A tab was renamed (by this or another client). Update the cached
+            // name; the frontend's tab strip reconciles from it next tick.
+            ServerMessage::Event {
+                event:
+                    SessionEventMsg::TabRenamed {
+                        word_id,
+                        tab_index,
+                        name,
+                    },
+            } => {
+                if let Some(entry) = self
+                    .session_list
+                    .iter_mut()
+                    .find(|e| e.meta.word_id == word_id)
+                    && let Some(tab) = entry.tabs.iter_mut().find(|t| t.tab_index == tab_index)
+                {
+                    tab.name = name;
+                }
+            }
+
             ServerMessage::Event {
                 event: SessionEventMsg::PaneResized { pane_id, size },
             } => {

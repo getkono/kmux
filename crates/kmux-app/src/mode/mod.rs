@@ -27,6 +27,12 @@ pub enum Mode {
     ConfirmCloseSession { word_id: String },
     /// Rename session (typing new name)
     RenameSession { word_id: String, buffer: String },
+    /// Rename a tab (typing new name)
+    RenameTab {
+        word_id: String,
+        tab_index: u32,
+        buffer: String,
+    },
     /// Floating session picker with search
     SessionPicker,
     /// Floating server picker with search (recent servers)
@@ -84,6 +90,8 @@ pub enum Action {
     ClosePane,
     NextPane,
     PrevPane,
+    CloseTab,
+    RenameTab,
 
     // Tiling: split the focused pane, move focus between tiled panes, and resize
     // the focused pane's enclosing split.
@@ -196,7 +204,7 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::Scroll => resolve_scroll(key, mods),
         Mode::Signal => resolve_signal(key, mods),
         Mode::ConfirmCloseSession { .. } => resolve_confirm_close(key),
-        Mode::RenameSession { .. } => resolve_rename(key, mods),
+        Mode::RenameSession { .. } | Mode::RenameTab { .. } => resolve_rename(key, mods),
         Mode::SessionPicker => resolve_session_picker(key, mods),
         Mode::ServerPicker => resolve_server_picker(key, mods),
         Mode::Help => resolve_help(key),

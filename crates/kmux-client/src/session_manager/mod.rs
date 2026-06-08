@@ -792,6 +792,41 @@ mod tests {
     }
 
     #[test]
+    fn rename_tab_sends_tab_rename() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.active_session = Some("eagle".into());
+        mgr.rename_tab(2, "build");
+        match rx.try_recv() {
+            Ok(ClientMessage::TabRename {
+                word_id,
+                tab_index,
+                new_name,
+                ..
+            }) => {
+                assert_eq!(word_id, "eagle");
+                assert_eq!(tab_index, 2);
+                assert_eq!(new_name, "build");
+            }
+            other => panic!("expected TabRename, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tab_renamed_event_updates_cached_name() {
+        use kmux_protocol::messages::SessionEventMsg;
+        let mut mgr = make_manager();
+        mgr.session_list.push(make_entry("eagle", "/p")); // tab 0 starts named "1"
+        mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::TabRenamed {
+                word_id: "eagle".into(),
+                tab_index: 0,
+                name: "logs".into(),
+            },
+        });
+        assert_eq!(mgr.session_list[0].tabs[0].name, "logs");
+    }
+
+    #[test]
     fn display_name_disambiguation() {
         let mut mgr = make_manager();
         // Two sessions with the same basename "src" but different parent dirs
