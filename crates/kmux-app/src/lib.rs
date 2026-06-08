@@ -20,6 +20,12 @@
 /// resolution. Toolkit-agnostic: depends only on `kmux_client::key`.
 pub mod mode;
 
+/// Toolkit-agnostic tiling-layout resolver: turns a server-authoritative
+/// [`kmux_protocol::messages::LayoutNode`] tree + a window size into per-pane
+/// cell rectangles, deterministically. Shared by every frontend so all clients
+/// compute identical geometry (a hard requirement for PTY size negotiation).
+pub mod layout;
+
 /// Toolkit-neutral color palette ([`theme::Rgb`], [`theme::Theme`]) and the
 /// built-in theme TOML parsing.
 pub mod theme;
