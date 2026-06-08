@@ -140,8 +140,7 @@ install:
     set -euo pipefail
     # The `kmux` entrypoint + the `kmuxd` daemon go to ~/.cargo/bin on every
     # platform; the desktop GUI is installed the platform-native way and `kmux`
-    # (no args) opens it. `kmux-tui` is NOT installed — it is reachable only via
-    # `cargo run -p kmux-tui`.
+    # (no args) opens it.
     #   - Linux: the GTK frontend `kmux-gtk` to ~/.cargo/bin (the entrypoint execs
     #            it), plus its .desktop entry + icon into the XDG data dirs
     #            (Activities / app grid).

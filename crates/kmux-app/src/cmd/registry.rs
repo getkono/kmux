@@ -48,7 +48,7 @@ fn signal_from_name(s: &str) -> Result<i32, String> {
     }
 }
 
-// ── Client / TUI controls ────────────────────────────────────────────────────
+// ── Client controls ──────────────────────────────────────────────────────────
 
 fn cmd_quit(_app: &mut AppCore, _args: &[String]) -> CommandResult {
     Ok(CommandSuccess::Quit)
@@ -382,7 +382,7 @@ pub static ALL: &[CommandSpec] = &[
     CommandSpec {
         name: "quit",
         aliases: &["q", "exit"],
-        summary: "Quit the TUI",
+        summary: "Quit kmux",
         args: NO_ARGS,
         run: cmd_quit,
     },

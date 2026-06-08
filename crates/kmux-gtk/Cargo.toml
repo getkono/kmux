@@ -10,7 +10,7 @@ description = "GTK4 native GUI frontend for the kmux client (Linux)."
 
 # The GTK frontend ships as its own `kmux-gtk` binary: the default + official
 # client on Linux, also runnable on macOS. The unified `kmux` entrypoint (the
-# `kmux` crate) execs it; the terminal frontend is the separate `kmux-tui` binary.
+# `kmux` crate) execs it.
 [[bin]]
 name = "kmux-gtk"
 path = "src/main.rs"

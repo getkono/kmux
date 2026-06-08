@@ -1,6 +1,6 @@
 //! Shared CLI front door for the kmux frontends.
 //!
-//! Both binaries — `kmux` (GUI) and `kmux-tui` (TUI) — call [`run_cli`]: it
+//! The `kmux` entrypoint and the GUI frontends call [`run_cli`]: it
 //! initializes logging, parses the CLI, runs any non-interactive subcommand
 //! (`ls`, `daemon`, `--dry-run`), or returns a frontend-agnostic [`Plan`]
 //! describing the interactive session to launch. Each frontend then builds its
@@ -36,7 +36,7 @@ pub struct Plan {
     pub auto_session: Option<String>,
     pub theme: Theme,
     /// GUI font (Pango font-description string). The GUI frontend derives its
-    /// cell metrics from this; the TUI ignores it.
+    /// cell metrics from this.
     pub font: String,
     pub instance_id: String,
 }

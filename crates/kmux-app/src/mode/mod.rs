@@ -6,7 +6,7 @@ pub use resolve::*;
 
 use kmux_client::key::{Key, Modifiers};
 
-/// Zellij-style mode for the TUI.
+/// Zellij-style interaction mode (the modal keymap available to frontends).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Mode {
     /// Keys pass through to PTY. Only Ctrl+G is intercepted.

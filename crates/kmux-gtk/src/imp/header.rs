@@ -1,7 +1,6 @@
 //! The header bar as a view of `AppCore`: window title (server + active
 //! session), a connection-status indicator that reconnects on click, a
-//! server-switch button, and a lock indicator. Replaces the TUI session/status
-//! bars (`chrome.rs`).
+//! server-switch button, and a lock indicator.
 
 use std::cell::RefCell;
 use std::rc::Rc;

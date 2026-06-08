@@ -1,6 +1,6 @@
 # Themes
 
-kmux supports colour themes for the TUI client. Six themes are built in and
+kmux supports colour themes for the client. Six themes are built in and
 compiled into the binary; custom themes can be added without rebuilding.
 
 ## Built-in themes
@@ -68,9 +68,9 @@ purple    = "#c6a0f6"       # session mode indicator
 orange    = "#f5a97f"       # rename mode indicator
 status_bg = "#1e2030"       # background of the status and session bars
 
-# Optional. The inner-pane cursor is rendered by kmux itself (the TUI paints it
-# in-cell rather than delegating to the host terminal's hardware cursor), so
-# these control how it looks regardless of host terminal cursor settings.
+# Optional. The inner-pane cursor is rendered by kmux itself (painted in-cell
+# rather than delegating to a host terminal's hardware cursor), so these control
+# how it looks regardless of any host terminal cursor settings.
 # cursor_bg defaults to `fg`, cursor_fg defaults to `bg`.
 cursor_bg = "#cad3f5"       # Block cursor bg + Bar/Underline glyph color
 cursor_fg = "#24273a"       # text drawn on top of the Block cursor
@@ -85,5 +85,5 @@ Theme parsing and resolution are frontend-agnostic and live in `kmux-app`
 (`kmux_app::theme` and `kmux_app::config::resolve_theme`). The palette is stored
 as a toolkit-neutral `Rgb` triple — `kmux_app::theme::Rgb` — and the active
 palette lives on `AppCore.palette`. Each frontend converts to its own color type
-at the render boundary (the TUI to `ratatui::style::Color`, the GTK frontend to
-cairo colors). See [architecture-frontend.md](architecture-frontend.md).
+at the render boundary (the GTK frontend to cairo colors, the Swift app to
+`NSColor` via FFI). See [architecture-frontend.md](architecture-frontend.md).

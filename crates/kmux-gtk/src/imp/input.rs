@@ -1,6 +1,4 @@
 //! Pointer input on the grid: scroll-wheel handling and drag text selection.
-//! Mirrors the TUI's `app/mouse_handler.rs` (scroll); selection is net-new
-//! (the TUI has no mouse selection).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;

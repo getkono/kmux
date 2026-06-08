@@ -80,7 +80,7 @@ just install       # release build → ~/Applications/kmux.app + `kmux` & `kmuxd
    bundle's `kmux-swift` executable (below), so typing `kmux` in a terminal
    starts the GUI — and `kmux daemon …` / `kmux ls` run the CLI directly. (The
    former `kmux-swift/macos/kmux` shell launcher is gone — the `kmux` binary
-   replaces it.) `kmux-tui` is **not** installed. Then it:
+   replaces it.) Then it:
 2. builds the release `kmux-ffi` staticlib + matching Swift bindings
    (`just gen-ffi-bindings release`) and the app in release, linking that
    archive (via `KMUX_FFI_LIB`, which overrides `Package.swift`'s debug default),

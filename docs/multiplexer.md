@@ -145,7 +145,7 @@ These are single-byte sequences handled directly by the VT parser.
 | `CSI M` | DL — Delete Line | **Stable** | |
 | `CSI r` | DECSTBM — Set Top/Bottom Margins | **Stable** | |
 | `CSI s` | SCOSC — Save Cursor (SCO variant) | **Stable** | |
-| `CSI u` | SCORC / Kitty query | **Partial** | Restore cursor (SCO) parsed; kitty query path only active when `kitty_keyboard` is enabled (currently hardcoded false in the TUI client) |
+| `CSI u` | SCORC / Kitty query | **Partial** | Restore cursor (SCO) parsed; kitty query path only active when `kitty_keyboard` is enabled (currently declared false by the GUI clients) |
 
 ### SGR — Select Graphic Rendition
 
@@ -281,7 +281,7 @@ alternative backends.
 
 | Sequence | Name | Status | Notes |
 |----------|------|--------|-------|
-| `APC G … ST` | Kitty graphics protocol | **Unimplemented** | libghostty-vt parses APC G payloads unconditionally; the `kitty_graphics` capability atomic is recomputed on every attach/detach but not consulted at parse time today.  Phase A drops image data at the `GhosttyBackend` boundary.  The TUI client (`crates/kmux`) currently hardcodes `kitty_graphics: false`. |
+| `APC G … ST` | Kitty graphics protocol | **Unimplemented** | libghostty-vt parses APC G payloads unconditionally; the `kitty_graphics` capability atomic is recomputed on every attach/detach but not consulted at parse time today.  Phase A drops image data at the `GhosttyBackend` boundary.  The GUI clients currently declare `kitty_graphics: false`. |
 
 ---
 
@@ -387,7 +387,7 @@ encoding (`crates/kmux/src/app/mouse_handler.rs`).
 | Terminal resize | **Stable** | `ClientMessage::Resize` carries `TermSize { rows, cols, pixel_width, pixel_height }`; server picks smallest-wins dimensions across all attached clients; `TIOCSWINSZ` issued outside the session lock |
 | Pixel dimensions | **Stable** | `pixel_width` / `pixel_height` forwarded (for future image-protocol scaling); `0` = unknown |
 | Resize debounce | **Stable** | 100 ms debounce in the client event loop (`RESIZE_DEBOUNCE`) to avoid flooding the server during window drag |
-| `SIGWINCH` forwarding | **Stable** | crossterm raises resize events; client issues `ClientMessage::Resize` which triggers a server-side `TIOCSWINSZ` to the PTY child |
+| `SIGWINCH` forwarding | **Stable** | the toolkit raises resize events; the client issues `ClientMessage::Resize` which triggers a server-side `TIOCSWINSZ` to the PTY child |
 
 ---
 
@@ -396,7 +396,7 @@ encoding (`crates/kmux/src/app/mouse_handler.rs`).
 | Protocol | Status | Notes |
 |----------|--------|-------|
 | Sixel (DCS) | **Unimplemented** | Phase A: dropped silently at the `GhosttyBackend` boundary.  Phase B: extract from libghostty-vt and forward via extended wire protocol |
-| Kitty graphics (APC) | **Unimplemented** | Phase A: same; capability atomic is wired but the TUI client hardcodes `false`; see APC section above |
+| Kitty graphics (APC) | **Unimplemented** | Phase A: same; capability atomic is wired but the GUI clients declare `false`; see APC section above |
 | iTerm2 inline images (OSC 1337) | **Unimplemented** | Parsed; dropped silently |
 
 ---
@@ -405,11 +405,11 @@ encoding (`crates/kmux/src/app/mouse_handler.rs`).
 
 Client capabilities are declared at auth time in `ClientCapabilities`:
 
-| Field | Current TUI client value | Effect |
+| Field | Current GUI client value | Effect |
 |-------|--------------------------|--------|
 | `truecolor` | Detected from `$COLORTERM` / `$TERM` | Reserved for future per-client colour downgrade (today server always sends RGB) |
 | `kitty_graphics` | `false` (hardcoded) | Drives the `kitty_graphics` atomic in `CapabilityHandles` (reserved for future parse-time gating) |
-| `kitty_keyboard` | Set when `crossterm::terminal::supports_keyboard_enhancement()` returns true and `PushKeyboardEnhancementFlags` succeeds | Reported to the daemon for future parse-time gating; the *encoding* path uses the live `kitty_keyboard.current()` flags read from the pane's Ghostty terminal each `encode_key_event` call (see `docs/keyboard.md`) |
+| `kitty_keyboard` | Set by the frontend when its toolkit reports keyboard-enhancement support (the GUI clients declare `false`) | Reported to the daemon for future parse-time gating; the *encoding* path uses the live `kitty_keyboard.current()` flags read from the pane's Ghostty terminal each `encode_key_event` call (see `docs/keyboard.md`) |
 | `term` | `$TERM` (informational) | Logged; not used for `TERM` selection |
 | `term_program` | `$TERM_PROGRAM` (informational) | Logged; not used |
 
@@ -422,7 +422,7 @@ sequences every attached client can handle (`capability::intersect_for_atomics`)
 ## Known limitations and planned work
 
 1. **Mouse click/drag forwarding** — only scroll events are currently forwarded
-   to the PTY.  Click and drag events consumed by the TUI (e.g. badge clicks)
+   to the PTY.  Click and drag events consumed by the client (e.g. chrome clicks)
    are not passed through even when the application requests any-event tracking.
 
 2. **Image protocols (Phase B)** — libghostty-vt parses kitty (APC G), sixel

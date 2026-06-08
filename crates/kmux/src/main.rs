@@ -10,9 +10,6 @@
 //!   client), located next to this executable or on `PATH`.
 //! - **macOS:** the native Swift app bundle (`~/Applications/kmux.app`,
 //!   overridable with `KMUX_APP`).
-//!
-//! The terminal frontend (`kmux-tui`) is intentionally **not** reachable from
-//! here — it is built/run only as its own package (`cargo run -p kmux-tui`).
 
 use kmux_app::launch::{Launch, run_cli};
 use kmux_client::generate_instance_id;

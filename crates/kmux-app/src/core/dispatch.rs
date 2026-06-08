@@ -1,9 +1,9 @@
 //! Action dispatch on [`AppCore`]: the single source of truth for how a
 //! resolved [`Action`] mutates client state, shared by the key path and the
-//! command palette. Moved from the TUI's `app/key_handler.rs`.
+//! command palette.
 //!
 //! Two arms that require toolkit I/O are *not* here: `Action::ForwardKey`
-//! (needs the raw crossterm event to encode under live Ghostty mode state —
+//! (needs the raw toolkit key event to encode under live Ghostty mode state —
 //! the frontend handles it before calling dispatch) and clipboard copy/paste
 //! (emitted as [`KeyResult::CopyToClipboard`] / [`KeyResult::RequestPaste`]
 //! effects that the frontend performs).

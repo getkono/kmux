@@ -6,10 +6,9 @@
 //! settle a debounced resize, handle the bootstrap outcome (and launch the SSH
 //! supervisor), apply a transport upgrade, react to a tunnel death, tick the
 //! liveness ping + metrics flush, and advance the cursor blink. That loop is not
-//! UI-specific, yet it used to live inside each frontend (the `kmux-tui`
-//! `tokio::select!` loop and the `kmux-gtk` glib `pump`), duplicated and — for a
-//! non-Rust frontend reaching `AppCore` across an FFI boundary — impossible to
-//! express in the target language.
+//! UI-specific, yet it used to live inside each frontend (e.g. the `kmux-gtk`
+//! glib `pump`), duplicated and — for a non-Rust frontend reaching `AppCore`
+//! across an FFI boundary — impossible to express in the target language.
 //!
 //! `FrontendDriver` lifts that orchestration here. A frontend now:
 //!
@@ -545,7 +544,7 @@ impl FrontendDriver {
 }
 
 /// Frontends read core state directly (`driver.mgr`, `driver.mode`,
-/// `driver.palette`, …) through this deref, mirroring `kmux-tui`'s `App`.
+/// `driver.palette`, …) through this deref.
 impl Deref for FrontendDriver {
     type Target = AppCore;
     fn deref(&self) -> &AppCore {

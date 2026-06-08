@@ -34,7 +34,7 @@ pub(super) enum PaneSync {
     AwaitingSync,
 }
 
-/// Shared client-side session management logic used by both the TUI and GUI frontends.
+/// Shared client-side session management logic used by the client frontends.
 pub struct SessionManager {
     // Connection params
     pub(super) host: String,

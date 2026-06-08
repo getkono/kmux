@@ -16,7 +16,7 @@ pub enum CommandSuccess {
     Ok,
     /// Run completed with a status message to flash on the bottom bar.
     Status(String),
-    /// Quit the TUI.
+    /// Quit the client.
     Quit,
     /// Force a reconnect.
     Reconnect,

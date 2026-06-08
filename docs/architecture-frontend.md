@@ -1,12 +1,11 @@
 # Client frontend architecture
 
 This document describes how the kmux **client** is layered so that the same core
-can drive multiple frontends — the terminal UI (`kmux-tui`), a native GTK4 GUI
-(`kmux-gtk`, Linux + macOS), and a native SwiftUI app (`kmux-swift`, macOS, via the
-`kmux-ffi` uniffi boundary) — all fronted by one toolkit-agnostic entrypoint
-binary, `kmux`. It is the result of the TUI→GUI extraction: pulling
-everything that is *not* terminal-specific out of the TUI binary into a shared,
-toolkit-agnostic core.
+can drive multiple frontends — a native GTK4 GUI (`kmux-gtk`, Linux + macOS) and
+a native SwiftUI app (`kmux-swift`, macOS, via the `kmux-ffi` uniffi boundary) —
+all fronted by one toolkit-agnostic entrypoint binary, `kmux`. Everything that is
+*not* toolkit-specific lives in a shared core (`kmux-app`), so a new frontend is
+a thin presentation + input layer over it.
 
 ## Layering
 
@@ -24,20 +23,19 @@ kmux-app        INTERACTION POLICY (toolkit-agnostic): Mode/Action + resolve,
       │         connection orchestration, theme palette (Rgb) + config,
       │         recent-servers, the shared CLI front door (run_cli)
       │         + the FrontendDriver (the shared run loop)
-      ├───────────────┬─────────────────┬─────────────────
-      ▼               ▼                 ▼
-kmux-tui          kmux-gtk          kmux-ffi            FRONTENDS
-(ratatui +        (GTK4 + glib +    (uniffi C ABI →     (presentation only)
- crossterm;        cairo;            SwiftUI macOS app)
- direct-run only)  Linux + macOS)
+      ├─────────────────────┬─────────────────
+      ▼                     ▼
+kmux-gtk              kmux-ffi              FRONTENDS
+(GTK4 + glib +        (uniffi C ABI →       (presentation only)
+ cairo;                SwiftUI macOS app)
+ Linux + macOS)
 ```
 
 **Hard rule:** nothing at or below `kmux-app` may depend on a UI toolkit.
 `kmux-app` depends only on `kmux-client` + `kmux-protocol` (plus `clap`/`tabled`
 for the CLI and `serde`/`toml` for config — none of which are UI toolkits).
-`ratatui`/`crossterm` live **only** in `kmux-tui`; `gtk4`/`gdk`/`cairo` live
-**only** in `kmux-gtk`. This is enforceable: `cargo tree -p kmux-app` shows no
-`ratatui`/`crossterm`/`gtk4`.
+`gtk4`/`gdk`/`cairo` live **only** in `kmux-gtk`. This is enforceable:
+`cargo tree -p kmux-app` shows no `gtk4`.
 
 ## `AppCore`: driven, not driving
 
@@ -51,13 +49,12 @@ The contract a frontend implements:
 
 - **Input in** (toolkit-agnostic): the frontend produces an `Action` and calls
   `core.dispatch_action(action)` — the single entry point. *How* a frontend
-  produces actions is its own choice. The TUI uses the modal keymap: convert the
-  crossterm event to `kmux_client::key::{Key, Modifiers}`, call
-  `kmux_app::mode::resolve(&core.mode, &key, mods)` for the next `Mode` +
-  `Action`. The GTK frontend is **accelerators-only**: native GTK accelerators,
-  menu items, and widgets bind straight to `Action`s / `TopBarAction`s (it does
-  *not* call `mode::resolve`), and any key the accelerators don't claim is
-  forwarded to the PTY. Plus `core.set_term_size(size)` whenever the content
+  produces actions is its own choice. The GTK frontend is **accelerators-only**:
+  native GTK accelerators, menu items, and widgets bind straight to `Action`s /
+  `TopBarAction`s, and any key the accelerators don't claim is forwarded to the
+  PTY. (The modal keymap `kmux_app::mode::resolve` remains available in the core
+  for any frontend that prefers a chord-based input model.) Plus
+  `core.set_term_size(size)` whenever the content
   area resizes (the frontend reports its geometry — the core never queries a
   terminal).
 - **State out** (no toolkit types): read `core.mode`, `core.palette` (convert to
@@ -81,11 +78,9 @@ The contract a frontend implements:
   are core concerns. The frontend creates the channels, hands the senders to
   `core.start_bootstrap(...)`, and drains the receivers in its own loop.
 
-The TUI pumps `AppCore` from a `tokio::select!` loop (`kmux-tui/src/app/
-event_loop.rs`); the GTK frontend and `kmux-ffi` pump it through the
-**`FrontendDriver`** (below). The render leaf and how each frontend produces
-`Action`s (modal keymap vs. native accelerators/widgets) differ; the core is
-identical.
+The GTK frontend and `kmux-ffi` pump `AppCore` through the **`FrontendDriver`**
+(below). The render leaf and how each frontend produces `Action`s differ; the
+core is identical.
 
 ## `FrontendDriver`: the shared run loop
 
@@ -125,11 +120,10 @@ loop and the runtime. The toolkit-agnostic helpers that used to live in the GTK
 crate now live with it: `driver::blink::advance_blink` (the cursor-blink state
 machine) and `driver::clipboard::sanitize_clipboard_text` (NUL stripping).
 
-`kmux-gtk` is migrated onto the driver: its `Frontend` is now just
+`kmux-gtk` runs on the driver: its `Frontend` is just
 `{ driver, metrics, css_provider }`, and `pump` is `driver.tick()` + apply
-effects + reconcile chrome + redraw. `kmux-tui` is intentionally **not** migrated
-— it keeps its own `tokio::select!` loop as the regression oracle (the driver
-has its own unit tests in `kmux-app/src/driver/`).
+effects + reconcile chrome + redraw. The driver has its own unit tests in
+`kmux-app/src/driver/`.
 
 ## Theme: one palette, per-frontend colors
 
@@ -138,36 +132,26 @@ triple, parses the `themes/*.toml` files, and `kmux_app::config::resolve_theme`
 returns it. `AppCore.palette` holds the active one (the `/theme` command mutates
 it). Each frontend converts to its toolkit's color type at the render boundary:
 
-- `kmux-tui`: a ratatui-typed `Theme` built via `From<kmux_app::theme::Theme>`,
-  refreshed from `core.palette` before each draw (`kmux-tui/src/theme.rs`).
 - `kmux-gtk`: cairo `set_source_rgb` directly from the `Rgb`/`CellColor`
   components.
+- `kmux-swift`: the FFI resolves `DEFAULT_*` cells against the palette in Rust
+  and the renderer maps the packed colors to `NSColor`.
 
 The field is named `palette` (not `theme`) so it does not shadow a frontend's
-own rendered-theme field through the `App: Deref<Target = AppCore>` wrapper.
+own rendered-theme field through a `Deref<Target = AppCore>` wrapper.
 
 The palette includes `cursor_bg` / `cursor_fg` (optional in `themes/*.toml`,
-defaulting to `fg` / `bg`). Both frontends draw the inner-pane cursor themselves
-and honor these colors — the TUI paints it in-cell, the GTK frontend draws it via
-cairo. See [terminal-backend.md](terminal-backend.md#cursor-rendering-in-cell).
-
-## The TUI `App` wrapper
-
-`kmux-tui`'s `App` is a thin presentation wrapper: `{ core: AppCore, theme
-(ratatui), hit-boxes, paste_tx }`. It `Deref`s to `AppCore` so the event loop
-and renderers reach core state (`self.mgr`, `self.mode`, …) directly — a
-deliberate newtype-wrapper ergonomic. A native GUI frontend wraps the same
-`AppCore` the same way (or holds it directly, as `kmux-gtk` does).
+defaulting to `fg` / `bg`). The frontend draws the inner-pane cursor itself and
+honors these colors. See
+[terminal-backend.md](terminal-backend.md#cursor-rendering-in-cell).
 
 ## Binaries and the shared CLI front door
 
 The naming is: **`kmux`** is the entrypoint (the `kmux` crate's binary) on both
 Linux and macOS — it offers the CLI and opens the platform desktop app;
 **`kmux-gtk`** is the GTK frontend (the `kmux-gtk` crate's binary — the default +
-official client on Linux, also runnable on macOS); **`kmux-tui`** is the terminal
-client (the `kmux-tui` crate's binary, kept for SSH/headless use, reachable only
-by running its package directly); **`kmux-swift`** is the native macOS app; and
-**`kmuxd`** is the daemon.
+official client on Linux, also runnable on macOS); **`kmux-swift`** is the native
+macOS app; and **`kmuxd`** is the daemon.
 
 `kmux` and the frontends all share one CLI front door — `kmux_app::launch::run_cli`.
 It initializes logging, parses the CLI, runs any non-interactive subcommand
@@ -183,8 +167,7 @@ match run_cli(instance_id).await? {
 ```
 
 Each frontend builds its own `AppCore` from the `Plan` (supplying its own
-capabilities — the TUI probes the terminal; the GUI declares truecolor) and runs
-its pump.
+capabilities — the GUI declares truecolor) and runs its pump.
 
 The **`kmux` entrypoint** is the same front door minus the in-process GUI: it
 runs `run_cli` and, on `Launch::Interactive`, *execs* the platform desktop binary
@@ -194,8 +177,7 @@ forwarding argv. The spawned frontend re-runs `run_cli` and rebuilds the same
 `Plan` (a benign double-parse). `kmux` itself depends only on `kmux-app` (no UI
 toolkit), so `kmux daemon start`, `kmux ls`, `kmux --server …` work identically
 on both platforms without loading GTK — only the interactive presentation is
-delegated to the per-platform frontend. The TUI is deliberately **not** reachable
-from `kmux`.
+delegated to the per-platform frontend.
 
 ## Running
 
@@ -205,7 +187,6 @@ from `kmux`.
   `kmux` + `kmux-gtk` then runs `kmux`).
 - GUI directly: `cargo run -p kmux-gtk` (binary `kmux-gtk`) — opens a window,
   connects, renders the active session, forwards keystrokes (Linux + macOS).
-- TUI: `cargo run -p kmux-tui` (binary `kmux-tui`) — the only way to reach the TUI.
 
 ### Building and running `kmux-gtk`
 
@@ -297,9 +278,9 @@ drift).
 
 The GTK GUI (`kmux-gtk`) is the **primary** client on Linux and is a *native*
 libadwaita app — only the terminal panes are drawn like a terminal; everything
-around them uses native widgets. It drives `AppCore` through the same contract
-as the TUI; the GTK-specific parts are the pump, the render leaf, and the native
-widget mapping:
+around them uses native widgets. It drives `AppCore` through the contract above;
+the GTK-specific parts are the pump, the render leaf, and the native widget
+mapping:
 
 - Full Pango grid rendering — text attributes, wide chars, cursor shapes, and
   scrollback — at font-derived cell metrics (`render.rs`). One shared
@@ -315,12 +296,12 @@ widget mapping:
   Sessions and panes are reconciled against `AppCore` each pump tick (cheap
   per-region signatures); selecting/closing routes through `TopBarAction` /
   `Action`. Panes map to tabs because the protocol streams only the active grid.
-- **Accelerators-only keyboard** (`actions.rs`): every command the TUI reaches
-  via `Ctrl+G` chords is a `gio` action bound to a reserved accelerator
-  (`Ctrl+Shift+…`, function keys, `Ctrl+digit`), surfaced in a hamburger menu
-  and a `GtkShortcutsWindow`; the key controller on the focused terminal
-  forwards everything the accelerators don't claim to the PTY. The modal chord
-  path is not used in the GUI (the TUI keeps it as the regression oracle).
+- **Accelerators-only keyboard** (`actions.rs`): each command is a `gio` action
+  bound to a reserved accelerator (`Ctrl+Shift+…`, function keys, `Ctrl+digit`),
+  surfaced in a hamburger menu and a `GtkShortcutsWindow`; the key controller on
+  the focused terminal forwards everything the accelerators don't claim to the
+  PTY. The modal chord path (`mode::resolve`) is available in the core but not
+  used by the GUI.
 - **Native dialogs** (`dialogs.rs`), all driven by `core.mode`: session/server/
   directory pickers and the `/`-command palette as `adw::Dialog`s (search entry
   + reconciled list); confirm-close/rename as `adw::AlertDialog`s; connecting/
@@ -345,16 +326,11 @@ The one toolkit-agnostic addition this required was `AppCore::set_picker_search`
 filter in one shot; everything else reused the existing `Action` / dispatch /
 picker-query surface.
 
-`kmux-tui` is **deprecated** but kept building and tested: it remains the
-headless/SSH client and the regression oracle for the shared `kmux-app`
-interaction layer. No new feature work targets it.
-
 ### Future
 
 - **Frontend selection from `kmux`.** The `kmux` entrypoint launches the platform
-  desktop app by `exec`. A future flag (e.g. `kmux --gtk` on macOS, or a `--tui`
-  opt-in) could let it pick a non-default frontend, and a no-display fallback
-  could select the terminal frontend automatically.
+  desktop app by `exec`. A future flag (e.g. `kmux --gtk` on macOS) could let it
+  pick a non-default frontend.
 - **macOS interactive args.** `kmux` forwards argv to the Swift `kmux.app`, but
   the Swift app currently ignores connect flags (`--server`/`--theme`/…) and uses
   defaults; honoring them there (parsing argv into a `DriverConfig`) is a

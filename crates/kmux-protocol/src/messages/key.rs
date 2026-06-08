@@ -120,8 +120,8 @@ bitflags::bitflags! {
     }
 }
 
-/// Press / Repeat. Release events are not currently forwarded by kmux —
-/// crossterm's REPORT_EVENT_TYPES flag is not enabled on the client side.
+/// Press / Repeat. Release events are not currently forwarded by kmux — the
+/// clients do not request key-release reporting from their input toolkit.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyAction {

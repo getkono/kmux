@@ -2,7 +2,7 @@
 //!
 //! The cell geometry is derived from the configured font ([`Metrics`]) rather
 //! than hardcoded, so the grid stays aligned at any font size or display scale.
-//! This is the GTK analog of the TUI's `ui/grid.rs` and mirrors its handling of
+//! It renders the `CellGrid` into Cairo/Pango, handling
 //! default colors, wide-char spacers, control chars, text attributes, cursor
 //! shapes, and scrollback.
 

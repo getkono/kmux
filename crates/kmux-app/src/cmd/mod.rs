@@ -1,5 +1,5 @@
 //! Command palette: an extensible registry-driven `/`-prefixed mini-language
-//! for the TUI. See `docs/command-mode.md` for the design.
+//! for the client. See `docs/command-mode.md` for the design.
 //!
 //! Module layout:
 //! - [`spec`]: data types for command definitions and errors.

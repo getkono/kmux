@@ -1,6 +1,6 @@
 # Keyboard Input
 
-kmux's input path forwards modifier-aware key events from the client TUI to
+kmux's input path forwards modifier-aware key events from the client to
 the daemon, which encodes them using the live state of the in-pane Ghostty
 terminal emulator.  This means modified keys (Shift+Enter, Alt+Enter,
 Shift+Tab, Ctrl+Arrow, …) are encoded with whatever protocol the inner
@@ -48,19 +48,15 @@ events, and signal-injection paths where the client already has bytes.
 
 ## Client side
 
-`crates/kmux/src/main.rs` calls
-`crossterm::terminal::supports_keyboard_enhancement()` and pushes
-`DISAMBIGUATE_ESCAPE_CODES | REPORT_ALTERNATE_KEYS` if supported.  This
-makes crossterm see Shift+Enter / Shift+Tab as distinguishable events
-rather than collapsing them into the bare key.  Terminals that don't
-support it (Apple Terminal, older TTYs) ignore the push and we fall back
-to legacy behaviour automatically.
-
-`crates/kmux/src/key_convert.rs::convert_to_protocol_key` translates
-crossterm `KeyEvent` → wire `KeyEvent`.  Letters and digits are mapped to
-their dedicated physical-key variants so kitty's "report alternates" works
-correctly; other printables fall through as `KeyCode::Unidentified` plus
-the text and let the encoder write the UTF-8 directly.
+The GUI frontend receives key events from its toolkit (GDK on GTK, AppKit on
+macOS) and translates them into the wire `KeyEvent`. In `kmux-gtk` this is
+`crates/kmux-gtk/src/imp/convert.rs::convert_to_protocol_key`; the Swift app
+goes through the FFI `send_char` / `send_named_key`. Letters and digits are
+mapped to their dedicated physical-key variants so kitty's "report alternates"
+works correctly; other printables fall through as `KeyCode::Unidentified` plus
+the text, letting the daemon's encoder write the UTF-8 directly. The toolkit
+reports modified keys (Shift+Enter, Shift+Tab) as distinguishable events, so the
+daemon can encode them under whatever protocol the inner program negotiated.
 
 ## Daemon side
 
