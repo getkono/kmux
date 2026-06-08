@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use super::category::MessageCategory;
 use super::session::{
-    ClientId, ConnectionId, ErrorCode, PaneId, RequestId, SequenceNo, SessionEntry,
-    SessionEventMsg, WordId,
+    ClientId, ConnectionId, ErrorCode, LayoutNode, PaneId, PaneInfo, RequestId, SequenceNo,
+    SessionEntry, SessionEventMsg, TabIndex, TabInfo, WordId,
 };
 use super::vt::{CellState, CursorState, GridSnapshot, TermModes, TerminalDiff};
 
@@ -66,6 +66,41 @@ pub enum ServerMessage {
         request_id: RequestId,
         pane_id: PaneId,
         exit_code: Option<i32>,
+    },
+
+    /// Confirmation that a new tab was created.
+    TabCreated {
+        request_id: RequestId,
+        word_id: WordId,
+        tab: TabInfo,
+    },
+
+    /// Confirmation that a tab was closed.
+    TabClosed {
+        request_id: RequestId,
+        word_id: WordId,
+        tab_index: TabIndex,
+    },
+
+    /// Confirmation that a pane was split: carries the freshly spawned pane plus
+    /// the tab's new authoritative layout tree.
+    PaneSplit {
+        request_id: RequestId,
+        word_id: WordId,
+        tab_index: TabIndex,
+        new_pane: PaneInfo,
+        layout: LayoutNode,
+    },
+
+    /// Authoritative layout state for one tab. Broadcast to every client viewing
+    /// the tab after **any** layout mutation (split, close, swap, resize, focus)
+    /// and sent on (re)attach. Clients replace their cached tree wholesale — they
+    /// never merge — so concurrent client edits resolve last-writer-wins.
+    LayoutUpdate {
+        word_id: WordId,
+        tab_index: TabIndex,
+        layout: LayoutNode,
+        focused_pane: u32,
     },
 
     /// The client fell too far behind and missed output. Re-attach with `last_seqno`.
@@ -182,6 +217,10 @@ impl ServerMessage {
             | Self::SessionRenamed { .. }
             | Self::PaneCreated { .. }
             | Self::PaneClosed { .. }
+            | Self::TabCreated { .. }
+            | Self::TabClosed { .. }
+            | Self::PaneSplit { .. }
+            | Self::LayoutUpdate { .. }
             | Self::Event { .. }
             | Self::Error { .. }
             | Self::InputLockGranted { .. }
@@ -198,12 +237,13 @@ mod tests {
     use std::sync::Arc;
 
     use super::super::session::{
-        ClientId, ErrorCode, SessionEntry, SessionEventMsg, SessionMeta, TermSize,
+        ClientId, ErrorCode, PaneInfo, SessionEntry, SessionEventMsg, SessionMeta, TermSize,
     };
     use super::super::vt::{CursorState, GridSnapshot, TermModes, TerminalDiff};
     use super::*;
 
     fn dummy_session_entry() -> SessionEntry {
+        use super::super::session::{LayoutNode, TabInfo};
         SessionEntry {
             meta: SessionMeta {
                 index: 0,
@@ -212,6 +252,13 @@ mod tests {
                 cwd: "/".into(),
             },
             panes: vec![],
+            tabs: vec![TabInfo {
+                tab_index: 0,
+                name: "1".into(),
+                layout: LayoutNode::single(0),
+                focused_pane: 0,
+            }],
+            active_tab: 0,
         }
     }
 
@@ -333,6 +380,54 @@ mod tests {
                     request_id: 0,
                     pane_id: "p".into(),
                     exit_code: None,
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::TabCreated {
+                    request_id: 0,
+                    word_id: "w".into(),
+                    tab: super::super::session::TabInfo {
+                        tab_index: 0,
+                        name: "1".into(),
+                        layout: super::super::session::LayoutNode::single(0),
+                        focused_pane: 0,
+                    },
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::TabClosed {
+                    request_id: 0,
+                    word_id: "w".into(),
+                    tab_index: 0,
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::PaneSplit {
+                    request_id: 0,
+                    word_id: "w".into(),
+                    tab_index: 0,
+                    new_pane: PaneInfo {
+                        pane_id: "w/1".into(),
+                        pane_index: 1,
+                        program: "/bin/sh".into(),
+                        size: TermSize::default(),
+                        attached_clients: vec![],
+                        status: super::super::session::SessionStatus::Running,
+                        title: String::new(),
+                    },
+                    layout: super::super::session::LayoutNode::single(0),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::LayoutUpdate {
+                    word_id: "w".into(),
+                    tab_index: 0,
+                    layout: super::super::session::LayoutNode::single(0),
+                    focused_pane: 0,
                 },
                 MessageCategory::Control,
             ),

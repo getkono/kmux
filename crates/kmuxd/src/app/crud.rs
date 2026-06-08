@@ -1,7 +1,7 @@
 use std::path::Path;
 
 use kmux_protocol::messages::{
-    ClientCapabilities, PaneInfo, SessionEntry, SessionMeta, SessionStatus, TermSize,
+    ClientCapabilities, LayoutNode, PaneInfo, SessionEntry, SessionMeta, SessionStatus, TermSize,
 };
 use kmux_pty::error::{KmuxError, Result};
 
@@ -94,10 +94,22 @@ impl ServerApp {
         let mut panes = HashMap::new();
         panes.insert(pane_index, relay);
 
+        // Seed a single default tab containing the initial pane.
+        let tab = super::TabState {
+            tab_index: 0,
+            name: "1".to_string(),
+            layout: LayoutNode::single(pane_index),
+            focused_pane: pane_index,
+        };
+        let tab_info = tab.to_info();
+
         let state = SessionState {
             meta: meta.clone(),
             panes,
             next_pane_index: 1,
+            tabs: vec![tab],
+            next_tab_index: 1,
+            active_tab: 0,
         };
 
         self.sessions.write().await.insert(word_id.clone(), state);
@@ -105,6 +117,8 @@ impl ServerApp {
         Ok(SessionEntry {
             meta,
             panes: vec![pane_info],
+            tabs: vec![tab_info],
+            active_tab: 0,
         })
     }
 
@@ -164,6 +178,8 @@ impl ServerApp {
                 SessionEntry {
                     meta: state.meta.clone(),
                     panes,
+                    tabs: state.tab_infos(),
+                    active_tab: state.active_tab,
                 }
             })
             .collect();

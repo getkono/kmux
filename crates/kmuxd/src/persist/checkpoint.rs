@@ -76,6 +76,14 @@ mod tests {
                     scrollback_lines: vec![],
                     cwd: "/tmp".to_string(),
                 }],
+                tabs: vec![crate::persist::PersistedTab {
+                    tab_index: 0,
+                    name: "1".to_string(),
+                    layout: kmux_protocol::messages::LayoutNode::single(0),
+                    focused_pane: 0,
+                }],
+                next_tab_index: 1,
+                active_tab: 0,
             }],
         }
     }

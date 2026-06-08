@@ -3,7 +3,7 @@ use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64};
 use std::sync::{Arc, Mutex};
 
-use kmux_protocol::messages::{ClientCapabilities, InputMode, PaneId, SessionStatus, TermSize};
+use kmux_protocol::messages::{ClientCapabilities, InputMode, SessionStatus, TermSize};
 use kmux_pty::config::{EnvBuilder, PtyConfig};
 use kmux_pty::error::Result;
 
@@ -13,64 +13,22 @@ use crate::relay::session_diff_loop;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::new_term_state;
 
-use super::helpers::resolve_cwd;
 use super::{ClientMap, PaneEventSink, PaneRelay, SCROLLBACK_CAPACITY, ServerApp};
 
 impl ServerApp {
-    /// Add a new pane to an existing session.
-    pub async fn create_pane(
+    /// Gracefully close a single pane, collapsing its tab's layout tree.
+    ///
+    /// Returns the child exit code (if known) and a [`PaneCloseOutcome`]
+    /// describing how the tab/session changed, so the caller can broadcast the
+    /// authoritative `LayoutUpdate` / tab-close event. If the pane was the last
+    /// in its tab the tab is removed; if it was the last tab the session closes.
+    pub async fn close_pane(
         &self,
-        word_id: &str,
-        program: Option<String>,
-        args: Vec<String>,
-        size: TermSize,
-        seed_caps: &ClientCapabilities,
-    ) -> Result<PaneId> {
-        use kmux_pty::error::KmuxError;
-        use std::path::PathBuf;
-
-        // Grab pane index and CWD with a short write lock, then drop it before IO.
-        let (pane_index, pane_id, effective_cwd) = {
-            let mut sessions = self.sessions.write().await;
-            let state = sessions
-                .get_mut(word_id)
-                .ok_or_else(|| KmuxError::SessionNotFound {
-                    name: word_id.to_string(),
-                })?;
-            let pane_index = state.next_pane_index;
-            state.next_pane_index += 1;
-            let pane_id = format!("{word_id}/{pane_index}");
-            let effective_cwd = resolve_cwd(&PathBuf::from(&state.meta.cwd));
-            (pane_index, pane_id, effective_cwd)
-        };
-
-        let relay = self
-            .spawn_pane_relay(
-                &pane_id,
-                program,
-                args,
-                size,
-                Some(&effective_cwd),
-                seed_caps,
-            )
-            .await?;
-
-        let mut sessions = self.sessions.write().await;
-        let state = sessions
-            .get_mut(word_id)
-            .ok_or_else(|| KmuxError::SessionNotFound {
-                name: word_id.to_string(),
-            })?;
-        state.panes.insert(pane_index, relay);
-
-        Ok(pane_id)
-    }
-
-    /// Gracefully close a single pane.
-    /// If it was the last pane in its session, also removes the session.
-    pub async fn close_pane(&self, pane_id: &str) -> Result<Option<i32>> {
+        pane_id: &str,
+    ) -> Result<(Option<i32>, super::PaneCloseOutcome)> {
         use kmux_pty::error::KmuxError;
 
+        use super::PaneCloseOutcome;
         use super::helpers::parse_pane_id;
 
         let (word_id, pane_index) =
@@ -90,18 +48,59 @@ impl ServerApp {
 
         self.manager.close_nowait(pane_id).await?;
 
-        // Remove pane from session; remove session if empty
+        // Remove the pane and collapse its tab's layout; remove the tab if it
+        // becomes empty, and the session if it has no tabs left.
         let mut sessions = self.sessions.write().await;
-        if let Some(state) = sessions.get_mut(word_id) {
-            state.panes.remove(&pane_index);
+        let Some(state) = sessions.get_mut(word_id) else {
+            return Ok((None, PaneCloseOutcome::Gone));
+        };
+        state.panes.remove(&pane_index);
+
+        let Some(tab_index) = state.tab_of_pane(pane_index) else {
+            // Pane wasn't in any tab's tree (shouldn't happen); fall back to the
+            // legacy "drop empty session" behavior.
             if state.panes.is_empty() {
                 let word = word_id.to_string();
                 sessions.remove(&word);
                 self.wordlist.lock().unwrap().release(&word);
+                return Ok((None, PaneCloseOutcome::SessionClosed));
             }
-        }
+            return Ok((None, PaneCloseOutcome::Gone));
+        };
 
-        Ok(None)
+        let tab = state.tab_mut(tab_index).expect("tab_of_pane returned it");
+        let leaves = tab.layout.leaves();
+        let outcome = if leaves.len() <= 1 {
+            // Last pane in this tab → remove the tab.
+            state.tabs.retain(|t| t.tab_index != tab_index);
+            if state.active_tab == tab_index {
+                state.active_tab = state.tabs.first().map(|t| t.tab_index).unwrap_or(0);
+            }
+            if state.tabs.is_empty() {
+                let word = word_id.to_string();
+                sessions.remove(&word);
+                self.wordlist.lock().unwrap().release(&word);
+                PaneCloseOutcome::SessionClosed
+            } else {
+                PaneCloseOutcome::TabClosed { tab_index }
+            }
+        } else {
+            // Collapse the leaf and refocus a sibling if it held focus.
+            let refocus = super::layout::next_focus_after_removal(&tab.layout, pane_index);
+            super::layout::remove_pane(&mut tab.layout, pane_index);
+            if tab.focused_pane == pane_index {
+                tab.focused_pane = refocus
+                    .or_else(|| tab.layout.leaves().first().copied())
+                    .unwrap_or(pane_index);
+            }
+            PaneCloseOutcome::TabUpdated {
+                tab_index,
+                layout: tab.layout.clone(),
+                focused_pane: tab.focused_pane,
+            }
+        };
+
+        Ok((None, outcome))
     }
 
     /// Spawn a PTY process and create a `PaneRelay` for it.

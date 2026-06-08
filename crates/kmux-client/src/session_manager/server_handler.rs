@@ -277,6 +277,71 @@ impl SessionManager {
                 events.push(SessionEvent::PaneClosed { pane_id });
             }
 
+            // Tab/layout messages. The single-pane client does not tile yet, so
+            // these are reconciled into the cached `session_list` tabs but do not
+            // change rendering. (Phase 1 wires the visible-set + focus handling.)
+            ServerMessage::LayoutUpdate {
+                word_id,
+                tab_index,
+                layout,
+                focused_pane,
+            } => {
+                if let Some(tab) = self
+                    .session_list
+                    .iter_mut()
+                    .find(|e| e.meta.word_id == word_id)
+                    .and_then(|e| e.tabs.iter_mut().find(|t| t.tab_index == tab_index))
+                {
+                    tab.layout = layout;
+                    tab.focused_pane = focused_pane;
+                }
+            }
+
+            ServerMessage::TabCreated { word_id, tab, .. } => {
+                if let Some(entry) = self
+                    .session_list
+                    .iter_mut()
+                    .find(|e| e.meta.word_id == word_id)
+                    && !entry.tabs.iter().any(|t| t.tab_index == tab.tab_index)
+                {
+                    entry.tabs.push(tab);
+                }
+            }
+
+            ServerMessage::TabClosed {
+                word_id, tab_index, ..
+            } => {
+                if let Some(entry) = self
+                    .session_list
+                    .iter_mut()
+                    .find(|e| e.meta.word_id == word_id)
+                {
+                    entry.tabs.retain(|t| t.tab_index != tab_index);
+                }
+            }
+
+            ServerMessage::PaneSplit {
+                word_id,
+                tab_index,
+                new_pane,
+                layout,
+                ..
+            } => {
+                self.buffers.entry(new_pane.pane_id.clone()).or_default();
+                if let Some(entry) = self
+                    .session_list
+                    .iter_mut()
+                    .find(|e| e.meta.word_id == word_id)
+                {
+                    if !entry.panes.iter().any(|p| p.pane_id == new_pane.pane_id) {
+                        entry.panes.push(new_pane);
+                    }
+                    if let Some(tab) = entry.tabs.iter_mut().find(|t| t.tab_index == tab_index) {
+                        tab.layout = layout;
+                    }
+                }
+            }
+
             ServerMessage::TerminalSnapshot {
                 pane_id,
                 snapshot,

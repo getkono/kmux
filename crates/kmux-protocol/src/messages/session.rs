@@ -18,6 +18,16 @@ pub type WordId = String;
 /// Example: `"eagle/0"`, `"eagle/1"`.
 pub type PaneId = String;
 
+/// Tab index within a session (0-based, monotonically increasing per session).
+///
+/// A *tab* is a named tiling layout over a subset of the session's panes. The
+/// hierarchy is **Session → Tab → Pane**: a session owns a flat pool of panes
+/// (each one PTY, identified by [`PaneId`]) and one or more tabs, each of which
+/// arranges some of those panes in a [`LayoutNode`] tree. Tab indices appear
+/// only in tab/layout control messages, never in the hot PTY path (which keys
+/// off [`PaneId`]).
+pub type TabIndex = u32;
+
 /// Rendering capabilities self-declared by a client at Auth time.
 ///
 /// The daemon uses these to decide which PTY environment variables to set
@@ -116,11 +126,90 @@ pub struct PaneInfo {
     pub title: String,
 }
 
+/// Orientation of a layout split.
+///
+/// `Horizontal` lays children out **left ↔ right** (a vertical divider between
+/// them); `Vertical` lays children **top ↕ bottom** (a horizontal divider).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SplitDir {
+    Horizontal,
+    Vertical,
+}
+
+/// A resolution-independent tiling layout for one tab.
+///
+/// Leaves reference a pane by its session-local `pane_index`; `Split` nodes hold
+/// child weights as **permille** integers (0..=1000 summing to ~1000), so the
+/// tree is bit-exact across clients — every client resolves the *same* tree
+/// against *its own* window into per-pane cell rectangles (see the
+/// `kmux-app::layout` resolver), and the daemon's smallest-wins size negotiation
+/// reconciles the differing per-client cell sizes. `ratios.len() == children.len()`.
+///
+/// Permille (not `f32`) is deliberate: it keeps the tree deterministic and safe
+/// to compare for change-suppression. Never compare layouts with float equality.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LayoutNode {
+    Leaf {
+        pane_index: u32,
+    },
+    Split {
+        dir: SplitDir,
+        /// Child weights in permille (0..=1000); same length as `children`.
+        ratios: Vec<u16>,
+        children: Vec<LayoutNode>,
+    },
+}
+
+impl LayoutNode {
+    /// A single-pane leaf layout (the default for a freshly created tab).
+    pub fn single(pane_index: u32) -> Self {
+        LayoutNode::Leaf { pane_index }
+    }
+
+    /// Collect the `pane_index` of every leaf, left-to-right depth-first.
+    pub fn leaves(&self) -> Vec<u32> {
+        let mut out = Vec::new();
+        self.collect_leaves(&mut out);
+        out
+    }
+
+    fn collect_leaves(&self, out: &mut Vec<u32>) {
+        match self {
+            LayoutNode::Leaf { pane_index } => out.push(*pane_index),
+            LayoutNode::Split { children, .. } => {
+                for c in children {
+                    c.collect_leaves(out);
+                }
+            }
+        }
+    }
+}
+
+/// One tab: a named tiling layout over a subset of the session's panes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TabInfo {
+    pub tab_index: TabIndex,
+    /// Human-readable display name (default: the 1-based tab number).
+    pub name: String,
+    /// The tab's tiling layout tree (leaves reference `pane_index`).
+    pub layout: LayoutNode,
+    /// `pane_index` of the leaf that currently has input focus within this tab.
+    pub focused_pane: u32,
+}
+
 /// Full session listing entry returned by `SessionList` and related messages.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionEntry {
     pub meta: SessionMeta,
+    /// Flat list of every pane (PTY) in the session, regardless of tab. Chrome
+    /// (titles, status, attach state) reads this; the per-tab `layout` trees
+    /// reference these panes by `pane_index`.
     pub panes: Vec<PaneInfo>,
+    /// The session's tabs (tiling layouts). Always at least one.
+    pub tabs: Vec<TabInfo>,
+    /// The tab index the server restored/created as the default view. Which tab
+    /// a *client* is actually viewing is client-local state.
+    pub active_tab: TabIndex,
 }
 
 /// Input control mode for a pane.
@@ -166,6 +255,29 @@ pub enum SessionEventMsg {
     },
     /// A pane was closed.
     PaneClosed { pane_id: PaneId },
+
+    /// A new tab was created inside a session.
+    TabCreated {
+        word_id: WordId,
+        tab_index: TabIndex,
+    },
+    /// A tab (and any panes unique to it) was closed.
+    TabClosed {
+        word_id: WordId,
+        tab_index: TabIndex,
+    },
+    /// A tab's display name changed.
+    TabRenamed {
+        word_id: WordId,
+        tab_index: TabIndex,
+        name: String,
+    },
+    /// A tab's layout tree and/or focus changed. Clients should reconcile to the
+    /// authoritative tree carried by the next `LayoutUpdate` for this tab.
+    LayoutChanged {
+        word_id: WordId,
+        tab_index: TabIndex,
+    },
 }
 
 #[cfg(test)]
@@ -234,6 +346,109 @@ mod tests {
                 assert_eq!(data, "aGVsbG8=");
             }
             _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn layout_node_nested_roundtrips() {
+        // A 2-level tree: a horizontal split whose right child is a vertical split.
+        let tree = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![400, 600],
+            children: vec![
+                LayoutNode::Leaf { pane_index: 0 },
+                LayoutNode::Split {
+                    dir: SplitDir::Vertical,
+                    ratios: vec![500, 500],
+                    children: vec![
+                        LayoutNode::Leaf { pane_index: 1 },
+                        LayoutNode::Leaf { pane_index: 2 },
+                    ],
+                },
+            ],
+        };
+        let bytes = postcard::to_allocvec(&tree).expect("serialize");
+        let decoded: LayoutNode = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded, tree);
+        assert_eq!(decoded.leaves(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn tab_info_roundtrips() {
+        let tab = TabInfo {
+            tab_index: 3,
+            name: "build".into(),
+            layout: LayoutNode::Split {
+                dir: SplitDir::Vertical,
+                ratios: vec![700, 300],
+                children: vec![
+                    LayoutNode::Leaf { pane_index: 5 },
+                    LayoutNode::Leaf { pane_index: 6 },
+                ],
+            },
+            focused_pane: 6,
+        };
+        let bytes = postcard::to_allocvec(&tab).expect("serialize");
+        let decoded: TabInfo = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded.tab_index, 3);
+        assert_eq!(decoded.name, "build");
+        assert_eq!(decoded.focused_pane, 6);
+        assert_eq!(decoded.layout.leaves(), vec![5, 6]);
+    }
+
+    #[test]
+    fn session_entry_with_tabs_roundtrips() {
+        let entry = SessionEntry {
+            meta: SessionMeta {
+                index: 0,
+                word_id: "eagle".into(),
+                name: "kmux".into(),
+                cwd: "/dev/kmux".into(),
+            },
+            panes: vec![],
+            tabs: vec![TabInfo {
+                tab_index: 0,
+                name: "1".into(),
+                layout: LayoutNode::single(0),
+                focused_pane: 0,
+            }],
+            active_tab: 0,
+        };
+        let bytes = postcard::to_allocvec(&entry).expect("serialize");
+        let decoded: SessionEntry = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded.tabs.len(), 1);
+        assert_eq!(decoded.active_tab, 0);
+        assert_eq!(decoded.tabs[0].layout, LayoutNode::single(0));
+    }
+
+    #[test]
+    fn tab_lifecycle_events_roundtrip() {
+        for msg in [
+            SessionEventMsg::TabCreated {
+                word_id: "eagle".into(),
+                tab_index: 1,
+            },
+            SessionEventMsg::TabClosed {
+                word_id: "eagle".into(),
+                tab_index: 1,
+            },
+            SessionEventMsg::TabRenamed {
+                word_id: "eagle".into(),
+                tab_index: 1,
+                name: "logs".into(),
+            },
+            SessionEventMsg::LayoutChanged {
+                word_id: "eagle".into(),
+                tab_index: 0,
+            },
+        ] {
+            let bytes = postcard::to_allocvec(&msg).expect("serialize");
+            let decoded: SessionEventMsg = postcard::from_bytes(&bytes).expect("deserialize");
+            // Round-trips to an equal-shaped event (spot check the discriminant).
+            assert_eq!(
+                std::mem::discriminant(&decoded),
+                std::mem::discriminant(&msg)
+            );
         }
     }
 

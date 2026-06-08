@@ -357,6 +357,13 @@ mod tests {
                 status: SessionStatus::Running,
                 title: String::new(),
             }],
+            tabs: vec![kmux_protocol::messages::TabInfo {
+                tab_index: 0,
+                name: "1".to_string(),
+                layout: kmux_protocol::messages::LayoutNode::single(0),
+                focused_pane: 0,
+            }],
+            active_tab: 0,
         }
     }
 
@@ -595,6 +602,8 @@ mod tests {
                 cwd: "/proj-a/src".to_string(),
             },
             panes: vec![],
+            tabs: vec![],
+            active_tab: 0,
         });
         mgr.session_list.push(SessionEntry {
             meta: SessionMeta {
@@ -604,6 +613,8 @@ mod tests {
                 cwd: "/proj-b/src".to_string(),
             },
             panes: vec![],
+            tabs: vec![],
+            active_tab: 0,
         });
 
         assert_eq!(mgr.display_name_for("alpha"), "src (proj-a)");
@@ -621,6 +632,8 @@ mod tests {
                 cwd: "/home/user/myapp".to_string(),
             },
             panes: vec![],
+            tabs: vec![],
+            active_tab: 0,
         });
         assert_eq!(mgr.display_name_for("eagle"), "myapp");
     }

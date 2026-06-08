@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
-use kmux_protocol::messages::{ClientCapabilities, InputMode, SessionStatus};
+use kmux_protocol::messages::{ClientCapabilities, InputMode, LayoutNode, SessionStatus};
 use kmux_pty::config::{EnvBuilder, PtyConfig};
 use tracing::warn;
 
@@ -165,10 +165,73 @@ impl ServerApp {
                 continue;
             }
 
+            // Reconcile the persisted tabs against the panes that actually
+            // restored: drop dead leaves (collapsing splits) and tabs whose
+            // panes all failed, and refocus if the focused pane is gone.
+            let mut tabs: Vec<super::TabState> = Vec::new();
+            for pt in &persisted_session.tabs {
+                let mut layout = pt.layout.clone();
+                let missing: Vec<u32> = layout
+                    .leaves()
+                    .into_iter()
+                    .filter(|i| !panes_map.contains_key(i))
+                    .collect();
+                for m in missing {
+                    super::layout::remove_pane(&mut layout, m);
+                }
+                let live: Vec<u32> = layout
+                    .leaves()
+                    .into_iter()
+                    .filter(|i| panes_map.contains_key(i))
+                    .collect();
+                if live.is_empty() {
+                    continue;
+                }
+                let focused = if panes_map.contains_key(&pt.focused_pane) {
+                    pt.focused_pane
+                } else {
+                    live[0]
+                };
+                tabs.push(super::TabState {
+                    tab_index: pt.tab_index,
+                    name: pt.name.clone(),
+                    layout,
+                    focused_pane: focused,
+                });
+            }
+            // Fallback for a checkpoint with no usable tabs: wrap each restored
+            // pane in its own single-pane tab.
+            if tabs.is_empty() {
+                let mut indices: Vec<u32> = panes_map.keys().copied().collect();
+                indices.sort_unstable();
+                for (i, idx) in indices.into_iter().enumerate() {
+                    tabs.push(super::TabState {
+                        tab_index: i as u32,
+                        name: format!("{}", i + 1),
+                        layout: LayoutNode::single(idx),
+                        focused_pane: idx,
+                    });
+                }
+            }
+            let next_tab_index = persisted_session
+                .next_tab_index
+                .max(tabs.iter().map(|t| t.tab_index + 1).max().unwrap_or(0));
+            let active_tab = if tabs
+                .iter()
+                .any(|t| t.tab_index == persisted_session.active_tab)
+            {
+                persisted_session.active_tab
+            } else {
+                tabs[0].tab_index
+            };
+
             let session_state = SessionState {
                 meta: persisted_session.meta.clone(),
                 panes: panes_map,
                 next_pane_index: persisted_session.next_pane_index,
+                tabs,
+                next_tab_index,
+                active_tab,
             };
 
             self.sessions

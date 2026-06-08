@@ -8,7 +8,9 @@
 pub mod checkpoint;
 pub mod restore;
 
-use kmux_protocol::messages::{CellState, GridSnapshot, SessionMeta, SessionStatus, TermSize};
+use kmux_protocol::messages::{
+    CellState, GridSnapshot, LayoutNode, SessionMeta, SessionStatus, TermSize,
+};
 use serde::{Deserialize, Serialize};
 
 /// Current format version. Increment when making breaking schema changes.
@@ -17,7 +19,11 @@ use serde::{Deserialize, Serialize};
 /// - `version == STATE_VERSION`: deserialize as-is.
 /// - `version < STATE_VERSION`: run migration chain.
 /// - `version > STATE_VERSION`: refuse (written by a newer daemon).
-pub const STATE_VERSION: u32 = 2;
+///
+/// v2 → v3: `PersistedSession` gains a `tabs` layout layer (Session → Tab →
+/// Pane). v2 checkpoints migrate by wrapping each pane in its own single-pane
+/// tab, preserving the pre-tab "each pane is a switchable view" behavior.
+pub const STATE_VERSION: u32 = 3;
 
 /// On-disk terminal size representation.
 ///
@@ -77,6 +83,21 @@ pub struct PersistedSession {
     pub next_pane_index: u32,
     /// All panes in this session.
     pub panes: Vec<PersistedPane>,
+    /// The session's tabs (tiling layouts over the panes).
+    pub tabs: Vec<PersistedTab>,
+    /// Next tab index to assign within this session.
+    pub next_tab_index: u32,
+    /// Default/restored tab view.
+    pub active_tab: u32,
+}
+
+/// One persisted tab: a named layout tree over the session's panes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedTab {
+    pub tab_index: u32,
+    pub name: String,
+    pub layout: LayoutNode,
+    pub focused_pane: u32,
 }
 
 /// One persisted pane.
@@ -157,6 +178,14 @@ mod tests {
                     scrollback_lines: vec![vec![kmux_protocol::messages::CellState::default(); 80]],
                     cwd: "/home/user/project".to_string(),
                 }],
+                tabs: vec![PersistedTab {
+                    tab_index: 0,
+                    name: "1".to_string(),
+                    layout: LayoutNode::single(0),
+                    focused_pane: 0,
+                }],
+                next_tab_index: 1,
+                active_tab: 0,
             }],
         }
     }
