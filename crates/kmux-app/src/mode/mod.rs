@@ -77,11 +77,21 @@ pub enum Action {
     RenameSubmit,
     Disconnect,
 
-    // Pane management
+    // Pane / tab management.
+    // (`CreatePane`/`NextPane`/`PrevPane` map to tab operations — the
+    // user-facing "pane" the chrome shows as a tab is now a Tab.)
     CreatePane,
     ClosePane,
     NextPane,
     PrevPane,
+
+    // Tiling: split the focused pane and move focus between tiled panes.
+    SplitRight,
+    SplitDown,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
 
     // Session picker
     CloseSessionPicker,

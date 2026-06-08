@@ -45,8 +45,18 @@ impl AppCore {
             }
             Action::NextSession => self.mgr.cycle_session(1),
             Action::PrevSession => self.mgr.cycle_session(-1),
-            Action::NextPane => self.mgr.cycle_pane(1),
-            Action::PrevPane => self.mgr.cycle_pane(-1),
+            Action::NextPane => self.mgr.cycle_tab(1),
+            Action::PrevPane => self.mgr.cycle_tab(-1),
+            Action::SplitRight => self
+                .mgr
+                .split_focused(kmux_protocol::messages::SplitDir::Horizontal),
+            Action::SplitDown => self
+                .mgr
+                .split_focused(kmux_protocol::messages::SplitDir::Vertical),
+            Action::FocusLeft => self.focus_dir(crate::layout::FocusDir::Left),
+            Action::FocusRight => self.focus_dir(crate::layout::FocusDir::Right),
+            Action::FocusUp => self.focus_dir(crate::layout::FocusDir::Up),
+            Action::FocusDown => self.focus_dir(crate::layout::FocusDir::Down),
             Action::JumpToSession(idx) => {
                 if idx < self.mgr.session_list().len() {
                     let word_id = self.mgr.session_list()[idx].meta.word_id.clone();
@@ -397,6 +407,34 @@ impl AppCore {
         }
 
         KeyResult::Continue
+    }
+
+    /// Move keyboard focus to the tiled pane in `dir` from the focused pane,
+    /// resolving the active tab's layout against the current content size and
+    /// picking the geometric neighbor.
+    fn focus_dir(&mut self, dir: crate::layout::FocusDir) {
+        let Some(layout) = self.mgr.active_layout().cloned() else {
+            return;
+        };
+        let Some(focused) = self
+            .mgr
+            .active_pane_id()
+            .and_then(|p| p.rsplit_once('/'))
+            .and_then(|(_, i)| i.parse::<u32>().ok())
+        else {
+            return;
+        };
+        let rects = crate::layout::resolve_layout(
+            &layout,
+            self.term_size.cols,
+            self.term_size.rows,
+            &crate::layout::LayoutConfig::default(),
+        );
+        if let Some(target) = crate::layout::focus_neighbor(&rects, focused, dir)
+            && let Some(word) = self.mgr.active_session().map(|s| s.to_string())
+        {
+            self.mgr.focus_pane(format!("{word}/{target}"));
+        }
     }
 
     fn command_hint_up(&mut self) {
