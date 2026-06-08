@@ -858,7 +858,10 @@ mod tests {
         mgr.active_tab = Some(0);
         mgr.active_pane = Some("eagle/1".into());
         // Unzoomed: the full tree renders.
-        assert!(matches!(mgr.render_layout(), Some(LayoutNode::Split { .. })));
+        assert!(matches!(
+            mgr.render_layout(),
+            Some(LayoutNode::Split { .. })
+        ));
         // Zoomed: only the focused pane (leaf 1) renders full-area.
         mgr.toggle_zoom();
         assert!(mgr.is_zoomed());
