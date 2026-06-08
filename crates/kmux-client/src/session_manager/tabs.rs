@@ -194,6 +194,24 @@ impl SessionManager {
     // which owns the resolver: it computes the target pane via
     // `layout::focus_neighbor` and calls `focus_pane` above.
 
+    /// Resize a split in the active tab: set the child weights of the `Split`
+    /// addressed by `path` (a child-index descent from the layout root). The new
+    /// ratios are computed by the frontend's resolver (`kmux_app::layout`); the
+    /// server clamps to its minimum, renormalizes to 1000, and broadcasts the
+    /// authoritative `LayoutUpdate`. No-op when there is no active session/tab.
+    pub fn set_layout_ratios(&mut self, path: Vec<u32>, ratios: Vec<u16>) {
+        let (Some(word_id), Some(tab_index)) = (self.active_session.clone(), self.active_tab)
+        else {
+            return;
+        };
+        self.send_ws(ClientMessage::SetLayoutRatios {
+            word_id,
+            tab_index,
+            path,
+            ratios,
+        });
+    }
+
     // ── Split / new-tab intents ──────────────────────────────────────────────
 
     /// Split the focused pane in the active tab, spawning a new pane in `dir`.

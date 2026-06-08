@@ -57,6 +57,10 @@ impl AppCore {
             Action::FocusRight => self.focus_dir(crate::layout::FocusDir::Right),
             Action::FocusUp => self.focus_dir(crate::layout::FocusDir::Up),
             Action::FocusDown => self.focus_dir(crate::layout::FocusDir::Down),
+            Action::ResizeLeft => self.resize(crate::layout::FocusDir::Left),
+            Action::ResizeRight => self.resize(crate::layout::FocusDir::Right),
+            Action::ResizeUp => self.resize(crate::layout::FocusDir::Up),
+            Action::ResizeDown => self.resize(crate::layout::FocusDir::Down),
             Action::JumpToSession(idx) => {
                 if idx < self.mgr.session_list().len() {
                     let word_id = self.mgr.session_list()[idx].meta.word_id.clone();
@@ -434,6 +438,29 @@ impl AppCore {
             && let Some(word) = self.mgr.active_session().map(|s| s.to_string())
         {
             self.mgr.focus_pane(format!("{word}/{target}"));
+        }
+    }
+
+    /// Resize the focused pane's enclosing split in `dir` by one step. Computes
+    /// the new ratios from the shared (resolution-independent) tree and sends
+    /// them to the server, which clamps, renormalizes, and broadcasts the
+    /// authoritative `LayoutUpdate` back to every client viewing the tab.
+    fn resize(&mut self, dir: crate::layout::FocusDir) {
+        let Some(layout) = self.mgr.active_layout().cloned() else {
+            return;
+        };
+        let Some(focused) = self
+            .mgr
+            .active_pane_id()
+            .and_then(|p| p.rsplit_once('/'))
+            .and_then(|(_, i)| i.parse::<u32>().ok())
+        else {
+            return;
+        };
+        if let Some((path, ratios)) =
+            crate::layout::resize_split(&layout, focused, dir, crate::layout::RESIZE_STEP_PERMILLE)
+        {
+            self.mgr.set_layout_ratios(path, ratios);
         }
     }
 

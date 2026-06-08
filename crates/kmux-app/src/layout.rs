@@ -224,6 +224,127 @@ fn axis_overlap(a0: u16, a_len: u16, b0: u16, b_len: u16) -> u32 {
     hi.saturating_sub(lo)
 }
 
+// ── Keyboard resize ──────────────────────────────────────────────────────────
+
+/// Permille a single keyboard resize step shifts a split boundary (5%).
+pub const RESIZE_STEP_PERMILLE: u16 = 50;
+
+/// Lowest permille weight a resize leaves a child with, mirroring the server's
+/// `MIN_RATIO` so client and server agree on the clamp.
+const MIN_RESIZE_RATIO: i32 = 20;
+
+/// Compute the `SetLayoutRatios` payload to resize the `focused` pane in `dir`
+/// by `step` permille.
+///
+/// Finds the nearest ancestor [`LayoutNode::Split`] of the focused pane on the
+/// matching axis — `Horizontal` for `Left`/`Right`, `Vertical` for `Up`/`Down` —
+/// and shifts `step` permille across the boundary between the focused subtree and
+/// an adjacent sibling. `Right`/`Down` grow the focused pane; `Left`/`Up` shrink
+/// it, regardless of which boundary moves, so the four arrows map cleanly onto
+/// "wider/narrower/taller/shorter".
+///
+/// Returns `(path, new_ratios)` addressing that split (the `path` is a root
+/// child-index descent, the form [`crate::layout`]'s server counterpart
+/// `set_ratios` expects), or `None` when the focused pane has no resizable
+/// ancestor on that axis or the move clamps to a no-op.
+pub fn resize_split(
+    root: &LayoutNode,
+    focused: u32,
+    dir: FocusDir,
+    step: u16,
+) -> Option<(Vec<u32>, Vec<u16>)> {
+    let axis = match dir {
+        FocusDir::Left | FocusDir::Right => SplitDir::Horizontal,
+        FocusDir::Up | FocusDir::Down => SplitDir::Vertical,
+    };
+    let grow = matches!(dir, FocusDir::Right | FocusDir::Down);
+    let (path, child) = nearest_split_on_axis(root, focused, axis)?;
+    let LayoutNode::Split {
+        ratios, children, ..
+    } = node_at(root, &path)?
+    else {
+        return None;
+    };
+    let n = children.len();
+    if n < 2 {
+        return None;
+    }
+    // Trade `step` with the next sibling, or the previous one when the focused
+    // child is last. Either way the focused child gains (grow) or loses (shrink),
+    // so Left/Right purely change width and Up/Down purely change height.
+    let neighbor = if child + 1 < n { child + 1 } else { child - 1 };
+    let mut new = ratios.clone();
+    let delta = if grow { step as i32 } else { -(step as i32) };
+    shift_pair(&mut new, child, neighbor, delta);
+    if new == *ratios {
+        return None; // Clamped to a no-op (already at the minimum boundary).
+    }
+    Some((path, new))
+}
+
+/// Move `delta` permille into child `a` from child `b` (negative `delta` moves
+/// the other way), preserving their pairwise sum and clamping both to a minimum
+/// so neither collapses. Because only this pair changes, the split still sums to
+/// the same total (1000).
+fn shift_pair(ratios: &mut [u16], a: usize, b: usize, delta: i32) {
+    let total = ratios[a] as i32 + ratios[b] as i32;
+    if total < MIN_RESIZE_RATIO * 2 {
+        return;
+    }
+    let na = (ratios[a] as i32 + delta).clamp(MIN_RESIZE_RATIO, total - MIN_RESIZE_RATIO);
+    ratios[a] = na as u16;
+    ratios[b] = (total - na) as u16;
+}
+
+/// Path (root child-index descent) to the nearest ancestor `Split` of `focused`
+/// whose `dir == axis`, plus the index — within that split — of the child whose
+/// subtree contains `focused`. `None` if no such ancestor exists.
+fn nearest_split_on_axis(
+    root: &LayoutNode,
+    focused: u32,
+    axis: SplitDir,
+) -> Option<(Vec<u32>, usize)> {
+    let mut descent: Vec<(SplitDir, u32)> = Vec::new();
+    if !build_descent(root, focused, &mut descent) {
+        return None;
+    }
+    // The deepest split on the axis is the innermost (nearest) ancestor.
+    let k = descent.iter().rposition(|(d, _)| *d == axis)?;
+    let path = descent[..k].iter().map(|(_, c)| *c).collect();
+    Some((path, descent[k].1 as usize))
+}
+
+/// Record, for each `Split` on the path from `root` down to the leaf `focused`,
+/// its direction and the child index taken. Returns whether `focused` was found
+/// (leaving `acc` as the descent on success).
+fn build_descent(node: &LayoutNode, focused: u32, acc: &mut Vec<(SplitDir, u32)>) -> bool {
+    match node {
+        LayoutNode::Leaf { pane_index } => *pane_index == focused,
+        LayoutNode::Split { dir, children, .. } => {
+            for (i, child) in children.iter().enumerate() {
+                acc.push((*dir, i as u32));
+                if build_descent(child, focused, acc) {
+                    return true;
+                }
+                acc.pop();
+            }
+            false
+        }
+    }
+}
+
+/// The node reached by descending `path` (child indices) from `root`.
+fn node_at<'a>(root: &'a LayoutNode, path: &[u32]) -> Option<&'a LayoutNode> {
+    let mut node = root;
+    for &idx in path {
+        let LayoutNode::Split { children, .. } = node else {
+            return None;
+        };
+        node = children.get(idx as usize)?;
+    }
+    Some(node)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,5 +499,95 @@ mod tests {
         // From the top-right pane, down goes to the bottom-right pane.
         assert_eq!(focus_neighbor(&rects, 1, FocusDir::Down), Some(2));
         assert_eq!(focus_neighbor(&rects, 2, FocusDir::Up), Some(1));
+    }
+
+    fn hsplit(a: u32, b: u32) -> LayoutNode {
+        LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![500, 500],
+            children: vec![leaf(a), leaf(b)],
+        }
+    }
+
+    #[test]
+    fn resize_grows_focused_toward_next_sibling() {
+        // [0 | 1], focus 0, grow right: 0 takes from 1.
+        let tree = hsplit(0, 1);
+        let (path, ratios) = resize_split(&tree, 0, FocusDir::Right, 50).unwrap();
+        assert_eq!(path, Vec::<u32>::new(), "the root split is addressed by []");
+        assert_eq!(ratios, vec![550, 450]);
+        // The pairwise total is preserved, so the split still sums to 1000.
+        assert_eq!(ratios.iter().map(|&x| x as u32).sum::<u32>(), 1000);
+    }
+
+    #[test]
+    fn resize_shrinks_focused_toward_next_sibling() {
+        let tree = hsplit(0, 1);
+        let (_, ratios) = resize_split(&tree, 0, FocusDir::Left, 50).unwrap();
+        assert_eq!(ratios, vec![450, 550]);
+    }
+
+    #[test]
+    fn resize_last_child_trades_with_previous() {
+        // Focus the rightmost pane: growing right has no right sibling, so it
+        // steals from the left sibling (still gets wider).
+        let tree = hsplit(0, 1);
+        let (_, ratios) = resize_split(&tree, 1, FocusDir::Right, 50).unwrap();
+        assert_eq!(ratios, vec![450, 550]);
+        let (_, ratios) = resize_split(&tree, 1, FocusDir::Left, 50).unwrap();
+        assert_eq!(ratios, vec![550, 450]);
+    }
+
+    #[test]
+    fn resize_wrong_axis_returns_none() {
+        // A purely horizontal tree has no vertical split to resize.
+        let tree = hsplit(0, 1);
+        assert_eq!(resize_split(&tree, 0, FocusDir::Up, 50), None);
+        assert_eq!(resize_split(&tree, 0, FocusDir::Down, 50), None);
+    }
+
+    #[test]
+    fn resize_picks_nearest_ancestor_on_each_axis() {
+        // Left leaf 0; right half is a vertical split of 1 (top) / 2 (bottom).
+        let tree = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![500, 500],
+            children: vec![leaf(0), {
+                LayoutNode::Split {
+                    dir: SplitDir::Vertical,
+                    ratios: vec![500, 500],
+                    children: vec![leaf(1), leaf(2)],
+                }
+            }],
+        };
+        // Horizontal resize of pane 1 acts on the root split (child 1 = the
+        // right subtree), growing the whole right column.
+        let (path, ratios) = resize_split(&tree, 1, FocusDir::Right, 50).unwrap();
+        assert_eq!(path, Vec::<u32>::new());
+        assert_eq!(ratios, vec![450, 550]);
+        // Vertical resize of pane 1 acts on the inner split at path [1].
+        let (path, ratios) = resize_split(&tree, 1, FocusDir::Down, 50).unwrap();
+        assert_eq!(path, vec![1]);
+        assert_eq!(ratios, vec![550, 450]);
+    }
+
+    #[test]
+    fn resize_clamps_to_minimum_and_reports_no_op() {
+        // Both children already at the floor: a further shrink is a no-op.
+        let tree = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![20, 980],
+            children: vec![leaf(0), leaf(1)],
+        };
+        // Shrinking pane 0 further can't drop it below the minimum → None.
+        assert_eq!(resize_split(&tree, 0, FocusDir::Left, 50), None);
+        // Growing it is still fine.
+        let (_, ratios) = resize_split(&tree, 0, FocusDir::Right, 50).unwrap();
+        assert_eq!(ratios, vec![70, 930]);
+    }
+
+    #[test]
+    fn resize_root_leaf_returns_none() {
+        assert_eq!(resize_split(&leaf(0), 0, FocusDir::Right, 50), None);
     }
 }

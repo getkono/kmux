@@ -40,6 +40,24 @@ fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
         ("focus-right", Action::FocusRight, &["<Ctrl><Alt>Right"]),
         ("focus-up", Action::FocusUp, &["<Ctrl><Alt>Up"]),
         ("focus-down", Action::FocusDown, &["<Ctrl><Alt>Down"]),
+        // Resize the focused pane. Ctrl+Shift+Alt avoids the plain Ctrl+Alt
+        // arrows many window managers grab for workspace switching.
+        (
+            "resize-left",
+            Action::ResizeLeft,
+            &["<Ctrl><Shift><Alt>Left"],
+        ),
+        (
+            "resize-right",
+            Action::ResizeRight,
+            &["<Ctrl><Shift><Alt>Right"],
+        ),
+        ("resize-up", Action::ResizeUp, &["<Ctrl><Shift><Alt>Up"]),
+        (
+            "resize-down",
+            Action::ResizeDown,
+            &["<Ctrl><Shift><Alt>Down"],
+        ),
         ("new-session", Action::CreateSession, &["<Ctrl><Shift>n"]),
         ("close-session", Action::CloseSession, &["<Ctrl><Shift>w"]),
         ("rename-session", Action::RenameSession, &["F2"]),
@@ -280,6 +298,15 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;q</property><property name="title">Close pane</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;Right</property><property name="title">Next pane</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;Left</property><property name="title">Previous pane</property></object></child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">Tiling</property>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;backslash</property><property name="title">Split right</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;minus</property><property name="title">Split down</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Alt&gt;Left &lt;Ctrl&gt;&lt;Alt&gt;Right &lt;Ctrl&gt;&lt;Alt&gt;Up &lt;Ctrl&gt;&lt;Alt&gt;Down</property><property name="title">Move focus between panes</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;&lt;Alt&gt;Left &lt;Ctrl&gt;&lt;Shift&gt;&lt;Alt&gt;Right &lt;Ctrl&gt;&lt;Shift&gt;&lt;Alt&gt;Up &lt;Ctrl&gt;&lt;Shift&gt;&lt;Alt&gt;Down</property><property name="title">Resize focused pane</property></object></child>
           </object>
         </child>
         <child>

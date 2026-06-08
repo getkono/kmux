@@ -85,13 +85,18 @@ pub enum Action {
     NextPane,
     PrevPane,
 
-    // Tiling: split the focused pane and move focus between tiled panes.
+    // Tiling: split the focused pane, move focus between tiled panes, and resize
+    // the focused pane's enclosing split.
     SplitRight,
     SplitDown,
     FocusLeft,
     FocusRight,
     FocusUp,
     FocusDown,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
 
     // Session picker
     CloseSessionPicker,

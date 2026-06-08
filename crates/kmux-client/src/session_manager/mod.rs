@@ -712,6 +712,37 @@ mod tests {
     }
 
     #[test]
+    fn set_layout_ratios_sends_for_active_tab() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.active_session = Some("eagle".to_string());
+        mgr.active_tab = Some(0);
+        mgr.set_layout_ratios(vec![1], vec![550, 450]);
+        match rx.try_recv() {
+            Ok(ClientMessage::SetLayoutRatios {
+                word_id,
+                tab_index,
+                path,
+                ratios,
+            }) => {
+                assert_eq!(word_id, "eagle");
+                assert_eq!(tab_index, 0);
+                assert_eq!(path, vec![1]);
+                assert_eq!(ratios, vec![550, 450]);
+            }
+            other => panic!("expected SetLayoutRatios, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_layout_ratios_noop_without_active_tab() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.active_session = Some("eagle".to_string());
+        mgr.active_tab = None;
+        mgr.set_layout_ratios(vec![], vec![500, 500]);
+        assert!(rx.try_recv().is_err(), "no message without an active tab");
+    }
+
+    #[test]
     fn display_name_disambiguation() {
         let mut mgr = make_manager();
         // Two sessions with the same basename "src" but different parent dirs
