@@ -29,7 +29,7 @@ fn cfg() -> LayoutConfig {
 pub fn push_sizes(fe: &Rc<RefCell<Frontend>>, width_px: i32, height_px: i32) {
     let mut f = fe.borrow_mut();
     let (cols, rows) = f.metrics.cols_rows(width_px, height_px);
-    let Some(layout) = f.core.mgr.active_layout().cloned() else {
+    let Some(layout) = f.core.mgr.render_layout() else {
         return;
     };
     let Some(word) = f.core.mgr.active_session().map(str::to_string) else {
@@ -64,7 +64,7 @@ pub fn pane_at(
 ) -> Option<String> {
     let f = fe.borrow();
     let (cols, rows) = f.metrics.cols_rows(width_px, height_px);
-    let layout = f.core.mgr.active_layout().cloned()?;
+    let layout = f.core.mgr.render_layout()?;
     let word = f.core.mgr.active_session()?.to_string();
     let (cw, ch) = (f.metrics.cell_w, f.metrics.cell_h);
     for r in resolve_layout(&layout, cols, rows, &cfg()) {

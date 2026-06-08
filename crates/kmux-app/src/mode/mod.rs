@@ -109,6 +109,10 @@ pub enum Action {
     /// the moved pane to its new slot).
     SwapNext,
     SwapPrev,
+    /// Regenerate the active tab into the next preset layout (tmux next-layout).
+    CycleLayout,
+    /// Toggle tmux-style zoom of the focused pane (client-local view flag).
+    ToggleZoom,
 
     // Session picker
     CloseSessionPicker,

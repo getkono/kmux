@@ -70,6 +70,11 @@ pub struct SessionManager {
     /// A pane the client created and wants to focus once the refreshed session
     /// list (carrying its new tab) arrives.
     pub(super) pending_select_pane: Option<PaneId>,
+    /// Client-local view flag: when set, only the focused pane is rendered/sized
+    /// (full content area), à la tmux zoom. Does not mutate the shared tree.
+    pub(super) zoomed: bool,
+    /// Rotating index into the preset [`LayoutScheme`]s for `cycle_layout`.
+    pub(super) layout_scheme_idx: usize,
     /// Terminal buffers keyed by pane_id.
     pub buffers: HashMap<PaneId, CellGrid>,
     pub(super) pane_sync: HashMap<PaneId, PaneSync>,
@@ -142,6 +147,8 @@ impl SessionManager {
             visible_panes: Vec::new(),
             pane_sizes: HashMap::new(),
             pending_select_pane: None,
+            zoomed: false,
+            layout_scheme_idx: 0,
             buffers: HashMap::new(),
             pane_sync: HashMap::new(),
             input_locked: HashMap::new(),
@@ -789,6 +796,73 @@ mod tests {
         mgr.active_pane = Some("eagle/0".into());
         mgr.swap_focused(1);
         assert!(rx.try_recv().is_err(), "single-pane tab cannot swap");
+    }
+
+    #[test]
+    fn apply_scheme_sends_apply_layout_scheme() {
+        use kmux_protocol::messages::LayoutScheme;
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.active_session = Some("eagle".into());
+        mgr.active_tab = Some(0);
+        mgr.apply_scheme(LayoutScheme::EvenVertical);
+        match rx.try_recv() {
+            Ok(ClientMessage::ApplyLayoutScheme {
+                word_id,
+                tab_index,
+                scheme,
+            }) => {
+                assert_eq!(word_id, "eagle");
+                assert_eq!(tab_index, 0);
+                assert_eq!(scheme, LayoutScheme::EvenVertical);
+            }
+            other => panic!("expected ApplyLayoutScheme, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cycle_layout_advances_through_presets() {
+        use kmux_protocol::messages::LayoutScheme;
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.active_session = Some("eagle".into());
+        mgr.active_tab = Some(0);
+        // First cycle steps idx 0 → 1, the second preset (EvenVertical).
+        mgr.cycle_layout();
+        match rx.try_recv() {
+            Ok(ClientMessage::ApplyLayoutScheme { scheme, .. }) => {
+                assert_eq!(scheme, LayoutScheme::EvenVertical);
+            }
+            other => panic!("expected ApplyLayoutScheme, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_layout_collapses_to_focused_when_zoomed() {
+        use kmux_protocol::messages::{LayoutNode, SplitDir, TabInfo};
+        let mut mgr = make_manager();
+        let mut entry = make_entry("eagle", "/p");
+        entry.tabs = vec![TabInfo {
+            tab_index: 0,
+            name: "1".into(),
+            layout: LayoutNode::Split {
+                dir: SplitDir::Horizontal,
+                ratios: vec![500, 500],
+                children: vec![
+                    LayoutNode::Leaf { pane_index: 0 },
+                    LayoutNode::Leaf { pane_index: 1 },
+                ],
+            },
+            focused_pane: 1,
+        }];
+        mgr.session_list.push(entry);
+        mgr.active_session = Some("eagle".into());
+        mgr.active_tab = Some(0);
+        mgr.active_pane = Some("eagle/1".into());
+        // Unzoomed: the full tree renders.
+        assert!(matches!(mgr.render_layout(), Some(LayoutNode::Split { .. })));
+        // Zoomed: only the focused pane (leaf 1) renders full-area.
+        mgr.toggle_zoom();
+        assert!(mgr.is_zoomed());
+        assert_eq!(mgr.render_layout(), Some(LayoutNode::single(1)));
     }
 
     #[test]

@@ -7,9 +7,17 @@
 //! target — within that set. The layout tree + shared focus live on the server;
 //! the client mirrors them from `LayoutUpdate` / the session list.
 
-use kmux_protocol::messages::{ClientMessage, LayoutNode, PaneId, TabInfo, TermSize};
+use kmux_protocol::messages::{ClientMessage, LayoutNode, LayoutScheme, PaneId, TabInfo, TermSize};
 
 use super::SessionManager;
+
+/// The preset layouts [`SessionManager::cycle_layout`] rotates through.
+const LAYOUT_SCHEMES: [LayoutScheme; 4] = [
+    LayoutScheme::EvenHorizontal,
+    LayoutScheme::EvenVertical,
+    LayoutScheme::MainVertical,
+    LayoutScheme::MainHorizontal,
+];
 
 impl SessionManager {
     // ── Accessors ───────────────────────────────────────────────────────────
@@ -105,6 +113,58 @@ impl SessionManager {
                 self.send_ws(ClientMessage::Resize { pane_id, size });
             }
         }
+    }
+
+    // ── Tiling schemes + zoom ────────────────────────────────────────────────
+
+    /// Apply the next preset layout to the active tab (tmux-style "next-layout").
+    pub fn cycle_layout(&mut self) {
+        self.layout_scheme_idx = (self.layout_scheme_idx + 1) % LAYOUT_SCHEMES.len();
+        self.apply_scheme(LAYOUT_SCHEMES[self.layout_scheme_idx]);
+    }
+
+    /// Regenerate the active tab's layout into a preset `scheme`
+    /// (server-authoritative: the server rebuilds the tree and broadcasts it).
+    pub fn apply_scheme(&mut self, scheme: LayoutScheme) {
+        let (Some(word_id), Some(tab_index)) = (self.active_session.clone(), self.active_tab)
+        else {
+            return;
+        };
+        self.send_ws(ClientMessage::ApplyLayoutScheme {
+            word_id,
+            tab_index,
+            scheme,
+        });
+    }
+
+    /// Toggle tmux-style zoom of the focused pane — a client-local view flag that
+    /// renders/sizes only the focused pane full-area, without mutating the shared
+    /// tree.
+    pub fn toggle_zoom(&mut self) {
+        self.zoomed = !self.zoomed;
+    }
+
+    /// Whether zoom is currently active.
+    pub fn is_zoomed(&self) -> bool {
+        self.zoomed
+    }
+
+    /// The layout the frontend should render/size against: the active tab's tree,
+    /// or — when zoomed — a single-leaf layout of just the focused pane. `None`
+    /// when there is no active tab. Frontends use this instead of
+    /// [`active_layout`](Self::active_layout) for rendering and sizing.
+    pub fn render_layout(&self) -> Option<LayoutNode> {
+        let layout = self.active_layout()?;
+        if self.zoomed
+            && let Some(idx) = self
+                .active_pane
+                .as_ref()
+                .and_then(|p| p.rsplit_once('/'))
+                .and_then(|(_, i)| i.parse::<u32>().ok())
+        {
+            return Some(LayoutNode::single(idx));
+        }
+        Some(layout.clone())
     }
 
     // ── Visible-set management ───────────────────────────────────────────────

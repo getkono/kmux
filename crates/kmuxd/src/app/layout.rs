@@ -9,7 +9,7 @@
 //! Ratios are **permille** (`u16`, summing to 1000). All mutations renormalize
 //! so the invariant holds, keeping the tree deterministic across clients.
 
-use kmux_protocol::messages::{LayoutNode, SplitDir};
+use kmux_protocol::messages::{LayoutNode, LayoutScheme, SplitDir};
 
 /// Lowest permille weight a child may hold, so a pane can never be fully
 /// collapsed to zero by a resize. Cell-level minimums are enforced separately
@@ -272,6 +272,63 @@ fn is_leaf(pane_index: u32) -> impl Fn(&LayoutNode) -> bool {
     move |n: &LayoutNode| matches!(n, LayoutNode::Leaf { pane_index: p } if *p == pane_index)
 }
 
+/// Regenerate a tree from `leaves` (in order) into a preset [`LayoutScheme`]. A
+/// single pane is always a bare leaf regardless of scheme.
+pub fn apply_scheme(leaves: &[u32], scheme: LayoutScheme) -> LayoutNode {
+    match leaves {
+        [] => LayoutNode::single(0),
+        [only] => LayoutNode::single(*only),
+        _ => match scheme {
+            LayoutScheme::EvenHorizontal => even_split(leaves, SplitDir::Horizontal),
+            LayoutScheme::EvenVertical => even_split(leaves, SplitDir::Vertical),
+            // Main on the left (horizontal outer split), stack in a right column.
+            LayoutScheme::MainVertical => {
+                main_split(leaves, SplitDir::Horizontal, SplitDir::Vertical)
+            }
+            // Main on top (vertical outer split), stack in a bottom row.
+            LayoutScheme::MainHorizontal => {
+                main_split(leaves, SplitDir::Vertical, SplitDir::Horizontal)
+            }
+        },
+    }
+}
+
+/// One flat split of all `leaves` in `dir`, evenly weighted.
+fn even_split(leaves: &[u32], dir: SplitDir) -> LayoutNode {
+    let n = leaves.len();
+    let mut ratios = vec![(1000 / n) as u16; n];
+    normalize(&mut ratios);
+    LayoutNode::Split {
+        dir,
+        ratios,
+        children: leaves
+            .iter()
+            .map(|&p| LayoutNode::Leaf { pane_index: p })
+            .collect(),
+    }
+}
+
+/// The first leaf as a ~50% "main" pane split off in `outer`; the rest evenly
+/// arranged in `inner` as the stack.
+fn main_split(leaves: &[u32], outer: SplitDir, inner: SplitDir) -> LayoutNode {
+    let main = LayoutNode::Leaf {
+        pane_index: leaves[0],
+    };
+    let rest = &leaves[1..];
+    let stack = if rest.len() == 1 {
+        LayoutNode::Leaf {
+            pane_index: rest[0],
+        }
+    } else {
+        even_split(rest, inner)
+    };
+    LayoutNode::Split {
+        dir: outer,
+        ratios: vec![500, 500],
+        children: vec![main, stack],
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -433,6 +490,67 @@ mod tests {
         assert_eq!(tree.leaves(), vec![2, 1, 0]);
         // Swapping a non-existent pane fails.
         assert!(!swap(&mut tree, 0, 99));
+    }
+
+    #[test]
+    fn scheme_even_horizontal_is_one_flat_row() {
+        let tree = apply_scheme(&[0, 1, 2], LayoutScheme::EvenHorizontal);
+        match &tree {
+            LayoutNode::Split { dir, children, .. } => {
+                assert_eq!(*dir, SplitDir::Horizontal);
+                assert_eq!(children.len(), 3);
+                assert!(
+                    children
+                        .iter()
+                        .all(|c| matches!(c, LayoutNode::Leaf { .. }))
+                );
+            }
+            _ => panic!("expected split"),
+        }
+        assert_eq!(tree.leaves(), vec![0, 1, 2]);
+        assert_well_formed(&tree);
+    }
+
+    #[test]
+    fn scheme_main_vertical_is_main_plus_stack() {
+        // Main pane 0 on the left; 1 & 2 stacked on the right.
+        let tree = apply_scheme(&[0, 1, 2], LayoutScheme::MainVertical);
+        match &tree {
+            LayoutNode::Split { dir, children, .. } => {
+                assert_eq!(*dir, SplitDir::Horizontal);
+                assert_eq!(children.len(), 2);
+                assert!(matches!(children[0], LayoutNode::Leaf { pane_index: 0 }));
+                match &children[1] {
+                    LayoutNode::Split { dir, children, .. } => {
+                        assert_eq!(*dir, SplitDir::Vertical);
+                        assert_eq!(children.len(), 2);
+                    }
+                    _ => panic!("stack should be a split"),
+                }
+            }
+            _ => panic!("expected split"),
+        }
+        assert_eq!(tree.leaves(), vec![0, 1, 2]);
+        assert_well_formed(&tree);
+    }
+
+    #[test]
+    fn scheme_single_pane_stays_a_leaf() {
+        assert_eq!(apply_scheme(&[5], LayoutScheme::MainVertical), leaf(5));
+    }
+
+    #[test]
+    fn scheme_two_panes_main_is_a_simple_split() {
+        // With only one pane in the stack, the stack is a bare leaf, not a split.
+        let tree = apply_scheme(&[0, 1], LayoutScheme::MainHorizontal);
+        match &tree {
+            LayoutNode::Split { dir, children, .. } => {
+                assert_eq!(*dir, SplitDir::Vertical);
+                assert!(matches!(children[1], LayoutNode::Leaf { pane_index: 1 }));
+            }
+            _ => panic!("expected split"),
+        }
+        assert_well_formed(&tree);
     }
 
     #[test]

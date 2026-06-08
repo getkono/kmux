@@ -109,7 +109,7 @@ pub fn render_tiled(
     src(cr, palette.bg.r, palette.bg.g, palette.bg.b);
     let _ = cr.paint();
 
-    let Some(layout) = core.mgr.active_layout().cloned() else {
+    let Some(layout) = core.mgr.render_layout() else {
         // No tab: single active grid, or the no-session placeholder.
         match core.mgr.active_grid() {
             Some(grid) => paint_grid(grid, cr, ctx, metrics, palette, width, height, cursor_phase),

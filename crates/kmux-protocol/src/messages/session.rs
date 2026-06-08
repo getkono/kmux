@@ -136,6 +136,21 @@ pub enum SplitDir {
     Vertical,
 }
 
+/// A preset tiling arrangement the server regenerates a tab's [`LayoutNode`] tree
+/// into from its current set of panes (in their existing leaf order), à la tmux's
+/// preset layouts. Used by `ApplyLayoutScheme`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LayoutScheme {
+    /// All panes in a single row (one horizontal split).
+    EvenHorizontal,
+    /// All panes in a single column (one vertical split).
+    EvenVertical,
+    /// A large "main" pane on the left; the rest stacked in a column on the right.
+    MainVertical,
+    /// A large "main" pane on top; the rest in a row along the bottom.
+    MainHorizontal,
+}
+
 /// A resolution-independent tiling layout for one tab.
 ///
 /// Leaves reference a pane by its session-local `pane_index`; `Split` nodes hold

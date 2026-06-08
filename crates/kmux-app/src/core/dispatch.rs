@@ -77,6 +77,8 @@ impl AppCore {
             Action::ResizeDown => self.resize(crate::layout::FocusDir::Down),
             Action::SwapNext => self.mgr.swap_focused(1),
             Action::SwapPrev => self.mgr.swap_focused(-1),
+            Action::CycleLayout => self.mgr.cycle_layout(),
+            Action::ToggleZoom => self.mgr.toggle_zoom(),
             Action::JumpToSession(idx) => {
                 if idx < self.mgr.session_list().len() {
                     let word_id = self.mgr.session_list()[idx].meta.word_id.clone();

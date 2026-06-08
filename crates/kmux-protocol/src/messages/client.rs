@@ -1,8 +1,8 @@
 use super::category::MessageCategory;
 use super::key::KeyEvent;
 use super::session::{
-    ClientCapabilities, ConnectionId, PaneId, RequestId, SequenceNo, SplitDir, TabIndex, TermSize,
-    WordId,
+    ClientCapabilities, ConnectionId, LayoutScheme, PaneId, RequestId, SequenceNo, SplitDir,
+    TabIndex, TermSize, WordId,
 };
 
 /// Messages sent from client -> server.
@@ -142,6 +142,14 @@ pub enum ClientMessage {
         ratios: Vec<u16>,
     },
 
+    /// Regenerate a tab's layout tree into a preset arrangement (tmux-style) from
+    /// its current panes. The server rebuilds the tree and broadcasts the result.
+    ApplyLayoutScheme {
+        word_id: WordId,
+        tab_index: TabIndex,
+        scheme: LayoutScheme,
+    },
+
     /// Set which pane has input focus within a tab (the shared, server-tracked
     /// focus). Broadcast to all clients viewing the tab.
     SetFocus {
@@ -253,6 +261,7 @@ impl ClientMessage {
             | Self::PaneSplit { .. }
             | Self::PaneSwap { .. }
             | Self::SetLayoutRatios { .. }
+            | Self::ApplyLayoutScheme { .. }
             | Self::SetFocus { .. }
             | Self::Resize { .. }
             | Self::Attach { .. }
@@ -376,6 +385,29 @@ mod tests {
     fn version_mismatch_hint_not_a_mismatch() {
         let hint = version_mismatch_hint("invalid token");
         assert!(hint.is_empty());
+    }
+
+    #[test]
+    fn apply_layout_scheme_roundtrips() {
+        use super::super::session::LayoutScheme;
+        let msg = ClientMessage::ApplyLayoutScheme {
+            word_id: "eagle".into(),
+            tab_index: 2,
+            scheme: LayoutScheme::MainHorizontal,
+        };
+        let bytes = crate::encode_client(&msg).unwrap();
+        match crate::decode_client(&bytes).unwrap() {
+            ClientMessage::ApplyLayoutScheme {
+                word_id,
+                tab_index,
+                scheme,
+            } => {
+                assert_eq!(word_id, "eagle");
+                assert_eq!(tab_index, 2);
+                assert_eq!(scheme, LayoutScheme::MainHorizontal);
+            }
+            other => panic!("expected ApplyLayoutScheme, got {other:?}"),
+        }
     }
 
     #[test]
@@ -576,6 +608,14 @@ mod tests {
                     tab_index: 0,
                     path: vec![],
                     ratios: vec![500, 500],
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::ApplyLayoutScheme {
+                    word_id: "w".into(),
+                    tab_index: 0,
+                    scheme: super::super::session::LayoutScheme::MainVertical,
                 },
                 MessageCategory::Control,
             ),

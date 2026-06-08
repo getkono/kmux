@@ -356,6 +356,22 @@ pub async fn handle_message<A: PaneAttacher>(
             }
         }
 
+        ClientMessage::ApplyLayoutScheme {
+            word_id,
+            tab_index,
+            scheme,
+        } => {
+            if let Ok((layout, focused)) = state
+                .app
+                .apply_layout_scheme(&word_id, tab_index, scheme)
+                .await
+            {
+                state
+                    .app
+                    .broadcast_layout(&word_id, tab_index, layout, focused);
+            }
+        }
+
         ClientMessage::SetFocus {
             word_id,
             tab_index,

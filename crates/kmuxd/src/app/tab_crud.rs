@@ -9,7 +9,8 @@
 use std::path::PathBuf;
 
 use kmux_protocol::messages::{
-    ClientCapabilities, LayoutNode, PaneInfo, SessionStatus, SplitDir, TabInfo, TermSize,
+    ClientCapabilities, LayoutNode, LayoutScheme, PaneInfo, SessionStatus, SplitDir, TabInfo,
+    TermSize,
 };
 use kmux_pty::error::{KmuxError, Result};
 
@@ -295,6 +296,30 @@ impl ServerApp {
                 name: format!("{word_id} tab {tab_index}"),
             })?;
         layout::set_ratios(&mut tab.layout, path, ratios);
+        Ok((tab.layout.clone(), tab.focused_pane))
+    }
+
+    /// Regenerate a tab's layout into a preset [`LayoutScheme`] from its current
+    /// panes (in leaf order). Returns the new layout + focus.
+    pub async fn apply_layout_scheme(
+        &self,
+        word_id: &str,
+        tab_index: u32,
+        scheme: LayoutScheme,
+    ) -> Result<(LayoutNode, u32)> {
+        let mut sessions = self.sessions.write().await;
+        let state = sessions
+            .get_mut(word_id)
+            .ok_or_else(|| KmuxError::SessionNotFound {
+                name: word_id.to_string(),
+            })?;
+        let tab = state
+            .tab_mut(tab_index)
+            .ok_or_else(|| KmuxError::SessionNotFound {
+                name: format!("{word_id} tab {tab_index}"),
+            })?;
+        let leaves = tab.layout.leaves();
+        tab.layout = layout::apply_scheme(&leaves, scheme);
         Ok((tab.layout.clone(), tab.focused_pane))
     }
 
