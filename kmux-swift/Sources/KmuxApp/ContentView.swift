@@ -179,6 +179,11 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut("]", modifiers: [.command, .control])
             Button("Move Pane Back") { model.dispatch(.swapPrev) }
                 .keyboardShortcut("[", modifiers: [.command, .control])
+            Divider()
+            Button("Cycle Layout") { model.dispatch(.cycleLayout) }
+                .keyboardShortcut(" ", modifiers: [.command, .shift])
+            Button("Toggle Zoom") { model.dispatch(.toggleZoom) }
+                .keyboardShortcut("z", modifiers: [.command, .control])
             Button("Close Pane") { model.dispatch(.closePane) }
                 .keyboardShortcut("w", modifiers: [.command, .shift])
         }

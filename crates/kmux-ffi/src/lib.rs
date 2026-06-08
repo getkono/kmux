@@ -68,7 +68,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 3;
+pub const KMUX_FFI_ABI_VERSION: u32 = 4;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -156,6 +156,8 @@ pub enum FfiAction {
     ResizeDown,
     SwapNext,
     SwapPrev,
+    CycleLayout,
+    ToggleZoom,
     ScrollUp { lines: u32 },
     ScrollDown { lines: u32 },
     ScrollPageUp,
@@ -195,6 +197,8 @@ impl From<FfiAction> for Action {
             FfiAction::ResizeDown => Action::ResizeDown,
             FfiAction::SwapNext => Action::SwapNext,
             FfiAction::SwapPrev => Action::SwapPrev,
+            FfiAction::CycleLayout => Action::CycleLayout,
+            FfiAction::ToggleZoom => Action::ToggleZoom,
             FfiAction::ScrollUp { lines } => Action::ScrollUp(lines as usize),
             FfiAction::ScrollDown { lines } => Action::ScrollDown(lines as usize),
             FfiAction::ScrollPageUp => Action::ScrollPageUp,
@@ -924,11 +928,12 @@ impl KmuxDriver {
             .active_pane_id()
             .and_then(|p| p.rsplit_once('/'))
             .and_then(|(_, i)| i.parse::<u32>().ok());
-        let Some(layout) = d.mgr.active_layout() else {
+        // `render_layout` collapses to the focused pane when zoomed.
+        let Some(layout) = d.mgr.render_layout() else {
             return Vec::new();
         };
         kmux_app::layout::resolve_layout(
-            layout,
+            &layout,
             area_cols,
             area_rows,
             &kmux_app::layout::LayoutConfig::default(),
@@ -1501,11 +1506,12 @@ mod tests {
     }
 
     #[test]
-    fn abi_version_is_three() {
-        // The tiling surface (tabs/layout/per-pane grid/new actions) bumped the
-        // ABI; the Swift wrapper asserts the same constant on startup.
-        assert_eq!(KMUX_FFI_ABI_VERSION, 3);
-        assert_eq!(kmux_ffi_abi_version(), 3);
+    fn abi_version_is_four() {
+        // The tiling surface (tabs/layout/per-pane grid/new actions, then preset
+        // layouts + zoom) bumped the ABI; the Swift wrapper asserts the same
+        // constant on startup.
+        assert_eq!(KMUX_FFI_ABI_VERSION, 4);
+        assert_eq!(kmux_ffi_abi_version(), 4);
     }
 
     #[test]
@@ -1516,5 +1522,7 @@ mod tests {
         assert_eq!(Action::from(FfiAction::SwapNext), Action::SwapNext);
         assert_eq!(Action::from(FfiAction::RenameTab), Action::RenameTab);
         assert_eq!(Action::from(FfiAction::CloseTab), Action::CloseTab);
+        assert_eq!(Action::from(FfiAction::CycleLayout), Action::CycleLayout);
+        assert_eq!(Action::from(FfiAction::ToggleZoom), Action::ToggleZoom);
     }
 }
