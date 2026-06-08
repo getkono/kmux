@@ -743,6 +743,55 @@ mod tests {
     }
 
     #[test]
+    fn swap_focused_sends_pane_swap_for_neighbor() {
+        use kmux_protocol::messages::{LayoutNode, SplitDir, TabInfo};
+        let (mut mgr, mut rx) = make_connected_manager();
+        let mut entry = make_entry("eagle", "/p");
+        entry.tabs = vec![TabInfo {
+            tab_index: 0,
+            name: "1".into(),
+            layout: LayoutNode::Split {
+                dir: SplitDir::Horizontal,
+                ratios: vec![500, 500],
+                children: vec![
+                    LayoutNode::Leaf { pane_index: 0 },
+                    LayoutNode::Leaf { pane_index: 1 },
+                ],
+            },
+            focused_pane: 0,
+        }];
+        mgr.session_list.push(entry);
+        mgr.active_session = Some("eagle".into());
+        mgr.active_tab = Some(0);
+        mgr.active_pane = Some("eagle/0".into());
+        mgr.swap_focused(1);
+        match rx.try_recv() {
+            Ok(ClientMessage::PaneSwap {
+                word_id,
+                tab_index,
+                a,
+                b,
+            }) => {
+                assert_eq!(word_id, "eagle");
+                assert_eq!(tab_index, 0);
+                assert_eq!((a, b), (0, 1));
+            }
+            other => panic!("expected PaneSwap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn swap_focused_noop_for_single_pane_tab() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.session_list.push(make_entry("eagle", "/p")); // one tab, one leaf
+        mgr.active_session = Some("eagle".into());
+        mgr.active_tab = Some(0);
+        mgr.active_pane = Some("eagle/0".into());
+        mgr.swap_focused(1);
+        assert!(rx.try_recv().is_err(), "single-pane tab cannot swap");
+    }
+
+    #[test]
     fn display_name_disambiguation() {
         let mut mgr = make_manager();
         // Two sessions with the same basename "src" but different parent dirs

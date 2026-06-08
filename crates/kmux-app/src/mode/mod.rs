@@ -97,6 +97,10 @@ pub enum Action {
     ResizeRight,
     ResizeUp,
     ResizeDown,
+    /// Move the focused pane forward/back in the tab's leaf order (focus follows
+    /// the moved pane to its new slot).
+    SwapNext,
+    SwapPrev,
 
     // Session picker
     CloseSessionPicker,

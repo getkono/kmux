@@ -61,6 +61,8 @@ impl AppCore {
             Action::ResizeRight => self.resize(crate::layout::FocusDir::Right),
             Action::ResizeUp => self.resize(crate::layout::FocusDir::Up),
             Action::ResizeDown => self.resize(crate::layout::FocusDir::Down),
+            Action::SwapNext => self.mgr.swap_focused(1),
+            Action::SwapPrev => self.mgr.swap_focused(-1),
             Action::JumpToSession(idx) => {
                 if idx < self.mgr.session_list().len() {
                     let word_id = self.mgr.session_list()[idx].meta.word_id.clone();

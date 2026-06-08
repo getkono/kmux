@@ -241,6 +241,45 @@ impl SessionManager {
         });
     }
 
+    /// Swap the focused pane with the next (`offset = 1`) or previous
+    /// (`offset = -1`) pane in the active tab's leaf order, wrapping. The server
+    /// exchanges the two leaves in place and broadcasts the new tree; focus
+    /// follows the moved pane to its new slot. No-op for a single-pane tab.
+    pub fn swap_focused(&mut self, offset: i32) {
+        let (Some(word_id), Some(tab_index)) = (self.active_session.clone(), self.active_tab)
+        else {
+            return;
+        };
+        let Some(focused) = self
+            .active_pane
+            .as_ref()
+            .and_then(|p| p.rsplit_once('/'))
+            .and_then(|(_, i)| i.parse::<u32>().ok())
+        else {
+            return;
+        };
+        let Some(leaves) = self.tab_layout(&word_id, tab_index).map(|l| l.leaves()) else {
+            return;
+        };
+        if leaves.len() < 2 {
+            return;
+        }
+        let Some(pos) = leaves.iter().position(|&p| p == focused) else {
+            return;
+        };
+        let n = leaves.len() as i32;
+        let target = leaves[((pos as i32 + offset).rem_euclid(n)) as usize];
+        if target == focused {
+            return;
+        }
+        self.send_ws(ClientMessage::PaneSwap {
+            word_id,
+            tab_index,
+            a: focused,
+            b: target,
+        });
+    }
+
     /// Create a new tab (with one fresh pane) in the active session.
     pub fn create_tab(&mut self) {
         let Some(word_id) = self.active_session.clone() else {

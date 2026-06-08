@@ -58,6 +58,9 @@ fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
             Action::ResizeDown,
             &["<Ctrl><Shift><Alt>Down"],
         ),
+        // Move the focused pane forward/back in the tab's leaf order.
+        ("swap-next", Action::SwapNext, &["<Ctrl><Shift>period"]),
+        ("swap-prev", Action::SwapPrev, &["<Ctrl><Shift>comma"]),
         ("new-session", Action::CreateSession, &["<Ctrl><Shift>n"]),
         ("close-session", Action::CloseSession, &["<Ctrl><Shift>w"]),
         ("rename-session", Action::RenameSession, &["F2"]),
@@ -307,6 +310,7 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;minus</property><property name="title">Split down</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Alt&gt;Left &lt;Ctrl&gt;&lt;Alt&gt;Right &lt;Ctrl&gt;&lt;Alt&gt;Up &lt;Ctrl&gt;&lt;Alt&gt;Down</property><property name="title">Move focus between panes</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;&lt;Alt&gt;Left &lt;Ctrl&gt;&lt;Shift&gt;&lt;Alt&gt;Right &lt;Ctrl&gt;&lt;Shift&gt;&lt;Alt&gt;Up &lt;Ctrl&gt;&lt;Shift&gt;&lt;Alt&gt;Down</property><property name="title">Resize focused pane</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;comma &lt;Ctrl&gt;&lt;Shift&gt;period</property><property name="title">Move pane back / forward</property></object></child>
           </object>
         </child>
         <child>
