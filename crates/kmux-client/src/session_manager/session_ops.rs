@@ -5,39 +5,62 @@ use kmux_protocol::messages::{ClientMessage, TermSize};
 use super::SessionManager;
 
 impl SessionManager {
-    /// Switch to a different session by word_id (attaches to its first pane).
+    /// Switch to a different session, attaching its active tab's visible pane
+    /// set and focusing that tab's focused pane.
     pub fn select_session(&mut self, word_id: String) {
-        if let Some(prev_pane) = self.active_pane.take() {
-            self.send_ws(ClientMessage::Detach { pane_id: prev_pane });
-        }
-        let first_pane = self
-            .session_list
-            .iter()
-            .find(|e| e.meta.word_id == word_id)
-            .and_then(|e| e.panes.first())
-            .map(|p| p.pane_id.clone());
-        self.active_session = Some(word_id);
-        self.active_pane = first_pane.clone();
-        if let Some(pane_id) = first_pane {
-            if let Some(buf) = self.buffers.get_mut(&pane_id) {
-                buf.clear();
-            }
-            self.attach_fresh(pane_id);
-        }
+        let Some(entry) = self.session_list.iter().find(|e| e.meta.word_id == word_id) else {
+            return;
+        };
+        let tab_index = entry.active_tab;
+        // The active tab's focus + visible set; fall back to the first pane if
+        // the session has no tab metadata yet.
+        let (focus_idx, visible) = match entry.tabs.iter().find(|t| t.tab_index == tab_index) {
+            Some(t) => (
+                t.focused_pane,
+                t.layout
+                    .leaves()
+                    .into_iter()
+                    .map(|i| format!("{word_id}/{i}"))
+                    .collect::<Vec<_>>(),
+            ),
+            None => match entry.panes.first() {
+                Some(p) => (p.pane_index, vec![p.pane_id.clone()]),
+                None => (0, vec![]),
+            },
+        };
+        self.active_session = Some(word_id.clone());
+        self.active_tab = Some(tab_index);
+        self.set_visible_set(visible);
+        self.focus_from_tab(&word_id, focus_idx);
     }
 
-    /// Switch to a specific pane.
+    /// Select a specific pane: switch session/tab as needed so it becomes
+    /// visible, then focus it within its tab.
     pub fn select_pane(&mut self, pane_id: String) {
-        if let Some(prev_pane) = self.active_pane.take()
-            && prev_pane != pane_id
-        {
-            self.send_ws(ClientMessage::Detach { pane_id: prev_pane });
+        match self.locate_pane(&pane_id) {
+            Some((word_id, tab_index)) => {
+                if self.active_session.as_deref() != Some(word_id.as_str()) {
+                    self.select_session(word_id);
+                } else if self.active_tab != Some(tab_index) {
+                    self.select_tab(tab_index);
+                }
+                self.focus_pane(pane_id);
+            }
+            None => {
+                // Pane not in the cached tabs: fall back to a single fresh attach.
+                for prev in std::mem::take(&mut self.visible_panes) {
+                    if prev != pane_id {
+                        self.send_ws(ClientMessage::Detach { pane_id: prev });
+                    }
+                }
+                if let Some(buf) = self.buffers.get_mut(&pane_id) {
+                    buf.clear();
+                }
+                self.active_pane = Some(pane_id.clone());
+                self.visible_panes = vec![pane_id.clone()];
+                self.attach_fresh(pane_id);
+            }
         }
-        if let Some(buf) = self.buffers.get_mut(&pane_id) {
-            buf.clear();
-        }
-        self.active_pane = Some(pane_id.clone());
-        self.attach_fresh(pane_id);
     }
 
     /// Cycle to the next/previous session by offset.

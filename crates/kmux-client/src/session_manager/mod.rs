@@ -3,6 +3,7 @@ mod connection;
 mod input;
 mod server_handler;
 mod session_ops;
+mod tabs;
 
 pub use server_handler::SessionEvent;
 
@@ -34,7 +35,7 @@ pub(super) enum PaneSync {
     AwaitingSync,
 }
 
-/// Shared client-side session management logic used by both the TUI and GUI frontends.
+/// Shared client-side session management logic used by the client frontends.
 pub struct SessionManager {
     // Connection params
     pub(super) host: String,
@@ -49,12 +50,31 @@ pub struct SessionManager {
     pub connected: bool,
     pub status_msg: String,
 
-    // Two-level session state
+    // Session / tab / pane state
     pub session_list: Vec<SessionEntry>,
     /// Currently active session (word_id).
     pub active_session: Option<WordId>,
-    /// Currently active pane (pane_id = "{word_id}/{pane_index}").
+    /// The tab currently viewed within `active_session` (client-local — which
+    /// tab a client views is not shared, unlike the layout tree + focus).
+    pub active_tab: Option<u32>,
+    /// The **focused** pane (pane_id = "{word_id}/{pane_index}") — the input
+    /// target and the highlighted leaf within the visible set.
     pub active_pane: Option<PaneId>,
+    /// Panes currently attached + rendered: the leaves of the active tab's
+    /// layout. `active_pane` is the focused one within this set.
+    pub(super) visible_panes: Vec<PaneId>,
+    /// Per-pane content size (each pane's resolved sub-rect), pushed by the
+    /// frontend from the shared layout resolver. Attach/Resize use this; falls
+    /// back to the full window size when unset (single-pane tabs).
+    pub(super) pane_sizes: HashMap<PaneId, TermSize>,
+    /// A pane the client created and wants to focus once the refreshed session
+    /// list (carrying its new tab) arrives.
+    pub(super) pending_select_pane: Option<PaneId>,
+    /// Client-local view flag: when set, only the focused pane is rendered/sized
+    /// (full content area), à la tmux zoom. Does not mutate the shared tree.
+    pub(super) zoomed: bool,
+    /// Rotating index into the preset [`LayoutScheme`]s for `cycle_layout`.
+    pub(super) layout_scheme_idx: usize,
     /// Terminal buffers keyed by pane_id.
     pub buffers: HashMap<PaneId, CellGrid>,
     pub(super) pane_sync: HashMap<PaneId, PaneSync>,
@@ -122,7 +142,13 @@ impl SessionManager {
             status_msg: String::new(),
             session_list: Vec::new(),
             active_session: None,
+            active_tab: None,
             active_pane: None,
+            visible_panes: Vec::new(),
+            pane_sizes: HashMap::new(),
+            pending_select_pane: None,
+            zoomed: false,
+            layout_scheme_idx: 0,
             buffers: HashMap::new(),
             pane_sync: HashMap::new(),
             input_locked: HashMap::new(),
@@ -282,14 +308,24 @@ impl SessionManager {
         self.pane_sync
             .insert(pane_id.clone(), PaneSync::AwaitingSync);
         self.in_flight_history_fetches.remove(&pane_id);
+        // Use the pane's resolved sub-rect size if the frontend has set one;
+        // otherwise the full window size (correct for a single-pane tab).
+        let size = self
+            .pane_sizes
+            .get(&pane_id)
+            .copied()
+            .unwrap_or(self.last_term_size);
         self.send_ws(ClientMessage::Attach {
             pane_id,
             last_seqno: None,
-            size: self.last_term_size,
+            size,
         });
     }
 
-    /// Update the stored terminal size and send a `Resize` to every attached pane.
+    /// Update the stored window size (the fallback) and send a `Resize` to every
+    /// attached pane. A pane with a resolved sub-rect size (set by the frontend
+    /// via [`Self::set_pane_sizes`] for a tiled tab) keeps that size; the rest
+    /// resize to the full window (the single-pane case).
     pub fn update_term_size(&mut self, size: TermSize) {
         self.last_term_size = size;
         let attached: Vec<String> = self
@@ -299,7 +335,8 @@ impl SessionManager {
             .cloned()
             .collect();
         for pane_id in attached {
-            self.send_ws(ClientMessage::Resize { pane_id, size });
+            let s = self.pane_sizes.get(&pane_id).copied().unwrap_or(size);
+            self.send_ws(ClientMessage::Resize { pane_id, size: s });
         }
     }
 }
@@ -357,6 +394,13 @@ mod tests {
                 status: SessionStatus::Running,
                 title: String::new(),
             }],
+            tabs: vec![kmux_protocol::messages::TabInfo {
+                tab_index: 0,
+                name: "1".to_string(),
+                layout: kmux_protocol::messages::LayoutNode::single(0),
+                focused_pane: 0,
+            }],
+            active_tab: 0,
         }
     }
 
@@ -437,51 +481,142 @@ mod tests {
         assert!(mgr.buffers.contains_key("falcon/0"));
     }
 
+    /// Build a `SessionEntry` with one tab per pane index (mirrors the
+    /// `PaneCreate` = "new tab" model after the server wraps each pane).
+    fn make_entry_with_tabs(word_id: &str, cwd: &str, pane_count: u32) -> SessionEntry {
+        use kmux_protocol::messages::{LayoutNode, SessionMeta, TabInfo};
+        SessionEntry {
+            meta: SessionMeta {
+                index: 0,
+                word_id: word_id.to_string(),
+                name: std::path::Path::new(cwd)
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or(word_id)
+                    .to_string(),
+                cwd: cwd.to_string(),
+            },
+            panes: (0..pane_count)
+                .map(|i| PaneInfo {
+                    pane_id: format!("{word_id}/{i}"),
+                    pane_index: i,
+                    program: String::new(),
+                    size: TermSize::default(),
+                    attached_clients: vec![],
+                    status: SessionStatus::Running,
+                    title: String::new(),
+                })
+                .collect(),
+            tabs: (0..pane_count)
+                .map(|i| TabInfo {
+                    tab_index: i,
+                    name: format!("{}", i + 1),
+                    layout: LayoutNode::single(i),
+                    focused_pane: i,
+                })
+                .collect(),
+            active_tab: 0,
+        }
+    }
+
     #[test]
-    fn pane_created_switches_active_and_detaches_previous() {
+    fn pane_created_defers_select_until_refresh() {
         use super::server_handler::SessionEvent;
         let (mut mgr, mut rx) = make_connected_manager();
 
         mgr.session_list
-            .push(make_entry("eagle", "/home/user/proj"));
-        mgr.active_session = Some("eagle".to_string());
-        mgr.active_pane = Some("eagle/0".to_string());
-        mgr.buffers
-            .insert("eagle/0".to_string(), CellGrid::default());
-        // Drain anything pending so we can inspect only the messages emitted
-        // by the PaneCreated handler.
+            .push(make_entry_with_tabs("eagle", "/home/user/proj", 1));
+        mgr.select_session("eagle".to_string());
         while rx.try_recv().is_ok() {}
 
+        // PaneCreate reply: the new pane is buffered, a refresh is requested, and
+        // selection is deferred (active_pane unchanged for now).
         let events = mgr.handle_server_message(ServerMessage::PaneCreated {
             request_id: 0,
             pane_id: "eagle/1".to_string(),
             session_word_id: "eagle".to_string(),
             size: TermSize::default(),
         });
-
         assert!(matches!(
             events.as_slice(),
             [SessionEvent::PaneCreated { pane_id }] if pane_id == "eagle/1"
         ));
-        assert_eq!(mgr.active_session.as_deref(), Some("eagle"));
-        assert_eq!(mgr.active_pane.as_deref(), Some("eagle/1"));
         assert!(mgr.buffers.contains_key("eagle/1"));
-
-        // Expect a `Detach eagle/0` followed by an `Attach eagle/1`.
+        assert_eq!(mgr.pending_select_pane.as_deref(), Some("eagle/1"));
         let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
-            msgs.iter().any(|m| matches!(
-                m,
-                ClientMessage::Detach { pane_id } if pane_id == "eagle/0"
-            )),
-            "previous pane must be detached: {msgs:?}",
+            msgs.iter()
+                .any(|m| matches!(m, ClientMessage::SessionList { .. })),
+            "a session-list refresh must be requested: {msgs:?}",
+        );
+
+        // The refreshed list carries the new tab (tab 1 → pane eagle/1). Now the
+        // deferred select fires: switch to tab 1, attaching eagle/1 and detaching
+        // the old visible set (eagle/0).
+        mgr.handle_server_message(ServerMessage::SessionListResult {
+            request_id: 0,
+            sessions: vec![make_entry_with_tabs("eagle", "/home/user/proj", 2)],
+        });
+        assert_eq!(mgr.active_pane.as_deref(), Some("eagle/1"));
+        assert_eq!(mgr.active_tab, Some(1));
+        assert!(mgr.pending_select_pane.is_none());
+        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            msgs.iter().any(
+                |m| matches!(m, ClientMessage::Attach { pane_id, .. } if pane_id == "eagle/1")
+            ),
+            "new pane must be attached: {msgs:?}",
         );
         assert!(
-            msgs.iter().any(|m| matches!(
-                m,
-                ClientMessage::Attach { pane_id, .. } if pane_id == "eagle/1"
-            )),
-            "new pane must be attached: {msgs:?}",
+            msgs.iter()
+                .any(|m| matches!(m, ClientMessage::Detach { pane_id } if pane_id == "eagle/0")),
+            "previous tab's pane must be detached: {msgs:?}",
+        );
+    }
+
+    #[test]
+    fn layout_update_attaches_split_pane_without_detaching_sibling() {
+        use kmux_protocol::messages::{LayoutNode, SplitDir};
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.session_list
+            .push(make_entry_with_tabs("eagle", "/proj", 1));
+        mgr.select_session("eagle".to_string());
+        while rx.try_recv().is_ok() {}
+
+        // A split adds pane 1 alongside pane 0 in the active tab (tab 0).
+        mgr.handle_server_message(ServerMessage::LayoutUpdate {
+            word_id: "eagle".to_string(),
+            tab_index: 0,
+            layout: LayoutNode::Split {
+                dir: SplitDir::Horizontal,
+                ratios: vec![500, 500],
+                children: vec![
+                    LayoutNode::Leaf { pane_index: 0 },
+                    LayoutNode::Leaf { pane_index: 1 },
+                ],
+            },
+            focused_pane: 1,
+        });
+
+        // Both panes are now visible; focus follows the server (pane 1). The
+        // existing sibling (eagle/0) is not detached.
+        assert_eq!(
+            mgr.visible_panes(),
+            &["eagle/0".to_string(), "eagle/1".to_string()]
+        );
+        assert_eq!(mgr.active_pane.as_deref(), Some("eagle/1"));
+        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            msgs.iter().any(
+                |m| matches!(m, ClientMessage::Attach { pane_id, .. } if pane_id == "eagle/1")
+            ),
+            "the new split pane must be attached: {msgs:?}",
+        );
+        assert!(
+            !msgs
+                .iter()
+                .any(|m| matches!(m, ClientMessage::Detach { pane_id } if pane_id == "eagle/0")),
+            "the existing sibling must NOT be detached: {msgs:?}",
         );
     }
 
@@ -584,6 +719,191 @@ mod tests {
     }
 
     #[test]
+    fn set_layout_ratios_sends_for_active_tab() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.active_session = Some("eagle".to_string());
+        mgr.active_tab = Some(0);
+        mgr.set_layout_ratios(vec![1], vec![550, 450]);
+        match rx.try_recv() {
+            Ok(ClientMessage::SetLayoutRatios {
+                word_id,
+                tab_index,
+                path,
+                ratios,
+            }) => {
+                assert_eq!(word_id, "eagle");
+                assert_eq!(tab_index, 0);
+                assert_eq!(path, vec![1]);
+                assert_eq!(ratios, vec![550, 450]);
+            }
+            other => panic!("expected SetLayoutRatios, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_layout_ratios_noop_without_active_tab() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.active_session = Some("eagle".to_string());
+        mgr.active_tab = None;
+        mgr.set_layout_ratios(vec![], vec![500, 500]);
+        assert!(rx.try_recv().is_err(), "no message without an active tab");
+    }
+
+    #[test]
+    fn swap_focused_sends_pane_swap_for_neighbor() {
+        use kmux_protocol::messages::{LayoutNode, SplitDir, TabInfo};
+        let (mut mgr, mut rx) = make_connected_manager();
+        let mut entry = make_entry("eagle", "/p");
+        entry.tabs = vec![TabInfo {
+            tab_index: 0,
+            name: "1".into(),
+            layout: LayoutNode::Split {
+                dir: SplitDir::Horizontal,
+                ratios: vec![500, 500],
+                children: vec![
+                    LayoutNode::Leaf { pane_index: 0 },
+                    LayoutNode::Leaf { pane_index: 1 },
+                ],
+            },
+            focused_pane: 0,
+        }];
+        mgr.session_list.push(entry);
+        mgr.active_session = Some("eagle".into());
+        mgr.active_tab = Some(0);
+        mgr.active_pane = Some("eagle/0".into());
+        mgr.swap_focused(1);
+        match rx.try_recv() {
+            Ok(ClientMessage::PaneSwap {
+                word_id,
+                tab_index,
+                a,
+                b,
+            }) => {
+                assert_eq!(word_id, "eagle");
+                assert_eq!(tab_index, 0);
+                assert_eq!((a, b), (0, 1));
+            }
+            other => panic!("expected PaneSwap, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn swap_focused_noop_for_single_pane_tab() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.session_list.push(make_entry("eagle", "/p")); // one tab, one leaf
+        mgr.active_session = Some("eagle".into());
+        mgr.active_tab = Some(0);
+        mgr.active_pane = Some("eagle/0".into());
+        mgr.swap_focused(1);
+        assert!(rx.try_recv().is_err(), "single-pane tab cannot swap");
+    }
+
+    #[test]
+    fn apply_scheme_sends_apply_layout_scheme() {
+        use kmux_protocol::messages::LayoutScheme;
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.active_session = Some("eagle".into());
+        mgr.active_tab = Some(0);
+        mgr.apply_scheme(LayoutScheme::EvenVertical);
+        match rx.try_recv() {
+            Ok(ClientMessage::ApplyLayoutScheme {
+                word_id,
+                tab_index,
+                scheme,
+            }) => {
+                assert_eq!(word_id, "eagle");
+                assert_eq!(tab_index, 0);
+                assert_eq!(scheme, LayoutScheme::EvenVertical);
+            }
+            other => panic!("expected ApplyLayoutScheme, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cycle_layout_advances_through_presets() {
+        use kmux_protocol::messages::LayoutScheme;
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.active_session = Some("eagle".into());
+        mgr.active_tab = Some(0);
+        // First cycle steps idx 0 → 1, the second preset (EvenVertical).
+        mgr.cycle_layout();
+        match rx.try_recv() {
+            Ok(ClientMessage::ApplyLayoutScheme { scheme, .. }) => {
+                assert_eq!(scheme, LayoutScheme::EvenVertical);
+            }
+            other => panic!("expected ApplyLayoutScheme, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn render_layout_collapses_to_focused_when_zoomed() {
+        use kmux_protocol::messages::{LayoutNode, SplitDir, TabInfo};
+        let mut mgr = make_manager();
+        let mut entry = make_entry("eagle", "/p");
+        entry.tabs = vec![TabInfo {
+            tab_index: 0,
+            name: "1".into(),
+            layout: LayoutNode::Split {
+                dir: SplitDir::Horizontal,
+                ratios: vec![500, 500],
+                children: vec![
+                    LayoutNode::Leaf { pane_index: 0 },
+                    LayoutNode::Leaf { pane_index: 1 },
+                ],
+            },
+            focused_pane: 1,
+        }];
+        mgr.session_list.push(entry);
+        mgr.active_session = Some("eagle".into());
+        mgr.active_tab = Some(0);
+        mgr.active_pane = Some("eagle/1".into());
+        // Unzoomed: the full tree renders.
+        assert!(matches!(
+            mgr.render_layout(),
+            Some(LayoutNode::Split { .. })
+        ));
+        // Zoomed: only the focused pane (leaf 1) renders full-area.
+        mgr.toggle_zoom();
+        assert!(mgr.is_zoomed());
+        assert_eq!(mgr.render_layout(), Some(LayoutNode::single(1)));
+    }
+
+    #[test]
+    fn rename_tab_sends_tab_rename() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.active_session = Some("eagle".into());
+        mgr.rename_tab(2, "build");
+        match rx.try_recv() {
+            Ok(ClientMessage::TabRename {
+                word_id,
+                tab_index,
+                new_name,
+                ..
+            }) => {
+                assert_eq!(word_id, "eagle");
+                assert_eq!(tab_index, 2);
+                assert_eq!(new_name, "build");
+            }
+            other => panic!("expected TabRename, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tab_renamed_event_updates_cached_name() {
+        use kmux_protocol::messages::SessionEventMsg;
+        let mut mgr = make_manager();
+        mgr.session_list.push(make_entry("eagle", "/p")); // tab 0 starts named "1"
+        mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::TabRenamed {
+                word_id: "eagle".into(),
+                tab_index: 0,
+                name: "logs".into(),
+            },
+        });
+        assert_eq!(mgr.session_list[0].tabs[0].name, "logs");
+    }
+
+    #[test]
     fn display_name_disambiguation() {
         let mut mgr = make_manager();
         // Two sessions with the same basename "src" but different parent dirs
@@ -595,6 +915,8 @@ mod tests {
                 cwd: "/proj-a/src".to_string(),
             },
             panes: vec![],
+            tabs: vec![],
+            active_tab: 0,
         });
         mgr.session_list.push(SessionEntry {
             meta: SessionMeta {
@@ -604,6 +926,8 @@ mod tests {
                 cwd: "/proj-b/src".to_string(),
             },
             panes: vec![],
+            tabs: vec![],
+            active_tab: 0,
         });
 
         assert_eq!(mgr.display_name_for("alpha"), "src (proj-a)");
@@ -621,6 +945,8 @@ mod tests {
                 cwd: "/home/user/myapp".to_string(),
             },
             panes: vec![],
+            tabs: vec![],
+            active_tab: 0,
         });
         assert_eq!(mgr.display_name_for("eagle"), "myapp");
     }

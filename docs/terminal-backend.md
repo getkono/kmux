@@ -114,28 +114,25 @@ whichever `Arc<dyn BackendEventSink>` the host passes in.  `NullEventSink`
 
 ## Cursor rendering (in-cell)
 
-Both frontends paint the inner-pane cursor **themselves** — the TUI does *not*
-delegate Bar/Underline shapes to the host terminal's hardware cursor via
-`Frame::set_cursor_position`. The host cursor's shape comes from the user's
-terminal settings (often a Block, never updated by DECSCUSR), can be hidden in
-alternate-screen mode, and may sit beneath painted content invisibly. In-cell
-rendering makes the cursor visible everywhere regardless of the host. Modern
-TUIs such as Claude Code request a Bar via DECSCUSR `\x1b[5 q`; before this the
-bar was invisible inside kmux.
+The frontend paints the inner-pane cursor **itself** rather than delegating
+Bar/Underline shapes to a host terminal's hardware cursor. In-cell rendering
+makes the cursor visible everywhere and reflects the inner program's DECSCUSR
+shape request; modern TUIs such as Claude Code request a Bar via DECSCUSR
+`\x1b[5 q`.
 
-| Shape | TUI (`kmux-tui`) | GTK (`kmux-gtk`) |
-|---|---|---|
-| `Block` | bg ← `cursor_bg`, fg ← `cursor_fg`; glyph kept | filled rect in `cursor_bg`, glyph redrawn in `cursor_fg` |
-| `Bar` | symbol ← `▏` (U+258F), fg ← `cursor_bg` | 2px vertical bar in `cursor_bg` |
-| `Underline` | symbol ← `▁` (U+2581), fg ← `cursor_bg` | 2px bottom bar in `cursor_bg` |
-| `HollowBlock` | fg ← `cursor_bg`, `Modifier::SLOW_BLINK` | 1px outline in `cursor_bg` |
-| `Hidden` | no-op | no-op |
+| Shape | GTK (`kmux-gtk`) |
+|---|---|
+| `Block` | filled rect in `cursor_bg`, glyph redrawn in `cursor_fg` |
+| `Bar` | 2px vertical bar in `cursor_bg` |
+| `Underline` | 2px bottom bar in `cursor_bg` |
+| `HollowBlock` | 1px outline in `cursor_bg` |
+| `Hidden` | no-op |
 
 Themes default `cursor_bg = fg` and `cursor_fg = bg` so contrast is good on every
 theme without per-theme tuning; both are overridable in `themes/*.toml` (see
-[themes.md](themes.md)). The TUI painter is
-`crates/kmux-tui/src/ui/grid.rs::paint_cursor_cell`; the GTK painter is
-`crates/kmux-gtk/src/render.rs::draw_cursor`.
+[themes.md](themes.md)). The GTK painter is
+`crates/kmux-gtk/src/render.rs::draw_cursor`; the Swift renderer paints the same
+shapes from the FFI `grid_snapshot` cursor fields.
 
 ### Blink
 
@@ -152,8 +149,6 @@ the request rather than blinking every cursor, so a steady cursor stays solid:
   cursor on the "off" half. (The blink state machine moved from `kmux-gtk` into
   `kmux-app` when the run loop was shared; the FFI `grid_snapshot` carries the
   same `blink` bit and `blink_on()` so a SwiftUI renderer blinks identically.)
-- **TUI** adds `Modifier::SLOW_BLINK` to the painted cursor cell so the host
-  terminal blinks it.
 
 This is the second half of issue #50: the GTK bar cursor was visible but never
 blinked, even though Claude Code requests a *blinking* bar (`\x1b[5 q`).
@@ -254,8 +249,8 @@ and move to lazy fetch.
 4. **Lines are stored at capture width.** No truncation on insert; clients
    render them by wrapping, not clipping, when the viewport is narrower.
 5. **`WIDE_CHAR_SPACER` slots are empty symbols.** The second half of a
-   double-width glyph writes `set_symbol("")` — ratatui convention — not a
-   trailing space.
+   double-width glyph carries an empty symbol (rendered as part of the wide
+   glyph to its left), not a trailing space.
 
 ### `ScrollbackMirror` (daemon)
 

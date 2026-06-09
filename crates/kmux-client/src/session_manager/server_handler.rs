@@ -138,13 +138,23 @@ impl SessionManager {
                         self.buffers.entry(pane.pane_id.clone()).or_default();
                     }
                 }
-                if self.active_session.is_none()
-                    && let Some(first_entry) = sessions.first()
-                    && let Some(first_pane) = first_entry.panes.first()
+                // Resolve a deferred "focus the pane I just created" once its tab
+                // is known; else pick an initial session; else re-sync the active
+                // session's tab after a refresh.
+                if let Some(pending) = self.pending_select_pane.take() {
+                    if self.locate_pane(&pending).is_some() {
+                        self.select_pane(pending);
+                    } else {
+                        self.pending_select_pane = Some(pending);
+                    }
+                } else if self.active_session.is_none() {
+                    if let Some(first) = sessions.first().map(|e| e.meta.word_id.clone()) {
+                        self.select_session(first);
+                    }
+                } else if self.visible_panes.is_empty()
+                    && let Some(word) = self.active_session.clone()
                 {
-                    self.active_session = Some(first_entry.meta.word_id.clone());
-                    self.active_pane = Some(first_pane.pane_id.clone());
-                    self.attach_fresh(first_pane.pane_id.clone());
+                    self.select_session(word);
                 }
                 events.push(SessionEvent::SessionListReceived);
             }
@@ -154,18 +164,11 @@ impl SessionManager {
                 for pane in &entry.panes {
                     self.buffers.entry(pane.pane_id.clone()).or_default();
                 }
-                // Switch to the first pane of the new session
-                let first_pane_id = entry.panes.first().map(|p| p.pane_id.clone());
-                if let Some(prev_pane) = self.active_pane.take() {
-                    self.send_ws(ClientMessage::Detach { pane_id: prev_pane });
-                }
-                self.active_session = Some(word_id.clone());
-                self.active_pane = first_pane_id.clone();
                 self.session_list.push(entry);
                 self.status_msg = format!("Session '{word_id}' created");
-                if let Some(pane_id) = first_pane_id {
-                    self.attach_fresh(pane_id);
-                }
+                // Switch to the new session (detaches the old visible set and
+                // attaches the new session's active tab).
+                self.select_session(word_id.clone());
                 events.push(SessionEvent::SessionCreated { word_id });
             }
 
@@ -187,18 +190,14 @@ impl SessionManager {
                 self.session_list.retain(|e| e.meta.word_id != word_id);
 
                 if self.active_session.as_deref() == Some(&word_id) {
-                    // Fall back to first remaining session
-                    if let Some(next_entry) = self.session_list.first() {
-                        let next_word_id = next_entry.meta.word_id.clone();
-                        let next_pane_id = next_entry.panes.first().map(|p| p.pane_id.clone());
-                        self.active_session = Some(next_word_id);
-                        self.active_pane = next_pane_id.clone();
-                        if let Some(pane_id) = next_pane_id {
-                            self.attach_fresh(pane_id);
-                        }
-                    } else {
-                        self.active_session = None;
-                        self.active_pane = None;
+                    // The closed session's panes are gone server-side; clear local
+                    // view state and fall back to the first remaining session.
+                    self.active_session = None;
+                    self.active_tab = None;
+                    self.active_pane = None;
+                    self.visible_panes.clear();
+                    if let Some(next) = self.session_list.first().map(|e| e.meta.word_id.clone()) {
+                        self.select_session(next);
                     }
                 }
                 events.push(SessionEvent::SessionClosed { word_id });
@@ -211,7 +210,7 @@ impl SessionManager {
                 ..
             } => {
                 self.buffers.entry(pane_id.clone()).or_default();
-                // Update the session_list entry
+                // Record the new pane in the flat list for immediate chrome.
                 if let Some(entry) = self
                     .session_list
                     .iter_mut()
@@ -221,32 +220,23 @@ impl SessionManager {
                         .rsplit_once('/')
                         .and_then(|(_, idx)| idx.parse().ok())
                         .unwrap_or(0);
-                    entry.panes.push(PaneInfo {
-                        pane_id: pane_id.clone(),
-                        pane_index,
-                        program: String::new(),
-                        size,
-                        attached_clients: vec![],
-                        status: SessionStatus::Running,
-                        title: String::new(),
-                    });
+                    if !entry.panes.iter().any(|p| p.pane_id == pane_id) {
+                        entry.panes.push(PaneInfo {
+                            pane_id: pane_id.clone(),
+                            pane_index,
+                            program: String::new(),
+                            size,
+                            attached_clients: vec![],
+                            status: SessionStatus::Running,
+                            title: String::new(),
+                        });
+                    }
                 }
-                // `PaneCreated` is the direct reply to this client's own
-                // `PaneCreate` request, so switch focus to the new pane —
-                // mirrors `select_pane` semantics. Broadcasts to other clients
-                // use `SessionEventMsg::PaneSpawned`, which is not handled
-                // here and therefore does not steal focus.
-                if let Some(prev) = self.active_pane.take()
-                    && prev != pane_id
-                {
-                    self.send_ws(ClientMessage::Detach { pane_id: prev });
-                }
-                self.active_session = Some(session_word_id);
-                self.active_pane = Some(pane_id.clone());
-                if let Some(buf) = self.buffers.get_mut(&pane_id) {
-                    buf.clear();
-                }
-                self.attach_fresh(pane_id.clone());
+                // `PaneCreate` creates a new tab server-side; its layout arrives
+                // with the refreshed session list. Defer focusing the new pane
+                // until then.
+                self.pending_select_pane = Some(pane_id.clone());
+                self.request_session_list();
                 events.push(SessionEvent::PaneCreated { pane_id });
             }
 
@@ -275,6 +265,116 @@ impl SessionManager {
                     }
                 }
                 events.push(SessionEvent::PaneClosed { pane_id });
+            }
+
+            // ── Tab / layout reconciliation ─────────────────────────────────
+            // `LayoutUpdate` is the authoritative tree (+ shared focus) broadcast
+            // after any mutation. Update the cache, and when it targets the tab
+            // this client is viewing, reconcile the visible set + focus.
+            ServerMessage::LayoutUpdate {
+                word_id,
+                tab_index,
+                layout,
+                focused_pane,
+            } => {
+                if let Some(tab) = self
+                    .session_list
+                    .iter_mut()
+                    .find(|e| e.meta.word_id == word_id)
+                    .and_then(|e| e.tabs.iter_mut().find(|t| t.tab_index == tab_index))
+                {
+                    tab.layout = layout;
+                    tab.focused_pane = focused_pane;
+                }
+                if self.active_session.as_deref() == Some(word_id.as_str())
+                    && self.active_tab == Some(tab_index)
+                    && let Some((focus_idx, visible)) = self.tab_view(&word_id, tab_index)
+                {
+                    self.set_visible_set(visible);
+                    self.focus_from_tab(&word_id, focus_idx);
+                }
+            }
+
+            // A tab was created (a different client, or via `TabCreate`). The
+            // event carries the tab index but not its full layout, so refresh.
+            ServerMessage::TabCreated { word_id, tab, .. } => {
+                let tab_index = tab.tab_index;
+                if let Some(entry) = self
+                    .session_list
+                    .iter_mut()
+                    .find(|e| e.meta.word_id == word_id)
+                    && !entry.tabs.iter().any(|t| t.tab_index == tab.tab_index)
+                {
+                    entry.tabs.push(tab);
+                }
+                // If this is our active session, switch to the new tab.
+                if self.active_session.as_deref() == Some(word_id.as_str()) {
+                    self.select_tab(tab_index);
+                }
+            }
+
+            ServerMessage::TabClosed {
+                word_id, tab_index, ..
+            } => {
+                if let Some(entry) = self
+                    .session_list
+                    .iter_mut()
+                    .find(|e| e.meta.word_id == word_id)
+                {
+                    entry.tabs.retain(|t| t.tab_index != tab_index);
+                }
+                // If the closed tab was the one we were viewing, move to another.
+                if self.active_session.as_deref() == Some(word_id.as_str())
+                    && self.active_tab == Some(tab_index)
+                {
+                    self.active_tab = None;
+                    self.visible_panes.clear();
+                    let next = self
+                        .session_list
+                        .iter()
+                        .find(|e| e.meta.word_id == word_id)
+                        .and_then(|e| e.tabs.first())
+                        .map(|t| t.tab_index);
+                    match next {
+                        Some(t) => self.select_tab(t),
+                        None => {
+                            self.active_pane = None;
+                        }
+                    }
+                }
+            }
+
+            // The dedicated split reply: a new pane + the tab's new tree. Attach
+            // the new pane (without detaching siblings) when it's our active tab.
+            ServerMessage::PaneSplit {
+                word_id,
+                tab_index,
+                new_pane,
+                layout,
+                ..
+            } => {
+                self.buffers.entry(new_pane.pane_id.clone()).or_default();
+                let new_idx = new_pane.pane_index;
+                if let Some(entry) = self
+                    .session_list
+                    .iter_mut()
+                    .find(|e| e.meta.word_id == word_id)
+                {
+                    if !entry.panes.iter().any(|p| p.pane_id == new_pane.pane_id) {
+                        entry.panes.push(new_pane);
+                    }
+                    if let Some(tab) = entry.tabs.iter_mut().find(|t| t.tab_index == tab_index) {
+                        tab.layout = layout;
+                        tab.focused_pane = new_idx;
+                    }
+                }
+                if self.active_session.as_deref() == Some(word_id.as_str())
+                    && self.active_tab == Some(tab_index)
+                    && let Some((focus_idx, visible)) = self.tab_view(&word_id, tab_index)
+                {
+                    self.set_visible_set(visible);
+                    self.focus_from_tab(&word_id, focus_idx);
+                }
             }
 
             ServerMessage::TerminalSnapshot {
@@ -371,6 +471,26 @@ impl SessionManager {
                     }
                 }
                 events.push(SessionEvent::SessionRenamed { word_id, new_name });
+            }
+
+            // A tab was renamed (by this or another client). Update the cached
+            // name; the frontend's tab strip reconciles from it next tick.
+            ServerMessage::Event {
+                event:
+                    SessionEventMsg::TabRenamed {
+                        word_id,
+                        tab_index,
+                        name,
+                    },
+            } => {
+                if let Some(entry) = self
+                    .session_list
+                    .iter_mut()
+                    .find(|e| e.meta.word_id == word_id)
+                    && let Some(tab) = entry.tabs.iter_mut().find(|t| t.tab_index == tab_index)
+                {
+                    tab.name = name;
+                }
             }
 
             ServerMessage::Event {

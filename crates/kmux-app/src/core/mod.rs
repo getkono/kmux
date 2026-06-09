@@ -1,12 +1,12 @@
 //! `AppCore`: the frontend-agnostic client view-model and orchestration state.
 //!
 //! `AppCore` holds the session manager plus all interaction/connection state
-//! that is independent of any UI toolkit. Frontends (`kmux-tui`, `kmux-gtk`)
+//! that is independent of any UI toolkit. Frontends (`kmux-gtk`, `kmux-swift`)
 //! *drive* it: they pump input in (keys, actions, resize, server messages) and
 //! read state out for rendering. `AppCore` never owns the run loop, a terminal,
 //! or a widget — it is a passive state machine plus orchestration methods.
 //!
-//! Toolkit-specific state (ratatui colors, `Rect` hit-boxes, the clipboard
+//! Toolkit-specific state (color types, `Rect` hit-boxes, the clipboard
 //! channel) lives on the frontend's own struct, not here.
 
 use std::collections::VecDeque;
@@ -57,9 +57,9 @@ pub enum SwitchTarget {
     Ssh(RemoteTarget),
 }
 
-/// Action carried by a clickable top-bar segment. Frontend-neutral intent: the
-/// TUI records these against `Rect`s for mouse hit-testing; a GUI can bind them
-/// to widgets. The hit-testing geometry itself stays frontend-side.
+/// Action carried by a clickable top-bar segment. Frontend-neutral intent: a
+/// GUI binds these to widgets for click handling. The hit-testing geometry
+/// itself stays frontend-side.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TopBarAction {
     OpenServerPicker,

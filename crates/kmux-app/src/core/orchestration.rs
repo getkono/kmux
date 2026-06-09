@@ -1,7 +1,6 @@
-//! Connection/session orchestration methods on [`AppCore`]. Moved verbatim from
-//! the TUI's `app/helpers.rs` and `app/event_loop.rs` (the pure-core parts);
-//! the only behavioural change is reading the cached `self.term_size` instead
-//! of querying the terminal directly (frontends report their geometry).
+//! Connection/session orchestration methods on [`AppCore`]: the pure-core parts
+//! of driving a connection. These read the cached `self.term_size` rather than
+//! querying a terminal directly (frontends report their geometry).
 
 use kmux_client::connection_state::{ConnectionState, DisconnectReason};
 use kmux_client::pipeline::{self, BootstrapOutcome, NoopObserver, ResolvedTarget, SshContext};
@@ -394,7 +393,7 @@ impl AppCore {
     /// server identity, ssh target, auto-select reset, and disconnect of the
     /// old connection. The frontend owns the toolkit-coupled remainder (replace
     /// the server-message channel, then `start_bootstrap` with the returned
-    /// target) so both the TUI and the GUI run loops drive it identically.
+    /// target) so every frontend's run loop drives it identically.
     pub fn prepare_switch(&mut self, target: &SwitchTarget) -> ResolvedTarget {
         self.did_auto_select = false;
         self.mgr.disconnect();

@@ -1,9 +1,9 @@
 //! Action dispatch on [`AppCore`]: the single source of truth for how a
 //! resolved [`Action`] mutates client state, shared by the key path and the
-//! command palette. Moved from the TUI's `app/key_handler.rs`.
+//! command palette.
 //!
 //! Two arms that require toolkit I/O are *not* here: `Action::ForwardKey`
-//! (needs the raw crossterm event to encode under live Ghostty mode state —
+//! (needs the raw toolkit key event to encode under live Ghostty mode state —
 //! the frontend handles it before calling dispatch) and clipboard copy/paste
 //! (emitted as [`KeyResult::CopyToClipboard`] / [`KeyResult::RequestPaste`]
 //! effects that the frontend performs).
@@ -45,8 +45,41 @@ impl AppCore {
             }
             Action::NextSession => self.mgr.cycle_session(1),
             Action::PrevSession => self.mgr.cycle_session(-1),
-            Action::NextPane => self.mgr.cycle_pane(1),
-            Action::PrevPane => self.mgr.cycle_pane(-1),
+            Action::NextPane => self.mgr.cycle_tab(1),
+            Action::PrevPane => self.mgr.cycle_tab(-1),
+            Action::CloseTab => self.mgr.close_tab(),
+            Action::RenameTab => {
+                if let (Some(word_id), Some(tab_index)) = (
+                    self.mgr.active_session().map(|s| s.to_string()),
+                    self.mgr.active_tab(),
+                ) {
+                    let buffer = self.mgr.active_tab_name().unwrap_or_default();
+                    self.mode = Mode::RenameTab {
+                        word_id,
+                        tab_index,
+                        buffer,
+                    };
+                }
+            }
+            Action::SplitRight => self
+                .mgr
+                .split_focused(kmux_protocol::messages::SplitDir::Horizontal),
+            Action::SplitDown => self
+                .mgr
+                .split_focused(kmux_protocol::messages::SplitDir::Vertical),
+            Action::FocusLeft => self.focus_dir(crate::layout::FocusDir::Left),
+            Action::FocusRight => self.focus_dir(crate::layout::FocusDir::Right),
+            Action::FocusUp => self.focus_dir(crate::layout::FocusDir::Up),
+            Action::FocusDown => self.focus_dir(crate::layout::FocusDir::Down),
+            Action::ResizeLeft => self.resize(crate::layout::FocusDir::Left),
+            Action::ResizeRight => self.resize(crate::layout::FocusDir::Right),
+            Action::ResizeUp => self.resize(crate::layout::FocusDir::Up),
+            Action::ResizeDown => self.resize(crate::layout::FocusDir::Down),
+            Action::SwapNext => self.mgr.swap_focused(1),
+            Action::SwapPrev => self.mgr.swap_focused(-1),
+            Action::CycleLayout => self.mgr.cycle_layout(),
+            Action::ToggleZoom => self.mgr.toggle_zoom(),
+            Action::FocusPaneAt(i) => self.focus_pane_at(i),
             Action::JumpToSession(idx) => {
                 if idx < self.mgr.session_list().len() {
                     let word_id = self.mgr.session_list()[idx].meta.word_id.clone();
@@ -69,23 +102,34 @@ impl AppCore {
                 }
             }
             Action::RenameChar(ch) => {
-                if let Mode::RenameSession { buffer, .. } = &mut self.mode {
+                if let Mode::RenameSession { buffer, .. } | Mode::RenameTab { buffer, .. } =
+                    &mut self.mode
+                {
                     buffer.push(ch);
                 }
             }
             Action::RenameBackspace => {
-                if let Mode::RenameSession { buffer, .. } = &mut self.mode {
+                if let Mode::RenameSession { buffer, .. } | Mode::RenameTab { buffer, .. } =
+                    &mut self.mode
+                {
                     buffer.pop();
                 }
             }
-            Action::RenameSubmit => {
-                if let Mode::RenameSession { buffer, word_id } =
-                    std::mem::replace(&mut self.mode, Mode::Normal)
-                {
+            Action::RenameSubmit => match std::mem::replace(&mut self.mode, Mode::Normal) {
+                Mode::RenameSession { buffer, word_id } => {
                     let new_name = buffer.trim().to_string();
                     self.mgr.rename_session(&word_id, &new_name);
                 }
-            }
+                Mode::RenameTab {
+                    tab_index, buffer, ..
+                } => {
+                    let new_name = buffer.trim().to_string();
+                    if !new_name.is_empty() {
+                        self.mgr.rename_tab(tab_index, &new_name);
+                    }
+                }
+                _ => {}
+            },
             Action::CloseSessionPicker => {
                 self.mode = Mode::Normal;
             }
@@ -399,6 +443,73 @@ impl AppCore {
         KeyResult::Continue
     }
 
+    /// Move keyboard focus to the tiled pane in `dir` from the focused pane,
+    /// resolving the active tab's layout against the current content size and
+    /// picking the geometric neighbor.
+    fn focus_dir(&mut self, dir: crate::layout::FocusDir) {
+        let Some(layout) = self.mgr.active_layout().cloned() else {
+            return;
+        };
+        let Some(focused) = self
+            .mgr
+            .active_pane_id()
+            .and_then(|p| p.rsplit_once('/'))
+            .and_then(|(_, i)| i.parse::<u32>().ok())
+        else {
+            return;
+        };
+        let rects = crate::layout::resolve_layout(
+            &layout,
+            self.term_size.cols,
+            self.term_size.rows,
+            &crate::layout::LayoutConfig::default(),
+        );
+        if let Some(target) = crate::layout::focus_neighbor(&rects, focused, dir)
+            && let Some(word) = self.mgr.active_session().map(|s| s.to_string())
+        {
+            self.mgr.focus_pane(format!("{word}/{target}"));
+        }
+    }
+
+    /// Focus the `index`-th pane (0-based) in the active tab's leaf order
+    /// (depth-first, left-to-right — the order the tiles are laid out). No-op
+    /// when there is no such pane.
+    fn focus_pane_at(&mut self, index: u32) {
+        let Some(pane_index) = self
+            .mgr
+            .active_layout()
+            .and_then(|l| l.leaves().get(index as usize).copied())
+        else {
+            return;
+        };
+        if let Some(word) = self.mgr.active_session().map(|s| s.to_string()) {
+            self.mgr.focus_pane(format!("{word}/{pane_index}"));
+        }
+    }
+
+    /// Resize the focused pane's enclosing split in `dir` by one step. Computes
+    /// the new ratios from the shared (resolution-independent) tree and sends
+    /// them to the server, which clamps, renormalizes, and broadcasts the
+    /// authoritative `LayoutUpdate` back to every client viewing the tab.
+    fn resize(&mut self, dir: crate::layout::FocusDir) {
+        let Some(layout) = self.mgr.active_layout().cloned() else {
+            return;
+        };
+        let Some(focused) = self
+            .mgr
+            .active_pane_id()
+            .and_then(|p| p.rsplit_once('/'))
+            .and_then(|(_, i)| i.parse::<u32>().ok())
+        else {
+            return;
+        };
+        if let Some((path, ratios)) =
+            crate::layout::resize_split(&layout, focused, dir, crate::layout::RESIZE_STEP_PERMILLE)
+        {
+            self.mgr.set_layout_ratios(path, ratios);
+        }
+    }
+
     fn command_hint_up(&mut self) {
         let state = match &mut self.mode {
             Mode::Command(s) => s,
@@ -614,6 +725,34 @@ mod tests {
             ClientCapabilities::default(),
         );
         AppCore::for_test(mgr)
+    }
+
+    #[tokio::test]
+    async fn rename_tab_mode_edits_buffer_and_submits_to_normal() {
+        let mut core = fixture_core();
+        core.mode = Mode::RenameTab {
+            word_id: "w".into(),
+            tab_index: 3,
+            buffer: String::new(),
+        };
+        core.dispatch_action(Action::RenameChar('h')).await;
+        core.dispatch_action(Action::RenameChar('i')).await;
+        match &core.mode {
+            Mode::RenameTab {
+                buffer, tab_index, ..
+            } => {
+                assert_eq!(buffer, "hi");
+                assert_eq!(*tab_index, 3);
+            }
+            other => panic!("expected RenameTab, got {other:?}"),
+        }
+        core.dispatch_action(Action::RenameBackspace).await;
+        if let Mode::RenameTab { buffer, .. } = &core.mode {
+            assert_eq!(buffer, "h");
+        }
+        // Submitting a non-empty name leaves the rename mode for Normal.
+        core.dispatch_action(Action::RenameSubmit).await;
+        assert_eq!(core.mode, Mode::Normal);
     }
 
     #[test]

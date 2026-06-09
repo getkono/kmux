@@ -41,7 +41,9 @@ pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
             ("Esc", "Cancel"),
         ],
         Mode::ConfirmCloseSession { .. } => vec![("y", "Confirm close"), ("any", "Cancel")],
-        Mode::RenameSession { .. } => vec![("Enter", "Submit"), ("Esc", "Cancel")],
+        Mode::RenameSession { .. } | Mode::RenameTab { .. } => {
+            vec![("Enter", "Submit"), ("Esc", "Cancel")]
+        }
         Mode::SessionPicker => vec![
             ("\u{2191}/\u{2193}", "Navigate"),
             ("Enter", "Select"),
@@ -80,6 +82,7 @@ pub fn mode_name(mode: &Mode) -> &'static str {
         Mode::Signal => "SIGNAL",
         Mode::ConfirmCloseSession { .. } => "CONFIRM CLOSE",
         Mode::RenameSession { .. } => "RENAME",
+        Mode::RenameTab { .. } => "RENAME TAB",
         Mode::SessionPicker => "SESSION PICKER",
         Mode::ServerPicker => "SERVER PICKER",
         Mode::Help => "HELP",
@@ -92,8 +95,8 @@ pub fn mode_name(mode: &Mode) -> &'static str {
 
 /// The accent color a mode is badged with, as a toolkit-neutral [`Rgb`] drawn
 /// from the active palette. Each frontend converts the result to its own color
-/// type at the render boundary (the TUI to a ratatui `Color`, the GUI to a
-/// cairo/CSS color), so the mode→color mapping has one source of truth.
+/// type at the render boundary (the GTK GUI to a cairo/CSS color), so the
+/// mode→color mapping has one source of truth.
 ///
 /// [`Rgb`]: crate::theme::Rgb
 pub fn mode_rgb(mode: &Mode, theme: &crate::theme::Theme) -> crate::theme::Rgb {
@@ -105,7 +108,7 @@ pub fn mode_rgb(mode: &Mode, theme: &crate::theme::Theme) -> crate::theme::Rgb {
         Mode::Scroll => theme.yellow,
         Mode::Signal => theme.red,
         Mode::ConfirmCloseSession { .. } => theme.red,
-        Mode::RenameSession { .. } => theme.orange,
+        Mode::RenameSession { .. } | Mode::RenameTab { .. } => theme.orange,
         Mode::SessionPicker => theme.accent,
         Mode::ServerPicker => theme.purple,
         Mode::Help => theme.accent,

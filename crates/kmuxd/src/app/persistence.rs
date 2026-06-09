@@ -21,7 +21,7 @@ impl ServerApp {
     pub async fn checkpoint_state(&self) -> crate::persist::PersistedDaemonState {
         use crate::persist::{
             MAX_SCROLLBACK_LINES, PersistedDaemonState, PersistedPane, PersistedSession,
-            STATE_VERSION,
+            PersistedTab, STATE_VERSION,
         };
 
         let sessions_guard = self.sessions.read().await;
@@ -68,10 +68,24 @@ impl ServerApp {
 
             persisted_panes.sort_by_key(|p| p.pane_index);
 
+            let persisted_tabs: Vec<PersistedTab> = session_state
+                .tabs
+                .iter()
+                .map(|t| PersistedTab {
+                    tab_index: t.tab_index,
+                    name: t.name.clone(),
+                    layout: t.layout.clone(),
+                    focused_pane: t.focused_pane,
+                })
+                .collect();
+
             persisted_sessions.push(PersistedSession {
                 meta: session_state.meta.clone(),
                 next_pane_index: session_state.next_pane_index,
                 panes: persisted_panes,
+                tabs: persisted_tabs,
+                next_tab_index: session_state.next_tab_index,
+                active_tab: session_state.active_tab,
             });
         }
 

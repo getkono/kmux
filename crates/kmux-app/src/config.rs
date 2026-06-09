@@ -18,7 +18,6 @@ pub struct KmuxConfig {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
     /// GUI font as a Pango font-description string (e.g. `"JetBrains Mono 12"`).
-    /// GUI-only; the TUI renders in the host terminal's font and ignores this.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font: Option<String>,
 }

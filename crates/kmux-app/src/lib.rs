@@ -2,7 +2,7 @@
 //!
 //! `kmux-app` sits between [`kmux_client`] (the mechanism: session management,
 //! transports, bootstrap, the terminal grid model) and the concrete frontends
-//! (`kmux-tui`, `kmux-gtk`, …). It owns the *interaction policy* that is
+//! (`kmux-gtk`, `kmux-swift`, …). It owns the *interaction policy* that is
 //! independent of any UI toolkit:
 //!
 //! - the modal keymap (`Mode`) and the [`Action`] vocabulary keys resolve to,
@@ -11,17 +11,20 @@
 //! - the theme *spec* (a toolkit-neutral RGB palette) and config loading,
 //! - the non-interactive CLI subcommands.
 //!
-//! Hard rule: nothing in this crate may depend on a UI toolkit (no `ratatui`,
-//! `crossterm`, or `gtk`). Frontends convert this crate's toolkit-neutral types
+//! Hard rule: nothing in this crate may depend on a UI toolkit (no `gtk`, no
+//! native macOS bindings). Frontends convert this crate's toolkit-neutral types
 //! (e.g. the RGB palette) to their own at the render leaf, and *drive* the
 //! `AppCore` — `AppCore` is a passive state machine, it never owns the run loop.
-//!
-//! Modules are introduced incrementally as logic is extracted from the TUI
-//! binary (see the migration plan).
 
 /// Modal keymap (`Mode`), the [`mode::Action`] vocabulary, and key → action
 /// resolution. Toolkit-agnostic: depends only on `kmux_client::key`.
 pub mod mode;
+
+/// Toolkit-agnostic tiling-layout resolver: turns a server-authoritative
+/// [`kmux_protocol::messages::LayoutNode`] tree + a window size into per-pane
+/// cell rectangles, deterministically. Shared by every frontend so all clients
+/// compute identical geometry (a hard requirement for PTY size negotiation).
+pub mod layout;
 
 /// Toolkit-neutral color palette ([`theme::Rgb`], [`theme::Theme`]) and the
 /// built-in theme TOML parsing.

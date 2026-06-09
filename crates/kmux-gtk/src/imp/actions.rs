@@ -25,10 +25,49 @@ use super::{Frontend, apply_effects, prefs};
 /// and the tests. Reserved combos avoid keys the inner terminal needs.
 fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
     vec![
+        // "New tab" historically spoke of "panes"; under Session → Tab → Pane it
+        // creates a tab. The action id stays `new-pane` for continuity.
         ("new-pane", Action::CreatePane, &["<Ctrl><Shift>t"]),
         ("close-pane", Action::ClosePane, &["<Ctrl><Shift>q"]),
         ("next-pane", Action::NextPane, &["<Ctrl><Shift>Right"]),
         ("prev-pane", Action::PrevPane, &["<Ctrl><Shift>Left"]),
+        ("close-tab", Action::CloseTab, &[]),
+        ("rename-tab", Action::RenameTab, &["<Shift>F2"]),
+        // Tiling: split the focused pane and move focus between tiled panes.
+        (
+            "split-right",
+            Action::SplitRight,
+            &["<Ctrl><Shift>backslash"],
+        ),
+        ("split-down", Action::SplitDown, &["<Ctrl><Shift>minus"]),
+        ("focus-left", Action::FocusLeft, &["<Ctrl><Alt>Left"]),
+        ("focus-right", Action::FocusRight, &["<Ctrl><Alt>Right"]),
+        ("focus-up", Action::FocusUp, &["<Ctrl><Alt>Up"]),
+        ("focus-down", Action::FocusDown, &["<Ctrl><Alt>Down"]),
+        // Resize the focused pane. Ctrl+Shift+Alt avoids the plain Ctrl+Alt
+        // arrows many window managers grab for workspace switching.
+        (
+            "resize-left",
+            Action::ResizeLeft,
+            &["<Ctrl><Shift><Alt>Left"],
+        ),
+        (
+            "resize-right",
+            Action::ResizeRight,
+            &["<Ctrl><Shift><Alt>Right"],
+        ),
+        ("resize-up", Action::ResizeUp, &["<Ctrl><Shift><Alt>Up"]),
+        (
+            "resize-down",
+            Action::ResizeDown,
+            &["<Ctrl><Shift><Alt>Down"],
+        ),
+        // Move the focused pane forward/back in the tab's leaf order.
+        ("swap-next", Action::SwapNext, &["<Ctrl><Shift>period"]),
+        ("swap-prev", Action::SwapPrev, &["<Ctrl><Shift>comma"]),
+        // Cycle preset layouts (tmux next-layout); zoom the focused pane.
+        ("cycle-layout", Action::CycleLayout, &["<Ctrl><Shift>space"]),
+        ("zoom-pane", Action::ToggleZoom, &["<Ctrl><Shift>z"]),
         ("new-session", Action::CreateSession, &["<Ctrl><Shift>n"]),
         ("close-session", Action::CloseSession, &["<Ctrl><Shift>w"]),
         ("rename-session", Action::RenameSession, &["F2"]),
@@ -69,6 +108,11 @@ fn jump_action(n: u8) -> Action {
     Action::JumpToSession(n.saturating_sub(1) as usize)
 }
 
+/// The `Action` a `focus-pane-N` accelerator dispatches (N is 1-based).
+fn focus_pane_action(n: u8) -> Action {
+    Action::FocusPaneAt(n.saturating_sub(1) as u32)
+}
+
 /// Install every action + accelerator + the primary menu. Called once.
 pub fn install(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application) {
     for (name, action, accels) in dispatched_specs() {
@@ -83,6 +127,15 @@ pub fn install(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application)
         let name = format!("jump-session-{n}");
         add_dispatch(shell, fe, app, &name, jump_action(n));
         let accel = format!("<Ctrl>{n}");
+        app.set_accels_for_action(&format!("win.{name}"), &[&accel]);
+    }
+
+    // Focus pane 1..9 in the active tab's leaf order. Alt+digit, since Ctrl+digit
+    // is taken by session jumps above.
+    for n in 1..=9u8 {
+        let name = format!("focus-pane-{n}");
+        add_dispatch(shell, fe, app, &name, focus_pane_action(n));
+        let accel = format!("<Alt>{n}");
         app.set_accels_for_action(&format!("win.{name}"), &[&accel]);
     }
 
@@ -206,12 +259,14 @@ fn build_menu() -> gio::Menu {
 
     let s1 = gio::Menu::new();
     s1.append(Some("New Session"), Some("win.new-session"));
-    s1.append(Some("New Pane"), Some("win.new-pane"));
+    s1.append(Some("New Tab"), Some("win.new-pane"));
     menu.append_section(None, &s1);
 
     let s2 = gio::Menu::new();
     s2.append(Some("Rename Session"), Some("win.rename-session"));
+    s2.append(Some("Rename Tab"), Some("win.rename-tab"));
     s2.append(Some("Close Pane"), Some("win.close-pane"));
+    s2.append(Some("Close Tab"), Some("win.close-tab"));
     s2.append(Some("Close Session"), Some("win.close-session"));
     menu.append_section(None, &s2);
 
@@ -264,11 +319,24 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
         </child>
         <child>
           <object class="GtkShortcutsGroup">
-            <property name="title">Panes</property>
-            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;t</property><property name="title">New pane</property></object></child>
+            <property name="title">Tabs</property>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;t</property><property name="title">New tab</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;Right</property><property name="title">Next tab</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;Left</property><property name="title">Previous tab</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Shift&gt;F2</property><property name="title">Rename tab</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;q</property><property name="title">Close pane</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;Right</property><property name="title">Next pane</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;Left</property><property name="title">Previous pane</property></object></child>
+          </object>
+        </child>
+        <child>
+          <object class="GtkShortcutsGroup">
+            <property name="title">Tiling</property>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;backslash</property><property name="title">Split right</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;minus</property><property name="title">Split down</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Alt&gt;Left &lt;Ctrl&gt;&lt;Alt&gt;Right &lt;Ctrl&gt;&lt;Alt&gt;Up &lt;Ctrl&gt;&lt;Alt&gt;Down</property><property name="title">Move focus between panes</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;&lt;Alt&gt;Left &lt;Ctrl&gt;&lt;Shift&gt;&lt;Alt&gt;Right &lt;Ctrl&gt;&lt;Shift&gt;&lt;Alt&gt;Up &lt;Ctrl&gt;&lt;Shift&gt;&lt;Alt&gt;Down</property><property name="title">Resize focused pane</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;comma &lt;Ctrl&gt;&lt;Shift&gt;period</property><property name="title">Move pane back / forward</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;space</property><property name="title">Cycle preset layouts</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;z</property><property name="title">Zoom focused pane</property></object></child>
           </object>
         </child>
         <child>
@@ -321,6 +389,12 @@ mod tests {
         assert_eq!(jump_action(1), Action::JumpToSession(0));
         assert_eq!(jump_action(3), Action::JumpToSession(2));
         assert_eq!(jump_action(9), Action::JumpToSession(8));
+    }
+
+    #[test]
+    fn focus_pane_action_is_zero_based() {
+        assert_eq!(focus_pane_action(1), Action::FocusPaneAt(0));
+        assert_eq!(focus_pane_action(9), Action::FocusPaneAt(8));
     }
 
     #[test]

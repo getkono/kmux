@@ -2,8 +2,8 @@
 //!
 //! This is the single source of truth for kmux themes. Colors are stored as a
 //! plain [`Rgb`] triple; each frontend converts to its own color type at the
-//! render boundary (e.g. `kmux-tui` maps `Rgb` to `ratatui::style::Color`, a
-//! future `kmux-gtk` to `gdk::RGBA`). Nothing here depends on a UI toolkit.
+//! render boundary (e.g. `kmux-gtk` maps `Rgb` to `gdk::RGBA`, and the Swift app
+//! to an `NSColor` via FFI). Nothing here depends on a UI toolkit.
 
 use serde::Deserialize;
 

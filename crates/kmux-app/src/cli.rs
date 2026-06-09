@@ -30,8 +30,8 @@ pub struct Cli {
     pub theme: Option<String>,
 
     /// GUI font as a Pango font-description string (e.g. "JetBrains Mono 12").
-    /// GUI only — the TUI uses the host terminal's font. Falls back to the
-    /// `font` key in ~/.config/kmux/config.toml, then "monospace 11".
+    /// Falls back to the `font` key in ~/.config/kmux/config.toml, then
+    /// "monospace 11".
     #[arg(long, global = true)]
     pub font: Option<String>,
 }
@@ -69,7 +69,7 @@ pub struct ConnectArgs {
     pub cwd: Option<String>,
 
     /// Trace connection setup end-to-end, verify with one ping, print a
-    /// report, and exit without launching the TUI.
+    /// report, and exit without launching the GUI.
     #[arg(long, short = 'n')]
     pub dry_run: bool,
 
@@ -88,7 +88,7 @@ pub enum Command {
         action: DaemonAction,
     },
 
-    /// List sessions on a server without launching the TUI
+    /// List sessions on a server without launching the GUI
     #[command(alias = "ls")]
     ListSessions {
         #[command(flatten)]

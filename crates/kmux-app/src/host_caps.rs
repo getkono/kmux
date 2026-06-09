@@ -5,9 +5,9 @@ use kmux_protocol::messages::ClientCapabilities;
 /// Rules:
 /// - `truecolor`: true if `$COLORTERM` is "truecolor" or "24bit", or `$TERM` ends with
 ///   "-direct" or "-truecolor".
-/// - `kitty_graphics`: always false — the TUI renderer (`CellGrid`) has no image support.
-/// - `kitty_keyboard`: from `kitty_keyboard_supported` — set by `main.rs` after a
-///   successful `crossterm::event::PushKeyboardEnhancementFlags`.
+/// - `kitty_graphics`: always false — the `CellGrid` renderer has no image support.
+/// - `kitty_keyboard`: from `kitty_keyboard_supported` — set by the frontend when
+///   its toolkit reports keyboard-enhancement support.
 /// - `term`/`term_program`: informational, forwarded as-is for server-side logging.
 pub fn detect(kitty_keyboard_supported: bool) -> ClientCapabilities {
     let term = std::env::var("TERM").ok();

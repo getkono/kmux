@@ -17,7 +17,6 @@ kmux-protocol = { path = "crates/kmux-protocol" }
 kmux-client = { path = "crates/kmux-client" }
 kmux-ghostty-sys = { path = "crates/kmux-ghostty-sys" }
 kmux-ghostty = { path = "crates/kmux-ghostty" }
-kmux-tui = { path = "crates/kmux-tui" }
 kmux-app = { path = "crates/kmux-app" }
 
 # External dependencies
@@ -26,7 +25,6 @@ base64 = "0.22"
 bitflags = "2.11.1"
 clap = { version = "4.6.1", features = ["derive"] }
 arboard = { version = "3", default-features = false }
-crossterm = { version = "0.29.0", features = ["event-stream"] }
 futures = "0.3"
 daemonize = "0.5"
 nix = { version = "0.31", features = ["fs", "net", "process", "signal", "term", "user"] }
@@ -34,7 +32,6 @@ serde_json = "1"
 postcard = { version = "1", features = ["alloc"] }
 quinn = "0.11"
 rand = "0.10.1"
-ratatui = "0.30.0"
 rcgen = "0.14.7"
 sha2 = "0.11.0"
 rustls = { version = "0.23.28", default-features = false, features = ["ring", "logging", "std", "tls12"] }

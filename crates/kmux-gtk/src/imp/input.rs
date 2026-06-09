@@ -1,6 +1,4 @@
 //! Pointer input on the grid: scroll-wheel handling and drag text selection.
-//! Mirrors the TUI's `app/mouse_handler.rs` (scroll); selection is net-new
-//! (the TUI has no mouse selection).
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
@@ -8,11 +6,13 @@ use std::time::Duration;
 
 use gtk4::prelude::*;
 use gtk4::{
-    DrawingArea, EventControllerMotion, EventControllerScroll, EventControllerScrollFlags,
-    GestureClick, gdk, glib,
+    Align, DrawingArea, EventControllerMotion, EventControllerScroll, EventControllerScrollFlags,
+    EventSequenceState, GestureClick, GestureDrag, PopoverMenu, gdk, gio, glib,
 };
 
+use kmux_app::layout::{Divider, ratios_for_drag};
 use kmux_client::grid::{GridPos, Selection, SelectionMode};
+use kmux_protocol::messages::SplitDir;
 
 use super::Frontend;
 
@@ -30,10 +30,165 @@ const AUTO_SCROLL_LINES: usize = 2;
 /// Auto-scroll cadence, matching the render pump's 16 ms.
 const AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(16);
 
-/// Attach the pointer controllers (scroll wheel + drag selection) to the grid.
+/// Attach the pointer controllers (scroll wheel + drag selection + click-to-
+/// focus) to the grid.
 pub fn attach(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
+    attach_focus_click(drawing, fe);
     attach_scroll(drawing, fe);
+    attach_resize(drawing, fe);
+    attach_context_menu(drawing, fe);
     attach_selection(drawing, fe);
+}
+
+/// Right-click context menu on a pane: focus the pane under the pointer (so the
+/// items target it) and pop a menu of the existing `win.*` pane actions. The
+/// popover is parented to the grid once and re-pointed on each press.
+fn attach_context_menu(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
+    let menu = gio::Menu::new();
+    menu.append(Some("Split Right"), Some("win.split-right"));
+    menu.append(Some("Split Down"), Some("win.split-down"));
+    menu.append(Some("Zoom Pane"), Some("win.zoom-pane"));
+    menu.append(Some("Close Pane"), Some("win.close-pane"));
+    let popover = PopoverMenu::from_model(Some(&menu));
+    popover.set_parent(drawing);
+    popover.set_has_arrow(false);
+    popover.set_halign(Align::Start);
+
+    let gesture = GestureClick::new();
+    gesture.set_button(gdk::BUTTON_SECONDARY);
+    let fe = fe.clone();
+    let area = drawing.clone();
+    gesture.connect_pressed(move |_g, _n, x, y| {
+        let mut changed = false;
+        if let Some(pane_id) = super::tiles::pane_at(&fe, x, y, area.width(), area.height()) {
+            let mut f = fe.borrow_mut();
+            if f.core.mgr.active_pane_id() != Some(pane_id.as_str()) {
+                f.core.mgr.focus_pane(pane_id);
+                f.core.needs_render = true;
+                changed = true;
+            }
+        }
+        if changed {
+            area.queue_draw();
+        }
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.popup();
+    });
+    drawing.add_controller(gesture);
+}
+
+/// Divider interaction: a hover over a divider shows a resize cursor, and a
+/// primary-button drag on a divider adjusts the owning split's ratios live
+/// (reusing the keyboard-resize wire path, [`SessionManager::set_layout_ratios`]
+/// via `ratios_for_drag`). Double-click-to-reset and text-selection suppression
+/// on dividers live in [`attach_selection`]'s press handler.
+fn attach_resize(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
+    // Hover: show a col-/row-resize cursor over a divider, default elsewhere.
+    let motion = EventControllerMotion::new();
+    {
+        let fe = fe.clone();
+        let area = drawing.clone();
+        motion.connect_motion(move |_m, x, y| {
+            let name = {
+                let f = fe.borrow();
+                super::tiles::divider_at(&f, x, y, area.width(), area.height()).map(|d| {
+                    match d.dir {
+                        SplitDir::Horizontal => "col-resize",
+                        SplitDir::Vertical => "row-resize",
+                    }
+                })
+            };
+            match name {
+                Some(n) => area.set_cursor(gdk::Cursor::from_name(n, None).as_ref()),
+                None => area.set_cursor(None),
+            }
+        });
+    }
+    {
+        let area = drawing.clone();
+        motion.connect_leave(move |_m| area.set_cursor(None));
+    }
+    drawing.add_controller(motion);
+
+    // Drag: a press that begins on a divider claims the sequence (so selection
+    // doesn't also start) and resizes the split as the pointer moves.
+    let active: Rc<RefCell<Option<Divider>>> = Rc::new(RefCell::new(None));
+    let drag = GestureDrag::new();
+    drag.set_button(gdk::BUTTON_PRIMARY);
+    {
+        let fe = fe.clone();
+        let area = drawing.clone();
+        let active = active.clone();
+        drag.connect_drag_begin(move |g, x, y| {
+            let d = {
+                let f = fe.borrow();
+                super::tiles::divider_at(&f, x, y, area.width(), area.height())
+            };
+            if d.is_some() {
+                g.set_state(EventSequenceState::Claimed);
+            }
+            *active.borrow_mut() = d;
+        });
+    }
+    {
+        let fe = fe.clone();
+        let area = drawing.clone();
+        let active = active.clone();
+        drag.connect_drag_update(move |g, ox, oy| {
+            let Some(div) = active.borrow().clone() else {
+                return;
+            };
+            let Some((sx, sy)) = g.start_point() else {
+                return;
+            };
+            let (px, py) = (sx + ox, sy + oy);
+            let mut f = fe.borrow_mut();
+            let pointer_cell = match div.dir {
+                SplitDir::Horizontal => (px / f.metrics.cell_w).max(0.0) as u16,
+                SplitDir::Vertical => (py / f.metrics.cell_h).max(0.0) as u16,
+            };
+            // Recompute against the *current* tree each update so a concurrent
+            // LayoutUpdate can't desync the drag (ratios_for_drag no-ops if the
+            // split was reshaped).
+            let Some(layout) = f.core.mgr.render_layout() else {
+                return;
+            };
+            if let Some(ratios) = ratios_for_drag(&layout, &div, pointer_cell) {
+                f.core.mgr.set_layout_ratios(div.path.clone(), ratios);
+                f.core.needs_render = true;
+            }
+            drop(f);
+            area.queue_draw();
+        });
+    }
+    {
+        let active = active.clone();
+        drag.connect_drag_end(move |_g, _ox, _oy| {
+            *active.borrow_mut() = None;
+        });
+    }
+    drawing.add_controller(drag);
+}
+
+/// Click-to-focus: a primary-button press focuses the tiled pane under the
+/// pointer. Does not claim the event, so drag-selection still starts. No-op for
+/// a single-pane tab (the click already lands on the only pane).
+fn attach_focus_click(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
+    let click = GestureClick::new();
+    let fe = fe.clone();
+    let area = drawing.clone();
+    click.connect_pressed(move |_g, _n, x, y| {
+        let (w, h) = (area.width(), area.height());
+        if let Some(pane_id) = super::tiles::pane_at(&fe, x, y, w, h) {
+            let mut f = fe.borrow_mut();
+            if f.core.mgr.active_pane_id() != Some(pane_id.as_str()) {
+                f.core.mgr.focus_pane(pane_id);
+                f.core.needs_render = true;
+            }
+        }
+        area.grab_focus();
+    });
+    drawing.add_controller(click);
 }
 
 /// Scroll wheel. Like the TUI: when the inner program enabled mouse reporting,
@@ -62,9 +217,15 @@ fn attach_scroll(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
             .unwrap_or((0.0, 0.0));
         {
             let mut f = fe.borrow_mut();
-            let col = (px / f.metrics.cell_w).max(0.0) as u16;
-            let row = (py / f.metrics.cell_h).max(0.0) as u16;
-            scroll_pane(&mut f, col, row, lines);
+            // Scroll the pane under the pointer (in its local cells), not the
+            // focused one.
+            if let Some((pane_id, rect)) =
+                super::tiles::pane_hit(&f, px, py, area.width(), area.height())
+            {
+                let col = ((px / f.metrics.cell_w) - rect.col as f64).max(0.0) as u16;
+                let row = ((py / f.metrics.cell_h) - rect.row as f64).max(0.0) as u16;
+                scroll_pane(&mut f, &pane_id, col, row, lines);
+            }
         }
         area.queue_draw();
         glib::Propagation::Stop
@@ -72,14 +233,18 @@ fn attach_scroll(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
     drawing.add_controller(scroll);
 }
 
-/// Map a pointer pixel to an absolute [`GridPos`], accounting for the current
-/// scroll position so selection works while scrolled into history. Returns
+/// Map a pointer pixel to an absolute [`GridPos`] in the focused pane, accounting
+/// for the pane's offset within a tiled tab and the current scroll position so
+/// selection works inside any tile and while scrolled into history. Returns
 /// `None` only when there is no active grid. Pixels outside the grid are clamped
 /// to the nearest edge cell by `CellGrid::visible_to_abs`.
-fn pos_at(f: &Frontend, x: f64, y: f64) -> Option<GridPos> {
+fn pos_at(f: &Frontend, x: f64, y: f64, width_px: i32, height_px: i32) -> Option<GridPos> {
     let grid = f.core.mgr.active_grid()?;
-    let col = (x / f.metrics.cell_w).floor().max(0.0) as usize;
-    let vr = (y / f.metrics.cell_h).floor().max(0.0) as usize;
+    let (off_c, off_r) = super::tiles::focused_rect(f, width_px, height_px)
+        .map(|r| (r.col as f64, r.row as f64))
+        .unwrap_or((0.0, 0.0));
+    let col = ((x / f.metrics.cell_w) - off_c).floor().max(0.0) as usize;
+    let vr = ((y / f.metrics.cell_h) - off_r).floor().max(0.0) as usize;
     Some(grid.visible_to_abs(vr, col))
 }
 
@@ -123,9 +288,28 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
         click.connect_pressed(move |_g, n_press, x, y| {
             // Clicking the terminal takes keyboard focus back from the sidebar.
             area.grab_focus();
+            // A press on a divider is a resize, not a text selection: suppress
+            // selection here (the GestureDrag handles the drag), and reset the
+            // split to even on a double-click.
+            if let Some(div) = {
+                let f = fe.borrow();
+                super::tiles::divider_at(&f, x, y, area.width(), area.height())
+            } {
+                if n_press == 2 {
+                    let mut f = fe.borrow_mut();
+                    if let Some(layout) = f.core.mgr.render_layout()
+                        && let Some(ratios) = kmux_app::layout::even_ratios_at(&layout, &div.path)
+                    {
+                        f.core.mgr.set_layout_ratios(div.path.clone(), ratios);
+                        f.core.needs_render = true;
+                    }
+                }
+                drag.set(None);
+                return;
+            }
             let sel = {
                 let f = fe.borrow();
-                let Some(pos) = pos_at(&f, x, y) else {
+                let Some(pos) = pos_at(&f, x, y, area.width(), area.height()) else {
                     drag.set(None);
                     return;
                 };
@@ -198,7 +382,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
             drag.set(Some(d));
             let end = {
                 let f = fe.borrow();
-                pos_at(&f, x, y)
+                pos_at(&f, x, y, area.width(), area.height())
             };
             if let Some(end) = end {
                 set_selection(
@@ -235,19 +419,28 @@ fn autoscroll_tick(fe: &Rc<RefCell<Frontend>>, area: &DrawingArea, drag: &Rc<Cel
     let Some(d) = drag.get() else {
         return;
     };
-    let height = area.height() as f64;
+    let (w, h) = (area.width(), area.height());
     let mut f = fe.borrow_mut();
     let cell_w = f.metrics.cell_w;
+    let cell_h = f.metrics.cell_h;
+    // Auto-scroll relative to the focused pane's tile, not the whole window, so
+    // a drag near a tile edge (mid-window) scrolls correctly.
+    let rect = super::tiles::focused_rect(&f, w, h);
+    let off_c = rect.map(|r| r.col as f64).unwrap_or(0.0);
+    let pane_top = rect.map(|r| r.row as f64 * cell_h).unwrap_or(0.0);
+    let pane_bottom = rect
+        .map(|r| (r.row + r.rows) as f64 * cell_h)
+        .unwrap_or(h as f64);
     let Some(grid) = f.core.mgr.active_grid_mut() else {
         return;
     };
     let cols = grid.cols;
     let rows = grid.rows;
-    let col = ((d.last_x / cell_w).floor().max(0.0) as usize).min(cols.saturating_sub(1));
-    let edge_vr = if d.last_y < AUTO_SCROLL_MARGIN {
+    let col = (((d.last_x / cell_w) - off_c).floor().max(0.0) as usize).min(cols.saturating_sub(1));
+    let edge_vr = if d.last_y < pane_top + AUTO_SCROLL_MARGIN {
         grid.scroll_up(AUTO_SCROLL_LINES);
         0
-    } else if d.last_y > height - AUTO_SCROLL_MARGIN {
+    } else if d.last_y > pane_bottom - AUTO_SCROLL_MARGIN {
         grid.scroll_down(AUTO_SCROLL_LINES);
         rows.saturating_sub(1)
     } else {
@@ -263,22 +456,24 @@ fn autoscroll_tick(fe: &Rc<RefCell<Frontend>>, area: &DrawingArea, drag: &Rc<Cel
     area.queue_draw();
 }
 
-/// Apply a wheel scroll to the active pane (port of the TUI `scroll_pane`).
-fn scroll_pane(f: &mut Frontend, col: u16, row: u16, lines: i32) {
-    let Some(pane_id) = f.core.mgr.active_pane_id().map(|s| s.to_string()) else {
-        return;
-    };
-    let use_pty = f
-        .core
-        .mgr
-        .buffer(&pane_id)
-        .map(|g| g.modes().mouse_report())
-        .unwrap_or(false);
+/// Apply a wheel scroll to `pane_id` (the pane under the pointer), in that
+/// pane's local cell coordinates (port of the TUI `scroll_pane`). Mouse-report
+/// is forwarded to the PTY only when the pointer is over the focused pane (input
+/// is routed to the focused pane); over any other pane the wheel scrolls that
+/// pane's local scrollback.
+fn scroll_pane(f: &mut Frontend, pane_id: &str, col: u16, row: u16, lines: i32) {
+    let focused = f.core.mgr.active_pane_id() == Some(pane_id);
+    let use_pty = focused
+        && f.core
+            .mgr
+            .buffer(pane_id)
+            .map(|g| g.modes().mouse_report())
+            .unwrap_or(false);
     if use_pty {
         let sgr = f
             .core
             .mgr
-            .buffer(&pane_id)
+            .buffer(pane_id)
             .map(|g| g.modes().sgr_mouse())
             .unwrap_or(false);
         // 1-based terminal coordinates.
@@ -286,7 +481,7 @@ fn scroll_pane(f: &mut Frontend, col: u16, row: u16, lines: i32) {
         if !bytes.is_empty() {
             f.core.mgr.send_input(bytes);
         }
-    } else if let Some(grid) = f.core.mgr.buffer_mut(&pane_id) {
+    } else if let Some(grid) = f.core.mgr.buffer_mut(pane_id) {
         if lines > 0 {
             grid.scroll_up(lines as usize);
         } else {

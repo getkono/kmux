@@ -1,6 +1,6 @@
 # Command Mode
 
-Command mode is a floating, `/`-prefixed input box for the kmux TUI that
+Command mode is a floating, `/`-prefixed input box for the kmux client that
 supplements (and partially replaces) the Zellij-style key chord tree. It is
 designed so new commands can be added by appending one struct to a static
 table — no new `Action` variants, mode arms, or rendering glue per command.
@@ -75,11 +75,11 @@ Files:
 | `crates/kmux-app/src/cmd/registry.rs` | `static ALL: &[CommandSpec]` plus the command bodies (`fn(&mut AppCore, …)`) |
 | `crates/kmux-app/src/cmd/exec.rs` | `run(&mut AppCore, buffer)` glue between submit and registry |
 | `crates/kmux-app/src/core/dispatch.rs` | `AppCore::dispatch_action` (the unified action handler) and command-edit arms |
-| `crates/kmux-tui/src/ui/overlays/command.rs` | floating overlay; reuses `render_list_picker` (TUI render leaf) |
+| `crates/kmux-gtk/src/imp/` | floating overlay rendering (GTK render leaf) |
 
 The command palette, mode model, and action dispatch are all frontend-agnostic
 and live in `kmux-app` (see [architecture-frontend.md](architecture-frontend.md));
-only the overlay's ratatui rendering stays in `kmux-tui`.
+only the overlay's rendering stays in the frontend.
 
 ## Refactor seam: `dispatch_action`
 

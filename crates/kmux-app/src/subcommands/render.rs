@@ -308,6 +308,13 @@ mod tests {
                 status: SessionStatus::Running,
                 title: String::new(),
             }],
+            tabs: vec![kmux_protocol::messages::TabInfo {
+                tab_index: 0,
+                name: "1".to_string(),
+                layout: kmux_protocol::messages::LayoutNode::single(0),
+                focused_pane: 0,
+            }],
+            active_tab: 0,
         }];
         let rows = session_rows(&sessions);
         assert_eq!(rows.len(), 1);

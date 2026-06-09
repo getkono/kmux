@@ -1,18 +1,18 @@
-//! GTK/GDK → toolkit-agnostic conversions. The GTK analog of the TUI's
-//! `key_convert` (crossterm → key) and `theme::rgb` (Rgb → ratatui Color).
+//! GTK/GDK → toolkit-agnostic conversions: GDK key events → the wire `KeyEvent`,
+//! and the palette `Rgb` → the GTK render-leaf color.
 
 use gtk4::gdk;
 use kmux_protocol::messages::{
     KeyAction as ProtoAction, KeyCode as ProtoKey, KeyEvent as ProtoKeyEvent, KeyMods as ProtoMods,
 };
 
-// NOTE: the toolkit render-leaf color conversion (the GTK analog of the TUI's
-// `Rgb -> ratatui::Color`) is currently done inline in `render` via cairo's
-// `set_source_rgb(f64, f64, f64)`. A `gdk::RGBA` conversion would be added here
-// once widget/CSS styling (rather than raw cairo) needs it.
+// NOTE: the toolkit render-leaf color conversion (palette `Rgb` → color) is
+// currently done inline in `render` via cairo's `set_source_rgb(f64, f64, f64)`.
+// A `gdk::RGBA` conversion would be added here once widget/CSS styling (rather
+// than raw cairo) needs it.
 
 /// Convert a GDK key press into the structured wire form for
-/// `ClientMessage::PtyKeyBatch`, mirroring the TUI's `convert_to_protocol_key`.
+/// `ClientMessage::PtyKeyBatch`.
 ///
 /// The daemon owns a per-pane Ghostty key encoder and turns this into the right
 /// bytes under the live terminal mode state (DECCKM, kitty kbd flags,

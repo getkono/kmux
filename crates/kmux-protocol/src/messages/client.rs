@@ -1,7 +1,8 @@
 use super::category::MessageCategory;
 use super::key::KeyEvent;
 use super::session::{
-    ClientCapabilities, ConnectionId, PaneId, RequestId, SequenceNo, TermSize, WordId,
+    ClientCapabilities, ConnectionId, LayoutScheme, PaneId, RequestId, SequenceNo, SplitDir,
+    TabIndex, TermSize, WordId,
 };
 
 /// Messages sent from client -> server.
@@ -69,10 +70,92 @@ pub enum ClientMessage {
         size: TermSize,
     },
 
-    /// Request graceful close of a single pane.
+    /// Request graceful close of a single pane. The server removes the pane's
+    /// leaf from its tab's layout tree (collapsing the parent split) and
+    /// broadcasts a `LayoutUpdate` for the affected tab.
     PaneClose {
         request_id: RequestId,
         pane_id: PaneId,
+    },
+
+    /// Create a new tab inside an existing session, with one fresh pane.
+    /// (This is what the user-facing "new tab" action does; the previous
+    /// "new pane" semantics map here.)
+    TabCreate {
+        request_id: RequestId,
+        word_id: WordId,
+        /// Shell or program to run in the tab's initial pane; defaults to the
+        /// system shell if `None`.
+        program: Option<String>,
+        args: Vec<String>,
+        size: TermSize,
+    },
+
+    /// Request graceful close of an entire tab and every pane unique to it.
+    TabClose {
+        request_id: RequestId,
+        word_id: WordId,
+        tab_index: TabIndex,
+    },
+
+    /// Rename a tab's display name.
+    TabRename {
+        request_id: RequestId,
+        word_id: WordId,
+        tab_index: TabIndex,
+        new_name: String,
+    },
+
+    /// Split the focused (or named) pane within a tab, spawning a new pane (PTY)
+    /// adjacent to it in `dir`. The server spawns the PTY, inserts its leaf into
+    /// the tab's layout tree, and broadcasts the new tree via `PaneSplit` /
+    /// `LayoutUpdate`.
+    PaneSplit {
+        request_id: RequestId,
+        word_id: WordId,
+        tab_index: TabIndex,
+        /// `pane_index` of the leaf to split.
+        from_pane: u32,
+        dir: SplitDir,
+        /// Shell or program for the new pane; defaults to the system shell.
+        program: Option<String>,
+        args: Vec<String>,
+        size: TermSize,
+    },
+
+    /// Swap two panes' positions within a tab's layout (exchange the two leaves
+    /// in place; split ratios are untouched).
+    PaneSwap {
+        word_id: WordId,
+        tab_index: TabIndex,
+        a: u32,
+        b: u32,
+    },
+
+    /// Adjust the child weights of one `Split` node, addressed by `path`
+    /// (child-index descent from the tab's layout root). Used to resize a split.
+    /// The server clamps to minimum sizes, renormalizes to 1000, and broadcasts.
+    SetLayoutRatios {
+        word_id: WordId,
+        tab_index: TabIndex,
+        path: Vec<u32>,
+        ratios: Vec<u16>,
+    },
+
+    /// Regenerate a tab's layout tree into a preset arrangement (tmux-style) from
+    /// its current panes. The server rebuilds the tree and broadcasts the result.
+    ApplyLayoutScheme {
+        word_id: WordId,
+        tab_index: TabIndex,
+        scheme: LayoutScheme,
+    },
+
+    /// Set which pane has input focus within a tab (the shared, server-tracked
+    /// focus). Broadcast to all clients viewing the tab.
+    SetFocus {
+        word_id: WordId,
+        tab_index: TabIndex,
+        pane_index: u32,
     },
 
     /// Send bytes to the PTY master (user keystrokes).
@@ -172,6 +255,14 @@ impl ClientMessage {
             | Self::SessionRename { .. }
             | Self::PaneCreate { .. }
             | Self::PaneClose { .. }
+            | Self::TabCreate { .. }
+            | Self::TabClose { .. }
+            | Self::TabRename { .. }
+            | Self::PaneSplit { .. }
+            | Self::PaneSwap { .. }
+            | Self::SetLayoutRatios { .. }
+            | Self::ApplyLayoutScheme { .. }
+            | Self::SetFocus { .. }
             | Self::Resize { .. }
             | Self::Attach { .. }
             | Self::Detach { .. }
@@ -294,6 +385,29 @@ mod tests {
     fn version_mismatch_hint_not_a_mismatch() {
         let hint = version_mismatch_hint("invalid token");
         assert!(hint.is_empty());
+    }
+
+    #[test]
+    fn apply_layout_scheme_roundtrips() {
+        use super::super::session::LayoutScheme;
+        let msg = ClientMessage::ApplyLayoutScheme {
+            word_id: "eagle".into(),
+            tab_index: 2,
+            scheme: LayoutScheme::MainHorizontal,
+        };
+        let bytes = crate::encode_client(&msg).unwrap();
+        match crate::decode_client(&bytes).unwrap() {
+            ClientMessage::ApplyLayoutScheme {
+                word_id,
+                tab_index,
+                scheme,
+            } => {
+                assert_eq!(word_id, "eagle");
+                assert_eq!(tab_index, 2);
+                assert_eq!(scheme, LayoutScheme::MainHorizontal);
+            }
+            other => panic!("expected ApplyLayoutScheme, got {other:?}"),
+        }
     }
 
     #[test]
@@ -437,6 +551,80 @@ mod tests {
             ),
             (
                 ClientMessage::SetSnapshotMode { enabled: false },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::TabCreate {
+                    request_id: 0,
+                    word_id: "w".into(),
+                    program: None,
+                    args: vec![],
+                    size: TermSize::default(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::TabClose {
+                    request_id: 0,
+                    word_id: "w".into(),
+                    tab_index: 0,
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::TabRename {
+                    request_id: 0,
+                    word_id: "w".into(),
+                    tab_index: 0,
+                    new_name: "n".into(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::PaneSplit {
+                    request_id: 0,
+                    word_id: "w".into(),
+                    tab_index: 0,
+                    from_pane: 0,
+                    dir: super::super::session::SplitDir::Horizontal,
+                    program: None,
+                    args: vec![],
+                    size: TermSize::default(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::PaneSwap {
+                    word_id: "w".into(),
+                    tab_index: 0,
+                    a: 0,
+                    b: 1,
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::SetLayoutRatios {
+                    word_id: "w".into(),
+                    tab_index: 0,
+                    path: vec![],
+                    ratios: vec![500, 500],
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::ApplyLayoutScheme {
+                    word_id: "w".into(),
+                    tab_index: 0,
+                    scheme: super::super::session::LayoutScheme::MainVertical,
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::SetFocus {
+                    word_id: "w".into(),
+                    tab_index: 0,
+                    pane_index: 0,
+                },
                 MessageCategory::Control,
             ),
             (

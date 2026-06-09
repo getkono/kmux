@@ -3,11 +3,14 @@ mod attach;
 mod crud;
 mod helpers;
 mod io;
+pub(super) mod layout;
 mod pane_crud;
 mod persistence;
 pub(super) mod restore;
+mod tab_crud;
 
 pub use attach::{AttachParams, AttachResult, InputLockOutcome};
+pub use tab_crud::PaneCloseOutcome;
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -235,13 +238,71 @@ impl PaneRelay {
     }
 }
 
-/// State for one session: its metadata plus all its panes.
+/// One tab: a named tiling layout over a subset of the session's panes.
+///
+/// The layout tree and `focused_pane` are **server-authoritative and shared**
+/// across all clients viewing the tab. The `panes` relay map on
+/// [`SessionState`] remains the single source of PTY truth; a tab's `layout`
+/// is a view over its `pane_index` keys.
+pub struct TabState {
+    pub tab_index: u32,
+    pub name: String,
+    pub layout: kmux_protocol::messages::LayoutNode,
+    /// `pane_index` of the focused leaf within this tab.
+    pub focused_pane: u32,
+}
+
+impl TabState {
+    /// Snapshot this tab as a wire [`TabInfo`].
+    pub fn to_info(&self) -> kmux_protocol::messages::TabInfo {
+        kmux_protocol::messages::TabInfo {
+            tab_index: self.tab_index,
+            name: self.name.clone(),
+            layout: self.layout.clone(),
+            focused_pane: self.focused_pane,
+        }
+    }
+}
+
+/// State for one session: its metadata, all its panes, and its tabs.
 pub struct SessionState {
     pub meta: kmux_protocol::messages::SessionMeta,
-    /// Map of pane_index -> PaneRelay.
+    /// Map of pane_index -> PaneRelay (the flat pool of PTYs; tabs reference
+    /// these by `pane_index`).
     pub panes: HashMap<u32, PaneRelay>,
     /// Next pane index to assign (monotonically increasing within this session).
     pub next_pane_index: u32,
+    /// The session's tabs (tiling layouts). Always non-empty for a live session.
+    pub tabs: Vec<TabState>,
+    /// Next tab index to assign (monotonically increasing within this session).
+    pub next_tab_index: u32,
+    /// Default/restored tab view (which tab a client views is client-local).
+    pub active_tab: u32,
+}
+
+impl SessionState {
+    /// Find a tab by index.
+    pub fn tab(&self, tab_index: u32) -> Option<&TabState> {
+        self.tabs.iter().find(|t| t.tab_index == tab_index)
+    }
+
+    /// Find a tab by index (mutable).
+    pub fn tab_mut(&mut self, tab_index: u32) -> Option<&mut TabState> {
+        self.tabs.iter_mut().find(|t| t.tab_index == tab_index)
+    }
+
+    /// Snapshot all tabs as wire [`TabInfo`]s.
+    pub fn tab_infos(&self) -> Vec<kmux_protocol::messages::TabInfo> {
+        self.tabs.iter().map(TabState::to_info).collect()
+    }
+
+    /// The tab (index) that contains the given pane, if any.
+    pub fn tab_of_pane(&self, pane_index: u32) -> Option<u32> {
+        self.tabs
+            .iter()
+            .find(|t| t.layout.leaves().contains(&pane_index))
+            .map(|t| t.tab_index)
+    }
 }
 
 /// Per-connection counters updated on every inbound/outbound frame.
@@ -343,6 +404,36 @@ impl ServerApp {
         &self,
     ) -> broadcast::Receiver<kmux_protocol::messages::ServerMessage> {
         self.vt_events_tx.subscribe()
+    }
+
+    /// Broadcast a server message to every connected client via the server-wide
+    /// event channel. Used for layout updates and tab lifecycle events, which —
+    /// like title changes — must reach all clients viewing a session, not just
+    /// those attached to one pane. Best-effort (no receivers = no-op).
+    pub fn broadcast(&self, msg: kmux_protocol::messages::ServerMessage) {
+        let _ = self.vt_events_tx.send(msg);
+    }
+
+    /// Broadcast the authoritative layout tree for a tab to all clients.
+    pub fn broadcast_layout(
+        &self,
+        word_id: &str,
+        tab_index: u32,
+        layout: kmux_protocol::messages::LayoutNode,
+        focused_pane: u32,
+    ) {
+        self.broadcast(kmux_protocol::messages::ServerMessage::LayoutUpdate {
+            word_id: word_id.to_string(),
+            tab_index,
+            layout,
+            focused_pane,
+        });
+    }
+
+    /// Broadcast a session lifecycle event (tab created/closed/renamed, layout
+    /// changed) to all connected clients.
+    pub fn broadcast_session_event(&self, event: kmux_protocol::messages::SessionEventMsg) {
+        self.broadcast(kmux_protocol::messages::ServerMessage::Event { event });
     }
 
     /// Subscribe to live connection-count changes for idle-shutdown tracking.

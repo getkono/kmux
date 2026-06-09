@@ -1,10 +1,12 @@
 use std::sync::atomic::Ordering;
 
-use kmux_protocol::messages::{ClientMessage, ErrorCode, ServerMessage, epoch_millis};
+use kmux_protocol::messages::{
+    ClientMessage, ErrorCode, ServerMessage, SessionEventMsg, epoch_millis,
+};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::app::{AttachParams, InputLockOutcome};
+use crate::app::{AttachParams, InputLockOutcome, PaneCloseOutcome};
 use crate::auth::validate_token;
 use crate::connection::classify_error;
 
@@ -149,6 +151,9 @@ pub async fn handle_message<A: PaneAttacher>(
             }
         }
 
+        // `PaneCreate` is the legacy "new pane" intent; under the Session → Tab
+        // → Pane model it creates a new TAB (with one pane). The reply still
+        // names the new pane so existing clients attach to it as before.
         ClientMessage::PaneCreate {
             request_id,
             word_id,
@@ -157,15 +162,21 @@ pub async fn handle_message<A: PaneAttacher>(
             size,
         } => match state
             .app
-            .create_pane(&word_id, program, args, size, &state.capabilities)
+            .create_tab(&word_id, program, args, size, &state.capabilities)
             .await
         {
-            Ok(pane_id) => state.send(ServerMessage::PaneCreated {
-                request_id,
-                pane_id,
-                session_word_id: word_id,
-                size,
-            }),
+            Ok((tab, pane)) => {
+                let tab_index = tab.tab_index;
+                state.send(ServerMessage::PaneCreated {
+                    request_id,
+                    pane_id: pane.pane_id,
+                    session_word_id: word_id.clone(),
+                    size,
+                });
+                state
+                    .app
+                    .broadcast_session_event(SessionEventMsg::TabCreated { word_id, tab_index });
+            }
             Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
         },
 
@@ -178,12 +189,202 @@ pub async fn handle_message<A: PaneAttacher>(
             }
             state.app.detach_from_pane(&pane_id, client_id).await;
             match state.app.close_pane(&pane_id).await {
-                Ok(exit_code) => state.send(ServerMessage::PaneClosed {
-                    request_id,
-                    pane_id,
-                    exit_code,
-                }),
+                Ok((exit_code, outcome)) => {
+                    state.send(ServerMessage::PaneClosed {
+                        request_id,
+                        pane_id: pane_id.clone(),
+                        exit_code,
+                    });
+                    let word_id = pane_id
+                        .split_once('/')
+                        .map(|(w, _)| w.to_string())
+                        .unwrap_or_default();
+                    match outcome {
+                        PaneCloseOutcome::TabUpdated {
+                            tab_index,
+                            layout,
+                            focused_pane,
+                        } => state
+                            .app
+                            .broadcast_layout(&word_id, tab_index, layout, focused_pane),
+                        PaneCloseOutcome::TabClosed { tab_index } => state
+                            .app
+                            .broadcast_session_event(SessionEventMsg::TabClosed {
+                                word_id,
+                                tab_index,
+                            }),
+                        PaneCloseOutcome::SessionClosed => state
+                            .app
+                            .broadcast_session_event(SessionEventMsg::SessionClosed { word_id }),
+                        PaneCloseOutcome::Gone => {}
+                    }
+                }
                 Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
+            }
+        }
+
+        ClientMessage::TabCreate {
+            request_id,
+            word_id,
+            program,
+            args,
+            size,
+        } => match state
+            .app
+            .create_tab(&word_id, program, args, size, &state.capabilities)
+            .await
+        {
+            Ok((tab, _pane)) => {
+                let tab_index = tab.tab_index;
+                state.send(ServerMessage::TabCreated {
+                    request_id,
+                    word_id: word_id.clone(),
+                    tab,
+                });
+                state
+                    .app
+                    .broadcast_session_event(SessionEventMsg::TabCreated { word_id, tab_index });
+            }
+            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
+        },
+
+        ClientMessage::TabClose {
+            request_id,
+            word_id,
+            tab_index,
+        } => match state.app.close_tab(&word_id, tab_index).await {
+            Ok(session_closed) => {
+                state.send(ServerMessage::TabClosed {
+                    request_id,
+                    word_id: word_id.clone(),
+                    tab_index,
+                });
+                if session_closed {
+                    state
+                        .app
+                        .broadcast_session_event(SessionEventMsg::SessionClosed { word_id });
+                } else {
+                    state
+                        .app
+                        .broadcast_session_event(SessionEventMsg::TabClosed { word_id, tab_index });
+                }
+            }
+            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
+        },
+
+        ClientMessage::TabRename {
+            request_id,
+            word_id,
+            tab_index,
+            new_name,
+        } => match state.app.rename_tab(&word_id, tab_index, &new_name).await {
+            Ok(()) => state
+                .app
+                .broadcast_session_event(SessionEventMsg::TabRenamed {
+                    word_id,
+                    tab_index,
+                    name: new_name,
+                }),
+            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
+        },
+
+        ClientMessage::PaneSplit {
+            request_id,
+            word_id,
+            tab_index,
+            from_pane,
+            dir,
+            program,
+            args,
+            size,
+        } => match state
+            .app
+            .split_pane(
+                &word_id,
+                tab_index,
+                from_pane,
+                dir,
+                program,
+                args,
+                size,
+                &state.capabilities,
+            )
+            .await
+        {
+            Ok((new_pane, layout, focused)) => {
+                state.send(ServerMessage::PaneSplit {
+                    request_id,
+                    word_id: word_id.clone(),
+                    tab_index,
+                    new_pane,
+                    layout: layout.clone(),
+                });
+                state
+                    .app
+                    .broadcast_layout(&word_id, tab_index, layout, focused);
+            }
+            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
+        },
+
+        ClientMessage::PaneSwap {
+            word_id,
+            tab_index,
+            a,
+            b,
+        } => {
+            if let Ok((layout, focused)) = state.app.swap_panes(&word_id, tab_index, a, b).await {
+                state
+                    .app
+                    .broadcast_layout(&word_id, tab_index, layout, focused);
+            }
+        }
+
+        ClientMessage::SetLayoutRatios {
+            word_id,
+            tab_index,
+            path,
+            ratios,
+        } => {
+            if let Ok((layout, focused)) = state
+                .app
+                .set_layout_ratios(&word_id, tab_index, &path, &ratios)
+                .await
+            {
+                state
+                    .app
+                    .broadcast_layout(&word_id, tab_index, layout, focused);
+            }
+        }
+
+        ClientMessage::ApplyLayoutScheme {
+            word_id,
+            tab_index,
+            scheme,
+        } => {
+            if let Ok((layout, focused)) = state
+                .app
+                .apply_layout_scheme(&word_id, tab_index, scheme)
+                .await
+            {
+                state
+                    .app
+                    .broadcast_layout(&word_id, tab_index, layout, focused);
+            }
+        }
+
+        ClientMessage::SetFocus {
+            word_id,
+            tab_index,
+            pane_index,
+        } => {
+            if let Ok((layout, focused)) = state
+                .app
+                .set_tab_focus(&word_id, tab_index, pane_index)
+                .await
+            {
+                state
+                    .app
+                    .broadcast_layout(&word_id, tab_index, layout, focused);
             }
         }
 

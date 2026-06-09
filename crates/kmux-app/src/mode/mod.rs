@@ -6,7 +6,7 @@ pub use resolve::*;
 
 use kmux_client::key::{Key, Modifiers};
 
-/// Zellij-style mode for the TUI.
+/// Zellij-style interaction mode (the modal keymap available to frontends).
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub enum Mode {
     /// Keys pass through to PTY. Only Ctrl+G is intercepted.
@@ -27,6 +27,12 @@ pub enum Mode {
     ConfirmCloseSession { word_id: String },
     /// Rename session (typing new name)
     RenameSession { word_id: String, buffer: String },
+    /// Rename a tab (typing new name)
+    RenameTab {
+        word_id: String,
+        tab_index: u32,
+        buffer: String,
+    },
     /// Floating session picker with search
     SessionPicker,
     /// Floating server picker with search (recent servers)
@@ -77,11 +83,38 @@ pub enum Action {
     RenameSubmit,
     Disconnect,
 
-    // Pane management
+    // Pane / tab management.
+    // (`CreatePane`/`NextPane`/`PrevPane` map to tab operations — the
+    // user-facing "pane" the chrome shows as a tab is now a Tab.)
     CreatePane,
     ClosePane,
     NextPane,
     PrevPane,
+    CloseTab,
+    RenameTab,
+
+    // Tiling: split the focused pane, move focus between tiled panes, and resize
+    // the focused pane's enclosing split.
+    SplitRight,
+    SplitDown,
+    FocusLeft,
+    FocusRight,
+    FocusUp,
+    FocusDown,
+    ResizeLeft,
+    ResizeRight,
+    ResizeUp,
+    ResizeDown,
+    /// Move the focused pane forward/back in the tab's leaf order (focus follows
+    /// the moved pane to its new slot).
+    SwapNext,
+    SwapPrev,
+    /// Regenerate the active tab into the next preset layout (tmux next-layout).
+    CycleLayout,
+    /// Toggle tmux-style zoom of the focused pane (client-local view flag).
+    ToggleZoom,
+    /// Focus the `i`-th pane (0-based) in the active tab's leaf order.
+    FocusPaneAt(u32),
 
     // Session picker
     CloseSessionPicker,
@@ -177,7 +210,7 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::Scroll => resolve_scroll(key, mods),
         Mode::Signal => resolve_signal(key, mods),
         Mode::ConfirmCloseSession { .. } => resolve_confirm_close(key),
-        Mode::RenameSession { .. } => resolve_rename(key, mods),
+        Mode::RenameSession { .. } | Mode::RenameTab { .. } => resolve_rename(key, mods),
         Mode::SessionPicker => resolve_session_picker(key, mods),
         Mode::ServerPicker => resolve_server_picker(key, mods),
         Mode::Help => resolve_help(key),

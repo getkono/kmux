@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Frontend-agnostic interaction layer for the kmux client, shared by the TUI and GUI frontends."
+description = "Frontend-agnostic interaction layer for the kmux client, shared by the GUI frontends."
 # Captures build metadata (git SHA, date, profile) for the CLI --version string.
 build = "build.rs"
 

@@ -1,7 +1,6 @@
 //! The native GTK window shell.
 //!
-//! Replaces the TUI-style four-bar `VBox` (`chrome.rs`) with native libadwaita
-//! chrome: an `adw::HeaderBar`, a collapsible sessions sidebar
+//! Native libadwaita chrome: an `adw::HeaderBar`, a collapsible sessions sidebar
 //! (`adw::OverlaySplitView`), and a pane tab strip (`adw::TabBar`/`TabView`).
 //! Only the terminal `DrawingArea` (painted by `render.rs`) looks like a
 //! terminal. Every widget here is a *view* of `AppCore`, reconciled by the pump

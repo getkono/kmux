@@ -2,6 +2,13 @@ set shell := ["bash", "-euo", "pipefail", "-c"]
 # Pass recipe arguments as $1, $2, ... so the release recipe can quote them safely.
 set positional-arguments
 
+# Point every recipe at the mise-pinned zig (0.15.2; see mise.toml) so the
+# kmux-ghostty-sys build picks it up even when mise is NOT activated in the
+# caller's shell (no `mise activate`/shims on PATH) and a different `zig` (e.g.
+# a Homebrew one) shadows it. build.rs honors $ZIG; we resolve it via mise and
+# fall back to bare `zig` (PATH lookup) when mise can't provide it.
+export ZIG := `mise which zig 2>/dev/null || echo zig`
+
 default:
     @just --list
 
@@ -79,16 +86,34 @@ gen-ffi-bindings profile="debug":
     echo "==> generated Swift bindings into kmux-swift/Sources/"
 
 # Build the native macOS app (kmux-swift). Regenerates bindings first.
-macos-app: gen-ffi-bindings
+swift-app: gen-ffi-bindings
     swift build --package-path kmux-swift
 
 # Run the native macOS app (kmux-swift).
-macos-run: gen-ffi-bindings
+swift-run: gen-ffi-bindings
     swift run --package-path kmux-swift
 
 # Test the native macOS app (kmux-swift).
-macos-test: gen-ffi-bindings
+swift-test: gen-ffi-bindings
     swift test --package-path kmux-swift
+
+# ── GTK app (kmux-gtk) ───────────────────────────────────────────────────────
+# The GTK4 + libadwaita client lives in crates/kmux-gtk and is the default client
+# on Linux, but also runs on macOS (needs Homebrew GTK4 + libadwaita:
+# `brew install gtk4 libadwaita`). If another pkg-config shadows the system one,
+# prefix these recipes with `PKG_CONFIG=/usr/bin/pkg-config`.
+
+# Build the GTK app (kmux-gtk).
+gtk-app:
+    cargo build -p kmux-gtk
+
+# Run the GTK app (kmux-gtk).
+gtk-run:
+    cargo run -p kmux-gtk
+
+# Test the GTK app (kmux-gtk).
+gtk-test:
+    cargo test -p kmux-gtk
 
 # Generate docs
 doc:
@@ -133,8 +158,7 @@ install:
     set -euo pipefail
     # The `kmux` entrypoint + the `kmuxd` daemon go to ~/.cargo/bin on every
     # platform; the desktop GUI is installed the platform-native way and `kmux`
-    # (no args) opens it. `kmux-tui` is NOT installed — it is reachable only via
-    # `cargo run -p kmux-tui`.
+    # (no args) opens it.
     #   - Linux: the GTK frontend `kmux-gtk` to ~/.cargo/bin (the entrypoint execs
     #            it), plus its .desktop entry + icon into the XDG data dirs
     #            (Activities / app grid).
