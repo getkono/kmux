@@ -26,6 +26,9 @@ final class KmuxModel: ObservableObject {
     /// The active tab's resolved pane rectangles (cells), recomputed each pump
     /// from the view's content area via the shared resolver.
     private(set) var layout: [FfiPaneRect] = []
+    /// The active tab's draggable dividers (cells), recomputed each pump. Empty
+    /// when a single pane fills the tab (including while zoomed).
+    private(set) var dividers: [FfiDivider] = []
     /// Each visible pane's packed grid snapshot, keyed by pane id.
     private(set) var paneSnapshots: [String: GridSnapshot] = [:]
     /// The focused pane id (the input + selection target within the tab).
@@ -112,6 +115,17 @@ final class KmuxModel: ObservableObject {
         apply(driver.selectTab(tabIndex: index))
     }
 
+    /// Resize a split by dragging `div` so its boundary sits at `pointerCell`
+    /// (cells along the divider's drag axis). Reuses the shared Rust math.
+    func applyDividerDrag(_ div: FfiDivider, pointerCell: UInt32) {
+        apply(driver.applyDividerDrag(divider: div, pointerCell: pointerCell))
+    }
+
+    /// Reset the split `div` belongs to back to even children (double-click).
+    func resetDivider(_ div: FfiDivider) {
+        apply(driver.resetDivider(divider: div))
+    }
+
     /// Focus a tiled pane within the active tab (a click on a tile). Updates the
     /// focused id optimistically so pointer coordinates map to the new pane right
     /// away; the next pump reconciles to the authoritative focus.
@@ -165,6 +179,7 @@ final class KmuxModel: ObservableObject {
         let (cols, rows) = m.colsRows(width: size.width, height: size.height)
         let rects = driver.layout(areaCols: cols, areaRows: rows)
         layout = rects
+        dividers = driver.dividers(areaCols: cols, areaRows: rows)
 
         // Push each pane's resolved sub-rect size so its PTY sizes to the tile,
         // not the whole window. Pixels are proportional (cells × cell size).

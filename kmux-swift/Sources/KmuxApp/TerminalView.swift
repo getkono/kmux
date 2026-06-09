@@ -29,6 +29,10 @@ final class TerminalNSView: NSView {
     var dragLast: NSPoint?
     /// Repeating timer that auto-scrolls while a drag sits at the viewport edge.
     var autoScrollTimer: Timer?
+    /// The divider being dragged (a press that began on a gutter), if any.
+    var activeDivider: FfiDivider?
+    /// Tracking area driving the hover resize cursor over dividers.
+    var dividerTrackingArea: NSTrackingArea?
 
     init(model: KmuxModel) {
         self.model = model

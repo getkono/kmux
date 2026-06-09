@@ -34,6 +34,17 @@ extension TerminalNSView {
 
     override func mouseDown(with event: NSEvent) {
         window?.makeFirstResponder(self)
+        // A press on a divider is a resize, not a focus/selection: a double-click
+        // resets the split to even, a single-click starts a drag.
+        if let div = dividerAt(event) {
+            if event.clickCount == 2 {
+                model.resetDivider(div)
+                activeDivider = nil
+            } else {
+                activeDivider = div
+            }
+            return
+        }
         // Click-to-focus: a press in a non-focused tile focuses it first, so the
         // selection (and its pane-local coordinates) land in the right pane.
         if let pid = paneIdAt(event), pid != model.focusedPaneId {
@@ -59,6 +70,17 @@ extension TerminalNSView {
     }
 
     override func mouseDragged(with event: NSEvent) {
+        // Live-resize while dragging a divider, recomputed against the current
+        // tree each event (the FFI no-ops if the split was reshaped).
+        if let div = activeDivider {
+            let p = convert(event.locationInWindow, from: nil)
+            let cell =
+                div.verticalBar
+                ? max(0, Int(p.x / metrics.cellWidth))
+                : max(0, Int(p.y / metrics.cellHeight))
+            model.applyDividerDrag(div, pointerCell: UInt32(cell))
+            return
+        }
         guard let anchor = dragAnchor else { return }
         dragLast = convert(event.locationInWindow, from: nil)
         let (col, row) = cellLocation(of: event)
@@ -69,7 +91,67 @@ extension TerminalNSView {
     }
 
     override func mouseUp(with event: NSEvent) {
+        if activeDivider != nil {
+            activeDivider = nil
+            return
+        }
         endDrag()
+    }
+
+    // MARK: - Divider hover + hit-test
+
+    override func mouseMoved(with event: NSEvent) {
+        if let div = dividerAt(event) {
+            (div.verticalBar ? NSCursor.resizeLeftRight : NSCursor.resizeUpDown).set()
+        } else {
+            NSCursor.arrow.set()
+        }
+    }
+
+    override func mouseExited(with event: NSEvent) {
+        NSCursor.arrow.set()
+    }
+
+    override func updateTrackingAreas() {
+        super.updateTrackingAreas()
+        if let ta = dividerTrackingArea { removeTrackingArea(ta) }
+        let ta = NSTrackingArea(
+            rect: bounds,
+            options: [.mouseMoved, .mouseEnteredAndExited, .activeInKeyWindow, .inVisibleRect],
+            owner: self, userInfo: nil)
+        addTrackingArea(ta)
+        dividerTrackingArea = ta
+    }
+
+    /// The draggable divider under a mouse event, within `dividerGrabPx` of its
+    /// gutter strip. Uses raw (whole-view) coordinates, like `paneIdAt`. When
+    /// several dividers sit near a nested corner, the nearest one wins.
+    func dividerAt(_ event: NSEvent) -> FfiDivider? {
+        let p = convert(event.locationInWindow, from: nil)
+        let cw = metrics.cellWidth
+        let ch = metrics.cellHeight
+        let slop: CGFloat = 4
+        var best: (FfiDivider, CGFloat)?
+        for d in model.dividers {
+            let px = CGFloat(d.hitCol) * cw
+            let py = CGFloat(d.hitRow) * ch
+            let pw = CGFloat(d.hitCols) * cw
+            let ph = CGFloat(d.hitRows) * ch
+            let edgeDist: CGFloat
+            let alongOk: Bool
+            if d.verticalBar {
+                edgeDist = abs(p.x - (px + pw / 2)) - pw / 2
+                alongOk = p.y >= py && p.y < py + ph
+            } else {
+                edgeDist = abs(p.y - (py + ph / 2)) - ph / 2
+                alongOk = p.x >= px && p.x < px + pw
+            }
+            if alongOk && edgeDist <= slop {
+                let key = max(edgeDist, 0)
+                if best == nil || key < best!.1 { best = (d, key) }
+            }
+        }
+        return best?.0
     }
 
     /// The visible cell under a mouse event, in the focused pane's local
