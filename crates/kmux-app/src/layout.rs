@@ -544,6 +544,16 @@ pub fn even_ratios(n: usize) -> Vec<u16> {
     vec![(1000 / n as u16).max(1); n]
 }
 
+/// Even ratios sized to the split addressed by `path` (for resetting that split
+/// to equal children — e.g. double-clicking a divider). `None` when `path` does
+/// not address a `Split`. The arity matches what `set_ratios` expects.
+pub fn even_ratios_at(root: &LayoutNode, path: &[u32]) -> Option<Vec<u16>> {
+    match node_at(root, path)? {
+        LayoutNode::Split { children, .. } => Some(even_ratios(children.len())),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

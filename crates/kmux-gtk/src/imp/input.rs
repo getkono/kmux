@@ -7,10 +7,12 @@ use std::time::Duration;
 use gtk4::prelude::*;
 use gtk4::{
     DrawingArea, EventControllerMotion, EventControllerScroll, EventControllerScrollFlags,
-    GestureClick, gdk, glib,
+    EventSequenceState, GestureClick, GestureDrag, gdk, glib,
 };
 
+use kmux_app::layout::{Divider, ratios_for_drag};
 use kmux_client::grid::{GridPos, Selection, SelectionMode};
+use kmux_protocol::messages::SplitDir;
 
 use super::Frontend;
 
@@ -33,7 +35,101 @@ const AUTO_SCROLL_INTERVAL: Duration = Duration::from_millis(16);
 pub fn attach(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
     attach_focus_click(drawing, fe);
     attach_scroll(drawing, fe);
+    attach_resize(drawing, fe);
     attach_selection(drawing, fe);
+}
+
+/// Divider interaction: a hover over a divider shows a resize cursor, and a
+/// primary-button drag on a divider adjusts the owning split's ratios live
+/// (reusing the keyboard-resize wire path, [`SessionManager::set_layout_ratios`]
+/// via `ratios_for_drag`). Double-click-to-reset and text-selection suppression
+/// on dividers live in [`attach_selection`]'s press handler.
+fn attach_resize(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
+    // Hover: show a col-/row-resize cursor over a divider, default elsewhere.
+    let motion = EventControllerMotion::new();
+    {
+        let fe = fe.clone();
+        let area = drawing.clone();
+        motion.connect_motion(move |_m, x, y| {
+            let name = {
+                let f = fe.borrow();
+                super::tiles::divider_at(&f, x, y, area.width(), area.height()).map(|d| {
+                    match d.dir {
+                        SplitDir::Horizontal => "col-resize",
+                        SplitDir::Vertical => "row-resize",
+                    }
+                })
+            };
+            match name {
+                Some(n) => area.set_cursor(gdk::Cursor::from_name(n, None).as_ref()),
+                None => area.set_cursor(None),
+            }
+        });
+    }
+    {
+        let area = drawing.clone();
+        motion.connect_leave(move |_m| area.set_cursor(None));
+    }
+    drawing.add_controller(motion);
+
+    // Drag: a press that begins on a divider claims the sequence (so selection
+    // doesn't also start) and resizes the split as the pointer moves.
+    let active: Rc<RefCell<Option<Divider>>> = Rc::new(RefCell::new(None));
+    let drag = GestureDrag::new();
+    drag.set_button(gdk::BUTTON_PRIMARY);
+    {
+        let fe = fe.clone();
+        let area = drawing.clone();
+        let active = active.clone();
+        drag.connect_drag_begin(move |g, x, y| {
+            let d = {
+                let f = fe.borrow();
+                super::tiles::divider_at(&f, x, y, area.width(), area.height())
+            };
+            if d.is_some() {
+                g.set_state(EventSequenceState::Claimed);
+            }
+            *active.borrow_mut() = d;
+        });
+    }
+    {
+        let fe = fe.clone();
+        let area = drawing.clone();
+        let active = active.clone();
+        drag.connect_drag_update(move |g, ox, oy| {
+            let Some(div) = active.borrow().clone() else {
+                return;
+            };
+            let Some((sx, sy)) = g.start_point() else {
+                return;
+            };
+            let (px, py) = (sx + ox, sy + oy);
+            let mut f = fe.borrow_mut();
+            let pointer_cell = match div.dir {
+                SplitDir::Horizontal => (px / f.metrics.cell_w).max(0.0) as u16,
+                SplitDir::Vertical => (py / f.metrics.cell_h).max(0.0) as u16,
+            };
+            // Recompute against the *current* tree each update so a concurrent
+            // LayoutUpdate can't desync the drag (ratios_for_drag no-ops if the
+            // split was reshaped).
+            let Some(layout) = f.core.mgr.render_layout() else {
+                return;
+            };
+            if let Some(ratios) = ratios_for_drag(&layout, &div, pointer_cell) {
+                f.core.mgr.set_layout_ratios(div.path.clone(), ratios);
+                f.core.needs_render = true;
+            }
+            drop(f);
+            area.queue_draw();
+        });
+    }
+    {
+        let active = active.clone();
+        drag.connect_drag_end(move |_g, _ox, _oy| {
+            *active.borrow_mut() = None;
+        });
+    }
+    drawing.add_controller(drag);
 }
 
 /// Click-to-focus: a primary-button press focuses the tiled pane under the
@@ -154,6 +250,25 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
         click.connect_pressed(move |_g, n_press, x, y| {
             // Clicking the terminal takes keyboard focus back from the sidebar.
             area.grab_focus();
+            // A press on a divider is a resize, not a text selection: suppress
+            // selection here (the GestureDrag handles the drag), and reset the
+            // split to even on a double-click.
+            if let Some(div) = {
+                let f = fe.borrow();
+                super::tiles::divider_at(&f, x, y, area.width(), area.height())
+            } {
+                if n_press == 2 {
+                    let mut f = fe.borrow_mut();
+                    if let Some(layout) = f.core.mgr.render_layout()
+                        && let Some(ratios) = kmux_app::layout::even_ratios_at(&layout, &div.path)
+                    {
+                        f.core.mgr.set_layout_ratios(div.path.clone(), ratios);
+                        f.core.needs_render = true;
+                    }
+                }
+                drag.set(None);
+                return;
+            }
             let sel = {
                 let f = fe.borrow();
                 let Some(pos) = pos_at(&f, x, y, area.width(), area.height()) else {
