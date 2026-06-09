@@ -166,6 +166,7 @@ impl ServerApp {
             scrollback.clone(),
             term_state.clone(),
             seqno_counter.clone(),
+            self.manager.clone(),
         ));
 
         Ok(PaneRelay {

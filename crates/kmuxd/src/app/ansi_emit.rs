@@ -12,13 +12,18 @@ use crate::term_state::TermState;
 /// terminal emulator.
 ///
 /// Emits the scrollback lines first (oldest → newest), then the visible
-/// viewport rows, then a dim "session restored" separator.  Because a real
-/// terminal emulator scrolls lines into its history buffer as content flows
-/// past the top of the screen, the user can scroll up to see the entire
-/// restored history.
+/// viewport rows, and — when `separator` is true — a dim "session restored"
+/// marker.  Because a real terminal emulator scrolls lines into its history
+/// buffer as content flows past the top of the screen, the user can scroll up to
+/// see the entire restored history.
+///
+/// `separator` is `true` when a fresh shell was respawned (the marker
+/// distinguishes the old history from the new prompt) and `false` for a live PTY
+/// inherited across a handoff (seamless — there is no respawn boundary).
 pub(super) fn snapshot_to_ansi(
     snapshot: &GridSnapshot,
     scrollback_lines: &[Vec<CellState>],
+    separator: bool,
 ) -> Vec<u8> {
     let mut out = Vec::new();
 
@@ -42,8 +47,11 @@ pub(super) fn snapshot_to_ansi(
         emit_cells_line(&mut out, &snapshot.cells[base..base + cols]);
     }
 
-    // Dim separator visually distinguishing the restored history from the new shell.
-    out.extend_from_slice(b"\x1b[2m[kmux: session restored]\x1b[0m\r\n");
+    // Dim separator visually distinguishing the restored history from the new
+    // shell. Omitted for inherited live PTYs, where the handoff is seamless.
+    if separator {
+        out.extend_from_slice(b"\x1b[2m[kmux: session restored]\x1b[0m\r\n");
+    }
 
     out
 }

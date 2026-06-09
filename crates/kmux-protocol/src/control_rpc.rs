@@ -23,6 +23,18 @@ pub const DAEMON_BOOT_ARGS: &[&str] = &[
     "0",
 ];
 
+/// Version of the daemon-to-daemon handoff protocol.
+///
+/// A graceful restart streams live PTY master file descriptors from the
+/// outgoing daemon to the incoming one over a Unix socket (`SCM_RIGHTS`). The
+/// two daemons may be different builds during an upgrade, so — like every other
+/// cross-component boundary in kmux — the handoff is versioned. The incoming
+/// daemon refuses the live-fd transfer on a mismatch and falls back to the
+/// (already versioned) on-disk snapshot restore, which is always safe.
+///
+/// Bump this on ANY change to the [`HandoffMessage`] wire format.
+pub const HANDOFF_PROTOCOL_VERSION: u32 = 1;
+
 /// JSON request sent to the daemon control socket.
 #[derive(Deserialize)]
 pub struct ControlRequest {
@@ -67,6 +79,68 @@ pub struct EndpointEntry {
 #[derive(Serialize, Deserialize)]
 pub struct StopResponse {
     pub status: String,
+}
+
+/// JSON response to the `"restart"` control command.
+///
+/// `handoff` is `true` when the daemon initiated a graceful live-PTY handoff to
+/// a successor instance. A daemon old enough to predate this command closes the
+/// connection without responding, so the client treats the resulting read error
+/// as "unsupported" and falls back to a hard stop-then-respawn restart.
+#[derive(Serialize, Deserialize)]
+pub struct RestartResponse {
+    pub status: String,
+    pub handoff: bool,
+}
+
+/// Per-pane metadata sent in [`HandoffMessage::Hello`].
+///
+/// The fd itself is delivered out-of-band as `SCM_RIGHTS` ancillary data on a
+/// later [`HandoffMessage::PaneFd`]; everything else the successor needs to
+/// rebuild the pane (program, size, scrollback, grid) comes from the on-disk
+/// checkpoint, keyed by `pane_id`.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct HandoffPaneMeta {
+    /// `{word_id}/{pane_index}` — the registry key shared with the checkpoint.
+    pub pane_id: String,
+    /// Child PID (informational; used by the successor for foreign-child
+    /// liveness polling, since a reparented child cannot be `waitpid`-ed).
+    pub pid: i32,
+    /// Whether a live master fd will be streamed for this pane. When `false`
+    /// (the child already exited), the successor respawns it from the snapshot.
+    pub has_live_fd: bool,
+}
+
+/// Daemon-to-daemon handoff control frames, exchanged as `\n`-delimited JSON
+/// over the handoff Unix socket. The only payload carried out-of-band (as
+/// `SCM_RIGHTS` ancillary data) is the PTY master fd on [`HandoffMessage::PaneFd`].
+///
+/// O = outgoing daemon, N = incoming (successor) daemon.
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum HandoffMessage {
+    /// O → N: opening frame. Lists every pane (in fd-stream order) and the auth
+    /// token for N to adopt so already-connected clients re-auth seamlessly.
+    Hello {
+        version: u32,
+        token: String,
+        panes: Vec<HandoffPaneMeta>,
+    },
+    /// N → O: N speaks the same handoff version and will pull the live fds.
+    Accept,
+    /// N → O: N declines the live transfer (e.g. version mismatch) and will fall
+    /// back to snapshot restore. O lets its children exit normally.
+    Decline { reason: String },
+    /// O → N: one live PTY master fd for `pane_id` follows as ancillary data.
+    PaneFd { pane_id: String },
+    /// N → O: the preceding [`PaneFd`](Self::PaneFd) was received and adopted.
+    /// Keeps fd streaming lock-step so each frame carries exactly one fd.
+    PaneFdAck,
+    /// O → N: every live fd has been streamed.
+    Complete,
+    /// N → O: N has reconstructed all panes and bound its sockets; O may exit.
+    Ack,
+    /// O → N: O has released its sockets and is exiting (informational).
+    Released,
 }
 
 /// JSON response to the `"sessions"` control command.

@@ -3,6 +3,21 @@
 All notable changes to kmux are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+
+## [Unreleased]
+
+### Features
+
+- **kmuxd:** Live PTY migration across planned daemon restarts — `kmux daemon
+  restart` now hands the running shells' PTY master fds to a freshly-spawned
+  successor over a Unix socket (`SCM_RIGHTS`), so editors/REPLs/jobs survive the
+  restart instead of being respawned. Versioned (`HANDOFF_PROTOCOL_VERSION`),
+  idempotent, and fault-tolerant: it rolls back or falls back to the existing
+  snapshot restore on any failure or version mismatch. See
+  `docs/daemon-handoff.md` ([#35](https://github.com/getkono/kmux/issues/35)).
+- **kmuxd:** Surface pane exit to clients — a shell exiting on its own now emits
+  `PaneExited` via the relay's PTY-EOF path (previously never emitted at runtime).
+
 ## [0.2.0](https://github.com/getkono/kmux/releases/tag/v0.2.0) - 2026-05-28
 
 ### Features

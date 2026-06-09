@@ -4,6 +4,7 @@ mod crud;
 mod helpers;
 mod io;
 pub(super) mod layout;
+mod migrate;
 mod pane_crud;
 mod persistence;
 pub(super) mod restore;

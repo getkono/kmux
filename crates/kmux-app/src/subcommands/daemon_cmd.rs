@@ -91,24 +91,62 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
         }
 
         DaemonAction::Restart => {
-            // Stop (ignore "not running").
-            let _ = kmux_client::daemon::stop_daemon().await;
-            // Poll until the old daemon is confirmed dead (up to 3 seconds).
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
-            loop {
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                if kmux_client::daemon::query_daemon().await.is_none() {
-                    break;
+            // If nothing is running, this is just a start.
+            let Some(old) = kmux_client::daemon::query_daemon().await else {
+                let status = kmux_client::daemon::ensure_compatible_daemon().await?;
+                println!("Daemon started — PID {}, port {}", status.pid, status.port);
+                return Ok(());
+            };
+            let old_pid = old.pid;
+
+            // Prefer a graceful live handoff so running shells survive. Fall back
+            // to a hard stop-then-respawn against a daemon too old to support it.
+            match kmux_client::daemon::restart_daemon().await {
+                Ok(true) => {
+                    // Wait for the successor (a distinct PID) to take over.
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        if let Some(s) = kmux_client::daemon::query_daemon().await
+                            && s.pid != old_pid
+                        {
+                            println!(
+                                "Daemon restarted (live handoff) — PID {}, port {}",
+                                s.pid, s.port
+                            );
+                            return Ok(());
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            anyhow::bail!(
+                                "timed out waiting for the successor daemon to take over"
+                            );
+                        }
+                    }
                 }
-                if tokio::time::Instant::now() >= deadline {
-                    anyhow::bail!("timed out waiting for daemon to stop");
+                Ok(false) => {
+                    anyhow::bail!("a restart is already in progress");
+                }
+                Err(_) => {
+                    // Old daemon predates graceful restart: hard restart (running
+                    // shells do not survive this one-time fallback).
+                    let _ = kmux_client::daemon::stop_daemon().await;
+                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(3);
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+                        if kmux_client::daemon::query_daemon().await.is_none() {
+                            break;
+                        }
+                        if tokio::time::Instant::now() >= deadline {
+                            anyhow::bail!("timed out waiting for daemon to stop");
+                        }
+                    }
+                    let status = kmux_client::daemon::ensure_compatible_daemon().await?;
+                    println!(
+                        "Daemon restarted — PID {}, port {}",
+                        status.pid, status.port
+                    );
                 }
             }
-            let status = kmux_client::daemon::ensure_compatible_daemon().await?;
-            println!(
-                "Daemon restarted — PID {}, port {}",
-                status.pid, status.port
-            );
         }
 
         DaemonAction::Sessions { all, format } => {

@@ -81,6 +81,37 @@ pub fn spawn_wait_task(pid: Pid) -> watch::Receiver<Option<ExitStatus>> {
     rx
 }
 
+/// Spawn an async task that polls a *foreign* child PID for liveness and
+/// signals exit via a `watch` channel.
+///
+/// Used for PTY sessions inherited across a daemon handoff: the child is not a
+/// child of this process (it was reparented to init when the previous daemon
+/// exited), so `waitpid` returns `ECHILD` and cannot be used. We poll
+/// `kill(pid, 0)` instead; once it reports `ESRCH` the process is gone. The
+/// exit *reason* (code/signal) is unrecoverable for a reparented process, so we
+/// report [`ExitStatus::Unknown`]. The authoritative, prompt exit signal is the
+/// PTY master returning EOF in the relay loop; this poll is a backstop that
+/// keeps `is_exited()` / `wait()` working for the inherited case.
+pub fn spawn_kill_poll_task(pid: Pid) -> watch::Receiver<Option<ExitStatus>> {
+    use std::time::Duration;
+    let (tx, rx) = watch::channel(None);
+    tokio::spawn(async move {
+        loop {
+            // `kill(pid, None)` sends no signal; it only checks existence.
+            match nix::sys::signal::kill(pid, None) {
+                Ok(()) => tokio::time::sleep(Duration::from_millis(500)).await,
+                Err(_) => {
+                    // ESRCH (gone) or EPERM (recycled into another user's pid) —
+                    // either way this child is no longer ours/alive.
+                    let _ = tx.send(Some(ExitStatus::Unknown));
+                    break;
+                }
+            }
+        }
+    });
+    rx
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

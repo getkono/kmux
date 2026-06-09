@@ -53,9 +53,10 @@ impl SessionManager {
 
     /// Register an already-constructed `PtySession` under a name.
     ///
-    /// Used when restoring a session from a checkpoint: the `PtySession` was
-    /// built from [`PtyProcess::reattach`] and needs to be tracked by the
-    /// registry so that `get_session`, `resize`, and `close` work normally.
+    /// Used when adopting a live PTY handed off from a previous daemon: the
+    /// `PtySession` was built from [`crate::PtyProcess::from_inherited`] and needs to be
+    /// tracked by the registry so that `get_session`, `resize`, and `close` work
+    /// normally.
     pub async fn register(&self, name: impl Into<String>, session: PtySession) -> Result<()> {
         let name = name.into();
         let mut sessions = self.sessions.lock().await;
@@ -157,6 +158,31 @@ impl SessionManager {
         Ok(())
     }
 
+    /// Duplicate the master fd of a named session for transfer to a successor
+    /// daemon via `SCM_RIGHTS`. The child stays alive as long as either the
+    /// original or the dup remains open.
+    pub async fn dup_master_fd(&self, name: &str) -> Result<std::os::fd::OwnedFd> {
+        let sessions = self.sessions.lock().await;
+        let session = sessions
+            .get(name)
+            .ok_or_else(|| KmuxError::SessionNotFound {
+                name: name.to_string(),
+            })?;
+        session.dup_master_fd().await
+    }
+
+    /// Whether a named session's child process has exited.
+    ///
+    /// Returns `None` if the session does not exist, `Some(true)` if its child
+    /// has exited, `Some(false)` if it is still running.
+    pub async fn is_exited(&self, name: &str) -> Option<bool> {
+        let sessions = self.sessions.lock().await;
+        match sessions.get(name) {
+            Some(session) => Some(session.is_exited().await),
+            None => None,
+        }
+    }
+
     /// Return the PID of the child process for a named session.
     ///
     /// Returns `None` if the session does not exist.
@@ -166,6 +192,20 @@ impl SessionManager {
             Some(session) => Some(session.child_pid().await),
             None => None,
         }
+    }
+
+    /// Emit a [`SessionEvent::Exited`] for a session whose child has been
+    /// observed to exit (e.g. the relay loop detected PTY EOF).
+    ///
+    /// Unlike [`close`](Self::close) this does *not* remove the session from the
+    /// registry — it only notifies subscribers. This is the path that surfaces a
+    /// naturally-exiting shell (and an exited foreign child inherited across a
+    /// daemon handoff, which cannot be `waitpid`-ed) to attached clients.
+    pub fn notify_exited(&self, name: &str, status: ExitStatus) {
+        self.events.emit(SessionEvent::Exited {
+            name: name.to_string(),
+            status,
+        });
     }
 
     /// Set keep-alive mode on all active sessions.
