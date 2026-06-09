@@ -154,6 +154,36 @@ extension TerminalNSView {
         return best?.0
     }
 
+    // MARK: - Context menu
+
+    /// Right-click context menu on a pane: focus the pane under the pointer (so
+    /// the items target it) and offer the same actions as the Pane menu.
+    override func menu(for event: NSEvent) -> NSMenu? {
+        if let pid = paneIdAt(event), pid != model.focusedPaneId {
+            model.focusPane(pid)
+        }
+        let menu = NSMenu()
+        menu.addItem(paneMenuItem("Split Right", .splitRight))
+        menu.addItem(paneMenuItem("Split Down", .splitDown))
+        menu.addItem(paneMenuItem("Zoom Pane", .toggleZoom))
+        menu.addItem(.separator())
+        menu.addItem(paneMenuItem("Close Pane", .closePane))
+        return menu
+    }
+
+    private func paneMenuItem(_ title: String, _ action: FfiAction) -> NSMenuItem {
+        let item = NSMenuItem(
+            title: title, action: #selector(dispatchPaneAction(_:)), keyEquivalent: "")
+        item.target = self
+        item.representedObject = action
+        return item
+    }
+
+    @objc private func dispatchPaneAction(_ sender: NSMenuItem) {
+        guard let action = sender.representedObject as? FfiAction else { return }
+        model.dispatch(action)
+    }
+
     /// The visible cell under a mouse event, in the focused pane's local
     /// coordinates (the FFI selection setters act on the focused grid). The FFI
     /// clamps to the grid, so out-of-bounds values here are harmless.

@@ -165,6 +165,14 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut(.upArrow, modifiers: [.command, .option])
             Button("Focus Down") { model.dispatch(.focusDown) }
                 .keyboardShortcut(.downArrow, modifiers: [.command, .option])
+            Menu("Focus Pane") {
+                ForEach(1...9, id: \.self) { n in
+                    Button("Pane \(n)") {
+                        model.dispatch(.focusPaneAt(index: UInt32(n - 1)))
+                    }
+                    .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: .command)
+                }
+            }
             Divider()
             Button("Resize Left") { model.dispatch(.resizeLeft) }
                 .keyboardShortcut(.leftArrow, modifiers: [.command, .control])
