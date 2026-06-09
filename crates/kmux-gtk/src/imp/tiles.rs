@@ -9,7 +9,7 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use kmux_app::layout::{LayoutConfig, resolve_layout};
+use kmux_app::layout::{LayoutConfig, PaneRect, resolve_layout};
 use kmux_protocol::messages::TermSize;
 
 use super::Frontend;
@@ -54,15 +54,17 @@ pub fn push_sizes(fe: &Rc<RefCell<Frontend>>, width_px: i32, height_px: i32) {
     f.core.mgr.set_pane_sizes(sizes);
 }
 
-/// The pane id at pixel position `(x, y)` within the drawing, if any.
-pub fn pane_at(
-    fe: &Rc<RefCell<Frontend>>,
+/// The pane id and its resolved cell rect at pixel `(x, y)` within the drawing,
+/// or `None` in a gutter / when there's no active tab. Pointer handlers use the
+/// rect to map a window pixel into the pane's *local* cell grid (selection and
+/// scroll are otherwise off by the pane's offset inside a tiled tab).
+pub fn pane_hit(
+    f: &Frontend,
     x: f64,
     y: f64,
     width_px: i32,
     height_px: i32,
-) -> Option<String> {
-    let f = fe.borrow();
+) -> Option<(String, PaneRect)> {
     let (cols, rows) = f.metrics.cols_rows(width_px, height_px);
     let layout = f.core.mgr.render_layout()?;
     let word = f.core.mgr.active_session()?.to_string();
@@ -71,8 +73,37 @@ pub fn pane_at(
         let (px, py) = (r.col as f64 * cw, r.row as f64 * ch);
         let (pw, ph) = (r.cols as f64 * cw, r.rows as f64 * ch);
         if x >= px && x < px + pw && y >= py && y < py + ph {
-            return Some(format!("{word}/{}", r.pane_index));
+            return Some((format!("{word}/{}", r.pane_index), r));
         }
     }
     None
+}
+
+/// The pane id at pixel position `(x, y)` within the drawing, if any.
+pub fn pane_at(
+    fe: &Rc<RefCell<Frontend>>,
+    x: f64,
+    y: f64,
+    width_px: i32,
+    height_px: i32,
+) -> Option<String> {
+    pane_hit(&fe.borrow(), x, y, width_px, height_px).map(|(id, _)| id)
+}
+
+/// The currently-focused pane's resolved rect within a `width_px × height_px`
+/// area. Lets pointer handlers map a window pixel into the focused pane's local
+/// cell grid — selection and auto-scroll act on the focused pane, which
+/// click-to-focus has already moved under the pointer on press.
+pub fn focused_rect(f: &Frontend, width_px: i32, height_px: i32) -> Option<PaneRect> {
+    let (cols, rows) = f.metrics.cols_rows(width_px, height_px);
+    let layout = f.core.mgr.render_layout()?;
+    let focused = f
+        .core
+        .mgr
+        .active_pane_id()
+        .and_then(|p| p.rsplit_once('/'))
+        .and_then(|(_, i)| i.parse::<u32>().ok())?;
+    resolve_layout(&layout, cols, rows, &cfg())
+        .into_iter()
+        .find(|r| r.pane_index == focused)
 }
