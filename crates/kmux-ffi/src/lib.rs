@@ -58,7 +58,7 @@ use kmux_client::generate_instance_id;
 use kmux_client::grid::{GridPos, Selection, SelectionMode};
 use kmux_client::input::{char_to_proto_key, encode_mouse_scroll};
 use kmux_protocol::messages::{
-    ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, TermSize,
+    ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, SplitDir, TermSize,
 };
 
 uniffi::setup_scaffolding!();
@@ -68,7 +68,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 4;
+pub const KMUX_FFI_ABI_VERSION: u32 = 5;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -136,7 +136,9 @@ pub enum FfiAction {
     CloseSession,
     NextSession,
     PrevSession,
-    JumpToSession { index: u32 },
+    JumpToSession {
+        index: u32,
+    },
     CreatePane,
     ClosePane,
     NextPane,
@@ -158,8 +160,16 @@ pub enum FfiAction {
     SwapPrev,
     CycleLayout,
     ToggleZoom,
-    ScrollUp { lines: u32 },
-    ScrollDown { lines: u32 },
+    /// Focus the `index`-th pane (0-based) in the active tab's leaf order.
+    FocusPaneAt {
+        index: u32,
+    },
+    ScrollUp {
+        lines: u32,
+    },
+    ScrollDown {
+        lines: u32,
+    },
     ScrollPageUp,
     ScrollPageDown,
     ToggleHud,
@@ -199,6 +209,7 @@ impl From<FfiAction> for Action {
             FfiAction::SwapPrev => Action::SwapPrev,
             FfiAction::CycleLayout => Action::CycleLayout,
             FfiAction::ToggleZoom => Action::ToggleZoom,
+            FfiAction::FocusPaneAt { index } => Action::FocusPaneAt(index),
             FfiAction::ScrollUp { lines } => Action::ScrollUp(lines as usize),
             FfiAction::ScrollDown { lines } => Action::ScrollDown(lines as usize),
             FfiAction::ScrollPageUp => Action::ScrollPageUp,
@@ -491,6 +502,59 @@ pub struct FfiPaneSize {
     pub cols: u16,
     pub pixel_width: u16,
     pub pixel_height: u16,
+}
+
+/// A draggable boundary between two adjacent tiles, mirroring
+/// `kmux_app::layout::Divider`. Returned by [`KmuxDriver::dividers`] for
+/// hit-testing + cursor; pass one back to [`KmuxDriver::apply_divider_drag`]
+/// with a pointer cell to resize. `vertical_bar` is `true` for a vertical bar
+/// dragged along the column axis (a col-resize), `false` for a horizontal bar
+/// dragged along the row axis (a row-resize).
+#[derive(uniffi::Record)]
+pub struct FfiDivider {
+    pub path: Vec<u32>,
+    pub vertical_bar: bool,
+    pub before: u32,
+    pub hit_col: u32,
+    pub hit_row: u32,
+    pub hit_cols: u32,
+    pub hit_rows: u32,
+    pub pair_start: u32,
+    pub pair_len: u32,
+}
+
+impl FfiDivider {
+    fn from_layout(d: kmux_app::layout::Divider) -> Self {
+        Self {
+            path: d.path,
+            vertical_bar: matches!(d.dir, SplitDir::Horizontal),
+            before: d.before as u32,
+            hit_col: d.hit_col as u32,
+            hit_row: d.hit_row as u32,
+            hit_cols: d.hit_cols as u32,
+            hit_rows: d.hit_rows as u32,
+            pair_start: d.pair_start as u32,
+            pair_len: d.pair_len as u32,
+        }
+    }
+
+    fn into_layout(self) -> kmux_app::layout::Divider {
+        kmux_app::layout::Divider {
+            path: self.path,
+            dir: if self.vertical_bar {
+                SplitDir::Horizontal
+            } else {
+                SplitDir::Vertical
+            },
+            before: self.before as usize,
+            hit_col: self.hit_col as u16,
+            hit_row: self.hit_row as u16,
+            hit_cols: self.hit_cols as u16,
+            hit_rows: self.hit_rows as u16,
+            pair_start: self.pair_start as u16,
+            pair_len: self.pair_len as u16,
+        }
+    }
 }
 
 /// One selected span on a *visible* display row (row 0 = top visible row), in
@@ -971,6 +1035,80 @@ impl KmuxDriver {
             })
             .collect();
         d.mgr.set_pane_sizes(mapped);
+    }
+
+    /// Enumerate the active tab's draggable dividers within an
+    /// `area_cols × area_rows` content area, via the shared
+    /// `kmux_app::layout::resolve_dividers` (so divider geometry matches the
+    /// tiles from [`layout`](Self::layout)). Empty when there is no active tab
+    /// or the focused pane is zoomed (a single tile has no boundary). The
+    /// frontend hit-tests a pointer against the `hit_*` strip for the resize
+    /// cursor + drag start.
+    pub fn dividers(&self, area_cols: u16, area_rows: u16) -> Vec<FfiDivider> {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let Some(layout) = d.mgr.render_layout() else {
+            return Vec::new();
+        };
+        kmux_app::layout::resolve_dividers(
+            &layout,
+            area_cols,
+            area_rows,
+            &kmux_app::layout::LayoutConfig::default(),
+        )
+        .into_iter()
+        .map(FfiDivider::from_layout)
+        .collect()
+    }
+
+    /// Resize a split by dragging its `divider` so the boundary sits at
+    /// `pointer_cell` (cells along the divider's drag axis). Recomputes the new
+    /// ratios against the current tree via `kmux_app::layout::ratios_for_drag`
+    /// and sends `SetLayoutRatios` (the same wire path as keyboard resize; the
+    /// server clamps, renormalizes, and broadcasts). No-op (empty effects) when
+    /// the split was reshaped or the move clamps to nothing. Signals a render.
+    pub fn apply_divider_drag(&self, divider: FfiDivider, pointer_cell: u32) -> Vec<FfiEffect> {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let Some(layout) = d.mgr.render_layout() else {
+            return Vec::new();
+        };
+        let divider = divider.into_layout();
+        let Some(ratios) =
+            kmux_app::layout::ratios_for_drag(&layout, &divider, pointer_cell as u16)
+        else {
+            return Vec::new();
+        };
+        let core = d.core_mut();
+        core.mgr.set_layout_ratios(divider.path, ratios);
+        core.needs_render = true;
+        vec![FfiEffect::NeedsRender]
+    }
+
+    /// Reset the split a `divider` belongs to back to even children (a
+    /// double-click on the divider). No-op when the divider's split is gone.
+    /// Signals a render.
+    pub fn reset_divider(&self, divider: FfiDivider) -> Vec<FfiEffect> {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let Some(layout) = d.mgr.render_layout() else {
+            return Vec::new();
+        };
+        let path = divider.path;
+        let Some(ratios) = kmux_app::layout::even_ratios_at(&layout, &path) else {
+            return Vec::new();
+        };
+        let core = d.core_mut();
+        core.mgr.set_layout_ratios(path, ratios);
+        core.needs_render = true;
+        vec![FfiEffect::NeedsRender]
+    }
+
+    /// Rename a tab of the active session (a native rename sheet). Signals a
+    /// render.
+    pub fn rename_tab(&self, tab_index: u32, name: String) -> Vec<FfiEffect> {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.mgr.rename_tab(tab_index, &name);
+        core.needs_render = true;
+        vec![FfiEffect::NeedsRender]
     }
 
     /// Cheap grid identity for a specific pane (per-tile change detection).
@@ -1506,12 +1644,12 @@ mod tests {
     }
 
     #[test]
-    fn abi_version_is_four() {
-        // The tiling surface (tabs/layout/per-pane grid/new actions, then preset
-        // layouts + zoom) bumped the ABI; the Swift wrapper asserts the same
-        // constant on startup.
-        assert_eq!(KMUX_FFI_ABI_VERSION, 4);
-        assert_eq!(kmux_ffi_abi_version(), 4);
+    fn abi_version_is_five() {
+        // The interactive-tiling surface (dividers + apply_divider_drag /
+        // reset_divider, numbered FocusPaneAt, rename_tab) bumped the ABI to 5;
+        // the Swift wrapper asserts the same constant on startup.
+        assert_eq!(KMUX_FFI_ABI_VERSION, 5);
+        assert_eq!(kmux_ffi_abi_version(), 5);
     }
 
     #[test]
@@ -1524,5 +1662,33 @@ mod tests {
         assert_eq!(Action::from(FfiAction::CloseTab), Action::CloseTab);
         assert_eq!(Action::from(FfiAction::CycleLayout), Action::CycleLayout);
         assert_eq!(Action::from(FfiAction::ToggleZoom), Action::ToggleZoom);
+        assert_eq!(
+            Action::from(FfiAction::FocusPaneAt { index: 2 }),
+            Action::FocusPaneAt(2)
+        );
+    }
+
+    #[test]
+    fn divider_round_trips_through_ffi() {
+        let d = kmux_app::layout::Divider {
+            path: vec![1, 0],
+            dir: SplitDir::Vertical,
+            before: 1,
+            hit_col: 3,
+            hit_row: 12,
+            hit_cols: 40,
+            hit_rows: 1,
+            pair_start: 6,
+            pair_len: 24,
+        };
+        let back = FfiDivider::from_layout(d.clone()).into_layout();
+        assert_eq!(back, d);
+        // The Horizontal/Vertical ⇄ vertical_bar mapping is faithful.
+        assert!(!FfiDivider::from_layout(d.clone()).vertical_bar);
+        let h = kmux_app::layout::Divider {
+            dir: SplitDir::Horizontal,
+            ..d
+        };
+        assert!(FfiDivider::from_layout(h).vertical_bar);
     }
 }
