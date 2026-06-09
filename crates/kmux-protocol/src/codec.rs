@@ -226,6 +226,7 @@ mod tests {
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
             history_total: 0,
+            scrollback_reset: None,
         };
         let msg = ServerMessage::TerminalUpdate {
             pane_id: "eagle/0".to_string(),
@@ -255,6 +256,7 @@ mod tests {
             },
             modes: TermModes(TermModes::APP_CURSOR),
             history_total: 0,
+            scrollback_base: 0,
             scrollback_tail: Vec::new(),
         };
         let msg = ServerMessage::TerminalSnapshot {
@@ -300,6 +302,7 @@ mod tests {
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
             history_total: 0,
+            scrollback_reset: None,
         };
         let msg = ServerMessage::TerminalUpdate {
             pane_id: "eagle/0".to_string(),

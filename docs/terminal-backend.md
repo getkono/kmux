@@ -236,9 +236,11 @@ and move to lazy fetch.
 
 ### Invariants
 
-1. **Snapshots never wipe scrollback.** `apply_snapshot` rewrites only the
-   viewport; scrollback persists across resize and reattach. Explicit
-   `SyncReset` or session restart are the only paths that clear history.
+1. **Snapshots never wipe scrollback on their own.** `apply_snapshot` rewrites
+   only the viewport; scrollback persists across resize and reattach. The paths
+   that *do* clear history are explicit: an inner-program wipe (`clear` /
+   `RIS`, carried by `TerminalDiff::scrollback_reset`), the snapshot's
+   `scrollback_base` advancing past held lines, `SyncReset`, or session restart.
 2. **Every scrollback line has an absolute `u64` index.** The index is
    monotonic for the life of the pane and shared end-to-end. An `append` at
    `first_index = N` asserts `N == current base + len()`; a mismatch is a
@@ -264,11 +266,13 @@ pub struct ScrollbackMirror {
 }
 ```
 
-Addressable API: `append`, `history_total`, `base_index`, `range(start, count)`,
-`tail(n)`, `tail_first_index(n)`. When the ring is full, the oldest line is
-evicted and `base_index` advances. Indices below `base_index` are
-unrecoverable from the mirror; a client that asks for them gets a clamped
-response starting at `base_index`.
+Addressable API: `append`, `reset`, `history_total`, `base_index`,
+`range(start, count)`, `tail(n)`, `tail_first_index(n)`. When the ring is full,
+the oldest line is evicted and `base_index` advances. `reset()` drops every
+held line and advances `base_index` to `history_total()` (used on an
+inner-program scrollback wipe — see [v22](#wire-changes-v22--scrollback-wipe-on-clear)).
+Indices below `base_index` are unrecoverable from the mirror; a client that asks
+for them gets a clamped response starting at `base_index`.
 
 ### Wire changes (v15)
 
@@ -316,17 +320,42 @@ is a wire break, which is why v14 → v15 → v16 each bump the version.
   DECSCUSR toggle with no cell change still reaches clients as a `CursorOnly`
   diff (the diff engine compares the whole `CursorState`).
 
+### Wire changes (v22) — scrollback wipe on `clear`
+
+`PROTOCOL_VERSION` = **22**. Fixes [#57](https://github.com/getkono/kmux/issues/57):
+`clear` (`CSI 3J`), `Ctrl+L`, and `RIS` (`ESC c` / `tput reset`) blanked the
+viewport but left the old scrollback recoverable, because the daemon mirror is
+append-only and never shrank when the backend's history did.
+
+- `TerminalDiff` gains `scrollback_reset: Option<u64>`. `Some(base)` means the
+  inner program wiped scrollback this frame; the client drops every line below
+  `base` (its new oldest index) **before** applying the diff. Because it rides
+  the diff, it is replayed from the `DiffBuffer` on a `Delta` reattach.
+- `GridSnapshot` gains `scrollback_base: u64` (the mirror's `base_index`). On
+  `apply_snapshot` the client unconditionally evicts everything below it — this
+  covers the *clear-then-resize* reconnect where the snapshot tail is empty but
+  stale lines are still held (so the `seed_tail` guard alone would miss them).
+
+Detection is entirely daemon-side and ABI-free: `compute_diff` treats any
+`history_size()` **decrease** on the primary screen (alt-screen and resize are
+handled by earlier branches; cap eviction plateaus rather than shrinking) as a
+wipe. It calls `ScrollbackMirror::reset()`, re-seeds from the backend's
+surviving scrollback, and stamps `scrollback_reset` with the post-reset base.
+`history_total` stays monotonic across the wipe. When survivors exist (the
+OSC 133 `scrollClear` path), the relay emits the `TerminalUpdate` **before** the
+`ScrollbackAppend` so the client wipes before the survivors land.
+
 ### Daemon flow (per diff)
 
 ```
 PTY bytes ──► backend.feed() ──► backend.history_size() vs prev
                                       │
-                              new scrollback lines
-                                      │
+                  grew ──► new lines  │  shrank ──► mirror.reset() + re-seed
+                                      │            (scrollback_reset = base)
                            mirror.append(lines) ──► (first_index, count)
                                       │
-                     TerminalDiff { ..., history_total }  ──► TerminalUpdate
-                                      │
+                     TerminalDiff { ..., history_total, scrollback_reset }
+                                      │                    ──► TerminalUpdate
                      ScrollbackAppend { first_index, lines }  (separate msg)
 ```
 
@@ -355,6 +384,12 @@ pub struct ScrollbackBuffer {
   On gap the buffer is cleared and the client will re-seed from the next
   snapshot (Phase B) or issue `FetchHistory` (Phase C).
 - `get_absolute(idx)` — O(1) lookup by absolute index.
+- `reset_to(history_total)` — wipe all lines and re-anchor `base_index` at
+  `history_total` (keeps the index space monotonic). Called from `apply_diff`
+  on `scrollback_reset`.
+- `evict_before(base)` — drop lines older than absolute `base`; if the buffer
+  holds fewer, empty it and re-anchor at `base`. Called unconditionally from
+  `apply_snapshot` against `GridSnapshot::scrollback_base`.
 
 `apply_diff` derives `first_index = history_total - scrollback_lines.len()`
 and calls `append_with_index`. `apply_scrollback_append` handles the

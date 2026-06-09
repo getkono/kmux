@@ -192,6 +192,7 @@ impl<B: TerminalBackend> DiffEngine<B> {
 
         let scrollback_tail = self.mirror.tail(SNAPSHOT_TAIL_LINES);
         let history_total = self.mirror.history_total();
+        let scrollback_base = self.mirror.base_index();
 
         GridSnapshot {
             rows: self.rows,
@@ -200,6 +201,7 @@ impl<B: TerminalBackend> DiffEngine<B> {
             cursor,
             modes,
             history_total,
+            scrollback_base,
             scrollback_tail,
         }
     }

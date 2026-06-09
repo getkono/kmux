@@ -662,6 +662,7 @@ mod tests {
             cursor: Default::default(),
             modes: TermModes::EMPTY,
             history_total: 0,
+            scrollback_base: 0,
             scrollback_tail: Vec::new(),
         };
         mgr.handle_server_message(ServerMessage::TerminalSnapshot {
@@ -693,6 +694,7 @@ mod tests {
             cursor: Default::default(),
             modes: TermModes::EMPTY,
             history_total: 0,
+            scrollback_reset: None,
         });
         mgr.handle_server_message(ServerMessage::TerminalUpdate {
             pane_id: "eagle/0".to_string(),
@@ -1118,6 +1120,7 @@ mod tests {
                 cursor: Default::default(),
                 modes: TermModes::EMPTY,
                 history_total,
+                scrollback_reset: None,
             })
         };
 
