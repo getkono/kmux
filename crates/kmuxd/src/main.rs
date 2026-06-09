@@ -9,6 +9,7 @@ mod connection;
 mod conversions;
 mod daemon;
 mod diff_engine;
+mod handoff;
 mod persist;
 mod relay;
 mod scrollback;
@@ -84,6 +85,13 @@ struct Cli {
     /// set; absent leaves each listener's configured port intact.
     #[arg(long)]
     tcp_port: Option<u16>,
+
+    /// Pull live PTY sessions from a still-running daemon during a graceful
+    /// restart. Set automatically by the outgoing daemon when it spawns its
+    /// successor; not intended for manual use. On any failure the daemon falls
+    /// back to the normal on-disk snapshot restore.
+    #[arg(long)]
+    handoff: bool,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -129,7 +137,15 @@ fn main() -> anyhow::Result<()> {
 
     if cli.daemon {
         let pid_path = kmux_protocol::dirs::pid_path()?;
-        daemon::daemonize_process(&pid_path)?;
+        // A graceful-restart successor (`--handoff`) must NOT take the pid file
+        // here: the predecessor still holds its `flock`. It writes the pid file
+        // itself once the predecessor exits (see `startup::async_main`).
+        let pid_arg = if cli.handoff {
+            None
+        } else {
+            Some(pid_path.as_path())
+        };
+        daemon::daemonize_process(pid_arg)?;
         // After this point we are in the daemonized child process with fresh fds.
     }
 
@@ -235,7 +251,7 @@ fn main() -> anyhow::Result<()> {
 
     let rt = tokio::runtime::Runtime::new()?;
     rt.block_on(
-        startup::async_main(cli.daemon, server_cfg)
+        startup::async_main(cli.daemon, cli.handoff, server_cfg)
             .instrument(tracing::info_span!("instance", id = %instance_id)),
     )?;
 

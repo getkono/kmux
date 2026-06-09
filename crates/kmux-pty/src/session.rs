@@ -39,10 +39,11 @@ impl PtySession {
         })
     }
 
-    /// Wrap an already-spawned (or reattached) `PtyProcess` in a session.
+    /// Wrap an already-spawned (or inherited) `PtyProcess` in a session.
     ///
-    /// Used when restoring a session from a checkpoint: the `PtyProcess` was
-    /// created via [`PtyProcess::reattach`] against a still-alive child.
+    /// Used when adopting a live PTY handed off from a previous daemon: the
+    /// `PtyProcess` was created via [`PtyProcess::from_inherited`] against a
+    /// still-alive (foreign) child.
     pub fn from_process(pty: PtyProcess) -> Self {
         Self {
             inner: Arc::new(Mutex::new(Inner { pty })),
@@ -145,6 +146,22 @@ impl PtySession {
     /// Return the PID of the child process.
     pub async fn child_pid(&self) -> nix::unistd::Pid {
         self.inner.lock().await.pty.pid
+    }
+
+    /// Duplicate the PTY master fd into an owning handle for transfer to a
+    /// successor daemon via `SCM_RIGHTS`.
+    ///
+    /// The returned fd shares the underlying open file description, so the child
+    /// keeps its controlling terminal as long as either the original or this dup
+    /// remains open — the basis for live PTY migration across a daemon handoff.
+    pub async fn dup_master_fd(&self) -> Result<std::os::fd::OwnedFd> {
+        self.inner
+            .lock()
+            .await
+            .pty
+            .io
+            .dup_owned()
+            .map_err(KmuxError::Io)
     }
 
     /// Enable or disable keep-alive mode.

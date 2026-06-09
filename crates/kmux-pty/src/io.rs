@@ -68,6 +68,23 @@ impl PtyMasterIo {
         }
         Self::new(new_fd)
     }
+
+    /// Duplicate the underlying fd into an owning handle for transfer to another
+    /// process via `SCM_RIGHTS`.
+    ///
+    /// The returned fd refers to the same open file description as this one, so
+    /// the child keeps its controlling terminal as long as *either* fd stays
+    /// open — the guarantee that lets a live PTY survive a daemon handoff. The
+    /// caller owns the result and is responsible for closing (or sending) it.
+    pub fn dup_owned(&self) -> io::Result<std::os::fd::OwnedFd> {
+        use std::os::fd::FromRawFd;
+        let new_fd = unsafe { nix::libc::dup(self.as_raw_fd()) };
+        if new_fd < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: `dup` returned a fresh, valid, owned fd.
+        Ok(unsafe { std::os::fd::OwnedFd::from_raw_fd(new_fd) })
+    }
 }
 
 impl PtyMasterIo {

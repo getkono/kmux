@@ -443,6 +443,15 @@ and arguments as the original.  The previous terminal grid is injected into
 the emulator as ANSI bytes so clients see the old visual state in the
 scrollback buffer when they first attach.
 
+Pane construction is factored into `build_pane_relay(pane_id, persisted, reader,
+writer, seed: SeedMode)`. A cold start / fallback restore uses
+`SeedMode::Respawned` (fresh shell + ANSI replay **with** a "[kmux: session
+restored]" separator). A **graceful handoff** successor instead inherits the
+predecessor's *live* PTY fd per pane and uses `SeedMode::Inherited` (same seed,
+**no** separator — the live process simply continues): see
+`restore_with_handoff` and `docs/daemon-handoff.md`. Panes whose child already
+exited fall back to the respawn path.
+
 ---
 
 ## 12. Client Attachment and Scrollback Replay (`app/attach.rs`)
@@ -517,6 +526,18 @@ Triggered by SIGINT, SIGTERM, or `stop` via the control socket:
 Client connections in progress are dropped ungracefully (no graceful disconnect
 message is sent).
 
+### 14.1 Graceful restart with live PTY handoff
+
+`restart` via the control socket takes a **distinct** path (`handoff::sender`):
+the daemon spawns a successor and streams each pane's live PTY master fd to it
+over `handoff.sock` (`SCM_RIGHTS`), so running shells survive the restart.
+Instead of the abort→checkpoint→exit sequence above, the outgoing daemon
+quiesces its relays *after* the successor confirms it holds every fd, writes a
+post-quiesce checkpoint, releases its sockets, and exits; the successor adopts
+the auth token and rebuilds each pane around the inherited fd. On any failure it
+rolls back (or the successor falls back to snapshot restore). Full sequence,
+versioning, and fault-tolerance model: `docs/daemon-handoff.md`.
+
 ---
 
 ## 15. Runtime Directory Layout
@@ -525,11 +546,11 @@ All paths resolve via `kmux_protocol::dirs`:
 
 ```
 $XDG_RUNTIME_DIR/kmux/
-  kmuxd.pid           PID of the running daemon
-  control             Unix control socket (status/stop/sessions)
+  daemon.pid          PID of the running daemon
+  daemon.sock         Unix control socket (status/stop/restart/sessions)
+  daemon-data.sock    Data socket (UDS listener for local clients)
+  handoff.sock        Transient: live-PTY fd transfer during a graceful restart
   token               Auth token (0600)
-  kmuxd.log           Daemon log (append)
-  kmux.sock           Data socket (UDS listener for local clients)
   session_state.bin   Periodic/shutdown checkpoint (postcard format)
   session_state.bin.tmp  Transient during atomic write
 ```

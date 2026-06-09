@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -10,25 +11,36 @@ use tracing::{error, info, warn};
 use crate::announce::{BootstrapPath, build_endpoint_list};
 use crate::app::ServerApp;
 use crate::config::ListenConfig;
-use kmux_protocol::control_rpc::{ControlRequest, EndpointEntry, StatusResponse, StopResponse};
+use kmux_protocol::control_rpc::{
+    ControlRequest, EndpointEntry, RestartResponse, StatusResponse, StopResponse,
+};
 
-/// Daemonize the current process (double-fork) and write the child PID to `pid_path`.
+/// Daemonize the current process (double-fork), optionally writing+locking the
+/// child PID into `pid_path`.
 ///
 /// This MUST be called before any tokio runtime is created — fork and async
 /// runtimes do not mix safely.
-pub fn daemonize_process(pid_path: &Path) -> anyhow::Result<()> {
+///
+/// `pid_path` is `None` for a graceful-restart successor: the `daemonize` crate
+/// `flock`s the pid file, and the predecessor still holds that lock, so a
+/// successor must daemonize without it and write the pid file itself once the
+/// predecessor has exited (see `startup::async_main`).
+pub fn daemonize_process(pid_path: Option<&Path>) -> anyhow::Result<()> {
     use daemonize::{Daemonize, Stdio};
 
     // Keep inherited stdout/stderr so errors that occur in the daemonized
     // grandchild (e.g. port bind failure, TLS setup error) are written to the
     // boot log that kmux-client opened for us, making them visible in the
     // failure hint instead of disappearing into /dev/null.
-    Daemonize::new()
-        .pid_file(pid_path)
+    let mut daemonize = Daemonize::new()
         .working_directory("/")
         .umask(0o077)
         .stdout(Stdio::keep())
-        .stderr(Stdio::keep())
+        .stderr(Stdio::keep());
+    if let Some(path) = pid_path {
+        daemonize = daemonize.pid_file(path);
+    }
+    daemonize
         .start()
         .map_err(|e| anyhow::anyhow!("daemonize failed: {e}"))?;
 
@@ -44,6 +56,10 @@ struct RequestCtx {
     start_time: Instant,
     app: Arc<ServerApp>,
     shutdown: Arc<Notify>,
+    /// Signals `async_main` to begin a graceful live-PTY handoff.
+    restart: Arc<Notify>,
+    /// Guards against concurrent restarts; set while a handoff is in flight.
+    handoff_in_progress: Arc<AtomicBool>,
     listeners: Vec<ListenConfig>,
     public_host: Option<String>,
 }
@@ -60,6 +76,10 @@ pub struct ControlSocketParams {
     pub start_time: Instant,
     pub app: Arc<ServerApp>,
     pub shutdown: Arc<Notify>,
+    /// Signals `async_main` to begin a graceful live-PTY handoff.
+    pub restart: Arc<Notify>,
+    /// Guards against concurrent restarts; set while a handoff is in flight.
+    pub handoff_in_progress: Arc<AtomicBool>,
     /// Resolved listener configs (with actual bound ports filled in).
     pub listeners: Vec<ListenConfig>,
     pub public_host: Option<String>,
@@ -82,6 +102,8 @@ pub async fn serve_control_socket(params: ControlSocketParams) {
         start_time,
         app,
         shutdown,
+        restart,
+        handoff_in_progress,
         listeners,
         public_host,
     } = params;
@@ -93,6 +115,8 @@ pub async fn serve_control_socket(params: ControlSocketParams) {
         start_time,
         app,
         shutdown: Arc::clone(&shutdown),
+        restart,
+        handoff_in_progress,
         listeners,
         public_host,
     };
@@ -237,6 +261,33 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
             info!("Received stop command, shutting down daemon");
             ctx.shutdown.notify_waiters();
         }
+        "restart" => {
+            // Refuse a second concurrent handoff.
+            let busy = ctx.handoff_in_progress.swap(true, Ordering::SeqCst);
+            let response = RestartResponse {
+                status: if busy { "busy" } else { "ok" }.to_string(),
+                handoff: true,
+            };
+            let mut json = match serde_json::to_string(&response) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to serialize restart response: {e}");
+                    return;
+                }
+            };
+            json.push('\n');
+            if let Err(e) = write_half.write_all(json.as_bytes()).await {
+                warn!("Control socket write error: {e}");
+            }
+            if busy {
+                warn!("restart command ignored: a handoff is already in progress");
+            } else {
+                info!("Received restart command, beginning graceful handoff");
+                // Wake the main task; it consumes the in-progress flag and clears
+                // it if the handoff rolls back.
+                ctx.restart.notify_one();
+            }
+        }
         "sessions" => {
             let resp = ctx.app.snapshot_sessions_with_connections().await;
             let mut json = match serde_json::to_string(&resp) {
@@ -302,6 +353,8 @@ mod tests {
             start_time: Instant::now(),
             app,
             shutdown: Arc::clone(&shutdown),
+            restart: Arc::new(Notify::new()),
+            handoff_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             listeners: vec![],
             public_host: None,
         };

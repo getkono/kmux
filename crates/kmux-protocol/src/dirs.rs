@@ -94,6 +94,17 @@ pub fn pid_path() -> anyhow::Result<PathBuf> {
     Ok(runtime_dir()?.join("daemon.pid"))
 }
 
+/// Path to the daemon handoff Unix domain socket.
+///
+/// Created transiently by an outgoing daemon during a graceful restart so the
+/// incoming daemon can pull live PTY master file descriptors across via
+/// `SCM_RIGHTS`. Distinct from the control and data sockets so that the two
+/// daemons can overlap without contending for those fixed paths. See
+/// [`super::control_rpc::HANDOFF_PROTOCOL_VERSION`] and `docs/daemon-handoff.md`.
+pub fn handoff_socket_path() -> anyhow::Result<PathBuf> {
+    Ok(runtime_dir()?.join("handoff.sock"))
+}
+
 /// Path to the client-side spawn lock.
 ///
 /// `kmux-client` flocks this file (LOCK_EX | LOCK_NB) to gate concurrent

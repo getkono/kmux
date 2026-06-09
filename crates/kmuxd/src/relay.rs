@@ -6,6 +6,8 @@ use std::time::{Duration, Instant};
 use kmux_protocol::messages::{
     ClientId, CursorState, SequenceNo, ServerMessage, TermModes, TerminalDiff, epoch_millis,
 };
+use kmux_pty::process::ExitStatus;
+use kmux_pty::registry::SessionManager;
 use kmux_pty::session::PtyReader;
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
@@ -22,6 +24,10 @@ use crate::term_state::TermState;
 /// Also polls the foreground process name every 500 ms via `tcgetpgrp` so
 /// pane titles update as the user switches between commands, even when the
 /// shell does not emit OSC 0/2 sequences.
+// Each parameter is a distinct shared handle the loop fans output into
+// (emulator, scrollback, client map, seqno, registry); bundling them into a
+// struct would only add indirection at the three call sites.
+#[allow(clippy::too_many_arguments)]
 pub async fn session_diff_loop(
     mut reader: PtyReader,
     pane_id: String,
@@ -30,6 +36,7 @@ pub async fn session_diff_loop(
     scrollback: Arc<Mutex<DiffBuffer>>,
     term_state: Arc<Mutex<TermState>>,
     seqno_counter: Arc<AtomicU64>,
+    manager: Arc<SessionManager>,
 ) {
     let master_fd = reader.as_raw_fd();
     let mut buf = vec![0u8; 65536];
@@ -98,6 +105,24 @@ pub async fn session_diff_loop(
                 }
             }
         }
+    }
+
+    // The read loop ended: the PTY master returned EOF (or errored), which means
+    // the child exited. Surface this to attached clients — the only runtime exit
+    // signal for a foreground child, and the *sole* one for a foreign child
+    // inherited across a handoff (which cannot be `waitpid`-ed).
+    //
+    // If the session is no longer registered, the pane was explicitly closed
+    // (`close_pane` removes it and already emits `Closed`), so we stay silent to
+    // avoid a redundant `Exited` after `Closed`. Otherwise the shell exited on
+    // its own and we report it.
+    if let Ok(session) = manager.get_session(&pane_id).await {
+        let status = match tokio::time::timeout(Duration::from_secs(2), session.wait()).await {
+            Ok(status) => status,
+            Err(_) => ExitStatus::Unknown,
+        };
+        debug!(pane_id, %status, "pane child exited");
+        manager.notify_exited(&pane_id, status);
     }
 }
 

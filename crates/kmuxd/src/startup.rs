@@ -17,8 +17,20 @@ use crate::auth::{generate_token, persist_token};
 use crate::term_state;
 use crate::tls;
 
-pub async fn async_main(daemon: bool, cfg: ServerConfig) -> anyhow::Result<()> {
+pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyhow::Result<()> {
     info!(backend = term_state::backend_name(), "terminal backend");
+
+    // A handoff successor daemonized without taking the pid file (the
+    // predecessor holds its lock). Capture the predecessor's pid now — while its
+    // pid file still exists — so we can write our own once it has exited.
+    let predecessor_pid: Option<i32> = if handoff {
+        kmux_protocol::dirs::pid_path()
+            .ok()
+            .and_then(|p| std::fs::read_to_string(p).ok())
+            .and_then(|s| s.trim().parse::<i32>().ok())
+    } else {
+        None
+    };
     info!(
         runtime_dir = %cfg.runtime_dir,
         allow_peer_cred = cfg.auth.allow_peer_cred,
@@ -40,7 +52,26 @@ pub async fn async_main(daemon: bool, cfg: ServerConfig) -> anyhow::Result<()> {
         CertMaterial::from_files(&cert_path, &key_path)?
     };
 
-    let token = generate_token();
+    // When launched as a graceful-restart successor (`--handoff`), pull the
+    // predecessor's live PTY fds and adopt its auth token *before* binding any
+    // listeners, so already-connected clients re-auth seamlessly. On any failure
+    // this returns `None` and we fall back to a normal snapshot restore.
+    let mut handoff_outcome = if handoff {
+        match crate::handoff::receiver::run().await {
+            Ok(outcome) => outcome,
+            Err(e) => {
+                warn!("handoff receive failed: {e}; falling back to snapshot restore");
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let token = match &handoff_outcome {
+        Some(o) => o.token.clone(),
+        None => generate_token(),
+    };
     match persist_token(&token) {
         Ok(path) => info!("Auth token persisted to {}", path.display()),
         Err(e) => tracing::warn!("Failed to persist auth token: {e}"),
@@ -50,12 +81,17 @@ pub async fn async_main(daemon: bool, cfg: ServerConfig) -> anyhow::Result<()> {
     let app = Arc::new(ServerApp::new(token.clone()));
 
     // Restore persisted sessions from the previous daemon instance, if any.
+    // With a successful handoff, panes named in `inherited` keep their live
+    // process; the rest respawn from the snapshot exactly as a cold start would.
     if let Ok(path) = kmux_protocol::dirs::session_state_path()
         && path.exists()
     {
         match crate::persist::restore::read_checkpoint(&path) {
             Ok(state) => {
-                let report = app.restore_from(state).await;
+                let report = match handoff_outcome.take() {
+                    Some(o) => app.restore_with_handoff(state, o.inherited).await,
+                    None => app.restore_from(state).await,
+                };
                 info!(
                     restored = report.restored,
                     alive = report.alive,
@@ -65,6 +101,9 @@ pub async fn async_main(daemon: bool, cfg: ServerConfig) -> anyhow::Result<()> {
             }
             Err(e) => warn!("failed to restore sessions from checkpoint: {e}"),
         }
+    }
+    if handoff_outcome.is_some() {
+        warn!("handoff: live fds received but no usable checkpoint; cannot reconstruct panes");
     }
 
     // Periodic checkpoint task.
@@ -168,6 +207,10 @@ pub async fn async_main(daemon: bool, cfg: ServerConfig) -> anyhow::Result<()> {
     }
 
     let shutdown = Arc::new(Notify::new());
+    // Signals a graceful live-PTY handoff (issue #35); `handoff_in_progress`
+    // guards against concurrent restart commands.
+    let restart = Arc::new(Notify::new());
+    let handoff_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Spawn idle-shutdown watcher when configured.
     if cfg.idle_shutdown_secs > 0 {
@@ -220,21 +263,62 @@ pub async fn async_main(daemon: bool, cfg: ServerConfig) -> anyhow::Result<()> {
             start_time: Instant::now(),
             app: Arc::clone(&app),
             shutdown: Arc::clone(&shutdown),
+            restart: Arc::clone(&restart),
+            handoff_in_progress: Arc::clone(&handoff_in_progress),
             listeners: resolved_listeners,
             public_host: cfg.advertise.public_host.clone(),
         };
         tokio::spawn(async move {
             crate::daemon::serve_control_socket(params).await;
         });
+
+        // A handoff successor must claim the pid file itself (it daemonized
+        // without one). Wait for the predecessor to exit so its pid-file cleanup
+        // can't clobber ours, then write our pid. The control socket already
+        // answers `status` (which reports the live pid), so this is not on the
+        // critical path for clients.
+        if handoff {
+            let pid_path = kmux_protocol::dirs::pid_path()?;
+            tokio::spawn(async move {
+                if let Some(raw) = predecessor_pid {
+                    let pid = nix::unistd::Pid::from_raw(raw);
+                    let deadline = Instant::now() + Duration::from_secs(10);
+                    while nix::sys::signal::kill(pid, None).is_ok() && Instant::now() < deadline {
+                        tokio::time::sleep(Duration::from_millis(100)).await;
+                    }
+                }
+                match std::fs::write(&pid_path, std::process::id().to_string()) {
+                    Ok(()) => info!("claimed pid file after predecessor exit"),
+                    Err(e) => warn!("failed to write pid file after handoff: {e}"),
+                }
+            });
+        }
     }
 
-    // Install signal handlers and wait for any shutdown signal.
+    // Install signal handlers and wait for a shutdown or restart signal.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => { info!("Received SIGINT, shutting down"); }
-        _ = sigterm.recv() => { info!("Received SIGTERM, shutting down"); }
-        _ = shutdown.notified() => { info!("Shutdown requested via control socket"); }
+    // `true` once a graceful handoff committed: the successor wrote the
+    // checkpoint and owns the live PTYs, so we skip our own shutdown checkpoint.
+    let mut handed_off = false;
+    loop {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => { info!("Received SIGINT, shutting down"); break; }
+            _ = sigterm.recv() => { info!("Received SIGTERM, shutting down"); break; }
+            _ = shutdown.notified() => { info!("Shutdown requested via control socket"); break; }
+            _ = restart.notified() => {
+                info!("Graceful restart requested; beginning live PTY handoff");
+                match crate::handoff::sender::run(&app).await {
+                    Ok(()) => { handed_off = true; break; }
+                    Err(e) => {
+                        warn!("handoff failed, resuming normal operation: {e}");
+                        // Nothing destructive happened before the commit point —
+                        // clear the guard and keep serving.
+                        handoff_in_progress.store(false, std::sync::atomic::Ordering::SeqCst);
+                    }
+                }
+            }
+        }
     }
 
     // Abort listener tasks.
@@ -242,17 +326,23 @@ pub async fn async_main(daemon: bool, cfg: ServerConfig) -> anyhow::Result<()> {
         handle.abort();
     }
 
-    // Clean shutdown: checkpoint the full session state.
-    let shutdown_state = app.checkpoint_state().await;
-    match kmux_protocol::dirs::session_state_path() {
-        Ok(path) => {
-            if let Err(e) = crate::persist::checkpoint::write_checkpoint(&shutdown_state, &path) {
-                warn!("shutdown checkpoint failed: {e}");
-            } else {
-                info!("session state checkpointed on shutdown");
+    // Clean shutdown: checkpoint the full session state — unless a handoff
+    // already wrote a fresh (post-quiesce) checkpoint and owns the live PTYs.
+    if handed_off {
+        info!("handoff committed; successor owns the live sessions");
+    } else {
+        let shutdown_state = app.checkpoint_state().await;
+        match kmux_protocol::dirs::session_state_path() {
+            Ok(path) => {
+                if let Err(e) = crate::persist::checkpoint::write_checkpoint(&shutdown_state, &path)
+                {
+                    warn!("shutdown checkpoint failed: {e}");
+                } else {
+                    info!("session state checkpointed on shutdown");
+                }
             }
+            Err(e) => warn!("could not determine checkpoint path on shutdown: {e}"),
         }
-        Err(e) => warn!("could not determine checkpoint path on shutdown: {e}"),
     }
 
     for endpoint in quic_endpoints {

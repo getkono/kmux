@@ -124,8 +124,8 @@ impl PtyProcess {
     }
 
     /// When `true`, dropping this `PtyProcess` will NOT send SIGKILL to the
-    /// child. The child process remains alive, allowing the next daemon
-    /// instance to reattach via [`PtyProcess::reattach`].
+    /// child. The child process remains alive so a successor daemon can adopt
+    /// its master fd via [`PtyProcess::from_inherited`] during a graceful handoff.
     pub fn set_keep_alive(&self, val: bool) {
         self.keep_alive.store(val, Ordering::Relaxed);
     }
@@ -135,28 +135,20 @@ impl PtyProcess {
         self.keep_alive.load(Ordering::Relaxed)
     }
 
-    /// Reattach to an existing child process by reopening its PTY master fd
-    /// from `/proc/<pid>/fd/<master_fd>`.
+    /// Adopt a live PTY master fd inherited from another process (e.g. across a
+    /// graceful daemon handoff via `SCM_RIGHTS`).
     ///
-    /// Used after a clean daemon restart when the child process was kept alive
-    /// via [`PtyProcess::set_keep_alive`]. Fails if the process has exited or
-    /// if `/proc/<pid>/fd/<master_fd>` is not accessible.
-    pub fn reattach(pid: Pid, master_fd_num: RawFd, size: WindowSize) -> Result<Self> {
-        let proc_fd_path = format!("/proc/{}/fd/{}", pid.as_raw(), master_fd_num);
-
-        // Open the existing PTY master fd via /proc.
-        // O_RDWR | O_NOCTTY: read/write without making it a controlling terminal.
-        let new_fd: RawFd = nix::fcntl::open(
-            proc_fd_path.as_str(),
-            nix::fcntl::OFlag::O_RDWR | nix::fcntl::OFlag::O_NOCTTY,
-            nix::sys::stat::Mode::empty(),
-        )
-        .map_err(KmuxError::Pty)?
-        .into_raw_fd();
-
-        let io = PtyMasterIo::new(new_fd).map_err(KmuxError::Io)?;
-        let exit_rx = spawn_wait_task(pid);
-
+    /// The child is *foreign*: it is not a child of this process (it was
+    /// reparented to init when the previous daemon exited), so `waitpid` cannot
+    /// observe its exit. Liveness is therefore tracked by polling `kill(pid, 0)`
+    /// (see [`spawn_kill_poll_task`]); the prompt, authoritative exit signal is
+    /// the PTY master returning EOF in the relay loop. Portable across Linux and
+    /// macOS (unlike the old `/proc/<pid>/fd` reopen, which this replaces).
+    ///
+    /// [`spawn_kill_poll_task`]: crate::process::spawn_kill_poll_task
+    pub fn from_inherited(fd: std::os::fd::OwnedFd, pid: Pid, size: WindowSize) -> Result<Self> {
+        let io = PtyMasterIo::new(fd.into_raw_fd()).map_err(KmuxError::Io)?;
+        let exit_rx = crate::process::spawn_kill_poll_task(pid);
         Ok(PtyProcess {
             io,
             pid,
@@ -242,6 +234,79 @@ mod tests {
             text.contains("hello"),
             "expected 'hello' in output, got: {text:?}"
         );
+    }
+
+    /// A PTY master fd duplicated via `dup_owned` and adopted with
+    /// `from_inherited` drives the *same* live child: writing to the inherited
+    /// master and reading its echo proves the dup is a fully-functional handle,
+    /// and the child stays alive after the original is dropped with keep-alive —
+    /// the core invariant behind live PTY migration across a daemon handoff.
+    #[tokio::test]
+    async fn from_inherited_drives_the_same_live_child() {
+        use std::time::Duration;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        // `cat` echoes its stdin straight back to stdout.
+        let original = PtyProcess::spawn(&PtyConfig::new("/bin/cat")).expect("spawn");
+        let pid = original.pid;
+        let size = original.size;
+
+        let dup = original.io.dup_owned().expect("dup master");
+        let mut inherited = PtyProcess::from_inherited(dup, pid, size).expect("from_inherited");
+
+        // Relinquish the original without killing the child (as a handoff would).
+        original.set_keep_alive(true);
+        drop(original);
+
+        inherited.io.write_all(b"hello\n").await.expect("write");
+
+        let mut seen = String::new();
+        let mut buf = [0u8; 256];
+        for _ in 0..20 {
+            match tokio::time::timeout(Duration::from_secs(2), inherited.io.read(&mut buf)).await {
+                Ok(Ok(n)) if n > 0 => {
+                    seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+                    if seen.contains("hello") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        assert!(
+            seen.contains("hello"),
+            "inherited PTY should echo input; got {seen:?}"
+        );
+        assert!(
+            nix::sys::signal::kill(pid, None).is_ok(),
+            "child should still be alive after the original was dropped"
+        );
+
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+    }
+
+    /// A foreign (inherited) child cannot be `waitpid`-ed, so exit is detected by
+    /// polling `kill(pid, 0)`. `wait()` must still resolve once the child exits.
+    #[tokio::test]
+    async fn from_inherited_detects_foreign_child_exit() {
+        use std::time::Duration;
+
+        let original =
+            PtyProcess::spawn(&PtyConfig::new("/bin/sh").args(["-c", "sleep 0.2"])).expect("spawn");
+        let pid = original.pid;
+        let size = original.size;
+
+        let dup = original.io.dup_owned().expect("dup master");
+        let mut inherited = PtyProcess::from_inherited(dup, pid, size).expect("from_inherited");
+        original.set_keep_alive(true);
+        drop(original);
+
+        let waited = tokio::time::timeout(Duration::from_secs(3), inherited.wait()).await;
+        assert!(
+            waited.is_ok(),
+            "foreign child exit was not detected in time"
+        );
+        assert!(inherited.is_exited(), "is_exited should be true after exit");
     }
 
     /// Verify that setting `keep_alive` prevents the Drop impl from sending

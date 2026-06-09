@@ -153,6 +153,19 @@ pub async fn stop_daemon() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Ask the running daemon to perform a graceful live-PTY handoff to a successor.
+///
+/// Returns `Ok(true)` when the daemon accepted the handoff (running shells will
+/// migrate), `Ok(false)` when it reports `busy`, and `Err(_)` when the daemon is
+/// too old to understand `restart` (it closes the connection without replying,
+/// so the response cannot be read) or is unreachable. The caller falls back to a
+/// hard stop-then-respawn restart in those cases.
+pub async fn restart_daemon() -> anyhow::Result<bool> {
+    use kmux_protocol::control_rpc::RestartResponse;
+    let resp: RestartResponse = control_request("restart").await?;
+    Ok(resp.status == "ok")
+}
+
 /// Query the daemon for its active sessions and per-connection metrics.
 pub async fn query_daemon_sessions() -> anyhow::Result<SessionsResponse> {
     control_request("sessions").await
