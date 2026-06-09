@@ -95,37 +95,51 @@ fn resolve_into(
             dir,
             ratios,
             children,
-        } => {
-            let n = children.len();
-            if n == 0 {
-                return;
-            }
-            match dir {
-                SplitDir::Horizontal => {
-                    // Children laid out left↔right; apportion the width axis.
-                    let gutters = (n as u16 - 1).saturating_mul(cfg.gutter_cols);
-                    let avail = cols.saturating_sub(gutters);
-                    let widths = apportion(avail, ratios);
-                    let mut x = col;
-                    for (child, w) in children.iter().zip(widths) {
-                        resolve_into(child, x, row, w, rows, cfg, out);
-                        x = x.saturating_add(w).saturating_add(cfg.gutter_cols);
-                    }
-                }
-                SplitDir::Vertical => {
-                    // Children laid out top↕bottom; apportion the height axis.
-                    let gutters = (n as u16 - 1).saturating_mul(cfg.gutter_rows);
-                    let avail = rows.saturating_sub(gutters);
-                    let heights = apportion(avail, ratios);
-                    let mut y = row;
-                    for (child, h) in children.iter().zip(heights) {
-                        resolve_into(child, col, y, cols, h, cfg, out);
-                        y = y.saturating_add(h).saturating_add(cfg.gutter_rows);
-                    }
+        } => match dir {
+            SplitDir::Horizontal => {
+                // Children laid out left↔right; apportion the width axis.
+                for ((x, w), child) in child_extents(col, cols, ratios, cfg.gutter_cols)
+                    .into_iter()
+                    .zip(children)
+                {
+                    resolve_into(child, x, row, w, rows, cfg, out);
                 }
             }
-        }
+            SplitDir::Vertical => {
+                // Children laid out top↕bottom; apportion the height axis.
+                for ((y, h), child) in child_extents(row, rows, ratios, cfg.gutter_rows)
+                    .into_iter()
+                    .zip(children)
+                {
+                    resolve_into(child, col, y, cols, h, cfg, out);
+                }
+            }
+        },
     }
+}
+
+/// The `(start, len)` of each child of a split along its layout axis: gutters
+/// subtracted before apportioning, children placed with one gutter between
+/// them. Shared by [`resolve_into`] (pane geometry) and [`resolve_dividers`]
+/// (boundary hit regions) so the two can never disagree about where a child —
+/// or the gutter after it — begins. `axis_start`/`axis_total` are the split's
+/// own offset and extent on the relevant axis (col/cols for `Horizontal`,
+/// row/rows for `Vertical`).
+fn child_extents(axis_start: u16, axis_total: u16, ratios: &[u16], gutter: u16) -> Vec<(u16, u16)> {
+    let n = ratios.len();
+    if n == 0 {
+        return Vec::new();
+    }
+    let gutters = (n as u16 - 1).saturating_mul(gutter);
+    let avail = axis_total.saturating_sub(gutters);
+    let lens = apportion(avail, ratios);
+    let mut out = Vec::with_capacity(n);
+    let mut pos = axis_start;
+    for len in lens {
+        out.push((pos, len));
+        pos = pos.saturating_add(len).saturating_add(gutter);
+    }
+    out
 }
 
 /// Apportion `total` integer cells among `ratios` (permille weights) using
@@ -158,6 +172,132 @@ fn apportion(total: u16, ratios: &[u16]) -> Vec<u16> {
         leftover -= 1;
     }
     alloc
+}
+
+// ── Draggable dividers ───────────────────────────────────────────────────────
+
+/// A draggable boundary between two adjacent children of a [`LayoutNode::Split`],
+/// in cell coordinates within the resolved content area. Frontends hit-test a
+/// pointer against `hit_*` (the gutter strip) and feed a drag position to
+/// [`ratios_for_drag`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Divider {
+    /// Child-index descent from the layout root to the `Split` this boundary
+    /// belongs to — the same `path` form [`resize_split`] returns and the
+    /// server's `set_ratios` expects.
+    pub path: Vec<u32>,
+    /// Orientation of the owning split. `Horizontal` → a *vertical* bar dragged
+    /// along the col axis (a "col-resize"); `Vertical` → a *horizontal* bar
+    /// dragged along the row axis (a "row-resize").
+    pub dir: SplitDir,
+    /// The boundary sits between `children[before]` and `children[before + 1]`.
+    pub before: usize,
+    /// Gutter strip rectangle in cells (the divider itself), for hit-testing.
+    pub hit_col: u16,
+    pub hit_row: u16,
+    pub hit_cols: u16,
+    pub hit_rows: u16,
+    /// Start cell of `children[before]` on the drag axis (col for `Horizontal`,
+    /// row for `Vertical`) — the origin the pointer fraction is measured from.
+    pub pair_start: u16,
+    /// Combined extent of the two adjacent children on the drag axis, *excluding*
+    /// the gutter between them. The drag fraction is
+    /// `(pointer - pair_start) / pair_len`.
+    pub pair_len: u16,
+}
+
+/// Enumerate every draggable divider for a layout tree resolved into an
+/// `area_cols × area_rows` content area. A `Split` with `n` children yields
+/// `n - 1` dividers; a single `Leaf` yields none — so a zoomed
+/// `render_layout()` (a single leaf) has zero dividers and nothing to drag.
+/// Order is depth-first, matching [`resolve_layout`]; divider hit cells fall in
+/// the exact gutters `resolve_layout` leaves blank (both use [`child_extents`]).
+pub fn resolve_dividers(
+    node: &LayoutNode,
+    area_cols: u16,
+    area_rows: u16,
+    cfg: &LayoutConfig,
+) -> Vec<Divider> {
+    let mut out = Vec::new();
+    let mut path = Vec::new();
+    dividers_into(node, 0, 0, area_cols, area_rows, cfg, &mut path, &mut out);
+    out
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dividers_into(
+    node: &LayoutNode,
+    col: u16,
+    row: u16,
+    cols: u16,
+    rows: u16,
+    cfg: &LayoutConfig,
+    path: &mut Vec<u32>,
+    out: &mut Vec<Divider>,
+) {
+    let LayoutNode::Split {
+        dir,
+        ratios,
+        children,
+    } = node
+    else {
+        return;
+    };
+    let n = children.len();
+    if n == 0 {
+        return;
+    }
+    let (extents, gutter) = match dir {
+        SplitDir::Horizontal => (
+            child_extents(col, cols, ratios, cfg.gutter_cols),
+            cfg.gutter_cols,
+        ),
+        SplitDir::Vertical => (
+            child_extents(row, rows, ratios, cfg.gutter_rows),
+            cfg.gutter_rows,
+        ),
+    };
+    // A divider per boundary between consecutive children: the gutter strip
+    // after `children[before]`.
+    for before in 0..n - 1 {
+        let (s0, l0) = extents[before];
+        let (_, l1) = extents[before + 1];
+        let pair_len = l0.saturating_add(l1);
+        out.push(match dir {
+            SplitDir::Horizontal => Divider {
+                path: path.clone(),
+                dir: *dir,
+                before,
+                hit_col: s0.saturating_add(l0),
+                hit_row: row,
+                hit_cols: gutter,
+                hit_rows: rows,
+                pair_start: s0,
+                pair_len,
+            },
+            SplitDir::Vertical => Divider {
+                path: path.clone(),
+                dir: *dir,
+                before,
+                hit_col: col,
+                hit_row: s0.saturating_add(l0),
+                hit_cols: cols,
+                hit_rows: gutter,
+                pair_start: s0,
+                pair_len,
+            },
+        });
+    }
+    // Recurse into each child's sub-rect, carrying the descent path.
+    for (i, child) in children.iter().enumerate() {
+        let (start, len) = extents[i];
+        path.push(i as u32);
+        match dir {
+            SplitDir::Horizontal => dividers_into(child, start, row, len, rows, cfg, path, out),
+            SplitDir::Vertical => dividers_into(child, col, start, cols, len, cfg, path, out),
+        }
+        path.pop();
+    }
 }
 
 /// Find the pane to focus when moving from `focused` in `dir`, using the
@@ -343,6 +483,65 @@ fn node_at<'a>(root: &'a LayoutNode, path: &[u32]) -> Option<&'a LayoutNode> {
         node = children.get(idx as usize)?;
     }
     Some(node)
+}
+
+/// Compute the new full ratios vector for the split a [`Divider`] belongs to,
+/// when its boundary is dragged so the divider sits at cell `pointer_cell` along
+/// the drag axis. Child `before`'s share of the pair's *combined* permille
+/// becomes its fraction of `pair_len`; the remainder goes to `before + 1`. Both
+/// are clamped to `MIN_RESIZE_RATIO` (the same floor keyboard resize uses, and
+/// the server's `MIN_RATIO`), so neither collapses; the other children's ratios
+/// are untouched, so the split still sums to its original total.
+///
+/// Returns the full ratios vec (arity `== children.len()`, the form `set_ratios`
+/// expects), or `None` when the split is missing/reshaped, the pair can't satisfy
+/// both floors, or the result equals the current ratios (a no-op — e.g. clamped
+/// at the floor, or the divider didn't move a whole cell).
+pub fn ratios_for_drag(root: &LayoutNode, div: &Divider, pointer_cell: u16) -> Option<Vec<u16>> {
+    let LayoutNode::Split {
+        dir,
+        ratios,
+        children,
+    } = node_at(root, &div.path)?
+    else {
+        return None;
+    };
+    // Geometry came from this same tree; bail if it has since been reshaped.
+    if *dir != div.dir {
+        return None;
+    }
+    let a = div.before;
+    let b = a + 1;
+    if b >= children.len() {
+        return None;
+    }
+    let pair = ratios[a] as i32 + ratios[b] as i32;
+    if pair < MIN_RESIZE_RATIO * 2 {
+        return None; // Can't keep both children at/above the floor.
+    }
+    let len = div.pair_len.max(1) as i32;
+    let off = (pointer_cell as i32 - div.pair_start as i32).clamp(0, len);
+    // Child `a`'s new permille share of the pair, by axis fraction, rounded to
+    // the nearest, then clamped so both children stay above the floor.
+    let new_a = ((off * pair + len / 2) / len).clamp(MIN_RESIZE_RATIO, pair - MIN_RESIZE_RATIO);
+    let mut out = ratios.clone();
+    out[a] = new_a as u16;
+    out[b] = (pair - new_a) as u16;
+    if out == *ratios {
+        return None; // No change (already there, or sub-cell movement).
+    }
+    Some(out)
+}
+
+/// Even permille weights for an `n`-child split, for resetting a split to equal
+/// sizes (e.g. double-clicking a divider). The server clamps + renormalizes to
+/// exactly 1000, so a remainder from the integer division is harmless. Empty for
+/// `n == 0`.
+pub fn even_ratios(n: usize) -> Vec<u16> {
+    if n == 0 {
+        return Vec::new();
+    }
+    vec![(1000 / n as u16).max(1); n]
 }
 
 #[cfg(test)]
@@ -589,5 +788,159 @@ mod tests {
     #[test]
     fn resize_root_leaf_returns_none() {
         assert_eq!(resize_split(&leaf(0), 0, FocusDir::Right, 50), None);
+    }
+
+    // ── Dividers ─────────────────────────────────────────────────────────────
+
+    fn vsplit(a: u32, b: u32) -> LayoutNode {
+        LayoutNode::Split {
+            dir: SplitDir::Vertical,
+            ratios: vec![500, 500],
+            children: vec![leaf(a), leaf(b)],
+        }
+    }
+
+    #[test]
+    fn dividers_single_leaf_is_empty() {
+        // A single leaf (also what a zoomed `render_layout()` collapses to) has
+        // no draggable boundary.
+        assert!(resolve_dividers(&leaf(0), 80, 24, &LayoutConfig::default()).is_empty());
+    }
+
+    #[test]
+    fn dividers_two_pane_horizontal() {
+        // 81 cols, 1-col gutter → 40 | gutter@40 | 40.
+        let divs = resolve_dividers(&hsplit(0, 1), 81, 24, &LayoutConfig::default());
+        assert_eq!(divs.len(), 1);
+        let d = &divs[0];
+        assert_eq!(d.path, Vec::<u32>::new());
+        assert_eq!(d.dir, SplitDir::Horizontal);
+        assert_eq!(d.before, 0);
+        assert_eq!(
+            (d.hit_col, d.hit_row, d.hit_cols, d.hit_rows),
+            (40, 0, 1, 24)
+        );
+        assert_eq!((d.pair_start, d.pair_len), (0, 80));
+    }
+
+    #[test]
+    fn dividers_three_way_has_two() {
+        let tree = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![300, 300, 400],
+            children: vec![leaf(0), leaf(1), leaf(2)],
+        };
+        let divs = resolve_dividers(&tree, 100, 24, &cfg_no_gutter());
+        assert_eq!(divs.len(), 2);
+        assert_eq!(divs[0].before, 0);
+        assert_eq!(divs[1].before, 1);
+        assert!(divs.iter().all(|d| d.path.is_empty()));
+    }
+
+    #[test]
+    fn dividers_nested_both_axes() {
+        // Left leaf 0; right half a vertical split of 1 (top) / 2 (bottom).
+        let tree = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![500, 500],
+            children: vec![leaf(0), vsplit(1, 2)],
+        };
+        let divs = resolve_dividers(&tree, 80, 24, &cfg_no_gutter());
+        assert_eq!(divs.len(), 2);
+        // Root horizontal divider between the left pane and the right column.
+        assert_eq!(divs[0].path, Vec::<u32>::new());
+        assert_eq!(divs[0].dir, SplitDir::Horizontal);
+        // Inner vertical divider inside the right column (path descends child 1).
+        assert_eq!(divs[1].path, vec![1]);
+        assert_eq!(divs[1].dir, SplitDir::Vertical);
+        // The inner divider lives in the right half, stacked at mid-height.
+        assert_eq!(divs[1].hit_col, 40);
+        assert_eq!(divs[1].hit_row, 12);
+    }
+
+    #[test]
+    fn dividers_land_in_resolver_gutters() {
+        // Each flat-split divider sits in the gutter right after the matching
+        // pane rect — proving `resolve_dividers` and `resolve_layout` share
+        // `child_extents` and never drift.
+        let tree = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![300, 300, 400],
+            children: vec![leaf(0), leaf(1), leaf(2)],
+        };
+        let rects = resolve_layout(&tree, 100, 24, &LayoutConfig::default());
+        let divs = resolve_dividers(&tree, 100, 24, &LayoutConfig::default());
+        for d in &divs {
+            let r = &rects[d.before];
+            assert_eq!(d.hit_col, r.col + r.cols, "divider after pane {}", d.before);
+            assert_eq!(d.hit_cols, 1); // default gutter
+            assert_eq!((d.hit_row, d.hit_rows), (0, 24));
+        }
+    }
+
+    #[test]
+    fn drag_sets_ratios_by_fraction() {
+        // Drag the 2-pane divider to 25% of the 80-cell pair span → ~[250, 750].
+        let tree = hsplit(0, 1);
+        let divs = resolve_dividers(&tree, 80, 24, &cfg_no_gutter());
+        let ratios = ratios_for_drag(&tree, &divs[0], 20).unwrap();
+        assert_eq!(ratios, vec![250, 750]);
+        assert_eq!(ratios.iter().map(|&x| x as u32).sum::<u32>(), 1000);
+    }
+
+    #[test]
+    fn drag_clamps_to_min_and_then_no_ops() {
+        let tree = hsplit(0, 1);
+        let divs = resolve_dividers(&tree, 80, 24, &cfg_no_gutter());
+        // Dragging to the far edge clamps child 0 to the floor (20).
+        let clamped = ratios_for_drag(&tree, &divs[0], 0).unwrap();
+        assert_eq!(clamped, vec![20, 980]);
+        // From a tree already at the floor, the same drag is a no-op.
+        let floored = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![20, 980],
+            children: vec![leaf(0), leaf(1)],
+        };
+        let fdivs = resolve_dividers(&floored, 80, 24, &cfg_no_gutter());
+        assert_eq!(ratios_for_drag(&floored, &fdivs[0], 0), None);
+    }
+
+    #[test]
+    fn drag_is_deterministic() {
+        let tree = hsplit(0, 1);
+        let divs = resolve_dividers(&tree, 97, 31, &LayoutConfig::default());
+        let a = ratios_for_drag(&tree, &divs[0], 30);
+        let b = ratios_for_drag(&tree, &divs[0], 30);
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn drag_only_touches_the_pair_in_a_three_way() {
+        let tree = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![300, 300, 400],
+            children: vec![leaf(0), leaf(1), leaf(2)],
+        };
+        let divs = resolve_dividers(&tree, 100, 24, &cfg_no_gutter());
+        // Drag the first divider (between panes 0 and 1); pane 2 is untouched.
+        let ratios = ratios_for_drag(&tree, &divs[0], 15).unwrap();
+        assert_eq!(ratios, vec![150, 450, 400]);
+    }
+
+    #[test]
+    fn drag_vertical_axis() {
+        // A vertical split's divider moves on the row axis.
+        let tree = vsplit(0, 1);
+        let divs = resolve_dividers(&tree, 80, 24, &cfg_no_gutter());
+        assert_eq!(divs[0].dir, SplitDir::Vertical);
+        let ratios = ratios_for_drag(&tree, &divs[0], 6).unwrap();
+        assert_eq!(ratios, vec![250, 750]);
+    }
+
+    #[test]
+    fn even_ratios_are_balanced() {
+        assert_eq!(even_ratios(2), vec![500, 500]);
+        assert_eq!(even_ratios(3), vec![333, 333, 333]);
+        assert!(even_ratios(0).is_empty());
     }
 }
