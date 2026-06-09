@@ -8,6 +8,7 @@ import KmuxBindings
 /// the server maps to a new tab).
 struct TabStrip: View {
     @ObservedObject var model: KmuxModel
+    @ObservedObject var ui: UIState
 
     var body: some View {
         HStack(spacing: 4) {
@@ -25,6 +26,13 @@ struct TabStrip: View {
                         .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
                 .buttonStyle(.plain)
+                .contextMenu {
+                    Button("Rename Tab…") { ui.renameTabTarget = tab }
+                    Button("Close Tab") {
+                        model.selectTab(tab.tabIndex)
+                        model.dispatch(.closeTab)
+                    }
+                }
             }
             Button {
                 model.dispatch(.createPane)

@@ -7,6 +7,9 @@ extension FfiSession: Identifiable {
     public var id: String { wordId }
 }
 extension FfiPane: Identifiable {}  // `id` is already a stored String property.
+extension FfiTab: Identifiable {
+    public var id: UInt32 { tabIndex }
+}
 
 extension FfiConnStatus {
     /// Indicator color for the connection badge, mirroring kmux-gtk's header dot.

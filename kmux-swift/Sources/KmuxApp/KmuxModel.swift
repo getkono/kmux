@@ -126,6 +126,11 @@ final class KmuxModel: ObservableObject {
         apply(driver.resetDivider(divider: div))
     }
 
+    /// Rename a tab of the active session (the native rename sheet).
+    func renameTab(_ index: UInt32, _ name: String) {
+        apply(driver.renameTab(tabIndex: index, name: name))
+    }
+
     /// Focus a tiled pane within the active tab (a click on a tile). Updates the
     /// focused id optimistically so pointer coordinates map to the new pane right
     /// away; the next pump reconciles to the authoritative focus.

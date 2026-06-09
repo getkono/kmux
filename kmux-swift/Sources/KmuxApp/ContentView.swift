@@ -9,6 +9,7 @@ final class UIState: ObservableObject {
     @Published var commandPalette = false
     @Published var help = false
     @Published var renameTarget: FfiSession?
+    @Published var renameTabTarget: FfiTab?
 }
 
 /// Root view: a native split layout (sessions sidebar + terminal detail with a
@@ -45,12 +46,15 @@ struct ContentView: View {
         .sheet(item: $ui.renameTarget) { session in
             RenameSheet(model: model, session: session, renameTarget: $ui.renameTarget)
         }
+        .sheet(item: $ui.renameTabTarget) { tab in
+            RenameTabSheet(model: model, tab: tab, renameTarget: $ui.renameTabTarget)
+        }
     }
 
     @ViewBuilder private var detail: some View {
         VStack(spacing: 0) {
             if model.tabs.count > 1 {
-                TabStrip(model: model)
+                TabStrip(model: model, ui: ui)
             }
             ZStack(alignment: .top) {
                 TerminalView(model: model)
