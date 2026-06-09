@@ -108,6 +108,11 @@ fn jump_action(n: u8) -> Action {
     Action::JumpToSession(n.saturating_sub(1) as usize)
 }
 
+/// The `Action` a `focus-pane-N` accelerator dispatches (N is 1-based).
+fn focus_pane_action(n: u8) -> Action {
+    Action::FocusPaneAt(n.saturating_sub(1) as u32)
+}
+
 /// Install every action + accelerator + the primary menu. Called once.
 pub fn install(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application) {
     for (name, action, accels) in dispatched_specs() {
@@ -122,6 +127,15 @@ pub fn install(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application)
         let name = format!("jump-session-{n}");
         add_dispatch(shell, fe, app, &name, jump_action(n));
         let accel = format!("<Ctrl>{n}");
+        app.set_accels_for_action(&format!("win.{name}"), &[&accel]);
+    }
+
+    // Focus pane 1..9 in the active tab's leaf order. Alt+digit, since Ctrl+digit
+    // is taken by session jumps above.
+    for n in 1..=9u8 {
+        let name = format!("focus-pane-{n}");
+        add_dispatch(shell, fe, app, &name, focus_pane_action(n));
+        let accel = format!("<Alt>{n}");
         app.set_accels_for_action(&format!("win.{name}"), &[&accel]);
     }
 
@@ -375,6 +389,12 @@ mod tests {
         assert_eq!(jump_action(1), Action::JumpToSession(0));
         assert_eq!(jump_action(3), Action::JumpToSession(2));
         assert_eq!(jump_action(9), Action::JumpToSession(8));
+    }
+
+    #[test]
+    fn focus_pane_action_is_zero_based() {
+        assert_eq!(focus_pane_action(1), Action::FocusPaneAt(0));
+        assert_eq!(focus_pane_action(9), Action::FocusPaneAt(8));
     }
 
     #[test]

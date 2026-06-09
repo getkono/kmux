@@ -79,6 +79,7 @@ impl AppCore {
             Action::SwapPrev => self.mgr.swap_focused(-1),
             Action::CycleLayout => self.mgr.cycle_layout(),
             Action::ToggleZoom => self.mgr.toggle_zoom(),
+            Action::FocusPaneAt(i) => self.focus_pane_at(i),
             Action::JumpToSession(idx) => {
                 if idx < self.mgr.session_list().len() {
                     let word_id = self.mgr.session_list()[idx].meta.word_id.clone();
@@ -467,6 +468,22 @@ impl AppCore {
             && let Some(word) = self.mgr.active_session().map(|s| s.to_string())
         {
             self.mgr.focus_pane(format!("{word}/{target}"));
+        }
+    }
+
+    /// Focus the `index`-th pane (0-based) in the active tab's leaf order
+    /// (depth-first, left-to-right — the order the tiles are laid out). No-op
+    /// when there is no such pane.
+    fn focus_pane_at(&mut self, index: u32) {
+        let Some(pane_index) = self
+            .mgr
+            .active_layout()
+            .and_then(|l| l.leaves().get(index as usize).copied())
+        else {
+            return;
+        };
+        if let Some(word) = self.mgr.active_session().map(|s| s.to_string()) {
+            self.mgr.focus_pane(format!("{word}/{pane_index}"));
         }
     }
 

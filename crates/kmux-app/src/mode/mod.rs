@@ -113,6 +113,8 @@ pub enum Action {
     CycleLayout,
     /// Toggle tmux-style zoom of the focused pane (client-local view flag).
     ToggleZoom,
+    /// Focus the `i`-th pane (0-based) in the active tab's leaf order.
+    FocusPaneAt(u32),
 
     // Session picker
     CloseSessionPicker,
