@@ -63,6 +63,17 @@ impl ScrollbackMirror {
         self.base_index + self.lines.len() as u64
     }
 
+    /// Drop every held line, advancing `base_index` to `history_total()` so
+    /// absolute indices stay monotonic. After this the mirror is empty and
+    /// `history_total()` is unchanged — it models "evict everything currently
+    /// held", which is what an inner-program scrollback wipe (`clear`'s
+    /// `CSI 3J`, or `RIS`) requires. Surviving lines are re-appended by the
+    /// caller, continuing from the same absolute index.
+    pub fn reset(&mut self) {
+        self.base_index = self.history_total();
+        self.lines.clear();
+    }
+
     /// Absolute index of the oldest line still stored. Indices below this
     /// have been evicted and are unrecoverable from the mirror.
     pub fn base_index(&self) -> u64 {
@@ -197,6 +208,40 @@ mod tests {
         let tail = m.tail(10);
         assert_eq!(tail.len(), 2);
         assert_eq!(m.tail_first_index(10), 0);
+    }
+
+    #[test]
+    fn reset_empties_lines_and_keeps_history_total_monotonic() {
+        let mut m = ScrollbackMirror::new(100);
+        m.append(vec![line('A', 4), line('B', 4), line('C', 4)]);
+        assert_eq!(m.history_total(), 3);
+
+        m.reset();
+        // Empty, but the absolute index space did not rewind.
+        assert!(m.is_empty());
+        assert_eq!(m.len(), 0);
+        assert_eq!(m.history_total(), 3);
+        assert_eq!(m.base_index(), 3);
+        // The old lines are unrecoverable.
+        let (idx, lines) = m.range(0, 10);
+        assert_eq!(idx, 3);
+        assert!(lines.is_empty());
+
+        // Surviving lines re-append continuing from the same absolute index.
+        let (first, count) = m.append(vec![line('D', 4)]);
+        assert_eq!(first, 3);
+        assert_eq!(count, 1);
+        assert_eq!(m.history_total(), 4);
+        assert_eq!(m.range(3, 1).1[0][0].c, 'D');
+    }
+
+    #[test]
+    fn reset_on_empty_mirror_is_noop() {
+        let mut m = ScrollbackMirror::new(10);
+        m.reset();
+        assert_eq!(m.history_total(), 0);
+        assert_eq!(m.base_index(), 0);
+        assert!(m.is_empty());
     }
 
     #[test]

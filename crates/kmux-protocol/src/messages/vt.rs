@@ -178,6 +178,14 @@ pub struct TerminalDiff {
     /// as of this frame). Clients assert monotonic growth.
     #[serde(default)]
     pub history_total: u64,
+    /// Set when the inner program wiped scrollback this frame (e.g. `clear`'s
+    /// `CSI 3J`, or `RIS`). `Some(base)` is the new oldest absolute index: the
+    /// client must drop every scrollback line below `base` before applying.
+    /// `history_total` stays monotonic across the wipe (the daemon's mirror
+    /// just advances its `base_index`), so any surviving lines arrive after via
+    /// `ScrollbackAppend` and the normal gap-fill path.
+    #[serde(default)]
+    pub scrollback_reset: Option<u64>,
 }
 
 /// Full grid snapshot -- sent on attach or after resize.
@@ -192,6 +200,12 @@ pub struct GridSnapshot {
     /// Absolute number of lines ever scrolled off from this pane.
     #[serde(default)]
     pub history_total: u64,
+    /// Oldest absolute scrollback index the daemon can still serve (its mirror's
+    /// `base_index`). Lines below this have been evicted or wiped (e.g. by a
+    /// `clear`) and are unrecoverable; a reattaching client must drop any it
+    /// still holds below `scrollback_base`.
+    #[serde(default)]
+    pub scrollback_base: u64,
     /// The last N scrollback lines (width-native, oldest first). The first
     /// line's absolute index is `history_total - scrollback_tail.len()`.
     /// Empty when the pane has no scrollback yet.

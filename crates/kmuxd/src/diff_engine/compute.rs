@@ -82,6 +82,11 @@ impl<B: TerminalBackend> DiffEngine<B> {
         let is_alt = self.backend.is_alt_screen();
         let current_history_size = self.backend.history_size();
 
+        // Set when the inner program wiped scrollback this frame (history
+        // shrank with no alt-screen transition). Carries the post-reset base
+        // index so clients drop every scrollback line below it.
+        let mut scrollback_reset: Option<u64> = None;
+
         let scrollback_lines = if is_alt {
             // On alt screen: save main history size (first time only), emit nothing.
             if self.saved_main_history_size.is_none() {
@@ -105,6 +110,25 @@ impl<B: TerminalBackend> DiffEngine<B> {
             let start = self.prev_history_size;
             self.prev_history_size = current_history_size;
             self.backend.read_history_lines(start, new_count, cols)
+        } else if current_history_size < self.prev_history_size {
+            // Backend scrollback shrank without an alt-screen transition: the
+            // inner program erased history -- `clear`'s `CSI 3J`, or `RIS` /
+            // `tput reset`. (Cap eviction never shrinks `history_size`; it
+            // plateaus. Reflow only happens on `resize()`, a separate path.)
+            // Realign the mirror to the backend's surviving scrollback so
+            // clients cannot recover the wiped lines. `reset()` keeps
+            // `history_total` monotonic by advancing `base_index`; the survived
+            // lines are re-appended by the common mirror-append below.
+            self.mirror.reset();
+            scrollback_reset = Some(self.mirror.base_index());
+            let survived = if current_history_size > 0 {
+                self.backend
+                    .read_history_lines(0, current_history_size, cols)
+            } else {
+                vec![]
+            };
+            self.prev_history_size = current_history_size;
+            survived
         } else {
             self.prev_history_size = current_history_size;
             vec![]
@@ -120,18 +144,23 @@ impl<B: TerminalBackend> DiffEngine<B> {
 
         let cells_changed = !ops.is_empty();
         let has_scrollback = !scrollback_lines.is_empty();
+        let scrollback_was_reset = scrollback_reset.is_some();
         let cursor_or_modes_changed = cursor_state != self.prev_cursor || modes != self.prev_modes;
 
         self.prev_cursor = cursor_state;
         self.prev_modes = modes;
 
-        if cells_changed || has_scrollback {
+        // A scrollback wipe must reach the client even when the viewport did
+        // not change (e.g. `CSI 3J` at an already-blank prompt), so it forces a
+        // `CellDiff` to carry `scrollback_reset`.
+        if cells_changed || has_scrollback || scrollback_was_reset {
             DiffResult::CellDiff {
                 diff: TerminalDiff {
                     ops,
                     cursor: cursor_state,
                     modes,
                     history_total,
+                    scrollback_reset,
                 },
                 scrollback_lines,
             }
@@ -493,6 +522,7 @@ mod tests {
                 cursor: Default::default(),
                 modes: TermModes::EMPTY,
                 history_total: 0,
+                scrollback_base: 0,
                 scrollback_tail: Vec::new(),
             }
         };
@@ -533,6 +563,105 @@ mod tests {
         assert_eq!(lines[0][0].c, 'A');
         assert_eq!(lines[1][0].c, 'B');
         assert_eq!(lines[2][0].c, 'C');
+    }
+
+    #[test]
+    fn scrollback_clear_resets_mirror_and_flags_reset() {
+        let mut engine = mock_engine(4, 4);
+        // Accumulate 5 lines of scrollback.
+        engine.backend.history_len = 5;
+        engine.backend.history_lines = make_history_lines(5, 4);
+        let _ = engine.compute_diff();
+        assert_eq!(engine.history_total(), 5);
+
+        // Inner program wipes scrollback (CSI 3J): history drops to 0.
+        engine.backend.history_len = 0;
+        engine.backend.history_lines = Vec::new();
+        let diff = engine.compute_diff();
+        match diff {
+            DiffResult::CellDiff {
+                diff,
+                scrollback_lines,
+            } => {
+                assert_eq!(
+                    diff.scrollback_reset,
+                    Some(5),
+                    "reset carries the post-wipe base (the old history_total)"
+                );
+                assert!(scrollback_lines.is_empty(), "nothing survives a full wipe");
+            }
+            other => panic!("expected CellDiff carrying the reset, got {other:?}"),
+        }
+        // history_total stays monotonic; old lines are unrecoverable.
+        assert_eq!(engine.history_total(), 5);
+        assert!(
+            engine.mirror_range(0, 10).1.is_empty(),
+            "wiped lines must not be recoverable from the mirror"
+        );
+    }
+
+    #[test]
+    fn scrollback_clear_reseeds_surviving_lines() {
+        let mut engine = mock_engine(4, 4);
+        engine.backend.history_len = 5;
+        engine.backend.history_lines = make_history_lines(5, 4);
+        let _ = engine.compute_diff();
+        assert_eq!(engine.history_total(), 5);
+
+        // A clear that leaves 2 surviving lines (OSC-133 scrollClear path).
+        engine.backend.history_len = 2;
+        engine.backend.history_lines = make_history_lines(2, 4);
+        let diff = engine.compute_diff();
+        match diff {
+            DiffResult::CellDiff {
+                diff,
+                scrollback_lines,
+            } => {
+                assert_eq!(diff.scrollback_reset, Some(5));
+                assert_eq!(scrollback_lines.len(), 2, "survivors are re-emitted");
+            }
+            other => panic!("expected CellDiff, got {other:?}"),
+        }
+        // 5 (reset base) + 2 survived = 7; older indices are gone.
+        assert_eq!(engine.history_total(), 7);
+        // A request for old indices clamps to the new base (5): indices 0..5
+        // are unrecoverable, only the 2 survivors at [5, 7) remain.
+        let (first, lines) = engine.mirror_range(0, 5);
+        assert_eq!(first, 5, "indices below the reset base are gone");
+        assert_eq!(lines.len(), 2, "only the survivors remain");
+        assert_eq!(engine.mirror_range(5, 2).1.len(), 2);
+    }
+
+    #[test]
+    fn scrollback_growth_does_not_flag_reset() {
+        let mut engine = mock_engine(4, 4);
+        let _ = engine.compute_diff();
+        engine.backend.history_len = 3;
+        engine.backend.history_lines = make_history_lines(3, 4);
+        engine.backend.cells[0].c = 'X';
+        match engine.compute_diff() {
+            DiffResult::CellDiff { diff, .. } => assert_eq!(diff.scrollback_reset, None),
+            other => panic!("expected CellDiff, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn alt_screen_entry_does_not_flag_reset() {
+        let mut engine = mock_engine(4, 4);
+        engine.backend.history_len = 5;
+        engine.backend.history_lines = make_history_lines(5, 4);
+        let _ = engine.compute_diff();
+
+        // Entering alt screen collapses history to 0, but that is NOT a wipe --
+        // the alt branch must take precedence over shrink detection.
+        engine.backend.alt_screen = true;
+        engine.backend.history_len = 0;
+        engine.backend.cells[0].c = 'F';
+        match engine.compute_diff() {
+            DiffResult::CellDiff { diff, .. } => assert_eq!(diff.scrollback_reset, None),
+            other => panic!("expected CellDiff, got {other:?}"),
+        }
+        assert_eq!(engine.history_total(), 5, "pre-alt history is preserved");
     }
 
     #[test]

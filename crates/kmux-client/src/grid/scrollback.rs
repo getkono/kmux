@@ -123,6 +123,30 @@ impl ScrollbackBuffer {
         self.lines.clear();
         self.base_index = 0;
     }
+
+    /// Wipe all held lines and re-anchor at absolute index `history_total`,
+    /// keeping the absolute index space monotonic. Mirrors the daemon's
+    /// `ScrollbackMirror::reset` on a `clear`/`RIS`: afterwards `history_total()`
+    /// equals `history_total`, the buffer is empty, and the next contiguous
+    /// append (the surviving lines) lands at `history_total`.
+    pub fn reset_to(&mut self, history_total: u64) {
+        self.lines.clear();
+        self.base_index = history_total;
+    }
+
+    /// Drop every line older than absolute index `base` (the daemon's oldest
+    /// still-serveable index). Used on (re)attach to discard lines the daemon
+    /// has since evicted or wiped. If the buffer holds fewer lines than that,
+    /// it empties and re-anchors `base_index` at `base`.
+    pub fn evict_before(&mut self, base: u64) {
+        while self.base_index < base {
+            if self.lines.pop_front().is_none() {
+                self.base_index = base;
+                return;
+            }
+            self.base_index += 1;
+        }
+    }
 }
 
 impl Default for ScrollbackBuffer {
@@ -179,6 +203,50 @@ mod tests {
         assert_eq!(sb.base_index(), 8);
         assert_eq!(sb.history_total(), 10);
         assert_eq!(sb.get_absolute(8).unwrap()[0].c, 'X');
+    }
+
+    #[test]
+    fn reset_to_wipes_and_reanchors_monotonic() {
+        let mut sb = ScrollbackBuffer::new(100);
+        sb.append_with_index(0, vec![line('A'), line('B'), line('C')]);
+        sb.reset_to(3);
+        assert!(sb.is_empty());
+        assert_eq!(sb.base_index(), 3);
+        assert_eq!(sb.history_total(), 3);
+        // Surviving lines append contiguously at the new anchor.
+        assert!(sb.append_with_index(3, vec![line('D')]));
+        assert_eq!(sb.get_absolute(3).unwrap()[0].c, 'D');
+    }
+
+    #[test]
+    fn evict_before_drops_old_lines() {
+        let mut sb = ScrollbackBuffer::new(100);
+        sb.append_with_index(0, vec![line('A'), line('B'), line('C'), line('D')]);
+        sb.evict_before(2);
+        assert_eq!(sb.base_index(), 2);
+        assert_eq!(sb.history_total(), 4);
+        assert!(sb.get_absolute(1).is_none(), "evicted line unreachable");
+        assert_eq!(sb.get_absolute(2).unwrap()[0].c, 'C');
+    }
+
+    #[test]
+    fn evict_before_past_end_empties_and_reanchors() {
+        let mut sb = ScrollbackBuffer::new(100);
+        sb.append_with_index(0, vec![line('A'), line('B')]);
+        // Daemon wiped everything up to index 5 (more than we hold).
+        sb.evict_before(5);
+        assert!(sb.is_empty());
+        assert_eq!(sb.base_index(), 5);
+        assert_eq!(sb.history_total(), 5);
+    }
+
+    #[test]
+    fn evict_before_noop_when_base_already_ahead() {
+        let mut sb = ScrollbackBuffer::new(100);
+        sb.seed_tail(10, vec![line('X'), line('Y')]); // base 8
+        sb.evict_before(5); // below base -> no-op
+        assert_eq!(sb.base_index(), 8);
+        assert_eq!(sb.history_total(), 10);
     }
 
     #[test]

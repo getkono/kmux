@@ -268,6 +268,7 @@ mod tests {
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
             history_total: 0,
+            scrollback_reset: None,
         }
     }
 
@@ -279,6 +280,7 @@ mod tests {
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
             history_total: 0,
+            scrollback_base: 0,
             scrollback_tail: vec![],
         }
     }

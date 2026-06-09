@@ -173,6 +173,7 @@ mod tests {
                         cursor: CursorState::default(),
                         modes: TermModes::EMPTY,
                         history_total: 0,
+                        scrollback_base: 0,
                         scrollback_tail: Vec::new(),
                     },
                     scrollback_lines: vec![vec![kmux_protocol::messages::CellState::default(); 80]],

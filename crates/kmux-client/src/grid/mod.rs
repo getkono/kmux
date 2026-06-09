@@ -150,6 +150,13 @@ impl CellGrid {
         self.cells = snapshot.cells;
         self.cursor = snapshot.cursor;
         self.modes = snapshot.modes;
+        // Drop any scrollback the daemon has since evicted or wiped (e.g. a
+        // `clear` after we lagged). `scrollback_base` is its oldest serveable
+        // index. This runs UNCONDITIONALLY -- outside the `seed_tail` guard
+        // below -- because the leak case is "clear then resize": the client
+        // holds non-empty scrollback and the post-clear snapshot tail is empty,
+        // so `seed_tail` is skipped and the stale lines would otherwise survive.
+        self.scrollback.evict_before(snapshot.scrollback_base);
         if !snapshot.scrollback_tail.is_empty() || self.scrollback.is_empty() {
             self.scrollback
                 .seed_tail(snapshot.history_total, snapshot.scrollback_tail);
@@ -174,6 +181,19 @@ impl CellGrid {
     /// has seen, we record the gap so the session manager can issue a
     /// `FetchHistory` request.
     pub fn apply_diff(&mut self, diff: TerminalDiff) {
+        // A scrollback wipe (`clear`'s CSI 3J, `RIS`) must drop history BEFORE
+        // the gap check below, so any surviving lines arrive cleanly via the
+        // out-of-band append (which the relay orders after this diff) and no
+        // spurious gap is recorded. `history_total` stays monotonic across the
+        // wipe, so `reset_to(base)` re-anchors at the daemon's new oldest index.
+        let scrollback_reset = diff.scrollback_reset.is_some();
+        if let Some(base) = diff.scrollback_reset {
+            self.scrollback.reset_to(base);
+            self.scroll_offset = 0;
+            self.selection = None;
+            self.pending_history_total = None;
+        }
+
         if diff.history_total > self.scrollback.history_total() {
             self.pending_history_total = Some(diff.history_total);
         }
@@ -207,7 +227,7 @@ impl CellGrid {
         }
         self.cursor = diff.cursor;
         self.modes = diff.modes;
-        if has_cell_ops {
+        if has_cell_ops || scrollback_reset {
             self.cells_generation += 1;
         }
         self.cursor_generation += 1;
@@ -636,6 +656,7 @@ mod tests {
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
             history_total: 0,
+            scrollback_base: 0,
             scrollback_tail: Vec::new(),
         }
     }
@@ -689,6 +710,59 @@ mod tests {
     }
 
     #[test]
+    fn apply_diff_scrollback_reset_wipes_scrollback() {
+        let mut grid = CellGrid::new(24, 80);
+        push_scrollback(&mut grid, vec![line("hello"), line("world")]);
+        assert_eq!(grid.scrollback_len(), 2);
+        grid.scroll_up(1);
+        assert!(grid.is_scrolled());
+
+        // A diff carrying scrollback_reset wipes history and snaps to live view.
+        // history_total stays monotonic: the new base equals the old total.
+        let diff = TerminalDiff {
+            ops: vec![DiffOp::Clear],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            history_total: 2,
+            scrollback_reset: Some(2),
+        };
+        grid.apply_diff(diff);
+        assert_eq!(
+            grid.scrollback_len(),
+            0,
+            "scrollback_reset wipes client scrollback"
+        );
+        assert!(!grid.is_scrolled(), "reset snaps back to the live view");
+        assert_eq!(
+            grid.scrollback().history_total(),
+            2,
+            "history_total stays monotonic across the wipe"
+        );
+        assert_eq!(grid.pending_history_gap(), None, "no spurious gap recorded");
+    }
+
+    #[test]
+    fn apply_snapshot_evicts_below_scrollback_base() {
+        // The clear-then-resize leak: the client holds scrollback, then a fresh
+        // snapshot arrives with an EMPTY tail but an advanced base (history was
+        // wiped). evict_before must drop the stale lines despite the empty tail.
+        let mut grid = CellGrid::new(24, 80);
+        push_scrollback(&mut grid, vec![line("a"), line("b"), line("c")]);
+        assert_eq!(grid.scrollback_len(), 3);
+
+        let mut snap = snapshot(24, 80);
+        snap.history_total = 3;
+        snap.scrollback_base = 3; // daemon wiped everything below index 3
+        grid.apply_snapshot(snap);
+        assert_eq!(
+            grid.scrollback_len(),
+            0,
+            "stale lines dropped even though the snapshot tail is empty"
+        );
+        assert_eq!(grid.scrollback().history_total(), 3);
+    }
+
+    #[test]
     fn apply_diff_flags_pending_history_gap() {
         let mut grid = CellGrid::new(24, 80);
         let diff = TerminalDiff {
@@ -696,6 +770,7 @@ mod tests {
             cursor: CursorState::default(),
             modes: TermModes::EMPTY,
             history_total: 5,
+            scrollback_reset: None,
         };
         grid.apply_diff(diff);
         assert_eq!(grid.pending_history_gap(), Some((0, 5)));

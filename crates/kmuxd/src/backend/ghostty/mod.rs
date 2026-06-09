@@ -626,6 +626,68 @@ mod tests {
         assert!(!sb.is_empty());
     }
 
+    /// Drive a few lines into scrollback, then return the engine and the
+    /// mirror's `history_total` once it is non-empty.
+    fn engine_with_scrollback() -> (DiffEngine<GhosttyBackend>, u64) {
+        let mut ts = DiffEngine::new(test_backend(4, 20));
+        for i in 0..8 {
+            ts.feed(format!("line{i}\r\n").as_bytes());
+        }
+        let _ = ts.compute_diff();
+        let total = ts.history_total();
+        assert!(total > 0, "expected scrollback to accumulate");
+        (ts, total)
+    }
+
+    fn reset_of(diff: DiffResult) -> Option<u64> {
+        match diff {
+            DiffResult::CellDiff { diff, .. } => diff.scrollback_reset,
+            DiffResult::CursorOnly { .. } | DiffResult::None => None,
+        }
+    }
+
+    #[test]
+    fn clear_scrollback_csi_3j_resets_history() {
+        // `clear` emits CSI 3J (erase scrollback) -- the core of issue #57.
+        let (mut ts, before) = engine_with_scrollback();
+        ts.feed(b"\x1b[3J");
+        let reset = reset_of(ts.compute_diff());
+
+        assert_eq!(ts.history_size(), 0, "backend scrollback is wiped");
+        assert_eq!(
+            reset,
+            Some(before),
+            "the diff carries the wipe at the monotonic base"
+        );
+        assert_eq!(ts.history_total(), before, "history_total stays monotonic");
+        assert!(
+            ts.mirror_range(0, before as u32 + 10).1.is_empty(),
+            "wiped lines must be unrecoverable from the mirror"
+        );
+    }
+
+    #[test]
+    fn ris_full_reset_wipes_scrollback() {
+        // `tput reset` / RIS (ESC c) is also in the issue's repro set.
+        let (mut ts, before) = engine_with_scrollback();
+        ts.feed(b"\x1bc");
+        let reset = reset_of(ts.compute_diff());
+
+        assert_eq!(ts.history_size(), 0, "RIS wipes backend scrollback");
+        assert_eq!(reset, Some(before));
+        assert!(ts.mirror_range(0, before as u32 + 10).1.is_empty());
+    }
+
+    #[test]
+    fn normal_output_after_clear_does_not_flag_reset() {
+        let (mut ts, _before) = engine_with_scrollback();
+        ts.feed(b"\x1b[3J");
+        let _ = ts.compute_diff();
+        // Subsequent ordinary output must not be mistaken for another wipe.
+        ts.feed(b"after clear\r\n");
+        assert_eq!(reset_of(ts.compute_diff()), None);
+    }
+
     #[test]
     fn resize_with_pixel_dims_roundtrip() {
         let mut ts = DiffEngine::new(test_backend(24, 80));

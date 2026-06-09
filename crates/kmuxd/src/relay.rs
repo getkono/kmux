@@ -181,35 +181,68 @@ fn flush_cell_diff(
                 "flush_cell_diff: broadcasting cell diff"
             );
 
-            // Emit scrollback out-of-band, referencing absolute indices
-            // derived from `history_total`. In v16 `TerminalDiff` no longer
-            // carries the lines inline; clients reconcile any gap via
+            // Scrollback travels out-of-band as `ScrollbackAppend`, referencing
+            // absolute indices derived from `history_total`. In v16 the diff no
+            // longer carries the lines inline; clients reconcile any gap via
             // `FetchHistory`.
-            if !scrollback_lines.is_empty() {
-                let sb_len = scrollback_lines.len() as u64;
-                let first_index = diff.history_total.saturating_sub(sb_len);
-                let sb_seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
-                let sb_msg = ServerMessage::ScrollbackAppend {
+            //
+            // Ordering: normally the append is sent before the viewport diff.
+            // On a scrollback-*reset* frame the client must wipe its buffer
+            // (via the diff's `scrollback_reset`) BEFORE the surviving lines are
+            // appended -- otherwise it appends onto stale scrollback and then
+            // wipes them. So the `TerminalUpdate` is emitted first in that case.
+            // Seqnos are allocated in emission order to stay monotonic.
+            let reset_first = diff.scrollback_reset.is_some();
+            let next_seqno = || SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
+            let has_sb = !scrollback_lines.is_empty();
+            let (update_seqno, sb_seqno) = match (reset_first, has_sb) {
+                (true, true) => {
+                    let u = next_seqno();
+                    (u, Some(next_seqno()))
+                }
+                (false, true) => {
+                    let s = next_seqno();
+                    (next_seqno(), Some(s))
+                }
+                (_, false) => (next_seqno(), None),
+            };
+
+            let sb_msg = sb_seqno.map(|sb_seqno| {
+                let first_index = diff
+                    .history_total
+                    .saturating_sub(scrollback_lines.len() as u64);
+                ServerMessage::ScrollbackAppend {
                     pane_id: pane_id.to_string(),
                     first_index,
                     lines: scrollback_lines,
                     seqno: sb_seqno,
                     sent_at_ms: epoch_millis(),
-                };
-                broadcast_to_clients(pane_id, &sb_msg, clients, term_state, sb_seqno);
-            }
+                }
+            });
 
-            let seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
             let diff = Arc::new(diff);
-            scrollback.lock().unwrap().push(seqno, Arc::clone(&diff));
-
-            let msg = ServerMessage::TerminalUpdate {
+            scrollback
+                .lock()
+                .unwrap()
+                .push(update_seqno, Arc::clone(&diff));
+            let update_msg = ServerMessage::TerminalUpdate {
                 pane_id: pane_id.to_string(),
                 diff,
-                seqno,
+                seqno: update_seqno,
                 sent_at_ms: epoch_millis(),
             };
-            broadcast_to_clients(pane_id, &msg, clients, term_state, seqno);
+
+            if reset_first {
+                broadcast_to_clients(pane_id, &update_msg, clients, term_state, update_seqno);
+                if let (Some(sb_msg), Some(sb_seqno)) = (&sb_msg, sb_seqno) {
+                    broadcast_to_clients(pane_id, sb_msg, clients, term_state, sb_seqno);
+                }
+            } else {
+                if let (Some(sb_msg), Some(sb_seqno)) = (&sb_msg, sb_seqno) {
+                    broadcast_to_clients(pane_id, sb_msg, clients, term_state, sb_seqno);
+                }
+                broadcast_to_clients(pane_id, &update_msg, clients, term_state, update_seqno);
+            }
         }
         DiffResult::CursorOnly {
             cursor,
@@ -227,6 +260,7 @@ fn flush_cell_diff(
                         cursor,
                         modes,
                         history_total,
+                        scrollback_reset: None,
                     }),
                 );
                 let msg = ServerMessage::CursorUpdate {
@@ -319,6 +353,7 @@ mod tests {
                 cursor: CursorState::default(),
                 modes: TermModes::EMPTY,
                 history_total: 0,
+                scrollback_reset: None,
             }),
             seqno: SequenceNo(1),
             sent_at_ms: 0,

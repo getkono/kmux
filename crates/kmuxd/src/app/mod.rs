@@ -944,6 +944,7 @@ mod tests {
                 cursor: CursorState::default(),
                 modes: TermModes::EMPTY,
                 history_total: 0,
+                scrollback_reset: None,
             }),
             seqno: SequenceNo(43),
             sent_at_ms: 0,
