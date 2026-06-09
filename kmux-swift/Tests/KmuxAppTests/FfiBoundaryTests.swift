@@ -6,6 +6,6 @@ import KmuxBindings
 final class FfiBoundaryTests: XCTestCase {
     /// The Swift app asserts this on startup; pin it so a drifted ABI fails CI.
     func testAbiVersionMatches() {
-        XCTAssertEqual(kmuxFfiAbiVersion(), 4)
+        XCTAssertEqual(kmuxFfiAbiVersion(), 5)
     }
 }
