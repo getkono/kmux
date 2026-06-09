@@ -6,8 +6,8 @@ use std::time::Duration;
 
 use gtk4::prelude::*;
 use gtk4::{
-    DrawingArea, EventControllerMotion, EventControllerScroll, EventControllerScrollFlags,
-    EventSequenceState, GestureClick, GestureDrag, gdk, glib,
+    Align, DrawingArea, EventControllerMotion, EventControllerScroll, EventControllerScrollFlags,
+    EventSequenceState, GestureClick, GestureDrag, PopoverMenu, gdk, gio, glib,
 };
 
 use kmux_app::layout::{Divider, ratios_for_drag};
@@ -36,7 +36,45 @@ pub fn attach(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
     attach_focus_click(drawing, fe);
     attach_scroll(drawing, fe);
     attach_resize(drawing, fe);
+    attach_context_menu(drawing, fe);
     attach_selection(drawing, fe);
+}
+
+/// Right-click context menu on a pane: focus the pane under the pointer (so the
+/// items target it) and pop a menu of the existing `win.*` pane actions. The
+/// popover is parented to the grid once and re-pointed on each press.
+fn attach_context_menu(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
+    let menu = gio::Menu::new();
+    menu.append(Some("Split Right"), Some("win.split-right"));
+    menu.append(Some("Split Down"), Some("win.split-down"));
+    menu.append(Some("Zoom Pane"), Some("win.zoom-pane"));
+    menu.append(Some("Close Pane"), Some("win.close-pane"));
+    let popover = PopoverMenu::from_model(Some(&menu));
+    popover.set_parent(drawing);
+    popover.set_has_arrow(false);
+    popover.set_halign(Align::Start);
+
+    let gesture = GestureClick::new();
+    gesture.set_button(gdk::BUTTON_SECONDARY);
+    let fe = fe.clone();
+    let area = drawing.clone();
+    gesture.connect_pressed(move |_g, _n, x, y| {
+        let mut changed = false;
+        if let Some(pane_id) = super::tiles::pane_at(&fe, x, y, area.width(), area.height()) {
+            let mut f = fe.borrow_mut();
+            if f.core.mgr.active_pane_id() != Some(pane_id.as_str()) {
+                f.core.mgr.focus_pane(pane_id);
+                f.core.needs_render = true;
+                changed = true;
+            }
+        }
+        if changed {
+            area.queue_draw();
+        }
+        popover.set_pointing_to(Some(&gdk::Rectangle::new(x as i32, y as i32, 1, 1)));
+        popover.popup();
+    });
+    drawing.add_controller(gesture);
 }
 
 /// Divider interaction: a hover over a divider shows a resize cursor, and a
