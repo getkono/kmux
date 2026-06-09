@@ -59,9 +59,9 @@ assert (`kmuxFfiAbiVersion() == 1`).
 ## Build / run / test
 
 ```sh
-just macos-app     # gen bindings + swift build
-just macos-run     # gen bindings + swift run (launches the app)
-just macos-test    # gen bindings + swift test
+just swift-app     # gen bindings + swift build
+just swift-run     # gen bindings + swift run (launches the app)
+just swift-test    # gen bindings + swift test
 ```
 
 (or directly: `swift build --package-path kmux-swift`, etc., after
@@ -110,7 +110,7 @@ cargo run -p kmuxd -- --self-signed     # or: kmux daemon start
 
 # In another: launch the app — it connects to the local daemon over the UDS,
 # renders the active session, and forwards keystrokes.
-just macos-run
+just swift-run
 ```
 
 The app defaults to the local daemon (`DriverConfig.server = nil`). Verify:
@@ -133,7 +133,7 @@ builds `kmux` and the GTK frontend `kmux-gtk` natively against Homebrew GTK
 - `just install` assembles an `~/Applications/kmux.app` bundle, but it is **not
   codesigned or notarized** yet (fine for a local from-source install; a
   Gatekeeper-distributable build is a follow-up). Run via `swift run` /
-  `just macos-run` it launches as a bare SwiftPM executable, setting
+  `just swift-run` it launches as a bare SwiftPM executable, setting
   `NSApplication` to a regular foreground app via the `onAppear` hook.
 - The renderer uses the system monospaced face; a configurable font in
   Preferences is a follow-up.

@@ -86,16 +86,34 @@ gen-ffi-bindings profile="debug":
     echo "==> generated Swift bindings into kmux-swift/Sources/"
 
 # Build the native macOS app (kmux-swift). Regenerates bindings first.
-macos-app: gen-ffi-bindings
+swift-app: gen-ffi-bindings
     swift build --package-path kmux-swift
 
 # Run the native macOS app (kmux-swift).
-macos-run: gen-ffi-bindings
+swift-run: gen-ffi-bindings
     swift run --package-path kmux-swift
 
 # Test the native macOS app (kmux-swift).
-macos-test: gen-ffi-bindings
+swift-test: gen-ffi-bindings
     swift test --package-path kmux-swift
+
+# ── GTK app (kmux-gtk) ───────────────────────────────────────────────────────
+# The GTK4 + libadwaita client lives in crates/kmux-gtk and is the default client
+# on Linux, but also runs on macOS (needs Homebrew GTK4 + libadwaita:
+# `brew install gtk4 libadwaita`). If another pkg-config shadows the system one,
+# prefix these recipes with `PKG_CONFIG=/usr/bin/pkg-config`.
+
+# Build the GTK app (kmux-gtk).
+gtk-app:
+    cargo build -p kmux-gtk
+
+# Run the GTK app (kmux-gtk).
+gtk-run:
+    cargo run -p kmux-gtk
+
+# Test the GTK app (kmux-gtk).
+gtk-test:
+    cargo test -p kmux-gtk
 
 # Generate docs
 doc:

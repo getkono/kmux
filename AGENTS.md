@@ -7,7 +7,7 @@ A terminal multiplexer / session manager with remote desktop capabilities.
 - Run server: `cargo run -p kmuxd -- --self-signed`
 - Run `kmux` (the entrypoint — CLI + opens the platform desktop app): `cargo run -p kmux`. Toolkit-free; handles `daemon`/`ls`/`--dry-run` itself and, for an interactive launch, execs `kmux-gtk` (Linux) or the Swift `kmux.app` (macOS). For a dev GUI run also build the frontend so the exec target exists (`just start`, which builds `kmux` + `kmux-gtk`).
 - Run GTK GUI directly (`kmux-gtk` — the default + official client on Linux, also runnable on macOS): `cargo run -p kmux-gtk` (needs GTK4 + libadwaita dev libs: system packages on Linux, `brew install gtk4 libadwaita` on macOS; if another `pkg-config` shadows the system one, prefix `PKG_CONFIG=/usr/bin/pkg-config`)
-- Run native macOS app (`kmux-swift` — the default GUI `kmux` opens on macOS): `just macos-run` (macOS only; needs Xcode). See [docs/building-macos.md](docs/building-macos.md)
+- Run native macOS app (`kmux-swift` — the default GUI `kmux` opens on macOS): `just swift-run` (macOS only; needs Xcode). See [docs/building-macos.md](docs/building-macos.md)
 - Run tests: `just test`
 - Lint: `just clippy`
 - Lint fix: `just clippy-fix`
