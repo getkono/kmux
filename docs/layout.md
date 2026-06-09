@@ -72,8 +72,15 @@ clients with the same window disagreed by a single cell, the PTY would thrash
 
 `LayoutConfig::default()` (gutter 1×1, min 1×1) is what every frontend passes, so
 they agree. `focus_neighbor` (the geometric tmux/zellij neighbor search) and
-`resize_split` (which split + ratios a keyboard resize should send) also live
-here, so focus and resize geometry are shared too.
+`resize_split` (which split + ratios a *keyboard* resize should send) also live
+here, so focus and resize geometry are shared too. So does the **mouse** resize
+path: `resolve_dividers` enumerates the draggable gutter boundaries (each with a
+split `path`, the pair's axis span, and a hit rectangle), and `ratios_for_drag`
+maps a pointer cell to the split's new ratios — clamped to the same `MIN_RATIO`
+floor as keyboard resize. Both frontends hit-test and drag against these, so a
+mouse resize is as deterministic as a keyboard one (and emits the same
+`SetLayoutRatios`). `resolve_dividers` is empty for a single leaf, so a zoomed
+tab (whose `render_layout()` is one leaf) has nothing to drag.
 
 The frontend resolves, renders each pane into its rect (GTK clips + translates on
 one `DrawingArea`; Swift does the same on one `NSView`), and pushes the resolved
@@ -119,7 +126,7 @@ tab closes the session.
 |-----------|-------------|--------|-------|
 | Split L/R/U/D | `PaneSplit` | spawn PTY, `split` | new pane gets focus |
 | Move focus | `SetFocus` | `set_tab_focus` | target chosen by `focus_neighbor` (client-side) |
-| Resize | `SetLayoutRatios` | `set_ratios` | ratios computed by `resize_split` (client-side) |
+| Resize | `SetLayoutRatios` | `set_ratios` | ratios from `resize_split` (keyboard) or `ratios_for_drag` (mouse divider drag), client-side; double-clicking a divider resets it to even (`even_ratios_at`) |
 | Swap | `PaneSwap` | `swap` | focus follows the moved pane |
 | Close pane | `PaneClose` | `remove_pane` (collapse) | last pane → close tab |
 | New / close / rename tab | `TabCreate` / `TabClose` / `TabRename` | tab CRUD | |
@@ -144,6 +151,23 @@ against `render_layout()` (not `active_layout()`), so a zoomed tab fills the are
 with the focused pane and the others stay attached but hidden. Toggling zoom off
 restores the tiled tree.
 
+## Mouse interaction
+
+Both frontends share the same pointer behaviors (GTK via `kmux-gtk`'s
+`imp::input`/`imp::tiles`, macOS via `MouseInput.swift` against the FFI divider
+surface):
+
+- **Click-to-focus** — a press in a tile focuses it. Selection and scroll are
+  **pane-relative**: coordinates are mapped into the pane under the pointer's
+  local cell grid (the scroll wheel scrolls that tile's scrollback), not the
+  whole window.
+- **Drag a divider** to resize the split live; the pointer shows a col-/row-
+  resize cursor on hover. **Double-click a divider** to reset that split to even.
+  A press within a few px of the 1-cell gutter grabs the divider (suppressing
+  text selection).
+- **Right-click a pane** for a context menu (split right/down, zoom, close pane)
+  — it focuses the pane under the pointer first.
+
 ## Keymap
 
 GTK uses reserved accelerators (it never shadows keys the inner program needs);
@@ -153,14 +177,17 @@ the macOS app uses the parallel ⌘-based shortcuts in its "Pane" / "Session" me
 |--------|------------------|----------------------|
 | Split right / down | `Ctrl+Shift+\` / `Ctrl+Shift+-` | `⌘D` / `⌘⇧D` |
 | Move focus | `Ctrl+Alt+←/→/↑/↓` | `⌘⌥←/→/↑/↓` |
-| Resize | `Ctrl+Shift+Alt+←/→/↑/↓` | `⌘⌃←/→/↑/↓` |
+| Focus pane by number | `Alt+1…9` | `⌘1…9` |
+| Resize (keyboard) | `Ctrl+Shift+Alt+←/→/↑/↓` | `⌘⌃←/→/↑/↓` |
+| Resize (mouse) | drag a divider · double-click → even | drag a divider · double-click → even |
 | Move pane (swap) | `Ctrl+Shift+,` / `Ctrl+Shift+.` | `⌘⌃[` / `⌘⌃]` |
 | Cycle preset layout | `Ctrl+Shift+Space` | `⌘⇧Space` |
 | Zoom focused pane | `Ctrl+Shift+Z` | `⌘⌃Z` |
+| Pane context menu | right-click a pane | right-click a pane |
 | New tab | `Ctrl+Shift+T` | `⌘T` |
 | Next / previous tab | `Ctrl+Shift+→` / `Ctrl+Shift+←` | `⌘⌥]` / `⌘⌥[` |
-| Rename tab | `Shift+F2` | *(native sheet — follow-up)* |
-| Close tab | *(tab-bar ✕ / menu)* | *(menu)* |
+| Rename tab | `Shift+F2` | *(tab context menu → native sheet)* |
+| Close tab | *(tab-bar ✕ / menu)* | *(tab context menu / menu)* |
 | Close pane | `Ctrl+Shift+Q` | `⌘⇧W` |
 
 ## Versioning
@@ -169,5 +196,7 @@ the macOS app uses the parallel ⌘-based shortcuts in its "Pane" / "Session" me
   `SetLayoutRatios`, `SetFocus`, `Tab*`, `ApplyLayoutScheme`, `LayoutUpdate`).
 - `STATE_VERSION = 3` — daemon checkpoint persistence; the v2→v3 migration wraps
   each persisted session's panes in a default one-tab-one-pane layout.
-- `KMUX_FFI_ABI_VERSION = 4` — the Swift tiling surface (`tabs`/`layout`/per-pane
-  grid/`focus_pane`/`set_pane_sizes` + the tiling/scheme/zoom `FfiAction`s).
+- `KMUX_FFI_ABI_VERSION = 5` — the Swift tiling surface (`tabs`/`layout`/per-pane
+  grid/`focus_pane`/`set_pane_sizes` + the tiling/scheme/zoom `FfiAction`s), plus
+  the interactive-divider surface (`dividers`, `apply_divider_drag`,
+  `reset_divider`), `FfiAction::FocusPaneAt`, and `rename_tab`.

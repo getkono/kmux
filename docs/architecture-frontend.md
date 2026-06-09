@@ -240,9 +240,13 @@ ignores it) and links the `kmux-ffi` staticlib.
   **mode-aware** key input (`send_char` / `send_named_key`, routed through the
   daemon's Ghostty encoder via `send_keys`, so no escape sequences are
   hand-rolled); the **tiling surface** — `tabs()` + `select_tab`, `layout(area)`
-  (the shared resolver's per-pane rects), per-pane `grid_snapshot_for` /
-  `selection_for` / `scroll_info_for`, `focus_pane`, `set_pane_sizes`, and the
-  split/focus/resize/swap/scheme/zoom `FfiAction`s (see [layout.md](layout.md));
+  (the shared resolver's per-pane rects), `dividers(area)` + `apply_divider_drag`
+  / `reset_divider` (interactive mouse resize, exposing
+  `kmux_app::layout::resolve_dividers` / `ratios_for_drag`), per-pane
+  `grid_snapshot_for` / `selection_for` / `scroll_info_for`, `focus_pane`,
+  `set_pane_sizes`, `rename_tab`, and the
+  split/focus/resize/swap/scheme/zoom/`FocusPaneAt` `FfiAction`s (see
+  [layout.md](layout.md));
   scroll- and wrap-aware text
   selection (per-visible-row wash spans, working while scrolled into history) +
   `scroll_at`/`scroll_lines`; the
@@ -260,11 +264,15 @@ ignores it) and links the `kmux-ffi` staticlib.
   glyph passes, text attributes, wide chars, the four cursor shapes + blink,
   selection wash, scroll indicator). Like the GTK leaf it **tiles** the active
   tab's panes from `layout()` (clip + translate per pane, focus border,
-  click-to-focus). Everything around it is native SwiftUI — a
-  sessions sidebar, a tab strip (from `tabs()`), a header with the connection
+  click-to-focus, pane-relative selection/scroll), with divider drag-resize +
+  hover cursor (from `dividers()`/`apply_divider_drag`), a right-click pane
+  context menu, and `⌘1…9` numbered focus. Everything around it is native
+  SwiftUI — a
+  sessions sidebar, a tab strip (from `tabs()`, with a rename/close context
+  menu), a header with the connection
   badge, the
-  command palette, the pickers, session rename/close, preferences (theme), and
-  the performance HUD/metrics — each driven by the FFI getters/dispatch,
+  command palette, the pickers, session + tab rename/close, preferences (theme),
+  and the performance HUD/metrics — each driven by the FFI getters/dispatch,
   file-for-file parallel to `kmux-gtk`'s `sidebar.rs`/`tabs.rs`/`header.rs`/
   `dialogs.rs`/`prefs.rs`.
 - **Platform gating.** `kmux-gtk`'s GTK4/libadwaita deps are target-gated to
