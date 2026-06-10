@@ -60,7 +60,7 @@ final class KmuxModel: ObservableObject {
         // Assert the ABI the bindings were generated against, on top of uniffi's
         // built-in binding-checksum check. Mirrors kmux-ghostty-sys's ABI guard.
         precondition(
-            kmuxFfiAbiVersion() == 5,
+            kmuxFfiAbiVersion() == 6,
             "kmux-ffi ABI mismatch: regenerate the Swift bindings (just gen-ffi-bindings)"
         )
         let config = DriverConfig(
@@ -69,6 +69,7 @@ final class KmuxModel: ObservableObject {
             cwd: nil,
             session: nil,
             theme: nil,  // default theme
+            cursorBlink: nil,  // resolve from config.toml, defaulting to true
             rows: 24,
             cols: 80,
             pixelWidth: 0,

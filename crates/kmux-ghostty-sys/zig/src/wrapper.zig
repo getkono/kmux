@@ -263,6 +263,26 @@ const Handler = struct {
                 defer inner.deinit();
                 try inner.vt(action, value);
             },
+            .cursor_style => {
+                var inner = gvt.ReadonlyHandler.init(self.terminal);
+                defer inner.deinit();
+                try inner.vt(action, value);
+                // ghostty-vt maps DECSCUSR 0 (`.default`, also the no-param
+                // form `CSI SP q`) to a *steady* cursor, but the xterm DECSCUSR
+                // spec defines 0 as a *blinking* block. Re-enable blink so the
+                // default cursor matches real terminals. `blinking_*`/`steady_*`
+                // keep the readonly handler's (correct) result.
+                if (value == .default) self.terminal.modes.set(.cursor_blinking, true);
+            },
+            .full_reset => {
+                var inner = gvt.ReadonlyHandler.init(self.terminal);
+                defer inner.deinit();
+                try inner.vt(action, value);
+                // RIS resets DEC mode 12 to its (false) default; restore the
+                // blinking power-on default to match real terminals (and our
+                // `Wrapper.create` initialization).
+                self.terminal.modes.set(.cursor_blinking, true);
+            },
             else => {
                 var inner = gvt.ReadonlyHandler.init(self.terminal);
                 defer inner.deinit();
@@ -311,6 +331,14 @@ const Wrapper = struct {
             .max_scrollback = scrollback,
         });
         errdefer self.terminal.deinit(alloc);
+
+        // Real terminals blink the default cursor; ghostty-vt's DEC mode 12
+        // (`cursor_blinking`) defaults to false. Start it enabled so a program
+        // that never issues DECSCUSR (e.g. Claude Code's input line, a bare
+        // shell) gets a blinking cursor. An explicit steady request
+        // (DECSCUSR `steady_*` / `CSI ?12l`) still clears it. See `Handler.vt`
+        // for the matching DECSCUSR-`default` and RIS handling.
+        self.terminal.modes.set(.cursor_blinking, true);
 
         self.stream = HandlerStream.initAlloc(alloc, .{
             .terminal = &self.terminal,
@@ -993,6 +1021,85 @@ test "readCursor reports DECSCUSR blink request" {
     kmux_ghostty_cursor(w, &cur);
     try std.testing.expectEqual(SHAPE_BAR, cur.shape);
     try std.testing.expectEqual(@as(u8, 0), cur.blink);
+}
+
+test "default cursor blinks without any DECSCUSR" {
+    const alloc = std.testing.allocator;
+    const sink: KmuxEventSink = .{
+        .user = null,
+        .on_title = null,
+        .on_bell = null,
+        .on_osc52 = null,
+        .on_hyperlink = null,
+    };
+    const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
+    defer w.destroy();
+
+    var cur: KmuxCursor = undefined;
+
+    // A program that never issues DECSCUSR (e.g. Claude Code) must blink, like
+    // a real terminal's power-on default.
+    kmux_ghostty_cursor(w, &cur);
+    try std.testing.expectEqual(@as(u8, 1), cur.blink);
+
+    // DECSCUSR 0 and the no-param form are the "default" style: still blinking.
+    try w.stream.nextSlice("\x1b[0 q");
+    kmux_ghostty_cursor(w, &cur);
+    try std.testing.expectEqual(@as(u8, 1), cur.blink);
+    try w.stream.nextSlice("\x1b[ q");
+    kmux_ghostty_cursor(w, &cur);
+    try std.testing.expectEqual(@as(u8, 1), cur.blink);
+
+    // An explicit steady block (DECSCUSR 2) still clears blink.
+    try w.stream.nextSlice("\x1b[2 q");
+    kmux_ghostty_cursor(w, &cur);
+    try std.testing.expectEqual(@as(u8, 0), cur.blink);
+}
+
+test "DEC mode 12 toggles cursor blink" {
+    const alloc = std.testing.allocator;
+    const sink: KmuxEventSink = .{
+        .user = null,
+        .on_title = null,
+        .on_bell = null,
+        .on_osc52 = null,
+        .on_hyperlink = null,
+    };
+    const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
+    defer w.destroy();
+
+    var cur: KmuxCursor = undefined;
+
+    // `CSI ?12l` disables the blink; `CSI ?12h` re-enables it.
+    try w.stream.nextSlice("\x1b[?12l");
+    kmux_ghostty_cursor(w, &cur);
+    try std.testing.expectEqual(@as(u8, 0), cur.blink);
+    try w.stream.nextSlice("\x1b[?12h");
+    kmux_ghostty_cursor(w, &cur);
+    try std.testing.expectEqual(@as(u8, 1), cur.blink);
+}
+
+test "RIS restores the blinking default cursor" {
+    const alloc = std.testing.allocator;
+    const sink: KmuxEventSink = .{
+        .user = null,
+        .on_title = null,
+        .on_bell = null,
+        .on_osc52 = null,
+        .on_hyperlink = null,
+    };
+    const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
+    defer w.destroy();
+
+    var cur: KmuxCursor = undefined;
+
+    // Steady block, then RIS (`ESC c`): blink returns to the power-on default.
+    try w.stream.nextSlice("\x1b[2 q");
+    kmux_ghostty_cursor(w, &cur);
+    try std.testing.expectEqual(@as(u8, 0), cur.blink);
+    try w.stream.nextSlice("\x1bc");
+    kmux_ghostty_cursor(w, &cur);
+    try std.testing.expectEqual(@as(u8, 1), cur.blink);
 }
 
 comptime {

@@ -27,6 +27,7 @@ pub fn open(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea) {
 
     group.add(&theme_row(fe, drawing));
     group.add(&font_row(fe, drawing));
+    group.add(&cursor_blink_row(fe, drawing));
 
     page.add(&group);
     window.add(&page);
@@ -89,6 +90,29 @@ fn font_row(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea) -> adw::EntryRow 
         let _ = config::save(&cfg);
         // Re-evaluate cols/rows at the new cell size, then repaint.
         drawing.queue_resize();
+        drawing.queue_draw();
+    });
+    row
+}
+
+/// Cursor-blink switch; toggles `core.cursor_blink_enabled` live and persists.
+fn cursor_blink_row(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea) -> adw::SwitchRow {
+    let row = adw::SwitchRow::new();
+    row.set_title("Blink cursor");
+    row.set_active(fe.borrow().core.cursor_blink_enabled);
+
+    let fe = fe.clone();
+    let drawing = drawing.clone();
+    row.connect_active_notify(move |row| {
+        let on = row.is_active();
+        {
+            let mut f = fe.borrow_mut();
+            f.core.cursor_blink_enabled = on;
+            f.core.needs_render = true;
+        }
+        let mut cfg = config::load();
+        cfg.cursor_blink = Some(on);
+        let _ = config::save(&cfg);
         drawing.queue_draw();
     });
     row

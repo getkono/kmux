@@ -9,6 +9,7 @@ import KmuxBindings
 struct PreferencesView: View {
     @ObservedObject var model: KmuxModel
     @State private var selectedTheme = ""
+    @State private var cursorBlink = true
 
     var body: some View {
         Form {
@@ -20,14 +21,22 @@ struct PreferencesView: View {
             .onChange(of: selectedTheme) { _, name in
                 if !name.isEmpty { model.driver.setTheme(name: name) }
             }
+
+            // Mirrors kmux-gtk's prefs cursor-blink switch. Toggling persists to
+            // ~/.config/kmux/config.toml via the driver and updates live.
+            Toggle("Blink cursor", isOn: $cursorBlink)
+                .onChange(of: cursorBlink) { _, on in
+                    model.driver.setCursorBlinkEnabled(enabled: on)
+                }
         }
         .formStyle(.grouped)
-        .frame(width: 340, height: 120)
+        .frame(width: 340, height: 150)
         .onAppear {
             // Best-effort initial selection: the first built-in theme.
             if selectedTheme.isEmpty {
                 selectedTheme = model.driver.availableThemes().first ?? ""
             }
+            cursorBlink = model.driver.cursorBlinkEnabled()
         }
     }
 }

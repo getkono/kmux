@@ -878,6 +878,25 @@ mod tests {
     }
 
     #[test]
+    fn default_cursor_blinks() {
+        let mut term = GhosttyTerm::new(size(4, 20), 1000, Arc::new(NullSink)).unwrap();
+        // A program that never issues DECSCUSR must blink, like a real terminal.
+        assert!(term.cursor().blink, "the default cursor should blink");
+        // DECSCUSR 0 (and the no-param form) is the blinking default per xterm.
+        term.feed(b"\x1b[0 q").unwrap();
+        assert!(
+            term.cursor().blink,
+            "DECSCUSR 0 should request a blinking cursor"
+        );
+        // An explicit steady block (DECSCUSR 2) still clears blink.
+        term.feed(b"\x1b[2 q").unwrap();
+        assert!(
+            !term.cursor().blink,
+            "DECSCUSR 2 should request a steady cursor"
+        );
+    }
+
+    #[test]
     fn send_across_thread_feed_and_drop() {
         // Exercises the `unsafe impl Send` — moves the handle to another
         // thread, feeds bytes, joins. Catches any TLS/thread-local assumption

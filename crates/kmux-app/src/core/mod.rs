@@ -80,6 +80,12 @@ pub struct AppCore {
     /// not shadow a frontend's own rendered-theme field through a deref.
     pub palette: Theme,
 
+    /// Whether the inner-pane cursor blinks. When `false`, a cursor that
+    /// requested blinking (DECSCUSR `blinking_*` / DEC mode 12) is drawn steady.
+    /// The blink phase is driven by the frontend pump
+    /// ([`crate::driver::blink`]); this gates whether it advances at all.
+    pub cursor_blink_enabled: bool,
+
     /// Current interaction mode (modal keymap state).
     pub mode: Mode,
 
@@ -166,6 +172,7 @@ impl AppCore {
         auto_cwd: Option<String>,
         capabilities: ClientCapabilities,
         theme: Theme,
+        cursor_blink: bool,
         term_size: TermSize,
     ) -> Self {
         let (is_local, accept_invalid_certs, ssh_target) = match &target {
@@ -210,6 +217,7 @@ impl AppCore {
         Self {
             mgr,
             palette: theme,
+            cursor_blink_enabled: cursor_blink,
             mode: Mode::Normal,
             term_size,
             hud_visible: false,
@@ -258,6 +266,7 @@ impl AppCore {
         Self {
             mgr,
             palette: crate::theme::default_theme(),
+            cursor_blink_enabled: true,
             mode: Mode::Normal,
             term_size: TermSize {
                 rows: 24,

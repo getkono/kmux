@@ -117,8 +117,10 @@ whichever `Arc<dyn BackendEventSink>` the host passes in.  `NullEventSink`
 The frontend paints the inner-pane cursor **itself** rather than delegating
 Bar/Underline shapes to a host terminal's hardware cursor. In-cell rendering
 makes the cursor visible everywhere and reflects the inner program's DECSCUSR
-shape request; modern TUIs such as Claude Code request a Bar via DECSCUSR
-`\x1b[5 q`.
+shape request; many TUIs (vim, fish, starship) request a Bar via DECSCUSR
+`\x1b[5 q`. Programs that issue no DECSCUSR — e.g. Claude Code, which only
+toggles cursor *visibility* via DEC mode 25 (`\x1b[?25h`/`l`) — get the default
+block shape.
 
 | Shape | GTK (`kmux-gtk`) |
 |---|---|
@@ -136,10 +138,21 @@ shapes from the FFI `grid_snapshot` cursor fields.
 
 ### Blink
 
-`CursorState.blink` carries the inner program's DECSCUSR blink request (DEC
-private mode 12 `cursor_blinking`; `blinking_*` → `true`, `steady_*` → `false`),
-read from libghostty-vt by the Zig wrapper's `readCursor`. Frontends **honor**
-the request rather than blinking every cursor, so a steady cursor stays solid:
+`CursorState.blink` carries whether the cursor should blink (DEC private mode 12
+`cursor_blinking`), read from libghostty-vt by the Zig wrapper's `readCursor`.
+The invariant is **the cursor blinks unless the program explicitly requested a
+steady cursor** — matching xterm/ghostty/iTerm. ghostty-vt's mode 12 defaults to
+`false`, so the Zig wrapper (`wrapper.zig`) nudges it to match real terminals:
+
+- `Wrapper.create` initializes mode 12 to `true`, so a program that never issues
+  DECSCUSR (e.g. Claude Code) gets a blinking default cursor.
+- DECSCUSR `blinking_*` → `true`, `steady_*` → `false`. DECSCUSR `0`/no-param
+  (`.default`) is forced back to `true` (xterm defines it as a blinking block,
+  but ghostty-vt maps it to steady); RIS (`\x1b c`) likewise restores blink.
+- DEC mode 12 (`\x1b[?12h`/`l`) toggles blink directly.
+
+Frontends **honor** the request rather than blinking every cursor, so a steady
+cursor stays solid:
 
 - **GTK** (and any frontend on the shared run loop) drives a blink phase off the
   60 Hz pump via `kmux_app::driver::blink::advance_blink`, toggling a blinking
@@ -150,8 +163,15 @@ the request rather than blinking every cursor, so a steady cursor stays solid:
   `kmux-app` when the run loop was shared; the FFI `grid_snapshot` carries the
   same `blink` bit and `blink_on()` so a SwiftUI renderer blinks identically.)
 
-This is the second half of issue #50: the GTK bar cursor was visible but never
-blinked, even though Claude Code requests a *blinking* bar (`\x1b[5 q`).
+A client-side **`cursor_blink`** setting (`config.toml`, default `true`) gates
+this: when `false`, `tick_blink` pins the phase solid so no cursor blinks
+regardless of the program's request. It is resolved at startup
+(`config::resolve_cursor_blink`) onto `AppCore::cursor_blink_enabled` and is
+live-toggleable from the GTK/Swift preferences window.
+
+Issue #50 first made an explicitly-requested blinking bar (`\x1b[5 q`) blink in
+GTK; issue #94 extended this to the **default** cursor, since current Claude Code
+issues no DECSCUSR at all (it relies on the terminal's blinking default).
 
 ## Key encoding (server-side)
 
