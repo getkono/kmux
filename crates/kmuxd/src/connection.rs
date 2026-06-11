@@ -64,7 +64,15 @@ async fn pane_uni_writer(
         }
     }
 
+    // Network impairment shim (issue #72): per-pane jitter on live pane-data
+    // frames only. `None` (no env knobs) skips the delay entirely.
+    let impair = crate::impair::config();
+    let mut rng = impair.map(|c| c.rng_for(crate::impair::pane_salt(&pane_id)));
+
     while let Some(msg) = client_rx.recv().await {
+        if let (Some(cfg), Some(rng)) = (impair, rng.as_mut()) {
+            crate::impair::maybe_delay(cfg, msg.category(), rng).await;
+        }
         let write_start = Instant::now();
         if send_frame(&mut uni, &msg).await.is_err() {
             break;

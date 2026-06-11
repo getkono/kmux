@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 use kmux_protocol::messages::{
     ClientId, CursorState, SequenceNo, ServerMessage, TermModes, TerminalDiff, epoch_millis,
 };
+use kmux_protocol::trace::DiffKind;
 use kmux_pty::process::ExitStatus;
 use kmux_pty::registry::SessionManager;
 use kmux_pty::session::PtyReader;
@@ -211,12 +212,14 @@ fn flush_cell_diff(
                 let first_index = diff
                     .history_total
                     .saturating_sub(scrollback_lines.len() as u64);
+                let sent_at = epoch_millis();
+                crate::trace::record(pane_id, sb_seqno.0, sent_at, 0, DiffKind::Scrollback);
                 ServerMessage::ScrollbackAppend {
                     pane_id: pane_id.to_string(),
                     first_index,
                     lines: scrollback_lines,
                     seqno: sb_seqno,
-                    sent_at_ms: epoch_millis(),
+                    sent_at_ms: sent_at,
                 }
             });
 
@@ -225,11 +228,19 @@ fn flush_cell_diff(
                 .lock()
                 .unwrap()
                 .push(update_seqno, Arc::clone(&diff));
+            let update_sent_at = epoch_millis();
+            crate::trace::record(
+                pane_id,
+                update_seqno.0,
+                update_sent_at,
+                ops,
+                DiffKind::Update,
+            );
             let update_msg = ServerMessage::TerminalUpdate {
                 pane_id: pane_id.to_string(),
                 diff,
                 seqno: update_seqno,
-                sent_at_ms: epoch_millis(),
+                sent_at_ms: update_sent_at,
             };
 
             if reset_first {
@@ -263,12 +274,14 @@ fn flush_cell_diff(
                         scrollback_reset: None,
                     }),
                 );
+                let sent_at = epoch_millis();
+                crate::trace::record(pane_id, seqno.0, sent_at, 0, DiffKind::Cursor);
                 let msg = ServerMessage::CursorUpdate {
                     pane_id: pane_id.to_string(),
                     cursor,
                     modes,
                     seqno,
-                    sent_at_ms: epoch_millis(),
+                    sent_at_ms: sent_at,
                 };
                 broadcast_to_clients(pane_id, &msg, clients, term_state, seqno);
             }
