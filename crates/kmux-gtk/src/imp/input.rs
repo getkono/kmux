@@ -12,6 +12,7 @@ use gtk4::{
 
 use kmux_app::layout::{Divider, ratios_for_drag};
 use kmux_client::grid::{GridPos, Selection, SelectionMode};
+use kmux_client::input::{MouseButton, MouseEvent, MouseEventKind, MouseMods};
 use kmux_protocol::messages::SplitDir;
 
 use super::Frontend;
@@ -248,6 +249,40 @@ fn pos_at(f: &Frontend, x: f64, y: f64, width_px: i32, height_px: i32) -> Option
     Some(grid.visible_to_abs(vr, col))
 }
 
+/// Map a pointer pixel to a 0-based *visible viewport* cell in the focused pane,
+/// clamped to the grid, for forwarding mouse reports to the inner program. The
+/// program only knows its on-screen grid, never the scrollback, so — unlike
+/// [`pos_at`] — this does not go through `visible_to_abs`. Returns `None` when
+/// there is no active grid.
+fn viewport_cell(
+    f: &Frontend,
+    x: f64,
+    y: f64,
+    width_px: i32,
+    height_px: i32,
+) -> Option<(u16, u16)> {
+    let grid = f.core.mgr.active_grid()?;
+    let (off_c, off_r) = super::tiles::focused_rect(f, width_px, height_px)
+        .map(|r| (r.col as f64, r.row as f64))
+        .unwrap_or((0.0, 0.0));
+    let col = (((x / f.metrics.cell_w) - off_c).floor().max(0.0) as usize)
+        .min(grid.cols.saturating_sub(1));
+    let row = (((y / f.metrics.cell_h) - off_r).floor().max(0.0) as usize)
+        .min(grid.rows.saturating_sub(1));
+    Some((col as u16, row as u16))
+}
+
+/// Build [`MouseMods`] from a GTK modifier state. `keep_shift` is `false` for
+/// motion/release on an in-progress PTY drag (the forward-vs-select decision was
+/// already made at press, so a Shift pressed mid-drag must not strand it).
+fn mods_from_state(st: gdk::ModifierType, keep_shift: bool) -> MouseMods {
+    MouseMods {
+        ctrl: st.contains(gdk::ModifierType::CONTROL_MASK),
+        alt: st.contains(gdk::ModifierType::ALT_MASK),
+        shift: keep_shift && st.contains(gdk::ModifierType::SHIFT_MASK),
+    }
+}
+
 /// In-progress single-click drag: the fixed anchor plus the last pointer
 /// position. The position lets a held drag past the viewport edge keep
 /// auto-scrolling from the last known location even after motion events stop
@@ -278,6 +313,10 @@ fn set_selection(fe: &Rc<RefCell<Frontend>>, area: &DrawingArea, sel: Option<Sel
 fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
     // `Some` only while a single-click drag is in progress.
     let drag: Rc<Cell<Option<Drag>>> = Rc::new(Cell::new(None));
+    // `true` while a primary-button drag is being forwarded to a mouse-tracking
+    // inner program (so motion/release forward too and local selection is
+    // suppressed). Mutually exclusive with `drag`.
+    let pty_drag: Rc<Cell<bool>> = Rc::new(Cell::new(false));
 
     let click = GestureClick::new();
     click.set_button(gdk::BUTTON_PRIMARY);
@@ -285,7 +324,8 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
         let fe = fe.clone();
         let area = drawing.clone();
         let drag = drag.clone();
-        click.connect_pressed(move |_g, n_press, x, y| {
+        let pty_drag = pty_drag.clone();
+        click.connect_pressed(move |g, n_press, x, y| {
             // Clicking the terminal takes keyboard focus back from the sidebar.
             area.grab_focus();
             // A press on a divider is a resize, not a text selection: suppress
@@ -306,6 +346,36 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                 }
                 drag.set(None);
                 return;
+            }
+            // If the focused pane's program enabled mouse tracking (and Shift
+            // isn't held to force local selection), forward the press to the PTY
+            // instead of starting a selection. Forwarding any press regardless of
+            // `n_press` lets the program interpret its own multi-clicks.
+            if let Some((col, row)) = {
+                let f = fe.borrow();
+                viewport_cell(&f, x, y, area.width(), area.height())
+            } {
+                let mods = mods_from_state(g.current_event_state(), true);
+                let forwarded = {
+                    let mut f = fe.borrow_mut();
+                    f.core.mgr.report_mouse(
+                        false,
+                        MouseEvent {
+                            button: MouseButton::Left,
+                            kind: MouseEventKind::Press,
+                            col: col + 1,
+                            row: row + 1,
+                            mods,
+                        },
+                    )
+                };
+                if forwarded {
+                    pty_drag.set(true);
+                    drag.set(None);
+                    // Drop any lingering highlight so the program owns the screen.
+                    set_selection(&fe, &area, None);
+                    return;
+                }
             }
             let sel = {
                 let f = fe.borrow();
@@ -361,8 +431,33 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
         });
     }
     {
+        let fe = fe.clone();
+        let area = drawing.clone();
         let drag = drag.clone();
-        click.connect_released(move |_g, _n, _x, _y| drag.set(None));
+        let pty_drag = pty_drag.clone();
+        click.connect_released(move |g, _n, x, y| {
+            if pty_drag.replace(false) {
+                if let Some((col, row)) = {
+                    let f = fe.borrow();
+                    viewport_cell(&f, x, y, area.width(), area.height())
+                } {
+                    let mods = mods_from_state(g.current_event_state(), false);
+                    let mut f = fe.borrow_mut();
+                    f.core.mgr.report_mouse(
+                        false,
+                        MouseEvent {
+                            button: MouseButton::Left,
+                            kind: MouseEventKind::Release,
+                            col: col + 1,
+                            row: row + 1,
+                            mods,
+                        },
+                    );
+                }
+                return;
+            }
+            drag.set(None);
+        });
     }
     drawing.add_controller(click);
 
@@ -373,7 +468,31 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
         let fe = fe.clone();
         let area = drawing.clone();
         let drag = drag.clone();
-        motion.connect_motion(move |_m, x, y| {
+        let pty_drag = pty_drag.clone();
+        motion.connect_motion(move |m, x, y| {
+            // While forwarding a drag to a mouse-tracking program, report motion
+            // to the PTY (gated server-side: 1002 needs a button held, which we
+            // are; 1000 reports none). No local selection in this mode.
+            if pty_drag.get() {
+                if let Some((col, row)) = {
+                    let f = fe.borrow();
+                    viewport_cell(&f, x, y, area.width(), area.height())
+                } {
+                    let mods = mods_from_state(m.current_event_state(), false);
+                    let mut f = fe.borrow_mut();
+                    f.core.mgr.report_mouse(
+                        true,
+                        MouseEvent {
+                            button: MouseButton::Left,
+                            kind: MouseEventKind::Motion,
+                            col: col + 1,
+                            row: row + 1,
+                            mods,
+                        },
+                    );
+                }
+                return;
+            }
             let Some(mut d) = drag.get() else {
                 return;
             };

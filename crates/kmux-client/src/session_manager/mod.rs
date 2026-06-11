@@ -404,6 +404,95 @@ mod tests {
         }
     }
 
+    /// A connected manager with one active pane whose inner program has the
+    /// given mouse modes set, plus the outbound message receiver.
+    fn manager_with_modes(
+        modes: TermModes,
+    ) -> (SessionManager, mpsc::UnboundedReceiver<ClientMessage>) {
+        use kmux_protocol::messages::CursorState;
+        let (mut mgr, rx) = make_connected_manager();
+        let mut grid = CellGrid::default();
+        grid.apply_cursor_update(CursorState::default(), modes);
+        mgr.buffers.insert("s1/0".to_string(), grid);
+        mgr.active_pane = Some("s1/0".to_string());
+        (mgr, rx)
+    }
+
+    fn mouse(
+        button: crate::input::MouseButton,
+        kind: crate::input::MouseEventKind,
+        shift: bool,
+    ) -> crate::input::MouseEvent {
+        crate::input::MouseEvent {
+            button,
+            kind,
+            col: 1,
+            row: 1,
+            mods: crate::input::MouseMods {
+                shift,
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn report_mouse_forwards_press_when_app_wants_it() {
+        use crate::input::{MouseButton, MouseEventKind};
+        let (mut mgr, mut rx) = manager_with_modes(TermModes(
+            TermModes::MOUSE_REPORT_CLICK | TermModes::SGR_MOUSE,
+        ));
+        let sent = mgr.report_mouse(
+            false,
+            mouse(MouseButton::Left, MouseEventKind::Press, false),
+        );
+        assert!(sent, "press should forward when mouse tracking is on");
+        match rx.try_recv() {
+            Ok(ClientMessage::PtyInput { data, .. }) => assert_eq!(data, b"\x1b[<0;1;1M"),
+            other => panic!("expected PtyInput, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn report_mouse_shift_bypasses_to_local_selection() {
+        use crate::input::{MouseButton, MouseEventKind};
+        let (mut mgr, mut rx) = manager_with_modes(TermModes(TermModes::MOUSE_REPORT_CLICK));
+        let sent = mgr.report_mouse(false, mouse(MouseButton::Left, MouseEventKind::Press, true));
+        assert!(!sent, "shift is the bypass key; never forward");
+        assert!(rx.try_recv().is_err(), "nothing should be sent to the PTY");
+    }
+
+    #[test]
+    fn report_mouse_ignored_when_no_mouse_mode() {
+        use crate::input::{MouseButton, MouseEventKind};
+        let (mut mgr, mut rx) = manager_with_modes(TermModes::EMPTY);
+        let sent = mgr.report_mouse(
+            false,
+            mouse(MouseButton::Left, MouseEventKind::Press, false),
+        );
+        assert!(!sent, "no mouse mode → the click is ours");
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn report_mouse_motion_gated_by_mode() {
+        use crate::input::{MouseButton, MouseEventKind};
+        let motion = || mouse(MouseButton::Left, MouseEventKind::Motion, false);
+
+        // Click tracking (1000) reports no motion at all.
+        let (mut mgr, _rx) = manager_with_modes(TermModes(TermModes::MOUSE_REPORT_CLICK));
+        assert!(!mgr.report_mouse(true, motion()));
+
+        // Button-event tracking (1002): motion only while a button is held.
+        let (mut mgr, _rx) = manager_with_modes(TermModes(TermModes::MOUSE_DRAG));
+        assert!(mgr.report_mouse(true, motion()));
+        let (mut mgr, _rx) = manager_with_modes(TermModes(TermModes::MOUSE_DRAG));
+        assert!(!mgr.report_mouse(false, motion()));
+
+        // Any-event tracking (1003): every motion, even with no button.
+        let (mut mgr, _rx) = manager_with_modes(TermModes(TermModes::MOUSE_MOTION));
+        assert!(mgr.report_mouse(false, motion()));
+    }
+
     #[test]
     fn auth_ok_sets_client_id() {
         let mut mgr = make_manager();

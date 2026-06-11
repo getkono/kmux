@@ -31,6 +31,10 @@ final class TerminalNSView: NSView {
     var autoScrollTimer: Timer?
     /// The divider being dragged (a press that began on a gutter), if any.
     var activeDivider: FfiDivider?
+    /// `true` while a primary-button drag is being forwarded to a mouse-tracking
+    /// inner program (so motion/release forward too and local selection is
+    /// suppressed). Mutually exclusive with `dragAnchor`.
+    var ptyDragging = false
     /// Tracking area driving the hover resize cursor over dividers.
     var dividerTrackingArea: NSTrackingArea?
 

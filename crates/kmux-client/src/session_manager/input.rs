@@ -1,6 +1,7 @@
 use kmux_protocol::messages::{ClientMessage, KeyEvent, TermSize};
 
 use super::SessionManager;
+use crate::input::{MouseEvent, MouseEventKind, encode_mouse_button};
 
 impl SessionManager {
     /// Returns `Ok(pane_id)` if input is allowed on the active pane, or sets
@@ -30,6 +31,52 @@ impl SessionManager {
             }
             Err(ok) => ok,
         }
+    }
+
+    /// Forward a pointer event to the active pane's inner program when it has
+    /// enabled mouse tracking, returning `true` iff bytes were sent — in which
+    /// case the caller skips its own client-side text selection.
+    ///
+    /// The decision policy (shared by every frontend so they behave
+    /// identically):
+    /// - **Shift is the bypass key**: a shift-held event is never forwarded, so
+    ///   the user can always select locally even inside a mouse-mode program.
+    /// - No active pane, or the program enabled no mouse mode → not forwarded.
+    /// - Motion is gated by the mode: any-event tracking (1003) reports every
+    ///   move; button-event tracking (1002) reports motion only while a button
+    ///   is held (`button_held`); plain click tracking (1000) reports none.
+    /// - Otherwise the event is encoded (SGR per the program's 1006 state) and
+    ///   sent to the PTY.
+    pub fn report_mouse(&mut self, button_held: bool, mut ev: MouseEvent) -> bool {
+        if ev.mods.shift {
+            return false;
+        }
+        let Some(pane_id) = self.active_pane.clone() else {
+            return false;
+        };
+        // Snapshot the pane's modes and dimensions (all `Copy`) so the borrow is
+        // released before the `send_input` mutable borrow below.
+        let Some((modes, cols, rows)) = self
+            .buffer(&pane_id)
+            .map(|g| (g.modes(), g.cols as u16, g.rows as u16))
+        else {
+            return false;
+        };
+        if !modes.mouse_report() {
+            return false;
+        }
+        if ev.kind == MouseEventKind::Motion {
+            let wants = modes.mouse_motion() || (modes.mouse_drag() && button_held);
+            if !wants {
+                return false;
+            }
+        }
+        // Clamp to the on-screen grid (1-based) so an edge/gutter pixel can't
+        // report a cell the program doesn't have.
+        ev.col = ev.col.clamp(1, cols.max(1));
+        ev.row = ev.row.clamp(1, rows.max(1));
+        let bytes = encode_mouse_button(&ev, modes.sgr_mouse());
+        self.send_input(bytes)
     }
 
     /// Send a batch of structured key events for the active pane.  The

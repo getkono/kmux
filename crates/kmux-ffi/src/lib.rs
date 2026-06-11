@@ -56,7 +56,9 @@ use kmux_app::theme::{self, Rgb, Theme};
 use kmux_client::connection_state::ConnectionState;
 use kmux_client::generate_instance_id;
 use kmux_client::grid::{GridPos, Selection, SelectionMode};
-use kmux_client::input::{char_to_proto_key, encode_mouse_scroll};
+use kmux_client::input::{
+    MouseButton, MouseEvent, MouseEventKind, MouseMods, char_to_proto_key, encode_mouse_scroll,
+};
 use kmux_protocol::messages::{
     ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, SplitDir, TermSize,
 };
@@ -68,7 +70,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 6;
+pub const KMUX_FFI_ABI_VERSION: u32 = 7;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -312,6 +314,62 @@ impl FfiNamedKey {
             FfiNamedKey::F10 => KeyCode::F10,
             FfiNamedKey::F11 => KeyCode::F11,
             FfiNamedKey::F12 => KeyCode::F12,
+        }
+    }
+}
+
+/// Mouse button forwarded to a mouse-tracking inner program (left only is wired
+/// today; middle/right are encodable for future use).
+#[derive(uniffi::Enum)]
+pub enum FfiMouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+impl FfiMouseButton {
+    fn to_client(&self) -> MouseButton {
+        match self {
+            FfiMouseButton::Left => MouseButton::Left,
+            FfiMouseButton::Middle => MouseButton::Middle,
+            FfiMouseButton::Right => MouseButton::Right,
+        }
+    }
+}
+
+/// Whether a pointer event is a button press, release, or motion (drag).
+#[derive(uniffi::Enum)]
+pub enum FfiMouseKind {
+    Press,
+    Release,
+    Motion,
+}
+
+impl FfiMouseKind {
+    fn to_client(&self) -> MouseEventKind {
+        match self {
+            FfiMouseKind::Press => MouseEventKind::Press,
+            FfiMouseKind::Release => MouseEventKind::Release,
+            FfiMouseKind::Motion => MouseEventKind::Motion,
+        }
+    }
+}
+
+/// Modifiers active during a mouse event. `shift` is the local-selection bypass
+/// (never forwarded — see `SessionManager::report_mouse`).
+#[derive(uniffi::Record)]
+pub struct FfiMouseMods {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+impl FfiMouseMods {
+    fn to_client(&self) -> MouseMods {
+        MouseMods {
+            ctrl: self.ctrl,
+            alt: self.alt,
+            shift: self.shift,
         }
     }
 }
@@ -1284,6 +1342,35 @@ impl KmuxDriver {
                 grid.scroll_down((-lines) as usize);
             }
         }
+    }
+
+    /// Forward a mouse button/drag/release to the active pane's inner program
+    /// when it has enabled mouse tracking, returning `true` iff it was sent (the
+    /// frontend then skips its own client-side text selection). `col`/`row` are
+    /// 0-based *visible* viewport cells (converted to the 1-based terminal
+    /// coordinates here, like [`KmuxDriver::scroll_at`]). `button_held` gates
+    /// motion under button-event tracking (mode 1002). A shift-held event is
+    /// never forwarded — Shift is the local-selection bypass. Mirrors the GTK
+    /// frontend's `report_mouse` calls; the policy lives in
+    /// `SessionManager::report_mouse`.
+    pub fn mouse_event(
+        &self,
+        col: u32,
+        row: u32,
+        button: FfiMouseButton,
+        kind: FfiMouseKind,
+        mods: FfiMouseMods,
+        button_held: bool,
+    ) -> bool {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let ev = MouseEvent {
+            button: button.to_client(),
+            kind: kind.to_client(),
+            col: col as u16 + 1,
+            row: row as u16 + 1,
+            mods: mods.to_client(),
+        };
+        d.mgr.report_mouse(button_held, ev)
     }
 
     /// Scroll the active pane's *local* scrollback by `lines` display rows

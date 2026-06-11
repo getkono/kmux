@@ -89,7 +89,21 @@ mod tests {
 
         let drag = TermModes(TermModes::MOUSE_DRAG);
         assert!(drag.mouse_report());
+        assert!(drag.mouse_drag());
+        assert!(!drag.mouse_motion());
         assert!(!drag.sgr_mouse());
+
+        // Click tracking (1000) reports buttons but not motion of any kind.
+        let click = TermModes(TermModes::MOUSE_REPORT_CLICK);
+        assert!(click.mouse_report());
+        assert!(!click.mouse_drag());
+        assert!(!click.mouse_motion());
+
+        // Any-event tracking (1003) reports every motion.
+        let motion = TermModes(TermModes::MOUSE_MOTION);
+        assert!(motion.mouse_report());
+        assert!(motion.mouse_motion());
+        assert!(!motion.mouse_drag());
     }
 
     #[test]

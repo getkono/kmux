@@ -547,7 +547,17 @@ impl CellGrid {
                     break;
                 }
             }
-            let max_col = self.cols.saturating_sub(1);
+            // A wrapped scrollback line is wider than the viewport, so bound the
+            // rightward scan by the logical line's length (not `cols`) — else a
+            // double-click near the wrap point would truncate the word.
+            let max_col = if pos.row < self.scrollback.len() {
+                self.scrollback
+                    .get(pos.row)
+                    .map(|l| effective_line_len(l).saturating_sub(1))
+                    .unwrap_or(0)
+            } else {
+                self.cols.saturating_sub(1)
+            };
             let mut end_col = pos.col;
             while end_col < max_col {
                 let next = GridPos {
@@ -931,5 +941,55 @@ mod tests {
         // the viewport width.
         select(&mut grid, pos(0, 0), pos(1, 3));
         assert_eq!(grid.selected_text().as_deref(), Some("ABCDEFGH\nWXYZ"));
+    }
+
+    #[test]
+    fn selected_text_none_for_degenerate_selection() {
+        let mut grid = CellGrid::new(3, 4);
+        push_scrollback(&mut grid, vec![line("abcd")]);
+        select(&mut grid, pos(0, 1), pos(0, 1));
+        assert_eq!(grid.selected_text(), None);
+    }
+
+    #[test]
+    fn selected_text_trims_trailing_blanks_per_line() {
+        let mut grid = CellGrid::new(3, 8);
+        // "hi" padded with default blanks, then a second line.
+        let mut padded = line("hi");
+        padded.extend(vec![CellState::default(); 6]);
+        push_scrollback(&mut grid, vec![padded, line("bye")]);
+        select(&mut grid, pos(0, 0), pos(1, 2));
+        assert_eq!(grid.selected_text().as_deref(), Some("hi\nbye"));
+    }
+
+    #[test]
+    fn find_word_boundaries_live_grid_word() {
+        let mut grid = CellGrid::new(1, 16);
+        grid.apply_snapshot(GridSnapshot {
+            rows: 1,
+            cols: 16,
+            cells: line("  foo_bar  baz  "),
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            history_total: 0,
+            scrollback_base: 0,
+            scrollback_tail: Vec::new(),
+        });
+        // Click inside "foo_bar" (cols 2..=8) selects the whole word.
+        let (s, e) = grid.find_word_boundaries(pos(0, 4));
+        assert_eq!((s, e), (pos(0, 2), pos(0, 8)));
+        // Click on a blank selects just that cell.
+        assert_eq!(grid.find_word_boundaries(pos(0, 0)), (pos(0, 0), pos(0, 0)));
+    }
+
+    #[test]
+    fn find_word_boundaries_spans_past_viewport_in_wide_scrollback() {
+        let mut grid = CellGrid::new(3, 4);
+        // A 10-char word in a scrollback line far wider than the 4-col viewport.
+        push_scrollback(&mut grid, vec![line("wxyzWXYZ12"), line("tail")]);
+        // Click mid-word, past the viewport width: the whole word is selected,
+        // not truncated at col 3.
+        let (s, e) = grid.find_word_boundaries(pos(0, 6));
+        assert_eq!((s, e), (pos(0, 0), pos(0, 9)));
     }
 }
