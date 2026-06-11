@@ -14,7 +14,8 @@ use kmux_client::pipeline::ResolvedTarget;
 use crate::cli::{Cli, Command};
 use crate::config;
 use crate::subcommands::{
-    ListSessionsConfig, parse_target, run_daemon_command, run_dry_run, run_list_sessions,
+    ListSessionsConfig, parse_target, run_daemon_command, run_debug_command, run_dry_run,
+    run_list_sessions,
 };
 use crate::theme::Theme;
 
@@ -125,6 +126,10 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
                 format,
             })
             .await?;
+            return Ok(Launch::Done);
+        }
+        Some(Command::Debug { action }) => {
+            run_debug_command(action).await?;
             return Ok(Launch::Done);
         }
         None => {}
