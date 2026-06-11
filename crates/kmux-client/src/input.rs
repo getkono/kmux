@@ -52,6 +52,112 @@ pub fn encode_mouse_scroll(col: u16, row: u16, lines: i32, sgr: bool) -> Vec<u8>
     out
 }
 
+/// A mouse button reportable to the inner program's mouse-tracking modes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseButton {
+    Left,
+    Middle,
+    Right,
+}
+
+impl MouseButton {
+    /// The low button bits of the xterm `cb` byte (left=0, middle=1, right=2).
+    fn code(self) -> u8 {
+        match self {
+            MouseButton::Left => 0,
+            MouseButton::Middle => 1,
+            MouseButton::Right => 2,
+        }
+    }
+}
+
+/// Whether a pointer event is a button press, a release, or motion (drag).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MouseEventKind {
+    Press,
+    Release,
+    Motion,
+}
+
+/// Keyboard modifiers active during a mouse event, packed into the `cb` byte.
+///
+/// `shift` is carried here so the encoder and the decision policy share one
+/// event type, but it is the terminal's *bypass* key: `report_mouse` never
+/// forwards a shift-held event (it falls through to local selection instead).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MouseMods {
+    pub ctrl: bool,
+    pub alt: bool,
+    pub shift: bool,
+}
+
+/// A pointer event to forward to the inner program's mouse-tracking modes.
+///
+/// `col`/`row` are 1-based *visible viewport* cells, like [`encode_mouse_scroll`]
+/// — the inner program only knows its on-screen grid, never the scrollback.
+#[derive(Debug, Clone, Copy)]
+pub struct MouseEvent {
+    pub button: MouseButton,
+    pub kind: MouseEventKind,
+    pub col: u16,
+    pub row: u16,
+    pub mods: MouseMods,
+}
+
+/// Encode a mouse button/motion event as a terminal mouse-tracking sequence.
+///
+/// Mirrors [`encode_mouse_scroll`] (same 1-based coordinates and `+32` legacy
+/// offsets), but for the buttons. The `cb` byte packs, from the low bits: the
+/// button (left=0, middle=1, right=2), `+4` shift, `+8` alt/meta, `+16` ctrl,
+/// and `+32` for a motion (drag) event.
+///
+/// With `sgr` (DEC mode 1006) the form is `\x1b[<{cb};{col};{row}{M|m}` — final
+/// `M` for press/motion, `m` for release, with the real button preserved.
+/// Without it the legacy X10 form `\x1b[M{cb+32}{col+32}{row+32}` is used;
+/// legacy can't say *which* button was released, so a release reports button 3.
+/// Legacy coordinates saturate at 223 (the 255−32 ceiling of a single byte).
+pub fn encode_mouse_button(ev: &MouseEvent, sgr: bool) -> Vec<u8> {
+    let mut mods: u8 = 0;
+    if ev.mods.shift {
+        mods += 4;
+    }
+    if ev.mods.alt {
+        mods += 8;
+    }
+    if ev.mods.ctrl {
+        mods += 16;
+    }
+    let motion: u8 = if ev.kind == MouseEventKind::Motion {
+        32
+    } else {
+        0
+    };
+
+    if sgr {
+        // SGR keeps the real button number; the final byte distinguishes
+        // press/motion (`M`) from release (`m`).
+        let cb = ev.button.code() + mods + motion;
+        let final_byte = if ev.kind == MouseEventKind::Release {
+            'm'
+        } else {
+            'M'
+        };
+        format!("\x1b[<{};{};{}{}", cb, ev.col, ev.row, final_byte).into_bytes()
+    } else {
+        // Legacy collapses every release to button 3 (it has no per-button
+        // release); press/motion carry the real button plus the motion bit.
+        let button = if ev.kind == MouseEventKind::Release {
+            3
+        } else {
+            ev.button.code() + motion
+        };
+        let cb = (button + mods).saturating_add(32);
+        let cx = (ev.col.min(223) as u8).saturating_add(32);
+        let cy = (ev.row.min(223) as u8).saturating_add(32);
+        vec![0x1b, b'[', b'M', cb, cx, cy]
+    }
+}
+
 /// Map a typed character to a `(physical-key, text, unshifted-codepoint)` triple
 /// for `ClientMessage::PtyKey` / `PtyKeyBatch`.
 ///
@@ -158,6 +264,147 @@ mod tests {
     fn zero_lines_produces_empty() {
         let bytes = encode_mouse_scroll(1, 1, 0, true);
         assert!(bytes.is_empty());
+    }
+
+    fn ev(button: MouseButton, kind: MouseEventKind, mods: MouseMods) -> MouseEvent {
+        MouseEvent {
+            button,
+            kind,
+            col: 10,
+            row: 5,
+            mods,
+        }
+    }
+
+    #[test]
+    fn sgr_button_press_left() {
+        let bytes = encode_mouse_button(
+            &ev(
+                MouseButton::Left,
+                MouseEventKind::Press,
+                MouseMods::default(),
+            ),
+            true,
+        );
+        assert_eq!(bytes, b"\x1b[<0;10;5M");
+    }
+
+    #[test]
+    fn sgr_button_release_keeps_button_uses_lowercase_m() {
+        let bytes = encode_mouse_button(
+            &ev(
+                MouseButton::Left,
+                MouseEventKind::Release,
+                MouseMods::default(),
+            ),
+            true,
+        );
+        assert_eq!(bytes, b"\x1b[<0;10;5m");
+    }
+
+    #[test]
+    fn sgr_motion_sets_the_32_bit() {
+        let bytes = encode_mouse_button(
+            &ev(
+                MouseButton::Left,
+                MouseEventKind::Motion,
+                MouseMods::default(),
+            ),
+            true,
+        );
+        assert_eq!(bytes, b"\x1b[<32;10;5M");
+    }
+
+    #[test]
+    fn sgr_middle_and_right_button_codes() {
+        let mid = encode_mouse_button(
+            &ev(
+                MouseButton::Middle,
+                MouseEventKind::Press,
+                MouseMods::default(),
+            ),
+            true,
+        );
+        assert_eq!(mid, b"\x1b[<1;10;5M");
+        let right = encode_mouse_button(
+            &ev(
+                MouseButton::Right,
+                MouseEventKind::Press,
+                MouseMods::default(),
+            ),
+            true,
+        );
+        assert_eq!(right, b"\x1b[<2;10;5M");
+    }
+
+    #[test]
+    fn sgr_modifiers_add_4_8_16() {
+        let mods = MouseMods {
+            ctrl: true,
+            alt: true,
+            shift: true,
+        };
+        // 0 (left) + 4 (shift) + 8 (alt) + 16 (ctrl) = 28
+        let bytes = encode_mouse_button(&ev(MouseButton::Left, MouseEventKind::Press, mods), true);
+        assert_eq!(bytes, b"\x1b[<28;10;5M");
+    }
+
+    #[test]
+    fn legacy_button_press_left() {
+        let bytes = encode_mouse_button(
+            &ev(
+                MouseButton::Left,
+                MouseEventKind::Press,
+                MouseMods::default(),
+            ),
+            false,
+        );
+        // cb=0+32=32, cx=10+32=42, cy=5+32=37
+        assert_eq!(bytes, &[0x1b, b'[', b'M', 32, 42, 37]);
+    }
+
+    #[test]
+    fn legacy_release_reports_button_3() {
+        let bytes = encode_mouse_button(
+            &ev(
+                MouseButton::Right,
+                MouseEventKind::Release,
+                MouseMods::default(),
+            ),
+            false,
+        );
+        // release collapses to button 3 regardless of which button: cb=3+32=35
+        assert_eq!(bytes, &[0x1b, b'[', b'M', 35, 42, 37]);
+    }
+
+    #[test]
+    fn legacy_motion_sets_the_32_bit() {
+        let bytes = encode_mouse_button(
+            &ev(
+                MouseButton::Left,
+                MouseEventKind::Motion,
+                MouseMods::default(),
+            ),
+            false,
+        );
+        // button 0 + motion 32 = 32, cb=32+32=64
+        assert_eq!(bytes, &[0x1b, b'[', b'M', 64, 42, 37]);
+    }
+
+    #[test]
+    fn legacy_coordinates_saturate_at_223() {
+        let bytes = encode_mouse_button(
+            &MouseEvent {
+                button: MouseButton::Left,
+                kind: MouseEventKind::Press,
+                col: 300,
+                row: 1,
+                mods: MouseMods::default(),
+            },
+            false,
+        );
+        // col clamps to 223, +32 = 255; row 1 + 32 = 33
+        assert_eq!(bytes, &[0x1b, b'[', b'M', 32, 255, 33]);
     }
 
     #[test]

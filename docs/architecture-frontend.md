@@ -340,6 +340,14 @@ mapping:
 - Mouse scroll-wheel (PTY mouse-report or local scrollback) and drag text
   selection with copy — selection works while scrolled into history, and a drag
   held at the top/bottom edge auto-scrolls so it can span more than one screen.
+  When the focused pane's program has enabled mouse tracking (DEC 1000/1002/1003,
+  SGR 1006), a primary-button **press/drag/release** is instead encoded and
+  forwarded to the PTY so the program (vim, tmux, htop, …) owns the mouse — the
+  decision and encoding are the shared, toolkit-agnostic
+  `SessionManager::report_mouse` + `kmux_client::input::encode_mouse_button`
+  (siblings of the existing `encode_mouse_scroll`). Holding **Shift** is the
+  bypass key: it always forces local selection even inside a mouse-mode program.
+  The Swift frontend reaches the same policy through the FFI `mouse_event` method.
 - libadwaita styling: the kmux palette feeds libadwaita's `accent_*` named
   colors (reloaded on `/theme`), so the chrome follows the active theme with
   stock styling; preferences (theme + font) open with **Ctrl+,**.

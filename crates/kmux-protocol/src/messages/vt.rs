@@ -142,6 +142,18 @@ impl TermModes {
         self.0 & (Self::MOUSE_REPORT_CLICK | Self::MOUSE_DRAG | Self::MOUSE_MOTION) != 0
     }
 
+    /// Whether button-event tracking is active (mode 1002): report motion only
+    /// while a button is held.
+    pub fn mouse_drag(self) -> bool {
+        self.0 & Self::MOUSE_DRAG != 0
+    }
+
+    /// Whether any-event tracking is active (mode 1003): report every motion,
+    /// even with no button held.
+    pub fn mouse_motion(self) -> bool {
+        self.0 & Self::MOUSE_MOTION != 0
+    }
+
     /// Whether SGR extended mouse coordinates are active (mode 1006).
     pub fn sgr_mouse(self) -> bool {
         self.0 & Self::SGR_MOUSE != 0

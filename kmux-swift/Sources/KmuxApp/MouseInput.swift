@@ -51,6 +51,20 @@ extension TerminalNSView {
             model.focusPane(pid)
         }
         let (col, row) = cellLocation(of: event)
+        // If the focused pane's program enabled mouse tracking (and Shift isn't
+        // held to force local selection), forward the press to the PTY instead
+        // of selecting. Forwarding every press lets the program interpret its
+        // own multi-clicks.
+        if model.driver.mouseEvent(
+            col: UInt32(col), row: UInt32(row),
+            button: .left, kind: .press,
+            mods: mouseMods(event, keepShift: true), buttonHeld: false) {
+            ptyDragging = true
+            endDrag()
+            model.driver.clearSelection()
+            model.refreshGridView()
+            return
+        }
         switch event.clickCount {
         case 2:
             model.driver.selectWordAt(row: UInt32(row), col: UInt32(col))
@@ -69,6 +83,17 @@ extension TerminalNSView {
         model.refreshGridView()
     }
 
+    /// Build `FfiMouseMods` from an event. `keepShift` is `false` for motion and
+    /// release on an in-progress PTY drag (the forward-vs-select decision was
+    /// made at press, so a Shift pressed mid-drag must not strand it).
+    func mouseMods(_ event: NSEvent, keepShift: Bool) -> FfiMouseMods {
+        let f = event.modifierFlags
+        return FfiMouseMods(
+            ctrl: f.contains(.control),
+            alt: f.contains(.option),
+            shift: keepShift && f.contains(.shift))
+    }
+
     override func mouseDragged(with event: NSEvent) {
         // Live-resize while dragging a divider, recomputed against the current
         // tree each event (the FFI no-ops if the split was reshaped).
@@ -79,6 +104,16 @@ extension TerminalNSView {
                 ? max(0, Int(p.x / metrics.cellWidth))
                 : max(0, Int(p.y / metrics.cellHeight))
             model.applyDividerDrag(div, pointerCell: UInt32(cell))
+            return
+        }
+        // Forwarding a drag to a mouse-tracking program: report motion (gated
+        // server-side — 1002 needs a button held, which we are; 1000 none).
+        if ptyDragging {
+            let (col, row) = cellLocation(of: event)
+            _ = model.driver.mouseEvent(
+                col: UInt32(col), row: UInt32(row),
+                button: .left, kind: .motion,
+                mods: mouseMods(event, keepShift: false), buttonHeld: true)
             return
         }
         guard let anchor = dragAnchor else { return }
@@ -93,6 +128,15 @@ extension TerminalNSView {
     override func mouseUp(with event: NSEvent) {
         if activeDivider != nil {
             activeDivider = nil
+            return
+        }
+        if ptyDragging {
+            ptyDragging = false
+            let (col, row) = cellLocation(of: event)
+            _ = model.driver.mouseEvent(
+                col: UInt32(col), row: UInt32(row),
+                button: .left, kind: .release,
+                mods: mouseMods(event, keepShift: false), buttonHeld: false)
             return
         }
         endDrag()
