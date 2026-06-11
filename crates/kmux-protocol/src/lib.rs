@@ -4,6 +4,7 @@ pub mod control_rpc;
 pub mod dirs;
 pub mod endpoint;
 pub mod messages;
+pub mod trace;
 pub mod transport;
 
 #[cfg(feature = "tls")]
