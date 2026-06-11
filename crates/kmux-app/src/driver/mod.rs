@@ -33,10 +33,12 @@
 
 mod blink;
 mod clipboard;
+mod frame_trace;
 
 pub use blink::{CURSOR_BLINK_HALF, advance_blink};
 pub use clipboard::sanitize_clipboard_text;
 
+use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
 use std::time::{Duration, Instant};
 
@@ -44,9 +46,49 @@ use kmux_client::connection_state::DisconnectReason;
 use kmux_client::grid::CellGrid;
 use kmux_client::supervisor::UpgradeSignal;
 use kmux_client::transport::TransportKind;
-use kmux_protocol::messages::{ClientMessage, KeyEvent, ServerMessage, TermSize};
+use kmux_protocol::messages::{
+    ClientMessage, KeyEvent, PaneId, ServerMessage, TermSize, epoch_millis,
+};
+use kmux_protocol::trace::{AppliedDiff, ClientTickRecord};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
+
+use self::frame_trace::ClientTraceSink;
+
+/// Logical-frame coalescing window (issue #72). Cell diffs the daemon emitted
+/// within this many ms of each other are considered one logical frame; painting
+/// part of such a group across separate pump ticks is a tear. Overridable via
+/// `KMUX_TEAR_WINDOW_MS`.
+const TEAR_WINDOW_MS: u64 = 16;
+/// Minimum cell ops for a diff to count as logical-frame content — filters
+/// single-cell keystroke echoes and cursor blinks (cursor-only updates are
+/// `CursorUpdate`, already excluded). Overridable via `KMUX_TEAR_MIN_OPS`.
+const TEAR_MIN_OPS: usize = 4;
+
+/// Decide whether the previous paint showed a partial logical frame: true when
+/// the previously-painted cell diff and this tick's earliest qualifying cell
+/// diff were emitted by the daemon within `window_ms` of each other (so they
+/// belonged to one logical frame but were painted across two ticks).
+pub(crate) fn tear_detected(
+    prev_painted_sent_at_ms: Option<u64>,
+    tick_first_sent_at_ms: u64,
+    window_ms: u64,
+) -> bool {
+    match prev_painted_sent_at_ms {
+        Some(prev) => tick_first_sent_at_ms
+            .checked_sub(prev)
+            .is_some_and(|gap| gap < window_ms),
+        None => false,
+    }
+}
+
+/// Read a `u64` env override, falling back to `default` when unset/invalid.
+fn env_u64(key: &str, default: u64) -> u64 {
+    std::env::var(key)
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or(default)
+}
 
 use crate::core::{AppCore, BootstrapPhase, BootstrapTaskResult, KeyResult, SwitchTarget};
 use crate::mode::{Action, Mode};
@@ -110,6 +152,16 @@ pub struct FrontendDriver {
     /// When the current blink half-cycle started; reset on keypress so typing
     /// shows a solid cursor.
     blink_phase_start: Instant,
+    /// Per-pane `sent_at_ms` of the most recent cell diff painted, for the
+    /// tearing detector (issue #72).
+    tear_state: HashMap<PaneId, u64>,
+    /// Coalescing window + min-ops thresholds for the tearing detector.
+    tear_window_ms: u64,
+    tear_min_ops: usize,
+    /// Monotonic pump-tick id, used to tag client frame-trace records.
+    tick_id: u64,
+    /// Optional per-tick frame-trace sink (`KMUX_FRAME_TRACE`).
+    trace: Option<ClientTraceSink>,
 }
 
 impl FrontendDriver {
@@ -147,6 +199,11 @@ impl FrontendDriver {
             resize_deadline: None,
             blink_on: true,
             blink_phase_start: now,
+            tear_state: HashMap::new(),
+            tear_window_ms: env_u64("KMUX_TEAR_WINDOW_MS", TEAR_WINDOW_MS),
+            tear_min_ops: env_u64("KMUX_TEAR_MIN_OPS", TEAR_MIN_OPS as u64) as usize,
+            tick_id: 0,
+            trace: ClientTraceSink::from_env(),
         }
     }
 
@@ -162,6 +219,7 @@ impl FrontendDriver {
         let mut effects = Vec::new();
         let now = Instant::now();
         let mut dirty = false;
+        self.tick_id = self.tick_id.wrapping_add(1);
 
         if self.detect_palette_change() {
             effects.push(FrontendEffect::PaletteChanged);
@@ -244,6 +302,10 @@ impl FrontendDriver {
         let mut dirty = false;
         if !batch.is_empty() {
             self.core.mgr.metrics.record_batch(batch.len());
+            // Per-tick diagnostics (issue #72): read each diff's seqno/sent_at/
+            // ops before the messages are consumed, so we can run the tearing
+            // detector and emit a frame-trace record for this pump tick.
+            let (applied, tick_cells) = self.collect_tick_diagnostics(&batch);
             for m in batch {
                 let events = self.core.mgr.handle_server_message(m);
                 // Server-originated effects (OSC 52 clipboard writes) are
@@ -255,6 +317,18 @@ impl FrontendDriver {
                         ));
                     }
                 }
+            }
+            self.detect_tears(tick_cells);
+            // A non-empty batch always repaints, so painted = true for the trace.
+            if let Some(trace) = self.trace.as_mut()
+                && !applied.is_empty()
+            {
+                trace.record(&ClientTickRecord {
+                    tick_id: self.tick_id,
+                    at_ms: epoch_millis(),
+                    applied,
+                    painted: true,
+                });
             }
             dirty = true;
         }
@@ -268,6 +342,76 @@ impl FrontendDriver {
             dirty = true;
         }
         dirty
+    }
+
+    /// Extract per-diff timing from a drained batch for the tearing detector and
+    /// frame trace (issue #72). Returns `(applied, tick_cells)` where `applied`
+    /// is every seqno/sent_at/ops applied this tick and `tick_cells` is, per
+    /// pane, the `(min, max)` `sent_at_ms` over cell diffs with `>= tear_min_ops`
+    /// ops (the ones that count as logical-frame content).
+    fn collect_tick_diagnostics(
+        &self,
+        batch: &[ServerMessage],
+    ) -> (Vec<AppliedDiff>, HashMap<PaneId, (u64, u64)>) {
+        let mut applied: Vec<AppliedDiff> = Vec::new();
+        let mut tick_cells: HashMap<PaneId, (u64, u64)> = HashMap::new();
+        for m in batch {
+            match m {
+                ServerMessage::TerminalUpdate {
+                    pane_id,
+                    diff,
+                    seqno,
+                    sent_at_ms,
+                } => {
+                    let ops = diff.ops.len();
+                    applied.push(AppliedDiff {
+                        seqno: seqno.0,
+                        sent_at_ms: *sent_at_ms,
+                        ops,
+                    });
+                    if ops >= self.tear_min_ops {
+                        let e = tick_cells
+                            .entry(pane_id.clone())
+                            .or_insert((*sent_at_ms, *sent_at_ms));
+                        e.0 = e.0.min(*sent_at_ms);
+                        e.1 = e.1.max(*sent_at_ms);
+                    }
+                }
+                ServerMessage::CursorUpdate {
+                    seqno, sent_at_ms, ..
+                }
+                | ServerMessage::TerminalSnapshot {
+                    seqno, sent_at_ms, ..
+                }
+                | ServerMessage::ScrollbackAppend {
+                    seqno, sent_at_ms, ..
+                } => {
+                    applied.push(AppliedDiff {
+                        seqno: seqno.0,
+                        sent_at_ms: *sent_at_ms,
+                        ops: 0,
+                    });
+                }
+                _ => {}
+            }
+        }
+        (applied, tick_cells)
+    }
+
+    /// Run the tearing detector for each pane that applied cell content this
+    /// tick, then record this tick's painted state. A tear is counted when the
+    /// previous paint's cell diff and this tick's earliest qualifying cell diff
+    /// fall within `tear_window_ms` (one logical frame painted across two ticks).
+    fn detect_tears(&mut self, tick_cells: HashMap<PaneId, (u64, u64)>) {
+        for (pane, (first, last)) in tick_cells {
+            let prev = self.tear_state.get(&pane).copied();
+            if tear_detected(prev, first, self.tear_window_ms)
+                && let Some(prev) = prev
+            {
+                self.core.mgr.metrics.record_tear(&pane, prev, first);
+            }
+            self.tear_state.insert(pane, last);
+        }
     }
 
     /// Handle the bootstrap outcome (at most one per bootstrap): wire up the data
@@ -591,6 +735,11 @@ impl FrontendDriver {
             resize_deadline: None,
             blink_on: true,
             blink_phase_start: now,
+            tear_state: HashMap::new(),
+            tear_window_ms: TEAR_WINDOW_MS,
+            tear_min_ops: TEAR_MIN_OPS,
+            tick_id: 0,
+            trace: None,
         };
         (driver, srv_tx, bs_tx)
     }
@@ -660,5 +809,82 @@ mod tests {
         let _ = driver.tick();
         assert_eq!(driver.last_exit_error.as_deref(), Some("boom"));
         assert!(matches!(driver.mode, Mode::Disconnected { .. }));
+    }
+
+    // ── Tearing detector (issue #72) ─────────────────────────────────────────
+
+    #[test]
+    fn tear_detected_logic() {
+        // No prior paint → never a tear.
+        assert!(!tear_detected(None, 1_000, 16));
+        // Within the window → the previous paint showed a partial frame.
+        assert!(tear_detected(Some(1_000), 1_008, 16));
+        // Exactly the window → not within (strict `<`).
+        assert!(!tear_detected(Some(1_000), 1_016, 16));
+        // Beyond the window → two distinct logical frames, not a tear.
+        assert!(!tear_detected(Some(1_000), 1_050, 16));
+        // This tick's diff predates the painted one (reorder) → not a forward tear.
+        assert!(!tear_detected(Some(1_000), 990, 16));
+    }
+
+    fn cell_update(pane: &str, seqno: u64, sent_at_ms: u64, ops: usize) -> ServerMessage {
+        use kmux_protocol::messages::{CellState, CursorState, DiffOp, SequenceNo, TerminalDiff};
+        use std::sync::Arc;
+        let ops_vec = (0..ops)
+            .map(|i| DiffOp::Cell {
+                row: 0,
+                col: i as u16,
+                cell: CellState::default(),
+            })
+            .collect();
+        ServerMessage::TerminalUpdate {
+            pane_id: pane.to_string(),
+            diff: Arc::new(TerminalDiff {
+                ops: ops_vec,
+                cursor: CursorState::default(),
+                modes: kmux_protocol::messages::TermModes::EMPTY,
+                history_total: 0,
+                scrollback_reset: None,
+            }),
+            seqno: SequenceNo(seqno),
+            sent_at_ms,
+        }
+    }
+
+    #[test]
+    fn split_logical_frame_across_ticks_counts_a_tear() {
+        // Two cell diffs emitted 8ms apart (one logical frame) but delivered in
+        // separate pump ticks → the first paint was partial → one tear.
+        let (mut driver, srv_tx, _bs_tx) = FrontendDriver::for_test(fixture_core());
+        srv_tx.send(cell_update("pane", 0, 1_000, 8)).unwrap();
+        let _ = driver.tick();
+        srv_tx.send(cell_update("pane", 1, 1_008, 8)).unwrap();
+        let _ = driver.tick();
+        assert_eq!(driver.core.mgr.metrics.snapshot(false).counters.tears, 1);
+    }
+
+    #[test]
+    fn frame_painted_atomically_is_not_a_tear() {
+        // Both halves of the logical frame arrive in the SAME tick → painted
+        // together → no tear. A later, well-separated frame is also clean.
+        let (mut driver, srv_tx, _bs_tx) = FrontendDriver::for_test(fixture_core());
+        srv_tx.send(cell_update("pane", 0, 1_000, 8)).unwrap();
+        srv_tx.send(cell_update("pane", 1, 1_004, 8)).unwrap();
+        let _ = driver.tick();
+        srv_tx.send(cell_update("pane", 2, 2_000, 8)).unwrap();
+        let _ = driver.tick();
+        assert_eq!(driver.core.mgr.metrics.snapshot(false).counters.tears, 0);
+    }
+
+    #[test]
+    fn sub_min_ops_diffs_do_not_count() {
+        // Tiny diffs (keystroke echoes) are below TEAR_MIN_OPS and never tear,
+        // even when delivered in adjacent ticks within the window.
+        let (mut driver, srv_tx, _bs_tx) = FrontendDriver::for_test(fixture_core());
+        srv_tx.send(cell_update("pane", 0, 1_000, 1)).unwrap();
+        let _ = driver.tick();
+        srv_tx.send(cell_update("pane", 1, 1_005, 1)).unwrap();
+        let _ = driver.tick();
+        assert_eq!(driver.core.mgr.metrics.snapshot(false).counters.tears, 0);
     }
 }

@@ -124,6 +124,11 @@ impl MetricsStore {
         self.render.record_resync(session, reason);
     }
 
+    pub fn record_tear(&mut self, session: &str, prev_sent_at_ms: u64, next_sent_at_ms: u64) {
+        self.render
+            .record_tear(session, prev_sent_at_ms, next_sent_at_ms);
+    }
+
     pub fn snapshot(&self, snapshot_mode: bool) -> MetricsSnapshot {
         self.render.snapshot(snapshot_mode)
     }
@@ -260,5 +265,13 @@ mod tests {
         s.record_stale_discard("pane-1");
         s.record_stale_discard("pane-1");
         assert_eq!(s.snapshot(false).counters.stale_discards, 2);
+    }
+
+    #[test]
+    fn record_tear_increments_counter() {
+        let mut s = MetricsStore::in_memory();
+        s.record_tear("pane-1", 1000, 1008);
+        s.record_tear("pane-1", 1008, 1015);
+        assert_eq!(s.snapshot(false).counters.tears, 2);
     }
 }

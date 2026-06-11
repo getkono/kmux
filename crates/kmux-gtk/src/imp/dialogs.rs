@@ -728,8 +728,8 @@ fn update_hud(hud: &GtkBox, core: &AppCore) {
             if snap.snapshot_mode { "FORCED" } else { "off" }
         ),
         format!(
-            "Disc:{} Gap:{} Lag:{} Sync:{}",
-            c.stale_discards, c.seqno_gaps, c.lag_events, c.resyncs
+            "Disc:{} Gap:{} Lag:{} Sync:{} Tear:{}",
+            c.stale_discards, c.seqno_gaps, c.lag_events, c.resyncs, c.tears
         ),
     ];
     for line in lines {
@@ -824,8 +824,8 @@ fn metrics_content(core: &AppCore) -> ScrolledWindow {
     ));
     card.append(&label(
         &format!(
-            "Disc:{} Gap:{} Lag:{} Sync:{}",
-            c.stale_discards, c.seqno_gaps, c.lag_events, c.resyncs
+            "Disc:{} Gap:{} Lag:{} Sync:{} Tear:{}",
+            c.stale_discards, c.seqno_gaps, c.lag_events, c.resyncs, c.tears
         ),
         "monospace",
     ));
