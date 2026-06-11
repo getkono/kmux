@@ -1679,12 +1679,13 @@ mod tests {
     }
 
     #[test]
-    fn abi_version_is_six() {
-        // The cursor-blink toggle (DriverConfig.cursor_blink +
-        // cursor_blink_enabled / set_cursor_blink_enabled) bumped the ABI to 6;
-        // the Swift wrapper asserts the same constant on startup.
-        assert_eq!(KMUX_FFI_ABI_VERSION, 6);
-        assert_eq!(kmux_ffi_abi_version(), 6);
+    fn abi_version_export_matches_constant() {
+        // The exported free fn must return the constant verbatim. Asserting the
+        // invariant (not a hardcoded number) keeps `KMUX_FFI_ABI_VERSION` the
+        // single source of truth: bumping it needs no edit here, in the Swift
+        // app, or in CI. uniffi's regenerated binding-checksum check is what
+        // actually guards against stale bindings/dylib drift.
+        assert_eq!(kmux_ffi_abi_version(), KMUX_FFI_ABI_VERSION);
     }
 
     #[test]

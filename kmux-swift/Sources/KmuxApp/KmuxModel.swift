@@ -57,12 +57,11 @@ final class KmuxModel: ObservableObject {
     private static let pumpInterval = 1.0 / 60.0
 
     init() {
-        // Assert the ABI the bindings were generated against, on top of uniffi's
-        // built-in binding-checksum check. Mirrors kmux-ghostty-sys's ABI guard.
-        precondition(
-            kmuxFfiAbiVersion() == 6,
-            "kmux-ffi ABI mismatch: regenerate the Swift bindings (just gen-ffi-bindings)"
-        )
+        // No hand-typed ABI assert here: uniffi's regenerated binding-checksum
+        // check (contract version + per-function checksums) fires a fatalError
+        // on any bindings/dylib drift the moment we cross the boundary below, so
+        // a stale binding can't slip through. `KMUX_FFI_ABI_VERSION` stays the
+        // single human-meaningful marker, defined once on the Rust side.
         let config = DriverConfig(
             server: nil,  // local daemon
             sshPort: nil,
