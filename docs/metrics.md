@@ -116,9 +116,11 @@ Toggle: `Ctrl+G` then `m`. The overlay shows:
   non-zero category (Shell, Scrollback, Liveness, Control, Sync, Bootstrap)
   in stable display order, and the RTT EWMA + recent avg / max;
 - apply-side render stats (identical numbers to the HUD) and diag
-  counters (stale discards, seqno gaps, lag, resyncs).
+  counters (stale discards, seqno gaps, lag, resyncs, and the `Tear`
+  tearing counter — see [`debugging-tearing.md`](debugging-tearing.md)).
 
-Source: [`crates/kmux/src/ui/overlays/metrics.rs`](../crates/kmux/src/ui/overlays/metrics.rs).
+Source: GTK HUD + metrics dialog in
+[`crates/kmux-gtk/src/imp/dialogs.rs`](../crates/kmux-gtk/src/imp/dialogs.rs).
 
 ## Out of scope
 
