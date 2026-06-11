@@ -20,6 +20,11 @@ pub struct KmuxConfig {
     /// GUI font as a Pango font-description string (e.g. `"JetBrains Mono 12"`).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font: Option<String>,
+    /// Whether the inner-pane cursor blinks. `None` (the default) means blink;
+    /// set `false` to keep the cursor steady regardless of what the program
+    /// requests (DECSCUSR `blinking_*` / DEC mode 12).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor_blink: Option<bool>,
 }
 
 /// Load `config.toml`, returning defaults if it is missing or unparseable.
@@ -87,6 +92,24 @@ pub fn resolve_font(cli_font: Option<&str>) -> String {
         return font.to_string();
     }
     DEFAULT_FONT.to_string()
+}
+
+/// Resolve whether the inner-pane cursor blinks.
+///
+/// Priority order (mirrors [`resolve_font`]):
+/// 1. `--cursor-blink` CLI flag (`cli_value`)
+/// 2. `cursor_blink` key in `~/.config/kmux/config.toml`
+/// 3. `true` (blink by default, matching real terminals)
+pub fn resolve_cursor_blink(cli_value: Option<bool>) -> bool {
+    if let Some(value) = cli_value {
+        return value;
+    }
+    if let Some(cfg) = load_config_file()
+        && let Some(value) = cfg.cursor_blink
+    {
+        return value;
+    }
+    true
 }
 
 /// Try to load a theme by name.
@@ -280,6 +303,41 @@ status_bg = "#111111"
     }
 
     #[test]
+    fn cursor_blink_cli_flag_wins() {
+        assert!(!resolve_cursor_blink(Some(false)));
+        assert!(resolve_cursor_blink(Some(true)));
+    }
+
+    #[test]
+    fn cursor_blink_defaults_to_true_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        let blink = resolve_cursor_blink(None);
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert!(blink, "the default cursor should blink");
+    }
+
+    #[test]
+    fn cursor_blink_from_config_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let kmux_dir = tmp.path().join("kmux");
+        std::fs::create_dir_all(&kmux_dir).unwrap();
+        std::fs::write(kmux_dir.join("config.toml"), "cursor_blink = false\n").unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        let blink = resolve_cursor_blink(None);
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert!(!blink, "config cursor_blink=false should disable blinking");
+    }
+
+    #[test]
+    fn config_file_parses_cursor_blink_field() {
+        let cfg: KmuxConfig = toml::from_str("cursor_blink = false").unwrap();
+        assert_eq!(cfg.cursor_blink, Some(false));
+    }
+
+    #[test]
     fn save_then_load_round_trips() {
         let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
@@ -287,6 +345,7 @@ status_bg = "#111111"
         let cfg = KmuxConfig {
             theme: Some("dracula".into()),
             font: Some("Fira Code 13".into()),
+            cursor_blink: Some(false),
         };
         let saved = save(&cfg);
         let loaded = load();
@@ -294,5 +353,6 @@ status_bg = "#111111"
         saved.unwrap();
         assert_eq!(loaded.theme.as_deref(), Some("dracula"));
         assert_eq!(loaded.font.as_deref(), Some("Fira Code 13"));
+        assert_eq!(loaded.cursor_blink, Some(false));
     }
 }

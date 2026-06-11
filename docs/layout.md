@@ -196,7 +196,9 @@ the macOS app uses the parallel ⌘-based shortcuts in its "Pane" / "Session" me
   `SetLayoutRatios`, `SetFocus`, `Tab*`, `ApplyLayoutScheme`, `LayoutUpdate`).
 - `STATE_VERSION = 3` — daemon checkpoint persistence; the v2→v3 migration wraps
   each persisted session's panes in a default one-tab-one-pane layout.
-- `KMUX_FFI_ABI_VERSION = 5` — the Swift tiling surface (`tabs`/`layout`/per-pane
+- `KMUX_FFI_ABI_VERSION` — gates the Swift tiling surface (`tabs`/`layout`/per-pane
   grid/`focus_pane`/`set_pane_sizes` + the tiling/scheme/zoom `FfiAction`s), plus
   the interactive-divider surface (`dividers`, `apply_divider_drag`,
-  `reset_divider`), `FfiAction::FocusPaneAt`, and `rename_tab`.
+  `reset_divider`), `FfiAction::FocusPaneAt`, and `rename_tab`. Defined once in
+  `crates/kmux-ffi/src/lib.rs`; bumped whenever this surface changes (no value is
+  hardcoded on the Swift side — uniffi's binding-checksum check guards drift).

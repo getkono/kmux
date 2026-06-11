@@ -208,19 +208,22 @@ triple for every cell's foreground and background.
 ### Cursor shape — DECSCUSR (`CSI Ps SP q`)
 
 libghostty-vt tracks all six variants.  The wire protocol (`CursorShape`) has
-five variants: `Block`, `Underline`, `Bar`, `HollowBlock`, `Hidden`.  The
-blinking vs. steady distinction is **collapsed** — clients see the shape but
-not the requested blink state.
+five variants: `Block`, `Underline`, `Bar`, `HollowBlock`, `Hidden`, plus a
+separate `CursorState.blink` bool. The blink request is carried (DEC mode 12,
+below), so the shape and the blinking-vs-steady distinction both reach clients.
+DECSCUSR `0`/no-param (the default) is treated as a blinking block per xterm, so
+a program that issues no DECSCUSR still gets a blinking cursor (see
+[terminal-backend.md](terminal-backend.md) → Blink).
 
-| Sequence | Shape | Wire variant | Status | Notes |
-|----------|-------|-------------|--------|-------|
-| `CSI 0 SP q` | Default (implementation-defined) | `Block` | **Stable** | |
-| `CSI 1 SP q` | Blinking block | `Block` | **Partial** | Blink state dropped |
-| `CSI 2 SP q` | Steady block | `Block` | **Stable** | |
-| `CSI 3 SP q` | Blinking underline | `Underline` | **Partial** | Blink state dropped |
-| `CSI 4 SP q` | Steady underline | `Underline` | **Stable** | |
-| `CSI 5 SP q` | Blinking bar | `Bar` | **Partial** | Blink state dropped |
-| `CSI 6 SP q` | Steady bar | `Bar` | **Stable** | |
+| Sequence | Shape | Wire variant | Blink | Status | Notes |
+|----------|-------|-------------|-------|--------|-------|
+| `CSI 0 SP q` | Default | `Block` | `true` | **Stable** | xterm default = blinking block |
+| `CSI 1 SP q` | Blinking block | `Block` | `true` | **Stable** | |
+| `CSI 2 SP q` | Steady block | `Block` | `false` | **Stable** | |
+| `CSI 3 SP q` | Blinking underline | `Underline` | `true` | **Stable** | |
+| `CSI 4 SP q` | Steady underline | `Underline` | `false` | **Stable** | |
+| `CSI 5 SP q` | Blinking bar | `Bar` | `true` | **Stable** | |
+| `CSI 6 SP q` | Steady bar | `Bar` | `false` | **Stable** | |
 
 `HollowBlock` is carried in the wire protocol for completeness but is not
 emitted by the current backend — it may appear in future snapshots from
@@ -235,7 +238,7 @@ alternative backends.
 | `?5` | DECSCNM — Reverse video (screen) | **Partial** | Parsed by emulator; no dedicated wire flag; effect is absorbed into per-cell INVERSE via the diff |
 | `?6` | DECOM — Origin mode | **Stable** | Handled by libghostty-vt |
 | `?7` | DECAWM — Auto-wrap mode | **Stable** | Handled by libghostty-vt |
-| `?12` | AT&T 610 cursor blink | **Partial** | Parsed; blink state not forwarded on wire |
+| `?12` | AT&T 610 cursor blink | **Stable** | Forwarded as `CursorState::blink`; clients blink the cursor (gated by the `cursor_blink` setting) |
 | `?25` | DECTCEM — Cursor visibility | **Stable** | `CursorState::visible`; tested in `fzf_cursor_hidden_state` |
 | `?47` | Alternate screen buffer (old) | **Stable** | Handled by libghostty-vt |
 | `?1000` | X10 / normal mouse tracking | **Stable** | `MOUSE_REPORT_CLICK` set whenever any of 1000/1002/1003 is active |
@@ -436,24 +439,19 @@ sequences every attached client can handle (`capability::intersect_for_atomics`)
    wrapper boundary.  Forwarding to clients requires extending
    `kmux-protocol::messages::CellState` and the diff serialisation format.
 
-3. **Cursor blink state** — libghostty-vt tracks blinking vs. steady variants
-   of each cursor shape, but the wire `CursorShape` enum collapses them.  A
-   dedicated `blink: bool` field would allow clients to render the requested
-   cadence.
-
-4. **Underline variants and colour** — the wire protocol has a single
+3. **Underline variants and colour** — the wire protocol has a single
    `UNDERLINE` bit.  Adding an `underline_style: UnderlineStyle` field and an
    `underline_color: CellColor` field would expose the full SGR 4:n / SGR 58
    repertoire.
 
-5. **Overline** — `SGR 53` is parsed; a corresponding `OVERLINE` bit in
+4. **Overline** — `SGR 53` is parsed; a corresponding `OVERLINE` bit in
    `CellAttrs` would complete the standard decoration set.
 
-6. **OSC 52 clipboard** — the `on_osc52_copy` seam in `BackendEventSink`
+5. **OSC 52 clipboard** — the `on_osc52_copy` seam in `BackendEventSink`
    exists; full implementation requires a client-to-server clipboard channel.
 
-7. **OSC 7 (current directory)** — forwarding this would let the client update
+6. **OSC 7 (current directory)** — forwarding this would let the client update
    its session CWD display without a separate RPC.
 
-8. **Synchronized output (`?2026`)** — would allow flicker-free redraws; needs
+7. **Synchronized output (`?2026`)** — would allow flicker-free redraws; needs
    the diff engine to defer emission until the closing ST.

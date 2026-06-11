@@ -68,7 +68,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 5;
+pub const KMUX_FFI_ABI_VERSION: u32 = 6;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -95,6 +95,9 @@ pub struct DriverConfig {
     pub cwd: Option<String>,
     pub session: Option<String>,
     pub theme: Option<String>,
+    /// Whether the inner-pane cursor blinks. `None` defaults to `true` (and
+    /// falls back to the `cursor_blink` key in `config.toml`).
+    pub cursor_blink: Option<bool>,
     pub rows: u16,
     pub cols: u16,
     pub pixel_width: u16,
@@ -677,6 +680,7 @@ fn build_core(config: &DriverConfig) -> AppCore {
         .clone()
         .or_else(|| parsed_server.as_ref().and_then(|p| p.path.clone()));
     let theme = config::resolve_theme(config.theme.as_deref());
+    let cursor_blink = config::resolve_cursor_blink(config.cursor_blink);
     let initial_cwd = std::env::current_dir()
         .ok()
         .and_then(|p| p.to_str().map(String::from))
@@ -703,6 +707,7 @@ fn build_core(config: &DriverConfig) -> AppCore {
         auto_cwd,
         capabilities,
         theme,
+        cursor_blink,
         term_size,
     )
 }
@@ -1565,6 +1570,36 @@ impl KmuxDriver {
         self.inner.lock().expect("driver mutex poisoned").blink_on()
     }
 
+    /// Whether the inner-pane cursor is allowed to blink (Preferences toggle).
+    pub fn cursor_blink_enabled(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .cursor_blink_enabled
+    }
+
+    /// Enable/disable cursor blinking live and persist it to `config.toml`. When
+    /// disabled the cursor is drawn steady; the driver pins the blink phase solid
+    /// on the next [`tick`](Self::tick).
+    pub fn set_cursor_blink_enabled(&self, enabled: bool) {
+        {
+            let mut d = self.inner.lock().expect("driver mutex poisoned");
+            let core = d.core_mut();
+            if core.cursor_blink_enabled == enabled {
+                return;
+            }
+            core.cursor_blink_enabled = enabled;
+            core.needs_render = true;
+        }
+        // Persist (load-modify-save so theme/font are preserved), mirroring the
+        // GTK preferences window.
+        let mut cfg = config::load();
+        cfg.cursor_blink = Some(enabled);
+        if let Err(e) = config::save(&cfg) {
+            tracing::error!("failed to persist cursor_blink: {e}");
+        }
+    }
+
     /// Which interaction mode / overlay is active.
     pub fn mode(&self) -> FfiMode {
         mode_to_ffi(&self.inner.lock().expect("driver mutex poisoned").mode)
@@ -1644,12 +1679,13 @@ mod tests {
     }
 
     #[test]
-    fn abi_version_is_five() {
-        // The interactive-tiling surface (dividers + apply_divider_drag /
-        // reset_divider, numbered FocusPaneAt, rename_tab) bumped the ABI to 5;
-        // the Swift wrapper asserts the same constant on startup.
-        assert_eq!(KMUX_FFI_ABI_VERSION, 5);
-        assert_eq!(kmux_ffi_abi_version(), 5);
+    fn abi_version_export_matches_constant() {
+        // The exported free fn must return the constant verbatim. Asserting the
+        // invariant (not a hardcoded number) keeps `KMUX_FFI_ABI_VERSION` the
+        // single source of truth: bumping it needs no edit here, in the Swift
+        // app, or in CI. uniffi's regenerated binding-checksum check is what
+        // actually guards against stale bindings/dylib drift.
+        assert_eq!(kmux_ffi_abi_version(), KMUX_FFI_ABI_VERSION);
     }
 
     #[test]

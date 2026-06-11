@@ -34,6 +34,12 @@ pub struct Cli {
     /// "monospace 11".
     #[arg(long, global = true)]
     pub font: Option<String>,
+
+    /// Whether the inner-pane cursor blinks (`--cursor-blink true|false`).
+    /// Falls back to the `cursor_blink` key in ~/.config/kmux/config.toml,
+    /// then `true`.
+    #[arg(long, global = true)]
+    pub cursor_blink: Option<bool>,
 }
 
 /// Server addressing arguments shared by the default connect action and

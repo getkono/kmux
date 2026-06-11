@@ -139,6 +139,7 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         plan.auto_cwd.clone(),
         capabilities,
         plan.theme.clone(),
+        plan.cursor_blink,
         term_size,
     );
 

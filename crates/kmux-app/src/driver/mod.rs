@@ -393,11 +393,12 @@ impl FrontendDriver {
 
     /// Advance the cursor-blink phase. Returns whether the visible state changed.
     fn tick_blink(&mut self, now: Instant) -> bool {
-        let cursor_blinks = self.core.mgr.active_grid().is_some_and(|g| {
-            let c = g.cursor();
-            // Shape == Hidden ⇒ !visible, so `visible && blink` excludes hidden.
-            c.visible && c.blink
-        });
+        let cursor_blinks = self.core.cursor_blink_enabled
+            && self.core.mgr.active_grid().is_some_and(|g| {
+                let c = g.cursor();
+                // Shape == Hidden ⇒ !visible, so `visible && blink` excludes hidden.
+                c.visible && c.blink
+            });
         let (blink_on, blink_start, changed) =
             advance_blink(self.blink_on, self.blink_phase_start, cursor_blinks, now);
         self.blink_on = blink_on;

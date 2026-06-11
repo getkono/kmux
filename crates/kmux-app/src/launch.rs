@@ -38,6 +38,8 @@ pub struct Plan {
     /// GUI font (Pango font-description string). The GUI frontend derives its
     /// cell metrics from this.
     pub font: String,
+    /// Whether the inner-pane cursor blinks.
+    pub cursor_blink: bool,
     pub instance_id: String,
 }
 
@@ -151,6 +153,7 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         .or_else(|| parsed_server.as_ref().and_then(|p| p.path.clone()));
     let theme = config::resolve_theme(cli.theme.as_deref());
     let font = config::resolve_font(cli.font.as_deref());
+    let cursor_blink = config::resolve_cursor_blink(cli.cursor_blink);
 
     Ok(Launch::Interactive(Box::new(Plan {
         target,
@@ -159,6 +162,7 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         auto_session: cli.connect.session,
         theme,
         font,
+        cursor_blink,
         instance_id,
     })))
 }
