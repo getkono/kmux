@@ -268,7 +268,7 @@ alternative backends.
 | `OSC 7 … BEL/ST` | Set current working directory | **Unimplemented** | URI not extracted or forwarded |
 | `OSC 8 ; … ; uri BEL/ST` | Hyperlink | **Unimplemented** | `BackendEventSink::on_hyperlink()` seam exists; no forwarding yet |
 | `OSC 10 / 11 BEL/ST` | Query default fg/bg colour | **Partial** | Parsed; query responses not implemented (no back-channel to the application from the emulator) |
-| `OSC 52 ; … BEL/ST` | Clipboard read/write | **Unimplemented** | `BackendEventSink::on_osc52_copy()` seam exists; no forwarding yet |
+| `OSC 52 ; … BEL/ST` | Clipboard write (set) | **Stable** | `on_osc52_copy()` broadcasts `PaneClipboardCopy` server-wide; the client writes it to the system clipboard, honoring writes from any pane in the session it is viewing (last-in-wins). Clipboard *read* (`OSC 52 ; … ; ?`) is not answered (no client→server clipboard channel) |
 | `OSC 133 / 633` | Shell integration / semantic zones | **Not planned** | |
 | `OSC 1337` | iTerm2 inline images | **Unimplemented** | Parsed by libghostty-vt; image data dropped silently (Phase A) |
 | `OSC 9` | iTerm2 / Windows Terminal growl notification | **Not planned** | |
@@ -447,8 +447,9 @@ sequences every attached client can handle (`capability::intersect_for_atomics`)
 4. **Overline** — `SGR 53` is parsed; a corresponding `OVERLINE` bit in
    `CellAttrs` would complete the standard decoration set.
 
-5. **OSC 52 clipboard** — the `on_osc52_copy` seam in `BackendEventSink`
-   exists; full implementation requires a client-to-server clipboard channel.
+5. **OSC 52 clipboard read** — clipboard *writes* (set) are forwarded and
+   applied client-side (see the OSC table above); answering a clipboard *read*
+   (`OSC 52 ; … ; ?`) still requires a client→server clipboard channel.
 
 6. **OSC 7 (current directory)** — forwarding this would let the client update
    its session CWD display without a separate RPC.
