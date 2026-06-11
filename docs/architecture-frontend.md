@@ -69,10 +69,13 @@ The contract a frontend implements:
   - The same effect channel carries *server-originated* clipboard writes:
     `handle_session_events(events)` returns `Vec<KeyResult>` so an **OSC 52**
     copy from a remote pane (`SessionEventMsg::PaneClipboardCopy`) reaches the
-    local clipboard. The *policy* lives in the core — it honors the write only
-    when it came from the client's active pane and base64-decodes the payload —
-    while the *mechanism* (the actual `set_text`) stays in the frontend, reusing
-    the `CopyToClipboard` path. So a background pane can't clobber your clipboard.
+    local clipboard. The *policy* lives in the core — it honors the write when it
+    came from any pane in the session the client is currently viewing (not just
+    the focused split, so the most recent OSC 52 write wins) and base64-decodes
+    the payload — while the *mechanism* (the actual `set_text`) stays in the
+    frontend, reusing the `CopyToClipboard` path. The daemon broadcasts OSC 52
+    server-wide, so scoping to the active session is what keeps a pane in an
+    unrelated background session from clobbering your clipboard.
 - **Channels**: `AppCore` owns the tokio mpsc channels for *network* events
   (server messages, bootstrap outcome, transport upgrade, tunnel death) — those
   are core concerns. The frontend creates the channels, hands the senders to
