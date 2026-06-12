@@ -40,3 +40,7 @@ postcard.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Used only by tests/handoff_e2e.rs to drive a real daemon's control + data
+# sockets across a graceful restart. kmux-client depends on kmux-protocol (never
+# on kmuxd), so this introduces no dependency cycle.
+kmux-client.workspace = true

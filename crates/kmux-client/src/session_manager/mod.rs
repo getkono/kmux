@@ -372,6 +372,56 @@ mod tests {
         (mgr, rx)
     }
 
+    /// The client side of the live daemon upgrade (#36): when the daemon restarts,
+    /// the old transport dies and the client reconnects to the successor. The
+    /// successor adopts the predecessor's token and can transfer the existing pane
+    /// streams — but only if the client re-authenticates with the SAME
+    /// `connection_id`. This test pins the seam (`prepare_reconnect`) that must
+    /// preserve that identity across the disconnect, so a handoff reconnect is
+    /// seamless rather than starting a brand-new connection.
+    #[test]
+    fn reconnect_preserves_connection_id_for_handoff() {
+        use kmux_protocol::messages::ConnectionId;
+
+        use crate::connection_state::{ConnectionState, DisconnectReason};
+
+        let (mut mgr, _rx) = make_connected_manager();
+        let cid = ConnectionId(4242);
+        mgr.connection_id = Some(cid);
+
+        // Daemon went away (it restarted): the transport is lost but identity stays.
+        mgr.mark_connection_lost_with(DisconnectReason::ServerClosed);
+        assert!(mgr.ws_sender.is_none(), "the dead sender must be dropped");
+        assert!(
+            matches!(
+                mgr.connection_state(),
+                ConnectionState::Disconnected {
+                    reason: DisconnectReason::ServerClosed
+                }
+            ),
+            "should record why the connection dropped"
+        );
+        assert_eq!(
+            mgr.connection_id,
+            Some(cid),
+            "connection_id must survive a lost connection"
+        );
+
+        // Begin the reconnect: state flips to Handshaking, identity still retained
+        // so the re-auth can pass `connection_id: Some(..)` to the successor.
+        mgr.prepare_reconnect();
+        assert!(matches!(
+            mgr.connection_state(),
+            ConnectionState::Handshaking
+        ));
+        assert_eq!(
+            mgr.connection_id,
+            Some(cid),
+            "prepare_reconnect must preserve connection_id so the successor can \
+             transfer pane streams"
+        );
+    }
+
     fn make_entry(word_id: &str, cwd: &str) -> SessionEntry {
         use kmux_protocol::messages::SessionMeta;
         SessionEntry {
