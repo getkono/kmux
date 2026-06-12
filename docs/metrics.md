@@ -106,6 +106,18 @@ struct) and are aged out naturally when the file rotates.
 At 10 MiB the active file is renamed to `metrics.jsonl.1`, overwriting
 any previous generation.
 
+## Performance HUD
+
+A live ticker of apply-side render health, toggled with `Ctrl+G h` (GTK
+`<Ctrl><Shift>h` / Swift `⌘⇧H`, or the `hud` command). Visibility is held in
+`AppCore::hud_visible` and read by every frontend through the FFI getter.
+
+It defaults **on for debug builds** (`cfg!(debug_assertions)` in
+`AppCore::new`) so live diagnostics are available without an extra keystroke
+during development; release builds start hidden. Either profile can toggle it
+at runtime. The test constructor (`AppCore::for_test`) keeps it off for
+deterministic toggle tests.
+
 ## Metrics overlay
 
 Toggle: `Ctrl+G` then `m`. The overlay shows:
