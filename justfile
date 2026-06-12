@@ -78,8 +78,12 @@ gen-ffi-bindings profile="debug":
     esac
     cargo build $relflag -p kmux-ffi
     out=$(mktemp -d)
+    # `--no-format` skips uniffi's optional swiftformat pass: the bindings are
+    # machine-generated (and gitignored), so formatting them is pointless, and
+    # without it uniffi prints a benign "Unable to auto-format" warning whenever
+    # swiftformat isn't installed (see issue #104).
     cargo run -p kmux-ffi --bin uniffi-bindgen -- \
-        generate --library target/{{profile}}/libkmux_ffi.dylib --language swift --out-dir "$out"
+        generate --no-format --library target/{{profile}}/libkmux_ffi.dylib --language swift --out-dir "$out"
     mkdir -p kmux-swift/Sources/kmux_ffiFFI kmux-swift/Sources/KmuxBindings
     cp "$out/kmux_ffiFFI.h"  kmux-swift/Sources/kmux_ffiFFI/kmux_ffiFFI.h
     cp "$out/kmux_ffi.swift" kmux-swift/Sources/KmuxBindings/kmux_ffi.swift
