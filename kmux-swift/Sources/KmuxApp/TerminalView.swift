@@ -37,6 +37,11 @@ final class TerminalNSView: NSView {
     var ptyDragging = false
     /// Tracking area driving the hover resize cursor over dividers.
     var dividerTrackingArea: NSTrackingArea?
+    /// Last `(cols, rows)` reported to the driver. AppKit re-issues `setFrameSize`
+    /// (and `viewDidMoveToWindow`) on layout passes that don't change the cell
+    /// grid; skipping those keeps a redundant callback from restarting the
+    /// driver's 100 ms resize debounce (so a settled size actually reaches the daemon).
+    private var lastReportedCells: (cols: UInt16, rows: UInt16)?
 
     init(model: KmuxModel) {
         self.model = model
@@ -67,8 +72,10 @@ final class TerminalNSView: NSView {
     /// (debounced inside the driver). Mirrors kmux-gtk's `connect_resize`.
     private func reportSize(_ size: NSSize) {
         guard size.width > 0, size.height > 0 else { return }
-        let scale = window?.backingScaleFactor ?? 2.0
         let (cols, rows) = metrics.colsRows(width: size.width, height: size.height)
+        if let last = lastReportedCells, last == (cols, rows) { return }
+        lastReportedCells = (cols, rows)
+        let scale = window?.backingScaleFactor ?? 2.0
         let pw = UInt16(min(Int(size.width * scale), Int(UInt16.max)))
         let ph = UInt16(min(Int(size.height * scale), Int(UInt16.max)))
         model.driver.requestResize(rows: rows, cols: cols, pixelWidth: pw, pixelHeight: ph)

@@ -128,6 +128,44 @@ machine) and `driver::clipboard::sanitize_clipboard_text` (NUL stripping).
 effects + reconcile chrome + redraw. The driver has its own unit tests in
 `kmux-app/src/driver/`.
 
+## Terminal resize: clients report, the daemon negotiates
+
+The PTY size is **owned by the daemon**, not any one client. Clients only
+*report* a desired size; the daemon negotiates the effective size across every
+client attached to a pane (smallest-wins on rows and cols, ignoring zero), and
+when that changes it resizes the PTY and broadcasts a `PaneResized` event plus a
+fresh `TerminalSnapshot`. A frontend therefore never sizes a terminal directly —
+it reports geometry and renders whatever the daemon sends back.
+
+A frontend maps its **content area's pixel size → (cols, rows)** through the cell
+metrics (`render::Metrics` / `TerminalMetrics`) and feeds the result down two
+paths, both ending in a `ClientMessage::Resize` from `kmux-client`:
+
+1. **Debounced whole-area term size.** On an actual size change the frontend
+   calls `driver.request_resize(size)`; the `FrontendDriver` coalesces the burst
+   over `RESIZE_DEBOUNCE` (100 ms) and then `set_term_size` →
+   `SessionManager::update_term_size`. This updates `last_term_size` — the size
+   the **first `Attach` carries** and the fallback for a single-pane tab — and
+   `Resize`s every attached pane that has no resolved tile size of its own.
+2. **Per-frame resolved tile sizes.** Each pump the frontend resolves the active
+   tab's layout against the content area (the shared `kmux_app::layout` resolver)
+   and pushes each pane's sub-rect via `set_pane_sizes` (GTK `tiles::push_sizes`,
+   Swift `KmuxModel.refreshTiles` → `driver.set_pane_sizes`). `set_pane_sizes`
+   only emits a `Resize` for a pane that is **attached (`pane_sync`) and whose
+   size changed**, so a tiled pane's PTY tracks its tile, not the whole window,
+   without thrashing. Because this runs every frame, it is what corrects a pane
+   that attached at the seeded default before the real geometry was known — see
+   the `set_pane_sizes_*` tests in `kmux-client`.
+
+Both paths read the same geometry, so the frontend's content view **must be sized
+to the real window area as early as possible**. The GTK `DrawingArea` emits a
+reliable `connect_resize` (size-allocate) on `window.present()`, so it reports the
+real size on startup. The Swift terminal is an `NSViewRepresentable`; it must
+claim the full detail area with `.frame(maxWidth: .infinity, maxHeight: .infinity)`
+in `ContentView`. Without it the hosted `NSView` is laid out at a stale/ideal size
+and only re-sized once a manual window resize forces a fresh layout pass — which
+left the remote PTY pinned at the default 24×80 until the window was dragged.
+
 ## Theme: one palette, per-frontend colors
 
 `kmux_app::theme` owns the source-of-truth palette as a toolkit-neutral `Rgb`
