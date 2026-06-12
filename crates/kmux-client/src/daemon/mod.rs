@@ -352,4 +352,65 @@ mod tests {
         let result: anyhow::Result<StatusResponse> = control_request("status").await;
         assert!(result.is_err());
     }
+
+    /// The `restart` control RPC has three outcomes the `kmux daemon restart`
+    /// command branches on (see `kmux-app/src/subcommands/daemon_cmd.rs`):
+    ///   - `{"status":"ok"}`   → `Ok(true)`  — graceful handoff accepted
+    ///   - `{"status":"busy"}` → `Ok(false)` — a restart is already in progress
+    ///   - connection closed without a reply → `Err` — daemon predates `restart`,
+    ///     so the caller falls back to a hard stop-then-respawn.
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn restart_daemon_maps_accepted_busy_and_unsupported() {
+        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+        use tokio::net::UnixListener;
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+
+        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
+        let listener = UnixListener::bind(&socket_path).unwrap();
+
+        // Serve three connections in order: accept, busy, then close-without-reply.
+        tokio::spawn(async move {
+            let replies: [Option<&str>; 3] = [
+                Some(r#"{"status":"ok","handoff":true}"#),
+                Some(r#"{"status":"busy","handoff":false}"#),
+                None, // mimic an old daemon: close without replying
+            ];
+            for reply in replies {
+                let Ok((stream, _)) = listener.accept().await else {
+                    return;
+                };
+                let (read_half, mut write_half) = stream.into_split();
+                let mut reader = BufReader::new(read_half);
+                let mut line = String::new();
+                let _ = reader.read_line(&mut line).await;
+                assert!(line.contains("\"restart\""), "expected a restart command");
+                if let Some(body) = reply {
+                    let _ = write_half.write_all(format!("{body}\n").as_bytes()).await;
+                }
+                // Dropping `write_half` (reply == None) closes the connection so the
+                // client reads EOF and surfaces an error.
+            }
+        });
+
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        assert!(
+            super::restart_daemon()
+                .await
+                .expect("accepted reply parses"),
+            "status=ok must report an accepted handoff"
+        );
+        assert!(
+            !super::restart_daemon().await.expect("busy reply parses"),
+            "status=busy must report no handoff"
+        );
+        assert!(
+            super::restart_daemon().await.is_err(),
+            "a daemon that closes without replying must surface as Err (unsupported)"
+        );
+    }
 }

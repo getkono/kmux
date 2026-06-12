@@ -129,10 +129,13 @@ pub async fn run(app: &Arc<ServerApp>) -> anyhow::Result<()> {
 }
 
 /// Spawn the successor daemon: re-exec this binary with the standard boot args
-/// plus `--handoff`. After an in-place upgrade `current_exe()` resolves to the
-/// new binary at the same path.
+/// plus `--handoff`. The binary path is resolved by [`resolve_successor_exe`] so a
+/// live upgrade (the new binary swapped in over our path) re-execs the *new* code.
 fn spawn_successor() -> anyhow::Result<()> {
-    let exe = std::env::current_exe().context("resolving current executable")?;
+    let exe = resolve_successor_exe(
+        std::env::current_exe().context("resolving current executable")?,
+        |p| p.exists(),
+    )?;
     let mut args: Vec<&str> = DAEMON_BOOT_ARGS.to_vec();
     args.push("--handoff");
     std::process::Command::new(&exe)
@@ -145,10 +148,95 @@ fn spawn_successor() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve the path to re-exec for the successor daemon, accounting for an
+/// in-place upgrade (`just upgrade-daemon`: `cargo install` atomically replaces the
+/// binary, then `kmux daemon restart` triggers this handoff).
+///
+/// `current_exe()` behaves differently across platforms once the running binary is
+/// replaced on disk:
+///   - **macOS** keeps the original path, which now resolves to the freshly
+///     installed inode — re-execing it runs the new binary, so we use it as-is.
+///   - **Linux** unlinks the running inode (the atomic rename), so `/proc/self/exe`
+///     reads back as `"<path> (deleted)"`. Re-execing that literal path would
+///     `ENOENT` and the handoff would roll back onto the *old* in-memory code — the
+///     upgrade would silently no-op. We strip the marker and prefer the de-suffixed
+///     path when the replacement now exists there.
+///
+/// Returns an error when neither candidate exists on disk, so `spawn_successor`
+/// fails before the commit point and the daemon keeps serving (no session loss)
+/// rather than spawning nothing.
+fn resolve_successor_exe(
+    exe: std::path::PathBuf,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> anyhow::Result<std::path::PathBuf> {
+    // Linux marks the unlinked original as "<path> (deleted)"; prefer the
+    // replacement sitting at the same (un-suffixed) path when it is present.
+    if let Some(stripped) = exe.to_str().and_then(|s| s.strip_suffix(" (deleted)")) {
+        let candidate = std::path::PathBuf::from(stripped);
+        if exists(&candidate) {
+            return Ok(candidate);
+        }
+    }
+    if exists(&exe) {
+        return Ok(exe);
+    }
+    bail!(
+        "cannot locate the daemon binary to re-exec ({}); was it removed mid-upgrade?",
+        exe.display()
+    )
+}
+
 /// Write a fresh checkpoint to the standard session-state path.
 async fn write_checkpoint(app: &ServerApp) -> anyhow::Result<()> {
     let state = app.checkpoint_state().await;
     let path = kmux_protocol::dirs::session_state_path()?;
     crate::persist::checkpoint::write_checkpoint(&state, &path)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+
+    use super::resolve_successor_exe;
+
+    #[test]
+    fn resolves_unmodified_path_when_present() {
+        // The common case (no upgrade, or macOS post-upgrade): current_exe() points
+        // at a real file, so we re-exec it verbatim.
+        let exe = PathBuf::from("/usr/local/bin/kmuxd");
+        let got = resolve_successor_exe(exe.clone(), |p| p == Path::new("/usr/local/bin/kmuxd"))
+            .expect("should resolve");
+        assert_eq!(got, exe);
+    }
+
+    #[test]
+    fn strips_deleted_marker_and_prefers_replacement() {
+        // Linux after an in-place `cargo install`: the running inode is unlinked, so
+        // current_exe() returns the " (deleted)" marker while the *new* binary sits
+        // at the un-suffixed path. We must re-exec the replacement (the new code).
+        let exe = PathBuf::from("/home/u/.cargo/bin/kmuxd (deleted)");
+        let got = resolve_successor_exe(exe, |p| p == Path::new("/home/u/.cargo/bin/kmuxd"))
+            .expect("should resolve to the replacement");
+        assert_eq!(got, PathBuf::from("/home/u/.cargo/bin/kmuxd"));
+    }
+
+    #[test]
+    fn errors_when_neither_candidate_exists() {
+        // Marker present but no replacement has landed (and the literal path is gone
+        // too): fail so the handoff rolls back rather than spawning nothing.
+        let exe = PathBuf::from("/home/u/.cargo/bin/kmuxd (deleted)");
+        let err = resolve_successor_exe(exe, |_| false).expect_err("should error");
+        assert!(err.to_string().contains("cannot locate"), "{err}");
+    }
+
+    #[test]
+    fn falls_back_to_literal_marker_path_when_it_really_exists() {
+        // Defensive: a real file literally named "... (deleted)" with no replacement
+        // — re-exec it rather than erroring.
+        let exe = PathBuf::from("/weird/kmuxd (deleted)");
+        let got = resolve_successor_exe(exe.clone(), |p| p == Path::new("/weird/kmuxd (deleted)"))
+            .expect("should fall back to the literal path");
+        assert_eq!(got, exe);
+    }
 }

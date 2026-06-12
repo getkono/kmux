@@ -152,6 +152,35 @@ start-daemon:
 stop-daemon:
     cargo run -p kmux -- daemon stop
 
+# Upgrade a running daemon in place: build + install a fresh release kmuxd, then
+# live-restart it so existing sessions (shells, editors, REPLs) survive (issue #36).
+# Unlike `restart-daemon` (which only rebuilds + restarts a dev daemon), this swaps
+# the installed system binary, so it is the path to ship a new daemon to a live
+# session. See docs/daemon-handoff.md §"Upgrading a running daemon".
+upgrade-daemon:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    command -v kmux >/dev/null || { echo "error: 'kmux' not found on PATH; run 'just install' first (this recipe upgrades an *installed* daemon)" >&2; exit 1; }
+    # Rebuild the release kmuxd. This also refreshes the build-tree libkmux_ghostty
+    # that the installed binary's rpath points at — `cargo install` does NOT
+    # bundle/repoint the dylib the way `just package` does, so a fresh build keeps
+    # the new daemon's library ABI-matched (kmux-ghostty-sys EXPECTED_ABI_VERSION).
+    cargo build --release -p kmuxd
+    # Atomic in-place replace of ~/.cargo/bin/kmuxd. The live restart below re-execs
+    # the *running* daemon's own binary path (see handoff::sender::resolve_successor_exe),
+    # so an in-place upgrade only takes effect when the running daemon IS this
+    # installed binary — a dev daemon launched from target/debug/kmuxd would re-exec
+    # the debug build, not this one.
+    cargo install --path crates/kmuxd
+    # Trigger the graceful handoff: the new binary is spawned as a successor, every
+    # live PTY master fd is streamed to it via SCM_RIGHTS, then the old daemon exits;
+    # connected clients reconnect with the adopted token. `kmux daemon restart`
+    # starts the daemon if none is running. It is the success gate (non-zero on a
+    # failed/timed-out handoff); the status prints are informational only.
+    echo "==> before:"; kmux daemon status || true
+    kmux daemon restart
+    echo "==> after:";  kmux daemon status || true
+
 # Install the clients + daemon for the host platform (release build).
 install:
     #!/usr/bin/env bash
