@@ -14,14 +14,7 @@ use crate::messages::SessionMeta;
 /// silently locks in TCP+TLS forever (TCP+TLS happens to work despite a
 /// loopback bind because the SSH `-L` tunnel terminates on the remote's
 /// loopback; QUIC has no such tunnel).
-pub const DAEMON_BOOT_ARGS: &[&str] = &[
-    "--daemon",
-    "--self-signed",
-    "--bind",
-    "0.0.0.0",
-    "--port",
-    "0",
-];
+pub const DAEMON_BOOT_ARGS: &[&str] = &["--daemon", "--bind", "0.0.0.0", "--port", "0"];
 
 /// Version of the daemon-to-daemon handoff protocol.
 ///

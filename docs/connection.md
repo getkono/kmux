@@ -332,9 +332,8 @@ version = 1
 runtime_dir = "auto"   # resolves to $XDG_RUNTIME_DIR/kmux
 
 [tls]
-cert = "/etc/kmuxd/cert.pem"
+cert = "/etc/kmuxd/cert.pem"   # optional; omit cert+key for a self-signed cert
 key  = "/etc/kmuxd/key.pem"
-# self_signed = true    # development only
 
 [[listen]]
 kind = "quic"           # "quic" | "tcp+tls" | "unix"
@@ -732,7 +731,7 @@ Every place that spawns `kmuxd` uses one of two strategies. They are intentional
 Once the binary is located, `start_daemon()` spawns it with the canonical argv:
 
 ```
-kmuxd --daemon --self-signed --bind 127.0.0.1 --port 0
+kmuxd --daemon --bind 0.0.0.0 --port 0
 ```
 
 This constant is defined in `crates/kmux-protocol/src/control_rpc.rs::DAEMON_BOOT_ARGS` and is the single source of truth for every spawn site.

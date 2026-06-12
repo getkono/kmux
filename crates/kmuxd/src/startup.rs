@@ -43,18 +43,13 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     );
 
     // ── TLS material ───────────────────────────────────────────────────────────
-    let material = if cfg.tls.self_signed {
-        CertMaterial::self_signed()?
-    } else {
-        let cert_path = cfg.tls.cert.ok_or_else(|| {
-            anyhow::anyhow!(
-                "TLS cert path required (set [tls] cert in kmuxd.toml or use --self-signed)"
-            )
-        })?;
-        let key_path = cfg.tls.key.ok_or_else(|| {
-            anyhow::anyhow!("TLS key path required (set [tls] key in kmuxd.toml)")
-        })?;
-        CertMaterial::from_files(&cert_path, &key_path)?
+    // A configured cert/key pair loads a custom certificate; otherwise the
+    // daemon generates an in-memory self-signed certificate. Self-signed is the
+    // default for this kind of software, so it needs no flag or config knob
+    // (issue #100). `ServerConfig::resolve` has already rejected a half-set pair.
+    let material = match (&cfg.tls.cert, &cfg.tls.key) {
+        (Some(cert_path), Some(key_path)) => CertMaterial::from_files(cert_path, key_path)?,
+        _ => CertMaterial::self_signed()?,
     };
 
     // When launched as a graceful-restart successor (`--handoff`), pull the
