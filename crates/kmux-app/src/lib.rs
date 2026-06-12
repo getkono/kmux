@@ -30,6 +30,10 @@ pub mod layout;
 /// built-in theme TOML parsing.
 pub mod theme;
 
+/// Toolkit-neutral terminal appearance/font settings ([`appearance::Appearance`])
+/// that each frontend converts to its own font/metrics types at the render leaf.
+pub mod appearance;
+
 /// Client config file + theme resolution (returns the toolkit-neutral theme).
 pub mod config;
 

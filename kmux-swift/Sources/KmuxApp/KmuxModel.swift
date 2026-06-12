@@ -13,6 +13,10 @@ final class KmuxModel: ObservableObject {
 
     // ── Chrome state (published; updated only when it changes) ──
     @Published private(set) var theme: FfiTheme
+    /// Resolved terminal appearance (font family/size/style, OpenType features,
+    /// cell adjustments) the terminal view builds its `NSFont` metrics from.
+    /// Resolved once from `config.toml` at startup.
+    let appearance: FfiAppearance
     @Published private(set) var connection: FfiConnInfo
     @Published private(set) var sessions: [FfiSession] = []
     /// Tabs of the active session (Session → Tab → Pane) for the tab strip.
@@ -80,6 +84,7 @@ final class KmuxModel: ObservableObject {
             fatalError("failed to initialize the kmux driver: \(error)")
         }
         theme = driver.theme()
+        appearance = driver.appearance()
         connection = driver.connection()
     }
 

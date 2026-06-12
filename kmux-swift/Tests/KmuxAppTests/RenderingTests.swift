@@ -1,5 +1,7 @@
 import XCTest
 
+import KmuxBindings
+
 @testable import KmuxApp
 
 /// Unit tests for the pure render-side logic (packed-cell decode + cell
@@ -75,5 +77,26 @@ final class RenderingTests: XCTestCase {
         let (c0, r0) = m.colsRows(width: 0, height: 0)
         XCTAssertEqual(c0, 1)
         XCTAssertEqual(r0, 1)
+    }
+
+    func testMetricsFromAppearanceAppliesCellAdjust() {
+        func appearance(width: FfiCellAdjust, height: FfiCellAdjust) -> FfiAppearance {
+            FfiAppearance(
+                family: "Menlo", familyBold: nil, familyItalic: nil, familyBoldItalic: nil,
+                sizePt: 13, style: nil, features: [],
+                cellWidthAdjust: width, cellHeightAdjust: height)
+        }
+        let zero = FfiCellAdjust(kind: .pixels, value: 0)
+        let base = TerminalMetrics(appearance: appearance(width: zero, height: zero))
+
+        // +4px width adds exactly 4 (both sides ceil an integer offset).
+        let wider = TerminalMetrics(
+            appearance: appearance(width: FfiCellAdjust(kind: .pixels, value: 4), height: zero))
+        XCTAssertEqual(wider.cellWidth, base.cellWidth + 4)
+
+        // +50% height grows the cell.
+        let taller = TerminalMetrics(
+            appearance: appearance(width: zero, height: FfiCellAdjust(kind: .percent, value: 50)))
+        XCTAssertGreaterThan(taller.cellHeight, base.cellHeight)
     }
 }

@@ -46,6 +46,7 @@ use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Runtime;
 
+use kmux_app::appearance::{Appearance, CellAdjust};
 use kmux_app::cmd;
 use kmux_app::config;
 use kmux_app::core::{AppCore, TopBarAction};
@@ -70,7 +71,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 7;
+pub const KMUX_FFI_ABI_VERSION: u32 = 8;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -462,6 +463,68 @@ impl From<&Theme> for FfiTheme {
     }
 }
 
+/// Whether a [`FfiCellAdjust`] adds pixels or scales by a percentage.
+#[derive(uniffi::Enum)]
+pub enum FfiCellAdjustKind {
+    Pixels,
+    Percent,
+}
+
+/// A cell-dimension adjustment (mirrors [`CellAdjust`]). `Pixels` adds `value`
+/// logical pixels; `Percent` scales by `value`% (e.g. `10.0` → +10%).
+#[derive(uniffi::Record)]
+pub struct FfiCellAdjust {
+    pub kind: FfiCellAdjustKind,
+    pub value: f32,
+}
+
+impl From<&CellAdjust> for FfiCellAdjust {
+    fn from(a: &CellAdjust) -> Self {
+        match a {
+            CellAdjust::Pixels(v) => FfiCellAdjust {
+                kind: FfiCellAdjustKind::Pixels,
+                value: *v,
+            },
+            CellAdjust::Percent(v) => FfiCellAdjust {
+                kind: FfiCellAdjustKind::Percent,
+                value: *v,
+            },
+        }
+    }
+}
+
+/// The active toolkit-neutral terminal appearance (font + cell geometry). The
+/// Swift frontend builds an `NSFont` + CoreText feature settings from this.
+#[derive(uniffi::Record)]
+pub struct FfiAppearance {
+    pub family: String,
+    pub family_bold: Option<String>,
+    pub family_italic: Option<String>,
+    pub family_bold_italic: Option<String>,
+    pub size_pt: f32,
+    pub style: Option<String>,
+    /// OpenType feature settings as harfbuzz tag strings (`"tag=value"`).
+    pub features: Vec<String>,
+    pub cell_width_adjust: FfiCellAdjust,
+    pub cell_height_adjust: FfiCellAdjust,
+}
+
+impl From<&Appearance> for FfiAppearance {
+    fn from(a: &Appearance) -> Self {
+        Self {
+            family: a.family.clone(),
+            family_bold: a.family_bold.clone(),
+            family_italic: a.family_italic.clone(),
+            family_bold_italic: a.family_bold_italic.clone(),
+            size_pt: a.size_pt,
+            style: a.style.clone(),
+            features: a.features.iter().map(|f| f.to_setting()).collect(),
+            cell_width_adjust: (&a.cell_width_adjust).into(),
+            cell_height_adjust: (&a.cell_height_adjust).into(),
+        }
+    }
+}
+
 /// Connection lifecycle state (for the connection badge / disconnect overlay).
 #[derive(uniffi::Enum)]
 pub enum FfiConnStatus {
@@ -738,6 +801,9 @@ fn build_core(config: &DriverConfig) -> AppCore {
         .clone()
         .or_else(|| parsed_server.as_ref().and_then(|p| p.path.clone()));
     let theme = config::resolve_theme(config.theme.as_deref());
+    // No `--font` flag on the Swift path; the appearance resolves from
+    // `config.toml` (mirroring how `theme`/`cursor_blink` default here).
+    let appearance = config::resolve_appearance(None);
     let cursor_blink = config::resolve_cursor_blink(config.cursor_blink);
     let initial_cwd = std::env::current_dir()
         .ok()
@@ -765,6 +831,7 @@ fn build_core(config: &DriverConfig) -> AppCore {
         auto_cwd,
         capabilities,
         theme,
+        appearance,
         cursor_blink,
         term_size,
     )
@@ -948,6 +1015,12 @@ impl KmuxDriver {
     /// The active palette (for the renderer + native chrome).
     pub fn theme(&self) -> FfiTheme {
         FfiTheme::from(&self.inner.lock().expect("driver mutex poisoned").palette)
+    }
+
+    /// The active terminal appearance (font family/size/style, OpenType
+    /// features, cell adjustments) the renderer builds its `NSFont` from.
+    pub fn appearance(&self) -> FfiAppearance {
+        FfiAppearance::from(&self.inner.lock().expect("driver mutex poisoned").appearance)
     }
 
     /// The current connection state + badge label.
@@ -1773,6 +1846,54 @@ mod tests {
         // app, or in CI. uniffi's regenerated binding-checksum check is what
         // actually guards against stale bindings/dylib drift.
         assert_eq!(kmux_ffi_abi_version(), KMUX_FFI_ABI_VERSION);
+    }
+
+    #[test]
+    fn ffi_appearance_maps_fields() {
+        use kmux_app::appearance::FontFeature;
+        let appearance = Appearance {
+            family: "JetBrains Mono".into(),
+            family_bold: Some("JetBrains Mono Bold".into()),
+            family_italic: None,
+            family_bold_italic: None,
+            size_pt: 14.0,
+            style: Some("Medium".into()),
+            features: vec![
+                FontFeature {
+                    tag: "ss01".into(),
+                    value: 1,
+                },
+                FontFeature {
+                    tag: "liga".into(),
+                    value: 0,
+                },
+            ],
+            cell_width_adjust: CellAdjust::Pixels(2.0),
+            cell_height_adjust: CellAdjust::Percent(10.0),
+        };
+        let ffi = FfiAppearance::from(&appearance);
+        assert_eq!(ffi.family, "JetBrains Mono");
+        assert_eq!(ffi.family_bold.as_deref(), Some("JetBrains Mono Bold"));
+        assert_eq!(ffi.size_pt, 14.0);
+        assert_eq!(ffi.style.as_deref(), Some("Medium"));
+        assert_eq!(
+            ffi.features,
+            vec!["ss01=1".to_string(), "liga=0".to_string()]
+        );
+        assert!(matches!(
+            ffi.cell_width_adjust,
+            FfiCellAdjust {
+                kind: FfiCellAdjustKind::Pixels,
+                value
+            } if value == 2.0
+        ));
+        assert!(matches!(
+            ffi.cell_height_adjust,
+            FfiCellAdjust {
+                kind: FfiCellAdjustKind::Percent,
+                value
+            } if value == 10.0
+        ));
     }
 
     #[test]

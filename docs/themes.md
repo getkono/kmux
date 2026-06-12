@@ -3,6 +3,9 @@
 kmux supports colour themes for the client. Six themes are built in and
 compiled into the binary; custom themes can be added without rebuilding.
 
+For fonts and cell geometry (font family, size, OpenType features, …), see
+[appearance.md](appearance.md).
+
 ## Built-in themes
 
 | Name | Description |

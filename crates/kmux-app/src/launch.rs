@@ -11,6 +11,7 @@ use tracing_subscriber::EnvFilter;
 
 use kmux_client::pipeline::ResolvedTarget;
 
+use crate::appearance::Appearance;
 use crate::cli::{Cli, Command};
 use crate::config;
 use crate::subcommands::{
@@ -36,9 +37,13 @@ pub struct Plan {
     pub auto_cwd: Option<String>,
     pub auto_session: Option<String>,
     pub theme: Theme,
-    /// GUI font (Pango font-description string). The GUI frontend derives its
-    /// cell metrics from this.
+    /// Legacy GUI font (Pango font-description string). Retained for the GTK
+    /// preferences font entry; the cell metrics are now derived from
+    /// [`appearance`](Self::appearance), which already folds this in.
     pub font: String,
+    /// Resolved terminal appearance (font family/size/style, OpenType features,
+    /// cell adjustments). The GUI frontends derive their cell metrics from this.
+    pub appearance: Appearance,
     /// Whether the inner-pane cursor blinks.
     pub cursor_blink: bool,
     pub instance_id: String,
@@ -158,6 +163,7 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         .or_else(|| parsed_server.as_ref().and_then(|p| p.path.clone()));
     let theme = config::resolve_theme(cli.theme.as_deref());
     let font = config::resolve_font(cli.font.as_deref());
+    let appearance = config::resolve_appearance(cli.font.as_deref());
     let cursor_blink = config::resolve_cursor_blink(cli.cursor_blink);
 
     Ok(Launch::Interactive(Box::new(Plan {
@@ -167,6 +173,7 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         auto_session: cli.connect.session,
         theme,
         font,
+        appearance,
         cursor_blink,
         instance_id,
     })))

@@ -148,6 +148,25 @@ defaulting to `fg` / `bg`). The frontend draws the inner-pane cursor itself and
 honors these colors. See
 [terminal-backend.md](terminal-backend.md#cursor-rendering-in-cell).
 
+## Appearance: one font model, per-frontend metrics
+
+Fonts and cell geometry follow the same toolkit-neutral pattern as the palette.
+`kmux_app::appearance::Appearance` (font family + bold/italic variants, size,
+style, OpenType features, cell-size adjustments) is resolved from `config.toml`
+by `kmux_app::config::resolve_appearance` and held on `AppCore.appearance`. Each
+frontend converts it to its toolkit's font/metrics types at the render leaf:
+
+- `kmux-gtk`: a `pango::FontDescription` per style + a `pango::AttrFontFeatures`
+  attribute list, built in `render::Metrics`.
+- `kmux-swift`: an `NSFont` per style + CoreText feature settings, built in
+  `TerminalMetrics`. The `Appearance` crosses the FFI as the `FfiAppearance`
+  record (read via `KmuxDriver::appearance()`) — adding this getter bumped
+  `KMUX_FFI_ABI_VERSION` to 8.
+
+Like the palette, appearance never crosses the wire protocol — it is purely a
+client render concern. See [appearance.md](appearance.md) for the config keys
+and the cell-by-cell ligature limitation.
+
 ## Binaries and the shared CLI front door
 
 The naming is: **`kmux`** is the entrypoint (the `kmux` crate's binary) on both
