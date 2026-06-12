@@ -539,6 +539,13 @@ the auth token and rebuilds each pane around the inherited fd. On any failure it
 rolls back (or the successor falls back to snapshot restore). Full sequence,
 versioning, and fault-tolerance model: `docs/daemon-handoff.md`.
 
+This is the mechanism behind a **live upgrade** — `just upgrade-daemon` installs a
+new `kmuxd` and restarts onto it without dropping shells (issue #36). The upgrade
+mechanics (in-place binary swap, why the outgoing daemon must
+`shutdown_background()` to actually exit) and the full QA matrix are in
+`docs/daemon-handoff.md` §"Upgrading a running daemon" and
+`docs/qa-daemon-upgrade.md`.
+
 ---
 
 ## 15. Runtime Directory Layout

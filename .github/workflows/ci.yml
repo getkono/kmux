@@ -51,6 +51,10 @@ jobs:
         run: cargo clippy --workspace -- -D warnings
 
       - name: Test
+        # Includes the cross-process daemon handoff/upgrade integration tests
+        # (crates/kmuxd/tests/handoff_e2e.rs), which spawn a real kmuxd and drive a
+        # live `restart`. The Linux-specific `(deleted)`-inode upgrade path is
+        # exercised here.
         run: cargo test --workspace
 
   # macOS path: build/test kmux-ffi + the client stack it wraps, build the `kmux`
@@ -64,6 +68,11 @@ jobs:
     runs-on: macos-14 # Apple Silicon
     steps:
       - uses: actions/checkout@v4
+        # Submodules (vendor/ghostty) are needed to build kmuxd + kmux-pty below,
+        # which the daemon-handoff tests cover on macOS (a first-class target whose
+        # live-upgrade path differs from Linux's).
+        with:
+          submodules: true
 
       - name: Install GTK4 + libadwaita (Homebrew)
         run: brew install gtk4 libadwaita
@@ -83,6 +92,16 @@ jobs:
             target
           key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
 
+      - name: Cache zig build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            vendor/ghostty/.zig-cache
+          key: ${{ runner.os }}-zig-${{ hashFiles('vendor/ghostty/build.zig', 'vendor/ghostty/build.zig.zon', 'crates/kmux-ghostty-sys/zig/**') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+
       - name: Format check
         run: cargo fmt --check --all
 
@@ -94,6 +113,12 @@ jobs:
 
       - name: Test (kmux-ffi + the client stack it wraps)
         run: cargo test -p kmux-ffi -p kmux-app -p kmux-client -p kmux-protocol
+
+      - name: Test daemon + PTY (handoff / live-upgrade surfaces on macOS)
+        # Closes the macOS coverage gap: the daemon's graceful handoff and the
+        # in-place binary swap behave differently per platform (current_exe(),
+        # SCM_RIGHTS), so the daemon must be exercised on macOS too — not only Linux.
+        run: cargo test -p kmuxd -p kmux-pty
 
       - name: Build + test the native macOS app (kmux-swift)
         run: |

@@ -96,6 +96,48 @@ the `HandoffMessage` wire format.**
   replying; the client detects this and falls back to a hard stop-then-respawn
   (running shells do not survive that one-time fallback).
 
+## Upgrading a running daemon (`just upgrade-daemon`, issue #36)
+
+The handoff above is what makes a *live upgrade* possible: ship a new `kmuxd`
+build and restart onto it without dropping the shells it hosts. The
+`just upgrade-daemon` recipe does exactly that:
+
+1. `cargo build --release -p kmuxd` — also refreshes the build-tree
+   `libkmux_ghostty` the installed binary's rpath points at, keeping the new
+   daemon ABI-matched (`kmux-ghostty-sys` `EXPECTED_ABI_VERSION`).
+2. `cargo install --path crates/kmuxd` — **atomically replaces**
+   `~/.cargo/bin/kmuxd` in place.
+3. `kmux daemon restart` — drives the handoff above; the successor is the new
+   binary.
+
+Two mechanics are load-bearing:
+
+- **The successor runs the *new* code only if the running daemon's own binary
+  path was replaced.** `spawn_successor` re-execs the running daemon's binary
+  (`handoff::sender::resolve_successor_exe`), not the install target. So an
+  in-place upgrade takes effect when the running daemon *is* the installed
+  `~/.cargo/bin/kmuxd`; a dev daemon launched from `target/debug/kmuxd` would
+  re-exec the debug build. After the atomic replace, `resolve_successor_exe`
+  handles the platform split: macOS keeps the path (now the new inode); Linux's
+  `/proc/self/exe` reads back as `"<path> (deleted)"`, which it strips and
+  resolves to the replacement so the new code runs rather than `ENOENT`-ing.
+- **The outgoing daemon must fully exit.** Its migrated PTY children are kept
+  alive, so their per-child `waitpid` reaper threads (`spawn_blocking`) never
+  return. `main` therefore detaches blocking threads via
+  `Runtime::shutdown_background()` instead of dropping the runtime (which would
+  *join* those threads and hang the old daemon forever — defeating issue #36's
+  "old daemon completely shut-off"). Process exit reaps the detached threads.
+
+Across a version bump the handoff degrades safely: a `HANDOFF_PROTOCOL_VERSION`
+mismatch → `Decline` → snapshot restore; a `PROTOCOL_VERSION` mismatch is caught
+by the client on reconnect (it surfaces the documented "run `kmux daemon
+restart`" guidance); the on-disk checkpoint is versioned by `STATE_VERSION`.
+
+QA for the full upgrade surface — real workloads, the version-bump matrix,
+failure injection, and resource hygiene — is tracked in
+[`qa-daemon-upgrade.md`](qa-daemon-upgrade.md), backed by the automated
+cross-process tests in `crates/kmuxd/tests/handoff_e2e.rs`.
+
 ## Out of scope
 
 - **Listening sockets / the QUIC endpoint are not migrated.** Ephemeral ports and
