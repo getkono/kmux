@@ -57,7 +57,15 @@ struct ContentView: View {
                 TabStrip(model: model, ui: ui)
             }
             ZStack(alignment: .top) {
+                // Claim the full detail area so the hosted `NSView` is sized to the
+                // window on the first layout pass. Without this an `NSViewRepresentable`
+                // can be laid out at a stale/ideal size and only re-sized once a manual
+                // window resize forces a fresh layout — which left the remote PTY stuck
+                // at its initial 24×80 until you dragged the window (the size is read
+                // from the view's `bounds` by both the debounced term-size report and
+                // the per-frame pane-size push).
                 TerminalView(model: model)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity)
                 ConnectionBanner(model: model)
                 HudOverlay(model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
