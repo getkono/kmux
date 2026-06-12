@@ -246,12 +246,21 @@ fn main() -> anyhow::Result<()> {
     let server_cfg = config::ServerConfig::resolve(cfg_file)?;
 
     let rt = tokio::runtime::Runtime::new()?;
-    rt.block_on(
+    let result = rt.block_on(
         startup::async_main(cli.daemon, cli.handoff, server_cfg)
             .instrument(tracing::info_span!("instance", id = %instance_id)),
-    )?;
+    );
 
-    Ok(())
+    // A graceful-restart predecessor deliberately keeps its migrated PTY children
+    // alive (they belong to the successor now), so the per-child `waitpid` reaper
+    // threads (`spawn_blocking`, see kmux_pty::process::spawn_wait_task) never
+    // return. Dropping the runtime *joins* those blocking threads, which would hang
+    // the outgoing daemon forever instead of letting it "completely shut-off"
+    // (issue #36). Detach them: shut the runtime down in the background and let
+    // process exit reap the threads.
+    rt.shutdown_background();
+
+    result
 }
 
 /// Implementation of the `probe-or-start` subcommand.
