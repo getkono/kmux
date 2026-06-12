@@ -22,7 +22,7 @@ Subcommands:
   print-config     Dump resolved config and exit
 
 Server flags (all deprecated in favour of kmuxd.toml):
-  --bind / --port / --cert / --key / --self-signed / --daemon / --tcp-port
+  --bind / --port / --cert / --key / --daemon / --tcp-port
 ```
 
 Deprecated per-flag overrides are applied *after* loading the config file and
@@ -81,14 +81,15 @@ On first run with no config file found, a default template is written to
 `$XDG_CONFIG_HOME/kmuxd/kmuxd.toml`.
 
 `ServerConfig::resolve()` validates the result: at least one enabled listener;
-TLS material required when QUIC or TCP+TLS are enabled.
+a TLS `cert` requires a matching `key` (and vice versa). With neither set, the
+daemon generates an in-memory self-signed certificate (issue #100).
 
 ### Key Config Sections
 
 ```toml
 [tls]
-self_signed = true          # development; never written to disk
-cert = "/path/cert.pem"     # production
+# Omit cert/key for an auto-generated in-memory self-signed cert (the default).
+cert = "/path/cert.pem"     # custom certificate (optional)
 key  = "/path/key.pem"
 
 [[listen]]
@@ -115,10 +116,10 @@ Steps execute sequentially unless noted.
 ### 5.1 TLS Material
 
 ```
-if cfg.tls.self_signed:
-    CertMaterial::self_signed()   # rcgen EC key + cert, in-memory only
-else:
+if cfg.tls.cert and cfg.tls.key:
     CertMaterial::from_files(cert_path, key_path)
+else:
+    CertMaterial::self_signed()   # default: rcgen EC key + cert, in-memory only
 ```
 
 The same `CertMaterial` is cloned for each QUIC and TCP+TLS listener.

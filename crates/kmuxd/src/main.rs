@@ -63,20 +63,17 @@ struct Cli {
     #[arg(long)]
     port: Option<u16>,
 
-    /// Path to a PEM certificate file (required unless --self-signed).
+    /// Path to a PEM certificate file. Optional: when no cert/key pair is
+    /// configured the daemon generates an in-memory self-signed certificate.
     /// Prefer `[tls] cert = "..."` in kmuxd.toml for persistent configuration.
     #[arg(long)]
     cert: Option<String>,
 
-    /// Path to a PEM private key file (required unless --self-signed).
+    /// Path to a PEM private key file. Optional: when no cert/key pair is
+    /// configured the daemon generates an in-memory self-signed certificate.
     /// Prefer `[tls] key = "..."` in kmuxd.toml for persistent configuration.
     #[arg(long)]
     key: Option<String>,
-
-    /// Generate an in-memory self-signed certificate (for development).
-    /// Prefer `[tls] self_signed = true` in kmuxd.toml for persistent configuration.
-    #[arg(long)]
-    self_signed: bool,
 
     /// Run as a background daemon (double-fork, PID file, Unix socket control).
     /// Daemonization happens before the tokio runtime starts, so fork-safety is maintained.
@@ -209,9 +206,6 @@ fn main() -> anyhow::Result<()> {
     }
 
     // Apply deprecated CLI overrides (they win over the config file when present).
-    if cli.self_signed {
-        cfg_file.tls.self_signed = true;
-    }
     if let Some(cert) = cli.cert {
         cfg_file.tls.cert = Some(cert);
     }
@@ -406,7 +400,7 @@ fn build_ssh_endpoints(quic_port: u16, tcp_port: u16) -> Vec<serde_json::Value> 
         .collect()
 }
 
-/// Remove stale daemon artifacts and spawn `kmuxd --daemon --self-signed`.
+/// Remove stale daemon artifacts and spawn `kmuxd --daemon`.
 fn cleanup_and_start_daemon() -> anyhow::Result<()> {
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;

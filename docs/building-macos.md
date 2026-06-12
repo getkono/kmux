@@ -110,7 +110,7 @@ dev install, like `cargo install`), not a bundled dylib.
 
 ```sh
 # In one shell: start a local daemon (this build needs Zig for ghostty).
-cargo run -p kmuxd -- --self-signed     # or: kmux daemon start
+cargo run -p kmuxd     # self-signed cert by default; or: kmux daemon start
 
 # In another: launch the app — it connects to the local daemon over the UDS,
 # renders the active session, and forwards keystrokes.

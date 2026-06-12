@@ -106,12 +106,18 @@ fn default_runtime_dir() -> String {
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct TlsConfig {
-    /// Path to the PEM certificate file.
+    /// Path to the PEM certificate file. When no `cert`/`key` pair is set the
+    /// daemon generates an in-memory self-signed certificate (the default).
     pub cert: Option<String>,
-    /// Path to the PEM private key file.
+    /// Path to the PEM private key file. When no `cert`/`key` pair is set the
+    /// daemon generates an in-memory self-signed certificate (the default).
     pub key: Option<String>,
-    /// Generate an in-memory self-signed certificate (development only).
-    #[serde(default)]
+    /// Deprecated and ignored. Self-signed certificates are now the default
+    /// whenever no `cert`/`key` pair is configured (issue #100), so this knob
+    /// no longer changes any behaviour. It is still accepted — and skipped on
+    /// serialize — purely so config files that predate the change continue to
+    /// parse under `deny_unknown_fields`.
+    #[serde(default, skip_serializing)]
     pub self_signed: bool,
 }
 
@@ -167,10 +173,14 @@ fn default_auto() -> String {
 }
 
 fn default_listen() -> Vec<ListenConfig> {
+    // Use `default_bind()` (0.0.0.0) rather than a hardcoded "::": the latter
+    // formats to the unparseable `:::0` for the kernel-assigned (port 0)
+    // listeners and, per `default_bind`'s rationale, silently drops IPv4 on
+    // `bindv6only` hosts. Operators who want IPv6 can still set `bind = "::"`.
     vec![
         ListenConfig {
             kind: ListenKind::Quic,
-            bind: "::".to_string(),
+            bind: default_bind(),
             port: 0,
             enabled: true,
             path: "auto".to_string(),
@@ -179,7 +189,7 @@ fn default_listen() -> Vec<ListenConfig> {
         },
         ListenConfig {
             kind: ListenKind::TcpTls,
-            bind: "::".to_string(),
+            bind: default_bind(),
             port: 0,
             enabled: true,
             path: "auto".to_string(),
@@ -188,7 +198,7 @@ fn default_listen() -> Vec<ListenConfig> {
         },
         ListenConfig {
             kind: ListenKind::Unix,
-            bind: "::".to_string(),
+            bind: default_bind(),
             port: 0,
             enabled: true,
             path: "auto".to_string(),
@@ -277,14 +287,23 @@ impl ServerConfig {
             anyhow::bail!("no enabled listeners in configuration");
         }
 
-        // TLS is required when any QUIC or TCP+TLS listener is enabled.
-        let needs_tls = file
-            .listen
-            .iter()
-            .any(|l| l.enabled && matches!(l.kind, ListenKind::Quic | ListenKind::TcpTls));
-        if needs_tls && !file.tls.self_signed && file.tls.cert.is_none() {
-            anyhow::bail!(
-                "TLS cert+key or self_signed = true is required when QUIC or TCP+TLS listeners are enabled"
+        // A custom TLS certificate needs both halves. When neither is set the
+        // daemon falls back to an in-memory self-signed certificate — the
+        // default for this kind of software, so no flag or config knob is
+        // required (issue #100). Only a half-configured pair is an error.
+        match (file.tls.cert.is_some(), file.tls.key.is_some()) {
+            (true, false) => anyhow::bail!("[tls] cert is set but [tls] key is missing"),
+            (false, true) => anyhow::bail!("[tls] key is set but [tls] cert is missing"),
+            _ => {}
+        }
+
+        // The `self_signed` knob is gone (issue #100); a value lingering in an
+        // older config file is accepted but does nothing. Nudge the operator to
+        // drop it instead of silently ignoring it.
+        if file.tls.self_signed {
+            tracing::warn!(
+                "[tls] self_signed is deprecated and ignored: self-signed certificates are now \
+                 the default whenever no cert/key pair is configured; remove it from kmuxd.toml"
             );
         }
 
@@ -478,13 +497,11 @@ self_signed = true
     }
 
     #[test]
-    fn server_config_resolve_fails_without_tls_cert() {
+    fn server_config_resolve_ok_without_tls_cert() {
+        // No cert/key configured → self-signed is the default, so resolve must
+        // succeed even with QUIC/TCP+TLS listeners enabled (issue #100).
         let cfg = ConfigFile {
-            tls: TlsConfig {
-                cert: None,
-                key: None,
-                self_signed: false,
-            },
+            tls: TlsConfig::default(),
             listen: vec![ListenConfig {
                 kind: ListenKind::Quic,
                 bind: "::".into(),
@@ -496,11 +513,37 @@ self_signed = true
             }],
             ..ConfigFile::default()
         };
-        assert!(ServerConfig::resolve(cfg).is_err());
+        ServerConfig::resolve(cfg).unwrap();
     }
 
     #[test]
-    fn server_config_resolve_self_signed_ok() {
+    fn server_config_resolve_fails_with_half_set_cert_pair() {
+        // A cert without its key (or vice versa) is a misconfiguration.
+        let cert_only = ConfigFile {
+            tls: TlsConfig {
+                cert: Some("/etc/kmuxd/cert.pem".into()),
+                key: None,
+                ..TlsConfig::default()
+            },
+            ..ConfigFile::default()
+        };
+        assert!(ServerConfig::resolve(cert_only).is_err());
+
+        let key_only = ConfigFile {
+            tls: TlsConfig {
+                cert: None,
+                key: Some("/etc/kmuxd/key.pem".into()),
+                ..TlsConfig::default()
+            },
+            ..ConfigFile::default()
+        };
+        assert!(ServerConfig::resolve(key_only).is_err());
+    }
+
+    #[test]
+    fn server_config_resolve_accepts_deprecated_self_signed() {
+        // The deprecated `self_signed` knob is ignored but must still resolve
+        // cleanly so legacy config files keep working (issue #100).
         let cfg = ConfigFile {
             tls: TlsConfig {
                 self_signed: true,
@@ -564,6 +607,20 @@ port = 8443
         assert!(
             !content.contains("port"),
             "default config must not contain a port field"
+        );
+    }
+
+    #[test]
+    fn written_default_config_has_no_self_signed_field() {
+        // `self_signed` is deprecated and `skip_serializing`, so freshly written
+        // configs must not mention it (issue #100).
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("kmuxd.toml");
+        write_default_config(&path).unwrap();
+        let content = std::fs::read_to_string(&path).unwrap();
+        assert!(
+            !content.contains("self_signed"),
+            "default config must not contain a self_signed field"
         );
     }
 }

@@ -93,12 +93,14 @@ configuration.
 
 ## Quick start
 
-Start the server with a self-signed certificate:
+Start the server:
 
 ```bash
-$ cargo run -p kmuxd -- --self-signed
+$ cargo run -p kmuxd
 ```
 
+With no certificate configured, the server generates an in-memory self-signed
+certificate — the default for this kind of software, so no flag is needed.
 The server prints a shared auth token on startup. Connect with `kmux` (the
 entrypoint opens the platform desktop app), or run a frontend directly:
 
@@ -135,11 +137,8 @@ effective defaults:
 $ cargo run -p kmuxd -- print-config
 ```
 
-For development with a self-signed certificate, the legacy flag still works:
-
-```bash
-$ cargo run -p kmuxd -- --self-signed
-```
+To serve a custom certificate, set `[tls] cert` and `[tls] key` in `kmuxd.toml`
+(or pass `--cert`/`--key`); otherwise a self-signed certificate is generated.
 
 ## Development
 
