@@ -137,24 +137,20 @@ tail-daemon-log:
 
 # Binary resolution: the toolkit-free `kmux` client at target/debug/kmux picks up
 # its sibling kmuxd at target/debug/kmuxd, spawning it with the same argv as any
-# auto-spawn. `kmux daemon …` never loads a UI toolkit.
-# Rebuild kmux + kmuxd (debug) and restart the daemon via `kmux daemon restart`.
-restart-daemon:
+# auto-spawn. `kmux daemon …` never loads a UI toolkit. Forwarded args go straight
+# to the subcommand (which uses the same primitive as auto-spawn):
+#   just daemon start            # start the local daemon
+#   just daemon stop             # stop it
+#   just daemon restart          # rebuild + restart
+#   just daemon status           # query status
+# Rebuild kmux + kmuxd (debug) and run `kmux daemon <args>`.
+daemon *args:
     cargo build -p kmux -p kmuxd
-    cargo run -p kmux -- daemon restart
-
-# Start the local daemon (debug build) via the same primitive as auto-spawn.
-start-daemon:
-    cargo build -p kmux -p kmuxd
-    cargo run -p kmux -- daemon start
-
-# Stop the local daemon (debug build).
-stop-daemon:
-    cargo run -p kmux -- daemon stop
+    cargo run -p kmux -- daemon "$@"
 
 # Upgrade a running daemon in place: build + install a fresh release kmuxd, then
 # live-restart it so existing sessions (shells, editors, REPLs) survive (issue #36).
-# Unlike `restart-daemon` (which only rebuilds + restarts a dev daemon), this swaps
+# Unlike `just daemon restart` (which only rebuilds + restarts a dev daemon), this swaps
 # the installed system binary, so it is the path to ship a new daemon to a live
 # session. See docs/daemon-handoff.md §"Upgrading a running daemon".
 upgrade-daemon:
