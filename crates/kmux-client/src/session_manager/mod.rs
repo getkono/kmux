@@ -1238,6 +1238,86 @@ mod tests {
     }
 
     #[test]
+    fn set_pane_sizes_resizes_synced_pane_on_change_only() {
+        // The per-frame layout push (the frontends' `setPaneSizes` / GTK
+        // `tiles::push_sizes`) carries the real window size to the daemon after
+        // the initial Attach went out at the default 24×80: it must Resize a
+        // synced pane the first time its tile size is known and on every change,
+        // but never re-send an unchanged size (no PTY thrash).
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.buffers
+            .insert("eagle/0".to_string(), CellGrid::default());
+        mgr.pane_sync
+            .insert("eagle/0".to_string(), PaneSync::AwaitingSync);
+
+        let size = TermSize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        mgr.set_pane_sizes(vec![("eagle/0".to_string(), size)]);
+        match rx.try_recv().expect("Resize sent for the synced pane") {
+            ClientMessage::Resize { pane_id, size: s } => {
+                assert_eq!(pane_id, "eagle/0");
+                assert_eq!(s, size);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Same size again: no spurious Resize.
+        mgr.set_pane_sizes(vec![("eagle/0".to_string(), size)]);
+        assert!(rx.try_recv().is_err(), "unchanged size must not re-send");
+
+        // A new size: another Resize.
+        let bigger = TermSize {
+            rows: 50,
+            cols: 160,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        mgr.set_pane_sizes(vec![("eagle/0".to_string(), bigger)]);
+        match rx.try_recv().expect("Resize sent on size change") {
+            ClientMessage::Resize { size: s, .. } => assert_eq!(s, bigger),
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn set_pane_sizes_gated_on_attach_but_cached_for_it() {
+        // A pane the frontend has laid out but not yet attached must not get a
+        // Resize (the daemon has no relay for it yet), but the resolved size is
+        // still cached so the subsequent Attach carries it — so the real tile
+        // size reaches the daemon regardless of the push/attach ordering.
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.buffers
+            .insert("eagle/0".to_string(), CellGrid::default());
+
+        let size = TermSize {
+            rows: 40,
+            cols: 120,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        mgr.set_pane_sizes(vec![("eagle/0".to_string(), size)]);
+        assert!(
+            rx.try_recv().is_err(),
+            "no Resize before the pane is attached"
+        );
+
+        mgr.attach_fresh("eagle/0".to_string());
+        match rx.try_recv().expect("Attach sent") {
+            ClientMessage::Attach {
+                pane_id, size: s, ..
+            } => {
+                assert_eq!(pane_id, "eagle/0");
+                assert_eq!(s, size, "Attach must carry the cached tile size");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+    }
+
+    #[test]
     fn terminal_update_with_history_gap_issues_fetch_history() {
         // A TerminalUpdate that reports a non-zero `history_total` above what
         // the client has should trigger a single `FetchHistory`. A second
