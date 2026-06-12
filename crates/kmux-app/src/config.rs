@@ -6,6 +6,7 @@
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
+use crate::appearance::{self, Appearance, CellAdjust, FontFeature};
 use crate::theme::{self, Theme};
 
 /// Top-level kmux configuration file (`~/.config/kmux/config.toml`).
@@ -17,9 +18,45 @@ pub struct KmuxConfig {
     /// located in `~/.config/kmux/themes/`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub theme: Option<String>,
-    /// GUI font as a Pango font-description string (e.g. `"JetBrains Mono 12"`).
+    /// Legacy GUI font as a Pango font-description string (e.g.
+    /// `"JetBrains Mono 12"`). Deprecated in favor of the structured
+    /// `font_family`/`font_size` keys below, but still honored: it seeds the
+    /// resolved [`Appearance`]'s family + size when the structured keys are
+    /// absent. The structured keys win per-field when both are set.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub font: Option<String>,
+    /// Primary (regular) font family, e.g. `"JetBrains Mono"`.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "font-family")]
+    pub font_family: Option<String>,
+    /// Explicit family for bold text (synthesized from `font_family` if unset).
+    #[serde(skip_serializing_if = "Option::is_none", alias = "font-family-bold")]
+    pub font_family_bold: Option<String>,
+    /// Explicit family for italic text (synthesized from `font_family` if unset).
+    #[serde(skip_serializing_if = "Option::is_none", alias = "font-family-italic")]
+    pub font_family_italic: Option<String>,
+    /// Explicit family for bold-italic text (synthesized if unset).
+    #[serde(
+        skip_serializing_if = "Option::is_none",
+        alias = "font-family-bold-italic"
+    )]
+    pub font_family_bold_italic: Option<String>,
+    /// Font size in points.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "font-size")]
+    pub font_size: Option<f32>,
+    /// Optional named style/face for the regular font (e.g. `"Medium"`).
+    #[serde(skip_serializing_if = "Option::is_none", alias = "font-style")]
+    pub font_style: Option<String>,
+    /// OpenType feature settings, e.g. `["ss01", "-liga", "cv01=2"]`. See
+    /// [`FontFeature`] for the accepted token forms.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "font-feature")]
+    pub font_feature: Option<Vec<String>>,
+    /// Horizontal cell-size adjustment: a bare number adds pixels, a trailing
+    /// `%` scales (e.g. `"2"` or `"10%"`).
+    #[serde(skip_serializing_if = "Option::is_none", alias = "adjust-cell-width")]
+    pub adjust_cell_width: Option<String>,
+    /// Vertical cell-size adjustment (same form as `adjust_cell_width`).
+    #[serde(skip_serializing_if = "Option::is_none", alias = "adjust-cell-height")]
+    pub adjust_cell_height: Option<String>,
     /// Whether the inner-pane cursor blinks. `None` (the default) means blink;
     /// set `false` to keep the cursor steady regardless of what the program
     /// requests (DECSCUSR `blinking_*` / DEC mode 12).
@@ -92,6 +129,70 @@ pub fn resolve_font(cli_font: Option<&str>) -> String {
         return font.to_string();
     }
     DEFAULT_FONT.to_string()
+}
+
+/// Resolve the active terminal [`Appearance`] (font family/size/style, OpenType
+/// features, cell adjustments).
+///
+/// Each field follows the project's standard precedence:
+/// 1. the structured key in `~/.config/kmux/config.toml`
+///    (`font-family`, `font-size`, `font-feature`, `adjust-cell-*`, …);
+/// 2. otherwise, for family + size, the legacy `font` Pango string (resolved via
+///    [`resolve_font`], so `--font` and the config `font` key still apply);
+/// 3. otherwise the [`appearance`] defaults.
+///
+/// `cli_font` is the `--font` flag, forwarded to [`resolve_font`] for the legacy
+/// fallback (there are no per-field appearance CLI flags).
+pub fn resolve_appearance(cli_font: Option<&str>) -> Appearance {
+    // Legacy font string (CLI `--font` > config `font` > DEFAULT_FONT) seeds the
+    // family/size when the structured keys are absent.
+    let legacy = resolve_font(cli_font);
+    let (legacy_family, legacy_size) = appearance::parse_legacy_font(&legacy);
+
+    let cfg = load_config_file().unwrap_or_default();
+
+    let trimmed = |o: Option<String>| o.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
+
+    let family = trimmed(cfg.font_family)
+        .or(legacy_family)
+        .unwrap_or_else(|| appearance::DEFAULT_FAMILY.to_string());
+    let size_pt = cfg
+        .font_size
+        .filter(|s| *s > 0.0)
+        .or(legacy_size)
+        .unwrap_or(appearance::DEFAULT_SIZE_PT);
+
+    let features = cfg
+        .font_feature
+        .map(|tokens| {
+            tokens
+                .iter()
+                .filter_map(|t| FontFeature::parse(t))
+                .collect()
+        })
+        .unwrap_or_default();
+    let cell_width_adjust = cfg
+        .adjust_cell_width
+        .as_deref()
+        .and_then(CellAdjust::parse)
+        .unwrap_or_default();
+    let cell_height_adjust = cfg
+        .adjust_cell_height
+        .as_deref()
+        .and_then(CellAdjust::parse)
+        .unwrap_or_default();
+
+    Appearance {
+        family,
+        family_bold: trimmed(cfg.font_family_bold),
+        family_italic: trimmed(cfg.font_family_italic),
+        family_bold_italic: trimmed(cfg.font_family_bold_italic),
+        size_pt,
+        style: trimmed(cfg.font_style),
+        features,
+        cell_width_adjust,
+        cell_height_adjust,
+    }
 }
 
 /// Resolve whether the inner-pane cursor blinks.
@@ -345,7 +446,12 @@ status_bg = "#111111"
         let cfg = KmuxConfig {
             theme: Some("dracula".into()),
             font: Some("Fira Code 13".into()),
+            font_family: Some("JetBrains Mono".into()),
+            font_size: Some(14.0),
+            font_feature: Some(vec!["ss01".into(), "-liga".into()]),
+            adjust_cell_height: Some("10%".into()),
             cursor_blink: Some(false),
+            ..KmuxConfig::default()
         };
         let saved = save(&cfg);
         let loaded = load();
@@ -353,6 +459,91 @@ status_bg = "#111111"
         saved.unwrap();
         assert_eq!(loaded.theme.as_deref(), Some("dracula"));
         assert_eq!(loaded.font.as_deref(), Some("Fira Code 13"));
+        assert_eq!(loaded.font_family.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(loaded.font_size, Some(14.0));
+        assert_eq!(
+            loaded.font_feature.as_deref(),
+            Some(["ss01".to_string(), "-liga".to_string()].as_slice())
+        );
+        assert_eq!(loaded.adjust_cell_height.as_deref(), Some("10%"));
         assert_eq!(loaded.cursor_blink, Some(false));
+    }
+
+    #[test]
+    fn config_parses_structured_font_keys() {
+        let cfg: KmuxConfig = toml::from_str(
+            r#"
+font-family = "JetBrains Mono"
+font-size = 13.5
+font-feature = ["ss01", "-liga"]
+adjust-cell-width = "5"
+adjust-cell-height = "10%"
+"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.font_family.as_deref(), Some("JetBrains Mono"));
+        assert_eq!(cfg.font_size, Some(13.5));
+        assert_eq!(
+            cfg.font_feature.as_deref(),
+            Some(["ss01".to_string(), "-liga".to_string()].as_slice())
+        );
+        assert_eq!(cfg.adjust_cell_width.as_deref(), Some("5"));
+        assert_eq!(cfg.adjust_cell_height.as_deref(), Some("10%"));
+    }
+
+    #[test]
+    fn config_accepts_snake_case_font_keys() {
+        // snake_case is the canonical kmux form (matching `cursor_blink`); the
+        // kebab-case aliases above are for Ghostty-config compatibility.
+        let cfg: KmuxConfig =
+            toml::from_str("font_family = \"Fira Code\"\nfont_size = 12\n").unwrap();
+        assert_eq!(cfg.font_family.as_deref(), Some("Fira Code"));
+        assert_eq!(cfg.font_size, Some(12.0));
+    }
+
+    #[test]
+    fn appearance_defaults_when_nothing_set() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        let a = resolve_appearance(None);
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert_eq!(a.family, appearance::DEFAULT_FAMILY);
+        assert_eq!(a.size_pt, appearance::DEFAULT_SIZE_PT);
+        assert!(a.features.is_empty());
+        assert_eq!(a.cell_width_adjust, CellAdjust::default());
+    }
+
+    #[test]
+    fn appearance_seeds_family_size_from_legacy_font() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let kmux_dir = tmp.path().join("kmux");
+        std::fs::create_dir_all(&kmux_dir).unwrap();
+        std::fs::write(kmux_dir.join("config.toml"), "font = \"Fira Code 13\"\n").unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        let a = resolve_appearance(None);
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert_eq!(a.family, "Fira Code");
+        assert_eq!(a.size_pt, 13.0);
+    }
+
+    #[test]
+    fn appearance_structured_keys_win_over_legacy_font() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let kmux_dir = tmp.path().join("kmux");
+        std::fs::create_dir_all(&kmux_dir).unwrap();
+        std::fs::write(
+            kmux_dir.join("config.toml"),
+            "font = \"Fira Code 13\"\nfont-family = \"JetBrains Mono\"\nfont-size = 16\nfont-feature = [\"ss01\"]\n",
+        )
+        .unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        let a = resolve_appearance(None);
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert_eq!(a.family, "JetBrains Mono");
+        assert_eq!(a.size_pt, 16.0);
+        assert_eq!(a.feature_string().as_deref(), Some("ss01=1"));
     }
 }

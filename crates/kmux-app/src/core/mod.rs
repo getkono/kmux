@@ -18,6 +18,7 @@ use kmux_client::ssh::RemoteTarget;
 use kmux_protocol::messages::{ClientCapabilities, ServerMessage, TermSize};
 use tokio::sync::{mpsc, oneshot};
 
+use crate::appearance::Appearance;
 use crate::mode::Mode;
 use crate::recent_servers::{RecentServersCache, ServerKind};
 use crate::theme::Theme;
@@ -79,6 +80,12 @@ pub struct AppCore {
     /// type at the render boundary. Named `palette` (not `theme`) so it does
     /// not shadow a frontend's own rendered-theme field through a deref.
     pub palette: Theme,
+
+    /// Active terminal appearance (font family/size/style, OpenType features,
+    /// cell adjustments). Toolkit-neutral, like [`palette`](Self::palette): each
+    /// frontend converts it to its own font/metrics types at the render leaf.
+    /// Resolved from `config.toml` at construction.
+    pub appearance: Appearance,
 
     /// Whether the inner-pane cursor blinks. When `false`, a cursor that
     /// requested blinking (DECSCUSR `blinking_*` / DEC mode 12) is drawn steady.
@@ -172,6 +179,7 @@ impl AppCore {
         auto_cwd: Option<String>,
         capabilities: ClientCapabilities,
         theme: Theme,
+        appearance: Appearance,
         cursor_blink: bool,
         term_size: TermSize,
     ) -> Self {
@@ -217,6 +225,7 @@ impl AppCore {
         Self {
             mgr,
             palette: theme,
+            appearance,
             cursor_blink_enabled: cursor_blink,
             mode: Mode::Normal,
             term_size,
@@ -266,6 +275,7 @@ impl AppCore {
         Self {
             mgr,
             palette: crate::theme::default_theme(),
+            appearance: Appearance::default(),
             cursor_blink_enabled: true,
             mode: Mode::Normal,
             term_size: TermSize {

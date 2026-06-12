@@ -31,7 +31,9 @@ pub struct Cli {
 
     /// GUI font as a Pango font-description string (e.g. "JetBrains Mono 12").
     /// Falls back to the `font` key in ~/.config/kmux/config.toml, then
-    /// "monospace 11".
+    /// "monospace 11". Deprecated in favor of the structured `font-family` /
+    /// `font-size` config keys (see docs/appearance.md); still honored as the
+    /// family/size fallback when those are unset.
     #[arg(long, global = true)]
     pub font: Option<String>,
 

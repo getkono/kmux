@@ -40,7 +40,7 @@ final class TerminalNSView: NSView {
 
     init(model: KmuxModel) {
         self.model = model
-        self.metrics = TerminalMetrics(font: TerminalMetrics.defaultFont())
+        self.metrics = TerminalMetrics(appearance: model.appearance)
         super.init(frame: .zero)
         wantsLayer = true
     }
@@ -181,13 +181,14 @@ final class TerminalNSView: NSView {
         _ ch: Character, cell: PackedCell, row: Int, col: Int, theme: FfiTheme,
         metrics m: TerminalMetrics
     ) {
-        var font = m.font
-        if cell.bold || cell.italic {
-            var traits: NSFontDescriptor.SymbolicTraits = []
-            if cell.bold { traits.insert(.bold) }
-            if cell.italic { traits.insert(.italic) }
-            let desc = m.font.fontDescriptor.withSymbolicTraits(traits)
-            if let f = NSFont(descriptor: desc, size: m.font.pointSize) { font = f }
+        // Pick the matching face (explicit variant family, else synthetic style),
+        // each already carrying the configured OpenType features.
+        let font: NSFont
+        switch (cell.bold, cell.italic) {
+        case (true, true): font = m.fontBoldItalic
+        case (true, false): font = m.fontBold
+        case (false, true): font = m.fontItalic
+        case (false, false): font = m.font
         }
         var color = nsRGB(cell.fg)
         if cell.dim { color = color.withAlphaComponent(0.55) }

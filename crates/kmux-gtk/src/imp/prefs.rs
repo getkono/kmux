@@ -79,15 +79,19 @@ fn font_row(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea) -> adw::EntryRow 
     let drawing = drawing.clone();
     row.connect_apply(move |row| {
         let spec = row.text().to_string();
-        {
-            let mut f = fe.borrow_mut();
-            let font = render::font_from_str(&spec);
-            f.metrics = render::Metrics::measure(&drawing.pango_context(), font);
-            f.core.needs_render = true;
-        }
+        // Persist the legacy font string first, then re-resolve the full
+        // appearance so any structured `font-*` / `adjust-cell-*` keys in
+        // config.toml still apply on top of the edited family + size.
         let mut cfg = config::load();
         cfg.font = Some(spec);
         let _ = config::save(&cfg);
+        let appearance = config::resolve_appearance(None);
+        {
+            let mut f = fe.borrow_mut();
+            f.metrics = render::Metrics::measure(&drawing.pango_context(), &appearance);
+            f.core.appearance = appearance;
+            f.core.needs_render = true;
+        }
         // Re-evaluate cols/rows at the new cell size, then repaint.
         drawing.queue_resize();
         drawing.queue_draw();

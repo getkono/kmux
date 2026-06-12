@@ -139,6 +139,7 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         plan.auto_cwd.clone(),
         capabilities,
         plan.theme.clone(),
+        plan.appearance.clone(),
         plan.cursor_blink,
         term_size,
     );
@@ -156,10 +157,10 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     // than the sidebar list.
     drawing.set_focusable(true);
 
-    // Derive cell geometry from the configured font (the widget's PangoContext
-    // carries the display font map + scale). Recomputed on scale-factor change.
-    let font = render::font_from_str(&plan.font);
-    let metrics = render::Metrics::measure(&drawing.pango_context(), font);
+    // Derive cell geometry + per-style fonts from the configured appearance (the
+    // widget's PangoContext carries the display font map + scale). Recomputed on
+    // scale-factor change.
+    let metrics = render::Metrics::measure(&drawing.pango_context(), &plan.appearance);
 
     // Theme the chrome + overlays from the active palette, and match the
     // libadwaita window styling (light/dark) to the theme. Both are refreshed
@@ -214,8 +215,8 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         drawing.connect_scale_factor_notify(move |area| {
             {
                 let mut fe = fe.borrow_mut();
-                let font = fe.metrics.font.clone();
-                fe.metrics = render::Metrics::measure(&area.pango_context(), font);
+                let appearance = fe.core.appearance.clone();
+                fe.metrics = render::Metrics::measure(&area.pango_context(), &appearance);
             }
             area.queue_resize();
             area.queue_draw();

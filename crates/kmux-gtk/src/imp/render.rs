@@ -8,7 +8,9 @@
 
 use gtk4::cairo;
 use gtk4::pango;
+use gtk4::pango::IsAttribute;
 
+use kmux_app::appearance::Appearance;
 use kmux_app::core::AppCore;
 use kmux_app::layout::{LayoutConfig, resolve_layout};
 use kmux_app::theme::Theme as Palette;
@@ -19,25 +21,36 @@ use kmux_protocol::messages::{CellAttrs, CellState, CursorShape};
 /// client uses when computing per-pane sizes (`tiles::push_sizes`).
 pub const GUTTER: u16 = 1;
 
-/// Cell geometry derived from the configured font. Recomputed when the font or
-/// the display scale factor changes.
+/// Cell geometry + fonts derived from the configured [`Appearance`]. Recomputed
+/// when the appearance or the display scale factor changes.
 pub struct Metrics {
-    /// Cell advance width in (logical) pixels.
+    /// Cell advance width in (logical) pixels (after `adjust-cell-width`).
     pub cell_w: f64,
-    /// Cell height (ascent + descent) in (logical) pixels.
+    /// Cell height (ascent + descent) in (logical) pixels (after `adjust-cell-height`).
     pub cell_h: f64,
-    /// The font the metrics were measured for; reused to render glyphs.
+    /// The regular font, reused to render glyphs and shown in the prefs entry.
     pub font: pango::FontDescription,
+    /// Bold face: an explicit `font-family-bold`, else synthetic bold of `font`.
+    font_bold: pango::FontDescription,
+    /// Italic face: an explicit `font-family-italic`, else synthetic italic.
+    font_italic: pango::FontDescription,
+    /// Bold-italic face: an explicit family, else synthetic bold+italic.
+    font_bold_italic: pango::FontDescription,
+    /// OpenType feature attributes applied to every glyph, or `None` when no
+    /// `font-feature`s are configured.
+    features: Option<pango::AttrList>,
 }
 
 impl Metrics {
-    /// Measure cell size for `font` using `ctx` — a widget's `PangoContext`,
-    /// which carries the display font map, resolution, and scale factor, so the
-    /// result is in the same (logical) pixel space the `DrawingArea` draws in.
-    pub fn measure(ctx: &pango::Context, font: pango::FontDescription) -> Self {
+    /// Measure cell size + build the per-style fonts for `appearance` using
+    /// `ctx` — a widget's `PangoContext`, which carries the display font map,
+    /// resolution, and scale factor, so the result is in the same (logical)
+    /// pixel space the `DrawingArea` draws in.
+    pub fn measure(ctx: &pango::Context, appearance: &Appearance) -> Self {
+        let font = font_desc_from_appearance(appearance);
         let fm = ctx.metrics(Some(&font), None);
         let line_h = (fm.ascent() + fm.descent()) as f64 / pango::SCALE as f64;
-        let cell_h = line_h.ceil().max(1.0);
+        let cell_h = appearance.cell_height_adjust.apply(line_h).ceil().max(1.0);
 
         // Measure a representative advance for the (monospace) face; ceil so
         // cells tile without sub-pixel seams.
@@ -45,12 +58,29 @@ impl Metrics {
         layout.set_font_description(Some(&font));
         layout.set_text("M");
         let char_w = layout.size().0 as f64 / pango::SCALE as f64;
-        let cell_w = char_w.ceil().max(1.0);
+        let cell_w = appearance.cell_width_adjust.apply(char_w).ceil().max(1.0);
+
+        // OpenType feature attributes (per-glyph; cross-cell ligatures don't
+        // apply to a cell-by-cell renderer — see `kmux_app::appearance`).
+        let features = appearance.feature_string().map(|s| {
+            let list = pango::AttrList::new();
+            list.insert(pango::AttrFontFeatures::new(&s).upcast());
+            list
+        });
 
         Self {
             cell_w,
             cell_h,
+            font_bold: variant_desc(appearance, appearance.family_bold.as_deref(), true, false),
+            font_italic: variant_desc(appearance, appearance.family_italic.as_deref(), false, true),
+            font_bold_italic: variant_desc(
+                appearance,
+                appearance.family_bold_italic.as_deref(),
+                true,
+                true,
+            ),
             font,
+            features,
         }
     }
 
@@ -194,6 +224,9 @@ fn paint_grid(
     let _ = cr.paint();
 
     let layout = pango::Layout::new(ctx);
+    // OpenType features apply to every glyph drawn with this layout (the
+    // attribute spans the whole text, which we reset per cell).
+    layout.set_attributes(metrics.features.as_ref());
     let cells = grid.cells();
     let cols = grid.cols;
     let rows = grid.rows;
@@ -337,18 +370,17 @@ fn draw_cell_glyph(
         alpha,
     );
 
-    if attrs.contains(CellAttrs::BOLD) || attrs.contains(CellAttrs::ITALIC) {
-        let mut font = m.font.clone();
-        if attrs.contains(CellAttrs::BOLD) {
-            font.set_weight(pango::Weight::Bold);
-        }
-        if attrs.contains(CellAttrs::ITALIC) {
-            font.set_style(pango::Style::Italic);
-        }
-        layout.set_font_description(Some(&font));
-    } else {
-        layout.set_font_description(Some(&m.font));
-    }
+    // Pick the matching face (explicit variant family, else synthetic style).
+    let desc = match (
+        attrs.contains(CellAttrs::BOLD),
+        attrs.contains(CellAttrs::ITALIC),
+    ) {
+        (true, true) => &m.font_bold_italic,
+        (true, false) => &m.font_bold,
+        (false, true) => &m.font_italic,
+        (false, false) => &m.font,
+    };
+    layout.set_font_description(Some(desc));
 
     let mut buf = [0u8; 4];
     layout.set_text(cs.c.encode_utf8(&mut buf));
@@ -483,23 +515,50 @@ fn placeholder(
     pangocairo::functions::show_layout(cr, &layout);
 }
 
-/// Parse a Pango font-description string (e.g. `"monospace 11"`), falling back
-/// to a monospace default if it is empty/unparseable so we never render with a
-/// proportional fallback that breaks the grid.
-pub fn font_from_str(s: &str) -> pango::FontDescription {
-    let desc = pango::FontDescription::from_string(s);
-    if desc.family().is_none() {
-        desc_with_monospace(desc)
-    } else {
-        desc
+/// Build the regular [`pango::FontDescription`] for an [`Appearance`] — family
+/// (+ optional named style) and size, via Pango's font-description grammar.
+pub fn font_desc_from_appearance(a: &Appearance) -> pango::FontDescription {
+    let spec = match a.style.as_deref() {
+        Some(style) if !style.is_empty() => format!("{} {} {}", a.family, style, a.size_pt),
+        _ => format!("{} {}", a.family, a.size_pt),
+    };
+    ensure_monospace(pango::FontDescription::from_string(&spec), a.size_pt)
+}
+
+/// Build the bold/italic/bold-italic face: an explicit variant `family` when
+/// configured, otherwise the base face with synthetic weight/style applied.
+fn variant_desc(
+    a: &Appearance,
+    family: Option<&str>,
+    bold: bool,
+    italic: bool,
+) -> pango::FontDescription {
+    match family {
+        Some(fam) if !fam.is_empty() => ensure_monospace(
+            pango::FontDescription::from_string(&format!("{fam} {}", a.size_pt)),
+            a.size_pt,
+        ),
+        _ => {
+            let mut desc = font_desc_from_appearance(a);
+            if bold {
+                desc.set_weight(pango::Weight::Bold);
+            }
+            if italic {
+                desc.set_style(pango::Style::Italic);
+            }
+            desc
+        }
     }
 }
 
-/// Ensure a font description has a family, defaulting to `monospace`.
-fn desc_with_monospace(mut desc: pango::FontDescription) -> pango::FontDescription {
-    desc.set_family("monospace");
+/// Ensure a font description has a family + size, defaulting to `monospace` at
+/// `size_pt` so we never render with a proportional fallback that breaks the grid.
+fn ensure_monospace(mut desc: pango::FontDescription, size_pt: f32) -> pango::FontDescription {
+    if desc.family().is_none() {
+        desc.set_family("monospace");
+    }
     if desc.size() == 0 {
-        desc.set_size(11 * pango::SCALE);
+        desc.set_size((size_pt * pango::SCALE as f32) as i32);
     }
     desc
 }
