@@ -10,6 +10,7 @@ mod conversions;
 mod daemon;
 mod diff_engine;
 mod handoff;
+mod impair;
 mod persist;
 mod relay;
 mod scrollback;
@@ -17,6 +18,7 @@ mod startup;
 mod tcp_listener;
 mod term_state;
 mod tls;
+mod trace;
 mod wordlist;
 
 use clap::Parser;

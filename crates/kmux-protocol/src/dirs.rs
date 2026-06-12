@@ -217,6 +217,24 @@ pub fn metrics_log_path() -> anyhow::Result<PathBuf> {
     Ok(state_dir()?.join("metrics.jsonl"))
 }
 
+/// Path to the daemon's frame-trace JSONL (issue #72 diagnostics).
+///
+/// Written by `kmuxd` when `KMUX_FRAME_TRACE` is set — one
+/// [`crate::trace::DaemonDiffRecord`] per emitted diff. Consumed by the
+/// `kmux debug tearing` analyzer.
+pub fn daemon_trace_path() -> anyhow::Result<PathBuf> {
+    Ok(state_dir()?.join("frame_trace_daemon.jsonl"))
+}
+
+/// Path to the client's frame-trace JSONL (issue #72 diagnostics).
+///
+/// Written by the `kmux` client when `KMUX_FRAME_TRACE` is set — one
+/// [`crate::trace::ClientTickRecord`] per pump tick. Consumed by the
+/// `kmux debug tearing` analyzer.
+pub fn client_trace_path() -> anyhow::Result<PathBuf> {
+    Ok(state_dir()?.join("frame_trace_client.jsonl"))
+}
+
 /// Returns the directory where session state is persisted, creating it if necessary.
 ///
 /// Lives under the state directory: `$XDG_STATE_HOME/kmux/sessions/`.

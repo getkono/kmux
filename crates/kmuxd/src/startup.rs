@@ -20,6 +20,11 @@ use crate::tls;
 pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyhow::Result<()> {
     info!(backend = term_state::backend_name(), "terminal backend");
 
+    // Diagnostics (issue #72): log whether network impairment / frame tracing
+    // are active so the operator sees the knobs at startup.
+    crate::impair::init_and_log();
+    crate::trace::init_and_log();
+
     // A handoff successor daemonized without taking the pid file (the
     // predecessor holds its lock). Capture the predecessor's pid now — while its
     // pid file still exists — so we can write our own once it has exited.

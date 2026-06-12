@@ -104,6 +104,31 @@ pub enum Command {
         #[arg(long, default_value = "table")]
         format: OutputFormat,
     },
+
+    /// Internal diagnostics (hidden). See `kmux debug tearing` (issue #72).
+    #[command(hide = true)]
+    Debug {
+        #[command(subcommand)]
+        action: DebugAction,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum DebugAction {
+    /// Analyze daemon + client frame traces (captured with `KMUX_FRAME_TRACE=1`)
+    /// and report logical frames that were painted partially (tearing).
+    Tearing {
+        /// Daemon trace JSONL. Defaults to `<state_dir>/frame_trace_daemon.jsonl`.
+        #[arg(long)]
+        daemon_trace: Option<std::path::PathBuf>,
+        /// Client trace JSONL. Defaults to `<state_dir>/frame_trace_client.jsonl`.
+        #[arg(long)]
+        client_trace: Option<std::path::PathBuf>,
+        /// Logical-frame coalescing window in milliseconds: daemon diffs whose
+        /// send-time gaps are below this are treated as one logical frame.
+        #[arg(long, default_value_t = 16)]
+        window_ms: u64,
+    },
 }
 
 #[derive(Subcommand, Debug)]

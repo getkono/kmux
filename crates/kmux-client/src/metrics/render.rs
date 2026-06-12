@@ -154,6 +154,17 @@ impl RenderMetrics {
         self.event_log.push(event);
     }
 
+    /// Record a detected tear: a partial logical frame was painted (issue #72).
+    pub fn record_tear(&mut self, session: &str, prev_sent_at_ms: u64, next_sent_at_ms: u64) {
+        let event = DiagEvent::Tear {
+            session: session.to_owned(),
+            prev_sent_at_ms,
+            next_sent_at_ms,
+        };
+        self.counters.increment(&event);
+        self.event_log.push(event);
+    }
+
     pub fn snapshot(&self, snapshot_mode: bool) -> MetricsSnapshot {
         MetricsSnapshot {
             net_apply_avg_ms: self.network_apply_latency.avg(),

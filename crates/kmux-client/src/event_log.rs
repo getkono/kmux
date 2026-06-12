@@ -23,6 +23,14 @@ pub enum DiagEvent {
         session: String,
         reason: String,
     },
+    /// A partial logical frame was painted: this tick applied a cell diff whose
+    /// daemon `sent_at_ms` was within the coalescing window of the diff painted
+    /// last tick, so the previous paint showed an incomplete frame (issue #72).
+    Tear {
+        session: String,
+        prev_sent_at_ms: u64,
+        next_sent_at_ms: u64,
+    },
 }
 
 impl fmt::Display for DiagEvent {
@@ -44,6 +52,16 @@ impl fmt::Display for DiagEvent {
             DiagEvent::Resync { session, reason } => {
                 write!(f, "Resync '{session}': {reason}")
             }
+            DiagEvent::Tear {
+                session,
+                prev_sent_at_ms,
+                next_sent_at_ms,
+            } => {
+                write!(
+                    f,
+                    "Tear on '{session}': {prev_sent_at_ms}\u{2192}{next_sent_at_ms}ms"
+                )
+            }
         }
     }
 }
@@ -55,6 +73,8 @@ pub struct DiagCounters {
     pub seqno_gaps: u64,
     pub lag_events: u64,
     pub resyncs: u64,
+    /// Partial logical frames painted (issue #72 tearing detector).
+    pub tears: u64,
 }
 
 impl DiagCounters {
@@ -64,6 +84,7 @@ impl DiagCounters {
             DiagEvent::SeqnoGap { .. } => self.seqno_gaps += 1,
             DiagEvent::Lagged { .. } => self.lag_events += 1,
             DiagEvent::Resync { .. } => self.resyncs += 1,
+            DiagEvent::Tear { .. } => self.tears += 1,
         }
     }
 }

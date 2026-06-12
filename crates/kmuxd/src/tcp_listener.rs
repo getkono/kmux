@@ -33,7 +33,15 @@ impl PaneAttacher for TcpAttacher {
                         return;
                     }
                 }
+                // Network impairment shim (issue #72): delay live pane-data
+                // frames before they reach the shared TCP writer. Applied here —
+                // not in the writer loop — so Ping/control are never blocked.
+                let impair = crate::impair::config();
+                let mut rng = impair.map(|c| c.rng_for(crate::impair::pane_salt(&pane_id)));
                 while let Some(msg) = client_rx.recv().await {
+                    if let (Some(cfg), Some(rng)) = (impair, rng.as_mut()) {
+                        crate::impair::maybe_delay(cfg, msg.category(), rng).await;
+                    }
                     if ctrl_tx.send(msg).is_err() {
                         break;
                     }
