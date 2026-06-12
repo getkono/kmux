@@ -229,7 +229,10 @@ impl AppCore {
             cursor_blink_enabled: cursor_blink,
             mode: Mode::Normal,
             term_size,
-            hud_visible: false,
+            // Auto-show the performance HUD on debug builds so live diagnostics
+            // are on by default during development (#105). Release builds start
+            // hidden; either profile can toggle it at runtime (`hud` / ⌘⇧H).
+            hud_visible: cfg!(debug_assertions),
             metrics_overlay_visible: false,
             force_snapshot_mode: false,
             disconnect_at: None,
@@ -313,5 +316,38 @@ impl AppCore {
             last_exit_error: None,
             command_history: VecDeque::new(),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn new_local_core() -> AppCore {
+        AppCore::new(
+            ResolvedTarget::LocalDaemon,
+            String::new(),
+            String::new(),
+            None,
+            None,
+            ClientCapabilities::default(),
+            crate::theme::default_theme(),
+            Appearance::default(),
+            true,
+            TermSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+        )
+    }
+
+    /// The performance HUD auto-shows on debug builds and stays hidden on
+    /// release builds (#105). The default is wired to the compile profile, so
+    /// it must track `cfg!(debug_assertions)` rather than a hardcoded value.
+    #[test]
+    fn hud_default_follows_build_profile() {
+        assert_eq!(new_local_core().hud_visible, cfg!(debug_assertions));
     }
 }
