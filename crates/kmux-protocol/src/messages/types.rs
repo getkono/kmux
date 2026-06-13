@@ -65,7 +65,7 @@ impl TransportKind {
 ///
 /// You do **not** need to bump for purely behavioural changes that leave the
 /// wire format unchanged (e.g. changing server-side timeout values).
-pub const PROTOCOL_VERSION: u32 = 22;
+pub const PROTOCOL_VERSION: u32 = 23;
 
 /// Parse a version-mismatch reason string and return an actionable upgrade
 /// hint, or an empty string if the reason is not a version mismatch.

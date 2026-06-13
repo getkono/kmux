@@ -85,6 +85,46 @@ The GTK frontend and `kmux-ffi` pump `AppCore` through the **`FrontendDriver`**
 (below). The render leaf and how each frontend produces `Action`s differ; the
 core is identical.
 
+### Directory browser: open a new session in a chosen directory
+
+"New session" (the session picker's `＋` row, or a remote connect with no
+sessions) opens a **directory browser** — `Mode::DirectoryPicker` — to pick
+where the session is created. Because the daemon may be remote (over SSH), a
+native OS file chooser is wrong: the browser lists the **daemon host's**
+directories over the wire protocol.
+
+Flow (protocol round-trip, `PROTOCOL_VERSION` 22 → **23**):
+
+1. `AppCore::open_directory_browser` seeds `dir_browser_cwd` from the active
+   session's cwd (else `initial_cwd`), clears the filter, and calls
+   `SessionManager::request_list_directory(cwd)`, which sends
+   `ClientMessage::ListDirectory { request_id, path }` (empty `path` ⇒ the
+   daemon resolves `$HOME`, else `"."`).
+2. The daemon (`kmuxd` `client_handler::dispatch::list_directory`) canonicalizes
+   the path, reads it, and replies with
+   `ServerMessage::DirectoryListing { request_id, path, parent, entries, error }`
+   — `entries` are **subdirectories only** (we are choosing a directory), sorted
+   case-insensitively and capped at 2000; `error` is set (entries empty) on any
+   IO failure. This reads the daemon's own filesystem under normal FS perms (no
+   sandbox).
+3. The client stores the listing (dropping replies whose `request_id` doesn't
+   match the latest request, so stale listings can't clobber a newer navigation)
+   and emits `SessionEvent::DirectoryListed` so frontends repaint.
+4. `AppCore::dir_browser_rows()` is the row model: row 0
+   `DirBrowserRow::CreateHere { cwd }`, then `Up { parent }` (only when the
+   listing has a parent), then a `Enter { path, name }` per subdirectory whose
+   name contains the case-insensitive filter. Activating a row (`DirPickerSubmit`
+   / a click) either **creates** the session (`CreateHere` → `SessionCreate`,
+   back to `Mode::Normal`) or **navigates** (`Up`/`Enter` request a fresh listing
+   and keep the browser open — it refreshes in place). A typed *absolute* path in
+   the filter that matches no listed subdir navigates there on Enter.
+
+The browser is pure `AppCore` policy; the frontends are thin: `kmux-gtk` renders
+the rows in its `DirPicker` `adw::Dialog` (`dialogs.rs`), and `kmux-swift` has a
+`DirectoryBrowser` SwiftUI sheet driven by the `dir_browser()` FFI getter +
+`dir_browser_activate(index)` / `dir_browser_open_here()` (the FFI surface change
+bumps `KMUX_FFI_ABI_VERSION`).
+
 ## `FrontendDriver`: the shared run loop
 
 Driving `AppCore` has always meant the same arm-for-arm orchestration: own the

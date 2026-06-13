@@ -73,6 +73,20 @@ pub enum TopBarAction {
     CreatePane,
 }
 
+/// One row in the directory browser (the "new session — choose a directory"
+/// overlay). Frontends render these rows and dispatch the row's effect on
+/// activation; the row order is fixed by [`AppCore::dir_browser_rows`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirBrowserRow {
+    /// Create a new session in `cwd` (the currently-browsed directory). Row 0.
+    CreateHere { cwd: String },
+    /// Navigate up to the parent directory. Present only when the listing has a
+    /// parent (absent at the filesystem root).
+    Up { parent: String },
+    /// Navigate into the subdirectory `path` (display name `name`).
+    Enter { path: String, name: String },
+}
+
 /// Frontend-agnostic client view-model. See the module docs.
 pub struct AppCore {
     pub mgr: SessionManager,
@@ -117,9 +131,15 @@ pub struct AppCore {
     pub session_picker_selected: usize,
     pub session_picker_search: String,
 
-    // Directory picker state (remote connections).
+    // Directory browser state (choose where to open a new session). The browser
+    // lists the daemon host's directories over the protocol (so it works for a
+    // remote daemon). `dir_picker_buffer` is the per-row **filter** text and
+    // `dir_picker_selected` is the highlighted row index; the entries/parent
+    // come from `mgr.dir_listing()`.
     pub dir_picker_buffer: String,
     pub dir_picker_selected: usize,
+    /// The directory currently being browsed (the listing request target).
+    pub dir_browser_cwd: String,
 
     // Auto-session selection context.
     pub is_local: bool,
@@ -246,6 +266,7 @@ impl AppCore {
             session_picker_search: String::new(),
             dir_picker_buffer: String::new(),
             dir_picker_selected: 0,
+            dir_browser_cwd: String::new(),
             is_local,
             initial_cwd,
             did_auto_select: false,
@@ -302,6 +323,7 @@ impl AppCore {
             session_picker_search: String::new(),
             dir_picker_buffer: String::new(),
             dir_picker_selected: 0,
+            dir_browser_cwd: String::new(),
             is_local: true,
             initial_cwd: String::new(),
             did_auto_select: false,

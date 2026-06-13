@@ -73,6 +73,9 @@ struct LiveDialog {
     kind: DialogKind,
     dialog: adw::Dialog,
     list: Option<ListBox>,
+    /// The filter entry, kept so navigation (which clears the core filter) can
+    /// clear the visible text too. Only the list dialogs have one.
+    search: Option<SearchEntry>,
 }
 
 /// The live native dialog plus the HUD OSD and the transient-state trackers.
@@ -208,7 +211,11 @@ fn open_list_dialog(
                 "Filter servers",
                 core.server_picker_search.clone(),
             ),
-            DialogKind::DirPicker => ("Open session", "Directory…", core.dir_picker_buffer.clone()),
+            DialogKind::DirPicker => (
+                "New session — choose a directory",
+                "Filter directories…",
+                core.dir_picker_buffer.clone(),
+            ),
             DialogKind::Command => ("Command", "Type a command", command_buffer(core)),
             _ => unreachable!(),
         }
@@ -333,6 +340,7 @@ fn open_list_dialog(
         kind,
         dialog: dialog.clone(),
         list: Some(list),
+        search: Some(search),
     }
 }
 
@@ -371,6 +379,20 @@ fn populate_list(dialogs: &Rc<Dialogs>, fe: &Rc<RefCell<Frontend>>) {
         list.select_row(Some(&row));
     }
     dialogs.syncing.set(false);
+
+    // Keep the directory browser's filter entry in sync with the core filter,
+    // which navigation clears: when the user enters a folder we reset the filter
+    // in `AppCore`, so the visible text must follow. Only touch it on a genuine
+    // drift to avoid disturbing the caret while the user is typing.
+    if live.kind == DialogKind::DirPicker
+        && let Some(search) = &live.search
+    {
+        let want = fe.borrow().core.dir_picker_buffer.clone();
+        if search.text() != want {
+            search.set_text(&want);
+            search.set_position(-1);
+        }
+    }
 }
 
 /// Row labels + selected index for a list dialog.
@@ -400,15 +422,21 @@ fn list_rows(kind: DialogKind, core: &AppCore) -> (Vec<String>, usize) {
             (rows, sel)
         }
         DialogKind::DirPicker => {
-            let rows: Vec<String> = core
-                .dir_picker_matches()
-                .iter()
-                .take(50)
-                .map(|e| {
-                    let name = core.mgr.display_name_for(&e.meta.word_id);
-                    format!("{name}    {}", e.meta.cwd)
+            use kmux_app::core::DirBrowserRow;
+            let mut rows: Vec<String> = core
+                .dir_browser_rows()
+                .into_iter()
+                .map(|row| match row {
+                    DirBrowserRow::CreateHere { cwd } => format!("＋  New session in {cwd}"),
+                    DirBrowserRow::Up { parent } => format!("..  {parent}"),
+                    DirBrowserRow::Enter { name, .. } => format!("📁  {name}"),
                 })
                 .collect();
+            // Surface a listing error as a trailing dim-ish row (plain label here;
+            // the list uses a single style, so we just make it readable text).
+            if let Some(err) = core.dir_browser_error() {
+                rows.push(format!("⚠  {err}"));
+            }
             let sel = core.dir_picker_selected.min(rows.len().saturating_sub(1));
             (rows, sel)
         }
@@ -441,10 +469,12 @@ fn list_signature(core: &AppCore) -> String {
             core.filtered_servers().len()
         ),
         Some(DialogKind::DirPicker) => format!(
-            "dir|{}|{}|{}",
+            "dir|{}|{}|{}|{}|{}",
+            core.dir_browser_cwd,
             core.dir_picker_buffer,
             core.dir_picker_selected,
-            core.dir_picker_matches().len()
+            core.dir_browser_rows().len(),
+            core.dir_browser_error().unwrap_or("")
         ),
         Some(DialogKind::Command) => {
             format!("cmd|{}|{}", command_buffer(core), command_selected(core))
@@ -565,6 +595,7 @@ fn open_confirm(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
         kind: DialogKind::Confirm,
         dialog: dialog.upcast(),
         list: None,
+        search: None,
     }
 }
 
@@ -617,6 +648,7 @@ fn open_rename(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
         kind: DialogKind::Rename,
         dialog: dialog.upcast(),
         list: None,
+        search: None,
     }
 }
 
@@ -655,6 +687,7 @@ fn open_help(shell: &Rc<Shell>) -> LiveDialog {
         kind: DialogKind::Help,
         dialog: dialog.upcast(),
         list: None,
+        search: None,
     }
 }
 
