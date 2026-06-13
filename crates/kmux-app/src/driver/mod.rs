@@ -232,11 +232,6 @@ impl FrontendDriver {
         dirty |= self.drain_tunnel_deaths();
         dirty |= self.tick_liveness(now);
         self.tick_metrics(now);
-        // Keep the HUD refreshing while shown (the metrics dialog is a snapshot
-        // taken when it opens, so it does not need a per-frame tick).
-        if self.core.hud_visible {
-            dirty = true;
-        }
         dirty |= self.tick_blink(now);
 
         if self.core.needs_render {
@@ -248,6 +243,17 @@ impl FrontendDriver {
             effects.push(FrontendEffect::ForceClear);
             dirty = true;
         }
+
+        // Count real content repaints for the rendering-FPS counter (issue #61)
+        // BEFORE the HUD's own 60 Hz self-refresh below would inflate the rate.
+        self.core.note_render(now, dirty);
+
+        // Keep the live HUD ticker refreshing while it is shown (the metrics
+        // dialog is a snapshot taken when it opens, so it needs no per-frame tick).
+        if self.core.hud_visible {
+            dirty = true;
+        }
+
         if dirty {
             effects.push(FrontendEffect::NeedsRender);
         }

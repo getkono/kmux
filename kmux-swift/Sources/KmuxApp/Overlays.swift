@@ -55,6 +55,12 @@ private struct MetricsLines: View {
             Text(
                 "Disc:\(metrics.staleDiscards) Gap:\(metrics.seqnoGaps) "
                     + "Lag:\(metrics.lagEvents) Sync:\(metrics.resyncs)")
+            // Network latency + rendering FPS (issue #61); ★ marks a stale link.
+            if metrics.showPerfCounters {
+                let latency = metrics.netLatencyMs.map { String(format: "%.1f ms", $0) } ?? "—"
+                Text("Latency:   \(latency)\(metrics.latencyStale ? " ★" : "")")
+                Text("FPS:       \(metrics.renderFps)")
+            }
         }
     }
 }

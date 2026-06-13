@@ -735,6 +735,24 @@ fn update_hud(hud: &GtkBox, core: &AppCore) {
     for line in lines {
         hud.append(&label(&line, "kmux-hud-line"));
     }
+    // Network latency + rendering FPS (issue #61), shown unless disabled in
+    // config (which also skips their computation). A ★ marks a stale link
+    // (no inbound for >3× the ping interval).
+    if core.show_perf_counters {
+        let latency = match core.net_latency_ms() {
+            Some(ms) => format!("{ms:.1} ms"),
+            None => "—".to_string(),
+        };
+        let star = if core.net_latency_stale() { " ★" } else { "" };
+        hud.append(&label(
+            &format!("Latency:   {latency}{star}"),
+            "kmux-hud-line",
+        ));
+        hud.append(&label(
+            &format!("FPS:       {}", core.render_fps()),
+            "kmux-hud-line",
+        ));
+    }
     hud.set_visible(true);
 }
 

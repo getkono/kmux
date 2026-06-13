@@ -118,6 +118,15 @@ during development; release builds start hidden. Either profile can toggle it
 at runtime. The test constructor (`AppCore::for_test`) keeps it off for
 deterministic toggle tests.
 
+### Network latency + rendering FPS (issue #61)
+
+Two extra counters live at the bottom of the HUD:
+
+- **Latency** — the active transport's EWMA round-trip time (`SessionManager::last_rtt_ms`, from the Ping/Pong RTT tracker). A **★** is appended when the link has gone quiet for longer than **3× the ping interval** (`3 × liveness::PING_INTERVAL` = 15 s; `SessionManager::is_ping_stale`).
+- **FPS** — the rendering frame rate over a 1 s rolling window (`AppCore::render_fps`). It counts **real content repaints**, not the HUD's own 60 Hz self-refresh: `FrontendDriver::tick` calls `AppCore::note_render(now, did_render)` with the content-dirty flag *before* the HUD forces a redraw, so the number reflects actual terminal updates (idles near 0, peaks at the ~60 Hz pump cap).
+
+Both are computed only while the HUD is shown **and** the counters are enabled, so they cost nothing otherwise. They can be hidden via the `perf_counters = false` key in `config.toml` (or the GTK **Preferences → Performance** toggle) — which also **skips the calculation** for power efficiency on battery. The computation is non-blocking (a few field reads + a bounded `VecDeque` of frame timestamps) and runs on the existing pump, never on the network/render hot path. Exposed to Swift via the `FfiMetrics` `show_perf_counters` / `net_latency_ms` / `latency_stale` / `render_fps` fields (`KMUX_FFI_ABI_VERSION` bumped).
+
 ## Metrics overlay
 
 Toggle: `Ctrl+G` then `m`. The overlay shows:

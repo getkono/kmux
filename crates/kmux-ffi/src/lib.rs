@@ -71,7 +71,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 8;
+pub const KMUX_FFI_ABI_VERSION: u32 = 9;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -754,6 +754,16 @@ pub struct FfiMetrics {
     pub seqno_gaps: u64,
     pub lag_events: u64,
     pub resyncs: u64,
+    // ── Performance counters (issue #61) ──
+    /// Whether the latency + FPS counters are enabled (else hidden + uncomputed).
+    pub show_perf_counters: bool,
+    /// Network round-trip latency (ms) for the active transport; `None` before
+    /// the first ping round-trip.
+    pub net_latency_ms: Option<f64>,
+    /// Whether the link has gone quiet (>3× the ping interval): show the ★ star.
+    pub latency_stale: bool,
+    /// Rendering frames per second (actual repaints; idles near 0, peaks ~60).
+    pub render_fps: u32,
 }
 
 /// Which interaction mode / overlay is active. Carries the text the matching
@@ -1703,6 +1713,10 @@ impl KmuxDriver {
             seqno_gaps: c.seqno_gaps,
             lag_events: c.lag_events,
             resyncs: c.resyncs,
+            show_perf_counters: core.show_perf_counters,
+            net_latency_ms: core.net_latency_ms(),
+            latency_stale: core.net_latency_stale(),
+            render_fps: core.render_fps(),
         }
     }
 
