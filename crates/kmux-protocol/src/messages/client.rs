@@ -317,6 +317,7 @@ mod tests {
             client_id: None,
             server_version: None,
             connection_id: Some(ConnectionId(99)),
+            compression: None,
         };
         let bytes = crate::encode_server(&msg).unwrap();
         let decoded = crate::decode_server(&bytes).unwrap();
@@ -356,6 +357,7 @@ mod tests {
             client_id: None,
             server_version: Some("0.1.0".to_string()),
             connection_id: None,
+            compression: None,
         };
         let bytes = crate::encode_server(&msg).unwrap();
         let decoded = crate::decode_server(&bytes).unwrap();

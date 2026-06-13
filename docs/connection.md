@@ -264,7 +264,13 @@ Three data transports are supported, all implemented under `crates/kmux-protocol
 
 ### Wire Format
 
-All transports share the same wire format: postcard serialization with length-prefix framing, implemented in `crates/kmux-protocol/src/codec.rs` (formerly `frame.rs`). The `read_frame` and `write_frame` functions are generic over any `AsyncRead + AsyncWrite` pair, making the codec transport-agnostic.
+All transports share the same wire format, implemented in `crates/kmux-protocol/src/codec.rs` (formerly `frame.rs`). Each frame is:
+
+```text
+[u32 big-endian length][u8 codec tag][payload…]
+```
+
+The length prefix counts the 1-byte codec tag plus the (possibly compressed) payload. The payload is a postcard-serialized message; the codec tag is `0 = raw` or `1 = zstd` (per-frame, like HTTP `Content-Encoding`). The frame is **self-describing**, so `read_frame` decompresses purely from the tag with no per-connection state. `read_frame` / `write_frame` (identity) / `write_frame_compressed` are generic over any `AsyncRead + AsyncWrite` pair, making the codec transport-agnostic. Whether the writer compresses is a per-connection policy the daemon decides at auth — see [compression.md](compression.md).
 
 ### Listener Trait
 
@@ -681,8 +687,9 @@ Every connection that completes auth is given an `Arc<ConnectionMetrics>` alloca
 
 | Field | Type | Description |
 |-------|------|-------------|
-| `bytes_in` | `AtomicU64` | Total bytes read from the client (4-byte length prefix included). |
-| `bytes_out` | `AtomicU64` | Total bytes written to the client (4-byte length prefix included). |
+| `bytes_in` | `AtomicU64` | Total bytes read from the client (frame header included). |
+| `bytes_out` | `AtomicU64` | Total bytes written to the client on the wire (frame header included; **post-compression**). |
+| `bytes_out_uncompressed` | `AtomicU64` | What `bytes_out` would have been with no compression. `bytes_out / bytes_out_uncompressed` is the realised compression ratio. |
 | `msgs_in` | `AtomicU64` | Number of complete frames received from the client. |
 | `msgs_out` | `AtomicU64` | Number of complete frames sent to the client. |
 | `last_activity_ms` | `AtomicU64` | Epoch-ms timestamp of the last received frame; `0` means no frame yet. |
@@ -692,7 +699,7 @@ Every connection that completes auth is given an `Arc<ConnectionMetrics>` alloca
 
 **Metric continuity across channel switches.** When a client reconnects on a new transport (e.g. the `TransportSupervisor` upgrades UDS → QUIC), `ServerApp::register_client` is called with the existing `ConnectionId`. The daemon finds the existing `ConnectionState`, updates its `transport` label, and returns the *original* `Arc<ConnectionMetrics>` — so `bytes_in`/`bytes_out` keep counting as if the switch never happened. The new `Arc<ConnectionMetrics>` passed by the caller is discarded.
 
-**Where counters accumulate.** `bytes_in` and `msgs_in` are incremented in the `run_client_session` read loop immediately after each `read_frame` returns. `bytes_out` and `msgs_out` are incremented in the writer task after each `write_frame` succeeds. `last_activity_ms` is stamped to `epoch_millis()` on every inbound frame. `last_rtt_ms` and `last_pong_ms` are updated in the Pong dispatch branch when the received sequence number matches `last_ping_sent`.
+**Where counters accumulate.** `bytes_in` and `msgs_in` are incremented in the `run_client_session` read loop immediately after each `read_frame` returns. `bytes_out` (actual wire bytes), `bytes_out_uncompressed`, and `msgs_out` are incremented in the writer task after each `write_frame_compressed` succeeds (it returns the wire-byte count). `last_activity_ms` is stamped to `epoch_millis()` on every inbound frame. `last_rtt_ms` and `last_pong_ms` are updated in the Pong dispatch branch when the received sequence number matches `last_ping_sent`.
 
 ### `kmux daemon sessions`
 

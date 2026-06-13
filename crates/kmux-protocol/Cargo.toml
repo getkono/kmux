@@ -10,7 +10,8 @@ description = "Versioned wire protocol shared between kmux and kmuxd."
 
 [features]
 default = ["framing"]
-framing = ["dep:tokio"]
+# Length-prefixed async framing + per-frame zstd compression of the wire codec.
+framing = ["dep:tokio", "dep:zstd"]
 # TLS helpers (rustls, rcgen, TOFU store). Pulled in by quic and tcp-tls.
 tls = [
     "dep:rustls",
@@ -41,6 +42,7 @@ postcard.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, optional = true }
+zstd = { workspace = true, optional = true }
 quinn = { workspace = true, optional = true }
 # tls feature deps
 rustls = { workspace = true, optional = true }
@@ -52,3 +54,5 @@ toml = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Used by the `compression_bench` example to sweep zstd levels offline.
+zstd.workspace = true

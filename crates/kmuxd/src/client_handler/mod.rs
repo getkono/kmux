@@ -7,7 +7,9 @@ pub use session::{build_attach_replay, run_client_session};
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
+use kmux_protocol::Compressor;
 use kmux_protocol::TransportKind;
 use kmux_protocol::messages::{
     ClientCapabilities, ClientId, ConnectionId, ErrorCode, ServerMessage,
@@ -20,6 +22,45 @@ use crate::app::{AttachResult, ConnectionMetrics, ServerApp};
 
 /// Per-client output channel capacity (number of `ServerMessage` items buffered).
 pub const CLIENT_CHANNEL_CAPACITY: usize = 512;
+
+// ─── Outbound compression state ────────────────────────────────────────────────
+
+/// Per-connection outbound compression, shared between the auth handler (which
+/// flips `enabled` once the daemon decides, in [`handle_message`]) and the
+/// writer / pane-attacher tasks (which read it per frame). `level` and
+/// `min_size` are connection constants taken from `[compression]` config.
+pub struct OutboundCompression {
+    enabled: AtomicBool,
+    level: i32,
+    min_size: usize,
+}
+
+impl OutboundCompression {
+    pub fn new(level: i32, min_size: usize) -> Self {
+        Self {
+            enabled: AtomicBool::new(false),
+            level,
+            min_size,
+        }
+    }
+
+    /// Enable or disable compression for subsequent outbound frames.
+    pub fn set_enabled(&self, on: bool) {
+        self.enabled.store(on, Ordering::Relaxed);
+    }
+
+    /// The [`Compressor`] to apply to the next outbound frame.
+    pub fn compressor(&self) -> Compressor {
+        if self.enabled.load(Ordering::Relaxed) {
+            Compressor::Zstd {
+                level: self.level,
+                min_size: self.min_size,
+            }
+        } else {
+            Compressor::Off
+        }
+    }
+}
 
 // ─── PaneAttacher trait ───────────────────────────────────────────────────────
 
@@ -56,6 +97,9 @@ pub struct SharedClientState {
     pub transport: TransportKind,
     /// Live per-connection byte/activity counters shared with the I/O tasks.
     pub metrics: Arc<ConnectionMetrics>,
+    /// Outbound compression toggle, shared with the writer + pane-attacher tasks.
+    /// Flipped by the auth handler once the daemon decides (see [`handle_message`]).
+    pub comp_out: Arc<OutboundCompression>,
     /// When this connection resumes an existing `conn_id` (channel switch in
     /// progress), holds the *previous* transport that was attached to that
     /// `conn_id`. Consumed when `ChannelReady` arrives so the server can send
@@ -71,6 +115,7 @@ impl SharedClientState {
         conn_span: Span,
         transport: TransportKind,
         metrics: Arc<ConnectionMetrics>,
+        comp_out: Arc<OutboundCompression>,
     ) -> Self {
         Self {
             authenticated: false,
@@ -83,6 +128,7 @@ impl SharedClientState {
             conn_span,
             transport,
             metrics,
+            comp_out,
             pending_swap_from: None,
         }
     }

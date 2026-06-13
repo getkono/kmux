@@ -1024,6 +1024,7 @@ mod tests {
                 client_id: None,
                 server_version: None,
                 connection_id: None,
+                compression: None,
             })
             .unwrap();
 
@@ -1049,6 +1050,7 @@ mod tests {
                 client_id: None,
                 server_version: None,
                 connection_id: None,
+                compression: None,
             })
             .unwrap();
 
@@ -1073,6 +1075,7 @@ mod tests {
                 client_id: None,
                 server_version: None,
                 connection_id: None,
+                compression: None,
             })
             .unwrap();
         assert!(matches!(auth_rx.await, Ok(Ok(()))));
