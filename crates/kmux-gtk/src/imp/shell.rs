@@ -40,6 +40,9 @@ pub struct Shell {
     pub title: adw::WindowTitle,
     pub server_btn: Button,
     pub conn_btn: Button,
+    /// Transport-protocol indicator (issue #69): shows the active transport and,
+    /// double-clicked, opens the override chooser. Restyled when overridden.
+    pub transport_btn: Button,
     pub lock_btn: Button,
     pub menu_btn: MenuButton,
     pub header_sig: RefCell<Option<String>>,
@@ -66,6 +69,10 @@ pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
     let server_btn = Button::from_icon_name("network-server-symbolic");
     server_btn.set_tooltip_text(Some("Switch server"));
     let conn_btn = Button::from_icon_name("network-idle-symbolic");
+    let transport_btn = Button::with_label("");
+    transport_btn.add_css_class("flat");
+    transport_btn.set_tooltip_text(Some("Transport protocol — double-click to override"));
+    transport_btn.set_visible(false);
     let lock_btn = Button::from_icon_name("changes-prevent-symbolic");
     lock_btn.set_tooltip_text(Some("Input is locked"));
     lock_btn.add_css_class("warning");
@@ -80,6 +87,7 @@ pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
     header.pack_start(&command_btn);
     header.pack_end(&menu_btn);
     header.pack_end(&conn_btn);
+    header.pack_end(&transport_btn);
     header.pack_end(&lock_btn);
     header.pack_end(&server_btn);
 
@@ -174,6 +182,7 @@ pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
         title,
         server_btn,
         conn_btn,
+        transport_btn,
         lock_btn,
         menu_btn,
         header_sig: RefCell::new(None),

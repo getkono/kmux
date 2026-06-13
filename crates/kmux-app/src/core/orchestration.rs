@@ -249,6 +249,12 @@ impl AppCore {
         let accept_invalid = self.mgr.accept_invalid_certs();
         let (rtt_tx, rtt_rx) = mpsc::unbounded_channel();
         self.mgr.set_rtt_sink(rtt_tx);
+        // Transport override (issue #69): a live channel for runtime changes,
+        // plus the current choice seeded into the supervisor so an override set
+        // before this (re)connect is honoured immediately.
+        let (override_tx, override_rx) = mpsc::unbounded_channel();
+        self.mgr.set_override_sink(override_tx);
+        let forced = self.mgr.transport_override();
 
         // Compose the supervisor's endpoint set: every probable transport
         // including the currently-active one. Without the active TCP+TLS
@@ -280,6 +286,8 @@ impl AppCore {
                 server_tx: srv_tx,
                 upgrade_tx,
                 rtt_rx: Some(rtt_rx),
+                forced,
+                override_rx: Some(override_rx),
             });
             supervisor.run().await;
         });

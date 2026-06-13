@@ -107,7 +107,7 @@ struct ContentView: View {
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
         ToolbarItemGroup {
-            ConnectionBadge(connection: model.connection)
+            ConnectionBadge(model: model)
             Button { model.openServerPicker() } label: {
                 Image(systemName: "rectangle.connected.to.line.below")
             }

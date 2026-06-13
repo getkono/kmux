@@ -254,6 +254,15 @@ pub struct SupervisorParams {
     /// `Pong`. When `None`, the supervisor falls back to `LATENCY_UNKNOWN_MS`
     /// for all endpoints.
     pub rtt_rx: Option<mpsc::UnboundedReceiver<RttSample>>,
+    /// Transport override seeded at spawn (issue #69). `Some(kind)` pins the
+    /// transport and disables the heuristic; `None` is normal auto mode.
+    /// Persists across reconnects because the `SessionManager` re-seeds it
+    /// each time a supervisor is spawned.
+    pub forced: Option<TransportKind>,
+    /// Live override updates: `Some(kind)` engages a forced transport, `None`
+    /// returns to auto. A command on this channel takes effect immediately
+    /// (it wakes the probe loop), so the indicator and behaviour update at once.
+    pub override_rx: Option<mpsc::UnboundedReceiver<Option<TransportKind>>>,
 }
 
 // ─── TransportSupervisor ─────────────────────────────────────────────────────
@@ -274,6 +283,9 @@ pub struct TransportSupervisor {
     server_tx: mpsc::UnboundedSender<ServerMessage>,
     upgrade_tx: mpsc::Sender<UpgradeSignal>,
     rtt_rx: Option<mpsc::UnboundedReceiver<RttSample>>,
+    /// Active transport override (issue #69). `Some` disables the heuristic.
+    forced: Option<TransportKind>,
+    override_rx: Option<mpsc::UnboundedReceiver<Option<TransportKind>>>,
 }
 
 impl TransportSupervisor {
@@ -290,6 +302,8 @@ impl TransportSupervisor {
             server_tx: params.server_tx,
             upgrade_tx: params.upgrade_tx,
             rtt_rx: params.rtt_rx,
+            forced: params.forced,
+            override_rx: params.override_rx,
         }
     }
 
@@ -302,38 +316,120 @@ impl TransportSupervisor {
         }
     }
 
+    /// Ensure the forced transport (issue #69) is the active one. No-op when
+    /// already active or when the forced transport has no advertised endpoint
+    /// (e.g. UDS on a remote host — we log and stay put). On success it swaps
+    /// via `upgrade_tx`, exactly like a heuristic upgrade.
+    async fn ensure_active(&mut self, kind: TransportKind) {
+        if self.active_transport == kind {
+            return;
+        }
+        let Some(idx) = self.endpoints.iter().position(|e| e.kind == kind) else {
+            warn!(
+                forced = %kind,
+                active = %self.active_transport,
+                "Supervisor: forced transport has no advertised endpoint; staying put",
+            );
+            return;
+        };
+        let address = self.endpoints[idx].address.clone();
+        info!(forced = %kind, "Supervisor: forcing transport switch");
+        match probe_transport(
+            kind,
+            &address,
+            &self.token,
+            self.connection_id,
+            &self.capabilities,
+            self.accept_invalid_certs,
+            self.server_tx.clone(),
+        )
+        .await
+        {
+            Ok(sender) => {
+                if let Some(old) = self
+                    .endpoints
+                    .iter_mut()
+                    .find(|e| e.kind == self.active_transport)
+                {
+                    old.mark_swap_away();
+                }
+                self.active_transport = kind;
+                if self
+                    .upgrade_tx
+                    .send(UpgradeSignal {
+                        new_kind: kind,
+                        sender,
+                    })
+                    .await
+                    .is_err()
+                {
+                    debug!("Supervisor: upgrade_tx closed during forced swap");
+                }
+            }
+            Err(e) => {
+                self.endpoints[idx].record_failure();
+                warn!(
+                    transport = %kind,
+                    address = %address,
+                    error = %e,
+                    "Supervisor: forced transport probe failed; staying on {}",
+                    self.active_transport,
+                );
+            }
+        }
+    }
+
     /// Run the supervisor loop (blocking until upgrade_tx is dropped).
     pub async fn run(mut self) {
         let mut interval = tokio::time::interval(PROBE_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
+        // Own the receivers locally so the wait-loop's `select!` borrows them
+        // without conflicting with the `&mut self` method calls below.
+        let mut override_rx = self.override_rx.take();
+        let mut rtt_rx = self.rtt_rx.take();
+
+        // A transport override seeded at spawn (persisted across reconnects)
+        // takes effect immediately, before the first probe tick.
+        if let Some(kind) = self.forced {
+            self.ensure_active(kind).await;
+        }
+
         loop {
-            // Wait for the next probe tick while concurrently draining
-            // RTT samples. The RTT stream never cancels the tick — both
-            // can make progress in the same iteration.
+            // Wait for the next wake: a probe tick, or a live override change.
+            // RTT samples are drained without ending the wait.
             loop {
-                match self.rtt_rx.as_mut() {
-                    Some(rx) => tokio::select! {
-                        _ = interval.tick() => break,
-                        maybe_sample = rx.recv() => match maybe_sample {
-                            Some(s) => self.apply_rtt(s),
-                            None => {
-                                // Sender dropped: disable RTT ingress and
-                                // continue on pure tick cadence.
-                                self.rtt_rx = None;
+                tokio::select! {
+                    _ = interval.tick() => break,
+                    cmd = recv_opt(&mut override_rx) => match cmd {
+                        Some(target) => {
+                            if target != self.forced {
+                                info!(?target, "Supervisor: transport override changed");
                             }
+                            self.forced = target;
+                            break;
                         }
+                        // Sender dropped: stop accepting override updates.
+                        None => override_rx = None,
                     },
-                    None => {
-                        interval.tick().await;
-                        break;
-                    }
+                    sample = recv_opt(&mut rtt_rx) => match sample {
+                        Some(s) => self.apply_rtt(s),
+                        // Sender dropped: fall back to pure tick cadence.
+                        None => rtt_rx = None,
+                    },
                 }
             }
 
             if self.upgrade_tx.is_closed() {
                 debug!("Supervisor: upgrade_tx closed, stopping");
                 return;
+            }
+
+            // Override engaged → never run the heuristic; just keep the forced
+            // transport active (probe + swap to it if we have drifted away).
+            if let Some(kind) = self.forced {
+                self.ensure_active(kind).await;
+                continue;
             }
 
             let ranked = self.scorer.rank(&self.endpoints, self.active_transport);
@@ -456,6 +552,15 @@ impl TransportSupervisor {
                 }
             }
         }
+    }
+}
+
+/// Receive from an optional channel, or pend forever when it is `None` (so a
+/// `tokio::select!` arm over a dropped/absent receiver simply never fires).
+async fn recv_opt<T>(rx: &mut Option<mpsc::UnboundedReceiver<T>>) -> Option<T> {
+    match rx {
+        Some(r) => r.recv().await,
+        None => std::future::pending().await,
     }
 }
 
@@ -785,6 +890,8 @@ mod tests {
             server_tx: srv_tx,
             upgrade_tx: up_tx,
             rtt_rx: None,
+            forced: None,
+            override_rx: None,
         });
         assert_eq!(sup.endpoints.len(), 2);
         assert_eq!(sup.active_transport, TransportKind::Quic);
@@ -817,6 +924,8 @@ mod tests {
             server_tx: srv_tx,
             upgrade_tx: up_tx,
             rtt_rx: None,
+            forced: None,
+            override_rx: None,
         });
         sup.apply_rtt(RttSample {
             kind: TransportKind::Quic,
@@ -834,6 +943,71 @@ mod tests {
             .unwrap();
         assert_eq!(quic.rtt_ewma_ms, Some(42.0));
         assert!(tcp.rtt_ewma_ms.is_none());
+    }
+
+    // ── transport override (issue #69) ────────────────────────────────────────
+
+    fn forced_supervisor(
+        active: TransportKind,
+        forced: TransportKind,
+        endpoints: Vec<EndpointAdvert>,
+    ) -> (TransportSupervisor, mpsc::Receiver<UpgradeSignal>) {
+        let (srv_tx, _srv_rx) = mpsc::unbounded_channel();
+        let (up_tx, up_rx) = mpsc::channel(1);
+        let sup = TransportSupervisor::new(SupervisorParams {
+            endpoints,
+            connection_id: ConnectionId(1),
+            token: "tok".into(),
+            capabilities: ClientCapabilities::default(),
+            accept_invalid_certs: false,
+            active_transport: active,
+            is_local: false,
+            server_tx: srv_tx,
+            upgrade_tx: up_tx,
+            rtt_rx: None,
+            forced: Some(forced),
+            override_rx: None,
+        });
+        (sup, up_rx)
+    }
+
+    #[tokio::test]
+    async fn ensure_active_is_noop_when_already_on_forced_transport() {
+        let (mut sup, mut up_rx) = forced_supervisor(
+            TransportKind::Quic,
+            TransportKind::Quic,
+            vec![EndpointAdvert {
+                kind: TransportKind::Quic,
+                address: "host:8443".into(),
+            }],
+        );
+        sup.ensure_active(TransportKind::Quic).await;
+        assert!(
+            up_rx.try_recv().is_err(),
+            "no swap when already on the forced transport"
+        );
+        assert_eq!(sup.active_transport, TransportKind::Quic);
+    }
+
+    #[tokio::test]
+    async fn ensure_active_stays_put_when_forced_transport_unavailable() {
+        // UDS is not advertised (e.g. a remote host): we must not probe a
+        // non-existent endpoint and must keep the working transport.
+        let (mut sup, mut up_rx) = forced_supervisor(
+            TransportKind::Quic,
+            TransportKind::Uds,
+            vec![EndpointAdvert {
+                kind: TransportKind::Quic,
+                address: "host:8443".into(),
+            }],
+        );
+        sup.ensure_active(TransportKind::Uds).await;
+        assert!(up_rx.try_recv().is_err());
+        assert_eq!(
+            sup.active_transport,
+            TransportKind::Quic,
+            "stays on the available transport"
+        );
     }
 
     // ── spawn_auth_intercept ───────────────────────────────────────────────────

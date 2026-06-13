@@ -555,6 +555,9 @@ impl From<&ConnectionState> for FfiConnStatus {
 pub struct FfiConnInfo {
     pub status: FfiConnStatus,
     pub label: String,
+    /// Whether the transport is pinned via the override (issue #69). When true,
+    /// the protocol indicator renders in an "overridden" style.
+    pub transport_overridden: bool,
 }
 
 /// Recent round-trip-time summary for the active transport (connection
@@ -1074,6 +1077,7 @@ impl KmuxDriver {
         FfiConnInfo {
             status: FfiConnStatus::from(state),
             label: state.badge_label(),
+            transport_overridden: d.mgr.transport_override().is_some(),
         }
     }
 

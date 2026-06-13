@@ -506,6 +506,15 @@ Client                          Server
   | (data plane: TLS-TCP)         |
 ```
 
+### Transport override (issue #69)
+
+Transport selection is normally **auto**: the `TransportSupervisor` periodically scores and hot-swaps to the best transport (above). The user can pin it instead — useful when the heuristic picks badly for a given network.
+
+- **Selection mechanism.** The `/transport [auto|quic|tcp-tls|uds|tcp]` command sets the override (`auto` clears it). Double-clicking the protocol indicator (the header transport button on GTK, the connection badge on macOS) opens the command pre-filled, so the choice is a pick from the completer.
+- **Indicator.** While overridden, the protocol text renders in a distinct style — amber on GTK, an orange tint on macOS — so it's obvious the transport is pinned rather than auto-chosen.
+- **Mechanism.** The choice lives on `SessionManager::transport_override` (the source of truth; it persists across reconnects). It is seeded into each freshly-spawned supervisor (`SupervisorParams::forced`) and pushed live over an `override_rx` channel so a runtime change takes effect at once. When pinned, the supervisor **skips the periodic heuristic entirely** and only ensures the forced transport is active (probing/swapping to it once if needed; a no-op if it is already active or has no advertised endpoint, e.g. UDS on a remote host).
+- **Scope.** This is client-local — no wire-protocol change and no `PROTOCOL_VERSION` bump (it does bump `KMUX_FFI_ABI_VERSION` for the new `FfiConnInfo` field). It only affects connections that run a supervisor (the SSH/remote path); a local UDS connection has no alternative transport to switch to.
+
 ---
 
 ## Liveness and Recovery
