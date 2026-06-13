@@ -35,6 +35,22 @@ pub(super) enum PaneSync {
     AwaitingSync,
 }
 
+/// The latest directory listing received from the daemon in response to a
+/// [`SessionManager::request_list_directory`] call. Backs the app-layer
+/// directory browser (choosing where to open a new session on a possibly
+/// remote daemon).
+#[derive(Debug, Clone, Default)]
+pub struct DirListing {
+    /// The canonicalized directory actually listed.
+    pub path: String,
+    /// Its parent directory, or `None` at the filesystem root.
+    pub parent: Option<String>,
+    /// Its subdirectories (directories only).
+    pub entries: Vec<kmux_protocol::messages::DirEntry>,
+    /// A human-readable message when the listing failed; `None` on success.
+    pub error: Option<String>,
+}
+
 /// Shared client-side session management logic used by the client frontends.
 pub struct SessionManager {
     // Connection params
@@ -84,6 +100,13 @@ pub struct SessionManager {
     /// `request_id` of the in-flight query so we can coalesce (never issue a
     /// second request while the first is pending) and reconcile responses.
     pub(super) in_flight_history_fetches: HashMap<PaneId, u64>,
+    /// `request_id` of the most recent in-flight `ListDirectory` request, used
+    /// to drop stale `DirectoryListing` replies (the user may navigate again
+    /// before a slow listing returns). `None` when no request is outstanding.
+    pub(super) pending_dir_request: Option<u64>,
+    /// The latest directory listing received from the daemon, surfaced to the
+    /// app-layer directory browser.
+    pub(super) dir_listing: Option<DirListing>,
     pub client_id: Option<ClientId>,
 
     // Observability
@@ -119,6 +142,15 @@ pub struct SessionManager {
     /// `TransportSupervisor` is spawned so the scorer operates on live
     /// measurements. `None` when no supervisor exists (direct QUIC path).
     pub(super) rtt_tx: Option<mpsc::UnboundedSender<RttSample>>,
+
+    /// Transport override (issue #69). `Some(kind)` pins the transport and
+    /// disables the supervisor's periodic heuristic; `None` is auto mode. This
+    /// is the source of truth (persists across reconnects); it is re-seeded
+    /// into each freshly-spawned supervisor and pushed live via `override_tx`.
+    pub(super) transport_override: Option<TransportKind>,
+    /// Live channel to the current supervisor's override receiver, if one is
+    /// running. Replaced on every supervisor spawn via [`Self::set_override_sink`].
+    pub(super) override_tx: Option<mpsc::UnboundedSender<Option<TransportKind>>>,
 }
 
 impl SessionManager {
@@ -154,6 +186,8 @@ impl SessionManager {
             input_locked: HashMap::new(),
             next_request_id: 0,
             in_flight_history_fetches: HashMap::new(),
+            pending_dir_request: None,
+            dir_listing: None,
             client_id: None,
             metrics: MetricsStore::in_memory(),
             server_version: None,
@@ -163,6 +197,8 @@ impl SessionManager {
             connection_state: ConnectionState::Idle,
             liveness: Liveness::new(Instant::now()),
             rtt_tx: None,
+            transport_override: None,
+            override_tx: None,
         }
     }
 
@@ -171,6 +207,30 @@ impl SessionManager {
     /// feed the scorer's EWMA.
     pub fn set_rtt_sink(&mut self, tx: mpsc::UnboundedSender<RttSample>) {
         self.rtt_tx = Some(tx);
+    }
+
+    /// Wire the session manager to a freshly-spawned `TransportSupervisor`'s
+    /// override receiver (issue #69). Called alongside [`Self::set_rtt_sink`].
+    pub fn set_override_sink(&mut self, tx: mpsc::UnboundedSender<Option<TransportKind>>) {
+        self.override_tx = Some(tx);
+    }
+
+    /// The active transport override (`None` = auto). Drives the protocol
+    /// indicator and the connection inspector.
+    pub fn transport_override(&self) -> Option<TransportKind> {
+        self.transport_override
+    }
+
+    /// Set (or clear, with `None`) the transport override. Remembers the choice
+    /// across reconnects and pushes it live to a running supervisor so it takes
+    /// effect immediately. The supervisor stops auto-probing while pinned.
+    pub fn set_transport_override(&mut self, target: Option<TransportKind>) {
+        self.transport_override = target;
+        if let Some(tx) = self.override_tx.as_ref() {
+            // The supervisor may have exited (reconnect in flight); a send
+            // error just means the next spawn will re-seed from the field.
+            let _ = tx.send(target);
+        }
     }
 
     /// Forward an RTT observation to the supervisor (if any) tagged with
@@ -1429,5 +1489,80 @@ mod tests {
         let grid = mgr.buffers.get("eagle/0").expect("buffer exists");
         assert_eq!(grid.rows, 40);
         assert_eq!(grid.cols, 120);
+    }
+
+    #[test]
+    fn request_list_directory_sends_message_and_records_request() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.request_list_directory("/home/user".to_string());
+
+        match rx.try_recv().expect("ListDirectory sent") {
+            ClientMessage::ListDirectory { request_id, path } => {
+                assert_eq!(path, "/home/user");
+                assert_eq!(mgr.pending_dir_request, Some(request_id));
+            }
+            other => panic!("expected ListDirectory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn directory_listing_stores_and_emits_event_for_matching_request() {
+        use super::server_handler::SessionEvent;
+        use kmux_protocol::messages::DirEntry;
+
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.request_list_directory("/home/user".to_string());
+        let request_id = match rx.try_recv().unwrap() {
+            ClientMessage::ListDirectory { request_id, .. } => request_id,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        let events = mgr.handle_server_message(ServerMessage::DirectoryListing {
+            request_id,
+            path: "/home/user".to_string(),
+            parent: Some("/home".to_string()),
+            entries: vec![DirEntry {
+                name: "dev".to_string(),
+                is_dir: true,
+            }],
+            error: None,
+        });
+
+        assert!(matches!(events.as_slice(), [SessionEvent::DirectoryListed]));
+        let listing = mgr.dir_listing().expect("listing stored");
+        assert_eq!(listing.path, "/home/user");
+        assert_eq!(listing.parent.as_deref(), Some("/home"));
+        assert_eq!(listing.entries.len(), 1);
+        assert_eq!(listing.entries[0].name, "dev");
+        // The pending request is cleared once satisfied.
+        assert_eq!(mgr.pending_dir_request, None);
+    }
+
+    #[test]
+    fn directory_listing_drops_stale_response() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.request_list_directory("/a".to_string());
+        let _ = rx.try_recv().unwrap();
+        // The user navigated again; only the newest request is pending.
+        mgr.request_list_directory("/b".to_string());
+        let newest = match rx.try_recv().unwrap() {
+            ClientMessage::ListDirectory { request_id, .. } => request_id,
+            other => panic!("unexpected: {other:?}"),
+        };
+
+        // A late reply for the FIRST request (id = newest - 1) is ignored.
+        let events = mgr.handle_server_message(ServerMessage::DirectoryListing {
+            request_id: newest - 1,
+            path: "/a".to_string(),
+            parent: Some("/".to_string()),
+            entries: vec![],
+            error: None,
+        });
+        assert!(events.is_empty(), "stale reply must be dropped");
+        assert!(
+            mgr.dir_listing().is_none(),
+            "stale reply must not be stored"
+        );
+        assert_eq!(mgr.pending_dir_request, Some(newest));
     }
 }

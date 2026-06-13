@@ -28,6 +28,26 @@ impl fmt::Display for TransportKind {
     }
 }
 
+impl TransportKind {
+    /// Parse a user-facing transport name (case-insensitive) for the
+    /// `/transport` override command (issue #69). Returns `None` for unknown
+    /// names; the caller maps `"auto"` to *clearing* the override.
+    pub fn parse_cli(s: &str) -> Option<TransportKind> {
+        match s.to_ascii_lowercase().as_str() {
+            "quic" => Some(TransportKind::Quic),
+            "tcp-tls" | "tcptls" | "tls" => Some(TransportKind::TcpTls),
+            "tcp" => Some(TransportKind::Tcp),
+            "uds" | "unix" | "local" => Some(TransportKind::Uds),
+            _ => None,
+        }
+    }
+
+    /// The override-selectable names shown by the command completer (`auto`
+    /// first — it clears the override).
+    pub const SELECTABLE_NAMES: &'static [&'static str] =
+        &["auto", "quic", "tcp-tls", "uds", "tcp"];
+}
+
 /// Current wire protocol version. Bump when the wire format changes.
 ///
 /// The client sends this in `ClientMessage::Auth` and the server rejects
@@ -47,6 +67,7 @@ impl fmt::Display for TransportKind {
 ///
 /// You do **not** need to bump for purely behavioural changes that leave the
 /// wire format unchanged (e.g. changing server-side timeout values).
+
 ///
 /// # History
 ///

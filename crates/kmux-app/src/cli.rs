@@ -1,4 +1,5 @@
 use clap::{Args, Parser, Subcommand, ValueEnum};
+use clap_complete::engine::ArgValueCandidates;
 
 #[derive(Parser, Debug)]
 #[command(
@@ -26,7 +27,7 @@ pub struct Cli {
     /// Color theme: built-in name (one-dark, catppuccin-latte, catppuccin-frappe,
     /// catppuccin-macchiato, catppuccin-mocha, dracula) or a custom theme name
     /// from ~/.config/kmux/themes/<name>.toml
-    #[arg(long, global = true)]
+    #[arg(long, global = true, add = ArgValueCandidates::new(crate::completion::theme_candidates))]
     pub theme: Option<String>,
 
     /// GUI font as a Pango font-description string (e.g. "JetBrains Mono 12").
@@ -54,6 +55,7 @@ pub struct Cli {
 pub struct ServerArgs {
     /// Remote SSH target: `[user@]host[:ssh-port][:/path]` or a `hosts.toml`
     /// alias. Omit to connect to the local daemon.
+    #[arg(add = ArgValueCandidates::new(crate::completion::server_candidates))]
     pub server: Option<String>,
 
     /// Override the SSH port for the target (also settable via `host:port`
@@ -69,7 +71,7 @@ pub struct ConnectArgs {
     pub server_args: ServerArgs,
 
     /// Auto-attach to a named session (by display name or word_id)
-    #[arg(short, long)]
+    #[arg(short, long, add = ArgValueCandidates::new(crate::completion::session_candidates))]
     pub session: Option<String>,
 
     /// Working directory for a new session (used with --session or user@host:/path)

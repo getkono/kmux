@@ -8,11 +8,16 @@
 //! (emitted as [`KeyResult::CopyToClipboard`] / [`KeyResult::RequestPaste`]
 //! effects that the frontend performs).
 
+use std::time::Instant;
+
 use crate::cmd;
 use crate::mode::{Action, Mode};
 use crate::recent_servers::ServerKind;
 
-use super::{AppCore, COMMAND_HISTORY_CAP, KeyResult, SwitchTarget, TopBarAction};
+use super::{
+    AppCore, COMMAND_HISTORY_CAP, DirBrowserRow, KeyResult, PendingClose, SwitchTarget, SOFT_CLOSE_GRACE, SwitchTarget,
+    TopBarAction,
+};
 
 impl AppCore {
     /// Apply an [`Action`] to the core. Used both by the key path and by the
@@ -34,7 +39,10 @@ impl AppCore {
                 }
             }
             Action::ClosePane => {
-                self.mgr.close_pane();
+                self.soft_close_active_pane();
+            }
+            Action::UndoClose => {
+                self.undo_soft_close();
             }
             Action::ConfirmCloseYes => {
                 if let Mode::ConfirmCloseSession { word_id } =
@@ -218,6 +226,9 @@ impl AppCore {
             Action::ToggleMetrics => {
                 self.metrics_overlay_visible = !self.metrics_overlay_visible;
             }
+            Action::ToggleConnection => {
+                self.connection_overlay_visible = !self.connection_overlay_visible;
+            }
             Action::ToggleSnapshotMode => {
                 self.force_snapshot_mode = !self.force_snapshot_mode;
                 self.mgr.set_snapshot_mode(self.force_snapshot_mode);
@@ -248,26 +259,13 @@ impl AppCore {
                 self.dir_picker_selected = self.dir_picker_selected.saturating_sub(1);
             }
             Action::DirPickerDown => {
-                let count = self.dir_picker_matches().len();
+                let count = self.dir_browser_rows().len();
                 if count > 0 && self.dir_picker_selected + 1 < count {
                     self.dir_picker_selected += 1;
                 }
             }
             Action::DirPickerSubmit => {
-                let matches = self.dir_picker_matches();
-                if let Some(entry) = matches.get(self.dir_picker_selected) {
-                    let word_id = entry.meta.word_id.clone();
-                    self.mgr.select_session(word_id);
-                } else {
-                    let cwd = self.dir_picker_buffer.trim().to_string();
-                    if !cwd.is_empty() {
-                        if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
-                            self.mgr.select_session(word_id);
-                        } else {
-                            self.mgr.create_session(None, Some(&cwd), self.term_size);
-                        }
-                    }
-                }
+                self.submit_dir_browser_row();
             }
             Action::DirPickerCancel => {}
             Action::CancelBootstrap => {
@@ -560,9 +558,9 @@ impl AppCore {
     /// [`activate_picker_selection`](Self::activate_picker_selection).
     fn select_session_picker_entry(&mut self) {
         if self.session_picker_selected == 0 {
-            self.dir_picker_buffer = self.initial_cwd.clone();
-            self.dir_picker_selected = 0;
-            self.mode = Mode::DirectoryPicker;
+            // "+ New session" opens the directory browser (seeded at the active
+            // session's cwd) so the user picks where the session is created.
+            self.open_directory_browser();
             return;
         }
         let word_id = self
@@ -573,6 +571,46 @@ impl AppCore {
             self.mgr.select_session(word_id);
         }
         self.mode = Mode::Normal;
+    }
+
+    /// Act on the directory browser's currently-selected row (Enter / click /
+    /// activate). Shared by the keyboard [`Action::DirPickerSubmit`] and the
+    /// pointer-driven [`activate_picker_selection`](Self::activate_picker_selection):
+    ///
+    /// - [`DirBrowserRow::CreateHere`] creates a session in the browsed
+    ///   directory and returns to [`Mode::Normal`].
+    /// - [`DirBrowserRow::Up`] / [`DirBrowserRow::Enter`] navigate (request a
+    ///   fresh listing for the target) and keep the browser open.
+    ///
+    /// Power feature: when the filter is a non-empty **absolute** path that does
+    /// not match any listed row, Enter navigates to that typed path instead.
+    fn submit_dir_browser_row(&mut self) {
+        let rows = self.dir_browser_rows();
+        match rows.get(self.dir_picker_selected).cloned() {
+            Some(DirBrowserRow::CreateHere { cwd }) => {
+                // A typed absolute path that isn't a listed subdir is treated as
+                // "navigate there" rather than "create in the current dir", so a
+                // user can jump straight to a path they typed.
+                let typed = self.dir_picker_buffer.trim();
+                if typed.starts_with('/') && !self.filter_matches_listed_subdir() {
+                    self.navigate_directory_browser(typed.to_string());
+                    return;
+                }
+                self.mgr.create_session(None, Some(&cwd), self.term_size);
+                self.mode = Mode::Normal;
+            }
+            Some(DirBrowserRow::Up { parent }) => self.navigate_directory_browser(parent),
+            Some(DirBrowserRow::Enter { path, .. }) => self.navigate_directory_browser(path),
+            None => {}
+        }
+    }
+
+    /// Whether the current filter text matches at least one listed subdirectory
+    /// (used to decide whether Enter on a typed absolute path should navigate).
+    fn filter_matches_listed_subdir(&self) -> bool {
+        self.dir_browser_rows()
+            .iter()
+            .any(|r| matches!(r, DirBrowserRow::Enter { .. }))
     }
 
     /// The switch target for the current server-picker selection, or `None` when
@@ -621,6 +659,9 @@ impl AppCore {
                 None
             }
             TopBarAction::SelectPane(pane_id) => {
+                // Re-selecting a pane within its soft-close window restores it:
+                // the live shell was never killed, so just cancel the close (#86).
+                self.cancel_pending_close(&pane_id);
                 self.mgr.select_pane(pane_id);
                 None
             }
@@ -629,6 +670,93 @@ impl AppCore {
                 None
             }
         }
+    }
+
+    // ── Soft-close (issue #86) ────────────────────────────────────────────────
+
+    /// Request a deferred ("soft") close of the active pane. A healthy pane's
+    /// `PaneClose` is withheld for [`SOFT_CLOSE_GRACE`] so an accidental close
+    /// can be undone; an already-exited pane closes immediately. Re-requesting a
+    /// close that is already pending keeps the existing deadline.
+    pub fn soft_close_active_pane(&mut self) {
+        let Some(pane_id) = self.mgr.active_pane_id().map(str::to_string) else {
+            return;
+        };
+        if self.pending_closes.iter().any(|p| p.pane_id == pane_id) {
+            return;
+        }
+        // An unhealthy (already-exited) pane has no live shell to protect.
+        if !self.mgr.is_pane_running(&pane_id) {
+            self.mgr.close_pane_id(&pane_id);
+            return;
+        }
+        self.pending_closes.push(PendingClose {
+            pane_id,
+            deadline: Instant::now() + SOFT_CLOSE_GRACE,
+        });
+        self.soft_close_nonce = self.soft_close_nonce.wrapping_add(1);
+        self.mgr
+            .set_status_msg("Closing pane in 3s — undo to keep it".into());
+    }
+
+    /// Cancel the most recently scheduled soft-close (the toast/keyboard "Undo").
+    /// The live shell was never touched, so the pane simply stays.
+    pub fn undo_soft_close(&mut self) {
+        if self.pending_closes.pop().is_some() {
+            self.mgr.set_status_msg("Pane close cancelled".into());
+        }
+    }
+
+    /// Cancel a specific pane's pending soft-close (e.g. the user re-focused it
+    /// within the window). Returns whether one was cancelled.
+    pub fn cancel_pending_close(&mut self, pane_id: &str) -> bool {
+        let before = self.pending_closes.len();
+        self.pending_closes.retain(|p| p.pane_id != pane_id);
+        self.pending_closes.len() != before
+    }
+
+    /// Fire every soft-close whose grace window has elapsed (driven by the
+    /// frontend pump). Returns whether any close was sent, so the caller can
+    /// schedule a render. Cheap when nothing is pending.
+    pub fn fire_due_closes(&mut self, now: Instant) -> bool {
+        if self.pending_closes.is_empty() {
+            return false;
+        }
+        let mut due: Vec<String> = Vec::new();
+        self.pending_closes.retain(|p| {
+            let expired = p.deadline <= now;
+            if expired {
+                due.push(p.pane_id.clone());
+            }
+            !expired
+        });
+        for pane_id in &due {
+            self.mgr.close_pane_id(pane_id);
+        }
+        !due.is_empty()
+    }
+
+    /// Whether `pane_id` is awaiting a deferred close (for a "closing…" hint).
+    pub fn is_pane_pending_close(&self, pane_id: &str) -> bool {
+        self.pending_closes.iter().any(|p| p.pane_id == pane_id)
+    }
+
+    /// Whether any pane is awaiting a deferred close (drives the Undo affordance).
+    pub fn has_pending_close(&self) -> bool {
+        !self.pending_closes.is_empty()
+    }
+  
+    /// Open the command palette pre-filled with `transport ` so the user picks
+    /// from the completer (Auto + each protocol). Bound to the protocol
+    /// indicator (double-click) in the GUIs (issue #69).
+    pub fn open_transport_chooser(&mut self) {
+        const PREFILL: &str = "transport ";
+        self.mode = Mode::Command(crate::mode::CommandState {
+            buffer: PREFILL.to_string(),
+            cursor: PREFILL.len(),
+            selected: 0,
+            history_pos: None,
+        });
     }
 
     /// Set the selected index of the currently open picker (e.g. hover-to-
@@ -668,9 +796,9 @@ impl AppCore {
     /// Activate the current picker's selection (a click on a list item). Mirrors
     /// the keyboard Enter path but performs its own mode transition because it
     /// does not pass through `mode::resolve`. Returns a [`KeyResult`] only for
-    /// the server picker, which may switch servers. Note: a directory-picker
-    /// click only *selects an existing* session — creating from a typed path is
-    /// the keyboard `DirPickerSubmit` path.
+    /// the server picker, which may switch servers. For the directory browser
+    /// this navigates (Up / into a subdir) or creates a session (create-here),
+    /// identical to the keyboard `DirPickerSubmit` path.
     pub fn activate_picker_selection(&mut self) -> Option<KeyResult> {
         match self.mode {
             Mode::SessionPicker => {
@@ -683,12 +811,10 @@ impl AppCore {
                 target.map(KeyResult::SwitchServer)
             }
             Mode::DirectoryPicker => {
-                let matches = self.dir_picker_matches();
-                if let Some(entry) = matches.get(self.dir_picker_selected) {
-                    let word_id = entry.meta.word_id.clone();
-                    self.mgr.select_session(word_id);
-                }
-                self.mode = Mode::Normal;
+                // A click on a browser row: create-here returns to Normal;
+                // navigating into a folder keeps the browser open (it refreshes
+                // in place when the new listing arrives).
+                self.submit_dir_browser_row();
                 None
             }
             _ => None,
@@ -725,6 +851,99 @@ mod tests {
             ClientCapabilities::default(),
         );
         AppCore::for_test(mgr)
+    }
+
+    /// A connected core with one active pane carrying `status` (issue #86 tests).
+    fn core_with_active_pane(status: kmux_protocol::messages::SessionStatus) -> AppCore {
+        use kmux_protocol::messages::{
+            LayoutNode, PaneInfo, SessionEntry, SessionMeta, TabInfo, TermSize,
+        };
+        let mut core = fixture_core();
+        core.mgr.connected = true;
+        core.mgr.session_list = vec![SessionEntry {
+            meta: SessionMeta {
+                index: 0,
+                word_id: "eagle".into(),
+                name: "eagle".into(),
+                cwd: "/".into(),
+            },
+            panes: vec![PaneInfo {
+                pane_id: "eagle/0".into(),
+                pane_index: 0,
+                program: String::new(),
+                size: TermSize::default(),
+                attached_clients: vec![],
+                status,
+                title: String::new(),
+            }],
+            tabs: vec![TabInfo {
+                tab_index: 0,
+                name: "1".into(),
+                layout: LayoutNode::single(0),
+                focused_pane: 0,
+            }],
+            active_tab: 0,
+        }];
+        core.mgr.active_pane = Some("eagle/0".into());
+        core
+    }
+
+    #[tokio::test]
+    async fn close_pane_defers_then_undo_keeps_the_pane() {
+        use kmux_protocol::messages::SessionStatus;
+        let mut core = core_with_active_pane(SessionStatus::Running);
+        let nonce = core.soft_close_nonce;
+
+        // Close → deferred, not killed immediately.
+        core.dispatch_action(Action::ClosePane).await;
+        assert!(core.is_pane_pending_close("eagle/0"));
+        assert_eq!(core.soft_close_nonce, nonce + 1);
+
+        // A second close keeps the existing deadline (no duplicate).
+        core.dispatch_action(Action::ClosePane).await;
+        assert_eq!(core.pending_closes.len(), 1);
+
+        // Undo → cancelled; the shell was never touched.
+        core.dispatch_action(Action::UndoClose).await;
+        assert!(!core.has_pending_close());
+    }
+
+    #[test]
+    fn soft_close_fires_only_after_the_grace_window() {
+        use kmux_protocol::messages::SessionStatus;
+        let mut core = core_with_active_pane(SessionStatus::Running);
+        core.soft_close_active_pane();
+        assert!(core.has_pending_close());
+        // Before the deadline: nothing fires.
+        assert!(!core.fire_due_closes(Instant::now()));
+        assert!(core.has_pending_close());
+        // After the grace window: the close fires and the pending list drains.
+        let later = Instant::now() + SOFT_CLOSE_GRACE + std::time::Duration::from_millis(1);
+        assert!(core.fire_due_closes(later));
+        assert!(!core.has_pending_close());
+    }
+
+    #[test]
+    fn exited_pane_closes_immediately_without_grace() {
+        use kmux_protocol::messages::SessionStatus;
+        let mut core = core_with_active_pane(SessionStatus::Exited {
+            code: Some(0),
+            signal: None,
+        });
+        core.soft_close_active_pane();
+        // An already-dead shell needs no grace: no pending close is scheduled.
+        assert!(!core.has_pending_close());
+    }
+
+    #[test]
+    fn reselecting_a_pane_cancels_its_pending_close() {
+        use kmux_protocol::messages::SessionStatus;
+        let mut core = core_with_active_pane(SessionStatus::Running);
+        core.soft_close_active_pane();
+        assert!(core.is_pane_pending_close("eagle/0"));
+        // "Re-opening" the pane within the window restores it.
+        core.apply_top_bar_action(TopBarAction::SelectPane("eagle/0".into()));
+        assert!(!core.has_pending_close());
     }
 
     #[tokio::test]
@@ -882,14 +1101,18 @@ mod tests {
     }
 
     #[test]
-    fn activate_session_picker_index_zero_opens_directory_picker() {
+    fn activate_session_picker_index_zero_opens_directory_browser() {
+        // Activating the synthetic "+ New session" row opens the directory
+        // browser. With no active session it seeds the browse dir from
+        // initial_cwd and starts row 0 with an empty filter.
         let mut core = fixture_core();
         core.mode = Mode::SessionPicker;
         core.session_picker_selected = 0;
         core.initial_cwd = "/home/u/proj".into();
         assert!(core.activate_picker_selection().is_none());
         assert_eq!(core.mode, Mode::DirectoryPicker);
-        assert_eq!(core.dir_picker_buffer, "/home/u/proj");
+        assert_eq!(core.dir_browser_cwd, "/home/u/proj");
+        assert!(core.dir_picker_buffer.is_empty());
         assert_eq!(core.dir_picker_selected, 0);
     }
 

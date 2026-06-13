@@ -111,6 +111,15 @@ pub fn init_logging(instance_id: &str) {
 /// Initialize logging, parse the CLI, run any non-interactive subcommand, and
 /// otherwise return the interactive launch plan.
 pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
+    use clap::CommandFactory;
+    // MUST stay first: clap_complete requires that nothing is written to stdout
+    // before this runs. On a completion request (the `COMPLETE=<shell>` env var
+    // is set) it prints the completions/registration script and exits the
+    // process; otherwise it returns and normal parsing proceeds. Placing it here
+    // — the shared CLI front door, ahead of logging and any GUI handoff — gives
+    // every frontend identical, always-in-sync dynamic completion for free.
+    clap_complete::CompleteEnv::with_factory(Cli::command).complete();
+
     init_logging(&instance_id);
 
     let cli = Cli::parse();

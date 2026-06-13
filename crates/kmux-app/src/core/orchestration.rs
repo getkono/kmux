@@ -15,6 +15,7 @@ use tracing::{info, warn};
 
 use base64::Engine;
 
+use super::DirBrowserRow;
 use crate::mode::Mode;
 use crate::recent_servers::{RecentServer, ServerKind};
 
@@ -159,9 +160,9 @@ impl AppCore {
                 self.mgr.create_session(None, Some(&cwd), size);
             }
         } else if self.mgr.session_list().is_empty() {
-            // Remote, no active sessions: pick a path for the first session.
-            self.dir_picker_buffer = self.initial_cwd.clone();
-            self.mode = Mode::DirectoryPicker;
+            // Remote, no active sessions: browse the daemon host's filesystem to
+            // pick where the first session is created (starts at initial_cwd).
+            self.open_directory_browser();
         } else {
             // Remote with active sessions: let the user pick one (or hit the
             // synthetic "[+] New session" entry to open the directory picker).
@@ -189,14 +190,95 @@ impl AppCore {
             .collect()
     }
 
-    /// Returns sessions whose CWD contains the current `dir_picker_buffer` text (case-insensitive).
-    pub fn dir_picker_matches(&self) -> Vec<&SessionEntry> {
+    /// The directory browser's rows for the current listing + filter, in render
+    /// order:
+    ///
+    /// 1. [`DirBrowserRow::CreateHere`] for `dir_browser_cwd` (always row 0).
+    /// 2. [`DirBrowserRow::Up`] for the listing's parent (only if it has one).
+    /// 3. one [`DirBrowserRow::Enter`] per subdirectory whose name contains the
+    ///    case-insensitive filter [`dir_picker_buffer`](AppCore::dir_picker_buffer).
+    ///
+    /// The entries/parent come from [`SessionManager::dir_listing`]; until the
+    /// first listing arrives only CreateHere is shown. Any listing `error` is
+    /// surfaced separately by [`AppCore::dir_browser_error`]; the rows still
+    /// include CreateHere (+ Up when known) so the user can always recover.
+    pub fn dir_browser_rows(&self) -> Vec<DirBrowserRow> {
+        // Prefer the daemon's *canonical* listed path for "create here" so the
+        // session is created in the directory actually resolved (which may
+        // differ from the requested `dir_browser_cwd` after canonicalization);
+        // before the first listing arrives we only know the requested path.
+        let create_cwd = self
+            .mgr
+            .dir_listing()
+            .map(|l| l.path.clone())
+            .unwrap_or_else(|| self.dir_browser_cwd.clone());
+        let mut rows = vec![DirBrowserRow::CreateHere { cwd: create_cwd }];
+        let Some(listing) = self.mgr.dir_listing() else {
+            return rows;
+        };
+        if let Some(parent) = &listing.parent {
+            rows.push(DirBrowserRow::Up {
+                parent: parent.clone(),
+            });
+        }
         let lower = self.dir_picker_buffer.to_lowercase();
+        for entry in &listing.entries {
+            if lower.is_empty() || entry.name.to_lowercase().contains(&lower) {
+                rows.push(DirBrowserRow::Enter {
+                    path: join_path(&listing.path, &entry.name),
+                    name: entry.name.clone(),
+                });
+            }
+        }
+        rows
+    }
+
+    /// The current directory listing's error message, if the last listing
+    /// failed (e.g. permission denied). Frontends surface this to the user.
+    pub fn dir_browser_error(&self) -> Option<&str> {
+        self.mgr.dir_listing().and_then(|l| l.error.as_deref())
+    }
+
+    /// Open the directory browser (the "new session — choose a directory"
+    /// overlay): seed the browse directory from the active session's cwd
+    /// (falling back to [`initial_cwd`](AppCore::initial_cwd)), clear the
+    /// filter, request a listing for that directory, and enter
+    /// [`Mode::DirectoryPicker`]. Shared by every entry point (the session
+    /// picker's "+ New session" row and the remote-no-sessions auto path).
+    pub fn open_directory_browser(&mut self) {
+        let cwd = self.active_session_cwd().unwrap_or_else(|| {
+            if self.dir_browser_cwd.is_empty() {
+                self.initial_cwd.clone()
+            } else {
+                self.dir_browser_cwd.clone()
+            }
+        });
+        self.dir_browser_cwd = cwd.clone();
+        self.dir_picker_buffer.clear();
+        self.dir_picker_selected = 0;
+        self.mgr.request_list_directory(cwd);
+        self.mode = Mode::DirectoryPicker;
+    }
+
+    /// Navigate the open directory browser to `path`: make it the browse
+    /// directory, clear the filter + selection, and request a fresh listing.
+    /// Leaves the mode untouched (the browser stays open and refreshes in
+    /// place when the listing arrives).
+    pub fn navigate_directory_browser(&mut self, path: String) {
+        self.dir_browser_cwd = path.clone();
+        self.dir_picker_buffer.clear();
+        self.dir_picker_selected = 0;
+        self.mgr.request_list_directory(path);
+    }
+
+    /// The active session's server-side cwd, if a session is active.
+    fn active_session_cwd(&self) -> Option<String> {
+        let word_id = self.mgr.active_session()?;
         self.mgr
             .session_list()
             .iter()
-            .filter(|e| lower.is_empty() || e.meta.cwd.to_lowercase().contains(&lower))
-            .collect()
+            .find(|e| e.meta.word_id == word_id)
+            .map(|e| e.meta.cwd.clone())
     }
 
     /// Returns sessions matching the current `session_picker_search` text
@@ -249,6 +331,12 @@ impl AppCore {
         let accept_invalid = self.mgr.accept_invalid_certs();
         let (rtt_tx, rtt_rx) = mpsc::unbounded_channel();
         self.mgr.set_rtt_sink(rtt_tx);
+        // Transport override (issue #69): a live channel for runtime changes,
+        // plus the current choice seeded into the supervisor so an override set
+        // before this (re)connect is honoured immediately.
+        let (override_tx, override_rx) = mpsc::unbounded_channel();
+        self.mgr.set_override_sink(override_tx);
+        let forced = self.mgr.transport_override();
 
         // Compose the supervisor's endpoint set: every probable transport
         // including the currently-active one. Without the active TCP+TLS
@@ -280,6 +368,8 @@ impl AppCore {
                 server_tx: srv_tx,
                 upgrade_tx,
                 rtt_rx: Some(rtt_rx),
+                forced,
+                override_rx: Some(override_rx),
             });
             supervisor.run().await;
         });
@@ -475,6 +565,17 @@ impl AppCore {
     }
 }
 
+/// Join a daemon-host directory `base` with a child `name` into a full path,
+/// using POSIX `/` separators (the daemon is always a Unix host). Avoids a
+/// double slash when `base` is the filesystem root.
+fn join_path(base: &str, name: &str) -> String {
+    if base.ends_with('/') {
+        format!("{base}{name}")
+    } else {
+        format!("{base}/{name}")
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -586,5 +687,286 @@ mod tests {
     fn osc52_invalid_base64_is_ignored() {
         let eff = osc52_clipboard_effect(Some("eagle"), "eagle/0", "c", "not valid base64!");
         assert!(eff.is_none());
+    }
+
+    // ── Directory browser ────────────────────────────────────────────────────
+
+    use crate::mode::Action;
+    use kmux_protocol::messages::{
+        ClientMessage, DirEntry, LayoutNode, PaneInfo, SessionMeta, SessionStatus, TabInfo,
+        TermSize,
+    };
+    use tokio::sync::mpsc::UnboundedReceiver;
+
+    /// A core whose manager has a live sender, so sent `ClientMessage`s can be
+    /// asserted on the returned receiver. Drains the initial session-list
+    /// request that `set_ws_sender` emits.
+    fn connected_core() -> (AppCore, UnboundedReceiver<ClientMessage>) {
+        let mut core = fixture_core();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        core.mgr.set_ws_sender(tx);
+        while rx.try_recv().is_ok() {}
+        (core, rx)
+    }
+
+    fn entry(word_id: &str, cwd: &str) -> SessionEntry {
+        SessionEntry {
+            meta: SessionMeta {
+                index: 0,
+                word_id: word_id.into(),
+                name: word_id.into(),
+                cwd: cwd.into(),
+            },
+            panes: vec![PaneInfo {
+                pane_id: format!("{word_id}/0"),
+                pane_index: 0,
+                program: String::new(),
+                size: TermSize::default(),
+                attached_clients: vec![],
+                status: SessionStatus::Running,
+                title: String::new(),
+            }],
+            tabs: vec![TabInfo {
+                tab_index: 0,
+                name: "1".into(),
+                layout: LayoutNode::single(0),
+                focused_pane: 0,
+            }],
+            active_tab: 0,
+        }
+    }
+
+    /// Drive a `DirectoryListing` into the manager for whatever `ListDirectory`
+    /// request is currently pending, so the browser sees a listing.
+    fn deliver_listing(core: &mut AppCore, path: &str, parent: Option<&str>, dirs: &[&str]) {
+        let request_id = core
+            .mgr
+            .pending_dir_request_for_test()
+            .expect("a ListDirectory request must be pending");
+        core.mgr
+            .handle_server_message(ServerMessage::DirectoryListing {
+                request_id,
+                path: path.into(),
+                parent: parent.map(Into::into),
+                entries: dirs
+                    .iter()
+                    .map(|n| DirEntry {
+                        name: (*n).into(),
+                        is_dir: true,
+                    })
+                    .collect(),
+                error: None,
+            });
+    }
+
+    #[test]
+    fn opening_browser_seeds_cwd_from_active_session_and_requests_listing() {
+        let (mut core, mut rx) = connected_core();
+        core.initial_cwd = "/fallback".into();
+        core.mgr
+            .session_list
+            .push(entry("eagle", "/home/user/proj"));
+        core.mgr.select_session("eagle".into());
+        while rx.try_recv().is_ok() {}
+
+        core.open_directory_browser();
+
+        assert_eq!(core.mode, Mode::DirectoryPicker);
+        assert_eq!(core.dir_browser_cwd, "/home/user/proj");
+        assert!(core.dir_picker_buffer.is_empty());
+        match rx.try_recv().expect("a listing was requested") {
+            ClientMessage::ListDirectory { path, .. } => assert_eq!(path, "/home/user/proj"),
+            other => panic!("expected ListDirectory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn opening_browser_falls_back_to_initial_cwd_without_active_session() {
+        let (mut core, mut rx) = connected_core();
+        core.initial_cwd = "/fallback".into();
+
+        core.open_directory_browser();
+
+        assert_eq!(core.dir_browser_cwd, "/fallback");
+        match rx.try_recv().expect("a listing was requested") {
+            ClientMessage::ListDirectory { path, .. } => assert_eq!(path, "/fallback"),
+            other => panic!("expected ListDirectory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dir_browser_rows_order_create_here_then_up_then_filtered_subdirs() {
+        let (mut core, _rx) = connected_core();
+        core.open_directory_browser();
+        deliver_listing(
+            &mut core,
+            "/home/user",
+            Some("/home"),
+            &["dev", "docs", "music"],
+        );
+
+        let rows = core.dir_browser_rows();
+        // CreateHere carries the canonical listed path.
+        assert_eq!(
+            rows[0],
+            DirBrowserRow::CreateHere {
+                cwd: "/home/user".into()
+            }
+        );
+        assert_eq!(
+            rows[1],
+            DirBrowserRow::Up {
+                parent: "/home".into()
+            }
+        );
+        assert_eq!(
+            &rows[2..],
+            &[
+                DirBrowserRow::Enter {
+                    path: "/home/user/dev".into(),
+                    name: "dev".into()
+                },
+                DirBrowserRow::Enter {
+                    path: "/home/user/docs".into(),
+                    name: "docs".into()
+                },
+                DirBrowserRow::Enter {
+                    path: "/home/user/music".into(),
+                    name: "music".into()
+                },
+            ]
+        );
+
+        // The filter narrows the subdir rows (case-insensitive) and keeps the
+        // CreateHere + Up rows so the user can always recover.
+        core.dir_picker_buffer = "DO".into();
+        let rows = core.dir_browser_rows();
+        assert!(matches!(rows[0], DirBrowserRow::CreateHere { .. }));
+        assert!(matches!(rows[1], DirBrowserRow::Up { .. }));
+        let names: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                DirBrowserRow::Enter { name, .. } => Some(name.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(names, vec!["docs"]);
+    }
+
+    #[test]
+    fn dir_browser_rows_omit_up_at_filesystem_root() {
+        let (mut core, _rx) = connected_core();
+        core.open_directory_browser();
+        deliver_listing(&mut core, "/", None, &["bin", "etc"]);
+
+        let rows = core.dir_browser_rows();
+        assert!(matches!(rows[0], DirBrowserRow::CreateHere { .. }));
+        assert!(
+            !rows.iter().any(|r| matches!(r, DirBrowserRow::Up { .. })),
+            "no Up row at the filesystem root"
+        );
+    }
+
+    #[tokio::test]
+    async fn submit_create_here_sends_session_create_with_browsed_cwd() {
+        let (mut core, mut rx) = connected_core();
+        core.open_directory_browser();
+        deliver_listing(&mut core, "/srv/app", Some("/srv"), &["sub"]);
+        while rx.try_recv().is_ok() {}
+
+        // Row 0 is CreateHere; submit it.
+        core.dir_picker_selected = 0;
+        core.dispatch_action(Action::DirPickerSubmit).await;
+
+        assert_eq!(core.mode, Mode::Normal);
+        match rx.try_recv().expect("a session create was sent") {
+            ClientMessage::SessionCreate { cwd, .. } => {
+                assert_eq!(cwd.as_deref(), Some("/srv/app"));
+            }
+            other => panic!("expected SessionCreate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_subdir_requests_new_listing_and_keeps_browser_open() {
+        let (mut core, mut rx) = connected_core();
+        core.open_directory_browser();
+        deliver_listing(&mut core, "/home/user", Some("/home"), &["dev"]);
+        while rx.try_recv().is_ok() {}
+
+        // Select the "dev" Enter row (row 2: CreateHere, Up, dev) and submit.
+        core.dir_picker_selected = 2;
+        core.dispatch_action(Action::DirPickerSubmit).await;
+
+        // Navigation keeps the browser open and re-targets the browse dir.
+        assert_eq!(core.mode, Mode::DirectoryPicker);
+        assert_eq!(core.dir_browser_cwd, "/home/user/dev");
+        match rx.try_recv().expect("a new listing was requested") {
+            ClientMessage::ListDirectory { path, .. } => assert_eq!(path, "/home/user/dev"),
+            other => panic!("expected ListDirectory, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_up_navigates_to_parent() {
+        let (mut core, mut rx) = connected_core();
+        core.open_directory_browser();
+        deliver_listing(&mut core, "/home/user", Some("/home"), &["dev"]);
+        while rx.try_recv().is_ok() {}
+
+        core.dir_picker_selected = 1; // the Up row
+        core.dispatch_action(Action::DirPickerSubmit).await;
+
+        assert_eq!(core.mode, Mode::DirectoryPicker);
+        assert_eq!(core.dir_browser_cwd, "/home");
+        match rx.try_recv().expect("a parent listing was requested") {
+            ClientMessage::ListDirectory { path, .. } => assert_eq!(path, "/home"),
+            other => panic!("expected ListDirectory, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn submit_typed_absolute_path_navigates_when_unmatched() {
+        let (mut core, mut rx) = connected_core();
+        core.open_directory_browser();
+        deliver_listing(&mut core, "/home/user", Some("/home"), &["dev"]);
+        while rx.try_recv().is_ok() {}
+
+        // Type an absolute path that matches no listed subdir, then submit while
+        // CreateHere (row 0) is selected: the browser navigates to the typed path.
+        core.dir_picker_selected = 0;
+        core.dir_picker_buffer = "/var/log".into();
+        core.dispatch_action(Action::DirPickerSubmit).await;
+
+        assert_eq!(core.mode, Mode::DirectoryPicker);
+        assert_eq!(core.dir_browser_cwd, "/var/log");
+        match rx
+            .try_recv()
+            .expect("a listing for the typed path was requested")
+        {
+            ClientMessage::ListDirectory { path, .. } => assert_eq!(path, "/var/log"),
+            other => panic!("expected ListDirectory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dir_browser_surfaces_listing_error() {
+        let (mut core, _rx) = connected_core();
+        core.open_directory_browser();
+        let request_id = core.mgr.pending_dir_request_for_test().unwrap();
+        core.mgr
+            .handle_server_message(ServerMessage::DirectoryListing {
+                request_id,
+                path: "/root".into(),
+                parent: None,
+                entries: vec![],
+                error: Some("Permission denied".into()),
+            });
+        assert_eq!(core.dir_browser_error(), Some("Permission denied"));
+        // Even on error, CreateHere is present so the user can recover.
+        assert!(matches!(
+            core.dir_browser_rows().first(),
+            Some(DirBrowserRow::CreateHere { .. })
+        ));
     }
 }

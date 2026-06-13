@@ -7,7 +7,7 @@ use kmux_protocol::messages::{
 };
 use tracing::{info, warn};
 
-use super::{PaneSync, SessionManager};
+use super::{DirListing, PaneSync, SessionManager};
 
 /// High-level events emitted by `handle_server_message` for the UI to react to.
 #[derive(Debug, Clone)]
@@ -46,6 +46,9 @@ pub enum SessionEvent {
     InputLockDenied { pane_id: String, holder: ClientId },
     /// Input lock released on a pane.
     InputLockReleased { pane_id: String },
+    /// A directory listing arrived (in response to `request_list_directory`);
+    /// the app-layer directory browser should repaint.
+    DirectoryListed,
 }
 
 impl SessionManager {
@@ -570,6 +573,28 @@ impl SessionManager {
                 self.input_locked.insert(pane_id.clone(), false);
                 self.status_msg = format!("Input lock released on '{pane_id}'");
                 events.push(SessionEvent::InputLockReleased { pane_id });
+            }
+
+            ServerMessage::DirectoryListing {
+                request_id,
+                path,
+                parent,
+                entries,
+                error,
+            } => {
+                // Drop stale replies: only the most recent request counts (the
+                // user may have navigated again before this listing returned).
+                if self.pending_dir_request != Some(request_id) {
+                    return events;
+                }
+                self.pending_dir_request = None;
+                self.dir_listing = Some(DirListing {
+                    path,
+                    parent,
+                    entries,
+                    error,
+                });
+                events.push(SessionEvent::DirectoryListed);
             }
 
             ServerMessage::ScrollbackAppend {

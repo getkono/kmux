@@ -46,6 +46,9 @@ pub mod cmd;
 /// CLI argument definitions (clap).
 pub mod cli;
 
+/// Dynamic shell-completion value sources (clap_complete `unstable-dynamic`).
+pub mod completion;
+
 /// Terminal capability detection (env-based; frontend-agnostic).
 pub mod host_caps;
 
@@ -62,3 +65,9 @@ pub mod core;
 /// The toolkit-agnostic run-loop driver ([`driver::FrontendDriver`]) that owns
 /// the network channels + pump shared by every frontend.
 pub mod driver;
+
+/// Serializes process-environment mutation (`XDG_CONFIG_HOME` / `XDG_RUNTIME_DIR`)
+/// across the whole `kmux-app` test binary, since several modules' tests redirect
+/// the same vars and Cargo runs tests in parallel threads within one process.
+#[cfg(test)]
+pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

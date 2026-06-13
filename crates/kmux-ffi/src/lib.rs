@@ -49,7 +49,7 @@ use tokio::runtime::Runtime;
 use kmux_app::appearance::{Appearance, CellAdjust};
 use kmux_app::cmd;
 use kmux_app::config;
-use kmux_app::core::{AppCore, TopBarAction};
+use kmux_app::core::{AppCore, DirBrowserRow, TopBarAction};
 use kmux_app::driver::{FrontendDriver, FrontendEffect};
 use kmux_app::mode::{Action, CommandState, Mode};
 use kmux_app::subcommands::parse_target;
@@ -71,7 +71,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 8;
+pub const KMUX_FFI_ABI_VERSION: u32 = 9;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -147,6 +147,8 @@ pub enum FfiAction {
     },
     CreatePane,
     ClosePane,
+    /// Cancel the most recent soft-close within its grace window (issue #86).
+    UndoClose,
     NextPane,
     PrevPane,
     CloseTab,
@@ -180,6 +182,8 @@ pub enum FfiAction {
     ScrollPageDown,
     ToggleHud,
     ToggleMetrics,
+    /// Toggle the connection inspector overlay (issue #60).
+    ToggleConnection,
     ToggleInputLock,
     CopySelection,
     Paste,
@@ -197,6 +201,7 @@ impl From<FfiAction> for Action {
             FfiAction::JumpToSession { index } => Action::JumpToSession(index as usize),
             FfiAction::CreatePane => Action::CreatePane,
             FfiAction::ClosePane => Action::ClosePane,
+            FfiAction::UndoClose => Action::UndoClose,
             FfiAction::NextPane => Action::NextPane,
             FfiAction::PrevPane => Action::PrevPane,
             FfiAction::CloseTab => Action::CloseTab,
@@ -222,6 +227,7 @@ impl From<FfiAction> for Action {
             FfiAction::ScrollPageDown => Action::ScrollPageDown,
             FfiAction::ToggleHud => Action::ToggleHud,
             FfiAction::ToggleMetrics => Action::ToggleMetrics,
+            FfiAction::ToggleConnection => Action::ToggleConnection,
             FfiAction::ToggleInputLock => Action::ToggleInputLock,
             FfiAction::CopySelection => Action::CopySelection,
             FfiAction::Paste => Action::Paste,
@@ -552,6 +558,50 @@ impl From<&ConnectionState> for FfiConnStatus {
 pub struct FfiConnInfo {
     pub status: FfiConnStatus,
     pub label: String,
+    /// Whether the transport is pinned via the override (issue #69). When true,
+    /// the protocol indicator renders in an "overridden" style.
+    pub transport_overridden: bool,
+}
+
+/// Recent round-trip-time summary for the active transport (connection
+/// inspector). Mirrors `kmux_app::core::RttInfo`.
+#[derive(uniffi::Record)]
+pub struct FfiRtt {
+    /// EWMA latency in ms, or `None` before the first Ping/Pong.
+    pub ewma_ms: Option<f64>,
+    pub recent_avg_ms: f64,
+    pub recent_max_ms: f64,
+    pub samples: u64,
+}
+
+/// Per-transport byte/message traffic totals (connection inspector). Mirrors
+/// `kmux_app::core::TransportTraffic`.
+#[derive(uniffi::Record)]
+pub struct FfiTransportTraffic {
+    pub label: String,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub msgs_in: u64,
+    pub msgs_out: u64,
+}
+
+/// The connection / session / handshake technical details rendered by the
+/// connection inspector (issue #60). Mirrors `kmux_app::core::ConnectionInfo`.
+#[derive(uniffi::Record)]
+pub struct FfiConnectionDetails {
+    pub server: String,
+    pub is_local: bool,
+    pub endpoint: String,
+    pub state: String,
+    pub connected: bool,
+    pub transport: String,
+    pub connection_id: Option<u64>,
+    pub client_id: Option<u64>,
+    pub server_version: Option<String>,
+    pub protocol_version: u32,
+    pub accept_invalid_certs: bool,
+    pub rtt: Option<FfiRtt>,
+    pub transports: Vec<FfiTransportTraffic>,
 }
 
 /// One session in the session list.
@@ -737,6 +787,62 @@ pub struct FfiPicker {
     pub query: String,
     pub selected: u32,
     pub entries: Vec<FfiPickerEntry>,
+}
+
+/// The role of a directory-browser row, so the native UI can render the right
+/// glyph and the activation is unambiguous.
+#[derive(uniffi::Enum, PartialEq, Eq)]
+pub enum FfiDirRowKind {
+    /// Create a new session in the browsed directory (row 0).
+    CreateHere,
+    /// Navigate up to the parent directory.
+    Up,
+    /// Navigate into a subdirectory.
+    Enter,
+}
+
+/// One row in the directory browser (the "new session — choose a directory"
+/// overlay).
+#[derive(uniffi::Record)]
+pub struct FfiDirRow {
+    pub kind: FfiDirRowKind,
+    /// A user-facing label (the directory name, the parent path, or the
+    /// "new session in …" affordance).
+    pub label: String,
+    /// The target path this row acts on (the browsed dir for CreateHere, the
+    /// parent for Up, the subdir for Enter).
+    pub path: String,
+}
+
+/// The directory browser's full state, for native rendering. The list lets the
+/// user navigate the daemon host's filesystem (so it works for a remote daemon)
+/// and pick where a new session is created. Driven via `set_picker_search`
+/// (filter), `set_picker_selected`, and `submit_directory` / `activate_picker`
+/// (which create-here or navigate based on the selected row); `cancel_picker`
+/// dismisses it.
+#[derive(uniffi::Record)]
+pub struct FfiDirBrowser {
+    /// The directory currently being browsed.
+    pub cwd: String,
+    /// The current filter text.
+    pub query: String,
+    /// The highlighted row index.
+    pub selected: u32,
+    /// The browsable rows in render order (CreateHere, optional Up, subdirs).
+    pub rows: Vec<FfiDirRow>,
+    /// A listing error to surface (e.g. permission denied), if any.
+    pub error: Option<String>,
+}
+
+/// A user-facing label for a directory-browser row, shared by the generic
+/// `picker()` getter and the structured `dir_browser()` getter so both render
+/// the row identically.
+fn dir_row_label(row: &DirBrowserRow) -> String {
+    match row {
+        DirBrowserRow::CreateHere { cwd } => format!("＋  New session in {cwd}"),
+        DirBrowserRow::Up { parent } => format!("..  {parent}"),
+        DirBrowserRow::Enter { name, .. } => format!("📁  {name}"),
+    }
 }
 
 /// Client-side performance counters for the HUD ticker / metrics inspector.
@@ -1030,7 +1136,17 @@ impl KmuxDriver {
         FfiConnInfo {
             status: FfiConnStatus::from(state),
             label: state.badge_label(),
+            transport_overridden: d.mgr.transport_override().is_some(),
         }
+    }
+
+    /// Whether a pane is in its soft-close grace window (issue #86), so the
+    /// frontend can show an "Undo" affordance.
+    pub fn soft_close_pending(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .has_pending_close()
     }
 
     /// The session list, with the active session flagged.
@@ -1567,12 +1683,16 @@ impl KmuxDriver {
                 })
             }
             Mode::DirectoryPicker => {
+                // The directory picker is a *browser* of the daemon host's
+                // filesystem. The richer per-row state is exposed via
+                // `dir_browser()`; this generic getter keeps the picker sheet
+                // presenting and shows readable row labels.
                 let entries = core
-                    .dir_picker_matches()
+                    .dir_browser_rows()
                     .into_iter()
-                    .map(|e| FfiPickerEntry {
-                        label: core.mgr.display_name_for(&e.meta.word_id),
-                        detail: e.meta.cwd.clone(),
+                    .map(|row| FfiPickerEntry {
+                        label: dir_row_label(&row),
+                        detail: String::new(),
                     })
                     .collect();
                 Some(FfiPicker {
@@ -1584,6 +1704,37 @@ impl KmuxDriver {
             }
             _ => None,
         }
+    }
+
+    /// The directory browser's full state (rows with their kind, the browsed
+    /// directory, filter, selection, and any listing error), or `None` when the
+    /// directory browser is not open. Backs the native directory-browser UI.
+    pub fn dir_browser(&self) -> Option<FfiDirBrowser> {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core();
+        if !matches!(core.mode, Mode::DirectoryPicker) {
+            return None;
+        }
+        let rows = core
+            .dir_browser_rows()
+            .into_iter()
+            .map(|row| {
+                let label = dir_row_label(&row);
+                let (kind, path) = match row {
+                    DirBrowserRow::CreateHere { cwd } => (FfiDirRowKind::CreateHere, cwd),
+                    DirBrowserRow::Up { parent } => (FfiDirRowKind::Up, parent),
+                    DirBrowserRow::Enter { path, .. } => (FfiDirRowKind::Enter, path),
+                };
+                FfiDirRow { kind, label, path }
+            })
+            .collect();
+        Some(FfiDirBrowser {
+            cwd: core.dir_browser_cwd.clone(),
+            query: core.dir_picker_buffer.clone(),
+            selected: core.dir_picker_selected as u32,
+            rows,
+            error: core.dir_browser_error().map(|s| s.to_string()),
+        })
     }
 
     /// Open the recent-servers picker.
@@ -1633,11 +1784,37 @@ impl KmuxDriver {
             .collect()
     }
 
-    /// Submit the directory picker's typed path: select the matching session or
-    /// create a new one at that path (the create-from-typed-path path that a
-    /// plain `activate_picker` click does not cover).
+    /// Submit the directory browser's selected row: create-here returns to
+    /// normal interaction, navigation (Up / into a subdir, or a typed absolute
+    /// path) refreshes the listing in place. Also honors a typed absolute path
+    /// in the filter when it matches no listed row.
     pub fn submit_directory(&self) -> Vec<FfiEffect> {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
+        self.rt
+            .block_on(d.dispatch_action(Action::DirPickerSubmit))
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// Activate directory-browser row `index` (a tap): selects it, then submits.
+    /// CreateHere creates the session and dismisses; Up / a subdirectory
+    /// navigate and keep the browser open (it refreshes when the listing lands).
+    pub fn dir_browser_activate(&self, index: u32) -> Vec<FfiEffect> {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.core_mut().set_picker_selected(index as usize);
+        self.rt
+            .block_on(d.dispatch_action(Action::DirPickerSubmit))
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// Create a new session in the directory currently being browsed (the
+    /// CreateHere affordance), regardless of the highlighted row.
+    pub fn dir_browser_open_here(&self) -> Vec<FfiEffect> {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.core_mut().set_picker_selected(0);
         self.rt
             .block_on(d.dispatch_action(Action::DirPickerSubmit))
             .into_iter()
@@ -1683,6 +1860,51 @@ impl KmuxDriver {
             .lock()
             .expect("driver mutex poisoned")
             .metrics_overlay_visible
+    }
+
+    /// Whether the connection inspector overlay is open (issue #60).
+    pub fn connection_visible(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .connection_overlay_visible
+    }
+
+    /// The live connection / session / handshake details for the connection
+    /// inspector. Built from the toolkit-neutral `ConnectionInfo`.
+    pub fn connection_details(&self) -> FfiConnectionDetails {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let info = d.core().connection_info();
+        FfiConnectionDetails {
+            server: info.server,
+            is_local: info.is_local,
+            endpoint: info.endpoint,
+            state: info.state,
+            connected: info.connected,
+            transport: info.transport,
+            connection_id: info.connection_id,
+            client_id: info.client_id,
+            server_version: info.server_version,
+            protocol_version: info.protocol_version,
+            accept_invalid_certs: info.accept_invalid_certs,
+            rtt: info.rtt.map(|r| FfiRtt {
+                ewma_ms: r.ewma_ms,
+                recent_avg_ms: r.recent_avg_ms,
+                recent_max_ms: r.recent_max_ms,
+                samples: r.samples,
+            }),
+            transports: info
+                .transports
+                .into_iter()
+                .map(|t| FfiTransportTraffic {
+                    label: t.label,
+                    bytes_in: t.bytes_in,
+                    bytes_out: t.bytes_out,
+                    msgs_in: t.msgs_in,
+                    msgs_out: t.msgs_out,
+                })
+                .collect(),
+        }
     }
 
     /// A snapshot of the client-side performance metrics.
@@ -1909,6 +2131,11 @@ mod tests {
         assert_eq!(
             Action::from(FfiAction::FocusPaneAt { index: 2 }),
             Action::FocusPaneAt(2)
+        );
+        assert_eq!(Action::from(FfiAction::UndoClose), Action::UndoClose);
+        assert_eq!(
+            Action::from(FfiAction::ToggleConnection),
+            Action::ToggleConnection
         );
     }
 

@@ -23,7 +23,11 @@ kmux-app = { path = "crates/kmux-app" }
 anyhow = "1"
 base64 = "0.22"
 bitflags = "2.11.1"
-clap = { version = "4.6.1", features = ["derive"] }
+clap = { version = "4.6.1", features = ["derive", "unstable-ext"] }
+# Dynamic shell completion engine (CompleteEnv + custom value completers). Both
+# `unstable-dynamic` and clap's `unstable-ext` track clap's minor version, so
+# keep this tilde-pinned in lockstep with clap (4.6.x). See docs/shell-completion.md.
+clap_complete = { version = "~4.6", features = ["unstable-dynamic"] }
 arboard = { version = "3", default-features = false }
 futures = "0.3"
 daemonize = "0.5"
