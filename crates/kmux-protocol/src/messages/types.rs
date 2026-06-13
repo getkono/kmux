@@ -42,10 +42,33 @@ impl fmt::Display for TransportKind {
 /// - Adding new enum variants (postcard encodes variant index as a varint).
 /// - Changing the semantics of an existing field in a way that old code would
 ///   misinterpret.
+/// - Changing the wire framing (e.g. the per-frame codec tag added in v23 for
+///   protocol compression — see [`Compression`] and `docs/compression.md`).
 ///
 /// You do **not** need to bump for purely behavioural changes that leave the
 /// wire format unchanged (e.g. changing server-side timeout values).
-pub const PROTOCOL_VERSION: u32 = 22;
+///
+/// # History
+///
+/// - **23**: per-frame compression — `AuthResult.compression` and the
+///   self-describing frame codec tag.
+pub const PROTOCOL_VERSION: u32 = 23;
+
+/// Wire compression algorithm negotiated for a connection.
+///
+/// The daemon decides per connection whether to compress (see
+/// `docs/compression.md`) and echoes the chosen algorithm in
+/// [`ServerMessage::AuthResult`](crate::messages::ServerMessage). Because the
+/// exact-match `PROTOCOL_VERSION` handshake already guarantees both peers share
+/// an identical codec set, only the *policy* is negotiated, never *support*.
+///
+/// The level used by the compressor is a sender-side choice and is intentionally
+/// not on the wire — the decompressor reconstructs it from the zstd frame.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum Compression {
+    /// zstd (RFC 8878). The v1 default; see issue #59.
+    Zstd,
+}
 
 /// Parse a version-mismatch reason string and return an actionable upgrade
 /// hint, or an empty string if the reason is not a version mismatch.

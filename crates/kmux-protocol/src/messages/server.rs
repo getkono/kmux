@@ -5,6 +5,7 @@ use super::session::{
     ClientId, ConnectionId, ErrorCode, LayoutNode, PaneId, PaneInfo, RequestId, SequenceNo,
     SessionEntry, SessionEventMsg, TabIndex, TabInfo, WordId,
 };
+use super::types::Compression;
 use super::vt::{CellState, CursorState, GridSnapshot, TermModes, TerminalDiff};
 
 /// Messages sent from server -> client.
@@ -23,6 +24,13 @@ pub enum ServerMessage {
         /// when re-authenticating on a new transport channel.
         #[serde(default)]
         connection_id: Option<ConnectionId>,
+        /// Compression the daemon chose for this connection (HTTP
+        /// `Content-Encoding` analogue). `None` = uncompressed. The daemon
+        /// decides based on client locality and config; the client only needs
+        /// this for observability since `read_frame` decompresses per-frame
+        /// regardless. See `docs/compression.md`.
+        #[serde(default)]
+        compression: Option<Compression>,
     },
 
     /// Confirmation that the channel switch is complete. Sent in response to
@@ -488,6 +496,7 @@ mod tests {
                     client_id: None,
                     server_version: None,
                     connection_id: None,
+                    compression: None,
                 },
                 MessageCategory::Bootstrap,
             ),

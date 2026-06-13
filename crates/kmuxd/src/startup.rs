@@ -78,7 +78,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     }
     println!("Auth token: {token}");
 
-    let app = Arc::new(ServerApp::new(token.clone()));
+    let app = Arc::new(ServerApp::new(token.clone()).with_compression(cfg.compression.clone()));
 
     // Restore persisted sessions from the previous daemon instance, if any.
     // With a successful handoff, panes named in `inherited` keep their live

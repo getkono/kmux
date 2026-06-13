@@ -2,14 +2,16 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kmux_protocol::messages::{ErrorCode, ServerMessage};
-use kmux_protocol::{encode_server, write_frame};
+use kmux_protocol::{Compressor, encode_server, write_frame_compressed};
 use quinn::Connection;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 use tracing::{Instrument, debug};
 
 use crate::app::{AttachResult, ServerApp};
-use crate::client_handler::{PaneAttacher, build_attach_replay, run_client_session};
+use crate::client_handler::{
+    OutboundCompression, PaneAttacher, build_attach_replay, run_client_session,
+};
 
 pub fn classify_error(e: &kmux_pty::error::KmuxError) -> ErrorCode {
     match e {
@@ -25,6 +27,8 @@ pub fn classify_error(e: &kmux_pty::error::KmuxError) -> ErrorCode {
 /// Streams pane diffs to the client over a QUIC unidirectional stream.
 struct QuicAttacher {
     conn: Connection,
+    /// Shared outbound compression policy for this connection's pane streams.
+    comp_out: Arc<OutboundCompression>,
 }
 
 impl PaneAttacher for QuicAttacher {
@@ -35,13 +39,14 @@ impl PaneAttacher for QuicAttacher {
         mut client_rx: mpsc::Receiver<ServerMessage>,
     ) -> impl std::future::Future<Output = Result<AbortHandle, String>> + Send {
         let conn = self.conn.clone();
+        let comp_out = Arc::clone(&self.comp_out);
         async move {
             let uni_stream = conn
                 .open_uni()
                 .await
                 .map_err(|e| format!("failed to open uni stream: {e}"))?;
             let handle = tokio::spawn(async move {
-                pane_uni_writer(uni_stream, result, pane_id, &mut client_rx).await;
+                pane_uni_writer(uni_stream, result, pane_id, &mut client_rx, &comp_out).await;
             })
             .abort_handle();
             Ok(handle)
@@ -57,9 +62,13 @@ async fn pane_uni_writer(
     attach_result: AttachResult,
     pane_id: String,
     client_rx: &mut mpsc::Receiver<ServerMessage>,
+    comp_out: &OutboundCompression,
 ) {
     for msg in build_attach_replay(attach_result, &pane_id) {
-        if send_frame(&mut uni, &msg).await.is_err() {
+        if send_frame(&mut uni, &msg, comp_out.compressor())
+            .await
+            .is_err()
+        {
             return;
         }
     }
@@ -74,7 +83,10 @@ async fn pane_uni_writer(
             crate::impair::maybe_delay(cfg, msg.category(), rng).await;
         }
         let write_start = Instant::now();
-        if send_frame(&mut uni, &msg).await.is_err() {
+        if send_frame(&mut uni, &msg, comp_out.compressor())
+            .await
+            .is_err()
+        {
             break;
         }
         let write_us = write_start.elapsed().as_micros();
@@ -89,12 +101,16 @@ async fn pane_uni_writer(
 async fn send_frame(
     stream: &mut quinn::SendStream,
     msg: &ServerMessage,
+    comp: Compressor,
 ) -> Result<(), kmux_protocol::ProtocolError> {
     let bytes = encode_server(msg)?;
     if bytes.len() > 4096 {
         debug!(frame_bytes = bytes.len(), "large frame");
     }
-    write_frame(stream, &bytes).await
+    crate::capture::record(msg.category(), &bytes);
+    write_frame_compressed(stream, &bytes, comp)
+        .await
+        .map(|_| ())
 }
 
 // ─── QUIC connection handler ──────────────────────────────────────────────────
@@ -120,7 +136,10 @@ pub async fn handle_with_io<R, W>(
         writer,
         app,
         transport,
-        |_| QuicAttacher { conn: conn.clone() },
+        |_ctrl_tx, comp_out| QuicAttacher {
+            conn: conn.clone(),
+            comp_out,
+        },
         conn_span.clone(),
     )
     .instrument(conn_span)

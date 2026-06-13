@@ -44,34 +44,24 @@ rather than a full VT parser.
 
 ---
 
-## 2. Streaming Compression (zstd/LZ4)
+## 2. Protocol Compression (zstd) — ✅ Implemented (issue #59)
 
-**Current behavior:** PTY output bytes are sent uncompressed. Each
-`ServerMessage::PtyOutput` is postcard-encoded (`frame.rs:23-24`) and sent
-as a raw WebSocket binary frame. The `data: Vec<u8>` field in
-`messages.rs:205` carries verbatim terminal output.
+**Status:** Shipped as **stateless per-frame zstd** negotiated on the handshake.
+See [compression.md](compression.md) for the full design; this entry is kept as
+a roadmap pointer.
 
-**Why it's slow:** Terminal output is highly compressible -- repeated
-whitespace, ANSI escape sequences, and structured text (logs, code) see
-3-10x compression ratios. SSH achieves this with optional zlib compression.
-kmux sends every byte uncompressed, wasting bandwidth especially over
-WAN links.
+Terminal output is highly compressible (repeated whitespace, ANSI escapes,
+structured logs/code: 3–8×). The daemon now compresses server→client frames when
+the client is non-local (config-overridable), via a self-describing per-frame
+codec tag in `crates/kmux-protocol/src/codec.rs` — orthogonal to transport, so it
+covers QUIC, TCP+TLS, and UDS uniformly. The choice was **stateless per-frame**
+(not the streaming wrap originally sketched here) so it survives QUIC↔TCP
+transport swaps and `Lagged`/`SyncReset` gap recovery untouched.
 
-**Proposed change:** Add per-connection streaming compression negotiated
-during auth. The `ClientMessage::Auth` message would include a
-`compression: Option<CompressionAlgo>` field. When agreed, both sides wrap
-their WebSocket streams in a `zstd::stream::Encoder` /
-`zstd::stream::Decoder` (or LZ4 for lower latency). Compression applies
-to the postcard-encoded bytes before WS framing.
-
-**Estimated effort:** Medium. Requires a new dependency (`zstd` or `lz4`),
-negotiation logic in `connection.rs:57-83` (auth handler), and wrapping the
-sink/stream in `writer_loop` (line 354-368) and the client's `connect.rs`.
-
-**Relevant code:**
-- `crates/kmux-protocol/src/frame.rs:23-24` -- `encode_server` / `to_allocvec`
-- `crates/kmuxd/src/connection.rs:354-368` -- `writer_loop` sends raw bytes
-- `crates/kmux-protocol/src/messages.rs:106-110` -- `Auth` message (negotiation point)
+**Follow-ups** (gated on empirical capture/replay — see compression.md):
+- A trained static dictionary to also shrink small per-cell diffs.
+- Client→server (paste) compression.
+- Level retune from real traces.
 
 ---
 
@@ -291,7 +281,7 @@ framing.
 | #   | Optimization           | Bandwidth | Latency | CPU | Effort    | Multi-client |
 | --- | ---------------------- | --------- | ------- | --- | --------- | ------------ |
 | 1   | Server-side VT + diffs | +++       | +       | ++  | Large     | +++          |
-| 2   | Streaming compression  | +++       | -       | -   | Medium    | ++           |
+| 2   | Protocol compression ✅ | +++       | -       | -   | Medium    | ++           |
 | 3   | Output coalescing      | +         | -       | ++  | Small     | ++           |
 | 4   | WS frame batching      | +         | +       | ++  | Small     | +            |
 | 5   | Zero-copy Bytes        | --        | +       | ++  | Medium    | ++           |

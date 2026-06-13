@@ -13,6 +13,7 @@
 
 use std::path::{Path, PathBuf};
 
+use kmux_protocol::TransportKind;
 use serde::{Deserialize, Serialize};
 
 // ─── Schema ──────────────────────────────────────────────────────────────────
@@ -50,6 +51,10 @@ pub struct ConfigFile {
     #[serde(default)]
     pub auth: AuthConfig,
 
+    /// Wire compression settings.
+    #[serde(default)]
+    pub compression: CompressionConfig,
+
     /// Daemon lifecycle settings.
     #[serde(default)]
     pub daemon: DaemonConfig,
@@ -65,6 +70,7 @@ impl Default for ConfigFile {
             listen: default_listen(),
             advertise: AdvertiseConfig::default(),
             auth: AuthConfig::default(),
+            compression: CompressionConfig::default(),
             daemon: DaemonConfig::default(),
         }
     }
@@ -265,6 +271,72 @@ impl Default for AuthConfig {
     }
 }
 
+/// Wire compression configuration (`[compression]` in `kmuxd.toml`).
+///
+/// The daemon decides per connection whether to compress server→client traffic;
+/// see `docs/compression.md`.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CompressionConfig {
+    /// When to compress. See [`CompressionMode`].
+    #[serde(default)]
+    pub mode: CompressionMode,
+    /// zstd compression level applied by the sender. The decoder reconstructs
+    /// it from the zstd frame, so it never appears on the wire.
+    #[serde(default = "default_compression_level")]
+    pub level: i32,
+    /// Frames smaller than this many bytes are never compressed: the zstd
+    /// overhead would dominate and tiny frames rarely shrink.
+    #[serde(default = "default_compression_min_size")]
+    pub min_size: usize,
+}
+
+impl Default for CompressionConfig {
+    fn default() -> Self {
+        Self {
+            mode: CompressionMode::default(),
+            level: default_compression_level(),
+            min_size: default_compression_min_size(),
+        }
+    }
+}
+
+fn default_compression_level() -> i32 {
+    3
+}
+fn default_compression_min_size() -> usize {
+    256
+}
+
+/// When the daemon compresses server→client traffic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum CompressionMode {
+    /// Compress non-local clients; leave local (UDS) clients uncompressed.
+    /// This is the issue #59 default ("on if the client is not local").
+    #[default]
+    Auto,
+    /// Always compress, regardless of locality.
+    Always,
+    /// Never compress.
+    Never,
+}
+
+impl CompressionConfig {
+    /// Whether compression should be enabled for a connection accepted on
+    /// `transport`, per the configured [`CompressionMode`].
+    pub fn enabled_for(&self, transport: TransportKind) -> bool {
+        match self.mode {
+            CompressionMode::Always => true,
+            CompressionMode::Never => false,
+            // A Unix-domain socket is same-host: bandwidth is free there, so
+            // spending CPU to compress is pure waste. Every other transport may
+            // cross a network and benefits from compression.
+            CompressionMode::Auto => transport != TransportKind::Uds,
+        }
+    }
+}
+
 // ─── Effective server config ─────────────────────────────────────────────────
 
 /// Resolved, validated server configuration (computed from `ConfigFile` + CLI overrides).
@@ -274,6 +346,7 @@ pub struct ServerConfig {
     pub listeners: Vec<ListenConfig>,
     pub advertise: AdvertiseConfig,
     pub auth: AuthConfig,
+    pub compression: CompressionConfig,
     pub runtime_dir: String,
     /// Seconds of inactivity (zero clients) before the daemon exits. `0` = disabled.
     pub idle_shutdown_secs: u64,
@@ -312,6 +385,7 @@ impl ServerConfig {
             listeners: file.listen,
             advertise: file.advertise,
             auth: file.auth,
+            compression: file.compression,
             runtime_dir: file.runtime_dir,
             idle_shutdown_secs: file.daemon.idle_shutdown_secs,
         })
@@ -608,6 +682,50 @@ port = 8443
             !content.contains("port"),
             "default config must not contain a port field"
         );
+    }
+
+    #[test]
+    fn compression_defaults_are_auto_level3() {
+        let cfg = CompressionConfig::default();
+        assert_eq!(cfg.mode, CompressionMode::Auto);
+        assert_eq!(cfg.level, 3);
+        assert_eq!(cfg.min_size, 256);
+    }
+
+    #[test]
+    fn compression_section_parses() {
+        let toml = r#"
+[compression]
+mode = "always"
+level = 9
+min_size = 128
+"#;
+        let cfg: ConfigFile = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.compression.mode, CompressionMode::Always);
+        assert_eq!(cfg.compression.level, 9);
+        assert_eq!(cfg.compression.min_size, 128);
+    }
+
+    #[test]
+    fn compression_enabled_for_transport() {
+        let auto = CompressionConfig::default();
+        // Auto: on for every networked transport, off for the local UDS path.
+        assert!(auto.enabled_for(TransportKind::Quic));
+        assert!(auto.enabled_for(TransportKind::Tcp));
+        assert!(auto.enabled_for(TransportKind::TcpTls));
+        assert!(!auto.enabled_for(TransportKind::Uds));
+
+        let always = CompressionConfig {
+            mode: CompressionMode::Always,
+            ..CompressionConfig::default()
+        };
+        assert!(always.enabled_for(TransportKind::Uds));
+
+        let never = CompressionConfig {
+            mode: CompressionMode::Never,
+            ..CompressionConfig::default()
+        };
+        assert!(!never.enabled_for(TransportKind::Quic));
     }
 
     #[test]

@@ -98,11 +98,15 @@ impl SessionManager {
                 client_id,
                 server_version,
                 connection_id,
+                compression,
             } => {
                 if success {
                     self.client_id = client_id;
                     self.server_version = server_version;
                     self.connection_id = connection_id;
+                    // The daemon decides compression; frames self-describe, so
+                    // this is informational only (see docs/compression.md).
+                    info!("Authenticated (wire compression: {compression:?})");
                     events.push(SessionEvent::AuthOk);
                 } else {
                     warn!("Auth failed: {:?}", reason);

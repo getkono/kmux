@@ -552,6 +552,7 @@ mod tests {
             client_id: Some(ClientId(42)),
             server_version: Some("0.1.0".to_string()),
             connection_id: None,
+            compression: None,
         });
         use super::server_handler::SessionEvent;
         assert!(matches!(events.as_slice(), [SessionEvent::AuthOk]));
@@ -572,6 +573,7 @@ mod tests {
             client_id: None,
             server_version: None,
             connection_id: None,
+            compression: None,
         });
         assert!(matches!(
             events.as_slice(),

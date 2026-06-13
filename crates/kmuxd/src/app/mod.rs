@@ -317,6 +317,9 @@ pub struct ConnectionMetrics {
     pub created_at: Instant,
     pub bytes_in: AtomicU64,
     pub bytes_out: AtomicU64,
+    /// What `bytes_out` would have been with no compression (same framing).
+    /// `bytes_out / bytes_out_uncompressed` is the realised compression ratio.
+    pub bytes_out_uncompressed: AtomicU64,
     pub msgs_in: AtomicU64,
     pub msgs_out: AtomicU64,
     /// Epoch-ms timestamp of the last inbound frame; 0 = none yet.
@@ -336,6 +339,7 @@ impl ConnectionMetrics {
             created_at: Instant::now(),
             bytes_in: AtomicU64::new(0),
             bytes_out: AtomicU64::new(0),
+            bytes_out_uncompressed: AtomicU64::new(0),
             msgs_in: AtomicU64::new(0),
             msgs_out: AtomicU64::new(0),
             last_activity_ms: AtomicU64::new(0),
@@ -358,6 +362,8 @@ pub struct ServerApp {
     /// PTY registry for spawning and managing child processes.
     pub manager: Arc<PtyRegistry>,
     pub auth_token: String,
+    /// Wire compression policy applied to server→client traffic.
+    pub compression: crate::config::CompressionConfig,
     /// Map of word_id -> SessionState.
     pub(super) sessions: RwLock<HashMap<kmux_protocol::messages::WordId, SessionState>>,
     /// Monotonic session creation counter.
@@ -387,6 +393,7 @@ impl ServerApp {
         Self {
             manager: Arc::new(PtyRegistry::new()),
             auth_token: token,
+            compression: crate::config::CompressionConfig::default(),
             sessions: RwLock::new(HashMap::new()),
             session_index_counter: AtomicU32::new(0),
             next_client_id: AtomicU64::new(1),
@@ -397,6 +404,13 @@ impl ServerApp {
             conn_count_tx,
             vt_events_tx,
         }
+    }
+
+    /// Override the wire compression policy (from `kmuxd.toml`). Builder-style so
+    /// `startup.rs` can configure it before wrapping the app in an `Arc`.
+    pub fn with_compression(mut self, compression: crate::config::CompressionConfig) -> Self {
+        self.compression = compression;
+        self
     }
 
     /// Subscribe to VT-derived events (e.g. `PaneTitleChanged`) that are

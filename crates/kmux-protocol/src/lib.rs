@@ -13,9 +13,9 @@ pub mod tls;
 // QUIC transport constants — re-exported from transport::quic for backward compat.
 pub use transport::quic::{QUIC_IDLE_TIMEOUT_SECS, QUIC_KEEP_ALIVE_SECS};
 
-pub use codec::{ProtocolError, decode_client, decode_server, encode_client, encode_server};
 #[cfg(feature = "framing")]
-pub use codec::{read_frame, write_frame};
+pub use codec::{Compressor, read_frame, write_frame, write_frame_compressed};
+pub use codec::{ProtocolError, decode_client, decode_server, encode_client, encode_server};
 pub use endpoint::Endpoint;
 pub use messages::{
     CellAttrs, CellColor, CellState, ClientId, ClientMessage, CursorShape, CursorState, DiffOp,

@@ -1,7 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use kmux_protocol::messages::{
-    ClientMessage, ErrorCode, ServerMessage, SessionEventMsg, epoch_millis,
+    ClientMessage, Compression, ErrorCode, ServerMessage, SessionEventMsg, epoch_millis,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -39,6 +39,7 @@ pub async fn handle_message<A: PaneAttacher>(
                     client_id: None,
                     server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                     connection_id: None,
+                    compression: None,
                 });
                 warn!(
                     "Protocol version mismatch: client={protocol_version}, server={}",
@@ -61,16 +62,23 @@ pub async fn handle_message<A: PaneAttacher>(
                 state.pending_swap_from = previous_transport;
                 state.conn_span.record("conn_id", conn_id.0);
                 state.conn_span.record("client_id", client_id.0);
+                // The daemon decides compression from client locality + config
+                // (issue #59). Self-describing frames make this purely a sender
+                // policy: flip the shared toggle the writer/attacher tasks read.
+                let compress = state.app.compression.enabled_for(state.transport);
+                state.comp_out.set_enabled(compress);
                 state.send(ServerMessage::AuthResult {
                     success: true,
                     reason: None,
                     client_id: Some(client_id),
                     server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
                     connection_id: Some(conn_id),
+                    compression: compress.then_some(Compression::Zstd),
                 });
                 info!(
                     conn_id = conn_id.0,
                     client_id = client_id.0,
+                    compress,
                     "client authenticated"
                 );
             } else {
@@ -80,6 +88,7 @@ pub async fn handle_message<A: PaneAttacher>(
                     client_id: None,
                     server_version: None,
                     connection_id: None,
+                    compression: None,
                 });
                 warn!("authentication failed");
             }
@@ -560,4 +569,129 @@ pub async fn handle_message<A: PaneAttacher>(
     }
 
     true
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use kmux_protocol::Compressor;
+    use kmux_protocol::TransportKind;
+    use kmux_protocol::messages::{
+        ClientCapabilities, ClientMessage, Compression, PROTOCOL_VERSION, ServerMessage,
+    };
+    use tokio::sync::mpsc;
+    use tokio::task::AbortHandle;
+
+    use super::handle_message;
+    use crate::app::{AttachResult, ConnectionMetrics, ServerApp};
+    use crate::client_handler::{OutboundCompression, PaneAttacher, SharedClientState};
+    use crate::config::{CompressionConfig, CompressionMode};
+
+    /// Auth doesn't attach panes, so a never-called stub attacher suffices.
+    struct NoopAttacher;
+    impl PaneAttacher for NoopAttacher {
+        fn start_pane_stream(
+            &self,
+            _pane_id: String,
+            _result: AttachResult,
+            _client_rx: mpsc::Receiver<ServerMessage>,
+        ) -> impl std::future::Future<Output = Result<AbortHandle, String>> + Send {
+            // Never invoked during auth; `ready` avoids an empty async block.
+            std::future::ready(Err("noop".to_string()))
+        }
+    }
+
+    fn state_for(
+        app: Arc<ServerApp>,
+        transport: TransportKind,
+    ) -> (
+        SharedClientState,
+        Arc<OutboundCompression>,
+        mpsc::UnboundedReceiver<ServerMessage>,
+    ) {
+        let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
+        let comp_out = Arc::new(OutboundCompression::new(
+            app.compression.level,
+            app.compression.min_size,
+        ));
+        let state = SharedClientState::new(
+            app,
+            ctrl_tx,
+            tracing::Span::none(),
+            transport,
+            Arc::new(ConnectionMetrics::new()),
+            Arc::clone(&comp_out),
+        );
+        (state, comp_out, ctrl_rx)
+    }
+
+    async fn authenticate(state: &mut SharedClientState) {
+        let ok = handle_message(
+            state,
+            ClientMessage::Auth {
+                token: "tok".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: ClientCapabilities::default(),
+                connection_id: None,
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(ok, "auth must keep the connection open");
+        assert!(
+            state.authenticated,
+            "auth must succeed with a matching token"
+        );
+    }
+
+    /// With `mode = always`, a networked transport negotiates zstd: the auth
+    /// handler flips the shared toggle and advertises it in `AuthResult`.
+    #[tokio::test]
+    async fn auth_enables_compression_when_policy_says_so() {
+        let app = Arc::new(
+            ServerApp::new("tok".to_string()).with_compression(CompressionConfig {
+                mode: CompressionMode::Always,
+                ..CompressionConfig::default()
+            }),
+        );
+        let (mut state, comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::TcpTls);
+        authenticate(&mut state).await;
+
+        assert!(
+            matches!(comp_out.compressor(), Compressor::Zstd { .. }),
+            "writer-side compression must be enabled"
+        );
+        let auth = ctrl_rx.try_recv().expect("AuthResult queued");
+        assert!(matches!(
+            auth,
+            ServerMessage::AuthResult {
+                success: true,
+                compression: Some(Compression::Zstd),
+                ..
+            }
+        ));
+    }
+
+    /// Under the default `auto` mode a local UDS client is left uncompressed.
+    #[tokio::test]
+    async fn auth_leaves_uds_uncompressed_under_auto() {
+        let app = Arc::new(ServerApp::new("tok".to_string())); // default compression = auto
+        let (mut state, comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::Uds);
+        authenticate(&mut state).await;
+
+        assert!(
+            matches!(comp_out.compressor(), Compressor::Off),
+            "local UDS clients must stay uncompressed under auto"
+        );
+        let auth = ctrl_rx.try_recv().expect("AuthResult queued");
+        assert!(matches!(
+            auth,
+            ServerMessage::AuthResult {
+                success: true,
+                compression: None,
+                ..
+            }
+        ));
+    }
 }

@@ -74,7 +74,10 @@ pub async fn handle_tcp_io<R, W>(
         writer,
         app,
         transport,
-        |ctrl_tx| TcpAttacher { ctrl_tx },
+        // The TCP/UDS attacher funnels pane diffs through `ctrl_tx`, so the
+        // shared writer task compresses them; the per-connection policy is
+        // unused here.
+        |ctrl_tx, _comp_out| TcpAttacher { ctrl_tx },
         conn_span.clone(),
     )
     .instrument(conn_span)

@@ -3,6 +3,7 @@ mod app;
 mod auth;
 mod backend;
 mod capability;
+mod capture;
 mod client_handler;
 mod config;
 mod connection;

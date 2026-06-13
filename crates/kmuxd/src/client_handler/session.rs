@@ -4,13 +4,15 @@ use std::time::Duration;
 
 use kmux_protocol::TransportKind;
 use kmux_protocol::messages::{ErrorCode, ServerMessage, epoch_millis};
-use kmux_protocol::{decode_client, encode_server, read_frame, write_frame};
+use kmux_protocol::{decode_client, encode_server, read_frame, write_frame_compressed};
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{Instrument, Span, debug, info, warn};
 
 use crate::app::{AttachResult, ConnectionMetrics, ServerApp};
-use crate::client_handler::{PaneAttacher, SharedClientState, handle_message, pty_event_to_msg};
+use crate::client_handler::{
+    OutboundCompression, PaneAttacher, SharedClientState, handle_message, pty_event_to_msg,
+};
 
 /// Build the initial replay messages for a pane attach result.
 ///
@@ -75,13 +77,21 @@ pub async fn run_client_session<R, W, A, F>(
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send + 'static,
     A: PaneAttacher,
-    F: FnOnce(mpsc::UnboundedSender<ServerMessage>) -> A,
+    F: FnOnce(mpsc::UnboundedSender<ServerMessage>, Arc<OutboundCompression>) -> A,
 {
     let metrics = Arc::new(ConnectionMetrics::new());
+
+    // Outbound compression policy for this connection: level/min_size are the
+    // configured constants; the auth handler flips it on once the daemon decides.
+    let comp_out = Arc::new(OutboundCompression::new(
+        app.compression.level,
+        app.compression.min_size,
+    ));
 
     let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
 
     let writer_metrics = Arc::clone(&metrics);
+    let writer_comp = Arc::clone(&comp_out);
     let writer_task = tokio::spawn(
         async move {
             let mut ctrl_rx = ctrl_rx;
@@ -89,14 +99,23 @@ pub async fn run_client_session<R, W, A, F>(
             while let Some(msg) = ctrl_rx.recv().await {
                 match encode_server(&msg) {
                     Ok(bytes) => {
-                        if write_frame(&mut writer, &bytes).await.is_err() {
-                            break;
+                        crate::capture::record(msg.category(), &bytes);
+                        match write_frame_compressed(&mut writer, &bytes, writer_comp.compressor())
+                            .await
+                        {
+                            Ok(wire_len) => {
+                                writer_metrics
+                                    .bytes_out
+                                    .fetch_add(wire_len as u64, Ordering::Relaxed);
+                                // What the same frame would have cost uncompressed
+                                // (length prefix + codec tag + payload).
+                                writer_metrics
+                                    .bytes_out_uncompressed
+                                    .fetch_add(5 + bytes.len() as u64, Ordering::Relaxed);
+                                writer_metrics.msgs_out.fetch_add(1, Ordering::Relaxed);
+                            }
+                            Err(_) => break,
                         }
-                        // 4-byte length prefix + payload
-                        writer_metrics
-                            .bytes_out
-                            .fetch_add(4 + bytes.len() as u64, Ordering::Relaxed);
-                        writer_metrics.msgs_out.fetch_add(1, Ordering::Relaxed);
                     }
                     Err(e) => warn!("encode error: {e}"),
                 }
@@ -157,22 +176,25 @@ pub async fn run_client_session<R, W, A, F>(
         .instrument(conn_span.clone()),
     );
 
-    let attacher = make_attacher(ctrl_tx.clone());
+    let attacher = make_attacher(ctrl_tx.clone(), Arc::clone(&comp_out));
     let mut state = SharedClientState::new(
         app.clone(),
         ctrl_tx,
         conn_span,
         transport,
         Arc::clone(&metrics),
+        comp_out,
     );
 
     loop {
         match read_frame(&mut reader).await {
             Ok(Some(data)) => {
-                // Instrument inbound bytes on every frame, before auth.
+                // Instrument inbound bytes on every frame, before auth. v1
+                // clients send uncompressed uplink, so wire size is the 5-byte
+                // header (length prefix + codec tag) plus the payload.
                 metrics
                     .bytes_in
-                    .fetch_add(4 + data.len() as u64, Ordering::Relaxed);
+                    .fetch_add(5 + data.len() as u64, Ordering::Relaxed);
                 metrics.msgs_in.fetch_add(1, Ordering::Relaxed);
                 metrics
                     .last_activity_ms
