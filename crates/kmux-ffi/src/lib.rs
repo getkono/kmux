@@ -180,6 +180,8 @@ pub enum FfiAction {
     ScrollPageDown,
     ToggleHud,
     ToggleMetrics,
+    /// Toggle the connection inspector overlay (issue #60).
+    ToggleConnection,
     ToggleInputLock,
     CopySelection,
     Paste,
@@ -222,6 +224,7 @@ impl From<FfiAction> for Action {
             FfiAction::ScrollPageDown => Action::ScrollPageDown,
             FfiAction::ToggleHud => Action::ToggleHud,
             FfiAction::ToggleMetrics => Action::ToggleMetrics,
+            FfiAction::ToggleConnection => Action::ToggleConnection,
             FfiAction::ToggleInputLock => Action::ToggleInputLock,
             FfiAction::CopySelection => Action::CopySelection,
             FfiAction::Paste => Action::Paste,
@@ -555,6 +558,47 @@ pub struct FfiConnInfo {
     /// Whether the transport is pinned via the override (issue #69). When true,
     /// the protocol indicator renders in an "overridden" style.
     pub transport_overridden: bool,
+}
+
+/// Recent round-trip-time summary for the active transport (connection
+/// inspector). Mirrors `kmux_app::core::RttInfo`.
+#[derive(uniffi::Record)]
+pub struct FfiRtt {
+    /// EWMA latency in ms, or `None` before the first Ping/Pong.
+    pub ewma_ms: Option<f64>,
+    pub recent_avg_ms: f64,
+    pub recent_max_ms: f64,
+    pub samples: u64,
+}
+
+/// Per-transport byte/message traffic totals (connection inspector). Mirrors
+/// `kmux_app::core::TransportTraffic`.
+#[derive(uniffi::Record)]
+pub struct FfiTransportTraffic {
+    pub label: String,
+    pub bytes_in: u64,
+    pub bytes_out: u64,
+    pub msgs_in: u64,
+    pub msgs_out: u64,
+}
+
+/// The connection / session / handshake technical details rendered by the
+/// connection inspector (issue #60). Mirrors `kmux_app::core::ConnectionInfo`.
+#[derive(uniffi::Record)]
+pub struct FfiConnectionDetails {
+    pub server: String,
+    pub is_local: bool,
+    pub endpoint: String,
+    pub state: String,
+    pub connected: bool,
+    pub transport: String,
+    pub connection_id: Option<u64>,
+    pub client_id: Option<u64>,
+    pub server_version: Option<String>,
+    pub protocol_version: u32,
+    pub accept_invalid_certs: bool,
+    pub rtt: Option<FfiRtt>,
+    pub transports: Vec<FfiTransportTraffic>,
 }
 
 /// One session in the session list.
@@ -1689,6 +1733,51 @@ impl KmuxDriver {
             .metrics_overlay_visible
     }
 
+    /// Whether the connection inspector overlay is open (issue #60).
+    pub fn connection_visible(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .connection_overlay_visible
+    }
+
+    /// The live connection / session / handshake details for the connection
+    /// inspector. Built from the toolkit-neutral `ConnectionInfo`.
+    pub fn connection_details(&self) -> FfiConnectionDetails {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let info = d.core().connection_info();
+        FfiConnectionDetails {
+            server: info.server,
+            is_local: info.is_local,
+            endpoint: info.endpoint,
+            state: info.state,
+            connected: info.connected,
+            transport: info.transport,
+            connection_id: info.connection_id,
+            client_id: info.client_id,
+            server_version: info.server_version,
+            protocol_version: info.protocol_version,
+            accept_invalid_certs: info.accept_invalid_certs,
+            rtt: info.rtt.map(|r| FfiRtt {
+                ewma_ms: r.ewma_ms,
+                recent_avg_ms: r.recent_avg_ms,
+                recent_max_ms: r.recent_max_ms,
+                samples: r.samples,
+            }),
+            transports: info
+                .transports
+                .into_iter()
+                .map(|t| FfiTransportTraffic {
+                    label: t.label,
+                    bytes_in: t.bytes_in,
+                    bytes_out: t.bytes_out,
+                    msgs_in: t.msgs_in,
+                    msgs_out: t.msgs_out,
+                })
+                .collect(),
+        }
+    }
+
     /// A snapshot of the client-side performance metrics.
     pub fn metrics(&self) -> FfiMetrics {
         let d = self.inner.lock().expect("driver mutex poisoned");
@@ -1913,6 +2002,10 @@ mod tests {
         assert_eq!(
             Action::from(FfiAction::FocusPaneAt { index: 2 }),
             Action::FocusPaneAt(2)
+        );
+        assert_eq!(
+            Action::from(FfiAction::ToggleConnection),
+            Action::ToggleConnection
         );
     }
 

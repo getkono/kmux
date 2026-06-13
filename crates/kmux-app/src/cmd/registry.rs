@@ -110,6 +110,18 @@ fn cmd_transport(app: &mut AppCore, args: &[String]) -> CommandResult {
         Some(k) => format!("transport: forced {k}"),
         None => "transport: auto".into(),
     }))
+}  
+
+fn cmd_connection(app: &mut AppCore, _args: &[String]) -> CommandResult {
+    app.connection_overlay_visible = !app.connection_overlay_visible;
+    Ok(CommandSuccess::Status(format!(
+        "connection: {}",
+        if app.connection_overlay_visible {
+            "on"
+        } else {
+            "off"
+        }
+    )))
 }
 
 fn cmd_lock(app: &mut AppCore, _args: &[String]) -> CommandResult {
@@ -449,6 +461,13 @@ pub static ALL: &[CommandSpec] = &[
         run: cmd_metrics,
     },
     CommandSpec {
+        name: "connection",
+        aliases: &["conn"],
+        summary: "Toggle the connection inspector",
+        args: NO_ARGS,
+        run: cmd_connection,
+    },
+    CommandSpec {
         name: "lock",
         aliases: &["unlock"],
         summary: "Toggle input lock for the active pane",
@@ -752,6 +771,17 @@ mod tests {
         assert!(!app.metrics_overlay_visible);
         let _ = run(&mut app, "metrics");
         assert!(app.metrics_overlay_visible);
+    }
+
+    #[test]
+    fn connection_toggles() {
+        let mut app = fixture_core();
+        assert!(!app.connection_overlay_visible);
+        let _ = run(&mut app, "connection");
+        assert!(app.connection_overlay_visible);
+        // The `conn` alias toggles the same flag back off.
+        let _ = run(&mut app, "conn");
+        assert!(!app.connection_overlay_visible);
     }
 
     #[test]

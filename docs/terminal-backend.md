@@ -112,6 +112,41 @@ and drained from a separate task.
 whichever `Arc<dyn BackendEventSink>` the host passes in.  `NullEventSink`
 (no-op) is used in code paths that do not need backend events.
 
+## Dynamic colours: OSC 4 / 10 / 11 / 104 and the kitty colour protocol (OSC 21)
+
+Programs that re-theme the terminal at runtime — set a palette entry, change the
+default foreground/background/cursor, or push/pop the colour stack — use OSC
+sequences. kmux supports the **set/reset** half of these end-to-end and is
+verified by tests (`osc21_*` in `crates/kmuxd/src/backend/ghostty/mod.rs`,
+issue #39).
+
+**How it works.** The kmux Zig wrapper (`wrapper.zig`) intercepts only
+title/bell/clipboard/hyperlink/cursor; everything else — including the kitty
+colour protocol (`OSC 21`, ghostty's `kitty_color_report`) and the classic
+`OSC 4/10/11/104` (`color_operation`) — is delegated to ghostty's
+`ReadonlyHandler`, which **mutates the live terminal colour state**
+(`term.colors.palette`, `foreground`, `background`, `cursor`). The kmux
+diff/snapshot path then resolves *every* cell against that live palette on each
+frame (`resolveCell` reads `term.colors.palette.current`). The consequence:
+
+- A set/reset is reflected in **newly written** cells **and** in cells already
+  on screen (the whole grid is re-resolved), and the change is carried to clients
+  as an ordinary `TerminalDiff` — no special palette message and no
+  `PROTOCOL_VERSION` bump.
+- The kitty OSC 21 grammar (`21;<key>=<color>` to set, `21;<key>=` to reset,
+  with `<key>` a palette index, `foreground`/`background`/`cursor`/… special, and
+  colours as `#rrggbb`, `rgb:r/g/b`, `rgbi:…`, or CSS names) is parsed by
+  libghostty-vt; the wrapper's `Stream` is created with `initAlloc`, so the
+  allocating multi-key form is fully supported.
+
+**Query boundary (intentional).** Colour *queries* (`21;foreground=?`, `OSC 4;n;?`)
+are parsed but **not answered**: kmux's VT layer never writes back to the PTY —
+`kmux_ghostty_feed` returns no response bytes, and the readonly handler emits
+none. This is the same boundary that applies to every VT query kmux receives
+(DA/DSR/…); a malformed or query-only sequence is dropped without disturbing
+subsequent output. Adding a PTY write-back path for query replies is a
+cross-cutting concern, deliberately out of scope here.
+
 ## Cursor rendering (in-cell)
 
 The frontend paints the inner-pane cursor **itself** rather than delegating

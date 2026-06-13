@@ -43,6 +43,9 @@ struct ContentView: View {
         .sheet(isPresented: metricsPresented) {
             MetricsView(model: model)
         }
+        .sheet(isPresented: connectionPresented) {
+            ConnectionView(model: model)
+        }
         .sheet(item: $ui.renameTarget) { session in
             RenameSheet(model: model, session: session, renameTarget: $ui.renameTarget)
         }
@@ -92,6 +95,13 @@ struct ContentView: View {
         Binding(
             get: { model.metricsVisible },
             set: { if !$0 && model.metricsVisible { model.dispatch(.toggleMetrics) } }
+        )
+    }
+
+    private var connectionPresented: Binding<Bool> {
+        Binding(
+            get: { model.connectionVisible },
+            set: { if !$0 && model.connectionVisible { model.dispatch(.toggleConnection) } }
         )
     }
 
@@ -159,6 +169,8 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut("h", modifiers: [.command, .shift])
             Toggle("Metrics Inspector", isOn: metricsBinding)
                 .keyboardShortcut("m", modifiers: [.command, .shift])
+            Toggle("Connection Inspector", isOn: connectionBinding)
+                .keyboardShortcut("i", modifiers: [.command, .shift])
         }
         // Tiling: split the focused pane, move focus, resize, swap (the analog of
         // kmux-gtk's tiling accelerators). iTerm2-style split shortcuts; ⌘⌥ moves
@@ -224,6 +236,13 @@ struct KmuxCommands: Commands {
         Binding(
             get: { model.metricsVisible },
             set: { _ in model.dispatch(.toggleMetrics) }
+        )
+    }
+
+    private var connectionBinding: Binding<Bool> {
+        Binding(
+            get: { model.connectionVisible },
+            set: { _ in model.dispatch(.toggleConnection) }
         )
     }
 }

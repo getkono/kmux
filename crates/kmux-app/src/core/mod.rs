@@ -23,9 +23,11 @@ use crate::mode::Mode;
 use crate::recent_servers::{RecentServersCache, ServerKind};
 use crate::theme::Theme;
 
+mod connection_info;
 mod dispatch;
 mod orchestration;
 
+pub use connection_info::{ConnectionInfo, RttInfo, TransportTraffic};
 pub use orchestration::{BootstrapPhase, BootstrapTaskResult};
 
 /// Maximum entries kept in [`AppCore::command_history`].
@@ -103,6 +105,9 @@ pub struct AppCore {
 
     pub hud_visible: bool,
     pub metrics_overlay_visible: bool,
+    /// Whether the connection inspector overlay is open (issue #60). Like the
+    /// metrics overlay, this is a passive flag the frontends reconcile against.
+    pub connection_overlay_visible: bool,
     pub force_snapshot_mode: bool,
 
     /// Reconnection bookkeeping.
@@ -234,6 +239,7 @@ impl AppCore {
             // hidden; either profile can toggle it at runtime (`hud` / ⌘⇧H).
             hud_visible: cfg!(debug_assertions),
             metrics_overlay_visible: false,
+            connection_overlay_visible: false,
             force_snapshot_mode: false,
             disconnect_at: None,
             session_picker_selected: 0,
@@ -289,6 +295,7 @@ impl AppCore {
             },
             hud_visible: false,
             metrics_overlay_visible: false,
+            connection_overlay_visible: false,
             force_snapshot_mode: false,
             disconnect_at: None,
             session_picker_selected: 0,
