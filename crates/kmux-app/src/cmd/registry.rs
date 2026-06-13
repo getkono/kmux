@@ -303,8 +303,10 @@ fn cmd_pane_close(app: &mut AppCore, _args: &[String]) -> CommandResult {
     if app.mgr.active_pane_id().is_none() {
         return Err("no active pane".into());
     }
-    app.mgr.close_pane();
-    Ok(CommandSuccess::Status("closing pane…".into()))
+    // Route through the soft-close grace + undo (issue #86); it sets its own
+    // status message ("Closing pane in 3s…" or an immediate close).
+    app.soft_close_active_pane();
+    Ok(CommandSuccess::Ok)
 }
 
 fn cmd_pane_next(app: &mut AppCore, _args: &[String]) -> CommandResult {

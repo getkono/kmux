@@ -729,16 +729,36 @@ fn update_banner(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Front
     shell.banner.set_revealed(revealed);
 }
 
-/// Surface a newly-set status message as a transient toast.
+/// Surface a newly-set status message as a transient toast. While a pane is in
+/// its soft-close grace window (issue #86) the toast gains an "Undo" button that
+/// cancels the pending close.
 fn update_toast(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
-    let msg = fe.borrow().core.mgr.status_msg().to_string();
+    let (msg, pending) = {
+        let core = &fe.borrow().core;
+        (core.mgr.status_msg().to_string(), core.has_pending_close())
+    };
     if msg == *dialogs.last_status.borrow() {
         return;
     }
     *dialogs.last_status.borrow_mut() = msg.clone();
-    if !msg.is_empty() {
-        shell.toasts.add_toast(adw::Toast::new(&msg));
+    if msg.is_empty() {
+        return;
     }
+    let toast = adw::Toast::new(&msg);
+    if pending {
+        toast.set_button_label(Some("Undo"));
+        let fe = fe.clone();
+        let shell = shell.clone();
+        toast.connect_button_clicked(move |_| {
+            {
+                let mut f = fe.borrow_mut();
+                let _ = futures::executor::block_on(f.core.dispatch_action(Action::UndoClose));
+                f.core.needs_render = true;
+            }
+            shell.drawing.queue_draw();
+        });
+    }
+    shell.toasts.add_toast(toast);
 }
 
 // ── HUD ticker + metrics inspector dialog ──

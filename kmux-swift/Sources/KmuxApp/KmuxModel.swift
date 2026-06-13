@@ -28,6 +28,9 @@ final class KmuxModel: ObservableObject {
     @Published private(set) var dirBrowser: FfiDirBrowser?
     @Published private(set) var hudVisible = false
     @Published private(set) var metricsVisible = false
+    /// Whether a pane is in its soft-close grace window (issue #86), driving the
+    /// "Undo close" banner.
+    @Published private(set) var softClosePending = false
     /// Whether the connection inspector sheet is open (issue #60).
     @Published private(set) var connectionVisible = false
 
@@ -318,6 +321,8 @@ final class KmuxModel: ObservableObject {
         if hud != hudVisible { hudVisible = hud }
         let met = driver.metricsVisible()
         if met != metricsVisible { metricsVisible = met }
+        let pendingClose = driver.softClosePending()
+        if pendingClose != softClosePending { softClosePending = pendingClose }
         let conn = driver.connectionVisible()
         if conn != connectionVisible { connectionVisible = conn }
     }

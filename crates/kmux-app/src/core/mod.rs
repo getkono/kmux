@@ -10,7 +10,7 @@
 //! channel) lives on the frontend's own struct, not here.
 
 use std::collections::VecDeque;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::session_manager::SessionManager;
@@ -32,6 +32,20 @@ pub use orchestration::{BootstrapPhase, BootstrapTaskResult};
 
 /// Maximum entries kept in [`AppCore::command_history`].
 pub const COMMAND_HISTORY_CAP: usize = 100;
+
+/// Grace period between requesting a pane close and actually killing the shell
+/// (issue #86). A healthy pane's `PaneClose` is withheld for this long so an
+/// accidental close can be undone within the window.
+pub const SOFT_CLOSE_GRACE: Duration = Duration::from_secs(3);
+
+/// A pane whose close has been requested but deferred (issue #86). The real
+/// `PaneClose` is sent only once [`deadline`](Self::deadline) passes; until then
+/// the user can cancel (undo), leaving the live shell untouched.
+#[derive(Debug, Clone)]
+pub struct PendingClose {
+    pub pane_id: String,
+    pub deadline: Instant,
+}
 
 /// What a key/action dispatch returns to the frontend's run loop.
 ///
@@ -123,6 +137,14 @@ pub struct AppCore {
     /// metrics overlay, this is a passive flag the frontends reconcile against.
     pub connection_overlay_visible: bool,
     pub force_snapshot_mode: bool,
+
+    /// Panes pending a deferred (soft) close (issue #86), oldest first. While a
+    /// pane is here its `PaneClose` has NOT been sent; the driver fires it once
+    /// the deadline passes, and the user can undo within the window.
+    pub pending_closes: Vec<PendingClose>,
+    /// Bumped on every soft-close request so a frontend can show its "Undo"
+    /// affordance exactly once per scheduled close (not every frame).
+    pub soft_close_nonce: u64,
 
     /// Reconnection bookkeeping.
     pub disconnect_at: Option<Instant>,
@@ -261,6 +283,8 @@ impl AppCore {
             metrics_overlay_visible: false,
             connection_overlay_visible: false,
             force_snapshot_mode: false,
+            pending_closes: Vec::new(),
+            soft_close_nonce: 0,
             disconnect_at: None,
             session_picker_selected: 0,
             session_picker_search: String::new(),
@@ -318,6 +342,8 @@ impl AppCore {
             metrics_overlay_visible: false,
             connection_overlay_visible: false,
             force_snapshot_mode: false,
+            pending_closes: Vec::new(),
+            soft_close_nonce: 0,
             disconnect_at: None,
             session_picker_selected: 0,
             session_picker_search: String::new(),

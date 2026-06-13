@@ -169,12 +169,30 @@ impl SessionManager {
     /// Close the active pane.
     pub fn close_pane(&mut self) {
         if let Some(pane_id) = self.active_pane.clone() {
-            let rid = self.next_rid();
-            self.send_ws(ClientMessage::PaneClose {
-                request_id: rid,
-                pane_id,
-            });
+            self.close_pane_id(&pane_id);
         }
+    }
+
+    /// Send `PaneClose` for a specific pane (issue #86: the deferred soft-close
+    /// fires this once its grace window elapses, since the target pane may no
+    /// longer be the active one). Harmless if the pane is already gone.
+    pub fn close_pane_id(&mut self, pane_id: &str) {
+        let rid = self.next_rid();
+        self.send_ws(ClientMessage::PaneClose {
+            request_id: rid,
+            pane_id: pane_id.to_string(),
+        });
+    }
+
+    /// Whether the pane's shell is still running (issue #86 health check). False
+    /// for an already-exited or unknown pane, so the soft-close grace is skipped
+    /// for those (they close immediately).
+    pub fn is_pane_running(&self, pane_id: &str) -> bool {
+        self.session_list
+            .iter()
+            .flat_map(|e| &e.panes)
+            .find(|p| p.pane_id == pane_id)
+            .is_some_and(|p| matches!(p.status, kmux_protocol::messages::SessionStatus::Running))
     }
 
     /// Close the entire active session (all its panes).

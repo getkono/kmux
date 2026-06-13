@@ -147,6 +147,8 @@ pub enum FfiAction {
     },
     CreatePane,
     ClosePane,
+    /// Cancel the most recent soft-close within its grace window (issue #86).
+    UndoClose,
     NextPane,
     PrevPane,
     CloseTab,
@@ -199,6 +201,7 @@ impl From<FfiAction> for Action {
             FfiAction::JumpToSession { index } => Action::JumpToSession(index as usize),
             FfiAction::CreatePane => Action::CreatePane,
             FfiAction::ClosePane => Action::ClosePane,
+            FfiAction::UndoClose => Action::UndoClose,
             FfiAction::NextPane => Action::NextPane,
             FfiAction::PrevPane => Action::PrevPane,
             FfiAction::CloseTab => Action::CloseTab,
@@ -1135,6 +1138,15 @@ impl KmuxDriver {
             label: state.badge_label(),
             transport_overridden: d.mgr.transport_override().is_some(),
         }
+    }
+
+    /// Whether a pane is in its soft-close grace window (issue #86), so the
+    /// frontend can show an "Undo" affordance.
+    pub fn soft_close_pending(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .has_pending_close()
     }
 
     /// The session list, with the active session flagged.
@@ -2120,6 +2132,7 @@ mod tests {
             Action::from(FfiAction::FocusPaneAt { index: 2 }),
             Action::FocusPaneAt(2)
         );
+        assert_eq!(Action::from(FfiAction::UndoClose), Action::UndoClose);
         assert_eq!(
             Action::from(FfiAction::ToggleConnection),
             Action::ToggleConnection
