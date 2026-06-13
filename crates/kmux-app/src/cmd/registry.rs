@@ -84,6 +84,34 @@ fn cmd_metrics(app: &mut AppCore, _args: &[String]) -> CommandResult {
     )))
 }
 
+fn cmd_transport(app: &mut AppCore, args: &[String]) -> CommandResult {
+    use kmux_protocol::messages::TransportKind;
+    let Some(arg) = args.first() else {
+        // No argument: report the current mode + active transport.
+        return Ok(CommandSuccess::Status(match app.mgr.transport_override() {
+            Some(k) => format!("transport: forced {k} (use /transport auto to restore)"),
+            None => format!("transport: auto (on {})", app.mgr.current_transport),
+        }));
+    };
+    let target = if arg.eq_ignore_ascii_case("auto") {
+        None
+    } else {
+        match TransportKind::parse_cli(arg) {
+            Some(k) => Some(k),
+            None => {
+                return Err(format!(
+                    "unknown transport '{arg}' (auto|quic|tcp-tls|uds|tcp)"
+                ));
+            }
+        }
+    };
+    app.mgr.set_transport_override(target);
+    Ok(CommandSuccess::Status(match target {
+        Some(k) => format!("transport: forced {k}"),
+        None => "transport: auto".into(),
+    }))
+}
+
 fn cmd_lock(app: &mut AppCore, _args: &[String]) -> CommandResult {
     if app.mgr.active_pane_id().is_none() {
         return Err("no active pane".into());
@@ -377,6 +405,12 @@ const ARGS_ON_OFF: &[ArgSpec] = &[ArgSpec {
     completer: Completer::OnOff,
 }];
 
+const ARGS_TRANSPORT_OPT: &[ArgSpec] = &[ArgSpec {
+    name: "auto|quic|tcp-tls|uds|tcp",
+    required: false,
+    completer: Completer::Transports,
+}];
+
 /// All built-in commands. Order influences hint ordering on ties.
 pub static ALL: &[CommandSpec] = &[
     CommandSpec {
@@ -469,6 +503,13 @@ pub static ALL: &[CommandSpec] = &[
         summary: "Switch to the local UDS daemon",
         args: NO_ARGS,
         run: cmd_local,
+    },
+    CommandSpec {
+        name: "transport",
+        aliases: &[],
+        summary: "Override the transport protocol (auto|quic|tcp-tls|uds|tcp)",
+        args: ARGS_TRANSPORT_OPT,
+        run: cmd_transport,
     },
     CommandSpec {
         name: "session new",
@@ -849,6 +890,28 @@ mod tests {
         let _ = run(&mut app, "session rename foo");
         assert!(
             app.mgr.status_msg().contains("no active session"),
+            "got: {:?}",
+            app.mgr.status_msg()
+        );
+    }
+
+    #[test]
+    fn transport_sets_and_clears_override() {
+        use kmux_protocol::messages::TransportKind;
+        let mut app = fixture_core();
+        assert!(app.mgr.transport_override().is_none());
+        let _ = run(&mut app, "transport quic");
+        assert_eq!(app.mgr.transport_override(), Some(TransportKind::Quic));
+        let _ = run(&mut app, "transport auto");
+        assert!(app.mgr.transport_override().is_none());
+    }
+
+    #[test]
+    fn transport_unknown_name_errors() {
+        let mut app = fixture_core();
+        let _ = run(&mut app, "transport carrier-pigeon");
+        assert!(
+            app.mgr.status_msg().contains("unknown transport"),
             "got: {:?}",
             app.mgr.status_msg()
         );

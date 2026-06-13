@@ -631,6 +631,19 @@ impl AppCore {
         }
     }
 
+    /// Open the command palette pre-filled with `transport ` so the user picks
+    /// from the completer (Auto + each protocol). Bound to the protocol
+    /// indicator (double-click) in the GUIs (issue #69).
+    pub fn open_transport_chooser(&mut self) {
+        const PREFILL: &str = "transport ";
+        self.mode = Mode::Command(crate::mode::CommandState {
+            buffer: PREFILL.to_string(),
+            cursor: PREFILL.len(),
+            selected: 0,
+            history_pos: None,
+        });
+    }
+
     /// Set the selected index of the currently open picker (e.g. hover-to-
     /// highlight). No-op when no picker is open.
     pub fn set_picker_selected(&mut self, idx: usize) {

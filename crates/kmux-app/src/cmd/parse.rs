@@ -154,6 +154,7 @@ pub fn completer_values(c: Completer) -> &'static [&'static str] {
             "catppuccin-macchiato",
             "catppuccin-mocha",
         ],
+        Completer::Transports => kmux_protocol::messages::TransportKind::SELECTABLE_NAMES,
         Completer::Sessions | Completer::None => &[],
     }
 }

@@ -45,3 +45,6 @@ zig-out/
 /kmux-swift/.swiftpm/
 /kmux-swift/Sources/kmux_ffiFFI/kmux_ffiFFI.h
 /kmux-swift/Sources/KmuxBindings/kmux_ffi.swift
+
+# Claude Code agent worktrees (transient harness state)
+.claude/worktrees/

@@ -71,7 +71,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 8;
+pub const KMUX_FFI_ABI_VERSION: u32 = 9;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -552,6 +552,9 @@ impl From<&ConnectionState> for FfiConnStatus {
 pub struct FfiConnInfo {
     pub status: FfiConnStatus,
     pub label: String,
+    /// Whether the transport is pinned via the override (issue #69). When true,
+    /// the protocol indicator renders in an "overridden" style.
+    pub transport_overridden: bool,
 }
 
 /// One session in the session list.
@@ -1030,6 +1033,7 @@ impl KmuxDriver {
         FfiConnInfo {
             status: FfiConnStatus::from(state),
             label: state.badge_label(),
+            transport_overridden: d.mgr.transport_override().is_some(),
         }
     }
 

@@ -119,6 +119,15 @@ pub struct SessionManager {
     /// `TransportSupervisor` is spawned so the scorer operates on live
     /// measurements. `None` when no supervisor exists (direct QUIC path).
     pub(super) rtt_tx: Option<mpsc::UnboundedSender<RttSample>>,
+
+    /// Transport override (issue #69). `Some(kind)` pins the transport and
+    /// disables the supervisor's periodic heuristic; `None` is auto mode. This
+    /// is the source of truth (persists across reconnects); it is re-seeded
+    /// into each freshly-spawned supervisor and pushed live via `override_tx`.
+    pub(super) transport_override: Option<TransportKind>,
+    /// Live channel to the current supervisor's override receiver, if one is
+    /// running. Replaced on every supervisor spawn via [`Self::set_override_sink`].
+    pub(super) override_tx: Option<mpsc::UnboundedSender<Option<TransportKind>>>,
 }
 
 impl SessionManager {
@@ -163,6 +172,8 @@ impl SessionManager {
             connection_state: ConnectionState::Idle,
             liveness: Liveness::new(Instant::now()),
             rtt_tx: None,
+            transport_override: None,
+            override_tx: None,
         }
     }
 
@@ -171,6 +182,30 @@ impl SessionManager {
     /// feed the scorer's EWMA.
     pub fn set_rtt_sink(&mut self, tx: mpsc::UnboundedSender<RttSample>) {
         self.rtt_tx = Some(tx);
+    }
+
+    /// Wire the session manager to a freshly-spawned `TransportSupervisor`'s
+    /// override receiver (issue #69). Called alongside [`Self::set_rtt_sink`].
+    pub fn set_override_sink(&mut self, tx: mpsc::UnboundedSender<Option<TransportKind>>) {
+        self.override_tx = Some(tx);
+    }
+
+    /// The active transport override (`None` = auto). Drives the protocol
+    /// indicator and the connection inspector.
+    pub fn transport_override(&self) -> Option<TransportKind> {
+        self.transport_override
+    }
+
+    /// Set (or clear, with `None`) the transport override. Remembers the choice
+    /// across reconnects and pushes it live to a running supervisor so it takes
+    /// effect immediately. The supervisor stops auto-probing while pinned.
+    pub fn set_transport_override(&mut self, target: Option<TransportKind>) {
+        self.transport_override = target;
+        if let Some(tx) = self.override_tx.as_ref() {
+            // The supervisor may have exited (reconnect in flight); a send
+            // error just means the next spawn will re-seed from the field.
+            let _ = tx.send(target);
+        }
     }
 
     /// Forward an RTT observation to the supervisor (if any) tagged with
