@@ -345,6 +345,100 @@ mod tests {
         assert_eq!(x_cell.fg, CellColor::new(255, 128, 0));
     }
 
+    // ── OSC 21 / dynamic colours: the kitty color protocol (issue #39) ──────
+    //
+    // kmux delegates OSC 21 (and the classic OSC 4/10/11/104) to ghostty's
+    // readonly VT handler, which mutates `term.colors.palette` /
+    // `foreground` / `background` / `cursor`. Because the diff/snapshot
+    // re-resolves every cell against the *live* palette on each frame, a colour
+    // change shows up in both newly written and already-on-screen cells and is
+    // carried to clients as a diff. Queries (`key=?`) are parsed but
+    // deliberately not answered — kmux's VT layer never writes back to the PTY
+    // (`kmux_ghostty_feed` returns no response bytes), the same as every other
+    // VT query (DA/DSR/…). See `docs/terminal-backend.md`.
+
+    /// The resolved foreground of the (first) cell carrying `ch` in a fresh
+    /// full-grid snapshot.
+    fn snapshot_fg(ts: &mut DiffEngine<GhosttyBackend>, ch: char) -> CellColor {
+        ts.snapshot()
+            .cells
+            .into_iter()
+            .find(|c| c.c == ch)
+            .unwrap_or_else(|| panic!("cell '{ch}' not found in snapshot"))
+            .fg
+    }
+
+    #[test]
+    fn osc21_palette_set_applies_to_new_cells() {
+        let mut ts = DiffEngine::new(test_backend(24, 80));
+        // kitty color protocol: redefine palette index 5 as pure red.
+        ts.feed(b"\x1b]21;5=rgb:ff/00/00\x1b\\");
+        // A glyph drawn with SGR foreground = palette 5 resolves to the new red.
+        ts.feed(b"\x1b[38;5;5mZ");
+        assert_eq!(snapshot_fg(&mut ts, 'Z'), CellColor::new(0xff, 0x00, 0x00));
+    }
+
+    #[test]
+    fn osc21_palette_change_recolors_existing_cells_and_emits_diff() {
+        let mut ts = DiffEngine::new(test_backend(24, 80));
+        // Draw a glyph in palette colour 5, then settle the diff baseline.
+        ts.feed(b"\x1b[38;5;5mZ");
+        let before = snapshot_fg(&mut ts, 'Z');
+        let _ = ts.compute_diff();
+        // Redefine palette 5 → red. No new glyph is written.
+        ts.feed(b"\x1b]21;5=rgb:ff/00/00\x1b\\");
+        // The already-on-screen cell re-resolves to the new colour…
+        let after = snapshot_fg(&mut ts, 'Z');
+        assert_eq!(after, CellColor::new(0xff, 0x00, 0x00));
+        assert_ne!(
+            after, before,
+            "a palette change must recolour the existing cell"
+        );
+        // …and is carried to clients as a diff op (the full grid is re-resolved).
+        let diff = expect_cell_diff(ts.compute_diff());
+        let recolored = diff.ops.iter().any(|op| match op {
+            DiffOp::Cell { cell, .. } => cell.c == 'Z' && cell.fg == CellColor::new(0xff, 0, 0),
+            DiffOp::Row { cells, .. } => cells
+                .iter()
+                .any(|c| c.c == 'Z' && c.fg == CellColor::new(0xff, 0, 0)),
+            DiffOp::Clear => false,
+        });
+        assert!(
+            recolored,
+            "the recoloured cell must appear in the diff: {:?}",
+            diff.ops
+        );
+    }
+
+    #[test]
+    fn osc21_palette_reset_restores_default() {
+        // The default resolution of palette index 5 on a fresh terminal.
+        let default5 = {
+            let mut t = DiffEngine::new(test_backend(24, 80));
+            t.feed(b"\x1b[38;5;5mX");
+            snapshot_fg(&mut t, 'X')
+        };
+        let mut ts = DiffEngine::new(test_backend(24, 80));
+        ts.feed(b"\x1b]21;5=rgb:ff/00/00\x1b\\"); // set palette 5 → red
+        ts.feed(b"\x1b]21;5=\x1b\\"); // reset palette 5 (empty value)
+        ts.feed(b"\x1b[38;5;5mQ");
+        let q = snapshot_fg(&mut ts, 'Q');
+        assert_eq!(q, default5, "reset must restore the built-in palette 5");
+        assert_ne!(q, CellColor::new(0xff, 0x00, 0x00));
+    }
+
+    #[test]
+    fn osc21_query_is_ignored_without_corrupting_the_stream() {
+        let mut ts = DiffEngine::new(test_backend(24, 80));
+        // A colour *query* (`key=?`). kmux never writes back to the PTY, so the
+        // request is parsed and dropped; subsequent output must still render.
+        ts.feed(b"\x1b]21;foreground=?;2=?\x1b\\");
+        ts.feed(b"ok");
+        let snap = ts.snapshot();
+        assert_eq!(snap.cells[0].c, 'o');
+        assert_eq!(snap.cells[1].c, 'k');
+    }
+
     #[test]
     fn snapshot_captures_full_grid() {
         let mut ts = DiffEngine::new(test_backend(24, 80));
