@@ -69,6 +69,27 @@ struct ConnectionBanner: View {
     }
 }
 
+/// A transient "pane closing — Undo" banner shown during the soft-close grace
+/// window (issue #86), the macOS analog of kmux-gtk's Undo toast.
+struct SoftCloseBanner: View {
+    @ObservedObject var model: KmuxModel
+
+    var body: some View {
+        if model.softClosePending {
+            HStack(spacing: 10) {
+                Image(systemName: "trash")
+                Text("Pane closing…")
+                Button("Undo") { model.dispatch(.undoClose) }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.regularMaterial, in: Capsule())
+            .shadow(radius: 3)
+            .padding(.bottom, 12)
+        }
+    }
+}
+
 /// A static keyboard-shortcut reference, the analog of kmux-gtk's
 /// `GtkShortcutsWindow`.
 struct HelpView: View {

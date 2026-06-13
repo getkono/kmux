@@ -29,6 +29,7 @@ fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
         // creates a tab. The action id stays `new-pane` for continuity.
         ("new-pane", Action::CreatePane, &["<Ctrl><Shift>t"]),
         ("close-pane", Action::ClosePane, &["<Ctrl><Shift>q"]),
+        ("undo-close", Action::UndoClose, &["<Ctrl><Shift>u"]),
         ("next-pane", Action::NextPane, &["<Ctrl><Shift>Right"]),
         ("prev-pane", Action::PrevPane, &["<Ctrl><Shift>Left"]),
         ("close-tab", Action::CloseTab, &[]),
@@ -266,6 +267,7 @@ fn build_menu() -> gio::Menu {
     s2.append(Some("Rename Session"), Some("win.rename-session"));
     s2.append(Some("Rename Tab"), Some("win.rename-tab"));
     s2.append(Some("Close Pane"), Some("win.close-pane"));
+    s2.append(Some("Undo Close"), Some("win.undo-close"));
     s2.append(Some("Close Tab"), Some("win.close-tab"));
     s2.append(Some("Close Session"), Some("win.close-session"));
     menu.append_section(None, &s2);
@@ -324,7 +326,8 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;Right</property><property name="title">Next tab</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;Left</property><property name="title">Previous tab</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Shift&gt;F2</property><property name="title">Rename tab</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;q</property><property name="title">Close pane</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;q</property><property name="title">Close pane (soft, 3s undo)</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;u</property><property name="title">Undo close</property></object></child>
           </object>
         </child>
         <child>

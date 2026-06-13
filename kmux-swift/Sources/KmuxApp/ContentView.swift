@@ -70,6 +70,8 @@ struct ContentView: View {
                 HudOverlay(model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                     .padding(8)
+                SoftCloseBanner(model: model)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
             }
         }
         .frame(minWidth: 480, minHeight: 320)
@@ -206,6 +208,8 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut("z", modifiers: [.command, .control])
             Button("Close Pane") { model.dispatch(.closePane) }
                 .keyboardShortcut("w", modifiers: [.command, .shift])
+            Button("Undo Close") { model.dispatch(.undoClose) }
+                .keyboardShortcut("u", modifiers: [.command, .shift])
         }
         CommandGroup(replacing: .help) {
             Button("kmux Help") { ui.help = true }

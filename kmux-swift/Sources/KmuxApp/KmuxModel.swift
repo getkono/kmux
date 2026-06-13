@@ -25,6 +25,9 @@ final class KmuxModel: ObservableObject {
     @Published private(set) var picker: FfiPicker?
     @Published private(set) var hudVisible = false
     @Published private(set) var metricsVisible = false
+    /// Whether a pane is in its soft-close grace window (issue #86), driving the
+    /// "Undo close" banner.
+    @Published private(set) var softClosePending = false
 
     // ── Tiling render state (read by the terminal view each `draw`) ──
     /// The active tab's resolved pane rectangles (cells), recomputed each pump
@@ -295,6 +298,8 @@ final class KmuxModel: ObservableObject {
         if hud != hudVisible { hudVisible = hud }
         let met = driver.metricsVisible()
         if met != metricsVisible { metricsVisible = met }
+        let pendingClose = driver.softClosePending()
+        if pendingClose != softClosePending { softClosePending = pendingClose }
     }
 
     // MARK: - Clipboard

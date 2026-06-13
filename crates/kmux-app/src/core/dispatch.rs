@@ -8,11 +8,16 @@
 //! (emitted as [`KeyResult::CopyToClipboard`] / [`KeyResult::RequestPaste`]
 //! effects that the frontend performs).
 
+use std::time::Instant;
+
 use crate::cmd;
 use crate::mode::{Action, Mode};
 use crate::recent_servers::ServerKind;
 
-use super::{AppCore, COMMAND_HISTORY_CAP, KeyResult, SwitchTarget, TopBarAction};
+use super::{
+    AppCore, COMMAND_HISTORY_CAP, KeyResult, PendingClose, SOFT_CLOSE_GRACE, SwitchTarget,
+    TopBarAction,
+};
 
 impl AppCore {
     /// Apply an [`Action`] to the core. Used both by the key path and by the
@@ -34,7 +39,10 @@ impl AppCore {
                 }
             }
             Action::ClosePane => {
-                self.mgr.close_pane();
+                self.soft_close_active_pane();
+            }
+            Action::UndoClose => {
+                self.undo_soft_close();
             }
             Action::ConfirmCloseYes => {
                 if let Mode::ConfirmCloseSession { word_id } =
@@ -621,6 +629,9 @@ impl AppCore {
                 None
             }
             TopBarAction::SelectPane(pane_id) => {
+                // Re-selecting a pane within its soft-close window restores it:
+                // the live shell was never killed, so just cancel the close (#86).
+                self.cancel_pending_close(&pane_id);
                 self.mgr.select_pane(pane_id);
                 None
             }
@@ -629,6 +640,80 @@ impl AppCore {
                 None
             }
         }
+    }
+
+    // ── Soft-close (issue #86) ────────────────────────────────────────────────
+
+    /// Request a deferred ("soft") close of the active pane. A healthy pane's
+    /// `PaneClose` is withheld for [`SOFT_CLOSE_GRACE`] so an accidental close
+    /// can be undone; an already-exited pane closes immediately. Re-requesting a
+    /// close that is already pending keeps the existing deadline.
+    pub fn soft_close_active_pane(&mut self) {
+        let Some(pane_id) = self.mgr.active_pane_id().map(str::to_string) else {
+            return;
+        };
+        if self.pending_closes.iter().any(|p| p.pane_id == pane_id) {
+            return;
+        }
+        // An unhealthy (already-exited) pane has no live shell to protect.
+        if !self.mgr.is_pane_running(&pane_id) {
+            self.mgr.close_pane_id(&pane_id);
+            return;
+        }
+        self.pending_closes.push(PendingClose {
+            pane_id,
+            deadline: Instant::now() + SOFT_CLOSE_GRACE,
+        });
+        self.soft_close_nonce = self.soft_close_nonce.wrapping_add(1);
+        self.mgr
+            .set_status_msg("Closing pane in 3s — undo to keep it".into());
+    }
+
+    /// Cancel the most recently scheduled soft-close (the toast/keyboard "Undo").
+    /// The live shell was never touched, so the pane simply stays.
+    pub fn undo_soft_close(&mut self) {
+        if self.pending_closes.pop().is_some() {
+            self.mgr.set_status_msg("Pane close cancelled".into());
+        }
+    }
+
+    /// Cancel a specific pane's pending soft-close (e.g. the user re-focused it
+    /// within the window). Returns whether one was cancelled.
+    pub fn cancel_pending_close(&mut self, pane_id: &str) -> bool {
+        let before = self.pending_closes.len();
+        self.pending_closes.retain(|p| p.pane_id != pane_id);
+        self.pending_closes.len() != before
+    }
+
+    /// Fire every soft-close whose grace window has elapsed (driven by the
+    /// frontend pump). Returns whether any close was sent, so the caller can
+    /// schedule a render. Cheap when nothing is pending.
+    pub fn fire_due_closes(&mut self, now: Instant) -> bool {
+        if self.pending_closes.is_empty() {
+            return false;
+        }
+        let mut due: Vec<String> = Vec::new();
+        self.pending_closes.retain(|p| {
+            let expired = p.deadline <= now;
+            if expired {
+                due.push(p.pane_id.clone());
+            }
+            !expired
+        });
+        for pane_id in &due {
+            self.mgr.close_pane_id(pane_id);
+        }
+        !due.is_empty()
+    }
+
+    /// Whether `pane_id` is awaiting a deferred close (for a "closing…" hint).
+    pub fn is_pane_pending_close(&self, pane_id: &str) -> bool {
+        self.pending_closes.iter().any(|p| p.pane_id == pane_id)
+    }
+
+    /// Whether any pane is awaiting a deferred close (drives the Undo affordance).
+    pub fn has_pending_close(&self) -> bool {
+        !self.pending_closes.is_empty()
     }
 
     /// Set the selected index of the currently open picker (e.g. hover-to-
@@ -725,6 +810,99 @@ mod tests {
             ClientCapabilities::default(),
         );
         AppCore::for_test(mgr)
+    }
+
+    /// A connected core with one active pane carrying `status` (issue #86 tests).
+    fn core_with_active_pane(status: kmux_protocol::messages::SessionStatus) -> AppCore {
+        use kmux_protocol::messages::{
+            LayoutNode, PaneInfo, SessionEntry, SessionMeta, TabInfo, TermSize,
+        };
+        let mut core = fixture_core();
+        core.mgr.connected = true;
+        core.mgr.session_list = vec![SessionEntry {
+            meta: SessionMeta {
+                index: 0,
+                word_id: "eagle".into(),
+                name: "eagle".into(),
+                cwd: "/".into(),
+            },
+            panes: vec![PaneInfo {
+                pane_id: "eagle/0".into(),
+                pane_index: 0,
+                program: String::new(),
+                size: TermSize::default(),
+                attached_clients: vec![],
+                status,
+                title: String::new(),
+            }],
+            tabs: vec![TabInfo {
+                tab_index: 0,
+                name: "1".into(),
+                layout: LayoutNode::single(0),
+                focused_pane: 0,
+            }],
+            active_tab: 0,
+        }];
+        core.mgr.active_pane = Some("eagle/0".into());
+        core
+    }
+
+    #[tokio::test]
+    async fn close_pane_defers_then_undo_keeps_the_pane() {
+        use kmux_protocol::messages::SessionStatus;
+        let mut core = core_with_active_pane(SessionStatus::Running);
+        let nonce = core.soft_close_nonce;
+
+        // Close → deferred, not killed immediately.
+        core.dispatch_action(Action::ClosePane).await;
+        assert!(core.is_pane_pending_close("eagle/0"));
+        assert_eq!(core.soft_close_nonce, nonce + 1);
+
+        // A second close keeps the existing deadline (no duplicate).
+        core.dispatch_action(Action::ClosePane).await;
+        assert_eq!(core.pending_closes.len(), 1);
+
+        // Undo → cancelled; the shell was never touched.
+        core.dispatch_action(Action::UndoClose).await;
+        assert!(!core.has_pending_close());
+    }
+
+    #[test]
+    fn soft_close_fires_only_after_the_grace_window() {
+        use kmux_protocol::messages::SessionStatus;
+        let mut core = core_with_active_pane(SessionStatus::Running);
+        core.soft_close_active_pane();
+        assert!(core.has_pending_close());
+        // Before the deadline: nothing fires.
+        assert!(!core.fire_due_closes(Instant::now()));
+        assert!(core.has_pending_close());
+        // After the grace window: the close fires and the pending list drains.
+        let later = Instant::now() + SOFT_CLOSE_GRACE + std::time::Duration::from_millis(1);
+        assert!(core.fire_due_closes(later));
+        assert!(!core.has_pending_close());
+    }
+
+    #[test]
+    fn exited_pane_closes_immediately_without_grace() {
+        use kmux_protocol::messages::SessionStatus;
+        let mut core = core_with_active_pane(SessionStatus::Exited {
+            code: Some(0),
+            signal: None,
+        });
+        core.soft_close_active_pane();
+        // An already-dead shell needs no grace: no pending close is scheduled.
+        assert!(!core.has_pending_close());
+    }
+
+    #[test]
+    fn reselecting_a_pane_cancels_its_pending_close() {
+        use kmux_protocol::messages::SessionStatus;
+        let mut core = core_with_active_pane(SessionStatus::Running);
+        core.soft_close_active_pane();
+        assert!(core.is_pane_pending_close("eagle/0"));
+        // "Re-opening" the pane within the window restores it.
+        core.apply_top_bar_action(TopBarAction::SelectPane("eagle/0".into()));
+        assert!(!core.has_pending_close());
     }
 
     #[tokio::test]

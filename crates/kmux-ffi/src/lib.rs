@@ -71,7 +71,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 8;
+pub const KMUX_FFI_ABI_VERSION: u32 = 9;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -147,6 +147,8 @@ pub enum FfiAction {
     },
     CreatePane,
     ClosePane,
+    /// Cancel the most recent soft-close within its grace window (issue #86).
+    UndoClose,
     NextPane,
     PrevPane,
     CloseTab,
@@ -197,6 +199,7 @@ impl From<FfiAction> for Action {
             FfiAction::JumpToSession { index } => Action::JumpToSession(index as usize),
             FfiAction::CreatePane => Action::CreatePane,
             FfiAction::ClosePane => Action::ClosePane,
+            FfiAction::UndoClose => Action::UndoClose,
             FfiAction::NextPane => Action::NextPane,
             FfiAction::PrevPane => Action::PrevPane,
             FfiAction::CloseTab => Action::CloseTab,
@@ -1031,6 +1034,15 @@ impl KmuxDriver {
             status: FfiConnStatus::from(state),
             label: state.badge_label(),
         }
+    }
+
+    /// Whether a pane is in its soft-close grace window (issue #86), so the
+    /// frontend can show an "Undo" affordance.
+    pub fn soft_close_pending(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .has_pending_close()
     }
 
     /// The session list, with the active session flagged.
@@ -1910,6 +1922,7 @@ mod tests {
             Action::from(FfiAction::FocusPaneAt { index: 2 }),
             Action::FocusPaneAt(2)
         );
+        assert_eq!(Action::from(FfiAction::UndoClose), Action::UndoClose);
     }
 
     #[test]
