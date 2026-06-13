@@ -110,4 +110,19 @@ impl SessionManager {
             .map(|e| e.panes.as_slice())
             .unwrap_or(&[])
     }
+
+    /// The latest directory listing received from the daemon (in response to
+    /// [`SessionManager::request_list_directory`]), or `None` if none has
+    /// arrived yet. Backs the app-layer directory browser.
+    pub fn dir_listing(&self) -> Option<&super::DirListing> {
+        self.dir_listing.as_ref()
+    }
+
+    /// Test-only: the `request_id` of the in-flight `ListDirectory`, so a test
+    /// in a dependent crate can synthesize the matching `DirectoryListing`
+    /// reply (the field itself is crate-private).
+    #[doc(hidden)]
+    pub fn pending_dir_request_for_test(&self) -> Option<u64> {
+        self.pending_dir_request
+    }
 }

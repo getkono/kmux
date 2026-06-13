@@ -2,10 +2,12 @@ import SwiftUI
 
 import KmuxBindings
 
-/// A generic picker sheet driven by `picker()` — covers the session, server, and
-/// directory pickers (the analog of kmux-gtk's picker dialogs). Mode-driven: the
-/// directory picker, for instance, opens itself on a remote connect. Filtering /
-/// selection / activation route through the mode-generic core methods.
+/// A generic picker sheet driven by `picker()` — covers the **session** and
+/// **server** pickers (the analog of kmux-gtk's picker dialogs). The directory
+/// picker is a filesystem *browser* with its own richer sheet
+/// (`DirectoryBrowser`), so `ContentView` routes the `.directory` kind there;
+/// this sheet handles the other kinds. Filtering / selection / activation route
+/// through the mode-generic core methods.
 struct PickerSheet: View {
     @ObservedObject var model: KmuxModel
     @State private var query = ""

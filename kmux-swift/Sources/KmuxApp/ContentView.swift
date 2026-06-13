@@ -37,6 +37,9 @@ struct ContentView: View {
         .sheet(isPresented: pickerPresented) {
             PickerSheet(model: model)
         }
+        .sheet(isPresented: dirBrowserPresented) {
+            DirectoryBrowser(model: model)
+        }
         .sheet(isPresented: $ui.help) {
             HelpView(isPresented: $ui.help)
         }
@@ -79,11 +82,21 @@ struct ContentView: View {
         model.sessions.first(where: { $0.active })?.name ?? "kmux"
     }
 
-    /// Picker sheets are mode-driven (e.g. the directory picker opens itself on a
-    /// remote connect); dismissing one cancels it in the core.
+    /// Picker sheets are mode-driven (e.g. the directory browser opens itself on
+    /// a remote connect); dismissing one cancels it in the core. The directory
+    /// browser has its own richer sheet (`DirectoryBrowser`), so the generic
+    /// picker sheet covers only the session/server pickers.
     private var pickerPresented: Binding<Bool> {
         Binding(
-            get: { model.picker != nil },
+            get: { model.picker != nil && model.picker?.kind != .directory },
+            set: { if !$0 { model.driver.cancelPicker() } }
+        )
+    }
+
+    /// The directory browser is mode-driven and dismissing it cancels in core.
+    private var dirBrowserPresented: Binding<Bool> {
+        Binding(
+            get: { model.dirBrowser != nil },
             set: { if !$0 { model.driver.cancelPicker() } }
         )
     }
