@@ -37,11 +37,17 @@ struct ContentView: View {
         .sheet(isPresented: pickerPresented) {
             PickerSheet(model: model)
         }
+        .sheet(isPresented: dirBrowserPresented) {
+            DirectoryBrowser(model: model)
+        }
         .sheet(isPresented: $ui.help) {
             HelpView(isPresented: $ui.help)
         }
         .sheet(isPresented: metricsPresented) {
             MetricsView(model: model)
+        }
+        .sheet(isPresented: connectionPresented) {
+            ConnectionView(model: model)
         }
         .sheet(item: $ui.renameTarget) { session in
             RenameSheet(model: model, session: session, renameTarget: $ui.renameTarget)
@@ -70,6 +76,8 @@ struct ContentView: View {
                 HudOverlay(model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                     .padding(8)
+                SoftCloseBanner(model: model)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
             }
         }
         .frame(minWidth: 480, minHeight: 320)
@@ -79,11 +87,21 @@ struct ContentView: View {
         model.sessions.first(where: { $0.active })?.name ?? "kmux"
     }
 
-    /// Picker sheets are mode-driven (e.g. the directory picker opens itself on a
-    /// remote connect); dismissing one cancels it in the core.
+    /// Picker sheets are mode-driven (e.g. the directory browser opens itself on
+    /// a remote connect); dismissing one cancels it in the core. The directory
+    /// browser has its own richer sheet (`DirectoryBrowser`), so the generic
+    /// picker sheet covers only the session/server pickers.
     private var pickerPresented: Binding<Bool> {
         Binding(
-            get: { model.picker != nil },
+            get: { model.picker != nil && model.picker?.kind != .directory },
+            set: { if !$0 { model.driver.cancelPicker() } }
+        )
+    }
+
+    /// The directory browser is mode-driven and dismissing it cancels in core.
+    private var dirBrowserPresented: Binding<Bool> {
+        Binding(
+            get: { model.dirBrowser != nil },
             set: { if !$0 { model.driver.cancelPicker() } }
         )
     }
@@ -95,9 +113,16 @@ struct ContentView: View {
         )
     }
 
+    private var connectionPresented: Binding<Bool> {
+        Binding(
+            get: { model.connectionVisible },
+            set: { if !$0 && model.connectionVisible { model.dispatch(.toggleConnection) } }
+        )
+    }
+
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
         ToolbarItemGroup {
-            ConnectionBadge(connection: model.connection)
+            ConnectionBadge(model: model)
             Button { model.openServerPicker() } label: {
                 Image(systemName: "rectangle.connected.to.line.below")
             }
@@ -159,6 +184,8 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut("h", modifiers: [.command, .shift])
             Toggle("Metrics Inspector", isOn: metricsBinding)
                 .keyboardShortcut("m", modifiers: [.command, .shift])
+            Toggle("Connection Inspector", isOn: connectionBinding)
+                .keyboardShortcut("i", modifiers: [.command, .shift])
         }
         // Tiling: split the focused pane, move focus, resize, swap (the analog of
         // kmux-gtk's tiling accelerators). iTerm2-style split shortcuts; ⌘⌥ moves
@@ -206,6 +233,8 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut("z", modifiers: [.command, .control])
             Button("Close Pane") { model.dispatch(.closePane) }
                 .keyboardShortcut("w", modifiers: [.command, .shift])
+            Button("Undo Close") { model.dispatch(.undoClose) }
+                .keyboardShortcut("u", modifiers: [.command, .shift])
         }
         CommandGroup(replacing: .help) {
             Button("kmux Help") { ui.help = true }
@@ -224,6 +253,13 @@ struct KmuxCommands: Commands {
         Binding(
             get: { model.metricsVisible },
             set: { _ in model.dispatch(.toggleMetrics) }
+        )
+    }
+
+    private var connectionBinding: Binding<Bool> {
+        Binding(
+            get: { model.connectionVisible },
+            set: { _ in model.dispatch(.toggleConnection) }
         )
     }
 }

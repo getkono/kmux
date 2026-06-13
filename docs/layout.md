@@ -134,6 +134,17 @@ tab closes the session.
 | Preset layout | `ApplyLayoutScheme` | `apply_scheme` | server rebuilds the tree |
 | Zoom | *(client-local)* | — | a view flag; see below |
 
+### Soft-close (the 3-second undo, issue #86)
+
+Closing a pane (`Ctrl+Shift+Q` / `⌘⇧W`, or `/pane close`) is **deferred**, not immediate, so an accidental close is recoverable. This is purely **client-side** interaction policy in `kmux-app` — the wire `PaneClose` (and thus the kill) is simply withheld:
+
+- On a close request for a **healthy** pane (its shell is `Running`), `AppCore` records a `PendingClose { pane_id, deadline: now + SOFT_CLOSE_GRACE }` (3 s) instead of sending `PaneClose`. The frontends show an **Undo** affordance (a toast button on GTK, a banner on macOS); `Ctrl+Shift+U` / `⌘⇧U` also undoes.
+- The frontend pump (`FrontendDriver::tick`) calls `AppCore::fire_due_closes`, which sends the real `PaneClose` for each pane whose deadline has passed.
+- Cancelling — via **Undo** or by **re-selecting the pane** within the window — drops the `PendingClose`; the live shell was never touched, so the pane is restored as-is.
+- An already-**exited** pane (`is_pane_running` is false) skips the grace and closes at once.
+
+Re-opening *after* the kill is just an ordinary new pane/session — there is no special daemon-side resurrection (the kill is final once the wire `PaneClose` is sent). Tab and session close remain immediate (session close has its own confirmation dialog).
+
 ### Preset layouts (schemes)
 
 `ApplyLayoutScheme` rebuilds a tab's tree from its current panes (in leaf order)

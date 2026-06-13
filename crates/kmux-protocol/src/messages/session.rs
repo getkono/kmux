@@ -107,6 +107,20 @@ pub struct SessionMeta {
     pub cwd: String,
 }
 
+/// One entry returned by a `ListDirectory` directory browse.
+///
+/// Today the daemon only returns subdirectories (the browser chooses a
+/// *directory* in which to open a new session), so `is_dir` is always `true`.
+/// The field is kept explicit so the wire shape can later carry files too
+/// without a breaking change to call sites that already pattern-match on it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirEntry {
+    /// The entry's file name (a single path component, not a full path).
+    pub name: String,
+    /// Whether the entry is a directory. Always `true` in the current protocol.
+    pub is_dir: bool,
+}
+
 /// Snapshot of a single pane within a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneInfo {

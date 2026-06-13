@@ -88,6 +88,8 @@ pub enum Action {
     // user-facing "pane" the chrome shows as a tab is now a Tab.)
     CreatePane,
     ClosePane,
+    /// Cancel the most recent soft-close before its grace window elapses (#86).
+    UndoClose,
     NextPane,
     PrevPane,
     CloseTab,
@@ -144,6 +146,8 @@ pub enum Action {
     // HUD / modes
     ToggleHud,
     ToggleMetrics,
+    /// Toggle the connection inspector overlay (issue #60).
+    ToggleConnection,
     ToggleSnapshotMode,
     ToggleInputLock,
 

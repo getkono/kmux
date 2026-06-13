@@ -120,6 +120,10 @@ $ cargo run -p kmux-gtk    # GTK GUI directly (Linux default, also macOS) — ne
 
 By default, the server binds to `0.0.0.0:8443`.
 
+To enable dynamic tab-completion for `kmux` (subcommands, flags, themes,
+`hosts.toml` aliases, and live sessions), add one line to your shell config — see
+[docs/shell-completion.md](docs/shell-completion.md).
+
 ## Server configuration
 
 Configure `kmuxd` with a TOML file (see [docs/connection.md](docs/connection.md)

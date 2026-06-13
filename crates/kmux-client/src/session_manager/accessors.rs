@@ -99,6 +99,33 @@ impl SessionManager {
         self.accept_invalid_certs
     }
 
+    /// EWMA round-trip time (ms) for the active transport — the HUD's network
+    /// latency counter (issue #61). `None` before the first Ping/Pong.
+    pub fn last_rtt_ms(&self) -> Option<f64> {
+        let key = self.metrics.active_transport()?;
+        self.metrics.rtt.summary(key).and_then(|s| s.ewma_ms)
+    }
+
+    /// Whether the link has gone quiet for longer than 3× the ping interval
+    /// (issue #61: stars the latency counter). False when not connected.
+    pub fn is_ping_stale(&self, now: std::time::Instant) -> bool {
+        self.connection_state.is_live()
+            && self.liveness.idle_since(now) > 3 * crate::liveness::PING_INTERVAL
+    }
+ 
+    /// The currently-active transport channel (QUIC/TCP+TLS/UDS/TCP).
+    pub fn current_transport(&self) -> kmux_protocol::messages::TransportKind {
+        self.current_transport
+    }
+
+    /// RTT summary (EWMA + recent avg/max + sample count) for the active
+    /// transport, or `None` before the first Ping/Pong round-trip. Drives the
+    /// connection inspector and the HUD latency counter.
+    pub fn active_rtt(&self) -> Option<crate::metrics::RttSummary> {
+        let key = self.metrics.active_transport()?;
+        self.metrics.rtt.summary(key)
+    }
+
     pub fn token(&self) -> &str {
         &self.token
     }
@@ -109,5 +136,20 @@ impl SessionManager {
             .and_then(|wid| self.session_list.iter().find(|e| e.meta.word_id == *wid))
             .map(|e| e.panes.as_slice())
             .unwrap_or(&[])
+    }
+
+    /// The latest directory listing received from the daemon (in response to
+    /// [`SessionManager::request_list_directory`]), or `None` if none has
+    /// arrived yet. Backs the app-layer directory browser.
+    pub fn dir_listing(&self) -> Option<&super::DirListing> {
+        self.dir_listing.as_ref()
+    }
+
+    /// Test-only: the `request_id` of the in-flight `ListDirectory`, so a test
+    /// in a dependent crate can synthesize the matching `DirectoryListing`
+    /// reply (the field itself is crate-private).
+    #[doc(hidden)]
+    pub fn pending_dir_request_for_test(&self) -> Option<u64> {
+        self.pending_dir_request
     }
 }

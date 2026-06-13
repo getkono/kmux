@@ -235,6 +235,13 @@ pub enum ClientMessage {
 
     /// Response to server Ping.
     Pong { seq: u64 },
+
+    /// Request a listing of the daemon host's directories under `path`, so the
+    /// client can browse the (possibly remote) filesystem to pick where a new
+    /// session should be created. An empty `path` asks the daemon to resolve a
+    /// sensible default (the user's home directory, else `"."`). The daemon
+    /// replies with [`super::server::ServerMessage::DirectoryListing`].
+    ListDirectory { request_id: RequestId, path: String },
 }
 
 impl ClientMessage {
@@ -269,7 +276,8 @@ impl ClientMessage {
             | Self::Signal { .. }
             | Self::RequestInputLock { .. }
             | Self::ReleaseInputLock { .. }
-            | Self::SetSnapshotMode { .. } => MessageCategory::Control,
+            | Self::SetSnapshotMode { .. }
+            | Self::ListDirectory { .. } => MessageCategory::Control,
             Self::Auth { .. } | Self::ChannelReady => MessageCategory::Bootstrap,
         }
     }
@@ -637,9 +645,32 @@ mod tests {
                 MessageCategory::Bootstrap,
             ),
             (ClientMessage::ChannelReady, MessageCategory::Bootstrap),
+            (
+                ClientMessage::ListDirectory {
+                    request_id: 0,
+                    path: "/tmp".into(),
+                },
+                MessageCategory::Control,
+            ),
         ];
         for (msg, expected) in cases {
             assert_eq!(msg.category(), *expected, "wrong category for {msg:?}");
+        }
+    }
+
+    #[test]
+    fn list_directory_roundtrips() {
+        let msg = ClientMessage::ListDirectory {
+            request_id: 7,
+            path: "/home/user/dev".into(),
+        };
+        let bytes = crate::encode_client(&msg).unwrap();
+        match crate::decode_client(&bytes).unwrap() {
+            ClientMessage::ListDirectory { request_id, path } => {
+                assert_eq!(request_id, 7);
+                assert_eq!(path, "/home/user/dev");
+            }
+            other => panic!("expected ListDirectory, got {other:?}"),
         }
     }
 }

@@ -73,6 +73,9 @@ struct LiveDialog {
     kind: DialogKind,
     dialog: adw::Dialog,
     list: Option<ListBox>,
+    /// The filter entry, kept so navigation (which clears the core filter) can
+    /// clear the visible text too. Only the list dialogs have one.
+    search: Option<SearchEntry>,
 }
 
 /// The live native dialog plus the HUD OSD and the transient-state trackers.
@@ -92,6 +95,8 @@ pub struct Dialogs {
     last_status: RefCell<String>,
     /// The metrics inspector dialog, while open.
     metrics_dialog: RefCell<Option<adw::Dialog>>,
+    /// The connection inspector dialog, while open (issue #60).
+    connection_dialog: RefCell<Option<adw::Dialog>>,
 }
 
 /// Build the HUD overlay and add it to the shell overlay.
@@ -114,6 +119,7 @@ pub fn build(overlay: &gtk4::Overlay) -> Dialogs {
         banner_sig: RefCell::new(None),
         last_status: RefCell::new(String::new()),
         metrics_dialog: RefCell::new(None),
+        connection_dialog: RefCell::new(None),
     }
 }
 
@@ -128,6 +134,7 @@ pub fn sync(
     update_banner(dialogs, shell, fe);
     update_toast(dialogs, shell, fe);
     update_metrics_dialog(dialogs, shell, fe);
+    update_connection_dialog(dialogs, shell, fe);
     update_hud(&dialogs.hud, &fe.borrow().core);
 }
 
@@ -204,7 +211,11 @@ fn open_list_dialog(
                 "Filter servers",
                 core.server_picker_search.clone(),
             ),
-            DialogKind::DirPicker => ("Open session", "Directory…", core.dir_picker_buffer.clone()),
+            DialogKind::DirPicker => (
+                "New session — choose a directory",
+                "Filter directories…",
+                core.dir_picker_buffer.clone(),
+            ),
             DialogKind::Command => ("Command", "Type a command", command_buffer(core)),
             _ => unreachable!(),
         }
@@ -329,6 +340,7 @@ fn open_list_dialog(
         kind,
         dialog: dialog.clone(),
         list: Some(list),
+        search: Some(search),
     }
 }
 
@@ -367,6 +379,20 @@ fn populate_list(dialogs: &Rc<Dialogs>, fe: &Rc<RefCell<Frontend>>) {
         list.select_row(Some(&row));
     }
     dialogs.syncing.set(false);
+
+    // Keep the directory browser's filter entry in sync with the core filter,
+    // which navigation clears: when the user enters a folder we reset the filter
+    // in `AppCore`, so the visible text must follow. Only touch it on a genuine
+    // drift to avoid disturbing the caret while the user is typing.
+    if live.kind == DialogKind::DirPicker
+        && let Some(search) = &live.search
+    {
+        let want = fe.borrow().core.dir_picker_buffer.clone();
+        if search.text() != want {
+            search.set_text(&want);
+            search.set_position(-1);
+        }
+    }
 }
 
 /// Row labels + selected index for a list dialog.
@@ -396,15 +422,21 @@ fn list_rows(kind: DialogKind, core: &AppCore) -> (Vec<String>, usize) {
             (rows, sel)
         }
         DialogKind::DirPicker => {
-            let rows: Vec<String> = core
-                .dir_picker_matches()
-                .iter()
-                .take(50)
-                .map(|e| {
-                    let name = core.mgr.display_name_for(&e.meta.word_id);
-                    format!("{name}    {}", e.meta.cwd)
+            use kmux_app::core::DirBrowserRow;
+            let mut rows: Vec<String> = core
+                .dir_browser_rows()
+                .into_iter()
+                .map(|row| match row {
+                    DirBrowserRow::CreateHere { cwd } => format!("＋  New session in {cwd}"),
+                    DirBrowserRow::Up { parent } => format!("..  {parent}"),
+                    DirBrowserRow::Enter { name, .. } => format!("📁  {name}"),
                 })
                 .collect();
+            // Surface a listing error as a trailing dim-ish row (plain label here;
+            // the list uses a single style, so we just make it readable text).
+            if let Some(err) = core.dir_browser_error() {
+                rows.push(format!("⚠  {err}"));
+            }
             let sel = core.dir_picker_selected.min(rows.len().saturating_sub(1));
             (rows, sel)
         }
@@ -437,10 +469,12 @@ fn list_signature(core: &AppCore) -> String {
             core.filtered_servers().len()
         ),
         Some(DialogKind::DirPicker) => format!(
-            "dir|{}|{}|{}",
+            "dir|{}|{}|{}|{}|{}",
+            core.dir_browser_cwd,
             core.dir_picker_buffer,
             core.dir_picker_selected,
-            core.dir_picker_matches().len()
+            core.dir_browser_rows().len(),
+            core.dir_browser_error().unwrap_or("")
         ),
         Some(DialogKind::Command) => {
             format!("cmd|{}|{}", command_buffer(core), command_selected(core))
@@ -561,6 +595,7 @@ fn open_confirm(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
         kind: DialogKind::Confirm,
         dialog: dialog.upcast(),
         list: None,
+        search: None,
     }
 }
 
@@ -613,6 +648,7 @@ fn open_rename(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
         kind: DialogKind::Rename,
         dialog: dialog.upcast(),
         list: None,
+        search: None,
     }
 }
 
@@ -651,6 +687,7 @@ fn open_help(shell: &Rc<Shell>) -> LiveDialog {
         kind: DialogKind::Help,
         dialog: dialog.upcast(),
         list: None,
+        search: None,
     }
 }
 
@@ -692,16 +729,36 @@ fn update_banner(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Front
     shell.banner.set_revealed(revealed);
 }
 
-/// Surface a newly-set status message as a transient toast.
+/// Surface a newly-set status message as a transient toast. While a pane is in
+/// its soft-close grace window (issue #86) the toast gains an "Undo" button that
+/// cancels the pending close.
 fn update_toast(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
-    let msg = fe.borrow().core.mgr.status_msg().to_string();
+    let (msg, pending) = {
+        let core = &fe.borrow().core;
+        (core.mgr.status_msg().to_string(), core.has_pending_close())
+    };
     if msg == *dialogs.last_status.borrow() {
         return;
     }
     *dialogs.last_status.borrow_mut() = msg.clone();
-    if !msg.is_empty() {
-        shell.toasts.add_toast(adw::Toast::new(&msg));
+    if msg.is_empty() {
+        return;
     }
+    let toast = adw::Toast::new(&msg);
+    if pending {
+        toast.set_button_label(Some("Undo"));
+        let fe = fe.clone();
+        let shell = shell.clone();
+        toast.connect_button_clicked(move |_| {
+            {
+                let mut f = fe.borrow_mut();
+                let _ = futures::executor::block_on(f.core.dispatch_action(Action::UndoClose));
+                f.core.needs_render = true;
+            }
+            shell.drawing.queue_draw();
+        });
+    }
+    shell.toasts.add_toast(toast);
 }
 
 // ── HUD ticker + metrics inspector dialog ──
@@ -734,6 +791,24 @@ fn update_hud(hud: &GtkBox, core: &AppCore) {
     ];
     for line in lines {
         hud.append(&label(&line, "kmux-hud-line"));
+    }
+    // Network latency + rendering FPS (issue #61), shown unless disabled in
+    // config (which also skips their computation). A ★ marks a stale link
+    // (no inbound for >3× the ping interval).
+    if core.show_perf_counters {
+        let latency = match core.net_latency_ms() {
+            Some(ms) => format!("{ms:.1} ms"),
+            None => "—".to_string(),
+        };
+        let star = if core.net_latency_stale() { " ★" } else { "" };
+        hud.append(&label(
+            &format!("Latency:   {latency}{star}"),
+            "kmux-hud-line",
+        ));
+        hud.append(&label(
+            &format!("FPS:       {}", core.render_fps()),
+            "kmux-hud-line",
+        ));
     }
     hud.set_visible(true);
 }
@@ -829,6 +904,134 @@ fn metrics_content(core: &AppCore) -> ScrolledWindow {
         ),
         "monospace",
     ));
+
+    let scroll = ScrolledWindow::new();
+    scroll.set_vexpand(true);
+    scroll.set_child(Some(&card));
+    scroll
+}
+
+// ── Connection inspector dialog (issue #60) ──
+
+/// Open/close the connection inspector dialog from `connection_overlay_visible`,
+/// mirroring [`update_metrics_dialog`]. The content is rebuilt each open from a
+/// live [`kmux_app::core::ConnectionInfo`]; closing the dialog clears the flag.
+fn update_connection_dialog(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
+    let show = fe.borrow().core.connection_overlay_visible;
+    let open = dialogs.connection_dialog.borrow().is_some();
+    if show && !open {
+        let dialog = adw::Dialog::builder()
+            .title("Connection")
+            .content_width(560)
+            .content_height(460)
+            .build();
+        dialog.set_child(Some(&connection_content(&fe.borrow().core)));
+        {
+            let fe = fe.clone();
+            let shell = shell.clone();
+            dialog.connect_closed(move |_| {
+                fe.borrow_mut().core.connection_overlay_visible = false;
+                shell.drawing.grab_focus();
+            });
+        }
+        dialog.present(Some(&shell.window));
+        *dialogs.connection_dialog.borrow_mut() = Some(dialog);
+    } else if !show
+        && open
+        && let Some(d) = dialogs.connection_dialog.borrow_mut().take()
+    {
+        d.close();
+    }
+}
+
+/// The connection inspector body: server/endpoint, transport + state, the
+/// session/handshake identity, the live latency summary, and per-transport
+/// traffic — all from the toolkit-neutral [`kmux_app::core::ConnectionInfo`].
+fn connection_content(core: &AppCore) -> ScrolledWindow {
+    let info = core.connection_info();
+    let card = GtkBox::new(Orientation::Vertical, 4);
+    card.set_margin_top(12);
+    card.set_margin_bottom(12);
+    card.set_margin_start(12);
+    card.set_margin_end(12);
+
+    card.append(&label("Server", "heading"));
+    card.append(&label(&info.server, "monospace"));
+    if !info.is_local && !info.endpoint.is_empty() {
+        card.append(&label(
+            &format!("   endpoint {}", info.endpoint),
+            "dim-label",
+        ));
+    }
+    card.append(&label(&format!("State: {}", info.state), "monospace"));
+    card.append(&label(
+        &format!("Transport: {}", info.transport),
+        "monospace",
+    ));
+    if !info.is_local {
+        let tls = if info.accept_invalid_certs {
+            "TLS: accepting invalid certs (dev)"
+        } else {
+            "TLS: certificate verified"
+        };
+        card.append(&label(tls, "dim-label"));
+    }
+
+    card.append(&label("Identity", "heading"));
+    let conn = info
+        .connection_id
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "-".into());
+    let client = info
+        .client_id
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "-".into());
+    card.append(&label(
+        &format!("connection {conn}   client {client}"),
+        "monospace",
+    ));
+    let server_ver = info.server_version.as_deref().unwrap_or("unknown");
+    card.append(&label(
+        &format!("server v{server_ver}   protocol v{}", info.protocol_version),
+        "monospace",
+    ));
+
+    card.append(&label("Latency", "heading"));
+    match &info.rtt {
+        Some(rtt) => {
+            let ewma = rtt
+                .ewma_ms
+                .map(|v| format!("{v:.1}ms"))
+                .unwrap_or_else(|| "-".into());
+            card.append(&label(
+                &format!(
+                    "ping {ewma} ewma   recent {:.1}/{:.1}ms   {} samples",
+                    rtt.recent_avg_ms, rtt.recent_max_ms, rtt.samples
+                ),
+                "monospace",
+            ));
+        }
+        None => card.append(&label("(no ping samples yet)", "dim-label")),
+    }
+
+    card.append(&label("Traffic", "heading"));
+    if info.transports.is_empty() {
+        card.append(&label("(no transport traffic yet)", "dim-label"));
+    } else {
+        for t in &info.transports {
+            card.append(&label(
+                &format!(
+                    "{}   in {}  out {}   msgs {}/{}",
+                    t.label,
+                    fmt_bytes(t.bytes_in),
+                    fmt_bytes(t.bytes_out),
+                    t.msgs_in,
+                    t.msgs_out,
+                ),
+                "monospace",
+            ));
+        }
+    }
 
     let scroll = ScrolledWindow::new();
     scroll.set_vexpand(true);

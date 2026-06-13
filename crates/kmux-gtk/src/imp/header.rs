@@ -50,11 +50,30 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application) {
             s.drawing.queue_draw();
         });
     }
+
+    // Transport indicator → double-click opens the override chooser (issue #69).
+    // The command palette (pre-filled `transport `) is the selection mechanism.
+    {
+        let s = shell.clone();
+        let fe = fe.clone();
+        let gesture = gtk4::GestureClick::new();
+        gesture.connect_pressed(move |_g, n_press, _, _| {
+            if n_press == 2 {
+                {
+                    let mut f = fe.borrow_mut();
+                    f.core.open_transport_chooser();
+                    f.core.needs_render = true;
+                }
+                s.drawing.queue_draw();
+            }
+        });
+        shell.transport_btn.add_controller(gesture);
+    }
 }
 
 /// Refresh the header from current state. Cheap no-op when unchanged.
 pub fn sync(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
-    let (sig, server, session, icon, tip, class, locked) = {
+    let (sig, server, session, icon, tip, class, locked, transport, connected, overridden) = {
         let f = fe.borrow();
         let mgr = &f.core.mgr;
         let server = f.core.server_display.clone();
@@ -65,8 +84,20 @@ pub fn sync(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
         let state = mgr.connection_state();
         let (icon, tip, class) = conn_visual(state);
         let locked = mgr.active_input_locked();
-        let sig = format!("{server}|{session}|{}|{locked}", state.badge_label());
-        (sig, server, session, icon, tip, class, locked)
+        let connected = state.is_live();
+        let overridden = mgr.transport_override().is_some();
+        let transport = if connected {
+            mgr.current_transport.to_string()
+        } else {
+            String::new()
+        };
+        let sig = format!(
+            "{server}|{session}|{}|{locked}|{transport}|{overridden}",
+            state.badge_label()
+        );
+        (
+            sig, server, session, icon, tip, class, locked, transport, connected, overridden,
+        )
     };
     if shell.header_sig.borrow().as_deref() == Some(sig.as_str()) {
         return;
@@ -84,6 +115,24 @@ pub fn sync(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
         shell.conn_btn.remove_css_class(c);
     }
     shell.conn_btn.add_css_class(class);
+
+    // Transport indicator: visible only when connected; "warning" (amber) style
+    // signals an active override, "dim-label" the auto default (issue #69).
+    shell.transport_btn.set_visible(connected);
+    shell.transport_btn.set_label(&transport);
+    shell.transport_btn.remove_css_class("warning");
+    shell.transport_btn.remove_css_class("dim-label");
+    if overridden {
+        shell.transport_btn.add_css_class("warning");
+        shell
+            .transport_btn
+            .set_tooltip_text(Some("Transport overridden — double-click to change"));
+    } else {
+        shell.transport_btn.add_css_class("dim-label");
+        shell
+            .transport_btn
+            .set_tooltip_text(Some("Transport protocol — double-click to override"));
+    }
 
     shell.lock_btn.set_visible(locked);
 }

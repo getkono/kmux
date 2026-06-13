@@ -101,4 +101,6 @@ pub enum Completer {
     Themes,
     /// `on` / `off`.
     OnOff,
+    /// Transport override choices: `auto` / `quic` / `tcp-tls` / `uds` / `tcp`.
+    Transports,
 }

@@ -67,6 +67,11 @@ pub struct KmuxConfig {
     /// persists `false` here to silence it.
     #[serde(skip_serializing_if = "Option::is_none", alias = "warn-nested")]
     pub warn_nested: Option<bool>,
+    /// Whether the performance HUD shows the live network-latency and rendering
+    /// FPS counters (issue #61). `None` (the default) shows them; set `false` to
+    /// hide them, which also skips their per-frame computation to save power.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "perf-counters")]
+    pub perf_counters: Option<bool>,
 }
 
 /// Load `config.toml`, returning defaults if it is missing or unparseable.
@@ -235,6 +240,15 @@ pub fn set_warn_when_nested(value: bool) -> anyhow::Result<()> {
     save(&cfg)
 }
 
+/// Resolve whether the performance HUD shows the network-latency + FPS counters
+/// (issue #61). `perf_counters` key in `~/.config/kmux/config.toml`; defaults to
+/// `true`. Hiding them also disables their per-frame calculation.
+pub fn resolve_perf_counters() -> bool {
+    load_config_file()
+        .and_then(|cfg| cfg.perf_counters)
+        .unwrap_or(true)
+}
+
 /// Try to load a theme by name.
 ///
 /// Looks up built-in themes first, then `<config_dir>/themes/<name>.toml`.
@@ -305,13 +319,13 @@ fn load_config_file() -> Option<KmuxConfig> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
     use crate::theme::Rgb;
 
-    // Serialise all tests that mutate XDG_CONFIG_HOME to avoid races.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Serialise all tests that mutate XDG_CONFIG_HOME to avoid races. Shared
+    // crate-wide so completion.rs's tests (which mutate the same var) cannot
+    // race these.
+    use crate::ENV_LOCK;
 
     #[test]
     fn test_resolve_cli_builtin() {
@@ -484,6 +498,15 @@ status_bg = "#111111"
         );
         let back: KmuxConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(back.warn_nested, Some(false));
+    }
+  
+    #[test]
+    fn config_file_parses_perf_counters_field() {
+        // Both snake_case (canonical) and the kebab alias parse (issue #61).
+        let snake: KmuxConfig = toml::from_str("perf_counters = false").unwrap();
+        assert_eq!(snake.perf_counters, Some(false));
+        let kebab: KmuxConfig = toml::from_str("perf-counters = true").unwrap();
+        assert_eq!(kebab.perf_counters, Some(true));
     }
 
     #[test]
