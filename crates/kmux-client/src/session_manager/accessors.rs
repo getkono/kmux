@@ -99,6 +99,20 @@ impl SessionManager {
         self.accept_invalid_certs
     }
 
+    /// EWMA round-trip time (ms) for the active transport — the HUD's network
+    /// latency counter (issue #61). `None` before the first Ping/Pong.
+    pub fn last_rtt_ms(&self) -> Option<f64> {
+        let key = self.metrics.active_transport()?;
+        self.metrics.rtt.summary(key).and_then(|s| s.ewma_ms)
+    }
+
+    /// Whether the link has gone quiet for longer than 3× the ping interval
+    /// (issue #61: stars the latency counter). False when not connected.
+    pub fn is_ping_stale(&self, now: std::time::Instant) -> bool {
+        self.connection_state.is_live()
+            && self.liveness.idle_since(now) > 3 * crate::liveness::PING_INTERVAL
+    }
+ 
     /// The currently-active transport channel (QUIC/TCP+TLS/UDS/TCP).
     pub fn current_transport(&self) -> kmux_protocol::messages::TransportKind {
         self.current_transport

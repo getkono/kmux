@@ -62,6 +62,11 @@ pub struct KmuxConfig {
     /// requests (DECSCUSR `blinking_*` / DEC mode 12).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor_blink: Option<bool>,
+    /// Whether the performance HUD shows the live network-latency and rendering
+    /// FPS counters (issue #61). `None` (the default) shows them; set `false` to
+    /// hide them, which also skips their per-frame computation to save power.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "perf-counters")]
+    pub perf_counters: Option<bool>,
 }
 
 /// Load `config.toml`, returning defaults if it is missing or unparseable.
@@ -211,6 +216,15 @@ pub fn resolve_cursor_blink(cli_value: Option<bool>) -> bool {
         return value;
     }
     true
+}
+
+/// Resolve whether the performance HUD shows the network-latency + FPS counters
+/// (issue #61). `perf_counters` key in `~/.config/kmux/config.toml`; defaults to
+/// `true`. Hiding them also disables their per-frame calculation.
+pub fn resolve_perf_counters() -> bool {
+    load_config_file()
+        .and_then(|cfg| cfg.perf_counters)
+        .unwrap_or(true)
 }
 
 /// Try to load a theme by name.
@@ -436,6 +450,15 @@ status_bg = "#111111"
     fn config_file_parses_cursor_blink_field() {
         let cfg: KmuxConfig = toml::from_str("cursor_blink = false").unwrap();
         assert_eq!(cfg.cursor_blink, Some(false));
+    }
+
+    #[test]
+    fn config_file_parses_perf_counters_field() {
+        // Both snake_case (canonical) and the kebab alias parse (issue #61).
+        let snake: KmuxConfig = toml::from_str("perf_counters = false").unwrap();
+        assert_eq!(snake.perf_counters, Some(false));
+        let kebab: KmuxConfig = toml::from_str("perf-counters = true").unwrap();
+        assert_eq!(kebab.perf_counters, Some(true));
     }
 
     #[test]

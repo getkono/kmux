@@ -28,8 +28,13 @@ pub fn open(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea) {
     group.add(&theme_row(fe, drawing));
     group.add(&font_row(fe, drawing));
     group.add(&cursor_blink_row(fe, drawing));
-
     page.add(&group);
+
+    let perf = adw::PreferencesGroup::new();
+    perf.set_title("Performance");
+    perf.add(&perf_counters_row(fe, drawing));
+    page.add(&perf);
+
     window.add(&page);
     window.present();
 }
@@ -94,6 +99,32 @@ fn font_row(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea) -> adw::EntryRow 
         }
         // Re-evaluate cols/rows at the new cell size, then repaint.
         drawing.queue_resize();
+        drawing.queue_draw();
+    });
+    row
+}
+
+/// HUD performance-counters switch (issue #61); toggles `core.show_perf_counters`
+/// live (hiding the latency + FPS counters also stops their computation) and
+/// persists.
+fn perf_counters_row(fe: &Rc<RefCell<Frontend>>, drawing: &DrawingArea) -> adw::SwitchRow {
+    let row = adw::SwitchRow::new();
+    row.set_title("HUD latency & FPS counters");
+    row.set_subtitle("Hiding them also skips their per-frame calculation");
+    row.set_active(fe.borrow().core.show_perf_counters);
+
+    let fe = fe.clone();
+    let drawing = drawing.clone();
+    row.connect_active_notify(move |row| {
+        let on = row.is_active();
+        {
+            let mut f = fe.borrow_mut();
+            f.core.show_perf_counters = on;
+            f.core.needs_render = true;
+        }
+        let mut cfg = config::load();
+        cfg.perf_counters = Some(on);
+        let _ = config::save(&cfg);
         drawing.queue_draw();
     });
     row

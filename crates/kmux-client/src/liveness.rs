@@ -99,6 +99,12 @@ impl Liveness {
         now.saturating_duration_since(self.last_inbound) > self.timeout
     }
 
+    /// How long since the last inbound frame of any kind (issue #61: the HUD's
+    /// latency counter stars when this exceeds 3× the ping interval).
+    pub fn idle_since(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last_inbound)
+    }
+
     /// Next instant at which the event loop must wake up to either send
     /// a ping or re-evaluate the timeout. Used to arm a `sleep_until`.
     pub fn next_wakeup(&self) -> Instant {
