@@ -2,8 +2,8 @@ use std::sync::Arc;
 
 use super::category::MessageCategory;
 use super::session::{
-    ClientId, ConnectionId, ErrorCode, LayoutNode, PaneId, PaneInfo, RequestId, SequenceNo,
-    SessionEntry, SessionEventMsg, TabIndex, TabInfo, WordId,
+    ClientId, ConnectionId, DirEntry, ErrorCode, LayoutNode, PaneId, PaneInfo, RequestId,
+    SequenceNo, SessionEntry, SessionEventMsg, TabIndex, TabInfo, WordId,
 };
 use super::vt::{CellState, CursorState, GridSnapshot, TermModes, TerminalDiff};
 
@@ -196,6 +196,24 @@ pub enum ServerMessage {
 
     /// Confirmation that a session was renamed.
     SessionRenamed { word_id: WordId, new_name: String },
+
+    /// Response to [`super::client::ClientMessage::ListDirectory`]. Carries the
+    /// daemon host's directory listing the client browses to choose where a new
+    /// session is created.
+    DirectoryListing {
+        request_id: RequestId,
+        /// The canonicalized directory actually listed (echoes the requested
+        /// path on error so the client can keep showing where it tried to go).
+        path: String,
+        /// The listed directory's parent, or `None` at the filesystem root.
+        parent: Option<String>,
+        /// The listed directory's subdirectories only (we are choosing a
+        /// directory). Empty when `error` is `Some`.
+        entries: Vec<DirEntry>,
+        /// A human-readable message when the listing failed (e.g. permission
+        /// denied); `None` on success.
+        error: Option<String>,
+    },
 }
 
 impl ServerMessage {
@@ -225,7 +243,8 @@ impl ServerMessage {
             | Self::Error { .. }
             | Self::InputLockGranted { .. }
             | Self::InputLockDenied { .. }
-            | Self::InputLockReleased { .. } => MessageCategory::Control,
+            | Self::InputLockReleased { .. }
+            | Self::DirectoryListing { .. } => MessageCategory::Control,
             Self::Lagged { .. } | Self::SyncReset { .. } => MessageCategory::Sync,
             Self::AuthResult { .. } | Self::ChannelSwitched { .. } => MessageCategory::Bootstrap,
         }
@@ -497,9 +516,84 @@ mod tests {
                 },
                 MessageCategory::Bootstrap,
             ),
+            (
+                ServerMessage::DirectoryListing {
+                    request_id: 0,
+                    path: "/tmp".into(),
+                    parent: Some("/".into()),
+                    entries: vec![],
+                    error: None,
+                },
+                MessageCategory::Control,
+            ),
         ];
         for (msg, expected) in &cases {
             assert_eq!(msg.category(), *expected, "wrong category for {msg:?}");
+        }
+    }
+
+    #[test]
+    fn directory_listing_roundtrips() {
+        use super::super::session::DirEntry;
+        let msg = ServerMessage::DirectoryListing {
+            request_id: 5,
+            path: "/home/user".into(),
+            parent: Some("/home".into()),
+            entries: vec![
+                DirEntry {
+                    name: "dev".into(),
+                    is_dir: true,
+                },
+                DirEntry {
+                    name: "docs".into(),
+                    is_dir: true,
+                },
+            ],
+            error: None,
+        };
+        let bytes = crate::encode_server(&msg).unwrap();
+        match crate::decode_server(&bytes).unwrap() {
+            ServerMessage::DirectoryListing {
+                request_id,
+                path,
+                parent,
+                entries,
+                error,
+            } => {
+                assert_eq!(request_id, 5);
+                assert_eq!(path, "/home/user");
+                assert_eq!(parent.as_deref(), Some("/home"));
+                assert_eq!(entries.len(), 2);
+                assert_eq!(entries[0].name, "dev");
+                assert!(entries[0].is_dir);
+                assert!(error.is_none());
+            }
+            other => panic!("expected DirectoryListing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn directory_listing_error_roundtrips() {
+        let msg = ServerMessage::DirectoryListing {
+            request_id: 1,
+            path: "/root/secret".into(),
+            parent: None,
+            entries: vec![],
+            error: Some("Permission denied (os error 13)".into()),
+        };
+        let bytes = crate::encode_server(&msg).unwrap();
+        match crate::decode_server(&bytes).unwrap() {
+            ServerMessage::DirectoryListing {
+                parent,
+                entries,
+                error,
+                ..
+            } => {
+                assert!(parent.is_none());
+                assert!(entries.is_empty());
+                assert!(error.unwrap().contains("Permission denied"));
+            }
+            other => panic!("expected DirectoryListing, got {other:?}"),
         }
     }
 }

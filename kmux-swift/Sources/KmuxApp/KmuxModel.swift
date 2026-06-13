@@ -23,11 +23,16 @@ final class KmuxModel: ObservableObject {
     @Published private(set) var tabs: [FfiTab] = []
     @Published private(set) var mode: FfiMode = .normal
     @Published private(set) var picker: FfiPicker?
+    /// The directory browser's state when the "new session — choose a directory"
+    /// overlay is open (non-nil only in `Mode::DirectoryPicker`).
+    @Published private(set) var dirBrowser: FfiDirBrowser?
     @Published private(set) var hudVisible = false
     @Published private(set) var metricsVisible = false
     /// Whether a pane is in its soft-close grace window (issue #86), driving the
     /// "Undo close" banner.
     @Published private(set) var softClosePending = false
+    /// Whether the connection inspector sheet is open (issue #60).
+    @Published private(set) var connectionVisible = false
 
     // ── Tiling render state (read by the terminal view each `draw`) ──
     /// The active tab's resolved pane rectangles (cells), recomputed each pump
@@ -167,6 +172,22 @@ final class KmuxModel: ObservableObject {
         apply(driver.submitDirectory())
     }
 
+    /// Set the directory browser's filter text (resets the selection to row 0).
+    func setDirFilter(_ text: String) {
+        driver.setPickerSearch(text: text)
+    }
+
+    /// Activate directory-browser row `index` (a tap): CreateHere makes the
+    /// session and dismisses; Up / a subdir navigate and refresh in place.
+    func dirBrowserActivate(_ index: Int) {
+        apply(driver.dirBrowserActivate(index: UInt32(index)))
+    }
+
+    /// Create a new session in the directory currently being browsed.
+    func dirBrowserOpenHere() {
+        apply(driver.dirBrowserOpenHere())
+    }
+
     private func apply(_ effects: [FfiEffect]) {
         for effect in effects { handle(effect) }
         terminalView?.needsDisplay = true
@@ -294,12 +315,16 @@ final class KmuxModel: ObservableObject {
         if md != mode { mode = md }
         let pk = driver.picker()
         if pk != picker { picker = pk }
+        let db = driver.dirBrowser()
+        if db != dirBrowser { dirBrowser = db }
         let hud = driver.hudVisible()
         if hud != hudVisible { hudVisible = hud }
         let met = driver.metricsVisible()
         if met != metricsVisible { metricsVisible = met }
         let pendingClose = driver.softClosePending()
         if pendingClose != softClosePending { softClosePending = pendingClose }
+        let conn = driver.connectionVisible()
+        if conn != connectionVisible { connectionVisible = conn }
     }
 
     // MARK: - Clipboard

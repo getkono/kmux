@@ -1,7 +1,8 @@
+use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use kmux_protocol::messages::{
-    ClientMessage, ErrorCode, ServerMessage, SessionEventMsg, epoch_millis,
+    ClientMessage, DirEntry, ErrorCode, ServerMessage, SessionEventMsg, epoch_millis,
 };
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -540,6 +541,10 @@ pub async fn handle_message<A: PaneAttacher>(
             Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
         },
 
+        ClientMessage::ListDirectory { request_id, path } => {
+            state.send(list_directory(request_id, &path));
+        }
+
         ClientMessage::Ping { seq } => {
             state.send(ServerMessage::Pong { seq });
         }
@@ -560,4 +565,156 @@ pub async fn handle_message<A: PaneAttacher>(
     }
 
     true
+}
+
+/// Maximum number of directory entries returned in a single `DirectoryListing`,
+/// to bound the reply size for very large directories.
+const MAX_DIR_ENTRIES: usize = 2000;
+
+/// Build the `DirectoryListing` reply for a `ListDirectory` request.
+///
+/// Resolves `requested` (empty ⇒ `$HOME`, else the daemon's `.`), canonicalizes
+/// it, and returns its **subdirectories only** (the browser is choosing a
+/// directory), sorted case-insensitively and capped at [`MAX_DIR_ENTRIES`]. On
+/// any IO error it returns `error: Some(..)` with empty `entries` and echoes the
+/// requested path so the client keeps showing where it tried to go. This reads
+/// the daemon's own filesystem (the user owns it), so no sandboxing is applied
+/// beyond normal filesystem permissions.
+fn list_directory(request_id: u64, requested: &str) -> ServerMessage {
+    let target = if requested.is_empty() {
+        std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .unwrap_or_else(|| PathBuf::from("."))
+    } else {
+        PathBuf::from(requested)
+    };
+
+    let canonical = match std::fs::canonicalize(&target) {
+        Ok(p) => p,
+        Err(e) => return directory_error(request_id, requested, &e),
+    };
+
+    let read = match std::fs::read_dir(&canonical) {
+        Ok(rd) => rd,
+        Err(e) => return directory_error(request_id, requested, &e),
+    };
+
+    let mut entries: Vec<DirEntry> = Vec::new();
+    for entry in read.flatten() {
+        // Skip entries whose metadata can't be read (e.g. dangling symlink) and
+        // anything that is not a directory — `file_type()` does not traverse
+        // symlinks, so a symlink loop can't recurse here.
+        match entry.file_type() {
+            Ok(ft) if ft.is_dir() => {}
+            Ok(ft) if ft.is_symlink() => {
+                // Resolve one level so symlinked directories still appear, but
+                // bail out gracefully if the link is broken or loops.
+                match std::fs::metadata(entry.path()) {
+                    Ok(md) if md.is_dir() => {}
+                    _ => continue,
+                }
+            }
+            _ => continue,
+        }
+        if let Some(name) = entry.file_name().to_str() {
+            entries.push(DirEntry {
+                name: name.to_string(),
+                is_dir: true,
+            });
+        }
+    }
+    entries.sort_by_key(|e| e.name.to_lowercase());
+    entries.truncate(MAX_DIR_ENTRIES);
+
+    let parent = canonical
+        .parent()
+        .and_then(Path::to_str)
+        .map(str::to_string);
+
+    ServerMessage::DirectoryListing {
+        request_id,
+        path: canonical.to_string_lossy().into_owned(),
+        parent,
+        entries,
+        error: None,
+    }
+}
+
+/// Build a failed `DirectoryListing` echoing the requested path.
+fn directory_error(request_id: u64, requested: &str, err: &std::io::Error) -> ServerMessage {
+    ServerMessage::DirectoryListing {
+        request_id,
+        path: requested.to_string(),
+        parent: None,
+        entries: vec![],
+        error: Some(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn list_directory_returns_sorted_dirs_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("zebra")).unwrap();
+        std::fs::create_dir(tmp.path().join("Alpha")).unwrap();
+        std::fs::write(tmp.path().join("a_file.txt"), b"hi").unwrap();
+
+        let msg = list_directory(1, tmp.path().to_str().unwrap());
+        match msg {
+            ServerMessage::DirectoryListing {
+                request_id,
+                entries,
+                error,
+                parent,
+                ..
+            } => {
+                assert_eq!(request_id, 1);
+                assert!(error.is_none());
+                assert!(parent.is_some(), "a tempdir has a parent");
+                let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+                // Files are excluded; dirs are sorted case-insensitively.
+                assert_eq!(names, vec!["Alpha", "zebra"]);
+                assert!(entries.iter().all(|e| e.is_dir));
+            }
+            other => panic!("expected DirectoryListing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_directory_reports_error_for_missing_path() {
+        let msg = list_directory(2, "/this/path/does/not/exist/kmux");
+        match msg {
+            ServerMessage::DirectoryListing {
+                path,
+                entries,
+                error,
+                ..
+            } => {
+                assert_eq!(path, "/this/path/does/not/exist/kmux");
+                assert!(entries.is_empty());
+                assert!(error.is_some());
+            }
+            other => panic!("expected DirectoryListing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_directory_empty_path_resolves_a_default() {
+        // An empty path resolves to $HOME (or "."); either way it must not error
+        // in a normal environment and must echo a canonical, absolute path.
+        let msg = list_directory(3, "");
+        match msg {
+            ServerMessage::DirectoryListing { path, error, .. } => {
+                assert!(error.is_none(), "default dir should list: {error:?}");
+                assert!(
+                    Path::new(&path).is_absolute(),
+                    "canonicalized path should be absolute: {path}"
+                );
+            }
+            other => panic!("expected DirectoryListing, got {other:?}"),
+        }
+    }
 }

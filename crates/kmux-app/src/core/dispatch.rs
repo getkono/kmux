@@ -15,7 +15,7 @@ use crate::mode::{Action, Mode};
 use crate::recent_servers::ServerKind;
 
 use super::{
-    AppCore, COMMAND_HISTORY_CAP, KeyResult, PendingClose, SOFT_CLOSE_GRACE, SwitchTarget,
+    AppCore, COMMAND_HISTORY_CAP, DirBrowserRow, KeyResult, PendingClose, SwitchTarget, SOFT_CLOSE_GRACE, SwitchTarget,
     TopBarAction,
 };
 
@@ -226,6 +226,9 @@ impl AppCore {
             Action::ToggleMetrics => {
                 self.metrics_overlay_visible = !self.metrics_overlay_visible;
             }
+            Action::ToggleConnection => {
+                self.connection_overlay_visible = !self.connection_overlay_visible;
+            }
             Action::ToggleSnapshotMode => {
                 self.force_snapshot_mode = !self.force_snapshot_mode;
                 self.mgr.set_snapshot_mode(self.force_snapshot_mode);
@@ -256,26 +259,13 @@ impl AppCore {
                 self.dir_picker_selected = self.dir_picker_selected.saturating_sub(1);
             }
             Action::DirPickerDown => {
-                let count = self.dir_picker_matches().len();
+                let count = self.dir_browser_rows().len();
                 if count > 0 && self.dir_picker_selected + 1 < count {
                     self.dir_picker_selected += 1;
                 }
             }
             Action::DirPickerSubmit => {
-                let matches = self.dir_picker_matches();
-                if let Some(entry) = matches.get(self.dir_picker_selected) {
-                    let word_id = entry.meta.word_id.clone();
-                    self.mgr.select_session(word_id);
-                } else {
-                    let cwd = self.dir_picker_buffer.trim().to_string();
-                    if !cwd.is_empty() {
-                        if let Some(word_id) = self.mgr.find_session_by_cwd(&cwd) {
-                            self.mgr.select_session(word_id);
-                        } else {
-                            self.mgr.create_session(None, Some(&cwd), self.term_size);
-                        }
-                    }
-                }
+                self.submit_dir_browser_row();
             }
             Action::DirPickerCancel => {}
             Action::CancelBootstrap => {
@@ -568,9 +558,9 @@ impl AppCore {
     /// [`activate_picker_selection`](Self::activate_picker_selection).
     fn select_session_picker_entry(&mut self) {
         if self.session_picker_selected == 0 {
-            self.dir_picker_buffer = self.initial_cwd.clone();
-            self.dir_picker_selected = 0;
-            self.mode = Mode::DirectoryPicker;
+            // "+ New session" opens the directory browser (seeded at the active
+            // session's cwd) so the user picks where the session is created.
+            self.open_directory_browser();
             return;
         }
         let word_id = self
@@ -581,6 +571,46 @@ impl AppCore {
             self.mgr.select_session(word_id);
         }
         self.mode = Mode::Normal;
+    }
+
+    /// Act on the directory browser's currently-selected row (Enter / click /
+    /// activate). Shared by the keyboard [`Action::DirPickerSubmit`] and the
+    /// pointer-driven [`activate_picker_selection`](Self::activate_picker_selection):
+    ///
+    /// - [`DirBrowserRow::CreateHere`] creates a session in the browsed
+    ///   directory and returns to [`Mode::Normal`].
+    /// - [`DirBrowserRow::Up`] / [`DirBrowserRow::Enter`] navigate (request a
+    ///   fresh listing for the target) and keep the browser open.
+    ///
+    /// Power feature: when the filter is a non-empty **absolute** path that does
+    /// not match any listed row, Enter navigates to that typed path instead.
+    fn submit_dir_browser_row(&mut self) {
+        let rows = self.dir_browser_rows();
+        match rows.get(self.dir_picker_selected).cloned() {
+            Some(DirBrowserRow::CreateHere { cwd }) => {
+                // A typed absolute path that isn't a listed subdir is treated as
+                // "navigate there" rather than "create in the current dir", so a
+                // user can jump straight to a path they typed.
+                let typed = self.dir_picker_buffer.trim();
+                if typed.starts_with('/') && !self.filter_matches_listed_subdir() {
+                    self.navigate_directory_browser(typed.to_string());
+                    return;
+                }
+                self.mgr.create_session(None, Some(&cwd), self.term_size);
+                self.mode = Mode::Normal;
+            }
+            Some(DirBrowserRow::Up { parent }) => self.navigate_directory_browser(parent),
+            Some(DirBrowserRow::Enter { path, .. }) => self.navigate_directory_browser(path),
+            None => {}
+        }
+    }
+
+    /// Whether the current filter text matches at least one listed subdirectory
+    /// (used to decide whether Enter on a typed absolute path should navigate).
+    fn filter_matches_listed_subdir(&self) -> bool {
+        self.dir_browser_rows()
+            .iter()
+            .any(|r| matches!(r, DirBrowserRow::Enter { .. }))
     }
 
     /// The switch target for the current server-picker selection, or `None` when
@@ -715,6 +745,19 @@ impl AppCore {
     pub fn has_pending_close(&self) -> bool {
         !self.pending_closes.is_empty()
     }
+  
+    /// Open the command palette pre-filled with `transport ` so the user picks
+    /// from the completer (Auto + each protocol). Bound to the protocol
+    /// indicator (double-click) in the GUIs (issue #69).
+    pub fn open_transport_chooser(&mut self) {
+        const PREFILL: &str = "transport ";
+        self.mode = Mode::Command(crate::mode::CommandState {
+            buffer: PREFILL.to_string(),
+            cursor: PREFILL.len(),
+            selected: 0,
+            history_pos: None,
+        });
+    }
 
     /// Set the selected index of the currently open picker (e.g. hover-to-
     /// highlight). No-op when no picker is open.
@@ -753,9 +796,9 @@ impl AppCore {
     /// Activate the current picker's selection (a click on a list item). Mirrors
     /// the keyboard Enter path but performs its own mode transition because it
     /// does not pass through `mode::resolve`. Returns a [`KeyResult`] only for
-    /// the server picker, which may switch servers. Note: a directory-picker
-    /// click only *selects an existing* session — creating from a typed path is
-    /// the keyboard `DirPickerSubmit` path.
+    /// the server picker, which may switch servers. For the directory browser
+    /// this navigates (Up / into a subdir) or creates a session (create-here),
+    /// identical to the keyboard `DirPickerSubmit` path.
     pub fn activate_picker_selection(&mut self) -> Option<KeyResult> {
         match self.mode {
             Mode::SessionPicker => {
@@ -768,12 +811,10 @@ impl AppCore {
                 target.map(KeyResult::SwitchServer)
             }
             Mode::DirectoryPicker => {
-                let matches = self.dir_picker_matches();
-                if let Some(entry) = matches.get(self.dir_picker_selected) {
-                    let word_id = entry.meta.word_id.clone();
-                    self.mgr.select_session(word_id);
-                }
-                self.mode = Mode::Normal;
+                // A click on a browser row: create-here returns to Normal;
+                // navigating into a folder keeps the browser open (it refreshes
+                // in place when the new listing arrives).
+                self.submit_dir_browser_row();
                 None
             }
             _ => None,
@@ -1060,14 +1101,18 @@ mod tests {
     }
 
     #[test]
-    fn activate_session_picker_index_zero_opens_directory_picker() {
+    fn activate_session_picker_index_zero_opens_directory_browser() {
+        // Activating the synthetic "+ New session" row opens the directory
+        // browser. With no active session it seeds the browse dir from
+        // initial_cwd and starts row 0 with an empty filter.
         let mut core = fixture_core();
         core.mode = Mode::SessionPicker;
         core.session_picker_selected = 0;
         core.initial_cwd = "/home/u/proj".into();
         assert!(core.activate_picker_selection().is_none());
         assert_eq!(core.mode, Mode::DirectoryPicker);
-        assert_eq!(core.dir_picker_buffer, "/home/u/proj");
+        assert_eq!(core.dir_browser_cwd, "/home/u/proj");
+        assert!(core.dir_picker_buffer.is_empty());
         assert_eq!(core.dir_picker_selected, 0);
     }
 

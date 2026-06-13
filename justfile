@@ -237,6 +237,20 @@ install:
         # terminal starts the GUI.
         echo "==> installed kmux.app to ~/Applications (launch from Launchpad/Spotlight); the 'kmux' entrypoint execs it"
     fi
+    # Dynamic shell completion is built into the `kmux` binary (clap_complete's
+    # CompleteEnv) — there are no completion files to install, just one line to
+    # add per shell. We only print instructions (never edit rc files) so the
+    # change is transparent and reversible.
+    echo
+    echo "==> Optional: enable dynamic tab-completion for kmux. Add the line for"
+    echo "    your shell, then restart it (or re-source the rc file):"
+    echo
+    echo '      bash   (~/.bashrc):                  source <(COMPLETE=bash kmux)'
+    echo '      zsh    (~/.zshrc):                   source <(COMPLETE=zsh kmux)'
+    echo '      fish   (~/.config/fish/config.fish): COMPLETE=fish kmux | source'
+    echo
+    echo "    Completes subcommands, flags, themes, hosts.toml aliases, and live"
+    echo "    daemon sessions. See docs/shell-completion.md (Elvish/PowerShell too)."
 
 # Stage a distributable release tarball for the host target into dist/.
 package:

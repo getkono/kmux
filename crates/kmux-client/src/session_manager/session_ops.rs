@@ -131,6 +131,27 @@ impl SessionManager {
         }
     }
 
+    /// Ask the daemon to list the directories under `path` (empty ⇒ the daemon
+    /// resolves a default). Records the request id so a later
+    /// [`ServerMessage::DirectoryListing`](kmux_protocol::messages::ServerMessage::DirectoryListing)
+    /// can be matched and stale replies dropped. Drives the app-layer directory
+    /// browser used to pick where a new session is created.
+    ///
+    /// Drops any previous listing so the browser shows only the freshly-targeted
+    /// directory while the reply is in flight (the stale listing must not back a
+    /// "create here" in the directory we just navigated away from).
+    pub fn request_list_directory(&mut self, path: String) {
+        if self.ws_sender.is_some() {
+            let rid = self.next_rid();
+            self.pending_dir_request = Some(rid);
+            self.dir_listing = None;
+            self.send_ws(ClientMessage::ListDirectory {
+                request_id: rid,
+                path,
+            });
+        }
+    }
+
     /// Create a new pane in the active session.
     pub fn create_pane(&mut self, size: TermSize) {
         if let Some(word_id) = self.active_session.clone() {

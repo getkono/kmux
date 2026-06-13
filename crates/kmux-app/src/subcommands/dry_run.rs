@@ -170,6 +170,8 @@ async fn run_supervisor_phase(
         server_tx: fwd_tx,
         upgrade_tx,
         rtt_rx: None,
+        forced: None,
+        override_rx: None,
     });
     let handle = tokio::spawn(async move { supervisor.run().await });
 
