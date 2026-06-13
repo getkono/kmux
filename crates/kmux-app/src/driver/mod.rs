@@ -231,6 +231,8 @@ impl FrontendDriver {
         dirty |= self.drain_transport_upgrades();
         dirty |= self.drain_tunnel_deaths();
         dirty |= self.tick_liveness(now);
+        // Fire any soft-close whose 3 s grace window has elapsed (issue #86).
+        dirty |= self.core.fire_due_closes(now);
         self.tick_metrics(now);
         dirty |= self.tick_blink(now);
 

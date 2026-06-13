@@ -23,9 +23,11 @@ use crate::mode::Mode;
 use crate::recent_servers::{RecentServersCache, ServerKind};
 use crate::theme::Theme;
 
+mod connection_info;
 mod dispatch;
 mod orchestration;
 
+pub use connection_info::{ConnectionInfo, RttInfo, TransportTraffic};
 pub use orchestration::{BootstrapPhase, BootstrapTaskResult};
 
 /// Maximum entries kept in [`AppCore::command_history`].
@@ -33,6 +35,19 @@ pub const COMMAND_HISTORY_CAP: usize = 100;
 
 /// Rolling window over which the HUD's rendering-FPS counter is measured (#61).
 const RENDER_FPS_WINDOW: Duration = Duration::from_secs(1);
+/// Grace period between requesting a pane close and actually killing the shell
+/// (issue #86). A healthy pane's `PaneClose` is withheld for this long so an
+/// accidental close can be undone within the window.
+pub const SOFT_CLOSE_GRACE: Duration = Duration::from_secs(3);
+
+/// A pane whose close has been requested but deferred (issue #86). The real
+/// `PaneClose` is sent only once [`deadline`](Self::deadline) passes; until then
+/// the user can cancel (undo), leaving the live shell untouched.
+#[derive(Debug, Clone)]
+pub struct PendingClose {
+    pub pane_id: String,
+    pub deadline: Instant,
+}
 
 /// What a key/action dispatch returns to the frontend's run loop.
 ///
@@ -74,6 +89,20 @@ pub enum TopBarAction {
     CreatePane,
 }
 
+/// One row in the directory browser (the "new session — choose a directory"
+/// overlay). Frontends render these rows and dispatch the row's effect on
+/// activation; the row order is fixed by [`AppCore::dir_browser_rows`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DirBrowserRow {
+    /// Create a new session in `cwd` (the currently-browsed directory). Row 0.
+    CreateHere { cwd: String },
+    /// Navigate up to the parent directory. Present only when the listing has a
+    /// parent (absent at the filesystem root).
+    Up { parent: String },
+    /// Navigate into the subdirectory `path` (display name `name`).
+    Enter { path: String, name: String },
+}
+
 /// Frontend-agnostic client view-model. See the module docs.
 pub struct AppCore {
     pub mgr: SessionManager,
@@ -106,16 +135,29 @@ pub struct AppCore {
 
     pub hud_visible: bool,
     pub metrics_overlay_visible: bool,
+    /// Whether the connection inspector overlay is open (issue #60). Like the
+    /// metrics overlay, this is a passive flag the frontends reconcile against.
+    pub connection_overlay_visible: bool,
     pub force_snapshot_mode: bool,
 
     /// Whether the HUD shows the network-latency + rendering-FPS counters
     /// (issue #61). When `false`, the counters are hidden *and* their per-frame
     /// calculation is skipped (power-efficient). Resolved from `config.toml`.
     pub show_perf_counters: bool,
+  
     /// Recent render timestamps (most-recent last) within [`RENDER_FPS_WINDOW`],
     /// used to compute the rendering FPS. Only populated while the HUD is shown
     /// and the counters are enabled, so it costs nothing otherwise.
     render_frames: VecDeque<Instant>,
+  
+    /// Panes pending a deferred (soft) close (issue #86), oldest first. While a
+    /// pane is here its `PaneClose` has NOT been sent; the driver fires it once
+    /// the deadline passes, and the user can undo within the window.
+    pub pending_closes: Vec<PendingClose>,
+  
+    /// Bumped on every soft-close request so a frontend can show its "Undo"
+    /// affordance exactly once per scheduled close (not every frame).
+    pub soft_close_nonce: u64,
 
     /// Reconnection bookkeeping.
     pub disconnect_at: Option<Instant>,
@@ -124,9 +166,15 @@ pub struct AppCore {
     pub session_picker_selected: usize,
     pub session_picker_search: String,
 
-    // Directory picker state (remote connections).
+    // Directory browser state (choose where to open a new session). The browser
+    // lists the daemon host's directories over the protocol (so it works for a
+    // remote daemon). `dir_picker_buffer` is the per-row **filter** text and
+    // `dir_picker_selected` is the highlighted row index; the entries/parent
+    // come from `mgr.dir_listing()`.
     pub dir_picker_buffer: String,
     pub dir_picker_selected: usize,
+    /// The directory currently being browsed (the listing request target).
+    pub dir_browser_cwd: String,
 
     // Auto-session selection context.
     pub is_local: bool,
@@ -246,14 +294,18 @@ impl AppCore {
             // hidden; either profile can toggle it at runtime (`hud` / ⌘⇧H).
             hud_visible: cfg!(debug_assertions),
             metrics_overlay_visible: false,
+            connection_overlay_visible: false,
             force_snapshot_mode: false,
             show_perf_counters: crate::config::resolve_perf_counters(),
             render_frames: VecDeque::new(),
+            pending_closes: Vec::new(),
+            soft_close_nonce: 0,
             disconnect_at: None,
             session_picker_selected: 0,
             session_picker_search: String::new(),
             dir_picker_buffer: String::new(),
             dir_picker_selected: 0,
+            dir_browser_cwd: String::new(),
             is_local,
             initial_cwd,
             did_auto_select: false,
@@ -348,14 +400,18 @@ impl AppCore {
             },
             hud_visible: false,
             metrics_overlay_visible: false,
+            connection_overlay_visible: false,
             force_snapshot_mode: false,
             show_perf_counters: true,
             render_frames: VecDeque::new(),
+            pending_closes: Vec::new(),
+            soft_close_nonce: 0,
             disconnect_at: None,
             session_picker_selected: 0,
             session_picker_search: String::new(),
             dir_picker_buffer: String::new(),
             dir_picker_selected: 0,
+            dir_browser_cwd: String::new(),
             is_local: true,
             initial_cwd: String::new(),
             did_auto_select: false,

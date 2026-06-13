@@ -297,13 +297,13 @@ fn load_config_file() -> Option<KmuxConfig> {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Mutex;
-
     use super::*;
     use crate::theme::Rgb;
 
-    // Serialise all tests that mutate XDG_CONFIG_HOME to avoid races.
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
+    // Serialise all tests that mutate XDG_CONFIG_HOME to avoid races. Shared
+    // crate-wide so completion.rs's tests (which mutate the same var) cannot
+    // race these.
+    use crate::ENV_LOCK;
 
     #[test]
     fn test_resolve_cli_builtin() {

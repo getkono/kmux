@@ -23,18 +23,38 @@ extension FfiConnStatus {
     }
 }
 
-/// The header connection indicator (a colored dot + label).
+/// The header connection indicator (a colored dot + label). Double-click the
+/// label to override the transport protocol (issue #69); an active override is
+/// tinted (the analog of kmux-gtk's amber transport button). The `/transport`
+/// command is the underlying selection mechanism.
 struct ConnectionBadge: View {
-    let connection: FfiConnInfo
+    @ObservedObject var model: KmuxModel
+    @State private var showTransportMenu = false
+
+    private static let transports: [(String, String)] = [
+        ("Auto", "auto"), ("QUIC", "quic"), ("TCP+TLS", "tcp-tls"), ("UDS", "uds"), ("TCP", "tcp"),
+    ]
 
     var body: some View {
         HStack(spacing: 5) {
             Circle()
-                .fill(connection.status.color)
+                .fill(model.connection.status.color)
                 .frame(width: 8, height: 8)
-            Text(connection.label)
+            Text(model.connection.label)
                 .font(.caption)
-                .foregroundStyle(.secondary)
+                .foregroundStyle(
+                    model.connection.transportOverridden
+                        ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+        }
+        .contentShape(Rectangle())
+        .onTapGesture(count: 2) { showTransportMenu = true }
+        .help("Double-click to override the transport protocol")
+        .confirmationDialog(
+            "Transport protocol", isPresented: $showTransportMenu, titleVisibility: .visible
+        ) {
+            ForEach(Self.transports, id: \.1) { label, arg in
+                Button(label) { model.runCommand("transport \(arg)") }
+            }
         }
     }
 }
@@ -65,6 +85,27 @@ struct ConnectionBanner: View {
         case .connecting(let label): return ("Connecting to \(label)…", false)
         case .disconnected(let reason): return ("Disconnected: \(reason)", true)
         default: return nil
+        }
+    }
+}
+
+/// A transient "pane closing — Undo" banner shown during the soft-close grace
+/// window (issue #86), the macOS analog of kmux-gtk's Undo toast.
+struct SoftCloseBanner: View {
+    @ObservedObject var model: KmuxModel
+
+    var body: some View {
+        if model.softClosePending {
+            HStack(spacing: 10) {
+                Image(systemName: "trash")
+                Text("Pane closing…")
+                Button("Undo") { model.dispatch(.undoClose) }
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 8)
+            .background(.regularMaterial, in: Capsule())
+            .shadow(radius: 3)
+            .padding(.bottom, 12)
         }
     }
 }
