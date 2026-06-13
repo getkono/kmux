@@ -92,6 +92,8 @@ pub struct Dialogs {
     last_status: RefCell<String>,
     /// The metrics inspector dialog, while open.
     metrics_dialog: RefCell<Option<adw::Dialog>>,
+    /// The connection inspector dialog, while open (issue #60).
+    connection_dialog: RefCell<Option<adw::Dialog>>,
 }
 
 /// Build the HUD overlay and add it to the shell overlay.
@@ -114,6 +116,7 @@ pub fn build(overlay: &gtk4::Overlay) -> Dialogs {
         banner_sig: RefCell::new(None),
         last_status: RefCell::new(String::new()),
         metrics_dialog: RefCell::new(None),
+        connection_dialog: RefCell::new(None),
     }
 }
 
@@ -128,6 +131,7 @@ pub fn sync(
     update_banner(dialogs, shell, fe);
     update_toast(dialogs, shell, fe);
     update_metrics_dialog(dialogs, shell, fe);
+    update_connection_dialog(dialogs, shell, fe);
     update_hud(&dialogs.hud, &fe.borrow().core);
 }
 
@@ -829,6 +833,134 @@ fn metrics_content(core: &AppCore) -> ScrolledWindow {
         ),
         "monospace",
     ));
+
+    let scroll = ScrolledWindow::new();
+    scroll.set_vexpand(true);
+    scroll.set_child(Some(&card));
+    scroll
+}
+
+// ── Connection inspector dialog (issue #60) ──
+
+/// Open/close the connection inspector dialog from `connection_overlay_visible`,
+/// mirroring [`update_metrics_dialog`]. The content is rebuilt each open from a
+/// live [`kmux_app::core::ConnectionInfo`]; closing the dialog clears the flag.
+fn update_connection_dialog(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
+    let show = fe.borrow().core.connection_overlay_visible;
+    let open = dialogs.connection_dialog.borrow().is_some();
+    if show && !open {
+        let dialog = adw::Dialog::builder()
+            .title("Connection")
+            .content_width(560)
+            .content_height(460)
+            .build();
+        dialog.set_child(Some(&connection_content(&fe.borrow().core)));
+        {
+            let fe = fe.clone();
+            let shell = shell.clone();
+            dialog.connect_closed(move |_| {
+                fe.borrow_mut().core.connection_overlay_visible = false;
+                shell.drawing.grab_focus();
+            });
+        }
+        dialog.present(Some(&shell.window));
+        *dialogs.connection_dialog.borrow_mut() = Some(dialog);
+    } else if !show
+        && open
+        && let Some(d) = dialogs.connection_dialog.borrow_mut().take()
+    {
+        d.close();
+    }
+}
+
+/// The connection inspector body: server/endpoint, transport + state, the
+/// session/handshake identity, the live latency summary, and per-transport
+/// traffic — all from the toolkit-neutral [`kmux_app::core::ConnectionInfo`].
+fn connection_content(core: &AppCore) -> ScrolledWindow {
+    let info = core.connection_info();
+    let card = GtkBox::new(Orientation::Vertical, 4);
+    card.set_margin_top(12);
+    card.set_margin_bottom(12);
+    card.set_margin_start(12);
+    card.set_margin_end(12);
+
+    card.append(&label("Server", "heading"));
+    card.append(&label(&info.server, "monospace"));
+    if !info.is_local && !info.endpoint.is_empty() {
+        card.append(&label(
+            &format!("   endpoint {}", info.endpoint),
+            "dim-label",
+        ));
+    }
+    card.append(&label(&format!("State: {}", info.state), "monospace"));
+    card.append(&label(
+        &format!("Transport: {}", info.transport),
+        "monospace",
+    ));
+    if !info.is_local {
+        let tls = if info.accept_invalid_certs {
+            "TLS: accepting invalid certs (dev)"
+        } else {
+            "TLS: certificate verified"
+        };
+        card.append(&label(tls, "dim-label"));
+    }
+
+    card.append(&label("Identity", "heading"));
+    let conn = info
+        .connection_id
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "-".into());
+    let client = info
+        .client_id
+        .map(|c| c.to_string())
+        .unwrap_or_else(|| "-".into());
+    card.append(&label(
+        &format!("connection {conn}   client {client}"),
+        "monospace",
+    ));
+    let server_ver = info.server_version.as_deref().unwrap_or("unknown");
+    card.append(&label(
+        &format!("server v{server_ver}   protocol v{}", info.protocol_version),
+        "monospace",
+    ));
+
+    card.append(&label("Latency", "heading"));
+    match &info.rtt {
+        Some(rtt) => {
+            let ewma = rtt
+                .ewma_ms
+                .map(|v| format!("{v:.1}ms"))
+                .unwrap_or_else(|| "-".into());
+            card.append(&label(
+                &format!(
+                    "ping {ewma} ewma   recent {:.1}/{:.1}ms   {} samples",
+                    rtt.recent_avg_ms, rtt.recent_max_ms, rtt.samples
+                ),
+                "monospace",
+            ));
+        }
+        None => card.append(&label("(no ping samples yet)", "dim-label")),
+    }
+
+    card.append(&label("Traffic", "heading"));
+    if info.transports.is_empty() {
+        card.append(&label("(no transport traffic yet)", "dim-label"));
+    } else {
+        for t in &info.transports {
+            card.append(&label(
+                &format!(
+                    "{}   in {}  out {}   msgs {}/{}",
+                    t.label,
+                    fmt_bytes(t.bytes_in),
+                    fmt_bytes(t.bytes_out),
+                    t.msgs_in,
+                    t.msgs_out,
+                ),
+                "monospace",
+            ));
+        }
+    }
 
     let scroll = ScrolledWindow::new();
     scroll.set_vexpand(true);

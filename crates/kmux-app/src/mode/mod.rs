@@ -144,6 +144,8 @@ pub enum Action {
     // HUD / modes
     ToggleHud,
     ToggleMetrics,
+    /// Toggle the connection inspector overlay (issue #60).
+    ToggleConnection,
     ToggleSnapshotMode,
     ToggleInputLock,
 

@@ -86,6 +86,11 @@ fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
         ("toggle-lock", Action::ToggleInputLock, &["<Ctrl><Shift>l"]),
         ("toggle-hud", Action::ToggleHud, &["<Ctrl><Shift>h"]),
         ("toggle-metrics", Action::ToggleMetrics, &["<Ctrl><Shift>m"]),
+        (
+            "toggle-connection",
+            Action::ToggleConnection,
+            &["<Ctrl><Shift>i"],
+        ),
         ("snapshot", Action::ToggleSnapshotMode, &[]),
         ("redraw", Action::ForceRedraw, &[]),
         ("scroll-page-up", Action::ScrollPageUp, &["<Shift>Page_Up"]),
@@ -286,6 +291,7 @@ fn build_menu() -> gio::Menu {
     s4.append(Some("Lock Input"), Some("win.toggle-lock"));
     s4.append(Some("Performance HUD"), Some("win.toggle-hud"));
     s4.append(Some("Metrics"), Some("win.toggle-metrics"));
+    s4.append(Some("Connection"), Some("win.toggle-connection"));
     menu.append_section(None, &s4);
 
     let s5 = gio::Menu::new();
@@ -353,6 +359,7 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <property name="title">General</property>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">F9</property><property name="title">Toggle sidebar</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;l</property><property name="title">Lock input</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;i</property><property name="title">Connection inspector</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;r</property><property name="title">Reconnect</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;comma</property><property name="title">Preferences</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;q</property><property name="title">Quit</property></object></child>

@@ -218,6 +218,9 @@ impl AppCore {
             Action::ToggleMetrics => {
                 self.metrics_overlay_visible = !self.metrics_overlay_visible;
             }
+            Action::ToggleConnection => {
+                self.connection_overlay_visible = !self.connection_overlay_visible;
+            }
             Action::ToggleSnapshotMode => {
                 self.force_snapshot_mode = !self.force_snapshot_mode;
                 self.mgr.set_snapshot_mode(self.force_snapshot_mode);

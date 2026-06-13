@@ -708,6 +708,20 @@ Each row in the table is one *connection* (not one session). A session with mult
 
 **Implementation.** `ServerApp::snapshot_sessions_with_connections` holds both the sessions and connections read locks simultaneously to avoid tearing, then joins them: it builds a `ClientId → ConnectionInfo` map from the connections table, iterates session panes to collect attached `ClientId`s, and groups `ConnectionInfo`s per session. Any `ClientId` not found in any pane appears in `unattached`.
 
+### Connection inspector (GUI, issue #60)
+
+The desktop clients expose the *client side* of the same picture as an overlay — the sibling of the metrics inspector. Toggle it from the command palette (`/connection`, alias `/conn`), the menu (**Connection**), or the accelerator (`Ctrl+Shift+I` on GTK, `⌘⇧I` on macOS).
+
+The body is rendered from a single toolkit-neutral snapshot, `kmux_app::core::ConnectionInfo`, built by `AppCore::connection_info()` from the live `SessionManager`. `kmux-gtk` renders it directly (`dialogs::connection_content`); `kmux-swift` maps it to `FfiConnectionDetails` across the `kmux-ffi` boundary (`KmuxDriver::connection_details`) and renders `ConnectionView`. The snapshot carries:
+
+- **Server / endpoint** — the user-facing target (`localhost` or `user@host`) plus the resolved data-plane `host:port`, and (remote only) whether TLS certs are verified.
+- **State / transport** — the `ConnectionState` badge (`CONNECTED · QUIC`…) and the active transport channel.
+- **Identity** — the server-assigned `connection_id` and `client_id`, the daemon's binary version, and the wire `PROTOCOL_VERSION` this client speaks.
+- **Latency** — the active transport's RTT summary (EWMA + recent avg/max + sample count), sourced from the client's `RttTracker` (the same Ping/Pong measurements that feed the transport scorer).
+- **Traffic** — per-transport byte/message totals from the client metrics (`NetworkMetrics::snapshot_by_transport`).
+
+Because it reads only already-collected client state, the inspector adds no protocol traffic and no `PROTOCOL_VERSION` bump; it does bump `KMUX_FFI_ABI_VERSION` (new FFI records + getters).
+
 ---
 
 ## Daemon Binary Resolution

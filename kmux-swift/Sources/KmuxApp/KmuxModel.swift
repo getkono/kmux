@@ -25,6 +25,8 @@ final class KmuxModel: ObservableObject {
     @Published private(set) var picker: FfiPicker?
     @Published private(set) var hudVisible = false
     @Published private(set) var metricsVisible = false
+    /// Whether the connection inspector sheet is open (issue #60).
+    @Published private(set) var connectionVisible = false
 
     // ── Tiling render state (read by the terminal view each `draw`) ──
     /// The active tab's resolved pane rectangles (cells), recomputed each pump
@@ -295,6 +297,8 @@ final class KmuxModel: ObservableObject {
         if hud != hudVisible { hudVisible = hud }
         let met = driver.metricsVisible()
         if met != metricsVisible { metricsVisible = met }
+        let conn = driver.connectionVisible()
+        if conn != connectionVisible { connectionVisible = conn }
     }
 
     // MARK: - Clipboard

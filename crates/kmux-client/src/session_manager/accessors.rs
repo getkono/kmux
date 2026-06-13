@@ -99,6 +99,19 @@ impl SessionManager {
         self.accept_invalid_certs
     }
 
+    /// The currently-active transport channel (QUIC/TCP+TLS/UDS/TCP).
+    pub fn current_transport(&self) -> kmux_protocol::messages::TransportKind {
+        self.current_transport
+    }
+
+    /// RTT summary (EWMA + recent avg/max + sample count) for the active
+    /// transport, or `None` before the first Ping/Pong round-trip. Drives the
+    /// connection inspector and the HUD latency counter.
+    pub fn active_rtt(&self) -> Option<crate::metrics::RttSummary> {
+        let key = self.metrics.active_transport()?;
+        self.metrics.rtt.summary(key)
+    }
+
     pub fn token(&self) -> &str {
         &self.token
     }
