@@ -24,7 +24,80 @@ fn main() -> anyhow::Result<()> {
         // resolved `Plan` and forward argv instead — the spawned frontend re-runs
         // `run_cli` and rebuilds the identical plan (a benign double-parse). This
         // keeps each frontend runnable standalone with the very same flags.
-        Launch::Interactive(_plan) => launch_desktop(),
+        Launch::Interactive(_plan) => {
+            // Warn before nesting a GUI inside a kmux-managed shell (#73). The
+            // check lives only here in the entrypoint (not in the shared
+            // `run_cli`), so the frontend we exec below never re-prompts.
+            if !nested_kmux_check()? {
+                return Ok(());
+            }
+            launch_desktop()
+        }
+    }
+}
+
+/// If launched from inside a kmux-managed shell (the daemon exports `KMUX` in
+/// every pane), warn the user: opening a kmux GUI nested inside kmux is usually
+/// a mistake, and the new window is invisible on a headless host. Returns
+/// whether to proceed with the launch (issue #73).
+fn nested_kmux_check() -> anyhow::Result<bool> {
+    use std::io::{IsTerminal, Write};
+
+    // Not nested, or the user permanently opted out → proceed silently.
+    if std::env::var_os("KMUX").is_none() || !kmux_app::config::warn_when_nested() {
+        return Ok(true);
+    }
+
+    let mut err = std::io::stderr();
+    let _ = writeln!(
+        err,
+        "\n\x1b[33m⚠  This shell is already running under kmux (KMUX is set).\x1b[0m"
+    );
+    let _ = writeln!(
+        err,
+        "   Opening another kmux here nests a multiplexer inside itself, and the"
+    );
+    let _ = writeln!(err, "   new window is invisible on a headless host.\n");
+
+    // No TTY (non-interactive / headless): we cannot ask, and a nested invisible
+    // GUI is almost certainly unwanted — refuse, but say how to override.
+    if !std::io::stdin().is_terminal() {
+        let _ = writeln!(
+            err,
+            "   Refusing to start non-interactively. Set `warn_nested = false` in"
+        );
+        let _ = writeln!(err, "   ~/.config/kmux/config.toml to allow it.\n");
+        return Ok(false);
+    }
+
+    loop {
+        let _ = write!(
+            err,
+            "   [d] don't start   [s] start anyway   [a] always start from now on   [d]? "
+        );
+        let _ = err.flush();
+        let mut line = String::new();
+        // EOF (Ctrl-D) → treat as the safe default: don't start.
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            let _ = writeln!(err);
+            return Ok(false);
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "" | "d" | "n" | "no" => return Ok(false),
+            "s" | "y" | "yes" => return Ok(true),
+            "a" | "always" => {
+                if let Err(e) = kmux_app::config::set_warn_when_nested(false) {
+                    let _ = writeln!(err, "   (couldn't save preference: {e})");
+                }
+                return Ok(true);
+            }
+            other => {
+                let _ = writeln!(
+                    err,
+                    "   Unrecognized choice '{other}'. Please enter d, s, or a."
+                );
+            }
+        }
     }
 }
 

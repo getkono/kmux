@@ -61,6 +61,11 @@ pub fn pane_spawn_env(_seed_caps: &ClientCapabilities) -> HashMap<String, String
             "TERM_PROGRAM_VERSION".into(),
             env!("CARGO_PKG_VERSION").into(),
         ),
+        // Marker that this shell is managed by the kmux daemon (issue #73). The
+        // `kmux` entrypoint reads it to warn before opening a GUI *inside* kmux.
+        // Like tmux's `$TMUX`, presence is what matters; the value is the daemon
+        // version for debuggability.
+        ("KMUX".into(), env!("CARGO_PKG_VERSION").into()),
     ])
 }
 
@@ -80,6 +85,18 @@ mod tests {
     #[test]
     fn intersect_empty_is_false_false() {
         assert_eq!(intersect_for_atomics([].iter()), (false, false));
+    }
+
+    /// Spawned shells must carry the `KMUX` marker so the `kmux` entrypoint can
+    /// detect a nested launch (issue #73), alongside the existing TERM markers.
+    #[test]
+    fn pane_spawn_env_exports_kmux_marker() {
+        let env = pane_spawn_env(&ClientCapabilities::default());
+        assert_eq!(
+            env.get("KMUX").map(String::as_str),
+            Some(env!("CARGO_PKG_VERSION"))
+        );
+        assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("kmux"));
     }
 
     #[test]

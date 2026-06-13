@@ -62,6 +62,11 @@ pub struct KmuxConfig {
     /// requests (DECSCUSR `blinking_*` / DEC mode 12).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor_blink: Option<bool>,
+    /// Whether to warn before opening a kmux GUI *inside* a kmux-managed shell
+    /// (issue #73). `None`/`true` warns; the "start anyway from now on" choice
+    /// persists `false` here to silence it.
+    #[serde(skip_serializing_if = "Option::is_none", alias = "warn-nested")]
+    pub warn_nested: Option<bool>,
 }
 
 /// Load `config.toml`, returning defaults if it is missing or unparseable.
@@ -211,6 +216,23 @@ pub fn resolve_cursor_blink(cli_value: Option<bool>) -> bool {
         return value;
     }
     true
+}
+
+/// Whether the `kmux` entrypoint should warn before opening a GUI inside a
+/// kmux-managed shell (issue #73). Defaults to `true`; the user's "start anyway
+/// from now on" choice persists `warn_nested = false`.
+pub fn warn_when_nested() -> bool {
+    load_config_file()
+        .and_then(|cfg| cfg.warn_nested)
+        .unwrap_or(true)
+}
+
+/// Persist the nested-warning preference (issue #73), preserving the rest of the
+/// config file. Used when the user picks "start anyway from now on".
+pub fn set_warn_when_nested(value: bool) -> anyhow::Result<()> {
+    let mut cfg = load();
+    cfg.warn_nested = Some(value);
+    save(&cfg)
 }
 
 /// Try to load a theme by name.
@@ -436,6 +458,32 @@ status_bg = "#111111"
     fn config_file_parses_cursor_blink_field() {
         let cfg: KmuxConfig = toml::from_str("cursor_blink = false").unwrap();
         assert_eq!(cfg.cursor_blink, Some(false));
+    }
+
+    #[test]
+    fn config_file_parses_warn_nested_field() {
+        // Both snake_case (canonical) and the kebab alias parse (issue #73).
+        let snake: KmuxConfig = toml::from_str("warn_nested = false").unwrap();
+        assert_eq!(snake.warn_nested, Some(false));
+        let kebab: KmuxConfig = toml::from_str("warn-nested = true").unwrap();
+        assert_eq!(kebab.warn_nested, Some(true));
+    }
+
+    #[test]
+    fn warn_nested_round_trips_through_save_format() {
+        // The "start anyway from now on" choice (issue #73) must survive a
+        // save → load cycle using the canonical key written by `config::save`.
+        let cfg = KmuxConfig {
+            warn_nested: Some(false),
+            ..Default::default()
+        };
+        let serialized = toml::to_string_pretty(&cfg).unwrap();
+        assert!(
+            serialized.contains("warn_nested = false"),
+            "expected canonical key, got: {serialized}"
+        );
+        let back: KmuxConfig = toml::from_str(&serialized).unwrap();
+        assert_eq!(back.warn_nested, Some(false));
     }
 
     #[test]

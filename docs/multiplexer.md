@@ -66,6 +66,19 @@ Shells inside kmux panes always receive:
 | `COLORTERM` | `truecolor` | The emulator parses 24-bit SGR unconditionally; RGB is always transmitted on the wire |
 | `TERM_PROGRAM` | `kmux` | Prevents the launching terminal's `$TERM_PROGRAM` from leaking into panes |
 | `TERM_PROGRAM_VERSION` | `<cargo version>` | Stable identity for feature-sniffers (Starship, bat, etc.) |
+| `KMUX` | `<cargo version>` | Marks the shell as kmux-managed (like tmux's `$TMUX`); the `kmux` entrypoint reads it to warn before nesting a GUI — see below (issue #73) |
+
+These are set in `kmuxd`'s `capability::pane_spawn_env` and applied at PTY spawn.
+
+### Nested-launch warning (issue #73)
+
+Because every pane exports `KMUX`, running `kmux` *inside* a kmux pane is detectable. The `kmux` entrypoint (`crates/kmux/src/main.rs`) checks for `KMUX` before exec-ing the desktop GUI and, when set, warns at the **terminal** (not in the GUI — it would be invisible on a headless host) with three choices:
+
+- **don't start** (the default, and what EOF / a non-interactive stdin pick) — opening a multiplexer inside itself is usually a mistake;
+- **start anyway** — proceed this once;
+- **always start from now on** — proceed and persist `warn_nested = false` to `config.toml` (`config::set_warn_when_nested`) so the prompt is never shown again.
+
+The check lives only in the entrypoint, so the frontend it exec's never re-prompts.
 
 ---
 
