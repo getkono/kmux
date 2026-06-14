@@ -968,8 +968,7 @@ mod tests {
         shift_pair(&mut r, 0, 1, 600);
         assert_eq!(r[0] as i32 + r[1] as i32, 1000, "pairwise sum is invariant");
         assert_eq!(
-            r[1],
-            MIN_RESIZE_RATIO as u16,
+            r[1], MIN_RESIZE_RATIO as u16,
             "the shrinking side clamps to the floor instead of underflowing"
         );
         assert_eq!(r[0], 1000 - MIN_RESIZE_RATIO as u16);

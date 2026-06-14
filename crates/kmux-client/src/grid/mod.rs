@@ -809,7 +809,10 @@ mod tests {
         assert_eq!(grid.cells[82].c, 'a');
         assert_eq!(grid.cells[83].c, 'b');
         assert_eq!(grid.cells[84].c, 'c');
-        assert_ne!(grid.cells[81].c, 'a', "the cell before the run is untouched");
+        assert_ne!(
+            grid.cells[81].c, 'a',
+            "the cell before the run is untouched"
+        );
 
         // A run spilling one cell past the buffer end is truncated, not panicking.
         grid.apply_diff(cell_diff(vec![DiffOp::Row {
@@ -817,8 +820,15 @@ mod tests {
             start_col: 79,
             cells: line("YZ"),
         }]));
-        assert_eq!(grid.cells[1919].c, 'Y', "the in-bounds part of the run is written");
-        assert_eq!(grid.cells.len(), 1920, "the overflowing cell is dropped, no panic");
+        assert_eq!(
+            grid.cells[1919].c, 'Y',
+            "the in-bounds part of the run is written"
+        );
+        assert_eq!(
+            grid.cells.len(),
+            1920,
+            "the overflowing cell is dropped, no panic"
+        );
     }
 
     #[test]
@@ -831,8 +841,14 @@ mod tests {
             col: 0,
             cell: cell('a'),
         }]));
-        assert_eq!(grid.cells_generation, 1, "cell ops bump the cells generation");
-        assert_eq!(grid.cursor_generation, 1, "every diff bumps the cursor generation");
+        assert_eq!(
+            grid.cells_generation, 1,
+            "cell ops bump the cells generation"
+        );
+        assert_eq!(
+            grid.cursor_generation, 1,
+            "every diff bumps the cursor generation"
+        );
 
         // A diff with no ops (and no scrollback reset) leaves the cells
         // generation untouched but still advances the cursor generation.

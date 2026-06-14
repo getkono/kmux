@@ -159,10 +159,18 @@ mod tests {
         assert_eq!(TransportKind::parse_cli("QUIC"), Some(TransportKind::Quic));
         assert_eq!(TransportKind::parse_cli("tcp"), Some(TransportKind::Tcp));
         for tls in ["tcp-tls", "tcptls", "tls", "TCP-TLS"] {
-            assert_eq!(TransportKind::parse_cli(tls), Some(TransportKind::TcpTls), "{tls}");
+            assert_eq!(
+                TransportKind::parse_cli(tls),
+                Some(TransportKind::TcpTls),
+                "{tls}"
+            );
         }
         for uds in ["uds", "unix", "local"] {
-            assert_eq!(TransportKind::parse_cli(uds), Some(TransportKind::Uds), "{uds}");
+            assert_eq!(
+                TransportKind::parse_cli(uds),
+                Some(TransportKind::Uds),
+                "{uds}"
+            );
         }
     }
 
