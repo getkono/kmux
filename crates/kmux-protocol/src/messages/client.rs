@@ -695,7 +695,7 @@ mod tests {
             (
                 ClientMessage::OpenPeer {
                     request_id: 0,
-                    target: PeerTarget {
+                    target: PeerTarget::Ssh {
                         user: None,
                         host: "box".into(),
                         ssh_port: None,
@@ -749,10 +749,10 @@ mod tests {
     fn open_peer_and_close_peer_roundtrip() {
         let open = ClientMessage::OpenPeer {
             request_id: 9,
-            target: PeerTarget {
-                user: Some("alice".into()),
-                host: "box".into(),
-                ssh_port: Some(2222),
+            target: PeerTarget::Direct {
+                host: "127.0.0.1".into(),
+                port: 8443,
+                token: "tok".into(),
                 accept_invalid_certs: true,
             },
         };
@@ -760,8 +760,8 @@ mod tests {
         match crate::decode_client(&bytes).unwrap() {
             ClientMessage::OpenPeer { request_id, target } => {
                 assert_eq!(request_id, 9);
-                assert_eq!(target.peer_id(), "alice@box:2222");
-                assert!(target.accept_invalid_certs);
+                assert_eq!(target.peer_id(), "127.0.0.1:8443");
+                assert!(target.accept_invalid_certs());
             }
             other => panic!("expected OpenPeer, got {other:?}"),
         }

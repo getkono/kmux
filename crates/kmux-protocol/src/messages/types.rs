@@ -76,7 +76,10 @@ impl TransportKind {
 /// - **25**: daemon federation — `ClientMessage::OpenPeer`/`ClosePeer`,
 ///   `ServerMessage::PeerOpened`/`PeerClosed`/`PeerError`, and the `PeerTarget`
 ///   addressing struct (issue #121).
-pub const PROTOCOL_VERSION: u32 = 25;
+/// - **26**: `PeerTarget` becomes an enum with a `Direct { host, port, token }`
+///   TCP+TLS endpoint alongside `Ssh { .. }`, for LAN / same-host federation
+///   without SSH (issue #121).
+pub const PROTOCOL_VERSION: u32 = 26;
 
 /// Wire compression algorithm negotiated for a connection.
 ///
