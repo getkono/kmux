@@ -4,7 +4,7 @@ kmux ships prebuilt `kmux` + `kmuxd` binaries as GitHub Release assets. Releases
 are cut locally with one command and published by a tag-triggered workflow:
 
 ```sh
-just release 0.2.0
+mise run release 0.2.0
 ```
 
 That bumps the version, regenerates the changelog, commits, tags `v0.2.0`, and
@@ -21,7 +21,7 @@ There is a single source of truth: `[workspace.package].version` in the root
 release bumps exactly one line (plus the matching `Cargo.lock` entries). Tags are
 `v`-prefixed (`v0.2.0`); the version string inside is plain semver (`0.2.0`).
 
-## `just release <ver>`
+## `mise run release <ver>`
 
 The recipe is idempotent and re-runnable. Run it from a clean `master` checkout.
 It:
@@ -73,12 +73,12 @@ always agree.
   | `aarch64-apple-darwin` | `macos-14` |
   | `x86_64-apple-darwin` | `macos-15-intel` |
 
-  Each leg runs `just package` and uploads the resulting tarball + `.sha256`.
+  Each leg runs `mise run package` and uploads the resulting tarball + `.sha256`.
 - **release** generates notes with git-cliff and publishes every artifact via
   `softprops/action-gh-release` with `overwrite_files: true`, so re-runs replace
   assets in place rather than duplicating them.
 
-## Packaging (`just package`) and the shared library
+## Packaging (`mise run package`) and the shared library
 
 `kmuxd` **dynamically** links `libkmux_ghostty` — a Zig-built shared library that
 wraps libghostty-vt (see `crates/kmux-ghostty-sys/zig/build.zig`, which builds it
@@ -87,7 +87,7 @@ with `.linkage = .dynamic`). `crates/kmux-ghostty-sys/build.rs` links it as a
 (`target/.../out/install/lib`), which is convenient for development but useless on
 any other machine. (`kmux`, the client, does not link it.)
 
-So `just package` does more than copy two binaries:
+So `mise run package` does more than copy two binaries:
 
 1. Builds `kmux` + `kmuxd` in release mode.
 2. Copies both, the shared library, and `README.md` into
@@ -105,9 +105,10 @@ itself, with no `LD_LIBRARY_PATH` or build tree required.
 
 ## Prerequisites
 
-`just release` and `just package` need the `mise`-pinned tools (`mise install`):
-Zig, Rust, `git-cliff`, and `just`. On Linux, `just package` additionally needs
-`patchelf` on `PATH` (e.g. `dnf install patchelf` / `apt-get install patchelf`);
+`mise run release` and `mise run package` need the `mise`-pinned tools
+(`mise install`): Zig, Rust, and `git-cliff`. On Linux, `mise run package`
+additionally needs `patchelf` on `PATH` (e.g. `dnf install patchelf` /
+`apt-get install patchelf`);
 the release workflow installs it on its Linux legs. macOS uses `install_name_tool`
 from the Xcode command line tools.
 
@@ -115,6 +116,6 @@ from the Xcode command line tools.
 
 Two equivalent paths, both idempotent:
 
-- `just release <ver>` again — converges local state and force-repushes the tag.
+- `mise run release <ver>` again — converges local state and force-repushes the tag.
 - Actions → **Release** → **Run workflow**, with the existing tag — rebuilds and
   re-publishes without touching the tag or commits.

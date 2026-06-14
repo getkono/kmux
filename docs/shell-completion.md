@@ -19,7 +19,7 @@ Add the line for your shell, then restart the shell (or re-source the file):
 Elvish and PowerShell are also supported via the same mechanism — use
 `COMPLETE=elvish kmux` / `COMPLETE=powershell kmux`.
 
-`just install` prints these same instructions at the end of a successful install.
+`mise run install` prints these same instructions at the end of a successful install.
 
 ## What completes
 

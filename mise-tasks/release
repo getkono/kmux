@@ -1,0 +1,47 @@
+#!/usr/bin/env bash
+#MISE description="Cut a release: bump version, regenerate CHANGELOG, commit, tag v<ver>, push."
+#USAGE arg "<version>" help="Target version, semver, no leading 'v' (e.g. 0.2.0)"
+set -euo pipefail
+# Pushing the tag triggers the release workflow, which builds binaries for all
+# targets and publishes the GitHub Release. Idempotent / re-runnable: the same
+# version converges (no-op bump/commit) and force-repushes the tag to
+# re-trigger the workflow (so a failed or yanked release can be re-cut). Run
+# from a clean master checkout:  mise run release 0.2.0
+ver="${1:?usage: mise run release <version>}"
+if [[ ! "$ver" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+    echo "error: '$ver' is not valid semver (expected MAJOR.MINOR.PATCH, no leading 'v')" >&2
+    exit 1
+fi
+tag="v${ver}"
+branch=$(git rev-parse --abbrev-ref HEAD)
+[[ "$branch" == "master" ]] || { echo "error: releases must be cut from master (on '$branch')" >&2; exit 1; }
+if ! git diff --quiet || ! git diff --cached --quiet; then
+    echo "error: working tree not clean; commit or stash changes first" >&2
+    exit 1
+fi
+echo "==> fetching tags"
+git fetch --quiet origin --tags
+echo "==> setting workspace version to ${ver}"
+# Anchored to the [workspace.package] block so [workspace.dependencies] versions are untouched.
+sed -i.bak -E '/^\[workspace\.package\]/,/^\[/ s/^version = ".*"/version = "'"$ver"'"/' Cargo.toml
+rm -f Cargo.toml.bak
+# Sync the workspace member entries in Cargo.lock without bumping external deps.
+cargo update --workspace --offline
+echo "==> regenerating CHANGELOG.md"
+git cliff --tag "$tag" -o CHANGELOG.md
+git add -A
+if git diff --cached --quiet; then
+    echo "==> nothing to commit (already at ${tag} state)"
+else
+    git commit -q -m "chore(release): ${tag}"
+    echo "==> committed chore(release): ${tag}"
+fi
+echo "==> tagging ${tag} at HEAD"
+git tag -fa "$tag" -m "$tag"
+echo "==> pushing ${branch} (runs the pre-push fmt/clippy/test gate)"
+git push origin "$branch"
+echo "==> pushing ${tag} (force; re-triggers the release workflow)"
+git push --force --no-verify origin "$tag"
+echo "==> done"
+echo "    workflow: https://github.com/getkono/kmux/actions/workflows/release.yml"
+echo "    release:  https://github.com/getkono/kmux/releases/tag/${tag}"

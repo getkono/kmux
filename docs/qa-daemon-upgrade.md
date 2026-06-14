@@ -1,7 +1,7 @@
 # QA matrix — live daemon upgrade (issue #36)
 
 Manual validation plan for upgrading a running `kmuxd` in place
-(`just upgrade-daemon`) without dropping the shells it hosts. It complements the
+(`mise run upgrade-daemon`) without dropping the shells it hosts. It complements the
 automated coverage and covers the surfaces that are impractical to assert in a
 hermetic test (real interactive workloads, both GUI clients, deliberate version
 bumps, failure injection).
@@ -22,7 +22,7 @@ Run the whole matrix on **Linux (GTK client, `kmux-gtk`)** and **macOS (Swift ap
 | `live_pty_migrates_with_same_pid` (pre-existing) | `crates/kmuxd/src/app/migrate.rs` | In-process fd transfer keeps the same child PID. |
 | `pane_fd_round_trips_and_keeps_child_alive`, `hello_version_mismatch_round_trips_for_decline` (pre-existing) | `crates/kmuxd/src/handoff/mod.rs` | SCM_RIGHTS fd passing; version-mismatch → decline. |
 
-Run: `just test` (or `cargo test -p kmuxd -p kmux-pty -p kmux-client`).
+Run: `mise run test` (or `cargo test -p kmuxd -p kmux-pty -p kmux-client`).
 
 > **Note on what is *not* automated:** a successor built with a *different*
 > `HANDOFF_PROTOCOL_VERSION`/`STATE_VERSION` (needs a second build) and the real
@@ -30,8 +30,8 @@ Run: `just test` (or `cargo test -p kmuxd -p kmux-pty -p kmux-client`).
 
 ## A. Real workloads survive the upgrade
 
-Setup: `just install`, start the GUI, then in the steps below run
-`just upgrade-daemon` from a separate terminal and observe.
+Setup: `mise run install`, start the GUI, then in the steps below run
+`mise run upgrade-daemon` from a separate terminal and observe.
 
 | # | Workload in a live pane | Steps | Expected |
 | --- | --- | --- | --- |
@@ -64,7 +64,7 @@ Setup: `just install`, start the GUI, then in the steps below run
 
 | # | Steps | Expected |
 | --- | --- | --- |
-| D1 (Linux & macOS) | Run the installed `~/.cargo/bin/kmuxd` (via the GUI). Bump the workspace version (or make a visible change), `just upgrade-daemon`. | `kmux daemon status` shows the **new** `kmuxd_version`; sessions survived. On Linux this is the `/proc/self/exe (deleted)` path — confirm it does **not** silently keep the old version. |
+| D1 (Linux & macOS) | Run the installed `~/.cargo/bin/kmuxd` (via the GUI). Bump the workspace version (or make a visible change), `mise run upgrade-daemon`. | `kmux daemon status` shows the **new** `kmuxd_version`; sessions survived. On Linux this is the `/proc/self/exe (deleted)` path — confirm it does **not** silently keep the old version. |
 | D2 | Confirm the old daemon is gone | After the upgrade, the previous PID is no longer alive (`ps -p <old_pid>`); exactly one `kmuxd` runs. |
 
 ## E. Version-bump matrix (deliberately break compatibility, one at a time)
@@ -95,5 +95,5 @@ Cross-check against the invariants in [`daemon-handoff.md`](daemon-handoff.md).
 | # | Surface | Expected |
 | --- | --- | --- |
 | G1 | Many panes (e.g. 20+) | All migrate; no fd-exhaustion errors. |
-| G2 | Repeated upgrades (loop `just upgrade-daemon` 5–10×) | Sessions persist each time; daemon open-fd count is stable across iterations (`lsof -p <pid> \| wc -l`) — no leak. |
+| G2 | Repeated upgrades (loop `mise run upgrade-daemon` 5–10×) | Sessions persist each time; daemon open-fd count is stable across iterations (`lsof -p <pid> \| wc -l`) — no leak. |
 | G3 | Idempotency | Back-to-back upgrades with no intervening activity converge (no duplicate daemons, no orphaned `kmuxd`/shell processes). |

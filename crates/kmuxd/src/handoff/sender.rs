@@ -149,7 +149,7 @@ fn spawn_successor() -> anyhow::Result<()> {
 }
 
 /// Resolve the path to re-exec for the successor daemon, accounting for an
-/// in-place upgrade (`just upgrade-daemon`: `cargo install` atomically replaces the
+/// in-place upgrade (`mise run upgrade-daemon`: `cargo install` atomically replaces the
 /// binary, then `kmux daemon restart` triggers this handoff).
 ///
 /// `current_exe()` behaves differently across platforms once the running binary is

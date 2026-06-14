@@ -96,11 +96,11 @@ the `HandoffMessage` wire format.**
   replying; the client detects this and falls back to a hard stop-then-respawn
   (running shells do not survive that one-time fallback).
 
-## Upgrading a running daemon (`just upgrade-daemon`, issue #36)
+## Upgrading a running daemon (`mise run upgrade-daemon`, issue #36)
 
 The handoff above is what makes a *live upgrade* possible: ship a new `kmuxd`
 build and restart onto it without dropping the shells it hosts. The
-`just upgrade-daemon` recipe does exactly that:
+`mise run upgrade-daemon` task does exactly that:
 
 1. `cargo build --release -p kmuxd` — also refreshes the build-tree
    `libkmux_ghostty` the installed binary's rpath points at, keeping the new

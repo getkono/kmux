@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+#MISE description="Rebuild kmux + kmuxd (debug) and run 'kmux daemon <args>'."
+#
+# Binary resolution: the toolkit-free `kmux` client at target/debug/kmux picks up
+# its sibling kmuxd at target/debug/kmuxd, spawning it with the same argv as any
+# auto-spawn. `kmux daemon …` never loads a UI toolkit. Forwarded args go straight
+# to the subcommand (which uses the same primitive as auto-spawn):
+#   mise run daemon -- start            # start the local daemon
+#   mise run daemon -- stop             # stop it
+#   mise run daemon -- restart          # rebuild + restart
+#   mise run daemon -- status           # query status
+set -euo pipefail
+cargo build -p kmux -p kmuxd
+cargo run -p kmux -- daemon "$@"

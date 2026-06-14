@@ -1,0 +1,31 @@
+#!/usr/bin/env bash
+#MISE description="Generate the uniffi Swift bindings from the built kmux-ffi cdylib (macOS-only)."
+#USAGE arg "<profile>" help="Which built cdylib to introspect: debug|release" default="debug"
+#
+# The SwiftUI macOS client lives in kmux-swift/ (a SwiftPM package, outside the
+# cargo workspace) and links the kmux-ffi staticlib. This task is macOS-only
+# (gated like install/package); on Linux the GTK GUI (kmux-gtk) is the client.
+set -euo pipefail
+# The profile (debug|release) selects which built cdylib to introspect;
+# `mise run install` passes "release" so the bindings match the release staticlib
+# it links. The generated Swift is identical across profiles (it is derived from
+# the crate metadata), so the default debug profile is fine for dev builds.
+profile="${1:-debug}"
+[[ "$(uname -s)" == "Darwin" ]] || { echo "error: gen-ffi-bindings is macOS-only (the Swift app is macOS-only)" >&2; exit 1; }
+case "$profile" in
+    debug)   relflag="" ;;
+    release) relflag="--release" ;;
+    *) echo "error: profile must be 'debug' or 'release' (got '$profile')" >&2; exit 1 ;;
+esac
+cargo build $relflag -p kmux-ffi
+out=$(mktemp -d)
+# `--no-format` skips uniffi's optional swiftformat pass: the bindings are
+# machine-generated (and gitignored), so formatting them is pointless, and
+# without it uniffi prints a benign "Unable to auto-format" warning whenever
+# swiftformat isn't installed (see issue #104).
+cargo run -p kmux-ffi --bin uniffi-bindgen -- \
+    generate --no-format --library "target/${profile}/libkmux_ffi.dylib" --language swift --out-dir "$out"
+mkdir -p kmux-swift/Sources/kmux_ffiFFI kmux-swift/Sources/KmuxBindings
+cp "$out/kmux_ffiFFI.h"  kmux-swift/Sources/kmux_ffiFFI/kmux_ffiFFI.h
+cp "$out/kmux_ffi.swift" kmux-swift/Sources/KmuxBindings/kmux_ffi.swift
+echo "==> generated Swift bindings into kmux-swift/Sources/"

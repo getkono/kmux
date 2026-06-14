@@ -72,11 +72,10 @@ configuration.
     other version. If mise is **not** activated in your shell (no
     `mise activate` in your shell rc, so no shims on `PATH`), a different `zig`
     (e.g. a Homebrew one) may be used instead of the pinned one and builds may fail with a version
-    mismatch. The `just` recipes resolve the mise-pinned zig automatically
-    (they export `$ZIG`, which `build.rs` honors), so `just install` / `just
-    build` work regardless. For a raw `cargo build`/`cargo install`, either
-    activate mise, run it under `mise exec -- cargo …`, or pass
-    `ZIG="$(mise which zig)" cargo …`.
+    mismatch. The `mise` tasks run under mise's activated toolchain, so the
+    pinned zig is always on `PATH` — `mise run install` / `mise run build` work
+    regardless. For a raw `cargo build`/`cargo install`, either activate mise,
+    run it under `mise exec -- cargo …`, or pass `ZIG="$(mise which zig)" cargo …`.
 - Ghostty sources as a git submodule: after cloning, run
   `git submodule update --init` once to populate `vendor/ghostty/`.
 - **GTK4 development libraries** — required only to build the GTK GUI binary
@@ -110,7 +109,7 @@ $ cargo run -p kmux-gtk    # GTK GUI directly (Linux default, also macOS) — ne
 ```
 
 `cargo run -p kmux` execs the frontend binary, so for a dev GUI run build it too
-(or use `just start`, which builds `kmux` + `kmux-gtk` then runs `kmux`).
+(or use `mise run start`, which builds `kmux` + `kmux-gtk` then runs `kmux`).
 
 > If a `kmux-gtk` build fails with a `pkg-config` error about
 > `graphene-gobject-1.0` (or similar) not being found, your `PATH` has a
@@ -146,20 +145,26 @@ To serve a custom certificate, set `[tls] cert` and `[tls] key` in `kmuxd.toml`
 
 ## Development
 
+Tasks run through [mise](https://mise.jdx.dev) (`mise tasks` lists them all):
+
 ```bash
-cargo build --workspace    # build everything
-cargo test --workspace     # run all tests
-cargo fmt --all            # format
-cargo clippy --workspace   # lint
+mise run build    # cargo build
+mise run test     # cargo test --workspace
+mise run fmt      # cargo fmt --all
+mise run clippy   # cargo clippy (warnings denied)
+mise run start    # build + launch the GUI
 ```
 
-Git hooks (via [lefthook](https://github.com/evilmartians/lefthook)) run
-format and lint checks on commit, plus tests on push.
+Git hooks are managed by [hk](https://hk.jdx.dev) (pinned in `mise.toml`):
+format + lint auto-fix on commit (the fixes are auto-staged for you), and
+format/lint/tests on push. `mise install` installs hk and wires the hooks into
+git automatically; if the hooks aren't active, run `mise run setup`.
 
 ## Contributing
 
-Run `cargo test --workspace` and `cargo clippy --workspace` before submitting
-a PR. The project uses conventional commits (`type: description`).
+Run `mise run test` and `mise run clippy` before submitting a PR (the hk
+pre-push hook runs these for you). The project uses conventional commits
+(`type: description`).
 
 ## License
 

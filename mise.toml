@@ -2,11 +2,105 @@
 # Pinned to ghostty v1.3.1's minimum_zig_version (build.zig.zon).
 zig = "0.15.2"
 rust = "stable"
-# `just release` regenerates CHANGELOG.md from conventional commits via git-cliff,
-# and the release workflow shells out to `just package`. Pinning both here means
-# local dev and CI runners resolve identical versions.
+# `mise run release` regenerates CHANGELOG.md from conventional commits via
+# git-cliff, and the release workflow shells out to `mise run package`. Pinning
+# both here means local dev and CI runners resolve identical versions.
 "aqua:orhun/git-cliff" = "2.13.1"
-just = "1.50.0"
-# Mutation testing (`just mutants`). Pinned so local and CI sweeps mutate
+# Git hooks (pre-commit/pre-push); config in hk.pkl. hk uses its built-in pkl
+# evaluator, so no separate `pkl` CLI is needed. The `postinstall` hook below
+# wires it into .git/hooks after `mise install` (or run `mise run setup`).
+hk = "1.48.0"
+# Mutation testing (`mise run mutants`). Pinned so local and CI sweeps mutate
 # against an identical cargo-mutants version.
 "cargo:cargo-mutants" = "27.1.0"
+
+[settings]
+# Required for the `[hooks]` block below (mise gates hooks behind this flag).
+experimental = true
+
+[hooks]
+# After `mise install`, install hk's git hooks into .git/hooks (idempotent). The
+# `|| true` keeps a fresh checkout from failing the install if hk can't reach the
+# network to fetch its pkl schema on the very first run — rerun `mise run setup`.
+postinstall = "hk install || true"
+
+# ── Tasks ─────────────────────────────────────────────────────────────────────
+# `mise run <task>` replaces the old `just <task>`. mise activates the pinned
+# toolchain (incl. zig 0.15.2) for every task, so cargo builds resolve the right
+# zig via PATH automatically (build.rs honors $ZIG, else falls back to PATH zig).
+# One-liners live here; the multi-step recipes are scripts under mise-tasks/.
+
+[tasks.fmt]
+description = "Format all code"
+run = "cargo fmt --all"
+
+[tasks.fmt-check]
+description = "Check formatting (CI mode)"
+run = "cargo fmt --all -- --check"
+
+[tasks.clippy]
+description = "Run clippy lints"
+run = "cargo clippy --workspace --all-targets -- -D warnings"
+
+[tasks.clippy-fix]
+description = "Auto-fix clippy lints"
+run = "cargo clippy --fix --allow-dirty --allow-staged --workspace --all-targets -- -D warnings"
+
+[tasks.build]
+description = "Build (default features)"
+run = "cargo build"
+
+[tasks.test]
+description = "Run tests (whole workspace; matches CI)"
+run = "cargo test --workspace"
+
+[tasks.gtk-app]
+description = "Build the GTK app (kmux-gtk)"
+run = "cargo build -p kmux-gtk"
+
+[tasks.gtk-run]
+description = "Run the GTK app (kmux-gtk)"
+run = "cargo run -p kmux-gtk"
+
+[tasks.gtk-test]
+description = "Test the GTK app (kmux-gtk)"
+run = "cargo test -p kmux-gtk"
+
+[tasks.swift-app]
+description = "Build the native macOS app (kmux-swift). Regenerates bindings first."
+depends = ["gen-ffi-bindings"]
+run = "swift build --package-path kmux-swift"
+
+[tasks.swift-run]
+description = "Run the native macOS app (kmux-swift). Regenerates bindings first."
+depends = ["gen-ffi-bindings"]
+run = "swift run --package-path kmux-swift"
+
+[tasks.swift-test]
+description = "Test the native macOS app (kmux-swift). Regenerates bindings first."
+depends = ["gen-ffi-bindings"]
+run = "swift test --package-path kmux-swift"
+
+[tasks.doc]
+description = "Generate docs"
+run = "cargo doc --no-deps --open"
+
+[tasks.doc-check]
+description = "Check docs build (no open)"
+run = "cargo doc --no-deps --all-features"
+
+[tasks.doc-test]
+description = "Run doc tests"
+run = "cargo test --doc --all-features"
+
+[tasks.tail-client-log]
+description = "Tail the client log (kmux)"
+run = 'tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/kmux/client.log"'
+
+[tasks.tail-daemon-log]
+description = "Tail the daemon log (kmuxd)"
+run = 'tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/kmux/daemon.log"'
+
+[tasks.setup]
+description = "Install hk's git hooks (fallback for the postinstall hook)"
+run = "hk install"

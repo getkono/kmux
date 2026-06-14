@@ -778,9 +778,9 @@ This means `probe-or-start` always restarts the exact binary that was already on
 
 The remote `kmuxd` must be on the login `$PATH`. Non-interactive SSH sessions typically receive only `/usr/bin:/bin` (plus whatever `/etc/ssh/sshrc` or PAM adds). If `kmuxd` is installed at `~/.local/bin/kmuxd`, ensure the remote `/etc/environment` or `~/.profile` exports that path.
 
-### justfile (`just daemon <args>`)
+### mise task (`mise run daemon <args>`)
 
-This target rebuilds kmux + kmuxd (debug) and delegates to `kmux daemon <args>` via `cargo run -p kmux`, which uses `find_server_binary()` as above (e.g. `just daemon start` / `just daemon restart` / `just daemon stop`). The debug build's `target/debug/kmux` picks up `target/debug/kmuxd` as its sibling. No separate binary resolution logic exists in the justfile itself.
+This task rebuilds kmux + kmuxd (debug) and delegates to `kmux daemon <args>` via `cargo run -p kmux`, which uses `find_server_binary()` as above (e.g. `mise run daemon -- start` / `mise run daemon -- restart` / `mise run daemon -- stop`). The debug build's `target/debug/kmux` picks up `target/debug/kmuxd` as its sibling. No separate binary resolution logic exists in the task itself.
 
 ### Runtime directory isolation
 

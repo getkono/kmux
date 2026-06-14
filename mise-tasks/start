@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+#MISE description="Run the kmux GUI (debug build) via the kmux entrypoint, forwarding any args."
+#
+# Maximal debugging: full panic + library backtraces, verbose kmux logs, and
+# GLib/GTK diagnostics. Logs stream to stderr (the terminal) so a crash shows
+# the live trace next to its backtrace. Each env var below is overridable:
+#   mise run start                          # launch the GUI
+#   mise run start -- --dry-run myhost      # forward args to the binary
+#   RUST_LOG=trace mise run start           # override the default log filter
+#   KMUX_LOG_STDERR=0 mise run start        # log to the client log file instead
+# The `kmux` entrypoint execs its sibling `kmux-gtk` in target/debug, so build both.
+set -euo pipefail
+export RUST_BACKTRACE="${RUST_BACKTRACE:-full}"
+export RUST_LIB_BACKTRACE="${RUST_LIB_BACKTRACE:-1}"
+export RUST_LOG="${RUST_LOG:-kmux=debug,kmux_app=debug,kmux_client=debug,kmux_protocol=debug,kmux_gtk=debug}"
+export KMUX_LOG_STDERR="${KMUX_LOG_STDERR:-1}"
+export G_MESSAGES_DEBUG="${G_MESSAGES_DEBUG:-all}"
+export RUST_LOG_STYLE="${RUST_LOG_STYLE:-always}"
+cargo build -p kmux -p kmux-gtk
+cargo run -p kmux -- "$@"

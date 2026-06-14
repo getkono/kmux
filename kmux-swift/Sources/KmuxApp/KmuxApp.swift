@@ -16,7 +16,7 @@ struct KmuxSwiftApp: App {
                 .onAppear {
                     // Claim regular foreground-app status and come to the front.
                     // Needed when launched as a bare executable from a terminal
-                    // (`swift run` / `just macos-run`); harmless + idempotent when
+                    // (`swift run` / `mise run swift-run`); harmless + idempotent when
                     // launched from the installed `~/Applications/kmux.app` bundle.
                     NSApplication.shared.setActivationPolicy(.regular)
                     NSApplication.shared.activate(ignoringOtherApps: true)

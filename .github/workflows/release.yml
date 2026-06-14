@@ -1,6 +1,6 @@
 name: Release
 
-# Cut a release with `just release <ver>` (bumps the version, tags v<ver>, pushes).
+# Cut a release with `mise run release <ver>` (bumps the version, tags v<ver>, pushes).
 # Pushing the tag fires this workflow, which builds native binaries for every
 # target and publishes them to the GitHub Release. Re-running on an existing tag
 # (push --force, or the workflow_dispatch button) replaces the assets in place.
@@ -101,16 +101,16 @@ jobs:
           restore-keys: |
             ${{ matrix.target }}-zig-
 
-      # `just package` needs patchelf on Linux to repoint kmuxd's rpath to $ORIGIN.
+      # `mise run package` needs patchelf on Linux to repoint kmuxd's rpath to $ORIGIN.
       # macOS uses install_name_tool, which ships with the Xcode command line tools.
-      # `just package` builds the GTK frontend (`kmux-gtk`) on Linux, which links
+      # `mise run package` builds the GTK frontend (`kmux-gtk`) on Linux, which links
       # GTK4 + libadwaita; patchelf repoints kmuxd's rpath to $ORIGIN.
       - name: Install GTK4 + libadwaita + patchelf (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y patchelf libgtk-4-dev libadwaita-1-dev
 
       - name: Package
-        run: just package
+        run: mise run package
 
       - uses: actions/upload-artifact@v4
         with:

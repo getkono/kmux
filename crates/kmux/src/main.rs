@@ -120,7 +120,7 @@ fn launch_desktop() -> anyhow::Result<()> {
     let exe = app.join("Contents/MacOS/kmux-swift");
     if !exe.is_file() {
         anyhow::bail!(
-            "kmux: GUI not installed at {} — run `just install` from the kmux repo",
+            "kmux: GUI not installed at {} — run `mise run install` from the kmux repo",
             exe.display()
         );
     }
