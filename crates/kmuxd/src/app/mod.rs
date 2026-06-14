@@ -6,6 +6,11 @@ mod io;
 pub(super) mod layout;
 mod migrate;
 mod pane_crud;
+/// Always-compiled wrappers that route pane/session operations to the peer
+/// federation subsystem when it is enabled. The wrappers exist unconditionally
+/// (returning the no-op / "not supported" answer when the `federation` feature
+/// is off) so the dispatch layer never needs `#[cfg]` directives.
+mod peer_api;
 mod persistence;
 pub(super) mod restore;
 mod tab_crud;
@@ -394,6 +399,11 @@ pub struct ServerApp {
     /// Every connected client subscribes so that tab-bar titles update for all
     /// panes, not only the one the client is currently attached to.
     vt_events_tx: broadcast::Sender<kmux_protocol::messages::ServerMessage>,
+    /// Federation subsystem: upstream connections to remote `kmuxd`s whose
+    /// sessions are proxied to local GUIs (issue #121). See
+    /// [`crate::federation`] and `docs/architecture-federation.md`.
+    #[cfg(feature = "federation")]
+    pub(super) peer_manager: crate::federation::PeerManager,
 }
 
 impl ServerApp {
@@ -413,6 +423,8 @@ impl ServerApp {
             rng: Mutex::new(rand::rngs::SmallRng::from_rng(&mut rand::rng())),
             conn_count_tx,
             vt_events_tx,
+            #[cfg(feature = "federation")]
+            peer_manager: crate::federation::PeerManager::new(),
         }
     }
 
