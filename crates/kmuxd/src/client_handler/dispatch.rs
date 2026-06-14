@@ -663,7 +663,7 @@ fn directory_error(request_id: u64, requested: &str, err: &std::io::Error) -> Se
 #[cfg(test)]
 mod tests {
     use super::*;
-  
+
     use std::sync::Arc;
 
     use kmux_protocol::Compressor;

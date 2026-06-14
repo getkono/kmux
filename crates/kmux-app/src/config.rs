@@ -499,7 +499,7 @@ status_bg = "#111111"
         let back: KmuxConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(back.warn_nested, Some(false));
     }
-  
+
     #[test]
     fn config_file_parses_perf_counters_field() {
         // Both snake_case (canonical) and the kebab alias parse (issue #61).

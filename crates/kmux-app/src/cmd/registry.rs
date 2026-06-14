@@ -110,7 +110,7 @@ fn cmd_transport(app: &mut AppCore, args: &[String]) -> CommandResult {
         Some(k) => format!("transport: forced {k}"),
         None => "transport: auto".into(),
     }))
-}  
+}
 
 fn cmd_connection(app: &mut AppCore, _args: &[String]) -> CommandResult {
     app.connection_overlay_visible = !app.connection_overlay_visible;

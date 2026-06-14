@@ -7,3 +7,6 @@ rust = "stable"
 # local dev and CI runners resolve identical versions.
 "aqua:orhun/git-cliff" = "2.13.1"
 just = "1.50.0"
+# Mutation testing (`just mutants`). Pinned so local and CI sweeps mutate
+# against an identical cargo-mutants version.
+"cargo:cargo-mutants" = "27.1.0"

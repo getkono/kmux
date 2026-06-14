@@ -67,7 +67,6 @@ impl TransportKind {
 ///
 /// You do **not** need to bump for purely behavioural changes that leave the
 /// wire format unchanged (e.g. changing server-side timeout values).
-
 ///
 /// # History
 ///

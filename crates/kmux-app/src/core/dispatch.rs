@@ -15,8 +15,8 @@ use crate::mode::{Action, Mode};
 use crate::recent_servers::ServerKind;
 
 use super::{
-    AppCore, COMMAND_HISTORY_CAP, DirBrowserRow, KeyResult, PendingClose, SwitchTarget, SOFT_CLOSE_GRACE, SwitchTarget,
-    TopBarAction,
+    AppCore, COMMAND_HISTORY_CAP, DirBrowserRow, KeyResult, PendingClose, SOFT_CLOSE_GRACE,
+    SwitchTarget, TopBarAction,
 };
 
 impl AppCore {
@@ -745,7 +745,7 @@ impl AppCore {
     pub fn has_pending_close(&self) -> bool {
         !self.pending_closes.is_empty()
     }
-  
+
     /// Open the command palette pre-filled with `transport ` so the user picks
     /// from the completer (Auto + each protocol). Bound to the protocol
     /// indicator (double-click) in the GUIs (issue #69).

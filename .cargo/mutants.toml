@@ -1,0 +1,29 @@
+# cargo-mutants configuration for the kmux workspace.
+#
+# cargo-mutants is pinned via mise (see mise.toml: `cargo:cargo-mutants`).
+# Run the whole workspace with `just mutants`, or scope to one crate with
+# `cargo mutants -p kmux-protocol`. Results land in `mutants.out/`.
+
+# Mutant test runs use unit tests only (lib + bin targets). This deliberately
+# skips the `tests/` integration suites — notably kmuxd's `handoff_e2e`, which
+# spawns real daemon processes and is far too slow to run once per mutant.
+#
+# `--bins` is REQUIRED, not just `--lib`: kmuxd, kmux-gtk and kmux are bin-only
+# crates (main.rs, no lib.rs), so a bare `--lib` would silently skip ALL of
+# their unit tests (e.g. kmuxd's 181) and report every mutant there as missed.
+#
+# The full integration suite still runs in the real gate (`just test` / CI).
+additional_cargo_test_args = ["--lib", "--bins"]
+
+# Mutant builds and tests can run slower than the clean baseline; give headroom
+# so a slow — or deliberately hung — mutant is recorded as a timeout (= caught)
+# rather than aborting the sweep.
+timeout_multiplier = 5.0
+minimum_test_timeout = 30
+
+# Low-value files: raw C-ABI binding declarations and test-only mock backends
+# carry no business logic worth mutating.
+exclude_globs = [
+    "crates/kmux-ghostty-sys/src/**",
+    "**/mock.rs",
+]

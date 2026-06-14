@@ -112,7 +112,7 @@ impl SessionManager {
         self.connection_state.is_live()
             && self.liveness.idle_since(now) > 3 * crate::liveness::PING_INTERVAL
     }
- 
+
     /// The currently-active transport channel (QUIC/TCP+TLS/UDS/TCP).
     pub fn current_transport(&self) -> kmux_protocol::messages::TransportKind {
         self.current_transport
