@@ -139,3 +139,90 @@ pub fn epoch_secs_to_ymd_hms(secs: u64) -> (u32, u32, u32, u32, u32, u32) {
     let y = if mo <= 2 { y + 1 } else { y } as u32;
     (y, mo, d, h, mi, s)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn transport_kind_display_names() {
+        assert_eq!(TransportKind::Quic.to_string(), "QUIC");
+        assert_eq!(TransportKind::Tcp.to_string(), "TCP");
+        assert_eq!(TransportKind::TcpTls.to_string(), "TCP+TLS");
+        assert_eq!(TransportKind::Uds.to_string(), "UDS");
+    }
+
+    #[test]
+    fn parse_cli_accepts_known_names_case_insensitively() {
+        assert_eq!(TransportKind::parse_cli("quic"), Some(TransportKind::Quic));
+        assert_eq!(TransportKind::parse_cli("QUIC"), Some(TransportKind::Quic));
+        assert_eq!(TransportKind::parse_cli("tcp"), Some(TransportKind::Tcp));
+        for tls in ["tcp-tls", "tcptls", "tls", "TCP-TLS"] {
+            assert_eq!(
+                TransportKind::parse_cli(tls),
+                Some(TransportKind::TcpTls),
+                "{tls}"
+            );
+        }
+        for uds in ["uds", "unix", "local"] {
+            assert_eq!(TransportKind::parse_cli(uds), Some(TransportKind::Uds), "{uds}");
+        }
+    }
+
+    #[test]
+    fn parse_cli_rejects_unknown_and_auto() {
+        // `auto` is intentionally NOT a transport — the caller maps it to
+        // *clearing* the override, so parse_cli must return None for it.
+        assert_eq!(TransportKind::parse_cli("auto"), None);
+        assert_eq!(TransportKind::parse_cli("bogus"), None);
+        assert_eq!(TransportKind::parse_cli(""), None);
+    }
+
+    #[test]
+    fn version_mismatch_hint_reports_direction_and_boundary() {
+        assert!(
+            version_mismatch_hint("protocol version mismatch: client=12, server=13")
+                .contains("older")
+        );
+        assert!(
+            version_mismatch_hint("protocol version mismatch: client=14, server=13")
+                .contains("newer")
+        );
+        // Boundary: equal versions are not "older" (the comparison is strict <),
+        // so the hint falls to the newer-client branch.
+        assert!(
+            version_mismatch_hint("protocol version mismatch: client=13, server=13")
+                .contains("newer")
+        );
+        // A reason that is not a version mismatch yields no hint.
+        assert_eq!(version_mismatch_hint("connection refused"), "");
+        // Malformed (unparseable) versions also yield no hint.
+        assert_eq!(
+            version_mismatch_hint("protocol version mismatch: client=x, server=y"),
+            ""
+        );
+    }
+
+    #[test]
+    fn epoch_millis_is_well_past_2020() {
+        // 1_577_836_800_000 ms == 2020-01-01T00:00:00Z. The wall clock is long
+        // past that, which pins the function against the `-> 0` / `-> 1` mutants.
+        assert!(epoch_millis() > 1_577_836_800_000);
+    }
+
+    #[test]
+    fn epoch_secs_to_ymd_hms_matches_known_timestamps() {
+        // Unix epoch.
+        assert_eq!(epoch_secs_to_ymd_hms(0), (1970, 1, 1, 0, 0, 0));
+        // One day / one (non-leap) year later: date rollover.
+        assert_eq!(epoch_secs_to_ymd_hms(86_400), (1970, 1, 2, 0, 0, 0));
+        assert_eq!(epoch_secs_to_ymd_hms(31_536_000), (1971, 1, 1, 0, 0, 0));
+        // A known wall-clock instant: 2023-11-14T22:13:20Z.
+        assert_eq!(
+            epoch_secs_to_ymd_hms(1_700_000_000),
+            (2023, 11, 14, 22, 13, 20)
+        );
+        // Leap day exercises the civil-calendar month/day branch.
+        assert_eq!(epoch_secs_to_ymd_hms(1_582_934_400), (2020, 2, 29, 0, 0, 0));
+    }
+}
