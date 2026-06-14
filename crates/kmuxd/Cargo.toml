@@ -13,9 +13,23 @@ build = "build.rs"
 name = "kmuxd"
 path = "src/main.rs"
 
+[features]
+# Daemon federation (issue #121): the local kmuxd opens an upstream connection
+# to a remote kmuxd and proxies its sessions to local GUIs. Default-on for the
+# daemon (it always wants the capability); gated so the federation subsystem and
+# its `kmux-connect` dependency can be compiled out (`--no-default-features`),
+# which also keeps the upstream-connect machinery off any build that doesn't
+# need it. See docs/architecture-federation.md.
+default = ["federation"]
+federation = ["dep:kmux-connect"]
+
 [dependencies]
 kmux-pty.workspace = true
 kmux-protocol = { workspace = true, features = ["framing", "tls", "quic", "tcp-tls", "uds"] }
+# Outbound peer links (the "server is also a client" role). Only pulled in with
+# the `federation` feature; `kmux-connect` depends solely on `kmux-protocol`, so
+# this adds no dependency cycle.
+kmux-connect = { workspace = true, optional = true }
 daemonize.workspace = true
 nix.workspace = true
 serde.workspace = true

@@ -10,6 +10,8 @@ mod connection;
 mod conversions;
 mod daemon;
 mod diff_engine;
+#[cfg(feature = "federation")]
+mod federation;
 mod handoff;
 mod impair;
 mod persist;

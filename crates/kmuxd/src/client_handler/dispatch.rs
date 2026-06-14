@@ -7,7 +7,7 @@ use kmux_protocol::messages::{
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::app::{AttachParams, InputLockOutcome, PaneCloseOutcome};
+use crate::app::{AttachParams, AttachResult, InputLockOutcome, PaneCloseOutcome};
 use crate::auth::validate_token;
 use crate::connection::classify_error;
 
@@ -399,7 +399,11 @@ pub async fn handle_message<A: PaneAttacher>(
         }
 
         ClientMessage::SessionList { request_id } => {
-            let sessions = state.app.list_sessions().await;
+            // Merge locally-hosted sessions with every open peer's proxied
+            // sessions (local IDs, peer-decorated names). Federation off ⇒ the
+            // federated list is empty and this is the original behaviour.
+            let mut sessions = state.app.list_sessions().await;
+            sessions.extend(state.app.list_federated_sessions());
             state.send(ServerMessage::SessionListResult {
                 request_id,
                 sessions,
@@ -407,25 +411,53 @@ pub async fn handle_message<A: PaneAttacher>(
         }
 
         ClientMessage::PtyInput { pane_id, data } => {
-            if let Err(e) = state.app.write_input(&pane_id, client_id, data).await {
+            if state.app.is_federated_pane(&pane_id) {
+                state
+                    .app
+                    .forward_peer_message(&pane_id, move |remote| ClientMessage::PtyInput {
+                        pane_id: remote,
+                        data,
+                    });
+            } else if let Err(e) = state.app.write_input(&pane_id, client_id, data).await {
                 state.error(None, classify_error(&e), e.to_string());
             }
         }
 
         ClientMessage::PtyPaste { pane_id, data } => {
-            if let Err(e) = state.app.write_paste(&pane_id, client_id, data).await {
+            if state.app.is_federated_pane(&pane_id) {
+                state
+                    .app
+                    .forward_peer_message(&pane_id, move |remote| ClientMessage::PtyPaste {
+                        pane_id: remote,
+                        data,
+                    });
+            } else if let Err(e) = state.app.write_paste(&pane_id, client_id, data).await {
                 state.error(None, classify_error(&e), e.to_string());
             }
         }
 
         ClientMessage::PtyKey { pane_id, event } => {
-            if let Err(e) = state.app.write_key_event(&pane_id, client_id, event).await {
+            if state.app.is_federated_pane(&pane_id) {
+                state
+                    .app
+                    .forward_peer_message(&pane_id, move |remote| ClientMessage::PtyKey {
+                        pane_id: remote,
+                        event,
+                    });
+            } else if let Err(e) = state.app.write_key_event(&pane_id, client_id, event).await {
                 state.error(None, classify_error(&e), e.to_string());
             }
         }
 
         ClientMessage::PtyKeyBatch { pane_id, events } => {
-            if let Err(e) = state
+            if state.app.is_federated_pane(&pane_id) {
+                state.app.forward_peer_message(&pane_id, move |remote| {
+                    ClientMessage::PtyKeyBatch {
+                        pane_id: remote,
+                        events,
+                    }
+                });
+            } else if let Err(e) = state
                 .app
                 .write_key_batch(&pane_id, client_id, &events)
                 .await
@@ -435,7 +467,14 @@ pub async fn handle_message<A: PaneAttacher>(
         }
 
         ClientMessage::Resize { pane_id, size } => {
-            if let Err(e) = state.app.resize(&pane_id, client_id, size).await {
+            if state.app.is_federated_pane(&pane_id) {
+                state
+                    .app
+                    .forward_peer_message(&pane_id, move |remote| ClientMessage::Resize {
+                        pane_id: remote,
+                        size,
+                    });
+            } else if let Err(e) = state.app.resize(&pane_id, client_id, size).await {
                 state.error(None, classify_error(&e), e.to_string());
             }
         }
@@ -445,48 +484,69 @@ pub async fn handle_message<A: PaneAttacher>(
             last_seqno,
             size,
         } => {
-            // If already attached, detach first.
+            // If already attached, detach first (routes to the peer subsystem
+            // for federated panes, the local relay otherwise).
             if let Some(old) = state.attached.remove(&pane_id) {
                 old.abort();
-                state.app.detach_from_pane(&pane_id, client_id).await;
+                state.app.detach_pane_any(&pane_id, client_id).await;
             }
 
             let (client_tx, client_rx) = mpsc::channel::<ServerMessage>(CLIENT_CHANNEL_CAPACITY);
 
-            match state
-                .app
-                .attach(AttachParams {
-                    pane_id: pane_id.clone(),
-                    client_id,
-                    last_seqno,
-                    size,
-                    data_tx: client_tx,
-                    ctrl_tx: state.ctrl_tx.clone(),
-                    capabilities: state.capabilities.clone(),
-                })
-                .await
-            {
-                Ok(result) => {
-                    match attacher
-                        .start_pane_stream(pane_id.clone(), result, client_rx)
-                        .await
-                    {
-                        Ok(handle) => {
-                            state.attached.insert(pane_id, handle);
-                        }
-                        Err(e) => {
-                            state.error(None, ErrorCode::InternalError, e);
+            if state.app.is_federated_pane(&pane_id) {
+                // Federated pane: register as a viewer and forward the `Attach`
+                // upstream. The remote's snapshot and diffs arrive asynchronously
+                // through the peer feed loop and are pumped to this client via
+                // `client_rx`, so the synchronous replay is empty — `Delta(vec![])`
+                // emits no initial frames (see `build_attach_replay`).
+                state
+                    .app
+                    .federated_attach(&pane_id, client_id, client_tx, last_seqno, size);
+                match attacher
+                    .start_pane_stream(pane_id.clone(), AttachResult::Delta(vec![]), client_rx)
+                    .await
+                {
+                    Ok(handle) => {
+                        state.attached.insert(pane_id, handle);
+                    }
+                    Err(e) => state.error(None, ErrorCode::InternalError, e),
+                }
+            } else {
+                match state
+                    .app
+                    .attach(AttachParams {
+                        pane_id: pane_id.clone(),
+                        client_id,
+                        last_seqno,
+                        size,
+                        data_tx: client_tx,
+                        ctrl_tx: state.ctrl_tx.clone(),
+                        capabilities: state.capabilities.clone(),
+                    })
+                    .await
+                {
+                    Ok(result) => {
+                        match attacher
+                            .start_pane_stream(pane_id.clone(), result, client_rx)
+                            .await
+                        {
+                            Ok(handle) => {
+                                state.attached.insert(pane_id, handle);
+                            }
+                            Err(e) => {
+                                state.error(None, ErrorCode::InternalError, e);
+                            }
                         }
                     }
+                    Err(e) => state.error(None, classify_error(&e), e.to_string()),
                 }
-                Err(e) => state.error(None, classify_error(&e), e.to_string()),
             }
         }
 
         ClientMessage::Detach { pane_id } => {
             if let Some(handle) = state.attached.remove(&pane_id) {
                 handle.abort();
-                state.app.detach_from_pane(&pane_id, client_id).await;
+                state.app.detach_pane_any(&pane_id, client_id).await;
                 debug!("detached from pane '{pane_id}'");
             }
         }
@@ -560,18 +620,23 @@ pub async fn handle_message<A: PaneAttacher>(
         }
 
         ClientMessage::OpenPeer { request_id, target } => {
-            // Federation wiring lands in a later stage (issue #121). Until then a
-            // forward-built client gets an explicit rejection rather than silence,
-            // so it can surface the error instead of hanging on the request.
-            state.send(ServerMessage::PeerError {
-                request_id,
-                peer: Some(target.peer_id()),
-                reason: "federation is not supported by this daemon yet".to_string(),
-            });
+            // Ensure an upstream connection to the remote daemon and surface its
+            // sessions locally. With the `federation` feature off, `open_peer`
+            // returns the "not supported yet" error and this becomes a `PeerError`
+            // the client can surface (the prior stub behaviour).
+            let peer_hint = target.peer_id();
+            match state.app.open_peer(target).await {
+                Ok(peer) => state.send(ServerMessage::PeerOpened { request_id, peer }),
+                Err(reason) => state.send(ServerMessage::PeerError {
+                    request_id,
+                    peer: Some(peer_hint),
+                    reason,
+                }),
+            }
         }
 
         ClientMessage::ClosePeer { request_id, peer } => {
-            // Nothing is federated yet, so closing a peer is a no-op success.
+            state.app.close_peer(&peer);
             state.send(ServerMessage::PeerClosed { request_id, peer });
         }
 

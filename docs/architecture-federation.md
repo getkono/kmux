@@ -1,6 +1,8 @@
 # Daemon federation (issue #121)
 
-Status: **foundation landed; kmuxd integration designed, not yet implemented.**
+Status: **PR3 landed — one GUI attaches to a remote session through the local
+daemon, end-to-end (single viewer). Multi-GUI reconciliation (PR4) and GUI
+lean-down (PR5) remain.**
 
 ## Goal
 
@@ -22,12 +24,32 @@ See `docs/architecture-frontend.md` for the client layering this builds on.
 - **`CellGrid::to_snapshot()`** (`crates/kmux-client/src/grid/mod.rs`) — inverse of
   `apply_snapshot`; lets a cached grid mirror be re-serialised into a `GridSnapshot`
   for a newly-attaching GUI with no upstream round-trip. Round-trip tested.
-- **Federation wire protocol, `PROTOCOL_VERSION = 25`** (`crates/kmux-protocol`):
+- **Federation wire protocol, `PROTOCOL_VERSION = 26`** (`crates/kmux-protocol`):
   - `ClientMessage::OpenPeer { request_id, target: PeerTarget }` / `ClosePeer { request_id, peer }`
   - `ServerMessage::PeerOpened` / `PeerClosed` / `PeerError`
-  - `PeerTarget { user, host, ssh_port, accept_invalid_certs }` with `peer_id()` → `"user@host[:port]"`
-  - `kmuxd` dispatch + `kmux-client` handler carry **graceful stub arms** today
-    (OpenPeer → `PeerError "not supported yet"`); the real logic replaces them.
+  - `PeerTarget::{Ssh { user, host, ssh_port, accept_invalid_certs }, Direct { host, port,
+    token, accept_invalid_certs }}` with `peer_id()` → `"user@host[:port]"` / `"host:port"`.
+- **`kmuxd` federation subsystem (PR3)** — `crates/kmuxd/src/federation/` behind the
+  default-on `federation` cargo feature:
+  - `PeerManager` on `ServerApp` keyed by `PeerId`; `open_peer` connects upstream via
+    `kmux_connect::tcp_connect::connect_tcp_tls` (the `Direct` endpoint), authenticates,
+    fetches the remote `SessionList`, and registers each remote session under a
+    **freshly-drawn local `WordId`** (from the same `WordlistSampler` as local sessions,
+    so no collisions), holding the bidirectional `remote_word ↔ local_word` map.
+  - **Dispatch branching** (`client_handler/dispatch.rs`) routes `Attach` / `PtyInput` /
+    `PtyKey*` / `PtyPaste` / `Resize` / `Detach` for a federated pane to the peer (ID
+    translated, forwarded upstream) instead of the local relay; `SessionList` merges the
+    proxied sessions (peer-decorated names). The dispatch layer carries **no `#[cfg]`** —
+    every branch goes through always-compiled `ServerApp` wrappers (`app/peer_api.rs`).
+  - A per-peer **feed loop** drains the upstream `ServerMessage` stream, rewrites each
+    frame's pane ID remote→local, and fans pane content out to that pane's local viewers;
+    it answers upstream `Ping`s with `Pong`.
+  - Proxied panes are kept **entirely out** of `ServerApp.sessions` (which is strictly
+    PTY-backed), so no fake `PaneRelay`/`PtyWriter`/`term_state` ever exists.
+  - Verified by `crates/kmuxd/tests/federation_e2e.rs`: two real loopback daemons
+    federate over `Direct` TCP+TLS; a mock GUI attaches to the remote session through the
+    local daemon and both directions flow (remote output reaches the GUI under a local
+    pane ID; GUI input runs on the remote PTY).
 
 ## kmuxd integration design
 
@@ -75,11 +97,17 @@ for the upstream**, with dispatch branching federated vs. local:
 map. The GUI sees only local ids and needs no federation awareness beyond issuing
 `OpenPeer`; the peer origin is conveyed through the decorated session `name`.
 
-## PR breakdown (remaining)
+## PR breakdown
 
-- **PR3** — `PeerManager` + `open_peer` (upstream connect + remote `SessionList` +
-  local registration) + dispatch branching + upstream feed loop, behind `federation`.
-  End-to-end: one GUI attaches to one remote session through the local daemon.
+- **PR3 — landed.** `PeerManager` + `open_peer` (upstream connect + remote `SessionList`
+  + local registration) + dispatch branching + upstream feed loop, behind the default-on
+  `federation` feature. End-to-end: one GUI attaches to one remote session through the
+  local daemon (single viewer). Two carry-overs to later PRs, out of PR3's single-viewer
+  scope: the feed loop does not yet forward session-scoped events (titles, layout,
+  lifecycle) — pane content only (PR4); and federated sessions are held only in memory by
+  `PeerManager`, never in `ServerApp.sessions`, so they are already excluded from the
+  PTY-only persistence path — no `persist/` change was needed (the "ghost panes" risk in
+  the design note below does not arise).
 - **PR4** — multi-GUI reconciliation: upstream pane size = `effective_size` (min over
   local viewers); pause upstream only when **all** local viewers paused; capability
   union upstream / filter downstream; input-lock arbitration across local viewers;
@@ -91,24 +119,15 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   idle peer drop, peer-down isolation from local panes, version/profile guards on peer
   links, namespacing edge cases.
 
-## Open decision — federation addressing & testability
+## Resolved — federation addressing & testability
 
-`PeerTarget` is **SSH-only** today (`kmuxd probe-or-start` over SSH, then TCP+TLS over
-the tunnel), matching the existing remote-connection model (`kmux-connect`'s only
-remote handshake entry is `prepare_ssh`). This makes **end-to-end CI tests hard**: the
-existing `crates/kmuxd/tests/handoff_e2e.rs` spawns a daemon and connects over UDS/TCP
-with no SSH, and two loopback `kmuxd`s can't easily SSH to each other.
+**Decision: option (A), the direct endpoint.** `PeerTarget` gained a
+`Direct { host, port, token, accept_invalid_certs }` variant (`PROTOCOL_VERSION = 26`)
+alongside the existing `Ssh { .. }`, so a peer can be reached over TCP+TLS without SSH —
+for LAN / same-host setups and, critically, for CI. `crates/kmuxd/tests/federation_e2e.rs`
+spawns two loopback `kmuxd`s at isolated `XDG_*` dirs and federates over `Direct`, giving
+PR3 the end-to-end coverage the project expects (`mise run test` is a pre-push gate).
 
-Two ways forward (needs a maintainer call before PR3 implementation):
-
-- **(A) Direct endpoint in `PeerTarget`** — add a `direct: Option<{host, port, token}>`
-  variant so a peer can be reached over TCP+TLS without SSH (LAN + tests). Lets the
-  E2E test spawn two loopback daemons and federate over TCP. Small additive protocol
-  change (another `PROTOCOL_VERSION` bump). **Recommended** — unblocks rigorous testing
-  and is independently useful (LAN federation without SSH).
-- **(B) SSH-only + an `sshd`-on-loopback test harness** — keep addressing as-is and
-  stand up a throwaway `sshd` in the integration test. Heavier CI dependency; closer to
-  the real path.
-
-Until this is decided, PR3 cannot be implemented with the end-to-end test coverage the
-project expects (`mise run test` is a pre-push gate). The recommendation is **(A)**.
+PR3's `open_peer` implements the `Direct` path only; `Ssh` targets return a "not supported
+yet" `PeerError` (the SSH `probe-or-start` + `-L` tunnel path is future work — it reuses
+`kmux-connect`'s `prepare_ssh`, which already underpins the GUI's remote connections).

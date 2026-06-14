@@ -1310,6 +1310,7 @@ dependencies = [
  "clap",
  "daemonize",
  "kmux-client",
+ "kmux-connect",
  "kmux-ghostty",
  "kmux-ghostty-sys",
  "kmux-protocol",
