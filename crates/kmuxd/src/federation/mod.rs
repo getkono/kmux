@@ -29,11 +29,12 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use kmux_client::grid::CellGrid;
 use kmux_connect::connect::ConnectResult;
 use kmux_connect::tcp_connect::connect_tcp_tls;
 use kmux_protocol::messages::{
     ClientCapabilities, ClientId, ClientMessage, PeerId, PeerTarget, SequenceNo, ServerMessage,
-    SessionEntry, TermSize,
+    SessionEntry, TermSize, epoch_millis,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -56,6 +57,105 @@ pub struct PeerManager {
     word_index: Mutex<HashMap<String, PeerId>>,
 }
 
+/// One local GUI viewing a proxied pane, plus its declared terminal size (used
+/// for smallest-wins upstream reconciliation).
+struct Viewer {
+    data_tx: mpsc::Sender<ServerMessage>,
+    size: TermSize,
+}
+
+/// A proxied pane: the local viewers sharing it, a [`CellGrid`] mirror fed from
+/// the upstream stream (so a late local attacher can be served a snapshot with no
+/// upstream round-trip), the upstream seqno the mirror is current to, and the
+/// effective size last requested upstream.
+struct ProxiedPane {
+    viewers: HashMap<ClientId, Viewer>,
+    mirror: CellGrid,
+    /// Upstream seqno the mirror reflects; stamped onto minted snapshots so a late
+    /// attacher's subsequent diffs line up without a spurious gap.
+    last_seqno: SequenceNo,
+    /// Effective size (smallest-wins over `viewers`) last sent upstream; lets us
+    /// suppress redundant upstream `Resize`s.
+    upstream_size: TermSize,
+}
+
+impl ProxiedPane {
+    fn new(size: TermSize) -> Self {
+        Self {
+            viewers: HashMap::new(),
+            mirror: CellGrid::new(size.rows.max(1) as usize, size.cols.max(1) as usize),
+            last_seqno: SequenceNo(0),
+            upstream_size: size,
+        }
+    }
+
+    /// Smallest-wins size across all viewers (mirrors `kmuxd`'s `effective_size`).
+    /// Zero dims are ignored; pixel dims are not reconciled (the remote sizes by
+    /// rows/cols).
+    fn effective_size(&self) -> TermSize {
+        let rows = self
+            .viewers
+            .values()
+            .map(|v| v.size.rows)
+            .filter(|&r| r > 0)
+            .min()
+            .unwrap_or(0);
+        let cols = self
+            .viewers
+            .values()
+            .map(|v| v.size.cols)
+            .filter(|&c| c > 0)
+            .min()
+            .unwrap_or(0);
+        TermSize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+
+    fn viewer_senders(&self) -> Vec<mpsc::Sender<ServerMessage>> {
+        self.viewers.values().map(|v| v.data_tx.clone()).collect()
+    }
+
+    /// Feed an inbound (already-local-addressed) pane frame into the mirror.
+    fn apply_to_mirror(&mut self, msg: &ServerMessage) {
+        match msg {
+            ServerMessage::TerminalSnapshot {
+                snapshot, seqno, ..
+            } => {
+                self.mirror.apply_snapshot(snapshot.clone());
+                self.last_seqno = *seqno;
+            }
+            ServerMessage::TerminalUpdate { diff, seqno, .. } => {
+                self.mirror.apply_diff((**diff).clone());
+                self.last_seqno = *seqno;
+            }
+            ServerMessage::CursorUpdate {
+                cursor,
+                modes,
+                seqno,
+                ..
+            } => {
+                self.mirror.apply_cursor_update(*cursor, *modes);
+                self.last_seqno = *seqno;
+            }
+            ServerMessage::ScrollbackAppend {
+                first_index,
+                lines,
+                seqno,
+                ..
+            } => {
+                self.mirror
+                    .apply_scrollback_append(*first_index, lines.clone());
+                self.last_seqno = *seqno;
+            }
+            _ => {}
+        }
+    }
+}
+
 /// One upstream connection to a remote `kmuxd` and the local state proxying it.
 struct PeerConnection {
     /// Upstream sink: send `ClientMessage`s to the remote daemon.
@@ -67,8 +167,8 @@ struct PeerConnection {
     /// Proxied sessions keyed by local word, already localized (local IDs +
     /// peer-decorated name) for [`ServerApp::list_sessions`].
     sessions: HashMap<String, SessionEntry>,
-    /// Local viewers of each proxied pane: `local_pane_id -> {client_id -> data_tx}`.
-    viewers: HashMap<String, HashMap<ClientId, mpsc::Sender<ServerMessage>>>,
+    /// Proxied panes that have at least one local viewer, keyed by local pane ID.
+    panes: HashMap<String, ProxiedPane>,
     /// The feed-loop task draining the upstream stream; aborted on close.
     feed_task: Option<JoinHandle<()>>,
 }
@@ -80,7 +180,7 @@ impl PeerConnection {
             remote_to_local: HashMap::new(),
             local_to_remote: HashMap::new(),
             sessions: HashMap::new(),
-            viewers: HashMap::new(),
+            panes: HashMap::new(),
             feed_task: None,
         }
     }
@@ -107,35 +207,24 @@ impl PeerConnection {
         Some(format!("{local_word}/{idx}"))
     }
 
-    fn add_viewer(
-        &mut self,
-        local_pane_id: &str,
-        client_id: ClientId,
-        data_tx: mpsc::Sender<ServerMessage>,
-    ) {
-        self.viewers
-            .entry(local_pane_id.to_string())
-            .or_default()
-            .insert(client_id, data_tx);
-    }
-
-    /// Remove a viewer; returns `true` if the pane now has no viewers left.
-    fn remove_viewer(&mut self, local_pane_id: &str, client_id: ClientId) -> bool {
-        if let Some(vs) = self.viewers.get_mut(local_pane_id) {
-            vs.remove(&client_id);
-            if vs.is_empty() {
-                self.viewers.remove(local_pane_id);
-                return true;
+    /// Recompute the smallest-wins size for `local_pane_id` and, if it differs
+    /// from what was last sent upstream, forward a single `Resize` to `remote_pane`.
+    fn reconcile_size(&mut self, local_pane_id: &str, remote_pane: &str) {
+        let new_size = match self.panes.get_mut(local_pane_id) {
+            Some(pane) => {
+                let eff = pane.effective_size();
+                if eff == pane.upstream_size {
+                    return;
+                }
+                pane.upstream_size = eff;
+                eff
             }
-        }
-        false
-    }
-
-    fn viewers_of(&self, local_pane_id: &str) -> Vec<mpsc::Sender<ServerMessage>> {
-        self.viewers
-            .get(local_pane_id)
-            .map(|m| m.values().cloned().collect())
-            .unwrap_or_default()
+            None => return,
+        };
+        let _ = self.client_tx.send(ClientMessage::Resize {
+            pane_id: remote_pane.to_string(),
+            size: new_size,
+        });
     }
 }
 
@@ -325,8 +414,11 @@ impl PeerManager {
         guard.client_tx.send(build(remote_pane)).is_ok()
     }
 
-    /// Register `data_tx` as a viewer of federated `local_pane_id` and forward an
-    /// `Attach` upstream. Returns `false` when the pane is not federated.
+    /// Register `data_tx` as a viewer of federated `local_pane_id`. The **first**
+    /// viewer of a pane forwards an `Attach` upstream (the remote streams a
+    /// snapshot back); a **later** viewer is served a snapshot minted from the live
+    /// mirror with **no upstream round-trip**, then the upstream size is reconciled
+    /// (smallest-wins). Returns `false` when the pane is not federated.
     pub fn attach_viewer(
         &self,
         local_pane_id: &str,
@@ -345,18 +437,63 @@ impl PeerManager {
         let Some(remote_word) = guard.local_to_remote.get(local_word).cloned() else {
             return false;
         };
-        guard.add_viewer(local_pane_id, client_id, data_tx);
         let remote_pane = format!("{remote_word}/{idx}");
-        let _ = guard.client_tx.send(ClientMessage::Attach {
-            pane_id: remote_pane,
-            last_seqno,
-            size,
-        });
+
+        if guard.panes.contains_key(local_pane_id) {
+            // Late viewer: mint from the mirror, register, then reconcile size.
+            let pane = guard.panes.get_mut(local_pane_id).unwrap();
+            let minted = ServerMessage::TerminalSnapshot {
+                pane_id: local_pane_id.to_string(),
+                snapshot: pane.mirror.to_snapshot(),
+                seqno: pane.last_seqno,
+                sent_at_ms: epoch_millis(),
+            };
+            let _ = data_tx.try_send(minted);
+            pane.viewers.insert(client_id, Viewer { data_tx, size });
+            guard.reconcile_size(local_pane_id, &remote_pane);
+        } else {
+            // First viewer: create the pane (mirror sized to the viewer) and
+            // forward Attach upstream; the remote's snapshot arrives via the feed
+            // loop and seeds the mirror.
+            let mut pane = ProxiedPane::new(size);
+            pane.viewers.insert(client_id, Viewer { data_tx, size });
+            guard.panes.insert(local_pane_id.to_string(), pane);
+            let _ = guard.client_tx.send(ClientMessage::Attach {
+                pane_id: remote_pane,
+                last_seqno,
+                size,
+            });
+        }
         true
     }
 
-    /// Remove `client_id` as a viewer of federated `local_pane_id`; when it was
-    /// the last viewer, forward a `Detach` upstream so the remote stops streaming.
+    /// Update `client_id`'s declared size for federated `local_pane_id` and
+    /// reconcile the smallest-wins size upstream. Returns `false` when the pane is
+    /// not federated.
+    pub fn resize_viewer(&self, local_pane_id: &str, client_id: ClientId, size: TermSize) -> bool {
+        let Some((local_word, idx)) = split_pane_id(local_pane_id) else {
+            return false;
+        };
+        let Some(conn) = self.conn_for_word(local_word) else {
+            return false;
+        };
+        let mut guard = conn.lock().unwrap();
+        let Some(remote_word) = guard.local_to_remote.get(local_word).cloned() else {
+            return false;
+        };
+        if let Some(pane) = guard.panes.get_mut(local_pane_id)
+            && let Some(viewer) = pane.viewers.get_mut(&client_id)
+        {
+            viewer.size = size;
+        }
+        let remote_pane = format!("{remote_word}/{idx}");
+        guard.reconcile_size(local_pane_id, &remote_pane);
+        true
+    }
+
+    /// Remove `client_id` as a viewer of federated `local_pane_id`. When it was the
+    /// **last** viewer, forward a `Detach` upstream and drop the mirror; otherwise
+    /// reconcile the upstream size (a departing viewer may have been the smallest).
     pub fn detach_viewer(&self, local_pane_id: &str, client_id: ClientId) {
         let Some((local_word, idx)) = split_pane_id(local_pane_id) else {
             return;
@@ -365,13 +502,24 @@ impl PeerManager {
             return;
         };
         let mut guard = conn.lock().unwrap();
-        if guard.remove_viewer(local_pane_id, client_id)
-            && let Some(remote_word) = guard.local_to_remote.get(local_word).cloned()
-        {
-            let remote_pane = format!("{remote_word}/{idx}");
+        let Some(remote_word) = guard.local_to_remote.get(local_word).cloned() else {
+            return;
+        };
+        let remote_pane = format!("{remote_word}/{idx}");
+        let became_empty = match guard.panes.get_mut(local_pane_id) {
+            Some(pane) => {
+                pane.viewers.remove(&client_id);
+                pane.viewers.is_empty()
+            }
+            None => return,
+        };
+        if became_empty {
+            guard.panes.remove(local_pane_id);
             let _ = guard.client_tx.send(ClientMessage::Detach {
                 pane_id: remote_pane,
             });
+        } else {
+            guard.reconcile_size(local_pane_id, &remote_pane);
         }
     }
 
@@ -397,18 +545,27 @@ fn spawn_feed_loop(
                 continue;
             }
 
-            // Only pane-scoped frames are proxied in PR3. Session-scoped events
-            // (titles, layout, lifecycle) are forwarded in PR4.
+            // Only pane-scoped frames are proxied here. Session-scoped events
+            // (titles, layout, lifecycle) are forwarded with multi-viewer support
+            // in a later step.
             let Some(remote_pane) = msg_pane_id(&msg).map(str::to_string) else {
                 continue;
             };
 
+            // Translate the pane ID remote→local, feed the pane's mirror (so a late
+            // local attacher can be served from it), then collect its viewers.
             let viewers = {
-                let guard = conn.lock().unwrap();
+                let mut guard = conn.lock().unwrap();
                 match guard.to_local_pane(&remote_pane) {
                     Some(local_pane) => {
                         set_msg_pane_id(&mut msg, local_pane.clone());
-                        guard.viewers_of(&local_pane)
+                        match guard.panes.get_mut(&local_pane) {
+                            Some(pane) => {
+                                pane.apply_to_mirror(&msg);
+                                pane.viewer_senders()
+                            }
+                            None => Vec::new(),
+                        }
                     }
                     None => Vec::new(),
                 }
@@ -620,19 +777,73 @@ mod tests {
         );
     }
 
+    fn sz(rows: u16, cols: u16) -> TermSize {
+        TermSize {
+            rows,
+            cols,
+            pixel_width: 0,
+            pixel_height: 0,
+        }
+    }
+
     #[test]
-    fn viewer_registration_tracks_last_viewer() {
-        let (tx, _rx) = mpsc::unbounded_channel();
-        let mut conn = PeerConnection::new(tx);
+    fn proxied_pane_effective_size_is_smallest_wins() {
+        let mut pane = ProxiedPane::new(sz(24, 80));
         let (d1, _r1) = mpsc::channel(8);
         let (d2, _r2) = mpsc::channel(8);
-        conn.add_viewer("hawk/0", ClientId(1), d1);
-        conn.add_viewer("hawk/0", ClientId(2), d2);
-        assert_eq!(conn.viewers_of("hawk/0").len(), 2);
-        // Removing one viewer is not the last; removing the second is.
-        assert!(!conn.remove_viewer("hawk/0", ClientId(1)));
-        assert!(conn.remove_viewer("hawk/0", ClientId(2)));
-        assert!(conn.viewers_of("hawk/0").is_empty());
+        pane.viewers.insert(
+            ClientId(1),
+            Viewer {
+                data_tx: d1,
+                size: sz(24, 80),
+            },
+        );
+        pane.viewers.insert(
+            ClientId(2),
+            Viewer {
+                data_tx: d2,
+                size: sz(10, 40),
+            },
+        );
+        // Smallest-wins across viewers (the size forwarded upstream).
+        let eff = pane.effective_size();
+        assert_eq!((eff.rows, eff.cols), (10, 40));
+        assert_eq!(pane.viewer_senders().len(), 2);
+    }
+
+    #[test]
+    fn proxied_pane_mirror_round_trips_for_late_attach() {
+        let mut pane = ProxiedPane::new(sz(1, 1));
+        let mut cells = vec![kmux_protocol::messages::CellState::default(); 3];
+        cells[0].c = 'X';
+        cells[1].c = 'Y';
+        cells[2].c = 'Z';
+        let msg = ServerMessage::TerminalSnapshot {
+            pane_id: "hawk/0".to_string(),
+            snapshot: GridSnapshot {
+                rows: 1,
+                cols: 3,
+                cells,
+                cursor: Default::default(),
+                modes: kmux_protocol::messages::TermModes::EMPTY,
+                history_total: 0,
+                scrollback_base: 0,
+                scrollback_tail: vec![],
+            },
+            seqno: SequenceNo(7),
+            sent_at_ms: 0,
+        };
+        pane.apply_to_mirror(&msg);
+        // The mirror tracks the upstream seqno (stamped onto a minted snapshot so a
+        // late attacher's later diffs line up)…
+        assert_eq!(pane.last_seqno, SequenceNo(7));
+        // …and a snapshot minted from the mirror carries the applied content.
+        let minted = pane.mirror.to_snapshot();
+        let text: String = minted.cells.iter().map(|c| c.c).collect();
+        assert!(
+            text.contains("XYZ"),
+            "minted snapshot must carry mirror content: {text:?}"
+        );
     }
 
     #[test]

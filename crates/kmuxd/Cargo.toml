@@ -21,7 +21,7 @@ path = "src/main.rs"
 # which also keeps the upstream-connect machinery off any build that doesn't
 # need it. See docs/architecture-federation.md.
 default = ["federation"]
-federation = ["dep:kmux-connect"]
+federation = ["dep:kmux-connect", "dep:kmux-client"]
 
 [dependencies]
 kmux-pty.workspace = true
@@ -30,6 +30,11 @@ kmux-protocol = { workspace = true, features = ["framing", "tls", "quic", "tcp-t
 # the `federation` feature; `kmux-connect` depends solely on `kmux-protocol`, so
 # this adds no dependency cycle.
 kmux-connect = { workspace = true, optional = true }
+# Federation reuses the client-side `CellGrid` as the proxied-pane mirror (apply
+# upstream snapshots/diffs, mint a snapshot for a late local attacher via
+# `to_snapshot()`). `kmux-client` depends on `kmux-protocol`, never on `kmuxd`, so
+# no cycle. Also a dev-dependency (handoff_e2e); harmless overlap.
+kmux-client = { workspace = true, optional = true }
 daemonize.workspace = true
 nix.workspace = true
 serde.workspace = true

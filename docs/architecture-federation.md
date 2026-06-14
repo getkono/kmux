@@ -1,8 +1,10 @@
 # Daemon federation (issue #121)
 
-Status: **PR3 landed — one GUI attaches to a remote session through the local
-daemon, end-to-end (single viewer). Multi-GUI reconciliation (PR4) and GUI
-lean-down (PR5) remain.**
+Status: **PR3 + PR4 core landed — multiple GUIs share one proxied pane over a
+single upstream link, with smallest-wins sizing and zero-round-trip late attach.
+GUI lean-down (PR5), federation hardening (PR6), and the remaining reconciliation
+facets (pause-union, capability merge, input-lock, session-event forwarding)
+remain.**
 
 ## Goal
 
@@ -108,10 +110,26 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   `PeerManager`, never in `ServerApp.sessions`, so they are already excluded from the
   PTY-only persistence path — no `persist/` change was needed (the "ghost panes" risk in
   the design note below does not arise).
-- **PR4** — multi-GUI reconciliation: upstream pane size = `effective_size` (min over
-  local viewers); pause upstream only when **all** local viewers paused; capability
-  union upstream / filter downstream; input-lock arbitration across local viewers;
-  per-viewer snapshot minting via `to_snapshot()`.
+- **PR4 core — landed.** Multiple local GUIs share one proxied pane over a single
+  upstream link. Per-pane state grew from a flat viewer set to a `ProxiedPane`
+  holding per-viewer sizes, a `CellGrid` **mirror** (fed by the feed loop from
+  upstream snapshots/diffs/cursor/scrollback), and the upstream seqno + size:
+  - **smallest-wins sizing** — the upstream pane size is `min` over local viewers;
+    attach/resize/detach recompute it and forward **at most one** upstream `Resize`,
+    only when it changes (vs. PR3's verbatim per-client forwarding);
+  - **single upstream attach** — only the **first** viewer of a pane forwards `Attach`
+    upstream; the **last** to leave forwards `Detach`;
+  - **zero-round-trip late attach** — a second viewer is served a snapshot minted from
+    the live mirror via `to_snapshot()` (stamped with the mirror's seqno so its later
+    diffs line up), no upstream round-trip.
+  - Verified by `two_guis_share_one_proxied_pane_with_smallest_wins` in
+    `federation_e2e.rs`: a smaller second viewer shrinks the shared pane (the larger
+    viewer receives a resized-down snapshot), and the late viewer sees the shared
+    content.
+- **PR4 remaining facets** (independent, lower-risk): pause upstream only when **all**
+  local viewers are paused (issue #68 interplay); capability union upstream / filter
+  downstream; input-lock arbitration across local viewers; and forwarding
+  session-scoped events (titles, layout, lifecycle) to viewers.
 - **PR5** — lean the GUI: always UDS-local to `kmuxd`; the parsed `--server` target
   becomes an `OpenPeer`; feature-gate `quinn`/`rustls`/`ssh` **out** of the GUI build
   (they move to `kmuxd`'s peer role). CI check the GUI no longer links the net stack.
