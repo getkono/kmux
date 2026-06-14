@@ -13,6 +13,9 @@ hk = "1.48.0"
 # Mutation testing (`mise run mutants`). Pinned so local and CI sweeps mutate
 # against an identical cargo-mutants version.
 "cargo:cargo-mutants" = "27.1.0"
+# Line-count reporting (`mise run loc`). aqua backend ships prebuilt binaries
+# (like git-cliff above), so no source build. Pinned for stable counts.
+"aqua:XAMPPRocky/tokei" = "12.1.2"
 
 [settings]
 # Required for the `[hooks]` block below (mise gates hooks behind this flag).
@@ -92,6 +95,14 @@ run = "cargo doc --no-deps --all-features"
 [tasks.doc-test]
 description = "Run doc tests"
 run = "cargo test --doc --all-features"
+
+[tasks.loc]
+description = "Count lines of our own code + docs (tokei)"
+# Reports the code/docs we actually wrote. tokei already honors .gitignore (so
+# target/ and the generated swift bindings drop out); we additionally exclude
+# the ghostty submodule (vendored library) and crates/kmuxd/src/eff_long_wordlist.txt
+# (the EFF diceware wordlist — third-party data, not code we maintain).
+run = "tokei --exclude vendor --exclude crates/kmuxd/src/eff_long_wordlist.txt"
 
 [tasks.tail-client-log]
 description = "Tail the client log (kmux)"
