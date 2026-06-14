@@ -53,6 +53,49 @@ pub struct ClientCapabilities {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ClientId(pub u64);
 
+/// Stable identifier for a federated peer daemon (issue #121), derived from its
+/// [`PeerTarget`]: `"user@host"`, suffixed with `":port"` when a non-default SSH
+/// port is set, or bare `"host"` when no user is given. Used to address a peer
+/// in `ClosePeer` and to label the sessions it contributes.
+pub type PeerId = String;
+
+/// Addressing for a remote `kmuxd` the local daemon should federate to
+/// (issue #121). The local daemon opens **one** upstream connection per distinct
+/// `PeerTarget` and proxies that peer's sessions to local GUIs.
+///
+/// This is the protocol-level mirror of `kmux_connect`'s `RemoteTarget` plus
+/// `accept_invalid_certs`; the daemon maps it onto the connect mechanism. The
+/// handshake always flows over SSH (`kmuxd probe-or-start`), so only SSH
+/// addressing is carried here.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PeerTarget {
+    /// SSH user (e.g. `alice` in `alice@box`); `None` uses the SSH default.
+    pub user: Option<String>,
+    /// Remote host: a hostname, IP, or `~/.ssh/config` alias.
+    pub host: String,
+    /// SSH port override; `None` = the SSH default (usually 22).
+    pub ssh_port: Option<u16>,
+    /// Accept a self-signed / unpinned TLS certificate on the data plane.
+    pub accept_invalid_certs: bool,
+}
+
+impl PeerTarget {
+    /// The stable [`PeerId`] for this target: `"user@host"`, suffixed with
+    /// `":port"` when `ssh_port` is set, or bare `"host"` when no user is given.
+    /// `accept_invalid_certs` is deliberately excluded — it is policy, not
+    /// identity (the same host reached with either cert policy is one peer).
+    pub fn peer_id(&self) -> PeerId {
+        let base = match &self.user {
+            Some(u) => format!("{u}@{}", self.host),
+            None => self.host.clone(),
+        };
+        match self.ssh_port {
+            Some(p) => format!("{base}:{p}"),
+            None => base,
+        }
+    }
+}
+
 /// Monotonic sequence number attached to each PTY output chunk per pane.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 pub struct SequenceNo(pub u64);
@@ -336,6 +379,44 @@ mod tests {
         assert_eq!(d.cols, 80);
         assert_eq!(d.pixel_width, 0);
         assert_eq!(d.pixel_height, 0);
+    }
+
+    #[test]
+    fn peer_target_peer_id_and_roundtrip() {
+        let t = PeerTarget {
+            user: Some("alice".into()),
+            host: "box".into(),
+            ssh_port: Some(2222),
+            accept_invalid_certs: true,
+        };
+        // user@host:port when a port override is set.
+        assert_eq!(t.peer_id(), "alice@box:2222");
+        // No user, default port -> bare host.
+        assert_eq!(
+            PeerTarget {
+                user: None,
+                host: "srv".into(),
+                ssh_port: None,
+                accept_invalid_certs: false,
+            }
+            .peer_id(),
+            "srv"
+        );
+        // User, default port -> user@host (no :port suffix).
+        assert_eq!(
+            PeerTarget {
+                user: Some("bob".into()),
+                host: "h".into(),
+                ssh_port: None,
+                accept_invalid_certs: false,
+            }
+            .peer_id(),
+            "bob@h"
+        );
+
+        let bytes = postcard::to_allocvec(&t).expect("serialize");
+        let decoded: PeerTarget = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded, t);
     }
 
     #[test]

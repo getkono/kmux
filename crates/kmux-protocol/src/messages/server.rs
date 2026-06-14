@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use super::category::MessageCategory;
 use super::session::{
-    ClientId, ConnectionId, DirEntry, ErrorCode, LayoutNode, PaneId, PaneInfo, RequestId,
+    ClientId, ConnectionId, DirEntry, ErrorCode, LayoutNode, PaneId, PaneInfo, PeerId, RequestId,
     SequenceNo, SessionEntry, SessionEventMsg, TabIndex, TabInfo, WordId,
 };
 use super::types::Compression;
@@ -222,6 +222,25 @@ pub enum ServerMessage {
         /// denied); `None` on success.
         error: Option<String>,
     },
+
+    /// Acknowledges a successful [`super::client::ClientMessage::OpenPeer`]
+    /// (issue #121). The peer's sessions arrive via the normal session-list
+    /// flow (a follow-up `SessionListResult` / `Event`s), each under a
+    /// locally-assigned `word_id`; `peer` echoes the federated peer's id so the
+    /// client can label them.
+    PeerOpened { request_id: RequestId, peer: PeerId },
+
+    /// Acknowledges a [`super::client::ClientMessage::ClosePeer`]: the peer's
+    /// sessions have been removed from this client's list.
+    PeerClosed { request_id: RequestId, peer: PeerId },
+
+    /// A federation request failed (could not reach or authenticate the peer,
+    /// or a protocol-version mismatch). `peer` is the target id when known.
+    PeerError {
+        request_id: RequestId,
+        peer: Option<PeerId>,
+        reason: String,
+    },
 }
 
 impl ServerMessage {
@@ -252,7 +271,10 @@ impl ServerMessage {
             | Self::InputLockGranted { .. }
             | Self::InputLockDenied { .. }
             | Self::InputLockReleased { .. }
-            | Self::DirectoryListing { .. } => MessageCategory::Control,
+            | Self::DirectoryListing { .. }
+            | Self::PeerOpened { .. }
+            | Self::PeerClosed { .. }
+            | Self::PeerError { .. } => MessageCategory::Control,
             Self::Lagged { .. } | Self::SyncReset { .. } => MessageCategory::Sync,
             Self::AuthResult { .. } | Self::ChannelSwitched { .. } => MessageCategory::Bootstrap,
         }
@@ -535,6 +557,28 @@ mod tests {
                 },
                 MessageCategory::Control,
             ),
+            (
+                ServerMessage::PeerOpened {
+                    request_id: 0,
+                    peer: "box".into(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::PeerClosed {
+                    request_id: 0,
+                    peer: "box".into(),
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::PeerError {
+                    request_id: 0,
+                    peer: Some("box".into()),
+                    reason: "nope".into(),
+                },
+                MessageCategory::Control,
+            ),
         ];
         for (msg, expected) in &cases {
             assert_eq!(msg.category(), *expected, "wrong category for {msg:?}");
@@ -603,6 +647,41 @@ mod tests {
                 assert!(error.unwrap().contains("Permission denied"));
             }
             other => panic!("expected DirectoryListing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_messages_roundtrip() {
+        let opened = ServerMessage::PeerOpened {
+            request_id: 3,
+            peer: "alice@box".into(),
+        };
+        let bytes = crate::encode_server(&opened).unwrap();
+        match crate::decode_server(&bytes).unwrap() {
+            ServerMessage::PeerOpened { request_id, peer } => {
+                assert_eq!(request_id, 3);
+                assert_eq!(peer, "alice@box");
+            }
+            other => panic!("expected PeerOpened, got {other:?}"),
+        }
+
+        let err = ServerMessage::PeerError {
+            request_id: 4,
+            peer: Some("alice@box".into()),
+            reason: "version mismatch".into(),
+        };
+        let bytes = crate::encode_server(&err).unwrap();
+        match crate::decode_server(&bytes).unwrap() {
+            ServerMessage::PeerError {
+                request_id,
+                peer,
+                reason,
+            } => {
+                assert_eq!(request_id, 4);
+                assert_eq!(peer.as_deref(), Some("alice@box"));
+                assert_eq!(reason, "version mismatch");
+            }
+            other => panic!("expected PeerError, got {other:?}"),
         }
     }
 }

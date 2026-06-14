@@ -1,8 +1,8 @@
 use super::category::MessageCategory;
 use super::key::KeyEvent;
 use super::session::{
-    ClientCapabilities, ConnectionId, LayoutScheme, PaneId, RequestId, SequenceNo, SplitDir,
-    TabIndex, TermSize, WordId,
+    ClientCapabilities, ConnectionId, LayoutScheme, PaneId, PeerId, PeerTarget, RequestId,
+    SequenceNo, SplitDir, TabIndex, TermSize, WordId,
 };
 
 /// Messages sent from client -> server.
@@ -257,6 +257,22 @@ pub enum ClientMessage {
     /// sensible default (the user's home directory, else `"."`). The daemon
     /// replies with [`super::server::ServerMessage::DirectoryListing`].
     ListDirectory { request_id: RequestId, path: String },
+
+    /// Federate a remote `kmuxd` (issue #121): the local daemon opens (or
+    /// reuses) one upstream connection to `target` and surfaces that peer's
+    /// sessions in this client's session list (each under a locally-assigned
+    /// `word_id`). Reply: [`super::server::ServerMessage::PeerOpened`] on
+    /// success, [`super::server::ServerMessage::PeerError`] on failure.
+    OpenPeer {
+        request_id: RequestId,
+        target: PeerTarget,
+    },
+
+    /// Stop federating the peer identified by `peer` ([`PeerTarget::peer_id`]):
+    /// the daemon drops the upstream connection once this was its last local
+    /// viewer and removes the peer's sessions from the list. Reply:
+    /// [`super::server::ServerMessage::PeerClosed`].
+    ClosePeer { request_id: RequestId, peer: PeerId },
 }
 
 impl ClientMessage {
@@ -293,7 +309,9 @@ impl ClientMessage {
             | Self::ReleaseInputLock { .. }
             | Self::SetSnapshotMode { .. }
             | Self::SetPaused { .. }
-            | Self::ListDirectory { .. } => MessageCategory::Control,
+            | Self::ListDirectory { .. }
+            | Self::OpenPeer { .. }
+            | Self::ClosePeer { .. } => MessageCategory::Control,
             Self::Auth { .. } | Self::ChannelReady => MessageCategory::Bootstrap,
         }
     }
@@ -674,6 +692,25 @@ mod tests {
                 },
                 MessageCategory::Control,
             ),
+            (
+                ClientMessage::OpenPeer {
+                    request_id: 0,
+                    target: PeerTarget {
+                        user: None,
+                        host: "box".into(),
+                        ssh_port: None,
+                        accept_invalid_certs: false,
+                    },
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::ClosePeer {
+                    request_id: 0,
+                    peer: "box".into(),
+                },
+                MessageCategory::Control,
+            ),
         ];
         for (msg, expected) in cases {
             assert_eq!(msg.category(), *expected, "wrong category for {msg:?}");
@@ -705,6 +742,41 @@ mod tests {
                 assert_eq!(path, "/home/user/dev");
             }
             other => panic!("expected ListDirectory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_peer_and_close_peer_roundtrip() {
+        let open = ClientMessage::OpenPeer {
+            request_id: 9,
+            target: PeerTarget {
+                user: Some("alice".into()),
+                host: "box".into(),
+                ssh_port: Some(2222),
+                accept_invalid_certs: true,
+            },
+        };
+        let bytes = crate::encode_client(&open).unwrap();
+        match crate::decode_client(&bytes).unwrap() {
+            ClientMessage::OpenPeer { request_id, target } => {
+                assert_eq!(request_id, 9);
+                assert_eq!(target.peer_id(), "alice@box:2222");
+                assert!(target.accept_invalid_certs);
+            }
+            other => panic!("expected OpenPeer, got {other:?}"),
+        }
+
+        let close = ClientMessage::ClosePeer {
+            request_id: 10,
+            peer: "alice@box:2222".into(),
+        };
+        let bytes = crate::encode_client(&close).unwrap();
+        match crate::decode_client(&bytes).unwrap() {
+            ClientMessage::ClosePeer { request_id, peer } => {
+                assert_eq!(request_id, 10);
+                assert_eq!(peer, "alice@box:2222");
+            }
+            other => panic!("expected ClosePeer, got {other:?}"),
         }
     }
 }

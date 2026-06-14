@@ -103,6 +103,15 @@ impl ScrollbackBuffer {
         self.lines.is_empty()
     }
 
+    /// All currently held scrollback lines, oldest-first (cloned).
+    ///
+    /// The first line's absolute index is `base_index()` (equivalently
+    /// `history_total() - len()`), so this pairs with `history_total()` and
+    /// `base_index()` to fill the scrollback fields of a `GridSnapshot`.
+    pub fn tail(&self) -> Vec<Vec<CellState>> {
+        self.lines.iter().cloned().collect()
+    }
+
     /// Get a scrollback line by buffer-local index.
     pub fn get(&self, index: usize) -> Option<&Vec<CellState>> {
         self.lines.get(index)
