@@ -661,6 +661,13 @@ impl SessionManager {
                     self.record_rtt_to_supervisor(rtt_ms);
                 }
             }
+
+            // Federation responses (issue #121). The local client only receives
+            // these once it issues `OpenPeer` (a later stage); for now there is
+            // nothing to reconcile, so they are accepted and ignored.
+            ServerMessage::PeerOpened { .. }
+            | ServerMessage::PeerClosed { .. }
+            | ServerMessage::PeerError { .. } => {}
         }
         events
     }

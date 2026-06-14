@@ -559,6 +559,22 @@ pub async fn handle_message<A: PaneAttacher>(
             state.send(list_directory(request_id, &path));
         }
 
+        ClientMessage::OpenPeer { request_id, target } => {
+            // Federation wiring lands in a later stage (issue #121). Until then a
+            // forward-built client gets an explicit rejection rather than silence,
+            // so it can surface the error instead of hanging on the request.
+            state.send(ServerMessage::PeerError {
+                request_id,
+                peer: Some(target.peer_id()),
+                reason: "federation is not supported by this daemon yet".to_string(),
+            });
+        }
+
+        ClientMessage::ClosePeer { request_id, peer } => {
+            // Nothing is federated yet, so closing a peer is a no-op success.
+            state.send(ServerMessage::PeerClosed { request_id, peer });
+        }
+
         ClientMessage::Ping { seq } => {
             state.send(ServerMessage::Pong { seq });
         }

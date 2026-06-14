@@ -73,7 +73,10 @@ impl TransportKind {
 /// - **23**: per-frame compression — `AuthResult.compression` and the
 ///   self-describing frame codec tag.
 /// - **24**: connection pausing — `ClientMessage::SetPaused` (issue #68).
-pub const PROTOCOL_VERSION: u32 = 24;
+/// - **25**: daemon federation — `ClientMessage::OpenPeer`/`ClosePeer`,
+///   `ServerMessage::PeerOpened`/`PeerClosed`/`PeerError`, and the `PeerTarget`
+///   addressing struct (issue #121).
+pub const PROTOCOL_VERSION: u32 = 25;
 
 /// Wire compression algorithm negotiated for a connection.
 ///
