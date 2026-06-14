@@ -11,6 +11,16 @@ use tokio::sync::mpsc;
 use super::helpers::parse_pane_id;
 use super::{ClientSender, ServerApp};
 
+/// Maximum number of buffered diffs to replay on a delta attach/resume before
+/// coalescing to a single snapshot instead (issue #68).
+pub(super) const MAX_RESUME_DELTA_DIFFS: usize = 256;
+
+/// Maximum estimated byte size of buffered diffs to replay on a delta
+/// attach/resume before coalescing to a single snapshot instead. A grid
+/// snapshot is on the order of low tens of KiB, so once the pending delta
+/// exceeds this a snapshot is almost always the cheaper catch-up.
+pub(super) const MAX_RESUME_DELTA_BYTES: usize = 256 * 1024;
+
 /// Parameters for [`ServerApp::attach`].
 pub struct AttachParams {
     pub pane_id: String,
@@ -23,6 +33,7 @@ pub struct AttachParams {
 }
 
 /// Result of an attach operation describing what replay data to send.
+#[derive(Debug)]
 pub enum AttachResult {
     /// Fresh attach or first-time connect: full grid snapshot from TermState.
     FullSnapshot(GridSnapshot, SequenceNo),
@@ -36,6 +47,55 @@ pub enum AttachResult {
 pub enum InputLockOutcome {
     Granted,
     Denied(ClientId),
+}
+
+/// Compute the catch-up payload for an attach/resume from a pane's relay state.
+///
+/// - `None` last_seqno (fresh attach) → full snapshot.
+/// - `Some(seq)` within the scrollback buffer → delta replay of the missed
+///   diffs, unless they exceed the coalescing threshold (e.g. after a long
+///   pause), in which case a single final-state snapshot (`SyncReset`) is sent.
+/// - `Some(seq)` older than the buffer → `SyncReset` with a fresh snapshot.
+pub(super) fn compute_replay(
+    relay: &super::PaneRelay,
+    last_seqno: Option<SequenceNo>,
+) -> AttachResult {
+    let current_seqno = || {
+        SequenceNo(
+            relay
+                .seqno_counter
+                .load(Ordering::Relaxed)
+                .saturating_sub(1),
+        )
+    };
+    match last_seqno {
+        None => {
+            let snapshot = relay.term_state.lock().unwrap().snapshot();
+            AttachResult::FullSnapshot(snapshot, current_seqno())
+        }
+        Some(seq) => {
+            let buf = relay.scrollback.lock().unwrap();
+            match buf.oldest_seqno() {
+                Some(oldest) if seq >= oldest => {
+                    // Replay the missed diffs, unless they have piled up past the
+                    // coalescing threshold (e.g. after a long pause). In that case
+                    // send a single snapshot of the final state — catch-up cost
+                    // stays O(screen), not O(time paused).
+                    let (count, bytes) = buf.pending_stats(seq);
+                    if count > MAX_RESUME_DELTA_DIFFS || bytes > MAX_RESUME_DELTA_BYTES {
+                        let snapshot = relay.term_state.lock().unwrap().snapshot();
+                        AttachResult::SyncReset(snapshot, current_seqno())
+                    } else {
+                        AttachResult::Delta(buf.since(seq))
+                    }
+                }
+                _ => {
+                    let snapshot = relay.term_state.lock().unwrap().snapshot();
+                    AttachResult::SyncReset(snapshot, current_seqno())
+                }
+            }
+        }
+    }
 }
 
 impl ServerApp {
@@ -69,45 +129,30 @@ impl ServerApp {
                 name: pane_id.to_string(),
             })?;
 
-        let result = match last_seqno {
-            None => {
-                let snapshot = relay.term_state.lock().unwrap().snapshot();
-                let current_seqno = SequenceNo(
-                    relay
-                        .seqno_counter
-                        .load(Ordering::Relaxed)
-                        .saturating_sub(1),
-                );
-                AttachResult::FullSnapshot(snapshot, current_seqno)
-            }
-            Some(seq) => {
-                let buf = relay.scrollback.lock().unwrap();
-                match buf.oldest_seqno() {
-                    Some(oldest) if seq >= oldest => AttachResult::Delta(buf.since(seq)),
-                    _ => {
-                        let snapshot = relay.term_state.lock().unwrap().snapshot();
-                        let current_seqno = SequenceNo(
-                            relay
-                                .seqno_counter
-                                .load(Ordering::Relaxed)
-                                .saturating_sub(1),
-                        );
-                        AttachResult::SyncReset(snapshot, current_seqno)
-                    }
-                }
-            }
-        };
+        let result = compute_replay(relay, last_seqno);
 
-        relay.clients.lock().unwrap().insert(
-            client_id,
-            ClientSender {
-                data_tx,
-                ctrl_tx,
-                force_full_snapshot: false,
-                capabilities,
-                size,
-            },
-        );
+        {
+            let mut clients = relay.clients.lock().unwrap();
+            // Preserve connection-level flags across a re-attach. Without this,
+            // a re-attach (reconnect, tab switch, resume) silently resets
+            // snapshot mode. A re-attach implies the client is live again, so
+            // `paused` is cleared — resume reconciliation flows through here.
+            let force_full_snapshot = clients
+                .get(&client_id)
+                .map(|s| s.force_full_snapshot)
+                .unwrap_or(false);
+            clients.insert(
+                client_id,
+                ClientSender {
+                    data_tx,
+                    ctrl_tx,
+                    force_full_snapshot,
+                    paused: false,
+                    capabilities,
+                    size,
+                },
+            );
+        }
         relay.recompute_live_capabilities();
 
         // Reconcile effective size after new client joined.
@@ -130,6 +175,22 @@ impl ServerApp {
                 let mut map = relay.clients.lock().unwrap();
                 if let Some(sender) = map.get_mut(&client_id) {
                     sender.force_full_snapshot = enabled;
+                }
+            }
+        }
+    }
+
+    /// Pause or resume terminal-output delivery for a client across all panes
+    /// (issue #68). While paused the relay skips this client; the pane keeps
+    /// running and the client keeps counting toward the effective pane size.
+    /// Resume reconciliation happens when the client re-attaches its panes.
+    pub async fn set_paused(&self, client_id: ClientId, paused: bool) {
+        let sessions = self.sessions.read().await;
+        for state in sessions.values() {
+            for relay in state.panes.values() {
+                let mut map = relay.clients.lock().unwrap();
+                if let Some(sender) = map.get_mut(&client_id) {
+                    sender.paused = paused;
                 }
             }
         }

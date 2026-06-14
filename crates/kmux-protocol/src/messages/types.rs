@@ -72,7 +72,8 @@ impl TransportKind {
 ///
 /// - **23**: per-frame compression — `AuthResult.compression` and the
 ///   self-describing frame codec tag.
-pub const PROTOCOL_VERSION: u32 = 23;
+/// - **24**: connection pausing — `ClientMessage::SetPaused` (issue #68).
+pub const PROTOCOL_VERSION: u32 = 24;
 
 /// Wire compression algorithm negotiated for a connection.
 ///
@@ -158,11 +159,7 @@ mod tests {
         assert_eq!(TransportKind::parse_cli("QUIC"), Some(TransportKind::Quic));
         assert_eq!(TransportKind::parse_cli("tcp"), Some(TransportKind::Tcp));
         for tls in ["tcp-tls", "tcptls", "tls", "TCP-TLS"] {
-            assert_eq!(
-                TransportKind::parse_cli(tls),
-                Some(TransportKind::TcpTls),
-                "{tls}"
-            );
+            assert_eq!(TransportKind::parse_cli(tls), Some(TransportKind::TcpTls), "{tls}");
         }
         for uds in ["uds", "unix", "local"] {
             assert_eq!(TransportKind::parse_cli(uds), Some(TransportKind::Uds), "{uds}");
