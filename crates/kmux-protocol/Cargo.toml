@@ -56,3 +56,5 @@ toml = { workspace = true, optional = true }
 tempfile.workspace = true
 # Used by the `compression_bench` example to sweep zstd levels offline.
 zstd.workspace = true
+# Round-trip tests for the JSON control/handoff protocol (control_rpc.rs).
+serde_json.workspace = true
