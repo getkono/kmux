@@ -103,6 +103,18 @@ pub enum DirBrowserRow {
     Enter { path: String, name: String },
 }
 
+/// Why the connection is paused, surfaced to frontends for a status indicator
+/// (issue #68).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PauseReason {
+    /// Not paused.
+    None,
+    /// Paused by an explicit user toggle.
+    Manual,
+    /// Auto-paused because the app window is backgrounded/minimized.
+    Auto,
+}
+
 /// Frontend-agnostic client view-model. See the module docs.
 pub struct AppCore {
     pub mgr: SessionManager,
@@ -139,6 +151,13 @@ pub struct AppCore {
     /// metrics overlay, this is a passive flag the frontends reconcile against.
     pub connection_overlay_visible: bool,
     pub force_snapshot_mode: bool,
+
+    /// Connection paused by an explicit user toggle (issue #68). Persists across
+    /// window focus changes — only another toggle clears it.
+    pub manual_pause: bool,
+    /// Connection auto-paused because the app window is backgrounded/minimized
+    /// (issue #68). Cleared automatically when the window returns to foreground.
+    pub auto_pause: bool,
 
     /// Whether the HUD shows the network-latency + rendering-FPS counters
     /// (issue #61). When `false`, the counters are hidden *and* their per-frame
@@ -296,6 +315,8 @@ impl AppCore {
             metrics_overlay_visible: false,
             connection_overlay_visible: false,
             force_snapshot_mode: false,
+            manual_pause: false,
+            auto_pause: false,
             show_perf_counters: crate::config::resolve_perf_counters(),
             render_frames: VecDeque::new(),
             pending_closes: Vec::new(),
@@ -334,6 +355,50 @@ impl AppCore {
     pub fn set_term_size(&mut self, size: TermSize) {
         self.term_size = size;
         self.mgr.update_term_size(size);
+    }
+
+    // ── Connection pause (issue #68) ──────────────────────────────────────────
+
+    /// Effective pause state: paused if either the user toggled it or the app
+    /// is auto-paused while backgrounded.
+    pub fn is_paused(&self) -> bool {
+        self.manual_pause || self.auto_pause
+    }
+
+    /// Why the connection is currently paused, for chrome indicators.
+    pub fn pause_reason(&self) -> PauseReason {
+        if self.manual_pause {
+            PauseReason::Manual
+        } else if self.auto_pause {
+            PauseReason::Auto
+        } else {
+            PauseReason::None
+        }
+    }
+
+    /// Apply the effective pause state to the connection when it changed,
+    /// re-attaching panes on resume (see [`SessionManager::set_paused`]).
+    fn reconcile_pause(&mut self, was_paused: bool) {
+        let now_paused = self.is_paused();
+        if now_paused != was_paused {
+            self.mgr.set_paused(now_paused);
+        }
+    }
+
+    /// Flip the manual pause toggle (the `TogglePause` action). A manual pause
+    /// persists across window focus changes.
+    pub fn toggle_manual_pause(&mut self) {
+        let was = self.is_paused();
+        self.manual_pause = !self.manual_pause;
+        self.reconcile_pause(was);
+    }
+
+    /// Set the auto-pause flag (driven by window background/foreground, with a
+    /// debounce in the driver). Independent of the manual toggle.
+    pub fn set_auto_pause(&mut self, on: bool) {
+        let was = self.is_paused();
+        self.auto_pause = on;
+        self.reconcile_pause(was);
     }
 
     // ── Performance counters (issue #61) ──────────────────────────────────────
@@ -402,6 +467,8 @@ impl AppCore {
             metrics_overlay_visible: false,
             connection_overlay_visible: false,
             force_snapshot_mode: false,
+            manual_pause: false,
+            auto_pause: false,
             show_perf_counters: true,
             render_frames: VecDeque::new(),
             pending_closes: Vec::new(),
@@ -466,6 +533,36 @@ mod tests {
     #[test]
     fn hud_default_follows_build_profile() {
         assert_eq!(new_local_core().hud_visible, cfg!(debug_assertions));
+    }
+
+    /// Pause has two independent sources (issue #68): a manual toggle and an
+    /// auto-pause while backgrounded. The effective state is their OR, a manual
+    /// pause persists across focus changes, and the reason favours Manual.
+    #[test]
+    fn pause_state_machine_manual_persists_across_focus() {
+        let mut core = new_local_core();
+        assert!(!core.is_paused());
+        assert_eq!(core.pause_reason(), PauseReason::None);
+
+        // Window backgrounded → auto-pause.
+        core.set_auto_pause(true);
+        assert!(core.is_paused());
+        assert_eq!(core.pause_reason(), PauseReason::Auto);
+
+        // User also toggles a manual pause.
+        core.toggle_manual_pause();
+        assert!(core.is_paused());
+        assert_eq!(core.pause_reason(), PauseReason::Manual);
+
+        // Window returns to foreground: auto clears, but the manual pause stays.
+        core.set_auto_pause(false);
+        assert!(core.is_paused(), "manual pause must survive foregrounding");
+        assert_eq!(core.pause_reason(), PauseReason::Manual);
+
+        // User toggles the manual pause off → fully resumed.
+        core.toggle_manual_pause();
+        assert!(!core.is_paused());
+        assert_eq!(core.pause_reason(), PauseReason::None);
     }
 
     /// FPS counts only real content repaints — a HUD-only self-refresh

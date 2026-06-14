@@ -33,6 +33,8 @@ final class KmuxModel: ObservableObject {
     @Published private(set) var softClosePending = false
     /// Whether the connection inspector sheet is open (issue #60).
     @Published private(set) var connectionVisible = false
+    /// Connection pause state for the menu check + indicator (issue #68).
+    @Published private(set) var pauseState: FfiPauseState = .active
 
     // ── Tiling render state (read by the terminal view each `draw`) ──
     /// The active tab's resolved pane rectangles (cells), recomputed each pump
@@ -116,6 +118,13 @@ final class KmuxModel: ObservableObject {
     /// Dispatch a curated action and apply its effects.
     func dispatch(_ action: FfiAction) {
         apply(driver.dispatch(action: action))
+    }
+
+    /// Report whether the app is backgrounded, for auto-pause (issue #68).
+    /// Driven by `scenePhase`; the driver debounces before pausing and resumes
+    /// immediately on foreground. A manual pause is unaffected.
+    func setWindowBackground(_ backgrounded: Bool) {
+        driver.setWindowBackground(backgrounded: backgrounded)
     }
 
     /// Run a `/`-command line and apply its effects.
@@ -325,6 +334,8 @@ final class KmuxModel: ObservableObject {
         if pendingClose != softClosePending { softClosePending = pendingClose }
         let conn = driver.connectionVisible()
         if conn != connectionVisible { connectionVisible = conn }
+        let ps = driver.pauseState()
+        if ps != pauseState { pauseState = ps }
     }
 
     // MARK: - Clipboard

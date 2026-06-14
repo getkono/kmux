@@ -93,6 +93,8 @@ fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
             &["<Ctrl><Shift>i"],
         ),
         ("snapshot", Action::ToggleSnapshotMode, &[]),
+        // Pause the connection to save bandwidth (issue #68); b = bandwidth.
+        ("toggle-pause", Action::TogglePause, &["<Ctrl><Shift>b"]),
         ("redraw", Action::ForceRedraw, &[]),
         ("scroll-page-up", Action::ScrollPageUp, &["<Shift>Page_Up"]),
         (
@@ -291,6 +293,7 @@ fn build_menu() -> gio::Menu {
 
     let s4 = gio::Menu::new();
     s4.append(Some("Lock Input"), Some("win.toggle-lock"));
+    s4.append(Some("Pause Connection"), Some("win.toggle-pause"));
     s4.append(Some("Performance HUD"), Some("win.toggle-hud"));
     s4.append(Some("Metrics"), Some("win.toggle-metrics"));
     s4.append(Some("Connection"), Some("win.toggle-connection"));

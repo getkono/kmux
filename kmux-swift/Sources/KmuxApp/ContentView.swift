@@ -180,6 +180,10 @@ struct KmuxCommands: Commands {
             Divider()
             Button("Reconnect") { model.dispatch(.reconnect) }
                 .keyboardShortcut("r")
+            // Pause the connection to save bandwidth (issue #68). Shows a check
+            // when paused (manual or auto); toggling clears a manual pause.
+            Toggle("Pause Connection", isOn: pauseBinding)
+                .keyboardShortcut("b", modifiers: [.command, .shift])
             Toggle("Performance HUD", isOn: hudBinding)
                 .keyboardShortcut("h", modifiers: [.command, .shift])
             Toggle("Metrics Inspector", isOn: metricsBinding)
@@ -260,6 +264,13 @@ struct KmuxCommands: Commands {
         Binding(
             get: { model.connectionVisible },
             set: { _ in model.dispatch(.toggleConnection) }
+        )
+    }
+
+    private var pauseBinding: Binding<Bool> {
+        Binding(
+            get: { model.pauseState != .active },
+            set: { _ in model.dispatch(.togglePause) }
         )
     }
 }

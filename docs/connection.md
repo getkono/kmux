@@ -2,6 +2,8 @@
 
 This document is the technical reference for the kmux connection subsystem as implemented across Phases 1–7. It covers the two-phase connection model, all bootstrap strategies, the transport supervisor, the wire format, server configuration, and the decision logic governing transport selection.
 
+> See also [connection-pause.md](connection-pause.md) for bandwidth-saving connection pausing (issue #68): how a paused client stops receiving terminal output and catches up to the final state on resume.
+
 > **Invariant (as of the SSH-strict change).** The production initial-connect and reconnect paths are SSH-only for remote targets: `kmux <user@host>` (or any non-empty server string) flows through `SshBootstrap`. The `QuicDirectBootstrap` and `TlsTcpDirectBootstrap` strategies still exist in `bootstrap.rs` and remain used by the post-auth `TransportSupervisor` for data-plane upgrades (e.g. SSH-bootstrapped session swaps to direct QUIC for performance), but they are not part of the initial handshake.
 >
 > Daemon data-plane ports (QUIC, TCP+TLS) are ephemeral — bound on port `0`, the OS assigns them, and they're advertised to the client in the SSH `probe-or-start` response. They never appear on a user-facing CLI surface. The only user-typeable port is the **SSH** port (`host:2222` or `--ssh-port 2222`).

@@ -227,6 +227,27 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     // shared grid. The modal overlays + HUD ride the shell's inner overlay until
     // they become native dialogs.
     let shell = shell::build(app, &drawing);
+
+    // Auto-pause the connection while the window is minimized (issue #68). The
+    // GdkSurface — whose toplevel carries the minimized state — only exists once
+    // the window is realized, so attach the watcher from `realize`. Focus loss
+    // alone does NOT pause (a visible-but-unfocused window keeps streaming); the
+    // driver debounces this so a quick minimize/restore does not thrash.
+    {
+        let fe = fe.clone();
+        shell.window.connect_realize(move |win| {
+            let Some(surface) = win.surface() else { return };
+            let Ok(toplevel) = surface.downcast::<gdk::Toplevel>() else {
+                return;
+            };
+            let fe = fe.clone();
+            toplevel.connect_state_notify(move |tl| {
+                let backgrounded = tl.state().contains(gdk::ToplevelState::MINIMIZED);
+                fe.borrow_mut().core.set_window_background(backgrounded);
+            });
+        });
+    }
+
     let dialogs = Rc::new(dialogs::build(&shell.overlay));
     header::wire(&shell, &fe, app);
     tabs::wire(&shell, &fe, app);

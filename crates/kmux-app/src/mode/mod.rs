@@ -150,6 +150,9 @@ pub enum Action {
     ToggleConnection,
     ToggleSnapshotMode,
     ToggleInputLock,
+    /// Toggle connection pause to save bandwidth (issue #68). Manual pauses
+    /// persist across window focus changes (auto-pause clears independently).
+    TogglePause,
 
     // Clipboard
     CopySelection,

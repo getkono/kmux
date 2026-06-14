@@ -49,7 +49,7 @@ use tokio::runtime::Runtime;
 use kmux_app::appearance::{Appearance, CellAdjust};
 use kmux_app::cmd;
 use kmux_app::config;
-use kmux_app::core::{AppCore, DirBrowserRow, TopBarAction};
+use kmux_app::core::{AppCore, DirBrowserRow, PauseReason, TopBarAction};
 use kmux_app::driver::{FrontendDriver, FrontendEffect};
 use kmux_app::mode::{Action, CommandState, Mode};
 use kmux_app::subcommands::parse_target;
@@ -71,7 +71,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 9;
+pub const KMUX_FFI_ABI_VERSION: u32 = 10;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -185,6 +185,8 @@ pub enum FfiAction {
     /// Toggle the connection inspector overlay (issue #60).
     ToggleConnection,
     ToggleInputLock,
+    /// Toggle connection pause to save bandwidth (issue #68).
+    TogglePause,
     CopySelection,
     Paste,
     Quit,
@@ -229,10 +231,33 @@ impl From<FfiAction> for Action {
             FfiAction::ToggleMetrics => Action::ToggleMetrics,
             FfiAction::ToggleConnection => Action::ToggleConnection,
             FfiAction::ToggleInputLock => Action::ToggleInputLock,
+            FfiAction::TogglePause => Action::TogglePause,
             FfiAction::CopySelection => Action::CopySelection,
             FfiAction::Paste => Action::Paste,
             FfiAction::Quit => Action::Quit,
             FfiAction::Reconnect => Action::Reconnect,
+        }
+    }
+}
+
+/// Connection pause state for a frontend status indicator (issue #68). Mirrors
+/// [`PauseReason`].
+#[derive(uniffi::Enum, Debug, PartialEq, Eq)]
+pub enum FfiPauseState {
+    /// Live — not paused.
+    Active,
+    /// Paused by an explicit user toggle.
+    PausedManual,
+    /// Auto-paused because the app is backgrounded/minimized.
+    PausedBackground,
+}
+
+impl From<PauseReason> for FfiPauseState {
+    fn from(r: PauseReason) -> Self {
+        match r {
+            PauseReason::None => FfiPauseState::Active,
+            PauseReason::Manual => FfiPauseState::PausedManual,
+            PauseReason::Auto => FfiPauseState::PausedBackground,
         }
     }
 }
@@ -1095,6 +1120,27 @@ impl KmuxDriver {
                 pixel_width,
                 pixel_height,
             });
+    }
+
+    /// Report whether the app is backgrounded/inactive, for auto-pause (issue
+    /// #68). Backgrounding arms a short debounce before the connection pauses;
+    /// foregrounding resumes immediately. Drive this from SwiftUI's `scenePhase`
+    /// (and/or `NSWindow.occlusionState`). A manual pause is unaffected.
+    pub fn set_window_background(&self, backgrounded: bool) {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .set_window_background(backgrounded);
+    }
+
+    /// Current connection pause state for a status indicator (issue #68).
+    pub fn pause_state(&self) -> FfiPauseState {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .core()
+            .pause_reason()
+            .into()
     }
 
     /// Cheap grid identity for change detection (`None` if no active pane).
@@ -2072,6 +2118,30 @@ mod tests {
         assert_eq!(tab_label(0, ""), "1");
         assert_eq!(tab_label(2, "   "), "3");
         assert_eq!(tab_label(0, "build"), "build");
+    }
+
+    #[test]
+    fn toggle_pause_action_maps_to_core_action() {
+        assert!(matches!(
+            Action::from(FfiAction::TogglePause),
+            Action::TogglePause
+        ));
+    }
+
+    #[test]
+    fn pause_state_maps_from_pause_reason() {
+        assert_eq!(
+            FfiPauseState::from(PauseReason::None),
+            FfiPauseState::Active
+        );
+        assert_eq!(
+            FfiPauseState::from(PauseReason::Manual),
+            FfiPauseState::PausedManual
+        );
+        assert_eq!(
+            FfiPauseState::from(PauseReason::Auto),
+            FfiPauseState::PausedBackground
+        );
     }
 
     #[test]

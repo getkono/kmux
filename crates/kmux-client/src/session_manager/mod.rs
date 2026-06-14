@@ -1565,4 +1565,52 @@ mod tests {
         );
         assert_eq!(mgr.pending_dir_request, Some(newest));
     }
+
+    #[test]
+    fn set_paused_sends_setpaused_and_resume_reattaches_visible_panes() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.visible_panes = vec!["eagle/0".to_string(), "eagle/1".to_string()];
+        mgr.pane_sync.insert(
+            "eagle/0".to_string(),
+            PaneSync::Synced {
+                expected: SequenceNo(5),
+            },
+        );
+
+        // Pause: a single SetPaused { paused: true }, no re-attach.
+        mgr.set_paused(true);
+        match rx.try_recv() {
+            Ok(ClientMessage::SetPaused { paused: true }) => {}
+            other => panic!("expected SetPaused {{ paused: true }}, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "pause must not detach or re-attach");
+
+        // Resume: SetPaused { paused: false } then a full-snapshot re-attach of
+        // every visible pane (last_seqno: None → daemon sends final state).
+        mgr.set_paused(false);
+        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            matches!(
+                msgs.first(),
+                Some(ClientMessage::SetPaused { paused: false })
+            ),
+            "resume must first clear the pause flag, got {msgs:?}"
+        );
+        let reattached: Vec<&str> = msgs
+            .iter()
+            .filter_map(|m| match m {
+                ClientMessage::Attach {
+                    pane_id,
+                    last_seqno: None,
+                    ..
+                } => Some(pane_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            reattached,
+            vec!["eagle/0", "eagle/1"],
+            "resume re-attaches every visible pane with a fresh snapshot"
+        );
+    }
 }

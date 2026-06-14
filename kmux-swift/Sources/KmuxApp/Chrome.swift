@@ -45,6 +45,17 @@ struct ConnectionBadge: View {
                 .foregroundStyle(
                     model.connection.transportOverridden
                         ? AnyShapeStyle(.orange) : AnyShapeStyle(.secondary))
+            // Pause indicator (issue #68): the stream is intentionally stopped.
+            if model.pauseState != .active {
+                Label(
+                    model.pauseState == .pausedBackground ? "Paused (background)" : "Paused",
+                    systemImage: "pause.circle.fill"
+                )
+                .labelStyle(.titleAndIcon)
+                .font(.caption)
+                .foregroundStyle(.orange)
+                .help("Connection paused to save bandwidth")
+            }
         }
         .contentShape(Rectangle())
         .onTapGesture(count: 2) { showTransportMenu = true }
