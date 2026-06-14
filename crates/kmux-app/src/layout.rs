@@ -953,4 +953,82 @@ mod tests {
         assert_eq!(even_ratios(3), vec![333, 333, 333]);
         assert!(even_ratios(0).is_empty());
     }
+
+    // ── Resize/focus arithmetic edge cases ──────────────────────────────────
+    // The tests above pin typical 2-pane resizes and basic focus adjacency.
+    // These probe the boundary inputs the arithmetic actually turns on:
+    // oversized deltas, the MIN_RESIZE_RATIO floor, splits wider than two
+    // children, and genuine focus distance ties.
+
+    #[test]
+    fn shift_pair_preserves_sum_and_floors_the_shrinking_side() {
+        // Grow `a` by far more than the pair can give: `b` must stop at the
+        // floor (never wrap below zero) and the pairwise sum stays exact.
+        let mut r = [500u16, 500];
+        shift_pair(&mut r, 0, 1, 600);
+        assert_eq!(r[0] as i32 + r[1] as i32, 1000, "pairwise sum is invariant");
+        assert_eq!(
+            r[1],
+            MIN_RESIZE_RATIO as u16,
+            "the shrinking side clamps to the floor instead of underflowing"
+        );
+        assert_eq!(r[0], 1000 - MIN_RESIZE_RATIO as u16);
+
+        // Symmetric: a large negative delta floors `a`.
+        let mut r = [500u16, 500];
+        shift_pair(&mut r, 0, 1, -600);
+        assert_eq!(r[0], MIN_RESIZE_RATIO as u16);
+        assert_eq!(r[1], 1000 - MIN_RESIZE_RATIO as u16);
+    }
+
+    #[test]
+    fn shift_pair_is_a_noop_when_the_pair_cannot_hold_two_minimums() {
+        // total < 2*MIN: there is no rebalance that keeps both children at the
+        // floor, so the pair is left untouched rather than forced invalid.
+        let mut r = [MIN_RESIZE_RATIO as u16 - 1, MIN_RESIZE_RATIO as u16 - 1];
+        let before = r;
+        shift_pair(&mut r, 0, 1, 5);
+        assert_eq!(r, before, "a pair below 2*MIN is never modified");
+    }
+
+    #[test]
+    fn resize_split_handles_a_flat_three_way_split() {
+        // The 2-pane tests never exercise n > 2. Growing the middle pane trades
+        // only with its next sibling, leaving the first pane untouched.
+        let tree = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![300, 300, 400],
+            children: vec![leaf(0), leaf(1), leaf(2)],
+        };
+        let (path, ratios) = resize_split(&tree, 1, FocusDir::Right, 50).unwrap();
+        assert_eq!(path, Vec::<u32>::new());
+        assert_eq!(ratios, vec![300, 350, 350], "pane 1 grows into pane 2 only");
+        assert_eq!(ratios.iter().map(|&x| x as u32).sum::<u32>(), 1000);
+    }
+
+    #[test]
+    fn focus_neighbor_breaks_distance_ties_by_perpendicular_overlap() {
+        // Left pane spans the full height; the right column is split unevenly
+        // into a tall top pane (1) and a short bottom pane (2). Both right panes
+        // sit the same distance to the right of pane 0, so the tie is broken by
+        // overlap — pane 1 shares more rows with pane 0 and must win.
+        let tree = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![500, 500],
+            children: vec![
+                leaf(0),
+                LayoutNode::Split {
+                    dir: SplitDir::Vertical,
+                    ratios: vec![750, 250],
+                    children: vec![leaf(1), leaf(2)],
+                },
+            ],
+        };
+        let rects = resolve_layout(&tree, 80, 24, &cfg_no_gutter());
+        assert_eq!(
+            focus_neighbor(&rects, 0, FocusDir::Right),
+            Some(1),
+            "a distance tie breaks toward the neighbor with greater overlap"
+        );
+    }
 }

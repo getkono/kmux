@@ -751,6 +751,99 @@ mod tests {
         assert_eq!(grid.pending_history_gap(), None, "no spurious gap recorded");
     }
 
+    fn cell_diff(ops: Vec<DiffOp>) -> TerminalDiff {
+        TerminalDiff {
+            ops,
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            history_total: 0,
+            scrollback_reset: None,
+        }
+    }
+
+    #[test]
+    fn apply_diff_cell_op_writes_at_row_major_index() {
+        let mut grid = CellGrid::new(24, 80);
+        // Row-major: (row 2, col 3) is index 2*80 + 3 = 163.
+        grid.apply_diff(cell_diff(vec![DiffOp::Cell {
+            row: 2,
+            col: 3,
+            cell: cell('X'),
+        }]));
+        assert_eq!(grid.cells[163].c, 'X', "cell lands at row*cols + col");
+        assert_ne!(grid.cells[162].c, 'X', "the previous column is untouched");
+        assert_ne!(grid.cells[164].c, 'X', "the next column is untouched");
+    }
+
+    #[test]
+    fn apply_diff_cell_op_past_the_end_is_dropped_not_panicking() {
+        let mut grid = CellGrid::new(24, 80); // 1920 cells, valid indices 0..=1919
+        grid.apply_diff(cell_diff(vec![DiffOp::Cell {
+            row: 23,
+            col: 79,
+            cell: cell('Z'),
+        }]));
+        assert_eq!(grid.cells[1919].c, 'Z', "the last valid cell is written");
+        // row 24, col 0 → index 1920 == len → out of bounds; must be dropped.
+        grid.apply_diff(cell_diff(vec![DiffOp::Cell {
+            row: 24,
+            col: 0,
+            cell: cell('!'),
+        }]));
+        assert_eq!(
+            grid.cells.len(),
+            1920,
+            "an out-of-bounds cell op never grows or panics"
+        );
+    }
+
+    #[test]
+    fn apply_diff_row_op_writes_a_contiguous_run() {
+        let mut grid = CellGrid::new(24, 80);
+        // Row 1 from col 2 → base 1*80 + 2 = 82.
+        grid.apply_diff(cell_diff(vec![DiffOp::Row {
+            row: 1,
+            start_col: 2,
+            cells: line("abc"),
+        }]));
+        assert_eq!(grid.cells[82].c, 'a');
+        assert_eq!(grid.cells[83].c, 'b');
+        assert_eq!(grid.cells[84].c, 'c');
+        assert_ne!(grid.cells[81].c, 'a', "the cell before the run is untouched");
+
+        // A run spilling one cell past the buffer end is truncated, not panicking.
+        grid.apply_diff(cell_diff(vec![DiffOp::Row {
+            row: 23,
+            start_col: 79,
+            cells: line("YZ"),
+        }]));
+        assert_eq!(grid.cells[1919].c, 'Y', "the in-bounds part of the run is written");
+        assert_eq!(grid.cells.len(), 1920, "the overflowing cell is dropped, no panic");
+    }
+
+    #[test]
+    fn apply_diff_bumps_cells_generation_only_when_cells_change() {
+        let mut grid = CellGrid::new(24, 80);
+
+        // A diff with cell ops advances BOTH generations.
+        grid.apply_diff(cell_diff(vec![DiffOp::Cell {
+            row: 0,
+            col: 0,
+            cell: cell('a'),
+        }]));
+        assert_eq!(grid.cells_generation, 1, "cell ops bump the cells generation");
+        assert_eq!(grid.cursor_generation, 1, "every diff bumps the cursor generation");
+
+        // A diff with no ops (and no scrollback reset) leaves the cells
+        // generation untouched but still advances the cursor generation.
+        grid.apply_diff(cell_diff(vec![]));
+        assert_eq!(
+            grid.cells_generation, 1,
+            "an empty diff must not bump the cells generation"
+        );
+        assert_eq!(grid.cursor_generation, 2);
+    }
+
     #[test]
     fn apply_snapshot_evicts_below_scrollback_base() {
         // The clear-then-resize leak: the client holds scrollback, then a fresh
