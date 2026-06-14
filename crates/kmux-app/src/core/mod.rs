@@ -144,17 +144,17 @@ pub struct AppCore {
     /// (issue #61). When `false`, the counters are hidden *and* their per-frame
     /// calculation is skipped (power-efficient). Resolved from `config.toml`.
     pub show_perf_counters: bool,
-  
+
     /// Recent render timestamps (most-recent last) within [`RENDER_FPS_WINDOW`],
     /// used to compute the rendering FPS. Only populated while the HUD is shown
     /// and the counters are enabled, so it costs nothing otherwise.
     render_frames: VecDeque<Instant>,
-  
+
     /// Panes pending a deferred (soft) close (issue #86), oldest first. While a
     /// pane is here its `PaneClose` has NOT been sent; the driver fires it once
     /// the deadline passes, and the user can undo within the window.
     pub pending_closes: Vec<PendingClose>,
-  
+
     /// Bumped on every soft-close request so a frontend can show its "Undo"
     /// affordance exactly once per scheduled close (not every frame).
     pub soft_close_nonce: u64,
