@@ -306,6 +306,12 @@ fn broadcast_to_clients(
     {
         let map = clients.lock().unwrap();
         for (&client_id, sender) in map.iter() {
+            // Paused clients (issue #68) receive no terminal-output frames. They
+            // must NOT be marked lagged or dropped when their channel fills —
+            // they catch up on resume via re-attach reconciliation.
+            if sender.paused {
+                continue;
+            }
             let outgoing = if sender.force_full_snapshot {
                 snapshot_msg.get_or_insert_with(|| {
                     let snapshot = term_state.lock().unwrap().snapshot();
@@ -408,6 +414,7 @@ mod tests {
                 data_tx,
                 ctrl_tx,
                 force_full_snapshot: false,
+                paused: false,
                 capabilities: Default::default(),
                 size: Default::default(),
             },
@@ -444,6 +451,7 @@ mod tests {
                 data_tx,
                 ctrl_tx,
                 force_full_snapshot: false,
+                paused: false,
                 capabilities: Default::default(),
                 size: Default::default(),
             },
@@ -476,6 +484,7 @@ mod tests {
                 data_tx,
                 ctrl_tx,
                 force_full_snapshot: false,
+                paused: false,
                 capabilities: Default::default(),
                 size: Default::default(),
             },
@@ -496,5 +505,105 @@ mod tests {
         assert!(matches!(msg, ServerMessage::TerminalUpdate { .. }));
 
         assert_eq!(clients.lock().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn broadcast_skips_paused_client() {
+        // A paused client receives nothing; an active client still does.
+        let (paused_tx, mut paused_rx) = mpsc::channel::<ServerMessage>(16);
+        let (paused_ctrl_tx, _paused_ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (active_tx, mut active_rx) = mpsc::channel::<ServerMessage>(16);
+        let (active_ctrl_tx, _active_ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        {
+            let mut map = clients.lock().unwrap();
+            map.insert(
+                ClientId(1),
+                ClientSender {
+                    data_tx: paused_tx,
+                    ctrl_tx: paused_ctrl_tx,
+                    force_full_snapshot: false,
+                    paused: true,
+                    capabilities: Default::default(),
+                    size: Default::default(),
+                },
+            );
+            map.insert(
+                ClientId(2),
+                ClientSender {
+                    data_tx: active_tx,
+                    ctrl_tx: active_ctrl_tx,
+                    force_full_snapshot: false,
+                    paused: false,
+                    capabilities: Default::default(),
+                    size: Default::default(),
+                },
+            );
+        }
+
+        let ts = test_term_state();
+        broadcast_to_clients(
+            "eagle/0",
+            &dummy_update("eagle/0"),
+            &clients,
+            &ts,
+            SequenceNo(1),
+        );
+
+        assert!(
+            paused_rx.try_recv().is_err(),
+            "paused client should receive nothing"
+        );
+        assert!(
+            matches!(
+                active_rx.try_recv(),
+                Ok(ServerMessage::TerminalUpdate { .. })
+            ),
+            "active client should receive the diff"
+        );
+        // Both clients remain registered.
+        assert_eq!(clients.lock().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn paused_client_not_marked_lagged_when_data_full() {
+        // Even with a full data channel, a paused client is never marked lagged
+        // or removed — it catches up on resume.
+        let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        data_tx.try_send(dummy_update("eagle/0")).unwrap(); // fill to capacity
+
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        clients.lock().unwrap().insert(
+            ClientId(7),
+            ClientSender {
+                data_tx,
+                ctrl_tx,
+                force_full_snapshot: false,
+                paused: true,
+                capabilities: Default::default(),
+                size: Default::default(),
+            },
+        );
+
+        let ts = test_term_state();
+        broadcast_to_clients(
+            "eagle/0",
+            &dummy_update("eagle/0"),
+            &clients,
+            &ts,
+            SequenceNo(2),
+        );
+
+        assert!(
+            ctrl_rx.try_recv().is_err(),
+            "paused client must not receive a Lagged message"
+        );
+        assert_eq!(
+            clients.lock().unwrap().len(),
+            1,
+            "paused client must not be removed"
+        );
     }
 }

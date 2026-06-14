@@ -217,6 +217,21 @@ pub enum ClientMessage {
     /// diffs on every PTY output, bypassing the diff engine entirely.
     SetSnapshotMode { enabled: bool },
 
+    /// Pause or resume terminal-output delivery for this connection (issue #68).
+    ///
+    /// While paused (`true`), the daemon stops pushing `TerminalUpdate` /
+    /// `TerminalSnapshot` / `CursorUpdate` / `ScrollbackAppend` frames to this
+    /// client, saving bandwidth. The pane keeps running and the daemon keeps its
+    /// VT + scrollback state fully up to date, so a paused client still counts
+    /// toward the effective pane size (pausing never reflows the PTY for others).
+    ///
+    /// On resume (`false`), the client re-issues `Attach { last_seqno: Some(..) }`
+    /// for its visible panes; the daemon reconciles to the *final* state (a
+    /// coalesced delta or a single snapshot), so catch-up is instant regardless
+    /// of how long the connection was paused. Connection-level, like
+    /// [`Self::SetSnapshotMode`].
+    SetPaused { paused: bool },
+
     /// Ask the daemon for a range of scrollback lines starting at the given
     /// absolute index. Used to fill gaps (missed `ScrollbackAppend` frames)
     /// or lazily hydrate older history when the user scrolls past the
@@ -277,6 +292,7 @@ impl ClientMessage {
             | Self::RequestInputLock { .. }
             | Self::ReleaseInputLock { .. }
             | Self::SetSnapshotMode { .. }
+            | Self::SetPaused { .. }
             | Self::ListDirectory { .. } => MessageCategory::Control,
             Self::Auth { .. } | Self::ChannelReady => MessageCategory::Bootstrap,
         }
@@ -564,6 +580,10 @@ mod tests {
                 MessageCategory::Control,
             ),
             (
+                ClientMessage::SetPaused { paused: true },
+                MessageCategory::Control,
+            ),
+            (
                 ClientMessage::TabCreate {
                     request_id: 0,
                     word_id: "w".into(),
@@ -657,6 +677,18 @@ mod tests {
         ];
         for (msg, expected) in cases {
             assert_eq!(msg.category(), *expected, "wrong category for {msg:?}");
+        }
+    }
+
+    #[test]
+    fn set_paused_roundtrips() {
+        for paused in [true, false] {
+            let msg = ClientMessage::SetPaused { paused };
+            let bytes = crate::encode_client(&msg).unwrap();
+            match crate::decode_client(&bytes).unwrap() {
+                ClientMessage::SetPaused { paused: got } => assert_eq!(got, paused),
+                other => panic!("expected SetPaused, got {other:?}"),
+            }
         }
     }
 

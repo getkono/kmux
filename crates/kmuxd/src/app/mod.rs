@@ -48,6 +48,11 @@ pub struct ClientSender {
     /// When true, the relay sends full `TerminalSnapshot` messages instead
     /// of incremental `TerminalUpdate` diffs.
     pub force_full_snapshot: bool,
+    /// When true, the relay skips pushing terminal-output frames to this client
+    /// entirely (issue #68 connection pausing). The pane keeps running and this
+    /// client keeps counting toward the effective pane size; on resume the
+    /// client re-attaches and the daemon reconciles to the final state.
+    pub paused: bool,
     /// Rendering capabilities declared by this client at Auth time.
     pub capabilities: ClientCapabilities,
     /// Terminal size reported by this client at attach time (updated on `Resize`).
@@ -233,6 +238,11 @@ impl PaneRelay {
 
         let map = self.clients.lock().unwrap();
         for sender in map.values() {
+            // Paused clients (issue #68) get no resize snapshot; the fresh
+            // snapshot they pull on resume already reflects the final size.
+            if sender.paused {
+                continue;
+            }
             let _ = sender.ctrl_tx.send(event_msg.clone());
             let _ = sender.data_tx.try_send(snap_msg.clone());
         }
@@ -788,6 +798,7 @@ mod tests {
     use std::sync::atomic::AtomicU64;
     use tokio::sync::mpsc;
 
+    use super::{AttachParams, AttachResult, SessionState};
     use crate::app::{ClientSender, PaneRelay, SCROLLBACK_CAPACITY};
     use crate::backend::{
         BackendConfig, BackendSize, CapabilityHandles, DEFAULT_SCROLLBACK, NullEventSink,
@@ -804,6 +815,7 @@ mod tests {
             data_tx,
             ctrl_tx,
             force_full_snapshot: false,
+            paused: false,
             capabilities: ClientCapabilities::default(),
             size: TermSize {
                 rows,
@@ -935,6 +947,7 @@ mod tests {
                 data_tx: data_tx.clone(),
                 ctrl_tx,
                 force_full_snapshot: false,
+                paused: false,
                 capabilities: ClientCapabilities::default(),
                 size: TermSize {
                     rows: 40,
@@ -997,5 +1010,224 @@ mod tests {
             matches!(second, ServerMessage::TerminalUpdate { .. }),
             "follow-up diff must arrive after the snapshot, got {second:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn paused_client_still_counts_toward_effective_size() {
+        // Pausing must never reflow the PTY for other clients: a paused client
+        // keeps constraining the smallest-wins effective size (issue #68).
+        let relay = make_relay(80, 200);
+        let (id_paused, mut sender_paused) = make_client(24, 80);
+        sender_paused.paused = true;
+        let (id_active, sender_active) = make_client(40, 120);
+        relay
+            .clients
+            .lock()
+            .unwrap()
+            .insert(id_paused, sender_paused);
+        relay
+            .clients
+            .lock()
+            .unwrap()
+            .insert(id_active, sender_active);
+
+        let eff = relay.effective_size().unwrap();
+        assert_eq!(eff.rows, 24, "paused client's smaller rows still win");
+        assert_eq!(eff.cols, 80, "paused client's smaller cols still win");
+    }
+
+    #[tokio::test]
+    async fn broadcast_resize_skips_paused_client() {
+        use kmux_protocol::messages::ServerMessage;
+
+        let mut relay = make_relay(24, 80);
+        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        relay.clients.lock().unwrap().insert(
+            ClientId(1),
+            ClientSender {
+                data_tx,
+                ctrl_tx,
+                force_full_snapshot: false,
+                paused: true,
+                // Larger than relay.size so apply_effective_size would change.
+                capabilities: ClientCapabilities::default(),
+                size: TermSize {
+                    rows: 40,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            },
+        );
+
+        let new_size = relay.apply_effective_size().expect("size must change");
+        relay.broadcast_resize("pane-1", new_size, 42);
+
+        assert!(
+            ctrl_rx.try_recv().is_err(),
+            "paused client should get no PaneResized event"
+        );
+        assert!(
+            data_rx.try_recv().is_err(),
+            "paused client should get no resize snapshot"
+        );
+    }
+
+    // ─── Resume reconciliation (issue #68) ────────────────────────────────────
+
+    fn push_seqnos(relay: &PaneRelay, range: std::ops::RangeInclusive<u64>) {
+        use kmux_protocol::messages::{
+            CellState, CursorState, DiffOp, SequenceNo, TermModes, TerminalDiff,
+        };
+        let mut buf = relay.scrollback.lock().unwrap();
+        for n in range {
+            buf.push(
+                SequenceNo(n),
+                Arc::new(TerminalDiff {
+                    ops: vec![DiffOp::Cell {
+                        row: 0,
+                        col: 0,
+                        cell: CellState::default(),
+                    }],
+                    cursor: CursorState::default(),
+                    modes: TermModes::EMPTY,
+                    history_total: 0,
+                    scrollback_reset: None,
+                }),
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compute_replay_fresh_attach_returns_full_snapshot() {
+        use super::attach::compute_replay;
+        let relay = make_relay(24, 80);
+        assert!(matches!(
+            compute_replay(&relay, None),
+            AttachResult::FullSnapshot(..)
+        ));
+    }
+
+    #[tokio::test]
+    async fn compute_replay_delta_under_threshold_returns_delta() {
+        use super::attach::compute_replay;
+        use kmux_protocol::messages::SequenceNo;
+        let relay = make_relay(24, 80);
+        push_seqnos(&relay, 1..=5);
+        match compute_replay(&relay, Some(SequenceNo(1))) {
+            AttachResult::Delta(diffs) => {
+                let seqs: Vec<u64> = diffs.iter().map(|(s, _)| s.0).collect();
+                assert_eq!(
+                    seqs,
+                    vec![2, 3, 4, 5],
+                    "replays only diffs after last_seqno"
+                );
+            }
+            other => panic!("expected Delta, got a different variant: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn compute_replay_delta_over_threshold_coalesces_to_syncreset() {
+        use super::attach::{MAX_RESUME_DELTA_DIFFS, compute_replay};
+        use kmux_protocol::messages::SequenceNo;
+        let relay = make_relay(24, 80);
+        // More buffered diffs than the coalescing threshold allows to replay.
+        push_seqnos(&relay, 1..=(MAX_RESUME_DELTA_DIFFS as u64 + 50));
+        assert!(matches!(
+            compute_replay(&relay, Some(SequenceNo(1))),
+            AttachResult::SyncReset(..)
+        ));
+    }
+
+    async fn app_with_one_pane(word: &str) -> ServerApp {
+        use kmux_protocol::messages::SessionMeta;
+        let app = ServerApp::new("tok".to_string());
+        let relay = make_relay(24, 80);
+        let session = SessionState {
+            meta: SessionMeta {
+                index: 0,
+                word_id: word.to_string(),
+                name: "test".to_string(),
+                cwd: "/".to_string(),
+            },
+            panes: std::iter::once((0u32, relay)).collect(),
+            next_pane_index: 1,
+            tabs: vec![],
+            next_tab_index: 0,
+            active_tab: 0,
+        };
+        app.sessions.write().await.insert(word.to_string(), session);
+        app
+    }
+
+    fn attach_params(
+        client_id: ClientId,
+        last_seqno: Option<kmux_protocol::messages::SequenceNo>,
+    ) -> AttachParams {
+        use kmux_protocol::messages::ServerMessage;
+        let (data_tx, _rx) = mpsc::channel::<ServerMessage>(16);
+        let (ctrl_tx, _crx) = mpsc::unbounded_channel::<ServerMessage>();
+        AttachParams {
+            pane_id: "eagle/0".to_string(),
+            client_id,
+            last_seqno,
+            size: TermSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            data_tx,
+            ctrl_tx,
+            capabilities: ClientCapabilities::default(),
+        }
+    }
+
+    #[tokio::test]
+    async fn set_paused_marks_client_across_panes() {
+        let app = app_with_one_pane("eagle").await;
+        let client_id = ClientId(1);
+        app.attach(attach_params(client_id, None)).await.unwrap();
+
+        app.set_paused(client_id, true).await;
+        {
+            let sessions = app.sessions.read().await;
+            let map = sessions["eagle"].panes[&0].clients.lock().unwrap();
+            assert!(map.get(&client_id).unwrap().paused);
+        }
+
+        app.set_paused(client_id, false).await;
+        {
+            let sessions = app.sessions.read().await;
+            let map = sessions["eagle"].panes[&0].clients.lock().unwrap();
+            assert!(!map.get(&client_id).unwrap().paused);
+        }
+    }
+
+    #[tokio::test]
+    async fn reattach_preserves_snapshot_mode_and_clears_pause() {
+        use kmux_protocol::messages::SequenceNo;
+        let app = app_with_one_pane("eagle").await;
+        let client_id = ClientId(1);
+
+        app.attach(attach_params(client_id, None)).await.unwrap();
+        app.set_snapshot_mode(client_id, true).await;
+        app.set_paused(client_id, true).await;
+
+        // Resume: client re-attaches the pane with its last seqno.
+        app.attach(attach_params(client_id, Some(SequenceNo(1))))
+            .await
+            .unwrap();
+
+        let sessions = app.sessions.read().await;
+        let map = sessions["eagle"].panes[&0].clients.lock().unwrap();
+        let sender = map.get(&client_id).unwrap();
+        assert!(
+            sender.force_full_snapshot,
+            "snapshot mode must survive a re-attach"
+        );
+        assert!(!sender.paused, "a re-attach (resume) clears the pause flag");
     }
 }

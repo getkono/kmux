@@ -531,6 +531,11 @@ pub async fn handle_message<A: PaneAttacher>(
             debug!("client {client_id:?} snapshot mode = {enabled}");
         }
 
+        ClientMessage::SetPaused { paused } => {
+            state.app.set_paused(client_id, paused).await;
+            debug!("client {client_id:?} paused = {paused}");
+        }
+
         ClientMessage::FetchHistory {
             request_id,
             pane_id,

@@ -54,6 +54,23 @@ impl DiffBuffer {
         self.diffs.front().map(|(seq, _, _)| *seq)
     }
 
+    /// Count and estimated total byte size of buffered diffs with `seqno > after`.
+    ///
+    /// Reuses the per-entry size estimates cached at `push` time (no recompute,
+    /// no cloning). Used to decide whether a resume should replay a delta or
+    /// coalesce to a single snapshot (issue #68).
+    pub fn pending_stats(&self, after: SequenceNo) -> (usize, usize) {
+        let mut count = 0;
+        let mut bytes = 0;
+        for (seq, _, size) in self.diffs.iter() {
+            if *seq > after {
+                count += 1;
+                bytes += *size;
+            }
+        }
+        (count, bytes)
+    }
+
     /// The newest sequence number still in the buffer, or `None` if empty.
     #[cfg(test)]
     pub fn newest_seqno(&self) -> Option<SequenceNo> {
