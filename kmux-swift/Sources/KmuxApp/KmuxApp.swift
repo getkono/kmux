@@ -9,6 +9,7 @@ import SwiftUI
 struct KmuxSwiftApp: App {
     @StateObject private var model = KmuxModel()
     @StateObject private var ui = UIState()
+    @Environment(\.scenePhase) private var scenePhase
 
     var body: some Scene {
         WindowGroup {
@@ -21,6 +22,13 @@ struct KmuxSwiftApp: App {
                     NSApplication.shared.setActivationPolicy(.regular)
                     NSApplication.shared.activate(ignoringOtherApps: true)
                     model.start()
+                }
+                .onChange(of: scenePhase) { _, phase in
+                    // Auto-pause when the app is fully backgrounded (issue #68).
+                    // `.inactive` (visible but unfocused) keeps streaming so the
+                    // user can still watch; only `.background` pauses. The driver
+                    // debounces, so a quick hide/show does not thrash pause/resume.
+                    model.setWindowBackground(phase == .background)
                 }
         }
         .windowResizability(.contentMinSize)

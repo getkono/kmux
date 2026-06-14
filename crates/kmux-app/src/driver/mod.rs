@@ -101,6 +101,11 @@ const METRICS_FLUSH_TICK: Duration = Duration::from_secs(10);
 /// coalesce them into one `set_term_size` after the burst settles.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
 
+/// How long the window must stay backgrounded before the connection
+/// auto-pauses (issue #68). Short enough to save bandwidth promptly, long
+/// enough to ride out a quick alt-tab without thrashing pause/resume.
+const AUTO_PAUSE_DEBOUNCE: Duration = Duration::from_millis(1000);
+
 /// What a [`FrontendDriver::tick`] (or input dispatch) asks the frontend to do.
 ///
 /// This is the driver → frontend channel for the few actions that are inherently
@@ -158,6 +163,10 @@ pub struct FrontendDriver {
     /// Coalescing window + min-ops thresholds for the tearing detector.
     tear_window_ms: u64,
     tear_min_ops: usize,
+    /// When the app window first went to the background, if it currently is
+    /// (issue #68 auto-pause). After [`AUTO_PAUSE_DEBOUNCE`] still backgrounded,
+    /// `tick` auto-pauses the connection; foregrounding clears this immediately.
+    background_since: Option<Instant>,
     /// Monotonic pump-tick id, used to tag client frame-trace records.
     tick_id: u64,
     /// Optional per-tick frame-trace sink (`KMUX_FRAME_TRACE`).
@@ -202,6 +211,7 @@ impl FrontendDriver {
             tear_state: HashMap::new(),
             tear_window_ms: env_u64("KMUX_TEAR_WINDOW_MS", TEAR_WINDOW_MS),
             tear_min_ops: env_u64("KMUX_TEAR_MIN_OPS", TEAR_MIN_OPS as u64) as usize,
+            background_since: None,
             tick_id: 0,
             trace: ClientTraceSink::from_env(),
         }
@@ -231,6 +241,9 @@ impl FrontendDriver {
         dirty |= self.drain_transport_upgrades();
         dirty |= self.drain_tunnel_deaths();
         dirty |= self.tick_liveness(now);
+        // Auto-pause the connection once the window has been backgrounded long
+        // enough (issue #68).
+        dirty |= self.tick_auto_pause(now);
         // Fire any soft-close whose 3 s grace window has elapsed (issue #86).
         dirty |= self.core.fire_due_closes(now);
         self.tick_metrics(now);
@@ -665,6 +678,35 @@ impl FrontendDriver {
         self.resize_deadline = Some(Instant::now() + RESIZE_DEBOUNCE);
     }
 
+    /// Report whether the app window is backgrounded/minimized/occluded, for
+    /// auto-pause (issue #68). Backgrounding arms a debounce (the connection
+    /// auto-pauses from a later [`tick`](Self::tick) if still backgrounded after
+    /// [`AUTO_PAUSE_DEBOUNCE`]); foregrounding resumes immediately. A *manual*
+    /// pause is unaffected and persists across focus changes.
+    pub fn set_window_background(&mut self, backgrounded: bool) {
+        if backgrounded {
+            if self.background_since.is_none() && !self.core.auto_pause {
+                self.background_since = Some(Instant::now());
+            }
+        } else {
+            self.background_since = None;
+            self.core.set_auto_pause(false);
+        }
+    }
+
+    /// Apply the armed auto-pause once the debounce elapses. Returns whether the
+    /// pause state changed (so the caller flags a render for the indicator).
+    fn tick_auto_pause(&mut self, now: Instant) -> bool {
+        if let Some(since) = self.background_since
+            && !self.core.auto_pause
+            && now.duration_since(since) >= AUTO_PAUSE_DEBOUNCE
+        {
+            self.core.set_auto_pause(true);
+            return true;
+        }
+        false
+    }
+
     /// Snap the active pane's viewport back to the live bottom (e.g. on keypress).
     pub fn scroll_to_bottom(&mut self) {
         if let Some(grid) = self.core.mgr.active_grid_mut() {
@@ -746,6 +788,7 @@ impl FrontendDriver {
             tear_state: HashMap::new(),
             tear_window_ms: TEAR_WINDOW_MS,
             tear_min_ops: TEAR_MIN_OPS,
+            background_since: None,
             tick_id: 0,
             trace: None,
         };

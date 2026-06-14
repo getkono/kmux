@@ -236,6 +236,9 @@ impl AppCore {
             Action::ToggleInputLock => {
                 self.mgr.toggle_input_lock();
             }
+            Action::TogglePause => {
+                self.toggle_manual_pause();
+            }
             Action::CopySelection => {
                 if let Some(text) = self.mgr.active_grid().and_then(|g| g.selected_text()) {
                     return KeyResult::CopyToClipboard(text);

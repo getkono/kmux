@@ -73,7 +73,8 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application) {
 
 /// Refresh the header from current state. Cheap no-op when unchanged.
 pub fn sync(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
-    let (sig, server, session, icon, tip, class, locked, transport, connected, overridden) = {
+    use kmux_app::core::PauseReason;
+    let (sig, server, subtitle, icon, tip, class, locked, transport, connected, overridden) = {
         let f = fe.borrow();
         let mgr = &f.core.mgr;
         let server = f.core.server_display.clone();
@@ -91,12 +92,20 @@ pub fn sync(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
         } else {
             String::new()
         };
+        // Pause indicator (issue #68): surfaced in the subtitle so the user can
+        // tell the stream is intentionally stopped (vs. a stall).
+        let pause = match f.core.pause_reason() {
+            PauseReason::None => "",
+            PauseReason::Manual => " · ⏸ Paused",
+            PauseReason::Auto => " · ⏸ Paused (background)",
+        };
+        let subtitle = format!("{session}{pause}");
         let sig = format!(
-            "{server}|{session}|{}|{locked}|{transport}|{overridden}",
+            "{server}|{subtitle}|{}|{locked}|{transport}|{overridden}",
             state.badge_label()
         );
         (
-            sig, server, session, icon, tip, class, locked, transport, connected, overridden,
+            sig, server, subtitle, icon, tip, class, locked, transport, connected, overridden,
         )
     };
     if shell.header_sig.borrow().as_deref() == Some(sig.as_str()) {
@@ -107,7 +116,7 @@ pub fn sync(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
     shell
         .title
         .set_title(if server.is_empty() { "kmux" } else { &server });
-    shell.title.set_subtitle(&session);
+    shell.title.set_subtitle(&subtitle);
 
     shell.conn_btn.set_icon_name(icon);
     shell.conn_btn.set_tooltip_text(Some(tip));

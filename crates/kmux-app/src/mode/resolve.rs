@@ -99,6 +99,7 @@ pub fn resolve_session(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
             "d" => (Some(Mode::Normal), Action::Disconnect),
             "l" => (None, Action::ToggleInputLock),
             "f" => (None, Action::ToggleSnapshotMode),
+            "P" => (None, Action::TogglePause),
             "0" => (Some(Mode::Normal), Action::JumpToSession(9)),
             "1" => (Some(Mode::Normal), Action::JumpToSession(0)),
             "2" => (Some(Mode::Normal), Action::JumpToSession(1)),

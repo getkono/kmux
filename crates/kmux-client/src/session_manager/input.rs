@@ -153,4 +153,20 @@ impl SessionManager {
     pub fn set_snapshot_mode(&mut self, enabled: bool) {
         self.send_ws(ClientMessage::SetSnapshotMode { enabled });
     }
+
+    /// Pause or resume terminal-output delivery for this connection (issue #68).
+    ///
+    /// While paused the daemon stops pushing terminal frames, saving bandwidth;
+    /// the pane keeps running so nothing is lost. On resume we re-attach every
+    /// visible pane so the daemon sends a fresh snapshot of the *final* state —
+    /// instant, bounded catch-up (one snapshot, not a backlog replay), and it
+    /// reuses the well-tested snapshot-sync path.
+    pub fn set_paused(&mut self, paused: bool) {
+        self.send_ws(ClientMessage::SetPaused { paused });
+        if !paused {
+            for pane_id in self.visible_panes.clone() {
+                self.attach_fresh(pane_id);
+            }
+        }
+    }
 }
