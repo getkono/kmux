@@ -173,6 +173,28 @@ impl CellGrid {
         self.cursor_generation += 1;
     }
 
+    /// Export the current grid as a [`GridSnapshot`] — the inverse of
+    /// [`apply_snapshot`](Self::apply_snapshot).
+    ///
+    /// Re-serialises a live `CellGrid` so a fresh consumer can reconstruct the
+    /// exact view with no upstream round-trip (issue #121: the federation daemon
+    /// mints a snapshot for a newly-attaching GUI from its authoritative pane
+    /// mirror). The full held scrollback travels as `scrollback_tail` so the
+    /// consumer renders history immediately. The view-local `scroll_offset` and
+    /// `selection` are intentionally excluded from the wire snapshot.
+    pub fn to_snapshot(&self) -> GridSnapshot {
+        GridSnapshot {
+            rows: self.rows as u16,
+            cols: self.cols as u16,
+            cells: self.cells.clone(),
+            cursor: self.cursor,
+            modes: self.modes,
+            history_total: self.scrollback.history_total(),
+            scrollback_base: self.scrollback.base_index(),
+            scrollback_tail: self.scrollback.tail(),
+        }
+    }
+
     /// Apply a diff from the server -- only changed cells are updated.
     ///
     /// Scrollback no longer travels with the diff (v16); it arrives out-of-band
@@ -691,6 +713,51 @@ mod tests {
         let first = grid.scrollback().get(0).expect("line 0 present");
         assert_eq!(first.len(), 5);
         assert_eq!(first[0].c, 'h');
+    }
+
+    #[test]
+    fn to_snapshot_round_trips_through_apply_snapshot() {
+        // Drive a grid to a non-trivial state: populated cells, a moved cursor,
+        // non-empty modes, and several scrollback lines.
+        let mut a = CellGrid::new(3, 4);
+        a.apply_diff(TerminalDiff {
+            ops: vec![DiffOp::Row {
+                row: 0,
+                start_col: 0,
+                cells: line("abcd"),
+            }],
+            cursor: CursorState {
+                row: 1,
+                col: 2,
+                blink: true,
+                ..CursorState::default()
+            },
+            modes: TermModes(TermModes::BRACKETED_PASTE | TermModes::SGR_MOUSE),
+            history_total: 0,
+            scrollback_reset: None,
+        });
+        push_scrollback(&mut a, vec![line("old1"), line("old2"), line("old3")]);
+
+        // Export, then re-import into a fresh (deliberately mis-sized) grid.
+        let snap = a.to_snapshot();
+        let mut b = CellGrid::new(1, 1);
+        b.apply_snapshot(snap);
+
+        // The reconstructed grid is observably identical to the original.
+        assert_eq!(b.rows, a.rows);
+        assert_eq!(b.cols, a.cols);
+        assert_eq!(b.cells, a.cells);
+        assert_eq!(b.cursor, a.cursor);
+        assert_eq!(b.modes, a.modes);
+        assert_eq!(
+            b.scrollback().history_total(),
+            a.scrollback().history_total()
+        );
+        assert_eq!(b.scrollback().base_index(), a.scrollback().base_index());
+        assert_eq!(b.scrollback_len(), a.scrollback_len());
+        for i in 0..a.scrollback_len() {
+            assert_eq!(b.scrollback().get(i), a.scrollback().get(i), "line {i}");
+        }
     }
 
     #[test]
