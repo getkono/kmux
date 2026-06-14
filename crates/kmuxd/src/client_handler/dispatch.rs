@@ -467,13 +467,11 @@ pub async fn handle_message<A: PaneAttacher>(
         }
 
         ClientMessage::Resize { pane_id, size } => {
+            // Federated panes reconcile smallest-wins across local viewers inside
+            // the peer subsystem (which forwards at most one upstream Resize),
+            // rather than forwarding this client's size verbatim.
             if state.app.is_federated_pane(&pane_id) {
-                state
-                    .app
-                    .forward_peer_message(&pane_id, move |remote| ClientMessage::Resize {
-                        pane_id: remote,
-                        size,
-                    });
+                state.app.federated_resize(&pane_id, client_id, size);
             } else if let Err(e) = state.app.resize(&pane_id, client_id, size).await {
                 state.error(None, classify_error(&e), e.to_string());
             }

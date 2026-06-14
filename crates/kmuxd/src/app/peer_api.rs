@@ -133,6 +133,20 @@ impl ServerApp {
         }
     }
 
+    /// Update `client_id`'s declared size for a federated pane and reconcile the
+    /// smallest-wins size upstream. Returns `true` when `pane_id` is federated.
+    pub fn federated_resize(&self, pane_id: &str, client_id: ClientId, size: TermSize) -> bool {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.resize_viewer(pane_id, client_id, size)
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (pane_id, client_id, size);
+            false
+        }
+    }
+
     /// Detach `client_id` from `pane_id`, routing to the peer subsystem when the
     /// pane is federated and to the local relay otherwise.
     pub async fn detach_pane_any(&self, pane_id: &str, client_id: ClientId) {

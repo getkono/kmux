@@ -247,6 +247,32 @@ fn snapshot_text(snapshot: &kmux_protocol::messages::GridSnapshot) -> String {
     snapshot.cells.iter().map(|c| c.c).collect()
 }
 
+/// Ask the local daemon for its session list and return the federated session's
+/// (peer-decorated) first pane ID.
+async fn federated_pane(
+    tx: &mpsc::UnboundedSender<ClientMessage>,
+    rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
+) -> String {
+    tx.send(ClientMessage::SessionList { request_id: 100 })
+        .expect("send SessionList");
+    let list = recv_until(rx, Duration::from_secs(5), |m| {
+        matches!(m, ServerMessage::SessionListResult { .. })
+    })
+    .await
+    .expect("expected a SessionListResult");
+    let sessions = match list {
+        ServerMessage::SessionListResult { sessions, .. } => sessions,
+        _ => unreachable!(),
+    };
+    sessions
+        .iter()
+        .find(|e| e.meta.name.contains('@'))
+        .expect("the federated session should appear in the local list")
+        .panes[0]
+        .pane_id
+        .clone()
+}
+
 /// The headline #121 path: one GUI attaches to a remote session *through* the
 /// local daemon over a single federated link, and both input and output flow.
 #[tokio::test]
@@ -390,6 +416,157 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
 
     // ── Teardown. ──
     drop(gui_tx);
+    set_xdg(local_dir.path());
+    let _ = kmux_client::daemon::stop_daemon().await;
+    set_xdg(remote_dir.path());
+    let _ = kmux_client::daemon::stop_daemon().await;
+}
+
+/// PR4 reconciliation: two local GUIs share **one** proxied pane over a single
+/// federated link. A smaller second viewer shrinks the shared pane (smallest-wins),
+/// and the late viewer is served the live mirror's content.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
+async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
+    let cleanup = Cleanup::default();
+
+    let remote_dir = tempfile::tempdir().unwrap();
+    let local_dir = tempfile::tempdir().unwrap();
+
+    // Remote daemon hosting a marked session, then the local hub.
+    set_xdg(remote_dir.path());
+    let remote_pid = spawn_daemon(&exe).await;
+    cleanup.track(remote_pid as i32);
+    let remote_status = kmux_client::daemon::query_daemon()
+        .await
+        .expect("remote daemon status");
+    let remote_token = remote_status.token.clone();
+    let remote_tcp = remote_status.tcp_port;
+
+    const MARKER: &str = "SHARED_PANE_MARKER";
+    let pidfile = remote_dir.path().join("shell.pid");
+    let (_remote_word, shell_pid) =
+        create_remote_session(&remote_token, remote_dir.path(), MARKER, &pidfile).await;
+    cleanup.track(shell_pid);
+
+    set_xdg(local_dir.path());
+    let local_pid = spawn_daemon(&exe).await;
+    cleanup.track(local_pid as i32);
+    let local_token = kmux_client::daemon::query_daemon()
+        .await
+        .expect("local daemon status")
+        .token;
+
+    let big = TermSize {
+        rows: 24,
+        cols: 80,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+    let small = TermSize {
+        rows: 10,
+        cols: 40,
+        pixel_width: 0,
+        pixel_height: 0,
+    };
+
+    // GUI-1 federates and attaches at the LARGE size.
+    let (gui1_tx, mut gui1_rx) = connect_authenticated(&local_token).await;
+    gui1_tx
+        .send(ClientMessage::OpenPeer {
+            request_id: 1,
+            target: PeerTarget::Direct {
+                host: "127.0.0.1".into(),
+                port: remote_tcp,
+                token: remote_token.clone(),
+                accept_invalid_certs: true,
+            },
+        })
+        .expect("send OpenPeer");
+    let opened = recv_until(&mut gui1_rx, Duration::from_secs(15), |m| {
+        matches!(
+            m,
+            ServerMessage::PeerOpened { .. } | ServerMessage::PeerError { .. }
+        )
+    })
+    .await
+    .expect("expected a peer reply");
+    assert!(
+        matches!(opened, ServerMessage::PeerOpened { .. }),
+        "federation must open: {opened:?}"
+    );
+
+    let local_pane = federated_pane(&gui1_tx, &mut gui1_rx).await;
+    gui1_tx
+        .send(ClientMessage::Attach {
+            pane_id: local_pane.clone(),
+            last_seqno: None,
+            size: big,
+        })
+        .expect("gui1 Attach");
+    // Baseline: GUI-1 is the sole viewer, so the shared pane is at its large size.
+    let want = local_pane.clone();
+    let snap1 = recv_until(
+        &mut gui1_rx,
+        Duration::from_secs(15),
+        move |m| matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == want),
+    )
+    .await
+    .expect("gui1 snapshot");
+    assert!(
+        matches!(&snap1, ServerMessage::TerminalSnapshot { snapshot, .. } if snapshot.rows == 24),
+        "the sole viewer should see the pane at its own size"
+    );
+
+    // GUI-2 (a second connection to the SAME local daemon) sees the session via the
+    // already-open peer — one shared upstream link — and attaches at the SMALL size.
+    let (gui2_tx, mut gui2_rx) = connect_authenticated(&local_token).await;
+    let local_pane2 = federated_pane(&gui2_tx, &mut gui2_rx).await;
+    assert_eq!(
+        local_pane2, local_pane,
+        "both GUIs must see the same federated pane through one peer"
+    );
+    gui2_tx
+        .send(ClientMessage::Attach {
+            pane_id: local_pane.clone(),
+            last_seqno: None,
+            size: small,
+        })
+        .expect("gui2 Attach");
+
+    // Late-attach minting: GUI-2 is served the live mirror's content (the marker).
+    let want2 = local_pane.clone();
+    let snap2 = recv_until(
+        &mut gui2_rx,
+        Duration::from_secs(15),
+        move |m| matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == want2),
+    )
+    .await
+    .expect("gui2 snapshot");
+    assert!(
+        matches!(&snap2, ServerMessage::TerminalSnapshot { snapshot, .. } if snapshot_text(snapshot).contains(MARKER)),
+        "the late viewer must be served the shared pane's content"
+    );
+
+    // Smallest-wins: GUI-2 (10×40) joining shrinks the shared pane, so GUI-1 (24×80)
+    // receives a snapshot resized DOWN to 10 rows. With last-writer-wins this would
+    // never arrive (GUI-2's larger... smaller size would be ignored or GUI-1 kept big).
+    let want3 = local_pane.clone();
+    let shrunk = recv_until(&mut gui1_rx, Duration::from_secs(15), move |m| {
+        matches!(m, ServerMessage::TerminalSnapshot { pane_id, snapshot, .. }
+            if *pane_id == want3 && snapshot.rows == 10)
+    })
+    .await;
+    assert!(
+        shrunk.is_some(),
+        "a smaller second viewer must shrink the shared pane to the min size (smallest-wins)"
+    );
+
+    // ── Teardown. ──
+    drop(gui1_tx);
+    drop(gui2_tx);
     set_xdg(local_dir.path());
     let _ = kmux_client::daemon::stop_daemon().await;
     set_xdg(remote_dir.path());
