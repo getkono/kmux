@@ -15,7 +15,7 @@ use crate::mode::{Action, Mode};
 use crate::recent_servers::ServerKind;
 
 use super::{
-    AppCore, COMMAND_HISTORY_CAP, DirBrowserRow, KeyResult, PendingClose, SwitchTarget, SOFT_CLOSE_GRACE, SwitchTarget,
+    AppCore, COMMAND_HISTORY_CAP, DirBrowserRow, KeyResult, PendingClose, SOFT_CLOSE_GRACE, SwitchTarget,
     TopBarAction,
 };
 
