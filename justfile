@@ -57,6 +57,11 @@ build:
 test:
     cargo test
 
+# Mutation testing (cargo-mutants, pinned via mise; config in .cargo/mutants.toml).
+# Whole workspace by default; scope with args, e.g. `just mutants -p kmux-protocol`.
+mutants *args:
+    cargo mutants {{args}}
+
 # ── Native macOS app (kmux-swift) ────────────────────────────────────────────
 # The SwiftUI macOS client lives in kmux-swift/ (a SwiftPM package, outside the
 # cargo workspace) and links the kmux-ffi staticlib. These recipes are macOS-only
