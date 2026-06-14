@@ -26,7 +26,7 @@ use std::time::{Duration, Instant};
 use kmux_client::connect::ConnectResult;
 use kmux_client::tcp_connect::connect_uds;
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientMessage, PeerTarget, ServerMessage, TermSize,
+    ClientCapabilities, ClientMessage, PeerTarget, ServerMessage, SessionEventMsg, TermSize,
 };
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -412,6 +412,28 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
     assert!(
         poll_until(Duration::from_secs(15), || input_marker.exists()).await,
         "GUI input must reach the remote PTY and create the marker file"
+    );
+
+    // 5. Session-scoped events propagate: setting the window title on the remote
+    //    pane (OSC 2) must reach the GUI as a `PaneTitleChanged` addressed by the
+    //    LOCAL pane ID (the feed loop translated the event's pane ID).
+    let title_cmd = "printf '\\033]2;FEDTITLE_XYZ\\007'\n";
+    gui_tx
+        .send(ClientMessage::PtyInput {
+            pane_id: local_pane.clone(),
+            data: title_cmd.as_bytes().to_vec(),
+        })
+        .expect("send title-setting input");
+    let want_title_pane = local_pane.clone();
+    let title_evt = recv_until(&mut gui_rx, Duration::from_secs(15), move |m| {
+        matches!(m, ServerMessage::Event {
+            event: SessionEventMsg::PaneTitleChanged { pane_id, title },
+        } if *pane_id == want_title_pane && title.contains("FEDTITLE_XYZ"))
+    })
+    .await;
+    assert!(
+        title_evt.is_some(),
+        "a title change on the remote pane must reach the GUI as PaneTitleChanged for the local pane"
     );
 
     // ── Teardown. ──

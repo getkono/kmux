@@ -550,7 +550,14 @@ pub async fn handle_message<A: PaneAttacher>(
         }
 
         ClientMessage::Signal { pane_id, signal } => {
-            if let Err(e) = state.app.send_signal(&pane_id, signal).await {
+            if state.app.is_federated_pane(&pane_id) {
+                state
+                    .app
+                    .forward_peer_message(&pane_id, move |remote| ClientMessage::Signal {
+                        pane_id: remote,
+                        signal,
+                    });
+            } else if let Err(e) = state.app.send_signal(&pane_id, signal).await {
                 state.error(None, classify_error(&e), e.to_string());
             }
         }
@@ -599,19 +606,35 @@ pub async fn handle_message<A: PaneAttacher>(
             pane_id,
             start_index,
             count,
-        } => match state.app.fetch_history(&pane_id, start_index, count).await {
-            Ok((first_index, lines, history_total)) => {
-                state.send(ServerMessage::HistoryLines {
-                    request_id,
-                    pane_id,
-                    first_index,
-                    lines,
-                    history_total,
-                    sent_at_ms: kmux_protocol::messages::epoch_millis(),
+        } => {
+            // For a federated pane, forward the request upstream; the remote's
+            // `HistoryLines` reply is pane-scoped, so the feed loop translates it
+            // back to this viewer (matched by `request_id`).
+            if state.app.is_federated_pane(&pane_id) {
+                state.app.forward_peer_message(&pane_id, move |remote| {
+                    ClientMessage::FetchHistory {
+                        request_id,
+                        pane_id: remote,
+                        start_index,
+                        count,
+                    }
                 });
+            } else {
+                match state.app.fetch_history(&pane_id, start_index, count).await {
+                    Ok((first_index, lines, history_total)) => {
+                        state.send(ServerMessage::HistoryLines {
+                            request_id,
+                            pane_id,
+                            first_index,
+                            lines,
+                            history_total,
+                            sent_at_ms: kmux_protocol::messages::epoch_millis(),
+                        });
+                    }
+                    Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
+                }
             }
-            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
-        },
+        }
 
         ClientMessage::ListDirectory { request_id, path } => {
             state.send(list_directory(request_id, &path));
