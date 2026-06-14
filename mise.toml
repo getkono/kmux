@@ -1,7 +1,9 @@
 [tools]
 # Pinned to ghostty v1.3.1's minimum_zig_version (build.zig.zon).
 zig = "0.15.2"
-rust = "stable"
+# Pinned to an exact release (not floating "stable") for reproducible rustc +
+# rustfmt; mirrors rust-toolchain.toml. Bump deliberately.
+rust = "1.96.0"
 # `mise run release` regenerates CHANGELOG.md from conventional commits via
 # git-cliff, and the release workflow shells out to `mise run package`. Pinning
 # both here means local dev and CI runners resolve identical versions.

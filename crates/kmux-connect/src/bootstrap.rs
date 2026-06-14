@@ -111,9 +111,9 @@ where
 
 /// Bootstrap via the local daemon's Unix data socket.
 ///
-/// Calls [`kmux_client::daemon::ensure_compatible_daemon`] to start the daemon
-/// if not running and verify its protocol version matches ours, then connects
-/// to `daemon-data.sock` and performs the auth handshake.
+/// Calls [`crate::daemon::ensure_daemon`] to start the daemon if not running,
+/// gates on its reported protocol version matching ours, then connects to
+/// `daemon-data.sock` and performs the auth handshake.
 /// Wins in microseconds when the daemon is already running.
 pub struct UdsLocalBootstrap {
     pub capabilities: ClientCapabilities,

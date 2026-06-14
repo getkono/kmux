@@ -22,7 +22,7 @@ use crate::connect::{self, ConnectResult};
 use crate::daemon::{self, ensure_daemon};
 use crate::ssh::{self, RemoteTarget, SshError};
 use crate::tcp_connect;
-use crate::transport::TransportKind;
+use kmux_protocol::TransportKind;
 
 /// How long to wait for `AuthResult` after sending `Auth` on a transport.
 /// Must be long enough for SSH + TLS handshake + first frame round-trip

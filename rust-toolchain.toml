@@ -1,3 +1,6 @@
 [toolchain]
-channel = "stable"
+# Pinned to an exact release (not the floating "stable" channel) so rustc and
+# rustfmt are reproducible across local dev and CI; bump deliberately. Mirrors
+# the `rust` pin in mise.toml.
+channel = "1.96.0"
 components = ["rustfmt", "clippy"]

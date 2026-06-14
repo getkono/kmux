@@ -14,6 +14,7 @@ publish = false
 # Internal crates
 kmux-pty = { path = "crates/kmux-pty" }
 kmux-protocol = { path = "crates/kmux-protocol" }
+kmux-connect = { path = "crates/kmux-connect" }
 kmux-client = { path = "crates/kmux-client" }
 kmux-ghostty-sys = { path = "crates/kmux-ghostty-sys" }
 kmux-ghostty = { path = "crates/kmux-ghostty" }
