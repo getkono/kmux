@@ -59,8 +59,15 @@ test:
 
 # Mutation testing (cargo-mutants, pinned via mise; config in .cargo/mutants.toml).
 # Whole workspace by default; scope with args, e.g. `just mutants -p kmux-protocol`.
+# cargo-mutants makes a full scratch copy (incl. a fresh target/) per job; the
+# default /tmp is often a small tmpfs that overflows mid-sweep, so anchor the
+# scratch trees on disk (override with $CARGO_MUTANTS_TMPDIR).
 mutants *args:
-    cargo mutants {{args}}
+    #!/usr/bin/env bash
+    set -euo pipefail
+    export TMPDIR="${CARGO_MUTANTS_TMPDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/cargo-mutants-tmp}"
+    mkdir -p "$TMPDIR"
+    cargo mutants "$@"
 
 # ── Native macOS app (kmux-swift) ────────────────────────────────────────────
 # The SwiftUI macOS client lives in kmux-swift/ (a SwiftPM package, outside the

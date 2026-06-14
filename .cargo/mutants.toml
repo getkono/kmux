@@ -4,15 +4,22 @@
 # Run the whole workspace with `just mutants`, or scope to one crate with
 # `cargo mutants -p kmux-protocol`. Results land in `mutants.out/`.
 
-# Mutant test runs use unit tests only (lib + bin targets). This deliberately
-# skips the `tests/` integration suites — notably kmuxd's `handoff_e2e`, which
-# spawns real daemon processes and is far too slow to run once per mutant.
+# Mutant test runs use unit tests only (lib + bin targets), which skips the
+# `tests/` integration suites — notably kmuxd's `handoff_e2e`, which spawns real
+# daemon processes and is far too slow to run once per mutant.
 #
-# `--bins` is REQUIRED, not just `--lib`: kmuxd, kmux-gtk and kmux are bin-only
-# crates (main.rs, no lib.rs), so a bare `--lib` would silently skip ALL of
-# their unit tests (e.g. kmuxd's 181) and report every mutant there as missed.
+# `test_workspace = true` is REQUIRED alongside these flags. Without it,
+# cargo-mutants scopes the test run to the mutated package (`cargo test
+# --package=X --lib --bins`), and `--lib` then HARD-ERRORS with "no library
+# targets found" on the bin-only crates (kmuxd, kmux-gtk, kmux). cargo-mutants
+# misreads that failure as "every mutant caught", yielding a bogus 100% score
+# and zero real signal for the server. Testing the whole workspace
+# (`cargo test --workspace --lib --bins`) satisfies `--lib` from the lib crates
+# while still running every crate's unit tests, so bin-crate mutants are scored
+# for real.
 #
 # The full integration suite still runs in the real gate (`just test` / CI).
+test_workspace = true
 additional_cargo_test_args = ["--lib", "--bins"]
 
 # Mutant builds and tests can run slower than the clean baseline; give headroom
