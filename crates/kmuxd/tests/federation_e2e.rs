@@ -594,3 +594,125 @@ async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
     set_xdg(remote_dir.path());
     let _ = kmux_client::daemon::stop_daemon().await;
 }
+
+/// PR6 hardening: when the remote daemon dies, the failure is isolated. The GUI's
+/// federated session is cleanly closed (not left hanging), and the local daemon
+/// keeps serving — proxied panes live apart from locally-hosted ones.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
+async fn remote_daemon_death_is_isolated_from_local_daemon() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
+    let cleanup = Cleanup::default();
+
+    let remote_dir = tempfile::tempdir().unwrap();
+    let local_dir = tempfile::tempdir().unwrap();
+
+    // Remote daemon + a session, then the local hub.
+    set_xdg(remote_dir.path());
+    let remote_pid = spawn_daemon(&exe).await;
+    cleanup.track(remote_pid as i32);
+    let remote_status = kmux_client::daemon::query_daemon()
+        .await
+        .expect("remote daemon status");
+    let remote_token = remote_status.token.clone();
+    let remote_tcp = remote_status.tcp_port;
+    let pidfile = remote_dir.path().join("shell.pid");
+    let (_remote_word, shell_pid) =
+        create_remote_session(&remote_token, remote_dir.path(), "ISO_MARKER", &pidfile).await;
+    cleanup.track(shell_pid);
+
+    set_xdg(local_dir.path());
+    let local_pid = spawn_daemon(&exe).await;
+    cleanup.track(local_pid as i32);
+    let local_token = kmux_client::daemon::query_daemon()
+        .await
+        .expect("local daemon status")
+        .token;
+
+    // GUI federates and attaches to the remote session through the local daemon.
+    let (gui_tx, mut gui_rx) = connect_authenticated(&local_token).await;
+    gui_tx
+        .send(ClientMessage::OpenPeer {
+            request_id: 1,
+            target: PeerTarget::Direct {
+                host: "127.0.0.1".into(),
+                port: remote_tcp,
+                token: remote_token.clone(),
+                accept_invalid_certs: true,
+            },
+        })
+        .expect("send OpenPeer");
+    let opened = recv_until(&mut gui_rx, Duration::from_secs(15), |m| {
+        matches!(
+            m,
+            ServerMessage::PeerOpened { .. } | ServerMessage::PeerError { .. }
+        )
+    })
+    .await
+    .expect("expected a peer reply");
+    assert!(
+        matches!(opened, ServerMessage::PeerOpened { .. }),
+        "federation must open: {opened:?}"
+    );
+    let local_pane = federated_pane(&gui_tx, &mut gui_rx).await;
+    let local_word = local_pane.split('/').next().unwrap().to_string();
+    gui_tx
+        .send(ClientMessage::Attach {
+            pane_id: local_pane.clone(),
+            last_seqno: None,
+            size: ATTACH_SIZE,
+        })
+        .expect("gui Attach");
+    let want = local_pane.clone();
+    assert!(
+        recv_until(&mut gui_rx, Duration::from_secs(15), move |m| {
+            matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == want)
+        })
+        .await
+        .is_some(),
+        "must attach to the federated pane before the remote dies"
+    );
+
+    // Kill the remote daemon hard — its TCP link drops under the local daemon.
+    let _ = kill(Pid::from_raw(remote_pid as i32), Signal::SIGKILL);
+
+    // Isolation #1: the GUI's federated session is closed cleanly, not hung.
+    let want_word = local_word.clone();
+    let closed = recv_until(&mut gui_rx, Duration::from_secs(15), move |m| {
+        matches!(m, ServerMessage::Event {
+            event: SessionEventMsg::SessionClosed { word_id },
+        } if *word_id == want_word)
+    })
+    .await;
+    assert!(
+        closed.is_some(),
+        "a dead peer must surface as SessionClosed for its federated session"
+    );
+
+    // Isolation #2: the local daemon is unaffected — its connection to the GUI is
+    // live and it still serves new sessions.
+    gui_tx
+        .send(ClientMessage::SessionCreate {
+            request_id: 2,
+            name: Some("local-after-death".into()),
+            cwd: Some(local_dir.path().display().to_string()),
+            program: Some("/bin/sh".into()),
+            args: vec!["-c".into(), "exec sleep 600".into()],
+            size: ATTACH_SIZE,
+        })
+        .expect("send local SessionCreate");
+    let created = recv_until(&mut gui_rx, Duration::from_secs(10), |m| {
+        matches!(m, ServerMessage::SessionCreated { .. })
+    })
+    .await;
+    assert!(
+        created.is_some(),
+        "the local daemon must keep serving after a federated peer dies"
+    );
+
+    // ── Teardown (remote already dead). ──
+    drop(gui_tx);
+    set_xdg(local_dir.path());
+    let _ = kmux_client::daemon::stop_daemon().await;
+}

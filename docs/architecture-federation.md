@@ -141,9 +141,21 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
 - **PR5** — lean the GUI: always UDS-local to `kmuxd`; the parsed `--server` target
   becomes an `OpenPeer`; feature-gate `quinn`/`rustls`/`ssh` **out** of the GUI build
   (they move to `kmuxd`'s peer role). CI check the GUI no longer links the net stack.
-- **PR6** — hardening: upstream reconnect/backoff (reuse `kmux-connect` `recovery`),
-  idle peer drop, peer-down isolation from local panes, version/profile guards on peer
-  links, namespacing edge cases.
+- **PR6 — peer-down isolation + version guard — landed.** When the upstream link
+  closes (remote daemon gone, network dropped), the feed loop **isolates** the
+  failure: it sends every viewer a `SessionClosed` for its proxied session (so the
+  GUI cleans up instead of hanging), drops the panes/sessions, and marks the
+  connection `dead`. Locally-hosted PTY panes are untouched (separate relay). A dead
+  peer is **reaped lazily** on the next `open_peer` to the same address — releasing
+  its local words and clearing the word index — so re-federation starts clean
+  (`open_peer` holds the `&ServerApp` needed to return words to the pool, avoiding a
+  `Weak<ServerApp>` back-reference). Protocol-version mismatch is already rejected by
+  the upstream `Auth` handshake (`open_peer` surfaces it as a `PeerError`). E2E:
+  `remote_daemon_death_is_isolated_from_local_daemon` SIGKILLs the remote and asserts
+  the GUI gets `SessionClosed` while the local daemon keeps serving new sessions.
+- **PR6 remaining** (further hardening): upstream reconnect/backoff (reuse
+  `kmux-connect` `recovery`), idle peer drop (debounced teardown when no local viewer
+  remains), and backpressure refinement on a lagging viewer.
 
 ## Resolved — federation addressing & testability
 
