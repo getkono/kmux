@@ -1185,6 +1185,23 @@ dependencies = [
 name = "kmux-client"
 version = "0.2.0"
 dependencies = [
+ "bitflags",
+ "kmux-connect",
+ "kmux-protocol",
+ "nix",
+ "rand 0.10.1",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "kmux-connect"
+version = "0.2.0"
+dependencies = [
  "anyhow",
  "bitflags",
  "futures",
