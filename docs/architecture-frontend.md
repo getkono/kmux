@@ -283,7 +283,7 @@ delegated to the per-platform frontend.
 
 - Entrypoint: `cargo run -p kmux` (binary `kmux`) — runs the CLI subcommands and,
   for an interactive launch, execs the platform desktop app. For a dev GUI run,
-  build the frontend too so the exec target exists (`just start` builds
+  build the frontend too so the exec target exists (`mise run start` builds
   `kmux` + `kmux-gtk` then runs `kmux`).
 - GUI directly: `cargo run -p kmux-gtk` (binary `kmux-gtk`) — opens a window,
   connects, renders the active session, forwards keystrokes (Linux + macOS).
@@ -311,11 +311,11 @@ PKG_CONFIG=/usr/bin/pkg-config cargo build -p kmux-gtk
 This is a machine `PATH` quirk, not a repo setting; on a standard install the
 default `pkg-config` resolves gtk4 directly.
 
-`just install` installs the `kmux` entrypoint + the `kmux-gtk` GUI (Linux) plus
+`mise run install` installs the `kmux` entrypoint + the `kmux-gtk` GUI (Linux) plus
 its `.desktop` entry and icon into the XDG data dirs (on macOS it installs `kmux`
 and instead assembles `~/Applications/kmux.app` — see [the native macOS
 frontend](#the-native-macos-frontend-kmux-swift) and
-[building-macos.md](building-macos.md#install)); `just package` stages `kmux` +
+[building-macos.md](building-macos.md#install)); `mise run package` stages `kmux` +
 the `kmux-gtk` binary + desktop files into the release tarball under `share/`.
 `kmux-gtk` is the default client on Linux, launched by the `kmux` entrypoint;
 preferences (theme + font) open with **Ctrl+,**.
@@ -380,13 +380,13 @@ ignores it) and links the `kmux-ffi` staticlib.
   and its `main.rs` compiles to a stub only on other targets. `kmux-ffi` is pure
   Rust and builds everywhere; the `kmux` entrypoint is toolkit-free and builds
   everywhere; the Swift app is macOS-only by nature (SwiftPM + macOS CI /
-  justfile guards). Note: a full `cargo build --workspace` on macOS now requires
+  mise-task guards). Note: a full `cargo build --workspace` on macOS now requires
   Homebrew GTK (because `kmux-gtk` is a real target there); the macOS CI job is
   selective rather than `--workspace`.
 
 Build + run (bindings generation, linking, the macOS CI path) are in
 [building-macos.md](building-macos.md). The generated bindings are not committed;
-`just gen-ffi-bindings` produces them (the ABI assert + uniffi checksum guard
+`mise run gen-ffi-bindings` produces them (the ABI assert + uniffi checksum guard
 drift).
 
 ## Status
@@ -467,7 +467,7 @@ picker-query surface.
   functional and at feature parity with `kmux-gtk`. Remaining polish: a Metal
   renderer + same-attr run batching if profiling shows need; a configurable font
   in Preferences (the renderer currently uses the system monospaced face); a
-  **codesigned + notarized** `.app` bundle (`just install` already assembles an
+  **codesigned + notarized** `.app` bundle (`mise run install` already assembles an
   unsigned `~/Applications/kmux.app` — see
   [building-macos.md](building-macos.md#install)).
 - **Windows.** A native Windows frontend would also drive `FrontendDriver`. The

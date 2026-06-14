@@ -7,7 +7,7 @@
 //! intact. Unlike the in-process `live_pty_migrates_with_same_pid` unit test (which
 //! hand-transfers an fd between two `ServerApp`s in one process), they exercise the
 //! actual fork / exec / daemonize / `SCM_RIGHTS` path — including the in-place
-//! binary swap that `just upgrade-daemon` performs.
+//! binary swap that `mise run upgrade-daemon` performs.
 
 #![cfg(unix)]
 

@@ -128,7 +128,7 @@ fn verify_zig_version(zig: &str) {
             "zig version mismatch: expected {EXPECTED_ZIG_VERSION}, found {version} (resolved `{zig}`).\n\
              Run `mise install` to install the pinned zig. If it is already installed, \
              a different `zig` (e.g. a Homebrew one) is shadowing it because mise is not \
-             active in this shell: build via `just`, or set ZIG=\"$(mise which zig)\".",
+             active in this shell: build via `mise run build`, or set ZIG=\"$(mise which zig)\".",
         );
     }
 }

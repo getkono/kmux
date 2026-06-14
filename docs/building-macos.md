@@ -40,7 +40,7 @@ committed**. Produce them from the built `kmux-ffi` cdylib (uniffi *library
 mode*):
 
 ```sh
-just gen-ffi-bindings
+mise run gen-ffi-bindings
 ```
 
 which runs, roughly:
@@ -63,21 +63,21 @@ hardcodes its value.
 ## Build / run / test
 
 ```sh
-just swift-app     # gen bindings + swift build
-just swift-run     # gen bindings + swift run (launches the app)
-just swift-test    # gen bindings + swift test
+mise run swift-app     # gen bindings + swift build
+mise run swift-run     # gen bindings + swift run (launches the app)
+mise run swift-test    # gen bindings + swift test
 ```
 
 (or directly: `swift build --package-path kmux-swift`, etc., after
-`just gen-ffi-bindings`).
+`mise run gen-ffi-bindings`).
 
 ## Install
 
 ```sh
-just install       # release build → ~/Applications/kmux.app + `kmux` & `kmuxd` in ~/.cargo/bin
+mise run install       # release build → ~/Applications/kmux.app + `kmux` & `kmuxd` in ~/.cargo/bin
 ```
 
-`just install` is the macOS counterpart of the Linux GTK install. It:
+`mise run install` is the macOS counterpart of the Linux GTK install. It:
 
 1. installs the `kmux` entrypoint + the `kmuxd` daemon to `~/.cargo/bin`
    (release). `kmux` is toolkit-free; for an interactive launch it execs the app
@@ -86,7 +86,7 @@ just install       # release build → ~/Applications/kmux.app + `kmux` & `kmuxd
    former `kmux-swift/macos/kmux` shell launcher is gone — the `kmux` binary
    replaces it.) Then it:
 2. builds the release `kmux-ffi` staticlib + matching Swift bindings
-   (`just gen-ffi-bindings release`) and the app in release, linking that
+   (`mise run gen-ffi-bindings release`) and the app in release, linking that
    archive (via `KMUX_FFI_LIB`, which overrides `Package.swift`'s debug default),
 3. assembles `~/Applications/kmux.app` — `Contents/MacOS/kmux-swift`, a copy of
    `kmuxd` beside it, `Contents/Resources/kmux.icns`, and a versioned
@@ -114,7 +114,7 @@ cargo run -p kmuxd     # self-signed cert by default; or: kmux daemon start
 
 # In another: launch the app — it connects to the local daemon over the UDS,
 # renders the active session, and forwards keystrokes.
-just swift-run
+mise run swift-run
 ```
 
 The app defaults to the local daemon (`DriverConfig.server = nil`). Verify:
@@ -129,15 +129,15 @@ blink, and the connection badge + reconnect.
 The `macos` job in [`.github/workflows/ci.yml`](../.github/workflows/ci.yml)
 fmt-checks, clippies + tests `kmux` + `kmux-ffi` and the client stack it wraps,
 builds `kmux` and the GTK frontend `kmux-gtk` natively against Homebrew GTK
-(`brew install gtk4 libadwaita`), then runs `just gen-ffi-bindings` +
+(`brew install gtk4 libadwaita`), then runs `mise run gen-ffi-bindings` +
 `swift build` + `swift test`. It needs neither the Zig toolchain nor submodules.
 
 ## Notes / limitations
 
-- `just install` assembles an `~/Applications/kmux.app` bundle, but it is **not
+- `mise run install` assembles an `~/Applications/kmux.app` bundle, but it is **not
   codesigned or notarized** yet (fine for a local from-source install; a
   Gatekeeper-distributable build is a follow-up). Run via `swift run` /
-  `just swift-run` it launches as a bare SwiftPM executable, setting
+  `mise run swift-run` it launches as a bare SwiftPM executable, setting
   `NSApplication` to a regular foreground app via the `onAppear` hook.
 - The renderer uses the system monospaced face; a configurable font in
   Preferences is a follow-up.

@@ -11,13 +11,13 @@
 //   - `KmuxApp`      : the hand-written SwiftUI app + CoreText terminal renderer.
 //
 // The generated sources (`kmux_ffiFFI.h`, `kmux_ffi.swift`) and the Rust
-// staticlib are produced by `just gen-ffi-bindings` (see the repo justfile);
-// they are gitignored. Build with `just macos-app` / run with `just macos-run`.
+// staticlib are produced by `mise run gen-ffi-bindings` (see the repo's mise tasks);
+// they are gitignored. Build with `mise run swift-app` / run with `mise run swift-run`.
 import Foundation
 import PackageDescription
 
 // The prebuilt Rust staticlib to static-link. Defaults to the debug archive
-// (what `just macos-app` / `macos-run` / `macos-test` build); `just install`
+// (what `mise run swift-app` / `swift-run` / `swift-test` build); `mise run install`
 // overrides it via KMUX_FFI_LIB to link the optimized release archive into the
 // installed kmux.app. Path is relative to this package dir unless absolute.
 let kmuxFfiLib = ProcessInfo.processInfo.environment["KMUX_FFI_LIB"]

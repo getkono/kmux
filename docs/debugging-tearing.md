@@ -76,7 +76,7 @@ KMUX_NET_DELAY_MS=40 KMUX_NET_JITTER_MS=60 KMUX_NET_SEED=1 KMUX_FRAME_TRACE=1 \
   cargo run -p kmuxd
 # in another terminal: launch the client, KMUX_FRAME_TRACE=1, toggle the HUD
 # (Ctrl+G h), run a full-screen TUI (vim/htop) and watch `Tear:` climb.
-KMUX_FRAME_TRACE=1 just start
+KMUX_FRAME_TRACE=1 mise run start
 # then: kmux debug tearing  (corroborate the HUD count)
 ```
 

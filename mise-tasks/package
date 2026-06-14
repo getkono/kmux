@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+#MISE description="Stage a distributable release tarball for the host target into dist/."
+set -euo pipefail
+# kmuxd dynamically links libkmux_ghostty (a Zig-built shared lib; see
+# crates/kmux-ghostty-sys), so we bundle that .so/.dylib beside the binaries
+# and rewrite kmuxd's runpath to load it from its own dir ($ORIGIN /
+# @loader_path) -- otherwise the binary only runs from the build tree. Shared
+# by local testing and the release workflow (.github/workflows/release.yml).
+ver=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -n1)
+target=$(rustc -vV | sed -n 's/^host: //p')
+stage="kmux-${ver}-${target}"
+echo "==> building release binaries (${target})"
+cargo build --release -p kmux -p kmuxd
+rm -rf "dist/${stage}"
+mkdir -p "dist/${stage}"
+cp target/release/kmux target/release/kmuxd README.md "dist/${stage}/"
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    # Resolve the dylib from kmuxd's baked rpath (authoritative — it is where
+    # the binary was linked to look), then ship it and repoint to @loader_path.
+    libdir=$(otool -l target/release/kmuxd | awk '$1=="path"{print $2}' | grep -m1 kmux-ghostty-sys || true)
+    [[ -n "$libdir" && -f "$libdir/libkmux_ghostty.dylib" ]] || { echo "error: could not locate libkmux_ghostty.dylib (rpath: ${libdir:-none})" >&2; exit 1; }
+    cp "$libdir/libkmux_ghostty.dylib" "dist/${stage}/"
+    oldref=$(otool -L "dist/${stage}/kmuxd" | awk '/libkmux_ghostty/{print $1; exit}')
+    install_name_tool -change "$oldref" @rpath/libkmux_ghostty.dylib "dist/${stage}/kmuxd"
+    install_name_tool -add_rpath @loader_path "dist/${stage}/kmuxd"
+    strip -x "dist/${stage}/kmux" "dist/${stage}/kmuxd"
+else
+    command -v patchelf >/dev/null || { echo "error: patchelf is required to package on Linux (e.g. 'dnf install patchelf' / 'apt-get install patchelf')" >&2; exit 1; }
+    libdir=$(patchelf --print-rpath target/release/kmuxd | tr ':' '\n' | grep -m1 kmux-ghostty-sys || true)
+    [[ -n "$libdir" && -f "$libdir/libkmux_ghostty.so" ]] || { echo "error: could not locate libkmux_ghostty.so (rpath: ${libdir:-none})" >&2; exit 1; }
+    cp "$libdir/libkmux_ghostty.so" "dist/${stage}/"
+    patchelf --set-rpath '$ORIGIN' "dist/${stage}/kmuxd"
+    strip "dist/${stage}/kmux" "dist/${stage}/kmuxd"
+    # The GTK frontend (`kmux-gtk`) is the default client on Linux; the `kmux`
+    # entrypoint (shipped above) execs it. It dynamically links the system
+    # GTK4 + libadwaita (NOT bundled, unlike libkmux_ghostty) — they are
+    # runtime deps the user installs from their distro. Ship the binary plus
+    # its desktop entry + icon under share/.
+    echo "==> building + staging the kmux-gtk GUI"
+    cargo build --release -p kmux-gtk
+    cp target/release/kmux-gtk "dist/${stage}/"
+    strip "dist/${stage}/kmux-gtk"
+    mkdir -p "dist/${stage}/share/applications" \
+             "dist/${stage}/share/icons/hicolor/scalable/apps"
+    cp crates/kmux-gtk/data/dev.getkono.kmux.desktop "dist/${stage}/share/applications/"
+    cp crates/kmux-gtk/data/icons/dev.getkono.kmux.svg "dist/${stage}/share/icons/hicolor/scalable/apps/"
+fi
+tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+( cd dist && shasum -a 256 "${stage}.tar.gz" > "${stage}.tar.gz.sha256" )
+echo "==> packaged dist/${stage}.tar.gz"
+ls -l "dist/${stage}.tar.gz" "dist/${stage}.tar.gz.sha256"

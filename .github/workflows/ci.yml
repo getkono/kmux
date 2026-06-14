@@ -44,25 +44,27 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-zig-
 
+      # fmt-check / clippy / test are the same mise tasks the hk pre-push hook
+      # runs locally, so CI and local gates are byte-identical.
       - name: Format check
-        run: cargo fmt --check --all
+        run: mise run fmt-check
 
       - name: Clippy
-        run: cargo clippy --workspace -- -D warnings
+        run: mise run clippy
 
       - name: Test
         # Includes the cross-process daemon handoff/upgrade integration tests
         # (crates/kmuxd/tests/handoff_e2e.rs), which spawn a real kmuxd and drive a
         # live `restart`. The Linux-specific `(deleted)`-inode upgrade path is
         # exercised here.
-        run: cargo test --workspace
+        run: mise run test
 
   # macOS path: build/test kmux-ffi + the client stack it wraps, build the `kmux`
   # entrypoint and the GTK frontend (`kmux-gtk`) natively against Homebrew GTK,
   # and build/test the native SwiftUI app (kmux-swift). kmux-ffi has no Zig/ghostty
   # dependency, so this needs neither submodules nor the Zig toolchain — it is the
-  # macOS counterpart to the Linux GTK build above (linting is on the Linux
-  # `cargo clippy --workspace`; macOS only proves kmux-gtk builds natively here).
+  # macOS counterpart to the Linux GTK build above (full linting is the Linux
+  # `mise run clippy`; macOS only proves kmux-gtk builds natively here).
   macos:
     name: Check (macOS)
     runs-on: macos-14 # Apple Silicon
@@ -103,7 +105,7 @@ jobs:
             ${{ runner.os }}-zig-
 
       - name: Format check
-        run: cargo fmt --check --all
+        run: mise run fmt-check
 
       - name: Clippy (kmux entrypoint + kmux-ffi + the client stack it wraps)
         run: cargo clippy -p kmux -p kmux-ffi -p kmux-app -p kmux-client -p kmux-protocol -- -D warnings
@@ -122,6 +124,6 @@ jobs:
 
       - name: Build + test the native macOS app (kmux-swift)
         run: |
-          just gen-ffi-bindings
+          mise run gen-ffi-bindings
           swift build --package-path kmux-swift
           swift test --package-path kmux-swift

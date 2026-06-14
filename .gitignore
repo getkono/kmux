@@ -26,11 +26,11 @@ target
 zig-out/
 
 # === Release ===
-# `just package` stages tarballs here; the release workflow uploads them.
+# `mise run package` stages tarballs here; the release workflow uploads them.
 /dist/
 # Release notes scratch file produced by `git cliff` in the release workflow.
 /RELEASE_NOTES.md
-# Backup left by the in-place version bump in `just release`.
+# Backup left by the in-place version bump in `mise run release`.
 /Cargo.toml.bak
 
 # === kmux-ffi ===
@@ -40,7 +40,7 @@ zig-out/
 
 # === kmux-swift (native macOS app) ===
 # SwiftPM build products + the generated uniffi bindings (produced by
-# `just gen-ffi-bindings`; the runtime ABI assert + uniffi checksum guard drift).
+# `mise run gen-ffi-bindings`; the runtime ABI assert + uniffi checksum guard drift).
 /kmux-swift/.build/
 /kmux-swift/.swiftpm/
 /kmux-swift/Sources/kmux_ffiFFI/kmux_ffiFFI.h

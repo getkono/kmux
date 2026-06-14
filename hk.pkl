@@ -1,0 +1,70 @@
+amends "package://github.com/jdx/hk/releases/download/v1.48.0/hk@1.48.0#/Config.pkl"
+
+// Git hooks for kmux. Replaces lefthook.yml.
+//
+// Steps shell out to the mise tasks (`mise run fmt` / `clippy` / `test` / ...),
+// so the cargo flags live in exactly ONE place (mise.toml) and local hooks, the
+// `mise run` CLI, and CI all run identical commands.
+//
+// On pre-commit, `fix = true` + `stash = "git"` makes hk stash unstaged work,
+// run the fixers, re-stage the touched *.rs, then restore the stash. That
+// removes lefthook's manual `git diff --exit-code || "stage the changes and
+// re-commit"` dance: auto-fixes land in the commit with no second commit.
+//
+// `cargo fmt`/`cargo clippy` already span the whole workspace, so we don't pass
+// {{files}}; the glob only gates WHETHER a step runs (any staged *.rs) and which
+// files get re-staged after a fix.
+
+hooks {
+    ["pre-commit"] {
+        fix = true
+        stash = "git"
+        steps = new Mapping<String, Step> {
+            ["cargo-fmt"] {
+                glob = List("*.rs")
+                check = "mise run fmt-check"
+                fix = "mise run fmt"
+                stage = List("*.rs")
+            }
+            ["cargo-clippy"] {
+                glob = List("*.rs")
+                check = "mise run clippy"
+                fix = "mise run clippy-fix"
+                stage = List("*.rs")
+                depends = List("cargo-fmt") // mirror lefthook's piped fmt -> clippy order
+            }
+        }
+    }
+    ["pre-push"] {
+        steps = new Mapping<String, Step> {
+            ["cargo-fmt"] {
+                glob = List("*.rs")
+                check = "mise run fmt-check"
+            }
+            ["cargo-clippy"] {
+                glob = List("*.rs")
+                check = "mise run clippy"
+                depends = List("cargo-fmt")
+            }
+            ["cargo-test"] {
+                glob = List("*.rs")
+                check = "mise run test"
+                exclusive = true // run after the linters, not concurrently
+            }
+        }
+    }
+    // `hk check` / `hk check --all` parity path (read-only fmt + clippy).
+    ["check"] {
+        steps = new Mapping<String, Step> {
+            ["cargo-fmt"] {
+                glob = List("*.rs")
+                check = "mise run fmt-check"
+            }
+            ["cargo-clippy"] {
+                glob = List("*.rs")
+                check = "mise run clippy"
+                depends = List("cargo-fmt")
+            }
+        }
+    }
+}

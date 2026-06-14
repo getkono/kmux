@@ -1,6 +1,6 @@
 # git-cliff configuration for kmux.
 #
-# `just release <ver>` runs `git cliff --tag v<ver> -o CHANGELOG.md` to regenerate
+# `mise run release <ver>` runs `git cliff --tag v<ver> -o CHANGELOG.md` to regenerate
 # the changelog, and the release workflow runs `git cliff --latest` for the GitHub
 # Release body. Both consume this file, so the committed CHANGELOG and the release
 # notes always agree.
