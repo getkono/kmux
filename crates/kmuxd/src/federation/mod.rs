@@ -124,8 +124,12 @@ impl ProxiedPane {
         }
     }
 
-    fn viewer_senders(&self) -> Vec<mpsc::Sender<ServerMessage>> {
-        self.viewers.values().map(|v| v.data_tx.clone()).collect()
+    /// The viewers' **unbounded ctrl** senders — the delivery path for session
+    /// events and lifecycle signals, which must not be subject to the per-pane data
+    /// backpressure (matching the local daemon, where events reach clients via the
+    /// unbounded writer channel, not the bounded pane stream).
+    fn viewer_ctrl_senders(&self) -> Vec<mpsc::UnboundedSender<ServerMessage>> {
+        self.viewers.values().map(|v| v.ctrl_tx.clone()).collect()
     }
 
     /// Fan an (already local-addressed) pane frame out to every viewer, applying
@@ -261,15 +265,17 @@ impl PeerConnection {
         Some(format!("{local_word}/{idx}"))
     }
 
-    /// Every viewer of every proxied pane under `local_word` — the routing target
-    /// for session-scoped events (titles, layout, lifecycle), which in local
-    /// `kmuxd` reach all clients viewing a session, not just one pane.
-    fn viewers_under_word(&self, local_word: &str) -> Vec<mpsc::Sender<ServerMessage>> {
+    /// The **ctrl** senders of every viewer of every proxied pane under
+    /// `local_word` — the routing target for session-scoped events (titles, layout,
+    /// lifecycle), which in local `kmuxd` reach all clients viewing a session, not
+    /// just one pane, and are delivered out-of-band (unbounded) so backpressure on a
+    /// pane's content stream can never drop a title change or a `SessionClosed`.
+    fn viewers_under_word(&self, local_word: &str) -> Vec<mpsc::UnboundedSender<ServerMessage>> {
         let prefix = format!("{local_word}/");
         self.panes
             .iter()
             .filter(|(pane_id, _)| pane_id.starts_with(&prefix))
-            .flat_map(|(_, pane)| pane.viewer_senders())
+            .flat_map(|(_, pane)| pane.viewer_ctrl_senders())
             .collect()
     }
 
@@ -832,7 +838,9 @@ fn spawn_feed_loop(
             // Session-scoped events (titles, layout, tab/session lifecycle): translate
             // the embedded word remote→local and fan out to every viewer under that
             // word, so a GUI viewing a federated session still receives its title and
-            // layout updates.
+            // layout updates. These go over the viewers' unbounded ctrl channel
+            // (`viewers_under_word`), so — exactly as in the local daemon — a backed-up
+            // pane content stream can never drop an event.
             let viewers = {
                 let guard = conn.lock().unwrap();
                 match &mut msg {
@@ -853,7 +861,7 @@ fn spawn_feed_loop(
             };
             if let Some(viewers) = viewers {
                 for tx in viewers {
-                    let _ = tx.try_send(msg.clone());
+                    let _ = tx.send(msg.clone());
                 }
             }
         }
@@ -862,7 +870,10 @@ fn spawn_feed_loop(
         // the failure: tell every viewer its proxied session ended so the GUI
         // cleans up instead of hanging, drop the panes (closing the pane streams),
         // and mark the connection dead for lazy reaping. Locally-hosted PTY panes
-        // are untouched — they live in a separate relay.
+        // are untouched — they live in a separate relay. The `SessionClosed` goes
+        // over the unbounded ctrl channel so a viewer whose data stream happened to
+        // be full at death still learns the session ended (a bounded `try_send`
+        // could drop it and the GUI would hang, since no further frames follow).
         {
             let mut guard = conn.lock().unwrap();
             guard.dead = true;
@@ -874,7 +885,7 @@ fn spawn_feed_loop(
                     },
                 };
                 for tx in guard.viewers_under_word(local_word) {
-                    let _ = tx.try_send(closed.clone());
+                    let _ = tx.send(closed.clone());
                 }
             }
             // Drop panes (closing pane streams) and sessions (so a post-death
@@ -1189,7 +1200,7 @@ mod tests {
         // Smallest-wins across viewers (the size forwarded upstream).
         let eff = pane.effective_size();
         assert_eq!((eff.rows, eff.cols), (10, 40));
-        assert_eq!(pane.viewer_senders().len(), 2);
+        assert_eq!(pane.viewer_ctrl_senders().len(), 2);
     }
 
     #[test]
