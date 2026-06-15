@@ -326,6 +326,13 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         handle.abort();
     }
 
+    // Tear down federated peer links synchronously before the runtime is dropped:
+    // their `ssh -L` tunnel children are not kill-on-drop and would otherwise
+    // orphan when the process exits. Applies to every shutdown path (incl. a
+    // committed handoff — peer links are not migrated; the successor re-federates
+    // when GUIs reconnect). A no-op when no peers are open / federation is off.
+    app.close_all_peers();
+
     // Clean shutdown: checkpoint the full session state — unless a handoff
     // already wrote a fresh (post-quiesce) checkpoint and owns the live PTYs.
     if handed_off {

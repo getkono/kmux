@@ -63,11 +63,19 @@ pub struct PeerManager {
     word_index: Mutex<HashMap<String, PeerId>>,
 }
 
-/// One local GUI viewing a proxied pane, plus its declared terminal size (used
-/// for smallest-wins upstream reconciliation).
+/// One local GUI viewing a proxied pane: its bounded data channel, its unbounded
+/// ctrl channel (out-of-band signalling that bypasses data backpressure, e.g.
+/// `Lagged`), and its declared terminal size (used for smallest-wins upstream
+/// reconciliation).
 struct Viewer {
     data_tx: mpsc::Sender<ServerMessage>,
+    ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
     size: TermSize,
+    /// Connection-pause state (issue #68). While paused this viewer receives no
+    /// terminal-output frames (it is skipped in `fan_out`, never marked lagged) and
+    /// catches up on resume via re-attach; it still counts toward `effective_size`,
+    /// exactly as a paused client does in the local PTY relay.
+    paused: bool,
 }
 
 /// A proxied pane: the local viewers sharing it, a [`CellGrid`] mirror fed from
@@ -121,8 +129,53 @@ impl ProxiedPane {
         }
     }
 
-    fn viewer_senders(&self) -> Vec<mpsc::Sender<ServerMessage>> {
-        self.viewers.values().map(|v| v.data_tx.clone()).collect()
+    /// The viewers' **unbounded ctrl** senders — the delivery path for session
+    /// events and lifecycle signals, which must not be subject to the per-pane data
+    /// backpressure (matching the local daemon, where events reach clients via the
+    /// unbounded writer channel, not the bounded pane stream).
+    fn viewer_ctrl_senders(&self) -> Vec<mpsc::UnboundedSender<ServerMessage>> {
+        self.viewers.values().map(|v| v.ctrl_tx.clone()).collect()
+    }
+
+    /// Fan an (already local-addressed) pane frame out to every viewer, applying
+    /// the same backpressure policy as the local PTY relay
+    /// ([`crate::relay::broadcast_to_clients`]): a viewer whose **bounded** data
+    /// channel is full is sent a [`ServerMessage::Lagged`] over its **unbounded**
+    /// ctrl channel and dropped — it re-attaches and is served a fresh snapshot
+    /// minted off the still-correct mirror, exactly as a lagging local client
+    /// recovers. A viewer whose channel has closed is dropped silently. The mirror
+    /// is fed by the caller *before* this, so a dropped viewer never desyncs it.
+    fn fan_out(&mut self, local_pane_id: &str, msg: &ServerMessage) {
+        let mut dead: Vec<ClientId> = Vec::new();
+        for (&client_id, viewer) in self.viewers.iter() {
+            // Paused viewers (issue #68) receive no terminal output and must never
+            // be marked lagged or dropped when their channel fills — they resync on
+            // resume via re-attach. Same rule as `relay::broadcast_to_clients`.
+            if viewer.paused {
+                continue;
+            }
+            match viewer.data_tx.try_send(msg.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Out-of-band so it lands even though the data channel is full;
+                    // the client re-attaches with its last seqno and resyncs.
+                    let _ = viewer.ctrl_tx.send(ServerMessage::Lagged {
+                        pane_id: local_pane_id.to_string(),
+                        missed_count: 1,
+                    });
+                    dead.push(client_id);
+                    warn!(
+                        ?client_id,
+                        pane = local_pane_id,
+                        "federated viewer lagged; sent Lagged via ctrl and dropped",
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => dead.push(client_id),
+            }
+        }
+        for id in &dead {
+            self.viewers.remove(id);
+        }
     }
 
     /// Feed an inbound (already-local-addressed) pane frame into the mirror.
@@ -223,15 +276,17 @@ impl PeerConnection {
         Some(format!("{local_word}/{idx}"))
     }
 
-    /// Every viewer of every proxied pane under `local_word` — the routing target
-    /// for session-scoped events (titles, layout, lifecycle), which in local
-    /// `kmuxd` reach all clients viewing a session, not just one pane.
-    fn viewers_under_word(&self, local_word: &str) -> Vec<mpsc::Sender<ServerMessage>> {
+    /// The **ctrl** senders of every viewer of every proxied pane under
+    /// `local_word` — the routing target for session-scoped events (titles, layout,
+    /// lifecycle), which in local `kmuxd` reach all clients viewing a session, not
+    /// just one pane, and are delivered out-of-band (unbounded) so backpressure on a
+    /// pane's content stream can never drop a title change or a `SessionClosed`.
+    fn viewers_under_word(&self, local_word: &str) -> Vec<mpsc::UnboundedSender<ServerMessage>> {
         let prefix = format!("{local_word}/");
         self.panes
             .iter()
             .filter(|(pane_id, _)| pane_id.starts_with(&prefix))
-            .flat_map(|(_, pane)| pane.viewer_senders())
+            .flat_map(|(_, pane)| pane.viewer_ctrl_senders())
             .collect()
     }
 
@@ -253,6 +308,22 @@ impl PeerConnection {
             pane_id: remote_pane.to_string(),
             size: new_size,
         });
+    }
+}
+
+impl Drop for PeerConnection {
+    /// Defence in depth against orphaning an `ssh -L` tunnel. Every explicit
+    /// teardown (`close_peer`/`reap_dead_peer`/`PeerManager::close_all`) already
+    /// kills the tunnel synchronously, but `tokio::process::Child` is not
+    /// kill-on-drop, so if a `PeerConnection` is ever dropped by some other path
+    /// its tunnel child would keep running. Killing it here makes "a
+    /// `PeerConnection` never leaks its tunnel" a structural invariant. The feed
+    /// loop cannot be aborted from here (it holds an `Arc` to this connection, so
+    /// this `drop` only runs once it has already ended or been aborted).
+    fn drop(&mut self) {
+        if let Some(mut child) = self.ssh_tunnel.take() {
+            let _ = child.start_kill();
+        }
     }
 }
 
@@ -455,21 +526,48 @@ impl PeerManager {
             conn.register_session(local_word, remote_word, entry, &peer_id);
         }
 
-        // 5. Start the feed loop, then publish the peer + word index. Publishing
-        //    last means a lookup that sees the word in `word_index` also finds the
-        //    fully-built connection.
+        // 5. Publish the peer. The reuse check at the top of `open_peer` is not
+        //    atomic with this insert across the `await`-heavy connect above, so two
+        //    GUIs federating the *same* target concurrently can both reach here.
+        //    Decide the winner under a single `peers` lock — the winner spawns its
+        //    feed loop and inserts; a loser tears its duplicate down (closing the
+        //    redundant upstream link + SSH tunnel and releasing its drawn words) and
+        //    reuses the winner — so a race can never leak a connection or corrupt the
+        //    word index. The word index is published only by the winner, while still
+        //    holding `peers`, so a lookup that sees a word also finds its connection.
         let conn = Arc::new(Mutex::new(conn));
-        let feed = spawn_feed_loop(server_rx, client_tx, Arc::clone(&conn), peer_id.clone());
-        conn.lock().unwrap().feed_task = Some(feed);
-        self.peers
-            .lock()
-            .unwrap()
-            .insert(peer_id.clone(), Arc::clone(&conn));
-        {
-            let mut idx = self.word_index.lock().unwrap();
-            for w in &assigned_words {
-                idx.insert(w.clone(), peer_id.clone());
+        let won = {
+            let mut peers = self.peers.lock().unwrap();
+            let taken = peers
+                .get(&peer_id)
+                .is_some_and(|existing| !existing.lock().unwrap().dead);
+            if taken {
+                false
+            } else {
+                let feed =
+                    spawn_feed_loop(server_rx, client_tx, Arc::clone(&conn), peer_id.clone());
+                conn.lock().unwrap().feed_task = Some(feed);
+                peers.insert(peer_id.clone(), Arc::clone(&conn));
+                let mut idx = self.word_index.lock().unwrap();
+                for w in &assigned_words {
+                    idx.insert(w.clone(), peer_id.clone());
+                }
+                true
             }
+        };
+
+        if !won {
+            // Lost the race: tear down this duplicate (no feed loop was spawned, so
+            // dropping `conn` closes its `client_tx` and the upstream link) and
+            // return the drawn words to the pool.
+            if let Some(mut child) = conn.lock().unwrap().ssh_tunnel.take() {
+                let _ = child.start_kill();
+            }
+            for w in &assigned_words {
+                app.release_word(w);
+            }
+            debug!(%peer_id, "lost concurrent open race; discarded duplicate peer link");
+            return Ok(peer_id);
         }
 
         info!(%peer_id, sessions = assigned_words.len(), "federated peer opened");
@@ -512,6 +610,37 @@ impl PeerManager {
             app.release_word(local_word);
         }
         debug!(%peer_id, "reaped dead peer before re-federation");
+    }
+
+    /// Tear every peer down for daemon shutdown: abort each feed loop and kill each
+    /// SSH `-L` tunnel **synchronously**, so no tunnel child is orphaned when the
+    /// process exits. This matters because `tokio::process::Child` is not
+    /// kill-on-drop and the runtime is torn down in the background
+    /// (`Runtime::shutdown_background`), which races process exit — so relying on
+    /// drop order is not enough. Words are not returned to the pool (the daemon is
+    /// going away). Idempotent and a no-op when no peers are open.
+    pub fn close_all(&self) {
+        let conns: Vec<_> = self
+            .peers
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, conn)| conn)
+            .collect();
+        self.word_index.lock().unwrap().clear();
+        let count = conns.len();
+        for conn in &conns {
+            let mut guard = conn.lock().unwrap();
+            if let Some(task) = &guard.feed_task {
+                task.abort();
+            }
+            if let Some(mut child) = guard.ssh_tunnel.take() {
+                let _ = child.start_kill();
+            }
+        }
+        if count > 0 {
+            info!(peers = count, "closed all federated peers on shutdown");
+        }
     }
 
     /// Whether `pane_id`'s session is proxied from a peer.
@@ -564,6 +693,7 @@ impl PeerManager {
         local_pane_id: &str,
         client_id: ClientId,
         data_tx: mpsc::Sender<ServerMessage>,
+        ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
         last_seqno: Option<SequenceNo>,
         size: TermSize,
     ) -> bool {
@@ -589,14 +719,30 @@ impl PeerManager {
                 sent_at_ms: epoch_millis(),
             };
             let _ = data_tx.try_send(minted);
-            pane.viewers.insert(client_id, Viewer { data_tx, size });
+            pane.viewers.insert(
+                client_id,
+                Viewer {
+                    data_tx,
+                    ctrl_tx,
+                    size,
+                    paused: false,
+                },
+            );
             guard.reconcile_size(local_pane_id, &remote_pane);
         } else {
             // First viewer: create the pane (mirror sized to the viewer) and
             // forward Attach upstream; the remote's snapshot arrives via the feed
             // loop and seeds the mirror.
             let mut pane = ProxiedPane::new(size);
-            pane.viewers.insert(client_id, Viewer { data_tx, size });
+            pane.viewers.insert(
+                client_id,
+                Viewer {
+                    data_tx,
+                    ctrl_tx,
+                    size,
+                    paused: false,
+                },
+            );
             guard.panes.insert(local_pane_id.to_string(), pane);
             let _ = guard.client_tx.send(ClientMessage::Attach {
                 pane_id: remote_pane,
@@ -663,6 +809,24 @@ impl PeerManager {
         }
     }
 
+    /// Apply connection-pause state (issue #68) to every federated pane `client_id`
+    /// views, across all peers. A paused viewer is skipped in [`ProxiedPane::fan_out`]
+    /// (it stops receiving terminal output and resyncs on resume via re-attach, which
+    /// mints from the still-current mirror) but still counts toward smallest-wins
+    /// sizing — the same semantics as the local relay's `set_paused`. No-op for a
+    /// client that views no federated panes.
+    pub fn set_paused(&self, client_id: ClientId, paused: bool) {
+        let conns: Vec<_> = self.peers.lock().unwrap().values().cloned().collect();
+        for conn in conns {
+            let mut guard = conn.lock().unwrap();
+            for pane in guard.panes.values_mut() {
+                if let Some(viewer) = pane.viewers.get_mut(&client_id) {
+                    viewer.paused = paused;
+                }
+            }
+        }
+    }
+
     fn conn_for_word(&self, local_word: &str) -> Option<Arc<Mutex<PeerConnection>>> {
         let peer_id = self.word_index.lock().unwrap().get(local_word).cloned()?;
         self.peers.lock().unwrap().get(&peer_id).cloned()
@@ -687,29 +851,17 @@ fn spawn_feed_loop(
 
             // Pane-scoped frames: translate the pane ID remote→local, feed the
             // pane's mirror (so a late local attacher can be served from it), then
-            // collect that pane's viewers.
+            // fan out to that pane's viewers. `fan_out` applies the relay's
+            // backpressure policy: a full viewer is sent `Lagged` (out-of-band) and
+            // dropped, then resyncs on re-attach from the just-updated mirror.
             if let Some(remote_pane) = msg_pane_id(&msg).map(str::to_string) {
-                let viewers = {
-                    let mut guard = conn.lock().unwrap();
-                    match guard.to_local_pane(&remote_pane) {
-                        Some(local_pane) => {
-                            set_msg_pane_id(&mut msg, local_pane.clone());
-                            match guard.panes.get_mut(&local_pane) {
-                                Some(pane) => {
-                                    pane.apply_to_mirror(&msg);
-                                    pane.viewer_senders()
-                                }
-                                None => Vec::new(),
-                            }
-                        }
-                        None => Vec::new(),
+                let mut guard = conn.lock().unwrap();
+                if let Some(local_pane) = guard.to_local_pane(&remote_pane) {
+                    set_msg_pane_id(&mut msg, local_pane.clone());
+                    if let Some(pane) = guard.panes.get_mut(&local_pane) {
+                        pane.apply_to_mirror(&msg);
+                        pane.fan_out(&local_pane, &msg);
                     }
-                };
-                for tx in viewers {
-                    // Best-effort: a full viewer channel drops this frame; the client
-                    // recovers via `Lagged` + re-attach with `last_seqno`. PR6 hardens
-                    // the backpressure path.
-                    let _ = tx.try_send(msg.clone());
                 }
                 continue;
             }
@@ -717,7 +869,9 @@ fn spawn_feed_loop(
             // Session-scoped events (titles, layout, tab/session lifecycle): translate
             // the embedded word remote→local and fan out to every viewer under that
             // word, so a GUI viewing a federated session still receives its title and
-            // layout updates.
+            // layout updates. These go over the viewers' unbounded ctrl channel
+            // (`viewers_under_word`), so — exactly as in the local daemon — a backed-up
+            // pane content stream can never drop an event.
             let viewers = {
                 let guard = conn.lock().unwrap();
                 match &mut msg {
@@ -738,7 +892,7 @@ fn spawn_feed_loop(
             };
             if let Some(viewers) = viewers {
                 for tx in viewers {
-                    let _ = tx.try_send(msg.clone());
+                    let _ = tx.send(msg.clone());
                 }
             }
         }
@@ -747,7 +901,10 @@ fn spawn_feed_loop(
         // the failure: tell every viewer its proxied session ended so the GUI
         // cleans up instead of hanging, drop the panes (closing the pane streams),
         // and mark the connection dead for lazy reaping. Locally-hosted PTY panes
-        // are untouched — they live in a separate relay.
+        // are untouched — they live in a separate relay. The `SessionClosed` goes
+        // over the unbounded ctrl channel so a viewer whose data stream happened to
+        // be full at death still learns the session ended (a bounded `try_send`
+        // could drop it and the GUI would hang, since no further frames follow).
         {
             let mut guard = conn.lock().unwrap();
             guard.dead = true;
@@ -759,7 +916,7 @@ fn spawn_feed_loop(
                     },
                 };
                 for tx in guard.viewers_under_word(local_word) {
-                    let _ = tx.try_send(closed.clone());
+                    let _ = tx.send(closed.clone());
                 }
             }
             // Drop panes (closing pane streams) and sessions (so a post-death
@@ -1050,29 +1207,32 @@ mod tests {
         }
     }
 
+    /// A test viewer with a bounded data channel and a throwaway ctrl channel.
+    fn test_viewer(cap: usize, size: TermSize) -> (Viewer, mpsc::Receiver<ServerMessage>) {
+        let (data_tx, data_rx) = mpsc::channel(cap);
+        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel();
+        (
+            Viewer {
+                data_tx,
+                ctrl_tx,
+                size,
+                paused: false,
+            },
+            data_rx,
+        )
+    }
+
     #[test]
     fn proxied_pane_effective_size_is_smallest_wins() {
         let mut pane = ProxiedPane::new(sz(24, 80));
-        let (d1, _r1) = mpsc::channel(8);
-        let (d2, _r2) = mpsc::channel(8);
-        pane.viewers.insert(
-            ClientId(1),
-            Viewer {
-                data_tx: d1,
-                size: sz(24, 80),
-            },
-        );
-        pane.viewers.insert(
-            ClientId(2),
-            Viewer {
-                data_tx: d2,
-                size: sz(10, 40),
-            },
-        );
+        let (v1, _r1) = test_viewer(8, sz(24, 80));
+        let (v2, _r2) = test_viewer(8, sz(10, 40));
+        pane.viewers.insert(ClientId(1), v1);
+        pane.viewers.insert(ClientId(2), v2);
         // Smallest-wins across viewers (the size forwarded upstream).
         let eff = pane.effective_size();
         assert_eq!((eff.rows, eff.cols), (10, 40));
-        assert_eq!(pane.viewer_senders().len(), 2);
+        assert_eq!(pane.viewer_ctrl_senders().len(), 2);
     }
 
     #[test]
@@ -1111,6 +1271,114 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_delivers_to_healthy_viewer() {
+        let mut pane = ProxiedPane::new(sz(24, 80));
+        let (v, mut rx) = test_viewer(8, sz(24, 80));
+        pane.viewers.insert(ClientId(1), v);
+
+        pane.fan_out("hawk/0", &snapshot_msg("hawk/0"));
+
+        assert!(
+            matches!(rx.try_recv(), Ok(ServerMessage::TerminalSnapshot { .. })),
+            "a healthy viewer receives the frame"
+        );
+        assert_eq!(pane.viewers.len(), 1, "a healthy viewer is retained");
+    }
+
+    #[test]
+    fn fan_out_sends_lagged_via_ctrl_and_drops_full_viewer() {
+        // A capacity-1 data channel pre-filled so the next send overflows; the
+        // viewer must then get a `Lagged` on its ctrl channel and be removed.
+        let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        data_tx.try_send(snapshot_msg("hawk/0")).unwrap(); // fill to capacity
+
+        let mut pane = ProxiedPane::new(sz(24, 80));
+        pane.viewers.insert(
+            ClientId(9),
+            Viewer {
+                data_tx,
+                ctrl_tx,
+                size: sz(24, 80),
+                paused: false,
+            },
+        );
+
+        pane.fan_out("hawk/0", &snapshot_msg("hawk/0"));
+
+        let lagged = ctrl_rx.try_recv().expect("Lagged must arrive on ctrl");
+        assert!(
+            matches!(&lagged, ServerMessage::Lagged { pane_id, .. } if pane_id == "hawk/0"),
+            "a backed-up viewer is signalled Lagged out-of-band, got {lagged:?}",
+        );
+        assert!(
+            pane.viewers.is_empty(),
+            "a lagged viewer is dropped (it re-attaches and resyncs from the mirror)"
+        );
+    }
+
+    #[test]
+    fn fan_out_skips_paused_viewer_without_dropping_it() {
+        // A paused viewer (issue #68) receives nothing and is retained even when its
+        // channel is full — it resyncs on resume via re-attach, never lagged.
+        let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        data_tx.try_send(snapshot_msg("hawk/0")).unwrap(); // fill to capacity
+
+        let mut pane = ProxiedPane::new(sz(24, 80));
+        pane.viewers.insert(
+            ClientId(5),
+            Viewer {
+                data_tx,
+                ctrl_tx,
+                size: sz(24, 80),
+                paused: true,
+            },
+        );
+
+        pane.fan_out("hawk/0", &snapshot_msg("hawk/0"));
+
+        assert!(
+            ctrl_rx.try_recv().is_err(),
+            "a paused viewer must not be sent Lagged even with a full channel"
+        );
+        assert_eq!(
+            pane.viewers.len(),
+            1,
+            "a paused viewer must be retained, not dropped"
+        );
+    }
+
+    #[test]
+    fn fan_out_drops_closed_viewer_silently() {
+        let (data_tx, data_rx) = mpsc::channel::<ServerMessage>(8);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        drop(data_rx); // receiver gone → channel closed
+
+        let mut pane = ProxiedPane::new(sz(24, 80));
+        pane.viewers.insert(
+            ClientId(3),
+            Viewer {
+                data_tx,
+                ctrl_tx,
+                size: sz(24, 80),
+                paused: false,
+            },
+        );
+
+        pane.fan_out("hawk/0", &snapshot_msg("hawk/0"));
+
+        assert!(
+            pane.viewers.is_empty(),
+            "a viewer whose channel closed is dropped"
+        );
+        assert!(
+            ctrl_rx.try_recv().is_err(),
+            "a closed viewer gets no Lagged — it is simply gone"
+        );
+    }
+
+    #[test]
     fn is_federated_pane_reflects_word_index() {
         let mgr = PeerManager::new();
         assert!(!mgr.is_federated_pane("hawk/0"));
@@ -1144,6 +1412,60 @@ mod tests {
         );
         let _ = parked.start_kill();
         let _ = parked.wait().await;
+    }
+
+    /// Daemon shutdown must kill every peer's SSH tunnel synchronously (the
+    /// runtime is torn down in the background, racing process exit, and
+    /// `tokio::process::Child` is not kill-on-drop) and clear all peer state.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_all_kills_tunnels_and_clears_peers() {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        let mgr = PeerManager::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut conn = PeerConnection::new(tx);
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = Pid::from_raw(child.id().expect("child pid") as i32);
+        conn.ssh_tunnel = Some(child);
+        // A never-ending feed loop stand-in, so we exercise the abort path too.
+        conn.feed_task = Some(tokio::spawn(std::future::pending::<()>()));
+
+        let peer_id = "box:9000".to_string();
+        mgr.peers
+            .lock()
+            .unwrap()
+            .insert(peer_id.clone(), Arc::new(Mutex::new(conn)));
+        mgr.word_index
+            .lock()
+            .unwrap()
+            .insert("hawk".to_string(), peer_id);
+
+        mgr.close_all();
+
+        assert!(
+            mgr.peers.lock().unwrap().is_empty(),
+            "close_all must drop every peer"
+        );
+        assert!(
+            mgr.word_index.lock().unwrap().is_empty(),
+            "close_all must clear the word index"
+        );
+
+        // The tunnel pid must disappear (a live `sleep 60` would persist).
+        let mut gone = false;
+        for _ in 0..200 {
+            if kill(pid, None).is_err() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(gone, "close_all must kill the SSH tunnel");
     }
 
     /// An un-disarmed guard (any error between `negotiate` and registration, or a

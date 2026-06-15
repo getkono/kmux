@@ -134,10 +134,23 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   the remote pane arrives as `PaneTitleChanged` for the local pane). `Signal` and
   `FetchHistory` for a federated pane are forwarded upstream too (the `HistoryLines`
   reply is pane-scoped, so the feed loop routes it back to the requesting viewer).
+- **PR4 facet — per-viewer pause (local) — landed.** A paused GUI (issue #68) viewing a
+  proxied pane now stops receiving its output: `ServerApp::set_paused` also marks the
+  client's federated viewers (`set_federated_paused` → `PeerManager::set_paused`), and
+  `fan_out` skips paused viewers (never marking them lagged) — matching the local relay.
+  A paused viewer still counts toward smallest-wins sizing and resyncs on resume via
+  re-attach (which mints from the still-current mirror). Unit:
+  `fan_out_skips_paused_viewer_without_dropping_it`.
 - **PR4 remaining facets** (independent, lower-risk; a naive forward would break
-  multi-viewer correctness, so each needs real arbitration/filtering state): pause
-  upstream only when **all** local viewers are paused (issue #68 interplay); capability
-  union upstream / filter downstream; and input-lock arbitration across local viewers.
+  multi-viewer correctness, so each needs real arbitration/filtering state):
+  - **pause-*union* upstream** — when **all** local viewers of a proxied pane are paused,
+    stop the *upstream* stream too (the local-pause above already stops downstream
+    delivery; this reclaims the federation link's bandwidth). The natural mechanism is
+    `Detach` upstream on all-paused and re-`Attach` on first-resume — deferred because
+    that resume cost (a fresh upstream snapshot) is a real trade-off vs. keeping the
+    mirror warm, and the win only matters under sustained all-paused.
+  - capability union upstream / filter downstream; and input-lock arbitration across
+    local viewers.
 - **PR5 prerequisite — SSH peer federation — landed.** `open_peer` now serves
   `PeerTarget::Ssh` as well as `Direct`: it negotiates the `-L` tunnel via
   `kmux-connect`'s `ssh::negotiate` and connects over TCP+TLS through it, sharing the
@@ -199,9 +212,56 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   the upstream `Auth` handshake (`open_peer` surfaces it as a `PeerError`). E2E:
   `remote_daemon_death_is_isolated_from_local_daemon` SIGKILLs the remote and asserts
   the GUI gets `SessionClosed` while the local daemon keeps serving new sessions.
-- **PR6 remaining** (further hardening): upstream reconnect/backoff (reuse
-  `kmux-connect` `recovery`), idle peer drop (debounced teardown when no local viewer
-  remains), and backpressure refinement on a lagging viewer.
+- **PR6 — viewer backpressure parity — landed.** A proxied pane's frames are fanned
+  out by `ProxiedPane::fan_out`, which applies the **same** policy as the local PTY
+  relay (`relay::broadcast_to_clients`): a viewer whose bounded data channel is full is
+  sent a `Lagged` over its **unbounded ctrl channel** (out-of-band, so it lands despite
+  the backed-up data channel) and dropped — it re-attaches and is served a fresh
+  snapshot minted from the still-correct mirror (the mirror is fed *before* fan-out, so
+  a slow viewer never desyncs it); a closed viewer is dropped silently. The downstream
+  relay is now identical for PTY-backed and peer-backed panes. (Previously a full
+  channel silently dropped the frame, diverging that viewer permanently.)
+  **Session events and lifecycle** (titles, layout, tab/session events, and the
+  death-path `SessionClosed`) instead travel over each viewer's **unbounded ctrl**
+  channel (`viewers_under_word`), matching how the local daemon delivers events — so a
+  backed-up pane content stream can never drop a title change, and a viewer that was
+  full at the instant the peer died still receives its `SessionClosed` (otherwise the
+  GUI would hang, as no further frames follow). Content keeps backpressure; events are
+  guaranteed.
+- **PR6 — concurrent-open race — fixed.** `open_peer`'s reuse check and its publish
+  straddle the awaiting connect/auth/list, so two GUIs federating the same target at
+  once could both connect and both publish, the second overwriting the first and leaking
+  its link, feed task, and SSH tunnel. The winner is now chosen under a single `peers`
+  lock (the loser tears its duplicate down and reuses the winner), so a race can never
+  leak a connection or corrupt the word index. E2E:
+  `concurrent_open_peer_to_same_target_converges_on_one_link`.
+- **PR6 — SSH tunnel shutdown leak — fixed.** A federated `Ssh` peer parks its `ssh -L`
+  child on the connection; `tokio::process::Child` is not kill-on-drop and runtime
+  teardown (`shutdown_background`) races process exit, so daemon shutdown orphaned one
+  `ssh` per SSH peer. `PeerManager::close_all` (via `ServerApp::close_all_peers`) now
+  kills every tunnel and aborts every feed loop synchronously on the shutdown path
+  (all paths, including a committed handoff — peer links are not migrated); a `Drop` on
+  `PeerConnection` makes "never leaks its tunnel" structural. Unit:
+  `close_all_kills_tunnels_and_clears_peers`.
+- **PR6 — version guard — confirmed + tested.** A peer link is rejected on a
+  `PROTOCOL_VERSION` mismatch by the standard upstream `Auth` handshake (the remote
+  checks the version *before* the token), surfaced as `PeerError`. E2E
+  `federation_surfaces_upstream_auth_rejection_as_peer_error` covers that branch via a
+  wrong-token rejection (the same `AuthResult{success:false}` a version mismatch yields).
+- **PR6 — idle peer drop: intentionally not added.** The daemon's existing
+  idle-shutdown (`startup.rs`, debounced on client count → 0) already drops the whole
+  daemon — peers and their links included — when no GUI is connected, which is the only
+  case where dropping an upstream is unambiguously safe. Dropping a peer while a GUI is
+  still connected would remove its sessions from the picker mid-use, so a separate
+  debounced peer-idle-drop is both redundant (zero-GUI case) and wrong (GUI-connected
+  case).
+- **PR6 remaining** (future): **transparent upstream reconnect/backoff** — a *transient*
+  upstream blip (remote alive, network hiccup) currently surfaces as `SessionClosed`,
+  and recovery relies on the GUI re-issuing `OpenPeer` on its next local (re)connect
+  (#121 GUI rewire). Reconnecting in-daemon (reuse `kmux-connect` `recovery`, preserve
+  the local words, re-attach panes) is deferred: it needs remote-restart semantics
+  (a restarted remote has *different* session words, so a silent re-map would be wrong)
+  and a reachable flaky remote to verify, neither of which is in CI scope.
 
 ## Resolved — federation addressing & testability
 

@@ -77,6 +77,32 @@ impl ServerApp {
         }
     }
 
+    /// Apply connection-pause state (issue #68) to every federated pane `client_id`
+    /// views: a paused viewer is skipped in the feed loop's fan-out and resyncs on
+    /// resume via re-attach. A no-op without the feature (or for a client viewing no
+    /// federated panes). Complements [`ServerApp::set_paused`], which covers
+    /// locally-hosted panes.
+    pub fn set_federated_paused(&self, client_id: ClientId, paused: bool) {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.set_paused(client_id, paused);
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (client_id, paused);
+        }
+    }
+
+    /// Tear down every federated peer (abort feed loops, kill SSH tunnels) for
+    /// daemon shutdown, so no `ssh -L` child is orphaned when the process exits. A
+    /// no-op without the feature (or when no peers are open).
+    pub fn close_all_peers(&self) {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.close_all();
+        }
+    }
+
     /// The proxied sessions of every open peer, with local IDs and peer-decorated
     /// names, to be merged into [`ServerApp::list_sessions`]. Empty without the
     /// feature.
@@ -110,25 +136,28 @@ impl ServerApp {
         }
     }
 
-    /// Register `data_tx` as a viewer of federated `pane_id` and forward an
-    /// `Attach` upstream. Returns `true` when `pane_id` is federated (and the
-    /// attach was forwarded), `false` otherwise.
+    /// Register a viewer of federated `pane_id` and forward an `Attach` upstream.
+    /// `data_tx` is the viewer's bounded pane-stream channel; `ctrl_tx` is its
+    /// unbounded control channel, over which a `Lagged` is delivered out-of-band if
+    /// the data channel backs up (matching the local relay). Returns `true` when
+    /// `pane_id` is federated (and the attach was forwarded), `false` otherwise.
     pub fn federated_attach(
         &self,
         pane_id: &str,
         client_id: ClientId,
         data_tx: mpsc::Sender<ServerMessage>,
+        ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
         last_seqno: Option<SequenceNo>,
         size: TermSize,
     ) -> bool {
         #[cfg(feature = "federation")]
         {
             self.peer_manager
-                .attach_viewer(pane_id, client_id, data_tx, last_seqno, size)
+                .attach_viewer(pane_id, client_id, data_tx, ctrl_tx, last_seqno, size)
         }
         #[cfg(not(feature = "federation"))]
         {
-            let _ = (pane_id, client_id, data_tx, last_seqno, size);
+            let _ = (pane_id, client_id, data_tx, ctrl_tx, last_seqno, size);
             false
         }
     }

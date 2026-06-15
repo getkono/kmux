@@ -716,3 +716,240 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
     set_xdg(local_dir.path());
     let _ = kmux_client::daemon::stop_daemon().await;
 }
+
+/// PR6 hardening: two GUIs federating the **same** remote target concurrently
+/// converge on a single shared upstream link. The reuse check in `open_peer` is
+/// not atomic with the publish across the (slow, awaiting) connect, so both opens
+/// can run the full handshake before either publishes; the winner-takes-all
+/// publish must leave exactly one peer with one set of words — never a leaked
+/// duplicate link or a word index pointing at a connection that doesn't own it
+/// (which would make the federated pane un-attachable).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
+async fn concurrent_open_peer_to_same_target_converges_on_one_link() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
+    let cleanup = Cleanup::default();
+
+    let remote_dir = tempfile::tempdir().unwrap();
+    let local_dir = tempfile::tempdir().unwrap();
+
+    set_xdg(remote_dir.path());
+    let remote_pid = spawn_daemon(&exe).await;
+    cleanup.track(remote_pid as i32);
+    let remote_status = kmux_client::daemon::query_daemon()
+        .await
+        .expect("remote daemon status");
+    let remote_token = remote_status.token.clone();
+    let remote_tcp = remote_status.tcp_port;
+
+    const MARKER: &str = "CONCURRENT_OPEN_MARKER";
+    let pidfile = remote_dir.path().join("shell.pid");
+    let (_remote_word, shell_pid) =
+        create_remote_session(&remote_token, remote_dir.path(), MARKER, &pidfile).await;
+    cleanup.track(shell_pid);
+
+    set_xdg(local_dir.path());
+    let local_pid = spawn_daemon(&exe).await;
+    cleanup.track(local_pid as i32);
+    let local_token = kmux_client::daemon::query_daemon()
+        .await
+        .expect("local daemon status")
+        .token;
+
+    let (gui1_tx, mut gui1_rx) = connect_authenticated(&local_token).await;
+    let (gui2_tx, mut gui2_rx) = connect_authenticated(&local_token).await;
+
+    let target = || PeerTarget::Direct {
+        host: "127.0.0.1".into(),
+        port: remote_tcp,
+        token: remote_token.clone(),
+        accept_invalid_certs: true,
+    };
+    // Fire BOTH opens before awaiting either reply, so the two handshakes overlap
+    // and race to publish — exactly the window the fix closes.
+    gui1_tx
+        .send(ClientMessage::OpenPeer {
+            request_id: 1,
+            target: target(),
+        })
+        .expect("gui1 OpenPeer");
+    gui2_tx
+        .send(ClientMessage::OpenPeer {
+            request_id: 1,
+            target: target(),
+        })
+        .expect("gui2 OpenPeer");
+
+    let is_peer_reply = |m: &ServerMessage| {
+        matches!(
+            m,
+            ServerMessage::PeerOpened { .. } | ServerMessage::PeerError { .. }
+        )
+    };
+    // Disjoint mutable borrows (gui1_rx vs gui2_rx), so both futures poll under one
+    // `join!` and the two opens are genuinely in flight at once.
+    let (r1, r2) = tokio::join!(
+        recv_until(&mut gui1_rx, Duration::from_secs(15), is_peer_reply),
+        recv_until(&mut gui2_rx, Duration::from_secs(15), is_peer_reply),
+    );
+    let peer_of = |r: Option<ServerMessage>| match r {
+        Some(ServerMessage::PeerOpened { peer, .. }) => peer,
+        other => panic!("both concurrent opens must succeed, got {other:?}"),
+    };
+    let (p1, p2) = (peer_of(r1), peer_of(r2));
+    assert_eq!(
+        p1, p2,
+        "both GUIs must converge on the same peer id for the same target"
+    );
+
+    // Exactly one federated session is registered (a leaked duplicate would draw a
+    // second word and list a second proxied session).
+    gui1_tx
+        .send(ClientMessage::SessionList { request_id: 50 })
+        .expect("send SessionList");
+    let list = recv_until(&mut gui1_rx, Duration::from_secs(5), |m| {
+        matches!(m, ServerMessage::SessionListResult { .. })
+    })
+    .await
+    .expect("expected a SessionListResult");
+    let federated: Vec<_> = match list {
+        ServerMessage::SessionListResult { sessions, .. } => sessions
+            .into_iter()
+            .filter(|e| e.meta.name.contains('@'))
+            .collect(),
+        _ => unreachable!(),
+    };
+    assert_eq!(
+        federated.len(),
+        1,
+        "a concurrent open must leave exactly one proxied session, not a leaked duplicate"
+    );
+
+    // The surviving session is attachable — proves the word index still maps to the
+    // live connection (a race that overwrote the published peer would orphan it and
+    // the attach would never produce a snapshot).
+    let local_pane = federated[0].panes[0].pane_id.clone();
+    gui1_tx
+        .send(ClientMessage::Attach {
+            pane_id: local_pane.clone(),
+            last_seqno: None,
+            size: ATTACH_SIZE,
+        })
+        .expect("send Attach");
+    let want = local_pane.clone();
+    assert!(
+        recv_until(&mut gui1_rx, Duration::from_secs(15), move |m| {
+            matches!(m, ServerMessage::TerminalSnapshot { pane_id, snapshot, .. }
+                if *pane_id == want && snapshot_text(snapshot).contains(MARKER))
+        })
+        .await
+        .is_some(),
+        "the surviving federated pane must stay attachable after a concurrent open race"
+    );
+
+    // ── Teardown. ──
+    drop(gui1_tx);
+    drop(gui2_tx);
+    set_xdg(local_dir.path());
+    let _ = kmux_client::daemon::stop_daemon().await;
+    set_xdg(remote_dir.path());
+    let _ = kmux_client::daemon::stop_daemon().await;
+}
+
+/// PR6 hardening: an upstream peer link that **rejects authentication** surfaces
+/// cleanly as `PeerError` (not a hang or a half-open peer), and the local daemon
+/// keeps serving. This exercises the same `open_peer` branch a protocol-version
+/// mismatch hits — the remote rejects `Auth` with `AuthResult { success: false }`
+/// whether the cause is a bad token or an incompatible `PROTOCOL_VERSION`, and the
+/// version guard (`dispatch::handle_message`) is checked *before* the token — so a
+/// wrong token is a faithful, deterministic stand-in for the version-mismatch path
+/// (which cannot be provoked without building a second daemon at a different
+/// version).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
+async fn federation_surfaces_upstream_auth_rejection_as_peer_error() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
+    let cleanup = Cleanup::default();
+
+    let remote_dir = tempfile::tempdir().unwrap();
+    let local_dir = tempfile::tempdir().unwrap();
+
+    // Remote daemon (real token), then the local hub.
+    set_xdg(remote_dir.path());
+    let remote_pid = spawn_daemon(&exe).await;
+    cleanup.track(remote_pid as i32);
+    let remote_status = kmux_client::daemon::query_daemon()
+        .await
+        .expect("remote daemon status");
+    let remote_tcp = remote_status.tcp_port;
+
+    set_xdg(local_dir.path());
+    let local_pid = spawn_daemon(&exe).await;
+    cleanup.track(local_pid as i32);
+    let local_token = kmux_client::daemon::query_daemon()
+        .await
+        .expect("local daemon status")
+        .token;
+
+    // GUI federates with a WRONG token — the remote rejects authentication, the
+    // same `AuthResult { success: false }` a version mismatch produces.
+    let (gui_tx, mut gui_rx) = connect_authenticated(&local_token).await;
+    gui_tx
+        .send(ClientMessage::OpenPeer {
+            request_id: 1,
+            target: PeerTarget::Direct {
+                host: "127.0.0.1".into(),
+                port: remote_tcp,
+                token: "definitely-not-the-remote-token".into(),
+                accept_invalid_certs: true,
+            },
+        })
+        .expect("send OpenPeer");
+    let reply = recv_until(&mut gui_rx, Duration::from_secs(15), |m| {
+        matches!(
+            m,
+            ServerMessage::PeerOpened { .. } | ServerMessage::PeerError { .. }
+        )
+    })
+    .await
+    .expect("expected a peer reply");
+    match reply {
+        ServerMessage::PeerError { reason, .. } => {
+            assert!(
+                reason.contains("authentication") || reason.contains("token"),
+                "the rejection reason should name the auth failure, got: {reason}"
+            );
+        }
+        other => panic!("a rejected peer must surface as PeerError, got {other:?}"),
+    }
+
+    // Isolation: the local daemon is unaffected by the rejected peer — it still
+    // serves new local sessions.
+    gui_tx
+        .send(ClientMessage::SessionCreate {
+            request_id: 2,
+            name: Some("local-after-reject".into()),
+            cwd: Some(local_dir.path().display().to_string()),
+            program: Some("/bin/sh".into()),
+            args: vec!["-c".into(), "exec sleep 600".into()],
+            size: ATTACH_SIZE,
+        })
+        .expect("send local SessionCreate");
+    assert!(
+        recv_until(&mut gui_rx, Duration::from_secs(10), |m| {
+            matches!(m, ServerMessage::SessionCreated { .. })
+        })
+        .await
+        .is_some(),
+        "the local daemon must keep serving after a peer link is rejected"
+    );
+
+    // ── Teardown. ──
+    drop(gui_tx);
+    set_xdg(local_dir.path());
+    let _ = kmux_client::daemon::stop_daemon().await;
+    set_xdg(remote_dir.path());
+    let _ = kmux_client::daemon::stop_daemon().await;
+}

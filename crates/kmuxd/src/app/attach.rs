@@ -184,6 +184,10 @@ impl ServerApp {
     /// (issue #68). While paused the relay skips this client; the pane keeps
     /// running and the client keeps counting toward the effective pane size.
     /// Resume reconciliation happens when the client re-attaches its panes.
+    ///
+    /// Covers both locally-hosted panes (the relays below) and the client's
+    /// federated panes (`set_federated_paused`), so pausing a GUI viewing a proxied
+    /// remote session stops its output too — not just local sessions.
     pub async fn set_paused(&self, client_id: ClientId, paused: bool) {
         let sessions = self.sessions.read().await;
         for state in sessions.values() {
@@ -194,6 +198,8 @@ impl ServerApp {
                 }
             }
         }
+        drop(sessions);
+        self.set_federated_paused(client_id, paused);
     }
 
     /// Remove a client from a specific pane and release any lock they hold.

@@ -497,9 +497,14 @@ pub async fn handle_message<A: PaneAttacher>(
                 // through the peer feed loop and are pumped to this client via
                 // `client_rx`, so the synchronous replay is empty — `Delta(vec![])`
                 // emits no initial frames (see `build_attach_replay`).
-                state
-                    .app
-                    .federated_attach(&pane_id, client_id, client_tx, last_seqno, size);
+                state.app.federated_attach(
+                    &pane_id,
+                    client_id,
+                    client_tx,
+                    state.ctrl_tx.clone(),
+                    last_seqno,
+                    size,
+                );
                 match attacher
                     .start_pane_stream(pane_id.clone(), AttachResult::Delta(vec![]), client_rx)
                     .await
