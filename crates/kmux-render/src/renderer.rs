@@ -8,9 +8,10 @@
 //! backgrounds → cell glyphs → overlays (rules/wash/cursor/border) → overlay
 //! glyphs (block-cursor glyph + scroll text).
 //!
-//! Only the offscreen target lands here (the GTK path reads its pixels back into
-//! a `GdkMemoryTexture`); the direct-surface constructor for the Swift/Metal
-//! path is added with the FFI renderer object.
+//! Two targets are supported: an offscreen texture the caller reads back (the
+//! GTK path, via `read_pixels` → `GdkMemoryTexture`) and a direct platform
+//! surface presented each frame (the Swift/macOS `CAMetalLayer` path, driven by
+//! the FFI renderer object).
 
 use std::mem::size_of;
 
@@ -42,30 +43,33 @@ pub struct RenderedPixels {
     pub rgba: Vec<u8>,
 }
 
-struct OffscreenTarget {
-    texture: wgpu::Texture,
-    view: wgpu::TextureView,
+/// Where the renderer presents: an offscreen texture read back by the caller
+/// (GTK), or a platform surface presented directly (Swift/macOS CAMetalLayer).
+enum Target {
+    /// Render to an internal texture; `read_pixels` copies it out.
+    Offscreen { texture: wgpu::Texture },
+    /// Render to and present a swapchain surface (no readback).
+    Surface {
+        surface: wgpu::Surface<'static>,
+        config: wgpu::SurfaceConfiguration,
+    },
 }
 
-impl OffscreenTarget {
-    fn new(device: &wgpu::Device, width: u32, height: u32) -> Self {
-        let texture = device.create_texture(&wgpu::TextureDescriptor {
-            label: Some("kmux-render offscreen"),
-            size: wgpu::Extent3d {
-                width,
-                height,
-                depth_or_array_layers: 1,
-            },
-            mip_level_count: 1,
-            sample_count: 1,
-            dimension: wgpu::TextureDimension::D2,
-            format: TARGET_FORMAT,
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
-            view_formats: &[],
-        });
-        let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
-        Self { texture, view }
-    }
+fn make_offscreen_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Texture {
+    device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("kmux-render offscreen"),
+        size: wgpu::Extent3d {
+            width,
+            height,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: TARGET_FORMAT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::COPY_SRC,
+        view_formats: &[],
+    })
 }
 
 /// A GPU terminal renderer that draws into an offscreen RGBA texture.
@@ -82,13 +86,14 @@ pub struct TerminalRenderer {
     metrics: RenderMetrics,
     appearance: Appearance,
     palette: Theme,
-    target: OffscreenTarget,
+    target: Target,
     width: u32,
     height: u32,
 }
 
 impl TerminalRenderer {
-    /// Build an offscreen renderer of `width × height` physical px.
+    /// Build an offscreen renderer of `width × height` physical px (the GTK
+    /// path; `read_pixels` returns the rendered frame).
     pub fn new_offscreen(
         width: u32,
         height: u32,
@@ -97,14 +102,101 @@ impl TerminalRenderer {
         palette: &Theme,
     ) -> Result<Self, RenderError> {
         let instance = wgpu::Instance::default();
-        let adapter = pollster::block_on(request_adapter(&instance))?;
+        let adapter = pollster::block_on(request_adapter(&instance, None))?;
         let (device, queue) = pollster::block_on(request_device(&adapter))?;
-
-        let pipelines = Pipelines::new(&device, TARGET_FORMAT);
-        let metrics = RenderMetrics::from_appearance(appearance, scale);
         let (width, height) = (width.max(1), height.max(1));
-        let target = OffscreenTarget::new(&device, width, height);
+        let texture = make_offscreen_texture(&device, width, height);
+        Ok(Self::assemble(
+            device,
+            queue,
+            TARGET_FORMAT,
+            Target::Offscreen { texture },
+            width,
+            height,
+            scale,
+            appearance,
+            palette,
+        ))
+    }
 
+    /// Build a renderer that presents directly to a `CAMetalLayer` (the
+    /// Swift/macOS path; no readback).
+    ///
+    /// # Safety
+    /// `layer_ptr` must be a valid `CAMetalLayer` pointer that outlives the
+    /// returned renderer; the caller (the Swift view) owns and keeps it alive.
+    pub unsafe fn new_for_metal_layer(
+        layer_ptr: u64,
+        width: u32,
+        height: u32,
+        scale: f32,
+        appearance: &Appearance,
+        palette: &Theme,
+    ) -> Result<Self, RenderError> {
+        let instance = wgpu::Instance::default();
+        let surface = unsafe {
+            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(
+                layer_ptr as *mut std::ffi::c_void,
+            ))
+        }
+        .map_err(|e| RenderError::Surface(e.to_string()))?;
+        let adapter = pollster::block_on(request_adapter(&instance, Some(&surface)))?;
+        let (device, queue) = pollster::block_on(request_device(&adapter))?;
+        let (width, height) = (width.max(1), height.max(1));
+
+        let caps = surface.get_capabilities(&adapter);
+        // Prefer a non-sRGB format so colors are written straight (no gamma),
+        // matching the offscreen/CPU path.
+        let format = caps
+            .formats
+            .iter()
+            .copied()
+            .find(|f| !f.is_srgb())
+            .unwrap_or_else(|| caps.formats[0]);
+        let config = wgpu::SurfaceConfiguration {
+            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+            format,
+            width,
+            height,
+            present_mode: wgpu::PresentMode::Fifo,
+            alpha_mode: caps
+                .alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
+            view_formats: vec![],
+            desired_maximum_frame_latency: 2,
+        };
+        surface.configure(&device, &config);
+
+        Ok(Self::assemble(
+            device,
+            queue,
+            format,
+            Target::Surface { surface, config },
+            width,
+            height,
+            scale,
+            appearance,
+            palette,
+        ))
+    }
+
+    /// Shared construction once a device/queue/target/format are chosen.
+    #[allow(clippy::too_many_arguments)]
+    fn assemble(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        format: wgpu::TextureFormat,
+        target: Target,
+        width: u32,
+        height: u32,
+        scale: f32,
+        appearance: &Appearance,
+        palette: &Theme,
+    ) -> Self {
+        let pipelines = Pipelines::new(&device, format);
+        let metrics = RenderMetrics::from_appearance(appearance, scale);
         let globals_buf = device.create_buffer(&wgpu::BufferDescriptor {
             label: Some("kmux-render globals"),
             size: size_of::<Globals>() as u64,
@@ -130,7 +222,7 @@ impl TerminalRenderer {
             ..Default::default()
         });
 
-        Ok(Self {
+        Self {
             device,
             queue,
             pipelines,
@@ -146,7 +238,7 @@ impl TerminalRenderer {
             target,
             width,
             height,
-        })
+        }
     }
 
     /// API/ABI version of the renderer surface.
@@ -164,11 +256,20 @@ impl TerminalRenderer {
         self.metrics.cols_rows(w_px, h_px)
     }
 
-    /// Resize the offscreen target and/or rebuild metrics for a new scale.
+    /// Resize the target and/or rebuild metrics for a new scale.
     pub fn resize(&mut self, width: u32, height: u32, scale: f32) {
         let (width, height) = (width.max(1), height.max(1));
         if width != self.width || height != self.height {
-            self.target = OffscreenTarget::new(&self.device, width, height);
+            match &mut self.target {
+                Target::Offscreen { texture } => {
+                    *texture = make_offscreen_texture(&self.device, width, height);
+                }
+                Target::Surface { surface, config } => {
+                    config.width = width;
+                    config.height = height;
+                    surface.configure(&self.device, config);
+                }
+            }
             self.width = width;
             self.height = height;
         }
@@ -219,6 +320,37 @@ impl TerminalRenderer {
         let overlay_glyph_buf = self.instance_buffer(&overlay_glyphs);
 
         let clear = self.clear_color();
+
+        // Acquire the color target view; for a surface, also a frame to present.
+        let surface_frame = match &self.target {
+            Target::Surface { surface, .. } => match surface.get_current_texture() {
+                wgpu::CurrentSurfaceTexture::Success(frame)
+                | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => Some(frame),
+                wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    if let Target::Surface { surface, config } = &self.target {
+                        surface.configure(&self.device, config);
+                    }
+                    return Ok(()); // reconfigured; next frame redraws
+                }
+                wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    return Ok(()); // transient; skip this frame
+                }
+                wgpu::CurrentSurfaceTexture::Validation => {
+                    return Err(RenderError::Surface("surface validation error".into()));
+                }
+            },
+            Target::Offscreen { .. } => None,
+        };
+        let view = match (&self.target, &surface_frame) {
+            (Target::Offscreen { texture }, _) => {
+                texture.create_view(&wgpu::TextureViewDescriptor::default())
+            }
+            (_, Some(frame)) => frame
+                .texture
+                .create_view(&wgpu::TextureViewDescriptor::default()),
+            _ => unreachable!("surface target without an acquired frame"),
+        };
+
         let mut encoder = self
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
@@ -228,7 +360,7 @@ impl TerminalRenderer {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("kmux-render pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
-                    view: &self.target.view,
+                    view: &view,
                     resolve_target: None,
                     depth_slice: None,
                     ops: wgpu::Operations {
@@ -247,11 +379,21 @@ impl TerminalRenderer {
             self.draw_glyphs(&mut pass, &overlay_glyph_buf, &overlay_ranges);
         }
         self.queue.submit(Some(encoder.finish()));
+        if let Some(frame) = surface_frame {
+            frame.present();
+        }
         Ok(())
     }
 
-    /// Read the last rendered frame back as tightly-packed RGBA8.
+    /// Read the last rendered frame back as tightly-packed RGBA8 (offscreen
+    /// targets only; an error for a surface target).
     pub fn read_pixels(&mut self) -> Result<RenderedPixels, RenderError> {
+        let Target::Offscreen { texture } = &self.target else {
+            return Err(RenderError::Surface(
+                "read_pixels requires an offscreen target".into(),
+            ));
+        };
+        let texture = texture.clone();
         let (w, h) = (self.width, self.height);
         let unpadded = w * 4;
         let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
@@ -270,7 +412,7 @@ impl TerminalRenderer {
             });
         encoder.copy_texture_to_buffer(
             wgpu::TexelCopyTextureInfo {
-                texture: &self.target.texture,
+                texture: &texture,
                 mip_level: 0,
                 origin: wgpu::Origin3d::ZERO,
                 aspect: wgpu::TextureAspect::All,
@@ -519,13 +661,16 @@ fn solids(quads: &[SolidQuad]) -> Vec<SolidInstance> {
         .collect()
 }
 
-async fn request_adapter(instance: &wgpu::Instance) -> Result<wgpu::Adapter, RenderError> {
+async fn request_adapter(
+    instance: &wgpu::Instance,
+    compatible_surface: Option<&wgpu::Surface<'_>>,
+) -> Result<wgpu::Adapter, RenderError> {
     // Prefer a real adapter; accept a software/fallback one so CI can run.
     for force_fallback_adapter in [false, true] {
         let res = instance
             .request_adapter(&wgpu::RequestAdapterOptions {
                 power_preference: wgpu::PowerPreference::HighPerformance,
-                compatible_surface: None,
+                compatible_surface,
                 force_fallback_adapter,
             })
             .await;
