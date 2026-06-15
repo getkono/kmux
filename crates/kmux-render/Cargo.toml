@@ -25,6 +25,10 @@ kmux-protocol.workspace = true
 kmux-client.workspace = true
 kmux-app.workspace = true
 thiserror.workspace = true
+# Structured logs for the GPU path (adapter/surface setup, resize, frame
+# errors). Targets start with `kmux_render`, so the client's `kmux=*` env
+# filter captures them into the client log file. See docs/architecture-render.md.
+tracing.workspace = true
 
 # `text` tier (font metrics + glyph atlas).
 swash = { workspace = true, optional = true }

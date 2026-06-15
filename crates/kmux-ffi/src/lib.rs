@@ -40,7 +40,7 @@
 //! place `AppCore` is mutated, so there is no shared mutable cross-thread
 //! access. Off-main-thread calls are not part of the contract yet.
 
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use tokio::runtime::Runtime;
 
@@ -962,7 +962,21 @@ fn mode_to_ffi(mode: &Mode) -> FfiMode {
 
 /// Build an [`AppCore`] from a [`DriverConfig`], resolving the server target and
 /// theme exactly as `kmux_app::launch::run_cli` does for the Rust frontends.
-fn build_core(config: &DriverConfig) -> AppCore {
+/// Install the client tracing subscriber the first time a driver is built, so
+/// the Swift app's logs — this crate, `kmux-render`, and the rest of the client
+/// stack — land in the client log file, exactly like the GTK/CLI front door's
+/// `run_cli`. Without this the FFI path had no subscriber and dropped every
+/// event, which is what made early GPU bugs undiagnosable (PR #144 review).
+///
+/// Guarded by `Once`: [`kmux_app::launch::init_logging`] sets the *global*
+/// default subscriber, which must happen at most once per process (a second
+/// `new` would otherwise panic). Honors `RUST_LOG` / `KMUX_LOG_STDERR`.
+fn init_ffi_logging(instance_id: &str) {
+    static FFI_LOGGING: Once = Once::new();
+    FFI_LOGGING.call_once(|| kmux_app::launch::init_logging(instance_id));
+}
+
+fn build_core(config: &DriverConfig, instance_id: String) -> AppCore {
     let (target, parsed_server) = parse_target(config.server.as_deref(), config.ssh_port);
     let auto_cwd = config
         .cwd
@@ -994,7 +1008,7 @@ fn build_core(config: &DriverConfig) -> AppCore {
     AppCore::new(
         target,
         initial_cwd,
-        generate_instance_id(),
+        instance_id,
         config.session.clone(),
         auto_cwd,
         capabilities,
@@ -1019,10 +1033,24 @@ impl KmuxDriver {
     /// Build a driver and kick off the initial connection (per `config`).
     #[uniffi::constructor]
     pub fn new(config: DriverConfig) -> Result<Arc<Self>, FfiError> {
-        let rt = Runtime::new().map_err(|e| FfiError::Init {
-            message: e.to_string(),
+        // Generate the instance id once and share it between logging and the
+        // core, so the client log file and the daemon correlate by the same id.
+        let instance_id = generate_instance_id();
+        init_ffi_logging(&instance_id);
+        tracing::info!(
+            server = ?config.server,
+            session = ?config.session,
+            cols = config.cols,
+            rows = config.rows,
+            "kmux-ffi: constructing KmuxDriver"
+        );
+        let rt = Runtime::new().map_err(|e| {
+            tracing::error!(error = %e, "kmux-ffi: tokio runtime init failed");
+            FfiError::Init {
+                message: e.to_string(),
+            }
         })?;
-        let core = build_core(&config);
+        let core = build_core(&config, instance_id);
         // `FrontendDriver::new` spawns the initial bootstrap, so build it with
         // the runtime entered.
         let driver = {
@@ -2114,6 +2142,13 @@ impl KmuxRenderer {
         height: u32,
         scale: f32,
     ) -> Result<Arc<Self>, FfiError> {
+        tracing::debug!(
+            layer_ptr,
+            width,
+            height,
+            scale,
+            "KmuxRenderer::new_metal: creating Metal renderer"
+        );
         let d = driver.inner.lock().expect("driver mutex poisoned");
         // SAFETY: the Swift view guarantees the layer outlives this renderer.
         let renderer = unsafe {
@@ -2126,8 +2161,11 @@ impl KmuxRenderer {
                 &d.palette,
             )
         }
-        .map_err(|e| FfiError::Render {
-            message: e.to_string(),
+        .map_err(|e| {
+            tracing::error!(width, height, scale, error = %e, "KmuxRenderer::new_metal: GPU init failed");
+            FfiError::Render {
+                message: e.to_string(),
+            }
         })?;
         drop(d);
         Ok(Arc::new(Self {
@@ -2137,6 +2175,7 @@ impl KmuxRenderer {
 
     /// Resize the swapchain to `width × height` physical px at `scale`.
     pub fn resize(&self, width: u32, height: u32, scale: f32) {
+        tracing::debug!(width, height, scale, "KmuxRenderer::resize");
         self.inner
             .lock()
             .expect("renderer mutex poisoned")
@@ -2145,6 +2184,7 @@ impl KmuxRenderer {
 
     /// Re-read the font appearance from the driver (after a font change).
     pub fn refresh_appearance(&self, driver: &KmuxDriver) {
+        tracing::debug!("KmuxRenderer::refresh_appearance");
         let appearance = driver
             .inner
             .lock()
@@ -2159,6 +2199,7 @@ impl KmuxRenderer {
 
     /// Render the active tab and present. `width`/`height` are physical px.
     pub fn render(&self, driver: &KmuxDriver, width: u32, height: u32, scale: f32) {
+        tracing::trace!(width, height, scale, "KmuxRenderer::render");
         let mut renderer = self.inner.lock().expect("renderer mutex poisoned");
         let d = driver.inner.lock().expect("driver mutex poisoned");
         render_active_tab(&mut renderer, &d, width, height, scale);
@@ -2246,6 +2287,12 @@ fn render_active_tab(
         })
         .collect();
 
+    tracing::trace!(
+        panes = panes.len(),
+        multi,
+        blink_on,
+        "kmux-ffi: assembled GPU frame"
+    );
     let frame = Frame {
         width,
         height,

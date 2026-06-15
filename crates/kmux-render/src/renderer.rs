@@ -106,6 +106,15 @@ impl TerminalRenderer {
         let (device, queue) = pollster::block_on(request_device(&adapter))?;
         let (width, height) = (width.max(1), height.max(1));
         let texture = make_offscreen_texture(&device, width, height);
+        let info = adapter.get_info();
+        tracing::debug!(
+            adapter = %info.name,
+            backend = ?info.backend,
+            width,
+            height,
+            scale,
+            "kmux-render: offscreen renderer created"
+        );
         Ok(Self::assemble(
             device,
             queue,
@@ -169,6 +178,16 @@ impl TerminalRenderer {
         };
         surface.configure(&device, &config);
 
+        let info = adapter.get_info();
+        tracing::info!(
+            adapter = %info.name,
+            backend = ?info.backend,
+            format = ?format,
+            width,
+            height,
+            scale,
+            "kmux-render: Metal surface renderer created"
+        );
         Ok(Self::assemble(
             device,
             queue,
@@ -260,6 +279,11 @@ impl TerminalRenderer {
     pub fn resize(&mut self, width: u32, height: u32, scale: f32) {
         let (width, height) = (width.max(1), height.max(1));
         if width != self.width || height != self.height {
+            tracing::debug!(
+                from = ?(self.width, self.height),
+                to = ?(width, height),
+                "kmux-render: resizing target"
+            );
             match &mut self.target {
                 Target::Offscreen { texture } => {
                     *texture = make_offscreen_texture(&self.device, width, height);
@@ -274,6 +298,11 @@ impl TerminalRenderer {
             self.height = height;
         }
         if (scale - self.metrics.scale()).abs() > f32::EPSILON {
+            tracing::debug!(
+                old = self.metrics.scale(),
+                new = scale,
+                "kmux-render: scale changed; rebuilding metrics + atlas"
+            );
             self.metrics = RenderMetrics::from_appearance(&self.appearance, scale);
             self.reset_atlas();
         }
@@ -281,6 +310,7 @@ impl TerminalRenderer {
 
     /// Replace the font appearance (rebuilds faces + atlas).
     pub fn set_appearance(&mut self, appearance: &Appearance) {
+        tracing::debug!("kmux-render: appearance changed; rebuilding faces + atlas");
         self.appearance = appearance.clone();
         self.metrics = RenderMetrics::from_appearance(appearance, self.metrics.scale());
         self.reset_atlas();
@@ -293,6 +323,14 @@ impl TerminalRenderer {
 
     /// Render one frame into the offscreen texture.
     pub fn render(&mut self, frame: &Frame<'_>) -> Result<(), RenderError> {
+        tracing::trace!(
+            width = frame.width,
+            height = frame.height,
+            scale = frame.scale,
+            panes = frame.panes.len(),
+            multi = frame.multi,
+            "kmux-render: rendering frame"
+        );
         self.resize(frame.width, frame.height, frame.scale);
         self.palette = frame.palette.clone();
 
@@ -327,15 +365,20 @@ impl TerminalRenderer {
                 wgpu::CurrentSurfaceTexture::Success(frame)
                 | wgpu::CurrentSurfaceTexture::Suboptimal(frame) => Some(frame),
                 wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+                    tracing::debug!(
+                        "kmux-render: surface outdated/lost; reconfiguring (frame skipped)"
+                    );
                     if let Target::Surface { surface, config } = &self.target {
                         surface.configure(&self.device, config);
                     }
                     return Ok(()); // reconfigured; next frame redraws
                 }
                 wgpu::CurrentSurfaceTexture::Timeout | wgpu::CurrentSurfaceTexture::Occluded => {
+                    tracing::trace!("kmux-render: surface timeout/occluded; skipping frame");
                     return Ok(()); // transient; skip this frame
                 }
                 wgpu::CurrentSurfaceTexture::Validation => {
+                    tracing::warn!("kmux-render: surface validation error acquiring frame");
                     return Err(RenderError::Surface("surface validation error".into()));
                 }
             },
