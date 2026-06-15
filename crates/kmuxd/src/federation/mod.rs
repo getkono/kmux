@@ -9,9 +9,12 @@
 //! [`PeerConnection`] per distinct remote daemon, keyed by [`PeerId`]. Each
 //! connection holds the upstream `ClientMessage` sink (`client_tx`), a
 //! bidirectional `remote_word ↔ local_word` map, the proxied sessions (with
-//! local IDs), and the set of local viewers per proxied pane. A per-peer **feed
-//! loop** drains the upstream `ServerMessage` stream, rewrites each frame's pane
-//! ID from remote to local, and fans it out to that pane's local viewers.
+//! local IDs), and a [`ProxiedPane`] per shared pane (its local viewers, their
+//! sizes, and a `CellGrid` mirror). A per-peer **feed loop** drains the upstream
+//! `ServerMessage` stream, translates each frame's IDs from remote to local, and
+//! fans it out: pane content to that pane's viewers (feeding the mirror), and
+//! session-scoped events (titles, layout, lifecycle) to every viewer under the
+//! affected word.
 //!
 //! Federated sessions are kept **entirely separate** from `ServerApp.sessions`
 //! (which is strictly PTY-backed): a proxied pane has no local PTY, `term_state`
@@ -20,10 +23,12 @@
 //! verbatim — the remote daemon needs no awareness of federation and sees the
 //! local daemon as one ordinary client.
 //!
-//! This is the PR3 scope: **one** local viewer per proxied pane (a pure
-//! message-translating proxy). Multi-viewer reconciliation — size-min, pause
-//! union, capability merge, input-lock arbitration, and minting snapshots for
-//! late local attachers from a cached `CellGrid` mirror — is PR4.
+//! Multiple local GUIs share one proxied pane over a single upstream link, with
+//! smallest-wins sizing (the upstream pane size is the `min` over viewers) and
+//! zero-round-trip late attach (a second viewer is served a snapshot minted from
+//! the mirror). Remaining reconciliation facets — pause-union, capability merge,
+//! and input-lock arbitration across local viewers — are tracked in
+//! `docs/architecture-federation.md`.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -34,7 +39,7 @@ use kmux_connect::connect::ConnectResult;
 use kmux_connect::tcp_connect::connect_tcp_tls;
 use kmux_protocol::messages::{
     ClientCapabilities, ClientId, ClientMessage, PeerId, PeerTarget, SequenceNo, ServerMessage,
-    SessionEntry, TermSize, epoch_millis,
+    SessionEntry, SessionEventMsg, TermSize, epoch_millis,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -205,6 +210,18 @@ impl PeerConnection {
         let (remote_word, idx) = split_pane_id(remote_pane)?;
         let local_word = self.remote_to_local.get(remote_word)?;
         Some(format!("{local_word}/{idx}"))
+    }
+
+    /// Every viewer of every proxied pane under `local_word` — the routing target
+    /// for session-scoped events (titles, layout, lifecycle), which in local
+    /// `kmuxd` reach all clients viewing a session, not just one pane.
+    fn viewers_under_word(&self, local_word: &str) -> Vec<mpsc::Sender<ServerMessage>> {
+        let prefix = format!("{local_word}/");
+        self.panes
+            .iter()
+            .filter(|(pane_id, _)| pane_id.starts_with(&prefix))
+            .flat_map(|(_, pane)| pane.viewer_senders())
+            .collect()
     }
 
     /// Recompute the smallest-wins size for `local_pane_id` and, if it differs
@@ -545,36 +562,61 @@ fn spawn_feed_loop(
                 continue;
             }
 
-            // Only pane-scoped frames are proxied here. Session-scoped events
-            // (titles, layout, lifecycle) are forwarded with multi-viewer support
-            // in a later step.
-            let Some(remote_pane) = msg_pane_id(&msg).map(str::to_string) else {
-                continue;
-            };
-
-            // Translate the pane ID remote→local, feed the pane's mirror (so a late
-            // local attacher can be served from it), then collect its viewers.
-            let viewers = {
-                let mut guard = conn.lock().unwrap();
-                match guard.to_local_pane(&remote_pane) {
-                    Some(local_pane) => {
-                        set_msg_pane_id(&mut msg, local_pane.clone());
-                        match guard.panes.get_mut(&local_pane) {
-                            Some(pane) => {
-                                pane.apply_to_mirror(&msg);
-                                pane.viewer_senders()
+            // Pane-scoped frames: translate the pane ID remote→local, feed the
+            // pane's mirror (so a late local attacher can be served from it), then
+            // collect that pane's viewers.
+            if let Some(remote_pane) = msg_pane_id(&msg).map(str::to_string) {
+                let viewers = {
+                    let mut guard = conn.lock().unwrap();
+                    match guard.to_local_pane(&remote_pane) {
+                        Some(local_pane) => {
+                            set_msg_pane_id(&mut msg, local_pane.clone());
+                            match guard.panes.get_mut(&local_pane) {
+                                Some(pane) => {
+                                    pane.apply_to_mirror(&msg);
+                                    pane.viewer_senders()
+                                }
+                                None => Vec::new(),
                             }
-                            None => Vec::new(),
                         }
+                        None => Vec::new(),
                     }
-                    None => Vec::new(),
+                };
+                for tx in viewers {
+                    // Best-effort: a full viewer channel drops this frame; the client
+                    // recovers via `Lagged` + re-attach with `last_seqno`. PR6 hardens
+                    // the backpressure path.
+                    let _ = tx.try_send(msg.clone());
+                }
+                continue;
+            }
+
+            // Session-scoped events (titles, layout, tab/session lifecycle): translate
+            // the embedded word remote→local and fan out to every viewer under that
+            // word, so a GUI viewing a federated session still receives its title and
+            // layout updates.
+            let viewers = {
+                let guard = conn.lock().unwrap();
+                match &mut msg {
+                    ServerMessage::Event { event } => {
+                        rewrite_event_to_local(event, &guard.remote_to_local)
+                            .map(|local_word| guard.viewers_under_word(&local_word))
+                    }
+                    ServerMessage::LayoutUpdate { word_id, .. } => guard
+                        .remote_to_local
+                        .get(word_id.as_str())
+                        .cloned()
+                        .map(|local_word| {
+                            *word_id = local_word.clone();
+                            guard.viewers_under_word(&local_word)
+                        }),
+                    _ => None,
                 }
             };
-            for tx in viewers {
-                // Best-effort: a full viewer channel drops this frame; the client
-                // recovers via `Lagged` + re-attach with `last_seqno`. PR6 hardens
-                // the backpressure path.
-                let _ = tx.try_send(msg.clone());
+            if let Some(viewers) = viewers {
+                for tx in viewers {
+                    let _ = tx.try_send(msg.clone());
+                }
             }
         }
         debug!(%peer_id, "federation feed loop ended (upstream closed)");
@@ -592,6 +634,40 @@ fn localize_entry(mut entry: SessionEntry, local_word: &str, peer_id: &str) -> S
         pane.attached_clients.clear();
     }
     entry
+}
+
+/// Rewrite the word (or pane) a [`SessionEventMsg`] references from remote to
+/// local, returning the local word for routing. `None` when the referenced word
+/// is not federated (e.g. an event for a remote session we never registered).
+fn rewrite_event_to_local(
+    event: &mut SessionEventMsg,
+    remote_to_local: &std::collections::HashMap<String, String>,
+) -> Option<String> {
+    use SessionEventMsg::*;
+    match event {
+        PaneSpawned { pane_id }
+        | PaneExited { pane_id, .. }
+        | PaneResized { pane_id, .. }
+        | PaneTitleChanged { pane_id, .. }
+        | PaneClipboardCopy { pane_id, .. }
+        | PaneClosed { pane_id } => {
+            let (remote_word, idx) = split_pane_id(pane_id)?;
+            let local_word = remote_to_local.get(remote_word)?.clone();
+            *pane_id = format!("{local_word}/{idx}");
+            Some(local_word)
+        }
+        SessionCreated { word_id }
+        | SessionClosed { word_id }
+        | SessionRenamed { word_id, .. }
+        | TabCreated { word_id, .. }
+        | TabClosed { word_id, .. }
+        | TabRenamed { word_id, .. }
+        | LayoutChanged { word_id, .. } => {
+            let local_word = remote_to_local.get(word_id.as_str())?.clone();
+            *word_id = local_word.clone();
+            Some(local_word)
+        }
+    }
 }
 
 /// Split a `"word/index"` pane ID into its parts. Returns `None` for a malformed
@@ -754,6 +830,46 @@ mod tests {
         // A message with no pane_id is left alone.
         let ping = ServerMessage::Ping { seq: 1 };
         assert_eq!(msg_pane_id(&ping), None);
+    }
+
+    #[test]
+    fn rewrite_event_to_local_translates_pane_and_word_events() {
+        let mut map = std::collections::HashMap::new();
+        map.insert("eagle".to_string(), "hawk".to_string());
+
+        // A pane-scoped event rewrites the word portion of its pane ID.
+        let mut title = SessionEventMsg::PaneTitleChanged {
+            pane_id: "eagle/2".into(),
+            title: "t".into(),
+        };
+        assert_eq!(
+            rewrite_event_to_local(&mut title, &map).as_deref(),
+            Some("hawk")
+        );
+        match title {
+            SessionEventMsg::PaneTitleChanged { pane_id, .. } => assert_eq!(pane_id, "hawk/2"),
+            _ => unreachable!(),
+        }
+
+        // A word-scoped event rewrites its word ID.
+        let mut tab = SessionEventMsg::TabCreated {
+            word_id: "eagle".into(),
+            tab_index: 1,
+        };
+        assert_eq!(
+            rewrite_event_to_local(&mut tab, &map).as_deref(),
+            Some("hawk")
+        );
+        match tab {
+            SessionEventMsg::TabCreated { word_id, .. } => assert_eq!(word_id, "hawk"),
+            _ => unreachable!(),
+        }
+
+        // An event for an unfederated word is dropped (returns None).
+        let mut other = SessionEventMsg::PaneClosed {
+            pane_id: "unknown/0".into(),
+        };
+        assert_eq!(rewrite_event_to_local(&mut other, &map), None);
     }
 
     #[test]

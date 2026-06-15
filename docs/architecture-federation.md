@@ -126,10 +126,18 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
     `federation_e2e.rs`: a smaller second viewer shrinks the shared pane (the larger
     viewer receives a resized-down snapshot), and the late viewer sees the shared
     content.
-- **PR4 remaining facets** (independent, lower-risk): pause upstream only when **all**
-  local viewers are paused (issue #68 interplay); capability union upstream / filter
-  downstream; input-lock arbitration across local viewers; and forwarding
-  session-scoped events (titles, layout, lifecycle) to viewers.
+- **PR4 facet — session-event forwarding — landed.** The feed loop now forwards
+  session-scoped traffic, not just pane content: `Event { SessionEventMsg }` and
+  `LayoutUpdate` have their embedded word/pane ID translated remote→local and are
+  fanned out to every viewer under that word, so a GUI viewing a federated session
+  sees its **title / layout / tab / lifecycle** updates (E2E: an OSC-2 title change on
+  the remote pane arrives as `PaneTitleChanged` for the local pane). `Signal` and
+  `FetchHistory` for a federated pane are forwarded upstream too (the `HistoryLines`
+  reply is pane-scoped, so the feed loop routes it back to the requesting viewer).
+- **PR4 remaining facets** (independent, lower-risk; a naive forward would break
+  multi-viewer correctness, so each needs real arbitration/filtering state): pause
+  upstream only when **all** local viewers are paused (issue #68 interplay); capability
+  union upstream / filter downstream; and input-lock arbitration across local viewers.
 - **PR5** — lean the GUI: always UDS-local to `kmuxd`; the parsed `--server` target
   becomes an `OpenPeer`; feature-gate `quinn`/`rustls`/`ssh` **out** of the GUI build
   (they move to `kmuxd`'s peer role). CI check the GUI no longer links the net stack.
