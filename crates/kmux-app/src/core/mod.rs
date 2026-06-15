@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::session_manager::SessionManager;
 use kmux_client::ssh::RemoteTarget;
-use kmux_protocol::messages::{ClientCapabilities, ServerMessage, TermSize};
+use kmux_protocol::messages::{ClientCapabilities, PeerTarget, ServerMessage, TermSize};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::appearance::Appearance;
@@ -231,9 +231,16 @@ pub struct AppCore {
 
     /// Unique ID for this client process, written to the connection log on auth.
     pub instance_id: String,
-    /// SSH target stored for re-negotiation when the tunnel dies (SSH only).
+    /// SSH target stored for display/identity of the current remote server.
     pub ssh_target: Option<RemoteTarget>,
-    /// Target for the initial bootstrap. Consumed on the first connect.
+    /// The remote peer this GUI wants federated through the local daemon (issue
+    /// #121). `None` means a purely local server. When set, the GUI bootstraps
+    /// the **local** daemon (always UDS) and issues `OpenPeer` after every
+    /// successful (re)connect, so the remote network stack lives in `kmuxd`, not
+    /// here. Replaces the old "GUI opens its own SSH connection" model.
+    pub desired_peer: Option<PeerTarget>,
+    /// Target for the initial bootstrap. Consumed on the first connect. Always
+    /// the local daemon now; a remote `--server` is conveyed via `desired_peer`.
     pub pending_target: Option<ResolvedTarget>,
 
     /// Last fatal error to surface *after* the frontend has torn down, e.g. a
@@ -269,6 +276,33 @@ impl AppCore {
                 accept_invalid_certs,
             } => (false, *accept_invalid_certs, Some(target.clone())),
         };
+
+        // Federation model (issue #121): a remote `--server` no longer opens its
+        // own SSH/TLS connection from the GUI. Instead the GUI always bootstraps
+        // the local daemon (UDS) and asks it to federate the remote via
+        // `OpenPeer`. `is_local` still reflects *server identity* (it drives
+        // auto-select), while the bootstrap target is always the local daemon.
+        let desired_peer = match &target {
+            ResolvedTarget::LocalDaemon => None,
+            ResolvedTarget::Ssh {
+                target,
+                accept_invalid_certs,
+            } => Some(PeerTarget::Ssh {
+                user: target.user.clone(),
+                host: target.host.clone(),
+                ssh_port: target.ssh_port,
+                accept_invalid_certs: *accept_invalid_certs,
+            }),
+        };
+        let bootstrap_target = if desired_peer.is_some() {
+            ResolvedTarget::LocalDaemon
+        } else {
+            target
+        };
+        // Suppress the auto-select that the *pre-federation* session list would
+        // trigger; it is re-armed when `PeerOpened` arrives so the federated
+        // sessions are what the picker/auto-select acts on.
+        let suppress_initial_auto_select = desired_peer.is_some();
 
         let (server_display, server_string, server_kind) = if is_local {
             ("localhost".to_string(), String::new(), ServerKind::Local)
@@ -329,7 +363,7 @@ impl AppCore {
             dir_browser_cwd: String::new(),
             is_local,
             initial_cwd,
-            did_auto_select: false,
+            did_auto_select: suppress_initial_auto_select,
             auto_session,
             auto_cwd,
             server_display,
@@ -344,7 +378,8 @@ impl AppCore {
             pending_srv_tx: None,
             instance_id,
             ssh_target,
-            pending_target: Some(target),
+            desired_peer,
+            pending_target: Some(bootstrap_target),
             last_exit_error: None,
             command_history: VecDeque::new(),
         }
@@ -496,6 +531,7 @@ impl AppCore {
             pending_srv_tx: None,
             instance_id: String::new(),
             ssh_target: None,
+            desired_peer: None,
             pending_target: None,
             last_exit_error: None,
             command_history: VecDeque::new(),

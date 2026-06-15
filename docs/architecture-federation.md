@@ -144,10 +144,31 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   Direct path's auth/list/register tail. The tunnel child is parked on the
   `PeerConnection` and torn down on close/reap (a `TunnelGuard` prevents leaks on the
   error paths). This unblocks the GUI sending `OpenPeer { Ssh }` for `--server user@host`.
-- **PR5 (in progress)** — lean the GUI: always UDS-local to `kmuxd`; the parsed `--server`
-  target becomes an `OpenPeer`; feature-gate `quinn`/`rustls`/`ssh` **out** of the GUI build
-  (they move to `kmuxd`'s peer role). CI check the GUI no longer links the net stack. The
-  GUI connection-model change is behavioral and verified against a running GUI, not CI.
+- **PR5 — GUI connection model rewired (behavioral; runtime-pending).** The GUI now
+  **always bootstraps the local daemon (UDS)** and federates a remote `--server` through it
+  instead of dialling out itself:
+  - `AppCore` gains `desired_peer: Option<PeerTarget>`. A remote `--server` (still parsed to
+    a `ResolvedTarget::Ssh` for *identity*) is converted in `AppCore::new` into
+    `desired_peer` + a **local** bootstrap target; `is_local` continues to reflect *server
+    identity* (it drives auto-select), decoupled from the now-always-local transport.
+  - `current_target()` always returns `LocalDaemon`, and after **every** successful local
+    (re)connect the driver calls `federate_desired_peer()`, which issues
+    `SessionManager::open_peer(PeerTarget)` → `ClientMessage::OpenPeer`. Re-federation after
+    a reconnect is automatic and idempotent on the daemon.
+  - The daemon's `PeerOpened`/`PeerError` replies become `SessionEvent::PeerOpened`/`PeerError`.
+    `PeerOpened` re-arms the auto-select that was suppressed pre-federation and refreshes the
+    session list (so the *remote's* sessions drive the picker); `PeerError` surfaces as a
+    disconnect (reconnect retries the local link + `OpenPeer`). The server picker
+    (`prepare_switch`) routes through the same path.
+  - **Known v1 limitations** (flagged for the runtime pass): switching servers does not yet
+    `ClosePeer` the outgoing peer (its sessions linger until the daemon drops it);
+    `--session NAME` does not match the peer-decorated `NAME @ peer` form; there can be a
+    brief `Normal`-mode flash between local connect and federation. Covered by unit tests
+    (`federate_desired_peer_*`, `peer_opened_*`, `peer_error_*`, `prepare_switch_*`); the
+    end-to-end UX needs a running GTK/Swift GUI + a reachable remote, so it is verified there,
+    not in CI.
+- **PR5 remaining** — feature-gate `quinn`/`rustls`/`ssh` **out** of the GUI build (they now
+  only serve `kmuxd`'s peer role); CI-check the GUI binary no longer links the net stack.
 - **PR6 — peer-down isolation + version guard — landed.** When the upstream link
   closes (remote daemon gone, network dropped), the feed loop **isolates** the
   failure: it sends every viewer a `SessionClosed` for its proxied session (so the

@@ -49,6 +49,14 @@ pub enum SessionEvent {
     /// A directory listing arrived (in response to `request_list_directory`);
     /// the app-layer directory browser should repaint.
     DirectoryListed,
+    /// A federated peer was opened (issue #121): the local daemon now proxies
+    /// the remote's sessions. The app should refresh the session list so they
+    /// surface, then (re)run auto-select.
+    PeerOpened { peer: String },
+    /// Opening a federated peer failed (SSH/connect/auth error on the daemon's
+    /// upstream link). The app surfaces this to the user (e.g. a disconnect
+    /// overlay), since the remote server the user asked for is unreachable.
+    PeerError { reason: String },
 }
 
 impl SessionManager {
@@ -662,12 +670,17 @@ impl SessionManager {
                 }
             }
 
-            // Federation responses (issue #121). The local client only receives
-            // these once it issues `OpenPeer` (a later stage); for now there is
-            // nothing to reconcile, so they are accepted and ignored.
-            ServerMessage::PeerOpened { .. }
-            | ServerMessage::PeerClosed { .. }
-            | ServerMessage::PeerError { .. } => {}
+            // Federation responses (issue #121). The local daemon sends these
+            // after we issue `OpenPeer`/`ClosePeer` to federate a remote server.
+            ServerMessage::PeerOpened { peer, .. } => {
+                events.push(SessionEvent::PeerOpened { peer });
+            }
+            ServerMessage::PeerError { reason, .. } => {
+                events.push(SessionEvent::PeerError { reason });
+            }
+            // A close ack needs no app-level reconciliation (the peer's sessions
+            // simply stop appearing in the next `SessionList`).
+            ServerMessage::PeerClosed { .. } => {}
         }
         events
     }

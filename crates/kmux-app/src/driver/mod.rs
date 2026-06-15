@@ -467,6 +467,10 @@ impl FrontendDriver {
                     self.core.pending_srv_tx = None;
                 }
                 self.core.reflect_bootstrap_outcome();
+                // The local link is up; if the user asked for a remote server,
+                // ask the daemon to federate it now (issue #121). Idempotent, so
+                // this also re-federates after a reconnect.
+                self.core.federate_desired_peer();
                 self.bootstrap_rx = None;
                 true
             }

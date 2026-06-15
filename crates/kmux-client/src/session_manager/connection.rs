@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use kmux_protocol::messages::{ClientMessage, ServerMessage};
+use kmux_protocol::messages::{ClientMessage, PeerId, PeerTarget, ServerMessage};
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -95,6 +95,29 @@ impl SessionManager {
     pub fn request_session_list(&mut self) {
         let rid = self.next_rid();
         self.send_ws(ClientMessage::SessionList { request_id: rid });
+    }
+
+    /// Ask the (local) daemon to federate `target` (issue #121): it opens one
+    /// upstream connection to the remote `kmuxd` and surfaces that peer's
+    /// sessions in our `SessionList`. The reply is a `PeerOpened`/`PeerError`
+    /// (handled as a [`SessionEvent`](super::SessionEvent)). Idempotent on the
+    /// daemon, so it is safe to re-issue after a reconnect to re-federate.
+    pub fn open_peer(&mut self, target: PeerTarget) {
+        let rid = self.next_rid();
+        self.send_ws(ClientMessage::OpenPeer {
+            request_id: rid,
+            target,
+        });
+    }
+
+    /// Ask the daemon to drop a federated peer's upstream link and stop
+    /// surfacing its sessions. Best-effort; the ack needs no reconciliation.
+    pub fn close_peer(&mut self, peer: PeerId) {
+        let rid = self.next_rid();
+        self.send_ws(ClientMessage::ClosePeer {
+            request_id: rid,
+            peer,
+        });
     }
 
     pub fn disconnect(&mut self) {

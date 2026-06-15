@@ -7,7 +7,7 @@ use kmux_client::pipeline::{self, BootstrapOutcome, NoopObserver, ResolvedTarget
 use kmux_client::session_manager::SessionEvent;
 use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
 use kmux_client::transport::TransportKind;
-use kmux_protocol::messages::{ServerMessage, SessionEntry};
+use kmux_protocol::messages::{PeerTarget, ServerMessage, SessionEntry};
 use kmux_protocol::transport::bootstrap::EndpointAdvert;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -121,6 +121,25 @@ impl AppCore {
                     ) {
                         effects.push(eff);
                     }
+                }
+                SessionEvent::PeerOpened { peer } => {
+                    // The remote is now federated through the local daemon (issue
+                    // #121). Re-arm auto-select and refresh the list so the
+                    // remote's sessions — not the pre-federation local list —
+                    // drive the picker.
+                    info!(%peer, "federated peer opened");
+                    if matches!(self.mode, Mode::Connecting { .. }) {
+                        self.mode = Mode::Normal;
+                    }
+                    self.did_auto_select = false;
+                    self.mgr.request_session_list();
+                }
+                SessionEvent::PeerError { reason } => {
+                    // The server the user asked for is unreachable (SSH/auth/
+                    // connect failure on the daemon's upstream). Surface it like
+                    // a failed connect; reconnect re-runs the local link + OpenPeer.
+                    warn!(%reason, "federated peer failed to open");
+                    self.enter_disconnected(DisconnectReason::BootstrapFailed(reason));
                 }
                 _ => {}
             }
@@ -473,16 +492,23 @@ impl AppCore {
 
     /// Build the target to bootstrap against from current state.
     ///
-    /// The app is always in one of two states: local daemon (UDS) or a
-    /// remote SSH target. There is no direct-transport bootstrap surface.
+    /// Always the **local daemon** now (issue #121): the GUI's transport is
+    /// always UDS-local, and a remote server is federated through the daemon via
+    /// [`desired_peer`](AppCore::desired_peer) + `OpenPeer`, not by the GUI
+    /// dialling out. Reconnect therefore re-establishes the local link and
+    /// re-issues `OpenPeer` (see [`federate_desired_peer`](Self::federate_desired_peer)).
     pub fn current_target(&self) -> ResolvedTarget {
-        if let Some(target) = &self.ssh_target {
-            return ResolvedTarget::Ssh {
-                target: target.clone(),
-                accept_invalid_certs: self.mgr.accept_invalid_certs(),
-            };
-        }
         ResolvedTarget::LocalDaemon
+    }
+
+    /// After a successful local (re)connect, ask the daemon to federate the
+    /// desired remote peer, if any. Idempotent on the daemon, so re-issuing
+    /// after a reconnect simply re-federates.
+    pub fn federate_desired_peer(&mut self) {
+        if let Some(target) = self.desired_peer.clone() {
+            info!(peer = %target.peer_id(), "federating remote peer via local daemon");
+            self.mgr.open_peer(target);
+        }
     }
 
     /// Apply the state change for switching to a server chosen from the server
@@ -494,12 +520,16 @@ impl AppCore {
     /// the server-message channel, then `start_bootstrap` with the returned
     /// target) so every frontend's run loop drives it identically.
     pub fn prepare_switch(&mut self, target: &SwitchTarget) -> ResolvedTarget {
-        self.did_auto_select = false;
         self.mgr.disconnect();
+        // Every switch re-bootstraps the **local** daemon (issue #121). A remote
+        // server is conveyed via `desired_peer` and federated with `OpenPeer`
+        // after the local link is back up.
         match target {
             SwitchTarget::Local => {
+                self.did_auto_select = false;
                 self.is_local = true;
                 self.ssh_target = None;
+                self.desired_peer = None;
                 self.server_display = "localhost".to_string();
                 self.server_string = String::new();
                 self.server_kind = ServerKind::Local;
@@ -519,10 +549,16 @@ impl AppCore {
                 };
                 self.is_local = false;
                 self.ssh_target = Some(target.clone());
-                ResolvedTarget::Ssh {
-                    target: target.clone(),
+                self.desired_peer = Some(PeerTarget::Ssh {
+                    user: target.user.clone(),
+                    host: target.host.clone(),
+                    ssh_port: target.ssh_port,
                     accept_invalid_certs: self.mgr.accept_invalid_certs(),
-                }
+                });
+                // Suppress auto-select on the pre-federation (local) list; it is
+                // re-armed when `PeerOpened` arrives with the remote's sessions.
+                self.did_auto_select = true;
+                ResolvedTarget::LocalDaemon
             }
         }
     }
@@ -604,6 +640,12 @@ mod tests {
             host: "h".into(),
             ssh_port: None,
         });
+        core.desired_peer = Some(PeerTarget::Ssh {
+            user: Some("u".into()),
+            host: "h".into(),
+            ssh_port: None,
+            accept_invalid_certs: true,
+        });
         core.server_display = "u@h".into();
         core.server_string = "u@h".into();
         core.did_auto_select = true;
@@ -613,6 +655,10 @@ mod tests {
         assert!(matches!(resolved, ResolvedTarget::LocalDaemon));
         assert!(core.is_local);
         assert!(core.ssh_target.is_none());
+        assert!(
+            core.desired_peer.is_none(),
+            "switching local drops the peer"
+        );
         assert_eq!(core.server_display, "localhost");
         assert!(core.server_string.is_empty());
         assert!(matches!(core.server_kind, ServerKind::Local));
@@ -620,7 +666,7 @@ mod tests {
     }
 
     #[test]
-    fn prepare_switch_ssh_sets_identity_and_returns_target() {
+    fn prepare_switch_ssh_federates_through_local_daemon() {
         let mut core = fixture_core();
         let target = RemoteTarget {
             user: Some("alice".into()),
@@ -630,19 +676,130 @@ mod tests {
 
         let resolved = core.prepare_switch(&SwitchTarget::Ssh(target));
 
-        match resolved {
-            ResolvedTarget::Ssh { target: t, .. } => {
-                assert_eq!(t.host, "example.com");
-                assert_eq!(t.user.as_deref(), Some("alice"));
-                assert_eq!(t.ssh_port, Some(2222));
+        // Issue #121: the GUI always bootstraps the local daemon; the remote is
+        // federated via `desired_peer` + `OpenPeer`, not a direct GUI dial-out.
+        assert!(
+            matches!(resolved, ResolvedTarget::LocalDaemon),
+            "switching to a remote server must still bootstrap the local daemon",
+        );
+        match &core.desired_peer {
+            Some(PeerTarget::Ssh {
+                user,
+                host,
+                ssh_port,
+                ..
+            }) => {
+                assert_eq!(host, "example.com");
+                assert_eq!(user.as_deref(), Some("alice"));
+                assert_eq!(*ssh_port, Some(2222));
             }
-            _ => panic!("expected Ssh target"),
+            other => panic!("expected desired_peer = Ssh, got {other:?}"),
         }
+        // Identity still reflects the remote server (drives the UI + auto-select).
         assert!(!core.is_local);
         assert_eq!(core.server_display, "alice@example.com");
         assert_eq!(core.server_string, "alice@example.com");
         assert!(core.ssh_target.is_some());
         assert!(matches!(core.server_kind, ServerKind::Ssh { .. }));
+        // Auto-select is suppressed until the federated session list arrives.
+        assert!(
+            core.did_auto_select,
+            "auto-select must be suppressed until PeerOpened",
+        );
+    }
+
+    #[test]
+    fn current_target_is_always_local_even_with_a_desired_peer() {
+        let mut core = fixture_core();
+        core.prepare_switch(&SwitchTarget::Ssh(RemoteTarget {
+            user: None,
+            host: "box".into(),
+            ssh_port: None,
+        }));
+        assert!(core.desired_peer.is_some());
+        assert!(
+            matches!(core.current_target(), ResolvedTarget::LocalDaemon),
+            "the GUI's transport is always UDS-local (issue #121)",
+        );
+    }
+
+    #[test]
+    fn federate_desired_peer_sends_open_peer_to_the_daemon() {
+        use kmux_protocol::messages::ClientMessage;
+        let mut core = fixture_core();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        core.mgr.set_ws_sender(tx);
+        core.desired_peer = Some(PeerTarget::Ssh {
+            user: Some("alice".into()),
+            host: "box".into(),
+            ssh_port: Some(2222),
+            accept_invalid_certs: true,
+        });
+
+        core.federate_desired_peer();
+
+        let saw_open_peer = std::iter::from_fn(|| rx.try_recv().ok()).any(|msg| {
+            matches!(
+                msg,
+                ClientMessage::OpenPeer {
+                    target: PeerTarget::Ssh { ref host, .. },
+                    ..
+                } if host == "box"
+            )
+        });
+        assert!(saw_open_peer, "federate_desired_peer must send OpenPeer");
+    }
+
+    #[test]
+    fn federate_desired_peer_is_a_noop_without_a_peer() {
+        use kmux_protocol::messages::ClientMessage;
+        let mut core = fixture_core();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        core.mgr.set_ws_sender(tx);
+        core.desired_peer = None;
+
+        core.federate_desired_peer();
+
+        let sent_open_peer = std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|msg| matches!(msg, ClientMessage::OpenPeer { .. }));
+        assert!(!sent_open_peer, "a local server must not federate anything");
+    }
+
+    #[test]
+    fn peer_opened_rearms_auto_select_and_refreshes_list() {
+        use kmux_protocol::messages::ClientMessage;
+        let mut core = fixture_core();
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        core.mgr.set_ws_sender(tx);
+        core.did_auto_select = true; // suppressed at launch
+        core.mode = Mode::Connecting {
+            target_display: "x".into(),
+        };
+
+        core.handle_session_events(vec![SessionEvent::PeerOpened {
+            peer: "alice@box".into(),
+        }]);
+
+        assert!(!core.did_auto_select, "PeerOpened must re-arm auto-select");
+        assert!(matches!(core.mode, Mode::Normal));
+        let saw_list = std::iter::from_fn(|| rx.try_recv().ok())
+            .any(|msg| matches!(msg, ClientMessage::SessionList { .. }));
+        assert!(
+            saw_list,
+            "PeerOpened must refresh the federated session list"
+        );
+    }
+
+    #[test]
+    fn peer_error_surfaces_as_a_disconnect() {
+        let mut core = fixture_core();
+        core.handle_session_events(vec![SessionEvent::PeerError {
+            reason: "no route to host".into(),
+        }]);
+        match &core.mode {
+            Mode::Disconnected { reason } => assert!(reason.contains("no route to host")),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
     }
 
     #[test]
