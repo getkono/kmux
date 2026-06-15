@@ -65,3 +65,6 @@ pub use metrics::{Faces, FontFace, RenderMetrics};
 pub mod pipeline;
 #[cfg(feature = "gpu")]
 pub mod renderer;
+
+#[cfg(feature = "gpu")]
+pub use renderer::{RenderedPixels, TerminalRenderer};
