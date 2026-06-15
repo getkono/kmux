@@ -76,13 +76,14 @@ mise run swift-test    # gen bindings + swift test
 To run the app with the shared wgpu renderer instead of CoreText:
 
 ```sh
-mise run swift-gpu-run   # builds kmux-ffi --features gpu, regen bindings, swift -DKMUX_GPU, KMUX_RENDERER=wgpu
+mise run swift-gpu-run   # regen bindings, swift -DKMUX_GPU, KMUX_RENDERER=wgpu
 mise run swift-gpu-app   # build only
 ```
 
-These set `KMUX_FFI_FEATURES=gpu` so the staticlib + generated bindings include
-the `KmuxRenderer` object, compile the app with `-DKMUX_GPU`, and select the GPU
-path at runtime via `KMUX_RENDERER=wgpu`. The default tasks above stay CoreText.
+The `gpu` feature is on by default, so the staticlib + generated bindings always
+include the `KmuxRenderer` object; these tasks compile the app with `-DKMUX_GPU`
+(the Swift Metal view) and select the GPU path at runtime via `KMUX_RENDERER=wgpu`.
+The default tasks above stay CoreText.
 See [architecture-render.md](architecture-render.md).
 
 ## Install
