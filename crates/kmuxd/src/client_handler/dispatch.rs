@@ -643,8 +643,8 @@ pub async fn handle_message<A: PaneAttacher>(
         ClientMessage::OpenPeer { request_id, target } => {
             // Ensure an upstream connection to the remote daemon and surface its
             // sessions locally. With the `federation` feature off, `open_peer`
-            // returns the "not supported yet" error and this becomes a `PeerError`
-            // the client can surface (the prior stub behaviour).
+            // returns a "not supported" error and this becomes a `PeerError`
+            // the client can surface.
             let peer_hint = target.peer_id();
             match state.app.open_peer(target).await {
                 Ok(peer) => state.send(ServerMessage::PeerOpened { request_id, peer }),
