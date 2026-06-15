@@ -86,6 +86,22 @@ description = "Test the native macOS app (kmux-swift). Regenerates bindings firs
 depends = ["gen-ffi-bindings"]
 run = "swift test --package-path kmux-swift"
 
+[tasks.swift-gpu-app]
+description = "Build the macOS app with the wgpu GPU renderer (issue #132, opt-in)."
+env = { KMUX_FFI_FEATURES = "gpu" }
+run = [
+    "mise run gen-ffi-bindings",
+    "swift build --package-path kmux-swift -Xswiftc -DKMUX_GPU",
+]
+
+[tasks.swift-gpu-run]
+description = "Run the macOS app with the wgpu GPU renderer (KMUX_RENDERER=wgpu, opt-in)."
+env = { KMUX_FFI_FEATURES = "gpu", KMUX_RENDERER = "wgpu" }
+run = [
+    "mise run gen-ffi-bindings",
+    "swift run --package-path kmux-swift -Xswiftc -DKMUX_GPU",
+]
+
 [tasks.doc]
 description = "Generate docs"
 run = "cargo doc --no-deps --open"

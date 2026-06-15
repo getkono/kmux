@@ -17,13 +17,19 @@ case "$profile" in
     release) relflag="--release" ;;
     *) echo "error: profile must be 'debug' or 'release' (got '$profile')" >&2; exit 1 ;;
 esac
-cargo build $relflag -p kmux-ffi
+# Optional cargo features for kmux-ffi, e.g. `KMUX_FFI_FEATURES=gpu` to include
+# the wgpu KmuxRenderer object (issue #132). Default: lean, no wgpu. The same
+# flag is passed to the bindgen run so cargo does not rebuild the cdylib without
+# the feature (which would drop KmuxRenderer from the introspected library).
+featflag=()
+[[ -n "${KMUX_FFI_FEATURES:-}" ]] && featflag=(--features "$KMUX_FFI_FEATURES")
+cargo build $relflag "${featflag[@]}" -p kmux-ffi
 out=$(mktemp -d)
 # `--no-format` skips uniffi's optional swiftformat pass: the bindings are
 # machine-generated (and gitignored), so formatting them is pointless, and
 # without it uniffi prints a benign "Unable to auto-format" warning whenever
 # swiftformat isn't installed (see issue #104).
-cargo run -p kmux-ffi --bin uniffi-bindgen -- \
+cargo run "${featflag[@]}" -p kmux-ffi --bin uniffi-bindgen -- \
     generate --no-format --library "target/${profile}/libkmux_ffi.dylib" --language swift --out-dir "$out"
 mkdir -p kmux-swift/Sources/kmux_ffiFFI kmux-swift/Sources/KmuxBindings
 cp "$out/kmux_ffiFFI.h"  kmux-swift/Sources/kmux_ffiFFI/kmux_ffiFFI.h
