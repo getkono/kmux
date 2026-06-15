@@ -133,6 +133,17 @@ impl CellMetrics {
             cursor_thickness: (cell_h * 0.1).max(1.0),
         }
     }
+
+    /// Map a content-area pixel size to `(cols, rows)` — how many whole cells
+    /// fit. The single cols/rows authority that feeds the resize path; both
+    /// frontends route their geometry through this (the GTK draw/resize branch
+    /// and, via the FFI, the Swift one), replacing the per-toolkit Pango /
+    /// CoreText measurement. Always at least `1×1`.
+    pub fn cols_rows(&self, w_px: i32, h_px: i32) -> (u16, u16) {
+        let cols = (w_px.max(0) as f32 / self.cell_w.max(1.0)).floor().max(1.0);
+        let rows = (h_px.max(0) as f32 / self.cell_h.max(1.0)).floor().max(1.0);
+        (cols as u16, rows as u16)
+    }
 }
 
 /// A displayed cell with final (palette-resolved) float colors.
@@ -845,5 +856,16 @@ mod tests {
         // "[5/99]" => one bg quad + 6 glyphs, all on the last row.
         assert_eq!(scene.overlay_quads.len(), 1);
         assert_eq!(scene.overlay_glyphs.len(), 6);
+    }
+
+    #[test]
+    fn cols_rows_floors_and_clamps() {
+        let m = CellMetrics::new(8.0, 16.0);
+        assert_eq!(m.cols_rows(800, 320), (100, 20));
+        // Partial trailing cell is floored away.
+        assert_eq!(m.cols_rows(805, 327), (100, 20));
+        // Never zero, even for a zero/negative area.
+        assert_eq!(m.cols_rows(0, 0), (1, 1));
+        assert_eq!(m.cols_rows(-50, -50), (1, 1));
     }
 }

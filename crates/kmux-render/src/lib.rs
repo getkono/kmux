@@ -56,6 +56,9 @@ pub mod atlas;
 #[cfg(feature = "text")]
 pub mod metrics;
 
+#[cfg(feature = "text")]
+pub use metrics::{Faces, FontFace, RenderMetrics};
+
 #[cfg(feature = "gpu")]
 pub mod pipeline;
 #[cfg(feature = "gpu")]
