@@ -77,6 +77,16 @@ impl ServerApp {
         }
     }
 
+    /// Tear down every federated peer (abort feed loops, kill SSH tunnels) for
+    /// daemon shutdown, so no `ssh -L` child is orphaned when the process exits. A
+    /// no-op without the feature (or when no peers are open).
+    pub fn close_all_peers(&self) {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.close_all();
+        }
+    }
+
     /// The proxied sessions of every open peer, with local IDs and peer-decorated
     /// names, to be merged into [`ServerApp::list_sessions`]. Empty without the
     /// feature.

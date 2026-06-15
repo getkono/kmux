@@ -294,6 +294,22 @@ impl PeerConnection {
     }
 }
 
+impl Drop for PeerConnection {
+    /// Defence in depth against orphaning an `ssh -L` tunnel. Every explicit
+    /// teardown (`close_peer`/`reap_dead_peer`/`PeerManager::close_all`) already
+    /// kills the tunnel synchronously, but `tokio::process::Child` is not
+    /// kill-on-drop, so if a `PeerConnection` is ever dropped by some other path
+    /// its tunnel child would keep running. Killing it here makes "a
+    /// `PeerConnection` never leaks its tunnel" a structural invariant. The feed
+    /// loop cannot be aborted from here (it holds an `Arc` to this connection, so
+    /// this `drop` only runs once it has already ended or been aborted).
+    fn drop(&mut self) {
+        if let Some(mut child) = self.ssh_tunnel.take() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
 /// A resolved TCP+TLS endpoint for an upstream peer link. Both [`PeerTarget`]
 /// variants reduce to this: `Direct` is the endpoint verbatim; `Ssh` is the
 /// loopback end of an `-L` tunnel (with the tunnel child retained so it outlives
@@ -577,6 +593,37 @@ impl PeerManager {
             app.release_word(local_word);
         }
         debug!(%peer_id, "reaped dead peer before re-federation");
+    }
+
+    /// Tear every peer down for daemon shutdown: abort each feed loop and kill each
+    /// SSH `-L` tunnel **synchronously**, so no tunnel child is orphaned when the
+    /// process exits. This matters because `tokio::process::Child` is not
+    /// kill-on-drop and the runtime is torn down in the background
+    /// (`Runtime::shutdown_background`), which races process exit — so relying on
+    /// drop order is not enough. Words are not returned to the pool (the daemon is
+    /// going away). Idempotent and a no-op when no peers are open.
+    pub fn close_all(&self) {
+        let conns: Vec<_> = self
+            .peers
+            .lock()
+            .unwrap()
+            .drain()
+            .map(|(_, conn)| conn)
+            .collect();
+        self.word_index.lock().unwrap().clear();
+        let count = conns.len();
+        for conn in &conns {
+            let mut guard = conn.lock().unwrap();
+            if let Some(task) = &guard.feed_task {
+                task.abort();
+            }
+            if let Some(mut child) = guard.ssh_tunnel.take() {
+                let _ = child.start_kill();
+            }
+        }
+        if count > 0 {
+            info!(peers = count, "closed all federated peers on shutdown");
+        }
     }
 
     /// Whether `pane_id`'s session is proxied from a peer.
@@ -1288,6 +1335,60 @@ mod tests {
         );
         let _ = parked.start_kill();
         let _ = parked.wait().await;
+    }
+
+    /// Daemon shutdown must kill every peer's SSH tunnel synchronously (the
+    /// runtime is torn down in the background, racing process exit, and
+    /// `tokio::process::Child` is not kill-on-drop) and clear all peer state.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn close_all_kills_tunnels_and_clears_peers() {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        let mgr = PeerManager::new();
+        let (tx, _rx) = mpsc::unbounded_channel();
+        let mut conn = PeerConnection::new(tx);
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = Pid::from_raw(child.id().expect("child pid") as i32);
+        conn.ssh_tunnel = Some(child);
+        // A never-ending feed loop stand-in, so we exercise the abort path too.
+        conn.feed_task = Some(tokio::spawn(std::future::pending::<()>()));
+
+        let peer_id = "box:9000".to_string();
+        mgr.peers
+            .lock()
+            .unwrap()
+            .insert(peer_id.clone(), Arc::new(Mutex::new(conn)));
+        mgr.word_index
+            .lock()
+            .unwrap()
+            .insert("hawk".to_string(), peer_id);
+
+        mgr.close_all();
+
+        assert!(
+            mgr.peers.lock().unwrap().is_empty(),
+            "close_all must drop every peer"
+        );
+        assert!(
+            mgr.word_index.lock().unwrap().is_empty(),
+            "close_all must clear the word index"
+        );
+
+        // The tunnel pid must disappear (a live `sleep 60` would persist).
+        let mut gone = false;
+        for _ in 0..200 {
+            if kill(pid, None).is_err() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(gone, "close_all must kill the SSH tunnel");
     }
 
     /// An un-disarmed guard (any error between `negotiate` and registration, or a
