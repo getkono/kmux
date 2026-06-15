@@ -176,6 +176,10 @@ struct PeerConnection {
     panes: HashMap<String, ProxiedPane>,
     /// The feed-loop task draining the upstream stream; aborted on close.
     feed_task: Option<JoinHandle<()>>,
+    /// Set by the feed loop when the upstream link closes. A dead connection is
+    /// reaped lazily on the next `open_peer` to the same peer (which holds the
+    /// `&ServerApp` needed to release the local words), so re-federation works.
+    dead: bool,
 }
 
 impl PeerConnection {
@@ -187,6 +191,7 @@ impl PeerConnection {
             sessions: HashMap::new(),
             panes: HashMap::new(),
             feed_task: None,
+            dead: false,
         }
     }
 
@@ -257,12 +262,24 @@ impl PeerManager {
     pub async fn open_peer(&self, app: &ServerApp, target: PeerTarget) -> Result<PeerId, String> {
         let peer_id = target.peer_id();
 
-        if self.peers.lock().unwrap().contains_key(&peer_id) {
-            debug!(%peer_id, "reusing existing peer connection");
-            return Ok(peer_id);
+        // Reuse a live peer; reap a dead one (its upstream closed) so this becomes
+        // a fresh federation rather than handing back a defunct connection.
+        let existing_dead = self
+            .peers
+            .lock()
+            .unwrap()
+            .get(&peer_id)
+            .map(|c| c.lock().unwrap().dead);
+        match existing_dead {
+            Some(false) => {
+                debug!(%peer_id, "reusing existing peer connection");
+                return Ok(peer_id);
+            }
+            Some(true) => self.reap_dead_peer(app, &peer_id),
+            None => {}
         }
 
-        // PR3 supports only the direct TCP+TLS endpoint (LAN / same-host / tests).
+        // Only the direct TCP+TLS endpoint is wired (LAN / same-host / tests).
         // SSH peer setup (probe-or-start + `-L` tunnel) is deferred.
         let (host, port, token, accept_invalid) = match target {
             PeerTarget::Direct {
@@ -389,6 +406,21 @@ impl PeerManager {
             app.release_word(local_word);
         }
         info!(%peer_id, "federated peer closed");
+    }
+
+    /// Remove a peer whose upstream link already died (feed loop set `dead`),
+    /// releasing its local words back to the pool and clearing the word index so a
+    /// fresh `open_peer` to the same address starts clean.
+    fn reap_dead_peer(&self, app: &ServerApp, peer_id: &str) {
+        let conn = self.peers.lock().unwrap().remove(peer_id);
+        let Some(conn) = conn else { return };
+        let guard = conn.lock().unwrap();
+        let mut idx = self.word_index.lock().unwrap();
+        for local_word in guard.local_to_remote.keys() {
+            idx.remove(local_word);
+            app.release_word(local_word);
+        }
+        debug!(%peer_id, "reaped dead peer before re-federation");
     }
 
     /// Whether `pane_id`'s session is proxied from a peer.
@@ -619,7 +651,32 @@ fn spawn_feed_loop(
                 }
             }
         }
-        debug!(%peer_id, "federation feed loop ended (upstream closed)");
+
+        // The upstream link closed (remote daemon gone, network dropped). Isolate
+        // the failure: tell every viewer its proxied session ended so the GUI
+        // cleans up instead of hanging, drop the panes (closing the pane streams),
+        // and mark the connection dead for lazy reaping. Locally-hosted PTY panes
+        // are untouched — they live in a separate relay.
+        {
+            let mut guard = conn.lock().unwrap();
+            guard.dead = true;
+            let words: Vec<String> = guard.sessions.keys().cloned().collect();
+            for local_word in &words {
+                let closed = ServerMessage::Event {
+                    event: SessionEventMsg::SessionClosed {
+                        word_id: local_word.clone(),
+                    },
+                };
+                for tx in guard.viewers_under_word(local_word) {
+                    let _ = tx.try_send(closed.clone());
+                }
+            }
+            // Drop panes (closing pane streams) and sessions (so a post-death
+            // `SessionList` no longer lists this peer's now-gone sessions).
+            guard.panes.clear();
+            guard.sessions.clear();
+        }
+        debug!(%peer_id, "federation feed loop ended (upstream closed); viewers notified");
     })
 }
 
