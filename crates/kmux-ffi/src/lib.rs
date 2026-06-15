@@ -14,7 +14,7 @@
 //!   (a main-thread timer, the analog of the GTK `glib` timeout).
 //! - **Render (hot path)**: [`KmuxDriver::grid_info`] /
 //!   [`KmuxDriver::grid_snapshot`] expose the active grid as a generation-gated,
-//!   packed byte buffer (see [`cells`]) so the renderer copies only changed
+//!   packed byte buffer (see [`kmux_render::packed`]) so the renderer copies only changed
 //!   frames; plus [`KmuxDriver::theme`], [`KmuxDriver::blink_on`],
 //!   [`KmuxDriver::selection`], and [`KmuxDriver::scroll_info`].
 //! - **Input**: structured **mode-aware** keys ([`KmuxDriver::send_char`] /
@@ -40,8 +40,6 @@
 //! place `AppCore` is mutated, so there is no shared mutable cross-thread
 //! access. Off-main-thread calls are not part of the contract yet.
 
-mod cells;
-
 use std::sync::{Arc, Mutex};
 
 use tokio::runtime::Runtime;
@@ -63,6 +61,10 @@ use kmux_client::input::{
 use kmux_protocol::messages::{
     ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, SplitDir, TermSize,
 };
+// The packed-cell format is owned by `kmux-render` (the single encoder shared
+// with the GPU renderer; see docs/architecture-render.md). The non-GPU Swift
+// path encodes through it here, so the bytes are identical to the renderer's.
+use kmux_render::packed;
 #[cfg(feature = "gpu")]
 use kmux_render::{CellSource, CursorView, Frame, PaneView, ScrollIndicator, TerminalRenderer};
 
@@ -455,8 +457,8 @@ pub struct FfiCursor {
     pub blink: bool,
 }
 
-/// The active grid as a packed cell buffer (see [`cells`]) plus dimensions and
-/// cursor. `cells` is `rows * cols * 16` bytes, row-major.
+/// The active grid as a packed cell buffer (see [`kmux_render::packed`]) plus
+/// dimensions and cursor. `cells` is `rows * cols * 16` bytes, row-major.
 #[derive(uniffi::Record)]
 pub struct GridSnapshot {
     pub rows: u32,
@@ -1183,7 +1185,7 @@ impl KmuxDriver {
     pub fn grid_snapshot(&self) -> Option<GridSnapshot> {
         let d = self.inner.lock().expect("driver mutex poisoned");
         let grid = d.active_grid()?;
-        let cells = cells::encode_cells(grid, &d.palette);
+        let cells = packed::encode_cells(grid, &d.palette);
         let c = grid.cursor();
         Some(GridSnapshot {
             rows: grid.rows as u32,
@@ -1191,7 +1193,7 @@ impl KmuxDriver {
             cursor: FfiCursor {
                 row: c.row as u32,
                 col: c.col as u32,
-                shape: cells::cursor_shape_code(c.shape),
+                shape: packed::cursor_shape_code(c.shape),
                 visible: c.visible,
                 blink: c.blink,
             },
@@ -1459,7 +1461,7 @@ impl KmuxDriver {
     pub fn grid_snapshot_for(&self, pane_id: String) -> Option<GridSnapshot> {
         let d = self.inner.lock().expect("driver mutex poisoned");
         let grid = d.mgr.buffer(&pane_id)?;
-        let cells = cells::encode_cells(grid, &d.palette);
+        let cells = packed::encode_cells(grid, &d.palette);
         let c = grid.cursor();
         Some(GridSnapshot {
             rows: grid.rows as u32,
@@ -1467,7 +1469,7 @@ impl KmuxDriver {
             cursor: FfiCursor {
                 row: c.row as u32,
                 col: c.col as u32,
-                shape: cells::cursor_shape_code(c.shape),
+                shape: packed::cursor_shape_code(c.shape),
                 visible: c.visible,
                 blink: c.blink,
             },

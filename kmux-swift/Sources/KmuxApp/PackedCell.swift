@@ -1,8 +1,9 @@
 import Foundation
 
 /// A decoded terminal cell from the FFI's packed 16-byte, little-endian layout.
-/// Must match `kmux-ffi/src/cells.rs` (`DEFAULT_FG`/`DEFAULT_BG` are already
-/// resolved to RGBA in Rust, so the colors here are final).
+/// Must match `kmux-render/src/packed.rs` — the single owner of the format,
+/// shared with the GPU renderer (`DEFAULT_FG`/`DEFAULT_BG` are already resolved
+/// to RGBA in Rust, so the colors here are final).
 struct PackedCell {
     /// Unicode scalar value (`char as u32`).
     let scalar: UInt32
@@ -13,8 +14,8 @@ struct PackedCell {
     /// `0` = wide-char trailing spacer, `1` = normal, `2` = wide char.
     let width: UInt8
 
-    // Attribute bit positions (see cells.rs). The `default_*` bits are resolved
-    // away in Rust and never set here.
+    // Attribute bit positions (see kmux-render/src/packed.rs). The `default_*`
+    // bits are resolved away in Rust and never set here.
     var bold: Bool { attrs & (1 << 0) != 0 }
     var italic: Bool { attrs & (1 << 1) != 0 }
     var underline: Bool { attrs & (1 << 2) != 0 }
