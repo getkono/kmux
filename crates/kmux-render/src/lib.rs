@@ -49,6 +49,7 @@ pub mod geometry;
 pub mod packed;
 
 pub use frame::{CellSource, CursorView, Frame, PaneView, ScrollIndicator};
+pub use geometry::{CellMetrics, FaceStyle, GlyphQuad, SceneGeometry, SolidQuad, build_scene};
 
 #[cfg(feature = "text")]
 pub mod atlas;
