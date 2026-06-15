@@ -57,6 +57,8 @@ pub mod atlas;
 pub mod metrics;
 
 #[cfg(feature = "text")]
+pub use atlas::{Atlas, AtlasEntry, GlyphKey};
+#[cfg(feature = "text")]
 pub use metrics::{Faces, FontFace, RenderMetrics};
 
 #[cfg(feature = "gpu")]
