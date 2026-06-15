@@ -868,4 +868,61 @@ mod tests {
         assert_eq!(m.cols_rows(0, 0), (1, 1));
         assert_eq!(m.cols_rows(-50, -50), (1, 1));
     }
+
+    #[test]
+    fn grid_and_packed_build_identical_scenes() {
+        // The whole geometry pipeline (not just per-cell resolution) must agree
+        // between the Grid source and the equivalent packed buffer, so GTK
+        // (Grid) and Swift (Packed) render identically.
+        let grid = grid_with(
+            vec![
+                cell('a', 0),
+                cell('b', CellAttrs::BOLD | CellAttrs::UNDERLINE),
+                cell(' ', CellAttrs::DEFAULT_FG | CellAttrs::DEFAULT_BG),
+                cell('世', CellAttrs::WIDE_CHAR),
+                cell(' ', CellAttrs::WIDE_CHAR_SPACER),
+                cell('z', CellAttrs::DIM | CellAttrs::STRIKETHROUGH),
+            ],
+            2,
+            3,
+        );
+        let m = CellMetrics::new(8.0, 16.0);
+        let cursor = Some(CursorView::from_state(grid.cursor()));
+
+        let grid_pane = PaneView {
+            col: 0,
+            row: 0,
+            cols: 3,
+            rows: 2,
+            focused: true,
+            cells: CellSource::Grid(&grid),
+            cursor,
+            selection: &[],
+            scroll: None,
+        };
+        let grid_scene = build_scene(&Frame::single(100, 100, 1.0, theme(), true, grid_pane), &m);
+
+        let packed = crate::packed::encode_cells(&grid, theme());
+        let packed_pane = PaneView {
+            col: 0,
+            row: 0,
+            cols: 3,
+            rows: 2,
+            focused: true,
+            cells: CellSource::Packed {
+                cells: &packed,
+                cols: 3,
+                rows: 2,
+            },
+            cursor,
+            selection: &[],
+            scroll: None,
+        };
+        let packed_scene = build_scene(
+            &Frame::single(100, 100, 1.0, theme(), true, packed_pane),
+            &m,
+        );
+
+        assert_eq!(grid_scene, packed_scene);
+    }
 }

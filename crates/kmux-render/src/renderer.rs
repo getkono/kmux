@@ -796,4 +796,60 @@ mod tests {
         // Top-left pixel is inside cell (0,0)'s background quad.
         assert_eq!(&px.rgba[0..4], &[0xff, 0x00, 0x00, 0xff]);
     }
+
+    #[test]
+    fn golden_two_cell_row_positions_colors() {
+        let Some(mut r) = try_renderer(64, 32) else {
+            return;
+        };
+        let palette = theme();
+        // One row, two cells: red then green (explicit, space chars → no glyph
+        // over the background at the sample points).
+        let mut grid = CellGrid::new(1, 2);
+        grid.apply_snapshot(GridSnapshot {
+            rows: 1,
+            cols: 2,
+            cells: vec![
+                CellState {
+                    c: ' ',
+                    fg: CellColor::new(0xff, 0xff, 0xff),
+                    bg: CellColor::new(0xff, 0, 0),
+                    attrs: CellAttrs::EMPTY,
+                },
+                CellState {
+                    c: ' ',
+                    fg: CellColor::new(0xff, 0xff, 0xff),
+                    bg: CellColor::new(0, 0xff, 0),
+                    attrs: CellAttrs::EMPTY,
+                },
+            ],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            history_total: 0,
+            scrollback_base: 0,
+            scrollback_tail: Vec::new(),
+        });
+        let pane = PaneView {
+            col: 0,
+            row: 0,
+            cols: 2,
+            rows: 1,
+            focused: true,
+            cells: CellSource::Grid(&grid),
+            cursor: None,
+            selection: &[],
+            scroll: None,
+        };
+        r.render(&Frame::single(64, 32, 1.0, &palette, true, pane))
+            .unwrap();
+        let cw = r.metrics().cell().cell_w;
+        let px = r.read_pixels().unwrap();
+        let sample = |x: usize, y: usize| {
+            let i = (y * 64 + x) * 4;
+            [px.rgba[i], px.rgba[i + 1], px.rgba[i + 2]]
+        };
+        // Center of cell 0 is red; center of cell 1 is green.
+        assert_eq!(sample((cw * 0.5) as usize, 8), [0xff, 0, 0]);
+        assert_eq!(sample((cw * 1.5) as usize, 8), [0, 0xff, 0]);
+    }
 }
