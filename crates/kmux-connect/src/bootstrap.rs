@@ -229,6 +229,7 @@ impl Bootstrap for UdsLocalBootstrap {
 /// Bootstrap via a direct QUIC connection.
 ///
 /// Uses the existing `crate::connect::connect` function internally.
+#[cfg(feature = "remote")]
 pub struct QuicDirectBootstrap {
     pub host: String,
     pub port: u16,
@@ -238,6 +239,7 @@ pub struct QuicDirectBootstrap {
     pub accept_invalid_certs: bool,
 }
 
+#[cfg(feature = "remote")]
 impl Bootstrap for QuicDirectBootstrap {
     fn name(&self) -> &'static str {
         "quic-direct"
@@ -296,6 +298,7 @@ impl Bootstrap for QuicDirectBootstrap {
 // ─── TlsTcpDirectBootstrap ────────────────────────────────────────────────────
 
 /// Bootstrap via a direct TLS-over-TCP connection.
+#[cfg(feature = "remote")]
 pub struct TlsTcpDirectBootstrap {
     pub host: String,
     pub port: u16,
@@ -305,6 +308,7 @@ pub struct TlsTcpDirectBootstrap {
     pub accept_invalid_certs: bool,
 }
 
+#[cfg(feature = "remote")]
 impl Bootstrap for TlsTcpDirectBootstrap {
     fn name(&self) -> &'static str {
         "tcp-tls-direct"
@@ -362,6 +366,7 @@ impl Bootstrap for TlsTcpDirectBootstrap {
 /// On success the `SessionContext.send` channel delivers messages over the
 /// TLS-TCP tunnel. The caller may later upgrade the data plane to direct QUIC
 /// or TLS-TCP when the server becomes reachable directly.
+#[cfg(feature = "remote")]
 pub struct SshBootstrap {
     pub target: crate::ssh::RemoteTarget,
     pub capabilities: ClientCapabilities,
@@ -369,6 +374,7 @@ pub struct SshBootstrap {
     pub accept_invalid_certs: bool,
 }
 
+#[cfg(feature = "remote")]
 impl Bootstrap for SshBootstrap {
     fn name(&self) -> &'static str {
         "ssh"

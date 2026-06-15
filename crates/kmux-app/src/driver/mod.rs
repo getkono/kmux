@@ -44,11 +44,13 @@ use std::time::{Duration, Instant};
 
 use kmux_client::connection_state::DisconnectReason;
 use kmux_client::grid::CellGrid;
+#[cfg(feature = "remote")]
 use kmux_client::supervisor::UpgradeSignal;
+#[cfg(feature = "remote")]
 use kmux_client::transport::TransportKind;
-use kmux_protocol::messages::{
-    ClientMessage, KeyEvent, PaneId, ServerMessage, TermSize, epoch_millis,
-};
+#[cfg(feature = "remote")]
+use kmux_protocol::messages::ClientMessage;
+use kmux_protocol::messages::{KeyEvent, PaneId, ServerMessage, TermSize, epoch_millis};
 use kmux_protocol::trace::{AppliedDiff, ClientTickRecord};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -139,10 +141,16 @@ pub struct FrontendDriver {
     bootstrap_rx: Option<mpsc::UnboundedReceiver<BootstrapTaskResult>>,
     /// Better-transport signals from the background supervisor probe. The sender
     /// lives for the whole session; clones are handed to the SSH supervisor.
+    /// Only a `remote` build dials remotes directly and can upgrade transports;
+    /// a lean GUI is always UDS-local, so the whole subsystem is gated out.
+    #[cfg(feature = "remote")]
     upgrade_rx: mpsc::Receiver<UpgradeSignal>,
+    #[cfg(feature = "remote")]
     upgrade_tx: mpsc::Sender<UpgradeSignal>,
     /// SSH tunnel-death signal (the tunnel process exited unexpectedly).
+    #[cfg(feature = "remote")]
     tunnel_died_rx: mpsc::Receiver<()>,
+    #[cfg(feature = "remote")]
     tunnel_died_tx: mpsc::Sender<()>,
     /// Last palette applied, for `/theme` change detection.
     last_palette: crate::theme::Theme,
@@ -181,7 +189,9 @@ impl FrontendDriver {
     pub fn new(mut core: AppCore) -> Self {
         let (srv_tx, srv_rx) = mpsc::unbounded_channel::<ServerMessage>();
         let (bs_tx, bs_rx) = mpsc::unbounded_channel::<BootstrapTaskResult>();
+        #[cfg(feature = "remote")]
         let (upgrade_tx, upgrade_rx) = mpsc::channel::<UpgradeSignal>(1);
+        #[cfg(feature = "remote")]
         let (tunnel_died_tx, tunnel_died_rx) = mpsc::channel::<()>(1);
 
         let bootstrap_rx = if let Some(target) = core.pending_target.take() {
@@ -197,9 +207,13 @@ impl FrontendDriver {
             core,
             srv_rx,
             bootstrap_rx,
+            #[cfg(feature = "remote")]
             upgrade_rx,
+            #[cfg(feature = "remote")]
             upgrade_tx,
+            #[cfg(feature = "remote")]
             tunnel_died_rx,
+            #[cfg(feature = "remote")]
             tunnel_died_tx,
             last_palette,
             last_liveness: now,
@@ -238,8 +252,11 @@ impl FrontendDriver {
         dirty |= self.apply_settled_resize(now);
         dirty |= self.drain_server_messages(&mut effects);
         dirty |= self.poll_bootstrap_outcome();
-        dirty |= self.drain_transport_upgrades();
-        dirty |= self.drain_tunnel_deaths();
+        #[cfg(feature = "remote")]
+        {
+            dirty |= self.drain_transport_upgrades();
+            dirty |= self.drain_tunnel_deaths();
+        }
         dirty |= self.tick_liveness(now);
         // Auto-pause the connection once the window has been backgrounded long
         // enough (issue #68).
@@ -453,6 +470,7 @@ impl FrontendDriver {
                 // a stale error when the user finally quits.
                 self.core.last_exit_error = None;
                 let ssh_ctx = self.core.mgr.apply_outcome(*o);
+                #[cfg(feature = "remote")]
                 if let Some(ctx) = ssh_ctx {
                     let srv_tx = self
                         .core
@@ -464,6 +482,13 @@ impl FrontendDriver {
                     self.core
                         .launch_ssh_supervisor(ctx, srv_tx, upgrade_tx, tunnel_died_tx);
                 } else {
+                    self.core.pending_srv_tx = None;
+                }
+                // Lean build: the bootstrap is always UDS-local, so `apply_outcome`
+                // returns no SSH context and there is nothing to supervise.
+                #[cfg(not(feature = "remote"))]
+                {
+                    let _ = ssh_ctx;
                     self.core.pending_srv_tx = None;
                 }
                 self.core.reflect_bootstrap_outcome();
@@ -504,6 +529,7 @@ impl FrontendDriver {
     }
 
     /// Apply any better-transport signals from the background probe.
+    #[cfg(feature = "remote")]
     fn drain_transport_upgrades(&mut self) -> bool {
         let mut dirty = false;
         while let Ok(signal) = self.upgrade_rx.try_recv() {
@@ -518,6 +544,7 @@ impl FrontendDriver {
 
     /// Freeze the session if the SSH tunnel process exited while we are on the
     /// tunnelled transport.
+    #[cfg(feature = "remote")]
     fn drain_tunnel_deaths(&mut self) -> bool {
         let mut dirty = false;
         while self.tunnel_died_rx.try_recv().is_ok() {
@@ -770,7 +797,9 @@ impl FrontendDriver {
     ) {
         let (srv_tx, srv_rx) = mpsc::unbounded_channel::<ServerMessage>();
         let (bs_tx, bs_rx) = mpsc::unbounded_channel::<BootstrapTaskResult>();
+        #[cfg(feature = "remote")]
         let (upgrade_tx, upgrade_rx) = mpsc::channel::<UpgradeSignal>(1);
+        #[cfg(feature = "remote")]
         let (tunnel_died_tx, tunnel_died_rx) = mpsc::channel::<()>(1);
         let now = Instant::now();
         let last_palette = core.palette.clone();
@@ -778,9 +807,13 @@ impl FrontendDriver {
             core,
             srv_rx,
             bootstrap_rx: Some(bs_rx),
+            #[cfg(feature = "remote")]
             upgrade_rx,
+            #[cfg(feature = "remote")]
             upgrade_tx,
+            #[cfg(feature = "remote")]
             tunnel_died_rx,
+            #[cfg(feature = "remote")]
             tunnel_died_tx,
             last_palette,
             last_liveness: now,

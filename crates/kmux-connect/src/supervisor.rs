@@ -20,13 +20,18 @@
 
 use std::time::{Duration, Instant};
 
-use kmux_protocol::messages::{
-    ClientCapabilities, ClientMessage, ConnectionId, ServerMessage, TransportKind,
-};
+#[cfg(feature = "remote")]
+use kmux_protocol::messages::{ClientCapabilities, ConnectionId, ServerMessage};
+use kmux_protocol::messages::{ClientMessage, TransportKind};
 use kmux_protocol::transport::bootstrap::EndpointAdvert;
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::mpsc;
+#[cfg(feature = "remote")]
+use tokio::sync::oneshot;
+#[cfg(feature = "remote")]
 use tokio::time::timeout;
-use tracing::{debug, info, warn};
+use tracing::info;
+#[cfg(feature = "remote")]
+use tracing::{debug, warn};
 
 // ─── Scoring constants ────────────────────────────────────────────────────────
 
@@ -46,6 +51,7 @@ pub const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// not enough (a misconfigured server, expired token, or auth mismatch
 /// would otherwise look like a successful upgrade and silently disconnect
 /// the live channel when the rejected `AuthResult` arrives).
+#[cfg(feature = "remote")]
 const PROBE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 /// Hard cap on the underlying connect call. Quinn's handshake otherwise
 /// respects `QUIC_IDLE_TIMEOUT_SECS` (300 s), so a port that silently
@@ -53,6 +59,7 @@ const PROBE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 /// — long enough that no second scorer log ever reaches the user. With
 /// this timeout, a stuck probe surfaces as a `warn!` within ~10 s and
 /// the next 30 s tick gets a chance to run.
+#[cfg(feature = "remote")]
 const PROBE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 // ─── EndpointHealth ──────────────────────────────────────────────────────────
@@ -236,6 +243,7 @@ pub struct RttSample {
 // ─── SupervisorParams ─────────────────────────────────────────────────────────
 
 /// Parameters for `TransportSupervisor::new`.
+#[cfg(feature = "remote")]
 pub struct SupervisorParams {
     /// All endpoints the server has advertised.
     pub endpoints: Vec<EndpointAdvert>,
@@ -272,6 +280,7 @@ pub struct SupervisorParams {
 ///
 /// Spawned after bootstrap by calling `tokio::spawn(supervisor.run())`.
 /// Exits when `upgrade_tx` is dropped (caller shut down).
+#[cfg(feature = "remote")]
 pub struct TransportSupervisor {
     endpoints: Vec<EndpointHealth>,
     connection_id: ConnectionId,
@@ -288,6 +297,7 @@ pub struct TransportSupervisor {
     override_rx: Option<mpsc::UnboundedReceiver<Option<TransportKind>>>,
 }
 
+#[cfg(feature = "remote")]
 impl TransportSupervisor {
     pub fn new(params: SupervisorParams) -> Self {
         let endpoints = params.endpoints.iter().map(EndpointHealth::new).collect();
@@ -557,6 +567,7 @@ impl TransportSupervisor {
 
 /// Receive from an optional channel, or pend forever when it is `None` (so a
 /// `tokio::select!` arm over a dropped/absent receiver simply never fires).
+#[cfg(feature = "remote")]
 async fn recv_opt<T>(rx: &mut Option<mpsc::UnboundedReceiver<T>>) -> Option<T> {
     match rx {
         Some(r) => r.recv().await,
@@ -574,6 +585,7 @@ async fn recv_opt<T>(rx: &mut Option<mpsc::UnboundedReceiver<T>>) -> Option<T> {
 /// receiver that resolves with the auth outcome (`Ok` on success,
 /// `Err(reason)` on auth failure). The forwarder exits when the underlying
 /// transport's reader task drops its sender.
+#[cfg(feature = "remote")]
 fn spawn_auth_intercept(
     outer_tx: mpsc::UnboundedSender<ServerMessage>,
 ) -> (
@@ -614,6 +626,7 @@ fn spawn_auth_intercept(
 /// is observed on the new transport — opening the stream alone is not enough.
 ///
 /// `address` is `"host:port"` for QUIC/TCP+TLS or an absolute path for UDS.
+#[cfg(feature = "remote")]
 async fn probe_transport(
     kind: TransportKind,
     address: &str,
@@ -720,6 +733,7 @@ async fn probe_transport(
 }
 
 /// Parse `"host:port"` from an address string.
+#[cfg(feature = "remote")]
 fn parse_host_port(address: &str) -> Option<(String, u16)> {
     let (host, port_str) = address.rsplit_once(':')?;
     let port: u16 = port_str.parse().ok()?;

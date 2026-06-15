@@ -63,20 +63,34 @@ pub async fn resolve_connection(
         });
 
     if let Some(target) = ssh_target {
-        tracing::info!(
-            host = %target.host,
-            user = ?target.user,
-            "SSH negotiation starting"
-        );
-        let session = ssh::negotiate(&target)
-            .await
-            .map_err(|e| anyhow::anyhow!("SSH negotiation failed: {e}"))?;
-        Ok(ResolvedConnection {
-            host: "127.0.0.1".to_string(),
-            port: session.local_tcp_port,
-            tcp_port: None,
-            token: session.token,
-        })
+        #[cfg(feature = "remote")]
+        {
+            tracing::info!(
+                host = %target.host,
+                user = ?target.user,
+                "SSH negotiation starting"
+            );
+            let session = ssh::negotiate(&target)
+                .await
+                .map_err(|e| anyhow::anyhow!("SSH negotiation failed: {e}"))?;
+            Ok(ResolvedConnection {
+                host: "127.0.0.1".to_string(),
+                port: session.local_tcp_port,
+                tcp_port: None,
+                token: session.token,
+            })
+        }
+        // Lean build: no direct SSH dial-out. CLI subcommands (`ls`, `--dry-run`)
+        // reach only the local daemon; remote sessions are federated through the
+        // GUI via OpenPeer (issue #121).
+        #[cfg(not(feature = "remote"))]
+        {
+            let _ = target;
+            Err(anyhow::anyhow!(
+                "remote `--server` targets are not supported in this build; \
+                 this client connects only to the local daemon"
+            ))
+        }
     } else {
         let status = kmux_client::daemon::ensure_compatible_daemon().await?;
         Ok(ResolvedConnection {

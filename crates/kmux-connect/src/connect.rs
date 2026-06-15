@@ -1,17 +1,31 @@
+#[cfg(feature = "remote")]
 use std::net::ToSocketAddrs;
+#[cfg(feature = "remote")]
 use std::sync::{Arc, Mutex};
+#[cfg(feature = "remote")]
 use std::time::Duration;
 
-use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ConnectionId, ServerMessage};
+use kmux_protocol::messages::ClientMessage;
+#[cfg(feature = "remote")]
+use kmux_protocol::messages::{ClientCapabilities, ConnectionId, ServerMessage};
+#[cfg(feature = "remote")]
 use kmux_protocol::tls::{TofuStore, TofuVerifier};
+#[cfg(feature = "remote")]
 use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
-use tokio::sync::{Semaphore, mpsc};
+#[cfg(feature = "remote")]
+use tokio::sync::Semaphore;
+use tokio::sync::mpsc;
+#[cfg(feature = "remote")]
 use tracing::{debug, warn};
 
 /// Maximum number of concurrent server-initiated uni streams (one per attached session).
+#[cfg(feature = "remote")]
 const MAX_UNI_STREAMS: usize = 64;
 
 /// Outcome of a connection attempt.
+///
+/// Always available (the local UDS path returns it too); only the QUIC
+/// [`connect`] producer below is gated behind the `remote` feature.
 pub enum ConnectResult {
     /// Connected successfully; returns a sender for outbound messages.
     Connected(mpsc::UnboundedSender<ClientMessage>),
@@ -26,6 +40,7 @@ pub enum ConnectResult {
 /// - Accepts server-initiated unidirectional streams for per-session diffs
 ///
 /// The `server_tx` channel sends `ServerMessage` values back to the caller.
+#[cfg(feature = "remote")]
 pub async fn connect(
     host: String,
     port: u16,
@@ -168,6 +183,7 @@ pub async fn connect(
     ConnectResult::Connected(client_tx)
 }
 
+#[cfg(feature = "remote")]
 fn build_quinn_client_config(host: &str, port: u16, accept_invalid: bool) -> quinn::ClientConfig {
     let addr_key = format!("{host}:{port}");
 

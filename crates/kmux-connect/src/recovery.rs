@@ -16,9 +16,9 @@ use kmux_protocol::transport::bootstrap::{Bootstrap, BootstrapError, SessionCont
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
-use crate::bootstrap::{
-    QuicDirectBootstrap, SshBootstrap, TlsTcpDirectBootstrap, UdsLocalBootstrap, bootstrap_race,
-};
+#[cfg(feature = "remote")]
+use crate::bootstrap::{QuicDirectBootstrap, SshBootstrap, TlsTcpDirectBootstrap};
+use crate::bootstrap::{UdsLocalBootstrap, bootstrap_race};
 use crate::ssh::RemoteTarget;
 
 /// Everything needed to (re-)run `bootstrap_race`. Populated once from CLI
@@ -59,6 +59,7 @@ impl ReconnectContext {
             }));
         }
 
+        #[cfg(feature = "remote")]
         if !self.host.is_empty() && self.port != 0 && !self.token.is_empty() {
             strategies.push(Box::new(QuicDirectBootstrap {
                 host: self.host.clone(),
@@ -78,6 +79,7 @@ impl ReconnectContext {
             }));
         }
 
+        #[cfg(feature = "remote")]
         if let Some(target) = &self.ssh_target {
             strategies.push(Box::new(SshBootstrap {
                 target: target.clone(),
@@ -137,6 +139,7 @@ mod tests {
         assert_eq!(strategies[0].name(), "uds-local");
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn direct_context_yields_quic_and_tls_tcp() {
         let ctx = ReconnectContext {
@@ -154,6 +157,7 @@ mod tests {
         assert_eq!(strategies[1].name(), "tcp-tls-direct");
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn ssh_context_includes_ssh_strategy() {
         let ctx = ReconnectContext {
@@ -174,6 +178,7 @@ mod tests {
         assert_eq!(strategies[0].name(), "ssh");
     }
 
+    #[cfg(feature = "remote")]
     #[test]
     fn mixed_context_combines_all_applicable_strategies() {
         let ctx = ReconnectContext {

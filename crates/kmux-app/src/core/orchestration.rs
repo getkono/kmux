@@ -3,11 +3,16 @@
 //! querying a terminal directly (frontends report their geometry).
 
 use kmux_client::connection_state::{ConnectionState, DisconnectReason};
-use kmux_client::pipeline::{self, BootstrapOutcome, NoopObserver, ResolvedTarget, SshContext};
+#[cfg(feature = "remote")]
+use kmux_client::pipeline::SshContext;
+use kmux_client::pipeline::{self, BootstrapOutcome, NoopObserver, ResolvedTarget};
 use kmux_client::session_manager::SessionEvent;
+#[cfg(feature = "remote")]
 use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
+#[cfg(feature = "remote")]
 use kmux_client::transport::TransportKind;
 use kmux_protocol::messages::{PeerTarget, ServerMessage, SessionEntry};
+#[cfg(feature = "remote")]
 use kmux_protocol::transport::bootstrap::EndpointAdvert;
 use std::time::Instant;
 use tokio::sync::mpsc;
@@ -323,6 +328,11 @@ impl AppCore {
     /// Must be called immediately after `SessionManager::apply_outcome` so
     /// the supervisor sees the correct `ConnectionId` and the tunnel
     /// process is owned by the monitor task (not leaked).
+    ///
+    /// Only present in a `remote` build: a lean GUI never bootstraps an SSH
+    /// data plane (it federates remotes through the local daemon), so there is
+    /// no tunnel to supervise.
+    #[cfg(feature = "remote")]
     pub fn launch_ssh_supervisor(
         &mut self,
         ctx: SshContext,

@@ -17,8 +17,10 @@ use anyhow::Context;
 use kmux_client::pipeline::{
     BootstrapEvent, BootstrapObserver, BootstrapOutcome, ResolvedTarget, run_bootstrap,
 };
+#[cfg(feature = "remote")]
 use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
 use kmux_protocol::messages::{ClientMessage, ServerMessage};
+#[cfg(feature = "remote")]
 use kmux_protocol::transport::bootstrap::EndpointAdvert;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
@@ -29,6 +31,7 @@ use crate::host_caps;
 use super::parse_target;
 
 const PING_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "remote")]
 const TEST_DURATION: Duration = Duration::from_secs(10);
 
 /// Dispatch entry point wired in from `main.rs`.
@@ -62,7 +65,16 @@ pub async fn run_dry_run(args: &ServerArgs, test_mode: bool) -> anyhow::Result<(
     );
 
     if test_mode {
+        #[cfg(feature = "remote")]
         run_supervisor_phase(outcome, srv_rx, &observer).await?;
+        // Lean build: the transport supervisor (QUIC-upgrade probing) is gated
+        // out with the remote stack. `--dry-run` still works; `--test` has no
+        // transports to score.
+        #[cfg(not(feature = "remote"))]
+        observer.line(
+            "NOTE",
+            "`--test` transport probing is unavailable in this lean build",
+        );
     }
 
     Ok(())
@@ -110,6 +122,7 @@ async fn verify_ping(
 
 /// Run the live supervisor for [`TEST_DURATION`] so upgrade scoring and
 /// potential hot-swaps are observable on stdout.
+#[cfg(feature = "remote")]
 async fn run_supervisor_phase(
     outcome: BootstrapOutcome,
     mut srv_rx: mpsc::UnboundedReceiver<ServerMessage>,

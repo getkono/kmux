@@ -18,9 +18,9 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
 use tracing::{debug, warn};
 
-use crate::connect::{self, ConnectResult};
+use crate::connect::ConnectResult;
 use crate::daemon::{self, ensure_daemon};
-use crate::ssh::{self, RemoteTarget, SshError};
+use crate::ssh::{RemoteTarget, SshError};
 use crate::tcp_connect;
 use kmux_protocol::TransportKind;
 
@@ -315,10 +315,23 @@ pub async fn run_bootstrap(
 
     let plan = match target {
         ResolvedTarget::LocalDaemon => prepare_local_daemon(observer).await?,
+        #[cfg(feature = "remote")]
         ResolvedTarget::Ssh {
             target,
             accept_invalid_certs,
         } => prepare_ssh(target, accept_invalid_certs, observer).await?,
+        // A lean (UDS-only) build cannot dial a remote daemon directly — remote
+        // sessions are federated through the local daemon via `OpenPeer`. The
+        // GUI never produces an `Ssh` target in this build, so this is defensive.
+        #[cfg(not(feature = "remote"))]
+        ResolvedTarget::Ssh { .. } => {
+            return Err(BootstrapError::Connect {
+                strategy: "ssh",
+                error: "remote transports are disabled in this build; \
+                        remote sessions are federated through the local daemon"
+                    .into(),
+            });
+        }
     };
 
     let (client_tx, auth) = establish(
@@ -400,11 +413,14 @@ async fn prepare_local_daemon(
     })
 }
 
+#[cfg(feature = "remote")]
 async fn prepare_ssh(
     target: RemoteTarget,
     accept_invalid: bool,
     observer: &dyn BootstrapObserver,
 ) -> Result<ConnectPlan, BootstrapError> {
+    use crate::ssh;
+
     let dest = match &target.user {
         Some(u) => format!("{u}@{}", target.host),
         None => target.host.clone(),
@@ -515,8 +531,24 @@ async fn establish(
     });
 
     let sender_result = match plan.transport {
+        TransportKind::Uds => {
+            let socket_path =
+                kmux_protocol::dirs::data_socket_path().map_err(|e| BootstrapError::Connect {
+                    strategy: "uds",
+                    error: format!("data socket path: {e}"),
+                })?;
+            tcp_connect::connect_uds(
+                socket_path,
+                plan.token.clone(),
+                intercept_tx,
+                capabilities,
+                connection_id,
+            )
+            .await
+        }
+        #[cfg(feature = "remote")]
         TransportKind::Quic => {
-            connect::connect(
+            crate::connect::connect(
                 plan.host.clone(),
                 plan.port,
                 plan.token.clone(),
@@ -527,6 +559,7 @@ async fn establish(
             )
             .await
         }
+        #[cfg(feature = "remote")]
         TransportKind::TcpTls => {
             let tofu_key = match &plan.ssh_context {
                 Some(ctx) => format!("{}:{}", ctx.remote_host, ctx.remote_tcp_port),
@@ -544,27 +577,22 @@ async fn establish(
             )
             .await
         }
-        TransportKind::Uds => {
-            let socket_path =
-                kmux_protocol::dirs::data_socket_path().map_err(|e| BootstrapError::Connect {
-                    strategy: "uds",
-                    error: format!("data socket path: {e}"),
-                })?;
-            tcp_connect::connect_uds(
-                socket_path,
-                plan.token.clone(),
-                intercept_tx,
-                capabilities,
-                connection_id,
-            )
-            .await
-        }
+        #[cfg(feature = "remote")]
         TransportKind::Tcp => {
             return Err(BootstrapError::Connect {
                 strategy: "tcp",
                 error: "plain TCP bootstrap is not supported; \
                         use quic, tcp+tls, uds, or ssh"
                     .into(),
+            });
+        }
+        // Lean build: only UDS is wired in; every other transport is gated out
+        // with the `remote` feature. The local-daemon path only ever sets `Uds`.
+        #[cfg(not(feature = "remote"))]
+        other => {
+            return Err(BootstrapError::Connect {
+                strategy: transport_strategy_name(other),
+                error: "remote transports are disabled in this build".into(),
             });
         }
     };
