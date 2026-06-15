@@ -1525,6 +1525,7 @@ dependencies = [
  "kmux-app",
  "kmux-client",
  "kmux-protocol",
+ "kmux-render",
  "thiserror 2.0.18",
  "tokio",
  "tracing",

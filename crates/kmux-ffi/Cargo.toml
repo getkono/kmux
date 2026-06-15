@@ -22,10 +22,20 @@ crate-type = ["lib", "staticlib", "cdylib"]
 name = "uniffi-bindgen"
 path = "src/bin/uniffi-bindgen.rs"
 
+[features]
+# Opt-in GPU terminal rendering via kmux-render (wgpu), exposed to Swift as the
+# KmuxRenderer object. Off by default so the standard staticlib stays lean (no
+# wgpu); the wgpu-free packed-cell format is always used. See
+# docs/architecture-render.md.
+gpu = ["kmux-render/gpu"]
+
 [dependencies]
 kmux-app.workspace = true
 kmux-client.workspace = true
 kmux-protocol = { workspace = true, features = ["framing"] }
+# Default (wgpu-free) for the shared packed-cell format; the `gpu` feature turns
+# on the wgpu renderer for the KmuxRenderer object.
+kmux-render.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
