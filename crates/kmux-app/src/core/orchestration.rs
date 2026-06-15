@@ -1116,6 +1116,44 @@ mod tests {
         }
     }
 
+    #[tokio::test]
+    async fn create_session_action_uses_active_session_cwd() {
+        let (mut core, mut rx) = connected_core();
+        core.initial_cwd = "/fallback".into();
+        core.mgr
+            .session_list
+            .push(entry("eagle", "/home/user/proj"));
+        core.mgr.select_session("eagle".into());
+        while rx.try_recv().is_ok() {}
+
+        core.dispatch_action(Action::CreateSession).await;
+
+        match rx.try_recv().expect("a session create was sent") {
+            ClientMessage::SessionCreate { cwd, .. } => {
+                assert_eq!(cwd.as_deref(), Some("/home/user/proj"));
+            }
+            other => panic!("expected SessionCreate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_session_action_falls_back_to_initial_cwd() {
+        let (mut core, mut rx) = connected_core();
+        core.initial_cwd = "/fallback".into();
+        while rx.try_recv().is_ok() {}
+
+        // No active session: the action must still carry an explicit cwd rather
+        // than letting the daemon resolve a bare path against its own cwd.
+        core.dispatch_action(Action::CreateSession).await;
+
+        match rx.try_recv().expect("a session create was sent") {
+            ClientMessage::SessionCreate { cwd, .. } => {
+                assert_eq!(cwd.as_deref(), Some("/fallback"));
+            }
+            other => panic!("expected SessionCreate, got {other:?}"),
+        }
+    }
+
     #[test]
     fn dir_browser_surfaces_listing_error() {
         let (mut core, _rx) = connected_core();
