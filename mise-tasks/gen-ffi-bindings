@@ -17,10 +17,11 @@ case "$profile" in
     release) relflag="--release" ;;
     *) echo "error: profile must be 'debug' or 'release' (got '$profile')" >&2; exit 1 ;;
 esac
-# Optional cargo features for kmux-ffi, e.g. `KMUX_FFI_FEATURES=gpu` to include
-# the wgpu KmuxRenderer object (issue #132). Default: lean, no wgpu. The same
-# flag is passed to the bindgen run so cargo does not rebuild the cdylib without
-# the feature (which would drop KmuxRenderer from the introspected library).
+# Extra cargo features for kmux-ffi on top of the defaults. `gpu` is now a
+# default feature (issue #132), so the KmuxRenderer object is in the bindings
+# without setting anything; this hook remains for adding *other* features. The
+# same flag is passed to the bindgen run so cargo does not rebuild the cdylib
+# with a different feature set (which would change the introspected library).
 featflag=()
 [[ -n "${KMUX_FFI_FEATURES:-}" ]] && featflag=(--features "$KMUX_FFI_FEATURES")
 cargo build $relflag "${featflag[@]}" -p kmux-ffi

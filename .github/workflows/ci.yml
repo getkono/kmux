@@ -52,6 +52,12 @@ jobs:
       - name: Clippy
         run: mise run clippy
 
+      # The GPU renderer (issue #132) is a default feature, so clippy/test above
+      # already exercise it. This proves the wgpu-free path still compiles, so
+      # the CPU renderers can't bit-rot.
+      - name: Build without GPU (must stay wgpu-free)
+        run: mise run build-no-gpu
+
       - name: Test
         # Includes the cross-process daemon handoff/upgrade integration tests
         # (crates/kmuxd/tests/handoff_e2e.rs), which spawn a real kmuxd and drive a
@@ -112,6 +118,11 @@ jobs:
 
       - name: Build kmux + kmux-gtk (native GTK on macOS)
         run: cargo build -p kmux -p kmux-gtk
+
+      # GPU (issue #132) is a default feature, so the build/clippy/test steps
+      # here already compile wgpu; this proves the wgpu-free path still builds.
+      - name: Build without GPU (must stay wgpu-free)
+        run: mise run build-no-gpu
 
       - name: Test (kmux-ffi + the client stack it wraps)
         run: cargo test -p kmux-ffi -p kmux-app -p kmux-client -p kmux-protocol

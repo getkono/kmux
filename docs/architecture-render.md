@@ -6,9 +6,13 @@ per-frontend CPU rasterizers — `kmux-gtk`'s Cairo/Pango `render.rs` and the
 Swift app's CoreText `TerminalView` — with one wgpu implementation both
 frontends drive, so the cell-grid render leaf lives in one place.
 
-It is **opt-in** today: each frontend keeps its CPU renderer as the default and
-selects the GPU path with `KMUX_RENDERER=wgpu`. Flipping the default and removing
-the CPU renderers are deliberate follow-ups (see [Status](#status)).
+The GPU renderer is **compiled in by default** (the `gpu` feature is on, issue
+#132), so the standard build/test paths always cover it. The only opt-in is at
+**runtime**: each frontend keeps its CPU renderer as the startup default and
+switches to the GPU path when `KMUX_RENDERER=wgpu` is set. A lean, wgpu-free
+build is still available with `--no-default-features` (CI compiles that path too,
+via `mise run build-no-gpu`). Removing the CPU renderers outright is a deliberate
+follow-up (see [Status](#status)).
 
 ## Where it sits
 
@@ -43,7 +47,8 @@ The crate is layered so the lean builds pull no wgpu:
   `pollster`.
 
 Frontends enable `kmux-render/gpu` through their own `gpu` feature (`kmux-gtk`,
-`kmux-ffi`), off by default.
+`kmux-ffi`), **on by default**; `--no-default-features` drops back to the lean,
+wgpu-free path.
 
 ## The render input: `Frame`
 
@@ -124,13 +129,21 @@ surface (uniffi's binding-checksum check guards the rest).
 
 ## Selecting the GPU path
 
-- **GTK**: build with the feature and set the env —
-  `KMUX_RENDERER=wgpu cargo run -p kmux-gtk --features gpu`. Without the env it
-  stays on Cairo; if no GPU adapter is available it logs and falls back to Cairo.
-- **Swift**: `mise run swift-gpu-run` (builds the FFI with `--features gpu`,
-  regenerates bindings that include `KmuxRenderer`, builds the app with
-  `-DKMUX_GPU`, and runs with `KMUX_RENDERER=wgpu`). The default `mise run
-  swift-run` stays CoreText.
+The `gpu` feature is on by default, so the renderer is already compiled in; these
+just flip the **runtime** switch.
+
+- **GTK**: set the env — `KMUX_RENDERER=wgpu cargo run -p kmux-gtk`. Without it
+  GTK stays on Cairo; if no GPU adapter is available it logs and falls back to
+  Cairo.
+- **Swift**: `mise run swift-gpu-run` (regenerates bindings that include
+  `KmuxRenderer`, builds the app with `-DKMUX_GPU` so the Swift Metal view is
+  compiled, and runs with `KMUX_RENDERER=wgpu`). The default `mise run swift-run`
+  stays CoreText.
+
+Both clients write logs to the client log file (`mise run tail-client-log`); the
+GPU path logs adapter/surface setup, resizes, and frame errors there (raise
+verbosity with `RUST_LOG=kmux=debug` or `=trace`). The daemon logs separately to
+the daemon log file.
 
 ## Testing
 
@@ -145,12 +158,14 @@ Two tiers:
 
 ## Status
 
-Landed (opt-in): the `kmux-render` crate (core + text + gpu, GPU smoke-tested),
-the GTK offscreen path, the `kmux-ffi` `KmuxRenderer` object, and the Swift Metal
-path. Follow-ups: HiDPI-crisp GTK rendering (render at physical resolution),
-making the renderer the resize authority on the GTK path too (so tiled layouts
-match the Cairo path exactly), Linux `dmabuf` zero-copy, color-emoji glyphs, and
-— once proven on both platforms — flipping the default and removing the CPU
+Landed: the `kmux-render` crate (core + text + gpu, GPU smoke-tested), the GTK
+offscreen path, the `kmux-ffi` `KmuxRenderer` object, and the Swift Metal path.
+The `gpu` feature is now **on by default** (compiled + tested everywhere; CI also
+compiles the wgpu-free path), so only the runtime switch stays opt-in. Follow-ups:
+HiDPI-crisp GTK rendering (render at physical resolution), making the renderer the
+resize authority on the GTK path too (so tiled layouts match the Cairo path
+exactly), Linux `dmabuf` zero-copy, color-emoji glyphs, and — once proven on both
+platforms — making the GPU renderer the runtime default and removing the CPU
 renderers.
 
 [`CellGrid`]: ../crates/kmux-client/src/grid/mod.rs

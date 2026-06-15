@@ -16,9 +16,12 @@ name = "kmux-gtk"
 path = "src/main.rs"
 
 [features]
-# Opt-in GPU terminal rendering via the shared kmux-render crate (wgpu). Off by
-# default so the standard build stays Cairo-only and pulls no wgpu; selected at
-# runtime with KMUX_RENDERER=wgpu. See docs/architecture-render.md.
+# GPU terminal rendering via the shared kmux-render crate (wgpu). On by default
+# (issue #132) so the GPU path is always compiled; the renderer still stays
+# Cairo unless KMUX_RENDERER=wgpu selects it at runtime. Build
+# `--no-default-features` for a lean, Cairo-only binary that pulls no wgpu. CI
+# compiles both. See docs/architecture-render.md.
+default = ["gpu"]
 gpu = ["dep:kmux-render"]
 
 [dependencies]

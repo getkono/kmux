@@ -52,8 +52,17 @@ description = "Auto-fix clippy lints"
 run = "cargo clippy --fix --allow-dirty --allow-staged --workspace --all-targets -- -D warnings"
 
 [tasks.build]
-description = "Build (default features)"
+description = "Build (default features — includes the GPU renderer, issue #132)"
 run = "cargo build"
+
+[tasks.build-no-gpu]
+description = "Build the GUI crates without the GPU renderer (must stay wgpu-free)"
+# `gpu` is a default feature (issue #132), so the standard build/test paths
+# always exercise it. This proves the lean path still compiles, so the CPU
+# renderers (GTK Cairo, the wgpu-free packed-cell format) can never bit-rot.
+# Mirrors the CI "Build without GPU" step — kmux-gtk falls back to its
+# target-gated Cairo path; kmux-ffi keeps only the packed-cell format.
+run = "cargo build -p kmux-gtk -p kmux-ffi --no-default-features"
 
 [tasks.test]
 description = "Run tests (whole workspace; matches CI)"
@@ -86,17 +95,19 @@ description = "Test the native macOS app (kmux-swift). Regenerates bindings firs
 depends = ["gen-ffi-bindings"]
 run = "swift test --package-path kmux-swift"
 
+# The Rust `gpu` feature is on by default now, so the bindings always include
+# KmuxRenderer; these tasks add the Swift `-DKMUX_GPU` flag (compiles the Metal
+# view) and, for `-run`, the runtime `KMUX_RENDERER=wgpu` opt-in.
 [tasks.swift-gpu-app]
-description = "Build the macOS app with the wgpu GPU renderer (issue #132, opt-in)."
-env = { KMUX_FFI_FEATURES = "gpu" }
+description = "Build the macOS app with the Swift Metal view compiled in (issue #132)."
 run = [
     "mise run gen-ffi-bindings",
     "swift build --package-path kmux-swift -Xswiftc -DKMUX_GPU",
 ]
 
 [tasks.swift-gpu-run]
-description = "Run the macOS app with the wgpu GPU renderer (KMUX_RENDERER=wgpu, opt-in)."
-env = { KMUX_FFI_FEATURES = "gpu", KMUX_RENDERER = "wgpu" }
+description = "Run the macOS app on the wgpu GPU renderer (KMUX_RENDERER=wgpu)."
+env = { KMUX_RENDERER = "wgpu" }
 run = [
     "mise run gen-ffi-bindings",
     "swift run --package-path kmux-swift -Xswiftc -DKMUX_GPU",
