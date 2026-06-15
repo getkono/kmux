@@ -190,6 +190,13 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   a slow viewer never desyncs it); a closed viewer is dropped silently. The downstream
   relay is now identical for PTY-backed and peer-backed panes. (Previously a full
   channel silently dropped the frame, diverging that viewer permanently.)
+  **Session events and lifecycle** (titles, layout, tab/session events, and the
+  death-path `SessionClosed`) instead travel over each viewer's **unbounded ctrl**
+  channel (`viewers_under_word`), matching how the local daemon delivers events — so a
+  backed-up pane content stream can never drop a title change, and a viewer that was
+  full at the instant the peer died still receives its `SessionClosed` (otherwise the
+  GUI would hang, as no further frames follow). Content keeps backpressure; events are
+  guaranteed.
 - **PR6 — concurrent-open race — fixed.** `open_peer`'s reuse check and its publish
   straddle the awaiting connect/auth/list, so two GUIs federating the same target at
   once could both connect and both publish, the second overwriting the first and leaking
