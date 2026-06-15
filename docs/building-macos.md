@@ -71,6 +71,20 @@ mise run swift-test    # gen bindings + swift test
 (or directly: `swift build --package-path kmux-swift`, etc., after
 `mise run gen-ffi-bindings`).
 
+### GPU rendering (opt-in, issue #132)
+
+To run the app with the shared wgpu renderer instead of CoreText:
+
+```sh
+mise run swift-gpu-run   # builds kmux-ffi --features gpu, regen bindings, swift -DKMUX_GPU, KMUX_RENDERER=wgpu
+mise run swift-gpu-app   # build only
+```
+
+These set `KMUX_FFI_FEATURES=gpu` so the staticlib + generated bindings include
+the `KmuxRenderer` object, compile the app with `-DKMUX_GPU`, and select the GPU
+path at runtime via `KMUX_RENDERER=wgpu`. The default tasks above stay CoreText.
+See [architecture-render.md](architecture-render.md).
+
 ## Install
 
 ```sh

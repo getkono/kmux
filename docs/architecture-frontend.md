@@ -463,10 +463,15 @@ picker-query surface.
   the Swift app currently ignores connect flags (`--server`/`--theme`/…) and uses
   defaults; honoring them there (parsing argv into a `DriverConfig`) is a
   follow-up. CLI subcommands (`daemon`/`ls`/`--dry-run`) already work via `kmux`.
+- **Shared GPU renderer (`kmux-render`).** The cell-grid render leaf is now also
+  available as one cross-platform wgpu renderer both frontends drive (GTK
+  directly, Swift via `kmux-ffi`/`CAMetalLayer`), opt-in with `KMUX_RENDERER=wgpu`
+  (issue #132). The CPU renderers below remain the default; flipping the default
+  and removing them are follow-ups. See [architecture-render.md](architecture-render.md).
 - **Native macOS polish.** The `kmux-swift` app (see the section above) is
-  functional and at feature parity with `kmux-gtk`. Remaining polish: a Metal
-  renderer + same-attr run batching if profiling shows need; a configurable font
-  in Preferences (the renderer currently uses the system monospaced face); a
+  functional and at feature parity with `kmux-gtk`. Remaining polish: same-attr
+  run batching if profiling shows need; a configurable font in Preferences (the
+  CoreText renderer currently uses the system monospaced face); a
   **codesigned + notarized** `.app` bundle (`mise run install` already assembles an
   unsigned `~/Applications/kmux.app` — see
   [building-macos.md](building-macos.md#install)).
