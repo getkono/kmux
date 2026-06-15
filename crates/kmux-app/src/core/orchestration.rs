@@ -296,7 +296,7 @@ impl AppCore {
     }
 
     /// The active session's server-side cwd, if a session is active.
-    fn active_session_cwd(&self) -> Option<String> {
+    pub(super) fn active_session_cwd(&self) -> Option<String> {
         let word_id = self.mgr.active_session()?;
         self.mgr
             .session_list()

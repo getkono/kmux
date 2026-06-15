@@ -28,7 +28,14 @@ impl AppCore {
             // event); it never reaches the core dispatch.
             Action::ForwardKey => {}
             Action::CreateSession => {
-                self.mgr.create_session(None, None, self.term_size);
+                // Never assume where a new session opens: default to the focused
+                // session's cwd, falling back to the app's initial cwd. A bare
+                // create with no cwd would resolve against the *daemon's* working
+                // directory, not the user's.
+                let cwd = self
+                    .active_session_cwd()
+                    .unwrap_or_else(|| self.initial_cwd.clone());
+                self.mgr.create_session(None, Some(&cwd), self.term_size);
             }
             Action::CreatePane => {
                 self.mgr.create_pane(self.term_size);
