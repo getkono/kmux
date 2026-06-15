@@ -63,10 +63,13 @@ pub struct PeerManager {
     word_index: Mutex<HashMap<String, PeerId>>,
 }
 
-/// One local GUI viewing a proxied pane, plus its declared terminal size (used
-/// for smallest-wins upstream reconciliation).
+/// One local GUI viewing a proxied pane: its bounded data channel, its unbounded
+/// ctrl channel (out-of-band signalling that bypasses data backpressure, e.g.
+/// `Lagged`), and its declared terminal size (used for smallest-wins upstream
+/// reconciliation).
 struct Viewer {
     data_tx: mpsc::Sender<ServerMessage>,
+    ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
     size: TermSize,
 }
 
@@ -123,6 +126,41 @@ impl ProxiedPane {
 
     fn viewer_senders(&self) -> Vec<mpsc::Sender<ServerMessage>> {
         self.viewers.values().map(|v| v.data_tx.clone()).collect()
+    }
+
+    /// Fan an (already local-addressed) pane frame out to every viewer, applying
+    /// the same backpressure policy as the local PTY relay
+    /// ([`crate::relay::broadcast_to_clients`]): a viewer whose **bounded** data
+    /// channel is full is sent a [`ServerMessage::Lagged`] over its **unbounded**
+    /// ctrl channel and dropped — it re-attaches and is served a fresh snapshot
+    /// minted off the still-correct mirror, exactly as a lagging local client
+    /// recovers. A viewer whose channel has closed is dropped silently. The mirror
+    /// is fed by the caller *before* this, so a dropped viewer never desyncs it.
+    fn fan_out(&mut self, local_pane_id: &str, msg: &ServerMessage) {
+        let mut dead: Vec<ClientId> = Vec::new();
+        for (&client_id, viewer) in self.viewers.iter() {
+            match viewer.data_tx.try_send(msg.clone()) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    // Out-of-band so it lands even though the data channel is full;
+                    // the client re-attaches with its last seqno and resyncs.
+                    let _ = viewer.ctrl_tx.send(ServerMessage::Lagged {
+                        pane_id: local_pane_id.to_string(),
+                        missed_count: 1,
+                    });
+                    dead.push(client_id);
+                    warn!(
+                        ?client_id,
+                        pane = local_pane_id,
+                        "federated viewer lagged; sent Lagged via ctrl and dropped",
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => dead.push(client_id),
+            }
+        }
+        for id in &dead {
+            self.viewers.remove(id);
+        }
     }
 
     /// Feed an inbound (already-local-addressed) pane frame into the mirror.
@@ -564,6 +602,7 @@ impl PeerManager {
         local_pane_id: &str,
         client_id: ClientId,
         data_tx: mpsc::Sender<ServerMessage>,
+        ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
         last_seqno: Option<SequenceNo>,
         size: TermSize,
     ) -> bool {
@@ -589,14 +628,28 @@ impl PeerManager {
                 sent_at_ms: epoch_millis(),
             };
             let _ = data_tx.try_send(minted);
-            pane.viewers.insert(client_id, Viewer { data_tx, size });
+            pane.viewers.insert(
+                client_id,
+                Viewer {
+                    data_tx,
+                    ctrl_tx,
+                    size,
+                },
+            );
             guard.reconcile_size(local_pane_id, &remote_pane);
         } else {
             // First viewer: create the pane (mirror sized to the viewer) and
             // forward Attach upstream; the remote's snapshot arrives via the feed
             // loop and seeds the mirror.
             let mut pane = ProxiedPane::new(size);
-            pane.viewers.insert(client_id, Viewer { data_tx, size });
+            pane.viewers.insert(
+                client_id,
+                Viewer {
+                    data_tx,
+                    ctrl_tx,
+                    size,
+                },
+            );
             guard.panes.insert(local_pane_id.to_string(), pane);
             let _ = guard.client_tx.send(ClientMessage::Attach {
                 pane_id: remote_pane,
@@ -687,29 +740,17 @@ fn spawn_feed_loop(
 
             // Pane-scoped frames: translate the pane ID remote→local, feed the
             // pane's mirror (so a late local attacher can be served from it), then
-            // collect that pane's viewers.
+            // fan out to that pane's viewers. `fan_out` applies the relay's
+            // backpressure policy: a full viewer is sent `Lagged` (out-of-band) and
+            // dropped, then resyncs on re-attach from the just-updated mirror.
             if let Some(remote_pane) = msg_pane_id(&msg).map(str::to_string) {
-                let viewers = {
-                    let mut guard = conn.lock().unwrap();
-                    match guard.to_local_pane(&remote_pane) {
-                        Some(local_pane) => {
-                            set_msg_pane_id(&mut msg, local_pane.clone());
-                            match guard.panes.get_mut(&local_pane) {
-                                Some(pane) => {
-                                    pane.apply_to_mirror(&msg);
-                                    pane.viewer_senders()
-                                }
-                                None => Vec::new(),
-                            }
-                        }
-                        None => Vec::new(),
+                let mut guard = conn.lock().unwrap();
+                if let Some(local_pane) = guard.to_local_pane(&remote_pane) {
+                    set_msg_pane_id(&mut msg, local_pane.clone());
+                    if let Some(pane) = guard.panes.get_mut(&local_pane) {
+                        pane.apply_to_mirror(&msg);
+                        pane.fan_out(&local_pane, &msg);
                     }
-                };
-                for tx in viewers {
-                    // Best-effort: a full viewer channel drops this frame; the client
-                    // recovers via `Lagged` + re-attach with `last_seqno`. PR6 hardens
-                    // the backpressure path.
-                    let _ = tx.try_send(msg.clone());
                 }
                 continue;
             }
@@ -1050,25 +1091,27 @@ mod tests {
         }
     }
 
+    /// A test viewer with a bounded data channel and a throwaway ctrl channel.
+    fn test_viewer(cap: usize, size: TermSize) -> (Viewer, mpsc::Receiver<ServerMessage>) {
+        let (data_tx, data_rx) = mpsc::channel(cap);
+        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel();
+        (
+            Viewer {
+                data_tx,
+                ctrl_tx,
+                size,
+            },
+            data_rx,
+        )
+    }
+
     #[test]
     fn proxied_pane_effective_size_is_smallest_wins() {
         let mut pane = ProxiedPane::new(sz(24, 80));
-        let (d1, _r1) = mpsc::channel(8);
-        let (d2, _r2) = mpsc::channel(8);
-        pane.viewers.insert(
-            ClientId(1),
-            Viewer {
-                data_tx: d1,
-                size: sz(24, 80),
-            },
-        );
-        pane.viewers.insert(
-            ClientId(2),
-            Viewer {
-                data_tx: d2,
-                size: sz(10, 40),
-            },
-        );
+        let (v1, _r1) = test_viewer(8, sz(24, 80));
+        let (v2, _r2) = test_viewer(8, sz(10, 40));
+        pane.viewers.insert(ClientId(1), v1);
+        pane.viewers.insert(ClientId(2), v2);
         // Smallest-wins across viewers (the size forwarded upstream).
         let eff = pane.effective_size();
         assert_eq!((eff.rows, eff.cols), (10, 40));
@@ -1107,6 +1150,80 @@ mod tests {
         assert!(
             text.contains("XYZ"),
             "minted snapshot must carry mirror content: {text:?}"
+        );
+    }
+
+    #[test]
+    fn fan_out_delivers_to_healthy_viewer() {
+        let mut pane = ProxiedPane::new(sz(24, 80));
+        let (v, mut rx) = test_viewer(8, sz(24, 80));
+        pane.viewers.insert(ClientId(1), v);
+
+        pane.fan_out("hawk/0", &snapshot_msg("hawk/0"));
+
+        assert!(
+            matches!(rx.try_recv(), Ok(ServerMessage::TerminalSnapshot { .. })),
+            "a healthy viewer receives the frame"
+        );
+        assert_eq!(pane.viewers.len(), 1, "a healthy viewer is retained");
+    }
+
+    #[test]
+    fn fan_out_sends_lagged_via_ctrl_and_drops_full_viewer() {
+        // A capacity-1 data channel pre-filled so the next send overflows; the
+        // viewer must then get a `Lagged` on its ctrl channel and be removed.
+        let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        data_tx.try_send(snapshot_msg("hawk/0")).unwrap(); // fill to capacity
+
+        let mut pane = ProxiedPane::new(sz(24, 80));
+        pane.viewers.insert(
+            ClientId(9),
+            Viewer {
+                data_tx,
+                ctrl_tx,
+                size: sz(24, 80),
+            },
+        );
+
+        pane.fan_out("hawk/0", &snapshot_msg("hawk/0"));
+
+        let lagged = ctrl_rx.try_recv().expect("Lagged must arrive on ctrl");
+        assert!(
+            matches!(&lagged, ServerMessage::Lagged { pane_id, .. } if pane_id == "hawk/0"),
+            "a backed-up viewer is signalled Lagged out-of-band, got {lagged:?}",
+        );
+        assert!(
+            pane.viewers.is_empty(),
+            "a lagged viewer is dropped (it re-attaches and resyncs from the mirror)"
+        );
+    }
+
+    #[test]
+    fn fan_out_drops_closed_viewer_silently() {
+        let (data_tx, data_rx) = mpsc::channel::<ServerMessage>(8);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        drop(data_rx); // receiver gone → channel closed
+
+        let mut pane = ProxiedPane::new(sz(24, 80));
+        pane.viewers.insert(
+            ClientId(3),
+            Viewer {
+                data_tx,
+                ctrl_tx,
+                size: sz(24, 80),
+            },
+        );
+
+        pane.fan_out("hawk/0", &snapshot_msg("hawk/0"));
+
+        assert!(
+            pane.viewers.is_empty(),
+            "a viewer whose channel closed is dropped"
+        );
+        assert!(
+            ctrl_rx.try_recv().is_err(),
+            "a closed viewer gets no Lagged — it is simply gone"
         );
     }
 
