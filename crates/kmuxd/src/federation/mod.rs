@@ -71,6 +71,11 @@ struct Viewer {
     data_tx: mpsc::Sender<ServerMessage>,
     ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
     size: TermSize,
+    /// Connection-pause state (issue #68). While paused this viewer receives no
+    /// terminal-output frames (it is skipped in `fan_out`, never marked lagged) and
+    /// catches up on resume via re-attach; it still counts toward `effective_size`,
+    /// exactly as a paused client does in the local PTY relay.
+    paused: bool,
 }
 
 /// A proxied pane: the local viewers sharing it, a [`CellGrid`] mirror fed from
@@ -143,6 +148,12 @@ impl ProxiedPane {
     fn fan_out(&mut self, local_pane_id: &str, msg: &ServerMessage) {
         let mut dead: Vec<ClientId> = Vec::new();
         for (&client_id, viewer) in self.viewers.iter() {
+            // Paused viewers (issue #68) receive no terminal output and must never
+            // be marked lagged or dropped when their channel fills — they resync on
+            // resume via re-attach. Same rule as `relay::broadcast_to_clients`.
+            if viewer.paused {
+                continue;
+            }
             match viewer.data_tx.try_send(msg.clone()) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
@@ -714,6 +725,7 @@ impl PeerManager {
                     data_tx,
                     ctrl_tx,
                     size,
+                    paused: false,
                 },
             );
             guard.reconcile_size(local_pane_id, &remote_pane);
@@ -728,6 +740,7 @@ impl PeerManager {
                     data_tx,
                     ctrl_tx,
                     size,
+                    paused: false,
                 },
             );
             guard.panes.insert(local_pane_id.to_string(), pane);
@@ -793,6 +806,24 @@ impl PeerManager {
             });
         } else {
             guard.reconcile_size(local_pane_id, &remote_pane);
+        }
+    }
+
+    /// Apply connection-pause state (issue #68) to every federated pane `client_id`
+    /// views, across all peers. A paused viewer is skipped in [`ProxiedPane::fan_out`]
+    /// (it stops receiving terminal output and resyncs on resume via re-attach, which
+    /// mints from the still-current mirror) but still counts toward smallest-wins
+    /// sizing — the same semantics as the local relay's `set_paused`. No-op for a
+    /// client that views no federated panes.
+    pub fn set_paused(&self, client_id: ClientId, paused: bool) {
+        let conns: Vec<_> = self.peers.lock().unwrap().values().cloned().collect();
+        for conn in conns {
+            let mut guard = conn.lock().unwrap();
+            for pane in guard.panes.values_mut() {
+                if let Some(viewer) = pane.viewers.get_mut(&client_id) {
+                    viewer.paused = paused;
+                }
+            }
         }
     }
 
@@ -1185,6 +1216,7 @@ mod tests {
                 data_tx,
                 ctrl_tx,
                 size,
+                paused: false,
             },
             data_rx,
         )
@@ -1268,6 +1300,7 @@ mod tests {
                 data_tx,
                 ctrl_tx,
                 size: sz(24, 80),
+                paused: false,
             },
         );
 
@@ -1285,6 +1318,38 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_skips_paused_viewer_without_dropping_it() {
+        // A paused viewer (issue #68) receives nothing and is retained even when its
+        // channel is full — it resyncs on resume via re-attach, never lagged.
+        let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        data_tx.try_send(snapshot_msg("hawk/0")).unwrap(); // fill to capacity
+
+        let mut pane = ProxiedPane::new(sz(24, 80));
+        pane.viewers.insert(
+            ClientId(5),
+            Viewer {
+                data_tx,
+                ctrl_tx,
+                size: sz(24, 80),
+                paused: true,
+            },
+        );
+
+        pane.fan_out("hawk/0", &snapshot_msg("hawk/0"));
+
+        assert!(
+            ctrl_rx.try_recv().is_err(),
+            "a paused viewer must not be sent Lagged even with a full channel"
+        );
+        assert_eq!(
+            pane.viewers.len(),
+            1,
+            "a paused viewer must be retained, not dropped"
+        );
+    }
+
+    #[test]
     fn fan_out_drops_closed_viewer_silently() {
         let (data_tx, data_rx) = mpsc::channel::<ServerMessage>(8);
         let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
@@ -1297,6 +1362,7 @@ mod tests {
                 data_tx,
                 ctrl_tx,
                 size: sz(24, 80),
+                paused: false,
             },
         );
 

@@ -134,10 +134,23 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   the remote pane arrives as `PaneTitleChanged` for the local pane). `Signal` and
   `FetchHistory` for a federated pane are forwarded upstream too (the `HistoryLines`
   reply is pane-scoped, so the feed loop routes it back to the requesting viewer).
+- **PR4 facet — per-viewer pause (local) — landed.** A paused GUI (issue #68) viewing a
+  proxied pane now stops receiving its output: `ServerApp::set_paused` also marks the
+  client's federated viewers (`set_federated_paused` → `PeerManager::set_paused`), and
+  `fan_out` skips paused viewers (never marking them lagged) — matching the local relay.
+  A paused viewer still counts toward smallest-wins sizing and resyncs on resume via
+  re-attach (which mints from the still-current mirror). Unit:
+  `fan_out_skips_paused_viewer_without_dropping_it`.
 - **PR4 remaining facets** (independent, lower-risk; a naive forward would break
-  multi-viewer correctness, so each needs real arbitration/filtering state): pause
-  upstream only when **all** local viewers are paused (issue #68 interplay); capability
-  union upstream / filter downstream; and input-lock arbitration across local viewers.
+  multi-viewer correctness, so each needs real arbitration/filtering state):
+  - **pause-*union* upstream** — when **all** local viewers of a proxied pane are paused,
+    stop the *upstream* stream too (the local-pause above already stops downstream
+    delivery; this reclaims the federation link's bandwidth). The natural mechanism is
+    `Detach` upstream on all-paused and re-`Attach` on first-resume — deferred because
+    that resume cost (a fresh upstream snapshot) is a real trade-off vs. keeping the
+    mirror warm, and the win only matters under sustained all-paused.
+  - capability union upstream / filter downstream; and input-lock arbitration across
+    local viewers.
 - **PR5 prerequisite — SSH peer federation — landed.** `open_peer` now serves
   `PeerTarget::Ssh` as well as `Direct`: it negotiates the `-L` tunnel via
   `kmux-connect`'s `ssh::negotiate` and connects over TCP+TLS through it, sharing the

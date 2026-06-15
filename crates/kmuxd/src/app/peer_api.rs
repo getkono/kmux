@@ -77,6 +77,22 @@ impl ServerApp {
         }
     }
 
+    /// Apply connection-pause state (issue #68) to every federated pane `client_id`
+    /// views: a paused viewer is skipped in the feed loop's fan-out and resyncs on
+    /// resume via re-attach. A no-op without the feature (or for a client viewing no
+    /// federated panes). Complements [`ServerApp::set_paused`], which covers
+    /// locally-hosted panes.
+    pub fn set_federated_paused(&self, client_id: ClientId, paused: bool) {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.set_paused(client_id, paused);
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (client_id, paused);
+        }
+    }
+
     /// Tear down every federated peer (abort feed loops, kill SSH tunnels) for
     /// daemon shutdown, so no `ssh -L` child is orphaned when the process exits. A
     /// no-op without the feature (or when no peers are open).
