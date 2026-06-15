@@ -48,6 +48,8 @@ pub mod frame;
 pub mod geometry;
 pub mod packed;
 
+pub use frame::{CellSource, CursorView, Frame, PaneView, ScrollIndicator};
+
 #[cfg(feature = "text")]
 pub mod atlas;
 #[cfg(feature = "text")]
