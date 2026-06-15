@@ -1,9 +1,12 @@
 use std::path::Path;
+#[cfg(feature = "remote")]
 use std::sync::{Arc, Mutex};
 
 use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ConnectionId, ServerMessage};
+#[cfg(feature = "remote")]
 use kmux_protocol::tls::{TofuStore, TofuVerifier};
 use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
+#[cfg(feature = "remote")]
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
@@ -19,6 +22,7 @@ use crate::connect::ConnectResult;
 ///
 /// Pass `connection_id = Some(id)` to resume an existing session after a
 /// transport switch (e.g. QUIC → TCP fallback).
+#[cfg(feature = "remote")]
 pub async fn connect_tcp(
     host: String,
     port: u16,
@@ -102,6 +106,7 @@ pub async fn connect_tcp(
 /// parameter lets callers separate the connection address from the TOFU identity:
 /// for SSH-tunnel connections pass `"remote_host:remote_port"` so the pin is
 /// keyed to the actual server, not the ephemeral loopback port.
+#[cfg(feature = "remote")]
 #[allow(clippy::too_many_arguments)]
 pub async fn connect_tcp_tls(
     host: String,
@@ -284,6 +289,7 @@ pub async fn connect_uds(
 
 /// Load the TOFU store from `known_hosts.toml`, or fall back to a temp-file
 /// backed in-memory store for this process run.
+#[cfg(feature = "remote")]
 fn load_tofu_store() -> Arc<Mutex<TofuStore>> {
     let path = kmux_protocol::dirs::known_hosts_path()
         .inspect_err(|e| warn!("cannot determine known_hosts path: {e}"))
@@ -305,6 +311,7 @@ fn load_tofu_store() -> Arc<Mutex<TofuStore>> {
     }
 }
 
+#[cfg(feature = "remote")]
 fn set_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
     use nix::sys::socket::{setsockopt, sockopt};
     use std::os::unix::io::AsRawFd;

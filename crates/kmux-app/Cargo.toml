@@ -10,6 +10,14 @@ description = "Frontend-agnostic interaction layer for the kmux client, shared b
 # Captures build metadata (git SHA, date, profile) for the CLI --version string.
 build = "build.rs"
 
+[features]
+default = ["remote"]
+# Forward the remote-transport stack to kmux-client. Gates the SSH supervisor
+# launch + the `--test` transport-probing diagnostic, which only make sense when
+# the GUI dials remotes directly. Default-on for standalone builds/tests; the
+# workspace disables it so GUI frontends stay lean (issue #121).
+remote = ["kmux-client/remote"]
+
 [dependencies]
 kmux-client.workspace = true
 kmux-protocol = { workspace = true, features = ["framing"] }

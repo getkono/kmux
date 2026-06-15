@@ -8,8 +8,30 @@ repository.workspace = true
 publish.workspace = true
 description = "Connection & protocol-negotiation mechanism for kmux clients: bootstrap strategies, transports (QUIC/TCP+TLS/UDS/SSH), transport supervision, and local daemon lifecycle."
 
+[features]
+default = ["remote"]
+# Remote transports: direct QUIC (quinn), direct TCP+TLS (rustls/tokio-rustls),
+# and SSH negotiation (`ssh::negotiate` + the `TransportSupervisor`). Gated so a
+# GUI client can build a lean binary that only speaks UDS to the local daemon —
+# remote sessions reach it via the daemon's federation, not a direct dial-out
+# (issue #121). `kmuxd` keeps this on (it federates to remote daemons). The
+# always-compiled surface keeps the UDS bootstrap, the local-daemon lifecycle,
+# server-string parsing, and the transport scorer types. See
+# docs/architecture-federation.md.
+remote = [
+    "dep:quinn",
+    "dep:rustls",
+    "dep:tokio-rustls",
+    "kmux-protocol/tls",
+    "kmux-protocol/tcp-tls",
+]
+
 [dependencies]
-kmux-protocol = { workspace = true, features = ["framing", "tls", "tcp-tls", "uds"] }
+# Default feature is `framing`; `uds` adds the local-socket transport. The
+# `remote` feature below pulls in `tls` + `tcp-tls` for the direct QUIC/TCP+TLS
+# paths. (We can't disable kmux-protocol's defaults from a workspace member, but
+# its only default is `framing`, which the base build needs anyway.)
+kmux-protocol = { workspace = true, features = ["uds"] }
 anyhow.workspace = true
 futures.workspace = true
 rand.workspace = true
@@ -18,10 +40,9 @@ serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
-quinn.workspace = true
-rustls.workspace = true
-rustls-native-certs.workspace = true
-tokio-rustls.workspace = true
+quinn = { workspace = true, optional = true }
+rustls = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
 tracing.workspace = true
 bitflags.workspace = true
 toml.workspace = true

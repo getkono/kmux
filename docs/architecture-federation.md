@@ -167,8 +167,26 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
     (`federate_desired_peer_*`, `peer_opened_*`, `peer_error_*`, `prepare_switch_*`); the
     end-to-end UX needs a running GTK/Swift GUI + a reachable remote, so it is verified there,
     not in CI.
-- **PR5 remaining** — feature-gate `quinn`/`rustls`/`ssh` **out** of the GUI build (they now
-  only serve `kmuxd`'s peer role); CI-check the GUI binary no longer links the net stack.
+- **PR5b — lean GUI: the network stack is feature-gated out — landed.** A default-on
+  `remote` feature on `kmux-connect` gates the direct-transport surface (QUIC via `quinn`,
+  TCP+TLS via `rustls`/`tokio-rustls`, `ssh::negotiate`, and the `TransportSupervisor`).
+  `kmux-client` and `kmux-app` forward it (`remote = ["<lower>/remote", …]`); the workspace
+  sets `default-features = false` on `kmux-connect`/`kmux-client`/`kmux-app`, so the GUI
+  frontends (`kmux`, `kmux-gtk`, `kmux-ffi`/`kmux-swift`) inherit the **lean** UDS-only stack
+  and only `kmuxd` opts back in (its `federation` feature pulls `kmux-connect/remote`). What
+  stays ungated is everything the lean GUI still needs: the UDS bootstrap + local-daemon
+  lifecycle, `--server` string parsing → `RemoteTarget`/`PeerTarget` (identity, not transport,
+  so the GUI can still build an `OpenPeer`), `ConnectResult`/`connect_uds`, and the transport
+  scorer *types* (`RttSample`/`EndpointHealth`) woven into the always-compiled session manager.
+  Verified by building each frontend in isolation and asserting `rustls`/`quinn`/`rcgen`/
+  `tokio-rustls` are absent from its compiled deps (`cargo build -p kmux`/`kmux-gtk`/`kmux-ffi`
+  in a clean target dir). **Consequence:** in a lean build the CLI `--server` paths (`kmux ls
+  --server …`, `--dry-run --server …`) and `--test` transport probing are unavailable — they
+  return a clear "not supported in this build" error; remote access is via the GUI's `OpenPeer`
+  federation. The full client (with `--features remote`, e.g. for diagnostics) keeps them. The
+  workspace `cargo build`/`clippy` still compiles every crate with `remote` on (each lib crate
+  is a build root with its own default), so the gated paths are always linted; the leanness
+  only materializes when a GUI binary is built in an invocation that excludes `kmuxd`.
 - **PR6 — peer-down isolation + version guard — landed.** When the upstream link
   closes (remote daemon gone, network dropped), the feed loop **isolates** the
   failure: it sends every viewer a `SessionClosed` for its proxied session (so the

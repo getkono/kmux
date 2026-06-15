@@ -14,11 +14,15 @@ publish = false
 # Internal crates
 kmux-pty = { path = "crates/kmux-pty" }
 kmux-protocol = { path = "crates/kmux-protocol" }
-kmux-connect = { path = "crates/kmux-connect" }
-kmux-client = { path = "crates/kmux-client" }
+# The client stack defaults to a lean, UDS-only build (no quinn/rustls/ssh): the
+# `remote` feature (default-on when each crate is built standalone) is disabled
+# here so GUI frontends inherit the lean stack and only `kmuxd` opts back in via
+# its `federation` feature. See docs/architecture-federation.md.
+kmux-connect = { path = "crates/kmux-connect", default-features = false }
+kmux-client = { path = "crates/kmux-client", default-features = false }
 kmux-ghostty-sys = { path = "crates/kmux-ghostty-sys" }
 kmux-ghostty = { path = "crates/kmux-ghostty" }
-kmux-app = { path = "crates/kmux-app" }
+kmux-app = { path = "crates/kmux-app", default-features = false }
 
 # External dependencies
 anyhow = "1"

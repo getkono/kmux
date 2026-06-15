@@ -21,7 +21,10 @@ path = "src/main.rs"
 # which also keeps the upstream-connect machinery off any build that doesn't
 # need it. See docs/architecture-federation.md.
 default = ["federation"]
-federation = ["dep:kmux-connect", "dep:kmux-client"]
+# `kmux-connect/remote` re-enables the upstream transport stack (the workspace
+# builds the client crates lean by default for the GUIs); the daemon federates
+# to remote daemons over TCP+TLS and SSH, so it needs the full stack.
+federation = ["dep:kmux-connect", "kmux-connect/remote", "dep:kmux-client"]
 
 [dependencies]
 kmux-pty.workspace = true

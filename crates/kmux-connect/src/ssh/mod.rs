@@ -1,4 +1,10 @@
+// `negotiate` runs `ssh ... kmuxd probe-or-start` and stands up an `-L` tunnel —
+// the only remote-transport part of this module. The server-string parsing and
+// the `RemoteTarget` / `SshError` types below stay ungated so a lean GUI build
+// can still turn a `--server user@host` string into a `PeerTarget` for OpenPeer.
+#[cfg(feature = "remote")]
 mod negotiate;
+#[cfg(feature = "remote")]
 pub use negotiate::negotiate;
 
 use crate::hosts::{HostEntry, HostsConfig};
