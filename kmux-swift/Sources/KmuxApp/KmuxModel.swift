@@ -332,8 +332,8 @@ final class KmuxModel: ObservableObject {
         if met != metricsVisible { metricsVisible = met }
         let pendingClose = driver.softClosePending()
         if pendingClose != softClosePending { softClosePending = pendingClose }
-        let conn = driver.connectionVisible()
-        if conn != connectionVisible { connectionVisible = conn }
+        let connVisible = driver.connectionVisible()
+        if connVisible != connectionVisible { connectionVisible = connVisible }
         let ps = driver.pauseState()
         if ps != pauseState { pauseState = ps }
     }
