@@ -51,7 +51,7 @@ impl ServerApp {
 
     /// Ensure an upstream connection to `target` exists and surface its sessions
     /// locally, returning the peer's stable [`PeerId`]. Without the feature this
-    /// reports the same "not supported yet" error the client already handles.
+    /// reports a "not supported" error the client already handles.
     pub async fn open_peer(&self, target: PeerTarget) -> Result<PeerId, String> {
         #[cfg(feature = "federation")]
         {

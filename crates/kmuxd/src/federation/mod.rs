@@ -36,6 +36,7 @@ use std::time::Duration;
 
 use kmux_client::grid::CellGrid;
 use kmux_connect::connect::ConnectResult;
+use kmux_connect::ssh::{self, RemoteTarget};
 use kmux_connect::tcp_connect::connect_tcp_tls;
 use kmux_protocol::messages::{
     ClientCapabilities, ClientId, ClientMessage, PeerId, PeerTarget, SequenceNo, ServerMessage,
@@ -176,6 +177,10 @@ struct PeerConnection {
     panes: HashMap<String, ProxiedPane>,
     /// The feed-loop task draining the upstream stream; aborted on close.
     feed_task: Option<JoinHandle<()>>,
+    /// The background `ssh -L -N` tunnel process for an [`PeerTarget::Ssh`] peer,
+    /// kept alive for the life of the connection (the `-L` forward dies with it).
+    /// `None` for a [`PeerTarget::Direct`] peer. Killed on close/reap.
+    ssh_tunnel: Option<tokio::process::Child>,
     /// Set by the feed loop when the upstream link closes. A dead connection is
     /// reaped lazily on the next `open_peer` to the same peer (which holds the
     /// `&ServerApp` needed to release the local words), so re-federation works.
@@ -191,6 +196,7 @@ impl PeerConnection {
             sessions: HashMap::new(),
             panes: HashMap::new(),
             feed_task: None,
+            ssh_tunnel: None,
             dead: false,
         }
     }
@@ -250,6 +256,42 @@ impl PeerConnection {
     }
 }
 
+/// A resolved TCP+TLS endpoint for an upstream peer link. Both [`PeerTarget`]
+/// variants reduce to this: `Direct` is the endpoint verbatim; `Ssh` is the
+/// loopback end of an `-L` tunnel (with the tunnel child retained so it outlives
+/// the connection). From here the connect/auth/list/register path is identical.
+struct PeerConnectPlan {
+    host: String,
+    port: u16,
+    /// TOFU identity for cert pinning — for SSH this is the *real* remote
+    /// `host:tcp_port`, not the ephemeral loopback the tunnel listens on.
+    tofu_key: String,
+    token: String,
+    accept_invalid: bool,
+    ssh_tunnel: Option<tokio::process::Child>,
+}
+
+/// Kills a parked SSH `-L` tunnel on drop unless [`disarm`](Self::disarm)ed.
+/// `tokio::process::Child` is not kill-on-drop, so any error between
+/// `ssh::negotiate` and a fully-registered peer would otherwise leak the
+/// process. Disarmed once the tunnel is parked on the live [`PeerConnection`].
+struct TunnelGuard(Option<tokio::process::Child>);
+
+impl TunnelGuard {
+    /// Take the child out, disarming the guard (the caller owns teardown now).
+    fn disarm(&mut self) -> Option<tokio::process::Child> {
+        self.0.take()
+    }
+}
+
+impl Drop for TunnelGuard {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.0.take() {
+            let _ = child.start_kill();
+        }
+    }
+}
+
 impl PeerManager {
     pub fn new() -> Self {
         Self::default()
@@ -279,27 +321,67 @@ impl PeerManager {
             None => {}
         }
 
-        // Only the direct TCP+TLS endpoint is wired (LAN / same-host / tests).
-        // SSH peer setup (probe-or-start + `-L` tunnel) is deferred.
-        let (host, port, token, accept_invalid) = match target {
+        // Resolve the target to a TCP+TLS endpoint. A `Direct` peer is that
+        // endpoint verbatim; an `Ssh` peer first negotiates a `-L` tunnel
+        // (`kmuxd probe-or-start` over SSH, then forward a loopback port) and is
+        // reached over TCP+TLS through it — identical from here on. The tunnel
+        // child is carried in the plan so it can be parked on the connection.
+        let plan = match target {
             PeerTarget::Direct {
                 host,
                 port,
                 token,
                 accept_invalid_certs,
-            } => (host, port, token, accept_invalid_certs),
-            PeerTarget::Ssh { .. } => {
-                return Err(
-                    "SSH peer targets are not supported yet; use a direct TCP+TLS endpoint"
-                        .to_string(),
-                );
+            } => PeerConnectPlan {
+                tofu_key: format!("{host}:{port}"),
+                host,
+                port,
+                token,
+                accept_invalid: accept_invalid_certs,
+                ssh_tunnel: None,
+            },
+            PeerTarget::Ssh {
+                user,
+                host,
+                ssh_port,
+                accept_invalid_certs,
+            } => {
+                let remote = RemoteTarget {
+                    user,
+                    host,
+                    ssh_port,
+                };
+                let ssh = ssh::negotiate(&remote)
+                    .await
+                    .map_err(|e| format!("SSH peer negotiation failed: {e}"))?;
+                PeerConnectPlan {
+                    tofu_key: format!("{}:{}", ssh.remote_host, ssh.remote_tcp_port),
+                    host: "127.0.0.1".to_string(),
+                    port: ssh.local_tcp_port,
+                    token: ssh.token,
+                    accept_invalid: accept_invalid_certs,
+                    ssh_tunnel: Some(ssh.tunnel_process),
+                }
             }
         };
+
+        let PeerConnectPlan {
+            host,
+            port,
+            tofu_key,
+            token,
+            accept_invalid,
+            ssh_tunnel,
+        } = plan;
+        // Hold the SSH tunnel in a kill-on-drop guard so any early-return error
+        // path below (connect, auth, or session-list failure/timeout) tears down
+        // the `ssh -L` process — `tokio::process::Child` is not kill-on-drop. The
+        // guard is disarmed at step 4 once the tunnel is parked on the connection.
+        let mut tunnel = TunnelGuard(ssh_tunnel);
 
         // 1. Open the upstream link. `connect_tcp_tls` sends `Auth` itself and
         //    forwards every `ServerMessage` (incl. `AuthResult`) to `server_tx`.
         let (server_tx, mut server_rx) = mpsc::unbounded_channel::<ServerMessage>();
-        let tofu_key = format!("{host}:{port}");
         let client_tx = match connect_tcp_tls(
             host,
             port,
@@ -352,8 +434,11 @@ impl PeerManager {
             _ => return Err("peer did not return a session list in time".to_string()),
         };
 
-        // 4. Register each remote session under a fresh local word.
+        // 4. Register each remote session under a fresh local word. Park the SSH
+        //    tunnel (if any) on the connection — disarming the guard — so it lives
+        //    as long as the link and is killed by `close_peer`/`reap_dead_peer`.
         let mut conn = PeerConnection::new(client_tx.clone());
+        conn.ssh_tunnel = tunnel.disarm();
         let mut assigned_words: Vec<String> = Vec::new();
         for entry in remote_sessions {
             let remote_word = entry.meta.word_id.clone();
@@ -396,9 +481,12 @@ impl PeerManager {
     pub fn close_peer(&self, app: &ServerApp, peer_id: &str) {
         let conn = self.peers.lock().unwrap().remove(peer_id);
         let Some(conn) = conn else { return };
-        let guard = conn.lock().unwrap();
+        let mut guard = conn.lock().unwrap();
         if let Some(task) = &guard.feed_task {
             task.abort();
+        }
+        if let Some(mut child) = guard.ssh_tunnel.take() {
+            let _ = child.start_kill();
         }
         let mut idx = self.word_index.lock().unwrap();
         for local_word in guard.local_to_remote.keys() {
@@ -414,7 +502,10 @@ impl PeerManager {
     fn reap_dead_peer(&self, app: &ServerApp, peer_id: &str) {
         let conn = self.peers.lock().unwrap().remove(peer_id);
         let Some(conn) = conn else { return };
-        let guard = conn.lock().unwrap();
+        let mut guard = conn.lock().unwrap();
+        if let Some(mut child) = guard.ssh_tunnel.take() {
+            let _ = child.start_kill();
+        }
         let mut idx = self.word_index.lock().unwrap();
         for local_word in guard.local_to_remote.keys() {
             idx.remove(local_word);
@@ -1031,5 +1122,55 @@ mod tests {
         assert!(mgr.is_federated_pane("hawk/3"));
         assert!(!mgr.is_federated_pane("otherword/0"));
         assert!(!mgr.is_federated_pane("malformed"));
+    }
+
+    /// The SSH-federation success path parks the tunnel via `disarm`, which must
+    /// hand the child back **alive** — killing it here would tear down the `-L`
+    /// forward the freshly-opened peer depends on.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tunnel_guard_disarm_parks_the_child_alive() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let mut guard = TunnelGuard(Some(child));
+        let mut parked = guard.disarm().expect("disarm yields the child");
+        drop(guard); // Now a no-op: it must NOT kill the parked child.
+
+        assert!(
+            parked.try_wait().expect("try_wait").is_none(),
+            "a disarmed tunnel must stay running for the live peer",
+        );
+        let _ = parked.start_kill();
+        let _ = parked.wait().await;
+    }
+
+    /// An un-disarmed guard (any error between `negotiate` and registration, or a
+    /// later `close_peer`/`reap`) must kill the tunnel — `tokio::process::Child`
+    /// is not kill-on-drop, so a leak here would orphan an `ssh -L` per failure.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn tunnel_guard_kills_on_drop() {
+        use nix::sys::signal::kill;
+        use nix::unistd::Pid;
+
+        let child = tokio::process::Command::new("sleep")
+            .arg("60")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = Pid::from_raw(child.id().expect("child pid") as i32);
+        drop(TunnelGuard(Some(child))); // Drop sends SIGKILL; tokio reaps the zombie.
+
+        // A live `sleep 60` would keep existing; the kill makes the pid disappear.
+        let mut gone = false;
+        for _ in 0..200 {
+            if kill(pid, None).is_err() {
+                gone = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(gone, "a dropped TunnelGuard must kill the tunnel process");
     }
 }

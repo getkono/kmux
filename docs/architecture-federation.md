@@ -138,9 +138,16 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   multi-viewer correctness, so each needs real arbitration/filtering state): pause
   upstream only when **all** local viewers are paused (issue #68 interplay); capability
   union upstream / filter downstream; and input-lock arbitration across local viewers.
-- **PR5** — lean the GUI: always UDS-local to `kmuxd`; the parsed `--server` target
-  becomes an `OpenPeer`; feature-gate `quinn`/`rustls`/`ssh` **out** of the GUI build
-  (they move to `kmuxd`'s peer role). CI check the GUI no longer links the net stack.
+- **PR5 prerequisite — SSH peer federation — landed.** `open_peer` now serves
+  `PeerTarget::Ssh` as well as `Direct`: it negotiates the `-L` tunnel via
+  `kmux-connect`'s `ssh::negotiate` and connects over TCP+TLS through it, sharing the
+  Direct path's auth/list/register tail. The tunnel child is parked on the
+  `PeerConnection` and torn down on close/reap (a `TunnelGuard` prevents leaks on the
+  error paths). This unblocks the GUI sending `OpenPeer { Ssh }` for `--server user@host`.
+- **PR5 (in progress)** — lean the GUI: always UDS-local to `kmuxd`; the parsed `--server`
+  target becomes an `OpenPeer`; feature-gate `quinn`/`rustls`/`ssh` **out** of the GUI build
+  (they move to `kmuxd`'s peer role). CI check the GUI no longer links the net stack. The
+  GUI connection-model change is behavioral and verified against a running GUI, not CI.
 - **PR6 — peer-down isolation + version guard — landed.** When the upstream link
   closes (remote daemon gone, network dropped), the feed loop **isolates** the
   failure: it sends every viewer a `SessionClosed` for its proxied session (so the
@@ -166,6 +173,15 @@ for LAN / same-host setups and, critically, for CI. `crates/kmuxd/tests/federati
 spawns two loopback `kmuxd`s at isolated `XDG_*` dirs and federates over `Direct`, giving
 PR3 the end-to-end coverage the project expects (`mise run test` is a pre-push gate).
 
-PR3's `open_peer` implements the `Direct` path only; `Ssh` targets return a "not supported
-yet" `PeerError` (the SSH `probe-or-start` + `-L` tunnel path is future work — it reuses
-`kmux-connect`'s `prepare_ssh`, which already underpins the GUI's remote connections).
+`open_peer` now wires **both** paths. `Direct` is the endpoint verbatim; `Ssh` reuses
+`kmux-connect`'s `ssh::negotiate` (the same `kmuxd probe-or-start` + `-L` tunnel that
+underpins the GUI's remote connections) to bring up a loopback forward, then connects over
+TCP+TLS through it — identical from there on (the TOFU pin is keyed to the *real* remote
+`host:tcp_port`, not the ephemeral tunnel port). The `ssh -L -N` child is parked on the
+`PeerConnection` (it is not kill-on-drop) and killed on `close_peer`/reap; a `TunnelGuard`
+kills it on any error between `negotiate` and registration so a failed open can't leak it.
+
+**Testability note:** the `Direct` endpoint remains the path exercised end-to-end in CI
+(`federation_e2e.rs`, no sshd required). The SSH path's tunnel-lifecycle invariants are
+unit-tested (`tunnel_guard_*`); its full `negotiate` handshake needs a reachable sshd and so
+is verified against a real remote rather than in CI.
