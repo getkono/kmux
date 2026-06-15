@@ -14,7 +14,7 @@
 //!   (a main-thread timer, the analog of the GTK `glib` timeout).
 //! - **Render (hot path)**: [`KmuxDriver::grid_info`] /
 //!   [`KmuxDriver::grid_snapshot`] expose the active grid as a generation-gated,
-//!   packed byte buffer (see [`cells`]) so the renderer copies only changed
+//!   packed byte buffer (see [`kmux_render::packed`]) so the renderer copies only changed
 //!   frames; plus [`KmuxDriver::theme`], [`KmuxDriver::blink_on`],
 //!   [`KmuxDriver::selection`], and [`KmuxDriver::scroll_info`].
 //! - **Input**: structured **mode-aware** keys ([`KmuxDriver::send_char`] /
@@ -40,9 +40,7 @@
 //! place `AppCore` is mutated, so there is no shared mutable cross-thread
 //! access. Off-main-thread calls are not part of the contract yet.
 
-mod cells;
-
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Once};
 
 use tokio::runtime::Runtime;
 
@@ -63,6 +61,12 @@ use kmux_client::input::{
 use kmux_protocol::messages::{
     ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, SplitDir, TermSize,
 };
+// The packed-cell format is owned by `kmux-render` (the single encoder shared
+// with the GPU renderer; see docs/architecture-render.md). The non-GPU Swift
+// path encodes through it here, so the bytes are identical to the renderer's.
+use kmux_render::packed;
+#[cfg(feature = "gpu")]
+use kmux_render::{CellSource, CursorView, Frame, PaneView, ScrollIndicator, TerminalRenderer};
 
 uniffi::setup_scaffolding!();
 
@@ -71,7 +75,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 10;
+pub const KMUX_FFI_ABI_VERSION: u32 = 11;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -80,11 +84,34 @@ pub fn kmux_ffi_abi_version() -> u32 {
     KMUX_FFI_ABI_VERSION
 }
 
+/// The kmux-render API version this crate was written against. A compile-time
+/// guard (below) asserts the linked `kmux-render` matches, so the renderer
+/// boundary is versioned like the others.
+#[cfg(feature = "gpu")]
+pub const EXPECTED_RENDER_API: u32 = 1;
+
+#[cfg(feature = "gpu")]
+const _: () = assert!(
+    kmux_render::KMUX_RENDER_API_VERSION == EXPECTED_RENDER_API,
+    "linked kmux-render API version does not match EXPECTED_RENDER_API",
+);
+
+/// The linked kmux-render API version, asserted on the Swift side alongside
+/// [`KMUX_FFI_ABI_VERSION`].
+#[cfg(feature = "gpu")]
+#[uniffi::export]
+pub fn kmux_ffi_render_api_version() -> u32 {
+    kmux_render::KMUX_RENDER_API_VERSION
+}
+
 /// Failure constructing a [`KmuxDriver`].
 #[derive(Debug, thiserror::Error, uniffi::Error)]
 pub enum FfiError {
     #[error("failed to initialize kmux: {message}")]
     Init { message: String },
+    /// GPU renderer construction or operation failed (the `gpu` feature).
+    #[error("renderer error: {message}")]
+    Render { message: String },
 }
 
 /// Parameters for [`KmuxDriver::new`]. Mirrors the CLI front door's launch plan:
@@ -430,8 +457,8 @@ pub struct FfiCursor {
     pub blink: bool,
 }
 
-/// The active grid as a packed cell buffer (see [`cells`]) plus dimensions and
-/// cursor. `cells` is `rows * cols * 16` bytes, row-major.
+/// The active grid as a packed cell buffer (see [`kmux_render::packed`]) plus
+/// dimensions and cursor. `cells` is `rows * cols * 16` bytes, row-major.
 #[derive(uniffi::Record)]
 pub struct GridSnapshot {
     pub rows: u32,
@@ -935,7 +962,21 @@ fn mode_to_ffi(mode: &Mode) -> FfiMode {
 
 /// Build an [`AppCore`] from a [`DriverConfig`], resolving the server target and
 /// theme exactly as `kmux_app::launch::run_cli` does for the Rust frontends.
-fn build_core(config: &DriverConfig) -> AppCore {
+/// Install the client tracing subscriber the first time a driver is built, so
+/// the Swift app's logs — this crate, `kmux-render`, and the rest of the client
+/// stack — land in the client log file, exactly like the GTK/CLI front door's
+/// `run_cli`. Without this the FFI path had no subscriber and dropped every
+/// event, which is what made early GPU bugs undiagnosable (PR #144 review).
+///
+/// Guarded by `Once`: [`kmux_app::launch::init_logging`] sets the *global*
+/// default subscriber, which must happen at most once per process (a second
+/// `new` would otherwise panic). Honors `RUST_LOG` / `KMUX_LOG_STDERR`.
+fn init_ffi_logging(instance_id: &str) {
+    static FFI_LOGGING: Once = Once::new();
+    FFI_LOGGING.call_once(|| kmux_app::launch::init_logging(instance_id));
+}
+
+fn build_core(config: &DriverConfig, instance_id: String) -> AppCore {
     let (target, parsed_server) = parse_target(config.server.as_deref(), config.ssh_port);
     let auto_cwd = config
         .cwd
@@ -967,7 +1008,7 @@ fn build_core(config: &DriverConfig) -> AppCore {
     AppCore::new(
         target,
         initial_cwd,
-        generate_instance_id(),
+        instance_id,
         config.session.clone(),
         auto_cwd,
         capabilities,
@@ -992,10 +1033,24 @@ impl KmuxDriver {
     /// Build a driver and kick off the initial connection (per `config`).
     #[uniffi::constructor]
     pub fn new(config: DriverConfig) -> Result<Arc<Self>, FfiError> {
-        let rt = Runtime::new().map_err(|e| FfiError::Init {
-            message: e.to_string(),
+        // Generate the instance id once and share it between logging and the
+        // core, so the client log file and the daemon correlate by the same id.
+        let instance_id = generate_instance_id();
+        init_ffi_logging(&instance_id);
+        tracing::info!(
+            server = ?config.server,
+            session = ?config.session,
+            cols = config.cols,
+            rows = config.rows,
+            "kmux-ffi: constructing KmuxDriver"
+        );
+        let rt = Runtime::new().map_err(|e| {
+            tracing::error!(error = %e, "kmux-ffi: tokio runtime init failed");
+            FfiError::Init {
+                message: e.to_string(),
+            }
         })?;
-        let core = build_core(&config);
+        let core = build_core(&config, instance_id);
         // `FrontendDriver::new` spawns the initial bootstrap, so build it with
         // the runtime entered.
         let driver = {
@@ -1158,7 +1213,7 @@ impl KmuxDriver {
     pub fn grid_snapshot(&self) -> Option<GridSnapshot> {
         let d = self.inner.lock().expect("driver mutex poisoned");
         let grid = d.active_grid()?;
-        let cells = cells::encode_cells(grid, &d.palette);
+        let cells = packed::encode_cells(grid, &d.palette);
         let c = grid.cursor();
         Some(GridSnapshot {
             rows: grid.rows as u32,
@@ -1166,7 +1221,7 @@ impl KmuxDriver {
             cursor: FfiCursor {
                 row: c.row as u32,
                 col: c.col as u32,
-                shape: cells::cursor_shape_code(c.shape),
+                shape: packed::cursor_shape_code(c.shape),
                 visible: c.visible,
                 blink: c.blink,
             },
@@ -1434,7 +1489,7 @@ impl KmuxDriver {
     pub fn grid_snapshot_for(&self, pane_id: String) -> Option<GridSnapshot> {
         let d = self.inner.lock().expect("driver mutex poisoned");
         let grid = d.mgr.buffer(&pane_id)?;
-        let cells = cells::encode_cells(grid, &d.palette);
+        let cells = packed::encode_cells(grid, &d.palette);
         let c = grid.cursor();
         Some(GridSnapshot {
             rows: grid.rows as u32,
@@ -1442,7 +1497,7 @@ impl KmuxDriver {
             cursor: FfiCursor {
                 row: c.row as u32,
                 col: c.col as u32,
-                shape: cells::cursor_shape_code(c.shape),
+                shape: packed::cursor_shape_code(c.shape),
                 visible: c.visible,
                 blink: c.blink,
             },
@@ -2056,6 +2111,210 @@ impl KmuxDriver {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         d.scroll_to_bottom();
         d.send_keys(vec![ev]);
+    }
+}
+
+/// GPU terminal renderer presenting to a macOS `CAMetalLayer` (issue #132).
+///
+/// An opaque, thread-confined wrapper over [`kmux_render::TerminalRenderer`]
+/// (all calls on the Swift main thread). It reads the active tab's grids +
+/// layout from a [`KmuxDriver`] and presents directly to the layer — no
+/// readback. Built only with the `gpu` feature; the default staticlib omits it.
+#[cfg(feature = "gpu")]
+#[derive(uniffi::Object)]
+pub struct KmuxRenderer {
+    inner: Mutex<TerminalRenderer>,
+}
+
+#[cfg(feature = "gpu")]
+#[uniffi::export]
+impl KmuxRenderer {
+    /// Build a renderer bound to a `CAMetalLayer` pointer, using the driver's
+    /// current appearance + palette. `width`/`height` are physical px.
+    ///
+    /// The Swift view owns the layer and must keep it alive for the renderer's
+    /// lifetime (it drops the renderer before tearing the view down).
+    #[uniffi::constructor]
+    pub fn new_metal(
+        driver: &KmuxDriver,
+        layer_ptr: u64,
+        width: u32,
+        height: u32,
+        scale: f32,
+    ) -> Result<Arc<Self>, FfiError> {
+        tracing::debug!(
+            layer_ptr,
+            width,
+            height,
+            scale,
+            "KmuxRenderer::new_metal: creating Metal renderer"
+        );
+        let d = driver.inner.lock().expect("driver mutex poisoned");
+        // SAFETY: the Swift view guarantees the layer outlives this renderer.
+        let renderer = unsafe {
+            TerminalRenderer::new_for_metal_layer(
+                layer_ptr,
+                width,
+                height,
+                scale,
+                &d.appearance,
+                &d.palette,
+            )
+        }
+        .map_err(|e| {
+            tracing::error!(width, height, scale, error = %e, "KmuxRenderer::new_metal: GPU init failed");
+            FfiError::Render {
+                message: e.to_string(),
+            }
+        })?;
+        drop(d);
+        Ok(Arc::new(Self {
+            inner: Mutex::new(renderer),
+        }))
+    }
+
+    /// Resize the swapchain to `width × height` physical px at `scale`.
+    pub fn resize(&self, width: u32, height: u32, scale: f32) {
+        tracing::debug!(width, height, scale, "KmuxRenderer::resize");
+        self.inner
+            .lock()
+            .expect("renderer mutex poisoned")
+            .resize(width, height, scale);
+    }
+
+    /// Re-read the font appearance from the driver (after a font change).
+    pub fn refresh_appearance(&self, driver: &KmuxDriver) {
+        tracing::debug!("KmuxRenderer::refresh_appearance");
+        let appearance = driver
+            .inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .appearance
+            .clone();
+        self.inner
+            .lock()
+            .expect("renderer mutex poisoned")
+            .set_appearance(&appearance);
+    }
+
+    /// Render the active tab and present. `width`/`height` are physical px.
+    pub fn render(&self, driver: &KmuxDriver, width: u32, height: u32, scale: f32) {
+        tracing::trace!(width, height, scale, "KmuxRenderer::render");
+        let mut renderer = self.inner.lock().expect("renderer mutex poisoned");
+        let d = driver.inner.lock().expect("driver mutex poisoned");
+        render_active_tab(&mut renderer, &d, width, height, scale);
+    }
+
+    /// The linked kmux-render API version.
+    pub fn api_version(&self) -> u32 {
+        kmux_render::KMUX_RENDER_API_VERSION
+    }
+}
+
+/// Assemble the active tab's frame from the driver and render it. Mirrors the
+/// GTK `render_gpu::paint` frame assembly — both read the shared layout + grids
+/// and build an identical [`Frame`] with `CellSource::Grid`.
+#[cfg(feature = "gpu")]
+fn render_active_tab(
+    renderer: &mut TerminalRenderer,
+    d: &FrontendDriver,
+    width: u32,
+    height: u32,
+    scale: f32,
+) {
+    if width == 0 || height == 0 {
+        return;
+    }
+    type Entry<'a> = (u16, u16, u16, u16, bool, &'a kmux_client::grid::CellGrid);
+    let mut entries: Vec<Entry<'_>> = Vec::new();
+    let mut multi = false;
+    if let Some(layout) = d.mgr.render_layout() {
+        let (cols, rows) = renderer.cols_rows(width as i32, height as i32);
+        let rects = kmux_app::layout::resolve_layout(
+            &layout,
+            cols,
+            rows,
+            &kmux_app::layout::LayoutConfig::default(),
+        );
+        multi = rects.len() > 1;
+        let focused = d
+            .mgr
+            .active_pane_id()
+            .and_then(|p| p.rsplit_once('/'))
+            .and_then(|(_, i)| i.parse::<u32>().ok());
+        let word = d.mgr.active_session().unwrap_or("").to_string();
+        for r in &rects {
+            let pane_id = format!("{word}/{}", r.pane_index);
+            if let Some(grid) = d.mgr.buffer(&pane_id) {
+                entries.push((
+                    r.col,
+                    r.row,
+                    r.cols,
+                    r.rows,
+                    Some(r.pane_index) == focused,
+                    grid,
+                ));
+            }
+        }
+    } else if let Some(grid) = d.active_grid() {
+        entries.push((0, 0, grid.cols as u16, grid.rows as u16, true, grid));
+    }
+
+    let spans: Vec<Vec<(u16, u16, u16)>> = entries
+        .iter()
+        .map(|e| e.5.visible_selection_spans())
+        .collect();
+    let blink_on = d.blink_on();
+    let panes: Vec<PaneView<'_>> = entries
+        .iter()
+        .zip(spans.iter())
+        .map(|(e, sel)| {
+            let scrolled = e.5.scroll_offset() > 0;
+            PaneView {
+                col: e.0,
+                row: e.1,
+                cols: e.2,
+                rows: e.3,
+                focused: e.4,
+                cells: CellSource::Grid(e.5),
+                cursor: (!scrolled).then(|| CursorView::from_state(e.5.cursor())),
+                selection: sel,
+                scroll: scrolled.then(|| ScrollIndicator {
+                    offset: e.5.scroll_offset(),
+                    total: e.5.total_scrollback_display_rows(),
+                }),
+            }
+        })
+        .collect();
+
+    tracing::trace!(
+        panes = panes.len(),
+        multi,
+        blink_on,
+        "kmux-ffi: assembled GPU frame"
+    );
+    let frame = Frame {
+        width,
+        height,
+        scale,
+        palette: &d.palette,
+        blink_on,
+        panes,
+        multi,
+    };
+    if let Err(e) = renderer.render(&frame) {
+        tracing::warn!("kmux-render: metal frame failed: {e}");
+    }
+}
+
+#[cfg(all(test, feature = "gpu"))]
+mod gpu_tests {
+    #[test]
+    fn render_api_matches_expected() {
+        assert_eq!(
+            kmux_render::KMUX_RENDER_API_VERSION,
+            super::EXPECTED_RENDER_API
+        );
     }
 }
 

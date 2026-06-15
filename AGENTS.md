@@ -9,6 +9,7 @@ A terminal multiplexer / session manager with remote desktop capabilities.
 - Run `kmux` (the entrypoint — CLI + opens the platform desktop app): `cargo run -p kmux`. Toolkit-free; handles `daemon`/`ls`/`--dry-run` itself and, for an interactive launch, execs `kmux-gtk` (Linux) or the Swift `kmux.app` (macOS). For a dev GUI run also build the frontend so the exec target exists (`mise run start`, which builds `kmux` + `kmux-gtk`).
 - Run GTK GUI directly (`kmux-gtk` — the default + official client on Linux, also runnable on macOS): `cargo run -p kmux-gtk` (needs GTK4 + libadwaita dev libs: system packages on Linux, `brew install gtk4 libadwaita` on macOS; if another `pkg-config` shadows the system one, prefix `PKG_CONFIG=/usr/bin/pkg-config`)
 - Run native macOS app (`kmux-swift` — the default GUI `kmux` opens on macOS): `mise run swift-run` (macOS only; needs Xcode). See [docs/building-macos.md](docs/building-macos.md)
+- GPU terminal rendering (issue #132): the shared `kmux-render` crate (wgpu) replaces the per-frontend CPU rasterizers. The `gpu` feature is **on by default** now (compiled + tested everywhere; build `--no-default-features` — or `mise run build-no-gpu` — for the lean, wgpu-free path that CI also checks). Only the runtime switch is opt-in: select the GPU path with `KMUX_RENDERER=wgpu cargo run -p kmux-gtk`; Swift uses `mise run swift-gpu-run`. Runtime defaults stay Cairo/CoreText. See [docs/architecture-render.md](docs/architecture-render.md).
 - Run tests: `mise run test`
 - Lint: `mise run clippy`
 - Lint fix: `mise run clippy-fix`

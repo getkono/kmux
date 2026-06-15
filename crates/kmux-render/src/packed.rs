@@ -1,23 +1,30 @@
-//! Packed, FFI-stable encoding of the terminal grid for the Swift renderer.
+//! The single owner of kmux's FFI-stable packed-cell format.
 //!
 //! The hot render path is the cell grid. Rather than lowering a `Vec` of typed
-//! records across the FFI boundary every frame (uniffi would box each one), the
-//! grid is packed into a single flat `Vec<u8>` whose layout is documented here
-//! and reinterpreted on the Swift side — one allocation per *changed* frame
-//! (the frontend skips the fetch when [`CellGrid::cells_generation`] is
-//! unchanged). The `DEFAULT_FG`/`DEFAULT_BG` cell flags are resolved against the
-//! active palette *in Rust*, so Swift receives final RGBA and never needs the
-//! theme to paint a cell.
+//! records across the `kmux-ffi` boundary every frame (uniffi would box each
+//! one), the grid is packed into a single flat `Vec<u8>` whose layout is
+//! documented here and reinterpreted on the Swift side — one allocation per
+//! *changed* frame (the frontend skips the fetch when
+//! [`CellGrid::cells_generation`] is unchanged). The `DEFAULT_FG`/`DEFAULT_BG`
+//! cell flags are resolved against the active palette *in Rust*, so a consumer
+//! receives final RGBA and never needs the theme to paint a cell.
+//!
+//! This module previously lived in `kmux-ffi/src/cells.rs`. It moved here so the
+//! format has ONE home guarded by [`crate::KMUX_RENDER_API_VERSION`]: `kmux-ffi`
+//! re-exports these functions (so the Swift bindings are unchanged) and the GPU
+//! renderer decodes the same bytes for its `Packed` cell source.
+//!
+//! [`CellGrid::cells_generation`]: kmux_client::grid::CellGrid::cells_generation
 
 use kmux_app::theme::Theme;
-use kmux_client::grid::{CellGrid, scrollback_display_row_at};
+use kmux_client::grid::CellGrid;
 use kmux_protocol::messages::{CellAttrs, CellState, CursorShape};
 
 /// Bytes per packed cell. Little-endian layout:
 /// - `[0..4]`  Unicode scalar value (`char as u32`)
 /// - `[4..8]`  foreground RGBA (`DEFAULT_FG` resolved against the palette)
 /// - `[8..12]` background RGBA (`DEFAULT_BG` resolved against the palette)
-/// - `[12..14]` attribute bits (`CellAttrs`: bold=0, italic=1, underline=2,
+/// - `[12..14]` attribute bits ([`CellAttrs`]: bold=0, italic=1, underline=2,
 ///   strikethrough=3, inverse=4, hidden=5, dim=6, blink=7, wide=8,
 ///   wide-spacer=9; the `default_*` bits are already resolved away)
 /// - `[14]` cell width: `0` = wide-char trailing spacer, `2` = wide char,
@@ -41,7 +48,8 @@ fn resolve_bg(cell: &CellState, theme: &Theme) -> [u8; 4] {
     }
 }
 
-fn cell_width(attrs: CellAttrs) -> u8 {
+/// Cell width code: `0` = wide-char trailing spacer, `2` = wide char, `1` = normal.
+pub fn cell_width(attrs: CellAttrs) -> u8 {
     if attrs.contains(CellAttrs::WIDE_CHAR_SPACER) {
         0
     } else if attrs.contains(CellAttrs::WIDE_CHAR) {
@@ -64,42 +72,13 @@ pub fn encode_cell(out: &mut Vec<u8>, cell: &CellState, theme: &Theme) {
 /// Pack the grid's *displayed* cells row-major into a flat buffer
 /// (`rows * cols * PACKED_CELL_LEN` bytes).
 ///
-/// When scrolled into history (`scroll_offset > 0`) this composites scrollback
-/// lines into the top rows exactly like the GTK renderer (`render.rs::cell_at` +
-/// [`scrollback_display_row_at`]), so the Swift frontend renders scrollback
-/// content while scrolled — not just the live viewport. At the live bottom the
-/// output is identical to packing `grid.cells()` directly. Positions with no
-/// backing cell (a short scrollback slice) encode as a blank, palette-background
-/// cell so the row still tiles fully.
+/// Scrollback compositing (when `scroll_offset > 0`) and the live-view fast path
+/// are delegated to [`crate::geometry::for_each_displayed_cell`], the single
+/// shared definition of "which cell shows at (vr, vc)", so this encoder and the
+/// renderer's `Grid` path can never disagree.
 pub fn encode_cells(grid: &CellGrid, theme: &Theme) -> Vec<u8> {
-    let cols = grid.cols;
-    let rows = grid.rows;
-    let scroll_offset = grid.scroll_offset();
-    let scrollback = grid.scrollback();
-    let cells = grid.cells();
-    let blank = CellState::default();
-
-    let mut out = Vec::with_capacity(rows * cols * PACKED_CELL_LEN);
-    for vr in 0..rows {
-        let sb_row = if scroll_offset > 0 && vr < scroll_offset {
-            scrollback_display_row_at(scrollback, cols, scroll_offset - 1 - vr)
-        } else {
-            None
-        };
-        for vc in 0..cols {
-            let cell = if let Some((line_idx, col_start)) = sb_row {
-                scrollback
-                    .get(line_idx)
-                    .and_then(|line| line.get(col_start + vc))
-            } else if scroll_offset > 0 {
-                vr.checked_sub(scroll_offset)
-                    .and_then(|grid_row| cells.get(grid_row * cols + vc))
-            } else {
-                cells.get(vr * cols + vc)
-            };
-            encode_cell(&mut out, cell.unwrap_or(&blank), theme);
-        }
-    }
+    let mut out = Vec::with_capacity(grid.rows * grid.cols * PACKED_CELL_LEN);
+    crate::geometry::for_each_displayed_cell(grid, |_, _, cell| encode_cell(&mut out, cell, theme));
     out
 }
 
@@ -112,6 +91,57 @@ pub fn cursor_shape_code(shape: CursorShape) -> u8 {
         CursorShape::HollowBlock => 3,
         CursorShape::Hidden => 4,
     }
+}
+
+/// A decoded packed cell: final (palette-resolved) colors + the character,
+/// attributes, and width. The renderer's `Packed` cell source reads these.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RenderCell {
+    /// The cell's character (`'\u{fffd}'` if the scalar was not a valid char).
+    pub ch: char,
+    /// Foreground RGBA, already resolved against the palette.
+    pub fg: [u8; 4],
+    /// Background RGBA, already resolved against the palette.
+    pub bg: [u8; 4],
+    /// Attribute bits (bold/italic/underline/…); the `default_*` bits are
+    /// resolved away and should be ignored.
+    pub attrs: CellAttrs,
+    /// Width code: `0` = spacer, `1` = normal, `2` = wide.
+    pub width: u8,
+}
+
+impl RenderCell {
+    /// Whether this is the trailing spacer half of a wide character (no glyph).
+    pub fn is_spacer(&self) -> bool {
+        self.width == 0 || self.attrs.contains(CellAttrs::WIDE_CHAR_SPACER)
+    }
+}
+
+/// Decode one [`PACKED_CELL_LEN`]-byte cell from the front of `bytes`.
+///
+/// # Panics
+/// Panics if `bytes.len() < PACKED_CELL_LEN` (a packing/indexing bug).
+pub fn decode_cell(bytes: &[u8]) -> RenderCell {
+    let c: &[u8; PACKED_CELL_LEN] = bytes[..PACKED_CELL_LEN]
+        .try_into()
+        .expect("packed cell needs PACKED_CELL_LEN bytes");
+    let scalar = u32::from_le_bytes([c[0], c[1], c[2], c[3]]);
+    RenderCell {
+        ch: char::from_u32(scalar).unwrap_or('\u{fffd}'),
+        fg: [c[4], c[5], c[6], c[7]],
+        bg: [c[8], c[9], c[10], c[11]],
+        attrs: CellAttrs(u16::from_le_bytes([c[12], c[13]])),
+        width: c[14],
+    }
+}
+
+/// Decode the cell at row-major `index` from a packed buffer.
+///
+/// # Panics
+/// Panics if the buffer is too short for `index`.
+pub fn decode_at(buf: &[u8], index: usize) -> RenderCell {
+    let off = index * PACKED_CELL_LEN;
+    decode_cell(&buf[off..off + PACKED_CELL_LEN])
 }
 
 #[cfg(test)]
@@ -157,7 +187,6 @@ mod tests {
         let mut out = Vec::new();
         let t = theme();
         encode_cell(&mut out, &cell, &t);
-        // DEFAULT_FG/DEFAULT_BG → the palette colors, not the cell's stored RGB.
         assert_eq!(&out[4..8], &[t.fg.r, t.fg.g, t.fg.b, 0xff]);
         assert_eq!(&out[8..12], &[t.bg.r, t.bg.g, t.bg.b, 0xff]);
     }
@@ -212,9 +241,7 @@ mod tests {
     }
 
     fn char_at(packed: &[u8], cols: usize, vr: usize, vc: usize) -> char {
-        let off = (vr * cols + vc) * PACKED_CELL_LEN;
-        let code = u32::from_le_bytes(packed[off..off + 4].try_into().unwrap());
-        char::from_u32(code).unwrap()
+        decode_at(packed, vr * cols + vc).ch
     }
 
     #[test]
@@ -234,7 +261,6 @@ mod tests {
     fn encode_cells_live_view_matches_raw_cells() {
         let mut grid = CellGrid::new(2, 4);
         grid.apply_scrollback_append(0, vec![line("AAAA")]);
-        // At the live bottom (no scroll), output equals packing grid.cells().
         let t = theme();
         let packed = encode_cells(&grid, &t);
         let mut expected = Vec::new();
@@ -242,5 +268,45 @@ mod tests {
             encode_cell(&mut expected, cell, &t);
         }
         assert_eq!(packed, expected);
+    }
+
+    #[test]
+    fn decode_round_trips_encode() {
+        let cell = CellState {
+            c: '世',
+            fg: CellColor::new(10, 20, 30),
+            bg: CellColor::new(40, 50, 60),
+            attrs: CellAttrs(CellAttrs::BOLD | CellAttrs::WIDE_CHAR),
+        };
+        let mut out = Vec::new();
+        encode_cell(&mut out, &cell, &theme());
+        let decoded = decode_cell(&out);
+        assert_eq!(decoded.ch, '世');
+        assert_eq!(decoded.fg, [10, 20, 30, 0xff]);
+        assert_eq!(decoded.bg, [40, 50, 60, 0xff]);
+        assert!(decoded.attrs.contains(CellAttrs::BOLD));
+        assert_eq!(decoded.width, 2);
+        assert!(!decoded.is_spacer());
+    }
+
+    #[test]
+    fn decode_spacer_is_recognized() {
+        let cell = CellState {
+            c: ' ',
+            fg: CellColor::new(1, 1, 1),
+            bg: CellColor::new(2, 2, 2),
+            attrs: CellAttrs(CellAttrs::WIDE_CHAR_SPACER),
+        };
+        let mut out = Vec::new();
+        encode_cell(&mut out, &cell, &theme());
+        assert!(decode_cell(&out).is_spacer());
+    }
+
+    #[test]
+    fn decode_invalid_scalar_is_replacement_char() {
+        // A surrogate code point (0xD800) is not a valid char.
+        let mut bytes = vec![0u8; PACKED_CELL_LEN];
+        bytes[0..4].copy_from_slice(&0xD800u32.to_le_bytes());
+        assert_eq!(decode_cell(&bytes).ch, '\u{fffd}');
     }
 }

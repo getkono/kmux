@@ -33,6 +33,8 @@ mod header;
 mod input;
 mod prefs;
 mod render;
+#[cfg(feature = "gpu")]
+mod render_gpu;
 mod shell;
 mod sidebar;
 mod tabs;
@@ -72,6 +74,10 @@ pub(crate) struct Frontend {
     /// The CSS provider for the chrome/overlay theme, reloaded when the driver
     /// reports a palette change (`/theme`).
     css_provider: gtk4::CssProvider,
+    /// Opt-in GPU renderer (active only when `KMUX_RENDERER=wgpu` and an adapter
+    /// is available); otherwise inert and the Cairo path in `render` is used.
+    #[cfg(feature = "gpu")]
+    gpu: render_gpu::GpuState,
 }
 
 /// Entry point for the interactive GTK frontend. Shares the CLI front door with
@@ -174,11 +180,24 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         core: driver,
         metrics,
         css_provider,
+        #[cfg(feature = "gpu")]
+        gpu: render_gpu::GpuState::new(&plan.appearance, &plan.theme),
     }));
 
     {
         let fe = fe.clone();
         drawing.set_draw_func(move |area, cr, w, h| {
+            // GPU path (opt-in): render via kmux-render and blit the result.
+            #[cfg(feature = "gpu")]
+            {
+                let mut f = fe.borrow_mut();
+                if f.gpu.enabled() {
+                    let blink = f.core.blink_on();
+                    let Frontend { core, gpu, .. } = &mut *f;
+                    render_gpu::paint(gpu, core, cr, w, h, blink);
+                    return;
+                }
+            }
             let fe = fe.borrow();
             render::render_tiled(
                 &fe.core,

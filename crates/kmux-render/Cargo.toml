@@ -1,0 +1,42 @@
+[package]
+name = "kmux-render"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+description = "Cross-platform GPU-accelerated terminal cell-grid renderer (wgpu) shared by the kmux GUI frontends."
+
+[features]
+# The wgpu-free core (frame/packed/geometry/color) is always compiled so
+# `kmux-ffi` can own the packed-cell format without dragging in wgpu. Two opt-in
+# tiers layer on top:
+#   - `text`: font rasterization + atlas packing (swash/etagere/fontdb) — the
+#     `metrics` + `atlas` modules. CPU-only, headlessly testable, NO wgpu.
+#   - `gpu`: the actual GPU renderer (`renderer` + `pipeline`); implies `text`.
+# Frontends opt in via their own `gpu` feature. See docs/architecture-render.md.
+default = []
+text = ["dep:swash", "dep:etagere", "dep:fontdb"]
+gpu = ["text", "dep:wgpu", "dep:raw-window-handle", "dep:bytemuck", "dep:pollster"]
+
+[dependencies]
+kmux-protocol.workspace = true
+kmux-client.workspace = true
+kmux-app.workspace = true
+thiserror.workspace = true
+# Structured logs for the GPU path (adapter/surface setup, resize, frame
+# errors). Targets start with `kmux_render`, so the client's `kmux=*` env
+# filter captures them into the client log file. See docs/architecture-render.md.
+tracing.workspace = true
+
+# `text` tier (font metrics + glyph atlas).
+swash = { workspace = true, optional = true }
+etagere = { workspace = true, optional = true }
+fontdb = { workspace = true, optional = true }
+
+# `gpu` tier (the wgpu renderer).
+wgpu = { workspace = true, optional = true }
+raw-window-handle = { workspace = true, optional = true }
+bytemuck = { workspace = true, optional = true }
+pollster = { workspace = true, optional = true }

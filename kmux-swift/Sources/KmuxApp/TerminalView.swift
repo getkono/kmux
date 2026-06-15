@@ -1,4 +1,5 @@
 import AppKit
+import QuartzCore
 import SwiftUI
 
 import KmuxBindings
@@ -43,6 +44,17 @@ final class TerminalNSView: NSView {
     /// driver's 100 ms resize debounce (so a settled size actually reaches the daemon).
     private var lastReportedCells: (cols: UInt16, rows: UInt16)?
 
+    #if KMUX_GPU
+        /// When `KMUX_RENDERER=wgpu`, the grid is drawn by the shared GPU renderer
+        /// (kmux-render, over the FFI) into a `CAMetalLayer` instead of CoreText.
+        /// The view, input, sizing, and pump are otherwise unchanged: `needsDisplay`
+        /// routes to `updateLayer()` (Metal) instead of `draw(_:)` (CoreText).
+        private let gpuActive =
+            ProcessInfo.processInfo.environment["KMUX_RENDERER"]?.lowercased() == "wgpu"
+        private var gpuRenderer: KmuxRenderer?
+        private var gpuDrawable: (w: UInt32, h: UInt32)?
+    #endif
+
     init(model: KmuxModel) {
         self.model = model
         self.metrics = TerminalMetrics(appearance: model.appearance)
@@ -80,6 +92,50 @@ final class TerminalNSView: NSView {
         let ph = UInt16(min(Int(size.height * scale), Int(UInt16.max)))
         model.driver.requestResize(rows: rows, cols: cols, pixelWidth: pw, pixelHeight: ph)
     }
+
+    // MARK: - GPU rendering (opt-in)
+
+    #if KMUX_GPU
+        // A CAMetalLayer backing when GPU rendering is active, so wgpu presents to
+        // it; otherwise AppKit's default layer (CoreText `draw`).
+        override func makeBackingLayer() -> CALayer {
+            gpuActive ? CAMetalLayer() : super.makeBackingLayer()
+        }
+
+        // Route display to `updateLayer` (Metal) instead of `draw` when GPU-active.
+        override var wantsUpdateLayer: Bool { gpuActive }
+
+        override func updateLayer() {
+            renderMetalFrame()
+        }
+
+        /// Render the active tab via the FFI `KmuxRenderer` into the metal layer.
+        /// Created lazily on the first frame; on init failure it logs once and
+        /// leaves the layer blank (the user explicitly opted into wgpu).
+        private func renderMetalFrame() {
+            guard gpuActive, let metalLayer = layer as? CAMetalLayer else { return }
+            let scale = window?.backingScaleFactor ?? 2.0
+            metalLayer.contentsScale = scale
+            let w = UInt32(max(1, Int((bounds.width * scale).rounded())))
+            let h = UInt32(max(1, Int((bounds.height * scale).rounded())))
+
+            if gpuRenderer == nil {
+                let ptr = UInt64(UInt(bitPattern: Unmanaged.passUnretained(metalLayer).toOpaque()))
+                gpuRenderer = try? KmuxRenderer.newMetal(
+                    driver: model.driver, layerPtr: ptr, width: w, height: h, scale: Float(scale))
+                gpuDrawable = (w, h)
+                if gpuRenderer == nil {
+                    NSLog("kmux-render: GPU renderer init failed; KMUX_RENDERER=wgpu had no effect")
+                }
+            }
+            guard let renderer = gpuRenderer else { return }
+            if gpuDrawable.map({ $0 != (w, h) }) ?? true {
+                renderer.resize(width: w, height: h, scale: Float(scale))
+                gpuDrawable = (w, h)
+            }
+            renderer.render(driver: model.driver, width: w, height: h, scale: Float(scale))
+        }
+    #endif
 
     // MARK: - Rendering
 
