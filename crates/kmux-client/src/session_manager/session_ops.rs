@@ -111,19 +111,19 @@ impl SessionManager {
     /// Create a new session.
     ///
     /// `name` — optional display name; defaults to the basename of `cwd`.
-    /// `cwd`  — optional working directory; defaults to the client's current directory.
+    /// `cwd`  — working directory for the new session. Callers should supply an
+    ///          explicit path: the app layer never assumes where a session
+    ///          opens (the GUI seeds it from the focused session's cwd or a
+    ///          directory the user picks). `None` is forwarded verbatim; relying
+    ///          on it is a bug, since the daemon then resolves the path against
+    ///          *its own* working directory, not the client's.
     pub fn create_session(&mut self, name: Option<&str>, cwd: Option<&str>, size: TermSize) {
         if self.ws_sender.is_some() {
             let rid = self.next_rid();
-            let resolved_cwd = cwd.map(|c| c.to_string()).or_else(|| {
-                std::env::current_dir()
-                    .ok()
-                    .and_then(|p| p.to_str().map(|s| s.to_string()))
-            });
             self.send_ws(ClientMessage::SessionCreate {
                 request_id: rid,
                 name: name.map(|n| n.to_string()),
-                cwd: resolved_cwd,
+                cwd: cwd.map(|c| c.to_string()),
                 program: None,
                 args: vec![],
                 size,
