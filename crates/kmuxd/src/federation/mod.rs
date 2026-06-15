@@ -493,21 +493,48 @@ impl PeerManager {
             conn.register_session(local_word, remote_word, entry, &peer_id);
         }
 
-        // 5. Start the feed loop, then publish the peer + word index. Publishing
-        //    last means a lookup that sees the word in `word_index` also finds the
-        //    fully-built connection.
+        // 5. Publish the peer. The reuse check at the top of `open_peer` is not
+        //    atomic with this insert across the `await`-heavy connect above, so two
+        //    GUIs federating the *same* target concurrently can both reach here.
+        //    Decide the winner under a single `peers` lock — the winner spawns its
+        //    feed loop and inserts; a loser tears its duplicate down (closing the
+        //    redundant upstream link + SSH tunnel and releasing its drawn words) and
+        //    reuses the winner — so a race can never leak a connection or corrupt the
+        //    word index. The word index is published only by the winner, while still
+        //    holding `peers`, so a lookup that sees a word also finds its connection.
         let conn = Arc::new(Mutex::new(conn));
-        let feed = spawn_feed_loop(server_rx, client_tx, Arc::clone(&conn), peer_id.clone());
-        conn.lock().unwrap().feed_task = Some(feed);
-        self.peers
-            .lock()
-            .unwrap()
-            .insert(peer_id.clone(), Arc::clone(&conn));
-        {
-            let mut idx = self.word_index.lock().unwrap();
-            for w in &assigned_words {
-                idx.insert(w.clone(), peer_id.clone());
+        let won = {
+            let mut peers = self.peers.lock().unwrap();
+            let taken = peers
+                .get(&peer_id)
+                .is_some_and(|existing| !existing.lock().unwrap().dead);
+            if taken {
+                false
+            } else {
+                let feed =
+                    spawn_feed_loop(server_rx, client_tx, Arc::clone(&conn), peer_id.clone());
+                conn.lock().unwrap().feed_task = Some(feed);
+                peers.insert(peer_id.clone(), Arc::clone(&conn));
+                let mut idx = self.word_index.lock().unwrap();
+                for w in &assigned_words {
+                    idx.insert(w.clone(), peer_id.clone());
+                }
+                true
             }
+        };
+
+        if !won {
+            // Lost the race: tear down this duplicate (no feed loop was spawned, so
+            // dropping `conn` closes its `client_tx` and the upstream link) and
+            // return the drawn words to the pool.
+            if let Some(mut child) = conn.lock().unwrap().ssh_tunnel.take() {
+                let _ = child.start_kill();
+            }
+            for w in &assigned_words {
+                app.release_word(w);
+            }
+            debug!(%peer_id, "lost concurrent open race; discarded duplicate peer link");
+            return Ok(peer_id);
         }
 
         info!(%peer_id, sessions = assigned_words.len(), "federated peer opened");
