@@ -1556,6 +1556,7 @@ dependencies = [
  "kmux-app",
  "kmux-client",
  "kmux-protocol",
+ "kmux-render",
  "libadwaita",
  "pangocairo",
  "tokio",

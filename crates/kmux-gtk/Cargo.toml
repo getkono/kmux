@@ -15,10 +15,17 @@ description = "GTK4 native GUI frontend for the kmux client (Linux)."
 name = "kmux-gtk"
 path = "src/main.rs"
 
+[features]
+# Opt-in GPU terminal rendering via the shared kmux-render crate (wgpu). Off by
+# default so the standard build stays Cairo-only and pulls no wgpu; selected at
+# runtime with KMUX_RENDERER=wgpu. See docs/architecture-render.md.
+gpu = ["dep:kmux-render"]
+
 [dependencies]
 kmux-app.workspace = true
 kmux-client.workspace = true
 kmux-protocol = { workspace = true, features = ["framing"] }
+kmux-render = { workspace = true, optional = true, features = ["gpu"] }
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
