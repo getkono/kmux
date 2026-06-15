@@ -716,3 +716,100 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
     set_xdg(local_dir.path());
     let _ = kmux_client::daemon::stop_daemon().await;
 }
+
+/// PR6 hardening: an upstream peer link that **rejects authentication** surfaces
+/// cleanly as `PeerError` (not a hang or a half-open peer), and the local daemon
+/// keeps serving. This exercises the same `open_peer` branch a protocol-version
+/// mismatch hits — the remote rejects `Auth` with `AuthResult { success: false }`
+/// whether the cause is a bad token or an incompatible `PROTOCOL_VERSION`, and the
+/// version guard (`dispatch::handle_message`) is checked *before* the token — so a
+/// wrong token is a faithful, deterministic stand-in for the version-mismatch path
+/// (which cannot be provoked without building a second daemon at a different
+/// version).
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
+async fn federation_surfaces_upstream_auth_rejection_as_peer_error() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
+    let cleanup = Cleanup::default();
+
+    let remote_dir = tempfile::tempdir().unwrap();
+    let local_dir = tempfile::tempdir().unwrap();
+
+    // Remote daemon (real token), then the local hub.
+    set_xdg(remote_dir.path());
+    let remote_pid = spawn_daemon(&exe).await;
+    cleanup.track(remote_pid as i32);
+    let remote_status = kmux_client::daemon::query_daemon()
+        .await
+        .expect("remote daemon status");
+    let remote_tcp = remote_status.tcp_port;
+
+    set_xdg(local_dir.path());
+    let local_pid = spawn_daemon(&exe).await;
+    cleanup.track(local_pid as i32);
+    let local_token = kmux_client::daemon::query_daemon()
+        .await
+        .expect("local daemon status")
+        .token;
+
+    // GUI federates with a WRONG token — the remote rejects authentication, the
+    // same `AuthResult { success: false }` a version mismatch produces.
+    let (gui_tx, mut gui_rx) = connect_authenticated(&local_token).await;
+    gui_tx
+        .send(ClientMessage::OpenPeer {
+            request_id: 1,
+            target: PeerTarget::Direct {
+                host: "127.0.0.1".into(),
+                port: remote_tcp,
+                token: "definitely-not-the-remote-token".into(),
+                accept_invalid_certs: true,
+            },
+        })
+        .expect("send OpenPeer");
+    let reply = recv_until(&mut gui_rx, Duration::from_secs(15), |m| {
+        matches!(
+            m,
+            ServerMessage::PeerOpened { .. } | ServerMessage::PeerError { .. }
+        )
+    })
+    .await
+    .expect("expected a peer reply");
+    match reply {
+        ServerMessage::PeerError { reason, .. } => {
+            assert!(
+                reason.contains("authentication") || reason.contains("token"),
+                "the rejection reason should name the auth failure, got: {reason}"
+            );
+        }
+        other => panic!("a rejected peer must surface as PeerError, got {other:?}"),
+    }
+
+    // Isolation: the local daemon is unaffected by the rejected peer — it still
+    // serves new local sessions.
+    gui_tx
+        .send(ClientMessage::SessionCreate {
+            request_id: 2,
+            name: Some("local-after-reject".into()),
+            cwd: Some(local_dir.path().display().to_string()),
+            program: Some("/bin/sh".into()),
+            args: vec!["-c".into(), "exec sleep 600".into()],
+            size: ATTACH_SIZE,
+        })
+        .expect("send local SessionCreate");
+    assert!(
+        recv_until(&mut gui_rx, Duration::from_secs(10), |m| {
+            matches!(m, ServerMessage::SessionCreated { .. })
+        })
+        .await
+        .is_some(),
+        "the local daemon must keep serving after a peer link is rejected"
+    );
+
+    // ── Teardown. ──
+    drop(gui_tx);
+    set_xdg(local_dir.path());
+    let _ = kmux_client::daemon::stop_daemon().await;
+    set_xdg(remote_dir.path());
+    let _ = kmux_client::daemon::stop_daemon().await;
+}
