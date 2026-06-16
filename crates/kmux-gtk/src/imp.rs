@@ -385,6 +385,9 @@ pub(crate) fn apply_effects(
     for eff in effects {
         match eff {
             FrontendEffect::NeedsRender | FrontendEffect::ForceClear => redraw = true,
+            // Diagnostic renderer reset: repaint now; rebuilding the GPU
+            // renderer + glyph atlas is wired in with the render-debug overlay.
+            FrontendEffect::ResetRenderer => redraw = true,
             FrontendEffect::PaletteChanged => {
                 // Reflect a `/theme` palette change onto the chrome CSS + window
                 // light/dark styling (the cairo grid reads the palette live).

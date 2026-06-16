@@ -148,6 +148,12 @@ pub enum Action {
     ToggleMetrics,
     /// Toggle the connection inspector overlay (issue #60).
     ToggleConnection,
+    /// Toggle the render-debug overlay: what the renderer is handed each frame
+    /// (cursor logical + pixel geometry, renderer leaf, scene counts).
+    ToggleRenderDebug,
+    /// Rebuild the client renderer + glyph atlas and force a full repaint
+    /// (diagnostic — heavier than [`Action::ForceRedraw`]).
+    ResetRenderer,
     ToggleSnapshotMode,
     ToggleInputLock,
     /// Toggle connection pause to save bandwidth (issue #68). Manual pauses

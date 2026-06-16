@@ -158,6 +158,10 @@ impl From<FrontendEffect> for FfiEffect {
             FrontendEffect::CopyToClipboard(text) => FfiEffect::CopyToClipboard { text },
             FrontendEffect::RequestPaste => FfiEffect::RequestPaste,
             FrontendEffect::Quit => FfiEffect::Quit,
+            // Diagnostic renderer reset. Surfaced to Swift as a force-clear for
+            // now (it repaints); a dedicated FfiEffect::ResetRenderer that also
+            // rebuilds the Metal renderer + atlas lands with the render-debug FFI.
+            FrontendEffect::ResetRenderer => FfiEffect::ForceClear,
         }
     }
 }
