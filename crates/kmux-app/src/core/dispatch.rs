@@ -15,8 +15,8 @@ use crate::mode::{Action, Mode};
 use crate::recent_servers::ServerKind;
 
 use super::{
-    AppCore, COMMAND_HISTORY_CAP, DirBrowserRow, KeyResult, PendingClose, SOFT_CLOSE_GRACE,
-    SwitchTarget, TopBarAction,
+    AppCore, COMMAND_HISTORY_CAP, DirBrowserRow, KeyResult, LaunchRow, PendingClose,
+    SOFT_CLOSE_GRACE, SwitchTarget, TopBarAction,
 };
 
 impl AppCore {
@@ -278,6 +278,29 @@ impl AppCore {
                 self.submit_dir_browser_row();
             }
             Action::DirPickerCancel => {}
+            Action::LaunchSearchChar(ch) => {
+                self.launch_search.push(ch);
+                self.launch_selected = 0;
+            }
+            Action::LaunchSearchBackspace => {
+                self.launch_search.pop();
+                self.launch_selected = 0;
+            }
+            Action::LaunchUp => {
+                self.launch_selected = self.launch_selected.saturating_sub(1);
+            }
+            Action::LaunchDown => {
+                let count = self.launch_rows().len();
+                if count > 0 && self.launch_selected + 1 < count {
+                    self.launch_selected += 1;
+                }
+            }
+            Action::LaunchSelect => {
+                self.submit_launch_row();
+            }
+            Action::LaunchClose | Action::LaunchOverlayCancel => {
+                self.mode = Mode::Normal;
+            }
             Action::CancelBootstrap => {
                 // Dropping the sender triggers the oneshot in the bootstrap task,
                 // which causes it to abort. The outcome arm handles the None.
@@ -615,6 +638,60 @@ impl AppCore {
         }
     }
 
+    /// Open the unified session launcher (issue #121), resetting its filter and
+    /// selection. The entry point for the GUI new-session button.
+    pub fn open_launch_picker(&mut self) {
+        self.launch_selected = 0;
+        self.launch_search.clear();
+        self.mode = Mode::LaunchPicker;
+    }
+
+    /// Open the add-a-remote form. The frontend renders native fields and calls
+    /// [`AppCore::submit_add_remote`].
+    pub fn open_add_remote(&mut self) {
+        self.mode = Mode::AddRemote;
+    }
+
+    /// Open the "new session on a remote" path prompt for `peer`. The frontend
+    /// renders the field and calls [`AppCore::submit_remote_new_session`].
+    pub fn open_remote_new_session(&mut self, peer: String) {
+        self.mode = Mode::RemoteNewSession { peer };
+    }
+
+    /// Activate the selected launcher row (issue #121). Mirrors the dir-browser
+    /// submit: existing-session rows attach and close; the local-new row opens
+    /// the directory browser; a remote header toggles expand (connecting on
+    /// focus); the remote-new and add-remote rows open their forms.
+    fn submit_launch_row(&mut self) {
+        let rows = self.launch_rows();
+        let Some(row) = rows.get(self.launch_selected).cloned() else {
+            return;
+        };
+        match row {
+            LaunchRow::LocalNewSession { .. } => {
+                // The directory browser already creates a local session at the
+                // chosen directory, seeded from the focused session's cwd.
+                self.open_directory_browser();
+            }
+            LaunchRow::LocalExisting { word_id, .. }
+            | LaunchRow::RemoteExisting { word_id, .. } => {
+                self.mgr.select_session(word_id);
+                self.mode = Mode::Normal;
+            }
+            LaunchRow::Remote { peer, expanded, .. } => {
+                if expanded {
+                    self.collapse_remote(&peer);
+                } else {
+                    self.expand_remote(peer);
+                }
+                // Stay in the launcher so the section visibly expands/collapses.
+                self.mode = Mode::LaunchPicker;
+            }
+            LaunchRow::RemoteNewSession { peer } => self.open_remote_new_session(peer),
+            LaunchRow::AddRemote => self.open_add_remote(),
+        }
+    }
+
     /// Whether the current filter text matches at least one listed subdirectory
     /// (used to decide whether Enter on a typed absolute path should navigate).
     fn filter_matches_listed_subdir(&self) -> bool {
@@ -666,6 +743,10 @@ impl AppCore {
                 self.session_picker_selected = 0;
                 self.session_picker_search.clear();
                 self.mode = Mode::SessionPicker;
+                None
+            }
+            TopBarAction::OpenLaunchPicker => {
+                self.open_launch_picker();
                 None
             }
             TopBarAction::SelectPane(pane_id) => {
@@ -776,6 +857,7 @@ impl AppCore {
             Mode::SessionPicker => self.session_picker_selected = idx,
             Mode::ServerPicker => self.server_picker_selected = idx,
             Mode::DirectoryPicker => self.dir_picker_selected = idx,
+            Mode::LaunchPicker => self.launch_selected = idx,
             _ => {}
         }
     }
@@ -798,6 +880,10 @@ impl AppCore {
             Mode::DirectoryPicker => {
                 self.dir_picker_buffer = text;
                 self.dir_picker_selected = 0;
+            }
+            Mode::LaunchPicker => {
+                self.launch_search = text;
+                self.launch_selected = 0;
             }
             _ => {}
         }
@@ -825,6 +911,10 @@ impl AppCore {
                 // navigating into a folder keeps the browser open (it refreshes
                 // in place when the new listing arrives).
                 self.submit_dir_browser_row();
+                None
+            }
+            Mode::LaunchPicker => {
+                self.submit_launch_row();
                 None
             }
             _ => None,

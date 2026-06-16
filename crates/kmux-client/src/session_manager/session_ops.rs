@@ -1,6 +1,6 @@
 use std::path::Path;
 
-use kmux_protocol::messages::{ClientMessage, TermSize};
+use kmux_protocol::messages::{ClientMessage, PeerId, TermSize};
 
 use super::SessionManager;
 
@@ -127,9 +127,33 @@ impl SessionManager {
                 program: None,
                 args: vec![],
                 size,
-                // Local create; the app layer routes remote creates to a peer
-                // (issue #121 launcher) via a dedicated path.
+                // Local create; remote creates go through create_session_on_peer.
                 peer: None,
+            });
+        }
+    }
+
+    /// Create a new session on a federated `peer` (issue #121). Like
+    /// [`create_session`](Self::create_session) but the hub forwards the create
+    /// upstream to `peer` and registers the result under a local word, replying
+    /// `SessionCreated` with the localized entry.
+    pub fn create_session_on_peer(
+        &mut self,
+        name: Option<&str>,
+        cwd: Option<&str>,
+        peer: PeerId,
+        size: TermSize,
+    ) {
+        if self.ws_sender.is_some() {
+            let rid = self.next_rid();
+            self.send_ws(ClientMessage::SessionCreate {
+                request_id: rid,
+                name: name.map(|n| n.to_string()),
+                cwd: cwd.map(|c| c.to_string()),
+                program: None,
+                args: vec![],
+                size,
+                peer: Some(peer),
             });
         }
     }

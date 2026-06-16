@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use base64::Engine;
 
-use super::{DirBrowserRow, LaunchRow, RemoteStatus};
+use super::{AddRemoteForm, DirBrowserRow, LaunchRow, RemoteStatus};
 use crate::mode::Mode;
 use crate::recent_servers::{RecentServer, ServerKind};
 
@@ -129,22 +129,35 @@ impl AppCore {
                 }
                 SessionEvent::PeerOpened { peer } => {
                     // The remote is now federated through the local daemon (issue
-                    // #121). Re-arm auto-select and refresh the list so the
-                    // remote's sessions — not the pre-federation local list —
-                    // drive the picker.
+                    // #121). Mark it connected, re-arm auto-select, and refresh the
+                    // list so the remote's sessions — not the pre-federation local
+                    // list — drive the picker.
                     info!(%peer, "federated peer opened");
+                    self.peer_status.insert(peer, RemoteStatus::Connected);
                     if matches!(self.mode, Mode::Connecting { .. }) {
                         self.mode = Mode::Normal;
                     }
                     self.did_auto_select = false;
                     self.mgr.request_session_list();
                 }
-                SessionEvent::PeerError { reason } => {
-                    // The server the user asked for is unreachable (SSH/auth/
-                    // connect failure on the daemon's upstream). Surface it like
-                    // a failed connect; reconnect re-runs the local link + OpenPeer.
-                    warn!(%reason, "federated peer failed to open");
-                    self.enter_disconnected(DisconnectReason::BootstrapFailed(reason));
+                SessionEvent::PeerError { peer, reason } => {
+                    warn!(?peer, %reason, "federated peer failed to open");
+                    // Isolate a launcher-initiated failure to its remote (the row
+                    // shows the error). Only the CLI `--server` peer failing during
+                    // the initial bootstrap still surfaces as a global disconnect —
+                    // there is no other server to fall back to. A failure the daemon
+                    // could not attribute (peer: None) also disconnects globally.
+                    let bootstrapping = matches!(self.mode, Mode::Connecting { .. });
+                    let is_desired = matches!(
+                        (&peer, &self.desired_peer),
+                        (Some(p), Some(t)) if *p == t.peer_id()
+                    );
+                    match peer {
+                        Some(p) if !(bootstrapping && is_desired) => {
+                            self.peer_status.insert(p, RemoteStatus::Error(reason));
+                        }
+                        _ => self.enter_disconnected(DisconnectReason::BootstrapFailed(reason)),
+                    }
                 }
                 _ => {}
             }
@@ -598,14 +611,148 @@ impl AppCore {
         ResolvedTarget::LocalDaemon
     }
 
-    /// After a successful local (re)connect, ask the daemon to federate the
-    /// desired remote peer, if any. Idempotent on the daemon, so re-issuing
-    /// after a reconnect simply re-federates.
+    /// After a successful local (re)connect, ask the daemon to (re-)federate
+    /// every remote the user has connected this session, plus the CLI
+    /// `--server` peer on first connect (issue #121). Idempotent on the daemon,
+    /// so re-issuing after a reconnect simply re-federates them all — not just
+    /// one. Remembered-but-unconnected remotes (status `Idle`) are left alone.
     pub fn federate_desired_peer(&mut self) {
-        if let Some(target) = self.desired_peer.clone() {
-            info!(peer = %target.peer_id(), "federating remote peer via local daemon");
+        let mut opened: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
+        let reconnect: Vec<(PeerId, PeerTarget)> = self
+            .peer_targets
+            .iter()
+            .filter(|(id, _)| {
+                matches!(
+                    self.peer_status.get(*id),
+                    Some(RemoteStatus::Connected | RemoteStatus::Connecting)
+                )
+            })
+            .map(|(id, t)| (id.clone(), t.clone()))
+            .collect();
+        for (id, target) in reconnect {
+            info!(peer = %id, "re-federating connected peer");
             self.mgr.open_peer(target);
+            opened.insert(id);
         }
+        if let Some(target) = self.desired_peer.clone() {
+            let id = target.peer_id();
+            if opened.insert(id.clone()) {
+                info!(peer = %id, "federating desired peer via local daemon");
+                self.peer_status.insert(id, RemoteStatus::Connecting);
+                self.mgr.open_peer(target);
+            }
+        }
+    }
+
+    /// Expand a remote section, connecting to it on focus (issue #121). Looks up
+    /// the peer's target in the in-session registry and federates it through the
+    /// local daemon; `PeerOpened`/`PeerError` later updates its status. A no-op
+    /// for an already-connected remote (it just stays expanded).
+    pub fn expand_remote(&mut self, peer: PeerId) {
+        self.launch_expanded.insert(peer.clone());
+        if self.peer_status.get(&peer) == Some(&RemoteStatus::Connected) {
+            return;
+        }
+        let Some(target) = self.peer_targets.get(&peer).cloned() else {
+            self.peer_status
+                .insert(peer, RemoteStatus::Error("unknown remote".into()));
+            return;
+        };
+        self.peer_status.insert(peer, RemoteStatus::Connecting);
+        self.mgr.open_peer(target);
+    }
+
+    /// Collapse a remote section (issue #121). To honor connect-on-focus without
+    /// killing a remote you are actively using, the upstream link is dropped only
+    /// when the active session does not belong to that peer; otherwise it stays
+    /// connected (drop it explicitly via disconnect).
+    pub fn collapse_remote(&mut self, peer: &str) {
+        self.launch_expanded.remove(peer);
+        let active = self.mgr.active_session().map(|s| s.to_string());
+        let in_use = self.mgr.session_list().iter().any(|e| {
+            e.peer.as_deref() == Some(peer) && active.as_deref() == Some(e.meta.word_id.as_str())
+        });
+        if !in_use {
+            self.mgr.close_peer(peer.to_string());
+            self.peer_status
+                .insert(peer.to_string(), RemoteStatus::Idle);
+        }
+    }
+
+    /// Explicitly disconnect a remote (issue #121): drop its upstream link and
+    /// forget its status, regardless of whether a session of it is in use.
+    pub fn disconnect_remote(&mut self, peer: &str) {
+        self.launch_expanded.remove(peer);
+        self.mgr.close_peer(peer.to_string());
+        self.peer_status
+            .insert(peer.to_string(), RemoteStatus::Idle);
+    }
+
+    /// Build a [`PeerTarget`] from the add-remote form, register it in the
+    /// in-session remote list, remember it (SSH only — `Direct` tokens are never
+    /// written to disk), and connect to it (issue #121). Returns an error string
+    /// for the frontend to surface when the form is incomplete.
+    pub fn submit_add_remote(&mut self, form: AddRemoteForm) -> Result<(), String> {
+        let host = form.host.trim();
+        if host.is_empty() {
+            return Err("host is required".into());
+        }
+        let target = if form.use_ssh {
+            PeerTarget::Ssh {
+                user: (!form.user.trim().is_empty()).then(|| form.user.trim().to_string()),
+                host: host.to_string(),
+                ssh_port: form.port,
+                accept_invalid_certs: form.accept_invalid_certs,
+            }
+        } else {
+            let port = form
+                .port
+                .ok_or_else(|| "port is required for a direct connection".to_string())?;
+            if form.token.is_empty() {
+                return Err("token is required for a direct connection".into());
+            }
+            PeerTarget::Direct {
+                host: host.to_string(),
+                port,
+                token: form.token,
+                accept_invalid_certs: form.accept_invalid_certs,
+            }
+        };
+        let peer = target.peer_id();
+        self.peer_targets.insert(peer.clone(), target);
+        self.record_peer_in_recents(&peer);
+        self.mode = Mode::Normal;
+        self.expand_remote(peer);
+        Ok(())
+    }
+
+    /// Create a new session on a federated `peer` at `cwd` (issue #121). An empty
+    /// `cwd` lets the remote daemon resolve a default. Closes the prompt.
+    pub fn submit_remote_new_session(&mut self, peer: PeerId, cwd: String) {
+        let cwd = cwd.trim();
+        let cwd_opt = (!cwd.is_empty()).then_some(cwd);
+        self.mgr
+            .create_session_on_peer(None, cwd_opt, peer, self.term_size);
+        self.mode = Mode::Normal;
+    }
+
+    /// Persist an SSH peer in the recent-servers list so it reappears next
+    /// session. `Direct` peers are skipped — their token must not hit disk.
+    fn record_peer_in_recents(&mut self, peer: &str) {
+        let kind = match self.peer_targets.get(peer) {
+            Some(PeerTarget::Ssh {
+                user,
+                host,
+                ssh_port,
+                ..
+            }) => ServerKind::Ssh {
+                user: user.clone(),
+                host: host.clone(),
+                ssh_port: *ssh_port,
+            },
+            _ => return,
+        };
+        self.recent_servers.record_connection(peer, peer, kind);
     }
 
     /// Apply the state change for switching to a server chosen from the server
@@ -888,9 +1035,108 @@ mod tests {
     }
 
     #[test]
-    fn peer_error_surfaces_as_a_disconnect() {
+    fn attributed_peer_error_isolates_to_the_remote() {
         let mut core = fixture_core();
+        // Not bootstrapping (mode is Normal): a launcher-initiated failure marks
+        // only that remote, leaving the rest of the UI alone.
         core.handle_session_events(vec![SessionEvent::PeerError {
+            peer: Some("alice@box".into()),
+            reason: "ssh: connect timeout".into(),
+        }]);
+        assert!(
+            !matches!(core.mode, Mode::Disconnected { .. }),
+            "an attributed failure must not disconnect the whole client"
+        );
+        assert_eq!(
+            core.peer_status.get("alice@box"),
+            Some(&RemoteStatus::Error("ssh: connect timeout".into()))
+        );
+    }
+
+    #[test]
+    fn expand_remote_connects_and_marks_connecting() {
+        let (mut core, mut rx) = connected_core();
+        core.peer_targets.insert(
+            "alice@box".into(),
+            PeerTarget::Ssh {
+                user: Some("alice".into()),
+                host: "box".into(),
+                ssh_port: None,
+                accept_invalid_certs: false,
+            },
+        );
+
+        core.expand_remote("alice@box".into());
+
+        assert!(core.launch_expanded.contains("alice@box"));
+        assert_eq!(
+            core.peer_status.get("alice@box"),
+            Some(&RemoteStatus::Connecting)
+        );
+        let mut saw_open = false;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg, ClientMessage::OpenPeer { .. }) {
+                saw_open = true;
+            }
+        }
+        assert!(saw_open, "expand_remote must federate via OpenPeer");
+    }
+
+    // Async: submit_add_remote persists the SSH remote via record_connection,
+    // whose save() spawns a blocking task that needs a runtime.
+    #[tokio::test]
+    async fn add_remote_ssh_registers_records_and_connects() {
+        let (mut core, mut rx) = connected_core();
+        core.submit_add_remote(AddRemoteForm {
+            use_ssh: true,
+            host: "box".into(),
+            user: "alice".into(),
+            port: Some(2222),
+            token: String::new(),
+            accept_invalid_certs: false,
+        })
+        .expect("a complete SSH form is valid");
+
+        assert!(core.peer_targets.contains_key("alice@box:2222"));
+        assert_eq!(
+            core.peer_status.get("alice@box:2222"),
+            Some(&RemoteStatus::Connecting)
+        );
+        assert_eq!(core.mode, Mode::Normal);
+        let mut saw_open = false;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg, ClientMessage::OpenPeer { .. }) {
+                saw_open = true;
+            }
+        }
+        assert!(saw_open, "adding a remote must connect to it");
+    }
+
+    #[test]
+    fn add_remote_direct_requires_port() {
+        let mut core = fixture_core();
+        let err = core
+            .submit_add_remote(AddRemoteForm {
+                use_ssh: false,
+                host: "10.0.0.5".into(),
+                user: String::new(),
+                port: None,
+                token: "tok".into(),
+                accept_invalid_certs: true,
+            })
+            .expect_err("a Direct remote without a port must be rejected");
+        assert!(
+            err.contains("port"),
+            "error should mention the missing port"
+        );
+    }
+
+    #[test]
+    fn unattributed_peer_error_surfaces_as_a_global_disconnect() {
+        let mut core = fixture_core();
+        // No peer attribution ⇒ the legacy global disconnect.
+        core.handle_session_events(vec![SessionEvent::PeerError {
+            peer: None,
             reason: "no route to host".into(),
         }]);
         match &core.mode {

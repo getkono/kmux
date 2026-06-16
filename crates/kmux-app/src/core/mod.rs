@@ -84,6 +84,8 @@ pub enum TopBarAction {
     OpenServerPicker,
     Reconnect,
     OpenSessionPicker,
+    /// Open the unified session launcher (issue #121): the new-session button.
+    OpenLaunchPicker,
     SelectPane(String),
     /// Affordance to spawn a new pane in the active session.
     CreatePane,
@@ -155,6 +157,25 @@ pub enum LaunchRow {
     },
     /// Affordance to add a new remote (SSH or Direct). Always the last row.
     AddRemote,
+}
+
+/// Values collected by the add-remote form (issue #121). The frontend owns the
+/// native input widgets and hands a completed form to
+/// [`AppCore::submit_add_remote`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddRemoteForm {
+    /// `true` for an SSH remote (the default), `false` for a `Direct` TCP+TLS one.
+    pub use_ssh: bool,
+    /// Hostname / IP / SSH alias. Required.
+    pub host: String,
+    /// SSH user; empty means "default user" (SSH only).
+    pub user: String,
+    /// SSH port override, or the `Direct` TCP+TLS port (required for `Direct`).
+    pub port: Option<u16>,
+    /// Shared token for a `Direct` peer (required; never persisted to disk).
+    pub token: String,
+    /// Accept a self-signed / unpinned server certificate.
+    pub accept_invalid_certs: bool,
 }
 
 /// Why the connection is paused, surfaced to frontends for a status indicator

@@ -41,6 +41,16 @@ pub enum Mode {
     Help,
     /// Directory picker for remote connections: type a path to open/create a session
     DirectoryPicker,
+    /// Unified session launcher (issue #121): a searchable list to open or create
+    /// a session locally or on a remote. Rows come from [`AppCore::launch_rows`].
+    LaunchPicker,
+    /// Add-a-remote form (issue #121). The frontend owns the native input fields
+    /// and calls [`AppCore::submit_add_remote`]; the core only opens/cancels.
+    AddRemote,
+    /// Prompt for the directory of a new session on a federated `peer` (issue
+    /// #121). The frontend owns the path field and calls
+    /// [`AppCore::submit_remote_new_session`].
+    RemoteNewSession { peer: String },
     /// Background bootstrap in progress. Input is held; Esc cancels.
     Connecting { target_display: String },
     /// Connection dropped. Input to panes is frozen; the overlay asks the
@@ -172,6 +182,16 @@ pub enum Action {
     DirPickerSubmit,
     DirPickerCancel,
 
+    // Unified launcher (issue #121)
+    LaunchClose,
+    LaunchSelect,
+    LaunchUp,
+    LaunchDown,
+    LaunchSearchChar(char),
+    LaunchSearchBackspace,
+    /// Cancel a frontend-owned launcher overlay (add-remote / remote path prompt).
+    LaunchOverlayCancel,
+
     // Cancel an in-progress background bootstrap.
     CancelBootstrap,
 
@@ -222,6 +242,8 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::ServerPicker => resolve_server_picker(key, mods),
         Mode::Help => resolve_help(key),
         Mode::DirectoryPicker => resolve_dir_picker(key, mods),
+        Mode::LaunchPicker => resolve_launch_picker(key, mods),
+        Mode::AddRemote | Mode::RemoteNewSession { .. } => resolve_launch_overlay(key),
         Mode::Connecting { .. } => resolve_connecting(key, mods),
         Mode::Disconnected { .. } => resolve_disconnected(key),
         Mode::Command(_) => resolve_command(key, mods),

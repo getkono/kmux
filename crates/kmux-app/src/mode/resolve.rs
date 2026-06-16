@@ -271,6 +271,28 @@ pub fn resolve_dir_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) 
     )
 }
 
+pub fn resolve_launch_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+    resolve_picker(
+        key,
+        mods,
+        Action::LaunchClose,
+        Action::LaunchSelect,
+        Action::LaunchUp,
+        Action::LaunchDown,
+        Action::LaunchSearchBackspace,
+        Action::LaunchSearchChar,
+    )
+}
+
+/// Esc/Ctrl+C cancels a frontend-owned launcher overlay (add-remote / remote
+/// path prompt). All other input is handled by the overlay's native fields.
+pub fn resolve_launch_overlay(key: &Key) -> (Option<Mode>, Action) {
+    if matches!(key, Key::Named(NamedKey::Escape)) {
+        return (Some(Mode::Normal), Action::LaunchOverlayCancel);
+    }
+    (None, Action::None)
+}
+
 /// Esc or Ctrl+C cancels the in-progress background bootstrap.
 pub fn resolve_connecting(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     if matches!(key, Key::Named(NamedKey::Escape)) {
