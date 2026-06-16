@@ -237,6 +237,7 @@ mod tests {
                 pixel_width: 0,
                 pixel_height: 0,
             },
+            peer: None,
         };
         let bytes = encode_client(&msg).expect("encode");
         let decoded = decode_client(&bytes).expect("decode");

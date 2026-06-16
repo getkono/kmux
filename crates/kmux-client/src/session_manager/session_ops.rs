@@ -127,6 +127,9 @@ impl SessionManager {
                 program: None,
                 args: vec![],
                 size,
+                // Local create; the app layer routes remote creates to a peer
+                // (issue #121 launcher) via a dedicated path.
+                peer: None,
             });
         }
     }

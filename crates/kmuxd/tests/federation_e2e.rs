@@ -203,6 +203,7 @@ async fn create_remote_session(
         .send(ClientMessage::SessionCreate {
             request_id: 1,
             name: Some("fed-src".into()),
+            peer: None,
             cwd: Some(cwd.display().to_string()),
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), script],
@@ -696,6 +697,7 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
         .send(ClientMessage::SessionCreate {
             request_id: 2,
             name: Some("local-after-death".into()),
+            peer: None,
             cwd: Some(local_dir.path().display().to_string()),
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), "exec sleep 600".into()],
@@ -931,6 +933,7 @@ async fn federation_surfaces_upstream_auth_rejection_as_peer_error() {
         .send(ClientMessage::SessionCreate {
             request_id: 2,
             name: Some("local-after-reject".into()),
+            peer: None,
             cwd: Some(local_dir.path().display().to_string()),
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), "exec sleep 600".into()],

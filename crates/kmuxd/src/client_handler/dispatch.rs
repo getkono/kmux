@@ -126,6 +126,8 @@ pub async fn handle_message<A: PaneAttacher>(
             program,
             args,
             size,
+            // PR3 (issue #121) captures this to route remote creates to a peer.
+            peer: _,
         } => match state
             .app
             .create_session(name, cwd, program, args, size, &state.capabilities)

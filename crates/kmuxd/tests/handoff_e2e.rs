@@ -193,6 +193,7 @@ async fn create_session_with_recorded_child(token: &str, cwd: &Path, pidfile: &P
         .send(ClientMessage::SessionCreate {
             request_id: 1,
             name: Some("e2e".into()),
+            peer: None,
             cwd: Some(cwd.display().to_string()),
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), script],
