@@ -67,7 +67,7 @@ pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
     command_btn.set_tooltip_text(Some("Command palette (Ctrl+Shift+P)"));
     command_btn.set_action_name(Some("win.command"));
     let server_btn = Button::from_icon_name("network-server-symbolic");
-    server_btn.set_tooltip_text(Some("Switch server"));
+    server_btn.set_tooltip_text(Some("Open launcher (sessions & remotes)"));
     let conn_btn = Button::from_icon_name("network-idle-symbolic");
     let transport_btn = Button::with_label("");
     transport_btn.add_css_class("flat");

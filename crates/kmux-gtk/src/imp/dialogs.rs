@@ -18,11 +18,11 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk4::{
-    Align, Box as GtkBox, Entry, EventControllerKey, Label, ListBox, ListBoxRow, Orientation,
-    ScrolledWindow, SearchEntry, SelectionMode, gdk, glib,
+    Align, Box as GtkBox, Button, Entry, EventControllerKey, Image, Label, ListBox, ListBoxRow,
+    Orientation, ScrolledWindow, SearchEntry, SelectionMode, Spinner, gdk, glib,
 };
 
-use kmux_app::core::AppCore;
+use kmux_app::core::{AddRemoteForm, AppCore, LaunchRow, RemoteStatus};
 use kmux_app::mode::{Action, Mode};
 use kmux_app::{cmd, mode};
 
@@ -36,10 +36,17 @@ enum DialogKind {
     SessionPicker,
     ServerPicker,
     DirPicker,
+    /// The unified session launcher (issue #121): a rich, hierarchical list of
+    /// local + remote open/create rows from [`AppCore::launch_rows`].
+    Launch,
     Command,
     Confirm,
     Rename,
     Help,
+    /// The add-a-remote form (issue #121): a native field form, not a list.
+    AddRemote,
+    /// The "new session on a remote" path prompt (issue #121).
+    RemoteNew,
 }
 
 impl DialogKind {
@@ -50,6 +57,7 @@ impl DialogKind {
             DialogKind::SessionPicker
                 | DialogKind::ServerPicker
                 | DialogKind::DirPicker
+                | DialogKind::Launch
                 | DialogKind::Command
         )
     }
@@ -59,10 +67,13 @@ impl DialogKind {
             Mode::SessionPicker => Some(DialogKind::SessionPicker),
             Mode::ServerPicker => Some(DialogKind::ServerPicker),
             Mode::DirectoryPicker => Some(DialogKind::DirPicker),
+            Mode::LaunchPicker => Some(DialogKind::Launch),
             Mode::Command(_) => Some(DialogKind::Command),
             Mode::ConfirmCloseSession { .. } => Some(DialogKind::Confirm),
             Mode::RenameSession { .. } | Mode::RenameTab { .. } => Some(DialogKind::Rename),
             Mode::Help => Some(DialogKind::Help),
+            Mode::AddRemote => Some(DialogKind::AddRemote),
+            Mode::RemoteNewSession { .. } => Some(DialogKind::RemoteNew),
             _ => None,
         }
     }
@@ -160,16 +171,16 @@ fn reconcile_native(
     }
 
     // Refresh the list contents of a live picker/command dialog on change.
-    let is_list = dialogs
-        .current
-        .borrow()
-        .as_ref()
-        .is_some_and(|d| d.kind.is_list());
-    if is_list {
+    let kind = dialogs.current.borrow().as_ref().map(|d| d.kind);
+    if kind.is_some_and(|k| k.is_list()) {
         let sig = list_signature(&fe.borrow().core);
         if dialogs.list_sig.borrow().as_deref() != Some(sig.as_str()) {
             *dialogs.list_sig.borrow_mut() = Some(sig);
-            populate_list(dialogs, fe);
+            if kind == Some(DialogKind::Launch) {
+                populate_launch(dialogs, shell, fe);
+            } else {
+                populate_list(dialogs, fe);
+            }
         }
     }
 }
@@ -186,6 +197,8 @@ fn open_dialog(
         DialogKind::Confirm => open_confirm(shell, fe),
         DialogKind::Rename => open_rename(shell, fe),
         DialogKind::Help => open_help(shell),
+        DialogKind::AddRemote => open_add_remote_dialog(shell, fe),
+        DialogKind::RemoteNew => open_remote_new_dialog(shell, fe),
         _ => open_list_dialog(kind, dialogs, shell, fe, app),
     }
 }
@@ -215,6 +228,11 @@ fn open_list_dialog(
                 "New session — choose a directory",
                 "Filter directories…",
                 core.dir_picker_buffer.clone(),
+            ),
+            DialogKind::Launch => (
+                "Open or create a session",
+                "Filter sessions and remotes…",
+                core.launch_search.clone(),
             ),
             DialogKind::Command => ("Command", "Type a command", command_buffer(core)),
             _ => unreachable!(),
@@ -395,6 +413,164 @@ fn populate_list(dialogs: &Rc<Dialogs>, fe: &Rc<RefCell<Frontend>>) {
     }
 }
 
+/// Rebuild the launcher's rich, hierarchical rows from [`AppCore::launch_rows`]
+/// (issue #121). Unlike the plain-label pickers, each row is an `adw::ActionRow`
+/// with an icon, a status pill / spinner, indentation for a remote's children,
+/// and an inline disconnect button for a live remote. Row index maps 1:1 to
+/// `launch_rows`, so the shared search/navigation/activation path drives it
+/// unchanged.
+fn populate_launch(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
+    let cur = dialogs.current.borrow();
+    let Some(live) = cur.as_ref() else {
+        return;
+    };
+    let Some(list) = &live.list else {
+        return;
+    };
+    let (rows, selected) = {
+        let core = &fe.borrow().core;
+        (core.launch_rows(), core.launch_selected)
+    };
+
+    dialogs.syncing.set(true);
+    while let Some(child) = list.first_child() {
+        list.remove(&child);
+    }
+    for row in &rows {
+        list.append(&launch_row_widget(row, shell, fe));
+    }
+    let sel = selected.min(rows.len().saturating_sub(1));
+    if let Some(r) = list.row_at_index(sel as i32) {
+        list.select_row(Some(&r));
+    }
+    dialogs.syncing.set(false);
+}
+
+/// Build one launcher row as an activatable `adw::ActionRow`.
+fn launch_row_widget(
+    row: &LaunchRow,
+    shell: &Rc<Shell>,
+    fe: &Rc<RefCell<Frontend>>,
+) -> adw::ActionRow {
+    match row {
+        LaunchRow::LocalNewSession { default_cwd } => {
+            launch_action_row("New local session", default_cwd, "list-add-symbolic", false)
+        }
+        LaunchRow::LocalExisting {
+            name, cwd, active, ..
+        } => {
+            let r = launch_action_row(name, cwd, "utilities-terminal-symbolic", false);
+            if *active {
+                r.add_suffix(&status_pill("active", "success", None));
+            }
+            r
+        }
+        LaunchRow::Remote {
+            label,
+            status,
+            expanded,
+            peer,
+        } => {
+            let chevron = if *expanded {
+                "pan-down-symbolic"
+            } else {
+                "pan-end-symbolic"
+            };
+            let r = launch_action_row(label, "", chevron, false);
+            if let Some(w) = status_suffix(status) {
+                r.add_suffix(&w);
+            }
+            if matches!(status, RemoteStatus::Connected | RemoteStatus::Connecting) {
+                r.add_suffix(&disconnect_button(peer, shell, fe));
+            }
+            r
+        }
+        LaunchRow::RemoteNewSession { .. } => {
+            launch_action_row("New session", "", "list-add-symbolic", true)
+        }
+        LaunchRow::RemoteExisting {
+            name, cwd, active, ..
+        } => {
+            let r = launch_action_row(name, cwd, "utilities-terminal-symbolic", true);
+            if *active {
+                r.add_suffix(&status_pill("active", "success", None));
+            }
+            r
+        }
+        LaunchRow::AddRemote => {
+            launch_action_row("Add remote…", "", "network-server-symbolic", false)
+        }
+    }
+}
+
+/// A launcher `adw::ActionRow`: a leading icon, optional subtitle, and a left
+/// spacer when it is a remote's (indented) child row.
+fn launch_action_row(title: &str, subtitle: &str, icon: &str, indent: bool) -> adw::ActionRow {
+    let r = adw::ActionRow::builder().title(title).build();
+    r.set_activatable(true);
+    if !subtitle.is_empty() {
+        r.set_subtitle(subtitle);
+    }
+    if indent {
+        let spacer = GtkBox::new(Orientation::Horizontal, 0);
+        spacer.set_size_request(20, -1);
+        r.add_prefix(&spacer);
+    }
+    r.add_prefix(&Image::from_icon_name(icon));
+    r
+}
+
+/// A small caption pill (e.g. "active"/"connected") in a semantic color, with an
+/// optional tooltip carrying the detail (used for an error reason).
+fn status_pill(text: &str, css: &str, tip: Option<&str>) -> Label {
+    let l = Label::new(Some(text));
+    l.add_css_class(css);
+    l.add_css_class("caption");
+    l.set_valign(Align::Center);
+    if let Some(t) = tip {
+        l.set_tooltip_text(Some(t));
+    }
+    l
+}
+
+/// The trailing status indicator for a remote row: a spinner while connecting, a
+/// colored pill when connected/errored, nothing when idle.
+fn status_suffix(status: &RemoteStatus) -> Option<gtk4::Widget> {
+    match status {
+        RemoteStatus::Idle => None,
+        RemoteStatus::Connecting => {
+            let s = Spinner::new();
+            s.start();
+            s.set_valign(Align::Center);
+            s.set_tooltip_text(Some("Connecting…"));
+            Some(s.upcast())
+        }
+        RemoteStatus::Connected => Some(status_pill("connected", "success", None).upcast()),
+        RemoteStatus::Error(e) => Some(status_pill("error", "error", Some(e)).upcast()),
+    }
+}
+
+/// An inline "disconnect this remote" button (issue #121). Clicking it consumes
+/// the press, so it does not also toggle the row's expand state.
+fn disconnect_button(peer: &str, shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Button {
+    let btn = Button::from_icon_name("network-offline-symbolic");
+    btn.set_tooltip_text(Some("Disconnect"));
+    btn.add_css_class("flat");
+    btn.set_valign(Align::Center);
+    let peer = peer.to_string();
+    let fe = fe.clone();
+    let shell = shell.clone();
+    btn.connect_clicked(move |_| {
+        {
+            let mut f = fe.borrow_mut();
+            f.core.disconnect_remote(&peer);
+            f.core.needs_render = true;
+        }
+        shell.drawing.queue_draw();
+    });
+    btn
+}
+
 /// Row labels + selected index for a list dialog.
 fn list_rows(kind: DialogKind, core: &AppCore) -> (Vec<String>, usize) {
     match kind {
@@ -476,6 +652,16 @@ fn list_signature(core: &AppCore) -> String {
             core.dir_browser_rows().len(),
             core.dir_browser_error().unwrap_or("")
         ),
+        Some(DialogKind::Launch) => {
+            // Captures every field that changes a row's look (expand, status,
+            // active, peer set) so the launcher rebuilds only on real change.
+            let body: String = core
+                .launch_rows()
+                .iter()
+                .map(|r| format!("{r:?};"))
+                .collect();
+            format!("la|{}|{}|{body}", core.launch_search, core.launch_selected)
+        }
         Some(DialogKind::Command) => {
             format!("cmd|{}|{}", command_buffer(core), command_selected(core))
         }
@@ -501,6 +687,8 @@ fn move_selection(core: &mut AppCore, down: bool) {
         (Some(DialogKind::ServerPicker), false) => Action::ServerPickerUp,
         (Some(DialogKind::DirPicker), true) => Action::DirPickerDown,
         (Some(DialogKind::DirPicker), false) => Action::DirPickerUp,
+        (Some(DialogKind::Launch), true) => Action::LaunchDown,
+        (Some(DialogKind::Launch), false) => Action::LaunchUp,
         (Some(DialogKind::Command), true) => Action::CommandHintDown,
         (Some(DialogKind::Command), false) => Action::CommandHintUp,
         _ => return,
@@ -685,6 +873,223 @@ fn open_help(shell: &Rc<Shell>) -> LiveDialog {
     dialog.present(Some(&shell.window));
     LiveDialog {
         kind: DialogKind::Help,
+        dialog: dialog.upcast(),
+        list: None,
+        search: None,
+    }
+}
+
+// ── Add-remote + remote-new-session forms (issue #121) ──
+
+/// The add-a-remote form: a native field form (kind, host, user, port, token,
+/// accept-invalid-certs) submitted to [`AppCore::submit_add_remote`]. Unlike the
+/// list dialogs this is a plain `adw::Dialog` so we control validation — a bad
+/// form shows an inline error and stays open; a good one connects on focus and
+/// returns to the launcher with the new remote expanded.
+fn open_add_remote_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
+    let kind = adw::ComboRow::new();
+    kind.set_title("Connection");
+    kind.set_model(Some(&gtk4::StringList::new(&["SSH", "Direct (TCP+TLS)"])));
+    let host = adw::EntryRow::builder().title("Host").build();
+    let user = adw::EntryRow::builder()
+        .title("User (optional, SSH)")
+        .build();
+    let port = adw::EntryRow::builder()
+        .title("Port (required for Direct)")
+        .build();
+    let token = adw::PasswordEntryRow::builder()
+        .title("Token (Direct only)")
+        .build();
+    let certs = adw::SwitchRow::builder()
+        .title("Accept invalid certificates")
+        .build();
+
+    let group = adw::PreferencesGroup::new();
+    group.add(&kind);
+    group.add(&host);
+    group.add(&user);
+    group.add(&port);
+    group.add(&token);
+    group.add(&certs);
+
+    let error = Label::new(None);
+    error.add_css_class("error");
+    error.set_halign(Align::Start);
+    error.set_wrap(true);
+    error.set_visible(false);
+
+    let body = GtkBox::new(Orientation::Vertical, 12);
+    body.set_margin_top(12);
+    body.set_margin_bottom(12);
+    body.set_margin_start(12);
+    body.set_margin_end(12);
+    body.append(&group);
+    body.append(&error);
+
+    let cancel = Button::with_label("Cancel");
+    let add = Button::with_label("Add");
+    add.add_css_class("suggested-action");
+
+    let header = adw::HeaderBar::new();
+    header.set_title_widget(Some(&adw::WindowTitle::new("Add remote", "")));
+    header.set_show_start_title_buttons(false);
+    header.set_show_end_title_buttons(false);
+    header.pack_start(&cancel);
+    header.pack_end(&add);
+
+    let toolbar = adw::ToolbarView::new();
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&body));
+
+    let dialog = adw::Dialog::builder()
+        .title("Add remote")
+        .content_width(460)
+        .build();
+    dialog.set_child(Some(&toolbar));
+
+    // Cancel → return to Normal and close.
+    {
+        let fe = fe.clone();
+        let dialog2 = dialog.clone();
+        cancel.connect_clicked(move |_| {
+            {
+                let mut f = fe.borrow_mut();
+                let _ = futures::executor::block_on(
+                    f.core.dispatch_action(Action::LaunchOverlayCancel),
+                );
+                f.core.needs_render = true;
+            }
+            dialog2.close();
+        });
+    }
+
+    // Add → validate via the core; on error show it inline and stay open, on
+    // success reopen the launcher (the remote is now expanded + connecting).
+    {
+        let fe = fe.clone();
+        let shell = shell.clone();
+        let kind = kind.clone();
+        let host = host.clone();
+        let user = user.clone();
+        let port = port.clone();
+        let token = token.clone();
+        let certs = certs.clone();
+        let error = error.clone();
+        add.connect_clicked(move |_| {
+            let form = AddRemoteForm {
+                use_ssh: kind.selected() == 0,
+                host: host.text().to_string(),
+                user: user.text().to_string(),
+                port: port.text().trim().parse::<u16>().ok(),
+                token: token.text().to_string(),
+                accept_invalid_certs: certs.is_active(),
+            };
+            let result = {
+                let mut f = fe.borrow_mut();
+                let r = f.core.submit_add_remote(form);
+                if r.is_ok() {
+                    // Core returns to Normal on success; reopen the launcher so the
+                    // new remote is visible (expanded, connecting on focus).
+                    f.core.open_launch_picker();
+                }
+                f.core.needs_render = true;
+                r
+            };
+            match result {
+                Ok(()) => shell.drawing.queue_draw(),
+                Err(e) => {
+                    error.set_text(&e);
+                    error.set_visible(true);
+                }
+            }
+        });
+    }
+
+    // Esc / click-away → treat as cancel if still in the form.
+    {
+        let fe = fe.clone();
+        let shell = shell.clone();
+        dialog.connect_closed(move |_| {
+            let mut f = fe.borrow_mut();
+            if matches!(f.core.mode, Mode::AddRemote) {
+                f.core.mode = Mode::Normal;
+                f.core.needs_render = true;
+            }
+            drop(f);
+            shell.drawing.grab_focus();
+            shell.drawing.queue_draw();
+        });
+    }
+
+    dialog.present(Some(&shell.window));
+    host.grab_focus();
+    LiveDialog {
+        kind: DialogKind::AddRemote,
+        dialog: dialog.upcast(),
+        list: None,
+        search: None,
+    }
+}
+
+/// The "new session on a remote" path prompt: a one-field alert seeded from that
+/// peer's focused session cwd, submitted to [`AppCore::submit_remote_new_session`].
+fn open_remote_new_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
+    let peer = match &fe.borrow().core.mode {
+        Mode::RemoteNewSession { peer } => peer.clone(),
+        _ => String::new(),
+    };
+    let seed = {
+        let core = &fe.borrow().core;
+        let active = core.mgr.active_session();
+        let on_peer =
+            |e: &&kmux_protocol::messages::SessionEntry| e.peer.as_deref() == Some(peer.as_str());
+        core.mgr
+            .session_list()
+            .iter()
+            .find(|e| on_peer(e) && active == Some(e.meta.word_id.as_str()))
+            .or_else(|| core.mgr.session_list().iter().find(on_peer))
+            .map(|e| e.meta.cwd.clone())
+            .unwrap_or_default()
+    };
+
+    let entry = Entry::new();
+    entry.set_text(&seed);
+    entry.set_placeholder_text(Some("Path (blank = remote default)"));
+    entry.set_activates_default(true);
+
+    let dialog = adw::AlertDialog::new(
+        Some("New remote session"),
+        Some(&format!("Create a session on “{peer}”.")),
+    );
+    dialog.set_extra_child(Some(&entry));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("create", "Create");
+    dialog.set_response_appearance("create", adw::ResponseAppearance::Suggested);
+    dialog.set_default_response(Some("create"));
+    dialog.set_close_response("cancel");
+    {
+        let fe = fe.clone();
+        let shell = shell.clone();
+        let entry = entry.clone();
+        dialog.connect_response(None, move |_d, resp| {
+            {
+                let mut f = fe.borrow_mut();
+                if resp == "create" {
+                    let cwd = entry.text().to_string();
+                    f.core.submit_remote_new_session(peer.clone(), cwd);
+                } else {
+                    let _ = futures::executor::block_on(
+                        f.core.dispatch_action(Action::LaunchOverlayCancel),
+                    );
+                }
+                f.core.needs_render = true;
+            }
+            shell.drawing.queue_draw();
+        });
+    }
+    dialog.present(Some(&shell.window));
+    LiveDialog {
+        kind: DialogKind::RemoteNew,
         dialog: dialog.upcast(),
         list: None,
         search: None,

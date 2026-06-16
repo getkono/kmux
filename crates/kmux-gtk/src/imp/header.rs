@@ -20,14 +20,16 @@ const CONN_CLASSES: [&str; 4] = ["success", "warning", "error", "dim-label"];
 
 /// Wire the header buttons. Called once.
 pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application) {
-    // Server button → open the server picker.
+    // Server button → open the unified launcher (issue #121). Remotes are now
+    // federated into the local hub and managed from the launcher, so this is the
+    // single entry point for "connect to / open a session on another machine".
     {
         let s = shell.clone();
         let fe = fe.clone();
         shell.server_btn.connect_clicked(move |_| {
             {
                 let mut f = fe.borrow_mut();
-                f.core.apply_top_bar_action(TopBarAction::OpenServerPicker);
+                f.core.apply_top_bar_action(TopBarAction::OpenLaunchPicker);
                 f.core.needs_render = true;
             }
             s.drawing.queue_draw();
