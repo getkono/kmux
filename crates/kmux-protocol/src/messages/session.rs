@@ -590,6 +590,35 @@ mod tests {
     }
 
     #[test]
+    fn session_entry_peer_attribution_roundtrips() {
+        // A federated entry carries its owning peer; a local entry leaves it
+        // None. Both must survive the postcard wire roundtrip (issue #121).
+        let federated = SessionEntry {
+            meta: SessionMeta {
+                index: 2,
+                word_id: "eagle".into(),
+                name: "kmux".into(),
+                cwd: "/dev/kmux".into(),
+            },
+            panes: vec![],
+            tabs: vec![],
+            active_tab: 0,
+            peer: Some("alice@box:2222".into()),
+        };
+        let bytes = postcard::to_allocvec(&federated).expect("serialize");
+        let decoded: SessionEntry = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded.peer.as_deref(), Some("alice@box:2222"));
+
+        let local = SessionEntry {
+            peer: None,
+            ..federated
+        };
+        let bytes = postcard::to_allocvec(&local).expect("serialize");
+        let decoded: SessionEntry = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded.peer, None);
+    }
+
+    #[test]
     fn tab_lifecycle_events_roundtrip() {
         for msg in [
             SessionEventMsg::TabCreated {
