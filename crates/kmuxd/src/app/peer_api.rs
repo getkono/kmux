@@ -77,6 +77,31 @@ impl ServerApp {
         }
     }
 
+    /// Create a new session on an already-federated `peer`, returning the
+    /// localized [`SessionEntry`] the hub replies to the requesting client.
+    /// Without the feature this reports a "not supported" error.
+    pub async fn create_remote_session(
+        &self,
+        peer: &str,
+        name: Option<String>,
+        cwd: Option<String>,
+        program: Option<String>,
+        args: Vec<String>,
+        size: TermSize,
+    ) -> Result<SessionEntry, String> {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager
+                .create_remote_session(self, peer, name, cwd, program, args, size)
+                .await
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (peer, name, cwd, program, args, size);
+            Err("federation is not supported by this daemon yet".to_string())
+        }
+    }
+
     /// Apply connection-pause state (issue #68) to every federated pane `client_id`
     /// views: a paused viewer is skipped in the feed loop's fan-out and resyncs on
     /// resume via re-attach. A no-op without the feature (or for a client viewing no

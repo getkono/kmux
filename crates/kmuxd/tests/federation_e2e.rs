@@ -203,6 +203,7 @@ async fn create_remote_session(
         .send(ClientMessage::SessionCreate {
             request_id: 1,
             name: Some("fed-src".into()),
+            peer: None,
             cwd: Some(cwd.display().to_string()),
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), script],
@@ -434,6 +435,144 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
     assert!(
         title_evt.is_some(),
         "a title change on the remote pane must reach the GUI as PaneTitleChanged for the local pane"
+    );
+
+    // ── Teardown. ──
+    drop(gui_tx);
+    set_xdg(local_dir.path());
+    let _ = kmux_client::daemon::stop_daemon().await;
+    set_xdg(remote_dir.path());
+    let _ = kmux_client::daemon::stop_daemon().await;
+}
+
+/// Creating a session on a federated peer (issue #121 launcher): the GUI sends
+/// `SessionCreate { peer: Some(..) }` to the hub, which forwards it upstream,
+/// registers the result under a local word, and replies `SessionCreated` with the
+/// session attributed to its peer. The new session must run on the *remote* host.
+#[tokio::test]
+#[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
+async fn gui_creates_a_session_on_a_federated_peer() {
+    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
+    let cleanup = Cleanup::default();
+
+    let remote_dir = tempfile::tempdir().unwrap();
+    let local_dir = tempfile::tempdir().unwrap();
+
+    // ── Remote daemon: starts with no sessions; the hub will create one on it. ──
+    set_xdg(remote_dir.path());
+    let remote_pid = spawn_daemon(&exe).await;
+    cleanup.track(remote_pid as i32);
+    let remote_status = kmux_client::daemon::query_daemon()
+        .await
+        .expect("remote daemon status");
+    let remote_token = remote_status.token.clone();
+    let remote_tcp = remote_status.tcp_port;
+    assert!(remote_tcp != 0, "remote daemon must expose a TCP+TLS port");
+
+    // ── Local hub daemon: what the GUI talks to. ──
+    set_xdg(local_dir.path());
+    let local_pid = spawn_daemon(&exe).await;
+    cleanup.track(local_pid as i32);
+    let local_token = kmux_client::daemon::query_daemon()
+        .await
+        .expect("local daemon status")
+        .token;
+
+    let (gui_tx, mut gui_rx) = connect_authenticated(&local_token).await;
+
+    // 1. Federate the hub to the remote.
+    gui_tx
+        .send(ClientMessage::OpenPeer {
+            request_id: 10,
+            target: PeerTarget::Direct {
+                host: "127.0.0.1".into(),
+                port: remote_tcp,
+                token: remote_token.clone(),
+                accept_invalid_certs: true,
+            },
+        })
+        .expect("send OpenPeer");
+    let peer_id = match recv_until(&mut gui_rx, Duration::from_secs(15), |m| {
+        matches!(
+            m,
+            ServerMessage::PeerOpened { .. } | ServerMessage::PeerError { .. }
+        )
+    })
+    .await
+    .expect("expected a PeerOpened/PeerError reply")
+    {
+        ServerMessage::PeerOpened { peer, .. } => peer,
+        ServerMessage::PeerError { reason, .. } => panic!("federation failed: {reason}"),
+        _ => unreachable!(),
+    };
+
+    // 2. Create a new session ON the peer. The shell records its PID so we can
+    //    prove a live *remote* PTY was spawned (and clean it up).
+    let pidfile = remote_dir.path().join("created.pid");
+    let script = format!("echo $$ > {}; exec sleep 600", pidfile.display());
+    gui_tx
+        .send(ClientMessage::SessionCreate {
+            request_id: 20,
+            name: Some("made-on-remote".into()),
+            cwd: Some(remote_dir.path().display().to_string()),
+            program: Some("/bin/sh".into()),
+            args: vec!["-c".into(), script],
+            size: ATTACH_SIZE,
+            peer: Some(peer_id.clone()),
+        })
+        .expect("send SessionCreate on peer");
+    let entry = match recv_until(&mut gui_rx, Duration::from_secs(15), |m| {
+        matches!(
+            m,
+            ServerMessage::SessionCreated { .. } | ServerMessage::Error { .. }
+        )
+    })
+    .await
+    .expect("expected a SessionCreated/Error reply")
+    {
+        ServerMessage::SessionCreated { entry, .. } => entry,
+        ServerMessage::Error { message, .. } => panic!("remote create failed: {message}"),
+        _ => unreachable!(),
+    };
+
+    // The reply is attributed to the peer and addressed by a fresh local word.
+    assert_eq!(
+        entry.peer.as_deref(),
+        Some(peer_id.as_str()),
+        "a session created on a peer must be attributed to it"
+    );
+    assert!(entry.meta.name.contains("made-on-remote"));
+    let local_pane = entry.panes[0].pane_id.clone();
+    assert!(
+        local_pane.starts_with(&entry.meta.word_id),
+        "pane ID must be namespaced under the local word"
+    );
+
+    // 3. The shell really ran on the remote host: its PID file appears there.
+    let shell_pid = read_pid_file(&pidfile, Duration::from_secs(15))
+        .expect("peer-created shell must write PID");
+    cleanup.track(shell_pid);
+
+    // 4. The new session appears in the hub's merged list, attributed to its peer.
+    gui_tx
+        .send(ClientMessage::SessionList { request_id: 21 })
+        .expect("send SessionList");
+    let sessions = match recv_until(&mut gui_rx, Duration::from_secs(5), |m| {
+        matches!(m, ServerMessage::SessionListResult { .. })
+    })
+    .await
+    .expect("expected a SessionListResult")
+    {
+        ServerMessage::SessionListResult { sessions, .. } => sessions,
+        _ => unreachable!(),
+    };
+    assert!(
+        sessions
+            .iter()
+            .any(|e| e.meta.word_id == entry.meta.word_id
+                && e.peer.as_deref() == Some(peer_id.as_str())),
+        "the peer-created session must appear in the merged list, attributed to its peer"
     );
 
     // ── Teardown. ──
@@ -696,6 +835,7 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
         .send(ClientMessage::SessionCreate {
             request_id: 2,
             name: Some("local-after-death".into()),
+            peer: None,
             cwd: Some(local_dir.path().display().to_string()),
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), "exec sleep 600".into()],
@@ -931,6 +1071,7 @@ async fn federation_surfaces_upstream_auth_rejection_as_peer_error() {
         .send(ClientMessage::SessionCreate {
             request_id: 2,
             name: Some("local-after-reject".into()),
+            peer: None,
             cwd: Some(local_dir.path().display().to_string()),
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), "exec sleep 600".into()],

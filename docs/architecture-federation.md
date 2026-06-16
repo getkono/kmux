@@ -31,6 +31,20 @@ See `docs/architecture-frontend.md` for the client layering this builds on.
   - `ServerMessage::PeerOpened` / `PeerClosed` / `PeerError`
   - `PeerTarget::{Ssh { user, host, ssh_port, accept_invalid_certs }, Direct { host, port,
     token, accept_invalid_certs }}` with `peer_id()` → `"user@host[:port]"` / `"host:port"`.
+- **Peer attribution + peer-routed create, `PROTOCOL_VERSION = 26 → 27`** (the
+  launcher; see [architecture-frontend.md](architecture-frontend.md)):
+  - `SessionEntry.peer: Option<PeerId>` — machine-readable "which machine is this
+    session on", set by the daemon's `localize_entry` (it had only the decorated
+    `name @ peer` before). The launcher/sidebar group by it; `kmux ls` adds a PEER
+    column. It rides `SessionEntry`, **not** the persisted `SessionMeta`, so it
+    needs no checkpoint migration.
+  - `ClientMessage::SessionCreate.peer: Option<PeerId>` routes creation to a
+    federated peer: the hub's `PeerManager::create_remote_session` forwards the
+    `SessionCreate` upstream, draws a local `WordId` for the returned session, and
+    registers the mapping (the create-time analog of `open_peer`'s adoption). The
+    feed loop completes the request via a `pending_creates` oneshot, since it owns
+    the upstream stream. (postcard is positional, so adding a field is breaking →
+    the version bump, not just `#[serde(default)]`.)
 - **`kmuxd` federation subsystem (PR3)** — `crates/kmuxd/src/federation/` behind the
   default-on `federation` cargo feature:
   - `PeerManager` on `ServerApp` keyed by `PeerId`; `open_peer` connects upstream via

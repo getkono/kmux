@@ -126,13 +126,27 @@ pub async fn handle_message<A: PaneAttacher>(
             program,
             args,
             size,
-        } => match state
-            .app
-            .create_session(name, cwd, program, args, size, &state.capabilities)
-            .await
-        {
-            Ok(entry) => state.send(ServerMessage::SessionCreated { request_id, entry }),
-            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
+            peer,
+        } => match peer {
+            // Create on a federated peer (issue #121 launcher): the hub forwards
+            // the create upstream and registers the result under a local word,
+            // then replies SessionCreated exactly as for a local create.
+            Some(peer) => match state
+                .app
+                .create_remote_session(&peer, name, cwd, program, args, size)
+                .await
+            {
+                Ok(entry) => state.send(ServerMessage::SessionCreated { request_id, entry }),
+                Err(e) => state.error(Some(request_id), ErrorCode::InternalError, e),
+            },
+            None => match state
+                .app
+                .create_session(name, cwd, program, args, size, &state.capabilities)
+                .await
+            {
+                Ok(entry) => state.send(ServerMessage::SessionCreated { request_id, entry }),
+                Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
+            },
         },
 
         ClientMessage::SessionClose {

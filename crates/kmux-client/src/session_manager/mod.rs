@@ -511,6 +511,7 @@ mod tests {
                 focused_pane: 0,
             }],
             active_tab: 0,
+            peer: None,
         }
     }
 
@@ -717,6 +718,7 @@ mod tests {
                 })
                 .collect(),
             active_tab: 0,
+            peer: None,
         }
     }
 
@@ -1120,6 +1122,7 @@ mod tests {
             panes: vec![],
             tabs: vec![],
             active_tab: 0,
+            peer: None,
         });
         mgr.session_list.push(SessionEntry {
             meta: SessionMeta {
@@ -1131,6 +1134,7 @@ mod tests {
             panes: vec![],
             tabs: vec![],
             active_tab: 0,
+            peer: None,
         });
 
         assert_eq!(mgr.display_name_for("alpha"), "src (proj-a)");
@@ -1150,6 +1154,7 @@ mod tests {
             panes: vec![],
             tabs: vec![],
             active_tab: 0,
+            peer: None,
         });
         assert_eq!(mgr.display_name_for("eagle"), "myapp");
     }

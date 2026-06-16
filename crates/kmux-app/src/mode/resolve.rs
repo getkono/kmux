@@ -239,19 +239,6 @@ pub fn resolve_session_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Acti
     )
 }
 
-pub fn resolve_server_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
-    resolve_picker(
-        key,
-        mods,
-        Action::ServerPickerClose,
-        Action::ServerPickerSelect,
-        Action::ServerPickerUp,
-        Action::ServerPickerDown,
-        Action::ServerPickerBackspace,
-        Action::ServerPickerChar,
-    )
-}
-
 pub fn resolve_help(key: &Key) -> (Option<Mode>, Action) {
     // Any key exits help
     let _ = key;
@@ -269,6 +256,28 @@ pub fn resolve_dir_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) 
         Action::DirPickerBackspace,
         Action::DirPickerChar,
     )
+}
+
+pub fn resolve_launch_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+    resolve_picker(
+        key,
+        mods,
+        Action::LaunchClose,
+        Action::LaunchSelect,
+        Action::LaunchUp,
+        Action::LaunchDown,
+        Action::LaunchSearchBackspace,
+        Action::LaunchSearchChar,
+    )
+}
+
+/// Esc/Ctrl+C cancels a frontend-owned launcher overlay (add-remote / remote
+/// path prompt). All other input is handled by the overlay's native fields.
+pub fn resolve_launch_overlay(key: &Key) -> (Option<Mode>, Action) {
+    if matches!(key, Key::Named(NamedKey::Escape)) {
+        return (Some(Mode::Normal), Action::LaunchOverlayCancel);
+    }
+    (None, Action::None)
 }
 
 /// Esc or Ctrl+C cancels the in-progress background bootstrap.
@@ -441,17 +450,6 @@ mod tests {
         );
         assert_eq!(mode, Some(Mode::Normal));
         assert_eq!(action, Action::DirPickerCancel);
-    }
-
-    #[test]
-    fn ctrl_c_cancels_server_picker() {
-        let (mode, action) = resolve(
-            &Mode::ServerPicker,
-            &Key::Character("c".into()),
-            Modifiers::CTRL,
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-        assert_eq!(action, Action::ServerPickerClose);
     }
 
     #[test]

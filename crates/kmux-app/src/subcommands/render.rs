@@ -10,6 +10,8 @@ use crate::cli::OutputFormat;
 
 #[derive(Tabled)]
 pub struct SessionRow {
+    #[tabled(rename = "PEER")]
+    pub peer: String,
     #[tabled(rename = "NAME")]
     pub name: String,
     #[tabled(rename = "ID")]
@@ -20,16 +22,34 @@ pub struct SessionRow {
     pub panes: usize,
 }
 
+/// Build the `kmux ls` rows, grouped by peer (issue #121): local sessions first,
+/// then each federated remote (alphabetically). The federated `"name @ peer"`
+/// decoration is stripped from NAME since PEER already carries it.
 pub fn session_rows(sessions: &[SessionEntry]) -> Vec<SessionRow> {
-    sessions
+    let mut rows: Vec<SessionRow> = sessions
         .iter()
-        .map(|e| SessionRow {
-            name: e.meta.name.clone(),
-            id: e.meta.word_id.clone(),
-            cwd: e.meta.cwd.clone(),
-            panes: e.panes.len(),
+        .map(|e| {
+            let name = match &e.peer {
+                Some(p) => e
+                    .meta
+                    .name
+                    .strip_suffix(&format!(" @ {p}"))
+                    .unwrap_or(&e.meta.name)
+                    .to_string(),
+                None => e.meta.name.clone(),
+            };
+            SessionRow {
+                peer: e.peer.clone().unwrap_or_else(|| "local".to_string()),
+                name,
+                id: e.meta.word_id.clone(),
+                cwd: e.meta.cwd.clone(),
+                panes: e.panes.len(),
+            }
         })
-        .collect()
+        .collect();
+    // local (peer.is_none()) first, then remotes alphabetically by peer.
+    rows.sort_by(|a, b| (a.peer != "local", &a.peer).cmp(&(b.peer != "local", &b.peer)));
+    rows
 }
 
 // ─── Daemon sessions row (kmux daemon sessions) ───────────────────────────────
@@ -315,11 +335,41 @@ mod tests {
                 focused_pane: 0,
             }],
             active_tab: 0,
+            peer: None,
         }];
         let rows = session_rows(&sessions);
         assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].peer, "local");
         assert_eq!(rows[0].name, "dev");
         assert_eq!(rows[0].id, "eagle");
         assert_eq!(rows[0].panes, 1);
+    }
+
+    /// `kmux ls` groups by peer: local sessions first, then federated remotes in
+    /// alphabetical order, with the `" @ peer"` decoration stripped from NAME
+    /// (issue #121).
+    #[test]
+    fn session_rows_group_local_first_then_peers() {
+        let entry = |name: &str, id: &str, peer: Option<&str>| SessionEntry {
+            meta: make_meta(name, id),
+            panes: vec![],
+            tabs: vec![],
+            active_tab: 0,
+            peer: peer.map(String::from),
+        };
+        // Deliberately out of order: a remote, then a local, then another remote.
+        let sessions = vec![
+            entry("api @ bob@host", "eagle", Some("bob@host")),
+            entry("dev", "hippo", None),
+            entry("web @ alice@box", "otter", Some("alice@box")),
+        ];
+        let rows = session_rows(&sessions);
+        // local first, then alice@box, then bob@host.
+        assert_eq!(rows[0].peer, "local");
+        assert_eq!(rows[0].name, "dev");
+        assert_eq!(rows[1].peer, "alice@box");
+        assert_eq!(rows[1].name, "web", "the ' @ peer' suffix is stripped");
+        assert_eq!(rows[2].peer, "bob@host");
+        assert_eq!(rows[2].name, "api");
     }
 }

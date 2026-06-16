@@ -318,6 +318,16 @@ pub struct SessionEntry {
     /// The tab index the server restored/created as the default view. Which tab
     /// a *client* is actually viewing is client-local state.
     pub active_tab: TabIndex,
+    /// The federated peer this session is being viewed through, or `None` for a
+    /// local session. Set by the hub's `localize_entry` when it proxies a remote
+    /// peer's session list, so clients can group and attribute sessions by
+    /// machine without parsing the decorated display name. This is a per-listing,
+    /// hub-assigned attribute (not part of the immutable [`SessionMeta`], and not
+    /// persisted). `#[serde(default)]` keeps it optional in source; the
+    /// exact-match `PROTOCOL_VERSION` handshake guarantees both ends agree on the
+    /// wire shape.
+    #[serde(default)]
+    pub peer: Option<PeerId>,
 }
 
 /// Input control mode for a pane.
@@ -570,12 +580,42 @@ mod tests {
                 focused_pane: 0,
             }],
             active_tab: 0,
+            peer: None,
         };
         let bytes = postcard::to_allocvec(&entry).expect("serialize");
         let decoded: SessionEntry = postcard::from_bytes(&bytes).expect("deserialize");
         assert_eq!(decoded.tabs.len(), 1);
         assert_eq!(decoded.active_tab, 0);
         assert_eq!(decoded.tabs[0].layout, LayoutNode::single(0));
+    }
+
+    #[test]
+    fn session_entry_peer_attribution_roundtrips() {
+        // A federated entry carries its owning peer; a local entry leaves it
+        // None. Both must survive the postcard wire roundtrip (issue #121).
+        let federated = SessionEntry {
+            meta: SessionMeta {
+                index: 2,
+                word_id: "eagle".into(),
+                name: "kmux".into(),
+                cwd: "/dev/kmux".into(),
+            },
+            panes: vec![],
+            tabs: vec![],
+            active_tab: 0,
+            peer: Some("alice@box:2222".into()),
+        };
+        let bytes = postcard::to_allocvec(&federated).expect("serialize");
+        let decoded: SessionEntry = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded.peer.as_deref(), Some("alice@box:2222"));
+
+        let local = SessionEntry {
+            peer: None,
+            ..federated
+        };
+        let bytes = postcard::to_allocvec(&local).expect("serialize");
+        let decoded: SessionEntry = postcard::from_bytes(&bytes).expect("deserialize");
+        assert_eq!(decoded.peer, None);
     }
 
     #[test]

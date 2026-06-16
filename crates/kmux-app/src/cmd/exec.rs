@@ -1,6 +1,6 @@
 //! Glue between `Mode::Command` submission and the registered command bodies.
 
-use crate::core::{AppCore, SwitchTarget};
+use crate::core::AppCore;
 
 use super::parse::{ParseError, parse};
 use super::registry;
@@ -12,7 +12,6 @@ pub enum Outcome {
     Continue,
     Quit,
     Reconnect,
-    SwitchServer(SwitchTarget),
 }
 
 /// Parse `buffer` against the registry and execute it. Sets `app.mgr.status_msg`
@@ -34,7 +33,6 @@ pub fn run(app: &mut AppCore, buffer: &str) -> Outcome {
         }
         Ok(CommandSuccess::Quit) => Outcome::Quit,
         Ok(CommandSuccess::Reconnect) => Outcome::Reconnect,
-        Ok(CommandSuccess::SwitchServer(t)) => Outcome::SwitchServer(t),
         Err(msg) => {
             app.mgr
                 .set_status_msg(format!("/{}: {msg}", parsed.spec.name));

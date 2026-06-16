@@ -3,8 +3,8 @@
 use crate::core::AppCore;
 
 /// The result a command body returns. Mirrors the small set of things keys can
-/// do — most commands simply mutate `App` and return `Ok`. Quit/Reconnect/
-/// SwitchServer flow back through `KeyResult` via the [`Outcome`](super::exec::Outcome) layer.
+/// do — most commands simply mutate `App` and return `Ok`. Quit/Reconnect flow
+/// back through `KeyResult` via the [`Outcome`](super::exec::Outcome) layer.
 pub type CommandResult = Result<CommandSuccess, String>;
 
 /// A successful command may optionally bubble a control-flow signal back to
@@ -20,8 +20,6 @@ pub enum CommandSuccess {
     Quit,
     /// Force a reconnect.
     Reconnect,
-    /// Switch to another server.
-    SwitchServer(crate::core::SwitchTarget),
 }
 
 /// Function pointer signature for command bodies.

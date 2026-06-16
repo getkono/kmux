@@ -42,6 +42,11 @@ pub enum ClientMessage {
         program: Option<String>,
         args: Vec<String>,
         size: TermSize,
+        /// Which federated peer to create the session on. `None` creates on the
+        /// local daemon; `Some(peer)` routes the request upstream to that peer
+        /// (the hub forwards it and registers the result under a local word).
+        #[serde(default)]
+        peer: Option<PeerId>,
     },
 
     /// Request graceful close of an entire session (all panes).
@@ -514,6 +519,7 @@ mod tests {
                     program: None,
                     args: vec![],
                     size: TermSize::default(),
+                    peer: None,
                 },
                 MessageCategory::Control,
             ),

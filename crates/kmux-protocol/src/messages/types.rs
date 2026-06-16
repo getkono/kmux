@@ -79,7 +79,11 @@ impl TransportKind {
 /// - **26**: `PeerTarget` becomes an enum with a `Direct { host, port, token }`
 ///   TCP+TLS endpoint alongside `Ssh { .. }`, for LAN / same-host federation
 ///   without SSH (issue #121).
-pub const PROTOCOL_VERSION: u32 = 26;
+/// - **27**: federated session attribution and peer-routed creation —
+///   `SessionEntry.peer` (which machine a listed session lives on) and
+///   `ClientMessage::SessionCreate.peer` (create on a connected remote), for the
+///   unified session launcher (issue #121).
+pub const PROTOCOL_VERSION: u32 = 27;
 
 /// Wire compression algorithm negotiated for a connection.
 ///

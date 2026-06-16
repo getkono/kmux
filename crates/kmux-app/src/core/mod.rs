@@ -9,13 +9,13 @@
 //! Toolkit-specific state (color types, `Rect` hit-boxes, the clipboard
 //! channel) lives on the frontend's own struct, not here.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
 use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::session_manager::SessionManager;
 use kmux_client::ssh::RemoteTarget;
-use kmux_protocol::messages::{ClientCapabilities, PeerTarget, ServerMessage, TermSize};
+use kmux_protocol::messages::{ClientCapabilities, PeerId, PeerTarget, ServerMessage, TermSize};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::appearance::Appearance;
@@ -59,8 +59,6 @@ pub enum KeyResult {
     Quit,
     /// User submitted the Connect form; the frontend must replace `srv_rx`.
     Reconnect,
-    /// User selected a server from the server picker.
-    SwitchServer(SwitchTarget),
     /// Core requests the frontend copy this text to the system clipboard.
     /// Clipboard access is toolkit-specific, so it is performed frontend-side.
     CopyToClipboard(String),
@@ -69,21 +67,15 @@ pub enum KeyResult {
     RequestPaste,
 }
 
-/// Destination chosen from the server picker.
-#[derive(Debug)]
-pub enum SwitchTarget {
-    Local,
-    Ssh(RemoteTarget),
-}
-
 /// Action carried by a clickable top-bar segment. Frontend-neutral intent: a
 /// GUI binds these to widgets for click handling. The hit-testing geometry
 /// itself stays frontend-side.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TopBarAction {
-    OpenServerPicker,
     Reconnect,
     OpenSessionPicker,
+    /// Open the unified session launcher (issue #121): the new-session button.
+    OpenLaunchPicker,
     SelectPane(String),
     /// Affordance to spawn a new pane in the active session.
     CreatePane,
@@ -101,6 +93,79 @@ pub enum DirBrowserRow {
     Up { parent: String },
     /// Navigate into the subdirectory `path` (display name `name`).
     Enter { path: String, name: String },
+}
+
+/// Connection status of a remote in the launcher (issue #121). Drives the
+/// status indicator on a remote's row; `Error` carries the reason for inline
+/// display and keeps the failure isolated to that one remote.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RemoteStatus {
+    /// Known but not connected this session.
+    Idle,
+    /// An `OpenPeer` is in flight (expanded, awaiting `PeerOpened`).
+    Connecting,
+    /// Federated: the peer's sessions are live in the merged list.
+    Connected,
+    /// The last connect attempt failed; the string is the reason, shown inline.
+    Error(String),
+}
+
+/// One row in the unified session launcher (issue #121): a flat,
+/// frontend-renderable projection of "open or create a session, locally or on a
+/// remote". A dumb frontend renders each row and dispatches its activation; the
+/// order and contents are fixed by [`AppCore::launch_rows`].
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LaunchRow {
+    /// Open a new local session, defaulting to `default_cwd` (the focused
+    /// session's root). Activating opens the directory browser seeded there.
+    LocalNewSession { default_cwd: String },
+    /// Attach an existing local session.
+    LocalExisting {
+        word_id: String,
+        name: String,
+        cwd: String,
+        active: bool,
+    },
+    /// A remote's header/toggle row. Activating expands it (connecting on focus)
+    /// or collapses it. `status` drives the indicator; `expanded` the chevron.
+    Remote {
+        peer: PeerId,
+        label: String,
+        status: RemoteStatus,
+        expanded: bool,
+    },
+    /// Open a new session on `peer` (shown only while the remote is expanded and
+    /// connected). Activating opens a path prompt.
+    RemoteNewSession { peer: PeerId },
+    /// Attach an existing session on `peer` (shown only while expanded).
+    RemoteExisting {
+        peer: PeerId,
+        word_id: String,
+        name: String,
+        cwd: String,
+        active: bool,
+    },
+    /// Affordance to add a new remote (SSH or Direct). Always the last row.
+    AddRemote,
+}
+
+/// Values collected by the add-remote form (issue #121). The frontend owns the
+/// native input widgets and hands a completed form to
+/// [`AppCore::submit_add_remote`].
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AddRemoteForm {
+    /// `true` for an SSH remote (the default), `false` for a `Direct` TCP+TLS one.
+    pub use_ssh: bool,
+    /// Hostname / IP / SSH alias. Required.
+    pub host: String,
+    /// SSH user; empty means "default user" (SSH only).
+    pub user: String,
+    /// SSH port override, or the `Direct` TCP+TLS port (required for `Direct`).
+    pub port: Option<u16>,
+    /// Shared token for a `Direct` peer (required; never persisted to disk).
+    pub token: String,
+    /// Accept a self-signed / unpinned server certificate.
+    pub accept_invalid_certs: bool,
 }
 
 /// Why the connection is paused, surfaced to frontends for a status indicator
@@ -211,10 +276,6 @@ pub struct AppCore {
     /// Connection kind for the current server (used for reconnect routing).
     pub server_kind: ServerKind,
 
-    // Server picker state.
-    pub server_picker_selected: usize,
-    pub server_picker_search: String,
-
     /// Persisted recent-servers cache.
     pub recent_servers: RecentServersCache,
 
@@ -250,6 +311,25 @@ pub struct AppCore {
     /// Most-recently-submitted command-palette buffers (oldest first), capped
     /// at [`COMMAND_HISTORY_CAP`].
     pub command_history: VecDeque<String>,
+
+    // ──── Unified session launcher (issue #121) ────
+    /// Highlighted row in the launcher (index into [`AppCore::launch_rows`]).
+    pub launch_selected: usize,
+    /// Launcher filter text (matches local/remote session names + remote hosts).
+    pub launch_search: String,
+    /// Remotes whose section is expanded — expanding connects on focus, so this
+    /// is also "the remotes the user has focused this session".
+    pub launch_expanded: HashSet<PeerId>,
+    /// Per-remote connection status, keyed by [`PeerId`]. Drives each remote
+    /// row's indicator; a failed connect lands here (isolated) instead of
+    /// tearing down the whole UI.
+    pub peer_status: HashMap<PeerId, RemoteStatus>,
+    /// In-session remote registry: the [`PeerTarget`] used to (re)connect each
+    /// known remote, keyed by [`PeerId`]. Seeded from recents (SSH) and the CLI
+    /// `--server` peer, extended by the add-remote form (incl. `Direct`, whose
+    /// token lives only here). The source of truth for connect and for
+    /// re-federation after a reconnect.
+    pub peer_targets: HashMap<PeerId, PeerTarget>,
 }
 
 impl AppCore {
@@ -335,6 +415,24 @@ impl AppCore {
         // Seed the initial size so the first Attach carries real dimensions.
         mgr.update_term_size(term_size);
 
+        // Seed the launcher's remote registry from remembered servers (SSH only)
+        // plus the CLI `--server` peer, so known remotes appear and a reconnect
+        // can re-federate them. The `--server` peer starts expanded (it is the
+        // server the user explicitly asked for).
+        let recent_servers = RecentServersCache::load();
+        let mut peer_targets: HashMap<PeerId, PeerTarget> = HashMap::new();
+        for srv in recent_servers.servers() {
+            if let (Some(id), Some(target)) = (srv.kind.peer_id(), srv.kind.to_peer_target(false)) {
+                peer_targets.entry(id).or_insert(target);
+            }
+        }
+        let mut launch_expanded: HashSet<PeerId> = HashSet::new();
+        if let Some(target) = &desired_peer {
+            let id = target.peer_id();
+            peer_targets.insert(id.clone(), target.clone());
+            launch_expanded.insert(id);
+        }
+
         Self {
             mgr,
             palette: theme,
@@ -369,9 +467,7 @@ impl AppCore {
             server_display,
             server_string,
             server_kind,
-            server_picker_selected: 0,
-            server_picker_search: String::new(),
-            recent_servers: RecentServersCache::load(),
+            recent_servers,
             needs_render: true,
             force_clear: false,
             cancel_tx: None,
@@ -382,6 +478,11 @@ impl AppCore {
             pending_target: Some(bootstrap_target),
             last_exit_error: None,
             command_history: VecDeque::new(),
+            launch_selected: 0,
+            launch_search: String::new(),
+            launch_expanded,
+            peer_status: HashMap::new(),
+            peer_targets,
         }
     }
 
@@ -522,8 +623,6 @@ impl AppCore {
             server_display: String::new(),
             server_string: String::new(),
             server_kind: ServerKind::Local,
-            server_picker_selected: 0,
-            server_picker_search: String::new(),
             recent_servers: RecentServersCache::load(),
             needs_render: true,
             force_clear: false,
@@ -535,6 +634,11 @@ impl AppCore {
             pending_target: None,
             last_exit_error: None,
             command_history: VecDeque::new(),
+            launch_selected: 0,
+            launch_search: String::new(),
+            launch_expanded: HashSet::new(),
+            peer_status: HashMap::new(),
+            peer_targets: HashMap::new(),
         }
     }
 }

@@ -1,6 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use kmux_protocol::messages::SessionEntry;
+use kmux_protocol::messages::{PeerId, PeerTarget, SessionEntry};
 use serde::{Deserialize, Serialize};
 
 const MAX_SERVERS: usize = 10;
@@ -20,6 +20,37 @@ pub enum ServerKind {
         host: String,
         ssh_port: Option<u16>,
     },
+}
+
+impl ServerKind {
+    /// Build the [`PeerTarget`] used to federate this server through the local
+    /// hub, or `None` for the local daemon (which is the hub, never federated).
+    ///
+    /// `Direct` (LAN/token) peers are intentionally not persisted here — their
+    /// shared token must not sit in plaintext on disk — so they live only in the
+    /// in-session remote registry and are re-added via the add-remote form.
+    pub fn to_peer_target(&self, accept_invalid_certs: bool) -> Option<PeerTarget> {
+        match self {
+            ServerKind::Local => None,
+            ServerKind::Ssh {
+                user,
+                host,
+                ssh_port,
+            } => Some(PeerTarget::Ssh {
+                user: user.clone(),
+                host: host.clone(),
+                ssh_port: *ssh_port,
+                accept_invalid_certs,
+            }),
+        }
+    }
+
+    /// The stable [`PeerId`] of this server (matching [`PeerTarget::peer_id`]),
+    /// or `None` for the local daemon. Lets the launcher correlate a remembered
+    /// server with a live federated peer.
+    pub fn peer_id(&self) -> Option<PeerId> {
+        self.to_peer_target(false).as_ref().map(PeerTarget::peer_id)
+    }
 }
 
 /// A single session snapshot cached from a previous connection.
@@ -154,5 +185,41 @@ impl RecentServersCache {
     /// Read-only access to the cached server list.
     pub fn servers(&self) -> &[RecentServer] {
         &self.servers
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_server_kind_round_trips_to_peer_target_and_id() {
+        let kind = ServerKind::Ssh {
+            user: Some("alice".into()),
+            host: "box".into(),
+            ssh_port: Some(2222),
+        };
+        match kind.to_peer_target(true) {
+            Some(PeerTarget::Ssh {
+                user,
+                host,
+                ssh_port,
+                accept_invalid_certs,
+            }) => {
+                assert_eq!(user.as_deref(), Some("alice"));
+                assert_eq!(host, "box");
+                assert_eq!(ssh_port, Some(2222));
+                assert!(accept_invalid_certs);
+            }
+            other => panic!("expected an Ssh PeerTarget, got {other:?}"),
+        }
+        // peer_id matches PeerTarget::peer_id and is independent of cert policy.
+        assert_eq!(kind.peer_id(), Some("alice@box:2222".to_string()));
+    }
+
+    #[test]
+    fn local_server_kind_has_no_peer_target() {
+        assert!(ServerKind::Local.to_peer_target(false).is_none());
+        assert!(ServerKind::Local.peer_id().is_none());
     }
 }

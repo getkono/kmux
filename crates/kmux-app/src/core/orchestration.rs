@@ -11,7 +11,7 @@ use kmux_client::session_manager::SessionEvent;
 use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
 #[cfg(feature = "remote")]
 use kmux_client::transport::TransportKind;
-use kmux_protocol::messages::{PeerTarget, ServerMessage, SessionEntry};
+use kmux_protocol::messages::{PeerId, PeerTarget, ServerMessage, SessionEntry};
 #[cfg(feature = "remote")]
 use kmux_protocol::transport::bootstrap::EndpointAdvert;
 use std::time::Instant;
@@ -20,11 +20,11 @@ use tracing::{info, warn};
 
 use base64::Engine;
 
-use super::DirBrowserRow;
+use super::{AddRemoteForm, DirBrowserRow, LaunchRow, RemoteStatus};
 use crate::mode::Mode;
-use crate::recent_servers::{RecentServer, ServerKind};
+use crate::recent_servers::ServerKind;
 
-use super::{AppCore, KeyResult, SwitchTarget};
+use super::{AppCore, KeyResult};
 
 #[derive(Debug)]
 pub enum BootstrapPhase {
@@ -129,22 +129,35 @@ impl AppCore {
                 }
                 SessionEvent::PeerOpened { peer } => {
                     // The remote is now federated through the local daemon (issue
-                    // #121). Re-arm auto-select and refresh the list so the
-                    // remote's sessions — not the pre-federation local list —
-                    // drive the picker.
+                    // #121). Mark it connected, re-arm auto-select, and refresh the
+                    // list so the remote's sessions — not the pre-federation local
+                    // list — drive the picker.
                     info!(%peer, "federated peer opened");
+                    self.peer_status.insert(peer, RemoteStatus::Connected);
                     if matches!(self.mode, Mode::Connecting { .. }) {
                         self.mode = Mode::Normal;
                     }
                     self.did_auto_select = false;
                     self.mgr.request_session_list();
                 }
-                SessionEvent::PeerError { reason } => {
-                    // The server the user asked for is unreachable (SSH/auth/
-                    // connect failure on the daemon's upstream). Surface it like
-                    // a failed connect; reconnect re-runs the local link + OpenPeer.
-                    warn!(%reason, "federated peer failed to open");
-                    self.enter_disconnected(DisconnectReason::BootstrapFailed(reason));
+                SessionEvent::PeerError { peer, reason } => {
+                    warn!(?peer, %reason, "federated peer failed to open");
+                    // Isolate a launcher-initiated failure to its remote (the row
+                    // shows the error). Only the CLI `--server` peer failing during
+                    // the initial bootstrap still surfaces as a global disconnect —
+                    // there is no other server to fall back to. A failure the daemon
+                    // could not attribute (peer: None) also disconnects globally.
+                    let bootstrapping = matches!(self.mode, Mode::Connecting { .. });
+                    let is_desired = matches!(
+                        (&peer, &self.desired_peer),
+                        (Some(p), Some(t)) if *p == t.peer_id()
+                    );
+                    match peer {
+                        Some(p) if !(bootstrapping && is_desired) => {
+                            self.peer_status.insert(p, RemoteStatus::Error(reason));
+                        }
+                        _ => self.enter_disconnected(DisconnectReason::BootstrapFailed(reason)),
+                    }
                 }
                 _ => {}
             }
@@ -197,21 +210,6 @@ impl AppCore {
             self.session_picker_search.clear();
             self.mode = Mode::SessionPicker;
         }
-    }
-
-    /// Returns recent servers filtered by the current `server_picker_search` text.
-    pub fn filtered_servers(&self) -> Vec<RecentServer> {
-        let lower = self.server_picker_search.to_lowercase();
-        self.recent_servers
-            .servers()
-            .iter()
-            .filter(|s| {
-                lower.is_empty()
-                    || s.display.to_lowercase().contains(&lower)
-                    || s.server_string.to_lowercase().contains(&lower)
-            })
-            .cloned()
-            .collect()
     }
 
     /// The directory browser's rows for the current listing + filter, in render
@@ -296,13 +294,100 @@ impl AppCore {
     }
 
     /// The active session's server-side cwd, if a session is active.
-    fn active_session_cwd(&self) -> Option<String> {
+    pub(super) fn active_session_cwd(&self) -> Option<String> {
         let word_id = self.mgr.active_session()?;
         self.mgr
             .session_list()
             .iter()
             .find(|e| e.meta.word_id == word_id)
             .map(|e| e.meta.cwd.clone())
+    }
+
+    /// Build the unified launcher's rows (issue #121): a flat, filtered
+    /// projection of "open or create a session, locally or on a remote". Order:
+    /// local-new, local sessions, then each known remote's toggle row (and, when
+    /// expanded + connected, its new-session row and its sessions), then
+    /// "Add remote…". A dumb frontend renders this list as-is.
+    pub fn launch_rows(&self) -> Vec<LaunchRow> {
+        let q = self.launch_search.to_lowercase();
+        let matches = |s: &str| q.is_empty() || s.to_lowercase().contains(&q);
+        let active = self.mgr.active_session().map(|s| s.to_string());
+        let is_active = |word_id: &str| active.as_deref() == Some(word_id);
+
+        let mut rows = Vec::new();
+
+        // 1. New local session, seeded at the focused session's cwd.
+        rows.push(LaunchRow::LocalNewSession {
+            default_cwd: self
+                .active_session_cwd()
+                .unwrap_or_else(|| self.initial_cwd.clone()),
+        });
+
+        // 2. Existing local sessions (no peer attribution).
+        for e in self.mgr.session_list().iter().filter(|e| e.peer.is_none()) {
+            if matches(&e.meta.name) || matches(&e.meta.cwd) {
+                rows.push(LaunchRow::LocalExisting {
+                    word_id: e.meta.word_id.clone(),
+                    name: e.meta.name.clone(),
+                    cwd: e.meta.cwd.clone(),
+                    active: is_active(&e.meta.word_id),
+                });
+            }
+        }
+
+        // 3. Remotes, in a stable order. Expanding connects on focus; a connected
+        //    remote offers a new-session row and lists its sessions.
+        let mut peer_ids: Vec<&PeerId> = self.peer_targets.keys().collect();
+        peer_ids.sort();
+        for peer in peer_ids {
+            let status = self
+                .peer_status
+                .get(peer)
+                .cloned()
+                .unwrap_or(RemoteStatus::Idle);
+            let expanded = self.launch_expanded.contains(peer);
+            // A collapsed remote is hidden by a non-matching search; an expanded
+            // one always shows so the user can still collapse it.
+            if matches(peer) || expanded {
+                rows.push(LaunchRow::Remote {
+                    peer: peer.clone(),
+                    label: peer.clone(),
+                    status: status.clone(),
+                    expanded,
+                });
+            }
+            if expanded && status == RemoteStatus::Connected {
+                rows.push(LaunchRow::RemoteNewSession { peer: peer.clone() });
+                for e in self
+                    .mgr
+                    .session_list()
+                    .iter()
+                    .filter(|e| e.peer.as_deref() == Some(peer.as_str()))
+                {
+                    // The hub decorates federated names as "name @ peer"; strip
+                    // the decoration since the row already sits under the remote.
+                    let name = e
+                        .meta
+                        .name
+                        .strip_suffix(&format!(" @ {peer}"))
+                        .unwrap_or(&e.meta.name)
+                        .to_string();
+                    if matches(&name) || matches(&e.meta.cwd) {
+                        rows.push(LaunchRow::RemoteExisting {
+                            peer: peer.clone(),
+                            word_id: e.meta.word_id.clone(),
+                            name,
+                            cwd: e.meta.cwd.clone(),
+                            active: is_active(&e.meta.word_id),
+                        });
+                    }
+                }
+            }
+        }
+
+        // 4. Add a new remote.
+        rows.push(LaunchRow::AddRemote);
+        rows
     }
 
     /// Returns sessions matching the current `session_picker_search` text
@@ -511,66 +596,148 @@ impl AppCore {
         ResolvedTarget::LocalDaemon
     }
 
-    /// After a successful local (re)connect, ask the daemon to federate the
-    /// desired remote peer, if any. Idempotent on the daemon, so re-issuing
-    /// after a reconnect simply re-federates.
+    /// After a successful local (re)connect, ask the daemon to (re-)federate
+    /// every remote the user has connected this session, plus the CLI
+    /// `--server` peer on first connect (issue #121). Idempotent on the daemon,
+    /// so re-issuing after a reconnect simply re-federates them all — not just
+    /// one. Remembered-but-unconnected remotes (status `Idle`) are left alone.
     pub fn federate_desired_peer(&mut self) {
-        if let Some(target) = self.desired_peer.clone() {
-            info!(peer = %target.peer_id(), "federating remote peer via local daemon");
+        let mut opened: std::collections::HashSet<PeerId> = std::collections::HashSet::new();
+        let reconnect: Vec<(PeerId, PeerTarget)> = self
+            .peer_targets
+            .iter()
+            .filter(|(id, _)| {
+                matches!(
+                    self.peer_status.get(*id),
+                    Some(RemoteStatus::Connected | RemoteStatus::Connecting)
+                )
+            })
+            .map(|(id, t)| (id.clone(), t.clone()))
+            .collect();
+        for (id, target) in reconnect {
+            info!(peer = %id, "re-federating connected peer");
             self.mgr.open_peer(target);
+            opened.insert(id);
+        }
+        if let Some(target) = self.desired_peer.clone() {
+            let id = target.peer_id();
+            if opened.insert(id.clone()) {
+                info!(peer = %id, "federating desired peer via local daemon");
+                self.peer_status.insert(id, RemoteStatus::Connecting);
+                self.mgr.open_peer(target);
+            }
         }
     }
 
-    /// Apply the state change for switching to a server chosen from the server
-    /// picker, returning the [`ResolvedTarget`] the frontend should bootstrap.
-    ///
-    /// This is the shared half of `KeyResult::SwitchServer` handling — the
-    /// server identity, ssh target, auto-select reset, and disconnect of the
-    /// old connection. The frontend owns the toolkit-coupled remainder (replace
-    /// the server-message channel, then `start_bootstrap` with the returned
-    /// target) so every frontend's run loop drives it identically.
-    pub fn prepare_switch(&mut self, target: &SwitchTarget) -> ResolvedTarget {
-        self.mgr.disconnect();
-        // Every switch re-bootstraps the **local** daemon (issue #121). A remote
-        // server is conveyed via `desired_peer` and federated with `OpenPeer`
-        // after the local link is back up.
-        match target {
-            SwitchTarget::Local => {
-                self.did_auto_select = false;
-                self.is_local = true;
-                self.ssh_target = None;
-                self.desired_peer = None;
-                self.server_display = "localhost".to_string();
-                self.server_string = String::new();
-                self.server_kind = ServerKind::Local;
-                ResolvedTarget::LocalDaemon
-            }
-            SwitchTarget::Ssh(target) => {
-                let display = match &target.user {
-                    Some(u) => format!("{}@{}", u, target.host),
-                    None => target.host.clone(),
-                };
-                self.server_display = display.clone();
-                self.server_string = display;
-                self.server_kind = ServerKind::Ssh {
-                    user: target.user.clone(),
-                    host: target.host.clone(),
-                    ssh_port: target.ssh_port,
-                };
-                self.is_local = false;
-                self.ssh_target = Some(target.clone());
-                self.desired_peer = Some(PeerTarget::Ssh {
-                    user: target.user.clone(),
-                    host: target.host.clone(),
-                    ssh_port: target.ssh_port,
-                    accept_invalid_certs: self.mgr.accept_invalid_certs(),
-                });
-                // Suppress auto-select on the pre-federation (local) list; it is
-                // re-armed when `PeerOpened` arrives with the remote's sessions.
-                self.did_auto_select = true;
-                ResolvedTarget::LocalDaemon
-            }
+    /// Expand a remote section, connecting to it on focus (issue #121). Looks up
+    /// the peer's target in the in-session registry and federates it through the
+    /// local daemon; `PeerOpened`/`PeerError` later updates its status. A no-op
+    /// for an already-connected remote (it just stays expanded).
+    pub fn expand_remote(&mut self, peer: PeerId) {
+        self.launch_expanded.insert(peer.clone());
+        if self.peer_status.get(&peer) == Some(&RemoteStatus::Connected) {
+            return;
         }
+        let Some(target) = self.peer_targets.get(&peer).cloned() else {
+            self.peer_status
+                .insert(peer, RemoteStatus::Error("unknown remote".into()));
+            return;
+        };
+        self.peer_status.insert(peer, RemoteStatus::Connecting);
+        self.mgr.open_peer(target);
+    }
+
+    /// Collapse a remote section (issue #121). To honor connect-on-focus without
+    /// killing a remote you are actively using, the upstream link is dropped only
+    /// when the active session does not belong to that peer; otherwise it stays
+    /// connected (drop it explicitly via disconnect).
+    pub fn collapse_remote(&mut self, peer: &str) {
+        self.launch_expanded.remove(peer);
+        let active = self.mgr.active_session().map(|s| s.to_string());
+        let in_use = self.mgr.session_list().iter().any(|e| {
+            e.peer.as_deref() == Some(peer) && active.as_deref() == Some(e.meta.word_id.as_str())
+        });
+        if !in_use {
+            self.mgr.close_peer(peer.to_string());
+            self.peer_status
+                .insert(peer.to_string(), RemoteStatus::Idle);
+        }
+    }
+
+    /// Explicitly disconnect a remote (issue #121): drop its upstream link and
+    /// forget its status, regardless of whether a session of it is in use.
+    pub fn disconnect_remote(&mut self, peer: &str) {
+        self.launch_expanded.remove(peer);
+        self.mgr.close_peer(peer.to_string());
+        self.peer_status
+            .insert(peer.to_string(), RemoteStatus::Idle);
+    }
+
+    /// Build a [`PeerTarget`] from the add-remote form, register it in the
+    /// in-session remote list, remember it (SSH only — `Direct` tokens are never
+    /// written to disk), and connect to it (issue #121). Returns an error string
+    /// for the frontend to surface when the form is incomplete.
+    pub fn submit_add_remote(&mut self, form: AddRemoteForm) -> Result<(), String> {
+        let host = form.host.trim();
+        if host.is_empty() {
+            return Err("host is required".into());
+        }
+        let target = if form.use_ssh {
+            PeerTarget::Ssh {
+                user: (!form.user.trim().is_empty()).then(|| form.user.trim().to_string()),
+                host: host.to_string(),
+                ssh_port: form.port,
+                accept_invalid_certs: form.accept_invalid_certs,
+            }
+        } else {
+            let port = form
+                .port
+                .ok_or_else(|| "port is required for a direct connection".to_string())?;
+            if form.token.is_empty() {
+                return Err("token is required for a direct connection".into());
+            }
+            PeerTarget::Direct {
+                host: host.to_string(),
+                port,
+                token: form.token,
+                accept_invalid_certs: form.accept_invalid_certs,
+            }
+        };
+        let peer = target.peer_id();
+        self.peer_targets.insert(peer.clone(), target);
+        self.record_peer_in_recents(&peer);
+        self.mode = Mode::Normal;
+        self.expand_remote(peer);
+        Ok(())
+    }
+
+    /// Create a new session on a federated `peer` at `cwd` (issue #121). An empty
+    /// `cwd` lets the remote daemon resolve a default. Closes the prompt.
+    pub fn submit_remote_new_session(&mut self, peer: PeerId, cwd: String) {
+        let cwd = cwd.trim();
+        let cwd_opt = (!cwd.is_empty()).then_some(cwd);
+        self.mgr
+            .create_session_on_peer(None, cwd_opt, peer, self.term_size);
+        self.mode = Mode::Normal;
+    }
+
+    /// Persist an SSH peer in the recent-servers list so it reappears next
+    /// session. `Direct` peers are skipped — their token must not hit disk.
+    fn record_peer_in_recents(&mut self, peer: &str) {
+        let kind = match self.peer_targets.get(peer) {
+            Some(PeerTarget::Ssh {
+                user,
+                host,
+                ssh_port,
+                ..
+            }) => ServerKind::Ssh {
+                user: user.clone(),
+                host: host.clone(),
+                ssh_port: *ssh_port,
+            },
+            _ => return,
+        };
+        self.recent_servers.record_connection(peer, peer, kind);
     }
 
     /// Transition to `Mode::Disconnected`, record the reason in the session
@@ -626,7 +793,6 @@ fn join_path(base: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use kmux_client::session_manager::SessionManager;
-    use kmux_client::ssh::RemoteTarget;
     use kmux_protocol::messages::ClientCapabilities;
 
     fn fixture_core() -> AppCore {
@@ -641,92 +807,16 @@ mod tests {
     }
 
     #[test]
-    fn prepare_switch_local_resets_identity_to_localhost() {
-        let mut core = fixture_core();
-        // Pretend we were connected to a remote server.
-        core.is_local = false;
-        core.ssh_target = Some(RemoteTarget {
-            user: Some("u".into()),
-            host: "h".into(),
-            ssh_port: None,
-        });
-        core.desired_peer = Some(PeerTarget::Ssh {
-            user: Some("u".into()),
-            host: "h".into(),
-            ssh_port: None,
-            accept_invalid_certs: true,
-        });
-        core.server_display = "u@h".into();
-        core.server_string = "u@h".into();
-        core.did_auto_select = true;
-
-        let resolved = core.prepare_switch(&SwitchTarget::Local);
-
-        assert!(matches!(resolved, ResolvedTarget::LocalDaemon));
-        assert!(core.is_local);
-        assert!(core.ssh_target.is_none());
-        assert!(
-            core.desired_peer.is_none(),
-            "switching local drops the peer"
-        );
-        assert_eq!(core.server_display, "localhost");
-        assert!(core.server_string.is_empty());
-        assert!(matches!(core.server_kind, ServerKind::Local));
-        assert!(!core.did_auto_select, "auto-select must reset on switch");
-    }
-
-    #[test]
-    fn prepare_switch_ssh_federates_through_local_daemon() {
-        let mut core = fixture_core();
-        let target = RemoteTarget {
-            user: Some("alice".into()),
-            host: "example.com".into(),
-            ssh_port: Some(2222),
-        };
-
-        let resolved = core.prepare_switch(&SwitchTarget::Ssh(target));
-
-        // Issue #121: the GUI always bootstraps the local daemon; the remote is
-        // federated via `desired_peer` + `OpenPeer`, not a direct GUI dial-out.
-        assert!(
-            matches!(resolved, ResolvedTarget::LocalDaemon),
-            "switching to a remote server must still bootstrap the local daemon",
-        );
-        match &core.desired_peer {
-            Some(PeerTarget::Ssh {
-                user,
-                host,
-                ssh_port,
-                ..
-            }) => {
-                assert_eq!(host, "example.com");
-                assert_eq!(user.as_deref(), Some("alice"));
-                assert_eq!(*ssh_port, Some(2222));
-            }
-            other => panic!("expected desired_peer = Ssh, got {other:?}"),
-        }
-        // Identity still reflects the remote server (drives the UI + auto-select).
-        assert!(!core.is_local);
-        assert_eq!(core.server_display, "alice@example.com");
-        assert_eq!(core.server_string, "alice@example.com");
-        assert!(core.ssh_target.is_some());
-        assert!(matches!(core.server_kind, ServerKind::Ssh { .. }));
-        // Auto-select is suppressed until the federated session list arrives.
-        assert!(
-            core.did_auto_select,
-            "auto-select must be suppressed until PeerOpened",
-        );
-    }
-
-    #[test]
     fn current_target_is_always_local_even_with_a_desired_peer() {
         let mut core = fixture_core();
-        core.prepare_switch(&SwitchTarget::Ssh(RemoteTarget {
+        // A federated remote lives in `desired_peer`; the GUI's own transport
+        // stays UDS-local regardless (issue #121).
+        core.desired_peer = Some(PeerTarget::Ssh {
             user: None,
             host: "box".into(),
             ssh_port: None,
-        }));
-        assert!(core.desired_peer.is_some());
+            accept_invalid_certs: true,
+        });
         assert!(
             matches!(core.current_target(), ResolvedTarget::LocalDaemon),
             "the GUI's transport is always UDS-local (issue #121)",
@@ -801,9 +891,108 @@ mod tests {
     }
 
     #[test]
-    fn peer_error_surfaces_as_a_disconnect() {
+    fn attributed_peer_error_isolates_to_the_remote() {
         let mut core = fixture_core();
+        // Not bootstrapping (mode is Normal): a launcher-initiated failure marks
+        // only that remote, leaving the rest of the UI alone.
         core.handle_session_events(vec![SessionEvent::PeerError {
+            peer: Some("alice@box".into()),
+            reason: "ssh: connect timeout".into(),
+        }]);
+        assert!(
+            !matches!(core.mode, Mode::Disconnected { .. }),
+            "an attributed failure must not disconnect the whole client"
+        );
+        assert_eq!(
+            core.peer_status.get("alice@box"),
+            Some(&RemoteStatus::Error("ssh: connect timeout".into()))
+        );
+    }
+
+    #[test]
+    fn expand_remote_connects_and_marks_connecting() {
+        let (mut core, mut rx) = connected_core();
+        core.peer_targets.insert(
+            "alice@box".into(),
+            PeerTarget::Ssh {
+                user: Some("alice".into()),
+                host: "box".into(),
+                ssh_port: None,
+                accept_invalid_certs: false,
+            },
+        );
+
+        core.expand_remote("alice@box".into());
+
+        assert!(core.launch_expanded.contains("alice@box"));
+        assert_eq!(
+            core.peer_status.get("alice@box"),
+            Some(&RemoteStatus::Connecting)
+        );
+        let mut saw_open = false;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg, ClientMessage::OpenPeer { .. }) {
+                saw_open = true;
+            }
+        }
+        assert!(saw_open, "expand_remote must federate via OpenPeer");
+    }
+
+    // Async: submit_add_remote persists the SSH remote via record_connection,
+    // whose save() spawns a blocking task that needs a runtime.
+    #[tokio::test]
+    async fn add_remote_ssh_registers_records_and_connects() {
+        let (mut core, mut rx) = connected_core();
+        core.submit_add_remote(AddRemoteForm {
+            use_ssh: true,
+            host: "box".into(),
+            user: "alice".into(),
+            port: Some(2222),
+            token: String::new(),
+            accept_invalid_certs: false,
+        })
+        .expect("a complete SSH form is valid");
+
+        assert!(core.peer_targets.contains_key("alice@box:2222"));
+        assert_eq!(
+            core.peer_status.get("alice@box:2222"),
+            Some(&RemoteStatus::Connecting)
+        );
+        assert_eq!(core.mode, Mode::Normal);
+        let mut saw_open = false;
+        while let Ok(msg) = rx.try_recv() {
+            if matches!(msg, ClientMessage::OpenPeer { .. }) {
+                saw_open = true;
+            }
+        }
+        assert!(saw_open, "adding a remote must connect to it");
+    }
+
+    #[test]
+    fn add_remote_direct_requires_port() {
+        let mut core = fixture_core();
+        let err = core
+            .submit_add_remote(AddRemoteForm {
+                use_ssh: false,
+                host: "10.0.0.5".into(),
+                user: String::new(),
+                port: None,
+                token: "tok".into(),
+                accept_invalid_certs: true,
+            })
+            .expect_err("a Direct remote without a port must be rejected");
+        assert!(
+            err.contains("port"),
+            "error should mention the missing port"
+        );
+    }
+
+    #[test]
+    fn unattributed_peer_error_surfaces_as_a_global_disconnect() {
+        let mut core = fixture_core();
+        // No peer attribution ⇒ the legacy global disconnect.
+        core.handle_session_events(vec![SessionEvent::PeerError {
+            peer: None,
             reason: "no route to host".into(),
         }]);
         match &core.mode {
@@ -900,6 +1089,7 @@ mod tests {
                 focused_pane: 0,
             }],
             active_tab: 0,
+            peer: None,
         }
     }
 
@@ -1114,6 +1304,85 @@ mod tests {
             ClientMessage::ListDirectory { path, .. } => assert_eq!(path, "/var/log"),
             other => panic!("expected ListDirectory, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn create_session_action_uses_active_session_cwd() {
+        let (mut core, mut rx) = connected_core();
+        core.initial_cwd = "/fallback".into();
+        core.mgr
+            .session_list
+            .push(entry("eagle", "/home/user/proj"));
+        core.mgr.select_session("eagle".into());
+        while rx.try_recv().is_ok() {}
+
+        core.dispatch_action(Action::CreateSession).await;
+
+        match rx.try_recv().expect("a session create was sent") {
+            ClientMessage::SessionCreate { cwd, .. } => {
+                assert_eq!(cwd.as_deref(), Some("/home/user/proj"));
+            }
+            other => panic!("expected SessionCreate, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn create_session_action_falls_back_to_initial_cwd() {
+        let (mut core, mut rx) = connected_core();
+        core.initial_cwd = "/fallback".into();
+        while rx.try_recv().is_ok() {}
+
+        // No active session: the action must still carry an explicit cwd rather
+        // than letting the daemon resolve a bare path against its own cwd.
+        core.dispatch_action(Action::CreateSession).await;
+
+        match rx.try_recv().expect("a session create was sent") {
+            ClientMessage::SessionCreate { cwd, .. } => {
+                assert_eq!(cwd.as_deref(), Some("/fallback"));
+            }
+            other => panic!("expected SessionCreate, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn launch_rows_lists_local_then_collapsed_remote_then_add() {
+        let (mut core, _rx) = connected_core();
+        core.initial_cwd = "/fallback".into();
+        core.mgr
+            .session_list
+            .push(entry("eagle", "/home/user/proj"));
+        core.peer_targets.insert(
+            "alice@box".into(),
+            PeerTarget::Ssh {
+                user: Some("alice".into()),
+                host: "box".into(),
+                ssh_port: None,
+                accept_invalid_certs: false,
+            },
+        );
+
+        let rows = core.launch_rows();
+
+        // Row 0: new local session, seeded at the focused cwd (no active session
+        // ⇒ initial_cwd).
+        assert!(matches!(
+            &rows[0],
+            LaunchRow::LocalNewSession { default_cwd } if default_cwd == "/fallback"
+        ));
+        // The local session is listed.
+        assert!(
+            rows.iter().any(
+                |r| matches!(r, LaunchRow::LocalExisting { word_id, .. } if word_id == "eagle")
+            )
+        );
+        // The known remote appears collapsed (a toggle row; its sessions are
+        // hidden until it is expanded + connected).
+        assert!(rows.iter().any(|r| matches!(
+            r,
+            LaunchRow::Remote { peer, expanded: false, .. } if peer == "alice@box"
+        )));
+        // Add-remote is always the last row.
+        assert!(matches!(rows.last(), Some(LaunchRow::AddRemote)));
     }
 
     #[test]

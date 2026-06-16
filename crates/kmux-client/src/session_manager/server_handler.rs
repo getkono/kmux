@@ -54,9 +54,13 @@ pub enum SessionEvent {
     /// surface, then (re)run auto-select.
     PeerOpened { peer: String },
     /// Opening a federated peer failed (SSH/connect/auth error on the daemon's
-    /// upstream link). The app surfaces this to the user (e.g. a disconnect
-    /// overlay), since the remote server the user asked for is unreachable.
-    PeerError { reason: String },
+    /// upstream link). `peer` is the target's [`PeerId`](kmux_protocol::messages::PeerId)
+    /// when the daemon could attribute the failure, so the launcher can mark just
+    /// that remote as errored instead of tearing down the whole UI.
+    PeerError {
+        peer: Option<String>,
+        reason: String,
+    },
 }
 
 impl SessionManager {
@@ -675,8 +679,8 @@ impl SessionManager {
             ServerMessage::PeerOpened { peer, .. } => {
                 events.push(SessionEvent::PeerOpened { peer });
             }
-            ServerMessage::PeerError { reason, .. } => {
-                events.push(SessionEvent::PeerError { reason });
+            ServerMessage::PeerError { peer, reason, .. } => {
+                events.push(SessionEvent::PeerError { peer, reason });
             }
             // A close ack needs no app-level reconciliation (the peer's sessions
             // simply stop appearing in the next `SessionList`).

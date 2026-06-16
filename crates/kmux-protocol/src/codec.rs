@@ -237,6 +237,7 @@ mod tests {
                 pixel_width: 0,
                 pixel_height: 0,
             },
+            peer: None,
         };
         let bytes = encode_client(&msg).expect("encode");
         let decoded = decode_client(&bytes).expect("decode");
@@ -244,6 +245,29 @@ mod tests {
             matches!(&decoded, ClientMessage::SessionCreate { request_id: 42, name, .. }
                 if name.as_deref() == Some("my-session"))
         );
+    }
+
+    #[test]
+    fn roundtrip_client_session_create_on_peer() {
+        // The peer target must survive the postcard wire roundtrip so the hub
+        // can route the create to a federated remote (issue #121).
+        let msg = ClientMessage::SessionCreate {
+            request_id: 7,
+            name: None,
+            cwd: Some("/srv/app".to_string()),
+            program: None,
+            args: vec![],
+            size: TermSize::default(),
+            peer: Some("10.0.0.5:8443".to_string()),
+        };
+        let bytes = encode_client(&msg).expect("encode");
+        match decode_client(&bytes).expect("decode") {
+            ClientMessage::SessionCreate { peer, cwd, .. } => {
+                assert_eq!(peer.as_deref(), Some("10.0.0.5:8443"));
+                assert_eq!(cwd.as_deref(), Some("/srv/app"));
+            }
+            other => panic!("expected SessionCreate, got {other:?}"),
+        }
     }
 
     #[test]
