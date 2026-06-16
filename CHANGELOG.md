@@ -8,6 +8,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Features
 
+- **render:** Render-debug tooling for diagnosing cursor/render issues — a live
+  overlay (GTK `Ctrl+Shift+D`, Swift `⌘⇧G`) showing what the renderer is handed
+  each frame (renderer leaf, frame/grid/cell geometry, cursor logical state, and
+  the exact pixel rect `kmux_render::cursor_geometry` computes), a renderer reset
+  that rebuilds the renderer + glyph atlas (GTK `Ctrl+Shift+F5`, Swift menu), and
+  `RUST_LOG="kmux::render_debug=trace"` cursor traces that diff the CPU paths'
+  hardcoded cursor constants against the renderer's scale-aware geometry. See
+  `docs/architecture-render.md`. (`kmux-ffi` ABI 14.)
 - **kmuxd:** Live PTY migration across planned daemon restarts — `kmux daemon
   restart` now hands the running shells' PTY master fds to a freshly-spawned
   successor over a Unix socket (`SCM_RIGHTS`), so editors/REPLs/jobs survive the
