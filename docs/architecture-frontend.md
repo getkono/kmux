@@ -125,6 +125,57 @@ the rows in its `DirPicker` `adw::Dialog` (`dialogs.rs`), and `kmux-swift` has a
 `dir_browser_activate(index)` / `dir_browser_open_here()` (the FFI surface change
 bumps `KMUX_FFI_ABI_VERSION`).
 
+### Session launcher: one picker for every "open a session" (issue #121)
+
+The "New session" button and the old "Switch Server" entry point both open the
+**unified launcher** — `Mode::LaunchPicker` — a VS Code Remote–style hierarchy of
+*everywhere you can open or create a session*. It replaces the retired
+`ServerPicker`/`SwitchServer` whole-client reconnect path: remotes are federated
+into the local hub (see [architecture-federation.md](architecture-federation.md))
+and managed in one window, never assuming where a new session lands.
+
+It is pure `AppCore` policy. `AppCore::launch_rows()` is a flat, filtered row
+model (`LaunchRow`) a dumb frontend renders as-is, in fixed order:
+
+1. `LocalNewSession { default_cwd }` — opens the directory browser seeded at the
+   focused session's cwd (so "new session" never assumes the client's cwd).
+2. `LocalExisting { … }` — every local session.
+3. Per known remote (the in-session `peer_targets` registry, seeded from recents'
+   SSH entries + the CLI `--server` peer): a `Remote { peer, status, expanded }`
+   header, and when expanded **and** connected, a `RemoteNewSession` row plus a
+   `RemoteExisting` row per federated session.
+4. `AddRemote` — always last.
+
+**Connect on focus.** Expanding a remote is the connect: `expand_remote(peer)`
+sets its `RemoteStatus` to `Connecting` and federates it via the existing
+`SessionManager::open_peer` (no new probe protocol). `PeerOpened`/`PeerError`
+update `peer_status[peer]` — a failure is **isolated** to that remote's row, not a
+global disconnect (except the CLI `--server` peer failing during initial
+bootstrap). Collapsing keeps the link if the active session belongs to the peer;
+`disconnect_remote` is the explicit drop. A local-daemon reconnect re-federates
+every connected peer (`federate_desired_peer`).
+
+The `LaunchPicker` list reuses the generic picker plumbing
+(`set_picker_search` / `set_picker_selected` / `activate_picker_selection`), so a
+frontend drives it like any picker. The two sub-forms are **frontend-owned** (they
+own native input widgets, not a char-by-char core buffer): `Mode::AddRemote`
+(submitted via `submit_add_remote(AddRemoteForm) -> Result<(), String>`) and
+`Mode::RemoteNewSession { peer }` (a path prompt → `submit_remote_new_session`).
+Direct (LAN/token) remotes live in-session only — their token is never written to
+disk; only SSH remotes are remembered.
+
+Frontends stay thin: `kmux-gtk` renders the rows as rich `adw::ActionRow`s (status
+pill/spinner, inline disconnect, indented children) in `dialogs.rs` and groups its
+sidebar by `SessionEntry.peer`; `kmux-swift` has `LaunchPicker.swift` +
+`AddRemoteSheet.swift` driven by the `launch_picker()` FFI getter (which carries
+`peer`/`status` so the native UI renders without re-deriving). The command palette
+exposes the same actions: `/launch`, `/connect <target>`, `/disconnect-remote`.
+
+Peer attribution rides the protocol: `SessionEntry.peer` (set by the daemon's
+`localize_entry`) tells the launcher and `kmux ls` which machine a session is on,
+and `ClientMessage::SessionCreate.peer` routes creation to a federated peer — see
+[architecture-federation.md](architecture-federation.md).
+
 ## `FrontendDriver`: the shared run loop
 
 Driving `AppCore` has always meant the same arm-for-arm orchestration: own the
