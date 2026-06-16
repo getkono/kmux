@@ -137,6 +137,29 @@ final class TerminalNSView: NSView {
         }
     #endif
 
+    // MARK: - Render-debug tooling
+
+    /// Diagnostic renderer reset (Reset Renderer menu / FfiEffect): drop the GPU
+    /// renderer + drawable so the next frame rebuilds them with a fresh glyph
+    /// atlas, then repaint. On the CoreText path this is just a repaint (there is
+    /// no persistent renderer/atlas to rebuild).
+    func resetGpuRenderer() {
+        #if KMUX_GPU
+            gpuRenderer = nil
+            gpuDrawable = nil
+        #endif
+        needsDisplay = true
+    }
+
+    /// The active renderer leaf, for the render-debug overlay.
+    var activeRendererName: String {
+        #if KMUX_GPU
+            return gpuActive ? "wgpu" : "coretext"
+        #else
+            return "coretext"
+        #endif
+    }
+
     // MARK: - Rendering
 
     override func draw(_ dirtyRect: NSRect) {

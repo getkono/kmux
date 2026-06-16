@@ -136,6 +136,7 @@ struct HelpView: View {
         ("⌘R", "Reconnect"),
         ("⌘C / ⌘V", "Copy selection / paste"),
         ("⌘⇧H", "Toggle performance HUD"),
+        ("⌘⇧G", "Toggle render-debug overlay"),
         ("⌘,", "Preferences"),
     ]
 
