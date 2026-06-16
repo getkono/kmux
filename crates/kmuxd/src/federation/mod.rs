@@ -934,6 +934,10 @@ fn spawn_feed_loop(
 fn localize_entry(mut entry: SessionEntry, local_word: &str, peer_id: &str) -> SessionEntry {
     entry.meta.name = format!("{} @ {peer_id}", entry.meta.name);
     entry.meta.word_id = local_word.to_string();
+    // Attribute the session to its peer so clients can group it by machine. The
+    // name decoration above stays for now (older/CLI views still rely on it); a
+    // frontend that groups by `peer` strips the decoration for display.
+    entry.peer = Some(peer_id.to_string());
     for pane in &mut entry.panes {
         pane.pane_id = format!("{local_word}/{}", pane.pane_index);
         pane.attached_clients.clear();
@@ -1119,6 +1123,7 @@ mod tests {
         let local = localize_entry(sample_entry("eagle", "work"), "hawk", "box:9000");
         assert_eq!(local.meta.word_id, "hawk");
         assert_eq!(local.meta.name, "work @ box:9000");
+        assert_eq!(local.peer.as_deref(), Some("box:9000"));
         assert_eq!(local.panes[0].pane_id, "hawk/0");
         assert_eq!(local.panes[0].pane_index, 0);
         // Remote client IDs are meaningless locally and must be cleared.
