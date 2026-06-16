@@ -174,6 +174,94 @@ pub struct SceneGeometry {
     pub overlay_glyphs: Vec<GlyphQuad>,
 }
 
+/// Per-layer primitive counts of a [`SceneGeometry`], for debug HUDs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SceneCounts {
+    /// Background quads (one per cell).
+    pub bg_quads: usize,
+    /// Cell glyphs.
+    pub glyphs: usize,
+    /// Overlay quads (rules, selection wash, cursor, focus border, scroll bg).
+    pub overlay_quads: usize,
+    /// Overlay glyphs (block-cursor glyph + scroll-indicator text).
+    pub overlay_glyphs: usize,
+}
+
+impl SceneGeometry {
+    /// The per-layer primitive counts, for debug HUDs that report what the
+    /// renderer was handed this frame.
+    pub fn counts(&self) -> SceneCounts {
+        SceneCounts {
+            bg_quads: self.bg_quads.len(),
+            glyphs: self.glyphs.len(),
+            overlay_quads: self.overlay_quads.len(),
+            overlay_glyphs: self.overlay_glyphs.len(),
+        }
+    }
+}
+
+/// One solid rectangle of a cursor in physical pixels (the cursor's [`SolidQuad`]
+/// geometry without the palette color). A block/bar/underline cursor is a single
+/// rect; a hollow-block is four (its outline).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct CursorRect {
+    /// Left edge (physical px).
+    pub x: f32,
+    /// Top edge (physical px).
+    pub y: f32,
+    /// Width (physical px).
+    pub w: f32,
+    /// Height (physical px).
+    pub h: f32,
+}
+
+/// The cursor's pixel geometry for debug tooling: the cell origin plus the solid
+/// rectangles the renderer would fill. Built by [`cursor_geometry`], which shares
+/// [`cursor_shape_rects`] with [`emit_cursor`] so the debug overlay provably
+/// matches what is drawn.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CursorGeometry {
+    /// Cursor cell top-left in physical px (computed even when out of range).
+    pub cell_origin: (f32, f32),
+    /// Whether the cursor falls within the pane grid (else `rects` is empty).
+    pub in_range: bool,
+    /// The solid rects the cursor occupies (empty for `Hidden`/out-of-range).
+    pub rects: Vec<CursorRect>,
+}
+
+/// The cursor's solid-rect geometry for `cursor` at `pane_origin` (the pane's
+/// top-left in physical px), exactly the rects [`emit_cursor`] would emit.
+///
+/// Range gating matches the renderer: an out-of-range cursor yields
+/// `in_range = false` with no rects. Blink gating is **not** applied — debug
+/// tooling wants the geometry even in a blink's off phase (consult
+/// [`CursorView::is_drawn`] separately for whether it actually paints).
+pub fn cursor_geometry(
+    cursor: &CursorView,
+    pane_origin: (f32, f32),
+    cols: u16,
+    rows: u16,
+    m: &CellMetrics,
+) -> CursorGeometry {
+    let (ox, oy) = pane_origin;
+    let cell_origin = (
+        ox + cursor.col as f32 * m.cell_w,
+        oy + cursor.row as f32 * m.cell_h,
+    );
+    if cursor.col >= cols || cursor.row >= rows {
+        return CursorGeometry {
+            cell_origin,
+            in_range: false,
+            rects: Vec::new(),
+        };
+    }
+    CursorGeometry {
+        cell_origin,
+        in_range: true,
+        rects: cursor_shape_rects(cursor.shape, cell_origin.0, cell_origin.1, m),
+    }
+}
+
 /// Visit every *displayed* cell of `grid` row-major, compositing scrollback into
 /// the top rows when scrolled (identical to the GTK renderer and
 /// [`scrollback_display_row_at`]). The one shared definition consumed by both
@@ -386,45 +474,66 @@ fn emit_cursor(
     let y = oy + cv.row as f32 * m.cell_h;
     let cb = color::rgb(frame.palette.cursor_bg);
 
-    match cv.shape {
-        CursorShape::Block => {
-            scene.overlay_quads.push(SolidQuad {
-                x,
-                y,
-                w: m.cell_w,
-                h: m.cell_h,
-                color: cb,
+    // The solid rects (one for block/bar/underline, four for the hollow outline),
+    // shared with `cursor_geometry` so the debug overlay agrees with what we draw.
+    for r in cursor_shape_rects(cv.shape, x, y, m) {
+        scene.overlay_quads.push(SolidQuad {
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: r.h,
+            color: cb,
+        });
+    }
+
+    // A block cursor also redraws the covered glyph in cursor_fg, over the fill.
+    if matches!(cv.shape, CursorShape::Block) {
+        let rc = resolved_cell_at(&pane.cells, frame.palette, cv.row, cv.col);
+        if rc.width != 0 && !rc.attrs.contains(CellAttrs::HIDDEN) && is_drawable(rc.ch) {
+            scene.overlay_glyphs.push(GlyphQuad {
+                cell_x: x,
+                cell_y: y,
+                ch: rc.ch,
+                style: FaceStyle::from_attrs(rc.attrs),
+                color: color::rgb(frame.palette.cursor_fg),
             });
-            // Redraw the covered glyph in cursor_fg, over the fill.
-            let rc = resolved_cell_at(&pane.cells, frame.palette, cv.row, cv.col);
-            if rc.width != 0 && !rc.attrs.contains(CellAttrs::HIDDEN) && is_drawable(rc.ch) {
-                scene.overlay_glyphs.push(GlyphQuad {
-                    cell_x: x,
-                    cell_y: y,
-                    ch: rc.ch,
-                    style: FaceStyle::from_attrs(rc.attrs),
-                    color: color::rgb(frame.palette.cursor_fg),
-                });
-            }
         }
-        CursorShape::HollowBlock => {
-            emit_outline(scene, x, y, m.cell_w, m.cell_h, m.cursor_thickness, cb)
-        }
-        CursorShape::Underline => scene.overlay_quads.push(SolidQuad {
+    }
+}
+
+/// The solid rectangles a cursor of `shape` occupies, with cell top-left at
+/// `(x, y)` in physical px. Block → one full-cell rect; HollowBlock → four
+/// outline rects (top, bottom, left, right — matching [`emit_outline`]);
+/// Underline/Bar → one thin rect; Hidden → none. The single definition shared by
+/// [`emit_cursor`] (the renderer) and [`cursor_geometry`] (debug tooling).
+fn cursor_shape_rects(shape: CursorShape, x: f32, y: f32, m: &CellMetrics) -> Vec<CursorRect> {
+    let (w, h, t) = (m.cell_w, m.cell_h, m.cursor_thickness);
+    match shape {
+        CursorShape::Block => vec![CursorRect { x, y, w, h }],
+        CursorShape::HollowBlock => vec![
+            CursorRect { x, y, w, h: t }, // top
+            CursorRect {
+                x,
+                y: y + h - t,
+                w,
+                h: t,
+            }, // bottom
+            CursorRect { x, y, w: t, h }, // left
+            CursorRect {
+                x: x + w - t,
+                y,
+                w: t,
+                h,
+            }, // right
+        ],
+        CursorShape::Underline => vec![CursorRect {
             x,
-            y: y + m.cell_h - m.cursor_thickness,
-            w: m.cell_w,
-            h: m.cursor_thickness,
-            color: cb,
-        }),
-        CursorShape::Bar => scene.overlay_quads.push(SolidQuad {
-            x,
-            y,
-            w: m.cursor_thickness,
-            h: m.cell_h,
-            color: cb,
-        }),
-        CursorShape::Hidden => {}
+            y: y + h - t,
+            w,
+            h: t,
+        }],
+        CursorShape::Bar => vec![CursorRect { x, y, w: t, h }],
+        CursorShape::Hidden => Vec::new(),
     }
 }
 
@@ -792,6 +901,135 @@ mod tests {
         let scene = build_scene(&frame, &CellMetrics::new(8.0, 16.0));
         assert!(scene.overlay_quads.is_empty());
         assert!(scene.overlay_glyphs.is_empty());
+    }
+
+    #[test]
+    fn cursor_geometry_block_matches_emit_cursor() {
+        // The debug helper must report exactly the rect the renderer fills.
+        let grid = grid_with(vec![cell('K', 0); 6], 2, 3);
+        let mut p = pane(&grid, &[]);
+        let cv = CursorView {
+            col: 1,
+            row: 1,
+            shape: CursorShape::Block,
+            blink: false,
+            visible: true,
+        };
+        p.cursor = Some(cv);
+        let m = CellMetrics::new(8.0, 16.0);
+        let frame = Frame::single(100, 100, 1.0, theme(), true, p);
+        let scene = build_scene(&frame, &m);
+
+        let geo = cursor_geometry(&cv, (0.0, 0.0), 3, 2, &m);
+        assert!(geo.in_range);
+        assert_eq!(geo.rects.len(), 1);
+        let q = scene.overlay_quads[0]; // the block fill emit_cursor pushed
+        let r = geo.rects[0];
+        assert_eq!((r.x, r.y, r.w, r.h), (q.x, q.y, q.w, q.h));
+        assert_eq!((r.x, r.y), (8.0, 16.0)); // col 1, row 1 → 8×16 cells
+    }
+
+    #[test]
+    fn cursor_geometry_bar_underline_hollow_hidden() {
+        let m = CellMetrics::new(8.0, 16.0);
+        let base = CursorView {
+            col: 0,
+            row: 0,
+            shape: CursorShape::Bar,
+            blink: false,
+            visible: true,
+        };
+
+        let bar = cursor_geometry(&base, (0.0, 0.0), 1, 1, &m);
+        assert_eq!(bar.rects.len(), 1);
+        assert_eq!((bar.rects[0].w, bar.rects[0].h), (m.cursor_thickness, 16.0));
+
+        let underline = cursor_geometry(
+            &CursorView {
+                shape: CursorShape::Underline,
+                ..base
+            },
+            (0.0, 0.0),
+            1,
+            1,
+            &m,
+        );
+        assert_eq!(underline.rects.len(), 1);
+        assert_eq!(underline.rects[0].y, 16.0 - m.cursor_thickness);
+        assert_eq!(
+            (underline.rects[0].w, underline.rects[0].h),
+            (8.0, m.cursor_thickness)
+        );
+
+        let hollow = cursor_geometry(
+            &CursorView {
+                shape: CursorShape::HollowBlock,
+                ..base
+            },
+            (0.0, 0.0),
+            1,
+            1,
+            &m,
+        );
+        assert_eq!(hollow.rects.len(), 4); // top, bottom, left, right
+
+        let hidden = cursor_geometry(
+            &CursorView {
+                shape: CursorShape::Hidden,
+                ..base
+            },
+            (0.0, 0.0),
+            1,
+            1,
+            &m,
+        );
+        assert!(hidden.in_range);
+        assert!(hidden.rects.is_empty());
+    }
+
+    #[test]
+    fn cursor_geometry_out_of_range_is_empty_but_keeps_origin() {
+        let m = CellMetrics::new(8.0, 16.0);
+        let cv = CursorView {
+            col: 5,
+            row: 0,
+            shape: CursorShape::Block,
+            blink: false,
+            visible: true,
+        };
+        let geo = cursor_geometry(&cv, (0.0, 0.0), 3, 2, &m);
+        assert!(!geo.in_range);
+        assert!(geo.rects.is_empty());
+        assert_eq!(geo.cell_origin, (40.0, 0.0)); // still reported for diagnostics
+    }
+
+    #[test]
+    fn cursor_geometry_applies_pane_origin() {
+        let m = CellMetrics::new(8.0, 16.0);
+        let cv = CursorView {
+            col: 2,
+            row: 1,
+            shape: CursorShape::Block,
+            blink: false,
+            visible: true,
+        };
+        let geo = cursor_geometry(&cv, (100.0, 200.0), 4, 4, &m);
+        assert_eq!(geo.cell_origin, (100.0 + 16.0, 200.0 + 16.0));
+        assert_eq!((geo.rects[0].x, geo.rects[0].y), (116.0, 216.0));
+    }
+
+    #[test]
+    fn scene_counts_match_layer_lengths() {
+        let grid = grid_with(vec![cell('a', 0), cell('b', 0)], 1, 2);
+        let p = pane(&grid, &[]);
+        let frame = Frame::single(100, 100, 1.0, theme(), true, p);
+        let scene = build_scene(&frame, &CellMetrics::new(8.0, 16.0));
+        let c = scene.counts();
+        assert_eq!(c.bg_quads, scene.bg_quads.len());
+        assert_eq!(c.glyphs, scene.glyphs.len());
+        assert_eq!(c.overlay_quads, scene.overlay_quads.len());
+        assert_eq!(c.overlay_glyphs, scene.overlay_glyphs.len());
+        assert_eq!(c.bg_quads, 2); // one background per cell
     }
 
     #[test]
