@@ -40,6 +40,9 @@ struct ContentView: View {
         .sheet(isPresented: dirBrowserPresented) {
             DirectoryBrowser(model: model)
         }
+        .sheet(isPresented: launcherPresented) {
+            LauncherSheet(model: model)
+        }
         .sheet(isPresented: $ui.help) {
             HelpView(isPresented: $ui.help)
         }
@@ -106,6 +109,22 @@ struct ContentView: View {
         )
     }
 
+    /// One sheet for the whole launcher flow (issue #121): the list, the
+    /// add-remote form, and the remote path prompt are all the same modal — its
+    /// content swaps on the mode so stepping launcher→add-remote→launcher never
+    /// dismisses/re-presents. Dismissing (drag / Esc) cancels in the core.
+    private var launcherPresented: Binding<Bool> {
+        Binding(
+            get: {
+                switch model.mode {
+                case .launchPicker, .addRemote, .remoteNewSession: return true
+                default: return false
+                }
+            },
+            set: { if !$0 { model.driver.cancelPicker() } }
+        )
+    }
+
     private var metricsPresented: Binding<Bool> {
         Binding(
             get: { model.metricsVisible },
@@ -123,10 +142,10 @@ struct ContentView: View {
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
         ToolbarItemGroup {
             ConnectionBadge(model: model)
-            Button { model.openServerPicker() } label: {
+            Button { model.openLaunchPicker() } label: {
                 Image(systemName: "rectangle.connected.to.line.below")
             }
-            .help("Switch server")
+            .help("Open launcher (sessions & remotes)")
             Button { ui.commandPalette = true } label: {
                 Image(systemName: "command")
             }
@@ -165,7 +184,7 @@ struct KmuxCommands: Commands {
         CommandMenu("Session") {
             Button("Command Palette…") { ui.commandPalette = true }
                 .keyboardShortcut("p")
-            Button("Switch Server…") { model.openServerPicker() }
+            Button("Open Launcher…") { model.openLaunchPicker() }
                 .keyboardShortcut("o")
             Divider()
             Button("Next Session") { model.dispatch(.nextSession) }

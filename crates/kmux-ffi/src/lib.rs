@@ -665,6 +665,9 @@ pub struct FfiSession {
     pub name: String,
     pub cwd: String,
     pub active: bool,
+    /// The federated peer this session lives on (issue #121), or `None` for a
+    /// local session. Lets the sidebar group sessions by machine.
+    pub peer: Option<String>,
 }
 
 /// One pane (tab) in the active session.
@@ -1462,6 +1465,7 @@ impl KmuxDriver {
                 word_id: e.meta.word_id.clone(),
                 name: e.meta.name.clone(),
                 cwd: e.meta.cwd.clone(),
+                peer: e.peer.clone(),
             })
             .collect()
     }

@@ -23,6 +23,10 @@ final class KmuxModel: ObservableObject {
     @Published private(set) var tabs: [FfiTab] = []
     @Published private(set) var mode: FfiMode = .normal
     @Published private(set) var picker: FfiPicker?
+    /// The unified session launcher's state (issue #121), non-nil only in
+    /// `Mode::LaunchPicker`. Driven by the generic picker methods plus the
+    /// `submit*`/`disconnectRemote` helpers below.
+    @Published private(set) var launchPicker: FfiLaunchPicker?
     /// The directory browser's state when the "new session — choose a directory"
     /// overlay is open (non-nil only in `Mode::DirectoryPicker`).
     @Published private(set) var dirBrowser: FfiDirBrowser?
@@ -169,6 +173,28 @@ final class KmuxModel: ObservableObject {
     /// Open the session picker.
     func openSessionPicker() {
         apply(driver.openSessionPicker())
+    }
+
+    /// Open the unified session launcher (issue #121) — the new-session button.
+    func openLaunchPicker() {
+        apply(driver.openLaunchPicker())
+    }
+
+    /// Submit the add-remote form (issue #121): build + connect the peer, persist
+    /// SSH ones. Returns an error message (form stays open) or `nil` on success.
+    func submitAddRemote(_ form: FfiAddRemoteForm) -> String? {
+        driver.submitAddRemote(form: form)
+    }
+
+    /// Create a new session on a federated `peer` at `cwd` (issue #121); empty
+    /// `cwd` lets the remote daemon resolve a default.
+    func submitRemoteNewSession(peer: String, cwd: String) {
+        driver.submitRemoteNewSession(peer: peer, cwd: cwd)
+    }
+
+    /// Disconnect a federated remote (issue #121): drop its link and forget it.
+    func disconnectRemote(_ peer: String) {
+        driver.disconnectRemote(peer: peer)
     }
 
     /// Activate the open picker's selection (click / Enter).
@@ -324,6 +350,8 @@ final class KmuxModel: ObservableObject {
         if md != mode { mode = md }
         let pk = driver.picker()
         if pk != picker { picker = pk }
+        let lp = driver.launchPicker()
+        if lp != launchPicker { launchPicker = lp }
         let db = driver.dirBrowser()
         if db != dirBrowser { dirBrowser = db }
         let hud = driver.hudVisible()
