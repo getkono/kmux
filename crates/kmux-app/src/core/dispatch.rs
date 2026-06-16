@@ -893,6 +893,7 @@ mod tests {
                 focused_pane: 0,
             }],
             active_tab: 0,
+            peer: None,
         }];
         core.mgr.active_pane = Some("eagle/0".into());
         core

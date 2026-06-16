@@ -315,6 +315,7 @@ mod tests {
                 focused_pane: 0,
             }],
             active_tab: 0,
+            peer: None,
         }];
         let rows = session_rows(&sessions);
         assert_eq!(rows.len(), 1);

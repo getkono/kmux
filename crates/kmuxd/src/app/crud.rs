@@ -119,6 +119,9 @@ impl ServerApp {
             panes: vec![pane_info],
             tabs: vec![tab_info],
             active_tab: 0,
+            // Local session: federated attribution is added by the hub's
+            // `localize_entry` only when proxying a remote peer.
+            peer: None,
         })
     }
 
@@ -180,6 +183,7 @@ impl ServerApp {
                     panes,
                     tabs: state.tab_infos(),
                     active_tab: state.active_tab,
+                    peer: None,
                 }
             })
             .collect();

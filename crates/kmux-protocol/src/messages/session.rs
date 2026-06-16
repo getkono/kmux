@@ -318,6 +318,16 @@ pub struct SessionEntry {
     /// The tab index the server restored/created as the default view. Which tab
     /// a *client* is actually viewing is client-local state.
     pub active_tab: TabIndex,
+    /// The federated peer this session is being viewed through, or `None` for a
+    /// local session. Set by the hub's `localize_entry` when it proxies a remote
+    /// peer's session list, so clients can group and attribute sessions by
+    /// machine without parsing the decorated display name. This is a per-listing,
+    /// hub-assigned attribute (not part of the immutable [`SessionMeta`], and not
+    /// persisted). `#[serde(default)]` keeps it optional in source; the
+    /// exact-match `PROTOCOL_VERSION` handshake guarantees both ends agree on the
+    /// wire shape.
+    #[serde(default)]
+    pub peer: Option<PeerId>,
 }
 
 /// Input control mode for a pane.
@@ -570,6 +580,7 @@ mod tests {
                 focused_pane: 0,
             }],
             active_tab: 0,
+            peer: None,
         };
         let bytes = postcard::to_allocvec(&entry).expect("serialize");
         let decoded: SessionEntry = postcard::from_bytes(&bytes).expect("deserialize");
