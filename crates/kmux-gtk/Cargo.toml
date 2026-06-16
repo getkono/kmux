@@ -22,13 +22,16 @@ path = "src/main.rs"
 # `--no-default-features` for a lean, Cairo-only binary that pulls no wgpu. CI
 # compiles both. See docs/architecture-render.md.
 default = ["gpu"]
-gpu = ["dep:kmux-render"]
+gpu = ["kmux-render/gpu"]
 
 [dependencies]
 kmux-app.workspace = true
 kmux-client.workspace = true
 kmux-protocol = { workspace = true, features = ["framing"] }
-kmux-render = { workspace = true, optional = true, features = ["gpu"] }
+# The wgpu-free core (geometry/cursor_geometry/CellMetrics) is always linked so
+# the render-debug overlay can report what the renderer computes even on the
+# Cairo path; the `gpu` feature layers on wgpu (`kmux-render/gpu`).
+kmux-render.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true

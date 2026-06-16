@@ -88,8 +88,10 @@ struct LiveDialog {
 
 /// The live native dialog plus the HUD OSD and the transient-state trackers.
 pub struct Dialogs {
-    /// Performance HUD (live OSD ticker over the grid).
+    /// Performance HUD (live OSD ticker over the grid, top-End).
     hud: GtkBox,
+    /// Render-debug overlay (top-Start): what the renderer is handed each frame.
+    render_debug: GtkBox,
     current: RefCell<Option<LiveDialog>>,
     /// Content signature for the live list dialog so we only rebuild rows on a
     /// real change (not every frame of terminal output).
@@ -119,8 +121,20 @@ pub fn build(overlay: &gtk4::Overlay) -> Dialogs {
     hud.set_visible(false);
     overlay.add_overlay(&hud);
 
+    // Render-debug overlay: top-Start so it never overlaps the top-End perf HUD.
+    let render_debug = GtkBox::new(Orientation::Vertical, 0);
+    render_debug.add_css_class("osd");
+    render_debug.add_css_class("kmux-render-debug");
+    render_debug.set_halign(Align::Start);
+    render_debug.set_valign(Align::Start);
+    render_debug.set_margin_top(8);
+    render_debug.set_margin_start(8);
+    render_debug.set_visible(false);
+    overlay.add_overlay(&render_debug);
+
     Dialogs {
         hud,
+        render_debug,
         current: RefCell::new(None),
         list_sig: RefCell::new(None),
         syncing: Cell::new(false),
@@ -144,6 +158,7 @@ pub fn sync(
     update_metrics_dialog(dialogs, shell, fe);
     update_connection_dialog(dialogs, shell, fe);
     update_hud(&dialogs.hud, &fe.borrow().core);
+    update_render_debug(&dialogs.render_debug, shell, fe);
 }
 
 /// Open/close/refresh the live native dialog to match `core.mode`.
@@ -1188,6 +1203,108 @@ fn update_hud(hud: &GtkBox, core: &AppCore) {
         ));
     }
     hud.set_visible(true);
+}
+
+/// Render-debug overlay (top-Start): what the renderer is handed each frame —
+/// the active renderer leaf, frame/grid/cell geometry, the cursor's logical
+/// state, and the exact pixel rect `kmux_render::cursor_geometry` computes for it
+/// (compare against what the active path actually draws — e.g. the Cairo path's
+/// hardcoded 2px cursor vs the renderer's scale-aware `cursor_thickness`). Scene
+/// primitive counts appear on the GPU path.
+fn update_render_debug(overlay: &GtkBox, shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
+    let f = fe.borrow();
+    if !f.core.render_debug_visible() {
+        overlay.set_visible(false);
+        return;
+    }
+    clear(overlay);
+
+    let frame_w = shell.drawing.width().max(0) as u32;
+    let frame_h = shell.drawing.height().max(0) as u32;
+    let scale = shell.drawing.scale_factor() as f32;
+
+    #[cfg(feature = "gpu")]
+    let renderer = if f.gpu.enabled() { "wgpu" } else { "cairo" };
+    #[cfg(not(feature = "gpu"))]
+    let renderer = "cairo";
+
+    let snap = f
+        .core
+        .render_debug_snapshot(frame_w, frame_h, scale, renderer);
+    // The renderer's own cell geometry (so the pixel rect matches kmux-render).
+    let cell = kmux_render::CellMetrics::new(f.metrics.cell_w as f32, f.metrics.cell_h as f32);
+
+    let mut lines: Vec<String> = vec![
+        format!(
+            "renderer: {}   frame: {}×{}px   scale: {}",
+            snap.renderer, snap.frame_width, snap.frame_height, snap.scale
+        ),
+        format!(
+            "cell: {:.1}×{:.1}px   cursor_thickness: {:.2}px   blink_on: {}",
+            cell.cell_w, cell.cell_h, cell.cursor_thickness, snap.blink_on
+        ),
+    ];
+
+    match &snap.pane {
+        None => lines.push("pane: (none)".to_string()),
+        Some(p) => {
+            lines.push(format!(
+                "pane: {}   grid: {}×{}   scroll: {}",
+                p.pane_id, p.grid_cols, p.grid_rows, p.scroll_offset
+            ));
+            match &p.cursor {
+                None => lines.push("cursor: hidden (scrolled into history)".to_string()),
+                Some(c) => {
+                    lines.push(format!(
+                        "cursor: ({},{}) {:?}  blink={} visible={} drawn={}",
+                        c.col, c.row, c.shape, c.blink, c.visible, c.is_drawn
+                    ));
+                    // Pane-relative pixel rect the renderer would fill.
+                    let cv = kmux_render::CursorView {
+                        col: c.col,
+                        row: c.row,
+                        shape: c.shape,
+                        blink: c.blink,
+                        visible: c.visible,
+                    };
+                    let geo = kmux_render::cursor_geometry(
+                        &cv,
+                        (0.0, 0.0),
+                        p.grid_cols,
+                        p.grid_rows,
+                        &cell,
+                    );
+                    if !geo.in_range {
+                        lines.push("  px: out of range".to_string());
+                    } else if let Some(r) = geo.rects.first() {
+                        lines.push(format!(
+                            "  px: x={:.1} y={:.1} w={:.1} h={:.1}  ({} rect/s)",
+                            r.x,
+                            r.y,
+                            r.w,
+                            r.h,
+                            geo.rects.len()
+                        ));
+                    } else {
+                        lines.push("  px: no rects (hidden shape)".to_string());
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    if let Some(counts) = f.gpu.last_scene_counts() {
+        lines.push(format!(
+            "scene: bg={} glyphs={} overlay={} ov-glyphs={}",
+            counts.bg_quads, counts.glyphs, counts.overlay_quads, counts.overlay_glyphs
+        ));
+    }
+
+    for line in lines {
+        overlay.append(&label(&line, "kmux-render-debug-line"));
+    }
+    overlay.set_visible(true);
 }
 
 /// Open/close the metrics inspector dialog from `metrics_overlay_visible`. The

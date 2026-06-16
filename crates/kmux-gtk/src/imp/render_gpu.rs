@@ -19,7 +19,10 @@ use kmux_app::appearance::Appearance;
 use kmux_app::core::AppCore;
 use kmux_app::layout::{LayoutConfig, resolve_layout};
 use kmux_app::theme::Theme;
-use kmux_render::{CellSource, CursorView, Frame, PaneView, ScrollIndicator, TerminalRenderer};
+use kmux_render::{
+    CellSource, CursorView, Frame, PaneView, SceneCounts, ScrollIndicator, TerminalRenderer,
+    build_scene, cursor_geometry,
+};
 
 use super::render::GUTTER;
 
@@ -45,6 +48,9 @@ fn cfg() -> LayoutConfig {
 /// available; otherwise inert (the Cairo path is used).
 pub(crate) struct GpuState {
     renderer: Option<TerminalRenderer>,
+    /// Scene primitive counts from the last painted frame, stashed for the
+    /// render-debug overlay (only while it is visible). See [`paint`].
+    last_counts: Option<SceneCounts>,
 }
 
 impl GpuState {
@@ -52,18 +58,25 @@ impl GpuState {
     /// inert state) when the env var is unset or GPU init fails.
     pub(crate) fn new(appearance: &Appearance, theme: &Theme) -> Self {
         if !wants_gpu() {
-            return Self { renderer: None };
+            return Self {
+                renderer: None,
+                last_counts: None,
+            };
         }
         match TerminalRenderer::new_offscreen(1, 1, 1.0, appearance, theme) {
             Ok(renderer) => {
                 tracing::info!("kmux-render: GPU renderer active (KMUX_RENDERER=wgpu)");
                 Self {
                     renderer: Some(renderer),
+                    last_counts: None,
                 }
             }
             Err(e) => {
                 tracing::warn!("KMUX_RENDERER=wgpu set but GPU init failed: {e}; using Cairo");
-                Self { renderer: None }
+                Self {
+                    renderer: None,
+                    last_counts: None,
+                }
             }
         }
     }
@@ -71,6 +84,12 @@ impl GpuState {
     /// Whether the GPU path should be used for drawing.
     pub(crate) fn enabled(&self) -> bool {
         self.renderer.is_some()
+    }
+
+    /// The scene primitive counts from the last painted frame, when the
+    /// render-debug overlay is active (the renderer stashes them during [`paint`]).
+    pub(crate) fn last_scene_counts(&self) -> Option<SceneCounts> {
+        self.last_counts
     }
 }
 
@@ -176,6 +195,36 @@ pub(crate) fn paint(
         panes,
         multi,
     };
+
+    // Render-debug instrumentation (issue: cursor render debugging). Both paths
+    // are gated so they cost nothing when the overlay is hidden and trace logging
+    // is off — the overlay stashes scene counts; the trace logs the cursor's
+    // pixel rect as kmux-render computes it (compare against the drawn pixels).
+    if core.render_debug_visible {
+        state.last_counts = Some(build_scene(&frame, renderer.metrics().cell()).counts());
+    }
+    if tracing::enabled!(target: "kmux::render_debug", tracing::Level::TRACE) {
+        let m = renderer.metrics().cell();
+        for pane in &frame.panes {
+            if let Some(cv) = pane.cursor {
+                let (cols, rows) = pane.cells.dims();
+                let origin = (pane.col as f32 * m.cell_w, pane.row as f32 * m.cell_h);
+                let geo = cursor_geometry(&cv, origin, cols, rows, m);
+                tracing::trace!(
+                    target: "kmux::render_debug",
+                    focused = pane.focused,
+                    col = cv.col,
+                    row = cv.row,
+                    shape = ?cv.shape,
+                    blink_on = frame.blink_on,
+                    in_range = geo.in_range,
+                    rects = geo.rects.len(),
+                    rect0 = ?geo.rects.first(),
+                    "gpu cursor geometry (kmux-render)"
+                );
+            }
+        }
+    }
 
     if let Err(e) = renderer.render(&frame) {
         tracing::warn!("kmux-render GPU frame failed: {e}");

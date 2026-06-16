@@ -92,6 +92,19 @@ fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
             Action::ToggleConnection,
             &["<Ctrl><Shift>i"],
         ),
+        // Render-debug overlay: what the renderer is handed each frame (cursor
+        // logical + pixel geometry, renderer leaf, scene counts). `d` = debug.
+        (
+            "toggle-render-debug",
+            Action::ToggleRenderDebug,
+            &["<Ctrl><Shift>d"],
+        ),
+        // Rebuild the renderer + glyph atlas and full-repaint (diagnostic).
+        (
+            "reset-renderer",
+            Action::ResetRenderer,
+            &["<Ctrl><Shift>F5"],
+        ),
         ("snapshot", Action::ToggleSnapshotMode, &[]),
         // Pause the connection to save bandwidth (issue #68); b = bandwidth.
         ("toggle-pause", Action::TogglePause, &["<Ctrl><Shift>b"]),
@@ -297,6 +310,8 @@ fn build_menu() -> gio::Menu {
     s4.append(Some("Performance HUD"), Some("win.toggle-hud"));
     s4.append(Some("Metrics"), Some("win.toggle-metrics"));
     s4.append(Some("Connection"), Some("win.toggle-connection"));
+    s4.append(Some("Render Debug"), Some("win.toggle-render-debug"));
+    s4.append(Some("Reset Renderer"), Some("win.reset-renderer"));
     menu.append_section(None, &s4);
 
     let s5 = gio::Menu::new();
@@ -366,6 +381,8 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">F9</property><property name="title">Toggle sidebar</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;l</property><property name="title">Lock input</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;i</property><property name="title">Connection inspector</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;d</property><property name="title">Render-debug overlay</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;F5</property><property name="title">Reset renderer + atlas</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;r</property><property name="title">Reconnect</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;comma</property><property name="title">Preferences</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;q</property><property name="title">Quit</property></object></child>
@@ -418,6 +435,11 @@ mod tests {
         assert_eq!(action_for("copy"), Some(Action::CopySelection));
         assert_eq!(action_for("paste"), Some(Action::Paste));
         assert_eq!(action_for("reconnect"), Some(Action::Reconnect));
+        assert_eq!(
+            action_for("toggle-render-debug"),
+            Some(Action::ToggleRenderDebug)
+        );
+        assert_eq!(action_for("reset-renderer"), Some(Action::ResetRenderer));
     }
 
     #[test]

@@ -385,9 +385,26 @@ pub(crate) fn apply_effects(
     for eff in effects {
         match eff {
             FrontendEffect::NeedsRender | FrontendEffect::ForceClear => redraw = true,
-            // Diagnostic renderer reset: repaint now; rebuilding the GPU
-            // renderer + glyph atlas is wired in with the render-debug overlay.
-            FrontendEffect::ResetRenderer => redraw = true,
+            // Diagnostic renderer reset (Ctrl+Shift+F5): re-measure cell geometry
+            // + fonts and rebuild the GPU renderer + glyph atlas (inert when wgpu
+            // is off), then full-repaint. Clears any corrupt cached state.
+            FrontendEffect::ResetRenderer => {
+                {
+                    let mut f = fe.borrow_mut();
+                    let appearance = f.core.appearance.clone();
+                    f.metrics = render::Metrics::measure(&drawing.pango_context(), &appearance);
+                    #[cfg(feature = "gpu")]
+                    {
+                        let theme = f.core.palette.clone();
+                        f.gpu = render_gpu::GpuState::new(&appearance, &theme);
+                    }
+                }
+                tracing::info!(
+                    target: "kmux::render_debug",
+                    "GTK: renderer reset (metrics re-measured, GPU renderer + atlas rebuilt)"
+                );
+                redraw = true;
+            }
             FrontendEffect::PaletteChanged => {
                 // Reflect a `/theme` palette change onto the chrome CSS + window
                 // light/dark styling (the cairo grid reads the palette live).

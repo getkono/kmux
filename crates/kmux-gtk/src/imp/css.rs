@@ -28,7 +28,10 @@ pub fn stylesheet(p: &Theme) -> String {
 \n\
 /* Performance HUD ticker, on top of the libadwaita .osd panel. */\n\
 .kmux-hud {{ padding: 6px 10px; }}\n\
-.kmux-hud-line {{ color: {green}; font-family: monospace; }}\n"
+.kmux-hud-line {{ color: {green}; font-family: monospace; }}\n\
+/* Render-debug overlay (top-Start), distinct from the perf HUD (top-End). */\n\
+.kmux-render-debug {{ padding: 6px 10px; }}\n\
+.kmux-render-debug-line {{ color: {accent}; font-family: monospace; }}\n"
     )
 }
 
