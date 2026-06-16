@@ -148,7 +148,7 @@ pub fn install(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application)
     }
 
     add_command(shell, fe);
-    add_switch_server(shell, fe);
+    add_open_launcher(shell, fe);
     add_toggle_sidebar(shell);
     add_preferences(shell, fe);
     add_help(shell);
@@ -206,14 +206,14 @@ fn add_command(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
     shell.window.add_action(&act);
 }
 
-fn add_switch_server(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
-    let act = gio::SimpleAction::new("switch-server", None);
+fn add_open_launcher(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
+    let act = gio::SimpleAction::new("launch", None);
     let fe = fe.clone();
     let s = shell.clone();
     act.connect_activate(move |_, _| {
         {
             let mut f = fe.borrow_mut();
-            f.core.apply_top_bar_action(TopBarAction::OpenServerPicker);
+            f.core.apply_top_bar_action(TopBarAction::OpenLaunchPicker);
             f.core.needs_render = true;
         }
         s.drawing.queue_draw();
@@ -280,7 +280,7 @@ fn build_menu() -> gio::Menu {
     menu.append_section(None, &s2);
 
     let s3 = gio::Menu::new();
-    s3.append(Some("Switch Server…"), Some("win.switch-server"));
+    s3.append(Some("Open Launcher…"), Some("win.launch"));
     s3.append(Some("Reconnect"), Some("win.reconnect"));
     s3.append(Some("Disconnect"), Some("win.disconnect"));
     let signals = gio::Menu::new();

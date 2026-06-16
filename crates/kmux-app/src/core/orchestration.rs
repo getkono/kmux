@@ -22,9 +22,9 @@ use base64::Engine;
 
 use super::{AddRemoteForm, DirBrowserRow, LaunchRow, RemoteStatus};
 use crate::mode::Mode;
-use crate::recent_servers::{RecentServer, ServerKind};
+use crate::recent_servers::ServerKind;
 
-use super::{AppCore, KeyResult, SwitchTarget};
+use super::{AppCore, KeyResult};
 
 #[derive(Debug)]
 pub enum BootstrapPhase {
@@ -210,21 +210,6 @@ impl AppCore {
             self.session_picker_search.clear();
             self.mode = Mode::SessionPicker;
         }
-    }
-
-    /// Returns recent servers filtered by the current `server_picker_search` text.
-    pub fn filtered_servers(&self) -> Vec<RecentServer> {
-        let lower = self.server_picker_search.to_lowercase();
-        self.recent_servers
-            .servers()
-            .iter()
-            .filter(|s| {
-                lower.is_empty()
-                    || s.display.to_lowercase().contains(&lower)
-                    || s.server_string.to_lowercase().contains(&lower)
-            })
-            .cloned()
-            .collect()
     }
 
     /// The directory browser's rows for the current listing + filter, in render
@@ -755,58 +740,6 @@ impl AppCore {
         self.recent_servers.record_connection(peer, peer, kind);
     }
 
-    /// Apply the state change for switching to a server chosen from the server
-    /// picker, returning the [`ResolvedTarget`] the frontend should bootstrap.
-    ///
-    /// This is the shared half of `KeyResult::SwitchServer` handling — the
-    /// server identity, ssh target, auto-select reset, and disconnect of the
-    /// old connection. The frontend owns the toolkit-coupled remainder (replace
-    /// the server-message channel, then `start_bootstrap` with the returned
-    /// target) so every frontend's run loop drives it identically.
-    pub fn prepare_switch(&mut self, target: &SwitchTarget) -> ResolvedTarget {
-        self.mgr.disconnect();
-        // Every switch re-bootstraps the **local** daemon (issue #121). A remote
-        // server is conveyed via `desired_peer` and federated with `OpenPeer`
-        // after the local link is back up.
-        match target {
-            SwitchTarget::Local => {
-                self.did_auto_select = false;
-                self.is_local = true;
-                self.ssh_target = None;
-                self.desired_peer = None;
-                self.server_display = "localhost".to_string();
-                self.server_string = String::new();
-                self.server_kind = ServerKind::Local;
-                ResolvedTarget::LocalDaemon
-            }
-            SwitchTarget::Ssh(target) => {
-                let display = match &target.user {
-                    Some(u) => format!("{}@{}", u, target.host),
-                    None => target.host.clone(),
-                };
-                self.server_display = display.clone();
-                self.server_string = display;
-                self.server_kind = ServerKind::Ssh {
-                    user: target.user.clone(),
-                    host: target.host.clone(),
-                    ssh_port: target.ssh_port,
-                };
-                self.is_local = false;
-                self.ssh_target = Some(target.clone());
-                self.desired_peer = Some(PeerTarget::Ssh {
-                    user: target.user.clone(),
-                    host: target.host.clone(),
-                    ssh_port: target.ssh_port,
-                    accept_invalid_certs: self.mgr.accept_invalid_certs(),
-                });
-                // Suppress auto-select on the pre-federation (local) list; it is
-                // re-armed when `PeerOpened` arrives with the remote's sessions.
-                self.did_auto_select = true;
-                ResolvedTarget::LocalDaemon
-            }
-        }
-    }
-
     /// Transition to `Mode::Disconnected`, record the reason in the session
     /// manager, and emit a structured tracing event.
     pub fn enter_disconnected(&mut self, reason: DisconnectReason) {
@@ -860,7 +793,6 @@ fn join_path(base: &str, name: &str) -> String {
 mod tests {
     use super::*;
     use kmux_client::session_manager::SessionManager;
-    use kmux_client::ssh::RemoteTarget;
     use kmux_protocol::messages::ClientCapabilities;
 
     fn fixture_core() -> AppCore {
@@ -875,92 +807,16 @@ mod tests {
     }
 
     #[test]
-    fn prepare_switch_local_resets_identity_to_localhost() {
-        let mut core = fixture_core();
-        // Pretend we were connected to a remote server.
-        core.is_local = false;
-        core.ssh_target = Some(RemoteTarget {
-            user: Some("u".into()),
-            host: "h".into(),
-            ssh_port: None,
-        });
-        core.desired_peer = Some(PeerTarget::Ssh {
-            user: Some("u".into()),
-            host: "h".into(),
-            ssh_port: None,
-            accept_invalid_certs: true,
-        });
-        core.server_display = "u@h".into();
-        core.server_string = "u@h".into();
-        core.did_auto_select = true;
-
-        let resolved = core.prepare_switch(&SwitchTarget::Local);
-
-        assert!(matches!(resolved, ResolvedTarget::LocalDaemon));
-        assert!(core.is_local);
-        assert!(core.ssh_target.is_none());
-        assert!(
-            core.desired_peer.is_none(),
-            "switching local drops the peer"
-        );
-        assert_eq!(core.server_display, "localhost");
-        assert!(core.server_string.is_empty());
-        assert!(matches!(core.server_kind, ServerKind::Local));
-        assert!(!core.did_auto_select, "auto-select must reset on switch");
-    }
-
-    #[test]
-    fn prepare_switch_ssh_federates_through_local_daemon() {
-        let mut core = fixture_core();
-        let target = RemoteTarget {
-            user: Some("alice".into()),
-            host: "example.com".into(),
-            ssh_port: Some(2222),
-        };
-
-        let resolved = core.prepare_switch(&SwitchTarget::Ssh(target));
-
-        // Issue #121: the GUI always bootstraps the local daemon; the remote is
-        // federated via `desired_peer` + `OpenPeer`, not a direct GUI dial-out.
-        assert!(
-            matches!(resolved, ResolvedTarget::LocalDaemon),
-            "switching to a remote server must still bootstrap the local daemon",
-        );
-        match &core.desired_peer {
-            Some(PeerTarget::Ssh {
-                user,
-                host,
-                ssh_port,
-                ..
-            }) => {
-                assert_eq!(host, "example.com");
-                assert_eq!(user.as_deref(), Some("alice"));
-                assert_eq!(*ssh_port, Some(2222));
-            }
-            other => panic!("expected desired_peer = Ssh, got {other:?}"),
-        }
-        // Identity still reflects the remote server (drives the UI + auto-select).
-        assert!(!core.is_local);
-        assert_eq!(core.server_display, "alice@example.com");
-        assert_eq!(core.server_string, "alice@example.com");
-        assert!(core.ssh_target.is_some());
-        assert!(matches!(core.server_kind, ServerKind::Ssh { .. }));
-        // Auto-select is suppressed until the federated session list arrives.
-        assert!(
-            core.did_auto_select,
-            "auto-select must be suppressed until PeerOpened",
-        );
-    }
-
-    #[test]
     fn current_target_is_always_local_even_with_a_desired_peer() {
         let mut core = fixture_core();
-        core.prepare_switch(&SwitchTarget::Ssh(RemoteTarget {
+        // A federated remote lives in `desired_peer`; the GUI's own transport
+        // stays UDS-local regardless (issue #121).
+        core.desired_peer = Some(PeerTarget::Ssh {
             user: None,
             host: "box".into(),
             ssh_port: None,
-        }));
-        assert!(core.desired_peer.is_some());
+            accept_invalid_certs: true,
+        });
         assert!(
             matches!(core.current_target(), ResolvedTarget::LocalDaemon),
             "the GUI's transport is always UDS-local (issue #121)",

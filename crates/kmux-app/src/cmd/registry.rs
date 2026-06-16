@@ -183,17 +183,40 @@ fn cmd_reconnect(_app: &mut AppCore, _args: &[String]) -> CommandResult {
     Ok(CommandSuccess::Reconnect)
 }
 
-fn cmd_server(app: &mut AppCore, _args: &[String]) -> CommandResult {
-    app.mode = Mode::ServerPicker;
-    app.server_picker_search.clear();
-    app.server_picker_selected = 0;
+fn cmd_launch(app: &mut AppCore, _args: &[String]) -> CommandResult {
+    app.open_launch_picker();
     Ok(CommandSuccess::Ok)
 }
 
-fn cmd_local(_app: &mut AppCore, _args: &[String]) -> CommandResult {
-    Ok(CommandSuccess::SwitchServer(
-        crate::core::SwitchTarget::Local,
-    ))
+/// `/connect <[user@]host[:port]>` — federate an SSH remote into the local hub
+/// (issue #121): register it, remember it, and connect on focus. The same path
+/// the launcher's add-remote form takes, exposed to the command palette.
+fn cmd_connect(app: &mut AppCore, args: &[String]) -> CommandResult {
+    let target = args
+        .first()
+        .ok_or_else(|| "usage: /connect <[user@]host[:port]>".to_string())?;
+    let parsed = kmux_client::ssh::parse_server_string(target);
+    let remote = kmux_client::ssh::resolve_remote_target(&parsed)
+        .ok_or_else(|| format!("could not parse remote target '{target}'"))?;
+    let form = crate::core::AddRemoteForm {
+        use_ssh: true,
+        host: remote.host,
+        user: remote.user.unwrap_or_default(),
+        port: remote.ssh_port,
+        token: String::new(),
+        accept_invalid_certs: app.mgr.accept_invalid_certs(),
+    };
+    app.submit_add_remote(form)?;
+    Ok(CommandSuccess::Status(format!("connecting to {target}…")))
+}
+
+/// `/disconnect-remote <peer>` — drop a federated remote's link (issue #121).
+fn cmd_disconnect_remote(app: &mut AppCore, args: &[String]) -> CommandResult {
+    let peer = args
+        .first()
+        .ok_or_else(|| "usage: /disconnect-remote <peer>".to_string())?;
+    app.disconnect_remote(peer);
+    Ok(CommandSuccess::Status(format!("disconnected {peer}")))
 }
 
 // ── Sessions ─────────────────────────────────────────────────────────────────
@@ -401,6 +424,18 @@ const ARGS_QUERY_REQ: &[ArgSpec] = &[ArgSpec {
     completer: Completer::Sessions,
 }];
 
+const ARGS_TARGET_REQ: &[ArgSpec] = &[ArgSpec {
+    name: "[user@]host[:port]",
+    required: true,
+    completer: Completer::None,
+}];
+
+const ARGS_PEER_REQ: &[ArgSpec] = &[ArgSpec {
+    name: "peer",
+    required: true,
+    completer: Completer::None,
+}];
+
 const ARGS_THEME_REQ: &[ArgSpec] = &[ArgSpec {
     name: "name",
     required: true,
@@ -512,18 +547,25 @@ pub static ALL: &[CommandSpec] = &[
         run: cmd_reconnect,
     },
     CommandSpec {
-        name: "server",
-        aliases: &[],
-        summary: "Open the server picker",
+        name: "launch",
+        aliases: &["server"],
+        summary: "Open the session launcher (sessions & remotes)",
         args: NO_ARGS,
-        run: cmd_server,
+        run: cmd_launch,
     },
     CommandSpec {
-        name: "local",
+        name: "connect",
         aliases: &[],
-        summary: "Switch to the local UDS daemon",
-        args: NO_ARGS,
-        run: cmd_local,
+        summary: "Federate an SSH remote into the local hub",
+        args: ARGS_TARGET_REQ,
+        run: cmd_connect,
+    },
+    CommandSpec {
+        name: "disconnect-remote",
+        aliases: &[],
+        summary: "Drop a federated remote's connection",
+        args: ARGS_PEER_REQ,
+        run: cmd_disconnect_remote,
     },
     CommandSpec {
         name: "transport",
@@ -813,10 +855,11 @@ mod tests {
     }
 
     #[test]
-    fn server_opens_picker_mode() {
+    fn launch_opens_the_launcher() {
         let mut app = fixture_core();
+        // The legacy `server` alias still resolves to the launcher.
         let _ = run(&mut app, "server");
-        assert!(matches!(app.mode, Mode::ServerPicker));
+        assert!(matches!(app.mode, Mode::LaunchPicker));
     }
 
     #[test]
@@ -950,12 +993,15 @@ mod tests {
     }
 
     #[test]
-    fn local_returns_switch_server_outcome() {
+    fn disconnect_remote_reports_status() {
         let mut app = fixture_core();
-        assert!(matches!(
-            run(&mut app, "local"),
-            Outcome::SwitchServer(crate::core::SwitchTarget::Local)
-        ));
+        let outcome = run(&mut app, "disconnect-remote box");
+        assert!(matches!(outcome, Outcome::Continue));
+        assert!(
+            app.mgr.status_msg().contains("disconnected box"),
+            "got: {:?}",
+            app.mgr.status_msg()
+        );
     }
 
     #[test]

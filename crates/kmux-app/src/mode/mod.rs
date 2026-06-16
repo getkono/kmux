@@ -35,8 +35,6 @@ pub enum Mode {
     },
     /// Floating session picker with search
     SessionPicker,
-    /// Floating server picker with search (recent servers)
-    ServerPicker,
     /// Help overlay
     Help,
     /// Directory picker for remote connections: type a path to open/create a session
@@ -136,14 +134,6 @@ pub enum Action {
     PickerSearchChar(char),
     PickerSearchBackspace,
 
-    // Server picker
-    ServerPickerChar(char),
-    ServerPickerBackspace,
-    ServerPickerUp,
-    ServerPickerDown,
-    ServerPickerSelect,
-    ServerPickerClose,
-
     // Signals
     SendSignal(i32),
 
@@ -239,7 +229,6 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::ConfirmCloseSession { .. } => resolve_confirm_close(key),
         Mode::RenameSession { .. } | Mode::RenameTab { .. } => resolve_rename(key, mods),
         Mode::SessionPicker => resolve_session_picker(key, mods),
-        Mode::ServerPicker => resolve_server_picker(key, mods),
         Mode::Help => resolve_help(key),
         Mode::DirectoryPicker => resolve_dir_picker(key, mods),
         Mode::LaunchPicker => resolve_launch_picker(key, mods),

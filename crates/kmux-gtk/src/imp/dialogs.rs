@@ -34,7 +34,6 @@ use super::{Frontend, apply_effects};
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum DialogKind {
     SessionPicker,
-    ServerPicker,
     DirPicker,
     /// The unified session launcher (issue #121): a rich, hierarchical list of
     /// local + remote open/create rows from [`AppCore::launch_rows`].
@@ -55,7 +54,6 @@ impl DialogKind {
         matches!(
             self,
             DialogKind::SessionPicker
-                | DialogKind::ServerPicker
                 | DialogKind::DirPicker
                 | DialogKind::Launch
                 | DialogKind::Command
@@ -65,7 +63,6 @@ impl DialogKind {
     fn from_mode(mode: &Mode) -> Option<Self> {
         match mode {
             Mode::SessionPicker => Some(DialogKind::SessionPicker),
-            Mode::ServerPicker => Some(DialogKind::ServerPicker),
             Mode::DirectoryPicker => Some(DialogKind::DirPicker),
             Mode::LaunchPicker => Some(DialogKind::Launch),
             Mode::Command(_) => Some(DialogKind::Command),
@@ -218,11 +215,6 @@ fn open_list_dialog(
                 "Sessions",
                 "Filter sessions",
                 core.session_picker_search.clone(),
-            ),
-            DialogKind::ServerPicker => (
-                "Servers",
-                "Filter servers",
-                core.server_picker_search.clone(),
             ),
             DialogKind::DirPicker => (
                 "New session — choose a directory",
@@ -585,18 +577,6 @@ fn list_rows(kind: DialogKind, core: &AppCore) -> (Vec<String>, usize) {
                 .min(rows.len().saturating_sub(1));
             (rows, sel)
         }
-        DialogKind::ServerPicker => {
-            let rows: Vec<String> = core
-                .filtered_servers()
-                .iter()
-                .take(50)
-                .map(|s| format!("{}    {}s    {}", s.display, s.sessions.len(), s.time_ago()))
-                .collect();
-            let sel = core
-                .server_picker_selected
-                .min(rows.len().saturating_sub(1));
-            (rows, sel)
-        }
         DialogKind::DirPicker => {
             use kmux_app::core::DirBrowserRow;
             let mut rows: Vec<String> = core
@@ -638,12 +618,6 @@ fn list_signature(core: &AppCore) -> String {
             core.session_picker_selected,
             core.session_picker_matches().len()
         ),
-        Some(DialogKind::ServerPicker) => format!(
-            "sv|{}|{}|{}",
-            core.server_picker_search,
-            core.server_picker_selected,
-            core.filtered_servers().len()
-        ),
         Some(DialogKind::DirPicker) => format!(
             "dir|{}|{}|{}|{}|{}",
             core.dir_browser_cwd,
@@ -683,8 +657,6 @@ fn move_selection(core: &mut AppCore, down: bool) {
     let action = match (DialogKind::from_mode(&core.mode), down) {
         (Some(DialogKind::SessionPicker), true) => Action::PickerDown,
         (Some(DialogKind::SessionPicker), false) => Action::PickerUp,
-        (Some(DialogKind::ServerPicker), true) => Action::ServerPickerDown,
-        (Some(DialogKind::ServerPicker), false) => Action::ServerPickerUp,
         (Some(DialogKind::DirPicker), true) => Action::DirPickerDown,
         (Some(DialogKind::DirPicker), false) => Action::DirPickerUp,
         (Some(DialogKind::Launch), true) => Action::LaunchDown,

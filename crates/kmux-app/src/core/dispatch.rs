@@ -12,11 +12,10 @@ use std::time::Instant;
 
 use crate::cmd;
 use crate::mode::{Action, Mode};
-use crate::recent_servers::ServerKind;
 
 use super::{
     AppCore, COMMAND_HISTORY_CAP, DirBrowserRow, KeyResult, LaunchRow, PendingClose,
-    SOFT_CLOSE_GRACE, SwitchTarget, TopBarAction,
+    SOFT_CLOSE_GRACE, TopBarAction,
 };
 
 impl AppCore {
@@ -170,31 +169,6 @@ impl AppCore {
             Action::PickerSearchBackspace => {
                 self.session_picker_search.pop();
                 self.session_picker_selected = 0;
-            }
-            Action::ServerPickerChar(ch) => {
-                self.server_picker_search.push(ch);
-                self.server_picker_selected = 0;
-            }
-            Action::ServerPickerBackspace => {
-                self.server_picker_search.pop();
-                self.server_picker_selected = 0;
-            }
-            Action::ServerPickerUp => {
-                self.server_picker_selected = self.server_picker_selected.saturating_sub(1);
-            }
-            Action::ServerPickerDown => {
-                let count = self.filtered_servers().len();
-                if count > 0 && self.server_picker_selected + 1 < count {
-                    self.server_picker_selected += 1;
-                }
-            }
-            Action::ServerPickerClose => {}
-            Action::ServerPickerSelect => {
-                // A different server switches; the same server (or no selection)
-                // just closes the picker (resolve already set Mode::Normal).
-                if let Some(target) = self.server_picker_switch_target() {
-                    return KeyResult::SwitchServer(target);
-                }
             }
             Action::Disconnect => {
                 self.mgr.disconnect();
@@ -464,7 +438,6 @@ impl AppCore {
                     cmd::exec::Outcome::Continue => {}
                     cmd::exec::Outcome::Quit => return KeyResult::Quit,
                     cmd::exec::Outcome::Reconnect => return KeyResult::Reconnect,
-                    cmd::exec::Outcome::SwitchServer(t) => return KeyResult::SwitchServer(t),
                 }
             }
 
@@ -700,44 +673,12 @@ impl AppCore {
             .any(|r| matches!(r, DirBrowserRow::Enter { .. }))
     }
 
-    /// The switch target for the current server-picker selection, or `None` when
-    /// nothing is selected or the selection is the already-connected server (in
-    /// which case the caller just closes the picker). Shared by the keyboard
-    /// `ServerPickerSelect` action and the pointer-driven activation.
-    fn server_picker_switch_target(&self) -> Option<SwitchTarget> {
-        let server = self
-            .filtered_servers()
-            .get(self.server_picker_selected)
-            .cloned()?;
-        if server.server_string == self.server_string {
-            return None;
-        }
-        Some(match server.kind {
-            ServerKind::Local => SwitchTarget::Local,
-            ServerKind::Ssh {
-                user,
-                host,
-                ssh_port,
-            } => SwitchTarget::Ssh(kmux_client::ssh::RemoteTarget {
-                user,
-                host,
-                ssh_port,
-            }),
-        })
-    }
-
     /// Apply a clickable top-bar action (server/connection/session badges, pane
     /// tabs, the `+` button). Frontend-neutral: the TUI hit-tests a column to a
     /// [`TopBarAction`], a GUI binds it to a widget; both then call this.
     /// Returns a [`KeyResult`] for actions that must reach the run loop.
     pub fn apply_top_bar_action(&mut self, action: TopBarAction) -> Option<KeyResult> {
         match action {
-            TopBarAction::OpenServerPicker => {
-                self.server_picker_selected = 0;
-                self.server_picker_search.clear();
-                self.mode = Mode::ServerPicker;
-                None
-            }
             TopBarAction::Reconnect => Some(KeyResult::Reconnect),
             TopBarAction::OpenSessionPicker => {
                 self.session_picker_selected = 0;
@@ -855,7 +796,6 @@ impl AppCore {
     pub fn set_picker_selected(&mut self, idx: usize) {
         match self.mode {
             Mode::SessionPicker => self.session_picker_selected = idx,
-            Mode::ServerPicker => self.server_picker_selected = idx,
             Mode::DirectoryPicker => self.dir_picker_selected = idx,
             Mode::LaunchPicker => self.launch_selected = idx,
             _ => {}
@@ -873,10 +813,6 @@ impl AppCore {
                 self.session_picker_search = text;
                 self.session_picker_selected = 0;
             }
-            Mode::ServerPicker => {
-                self.server_picker_search = text;
-                self.server_picker_selected = 0;
-            }
             Mode::DirectoryPicker => {
                 self.dir_picker_buffer = text;
                 self.dir_picker_selected = 0;
@@ -891,20 +827,15 @@ impl AppCore {
 
     /// Activate the current picker's selection (a click on a list item). Mirrors
     /// the keyboard Enter path but performs its own mode transition because it
-    /// does not pass through `mode::resolve`. Returns a [`KeyResult`] only for
-    /// the server picker, which may switch servers. For the directory browser
-    /// this navigates (Up / into a subdir) or creates a session (create-here),
-    /// identical to the keyboard `DirPickerSubmit` path.
+    /// does not pass through `mode::resolve`. For the directory browser this
+    /// navigates (Up / into a subdir) or creates a session (create-here),
+    /// identical to the keyboard `DirPickerSubmit` path; the launcher submits its
+    /// row. Returns a [`KeyResult`] only when an activation reaches the run loop.
     pub fn activate_picker_selection(&mut self) -> Option<KeyResult> {
         match self.mode {
             Mode::SessionPicker => {
                 self.select_session_picker_entry();
                 None
-            }
-            Mode::ServerPicker => {
-                let target = self.server_picker_switch_target();
-                self.mode = Mode::Normal;
-                target.map(KeyResult::SwitchServer)
             }
             Mode::DirectoryPicker => {
                 // A click on a browser row: create-here returns to Normal;
@@ -1123,20 +1054,6 @@ mod tests {
     }
 
     #[test]
-    fn top_bar_open_server_picker_resets_state_and_enters_mode() {
-        let mut core = fixture_core();
-        core.server_picker_search = "stale".into();
-        core.server_picker_selected = 4;
-        assert!(
-            core.apply_top_bar_action(TopBarAction::OpenServerPicker)
-                .is_none()
-        );
-        assert_eq!(core.mode, Mode::ServerPicker);
-        assert!(core.server_picker_search.is_empty());
-        assert_eq!(core.server_picker_selected, 0);
-    }
-
-    #[test]
     fn top_bar_open_session_picker_resets_state_and_enters_mode() {
         let mut core = fixture_core();
         core.session_picker_search = "stale".into();
@@ -1153,9 +1070,9 @@ mod tests {
     #[test]
     fn set_picker_selected_targets_the_active_picker_only() {
         let mut core = fixture_core();
-        core.mode = Mode::ServerPicker;
+        core.mode = Mode::LaunchPicker;
         core.set_picker_selected(3);
-        assert_eq!(core.server_picker_selected, 3);
+        assert_eq!(core.launch_selected, 3);
 
         core.mode = Mode::SessionPicker;
         core.set_picker_selected(2);
@@ -1165,7 +1082,7 @@ mod tests {
         core.mode = Mode::Normal;
         core.set_picker_selected(9);
         assert_eq!(core.session_picker_selected, 2);
-        assert_eq!(core.server_picker_selected, 3);
+        assert_eq!(core.launch_selected, 3);
     }
 
     #[test]
@@ -1178,11 +1095,11 @@ mod tests {
         assert_eq!(core.session_picker_search, "foo");
         assert_eq!(core.session_picker_selected, 0);
 
-        core.mode = Mode::ServerPicker;
-        core.server_picker_selected = 3;
+        core.mode = Mode::LaunchPicker;
+        core.launch_selected = 3;
         core.set_picker_search("bar".into());
-        assert_eq!(core.server_picker_search, "bar");
-        assert_eq!(core.server_picker_selected, 0);
+        assert_eq!(core.launch_search, "bar");
+        assert_eq!(core.launch_selected, 0);
 
         core.mode = Mode::DirectoryPicker;
         core.dir_picker_selected = 2;
@@ -1197,7 +1114,7 @@ mod tests {
         core.mode = Mode::Normal;
         core.set_picker_search("x".into());
         assert!(core.session_picker_search.is_empty());
-        assert!(core.server_picker_search.is_empty());
+        assert!(core.launch_search.is_empty());
         assert!(core.dir_picker_buffer.is_empty());
     }
 

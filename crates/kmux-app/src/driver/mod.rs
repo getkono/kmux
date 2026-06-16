@@ -92,7 +92,7 @@ fn env_u64(key: &str, default: u64) -> u64 {
         .unwrap_or(default)
 }
 
-use crate::core::{AppCore, BootstrapPhase, BootstrapTaskResult, KeyResult, SwitchTarget};
+use crate::core::{AppCore, BootstrapPhase, BootstrapTaskResult, KeyResult};
 use crate::mode::{Action, Mode};
 
 /// Liveness ping + timeout evaluation cadence.
@@ -642,7 +642,6 @@ impl FrontendDriver {
             KeyResult::Continue => {}
             KeyResult::Quit => effects.push(FrontendEffect::Quit),
             KeyResult::Reconnect => self.reconnect(),
-            KeyResult::SwitchServer(target) => self.switch_server(target),
             KeyResult::CopyToClipboard(text) => effects.push(FrontendEffect::CopyToClipboard(
                 sanitize_clipboard_text(&text).into_owned(),
             )),
@@ -661,19 +660,6 @@ impl FrontendDriver {
         let target = self.core.current_target();
         self.core
             .start_bootstrap(target, srv_tx, BootstrapPhase::Reconnect, bs_tx);
-        self.core.needs_render = true;
-    }
-
-    /// Apply a server-picker selection: `AppCore` mutates the server identity and
-    /// returns the target; the driver rebuilds channels and bootstraps it.
-    fn switch_server(&mut self, target: SwitchTarget) {
-        let (srv_tx, srv_rx) = mpsc::unbounded_channel();
-        self.srv_rx = srv_rx;
-        let resolved = self.core.prepare_switch(&target);
-        let (bs_tx, bs_rx) = mpsc::unbounded_channel();
-        self.bootstrap_rx = Some(bs_rx);
-        self.core
-            .start_bootstrap(resolved, srv_tx, BootstrapPhase::Initial, bs_tx);
         self.core.needs_render = true;
     }
 

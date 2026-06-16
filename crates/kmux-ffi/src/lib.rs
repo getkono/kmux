@@ -77,7 +77,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 12;
+pub const KMUX_FFI_ABI_VERSION: u32 = 13;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -824,7 +824,6 @@ pub struct FfiCommandHint {
 #[derive(uniffi::Enum)]
 pub enum FfiPickerKind {
     Session,
-    Server,
     Directory,
 }
 
@@ -1109,7 +1108,6 @@ pub enum FfiMode {
     Normal,
     Locked,
     SessionPicker,
-    ServerPicker,
     DirectoryPicker,
     /// Unified session launcher (issue #121); rows via `launch_picker()`.
     LaunchPicker,
@@ -1136,7 +1134,6 @@ fn mode_to_ffi(mode: &Mode) -> FfiMode {
         Mode::Normal => FfiMode::Normal,
         Mode::Locked => FfiMode::Locked,
         Mode::SessionPicker => FfiMode::SessionPicker,
-        Mode::ServerPicker => FfiMode::ServerPicker,
         Mode::DirectoryPicker => FfiMode::DirectoryPicker,
         Mode::LaunchPicker => FfiMode::LaunchPicker,
         Mode::AddRemote => FfiMode::AddRemote,
@@ -1966,27 +1963,6 @@ impl KmuxDriver {
                     entries,
                 })
             }
-            Mode::ServerPicker => {
-                let entries = core
-                    .filtered_servers()
-                    .into_iter()
-                    .map(|s| {
-                        // time_ago() borrows all of `s`, so compute it before
-                        // moving `display` out.
-                        let detail = s.time_ago();
-                        FfiPickerEntry {
-                            label: s.display,
-                            detail,
-                        }
-                    })
-                    .collect();
-                Some(FfiPicker {
-                    kind: FfiPickerKind::Server,
-                    query: core.server_picker_search.clone(),
-                    selected: core.server_picker_selected as u32,
-                    entries,
-                })
-            }
             Mode::DirectoryPicker => {
                 // The directory picker is a *browser* of the daemon host's
                 // filesystem. The richer per-row state is exposed via
@@ -2103,16 +2079,6 @@ impl KmuxDriver {
         let core = d.core_mut();
         core.disconnect_remote(&peer);
         core.needs_render = true;
-    }
-
-    /// Open the recent-servers picker.
-    pub fn open_server_picker(&self) -> Vec<FfiEffect> {
-        let _guard = self.rt.enter();
-        let mut d = self.inner.lock().expect("driver mutex poisoned");
-        d.apply_top_bar_action(TopBarAction::OpenServerPicker)
-            .into_iter()
-            .map(FfiEffect::from)
-            .collect()
     }
 
     /// Open the session picker.

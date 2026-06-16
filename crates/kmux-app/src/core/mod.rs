@@ -59,8 +59,6 @@ pub enum KeyResult {
     Quit,
     /// User submitted the Connect form; the frontend must replace `srv_rx`.
     Reconnect,
-    /// User selected a server from the server picker.
-    SwitchServer(SwitchTarget),
     /// Core requests the frontend copy this text to the system clipboard.
     /// Clipboard access is toolkit-specific, so it is performed frontend-side.
     CopyToClipboard(String),
@@ -69,19 +67,11 @@ pub enum KeyResult {
     RequestPaste,
 }
 
-/// Destination chosen from the server picker.
-#[derive(Debug)]
-pub enum SwitchTarget {
-    Local,
-    Ssh(RemoteTarget),
-}
-
 /// Action carried by a clickable top-bar segment. Frontend-neutral intent: a
 /// GUI binds these to widgets for click handling. The hit-testing geometry
 /// itself stays frontend-side.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum TopBarAction {
-    OpenServerPicker,
     Reconnect,
     OpenSessionPicker,
     /// Open the unified session launcher (issue #121): the new-session button.
@@ -286,10 +276,6 @@ pub struct AppCore {
     /// Connection kind for the current server (used for reconnect routing).
     pub server_kind: ServerKind,
 
-    // Server picker state.
-    pub server_picker_selected: usize,
-    pub server_picker_search: String,
-
     /// Persisted recent-servers cache.
     pub recent_servers: RecentServersCache,
 
@@ -481,8 +467,6 @@ impl AppCore {
             server_display,
             server_string,
             server_kind,
-            server_picker_selected: 0,
-            server_picker_search: String::new(),
             recent_servers,
             needs_render: true,
             force_clear: false,
@@ -639,8 +623,6 @@ impl AppCore {
             server_display: String::new(),
             server_string: String::new(),
             server_kind: ServerKind::Local,
-            server_picker_selected: 0,
-            server_picker_search: String::new(),
             recent_servers: RecentServersCache::load(),
             needs_render: true,
             force_clear: false,

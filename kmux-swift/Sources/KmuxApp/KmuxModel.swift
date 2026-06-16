@@ -165,11 +165,6 @@ final class KmuxModel: ObservableObject {
         apply(driver.focusPane(paneId: id))
     }
 
-    /// Open the recent-servers picker.
-    func openServerPicker() {
-        apply(driver.openServerPicker())
-    }
-
     /// Open the session picker.
     func openSessionPicker() {
         apply(driver.openSessionPicker())

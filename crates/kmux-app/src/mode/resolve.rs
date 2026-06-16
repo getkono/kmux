@@ -239,19 +239,6 @@ pub fn resolve_session_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Acti
     )
 }
 
-pub fn resolve_server_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
-    resolve_picker(
-        key,
-        mods,
-        Action::ServerPickerClose,
-        Action::ServerPickerSelect,
-        Action::ServerPickerUp,
-        Action::ServerPickerDown,
-        Action::ServerPickerBackspace,
-        Action::ServerPickerChar,
-    )
-}
-
 pub fn resolve_help(key: &Key) -> (Option<Mode>, Action) {
     // Any key exits help
     let _ = key;
@@ -463,17 +450,6 @@ mod tests {
         );
         assert_eq!(mode, Some(Mode::Normal));
         assert_eq!(action, Action::DirPickerCancel);
-    }
-
-    #[test]
-    fn ctrl_c_cancels_server_picker() {
-        let (mode, action) = resolve(
-            &Mode::ServerPicker,
-            &Key::Character("c".into()),
-            Modifiers::CTRL,
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-        assert_eq!(action, Action::ServerPickerClose);
     }
 
     #[test]
