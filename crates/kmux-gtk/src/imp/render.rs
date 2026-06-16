@@ -430,6 +430,35 @@ fn draw_cursor(
     // override it independently of the text foreground.
     let cur = palette.cursor_bg;
 
+    // Render-debug trace: the Cairo path's hardcoded cursor geometry (2px
+    // bar/underline below) side-by-side with what kmux-render's `cursor_geometry`
+    // would compute (scale-aware `cursor_thickness`). The divergence is the prime
+    // suspect for incorrect cursor rendering — enable with
+    // `RUST_LOG="kmux::render_debug=trace"`.
+    if tracing::enabled!(target: "kmux::render_debug", tracing::Level::TRACE) {
+        let rcell = kmux_render::CellMetrics::new(m.cell_w as f32, m.cell_h as f32);
+        let cv = kmux_render::CursorView {
+            col: cursor.col,
+            row: cursor.row,
+            shape: cursor.shape,
+            blink: cursor.blink,
+            visible: cursor.visible,
+        };
+        let geo = kmux_render::cursor_geometry(&cv, (0.0, 0.0), cols as u16, rows as u16, &rcell);
+        tracing::trace!(
+            target: "kmux::render_debug",
+            col = cursor.col,
+            row = cursor.row,
+            shape = ?cursor.shape,
+            cairo_x = x,
+            cairo_y = y,
+            cairo_bar_underline_thickness = 2.0_f64,
+            renderer_cursor_thickness = rcell.cursor_thickness,
+            renderer_rect0 = ?geo.rects.first(),
+            "cairo cursor vs kmux-render geometry"
+        );
+    }
+
     match cursor.shape {
         CursorShape::Block => {
             // Inverted block: fill with the cursor color, redraw the glyph in

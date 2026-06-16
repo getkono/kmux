@@ -210,6 +210,19 @@ impl AppCore {
             Action::ToggleConnection => {
                 self.connection_overlay_visible = !self.connection_overlay_visible;
             }
+            Action::ToggleRenderDebug => {
+                self.render_debug_visible = !self.render_debug_visible;
+            }
+            Action::ResetRenderer => {
+                tracing::info!(
+                    target: "kmux::render_debug",
+                    "ResetRenderer requested: rebuilding renderer + atlas, full repaint"
+                );
+                // Force a full re-pack/repaint; the frontend rebuilds its own
+                // renderer/atlas on the resulting effect (it owns that object).
+                self.force_clear = true;
+                return KeyResult::ResetRenderer;
+            }
             Action::ToggleSnapshotMode => {
                 self.force_snapshot_mode = !self.force_snapshot_mode;
                 self.mgr.set_snapshot_mode(self.force_snapshot_mode);
@@ -938,6 +951,24 @@ mod tests {
         // Undo → cancelled; the shell was never touched.
         core.dispatch_action(Action::UndoClose).await;
         assert!(!core.has_pending_close());
+    }
+
+    #[tokio::test]
+    async fn toggle_render_debug_flips_flag() {
+        let mut core = fixture_core();
+        assert!(!core.render_debug_visible);
+        core.dispatch_action(Action::ToggleRenderDebug).await;
+        assert!(core.render_debug_visible);
+        core.dispatch_action(Action::ToggleRenderDebug).await;
+        assert!(!core.render_debug_visible);
+    }
+
+    #[tokio::test]
+    async fn reset_renderer_signals_keyresult_and_forces_clear() {
+        let mut core = fixture_core();
+        let result = core.dispatch_action(Action::ResetRenderer).await;
+        assert!(matches!(result, KeyResult::ResetRenderer));
+        assert!(core.force_clear); // full re-pack/repaint on the next tick
     }
 
     #[test]

@@ -79,6 +79,10 @@ struct ContentView: View {
                 HudOverlay(model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topTrailing)
                     .padding(8)
+                // Render-debug overlay: top-leading, opposite the top-trailing HUD.
+                RenderDebugOverlay(model: model)
+                    .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .topLeading)
+                    .padding(8)
                 SoftCloseBanner(model: model)
                     .frame(maxWidth: .infinity, maxHeight: .infinity, alignment: .bottom)
             }
@@ -209,6 +213,11 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut("m", modifiers: [.command, .shift])
             Toggle("Connection Inspector", isOn: connectionBinding)
                 .keyboardShortcut("i", modifiers: [.command, .shift])
+            // Render-debug overlay + renderer reset (debugging cursor rendering).
+            // ⌘⇧G (⌘⇧D is Split Down); reset has no default shortcut.
+            Toggle("Render Debug", isOn: renderDebugBinding)
+                .keyboardShortcut("g", modifiers: [.command, .shift])
+            Button("Reset Renderer") { model.dispatch(.resetRenderer) }
         }
         // Tiling: split the focused pane, move focus, resize, swap (the analog of
         // kmux-gtk's tiling accelerators). iTerm2-style split shortcuts; ⌘⌥ moves
@@ -283,6 +292,13 @@ struct KmuxCommands: Commands {
         Binding(
             get: { model.connectionVisible },
             set: { _ in model.dispatch(.toggleConnection) }
+        )
+    }
+
+    private var renderDebugBinding: Binding<Bool> {
+        Binding(
+            get: { model.renderDebugVisible },
+            set: { _ in model.dispatch(.toggleRenderDebug) }
         )
     }
 

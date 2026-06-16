@@ -145,6 +145,55 @@ GPU path logs adapter/surface setup, resizes, and frame errors there (raise
 verbosity with `RUST_LOG=kmux=debug` or `=trace`). The daemon logs separately to
 the daemon log file.
 
+## Render debugging (cursor geometry et al.)
+
+When the terminal renders something wrong — the original motivating case was the
+**cursor** — there are two ways to see what the renderer is actually handed,
+without a debugger.
+
+**Render-debug overlay** — a live OSD (top-leading, opposite the perf HUD) that
+shows, for the focused pane: the active renderer leaf (`cairo`/`coretext`/`wgpu`),
+the frame/grid/cell geometry, the cursor's *logical* state (col, row, shape,
+blink, visible, `is_drawn`), and the exact pixel rect
+[`cursor_geometry`](../crates/kmux-render/src/geometry.rs) computes for it. On the
+GPU path it also shows the scene primitive counts. Toggle it:
+
+- **GTK**: `Ctrl+Shift+D` (hamburger menu → *Render Debug*).
+- **Swift**: `⌘⇧G` (Session menu → *Render Debug*).
+
+Compare the overlay's `px:` line against what you see drawn. The overlay's rect
+comes from `cursor_geometry`, which shares its per-shape rect math
+(`cursor_shape_rects`) with the renderer's `emit_cursor`, so it provably matches
+the GPU path. The **CPU** paths rasterize the cursor directly with their *own*
+constants — GTK Cairo and Swift CoreText both hardcode a **2px** bar/underline,
+while the renderer uses a scale-aware `cursor_thickness` (`(cell_h*0.1).max(1)`).
+That divergence is exactly the kind of bug the overlay surfaces.
+
+**Structured traces** — under the `kmux::render_debug` target:
+
+- `RUST_LOG="kmux::render_debug=trace"` — per-frame cursor geometry. The GPU path
+  logs `cursor_geometry`'s rect; the GTK Cairo path logs its hardcoded constants
+  *next to* the renderer's `cursor_thickness` (one line, side by side) — diffing
+  the two pinpoints a cursor mismatch. Also emits a one-shot line on renderer reset.
+- `RUST_LOG=kmux_render=trace` — the renderer's own render/resize/atlas-rebuild
+  lines (adapter, surface, frame skips).
+
+**Renderer reset** — a diagnostic that rebuilds the renderer + glyph atlas (and
+re-measures cell metrics) and forces a full repaint, to clear any corrupt cached
+state. GTK: `Ctrl+Shift+F5` (menu → *Reset Renderer*). Swift: Session menu →
+*Reset Renderer*. On the CPU paths (no persistent atlas) it degrades to a full
+re-pack + repaint. It routes through `Action::ResetRenderer` →
+`FrontendEffect::ResetRenderer`, because the renderer object is frontend-owned, so
+only the frontend can drop and recreate it.
+
+The toolkit-agnostic half lives in `kmux-app`
+([`core::render_debug`](../crates/kmux-app/src/core/render_debug.rs)): it assembles
+the *logical* snapshot only (no kmux-render types — `kmux-render` depends on
+`kmux-app`, so the reverse would be a cargo cycle). Each frontend turns the logical
+cursor into pixel rects via `kmux_render::cursor_geometry` (GTK directly; Swift via
+the `kmux-ffi` `render_debug` getter), so the rects reflect that frontend's *own*
+cell metrics.
+
 ## Testing
 
 Two tiers:

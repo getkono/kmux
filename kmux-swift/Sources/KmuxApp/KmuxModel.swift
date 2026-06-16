@@ -37,6 +37,9 @@ final class KmuxModel: ObservableObject {
     @Published private(set) var softClosePending = false
     /// Whether the connection inspector sheet is open (issue #60).
     @Published private(set) var connectionVisible = false
+    /// Whether the render-debug overlay is shown (what the renderer is handed
+    /// each frame — for debugging cursor rendering).
+    @Published private(set) var renderDebugVisible = false
     /// Connection pause state for the menu check + indicator (issue #68).
     @Published private(set) var pauseState: FfiPauseState = .active
 
@@ -329,7 +332,31 @@ final class KmuxModel: ObservableObject {
             if let text = readClipboard() { driver.feedPaste(text: text) }
         case .quit:
             NSApplication.shared.terminate(nil)
+        case .resetRenderer:
+            // Diagnostic: re-pack every pane and rebuild the GPU renderer + atlas.
+            forceRefetch = true
+            lastGenByPane.removeAll()
+            terminalView?.resetGpuRenderer()
         }
+    }
+
+    /// Build the render-debug snapshot for the overlay: pass the view's content
+    /// size, backing scale, renderer leaf, and cell geometry; the Rust side fills
+    /// the logical pane/cursor state and computes the cursor's pixel rects. The
+    /// cell geometry is in points (matching the CoreText path), so the pixel rect
+    /// is directly comparable to what `drawCursor` paints.
+    func renderDebug() -> FfiRenderDebug {
+        let size = terminalView?.bounds.size ?? .zero
+        let scale = Float(terminalView?.window?.backingScaleFactor ?? 2.0)
+        let m = terminalView?.metrics
+        return driver.renderDebug(
+            frameWidth: UInt32(max(size.width, 0)),
+            frameHeight: UInt32(max(size.height, 0)),
+            scale: scale,
+            renderer: terminalView?.activeRendererName ?? "coretext",
+            cellW: Float(m?.cellWidth ?? 0),
+            cellH: Float(m?.cellHeight ?? 0)
+        )
     }
 
     /// Refresh the published chrome state, assigning only on change so SwiftUI
@@ -357,6 +384,8 @@ final class KmuxModel: ObservableObject {
         if pendingClose != softClosePending { softClosePending = pendingClose }
         let connVisible = driver.connectionVisible()
         if connVisible != connectionVisible { connectionVisible = connVisible }
+        let rd = driver.renderDebugVisible()
+        if rd != renderDebugVisible { renderDebugVisible = rd }
         let ps = driver.pauseState()
         if ps != pauseState { pauseState = ps }
     }

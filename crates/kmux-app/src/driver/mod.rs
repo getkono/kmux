@@ -120,6 +120,10 @@ pub enum FrontendEffect {
     NeedsRender,
     /// Perform a full repaint (clear + redraw).
     ForceClear,
+    /// Diagnostic: rebuild the frontend's renderer + glyph atlas, then repaint.
+    /// The renderer object is frontend-owned, so only the frontend can recreate
+    /// it — hence this dedicated effect (see [`crate::mode::Action::ResetRenderer`]).
+    ResetRenderer,
     /// The `/theme` palette changed; reload toolkit-specific chrome styling.
     /// Implies a repaint. Read the new palette from [`FrontendDriver::palette`].
     PaletteChanged,
@@ -642,6 +646,7 @@ impl FrontendDriver {
             KeyResult::Continue => {}
             KeyResult::Quit => effects.push(FrontendEffect::Quit),
             KeyResult::Reconnect => self.reconnect(),
+            KeyResult::ResetRenderer => effects.push(FrontendEffect::ResetRenderer),
             KeyResult::CopyToClipboard(text) => effects.push(FrontendEffect::CopyToClipboard(
                 sanitize_clipboard_text(&text).into_owned(),
             )),
@@ -741,6 +746,26 @@ impl FrontendDriver {
     /// Whether the cursor is shown on the current frame (blink phase).
     pub fn blink_on(&self) -> bool {
         self.blink_on
+    }
+
+    /// Whether the render-debug overlay is shown (the frontend reconciles its
+    /// overlay against this each pump).
+    pub fn render_debug_visible(&self) -> bool {
+        self.core.render_debug_visible
+    }
+
+    /// Assemble a [`RenderDebugSnapshot`] for the focused pane, supplying the
+    /// driver's current blink phase. The frontend passes its own pixel/scale/
+    /// renderer context.
+    pub fn render_debug_snapshot(
+        &self,
+        frame_width: u32,
+        frame_height: u32,
+        scale: f32,
+        renderer: &str,
+    ) -> crate::core::RenderDebugSnapshot {
+        self.core
+            .render_debug_snapshot(frame_width, frame_height, scale, renderer, self.blink_on)
     }
 
     /// Borrow the wrapped [`AppCore`] (read). Most frontends reach core state

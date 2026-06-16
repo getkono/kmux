@@ -77,7 +77,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 13;
+pub const KMUX_FFI_ABI_VERSION: u32 = 14;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -144,9 +144,13 @@ pub enum FfiEffect {
     NeedsRender,
     ForceClear,
     PaletteChanged,
-    CopyToClipboard { text: String },
+    CopyToClipboard {
+        text: String,
+    },
     RequestPaste,
     Quit,
+    /// Diagnostic: rebuild the Metal renderer + glyph atlas, then repaint.
+    ResetRenderer,
 }
 
 impl From<FrontendEffect> for FfiEffect {
@@ -158,6 +162,7 @@ impl From<FrontendEffect> for FfiEffect {
             FrontendEffect::CopyToClipboard(text) => FfiEffect::CopyToClipboard { text },
             FrontendEffect::RequestPaste => FfiEffect::RequestPaste,
             FrontendEffect::Quit => FfiEffect::Quit,
+            FrontendEffect::ResetRenderer => FfiEffect::ResetRenderer,
         }
     }
 }
@@ -213,6 +218,10 @@ pub enum FfiAction {
     ToggleMetrics,
     /// Toggle the connection inspector overlay (issue #60).
     ToggleConnection,
+    /// Toggle the render-debug overlay (what the renderer is handed each frame).
+    ToggleRenderDebug,
+    /// Rebuild the renderer + glyph atlas and full-repaint (diagnostic).
+    ResetRenderer,
     ToggleInputLock,
     /// Toggle connection pause to save bandwidth (issue #68).
     TogglePause,
@@ -259,6 +268,8 @@ impl From<FfiAction> for Action {
             FfiAction::ToggleHud => Action::ToggleHud,
             FfiAction::ToggleMetrics => Action::ToggleMetrics,
             FfiAction::ToggleConnection => Action::ToggleConnection,
+            FfiAction::ToggleRenderDebug => Action::ToggleRenderDebug,
+            FfiAction::ResetRenderer => Action::ResetRenderer,
             FfiAction::ToggleInputLock => Action::ToggleInputLock,
             FfiAction::TogglePause => Action::TogglePause,
             FfiAction::CopySelection => Action::CopySelection,
@@ -467,6 +478,53 @@ pub struct GridSnapshot {
     pub cols: u32,
     pub cursor: FfiCursor,
     pub cells: Vec<u8>,
+}
+
+/// One solid rect of the cursor in physical px — exactly what `kmux_render`
+/// would fill (block/bar/underline = 1 rect; hollow-block = 4).
+#[derive(uniffi::Record)]
+pub struct FfiCursorRect {
+    pub x: f32,
+    pub y: f32,
+    pub w: f32,
+    pub h: f32,
+}
+
+/// What the renderer is handed for the focused pane this frame, for the Swift
+/// render-debug overlay. Mirrors [`kmux_app::core::RenderDebugSnapshot`] (a flat
+/// record, like [`FfiCursor`]), with the cursor's pixel rects computed here via
+/// [`kmux_render::cursor_geometry`] from the cell geometry Swift passes in.
+///
+/// `has_pane` gates the pane fields; `has_cursor` gates the cursor fields (false
+/// when no pane is active or it is scrolled into history). `cursor_shape` uses
+/// the same code as [`FfiCursor::shape`] (0=block … 4=hidden).
+#[derive(uniffi::Record)]
+pub struct FfiRenderDebug {
+    pub frame_width: u32,
+    pub frame_height: u32,
+    pub scale: f32,
+    pub renderer: String,
+    pub blink_on: bool,
+    /// The renderer's scale-aware cursor thickness for the passed cell geometry
+    /// (compare against the CoreText path's own constants).
+    pub cursor_thickness: f32,
+    pub has_pane: bool,
+    pub pane_id: String,
+    pub grid_cols: u32,
+    pub grid_rows: u32,
+    pub scroll_offset: u64,
+    pub has_cursor: bool,
+    pub cursor_col: u32,
+    pub cursor_row: u32,
+    pub cursor_shape: u8,
+    pub cursor_blink: bool,
+    pub cursor_visible: bool,
+    pub cursor_is_drawn: bool,
+    /// Whether the cursor falls within the grid (else `cursor_rects` is empty).
+    pub cursor_in_range: bool,
+    pub cursor_cell_x: f32,
+    pub cursor_cell_y: f32,
+    pub cursor_rects: Vec<FfiCursorRect>,
 }
 
 /// An RGB palette color.
@@ -2204,6 +2262,14 @@ impl KmuxDriver {
             .connection_overlay_visible
     }
 
+    /// Whether the render-debug overlay is shown.
+    pub fn render_debug_visible(&self) -> bool {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .render_debug_visible()
+    }
+
     /// The live connection / session / handshake details for the connection
     /// inspector. Built from the toolkit-neutral `ConnectionInfo`.
     pub fn connection_details(&self) -> FfiConnectionDetails {
@@ -2264,6 +2330,89 @@ impl KmuxDriver {
             latency_stale: core.net_latency_stale(),
             render_fps: core.render_fps(),
         }
+    }
+
+    /// What the renderer is handed for the focused pane this frame, for the
+    /// render-debug overlay. Swift passes its content-area pixel size, scale,
+    /// renderer leaf, and cell geometry; the cursor's pixel rects are computed
+    /// here via [`kmux_render::cursor_geometry`] so they match the renderer.
+    pub fn render_debug(
+        &self,
+        frame_width: u32,
+        frame_height: u32,
+        scale: f32,
+        renderer: String,
+        cell_w: f32,
+        cell_h: f32,
+    ) -> FfiRenderDebug {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let snap = d.render_debug_snapshot(frame_width, frame_height, scale, &renderer);
+        let cell = kmux_render::CellMetrics::new(cell_w, cell_h);
+
+        let mut out = FfiRenderDebug {
+            frame_width: snap.frame_width,
+            frame_height: snap.frame_height,
+            scale: snap.scale,
+            renderer: snap.renderer,
+            blink_on: snap.blink_on,
+            cursor_thickness: cell.cursor_thickness,
+            has_pane: false,
+            pane_id: String::new(),
+            grid_cols: 0,
+            grid_rows: 0,
+            scroll_offset: 0,
+            has_cursor: false,
+            cursor_col: 0,
+            cursor_row: 0,
+            cursor_shape: 0,
+            cursor_blink: false,
+            cursor_visible: false,
+            cursor_is_drawn: false,
+            cursor_in_range: false,
+            cursor_cell_x: 0.0,
+            cursor_cell_y: 0.0,
+            cursor_rects: Vec::new(),
+        };
+
+        if let Some(p) = snap.pane {
+            out.has_pane = true;
+            out.pane_id = p.pane_id;
+            out.grid_cols = p.grid_cols as u32;
+            out.grid_rows = p.grid_rows as u32;
+            out.scroll_offset = p.scroll_offset as u64;
+            if let Some(c) = p.cursor {
+                let cv = kmux_render::CursorView {
+                    col: c.col,
+                    row: c.row,
+                    shape: c.shape,
+                    blink: c.blink,
+                    visible: c.visible,
+                };
+                let geo =
+                    kmux_render::cursor_geometry(&cv, (0.0, 0.0), p.grid_cols, p.grid_rows, &cell);
+                out.has_cursor = true;
+                out.cursor_col = c.col as u32;
+                out.cursor_row = c.row as u32;
+                out.cursor_shape = packed::cursor_shape_code(c.shape);
+                out.cursor_blink = c.blink;
+                out.cursor_visible = c.visible;
+                out.cursor_is_drawn = c.is_drawn;
+                out.cursor_in_range = geo.in_range;
+                out.cursor_cell_x = geo.cell_origin.0;
+                out.cursor_cell_y = geo.cell_origin.1;
+                out.cursor_rects = geo
+                    .rects
+                    .into_iter()
+                    .map(|r| FfiCursorRect {
+                        x: r.x,
+                        y: r.y,
+                        w: r.w,
+                        h: r.h,
+                    })
+                    .collect();
+            }
+        }
+        out
     }
 
     /// The built-in theme names (for a Preferences theme picker).

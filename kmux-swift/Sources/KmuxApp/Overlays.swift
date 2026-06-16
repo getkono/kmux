@@ -19,6 +19,76 @@ struct HudOverlay: View {
     }
 }
 
+/// The live render-debug overlay (⌘⇧G), the analog of kmux-gtk's render-debug
+/// OSD: what the renderer is handed each frame — renderer leaf, frame/grid/cell
+/// geometry, the cursor's logical state, and the exact pixel rect
+/// `kmux_render::cursor_geometry` computes for it (compare against the CoreText
+/// path's own hardcoded 2pt cursor). Polls a few times a second.
+struct RenderDebugOverlay: View {
+    @ObservedObject var model: KmuxModel
+
+    var body: some View {
+        if model.renderDebugVisible {
+            TimelineView(.periodic(from: .now, by: 0.25)) { _ in
+                RenderDebugLines(d: model.renderDebug())
+                    .font(.system(.caption2, design: .monospaced))
+                    .padding(8)
+                    .background(.thinMaterial, in: RoundedRectangle(cornerRadius: 6))
+            }
+        }
+    }
+}
+
+/// The render-debug readout (mirrors kmux-gtk's render-debug overlay lines).
+private struct RenderDebugLines: View {
+    let d: FfiRenderDebug
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text("renderer: \(d.renderer)   frame: \(d.frameWidth)×\(d.frameHeight)pt   scale: \(fmt0(d.scale))")
+            Text("cell cursor_thickness: \(fmt2(d.cursorThickness))pt   blink_on: \(yn(d.blinkOn))")
+            if d.hasPane {
+                Text("pane: \(d.paneId)   grid: \(d.gridCols)×\(d.gridRows)   scroll: \(d.scrollOffset)")
+                if d.hasCursor {
+                    Text(
+                        "cursor: (\(d.cursorCol),\(d.cursorRow)) \(shapeName(d.cursorShape))  "
+                            + "blink=\(yn(d.cursorBlink)) vis=\(yn(d.cursorVisible)) drawn=\(yn(d.cursorIsDrawn))"
+                    )
+                    if !d.cursorInRange {
+                        Text("  px: out of range")
+                    } else if let r = d.cursorRects.first {
+                        Text(
+                            "  px: x=\(fmt1(r.x)) y=\(fmt1(r.y)) w=\(fmt1(r.w)) h=\(fmt1(r.h))  "
+                                + "(\(d.cursorRects.count) rect/s)")
+                    } else {
+                        Text("  px: no rects (hidden shape)")
+                    }
+                } else {
+                    Text("cursor: hidden (scrolled into history)")
+                }
+            } else {
+                Text("pane: (none)")
+            }
+        }
+    }
+
+    private func yn(_ b: Bool) -> String { b ? "true" : "false" }
+    private func fmt0(_ v: Float) -> String { String(format: "%.0f", Double(v)) }
+    private func fmt1(_ v: Float) -> String { String(format: "%.1f", Double(v)) }
+    private func fmt2(_ v: Float) -> String { String(format: "%.2f", Double(v)) }
+
+    private func shapeName(_ code: UInt8) -> String {
+        switch code {
+        case 0: return "block"
+        case 1: return "underline"
+        case 2: return "bar"
+        case 3: return "hollow"
+        case 4: return "hidden"
+        default: return "?\(code)"
+        }
+    }
+}
+
 /// The metrics inspector sheet (⌘⇧M), the analog of kmux-gtk's metrics dialog.
 struct MetricsView: View {
     @ObservedObject var model: KmuxModel

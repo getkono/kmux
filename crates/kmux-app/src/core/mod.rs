@@ -26,9 +26,11 @@ use crate::theme::Theme;
 mod connection_info;
 mod dispatch;
 mod orchestration;
+mod render_debug;
 
 pub use connection_info::{ConnectionInfo, RttInfo, TransportTraffic};
 pub use orchestration::{BootstrapPhase, BootstrapTaskResult};
+pub use render_debug::{CursorDebug, PaneDebug, RenderDebugSnapshot};
 
 /// Maximum entries kept in [`AppCore::command_history`].
 pub const COMMAND_HISTORY_CAP: usize = 100;
@@ -59,6 +61,9 @@ pub enum KeyResult {
     Quit,
     /// User submitted the Connect form; the frontend must replace `srv_rx`.
     Reconnect,
+    /// Diagnostic: the frontend must rebuild its renderer + glyph atlas (it owns
+    /// that object) and force a full repaint. See [`crate::mode::Action::ResetRenderer`].
+    ResetRenderer,
     /// Core requests the frontend copy this text to the system clipboard.
     /// Clipboard access is toolkit-specific, so it is performed frontend-side.
     CopyToClipboard(String),
@@ -215,6 +220,10 @@ pub struct AppCore {
     /// Whether the connection inspector overlay is open (issue #60). Like the
     /// metrics overlay, this is a passive flag the frontends reconcile against.
     pub connection_overlay_visible: bool,
+    /// Whether the render-debug overlay is shown — the diagnostic that exposes
+    /// what the renderer is handed each frame (cursor logical + pixel geometry,
+    /// renderer leaf, scene counts). A passive flag the frontends reconcile.
+    pub render_debug_visible: bool,
     pub force_snapshot_mode: bool,
 
     /// Connection paused by an explicit user toggle (issue #68). Persists across
@@ -446,6 +455,7 @@ impl AppCore {
             hud_visible: cfg!(debug_assertions),
             metrics_overlay_visible: false,
             connection_overlay_visible: false,
+            render_debug_visible: false,
             force_snapshot_mode: false,
             manual_pause: false,
             auto_pause: false,
@@ -602,6 +612,7 @@ impl AppCore {
             hud_visible: false,
             metrics_overlay_visible: false,
             connection_overlay_visible: false,
+            render_debug_visible: false,
             force_snapshot_mode: false,
             manual_pause: false,
             auto_pause: false,
