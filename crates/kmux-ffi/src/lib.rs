@@ -47,7 +47,9 @@ use tokio::runtime::Runtime;
 use kmux_app::appearance::{Appearance, CellAdjust};
 use kmux_app::cmd;
 use kmux_app::config;
-use kmux_app::core::{AppCore, DirBrowserRow, PauseReason, TopBarAction};
+use kmux_app::core::{
+    AddRemoteForm, AppCore, DirBrowserRow, LaunchRow, PauseReason, RemoteStatus, TopBarAction,
+};
 use kmux_app::driver::{FrontendDriver, FrontendEffect};
 use kmux_app::mode::{Action, CommandState, Mode};
 use kmux_app::subcommands::parse_target;
@@ -75,7 +77,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 11;
+pub const KMUX_FFI_ABI_VERSION: u32 = 12;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -886,6 +888,178 @@ pub struct FfiDirBrowser {
     pub error: Option<String>,
 }
 
+/// Connection status of a remote in the launcher (issue #121), mirroring
+/// [`RemoteStatus`]. The error reason is carried on the row's `detail`.
+#[derive(uniffi::Enum, Debug, PartialEq, Eq)]
+pub enum FfiRemoteStatus {
+    Idle,
+    Connecting,
+    Connected,
+    Error,
+}
+
+/// The role of a launcher row, so the native UI renders the right control and
+/// activation is unambiguous.
+#[derive(uniffi::Enum, Debug, PartialEq, Eq)]
+pub enum FfiLaunchRowKind {
+    /// Open a new local session (opens the directory browser).
+    LocalNewSession,
+    /// Attach an existing local session.
+    LocalExisting,
+    /// A remote's header/toggle row (expand connects on focus).
+    Remote,
+    /// Open a new session on the remote (opens the path prompt).
+    RemoteNewSession,
+    /// Attach an existing session on the remote.
+    RemoteExisting,
+    /// Add a new remote (opens the add-remote form).
+    AddRemote,
+}
+
+/// One row in the unified session launcher (issue #121), flattened for native
+/// rendering. `peer`/`word_id` carry the routing keys; `status`/`expanded` drive
+/// a remote header; `active` marks the focused session.
+#[derive(uniffi::Record)]
+pub struct FfiLaunchRow {
+    pub kind: FfiLaunchRowKind,
+    pub label: String,
+    /// Secondary text: a session's cwd, or a remote's status / error reason.
+    pub detail: String,
+    pub peer: Option<String>,
+    pub word_id: Option<String>,
+    pub status: FfiRemoteStatus,
+    pub expanded: bool,
+    pub active: bool,
+}
+
+/// The launcher's full state, for native rendering. Driven via the generic
+/// `set_picker_search` / `set_picker_selected` / `activate_picker` /
+/// `cancel_picker` (the launcher is a picker), plus `launch_*` helpers.
+#[derive(uniffi::Record)]
+pub struct FfiLaunchPicker {
+    pub query: String,
+    pub selected: u32,
+    pub rows: Vec<FfiLaunchRow>,
+}
+
+/// Values for the add-remote form (issue #121), mirroring [`AddRemoteForm`].
+#[derive(uniffi::Record)]
+pub struct FfiAddRemoteForm {
+    pub use_ssh: bool,
+    pub host: String,
+    pub user: String,
+    pub port: Option<u16>,
+    pub token: String,
+    pub accept_invalid_certs: bool,
+}
+
+impl From<FfiAddRemoteForm> for AddRemoteForm {
+    fn from(f: FfiAddRemoteForm) -> Self {
+        AddRemoteForm {
+            use_ssh: f.use_ssh,
+            host: f.host,
+            user: f.user,
+            port: f.port,
+            token: f.token,
+            accept_invalid_certs: f.accept_invalid_certs,
+        }
+    }
+}
+
+fn remote_status_to_ffi(s: &RemoteStatus) -> FfiRemoteStatus {
+    match s {
+        RemoteStatus::Idle => FfiRemoteStatus::Idle,
+        RemoteStatus::Connecting => FfiRemoteStatus::Connecting,
+        RemoteStatus::Connected => FfiRemoteStatus::Connected,
+        RemoteStatus::Error(_) => FfiRemoteStatus::Error,
+    }
+}
+
+/// Flatten a [`LaunchRow`] into its FFI projection.
+fn launch_row_to_ffi(row: LaunchRow) -> FfiLaunchRow {
+    let idle = FfiLaunchRow {
+        kind: FfiLaunchRowKind::AddRemote,
+        label: String::new(),
+        detail: String::new(),
+        peer: None,
+        word_id: None,
+        status: FfiRemoteStatus::Idle,
+        expanded: false,
+        active: false,
+    };
+    match row {
+        LaunchRow::LocalNewSession { default_cwd } => FfiLaunchRow {
+            kind: FfiLaunchRowKind::LocalNewSession,
+            label: "New local session".to_string(),
+            detail: default_cwd,
+            ..idle
+        },
+        LaunchRow::LocalExisting {
+            word_id,
+            name,
+            cwd,
+            active,
+        } => FfiLaunchRow {
+            kind: FfiLaunchRowKind::LocalExisting,
+            label: name,
+            detail: cwd,
+            word_id: Some(word_id),
+            active,
+            ..idle
+        },
+        LaunchRow::Remote {
+            peer,
+            label,
+            status,
+            expanded,
+        } => {
+            let detail = match &status {
+                RemoteStatus::Error(reason) => reason.clone(),
+                RemoteStatus::Connecting => "connecting…".to_string(),
+                RemoteStatus::Connected => "connected".to_string(),
+                RemoteStatus::Idle => String::new(),
+            };
+            FfiLaunchRow {
+                kind: FfiLaunchRowKind::Remote,
+                label,
+                detail,
+                peer: Some(peer),
+                status: remote_status_to_ffi(&status),
+                expanded,
+                ..idle
+            }
+        }
+        LaunchRow::RemoteNewSession { peer } => FfiLaunchRow {
+            kind: FfiLaunchRowKind::RemoteNewSession,
+            label: "New session…".to_string(),
+            peer: Some(peer),
+            status: FfiRemoteStatus::Connected,
+            ..idle
+        },
+        LaunchRow::RemoteExisting {
+            peer,
+            word_id,
+            name,
+            cwd,
+            active,
+        } => FfiLaunchRow {
+            kind: FfiLaunchRowKind::RemoteExisting,
+            label: name,
+            detail: cwd,
+            peer: Some(peer),
+            word_id: Some(word_id),
+            status: FfiRemoteStatus::Connected,
+            active,
+            ..idle
+        },
+        LaunchRow::AddRemote => FfiLaunchRow {
+            kind: FfiLaunchRowKind::AddRemote,
+            label: "Add remote…".to_string(),
+            ..idle
+        },
+    }
+}
+
 /// A user-facing label for a directory-browser row, shared by the generic
 /// `picker()` getter and the structured `dir_browser()` getter so both render
 /// the row identically.
@@ -934,10 +1108,23 @@ pub enum FfiMode {
     SessionPicker,
     ServerPicker,
     DirectoryPicker,
+    /// Unified session launcher (issue #121); rows via `launch_picker()`.
+    LaunchPicker,
+    /// Add-a-remote form (issue #121); submit via `submit_add_remote`.
+    AddRemote,
+    /// New-session-on-a-remote path prompt (issue #121); `peer` is the target,
+    /// submit via `submit_remote_new_session`.
+    RemoteNewSession {
+        peer: String,
+    },
     Help,
     Command,
-    Connecting { label: String },
-    Disconnected { reason: String },
+    Connecting {
+        label: String,
+    },
+    Disconnected {
+        reason: String,
+    },
     Other,
 }
 
@@ -948,6 +1135,9 @@ fn mode_to_ffi(mode: &Mode) -> FfiMode {
         Mode::SessionPicker => FfiMode::SessionPicker,
         Mode::ServerPicker => FfiMode::ServerPicker,
         Mode::DirectoryPicker => FfiMode::DirectoryPicker,
+        Mode::LaunchPicker => FfiMode::LaunchPicker,
+        Mode::AddRemote => FfiMode::AddRemote,
+        Mode::RemoteNewSession { peer } => FfiMode::RemoteNewSession { peer: peer.clone() },
         Mode::Help => FfiMode::Help,
         Mode::Command(_) => FfiMode::Command,
         Mode::Connecting { target_display } => FfiMode::Connecting {
@@ -1848,6 +2038,69 @@ impl KmuxDriver {
         })
     }
 
+    /// The unified session launcher's full state (issue #121), or `None` when it
+    /// is not open. Driven by the generic picker methods (`set_picker_search`,
+    /// `set_picker_selected`, `activate_picker`, `cancel_picker`) plus the
+    /// `submit_*` helpers below.
+    pub fn launch_picker(&self) -> Option<FfiLaunchPicker> {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core();
+        if !matches!(core.mode, Mode::LaunchPicker) {
+            return None;
+        }
+        let rows = core
+            .launch_rows()
+            .into_iter()
+            .map(launch_row_to_ffi)
+            .collect();
+        Some(FfiLaunchPicker {
+            query: core.launch_search.clone(),
+            selected: core.launch_selected as u32,
+            rows,
+        })
+    }
+
+    /// Open the unified session launcher (the new-session button).
+    pub fn open_launch_picker(&self) -> Vec<FfiEffect> {
+        let _guard = self.rt.enter();
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.apply_top_bar_action(TopBarAction::OpenLaunchPicker)
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
+    }
+
+    /// Build a peer from the add-remote form, register + connect it, and persist
+    /// SSH ones (issue #121). Returns an error message when the form is
+    /// incomplete (and leaves the form open), or `None` on success.
+    pub fn submit_add_remote(&self, form: FfiAddRemoteForm) -> Option<String> {
+        let _guard = self.rt.enter();
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        let result = core.submit_add_remote(form.into());
+        core.needs_render = true;
+        result.err()
+    }
+
+    /// Create a new session on a federated `peer` at `cwd` (issue #121). An empty
+    /// `cwd` lets the remote daemon resolve a default. Closes the prompt.
+    pub fn submit_remote_new_session(&self, peer: String, cwd: String) {
+        let _guard = self.rt.enter();
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.submit_remote_new_session(peer, cwd);
+        core.needs_render = true;
+    }
+
+    /// Disconnect a federated remote (issue #121): drop its link and forget it.
+    pub fn disconnect_remote(&self, peer: String) {
+        let _guard = self.rt.enter();
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.disconnect_remote(&peer);
+        core.needs_render = true;
+    }
+
     /// Open the recent-servers picker.
     pub fn open_server_picker(&self) -> Vec<FfiEffect> {
         let _guard = self.rt.enter();
@@ -2411,6 +2664,55 @@ mod tests {
         // app, or in CI. uniffi's regenerated binding-checksum check is what
         // actually guards against stale bindings/dylib drift.
         assert_eq!(kmux_ffi_abi_version(), KMUX_FFI_ABI_VERSION);
+    }
+
+    #[test]
+    fn launch_row_flattens_each_variant() {
+        // Local new + add-remote bookends.
+        let r = launch_row_to_ffi(LaunchRow::LocalNewSession {
+            default_cwd: "/home/u".into(),
+        });
+        assert_eq!(r.kind, FfiLaunchRowKind::LocalNewSession);
+        assert_eq!(r.detail, "/home/u");
+
+        // A remote header carries its peer, status, and expansion.
+        let r = launch_row_to_ffi(LaunchRow::Remote {
+            peer: "alice@box".into(),
+            label: "alice@box".into(),
+            status: RemoteStatus::Error("nope".into()),
+            expanded: true,
+        });
+        assert_eq!(r.kind, FfiLaunchRowKind::Remote);
+        assert_eq!(r.peer.as_deref(), Some("alice@box"));
+        assert_eq!(r.status, FfiRemoteStatus::Error);
+        assert_eq!(r.detail, "nope"); // the error reason surfaces as detail
+        assert!(r.expanded);
+
+        // An existing remote session carries both routing keys.
+        let r = launch_row_to_ffi(LaunchRow::RemoteExisting {
+            peer: "alice@box".into(),
+            word_id: "eagle".into(),
+            name: "proj".into(),
+            cwd: "/srv".into(),
+            active: true,
+        });
+        assert_eq!(r.kind, FfiLaunchRowKind::RemoteExisting);
+        assert_eq!(r.peer.as_deref(), Some("alice@box"));
+        assert_eq!(r.word_id.as_deref(), Some("eagle"));
+        assert!(r.active);
+    }
+
+    #[test]
+    fn mode_to_ffi_maps_launcher_modes() {
+        assert!(matches!(
+            mode_to_ffi(&Mode::LaunchPicker),
+            FfiMode::LaunchPicker
+        ));
+        assert!(matches!(mode_to_ffi(&Mode::AddRemote), FfiMode::AddRemote));
+        assert!(matches!(
+            mode_to_ffi(&Mode::RemoteNewSession { peer: "alice@box".into() }),
+            FfiMode::RemoteNewSession { peer } if peer == "alice@box"
+        ));
     }
 
     #[test]
