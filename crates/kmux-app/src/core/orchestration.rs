@@ -11,7 +11,7 @@ use kmux_client::session_manager::SessionEvent;
 use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
 #[cfg(feature = "remote")]
 use kmux_client::transport::TransportKind;
-use kmux_protocol::messages::{PeerTarget, ServerMessage, SessionEntry};
+use kmux_protocol::messages::{PeerId, PeerTarget, ServerMessage, SessionEntry};
 #[cfg(feature = "remote")]
 use kmux_protocol::transport::bootstrap::EndpointAdvert;
 use std::time::Instant;
@@ -20,7 +20,7 @@ use tracing::{info, warn};
 
 use base64::Engine;
 
-use super::DirBrowserRow;
+use super::{DirBrowserRow, LaunchRow, RemoteStatus};
 use crate::mode::Mode;
 use crate::recent_servers::{RecentServer, ServerKind};
 
@@ -303,6 +303,93 @@ impl AppCore {
             .iter()
             .find(|e| e.meta.word_id == word_id)
             .map(|e| e.meta.cwd.clone())
+    }
+
+    /// Build the unified launcher's rows (issue #121): a flat, filtered
+    /// projection of "open or create a session, locally or on a remote". Order:
+    /// local-new, local sessions, then each known remote's toggle row (and, when
+    /// expanded + connected, its new-session row and its sessions), then
+    /// "Add remote…". A dumb frontend renders this list as-is.
+    pub fn launch_rows(&self) -> Vec<LaunchRow> {
+        let q = self.launch_search.to_lowercase();
+        let matches = |s: &str| q.is_empty() || s.to_lowercase().contains(&q);
+        let active = self.mgr.active_session().map(|s| s.to_string());
+        let is_active = |word_id: &str| active.as_deref() == Some(word_id);
+
+        let mut rows = Vec::new();
+
+        // 1. New local session, seeded at the focused session's cwd.
+        rows.push(LaunchRow::LocalNewSession {
+            default_cwd: self
+                .active_session_cwd()
+                .unwrap_or_else(|| self.initial_cwd.clone()),
+        });
+
+        // 2. Existing local sessions (no peer attribution).
+        for e in self.mgr.session_list().iter().filter(|e| e.peer.is_none()) {
+            if matches(&e.meta.name) || matches(&e.meta.cwd) {
+                rows.push(LaunchRow::LocalExisting {
+                    word_id: e.meta.word_id.clone(),
+                    name: e.meta.name.clone(),
+                    cwd: e.meta.cwd.clone(),
+                    active: is_active(&e.meta.word_id),
+                });
+            }
+        }
+
+        // 3. Remotes, in a stable order. Expanding connects on focus; a connected
+        //    remote offers a new-session row and lists its sessions.
+        let mut peer_ids: Vec<&PeerId> = self.peer_targets.keys().collect();
+        peer_ids.sort();
+        for peer in peer_ids {
+            let status = self
+                .peer_status
+                .get(peer)
+                .cloned()
+                .unwrap_or(RemoteStatus::Idle);
+            let expanded = self.launch_expanded.contains(peer);
+            // A collapsed remote is hidden by a non-matching search; an expanded
+            // one always shows so the user can still collapse it.
+            if matches(peer) || expanded {
+                rows.push(LaunchRow::Remote {
+                    peer: peer.clone(),
+                    label: peer.clone(),
+                    status: status.clone(),
+                    expanded,
+                });
+            }
+            if expanded && status == RemoteStatus::Connected {
+                rows.push(LaunchRow::RemoteNewSession { peer: peer.clone() });
+                for e in self
+                    .mgr
+                    .session_list()
+                    .iter()
+                    .filter(|e| e.peer.as_deref() == Some(peer.as_str()))
+                {
+                    // The hub decorates federated names as "name @ peer"; strip
+                    // the decoration since the row already sits under the remote.
+                    let name = e
+                        .meta
+                        .name
+                        .strip_suffix(&format!(" @ {peer}"))
+                        .unwrap_or(&e.meta.name)
+                        .to_string();
+                    if matches(&name) || matches(&e.meta.cwd) {
+                        rows.push(LaunchRow::RemoteExisting {
+                            peer: peer.clone(),
+                            word_id: e.meta.word_id.clone(),
+                            name,
+                            cwd: e.meta.cwd.clone(),
+                            active: is_active(&e.meta.word_id),
+                        });
+                    }
+                }
+            }
+        }
+
+        // 4. Add a new remote.
+        rows.push(LaunchRow::AddRemote);
+        rows
     }
 
     /// Returns sessions matching the current `session_picker_search` text
@@ -1153,6 +1240,47 @@ mod tests {
             }
             other => panic!("expected SessionCreate, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn launch_rows_lists_local_then_collapsed_remote_then_add() {
+        let (mut core, _rx) = connected_core();
+        core.initial_cwd = "/fallback".into();
+        core.mgr
+            .session_list
+            .push(entry("eagle", "/home/user/proj"));
+        core.peer_targets.insert(
+            "alice@box".into(),
+            PeerTarget::Ssh {
+                user: Some("alice".into()),
+                host: "box".into(),
+                ssh_port: None,
+                accept_invalid_certs: false,
+            },
+        );
+
+        let rows = core.launch_rows();
+
+        // Row 0: new local session, seeded at the focused cwd (no active session
+        // ⇒ initial_cwd).
+        assert!(matches!(
+            &rows[0],
+            LaunchRow::LocalNewSession { default_cwd } if default_cwd == "/fallback"
+        ));
+        // The local session is listed.
+        assert!(
+            rows.iter().any(
+                |r| matches!(r, LaunchRow::LocalExisting { word_id, .. } if word_id == "eagle")
+            )
+        );
+        // The known remote appears collapsed (a toggle row; its sessions are
+        // hidden until it is expanded + connected).
+        assert!(rows.iter().any(|r| matches!(
+            r,
+            LaunchRow::Remote { peer, expanded: false, .. } if peer == "alice@box"
+        )));
+        // Add-remote is always the last row.
+        assert!(matches!(rows.last(), Some(LaunchRow::AddRemote)));
     }
 
     #[test]
