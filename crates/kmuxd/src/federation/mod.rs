@@ -39,10 +39,10 @@ use kmux_connect::connect::ConnectResult;
 use kmux_connect::ssh::{self, RemoteTarget};
 use kmux_connect::tcp_connect::connect_tcp_tls;
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ClientMessage, PeerId, PeerTarget, SequenceNo, ServerMessage,
-    SessionEntry, SessionEventMsg, TermSize, epoch_millis,
+    ClientCapabilities, ClientId, ClientMessage, PeerId, PeerTarget, RequestId, SequenceNo,
+    ServerMessage, SessionEntry, SessionEventMsg, TermSize, epoch_millis,
 };
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
@@ -52,6 +52,9 @@ use crate::app::ServerApp;
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long [`PeerManager::open_peer`] waits for the upstream session list.
 const LIST_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long [`PeerManager::create_remote_session`] waits for the upstream
+/// `SessionCreated` (or `Error`) when creating a session on a federated peer.
+const CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Owns every upstream peer connection and routes federated traffic.
 #[derive(Default)]
@@ -230,6 +233,15 @@ struct PeerConnection {
     panes: HashMap<String, ProxiedPane>,
     /// The feed-loop task draining the upstream stream; aborted on close.
     feed_task: Option<JoinHandle<()>>,
+    /// Monotonic request-id source for hub-initiated upstream requests (e.g.
+    /// create-on-peer). Starts at 2 so it never collides with the `SessionList`
+    /// probe (id 1) `open_peer` sends during the handshake.
+    next_request_id: RequestId,
+    /// In-flight hub-initiated `SessionCreate`s, keyed by upstream request id.
+    /// The feed loop completes the oneshot with the remote `SessionEntry` (or an
+    /// error string) when the matching `SessionCreated`/`Error` arrives;
+    /// `create_remote_session` then draws the local word and registers it.
+    pending_creates: HashMap<RequestId, oneshot::Sender<Result<SessionEntry, String>>>,
     /// The background `ssh -L -N` tunnel process for an [`PeerTarget::Ssh`] peer,
     /// kept alive for the life of the connection (the `-L` forward dies with it).
     /// `None` for a [`PeerTarget::Direct`] peer. Killed on close/reap.
@@ -249,9 +261,18 @@ impl PeerConnection {
             sessions: HashMap::new(),
             panes: HashMap::new(),
             feed_task: None,
+            next_request_id: 2,
+            pending_creates: HashMap::new(),
             ssh_tunnel: None,
             dead: false,
         }
+    }
+
+    /// Allocate the next upstream request id for a hub-initiated request.
+    fn next_rid(&mut self) -> RequestId {
+        let rid = self.next_request_id;
+        self.next_request_id += 1;
+        rid
     }
 
     /// Record a remote session under a freshly-drawn local word.
@@ -574,6 +595,96 @@ impl PeerManager {
         Ok(peer_id)
     }
 
+    /// Create a new session on an already-federated peer: forward a
+    /// `SessionCreate` upstream, register the result under a fresh local word,
+    /// and return the localized [`SessionEntry`] (the hub then replies
+    /// `SessionCreated` to the requesting GUI, exactly as for a local create).
+    ///
+    /// The feed loop owns the upstream stream once a peer is open, so the
+    /// response is routed back through a oneshot the loop completes on seeing the
+    /// matching `SessionCreated`/`Error`. Errors if the peer is unknown or dead,
+    /// the upstream create fails or times out, or the local word pool is empty.
+    // Mirrors `ServerApp::create_session`'s parameter list plus the peer link's
+    // `&ServerApp`; a spec struct would add indirection for one internal caller.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn create_remote_session(
+        &self,
+        app: &ServerApp,
+        peer_id: &str,
+        name: Option<String>,
+        cwd: Option<String>,
+        program: Option<String>,
+        args: Vec<String>,
+        size: TermSize,
+    ) -> Result<SessionEntry, String> {
+        // Resolve the live peer, allocate an upstream request id, and register a
+        // oneshot the feed loop completes when the response arrives.
+        let conn = self
+            .peers
+            .lock()
+            .unwrap()
+            .get(peer_id)
+            .cloned()
+            .ok_or_else(|| format!("peer {peer_id} is not connected"))?;
+        let (client_tx, rid, rx) = {
+            let mut guard = conn.lock().unwrap();
+            if guard.dead {
+                return Err(format!("peer {peer_id} connection is closed"));
+            }
+            let rid = guard.next_rid();
+            let (tx, rx) = oneshot::channel();
+            guard.pending_creates.insert(rid, tx);
+            (guard.client_tx.clone(), rid, rx)
+        };
+
+        // Forward the create upstream. `peer: None` — we are the remote daemon's
+        // client, so it creates the session locally on that host.
+        if client_tx
+            .send(ClientMessage::SessionCreate {
+                request_id: rid,
+                name,
+                cwd,
+                program,
+                args,
+                size,
+                peer: None,
+            })
+            .is_err()
+        {
+            conn.lock().unwrap().pending_creates.remove(&rid);
+            return Err(format!("peer {peer_id} connection closed before create"));
+        }
+
+        // Await the upstream response (the feed loop completes the oneshot).
+        let remote_entry = match tokio::time::timeout(CREATE_TIMEOUT, rx).await {
+            Ok(Ok(Ok(entry))) => entry,
+            Ok(Ok(Err(reason))) => return Err(format!("peer rejected session create: {reason}")),
+            Ok(Err(_)) => return Err("peer connection closed during session create".to_string()),
+            Err(_) => {
+                conn.lock().unwrap().pending_creates.remove(&rid);
+                return Err("peer did not confirm session create in time".to_string());
+            }
+        };
+
+        // Register under a fresh local word and publish it to the word index, so
+        // the new session is addressable and its panes route as federated.
+        let remote_word = remote_entry.meta.word_id.clone();
+        let local_word = app
+            .draw_word()
+            .ok_or_else(|| "local session word pool exhausted".to_string())?;
+        let entry = {
+            let mut guard = conn.lock().unwrap();
+            guard.register_session(local_word.clone(), remote_word, remote_entry, peer_id);
+            guard.sessions.get(&local_word).cloned()
+        };
+        self.word_index
+            .lock()
+            .unwrap()
+            .insert(local_word.clone(), peer_id.to_string());
+        info!(%peer_id, local_word, "created session on federated peer");
+        entry.ok_or_else(|| "internal: federated session vanished after register".to_string())
+    }
+
     /// Tear down the upstream connection to `peer_id`, release its local words,
     /// and abort its feed loop. No-op when the peer is unknown.
     pub fn close_peer(&self, app: &ServerApp, peer_id: &str) {
@@ -846,6 +957,31 @@ fn spawn_feed_loop(
             // Answer keepalive pings so the upstream considers us live.
             if let ServerMessage::Ping { seq } = msg {
                 let _ = client_tx.send(ClientMessage::Pong { seq });
+                continue;
+            }
+
+            // Route responses to hub-initiated requests (create-on-peer) back to
+            // the waiting oneshot. `SessionCreated` carries the *remote* entry;
+            // `create_remote_session` (holding `&ServerApp`) draws the local word
+            // and registers it. An `Error`/`SessionCreated` whose id we are not
+            // waiting on falls through to the normal handling below.
+            let response_rid = match &msg {
+                ServerMessage::SessionCreated { request_id, .. } => Some(*request_id),
+                ServerMessage::Error {
+                    request_id: Some(rid),
+                    ..
+                } => Some(*rid),
+                _ => None,
+            };
+            if let Some(rid) = response_rid
+                && let Some(tx) = conn.lock().unwrap().pending_creates.remove(&rid)
+            {
+                let result = match msg {
+                    ServerMessage::SessionCreated { entry, .. } => Ok(entry),
+                    ServerMessage::Error { message, .. } => Err(message),
+                    _ => unreachable!("response_rid is set only for those two variants"),
+                };
+                let _ = tx.send(result);
                 continue;
             }
 
