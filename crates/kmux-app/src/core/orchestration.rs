@@ -169,6 +169,24 @@ impl AppCore {
     pub fn auto_select_session(&mut self) {
         let size = self.term_size;
 
+        // `kmux diagnostic <test>`: always open a fresh dedicated session running
+        // the diagnostic emitter — never attach to or reuse an existing session,
+        // so the pattern is rendered in isolation (issue #145).
+        if let Some((program, args)) = self.initial_program.take() {
+            let cwd = self
+                .auto_cwd
+                .take()
+                .unwrap_or_else(|| self.initial_cwd.clone());
+            self.mgr.create_session_with_program(
+                Some("diagnostic"),
+                Some(&cwd),
+                Some(&program),
+                &args,
+                size,
+            );
+            return;
+        }
+
         if let Some(session_name) = self.auto_session.take() {
             // --session was given: find by name/word_id or create.
             if let Some(word_id) = self.mgr.find_session_by_name(&session_name) {

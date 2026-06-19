@@ -47,6 +47,10 @@ pub struct Plan {
     /// Whether the inner-pane cursor blinks.
     pub cursor_blink: bool,
     pub instance_id: String,
+    /// Run this `(program, args)` in a fresh dedicated initial session instead
+    /// of opening a shell. Currently populated only by `kmux diagnostic <test>`
+    /// (issue #145); `None` for every ordinary launch.
+    pub initial_program: Option<(String, Vec<String>)>,
 }
 
 /// Initialize tracing to the client log file (falling back to stderr) and log a
@@ -124,7 +128,10 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
 
     let cli = Cli::parse();
 
-    // Non-interactive subcommands short-circuit before any frontend setup.
+    // Most subcommands are non-interactive and short-circuit before any frontend
+    // setup. `kmux diagnostic <test>` is the exception: it falls through to an
+    // interactive launch, carrying the emitter program to run in the session.
+    let mut initial_program: Option<(String, Vec<String>)> = None;
     match cli.command {
         Some(Command::Daemon { action }) => {
             run_daemon_command(action).await?;
@@ -145,6 +152,26 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         Some(Command::Debug { action }) => {
             run_debug_command(action).await?;
             return Ok(Launch::Done);
+        }
+        Some(Command::Diagnostic { test, emit }) => {
+            if emit {
+                // Internal: the spawned session runs `kmux diagnostic <test> --emit`.
+                crate::diagnostic::emit(test.unwrap_or(crate::diagnostic::DiagnosticTest::All))?;
+                return Ok(Launch::Done);
+            }
+            match test {
+                // `kmux diagnostic` with no test lists the patterns and exits.
+                None => {
+                    crate::diagnostic::print_catalogue();
+                    return Ok(Launch::Done);
+                }
+                // `kmux diagnostic <test>` opens the GUI with a session running
+                // the emitter; resolve it now so a missing `kmux` binary fails
+                // here (before any GUI handoff) with a clear message.
+                Some(test) => {
+                    initial_program = Some(crate::diagnostic::session_command(test)?);
+                }
+            }
         }
         None => {}
     }
@@ -185,5 +212,6 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         appearance,
         cursor_blink,
         instance_id,
+        initial_program,
     })))
 }

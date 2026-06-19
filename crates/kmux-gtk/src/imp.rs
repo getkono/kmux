@@ -143,6 +143,7 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         plan.instance_id.clone(),
         plan.auto_session.clone(),
         plan.auto_cwd.clone(),
+        plan.initial_program.clone(),
         capabilities,
         plan.theme.clone(),
         plan.appearance.clone(),
