@@ -194,6 +194,38 @@ cursor into pixel rects via `kmux_render::cursor_geometry` (GTK directly; Swift 
 the `kmux-ffi` `render_debug` getter), so the rects reflect that frontend's *own*
 cell metrics.
 
+## Diagnostic test patterns (`kmux diagnostic`)
+
+Where the render-debug overlay shows what the renderer was *handed*, the diagnostic
+suite (issue #145) feeds it a *known input* and lets you eyeball the output:
+
+```
+kmux diagnostic            # list the patterns
+kmux diagnostic <test>     # open the GUI with a session painting <test>
+kmux diagnostic <test> --emit   # write the pattern to the host terminal instead
+```
+
+Patterns ([`kmux_app::diagnostic`](../crates/kmux-app/src/diagnostic/)): `glyphs`
+(ASCII + Unicode glyph grid — the original "glyphs not rendered" repro), `attrs`
+(bold/italic/underline/… across the four faces, exercising the atlas `FaceStyle`
+keys), `colors` (16 / 256 / truecolor ramps), `unicode` (wide CJK, emoji, combining
+marks), `boxes` (box-drawing alignment grid), and `all`.
+
+`kmux diagnostic <test>` is an **interactive** launch: it opens the GUI with a
+*fresh, dedicated* session whose program is the emitter — the `kmux` binary itself
+run as `kmux diagnostic <test> --emit`, which writes
+[`pattern_bytes`](../crates/kmux-app/src/diagnostic/patterns.rs) (the single source
+of truth) and then blocks on stdin so the pane stays up. Both frontends resolve the
+same launch command via `diagnostic::session_command`: GTK threads it through the
+`Plan`'s `initial_program`; Swift forwards the test name through
+`DriverConfig.diagnostic` (FFI ABI 15) and `build_core` resolves it the same way.
+`AppCore::auto_select_session` opens a new session for it instead of attaching to an
+existing one.
+
+Scope is the **local daemon**: the emitter is *this* host's `kmux` binary (located
+via `KMUX_BIN` → next-to-the-executable → `PATH`), which is also the daemon host. A
+remote daemon would need `kmux` installed there.
+
 ## Testing
 
 Two tiers:
