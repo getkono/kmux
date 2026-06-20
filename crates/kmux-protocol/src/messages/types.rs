@@ -86,7 +86,10 @@ impl TransportKind {
 /// - **28**: OSC 9;4 progress reporting — `PaneInfo.progress_state`/`progress`
 ///   (carried in the snapshot so late clients see the current bar) and the
 ///   `SessionEventMsg::PaneProgressChanged` event (issue #125).
-pub const PROTOCOL_VERSION: u32 = 28;
+/// - **29**: cross-session process overview — `ClientMessage::ProcessOverview`
+///   and `ServerMessage::ProcessOverviewResult` carrying per-pane process trees
+///   (`PaneProcesses` / `ProcessSample`), federated across peers (issue #122).
+pub const PROTOCOL_VERSION: u32 = 29;
 
 /// Wire compression algorithm negotiated for a connection.
 ///

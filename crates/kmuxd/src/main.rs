@@ -15,6 +15,7 @@ mod federation;
 mod handoff;
 mod impair;
 mod persist;
+mod process_stats;
 mod relay;
 mod scrollback;
 mod startup;

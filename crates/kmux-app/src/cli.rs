@@ -109,6 +109,18 @@ pub enum Command {
         format: OutputFormat,
     },
 
+    /// Show the process tree of every pane (CPU/memory) without the GUI (issue
+    /// #122). The hierarchical counterpart of `ls`.
+    #[command(alias = "top")]
+    Ps {
+        #[command(flatten)]
+        server_args: ServerArgs,
+
+        /// Output format
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
+
     /// Internal diagnostics (hidden). See `kmux debug tearing` (issue #72).
     #[command(hide = true)]
     Debug {

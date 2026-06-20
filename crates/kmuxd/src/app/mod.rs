@@ -441,6 +441,11 @@ pub struct ServerApp {
     /// [`crate::federation`] and `docs/architecture-federation.md`.
     #[cfg(feature = "federation")]
     pub(super) peer_manager: crate::federation::PeerManager,
+    /// Warmed process-table sampler for the process overview (issue #122). Held
+    /// behind a `Mutex` (refresh needs `&mut`) and an `Arc` so a request can take
+    /// the scan off the async runtime via `spawn_blocking`. Refreshes lazily, so
+    /// it is free until a client opens the overview.
+    pub(super) sampler: Arc<Mutex<crate::process_stats::ProcessSampler>>,
 }
 
 impl ServerApp {
@@ -462,6 +467,7 @@ impl ServerApp {
             vt_events_tx,
             #[cfg(feature = "federation")]
             peer_manager: crate::federation::PeerManager::new(),
+            sampler: Arc::new(Mutex::new(crate::process_stats::ProcessSampler::new())),
         }
     }
 

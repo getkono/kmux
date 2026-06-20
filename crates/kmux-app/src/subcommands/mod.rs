@@ -2,11 +2,13 @@ mod daemon_cmd;
 mod debug;
 mod dry_run;
 mod list;
+mod ps;
 pub mod render;
 pub use daemon_cmd::run_daemon_command;
 pub use debug::run_debug_command;
 pub use dry_run::run_dry_run;
 pub use list::{ListSessionsConfig, run_list_sessions};
+pub use ps::{ProcessOverviewConfig, run_process_overview};
 
 use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::ssh::{self, ParsedServer};

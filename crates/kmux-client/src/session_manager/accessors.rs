@@ -25,6 +25,12 @@ impl SessionManager {
         &self.session_list
     }
 
+    /// Latest per-pane process trees (issue #122), as last delivered by the
+    /// daemon. Empty until the first `ProcessOverviewResult` arrives.
+    pub fn process_overview(&self) -> &[kmux_protocol::messages::PaneProcesses] {
+        &self.process_overview
+    }
+
     pub fn buffer(&self, pane_id: &str) -> Option<&CellGrid> {
         self.buffers.get(pane_id)
     }

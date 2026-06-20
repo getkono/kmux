@@ -58,6 +58,12 @@ pub enum ClientMessage {
     /// Request a list of all active sessions.
     SessionList { request_id: RequestId },
 
+    /// Request a snapshot of the process tree running in every pane (issue #122).
+    /// Reply: [`super::server::ServerMessage::ProcessOverviewResult`]. The hub
+    /// merges its local panes with every federated peer's, translating each
+    /// peer's remote pane ids to the local ids it assigned them.
+    ProcessOverview { request_id: RequestId },
+
     /// Rename an existing session's display name.
     SessionRename {
         request_id: RequestId,
@@ -295,6 +301,7 @@ impl ClientMessage {
             Self::SessionCreate { .. }
             | Self::SessionClose { .. }
             | Self::SessionList { .. }
+            | Self::ProcessOverview { .. }
             | Self::SessionRename { .. }
             | Self::PaneCreate { .. }
             | Self::PaneClose { .. }
@@ -532,6 +539,10 @@ mod tests {
             ),
             (
                 ClientMessage::SessionList { request_id: 0 },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::ProcessOverview { request_id: 0 },
                 MessageCategory::Control,
             ),
             (

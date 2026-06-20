@@ -25,8 +25,11 @@ pub struct Shell {
     pub split: adw::OverlaySplitView,
     pub tab_view: adw::TabView,
     pub tab_bar: adw::TabBar,
-    /// Swaps between the tab content ("panes") and an empty-state page ("empty").
+    /// Swaps between the tab content ("panes"), an empty-state page ("empty"),
+    /// and the process overview ("overview", issue #122).
     pub content_stack: Stack,
+    /// The process-overview list (issue #122), reconciled by `overview::sync`.
+    pub overview_list: ListBox,
     /// Hosts the HUD OSD over the grid.
     pub overlay: Overlay,
     /// Connecting/disconnected banner above the content.
@@ -105,11 +108,13 @@ pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
         .description("Create a session from the sidebar to get started.")
         .build();
 
-    // Swap the live tab content with an empty-state page.
+    // Swap the live tab content with an empty-state page or the process overview.
+    let (overview_box, overview_list) = super::overview::build();
     let content_stack = Stack::new();
     content_stack.set_vexpand(true);
     content_stack.add_named(&tab_view, Some("panes"));
     content_stack.add_named(&empty, Some("empty"));
+    content_stack.add_named(&overview_box, Some("overview"));
     content_stack.set_visible_child_name("empty");
 
     let banner = adw::Banner::new("");
@@ -175,6 +180,7 @@ pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
         tab_view,
         tab_bar,
         content_stack,
+        overview_list,
         overlay,
         banner,
         toasts,

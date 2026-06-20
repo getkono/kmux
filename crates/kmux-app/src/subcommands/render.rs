@@ -5,6 +5,7 @@ use tabled::Tabled;
 use tabled::settings::Style;
 
 use crate::cli::OutputFormat;
+use crate::core::{OverviewRow, OverviewRowKind};
 
 // ─── Session row (kmux ls) ────────────────────────────────────────────────────
 
@@ -50,6 +51,45 @@ pub fn session_rows(sessions: &[SessionEntry]) -> Vec<SessionRow> {
     // local (peer.is_none()) first, then remotes alphabetically by peer.
     rows.sort_by(|a, b| (a.peer != "local", &a.peer).cmp(&(b.peer != "local", &b.peer)));
     rows
+}
+
+// ─── Process overview row (kmux ps) ───────────────────────────────────────────
+
+#[derive(Tabled)]
+pub struct ProcessRow {
+    #[tabled(rename = "NAME")]
+    pub name: String,
+    #[tabled(rename = "CPU%")]
+    pub cpu: String,
+    #[tabled(rename = "MEM")]
+    pub mem: String,
+    #[tabled(rename = "PID")]
+    pub pid: String,
+}
+
+/// Build the `kmux ps` table rows from the flat overview projection (issue #122),
+/// rendering the hierarchy by indenting NAME on each row's depth. Session rows
+/// also surface a peer/cwd hint so federated machines are distinguishable.
+pub fn process_overview_rows(rows: &[OverviewRow]) -> Vec<ProcessRow> {
+    rows.iter()
+        .map(|r| {
+            let indent = "  ".repeat(r.depth as usize);
+            let mut name = format!("{indent}{}", r.label);
+            if r.kind == OverviewRowKind::Session {
+                match &r.peer {
+                    Some(peer) => name.push_str(&format!("  ({peer})")),
+                    None if !r.detail.is_empty() => name.push_str(&format!("  ({})", r.detail)),
+                    None => {}
+                }
+            }
+            ProcessRow {
+                name,
+                cpu: format!("{:.1}", r.cpu_percent),
+                mem: format_bytes(r.mem_bytes),
+                pid: r.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+            }
+        })
+        .collect()
 }
 
 // ─── Daemon sessions row (kmux daemon sessions) ───────────────────────────────
@@ -218,6 +258,58 @@ mod tests {
     use super::*;
     use kmux_protocol::control_rpc::{SessionConnections, SessionsResponse};
     use kmux_protocol::messages::SessionMeta;
+
+    #[test]
+    fn process_overview_rows_indent_and_format() {
+        let rows = vec![
+            OverviewRow {
+                depth: 0,
+                kind: OverviewRowKind::Session,
+                label: "dev".into(),
+                detail: "/proj".into(),
+                cpu_percent: 12.0,
+                mem_bytes: 2 * 1024 * 1024,
+                pid: None,
+                peer: None,
+            },
+            OverviewRow {
+                depth: 3,
+                kind: OverviewRowKind::Process,
+                label: "cargo".into(),
+                detail: "cargo build".into(),
+                cpu_percent: 9.5,
+                mem_bytes: 1024,
+                pid: Some(101),
+                peer: None,
+            },
+        ];
+        let table = process_overview_rows(&rows);
+        // Session row: no indent, cwd hint appended, no pid.
+        assert_eq!(table[0].name, "dev  (/proj)");
+        assert_eq!(table[0].cpu, "12.0");
+        assert_eq!(table[0].mem, "2.0 MiB");
+        assert_eq!(table[0].pid, "-");
+        // Process row: indented by depth, pid shown.
+        assert_eq!(table[1].name, "      cargo");
+        assert_eq!(table[1].cpu, "9.5");
+        assert_eq!(table[1].pid, "101");
+    }
+
+    #[test]
+    fn process_overview_rows_session_shows_peer() {
+        let rows = vec![OverviewRow {
+            depth: 0,
+            kind: OverviewRowKind::Session,
+            label: "api".into(),
+            detail: "/srv".into(),
+            cpu_percent: 0.0,
+            mem_bytes: 0,
+            pid: None,
+            peer: Some("bob@host".into()),
+        }];
+        let table = process_overview_rows(&rows);
+        assert_eq!(table[0].name, "api  (bob@host)");
+    }
 
     fn make_conn(conn_id: u64, transport: &str) -> ConnectionInfo {
         ConnectionInfo {

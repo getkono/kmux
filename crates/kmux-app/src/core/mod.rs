@@ -26,10 +26,12 @@ use crate::theme::Theme;
 mod connection_info;
 mod dispatch;
 mod orchestration;
+mod overview;
 mod render_debug;
 
 pub use connection_info::{ConnectionInfo, RttInfo, TransportTraffic};
 pub use orchestration::{BootstrapPhase, BootstrapTaskResult};
+pub use overview::{OverviewRow, OverviewRowKind, build_overview_rows};
 pub use render_debug::{CursorDebug, PaneDebug, RenderDebugSnapshot};
 
 /// Maximum entries kept in [`AppCore::command_history`].

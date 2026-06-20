@@ -15,8 +15,8 @@ use crate::appearance::Appearance;
 use crate::cli::{Cli, Command};
 use crate::config;
 use crate::subcommands::{
-    ListSessionsConfig, parse_target, run_daemon_command, run_debug_command, run_dry_run,
-    run_list_sessions,
+    ListSessionsConfig, ProcessOverviewConfig, parse_target, run_daemon_command, run_debug_command,
+    run_dry_run, run_list_sessions, run_process_overview,
 };
 use crate::theme::Theme;
 
@@ -142,6 +142,18 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
             format,
         }) => {
             run_list_sessions(ListSessionsConfig {
+                server: server_args.server.as_deref(),
+                ssh_port: server_args.ssh_port,
+                format,
+            })
+            .await?;
+            return Ok(Launch::Done);
+        }
+        Some(Command::Ps {
+            server_args,
+            format,
+        }) => {
+            run_process_overview(ProcessOverviewConfig {
                 server: server_args.server.as_deref(),
                 ssh_port: server_args.ssh_port,
                 format,

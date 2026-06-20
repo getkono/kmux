@@ -97,6 +97,14 @@ impl SessionManager {
         self.send_ws(ClientMessage::SessionList { request_id: rid });
     }
 
+    /// Request a fresh process-overview snapshot (issue #122). The app layer
+    /// drives this on a ~1 Hz cadence while the overview view is open; the reply
+    /// is a `ProcessOverviewResult` handled into `process_overview`.
+    pub fn request_process_overview(&mut self) {
+        let rid = self.next_rid();
+        self.send_ws(ClientMessage::ProcessOverview { request_id: rid });
+    }
+
     /// Ask the (local) daemon to federate `target` (issue #121): it opens one
     /// upstream connection to the remote `kmuxd` and surfaces that peer's
     /// sessions in our `SessionList`. The reply is a `PeerOpened`/`PeerError`

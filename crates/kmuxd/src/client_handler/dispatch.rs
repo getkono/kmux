@@ -424,6 +424,14 @@ pub async fn handle_message<A: PaneAttacher>(
             });
         }
 
+        ClientMessage::ProcessOverview { request_id } => {
+            // Merge the locally-hosted panes' process trees with every open
+            // peer's (issue #122). Federation off ⇒ the federated half is empty.
+            let mut panes = state.app.local_process_overview().await;
+            panes.extend(state.app.collect_federated_process_overview().await);
+            state.send(ServerMessage::ProcessOverviewResult { request_id, panes });
+        }
+
         ClientMessage::PtyInput { pane_id, data } => {
             if state.app.is_federated_pane(&pane_id) {
                 state
