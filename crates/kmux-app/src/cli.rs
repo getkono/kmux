@@ -115,6 +115,20 @@ pub enum Command {
         #[command(subcommand)]
         action: DebugAction,
     },
+
+    /// Open a session running a render diagnostic test pattern, to visually
+    /// verify glyph/color rendering (issue #145). Run without a test to list
+    /// the available patterns.
+    Diagnostic {
+        /// Which test pattern to run; omit to list the available patterns.
+        #[arg(value_name = "TEST")]
+        test: Option<crate::diagnostic::DiagnosticTest>,
+
+        /// Emit the pattern to stdout and hold the pane open (internal: the
+        /// launched session runs this; also usable to test the host terminal).
+        #[arg(long, hide = true)]
+        emit: bool,
+    },
 }
 
 #[derive(Subcommand, Debug)]

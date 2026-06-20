@@ -50,6 +50,7 @@ use kmux_app::config;
 use kmux_app::core::{
     AddRemoteForm, AppCore, DirBrowserRow, LaunchRow, PauseReason, RemoteStatus, TopBarAction,
 };
+use kmux_app::diagnostic::{self, DiagnosticTest};
 use kmux_app::driver::{FrontendDriver, FrontendEffect};
 use kmux_app::mode::{Action, CommandState, Mode};
 use kmux_app::subcommands::parse_target;
@@ -77,7 +78,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 14;
+pub const KMUX_FFI_ABI_VERSION: u32 = 15;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -130,6 +131,10 @@ pub struct DriverConfig {
     /// Whether the inner-pane cursor blinks. `None` defaults to `true` (and
     /// falls back to the `cursor_blink` key in `config.toml`).
     pub cursor_blink: Option<bool>,
+    /// Render diagnostic to launch instead of a shell session: a
+    /// [`DiagnosticTest`](kmux_app::diagnostic::DiagnosticTest) name
+    /// (`glyphs`/`attrs`/…). `None` for an ordinary launch (issue #145).
+    pub diagnostic: Option<String>,
     pub rows: u16,
     pub cols: u16,
     pub pixel_width: u16,
@@ -1239,6 +1244,20 @@ fn build_core(config: &DriverConfig, instance_id: String) -> AppCore {
         .ok()
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_default();
+    // `kmux diagnostic <test>` on macOS: the Swift app forwards the test name
+    // here; resolve it to the same emitter command the GTK path uses (issue
+    // #145). An unknown name or a missing `kmux` binary degrades to an ordinary
+    // shell launch rather than failing the driver.
+    let initial_program = config.diagnostic.as_deref().and_then(|name| {
+        let test = DiagnosticTest::from_name(name)?;
+        match diagnostic::session_command(test) {
+            Ok(cmd) => Some(cmd),
+            Err(e) => {
+                tracing::warn!(error = %e, test = name, "diagnostic launch unavailable; opening a shell");
+                None
+            }
+        }
+    });
     // GUI capabilities: truecolor on, no kitty keyboard/graphics concept.
     let capabilities = ClientCapabilities {
         truecolor: true,
@@ -1259,6 +1278,7 @@ fn build_core(config: &DriverConfig, instance_id: String) -> AppCore {
         instance_id,
         config.session.clone(),
         auto_cwd,
+        initial_program,
         capabilities,
         theme,
         appearance,

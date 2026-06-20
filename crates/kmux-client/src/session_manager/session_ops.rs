@@ -118,14 +118,29 @@ impl SessionManager {
     ///          on it is a bug, since the daemon then resolves the path against
     ///          *its own* working directory, not the client's.
     pub fn create_session(&mut self, name: Option<&str>, cwd: Option<&str>, size: TermSize) {
+        self.create_session_with_program(name, cwd, None, &[], size);
+    }
+
+    /// Like [`create_session`](Self::create_session) but runs an explicit
+    /// `program` (with `args`) in the initial pane instead of the system shell.
+    /// Used by `kmux diagnostic <test>` to spawn the render-diagnostic emitter
+    /// (issue #145). `program == None` is equivalent to [`create_session`].
+    pub fn create_session_with_program(
+        &mut self,
+        name: Option<&str>,
+        cwd: Option<&str>,
+        program: Option<&str>,
+        args: &[String],
+        size: TermSize,
+    ) {
         if self.ws_sender.is_some() {
             let rid = self.next_rid();
             self.send_ws(ClientMessage::SessionCreate {
                 request_id: rid,
                 name: name.map(|n| n.to_string()),
                 cwd: cwd.map(|c| c.to_string()),
-                program: None,
-                args: vec![],
+                program: program.map(|p| p.to_string()),
+                args: args.to_vec(),
                 size,
                 // Local create; remote creates go through create_session_on_peer.
                 peer: None,

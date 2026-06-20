@@ -277,6 +277,10 @@ pub struct AppCore {
     pub auto_session: Option<String>,
     /// Effective cwd from `--cwd` or `:path` in server string.
     pub auto_cwd: Option<String>,
+    /// `(program, args)` to run in a fresh dedicated initial session instead of
+    /// a shell. Set by `kmux diagnostic <test>` (issue #145); `None` otherwise.
+    /// Consumed once by [`auto_select_session`](Self::auto_select_session).
+    pub initial_program: Option<(String, Vec<String>)>,
 
     /// Human-readable label for the current server shown in the server badge.
     pub server_display: String,
@@ -352,6 +356,7 @@ impl AppCore {
         instance_id: String,
         auto_session: Option<String>,
         auto_cwd: Option<String>,
+        initial_program: Option<(String, Vec<String>)>,
         capabilities: ClientCapabilities,
         theme: Theme,
         appearance: Appearance,
@@ -474,6 +479,7 @@ impl AppCore {
             did_auto_select: suppress_initial_auto_select,
             auto_session,
             auto_cwd,
+            initial_program,
             server_display,
             server_string,
             server_kind,
@@ -631,6 +637,7 @@ impl AppCore {
             did_auto_select: false,
             auto_session: None,
             auto_cwd: None,
+            initial_program: None,
             server_display: String::new(),
             server_string: String::new(),
             server_kind: ServerKind::Local,
@@ -663,6 +670,7 @@ mod tests {
             ResolvedTarget::LocalDaemon,
             String::new(),
             String::new(),
+            None,
             None,
             None,
             ClientCapabilities::default(),

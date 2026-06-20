@@ -52,6 +52,10 @@ pub mod completion;
 /// Terminal capability detection (env-based; frontend-agnostic).
 pub mod host_caps;
 
+/// Render diagnostic suite (`kmux diagnostic <test>`): named test patterns and
+/// the in-session emitter (issue #145).
+pub mod diagnostic;
+
 /// Non-interactive subcommands (`ls`, `daemon`, `--dry-run`) and target parsing.
 pub mod subcommands;
 
