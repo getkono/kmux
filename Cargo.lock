@@ -1629,6 +1629,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmux-vt-worker"
+version = "0.2.0"
+dependencies = [
+ "anyhow",
+ "kmux-ghostty-sys",
+ "kmux-protocol",
+ "kmux-pty",
+ "kmux-vt-core",
+ "kmux-worker-protocol",
+ "nix",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kmux-worker-protocol"
 version = "0.2.0"
 dependencies = [
