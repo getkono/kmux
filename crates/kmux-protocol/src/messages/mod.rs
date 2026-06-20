@@ -133,20 +133,6 @@ mod tests {
     }
 
     #[test]
-    fn pane_id_format() {
-        let word_id = "eagle".to_string();
-        let pane_index = 0u32;
-        let pane_id = format!("{word_id}/{pane_index}");
-        assert_eq!(pane_id, "eagle/0");
-
-        // Parse back
-        let (w, idx_str) = pane_id.rsplit_once('/').unwrap();
-        let idx: u32 = idx_str.parse().unwrap();
-        assert_eq!(w, "eagle");
-        assert_eq!(idx, 0);
-    }
-
-    #[test]
     fn connection_id_serialization_roundtrip() {
         let id = ConnectionId(0xdeadbeef_u64);
         // Use postcard (the wire codec) for the roundtrip.
