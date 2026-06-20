@@ -161,16 +161,23 @@ impl CellGrid {
             self.scrollback
                 .seed_tail(snapshot.history_total, snapshot.scrollback_tail);
         }
+        self.maybe_clear_history_gap();
+        self.scroll_offset = 0;
+        self.selection = None;
+        self.cells_generation += 1;
+        self.cursor_generation += 1;
+    }
+
+    /// Clear the pending-history-gap marker once the scrollback mirror has caught
+    /// up to (or past) the total we were waiting for. Called after any operation
+    /// that can grow `history_total()`.
+    fn maybe_clear_history_gap(&mut self) {
         if self
             .pending_history_total
             .is_some_and(|want| want <= self.scrollback.history_total())
         {
             self.pending_history_total = None;
         }
-        self.scroll_offset = 0;
-        self.selection = None;
-        self.cells_generation += 1;
-        self.cursor_generation += 1;
     }
 
     /// Export the current grid as a [`GridSnapshot`] — the inverse of
@@ -291,12 +298,7 @@ impl CellGrid {
                 }
             }
         }
-        if self
-            .pending_history_total
-            .is_some_and(|want| want <= self.scrollback.history_total())
-        {
-            self.pending_history_total = None;
-        }
+        self.maybe_clear_history_gap();
         self.cells_generation += 1;
     }
 
@@ -330,12 +332,7 @@ impl CellGrid {
         }
         // Else: reply is entirely older or duplicate; nothing to do until
         // back-fill support lands in Phase C.
-        if self
-            .pending_history_total
-            .is_some_and(|want| want <= self.scrollback.history_total())
-        {
-            self.pending_history_total = None;
-        }
+        self.maybe_clear_history_gap();
     }
 
     /// Whether the terminal is in application-cursor mode.
