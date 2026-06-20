@@ -8,8 +8,8 @@
 //! - [`registry`]: the static table of built-in commands.
 //! - [`exec`]: dispatch a parsed command into `App`.
 
-pub mod exec;
+pub(crate) mod exec;
 pub mod hint;
-pub mod parse;
-pub mod registry;
-pub mod spec;
+pub(crate) mod parse;
+pub(crate) mod registry;
+pub(crate) mod spec;
