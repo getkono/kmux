@@ -632,6 +632,8 @@ lifecycle.
 
 All `SshError` variants render with multi-line context (argv, exit, stderr tail). On launch, the TUI also re-prints the bootstrap error to stderr after the alternate-screen overlay tears down — so `kmux user@host` failures are visible after exit without consulting `~/.local/state/kmux/client.log`.
 
+**Where a dev build logs:** debug builds (`cargo run`, `mise run gtk-run` / `swift-run`) isolate their state under `kmux-debug/`, so they log to `~/.local/state/**kmux-debug**/client.log` — *not* the release `kmux/client.log`. A GUI error that seems "missing from the client log" is usually being written to the debug file while you watch the release one. Run `kmux debug paths` (with the binary in question) to print the exact resolved client/daemon log, runtime, and state paths plus the `kmuxd` an auto-spawn would launch; `mise run tail-client-log` / `tail-daemon-log` follow *both* profiles' logs at once.
+
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
 | `VersionMismatch { client: X, server: Y }` | `kmuxd` and `kmux` versions mismatch | Update both to the same version |
@@ -646,6 +648,7 @@ All `SshError` variants render with multi-line context (argv, exit, stderr tail)
 | TLS fingerprint mismatch | Server cert rotated | Delete the stale entry from `~/.config/kmux/known_hosts.toml` |
 | All transports fail | No network path | Check firewall; verify `kmuxd` is listening on correct ports |
 | Sessions lost after restart | Checkpoint failed | Check disk space; `$XDG_DATA_HOME/kmux/session_state.bin` |
+| (dev) GUI shows "daemon start failed" / never connects, nothing in `kmux/client.log` | Debug build logs + spawns under `kmux-debug/`; resolution must reach `target/debug/kmuxd`, not a release `kmuxd` on `$PATH` | Use `mise run gtk-run` / `swift-run` (they build + pin `KMUX_KMUXD=target/debug/kmuxd`); inspect with `kmux debug paths` + `mise run tail-client-log` |
 
 ### Dry-run diagnostics (`--dry-run`, `--test`)
 
@@ -748,17 +751,22 @@ Every place that spawns `kmuxd` uses one of two strategies. They are intentional
 
 ### Client-side (`kmux`, `kmux daemon start/restart`, auto-spawn)
 
-`find_server_binary()` in `crates/kmux-client/src/daemon/lifecycle.rs`:
+`find_server_binary()` in `crates/kmux-connect/src/daemon/lifecycle.rs`, in precedence order:
 
-1. **Sibling of the running `kmux` executable** — `current_exe().parent() / "kmuxd"`. This is the primary path in all normal layouts.
-2. **`$PATH` walk** — iterates `PATH` components looking for `kmuxd`. Fallback for unusual install layouts.
-3. Error if neither resolves.
+1. **`KMUX_KMUXD` env override** — an explicit path to a `kmuxd` binary (honored only when it points at a real file; a stale value falls through). Mirrors `KMUX_BIN` / `KMUX_APP`.
+2. **Sibling of the running executable** — `current_exe().parent() / "kmuxd"`. The primary path in all installed layouts (the GUI exe and `kmuxd` ship side by side).
+3. **Debug builds only — `target/<profile>/kmuxd`.** A path baked at build time from the crate's `OUT_DIR` (see `crates/kmux-connect/build.rs`). This makes a debug client prefer the matching debug daemon over any installed **release** `kmuxd` on `$PATH`, which it could never talk to (the two profiles use [separate runtime dirs](#runtime-directory-isolation), so a release daemon's socket never appears where the debug client polls). It also covers the macOS Swift dev app, whose `current_exe()` lives in `kmux-swift/.build/` with no `kmuxd` sibling.
+4. **`$PATH` walk** — iterates `PATH` components looking for `kmuxd`. Fallback for unusual install layouts.
+5. Error if none resolve (the message suggests setting `KMUX_KMUXD`).
 
-| Build mode | `kmux` location | `kmuxd` resolved from |
-|------------|-----------------|----------------------|
-| Debug (`cargo run -p kmux`) | `target/debug/kmux` | `target/debug/kmuxd` (sibling) |
-| Prod install | `/usr/local/bin/kmux` (or wherever) | `/usr/local/bin/kmuxd` (sibling) |
-| Custom layout | anywhere | sibling, then `$PATH` |
+| Build mode | `kmuxd` resolved from |
+|------------|----------------------|
+| Debug, `mise run gtk-run` / `swift-run` / `start` | `KMUX_KMUXD=target/debug/kmuxd` (set + built by the task) |
+| Debug, bare `cargo run -p kmux-gtk` / `swift run` | sibling `target/debug/kmuxd`, else the build-time `target/debug/kmuxd` |
+| Prod install | sibling of the GUI exe (bundled beside it; also on `$PATH`) |
+| Custom layout | `KMUX_KMUXD`, then sibling, then `$PATH` |
+
+> Why the debug-profile preference matters: before it, a debug GUI with no `kmuxd` sibling fell through to `$PATH` and auto-spawned an installed **release** `~/.cargo/bin/kmuxd`. That daemon writes its socket under `kmux/` while the debug client polls `kmux-debug/`, so the client never sees it and times out — i.e. "the dev build doesn't start the daemon". Prod is unaffected (`mise run install` bundles a matching release `kmuxd` beside the GUI).
 
 Once the binary is located, `start_daemon()` spawns it with the canonical argv:
 

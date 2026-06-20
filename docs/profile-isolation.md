@@ -66,11 +66,35 @@ The UDS path is itself the match signal.  When a debug `kmux` calls
 resolves to the `kmux-debug` runtime subdirectory.  If no debug daemon is
 listening there, `start_daemon()` spawns one.
 
-`find_server_binary()` (in `kmux-client::daemon::lifecycle`) prefers the
-sibling `kmuxd` binary — i.e. the binary in the same directory as the running
-`kmux` executable.  Cargo places all binaries for a profile in the same
-`target/{debug,release}/` tree, so the sibling rule reliably picks the
-same-profile daemon.
+`find_server_binary()` (in `kmux-connect::daemon::lifecycle`) resolves the
+`kmuxd` to spawn in precedence order: the `KMUX_KMUXD` override → the sibling
+`kmuxd` (same directory as the running executable) → **debug builds only:** the
+build-time `target/<profile>/kmuxd` → a `$PATH` walk.  Cargo places all binaries
+for a profile in the same `target/{debug,release}/` tree, so the sibling rule
+picks the same-profile daemon for an installed layout.
+
+The debug-only `target/<profile>` step exists because the sibling rule does *not*
+hold for every dev launch: the macOS Swift app's `current_exe()` lives in
+`kmux-swift/.build/` (no `kmuxd` sibling), and a bare `cargo run` may not have
+built `kmuxd` yet.  Without that step the resolver fell through to `$PATH` and
+auto-spawned an installed **release** `~/.cargo/bin/kmuxd`; that daemon binds its
+socket under `kmux/` while the debug client polls `kmux-debug/`, so the two never
+meet and the GUI reports "daemon start failed".  The dev run tasks
+(`mise run gtk-run` / `swift-run` / `start`) also build `kmuxd` and export
+`KMUX_KMUXD=target/debug/kmuxd` to pin it explicitly.
+
+### Finding the active profile's logs
+
+Because the logs are profile-specific, a `cargo run` GUI writes
+`kmux-debug/client.log` while an installed build writes `kmux/client.log` — a
+common source of "the error isn't in the log" confusion.  Two helpers cut
+through it:
+
+- `kmux debug paths` — run the binary in question; it prints its *own*
+  profile's client/daemon logs, runtime/state dirs, and the `kmuxd` an
+  auto-spawn would launch.
+- `mise run tail-client-log` / `mise run tail-daemon-log` — follow **both**
+  the `kmux/` and `kmux-debug/` logs at once.
 
 For remote (SSH / TCP / QUIC) connections the profile of the remote daemon is
 irrelevant; `PROTOCOL_VERSION` (u32) remains the only wire-level compatibility
