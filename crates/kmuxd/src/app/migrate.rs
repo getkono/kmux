@@ -56,10 +56,9 @@ impl ServerApp {
             let mut sessions = self.sessions.write().await;
             for state in sessions.values_mut() {
                 for relay in state.panes.values_mut() {
-                    relay._task.abort();
-                    // Swap in a no-op handle so we can own and await the real one.
-                    let noop = tokio::spawn(async {});
-                    handles.push(std::mem::replace(&mut relay._task, noop));
+                    // Abort the engine's relay task and take the real handle so we
+                    // can await its cancellation below.
+                    handles.push(relay.engine.abort_relay_task());
                 }
             }
         }

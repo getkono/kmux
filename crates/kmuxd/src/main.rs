@@ -8,6 +8,7 @@ mod config;
 mod connection;
 mod conversions;
 mod daemon;
+mod engine;
 #[cfg(feature = "federation")]
 mod federation;
 mod handoff;

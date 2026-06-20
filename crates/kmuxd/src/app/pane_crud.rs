@@ -173,13 +173,13 @@ impl ServerApp {
 
         Ok(PaneRelay {
             clients,
-            writer,
-            _task: task,
+            engine: crate::engine::PaneEngine::InProcess(crate::engine::InProcessEngine::new(
+                term_state, writer, task,
+            )),
             program: prog,
             args,
             size,
             scrollback,
-            term_state,
             seqno_counter,
             input_mode: InputMode::Open,
             status: SessionStatus::Running,

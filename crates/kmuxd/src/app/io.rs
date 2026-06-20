@@ -25,7 +25,7 @@ impl ServerApp {
                 return Err(KmuxError::Pty(nix::Error::EPERM));
             }
         }
-        relay.writer.write_all(&data).await
+        relay.engine.write_input(&data).await
     }
 
     /// Encode a single structured key event with the pane's live Ghostty
@@ -64,21 +64,11 @@ impl ServerApp {
                 return Err(KmuxError::Pty(nix::Error::EPERM));
             }
         }
-        // Encode each event under the lock so mode-mutating sequences
-        // emitted by an earlier event in the batch are visible to later
-        // ones.  Most encodings are < 32 bytes; reserve enough up front
-        // to fit a typical run without re-allocating.
-        let mut bytes = Vec::with_capacity(events.len() * 32);
-        {
-            let term_state = relay.term_state.lock().unwrap();
-            for ev in events {
-                bytes.extend_from_slice(&term_state.encode_key_event(ev));
-            }
-        }
-        if bytes.is_empty() {
-            return Ok(());
-        }
-        relay.writer.write_all(&bytes).await
+        // The engine encodes each event against the emulator's live mode state
+        // (in-process under the term_state lock; in a worker it owns that state)
+        // so a mode-mutating sequence from an earlier event is visible to later
+        // ones in the batch, then writes the bytes to the PTY.
+        relay.engine.write_keys(events).await
     }
 
     /// Paste clipboard text into a pane's PTY stdin.
@@ -97,16 +87,7 @@ impl ServerApp {
                 return Err(KmuxError::Pty(nix::Error::EPERM));
             }
         }
-        let bracketed = relay.term_state.lock().unwrap().modes().bracketed_paste();
-        if bracketed {
-            let mut buf = Vec::with_capacity(data.len() + 12);
-            buf.extend_from_slice(b"\x1b[200~");
-            buf.extend_from_slice(data.as_bytes());
-            buf.extend_from_slice(b"\x1b[201~");
-            relay.writer.write_all(&buf).await
-        } else {
-            relay.writer.write_all(data.as_bytes()).await
-        }
+        relay.engine.write_paste(data.as_bytes()).await
     }
 
     /// Resize a pane's PTY and its server-side terminal emulator.
@@ -204,9 +185,7 @@ impl ServerApp {
     ) -> Result<(u64, Vec<Vec<CellState>>, u64)> {
         let sessions = self.sessions.read().await;
         let relay = get_pane_relay(&sessions, pane_id)?;
-        let ts = relay.term_state.lock().unwrap();
-        let (first_index, lines) = ts.mirror_range(start, count);
-        let history_total = ts.history_total();
+        let (first_index, lines, history_total) = relay.engine.fetch_history(start, count).await;
         Ok((first_index, lines, history_total))
     }
 }
