@@ -1629,6 +1629,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmux-worker-protocol"
+version = "0.2.0"
+dependencies = [
+ "kmux-protocol",
+ "nix",
+ "postcard",
+ "serde",
+ "thiserror 2.0.18",
+ "tokio",
+]
+
+[[package]]
 name = "kmuxd"
 version = "0.2.0"
 dependencies = [

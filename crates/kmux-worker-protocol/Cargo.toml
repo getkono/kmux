@@ -1,0 +1,25 @@
+[package]
+name = "kmux-worker-protocol"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Daemon<->worker IPC contract for kmux session process isolation (issue #126). Internal to the server side; never depended on by GUI frontends."
+
+[dependencies]
+# Shared wire payload types (TerminalDiff, CellState, GridSnapshot, KeyEvent,
+# TermSize, …) and the length-prefixed framing codec reused for the steady-state
+# stream. `framing` pulls in the async `read_frame`/`write_frame` helpers.
+kmux-protocol = { workspace = true, features = ["framing"] }
+serde.workspace = true
+postcard.workspace = true
+# SCM_RIGHTS fd passing on the one-time handshake frame (mirrors the daemon
+# handoff path).
+nix.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["full"] }
