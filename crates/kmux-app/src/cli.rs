@@ -147,6 +147,14 @@ pub enum DebugAction {
         #[arg(long, default_value_t = 16)]
         window_ms: u64,
     },
+
+    /// Print the resolved profile-specific paths — client/daemon logs, runtime
+    /// and state dirs — plus the `kmuxd` binary an auto-spawn would launch.
+    ///
+    /// Debug builds isolate these under `kmux-debug/`; release builds use
+    /// `kmux/`. Use this to find where a `cargo run` / `swift run` GUI is
+    /// actually logging, and which daemon it would start.
+    Paths,
 }
 
 #[derive(Subcommand, Debug)]
