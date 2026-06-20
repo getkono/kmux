@@ -1181,7 +1181,8 @@ fn rewrite_event_to_local(
         | PaneTitleChanged { pane_id, .. }
         | PaneProgressChanged { pane_id, .. }
         | PaneClipboardCopy { pane_id, .. }
-        | PaneClosed { pane_id } => {
+        | PaneClosed { pane_id }
+        | PaneFaulted { pane_id } => {
             let (remote_word, idx) = split_pane_id(pane_id)?;
             let local_word = remote_to_local.get(remote_word)?.clone();
             *pane_id = format!("{local_word}/{idx}");

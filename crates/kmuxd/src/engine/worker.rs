@@ -20,7 +20,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use kmux_client::grid::CellGrid;
 use kmux_protocol::messages::{
-    CellState, CursorState, GridSnapshot, KeyEvent, TermModes, TermSize,
+    CellState, CursorState, GridSnapshot, KeyEvent, ServerMessage, SessionEventMsg, TermModes,
+    TermSize,
 };
 use kmux_pty::error::Result;
 use kmux_pty::process::ExitStatus;
@@ -258,6 +259,12 @@ impl WorkerEngine {
 }
 
 /// Read the worker's event stream, fan it out to clients, and reap the child.
+///
+/// When the worker dies abnormally (a SIGSEGV in libghostty-vt, or any non-zero
+/// exit) — as opposed to the clean exit triggered by a pane close or handoff —
+/// the daemon is unaffected (this is just a task seeing EOF); we surface a
+/// [`SessionEventMsg::PaneFaulted`] to attached clients so the crash is visible.
+/// The shell survives because the daemon still holds the PTY master fd.
 async fn supervise(
     mut sock_rd: OwnedReadHalf,
     child: std::process::Child,
@@ -283,7 +290,23 @@ async fn supervise(
         }
     }
 
-    reap_child(child, &fanout.pane_id);
+    if reap_child(child, &fanout.pane_id) {
+        warn!(pane_id = %fanout.pane_id, "isolated VT worker crashed; surfacing fault (daemon and other sessions unaffected)");
+        broadcast_fault(&fanout);
+    }
+}
+
+/// Tell attached clients the pane's worker crashed. Uses the unbounded control
+/// channel so the notice is never dropped (same channel `PaneEventSink` uses).
+fn broadcast_fault(fanout: &WorkerFanout) {
+    let msg = ServerMessage::Event {
+        event: SessionEventMsg::PaneFaulted {
+            pane_id: fanout.pane_id.clone(),
+        },
+    };
+    for sender in fanout.clients.lock().unwrap().values() {
+        let _ = sender.ctrl_tx.send(msg.clone());
+    }
 }
 
 /// Apply one worker event: update the mirror and fan out to clients via the
@@ -373,16 +396,22 @@ fn handle_event(
     }
 }
 
-/// The worker is the daemon's direct child; reap it so it does not linger as a
-/// zombie. (How it died — clean vs signal — is used for fault handling.)
-fn reap_child(mut child: std::process::Child, pane_id: &str) {
-    match child.try_wait() {
-        Ok(Some(status)) => debug!(pane_id, ?status, "worker exited"),
-        Ok(None) => {
-            let _ = child.kill();
-            let _ = child.wait();
+/// Reap the worker (the daemon's direct child) so it does not linger as a
+/// zombie, and report whether it died abnormally. A clean exit (code 0) is the
+/// pane-close / handoff path; a signal death (SIGSEGV/SIGABRT) or non-zero exit
+/// is a crash that should fault the pane. The worker has already exited by the
+/// time we get here (we observed its socket EOF), so `wait` returns promptly.
+fn reap_child(mut child: std::process::Child, pane_id: &str) -> bool {
+    match child.wait() {
+        Ok(status) => {
+            let faulted = !status.success();
+            debug!(pane_id, ?status, faulted, "worker reaped");
+            faulted
         }
-        Err(e) => warn!(pane_id, "worker wait failed: {e}"),
+        Err(e) => {
+            warn!(pane_id, "worker wait failed: {e}");
+            false
+        }
     }
 }
 
