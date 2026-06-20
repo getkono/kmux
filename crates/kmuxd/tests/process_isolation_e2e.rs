@@ -292,6 +292,23 @@ async fn worker_crash_is_isolated_from_the_daemon() {
         "the crashed pane should surface PaneFaulted to its client"
     );
 
+    // Self-healing: the shell is still alive, so the daemon respawns the worker
+    // and resyncs the client to the fresh emulator with a snapshot.
+    let resync = recv_until(
+        &mut client.rx,
+        Duration::from_secs(10),
+        |m| matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == pane_a),
+    )
+    .await;
+    assert!(
+        resync.is_some(),
+        "the faulted pane should respawn its worker and resync the client"
+    );
+    assert!(
+        find_worker_pid(daemon_pid, Duration::from_secs(5)).is_some(),
+        "a replacement worker should be running for the recovered pane"
+    );
+
     // Headline: the daemon is still alive and responsive.
     assert!(
         pid_alive(daemon_pid as i32),

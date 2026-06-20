@@ -232,9 +232,10 @@ impl ServerApp {
 
     /// Spawn an isolated VT worker for this pane and wrap it in a
     /// [`PaneEngine::Worker`]. The daemon keeps the authoritative PTY master fd
-    /// (so the shell outlives a worker crash) and hands the worker a `dup`.
+    /// (so the shell outlives a worker crash) and hands the worker a `dup`. Used
+    /// for the initial spawn and for respawn after a crash (see `app::recover`).
     #[allow(clippy::too_many_arguments)]
-    async fn try_spawn_worker_engine(
+    pub(super) async fn try_spawn_worker_engine(
         &self,
         pane_id: &str,
         size: TermSize,
@@ -255,6 +256,7 @@ impl ServerApp {
             seqno_counter,
             event_sink,
             manager: self.manager.clone(),
+            fault_tx: self.worker_fault_tx(),
         };
         let engine = WorkerEngine::spawn(
             pid,

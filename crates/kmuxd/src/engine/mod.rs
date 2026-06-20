@@ -119,6 +119,11 @@ impl PaneEngine {
         }
     }
 
+    /// Whether this pane runs in an isolated worker subprocess.
+    pub fn is_worker(&self) -> bool {
+        matches!(self, Self::Worker(_))
+    }
+
     /// Abort the pane's relay task and swap in a no-op handle, returning the real
     /// one so the caller can await its cancellation (used by handoff quiesce).
     pub fn abort_relay_task(&mut self) -> JoinHandle<()> {

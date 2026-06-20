@@ -12,6 +12,7 @@ mod pane_crud;
 /// is off) so the dispatch layer never needs `#[cfg]` directives.
 mod peer_api;
 mod persistence;
+mod recover;
 pub(super) mod restore;
 mod tab_crud;
 
@@ -442,12 +443,22 @@ pub struct ServerApp {
     /// the scan off the async runtime via `spawn_blocking`. Refreshes lazily, so
     /// it is free until a client opens the overview.
     pub(super) sampler: Arc<Mutex<crate::process_stats::ProcessSampler>>,
+    /// Pane ids whose isolated VT worker crashed, reported by worker supervisors
+    /// for respawn (issue #126). Drained by the task spawned in
+    /// [`ServerApp::spawn_worker_respawn_task`].
+    worker_fault_tx: mpsc::UnboundedSender<String>,
+    /// Receiver half, taken once by `spawn_worker_respawn_task`.
+    worker_fault_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    /// Per-pane restart timestamps, used to bound worker respawns (crash-loop
+    /// guard); keyed by `pane_id`.
+    worker_restart_log: Mutex<HashMap<String, Vec<std::time::Instant>>>,
 }
 
 impl ServerApp {
     pub fn new(token: String) -> Self {
         let (conn_count_tx, _) = watch::channel(0usize);
         let (vt_events_tx, _) = broadcast::channel(512);
+        let (worker_fault_tx, worker_fault_rx) = mpsc::unbounded_channel();
         Self {
             manager: Arc::new(PtyRegistry::new()),
             auth_token: token,
@@ -464,7 +475,15 @@ impl ServerApp {
             #[cfg(feature = "federation")]
             peer_manager: crate::federation::PeerManager::new(),
             sampler: Arc::new(Mutex::new(crate::process_stats::ProcessSampler::new())),
+            worker_fault_tx,
+            worker_fault_rx: Mutex::new(Some(worker_fault_rx)),
+            worker_restart_log: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Clone the sender worker supervisors use to report a crash for respawn.
+    pub(crate) fn worker_fault_tx(&self) -> mpsc::UnboundedSender<String> {
+        self.worker_fault_tx.clone()
     }
 
     /// Override the wire compression policy (from `kmuxd.toml`). Builder-style so

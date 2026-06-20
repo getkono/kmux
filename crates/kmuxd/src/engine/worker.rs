@@ -67,6 +67,8 @@ pub struct WorkerFanout {
     pub seqno_counter: Arc<AtomicU64>,
     pub event_sink: Arc<PaneEventSink>,
     pub manager: Arc<SessionManager>,
+    /// Reports this pane id for respawn when the worker crashes (issue #126).
+    pub fault_tx: mpsc::UnboundedSender<String>,
 }
 
 impl WorkerEngine {
@@ -293,6 +295,9 @@ async fn supervise(
     if reap_child(child, &fanout.pane_id) {
         warn!(pane_id = %fanout.pane_id, "isolated VT worker crashed; surfacing fault (daemon and other sessions unaffected)");
         broadcast_fault(&fanout);
+        // Ask the daemon to respawn the worker (the shell is still alive). If the
+        // respawn channel is gone (shutdown), the pane simply stays faulted.
+        let _ = fanout.fault_tx.send(fanout.pane_id.clone());
     }
 }
 
