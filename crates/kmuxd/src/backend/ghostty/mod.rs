@@ -7,10 +7,23 @@
 
 use std::sync::Arc;
 
-use kmux_ghostty::{EventSink, GhosttyError, GhosttyTerm, TermSize};
-use kmux_protocol::messages::{CellState, CursorState, KeyEvent as ProtoKeyEvent, TermModes};
+use kmux_ghostty::{EventSink, GhosttyError, GhosttyTerm, ProgressReport, ProgressState, TermSize};
+use kmux_protocol::messages::{
+    CellState, CursorState, KeyEvent as ProtoKeyEvent, PaneProgressState, TermModes,
+};
 
 use crate::backend::{BackendConfig, BackendEventSink, BackendSize, TerminalBackend};
+
+/// Map the VT-layer progress state onto the wire enum used by the relay/clients.
+fn map_progress_state(state: ProgressState) -> PaneProgressState {
+    match state {
+        ProgressState::Remove => PaneProgressState::Remove,
+        ProgressState::Set => PaneProgressState::Set,
+        ProgressState::Error => PaneProgressState::Error,
+        ProgressState::Indeterminate => PaneProgressState::Indeterminate,
+        ProgressState::Pause => PaneProgressState::Pause,
+    }
+}
 
 /// Safe adapter: presents the kmuxd-level [`BackendEventSink`] to
 /// `kmux-ghostty` as its crate-local [`EventSink`]. Both traits share the same
@@ -56,6 +69,11 @@ impl EventSink for EventSinkAdapter {
     fn on_hyperlink(&self, id: Option<&str>, uri: &str) {
         self.0.on_hyperlink(id, uri);
     }
+
+    fn on_progress(&self, report: ProgressReport) {
+        self.0
+            .on_progress(map_progress_state(report.state), report.progress);
+    }
 }
 
 /// VT emulator backend powered by libghostty-vt v1.3.1.
@@ -68,6 +86,7 @@ pub struct GhosttyBackend {
     size: BackendSize,
     events: Arc<dyn BackendEventSink>,
     last_title: String,
+    last_progress: ProgressReport,
 }
 
 impl std::fmt::Debug for GhosttyBackend {
@@ -99,6 +118,7 @@ impl TerminalBackend for GhosttyBackend {
             size: cfg.size,
             events,
             last_title: String::new(),
+            last_progress: ProgressReport::none(),
         }
     }
 
@@ -126,6 +146,15 @@ impl TerminalBackend for GhosttyBackend {
         {
             self.last_title = title.clone();
             self.events.on_title(&title);
+        }
+        // Same cold-attach rationale for OSC 9;4 progress: a script can emit it
+        // before any client subscribes. PaneEventSink dedups, so the push
+        // callback + this pull never double-broadcast.
+        let progress = self.term.progress();
+        if progress != self.last_progress {
+            self.last_progress = progress;
+            self.events
+                .on_progress(map_progress_state(progress.state), progress.progress);
         }
     }
 
@@ -833,6 +862,44 @@ mod tests {
         assert!(
             titles.iter().any(|t| t.contains("My Terminal Title")),
             "expected title event, got: {titles:?}"
+        );
+    }
+
+    #[test]
+    fn event_sink_receives_progress() {
+        struct ProgressCapture(Mutex<Vec<(PaneProgressState, Option<u8>)>>);
+        impl BackendEventSink for ProgressCapture {
+            fn on_progress(&self, state: PaneProgressState, progress: Option<u8>) {
+                self.0.lock().unwrap().push((state, progress));
+            }
+        }
+
+        let sink = Arc::new(ProgressCapture(Mutex::new(vec![])));
+        let cfg = BackendConfig {
+            size: BackendSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            capabilities: CapabilityHandles {
+                kitty_graphics: Arc::new(AtomicBool::new(false)),
+                kitty_keyboard: Arc::new(AtomicBool::new(false)),
+            },
+            events: Arc::clone(&sink) as Arc<dyn BackendEventSink>,
+            scrollback: 1_000,
+        };
+
+        let mut backend = GhosttyBackend::new(cfg);
+        // OSC 9;4;2;30 — error state at 30%.
+        backend.feed(b"\x1b]9;4;2;30\x07");
+
+        let events = sink.0.lock().unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|&(s, p)| s == PaneProgressState::Error && p == Some(30)),
+            "expected progress event, got: {events:?}"
         );
     }
 

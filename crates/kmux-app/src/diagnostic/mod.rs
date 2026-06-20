@@ -36,6 +36,10 @@ pub enum DiagnosticTest {
     Unicode,
     /// Box-drawing and line-drawing alignment grid.
     Boxes,
+    /// Animated OSC 9;4 (ConEmu/WT) progress-bar states (issue #125). Unlike the
+    /// in-grid patterns this paints *window chrome* and loops over time, so it is
+    /// excluded from [`Self::All`].
+    Progress,
     /// Every pattern above, in order.
     All,
 }
@@ -59,6 +63,7 @@ impl DiagnosticTest {
             DiagnosticTest::Colors => "colors",
             DiagnosticTest::Unicode => "unicode",
             DiagnosticTest::Boxes => "boxes",
+            DiagnosticTest::Progress => "progress",
             DiagnosticTest::All => "all",
         }
     }
@@ -68,7 +73,7 @@ impl DiagnosticTest {
     pub fn from_name(name: &str) -> Option<DiagnosticTest> {
         DiagnosticTest::EACH
             .into_iter()
-            .chain(std::iter::once(DiagnosticTest::All))
+            .chain([DiagnosticTest::Progress, DiagnosticTest::All])
             .find(|test| test.name() == name)
     }
 
@@ -80,6 +85,7 @@ impl DiagnosticTest {
             DiagnosticTest::Colors => "16/256/truecolor ramps",
             DiagnosticTest::Unicode => "wide CJK, emoji, combining marks",
             DiagnosticTest::Boxes => "box-drawing alignment grid",
+            DiagnosticTest::Progress => "animated OSC 9;4 progress-bar states",
             DiagnosticTest::All => "run every pattern above, in order",
         }
     }
@@ -91,11 +97,9 @@ pub fn print_catalogue() {
     for test in DiagnosticTest::EACH {
         println!("  {:<8}  {}", test.name(), test.description());
     }
-    println!(
-        "  {:<8}  {}",
-        DiagnosticTest::All.name(),
-        DiagnosticTest::All.description()
-    );
+    for test in [DiagnosticTest::Progress, DiagnosticTest::All] {
+        println!("  {:<8}  {}", test.name(), test.description());
+    }
     println!("\nRun:  kmux diagnostic <test>");
 }
 
@@ -104,6 +108,12 @@ pub fn print_catalogue() {
 /// directly usable to test the *host* terminal.
 pub fn emit(test: DiagnosticTest) -> anyhow::Result<()> {
     use std::io::{Read, Write};
+
+    // The progress test paints window chrome, not the grid, and is inherently
+    // animated — it runs its own timed loop instead of the one-shot path below.
+    if test == DiagnosticTest::Progress {
+        return emit_progress_animated();
+    }
 
     let mut out = std::io::stdout().lock();
     out.write_all(&pattern_bytes(test))?;
@@ -128,6 +138,118 @@ pub fn emit(test: DiagnosticTest) -> anyhow::Result<()> {
         }
     }
     Ok(())
+}
+
+/// Animated emitter for the `progress` test (OSC 9;4 / issue #125). The progress
+/// bar is window chrome, not grid content, and is stateful, so this loops over
+/// the states — sweeping `0→100` for the numeric ones (set/error/pause), holding
+/// the value-less indeterminate, then clearing — narrating each step in the pane
+/// so the viewer knows the expected bar. Holds the pane open: the loop runs until
+/// stdin reaches EOF or the user presses Enter (a reader thread flips `stop`).
+///
+/// `KMUX_DIAG_PROGRESS_STEP_MS` overrides the per-step delay (default 200 ms);
+/// the integration test sets it to `0` for a fast, deterministic run.
+fn emit_progress_animated() -> anyhow::Result<()> {
+    use std::io::{Read, Write};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::time::Duration;
+
+    let step = Duration::from_millis(
+        std::env::var("KMUX_DIAG_PROGRESS_STEP_MS")
+            .ok()
+            .and_then(|s| s.parse::<u64>().ok())
+            .unwrap_or(200),
+    );
+
+    let mut out = std::io::stdout().lock();
+    writeln!(
+        out,
+        "\x1b[1mOSC 9;4 progress diagnostic (issue #125)\x1b[0m"
+    )?;
+    writeln!(
+        out,
+        "Watch the pane's progress bar. Cycling states: \
+         1=set 2=error 4=pause 3=indeterminate 0=remove."
+    )?;
+    out.flush()?;
+
+    // A reader thread flips `stop` on Enter or EOF (pane closed / stdin closed),
+    // so the animation loop is interruptible without blocking on stdin itself.
+    let stop = Arc::new(AtomicBool::new(false));
+    {
+        let stop = Arc::clone(&stop);
+        std::thread::spawn(move || {
+            let mut stdin = std::io::stdin().lock();
+            let mut byte = [0u8; 1];
+            loop {
+                match stdin.read(&mut byte) {
+                    Ok(0) => break,
+                    Ok(_) if byte[0] == b'\n' || byte[0] == b'\r' => break,
+                    Ok(_) => continue,
+                    Err(_) => break,
+                }
+            }
+            stop.store(true, Ordering::SeqCst);
+        });
+    }
+
+    // The numeric states that carry a percentage, with the colour to expect.
+    let sweeps: [(u8, &str); 3] = [(1, "accent bar"), (2, "red bar"), (4, "amber bar")];
+    'cycle: loop {
+        for (state, expect) in sweeps {
+            for pct in (0..=100).step_by(20) {
+                // Write the frame *before* checking `stop`, so a fast EOF (e.g.
+                // the integration test's closed stdin) still produces at least
+                // one OSC 9;4 sequence rather than racing the reader thread.
+                writeln!(out, "OSC 9;4;{state};{pct} — expect {expect} at {pct}%")?;
+                write!(out, "\x1b]9;4;{state};{pct}\x07")?;
+                out.flush()?;
+                if stop.load(Ordering::SeqCst) {
+                    break 'cycle;
+                }
+                sleep_unless_stopped(&stop, step);
+            }
+        }
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        writeln!(out, "OSC 9;4;3 — expect an indeterminate/busy bar (no %)")?;
+        write!(out, "\x1b]9;4;3\x07")?;
+        out.flush()?;
+        sleep_unless_stopped(&stop, step * 5);
+
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        writeln!(out, "OSC 9;4;0 — expect the bar to disappear")?;
+        write!(out, "\x1b]9;4;0\x07")?;
+        out.flush()?;
+        sleep_unless_stopped(&stop, step * 5);
+    }
+
+    // Leave no bar behind on exit.
+    let _ = write!(out, "\x1b]9;4;0\x07");
+    let _ = out.flush();
+    Ok(())
+}
+
+/// Sleep `dur`, but wake early (in ~20 ms slices) if `stop` is set, so Enter/EOF
+/// ends the animation promptly. A zero duration returns immediately.
+fn sleep_unless_stopped(stop: &std::sync::atomic::AtomicBool, dur: std::time::Duration) {
+    use std::sync::atomic::Ordering;
+    use std::time::Duration;
+
+    let slice = Duration::from_millis(20);
+    let mut remaining = dur;
+    while remaining > Duration::ZERO {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        let s = remaining.min(slice);
+        std::thread::sleep(s);
+        remaining -= s;
+    }
 }
 
 /// The `(program, args)` that runs `test` in a session: the located `kmux`
@@ -191,10 +313,30 @@ mod tests {
                 .unwrap_or_else(|_| panic!("`{}` should parse", test.name()));
             assert_eq!(parsed, test);
         }
+        // `progress` and `all` are not in EACH but must still parse.
+        assert_eq!(
+            DiagnosticTest::from_str("progress", false).unwrap(),
+            DiagnosticTest::Progress
+        );
         assert_eq!(
             DiagnosticTest::from_str("all", false).unwrap(),
             DiagnosticTest::All
         );
+    }
+
+    #[test]
+    fn from_name_resolves_progress() {
+        assert_eq!(
+            DiagnosticTest::from_name("progress"),
+            Some(DiagnosticTest::Progress)
+        );
+    }
+
+    #[test]
+    fn progress_is_excluded_from_all() {
+        // `All` concatenates the in-grid `EACH` patterns; the animated progress
+        // chrome test must not be swept into it.
+        assert!(!DiagnosticTest::EACH.contains(&DiagnosticTest::Progress));
     }
 
     #[test]
@@ -203,6 +345,9 @@ mod tests {
         unsafe { std::env::set_var("KMUX_BIN", std::env::current_exe().unwrap()) };
         let (_, args) = session_command(DiagnosticTest::Glyphs).unwrap();
         assert_eq!(args, vec!["diagnostic", "glyphs", "--emit"]);
+
+        let (_, args) = session_command(DiagnosticTest::Progress).unwrap();
+        assert_eq!(args, vec!["diagnostic", "progress", "--emit"]);
         unsafe { std::env::remove_var("KMUX_BIN") };
     }
 }

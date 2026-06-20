@@ -100,6 +100,7 @@ pub trait BackendEventSink: Send + Sync + 'static {
     fn on_title(&self, _title: &str) {}
     fn on_bell(&self) {}
     fn on_osc52_copy(&self, _selection: &str, _base64_data: &str) {}
+    fn on_progress(&self, _state: PaneProgressState, _progress: Option<u8>) {}
     fn on_hyperlink(&self, _id: Option<&str>, _uri: &str) {}
 }
 ```
@@ -399,6 +400,27 @@ surviving scrollback, and stamps `scrollback_reset` with the post-reset base.
 `history_total` stays monotonic across the wipe. When survivors exist (the
 OSC 133 `scrollClear` path), the relay emits the `TerminalUpdate` **before** the
 `ScrollbackAppend` so the client wipes before the survivors land.
+
+### Wire changes (v28) — OSC 9;4 progress
+
+`PROTOCOL_VERSION` = **28**. Implements [#125](https://github.com/getkono/kmux/issues/125):
+the ConEmu / Windows-Terminal progress report (`OSC 9 ; 4 ; state ; pct`), which
+Ghostty renders as a thin bar. libghostty-vt already parses it into a
+`progress_report` action; the kmux Zig wrapper now intercepts it (C ABI v4) and
+the daemon surfaces it through `BackendEventSink::on_progress`.
+
+- `PaneInfo` gains `progress_state: PaneProgressState` (`Remove`/`Set`/`Error`/
+  `Indeterminate`/`Pause`, `Remove` until the program emits one) and
+  `progress: Option<u8>` (`0..=100`, `None` for value-less states). Populated by
+  the daemon from `PaneRelay.progress`, so a late-attaching client sees the
+  current bar in the snapshot — the cross-client tracking the issue requires.
+- New `SessionEventMsg::PaneProgressChanged { pane_id, state, progress }`,
+  broadcast like `PaneTitleChanged`: `PaneEventSink::on_progress` dedups against
+  the relay's stored state, stores the new value, and pushes the event to every
+  attached client. `GhosttyBackend::feed` also pulls `term.progress()` (the same
+  cold-attach guard as the title) so a report that fires before any subscriber
+  is not lost. Frontends repaint a per-pane progress bar from the cached
+  `PaneInfo` (Cairo path + Swift; the GPU path is a follow-up).
 
 ### Daemon flow (per diff)
 

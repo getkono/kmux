@@ -21,7 +21,9 @@ use crate::term_state::new_term_state;
 use super::ansi_emit::{seed_pane_with_preamble, snapshot_to_ansi};
 use super::helpers::resolve_cwd;
 use super::persistence::RestoreReport;
-use super::{ClientMap, PaneEventSink, PaneRelay, SCROLLBACK_CAPACITY, ServerApp, SessionState};
+use super::{
+    ClientMap, PaneEventSink, PaneProgress, PaneRelay, SCROLLBACK_CAPACITY, ServerApp, SessionState,
+};
 
 /// How a restored pane's emulator should be seeded from its checkpoint snapshot.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -305,9 +307,11 @@ impl ServerApp {
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         let scrollback = Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY)));
         let title = Arc::new(Mutex::new(String::new()));
+        let progress = Arc::new(Mutex::new(PaneProgress::default()));
         let title_sink = Arc::new(PaneEventSink::new(
             pane_id.to_string(),
             title.clone(),
+            progress.clone(),
             self.vt_events_tx.clone(),
         ));
         let relay_sink = Arc::clone(&title_sink) as Arc<dyn crate::backend::BackendEventSink>;
@@ -360,6 +364,7 @@ impl ServerApp {
             kitty_graphics_enabled,
             kitty_keyboard_enabled,
             title,
+            progress,
         }
     }
 }

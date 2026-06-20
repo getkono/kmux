@@ -469,6 +469,8 @@ mod tests {
                         attached_clients: vec![],
                         status: super::super::session::SessionStatus::Running,
                         title: String::new(),
+                        progress_state: Default::default(),
+                        progress: None,
                     },
                     layout: super::super::session::LayoutNode::single(0),
                 },

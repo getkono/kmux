@@ -209,7 +209,11 @@ Patterns ([`kmux_app::diagnostic`](../crates/kmux-app/src/diagnostic/)): `glyphs
 (ASCII + Unicode glyph grid — the original "glyphs not rendered" repro), `attrs`
 (bold/italic/underline/… across the four faces, exercising the atlas `FaceStyle`
 keys), `colors` (16 / 256 / truecolor ramps), `unicode` (wide CJK, emoji, combining
-marks), `boxes` (box-drawing alignment grid), and `all`.
+marks), `boxes` (box-drawing alignment grid), `progress` (animated OSC 9;4
+progress-bar states — issue #125; see below), and `all`. `progress` is excluded
+from `all` because it paints *window chrome* and loops over time rather than
+emitting a one-shot grid; its emitter sweeps the states on a timer (step overridable
+via `KMUX_DIAG_PROGRESS_STEP_MS`) until the pane closes.
 
 `kmux diagnostic <test>` is an **interactive** launch: it opens the GUI with a
 *fresh, dedicated* session whose program is the emitter — the `kmux` binary itself
@@ -225,6 +229,32 @@ existing one.
 Scope is the **local daemon**: the emitter is *this* host's `kmux` binary (located
 via `KMUX_BIN` → next-to-the-executable → `PATH`), which is also the daemon host. A
 remote daemon would need `kmux` installed there.
+
+## OSC 9;4 progress bar (issue #125)
+
+The ConEmu / Windows-Terminal progress report (`OSC 9 ; 4 ; state ; pct`) renders
+as a thin **per-pane** bar, mirroring Ghostty's window bar but per tile (kmux tabs
+can tile several panes). The end-to-end path reuses the OSC 0/2 title pipeline:
+
+```
+libghostty-vt parses 9;4 → kmux Zig wrapper Handler.vt(.progress_report)  (C ABI v4)
+  → kmux-ghostty EventSink::on_progress(ProgressReport)
+  → kmuxd BackendEventSink::on_progress(PaneProgressState, Option<u8>)
+  → PaneEventSink: dedup + store in PaneRelay.progress + broadcast PaneProgressChanged
+                   (+ PaneInfo snapshot carries it, so late clients see the bar)
+  → client SessionManager updates cached PaneInfo
+  → frontend reads PaneInfo on the render tick and paints the bar
+```
+
+Rendering lives in the **Cairo** path ([`render::render_tiled`](../crates/kmux-gtk/src/imp/render.rs))
+and the **Swift** CoreText path ([`TerminalView.draw`](../kmux-swift/Sources/KmuxApp/TerminalView.swift)):
+a ~3px bar along each pane's bottom edge, width = `progress/100` of the tile (full
+width for `Indeterminate`), looked up via `SessionManager::pane_info` (GTK) /
+`FfiPaneRect.progress_state`/`progress` (Swift, FFI ABI 16). State→colour: `Set`→accent,
+`Error`→red, `Pause`→orange, `Indeterminate`→accent, `Remove`→no bar. A
+`PaneProgressChanged` event marks the frame dirty so the bar updates live without a
+keystroke. The **GPU path** (`KMUX_RENDERER=wgpu`) does not yet draw the bar —
+surfacing it through the shared `kmux-render` scene is a follow-up.
 
 ## Testing
 

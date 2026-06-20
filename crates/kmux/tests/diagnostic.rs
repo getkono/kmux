@@ -49,12 +49,44 @@ fn no_test_lists_catalogue() {
 
     assert!(out.status.success(), "non-zero exit {:?}", out.status);
     let stdout = String::from_utf8_lossy(&out.stdout);
-    for name in ["glyphs", "attrs", "colors", "unicode", "boxes", "all"] {
+    for name in [
+        "glyphs", "attrs", "colors", "unicode", "boxes", "progress", "all",
+    ] {
         assert!(
             stdout.contains(name),
             "catalogue missing `{name}`:\n{stdout}"
         );
     }
+}
+
+/// `kmux diagnostic progress --emit` runs the animated OSC 9;4 emitter. With
+/// stdin closed (EOF) the reader thread stops the loop immediately, and
+/// `KMUX_DIAG_PROGRESS_STEP_MS=0` removes the per-step delay, so the run is fast
+/// and deterministic. It must write at least one OSC 9;4 sequence and the legend.
+#[test]
+fn emit_progress_writes_sequences_and_exits() {
+    let out = Command::new(env!("CARGO_BIN_EXE_kmux"))
+        .args(["diagnostic", "progress", "--emit"])
+        .env("KMUX_DIAG_PROGRESS_STEP_MS", "0")
+        .stdin(Stdio::null())
+        .output()
+        .expect("run kmux diagnostic progress --emit");
+
+    assert!(
+        out.status.success(),
+        "expected success, got {:?}; stderr: {}",
+        out.status,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("\x1b]9;4;"),
+        "missing OSC 9;4 sequence in stdout:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("progress diagnostic"),
+        "missing progress legend in stdout:\n{stdout}"
+    );
 }
 
 /// An unknown test name is rejected by clap (exit non-zero), not silently
