@@ -11,6 +11,7 @@ use std::rc::Rc;
 
 use kmux_app::layout::{Divider, LayoutConfig, PaneRect, resolve_dividers, resolve_layout};
 use kmux_protocol::messages::{SplitDir, TermSize};
+use kmux_protocol::{format_pane_id, pane_index};
 
 use super::Frontend;
 use super::render::GUTTER;
@@ -41,7 +42,7 @@ pub fn push_sizes(fe: &Rc<RefCell<Frontend>>, width_px: i32, height_px: i32) {
         .iter()
         .map(|r| {
             (
-                format!("{word}/{}", r.pane_index),
+                format_pane_id(&word, r.pane_index),
                 TermSize {
                     rows: r.rows,
                     cols: r.cols,
@@ -73,7 +74,7 @@ pub fn pane_hit(
         let (px, py) = (r.col as f64 * cw, r.row as f64 * ch);
         let (pw, ph) = (r.cols as f64 * cw, r.rows as f64 * ch);
         if x >= px && x < px + pw && y >= py && y < py + ph {
-            return Some((format!("{word}/{}", r.pane_index), r));
+            return Some((format_pane_id(&word, r.pane_index), r));
         }
     }
     None
@@ -137,12 +138,7 @@ pub fn divider_at(f: &Frontend, x: f64, y: f64, width_px: i32, height_px: i32) -
 pub fn focused_rect(f: &Frontend, width_px: i32, height_px: i32) -> Option<PaneRect> {
     let (cols, rows) = f.metrics.cols_rows(width_px, height_px);
     let layout = f.core.mgr.render_layout()?;
-    let focused = f
-        .core
-        .mgr
-        .active_pane_id()
-        .and_then(|p| p.rsplit_once('/'))
-        .and_then(|(_, i)| i.parse::<u32>().ok())?;
+    let focused = f.core.mgr.active_pane_id().and_then(pane_index)?;
     resolve_layout(&layout, cols, rows, &cfg())
         .into_iter()
         .find(|r| r.pane_index == focused)
