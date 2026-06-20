@@ -6,12 +6,38 @@ use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ConnectionId, S
 #[cfg(feature = "remote")]
 use kmux_protocol::tls::{TofuStore, TofuVerifier};
 use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
+use tokio::io::AsyncWrite;
 #[cfg(feature = "remote")]
 use tokio::net::TcpStream;
 use tokio::sync::mpsc;
 use tracing::{debug, warn};
 
 use crate::connect::ConnectResult;
+
+/// Encode and write the initial `Auth` frame on a freshly-opened control stream.
+///
+/// Centralises the auth handshake payload — token + `PROTOCOL_VERSION` +
+/// capabilities + `connection_id` — so every transport (UDS / TCP / TCP+TLS /
+/// QUIC) sends a byte-identical frame and a new `Auth` field is wired in exactly
+/// one place. Returns a human-readable error; the caller wraps it in
+/// [`ConnectResult::Failed`].
+pub(crate) async fn send_auth_frame<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    token: String,
+    capabilities: ClientCapabilities,
+    connection_id: Option<ConnectionId>,
+) -> Result<(), String> {
+    let auth_bytes = encode_client(&ClientMessage::Auth {
+        token,
+        protocol_version: kmux_protocol::messages::PROTOCOL_VERSION,
+        capabilities,
+        connection_id,
+    })
+    .map_err(|e| format!("auth encode failed: {e}"))?;
+    write_frame(writer, &auth_bytes)
+        .await
+        .map_err(|e| format!("auth write failed: {e}"))
+}
 
 /// Establish a TCP connection to `host:port` and authenticate with `token`.
 ///
@@ -44,17 +70,8 @@ pub async fn connect_tcp(
     let (mut read_half, mut write_half) = stream.into_split();
 
     // Authenticate immediately.
-    let auth_bytes = match encode_client(&ClientMessage::Auth {
-        token,
-        protocol_version: kmux_protocol::messages::PROTOCOL_VERSION,
-        capabilities,
-        connection_id,
-    }) {
-        Ok(bytes) => bytes,
-        Err(e) => return ConnectResult::Failed(format!("TCP auth encode failed: {e}")),
-    };
-    if let Err(e) = write_frame(&mut write_half, &auth_bytes).await {
-        return ConnectResult::Failed(format!("TCP auth write failed: {e}"));
+    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, connection_id).await {
+        return ConnectResult::Failed(e);
     }
 
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<ClientMessage>();
@@ -154,17 +171,8 @@ pub async fn connect_tcp_tls(
 
     let (mut read_half, mut write_half) = tokio::io::split(tls_stream);
 
-    let auth_bytes = match encode_client(&ClientMessage::Auth {
-        token,
-        protocol_version: kmux_protocol::messages::PROTOCOL_VERSION,
-        capabilities,
-        connection_id,
-    }) {
-        Ok(bytes) => bytes,
-        Err(e) => return ConnectResult::Failed(format!("TCP+TLS auth encode failed: {e}")),
-    };
-    if let Err(e) = write_frame(&mut write_half, &auth_bytes).await {
-        return ConnectResult::Failed(format!("TCP+TLS auth write failed: {e}"));
+    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, connection_id).await {
+        return ConnectResult::Failed(e);
     }
 
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<ClientMessage>();
@@ -233,17 +241,8 @@ pub async fn connect_uds(
 
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
-    let auth_bytes = match encode_client(&ClientMessage::Auth {
-        token,
-        protocol_version: kmux_protocol::messages::PROTOCOL_VERSION,
-        capabilities,
-        connection_id,
-    }) {
-        Ok(bytes) => bytes,
-        Err(e) => return ConnectResult::Failed(format!("UDS auth encode failed: {e}")),
-    };
-    if let Err(e) = write_frame(&mut write_half, &auth_bytes).await {
-        return ConnectResult::Failed(format!("UDS auth write failed: {e}"));
+    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, connection_id).await {
+        return ConnectResult::Failed(e);
     }
 
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<ClientMessage>();
