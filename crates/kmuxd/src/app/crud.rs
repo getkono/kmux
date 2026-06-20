@@ -1,7 +1,9 @@
 use std::path::Path;
+use std::sync::Arc;
 
 use kmux_protocol::messages::{
-    ClientCapabilities, LayoutNode, PaneInfo, SessionEntry, SessionMeta, SessionStatus, TermSize,
+    ClientCapabilities, LayoutNode, PaneId, PaneInfo, PaneProcesses, SessionEntry, SessionMeta,
+    SessionStatus, TermSize,
 };
 use kmux_pty::error::{KmuxError, Result};
 
@@ -191,6 +193,49 @@ impl ServerApp {
         entries
     }
 
+    /// Sample the process tree of every locally-hosted pane (issue #122).
+    ///
+    /// Gathers each pane's PTY child pid, then runs the (blocking) `sysinfo`
+    /// scan on a blocking thread so the async runtime is never stalled. The
+    /// sampler refreshes lazily, so this is cheap to call repeatedly while the
+    /// overview is open and free when it is not. Federated panes are handled
+    /// separately by the peer subsystem and merged by the dispatch layer.
+    pub async fn local_process_overview(&self) -> Vec<PaneProcesses> {
+        let roots = self.collect_pane_roots().await;
+        let sampler = Arc::clone(&self.sampler);
+        tokio::task::spawn_blocking(move || {
+            let now = std::time::Instant::now();
+            sampler.lock().unwrap().sample(now, &roots)
+        })
+        .await
+        .unwrap_or_default()
+    }
+
+    /// The `(pane_id, child_pid)` of every locally-hosted pane. The session read
+    /// lock is dropped before querying pids so it is never held across an await.
+    async fn collect_pane_roots(&self) -> Vec<(PaneId, Option<i32>)> {
+        let pane_ids: Vec<PaneId> = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .values()
+                .flat_map(|state| {
+                    let word = state.meta.word_id.clone();
+                    state
+                        .panes
+                        .keys()
+                        .map(move |idx| format!("{word}/{idx}"))
+                        .collect::<Vec<_>>()
+                })
+                .collect()
+        };
+        let mut roots = Vec::with_capacity(pane_ids.len());
+        for pane_id in pane_ids {
+            let pid = self.manager.child_pid(&pane_id).await.map(|p| p.as_raw());
+            roots.push((pane_id, pid));
+        }
+        roots
+    }
+
     /// Rename a session's display name.
     pub async fn rename_session(&self, word_id: &str, new_name: &str) -> Result<()> {
         let mut sessions = self.sessions.write().await;
@@ -201,5 +246,57 @@ impl ServerApp {
             })?;
         state.meta.name = new_name.to_string();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kmux_protocol::messages::TermSize;
+
+    /// End-to-end (issue #122): a session running a real child appears in the
+    /// local process overview, rooted at that pane's PTY child pid, with the
+    /// child present in its process tree.
+    #[tokio::test]
+    async fn local_process_overview_reports_pane_child() {
+        let size = TermSize::default();
+        let caps = ClientCapabilities::default();
+        let app = ServerApp::new("tok".to_string());
+
+        // A long-lived, childless process makes the assertion deterministic.
+        let entry = app
+            .create_session(
+                None,
+                Some("/tmp".to_string()),
+                Some("/bin/sleep".to_string()),
+                vec!["30".to_string()],
+                size,
+                &caps,
+            )
+            .await
+            .expect("create_session");
+        let word = entry.meta.word_id.clone();
+        let pane_id = format!("{word}/0");
+        let child_pid = app
+            .manager
+            .child_pid(&pane_id)
+            .await
+            .expect("pane child pid")
+            .as_raw();
+
+        let overview = app.local_process_overview().await;
+        let pane = overview
+            .iter()
+            .find(|p| p.pane_id == pane_id)
+            .expect("pane present in overview");
+        assert_eq!(pane.root_pid, Some(child_pid));
+        assert!(
+            pane.processes.iter().any(|p| p.pid == child_pid),
+            "pane's child pid {child_pid} should be in its process tree: {:?}",
+            pane.processes
+        );
+
+        // Clean up the spawned child.
+        let _ = app.close_session(&word).await;
     }
 }

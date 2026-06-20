@@ -83,7 +83,10 @@ impl TransportKind {
 ///   `SessionEntry.peer` (which machine a listed session lives on) and
 ///   `ClientMessage::SessionCreate.peer` (create on a connected remote), for the
 ///   unified session launcher (issue #121).
-pub const PROTOCOL_VERSION: u32 = 27;
+/// - **28**: cross-session process overview — `ClientMessage::ProcessOverview`
+///   and `ServerMessage::ProcessOverviewResult` carrying per-pane process trees
+///   (`PaneProcesses` / `ProcessSample`), federated across peers (issue #122).
+pub const PROTOCOL_VERSION: u32 = 28;
 
 /// Wire compression algorithm negotiated for a connection.
 ///

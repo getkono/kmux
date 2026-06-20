@@ -39,8 +39,8 @@ use kmux_connect::connect::ConnectResult;
 use kmux_connect::ssh::{self, RemoteTarget};
 use kmux_connect::tcp_connect::connect_tcp_tls;
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ClientMessage, PeerId, PeerTarget, RequestId, SequenceNo,
-    ServerMessage, SessionEntry, SessionEventMsg, TermSize, epoch_millis,
+    ClientCapabilities, ClientId, ClientMessage, PaneProcesses, PeerId, PeerTarget, RequestId,
+    SequenceNo, ServerMessage, SessionEntry, SessionEventMsg, TermSize, epoch_millis,
 };
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
@@ -55,6 +55,11 @@ const LIST_TIMEOUT: Duration = Duration::from_secs(10);
 /// How long [`PeerManager::create_remote_session`] waits for the upstream
 /// `SessionCreated` (or `Error`) when creating a session on a federated peer.
 const CREATE_TIMEOUT: Duration = Duration::from_secs(10);
+/// How long [`PeerManager::collect_process_overview`] waits for each peer's
+/// `ProcessOverviewResult` (issue #122). Short, because the overview polls ~1 Hz
+/// and a slow/dead peer should not stall the whole snapshot — it just contributes
+/// nothing this round.
+const OVERVIEW_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Owns every upstream peer connection and routes federated traffic.
 #[derive(Default)]
@@ -242,6 +247,11 @@ struct PeerConnection {
     /// error string) when the matching `SessionCreated`/`Error` arrives;
     /// `create_remote_session` then draws the local word and registers it.
     pending_creates: HashMap<RequestId, oneshot::Sender<Result<SessionEntry, String>>>,
+    /// In-flight hub-initiated `ProcessOverview`s, keyed by upstream request id
+    /// (issue #122). The feed loop completes the oneshot with the peer's per-pane
+    /// process trees — already translated to local pane ids — when the matching
+    /// `ProcessOverviewResult` arrives.
+    pending_overviews: HashMap<RequestId, oneshot::Sender<Vec<PaneProcesses>>>,
     /// The background `ssh -L -N` tunnel process for an [`PeerTarget::Ssh`] peer,
     /// kept alive for the life of the connection (the `-L` forward dies with it).
     /// `None` for a [`PeerTarget::Direct`] peer. Killed on close/reap.
@@ -263,6 +273,7 @@ impl PeerConnection {
             feed_task: None,
             next_request_id: 2,
             pending_creates: HashMap::new(),
+            pending_overviews: HashMap::new(),
             ssh_tunnel: None,
             dead: false,
         }
@@ -772,6 +783,58 @@ impl PeerManager {
         out
     }
 
+    /// Collect the process overview from every connected peer (issue #122),
+    /// fanning out one `ProcessOverview` request per peer and awaiting the
+    /// replies concurrently. Returned pane ids are already local (the feed loop
+    /// translates them). A dead or slow peer contributes nothing this round
+    /// rather than stalling the snapshot.
+    pub async fn collect_process_overview(&self) -> Vec<PaneProcesses> {
+        let conns: Vec<Arc<Mutex<PeerConnection>>> =
+            self.peers.lock().unwrap().values().cloned().collect();
+
+        let mut set = tokio::task::JoinSet::new();
+        for conn in conns {
+            // Allocate a request id, register the oneshot, and dispatch upstream.
+            let (rid, rx) = {
+                let mut guard = conn.lock().unwrap();
+                if guard.dead {
+                    continue;
+                }
+                let rid = guard.next_rid();
+                let (tx, rx) = oneshot::channel();
+                guard.pending_overviews.insert(rid, tx);
+                if guard
+                    .client_tx
+                    .send(ClientMessage::ProcessOverview { request_id: rid })
+                    .is_err()
+                {
+                    guard.pending_overviews.remove(&rid);
+                    continue;
+                }
+                (rid, rx)
+            };
+            set.spawn(async move {
+                match tokio::time::timeout(OVERVIEW_TIMEOUT, rx).await {
+                    Ok(Ok(panes)) => panes,
+                    // Timed out or the link closed: drop the registration and
+                    // move on, so this peer simply contributes nothing.
+                    _ => {
+                        conn.lock().unwrap().pending_overviews.remove(&rid);
+                        Vec::new()
+                    }
+                }
+            });
+        }
+
+        let mut out = Vec::new();
+        while let Some(res) = set.join_next().await {
+            if let Ok(panes) = res {
+                out.extend(panes);
+            }
+        }
+        out
+    }
+
     /// Translate `local_pane_id` to its remote form and forward
     /// `build(remote_pane_id)` upstream. Returns `false` (forwarding nothing) when
     /// the pane is not federated, so the caller can fall back to local handling.
@@ -957,6 +1020,28 @@ fn spawn_feed_loop(
             // Answer keepalive pings so the upstream considers us live.
             if let ServerMessage::Ping { seq } = msg {
                 let _ = client_tx.send(ClientMessage::Pong { seq });
+                continue;
+            }
+
+            // Route process-overview responses (issue #122) to the waiting
+            // collector, translating each pane id remote→local. This frame is
+            // neither pane- nor session-scoped, so it must be handled before the
+            // routing below. Panes whose word we no longer map are dropped.
+            if let ServerMessage::ProcessOverviewResult { request_id, panes } = &msg {
+                let mut guard = conn.lock().unwrap();
+                if let Some(tx) = guard.pending_overviews.remove(request_id) {
+                    let localized: Vec<PaneProcesses> = panes
+                        .iter()
+                        .filter_map(|p| {
+                            Some(PaneProcesses {
+                                pane_id: guard.to_local_pane(&p.pane_id)?,
+                                ..p.clone()
+                            })
+                        })
+                        .collect();
+                    drop(guard);
+                    let _ = tx.send(localized);
+                }
                 continue;
             }
 

@@ -59,6 +59,10 @@ tracing-subscriber.workspace = true
 thiserror.workspace = true
 anyhow.workspace = true
 postcard.workspace = true
+# Cross-platform process stats (CPU/memory) for the process overview (issue
+# #122). Used to sample each pane's process tree. `default-features = false`
+# drops the disk/network/component probes we never query.
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 tempfile.workspace = true

@@ -11,7 +11,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ClientMessage, PaneId, SequenceNo, SessionEntry, TermSize, WordId,
+    ClientCapabilities, ClientId, ClientMessage, PaneId, PaneProcesses, SequenceNo, SessionEntry,
+    TermSize, WordId,
 };
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -68,6 +69,11 @@ pub struct SessionManager {
 
     // Session / tab / pane state
     pub session_list: Vec<SessionEntry>,
+    /// Latest per-pane process trees from the daemon (issue #122), keyed
+    /// implicitly by `PaneProcesses::pane_id`. Refreshed by
+    /// [`Self::request_process_overview`] while the process-overview view is
+    /// open; empty otherwise. Joined with `session_list` by the app layer.
+    pub process_overview: Vec<PaneProcesses>,
     /// Currently active session (word_id).
     pub active_session: Option<WordId>,
     /// The tab currently viewed within `active_session` (client-local — which
@@ -173,6 +179,7 @@ impl SessionManager {
             connected: false,
             status_msg: String::new(),
             session_list: Vec::new(),
+            process_overview: Vec::new(),
             active_session: None,
             active_tab: None,
             active_pane: None,
@@ -663,6 +670,35 @@ mod tests {
         assert_eq!(mgr.active_pane.as_deref(), Some("eagle/0"));
         // Attach message should have been sent
         assert!(rx.try_recv().is_ok());
+    }
+
+    #[test]
+    fn process_overview_result_caches_panes() {
+        use super::server_handler::SessionEvent;
+        use kmux_protocol::messages::{PaneProcesses, ProcessSample};
+        let (mut mgr, _rx) = make_connected_manager();
+
+        let panes = vec![PaneProcesses {
+            pane_id: "eagle/0".into(),
+            root_pid: Some(100),
+            processes: vec![ProcessSample {
+                pid: 100,
+                ppid: None,
+                name: "zsh".into(),
+                cmd: "-zsh".into(),
+                cpu_percent: 1.0,
+                mem_bytes: 1024,
+            }],
+        }];
+        let events = mgr.handle_server_message(ServerMessage::ProcessOverviewResult {
+            request_id: 7,
+            panes: panes.clone(),
+        });
+        assert!(matches!(
+            events.as_slice(),
+            [SessionEvent::ProcessOverviewReceived]
+        ));
+        assert_eq!(mgr.process_overview(), panes.as_slice());
     }
 
     #[test]

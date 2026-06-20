@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use super::category::MessageCategory;
+use super::process::PaneProcesses;
 use super::session::{
     ClientId, ConnectionId, DirEntry, ErrorCode, LayoutNode, PaneId, PaneInfo, PeerId, RequestId,
     SequenceNo, SessionEntry, SessionEventMsg, TabIndex, TabInfo, WordId,
@@ -58,6 +59,13 @@ pub enum ServerMessage {
     SessionListResult {
         request_id: RequestId,
         sessions: Vec<SessionEntry>,
+    },
+
+    /// Response to `ProcessOverview` (issue #122): the process tree of every
+    /// pane (local plus every federated peer's), keyed by local pane id.
+    ProcessOverviewResult {
+        request_id: RequestId,
+        panes: Vec<PaneProcesses>,
     },
 
     /// Confirmation that a new pane was created.
@@ -259,6 +267,7 @@ impl ServerMessage {
             Self::SessionCreated { .. }
             | Self::SessionClosed { .. }
             | Self::SessionListResult { .. }
+            | Self::ProcessOverviewResult { .. }
             | Self::SessionRenamed { .. }
             | Self::PaneCreated { .. }
             | Self::PaneClosed { .. }
@@ -408,6 +417,13 @@ mod tests {
                 ServerMessage::SessionListResult {
                     request_id: 0,
                     sessions: vec![],
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ServerMessage::ProcessOverviewResult {
+                    request_id: 0,
+                    panes: vec![],
                 },
                 MessageCategory::Control,
             ),

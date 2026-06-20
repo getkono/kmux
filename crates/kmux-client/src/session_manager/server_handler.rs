@@ -18,6 +18,9 @@ pub enum SessionEvent {
     AuthFailed { reason: String },
     /// Session list was received.
     SessionListReceived,
+    /// A process-overview snapshot was received (issue #122); the overview view
+    /// should repaint from `SessionManager::process_overview`.
+    ProcessOverviewReceived,
     /// A new session was created and is now the active session.
     SessionCreated { word_id: String },
     /// A session was closed.
@@ -176,6 +179,11 @@ impl SessionManager {
                     self.select_session(word);
                 }
                 events.push(SessionEvent::SessionListReceived);
+            }
+
+            ServerMessage::ProcessOverviewResult { panes, .. } => {
+                self.process_overview = panes;
+                events.push(SessionEvent::ProcessOverviewReceived);
             }
 
             ServerMessage::SessionCreated { entry, .. } => {

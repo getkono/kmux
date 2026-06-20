@@ -12,7 +12,8 @@
 //! locally-hosted one.
 
 use kmux_protocol::messages::{
-    ClientId, ClientMessage, PeerId, PeerTarget, SequenceNo, ServerMessage, SessionEntry, TermSize,
+    ClientId, ClientMessage, PaneProcesses, PeerId, PeerTarget, SequenceNo, ServerMessage,
+    SessionEntry, TermSize,
 };
 use tokio::sync::mpsc;
 
@@ -135,6 +136,20 @@ impl ServerApp {
         #[cfg(feature = "federation")]
         {
             self.peer_manager.list_sessions()
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            Vec::new()
+        }
+    }
+
+    /// The process overview of every open peer (issue #122), with pane ids
+    /// translated to local form, to be merged into the hub's
+    /// `ProcessOverviewResult`. Empty without the feature.
+    pub async fn collect_federated_process_overview(&self) -> Vec<PaneProcesses> {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.collect_process_overview().await
         }
         #[cfg(not(feature = "federation"))]
         {
