@@ -27,8 +27,8 @@ use std::time::Instant;
 use kmux_protocol::TransportKind;
 use kmux_protocol::control_rpc::{ConnectionInfo, SessionConnections, SessionsResponse};
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ConnectionId, InputMode, PaneProgressState, SessionStatus,
-    TermSize, epoch_millis,
+    ClientCapabilities, ClientId, ConnectionId, InputMode, PaneId, PaneInfo, PaneProgressState,
+    SessionStatus, TermSize, epoch_millis,
 };
 use kmux_pty::events::SessionEvent;
 use kmux_pty::registry::SessionManager as PtyRegistry;
@@ -216,6 +216,31 @@ impl PaneRelay {
         // In-process backends read the atomics above directly; a worker pane is
         // told over IPC (no-op for the in-process engine).
         self.engine.set_capabilities(graphics, keyboard);
+    }
+
+    /// Build a [`PaneInfo`] snapshot of this relay. Callers supply the parts that
+    /// vary by context: `pane_id` / `pane_index`, the attached-client list, and the
+    /// status — a freshly-created pane passes `Vec::new()` + `Running`, while a
+    /// list snapshot passes the live clients + `self.status`.
+    pub(crate) fn to_pane_info(
+        &self,
+        pane_id: PaneId,
+        pane_index: u32,
+        attached_clients: Vec<ClientId>,
+        status: SessionStatus,
+    ) -> PaneInfo {
+        let progress = *self.progress.lock().unwrap();
+        PaneInfo {
+            pane_id,
+            pane_index,
+            program: self.program.clone(),
+            size: self.size,
+            attached_clients,
+            status,
+            title: self.title.lock().unwrap().clone(),
+            progress_state: progress.state,
+            progress: progress.progress,
+        }
     }
 
     /// Compute the effective pane size: smallest rows and cols across all

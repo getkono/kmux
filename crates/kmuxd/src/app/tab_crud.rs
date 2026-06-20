@@ -65,18 +65,7 @@ impl ServerApp {
         let relay = self
             .spawn_pane_relay(&pane_id, program, args, size, Some(&cwd), seed_caps)
             .await?;
-        let progress = *relay.progress.lock().unwrap();
-        let pane_info = PaneInfo {
-            pane_id,
-            pane_index,
-            program: relay.program.clone(),
-            size: relay.size,
-            attached_clients: vec![],
-            status: SessionStatus::Running,
-            title: relay.title.lock().unwrap().clone(),
-            progress_state: progress.state,
-            progress: progress.progress,
-        };
+        let pane_info = relay.to_pane_info(pane_id, pane_index, Vec::new(), SessionStatus::Running);
 
         let tab_info = {
             let mut sessions = self.sessions.write().await;
@@ -219,18 +208,7 @@ impl ServerApp {
         let relay = self
             .spawn_pane_relay(&pane_id, program, args, size, Some(&cwd), seed_caps)
             .await?;
-        let progress = *relay.progress.lock().unwrap();
-        let pane_info = PaneInfo {
-            pane_id,
-            pane_index: new_index,
-            program: relay.program.clone(),
-            size: relay.size,
-            attached_clients: vec![],
-            status: SessionStatus::Running,
-            title: relay.title.lock().unwrap().clone(),
-            progress_state: progress.state,
-            progress: progress.progress,
-        };
+        let pane_info = relay.to_pane_info(pane_id, new_index, Vec::new(), SessionStatus::Running);
 
         let (new_layout, focused) = {
             let mut sessions = self.sessions.write().await;

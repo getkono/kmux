@@ -84,18 +84,12 @@ impl ServerApp {
             )
             .await?;
 
-        let progress = *relay.progress.lock().unwrap();
-        let pane_info = PaneInfo {
-            pane_id: pane_id.clone(),
+        let pane_info = relay.to_pane_info(
+            pane_id.clone(),
             pane_index,
-            program: relay.program.clone(),
-            size: relay.size,
-            attached_clients: vec![],
-            status: SessionStatus::Running,
-            title: relay.title.lock().unwrap().clone(),
-            progress_state: progress.state,
-            progress: progress.progress,
-        };
+            Vec::new(),
+            SessionStatus::Running,
+        );
 
         let mut panes = HashMap::new();
         panes.insert(pane_index, relay);
@@ -172,18 +166,12 @@ impl ServerApp {
                     .map(|(&pane_index, relay)| {
                         let attached_clients =
                             relay.clients.lock().unwrap().keys().copied().collect();
-                        let progress = *relay.progress.lock().unwrap();
-                        PaneInfo {
-                            pane_id: format_pane_id(&state.meta.word_id, pane_index),
+                        relay.to_pane_info(
+                            format_pane_id(&state.meta.word_id, pane_index),
                             pane_index,
-                            program: relay.program.clone(),
-                            size: relay.size,
                             attached_clients,
-                            status: relay.status.clone(),
-                            title: relay.title.lock().unwrap().clone(),
-                            progress_state: progress.state,
-                            progress: progress.progress,
-                        }
+                            relay.status.clone(),
+                        )
                     })
                     .collect();
                 panes.sort_by_key(|p| p.pane_index);
