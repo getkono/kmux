@@ -2,6 +2,14 @@ mod lifecycle;
 pub use lifecycle::ensure_daemon;
 pub(crate) use lifecycle::find_server_binary;
 
+/// Resolve the `kmuxd` binary an auto-spawn would launch, using the same
+/// precedence as the spawn path (`KMUX_KMUXD` → exe sibling → debug
+/// `target/<profile>` → `$PATH`). Exposed for diagnostics (`kmux debug paths`)
+/// so a developer can see *which* daemon a connect would start.
+pub fn resolve_kmuxd_path() -> anyhow::Result<std::path::PathBuf> {
+    find_server_binary()
+}
+
 /// Protects XDG_RUNTIME_DIR mutations — shared across all daemon tests.
 #[cfg(test)]
 pub(super) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
