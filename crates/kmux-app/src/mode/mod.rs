@@ -217,7 +217,7 @@ pub enum Action {
     // Quit the application
     Quit,
 
-    // Request a full reconnect via `recovery::ReconnectContext::run`.
+    // Request a full reconnect (the driver rebuilds + re-runs the bootstrap).
     Reconnect,
 
     // Force a full terminal clear + redraw (diagnostic).
