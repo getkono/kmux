@@ -89,7 +89,9 @@ impl TransportKind {
 /// - **29**: cross-session process overview — `ClientMessage::ProcessOverview`
 ///   and `ServerMessage::ProcessOverviewResult` carrying per-pane process trees
 ///   (`PaneProcesses` / `ProcessSample`), federated across peers (issue #122).
-pub const PROTOCOL_VERSION: u32 = 29;
+/// - **30**: `SessionEventMsg::PaneFaulted` — an isolated VT worker crashed and
+///   is being respawned; the shell survives (issue #126, process isolation).
+pub const PROTOCOL_VERSION: u32 = 30;
 
 /// Wire compression algorithm negotiated for a connection.
 ///

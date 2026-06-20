@@ -6,9 +6,12 @@ use std::sync::{Arc, Mutex};
 use kmux_protocol::messages::{ClientCapabilities, InputMode, SessionStatus, TermSize};
 use kmux_pty::config::{EnvBuilder, PtyConfig};
 use kmux_pty::error::Result;
+use kmux_pty::session::PtySession;
+use tracing::warn;
 
 use crate::backend::{BackendConfig, BackendSize, CapabilityHandles, DEFAULT_SCROLLBACK};
 use crate::capability::{intersect_for_atomics, pane_spawn_env};
+use crate::engine::{PaneEngine, WorkerEngine, WorkerFanout};
 use crate::relay::session_diff_loop;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::new_term_state;
@@ -136,7 +139,6 @@ impl ServerApp {
 
         self.manager.spawn(pane_id, &config).await?;
         let session = self.manager.get_session(pane_id).await?;
-        let (reader, writer) = session.split().await?;
 
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         let scrollback = Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY)));
@@ -148,38 +150,76 @@ impl ServerApp {
             progress.clone(),
             self.vt_events_tx.clone(),
         ));
-        let relay_sink = Arc::clone(&title_sink) as Arc<dyn crate::backend::BackendEventSink>;
-        let term_state = Arc::new(Mutex::new(new_term_state(BackendConfig {
-            size: BackendSize::from(size),
-            capabilities: CapabilityHandles {
-                kitty_graphics: kitty_graphics_enabled.clone(),
-                kitty_keyboard: kitty_keyboard_enabled.clone(),
-            },
-            events: title_sink,
-            scrollback: DEFAULT_SCROLLBACK,
-        })));
         let seqno_counter = Arc::new(AtomicU64::new(1));
 
-        let task = tokio::spawn(session_diff_loop(
-            reader,
-            pane_id.to_string(),
-            relay_sink,
-            clients.clone(),
-            scrollback.clone(),
-            term_state.clone(),
-            seqno_counter.clone(),
-            self.manager.clone(),
-        ));
+        // Opt-in process isolation (issue #126): run the VT pipeline in a worker
+        // subprocess. Any failure falls back to the in-process engine, which is
+        // always safe.
+        let mut engine = None;
+        if crate::engine::process_isolation_enabled() {
+            match self
+                .try_spawn_worker_engine(
+                    pane_id,
+                    size,
+                    kg_init,
+                    kk_init,
+                    &session,
+                    clients.clone(),
+                    scrollback.clone(),
+                    seqno_counter.clone(),
+                    title_sink.clone(),
+                )
+                .await
+            {
+                Ok(eng) => engine = Some(eng),
+                Err(e) => {
+                    warn!(
+                        pane_id,
+                        "process isolation: worker spawn failed ({e}); falling back to in-process"
+                    );
+                }
+            }
+        }
+
+        let engine = match engine {
+            Some(engine) => engine,
+            None => {
+                // In-process: emulator + relay loop live in the daemon.
+                let (reader, writer) = session.split().await?;
+                let relay_sink =
+                    Arc::clone(&title_sink) as Arc<dyn crate::backend::BackendEventSink>;
+                let term_state = Arc::new(Mutex::new(new_term_state(BackendConfig {
+                    size: BackendSize::from(size),
+                    capabilities: CapabilityHandles {
+                        kitty_graphics: kitty_graphics_enabled.clone(),
+                        kitty_keyboard: kitty_keyboard_enabled.clone(),
+                    },
+                    events: title_sink,
+                    scrollback: DEFAULT_SCROLLBACK,
+                })));
+                let task = tokio::spawn(session_diff_loop(
+                    reader,
+                    pane_id.to_string(),
+                    relay_sink,
+                    clients.clone(),
+                    scrollback.clone(),
+                    term_state.clone(),
+                    seqno_counter.clone(),
+                    self.manager.clone(),
+                ));
+                crate::engine::PaneEngine::InProcess(crate::engine::InProcessEngine::new(
+                    term_state, writer, task,
+                ))
+            }
+        };
 
         Ok(PaneRelay {
             clients,
-            writer,
-            _task: task,
+            engine,
             program: prog,
             args,
             size,
             scrollback,
-            term_state,
             seqno_counter,
             input_mode: InputMode::Open,
             status: SessionStatus::Running,
@@ -188,5 +228,46 @@ impl ServerApp {
             title,
             progress,
         })
+    }
+
+    /// Spawn an isolated VT worker for this pane and wrap it in a
+    /// [`PaneEngine::Worker`]. The daemon keeps the authoritative PTY master fd
+    /// (so the shell outlives a worker crash) and hands the worker a `dup`. Used
+    /// for the initial spawn and for respawn after a crash (see `app::recover`).
+    #[allow(clippy::too_many_arguments)]
+    pub(super) async fn try_spawn_worker_engine(
+        &self,
+        pane_id: &str,
+        size: TermSize,
+        kitty_graphics: bool,
+        kitty_keyboard: bool,
+        session: &PtySession,
+        clients: ClientMap,
+        scrollback: Arc<Mutex<DiffBuffer>>,
+        seqno_counter: Arc<AtomicU64>,
+        event_sink: Arc<PaneEventSink>,
+    ) -> anyhow::Result<PaneEngine> {
+        let pid = session.child_pid().await.as_raw();
+        let master_fd = session.dup_master_fd().await?;
+        let fanout = WorkerFanout {
+            pane_id: pane_id.to_string(),
+            clients,
+            scrollback,
+            seqno_counter,
+            event_sink,
+            manager: self.manager.clone(),
+            fault_tx: self.worker_fault_tx(),
+        };
+        let engine = WorkerEngine::spawn(
+            pid,
+            size,
+            DEFAULT_SCROLLBACK as u32,
+            kitty_graphics,
+            kitty_keyboard,
+            master_fd,
+            fanout,
+        )
+        .await?;
+        Ok(PaneEngine::Worker(engine))
     }
 }

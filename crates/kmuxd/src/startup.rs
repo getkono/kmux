@@ -79,6 +79,9 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     println!("Auth token: {token}");
 
     let app = Arc::new(ServerApp::new(token.clone()).with_compression(cfg.compression.clone()));
+    // Respawn isolated VT workers that crash (issue #126); no-op until a pane
+    // actually runs in a worker (KMUX_SESSION_ISOLATION=process).
+    app.spawn_worker_respawn_task();
 
     // Restore persisted sessions from the previous daemon instance, if any.
     // With a successful handoff, panes named in `inherited` keep their live

@@ -12,6 +12,7 @@ mod pane_crud;
 /// is off) so the dispatch layer never needs `#[cfg]` directives.
 mod peer_api;
 mod persistence;
+mod recover;
 pub(super) mod restore;
 mod tab_crud;
 
@@ -31,13 +32,11 @@ use kmux_protocol::messages::{
 };
 use kmux_pty::events::SessionEvent;
 use kmux_pty::registry::SessionManager as PtyRegistry;
-use kmux_pty::session::PtyWriter;
 use rand::SeedableRng as _;
 use tokio::sync::{RwLock, broadcast, mpsc, watch};
 
 use crate::capability::intersect_for_atomics;
 use crate::scrollback::DiffBuffer;
-use crate::term_state::TermState;
 use crate::wordlist::WordlistSampler;
 
 /// 10 MB scrollback buffer per pane (estimated diff size).
@@ -166,10 +165,10 @@ impl crate::backend::BackendEventSink for PaneEventSink {
 pub struct PaneRelay {
     /// Per-client output senders, shared with the relay task.
     pub clients: ClientMap,
-    /// Write half of the split pane, used to forward client input.
-    pub writer: PtyWriter,
-    /// Background task that reads from the PTY and sends to each client.
-    pub _task: tokio::task::JoinHandle<()>,
+    /// The VT engine: terminal emulation + PTY input, either in-process or in an
+    /// isolated worker subprocess. Replaces the former direct `term_state` /
+    /// `writer` / relay-task fields so both paths share one seam.
+    pub engine: crate::engine::PaneEngine,
     /// Program name, stored for `SessionList` responses and session restore.
     pub program: String,
     /// Arguments passed to the program at spawn time, stored for session restore.
@@ -178,8 +177,6 @@ pub struct PaneRelay {
     pub size: TermSize,
     /// Ring buffer of recent diffs, keyed by sequence number.
     pub scrollback: Arc<Mutex<DiffBuffer>>,
-    /// Server-side VT emulation state for this pane.
-    pub term_state: Arc<Mutex<TermState>>,
     /// Monotonic seqno counter shared with the relay diff loop.
     pub seqno_counter: Arc<AtomicU64>,
     /// Input control mode for this pane.
@@ -216,6 +213,9 @@ impl PaneRelay {
             .store(graphics, Ordering::Relaxed);
         self.kitty_keyboard_enabled
             .store(keyboard, Ordering::Relaxed);
+        // In-process backends read the atomics above directly; a worker pane is
+        // told over IPC (no-op for the in-process engine).
+        self.engine.set_capabilities(graphics, keyboard);
     }
 
     /// Compute the effective pane size: smallest rows and cols across all
@@ -249,10 +249,7 @@ impl PaneRelay {
         if new_size.rows == self.size.rows && new_size.cols == self.size.cols {
             return None;
         }
-        self.term_state
-            .lock()
-            .unwrap()
-            .resize(crate::backend::BackendSize::from(new_size));
+        self.engine.resize_emulator(new_size);
         self.size = new_size;
         Some(new_size)
     }
@@ -270,7 +267,7 @@ impl PaneRelay {
                 size: new_size,
             },
         };
-        let snapshot = self.term_state.lock().unwrap().snapshot();
+        let snapshot = self.engine.snapshot();
         let snap_msg = kmux_protocol::messages::ServerMessage::TerminalSnapshot {
             pane_id: pane_id.to_string(),
             snapshot,
@@ -446,12 +443,22 @@ pub struct ServerApp {
     /// the scan off the async runtime via `spawn_blocking`. Refreshes lazily, so
     /// it is free until a client opens the overview.
     pub(super) sampler: Arc<Mutex<crate::process_stats::ProcessSampler>>,
+    /// Pane ids whose isolated VT worker crashed, reported by worker supervisors
+    /// for respawn (issue #126). Drained by the task spawned in
+    /// [`ServerApp::spawn_worker_respawn_task`].
+    worker_fault_tx: mpsc::UnboundedSender<String>,
+    /// Receiver half, taken once by `spawn_worker_respawn_task`.
+    worker_fault_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    /// Per-pane restart timestamps, used to bound worker respawns (crash-loop
+    /// guard); keyed by `pane_id`.
+    worker_restart_log: Mutex<HashMap<String, Vec<std::time::Instant>>>,
 }
 
 impl ServerApp {
     pub fn new(token: String) -> Self {
         let (conn_count_tx, _) = watch::channel(0usize);
         let (vt_events_tx, _) = broadcast::channel(512);
+        let (worker_fault_tx, worker_fault_rx) = mpsc::unbounded_channel();
         Self {
             manager: Arc::new(PtyRegistry::new()),
             auth_token: token,
@@ -468,7 +475,15 @@ impl ServerApp {
             #[cfg(feature = "federation")]
             peer_manager: crate::federation::PeerManager::new(),
             sampler: Arc::new(Mutex::new(crate::process_stats::ProcessSampler::new())),
+            worker_fault_tx,
+            worker_fault_rx: Mutex::new(Some(worker_fault_rx)),
+            worker_restart_log: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Clone the sender worker supervisors use to report a crash for respawn.
+    pub(crate) fn worker_fault_tx(&self) -> mpsc::UnboundedSender<String> {
+        self.worker_fault_tx.clone()
     }
 
     /// Override the wire compression policy (from `kmuxd.toml`). Builder-style so
@@ -905,8 +920,11 @@ mod tests {
         let kitty_keyboard_enabled = Arc::new(AtomicBool::new(false));
         PaneRelay {
             clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            writer: PtyWriter::sink().unwrap(),
-            _task: tokio::task::spawn(async {}),
+            engine: crate::engine::PaneEngine::InProcess(crate::engine::InProcessEngine::new(
+                term_state,
+                PtyWriter::sink().unwrap(),
+                tokio::task::spawn(async {}),
+            )),
             program: "/bin/sh".to_string(),
             args: vec![],
             size: TermSize {
@@ -916,7 +934,6 @@ mod tests {
                 pixel_height: 0,
             },
             scrollback: Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY))),
-            term_state,
             seqno_counter: Arc::new(AtomicU64::new(1)),
             input_mode: kmux_protocol::messages::InputMode::Open,
             status: kmux_protocol::messages::SessionStatus::Running,

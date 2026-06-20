@@ -35,20 +35,8 @@ impl ServerApp {
             for (&pane_index, relay) in session_state.panes.iter() {
                 let pane_id = format!("{word_id}/{pane_index}");
 
-                // Snapshot grid state and extract scrollback in one lock scope.
-                let (grid, scrollback_lines) = {
-                    let ts = relay.term_state.lock().unwrap();
-                    let grid = ts.snapshot();
-                    let size = ts.history_size();
-                    let start = size.saturating_sub(MAX_SCROLLBACK_LINES);
-                    let count = size - start;
-                    let scrollback_lines = if count > 0 {
-                        ts.read_history_lines(start, count)
-                    } else {
-                        vec![]
-                    };
-                    (grid, scrollback_lines)
-                };
+                // Snapshot grid state and extract scrollback for the checkpoint.
+                let (grid, scrollback_lines) = relay.engine.checkpoint_grid(MAX_SCROLLBACK_LINES);
 
                 // Get child PID from the PTY registry.
                 let child_pid = self.manager.child_pid(&pane_id).await.map(|p| p.as_raw());

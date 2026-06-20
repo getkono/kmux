@@ -94,9 +94,13 @@ pub trait BackendEventSink: Send + Sync + 'static {
 /// A no-op event sink used in tests that do not need backend events.
 /// Production pane relays install a real sink (`PaneEventSink`) so OSC 0/2
 /// titles and OSC 52 clipboard writes flow through to clients.
-#[cfg(test)]
+///
+/// Gated behind `test-util` (and this crate's own `test`) so downstream test
+/// builds — kmuxd's relay/app unit tests — can construct a `TermState` without
+/// pulling it into production binaries.
+#[cfg(any(test, feature = "test-util"))]
 pub struct NullEventSink;
-#[cfg(test)]
+#[cfg(any(test, feature = "test-util"))]
 impl BackendEventSink for NullEventSink {}
 
 /// Configuration passed to [`TerminalBackend::new`].

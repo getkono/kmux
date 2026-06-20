@@ -70,7 +70,7 @@ pub(super) fn compute_replay(
     };
     match last_seqno {
         None => {
-            let snapshot = relay.term_state.lock().unwrap().snapshot();
+            let snapshot = relay.engine.snapshot();
             AttachResult::FullSnapshot(snapshot, current_seqno())
         }
         Some(seq) => {
@@ -83,14 +83,14 @@ pub(super) fn compute_replay(
                     // stays O(screen), not O(time paused).
                     let (count, bytes) = buf.pending_stats(seq);
                     if count > MAX_RESUME_DELTA_DIFFS || bytes > MAX_RESUME_DELTA_BYTES {
-                        let snapshot = relay.term_state.lock().unwrap().snapshot();
+                        let snapshot = relay.engine.snapshot();
                         AttachResult::SyncReset(snapshot, current_seqno())
                     } else {
                         AttachResult::Delta(buf.since(seq))
                     }
                 }
                 _ => {
-                    let snapshot = relay.term_state.lock().unwrap().snapshot();
+                    let snapshot = relay.engine.snapshot();
                     AttachResult::SyncReset(snapshot, current_seqno())
                 }
             }

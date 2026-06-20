@@ -405,6 +405,11 @@ pub enum SessionEventMsg {
     },
     /// A pane was closed.
     PaneClosed { pane_id: PaneId },
+    /// A pane's isolated VT worker crashed (issue #126). The pane's shell is
+    /// still alive (the daemon holds the PTY master fd) but its emulator died;
+    /// the daemon respawns the worker. Clients surface this as a transient
+    /// "session recovering" state rather than an exit.
+    PaneFaulted { pane_id: PaneId },
 
     /// A new tab was created inside a session.
     TabCreated {

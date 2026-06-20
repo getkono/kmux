@@ -1,0 +1,20 @@
+[package]
+name = "kmux-vt-core"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Shared server-side VT pipeline (terminal backend, diff engine, scrollback mirror) for kmuxd and the isolated kmux-vt-worker."
+
+[features]
+# Exposes the in-memory test doubles (`NullEventSink`, the mock backend) to
+# downstream crates' test builds. kmuxd enables this in its dev-dependencies so
+# its relay/app unit tests can construct a `TermState` without libghostty-vt.
+test-util = []
+
+[dependencies]
+kmux-protocol.workspace = true
+kmux-ghostty.workspace = true
+tracing.workspace = true

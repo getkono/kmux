@@ -351,13 +351,13 @@ impl ServerApp {
 
         PaneRelay {
             clients,
-            writer,
-            _task: task,
+            engine: crate::engine::PaneEngine::InProcess(crate::engine::InProcessEngine::new(
+                term_state, writer, task,
+            )),
             program: persisted_pane.program.clone(),
             args: persisted_pane.args.clone(),
             size,
             scrollback,
-            term_state,
             seqno_counter,
             input_mode: InputMode::Open,
             status: SessionStatus::Running,
