@@ -250,10 +250,7 @@ impl SessionManager {
                     .iter_mut()
                     .find(|e| e.meta.word_id == session_word_id)
                 {
-                    let pane_index = pane_id
-                        .rsplit_once('/')
-                        .and_then(|(_, idx)| idx.parse().ok())
-                        .unwrap_or(0);
+                    let pane_index = kmux_protocol::pane_index(&pane_id).unwrap_or(0);
                     if !entry.panes.iter().any(|p| p.pane_id == pane_id) {
                         entry.panes.push(PaneInfo {
                             pane_id: pane_id.clone(),

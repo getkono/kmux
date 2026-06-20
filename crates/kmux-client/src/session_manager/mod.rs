@@ -412,6 +412,7 @@ impl SessionManager {
 mod tests {
     use std::sync::Arc;
 
+    use kmux_protocol::format_pane_id;
     use kmux_protocol::messages::{
         ClientCapabilities, ClientId, ClientMessage, GridSnapshot, PaneInfo, SequenceNo,
         ServerMessage, SessionEntry, SessionMeta, SessionStatus, TermModes, TermSize,
@@ -503,7 +504,7 @@ mod tests {
                 cwd: cwd.to_string(),
             },
             panes: vec![PaneInfo {
-                pane_id: format!("{word_id}/0"),
+                pane_id: format_pane_id(word_id, 0),
                 pane_index: 0,
                 program: String::new(),
                 size: TermSize::default(),
@@ -738,7 +739,7 @@ mod tests {
             },
             panes: (0..pane_count)
                 .map(|i| PaneInfo {
-                    pane_id: format!("{word_id}/{i}"),
+                    pane_id: format_pane_id(word_id, i),
                     pane_index: i,
                     program: String::new(),
                     size: TermSize::default(),
@@ -954,7 +955,8 @@ mod tests {
         let (mut mgr, _rx) = make_connected_manager();
         for (wid, cwd) in [("a", "/a"), ("b", "/b"), ("c", "/c")] {
             let entry = make_entry(wid, cwd);
-            mgr.buffers.insert(format!("{wid}/0"), CellGrid::default());
+            mgr.buffers
+                .insert(format_pane_id(wid, 0), CellGrid::default());
             mgr.session_list.push(entry);
         }
         mgr.active_session = Some("c".to_string());
