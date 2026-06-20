@@ -1,6 +1,7 @@
 use std::path::Path;
 use std::sync::Arc;
 
+use kmux_protocol::format_pane_id;
 use kmux_protocol::messages::{
     ClientCapabilities, LayoutNode, PaneId, PaneInfo, PaneProcesses, SessionEntry, SessionMeta,
     SessionStatus, TermSize,
@@ -71,7 +72,7 @@ impl ServerApp {
 
         // Spawn initial pane (index 0)
         let pane_index = 0u32;
-        let pane_id = format!("{word_id}/{pane_index}");
+        let pane_id = format_pane_id(&word_id, pane_index);
         let relay = self
             .spawn_pane_relay(
                 &pane_id,
@@ -139,7 +140,7 @@ impl ServerApp {
                 .map(|s| {
                     s.panes
                         .keys()
-                        .map(|&idx| (idx, format!("{word_id}/{idx}")))
+                        .map(|&idx| (idx, format_pane_id(word_id, idx)))
                         .collect()
                 })
                 .unwrap_or_default()
@@ -173,7 +174,7 @@ impl ServerApp {
                             relay.clients.lock().unwrap().keys().copied().collect();
                         let progress = *relay.progress.lock().unwrap();
                         PaneInfo {
-                            pane_id: format!("{}/{pane_index}", state.meta.word_id),
+                            pane_id: format_pane_id(&state.meta.word_id, pane_index),
                             pane_index,
                             program: relay.program.clone(),
                             size: relay.size,
@@ -229,7 +230,7 @@ impl ServerApp {
                     state
                         .panes
                         .keys()
-                        .map(move |idx| format!("{word}/{idx}"))
+                        .map(move |idx| format_pane_id(&word, *idx))
                         .collect::<Vec<_>>()
                 })
                 .collect()
@@ -282,7 +283,7 @@ mod tests {
             .await
             .expect("create_session");
         let word = entry.meta.word_id.clone();
-        let pane_id = format!("{word}/0");
+        let pane_id = format_pane_id(&word, 0);
         let child_pid = app
             .manager
             .child_pid(&pane_id)

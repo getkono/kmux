@@ -50,11 +50,7 @@ pub(super) fn get_pane_relay_mut<'a>(
 }
 
 /// Parse a pane ID `"{word_id}/{pane_index}"` into its components.
-pub fn parse_pane_id(pane_id: &str) -> Option<(&str, u32)> {
-    let (word, idx_str) = pane_id.rsplit_once('/')?;
-    let idx: u32 = idx_str.parse().ok()?;
-    Some((word, idx))
-}
+pub use kmux_protocol::parse_pane_id;
 
 /// Walk up the directory tree to find the nearest existing ancestor.
 pub(super) fn resolve_cwd(desired: &Path) -> PathBuf {

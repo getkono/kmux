@@ -1,5 +1,7 @@
 use std::sync::atomic::Ordering;
 
+use kmux_protocol::format_pane_id;
+
 use super::ServerApp;
 
 /// Summary of a session restore operation.
@@ -33,7 +35,7 @@ impl ServerApp {
             let mut persisted_panes = Vec::with_capacity(session_state.panes.len());
 
             for (&pane_index, relay) in session_state.panes.iter() {
-                let pane_id = format!("{word_id}/{pane_index}");
+                let pane_id = format_pane_id(word_id, pane_index);
 
                 // Snapshot grid state and extract scrollback for the checkpoint.
                 let (grid, scrollback_lines) = relay.engine.checkpoint_grid(MAX_SCROLLBACK_LINES);
