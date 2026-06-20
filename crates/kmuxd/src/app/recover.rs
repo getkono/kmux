@@ -72,10 +72,19 @@ impl ServerApp {
                 relay.scrollback.clone(),
                 relay.seqno_counter.clone(),
                 relay.title.clone(),
+                relay.progress.clone(),
             )
         };
-        let (size, kitty_graphics, kitty_keyboard, clients, scrollback, seqno_counter, title) =
-            gathered;
+        let (
+            size,
+            kitty_graphics,
+            kitty_keyboard,
+            clients,
+            scrollback,
+            seqno_counter,
+            title,
+            progress,
+        ) = gathered;
 
         // Spawn the replacement worker WITHOUT holding the sessions lock (the
         // handshake is async). It re-adopts the daemon's retained master fd.
@@ -85,6 +94,7 @@ impl ServerApp {
         let event_sink = Arc::new(PaneEventSink::new(
             pane_id.to_string(),
             title,
+            progress,
             self.vt_events_tx.clone(),
         ));
         let new_engine = match self
