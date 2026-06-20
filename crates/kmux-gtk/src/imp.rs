@@ -31,6 +31,7 @@ mod css;
 mod dialogs;
 mod header;
 mod input;
+mod overview;
 mod prefs;
 mod render;
 #[cfg(feature = "gpu")]
@@ -317,10 +318,14 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     // Mouse: scroll-wheel (PTY mouse-report or local scrollback).
     input::attach(&drawing, &fe);
 
+    // Esc / q close the process overview (issue #122).
+    overview::attach_keys(&shell, &fe);
+
     // Populate the shell + overlays once so they aren't blank until the first tick.
     header::sync(&shell, &fe);
     tabs::sync(&shell, &fe);
     sidebar::sync(&shell, &fe);
+    overview::sync(&shell, &fe);
     dialogs::sync(&dialogs, &shell, &fe, app);
 
     // The pump: tick the driver, apply effects, sync the shell/dialogs, redraw.
@@ -361,6 +366,9 @@ fn pump(
         header::sync(shell, fe);
         tabs::sync(shell, fe);
         sidebar::sync(shell, fe);
+        // After tabs::sync sets panes/empty, let the overview override to its
+        // own stack child while it is open (issue #122).
+        overview::sync(shell, fe);
         dialogs::sync(dialogs, shell, fe, app);
         // Keep each visible pane's PTY sized to its resolved tile (no-op when no
         // tile's size changed). Skipped until the drawing has been allocated.

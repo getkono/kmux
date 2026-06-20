@@ -87,6 +87,13 @@ fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
         ("toggle-lock", Action::ToggleInputLock, &["<Ctrl><Shift>l"]),
         ("toggle-hud", Action::ToggleHud, &["<Ctrl><Shift>h"]),
         ("toggle-metrics", Action::ToggleMetrics, &["<Ctrl><Shift>m"]),
+        // Process overview: a main-area Tab → Pane → Process tree (issue #122).
+        // o = overview.
+        (
+            "process-overview",
+            Action::ToggleProcessOverview,
+            &["<Ctrl><Shift>o"],
+        ),
         (
             "toggle-connection",
             Action::ToggleConnection,
@@ -307,6 +314,7 @@ fn build_menu() -> gio::Menu {
     let s4 = gio::Menu::new();
     s4.append(Some("Lock Input"), Some("win.toggle-lock"));
     s4.append(Some("Pause Connection"), Some("win.toggle-pause"));
+    s4.append(Some("Process Overview"), Some("win.process-overview"));
     s4.append(Some("Performance HUD"), Some("win.toggle-hud"));
     s4.append(Some("Metrics"), Some("win.toggle-metrics"));
     s4.append(Some("Connection"), Some("win.toggle-connection"));
