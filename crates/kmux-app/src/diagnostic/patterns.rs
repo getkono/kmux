@@ -20,6 +20,7 @@ pub fn pattern_bytes(test: DiagnosticTest) -> Vec<u8> {
         DiagnosticTest::Colors => colors(&mut out),
         DiagnosticTest::Unicode => unicode(&mut out),
         DiagnosticTest::Boxes => boxes(&mut out),
+        DiagnosticTest::Progress => progress(&mut out),
         DiagnosticTest::All => {
             for t in DiagnosticTest::EACH {
                 section_header(&mut out, t.name());
@@ -39,6 +40,7 @@ fn pattern_into(test: DiagnosticTest, out: &mut String) {
         DiagnosticTest::Colors => colors(out),
         DiagnosticTest::Unicode => unicode(out),
         DiagnosticTest::Boxes => boxes(out),
+        DiagnosticTest::Progress => progress(out),
         DiagnosticTest::All => {}
     }
 }
@@ -208,6 +210,27 @@ fn boxes(out: &mut String) {
     out.push_str("Diagonals:     ╱ ╲ ╳    Half blocks:  ▖ ▗ ▘ ▝ ▙ ▟ ▛ ▜\n");
 }
 
+// ── progress ──────────────────────────────────────────────────────────────
+
+/// Static single-frame fallback for the OSC 9;4 progress test (issue #125).
+///
+/// The progress bar is *window chrome*, not grid content, and the real test is
+/// the animated loop in [`super::emit_progress_animated`]. These bytes are what
+/// `pattern_bytes(Progress)` yields — a legend plus one concrete frame — so the
+/// host-terminal `--emit` and any byte-level test still see a valid OSC 9;4.
+fn progress(out: &mut String) {
+    out.push_str("OSC 9;4 progress report (ConEmu / Windows-Terminal).\n");
+    out.push_str(
+        "Run `kmux diagnostic progress` for the animated test; this static frame\n\
+         sets a single state.\n\n",
+    );
+    out.push_str("States: 0=remove  1=set  2=error  3=indeterminate  4=pause   value 0..=100\n");
+    // One concrete frame: normal progress at 50%.
+    out.push_str(ESC);
+    out.push_str("]9;4;1;50\x07");
+    out.push_str("\nSet: state=1 (set), 50%\n");
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -224,11 +247,18 @@ mod tests {
             DiagnosticTest::Colors,
             DiagnosticTest::Unicode,
             DiagnosticTest::Boxes,
+            DiagnosticTest::Progress,
             DiagnosticTest::All,
         ] {
             let s = render(test);
             assert!(!s.is_empty(), "{} pattern is empty", test.name());
         }
+    }
+
+    #[test]
+    fn progress_fallback_emits_osc_9_4() {
+        let s = render(DiagnosticTest::Progress);
+        assert!(s.contains("\x1b]9;4;"), "progress fallback missing OSC 9;4");
     }
 
     #[test]

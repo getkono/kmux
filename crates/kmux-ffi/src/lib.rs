@@ -63,7 +63,8 @@ use kmux_client::input::{
     MouseButton, MouseEvent, MouseEventKind, MouseMods, char_to_proto_key, encode_mouse_scroll,
 };
 use kmux_protocol::messages::{
-    ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, SplitDir, TermSize,
+    ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, PaneProgressState, SplitDir,
+    TermSize,
 };
 // The packed-cell format is owned by `kmux-render` (the single encoder shared
 // with the GPU renderer; see docs/architecture-render.md). The non-GPU Swift
@@ -79,7 +80,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 16;
+pub const KMUX_FFI_ABI_VERSION: u32 = 17;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -812,6 +813,35 @@ fn overview_kind_to_ffi(kind: OverviewRowKind) -> FfiOverviewKind {
     }
 }
 
+/// OSC 9;4 (ConEmu/Windows-Terminal) progress-bar state for a pane (issue #125).
+/// Mirrors [`PaneProgressState`]; drives the per-pane progress bar the SwiftUI
+/// frontend overlays on each tile.
+#[derive(uniffi::Enum, Debug, PartialEq, Eq)]
+pub enum FfiProgressState {
+    /// No bar.
+    Remove,
+    /// Normal progress (accent).
+    Set,
+    /// Error (red).
+    Error,
+    /// Indeterminate / busy (full-width accent).
+    Indeterminate,
+    /// Paused / warning (amber).
+    Pause,
+}
+
+impl From<PaneProgressState> for FfiProgressState {
+    fn from(s: PaneProgressState) -> Self {
+        match s {
+            PaneProgressState::Remove => FfiProgressState::Remove,
+            PaneProgressState::Set => FfiProgressState::Set,
+            PaneProgressState::Error => FfiProgressState::Error,
+            PaneProgressState::Indeterminate => FfiProgressState::Indeterminate,
+            PaneProgressState::Pause => FfiProgressState::Pause,
+        }
+    }
+}
+
 /// One resolved pane rectangle in the active tab, in cell coordinates within the
 /// content area passed to [`KmuxDriver::layout`]. `(col, row)` is the top-left
 /// corner; the frontend tiles one terminal view per rect and flags the
@@ -825,6 +855,10 @@ pub struct FfiPaneRect {
     pub cols: u32,
     pub rows: u32,
     pub focused: bool,
+    /// Latest OSC 9;4 progress state for the pane (issue #125); `Remove` = no bar.
+    pub progress_state: FfiProgressState,
+    /// Progress percentage `0..=100`, or `None` for value-less states.
+    pub progress: Option<u8>,
 }
 
 /// A per-pane resolved size the frontend pushes down via
@@ -1701,14 +1735,24 @@ impl KmuxDriver {
             &kmux_app::layout::LayoutConfig::default(),
         )
         .into_iter()
-        .map(|r| FfiPaneRect {
-            pane_id: format!("{word}/{}", r.pane_index),
-            pane_index: r.pane_index,
-            col: r.col as u32,
-            row: r.row as u32,
-            cols: r.cols as u32,
-            rows: r.rows as u32,
-            focused: focused == Some(r.pane_index),
+        .map(|r| {
+            let pane_id = format!("{word}/{}", r.pane_index);
+            let (progress_state, progress) = d
+                .mgr
+                .pane_info(&pane_id)
+                .map(|p| (p.progress_state.into(), p.progress))
+                .unwrap_or((FfiProgressState::Remove, None));
+            FfiPaneRect {
+                pane_id,
+                pane_index: r.pane_index,
+                col: r.col as u32,
+                row: r.row as u32,
+                cols: r.cols as u32,
+                rows: r.rows as u32,
+                focused: focused == Some(r.pane_index),
+                progress_state,
+                progress,
+            }
         })
         .collect()
     }

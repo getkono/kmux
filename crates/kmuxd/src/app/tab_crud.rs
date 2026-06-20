@@ -64,6 +64,7 @@ impl ServerApp {
         let relay = self
             .spawn_pane_relay(&pane_id, program, args, size, Some(&cwd), seed_caps)
             .await?;
+        let progress = *relay.progress.lock().unwrap();
         let pane_info = PaneInfo {
             pane_id,
             pane_index,
@@ -72,6 +73,8 @@ impl ServerApp {
             attached_clients: vec![],
             status: SessionStatus::Running,
             title: relay.title.lock().unwrap().clone(),
+            progress_state: progress.state,
+            progress: progress.progress,
         };
 
         let tab_info = {
@@ -215,6 +218,7 @@ impl ServerApp {
         let relay = self
             .spawn_pane_relay(&pane_id, program, args, size, Some(&cwd), seed_caps)
             .await?;
+        let progress = *relay.progress.lock().unwrap();
         let pane_info = PaneInfo {
             pane_id,
             pane_index: new_index,
@@ -223,6 +227,8 @@ impl ServerApp {
             attached_clients: vec![],
             status: SessionStatus::Running,
             title: relay.title.lock().unwrap().clone(),
+            progress_state: progress.state,
+            progress: progress.progress,
         };
 
         let (new_layout, focused) = {

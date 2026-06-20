@@ -73,8 +73,14 @@ description = "Build the GTK app (kmux-gtk)"
 run = "cargo build -p kmux-gtk"
 
 [tasks.gtk-run]
-description = "Run the GTK app (kmux-gtk)"
-run = "cargo run -p kmux-gtk"
+description = "Run the GTK app (kmux-gtk) against the debug daemon"
+# Build + pin the debug kmuxd so the GUI auto-spawns it, not an installed
+# release kmuxd on PATH (which a debug client can never reach — separate runtime
+# dirs). See find_server_binary() / KMUX_KMUXD in crates/kmux-connect.
+run = [
+    "cargo build -p kmuxd",
+    'KMUX_KMUXD="$PWD/target/debug/kmuxd" cargo run -p kmux-gtk',
+]
 
 [tasks.gtk-test]
 description = "Test the GTK app (kmux-gtk)"
@@ -86,9 +92,14 @@ depends = ["gen-ffi-bindings"]
 run = "swift build --package-path kmux-swift"
 
 [tasks.swift-run]
-description = "Run the native macOS app (kmux-swift). Regenerates bindings first."
+description = "Run the native macOS app (kmux-swift) against the debug daemon. Regenerates bindings first."
 depends = ["gen-ffi-bindings"]
-run = "swift run --package-path kmux-swift"
+# Build + pin the debug kmuxd (see gtk-run); the app inherits KMUX_KMUXD from
+# `swift run` and auto-spawns target/debug/kmuxd instead of a release one on PATH.
+run = [
+    "cargo build -p kmuxd",
+    'KMUX_KMUXD="$PWD/target/debug/kmuxd" swift run --package-path kmux-swift',
+]
 
 [tasks.swift-test]
 description = "Test the native macOS app (kmux-swift). Regenerates bindings first."
@@ -108,9 +119,11 @@ run = [
 [tasks.swift-gpu-run]
 description = "Run the macOS app on the wgpu GPU renderer (KMUX_RENDERER=wgpu)."
 env = { KMUX_RENDERER = "wgpu" }
+# Build + pin the debug kmuxd (see gtk-run) so the GPU dev app auto-spawns it.
 run = [
     "mise run gen-ffi-bindings",
-    "swift run --package-path kmux-swift -Xswiftc -DKMUX_GPU",
+    "cargo build -p kmuxd",
+    'KMUX_KMUXD="$PWD/target/debug/kmuxd" swift run --package-path kmux-swift -Xswiftc -DKMUX_GPU',
 ]
 
 [tasks.doc]
@@ -133,13 +146,9 @@ description = "Count lines of our own code + docs (tokei)"
 # (the EFF diceware wordlist — third-party data, not code we maintain).
 run = "tokei --exclude vendor --exclude crates/kmuxd/src/eff_long_wordlist.txt"
 
-[tasks.tail-client-log]
-description = "Tail the client log (kmux)"
-run = 'tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/kmux/client.log"'
-
-[tasks.tail-daemon-log]
-description = "Tail the daemon log (kmuxd)"
-run = 'tail -f "${XDG_STATE_HOME:-$HOME/.local/state}/kmux/daemon.log"'
+# tail-client-log / tail-daemon-log live in mise-tasks/ — they tail BOTH the
+# release (kmux/) and debug (kmux-debug/) logs so a `cargo run` dev build's
+# output is visible (debug builds isolate their state under kmux-debug/).
 
 [tasks.setup]
 description = "Install hk's git hooks (fallback for the postinstall hook)"

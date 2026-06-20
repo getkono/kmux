@@ -20,7 +20,7 @@ use core::ffi::c_void;
 /// ABI version expected by this Rust crate. The Zig wrapper exports the same
 /// constant via [`kmux_ghostty_abi_version`]. Mismatch is a build-time
 /// inconsistency — safe wrappers must panic on mismatch.
-pub const EXPECTED_ABI_VERSION: u32 = 3;
+pub const EXPECTED_ABI_VERSION: u32 = 4;
 
 // Result codes returned by the Zig wrapper. `OK` is 0; everything else is
 // a negative error code. Kept in sync with `src/wrapper.zig`.
@@ -157,6 +157,11 @@ pub struct KmuxEventSink {
     pub on_bell: Option<unsafe extern "C" fn(*mut c_void)>,
     pub on_osc52: Option<unsafe extern "C" fn(*mut c_void, u8, *const u8, usize)>,
     pub on_hyperlink: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize, *const u8, usize)>,
+    /// OSC 9;4 ConEmu/WT progress report. Args: `(user, state, progress, has)`
+    /// where `state` is the ordinal (0=remove, 1=set, 2=error, 3=indeterminate,
+    /// 4=pause), `progress` is 0..=100, and `has` is 1 when a progress value was
+    /// carried (encodes ghostty's `?u8`).
+    pub on_progress: Option<unsafe extern "C" fn(*mut c_void, u8, u8, u8)>,
 }
 
 // Safety: the sink is an inert vtable of function pointers plus an opaque
@@ -173,6 +178,7 @@ impl Default for KmuxEventSink {
             on_bell: None,
             on_osc52: None,
             on_hyperlink: None,
+            on_progress: None,
         }
     }
 }
@@ -237,6 +243,17 @@ unsafe extern "C" {
         out: *mut u8,
         buf_len: usize,
     ) -> usize;
+
+    /// Read the latest OSC 9;4 progress report. Writes the state ordinal
+    /// (0=remove, 1=set, 2=error, 3=indeterminate, 4=pause) into `*out_state`,
+    /// the 0..=100 value into `*out_value`, and 1/0 into `*out_has` for whether
+    /// a value was carried. Defaults to remove/0/0 until a sequence arrives.
+    pub fn kmux_ghostty_get_progress(
+        term: *const kmux_ghostty_term,
+        out_state: *mut u8,
+        out_value: *mut u8,
+        out_has: *mut u8,
+    );
 
     /// Number of rows currently held in scrollback (not counting the viewport).
     pub fn kmux_ghostty_history_size(term: *const kmux_ghostty_term) -> usize;

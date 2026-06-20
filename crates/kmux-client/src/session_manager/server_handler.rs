@@ -2,8 +2,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kmux_protocol::messages::{
-    ClientId, ClientMessage, PaneInfo, SequenceNo, ServerMessage, SessionEventMsg, SessionStatus,
-    epoch_millis,
+    ClientId, ClientMessage, PaneInfo, PaneProgressState, SequenceNo, ServerMessage,
+    SessionEventMsg, SessionStatus, epoch_millis,
 };
 use tracing::{info, warn};
 
@@ -33,6 +33,13 @@ pub enum SessionEvent {
     PaneClosed { pane_id: String },
     /// A pane's window title changed (OSC 0/2).
     PaneTitleChanged { pane_id: String, title: String },
+    /// A pane's OSC 9;4 progress changed (ConEmu/WT progress bar). The frontend
+    /// repaints the pane's progress bar from the cached `PaneInfo`.
+    PaneProgressChanged {
+        pane_id: String,
+        state: PaneProgressState,
+        progress: Option<u8>,
+    },
     /// A pane's program wrote the clipboard via OSC 52. `data` is the still
     /// base64-encoded payload; the app layer decodes and applies it (subject to
     /// the active-pane policy) at the frontend's clipboard leaf.
@@ -256,6 +263,8 @@ impl SessionManager {
                             attached_clients: vec![],
                             status: SessionStatus::Running,
                             title: String::new(),
+                            progress_state: Default::default(),
+                            progress: None,
                         });
                     }
                 }
@@ -538,6 +547,30 @@ impl SessionManager {
                     }
                 }
                 events.push(SessionEvent::PaneTitleChanged { pane_id, title });
+            }
+
+            ServerMessage::Event {
+                event:
+                    SessionEventMsg::PaneProgressChanged {
+                        pane_id,
+                        state,
+                        progress,
+                    },
+            } => {
+                // Update the cached snapshot so the frontend's per-pane progress
+                // bar repaints from `PaneInfo` on the next render tick.
+                for entry in &mut self.session_list {
+                    if let Some(pane) = entry.panes.iter_mut().find(|p| p.pane_id == pane_id) {
+                        pane.progress_state = state;
+                        pane.progress = progress;
+                        break;
+                    }
+                }
+                events.push(SessionEvent::PaneProgressChanged {
+                    pane_id,
+                    state,
+                    progress,
+                });
             }
 
             ServerMessage::Event {

@@ -939,6 +939,8 @@ mod tests {
                 attached_clients: vec![],
                 status,
                 title: String::new(),
+                progress_state: Default::default(),
+                progress: None,
             }],
             tabs: vec![TabInfo {
                 tab_index: 0,

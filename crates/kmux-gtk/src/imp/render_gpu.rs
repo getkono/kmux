@@ -259,6 +259,12 @@ pub(crate) fn paint(
         }
         Err(e) => tracing::warn!("kmux-render cairo surface failed: {e}"),
     }
+
+    // NOTE: the OSC 9;4 per-pane progress bar (issue #125) is currently drawn
+    // only on the Cairo path (`render::render_tiled`), the runtime default.
+    // Surfacing it through the GPU path means threading progress into the shared
+    // `kmux-render` scene — tracked as a follow-up; `KMUX_RENDERER=wgpu` shows no
+    // bar until then.
 }
 
 #[cfg(test)]

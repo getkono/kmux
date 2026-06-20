@@ -24,7 +24,7 @@ const Action = gvt.StreamAction;
 // ABI constants
 // -----------------------------------------------------------------------------
 
-pub const ABI_VERSION: u32 = 3;
+pub const ABI_VERSION: u32 = 4;
 
 // Result codes. Must match the values `kmux-ghostty-sys::error` expects.
 const OK: i32 = 0;
@@ -201,12 +201,17 @@ const KmuxEventSink = extern struct {
     on_bell: ?*const fn (*anyopaque) callconv(.c) void,
     on_osc52: ?*const fn (*anyopaque, u8, [*]const u8, usize) callconv(.c) void,
     on_hyperlink: ?*const fn (*anyopaque, [*]const u8, usize, [*]const u8, usize) callconv(.c) void,
+    /// OSC 9;4 ConEmu/WT progress report. `state` is the ordinal 0=remove,
+    /// 1=set, 2=error, 3=indeterminate, 4=pause; `progress` is 0..=100; `has`
+    /// is 1 when the sequence carried a progress value (else 0 — e.g. remove /
+    /// indeterminate), encoding ghostty's `?u8` across the C ABI.
+    on_progress: ?*const fn (*anyopaque, u8, u8, u8) callconv(.c) void,
 };
 
 // -----------------------------------------------------------------------------
-// Handler — wraps ghostty's readonly handler, intercepting the four events we
-// care about. Stored by value inside the `Stream`; its `terminal`/`sink`
-// pointers stay valid because `Wrapper` lives on the heap and is never moved.
+// Handler — wraps ghostty's readonly handler, intercepting the events we care
+// about. Stored by value inside the `Stream`; its `terminal`/`sink` pointers
+// stay valid because `Wrapper` lives on the heap and is never moved.
 // -----------------------------------------------------------------------------
 
 const Handler = struct {
@@ -214,6 +219,9 @@ const Handler = struct {
     sink: *const KmuxEventSink,
     title_buf: *[1024]u8,
     title_len: *usize,
+    progress_state: *u8,
+    progress_value: *u8,
+    progress_has: *u8,
 
     pub fn deinit(self: *Handler) void {
         _ = self;
@@ -250,6 +258,29 @@ const Handler = struct {
                         cb(u, value.kind, value.data.ptr, value.data.len);
                     }
                 }
+            },
+            .progress_report => {
+                // OSC 9;4 (ConEmu/WT progress). Store the latest state so
+                // callers can pull it at any time (a script can emit progress
+                // before any subscriber attaches), then fire the callback.
+                const st: u8 = switch (value.state) {
+                    .remove => 0,
+                    .set => 1,
+                    .@"error" => 2,
+                    .indeterminate => 3,
+                    .pause => 4,
+                };
+                const p: u8 = value.progress orelse 0;
+                const has: u8 = @intFromBool(value.progress != null);
+                self.progress_state.* = st;
+                self.progress_value.* = p;
+                self.progress_has.* = has;
+                if (self.sink.on_progress) |cb| {
+                    if (self.sink.user) |u| {
+                        cb(u, st, p, has);
+                    }
+                }
+                // Don't delegate: ghostty's readonly handler drops progress.
             },
             .start_hyperlink => {
                 if (self.sink.on_hyperlink) |cb| {
@@ -307,6 +338,12 @@ const Wrapper = struct {
     sink: KmuxEventSink,
     title_buf: [1024]u8,
     title_len: usize,
+    // Latest OSC 9;4 progress: state ordinal (0=remove default), value 0..=100,
+    // and `has` (1 when a value was carried). Mirrors `title_*` so callers can
+    // pull the current state even if the callback fired before they subscribed.
+    progress_state: u8,
+    progress_value: u8,
+    progress_has: u8,
 
     fn create(alloc: std.mem.Allocator, size: KmuxSize, scrollback: u32, sink: KmuxEventSink) !*Wrapper {
         if (size.rows == 0 or size.cols == 0) return error.InvalidSize;
@@ -323,6 +360,9 @@ const Wrapper = struct {
             .sink = sink,
             .title_buf = undefined,
             .title_len = 0,
+            .progress_state = 0,
+            .progress_value = 0,
+            .progress_has = 0,
         };
 
         self.terminal = try Terminal.init(alloc, .{
@@ -345,6 +385,9 @@ const Wrapper = struct {
             .sink = &self.sink,
             .title_buf = &self.title_buf,
             .title_len = &self.title_len,
+            .progress_state = &self.progress_state,
+            .progress_value = &self.progress_value,
+            .progress_has = &self.progress_has,
         });
 
         return self;
@@ -602,6 +645,21 @@ export fn kmux_ghostty_get_title(
     const n = @min(wrapper.title_len, buf_len);
     @memcpy(out[0..n], wrapper.title_buf[0..n]);
     return n;
+}
+
+/// Read the latest OSC 9;4 progress report. `out_state` is the ordinal
+/// (0=remove, 1=set, 2=error, 3=indeterminate, 4=pause), `out_value` is
+/// 0..=100, and `out_has` is 1 when the report carried a progress value.
+/// Defaults to remove/0/0 until the inner program emits a progress sequence.
+export fn kmux_ghostty_get_progress(
+    wrapper: *const Wrapper,
+    out_state: *u8,
+    out_value: *u8,
+    out_has: *u8,
+) callconv(.c) void {
+    out_state.* = wrapper.progress_state;
+    out_value.* = wrapper.progress_value;
+    out_has.* = wrapper.progress_has;
 }
 
 export fn kmux_ghostty_feed(
@@ -981,6 +1039,7 @@ test "wrapper roundtrip: feed hello, read cells" {
         .on_bell = null,
         .on_osc52 = null,
         .on_hyperlink = null,
+        .on_progress = null,
     };
     const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
     defer w.destroy();
@@ -1004,6 +1063,7 @@ test "readCursor reports DECSCUSR blink request" {
         .on_bell = null,
         .on_osc52 = null,
         .on_hyperlink = null,
+        .on_progress = null,
     };
     const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
     defer w.destroy();
@@ -1031,6 +1091,7 @@ test "default cursor blinks without any DECSCUSR" {
         .on_bell = null,
         .on_osc52 = null,
         .on_hyperlink = null,
+        .on_progress = null,
     };
     const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
     defer w.destroy();
@@ -1064,6 +1125,7 @@ test "DEC mode 12 toggles cursor blink" {
         .on_bell = null,
         .on_osc52 = null,
         .on_hyperlink = null,
+        .on_progress = null,
     };
     const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
     defer w.destroy();
@@ -1087,6 +1149,7 @@ test "RIS restores the blinking default cursor" {
         .on_bell = null,
         .on_osc52 = null,
         .on_hyperlink = null,
+        .on_progress = null,
     };
     const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
     defer w.destroy();
@@ -1100,6 +1163,47 @@ test "RIS restores the blinking default cursor" {
     try w.stream.nextSlice("\x1bc");
     kmux_ghostty_cursor(w, &cur);
     try std.testing.expectEqual(@as(u8, 1), cur.blink);
+}
+
+test "OSC 9;4 progress is stored and pullable" {
+    const alloc = std.testing.allocator;
+    const sink: KmuxEventSink = .{
+        .user = null,
+        .on_title = null,
+        .on_bell = null,
+        .on_osc52 = null,
+        .on_hyperlink = null,
+        .on_progress = null,
+    };
+    const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
+    defer w.destroy();
+
+    var state: u8 = 255;
+    var value: u8 = 255;
+    var has: u8 = 255;
+
+    // Default before any sequence: remove / 0 / no value.
+    kmux_ghostty_get_progress(w, &state, &value, &has);
+    try std.testing.expectEqual(@as(u8, 0), state);
+    try std.testing.expectEqual(@as(u8, 0), has);
+
+    // `OSC 9;4;1;50` → set, 50%, value present.
+    try w.stream.nextSlice("\x1b]9;4;1;50\x07");
+    kmux_ghostty_get_progress(w, &state, &value, &has);
+    try std.testing.expectEqual(@as(u8, 1), state);
+    try std.testing.expectEqual(@as(u8, 50), value);
+    try std.testing.expectEqual(@as(u8, 1), has);
+
+    // `OSC 9;4;3` (indeterminate) carries no progress value.
+    try w.stream.nextSlice("\x1b]9;4;3\x07");
+    kmux_ghostty_get_progress(w, &state, &value, &has);
+    try std.testing.expectEqual(@as(u8, 3), state);
+    try std.testing.expectEqual(@as(u8, 0), has);
+
+    // `OSC 9;4;0` clears the bar.
+    try w.stream.nextSlice("\x1b]9;4;0\x07");
+    kmux_ghostty_get_progress(w, &state, &value, &has);
+    try std.testing.expectEqual(@as(u8, 0), state);
 }
 
 comptime {

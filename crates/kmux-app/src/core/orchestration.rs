@@ -79,10 +79,14 @@ impl AppCore {
         let mut effects = Vec::new();
         for event in events {
             match event {
-                SessionEvent::AuthFailed { .. } => {
+                SessionEvent::AuthFailed { reason } => {
                     // SSH-only architecture: auth failure on the data plane
                     // means the SSH tunnel is up but the daemon rejected the
                     // token. Surface as a disconnect; the user can reconnect.
+                    // Log it too — every other GUI-visible disconnect path emits
+                    // a `warn!`, so this must as well or the overlay shows an
+                    // error with nothing in the client log to explain it.
+                    warn!(%reason, "authentication failed");
                     self.mode = Mode::Disconnected {
                         reason: "authentication failed".into(),
                     };
@@ -1099,6 +1103,8 @@ mod tests {
                 attached_clients: vec![],
                 status: SessionStatus::Running,
                 title: String::new(),
+                progress_state: Default::default(),
+                progress: None,
             }],
             tabs: vec![TabInfo {
                 tab_index: 0,

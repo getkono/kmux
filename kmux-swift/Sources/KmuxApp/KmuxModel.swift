@@ -266,6 +266,13 @@ final class KmuxModel: ObservableObject {
         let m = view.metrics
         let (cols, rows) = m.colsRows(width: size.width, height: size.height)
         let rects = driver.layout(areaCols: cols, areaRows: rows)
+        // OSC 9;4 progress is window chrome and doesn't bump a pane's grid
+        // generation, so detect a change here to force a repaint of the bar.
+        let progressChanged =
+            rects.count != layout.count
+            || zip(rects, layout).contains {
+                $0.progressState != $1.progressState || $0.progress != $1.progress
+            }
         layout = rects
         dividers = driver.dividers(areaCols: cols, areaRows: rows)
 
@@ -284,7 +291,7 @@ final class KmuxModel: ObservableObject {
         driver.setPaneSizes(sizes: sizes)
 
         let blink = driver.blinkOn()
-        var repaint = forceRefetch || blink != lastBlinkOn
+        var repaint = forceRefetch || blink != lastBlinkOn || progressChanged
         lastBlinkOn = blink
         blinkOn = blink
 

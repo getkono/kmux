@@ -1179,6 +1179,7 @@ fn rewrite_event_to_local(
         | PaneExited { pane_id, .. }
         | PaneResized { pane_id, .. }
         | PaneTitleChanged { pane_id, .. }
+        | PaneProgressChanged { pane_id, .. }
         | PaneClipboardCopy { pane_id, .. }
         | PaneClosed { pane_id } => {
             let (remote_word, idx) = split_pane_id(pane_id)?;
@@ -1300,6 +1301,8 @@ mod tests {
                 attached_clients: vec![ClientId(7)],
                 status: SessionStatus::Running,
                 title: String::new(),
+                progress_state: Default::default(),
+                progress: None,
             }],
             tabs: vec![TabInfo {
                 tab_index: 0,

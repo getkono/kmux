@@ -30,6 +30,33 @@ pub async fn run_debug_command(action: DebugAction) -> anyhow::Result<()> {
             };
             run_tearing_report(&daemon_path, &client_path, window_ms)
         }
+        DebugAction::Paths => {
+            print_paths();
+            Ok(())
+        }
+    }
+}
+
+/// Print the resolved profile-specific paths and the `kmuxd` an auto-spawn would
+/// launch. The binary knows its own build profile, so this is the reliable
+/// answer to "where are my dev logs / which daemon will start" — debug builds
+/// report the `kmux-debug/` dirs, release builds the `kmux/` dirs.
+fn print_paths() {
+    use kmux_protocol::dirs::{self, BuildProfile};
+
+    let line = |label: &str, resolved: anyhow::Result<std::path::PathBuf>| match resolved {
+        Ok(p) => println!("{label:<13} {}", p.display()),
+        Err(e) => println!("{label:<13} <error: {e}>"),
+    };
+
+    println!("{:<13} {}", "build:", BuildProfile::CURRENT);
+    line("client log:", dirs::client_log_path());
+    line("daemon log:", dirs::daemon_log_path());
+    line("runtime dir:", dirs::runtime_dir());
+    line("state dir:", dirs::state_dir());
+    match kmux_client::daemon::resolve_kmuxd_path() {
+        Ok(p) => println!("{:<13} {}", "kmuxd:", p.display()),
+        Err(e) => println!("{:<13} <not found: {e}>", "kmuxd:"),
     }
 }
 

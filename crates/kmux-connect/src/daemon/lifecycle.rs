@@ -318,6 +318,17 @@ pub(super) fn read_pid_file(path: &std::path::Path) -> Option<u32> {
 }
 
 pub(crate) fn find_server_binary() -> anyhow::Result<std::path::PathBuf> {
+    // 0. Explicit override (dev workflows, unusual layouts). Mirrors `KMUX_BIN`
+    //    (diagnostic emitter) and `KMUX_APP` (macOS bundle). Honored only when it
+    //    points at a real file, so a stale env var falls through to discovery
+    //    rather than hard-failing.
+    if let Some(path) = std::env::var_os("KMUX_KMUXD") {
+        let candidate = std::path::PathBuf::from(path);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
     // 1. Same directory as the running executable (typical installed layout).
     if let Ok(exe) = std::env::current_exe()
         && let Some(dir) = exe.parent()
@@ -328,13 +339,28 @@ pub(crate) fn find_server_binary() -> anyhow::Result<std::path::PathBuf> {
         }
     }
 
-    // 2. PATH lookup.
+    // 2. Debug builds: prefer the matching `target/<profile>/kmuxd` over any
+    //    release kmuxd on PATH. A debug client that spawned a release daemon
+    //    would never see it (release writes its socket under `kmux/`, the debug
+    //    client polls `kmux-debug/`), so without this a `cargo run` / `swift run`
+    //    GUI silently picks up `~/.cargo/bin/kmuxd` and times out. The dir is
+    //    baked at build time from the crate's `OUT_DIR` (see `build.rs`).
+    #[cfg(debug_assertions)]
+    if let Some(dir) = option_env!("KMUXD_TARGET_DIR") {
+        let candidate = std::path::Path::new(dir).join("kmuxd");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+
+    // 3. PATH lookup.
     if let Ok(path) = which_server() {
         return Ok(path);
     }
 
     Err(anyhow::anyhow!(
-        "could not find kmuxd binary; ensure it is installed alongside kmux or on PATH"
+        "could not find kmuxd binary; ensure it is installed alongside kmux or on \
+         PATH (or set KMUX_KMUXD to its path)"
     ))
 }
 
@@ -503,8 +529,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
-        // Place a stub "kmuxd" on PATH that prints a crash message and exits
-        // non-zero without ever binding a socket.
+        // Point the resolver straight at a stub "kmuxd" that prints a crash
+        // message and exits non-zero without ever binding a socket. Using
+        // `KMUX_KMUXD` (highest precedence) keeps this deterministic regardless
+        // of whether a real `target/<profile>/kmuxd` happens to be built — which
+        // the debug-only fallback in `find_server_binary` would otherwise prefer
+        // over a stub planted on `$PATH`.
         let fake_dir = tmp.path().join("bin");
         std::fs::create_dir_all(&fake_dir).unwrap();
         let fake_kmuxd = fake_dir.join("kmuxd");
@@ -517,12 +547,11 @@ mod tests {
         .unwrap();
         std::fs::set_permissions(&fake_kmuxd, std::fs::Permissions::from_mode(0o755)).unwrap();
 
-        let old_path = std::env::var("PATH").unwrap_or_default();
-        unsafe { std::env::set_var("PATH", fake_dir.as_os_str()) };
+        unsafe { std::env::set_var("KMUX_KMUXD", &fake_kmuxd) };
 
         let result = ensure_daemon().await;
 
-        unsafe { std::env::set_var("PATH", &old_path) };
+        unsafe { std::env::remove_var("KMUX_KMUXD") };
 
         let err = result.expect_err("fake kmuxd should not produce a live daemon");
         let msg = err.to_string();
@@ -534,5 +563,47 @@ mod tests {
             msg.contains("kmuxd output"),
             "error must label the captured output section: {msg}"
         );
+    }
+
+    /// `KMUX_KMUXD` is the highest-precedence resolution step: when it points at
+    /// a real file it must win over the exe-sibling, debug `target/<profile>`,
+    /// and `$PATH` lookups — this is what lets the dev GUI tasks pin the debug
+    /// `target/debug/kmuxd` instead of an installed release one on `$PATH`.
+    #[test]
+    fn kmux_kmuxd_override_takes_precedence() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let override_bin = tmp.path().join("my-kmuxd");
+        std::fs::write(&override_bin, b"#!/bin/sh\n").unwrap();
+
+        unsafe { std::env::set_var("KMUX_KMUXD", &override_bin) };
+        let resolved = find_server_binary();
+        unsafe { std::env::remove_var("KMUX_KMUXD") };
+
+        assert_eq!(
+            resolved.expect("override file exists, so resolution must succeed"),
+            override_bin,
+            "KMUX_KMUXD must win over sibling / target-dir / PATH resolution",
+        );
+    }
+
+    /// A stale `KMUX_KMUXD` (pointing at a non-existent path) must be ignored and
+    /// never handed back, so resolution falls through to real discovery.
+    #[test]
+    fn stale_kmux_kmuxd_override_is_ignored() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        let missing = tmp.path().join("does-not-exist-kmuxd");
+
+        unsafe { std::env::set_var("KMUX_KMUXD", &missing) };
+        let resolved = find_server_binary();
+        unsafe { std::env::remove_var("KMUX_KMUXD") };
+
+        if let Ok(path) = resolved {
+            assert_ne!(
+                path, missing,
+                "a non-existent override must never be returned"
+            );
+        }
     }
 }

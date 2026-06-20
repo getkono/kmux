@@ -16,5 +16,9 @@ export RUST_LOG="${RUST_LOG:-kmux=debug,kmux_app=debug,kmux_client=debug,kmux_pr
 export KMUX_LOG_STDERR="${KMUX_LOG_STDERR:-1}"
 export G_MESSAGES_DEBUG="${G_MESSAGES_DEBUG:-all}"
 export RUST_LOG_STYLE="${RUST_LOG_STYLE:-always}"
-cargo build -p kmux -p kmux-gtk
+# Build kmuxd too and pin the auto-spawn to the *debug* daemon. Without this a
+# debug GUI falls through to an installed release `~/.cargo/bin/kmuxd` on PATH,
+# which it can never talk to (separate runtime dirs) — so it never connects.
+export KMUX_KMUXD="${KMUX_KMUXD:-$PWD/target/debug/kmuxd}"
+cargo build -p kmux -p kmux-gtk -p kmuxd
 cargo run -p kmux -- "$@"

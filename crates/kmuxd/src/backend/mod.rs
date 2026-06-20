@@ -76,6 +76,15 @@ pub trait BackendEventSink: Send + Sync + 'static {
     /// `base64_data` is the still-encoded payload. `PaneEventSink` broadcasts
     /// this to clients, which decode and apply it at their clipboard leaf.
     fn on_osc52_copy(&self, _selection: &str, _base64_data: &str) {}
+    /// Called when the backend processes an OSC 9;4 progress report. `state` is
+    /// the progress state; `progress` is `0..=100` or `None`. `PaneEventSink`
+    /// stores the latest value and broadcasts `PaneProgressChanged` to clients.
+    fn on_progress(
+        &self,
+        _state: kmux_protocol::messages::PaneProgressState,
+        _progress: Option<u8>,
+    ) {
+    }
     // libghostty-vt also surfaces OSC 8 hyperlinks; no production sink consumes
     // them yet, so the default implementation drops silently.
     #[allow(dead_code)]

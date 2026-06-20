@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+#MISE description="Tail the daemon log — both release (kmux/) and debug (kmux-debug/) profiles."
+#
+# kmuxd isolates its log the same way the client does: a debug `kmuxd` writes
+# `kmux-debug/daemon.log`, a release one `kmux/daemon.log`. Tail BOTH so the dev
+# daemon's output is visible regardless of which profile is running. `kmux debug
+# paths` (run the matching binary) prints the exact resolved file.
+set -euo pipefail
+base="${XDG_STATE_HOME:-$HOME/.local/state}"
+release="$base/kmux/daemon.log"
+debug="$base/kmux-debug/daemon.log"
+# Pre-create so `tail -F` starts cleanly instead of warning about missing files.
+mkdir -p "$base/kmux" "$base/kmux-debug"
+touch "$release" "$debug"
+exec tail -F "$release" "$debug"

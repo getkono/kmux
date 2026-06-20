@@ -26,7 +26,8 @@ use std::time::Instant;
 use kmux_protocol::TransportKind;
 use kmux_protocol::control_rpc::{ConnectionInfo, SessionConnections, SessionsResponse};
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ConnectionId, InputMode, SessionStatus, TermSize, epoch_millis,
+    ClientCapabilities, ClientId, ConnectionId, InputMode, PaneProgressState, SessionStatus,
+    TermSize, epoch_millis,
 };
 use kmux_pty::events::SessionEvent;
 use kmux_pty::registry::SessionManager as PtyRegistry;
@@ -67,6 +68,15 @@ pub struct ClientSender {
 /// Shared map of per-client output senders for a single pane.
 pub type ClientMap = Arc<Mutex<HashMap<ClientId, ClientSender>>>;
 
+/// Latest OSC 9;4 progress for a pane: the state plus the optional `0..=100`
+/// percentage. Stored in the relay and updated by `PaneEventSink::on_progress`,
+/// then read into `PaneInfo` snapshots so late-attaching clients see the bar.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PaneProgress {
+    pub state: PaneProgressState,
+    pub progress: Option<u8>,
+}
+
 /// Backend event sink for a single pane. Owns the canonical title string and
 /// broadcasts VT-originated events (`PaneTitleChanged` for OSC 0/2,
 /// `PaneClipboardCopy` for OSC 52) to all connected clients via the server-wide
@@ -80,6 +90,7 @@ pub type ClientMap = Arc<Mutex<HashMap<ClientId, ClientSender>>>;
 pub struct PaneEventSink {
     pane_id: String,
     title: Arc<Mutex<String>>,
+    progress: Arc<Mutex<PaneProgress>>,
     vt_events: broadcast::Sender<kmux_protocol::messages::ServerMessage>,
 }
 
@@ -87,11 +98,13 @@ impl PaneEventSink {
     pub fn new(
         pane_id: String,
         title: Arc<Mutex<String>>,
+        progress: Arc<Mutex<PaneProgress>>,
         vt_events: broadcast::Sender<kmux_protocol::messages::ServerMessage>,
     ) -> Self {
         Self {
             pane_id,
             title,
+            progress,
             vt_events,
         }
     }
@@ -122,6 +135,26 @@ impl crate::backend::BackendEventSink for PaneEventSink {
                 pane_id: self.pane_id.clone(),
                 selection: selection.to_string(),
                 data: base64_data.to_string(),
+            },
+        };
+        // Ignore error: no receivers means no clients are currently connected.
+        let _ = self.vt_events.send(event);
+    }
+
+    fn on_progress(&self, state: PaneProgressState, progress: Option<u8>) {
+        {
+            let mut current = self.progress.lock().unwrap();
+            if current.state == state && current.progress == progress {
+                return;
+            }
+            current.state = state;
+            current.progress = progress;
+        }
+        let event = kmux_protocol::messages::ServerMessage::Event {
+            event: kmux_protocol::messages::SessionEventMsg::PaneProgressChanged {
+                pane_id: self.pane_id.clone(),
+                state,
+                progress,
             },
         };
         // Ignore error: no receivers means no clients are currently connected.
@@ -164,6 +197,10 @@ pub struct PaneRelay {
     /// Latest window title reported by the pane via OSC 0/2. Shared with the
     /// backend event sink, which updates it and broadcasts to clients.
     pub title: Arc<Mutex<String>>,
+    /// Latest OSC 9;4 progress reported by the pane. Shared with the backend
+    /// event sink, which updates it and broadcasts `PaneProgressChanged`; read
+    /// into `PaneInfo` snapshots so newly-attaching clients see the current bar.
+    pub progress: Arc<Mutex<PaneProgress>>,
 }
 
 impl PaneRelay {
@@ -710,6 +747,7 @@ mod tests {
         let sink = super::PaneEventSink::new(
             "eagle/0".to_string(),
             Arc::new(Mutex::new(String::new())),
+            Arc::new(Mutex::new(super::PaneProgress::default())),
             tx,
         );
 
@@ -885,6 +923,7 @@ mod tests {
             kitty_graphics_enabled,
             kitty_keyboard_enabled,
             title: Arc::new(Mutex::new(String::new())),
+            progress: Arc::new(Mutex::new(super::PaneProgress::default())),
         }
     }
 

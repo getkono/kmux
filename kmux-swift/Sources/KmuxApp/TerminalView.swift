@@ -190,6 +190,35 @@ final class TerminalNSView: NSView {
             ctx.setLineWidth(1)
             ctx.stroke(pixelRect(focused, metrics: m).insetBy(dx: 0.5, dy: 0.5))
         }
+
+        // OSC 9;4 progress bar (issue #125): a thin bar along each pane's bottom
+        // edge, colored by state, width proportional to the percent (full-width
+        // for indeterminate). Mirrors kmux-gtk's `render_tiled` progress bar.
+        for rect in rects {
+            guard let (color, frac) = progressBarFill(rect, theme: theme) else { continue }
+            let px = pixelRect(rect, metrics: m)
+            let barH: CGFloat = min(3, px.height)
+            let barW = min(px.width, px.width * frac)
+            if barW > 0 {
+                ctx.setFillColor(color)
+                ctx.fill(CGRect(x: px.minX, y: px.maxY - barH, width: barW, height: barH))
+            }
+        }
+    }
+
+    /// `(color, width-fraction)` for a pane's OSC 9;4 progress bar, or `nil` for
+    /// `Remove`. `Indeterminate` fills the full width; the numeric states use
+    /// `progress / 100`. Colours mirror the GTK frontend (set→accent, error→red,
+    /// pause→orange).
+    private func progressBarFill(_ rect: FfiPaneRect, theme: FfiTheme) -> (CGColor, CGFloat)? {
+        let frac = CGFloat(min(rect.progress ?? 0, 100)) / 100.0
+        switch rect.progressState {
+        case .remove: return nil
+        case .set: return (theme.accent.cgColor, frac)
+        case .error: return (theme.red.cgColor, frac)
+        case .pause: return (theme.orange.cgColor, frac)
+        case .indeterminate: return (theme.accent.cgColor, 1.0)
+        }
     }
 
     /// Render one pane's grid into its sub-rect. Backgrounds then glyphs, clipped
