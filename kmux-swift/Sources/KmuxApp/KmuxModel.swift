@@ -22,6 +22,10 @@ final class KmuxModel: ObservableObject {
     /// Tabs of the active session (Session → Tab → Pane) for the tab strip.
     @Published private(set) var tabs: [FfiTab] = []
     @Published private(set) var mode: FfiMode = .normal
+    /// Process-overview rows (issue #122), populated only while
+    /// `mode == .processOverview`; the main-area `ProcessOverviewView` renders
+    /// them. Refreshed ~1 Hz by the driver's snapshot polling.
+    @Published private(set) var overview: [FfiOverviewRow] = []
     @Published private(set) var picker: FfiPicker?
     /// The unified session launcher's state (issue #121), non-nil only in
     /// `Mode::LaunchPicker`. Driven by the generic picker methods plus the
@@ -387,6 +391,13 @@ final class KmuxModel: ObservableObject {
         if tb != tabs { tabs = tb }
         let md = driver.mode()
         if md != mode { mode = md }
+        // Only pull the (potentially large) overview rows while the view is open.
+        if md == .processOverview {
+            let ov = driver.overviewRows()
+            if ov != overview { overview = ov }
+        } else if !overview.isEmpty {
+            overview = []
+        }
         let pk = driver.picker()
         if pk != picker { picker = pk }
         let lp = driver.launchPicker()

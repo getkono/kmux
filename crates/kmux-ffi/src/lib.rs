@@ -48,7 +48,8 @@ use kmux_app::appearance::{Appearance, CellAdjust};
 use kmux_app::cmd;
 use kmux_app::config;
 use kmux_app::core::{
-    AddRemoteForm, AppCore, DirBrowserRow, LaunchRow, PauseReason, RemoteStatus, TopBarAction,
+    AddRemoteForm, AppCore, DirBrowserRow, LaunchRow, OverviewRowKind, PauseReason, RemoteStatus,
+    TopBarAction,
 };
 use kmux_app::diagnostic::{self, DiagnosticTest};
 use kmux_app::driver::{FrontendDriver, FrontendEffect};
@@ -78,7 +79,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 15;
+pub const KMUX_FFI_ABI_VERSION: u32 = 16;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -221,6 +222,8 @@ pub enum FfiAction {
     ScrollPageDown,
     ToggleHud,
     ToggleMetrics,
+    /// Toggle the process overview main-area view (issue #122).
+    ToggleProcessOverview,
     /// Toggle the connection inspector overlay (issue #60).
     ToggleConnection,
     /// Toggle the render-debug overlay (what the renderer is handed each frame).
@@ -272,6 +275,7 @@ impl From<FfiAction> for Action {
             FfiAction::ScrollPageDown => Action::ScrollPageDown,
             FfiAction::ToggleHud => Action::ToggleHud,
             FfiAction::ToggleMetrics => Action::ToggleMetrics,
+            FfiAction::ToggleProcessOverview => Action::ToggleProcessOverview,
             FfiAction::ToggleConnection => Action::ToggleConnection,
             FfiAction::ToggleRenderDebug => Action::ToggleRenderDebug,
             FfiAction::ResetRenderer => Action::ResetRenderer,
@@ -771,6 +775,43 @@ fn tab_label(index: u32, name: &str) -> String {
     }
 }
 
+/// What a process-overview row represents (issue #122), driving the Swift
+/// view's indent and styling per tier.
+#[derive(uniffi::Enum)]
+pub enum FfiOverviewKind {
+    Session,
+    Tab,
+    Pane,
+    Process,
+}
+
+/// One flattened process-overview row (issue #122). Mirrors
+/// `kmux_app::core::OverviewRow`; the Swift `ProcessOverviewView` indents by
+/// `depth` and right-aligns the CPU/memory/PID columns. Polled via
+/// [`KmuxDriver::overview_rows`].
+#[derive(uniffi::Record)]
+pub struct FfiOverviewRow {
+    pub depth: u8,
+    pub kind: FfiOverviewKind,
+    pub label: String,
+    pub detail: String,
+    pub cpu_percent: f32,
+    pub mem_bytes: u64,
+    /// PID for process rows (and the shell pid for pane rows); `None` otherwise.
+    pub pid: Option<i32>,
+    /// The federated peer this row belongs to (session rows only).
+    pub peer: Option<String>,
+}
+
+fn overview_kind_to_ffi(kind: OverviewRowKind) -> FfiOverviewKind {
+    match kind {
+        OverviewRowKind::Session => FfiOverviewKind::Session,
+        OverviewRowKind::Tab => FfiOverviewKind::Tab,
+        OverviewRowKind::Pane => FfiOverviewKind::Pane,
+        OverviewRowKind::Process => FfiOverviewKind::Process,
+    }
+}
+
 /// One resolved pane rectangle in the active tab, in cell coordinates within the
 /// content area passed to [`KmuxDriver::layout`]. `(col, row)` is the top-left
 /// corner; the frontend tiles one terminal view per rect and flags the
@@ -1182,6 +1223,8 @@ pub enum FfiMode {
         peer: String,
     },
     Help,
+    /// Process overview main-area view (issue #122); rows via `overview_rows()`.
+    ProcessOverview,
     Command,
     Connecting {
         label: String,
@@ -1201,6 +1244,7 @@ fn mode_to_ffi(mode: &Mode) -> FfiMode {
         Mode::LaunchPicker => FfiMode::LaunchPicker,
         Mode::AddRemote => FfiMode::AddRemote,
         Mode::RemoteNewSession { peer } => FfiMode::RemoteNewSession { peer: peer.clone() },
+        Mode::ProcessOverview => FfiMode::ProcessOverview,
         Mode::Help => FfiMode::Help,
         Mode::Command(_) => FfiMode::Command,
         Mode::Connecting { target_display } => FfiMode::Connecting {
@@ -1541,6 +1585,28 @@ impl KmuxDriver {
                 name: e.meta.name.clone(),
                 cwd: e.meta.cwd.clone(),
                 peer: e.peer.clone(),
+            })
+            .collect()
+    }
+
+    /// The process-overview rows (issue #122): a flat, depth-tagged
+    /// Session → Tab → Pane → Process tree joined with the latest CPU/memory
+    /// snapshot. Polled by the Swift `ProcessOverviewView` while
+    /// [`FfiMode::ProcessOverview`] is active; the driver re-requests the
+    /// snapshot at ~1 Hz.
+    pub fn overview_rows(&self) -> Vec<FfiOverviewRow> {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        d.overview_rows()
+            .into_iter()
+            .map(|r| FfiOverviewRow {
+                depth: r.depth,
+                kind: overview_kind_to_ffi(r.kind),
+                label: r.label,
+                detail: r.detail,
+                cpu_percent: r.cpu_percent,
+                mem_bytes: r.mem_bytes,
+                pid: r.pid,
+                peer: r.peer,
             })
             .collect()
     }

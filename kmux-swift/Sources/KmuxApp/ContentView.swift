@@ -61,6 +61,17 @@ struct ContentView: View {
     }
 
     @ViewBuilder private var detail: some View {
+        if case .processOverview = model.mode {
+            // The process overview (issue #122) takes over the main area, like
+            // kmux-gtk swapping the content stack to its "overview" child.
+            ProcessOverviewView(model: model)
+                .frame(minWidth: 480, minHeight: 320)
+        } else {
+            terminalDetail
+        }
+    }
+
+    @ViewBuilder private var terminalDetail: some View {
         VStack(spacing: 0) {
             if model.tabs.count > 1 {
                 TabStrip(model: model, ui: ui)
@@ -207,6 +218,9 @@ struct KmuxCommands: Commands {
             // when paused (manual or auto); toggling clears a manual pause.
             Toggle("Pause Connection", isOn: pauseBinding)
                 .keyboardShortcut("b", modifiers: [.command, .shift])
+            // Process overview main-area view (issue #122). o = overview.
+            Toggle("Process Overview", isOn: processOverviewBinding)
+                .keyboardShortcut("o", modifiers: [.command, .shift])
             Toggle("Performance HUD", isOn: hudBinding)
                 .keyboardShortcut("h", modifiers: [.command, .shift])
             Toggle("Metrics Inspector", isOn: metricsBinding)
@@ -278,6 +292,13 @@ struct KmuxCommands: Commands {
         Binding(
             get: { model.hudVisible },
             set: { _ in model.dispatch(.toggleHud) }
+        )
+    }
+
+    private var processOverviewBinding: Binding<Bool> {
+        Binding(
+            get: { if case .processOverview = model.mode { return true } else { return false } },
+            set: { _ in model.dispatch(.toggleProcessOverview) }
         )
     }
 
