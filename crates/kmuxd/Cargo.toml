@@ -46,6 +46,9 @@ kmux-ghostty.workspace = true
 # Direct dep (rather than only transitive via kmux-ghostty) so this crate's
 # build.rs receives `DEP_KMUX_GHOSTTY_LIB_DIR` and can embed the rpath.
 kmux-ghostty-sys.workspace = true
+# Shared VT pipeline: `backend`, `diff_engine`, `term_state` re-exported at the
+# crate root. Same code the isolated kmux-vt-worker runs (issue #126).
+kmux-vt-core.workspace = true
 tokio.workspace = true
 quinn.workspace = true
 rustls.workspace = true
@@ -66,6 +69,10 @@ sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Re-listed with `test-util` so kmuxd's relay/app unit tests can construct a
+# `TermState` via `NullEventSink` (feature unification turns it on only for the
+# test build, not the production daemon).
+kmux-vt-core = { workspace = true, features = ["test-util"] }
 # Used only by tests/handoff_e2e.rs to drive a real daemon's control + data
 # sockets across a graceful restart. kmux-client depends on kmux-protocol (never
 # on kmuxd), so this introduces no dependency cycle.

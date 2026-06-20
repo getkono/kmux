@@ -1620,6 +1620,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "kmux-vt-core"
+version = "0.2.0"
+dependencies = [
+ "kmux-ghostty",
+ "kmux-protocol",
+ "tracing",
+]
+
+[[package]]
 name = "kmuxd"
 version = "0.2.0"
 dependencies = [
@@ -1632,6 +1641,7 @@ dependencies = [
  "kmux-ghostty-sys",
  "kmux-protocol",
  "kmux-pty",
+ "kmux-vt-core",
  "nix",
  "postcard",
  "quinn",

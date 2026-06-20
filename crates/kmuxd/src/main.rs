@@ -1,7 +1,6 @@
 mod announce;
 mod app;
 mod auth;
-mod backend;
 mod capability;
 mod capture;
 mod client_handler;
@@ -9,7 +8,6 @@ mod config;
 mod connection;
 mod conversions;
 mod daemon;
-mod diff_engine;
 #[cfg(feature = "federation")]
 mod federation;
 mod handoff;
@@ -20,10 +18,16 @@ mod relay;
 mod scrollback;
 mod startup;
 mod tcp_listener;
-mod term_state;
 mod tls;
 mod trace;
 mod wordlist;
+
+// The server-side VT pipeline (terminal backend, diff engine, scrollback
+// mirror, `TermState`) lives in `kmux-vt-core` so the daemon's in-process path
+// and the isolated `kmux-vt-worker` subprocess run identical diff code (issue
+// #126). Re-exported at the crate root so existing `crate::backend::…` /
+// `crate::diff_engine::…` / `crate::term_state::…` paths keep resolving.
+pub use kmux_vt_core::{backend, diff_engine, term_state};
 
 use clap::Parser;
 use rand::Rng;

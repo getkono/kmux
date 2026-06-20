@@ -22,6 +22,11 @@ kmux-connect = { path = "crates/kmux-connect", default-features = false }
 kmux-client = { path = "crates/kmux-client", default-features = false }
 kmux-ghostty-sys = { path = "crates/kmux-ghostty-sys" }
 kmux-ghostty = { path = "crates/kmux-ghostty" }
+# Shared server-side VT pipeline (terminal backend, diff engine, scrollback
+# mirror). Depended on by kmuxd (in-process path) and the isolated
+# kmux-vt-worker subprocess so both run identical diff code (issue #126). See
+# docs/architecture-process-isolation.md.
+kmux-vt-core = { path = "crates/kmux-vt-core" }
 kmux-app = { path = "crates/kmux-app", default-features = false }
 # Shared GPU terminal renderer. Pulled only by the frontends' opt-in `gpu`
 # feature (and, wgpu-free, by kmux-ffi for the packed-cell format); the default
