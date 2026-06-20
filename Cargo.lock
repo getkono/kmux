@@ -1670,6 +1670,7 @@ dependencies = [
  "kmux-protocol",
  "kmux-pty",
  "kmux-vt-core",
+ "kmux-worker-protocol",
  "nix",
  "postcard",
  "quinn",

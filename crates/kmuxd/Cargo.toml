@@ -24,7 +24,7 @@ default = ["federation"]
 # `kmux-connect/remote` re-enables the upstream transport stack (the workspace
 # builds the client crates lean by default for the GUIs); the daemon federates
 # to remote daemons over TCP+TLS and SSH, so it needs the full stack.
-federation = ["dep:kmux-connect", "kmux-connect/remote", "dep:kmux-client"]
+federation = ["dep:kmux-connect", "kmux-connect/remote"]
 
 [dependencies]
 kmux-pty.workspace = true
@@ -33,11 +33,14 @@ kmux-protocol = { workspace = true, features = ["framing", "tls", "quic", "tcp-t
 # the `federation` feature; `kmux-connect` depends solely on `kmux-protocol`, so
 # this adds no dependency cycle.
 kmux-connect = { workspace = true, optional = true }
-# Federation reuses the client-side `CellGrid` as the proxied-pane mirror (apply
-# upstream snapshots/diffs, mint a snapshot for a late local attacher via
-# `to_snapshot()`). `kmux-client` depends on `kmux-protocol`, never on `kmuxd`, so
-# no cycle. Also a dev-dependency (handoff_e2e); harmless overlap.
-kmux-client = { workspace = true, optional = true }
+# The client-side `CellGrid` is reused as a pane mirror: federation mirrors a
+# proxied remote pane, and process isolation (issue #126) mirrors an isolated
+# worker's diff stream so the daemon can mint snapshots synchronously without an
+# IPC round-trip. `kmux-client` depends on `kmux-protocol`, never on `kmuxd`, so
+# no cycle. Lean (no remote transports) -- only the grid model is used.
+kmux-client.workspace = true
+# IPC contract for the isolated VT worker (issue #126).
+kmux-worker-protocol.workspace = true
 daemonize.workspace = true
 nix.workspace = true
 serde.workspace = true

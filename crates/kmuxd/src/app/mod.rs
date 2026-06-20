@@ -212,6 +212,9 @@ impl PaneRelay {
             .store(graphics, Ordering::Relaxed);
         self.kitty_keyboard_enabled
             .store(keyboard, Ordering::Relaxed);
+        // In-process backends read the atomics above directly; a worker pane is
+        // told over IPC (no-op for the in-process engine).
+        self.engine.set_capabilities(graphics, keyboard);
     }
 
     /// Compute the effective pane size: smallest rows and cols across all

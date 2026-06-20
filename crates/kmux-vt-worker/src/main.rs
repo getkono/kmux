@@ -188,7 +188,6 @@ async fn run() -> anyhow::Result<()> {
         &mut sock_rd,
         &term_state,
         &writer,
-        &session,
         &kitty_graphics,
         &kitty_keyboard,
         &events_tx,
@@ -308,7 +307,6 @@ async fn request_loop(
     sock_rd: &mut OwnedReadHalf,
     term_state: &Arc<Mutex<TermState>>,
     writer: &PtyWriter,
-    session: &PtySession,
     kitty_graphics: &Arc<AtomicBool>,
     kitty_keyboard: &Arc<AtomicBool>,
     events_tx: &mpsc::UnboundedSender<WorkerEvent>,
@@ -320,7 +318,6 @@ async fn request_loop(
                     req,
                     term_state,
                     writer,
-                    session,
                     kitty_graphics,
                     kitty_keyboard,
                     events_tx,
@@ -344,7 +341,6 @@ async fn handle_request(
     req: WorkerRequest,
     term_state: &Arc<Mutex<TermState>>,
     writer: &PtyWriter,
-    session: &PtySession,
     kitty_graphics: &Arc<AtomicBool>,
     kitty_keyboard: &Arc<AtomicBool>,
     events_tx: &mpsc::UnboundedSender<WorkerEvent>,
@@ -391,19 +387,11 @@ async fn handle_request(
             }
         }
         WorkerRequest::Resize { size } => {
-            {
-                let mut ts = term_state.lock().unwrap();
-                ts.resize(BackendSize::from(size));
-            }
-            if let Err(e) = session
-                .resize(WindowSize {
-                    rows: size.rows,
-                    cols: size.cols,
-                })
-                .await
-            {
-                warn!("worker: PTY resize failed: {e}");
-            }
+            // Resize only the emulator. The daemon owns the authoritative PTY
+            // master fd and issues the kernel `TIOCSWINSZ` itself (via the
+            // registry), so the worker must not also resize the shared PTY.
+            let mut ts = term_state.lock().unwrap();
+            ts.resize(BackendSize::from(size));
         }
         WorkerRequest::SnapshotRequest { req_id } => {
             let snapshot = {

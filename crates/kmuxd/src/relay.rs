@@ -4,7 +4,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use kmux_protocol::messages::{
-    ClientId, CursorState, SequenceNo, ServerMessage, TermModes, TerminalDiff, epoch_millis,
+    ClientId, CursorState, GridSnapshot, SequenceNo, ServerMessage, TermModes, TerminalDiff,
+    epoch_millis,
 };
 use kmux_protocol::trace::DiffKind;
 use kmux_pty::process::ExitStatus;
@@ -163,7 +164,38 @@ fn flush_cell_diff(
         ts.compute_diff()
     };
     let diff_us = diff_start.elapsed().as_micros();
+    // Force-full-snapshot clients are re-seeded straight from the emulator.
+    let snapshot_fn = || term_state.lock().unwrap().snapshot();
+    dispatch_diff_result(
+        pane_id,
+        result,
+        diff_us,
+        scrollback,
+        clients,
+        seqno_counter,
+        prev_cursor,
+        prev_modes,
+        &snapshot_fn,
+    );
+}
 
+/// Turn a computed [`DiffResult`] into client broadcasts: stamp seqnos, push to
+/// the scrollback replay buffer, and fan out `TerminalUpdate` /
+/// `ScrollbackAppend` / `CursorUpdate`. Shared by the in-process relay (above)
+/// and the out-of-process worker supervisor, which supplies its own
+/// `snapshot_fn` (the daemon-side mirror) so both paths fan out identically.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn dispatch_diff_result(
+    pane_id: &str,
+    result: DiffResult,
+    diff_us: u128,
+    scrollback: &Arc<Mutex<DiffBuffer>>,
+    clients: &ClientMap,
+    seqno_counter: &Arc<AtomicU64>,
+    prev_cursor: &mut CursorState,
+    prev_modes: &mut TermModes,
+    snapshot_fn: &dyn Fn() -> GridSnapshot,
+) {
     match result {
         DiffResult::CellDiff {
             diff,
@@ -244,15 +276,15 @@ fn flush_cell_diff(
             };
 
             if reset_first {
-                broadcast_to_clients(pane_id, &update_msg, clients, term_state, update_seqno);
+                broadcast_to_clients(pane_id, &update_msg, clients, snapshot_fn, update_seqno);
                 if let (Some(sb_msg), Some(sb_seqno)) = (&sb_msg, sb_seqno) {
-                    broadcast_to_clients(pane_id, sb_msg, clients, term_state, sb_seqno);
+                    broadcast_to_clients(pane_id, sb_msg, clients, snapshot_fn, sb_seqno);
                 }
             } else {
                 if let (Some(sb_msg), Some(sb_seqno)) = (&sb_msg, sb_seqno) {
-                    broadcast_to_clients(pane_id, sb_msg, clients, term_state, sb_seqno);
+                    broadcast_to_clients(pane_id, sb_msg, clients, snapshot_fn, sb_seqno);
                 }
-                broadcast_to_clients(pane_id, &update_msg, clients, term_state, update_seqno);
+                broadcast_to_clients(pane_id, &update_msg, clients, snapshot_fn, update_seqno);
             }
         }
         DiffResult::CursorOnly {
@@ -283,7 +315,7 @@ fn flush_cell_diff(
                     seqno,
                     sent_at_ms: sent_at,
                 };
-                broadcast_to_clients(pane_id, &msg, clients, term_state, seqno);
+                broadcast_to_clients(pane_id, &msg, clients, snapshot_fn, seqno);
             }
         }
         DiffResult::None => {
@@ -297,7 +329,7 @@ fn broadcast_to_clients(
     pane_id: &str,
     msg: &ServerMessage,
     clients: &ClientMap,
-    term_state: &Arc<Mutex<TermState>>,
+    snapshot_fn: &dyn Fn() -> GridSnapshot,
     seqno: SequenceNo,
 ) {
     let mut dead: Vec<ClientId> = Vec::new();
@@ -314,7 +346,7 @@ fn broadcast_to_clients(
             }
             let outgoing = if sender.force_full_snapshot {
                 snapshot_msg.get_or_insert_with(|| {
-                    let snapshot = term_state.lock().unwrap().snapshot();
+                    let snapshot = snapshot_fn();
                     ServerMessage::TerminalSnapshot {
                         pane_id: pane_id.to_string(),
                         snapshot,
@@ -425,7 +457,7 @@ mod tests {
             "eagle/0",
             &dummy_update("eagle/0"),
             &clients,
-            &ts,
+            &|| ts.lock().unwrap().snapshot(),
             SequenceNo(1),
         );
 
@@ -462,7 +494,7 @@ mod tests {
             "eagle/0",
             &dummy_update("eagle/0"),
             &clients,
-            &ts,
+            &|| ts.lock().unwrap().snapshot(),
             SequenceNo(1),
         );
 
@@ -495,7 +527,7 @@ mod tests {
             "eagle/0",
             &dummy_update("eagle/0"),
             &clients,
-            &ts,
+            &|| ts.lock().unwrap().snapshot(),
             SequenceNo(1),
         );
 
@@ -547,7 +579,7 @@ mod tests {
             "eagle/0",
             &dummy_update("eagle/0"),
             &clients,
-            &ts,
+            &|| ts.lock().unwrap().snapshot(),
             SequenceNo(1),
         );
 
@@ -592,7 +624,7 @@ mod tests {
             "eagle/0",
             &dummy_update("eagle/0"),
             &clients,
-            &ts,
+            &|| ts.lock().unwrap().snapshot(),
             SequenceNo(2),
         );
 
