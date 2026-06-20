@@ -245,6 +245,18 @@ pub fn resolve_help(key: &Key) -> (Option<Mode>, Action) {
     (Some(Mode::Normal), Action::None)
 }
 
+/// Process overview (issue #122). Esc / Ctrl+G / `q` close the view; scrolling is
+/// handled by the frontend's native table, so other keys are ignored here.
+pub fn resolve_process_overview(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+    if matches!(key, Key::Named(NamedKey::Escape))
+        || is_mode_key(key, mods)
+        || matches!(key, Key::Character(c) if c == "q")
+    {
+        return (None, Action::ToggleProcessOverview);
+    }
+    (None, Action::None)
+}
+
 pub fn resolve_dir_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     resolve_picker(
         key,

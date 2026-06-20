@@ -35,6 +35,12 @@ pub enum Mode {
     },
     /// Floating session picker with search
     SessionPicker,
+    /// Process overview (issue #122): a main-area view replacing the terminal,
+    /// listing every session's Tab → Pane → Process tree with CPU/memory. The
+    /// frontend renders [`AppCore::overview_rows`] in a native scrollable table;
+    /// the driver re-requests the snapshot at ~1 Hz while this mode is active.
+    /// Esc / Ctrl+G exits.
+    ProcessOverview,
     /// Help overlay
     Help,
     /// Directory picker for remote connections: type a path to open/create a session
@@ -146,6 +152,9 @@ pub enum Action {
     // HUD / modes
     ToggleHud,
     ToggleMetrics,
+    /// Toggle the process overview main-area view (issue #122). Opening it fires
+    /// an immediate snapshot request; closing returns to the terminal.
+    ToggleProcessOverview,
     /// Toggle the connection inspector overlay (issue #60).
     ToggleConnection,
     /// Toggle the render-debug overlay: what the renderer is handed each frame
@@ -235,6 +244,7 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::ConfirmCloseSession { .. } => resolve_confirm_close(key),
         Mode::RenameSession { .. } | Mode::RenameTab { .. } => resolve_rename(key, mods),
         Mode::SessionPicker => resolve_session_picker(key, mods),
+        Mode::ProcessOverview => resolve_process_overview(key, mods),
         Mode::Help => resolve_help(key),
         Mode::DirectoryPicker => resolve_dir_picker(key, mods),
         Mode::LaunchPicker => resolve_launch_picker(key, mods),

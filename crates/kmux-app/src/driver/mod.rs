@@ -99,6 +99,9 @@ use crate::mode::{Action, Mode};
 const LIVENESS_TICK: Duration = Duration::from_secs(1);
 /// Metrics JSONL flush cadence (see `docs/metrics.md`).
 const METRICS_FLUSH_TICK: Duration = Duration::from_secs(10);
+/// Process-overview refresh cadence while the overview is open (issue #122).
+/// Matched to the daemon's lazy-sample interval so CPU deltas stay meaningful.
+const PROCESS_OVERVIEW_TICK: Duration = Duration::from_secs(1);
 /// Debounce window for resize bursts; a window drag fires many size changes, so
 /// coalesce them into one `set_term_size` after the burst settles.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -162,6 +165,9 @@ pub struct FrontendDriver {
     /// tracks its own last-fire / deadline.
     last_liveness: Instant,
     last_metrics_flush: Instant,
+    /// Last time a process-overview snapshot was requested (issue #122). Used to
+    /// throttle re-requests to [`PROCESS_OVERVIEW_TICK`] while the view is open.
+    last_process_overview: Instant,
     pending_resize: Option<TermSize>,
     resize_deadline: Option<Instant>,
     /// Cursor-blink phase: `true` shows the cursor on the current frame.
@@ -222,6 +228,7 @@ impl FrontendDriver {
             last_palette,
             last_liveness: now,
             last_metrics_flush: now,
+            last_process_overview: now,
             pending_resize: None,
             resize_deadline: None,
             blink_on: true,
@@ -262,6 +269,8 @@ impl FrontendDriver {
             dirty |= self.drain_tunnel_deaths();
         }
         dirty |= self.tick_liveness(now);
+        // Refresh the process overview while it is open (issue #122).
+        dirty |= self.tick_process_overview(now);
         // Auto-pause the connection once the window has been backgrounded long
         // enough (issue #68).
         dirty |= self.tick_auto_pause(now);
@@ -582,6 +591,22 @@ impl FrontendDriver {
         false
     }
 
+    /// While the process overview is open (issue #122), re-request a snapshot at
+    /// [`PROCESS_OVERVIEW_TICK`]. Returns whether a request was sent (so the view
+    /// repaints on the eventual reply, not here — the reply arrives async). Does
+    /// nothing in any other mode, so an idle daemon is never polled.
+    fn tick_process_overview(&mut self, now: Instant) -> bool {
+        if !matches!(self.core.mode, Mode::ProcessOverview) {
+            return false;
+        }
+        if now.duration_since(self.last_process_overview) < PROCESS_OVERVIEW_TICK {
+            return false;
+        }
+        self.last_process_overview = now;
+        self.core.mgr.request_process_overview();
+        false
+    }
+
     /// Flush one metrics sample at [`METRICS_FLUSH_TICK`]. Never forces a redraw.
     fn tick_metrics(&mut self, now: Instant) {
         if now.duration_since(self.last_metrics_flush) >= METRICS_FLUSH_TICK {
@@ -829,6 +854,7 @@ impl FrontendDriver {
             last_palette,
             last_liveness: now,
             last_metrics_flush: now,
+            last_process_overview: now,
             pending_resize: None,
             resize_deadline: None,
             blink_on: true,

@@ -84,6 +84,11 @@ fn cmd_metrics(app: &mut AppCore, _args: &[String]) -> CommandResult {
     )))
 }
 
+fn cmd_processes(app: &mut AppCore, _args: &[String]) -> CommandResult {
+    app.toggle_process_overview();
+    Ok(CommandSuccess::Ok)
+}
+
 fn cmd_transport(app: &mut AppCore, args: &[String]) -> CommandResult {
     use kmux_protocol::messages::TransportKind;
     let Some(arg) = args.first() else {
@@ -498,6 +503,13 @@ pub static ALL: &[CommandSpec] = &[
         run: cmd_metrics,
     },
     CommandSpec {
+        name: "processes",
+        aliases: &["ps", "top"],
+        summary: "Toggle the process overview (all sessions)",
+        args: NO_ARGS,
+        run: cmd_processes,
+    },
+    CommandSpec {
         name: "connection",
         aliases: &["conn"],
         summary: "Toggle the connection inspector",
@@ -815,6 +827,16 @@ mod tests {
         assert!(!app.metrics_overlay_visible);
         let _ = run(&mut app, "metrics");
         assert!(app.metrics_overlay_visible);
+    }
+
+    #[test]
+    fn processes_toggles_overview_mode() {
+        let mut app = fixture_core();
+        let _ = run(&mut app, "processes");
+        assert!(matches!(app.mode, Mode::ProcessOverview));
+        // The `ps` alias toggles it back off.
+        let _ = run(&mut app, "ps");
+        assert!(matches!(app.mode, Mode::Normal));
     }
 
     #[test]

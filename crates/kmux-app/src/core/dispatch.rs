@@ -207,6 +207,9 @@ impl AppCore {
             Action::ToggleMetrics => {
                 self.metrics_overlay_visible = !self.metrics_overlay_visible;
             }
+            Action::ToggleProcessOverview => {
+                self.toggle_process_overview();
+            }
             Action::ToggleConnection => {
                 self.connection_overlay_visible = !self.connection_overlay_visible;
             }
@@ -630,6 +633,23 @@ impl AppCore {
         self.launch_selected = 0;
         self.launch_search.clear();
         self.mode = Mode::LaunchPicker;
+    }
+
+    /// Open the process overview (issue #122) and fire an immediate snapshot
+    /// request so the view has data before the driver's periodic poll kicks in.
+    pub fn open_process_overview(&mut self) {
+        self.mode = Mode::ProcessOverview;
+        self.mgr.request_process_overview();
+    }
+
+    /// Toggle the process overview: open it (with an immediate refresh) when
+    /// elsewhere, or return to the terminal when already open.
+    pub fn toggle_process_overview(&mut self) {
+        if matches!(self.mode, Mode::ProcessOverview) {
+            self.mode = Mode::Normal;
+        } else {
+            self.open_process_overview();
+        }
     }
 
     /// Open the add-a-remote form. The frontend renders native fields and calls
