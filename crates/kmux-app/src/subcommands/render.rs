@@ -327,6 +327,8 @@ mod tests {
                 attached_clients: vec![],
                 status: SessionStatus::Running,
                 title: String::new(),
+                progress_state: Default::default(),
+                progress: None,
             }],
             tabs: vec![kmux_protocol::messages::TabInfo {
                 tab_index: 0,

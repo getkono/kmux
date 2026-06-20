@@ -29,6 +29,16 @@ impl SessionManager {
         self.buffers.get(pane_id)
     }
 
+    /// The cached snapshot for a pane by id, searched across all sessions.
+    /// Carries the latest OSC 0/2 title and OSC 9;4 progress, kept current by
+    /// `handle_server_message`. Used by frontends to render per-pane chrome.
+    pub fn pane_info(&self, pane_id: &str) -> Option<&PaneInfo> {
+        self.session_list
+            .iter()
+            .flat_map(|e| e.panes.iter())
+            .find(|p| p.pane_id == pane_id)
+    }
+
     pub fn buffer_mut(&mut self, pane_id: &str) -> Option<&mut CellGrid> {
         self.buffers.get_mut(pane_id)
     }

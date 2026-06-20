@@ -284,7 +284,8 @@ alternative backends.
 | `OSC 52 ; … BEL/ST` | Clipboard write (set) | **Stable** | `on_osc52_copy()` broadcasts `PaneClipboardCopy` server-wide; the client writes it to the system clipboard, honoring writes from any pane in the session it is viewing (last-in-wins). Clipboard *read* (`OSC 52 ; … ; ?`) is not answered (no client→server clipboard channel) |
 | `OSC 133 / 633` | Shell integration / semantic zones | **Not planned** | |
 | `OSC 1337` | iTerm2 inline images | **Unimplemented** | Parsed by libghostty-vt; image data dropped silently (Phase A) |
-| `OSC 9` | iTerm2 / Windows Terminal growl notification | **Not planned** | |
+| `OSC 9 ; 4 ; state ; pct BEL/ST` | ConEmu / Windows Terminal progress report | **Stable** | `on_progress()` stores the latest state per pane in the relay (carried in the `PaneInfo` snapshot so late clients see it) and broadcasts `PaneProgressChanged`; rendered as a per-pane progress bar (Cairo + Swift). Tested in `event_sink_receives_progress` (issue #125) |
+| `OSC 9` (bare growl) | iTerm2 / Windows Terminal growl notification | **Not planned** | Only the `9 ; 4` progress sub-command above is handled |
 
 ---
 
@@ -398,6 +399,7 @@ encoding (`crates/kmux/src/app/mouse_handler.rs`).
 |---------|--------|-------|
 | Window title (`OSC 0/1/2`) | **Stable** | `BackendEventSink::on_title()` called synchronously inside `advance_bytes`; forwarded via `ServerMessage` (event-bus channel, non-blocking) |
 | Icon title (same sequence, `OSC 1`) | **Stable** | Merged into `on_title()` |
+| Progress report (`OSC 9 ; 4`) | **Stable** | `BackendEventSink::on_progress()` stores per-pane state in the relay (snapshot-tracked across clients) and broadcasts `PaneProgressChanged`; rendered as a per-pane progress bar (issue #125) |
 | BEL (`0x07`) | **Stable** | `BackendEventSink::on_bell()` called; clients can produce audible or visual bell |
 
 ---

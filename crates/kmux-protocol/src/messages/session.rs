@@ -200,6 +200,24 @@ pub struct DirEntry {
     pub is_dir: bool,
 }
 
+/// OSC 9;4 (ConEmu / Windows-Terminal) progress-bar state reported by a pane.
+/// Ghostty renders this as a thin bar in the window; kmux renders it per pane.
+/// `Remove` means no bar is shown.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum PaneProgressState {
+    /// No progress bar (cleared, or never set).
+    #[default]
+    Remove,
+    /// Normal progress.
+    Set,
+    /// Error / failed.
+    Error,
+    /// Indeterminate / busy (no known percentage).
+    Indeterminate,
+    /// Paused / warning.
+    Pause,
+}
+
 /// Snapshot of a single pane within a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneInfo {
@@ -217,6 +235,13 @@ pub struct PaneInfo {
     /// Latest window title reported by the pane's program via OSC 0/2.
     /// Empty until the program emits a title sequence.
     pub title: String,
+    /// Latest OSC 9;4 progress state reported by the pane's program. `Remove`
+    /// until the program emits a progress sequence. Tracked by the daemon and
+    /// carried in the snapshot so late-attaching clients see the current bar.
+    pub progress_state: PaneProgressState,
+    /// Progress percentage `0..=100` when `progress_state` carries one, else
+    /// `None` (e.g. `Remove` / `Indeterminate`).
+    pub progress: Option<u8>,
 }
 
 /// Orientation of a layout split.
@@ -363,6 +388,13 @@ pub enum SessionEventMsg {
     PaneResized { pane_id: PaneId, size: TermSize },
     /// A pane's program reported a new window title (OSC 0/2).
     PaneTitleChanged { pane_id: PaneId, title: String },
+    /// A pane's program reported OSC 9;4 progress (ConEmu/WT progress bar).
+    /// The daemon tracks the latest state per pane; this fires on every change.
+    PaneProgressChanged {
+        pane_id: PaneId,
+        state: PaneProgressState,
+        progress: Option<u8>,
+    },
     /// A pane's program wrote the clipboard via OSC 52. `selection` is the
     /// normalized target ("c"/"p"/"s"/"0".."7"); `data` is the still
     /// base64-encoded payload (decoded client-side at the clipboard leaf).

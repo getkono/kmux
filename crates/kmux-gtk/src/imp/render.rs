@@ -15,7 +15,7 @@ use kmux_app::core::AppCore;
 use kmux_app::layout::{LayoutConfig, resolve_layout};
 use kmux_app::theme::Theme as Palette;
 use kmux_client::grid::{CellGrid, ScrollbackBuffer, scrollback_display_row_at};
-use kmux_protocol::messages::{CellAttrs, CellState, CursorShape};
+use kmux_protocol::messages::{CellAttrs, CellState, CursorShape, PaneInfo};
 
 /// Divider thickness (cells) between tiled panes — must match the value the
 /// client uses when computing per-pane sizes (`tiles::push_sizes`).
@@ -204,7 +204,39 @@ pub fn render_tiled(
             );
             let _ = cr.stroke();
         }
+
+        // OSC 9;4 progress (issue #125): a thin bar along the pane's bottom edge,
+        // colored by state, width proportional to the percentage (full-width for
+        // the indeterminate state). Painted last so it sits over the grid/border.
+        if let Some(info) = core.mgr.pane_info(&pane_id)
+            && let Some(((cr8, cg8, cb8), frac)) = progress_bar_fill(info, palette)
+        {
+            let bar_h = 3.0_f64.min(ph);
+            let bar_w = (pw * frac).clamp(0.0, pw);
+            if bar_w > 0.0 {
+                src(cr, cr8, cg8, cb8);
+                cr.rectangle(px, py + ph - bar_h, bar_w, bar_h);
+                let _ = cr.fill();
+            }
+        }
     }
+}
+
+/// The `(color, width-fraction)` for a pane's OSC 9;4 progress bar, or `None`
+/// when no bar should be drawn (`Remove`). `Indeterminate` fills the full width;
+/// the numeric states use `progress`/100. Colours: set→accent, error→red,
+/// pause→orange.
+fn progress_bar_fill(info: &PaneInfo, palette: &Palette) -> Option<((u8, u8, u8), f64)> {
+    use kmux_protocol::messages::PaneProgressState as S;
+    let frac = f64::from(info.progress.unwrap_or(0).min(100)) / 100.0;
+    let (c, fraction) = match info.progress_state {
+        S::Remove => return None,
+        S::Set => (palette.accent, frac),
+        S::Error => (palette.red, frac),
+        S::Pause => (palette.orange, frac),
+        S::Indeterminate => (palette.accent, 1.0),
+    };
+    Some(((c.r, c.g, c.b), fraction))
 }
 
 /// Paint a single `grid` filling the current cairo target (origin at `(0,0)`).

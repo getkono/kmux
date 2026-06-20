@@ -83,6 +83,55 @@ impl From<sys::KmuxSize> for TermSize {
     }
 }
 
+/// OSC 9;4 (ConEmu / Windows-Terminal) progress-report state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProgressState {
+    /// Clear any progress indication (`OSC 9;4;0`).
+    Remove,
+    /// Normal progress (`OSC 9;4;1;<pct>`).
+    Set,
+    /// Error / failed (`OSC 9;4;2;<pct>`).
+    Error,
+    /// Indeterminate / busy with no known percentage (`OSC 9;4;3`).
+    Indeterminate,
+    /// Paused / warning (`OSC 9;4;4;<pct>`).
+    Pause,
+}
+
+/// A single OSC 9;4 progress report. `progress` is `0..=100` when the sequence
+/// carried a value, or `None` for the value-less states (remove/indeterminate).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ProgressReport {
+    pub state: ProgressState,
+    pub progress: Option<u8>,
+}
+
+impl ProgressReport {
+    /// The default "no progress bar" report.
+    #[must_use]
+    pub fn none() -> Self {
+        Self {
+            state: ProgressState::Remove,
+            progress: None,
+        }
+    }
+
+    /// Decode the raw `(state, value, has)` triple the C ABI delivers.
+    fn from_raw(state: u8, value: u8, has: u8) -> Self {
+        let state = match state {
+            0 => ProgressState::Remove,
+            1 => ProgressState::Set,
+            2 => ProgressState::Error,
+            3 => ProgressState::Indeterminate,
+            _ => ProgressState::Pause,
+        };
+        Self {
+            state,
+            progress: if has != 0 { Some(value) } else { None },
+        }
+    }
+}
+
 /// Terminal-emitted events. Callbacks fire **synchronously** inside
 /// [`GhosttyTerm::feed`]; implementations must not block or retain pointers.
 pub trait EventSink: Send + Sync + 'static {
@@ -95,6 +144,8 @@ pub trait EventSink: Send + Sync + 'static {
     /// OSC 8 start-hyperlink. `id` is the optional URL id (empty `""` is
     /// normalised to `None`); `uri` is the target.
     fn on_hyperlink(&self, _id: Option<&str>, _uri: &str) {}
+    /// OSC 9;4 progress report (ConEmu/WT progress bar). Fired on each change.
+    fn on_progress(&self, _report: ProgressReport) {}
 }
 
 /// A no-op sink useful for construction sites that do not route events
@@ -152,6 +203,7 @@ impl EventBridge {
             on_bell: Some(trampoline_bell),
             on_osc52: Some(trampoline_osc52),
             on_hyperlink: Some(trampoline_hyperlink),
+            on_progress: Some(trampoline_progress),
         }
     }
 }
@@ -206,6 +258,13 @@ unsafe extern "C" fn trampoline_hyperlink(
     };
     let id_opt = if id.is_empty() { None } else { Some(id) };
     bridge.sink.on_hyperlink(id_opt, uri);
+}
+
+unsafe extern "C" fn trampoline_progress(user: *mut c_void, state: u8, value: u8, has: u8) {
+    let bridge = unsafe { &*(user as *const EventBridge) };
+    bridge
+        .sink
+        .on_progress(ProgressReport::from_raw(state, value, has));
 }
 
 /// Owned handle to a libghostty-vt terminal. One per kmux pane.
@@ -384,6 +443,22 @@ impl GhosttyTerm {
         } else {
             String::from_utf8(buf[..n].to_vec()).ok()
         }
+    }
+
+    /// Return the latest OSC 9;4 progress report. Defaults to
+    /// [`ProgressState::Remove`] (no bar) until the inner program emits a
+    /// progress sequence. Pull-based companion to [`EventSink::on_progress`],
+    /// used by kmuxd to recover state if a report fired before a subscriber
+    /// attached.
+    #[must_use]
+    pub fn progress(&self) -> ProgressReport {
+        let mut state = 0u8;
+        let mut value = 0u8;
+        let mut has = 0u8;
+        unsafe {
+            sys::kmux_ghostty_get_progress(self.handle.as_ptr(), &mut state, &mut value, &mut has)
+        };
+        ProgressReport::from_raw(state, value, has)
     }
 
     /// Read `count` rows of scrollback starting at `start` (0 = oldest).
@@ -941,6 +1016,58 @@ mod tests {
         // OSC 2 also sets the title.
         term.feed(b"\x1b]2;Updated\x07").unwrap();
         assert_eq!(term.title().as_deref(), Some("Updated"));
+    }
+
+    #[derive(Default)]
+    struct ProgressRecorder(Mutex<Vec<ProgressReport>>);
+    impl EventSink for ProgressRecorder {
+        fn on_progress(&self, report: ProgressReport) {
+            self.0.lock().unwrap().push(report);
+        }
+    }
+
+    #[test]
+    fn event_sink_progress_trampoline() {
+        let rec = Arc::new(ProgressRecorder::default());
+        let mut term =
+            GhosttyTerm::new(size(4, 20), 100, rec.clone() as Arc<dyn EventSink>).unwrap();
+        // OSC 9;4;2;30 — error state at 30%.
+        term.feed(b"\x1b]9;4;2;30\x07").unwrap();
+        let got = rec.0.lock().unwrap().clone();
+        assert_eq!(
+            got,
+            vec![ProgressReport {
+                state: ProgressState::Error,
+                progress: Some(30),
+            }]
+        );
+    }
+
+    #[test]
+    fn progress_getter_tracks_latest_state() {
+        let mut term = GhosttyTerm::new(size(4, 20), 100, Arc::new(NullSink)).unwrap();
+        assert_eq!(term.progress(), ProgressReport::none());
+        // Set, 50%.
+        term.feed(b"\x1b]9;4;1;50\x07").unwrap();
+        assert_eq!(
+            term.progress(),
+            ProgressReport {
+                state: ProgressState::Set,
+                progress: Some(50),
+            }
+        );
+        // Indeterminate carries no value.
+        term.feed(b"\x1b]9;4;3\x07").unwrap();
+        assert_eq!(
+            term.progress(),
+            ProgressReport {
+                state: ProgressState::Indeterminate,
+                progress: None,
+            }
+        );
+        // Remove clears the bar.
+        term.feed(b"\x1b]9;4;0\x07").unwrap();
+        assert_eq!(term.progress(), ProgressReport::none());
     }
 
     #[derive(Default)]
