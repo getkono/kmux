@@ -4,6 +4,7 @@ use std::sync::atomic::Ordering;
 use kmux_protocol::messages::{
     ClientMessage, Compression, DirEntry, ErrorCode, ServerMessage, SessionEventMsg, epoch_millis,
 };
+use kmux_protocol::parse_pane_id;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
@@ -219,8 +220,7 @@ pub async fn handle_message<A: PaneAttacher>(
                         pane_id: pane_id.clone(),
                         exit_code,
                     });
-                    let word_id = pane_id
-                        .split_once('/')
+                    let word_id = parse_pane_id(&pane_id)
                         .map(|(w, _)| w.to_string())
                         .unwrap_or_default();
                     match outcome {

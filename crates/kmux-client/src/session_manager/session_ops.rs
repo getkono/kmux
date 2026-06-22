@@ -1,5 +1,6 @@
 use std::path::Path;
 
+use kmux_protocol::format_pane_id;
 use kmux_protocol::messages::{ClientMessage, PeerId, TermSize};
 
 use super::SessionManager;
@@ -20,7 +21,7 @@ impl SessionManager {
                 t.layout
                     .leaves()
                     .into_iter()
-                    .map(|i| format!("{word_id}/{i}"))
+                    .map(|i| format_pane_id(&word_id, i))
                     .collect::<Vec<_>>(),
             ),
             None => match entry.panes.first() {

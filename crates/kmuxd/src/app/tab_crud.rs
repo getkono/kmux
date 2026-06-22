@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use kmux_protocol::format_pane_id;
 use kmux_protocol::messages::{
     ClientCapabilities, LayoutNode, LayoutScheme, PaneInfo, SessionStatus, SplitDir, TabInfo,
     TermSize,
@@ -56,7 +57,7 @@ impl ServerApp {
             state.next_pane_index += 1;
             let tab_index = state.next_tab_index;
             state.next_tab_index += 1;
-            let pane_id = format!("{word_id}/{pane_index}");
+            let pane_id = format_pane_id(word_id, pane_index);
             let cwd = resolve_cwd(&PathBuf::from(&state.meta.cwd));
             (pane_index, tab_index, pane_id, cwd)
         };
@@ -64,18 +65,7 @@ impl ServerApp {
         let relay = self
             .spawn_pane_relay(&pane_id, program, args, size, Some(&cwd), seed_caps)
             .await?;
-        let progress = *relay.progress.lock().unwrap();
-        let pane_info = PaneInfo {
-            pane_id,
-            pane_index,
-            program: relay.program.clone(),
-            size: relay.size,
-            attached_clients: vec![],
-            status: SessionStatus::Running,
-            title: relay.title.lock().unwrap().clone(),
-            progress_state: progress.state,
-            progress: progress.progress,
-        };
+        let pane_info = relay.to_pane_info(pane_id, pane_index, Vec::new(), SessionStatus::Running);
 
         let tab_info = {
             let mut sessions = self.sessions.write().await;
@@ -114,7 +104,7 @@ impl ServerApp {
             tab.layout
                 .leaves()
                 .into_iter()
-                .map(|idx| (idx, format!("{word_id}/{idx}")))
+                .map(|idx| (idx, format_pane_id(word_id, idx)))
                 .collect()
         };
 
@@ -205,12 +195,12 @@ impl ServerApp {
                 })?;
             if !tab.layout.leaves().contains(&from_pane) {
                 return Err(KmuxError::SessionNotFound {
-                    name: format!("{word_id}/{from_pane}"),
+                    name: format_pane_id(word_id, from_pane),
                 });
             }
             let new_index = state.next_pane_index;
             state.next_pane_index += 1;
-            let pane_id = format!("{word_id}/{new_index}");
+            let pane_id = format_pane_id(word_id, new_index);
             let cwd = resolve_cwd(&PathBuf::from(&state.meta.cwd));
             (new_index, pane_id, cwd)
         };
@@ -218,18 +208,7 @@ impl ServerApp {
         let relay = self
             .spawn_pane_relay(&pane_id, program, args, size, Some(&cwd), seed_caps)
             .await?;
-        let progress = *relay.progress.lock().unwrap();
-        let pane_info = PaneInfo {
-            pane_id,
-            pane_index: new_index,
-            program: relay.program.clone(),
-            size: relay.size,
-            attached_clients: vec![],
-            status: SessionStatus::Running,
-            title: relay.title.lock().unwrap().clone(),
-            progress_state: progress.state,
-            progress: progress.progress,
-        };
+        let pane_info = relay.to_pane_info(pane_id, new_index, Vec::new(), SessionStatus::Running);
 
         let (new_layout, focused) = {
             let mut sessions = self.sessions.write().await;

@@ -16,6 +16,7 @@ use kmux_app::layout::{LayoutConfig, resolve_layout};
 use kmux_app::theme::Theme as Palette;
 use kmux_client::grid::{CellGrid, ScrollbackBuffer, scrollback_display_row_at};
 use kmux_protocol::messages::{CellAttrs, CellState, CursorShape, PaneInfo};
+use kmux_protocol::{format_pane_id, pane_index};
 
 /// Divider thickness (cells) between tiled panes — must match the value the
 /// client uses when computing per-pane sizes (`tiles::push_sizes`).
@@ -157,11 +158,7 @@ pub fn render_tiled(
     };
     let rects = resolve_layout(&layout, cols, rows, &cfg);
     let multi = rects.len() > 1;
-    let focused = core
-        .mgr
-        .active_pane_id()
-        .and_then(|p| p.rsplit_once('/'))
-        .and_then(|(_, i)| i.parse::<u32>().ok());
+    let focused = core.mgr.active_pane_id().and_then(pane_index);
     let word = core.mgr.active_session().unwrap_or("").to_string();
 
     for r in &rects {
@@ -169,7 +166,7 @@ pub fn render_tiled(
         let py = r.row as f64 * metrics.cell_h;
         let pw = r.cols as f64 * metrics.cell_w;
         let ph = r.rows as f64 * metrics.cell_h;
-        let pane_id = format!("{word}/{}", r.pane_index);
+        let pane_id = format_pane_id(&word, r.pane_index);
         if let Some(grid) = core.mgr.buffer(&pane_id) {
             let _ = cr.save();
             cr.rectangle(px, py, pw, ph);

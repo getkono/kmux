@@ -10,6 +10,8 @@
 
 use std::time::Instant;
 
+use kmux_protocol::{format_pane_id, pane_index};
+
 use crate::cmd;
 use crate::mode::{Action, Mode};
 
@@ -470,12 +472,7 @@ impl AppCore {
         let Some(layout) = self.mgr.active_layout().cloned() else {
             return;
         };
-        let Some(focused) = self
-            .mgr
-            .active_pane_id()
-            .and_then(|p| p.rsplit_once('/'))
-            .and_then(|(_, i)| i.parse::<u32>().ok())
-        else {
+        let Some(focused) = self.mgr.active_pane_id().and_then(pane_index) else {
             return;
         };
         let rects = crate::layout::resolve_layout(
@@ -487,7 +484,7 @@ impl AppCore {
         if let Some(target) = crate::layout::focus_neighbor(&rects, focused, dir)
             && let Some(word) = self.mgr.active_session().map(|s| s.to_string())
         {
-            self.mgr.focus_pane(format!("{word}/{target}"));
+            self.mgr.focus_pane(format_pane_id(&word, target));
         }
     }
 
@@ -503,7 +500,7 @@ impl AppCore {
             return;
         };
         if let Some(word) = self.mgr.active_session().map(|s| s.to_string()) {
-            self.mgr.focus_pane(format!("{word}/{pane_index}"));
+            self.mgr.focus_pane(format_pane_id(&word, pane_index));
         }
     }
 
@@ -515,12 +512,7 @@ impl AppCore {
         let Some(layout) = self.mgr.active_layout().cloned() else {
             return;
         };
-        let Some(focused) = self
-            .mgr
-            .active_pane_id()
-            .and_then(|p| p.rsplit_once('/'))
-            .and_then(|(_, i)| i.parse::<u32>().ok())
-        else {
+        let Some(focused) = self.mgr.active_pane_id().and_then(pane_index) else {
             return;
         };
         if let Some((path, ratios)) =

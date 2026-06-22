@@ -97,6 +97,29 @@ impl SessionManager {
         }
     }
 
+    /// Drop every per-pane buffer and bookkeeping entry for a closed pane, keeping
+    /// the buffer / pane_sync / input-lock / fetch maps in lock-step (a pane must
+    /// never outlive its sync state).
+    fn forget_pane(&mut self, pane_id: &str) {
+        self.buffers.remove(pane_id);
+        self.pane_sync.remove(pane_id);
+        self.input_locked.remove(pane_id);
+        self.in_flight_history_fetches.remove(pane_id);
+    }
+
+    /// Record a successfully-applied update: advance the pane's expected seqno and
+    /// log apply latency. Shared by every Terminal* / Cursor / Scrollback arm.
+    fn mark_synced(&mut self, pane_id: String, seqno: SequenceNo, start: Instant, sent_at_ms: u64) {
+        self.pane_sync.insert(
+            pane_id,
+            PaneSync::Synced {
+                expected: SequenceNo(seqno.0 + 1),
+            },
+        );
+        let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
+        self.metrics.record_apply(sent_at_ms, elapsed_ms);
+    }
+
     pub fn handle_server_message(&mut self, msg: ServerMessage) -> Vec<SessionEvent> {
         let mut events = Vec::new();
 
@@ -215,10 +238,7 @@ impl SessionManager {
                     .cloned();
                 if let Some(entry) = &entry {
                     for pane in &entry.panes {
-                        self.buffers.remove(&pane.pane_id);
-                        self.pane_sync.remove(&pane.pane_id);
-                        self.input_locked.remove(&pane.pane_id);
-                        self.in_flight_history_fetches.remove(&pane.pane_id);
+                        self.forget_pane(&pane.pane_id);
                     }
                 }
                 self.session_list.retain(|e| e.meta.word_id != word_id);
@@ -250,10 +270,7 @@ impl SessionManager {
                     .iter_mut()
                     .find(|e| e.meta.word_id == session_word_id)
                 {
-                    let pane_index = pane_id
-                        .rsplit_once('/')
-                        .and_then(|(_, idx)| idx.parse().ok())
-                        .unwrap_or(0);
+                    let pane_index = kmux_protocol::pane_index(&pane_id).unwrap_or(0);
                     if !entry.panes.iter().any(|p| p.pane_id == pane_id) {
                         entry.panes.push(PaneInfo {
                             pane_id: pane_id.clone(),
@@ -277,10 +294,7 @@ impl SessionManager {
             }
 
             ServerMessage::PaneClosed { pane_id, .. } => {
-                self.buffers.remove(&pane_id);
-                self.pane_sync.remove(&pane_id);
-                self.input_locked.remove(&pane_id);
-                self.in_flight_history_fetches.remove(&pane_id);
+                self.forget_pane(&pane_id);
 
                 // Remove pane from session_list
                 for entry in &mut self.session_list {
@@ -422,14 +436,7 @@ impl SessionManager {
                 let start = Instant::now();
                 let grid = self.buffers.entry(pane_id.clone()).or_default();
                 grid.apply_snapshot(snapshot);
-                self.pane_sync.insert(
-                    pane_id,
-                    PaneSync::Synced {
-                        expected: SequenceNo(seqno.0 + 1),
-                    },
-                );
-                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                self.metrics.record_apply(sent_at_ms, elapsed_ms);
+                self.mark_synced(pane_id, seqno, start, sent_at_ms);
             }
 
             ServerMessage::TerminalUpdate {
@@ -448,14 +455,7 @@ impl SessionManager {
                     grid.apply_diff(diff);
                     self.metrics.record_diff_stats(op_count);
                 }
-                self.pane_sync.insert(
-                    pane_id.clone(),
-                    PaneSync::Synced {
-                        expected: SequenceNo(seqno.0 + 1),
-                    },
-                );
-                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                self.metrics.record_apply(sent_at_ms, elapsed_ms);
+                self.mark_synced(pane_id.clone(), seqno, start, sent_at_ms);
                 if op_count > 100 {
                     let net_apply_ms = epoch_millis().saturating_sub(sent_at_ms) as f64;
                     self.metrics.record_large_diff(net_apply_ms);
@@ -477,14 +477,7 @@ impl SessionManager {
                 if let Some(grid) = self.buffers.get_mut(&pane_id) {
                     grid.apply_cursor_update(cursor, modes);
                 }
-                self.pane_sync.insert(
-                    pane_id,
-                    PaneSync::Synced {
-                        expected: SequenceNo(seqno.0 + 1),
-                    },
-                );
-                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                self.metrics.record_apply(sent_at_ms, elapsed_ms);
+                self.mark_synced(pane_id, seqno, start, sent_at_ms);
             }
 
             ServerMessage::SyncReset { pane_id } => {
@@ -664,14 +657,7 @@ impl SessionManager {
                 if let Some(grid) = self.buffers.get_mut(&pane_id) {
                     grid.apply_scrollback_append(first_index, lines);
                 }
-                self.pane_sync.insert(
-                    pane_id.clone(),
-                    PaneSync::Synced {
-                        expected: SequenceNo(seqno.0 + 1),
-                    },
-                );
-                let elapsed_ms = start.elapsed().as_secs_f64() * 1000.0;
-                self.metrics.record_apply(sent_at_ms, elapsed_ms);
+                self.mark_synced(pane_id.clone(), seqno, start, sent_at_ms);
                 self.maybe_fetch_history(&pane_id);
             }
 

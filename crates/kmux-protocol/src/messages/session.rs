@@ -16,7 +16,39 @@ pub type WordId = String;
 
 /// Pane identifier: `"{word_id}/{pane_index}"`.
 /// Example: `"eagle/0"`, `"eagle/1"`.
+///
+/// Build with [`format_pane_id`] and read back with [`parse_pane_id`] /
+/// [`pane_index`] / [`pane_word`] rather than hand-rolling `format!` / `rsplit_once`,
+/// so the `"{word_id}/{pane_index}"` convention is defined in exactly one place.
 pub type PaneId = String;
+
+/// Format a [`PaneId`] from its session word and pane index.
+pub fn format_pane_id(word_id: &str, pane_index: u32) -> PaneId {
+    format!("{word_id}/{pane_index}")
+}
+
+/// Parse a [`PaneId`] into its `(word_id, pane_index)` components.
+///
+/// The pane index is the segment after the final `/`, so session words that
+/// themselves contain `/` are tolerated. Returns `None` when there is no `/`,
+/// the word is empty, or the index is not a `u32`.
+pub fn parse_pane_id(pane_id: &str) -> Option<(&str, u32)> {
+    let (word_id, index) = pane_id.rsplit_once('/')?;
+    if word_id.is_empty() {
+        return None;
+    }
+    Some((word_id, index.parse().ok()?))
+}
+
+/// The `pane_index` component of a [`PaneId`], if well-formed.
+pub fn pane_index(pane_id: &str) -> Option<u32> {
+    parse_pane_id(pane_id).map(|(_, index)| index)
+}
+
+/// The session [`WordId`] component of a [`PaneId`], if well-formed.
+pub fn pane_word(pane_id: &str) -> Option<&str> {
+    parse_pane_id(pane_id).map(|(word, _)| word)
+}
 
 /// Tab index within a session (0-based, monotonically increasing per session).
 ///
@@ -438,6 +470,27 @@ pub enum SessionEventMsg {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pane_id_roundtrips_and_rejects_malformed() {
+        assert_eq!(format_pane_id("eagle", 0), "eagle/0");
+        assert_eq!(format_pane_id("eagle", 12), "eagle/12");
+
+        assert_eq!(parse_pane_id("eagle/0"), Some(("eagle", 0)));
+        // The index is the final segment, so words may themselves contain '/'.
+        assert_eq!(parse_pane_id("two/words/3"), Some(("two/words", 3)));
+        assert_eq!(pane_word("eagle/7"), Some("eagle"));
+        assert_eq!(pane_index("eagle/7"), Some(7));
+
+        // Malformed: no '/', empty word, or a non-numeric index.
+        assert_eq!(parse_pane_id("noindex"), None);
+        assert_eq!(parse_pane_id("/0"), None);
+        assert_eq!(parse_pane_id("eagle/x"), None);
+
+        // format -> parse round-trip.
+        let id = format_pane_id("falcon", 5);
+        assert_eq!(parse_pane_id(&id), Some(("falcon", 5)));
+    }
 
     #[test]
     fn term_size_pixel_fields_roundtrip() {

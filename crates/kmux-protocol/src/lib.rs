@@ -21,7 +21,8 @@ pub use messages::{
     CellAttrs, CellColor, CellState, ClientId, ClientMessage, CursorShape, CursorState, DiffOp,
     ErrorCode, GridSnapshot, PaneId, PaneInfo, RequestId, ServerMessage, SessionEntry,
     SessionEventMsg, SessionMeta, TermModes, TermSize, TerminalDiff, TransportKind, WordId,
-    epoch_secs_to_ymd_hms, version_mismatch_hint,
+    epoch_secs_to_ymd_hms, format_pane_id, pane_index, pane_word, parse_pane_id,
+    version_mismatch_hint,
 };
 #[cfg(feature = "framing")]
 pub use transport::bootstrap::{Bootstrap, BootstrapError, EndpointAdvert, SessionContext};

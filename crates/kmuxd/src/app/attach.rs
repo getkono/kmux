@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
+use kmux_protocol::format_pane_id;
 use kmux_protocol::messages::{
     ClientCapabilities, ClientId, GridSnapshot, InputMode, SequenceNo, ServerMessage, TermSize,
     TerminalDiff,
@@ -232,7 +233,7 @@ impl ServerApp {
         let mut sessions = self.sessions.write().await;
         for state in sessions.values_mut() {
             for (pane_index, relay) in state.panes.iter_mut() {
-                let pane_id = format!("{}/{}", state.meta.word_id, pane_index);
+                let pane_id = format_pane_id(&state.meta.word_id, *pane_index);
                 relay.clients.lock().unwrap().remove(&client_id);
                 relay.recompute_live_capabilities();
                 if relay.input_mode == InputMode::Locked(client_id) {

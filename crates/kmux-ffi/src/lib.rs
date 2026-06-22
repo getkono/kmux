@@ -66,6 +66,7 @@ use kmux_protocol::messages::{
     ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, PaneProgressState, SplitDir,
     TermSize,
 };
+use kmux_protocol::{format_pane_id, pane_index};
 // The packed-cell format is owned by `kmux-render` (the single encoder shared
 // with the GPU renderer; see docs/architecture-render.md). The non-GPU Swift
 // path encodes through it here, so the bytes are identical to the renderer's.
@@ -1719,11 +1720,7 @@ impl KmuxDriver {
         let Some(word) = d.mgr.active_session().map(|s| s.to_string()) else {
             return Vec::new();
         };
-        let focused = d
-            .mgr
-            .active_pane_id()
-            .and_then(|p| p.rsplit_once('/'))
-            .and_then(|(_, i)| i.parse::<u32>().ok());
+        let focused = d.mgr.active_pane_id().and_then(pane_index);
         // `render_layout` collapses to the focused pane when zoomed.
         let Some(layout) = d.mgr.render_layout() else {
             return Vec::new();
@@ -1736,7 +1733,7 @@ impl KmuxDriver {
         )
         .into_iter()
         .map(|r| {
-            let pane_id = format!("{word}/{}", r.pane_index);
+            let pane_id = format_pane_id(&word, r.pane_index);
             let (progress_state, progress) = d
                 .mgr
                 .pane_info(&pane_id)
@@ -2739,14 +2736,10 @@ fn render_active_tab(
             &kmux_app::layout::LayoutConfig::default(),
         );
         multi = rects.len() > 1;
-        let focused = d
-            .mgr
-            .active_pane_id()
-            .and_then(|p| p.rsplit_once('/'))
-            .and_then(|(_, i)| i.parse::<u32>().ok());
+        let focused = d.mgr.active_pane_id().and_then(pane_index);
         let word = d.mgr.active_session().unwrap_or("").to_string();
         for r in &rects {
-            let pane_id = format!("{word}/{}", r.pane_index);
+            let pane_id = format_pane_id(&word, r.pane_index);
             if let Some(grid) = d.mgr.buffer(&pane_id) {
                 entries.push((
                     r.col,

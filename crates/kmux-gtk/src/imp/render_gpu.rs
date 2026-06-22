@@ -19,6 +19,7 @@ use kmux_app::appearance::Appearance;
 use kmux_app::core::AppCore;
 use kmux_app::layout::{LayoutConfig, resolve_layout};
 use kmux_app::theme::Theme;
+use kmux_protocol::{format_pane_id, pane_index};
 use kmux_render::{
     CellSource, CursorView, Frame, PaneView, SceneCounts, ScrollIndicator, TerminalRenderer,
     build_scene, cursor_geometry,
@@ -127,14 +128,10 @@ pub(crate) fn paint(
         let (cols, rows) = renderer.cols_rows(width, height);
         let rects = resolve_layout(&layout, cols, rows, &cfg());
         multi = rects.len() > 1;
-        let focused = core
-            .mgr
-            .active_pane_id()
-            .and_then(|p| p.rsplit_once('/'))
-            .and_then(|(_, i)| i.parse::<u32>().ok());
+        let focused = core.mgr.active_pane_id().and_then(pane_index);
         let word = core.mgr.active_session().unwrap_or("").to_string();
         for r in &rects {
-            let pane_id = format!("{word}/{}", r.pane_index);
+            let pane_id = format_pane_id(&word, r.pane_index);
             if let Some(grid) = core.mgr.buffer(&pane_id) {
                 entries.push(PaneEntry {
                     col: r.col,

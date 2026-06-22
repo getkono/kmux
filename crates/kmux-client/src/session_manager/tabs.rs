@@ -8,6 +8,7 @@
 //! the client mirrors them from `LayoutUpdate` / the session list.
 
 use kmux_protocol::messages::{ClientMessage, LayoutNode, LayoutScheme, PaneId, TabInfo, TermSize};
+use kmux_protocol::{format_pane_id, pane_index, parse_pane_id};
 
 use super::SessionManager;
 
@@ -78,7 +79,7 @@ impl SessionManager {
             .layout
             .leaves()
             .into_iter()
-            .map(|i| format!("{word_id}/{i}"))
+            .map(|i| format_pane_id(word_id, i))
             .collect();
         Some((tab.focused_pane, visible))
     }
@@ -86,8 +87,7 @@ impl SessionManager {
     /// Locate the `(word_id, tab_index)` that contains `pane_id`, via the cached
     /// tab layouts.
     pub(super) fn locate_pane(&self, pane_id: &str) -> Option<(String, u32)> {
-        let (word, idx) = pane_id.rsplit_once('/')?;
-        let idx: u32 = idx.parse().ok()?;
+        let (word, idx) = parse_pane_id(pane_id)?;
         let entry = self.session_list.iter().find(|e| e.meta.word_id == word)?;
         let tab = entry
             .tabs
@@ -156,11 +156,7 @@ impl SessionManager {
     pub fn render_layout(&self) -> Option<LayoutNode> {
         let layout = self.active_layout()?;
         if self.zoomed
-            && let Some(idx) = self
-                .active_pane
-                .as_ref()
-                .and_then(|p| p.rsplit_once('/'))
-                .and_then(|(_, i)| i.parse::<u32>().ok())
+            && let Some(idx) = self.active_pane.as_deref().and_then(pane_index)
         {
             return Some(LayoutNode::single(idx));
         }
@@ -192,7 +188,7 @@ impl SessionManager {
 
     /// Set `active_pane` to the tab's focused leaf (or the first visible pane).
     pub(super) fn focus_from_tab(&mut self, word_id: &str, focus_idx: u32) {
-        let focus_pane = format!("{word_id}/{focus_idx}");
+        let focus_pane = format_pane_id(word_id, focus_idx);
         self.active_pane = if self.visible_panes.contains(&focus_pane) {
             Some(focus_pane)
         } else {
@@ -247,9 +243,7 @@ impl SessionManager {
         }
         self.active_pane = Some(pane_id.clone());
         if let (Some(word_id), Some(tab_index)) = (self.active_session.clone(), self.active_tab)
-            && let Some(idx) = pane_id
-                .rsplit_once('/')
-                .and_then(|(_, i)| i.parse::<u32>().ok())
+            && let Some(idx) = pane_index(&pane_id)
         {
             self.send_ws(ClientMessage::SetFocus {
                 word_id,
@@ -289,12 +283,7 @@ impl SessionManager {
         else {
             return;
         };
-        let Some(from_pane) = self
-            .active_pane
-            .as_ref()
-            .and_then(|p| p.rsplit_once('/'))
-            .and_then(|(_, i)| i.parse::<u32>().ok())
-        else {
+        let Some(from_pane) = self.active_pane.as_deref().and_then(pane_index) else {
             return;
         };
         let rid = self.next_rid();
@@ -319,12 +308,7 @@ impl SessionManager {
         else {
             return;
         };
-        let Some(focused) = self
-            .active_pane
-            .as_ref()
-            .and_then(|p| p.rsplit_once('/'))
-            .and_then(|(_, i)| i.parse::<u32>().ok())
-        else {
+        let Some(focused) = self.active_pane.as_deref().and_then(pane_index) else {
             return;
         };
         let Some(leaves) = self.tab_layout(&word_id, tab_index).map(|l| l.leaves()) else {

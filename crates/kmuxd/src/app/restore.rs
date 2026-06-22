@@ -4,6 +4,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
+use kmux_protocol::format_pane_id;
 use kmux_protocol::messages::{ClientCapabilities, InputMode, LayoutNode, SessionStatus};
 use kmux_pty::config::{EnvBuilder, PtyConfig};
 use kmux_pty::{PtyProcess, PtyReader, PtySession, PtyWriter};
@@ -88,7 +89,7 @@ impl ServerApp {
 
             for persisted_pane in persisted_session.panes {
                 let pane_index = persisted_pane.pane_index;
-                let pane_id = format!("{word_id}/{pane_index}");
+                let pane_id = format_pane_id(&word_id, pane_index);
                 let inherited_fd = inherited.remove(&pane_id);
 
                 match self

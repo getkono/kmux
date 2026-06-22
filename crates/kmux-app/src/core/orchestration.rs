@@ -12,6 +12,7 @@ use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSign
 #[cfg(feature = "remote")]
 use kmux_client::transport::TransportKind;
 use kmux_protocol::messages::{PeerId, PeerTarget, ServerMessage, SessionEntry};
+use kmux_protocol::pane_word;
 #[cfg(feature = "remote")]
 use kmux_protocol::transport::bootstrap::EndpointAdvert;
 use std::time::Instant;
@@ -57,8 +58,8 @@ fn osc52_clipboard_effect(
     data: &str,
 ) -> Option<KeyResult> {
     // `pane_id` is `"{word_id}/{pane_index}"`; the word_id is the session.
-    match (active_session, pane_id.rsplit_once('/')) {
-        (Some(session), Some((pane_session, _))) if session == pane_session => {}
+    match (active_session, pane_word(pane_id)) {
+        (Some(session), Some(pane_session)) if session == pane_session => {}
         _ => return None,
     }
     let bytes = base64::engine::general_purpose::STANDARD

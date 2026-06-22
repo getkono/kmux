@@ -10,6 +10,7 @@
 
 use std::collections::HashMap;
 
+use kmux_protocol::format_pane_id;
 use kmux_protocol::messages::{PaneInfo, PaneProcesses, SessionEntry};
 
 use super::AppCore;
@@ -88,7 +89,7 @@ pub fn build_overview_rows(
             let leaves = tab.layout.leaves();
             let pane_ids: Vec<String> = leaves
                 .iter()
-                .map(|i| format!("{}/{i}", entry.meta.word_id))
+                .map(|i| format_pane_id(&entry.meta.word_id, *i))
                 .collect();
             let (t_cpu, t_mem) = aggregate_pane_ids(pane_ids.iter().map(String::as_str), &by_pane);
             rows.push(OverviewRow {
@@ -103,7 +104,7 @@ pub fn build_overview_rows(
             });
 
             for &pane_index in &leaves {
-                let pane_id = format!("{}/{pane_index}", entry.meta.word_id);
+                let pane_id = format_pane_id(&entry.meta.word_id, pane_index);
                 let info = entry.panes.iter().find(|p| p.pane_index == pane_index);
                 let pp = by_pane.get(pane_id.as_str()).copied();
                 let (p_cpu, p_mem) = pp.map(tree_totals).unwrap_or((0.0, 0));
@@ -215,7 +216,7 @@ mod tests {
 
     fn pane(word: &str, idx: u32) -> PaneInfo {
         PaneInfo {
-            pane_id: format!("{word}/{idx}"),
+            pane_id: format_pane_id(word, idx),
             pane_index: idx,
             program: "zsh".into(),
             size: TermSize::default(),

@@ -42,6 +42,7 @@ use kmux_protocol::messages::{
     ClientCapabilities, ClientId, ClientMessage, PaneProcesses, PeerId, PeerTarget, RequestId,
     SequenceNo, ServerMessage, SessionEntry, SessionEventMsg, TermSize, epoch_millis,
 };
+use kmux_protocol::{format_pane_id, parse_pane_id};
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
@@ -303,9 +304,9 @@ impl PeerConnection {
 
     /// Translate a remote pane ID (`remote_word/idx`) to its local form.
     fn to_local_pane(&self, remote_pane: &str) -> Option<String> {
-        let (remote_word, idx) = split_pane_id(remote_pane)?;
+        let (remote_word, idx) = parse_pane_id(remote_pane)?;
         let local_word = self.remote_to_local.get(remote_word)?;
-        Some(format!("{local_word}/{idx}"))
+        Some(format_pane_id(local_word, idx))
     }
 
     /// The **ctrl** senders of every viewer of every proxied pane under
@@ -767,7 +768,7 @@ impl PeerManager {
 
     /// Whether `pane_id`'s session is proxied from a peer.
     pub fn is_federated_pane(&self, pane_id: &str) -> bool {
-        match split_pane_id(pane_id) {
+        match parse_pane_id(pane_id) {
             Some((word, _)) => self.word_index.lock().unwrap().contains_key(word),
             None => false,
         }
@@ -843,7 +844,7 @@ impl PeerManager {
         local_pane_id: &str,
         build: impl FnOnce(String) -> ClientMessage,
     ) -> bool {
-        let Some((local_word, idx)) = split_pane_id(local_pane_id) else {
+        let Some((local_word, idx)) = parse_pane_id(local_pane_id) else {
             return false;
         };
         let Some(conn) = self.conn_for_word(local_word) else {
@@ -853,7 +854,7 @@ impl PeerManager {
         let Some(remote_word) = guard.local_to_remote.get(local_word) else {
             return false;
         };
-        let remote_pane = format!("{remote_word}/{idx}");
+        let remote_pane = format_pane_id(remote_word, idx);
         guard.client_tx.send(build(remote_pane)).is_ok()
     }
 
@@ -871,7 +872,7 @@ impl PeerManager {
         last_seqno: Option<SequenceNo>,
         size: TermSize,
     ) -> bool {
-        let Some((local_word, idx)) = split_pane_id(local_pane_id) else {
+        let Some((local_word, idx)) = parse_pane_id(local_pane_id) else {
             return false;
         };
         let Some(conn) = self.conn_for_word(local_word) else {
@@ -881,7 +882,7 @@ impl PeerManager {
         let Some(remote_word) = guard.local_to_remote.get(local_word).cloned() else {
             return false;
         };
-        let remote_pane = format!("{remote_word}/{idx}");
+        let remote_pane = format_pane_id(&remote_word, idx);
 
         if guard.panes.contains_key(local_pane_id) {
             // Late viewer: mint from the mirror, register, then reconcile size.
@@ -931,7 +932,7 @@ impl PeerManager {
     /// reconcile the smallest-wins size upstream. Returns `false` when the pane is
     /// not federated.
     pub fn resize_viewer(&self, local_pane_id: &str, client_id: ClientId, size: TermSize) -> bool {
-        let Some((local_word, idx)) = split_pane_id(local_pane_id) else {
+        let Some((local_word, idx)) = parse_pane_id(local_pane_id) else {
             return false;
         };
         let Some(conn) = self.conn_for_word(local_word) else {
@@ -946,7 +947,7 @@ impl PeerManager {
         {
             viewer.size = size;
         }
-        let remote_pane = format!("{remote_word}/{idx}");
+        let remote_pane = format_pane_id(&remote_word, idx);
         guard.reconcile_size(local_pane_id, &remote_pane);
         true
     }
@@ -955,7 +956,7 @@ impl PeerManager {
     /// **last** viewer, forward a `Detach` upstream and drop the mirror; otherwise
     /// reconcile the upstream size (a departing viewer may have been the smallest).
     pub fn detach_viewer(&self, local_pane_id: &str, client_id: ClientId) {
-        let Some((local_word, idx)) = split_pane_id(local_pane_id) else {
+        let Some((local_word, idx)) = parse_pane_id(local_pane_id) else {
             return;
         };
         let Some(conn) = self.conn_for_word(local_word) else {
@@ -965,7 +966,7 @@ impl PeerManager {
         let Some(remote_word) = guard.local_to_remote.get(local_word).cloned() else {
             return;
         };
-        let remote_pane = format!("{remote_word}/{idx}");
+        let remote_pane = format_pane_id(&remote_word, idx);
         let became_empty = match guard.panes.get_mut(local_pane_id) {
             Some(pane) => {
                 pane.viewers.remove(&client_id);
@@ -1160,7 +1161,7 @@ fn localize_entry(mut entry: SessionEntry, local_word: &str, peer_id: &str) -> S
     // frontend that groups by `peer` strips the decoration for display.
     entry.peer = Some(peer_id.to_string());
     for pane in &mut entry.panes {
-        pane.pane_id = format!("{local_word}/{}", pane.pane_index);
+        pane.pane_id = format_pane_id(local_word, pane.pane_index);
         pane.attached_clients.clear();
     }
     entry
@@ -1183,9 +1184,9 @@ fn rewrite_event_to_local(
         | PaneClipboardCopy { pane_id, .. }
         | PaneClosed { pane_id }
         | PaneFaulted { pane_id } => {
-            let (remote_word, idx) = split_pane_id(pane_id)?;
+            let (remote_word, idx) = parse_pane_id(pane_id)?;
             let local_word = remote_to_local.get(remote_word)?.clone();
-            *pane_id = format!("{local_word}/{idx}");
+            *pane_id = format_pane_id(&local_word, idx);
             Some(local_word)
         }
         SessionCreated { word_id }
@@ -1200,16 +1201,6 @@ fn rewrite_event_to_local(
             Some(local_word)
         }
     }
-}
-
-/// Split a `"word/index"` pane ID into its parts. Returns `None` for a malformed
-/// ID or an empty word.
-fn split_pane_id(pane_id: &str) -> Option<(&str, u32)> {
-    let (word, idx) = pane_id.rsplit_once('/')?;
-    if word.is_empty() {
-        return None;
-    }
-    Some((word, idx.parse().ok()?))
 }
 
 /// Borrow the single `pane_id` a [`ServerMessage`] carries, if any.
@@ -1290,7 +1281,7 @@ mod tests {
                 cwd: "/tmp".to_string(),
             },
             panes: vec![PaneInfo {
-                pane_id: format!("{word}/0"),
+                pane_id: format_pane_id(word, 0),
                 pane_index: 0,
                 program: "sh".to_string(),
                 size: TermSize {
@@ -1332,15 +1323,6 @@ mod tests {
             seqno: SequenceNo(1),
             sent_at_ms: 0,
         }
-    }
-
-    #[test]
-    fn split_pane_id_parses_and_rejects() {
-        assert_eq!(split_pane_id("eagle/0"), Some(("eagle", 0)));
-        assert_eq!(split_pane_id("two/words/3"), Some(("two/words", 3)));
-        assert_eq!(split_pane_id("noindex"), None);
-        assert_eq!(split_pane_id("/0"), None);
-        assert_eq!(split_pane_id("eagle/x"), None);
     }
 
     #[test]

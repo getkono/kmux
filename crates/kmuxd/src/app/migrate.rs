@@ -6,6 +6,7 @@
 //! `docs/daemon-handoff.md` for the full sequence.
 
 use kmux_protocol::control_rpc::HandoffPaneMeta;
+use kmux_protocol::format_pane_id;
 
 use super::ServerApp;
 
@@ -26,7 +27,7 @@ impl ServerApp {
                     state
                         .panes
                         .keys()
-                        .map(move |idx| format!("{word_id}/{idx}"))
+                        .map(move |idx| format_pane_id(word_id, *idx))
                 })
                 .collect()
         };
@@ -103,7 +104,7 @@ mod tests {
             )
             .await
             .expect("create_session");
-        let pane_id = format!("{}/0", entry.meta.word_id);
+        let pane_id = kmux_protocol::format_pane_id(&entry.meta.word_id, 0);
         let pid_before = old
             .manager
             .child_pid(&pane_id)
