@@ -26,7 +26,7 @@ path = "src/bin/uniffi-bindgen.rs"
 # GPU terminal rendering via kmux-render (wgpu), exposed to Swift as the
 # KmuxRenderer object. On by default (issue #132) so the GPU path is always
 # compiled and covered by the standard build/test paths; the runtime still
-# stays CPU unless KMUX_RENDERER=wgpu selects it. Build `--no-default-features`
+# stays CPU unless `renderer = "gpu"` in config.toml selects it. Build `--no-default-features`
 # for a lean, wgpu-free staticlib — the packed-cell format is always available
 # regardless. CI compiles both. See docs/architecture-render.md.
 default = ["gpu"]

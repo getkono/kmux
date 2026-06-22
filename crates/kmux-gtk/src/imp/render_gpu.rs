@@ -1,4 +1,5 @@
-//! GPU render path for the GTK frontend (opt-in via `KMUX_RENDERER=wgpu`).
+//! GPU render path for the GTK frontend (opt-in via `renderer = "gpu"` in
+//! `config.toml`).
 //!
 //! The shared [`kmux_render`] crate renders the active tab's panes into an
 //! offscreen RGBA texture; we read the pixels back, swizzle RGBA→BGRA, and paint
@@ -6,7 +7,7 @@
 //! GTK's compositor happy with a single low-risk presentation path on both Linux
 //! and macOS (a Linux zero-copy dmabuf fast path is a future optimization). The
 //! Cairo renderer in [`super::render`] stays the default; this path is selected
-//! only when the env var is set and a GPU adapter is available.
+//! only when the config requests it and a GPU adapter is available.
 //!
 //! Note: this path uses the renderer's own (swash-derived) cell metrics, while
 //! the resize path still uses the Pango metrics, so tiled layouts may differ by
@@ -25,16 +26,9 @@ use kmux_render::{
     build_scene, cursor_geometry,
 };
 
+use kmux_app::config::RendererKind;
+
 use super::render::GUTTER;
-
-/// Whether `KMUX_RENDERER` selects the wgpu backend. Pure so it is testable.
-fn renderer_pref(value: Option<&str>) -> bool {
-    value.is_some_and(|v| v.eq_ignore_ascii_case("wgpu"))
-}
-
-fn wants_gpu() -> bool {
-    renderer_pref(std::env::var("KMUX_RENDERER").ok().as_deref())
-}
 
 fn cfg() -> LayoutConfig {
     LayoutConfig {
@@ -55,10 +49,11 @@ pub(crate) struct GpuState {
 }
 
 impl GpuState {
-    /// Build the GPU state, honoring `KMUX_RENDERER`. Falls back to Cairo (an
-    /// inert state) when the env var is unset or GPU init fails.
-    pub(crate) fn new(appearance: &Appearance, theme: &Theme) -> Self {
-        if !wants_gpu() {
+    /// Build the GPU state for the configured `renderer` backend. Falls back to
+    /// Cairo (an inert state) when `renderer` is [`RendererKind::Cairo`] or when
+    /// GPU init fails.
+    pub(crate) fn new(renderer: RendererKind, appearance: &Appearance, theme: &Theme) -> Self {
+        if renderer != RendererKind::Gpu {
             return Self {
                 renderer: None,
                 last_counts: None,
@@ -66,14 +61,16 @@ impl GpuState {
         }
         match TerminalRenderer::new_offscreen(1, 1, 1.0, appearance, theme) {
             Ok(renderer) => {
-                tracing::info!("kmux-render: GPU renderer active (KMUX_RENDERER=wgpu)");
+                tracing::info!("kmux-render: GPU renderer active (renderer = \"gpu\")");
                 Self {
                     renderer: Some(renderer),
                     last_counts: None,
                 }
             }
             Err(e) => {
-                tracing::warn!("KMUX_RENDERER=wgpu set but GPU init failed: {e}; using Cairo");
+                tracing::warn!(
+                    "renderer = \"gpu\" requested but GPU init failed: {e}; using Cairo"
+                );
                 Self {
                     renderer: None,
                     last_counts: None,
@@ -85,6 +82,17 @@ impl GpuState {
     /// Whether the GPU path should be used for drawing.
     pub(crate) fn enabled(&self) -> bool {
         self.renderer.is_some()
+    }
+
+    /// The renderer actually in use this frame — the *effective* backend, which
+    /// can differ from the configured one (GPU init failure falls back to Cairo).
+    /// Surfaced in the render-debug overlay so it reflects reality, not config.
+    pub(crate) fn active_renderer_name(&self) -> &'static str {
+        if self.renderer.is_some() {
+            "wgpu"
+        } else {
+            "cairo"
+        }
     }
 
     /// The scene primitive counts from the last painted frame, when the
@@ -260,20 +268,23 @@ pub(crate) fn paint(
     // NOTE: the OSC 9;4 per-pane progress bar (issue #125) is currently drawn
     // only on the Cairo path (`render::render_tiled`), the runtime default.
     // Surfacing it through the GPU path means threading progress into the shared
-    // `kmux-render` scene — tracked as a follow-up; `KMUX_RENDERER=wgpu` shows no
+    // `kmux-render` scene — tracked as a follow-up; `renderer = "gpu"` shows no
     // bar until then.
 }
 
 #[cfg(test)]
 mod tests {
-    use super::renderer_pref;
+    use super::*;
+    use kmux_app::theme;
 
     #[test]
-    fn renderer_pref_selects_wgpu_case_insensitively() {
-        assert!(renderer_pref(Some("wgpu")));
-        assert!(renderer_pref(Some("WGPU")));
-        assert!(!renderer_pref(Some("cairo")));
-        assert!(!renderer_pref(Some("")));
-        assert!(!renderer_pref(None));
+    fn cairo_renderer_yields_an_inert_disabled_state() {
+        // RendererKind::Cairo must never init the GPU path — this stays headless
+        // (no adapter) and reports the effective renderer as cairo.
+        let appearance = Appearance::default();
+        let theme = theme::default_theme();
+        let state = GpuState::new(RendererKind::Cairo, &appearance, &theme);
+        assert!(!state.enabled(), "Cairo must not enable the GPU path");
+        assert_eq!(state.active_renderer_name(), "cairo");
     }
 }

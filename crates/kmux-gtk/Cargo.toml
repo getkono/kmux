@@ -18,7 +18,7 @@ path = "src/main.rs"
 [features]
 # GPU terminal rendering via the shared kmux-render crate (wgpu). On by default
 # (issue #132) so the GPU path is always compiled; the renderer still stays
-# Cairo unless KMUX_RENDERER=wgpu selects it at runtime. Build
+# Cairo unless `renderer = "gpu"` in config.toml selects it at runtime. Build
 # `--no-default-features` for a lean, Cairo-only binary that pulls no wgpu. CI
 # compiles both. See docs/architecture-render.md.
 default = ["gpu"]

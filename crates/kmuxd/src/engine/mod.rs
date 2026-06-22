@@ -24,19 +24,10 @@ use kmux_protocol::messages::{CellState, GridSnapshot, KeyEvent, TermSize};
 use kmux_pty::error::Result;
 use tokio::task::JoinHandle;
 
-/// Env var selecting the pane isolation mode. `process` runs each pane's VT
-/// pipeline in an isolated `kmux-vt-worker` subprocess (issue #126); anything
-/// else (the default) keeps the emulator in-process. Mirrors the opt-in rollout
-/// of the GPU renderer (`KMUX_RENDERER=wgpu`).
-const ISOLATION_ENV: &str = "KMUX_SESSION_ISOLATION";
-
-/// Whether process isolation is requested via `KMUX_SESSION_ISOLATION=process`.
-/// Off by default; a worker spawn failure always falls back to in-process.
-pub fn process_isolation_enabled() -> bool {
-    std::env::var(ISOLATION_ENV)
-        .map(|v| v.eq_ignore_ascii_case("process"))
-        .unwrap_or(false)
-}
+// Pane isolation is selected by `[daemon] session_isolation` in `kmuxd.toml`
+// (overridable with `kmuxd --session-isolation`), resolved into
+// `ServerApp::session_isolation` and read at pane creation. A worker spawn
+// failure always falls back to the in-process engine.
 
 /// The terminal emulator + PTY-input half of a pane.
 pub enum PaneEngine {

@@ -75,10 +75,15 @@ pub(crate) struct Frontend {
     /// The CSS provider for the chrome/overlay theme, reloaded when the driver
     /// reports a palette change (`/theme`).
     css_provider: gtk4::CssProvider,
-    /// Opt-in GPU renderer (active only when `KMUX_RENDERER=wgpu` and an adapter
-    /// is available); otherwise inert and the Cairo path in `render` is used.
+    /// Opt-in GPU renderer (active only when `renderer = "gpu"` is set in
+    /// `config.toml` and an adapter is available); otherwise inert and the Cairo
+    /// path in `render` is used.
     #[cfg(feature = "gpu")]
     gpu: render_gpu::GpuState,
+    /// The renderer backend resolved from config, retained so the renderer can be
+    /// rebuilt (e.g. on a `ResetRenderer` effect) without re-reading config.
+    #[cfg(feature = "gpu")]
+    renderer: kmux_app::config::RendererKind,
 }
 
 /// Entry point for the interactive GTK frontend. Shares the CLI front door with
@@ -183,7 +188,9 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         metrics,
         css_provider,
         #[cfg(feature = "gpu")]
-        gpu: render_gpu::GpuState::new(&plan.appearance, &plan.theme),
+        gpu: render_gpu::GpuState::new(plan.renderer, &plan.appearance, &plan.theme),
+        #[cfg(feature = "gpu")]
+        renderer: plan.renderer,
     }));
 
     {
@@ -405,7 +412,8 @@ pub(crate) fn apply_effects(
                     #[cfg(feature = "gpu")]
                     {
                         let theme = f.core.palette.clone();
-                        f.gpu = render_gpu::GpuState::new(&appearance, &theme);
+                        let renderer = f.renderer;
+                        f.gpu = render_gpu::GpuState::new(renderer, &appearance, &theme);
                     }
                 }
                 tracing::info!(

@@ -25,10 +25,17 @@ by `hk` and installed by `mise install` (or `mise run setup`).
 
 ### Runtime switches (default off, opt-in)
 
-- `KMUX_RENDERER=wgpu` — GPU terminal renderer (default Cairo/CoreText).
+These are strictly-typed config/CLI, not environment variables.
+
+- `renderer = "gpu"` in `~/.config/kmux/config.toml` — GPU terminal renderer
+  (default `"cairo"`, i.e. Cairo/CoreText). Config-only on purpose: a kmux GUI
+  client is a singleton process, so a per-launch flag could not retarget the
+  already-running renderer. The render-debug overlay reports the *effective*
+  renderer (a GPU-init failure falls back to CPU).
   See [docs/architecture-render.md](docs/architecture-render.md).
-- `KMUX_SESSION_ISOLATION=process` — run each pane's VT pipeline in an isolated
-  `kmux-vt-worker` subprocess.
+- `kmuxd --session-isolation process` (or `[daemon] session_isolation = "process"`
+  in `kmuxd.toml`) — run each pane's VT pipeline in an isolated `kmux-vt-worker`
+  subprocess. End users set the config key, since the daemon is auto-spawned.
   See [docs/architecture-process-isolation.md](docs/architecture-process-isolation.md).
 
 ### Diagnostics

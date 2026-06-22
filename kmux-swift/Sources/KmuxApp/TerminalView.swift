@@ -45,14 +45,18 @@ final class TerminalNSView: NSView {
     private var lastReportedCells: (cols: UInt16, rows: UInt16)?
 
     #if KMUX_GPU
-        /// When `KMUX_RENDERER=wgpu`, the grid is drawn by the shared GPU renderer
-        /// (kmux-render, over the FFI) into a `CAMetalLayer` instead of CoreText.
-        /// The view, input, sizing, and pump are otherwise unchanged: `needsDisplay`
-        /// routes to `updateLayer()` (Metal) instead of `draw(_:)` (CoreText).
-        private let gpuActive =
-            ProcessInfo.processInfo.environment["KMUX_RENDERER"]?.lowercased() == "wgpu"
+        /// When `renderer = "gpu"` is set in `~/.config/kmux/config.toml`, the grid
+        /// is drawn by the shared GPU renderer (kmux-render, over the FFI) into a
+        /// `CAMetalLayer` instead of CoreText. The view, input, sizing, and pump are
+        /// otherwise unchanged: `needsDisplay` routes to `updateLayer()` (Metal)
+        /// instead of `draw(_:)` (CoreText). Resolved from config (not an env var or
+        /// flag) because a singleton app cannot honor a per-launch flag.
+        private let gpuActive = resolveRenderer() == "gpu"
         private var gpuRenderer: KmuxRenderer?
         private var gpuDrawable: (w: UInt32, h: UInt32)?
+        /// Set when Metal renderer construction fails, so the render-debug overlay
+        /// reports the *effective* state rather than the requested one.
+        private var gpuInitFailed = false
     #endif
 
     init(model: KmuxModel) {
@@ -125,7 +129,9 @@ final class TerminalNSView: NSView {
                     driver: model.driver, layerPtr: ptr, width: w, height: h, scale: Float(scale))
                 gpuDrawable = (w, h)
                 if gpuRenderer == nil {
-                    NSLog("kmux-render: GPU renderer init failed; KMUX_RENDERER=wgpu had no effect")
+                    gpuInitFailed = true
+                    NSLog(
+                        "kmux-render: GPU renderer init failed; renderer = \"gpu\" had no effect")
                 }
             }
             guard let renderer = gpuRenderer else { return }
@@ -151,10 +157,15 @@ final class TerminalNSView: NSView {
         needsDisplay = true
     }
 
-    /// The active renderer leaf, for the render-debug overlay.
+    /// The *effective* renderer leaf, for the render-debug overlay — the renderer
+    /// actually drawing, which can differ from the configured one when GPU init
+    /// fails. The source of truth is live view state, not the config value.
     var activeRendererName: String {
         #if KMUX_GPU
-            return gpuActive ? "wgpu" : "coretext"
+            if gpuActive {
+                return gpuInitFailed ? "wgpu (init failed)" : "wgpu"
+            }
+            return "coretext"
         #else
             return "coretext"
         #endif

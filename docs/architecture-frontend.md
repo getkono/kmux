@@ -516,8 +516,8 @@ picker-query surface.
   follow-up. CLI subcommands (`daemon`/`ls`/`--dry-run`) already work via `kmux`.
 - **Shared GPU renderer (`kmux-render`).** The cell-grid render leaf is now also
   available as one cross-platform wgpu renderer both frontends drive (GTK
-  directly, Swift via `kmux-ffi`/`CAMetalLayer`), opt-in with `KMUX_RENDERER=wgpu`
-  (issue #132). The CPU renderers below remain the default; flipping the default
+  directly, Swift via `kmux-ffi`/`CAMetalLayer`), opt-in with `renderer = "gpu"`
+  in `config.toml` (issue #132). The CPU renderers below remain the default; flipping the default
   and removing them are follow-ups. See [architecture-render.md](architecture-render.md).
 - **Native macOS polish.** The `kmux-swift` app (see the section above) is
   functional and at feature parity with `kmux-gtk`. Remaining polish: same-attr

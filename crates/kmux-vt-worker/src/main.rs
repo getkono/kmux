@@ -1,6 +1,6 @@
 //! Isolated per-pane VT worker (issue #126).
 //!
-//! kmuxd spawns one of these per pane when `KMUX_SESSION_ISOLATION=process`. The
+//! kmuxd spawns one of these per pane when `session_isolation = "process"`. The
 //! daemon owns the PTY but hands this worker a `dup` of the master fd over a
 //! socketpair (`SCM_RIGHTS`); the worker runs the crash-prone libghostty-vt
 //! pipeline — the *only* `unsafe`/FFI surface in the VT path — out-of-process.

@@ -100,6 +100,13 @@ struct Cli {
     /// back to the normal on-disk snapshot restore.
     #[arg(long)]
     handoff: bool,
+
+    /// Pane VT isolation mode. Overrides `[daemon] session_isolation` in
+    /// kmuxd.toml when set. `in-process` (default) keeps the emulator in the
+    /// daemon; `process` runs each pane's VT pipeline in an isolated
+    /// `kmux-vt-worker` subprocess (issue #126).
+    #[arg(long, value_enum)]
+    session_isolation: Option<config::SessionIsolationMode>,
 }
 
 #[derive(clap::Subcommand, Debug)]
@@ -220,6 +227,10 @@ fn main() -> anyhow::Result<()> {
     }
     if let Some(key) = cli.key {
         cfg_file.tls.key = Some(key);
+    }
+    // The `--session-isolation` flag (issue #126) overrides the `[daemon]` key.
+    if let Some(mode) = cli.session_isolation {
+        cfg_file.daemon.session_isolation = mode;
     }
     // Apply bind/port overrides only when the user explicitly passed the
     // corresponding flag. Previously these were eager-defaulted on the CLI

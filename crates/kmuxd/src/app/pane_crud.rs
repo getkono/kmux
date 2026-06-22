@@ -156,7 +156,7 @@ impl ServerApp {
         // subprocess. Any failure falls back to the in-process engine, which is
         // always safe.
         let mut engine = None;
-        if crate::engine::process_isolation_enabled() {
+        if self.session_isolation.is_process() {
             match self
                 .try_spawn_worker_engine(
                     pane_id,

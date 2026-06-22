@@ -1223,8 +1223,11 @@ fn update_render_debug(overlay: &GtkBox, shell: &Rc<Shell>, fe: &Rc<RefCell<Fron
     let frame_h = shell.drawing.height().max(0) as u32;
     let scale = shell.drawing.scale_factor() as f32;
 
+    // The *effective* renderer (live state), not the configured one: a GPU-init
+    // failure falls back to Cairo, and the overlay must reflect what is actually
+    // drawing this frame.
     #[cfg(feature = "gpu")]
-    let renderer = if f.gpu.enabled() { "wgpu" } else { "cairo" };
+    let renderer = f.gpu.active_renderer_name();
     #[cfg(not(feature = "gpu"))]
     let renderer = "cairo";
 

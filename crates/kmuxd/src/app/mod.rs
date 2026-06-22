@@ -438,6 +438,9 @@ pub struct ServerApp {
     pub auth_token: String,
     /// Wire compression policy applied to server→client traffic.
     pub compression: crate::config::CompressionConfig,
+    /// Pane VT-pipeline isolation mode (issue #126), resolved from `kmuxd.toml` /
+    /// the `--session-isolation` flag.
+    pub session_isolation: crate::config::SessionIsolationMode,
     /// Map of word_id -> SessionState.
     pub(super) sessions: RwLock<HashMap<kmux_protocol::messages::WordId, SessionState>>,
     /// Monotonic session creation counter.
@@ -488,6 +491,7 @@ impl ServerApp {
             manager: Arc::new(PtyRegistry::new()),
             auth_token: token,
             compression: crate::config::CompressionConfig::default(),
+            session_isolation: crate::config::SessionIsolationMode::default(),
             sessions: RwLock::new(HashMap::new()),
             session_index_counter: AtomicU32::new(0),
             next_client_id: AtomicU64::new(1),
@@ -515,6 +519,13 @@ impl ServerApp {
     /// `startup.rs` can configure it before wrapping the app in an `Arc`.
     pub fn with_compression(mut self, compression: crate::config::CompressionConfig) -> Self {
         self.compression = compression;
+        self
+    }
+
+    /// Set the pane isolation mode (from `kmuxd.toml` / `--session-isolation`).
+    /// Builder-style, like [`with_compression`](Self::with_compression).
+    pub fn with_session_isolation(mut self, mode: crate::config::SessionIsolationMode) -> Self {
+        self.session_isolation = mode;
         self
     }
 
