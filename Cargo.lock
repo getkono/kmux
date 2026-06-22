@@ -1506,7 +1506,6 @@ dependencies = [
  "kmux-protocol",
  "nix",
  "quinn",
- "rand 0.10.1",
  "rustls",
  "serde",
  "serde_json",
