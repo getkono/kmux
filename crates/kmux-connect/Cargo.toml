@@ -6,7 +6,7 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Connection & protocol-negotiation mechanism for kmux clients: bootstrap strategies, transports (QUIC/TCP+TLS/UDS/SSH), transport supervision, and local daemon lifecycle."
+description = "Connection & protocol-negotiation mechanism for kmux clients: transports (QUIC/TCP+TLS/UDS/SSH), transport supervision, and local daemon lifecycle."
 
 [features]
 default = ["remote"]
@@ -34,7 +34,6 @@ remote = [
 kmux-protocol = { workspace = true, features = ["uds"] }
 anyhow.workspace = true
 futures.workspace = true
-rand.workspace = true
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true

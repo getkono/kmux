@@ -5,7 +5,6 @@
 //! UI and the manager drifting out of sync. Transitions are driven by:
 //!
 //! - `SessionManager` (auth handshake, drop, transport swap),
-//! - `recovery::Recovery` (handshaking → connected | disconnected),
 //! - `liveness::Liveness` (timeout → disconnected).
 //!
 //! No transport-specific or OS-level signals influence this state — only
@@ -25,8 +24,8 @@ pub enum ConnectionState {
     Handshaking,
     /// Authenticated and carrying traffic on `transport`.
     Connected { transport: TransportKind },
-    /// A drop has happened and `recovery` is actively re-running
-    /// `bootstrap_race`. `attempt` starts at 1.
+    /// A drop has happened and the client is actively re-running the bootstrap.
+    /// `attempt` starts at 1.
     Reconnecting { attempt: u32 },
     /// Dropped and waiting for the user to confirm a reconnect.
     Disconnected { reason: DisconnectReason },
