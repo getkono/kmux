@@ -58,10 +58,28 @@ pub struct ClientSender {
     /// client keeps counting toward the effective pane size; on resume the
     /// client re-attaches and the daemon reconciles to the final state.
     pub paused: bool,
+    /// When `paused`, whether the pause is the *background auto-pause* (`true`)
+    /// rather than an explicit manual pause (`false`). An auto-paused client
+    /// keeps streaming any pane it has marked `no_auto_pause`; a manual pause
+    /// skips every pane regardless (issue #68). Meaningless when `!paused`.
+    pub pause_auto: bool,
+    /// When true, this pane is exempt from *auto*-pause for this client: it keeps
+    /// streaming while the connection is auto-paused, but a manual pause still
+    /// stops it (issue #68). The client re-asserts this after each `Attach`.
+    pub no_auto_pause: bool,
     /// Rendering capabilities declared by this client at Auth time.
     pub capabilities: ClientCapabilities,
     /// Terminal size reported by this client at attach time (updated on `Resize`).
     pub size: TermSize,
+}
+
+impl ClientSender {
+    /// Whether terminal-output frames for *this* pane should be withheld from
+    /// this client (issue #68). A manual pause withholds every pane; an
+    /// auto-pause withholds all but panes the client marked `no_auto_pause`.
+    pub fn output_paused(&self) -> bool {
+        self.paused && !(self.pause_auto && self.no_auto_pause)
+    }
 }
 
 /// Shared map of per-client output senders for a single pane.
@@ -304,7 +322,8 @@ impl PaneRelay {
         for sender in map.values() {
             // Paused clients (issue #68) get no resize snapshot; the fresh
             // snapshot they pull on resume already reflects the final size.
-            if sender.paused {
+            // Auto-pause-exempt panes keep streaming, so they still get resizes.
+            if sender.output_paused() {
                 continue;
             }
             let _ = sender.ctrl_tx.send(event_msg.clone());
@@ -912,6 +931,8 @@ mod tests {
             ctrl_tx,
             force_full_snapshot: false,
             paused: false,
+            pause_auto: false,
+            no_auto_pause: false,
             capabilities: ClientCapabilities::default(),
             size: TermSize {
                 rows,
@@ -1047,6 +1068,8 @@ mod tests {
                 ctrl_tx,
                 force_full_snapshot: false,
                 paused: false,
+                pause_auto: false,
+                no_auto_pause: false,
                 capabilities: ClientCapabilities::default(),
                 size: TermSize {
                     rows: 40,
@@ -1149,6 +1172,8 @@ mod tests {
                 ctrl_tx,
                 force_full_snapshot: false,
                 paused: true,
+                pause_auto: false,
+                no_auto_pause: false,
                 // Larger than relay.size so apply_effective_size would change.
                 capabilities: ClientCapabilities::default(),
                 size: TermSize {
@@ -1290,18 +1315,55 @@ mod tests {
         let client_id = ClientId(1);
         app.attach(attach_params(client_id, None)).await.unwrap();
 
-        app.set_paused(client_id, true).await;
+        app.set_paused(client_id, true, true).await;
         {
             let sessions = app.sessions.read().await;
             let map = sessions["eagle"].panes[&0].clients.lock().unwrap();
-            assert!(map.get(&client_id).unwrap().paused);
+            let sender = map.get(&client_id).unwrap();
+            assert!(sender.paused);
+            assert!(
+                sender.pause_auto,
+                "the reason (auto) is recorded for the relay"
+            );
         }
 
-        app.set_paused(client_id, false).await;
+        app.set_paused(client_id, false, false).await;
         {
             let sessions = app.sessions.read().await;
             let map = sessions["eagle"].panes[&0].clients.lock().unwrap();
             assert!(!map.get(&client_id).unwrap().paused);
+        }
+    }
+
+    #[tokio::test]
+    async fn auto_pause_exempt_pane_keeps_streaming_until_manual() {
+        let app = app_with_one_pane("eagle").await;
+        let client_id = ClientId(1);
+        app.attach(attach_params(client_id, None)).await.unwrap();
+        app.set_pane_no_auto_pause(client_id, "eagle/0", true).await;
+
+        // Auto-pause: an exempt pane is NOT output-paused.
+        app.set_paused(client_id, true, true).await;
+        {
+            let sessions = app.sessions.read().await;
+            let map = sessions["eagle"].panes[&0].clients.lock().unwrap();
+            let sender = map.get(&client_id).unwrap();
+            assert!(sender.no_auto_pause);
+            assert!(
+                !sender.output_paused(),
+                "exempt pane streams through a background auto-pause"
+            );
+        }
+
+        // Manual pause overrides the exemption.
+        app.set_paused(client_id, true, false).await;
+        {
+            let sessions = app.sessions.read().await;
+            let map = sessions["eagle"].panes[&0].clients.lock().unwrap();
+            assert!(
+                map.get(&client_id).unwrap().output_paused(),
+                "a manual pause withholds even an exempt pane"
+            );
         }
     }
 
@@ -1313,7 +1375,7 @@ mod tests {
 
         app.attach(attach_params(client_id, None)).await.unwrap();
         app.set_snapshot_mode(client_id, true).await;
-        app.set_paused(client_id, true).await;
+        app.set_paused(client_id, true, false).await;
 
         // Resume: client re-attaches the pane with its last seqno.
         app.attach(attach_params(client_id, Some(SequenceNo(1))))

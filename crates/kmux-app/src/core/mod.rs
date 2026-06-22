@@ -530,29 +530,90 @@ impl AppCore {
         }
     }
 
-    /// Apply the effective pause state to the connection when it changed,
-    /// re-attaching panes on resume (see [`SessionManager::set_paused`]).
-    fn reconcile_pause(&mut self, was_paused: bool) {
-        let now_paused = self.is_paused();
-        if now_paused != was_paused {
-            self.mgr.set_paused(now_paused);
+    /// Whether terminal output for `pane_id` is currently withheld (issue #68):
+    /// a manual pause withholds every pane; a background auto-pause withholds all
+    /// but panes marked exempt. Drives the per-pane + per-tab pause indicators.
+    pub fn is_pane_paused(&self, pane_id: &str) -> bool {
+        self.manual_pause || (self.auto_pause && !self.mgr.is_pane_auto_pause_exempt(pane_id))
+    }
+
+    /// The pause reason as it applies to a single pane (per-pane chrome).
+    pub fn pane_pause_reason(&self, pane_id: &str) -> PauseReason {
+        if self.manual_pause {
+            PauseReason::Manual
+        } else if self.auto_pause && !self.mgr.is_pane_auto_pause_exempt(pane_id) {
+            PauseReason::Auto
+        } else {
+            PauseReason::None
         }
+    }
+
+    /// Whether `pane_id` is marked exempt from auto-pause at the *pane* level
+    /// (drives the pane menu's checkmark; issue #68).
+    pub fn pane_no_auto_pause(&self, pane_id: &str) -> bool {
+        self.mgr.pane_marked_auto_pause_exempt(pane_id)
+    }
+
+    /// Whether `word_id` is marked exempt from auto-pause at the *session* level
+    /// (session/tab menu checkmark; issue #68).
+    pub fn session_no_auto_pause(&self, word_id: &str) -> bool {
+        self.mgr.session_marked_auto_pause_exempt(word_id)
+    }
+
+    /// Reconcile the effective pause state (and per-pane exemptions) with the
+    /// connection. Idempotent — the session manager sends `SetPaused` only on
+    /// change and re-attaches exactly the panes that resume streaming.
+    fn reconcile_pause(&mut self) {
+        let paused = self.is_paused();
+        let auto = matches!(self.pause_reason(), PauseReason::Auto);
+        self.mgr.reconcile_pause(paused, auto);
     }
 
     /// Flip the manual pause toggle (the `TogglePause` action). A manual pause
     /// persists across window focus changes.
     pub fn toggle_manual_pause(&mut self) {
-        let was = self.is_paused();
         self.manual_pause = !self.manual_pause;
-        self.reconcile_pause(was);
+        self.reconcile_pause();
     }
 
     /// Set the auto-pause flag (driven by window background/foreground, with a
     /// debounce in the driver). Independent of the manual toggle.
     pub fn set_auto_pause(&mut self, on: bool) {
-        let was = self.is_paused();
+        if self.auto_pause == on {
+            return;
+        }
         self.auto_pause = on;
-        self.reconcile_pause(was);
+        self.reconcile_pause();
+    }
+
+    /// Toggle `pane_id`'s exemption from auto-pause (issue #68): an exempt pane
+    /// keeps streaming through a background auto-pause.
+    pub fn toggle_pane_no_auto_pause(&mut self, pane_id: &str) {
+        self.mgr.toggle_pane_auto_pause_exempt(pane_id);
+        self.reconcile_pause();
+    }
+
+    /// Toggle the *focused* pane's exemption from auto-pause (the menu/keyboard
+    /// action). No-op without a focused pane.
+    pub fn toggle_focused_pane_no_auto_pause(&mut self) {
+        if let Some(pane_id) = self.mgr.active_pane.clone() {
+            self.toggle_pane_no_auto_pause(&pane_id);
+        }
+    }
+
+    /// Toggle a whole session's exemption from auto-pause (issue #68); every pane
+    /// in the session inherits it.
+    pub fn toggle_session_no_auto_pause(&mut self, word_id: &str) {
+        self.mgr.toggle_session_auto_pause_exempt(word_id);
+        self.reconcile_pause();
+    }
+
+    /// Toggle the *active* session's exemption from auto-pause (the menu action).
+    /// No-op without an active session.
+    pub fn toggle_active_session_no_auto_pause(&mut self) {
+        if let Some(word_id) = self.mgr.active_session.clone() {
+            self.toggle_session_no_auto_pause(&word_id);
+        }
     }
 
     // ── Performance counters (issue #61) ──────────────────────────────────────
@@ -724,6 +785,33 @@ mod tests {
         core.toggle_manual_pause();
         assert!(!core.is_paused());
         assert_eq!(core.pause_reason(), PauseReason::None);
+    }
+
+    /// Per-pane pause indicators honor an auto-pause exemption, but a manual
+    /// pause overrides it (issue #68).
+    #[test]
+    fn per_pane_pause_respects_auto_pause_exemption() {
+        let mut core = new_local_core();
+        core.toggle_pane_no_auto_pause("w/0");
+        assert!(core.pane_no_auto_pause("w/0"));
+
+        // Auto-pause: the exempt pane keeps streaming; its siblings are paused.
+        core.set_auto_pause(true);
+        assert!(
+            !core.is_pane_paused("w/0"),
+            "exempt pane streams under auto-pause"
+        );
+        assert_eq!(core.pane_pause_reason("w/0"), PauseReason::None);
+        assert!(core.is_pane_paused("w/1"), "non-exempt pane is auto-paused");
+        assert_eq!(core.pane_pause_reason("w/1"), PauseReason::Auto);
+
+        // Manual pause overrides the exemption: every pane is paused.
+        core.toggle_manual_pause();
+        assert!(
+            core.is_pane_paused("w/0"),
+            "manual pause overrides the exemption"
+        );
+        assert_eq!(core.pane_pause_reason("w/0"), PauseReason::Manual);
     }
 
     /// FPS counts only real content repaints — a HUD-only self-refresh

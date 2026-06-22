@@ -149,7 +149,9 @@ impl ServerApp {
             sent_at_ms: epoch_millis(),
         };
         for sender in relay.clients.lock().unwrap().values() {
-            if !sender.paused {
+            // A paused client skips the post-respawn snapshot and resyncs on
+            // resume; an auto-pause-exempt pane still streams, so it gets it.
+            if !sender.output_paused() {
                 let _ = sender.data_tx.try_send(msg.clone());
             }
         }

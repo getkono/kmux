@@ -232,7 +232,25 @@ pub enum ClientMessage {
     /// coalesced delta or a single snapshot), so catch-up is instant regardless
     /// of how long the connection was paused. Connection-level, like
     /// [`Self::SetSnapshotMode`].
-    SetPaused { paused: bool },
+    ///
+    /// `auto` distinguishes the *reason*: `true` is the debounced background
+    /// auto-pause (eligible for per-pane exemption — see
+    /// [`Self::SetPaneNoAutoPause`]), `false` is an explicit manual pause (which
+    /// pauses every pane, exemptions included). When both sources are active the
+    /// client sends `auto: false`, since a manual pause wins. Ignored when
+    /// `paused` is `false`.
+    SetPaused { paused: bool, auto: bool },
+
+    /// Exempt a single pane from this connection's *auto*-pause (issue #68).
+    ///
+    /// When `exempt` is `true`, the daemon keeps streaming this pane to this
+    /// client even while the connection is auto-paused (`SetPaused { auto: true
+    /// }`) — e.g. a long-running build the user wants to keep watching after
+    /// tabbing away. A *manual* pause still stops it. The exemption is a
+    /// per-client preference and is **not** persisted across a re-attach: the
+    /// client re-asserts it after each `Attach`. Session-level exemption is a
+    /// client-side grouping that expands to one `SetPaneNoAutoPause` per pane.
+    SetPaneNoAutoPause { pane_id: PaneId, exempt: bool },
 
     /// Ask the daemon for a range of scrollback lines starting at the given
     /// absolute index. Used to fill gaps (missed `ScrollbackAppend` frames)
@@ -311,6 +329,7 @@ impl ClientMessage {
             | Self::ReleaseInputLock { .. }
             | Self::SetSnapshotMode { .. }
             | Self::SetPaused { .. }
+            | Self::SetPaneNoAutoPause { .. }
             | Self::ListDirectory { .. }
             | Self::OpenPeer { .. }
             | Self::ClosePeer { .. } => MessageCategory::Control,
@@ -591,7 +610,17 @@ mod tests {
                 MessageCategory::Control,
             ),
             (
-                ClientMessage::SetPaused { paused: true },
+                ClientMessage::SetPaused {
+                    paused: true,
+                    auto: false,
+                },
+                MessageCategory::Control,
+            ),
+            (
+                ClientMessage::SetPaneNoAutoPause {
+                    pane_id: "p".into(),
+                    exempt: true,
+                },
                 MessageCategory::Control,
             ),
             (
@@ -712,12 +741,39 @@ mod tests {
 
     #[test]
     fn set_paused_roundtrips() {
-        for paused in [true, false] {
-            let msg = ClientMessage::SetPaused { paused };
+        for (paused, auto) in [(true, false), (true, true), (false, false)] {
+            let msg = ClientMessage::SetPaused { paused, auto };
             let bytes = crate::encode_client(&msg).unwrap();
             match crate::decode_client(&bytes).unwrap() {
-                ClientMessage::SetPaused { paused: got } => assert_eq!(got, paused),
+                ClientMessage::SetPaused {
+                    paused: gp,
+                    auto: ga,
+                } => {
+                    assert_eq!(gp, paused);
+                    assert_eq!(ga, auto);
+                }
                 other => panic!("expected SetPaused, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn set_pane_no_auto_pause_roundtrips() {
+        for exempt in [true, false] {
+            let msg = ClientMessage::SetPaneNoAutoPause {
+                pane_id: "w/0".into(),
+                exempt,
+            };
+            let bytes = crate::encode_client(&msg).unwrap();
+            match crate::decode_client(&bytes).unwrap() {
+                ClientMessage::SetPaneNoAutoPause {
+                    pane_id,
+                    exempt: got,
+                } => {
+                    assert_eq!(pane_id, "w/0");
+                    assert_eq!(got, exempt);
+                }
+                other => panic!("expected SetPaneNoAutoPause, got {other:?}"),
             }
         }
     }

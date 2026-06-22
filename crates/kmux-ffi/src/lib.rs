@@ -81,7 +81,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 17;
+pub const KMUX_FFI_ABI_VERSION: u32 = 18;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -235,6 +235,11 @@ pub enum FfiAction {
     ToggleInputLock,
     /// Toggle connection pause to save bandwidth (issue #68).
     TogglePause,
+    /// Toggle the focused pane's exemption from *auto*-pause (issue #68): it
+    /// keeps streaming when the window is backgrounded.
+    ToggleFocusedPaneNoAutoPause,
+    /// Toggle the active session's exemption from auto-pause (issue #68).
+    ToggleActiveSessionNoAutoPause,
     CopySelection,
     Paste,
     Quit,
@@ -283,6 +288,8 @@ impl From<FfiAction> for Action {
             FfiAction::ResetRenderer => Action::ResetRenderer,
             FfiAction::ToggleInputLock => Action::ToggleInputLock,
             FfiAction::TogglePause => Action::TogglePause,
+            FfiAction::ToggleFocusedPaneNoAutoPause => Action::ToggleFocusedPaneNoAutoPause,
+            FfiAction::ToggleActiveSessionNoAutoPause => Action::ToggleActiveSessionNoAutoPause,
             FfiAction::CopySelection => Action::CopySelection,
             FfiAction::Paste => Action::Paste,
             FfiAction::Quit => Action::Quit,
@@ -765,6 +772,9 @@ pub struct FfiTab {
     pub tab_index: u32,
     pub name: String,
     pub active: bool,
+    /// Whether any pane of this tab is currently paused (issue #68); drives the
+    /// tab strip's pause marker.
+    pub paused: bool,
 }
 
 /// Tab name, falling back to its 1-based index (mirrors the client's
@@ -860,6 +870,12 @@ pub struct FfiPaneRect {
     pub progress_state: FfiProgressState,
     /// Progress percentage `0..=100`, or `None` for value-less states.
     pub progress: Option<u8>,
+    /// Whether terminal output for this pane is currently withheld by a
+    /// connection pause (issue #68) — drives the per-pane "Paused" badge.
+    pub paused: bool,
+    /// Whether this pane is marked exempt from *auto*-pause (keeps streaming when
+    /// the window is backgrounded); drives the pane menu's checkmark (issue #68).
+    pub no_auto_pause: bool,
 }
 
 /// A per-pane resolved size the frontend pushes down via
@@ -1545,6 +1561,37 @@ impl KmuxDriver {
             .into()
     }
 
+    /// Toggle a pane's exemption from *auto*-pause (issue #68): it keeps
+    /// streaming when the window is backgrounded. Drives the pane context-menu
+    /// toggle (a manual pause still pauses it).
+    pub fn toggle_pane_no_auto_pause(&self, pane_id: String) -> Vec<FfiEffect> {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.toggle_pane_no_auto_pause(&pane_id);
+        core.needs_render = true;
+        vec![FfiEffect::NeedsRender]
+    }
+
+    /// Toggle a whole session's exemption from auto-pause (issue #68); every
+    /// pane in the session inherits it. Drives the session context-menu toggle.
+    pub fn toggle_session_no_auto_pause(&self, word_id: String) -> Vec<FfiEffect> {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        let core = d.core_mut();
+        core.toggle_session_no_auto_pause(&word_id);
+        core.needs_render = true;
+        vec![FfiEffect::NeedsRender]
+    }
+
+    /// Whether `word_id` is marked exempt from auto-pause at the session level
+    /// (session menu checkmark; issue #68).
+    pub fn session_no_auto_pause(&self, word_id: String) -> bool {
+        self.inner
+            .lock()
+            .expect("driver mutex poisoned")
+            .core()
+            .session_no_auto_pause(&word_id)
+    }
+
     /// Cheap grid identity for change detection (`None` if no active pane).
     pub fn grid_info(&self) -> Option<GridInfo> {
         let d = self.inner.lock().expect("driver mutex poisoned");
@@ -1677,13 +1724,27 @@ impl KmuxDriver {
     pub fn tabs(&self) -> Vec<FfiTab> {
         let d = self.inner.lock().expect("driver mutex poisoned");
         let active = d.mgr.active_tab();
+        let word = d
+            .mgr
+            .active_session()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         d.mgr
             .active_session_tabs()
             .iter()
-            .map(|t| FfiTab {
-                tab_index: t.tab_index,
-                name: tab_label(t.tab_index, &t.name),
-                active: active == Some(t.tab_index),
+            .map(|t| {
+                // A tab is paused if any of its panes is paused (issue #68).
+                let paused = t
+                    .layout
+                    .leaves()
+                    .iter()
+                    .any(|idx| d.core().is_pane_paused(&format_pane_id(&word, *idx)));
+                FfiTab {
+                    tab_index: t.tab_index,
+                    name: tab_label(t.tab_index, &t.name),
+                    active: active == Some(t.tab_index),
+                    paused,
+                }
             })
             .collect()
     }
@@ -1739,6 +1800,8 @@ impl KmuxDriver {
                 .pane_info(&pane_id)
                 .map(|p| (p.progress_state.into(), p.progress))
                 .unwrap_or((FfiProgressState::Remove, None));
+            let paused = d.core().is_pane_paused(&pane_id);
+            let no_auto_pause = d.core().pane_no_auto_pause(&pane_id);
             FfiPaneRect {
                 pane_id,
                 pane_index: r.pane_index,
@@ -1749,6 +1812,8 @@ impl KmuxDriver {
                 focused: focused == Some(r.pane_index),
                 progress_state,
                 progress,
+                paused,
+                no_auto_pause,
             }
         })
         .collect()
@@ -2879,6 +2944,14 @@ mod tests {
         assert!(matches!(
             Action::from(FfiAction::TogglePause),
             Action::TogglePause
+        ));
+        assert!(matches!(
+            Action::from(FfiAction::ToggleFocusedPaneNoAutoPause),
+            Action::ToggleFocusedPaneNoAutoPause
+        ));
+        assert!(matches!(
+            Action::from(FfiAction::ToggleActiveSessionNoAutoPause),
+            Action::ToggleActiveSessionNoAutoPause
         ));
     }
 
