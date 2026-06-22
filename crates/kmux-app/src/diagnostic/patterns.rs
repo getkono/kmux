@@ -84,8 +84,19 @@ fn glyphs(out: &mut String) {
     out.push_str("Braille:  ");
     out.push_str("⠁⠉⠋⠛⠟⠿⡿⣿⣷⣯⣟⡿⢿⣻⣽⣾\n");
 
-    out.push_str("Powerline (may tofu without a patched font):  ");
-    out.push_str("\u{e0b0}\u{e0b1}\u{e0b2}\u{e0b3}  \u{e0a0}\u{e0a1}\u{e0a2}\n");
+    // Powerline + Nerd Font glyphs. These live in the Private Use Area and the
+    // default `monospace` font lacks them; kmux bundles a symbol fallback font so
+    // they render solid rather than as tofu/blank on every renderer (issue #145).
+    out.push_str("Powerline separators:  ");
+    out.push_str(
+        "\u{e0b0}\u{e0b1}\u{e0b2}\u{e0b3}\u{e0b4}\u{e0b5}\u{e0b6}\u{e0b7}\u{e0ba}\u{e0bc}\u{e0be}  \
+         \u{e0a0}\u{e0a1}\u{e0a2}\u{e0a3}\n",
+    );
+
+    out.push_str("Nerd Font icons:  ");
+    out.push_str(
+        "\u{f015}\u{f07b}\u{f07c}\u{e5fb}\u{f02b}\u{f09b}\u{f013}\u{f0e7}\u{f071}\u{f021}\u{e702}\u{e706}\n",
+    );
 }
 
 // ── attrs ─────────────────────────────────────────────────────────────────
