@@ -82,17 +82,11 @@ pub async fn connect(
     };
 
     // Authenticate immediately
-    let auth_bytes = match encode_client(&ClientMessage::Auth {
-        token,
-        protocol_version: kmux_protocol::messages::PROTOCOL_VERSION,
-        capabilities,
-        connection_id,
-    }) {
-        Ok(bytes) => bytes,
-        Err(e) => return ConnectResult::Failed(format!("auth encode failed: {e}")),
-    };
-    if let Err(e) = write_frame(&mut ctrl_send, &auth_bytes).await {
-        return ConnectResult::Failed(format!("auth write failed: {e}"));
+    if let Err(e) =
+        crate::tcp_connect::send_auth_frame(&mut ctrl_send, token, capabilities, connection_id)
+            .await
+    {
+        return ConnectResult::Failed(e);
     }
 
     let (client_tx, mut client_rx) = mpsc::unbounded_channel::<ClientMessage>();

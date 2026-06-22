@@ -2,10 +2,10 @@
 //!
 //! Holds the per-connection client state (session list, per-pane [`grid::CellGrid`]
 //! buffers, [`liveness`], [`metrics`]) and the toolkit-agnostic pieces a frontend
-//! reads to render. The connection/negotiation *mechanism* (bootstrap strategies,
-//! transports, daemon lifecycle) was extracted into `kmux-connect` (issue #121) so
-//! it can be shared with `kmuxd`'s federation role; it is re-exported here under
-//! the original paths so existing `kmux_client::{...}` consumers — and internal
+//! reads to render. The connection/negotiation *mechanism* (transports, daemon
+//! lifecycle) was extracted into `kmux-connect` (issue #121) so it can be shared
+//! with `kmuxd`'s federation role; it is re-exported here under the original
+//! paths so existing `kmux_client::{...}` consumers — and internal
 //! `crate::{pipeline,supervisor,…}` references — keep resolving unchanged.
 
 pub mod connection_log;
@@ -19,9 +19,7 @@ pub mod metrics;
 pub mod session_manager;
 pub mod transport;
 
-pub use kmux_connect::{
-    bootstrap, connect, daemon, hosts, pipeline, recovery, ssh, supervisor, tcp_connect, token,
-};
+pub use kmux_connect::{connect, daemon, hosts, pipeline, ssh, supervisor, tcp_connect, token};
 
 use rand::Rng;
 
