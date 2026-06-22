@@ -203,13 +203,24 @@ extension TerminalNSView {
     /// Right-click context menu on a pane: focus the pane under the pointer (so
     /// the items target it) and offer the same actions as the Pane menu.
     override func menu(for event: NSEvent) -> NSMenu? {
-        if let pid = paneIdAt(event), pid != model.focusedPaneId {
+        let pid = paneIdAt(event)
+        if let pid, pid != model.focusedPaneId {
             model.focusPane(pid)
         }
         let menu = NSMenu()
         menu.addItem(paneMenuItem("Split Right", .splitRight))
         menu.addItem(paneMenuItem("Split Down", .splitDown))
         menu.addItem(paneMenuItem("Zoom Pane", .toggleZoom))
+        menu.addItem(.separator())
+        // Keep this pane streaming through a background auto-pause (issue #68);
+        // the menu has already focused the pane under the pointer, so the
+        // focused-pane action targets it. Checkmark shows the current state.
+        let keepStreaming = paneMenuItem(
+            "Keep Streaming in Background", .toggleFocusedPaneNoAutoPause)
+        if let pid, let rect = model.layout.first(where: { $0.paneId == pid }) {
+            keepStreaming.state = rect.noAutoPause ? .on : .off
+        }
+        menu.addItem(keepStreaming)
         menu.addItem(.separator())
         menu.addItem(paneMenuItem("Close Pane", .closePane))
         return menu
