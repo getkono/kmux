@@ -81,13 +81,24 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 17;
+pub const KMUX_FFI_ABI_VERSION: u32 = 18;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
 #[uniffi::export]
 pub fn kmux_ffi_abi_version() -> u32 {
     KMUX_FFI_ABI_VERSION
+}
+
+/// The terminal renderer backend resolved from `~/.config/kmux/config.toml`
+/// (`"cairo"` or `"gpu"`), as a stable lowercase token. The Swift frontend calls
+/// this once at startup to decide whether to build the Metal path — the renderer
+/// is config-only (not a CLI flag) because a singleton GUI client cannot honor a
+/// per-launch flag. The render-debug overlay still reports the *effective*
+/// renderer from live state (a GPU-init failure falls back to CoreText).
+#[uniffi::export]
+pub fn resolve_renderer() -> String {
+    config::resolve_renderer().as_str().to_string()
 }
 
 /// The kmux-render API version this crate was written against. A compile-time
