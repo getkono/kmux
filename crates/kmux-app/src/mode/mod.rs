@@ -2,7 +2,7 @@ mod hints;
 mod resolve;
 
 pub use hints::*;
-pub use resolve::*;
+pub(crate) use resolve::*;
 
 use kmux_client::key::{Key, Modifiers};
 

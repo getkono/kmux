@@ -9,7 +9,7 @@ fn is_ctrl_c(key: &Key, mods: Modifiers) -> bool {
     mods.contains(Modifiers::CTRL) && matches!(key, Key::Character(c) if c == "c")
 }
 
-pub fn resolve_normal(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_normal(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     if is_mode_key(key, mods) {
         return (Some(Mode::Select), Action::None);
     }
@@ -47,7 +47,7 @@ pub fn resolve_normal(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     (None, Action::ForwardKey)
 }
 
-pub fn resolve_locked(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_locked(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     if is_mode_key(key, mods) {
         return (Some(Mode::Normal), Action::None);
     }
@@ -55,7 +55,7 @@ pub fn resolve_locked(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     (None, Action::ForwardKey)
 }
 
-pub fn resolve_mode_select(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_mode_select(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     // Command palette: bare `/` (or Ctrl+/ which kitty/Ghostty deliver as the
     // same `Char('/')`) or the legacy `\x1f` byte some terminals emit for
     // Ctrl+/. Either form lands here regardless of the CTRL modifier.
@@ -85,7 +85,7 @@ pub fn resolve_mode_select(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action
     }
 }
 
-pub fn resolve_session(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_session(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     match key {
         Key::Character(c) => match c.as_str() {
             "c" => (Some(Mode::Normal), Action::CreateSession),
@@ -122,7 +122,7 @@ pub fn resolve_session(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     }
 }
 
-pub fn resolve_scroll(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_scroll(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     match key {
         Key::Named(NamedKey::ArrowUp) => (None, Action::ScrollUp(1)),
         Key::Named(NamedKey::ArrowDown) => (None, Action::ScrollDown(1)),
@@ -134,7 +134,7 @@ pub fn resolve_scroll(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     }
 }
 
-pub fn resolve_signal(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_signal(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     match key {
         Key::Character(c) => {
             let action = match signal_from_key(c.as_str()) {
@@ -148,7 +148,7 @@ pub fn resolve_signal(key: &Key, _mods: Modifiers) -> (Option<Mode>, Action) {
     }
 }
 
-pub fn resolve_confirm_close(key: &Key) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_confirm_close(key: &Key) -> (Option<Mode>, Action) {
     match key {
         // Return None for mode: the action handler owns the transition so it
         // can extract word_id via mem::replace before setting Mode::Normal.
@@ -159,7 +159,7 @@ pub fn resolve_confirm_close(key: &Key) -> (Option<Mode>, Action) {
 
 /// Keys accepted while disconnected. Everything else is dropped (so pane
 /// input is effectively frozen) and the overlay stays up.
-pub fn resolve_disconnected(key: &Key) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_disconnected(key: &Key) -> (Option<Mode>, Action) {
     match key {
         Key::Character(c) if c == "y" || c == "Y" => (None, Action::Reconnect),
         Key::Named(NamedKey::Enter) => (None, Action::Reconnect),
@@ -168,7 +168,7 @@ pub fn resolve_disconnected(key: &Key) -> (Option<Mode>, Action) {
     }
 }
 
-pub fn resolve_rename(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_rename(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     if is_ctrl_c(key, mods) {
         return (Some(Mode::Normal), Action::None);
     }
@@ -226,7 +226,7 @@ fn resolve_picker(
     }
 }
 
-pub fn resolve_session_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_session_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     resolve_picker(
         key,
         mods,
@@ -239,7 +239,7 @@ pub fn resolve_session_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Acti
     )
 }
 
-pub fn resolve_help(key: &Key) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_help(key: &Key) -> (Option<Mode>, Action) {
     // Any key exits help
     let _ = key;
     (Some(Mode::Normal), Action::None)
@@ -247,7 +247,7 @@ pub fn resolve_help(key: &Key) -> (Option<Mode>, Action) {
 
 /// Process overview (issue #122). Esc / Ctrl+G / `q` close the view; scrolling is
 /// handled by the frontend's native table, so other keys are ignored here.
-pub fn resolve_process_overview(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_process_overview(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     if matches!(key, Key::Named(NamedKey::Escape))
         || is_mode_key(key, mods)
         || matches!(key, Key::Character(c) if c == "q")
@@ -257,7 +257,7 @@ pub fn resolve_process_overview(key: &Key, mods: Modifiers) -> (Option<Mode>, Ac
     (None, Action::None)
 }
 
-pub fn resolve_dir_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_dir_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     resolve_picker(
         key,
         mods,
@@ -270,7 +270,7 @@ pub fn resolve_dir_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) 
     )
 }
 
-pub fn resolve_launch_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_launch_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     resolve_picker(
         key,
         mods,
@@ -285,7 +285,7 @@ pub fn resolve_launch_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Actio
 
 /// Esc/Ctrl+C cancels a frontend-owned launcher overlay (add-remote / remote
 /// path prompt). All other input is handled by the overlay's native fields.
-pub fn resolve_launch_overlay(key: &Key) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_launch_overlay(key: &Key) -> (Option<Mode>, Action) {
     if matches!(key, Key::Named(NamedKey::Escape)) {
         return (Some(Mode::Normal), Action::LaunchOverlayCancel);
     }
@@ -293,7 +293,7 @@ pub fn resolve_launch_overlay(key: &Key) -> (Option<Mode>, Action) {
 }
 
 /// Esc or Ctrl+C cancels the in-progress background bootstrap.
-pub fn resolve_connecting(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_connecting(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     if matches!(key, Key::Named(NamedKey::Escape)) {
         return (None, Action::CancelBootstrap);
     }
@@ -303,7 +303,7 @@ pub fn resolve_connecting(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) 
     (None, Action::None)
 }
 
-pub fn resolve_command(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+pub(crate) fn resolve_command(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     // Esc cancels and restores Normal mode. CommandState is dropped.
     if matches!(key, Key::Named(NamedKey::Escape)) {
         return (Some(Mode::Normal), Action::None);
