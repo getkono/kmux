@@ -1453,6 +1453,7 @@ name = "kmux"
 version = "0.2.0"
 dependencies = [
  "anyhow",
+ "clap",
  "kmux-app",
  "kmux-client",
  "tokio",

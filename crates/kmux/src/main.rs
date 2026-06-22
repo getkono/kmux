@@ -107,13 +107,18 @@ fn launch_desktop() -> anyhow::Result<()> {
     exec_forwarding(locate_binary("kmux-gtk")?)
 }
 
-/// macOS: exec the native Swift app bundle's executable directly so it runs in
-/// the foreground attached to the terminal (the Dock icon / app menu still come
-/// from `Contents/Info.plist` above it), forwarding args + stdio. `KMUX_APP`
-/// overrides the bundle location (defaults to `~/Applications/kmux.app`). This is
-/// the Rust port of the former `kmux-swift/macos/kmux` launcher script.
+/// macOS: launch the native Swift app bundle via `open` so each `kmux`
+/// invocation gets its **own window**. When an instance is already running, the
+/// launch is routed to it through the `kmux://` URL scheme (it opens a new
+/// window for the URL); otherwise the app is cold-started with the same request
+/// forwarded on argv. Going through `open` (LaunchServices) — rather than a bare
+/// exec of the bundle binary — is what makes the running-instance routing work,
+/// fixing repeated launches collapsing into one window. `KMUX_APP` overrides the
+/// bundle location (defaults to `~/Applications/kmux.app`).
 #[cfg(target_os = "macos")]
 fn launch_desktop() -> anyhow::Result<()> {
+    use clap::Parser;
+
     let app = std::env::var_os("KMUX_APP")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(default_app_bundle);
@@ -124,7 +129,102 @@ fn launch_desktop() -> anyhow::Result<()> {
             exe.display()
         );
     }
-    exec_forwarding(exe)
+
+    let url = build_launch_url(&kmux_app::cli::Cli::parse());
+    if swift_app_running() {
+        // Running: route to the existing instance → it opens a new window.
+        run_open(&[std::ffi::OsString::from(&url)])
+    } else {
+        // Cold start: launch the app with the request forwarded on argv.
+        run_open(&[
+            app.into_os_string(),
+            std::ffi::OsString::from("--args"),
+            std::ffi::OsString::from("--launch-url"),
+            std::ffi::OsString::from(&url),
+        ])
+    }
+}
+
+/// Run `/usr/bin/open` with `args`, erroring if it fails to launch.
+#[cfg(target_os = "macos")]
+fn run_open(args: &[std::ffi::OsString]) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let status = std::process::Command::new("/usr/bin/open")
+        .args(args)
+        .status()
+        .context("failed to run `open` to launch the kmux app")?;
+    if !status.success() {
+        anyhow::bail!("`open` exited unsuccessfully ({status})");
+    }
+    Ok(())
+}
+
+/// Whether an instance of the Swift app (`kmux-swift`) is already running, so a
+/// new launch should route to it (a new window) rather than cold-start. On any
+/// uncertainty this returns `false` (cold start), which is always safe.
+#[cfg(target_os = "macos")]
+fn swift_app_running() -> bool {
+    std::process::Command::new("/usr/bin/pgrep")
+        .args(["-x", "kmux-swift"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Build the `kmux://new?…` URL the app turns into one window's `LaunchRequest`
+/// (server / ssh-port / session / cwd / diagnostic), re-parsing the shared `Cli`.
+#[cfg(target_os = "macos")]
+fn build_launch_url(cli: &kmux_app::cli::Cli) -> String {
+    let mut params: Vec<(&str, String)> = Vec::new();
+    if let Some(s) = &cli.connect.server_args.server {
+        params.push(("server", s.clone()));
+    }
+    if let Some(p) = cli.connect.server_args.ssh_port {
+        params.push(("ssh-port", p.to_string()));
+    }
+    if let Some(s) = &cli.connect.session {
+        params.push(("session", s.clone()));
+    }
+    if let Some(c) = &cli.connect.cwd {
+        params.push(("cwd", c.clone()));
+    }
+    if let Some(kmux_app::cli::Command::Diagnostic {
+        test: Some(t),
+        emit: false,
+    }) = &cli.command
+        && let Some(v) = clap::ValueEnum::to_possible_value(t)
+    {
+        params.push(("diagnostic", v.get_name().to_string()));
+    }
+    if params.is_empty() {
+        return "kmux://new".to_string();
+    }
+    let query = params
+        .iter()
+        .map(|(k, v)| format!("{k}={}", percent_encode(v)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("kmux://new?{query}")
+}
+
+/// Percent-encode a URL query value, keeping the RFC 3986 unreserved set verbatim.
+#[cfg(target_os = "macos")]
+fn percent_encode(s: &str) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::with_capacity(s.len());
+    for &b in s.as_bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                out.push(b as char)
+            }
+            _ => {
+                let _ = write!(out, "%{b:02X}");
+            }
+        }
+    }
+    out
 }
 
 #[cfg(target_os = "macos")]
@@ -145,8 +245,9 @@ fn launch_desktop() -> anyhow::Result<()> {
 }
 
 /// Replace this process with `bin`, forwarding our arguments (minus argv[0]).
-/// `exec` only returns on failure.
-#[cfg(any(target_os = "linux", target_os = "macos"))]
+/// `exec` only returns on failure. Linux only — macOS launches via `open` (see
+/// [`launch_desktop`]) so it can route to the running app instance.
+#[cfg(target_os = "linux")]
 fn exec_forwarding(bin: std::path::PathBuf) -> anyhow::Result<()> {
     use anyhow::Context;
     use std::os::unix::process::CommandExt;
