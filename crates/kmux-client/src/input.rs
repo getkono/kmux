@@ -159,7 +159,7 @@ pub fn encode_mouse_button(ev: &MouseEvent, sgr: bool) -> Vec<u8> {
 }
 
 /// Map a typed character to a `(physical-key, text, unshifted-codepoint)` triple
-/// for `ClientMessage::PtyKey` / `PtyKeyBatch`.
+/// for `ClientMessage::PtyKeyBatch`.
 ///
 /// Letters and digits get their dedicated physical [`ProtoKey`] so the daemon's
 /// kitty-keyboard encoder reports the right ordinal; everything else (punctuation
