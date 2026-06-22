@@ -78,9 +78,13 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     }
     println!("Auth token: {token}");
 
-    let app = Arc::new(ServerApp::new(token.clone()).with_compression(cfg.compression.clone()));
+    let app = Arc::new(
+        ServerApp::new(token.clone())
+            .with_compression(cfg.compression.clone())
+            .with_session_isolation(cfg.session_isolation),
+    );
     // Respawn isolated VT workers that crash (issue #126); no-op until a pane
-    // actually runs in a worker (KMUX_SESSION_ISOLATION=process).
+    // actually runs in a worker (`session_isolation = "process"`).
     app.spawn_worker_respawn_task();
 
     // Restore persisted sessions from the previous daemon instance, if any.

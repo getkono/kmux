@@ -76,6 +76,27 @@ impl Default for ConfigFile {
     }
 }
 
+/// Pane VT-pipeline isolation mode (`[daemon] session_isolation` in `kmuxd.toml`,
+/// overridable with `kmuxd --session-isolation`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize, clap::ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionIsolationMode {
+    /// The emulator (`TermState`) and PTY writer live in the daemon. The default
+    /// and historical behavior.
+    #[default]
+    InProcess,
+    /// Each pane's VT pipeline runs in an isolated `kmux-vt-worker` subprocess so
+    /// a libghostty-vt crash cannot take down the daemon (issue #126).
+    Process,
+}
+
+impl SessionIsolationMode {
+    /// Whether per-pane worker subprocess isolation is requested.
+    pub fn is_process(self) -> bool {
+        matches!(self, SessionIsolationMode::Process)
+    }
+}
+
 /// Daemon lifecycle settings (`[daemon]` in `kmuxd.toml`).
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -87,12 +108,18 @@ pub struct DaemonConfig {
     /// is long enough for clients to reconnect across transport switches.
     #[serde(default = "default_idle_shutdown_secs")]
     pub idle_shutdown_secs: u64,
+    /// Pane isolation mode (issue #126). `in-process` (default) keeps the
+    /// emulator in the daemon; `process` runs each pane's VT pipeline in an
+    /// isolated `kmux-vt-worker` subprocess.
+    #[serde(default)]
+    pub session_isolation: SessionIsolationMode,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
             idle_shutdown_secs: default_idle_shutdown_secs(),
+            session_isolation: SessionIsolationMode::default(),
         }
     }
 }
@@ -350,6 +377,8 @@ pub struct ServerConfig {
     pub runtime_dir: String,
     /// Seconds of inactivity (zero clients) before the daemon exits. `0` = disabled.
     pub idle_shutdown_secs: u64,
+    /// Pane VT-pipeline isolation mode (issue #126).
+    pub session_isolation: SessionIsolationMode,
 }
 
 impl ServerConfig {
@@ -388,6 +417,7 @@ impl ServerConfig {
             compression: file.compression,
             runtime_dir: file.runtime_dir,
             idle_shutdown_secs: file.daemon.idle_shutdown_secs,
+            session_isolation: file.daemon.session_isolation,
         })
     }
 }
@@ -659,6 +689,31 @@ idle_shutdown_secs = 60
         // Only test the ConfigFile default — resolve() requires TLS when QUIC/TCP+TLS are enabled.
         let cfg = ConfigFile::default();
         assert_eq!(cfg.daemon.idle_shutdown_secs, 30);
+    }
+
+    #[test]
+    fn daemon_session_isolation_parses() {
+        let toml = r#"
+[tls]
+self_signed = true
+
+[daemon]
+session_isolation = "process"
+"#;
+        let cfg: ConfigFile = toml::from_str(toml).unwrap();
+        assert_eq!(cfg.daemon.session_isolation, SessionIsolationMode::Process);
+        let resolved = ServerConfig::resolve(cfg).unwrap();
+        assert!(resolved.session_isolation.is_process());
+    }
+
+    #[test]
+    fn daemon_session_isolation_defaults_to_in_process() {
+        let cfg = ConfigFile::default();
+        assert_eq!(
+            cfg.daemon.session_isolation,
+            SessionIsolationMode::InProcess
+        );
+        assert!(!cfg.daemon.session_isolation.is_process());
     }
 
     #[test]
