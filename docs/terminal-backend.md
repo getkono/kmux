@@ -532,7 +532,7 @@ This FFI boundary is the daemon's primary crash surface: a memory fault inside
 libghostty-vt is a SIGSEGV against the whole process. The `backend` /
 `diff_engine` / `term_state` modules documented here live in the **`kmux-vt-core`**
 crate so they can run either in-process (the default) or in an isolated
-`kmux-vt-worker` subprocess — selected by `KMUX_SESSION_ISOLATION=process` — that
+`kmux-vt-worker` subprocess — selected by `session_isolation = "process"` — that
 contains such a crash to one pane. See
 [architecture-process-isolation.md](architecture-process-isolation.md) (issue #126).
 
