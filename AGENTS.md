@@ -4,32 +4,58 @@ A terminal multiplexer / session manager with remote desktop capabilities.
 
 ## Commands
 
-- Run server: `cargo run -p kmuxd` (generates a self-signed cert by default)
-- Tasks run via mise (`mise run <task>`, replacing the old `just <task>`); `mise tasks` lists them. Git hooks are managed by `hk` (config in `hk.pkl`), installed by `mise install` (or `mise run setup`).
-- Run `kmux` (the entrypoint — CLI + opens the platform desktop app): `cargo run -p kmux`. Toolkit-free; handles `daemon`/`ls`/`--dry-run` itself and, for an interactive launch, execs `kmux-gtk` (Linux) or the Swift `kmux.app` (macOS). For a dev GUI run also build the frontend so the exec target exists (`mise run start`, which builds `kmux` + `kmux-gtk`).
-- Run GTK GUI directly (`kmux-gtk` — the default + official client on Linux, also runnable on macOS): `cargo run -p kmux-gtk` (needs GTK4 + libadwaita dev libs: system packages on Linux, `brew install gtk4 libadwaita` on macOS; if another `pkg-config` shadows the system one, prefix `PKG_CONFIG=/usr/bin/pkg-config`)
-- Run native macOS app (`kmux-swift` — the default GUI `kmux` opens on macOS): `mise run swift-run` (macOS only; needs Xcode). See [docs/building-macos.md](docs/building-macos.md)
-- Render diagnostics (issue #145): `kmux diagnostic <test>` opens the GUI with a session painting a known test pattern (`glyphs`/`attrs`/`colors`/`unicode`/`boxes`/`all`) so glyph/color rendering can be visually verified; `kmux diagnostic` lists them and `--emit` writes the pattern to the host terminal. `progress` (issue #125) is an extra, *animated* test that emits OSC 9;4 progress states to verify the per-pane progress bar — it loops over time and so is excluded from `all`. Local-daemon scoped. See [docs/architecture-render.md](docs/architecture-render.md).
-- Process overview (issue #122): a hierarchical view of every session's `Tab → Pane → Process` tree with CPU/memory. In the GUI it's a main-area view toggled with `Ctrl+Shift+O` (GTK) / `⌘⇧O` (Swift) or the `/processes` command; `kmux ps` (alias `top`, `--format json`) is the headless counterpart of `kmux ls`. Daemon-side sampling via `sysinfo`; federated across peers. See [docs/architecture-process-overview.md](docs/architecture-process-overview.md).
-- GPU terminal rendering (issue #132): the shared `kmux-render` crate (wgpu) replaces the per-frontend CPU rasterizers. The `gpu` feature is **on by default** now (compiled + tested everywhere; build `--no-default-features` — or `mise run build-no-gpu` — for the lean, wgpu-free path that CI also checks). Only the runtime switch is opt-in: select the GPU path with `KMUX_RENDERER=wgpu cargo run -p kmux-gtk`; Swift uses `mise run swift-gpu-run`. Runtime defaults stay Cairo/CoreText. See [docs/architecture-render.md](docs/architecture-render.md).
-- Dev daemon + logs: the GUI run tasks (`mise run gtk-run` / `swift-run` / `start`) build `kmuxd` and pin `KMUX_KMUXD=target/debug/kmuxd` so a **debug** GUI auto-spawns the **debug** daemon (not an installed release `kmuxd` on `$PATH`, which it can't reach — debug builds isolate runtime/state under `kmux-debug/`). Debug builds therefore log to `~/.local/state/kmux-debug/client.log`, not `kmux/client.log`; `kmux debug paths` prints the active profile's resolved log/state/runtime paths + the `kmuxd` it would spawn, and `mise run tail-client-log` / `tail-daemon-log` follow both profiles' logs. See [docs/profile-isolation.md](docs/profile-isolation.md).
-- Session process isolation (issue #126): the crash-prone VT pipeline (libghostty-vt FFI + diff engine, extracted into the shared `kmux-vt-core` crate) can run per pane in an isolated `kmux-vt-worker` subprocess so a SIGSEGV in the emulator faults one session instead of taking down the daemon. The daemon keeps the PTY master fd (the shell survives), supervises the worker, and respawns it on crash. Compiled + tested everywhere; **runtime opt-in** via `KMUX_SESSION_ISOLATION=process` (default stays in-process, like the GPU switch). The daemon↔worker wire contract is the versioned `kmux-worker-protocol` crate. See [docs/architecture-process-isolation.md](docs/architecture-process-isolation.md).
-- Run tests: `mise run test`
-- Lint: `mise run clippy`
-- Lint fix: `mise run clippy-fix`
-- Format: `mise run fmt`
-- Format check: `mise run fmt-check`
+Tasks run via `mise run <task>` (`mise tasks` lists them). Git hooks are managed
+by `hk` and installed by `mise install` (or `mise run setup`).
+
+- `mise run test` — workspace test suite (matches CI)
+- `mise run clippy` / `clippy-fix` — lint / autofix
+- `mise run fmt` / `fmt-check` — format / check
+- `mise run build` — build with default features (incl. the GPU renderer);
+  `build-no-gpu` builds the lean, wgpu-free path CI also checks
+- `mise run start` — run the `kmux` GUI (debug) via the entrypoint;
+  `gtk-run` / `swift-run` run a frontend directly
+
+### Binaries
+
+- `kmux` — toolkit-free entrypoint (CLI + launcher): `cargo run -p kmux`
+- `kmuxd` — daemon: `cargo run -p kmuxd` (self-signed cert by default)
+- `kmux-gtk` (GTK4, Linux + macOS) and `kmux-swift` (native macOS) are the
+  clients. See [docs/building-macos.md](docs/building-macos.md) and
+  [docs/architecture-frontend.md](docs/architecture-frontend.md) for setup.
+
+### Runtime switches (default off, opt-in)
+
+- `KMUX_RENDERER=wgpu` — GPU terminal renderer (default Cairo/CoreText).
+  See [docs/architecture-render.md](docs/architecture-render.md).
+- `KMUX_SESSION_ISOLATION=process` — run each pane's VT pipeline in an isolated
+  `kmux-vt-worker` subprocess.
+  See [docs/architecture-process-isolation.md](docs/architecture-process-isolation.md).
+
+### Diagnostics
+
+- `kmux diagnostic [<test>]` — paint a render-verification pattern; `--emit`
+  writes it to the host terminal. See [docs/architecture-render.md](docs/architecture-render.md).
+- `kmux ls` / `kmux ps` (alias `top`) — list sessions / process overview.
+  See [docs/architecture-process-overview.md](docs/architecture-process-overview.md).
+- `kmux debug paths` — print the active profile's log/state/runtime paths.
+  Debug builds isolate state under `kmux-debug/`.
+  See [docs/profile-isolation.md](docs/profile-isolation.md).
 
 ## Conventions
 
-- The client is layered for multiple frontends: `kmux-protocol` → `kmux-client` (mechanism) → `kmux-app` (toolkit-agnostic interaction policy + `AppCore` + the `FrontendDriver` shared run loop + the shared CLI front door `run_cli`) → frontends: `kmux-gtk` (GTK4, **Linux + macOS**) and `kmux-swift` (native SwiftUI, **macOS-only**) — the latter drives `FrontendDriver` across the `kmux-ffi` uniffi C-ABI boundary. Above the frontends sits **`kmux`**, the toolkit-agnostic entrypoint binary (CLI + launcher): it runs the shared subcommands and, for an interactive launch, execs the platform desktop app (`kmux-gtk` on Linux, the Swift `kmux.app` on macOS). `kmux-gtk`'s GTK deps are target-gated to Linux + macOS (a stub binary on other OSes; macOS needs Homebrew GTK4 + libadwaita); `kmux-swift` is a SwiftPM package outside the cargo workspace. Nothing at or below `kmux-app` may depend on a UI toolkit (`kmux` sits above it and stays toolkit-free regardless). See [docs/architecture-frontend.md](docs/architecture-frontend.md).
-- Any architectural detail/change should be documented in `docs/` directory.
-- Use strict Rust -- no `#[allow(unused)]` without justification
-- Write tests for all new functionality
-- Use conventional commits (`type: description`)
-- Keep functions small and focused
-- Prefer `thiserror` for error types, `anyhow` for application-level errors
+- The client is layered so no UI toolkit is depended on at or below `kmux-app`:
+  `kmux-protocol` → `kmux-client` → `kmux-app` (policy + `FrontendDriver` +
+  `run_cli`) → frontends (`kmux-gtk`, `kmux-swift` via `kmux-ffi`); `kmux` sits
+  on top. See [docs/architecture-frontend.md](docs/architecture-frontend.md).
+- Document architectural changes in `docs/`.
+- Strict Rust — no `#[allow(unused)]` without justification.
+- Write tests for new functionality; keep functions small and focused.
+- Conventional commits (`type: description`).
+- `thiserror` for error types, `anyhow` for application-level errors.
 
 ## Correctness (IMPORTANT!)
 
-- Every component that interacts with external dependencies is versioned. For instance, the data protocol is versioned so `kmux` refuses to talk to `kmuxd` instance unless it matches. The `kmux-ffi` C ABI carries `KMUX_FFI_ABI_VERSION` (asserted by the Swift wrapper, alongside uniffi's binding-checksum check), like `kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`.
+- Every component that talks to an external dependency is versioned and refuses a
+  mismatch: the data protocol (`PROTOCOL_VERSION`), the `kmux-ffi` C ABI
+  (`KMUX_FFI_ABI_VERSION`), the daemon↔worker contract (`kmux-worker-protocol`),
+  and `kmux-ghostty-sys` (`EXPECTED_ABI_VERSION`).
