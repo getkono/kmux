@@ -91,7 +91,9 @@ impl TransportKind {
 ///   (`PaneProcesses` / `ProcessSample`), federated across peers (issue #122).
 /// - **30**: `SessionEventMsg::PaneFaulted` — an isolated VT worker crashed and
 ///   is being respawned; the shell survives (issue #126, process isolation).
-pub const PROTOCOL_VERSION: u32 = 30;
+/// - **31**: removed the unused singular `ClientMessage::PtyKey`; clients only
+///   ever send `PtyKeyBatch` (a batch subsumes the single-key case).
+pub const PROTOCOL_VERSION: u32 = 31;
 
 /// Wire compression algorithm negotiated for a connection.
 ///

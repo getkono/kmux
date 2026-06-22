@@ -172,15 +172,6 @@ pub enum ClientMessage {
     /// Send bytes to the PTY master (user keystrokes).
     PtyInput { pane_id: PaneId, data: Vec<u8> },
 
-    /// Send a structured key event to a pane.  The daemon encodes it via
-    /// the pane's live Ghostty key encoder, which tracks DECCKM, kitty
-    /// keyboard flags, modifyOtherKeys, etc., so the bytes always match
-    /// what the inner program negotiated.
-    ///
-    /// Use this for genuine keystrokes; use `PtyInput` for raw byte writes
-    /// (paste, mouse-report scroll wheels, signal injection).
-    PtyKey { pane_id: PaneId, event: KeyEvent },
-
     /// Batch of structured key events for one pane, encoded by the daemon
     /// in order before being written to the PTY.  Lets the client coalesce
     /// rapid keystrokes (e.g. typing through autocomplete) into a single
@@ -292,10 +283,9 @@ impl ClientMessage {
     /// function is a compile error.
     pub fn category(&self) -> MessageCategory {
         match self {
-            Self::PtyInput { .. }
-            | Self::PtyPaste { .. }
-            | Self::PtyKey { .. }
-            | Self::PtyKeyBatch { .. } => MessageCategory::Shell,
+            Self::PtyInput { .. } | Self::PtyPaste { .. } | Self::PtyKeyBatch { .. } => {
+                MessageCategory::Shell
+            }
             Self::FetchHistory { .. } => MessageCategory::Scrollback,
             Self::Ping { .. } | Self::Pong { .. } => MessageCategory::Liveness,
             Self::SessionCreate { .. }
@@ -468,7 +458,6 @@ mod tests {
 
     #[test]
     fn category_covers_every_client_variant() {
-        use super::super::key::{KeyAction, KeyCode, KeyEvent, KeyMods};
         use super::super::session::TermSize;
         // One representative per variant — ensures the exhaustive match compiles
         // and each variant maps to a specific category.
@@ -484,19 +473,6 @@ mod tests {
                 ClientMessage::PtyPaste {
                     pane_id: "p".into(),
                     data: "x".into(),
-                },
-                MessageCategory::Shell,
-            ),
-            (
-                ClientMessage::PtyKey {
-                    pane_id: "p".into(),
-                    event: KeyEvent {
-                        code: KeyCode::Enter,
-                        mods: KeyMods::SHIFT,
-                        action: KeyAction::Press,
-                        text: String::new(),
-                        unshifted_codepoint: 0,
-                    },
                 },
                 MessageCategory::Shell,
             ),

@@ -458,19 +458,6 @@ pub async fn handle_message<A: PaneAttacher>(
             }
         }
 
-        ClientMessage::PtyKey { pane_id, event } => {
-            if state.app.is_federated_pane(&pane_id) {
-                state
-                    .app
-                    .forward_peer_message(&pane_id, move |remote| ClientMessage::PtyKey {
-                        pane_id: remote,
-                        event,
-                    });
-            } else if let Err(e) = state.app.write_key_event(&pane_id, client_id, event).await {
-                state.error(None, classify_error(&e), e.to_string());
-            }
-        }
-
         ClientMessage::PtyKeyBatch { pane_id, events } => {
             if state.app.is_federated_pane(&pane_id) {
                 state.app.forward_peer_message(&pane_id, move |remote| {

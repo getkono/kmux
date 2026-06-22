@@ -28,19 +28,6 @@ impl ServerApp {
         relay.engine.write_input(&data).await
     }
 
-    /// Encode a single structured key event with the pane's live Ghostty
-    /// mode state (DECCKM, kitty kbd flags, modifyOtherKeys, …) and write
-    /// the result to the PTY.  See [`ClientMessage::PtyKey`] for the wire
-    /// motivation.
-    pub async fn write_key_event(
-        &self,
-        pane_id: &str,
-        client_id: ClientId,
-        event: KeyEvent,
-    ) -> Result<()> {
-        self.write_key_batch(pane_id, client_id, &[event]).await
-    }
-
     /// Encode a batch of key events in order using the pane's live Ghostty
     /// mode state and concatenate the encoded bytes into a single PTY
     /// write.  Each event sees the state left by the previous event in the
