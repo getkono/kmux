@@ -115,6 +115,9 @@ fn run_gui(plan: Plan) -> anyhow::Result<()> {
     // than adw::Application to avoid threading adw types through every helper).
     app.connect_startup(|_| {
         adw::init().expect("failed to initialize libadwaita");
+        // Make Powerline/Nerd glyphs available to Pango's fallback on the Cairo
+        // path before any window/PangoContext is created (issue #145).
+        register_symbol_fallback_font();
     });
     {
         let exit_error = exit_error.clone();
@@ -125,6 +128,53 @@ fn run_gui(plan: Plan) -> anyhow::Result<()> {
         eprintln!("kmux: connection failed:\n{err}");
     }
     Ok(())
+}
+
+/// Register the bundled symbol fallback font (Powerline + Nerd glyphs) with
+/// fontconfig so Pango's automatic font fallback resolves glyphs the configured
+/// font lacks on the Cairo path (issue #145). Best-effort: any failure is logged
+/// and ignored (the GPU path has its own atlas fallback, and missing glyphs just
+/// stay as tofu as before). fontconfig has no add-from-memory API in the
+/// versions we target, so the embedded bytes are staged to a file under the
+/// runtime dir and that path is added.
+fn register_symbol_fallback_font() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = match kmux_protocol::dirs::runtime_dir() {
+        Ok(dir) => dir.join("SymbolsNerdFontMono-Regular.ttf"),
+        Err(e) => {
+            tracing::warn!("symbol fallback font: cannot resolve runtime dir: {e}");
+            return;
+        }
+    };
+    // Rewrite every startup so the staged file matches the embedded bytes.
+    if let Err(e) = std::fs::write(&path, kmux_render::symbol_fallback_bytes()) {
+        tracing::warn!("symbol fallback font: write {} failed: {e}", path.display());
+        return;
+    }
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        tracing::warn!("symbol fallback font: path has interior NUL");
+        return;
+    };
+    // SAFETY: `FcConfigGetCurrent` returns the live config (or null, which
+    // `FcConfigAppFontAddFile` treats as "the current config"); `c_path` is a
+    // valid NUL-terminated string that outlives the call.
+    let ok = unsafe {
+        let config = fontconfig_sys::FcConfigGetCurrent();
+        fontconfig_sys::FcConfigAppFontAddFile(
+            config,
+            c_path.as_ptr() as *const fontconfig_sys::FcChar8,
+        )
+    };
+    if ok == 0 {
+        tracing::warn!(
+            "symbol fallback font: fontconfig rejected {}",
+            path.display()
+        );
+    } else {
+        tracing::info!("symbol fallback font registered with fontconfig");
+    }
 }
 
 fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String>>>) {

@@ -45,3 +45,7 @@ futures.workspace = true
 gtk4 = "0.9"
 adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
 pangocairo = "0.20"
+# Register the bundled symbol fallback font with fontconfig at startup so Pango's
+# automatic font fallback resolves Powerline/Nerd glyphs on the Cairo path (issue
+# #145). fontconfig is always present wherever GTK builds (pango links it).
+fontconfig-sys = { package = "yeslogic-fontconfig-sys", version = "6" }
