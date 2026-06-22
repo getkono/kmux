@@ -115,6 +115,18 @@ fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
         ("snapshot", Action::ToggleSnapshotMode, &[]),
         // Pause the connection to save bandwidth (issue #68); b = bandwidth.
         ("toggle-pause", Action::TogglePause, &["<Ctrl><Shift>b"]),
+        // Keep a pane / the session streaming through a background auto-pause
+        // (issue #68). Menu-only (no default accelerator).
+        (
+            "toggle-pane-keep-streaming",
+            Action::ToggleFocusedPaneNoAutoPause,
+            &[],
+        ),
+        (
+            "toggle-session-keep-streaming",
+            Action::ToggleActiveSessionNoAutoPause,
+            &[],
+        ),
         ("redraw", Action::ForceRedraw, &[]),
         ("scroll-page-up", Action::ScrollPageUp, &["<Shift>Page_Up"]),
         (
@@ -314,6 +326,10 @@ fn build_menu() -> gio::Menu {
     let s4 = gio::Menu::new();
     s4.append(Some("Lock Input"), Some("win.toggle-lock"));
     s4.append(Some("Pause Connection"), Some("win.toggle-pause"));
+    s4.append(
+        Some("Keep Session Streaming in Background"),
+        Some("win.toggle-session-keep-streaming"),
+    );
     s4.append(Some("Process Overview"), Some("win.process-overview"));
     s4.append(Some("Performance HUD"), Some("win.toggle-hud"));
     s4.append(Some("Metrics"), Some("win.toggle-metrics"));

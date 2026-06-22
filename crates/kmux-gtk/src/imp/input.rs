@@ -50,6 +50,11 @@ fn attach_context_menu(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
     menu.append(Some("Split Down"), Some("win.split-down"));
     menu.append(Some("Zoom Pane"), Some("win.zoom-pane"));
     menu.append(Some("Close Pane"), Some("win.close-pane"));
+    // Keep this pane streaming through a background auto-pause (issue #68).
+    menu.append(
+        Some("Keep Streaming in Background"),
+        Some("win.toggle-pane-keep-streaming"),
+    );
     let popover = PopoverMenu::from_model(Some(&menu));
     popover.set_parent(drawing);
     popover.set_has_arrow(false);

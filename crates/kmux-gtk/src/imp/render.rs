@@ -216,7 +216,45 @@ pub fn render_tiled(
                 let _ = cr.fill();
             }
         }
+
+        // Connection pause (issue #68): a ⏸ badge in the pane's top-right corner
+        // while its output is withheld. Drawn from primitives (two bars) so it
+        // needs no font; painted last so it sits above the grid.
+        if core.is_pane_paused(&pane_id) {
+            paint_pause_badge(cr, palette, px, py, pw, ph);
+        }
     }
+}
+
+/// Paint a small pause glyph (two vertical bars on a pill) in the top-right
+/// corner of a pane rect, marking that its output is paused (issue #68).
+fn paint_pause_badge(cr: &cairo::Context, palette: &Palette, px: f64, py: f64, pw: f64, ph: f64) {
+    let pad = 6.0_f64;
+    let box_sz = 16.0_f64.min(pw - 2.0 * pad).min(ph - 2.0 * pad);
+    if box_sz <= 6.0 {
+        return;
+    }
+    let bx = px + pw - box_sz - pad;
+    let by = py + pad;
+    // Pill background for contrast against any grid content.
+    src(
+        cr,
+        palette.status_bg.r,
+        palette.status_bg.g,
+        palette.status_bg.b,
+    );
+    cr.rectangle(bx, by, box_sz, box_sz);
+    let _ = cr.fill();
+    // Two bars forming the pause glyph.
+    let bar_w = box_sz / 5.0;
+    let bar_h = box_sz * 0.5;
+    let gap = box_sz / 6.0;
+    let bar_y = by + (box_sz - bar_h) / 2.0;
+    let cx = bx + box_sz / 2.0;
+    src(cr, palette.accent.r, palette.accent.g, palette.accent.b);
+    cr.rectangle(cx - gap / 2.0 - bar_w, bar_y, bar_w, bar_h);
+    cr.rectangle(cx + gap / 2.0, bar_y, bar_w, bar_h);
+    let _ = cr.fill();
 }
 
 /// The `(color, width-fraction)` for a pane's OSC 9;4 progress bar, or `None`
