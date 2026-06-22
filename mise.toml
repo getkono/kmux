@@ -18,6 +18,13 @@ hk = "1.48.0"
 # Line-count reporting (`mise run loc`). aqua backend ships prebuilt binaries
 # (like git-cliff above), so no source build. Pinned for stable counts.
 "aqua:XAMPPRocky/tokei" = "12.1.2"
+# Conventional-commit linting (issue #130): the hk commit-msg/pre-push hooks and
+# the CI commit-lint job all run `convco check` via the `commit-msg-check` /
+# `commit-check` mise-tasks. Built from source — convco ships no arch-tagged
+# prebuilt we can pin against — but it pins git2 with default-features=false, so
+# it vendors libgit2 with no openssl/system deps (just a C compiler); mise caches
+# the compiled binary like cargo-mutants above.
+"cargo:convco" = "0.6.4"
 
 [settings]
 # Required for the `[hooks]` block below (mise gates hooks behind this flag).

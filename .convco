@@ -1,0 +1,12 @@
+# convco configuration (issue #130). convco auto-discovers this file from the
+# repo root and the hk commit-msg/pre-push hooks + the CI commit-lint job run
+# `convco check` against it. Changelog generation is git-cliff's job (cliff.toml),
+# not convco's — this only governs commit *validation*.
+#
+# Sole override: relax the scope regex so it accepts the comma-separated
+# multi-scopes this repo already uses, e.g. `fix(server,client)`,
+# `feat(client,app,ffi,gtk,swift)`, `refactor(kmux-gtk,kmux-ffi)`. convco's
+# default (`^[[:alnum:]]+(?:[-_/][[:alnum:]]+)*$`) rejects the comma; we add it to
+# the separator class. Everything else (allowed types, etc.) uses convco defaults.
+# NB: convco config keys are camelCase (`scopeRegex`, not `scope_regex`).
+scopeRegex: "^[[:alnum:]]+(?:[-_/,][[:alnum:]]+)*$"

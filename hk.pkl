@@ -16,6 +16,19 @@ amends "package://github.com/jdx/hk/releases/download/v1.48.0/hk@1.48.0#/Config.
 // files get re-staged after a fix.
 
 hooks {
+    // Conventional-commit enforcement (issue #130), via convco (pinned in
+    // mise.toml). commit-msg is the immediate gate as each message is written;
+    // pre-push is the last local net for commits that bypassed it (--no-verify,
+    // amend, rebase). CI re-checks the whole PR range authoritatively.
+    ["commit-msg"] {
+        steps = new Mapping<String, Step> {
+            ["convco"] {
+                // hk passes the message file as {{commit_msg_file}}; the task
+                // skips merge messages and strips git's comment lines.
+                check = "mise run commit-msg-check {{commit_msg_file}}"
+            }
+        }
+    }
     ["pre-commit"] {
         fix = true
         stash = "git"
@@ -37,6 +50,11 @@ hooks {
     }
     ["pre-push"] {
         steps = new Mapping<String, Step> {
+            // No glob: lint the pushed commits regardless of which files changed
+            // (default range is this branch's commits since the trunk).
+            ["convco"] {
+                check = "mise run commit-check"
+            }
             ["cargo-fmt"] {
                 glob = List("*.rs")
                 check = "mise run fmt-check"

@@ -1,0 +1,20 @@
+#!/usr/bin/env bash
+#MISE description="Lint commit messages as conventional commits (convco) over a revision range."
+#USAGE arg "<range>" help="git revision range to check; defaults to this branch's new commits since the trunk" default=""
+#
+# Used by the hk pre-push hook (no arg) and the CI commit-lint job (explicit
+# base..head). convco skips merge commits (>1 parent) by default, so local
+# "Merge …" commits never trip it. Enforces issue #130.
+set -euo pipefail
+range="${1:-}"
+if [[ -z "$range" ]]; then
+    # Default: only THIS branch's own commits, from where it diverged from the
+    # trunk to HEAD — so we never re-lint pre-existing history. Prefer the remote
+    # trunk (authoritative), fall back to the local branch.
+    trunk=$(git rev-parse --verify --quiet origin/master || git rev-parse --verify --quiet master) || {
+        echo "commit-check: no origin/master or master ref found; pass an explicit range" >&2
+        exit 0
+    }
+    range="$(git merge-base "$trunk" HEAD)..HEAD"
+fi
+exec convco check "$range"
