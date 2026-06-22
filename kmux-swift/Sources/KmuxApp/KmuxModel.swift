@@ -129,6 +129,8 @@ final class KmuxModel: ObservableObject {
     /// Start the pump on the main run loop (common modes so it keeps ticking
     /// during window resize / menu tracking).
     func start() {
+        // Make Powerline/Nerd glyphs available to the CoreText path (issue #145).
+        registerSymbolFallbackFont()
         let t = Timer(timeInterval: Self.pumpInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.pump() }
         }
