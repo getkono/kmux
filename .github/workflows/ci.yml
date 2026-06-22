@@ -65,6 +65,31 @@ jobs:
         # exercised here.
         run: mise run test
 
+  # Conventional-commit enforcement (issue #130): lint every commit in the PR via
+  # convco — the same `mise run commit-check` the hk pre-push hook runs locally.
+  # PR-only (no commit range to check on a push to master); convco is pure Rust +
+  # vendored libgit2, so this needs neither submodules nor system GTK deps.
+  commit-lint:
+    name: Commit lint
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so the base..head range resolves (default depth is 1).
+          fetch-depth: 0
+
+      - name: Install toolchains (mise)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - name: Lint commit messages (convco)
+        # base.sha..head.sha is the PR's own commits (commits already on master
+        # are excluded; merge commits are skipped by convco).
+        run: mise run commit-check ${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}
+
   # macOS path: build/test kmux-ffi + the client stack it wraps, build the `kmux`
   # entrypoint and the GTK frontend (`kmux-gtk`) natively against Homebrew GTK,
   # and build/test the native SwiftUI app (kmux-swift). kmux-ffi has no Zig/ghostty

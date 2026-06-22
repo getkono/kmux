@@ -50,7 +50,9 @@ by `hk` and installed by `mise install` (or `mise run setup`).
 - Document architectural changes in `docs/`.
 - Strict Rust — no `#[allow(unused)]` without justification.
 - Write tests for new functionality; keep functions small and focused.
-- Conventional commits (`type: description`).
+- Conventional commits (`type: description`), enforced by the `commit-msg` +
+  `pre-push` hk hooks and CI via `convco` (escape hatch: `git commit --no-verify`;
+  check a range manually with `mise run commit-check <base>..HEAD`).
 - `thiserror` for error types, `anyhow` for application-level errors.
 
 ## Correctness (IMPORTANT!)
