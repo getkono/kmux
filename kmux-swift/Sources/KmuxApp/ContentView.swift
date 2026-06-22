@@ -186,33 +186,39 @@ struct ContentView: View {
 /// (`gio` actions bound to accelerators). Commands dispatch the same toolkit-
 /// agnostic `FfiAction`s the buttons do.
 struct KmuxCommands: Commands {
-    @ObservedObject var model: KmuxModel
-    @ObservedObject var ui: UIState
+    // The key window's model/UI (per-window, via focused-scene values). `nil`
+    // when no terminal window is focused (e.g. only Preferences is open), in
+    // which case the window-scoped actions below are inert.
+    @FocusedValue(\.kmuxModel) private var model: KmuxModel?
+    @FocusedValue(\.kmuxUI) private var ui: UIState?
+    @Environment(\.openWindow) private var openWindow
 
     var body: some Commands {
         CommandGroup(replacing: .newItem) {
-            Button("New Session") { model.dispatch(.createSession) }
+            Button("New Window") { openWindow(value: LaunchRequest()) }
+                .keyboardShortcut("n", modifiers: [.command, .shift])
+            Button("New Session") { model?.dispatch(.createSession) }
                 .keyboardShortcut("n")
-            Button("New Tab") { model.dispatch(.createPane) }
+            Button("New Tab") { model?.dispatch(.createPane) }
                 .keyboardShortcut("t")
         }
         CommandMenu("Session") {
-            Button("Command Palette…") { ui.commandPalette = true }
+            Button("Command Palette…") { ui?.commandPalette = true }
                 .keyboardShortcut("p")
-            Button("Open Launcher…") { model.openLaunchPicker() }
+            Button("Open Launcher…") { model?.openLaunchPicker() }
                 .keyboardShortcut("o")
             Divider()
-            Button("Next Session") { model.dispatch(.nextSession) }
+            Button("Next Session") { model?.dispatch(.nextSession) }
                 .keyboardShortcut("]", modifiers: [.command, .shift])
-            Button("Previous Session") { model.dispatch(.prevSession) }
+            Button("Previous Session") { model?.dispatch(.prevSession) }
                 .keyboardShortcut("[", modifiers: [.command, .shift])
-            Button("Next Tab") { model.dispatch(.nextPane) }
+            Button("Next Tab") { model?.dispatch(.nextPane) }
                 .keyboardShortcut("]", modifiers: [.command, .option])
-            Button("Previous Tab") { model.dispatch(.prevPane) }
+            Button("Previous Tab") { model?.dispatch(.prevPane) }
                 .keyboardShortcut("[", modifiers: [.command, .option])
-            Button("Close Tab") { model.dispatch(.closeTab) }
+            Button("Close Tab") { model?.dispatch(.closeTab) }
             Divider()
-            Button("Reconnect") { model.dispatch(.reconnect) }
+            Button("Reconnect") { model?.dispatch(.reconnect) }
                 .keyboardShortcut("r")
             // Pause the connection to save bandwidth (issue #68). Shows a check
             // when paused (manual or auto); toggling clears a manual pause.
@@ -231,102 +237,106 @@ struct KmuxCommands: Commands {
             // ⌘⇧G (⌘⇧D is Split Down); reset has no default shortcut.
             Toggle("Render Debug", isOn: renderDebugBinding)
                 .keyboardShortcut("g", modifiers: [.command, .shift])
-            Button("Reset Renderer") { model.dispatch(.resetRenderer) }
+            Button("Reset Renderer") { model?.dispatch(.resetRenderer) }
         }
         // Tiling: split the focused pane, move focus, resize, swap (the analog of
         // kmux-gtk's tiling accelerators). iTerm2-style split shortcuts; ⌘⌥ moves
         // focus, ⌘⌃ resizes / reorders.
         CommandMenu("Pane") {
-            Button("Split Right") { model.dispatch(.splitRight) }
+            Button("Split Right") { model?.dispatch(.splitRight) }
                 .keyboardShortcut("d", modifiers: .command)
-            Button("Split Down") { model.dispatch(.splitDown) }
+            Button("Split Down") { model?.dispatch(.splitDown) }
                 .keyboardShortcut("d", modifiers: [.command, .shift])
             Divider()
-            Button("Focus Left") { model.dispatch(.focusLeft) }
+            Button("Focus Left") { model?.dispatch(.focusLeft) }
                 .keyboardShortcut(.leftArrow, modifiers: [.command, .option])
-            Button("Focus Right") { model.dispatch(.focusRight) }
+            Button("Focus Right") { model?.dispatch(.focusRight) }
                 .keyboardShortcut(.rightArrow, modifiers: [.command, .option])
-            Button("Focus Up") { model.dispatch(.focusUp) }
+            Button("Focus Up") { model?.dispatch(.focusUp) }
                 .keyboardShortcut(.upArrow, modifiers: [.command, .option])
-            Button("Focus Down") { model.dispatch(.focusDown) }
+            Button("Focus Down") { model?.dispatch(.focusDown) }
                 .keyboardShortcut(.downArrow, modifiers: [.command, .option])
             Menu("Focus Pane") {
                 ForEach(1...9, id: \.self) { n in
                     Button("Pane \(n)") {
-                        model.dispatch(.focusPaneAt(index: UInt32(n - 1)))
+                        model?.dispatch(.focusPaneAt(index: UInt32(n - 1)))
                     }
                     .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: .command)
                 }
             }
             Divider()
-            Button("Resize Left") { model.dispatch(.resizeLeft) }
+            Button("Resize Left") { model?.dispatch(.resizeLeft) }
                 .keyboardShortcut(.leftArrow, modifiers: [.command, .control])
-            Button("Resize Right") { model.dispatch(.resizeRight) }
+            Button("Resize Right") { model?.dispatch(.resizeRight) }
                 .keyboardShortcut(.rightArrow, modifiers: [.command, .control])
-            Button("Resize Up") { model.dispatch(.resizeUp) }
+            Button("Resize Up") { model?.dispatch(.resizeUp) }
                 .keyboardShortcut(.upArrow, modifiers: [.command, .control])
-            Button("Resize Down") { model.dispatch(.resizeDown) }
+            Button("Resize Down") { model?.dispatch(.resizeDown) }
                 .keyboardShortcut(.downArrow, modifiers: [.command, .control])
             Divider()
-            Button("Move Pane Forward") { model.dispatch(.swapNext) }
+            Button("Move Pane Forward") { model?.dispatch(.swapNext) }
                 .keyboardShortcut("]", modifiers: [.command, .control])
-            Button("Move Pane Back") { model.dispatch(.swapPrev) }
+            Button("Move Pane Back") { model?.dispatch(.swapPrev) }
                 .keyboardShortcut("[", modifiers: [.command, .control])
             Divider()
-            Button("Cycle Layout") { model.dispatch(.cycleLayout) }
+            Button("Cycle Layout") { model?.dispatch(.cycleLayout) }
                 .keyboardShortcut(" ", modifiers: [.command, .shift])
-            Button("Toggle Zoom") { model.dispatch(.toggleZoom) }
+            Button("Toggle Zoom") { model?.dispatch(.toggleZoom) }
                 .keyboardShortcut("z", modifiers: [.command, .control])
-            Button("Close Pane") { model.dispatch(.closePane) }
+            Button("Close Pane") { model?.dispatch(.closePane) }
                 .keyboardShortcut("w", modifiers: [.command, .shift])
-            Button("Undo Close") { model.dispatch(.undoClose) }
+            Button("Undo Close") { model?.dispatch(.undoClose) }
                 .keyboardShortcut("u", modifiers: [.command, .shift])
         }
         CommandGroup(replacing: .help) {
-            Button("kmux Help") { ui.help = true }
+            Button("kmux Help") { ui?.help = true }
                 .keyboardShortcut("?", modifiers: [.command])
         }
     }
 
+    // Toggle bindings read/write the focused window's model; they read `false`
+    // and no-op when no terminal window is focused.
     private var hudBinding: Binding<Bool> {
         Binding(
-            get: { model.hudVisible },
-            set: { _ in model.dispatch(.toggleHud) }
+            get: { model?.hudVisible ?? false },
+            set: { _ in model?.dispatch(.toggleHud) }
         )
     }
 
     private var processOverviewBinding: Binding<Bool> {
         Binding(
-            get: { if case .processOverview = model.mode { return true } else { return false } },
-            set: { _ in model.dispatch(.toggleProcessOverview) }
+            get: {
+                if case .processOverview = model?.mode { return true } else { return false }
+            },
+            set: { _ in model?.dispatch(.toggleProcessOverview) }
         )
     }
 
     private var metricsBinding: Binding<Bool> {
         Binding(
-            get: { model.metricsVisible },
-            set: { _ in model.dispatch(.toggleMetrics) }
+            get: { model?.metricsVisible ?? false },
+            set: { _ in model?.dispatch(.toggleMetrics) }
         )
     }
 
     private var connectionBinding: Binding<Bool> {
         Binding(
-            get: { model.connectionVisible },
-            set: { _ in model.dispatch(.toggleConnection) }
+            get: { model?.connectionVisible ?? false },
+            set: { _ in model?.dispatch(.toggleConnection) }
         )
     }
 
     private var renderDebugBinding: Binding<Bool> {
         Binding(
-            get: { model.renderDebugVisible },
-            set: { _ in model.dispatch(.toggleRenderDebug) }
+            get: { model?.renderDebugVisible ?? false },
+            set: { _ in model?.dispatch(.toggleRenderDebug) }
         )
     }
 
     private var pauseBinding: Binding<Bool> {
         Binding(
-            get: { model.pauseState != .active },
-            set: { _ in model.dispatch(.togglePause) }
+            get: { (model?.pauseState ?? .active) != .active },
+            set: { _ in model?.dispatch(.togglePause) }
         )
     }
 }
