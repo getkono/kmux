@@ -137,6 +137,41 @@ user can still watch; only a hidden/minimized/backgrounded window pauses.
   pause_state}`, and per-pane `FfiPaneRect.{paused, no_auto_pause}` /
   `FfiTab.paused`. `KMUX_FFI_ABI_VERSION` is 18.
 
+## Input on a paused connection (issue #165)
+
+A keystroke is handled by *why* the connection is paused — the reason already
+carried by `(paused, auto)`. This is purely client-side and reuses the existing
+`SetPaused` + re-attach path, so there is **no protocol or FFI ABI change**.
+
+- **Auto-paused** (backgrounded): typing **resumes immediately** and is then
+  forwarded, so the user sees the output of what they type.
+  `FrontendDriver::resume_if_auto_paused` (run from `send_keys` / `feed_paste`)
+  clears `auto_pause` and disarms the background debounce *before* the input is
+  sent, so the wire order is `SetPaused(false)` → `Attach` → the keystroke and the
+  echo streams back. Reconciliation stays minimal (the O(screen) re-attach
+  snapshot above); `set_auto_pause` is idempotent, so only the first keystroke of
+  a burst does any work.
+- **Manually paused**: the pause is deliberate, so the input is **dropped** — a
+  user shouldn't type blind into a terminal they've chosen not to watch. Only the
+  manual toggle resumes. The drop is the single chokepoint
+  `SessionManager::input_suppressed()` (`pause_applied == (true, false)`) guarding
+  `send_input` / `send_key_batch` / `send_paste`, so it covers keys, paste, raw
+  bytes, and the mouse-report wheels/buttons that route through `send_input`
+  uniformly. (A suppressed `report_mouse` returns `false`, so the frontend falls
+  back to local text selection on the frozen screen.) When both sources are active
+  a manual pause wins, so the input is dropped (not resumed).
+
+### Local-daemon connections are never auto-paused
+
+A local-daemon connection (`AppCore::is_local`) has no data savings from pausing
+— the client↔daemon link is local (UDS) — so a backgrounded local window keeps
+streaming. The guard lives at the single chokepoint `AppCore::set_auto_pause`
+(with a matching debounce skip in `FrontendDriver::set_window_background`).
+`is_local` reflects server identity, so this holds under federation too, where the
+GUI always bootstraps the local daemon over UDS. A *manual* pause still works for
+local sessions. (`is_local` is currently a per-window property; making auto-pause
+locality per-session is a follow-up tied to federated upstream pause-union.)
+
 ## Verify
 
 1. Open a session; toggle pause (`Ctrl+Shift+B` on GTK, `⌘⇧B` on macOS). The
@@ -151,3 +186,11 @@ user can still watch; only a hidden/minimized/backgrounded window pauses.
 5. Mark a pane "Keep Streaming in Background" (pane context menu), then minimize:
    that pane keeps updating while the rest auto-pause; restore → only the
    non-exempt panes catch up. A manual pause still pauses the exempt pane too.
+6. **Keyboard resume (issue #165).** On a remote session, background the window
+   (~1 s) to auto-pause, then type: the connection resumes immediately and the
+   keystrokes echo, with no long catch-up.
+7. **Manual pause drops input (issue #165).** Manually pause, then type / paste /
+   scroll: nothing reaches the PTY (no echo, output frozen). Toggle off → resumes.
+8. **Local daemon (issue #165).** Launch a purely local session (`kmux`, no
+   `--server`) and background the window: it **never** auto-pauses. (Manual pause
+   still works.)
