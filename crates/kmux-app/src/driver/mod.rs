@@ -759,7 +759,10 @@ impl FrontendDriver {
     /// pause is unaffected and persists across focus changes.
     pub fn set_window_background(&mut self, backgrounded: bool) {
         if backgrounded {
-            if self.background_since.is_none() && !self.core.auto_pause {
+            // Local-daemon connections never auto-pause (issue #165), so don't
+            // bother arming the debounce for them — `set_auto_pause` would no-op
+            // anyway, this just avoids the idle per-frame `tick_auto_pause` check.
+            if self.background_since.is_none() && !self.core.auto_pause && !self.core.is_local {
                 self.background_since = Some(Instant::now());
             }
         } else {

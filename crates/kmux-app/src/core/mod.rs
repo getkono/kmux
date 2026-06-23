@@ -579,7 +579,17 @@ impl AppCore {
 
     /// Set the auto-pause flag (driven by window background/foreground, with a
     /// debounce in the driver). Independent of the manual toggle.
+    ///
+    /// Local-daemon connections are never auto-paused (issue #165): the
+    /// client↔daemon link is local (UDS) so withholding frames saves no data,
+    /// and a backgrounded local window should keep streaming. `is_local`
+    /// reflects server identity, so this also holds under federation (where the
+    /// GUI always bootstraps the local daemon over UDS). A *manual* pause is
+    /// unaffected and still works for local sessions.
     pub fn set_auto_pause(&mut self, on: bool) {
+        if on && self.is_local {
+            return;
+        }
         if self.auto_pause == on {
             return;
         }
@@ -750,6 +760,14 @@ mod tests {
         )
     }
 
+    /// A non-local core (remote server). Auto-pause only applies to remote
+    /// connections (issue #165), so the auto-pause state-machine tests need one.
+    fn new_remote_core() -> AppCore {
+        let mut core = new_local_core();
+        core.is_local = false;
+        core
+    }
+
     /// The performance HUD auto-shows on debug builds and stays hidden on
     /// release builds (#105). The default is wired to the compile profile, so
     /// it must track `cfg!(debug_assertions)` rather than a hardcoded value.
@@ -758,12 +776,31 @@ mod tests {
         assert_eq!(new_local_core().hud_visible, cfg!(debug_assertions));
     }
 
+    /// A local-daemon connection is never auto-paused (issue #165): there are no
+    /// data savings on a local link. A manual pause still works.
+    #[test]
+    fn local_daemon_never_auto_pauses() {
+        let mut core = new_local_core();
+        assert!(core.is_local);
+
+        // Backgrounding a local window must not pause it.
+        core.set_auto_pause(true);
+        assert!(!core.auto_pause, "local connection must not auto-pause");
+        assert!(!core.is_paused());
+        assert_eq!(core.pause_reason(), PauseReason::None);
+
+        // The manual toggle is unaffected.
+        core.toggle_manual_pause();
+        assert!(core.is_paused());
+        assert_eq!(core.pause_reason(), PauseReason::Manual);
+    }
+
     /// Pause has two independent sources (issue #68): a manual toggle and an
     /// auto-pause while backgrounded. The effective state is their OR, a manual
     /// pause persists across focus changes, and the reason favours Manual.
     #[test]
     fn pause_state_machine_manual_persists_across_focus() {
-        let mut core = new_local_core();
+        let mut core = new_remote_core();
         assert!(!core.is_paused());
         assert_eq!(core.pause_reason(), PauseReason::None);
 
@@ -792,7 +829,7 @@ mod tests {
     /// pause overrides it (issue #68).
     #[test]
     fn per_pane_pause_respects_auto_pause_exemption() {
-        let mut core = new_local_core();
+        let mut core = new_remote_core();
         core.toggle_pane_no_auto_pause("w/0");
         assert!(core.pane_no_auto_pause("w/0"));
 
