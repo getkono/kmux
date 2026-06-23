@@ -374,6 +374,15 @@ pub struct SessionState {
     pub next_tab_index: u32,
     /// Default/restored tab view (which tab a client views is client-local).
     pub active_tab: u32,
+    /// Epoch-ms timestamp of the last user input to any pane in this session.
+    ///
+    /// Stored behind an `Arc<AtomicU64>` so the input path can stamp it under
+    /// the `sessions` *read* lock (interior mutability) without contending on a
+    /// write lock. Persisted into `PersistedSession::last_active_ms` at
+    /// checkpoint time so closed sessions can be ordered by recency in the
+    /// restore UI (issue #64). Mirrors [`ConnectionMetrics::last_activity_ms`],
+    /// but per-session and durable.
+    pub last_active: Arc<AtomicU64>,
 }
 
 impl SessionState {
@@ -1417,6 +1426,7 @@ mod tests {
             tabs: vec![],
             next_tab_index: 0,
             active_tab: 0,
+            last_active: Arc::new(AtomicU64::new(0)),
         };
         app.sessions.write().await.insert(word.to_string(), session);
         app

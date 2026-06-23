@@ -23,7 +23,10 @@ use serde::{Deserialize, Serialize};
 /// v2 → v3: `PersistedSession` gains a `tabs` layout layer (Session → Tab →
 /// Pane). v2 checkpoints migrate by wrapping each pane in its own single-pane
 /// tab, preserving the pre-tab "each pane is a switchable view" behavior.
-pub const STATE_VERSION: u32 = 3;
+///
+/// v3 → v4: `PersistedSession` gains `last_active_ms` (issue #64). v3 checkpoints
+/// migrate with `last_active_ms = 0` (treated as "unknown" by the restore UI).
+pub const STATE_VERSION: u32 = 4;
 
 /// On-disk terminal size representation.
 ///
@@ -89,6 +92,10 @@ pub struct PersistedSession {
     pub next_tab_index: u32,
     /// Default/restored tab view.
     pub active_tab: u32,
+    /// Epoch-ms timestamp of the last user input to any pane in this session
+    /// (issue #64). `0` means unknown (e.g. migrated from a pre-v4 checkpoint).
+    /// Used to order closed sessions by recency in the restore UI.
+    pub last_active_ms: u64,
 }
 
 /// One persisted tab: a named layout tree over the session's panes.
@@ -187,6 +194,7 @@ mod tests {
                 }],
                 next_tab_index: 1,
                 active_tab: 0,
+                last_active_ms: 1_700_000_000_000,
             }],
         }
     }
@@ -210,6 +218,7 @@ mod tests {
         assert_eq!(session.meta.word_id, "eagle");
         assert_eq!(session.meta.name, "my-session");
         assert_eq!(session.next_pane_index, 2);
+        assert_eq!(session.last_active_ms, 1_700_000_000_000);
         assert_eq!(session.panes.len(), 1);
 
         let pane = &session.panes[0];

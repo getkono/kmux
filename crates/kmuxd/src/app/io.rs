@@ -6,7 +6,7 @@ use tracing::warn;
 
 use super::ServerApp;
 use super::attach::InputLockOutcome;
-use super::helpers::{get_pane_relay, get_pane_relay_mut};
+use super::helpers::{get_pane_relay, get_pane_relay_mut, touch_session_for_pane};
 
 impl ServerApp {
     /// Forward user input bytes to a pane's PTY stdin.
@@ -25,6 +25,7 @@ impl ServerApp {
                 return Err(KmuxError::Pty(nix::Error::EPERM));
             }
         }
+        touch_session_for_pane(&sessions, pane_id);
         relay.engine.write_input(&data).await
     }
 
@@ -51,6 +52,7 @@ impl ServerApp {
                 return Err(KmuxError::Pty(nix::Error::EPERM));
             }
         }
+        touch_session_for_pane(&sessions, pane_id);
         // The engine encodes each event against the emulator's live mode state
         // (in-process under the term_state lock; in a worker it owns that state)
         // so a mode-mutating sequence from an earlier event is visible to later
@@ -74,6 +76,7 @@ impl ServerApp {
                 return Err(KmuxError::Pty(nix::Error::EPERM));
             }
         }
+        touch_session_for_pane(&sessions, pane_id);
         relay.engine.write_paste(data.as_bytes()).await
     }
 

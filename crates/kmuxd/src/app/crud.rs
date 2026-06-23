@@ -1,10 +1,11 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use kmux_protocol::format_pane_id;
 use kmux_protocol::messages::{
     ClientCapabilities, LayoutNode, PaneId, PaneInfo, PaneProcesses, SessionEntry, SessionMeta,
-    SessionStatus, TermSize,
+    SessionStatus, TermSize, epoch_millis,
 };
 use kmux_pty::error::{KmuxError, Result};
 
@@ -110,6 +111,7 @@ impl ServerApp {
             tabs: vec![tab],
             next_tab_index: 1,
             active_tab: 0,
+            last_active: Arc::new(AtomicU64::new(epoch_millis())),
         };
 
         self.sessions.write().await.insert(word_id.clone(), state);

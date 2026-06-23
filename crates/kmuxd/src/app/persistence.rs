@@ -76,6 +76,7 @@ impl ServerApp {
                 tabs: persisted_tabs,
                 next_tab_index: session_state.next_tab_index,
                 active_tab: session_state.active_tab,
+                last_active_ms: session_state.last_active.load(Ordering::Relaxed),
             });
         }
 

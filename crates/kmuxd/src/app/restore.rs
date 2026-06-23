@@ -5,7 +5,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use kmux_protocol::format_pane_id;
-use kmux_protocol::messages::{ClientCapabilities, InputMode, LayoutNode, SessionStatus};
+use kmux_protocol::messages::{
+    ClientCapabilities, InputMode, LayoutNode, SessionStatus, epoch_millis,
+};
 use kmux_pty::config::{EnvBuilder, PtyConfig};
 use kmux_pty::{PtyProcess, PtyReader, PtySession, PtyWriter};
 use nix::unistd::Pid;
@@ -178,6 +180,15 @@ impl ServerApp {
                 tabs[0].tab_index
             };
 
+            // Preserve the persisted last-active time so restored sessions keep
+            // their place in recency ordering; fall back to "now" for pre-v4
+            // checkpoints that carry no timestamp (migrated value 0).
+            let last_active_ms = if persisted_session.last_active_ms == 0 {
+                epoch_millis()
+            } else {
+                persisted_session.last_active_ms
+            };
+
             let session_state = SessionState {
                 meta: persisted_session.meta.clone(),
                 panes: panes_map,
@@ -185,6 +196,7 @@ impl ServerApp {
                 tabs,
                 next_tab_index,
                 active_tab,
+                last_active: Arc::new(AtomicU64::new(last_active_ms)),
             };
 
             self.sessions
