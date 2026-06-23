@@ -37,6 +37,9 @@ by `hk` and installed by `mise install` (or `mise run setup`).
   writes it to the host terminal. See [docs/architecture-render.md](docs/architecture-render.md).
 - `kmux ls` / `kmux ps` (alias `top`) — list sessions / process overview.
   See [docs/architecture-process-overview.md](docs/architecture-process-overview.md).
+- `kmux clients [<session>]` / `kmux kick <session> <client>` — list the client
+  connections attached to sessions and detach one (issue #146).
+  See [docs/architecture-identity.md](docs/architecture-identity.md).
 - `kmux debug paths` — print the active profile's log/state/runtime paths.
   Debug builds isolate state under `kmux-debug/`.
   See [docs/profile-isolation.md](docs/profile-isolation.md).
@@ -59,3 +62,9 @@ by `hk` and installed by `mise install` (or `mise run setup`).
   mismatch: the data protocol (`PROTOCOL_VERSION`), the `kmux-ffi` C ABI
   (`KMUX_FFI_ABI_VERSION`), the daemon↔worker contract (`kmux-worker-protocol`),
   and `kmux-ghostty-sys` (`EXPECTED_ABI_VERSION`).
+- Every connecting party proves a cryptographic identity (issue #146): the daemon
+  challenges each `Auth` with a random nonce and verifies the Ed25519 signature
+  against the presented public key (its SHA-256 fingerprint is the `machine_id`)
+  before trusting it, so no client can impersonate another. The shared token
+  still gates access; identity is layered on top for attribution + management.
+  See [docs/architecture-identity.md](docs/architecture-identity.md).
