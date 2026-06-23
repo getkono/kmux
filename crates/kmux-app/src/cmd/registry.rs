@@ -198,6 +198,13 @@ fn cmd_launch(app: &mut AppCore, _args: &[String]) -> CommandResult {
     Ok(CommandSuccess::Ok)
 }
 
+/// `/restore` — open the launcher, which lists closed sessions in its "Restore"
+/// section (issue #64). The launcher refreshes the closed-session list on open.
+fn cmd_restore(app: &mut AppCore, _args: &[String]) -> CommandResult {
+    app.open_launch_picker();
+    Ok(CommandSuccess::Ok)
+}
+
 /// `/connect <[user@]host[:port]>` — federate an SSH remote into the local hub
 /// (issue #121): register it, remember it, and connect on focus. The same path
 /// the launcher's add-remote form takes, exposed to the command palette.
@@ -578,6 +585,13 @@ pub static ALL: &[CommandSpec] = &[
         summary: "Open the session launcher (sessions & remotes)",
         args: NO_ARGS,
         run: cmd_launch,
+    },
+    CommandSpec {
+        name: "restore",
+        aliases: &[],
+        summary: "Open the launcher to restore a closed session",
+        args: NO_ARGS,
+        run: cmd_restore,
     },
     CommandSpec {
         name: "connect",

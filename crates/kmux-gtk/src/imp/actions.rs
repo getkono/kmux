@@ -194,6 +194,9 @@ pub fn install(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application)
     add_quit(shell, app);
 
     app.set_accels_for_action("win.command", &["<Ctrl><Shift>p"]);
+    // Open the launcher (sessions + the "Restore" section of closed sessions,
+    // issue #64). "R" for restore.
+    app.set_accels_for_action("win.launch", &["<Ctrl><Shift>r"]);
     app.set_accels_for_action("win.toggle-sidebar", &["F9"]);
     app.set_accels_for_action("win.preferences", &["<Ctrl>comma"]);
     app.set_accels_for_action("win.help", &["<Ctrl>question", "F1"]);

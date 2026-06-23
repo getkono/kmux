@@ -501,6 +501,26 @@ fn launch_row_widget(
             }
             r
         }
+        LaunchRow::ClosedSession {
+            name,
+            cwd,
+            last_active_ms,
+            ..
+        } => {
+            let when = kmux_app::core::relative_time_label(*last_active_ms);
+            let subtitle = if cwd.is_empty() {
+                when.clone()
+            } else {
+                format!("{cwd} · {when}")
+            };
+            let r = launch_action_row(name, &subtitle, "view-refresh-symbolic", false);
+            r.add_suffix(&status_pill(
+                "restore",
+                "accent",
+                Some("Restore this closed session"),
+            ));
+            r
+        }
         LaunchRow::AddRemote => {
             launch_action_row("Add remote…", "", "network-server-symbolic", false)
         }

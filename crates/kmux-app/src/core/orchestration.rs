@@ -408,7 +408,20 @@ impl AppCore {
             }
         }
 
-        // 4. Add a new remote.
+        // 4. Restore section: closed local sessions from the daemon's graveyard
+        //    (issue #64), already ordered most-recently-active first.
+        for c in self.mgr.closed_session_list() {
+            if matches(&c.meta.name) || matches(&c.meta.cwd) {
+                rows.push(LaunchRow::ClosedSession {
+                    word_id: c.meta.word_id.clone(),
+                    name: c.meta.name.clone(),
+                    cwd: c.meta.cwd.clone(),
+                    last_active_ms: c.last_active_ms,
+                });
+            }
+        }
+
+        // 5. Add a new remote.
         rows.push(LaunchRow::AddRemote);
         rows
     }
@@ -1408,6 +1421,62 @@ mod tests {
         )));
         // Add-remote is always the last row.
         assert!(matches!(rows.last(), Some(LaunchRow::AddRemote)));
+    }
+
+    #[test]
+    fn launch_rows_includes_restore_section_filtered_and_ordered() {
+        use kmux_protocol::messages::ClosedSessionEntry;
+        let (mut core, _rx) = connected_core();
+        // Daemon serves closed sessions already ordered most-recently-active
+        // first; launch_rows preserves that order.
+        core.mgr.closed_sessions = vec![
+            ClosedSessionEntry {
+                meta: SessionMeta {
+                    index: 0,
+                    word_id: "hawk".into(),
+                    name: "hawk".into(),
+                    cwd: "/old".into(),
+                },
+                last_active_ms: 2_000,
+                closed_at_ms: 2_000,
+                pane_count: 1,
+            },
+            ClosedSessionEntry {
+                meta: SessionMeta {
+                    index: 1,
+                    word_id: "wren".into(),
+                    name: "wren".into(),
+                    cwd: "/tmp".into(),
+                },
+                last_active_ms: 1_000,
+                closed_at_ms: 1_000,
+                pane_count: 2,
+            },
+        ];
+
+        let rows = core.launch_rows();
+        let closed: Vec<&str> = rows
+            .iter()
+            .filter_map(|r| match r {
+                LaunchRow::ClosedSession { word_id, .. } => Some(word_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closed, vec!["hawk", "wren"]);
+        // The Restore rows sit before the trailing AddRemote row.
+        assert!(matches!(rows.last(), Some(LaunchRow::AddRemote)));
+
+        // The launcher search filters closed sessions too.
+        core.launch_search = "wren".into();
+        let filtered: Vec<String> = core
+            .launch_rows()
+            .iter()
+            .filter_map(|r| match r {
+                LaunchRow::ClosedSession { word_id, .. } => Some(word_id.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(filtered, vec!["wren".to_string()]);
     }
 
     #[test]

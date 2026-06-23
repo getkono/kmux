@@ -624,6 +624,9 @@ impl AppCore {
     pub fn open_launch_picker(&mut self) {
         self.launch_selected = 0;
         self.launch_search.clear();
+        // Refresh the restorable closed-session list so the "Restore" section is
+        // populated by the time the overlay renders (issue #64).
+        self.mgr.request_closed_sessions();
         self.mode = Mode::LaunchPicker;
     }
 
@@ -714,6 +717,12 @@ impl AppCore {
                 self.mode = Mode::LaunchPicker;
             }
             LaunchRow::RemoteNewSession { peer } => self.open_remote_new_session(peer),
+            LaunchRow::ClosedSession { word_id, .. } => {
+                // Respawn the closed session; the daemon's SessionCreated reply
+                // selects it (issue #64).
+                self.mgr.restore_session(&word_id);
+                self.mode = Mode::Normal;
+            }
             LaunchRow::AddRemote => self.open_add_remote(),
         }
     }

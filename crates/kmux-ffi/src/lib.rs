@@ -81,7 +81,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 19;
+pub const KMUX_FFI_ABI_VERSION: u32 = 20;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -1115,6 +1115,8 @@ pub enum FfiLaunchRowKind {
     RemoteNewSession,
     /// Attach an existing session on the remote.
     RemoteExisting,
+    /// Restore a closed (inactive) local session from the graveyard (issue #64).
+    ClosedSession,
     /// Add a new remote (opens the add-remote form).
     AddRemote,
 }
@@ -1255,6 +1257,26 @@ fn launch_row_to_ffi(row: LaunchRow) -> FfiLaunchRow {
             active,
             ..idle
         },
+        LaunchRow::ClosedSession {
+            word_id,
+            name,
+            cwd,
+            last_active_ms,
+        } => {
+            let when = kmux_app::core::relative_time_label(last_active_ms);
+            let detail = if cwd.is_empty() {
+                when
+            } else {
+                format!("{cwd} · {when}")
+            };
+            FfiLaunchRow {
+                kind: FfiLaunchRowKind::ClosedSession,
+                label: name,
+                detail,
+                word_id: Some(word_id),
+                ..idle
+            }
+        }
         LaunchRow::AddRemote => FfiLaunchRow {
             kind: FfiLaunchRowKind::AddRemote,
             label: "Add remote…".to_string(),

@@ -164,8 +164,42 @@ pub enum LaunchRow {
         cwd: String,
         active: bool,
     },
+    /// Restore a closed (inactive) local session from the daemon's graveyard
+    /// (issue #64). Shown in a "Restore" section, ordered most-recently-active
+    /// first. Activating respawns it and attaches.
+    ClosedSession {
+        word_id: String,
+        name: String,
+        cwd: String,
+        /// Epoch-ms of last activity before close; frontends render it as a
+        /// relative "last active" label and the rows are ordered by it.
+        last_active_ms: u64,
+    },
     /// Affordance to add a new remote (SSH or Direct). Always the last row.
     AddRemote,
+}
+
+/// Format an epoch-ms "last active" timestamp as a short relative label for the
+/// restore UI (issue #64): `"just now"`, `"5m ago"`, `"2h ago"`, `"3d ago"`.
+/// `0` (the "unknown" sentinel for pre-v4 sessions) yields `"unknown"`.
+/// Frontend-agnostic so GTK and the Swift FFI render closed-session rows alike.
+pub fn relative_time_label(last_active_ms: u64) -> String {
+    if last_active_ms == 0 {
+        return "unknown".to_string();
+    }
+    let now = kmux_protocol::messages::epoch_millis();
+    let secs = now.saturating_sub(last_active_ms) / 1000;
+    if secs < 5 {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
 }
 
 /// Values collected by the add-remote form (issue #121). The frontend owns the
