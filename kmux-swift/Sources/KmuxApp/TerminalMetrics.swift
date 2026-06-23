@@ -33,16 +33,16 @@ struct TerminalMetrics: Equatable {
             family: appearance.family, size: size, style: appearance.style)
 
         let regular = TerminalMetrics.applyFeatures(rawBase, features: features)
-        self.font = regular
-        self.fontBold = TerminalMetrics.applyFeatures(
+        self.font = TerminalMetrics.withSymbolFallback(regular)
+        self.fontBold = TerminalMetrics.withSymbolFallback(TerminalMetrics.applyFeatures(
             TerminalMetrics.face(rawBase, family: appearance.familyBold, size: size, bold: true, italic: false),
-            features: features)
-        self.fontItalic = TerminalMetrics.applyFeatures(
+            features: features))
+        self.fontItalic = TerminalMetrics.withSymbolFallback(TerminalMetrics.applyFeatures(
             TerminalMetrics.face(rawBase, family: appearance.familyItalic, size: size, bold: false, italic: true),
-            features: features)
-        self.fontBoldItalic = TerminalMetrics.applyFeatures(
+            features: features))
+        self.fontBoldItalic = TerminalMetrics.withSymbolFallback(TerminalMetrics.applyFeatures(
             TerminalMetrics.face(rawBase, family: appearance.familyBoldItalic, size: size, bold: true, italic: true),
-            features: features)
+            features: features))
 
         self.ascent = regular.ascender
         let descent = -regular.descender  // descender is negative
@@ -57,10 +57,13 @@ struct TerminalMetrics: Equatable {
     /// fallback and in tests.
     init(font: NSFont) {
         let size = font.pointSize
-        self.font = font
-        self.fontBold = TerminalMetrics.face(font, family: nil, size: size, bold: true, italic: false)
-        self.fontItalic = TerminalMetrics.face(font, family: nil, size: size, bold: false, italic: true)
-        self.fontBoldItalic = TerminalMetrics.face(font, family: nil, size: size, bold: true, italic: true)
+        self.font = TerminalMetrics.withSymbolFallback(font)
+        self.fontBold = TerminalMetrics.withSymbolFallback(
+            TerminalMetrics.face(font, family: nil, size: size, bold: true, italic: false))
+        self.fontItalic = TerminalMetrics.withSymbolFallback(
+            TerminalMetrics.face(font, family: nil, size: size, bold: false, italic: true))
+        self.fontBoldItalic = TerminalMetrics.withSymbolFallback(
+            TerminalMetrics.face(font, family: nil, size: size, bold: true, italic: true))
         self.ascent = font.ascender
         let descent = -font.descender
         self.cellHeight = max(1, (font.ascender + descent).rounded(.up))
@@ -135,6 +138,26 @@ struct TerminalMetrics: Equatable {
         }
         guard !settings.isEmpty else { return font }
         let desc = font.fontDescriptor.addingAttributes([.featureSettings: settings])
+        return NSFont(descriptor: desc, size: font.pointSize) ?? font
+    }
+
+    /// Add the bundled symbol fallback font to `font`'s CoreText cascade list so
+    /// `NSAttributedString.draw()` substitutes it for the Powerline (U+E0B0–) and
+    /// Nerd Private Use Area glyphs the configured face lacks (issue #145).
+    /// Registering the font (`FontFallback`) only makes it discoverable by name;
+    /// the cascade list is what makes CoreText actually fall back to it. The
+    /// symbol descriptor is prepended to the font's *default* cascade list so PUA
+    /// glyphs resolve to it while the system's emoji/CJK fallbacks are preserved.
+    /// Returns `font` unchanged if the fallback descriptor or rebuilt face is
+    /// unavailable.
+    private static func withSymbolFallback(_ font: NSFont) -> NSFont {
+        guard let symbol = symbolFallbackDescriptor else { return font }
+        let defaults =
+            (CTFontCopyDefaultCascadeListForLanguages(font as CTFont, nil) as? [CTFontDescriptor])
+            ?? []
+        let cascade = [symbol] + defaults
+        let key = NSFontDescriptor.AttributeName(kCTFontCascadeListAttribute as String)
+        let desc = font.fontDescriptor.addingAttributes([key: cascade])
         return NSFont(descriptor: desc, size: font.pointSize) ?? font
     }
 

@@ -1,3 +1,5 @@
+import AppKit
+import CoreText
 import XCTest
 
 import KmuxBindings
@@ -77,6 +79,53 @@ final class RenderingTests: XCTestCase {
         let (c0, r0) = m.colsRows(width: 0, height: 0)
         XCTAssertEqual(c0, 1)
         XCTAssertEqual(r0, 1)
+    }
+
+    /// Number of painted (non-transparent) pixels when `s` is drawn at `.zero`
+    /// with `font` via `NSAttributedString.draw` — the exact mechanism
+    /// `TerminalView.drawGlyph` uses (NSStringDrawing, not `CTLine`).
+    private func drawnInk(_ s: String, font: NSFont) -> Int {
+        guard
+            let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: 40, pixelsHigh: 40, bitsPerSample: 8,
+                samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                bytesPerRow: 0, bitsPerPixel: 0)
+        else { return -1 }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSAttributedString(string: s, attributes: [.font: font, .foregroundColor: NSColor.white])
+            .draw(at: .zero)
+        NSGraphicsContext.restoreGraphicsState()
+        guard let data = rep.bitmapData else { return -1 }
+        var count = 0
+        for i in stride(from: 3, to: rep.bytesPerRow * 40, by: 4) where data[i] != 0 { count += 1 }
+        return count
+    }
+
+    func testCoreTextRendersFallbackGlyphsOnTheDrawPath() {
+        // Regression guard for issue #145 on the default CoreText path. The grid
+        // draws via NSAttributedString.draw (NSStringDrawing) — NOT CTLine — so we
+        // assert at that layer: a Powerline (U+E0B0) and a Nerd icon (U+F015), both
+        // absent from Menlo, must paint the SAME pixels through the metrics face as
+        // they do when drawn directly with the bundled symbol font. That proves the
+        // cascade list TerminalMetrics installs actually takes effect when drawing;
+        // registering the font (FontFallback) alone does not.
+        guard let menlo = NSFont(name: "Menlo", size: 13), let symDesc = symbolFallbackDescriptor
+        else {
+            XCTFail("Menlo or symbol fallback descriptor unavailable")
+            return
+        }
+        let m = TerminalMetrics(font: menlo)
+        let symbol = CTFontCreateWithFontDescriptor(symDesc, 13, nil) as NSFont
+
+        for pua in ["\u{E0B0}", "\u{F015}"] {
+            let scalar = String(format: "U+%04X", pua.unicodeScalars.first!.value)
+            let viaCascade = drawnInk(pua, font: m.font)
+            let viaSymbol = drawnInk(pua, font: symbol)
+            XCTAssertGreaterThan(viaCascade, 0, "\(scalar) painted nothing through the cascade")
+            XCTAssertEqual(
+                viaCascade, viaSymbol, "\(scalar) did not fall back to the bundled symbol font")
+        }
     }
 
     func testMetricsFromAppearanceAppliesCellAdjust() {
