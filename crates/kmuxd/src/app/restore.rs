@@ -85,127 +85,148 @@ impl ServerApp {
 
         for persisted_session in state.sessions {
             let word_id = persisted_session.meta.word_id.clone();
-            let mut panes_map: HashMap<u32, PaneRelay> = HashMap::new();
-            let session_cwd = PathBuf::from(&persisted_session.meta.cwd);
-            let effective_cwd = resolve_cwd(&session_cwd);
-
-            for persisted_pane in persisted_session.panes {
-                let pane_index = persisted_pane.pane_index;
-                let pane_id = format_pane_id(&word_id, pane_index);
-                let inherited_fd = inherited.remove(&pane_id);
-
-                match self
-                    .restore_one_pane(&pane_id, &persisted_pane, inherited_fd, &effective_cwd)
-                    .await
-                {
-                    Some((relay, was_live)) => {
-                        panes_map.insert(pane_index, relay);
-                        report.restored += 1;
-                        if was_live {
-                            report.alive += 1;
-                        } else {
-                            report.dead += 1;
-                        }
-                    }
-                    None => continue,
-                }
-            }
-
-            if panes_map.is_empty() {
-                // All panes failed to spawn — release the word ID.
-                self.wordlist
-                    .lock()
-                    .unwrap()
-                    .release(&persisted_session.meta.word_id);
-                continue;
-            }
-
-            // Reconcile the persisted tabs against the panes that actually
-            // restored: drop dead leaves (collapsing splits) and tabs whose
-            // panes all failed, and refocus if the focused pane is gone.
-            let mut tabs: Vec<super::TabState> = Vec::new();
-            for pt in &persisted_session.tabs {
-                let mut layout = pt.layout.clone();
-                let missing: Vec<u32> = layout
-                    .leaves()
-                    .into_iter()
-                    .filter(|i| !panes_map.contains_key(i))
-                    .collect();
-                for m in missing {
-                    super::layout::remove_pane(&mut layout, m);
-                }
-                let live: Vec<u32> = layout
-                    .leaves()
-                    .into_iter()
-                    .filter(|i| panes_map.contains_key(i))
-                    .collect();
-                if live.is_empty() {
-                    continue;
-                }
-                let focused = if panes_map.contains_key(&pt.focused_pane) {
-                    pt.focused_pane
-                } else {
-                    live[0]
-                };
-                tabs.push(super::TabState {
-                    tab_index: pt.tab_index,
-                    name: pt.name.clone(),
-                    layout,
-                    focused_pane: focused,
-                });
-            }
-            // Fallback for a checkpoint with no usable tabs: wrap each restored
-            // pane in its own single-pane tab.
-            if tabs.is_empty() {
-                let mut indices: Vec<u32> = panes_map.keys().copied().collect();
-                indices.sort_unstable();
-                for (i, idx) in indices.into_iter().enumerate() {
-                    tabs.push(super::TabState {
-                        tab_index: i as u32,
-                        name: format!("{}", i + 1),
-                        layout: LayoutNode::single(idx),
-                        focused_pane: idx,
-                    });
-                }
-            }
-            let next_tab_index = persisted_session
-                .next_tab_index
-                .max(tabs.iter().map(|t| t.tab_index + 1).max().unwrap_or(0));
-            let active_tab = if tabs
-                .iter()
-                .any(|t| t.tab_index == persisted_session.active_tab)
-            {
-                persisted_session.active_tab
-            } else {
-                tabs[0].tab_index
-            };
-
-            // Preserve the persisted last-active time so restored sessions keep
-            // their place in recency ordering; fall back to "now" for pre-v4
-            // checkpoints that carry no timestamp (migrated value 0).
-            let last_active_ms = if persisted_session.last_active_ms == 0 {
-                epoch_millis()
-            } else {
-                persisted_session.last_active_ms
-            };
-
-            let session_state = SessionState {
-                meta: persisted_session.meta.clone(),
-                panes: panes_map,
-                next_pane_index: persisted_session.next_pane_index,
-                tabs,
-                next_tab_index,
-                active_tab,
-                last_active: Arc::new(AtomicU64::new(last_active_ms)),
-            };
-
-            self.sessions
-                .write()
+            match self
+                .restore_one_session(persisted_session, &mut inherited, &mut report)
                 .await
-                .insert(word_id.clone(), session_state);
+            {
+                Some(session_state) => {
+                    self.sessions.write().await.insert(word_id, session_state);
+                }
+                None => {
+                    // All panes failed to spawn — release the word ID.
+                    self.wordlist.lock().unwrap().release(&word_id);
+                }
+            }
         }
 
         report
+    }
+
+    /// Rebuild a single session from its persisted snapshot.
+    ///
+    /// Adopts inherited live fds for any panes present in `inherited` (handoff),
+    /// respawning the rest. Reconciles the persisted tabs against the panes that
+    /// actually came back. Returns `None` if every pane failed (the caller then
+    /// releases the word). Updates `report` with per-pane alive/dead counts.
+    ///
+    /// Shared by cold-start restore ([`restore_inner`](Self::restore_inner)) and
+    /// on-demand restore of a closed session ([`restore_session`](Self::restore_session),
+    /// issue #64), which passes an empty `inherited` so every pane respawns.
+    pub(super) async fn restore_one_session(
+        &self,
+        persisted_session: crate::persist::PersistedSession,
+        inherited: &mut HashMap<String, (OwnedFd, Pid)>,
+        report: &mut RestoreReport,
+    ) -> Option<SessionState> {
+        let word_id = persisted_session.meta.word_id.clone();
+        let mut panes_map: HashMap<u32, PaneRelay> = HashMap::new();
+        let session_cwd = PathBuf::from(&persisted_session.meta.cwd);
+        let effective_cwd = resolve_cwd(&session_cwd);
+
+        for persisted_pane in persisted_session.panes {
+            let pane_index = persisted_pane.pane_index;
+            let pane_id = format_pane_id(&word_id, pane_index);
+            let inherited_fd = inherited.remove(&pane_id);
+
+            match self
+                .restore_one_pane(&pane_id, &persisted_pane, inherited_fd, &effective_cwd)
+                .await
+            {
+                Some((relay, was_live)) => {
+                    panes_map.insert(pane_index, relay);
+                    report.restored += 1;
+                    if was_live {
+                        report.alive += 1;
+                    } else {
+                        report.dead += 1;
+                    }
+                }
+                None => continue,
+            }
+        }
+
+        if panes_map.is_empty() {
+            return None;
+        }
+
+        // Reconcile the persisted tabs against the panes that actually
+        // restored: drop dead leaves (collapsing splits) and tabs whose
+        // panes all failed, and refocus if the focused pane is gone.
+        let mut tabs: Vec<super::TabState> = Vec::new();
+        for pt in &persisted_session.tabs {
+            let mut layout = pt.layout.clone();
+            let missing: Vec<u32> = layout
+                .leaves()
+                .into_iter()
+                .filter(|i| !panes_map.contains_key(i))
+                .collect();
+            for m in missing {
+                super::layout::remove_pane(&mut layout, m);
+            }
+            let live: Vec<u32> = layout
+                .leaves()
+                .into_iter()
+                .filter(|i| panes_map.contains_key(i))
+                .collect();
+            if live.is_empty() {
+                continue;
+            }
+            let focused = if panes_map.contains_key(&pt.focused_pane) {
+                pt.focused_pane
+            } else {
+                live[0]
+            };
+            tabs.push(super::TabState {
+                tab_index: pt.tab_index,
+                name: pt.name.clone(),
+                layout,
+                focused_pane: focused,
+            });
+        }
+        // Fallback for a checkpoint with no usable tabs: wrap each restored
+        // pane in its own single-pane tab.
+        if tabs.is_empty() {
+            let mut indices: Vec<u32> = panes_map.keys().copied().collect();
+            indices.sort_unstable();
+            for (i, idx) in indices.into_iter().enumerate() {
+                tabs.push(super::TabState {
+                    tab_index: i as u32,
+                    name: format!("{}", i + 1),
+                    layout: LayoutNode::single(idx),
+                    focused_pane: idx,
+                });
+            }
+        }
+        let next_tab_index = persisted_session
+            .next_tab_index
+            .max(tabs.iter().map(|t| t.tab_index + 1).max().unwrap_or(0));
+        let active_tab = if tabs
+            .iter()
+            .any(|t| t.tab_index == persisted_session.active_tab)
+        {
+            persisted_session.active_tab
+        } else {
+            tabs[0].tab_index
+        };
+
+        // Preserve the persisted last-active time so restored sessions keep
+        // their place in recency ordering; fall back to "now" for pre-v4
+        // checkpoints that carry no timestamp (migrated value 0).
+        let last_active_ms = if persisted_session.last_active_ms == 0 {
+            epoch_millis()
+        } else {
+            persisted_session.last_active_ms
+        };
+
+        Some(SessionState {
+            meta: persisted_session.meta.clone(),
+            panes: panes_map,
+            next_pane_index: persisted_session.next_pane_index,
+            tabs,
+            next_tab_index,
+            active_tab,
+            last_active: Arc::new(AtomicU64::new(last_active_ms)),
+        })
     }
 
     /// Restore a single pane: adopt its inherited live fd if one was handed off,

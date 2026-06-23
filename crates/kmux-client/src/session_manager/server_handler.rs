@@ -230,6 +230,12 @@ impl SessionManager {
                 events.push(SessionEvent::SessionListReceived);
             }
 
+            ServerMessage::ClosedSessionListResult { sessions, .. } => {
+                // Already ordered most-recently-active first by the daemon. The
+                // launcher polls `closed_session_list()` when it opens (issue #64).
+                self.closed_sessions = sessions;
+            }
+
             ServerMessage::ProcessOverviewResult { panes, .. } => {
                 self.process_overview = panes;
                 events.push(SessionEvent::ProcessOverviewReceived);

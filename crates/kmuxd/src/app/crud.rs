@@ -164,35 +164,38 @@ impl ServerApp {
         Ok(None)
     }
 
+    /// Build the wire [`SessionEntry`] for one live session (local; `peer: None`).
+    /// Shared by [`list_sessions`](Self::list_sessions) and the restore path.
+    pub(super) fn build_session_entry(&self, state: &SessionState) -> SessionEntry {
+        let mut panes: Vec<PaneInfo> = state
+            .panes
+            .iter()
+            .map(|(&pane_index, relay)| {
+                let attached_clients = relay.clients.lock().unwrap().keys().copied().collect();
+                relay.to_pane_info(
+                    format_pane_id(&state.meta.word_id, pane_index),
+                    pane_index,
+                    attached_clients,
+                    relay.status.clone(),
+                )
+            })
+            .collect();
+        panes.sort_by_key(|p| p.pane_index);
+        SessionEntry {
+            meta: state.meta.clone(),
+            panes,
+            tabs: state.tab_infos(),
+            active_tab: state.active_tab,
+            peer: None,
+        }
+    }
+
     /// List all active sessions with their pane metadata.
     pub async fn list_sessions(&self) -> Vec<SessionEntry> {
         let sessions = self.sessions.read().await;
         let mut entries: Vec<SessionEntry> = sessions
             .values()
-            .map(|state| {
-                let mut panes: Vec<PaneInfo> = state
-                    .panes
-                    .iter()
-                    .map(|(&pane_index, relay)| {
-                        let attached_clients =
-                            relay.clients.lock().unwrap().keys().copied().collect();
-                        relay.to_pane_info(
-                            format_pane_id(&state.meta.word_id, pane_index),
-                            pane_index,
-                            attached_clients,
-                            relay.status.clone(),
-                        )
-                    })
-                    .collect();
-                panes.sort_by_key(|p| p.pane_index);
-                SessionEntry {
-                    meta: state.meta.clone(),
-                    panes,
-                    tabs: state.tab_infos(),
-                    active_tab: state.active_tab,
-                    peer: None,
-                }
-            })
+            .map(|state| self.build_session_entry(state))
             .collect();
         entries.sort_by_key(|e| e.meta.index);
         entries

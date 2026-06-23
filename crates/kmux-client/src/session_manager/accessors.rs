@@ -25,6 +25,13 @@ impl SessionManager {
         &self.session_list
     }
 
+    /// Closed (inactive) sessions offered for restore (issue #64), ordered
+    /// most-recently-active first. Empty until [`Self::request_closed_sessions`]
+    /// has been answered by the daemon.
+    pub fn closed_session_list(&self) -> &[kmux_protocol::messages::ClosedSessionEntry] {
+        &self.closed_sessions
+    }
+
     /// Latest per-pane process trees (issue #122), as last delivered by the
     /// daemon. Empty until the first `ProcessOverviewResult` arrives.
     pub fn process_overview(&self) -> &[kmux_protocol::messages::PaneProcesses] {

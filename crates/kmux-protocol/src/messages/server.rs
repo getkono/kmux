@@ -3,8 +3,9 @@ use std::sync::Arc;
 use super::category::MessageCategory;
 use super::process::PaneProcesses;
 use super::session::{
-    ClientId, ClientInfo, ConnectionId, DirEntry, ErrorCode, LayoutNode, PaneId, PaneInfo, PeerId,
-    RequestId, SequenceNo, SessionEntry, SessionEventMsg, TabIndex, TabInfo, WordId,
+    ClientId, ClientInfo, ClosedSessionEntry, ConnectionId, DirEntry, ErrorCode, LayoutNode,
+    PaneId, PaneInfo, PeerId, RequestId, SequenceNo, SessionEntry, SessionEventMsg, TabIndex,
+    TabInfo, WordId,
 };
 use super::types::Compression;
 use super::vt::{CellState, CursorState, GridSnapshot, TermModes, TerminalDiff};
@@ -77,6 +78,13 @@ pub enum ServerMessage {
     SessionListResult {
         request_id: RequestId,
         sessions: Vec<SessionEntry>,
+    },
+
+    /// Response to `SessionListClosed` (issue #64): the closed (inactive)
+    /// sessions retained in the daemon's graveyard, newest-active first.
+    ClosedSessionListResult {
+        request_id: RequestId,
+        sessions: Vec<ClosedSessionEntry>,
     },
 
     /// Response to `ProcessOverview` (issue #122): the process tree of every
@@ -307,6 +315,7 @@ impl ServerMessage {
             Self::SessionCreated { .. }
             | Self::SessionClosed { .. }
             | Self::SessionListResult { .. }
+            | Self::ClosedSessionListResult { .. }
             | Self::ProcessOverviewResult { .. }
             | Self::SessionRenamed { .. }
             | Self::PaneCreated { .. }

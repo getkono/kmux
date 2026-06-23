@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ClientInfo, ClientMessage, PaneId, PaneProcesses, SequenceNo,
-    SessionEntry, TermSize, WordId,
+    ClientCapabilities, ClientId, ClientInfo, ClientMessage, ClosedSessionEntry, PaneId,
+    PaneProcesses, SequenceNo, SessionEntry, TermSize, WordId,
 };
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -69,6 +69,10 @@ pub struct SessionManager {
 
     // Session / tab / pane state
     pub session_list: Vec<SessionEntry>,
+    /// Closed (inactive) sessions offered for restore (issue #64), refreshed by
+    /// [`Self::request_closed_sessions`] (e.g. when the launcher opens) and
+    /// served already ordered most-recently-active first by the daemon.
+    pub closed_sessions: Vec<ClosedSessionEntry>,
     /// Latest per-pane process trees from the daemon (issue #122), keyed
     /// implicitly by `PaneProcesses::pane_id`. Refreshed by
     /// [`Self::request_process_overview`] while the process-overview view is
@@ -204,6 +208,7 @@ impl SessionManager {
             connected: false,
             status_msg: String::new(),
             session_list: Vec::new(),
+            closed_sessions: Vec::new(),
             process_overview: Vec::new(),
             client_list: Vec::new(),
             client_list_word: None,

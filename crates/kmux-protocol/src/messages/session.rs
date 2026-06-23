@@ -417,6 +417,23 @@ pub struct SessionEntry {
     pub peer: Option<PeerId>,
 }
 
+/// A closed (inactive) session retained in the daemon's graveyard and offered
+/// for restore (issue #64). Lightweight: the heavy snapshot stays on the daemon,
+/// keyed by `meta.word_id`; the client only needs enough to render and order the
+/// restore list, then sends [`super::client::ClientMessage::SessionRestore`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClosedSessionEntry {
+    /// Identity and display metadata of the closed session.
+    pub meta: SessionMeta,
+    /// Epoch-ms timestamp of the last user input before it closed; the restore
+    /// UI orders the list by this (most-recently-active first).
+    pub last_active_ms: u64,
+    /// Epoch-ms timestamp of when the session was closed.
+    pub closed_at_ms: u64,
+    /// Number of panes that will be respawned on restore.
+    pub pane_count: u32,
+}
+
 /// Input control mode for a pane.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum InputMode {

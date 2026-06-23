@@ -13,12 +13,14 @@
 //!   rewrites the file only if it actually pruned something (so a steady state
 //!   costs zero extra I/O).
 
-use kmux_protocol::messages::epoch_millis;
+use kmux_protocol::messages::{ClosedSessionEntry, SessionEntry, epoch_millis};
+use kmux_pty::error::{KmuxError, Result};
 use tracing::warn;
 
 use crate::persist::{GRAVEYARD_VERSION, PersistedClosedSession, PersistedGraveyard};
 
 use super::ServerApp;
+use super::persistence::RestoreReport;
 
 impl ServerApp {
     /// Retain a just-closed session in the graveyard: push it, enforce the caps,
@@ -67,6 +69,75 @@ impl ServerApp {
             wl.release(word);
         }
         true
+    }
+
+    /// Snapshot the graveyard as wire [`ClosedSessionEntry`]s for the restore
+    /// UI, ordered most-recently-active first (issue #64).
+    pub(crate) fn closed_session_entries(&self) -> Vec<ClosedSessionEntry> {
+        let mut entries: Vec<ClosedSessionEntry> = self
+            .closed_sessions
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|c| ClosedSessionEntry {
+                meta: c.session.meta.clone(),
+                last_active_ms: c.session.last_active_ms,
+                closed_at_ms: c.closed_at_ms,
+                pane_count: c.session.panes.len() as u32,
+            })
+            .collect();
+        entries.sort_by_key(|e| std::cmp::Reverse(e.last_active_ms));
+        entries
+    }
+
+    /// Restore a closed session from the graveyard (issue #64): respawn its
+    /// panes (replaying scrollback), move it into the live map, and rewrite the
+    /// graveyard file. The word was already reserved while inactive, so it
+    /// carries over to the live session unchanged.
+    ///
+    /// A failed restore leaves the snapshot in the graveyard (and its word
+    /// reserved) so the user can retry; the entry is only removed on success.
+    pub(crate) async fn restore_session(&self, word_id: &str) -> Result<SessionEntry> {
+        let snapshot = {
+            let guard = self.closed_sessions.lock().unwrap();
+            guard
+                .iter()
+                .find(|c| c.session.meta.word_id == word_id)
+                .map(|c| c.session.clone())
+        };
+        let Some(snapshot) = snapshot else {
+            return Err(KmuxError::SessionNotFound {
+                name: word_id.to_string(),
+            });
+        };
+
+        // Graveyard sessions always respawn (no inherited live fds).
+        let mut report = RestoreReport::default();
+        let mut inherited = std::collections::HashMap::new();
+        let Some(state) = self
+            .restore_one_session(snapshot, &mut inherited, &mut report)
+            .await
+        else {
+            return Err(KmuxError::Spawn(format!(
+                "failed to restore closed session '{word_id}'"
+            )));
+        };
+
+        let entry = self.build_session_entry(&state);
+        self.sessions
+            .write()
+            .await
+            .insert(word_id.to_string(), state);
+
+        // Success: drop the entry and rewrite the file. The reserved word now
+        // belongs to the live session.
+        self.closed_sessions
+            .lock()
+            .unwrap()
+            .retain(|c| c.session.meta.word_id != word_id);
+        self.persist_graveyard();
+
+        Ok(entry)
     }
 
     /// Prune by TTL/count and rewrite the graveyard file only if it changed.
@@ -254,6 +325,41 @@ mod tests {
             .unwrap()
             .push(closed("eagle", epoch_millis()));
         assert!(!app.prune_graveyard(), "nothing to prune → no change");
+    }
+
+    #[tokio::test]
+    async fn close_then_restore_roundtrip() {
+        use kmux_protocol::messages::{ClientCapabilities, TermSize};
+
+        let app = ServerApp::new("tok".to_string());
+        let entry = app
+            .create_session(
+                None,
+                Some("/tmp".to_string()),
+                Some("/bin/sleep".to_string()),
+                vec!["30".to_string()],
+                TermSize::default(),
+                &ClientCapabilities::default(),
+            )
+            .await
+            .expect("create_session");
+        let word = entry.meta.word_id.clone();
+
+        // Close → session leaves the live map and lands in the graveyard.
+        app.close_session(&word).await.expect("close_session");
+        assert!(app.sessions.read().await.get(&word).is_none());
+        assert_eq!(words(&app), vec![word.clone()]);
+
+        // Restore → session is live again and gone from the graveyard.
+        let restored = app.restore_session(&word).await.expect("restore_session");
+        assert_eq!(restored.meta.word_id, word);
+        assert!(app.sessions.read().await.get(&word).is_some());
+        assert!(app.closed_sessions.lock().unwrap().is_empty());
+
+        // Restoring a word that isn't in the graveyard errors.
+        assert!(app.restore_session("nonexistent").await.is_err());
+
+        let _ = app.close_session(&word).await; // clean up the spawned child
     }
 
     #[tokio::test]
