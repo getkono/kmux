@@ -322,8 +322,8 @@ struct KmuxCommands: Commands {
 
     private var connectedClientsBinding: Binding<Bool> {
         Binding(
-            get: { if case .connectedClients = model.mode { return true } else { return false } },
-            set: { _ in model.dispatch(.toggleConnectedClients) }
+            get: { if case .connectedClients = model?.mode { return true } else { return false } },
+            set: { _ in model?.dispatch(.toggleConnectedClients) }
         )
     }
 

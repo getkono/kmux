@@ -4,12 +4,15 @@
 //! door ([`kmux_app::launch::run_cli`]) with the frontends, so the
 //! non-interactive subcommands (`daemon …`, `ls`, `--dry-run`) behave
 //! identically everywhere without ever loading a UI toolkit. For an interactive
-//! launch it hands off to the platform's desktop client by `exec`ing it:
+//! launch it hands off to the platform's desktop client:
 //!
-//! - **Linux:** the GTK frontend binary `kmux-gtk` (the default + official
-//!   client), located next to this executable or on `PATH`.
-//! - **macOS:** the native Swift app bundle (`~/Applications/kmux.app`,
-//!   overridable with `KMUX_APP`).
+//! - **Linux:** `exec`s the GTK frontend binary `kmux-gtk` (the default +
+//!   official client), located next to this executable or on `PATH`.
+//! - **macOS:** launches the native Swift app bundle (`~/Applications/kmux.app`,
+//!   overridable with `KMUX_APP`) via `open` so each invocation gets its own
+//!   window. As a dev convenience, when `KMUX_APP` points at a bare `kmux-swift`
+//!   executable rather than a `.app` bundle, it is `exec`ed in the foreground
+//!   instead — see [`launch_desktop`].
 
 use kmux_app::launch::{Launch, run_cli};
 use kmux_client::generate_instance_id;
@@ -104,7 +107,9 @@ fn nested_kmux_check() -> anyhow::Result<bool> {
 /// Linux: exec the GTK frontend, forwarding our arguments.
 #[cfg(target_os = "linux")]
 fn launch_desktop() -> anyhow::Result<()> {
-    exec_forwarding(locate_binary("kmux-gtk")?)
+    let bin = locate_binary("kmux-gtk")?;
+    let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
+    exec_forwarding(&bin, &args)
 }
 
 /// macOS: launch the native Swift app bundle via `open` so each `kmux`
@@ -115,6 +120,13 @@ fn launch_desktop() -> anyhow::Result<()> {
 /// exec of the bundle binary — is what makes the running-instance routing work,
 /// fixing repeated launches collapsing into one window. `KMUX_APP` overrides the
 /// bundle location (defaults to `~/Applications/kmux.app`).
+///
+/// Dev exception: when `KMUX_APP` points at a regular file (the freshly built
+/// `kmux-swift` executable, not a `.app` directory — the layout the `dev` mise
+/// task sets up), `exec` it directly in the foreground, forwarding the same
+/// `--launch-url`. That keeps its stdio attached to the launching terminal so
+/// logs/backtraces stream there (what `./kmux` relies on), and routes the dev
+/// GUI through this very entrypoint instead of a parallel `swift run` path.
 #[cfg(target_os = "macos")]
 fn launch_desktop() -> anyhow::Result<()> {
     use clap::Parser;
@@ -122,6 +134,19 @@ fn launch_desktop() -> anyhow::Result<()> {
     let app = std::env::var_os("KMUX_APP")
         .map(std::path::PathBuf::from)
         .unwrap_or_else(default_app_bundle);
+
+    let url = build_launch_url(&kmux_app::cli::Cli::parse());
+
+    if app.is_file() {
+        return exec_forwarding(
+            &app,
+            &[
+                std::ffi::OsString::from("--launch-url"),
+                std::ffi::OsString::from(&url),
+            ],
+        );
+    }
+
     let exe = app.join("Contents/MacOS/kmux-swift");
     if !exe.is_file() {
         anyhow::bail!(
@@ -130,7 +155,6 @@ fn launch_desktop() -> anyhow::Result<()> {
         );
     }
 
-    let url = build_launch_url(&kmux_app::cli::Cli::parse());
     if swift_app_running() {
         // Running: route to the existing instance → it opens a new window.
         run_open(&[std::ffi::OsString::from(&url)])
@@ -244,16 +268,18 @@ fn launch_desktop() -> anyhow::Result<()> {
     )
 }
 
-/// Replace this process with `bin`, forwarding our arguments (minus argv[0]).
-/// `exec` only returns on failure. Linux only — macOS launches via `open` (see
-/// [`launch_desktop`]) so it can route to the running app instance.
-#[cfg(target_os = "linux")]
-fn exec_forwarding(bin: std::path::PathBuf) -> anyhow::Result<()> {
+/// Replace this process with `bin`, passing `args`. `exec` only returns on
+/// failure, so on success this never returns and the frontend inherits our
+/// stdio (its output streams to the launching terminal). Used by Linux (the
+/// `kmux-gtk` handoff, forwarding our argv) and by the macOS dev path (`exec`ing
+/// the bare `kmux-swift` executable with `--launch-url`); macOS prod launches
+/// via `open` instead (see [`launch_desktop`]) so it can route to a running
+/// instance.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn exec_forwarding(bin: &std::path::Path, args: &[std::ffi::OsString]) -> anyhow::Result<()> {
     use anyhow::Context;
     use std::os::unix::process::CommandExt;
-    let err = std::process::Command::new(&bin)
-        .args(std::env::args_os().skip(1))
-        .exec();
+    let err = std::process::Command::new(bin).args(args).exec();
     Err(err).with_context(|| format!("failed to launch {}", bin.display()))
 }
 
