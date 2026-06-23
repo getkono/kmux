@@ -59,6 +59,19 @@ pub enum SessionEvent {
     /// A directory listing arrived (in response to `request_list_directory`);
     /// the app-layer directory browser should repaint.
     DirectoryListed,
+    /// The connected-clients list arrived (issue #146) in response to
+    /// [`SessionManager::request_client_list`]; the connected-clients view should
+    /// repaint from [`SessionManager::client_list`]. `word_id` is the session it
+    /// pertains to.
+    ClientListReceived { word_id: String },
+    /// A kick this client requested succeeded (issue #146).
+    ClientKicked {
+        word_id: String,
+        client_id: ClientId,
+    },
+    /// This client was kicked from `word_id` by another client (issue #146);
+    /// `by_label` names who. The app should leave the session.
+    KickedFromSession { word_id: String, by_label: String },
     /// A federated peer was opened (issue #121): the local daemon now proxies
     /// the remote's sessions. The app should refresh the session list so they
     /// surface, then (re)run auto-select.
@@ -147,11 +160,17 @@ impl SessionManager {
                 server_version,
                 connection_id,
                 compression,
+                machine_id,
+                label,
+                server_machine_id,
             } => {
                 if success {
                     self.client_id = client_id;
                     self.server_version = server_version;
                     self.connection_id = connection_id;
+                    self.machine_id = machine_id;
+                    self.label = label;
+                    self.server_machine_id = server_machine_id;
                     // The daemon decides compression; frames self-describe, so
                     // this is informational only (see docs/compression.md).
                     info!("Authenticated (wire compression: {compression:?})");
@@ -703,6 +722,29 @@ impl SessionManager {
 
             // Federation responses (issue #121). The local daemon sends these
             // after we issue `OpenPeer`/`ClosePeer` to federate a remote server.
+            // The handshake challenge is consumed by the connection bootstrap; the
+            // session manager never sees it in practice. Ignore for exhaustiveness.
+            ServerMessage::AuthChallenge { .. } => {}
+
+            ServerMessage::ClientListResult {
+                word_id, clients, ..
+            } => {
+                self.client_list = clients;
+                self.client_list_word = Some(word_id.clone());
+                events.push(SessionEvent::ClientListReceived { word_id });
+            }
+
+            ServerMessage::ClientKicked {
+                word_id, client_id, ..
+            } => {
+                events.push(SessionEvent::ClientKicked { word_id, client_id });
+            }
+
+            ServerMessage::SessionKicked { word_id, by_label } => {
+                warn!("kicked from session {word_id} by {by_label}");
+                events.push(SessionEvent::KickedFromSession { word_id, by_label });
+            }
+
             ServerMessage::PeerOpened { peer, .. } => {
                 events.push(SessionEvent::PeerOpened { peer });
             }

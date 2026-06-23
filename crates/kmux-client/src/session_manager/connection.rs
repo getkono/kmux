@@ -1,6 +1,6 @@
 use std::time::Instant;
 
-use kmux_protocol::messages::{ClientMessage, PeerId, PeerTarget, ServerMessage};
+use kmux_protocol::messages::{ClientId, ClientMessage, PeerId, PeerTarget, ServerMessage, WordId};
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -103,6 +103,29 @@ impl SessionManager {
     pub fn request_process_overview(&mut self) {
         let rid = self.next_rid();
         self.send_ws(ClientMessage::ProcessOverview { request_id: rid });
+    }
+
+    /// Request the connections attached to `word_id` (issue #146). The app layer
+    /// drives this while the connected-clients view is open; the reply is a
+    /// `ClientListResult` handled into [`super::SessionManager::client_list`].
+    pub fn request_client_list(&mut self, word_id: WordId) {
+        let rid = self.next_rid();
+        self.send_ws(ClientMessage::ClientList {
+            request_id: rid,
+            word_id,
+        });
+    }
+
+    /// Kick one client connection out of `word_id` (issue #146). The reply is a
+    /// `ClientKicked` (handled as a [`SessionEvent`](super::SessionEvent)) or an
+    /// `Error`.
+    pub fn kick_client(&mut self, word_id: WordId, client_id: ClientId) {
+        let rid = self.next_rid();
+        self.send_ws(ClientMessage::KickClient {
+            request_id: rid,
+            word_id,
+            client_id,
+        });
     }
 
     /// Ask the (local) daemon to federate `target` (issue #121): it opens one

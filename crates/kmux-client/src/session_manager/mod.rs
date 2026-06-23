@@ -11,8 +11,8 @@ use std::collections::HashMap;
 use std::time::Instant;
 
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ClientMessage, PaneId, PaneProcesses, SequenceNo, SessionEntry,
-    TermSize, WordId,
+    ClientCapabilities, ClientId, ClientInfo, ClientMessage, PaneId, PaneProcesses, SequenceNo,
+    SessionEntry, TermSize, WordId,
 };
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -74,6 +74,20 @@ pub struct SessionManager {
     /// [`Self::request_process_overview`] while the process-overview view is
     /// open; empty otherwise. Joined with `session_list` by the app layer.
     pub process_overview: Vec<PaneProcesses>,
+    /// Connections attached to the session most recently queried via
+    /// [`Self::request_client_list`] (issue #146); refreshed while the
+    /// connected-clients view is open, empty otherwise. The `word_id` it pertains
+    /// to is [`Self::client_list_word`].
+    pub client_list: Vec<ClientInfo>,
+    /// The session `word_id` that [`Self::client_list`] pertains to, if any.
+    pub client_list_word: Option<WordId>,
+    /// This connection's own cryptographic identity fingerprint, from
+    /// `AuthResult` (issue #146).
+    pub machine_id: Option<String>,
+    /// This connection's daemon-assigned user-readable label, from `AuthResult`.
+    pub label: Option<String>,
+    /// The daemon's own identity fingerprint, from `AuthResult`.
+    pub server_machine_id: Option<String>,
     /// Currently active session (word_id).
     pub active_session: Option<WordId>,
     /// The tab currently viewed within `active_session` (client-local — which
@@ -180,6 +194,11 @@ impl SessionManager {
             status_msg: String::new(),
             session_list: Vec::new(),
             process_overview: Vec::new(),
+            client_list: Vec::new(),
+            client_list_word: None,
+            machine_id: None,
+            label: None,
+            server_machine_id: None,
             active_session: None,
             active_tab: None,
             active_pane: None,
@@ -624,6 +643,9 @@ mod tests {
             server_version: Some("0.1.0".to_string()),
             connection_id: None,
             compression: None,
+            machine_id: None,
+            label: None,
+            server_machine_id: None,
         });
         use super::server_handler::SessionEvent;
         assert!(matches!(events.as_slice(), [SessionEvent::AuthOk]));
@@ -645,6 +667,9 @@ mod tests {
             server_version: None,
             connection_id: None,
             compression: None,
+            machine_id: None,
+            label: None,
+            server_machine_id: None,
         });
         assert!(matches!(
             events.as_slice(),
