@@ -533,6 +533,12 @@ impl TerminalRenderer {
         let ascent = metrics.ascent();
         let page = atlas.page_size() as f32;
 
+        // The bundled symbol fallback font (borrowed once): glyphs the configured
+        // face lacks — Powerline U+E0Bx, Nerd PUA icons — rasterize from this
+        // instead of rendering blank. The `'static` face never conflicts with the
+        // `&mut atlas` borrow.
+        let fallback = crate::fallback::symbol_fallback().as_ref();
+
         // Bucket per page, then flatten so each page's instances are contiguous.
         let mut buckets: Vec<Vec<GlyphInstance>> = Vec::new();
         for q in quads {
@@ -542,8 +548,11 @@ impl TerminalRenderer {
             let Some(font) = face.as_ref() else {
                 continue;
             };
+            // If the embedded fallback somehow failed to parse, use the primary
+            // face as its own fallback (a no-op, preserving old behavior).
             let Some(e) = atlas.get_or_insert(
                 font,
+                fallback.unwrap_or(font),
                 px,
                 GlyphKey {
                     style: q.style,
