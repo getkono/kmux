@@ -6,6 +6,15 @@
 # cargo workspace) and links the kmux-ffi staticlib. This task is macOS-only
 # (gated like install/package); on Linux the GTK GUI (kmux-gtk) is the client.
 set -euo pipefail
+# Copy only when the bytes differ. uniffi emits identical Swift/header output as
+# long as the FFI surface is unchanged, so preserving the destination's mtime in
+# that case keeps SwiftPM (which keys recompilation on mtime) from needlessly
+# rebuilding KmuxBindings/KmuxApp on every dev iteration. Returns 0 if it copied.
+copy_if_changed() {
+    local src="$1" dst="$2"
+    if [[ -f "$dst" ]] && cmp -s "$src" "$dst"; then return 1; fi
+    cp "$src" "$dst"
+}
 # The profile (debug|release) selects which built cdylib to introspect;
 # `mise run install` passes "release" so the bindings match the release staticlib
 # it links. The generated Swift is identical across profiles (it is derived from
@@ -26,6 +35,7 @@ featflag=()
 [[ -n "${KMUX_FFI_FEATURES:-}" ]] && featflag=(--features "$KMUX_FFI_FEATURES")
 cargo build $relflag "${featflag[@]}" -p kmux-ffi
 out=$(mktemp -d)
+trap 'rm -rf "$out"' EXIT
 # `--no-format` skips uniffi's optional swiftformat pass: the bindings are
 # machine-generated (and gitignored), so formatting them is pointless, and
 # without it uniffi prints a benign "Unable to auto-format" warning whenever
@@ -33,6 +43,11 @@ out=$(mktemp -d)
 cargo run "${featflag[@]}" -p kmux-ffi --bin uniffi-bindgen -- \
     generate --no-format --library "target/${profile}/libkmux_ffi.dylib" --language swift --out-dir "$out"
 mkdir -p kmux-swift/Sources/kmux_ffiFFI kmux-swift/Sources/KmuxBindings
-cp "$out/kmux_ffiFFI.h"  kmux-swift/Sources/kmux_ffiFFI/kmux_ffiFFI.h
-cp "$out/kmux_ffi.swift" kmux-swift/Sources/KmuxBindings/kmux_ffi.swift
-echo "==> generated Swift bindings into kmux-swift/Sources/"
+changed=0
+copy_if_changed "$out/kmux_ffiFFI.h"  kmux-swift/Sources/kmux_ffiFFI/kmux_ffiFFI.h && changed=1
+copy_if_changed "$out/kmux_ffi.swift" kmux-swift/Sources/KmuxBindings/kmux_ffi.swift && changed=1
+if [[ "$changed" == 1 ]]; then
+    echo "==> updated Swift bindings in kmux-swift/Sources/"
+else
+    echo "==> Swift bindings unchanged (FFI surface identical) — left as-is"
+fi

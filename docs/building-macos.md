@@ -60,6 +60,14 @@ single constant in `crates/kmux-ffi/src/lib.rs`) is the human-meaningful marker
 for that surface — bumping it is a one-line edit; nothing on the Swift side
 hardcodes its value.
 
+The copy step only overwrites `kmux_ffiFFI.h` / `kmux_ffi.swift` when their bytes
+actually change. uniffi emits identical output whenever the FFI surface is
+unchanged, so when you've only touched Rust internals the bindings keep their
+mtime and SwiftPM (which keys recompilation on mtime) skips rebuilding
+`KmuxBindings`/`KmuxApp` — it just relinks the updated staticlib. So a repeated
+`mise run swift-run` after a non-FFI change stays incremental instead of
+recompiling the Swift modules every time.
+
 ## Build / run / test
 
 ```sh
@@ -70,6 +78,17 @@ mise run swift-test    # gen bindings + swift test
 
 (or directly: `swift build --package-path kmux-swift`, etc., after
 `mise run gen-ffi-bindings`).
+
+### Cleaning up
+
+The SwiftPM build tree (`kmux-swift/.build`) is separate from cargo's `target/`
+and nothing prunes it, so over time it accumulates the debug + release builds, a
+module cache, and the editor's background `index-build` (easily >1 GB):
+
+```sh
+mise run clean-swift   # remove kmux-swift/.build only (fast; rebuilt on next swift-* task)
+mise run clean         # full reset: cargo clean + kmux-swift/.build
+```
 
 ### GPU rendering (opt-in, issue #132)
 

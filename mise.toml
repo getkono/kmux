@@ -75,6 +75,18 @@ run = "cargo build -p kmux-gtk -p kmux-ffi --no-default-features"
 description = "Run tests (whole workspace; matches CI)"
 run = "cargo test --workspace"
 
+# The SwiftPM build tree (kmux-swift/.build) is separate from cargo's target/ and
+# nothing else prunes it, so it grows unbounded (debug + release + module cache +
+# editor index-build). `clean-swift` reclaims just that; `clean` is the full reset.
+[tasks.clean-swift]
+description = "Remove the SwiftPM build tree (kmux-swift/.build)"
+run = "rm -rf kmux-swift/.build"
+
+[tasks.clean]
+description = "Remove all build artifacts (cargo target/ + SwiftPM .build)"
+depends = ["clean-swift"]
+run = "cargo clean"
+
 [tasks.gtk-app]
 description = "Build the GTK app (kmux-gtk)"
 run = "cargo build -p kmux-gtk"
