@@ -1,5 +1,6 @@
 use kmux_protocol::control_rpc::{ConnectionInfo, SessionsResponse};
-use kmux_protocol::messages::SessionEntry;
+use kmux_protocol::identity;
+use kmux_protocol::messages::{ClientInfo, SessionEntry};
 use tabled::Table;
 use tabled::Tabled;
 use tabled::settings::Style;
@@ -50,6 +51,55 @@ pub fn session_rows(sessions: &[SessionEntry]) -> Vec<SessionRow> {
         .collect();
     // local (peer.is_none()) first, then remotes alphabetically by peer.
     rows.sort_by(|a, b| (a.peer != "local", &a.peer).cmp(&(b.peer != "local", &b.peer)));
+    rows
+}
+
+// ─── Client row (kmux clients) ────────────────────────────────────────────────
+
+#[derive(Tabled)]
+pub struct ClientRow {
+    #[tabled(rename = "SESSION")]
+    pub session: String,
+    #[tabled(rename = "CLIENT")]
+    pub client: String,
+    #[tabled(rename = "ID")]
+    pub id: u64,
+    #[tabled(rename = "MACHINE")]
+    pub machine: String,
+    #[tabled(rename = "TRANSPORT")]
+    pub transport: String,
+    #[tabled(rename = "PANES")]
+    pub panes: String,
+}
+
+/// Build the `kmux clients` rows. `entries` pairs each session word-id with the
+/// connections attached to it (issue #146). The requester's own connection is
+/// suffixed with " (you)"; the machine id is abbreviated for display.
+pub fn client_rows(entries: &[(String, Vec<ClientInfo>)]) -> Vec<ClientRow> {
+    let mut rows = Vec::new();
+    for (word_id, clients) in entries {
+        for c in clients {
+            let client = if c.is_self {
+                format!("{} (you)", c.label)
+            } else {
+                c.label.clone()
+            };
+            let panes = c
+                .attached_panes
+                .iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(",");
+            rows.push(ClientRow {
+                session: word_id.clone(),
+                client,
+                id: c.client_id.0,
+                machine: identity::short(&c.machine_id).to_string(),
+                transport: c.transport.clone(),
+                panes,
+            });
+        }
+    }
     rows
 }
 
@@ -316,6 +366,9 @@ mod tests {
             connection_id: conn_id,
             client_id: 1,
             transport: transport.to_string(),
+            label: "alice@host".to_string(),
+            machine_id: "abc123".to_string(),
+            hostname: "host".to_string(),
             bytes_in: 1024 * 1024,
             bytes_out: 45 * 1024 * 1024,
             msgs_in: 10,

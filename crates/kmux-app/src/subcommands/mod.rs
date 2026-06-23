@@ -1,9 +1,11 @@
+mod clients;
 mod daemon_cmd;
 mod debug;
 mod dry_run;
 mod list;
 mod ps;
 pub mod render;
+pub use clients::{KickClientConfig, ListClientsConfig, run_kick_client, run_list_clients};
 pub use daemon_cmd::run_daemon_command;
 pub use debug::run_debug_command;
 pub use dry_run::run_dry_run;
@@ -101,6 +103,66 @@ pub async fn resolve_connection(
             tcp_port: Some(status.tcp_port),
             token: status.token,
         })
+    }
+}
+
+/// Run the full `Auth → AuthChallenge → AuthProof → AuthResult` handshake on a
+/// raw framed stream for the headless one-shot subcommands (issue #146). Returns
+/// once the daemon confirms authentication, or an error on rejection.
+pub(crate) async fn authenticate<R, W>(
+    read_half: &mut R,
+    write_half: &mut W,
+    token: String,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use kmux_protocol::identity::Identity;
+    use kmux_protocol::messages::{
+        ClientCapabilities, ClientMessage, PROTOCOL_VERSION, ServerMessage, version_mismatch_hint,
+    };
+    use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
+
+    let identity = Identity::load_or_create()?;
+    let auth = ClientMessage::Auth {
+        token,
+        protocol_version: PROTOCOL_VERSION,
+        capabilities: ClientCapabilities::default(),
+        connection_id: None,
+        public_key: identity.public_key_bytes().to_vec(),
+        hostname: kmux_protocol::identity::local_hostname(),
+        username: kmux_protocol::identity::local_username(),
+    };
+    write_frame(write_half, &encode_client(&auth)?).await?;
+
+    loop {
+        let data = read_frame(read_half)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Connection closed before auth response"))?;
+        match decode_server(&data)? {
+            ServerMessage::AuthChallenge { nonce } => {
+                let proof = ClientMessage::AuthProof {
+                    signature: identity.sign(&nonce),
+                };
+                write_frame(write_half, &encode_client(&proof)?).await?;
+            }
+            ServerMessage::AuthResult { success: true, .. } => return Ok(()),
+            ServerMessage::AuthResult {
+                success: false,
+                reason,
+                ..
+            } => {
+                let reason_str = reason.unwrap_or_else(|| "unknown error".into());
+                let hint = version_mismatch_hint(&reason_str);
+                if hint.is_empty() {
+                    anyhow::bail!("Authentication failed: {reason_str}");
+                } else {
+                    anyhow::bail!("Authentication failed: {reason_str}\n{hint}");
+                }
+            }
+            _ => continue,
+        }
     }
 }
 
