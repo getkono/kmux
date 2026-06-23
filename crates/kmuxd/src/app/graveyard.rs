@@ -328,6 +328,43 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn close_persists_graveyard_file_for_crash_recovery() {
+        use kmux_protocol::messages::{ClientCapabilities, TermSize};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("closed.bin");
+        let app = ServerApp::new("tok".to_string()).with_closed_sessions(20, 7, path.clone());
+
+        let entry = app
+            .create_session(
+                None,
+                Some("/tmp".to_string()),
+                Some("/bin/sleep".to_string()),
+                vec!["30".to_string()],
+                TermSize::default(),
+                &ClientCapabilities::default(),
+            )
+            .await
+            .expect("create_session");
+        let word = entry.meta.word_id.clone();
+
+        // Closing must persist the snapshot to disk *before* the kill, so a
+        // later daemon (crash recovery) can still read it.
+        app.close_session(&word).await.expect("close_session");
+        let on_disk = crate::persist::graveyard::read_graveyard(&path).expect("read_graveyard");
+        assert_eq!(on_disk.sessions.len(), 1);
+        assert_eq!(on_disk.sessions[0].session.meta.word_id, word);
+
+        // A fresh daemon loads it back into its in-memory graveyard.
+        let fresh = ServerApp::new("tok".to_string()).with_closed_sessions(20, 7, path);
+        let graveyard =
+            crate::persist::graveyard::read_graveyard(fresh.graveyard_path.as_ref().unwrap())
+                .unwrap();
+        assert!(!fresh.load_graveyard(graveyard).await); // nothing pruned
+        assert_eq!(words(&fresh), vec![word]);
+    }
+
+    #[tokio::test]
     async fn close_then_restore_roundtrip() {
         use kmux_protocol::messages::{ClientCapabilities, TermSize};
 

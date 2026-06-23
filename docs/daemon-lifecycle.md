@@ -100,7 +100,9 @@ enabled  = true
 audience = "any"            # any | local | lan | ssh-only
 
 [daemon]
-idle_shutdown_secs = 30     # 0 = disabled
+idle_shutdown_secs = 30      # 0 = disabled
+closed_session_keep = 20      # retained closed sessions for restore (issue #64)
+closed_session_ttl_days = 7   # drop closed sessions older than this; 0 = no age cap
 
 [advertise]
 public_host = "example.com" # override advertised hostname
@@ -388,9 +390,12 @@ For each session (sorted by index):
       (scrollback capped at MAX_SCROLLBACK_LINES = 10,000)
     child_pid = manager.child_pid(pane_id)   // informational only
     PersistedPane { pane_index, program, args, size, status, child_pid, grid, scrollback_lines, cwd }
-  PersistedSession { meta, next_pane_index, panes }
-PersistedDaemonState { version=2, session_index_counter, sessions, used_words }
+  PersistedSession { meta, next_pane_index, panes, tabs, next_tab_index, active_tab, last_active_ms }
+PersistedDaemonState { version, session_index_counter, sessions, used_words }
 ```
+
+`snapshot_session()` builds one `PersistedSession`; `checkpoint_state()` maps it
+over the live sessions, and the close path (§11b) reuses it for the graveyard.
 
 ### 10.2 `write_checkpoint(state, path)`
 
@@ -405,17 +410,22 @@ The atomic rename ensures a crash during the write never leaves a corrupt file.
 ### 10.3 Schema Versioning
 
 ```rust
-const STATE_VERSION: u32 = 2;
+const STATE_VERSION: u32 = 4;
 ```
 
 On read, the `version` field (first varint) is peeked before full
-deserialization:
+deserialization, then migrated forward through the chain:
 
-| Version | Action                                          |
-|---------|-------------------------------------------------|
-| 1       | Deserialize as v1, migrate: add `args: vec![]`  |
-| 2       | Deserialize as current                          |
-| > 2     | Error: "checkpoint is from a newer daemon"      |
+| Version | Action                                              |
+|---------|-----------------------------------------------------|
+| 1       | Migrate v1→v2 (add `args: vec![]`) → v3 → v4         |
+| 2       | Migrate v2→v3 (wrap each pane in its own tab) → v4   |
+| 3       | Migrate v3→v4 (add `last_active_ms = 0`)             |
+| 4       | Deserialize as current                              |
+| > 4     | Error: "checkpoint is from a newer daemon"          |
+
+The closed-session graveyard (`closed.bin`, §11b) is versioned independently via
+`GRAVEYARD_VERSION`.
 
 ---
 
@@ -452,6 +462,66 @@ predecessor's *live* PTY fd per pane and uses `SeedMode::Inherited` (same seed,
 **no** separator — the live process simply continues): see
 `restore_with_handoff` and `docs/daemon-handoff.md`. Panes whose child already
 exited fall back to the respawn path.
+
+Per-session restore is itself factored into `restore_one_session(persisted,
+inherited, report)`, reused for both the cold-start loop above and on-demand
+restore of a *closed* session (below).
+
+---
+
+## 11b. Closed-Session Graveyard & Restore (issue #64) — `app/graveyard.rs`, `persist/graveyard.rs`
+
+A session has three lifecycle states:
+
+| State        | Where it lives                              | Restore                                   |
+|--------------|---------------------------------------------|-------------------------------------------|
+| **Live**     | the live `sessions` map                     | already running                           |
+| **Closing**  | *client-local* grace window (no daemon msg) | instant undo — the live process is intact |
+| **Inactive** | the daemon's closed-session **graveyard**   | respawn + scrollback replay               |
+
+The **Closing** state is entirely client-side (see `kmux-app` soft-close): the
+`SessionClose` is simply withheld for a few seconds so an accidental close can be
+undone with the live session untouched. Only after that window does the daemon
+see the close and move the session to the graveyard (**Inactive**).
+
+**Retention on close.** `close_session` snapshots the session
+(`snapshot_session`, shared with the checkpoint) and pushes it to an in-memory
+graveyard **before** killing the PTYs, so the restorable copy is durable even
+across a mid-close crash. The session's word stays **reserved** while it is in
+the graveyard, so a later restore keeps the same identity; the word is released
+only when the entry is evicted.
+
+**Separate file, change-only writes.** The graveyard is persisted to its own
+`closed.bin` (sibling of `state.bin`), atomically (temp + rename), and rewritten
+**only when the set changes** — on close, on restore, or on a prune that actually
+dropped an entry. It is deliberately *not* folded into the 30 s live checkpoint:
+closed snapshots are large and immutable, so re-serializing them thousands of
+times a day would be pure waste. One file means there are no per-session files to
+orphan-GC.
+
+**Automatic cleanup (bounded, I/O-lazy).** Two caps, both configurable under
+`[daemon]`:
+
+- `closed_session_keep` (default 20) — a count cap enforced on every insert;
+  the oldest-closed entries past it are evicted (and their words freed).
+- `closed_session_ttl_days` (default 7) — an age cap swept on the periodic
+  checkpoint tick (`sweep_graveyard`), which rewrites `closed.bin` *only* if
+  something actually expired (so a steady state costs zero extra I/O). `0`
+  disables the age cap.
+
+On startup the graveyard is loaded, deduplicated against just-restored live
+sessions (**live wins**, covering the crash-after-close-before-checkpoint race),
+TTL-pruned, and each surviving word reserved.
+
+**Restore** (`restore_session`, triggered by `ClientMessage::SessionRestore`)
+respawns the session via `restore_one_session` (replaying scrollback above the
+`[kmux: session restored]` separator — processes are **not** resurrected), moves
+it into the live map, and rewrites `closed.bin`. A failed restore leaves the
+entry in the graveyard so the user can retry. Clients list restorable sessions
+with `ClientMessage::SessionListClosed` →
+`ServerMessage::ClosedSessionListResult` (`ClosedSessionEntry`, ordered
+most-recently-active first); the GUI surfaces them in the launcher's "Restore"
+section.
 
 ---
 
