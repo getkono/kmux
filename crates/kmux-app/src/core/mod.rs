@@ -23,6 +23,7 @@ use crate::mode::Mode;
 use crate::recent_servers::{RecentServersCache, ServerKind};
 use crate::theme::Theme;
 
+mod clients;
 mod connection_info;
 mod dispatch;
 mod orchestration;

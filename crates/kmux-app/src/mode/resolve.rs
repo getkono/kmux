@@ -257,6 +257,19 @@ pub(crate) fn resolve_process_overview(key: &Key, mods: Modifiers) -> (Option<Mo
     (None, Action::None)
 }
 
+/// Connected clients (issue #146). Esc / Ctrl+G / `q` close the view; the kick
+/// action and scrolling are driven by the frontend's native widgets, so other
+/// keys are ignored here.
+pub(crate) fn resolve_connected_clients(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+    if matches!(key, Key::Named(NamedKey::Escape))
+        || is_mode_key(key, mods)
+        || matches!(key, Key::Character(c) if c == "q")
+    {
+        return (None, Action::ToggleConnectedClients);
+    }
+    (None, Action::None)
+}
+
 pub(crate) fn resolve_dir_picker(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     resolve_picker(
         key,

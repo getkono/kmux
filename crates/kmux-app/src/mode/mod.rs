@@ -41,6 +41,12 @@ pub enum Mode {
     /// the driver re-requests the snapshot at ~1 Hz while this mode is active.
     /// Esc / Ctrl+G exits.
     ProcessOverview,
+    /// Connected clients (issue #146): a main-area view replacing the terminal,
+    /// listing the client connections attached to the active session — each with
+    /// its user-readable label, machine id, hostname, transport, and panes — with
+    /// a per-row Kick action. The frontend renders [`AppCore::client_rows`]. The
+    /// driver re-requests the list at ~1 Hz while this mode is active. Esc / q exits.
+    ConnectedClients,
     /// Help overlay
     Help,
     /// Directory picker for remote connections: type a path to open/create a session
@@ -155,6 +161,10 @@ pub enum Action {
     /// Toggle the process overview main-area view (issue #122). Opening it fires
     /// an immediate snapshot request; closing returns to the terminal.
     ToggleProcessOverview,
+    /// Toggle the connected-clients main-area view (issue #146). Opening it fires
+    /// an immediate client-list request for the active session; closing returns
+    /// to the terminal.
+    ToggleConnectedClients,
     /// Toggle the connection inspector overlay (issue #60).
     ToggleConnection,
     /// Toggle the render-debug overlay: what the renderer is handed each frame
@@ -245,6 +255,7 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::RenameSession { .. } | Mode::RenameTab { .. } => resolve_rename(key, mods),
         Mode::SessionPicker => resolve_session_picker(key, mods),
         Mode::ProcessOverview => resolve_process_overview(key, mods),
+        Mode::ConnectedClients => resolve_connected_clients(key, mods),
         Mode::Help => resolve_help(key),
         Mode::DirectoryPicker => resolve_dir_picker(key, mods),
         Mode::LaunchPicker => resolve_launch_picker(key, mods),

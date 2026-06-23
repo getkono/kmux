@@ -212,6 +212,9 @@ impl AppCore {
             Action::ToggleProcessOverview => {
                 self.toggle_process_overview();
             }
+            Action::ToggleConnectedClients => {
+                self.toggle_connected_clients();
+            }
             Action::ToggleConnection => {
                 self.connection_overlay_visible = !self.connection_overlay_visible;
             }
@@ -641,6 +644,34 @@ impl AppCore {
             self.mode = Mode::Normal;
         } else {
             self.open_process_overview();
+        }
+    }
+
+    /// Open the connected-clients view (issue #146) and request the active
+    /// session's client list so the view has data before the periodic poll.
+    pub fn open_connected_clients(&mut self) {
+        self.mode = Mode::ConnectedClients;
+        if let Some(word) = self.mgr.active_session.clone() {
+            self.mgr.request_client_list(word);
+        }
+    }
+
+    /// Toggle the connected-clients view: open it (with an immediate refresh) or
+    /// return to the terminal when already open.
+    pub fn toggle_connected_clients(&mut self) {
+        if matches!(self.mode, Mode::ConnectedClients) {
+            self.mode = Mode::Normal;
+        } else {
+            self.open_connected_clients();
+        }
+    }
+
+    /// Kick a client from the session whose list is currently shown (issue #146).
+    /// Uses [`SessionManager::client_list_word`] so the kick targets the listed
+    /// session even if the active session changed since the list was fetched.
+    pub fn kick_listed_client(&mut self, client_id: kmux_protocol::messages::ClientId) {
+        if let Some(word) = self.mgr.client_list_word.clone() {
+            self.mgr.kick_client(word, client_id);
         }
     }
 

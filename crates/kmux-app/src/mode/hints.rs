@@ -50,6 +50,11 @@ pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
             ("Esc", "Cancel"),
         ],
         Mode::ProcessOverview => vec![("\u{2191}/\u{2193}", "Scroll"), ("q/Esc", "Close")],
+        Mode::ConnectedClients => vec![
+            ("\u{2191}/\u{2193}", "Scroll"),
+            ("Kick", "Remove client"),
+            ("q/Esc", "Close"),
+        ],
         Mode::Help => vec![("any key", "Close")],
         Mode::DirectoryPicker => vec![
             ("\u{2191}/\u{2193}", "Navigate"),
@@ -88,6 +93,7 @@ pub fn mode_name(mode: &Mode) -> &'static str {
         Mode::RenameTab { .. } => "RENAME TAB",
         Mode::SessionPicker => "SESSION PICKER",
         Mode::ProcessOverview => "PROCESSES",
+        Mode::ConnectedClients => "CLIENTS",
         Mode::Help => "HELP",
         Mode::DirectoryPicker => "OPEN SESSION",
         Mode::LaunchPicker => "LAUNCHER",
@@ -117,6 +123,7 @@ pub fn mode_rgb(mode: &Mode, theme: &crate::theme::Theme) -> crate::theme::Rgb {
         Mode::RenameSession { .. } | Mode::RenameTab { .. } => theme.orange,
         Mode::SessionPicker => theme.accent,
         Mode::ProcessOverview => theme.accent,
+        Mode::ConnectedClients => theme.accent,
         Mode::Help => theme.accent,
         Mode::DirectoryPicker => theme.accent,
         Mode::LaunchPicker => theme.accent,
