@@ -656,6 +656,51 @@ mod tests {
         assert!(mgr.report_mouse(false, motion()));
     }
 
+    fn enter_key() -> kmux_protocol::messages::KeyEvent {
+        use kmux_protocol::messages::{KeyAction, KeyCode, KeyEvent, KeyMods};
+        KeyEvent {
+            code: KeyCode::Enter,
+            mods: KeyMods::default(),
+            action: KeyAction::Press,
+            text: String::new(),
+            unshifted_codepoint: 0,
+        }
+    }
+
+    /// A *manual* pause drops user PTY input across every path — keys, raw bytes,
+    /// and paste — so the user can't type blind into a terminal they can't see
+    /// (issue #165). Nothing reaches the wire.
+    #[test]
+    fn manual_pause_drops_user_input() {
+        let (mut mgr, mut rx) = manager_with_modes(TermModes::EMPTY);
+        mgr.pause_applied = (true, false); // manually paused
+
+        assert!(!mgr.send_key_batch(vec![enter_key()]), "keys are dropped");
+        assert!(!mgr.send_input(b"\x1b[A".to_vec()), "raw bytes are dropped");
+        assert!(!mgr.send_paste("hi".to_string()), "paste is dropped");
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing reaches the PTY while manually paused"
+        );
+    }
+
+    /// An *auto* pause does not drop input: a keystroke resumes the stream
+    /// upstream in the driver, so the bytes still flow through here (issue #165).
+    #[test]
+    fn auto_pause_does_not_drop_input() {
+        let (mut mgr, mut rx) = manager_with_modes(TermModes::EMPTY);
+        mgr.pause_applied = (true, true); // auto-paused
+
+        assert!(
+            mgr.send_key_batch(vec![enter_key()]),
+            "auto-paused keys flow"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(ClientMessage::PtyKeyBatch { .. })),
+            "the keystroke reaches the PTY"
+        );
+    }
+
     #[test]
     fn auth_ok_sets_client_id() {
         let mut mgr = make_manager();
