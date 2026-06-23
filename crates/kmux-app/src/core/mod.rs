@@ -54,6 +54,17 @@ pub struct PendingClose {
     pub deadline: Instant,
 }
 
+/// A session whose close has been requested but deferred (issue #64). The real
+/// `SessionClose` is sent only once `deadline` passes; until then the user can
+/// undo, leaving the live session (and all its processes) untouched.
+#[derive(Debug, Clone)]
+pub struct PendingSessionClose {
+    pub word_id: String,
+    /// Display name captured at request time, for the "restored" toast.
+    pub name: String,
+    pub deadline: Instant,
+}
+
 /// What a key/action dispatch returns to the frontend's run loop.
 ///
 /// This is the core → frontend control-flow channel: the frontend matches on
@@ -250,6 +261,13 @@ pub struct AppCore {
     /// pane is here its `PaneClose` has NOT been sent; the driver fires it once
     /// the deadline passes, and the user can undo within the window.
     pub pending_closes: Vec<PendingClose>,
+
+    /// Sessions pending a deferred (soft) close (issue #64), oldest first. Like
+    /// `pending_closes` but for whole sessions: the `SessionClose` is withheld
+    /// for [`SOFT_CLOSE_GRACE`] so an accidental close can be undone instantly
+    /// (the live session is never touched); after the window it is closed and
+    /// becomes restorable from the daemon's graveyard.
+    pub pending_session_closes: Vec<PendingSessionClose>,
 
     /// Bumped on every soft-close request so a frontend can show its "Undo"
     /// affordance exactly once per scheduled close (not every frame).
@@ -470,6 +488,7 @@ impl AppCore {
             show_perf_counters: crate::config::resolve_perf_counters(),
             render_frames: VecDeque::new(),
             pending_closes: Vec::new(),
+            pending_session_closes: Vec::new(),
             soft_close_nonce: 0,
             disconnect_at: None,
             session_picker_selected: 0,
@@ -689,6 +708,7 @@ impl AppCore {
             show_perf_counters: true,
             render_frames: VecDeque::new(),
             pending_closes: Vec::new(),
+            pending_session_closes: Vec::new(),
             soft_close_nonce: 0,
             disconnect_at: None,
             session_picker_selected: 0,

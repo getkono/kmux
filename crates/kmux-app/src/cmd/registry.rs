@@ -244,10 +244,12 @@ fn cmd_session_new(app: &mut AppCore, args: &[String]) -> CommandResult {
 
 fn cmd_session_close(app: &mut AppCore, _args: &[String]) -> CommandResult {
     require_connected(app)?;
-    let Some(word_id) = app.mgr.active_session().map(|s| s.to_string()) else {
+    if app.mgr.active_session().is_none() {
         return Err("no active session".into());
-    };
-    app.mode = Mode::ConfirmCloseSession { word_id };
+    }
+    // Soft-close with a grace window + undo (issue #64), matching the keybinding;
+    // the session becomes restorable from the graveyard after the window.
+    app.soft_close_active_session();
     Ok(CommandSuccess::Ok)
 }
 

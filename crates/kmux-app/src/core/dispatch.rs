@@ -17,7 +17,7 @@ use crate::mode::{Action, Mode};
 
 use super::{
     AppCore, COMMAND_HISTORY_CAP, DirBrowserRow, KeyResult, LaunchRow, PendingClose,
-    SOFT_CLOSE_GRACE, TopBarAction,
+    PendingSessionClose, SOFT_CLOSE_GRACE, TopBarAction,
 };
 
 impl AppCore {
@@ -42,22 +42,13 @@ impl AppCore {
                 self.mgr.create_pane(self.term_size);
             }
             Action::CloseSession => {
-                if let Some(word_id) = self.mgr.active_session().map(|s| s.to_string()) {
-                    self.mode = Mode::ConfirmCloseSession { word_id };
-                }
+                self.soft_close_active_session();
             }
             Action::ClosePane => {
                 self.soft_close_active_pane();
             }
             Action::UndoClose => {
                 self.undo_soft_close();
-            }
-            Action::ConfirmCloseYes => {
-                if let Mode::ConfirmCloseSession { word_id } =
-                    std::mem::replace(&mut self.mode, Mode::Normal)
-                {
-                    self.mgr.close_session(&word_id);
-                }
             }
             Action::NextSession => self.mgr.cycle_session(1),
             Action::PrevSession => self.mgr.cycle_session(-1),
@@ -793,10 +784,57 @@ impl AppCore {
             .set_status_msg("Closing pane in 3s — undo to keep it".into());
     }
 
-    /// Cancel the most recently scheduled soft-close (the toast/keyboard "Undo").
-    /// The live shell was never touched, so the pane simply stays.
+    /// Request a deferred ("soft") close of the active session (issue #64).
+    /// The `SessionClose` is withheld for [`SOFT_CLOSE_GRACE`] so an accidental
+    /// close can be undone instantly, with the live session untouched. Replaces
+    /// the old blocking "confirm close?" dialog — after the window the session is
+    /// closed and becomes restorable from the daemon's graveyard.
+    pub fn soft_close_active_session(&mut self) {
+        let Some(word_id) = self.mgr.active_session().map(str::to_string) else {
+            return;
+        };
+        if self
+            .pending_session_closes
+            .iter()
+            .any(|p| p.word_id == word_id)
+        {
+            return;
+        }
+        let name = self
+            .mgr
+            .session_list()
+            .iter()
+            .find(|e| e.meta.word_id == word_id)
+            .map(|e| e.meta.name.clone())
+            .unwrap_or_else(|| word_id.clone());
+        self.pending_session_closes.push(PendingSessionClose {
+            word_id,
+            name: name.clone(),
+            deadline: Instant::now() + SOFT_CLOSE_GRACE,
+        });
+        self.soft_close_nonce = self.soft_close_nonce.wrapping_add(1);
+        self.mgr
+            .set_status_msg(format!("Closing session '{name}' — undo to keep it"));
+    }
+
+    /// Cancel the most recently scheduled soft-close (the toast/keyboard "Undo"),
+    /// across both panes and sessions — whichever was scheduled most recently.
+    /// Nothing was sent to the daemon, so the reclaim is instant and the live
+    /// pane/session is untouched.
     pub fn undo_soft_close(&mut self) {
-        if self.pending_closes.pop().is_some() {
+        let pane_deadline = self.pending_closes.last().map(|p| p.deadline);
+        let session_deadline = self.pending_session_closes.last().map(|p| p.deadline);
+        let undo_session = match (pane_deadline, session_deadline) {
+            (Some(p), Some(s)) => s >= p,
+            (None, Some(_)) => true,
+            _ => false,
+        };
+        if undo_session {
+            if let Some(p) = self.pending_session_closes.pop() {
+                self.mgr
+                    .set_status_msg(format!("Session '{}' restored", p.name));
+            }
+        } else if self.pending_closes.pop().is_some() {
             self.mgr.set_status_msg("Pane close cancelled".into());
         }
     }
@@ -813,21 +851,39 @@ impl AppCore {
     /// frontend pump). Returns whether any close was sent, so the caller can
     /// schedule a render. Cheap when nothing is pending.
     pub fn fire_due_closes(&mut self, now: Instant) -> bool {
-        if self.pending_closes.is_empty() {
-            return false;
-        }
-        let mut due: Vec<String> = Vec::new();
-        self.pending_closes.retain(|p| {
-            let expired = p.deadline <= now;
-            if expired {
-                due.push(p.pane_id.clone());
+        let mut fired = false;
+
+        if !self.pending_closes.is_empty() {
+            let mut due: Vec<String> = Vec::new();
+            self.pending_closes.retain(|p| {
+                let expired = p.deadline <= now;
+                if expired {
+                    due.push(p.pane_id.clone());
+                }
+                !expired
+            });
+            for pane_id in &due {
+                self.mgr.close_pane_id(pane_id);
             }
-            !expired
-        });
-        for pane_id in &due {
-            self.mgr.close_pane_id(pane_id);
+            fired |= !due.is_empty();
         }
-        !due.is_empty()
+
+        if !self.pending_session_closes.is_empty() {
+            let mut due: Vec<String> = Vec::new();
+            self.pending_session_closes.retain(|p| {
+                let expired = p.deadline <= now;
+                if expired {
+                    due.push(p.word_id.clone());
+                }
+                !expired
+            });
+            for word_id in &due {
+                self.mgr.close_session(word_id);
+            }
+            fired |= !due.is_empty();
+        }
+
+        fired
     }
 
     /// Whether `pane_id` is awaiting a deferred close (for a "closing…" hint).
@@ -835,9 +891,17 @@ impl AppCore {
         self.pending_closes.iter().any(|p| p.pane_id == pane_id)
     }
 
-    /// Whether any pane is awaiting a deferred close (drives the Undo affordance).
+    /// Whether any pane is awaiting a deferred close (for a "closing…" hint).
+    pub fn is_session_pending_close(&self, word_id: &str) -> bool {
+        self.pending_session_closes
+            .iter()
+            .any(|p| p.word_id == word_id)
+    }
+
+    /// Whether any pane or session is awaiting a deferred close (drives the Undo
+    /// affordance shown by the frontends).
     pub fn has_pending_close(&self) -> bool {
-        !self.pending_closes.is_empty()
+        !self.pending_closes.is_empty() || !self.pending_session_closes.is_empty()
     }
 
     /// Open the command palette pre-filled with `transport ` so the user picks
@@ -1001,6 +1065,45 @@ mod tests {
 
         // Undo → cancelled; the shell was never touched.
         core.dispatch_action(Action::UndoClose).await;
+        assert!(!core.has_pending_close());
+    }
+
+    #[tokio::test]
+    async fn close_session_defers_then_undo_keeps_it() {
+        use kmux_protocol::messages::SessionStatus;
+        let mut core = core_with_active_pane(SessionStatus::Running);
+        core.mgr.active_session = Some("eagle".into());
+        let nonce = core.soft_close_nonce;
+
+        // Close → deferred (no SessionClose sent yet), not killed immediately.
+        core.dispatch_action(Action::CloseSession).await;
+        assert!(core.is_session_pending_close("eagle"));
+        assert!(core.has_pending_close());
+        assert_eq!(core.soft_close_nonce, nonce + 1);
+
+        // A second close keeps the existing deadline (no duplicate).
+        core.dispatch_action(Action::CloseSession).await;
+        assert_eq!(core.pending_session_closes.len(), 1);
+
+        // Undo → cancelled; the live session was never touched.
+        core.dispatch_action(Action::UndoClose).await;
+        assert!(!core.has_pending_close());
+        assert_eq!(core.mgr.status_msg(), "Session 'eagle' restored");
+    }
+
+    #[test]
+    fn session_soft_close_fires_only_after_the_grace_window() {
+        use kmux_protocol::messages::SessionStatus;
+        let mut core = core_with_active_pane(SessionStatus::Running);
+        core.mgr.active_session = Some("eagle".into());
+        core.soft_close_active_session();
+        assert!(core.has_pending_close());
+        // Before the deadline: nothing fires.
+        assert!(!core.fire_due_closes(Instant::now()));
+        assert!(core.has_pending_close());
+        // After the grace window: the close fires and the pending list drains.
+        let later = Instant::now() + SOFT_CLOSE_GRACE + std::time::Duration::from_millis(1);
+        assert!(core.fire_due_closes(later));
         assert!(!core.has_pending_close());
     }
 
