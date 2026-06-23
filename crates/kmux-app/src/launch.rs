@@ -67,8 +67,8 @@ pub fn init_logging(instance_id: &str) {
         _ => EnvFilter::new("kmux=info"),
     };
     // `KMUX_LOG_STDERR=1` forces logs to stderr instead of the client log file,
-    // so crash debugging (e.g. `mise run start`) shows the live trace in the
-    // terminal alongside any panic backtrace.
+    // so crash debugging (e.g. `./kmux`, which sets it) shows the live trace in
+    // the terminal alongside any panic backtrace.
     let force_stderr = std::env::var_os("KMUX_LOG_STDERR")
         .is_some_and(|v| !v.is_empty() && v != "0" && v != "false");
     let log_file = if force_stderr {

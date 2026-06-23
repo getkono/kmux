@@ -632,7 +632,7 @@ lifecycle.
 
 All `SshError` variants render with multi-line context (argv, exit, stderr tail). On launch, the TUI also re-prints the bootstrap error to stderr after the alternate-screen overlay tears down — so `kmux user@host` failures are visible after exit without consulting `~/.local/state/kmux/client.log`.
 
-**Where a dev build logs:** debug builds (`cargo run`, `mise run gtk-run` / `swift-run`) isolate their state under `kmux-debug/`, so they log to `~/.local/state/**kmux-debug**/client.log` — *not* the release `kmux/client.log`. A GUI error that seems "missing from the client log" is usually being written to the debug file while you watch the release one. Run `kmux debug paths` (with the binary in question) to print the exact resolved client/daemon log, runtime, and state paths plus the `kmuxd` an auto-spawn would launch; `mise run tail-client-log` / `tail-daemon-log` follow *both* profiles' logs at once.
+**Where a dev build logs:** debug builds (`cargo run`, `./kmux`) isolate their state under `kmux-debug/`, so they log to `~/.local/state/**kmux-debug**/client.log` — *not* the release `kmux/client.log`. A GUI error that seems "missing from the client log" is usually being written to the debug file while you watch the release one. Run `kmux debug paths` (with the binary in question) to print the exact resolved client/daemon log, runtime, and state paths plus the `kmuxd` an auto-spawn would launch; `mise run tail-client-log` / `tail-daemon-log` follow *both* profiles' logs at once.
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
@@ -648,7 +648,7 @@ All `SshError` variants render with multi-line context (argv, exit, stderr tail)
 | TLS fingerprint mismatch | Server cert rotated | Delete the stale entry from `~/.config/kmux/known_hosts.toml` |
 | All transports fail | No network path | Check firewall; verify `kmuxd` is listening on correct ports |
 | Sessions lost after restart | Checkpoint failed | Check disk space; `$XDG_DATA_HOME/kmux/session_state.bin` |
-| (dev) GUI shows "daemon start failed" / never connects, nothing in `kmux/client.log` | Debug build logs + spawns under `kmux-debug/`; resolution must reach `target/debug/kmuxd`, not a release `kmuxd` on `$PATH` | Use `mise run gtk-run` / `swift-run` (they build + pin `KMUX_KMUXD=target/debug/kmuxd`); inspect with `kmux debug paths` + `mise run tail-client-log` |
+| (dev) GUI shows "daemon start failed" / never connects, nothing in `kmux/client.log` | Debug build logs + spawns under `kmux-debug/`; resolution must reach `target/debug/kmuxd`, not a release `kmuxd` on `$PATH` | Use `./kmux` (it builds + pins `KMUX_KMUXD=target/debug/kmuxd`); inspect with `kmux debug paths` + `mise run tail-client-log` |
 
 ### Dry-run diagnostics (`--dry-run`, `--test`)
 
@@ -761,7 +761,7 @@ Every place that spawns `kmuxd` uses one of two strategies. They are intentional
 
 | Build mode | `kmuxd` resolved from |
 |------------|----------------------|
-| Debug, `mise run gtk-run` / `swift-run` / `start` | `KMUX_KMUXD=target/debug/kmuxd` (set + built by the task) |
+| Debug, `./kmux` | `KMUX_KMUXD=target/debug/kmuxd` (set + built by the task) |
 | Debug, bare `cargo run -p kmux-gtk` / `swift run` | sibling `target/debug/kmuxd`, else the build-time `target/debug/kmuxd` |
 | Prod install | sibling of the GUI exe (bundled beside it; also on `$PATH`) |
 | Custom layout | `KMUX_KMUXD`, then sibling, then `$PATH` |
@@ -788,9 +788,9 @@ This means `probe-or-start` always restarts the exact binary that was already on
 
 The remote `kmuxd` must be on the login `$PATH`. Non-interactive SSH sessions typically receive only `/usr/bin:/bin` (plus whatever `/etc/ssh/sshrc` or PAM adds). If `kmuxd` is installed at `~/.local/bin/kmuxd`, ensure the remote `/etc/environment` or `~/.profile` exports that path.
 
-### mise task (`mise run daemon <args>`)
+### Dev entrypoint (`./kmux daemon <args>`)
 
-This task rebuilds kmux + kmuxd (debug) and delegates to `kmux daemon <args>` via `cargo run -p kmux`, which uses `find_server_binary()` as above (e.g. `mise run daemon -- start` / `mise run daemon -- restart` / `mise run daemon -- stop`). The debug build's `target/debug/kmux` picks up `target/debug/kmuxd` as its sibling. No separate binary resolution logic exists in the task itself.
+`./kmux daemon <args>` rebuilds kmux + kmuxd (debug) and delegates to `kmux daemon <args>` via `cargo run -p kmux` (a CLI subcommand never loads a UI toolkit), which uses `find_server_binary()` as above (e.g. `./kmux daemon start` / `./kmux daemon restart` / `./kmux daemon stop`). The debug build's `target/debug/kmux` picks up `target/debug/kmuxd` as its sibling, and `mise run dev` also pins `KMUX_KMUXD=target/debug/kmuxd`. No separate binary resolution logic exists in the entrypoint itself.
 
 ### Runtime directory isolation
 

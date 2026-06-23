@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #MISE description="Tail the client log — both release (kmux/) and debug (kmux-debug/) profiles."
 #
-# Debug builds (`cargo run`, `mise run gtk-run` / `swift-run`) isolate their
+# Debug builds (`cargo run`, `./kmux`) isolate their
 # state under `kmux-debug/`; release/installed builds use `kmux/`. Tail BOTH so a
 # dev run's errors are visible no matter which profile is active — otherwise a
 # debug GUI logs to `kmux-debug/client.log` while you watch the release file and

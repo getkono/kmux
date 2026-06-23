@@ -137,12 +137,12 @@ would never reach the running renderer. The render-debug overlay
 (GTK `win.toggle-render-debug`, Swift ⌘⇧G) shows the **effective** renderer,
 which falls back to the CPU path if GPU init fails.
 
-- **GTK**: `renderer = "gpu"` then `cargo run -p kmux-gtk`. Without it GTK stays
-  on Cairo; if no GPU adapter is available it logs and falls back to Cairo.
-- **Swift**: `mise run swift-gpu-run` (regenerates bindings that include
-  `KmuxRenderer`, builds the app with `-DKMUX_GPU` so the Swift Metal view is
-  compiled, and selects the GPU path via a fixture `config.toml`). The default
-  `mise run swift-run` stays CoreText.
+- **GTK**: `renderer = "gpu"` then `./kmux` (Linux). Without it GTK stays on
+  Cairo; if no GPU adapter is available it logs and falls back to Cairo.
+- **Swift**: `renderer = "gpu"` then `./kmux` (macOS). The dev build always
+  compiles the Swift Metal view (`./kmux` passes `-DKMUX_GPU`), so the config key
+  alone flips between Metal and CoreText at runtime — no separate build. Without
+  it, or if Metal init fails, the app stays on CoreText.
 
 Both clients write logs to the client log file (`mise run tail-client-log`); the
 GPU path logs adapter/surface setup, resizes, and frame errors there (raise

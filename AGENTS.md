@@ -12,8 +12,11 @@ by `hk` and installed by `mise install` (or `mise run setup`).
 - `mise run fmt` / `fmt-check` — format / check
 - `mise run build` — build with default features (incl. the GPU renderer);
   `build-no-gpu` builds the lean, wgpu-free path CI also checks
-- `mise run start` — run the `kmux` GUI (debug) via the entrypoint;
-  `gtk-run` / `swift-run` run a frontend directly
+- `./kmux` — build + run the debug `kmux`, mirroring the installed binary:
+  `./kmux` launches the GUI, `./kmux daemon status` runs a CLI subcommand. It
+  forwards to `mise run dev`, which pins the debug daemon and routes per platform
+  (native Swift app on macOS, `kmux-gtk` on Linux). One frontend is built — the
+  renderer is a runtime config choice, not a separate build.
 
 ### Binaries
 

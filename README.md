@@ -100,16 +100,17 @@ $ cargo run -p kmuxd
 
 With no certificate configured, the server generates an in-memory self-signed
 certificate — the default for this kind of software, so no flag is needed.
-The server prints a shared auth token on startup. Connect with `kmux` (the
-entrypoint opens the platform desktop app), or run a frontend directly:
+The server prints a shared auth token on startup. Connect with the `./kmux` dev
+entrypoint — it mirrors the installed binary, building the debug binaries from
+this checkout and pinning the debug daemon:
 
 ```bash
-$ cargo run -p kmux        # entrypoint → opens the platform desktop app
-$ cargo run -p kmux-gtk    # GTK GUI directly (Linux default, also macOS) — needs GTK4 dev libs
+$ ./kmux                   # launch the GUI (native Swift app on macOS, kmux-gtk on Linux)
+$ ./kmux daemon status     # run a CLI subcommand (no GUI)
 ```
 
-`cargo run -p kmux` execs the frontend binary, so for a dev GUI run build it too
-(or use `mise run start`, which builds `kmux` + `kmux-gtk` then runs `kmux`).
+`./kmux` forwards to `mise run dev`. To run a frontend crate directly instead,
+`cargo run -p kmux-gtk` opens the GTK GUI (needs GTK4 dev libs).
 
 > If a `kmux-gtk` build fails with a `pkg-config` error about
 > `graphene-gobject-1.0` (or similar) not being found, your `PATH` has a
@@ -152,7 +153,7 @@ mise run build    # cargo build
 mise run test     # cargo test --workspace
 mise run fmt      # cargo fmt --all
 mise run clippy   # cargo clippy (warnings denied)
-mise run start    # build + launch the GUI
+./kmux            # build + launch the GUI (mirrors the installed binary)
 ```
 
 Git hooks are managed by [hk](https://hk.jdx.dev) (pinned in `mise.toml`):

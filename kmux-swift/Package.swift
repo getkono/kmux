@@ -12,14 +12,15 @@
 //
 // The generated sources (`kmux_ffiFFI.h`, `kmux_ffi.swift`) and the Rust
 // staticlib are produced by `mise run gen-ffi-bindings` (see the repo's mise tasks);
-// they are gitignored. Build with `mise run swift-app` / run with `mise run swift-run`.
+// they are gitignored. Run the app with `./kmux` (the dev entrypoint); build
+// directly with `swift build --package-path kmux-swift` after the bindings step.
 import Foundation
 import PackageDescription
 
 // The prebuilt Rust staticlib to static-link. Defaults to the debug archive
-// (what `mise run swift-app` / `swift-run` / `swift-test` build); `mise run install`
-// overrides it via KMUX_FFI_LIB to link the optimized release archive into the
-// installed kmux.app. Path is relative to this package dir unless absolute.
+// (what `./kmux` / `mise run swift-test` build); `mise run install` overrides it
+// via KMUX_FFI_LIB to link the optimized release archive into the installed
+// kmux.app. Path is relative to this package dir unless absolute.
 let kmuxFfiLib = ProcessInfo.processInfo.environment["KMUX_FFI_LIB"]
     ?? "../target/debug/libkmux_ffi.a"
 

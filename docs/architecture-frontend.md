@@ -332,10 +332,13 @@ delegated to the per-platform frontend.
 
 ## Running
 
-- Entrypoint: `cargo run -p kmux` (binary `kmux`) — runs the CLI subcommands and,
-  for an interactive launch, execs the platform desktop app. For a dev GUI run,
-  build the frontend too so the exec target exists (`mise run start` builds
-  `kmux` + `kmux-gtk` then runs `kmux`).
+- Dev entrypoint: `./kmux` — the one launcher, mirroring the installed binary. It
+  builds the debug binaries, pins the debug daemon, and routes per platform:
+  `./kmux` opens the GUI (native Swift app on macOS, `kmux-gtk` on Linux) while
+  `./kmux daemon start` / `./kmux ls` run CLI subcommands toolkit-free. It forwards
+  to `mise run dev`. (Under the hood this is `cargo run -p kmux`, which for an
+  interactive launch execs the platform desktop app — on Linux its sibling
+  `target/debug/kmux-gtk`, which `mise run dev` builds.)
 - GUI directly: `cargo run -p kmux-gtk` (binary `kmux-gtk`) — opens a window,
   connects, renders the active session, forwards keystrokes (Linux + macOS).
 

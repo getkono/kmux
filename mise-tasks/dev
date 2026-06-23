@@ -1,0 +1,60 @@
+#!/usr/bin/env bash
+#MISE description="Build + run the debug kmux, mirroring the installed binary. Backs ./kmux."
+#MISE quiet=true
+#
+# The single dev runner — usually invoked as `./kmux [args]` (the repo-root wrapper),
+# or directly as `mise run dev -- [args]`. It mirrors the prod `kmux` entrypoint:
+#   ./kmux                   # launch the GUI
+#   ./kmux daemon status     # run a CLI subcommand (toolkit-free, no GUI)
+#   ./kmux diagnostic glyphs # open a render-diagnostic session
+#
+# Maximal debugging: full panic + library backtraces, verbose kmux logs, and
+# GLib/GTK diagnostics. Logs stream to stderr (the terminal) so a crash shows the
+# live trace next to its backtrace. Every env var below is overridable:
+#   RUST_LOG=trace ./kmux         # override the default log filter
+#   KMUX_LOG_STDERR=0 ./kmux      # log to the client log file instead
+set -euo pipefail
+export RUST_BACKTRACE="${RUST_BACKTRACE:-full}"
+export RUST_LIB_BACKTRACE="${RUST_LIB_BACKTRACE:-1}"
+export RUST_LOG="${RUST_LOG:-kmux=debug,kmux_app=debug,kmux_client=debug,kmux_protocol=debug,kmux_gtk=debug}"
+export KMUX_LOG_STDERR="${KMUX_LOG_STDERR:-1}"
+export G_MESSAGES_DEBUG="${G_MESSAGES_DEBUG:-all}"
+export RUST_LOG_STYLE="${RUST_LOG_STYLE:-always}"
+# Pin the auto-spawn to the *debug* daemon. Without this a debug client falls
+# through to an installed release `~/.cargo/bin/kmuxd` on PATH, which it can never
+# talk to (separate runtime dirs) — so it never connects. See find_server_binary()
+# in crates/kmux-connect/src/daemon/lifecycle.rs.
+root="${MISE_PROJECT_ROOT:-$PWD}"
+export KMUX_KMUXD="${KMUX_KMUXD:-$root/target/debug/kmuxd}"
+
+# Classify the request. CLI subcommands run toolkit-free via the `kmux` entrypoint
+# on every platform; only GUI launches need a frontend. The Swift app does not
+# parse CLI subcommands (it only handles --launch-url / `diagnostic <test>`), so on
+# macOS the split matters; on Linux kmux-gtk handles both via the entrypoint anyway.
+is_cli=false
+case "${1:-}" in
+    daemon|ls|list-sessions|ps|top|debug|--version|-V|--help|-h) is_cli=true ;;
+    diagnostic)
+        # `diagnostic <test>` opens the GUI; bare `diagnostic` (catalogue) and the
+        # internal `diagnostic <test> --emit` are non-interactive.
+        if [[ -z "${2:-}" || "${2}" == -* ]]; then is_cli=true; fi
+        ;;
+esac
+
+if [[ "$is_cli" == false && "$(uname -s)" == "Darwin" ]]; then
+    # macOS GUI → the native Swift app (what prod launches). Regenerate bindings and
+    # build the debug daemon first. Always compile the Metal view (`-DKMUX_GPU`); the
+    # `renderer` config key decides at runtime whether it is used (default CoreText).
+    mise run gen-ffi-bindings
+    cargo build -p kmuxd
+    exec swift run --package-path kmux-swift -Xswiftc -DKMUX_GPU -- "$@"
+fi
+
+# All CLI, and Linux GUI → the toolkit-free `kmux` entrypoint. On Linux an
+# interactive launch execs its sibling target/debug/kmux-gtk, so build that too.
+pkgs=(-p kmux -p kmuxd)
+if [[ "$is_cli" == false && "$(uname -s)" != "Darwin" ]]; then
+    pkgs+=(-p kmux-gtk)
+fi
+cargo build "${pkgs[@]}"
+exec cargo run -p kmux -- "$@"

@@ -79,8 +79,8 @@ hold for every dev launch: the macOS Swift app's `current_exe()` lives in
 built `kmuxd` yet.  Without that step the resolver fell through to `$PATH` and
 auto-spawned an installed **release** `~/.cargo/bin/kmuxd`; that daemon binds its
 socket under `kmux/` while the debug client polls `kmux-debug/`, so the two never
-meet and the GUI reports "daemon start failed".  The dev run tasks
-(`mise run gtk-run` / `swift-run` / `start`) also build `kmuxd` and export
+meet and the GUI reports "daemon start failed".  The dev entrypoint `./kmux`
+(via `mise run dev`) also builds `kmuxd` and exports
 `KMUX_KMUXD=target/debug/kmuxd` to pin it explicitly.
 
 ### Finding the active profile's logs

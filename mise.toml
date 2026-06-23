@@ -87,66 +87,10 @@ description = "Remove all build artifacts (cargo target/ + SwiftPM .build)"
 depends = ["clean-swift"]
 run = "cargo clean"
 
-[tasks.gtk-app]
-description = "Build the GTK app (kmux-gtk)"
-run = "cargo build -p kmux-gtk"
-
-[tasks.gtk-run]
-description = "Run the GTK app (kmux-gtk) against the debug daemon"
-# Build + pin the debug kmuxd so the GUI auto-spawns it, not an installed
-# release kmuxd on PATH (which a debug client can never reach — separate runtime
-# dirs). See find_server_binary() / KMUX_KMUXD in crates/kmux-connect.
-run = [
-    "cargo build -p kmuxd",
-    'KMUX_KMUXD="$PWD/target/debug/kmuxd" cargo run -p kmux-gtk',
-]
-
-[tasks.gtk-test]
-description = "Test the GTK app (kmux-gtk)"
-run = "cargo test -p kmux-gtk"
-
-[tasks.swift-app]
-description = "Build the native macOS app (kmux-swift). Regenerates bindings first."
-depends = ["gen-ffi-bindings"]
-run = "swift build --package-path kmux-swift"
-
-[tasks.swift-run]
-description = "Run the native macOS app (kmux-swift) against the debug daemon. Regenerates bindings first."
-depends = ["gen-ffi-bindings"]
-# Build + pin the debug kmuxd (see gtk-run); the app inherits KMUX_KMUXD from
-# `swift run` and auto-spawns target/debug/kmuxd instead of a release one on PATH.
-run = [
-    "cargo build -p kmuxd",
-    'KMUX_KMUXD="$PWD/target/debug/kmuxd" swift run --package-path kmux-swift',
-]
-
 [tasks.swift-test]
 description = "Test the native macOS app (kmux-swift). Regenerates bindings first."
 depends = ["gen-ffi-bindings"]
 run = "swift test --package-path kmux-swift"
-
-# The Rust `gpu` feature is on by default now, so the bindings always include
-# KmuxRenderer; these tasks add the Swift `-DKMUX_GPU` flag (compiles the Metal
-# view) and, for `-run`, select the GPU path via a fixture `config.toml`
-# (`renderer = "gpu"`) — the runtime knob is config now, not an env var.
-[tasks.swift-gpu-app]
-description = "Build the macOS app with the Swift Metal view compiled in (issue #132)."
-run = [
-    "mise run gen-ffi-bindings",
-    "swift build --package-path kmux-swift -Xswiftc -DKMUX_GPU",
-]
-
-[tasks.swift-gpu-run]
-description = "Run the macOS app on the GPU renderer (renderer = \"gpu\" via a fixture config)."
-# Build + pin the debug kmuxd (see gtk-run) so the GPU dev app auto-spawns it.
-# A fixture XDG_CONFIG_HOME carries `renderer = "gpu"` since the renderer is now
-# a config key rather than an env var.
-run = [
-    "mise run gen-ffi-bindings",
-    "cargo build -p kmuxd",
-    "mkdir -p target/gpu-config/kmux && printf 'renderer = \"gpu\"\\n' > target/gpu-config/kmux/config.toml",
-    'XDG_CONFIG_HOME="$PWD/target/gpu-config" KMUX_KMUXD="$PWD/target/debug/kmuxd" swift run --package-path kmux-swift -Xswiftc -DKMUX_GPU',
-]
 
 [tasks.doc]
 description = "Generate docs"

@@ -2,7 +2,7 @@
 #MISE description="Upgrade a running installed daemon in place via live-restart (issue #36)."
 #
 # Build + install a fresh release kmuxd, then live-restart it so existing sessions
-# (shells, editors, REPLs) survive. Unlike `mise run daemon -- restart` (which only
+# (shells, editors, REPLs) survive. Unlike `./kmux daemon restart` (which only
 # rebuilds + restarts a dev daemon), this swaps the installed system binary, so it
 # is the path to ship a new daemon to a live session. See docs/daemon-handoff.md
 # §"Upgrading a running daemon".

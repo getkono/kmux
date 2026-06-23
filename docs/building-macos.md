@@ -65,19 +65,22 @@ actually change. uniffi emits identical output whenever the FFI surface is
 unchanged, so when you've only touched Rust internals the bindings keep their
 mtime and SwiftPM (which keys recompilation on mtime) skips rebuilding
 `KmuxBindings`/`KmuxApp` — it just relinks the updated staticlib. So a repeated
-`mise run swift-run` after a non-FFI change stays incremental instead of
-recompiling the Swift modules every time.
+`./kmux` after a non-FFI change stays incremental instead of recompiling the
+Swift modules every time.
 
 ## Build / run / test
 
 ```sh
-mise run swift-app     # gen bindings + swift build
-mise run swift-run     # gen bindings + swift run (launches the app)
+./kmux                 # gen bindings + build + run the app (debug; pins the debug daemon)
 mise run swift-test    # gen bindings + swift test
 ```
 
-(or directly: `swift build --package-path kmux-swift`, etc., after
-`mise run gen-ffi-bindings`).
+`./kmux` is the macOS dev launcher: it regenerates the bindings, builds the debug
+`kmuxd`, and runs the native Swift app via `swift run` (always with `-DKMUX_GPU`,
+so the renderer is a runtime config choice — see GPU rendering below). It also
+serves the CLI: `./kmux daemon status`, `./kmux ls`, etc. run toolkit-free without
+opening the app. (Or build directly: `swift build --package-path kmux-swift` after
+`mise run gen-ffi-bindings`.)
 
 ### Cleaning up
 
@@ -92,19 +95,18 @@ mise run clean         # full reset: cargo clean + kmux-swift/.build
 
 ### GPU rendering (opt-in, issue #132)
 
-To run the app with the shared wgpu renderer instead of CoreText:
+There is no separate GPU build. The `gpu` feature is on by default (so the
+staticlib + generated bindings always include the `KmuxRenderer` object), and
+`./kmux` always compiles the app with `-DKMUX_GPU` (the Swift Metal view). Which
+renderer is *used* is a pure runtime choice — set it in `config.toml`:
 
-```sh
-mise run swift-gpu-run   # regen bindings, swift -DKMUX_GPU, renderer = "gpu" config
-mise run swift-gpu-app   # build only
+```toml
+# ~/.config/kmux/config.toml
+renderer = "gpu"   # default is "cairo" (CoreText on macOS)
 ```
 
-The `gpu` feature is on by default, so the staticlib + generated bindings always
-include the `KmuxRenderer` object; these tasks compile the app with `-DKMUX_GPU`
-(the Swift Metal view) and select the GPU path at runtime via the `renderer = "gpu"`
-key in `config.toml` (`swift-gpu-run` points `XDG_CONFIG_HOME` at a fixture config).
-The default tasks above stay CoreText.
-See [architecture-render.md](architecture-render.md).
+Then `./kmux`. The render-debug overlay reports the *effective* renderer (a GPU
+init failure falls back to CoreText). See [architecture-render.md](architecture-render.md).
 
 ## Install
 
@@ -149,7 +151,7 @@ cargo run -p kmuxd     # self-signed cert by default; or: kmux daemon start
 
 # In another: launch the app — it connects to the local daemon over the UDS,
 # renders the active session, and forwards keystrokes.
-mise run swift-run
+./kmux
 ```
 
 The app defaults to the local daemon (`DriverConfig.server = nil`). Verify:
@@ -171,8 +173,8 @@ builds `kmux` and the GTK frontend `kmux-gtk` natively against Homebrew GTK
 
 - `mise run install` assembles an `~/Applications/kmux.app` bundle, but it is **not
   codesigned or notarized** yet (fine for a local from-source install; a
-  Gatekeeper-distributable build is a follow-up). Run via `swift run` /
-  `mise run swift-run` it launches as a bare SwiftPM executable, setting
+  Gatekeeper-distributable build is a follow-up). Run via `./kmux` (or `swift
+  run` directly) it launches as a bare SwiftPM executable, setting
   `NSApplication` to a regular foreground app via the `onAppear` hook.
 - The renderer uses the system monospaced face; a configurable font in
   Preferences is a follow-up.
