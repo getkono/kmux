@@ -49,6 +49,22 @@ pub(super) fn get_pane_relay_mut<'a>(
         })
 }
 
+/// Stamp the owning session's `last_active` with the current time (issue #64).
+///
+/// Called from the input path under the `sessions` *read* lock — the timestamp
+/// lives behind an `AtomicU64`, so no write lock is needed. A missing session or
+/// unparseable pane id is a no-op (the input path reports those errors itself).
+pub(super) fn touch_session_for_pane(sessions: &HashMap<String, SessionState>, pane_id: &str) {
+    if let Some((word_id, _)) = parse_pane_id(pane_id)
+        && let Some(state) = sessions.get(word_id)
+    {
+        state.last_active.store(
+            kmux_protocol::messages::epoch_millis(),
+            std::sync::atomic::Ordering::Relaxed,
+        );
+    }
+}
+
 /// Parse a pane ID `"{word_id}/{pane_index}"` into its components.
 pub use kmux_protocol::parse_pane_id;
 

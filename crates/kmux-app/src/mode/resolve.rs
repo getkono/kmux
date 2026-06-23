@@ -148,15 +148,6 @@ pub(crate) fn resolve_signal(key: &Key, _mods: Modifiers) -> (Option<Mode>, Acti
     }
 }
 
-pub(crate) fn resolve_confirm_close(key: &Key) -> (Option<Mode>, Action) {
-    match key {
-        // Return None for mode: the action handler owns the transition so it
-        // can extract word_id via mem::replace before setting Mode::Normal.
-        Key::Character(c) if c == "y" => (None, Action::ConfirmCloseYes),
-        _ => (Some(Mode::Normal), Action::None),
-    }
-}
-
 /// Keys accepted while disconnected. Everything else is dropped (so pane
 /// input is effectively frozen) and the overlay stays up.
 pub(crate) fn resolve_disconnected(key: &Key) -> (Option<Mode>, Action) {
@@ -533,35 +524,8 @@ mod tests {
         assert_eq!(action, Action::SelectPickerEntry);
     }
 
-    // Regression tests: confirm-close and rename-submit must NOT pre-transition
-    // the mode so that the action handler can extract data via mem::replace.
-
-    #[test]
-    fn confirm_close_y_does_not_change_mode() {
-        let (mode, action) = resolve(
-            &Mode::ConfirmCloseSession {
-                word_id: "abc".into(),
-            },
-            &Key::Character("y".into()),
-            Modifiers::empty(),
-        );
-        // mode must be None so the action handler can mem::replace the ConfirmCloseSession
-        assert_eq!(mode, None);
-        assert_eq!(action, Action::ConfirmCloseYes);
-    }
-
-    #[test]
-    fn confirm_close_other_key_cancels() {
-        let (mode, action) = resolve(
-            &Mode::ConfirmCloseSession {
-                word_id: "abc".into(),
-            },
-            &Key::Character("n".into()),
-            Modifiers::empty(),
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-        assert_eq!(action, Action::None);
-    }
+    // Regression test: rename-submit must NOT pre-transition the mode so that
+    // the action handler can extract data via mem::replace.
 
     #[test]
     fn rename_enter_does_not_change_mode() {

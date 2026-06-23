@@ -2,6 +2,7 @@ pub(super) mod ansi_emit;
 mod attach;
 mod clients;
 mod crud;
+mod graveyard;
 mod helpers;
 mod io;
 pub(super) mod layout;
@@ -374,6 +375,15 @@ pub struct SessionState {
     pub next_tab_index: u32,
     /// Default/restored tab view (which tab a client views is client-local).
     pub active_tab: u32,
+    /// Epoch-ms timestamp of the last user input to any pane in this session.
+    ///
+    /// Stored behind an `Arc<AtomicU64>` so the input path can stamp it under
+    /// the `sessions` *read* lock (interior mutability) without contending on a
+    /// write lock. Persisted into `PersistedSession::last_active_ms` at
+    /// checkpoint time so closed sessions can be ordered by recency in the
+    /// restore UI (issue #64). Mirrors [`ConnectionMetrics::last_activity_ms`],
+    /// but per-session and durable.
+    pub last_active: Arc<AtomicU64>,
 }
 
 impl SessionState {
@@ -568,6 +578,19 @@ pub struct ServerApp {
     /// Per-pane restart timestamps, used to bound worker respawns (crash-loop
     /// guard); keyed by `pane_id`.
     worker_restart_log: Mutex<HashMap<String, Vec<std::time::Instant>>>,
+    /// Retained closed (inactive) sessions a user can restore (issue #64),
+    /// newest-closed last. Persisted to its own `closed.bin` file, rewritten
+    /// only when this set changes. See `app/graveyard.rs`.
+    pub(super) closed_sessions: Mutex<Vec<crate::persist::PersistedClosedSession>>,
+    /// Count cap: at most this many closed sessions are retained; the oldest
+    /// (by close time) are evicted past it.
+    pub(super) closed_session_keep: usize,
+    /// Age cap in milliseconds: closed sessions older than this (since close)
+    /// are pruned by the periodic TTL sweep. `0` disables age-based pruning.
+    pub(super) closed_session_ttl_ms: u64,
+    /// On-disk graveyard file path. `None` (the default, e.g. in tests) keeps
+    /// the graveyard in memory only and skips all graveyard disk I/O.
+    pub(super) graveyard_path: Option<std::path::PathBuf>,
 }
 
 impl ServerApp {
@@ -596,7 +619,27 @@ impl ServerApp {
             worker_fault_tx,
             worker_fault_rx: Mutex::new(Some(worker_fault_rx)),
             worker_restart_log: Mutex::new(HashMap::new()),
+            closed_sessions: Mutex::new(Vec::new()),
+            closed_session_keep: crate::config::DEFAULT_CLOSED_SESSION_KEEP as usize,
+            closed_session_ttl_ms: crate::config::default_closed_session_ttl_ms(),
+            graveyard_path: None,
         }
+    }
+
+    /// Configure closed-session retention (from `kmuxd.toml`) and the on-disk
+    /// graveyard path. Builder-style, like [`with_compression`]. A
+    /// `ttl_days` of `0` disables age-based pruning; the count cap always
+    /// applies. See [`crate::config::ResolvedConfig`].
+    pub fn with_closed_sessions(
+        mut self,
+        keep: u32,
+        ttl_days: u32,
+        path: std::path::PathBuf,
+    ) -> Self {
+        self.closed_session_keep = keep as usize;
+        self.closed_session_ttl_ms = ttl_days as u64 * 24 * 60 * 60 * 1000;
+        self.graveyard_path = Some(path);
+        self
     }
 
     /// Clone the sender worker supervisors use to report a crash for respawn.
@@ -1417,6 +1460,7 @@ mod tests {
             tabs: vec![],
             next_tab_index: 0,
             active_tab: 0,
+            last_active: Arc::new(AtomicU64::new(0)),
         };
         app.sessions.write().await.insert(word.to_string(), session);
         app

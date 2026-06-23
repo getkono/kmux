@@ -104,7 +104,11 @@ impl TransportKind {
 ///   `server_machine_id`. New `ClientMessage::ClientList`/`KickClient`,
 ///   `ServerMessage::ClientListResult`/`ClientKicked`/`SessionKicked`, and the
 ///   `ClientInfo` struct expose listing and per-connection kicking of clients.
-pub const PROTOCOL_VERSION: u32 = 33;
+/// - **34**: restore closed sessions (issue #64). New
+///   `ClientMessage::SessionListClosed`/`SessionRestore` and
+///   `ServerMessage::ClosedSessionListResult` (carrying `ClosedSessionEntry`)
+///   let clients list and restore sessions retained in the daemon's graveyard.
+pub const PROTOCOL_VERSION: u32 = 34;
 
 /// Wire compression algorithm negotiated for a connection.
 ///

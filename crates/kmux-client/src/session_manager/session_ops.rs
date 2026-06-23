@@ -247,6 +247,23 @@ impl SessionManager {
         });
     }
 
+    /// Ask the daemon for the list of closed (restorable) sessions (issue #64).
+    /// The reply populates [`Self::closed_session_list`].
+    pub fn request_closed_sessions(&mut self) {
+        let rid = self.next_rid();
+        self.send_ws(ClientMessage::SessionListClosed { request_id: rid });
+    }
+
+    /// Restore a previously closed session by word id (issue #64). On success the
+    /// daemon replies with `SessionCreated`, handled like any new session.
+    pub fn restore_session(&mut self, word_id: &str) {
+        let rid = self.next_rid();
+        self.send_ws(ClientMessage::SessionRestore {
+            request_id: rid,
+            word_id: word_id.to_string(),
+        });
+    }
+
     /// Rename the active session's display name.
     pub fn rename_session(&mut self, word_id: &str, new_name: &str) {
         if !new_name.is_empty() {

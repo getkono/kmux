@@ -85,6 +85,7 @@ mod tests {
                 }],
                 next_tab_index: 1,
                 active_tab: 0,
+                last_active_ms: 0,
             }],
         }
     }

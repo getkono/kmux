@@ -262,6 +262,15 @@ pub fn session_state_path() -> anyhow::Result<PathBuf> {
     Ok(sessions_dir()?.join("state.bin"))
 }
 
+/// Path to the closed-session graveyard file (issue #64).
+///
+/// A sibling of [`session_state_path`], kept separate so that the large,
+/// immutable closed-session snapshots are rewritten only when the graveyard set
+/// changes — never on the periodic live checkpoint.
+pub fn closed_sessions_path() -> anyhow::Result<PathBuf> {
+    Ok(sessions_dir()?.join("closed.bin"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

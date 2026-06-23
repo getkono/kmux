@@ -23,8 +23,6 @@ pub enum Mode {
     Scroll,
     /// Signal menu: k=SIGKILL, t=SIGTERM, s=SIGSTOP, c=SIGCONT
     Signal,
-    /// Confirm close session (y/n)
-    ConfirmCloseSession { word_id: String },
     /// Rename session (typing new name)
     RenameSession { word_id: String, buffer: String },
     /// Rename a tab (typing new name)
@@ -93,7 +91,6 @@ pub enum Action {
     // Session management
     CreateSession,
     CloseSession,
-    ConfirmCloseYes,
     NextSession,
     PrevSession,
     JumpToSession(usize),
@@ -256,7 +253,6 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::Session => resolve_session(key, mods),
         Mode::Scroll => resolve_scroll(key, mods),
         Mode::Signal => resolve_signal(key, mods),
-        Mode::ConfirmCloseSession { .. } => resolve_confirm_close(key),
         Mode::RenameSession { .. } | Mode::RenameTab { .. } => resolve_rename(key, mods),
         Mode::SessionPicker => resolve_session_picker(key, mods),
         Mode::ProcessOverview => resolve_process_overview(key, mods),

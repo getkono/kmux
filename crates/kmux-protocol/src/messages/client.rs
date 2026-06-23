@@ -94,6 +94,20 @@ pub enum ClientMessage {
         new_name: String,
     },
 
+    /// Request the list of closed (inactive) sessions that can be restored
+    /// (issue #64). Reply: [`super::server::ServerMessage::ClosedSessionListResult`].
+    /// Fetched lazily (e.g. when the launcher opens), not pushed.
+    SessionListClosed { request_id: RequestId },
+
+    /// Restore a previously closed session from the daemon's graveyard
+    /// (issue #64). On success the daemon respawns the session and replies with
+    /// [`super::server::ServerMessage::SessionCreated`] (the session is live
+    /// again); on failure it replies with an error.
+    SessionRestore {
+        request_id: RequestId,
+        word_id: WordId,
+    },
+
     /// Create a new pane inside an existing session.
     PaneCreate {
         request_id: RequestId,
@@ -353,6 +367,8 @@ impl ClientMessage {
             Self::SessionCreate { .. }
             | Self::SessionClose { .. }
             | Self::SessionList { .. }
+            | Self::SessionListClosed { .. }
+            | Self::SessionRestore { .. }
             | Self::ProcessOverview { .. }
             | Self::SessionRename { .. }
             | Self::PaneCreate { .. }
@@ -437,6 +453,52 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn closed_session_messages_roundtrip() {
+        use super::super::session::ClosedSessionEntry;
+
+        // Client → server: list + restore requests.
+        let list = ClientMessage::SessionListClosed { request_id: 7 };
+        assert!(matches!(
+            crate::decode_client(&crate::encode_client(&list).unwrap()).unwrap(),
+            ClientMessage::SessionListClosed { request_id: 7 }
+        ));
+
+        let restore = ClientMessage::SessionRestore {
+            request_id: 8,
+            word_id: "eagle".to_string(),
+        };
+        match crate::decode_client(&crate::encode_client(&restore).unwrap()).unwrap() {
+            ClientMessage::SessionRestore { word_id, .. } => assert_eq!(word_id, "eagle"),
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Server → client: the closed-session list result.
+        let result = ServerMessage::ClosedSessionListResult {
+            request_id: 7,
+            sessions: vec![ClosedSessionEntry {
+                meta: super::super::session::SessionMeta {
+                    index: 0,
+                    word_id: "eagle".to_string(),
+                    name: "proj".to_string(),
+                    cwd: "/tmp".to_string(),
+                },
+                last_active_ms: 123,
+                closed_at_ms: 456,
+                pane_count: 2,
+            }],
+        };
+        match crate::decode_server(&crate::encode_server(&result).unwrap()).unwrap() {
+            ServerMessage::ClosedSessionListResult { sessions, .. } => {
+                assert_eq!(sessions.len(), 1);
+                assert_eq!(sessions[0].meta.word_id, "eagle");
+                assert_eq!(sessions[0].last_active_ms, 123);
+                assert_eq!(sessions[0].pane_count, 2);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
     }
 
     #[test]

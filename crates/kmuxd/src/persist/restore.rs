@@ -30,12 +30,17 @@ pub fn read_checkpoint(path: &Path) -> anyhow::Result<PersistedDaemonState> {
         1 => {
             let v1: v1::PersistedDaemonState = postcard::from_bytes(&bytes)
                 .map_err(|e| anyhow::anyhow!("failed to deserialize v1 checkpoint: {e}"))?;
-            Ok(migrate_v2_to_v3(migrate_v1_to_v2(v1)))
+            Ok(migrate_v3_to_v4(migrate_v2_to_v3(migrate_v1_to_v2(v1))))
         }
         2 => {
             let v2: v2::PersistedDaemonState = postcard::from_bytes(&bytes)
                 .map_err(|e| anyhow::anyhow!("failed to deserialize v2 checkpoint: {e}"))?;
-            Ok(migrate_v2_to_v3(v2))
+            Ok(migrate_v3_to_v4(migrate_v2_to_v3(v2)))
+        }
+        3 => {
+            let v3: v3::PersistedDaemonState = postcard::from_bytes(&bytes)
+                .map_err(|e| anyhow::anyhow!("failed to deserialize v3 checkpoint: {e}"))?;
+            Ok(migrate_v3_to_v4(v3))
         }
         v if v <= STATE_VERSION => {
             let state: PersistedDaemonState = postcard::from_bytes(&bytes)
@@ -83,14 +88,14 @@ fn migrate_v1_to_v2(v1: v1::PersistedDaemonState) -> v2::PersistedDaemonState {
     }
 }
 
-/// Migrate a v2 checkpoint to the current (`STATE_VERSION`) schema.
+/// Migrate a v2 checkpoint to the v3 schema.
 ///
 /// v2 → v3: sessions gain a tab layer. Each pre-tab pane was a separate
 /// switchable view, so we wrap each pane in its own single-pane tab to preserve
 /// that behavior exactly.
-fn migrate_v2_to_v3(v2: v2::PersistedDaemonState) -> PersistedDaemonState {
-    PersistedDaemonState {
-        version: STATE_VERSION,
+fn migrate_v2_to_v3(v2: v2::PersistedDaemonState) -> v3::PersistedDaemonState {
+    v3::PersistedDaemonState {
+        version: 3,
         session_index_counter: v2.session_index_counter,
         used_words: v2.used_words,
         sessions: v2
@@ -98,7 +103,7 @@ fn migrate_v2_to_v3(v2: v2::PersistedDaemonState) -> PersistedDaemonState {
             .into_iter()
             .map(|s| {
                 let (tabs, next_tab_index, active_tab) = wrap_panes_in_tabs(&s.panes);
-                PersistedSession {
+                v3::PersistedSession {
                     meta: s.meta,
                     next_pane_index: s.next_pane_index,
                     panes: s
@@ -120,6 +125,31 @@ fn migrate_v2_to_v3(v2: v2::PersistedDaemonState) -> PersistedDaemonState {
                     next_tab_index,
                     active_tab,
                 }
+            })
+            .collect(),
+    }
+}
+
+/// Migrate a v3 checkpoint to the current (`STATE_VERSION`) schema.
+///
+/// v3 → v4: `PersistedSession` gains `last_active_ms` (issue #64). We have no
+/// recorded activity time for pre-v4 sessions, so default to `0` ("unknown").
+fn migrate_v3_to_v4(v3: v3::PersistedDaemonState) -> PersistedDaemonState {
+    PersistedDaemonState {
+        version: STATE_VERSION,
+        session_index_counter: v3.session_index_counter,
+        used_words: v3.used_words,
+        sessions: v3
+            .sessions
+            .into_iter()
+            .map(|s| PersistedSession {
+                meta: s.meta,
+                next_pane_index: s.next_pane_index,
+                panes: s.panes,
+                tabs: s.tabs,
+                next_tab_index: s.next_tab_index,
+                active_tab: s.active_tab,
+                last_active_ms: 0,
             })
             .collect(),
     }
@@ -208,6 +238,34 @@ mod v2 {
         pub grid: GridSnapshot,
         pub scrollback_lines: Vec<Vec<CellState>>,
         pub cwd: String,
+    }
+}
+
+/// v3 schema types — the pre-`last_active_ms` layout. `PersistedPane` and
+/// `PersistedTab` are unchanged from v3 to v4, so they are reused from the
+/// current schema; only `PersistedSession` differs (it lacks `last_active_ms`).
+/// Used only for migration (and tests).
+mod v3 {
+    use super::{PersistedPane, PersistedTab};
+    use kmux_protocol::messages::SessionMeta;
+    use serde::{Deserialize, Serialize};
+
+    #[derive(Serialize, Deserialize)]
+    pub struct PersistedDaemonState {
+        pub version: u32,
+        pub session_index_counter: u32,
+        pub sessions: Vec<PersistedSession>,
+        pub used_words: Vec<String>,
+    }
+
+    #[derive(Serialize, Deserialize)]
+    pub struct PersistedSession {
+        pub meta: SessionMeta,
+        pub next_pane_index: u32,
+        pub panes: Vec<PersistedPane>,
+        pub tabs: Vec<PersistedTab>,
+        pub next_tab_index: u32,
+        pub active_tab: u32,
     }
 }
 
@@ -415,6 +473,68 @@ mod tests {
         assert_eq!(session.tabs[1].layout, LayoutNode::single(1));
         assert_eq!(session.next_tab_index, 2);
         assert_eq!(session.active_tab, 0);
+    }
+
+    #[test]
+    fn migrate_v3_checkpoint_defaults_last_active_to_zero() {
+        use crate::persist::{PersistedPane, PersistedTab, PersistedTermSize};
+        use kmux_protocol::messages::{
+            CursorState, GridSnapshot, LayoutNode, SessionMeta, SessionStatus, TermModes,
+        };
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.bin");
+
+        // A v3 session (tabs present, no last_active_ms) written to disk.
+        let v3_state = v3::PersistedDaemonState {
+            version: 3,
+            session_index_counter: 2,
+            used_words: vec!["eagle".to_string()],
+            sessions: vec![v3::PersistedSession {
+                meta: SessionMeta {
+                    index: 0,
+                    word_id: "eagle".to_string(),
+                    name: "s".to_string(),
+                    cwd: "/tmp".to_string(),
+                },
+                next_pane_index: 1,
+                panes: vec![PersistedPane {
+                    pane_index: 0,
+                    program: "/bin/zsh".to_string(),
+                    args: vec![],
+                    size: PersistedTermSize { rows: 24, cols: 80 },
+                    status: SessionStatus::Running,
+                    child_pid: None,
+                    grid: GridSnapshot {
+                        rows: 24,
+                        cols: 80,
+                        cells: vec![Default::default(); 24 * 80],
+                        cursor: CursorState::default(),
+                        modes: TermModes::EMPTY,
+                        history_total: 0,
+                        scrollback_base: 0,
+                        scrollback_tail: Vec::new(),
+                    },
+                    scrollback_lines: vec![],
+                    cwd: "/tmp".to_string(),
+                }],
+                tabs: vec![PersistedTab {
+                    tab_index: 0,
+                    name: "1".to_string(),
+                    layout: LayoutNode::single(0),
+                    focused_pane: 0,
+                }],
+                next_tab_index: 1,
+                active_tab: 0,
+            }],
+        };
+        let bytes = postcard::to_allocvec(&v3_state).unwrap();
+        std::fs::write(&path, bytes).unwrap();
+
+        let migrated = read_checkpoint(&path).unwrap();
+        assert_eq!(migrated.version, STATE_VERSION);
+        assert_eq!(migrated.sessions[0].last_active_ms, 0);
+        assert_eq!(migrated.sessions[0].tabs.len(), 1);
     }
 
     #[test]
