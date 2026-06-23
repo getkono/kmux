@@ -6,6 +6,7 @@
 //! persistence layer requires no changes.
 
 pub mod checkpoint;
+pub mod graveyard;
 pub mod restore;
 
 use kmux_protocol::messages::{
@@ -139,6 +140,45 @@ pub struct PersistedPane {
 /// The backend supports up to 50,000 lines; we cap persistence at 10,000
 /// to keep checkpoint files reasonably sized while still being useful.
 pub const MAX_SCROLLBACK_LINES: usize = 10_000;
+
+/// On-disk format version for the closed-session graveyard file (issue #64).
+/// Independent of [`STATE_VERSION`]: the graveyard lives in its own file.
+pub const GRAVEYARD_VERSION: u32 = 1;
+
+/// One retained, closed (inactive) session that the user can restore.
+///
+/// Wraps a [`PersistedSession`] (the same snapshot the live checkpoint captures)
+/// with the time it was closed, which drives eviction and TTL pruning. UI
+/// recency ordering uses the inner `session.last_active_ms`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedClosedSession {
+    /// The session snapshot at the moment it was closed.
+    pub session: PersistedSession,
+    /// Epoch-ms timestamp of when the session was closed.
+    pub closed_at_ms: u64,
+}
+
+/// Top-level on-disk graveyard: every retained closed session.
+///
+/// Persisted separately from [`PersistedDaemonState`] and rewritten only when
+/// the set changes (a close, a restore, or a prune that actually dropped an
+/// entry) — never on the periodic live checkpoint.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PersistedGraveyard {
+    /// Format version (see [`GRAVEYARD_VERSION`]).
+    pub version: u32,
+    /// Retained closed sessions, newest-closed last.
+    pub sessions: Vec<PersistedClosedSession>,
+}
+
+impl Default for PersistedGraveyard {
+    fn default() -> Self {
+        Self {
+            version: GRAVEYARD_VERSION,
+            sessions: Vec::new(),
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests {

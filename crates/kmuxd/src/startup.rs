@@ -89,12 +89,22 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         }
     };
 
-    let app = Arc::new(
-        ServerApp::new(token.clone())
-            .with_compression(cfg.compression.clone())
-            .with_machine_id(server_machine_id)
-            .with_session_isolation(cfg.session_isolation),
-    );
+    let mut app_builder = ServerApp::new(token.clone())
+        .with_compression(cfg.compression.clone())
+        .with_machine_id(server_machine_id)
+        .with_session_isolation(cfg.session_isolation);
+    // Closed-session graveyard (issue #64): retain closed sessions for restore.
+    match kmux_protocol::dirs::closed_sessions_path() {
+        Ok(path) => {
+            app_builder = app_builder.with_closed_sessions(
+                cfg.closed_session_keep,
+                cfg.closed_session_ttl_days,
+                path,
+            );
+        }
+        Err(e) => warn!("could not determine graveyard path; closed sessions won't persist: {e}"),
+    }
+    let app = Arc::new(app_builder);
     // Respawn isolated VT workers that crash (issue #126); no-op until a pane
     // actually runs in a worker (`session_isolation = "process"`).
     app.spawn_worker_respawn_task();
@@ -125,6 +135,28 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         warn!("handoff: live fds received but no usable checkpoint; cannot reconstruct panes");
     }
 
+    // Load the closed-session graveyard (issue #64). Done after live restore so
+    // it can drop any entry that collides with a just-restored live session
+    // (live wins). Stale/over-cap entries are pruned on load; rewrite if so.
+    match kmux_protocol::dirs::closed_sessions_path() {
+        Ok(path) => match crate::persist::graveyard::read_graveyard(&path) {
+            Ok(graveyard) => {
+                let found = graveyard.sessions.len();
+                let changed = app.load_graveyard(graveyard).await;
+                info!(
+                    retained = found,
+                    pruned = changed,
+                    "closed-session graveyard loaded"
+                );
+                if changed {
+                    app.persist_graveyard();
+                }
+            }
+            Err(e) => warn!("failed to load closed-session graveyard: {e}"),
+        },
+        Err(e) => warn!("could not determine graveyard path: {e}"),
+    }
+
     // Periodic checkpoint task.
     {
         let persist_app = Arc::clone(&app);
@@ -143,6 +175,9 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
                     }
                     Err(e) => warn!("could not determine checkpoint path: {e}"),
                 }
+                // TTL-sweep the closed-session graveyard (issue #64); rewrites
+                // the graveyard file only if something actually expired.
+                persist_app.sweep_graveyard();
             }
         });
     }

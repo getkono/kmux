@@ -127,31 +127,39 @@ impl ServerApp {
         })
     }
 
-    /// Gracefully close all panes of a session and remove it.
+    /// Gracefully close all panes of a session and remove it from the live map.
+    ///
+    /// The session is not discarded: its snapshot is retained in the closed-
+    /// session graveyard so the user can restore it later (issue #64). The
+    /// snapshot is captured and persisted **before** the PTYs are killed, so the
+    /// restorable copy survives even if the daemon crashes mid-close. The word is
+    /// intentionally **not** released — it stays reserved while the session is in
+    /// the graveyard so a restore preserves its identity; it is freed only when
+    /// the entry is evicted by the retention caps.
     pub async fn close_session(&self, word_id: &str) -> Result<Option<i32>> {
-        let pane_ids: Vec<(u32, String)> = {
+        let pane_ids: Vec<String> = {
             let sessions = self.sessions.read().await;
-            sessions
-                .get(word_id)
-                .map(|s| {
-                    s.panes
-                        .keys()
-                        .map(|&idx| (idx, format_pane_id(word_id, idx)))
-                        .collect()
-                })
-                .unwrap_or_default()
+            let Some(state) = sessions.get(word_id) else {
+                return Ok(None);
+            };
+            let snapshot = self.snapshot_session(state).await;
+            let pane_ids = state
+                .panes
+                .keys()
+                .map(|&idx| format_pane_id(word_id, idx))
+                .collect();
+            self.retain_closed_session(crate::persist::PersistedClosedSession {
+                session: snapshot,
+                closed_at_ms: epoch_millis(),
+            });
+            pane_ids
         };
 
-        for (_, pane_id) in &pane_ids {
+        for pane_id in &pane_ids {
             let _ = self.manager.close_nowait(pane_id).await;
         }
 
-        // Remove session state
-        let mut sessions = self.sessions.write().await;
-        sessions.remove(word_id);
-
-        // Return word to pool
-        self.wordlist.lock().unwrap().release(word_id);
+        self.sessions.write().await.remove(word_id);
 
         Ok(None)
     }
