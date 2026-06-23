@@ -31,7 +31,7 @@ remote = [
 # `remote` feature below pulls in `tls` + `tcp-tls` for the direct QUIC/TCP+TLS
 # paths. (We can't disable kmux-protocol's defaults from a workspace member, but
 # its only default is `framing`, which the base build needs anyway.)
-kmux-protocol = { workspace = true, features = ["uds"] }
+kmux-protocol = { workspace = true, features = ["uds", "identity"] }
 anyhow.workspace = true
 futures.workspace = true
 nix.workspace = true

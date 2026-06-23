@@ -89,6 +89,11 @@ fn cmd_processes(app: &mut AppCore, _args: &[String]) -> CommandResult {
     Ok(CommandSuccess::Ok)
 }
 
+fn cmd_clients(app: &mut AppCore, _args: &[String]) -> CommandResult {
+    app.toggle_connected_clients();
+    Ok(CommandSuccess::Ok)
+}
+
 fn cmd_transport(app: &mut AppCore, args: &[String]) -> CommandResult {
     use kmux_protocol::messages::TransportKind;
     let Some(arg) = args.first() else {
@@ -508,6 +513,13 @@ pub static ALL: &[CommandSpec] = &[
         summary: "Toggle the process overview (all sessions)",
         args: NO_ARGS,
         run: cmd_processes,
+    },
+    CommandSpec {
+        name: "clients",
+        aliases: &["kick"],
+        summary: "Toggle the connected-clients view (this session)",
+        args: NO_ARGS,
+        run: cmd_clients,
     },
     CommandSpec {
         name: "connection",

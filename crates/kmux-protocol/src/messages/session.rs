@@ -276,6 +276,36 @@ pub struct PaneInfo {
     pub progress: Option<u8>,
 }
 
+/// One client connection attached to a session, for the client-management views
+/// (issue #146). Carries both identity levels: the cryptographic `machine_id`
+/// (shared by all of one user@machine's connections) and the daemon-assigned,
+/// user-readable per-connection `label` (`username@hostname[#N]`), which is the
+/// unit listed and kicked.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientInfo {
+    /// Stable per-connection handle used as the kick target.
+    pub client_id: ClientId,
+    /// Underlying connection id (survives transport switches).
+    pub connection_id: ConnectionId,
+    /// User-readable label assigned by the host daemon: `username@hostname`, with
+    /// a `#N` suffix when the same user@host has multiple live connections.
+    pub label: String,
+    /// Cryptographic machine/user identity: hex SHA-256 of the public key.
+    pub machine_id: String,
+    /// Client-reported hostname (friendly label only).
+    pub hostname: String,
+    /// Client-reported OS username (friendly label only).
+    pub username: String,
+    /// Human-readable transport name ("quic" / "tcp" / "uds").
+    pub transport: String,
+    /// Pane indices of this session that the client is currently attached to.
+    pub attached_panes: Vec<u32>,
+    /// Seconds since the connection was registered.
+    pub uptime_secs: u64,
+    /// True for the connection that issued the list request (shown as "(you)").
+    pub is_self: bool,
+}
+
 /// Orientation of a layout split.
 ///
 /// `Horizontal` lays children out **left ↔ right** (a vertical divider between
@@ -778,4 +808,6 @@ pub enum ErrorCode {
     SessionLimitReached,
     /// The specified pane was not found.
     PaneNotFound,
+    /// The specified client connection was not found / not attached (issue #146).
+    ClientNotFound,
 }

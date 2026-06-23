@@ -79,12 +79,30 @@ pub trait PaneAttacher: Send + Sync {
 
 // ─── Shared client state ──────────────────────────────────────────────────────
 
+/// State held between the `Auth` and `AuthProof` handshake messages (issue #146):
+/// the random nonce the daemon issued plus the identity claim it will trust once
+/// the client returns a valid signature over that nonce.
+pub struct PendingAuth {
+    pub nonce: Vec<u8>,
+    pub public_key: Vec<u8>,
+    pub hostname: String,
+    pub username: String,
+    pub capabilities: ClientCapabilities,
+    pub connection_id: Option<ConnectionId>,
+}
+
 /// Transport-independent state for a connected client.
 pub struct SharedClientState {
     pub authenticated: bool,
     pub client_id: Option<ClientId>,
     pub connection_id: Option<ConnectionId>,
     pub capabilities: ClientCapabilities,
+    /// Set after a valid `Auth`; consumed when `AuthProof` arrives (issue #146).
+    pub pending_auth: Option<PendingAuth>,
+    /// This connection's verified identity fingerprint, once authenticated.
+    pub machine_id: Option<String>,
+    /// This connection's daemon-assigned user-readable label, once authenticated.
+    pub label: Option<String>,
     /// Output-forwarding task handles, keyed by pane_id.
     pub attached: HashMap<String, AbortHandle>,
     /// Sender for the control-stream writer task.
@@ -122,6 +140,9 @@ impl SharedClientState {
             client_id: None,
             connection_id: None,
             capabilities: ClientCapabilities::default(),
+            pending_auth: None,
+            machine_id: None,
+            label: None,
             attached: HashMap::new(),
             ctrl_tx,
             app,

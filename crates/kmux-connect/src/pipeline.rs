@@ -495,40 +495,8 @@ async fn establish(
         port: hs_port,
     });
 
-    let (intercept_tx, mut intercept_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let (intercept_tx, intercept_rx) = mpsc::unbounded_channel::<ServerMessage>();
     let (auth_tx, auth_rx) = oneshot::channel::<Result<AuthOutcome, String>>();
-
-    let forwarder_outer = outer_tx.clone();
-    tokio::spawn(async move {
-        let mut auth_tx = Some(auth_tx);
-        while let Some(msg) = intercept_rx.recv().await {
-            if let (Some(_), ServerMessage::AuthResult { .. }) = (&auth_tx, &msg) {
-                let captured = match &msg {
-                    ServerMessage::AuthResult {
-                        success: true,
-                        connection_id,
-                        server_version,
-                        ..
-                    } => Ok(AuthOutcome {
-                        connection_id: connection_id.unwrap_or(ConnectionId(0)),
-                        server_version: server_version.clone(),
-                    }),
-                    ServerMessage::AuthResult {
-                        success: false,
-                        reason,
-                        ..
-                    } => Err(reason.clone().unwrap_or_else(|| "rejected".into())),
-                    _ => unreachable!(),
-                };
-                if let Some(tx) = auth_tx.take() {
-                    let _ = tx.send(captured);
-                }
-            }
-            if forwarder_outer.send(msg).is_err() {
-                break;
-            }
-        }
-    });
 
     let sender_result = match plan.transport {
         TransportKind::Uds => {
@@ -616,6 +584,49 @@ async fn establish(
             return Err(err);
         }
     };
+
+    // Drain the server stream: answer the identity challenge in-band (issue #146,
+    // needs `client_tx`, hence spawned here rather than before connect), capture
+    // the terminal `AuthResult`, and forward everything else to the session
+    // manager. Buffered frames wait in `intercept_rx` until this starts.
+    let forwarder_outer = outer_tx.clone();
+    let challenge_tx = client_tx.clone();
+    tokio::spawn(async move {
+        let mut intercept_rx = intercept_rx;
+        let mut auth_tx = Some(auth_tx);
+        while let Some(msg) = intercept_rx.recv().await {
+            // Sign the challenge and reply; never forwarded downstream.
+            if let ServerMessage::AuthChallenge { nonce } = &msg {
+                tcp_connect::answer_auth_challenge(&challenge_tx, nonce);
+                continue;
+            }
+            if let (Some(_), ServerMessage::AuthResult { .. }) = (&auth_tx, &msg) {
+                let captured = match &msg {
+                    ServerMessage::AuthResult {
+                        success: true,
+                        connection_id,
+                        server_version,
+                        ..
+                    } => Ok(AuthOutcome {
+                        connection_id: connection_id.unwrap_or(ConnectionId(0)),
+                        server_version: server_version.clone(),
+                    }),
+                    ServerMessage::AuthResult {
+                        success: false,
+                        reason,
+                        ..
+                    } => Err(reason.clone().unwrap_or_else(|| "rejected".into())),
+                    _ => unreachable!(),
+                };
+                if let Some(tx) = auth_tx.take() {
+                    let _ = tx.send(captured);
+                }
+            }
+            if forwarder_outer.send(msg).is_err() {
+                break;
+            }
+        }
+    });
 
     match timeout(AUTH_TIMEOUT, auth_rx).await {
         Ok(Ok(Ok(auth))) => {

@@ -121,6 +121,57 @@ pub enum Command {
         format: OutputFormat,
     },
 
+    /// List the client connections attached to sessions on a server (issue #146).
+    /// Each connection shows its user-readable label, machine id, hostname, and
+    /// which session/panes it is viewing. Pass a session word-id to scope to one.
+    ///
+    /// The session is the leading positional; address a remote daemon with
+    /// `--server` (mirrors `ls`/`ps`, which take the server positionally because
+    /// it is their only argument).
+    Clients {
+        /// Limit to one session (word-id); omit to list every session's clients.
+        #[arg(value_name = "SESSION")]
+        session: Option<String>,
+
+        /// Target server: `[user@]host[:ssh-port][:/path]` or a `hosts.toml`
+        /// alias. Omit to use the local daemon.
+        #[arg(long, add = ArgValueCandidates::new(crate::completion::server_candidates))]
+        server: Option<String>,
+
+        /// Override the SSH port for the target server.
+        #[arg(long)]
+        ssh_port: Option<u16>,
+
+        /// Output format
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
+
+    /// Kick one client connection out of a session (issue #146): the target is
+    /// detached from the session's panes (its connection stays alive). Identify
+    /// the client by its user-readable label or numeric client-id from `clients`.
+    ///
+    /// `session` and `client` are required positionals; address a remote daemon
+    /// with `--server`.
+    Kick {
+        /// Session word-id the client is attached to.
+        #[arg(value_name = "SESSION")]
+        session: String,
+
+        /// The client to kick: its label (e.g. `alice@box`) or numeric client-id.
+        #[arg(value_name = "CLIENT")]
+        client: String,
+
+        /// Target server: `[user@]host[:ssh-port][:/path]` or a `hosts.toml`
+        /// alias. Omit to use the local daemon.
+        #[arg(long, add = ArgValueCandidates::new(crate::completion::server_candidates))]
+        server: Option<String>,
+
+        /// Override the SSH port for the target server.
+        #[arg(long)]
+        ssh_port: Option<u16>,
+    },
+
     /// Internal diagnostics (hidden). See `kmux debug tearing` (issue #72).
     #[command(hide = true)]
     Debug {

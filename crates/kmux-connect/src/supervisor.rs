@@ -586,18 +586,20 @@ async fn recv_opt<T>(rx: &mut Option<mpsc::UnboundedReceiver<T>>) -> Option<T> {
 /// `Err(reason)` on auth failure). The forwarder exits when the underlying
 /// transport's reader task drops its sender.
 #[cfg(feature = "remote")]
-fn spawn_auth_intercept(
+fn spawn_auth_forwarder(
+    mut intercept_rx: mpsc::UnboundedReceiver<ServerMessage>,
+    auth_tx: oneshot::Sender<Result<(), String>>,
     outer_tx: mpsc::UnboundedSender<ServerMessage>,
-) -> (
-    mpsc::UnboundedSender<ServerMessage>,
-    oneshot::Receiver<Result<(), String>>,
+    client_tx: mpsc::UnboundedSender<ClientMessage>,
 ) {
-    let (intercept_tx, mut intercept_rx) = mpsc::unbounded_channel::<ServerMessage>();
-    let (auth_tx, auth_rx) = oneshot::channel::<Result<(), String>>();
-
     tokio::spawn(async move {
         let mut auth_tx = Some(auth_tx);
         while let Some(msg) = intercept_rx.recv().await {
+            // Answer the identity challenge in-band (issue #146); never forwarded.
+            if let ServerMessage::AuthChallenge { nonce } = &msg {
+                crate::tcp_connect::answer_auth_challenge(&client_tx, nonce);
+                continue;
+            }
             if let (Some(_), ServerMessage::AuthResult { .. }) = (&auth_tx, &msg) {
                 let captured = match &msg {
                     ServerMessage::AuthResult { success: true, .. } => Ok(()),
@@ -617,8 +619,6 @@ fn spawn_auth_intercept(
             }
         }
     });
-
-    (intercept_tx, auth_rx)
 }
 
 /// Attempt a connection on `kind` using the given address and return the
@@ -638,7 +638,8 @@ async fn probe_transport(
 ) -> Result<mpsc::UnboundedSender<ClientMessage>, String> {
     use crate::connect::ConnectResult;
 
-    let (intercept_tx, auth_rx) = spawn_auth_intercept(server_tx);
+    let (intercept_tx, intercept_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let (auth_tx, auth_rx) = oneshot::channel::<Result<(), String>>();
 
     let token = token.to_string();
     let address = address.to_string();
@@ -708,6 +709,11 @@ async fn probe_transport(
         ConnectResult::Connected(s) => s,
         ConnectResult::Failed(e) => return Err(e),
     };
+
+    // Forward the server stream and answer the identity challenge (issue #146):
+    // spawned here because it needs `sender` (client_tx) to reply. Any frames the
+    // daemon already sent buffer in `intercept_rx` until this drains them.
+    spawn_auth_forwarder(intercept_rx, auth_tx, server_tx, sender.clone());
 
     // Wait for the server to confirm authentication on the new channel.
     // Dropping `sender` on Err closes the new transport's writer task, which
@@ -1026,21 +1032,44 @@ mod tests {
 
     // ── spawn_auth_intercept ───────────────────────────────────────────────────
 
-    #[tokio::test]
-    async fn auth_intercept_signals_success_and_forwards_msg() {
-        let (outer_tx, mut outer_rx) = mpsc::unbounded_channel::<ServerMessage>();
-        let (intercept_tx, auth_rx) = spawn_auth_intercept(outer_tx);
+    /// Build a successful `AuthResult` for the forwarder tests (issue #146 added
+    /// the identity fields, defaulted to `None` here).
+    fn ok_auth_result() -> ServerMessage {
+        ServerMessage::AuthResult {
+            success: true,
+            reason: None,
+            client_id: None,
+            server_version: None,
+            connection_id: None,
+            compression: None,
+            machine_id: None,
+            label: None,
+            server_machine_id: None,
+        }
+    }
 
-        intercept_tx
-            .send(ServerMessage::AuthResult {
-                success: true,
-                reason: None,
-                client_id: None,
-                server_version: None,
-                connection_id: None,
-                compression: None,
-            })
-            .unwrap();
+    /// Spawn a forwarder wired to fresh channels; returns the intercept sink, the
+    /// auth receiver, and the outer receiver. The client sink is dropped (these
+    /// tests do not exercise the challenge path).
+    #[cfg(feature = "remote")]
+    fn forwarder_under_test() -> (
+        mpsc::UnboundedSender<ServerMessage>,
+        oneshot::Receiver<Result<(), String>>,
+        mpsc::UnboundedReceiver<ServerMessage>,
+    ) {
+        let (outer_tx, outer_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (intercept_tx, intercept_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (auth_tx, auth_rx) = oneshot::channel::<Result<(), String>>();
+        let (client_tx, _client_rx) = mpsc::unbounded_channel::<ClientMessage>();
+        spawn_auth_forwarder(intercept_rx, auth_tx, outer_tx, client_tx);
+        (intercept_tx, auth_rx, outer_rx)
+    }
+
+    #[tokio::test]
+    async fn auth_forwarder_signals_success_and_forwards_msg() {
+        let (intercept_tx, auth_rx, mut outer_rx) = forwarder_under_test();
+
+        intercept_tx.send(ok_auth_result()).unwrap();
 
         // Auth oneshot resolves Ok.
         assert!(matches!(auth_rx.await, Ok(Ok(()))));
@@ -1053,9 +1082,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_intercept_signals_failure_with_reason() {
-        let (outer_tx, _outer_rx) = mpsc::unbounded_channel::<ServerMessage>();
-        let (intercept_tx, auth_rx) = spawn_auth_intercept(outer_tx);
+    async fn auth_forwarder_signals_failure_with_reason() {
+        let (intercept_tx, auth_rx, _outer_rx) = forwarder_under_test();
 
         intercept_tx
             .send(ServerMessage::AuthResult {
@@ -1065,6 +1093,9 @@ mod tests {
                 server_version: None,
                 connection_id: None,
                 compression: None,
+                machine_id: None,
+                label: None,
+                server_machine_id: None,
             })
             .unwrap();
 
@@ -1075,23 +1106,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_intercept_resolves_only_first_auth_result() {
+    async fn auth_forwarder_resolves_only_first_auth_result() {
         // The supervisor's probe contract: only the *first* AuthResult counts.
         // Any subsequent server message (including a stray second AuthResult)
         // must keep being forwarded but must not re-fire the auth oneshot.
-        let (outer_tx, mut outer_rx) = mpsc::unbounded_channel::<ServerMessage>();
-        let (intercept_tx, auth_rx) = spawn_auth_intercept(outer_tx);
+        let (intercept_tx, auth_rx, mut outer_rx) = forwarder_under_test();
 
-        intercept_tx
-            .send(ServerMessage::AuthResult {
-                success: true,
-                reason: None,
-                client_id: None,
-                server_version: None,
-                connection_id: None,
-                compression: None,
-            })
-            .unwrap();
+        intercept_tx.send(ok_auth_result()).unwrap();
         assert!(matches!(auth_rx.await, Ok(Ok(()))));
 
         // A subsequent non-AuthResult message must still be forwarded.

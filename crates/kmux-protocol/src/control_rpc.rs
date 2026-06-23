@@ -158,6 +158,16 @@ pub struct ConnectionInfo {
     pub connection_id: u64,
     pub client_id: u64,
     pub transport: String,
+    /// Daemon-assigned user-readable label `username@hostname[#N]` (issue #146).
+    #[serde(default)]
+    pub label: String,
+    /// Cryptographic machine/user identity: hex SHA-256 of the public key
+    /// (issue #146). Empty for connections from pre-identity clients.
+    #[serde(default)]
+    pub machine_id: String,
+    /// Client-reported hostname (friendly label only) (issue #146).
+    #[serde(default)]
+    pub hostname: String,
     pub bytes_in: u64,
     pub bytes_out: u64,
     pub msgs_in: u64,

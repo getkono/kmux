@@ -1,5 +1,6 @@
 pub(super) mod ansi_emit;
 mod attach;
+mod clients;
 mod crud;
 mod helpers;
 mod io;
@@ -17,6 +18,7 @@ pub(super) mod restore;
 mod tab_crud;
 
 pub use attach::{AttachParams, AttachResult, InputLockOutcome};
+pub use clients::KickOutcome;
 pub use tab_crud::PaneCloseOutcome;
 
 use std::collections::HashMap;
@@ -448,6 +450,69 @@ struct ConnectionState {
     client_id: ClientId,
     transport: TransportKind,
     metrics: Arc<ConnectionMetrics>,
+    /// Cryptographic identity fingerprint (hex SHA-256 of the public key) of the
+    /// user@machine behind this connection (issue #146). Verified at auth time.
+    machine_id: String,
+    /// Client-reported hostname (friendly label only).
+    hostname: String,
+    /// Client-reported OS username (friendly label only).
+    username: String,
+    /// Daemon-assigned user-readable label `username@hostname[#N]`, unique among
+    /// live connections — the unit listed and kicked.
+    label: String,
+}
+
+/// The cryptographic identity a client presents at auth time (issue #146),
+/// verified before it is trusted and stored in [`ConnectionState`].
+#[derive(Debug, Clone, Default)]
+pub struct ClientIdentity {
+    /// Hex SHA-256 fingerprint of the presented public key.
+    pub machine_id: String,
+    /// Client-reported hostname.
+    pub hostname: String,
+    /// Client-reported OS username.
+    pub username: String,
+}
+
+/// What [`ServerApp::register_client`] returns: the assigned ids, the previous
+/// transport (on a channel switch), and the user-readable label assigned to this
+/// connection.
+pub struct RegisteredClient {
+    pub client_id: ClientId,
+    pub connection_id: ConnectionId,
+    pub previous_transport: Option<TransportKind>,
+    pub label: String,
+}
+
+/// Compose a user-readable connection label `username@hostname`, appending a
+/// `#N` suffix (smallest free `N ≥ 2`) when another live connection already uses
+/// the base — so labels are unique among live connections (issue #146). Empty
+/// hostname/username fall back to `unknown`.
+fn assign_label(hostname: &str, username: &str, conns: &HashMap<u64, ConnectionState>) -> String {
+    let user = if username.is_empty() {
+        "unknown"
+    } else {
+        username
+    };
+    let host = if hostname.is_empty() {
+        "unknown"
+    } else {
+        hostname
+    };
+    let base = format!("{user}@{host}");
+    let existing: std::collections::HashSet<&str> =
+        conns.values().map(|c| c.label.as_str()).collect();
+    if !existing.contains(base.as_str()) {
+        return base;
+    }
+    let mut n = 2u32;
+    loop {
+        let candidate = format!("{base}#{n}");
+        if !existing.contains(candidate.as_str()) {
+            return candidate;
+        }
+        n += 1;
+    }
 }
 
 /// Shared server state -- wrapped in `Arc` and cloned into each connection task.
@@ -455,6 +520,10 @@ pub struct ServerApp {
     /// PTY registry for spawning and managing child processes.
     pub manager: Arc<PtyRegistry>,
     pub auth_token: String,
+    /// This daemon's own cryptographic identity fingerprint (hex SHA-256 of its
+    /// public key), reported to clients in `AuthResult.server_machine_id` (issue
+    /// #146). Empty until set by `with_machine_id` (tests leave it empty).
+    pub server_machine_id: String,
     /// Wire compression policy applied to server→client traffic.
     pub compression: crate::config::CompressionConfig,
     /// Pane VT-pipeline isolation mode (issue #126), resolved from `kmuxd.toml` /
@@ -509,6 +578,7 @@ impl ServerApp {
         Self {
             manager: Arc::new(PtyRegistry::new()),
             auth_token: token,
+            server_machine_id: String::new(),
             compression: crate::config::CompressionConfig::default(),
             session_isolation: crate::config::SessionIsolationMode::default(),
             sessions: RwLock::new(HashMap::new()),
@@ -538,6 +608,13 @@ impl ServerApp {
     /// `startup.rs` can configure it before wrapping the app in an `Arc`.
     pub fn with_compression(mut self, compression: crate::config::CompressionConfig) -> Self {
         self.compression = compression;
+        self
+    }
+
+    /// Set this daemon's own identity fingerprint (issue #146). Builder-style so
+    /// `startup.rs` can load the keypair before wrapping the app in an `Arc`.
+    pub fn with_machine_id(mut self, machine_id: String) -> Self {
+        self.server_machine_id = machine_id;
         self
     }
 
@@ -603,49 +680,61 @@ impl ServerApp {
     /// Register a freshly-connected client or resume an existing connection
     /// after a channel switch.
     ///
-    /// Returns `(client_id, conn_id, metrics, previous_transport)`. The last
-    /// element is `Some(old)` when a channel switch is in progress (the
-    /// caller must remember this and send it back in `ChannelSwitched`
-    /// once the new channel signals `ChannelReady`); `None` when this is
-    /// the first connection for the conn_id.
+    /// Returns a [`RegisteredClient`] whose `previous_transport` is `Some(old)`
+    /// when a channel switch is in progress (the caller must remember this and
+    /// send it back in `ChannelSwitched` once the new channel signals
+    /// `ChannelReady`); `None` when this is the first connection for the conn_id.
+    /// `identity` is the verified cryptographic identity (issue #146); on a fresh
+    /// connection the daemon assigns a unique user-readable `label` derived from
+    /// it. On resume the existing connection's label/identity are kept.
     pub async fn register_client(
         &self,
         transport: TransportKind,
         new_metrics: Arc<ConnectionMetrics>,
         incoming_conn_id: Option<ConnectionId>,
-    ) -> (
-        ClientId,
-        ConnectionId,
-        Arc<ConnectionMetrics>,
-        Option<TransportKind>,
-    ) {
+        identity: ClientIdentity,
+    ) -> RegisteredClient {
         if let Some(conn_id) = incoming_conn_id {
             // Resume an existing connection (channel switch in progress).
             let mut conns = self.connections.write().await;
             if let Some(state) = conns.get_mut(&conn_id.0) {
                 let previous = state.transport;
                 state.transport = transport;
-                let metrics = Arc::clone(&state.metrics);
-                return (state.client_id, conn_id, metrics, Some(previous));
+                return RegisteredClient {
+                    client_id: state.client_id,
+                    connection_id: conn_id,
+                    previous_transport: Some(previous),
+                    label: state.label.clone(),
+                };
             }
             // Unknown ConnectionId — treat as a fresh connection.
         }
         let client_id = ClientId(self.next_client_id.fetch_add(1, Ordering::Relaxed));
         let conn_id = ConnectionId(self.next_connection_id.fetch_add(1, Ordering::Relaxed));
-        let count = {
+        let (label, count) = {
             let mut conns = self.connections.write().await;
+            let label = assign_label(&identity.hostname, &identity.username, &conns);
             conns.insert(
                 conn_id.0,
                 ConnectionState {
                     client_id,
                     transport,
-                    metrics: Arc::clone(&new_metrics),
+                    metrics: new_metrics,
+                    machine_id: identity.machine_id,
+                    hostname: identity.hostname,
+                    username: identity.username,
+                    label: label.clone(),
                 },
             );
-            conns.len()
+            (label, conns.len())
         };
         let _ = self.conn_count_tx.send(count);
-        (client_id, conn_id, new_metrics, None)
+        RegisteredClient {
+            client_id,
+            connection_id: conn_id,
+            previous_transport: None,
+            label,
+        }
     }
 
     /// Remove the connection entry when a client disconnects.
@@ -679,6 +768,9 @@ impl ServerApp {
                     connection_id: *conn_id_u64,
                     client_id: state.client_id.0,
                     transport: state.transport.to_string(),
+                    label: state.label.clone(),
+                    machine_id: state.machine_id.clone(),
+                    hostname: state.hostname.clone(),
                     bytes_in: m.bytes_in.load(Ordering::Relaxed),
                     bytes_out: m.bytes_out.load(Ordering::Relaxed),
                     msgs_in: m.msgs_in.load(Ordering::Relaxed),
@@ -773,7 +865,7 @@ mod tests {
 
     use kmux_protocol::TransportKind;
 
-    use super::{ConnectionMetrics, ServerApp};
+    use super::{ClientIdentity, ConnectionMetrics, KickOutcome, ServerApp};
 
     #[tokio::test]
     async fn conn_count_watch_tracks_register_and_unregister() {
@@ -784,14 +876,23 @@ mod tests {
         assert_eq!(*rx.borrow(), 0);
 
         let m1 = Arc::new(ConnectionMetrics::new());
-        let (_, c1, _, _) = app
-            .register_client(TransportKind::Uds, Arc::clone(&m1), None)
-            .await;
+        let c1 = app
+            .register_client(
+                TransportKind::Uds,
+                Arc::clone(&m1),
+                None,
+                ClientIdentity::default(),
+            )
+            .await
+            .connection_id;
         rx.changed().await.unwrap();
         assert_eq!(*rx.borrow(), 1);
 
         let m2 = Arc::new(ConnectionMetrics::new());
-        let (_, c2, _, _) = app.register_client(TransportKind::Tcp, m2, None).await;
+        let c2 = app
+            .register_client(TransportKind::Tcp, m2, None, ClientIdentity::default())
+            .await
+            .connection_id;
         rx.changed().await.unwrap();
         assert_eq!(*rx.borrow(), 2);
 
@@ -846,18 +947,26 @@ mod tests {
         let metrics = Arc::new(ConnectionMetrics::new());
         metrics.bytes_in.store(42, Ordering::Relaxed);
 
-        let (client_id, conn_id, returned_metrics, previous) = app
-            .register_client(TransportKind::Uds, Arc::clone(&metrics), None)
+        let reg = app
+            .register_client(
+                TransportKind::Uds,
+                Arc::clone(&metrics),
+                None,
+                ClientIdentity::default(),
+            )
             .await;
 
         // IDs start at 1.
-        assert_eq!(client_id.0, 1);
-        assert_eq!(conn_id.0, 1);
+        assert_eq!(reg.client_id.0, 1);
+        assert_eq!(reg.connection_id.0, 1);
         // Fresh registration carries no previous transport.
-        assert!(previous.is_none());
-        // The same Arc is returned, so counter mutations are visible.
-        returned_metrics.bytes_in.fetch_add(8, Ordering::Relaxed);
-        assert_eq!(metrics.bytes_in.load(Ordering::Relaxed), 50);
+        assert!(reg.previous_transport.is_none());
+        // The Arc we passed is the one stored: a later mutation is visible in the
+        // snapshot the daemon builds from the connection's metrics.
+        metrics.bytes_in.fetch_add(8, Ordering::Relaxed);
+        let snap = app.snapshot_sessions_with_connections().await;
+        assert_eq!(snap.unattached.len(), 1);
+        assert_eq!(snap.unattached[0].bytes_in, 50);
     }
 
     #[tokio::test]
@@ -866,39 +975,53 @@ mod tests {
         let original_metrics = Arc::new(ConnectionMetrics::new());
         original_metrics.bytes_in.store(100, Ordering::Relaxed);
 
-        let (_, conn_id, _, first_previous) = app
-            .register_client(TransportKind::Tcp, Arc::clone(&original_metrics), None)
+        let first = app
+            .register_client(
+                TransportKind::Tcp,
+                Arc::clone(&original_metrics),
+                None,
+                ClientIdentity::default(),
+            )
             .await;
         // Fresh registration has no previous transport.
-        assert!(first_previous.is_none());
+        assert!(first.previous_transport.is_none());
+        let conn_id = first.connection_id;
 
         // Simulate a channel switch: re-register with a new metrics Arc.
         let new_metrics = Arc::new(ConnectionMetrics::new());
-        let (_, same_conn_id, reused_metrics, swap_previous) = app
-            .register_client(TransportKind::Quic, Arc::clone(&new_metrics), Some(conn_id))
+        let reg = app
+            .register_client(
+                TransportKind::Quic,
+                Arc::clone(&new_metrics),
+                Some(conn_id),
+                ClientIdentity::default(),
+            )
             .await;
 
-        assert_eq!(same_conn_id, conn_id);
-        // Should return the *original* metrics, not the new one.
-        assert_eq!(reused_metrics.bytes_in.load(Ordering::Relaxed), 100);
+        assert_eq!(reg.connection_id, conn_id);
         // The genuinely-old transport must come back so the caller can
         // emit `ChannelSwitched { old_transport: Tcp }` later. Previously
         // this was silently overwritten with `Quic` regardless of the
         // actual prior transport.
-        assert_eq!(swap_previous, Some(TransportKind::Tcp));
+        assert_eq!(reg.previous_transport, Some(TransportKind::Tcp));
 
-        // The recorded transport for the connection now reflects the new
-        // channel.
+        // The recorded transport for the connection now reflects the new channel,
+        // but the connection keeps its *original* metrics (100, not the new,
+        // zeroed Arc) — resume reuses the existing accounting.
         let snap = app.snapshot_sessions_with_connections().await;
         assert_eq!(snap.unattached.len(), 1);
         assert_eq!(snap.unattached[0].transport, "QUIC");
+        assert_eq!(snap.unattached[0].bytes_in, 100);
     }
 
     #[tokio::test]
     async fn unregister_removes_connection() {
         let app = ServerApp::new("tok".to_string());
         let metrics = Arc::new(ConnectionMetrics::new());
-        let (_, conn_id, _, _) = app.register_client(TransportKind::Uds, metrics, None).await;
+        let conn_id = app
+            .register_client(TransportKind::Uds, metrics, None, ClientIdentity::default())
+            .await
+            .connection_id;
         app.unregister_client(conn_id).await;
 
         // After unregister, snapshot_sessions_with_connections returns no unattached.
@@ -910,7 +1033,9 @@ mod tests {
     async fn snapshot_reports_correct_transport_label() {
         let app = ServerApp::new("tok".to_string());
         let metrics = Arc::new(ConnectionMetrics::new());
-        let _ = app.register_client(TransportKind::Uds, metrics, None).await;
+        let _ = app
+            .register_client(TransportKind::Uds, metrics, None, ClientIdentity::default())
+            .await;
 
         let snap = app.snapshot_sessions_with_connections().await;
         assert_eq!(snap.unattached.len(), 1);
@@ -1401,5 +1526,144 @@ mod tests {
             "snapshot mode must survive a re-attach"
         );
         assert!(!sender.paused, "a re-attach (resume) clears the pause flag");
+    }
+
+    // ─── Client management (issue #146) ──────────────────────────────────────
+
+    #[test]
+    fn assign_label_disambiguates_same_user_at_host() {
+        use std::collections::HashMap;
+        let mk = |label: &str| super::ConnectionState {
+            client_id: ClientId(0),
+            transport: TransportKind::Uds,
+            metrics: Arc::new(ConnectionMetrics::new()),
+            machine_id: String::new(),
+            hostname: String::new(),
+            username: String::new(),
+            label: label.to_string(),
+        };
+        let mut conns: HashMap<u64, super::ConnectionState> = HashMap::new();
+        assert_eq!(super::assign_label("box", "alice", &conns), "alice@box");
+        conns.insert(1, mk("alice@box"));
+        assert_eq!(super::assign_label("box", "alice", &conns), "alice@box#2");
+        conns.insert(2, mk("alice@box#2"));
+        assert_eq!(super::assign_label("box", "alice", &conns), "alice@box#3");
+        // A different user or host is unaffected.
+        assert_eq!(super::assign_label("box", "bob", &conns), "bob@box");
+        // Empty hostname/username fall back to `unknown`.
+        assert_eq!(super::assign_label("", "", &conns), "unknown@unknown");
+    }
+
+    #[tokio::test]
+    async fn list_and_kick_session_clients() {
+        use kmux_protocol::messages::ServerMessage;
+        let app = app_with_one_pane("eagle").await;
+
+        let a = app
+            .register_client(
+                TransportKind::Uds,
+                Arc::new(ConnectionMetrics::new()),
+                None,
+                ClientIdentity {
+                    machine_id: "m-a".into(),
+                    hostname: "boxa".into(),
+                    username: "alice".into(),
+                },
+            )
+            .await;
+        let b = app
+            .register_client(
+                TransportKind::Tcp,
+                Arc::new(ConnectionMetrics::new()),
+                None,
+                ClientIdentity {
+                    machine_id: "m-b".into(),
+                    hostname: "boxb".into(),
+                    username: "bob".into(),
+                },
+            )
+            .await;
+
+        // Attach a (channels dropped) and b (retain ctrl_rx to observe the kick).
+        app.attach(attach_params(a.client_id, None)).await.unwrap();
+        let (data_tx, _drx) = mpsc::channel::<ServerMessage>(16);
+        let (ctrl_tx, mut ctrl_rx_b) = mpsc::unbounded_channel::<ServerMessage>();
+        app.attach(AttachParams {
+            pane_id: "eagle/0".to_string(),
+            client_id: b.client_id,
+            last_seqno: None,
+            size: TermSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            data_tx,
+            ctrl_tx,
+            capabilities: ClientCapabilities::default(),
+        })
+        .await
+        .unwrap();
+
+        // List shows both connections; the requester is marked self.
+        let clients = app
+            .list_session_clients("eagle", a.client_id)
+            .await
+            .expect("session exists");
+        assert_eq!(clients.len(), 2);
+        let me = clients
+            .iter()
+            .find(|c| c.client_id == a.client_id)
+            .expect("self present");
+        assert!(me.is_self);
+        assert_eq!(me.username, "alice");
+        assert_eq!(me.machine_id, "m-a");
+        let other = clients
+            .iter()
+            .find(|c| c.client_id == b.client_id)
+            .expect("other present");
+        assert!(!other.is_self);
+        assert_eq!(other.label, b.label);
+        assert_eq!(other.attached_panes, vec![0]);
+
+        // Unknown session → None.
+        assert!(
+            app.list_session_clients("missing", a.client_id)
+                .await
+                .is_none()
+        );
+
+        // Kick b: it is detached from the session and notified; a remains.
+        assert!(matches!(
+            app.kick_client_from_session("eagle", b.client_id, "alice@boxa")
+                .await,
+            KickOutcome::Kicked
+        ));
+        match ctrl_rx_b.try_recv() {
+            Ok(ServerMessage::SessionKicked { word_id, by_label }) => {
+                assert_eq!(word_id, "eagle");
+                assert_eq!(by_label, "alice@boxa");
+            }
+            other => panic!("expected SessionKicked, got {other:?}"),
+        }
+        let after = app
+            .list_session_clients("eagle", a.client_id)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1, "only the un-kicked client remains");
+        assert_eq!(after[0].client_id, a.client_id);
+
+        // Re-kicking the now-detached client → ClientNotFound; unknown session →
+        // SessionNotFound.
+        assert!(matches!(
+            app.kick_client_from_session("eagle", b.client_id, "x")
+                .await,
+            KickOutcome::ClientNotFound
+        ));
+        assert!(matches!(
+            app.kick_client_from_session("missing", a.client_id, "x")
+                .await,
+            KickOutcome::SessionNotFound
+        ));
     }
 }

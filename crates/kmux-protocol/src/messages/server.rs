@@ -3,8 +3,8 @@ use std::sync::Arc;
 use super::category::MessageCategory;
 use super::process::PaneProcesses;
 use super::session::{
-    ClientId, ConnectionId, DirEntry, ErrorCode, LayoutNode, PaneId, PaneInfo, PeerId, RequestId,
-    SequenceNo, SessionEntry, SessionEventMsg, TabIndex, TabInfo, WordId,
+    ClientId, ClientInfo, ConnectionId, DirEntry, ErrorCode, LayoutNode, PaneId, PaneInfo, PeerId,
+    RequestId, SequenceNo, SessionEntry, SessionEventMsg, TabIndex, TabInfo, WordId,
 };
 use super::types::Compression;
 use super::vt::{CellState, CursorState, GridSnapshot, TermModes, TerminalDiff};
@@ -12,7 +12,12 @@ use super::vt::{CellState, CursorState, GridSnapshot, TermModes, TerminalDiff};
 /// Messages sent from server -> client.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ServerMessage {
-    /// Response to `Auth`.
+    /// Challenge issued after a valid `Auth` (token + protocol accepted): the
+    /// client must sign `nonce` with its identity private key and return the
+    /// signature in [`super::client::ClientMessage::AuthProof`] (issue #146).
+    AuthChallenge { nonce: Vec<u8> },
+
+    /// Response to the `Auth` → `AuthChallenge` → `AuthProof` handshake.
     AuthResult {
         success: bool,
         reason: Option<String>,
@@ -32,6 +37,19 @@ pub enum ServerMessage {
         /// regardless. See `docs/compression.md`.
         #[serde(default)]
         compression: Option<Compression>,
+        /// This connection's own identity fingerprint, as the daemon recorded it
+        /// (SHA-256 of the presented public key). `None` on failure (issue #146).
+        #[serde(default)]
+        machine_id: Option<String>,
+        /// The daemon-assigned user-readable label for this connection
+        /// (`username@hostname`, with a `#N` suffix to disambiguate). `None` on
+        /// failure (issue #146).
+        #[serde(default)]
+        label: Option<String>,
+        /// The daemon's own identity fingerprint, so the client knows which
+        /// machine it is talking to. `None` on failure (issue #146).
+        #[serde(default)]
+        server_machine_id: Option<String>,
     },
 
     /// Confirmation that the channel switch is complete. Sent in response to
@@ -249,6 +267,28 @@ pub enum ServerMessage {
         peer: Option<PeerId>,
         reason: String,
     },
+
+    /// Response to [`super::client::ClientMessage::ClientList`] (issue #146): the
+    /// connections attached to `word_id`, each with its machine id + user-readable
+    /// label. For a federated session the hub relays the owning peer's answer.
+    ClientListResult {
+        request_id: RequestId,
+        word_id: WordId,
+        clients: Vec<ClientInfo>,
+    },
+
+    /// Acknowledges a [`super::client::ClientMessage::KickClient`] (issue #146):
+    /// `client_id` was detached from session `word_id`.
+    ClientKicked {
+        request_id: RequestId,
+        word_id: WordId,
+        client_id: ClientId,
+    },
+
+    /// Pushed unsolicited to a connection that was kicked from `word_id` by
+    /// another client (issue #146), so its UI can leave the session. `by_label`
+    /// is the user-readable label of the connection that issued the kick.
+    SessionKicked { word_id: WordId, by_label: String },
 }
 
 impl ServerMessage {
@@ -283,9 +323,14 @@ impl ServerMessage {
             | Self::DirectoryListing { .. }
             | Self::PeerOpened { .. }
             | Self::PeerClosed { .. }
-            | Self::PeerError { .. } => MessageCategory::Control,
+            | Self::PeerError { .. }
+            | Self::ClientListResult { .. }
+            | Self::ClientKicked { .. }
+            | Self::SessionKicked { .. } => MessageCategory::Control,
             Self::Lagged { .. } | Self::SyncReset { .. } => MessageCategory::Sync,
-            Self::AuthResult { .. } | Self::ChannelSwitched { .. } => MessageCategory::Bootstrap,
+            Self::AuthChallenge { .. } | Self::AuthResult { .. } | Self::ChannelSwitched { .. } => {
+                MessageCategory::Bootstrap
+            }
         }
     }
 }
@@ -557,6 +602,9 @@ mod tests {
                     server_version: None,
                     connection_id: None,
                     compression: None,
+                    machine_id: None,
+                    label: None,
+                    server_machine_id: None,
                 },
                 MessageCategory::Bootstrap,
             ),

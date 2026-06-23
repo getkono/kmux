@@ -30,6 +30,8 @@ pub struct Shell {
     pub content_stack: Stack,
     /// The process-overview list (issue #122), reconciled by `overview::sync`.
     pub overview_list: ListBox,
+    /// The connected-clients list (issue #146), reconciled by `clients::sync`.
+    pub clients_list: ListBox,
     /// Hosts the HUD OSD over the grid.
     pub overlay: Overlay,
     /// Connecting/disconnected banner above the content.
@@ -108,13 +110,16 @@ pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
         .description("Create a session from the sidebar to get started.")
         .build();
 
-    // Swap the live tab content with an empty-state page or the process overview.
+    // Swap the live tab content with an empty-state page, the process overview,
+    // or the connected-clients view.
     let (overview_box, overview_list) = super::overview::build();
+    let (clients_box, clients_list) = super::clients::build();
     let content_stack = Stack::new();
     content_stack.set_vexpand(true);
     content_stack.add_named(&tab_view, Some("panes"));
     content_stack.add_named(&empty, Some("empty"));
     content_stack.add_named(&overview_box, Some("overview"));
+    content_stack.add_named(&clients_box, Some("clients"));
     content_stack.set_visible_child_name("empty");
 
     let banner = adw::Banner::new("");
@@ -181,6 +186,7 @@ pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
         tab_bar,
         content_stack,
         overview_list,
+        clients_list,
         overlay,
         banner,
         toasts,

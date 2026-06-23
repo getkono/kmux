@@ -7,6 +7,9 @@ pub mod messages;
 pub mod trace;
 pub mod transport;
 
+#[cfg(feature = "identity")]
+pub mod identity;
+
 #[cfg(feature = "tls")]
 pub mod tls;
 

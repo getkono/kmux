@@ -217,6 +217,9 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             capabilities: ClientCapabilities::default(),
             connection_id: None,
+            public_key: vec![1, 2, 3],
+            hostname: "host".to_string(),
+            username: "user".to_string(),
         };
         let bytes = encode_client(&msg).expect("encode");
         let decoded = decode_client(&bytes).expect("decode");
@@ -344,6 +347,9 @@ mod tests {
             server_version: Some("0.1.0".to_string()),
             connection_id: None,
             compression: None,
+            machine_id: None,
+            label: None,
+            server_machine_id: None,
         };
         let bytes = encode_server(&msg).expect("encode");
         let decoded = decode_server(&bytes).expect("decode");

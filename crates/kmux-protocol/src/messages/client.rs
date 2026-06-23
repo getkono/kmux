@@ -1,14 +1,18 @@
 use super::category::MessageCategory;
 use super::key::KeyEvent;
 use super::session::{
-    ClientCapabilities, ConnectionId, LayoutScheme, PaneId, PeerId, PeerTarget, RequestId,
-    SequenceNo, SplitDir, TabIndex, TermSize, WordId,
+    ClientCapabilities, ClientId, ConnectionId, LayoutScheme, PaneId, PeerId, PeerTarget,
+    RequestId, SequenceNo, SplitDir, TabIndex, TermSize, WordId,
 };
 
 /// Messages sent from client -> server.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub enum ClientMessage {
-    /// First message: authenticate with a shared token and declare capabilities.
+    /// First message: authenticate with a shared token and declare capabilities
+    /// and cryptographic identity (issue #146). The server validates the token,
+    /// then replies with an [`super::server::ServerMessage::AuthChallenge`] whose
+    /// nonce the client signs and returns in [`ClientMessage::AuthProof`] to
+    /// prove possession of the private key behind `public_key`.
     Auth {
         token: String,
         /// Must equal `PROTOCOL_VERSION`; server rejects mismatches.
@@ -22,7 +26,26 @@ pub enum ClientMessage {
         /// `None` for a fresh connection.
         #[serde(default)]
         connection_id: Option<ConnectionId>,
+        /// Raw Ed25519 public key (32 bytes) identifying this user@machine. Its
+        /// SHA-256 fingerprint is the stable `machine_id`. Verified via the
+        /// challenge–response below before the daemon trusts it.
+        #[serde(default)]
+        public_key: Vec<u8>,
+        /// Client-reported hostname (a friendly label; the cryptographic identity
+        /// is `public_key`, not this).
+        #[serde(default)]
+        hostname: String,
+        /// Client-reported OS username; the daemon composes the user-readable
+        /// per-connection label `username@hostname`.
+        #[serde(default)]
+        username: String,
     },
+
+    /// Second handshake message: the Ed25519 signature over the nonce the daemon
+    /// sent in [`super::server::ServerMessage::AuthChallenge`], proving the client
+    /// holds the private key for the `public_key` it presented in [`Auth`]. On
+    /// success the daemon replies with `AuthResult`.
+    AuthProof { signature: Vec<u8> },
 
     /// Signal to the server that this channel is ready to become the primary
     /// transport. Sent after a successful channel-switch `Auth`. The server
@@ -293,6 +316,27 @@ pub enum ClientMessage {
     /// viewer and removes the peer's sessions from the list. Reply:
     /// [`super::server::ServerMessage::PeerClosed`].
     ClosePeer { request_id: RequestId, peer: PeerId },
+
+    /// List the client connections attached to the session `word_id` (issue
+    /// #146). The daemon hosting the session answers with
+    /// [`super::server::ServerMessage::ClientListResult`]; for a federated
+    /// session the local hub forwards this to the owning peer.
+    ClientList {
+        request_id: RequestId,
+        word_id: WordId,
+    },
+
+    /// Kick a single client connection out of the session `word_id` (issue #146):
+    /// the daemon detaches that `client_id` from every pane of the session (so,
+    /// e.g., its window-size no longer constrains the others) and notifies it via
+    /// [`super::server::ServerMessage::SessionKicked`]. The target's connection
+    /// stays alive. Reply: [`super::server::ServerMessage::ClientKicked`], or an
+    /// `Error` if the client is not attached.
+    KickClient {
+        request_id: RequestId,
+        word_id: WordId,
+        client_id: ClientId,
+    },
 }
 
 impl ClientMessage {
@@ -332,8 +376,12 @@ impl ClientMessage {
             | Self::SetPaneNoAutoPause { .. }
             | Self::ListDirectory { .. }
             | Self::OpenPeer { .. }
-            | Self::ClosePeer { .. } => MessageCategory::Control,
-            Self::Auth { .. } | Self::ChannelReady => MessageCategory::Bootstrap,
+            | Self::ClosePeer { .. }
+            | Self::ClientList { .. }
+            | Self::KickClient { .. } => MessageCategory::Control,
+            Self::Auth { .. } | Self::AuthProof { .. } | Self::ChannelReady => {
+                MessageCategory::Bootstrap
+            }
         }
     }
 }
@@ -352,6 +400,9 @@ mod tests {
             protocol_version: PROTOCOL_VERSION,
             capabilities: ClientCapabilities::default(),
             connection_id: Some(ConnectionId(42)),
+            public_key: Vec::new(),
+            hostname: String::new(),
+            username: String::new(),
         };
         let bytes = crate::encode_client(&msg).unwrap();
         let decoded = crate::decode_client(&bytes).unwrap();
@@ -373,6 +424,9 @@ mod tests {
             server_version: None,
             connection_id: Some(ConnectionId(99)),
             compression: None,
+            machine_id: None,
+            label: None,
+            server_machine_id: None,
         };
         let bytes = crate::encode_server(&msg).unwrap();
         let decoded = crate::decode_server(&bytes).unwrap();
@@ -413,6 +467,9 @@ mod tests {
             server_version: Some("0.1.0".to_string()),
             connection_id: None,
             compression: None,
+            machine_id: None,
+            label: None,
+            server_machine_id: None,
         };
         let bytes = crate::encode_server(&msg).unwrap();
         let decoded = crate::decode_server(&bytes).unwrap();
@@ -703,6 +760,9 @@ mod tests {
                     protocol_version: PROTOCOL_VERSION,
                     capabilities: ClientCapabilities::default(),
                     connection_id: None,
+                    public_key: Vec::new(),
+                    hostname: String::new(),
+                    username: String::new(),
                 },
                 MessageCategory::Bootstrap,
             ),

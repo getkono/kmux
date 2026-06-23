@@ -78,9 +78,21 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     }
     println!("Auth token: {token}");
 
+    // Load (or generate on first run) this daemon's cryptographic identity, so it
+    // can report its own `machine_id` to clients and present a verifiable identity
+    // when federating to peers (issue #146).
+    let server_machine_id = match kmux_protocol::identity::Identity::load_or_create() {
+        Ok(id) => id.fingerprint(),
+        Err(e) => {
+            tracing::warn!("Failed to load identity key: {e}");
+            String::new()
+        }
+    };
+
     let app = Arc::new(
         ServerApp::new(token.clone())
             .with_compression(cfg.compression.clone())
+            .with_machine_id(server_machine_id)
             .with_session_isolation(cfg.session_isolation),
     );
     // Respawn isolated VT workers that crash (issue #126); no-op until a pane

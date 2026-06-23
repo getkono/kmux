@@ -9,7 +9,7 @@
 use crate::cli::OutputFormat;
 use crate::core::build_overview_rows;
 
-use super::{render, resolve_connection};
+use super::{authenticate, render, resolve_connection};
 
 pub struct ProcessOverviewConfig<'a> {
     pub server: Option<&'a str>,
@@ -21,10 +21,7 @@ pub async fn run_process_overview(cfg: ProcessOverviewConfig<'_>) -> anyhow::Res
     let conn = resolve_connection(cfg.server, cfg.ssh_port).await?;
     let format = cfg.format;
 
-    use kmux_protocol::messages::{
-        ClientCapabilities, ClientMessage, PROTOCOL_VERSION, PaneProcesses, ServerMessage,
-        SessionEntry, version_mismatch_hint,
-    };
+    use kmux_protocol::messages::{ClientMessage, PaneProcesses, ServerMessage, SessionEntry};
     use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
     use tokio::net::TcpStream;
 
@@ -34,36 +31,8 @@ pub async fn run_process_overview(cfg: ProcessOverviewConfig<'_>) -> anyhow::Res
         .map_err(|e| anyhow::anyhow!("Failed to connect to {}:{}: {e}", conn.host, tcp_port))?;
     let (mut read_half, mut write_half) = stream.into_split();
 
-    // Authenticate.
-    let auth_msg = ClientMessage::Auth {
-        token: conn.token,
-        protocol_version: PROTOCOL_VERSION,
-        capabilities: ClientCapabilities::default(),
-        connection_id: None,
-    };
-    write_frame(&mut write_half, &encode_client(&auth_msg)?).await?;
-    loop {
-        let data = read_frame(&mut read_half)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Connection closed before auth response"))?;
-        match decode_server(&data)? {
-            ServerMessage::AuthResult { success: true, .. } => break,
-            ServerMessage::AuthResult {
-                success: false,
-                reason,
-                ..
-            } => {
-                let reason_str = reason.unwrap_or_else(|| "unknown error".into());
-                let hint = version_mismatch_hint(&reason_str);
-                if hint.is_empty() {
-                    anyhow::bail!("Authentication failed: {reason_str}");
-                } else {
-                    anyhow::bail!("Authentication failed: {reason_str}\n{hint}");
-                }
-            }
-            _ => continue,
-        }
-    }
+    // Authenticate (token + cryptographic identity challenge–response, issue #146).
+    authenticate(&mut read_half, &mut write_half, conn.token).await?;
 
     // Fetch the session list (for the Session → Tab → Pane hierarchy).
     write_frame(
