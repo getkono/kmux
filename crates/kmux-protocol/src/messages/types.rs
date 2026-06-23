@@ -93,7 +93,14 @@ impl TransportKind {
 ///   is being respawned; the shell survives (issue #126, process isolation).
 /// - **31**: removed the unused singular `ClientMessage::PtyKey`; clients only
 ///   ever send `PtyKeyBatch` (a batch subsumes the single-key case).
-pub const PROTOCOL_VERSION: u32 = 31;
+/// - **32**: cryptographic identity + client management (issue #146).
+///   `ClientMessage::Auth` carries `public_key`/`hostname`/`username`; a
+///   challenge–response handshake adds `ServerMessage::AuthChallenge` and
+///   `ClientMessage::AuthProof`; `AuthResult` carries `machine_id`/`label`/
+///   `server_machine_id`. New `ClientMessage::ClientList`/`KickClient`,
+///   `ServerMessage::ClientListResult`/`ClientKicked`/`SessionKicked`, and the
+///   `ClientInfo` struct expose listing and per-connection kicking of clients.
+pub const PROTOCOL_VERSION: u32 = 32;
 
 /// Wire compression algorithm negotiated for a connection.
 ///
