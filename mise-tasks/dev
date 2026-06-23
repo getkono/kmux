@@ -8,6 +8,12 @@
 #   ./kmux daemon status     # run a CLI subcommand (toolkit-free, no GUI)
 #   ./kmux diagnostic glyphs # open a render-diagnostic session
 #
+# ONE code path: build the debug binaries the entrypoint dispatches to, then hand
+# every invocation to `kmux` — the same entrypoint prod ships. `kmux` itself (via
+# `kmux_app::launch::run_cli`) decides CLI vs GUI and which frontend to launch, so
+# this launcher never second-guesses argv. That keeps the two in sync by
+# construction: there is no subcommand list here to drift from the real CLI.
+#
 # Maximal debugging: full panic + library backtraces, verbose kmux logs, and
 # GLib/GTK diagnostics. Logs stream to stderr (the terminal) so a crash shows the
 # live trace next to its backtrace. Every env var below is overridable:
@@ -27,33 +33,22 @@ export RUST_LOG_STYLE="${RUST_LOG_STYLE:-always}"
 root="${MISE_PROJECT_ROOT:-$PWD}"
 export KMUX_KMUXD="${KMUX_KMUXD:-$root/target/debug/kmuxd}"
 
-# Classify the request. CLI subcommands run toolkit-free via the `kmux` entrypoint
-# on every platform; only GUI launches need a frontend. The Swift app does not
-# parse CLI subcommands (it only handles --launch-url / `diagnostic <test>`), so on
-# macOS the split matters; on Linux kmux-gtk handles both via the entrypoint anyway.
-is_cli=false
-case "${1:-}" in
-    daemon|ls|list-sessions|ps|top|debug|--version|-V|--help|-h) is_cli=true ;;
-    diagnostic)
-        # `diagnostic <test>` opens the GUI; bare `diagnostic` (catalogue) and the
-        # internal `diagnostic <test> --emit` are non-interactive.
-        if [[ -z "${2:-}" || "${2}" == -* ]]; then is_cli=true; fi
-        ;;
-esac
-
-if [[ "$is_cli" == false && "$(uname -s)" == "Darwin" ]]; then
-    # macOS GUI → the native Swift app (what prod launches). Regenerate bindings and
-    # build the debug daemon first. Always compile the Metal view (`-DKMUX_GPU`); the
-    # `renderer` config key decides at runtime whether it is used (default CoreText).
-    mise run gen-ffi-bindings
-    cargo build -p kmuxd
-    exec swift run --package-path kmux-swift -Xswiftc -DKMUX_GPU -- "$@"
-fi
-
-# All CLI, and Linux GUI → the toolkit-free `kmux` entrypoint. On Linux an
-# interactive launch execs its sibling target/debug/kmux-gtk, so build that too.
+# The frontend the entrypoint hands an interactive launch to. CLI subcommands
+# need none of this — but building it unconditionally is what removes the argv
+# guesswork; the cost is just an incremental no-op rebuild once everything's warm.
 pkgs=(-p kmux -p kmuxd)
-if [[ "$is_cli" == false && "$(uname -s)" != "Darwin" ]]; then
+if [[ "$(uname -s)" == "Darwin" ]]; then
+    # macOS GUI is the native Swift app. Regenerate its bindings and build it
+    # (always with `-DKMUX_GPU` — the Metal view is compiled in; the `renderer`
+    # config key picks CoreText vs GPU at runtime), then point the entrypoint at
+    # the freshly built executable. `kmux` execs it in the foreground for an
+    # interactive launch (so its logs stream to this terminal) and ignores it for
+    # CLI subcommands — see launch_desktop() in crates/kmux/src/main.rs.
+    mise run gen-ffi-bindings
+    swift build --package-path kmux-swift -Xswiftc -DKMUX_GPU
+    export KMUX_APP="${KMUX_APP:-$root/kmux-swift/.build/debug/kmux-swift}"
+else
+    # Linux GUI is kmux-gtk, which the entrypoint execs as a sibling binary.
     pkgs+=(-p kmux-gtk)
 fi
 cargo build "${pkgs[@]}"

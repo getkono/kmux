@@ -75,12 +75,16 @@ Swift modules every time.
 mise run swift-test    # gen bindings + swift test
 ```
 
-`./kmux` is the macOS dev launcher: it regenerates the bindings, builds the debug
-`kmuxd`, and runs the native Swift app via `swift run` (always with `-DKMUX_GPU`,
-so the renderer is a runtime config choice — see GPU rendering below). It also
-serves the CLI: `./kmux daemon status`, `./kmux ls`, etc. run toolkit-free without
-opening the app. (Or build directly: `swift build --package-path kmux-swift` after
-`mise run gen-ffi-bindings`.)
+`./kmux` is the macOS dev launcher. It has a **single code path**: regenerate the
+bindings, build the debug `kmuxd`, the debug `kmux` entrypoint, and the Swift app
+(`swift build`, always with `-DKMUX_GPU`, so the renderer is a runtime config
+choice — see GPU rendering below), then hand the invocation to `kmux`. The `kmux`
+entrypoint — exactly as it ships — decides CLI vs GUI: `./kmux daemon status`,
+`./kmux ls`, etc. run toolkit-free without opening the app, while an interactive
+launch `exec`s the freshly built `kmux-swift` in the foreground (pointed at via
+`KMUX_APP`, so its logs stream to the terminal). The launcher never inspects argv
+itself, so there is no subcommand list to drift from the real CLI. (Or build
+directly: `swift build --package-path kmux-swift` after `mise run gen-ffi-bindings`.)
 
 ### Cleaning up
 
@@ -131,10 +135,13 @@ mise run install       # release build → ~/Applications/kmux.app + `kmux` & `k
    the app appears in Launchpad / Spotlight / Dock with its icon. This is the
    macOS analog of kmux-gtk's `.desktop` entry + icon on Linux.
 
-`kmux` execs the in-bundle Mach-O directly (vs. `open`ing the bundle) so the GUI
-forwards args + stdio and runs in the foreground; macOS still applies the
-bundle's icon/menu because it finds `Contents/Info.plist` above the executable.
-`KMUX_APP` overrides the bundle location (default `~/Applications/kmux.app`).
+`kmux` launches the bundle via `open` (LaunchServices) so each invocation gets
+its **own window**, routed to a running instance through the `kmux://` URL scheme
+(repeated launches no longer collapse into one window). `KMUX_APP` overrides the
+bundle location (default `~/Applications/kmux.app`). As a dev convenience, when
+`KMUX_APP` points at a bare `kmux-swift` executable rather than a `.app` directory
+— the layout the `dev` mise task sets up — `kmux` `exec`s it directly in the
+foreground, forwarding stdio so logs stream to the launching terminal.
 
 `kmuxd` is bundled *beside* the app exe because `find_server_binary()` checks the
 running exe's own directory before `PATH`: a Finder/Spotlight launch gets the
