@@ -21,3 +21,8 @@ kmux-app.workspace = true
 kmux-client.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
+
+# macOS only: re-parse the shared `Cli` in the launcher to build the `kmux://`
+# launch URL that routes each launch to the running app instance as a new window.
+[target.'cfg(target_os = "macos")'.dependencies]
+clap.workspace = true

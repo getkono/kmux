@@ -7,11 +7,26 @@ import KmuxBindings
 /// next tick, which reloads the chrome + grid colors live. (Font selection is a
 /// follow-up; the renderer currently uses the system monospaced face.)
 struct PreferencesView: View {
-    @ObservedObject var model: KmuxModel
+    // Applies to the focused window's connection (per-window models). When no
+    // terminal window is focused there is nothing to configure.
+    @FocusedValue(\.kmuxModel) private var model: KmuxModel?
     @State private var selectedTheme = ""
     @State private var cursorBlink = true
 
     var body: some View {
+        Group {
+            if let model {
+                form(model)
+            } else {
+                Text("Open a terminal window to change appearance.")
+                    .foregroundStyle(.secondary)
+                    .padding()
+            }
+        }
+        .frame(width: 340, height: 150)
+    }
+
+    private func form(_ model: KmuxModel) -> some View {
         Form {
             Picker("Theme", selection: $selectedTheme) {
                 ForEach(model.driver.availableThemes(), id: \.self) { name in
@@ -30,7 +45,6 @@ struct PreferencesView: View {
                 }
         }
         .formStyle(.grouped)
-        .frame(width: 340, height: 150)
         .onAppear {
             // Best-effort initial selection: the first built-in theme.
             if selectedTheme.isEmpty {

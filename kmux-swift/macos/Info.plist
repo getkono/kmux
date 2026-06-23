@@ -31,5 +31,21 @@
     <true/>
     <key>NSPrincipalClass</key>
     <string>NSApplication</string>
+    <!--
+      The `kmux://` URL scheme lets the `kmux` launcher route each subsequent
+      launch to the running app instance, which opens a new window for it
+      (single instance, multiple windows). See crates/kmux/src/main.rs.
+    -->
+    <key>CFBundleURLTypes</key>
+    <array>
+        <dict>
+            <key>CFBundleURLName</key>
+            <string>dev.getkono.kmux</string>
+            <key>CFBundleURLSchemes</key>
+            <array>
+                <string>kmux</string>
+            </array>
+        </dict>
+    </array>
 </dict>
 </plist>

@@ -120,6 +120,13 @@ fn run_gui(plan: Plan) -> anyhow::Result<()> {
         register_symbol_fallback_font();
     });
     {
+        // New window per launch: `GtkApplication` (default flags) is a singleton
+        // keyed by `APP_ID`, so a second `kmux` launch — execing another
+        // `kmux-gtk` — routes its `activate` to this primary instance, which
+        // builds another independent window (its own `Frontend`/connection) here.
+        // This matches the macOS Swift app's single-instance/multi-window model.
+        // (Forwarding the *second* launch's args to its window would need
+        // `HANDLES_COMMAND_LINE`; today each window uses the first launch's plan.)
         let exit_error = exit_error.clone();
         app.connect_activate(move |app| build_ui(app, &plan, exit_error.clone()));
     }
