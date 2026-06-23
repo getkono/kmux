@@ -8,11 +8,28 @@ use kmux_protocol::parse_pane_id;
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
 
-use crate::app::{AttachParams, AttachResult, InputLockOutcome, PaneCloseOutcome};
+use crate::app::{
+    AttachParams, AttachResult, ClientIdentity, InputLockOutcome, KickOutcome, PaneCloseOutcome,
+};
 use crate::auth::validate_token;
 use crate::connection::classify_error;
 
-use super::{CLIENT_CHANNEL_CAPACITY, PaneAttacher, SharedClientState};
+use super::{CLIENT_CHANNEL_CAPACITY, PaneAttacher, PendingAuth, SharedClientState};
+
+/// Build a failed `AuthResult` carrying a human-readable `reason` (issue #146).
+fn auth_failure(reason: String) -> ServerMessage {
+    ServerMessage::AuthResult {
+        success: false,
+        reason: Some(reason),
+        client_id: None,
+        server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
+        connection_id: None,
+        compression: None,
+        machine_id: None,
+        label: None,
+        server_machine_id: None,
+    }
+}
 
 /// Dispatch a single [`ClientMessage`] for a connected client.
 ///
@@ -24,78 +41,113 @@ pub async fn handle_message<A: PaneAttacher>(
     attacher: &A,
 ) -> bool {
     if !state.authenticated {
-        if let ClientMessage::Auth {
-            token,
-            protocol_version,
-            capabilities,
-            connection_id: incoming_conn_id,
-        } = msg
-        {
-            if protocol_version != kmux_protocol::messages::PROTOCOL_VERSION {
-                state.send(ServerMessage::AuthResult {
-                    success: false,
-                    reason: Some(format!(
+        match msg {
+            // Step 1: validate token + protocol, then issue a signing challenge.
+            ClientMessage::Auth {
+                token,
+                protocol_version,
+                capabilities,
+                connection_id: incoming_conn_id,
+                public_key,
+                hostname,
+                username,
+            } => {
+                if protocol_version != kmux_protocol::messages::PROTOCOL_VERSION {
+                    state.send(auth_failure(format!(
                         "protocol version mismatch: client={protocol_version}, server={}",
                         kmux_protocol::messages::PROTOCOL_VERSION
-                    )),
-                    client_id: None,
-                    server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                    connection_id: None,
-                    compression: None,
+                    )));
+                    warn!(
+                        "Protocol version mismatch: client={protocol_version}, server={}",
+                        kmux_protocol::messages::PROTOCOL_VERSION
+                    );
+                    return false;
+                }
+                if !validate_token(&token, &state.app.auth_token) {
+                    state.send(auth_failure("invalid token".to_string()));
+                    warn!("authentication failed");
+                    return true;
+                }
+                // Token accepted: challenge the client to prove it holds the
+                // private key behind `public_key` (issue #146).
+                let nonce = kmux_protocol::identity::random_nonce().to_vec();
+                state.pending_auth = Some(PendingAuth {
+                    nonce: nonce.clone(),
+                    public_key,
+                    hostname,
+                    username,
+                    capabilities,
+                    connection_id: incoming_conn_id,
                 });
-                warn!(
-                    "Protocol version mismatch: client={protocol_version}, server={}",
-                    kmux_protocol::messages::PROTOCOL_VERSION
-                );
-                return false;
-            } else if validate_token(&token, &state.app.auth_token) {
-                let (client_id, conn_id, _metrics, previous_transport) = state
+                state.send(ServerMessage::AuthChallenge { nonce });
+            }
+            // Step 2: verify the signature, then register the connection.
+            ClientMessage::AuthProof { signature } => {
+                let Some(pending) = state.pending_auth.take() else {
+                    state.error(
+                        None,
+                        ErrorCode::NotAuthenticated,
+                        "send Auth before AuthProof",
+                    );
+                    return true;
+                };
+                if !kmux_protocol::identity::verify(&pending.public_key, &pending.nonce, &signature)
+                {
+                    state.send(auth_failure("identity verification failed".to_string()));
+                    warn!("identity verification failed");
+                    return false;
+                }
+                let machine_id = kmux_protocol::identity::fingerprint(&pending.public_key);
+                let reg = state
                     .app
                     .register_client(
                         state.transport,
                         std::sync::Arc::clone(&state.metrics),
-                        incoming_conn_id,
+                        pending.connection_id,
+                        ClientIdentity {
+                            machine_id: machine_id.clone(),
+                            hostname: pending.hostname,
+                            username: pending.username,
+                        },
                     )
                     .await;
-                state.client_id = Some(client_id);
-                state.connection_id = Some(conn_id);
-                state.capabilities = capabilities;
+                state.client_id = Some(reg.client_id);
+                state.connection_id = Some(reg.connection_id);
+                state.capabilities = pending.capabilities;
                 state.authenticated = true;
-                state.pending_swap_from = previous_transport;
-                state.conn_span.record("conn_id", conn_id.0);
-                state.conn_span.record("client_id", client_id.0);
+                state.pending_swap_from = reg.previous_transport;
+                state.machine_id = Some(machine_id.clone());
+                state.label = Some(reg.label.clone());
+                state.conn_span.record("conn_id", reg.connection_id.0);
+                state.conn_span.record("client_id", reg.client_id.0);
                 // The daemon decides compression from client locality + config
                 // (issue #59). Self-describing frames make this purely a sender
                 // policy: flip the shared toggle the writer/attacher tasks read.
                 let compress = state.app.compression.enabled_for(state.transport);
                 state.comp_out.set_enabled(compress);
+                let server_machine_id = state.app.server_machine_id.clone();
                 state.send(ServerMessage::AuthResult {
                     success: true,
                     reason: None,
-                    client_id: Some(client_id),
+                    client_id: Some(reg.client_id),
                     server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                    connection_id: Some(conn_id),
+                    connection_id: Some(reg.connection_id),
                     compression: compress.then_some(Compression::Zstd),
+                    machine_id: Some(machine_id),
+                    label: Some(reg.label),
+                    server_machine_id: (!server_machine_id.is_empty()).then_some(server_machine_id),
                 });
                 info!(
-                    conn_id = conn_id.0,
-                    client_id = client_id.0,
+                    conn_id = reg.connection_id.0,
+                    client_id = reg.client_id.0,
+                    label = state.label.as_deref().unwrap_or(""),
                     compress,
                     "client authenticated"
                 );
-            } else {
-                state.send(ServerMessage::AuthResult {
-                    success: false,
-                    reason: Some("invalid token".to_string()),
-                    client_id: None,
-                    server_version: None,
-                    connection_id: None,
-                    compression: None,
-                });
-                warn!("authentication failed");
             }
-        } else {
-            state.error(None, ErrorCode::NotAuthenticated, "send Auth first");
+            _ => {
+                state.error(None, ErrorCode::NotAuthenticated, "send Auth first");
+            }
         }
         return true;
     }
@@ -104,6 +156,9 @@ pub async fn handle_message<A: PaneAttacher>(
 
     match msg {
         ClientMessage::Auth { .. } => {}
+
+        // Already authenticated — a stray proof is ignored.
+        ClientMessage::AuthProof { .. } => {}
 
         ClientMessage::ChannelReady => {
             // The previous transport was captured in `state.pending_swap_from`
@@ -683,6 +738,79 @@ pub async fn handle_message<A: PaneAttacher>(
             state.send(ServerMessage::PeerClosed { request_id, peer });
         }
 
+        ClientMessage::ClientList {
+            request_id,
+            word_id,
+        } => {
+            // Federated session ⇒ forward to the owning peer; otherwise build the
+            // list from this daemon's own connections (issue #146).
+            if state.app.is_federated_session(&word_id) {
+                match state.app.list_federated_session_clients(&word_id).await {
+                    Ok(clients) => state.send(ServerMessage::ClientListResult {
+                        request_id,
+                        word_id,
+                        clients,
+                    }),
+                    Err(reason) => {
+                        state.error(Some(request_id), ErrorCode::SessionNotFound, reason)
+                    }
+                }
+            } else {
+                match state.app.list_session_clients(&word_id, client_id).await {
+                    Some(clients) => state.send(ServerMessage::ClientListResult {
+                        request_id,
+                        word_id,
+                        clients,
+                    }),
+                    None => state.error(
+                        Some(request_id),
+                        ErrorCode::SessionNotFound,
+                        "session not found",
+                    ),
+                }
+            }
+        }
+
+        ClientMessage::KickClient {
+            request_id,
+            word_id,
+            client_id: target,
+        } => {
+            if state.app.is_federated_session(&word_id) {
+                match state.app.kick_federated_client(&word_id, target).await {
+                    Ok(()) => state.send(ServerMessage::ClientKicked {
+                        request_id,
+                        word_id,
+                        client_id: target,
+                    }),
+                    Err(reason) => state.error(Some(request_id), ErrorCode::ClientNotFound, reason),
+                }
+            } else {
+                let by_label = state.label.clone().unwrap_or_default();
+                match state
+                    .app
+                    .kick_client_from_session(&word_id, target, &by_label)
+                    .await
+                {
+                    KickOutcome::Kicked => state.send(ServerMessage::ClientKicked {
+                        request_id,
+                        word_id,
+                        client_id: target,
+                    }),
+                    KickOutcome::SessionNotFound => state.error(
+                        Some(request_id),
+                        ErrorCode::SessionNotFound,
+                        "session not found",
+                    ),
+                    KickOutcome::ClientNotFound => state.error(
+                        Some(request_id),
+                        ErrorCode::ClientNotFound,
+                        "client not attached to session",
+                    ),
+                }
+            }
+        }
+
         ClientMessage::Ping { seq } => {
             state.send(ServerMessage::Pong { seq });
         }
@@ -847,6 +975,8 @@ mod tests {
     }
 
     async fn authenticate(state: &mut SharedClientState) {
+        let identity = kmux_protocol::identity::Identity::generate();
+        // Step 1: Auth → the daemon stashes a challenge in `state.pending_auth`.
         let ok = handle_message(
             state,
             ClientMessage::Auth {
@@ -854,14 +984,33 @@ mod tests {
                 protocol_version: PROTOCOL_VERSION,
                 capabilities: ClientCapabilities::default(),
                 connection_id: None,
+                public_key: identity.public_key_bytes().to_vec(),
+                hostname: "host".to_string(),
+                username: "user".to_string(),
             },
             &NoopAttacher,
         )
         .await;
         assert!(ok, "auth must keep the connection open");
+        let nonce = state
+            .pending_auth
+            .as_ref()
+            .expect("challenge issued after valid token")
+            .nonce
+            .clone();
+        // Step 2: AuthProof with a valid signature over the nonce.
+        let ok = handle_message(
+            state,
+            ClientMessage::AuthProof {
+                signature: identity.sign(&nonce),
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(ok, "auth proof must keep the connection open");
         assert!(
             state.authenticated,
-            "auth must succeed with a matching token"
+            "auth must succeed with a matching token + valid identity proof"
         );
     }
 
@@ -882,6 +1031,11 @@ mod tests {
             matches!(comp_out.compressor(), Compressor::Zstd { .. }),
             "writer-side compression must be enabled"
         );
+        // The challenge precedes the result on the control channel.
+        assert!(matches!(
+            ctrl_rx.try_recv().expect("AuthChallenge queued"),
+            ServerMessage::AuthChallenge { .. }
+        ));
         let auth = ctrl_rx.try_recv().expect("AuthResult queued");
         assert!(matches!(
             auth,
@@ -904,6 +1058,11 @@ mod tests {
             matches!(comp_out.compressor(), Compressor::Off),
             "local UDS clients must stay uncompressed under auto"
         );
+        // The challenge precedes the result on the control channel.
+        assert!(matches!(
+            ctrl_rx.try_recv().expect("AuthChallenge queued"),
+            ServerMessage::AuthChallenge { .. }
+        ));
         let auth = ctrl_rx.try_recv().expect("AuthResult queued");
         assert!(matches!(
             auth,
@@ -912,6 +1071,54 @@ mod tests {
                 compression: None,
                 ..
             }
+        ));
+    }
+
+    /// A valid token with an invalid identity signature is rejected and the
+    /// connection is closed (issue #146): proof-of-possession is mandatory.
+    #[tokio::test]
+    async fn auth_rejects_invalid_signature() {
+        let app = Arc::new(ServerApp::new("tok".to_string()));
+        let (mut state, _comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::Uds);
+        let identity = kmux_protocol::identity::Identity::generate();
+
+        let ok = handle_message(
+            &mut state,
+            ClientMessage::Auth {
+                token: "tok".to_string(),
+                protocol_version: PROTOCOL_VERSION,
+                capabilities: ClientCapabilities::default(),
+                connection_id: None,
+                public_key: identity.public_key_bytes().to_vec(),
+                hostname: "h".to_string(),
+                username: "u".to_string(),
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(
+            ok,
+            "a valid token keeps the connection open for the proof step"
+        );
+        assert!(matches!(
+            ctrl_rx.try_recv(),
+            Ok(ServerMessage::AuthChallenge { .. })
+        ));
+
+        // A bogus signature must be rejected and the connection closed.
+        let ok = handle_message(
+            &mut state,
+            ClientMessage::AuthProof {
+                signature: vec![0u8; 64],
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(!ok, "an invalid proof must close the connection");
+        assert!(!state.authenticated);
+        assert!(matches!(
+            ctrl_rx.try_recv(),
+            Ok(ServerMessage::AuthResult { success: false, .. })
         ));
     }
 

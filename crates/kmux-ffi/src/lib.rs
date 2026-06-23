@@ -247,6 +247,8 @@ pub enum FfiAction {
     ToggleMetrics,
     /// Toggle the process overview main-area view (issue #122).
     ToggleProcessOverview,
+    /// Toggle the connected-clients main-area view (issue #146).
+    ToggleConnectedClients,
     /// Toggle the connection inspector overlay (issue #60).
     ToggleConnection,
     /// Toggle the render-debug overlay (what the renderer is handed each frame).
@@ -304,6 +306,7 @@ impl From<FfiAction> for Action {
             FfiAction::ToggleHud => Action::ToggleHud,
             FfiAction::ToggleMetrics => Action::ToggleMetrics,
             FfiAction::ToggleProcessOverview => Action::ToggleProcessOverview,
+            FfiAction::ToggleConnectedClients => Action::ToggleConnectedClients,
             FfiAction::ToggleConnection => Action::ToggleConnection,
             FfiAction::ToggleRenderDebug => Action::ToggleRenderDebug,
             FfiAction::ResetRenderer => Action::ResetRenderer,
@@ -845,6 +848,28 @@ fn overview_kind_to_ffi(kind: OverviewRowKind) -> FfiOverviewKind {
     }
 }
 
+/// One connected client attached to the active session (issue #146). Mirrors
+/// `kmux_protocol::messages::ClientInfo`; the Swift `ConnectedClientsView`
+/// renders one row per entry with a Kick button. Polled via
+/// [`KmuxDriver::client_rows`]; `client_id` is the kick target for
+/// [`KmuxDriver::kick_client`].
+#[derive(uniffi::Record)]
+pub struct FfiClientRow {
+    /// Stable per-connection id, passed back to `kick_client`.
+    pub client_id: u64,
+    /// User-readable label `username@hostname[#N]`.
+    pub label: String,
+    /// Cryptographic machine identity (hex SHA-256 of the public key).
+    pub machine_id: String,
+    pub hostname: String,
+    pub username: String,
+    pub transport: String,
+    /// Pane indices of the session this client is viewing.
+    pub panes: Vec<u32>,
+    /// True for the requester's own connection (rendered as "(you)").
+    pub is_self: bool,
+}
+
 /// OSC 9;4 (ConEmu/Windows-Terminal) progress-bar state for a pane (issue #125).
 /// Mirrors [`PaneProgressState`]; drives the per-pane progress bar the SwiftUI
 /// frontend overlays on each tile.
@@ -1297,6 +1322,8 @@ pub enum FfiMode {
     Help,
     /// Process overview main-area view (issue #122); rows via `overview_rows()`.
     ProcessOverview,
+    /// Connected-clients main-area view (issue #146); rows via `client_rows()`.
+    ConnectedClients,
     Command,
     Connecting {
         label: String,
@@ -1317,6 +1344,7 @@ fn mode_to_ffi(mode: &Mode) -> FfiMode {
         Mode::AddRemote => FfiMode::AddRemote,
         Mode::RemoteNewSession { peer } => FfiMode::RemoteNewSession { peer: peer.clone() },
         Mode::ProcessOverview => FfiMode::ProcessOverview,
+        Mode::ConnectedClients => FfiMode::ConnectedClients,
         Mode::Help => FfiMode::Help,
         Mode::Command(_) => FfiMode::Command,
         Mode::Connecting { target_display } => FfiMode::Connecting {
@@ -1712,6 +1740,33 @@ impl KmuxDriver {
                 peer: r.peer,
             })
             .collect()
+    }
+
+    /// The connected clients of the active session (issue #146). Polled by the
+    /// Swift `ConnectedClientsView` while [`FfiMode::ConnectedClients`] is active;
+    /// the driver re-requests the list at ~1 Hz.
+    pub fn client_rows(&self) -> Vec<FfiClientRow> {
+        let d = self.inner.lock().expect("driver mutex poisoned");
+        d.client_rows()
+            .into_iter()
+            .map(|c| FfiClientRow {
+                client_id: c.client_id.0,
+                label: c.label,
+                machine_id: c.machine_id,
+                hostname: c.hostname,
+                username: c.username,
+                transport: c.transport,
+                panes: c.attached_panes,
+                is_self: c.is_self,
+            })
+            .collect()
+    }
+
+    /// Kick the client connection `client_id` from the session whose list is
+    /// currently shown (issue #146). The list refreshes on the next poll.
+    pub fn kick_client(&self, client_id: u64) {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        d.kick_listed_client(kmux_protocol::messages::ClientId(client_id));
     }
 
     /// The panes (tabs) of the active session, with the active pane flagged.

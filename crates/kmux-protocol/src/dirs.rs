@@ -151,6 +151,16 @@ pub fn known_hosts_path() -> anyhow::Result<PathBuf> {
     Ok(config_dir()?.join("known_hosts.toml"))
 }
 
+/// Path to the Ed25519 machine/user identity keypair (issue #146).
+///
+/// Lives in the config dir (PKCS#8 DER, mode 0600), alongside the TOFU store and
+/// cached TLS certs. Like those, it is *shared* across the debug/release profiles
+/// — it represents the stable identity of this user@machine, not runtime state,
+/// so a `cargo run` instance and an installed release present the same identity.
+pub fn identity_key_path() -> anyhow::Result<PathBuf> {
+    Ok(config_dir()?.join("identity.key"))
+}
+
 /// Directory where cached TLS certificates are stored (e.g. auto-generated self-signed certs).
 pub fn tls_cert_dir() -> anyhow::Result<PathBuf> {
     let dir = config_dir()?.join("tls");

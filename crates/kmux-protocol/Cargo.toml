@@ -21,6 +21,11 @@ tls = [
     "dep:sha2",
     "dep:toml",
 ]
+# Cryptographic machine/user identity: Ed25519 keypair persistence, fingerprint,
+# sign, and verify (issue #146). Only the keypair logic is gated; the wire fields
+# that carry public keys / signatures / nonces are plain bytes and always
+# compiled. Enabled by every crate that signs (clients) or verifies (daemon).
+identity = ["dep:ring", "dep:sha2"]
 # QUIC transport.
 quic = ["tls", "dep:quinn"]
 # TCP+TLS transport.
@@ -35,7 +40,7 @@ server = []
 [dependencies]
 anyhow.workspace = true
 bitflags = { workspace = true, features = ["serde"] }
-nix = { workspace = true, features = ["net", "user"] }
+nix = { workspace = true, features = ["net", "user", "hostname"] }
 tokio-rustls = { workspace = true, optional = true }
 serde.workspace = true
 postcard.workspace = true
@@ -50,6 +55,8 @@ rustls-pemfile = { workspace = true, optional = true }
 rustls-native-certs = { workspace = true, optional = true }
 rcgen = { workspace = true, optional = true }
 sha2 = { workspace = true, optional = true }
+# Ed25519 sign/verify for the `identity` feature (issue #146).
+ring = { workspace = true, optional = true }
 toml = { workspace = true, optional = true }
 
 [dev-dependencies]

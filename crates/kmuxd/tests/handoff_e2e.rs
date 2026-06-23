@@ -180,11 +180,28 @@ async fn create_session_with_recorded_child(token: &str, cwd: &Path, pidfile: &P
         ConnectResult::Failed(e) => panic!("UDS connect failed: {e}"),
     };
 
-    let auth = recv_until(&mut srv_rx, Duration::from_secs(5), |m| {
-        matches!(m, ServerMessage::AuthResult { success: true, .. })
-    })
-    .await;
-    assert!(auth.is_some(), "expected a successful AuthResult");
+    // Answer the identity challenge, then await the successful result (issue #146).
+    let auth = loop {
+        match recv_until(&mut srv_rx, Duration::from_secs(5), |m| {
+            matches!(
+                m,
+                ServerMessage::AuthChallenge { .. } | ServerMessage::AuthResult { .. }
+            )
+        })
+        .await
+        {
+            Some(ServerMessage::AuthChallenge { nonce }) => {
+                assert!(kmux_client::tcp_connect::answer_auth_challenge(
+                    &client_tx, &nonce
+                ));
+            }
+            other => break other,
+        }
+    };
+    assert!(
+        matches!(auth, Some(ServerMessage::AuthResult { success: true, .. })),
+        "expected a successful AuthResult"
+    );
 
     // `exec sleep` so the recorded PID *is* the long-lived process the handoff must
     // keep alive (no intermediate `sh` that could exit and change the PID).

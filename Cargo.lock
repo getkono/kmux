@@ -1575,6 +1575,7 @@ dependencies = [
  "postcard",
  "quinn",
  "rcgen",
+ "ring",
  "rustls",
  "rustls-native-certs",
  "rustls-pemfile",

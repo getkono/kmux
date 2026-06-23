@@ -20,7 +20,7 @@ remote = ["kmux-client/remote"]
 
 [dependencies]
 kmux-client.workspace = true
-kmux-protocol = { workspace = true, features = ["framing"] }
+kmux-protocol = { workspace = true, features = ["framing", "identity"] }
 anyhow.workspace = true
 base64.workspace = true
 clap.workspace = true

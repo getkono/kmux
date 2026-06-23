@@ -17,26 +17,71 @@ use crate::connect::ConnectResult;
 /// Encode and write the initial `Auth` frame on a freshly-opened control stream.
 ///
 /// Centralises the auth handshake payload — token + `PROTOCOL_VERSION` +
-/// capabilities + `connection_id` — so every transport (UDS / TCP / TCP+TLS /
-/// QUIC) sends a byte-identical frame and a new `Auth` field is wired in exactly
-/// one place. Returns a human-readable error; the caller wraps it in
-/// [`ConnectResult::Failed`].
+/// capabilities + `connection_id` + this process's cryptographic identity claim
+/// (public key + hostname/username, issue #146) — so every transport (UDS / TCP
+/// / TCP+TLS / QUIC) sends a byte-identical frame and a new `Auth` field is wired
+/// in exactly one place. The daemon replies with an `AuthChallenge` the caller
+/// answers via [`answer_auth_challenge`]. Returns a human-readable error; the
+/// caller wraps it in [`ConnectResult::Failed`].
 pub(crate) async fn send_auth_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     token: String,
     capabilities: ClientCapabilities,
     connection_id: Option<ConnectionId>,
 ) -> Result<(), String> {
+    let (public_key, hostname, username) = local_identity_claim();
     let auth_bytes = encode_client(&ClientMessage::Auth {
         token,
         protocol_version: kmux_protocol::messages::PROTOCOL_VERSION,
         capabilities,
         connection_id,
+        public_key,
+        hostname,
+        username,
     })
     .map_err(|e| format!("auth encode failed: {e}"))?;
     write_frame(writer, &auth_bytes)
         .await
         .map_err(|e| format!("auth write failed: {e}"))
+}
+
+/// This process's identity claim for the `Auth` handshake (issue #146): the
+/// local Ed25519 public key plus friendly hostname/username labels. A failure to
+/// load the key yields an empty key (the daemon then rejects the handshake).
+fn local_identity_claim() -> (Vec<u8>, String, String) {
+    let public_key = match kmux_protocol::identity::Identity::load_or_create() {
+        Ok(id) => id.public_key_bytes().to_vec(),
+        Err(e) => {
+            warn!("failed to load identity key: {e}");
+            Vec::new()
+        }
+    };
+    (
+        public_key,
+        kmux_protocol::identity::local_hostname(),
+        kmux_protocol::identity::local_username(),
+    )
+}
+
+/// Sign a server challenge `nonce` with the local identity and send the
+/// resulting [`ClientMessage::AuthProof`] upstream (issue #146). Returns `false`
+/// if the identity can't be loaded or the sink is closed.
+pub fn answer_auth_challenge(
+    client_tx: &mpsc::UnboundedSender<ClientMessage>,
+    nonce: &[u8],
+) -> bool {
+    let identity = match kmux_protocol::identity::Identity::load_or_create() {
+        Ok(id) => id,
+        Err(e) => {
+            warn!("failed to load identity to answer challenge: {e}");
+            return false;
+        }
+    };
+    client_tx
+        .send(ClientMessage::AuthProof {
+            signature: identity.sign(nonce),
+        })
+        .is_ok()
 }
 
 /// Establish a TCP connection to `host:port` and authenticate with `token`.

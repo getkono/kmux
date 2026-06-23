@@ -102,6 +102,9 @@ const METRICS_FLUSH_TICK: Duration = Duration::from_secs(10);
 /// Process-overview refresh cadence while the overview is open (issue #122).
 /// Matched to the daemon's lazy-sample interval so CPU deltas stay meaningful.
 const PROCESS_OVERVIEW_TICK: Duration = Duration::from_secs(1);
+/// Connected-clients refresh cadence while that view is open (issue #146), so
+/// the list reflects clients attaching/detaching without a manual reopen.
+const CONNECTED_CLIENTS_TICK: Duration = Duration::from_secs(1);
 /// Debounce window for resize bursts; a window drag fires many size changes, so
 /// coalesce them into one `set_term_size` after the burst settles.
 const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
@@ -168,6 +171,9 @@ pub struct FrontendDriver {
     /// Last time a process-overview snapshot was requested (issue #122). Used to
     /// throttle re-requests to [`PROCESS_OVERVIEW_TICK`] while the view is open.
     last_process_overview: Instant,
+    /// Last time the connected-clients list was requested (issue #146). Throttles
+    /// re-requests to [`CONNECTED_CLIENTS_TICK`] while that view is open.
+    last_connected_clients: Instant,
     pending_resize: Option<TermSize>,
     resize_deadline: Option<Instant>,
     /// Cursor-blink phase: `true` shows the cursor on the current frame.
@@ -229,6 +235,7 @@ impl FrontendDriver {
             last_liveness: now,
             last_metrics_flush: now,
             last_process_overview: now,
+            last_connected_clients: now,
             pending_resize: None,
             resize_deadline: None,
             blink_on: true,
@@ -271,6 +278,8 @@ impl FrontendDriver {
         dirty |= self.tick_liveness(now);
         // Refresh the process overview while it is open (issue #122).
         dirty |= self.tick_process_overview(now);
+        // Refresh the connected-clients list while that view is open (issue #146).
+        dirty |= self.tick_connected_clients(now);
         // Auto-pause the connection once the window has been backgrounded long
         // enough (issue #68).
         dirty |= self.tick_auto_pause(now);
@@ -607,6 +616,24 @@ impl FrontendDriver {
         false
     }
 
+    /// Re-request the active session's client list at [`CONNECTED_CLIENTS_TICK`]
+    /// while the connected-clients view is open (issue #146). Returns whether a
+    /// request was sent (the view repaints on the async reply). No-op in any other
+    /// mode, so an idle daemon is never polled.
+    fn tick_connected_clients(&mut self, now: Instant) -> bool {
+        if !matches!(self.core.mode, Mode::ConnectedClients) {
+            return false;
+        }
+        if now.duration_since(self.last_connected_clients) < CONNECTED_CLIENTS_TICK {
+            return false;
+        }
+        self.last_connected_clients = now;
+        if let Some(word) = self.core.mgr.active_session.clone() {
+            self.core.mgr.request_client_list(word);
+        }
+        false
+    }
+
     /// Flush one metrics sample at [`METRICS_FLUSH_TICK`]. Never forces a redraw.
     fn tick_metrics(&mut self, now: Instant) {
         if now.duration_since(self.last_metrics_flush) >= METRICS_FLUSH_TICK {
@@ -855,6 +882,7 @@ impl FrontendDriver {
             last_liveness: now,
             last_metrics_flush: now,
             last_process_overview: now,
+            last_connected_clients: now,
             pending_resize: None,
             resize_deadline: None,
             blink_on: true,

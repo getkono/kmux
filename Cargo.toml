@@ -54,6 +54,10 @@ postcard = { version = "1", features = ["alloc"] }
 quinn = "0.11"
 rand = "0.10.1"
 rcgen = "0.14.7"
+# Ed25519 sign/verify for cryptographic machine identity (issue #146). Already
+# in the tree transitively via rustls; pinned to the resolved version. Pulled
+# only by kmux-protocol's `identity` feature.
+ring = "0.17"
 sha2 = "0.11.0"
 rustls = { version = "0.23.28", default-features = false, features = ["ring", "logging", "std", "tls12"] }
 rustls-native-certs = "0.8"

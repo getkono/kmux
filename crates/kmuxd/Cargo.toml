@@ -28,7 +28,14 @@ federation = ["dep:kmux-connect", "kmux-connect/remote"]
 
 [dependencies]
 kmux-pty.workspace = true
-kmux-protocol = { workspace = true, features = ["framing", "tls", "quic", "tcp-tls", "uds"] }
+kmux-protocol = { workspace = true, features = [
+    "framing",
+    "tls",
+    "quic",
+    "tcp-tls",
+    "uds",
+    "identity",
+] }
 # Outbound peer links (the "server is also a client" role). Only pulled in with
 # the `federation` feature; `kmux-connect` depends solely on `kmux-protocol`, so
 # this adds no dependency cycle.

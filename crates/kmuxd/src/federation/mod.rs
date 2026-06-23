@@ -39,8 +39,8 @@ use kmux_connect::connect::ConnectResult;
 use kmux_connect::ssh::{self, RemoteTarget};
 use kmux_connect::tcp_connect::connect_tcp_tls;
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ClientMessage, PaneProcesses, PeerId, PeerTarget, RequestId,
-    SequenceNo, ServerMessage, SessionEntry, SessionEventMsg, TermSize, epoch_millis,
+    ClientCapabilities, ClientId, ClientInfo, ClientMessage, PaneProcesses, PeerId, PeerTarget,
+    RequestId, SequenceNo, ServerMessage, SessionEntry, SessionEventMsg, TermSize, epoch_millis,
 };
 use kmux_protocol::{format_pane_id, parse_pane_id};
 
@@ -272,6 +272,14 @@ struct PeerConnection {
     /// process trees — already translated to local pane ids — when the matching
     /// `ProcessOverviewResult` arrives.
     pending_overviews: HashMap<RequestId, oneshot::Sender<Vec<PaneProcesses>>>,
+    /// In-flight hub-initiated `ClientList`s, keyed by upstream request id (issue
+    /// #146). The feed loop completes the oneshot with the peer's connections when
+    /// the matching `ClientListResult` arrives.
+    pending_client_lists: HashMap<RequestId, oneshot::Sender<Vec<ClientInfo>>>,
+    /// In-flight hub-initiated `KickClient`s, keyed by upstream request id (issue
+    /// #146). The feed loop completes the oneshot when the matching `ClientKicked`
+    /// (Ok) or `Error` (Err) arrives.
+    pending_kicks: HashMap<RequestId, oneshot::Sender<Result<(), String>>>,
     /// The background `ssh -L -N` tunnel process for an [`PeerTarget::Ssh`] peer,
     /// kept alive for the life of the connection (the `-L` forward dies with it).
     /// `None` for a [`PeerTarget::Direct`] peer. Killed on close/reap.
@@ -294,6 +302,8 @@ impl PeerConnection {
             next_request_id: 2,
             pending_creates: HashMap::new(),
             pending_overviews: HashMap::new(),
+            pending_client_lists: HashMap::new(),
+            pending_kicks: HashMap::new(),
             ssh_tunnel: None,
             dead: false,
         }
@@ -521,24 +531,37 @@ impl PeerManager {
             ConnectResult::Failed(e) => return Err(format!("peer connect failed: {e}")),
         };
 
-        // 2. Await authentication.
-        match recv_until(&mut server_rx, AUTH_TIMEOUT, |m| {
-            matches!(m, ServerMessage::AuthResult { .. })
-        })
-        .await
-        {
-            Some(ServerMessage::AuthResult { success: true, .. }) => {}
-            Some(ServerMessage::AuthResult {
-                success: false,
-                reason,
-                ..
-            }) => {
-                return Err(format!(
-                    "peer rejected authentication: {}",
-                    reason.unwrap_or_else(|| "unknown reason".to_string())
-                ));
+        // 2. Answer the identity challenge with our own key, then await the
+        //    authentication result (issue #146). The hub authenticates upstream as
+        //    a distinct cryptographic entity, so the peer's client list shows it as
+        //    one connection.
+        loop {
+            match recv_until(&mut server_rx, AUTH_TIMEOUT, |m| {
+                matches!(
+                    m,
+                    ServerMessage::AuthChallenge { .. } | ServerMessage::AuthResult { .. }
+                )
+            })
+            .await
+            {
+                Some(ServerMessage::AuthChallenge { nonce }) => {
+                    if !kmux_connect::tcp_connect::answer_auth_challenge(&client_tx, &nonce) {
+                        return Err("failed to answer peer identity challenge".to_string());
+                    }
+                }
+                Some(ServerMessage::AuthResult { success: true, .. }) => break,
+                Some(ServerMessage::AuthResult {
+                    success: false,
+                    reason,
+                    ..
+                }) => {
+                    return Err(format!(
+                        "peer rejected authentication: {}",
+                        reason.unwrap_or_else(|| "unknown reason".to_string())
+                    ));
+                }
+                _ => return Err("peer did not complete authentication in time".to_string()),
             }
-            _ => return Err("peer did not complete authentication in time".to_string()),
         }
 
         // 3. Fetch the remote session list.
@@ -855,6 +878,97 @@ impl PeerManager {
         out
     }
 
+    /// Whether the local session `word_id` is proxied from a federated peer
+    /// (issue #146).
+    pub fn is_federated_session(&self, word_id: &str) -> bool {
+        self.word_index.lock().unwrap().contains_key(word_id)
+    }
+
+    /// Forward a `ClientList` for the federated session `local_word` to its owning
+    /// peer and return the connections the peer reports (issue #146). The peer's
+    /// labels/ids/machine ids are relayed verbatim — they are meaningful on that
+    /// host (and `machine_id` is globally unique).
+    pub async fn list_session_clients(&self, local_word: &str) -> Result<Vec<ClientInfo>, String> {
+        let conn = self
+            .conn_for_word(local_word)
+            .ok_or_else(|| format!("session {local_word} is not federated"))?;
+        let (rid, rx) = {
+            let mut guard = conn.lock().unwrap();
+            if guard.dead {
+                return Err("peer connection is closed".to_string());
+            }
+            let Some(remote_word) = guard.local_to_remote.get(local_word).cloned() else {
+                return Err(format!("session {local_word} is not federated"));
+            };
+            let rid = guard.next_rid();
+            let (tx, rx) = oneshot::channel();
+            guard.pending_client_lists.insert(rid, tx);
+            if guard
+                .client_tx
+                .send(ClientMessage::ClientList {
+                    request_id: rid,
+                    word_id: remote_word,
+                })
+                .is_err()
+            {
+                guard.pending_client_lists.remove(&rid);
+                return Err("peer connection closed before client list".to_string());
+            }
+            (rid, rx)
+        };
+        match tokio::time::timeout(LIST_TIMEOUT, rx).await {
+            Ok(Ok(clients)) => Ok(clients),
+            _ => {
+                conn.lock().unwrap().pending_client_lists.remove(&rid);
+                Err("peer did not return a client list in time".to_string())
+            }
+        }
+    }
+
+    /// Forward a `KickClient` for the federated session `local_word` to its owning
+    /// peer, translating the local word to the remote one (issue #146).
+    pub async fn kick_session_client(
+        &self,
+        local_word: &str,
+        client_id: ClientId,
+    ) -> Result<(), String> {
+        let conn = self
+            .conn_for_word(local_word)
+            .ok_or_else(|| format!("session {local_word} is not federated"))?;
+        let (rid, rx) = {
+            let mut guard = conn.lock().unwrap();
+            if guard.dead {
+                return Err("peer connection is closed".to_string());
+            }
+            let Some(remote_word) = guard.local_to_remote.get(local_word).cloned() else {
+                return Err(format!("session {local_word} is not federated"));
+            };
+            let rid = guard.next_rid();
+            let (tx, rx) = oneshot::channel();
+            guard.pending_kicks.insert(rid, tx);
+            if guard
+                .client_tx
+                .send(ClientMessage::KickClient {
+                    request_id: rid,
+                    word_id: remote_word,
+                    client_id,
+                })
+                .is_err()
+            {
+                guard.pending_kicks.remove(&rid);
+                return Err("peer connection closed before kick".to_string());
+            }
+            (rid, rx)
+        };
+        match tokio::time::timeout(CREATE_TIMEOUT, rx).await {
+            Ok(Ok(result)) => result,
+            _ => {
+                conn.lock().unwrap().pending_kicks.remove(&rid);
+                Err("peer did not confirm kick in time".to_string())
+            }
+        }
+    }
+
     /// Translate `local_pane_id` to its remote form and forward
     /// `build(remote_pane_id)` upstream. Returns `false` (forwarding nothing) when
     /// the pane is not federated, so the caller can fall back to local handling.
@@ -1085,29 +1199,55 @@ fn spawn_feed_loop(
                 continue;
             }
 
-            // Route responses to hub-initiated requests (create-on-peer) back to
-            // the waiting oneshot. `SessionCreated` carries the *remote* entry;
+            // Route client-list responses (issue #146) to the waiting requester.
+            // The peer's `ClientInfo`s are relayed verbatim (their ids/labels are
+            // meaningful on that host). A response we are not waiting on is dropped.
+            if let ServerMessage::ClientListResult { request_id, .. } = &msg {
+                if let Some(tx) = conn.lock().unwrap().pending_client_lists.remove(request_id)
+                    && let ServerMessage::ClientListResult { clients, .. } = msg
+                {
+                    let _ = tx.send(clients);
+                }
+                continue;
+            }
+
+            // Route responses to hub-initiated requests (create-on-peer, kick) back
+            // to the waiting oneshot. `SessionCreated` carries the *remote* entry;
             // `create_remote_session` (holding `&ServerApp`) draws the local word
-            // and registers it. An `Error`/`SessionCreated` whose id we are not
-            // waiting on falls through to the normal handling below.
+            // and registers it. `ClientKicked`/`Error` complete a pending kick. An
+            // `Error`/`SessionCreated` whose id we are not waiting on falls through
+            // to the normal handling below.
             let response_rid = match &msg {
                 ServerMessage::SessionCreated { request_id, .. } => Some(*request_id),
+                ServerMessage::ClientKicked { request_id, .. } => Some(*request_id),
                 ServerMessage::Error {
                     request_id: Some(rid),
                     ..
                 } => Some(*rid),
                 _ => None,
             };
-            if let Some(rid) = response_rid
-                && let Some(tx) = conn.lock().unwrap().pending_creates.remove(&rid)
-            {
-                let result = match msg {
-                    ServerMessage::SessionCreated { entry, .. } => Ok(entry),
-                    ServerMessage::Error { message, .. } => Err(message),
-                    _ => unreachable!("response_rid is set only for those two variants"),
-                };
-                let _ = tx.send(result);
-                continue;
+            if let Some(rid) = response_rid {
+                // A pending kick takes priority for its id, then a pending create.
+                let kick_tx = conn.lock().unwrap().pending_kicks.remove(&rid);
+                if let Some(tx) = kick_tx {
+                    let result = match msg {
+                        ServerMessage::ClientKicked { .. } => Ok(()),
+                        ServerMessage::Error { message, .. } => Err(message),
+                        _ => Ok(()),
+                    };
+                    let _ = tx.send(result);
+                    continue;
+                }
+                let create_tx = conn.lock().unwrap().pending_creates.remove(&rid);
+                if let Some(tx) = create_tx {
+                    let result = match msg {
+                        ServerMessage::SessionCreated { entry, .. } => Ok(entry),
+                        ServerMessage::Error { message, .. } => Err(message),
+                        _ => continue,
+                    };
+                    let _ = tx.send(result);
+                    continue;
+                }
             }
 
             // Pane-scoped frames: translate the pane ID remote→local, feed the
