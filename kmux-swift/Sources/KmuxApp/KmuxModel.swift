@@ -26,6 +26,10 @@ final class KmuxModel: ObservableObject {
     /// `mode == .processOverview`; the main-area `ProcessOverviewView` renders
     /// them. Refreshed ~1 Hz by the driver's snapshot polling.
     @Published private(set) var overview: [FfiOverviewRow] = []
+    /// Connected-clients rows for the active session (issue #146), populated only
+    /// while `mode == .connectedClients`; the main-area `ConnectedClientsView`
+    /// renders them. Refreshed ~1 Hz by the driver's polling.
+    @Published private(set) var connectedClients: [FfiClientRow] = []
     @Published private(set) var picker: FfiPicker?
     /// The unified session launcher's state (issue #121), non-nil only in
     /// `Mode::LaunchPicker`. Driven by the generic picker methods plus the
@@ -146,6 +150,12 @@ final class KmuxModel: ObservableObject {
     /// Dispatch a curated action and apply its effects.
     func dispatch(_ action: FfiAction) {
         apply(driver.dispatch(action: action))
+    }
+
+    /// Kick a client connection from the listed session (issue #146). The
+    /// connected-clients list refreshes on the next ~1 Hz poll.
+    func kickClient(_ clientId: UInt64) {
+        driver.kickClient(clientId: clientId)
     }
 
     /// Report whether the app is backgrounded, for auto-pause (issue #68).
@@ -404,6 +414,13 @@ final class KmuxModel: ObservableObject {
             if ov != overview { overview = ov }
         } else if !overview.isEmpty {
             overview = []
+        }
+        // Likewise the connected-clients list while that view is open (issue #146).
+        if md == .connectedClients {
+            let cl = driver.clientRows()
+            if cl != connectedClients { connectedClients = cl }
+        } else if !connectedClients.isEmpty {
+            connectedClients = []
         }
         let pk = driver.picker()
         if pk != picker { picker = pk }

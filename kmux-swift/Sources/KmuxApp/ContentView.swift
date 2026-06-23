@@ -66,6 +66,11 @@ struct ContentView: View {
             // kmux-gtk swapping the content stack to its "overview" child.
             ProcessOverviewView(model: model)
                 .frame(minWidth: 480, minHeight: 320)
+        } else if case .connectedClients = model.mode {
+            // The connected-clients view (issue #146) takes over the main area,
+            // like kmux-gtk swapping to its "clients" content-stack child.
+            ConnectedClientsView(model: model)
+                .frame(minWidth: 560, minHeight: 320)
         } else {
             terminalDetail
         }
@@ -221,6 +226,9 @@ struct KmuxCommands: Commands {
             // Process overview main-area view (issue #122). o = overview.
             Toggle("Process Overview", isOn: processOverviewBinding)
                 .keyboardShortcut("o", modifiers: [.command, .shift])
+            // Connected-clients main-area view (issue #146). k = clients / kick.
+            Toggle("Connected Clients", isOn: connectedClientsBinding)
+                .keyboardShortcut("k", modifiers: [.command, .shift])
             Toggle("Performance HUD", isOn: hudBinding)
                 .keyboardShortcut("h", modifiers: [.command, .shift])
             Toggle("Metrics Inspector", isOn: metricsBinding)
@@ -299,6 +307,13 @@ struct KmuxCommands: Commands {
         Binding(
             get: { if case .processOverview = model.mode { return true } else { return false } },
             set: { _ in model.dispatch(.toggleProcessOverview) }
+        )
+    }
+
+    private var connectedClientsBinding: Binding<Bool> {
+        Binding(
+            get: { if case .connectedClients = model.mode { return true } else { return false } },
+            set: { _ in model.dispatch(.toggleConnectedClients) }
         )
     }
 
