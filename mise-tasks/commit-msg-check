@@ -1,0 +1,16 @@
+#!/usr/bin/env bash
+#MISE description="Validate an in-progress commit message as a conventional commit (convco)."
+#USAGE arg "<msgfile>" help="Path to the commit message file (git's commit-msg hook arg)"
+#
+# Wired to the hk commit-msg hook, which passes {{commit_msg_file}}. Enforces
+# issue #130 the moment a message is written. Scope rules come from .convco.
+set -euo pipefail
+msgfile="${1:?usage: commit-msg-check <commit-msg-file>}"
+# git runs commit-msg for merge commits too; their auto-generated "Merge …"
+# subject isn't conventional and must not block a merge.
+if [[ -f "$(git rev-parse --git-path MERGE_HEAD)" ]]; then
+    exit 0
+fi
+# --from-stdin checks the single message on stdin; --strip drops git's comment
+# and whitespace lines (like `git commit --cleanup=strip`) before validating.
+convco check --from-stdin --strip < "$msgfile"

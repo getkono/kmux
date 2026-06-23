@@ -7,7 +7,7 @@ mod tabs;
 
 pub use server_handler::SessionEvent;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use kmux_protocol::messages::{
@@ -115,6 +115,17 @@ pub struct SessionManager {
     pub buffers: HashMap<PaneId, CellGrid>,
     pub(super) pane_sync: HashMap<PaneId, PaneSync>,
     pub input_locked: HashMap<PaneId, bool>,
+    /// Panes the user marked exempt from *auto*-pause (issue #68): they keep
+    /// streaming through a background auto-pause. Re-asserted to the daemon after
+    /// every `Attach` (the daemon resets the flag on attach).
+    pub(super) auto_pause_exempt_panes: HashSet<PaneId>,
+    /// Sessions (word ids) marked exempt from auto-pause; every pane in the
+    /// session inherits the exemption (issue #68).
+    pub(super) auto_pause_exempt_sessions: HashSet<WordId>,
+    /// Last `(paused, auto)` pushed to the daemon, so [`Self::reconcile_pause`]
+    /// sends `SetPaused` only on change and re-attaches exactly the panes that
+    /// resume streaming.
+    pub(super) pause_applied: (bool, bool),
     pub(super) next_request_id: u64,
     /// Panes with an outstanding `FetchHistory` request; maps `pane_id` to the
     /// `request_id` of the in-flight query so we can coalesce (never issue a
@@ -210,6 +221,9 @@ impl SessionManager {
             buffers: HashMap::new(),
             pane_sync: HashMap::new(),
             input_locked: HashMap::new(),
+            auto_pause_exempt_panes: HashSet::new(),
+            auto_pause_exempt_sessions: HashSet::new(),
+            pause_applied: (false, false),
             next_request_id: 0,
             in_flight_history_fetches: HashMap::new(),
             pending_dir_request: None,
@@ -401,11 +415,20 @@ impl SessionManager {
             .get(&pane_id)
             .copied()
             .unwrap_or(self.last_term_size);
+        let exempt = self.is_pane_auto_pause_exempt(&pane_id);
         self.send_ws(ClientMessage::Attach {
-            pane_id,
+            pane_id: pane_id.clone(),
             last_seqno: None,
             size,
         });
+        // The daemon resets a pane's auto-pause exemption on attach, so re-assert
+        // it for an exempt pane right after attaching (issue #68).
+        if exempt {
+            self.send_ws(ClientMessage::SetPaneNoAutoPause {
+                pane_id,
+                exempt: true,
+            });
+        }
     }
 
     /// Update the stored window size (the fallback) and send a `Resize` to every
@@ -1638,8 +1661,22 @@ mod tests {
         assert_eq!(mgr.pending_dir_request, Some(newest));
     }
 
+    /// Collect every `Attach { last_seqno: None }` pane id drained from `rx`.
+    fn reattached_panes(msgs: &[ClientMessage]) -> Vec<&str> {
+        msgs.iter()
+            .filter_map(|m| match m {
+                ClientMessage::Attach {
+                    pane_id,
+                    last_seqno: None,
+                    ..
+                } => Some(pane_id.as_str()),
+                _ => None,
+            })
+            .collect()
+    }
+
     #[test]
-    fn set_paused_sends_setpaused_and_resume_reattaches_visible_panes() {
+    fn reconcile_pause_sends_setpaused_and_resume_reattaches_visible_panes() {
         let (mut mgr, mut rx) = make_connected_manager();
         mgr.visible_panes = vec!["eagle/0".to_string(), "eagle/1".to_string()];
         mgr.pane_sync.insert(
@@ -1649,40 +1686,97 @@ mod tests {
             },
         );
 
-        // Pause: a single SetPaused { paused: true }, no re-attach.
-        mgr.set_paused(true);
+        // Manual pause: a single SetPaused { paused: true, auto: false }, no re-attach.
+        mgr.reconcile_pause(true, false);
         match rx.try_recv() {
-            Ok(ClientMessage::SetPaused { paused: true }) => {}
-            other => panic!("expected SetPaused {{ paused: true }}, got {other:?}"),
+            Ok(ClientMessage::SetPaused {
+                paused: true,
+                auto: false,
+            }) => {}
+            other => panic!("expected SetPaused {{ paused: true, auto: false }}, got {other:?}"),
         }
         assert!(rx.try_recv().is_err(), "pause must not detach or re-attach");
 
         // Resume: SetPaused { paused: false } then a full-snapshot re-attach of
         // every visible pane (last_seqno: None → daemon sends final state).
-        mgr.set_paused(false);
+        mgr.reconcile_pause(false, false);
         let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
         assert!(
             matches!(
                 msgs.first(),
-                Some(ClientMessage::SetPaused { paused: false })
+                Some(ClientMessage::SetPaused {
+                    paused: false,
+                    auto: false
+                })
             ),
             "resume must first clear the pause flag, got {msgs:?}"
         );
-        let reattached: Vec<&str> = msgs
-            .iter()
-            .filter_map(|m| match m {
-                ClientMessage::Attach {
-                    pane_id,
-                    last_seqno: None,
-                    ..
-                } => Some(pane_id.as_str()),
-                _ => None,
-            })
-            .collect();
         assert_eq!(
-            reattached,
+            reattached_panes(&msgs),
             vec!["eagle/0", "eagle/1"],
             "resume re-attaches every visible pane with a fresh snapshot"
+        );
+    }
+
+    #[test]
+    fn auto_pause_exemption_keeps_pane_streaming() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.visible_panes = vec!["eagle/0".to_string(), "eagle/1".to_string()];
+
+        // Mark eagle/0 exempt: asserts SetPaneNoAutoPause for the attached pane.
+        assert!(mgr.toggle_pane_auto_pause_exempt("eagle/0"));
+        match rx.try_recv() {
+            Ok(ClientMessage::SetPaneNoAutoPause {
+                pane_id,
+                exempt: true,
+            }) => assert_eq!(pane_id, "eagle/0"),
+            other => panic!("expected SetPaneNoAutoPause, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err());
+
+        // Auto-pause: SetPaused { auto: true }; the exempt pane keeps streaming,
+        // so nothing is re-attached.
+        mgr.reconcile_pause(true, true);
+        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(matches!(
+            msgs.first(),
+            Some(ClientMessage::SetPaused {
+                paused: true,
+                auto: true
+            })
+        ));
+        assert!(
+            reattached_panes(&msgs).is_empty(),
+            "auto-pause must not re-attach (no pane resumed), got {msgs:?}"
+        );
+
+        // Foreground: only the non-exempt eagle/1 was withheld, so only it catches
+        // up. The exempt eagle/0 streamed throughout and needs no re-attach.
+        mgr.reconcile_pause(false, false);
+        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            reattached_panes(&msgs),
+            vec!["eagle/1"],
+            "only the non-exempt pane catches up on resume, got {msgs:?}"
+        );
+    }
+
+    #[test]
+    fn manual_pause_overrides_auto_pause_exemption() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.visible_panes = vec!["eagle/0".to_string()];
+        assert!(mgr.toggle_pane_auto_pause_exempt("eagle/0"));
+        let _ = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+        // A manual pause (auto: false) withholds even the exempt pane, so on
+        // resume it must be re-attached to catch up.
+        mgr.reconcile_pause(true, false);
+        mgr.reconcile_pause(false, false);
+        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert_eq!(
+            reattached_panes(&msgs),
+            vec!["eagle/0"],
+            "manual pause withholds the exempt pane, so it catches up on resume"
         );
     }
 }

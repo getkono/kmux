@@ -12,6 +12,7 @@ use std::rc::Rc;
 
 use adw::prelude::*;
 use gtk4::{Application, Box as GtkBox, Orientation, glib};
+use kmux_protocol::format_pane_id;
 
 use super::Frontend;
 use super::shell::Shell;
@@ -103,10 +104,25 @@ pub fn sync(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
         let f = fe.borrow();
         let mgr = &f.core.mgr;
         let active = mgr.active_tab().map(|t| t.to_string()).unwrap_or_default();
+        let word = mgr
+            .active_session()
+            .map(|s| s.to_string())
+            .unwrap_or_default();
         let want: Vec<(String, String)> = mgr
             .active_session_tabs()
             .iter()
-            .map(|t| (t.tab_index.to_string(), tab_label(t.tab_index, &t.name)))
+            .map(|t| {
+                // A tab is paused if any of its panes is paused (issue #68).
+                let paused = t
+                    .layout
+                    .leaves()
+                    .iter()
+                    .any(|idx| f.core.is_pane_paused(&format_pane_id(&word, *idx)));
+                (
+                    t.tab_index.to_string(),
+                    tab_label(t.tab_index, &t.name, paused),
+                )
+            })
             .collect();
         let sig = format!(
             "{active}|{}",
@@ -205,13 +221,15 @@ pub fn sync(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
     shell.tabs.syncing.set(false);
 }
 
-/// Tab title: the tab's name, falling back to its 1-based index.
-fn tab_label(index: u32, name: &str) -> String {
-    if name.trim().is_empty() {
+/// Tab title: the tab's name, falling back to its 1-based index. A paused tab is
+/// prefixed with a pause glyph (issue #68).
+fn tab_label(index: u32, name: &str, paused: bool) -> String {
+    let base = if name.trim().is_empty() {
         format!("{}", index + 1)
     } else {
         name.to_string()
-    }
+    };
+    if paused { format!("⏸ {base}") } else { base }
 }
 
 /// Move the single shared `DrawingArea` into `page`'s content box.

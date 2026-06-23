@@ -18,6 +18,13 @@ hk = "1.48.0"
 # Line-count reporting (`mise run loc`). aqua backend ships prebuilt binaries
 # (like git-cliff above), so no source build. Pinned for stable counts.
 "aqua:XAMPPRocky/tokei" = "12.1.2"
+# Conventional-commit linting (issue #130): the hk commit-msg/pre-push hooks and
+# the CI commit-lint job all run `convco check` via the `commit-msg-check` /
+# `commit-check` mise-tasks. Built from source — convco ships no arch-tagged
+# prebuilt we can pin against — but it pins git2 with default-features=false, so
+# it vendors libgit2 with no openssl/system deps (just a C compiler); mise caches
+# the compiled binary like cargo-mutants above.
+"cargo:convco" = "0.6.4"
 
 [settings]
 # Required for the `[hooks]` block below (mise gates hooks behind this flag).
@@ -108,7 +115,8 @@ run = "swift test --package-path kmux-swift"
 
 # The Rust `gpu` feature is on by default now, so the bindings always include
 # KmuxRenderer; these tasks add the Swift `-DKMUX_GPU` flag (compiles the Metal
-# view) and, for `-run`, the runtime `KMUX_RENDERER=wgpu` opt-in.
+# view) and, for `-run`, select the GPU path via a fixture `config.toml`
+# (`renderer = "gpu"`) — the runtime knob is config now, not an env var.
 [tasks.swift-gpu-app]
 description = "Build the macOS app with the Swift Metal view compiled in (issue #132)."
 run = [
@@ -117,13 +125,15 @@ run = [
 ]
 
 [tasks.swift-gpu-run]
-description = "Run the macOS app on the wgpu GPU renderer (KMUX_RENDERER=wgpu)."
-env = { KMUX_RENDERER = "wgpu" }
+description = "Run the macOS app on the GPU renderer (renderer = \"gpu\" via a fixture config)."
 # Build + pin the debug kmuxd (see gtk-run) so the GPU dev app auto-spawns it.
+# A fixture XDG_CONFIG_HOME carries `renderer = "gpu"` since the renderer is now
+# a config key rather than an env var.
 run = [
     "mise run gen-ffi-bindings",
     "cargo build -p kmuxd",
-    'KMUX_KMUXD="$PWD/target/debug/kmuxd" swift run --package-path kmux-swift -Xswiftc -DKMUX_GPU',
+    "mkdir -p target/gpu-config/kmux && printf 'renderer = \"gpu\"\\n' > target/gpu-config/kmux/config.toml",
+    'XDG_CONFIG_HOME="$PWD/target/gpu-config" KMUX_KMUXD="$PWD/target/debug/kmuxd" swift run --package-path kmux-swift -Xswiftc -DKMUX_GPU',
 ]
 
 [tasks.doc]

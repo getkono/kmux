@@ -85,41 +85,16 @@ final class KmuxModel: ObservableObject {
     /// Pump cadence (~60 Hz), matching the GTK frontend's 16 ms timeout.
     private static let pumpInterval = 1.0 / 60.0
 
-    /// The diagnostic test name from `kmux diagnostic <test>` (argv forwarded by
-    /// the `kmux` entrypoint), or `nil` for an ordinary launch. A minimal scan —
-    /// the Rust side validates the name and resolves the emitter command.
-    private static func diagnosticArg() -> String? {
-        let args = CommandLine.arguments
-        guard let i = args.firstIndex(of: "diagnostic"), i + 1 < args.count else {
-            return nil
-        }
-        let test = args[i + 1]
-        return test.hasPrefix("-") ? nil : test
-    }
-
-    init() {
+    /// Build the model for one window from its `LaunchRequest` (server / session
+    /// / cwd / diagnostic). Each window constructs its own driver — and thus its
+    /// own daemon connection — so windows are independent.
+    init(request: LaunchRequest) {
         // No hand-typed ABI assert here: uniffi's regenerated binding-checksum
         // check (contract version + per-function checksums) fires a fatalError
         // on any bindings/dylib drift the moment we cross the boundary below, so
         // a stale binding can't slip through. `KMUX_FFI_ABI_VERSION` stays the
         // single human-meaningful marker, defined once on the Rust side.
-        let config = DriverConfig(
-            server: nil,  // local daemon
-            sshPort: nil,
-            cwd: nil,
-            session: nil,
-            theme: nil,  // default theme
-            cursorBlink: nil,  // resolve from config.toml, defaulting to true
-            // `kmux diagnostic <test>`: the entrypoint forwards argv to this app;
-            // the test name routes a render-diagnostic session (issue #145). The
-            // entrypoint already handled the `--emit`/list cases, so only an
-            // interactive `diagnostic <test>` reaches here.
-            diagnostic: Self.diagnosticArg(),
-            rows: 24,
-            cols: 80,
-            pixelWidth: 0,
-            pixelHeight: 0
-        )
+        let config = request.driverConfig()
         do {
             driver = try KmuxDriver(config: config)
         } catch {
@@ -133,6 +108,8 @@ final class KmuxModel: ObservableObject {
     /// Start the pump on the main run loop (common modes so it keeps ticking
     /// during window resize / menu tracking).
     func start() {
+        // Make Powerline/Nerd glyphs available to the CoreText path (issue #145).
+        registerSymbolFallbackFont()
         let t = Timer(timeInterval: Self.pumpInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.pump() }
         }

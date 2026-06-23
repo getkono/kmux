@@ -1,4 +1,5 @@
 use kmux_protocol::messages::{ClientMessage, KeyEvent, TermSize};
+use kmux_protocol::parse_pane_id;
 
 use super::SessionManager;
 use crate::input::{MouseEvent, MouseEventKind, encode_mouse_button};
@@ -154,19 +155,93 @@ impl SessionManager {
         self.send_ws(ClientMessage::SetSnapshotMode { enabled });
     }
 
-    /// Pause or resume terminal-output delivery for this connection (issue #68).
+    /// Whether a terminal-output frame for `pane_id` is currently being withheld
+    /// from this pane because it is exempt from auto-pause (issue #68) — i.e.
+    /// the pane is in the exempt-panes set or its session is exempt.
+    pub fn is_pane_auto_pause_exempt(&self, pane_id: &str) -> bool {
+        if self.auto_pause_exempt_panes.contains(pane_id) {
+            return true;
+        }
+        parse_pane_id(pane_id)
+            .map(|(word_id, _)| self.auto_pause_exempt_sessions.contains(word_id))
+            .unwrap_or(false)
+    }
+
+    /// Whether the pane was explicitly marked exempt at the *pane* level (drives
+    /// the pane menu's checkmark; session-level exemption is reported separately).
+    pub fn pane_marked_auto_pause_exempt(&self, pane_id: &str) -> bool {
+        self.auto_pause_exempt_panes.contains(pane_id)
+    }
+
+    /// Whether `word_id` was marked exempt at the *session* level (menu checkmark).
+    pub fn session_marked_auto_pause_exempt(&self, word_id: &str) -> bool {
+        self.auto_pause_exempt_sessions.contains(word_id)
+    }
+
+    /// Reconcile the connection pause state with the daemon (issue #68).
     ///
-    /// While paused the daemon stops pushing terminal frames, saving bandwidth;
-    /// the pane keeps running so nothing is lost. On resume we re-attach every
-    /// visible pane so the daemon sends a fresh snapshot of the *final* state —
-    /// instant, bounded catch-up (one snapshot, not a backlog replay), and it
-    /// reuses the well-tested snapshot-sync path.
-    pub fn set_paused(&mut self, paused: bool) {
-        self.send_ws(ClientMessage::SetPaused { paused });
-        if !paused {
-            for pane_id in self.visible_panes.clone() {
+    /// `paused` is the effective pause, `auto` whether it is the background
+    /// auto-pause (vs a manual pause). Sends `SetPaused` only when the connection
+    /// state changes, then re-attaches every visible pane that transitions from
+    /// *skipped* to *streaming* so the daemon sends one fresh snapshot of the
+    /// final state — instant, bounded catch-up over the well-tested snapshot
+    /// path. A pane exempt from auto-pause keeps streaming through a background
+    /// pause, so it never needs catch-up there.
+    pub fn reconcile_pause(&mut self, paused: bool, auto: bool) {
+        let (was_paused, was_auto) = self.pause_applied;
+        if (paused, auto) != self.pause_applied {
+            self.send_ws(ClientMessage::SetPaused { paused, auto });
+        }
+        // A pane's output is withheld iff the connection is paused and the pause
+        // is not an auto-pause the pane is exempt from. Re-attach panes that flip
+        // from withheld to streaming (`attach_fresh` re-asserts the exemption).
+        let withheld = |paused: bool, auto: bool, exempt: bool| paused && !(auto && exempt);
+        for pane_id in self.visible_panes.clone() {
+            let exempt = self.is_pane_auto_pause_exempt(&pane_id);
+            if withheld(was_paused, was_auto, exempt) && !withheld(paused, auto, exempt) {
                 self.attach_fresh(pane_id);
             }
         }
+        self.pause_applied = (paused, auto);
+    }
+
+    /// Toggle a pane's exemption from auto-pause and return the new state. Sends
+    /// `SetPaneNoAutoPause` immediately if the pane is currently attached; the
+    /// caller follows with [`Self::reconcile_pause`] so a pane that starts/stops
+    /// streaming under the live pause state is re-synced (issue #68).
+    pub fn toggle_pane_auto_pause_exempt(&mut self, pane_id: &str) -> bool {
+        let exempt = !self.auto_pause_exempt_panes.contains(pane_id);
+        if exempt {
+            self.auto_pause_exempt_panes.insert(pane_id.to_string());
+        } else {
+            self.auto_pause_exempt_panes.remove(pane_id);
+        }
+        if self.visible_panes.iter().any(|p| p == pane_id) {
+            self.send_ws(ClientMessage::SetPaneNoAutoPause {
+                pane_id: pane_id.to_string(),
+                exempt,
+            });
+        }
+        exempt
+    }
+
+    /// Toggle a whole session's exemption from auto-pause and return the new
+    /// state. Asserts the change for every currently-visible pane of the session.
+    pub fn toggle_session_auto_pause_exempt(&mut self, word_id: &str) -> bool {
+        let exempt = !self.auto_pause_exempt_sessions.contains(word_id);
+        if exempt {
+            self.auto_pause_exempt_sessions.insert(word_id.to_string());
+        } else {
+            self.auto_pause_exempt_sessions.remove(word_id);
+        }
+        for pane_id in self.visible_panes.clone() {
+            let in_session = parse_pane_id(&pane_id)
+                .map(|(w, _)| w == word_id)
+                .unwrap_or(false);
+            if in_session {
+                self.send_ws(ClientMessage::SetPaneNoAutoPause { pane_id, exempt });
+            }
+        }
+        exempt
     }
 }

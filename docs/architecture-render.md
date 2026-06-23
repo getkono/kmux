@@ -9,7 +9,7 @@ frontends drive, so the cell-grid render leaf lives in one place.
 The GPU renderer is **compiled in by default** (the `gpu` feature is on, issue
 #132), so the standard build/test paths always cover it. The only opt-in is at
 **runtime**: each frontend keeps its CPU renderer as the startup default and
-switches to the GPU path when `KMUX_RENDERER=wgpu` is set. A lean, wgpu-free
+switches to the GPU path when `renderer = "gpu"` is set in `config.toml`. A lean, wgpu-free
 build is still available with `--no-default-features` (CI compiles that path too,
 via `mise run build-no-gpu`). Removing the CPU renderers outright is a deliberate
 follow-up (see [Status](#status)).
@@ -130,15 +130,19 @@ surface (uniffi's binding-checksum check guards the rest).
 ## Selecting the GPU path
 
 The `gpu` feature is on by default, so the renderer is already compiled in; these
-just flip the **runtime** switch.
+just flip the **runtime** switch via the `renderer` key in `config.toml`
+(`renderer = "gpu"`; default `"cairo"`). It is a config key — not a CLI flag —
+because a kmux GUI client is a singleton process, so a flag on a second launch
+would never reach the running renderer. The render-debug overlay
+(GTK `win.toggle-render-debug`, Swift ⌘⇧G) shows the **effective** renderer,
+which falls back to the CPU path if GPU init fails.
 
-- **GTK**: set the env — `KMUX_RENDERER=wgpu cargo run -p kmux-gtk`. Without it
-  GTK stays on Cairo; if no GPU adapter is available it logs and falls back to
-  Cairo.
+- **GTK**: `renderer = "gpu"` then `cargo run -p kmux-gtk`. Without it GTK stays
+  on Cairo; if no GPU adapter is available it logs and falls back to Cairo.
 - **Swift**: `mise run swift-gpu-run` (regenerates bindings that include
   `KmuxRenderer`, builds the app with `-DKMUX_GPU` so the Swift Metal view is
-  compiled, and runs with `KMUX_RENDERER=wgpu`). The default `mise run swift-run`
-  stays CoreText.
+  compiled, and selects the GPU path via a fixture `config.toml`). The default
+  `mise run swift-run` stays CoreText.
 
 Both clients write logs to the client log file (`mise run tail-client-log`); the
 GPU path logs adapter/surface setup, resizes, and frame errors there (raise
@@ -253,7 +257,7 @@ width for `Indeterminate`), looked up via `SessionManager::pane_info` (GTK) /
 `FfiPaneRect.progress_state`/`progress` (Swift, FFI ABI 16). State→colour: `Set`→accent,
 `Error`→red, `Pause`→orange, `Indeterminate`→accent, `Remove`→no bar. A
 `PaneProgressChanged` event marks the frame dirty so the bar updates live without a
-keystroke. The **GPU path** (`KMUX_RENDERER=wgpu`) does not yet draw the bar —
+keystroke. The **GPU path** (`renderer = "gpu"`) does not yet draw the bar —
 surfacing it through the shared `kmux-render` scene is a follow-up.
 
 ## Testing

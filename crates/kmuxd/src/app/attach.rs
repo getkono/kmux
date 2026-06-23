@@ -149,6 +149,10 @@ impl ServerApp {
                     ctrl_tx,
                     force_full_snapshot,
                     paused: false,
+                    pause_auto: false,
+                    // Reset on (re)attach; the client re-asserts any auto-pause
+                    // exemption for this pane via `SetPaneNoAutoPause` (issue #68).
+                    no_auto_pause: false,
                     capabilities,
                     size,
                 },
@@ -189,18 +193,39 @@ impl ServerApp {
     /// Covers both locally-hosted panes (the relays below) and the client's
     /// federated panes (`set_federated_paused`), so pausing a GUI viewing a proxied
     /// remote session stops its output too — not just local sessions.
-    pub async fn set_paused(&self, client_id: ClientId, paused: bool) {
+    pub async fn set_paused(&self, client_id: ClientId, paused: bool, auto: bool) {
         let sessions = self.sessions.read().await;
         for state in sessions.values() {
             for relay in state.panes.values() {
                 let mut map = relay.clients.lock().unwrap();
                 if let Some(sender) = map.get_mut(&client_id) {
                     sender.paused = paused;
+                    sender.pause_auto = auto;
                 }
             }
         }
         drop(sessions);
-        self.set_federated_paused(client_id, paused);
+        self.set_federated_paused(client_id, paused, auto);
+    }
+
+    /// Exempt (or un-exempt) a single pane from this client's *auto*-pause
+    /// (issue #68). An exempt pane keeps streaming through a background
+    /// auto-pause; a manual pause still stops it. No-op if the client is not
+    /// attached to the pane. Federated panes are handled by the federation layer.
+    pub async fn set_pane_no_auto_pause(&self, client_id: ClientId, pane_id: &str, exempt: bool) {
+        if let Some((word_id, pane_index)) = parse_pane_id(pane_id) {
+            let sessions = self.sessions.read().await;
+            if let Some(state) = sessions.get(word_id)
+                && let Some(relay) = state.panes.get(&pane_index)
+            {
+                let mut map = relay.clients.lock().unwrap();
+                if let Some(sender) = map.get_mut(&client_id) {
+                    sender.no_auto_pause = exempt;
+                }
+            }
+            drop(sessions);
+        }
+        self.set_federated_pane_no_auto_pause(client_id, pane_id, exempt);
     }
 
     /// Remove a client from a specific pane and release any lock they hold.

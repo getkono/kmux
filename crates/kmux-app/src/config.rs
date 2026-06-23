@@ -9,6 +9,47 @@ use tracing::error;
 use crate::appearance::{self, Appearance, CellAdjust, FontFeature};
 use crate::theme::{self, Theme};
 
+/// Terminal renderer backend.
+///
+/// Selected via the `renderer` key in `~/.config/kmux/config.toml`. It is a
+/// configuration key rather than a CLI flag on purpose: a kmux GUI client is
+/// effectively a singleton process (one app instance, many windows), so a flag
+/// passed to a *second* launch would route to the already-running process and
+/// never reach the live renderer. Reading it from config at process start is the
+/// only place the choice reliably applies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum RendererKind {
+    /// CPU renderer (Cairo on GTK, CoreText on macOS). The default.
+    #[default]
+    Cairo,
+    /// GPU renderer (wgpu on GTK, Metal on macOS) via the shared `kmux-render`
+    /// crate. `wgpu` is accepted as an alias for backward compatibility.
+    #[serde(alias = "wgpu")]
+    Gpu,
+}
+
+impl RendererKind {
+    /// The stable lowercase token used at the FFI boundary and in debug output
+    /// (`"cairo"` / `"gpu"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RendererKind::Cairo => "cairo",
+            RendererKind::Gpu => "gpu",
+        }
+    }
+
+    /// Parse a token (`"cairo"`, `"gpu"`, or the legacy `"wgpu"`), case-insensitive.
+    /// Returns `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "cairo" => Some(RendererKind::Cairo),
+            "gpu" | "wgpu" => Some(RendererKind::Gpu),
+            _ => None,
+        }
+    }
+}
+
 /// Top-level kmux configuration file (`~/.config/kmux/config.toml`).
 ///
 /// The file is optional; its absence is not an error.
@@ -72,6 +113,11 @@ pub struct KmuxConfig {
     /// hide them, which also skips their per-frame computation to save power.
     #[serde(skip_serializing_if = "Option::is_none", alias = "perf-counters")]
     pub perf_counters: Option<bool>,
+    /// Terminal renderer backend: `"cairo"` (CPU, default) or `"gpu"` (the
+    /// `kmux-render` GPU path; `"wgpu"` is accepted as an alias). `None` defaults
+    /// to `cairo`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub renderer: Option<RendererKind>,
 }
 
 /// Load `config.toml`, returning defaults if it is missing or unparseable.
@@ -221,6 +267,18 @@ pub fn resolve_cursor_blink(cli_value: Option<bool>) -> bool {
         return value;
     }
     true
+}
+
+/// Resolve the terminal renderer backend.
+///
+/// Reads the `renderer` key in `~/.config/kmux/config.toml`, defaulting to
+/// [`RendererKind::Cairo`]. This is config-only by design (see [`RendererKind`]):
+/// a singleton GUI client cannot honor a per-launch flag, so the choice lives in
+/// config and is read once at process start.
+pub fn resolve_renderer() -> RendererKind {
+    load_config_file()
+        .and_then(|cfg| cfg.renderer)
+        .unwrap_or_default()
 }
 
 /// Whether the `kmux` entrypoint should warn before opening a GUI inside a
@@ -498,6 +556,49 @@ status_bg = "#111111"
         );
         let back: KmuxConfig = toml::from_str(&serialized).unwrap();
         assert_eq!(back.warn_nested, Some(false));
+    }
+
+    #[test]
+    fn renderer_kind_parses_tokens_and_alias() {
+        assert_eq!(RendererKind::parse("cairo"), Some(RendererKind::Cairo));
+        assert_eq!(RendererKind::parse("GPU"), Some(RendererKind::Gpu));
+        assert_eq!(RendererKind::parse("wgpu"), Some(RendererKind::Gpu));
+        assert_eq!(RendererKind::parse("metal"), None);
+        assert_eq!(RendererKind::Gpu.as_str(), "gpu");
+        assert_eq!(RendererKind::Cairo.as_str(), "cairo");
+    }
+
+    #[test]
+    fn config_file_parses_renderer_field_and_wgpu_alias() {
+        let gpu: KmuxConfig = toml::from_str(r#"renderer = "gpu""#).unwrap();
+        assert_eq!(gpu.renderer, Some(RendererKind::Gpu));
+        let alias: KmuxConfig = toml::from_str(r#"renderer = "wgpu""#).unwrap();
+        assert_eq!(alias.renderer, Some(RendererKind::Gpu));
+        let cairo: KmuxConfig = toml::from_str(r#"renderer = "cairo""#).unwrap();
+        assert_eq!(cairo.renderer, Some(RendererKind::Cairo));
+    }
+
+    #[test]
+    fn resolve_renderer_defaults_to_cairo_when_unset() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        let r = resolve_renderer();
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert_eq!(r, RendererKind::Cairo);
+    }
+
+    #[test]
+    fn resolve_renderer_from_config_file() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let kmux_dir = tmp.path().join("kmux");
+        std::fs::create_dir_all(&kmux_dir).unwrap();
+        std::fs::write(kmux_dir.join("config.toml"), "renderer = \"gpu\"\n").unwrap();
+        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
+        let r = resolve_renderer();
+        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        assert_eq!(r, RendererKind::Gpu);
     }
 
     #[test]

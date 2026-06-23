@@ -76,10 +76,15 @@ pub(crate) struct Frontend {
     /// The CSS provider for the chrome/overlay theme, reloaded when the driver
     /// reports a palette change (`/theme`).
     css_provider: gtk4::CssProvider,
-    /// Opt-in GPU renderer (active only when `KMUX_RENDERER=wgpu` and an adapter
-    /// is available); otherwise inert and the Cairo path in `render` is used.
+    /// Opt-in GPU renderer (active only when `renderer = "gpu"` is set in
+    /// `config.toml` and an adapter is available); otherwise inert and the Cairo
+    /// path in `render` is used.
     #[cfg(feature = "gpu")]
     gpu: render_gpu::GpuState,
+    /// The renderer backend resolved from config, retained so the renderer can be
+    /// rebuilt (e.g. on a `ResetRenderer` effect) without re-reading config.
+    #[cfg(feature = "gpu")]
+    renderer: kmux_app::config::RendererKind,
 }
 
 /// Entry point for the interactive GTK frontend. Shares the CLI front door with
@@ -111,8 +116,18 @@ fn run_gui(plan: Plan) -> anyhow::Result<()> {
     // than adw::Application to avoid threading adw types through every helper).
     app.connect_startup(|_| {
         adw::init().expect("failed to initialize libadwaita");
+        // Make Powerline/Nerd glyphs available to Pango's fallback on the Cairo
+        // path before any window/PangoContext is created (issue #145).
+        register_symbol_fallback_font();
     });
     {
+        // New window per launch: `GtkApplication` (default flags) is a singleton
+        // keyed by `APP_ID`, so a second `kmux` launch — execing another
+        // `kmux-gtk` — routes its `activate` to this primary instance, which
+        // builds another independent window (its own `Frontend`/connection) here.
+        // This matches the macOS Swift app's single-instance/multi-window model.
+        // (Forwarding the *second* launch's args to its window would need
+        // `HANDLES_COMMAND_LINE`; today each window uses the first launch's plan.)
         let exit_error = exit_error.clone();
         app.connect_activate(move |app| build_ui(app, &plan, exit_error.clone()));
     }
@@ -121,6 +136,53 @@ fn run_gui(plan: Plan) -> anyhow::Result<()> {
         eprintln!("kmux: connection failed:\n{err}");
     }
     Ok(())
+}
+
+/// Register the bundled symbol fallback font (Powerline + Nerd glyphs) with
+/// fontconfig so Pango's automatic font fallback resolves glyphs the configured
+/// font lacks on the Cairo path (issue #145). Best-effort: any failure is logged
+/// and ignored (the GPU path has its own atlas fallback, and missing glyphs just
+/// stay as tofu as before). fontconfig has no add-from-memory API in the
+/// versions we target, so the embedded bytes are staged to a file under the
+/// runtime dir and that path is added.
+fn register_symbol_fallback_font() {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = match kmux_protocol::dirs::runtime_dir() {
+        Ok(dir) => dir.join("SymbolsNerdFontMono-Regular.ttf"),
+        Err(e) => {
+            tracing::warn!("symbol fallback font: cannot resolve runtime dir: {e}");
+            return;
+        }
+    };
+    // Rewrite every startup so the staged file matches the embedded bytes.
+    if let Err(e) = std::fs::write(&path, kmux_render::symbol_fallback_bytes()) {
+        tracing::warn!("symbol fallback font: write {} failed: {e}", path.display());
+        return;
+    }
+    let Ok(c_path) = CString::new(path.as_os_str().as_bytes()) else {
+        tracing::warn!("symbol fallback font: path has interior NUL");
+        return;
+    };
+    // SAFETY: `FcConfigGetCurrent` returns the live config (or null, which
+    // `FcConfigAppFontAddFile` treats as "the current config"); `c_path` is a
+    // valid NUL-terminated string that outlives the call.
+    let ok = unsafe {
+        let config = fontconfig_sys::FcConfigGetCurrent();
+        fontconfig_sys::FcConfigAppFontAddFile(
+            config,
+            c_path.as_ptr() as *const fontconfig_sys::FcChar8,
+        )
+    };
+    if ok == 0 {
+        tracing::warn!(
+            "symbol fallback font: fontconfig rejected {}",
+            path.display()
+        );
+    } else {
+        tracing::info!("symbol fallback font registered with fontconfig");
+    }
 }
 
 fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String>>>) {
@@ -184,7 +246,9 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
         metrics,
         css_provider,
         #[cfg(feature = "gpu")]
-        gpu: render_gpu::GpuState::new(&plan.appearance, &plan.theme),
+        gpu: render_gpu::GpuState::new(plan.renderer, &plan.appearance, &plan.theme),
+        #[cfg(feature = "gpu")]
+        renderer: plan.renderer,
     }));
 
     {
@@ -411,7 +475,8 @@ pub(crate) fn apply_effects(
                     #[cfg(feature = "gpu")]
                     {
                         let theme = f.core.palette.clone();
-                        f.gpu = render_gpu::GpuState::new(&appearance, &theme);
+                        let renderer = f.renderer;
+                        f.gpu = render_gpu::GpuState::new(renderer, &appearance, &theme);
                     }
                 }
                 tracing::info!(

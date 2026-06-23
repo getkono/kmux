@@ -13,7 +13,7 @@ use kmux_client::pipeline::ResolvedTarget;
 
 use crate::appearance::Appearance;
 use crate::cli::{Cli, Command};
-use crate::config;
+use crate::config::{self, RendererKind};
 use crate::subcommands::{
     KickClientConfig, ListClientsConfig, ListSessionsConfig, ProcessOverviewConfig, parse_target,
     run_daemon_command, run_debug_command, run_dry_run, run_kick_client, run_list_clients,
@@ -47,6 +47,9 @@ pub struct Plan {
     pub appearance: Appearance,
     /// Whether the inner-pane cursor blinks.
     pub cursor_blink: bool,
+    /// Terminal renderer backend resolved from `config.toml` (Cairo by default).
+    /// The GTK frontend uses this to decide whether to build the GPU path.
+    pub renderer: RendererKind,
     pub instance_id: String,
     /// Run this `(program, args)` in a fresh dedicated initial session instead
     /// of opening a shell. Currently populated only by `kmux diagnostic <test>`
@@ -244,6 +247,7 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
     let font = config::resolve_font(cli.font.as_deref());
     let appearance = config::resolve_appearance(cli.font.as_deref());
     let cursor_blink = config::resolve_cursor_blink(cli.cursor_blink);
+    let renderer = config::resolve_renderer();
 
     Ok(Launch::Interactive(Box::new(Plan {
         target,
@@ -254,6 +258,7 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         font,
         appearance,
         cursor_blink,
+        renderer,
         instance_id,
         initial_program,
     })))

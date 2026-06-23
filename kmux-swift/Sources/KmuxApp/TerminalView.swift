@@ -45,14 +45,18 @@ final class TerminalNSView: NSView {
     private var lastReportedCells: (cols: UInt16, rows: UInt16)?
 
     #if KMUX_GPU
-        /// When `KMUX_RENDERER=wgpu`, the grid is drawn by the shared GPU renderer
-        /// (kmux-render, over the FFI) into a `CAMetalLayer` instead of CoreText.
-        /// The view, input, sizing, and pump are otherwise unchanged: `needsDisplay`
-        /// routes to `updateLayer()` (Metal) instead of `draw(_:)` (CoreText).
-        private let gpuActive =
-            ProcessInfo.processInfo.environment["KMUX_RENDERER"]?.lowercased() == "wgpu"
+        /// When `renderer = "gpu"` is set in `~/.config/kmux/config.toml`, the grid
+        /// is drawn by the shared GPU renderer (kmux-render, over the FFI) into a
+        /// `CAMetalLayer` instead of CoreText. The view, input, sizing, and pump are
+        /// otherwise unchanged: `needsDisplay` routes to `updateLayer()` (Metal)
+        /// instead of `draw(_:)` (CoreText). Resolved from config (not an env var or
+        /// flag) because a singleton app cannot honor a per-launch flag.
+        private let gpuActive = resolveRenderer() == "gpu"
         private var gpuRenderer: KmuxRenderer?
         private var gpuDrawable: (w: UInt32, h: UInt32)?
+        /// Set when Metal renderer construction fails, so the render-debug overlay
+        /// reports the *effective* state rather than the requested one.
+        private var gpuInitFailed = false
     #endif
 
     init(model: KmuxModel) {
@@ -125,7 +129,9 @@ final class TerminalNSView: NSView {
                     driver: model.driver, layerPtr: ptr, width: w, height: h, scale: Float(scale))
                 gpuDrawable = (w, h)
                 if gpuRenderer == nil {
-                    NSLog("kmux-render: GPU renderer init failed; KMUX_RENDERER=wgpu had no effect")
+                    gpuInitFailed = true
+                    NSLog(
+                        "kmux-render: GPU renderer init failed; renderer = \"gpu\" had no effect")
                 }
             }
             guard let renderer = gpuRenderer else { return }
@@ -151,10 +157,15 @@ final class TerminalNSView: NSView {
         needsDisplay = true
     }
 
-    /// The active renderer leaf, for the render-debug overlay.
+    /// The *effective* renderer leaf, for the render-debug overlay — the renderer
+    /// actually drawing, which can differ from the configured one when GPU init
+    /// fails. The source of truth is live view state, not the config value.
     var activeRendererName: String {
         #if KMUX_GPU
-            return gpuActive ? "wgpu" : "coretext"
+            if gpuActive {
+                return gpuInitFailed ? "wgpu (init failed)" : "wgpu"
+            }
+            return "coretext"
         #else
             return "coretext"
         #endif
@@ -204,6 +215,35 @@ final class TerminalNSView: NSView {
                 ctx.fill(CGRect(x: px.minX, y: px.maxY - barH, width: barW, height: barH))
             }
         }
+
+        // Connection pause (issue #68): a ⏸ badge in each paused pane's top-right
+        // corner. Mirrors kmux-gtk's `paint_pause_badge`.
+        for rect in rects where rect.paused {
+            drawPauseBadge(rect, theme: theme, metrics: m, ctx: ctx)
+        }
+    }
+
+    /// Paint a small pause glyph (two bars on a pill) in a pane's top-right
+    /// corner while its output is paused (issue #68).
+    private func drawPauseBadge(
+        _ rect: FfiPaneRect, theme: FfiTheme, metrics m: TerminalMetrics, ctx: CGContext
+    ) {
+        let px = pixelRect(rect, metrics: m)
+        let pad: CGFloat = 6
+        let boxSz = min(16, px.width - 2 * pad, px.height - 2 * pad)
+        guard boxSz > 6 else { return }
+        let bx = px.maxX - boxSz - pad
+        let by = px.minY + pad
+        ctx.setFillColor(theme.statusBg.cgColor)
+        ctx.fill(CGRect(x: bx, y: by, width: boxSz, height: boxSz))
+        let barW = boxSz / 5
+        let barH = boxSz * 0.5
+        let gap = boxSz / 6
+        let barY = by + (boxSz - barH) / 2
+        let cx = bx + boxSz / 2
+        ctx.setFillColor(theme.orange.cgColor)
+        ctx.fill(CGRect(x: cx - gap / 2 - barW, y: barY, width: barW, height: barH))
+        ctx.fill(CGRect(x: cx + gap / 2, y: barY, width: barW, height: barH))
     }
 
     /// `(color, width-fraction)` for a pane's OSC 9;4 progress bar, or `nil` for

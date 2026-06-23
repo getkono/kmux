@@ -93,14 +93,18 @@ impl TransportKind {
 ///   is being respawned; the shell survives (issue #126, process isolation).
 /// - **31**: removed the unused singular `ClientMessage::PtyKey`; clients only
 ///   ever send `PtyKeyBatch` (a batch subsumes the single-key case).
-/// - **32**: cryptographic identity + client management (issue #146).
+/// - **32**: reason-aware connection pause — `ClientMessage::SetPaused` gains an
+///   `auto` flag and a new `ClientMessage::SetPaneNoAutoPause` exempts a pane
+///   from auto-pause, so a backgrounded client can keep streaming chosen panes
+///   while pausing the rest (issue #68).
+/// - **33**: cryptographic identity + client management (issue #146).
 ///   `ClientMessage::Auth` carries `public_key`/`hostname`/`username`; a
 ///   challenge–response handshake adds `ServerMessage::AuthChallenge` and
 ///   `ClientMessage::AuthProof`; `AuthResult` carries `machine_id`/`label`/
 ///   `server_machine_id`. New `ClientMessage::ClientList`/`KickClient`,
 ///   `ServerMessage::ClientListResult`/`ClientKicked`/`SessionKicked`, and the
 ///   `ClientInfo` struct expose listing and per-connection kicking of clients.
-pub const PROTOCOL_VERSION: u32 = 32;
+pub const PROTOCOL_VERSION: u32 = 33;
 
 /// Wire compression algorithm negotiated for a connection.
 ///

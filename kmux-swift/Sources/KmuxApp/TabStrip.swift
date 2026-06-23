@@ -16,14 +16,22 @@ struct TabStrip: View {
                 Button {
                     model.selectTab(tab.tabIndex)
                 } label: {
-                    Text(tab.name)
-                        .lineLimit(1)
-                        .padding(.horizontal, 10)
-                        .padding(.vertical, 4)
-                        .background(
-                            tab.active ? model.theme.accent.color.opacity(0.25) : Color.clear
-                        )
-                        .clipShape(RoundedRectangle(cornerRadius: 6))
+                    HStack(spacing: 4) {
+                        // Pause marker when any of the tab's panes is paused (issue #68).
+                        if tab.paused {
+                            Image(systemName: "pause.circle.fill")
+                                .font(.caption2)
+                                .foregroundStyle(.orange)
+                        }
+                        Text(tab.name)
+                            .lineLimit(1)
+                    }
+                    .padding(.horizontal, 10)
+                    .padding(.vertical, 4)
+                    .background(
+                        tab.active ? model.theme.accent.color.opacity(0.25) : Color.clear
+                    )
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
                 }
                 .buttonStyle(.plain)
                 .contextMenu {

@@ -153,8 +153,13 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   client's federated viewers (`set_federated_paused` → `PeerManager::set_paused`), and
   `fan_out` skips paused viewers (never marking them lagged) — matching the local relay.
   A paused viewer still counts toward smallest-wins sizing and resyncs on resume via
-  re-attach (which mints from the still-current mirror). Unit:
-  `fan_out_skips_paused_viewer_without_dropping_it`.
+  re-attach (which mints from the still-current mirror). The viewer pause is now
+  **reason-aware** and honors per-pane auto-pause exemptions (issue #68 follow-up): a
+  `Viewer` carries `pause_auto` + `no_auto_pause`, `fan_out` honors
+  `Viewer::output_paused()`, and `PeerManager::{set_paused, set_pane_no_auto_pause}` mirror
+  the local relay's `ClientSender` semantics. Units:
+  `fan_out_skips_paused_viewer_without_dropping_it`,
+  `fan_out_streams_auto_pause_exempt_viewer`.
 - **PR4 remaining facets** (independent, lower-risk; a naive forward would break
   multi-viewer correctness, so each needs real arbitration/filtering state):
   - **pause-*union* upstream** — when **all** local viewers of a proxied pane are paused,

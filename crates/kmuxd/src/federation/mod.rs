@@ -88,6 +88,21 @@ struct Viewer {
     /// catches up on resume via re-attach; it still counts toward `effective_size`,
     /// exactly as a paused client does in the local PTY relay.
     paused: bool,
+    /// When `paused`, whether the pause is the background auto-pause (`true`) vs a
+    /// manual pause (`false`); mirrors `ClientSender.pause_auto` (issue #68).
+    pause_auto: bool,
+    /// When true, this proxied pane is exempt from *auto*-pause for this viewer:
+    /// it keeps streaming through a background auto-pause, but a manual pause
+    /// still stops it. Mirrors `ClientSender.no_auto_pause` (issue #68).
+    no_auto_pause: bool,
+}
+
+impl Viewer {
+    /// Whether terminal-output frames for this proxied pane should be withheld
+    /// from this viewer — see [`crate::app::ClientSender::output_paused`].
+    fn output_paused(&self) -> bool {
+        self.paused && !(self.pause_auto && self.no_auto_pause)
+    }
 }
 
 /// A proxied pane: the local viewers sharing it, a [`CellGrid`] mirror fed from
@@ -162,8 +177,9 @@ impl ProxiedPane {
         for (&client_id, viewer) in self.viewers.iter() {
             // Paused viewers (issue #68) receive no terminal output and must never
             // be marked lagged or dropped when their channel fills — they resync on
-            // resume via re-attach. Same rule as `relay::broadcast_to_clients`.
-            if viewer.paused {
+            // resume via re-attach. Same rule as `relay::broadcast_to_clients`; an
+            // auto-pause-exempt pane keeps streaming through a background pause.
+            if viewer.output_paused() {
                 continue;
             }
             match viewer.data_tx.try_send(msg.clone()) {
@@ -1018,6 +1034,8 @@ impl PeerManager {
                     ctrl_tx,
                     size,
                     paused: false,
+                    pause_auto: false,
+                    no_auto_pause: false,
                 },
             );
             guard.reconcile_size(local_pane_id, &remote_pane);
@@ -1033,6 +1051,8 @@ impl PeerManager {
                     ctrl_tx,
                     size,
                     paused: false,
+                    pause_auto: false,
+                    no_auto_pause: false,
                 },
             );
             guard.panes.insert(local_pane_id.to_string(), pane);
@@ -1107,14 +1127,30 @@ impl PeerManager {
     /// mints from the still-current mirror) but still counts toward smallest-wins
     /// sizing — the same semantics as the local relay's `set_paused`. No-op for a
     /// client that views no federated panes.
-    pub fn set_paused(&self, client_id: ClientId, paused: bool) {
+    pub fn set_paused(&self, client_id: ClientId, paused: bool, auto: bool) {
         let conns: Vec<_> = self.peers.lock().unwrap().values().cloned().collect();
         for conn in conns {
             let mut guard = conn.lock().unwrap();
             for pane in guard.panes.values_mut() {
                 if let Some(viewer) = pane.viewers.get_mut(&client_id) {
                     viewer.paused = paused;
+                    viewer.pause_auto = auto;
                 }
+            }
+        }
+    }
+
+    /// Exempt (or un-exempt) one proxied pane from this viewer's *auto*-pause
+    /// (issue #68); see [`crate::app::ServerApp::set_pane_no_auto_pause`]. The
+    /// `local_pane_id` is the client-facing id, which is what `panes` is keyed by.
+    pub fn set_pane_no_auto_pause(&self, client_id: ClientId, local_pane_id: &str, exempt: bool) {
+        let conns: Vec<_> = self.peers.lock().unwrap().values().cloned().collect();
+        for conn in conns {
+            let mut guard = conn.lock().unwrap();
+            if let Some(pane) = guard.panes.get_mut(local_pane_id)
+                && let Some(viewer) = pane.viewers.get_mut(&client_id)
+            {
+                viewer.no_auto_pause = exempt;
             }
         }
     }
@@ -1481,6 +1517,8 @@ mod tests {
                 ctrl_tx,
                 size,
                 paused: false,
+                pause_auto: false,
+                no_auto_pause: false,
             },
             data_rx,
         )
@@ -1565,6 +1603,8 @@ mod tests {
                 ctrl_tx,
                 size: sz(24, 80),
                 paused: false,
+                pause_auto: false,
+                no_auto_pause: false,
             },
         );
 
@@ -1597,6 +1637,8 @@ mod tests {
                 ctrl_tx,
                 size: sz(24, 80),
                 paused: true,
+                pause_auto: false,
+                no_auto_pause: false,
             },
         );
 
@@ -1614,6 +1656,33 @@ mod tests {
     }
 
     #[test]
+    fn fan_out_streams_auto_pause_exempt_viewer() {
+        // An auto-paused viewer with a per-pane exemption keeps streaming through
+        // the background pause (issue #68); a manual pause would still skip it.
+        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(8);
+        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+
+        let mut pane = ProxiedPane::new(sz(24, 80));
+        pane.viewers.insert(
+            ClientId(5),
+            Viewer {
+                data_tx,
+                ctrl_tx,
+                size: sz(24, 80),
+                paused: true,
+                pause_auto: true,
+                no_auto_pause: true,
+            },
+        );
+
+        pane.fan_out("hawk/0", &snapshot_msg("hawk/0"));
+        assert!(
+            data_rx.try_recv().is_ok(),
+            "an auto-pause-exempt viewer keeps receiving frames"
+        );
+    }
+
+    #[test]
     fn fan_out_drops_closed_viewer_silently() {
         let (data_tx, data_rx) = mpsc::channel::<ServerMessage>(8);
         let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
@@ -1627,6 +1696,8 @@ mod tests {
                 ctrl_tx,
                 size: sz(24, 80),
                 paused: false,
+                pause_auto: false,
+                no_auto_pause: false,
             },
         );
 

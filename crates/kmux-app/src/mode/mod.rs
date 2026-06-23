@@ -178,6 +178,11 @@ pub enum Action {
     /// Toggle connection pause to save bandwidth (issue #68). Manual pauses
     /// persist across window focus changes (auto-pause clears independently).
     TogglePause,
+    /// Toggle the focused pane's exemption from *auto*-pause (issue #68): an
+    /// exempt pane keeps streaming when the window is backgrounded.
+    ToggleFocusedPaneNoAutoPause,
+    /// Toggle the active session's exemption from auto-pause (issue #68).
+    ToggleActiveSessionNoAutoPause,
 
     // Clipboard
     CopySelection,

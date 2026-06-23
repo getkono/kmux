@@ -54,6 +54,14 @@ pub use geometry::{
     SolidQuad, build_scene, cursor_geometry,
 };
 
+// The bundled glyph fallback font. The raw-bytes accessor is always compiled
+// (the CPU render paths register it in every build); only the swash `FontFace`
+// accessor needs the `text` tier.
+pub mod fallback;
+#[cfg(feature = "text")]
+pub use fallback::symbol_fallback;
+pub use fallback::symbol_fallback_bytes;
+
 #[cfg(feature = "text")]
 pub mod atlas;
 #[cfg(feature = "text")]

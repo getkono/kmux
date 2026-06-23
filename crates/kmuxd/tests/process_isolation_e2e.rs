@@ -1,6 +1,6 @@
 //! Cross-process integration test for session process isolation (issue #126).
 //!
-//! Spawns a *real* `kmuxd` with `KMUX_SESSION_ISOLATION=process`, so each pane's
+//! Spawns a *real* `kmuxd` with `--session-isolation process`, so each pane's
 //! VT pipeline runs in an isolated `kmux-vt-worker` subprocess. It then kills a
 //! worker abnormally (standing in for a libghostty-vt SIGSEGV) and asserts the
 //! headline invariant of #126: **the daemon survives**, the crashed pane
@@ -105,6 +105,8 @@ async fn spawn_daemon(exe: &Path) -> u32 {
             "0",
             "--tcp-port",
             "0",
+            "--session-isolation",
+            "process",
         ])
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
@@ -254,8 +256,8 @@ async fn worker_crash_is_isolated_from_the_daemon() {
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
     let worker_bin = ensure_worker_binary(&exe);
     set_env("KMUX_VT_WORKER_BIN", &worker_bin);
-    // SAFETY: ENV_LOCK held.
-    unsafe { std::env::set_var("KMUX_SESSION_ISOLATION", "process") };
+    // Process isolation is requested via the `--session-isolation process` flag
+    // that `spawn_daemon` passes (replaces the former KMUX_SESSION_ISOLATION env).
 
     let cleanup = Cleanup::default();
     let daemon_pid = spawn_daemon(&exe).await;

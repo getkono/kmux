@@ -105,11 +105,11 @@ in-process engine** for that pane, which is always safe.
 
 ## Opt-in rollout
 
-Isolation is selected per pane by `KMUX_SESSION_ISOLATION=process`. The default
-is in-process, mirroring how the GPU renderer shipped (`KMUX_RENDERER=wgpu`):
-the worker path is compiled and tested everywhere, but the runtime default is
-unchanged until it has soaked. Making isolation the default is a deliberate
-post-soak follow-up.
+Isolation is selected by `kmuxd --session-isolation process`, or by
+`[daemon] session_isolation = "process"` in `kmuxd.toml` (the form end users set,
+since the daemon is auto-spawned). The default is `in-process`: the worker path
+is compiled and tested everywhere, but the runtime default is unchanged until it
+has soaked. Making isolation the default is a deliberate post-soak follow-up.
 
 The daemon finds the worker binary via `$KMUX_VT_WORKER_BIN`, else next to its
 own executable, else on `PATH`.
@@ -150,7 +150,7 @@ the pane is left faulted.
   through the whole boundary (fd passing + handshake + steady stream) and
   asserts PTY output becomes a cell diff.
 - `kmuxd/tests/process_isolation_e2e.rs` — launches a real daemon with
-  `KMUX_SESSION_ISOLATION=process`, attaches a client, kills the worker, and
+  `--session-isolation process`, attaches a client, kills the worker, and
   asserts the daemon survives, the client sees `PaneFaulted`, the pane respawns
   and resyncs, and a fresh isolated session still works.
 
@@ -172,4 +172,4 @@ These are designed but intentionally deferred to keep this change reviewable:
   pane-addressed (`Hello` carries `pane_id`), so this is a supervisor/worker
   lifecycle change, not a wire change.
 - **Make isolation the default** after soak, then retire the in-process path or
-  keep it as the `KMUX_SESSION_ISOLATION=thread`-style fallback.
+  keep it as a `session_isolation = "thread"`-style fallback.

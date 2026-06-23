@@ -665,9 +665,17 @@ pub async fn handle_message<A: PaneAttacher>(
             debug!("client {client_id:?} snapshot mode = {enabled}");
         }
 
-        ClientMessage::SetPaused { paused } => {
-            state.app.set_paused(client_id, paused).await;
-            debug!("client {client_id:?} paused = {paused}");
+        ClientMessage::SetPaused { paused, auto } => {
+            state.app.set_paused(client_id, paused, auto).await;
+            debug!("client {client_id:?} paused = {paused} (auto = {auto})");
+        }
+
+        ClientMessage::SetPaneNoAutoPause { pane_id, exempt } => {
+            state
+                .app
+                .set_pane_no_auto_pause(client_id, &pane_id, exempt)
+                .await;
+            debug!("client {client_id:?} pane {pane_id} no_auto_pause = {exempt}");
         }
 
         ClientMessage::FetchHistory {
