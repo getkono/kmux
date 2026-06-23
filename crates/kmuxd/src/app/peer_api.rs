@@ -12,8 +12,8 @@
 //! locally-hosted one.
 
 use kmux_protocol::messages::{
-    ClientId, ClientMessage, PaneProcesses, PeerId, PeerTarget, SequenceNo, ServerMessage,
-    SessionEntry, TermSize,
+    ClientId, ClientInfo, ClientMessage, PaneProcesses, PeerId, PeerTarget, SequenceNo,
+    ServerMessage, SessionEntry, TermSize,
 };
 use tokio::sync::mpsc;
 
@@ -47,6 +47,61 @@ impl ServerApp {
         {
             let _ = pane_id;
             false
+        }
+    }
+
+    /// Whether the session `word_id` is proxied from a federated peer rather than
+    /// hosted locally (issue #146). Always `false` without the `federation`
+    /// feature. Session-level analogue of [`ServerApp::is_federated_pane`].
+    pub fn is_federated_session(&self, word_id: &str) -> bool {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.is_federated_session(word_id)
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = word_id;
+            false
+        }
+    }
+
+    /// Forward a [`ClientList`](ClientMessage::ClientList) for the federated
+    /// session `word_id` to the owning peer and return its connections (issue
+    /// #146). Errors when the peer is unknown/unreachable or without the feature.
+    pub async fn list_federated_session_clients(
+        &self,
+        word_id: &str,
+    ) -> Result<Vec<ClientInfo>, String> {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.list_session_clients(word_id).await
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = word_id;
+            Err("federation is not supported by this daemon yet".to_string())
+        }
+    }
+
+    /// Forward a [`KickClient`](ClientMessage::KickClient) for the federated
+    /// session `word_id` to the owning peer (issue #146). Errors when the peer is
+    /// unknown/unreachable, the client is not attached there, or without the
+    /// feature.
+    pub async fn kick_federated_client(
+        &self,
+        word_id: &str,
+        client_id: ClientId,
+    ) -> Result<(), String> {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager
+                .kick_session_client(word_id, client_id)
+                .await
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (word_id, client_id);
+            Err("federation is not supported by this daemon yet".to_string())
         }
     }
 
