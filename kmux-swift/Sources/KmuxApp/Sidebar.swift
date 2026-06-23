@@ -51,6 +51,17 @@ struct Sidebar: View {
                 )
                 .contextMenu {
                     Button("Rename…") { ui.renameTarget = item.session }
+                    // Keep the whole session streaming through a background
+                    // auto-pause (issue #68); checkmark reflects the current state.
+                    Button {
+                        model.driver.toggleSessionNoAutoPause(wordId: item.session.wordId)
+                    } label: {
+                        if model.driver.sessionNoAutoPause(wordId: item.session.wordId) {
+                            Label("Keep Streaming in Background", systemImage: "checkmark")
+                        } else {
+                            Text("Keep Streaming in Background")
+                        }
+                    }
                     Button("Close", role: .destructive) {
                         model.driver.closeSession(wordId: item.session.wordId)
                     }

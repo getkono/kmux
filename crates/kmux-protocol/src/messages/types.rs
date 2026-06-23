@@ -93,7 +93,11 @@ impl TransportKind {
 ///   is being respawned; the shell survives (issue #126, process isolation).
 /// - **31**: removed the unused singular `ClientMessage::PtyKey`; clients only
 ///   ever send `PtyKeyBatch` (a batch subsumes the single-key case).
-pub const PROTOCOL_VERSION: u32 = 31;
+/// - **32**: reason-aware connection pause — `ClientMessage::SetPaused` gains an
+///   `auto` flag and a new `ClientMessage::SetPaneNoAutoPause` exempts a pane
+///   from auto-pause, so a backgrounded client can keep streaming chosen panes
+///   while pausing the rest (issue #68).
+pub const PROTOCOL_VERSION: u32 = 32;
 
 /// Wire compression algorithm negotiated for a connection.
 ///

@@ -238,6 +238,12 @@ impl AppCore {
             Action::TogglePause => {
                 self.toggle_manual_pause();
             }
+            Action::ToggleFocusedPaneNoAutoPause => {
+                self.toggle_focused_pane_no_auto_pause();
+            }
+            Action::ToggleActiveSessionNoAutoPause => {
+                self.toggle_active_session_no_auto_pause();
+            }
             Action::CopySelection => {
                 if let Some(text) = self.mgr.active_grid().and_then(|g| g.selected_text()) {
                     return KeyResult::CopyToClipboard(text);

@@ -108,14 +108,35 @@ impl ServerApp {
     /// resume via re-attach. A no-op without the feature (or for a client viewing no
     /// federated panes). Complements [`ServerApp::set_paused`], which covers
     /// locally-hosted panes.
-    pub fn set_federated_paused(&self, client_id: ClientId, paused: bool) {
+    pub fn set_federated_paused(&self, client_id: ClientId, paused: bool, auto: bool) {
         #[cfg(feature = "federation")]
         {
-            self.peer_manager.set_paused(client_id, paused);
+            self.peer_manager.set_paused(client_id, paused, auto);
         }
         #[cfg(not(feature = "federation"))]
         {
-            let _ = (client_id, paused);
+            let _ = (client_id, paused, auto);
+        }
+    }
+
+    /// Exempt (or un-exempt) a single federated pane from `client_id`'s
+    /// *auto*-pause (issue #68). Complements
+    /// [`ServerApp::set_pane_no_auto_pause`] for locally-hosted panes. A no-op
+    /// without the feature or for a pane the client does not view federated.
+    pub fn set_federated_pane_no_auto_pause(
+        &self,
+        client_id: ClientId,
+        pane_id: &str,
+        exempt: bool,
+    ) {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager
+                .set_pane_no_auto_pause(client_id, pane_id, exempt);
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (client_id, pane_id, exempt);
         }
     }
 

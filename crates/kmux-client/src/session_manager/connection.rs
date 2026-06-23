@@ -136,6 +136,9 @@ impl SessionManager {
         self.session_list.clear();
         self.pane_sync.clear();
         self.input_locked.clear();
+        // A reconnect gets a fresh daemon that knows nothing of our pause state
+        // (issue #68); clear the mirror so the next reconcile re-sends it.
+        self.pause_applied = (false, false);
         self.set_connection_state(ConnectionState::Disconnected {
             reason: DisconnectReason::UserInitiated,
         });
@@ -149,6 +152,9 @@ impl SessionManager {
 
     pub fn mark_connection_lost_with(&mut self, reason: DisconnectReason) {
         self.ws_sender = None;
+        // The mirror is stale once the link drops; a reconnect re-sends pause
+        // state via the next reconcile (issue #68).
+        self.pause_applied = (false, false);
         self.set_connection_state(ConnectionState::Disconnected { reason });
     }
 

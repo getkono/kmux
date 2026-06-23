@@ -340,8 +340,9 @@ fn broadcast_to_clients(
         for (&client_id, sender) in map.iter() {
             // Paused clients (issue #68) receive no terminal-output frames. They
             // must NOT be marked lagged or dropped when their channel fills —
-            // they catch up on resume via re-attach reconciliation.
-            if sender.paused {
+            // they catch up on resume via re-attach reconciliation. A pane the
+            // client marked `no_auto_pause` keeps streaming through an auto-pause.
+            if sender.output_paused() {
                 continue;
             }
             let outgoing = if sender.force_full_snapshot {
@@ -447,6 +448,8 @@ mod tests {
                 ctrl_tx,
                 force_full_snapshot: false,
                 paused: false,
+                pause_auto: false,
+                no_auto_pause: false,
                 capabilities: Default::default(),
                 size: Default::default(),
             },
@@ -484,6 +487,8 @@ mod tests {
                 ctrl_tx,
                 force_full_snapshot: false,
                 paused: false,
+                pause_auto: false,
+                no_auto_pause: false,
                 capabilities: Default::default(),
                 size: Default::default(),
             },
@@ -517,6 +522,8 @@ mod tests {
                 ctrl_tx,
                 force_full_snapshot: false,
                 paused: false,
+                pause_auto: false,
+                no_auto_pause: false,
                 capabilities: Default::default(),
                 size: Default::default(),
             },
@@ -557,6 +564,8 @@ mod tests {
                     ctrl_tx: paused_ctrl_tx,
                     force_full_snapshot: false,
                     paused: true,
+                    pause_auto: false,
+                    no_auto_pause: false,
                     capabilities: Default::default(),
                     size: Default::default(),
                 },
@@ -568,6 +577,8 @@ mod tests {
                     ctrl_tx: active_ctrl_tx,
                     force_full_snapshot: false,
                     paused: false,
+                    pause_auto: false,
+                    no_auto_pause: false,
                     capabilities: Default::default(),
                     size: Default::default(),
                 },
@@ -614,6 +625,8 @@ mod tests {
                 ctrl_tx,
                 force_full_snapshot: false,
                 paused: true,
+                pause_auto: false,
+                no_auto_pause: false,
                 capabilities: Default::default(),
                 size: Default::default(),
             },

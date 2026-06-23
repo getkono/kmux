@@ -215,6 +215,35 @@ final class TerminalNSView: NSView {
                 ctx.fill(CGRect(x: px.minX, y: px.maxY - barH, width: barW, height: barH))
             }
         }
+
+        // Connection pause (issue #68): a ⏸ badge in each paused pane's top-right
+        // corner. Mirrors kmux-gtk's `paint_pause_badge`.
+        for rect in rects where rect.paused {
+            drawPauseBadge(rect, theme: theme, metrics: m, ctx: ctx)
+        }
+    }
+
+    /// Paint a small pause glyph (two bars on a pill) in a pane's top-right
+    /// corner while its output is paused (issue #68).
+    private func drawPauseBadge(
+        _ rect: FfiPaneRect, theme: FfiTheme, metrics m: TerminalMetrics, ctx: CGContext
+    ) {
+        let px = pixelRect(rect, metrics: m)
+        let pad: CGFloat = 6
+        let boxSz = min(16, px.width - 2 * pad, px.height - 2 * pad)
+        guard boxSz > 6 else { return }
+        let bx = px.maxX - boxSz - pad
+        let by = px.minY + pad
+        ctx.setFillColor(theme.statusBg.cgColor)
+        ctx.fill(CGRect(x: bx, y: by, width: boxSz, height: boxSz))
+        let barW = boxSz / 5
+        let barH = boxSz * 0.5
+        let gap = boxSz / 6
+        let barY = by + (boxSz - barH) / 2
+        let cx = bx + boxSz / 2
+        ctx.setFillColor(theme.orange.cgColor)
+        ctx.fill(CGRect(x: cx - gap / 2 - barW, y: barY, width: barW, height: barH))
+        ctx.fill(CGRect(x: cx + gap / 2, y: barY, width: barW, height: barH))
     }
 
     /// `(color, width-fraction)` for a pane's OSC 9;4 progress bar, or `nil` for
