@@ -755,6 +755,16 @@ mod tests {
         for i in 0..a.scrollback_len() {
             assert_eq!(b.scrollback().get(i), a.scrollback().get(i), "line {i}");
         }
+
+        // The desync oracle's contract: a reconstructed grid hashes identically
+        // to its source snapshot. This is what lets the server certify a seqno
+        // with `digest(server_snapshot)` and the client confirm with
+        // `digest(client.to_snapshot())`.
+        assert_eq!(
+            a.to_snapshot().digest(),
+            b.to_snapshot().digest(),
+            "round-tripped grid must share the source digest"
+        );
     }
 
     #[test]
