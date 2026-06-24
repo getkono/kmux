@@ -1,15 +1,27 @@
 # Releasing
 
-kmux ships prebuilt `kmux` + `kmuxd` binaries as GitHub Release assets. Releases
-are cut locally with one command and published by a tag-triggered workflow:
+kmux ships prebuilt binaries plus native packages as GitHub Release assets, and
+publishes to the AUR and a Homebrew tap. Releases are cut locally with one command
+and published by a tag-triggered workflow:
 
 ```sh
 mise run release 0.2.0
 ```
 
 That bumps the version, regenerates the changelog, commits, tags `v0.2.0`, and
-pushes. The tag push fires `.github/workflows/release.yml`, which builds native
-binaries for every target and attaches them to the release.
+pushes. The tag push fires `.github/workflows/release.yml`, which builds and
+publishes, per target:
+
+- relocatable tarballs (`kmux`, `kmuxd`, `kmux-vt-worker`, `libkmux_ghostty`, plus
+  the GTK GUI on Linux);
+- a signed + notarized macOS app inside a `.dmg` (Developer ID; secret-gated);
+- Debian/Ubuntu `.deb` and Fedora/RHEL `.rpm` for the full (`kmux`) and headless
+  (`kmux-headless`) flavors, via [nfpm](https://nfpm.goreleaser.com);
+- a `.flatpak` bundle (x86_64);
+- an AUR `kmux-bin` push and a Homebrew tap bump (both secret-gated).
+
+The packaging inputs live in [`packaging/`](../packaging) (see its README); the
+user-facing install matrix is [docs/installation.md](installation.md).
 
 The crates are `publish = false` — kmux is **not** published to crates.io. The
 unit of distribution is the binary tarball, not a registry crate.
@@ -73,10 +85,33 @@ always agree.
   | `aarch64-apple-darwin` | `macos-14` |
   | `x86_64-apple-darwin` | `macos-15-intel` |
 
-  Each leg runs `mise run package` and uploads the resulting tarball + `.sha256`.
+  Each leg runs `mise run package` and uploads the tarball + `.sha256`. The macOS
+  legs additionally build the GUI app (`mise run package-app`), codesign +
+  notarize it, and upload a `.dmg` — but only when the signing secrets are set
+  (the `prepare` job exposes `has_signing`).
+- **package-linux** (per Linux arch) downloads the tarball artifact, repoints the
+  rpath to the FHS libdir (`packaging/relocate-rpath.sh`), and builds the `.deb` +
+  `.rpm` for `kmux` and `kmux-headless` with nfpm.
+- **build-flatpak** / **release-flatpak** build the x86_64 `.flatpak` bundle and
+  attach it to the release (kept separate so a flatpak failure can't strip the
+  other assets).
 - **release** generates notes with git-cliff and publishes every artifact via
   `softprops/action-gh-release` with `overwrite_files: true`, so re-runs replace
   assets in place rather than duplicating them.
+- **publish-aur** (real tag pushes only) bumps the `kmux-bin` PKGBUILD + checksums
+  and pushes to the AUR; **update-tap** regenerates the Homebrew formula + cask and
+  pushes to `getkono/homebrew-tap`. Both are secret-gated.
+
+### Distribution secrets
+
+These GitHub secrets on `getkono/kmux` enable the secret-gated legs; until each is
+set, that leg is skipped and the rest of the release still publishes.
+
+| Secret(s) | Enables |
+|---|---|
+| `MACOS_CERT_P12_BASE64`, `MACOS_CERT_PASSWORD`, `KEYCHAIN_PASSWORD`, `MACOS_SIGN_IDENTITY`, `ASC_ISSUER_ID`, `ASC_KEY_ID`, `ASC_API_KEY_P8_BASE64` | macOS codesign + notarize → `.dmg` (and the Homebrew cask). The cert must be a **Developer ID Application** cert; the ASC values are an App Store Connect API key. |
+| `AUR_SSH_PRIVATE_KEY` | Pushing `kmux-bin` to the AUR. Needs an AUR account that owns `kmux-bin` with the public key registered; the first package must be created manually once. |
+| `HOMEBREW_TAP_TOKEN` | Pushing the formula + cask to `getkono/homebrew-tap` (a PAT with `contents: write` on that repo). |
 
 ## Packaging (`mise run package`) and the shared library
 
@@ -89,19 +124,25 @@ any other machine. (`kmux`, the client, does not link it.)
 
 So `mise run package` does more than copy two binaries:
 
-1. Builds `kmux` + `kmuxd` in release mode.
-2. Copies both, the shared library, and `README.md` into
+1. Builds `kmux` + `kmuxd` + `kmux-vt-worker` in release mode (the worker is the
+   process-isolation subprocess, issue #126; the daemon spawns it from beside its
+   own exe, so it must ship in every distribution).
+2. Copies the binaries, the shared library, `README.md`, and `LICENSE` into
    `dist/kmux-<ver>-<target>/`. The library path is read back from the binary's own
-   runpath, so it is always the exact artifact the binary was linked against.
-3. Rewrites `kmuxd`'s runpath so it loads the sibling library:
+   runpath, so it is always the exact artifact the binary was linked against. On
+   Linux it also stages `kmux-gtk` + its `.desktop` entry and icon under `share/`.
+3. Rewrites the runpath of `kmuxd` **and** `kmux-vt-worker` so they load the
+   sibling library:
    - Linux: `patchelf --set-rpath '$ORIGIN'`
    - macOS: `install_name_tool -change … @rpath/libkmux_ghostty.dylib` and
      `-add_rpath @loader_path`
 4. Strips the binaries, produces `kmux-<ver>-<target>.tar.gz`, and writes a
    `.sha256` sidecar (verify with `shasum -c`).
 
-The result runs from anywhere — `kmuxd` finds `libkmux_ghostty.{so,dylib}` next to
-itself, with no `LD_LIBRARY_PATH` or build tree required.
+The result runs from anywhere — `kmuxd` finds `libkmux_ghostty.{so,dylib}` and
+`kmux-vt-worker` next to itself, with no `LD_LIBRARY_PATH` or build tree required.
+The macOS GUI app is assembled separately by `mise run package-app` (reused by
+`mise run install` and the signing job); see [docs/building-macos.md](building-macos.md).
 
 ## Prerequisites
 
