@@ -275,12 +275,15 @@ lacks is drawn from the symbol font instead.
 - **GTK Cairo/Pango**: the font is registered with fontconfig
   (`FcConfigAppFontAddFile`, `kmux-gtk/src/imp.rs`); Pango's automatic fallback
   search then resolves missing glyphs from it.
-- **Swift CoreText**: registering the font alone is **not** enough — that only
-  makes it discoverable by name and does not add it to any cascade list. The
-  terminal faces in `TerminalMetrics` install it via `kCTFontCascadeListAttribute`
-  (prepended to the default cascade list), so `NSAttributedString.draw()`
-  substitutes it for missing glyphs while keeping the system's emoji/CJK
-  fallbacks.
+- **Swift CoreText**: resolved **per glyph** at draw time.
+  `TerminalMetrics.drawFont(for:base:)` asks the configured face whether it has
+  the glyph (`CTFontGetGlyphsForCharacters`, surrogate-safe so non-BMP Nerd
+  icons count) and, if not, draws that character straight from the bundled
+  symbol font; anything neither face has (emoji/CJK) falls through to
+  `NSAttributedString.draw`'s natural cascade. Registering the font or installing
+  it in a `kCTFontCascadeListAttribute` does **not** work — a custom cascade list
+  is silently ignored by CoreText on the system monospaced font (the default
+  `"monospace"` → SF Mono), which is exactly the case that matters.
 
 Verify visually with `kmux diagnostic glyphs` on each path; the diagnostic
 asserts nothing about pixels.

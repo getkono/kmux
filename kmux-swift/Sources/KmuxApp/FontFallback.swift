@@ -6,12 +6,12 @@ import KmuxBindings
 /// CoreText so app chrome can reference it by name. This mirrors the GPU atlas's
 /// embedded fallback and the GTK fontconfig registration (issue #145).
 ///
-/// Registration alone is NOT enough for the terminal grid: it only makes the
-/// font discoverable by name — it does not add it to any font's cascade list, so
-/// `NSAttributedString.draw()` still renders missing Powerline (U+E0B0–) and
-/// Nerd Private Use Area glyphs as tofu. The cascade list installed in
-/// `TerminalMetrics` (seeded from `symbolFallbackDescriptor`) is what actually
-/// resolves them. Best-effort and run exactly once.
+/// Registration is NOT what fixes the terminal grid: it only makes the font
+/// discoverable by name, and a custom cascade list is silently ignored by
+/// CoreText on the system monospaced font (the default). The grid instead
+/// resolves fallback *per glyph* — `TerminalMetrics.drawFont(for:base:)` draws
+/// a Powerline (U+E0B0–) or Nerd glyph the configured face lacks straight from
+/// the `symbolFallbackDescriptor` font. Best-effort and run exactly once.
 private let registerSymbolFallbackFontOnce: Void = {
     let bytes = symbolFallbackFontBytes()
     let data = Data(bytes)
@@ -33,9 +33,9 @@ private let registerSymbolFallbackFontOnce: Void = {
 
 /// A `CTFontDescriptor` for the bundled symbol fallback font, built once from the
 /// embedded bytes (independent of registration / PostScript name). `nil` only if
-/// the embedded font fails to parse. `TerminalMetrics` prepends it to each
-/// terminal face's cascade list so CoreText substitutes it for glyphs the
-/// configured font lacks (Powerline U+E0B0–, Nerd PUA icons).
+/// the embedded font fails to parse. `TerminalMetrics` builds its `symbolFont`
+/// from this and draws it per-glyph for the Powerline (U+E0B0–) and Nerd PUA
+/// icons the configured font lacks.
 let symbolFallbackDescriptor: CTFontDescriptor? = {
     let data = Data(symbolFallbackFontBytes())
     guard

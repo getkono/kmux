@@ -18,6 +18,10 @@ struct TerminalMetrics: Equatable {
     let fontItalic: NSFont
     /// Bold-italic face: an explicit family, else synthetic bold+italic.
     let fontBoldItalic: NSFont
+    /// The bundled symbol fallback font (Symbols Nerd Font Mono) at the
+    /// configured point size, used to draw Powerline/Nerd glyphs the configured
+    /// face lacks (issue #145). `nil` only if the embedded font fails to parse.
+    let symbolFont: NSFont?
     /// Advance width of a monospaced cell (after `adjust-cell-width`, ceil'd).
     let cellWidth: CGFloat
     /// Line height = ascent + descent (after `adjust-cell-height`, ceil'd).
@@ -33,16 +37,17 @@ struct TerminalMetrics: Equatable {
             family: appearance.family, size: size, style: appearance.style)
 
         let regular = TerminalMetrics.applyFeatures(rawBase, features: features)
-        self.font = TerminalMetrics.withSymbolFallback(regular)
-        self.fontBold = TerminalMetrics.withSymbolFallback(TerminalMetrics.applyFeatures(
+        self.font = regular
+        self.fontBold = TerminalMetrics.applyFeatures(
             TerminalMetrics.face(rawBase, family: appearance.familyBold, size: size, bold: true, italic: false),
-            features: features))
-        self.fontItalic = TerminalMetrics.withSymbolFallback(TerminalMetrics.applyFeatures(
+            features: features)
+        self.fontItalic = TerminalMetrics.applyFeatures(
             TerminalMetrics.face(rawBase, family: appearance.familyItalic, size: size, bold: false, italic: true),
-            features: features))
-        self.fontBoldItalic = TerminalMetrics.withSymbolFallback(TerminalMetrics.applyFeatures(
+            features: features)
+        self.fontBoldItalic = TerminalMetrics.applyFeatures(
             TerminalMetrics.face(rawBase, family: appearance.familyBoldItalic, size: size, bold: true, italic: true),
-            features: features))
+            features: features)
+        self.symbolFont = TerminalMetrics.makeSymbolFont(size: size)
 
         self.ascent = regular.ascender
         let descent = -regular.descender  // descender is negative
@@ -57,13 +62,11 @@ struct TerminalMetrics: Equatable {
     /// fallback and in tests.
     init(font: NSFont) {
         let size = font.pointSize
-        self.font = TerminalMetrics.withSymbolFallback(font)
-        self.fontBold = TerminalMetrics.withSymbolFallback(
-            TerminalMetrics.face(font, family: nil, size: size, bold: true, italic: false))
-        self.fontItalic = TerminalMetrics.withSymbolFallback(
-            TerminalMetrics.face(font, family: nil, size: size, bold: false, italic: true))
-        self.fontBoldItalic = TerminalMetrics.withSymbolFallback(
-            TerminalMetrics.face(font, family: nil, size: size, bold: true, italic: true))
+        self.font = font
+        self.fontBold = TerminalMetrics.face(font, family: nil, size: size, bold: true, italic: false)
+        self.fontItalic = TerminalMetrics.face(font, family: nil, size: size, bold: false, italic: true)
+        self.fontBoldItalic = TerminalMetrics.face(font, family: nil, size: size, bold: true, italic: true)
+        self.symbolFont = TerminalMetrics.makeSymbolFont(size: size)
         self.ascent = font.ascender
         let descent = -font.descender
         self.cellHeight = max(1, (font.ascender + descent).rounded(.up))
@@ -141,24 +144,42 @@ struct TerminalMetrics: Equatable {
         return NSFont(descriptor: desc, size: font.pointSize) ?? font
     }
 
-    /// Add the bundled symbol fallback font to `font`'s CoreText cascade list so
-    /// `NSAttributedString.draw()` substitutes it for the Powerline (U+E0B0–) and
-    /// Nerd Private Use Area glyphs the configured face lacks (issue #145).
-    /// Registering the font (`FontFallback`) only makes it discoverable by name;
-    /// the cascade list is what makes CoreText actually fall back to it. The
-    /// symbol descriptor is prepended to the font's *default* cascade list so PUA
-    /// glyphs resolve to it while the system's emoji/CJK fallbacks are preserved.
-    /// Returns `font` unchanged if the fallback descriptor or rebuilt face is
-    /// unavailable.
-    private static func withSymbolFallback(_ font: NSFont) -> NSFont {
-        guard let symbol = symbolFallbackDescriptor else { return font }
-        let defaults =
-            (CTFontCopyDefaultCascadeListForLanguages(font as CTFont, nil) as? [CTFontDescriptor])
-            ?? []
-        let cascade = [symbol] + defaults
-        let key = NSFontDescriptor.AttributeName(kCTFontCascadeListAttribute as String)
-        let desc = font.fontDescriptor.addingAttributes([key: cascade])
-        return NSFont(descriptor: desc, size: font.pointSize) ?? font
+    // MARK: - Symbol glyph fallback (issue #145)
+
+    /// Build the bundled symbol fallback font at `size`, or `nil` if the embedded
+    /// font failed to parse. Drawing Powerline/Nerd glyphs with this directly
+    /// (per-glyph, in `drawFont(for:base:)`) is what actually resolves them:
+    /// installing it in the configured face's `kCTFontCascadeListAttribute` is
+    /// silently ignored by CoreText on the system monospaced font (the default).
+    private static func makeSymbolFont(size: CGFloat) -> NSFont? {
+        guard let desc = symbolFallbackDescriptor else { return nil }
+        return CTFontCreateWithFontDescriptor(desc, size, nil) as NSFont
+    }
+
+    /// True if `font` has its *own* glyph for every Unicode scalar of `ch` (no
+    /// cascade). Surrogate-safe: a non-BMP scalar's glyph lands in slot 0 with a
+    /// benign 0 in the trailing-surrogate slot, so we check slot 0 — never
+    /// `contains(0)`, which would false-negative every non-BMP glyph.
+    static func hasGlyph(_ font: NSFont, for ch: Character) -> Bool {
+        let ct = font as CTFont
+        for scalar in ch.unicodeScalars {
+            var units = Array(String(scalar).utf16)
+            var glyphs = [CGGlyph](repeating: 0, count: units.count)
+            _ = CTFontGetGlyphsForCharacters(ct, &units, &glyphs, units.count)
+            if glyphs[0] == 0 { return false }
+        }
+        return true
+    }
+
+    /// The face to draw `ch` with: the configured `base` face when it has the
+    /// glyph; otherwise the bundled symbol font for the Powerline (U+E0B0–) and
+    /// Nerd glyphs `base` lacks; otherwise `base` again, so
+    /// `NSAttributedString.draw`'s natural cascade still resolves emoji/CJK
+    /// (issue #145). Mirrors the GPU atlas's per-glyph fallback in `atlas.rs`.
+    func drawFont(for ch: Character, base: NSFont) -> NSFont {
+        if TerminalMetrics.hasGlyph(base, for: ch) { return base }
+        if let symbol = symbolFont, TerminalMetrics.hasGlyph(symbol, for: ch) { return symbol }
+        return base
     }
 
     /// Parse a `"tag=value"` (or bare `"tag"`) feature setting into a 4-char
