@@ -473,7 +473,9 @@ impl SessionManager {
             } => {
                 let start = Instant::now();
                 let grid = self.buffers.entry(pane_id.clone()).or_default();
-                grid.apply_snapshot(snapshot);
+                // The client owns its freshly-decoded Arc (refcount 1), so this
+                // moves the grid out rather than cloning it.
+                grid.apply_snapshot(Arc::unwrap_or_clone(snapshot));
                 self.mark_synced(pane_id, seqno, start, sent_at_ms);
             }
 

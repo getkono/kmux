@@ -1009,7 +1009,7 @@ mod tests {
         };
         mgr.handle_server_message(ServerMessage::TerminalSnapshot {
             pane_id: "eagle/0".to_string(),
-            snapshot,
+            snapshot: snapshot.into(),
             seqno: SequenceNo(5),
             sent_at_ms: 0,
         });
@@ -1877,7 +1877,7 @@ mod tests {
         let pane = "s1/0".to_string();
         mgr.handle_server_message(ServerMessage::TerminalSnapshot {
             pane_id: pane.clone(),
-            snapshot: digest_snapshot(),
+            snapshot: digest_snapshot().into(),
             seqno: SequenceNo(seqno),
             sent_at_ms: 0,
         });

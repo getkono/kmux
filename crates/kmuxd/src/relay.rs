@@ -405,7 +405,7 @@ fn broadcast_to_clients(
             }
             let outgoing = if sender.force_full_snapshot {
                 snapshot_msg.get_or_insert_with(|| {
-                    let snapshot = snapshot_fn();
+                    let snapshot = Arc::new(snapshot_fn());
                     ServerMessage::TerminalSnapshot {
                         pane_id: pane_id.to_string(),
                         snapshot,

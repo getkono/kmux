@@ -495,7 +495,7 @@ mod tests {
         };
         let msg = ServerMessage::TerminalSnapshot {
             pane_id: "eagle/0".to_string(),
-            snapshot,
+            snapshot: std::sync::Arc::new(snapshot),
             seqno: SequenceNo(99),
             sent_at_ms: 0,
         };

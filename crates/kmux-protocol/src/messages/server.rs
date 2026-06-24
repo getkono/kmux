@@ -191,9 +191,15 @@ pub enum ServerMessage {
     },
 
     /// Full grid snapshot for an attached pane (sent on attach/resize).
+    ///
+    /// `Arc`-wrapped so the daemon can fan the same snapshot out to several
+    /// clients (multiple GUIs on one session, federation mirrors,
+    /// force-full-snapshot viewers) with O(1) clones instead of deep-copying the
+    /// whole grid per recipient. Postcard serialises `Arc<T>` exactly as `T`, so
+    /// the wire format is unchanged.
     TerminalSnapshot {
         pane_id: PaneId,
-        snapshot: GridSnapshot,
+        snapshot: Arc<GridSnapshot>,
         seqno: SequenceNo,
         /// Wall-clock timestamp (ms since Unix epoch) when the server sent this message.
         sent_at_ms: u64,
@@ -437,7 +443,7 @@ mod tests {
             (
                 ServerMessage::TerminalSnapshot {
                     pane_id: "p".into(),
-                    snapshot: dummy_grid_snapshot(),
+                    snapshot: std::sync::Arc::new(dummy_grid_snapshot()),
                     seqno: SequenceNo(1),
                     sent_at_ms: 0,
                 },

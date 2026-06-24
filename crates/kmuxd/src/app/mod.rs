@@ -313,7 +313,7 @@ impl PaneRelay {
                 size: new_size,
             },
         };
-        let snapshot = self.engine.snapshot();
+        let snapshot = std::sync::Arc::new(self.engine.snapshot());
         let snap_msg = kmux_protocol::messages::ServerMessage::TerminalSnapshot {
             pane_id: pane_id.to_string(),
             snapshot,
