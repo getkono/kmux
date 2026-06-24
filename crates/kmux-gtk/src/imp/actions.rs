@@ -191,6 +191,7 @@ pub fn install(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application)
     add_toggle_sidebar(shell);
     add_preferences(shell, fe);
     add_help(shell);
+    add_about(shell);
     add_quit(shell, app);
 
     app.set_accels_for_action("win.command", &["<Ctrl><Shift>p"]);
@@ -300,6 +301,31 @@ fn add_quit(shell: &Rc<Shell>, app: &Application) {
     shell.window.add_action(&act);
 }
 
+/// "About kmux": the native `adw::AboutWindow` showing the full version matrix —
+/// the same data `kmux -V` and the Swift About panel surface — so the running
+/// build is verifiable. The matrix (build identity + linked boundary versions)
+/// goes in the standard "Debugging Information" view, copyable with one click.
+fn add_about(shell: &Rc<Shell>) {
+    let act = gio::SimpleAction::new("about", None);
+    let s = shell.clone();
+    act.connect_activate(move |_, _| {
+        let v = kmux_app::version::VersionInfo::current();
+        let about = adw::AboutWindow::builder()
+            .application_name("kmux")
+            .application_icon(super::APP_ID)
+            .version(format!("{} ({})", v.semver, v.commit()))
+            .comments("A terminal multiplexer with remote desktop.")
+            .website("https://github.com/getkono/kmux")
+            .issue_url("https://github.com/getkono/kmux/issues")
+            .debug_info(v.long_string())
+            .transient_for(&s.window)
+            .modal(true)
+            .build();
+        about.present();
+    });
+    shell.window.add_action(&act);
+}
+
 /// The primary (hamburger) menu model.
 fn build_menu() -> gio::Menu {
     let menu = gio::Menu::new();
@@ -349,6 +375,7 @@ fn build_menu() -> gio::Menu {
     let s5 = gio::Menu::new();
     s5.append(Some("Preferences"), Some("win.preferences"));
     s5.append(Some("Keyboard Shortcuts"), Some("win.help"));
+    s5.append(Some("About kmux"), Some("win.about"));
     s5.append(Some("Quit"), Some("win.quit"));
     menu.append_section(None, &s5);
 

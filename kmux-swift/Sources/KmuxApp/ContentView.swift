@@ -20,6 +20,23 @@ struct ContentView: View {
     @ObservedObject var ui: UIState
     @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
+    /// At-a-glance dev-build marker (`kmux (dev) · <sha>[-dirty]`), or `nil` for a
+    /// release build. Gated on the FFI build profile so it's truthful about the
+    /// linked binary; lets you confirm `./kmux` launched the freshly built GUI.
+    private static let devMarker: String? = {
+        let v = kmuxFfiVersionInfo()
+        guard v.buildProfile == "debug" else { return nil }
+        return "kmux (dev) · \(v.gitDirty ? "\(v.gitSha)-dirty" : v.gitSha)"
+    }()
+
+    /// Title-bar subtitle: the connection label, prefixed with the dev marker on
+    /// debug builds.
+    private var windowSubtitle: String {
+        guard let marker = Self.devMarker else { return model.connection.label }
+        let label = model.connection.label
+        return label.isEmpty ? marker : "\(marker) — \(label)"
+    }
+
     var body: some View {
         NavigationSplitView(columnVisibility: $columnVisibility) {
             Sidebar(model: model, ui: ui)
@@ -29,7 +46,7 @@ struct ContentView: View {
         }
         .preferredColorScheme(model.theme.isDark ? .dark : .light)
         .navigationTitle(activeSessionName)
-        .navigationSubtitle(model.connection.label)
+        .navigationSubtitle(windowSubtitle)
         .toolbar { toolbar }
         .sheet(isPresented: $ui.commandPalette) {
             CommandPaletteView(model: model, isPresented: $ui.commandPalette)
@@ -299,6 +316,12 @@ struct KmuxCommands: Commands {
         CommandGroup(replacing: .help) {
             Button("kmux Help") { ui?.help = true }
                 .keyboardShortcut("?", modifiers: [.command])
+        }
+        // Replace the stock "About kmux" with our native panel showing the full
+        // version matrix (build identity + linked boundary versions), so the
+        // running build is verifiable at a glance (issue: dev/prod dispatch).
+        CommandGroup(replacing: .appInfo) {
+            Button("About kmux") { AboutPanel.show() }
         }
     }
 
