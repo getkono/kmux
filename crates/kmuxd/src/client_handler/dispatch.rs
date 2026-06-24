@@ -834,6 +834,21 @@ pub async fn handle_message<A: PaneAttacher>(
             }
         }
 
+        ClientMessage::Notify {
+            request_id,
+            pane_id,
+            kind,
+            title,
+            body,
+        } => match state
+            .app
+            .notify_pane_attention(&pane_id, kind, title, body)
+            .await
+        {
+            Ok(()) => state.send(ServerMessage::NotifyAccepted { request_id }),
+            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
+        },
+
         ClientMessage::Ping { seq } => {
             state.send(ServerMessage::Pong { seq });
         }

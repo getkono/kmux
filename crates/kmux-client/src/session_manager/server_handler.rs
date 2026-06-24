@@ -760,6 +760,11 @@ impl SessionManager {
             // A close ack needs no app-level reconciliation (the peer's sessions
             // simply stop appearing in the next `SessionList`).
             ServerMessage::PeerClosed { .. } => {}
+
+            // Reply to `ClientMessage::Notify` (issue #169). Consumed directly by
+            // the `kmux notify` CLI's own read loop, not the streaming session
+            // manager — ignore here for exhaustiveness.
+            ServerMessage::NotifyAccepted { .. } => {}
         }
         events
     }
