@@ -6,7 +6,7 @@ resolver = "2"
 version = "0.2.0"
 edition = "2024"
 authors = ["Justin Chung <noreply@justinchung.net>"]
-license = "LicenseRef-Proprietary"
+license = "AGPL-3.0-only OR LicenseRef-Commercial"
 repository = "https://github.com/getkono/kmux"
 publish = false
 
