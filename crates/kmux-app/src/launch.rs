@@ -6,7 +6,6 @@
 //! describing the interactive session to launch. Each frontend then builds its
 //! own `AppCore` from the plan (supplying its own capabilities) and runs.
 
-use clap::Parser;
 use tracing_subscriber::EnvFilter;
 
 use kmux_client::pipeline::ResolvedTarget;
@@ -139,7 +138,26 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
 
     init_logging(&instance_id);
 
-    let cli = Cli::parse();
+    // Parse with the version string overridden to the full matrix at runtime
+    // (clap's derive `version` is a compile-time literal and can't embed the
+    // const protocol/render numbers). `-V`/`--version` print
+    // `kmux <VersionInfo::long_string()>`; the GUIs show the same matrix in About.
+    let cli = {
+        use clap::FromArgMatches;
+        // clap's `version` wants a `'static` string; the matrix is built at
+        // runtime, so leak it once (process-lifetime, negligible).
+        let version: &'static str = Box::leak(
+            crate::version::VersionInfo::current()
+                .long_string()
+                .into_boxed_str(),
+        );
+        let mut cmd = Cli::command().version(version);
+        let matches = cmd.get_matches_mut();
+        match Cli::from_arg_matches(&matches) {
+            Ok(cli) => cli,
+            Err(e) => e.format(&mut cmd).exit(),
+        }
+    };
 
     // Most subcommands are non-interactive and short-circuit before any frontend
     // setup. `kmux diagnostic <test>` is the exception: it falls through to an

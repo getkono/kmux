@@ -90,6 +90,47 @@ pub fn kmux_ffi_abi_version() -> u32 {
     KMUX_FFI_ABI_VERSION
 }
 
+/// Build + version metadata for the Swift app's "About" panel — the same matrix
+/// `kmux -V` prints, plus this binary's renderer API and FFI ABI versions. Mirror
+/// of [`kmux_app::version::VersionInfo`] flattened for uniffi.
+#[derive(uniffi::Record)]
+pub struct FfiVersionInfo {
+    /// Crate semver, e.g. `"0.2.0"`.
+    pub semver: String,
+    /// Short git commit (or `"unknown"`).
+    pub git_sha: String,
+    /// Working tree had uncommitted changes at build time.
+    pub git_dirty: bool,
+    /// Build date, `YYYY-MM-DD`.
+    pub build_date: String,
+    /// Cargo profile (`"debug"` / `"release"`).
+    pub build_profile: String,
+    /// Client↔daemon wire protocol version.
+    pub protocol: u32,
+    /// Renderer API version (this binary links `kmux-render`).
+    pub render_api: u32,
+    /// FFI C-ABI version ([`KMUX_FFI_ABI_VERSION`]).
+    pub ffi_abi: u32,
+}
+
+/// Version + build metadata for the Swift "About" panel. The build identity
+/// (semver, git SHA + dirty, date, profile) is what makes a running build
+/// verifiable; the protocol/render/FFI numbers pin the linked boundaries.
+#[uniffi::export]
+pub fn kmux_ffi_version_info() -> FfiVersionInfo {
+    let v = kmux_app::version::VersionInfo::current();
+    FfiVersionInfo {
+        semver: v.semver.to_string(),
+        git_sha: v.git_sha.to_string(),
+        git_dirty: v.git_dirty,
+        build_date: v.build_date.to_string(),
+        build_profile: v.build_profile.to_string(),
+        protocol: v.protocol,
+        render_api: kmux_render::KMUX_RENDER_API_VERSION,
+        ffi_abi: KMUX_FFI_ABI_VERSION,
+    }
+}
+
 /// The terminal renderer backend resolved from `~/.config/kmux/config.toml`
 /// (`"cairo"` or `"gpu"`), as a stable lowercase token. The Swift frontend calls
 /// this once at startup to decide whether to build the Metal path — the renderer

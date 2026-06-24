@@ -107,7 +107,17 @@ pub(crate) fn run() -> anyhow::Result<()> {
 
 /// Run the GTK application for an interactive session built from `plan`.
 fn run_gui(plan: Plan) -> anyhow::Result<()> {
-    let app = Application::builder().application_id(APP_ID).build();
+    // Release builds keep the D-Bus single-instance lock (a second `kmux` routes
+    // its `activate` to the primary, which opens a new window). Debug builds opt
+    // OUT (`NON_UNIQUE`) so a freshly built `./kmux` always runs ITS OWN process
+    // and code instead of handing off to a possibly-stale primary — the launcher
+    // also kills the prior dev instance, so there is still exactly one. This is
+    // what makes a dev rebuild verifiable.
+    let mut builder = Application::builder().application_id(APP_ID);
+    if cfg!(debug_assertions) {
+        builder = builder.flags(gio::ApplicationFlags::NON_UNIQUE);
+    }
+    let app = builder.build();
     let plan = Rc::new(plan);
     // A fatal bootstrap error is shown in-window (disconnect overlay) and also
     // surfaced to stderr after teardown, mirroring the TUI's stashed-error path.
