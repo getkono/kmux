@@ -297,6 +297,13 @@ pub enum ServerMessage {
     /// another client (issue #146), so its UI can leave the session. `by_label`
     /// is the user-readable label of the connection that issued the kick.
     SessionKicked { word_id: WordId, by_label: String },
+
+    /// Acknowledges a [`super::client::ClientMessage::Notify`] (issue #169): the
+    /// pane was valid and the attention was broadcast as a
+    /// [`super::session::SessionEventMsg::PaneAttention`]. The actual
+    /// notification is surfaced by the GUI clients; this just confirms the
+    /// request reached the owning daemon (an unknown pane yields `Error`).
+    NotifyAccepted { request_id: RequestId },
 }
 
 impl ServerMessage {
@@ -335,7 +342,8 @@ impl ServerMessage {
             | Self::PeerError { .. }
             | Self::ClientListResult { .. }
             | Self::ClientKicked { .. }
-            | Self::SessionKicked { .. } => MessageCategory::Control,
+            | Self::SessionKicked { .. }
+            | Self::NotifyAccepted { .. } => MessageCategory::Control,
             Self::Lagged { .. } | Self::SyncReset { .. } => MessageCategory::Sync,
             Self::AuthChallenge { .. } | Self::AuthResult { .. } | Self::ChannelSwitched { .. } => {
                 MessageCategory::Bootstrap

@@ -108,7 +108,12 @@ impl TransportKind {
 ///   `ClientMessage::SessionListClosed`/`SessionRestore` and
 ///   `ServerMessage::ClosedSessionListResult` (carrying `ClosedSessionEntry`)
 ///   let clients list and restore sessions retained in the daemon's graveyard.
-pub const PROTOCOL_VERSION: u32 = 34;
+/// - **35**: Claude Code integration (issue #169). New `ClientMessage::Notify`
+///   lets a program inside a pane request a desktop notification; the daemon
+///   broadcasts `SessionEventMsg::PaneAttention` (carrying an `AttentionKind`
+///   and a server-assigned `attention_id` for client-side dedup) and replies
+///   `ServerMessage::NotifyAccepted`.
+pub const PROTOCOL_VERSION: u32 = 35;
 
 /// Wire compression algorithm negotiated for a connection.
 ///

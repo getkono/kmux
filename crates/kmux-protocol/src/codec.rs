@@ -292,6 +292,49 @@ mod tests {
     }
 
     #[test]
+    fn roundtrip_client_notify() {
+        let msg = ClientMessage::Notify {
+            request_id: 7,
+            pane_id: "eagle/0".to_string(),
+            kind: AttentionKind::NeedsInput,
+            title: "Claude".to_string(),
+            body: "needs your input".to_string(),
+        };
+        let bytes = encode_client(&msg).expect("encode");
+        let decoded = decode_client(&bytes).expect("decode");
+        assert!(matches!(
+            &decoded,
+            ClientMessage::Notify { kind: AttentionKind::NeedsInput, pane_id, .. }
+                if pane_id == "eagle/0"
+        ));
+    }
+
+    #[test]
+    fn roundtrip_pane_attention_event() {
+        let msg = ServerMessage::Event {
+            event: SessionEventMsg::PaneAttention {
+                pane_id: "eagle/0".to_string(),
+                kind: AttentionKind::TurnDone,
+                title: "Claude".to_string(),
+                body: "finished a turn".to_string(),
+                attention_id: 42,
+            },
+        };
+        let bytes = encode_server(&msg).expect("encode");
+        let decoded = decode_server(&bytes).expect("decode");
+        assert!(matches!(
+            &decoded,
+            ServerMessage::Event {
+                event: SessionEventMsg::PaneAttention {
+                    kind: AttentionKind::TurnDone,
+                    attention_id: 42,
+                    ..
+                }
+            }
+        ));
+    }
+
+    #[test]
     fn roundtrip_client_attach_with_seqno() {
         let msg = ClientMessage::Attach {
             pane_id: "eagle/0".to_string(),
