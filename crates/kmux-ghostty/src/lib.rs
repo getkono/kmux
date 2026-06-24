@@ -506,7 +506,18 @@ impl Drop for GhosttyTerm {
 
 fn convert_cell(c: &sys::KmuxCell) -> CellState {
     CellState {
-        c: char::from_u32(c.codepoint).unwrap_or(' '),
+        // libghostty reports an empty cell as codepoint 0, which `char::from_u32`
+        // maps to NUL ('\0'). Normalise it to a space so "blank" has a single
+        // representation everywhere in the pipeline: `CellState::default()`,
+        // `DiffOp::Clear`, and the diff engine's blank baseline all use ' '.
+        // Without this, a program writing a literal space over a never-written
+        // cell yields no diff (' ' equals the ' ' baseline) while a fresh
+        // snapshot still carries the original '\0' — the two representations
+        // render identically but silently desync a client's grid from the
+        // server's (caught by the grid-digest oracle).
+        c: char::from_u32(c.codepoint)
+            .filter(|&ch| ch != '\0')
+            .unwrap_or(' '),
         fg: rgba_to_color(c.fg_rgba),
         bg: rgba_to_color(c.bg_rgba),
         attrs: kmux_protocol::messages::CellAttrs(c.attrs),
