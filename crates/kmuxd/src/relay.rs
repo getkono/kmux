@@ -286,6 +286,12 @@ pub(crate) fn dispatch_diff_result(
                 }
                 broadcast_to_clients(pane_id, &update_msg, clients, snapshot_fn, update_seqno);
             }
+
+            // Certify the grid as of this viewport seqno, after the data it
+            // covers — on the same channel so it can never overtake that data.
+            if digest_due(update_seqno.0) {
+                broadcast_grid_digest(pane_id, clients, snapshot_fn, update_seqno);
+            }
         }
         DiffResult::CursorOnly {
             cursor,
@@ -316,11 +322,63 @@ pub(crate) fn dispatch_diff_result(
                     sent_at_ms: sent_at,
                 };
                 broadcast_to_clients(pane_id, &msg, clients, snapshot_fn, seqno);
+                if digest_due(seqno.0) {
+                    broadcast_grid_digest(pane_id, clients, snapshot_fn, seqno);
+                }
             }
         }
         DiffResult::None => {
             debug!(pane_id, "flush_cell_diff: no changes");
         }
+    }
+}
+
+/// Default cadence (in seqnos) at which the daemon certifies a pane's grid with
+/// a `GridDigest`. Throttled because each digest recomputes a full grid hash;
+/// 1-in-N keeps the hot path cheap while still catching drift within a few
+/// frames. Overridable via `KMUX_GRID_DIGEST_INTERVAL` (1 = every frame, used by
+/// the conformance/e2e tests).
+const DIGEST_SEQNO_INTERVAL: u64 = 32;
+
+/// Whether a `GridDigest` should be emitted for this seqno.
+fn digest_due(seqno: u64) -> bool {
+    static INTERVAL: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let interval = *INTERVAL.get_or_init(|| {
+        std::env::var("KMUX_GRID_DIGEST_INTERVAL")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .filter(|&n| n > 0)
+            .unwrap_or(DIGEST_SEQNO_INTERVAL)
+    });
+    seqno.is_multiple_of(interval)
+}
+
+/// Emit a `GridDigest` certifying the authoritative grid as of `seqno` to every
+/// diff-reconstructing client.
+///
+/// Best-effort by design: a client whose data channel is momentarily full just
+/// misses this check (the next digest re-certifies, and a real frame will mark
+/// it `Lagged` if it is truly behind), so — unlike `broadcast_to_clients` — we
+/// never mark a client lagged or dead for a digest. Force-full-snapshot clients
+/// are skipped: they receive whole snapshots and cannot desync.
+fn broadcast_grid_digest(
+    pane_id: &str,
+    clients: &ClientMap,
+    snapshot_fn: &dyn Fn() -> GridSnapshot,
+    seqno: SequenceNo,
+) {
+    let hash = snapshot_fn().live_digest();
+    let msg = ServerMessage::GridDigest {
+        pane_id: pane_id.to_string(),
+        seqno,
+        hash,
+    };
+    let map = clients.lock().unwrap();
+    for sender in map.values() {
+        if sender.output_paused() || sender.force_full_snapshot {
+            continue;
+        }
+        let _ = sender.data_tx.try_send(msg.clone());
     }
 }
 
@@ -544,6 +602,190 @@ mod tests {
         assert!(matches!(msg, ServerMessage::TerminalUpdate { .. }));
 
         assert_eq!(clients.lock().unwrap().len(), 1);
+    }
+
+    /// End-to-end through the *real* broadcast path: drive `dispatch_diff_result`
+    /// for a scripted byte stream with a digest forced after each frame, then
+    /// reconstruct the screen on a `CellGrid` from exactly the messages a client
+    /// receives. Every emitted `GridDigest` must match the reconstructed grid,
+    /// and the final grid must equal the server's authoritative snapshot. This
+    /// exercises what the Stage 1 conformance test cannot: real seqno allocation,
+    /// `TerminalUpdate`/`ScrollbackAppend`/`CursorUpdate` ordering (including the
+    /// reset-first rule), and the wire-level digest agreement.
+    #[test]
+    fn relay_broadcast_reconstructs_and_digests_match() {
+        use kmux_client::grid::CellGrid;
+
+        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(8192);
+        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        clients.lock().unwrap().insert(
+            ClientId(1),
+            ClientSender {
+                data_tx,
+                ctrl_tx,
+                force_full_snapshot: false,
+                paused: false,
+                pause_auto: false,
+                no_auto_pause: false,
+                capabilities: Default::default(),
+                size: Default::default(),
+            },
+        );
+
+        let ts = test_term_state();
+        let scrollback = Arc::new(Mutex::new(DiffBuffer::new(256 * 1024)));
+        let seqno_counter = Arc::new(AtomicU64::new(0));
+        let mut prev_cursor = CursorState::default();
+        let mut prev_modes = TermModes::EMPTY;
+        let snapshot_fn = || ts.lock().unwrap().snapshot();
+
+        // Seed the client exactly as a fresh attach would.
+        let mut grid = CellGrid::new(24, 80);
+        grid.apply_snapshot(snapshot_fn());
+
+        let script: &[&[u8]] = &[
+            b"hello \x1b[31mworld\x1b[0m",
+            b"\r\nsecond line with a space",
+            b"\x1b[2J\x1b[Hcleared",
+            // Overflow the viewport to exercise ScrollbackAppend ordering.
+            b"\r\nA\r\nB\r\nC\r\nD\r\nE\r\nF\r\nG\r\nH\r\nI\r\nJ\r\nK\r\nL\r\nM\r\nN\r\nO\r\nP\r\nQ\r\nR\r\nS\r\nT\r\nU\r\nV\r\nW\r\nX\r\nY\r\nZ\r\n",
+            b"\x1bcfresh after reset",
+        ];
+        for chunk in script {
+            ts.lock().unwrap().feed(chunk);
+            let result = ts.lock().unwrap().compute_diff();
+            dispatch_diff_result(
+                "eagle/0",
+                result,
+                0,
+                &scrollback,
+                &clients,
+                &seqno_counter,
+                &mut prev_cursor,
+                &mut prev_modes,
+                &snapshot_fn,
+            );
+            // Force a digest certifying the latest emitted seqno (bypassing the
+            // production throttle so every frame is checked).
+            let top = seqno_counter.load(Ordering::Relaxed);
+            if top > 0 {
+                broadcast_grid_digest("eagle/0", &clients, &snapshot_fn, SequenceNo(top - 1));
+            }
+        }
+
+        // Replay the client's inbound stream in order, asserting digests as they
+        // arrive (the grid is at the certified seqno by construction here).
+        let mut digests_checked = 0;
+        while let Ok(msg) = data_rx.try_recv() {
+            match msg {
+                ServerMessage::TerminalUpdate { diff, .. } => {
+                    grid.apply_diff((*diff).clone());
+                }
+                ServerMessage::ScrollbackAppend {
+                    first_index, lines, ..
+                } => grid.apply_scrollback_append(first_index, lines),
+                ServerMessage::CursorUpdate { cursor, modes, .. } => {
+                    grid.apply_cursor_update(cursor, modes)
+                }
+                ServerMessage::GridDigest { hash, .. } => {
+                    assert_eq!(
+                        grid.live_digest(),
+                        hash,
+                        "reconstructed grid diverged from the daemon's certified digest"
+                    );
+                    digests_checked += 1;
+                }
+                other => panic!("unexpected broadcast message: {other:?}"),
+            }
+        }
+
+        assert!(digests_checked > 0, "the run must emit and check digests");
+        assert_eq!(
+            grid.to_snapshot().digest(),
+            snapshot_fn().digest(),
+            "final reconstructed grid must equal the authoritative snapshot"
+        );
+    }
+
+    #[test]
+    fn grid_digest_delivered_with_authoritative_hash() {
+        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
+        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        clients.lock().unwrap().insert(
+            ClientId(1),
+            ClientSender {
+                data_tx,
+                ctrl_tx,
+                force_full_snapshot: false,
+                paused: false,
+                pause_auto: false,
+                no_auto_pause: false,
+                capabilities: Default::default(),
+                size: Default::default(),
+            },
+        );
+
+        let ts = test_term_state();
+        let expected = ts.lock().unwrap().snapshot().live_digest();
+        broadcast_grid_digest(
+            "eagle/0",
+            &clients,
+            &|| ts.lock().unwrap().snapshot(),
+            SequenceNo(7),
+        );
+
+        match data_rx
+            .try_recv()
+            .expect("digest delivered on data channel")
+        {
+            ServerMessage::GridDigest {
+                pane_id,
+                seqno,
+                hash,
+            } => {
+                assert_eq!(pane_id, "eagle/0");
+                assert_eq!(seqno, SequenceNo(7));
+                assert_eq!(hash, expected, "hash is the authoritative grid live_digest");
+            }
+            other => panic!("expected GridDigest, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn grid_digest_skips_snapshot_mode_client() {
+        // Force-full-snapshot clients get whole snapshots and cannot desync, so
+        // they must never receive a (meaningless) digest.
+        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
+        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        clients.lock().unwrap().insert(
+            ClientId(1),
+            ClientSender {
+                data_tx,
+                ctrl_tx,
+                force_full_snapshot: true,
+                paused: false,
+                pause_auto: false,
+                no_auto_pause: false,
+                capabilities: Default::default(),
+                size: Default::default(),
+            },
+        );
+
+        let ts = test_term_state();
+        broadcast_grid_digest(
+            "eagle/0",
+            &clients,
+            &|| ts.lock().unwrap().snapshot(),
+            SequenceNo(7),
+        );
+
+        assert!(
+            data_rx.try_recv().is_err(),
+            "snapshot-mode client must not receive a digest"
+        );
     }
 
     #[test]

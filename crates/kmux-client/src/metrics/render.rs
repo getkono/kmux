@@ -154,6 +154,21 @@ impl RenderMetrics {
         self.event_log.push(event);
     }
 
+    /// Snapshot of the diagnostic counters (Copy).
+    pub fn diag_counters(&self) -> DiagCounters {
+        self.counters
+    }
+
+    /// Record a grid-digest mismatch against the daemon's authoritative grid.
+    pub fn record_digest_mismatch(&mut self, session: &str, seqno: u64) {
+        let event = DiagEvent::DigestMismatch {
+            session: session.to_owned(),
+            seqno,
+        };
+        self.counters.increment(&event);
+        self.event_log.push(event);
+    }
+
     /// Record a detected tear: a partial logical frame was painted (issue #72).
     pub fn record_tear(&mut self, session: &str, prev_sent_at_ms: u64, next_sent_at_ms: u64) {
         let event = DiagEvent::Tear {

@@ -202,6 +202,24 @@ impl CellGrid {
         }
     }
 
+    /// Compute the live grid digest the daemon's `GridDigest` certifies — the
+    /// visible grid, cursor, modes, and scrollback envelope, excluding the
+    /// scrollback tail (see [`GridSnapshot::live_digest`]). Builds a tail-less
+    /// snapshot so the held scrollback is never cloned on the check path.
+    pub fn live_digest(&self) -> u128 {
+        GridSnapshot {
+            rows: self.rows as u16,
+            cols: self.cols as u16,
+            cells: self.cells.clone(),
+            cursor: self.cursor,
+            modes: self.modes,
+            history_total: self.scrollback.history_total(),
+            scrollback_base: self.scrollback.base_index(),
+            scrollback_tail: Vec::new(),
+        }
+        .live_digest()
+    }
+
     /// Apply a diff from the server -- only changed cells are updated.
     ///
     /// Scrollback no longer travels with the diff (v16); it arrives out-of-band

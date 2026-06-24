@@ -151,6 +151,20 @@ pub enum ServerMessage {
     /// Full snapshot was sent because the requested seqno is no longer in the buffer.
     SyncReset { pane_id: PaneId },
 
+    /// A checksum of the server's authoritative grid as of `seqno`, certifying
+    /// the diff stream up to that point. Emitted on the same (data) channel as
+    /// the diffs it covers, so it can never overtake the frame it describes. A
+    /// client that has applied exactly up to `seqno` recomputes the digest over
+    /// its reconstructed grid (`GridSnapshot::live_digest`) and, on a mismatch,
+    /// resyncs — turning otherwise-silent diff-stream corruption into a detected,
+    /// self-healing, countable event. `hash` is a [`GridSnapshot::live_digest`]
+    /// (scrollback tail content excluded; the envelope counts are included).
+    GridDigest {
+        pane_id: PaneId,
+        seqno: SequenceNo,
+        hash: u128,
+    },
+
     /// Asynchronous lifecycle event.
     Event { event: SessionEventMsg },
 
@@ -344,7 +358,9 @@ impl ServerMessage {
             | Self::ClientKicked { .. }
             | Self::SessionKicked { .. }
             | Self::NotifyAccepted { .. } => MessageCategory::Control,
-            Self::Lagged { .. } | Self::SyncReset { .. } => MessageCategory::Sync,
+            Self::Lagged { .. } | Self::SyncReset { .. } | Self::GridDigest { .. } => {
+                MessageCategory::Sync
+            }
             Self::AuthChallenge { .. } | Self::AuthResult { .. } | Self::ChannelSwitched { .. } => {
                 MessageCategory::Bootstrap
             }
@@ -608,6 +624,14 @@ mod tests {
             (
                 ServerMessage::SyncReset {
                     pane_id: "p".into(),
+                },
+                MessageCategory::Sync,
+            ),
+            (
+                ServerMessage::GridDigest {
+                    pane_id: "p".into(),
+                    seqno: SequenceNo(1),
+                    hash: 0,
                 },
                 MessageCategory::Sync,
             ),

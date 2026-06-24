@@ -527,6 +527,38 @@ impl SessionManager {
                 self.pane_sync.insert(pane_id, PaneSync::AwaitingSync);
             }
 
+            ServerMessage::GridDigest {
+                pane_id,
+                seqno,
+                hash,
+            } => {
+                // The digest certifies the grid as of `seqno`. Only verify when
+                // the pane is synced at EXACTLY that seqno (its next-expected is
+                // `seqno + 1`); otherwise the client is mid-stream, resyncing, or
+                // the digest is stale, and a comparison would be meaningless. The
+                // digest carries no new seqno and never advances sync state — it
+                // is a pure side-band check. Skip while a lazy `FetchHistory` is
+                // outstanding: the client is legitimately behind on the envelope
+                // counts the digest covers, so a mismatch would be a false alarm.
+                let synced_here = matches!(
+                    self.pane_sync.get(&pane_id),
+                    Some(PaneSync::Synced { expected }) if expected.0 == seqno.0 + 1
+                );
+                let mismatch = synced_here
+                    && self.buffers.get(&pane_id).is_some_and(|grid| {
+                        grid.pending_history_gap().is_none() && grid.live_digest() != hash
+                    });
+                if mismatch {
+                    self.metrics.record_digest_mismatch(&pane_id, seqno.0);
+                    self.metrics.record_resync(&pane_id, "grid digest mismatch");
+                    if let Some(grid) = self.buffers.get_mut(&pane_id) {
+                        grid.clear();
+                    }
+                    self.in_flight_history_fetches.remove(&pane_id);
+                    self.attach_fresh(pane_id);
+                }
+            }
+
             ServerMessage::Event {
                 event: SessionEventMsg::SessionRenamed { word_id, new_name },
             }

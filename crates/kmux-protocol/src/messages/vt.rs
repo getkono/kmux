@@ -314,6 +314,33 @@ impl GridSnapshot {
         }
         h.finish()
     }
+
+    /// Digest of the live state the wire-level oracle compares: the visible grid,
+    /// cursor, modes, and the scrollback *envelope* (`history_total` +
+    /// `scrollback_base`) — but NOT the scrollback tail contents.
+    ///
+    /// The tail is excluded on purpose. The server caps its snapshot tail at a
+    /// fixed window while a client accumulates full scrollback and may be
+    /// transiently behind during lazy `FetchHistory`, so hashing tail *contents*
+    /// would produce false mismatches. Tail content correctness is instead
+    /// covered exhaustively by the deterministic diff-pipeline conformance suite,
+    /// which controls both sides. This digest still catches viewport desync and
+    /// scrollback *count* corruption (reset/eviction), which is what the live
+    /// self-heal needs. See [`digest`](Self::digest) for the full version.
+    pub fn live_digest(&self) -> u128 {
+        let mut h = Fnv1a128::new();
+        h.write(&self.rows.to_le_bytes());
+        h.write(&self.cols.to_le_bytes());
+        h.write(&(self.cells.len() as u64).to_le_bytes());
+        for cell in &self.cells {
+            h.write_cell(cell);
+        }
+        h.write_cursor(&self.cursor);
+        h.write(&self.modes.0.to_le_bytes());
+        h.write(&self.history_total.to_le_bytes());
+        h.write(&self.scrollback_base.to_le_bytes());
+        h.finish()
+    }
 }
 
 #[cfg(test)]
@@ -390,6 +417,40 @@ mod digest_tests {
         let mut tail = sample();
         tail.scrollback_tail = vec![vec![glyph('a'), glyph('b')]];
         assert_ne!(base, tail.digest(), "scrollback tail content");
+    }
+
+    #[test]
+    fn live_digest_ignores_tail_content_but_covers_envelope() {
+        let base = sample().live_digest();
+
+        // Tail *content* differs → full digest changes, live digest does not.
+        let mut tail = sample();
+        tail.scrollback_tail = vec![vec![glyph('a')]];
+        // history_total/base unchanged, only the held tail content differs.
+        assert_eq!(base, tail.live_digest(), "tail content excluded from live");
+        assert_ne!(
+            sample().digest(),
+            tail.digest(),
+            "tail content in full digest"
+        );
+
+        // The envelope counts ARE covered (catches reset/eviction count drift).
+        let mut hist = sample();
+        hist.history_total = 9;
+        assert_ne!(base, hist.live_digest(), "history_total");
+
+        let mut sbbase = sample();
+        sbbase.scrollback_base = 4;
+        assert_ne!(base, sbbase.live_digest(), "scrollback_base");
+
+        // Viewport changes are covered.
+        let mut cellmut = sample();
+        cellmut.cells[0] = glyph('Q');
+        assert_ne!(base, cellmut.live_digest(), "viewport cell");
+
+        let mut cur = sample();
+        cur.cursor.row = 1;
+        assert_ne!(base, cur.live_digest(), "cursor");
     }
 
     #[test]
