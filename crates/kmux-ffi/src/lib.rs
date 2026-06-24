@@ -63,8 +63,8 @@ use kmux_client::input::{
     MouseButton, MouseEvent, MouseEventKind, MouseMods, char_to_proto_key, encode_mouse_scroll,
 };
 use kmux_protocol::messages::{
-    ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, PaneProgressState, SplitDir,
-    TermSize,
+    AttentionKind, ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, PaneProgressState,
+    SplitDir, TermSize,
 };
 use kmux_protocol::{format_pane_id, pane_index};
 // The packed-cell format is owned by `kmux-render` (the single encoder shared
@@ -81,13 +81,54 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 20;
+pub const KMUX_FFI_ABI_VERSION: u32 = 21;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
 #[uniffi::export]
 pub fn kmux_ffi_abi_version() -> u32 {
     KMUX_FFI_ABI_VERSION
+}
+
+/// Build + version metadata for the Swift app's "About" panel — the same matrix
+/// `kmux -V` prints, plus this binary's renderer API and FFI ABI versions. Mirror
+/// of [`kmux_app::version::VersionInfo`] flattened for uniffi.
+#[derive(uniffi::Record)]
+pub struct FfiVersionInfo {
+    /// Crate semver, e.g. `"0.2.0"`.
+    pub semver: String,
+    /// Short git commit (or `"unknown"`).
+    pub git_sha: String,
+    /// Working tree had uncommitted changes at build time.
+    pub git_dirty: bool,
+    /// Build date, `YYYY-MM-DD`.
+    pub build_date: String,
+    /// Cargo profile (`"debug"` / `"release"`).
+    pub build_profile: String,
+    /// Client↔daemon wire protocol version.
+    pub protocol: u32,
+    /// Renderer API version (this binary links `kmux-render`).
+    pub render_api: u32,
+    /// FFI C-ABI version ([`KMUX_FFI_ABI_VERSION`]).
+    pub ffi_abi: u32,
+}
+
+/// Version + build metadata for the Swift "About" panel. The build identity
+/// (semver, git SHA + dirty, date, profile) is what makes a running build
+/// verifiable; the protocol/render/FFI numbers pin the linked boundaries.
+#[uniffi::export]
+pub fn kmux_ffi_version_info() -> FfiVersionInfo {
+    let v = kmux_app::version::VersionInfo::current();
+    FfiVersionInfo {
+        semver: v.semver.to_string(),
+        git_sha: v.git_sha.to_string(),
+        git_dirty: v.git_dirty,
+        build_date: v.build_date.to_string(),
+        build_profile: v.build_profile.to_string(),
+        protocol: v.protocol,
+        render_api: kmux_render::KMUX_RENDER_API_VERSION,
+        ffi_abi: KMUX_FFI_ABI_VERSION,
+    }
 }
 
 /// The terminal renderer backend resolved from `~/.config/kmux/config.toml`
@@ -180,6 +221,36 @@ pub enum FfiEffect {
     Quit,
     /// Diagnostic: rebuild the Metal renderer + glyph atlas, then repaint.
     ResetRenderer,
+    /// A program in a pane requested attention via `kmux notify` (issue #169).
+    /// The Swift app posts a `UNUserNotification` and, on click, refocuses the
+    /// window for `word_id` and selects `pane_id`. `attention_id` dedups across
+    /// the app's windows so exactly one notification is posted.
+    Attention {
+        word_id: String,
+        pane_id: String,
+        kind: FfiAttentionKind,
+        title: String,
+        body: String,
+        attention_id: u64,
+    },
+}
+
+/// Why a pane wants attention (issue #169). FFI mirror of
+/// [`kmux_protocol::messages::AttentionKind`]; lets the Swift app word the
+/// notification (e.g. a turn finished vs. Claude is waiting on you).
+#[derive(uniffi::Enum)]
+pub enum FfiAttentionKind {
+    TurnDone,
+    NeedsInput,
+}
+
+impl From<AttentionKind> for FfiAttentionKind {
+    fn from(k: AttentionKind) -> Self {
+        match k {
+            AttentionKind::TurnDone => FfiAttentionKind::TurnDone,
+            AttentionKind::NeedsInput => FfiAttentionKind::NeedsInput,
+        }
+    }
 }
 
 impl From<FrontendEffect> for FfiEffect {
@@ -192,6 +263,21 @@ impl From<FrontendEffect> for FfiEffect {
             FrontendEffect::RequestPaste => FfiEffect::RequestPaste,
             FrontendEffect::Quit => FfiEffect::Quit,
             FrontendEffect::ResetRenderer => FfiEffect::ResetRenderer,
+            FrontendEffect::Attention {
+                word_id,
+                pane_id,
+                kind,
+                title,
+                body,
+                attention_id,
+            } => FfiEffect::Attention {
+                word_id,
+                pane_id,
+                kind: kind.into(),
+                title,
+                body,
+                attention_id,
+            },
         }
     }
 }

@@ -289,7 +289,7 @@ impl ServerApp {
             .env(
                 EnvBuilder::new()
                     .auto_term(false)
-                    .extend(pane_spawn_env(&ClientCapabilities::default())),
+                    .extend(pane_spawn_env(&ClientCapabilities::default(), pane_id)),
             );
 
         if let Err(e) = self.manager.spawn(pane_id, &config).await {

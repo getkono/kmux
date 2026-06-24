@@ -62,6 +62,10 @@ pub mod subcommands;
 /// Shared CLI front door (`run_cli`) used by every frontend binary.
 pub mod launch;
 
+/// Single source of build + version metadata ([`version::VersionInfo`]) surfaced
+/// by `kmux -V` and both GUIs' "About" panels.
+pub mod version;
+
 /// The frontend-agnostic client view-model ([`core::AppCore`]) and the
 /// connection/session orchestration that drives it.
 pub mod core;

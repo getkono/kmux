@@ -132,6 +132,26 @@ impl AppCore {
                         effects.push(eff);
                     }
                 }
+                SessionEvent::PaneAttention {
+                    word_id,
+                    pane_id,
+                    kind,
+                    title,
+                    body,
+                    attention_id,
+                } => {
+                    // Pure relay to the frontend: window selection + dedup is
+                    // toolkit-specific (a frontend owns all its windows), so the
+                    // policy lives there (issue #169).
+                    effects.push(KeyResult::Attention {
+                        word_id,
+                        pane_id,
+                        kind,
+                        title,
+                        body,
+                        attention_id,
+                    });
+                }
                 SessionEvent::PeerOpened { peer } => {
                     // The remote is now federated through the local daemon (issue
                     // #121). Mark it connected, re-arm auto-select, and refresh the

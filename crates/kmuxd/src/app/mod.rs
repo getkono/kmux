@@ -547,6 +547,10 @@ pub struct ServerApp {
     next_client_id: AtomicU64,
     /// Monotonic connection ID counter.
     next_connection_id: AtomicU64,
+    /// Monotonic attention ID counter (issue #169). Stamped onto every
+    /// `PaneAttention` broadcast so clients can dedup to one notification when
+    /// several windows of one GUI process are attached to the session.
+    next_attention_id: AtomicU64,
     /// Map of ConnectionId -> ConnectionState for channel switching.
     connections: RwLock<HashMap<u64, ConnectionState>>,
     /// Word pool for assigning unique session IDs.
@@ -608,6 +612,7 @@ impl ServerApp {
             session_index_counter: AtomicU32::new(0),
             next_client_id: AtomicU64::new(1),
             next_connection_id: AtomicU64::new(1),
+            next_attention_id: AtomicU64::new(1),
             connections: RwLock::new(HashMap::new()),
             wordlist: Mutex::new(WordlistSampler::new()),
             rng: Mutex::new(rand::rngs::SmallRng::from_rng(&mut rand::rng())),
@@ -704,6 +709,37 @@ impl ServerApp {
     /// changed) to all connected clients.
     pub fn broadcast_session_event(&self, event: kmux_protocol::messages::SessionEventMsg) {
         self.broadcast(kmux_protocol::messages::ServerMessage::Event { event });
+    }
+
+    /// Handle a `ClientMessage::Notify` (issue #169): validate that `pane_id`
+    /// names a live local pane, then broadcast a `PaneAttention` to every client
+    /// with a fresh `attention_id`. Errors (e.g. unknown pane) propagate so the
+    /// caller can reply with an `Error`.
+    ///
+    /// The pane is always local here: `kmux notify` runs *inside* the pane, so
+    /// it connects to the daemon that hosts it. A federated GUI sees the event
+    /// because the local hub's peer feed rewrites and forwards it (see
+    /// [`crate::federation`]).
+    pub async fn notify_pane_attention(
+        &self,
+        pane_id: &str,
+        kind: kmux_protocol::messages::AttentionKind,
+        title: String,
+        body: String,
+    ) -> kmux_pty::error::Result<()> {
+        {
+            let sessions = self.sessions.read().await;
+            helpers::get_pane_relay(&sessions, pane_id)?;
+        }
+        let attention_id = self.next_attention_id.fetch_add(1, Ordering::Relaxed);
+        self.broadcast_session_event(kmux_protocol::messages::SessionEventMsg::PaneAttention {
+            pane_id: pane_id.to_string(),
+            kind,
+            title,
+            body,
+            attention_id,
+        });
+        Ok(())
     }
 
     /// Subscribe to live connection-count changes for idle-shutdown tracking.
@@ -909,6 +945,22 @@ mod tests {
     use kmux_protocol::TransportKind;
 
     use super::{ClientIdentity, ConnectionMetrics, KickOutcome, ServerApp};
+
+    /// `notify_pane_attention` rejects an unknown pane (issue #169) rather than
+    /// broadcasting a bogus attention to clients.
+    #[tokio::test]
+    async fn notify_pane_attention_rejects_unknown_pane() {
+        let app = ServerApp::new("tok".to_string());
+        let result = app
+            .notify_pane_attention(
+                "ghost/0",
+                kmux_protocol::messages::AttentionKind::TurnDone,
+                "Claude".to_string(),
+                "done".to_string(),
+            )
+            .await;
+        assert!(result.is_err(), "an unknown pane must be rejected");
+    }
 
     #[tokio::test]
     async fn conn_count_watch_tracks_register_and_unregister() {

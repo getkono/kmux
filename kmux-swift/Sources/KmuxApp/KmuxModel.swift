@@ -110,6 +110,9 @@ final class KmuxModel: ObservableObject {
     func start() {
         // Make Powerline/Nerd glyphs available to the CoreText path (issue #145).
         registerSymbolFallbackFont()
+        // Register for `kmux notify` attention routing (issue #169): a
+        // notification's click can refocus this window for its session.
+        AttentionCoordinator.shared.register(self)
         let t = Timer(timeInterval: Self.pumpInterval, repeats: true) { [weak self] _ in
             MainActor.assumeIsolated { self?.pump() }
         }
@@ -352,7 +355,24 @@ final class KmuxModel: ObservableObject {
             forceRefetch = true
             lastGenByPane.removeAll()
             terminalView?.resetGpuRenderer()
+        case let .attention(wordId, paneId, kind, title, body, attentionId):
+            // `kmux notify` (#169): hand off to the process-global coordinator,
+            // which dedups across windows and posts one native notification.
+            AttentionCoordinator.shared.surface(
+                word: wordId, pane: paneId, kind: kind,
+                title: title, body: body, attentionId: attentionId)
         }
+    }
+
+    /// Switch this window to `word`'s session and select `pane` — the follow-up
+    /// when a `kmux notify` notification (issue #169) for this window is clicked.
+    func focusAttention(word: String, pane: String) {
+        if let idx = sessions.firstIndex(where: { $0.wordId == word }) {
+            dispatch(.jumpToSession(index: UInt32(idx)))
+        }
+        apply(driver.selectPane(id: pane))
+        terminalView?.window?.makeKeyAndOrderFront(nil)
+        terminalView?.needsDisplay = true
     }
 
     /// Build the render-debug snapshot for the overlay: pass the view's content

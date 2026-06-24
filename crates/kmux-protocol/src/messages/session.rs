@@ -250,6 +250,22 @@ pub enum PaneProgressState {
     Pause,
 }
 
+/// Why a pane is asking for the user's attention (issue #169).
+///
+/// Carried by [`SessionEventMsg::PaneAttention`] and `ClientMessage::Notify`.
+/// A tool inside the pane — Claude Code's hooks are the motivating case — maps
+/// its lifecycle to one of these so the client can word the notification
+/// appropriately.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AttentionKind {
+    /// The program finished a unit of work and is idle (e.g. Claude Code's
+    /// `Stop` hook — a turn completed).
+    TurnDone,
+    /// The program is blocked waiting on the user (e.g. Claude Code's
+    /// `Notification` hook — a permission prompt or idle input).
+    NeedsInput,
+}
+
 /// Snapshot of a single pane within a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaneInfo {
@@ -489,6 +505,22 @@ pub enum SessionEventMsg {
     /// the daemon respawns the worker. Clients surface this as a transient
     /// "session recovering" state rather than an exit.
     PaneFaulted { pane_id: PaneId },
+
+    /// A program inside `pane_id` asked for the user's attention (issue #169),
+    /// via `kmux notify`. Clients raise a native desktop notification that, on
+    /// click, refocuses the window showing this session and selects the pane.
+    ///
+    /// The daemon broadcasts this to **all** clients (like every other session
+    /// event), so each receiver dedups on `attention_id` — a value unique per
+    /// notify request — to post exactly one notification even when several
+    /// windows of one GUI process are attached to the session.
+    PaneAttention {
+        pane_id: PaneId,
+        kind: AttentionKind,
+        title: String,
+        body: String,
+        attention_id: u64,
+    },
 
     /// A new tab was created inside a session.
     TabCreated {

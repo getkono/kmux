@@ -171,9 +171,19 @@ pub fn build(app: &Application, drawing: &DrawingArea) -> Rc<Shell> {
     toolbar.add_top_bar(&header);
     toolbar.set_content(Some(&split));
 
+    // Debug builds carry an at-a-glance dev marker in the window title (taskbar /
+    // window switcher) so a fresh `./kmux` is distinguishable from a stale build.
+    let window_title = {
+        let v = kmux_app::version::VersionInfo::current();
+        if v.is_debug() {
+            format!("kmux (dev) · {}", v.commit())
+        } else {
+            "kmux".to_string()
+        }
+    };
     let window = adw::ApplicationWindow::builder()
         .application(app)
-        .title("kmux")
+        .title(&window_title)
         .default_width(960)
         .default_height(620)
         .build();

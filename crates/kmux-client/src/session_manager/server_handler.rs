@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kmux_protocol::messages::{
-    ClientId, ClientMessage, PaneInfo, PaneProgressState, SequenceNo, ServerMessage,
+    AttentionKind, ClientId, ClientMessage, PaneInfo, PaneProgressState, SequenceNo, ServerMessage,
     SessionEventMsg, SessionStatus, epoch_millis,
 };
 use tracing::{info, warn};
@@ -47,6 +47,19 @@ pub enum SessionEvent {
         pane_id: String,
         selection: String,
         data: String,
+    },
+    /// A program inside a pane asked for the user's attention via `kmux notify`
+    /// (issue #169). The frontend raises a native desktop notification that, on
+    /// click, refocuses the window for `word_id` and selects the pane.
+    /// `attention_id` is unique per request so a frontend with several windows
+    /// on this session posts exactly one notification.
+    PaneAttention {
+        word_id: String,
+        pane_id: String,
+        kind: AttentionKind,
+        title: String,
+        body: String,
+        attention_id: u64,
     },
     /// A structured error from the server.
     ServerError { message: String },
@@ -608,6 +621,31 @@ impl SessionManager {
                 });
             }
 
+            ServerMessage::Event {
+                event:
+                    SessionEventMsg::PaneAttention {
+                        pane_id,
+                        kind,
+                        title,
+                        body,
+                        attention_id,
+                    },
+            } => {
+                // The session word the GUI focuses on click; derive it from the
+                // pane id (already local — federation rewrote it upstream).
+                let word_id = kmux_protocol::pane_word(&pane_id)
+                    .unwrap_or(&pane_id)
+                    .to_string();
+                events.push(SessionEvent::PaneAttention {
+                    word_id,
+                    pane_id,
+                    kind,
+                    title,
+                    body,
+                    attention_id,
+                });
+            }
+
             ServerMessage::Event { .. } => {}
 
             ServerMessage::Lagged {
@@ -760,6 +798,11 @@ impl SessionManager {
             // A close ack needs no app-level reconciliation (the peer's sessions
             // simply stop appearing in the next `SessionList`).
             ServerMessage::PeerClosed { .. } => {}
+
+            // Reply to `ClientMessage::Notify` (issue #169). Consumed directly by
+            // the `kmux notify` CLI's own read loop, not the streaming session
+            // manager — ignore here for exhaustiveness.
+            ServerMessage::NotifyAccepted { .. } => {}
         }
         events
     }

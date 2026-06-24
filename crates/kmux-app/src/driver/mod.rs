@@ -50,7 +50,9 @@ use kmux_client::supervisor::UpgradeSignal;
 use kmux_client::transport::TransportKind;
 #[cfg(feature = "remote")]
 use kmux_protocol::messages::ClientMessage;
-use kmux_protocol::messages::{KeyEvent, PaneId, ServerMessage, TermSize, epoch_millis};
+use kmux_protocol::messages::{
+    AttentionKind, KeyEvent, PaneId, ServerMessage, TermSize, epoch_millis,
+};
 use kmux_protocol::trace::{AppliedDiff, ClientTickRecord};
 use tokio::sync::mpsc;
 use tokio::sync::mpsc::error::TryRecvError;
@@ -139,6 +141,19 @@ pub enum FrontendEffect {
     RequestPaste,
     /// Exit the application.
     Quit,
+    /// A program in a pane requested attention via `kmux notify` (issue #169).
+    /// The frontend raises a native desktop notification and, on click,
+    /// refocuses the window for `word_id` + selects `pane_id`. `attention_id` is
+    /// unique per request so a frontend dedups to one notification across its
+    /// windows. See `docs/architecture-claude-integration.md`.
+    Attention {
+        word_id: String,
+        pane_id: String,
+        kind: AttentionKind,
+        title: String,
+        body: String,
+        attention_id: u64,
+    },
 }
 
 /// Toolkit-agnostic run-loop driver wrapping an [`AppCore`]. See the module docs.
@@ -368,14 +383,11 @@ impl FrontendDriver {
             let (applied, tick_cells) = self.collect_tick_diagnostics(&batch);
             for m in batch {
                 let events = self.core.mgr.handle_server_message(m);
-                // Server-originated effects (OSC 52 clipboard writes) are
-                // sanitized here so every frontend's clipboard write is safe.
+                // Server-originated effects — OSC 52 clipboard writes (sanitized
+                // in `handle_key_result`) and `kmux notify` attentions (#169) —
+                // funnel through the same converter as dispatched key results.
                 for eff in self.core.handle_session_events(events) {
-                    if let KeyResult::CopyToClipboard(text) = eff {
-                        effects.push(FrontendEffect::CopyToClipboard(
-                            sanitize_clipboard_text(&text).into_owned(),
-                        ));
-                    }
+                    self.handle_key_result(eff, effects);
                 }
             }
             self.detect_tears(tick_cells);
@@ -703,6 +715,21 @@ impl FrontendDriver {
                 sanitize_clipboard_text(&text).into_owned(),
             )),
             KeyResult::RequestPaste => effects.push(FrontendEffect::RequestPaste),
+            KeyResult::Attention {
+                word_id,
+                pane_id,
+                kind,
+                title,
+                body,
+                attention_id,
+            } => effects.push(FrontendEffect::Attention {
+                word_id,
+                pane_id,
+                kind,
+                title,
+                body,
+                attention_id,
+            }),
         }
     }
 

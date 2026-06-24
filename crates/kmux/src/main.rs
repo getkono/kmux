@@ -10,9 +10,16 @@
 //!   official client), located next to this executable or on `PATH`.
 //! - **macOS:** launches the native Swift app bundle (`~/Applications/kmux.app`,
 //!   overridable with `KMUX_APP`) via `open` so each invocation gets its own
-//!   window. As a dev convenience, when `KMUX_APP` points at a bare `kmux-swift`
-//!   executable rather than a `.app` bundle, it is `exec`ed in the foreground
-//!   instead — see [`launch_desktop`].
+//!   window in the singleton instance.
+//!
+//! Prod vs dev split (see [`launch_desktop`]): a **release** build is the native
+//! singleton — it routes to / cold-starts the installed GUI (macOS LaunchServices
+//! plus the `kmux://` URL scheme; Linux D-Bus app-id). A **debug** build
+//! (`./kmux`, the `dev` mise task) instead **kills any stale instance and runs
+//! the freshly built binary directly**, so what you see is always the code you
+//! just compiled — never a handoff to an outdated GUI. On macOS the dev binary is
+//! the bare `kmux-swift` (`KMUX_APP` is a file, not a `.app`); on Linux `kmux-gtk`
+//! runs `NON_UNIQUE` in debug.
 
 use kmux_app::launch::{Launch, run_cli};
 use kmux_client::generate_instance_id;
@@ -104,10 +111,17 @@ fn nested_kmux_check() -> anyhow::Result<bool> {
     }
 }
 
-/// Linux: exec the GTK frontend, forwarding our arguments.
+/// Linux: exec the GTK frontend, forwarding our arguments. A release build is a
+/// D-Bus singleton (a second `kmux` opens a new window in the running instance).
+/// A debug build kills any prior dev instance first and `kmux-gtk` runs
+/// `NON_UNIQUE` (see `imp::run_gui`), so `./kmux` always runs the freshly built
+/// code rather than handing off to a possibly-stale primary.
 #[cfg(target_os = "linux")]
 fn launch_desktop() -> anyhow::Result<()> {
     let bin = locate_binary("kmux-gtk")?;
+    if cfg!(debug_assertions) {
+        kill_running(&bin);
+    }
     let args: Vec<std::ffi::OsString> = std::env::args_os().skip(1).collect();
     exec_forwarding(&bin, &args)
 }
@@ -138,6 +152,13 @@ fn launch_desktop() -> anyhow::Result<()> {
     let url = build_launch_url(&kmux_app::cli::Cli::parse());
 
     if app.is_file() {
+        // Dev path: `KMUX_APP` is the freshly built bare `kmux-swift` (the `dev`
+        // mise task sets it). Kill any instance already running that exact binary,
+        // then `exec` the fresh one in the foreground (stdio attached for logs).
+        // This *guarantees* `./kmux` shows the build you just compiled — a bare
+        // exec never coalesces with the prod bundle, and the kill replaces a stale
+        // dev instance instead of leaving a confusing second one.
+        kill_running(&app);
         return exec_forwarding(
             &app,
             &[
@@ -281,6 +302,22 @@ fn exec_forwarding(bin: &std::path::Path, args: &[std::ffi::OsString]) -> anyhow
     use std::os::unix::process::CommandExt;
     let err = std::process::Command::new(bin).args(args).exec();
     Err(err).with_context(|| format!("failed to launch {}", bin.display()))
+}
+
+/// Terminate any process already running the exact executable at `bin`, so a dev
+/// launch *replaces* a stale instance instead of leaving two. Best-effort and
+/// dev-only: `bin` is the freshly built GUI binary, matched by full path via
+/// `pkill -f` — our own `kmux` process never matches (its argv doesn't contain
+/// `bin`), and the installed prod bundle lives at a different path. The short
+/// sleep lets the old instance release its window/daemon connection before the
+/// fresh one starts.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn kill_running(bin: &std::path::Path) {
+    let Some(path) = bin.to_str() else { return };
+    let _ = std::process::Command::new("pkill")
+        .args(["-f", path])
+        .status();
+    std::thread::sleep(std::time::Duration::from_millis(150));
 }
 
 /// Find a sibling binary `name`: next to the running executable first (the

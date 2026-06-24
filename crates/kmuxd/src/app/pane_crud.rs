@@ -131,7 +131,7 @@ impl ServerApp {
             .env(
                 EnvBuilder::new()
                     .auto_term(false)
-                    .extend(pane_spawn_env(seed_caps)),
+                    .extend(pane_spawn_env(seed_caps, pane_id)),
             );
         if let Some(cwd_path) = cwd {
             config = config.cwd(cwd_path);

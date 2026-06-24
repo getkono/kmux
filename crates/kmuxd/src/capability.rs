@@ -42,6 +42,11 @@ pub fn intersect_for_atomics<'a>(
 /// - `TERM_PROGRAM=kmux` / `TERM_PROGRAM_VERSION=<version>` — override
 ///   launcher leakage so that feature-sniffers (Starship, bat, etc.) see a
 ///   consistent identity.
+/// - `KMUX_PANE=<word>/<idx>` / `KMUX_SESSION=<word>` — identify the pane and
+///   its session to programs running inside it (issue #169). A program that
+///   wants kmux to surface a desktop notification (e.g. Claude Code's
+///   `Stop` / `Notification` hooks) reads these and runs `kmux notify` so the
+///   daemon can attribute the event to the right pane/session.
 ///
 /// This is the "feature check" required by issue #19: TERM/COLORTERM are
 /// always safe to set because the PTY's immediate consumer is libghostty-vt,
@@ -51,8 +56,13 @@ pub fn intersect_for_atomics<'a>(
 /// the reason `ClientCapabilities.truecolor` exists on the wire today.
 ///
 /// The `_seed_caps` parameter is kept for future use (e.g. per-capability
-/// TERM selection if the backend becomes configurable).
-pub fn pane_spawn_env(_seed_caps: &ClientCapabilities) -> HashMap<String, String> {
+/// TERM selection if the backend becomes configurable). `pane_id` is the
+/// canonical `<word>/<idx>` form; the session word is split out for
+/// `KMUX_SESSION`.
+pub fn pane_spawn_env(_seed_caps: &ClientCapabilities, pane_id: &str) -> HashMap<String, String> {
+    // The session word is the part before the slash; fall back to the whole id
+    // if it is somehow malformed (it never is for a daemon-minted pane).
+    let session = kmux_protocol::pane_word(pane_id).unwrap_or(pane_id);
     HashMap::from([
         ("TERM".into(), "xterm-256color".into()),
         ("COLORTERM".into(), "truecolor".into()),
@@ -66,6 +76,9 @@ pub fn pane_spawn_env(_seed_caps: &ClientCapabilities) -> HashMap<String, String
         // Like tmux's `$TMUX`, presence is what matters; the value is the daemon
         // version for debuggability.
         ("KMUX".into(), env!("CARGO_PKG_VERSION").into()),
+        // Pane/session identity for in-pane tooling (issue #169).
+        ("KMUX_PANE".into(), pane_id.to_string()),
+        ("KMUX_SESSION".into(), session.to_string()),
     ])
 }
 
@@ -91,12 +104,22 @@ mod tests {
     /// detect a nested launch (issue #73), alongside the existing TERM markers.
     #[test]
     fn pane_spawn_env_exports_kmux_marker() {
-        let env = pane_spawn_env(&ClientCapabilities::default());
+        let env = pane_spawn_env(&ClientCapabilities::default(), "eagle/0");
         assert_eq!(
             env.get("KMUX").map(String::as_str),
             Some(env!("CARGO_PKG_VERSION"))
         );
         assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("kmux"));
+    }
+
+    /// In-pane tooling (issue #169) reads `KMUX_PANE`/`KMUX_SESSION` to attribute
+    /// a `kmux notify` to the right pane. `KMUX_PANE` is the full `<word>/<idx>`
+    /// id; `KMUX_SESSION` is just the session word.
+    #[test]
+    fn pane_spawn_env_exports_pane_and_session_identity() {
+        let env = pane_spawn_env(&ClientCapabilities::default(), "eagle/3");
+        assert_eq!(env.get("KMUX_PANE").map(String::as_str), Some("eagle/3"));
+        assert_eq!(env.get("KMUX_SESSION").map(String::as_str), Some("eagle"));
     }
 
     #[test]
@@ -122,7 +145,7 @@ mod tests {
     #[test]
     fn pane_spawn_env_has_required_keys() {
         let c = caps(false, false, false);
-        let env = pane_spawn_env(&c);
+        let env = pane_spawn_env(&c, "eagle/0");
         assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
         assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));
         assert_eq!(env.get("TERM_PROGRAM").map(String::as_str), Some("kmux"));
@@ -139,7 +162,7 @@ mod tests {
 
         let env = EnvBuilder::new()
             .auto_term(false)
-            .extend(pane_spawn_env(&ClientCapabilities::default()))
+            .extend(pane_spawn_env(&ClientCapabilities::default(), "eagle/0"))
             .build();
         assert_eq!(env.get("TERM").map(String::as_str), Some("xterm-256color"));
         assert_eq!(env.get("COLORTERM").map(String::as_str), Some("truecolor"));

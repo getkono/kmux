@@ -1,8 +1,8 @@
 use super::category::MessageCategory;
 use super::key::KeyEvent;
 use super::session::{
-    ClientCapabilities, ClientId, ConnectionId, LayoutScheme, PaneId, PeerId, PeerTarget,
-    RequestId, SequenceNo, SplitDir, TabIndex, TermSize, WordId,
+    AttentionKind, ClientCapabilities, ClientId, ConnectionId, LayoutScheme, PaneId, PeerId,
+    PeerTarget, RequestId, SequenceNo, SplitDir, TabIndex, TermSize, WordId,
 };
 
 /// Messages sent from client -> server.
@@ -351,6 +351,22 @@ pub enum ClientMessage {
         word_id: WordId,
         client_id: ClientId,
     },
+
+    /// Request a desktop notification on behalf of the program running in
+    /// `pane_id` (issue #169). Sent by `kmux notify`, which a tool inside the
+    /// pane (e.g. Claude Code's `Stop`/`Notification` hooks) invokes when it
+    /// finishes a turn or needs input. The daemon validates the pane, then
+    /// broadcasts [`super::session::SessionEventMsg::PaneAttention`] to all
+    /// clients so the GUI showing that session can surface it. Reply:
+    /// [`super::server::ServerMessage::NotifyAccepted`], or an `Error` if the
+    /// pane is unknown.
+    Notify {
+        request_id: RequestId,
+        pane_id: PaneId,
+        kind: AttentionKind,
+        title: String,
+        body: String,
+    },
 }
 
 impl ClientMessage {
@@ -394,7 +410,8 @@ impl ClientMessage {
             | Self::OpenPeer { .. }
             | Self::ClosePeer { .. }
             | Self::ClientList { .. }
-            | Self::KickClient { .. } => MessageCategory::Control,
+            | Self::KickClient { .. }
+            | Self::Notify { .. } => MessageCategory::Control,
             Self::Auth { .. } | Self::AuthProof { .. } | Self::ChannelReady => {
                 MessageCategory::Bootstrap
             }
