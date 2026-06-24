@@ -5,7 +5,8 @@ A terminal multiplexer / session manager with remote desktop capabilities.
 ## Commands
 
 Tasks run via `mise run <task>` (`mise tasks` lists them). Git hooks are managed
-by `hk` and installed by `mise install` (or `mise run setup`).
+by `hk`; `mise install` (or `mise run setup`) installs them and initializes the
+`vendor/ghostty` submodule.
 
 - `mise run test` — workspace test suite (matches CI)
 - `mise run clippy` / `clippy-fix` — lint / autofix

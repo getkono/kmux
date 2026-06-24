@@ -76,8 +76,9 @@ configuration.
     pinned zig is always on `PATH` — `mise run install` / `mise run build` work
     regardless. For a raw `cargo build`/`cargo install`, either activate mise,
     run it under `mise exec -- cargo …`, or pass `ZIG="$(mise which zig)" cargo …`.
-- Ghostty sources as a git submodule: after cloning, run
-  `git submodule update --init` once to populate `vendor/ghostty/`.
+- Ghostty sources as a git submodule, populating `vendor/ghostty/`. `mise install`
+  (or `mise run setup`) initializes it for you; to do it by hand, run
+  `git submodule update --init --recursive` at the repo root.
 - **GTK4 development libraries** — required only to build the GTK GUI binary
   (`kmux-gtk`). The `kmux` entrypoint and `kmuxd` binaries do not need them.
   - Fedora: `sudo dnf install gtk4-devel libadwaita-devel`
@@ -158,8 +159,9 @@ mise run clippy   # cargo clippy (warnings denied)
 
 Git hooks are managed by [hk](https://hk.jdx.dev) (pinned in `mise.toml`):
 format + lint auto-fix on commit (the fixes are auto-staged for you), and
-format/lint/tests on push. `mise install` installs hk and wires the hooks into
-git automatically; if the hooks aren't active, run `mise run setup`.
+format/lint/tests on push. `mise install` installs hk, wires the hooks into git,
+and initializes the `vendor/ghostty/` submodule automatically; if any of that
+didn't take (e.g. no network on first run), run `mise run setup`.
 
 ## Contributing
 
