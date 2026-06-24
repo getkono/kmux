@@ -190,15 +190,18 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   - The daemon's `PeerOpened`/`PeerError` replies become `SessionEvent::PeerOpened`/`PeerError`.
     `PeerOpened` re-arms the auto-select that was suppressed pre-federation and refreshes the
     session list (so the *remote's* sessions drive the picker); `PeerError` surfaces as a
-    disconnect (reconnect retries the local link + `OpenPeer`). The server picker
-    (`prepare_switch`) routes through the same path.
-  - **Known v1 limitations** (flagged for the runtime pass): switching servers does not yet
-    `ClosePeer` the outgoing peer (its sessions linger until the daemon drops it);
-    `--session NAME` does not match the peer-decorated `NAME @ peer` form; there can be a
-    brief `Normal`-mode flash between local connect and federation. Covered by unit tests
-    (`federate_desired_peer_*`, `peer_opened_*`, `peer_error_*`, `prepare_switch_*`); the
-    end-to-end UX needs a running GTK/Swift GUI + a reachable remote, so it is verified there,
-    not in CI.
+    disconnect (reconnect retries the local link + `OpenPeer`). The launcher's expand /
+    `disconnect_remote` actions drive peer setup and teardown through this same
+    `open_peer`/`close_peer` path; `collapse_remote` keeps the link while an active session
+    still belongs to the peer and sends `ClosePeer` once it does not (the old
+    `ServerPicker`/`prepare_switch` switch model was retired).
+  - **Known v1 limitation** (flagged for the runtime pass): a brief `Normal`-mode flash between
+    local connect and federation. (Two earlier gaps are resolved: peer teardown now rides
+    `collapse_remote`/`disconnect_remote`, and `--session NAME` matches the undecorated
+    `SessionEntry::base_name()`, so it resolves a federated `NAME @ peer` session.) Covered by
+    unit tests (`federate_desired_peer_*`, `peer_opened_*`, `peer_error_*`,
+    `find_session_by_name_*`); the end-to-end UX needs a running GTK/Swift GUI + a reachable
+    remote, so it is verified there, not in CI.
 - **PR5b — lean GUI: the network stack is feature-gated out — landed.** A default-on
   `remote` feature on `kmux-connect` gates the direct-transport surface (QUIC via `quinn`,
   TCP+TLS via `rustls`/`tokio-rustls`, `ssh::negotiate`, and the `TransportSupervisor`).

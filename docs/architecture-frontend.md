@@ -61,7 +61,7 @@ The contract a frontend implements:
   your color type at the render leaf), `core.mgr.active_grid()` (the `CellGrid`
   to paint), `core.hud_visible`, the picker fields, etc.
 - **Effects out**: `dispatch_action` returns a `KeyResult`. Besides the
-  control-flow variants (`Quit`, `Reconnect`, `SwitchServer`), it can return
+  control-flow variants (`Quit`, `Reconnect`), it can return
   `CopyToClipboard(String)` / `RequestPaste` — clipboard access is toolkit-
   specific, so the *frontend* performs it. `ForwardKey` (sending a keystroke to
   the PTY under the live terminal-mode state) also stays frontend-side, because

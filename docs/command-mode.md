@@ -192,23 +192,25 @@ are caught at CI time rather than at runtime.
 ## Control flow back to the event loop
 
 Most commands return `CommandSuccess::Ok` (no follow-up) or
-`CommandSuccess::Status(s)` (toast in the bottom bar). Three variants escape
+`CommandSuccess::Status(s)` (toast in the bottom bar). Two variants escape
 back to `App::run`:
 
 | Variant | Maps to `KeyResult` | Used by |
 |---|---|---|
 | `Quit` | `KeyResult::Quit` | `/quit` |
 | `Reconnect` | `KeyResult::Reconnect` | `/reconnect` |
-| `SwitchServer(t)` | `KeyResult::SwitchServer(t)` | `/local` (and future `/connect …`) |
 
 `exec::Outcome` mirrors these so the submit handler in `dispatch_action` can
-funnel them up unchanged.
+funnel them up unchanged. (The old `SwitchServer` escape was retired with the
+`ServerPicker` whole-client reconnect path; remotes are now federated in place —
+`/connect` / `/disconnect-remote` go through the launcher's `open_peer`/`close_peer`,
+not a reconnect.)
 
 ## Future work
 
-* `/connect <host[:port]> [token]` — needs token capture; today the
-  framework supports it (just return `SwitchServer(SwitchTarget::Direct{…})`)
-  but the path through `Reconnect` flow needs verification.
+* `/connect <host[:port]> [token]` — Direct-mode (token-authenticated) federation
+  still needs token capture; `/connect <user@host>` already federates an SSH remote
+  into the local hub via `open_peer` (`cmd_connect`).
 * Real `Ping`/`Pong` round-trip — `daemon ping` currently piggybacks on
   `request_session_list`. Adding a dedicated public method on
   `SessionManager` would let the command surface RTT.
