@@ -125,6 +125,7 @@ private struct LaunchRowView: View {
         switch row.kind {
         case .localNewSession, .remoteNewSession: return "plus.circle"
         case .localExisting, .remoteExisting: return "terminal"
+        case .closedSession: return "arrow.clockwise"
         case .remote: return row.expanded ? "chevron.down" : "chevron.right"
         case .addRemote: return "plus.rectangle.on.folder"
         }

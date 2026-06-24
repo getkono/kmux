@@ -260,6 +260,34 @@ width for `Indeterminate`), looked up via `SessionManager::pane_info` (GTK) /
 keystroke. The **GPU path** (`renderer = "gpu"`) does not yet draw the bar —
 surfacing it through the shared `kmux-render` scene is a follow-up.
 
+## Symbol glyph fallback
+
+The configured monospace font usually lacks Powerline separators (U+E0B0–) and
+Nerd Font Private Use Area icons, which would otherwise render as tofu/blank
+(issue #145). A single bundled font — `crates/kmux-render/assets/SymbolsNerdFontMono-Regular.ttf`
+(Symbols Nerd Font Mono, exposed as `kmux_render::symbol_fallback_bytes()` over
+the FFI) — supplies them as a per-glyph fallback. Each of the three render paths
+wires it in differently, but with the same effect: a glyph the primary face
+lacks is drawn from the symbol font instead.
+
+- **GPU atlas** (`kmux-render`): explicit fallback in `atlas.rs` — if the primary
+  face doesn't map the char, try `symbol_fallback()` before rendering blank.
+- **GTK Cairo/Pango**: the font is registered with fontconfig
+  (`FcConfigAppFontAddFile`, `kmux-gtk/src/imp.rs`); Pango's automatic fallback
+  search then resolves missing glyphs from it.
+- **Swift CoreText**: resolved **per glyph** at draw time.
+  `TerminalMetrics.drawFont(for:base:)` asks the configured face whether it has
+  the glyph (`CTFontGetGlyphsForCharacters`, surrogate-safe so non-BMP Nerd
+  icons count) and, if not, draws that character straight from the bundled
+  symbol font; anything neither face has (emoji/CJK) falls through to
+  `NSAttributedString.draw`'s natural cascade. Registering the font or installing
+  it in a `kCTFontCascadeListAttribute` does **not** work — a custom cascade list
+  is silently ignored by CoreText on the system monospaced font (the default
+  `"monospace"` → SF Mono), which is exactly the case that matters.
+
+Verify visually with `kmux diagnostic glyphs` on each path; the diagnostic
+asserts nothing about pixels.
+
 ## Testing
 
 Two tiers:

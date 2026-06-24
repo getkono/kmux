@@ -1,3 +1,5 @@
+import AppKit
+import CoreText
 import XCTest
 
 import KmuxBindings
@@ -77,6 +79,63 @@ final class RenderingTests: XCTestCase {
         let (c0, r0) = m.colsRows(width: 0, height: 0)
         XCTAssertEqual(c0, 1)
         XCTAssertEqual(r0, 1)
+    }
+
+    /// Number of painted (non-transparent) pixels when `s` is drawn at `.zero`
+    /// with `font` via `NSAttributedString.draw` — the exact mechanism
+    /// `TerminalView.drawGlyph` uses (NSStringDrawing, not `CTLine`).
+    private func drawnInk(_ s: String, font: NSFont) -> Int {
+        guard
+            let rep = NSBitmapImageRep(
+                bitmapDataPlanes: nil, pixelsWide: 40, pixelsHigh: 40, bitsPerSample: 8,
+                samplesPerPixel: 4, hasAlpha: true, isPlanar: false, colorSpaceName: .deviceRGB,
+                bytesPerRow: 0, bitsPerPixel: 0)
+        else { return -1 }
+        NSGraphicsContext.saveGraphicsState()
+        NSGraphicsContext.current = NSGraphicsContext(bitmapImageRep: rep)
+        NSAttributedString(string: s, attributes: [.font: font, .foregroundColor: NSColor.white])
+            .draw(at: .zero)
+        NSGraphicsContext.restoreGraphicsState()
+        guard let data = rep.bitmapData else { return -1 }
+        var count = 0
+        for i in stride(from: 3, to: rep.bytesPerRow * 40, by: 4) where data[i] != 0 { count += 1 }
+        return count
+    }
+
+    func testPerGlyphSymbolFallbackOnTheSystemMonoFont() {
+        // Regression guard for issue #145, exercising the *system monospaced font*
+        // (SF Mono) — the actual default (family "monospace" resolves to it) and
+        // the case the prior cascade-list fix silently missed: CoreText ignores a
+        // custom kCTFontCascadeListAttribute on the system UI fonts. The grid now
+        // substitutes the bundled symbol font per glyph in `drawFont(for:base:)`.
+        let sysMono = NSFont.monospacedSystemFont(ofSize: 13, weight: .regular)
+        let m = TerminalMetrics(font: sysMono)
+        guard let symbol = m.symbolFont else {
+            XCTFail("symbol fallback font unavailable")
+            return
+        }
+
+        // Powerline (BMP), Nerd icon (BMP), and a non-BMP Nerd glyph — the bundled
+        // font is mostly non-BMP, so this also guards the surrogate-safe coverage
+        // check (`font(_:covers:)` must inspect glyph slot 0, not `contains(0)`).
+        let fallbackGlyphs: [Character] = [
+            "\u{E0B0}", "\u{F015}", Character(UnicodeScalar(0xF0001)!),
+        ]
+        for ch in fallbackGlyphs {
+            let scalar = String(format: "U+%04X", ch.unicodeScalars.first!.value)
+            XCTAssertFalse(
+                TerminalMetrics.hasGlyph(sysMono, for: ch), "\(scalar): base unexpectedly has glyph")
+            XCTAssertTrue(
+                TerminalMetrics.hasGlyph(symbol, for: ch), "\(scalar): symbol font lacks glyph")
+            let resolved = m.drawFont(for: ch, base: m.font)
+            XCTAssertTrue(resolved === symbol, "\(scalar) did not resolve to the symbol font")
+            XCTAssertGreaterThan(
+                drawnInk(String(ch), font: resolved), 0, "\(scalar) painted nothing")
+        }
+
+        // Plain ASCII stays on the configured face (no needless substitution).
+        XCTAssertTrue(TerminalMetrics.hasGlyph(m.font, for: "A"))
+        XCTAssertTrue(m.drawFont(for: "A", base: m.font) === m.font)
     }
 
     func testMetricsFromAppearanceAppliesCellAdjust() {

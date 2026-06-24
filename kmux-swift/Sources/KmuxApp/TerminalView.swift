@@ -23,7 +23,14 @@ struct TerminalView: NSViewRepresentable {
 /// driver on resize. Keyboard/mouse input is attached in `KeyInput`/`MouseInput`.
 final class TerminalNSView: NSView {
     let model: KmuxModel
-    private(set) var metrics: TerminalMetrics
+    private(set) var metrics: TerminalMetrics {
+        didSet { glyphFontCache.removeAll(keepingCapacity: true) }
+    }
+    /// Per-`(glyph, style)` memo of the face each character draws with, so the
+    /// per-cell symbol-fallback resolution (`TerminalMetrics.drawFont`) runs once
+    /// per distinct glyph instead of on every frame. Tied to `metrics` (cleared
+    /// in its `didSet`).
+    private var glyphFontCache: [GlyphFontKey: NSFont] = [:]
     /// Anchor cell (visible coords) of an in-progress single-click drag selection.
     var dragAnchor: (col: Int, row: Int)?
     /// Last pointer location (view coords) during a drag; drives auto-scroll.
@@ -332,19 +339,39 @@ final class TerminalNSView: NSView {
         )
     }
 
+    /// Memoized key for `font(for:bold:italic:)`.
+    private struct GlyphFontKey: Hashable {
+        let ch: Character
+        let bold: Bool
+        let italic: Bool
+    }
+
+    /// The face to draw `ch` with for the given style: the configured variant
+    /// face, or the bundled symbol font when that face lacks the glyph
+    /// (Powerline/Nerd — issue #145). Memoized in `glyphFontCache`.
+    private func font(for ch: Character, bold: Bool, italic: Bool) -> NSFont {
+        let key = GlyphFontKey(ch: ch, bold: bold, italic: italic)
+        if let cached = glyphFontCache[key] { return cached }
+        let base: NSFont
+        switch (bold, italic) {
+        case (true, true): base = metrics.fontBoldItalic
+        case (true, false): base = metrics.fontBold
+        case (false, true): base = metrics.fontItalic
+        case (false, false): base = metrics.font
+        }
+        let resolved = metrics.drawFont(for: ch, base: base)
+        glyphFontCache[key] = resolved
+        return resolved
+    }
+
     private func drawGlyph(
         _ ch: Character, cell: PackedCell, row: Int, col: Int, theme: FfiTheme,
         metrics m: TerminalMetrics
     ) {
         // Pick the matching face (explicit variant family, else synthetic style),
-        // each already carrying the configured OpenType features.
-        let font: NSFont
-        switch (cell.bold, cell.italic) {
-        case (true, true): font = m.fontBoldItalic
-        case (true, false): font = m.fontBold
-        case (false, true): font = m.fontItalic
-        case (false, false): font = m.font
-        }
+        // each already carrying the configured OpenType features — and fall back
+        // to the bundled symbol font per-glyph for glyphs the face lacks.
+        let font = self.font(for: ch, bold: cell.bold, italic: cell.italic)
         var color = nsRGB(cell.fg)
         if cell.dim { color = color.withAlphaComponent(0.55) }
 
@@ -374,9 +401,10 @@ final class TerminalNSView: NSView {
                 if (idx + 1) * PackedCellLayout.stride <= snap.cells.count {
                     let cell = snap.cells.withUnsafeBytes { PackedCellLayout.decode($0, idx) }
                     if let ch = cell.character {
+                        let font = self.font(for: ch, bold: cell.bold, italic: cell.italic)
                         NSAttributedString(
                             string: String(ch),
-                            attributes: [.font: m.font, .foregroundColor: theme.cursorFg.nsColor]
+                            attributes: [.font: font, .foregroundColor: theme.cursorFg.nsColor]
                         ).draw(at: CGPoint(x: x, y: y))
                     }
                 }
