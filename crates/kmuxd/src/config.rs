@@ -113,6 +113,14 @@ pub struct DaemonConfig {
     /// isolated `kmux-vt-worker` subprocess.
     #[serde(default)]
     pub session_isolation: SessionIsolationMode,
+    /// Closed-session graveyard count cap (issue #64): the most recent N closed
+    /// sessions are retained for restore; the oldest are evicted past N.
+    #[serde(default = "default_closed_session_keep")]
+    pub closed_session_keep: u32,
+    /// Closed-session graveyard age cap in days (issue #64): closed sessions
+    /// older than this are pruned. `0` disables age-based pruning.
+    #[serde(default = "default_closed_session_ttl_days")]
+    pub closed_session_ttl_days: u32,
 }
 
 impl Default for DaemonConfig {
@@ -120,12 +128,31 @@ impl Default for DaemonConfig {
         Self {
             idle_shutdown_secs: default_idle_shutdown_secs(),
             session_isolation: SessionIsolationMode::default(),
+            closed_session_keep: default_closed_session_keep(),
+            closed_session_ttl_days: default_closed_session_ttl_days(),
         }
     }
 }
 
 fn default_idle_shutdown_secs() -> u64 {
     30
+}
+
+/// Default count cap for the closed-session graveyard (issue #64).
+pub const DEFAULT_CLOSED_SESSION_KEEP: u32 = 20;
+/// Default age cap (days) for the closed-session graveyard (issue #64).
+pub const DEFAULT_CLOSED_SESSION_TTL_DAYS: u32 = 7;
+
+fn default_closed_session_keep() -> u32 {
+    DEFAULT_CLOSED_SESSION_KEEP
+}
+fn default_closed_session_ttl_days() -> u32 {
+    DEFAULT_CLOSED_SESSION_TTL_DAYS
+}
+
+/// The default TTL expressed in milliseconds, for `ServerApp::new` defaults.
+pub fn default_closed_session_ttl_ms() -> u64 {
+    DEFAULT_CLOSED_SESSION_TTL_DAYS as u64 * 24 * 60 * 60 * 1000
 }
 
 fn default_config_version() -> u32 {
@@ -379,6 +406,10 @@ pub struct ServerConfig {
     pub idle_shutdown_secs: u64,
     /// Pane VT-pipeline isolation mode (issue #126).
     pub session_isolation: SessionIsolationMode,
+    /// Closed-session graveyard count cap (issue #64).
+    pub closed_session_keep: u32,
+    /// Closed-session graveyard age cap in days (issue #64); `0` disables it.
+    pub closed_session_ttl_days: u32,
 }
 
 impl ServerConfig {
@@ -418,6 +449,8 @@ impl ServerConfig {
             runtime_dir: file.runtime_dir,
             idle_shutdown_secs: file.daemon.idle_shutdown_secs,
             session_isolation: file.daemon.session_isolation,
+            closed_session_keep: file.daemon.closed_session_keep,
+            closed_session_ttl_days: file.daemon.closed_session_ttl_days,
         })
     }
 }

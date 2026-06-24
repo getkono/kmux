@@ -19,12 +19,30 @@ impl SessionManager {
         Ok(pane_id)
     }
 
+    /// Whether user PTY input is suppressed because the connection is *manually*
+    /// paused (issue #165). `pause_applied` is the last `(paused, auto)` pushed to
+    /// the daemon, and `(true, false)` is exactly a manual pause — a manual pause
+    /// wins over auto, so it always serialises with `auto = false`. A manual pause
+    /// is a deliberate "stop streaming" choice, so the keystrokes the user can't
+    /// see the output of are dropped rather than blindly sent to the PTY.
+    ///
+    /// An *auto*-pause does not suppress input: a keystroke resumes it instead
+    /// (`FrontendDriver::resume_if_auto_paused`), so those bytes flow through.
+    /// This is the single chokepoint for every input path — keys, paste, raw
+    /// bytes, and the mouse-report wheels/buttons that route through `send_input`.
+    fn input_suppressed(&self) -> bool {
+        self.pause_applied == (true, false)
+    }
+
     /// Send raw PTY input bytes for the active pane.
     ///
     /// Used for paths where bytes are already produced (mouse-report wheels,
     /// out-of-band signals).  Use [`Self::send_key_batch`] for actual
     /// keystrokes so the daemon can encode them with live mode state.
     pub fn send_input(&mut self, data: Vec<u8>) -> bool {
+        if self.input_suppressed() {
+            return false;
+        }
         match self.active_pane_unlocked() {
             Ok(pane_id) => {
                 self.send_ws(ClientMessage::PtyInput { pane_id, data });
@@ -85,6 +103,9 @@ impl SessionManager {
     /// bytes always match what the inner program negotiated (DECCKM, kitty
     /// kbd flags, modifyOtherKeys, …).
     pub fn send_key_batch(&mut self, events: Vec<KeyEvent>) -> bool {
+        if self.input_suppressed() {
+            return false;
+        }
         if events.is_empty() {
             return true;
         }
@@ -99,6 +120,9 @@ impl SessionManager {
 
     /// Send a paste string for the active pane.
     pub fn send_paste(&mut self, text: String) -> bool {
+        if self.input_suppressed() {
+            return false;
+        }
         if text.is_empty() {
             return true;
         }

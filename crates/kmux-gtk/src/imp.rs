@@ -26,6 +26,7 @@
 //! non-Rust frontend (e.g. the SwiftUI macOS app, via `kmux-ffi`) drives too.
 
 mod actions;
+mod attention;
 mod clients;
 mod convert;
 mod css;
@@ -107,7 +108,17 @@ pub(crate) fn run() -> anyhow::Result<()> {
 
 /// Run the GTK application for an interactive session built from `plan`.
 fn run_gui(plan: Plan) -> anyhow::Result<()> {
-    let app = Application::builder().application_id(APP_ID).build();
+    // Release builds keep the D-Bus single-instance lock (a second `kmux` routes
+    // its `activate` to the primary, which opens a new window). Debug builds opt
+    // OUT (`NON_UNIQUE`) so a freshly built `./kmux` always runs ITS OWN process
+    // and code instead of handing off to a possibly-stale primary — the launcher
+    // also kills the prior dev instance, so there is still exactly one. This is
+    // what makes a dev rebuild verifiable.
+    let mut builder = Application::builder().application_id(APP_ID);
+    if cfg!(debug_assertions) {
+        builder = builder.flags(gio::ApplicationFlags::NON_UNIQUE);
+    }
+    let app = builder.build();
     let plan = Rc::new(plan);
     // A fatal bootstrap error is shown in-window (disconnect overlay) and also
     // surfaced to stderr after teardown, mirroring the TUI's stashed-error path.
@@ -314,6 +325,10 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     // they become native dialogs.
     let shell = shell::build(app, &drawing);
 
+    // Register this window for cross-window attention routing (issue #169): a
+    // `kmux notify` notification's click picks the best window for the session.
+    attention::register_window(&shell.window, &fe, &drawing);
+
     // Auto-pause the connection while the window is minimized (issue #68). The
     // GdkSurface — whose toplevel carries the minimized state — only exists once
     // the window is realized, so attach the watcher from `realize`. Focus loss
@@ -498,6 +513,16 @@ pub(crate) fn apply_effects(
             FrontendEffect::CopyToClipboard(text) => copy_to_clipboard(&text),
             FrontendEffect::RequestPaste => request_paste(fe, drawing),
             FrontendEffect::Quit => app.quit(),
+            // A `kmux notify` attention (#169): post one native notification
+            // (deduped across windows) that refocuses the session on click.
+            FrontendEffect::Attention {
+                word_id,
+                pane_id,
+                kind,
+                title,
+                body,
+                attention_id,
+            } => attention::surface(app, word_id, pane_id, kind, title, body, attention_id),
         }
     }
     redraw

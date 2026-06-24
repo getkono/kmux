@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ClientInfo, ClientMessage, PaneId, PaneProcesses, SequenceNo,
-    SessionEntry, TermSize, WordId,
+    ClientCapabilities, ClientId, ClientInfo, ClientMessage, ClosedSessionEntry, PaneId,
+    PaneProcesses, SequenceNo, SessionEntry, TermSize, WordId,
 };
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -69,6 +69,10 @@ pub struct SessionManager {
 
     // Session / tab / pane state
     pub session_list: Vec<SessionEntry>,
+    /// Closed (inactive) sessions offered for restore (issue #64), refreshed by
+    /// [`Self::request_closed_sessions`] (e.g. when the launcher opens) and
+    /// served already ordered most-recently-active first by the daemon.
+    pub closed_sessions: Vec<ClosedSessionEntry>,
     /// Latest per-pane process trees from the daemon (issue #122), keyed
     /// implicitly by `PaneProcesses::pane_id`. Refreshed by
     /// [`Self::request_process_overview`] while the process-overview view is
@@ -204,6 +208,7 @@ impl SessionManager {
             connected: false,
             status_msg: String::new(),
             session_list: Vec::new(),
+            closed_sessions: Vec::new(),
             process_overview: Vec::new(),
             client_list: Vec::new(),
             client_list_word: None,
@@ -654,6 +659,51 @@ mod tests {
         // Any-event tracking (1003): every motion, even with no button.
         let (mut mgr, _rx) = manager_with_modes(TermModes(TermModes::MOUSE_MOTION));
         assert!(mgr.report_mouse(false, motion()));
+    }
+
+    fn enter_key() -> kmux_protocol::messages::KeyEvent {
+        use kmux_protocol::messages::{KeyAction, KeyCode, KeyEvent, KeyMods};
+        KeyEvent {
+            code: KeyCode::Enter,
+            mods: KeyMods::default(),
+            action: KeyAction::Press,
+            text: String::new(),
+            unshifted_codepoint: 0,
+        }
+    }
+
+    /// A *manual* pause drops user PTY input across every path — keys, raw bytes,
+    /// and paste — so the user can't type blind into a terminal they can't see
+    /// (issue #165). Nothing reaches the wire.
+    #[test]
+    fn manual_pause_drops_user_input() {
+        let (mut mgr, mut rx) = manager_with_modes(TermModes::EMPTY);
+        mgr.pause_applied = (true, false); // manually paused
+
+        assert!(!mgr.send_key_batch(vec![enter_key()]), "keys are dropped");
+        assert!(!mgr.send_input(b"\x1b[A".to_vec()), "raw bytes are dropped");
+        assert!(!mgr.send_paste("hi".to_string()), "paste is dropped");
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing reaches the PTY while manually paused"
+        );
+    }
+
+    /// An *auto* pause does not drop input: a keystroke resumes the stream
+    /// upstream in the driver, so the bytes still flow through here (issue #165).
+    #[test]
+    fn auto_pause_does_not_drop_input() {
+        let (mut mgr, mut rx) = manager_with_modes(TermModes::EMPTY);
+        mgr.pause_applied = (true, true); // auto-paused
+
+        assert!(
+            mgr.send_key_batch(vec![enter_key()]),
+            "auto-paused keys flow"
+        );
+        assert!(
+            matches!(rx.try_recv(), Ok(ClientMessage::PtyKeyBatch { .. })),
+            "the keystroke reaches the PTY"
+        );
     }
 
     #[test]

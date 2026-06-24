@@ -39,7 +39,6 @@ enum DialogKind {
     /// local + remote open/create rows from [`AppCore::launch_rows`].
     Launch,
     Command,
-    Confirm,
     Rename,
     Help,
     /// The add-a-remote form (issue #121): a native field form, not a list.
@@ -66,7 +65,6 @@ impl DialogKind {
             Mode::DirectoryPicker => Some(DialogKind::DirPicker),
             Mode::LaunchPicker => Some(DialogKind::Launch),
             Mode::Command(_) => Some(DialogKind::Command),
-            Mode::ConfirmCloseSession { .. } => Some(DialogKind::Confirm),
             Mode::RenameSession { .. } | Mode::RenameTab { .. } => Some(DialogKind::Rename),
             Mode::Help => Some(DialogKind::Help),
             Mode::AddRemote => Some(DialogKind::AddRemote),
@@ -206,7 +204,6 @@ fn open_dialog(
     app: &gtk4::Application,
 ) -> LiveDialog {
     match kind {
-        DialogKind::Confirm => open_confirm(shell, fe),
         DialogKind::Rename => open_rename(shell, fe),
         DialogKind::Help => open_help(shell),
         DialogKind::AddRemote => open_add_remote_dialog(shell, fe),
@@ -504,6 +501,26 @@ fn launch_row_widget(
             }
             r
         }
+        LaunchRow::ClosedSession {
+            name,
+            cwd,
+            last_active_ms,
+            ..
+        } => {
+            let when = kmux_app::core::relative_time_label(*last_active_ms);
+            let subtitle = if cwd.is_empty() {
+                when.clone()
+            } else {
+                format!("{cwd} · {when}")
+            };
+            let r = launch_action_row(name, &subtitle, "view-refresh-symbolic", false);
+            r.add_suffix(&status_pill(
+                "restore",
+                "accent",
+                Some("Restore this closed session"),
+            ));
+            r
+        }
         LaunchRow::AddRemote => {
             launch_action_row("Add remote…", "", "network-server-symbolic", false)
         }
@@ -730,49 +747,6 @@ fn set_command_buffer(core: &mut AppCore, text: String) {
 }
 
 // ── One-shot alert dialogs ──
-
-fn open_confirm(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
-    let name = {
-        let core = &fe.borrow().core;
-        match &core.mode {
-            Mode::ConfirmCloseSession { word_id } => core.mgr.display_name_for(word_id),
-            _ => String::new(),
-        }
-    };
-    let dialog = adw::AlertDialog::new(
-        Some("Close session?"),
-        Some(&format!("“{name}” and all its panes will be closed.")),
-    );
-    dialog.add_response("cancel", "Cancel");
-    dialog.add_response("close", "Close");
-    dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);
-    dialog.set_default_response(Some("cancel"));
-    dialog.set_close_response("cancel");
-    {
-        let fe = fe.clone();
-        let shell = shell.clone();
-        dialog.connect_response(None, move |_d, resp| {
-            let action = if resp == "close" {
-                Action::ConfirmCloseYes
-            } else {
-                Action::ExitToNormal
-            };
-            {
-                let mut f = fe.borrow_mut();
-                let _ = futures::executor::block_on(f.core.dispatch_action(action));
-                f.core.needs_render = true;
-            }
-            shell.drawing.queue_draw();
-        });
-    }
-    dialog.present(Some(&shell.window));
-    LiveDialog {
-        kind: DialogKind::Confirm,
-        dialog: dialog.upcast(),
-        list: None,
-        search: None,
-    }
-}
 
 fn open_rename(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
     let (current, title) = {

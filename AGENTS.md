@@ -5,7 +5,8 @@ A terminal multiplexer / session manager with remote desktop capabilities.
 ## Commands
 
 Tasks run via `mise run <task>` (`mise tasks` lists them). Git hooks are managed
-by `hk` and installed by `mise install` (or `mise run setup`).
+by `hk`; `mise install` (or `mise run setup`) installs them and initializes the
+`vendor/ghostty` submodule.
 
 - `mise run test` — workspace test suite (matches CI)
 - `mise run clippy` / `clippy-fix` — lint / autofix
@@ -50,6 +51,10 @@ These are strictly-typed config/CLI, not environment variables.
 - `kmux clients [<session>]` / `kmux kick <session> <client>` — list the client
   connections attached to sessions and detach one (issue #146).
   See [docs/architecture-identity.md](docs/architecture-identity.md).
+- `kmux notify` — from inside a pane, raise a native desktop notification on the
+  GUI showing that session; clicking it refocuses the window + pane (issue #169).
+  Reads `KMUX_PANE`/`KMUX_SESSION`; wired to Claude Code's `Stop`/`Notification`
+  hooks. See [docs/architecture-claude-integration.md](docs/architecture-claude-integration.md).
 - `kmux debug paths` — print the active profile's log/state/runtime paths.
   Debug builds isolate state under `kmux-debug/`.
   See [docs/profile-isolation.md](docs/profile-isolation.md).

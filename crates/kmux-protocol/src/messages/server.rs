@@ -3,8 +3,9 @@ use std::sync::Arc;
 use super::category::MessageCategory;
 use super::process::PaneProcesses;
 use super::session::{
-    ClientId, ClientInfo, ConnectionId, DirEntry, ErrorCode, LayoutNode, PaneId, PaneInfo, PeerId,
-    RequestId, SequenceNo, SessionEntry, SessionEventMsg, TabIndex, TabInfo, WordId,
+    ClientId, ClientInfo, ClosedSessionEntry, ConnectionId, DirEntry, ErrorCode, LayoutNode,
+    PaneId, PaneInfo, PeerId, RequestId, SequenceNo, SessionEntry, SessionEventMsg, TabIndex,
+    TabInfo, WordId,
 };
 use super::types::Compression;
 use super::vt::{CellState, CursorState, GridSnapshot, TermModes, TerminalDiff};
@@ -77,6 +78,13 @@ pub enum ServerMessage {
     SessionListResult {
         request_id: RequestId,
         sessions: Vec<SessionEntry>,
+    },
+
+    /// Response to `SessionListClosed` (issue #64): the closed (inactive)
+    /// sessions retained in the daemon's graveyard, newest-active first.
+    ClosedSessionListResult {
+        request_id: RequestId,
+        sessions: Vec<ClosedSessionEntry>,
     },
 
     /// Response to `ProcessOverview` (issue #122): the process tree of every
@@ -289,6 +297,13 @@ pub enum ServerMessage {
     /// another client (issue #146), so its UI can leave the session. `by_label`
     /// is the user-readable label of the connection that issued the kick.
     SessionKicked { word_id: WordId, by_label: String },
+
+    /// Acknowledges a [`super::client::ClientMessage::Notify`] (issue #169): the
+    /// pane was valid and the attention was broadcast as a
+    /// [`super::session::SessionEventMsg::PaneAttention`]. The actual
+    /// notification is surfaced by the GUI clients; this just confirms the
+    /// request reached the owning daemon (an unknown pane yields `Error`).
+    NotifyAccepted { request_id: RequestId },
 }
 
 impl ServerMessage {
@@ -307,6 +322,7 @@ impl ServerMessage {
             Self::SessionCreated { .. }
             | Self::SessionClosed { .. }
             | Self::SessionListResult { .. }
+            | Self::ClosedSessionListResult { .. }
             | Self::ProcessOverviewResult { .. }
             | Self::SessionRenamed { .. }
             | Self::PaneCreated { .. }
@@ -326,7 +342,8 @@ impl ServerMessage {
             | Self::PeerError { .. }
             | Self::ClientListResult { .. }
             | Self::ClientKicked { .. }
-            | Self::SessionKicked { .. } => MessageCategory::Control,
+            | Self::SessionKicked { .. }
+            | Self::NotifyAccepted { .. } => MessageCategory::Control,
             Self::Lagged { .. } | Self::SyncReset { .. } => MessageCategory::Sync,
             Self::AuthChallenge { .. } | Self::AuthResult { .. } | Self::ChannelSwitched { .. } => {
                 MessageCategory::Bootstrap

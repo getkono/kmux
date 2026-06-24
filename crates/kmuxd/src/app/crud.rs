@@ -1,10 +1,11 @@
 use std::path::Path;
 use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use kmux_protocol::format_pane_id;
 use kmux_protocol::messages::{
     ClientCapabilities, LayoutNode, PaneId, PaneInfo, PaneProcesses, SessionEntry, SessionMeta,
-    SessionStatus, TermSize,
+    SessionStatus, TermSize, epoch_millis,
 };
 use kmux_pty::error::{KmuxError, Result};
 
@@ -110,6 +111,7 @@ impl ServerApp {
             tabs: vec![tab],
             next_tab_index: 1,
             active_tab: 0,
+            last_active: Arc::new(AtomicU64::new(epoch_millis())),
         };
 
         self.sessions.write().await.insert(word_id.clone(), state);
@@ -125,33 +127,67 @@ impl ServerApp {
         })
     }
 
-    /// Gracefully close all panes of a session and remove it.
+    /// Gracefully close all panes of a session and remove it from the live map.
+    ///
+    /// The session is not discarded: its snapshot is retained in the closed-
+    /// session graveyard so the user can restore it later (issue #64). The
+    /// snapshot is captured and persisted **before** the PTYs are killed, so the
+    /// restorable copy survives even if the daemon crashes mid-close. The word is
+    /// intentionally **not** released — it stays reserved while the session is in
+    /// the graveyard so a restore preserves its identity; it is freed only when
+    /// the entry is evicted by the retention caps.
     pub async fn close_session(&self, word_id: &str) -> Result<Option<i32>> {
-        let pane_ids: Vec<(u32, String)> = {
+        let pane_ids: Vec<String> = {
             let sessions = self.sessions.read().await;
-            sessions
-                .get(word_id)
-                .map(|s| {
-                    s.panes
-                        .keys()
-                        .map(|&idx| (idx, format_pane_id(word_id, idx)))
-                        .collect()
-                })
-                .unwrap_or_default()
+            let Some(state) = sessions.get(word_id) else {
+                return Ok(None);
+            };
+            let snapshot = self.snapshot_session(state).await;
+            let pane_ids = state
+                .panes
+                .keys()
+                .map(|&idx| format_pane_id(word_id, idx))
+                .collect();
+            self.retain_closed_session(crate::persist::PersistedClosedSession {
+                session: snapshot,
+                closed_at_ms: epoch_millis(),
+            });
+            pane_ids
         };
 
-        for (_, pane_id) in &pane_ids {
+        for pane_id in &pane_ids {
             let _ = self.manager.close_nowait(pane_id).await;
         }
 
-        // Remove session state
-        let mut sessions = self.sessions.write().await;
-        sessions.remove(word_id);
-
-        // Return word to pool
-        self.wordlist.lock().unwrap().release(word_id);
+        self.sessions.write().await.remove(word_id);
 
         Ok(None)
+    }
+
+    /// Build the wire [`SessionEntry`] for one live session (local; `peer: None`).
+    /// Shared by [`list_sessions`](Self::list_sessions) and the restore path.
+    pub(super) fn build_session_entry(&self, state: &SessionState) -> SessionEntry {
+        let mut panes: Vec<PaneInfo> = state
+            .panes
+            .iter()
+            .map(|(&pane_index, relay)| {
+                let attached_clients = relay.clients.lock().unwrap().keys().copied().collect();
+                relay.to_pane_info(
+                    format_pane_id(&state.meta.word_id, pane_index),
+                    pane_index,
+                    attached_clients,
+                    relay.status.clone(),
+                )
+            })
+            .collect();
+        panes.sort_by_key(|p| p.pane_index);
+        SessionEntry {
+            meta: state.meta.clone(),
+            panes,
+            tabs: state.tab_infos(),
+            active_tab: state.active_tab,
+            peer: None,
+        }
     }
 
     /// List all active sessions with their pane metadata.
@@ -159,30 +195,7 @@ impl ServerApp {
         let sessions = self.sessions.read().await;
         let mut entries: Vec<SessionEntry> = sessions
             .values()
-            .map(|state| {
-                let mut panes: Vec<PaneInfo> = state
-                    .panes
-                    .iter()
-                    .map(|(&pane_index, relay)| {
-                        let attached_clients =
-                            relay.clients.lock().unwrap().keys().copied().collect();
-                        relay.to_pane_info(
-                            format_pane_id(&state.meta.word_id, pane_index),
-                            pane_index,
-                            attached_clients,
-                            relay.status.clone(),
-                        )
-                    })
-                    .collect();
-                panes.sort_by_key(|p| p.pane_index);
-                SessionEntry {
-                    meta: state.meta.clone(),
-                    panes,
-                    tabs: state.tab_infos(),
-                    active_tab: state.active_tab,
-                    peer: None,
-                }
-            })
+            .map(|state| self.build_session_entry(state))
             .collect();
         entries.sort_by_key(|e| e.meta.index);
         entries

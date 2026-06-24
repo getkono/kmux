@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::session_manager::SessionManager;
 use kmux_client::ssh::RemoteTarget;
-use kmux_protocol::messages::{ClientCapabilities, PeerId, PeerTarget, ServerMessage, TermSize};
+use kmux_protocol::messages::{
+    AttentionKind, ClientCapabilities, PeerId, PeerTarget, ServerMessage, TermSize,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::appearance::Appearance;
@@ -54,6 +56,17 @@ pub struct PendingClose {
     pub deadline: Instant,
 }
 
+/// A session whose close has been requested but deferred (issue #64). The real
+/// `SessionClose` is sent only once `deadline` passes; until then the user can
+/// undo, leaving the live session (and all its processes) untouched.
+#[derive(Debug, Clone)]
+pub struct PendingSessionClose {
+    pub word_id: String,
+    /// Display name captured at request time, for the "restored" toast.
+    pub name: String,
+    pub deadline: Instant,
+}
+
 /// What a key/action dispatch returns to the frontend's run loop.
 ///
 /// This is the core → frontend control-flow channel: the frontend matches on
@@ -73,6 +86,18 @@ pub enum KeyResult {
     /// Core requests the frontend read the system clipboard and feed it back as
     /// a paste (the frontend forwards the text to `mgr.send_paste`).
     RequestPaste,
+    /// A program in a pane requested attention via `kmux notify` (issue #169).
+    /// The frontend raises a native desktop notification and, on click,
+    /// refocuses the window for `word_id` and selects `pane_id`. `attention_id`
+    /// dedups across a frontend's windows so exactly one notification is posted.
+    Attention {
+        word_id: String,
+        pane_id: String,
+        kind: AttentionKind,
+        title: String,
+        body: String,
+        attention_id: u64,
+    },
 }
 
 /// Action carried by a clickable top-bar segment. Frontend-neutral intent: a
@@ -153,8 +178,42 @@ pub enum LaunchRow {
         cwd: String,
         active: bool,
     },
+    /// Restore a closed (inactive) local session from the daemon's graveyard
+    /// (issue #64). Shown in a "Restore" section, ordered most-recently-active
+    /// first. Activating respawns it and attaches.
+    ClosedSession {
+        word_id: String,
+        name: String,
+        cwd: String,
+        /// Epoch-ms of last activity before close; frontends render it as a
+        /// relative "last active" label and the rows are ordered by it.
+        last_active_ms: u64,
+    },
     /// Affordance to add a new remote (SSH or Direct). Always the last row.
     AddRemote,
+}
+
+/// Format an epoch-ms "last active" timestamp as a short relative label for the
+/// restore UI (issue #64): `"just now"`, `"5m ago"`, `"2h ago"`, `"3d ago"`.
+/// `0` (the "unknown" sentinel for pre-v4 sessions) yields `"unknown"`.
+/// Frontend-agnostic so GTK and the Swift FFI render closed-session rows alike.
+pub fn relative_time_label(last_active_ms: u64) -> String {
+    if last_active_ms == 0 {
+        return "unknown".to_string();
+    }
+    let now = kmux_protocol::messages::epoch_millis();
+    let secs = now.saturating_sub(last_active_ms) / 1000;
+    if secs < 5 {
+        "just now".to_string()
+    } else if secs < 60 {
+        format!("{secs}s ago")
+    } else if secs < 3600 {
+        format!("{}m ago", secs / 60)
+    } else if secs < 86_400 {
+        format!("{}h ago", secs / 3600)
+    } else {
+        format!("{}d ago", secs / 86_400)
+    }
 }
 
 /// Values collected by the add-remote form (issue #121). The frontend owns the
@@ -250,6 +309,13 @@ pub struct AppCore {
     /// pane is here its `PaneClose` has NOT been sent; the driver fires it once
     /// the deadline passes, and the user can undo within the window.
     pub pending_closes: Vec<PendingClose>,
+
+    /// Sessions pending a deferred (soft) close (issue #64), oldest first. Like
+    /// `pending_closes` but for whole sessions: the `SessionClose` is withheld
+    /// for [`SOFT_CLOSE_GRACE`] so an accidental close can be undone instantly
+    /// (the live session is never touched); after the window it is closed and
+    /// becomes restorable from the daemon's graveyard.
+    pub pending_session_closes: Vec<PendingSessionClose>,
 
     /// Bumped on every soft-close request so a frontend can show its "Undo"
     /// affordance exactly once per scheduled close (not every frame).
@@ -470,6 +536,7 @@ impl AppCore {
             show_perf_counters: crate::config::resolve_perf_counters(),
             render_frames: VecDeque::new(),
             pending_closes: Vec::new(),
+            pending_session_closes: Vec::new(),
             soft_close_nonce: 0,
             disconnect_at: None,
             session_picker_selected: 0,
@@ -579,7 +646,17 @@ impl AppCore {
 
     /// Set the auto-pause flag (driven by window background/foreground, with a
     /// debounce in the driver). Independent of the manual toggle.
+    ///
+    /// Local-daemon connections are never auto-paused (issue #165): the
+    /// client↔daemon link is local (UDS) so withholding frames saves no data,
+    /// and a backgrounded local window should keep streaming. `is_local`
+    /// reflects server identity, so this also holds under federation (where the
+    /// GUI always bootstraps the local daemon over UDS). A *manual* pause is
+    /// unaffected and still works for local sessions.
     pub fn set_auto_pause(&mut self, on: bool) {
+        if on && self.is_local {
+            return;
+        }
         if self.auto_pause == on {
             return;
         }
@@ -689,6 +766,7 @@ impl AppCore {
             show_perf_counters: true,
             render_frames: VecDeque::new(),
             pending_closes: Vec::new(),
+            pending_session_closes: Vec::new(),
             soft_close_nonce: 0,
             disconnect_at: None,
             session_picker_selected: 0,
@@ -750,6 +828,14 @@ mod tests {
         )
     }
 
+    /// A non-local core (remote server). Auto-pause only applies to remote
+    /// connections (issue #165), so the auto-pause state-machine tests need one.
+    fn new_remote_core() -> AppCore {
+        let mut core = new_local_core();
+        core.is_local = false;
+        core
+    }
+
     /// The performance HUD auto-shows on debug builds and stays hidden on
     /// release builds (#105). The default is wired to the compile profile, so
     /// it must track `cfg!(debug_assertions)` rather than a hardcoded value.
@@ -758,12 +844,31 @@ mod tests {
         assert_eq!(new_local_core().hud_visible, cfg!(debug_assertions));
     }
 
+    /// A local-daemon connection is never auto-paused (issue #165): there are no
+    /// data savings on a local link. A manual pause still works.
+    #[test]
+    fn local_daemon_never_auto_pauses() {
+        let mut core = new_local_core();
+        assert!(core.is_local);
+
+        // Backgrounding a local window must not pause it.
+        core.set_auto_pause(true);
+        assert!(!core.auto_pause, "local connection must not auto-pause");
+        assert!(!core.is_paused());
+        assert_eq!(core.pause_reason(), PauseReason::None);
+
+        // The manual toggle is unaffected.
+        core.toggle_manual_pause();
+        assert!(core.is_paused());
+        assert_eq!(core.pause_reason(), PauseReason::Manual);
+    }
+
     /// Pause has two independent sources (issue #68): a manual toggle and an
     /// auto-pause while backgrounded. The effective state is their OR, a manual
     /// pause persists across focus changes, and the reason favours Manual.
     #[test]
     fn pause_state_machine_manual_persists_across_focus() {
-        let mut core = new_local_core();
+        let mut core = new_remote_core();
         assert!(!core.is_paused());
         assert_eq!(core.pause_reason(), PauseReason::None);
 
@@ -792,7 +897,7 @@ mod tests {
     /// pause overrides it (issue #68).
     #[test]
     fn per_pane_pause_respects_auto_pause_exemption() {
-        let mut core = new_local_core();
+        let mut core = new_remote_core();
         core.toggle_pane_no_auto_pause("w/0");
         assert!(core.pane_no_auto_pause("w/0"));
 

@@ -479,6 +479,29 @@ pub async fn handle_message<A: PaneAttacher>(
             });
         }
 
+        // Closed-session restore (issue #64). The graveyard is local-only, so
+        // these are not federated.
+        ClientMessage::SessionListClosed { request_id } => {
+            state.send(ServerMessage::ClosedSessionListResult {
+                request_id,
+                sessions: state.app.closed_session_entries(),
+            });
+        }
+
+        ClientMessage::SessionRestore {
+            request_id,
+            word_id,
+        } => match state.app.restore_session(&word_id).await {
+            Ok(entry) => {
+                let restored = entry.meta.word_id.clone();
+                state.send(ServerMessage::SessionCreated { request_id, entry });
+                state
+                    .app
+                    .broadcast_session_event(SessionEventMsg::SessionCreated { word_id: restored });
+            }
+            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
+        },
+
         ClientMessage::ProcessOverview { request_id } => {
             // Merge the locally-hosted panes' process trees with every open
             // peer's (issue #122). Federation off ⇒ the federated half is empty.
@@ -810,6 +833,21 @@ pub async fn handle_message<A: PaneAttacher>(
                 }
             }
         }
+
+        ClientMessage::Notify {
+            request_id,
+            pane_id,
+            kind,
+            title,
+            body,
+        } => match state
+            .app
+            .notify_pane_attention(&pane_id, kind, title, body)
+            .await
+        {
+            Ok(()) => state.send(ServerMessage::NotifyAccepted { request_id }),
+            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
+        },
 
         ClientMessage::Ping { seq } => {
             state.send(ServerMessage::Pong { seq });
