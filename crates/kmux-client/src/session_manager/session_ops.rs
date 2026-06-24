@@ -285,10 +285,15 @@ impl SessionManager {
     }
 
     /// Find the first session whose display name or word_id matches `name`.
+    ///
+    /// Matches the decorated display name, the word_id, and — for federated
+    /// sessions — the undecorated [`SessionEntry::base_name`], so `--session foo`
+    /// resolves a remote session the hub lists as `"foo @ peer"` (issue #121). A
+    /// local session named `foo` still wins by iteration order.
     pub fn find_session_by_name(&self, name: &str) -> Option<String> {
         self.session_list
             .iter()
-            .find(|e| e.meta.name == name || e.meta.word_id == name)
+            .find(|e| e.meta.name == name || e.meta.word_id == name || e.base_name() == name)
             .map(|e| e.meta.word_id.clone())
     }
 
