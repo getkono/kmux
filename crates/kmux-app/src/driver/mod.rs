@@ -723,6 +723,7 @@ impl FrontendDriver {
     /// Forward a batch of key events to the active pane's PTY, and reset the
     /// blink cycle so typing shows a solid cursor.
     pub fn send_keys(&mut self, keys: Vec<KeyEvent>) {
+        self.resume_if_auto_paused();
         self.core.mgr.send_key_batch(keys);
         self.blink_on = true;
         self.blink_phase_start = Instant::now();
@@ -736,7 +737,28 @@ impl FrontendDriver {
     /// Feed clipboard text back as a paste (in response to
     /// [`FrontendEffect::RequestPaste`]).
     pub fn feed_paste(&mut self, text: String) {
+        self.resume_if_auto_paused();
         self.core.mgr.send_paste(text);
+    }
+
+    /// Resume an *auto*-paused connection so the user immediately sees the output
+    /// of what they type (issue #165). A keypress means the user is back, so the
+    /// stream should catch up — reconciliation is minimal (the re-attach replies
+    /// with one final snapshot, not a frame-by-frame replay). A *manual* pause is
+    /// deliberate and left alone: its input is dropped downstream
+    /// (`SessionManager::input_suppressed`) until the user toggles it off.
+    ///
+    /// Resume runs *before* the input is forwarded, so on the wire the daemon
+    /// sees `SetPaused(false)` → `Attach` → the keystroke, and the echo streams
+    /// back over the now-resumed connection. `set_auto_pause` is idempotent, so
+    /// only the first keystroke of a burst does any work.
+    fn resume_if_auto_paused(&mut self) {
+        if self.core.auto_pause && !self.core.manual_pause {
+            self.core.set_auto_pause(false);
+            // Disarm the background debounce so a still-armed timer can't
+            // re-pause the connection the user just resumed by typing.
+            self.background_since = None;
+        }
     }
 
     /// Report a new content size immediately (no debounce). Used to seed the
@@ -759,7 +781,10 @@ impl FrontendDriver {
     /// pause is unaffected and persists across focus changes.
     pub fn set_window_background(&mut self, backgrounded: bool) {
         if backgrounded {
-            if self.background_since.is_none() && !self.core.auto_pause {
+            // Local-daemon connections never auto-pause (issue #165), so don't
+            // bother arming the debounce for them — `set_auto_pause` would no-op
+            // anyway, this just avoids the idle per-frame `tick_auto_pause` check.
+            if self.background_since.is_none() && !self.core.auto_pause && !self.core.is_local {
                 self.background_since = Some(Instant::now());
             }
         } else {
@@ -962,6 +987,43 @@ mod tests {
         let _ = driver.tick();
         assert_eq!(driver.last_exit_error.as_deref(), Some("boom"));
         assert!(matches!(driver.mode, Mode::Disconnected { .. }));
+    }
+
+    // ── Keyboard-triggered resume (issue #165) ───────────────────────────────
+
+    /// A keystroke resumes an *auto*-paused connection so the user immediately
+    /// sees their own output, and disarms the background debounce so a still-armed
+    /// timer can't re-pause it. A *manual* pause is deliberate and left untouched.
+    #[test]
+    fn keystroke_resumes_auto_pause_but_not_manual_pause() {
+        let mut core = fixture_core();
+        core.is_local = false; // remote server: auto-pause is in play
+        let (mut driver, _srv_tx, _bs_tx) = FrontendDriver::for_test(core);
+
+        // Auto-paused with the background debounce still armed.
+        driver.core.set_auto_pause(true);
+        driver.background_since = Some(Instant::now());
+        assert!(driver.core.auto_pause);
+
+        // Typing resumes the connection and disarms the debounce.
+        driver.resume_if_auto_paused();
+        assert!(
+            !driver.core.auto_pause,
+            "a keystroke must resume an auto-pause"
+        );
+        assert!(
+            driver.background_since.is_none(),
+            "the debounce must be disarmed"
+        );
+
+        // A manual pause must survive a keystroke (its input is dropped instead).
+        driver.core.toggle_manual_pause();
+        assert!(driver.core.manual_pause);
+        driver.resume_if_auto_paused();
+        assert!(
+            driver.core.manual_pause,
+            "a manual pause must not be resumed by typing"
+        );
     }
 
     // ── Tearing detector (issue #72) ─────────────────────────────────────────
