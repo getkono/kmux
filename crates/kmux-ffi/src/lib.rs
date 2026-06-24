@@ -63,8 +63,8 @@ use kmux_client::input::{
     MouseButton, MouseEvent, MouseEventKind, MouseMods, char_to_proto_key, encode_mouse_scroll,
 };
 use kmux_protocol::messages::{
-    ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, PaneProgressState, SplitDir,
-    TermSize,
+    AttentionKind, ClientCapabilities, KeyAction, KeyCode, KeyEvent, KeyMods, PaneProgressState,
+    SplitDir, TermSize,
 };
 use kmux_protocol::{format_pane_id, pane_index};
 // The packed-cell format is owned by `kmux-render` (the single encoder shared
@@ -81,7 +81,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 20;
+pub const KMUX_FFI_ABI_VERSION: u32 = 21;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -221,6 +221,36 @@ pub enum FfiEffect {
     Quit,
     /// Diagnostic: rebuild the Metal renderer + glyph atlas, then repaint.
     ResetRenderer,
+    /// A program in a pane requested attention via `kmux notify` (issue #169).
+    /// The Swift app posts a `UNUserNotification` and, on click, refocuses the
+    /// window for `word_id` and selects `pane_id`. `attention_id` dedups across
+    /// the app's windows so exactly one notification is posted.
+    Attention {
+        word_id: String,
+        pane_id: String,
+        kind: FfiAttentionKind,
+        title: String,
+        body: String,
+        attention_id: u64,
+    },
+}
+
+/// Why a pane wants attention (issue #169). FFI mirror of
+/// [`kmux_protocol::messages::AttentionKind`]; lets the Swift app word the
+/// notification (e.g. a turn finished vs. Claude is waiting on you).
+#[derive(uniffi::Enum)]
+pub enum FfiAttentionKind {
+    TurnDone,
+    NeedsInput,
+}
+
+impl From<AttentionKind> for FfiAttentionKind {
+    fn from(k: AttentionKind) -> Self {
+        match k {
+            AttentionKind::TurnDone => FfiAttentionKind::TurnDone,
+            AttentionKind::NeedsInput => FfiAttentionKind::NeedsInput,
+        }
+    }
 }
 
 impl From<FrontendEffect> for FfiEffect {
@@ -233,6 +263,21 @@ impl From<FrontendEffect> for FfiEffect {
             FrontendEffect::RequestPaste => FfiEffect::RequestPaste,
             FrontendEffect::Quit => FfiEffect::Quit,
             FrontendEffect::ResetRenderer => FfiEffect::ResetRenderer,
+            FrontendEffect::Attention {
+                word_id,
+                pane_id,
+                kind,
+                title,
+                body,
+                attention_id,
+            } => FfiEffect::Attention {
+                word_id,
+                pane_id,
+                kind: kind.into(),
+                title,
+                body,
+                attention_id,
+            },
         }
     }
 }

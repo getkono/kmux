@@ -15,7 +15,9 @@ use std::time::{Duration, Instant};
 use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::session_manager::SessionManager;
 use kmux_client::ssh::RemoteTarget;
-use kmux_protocol::messages::{ClientCapabilities, PeerId, PeerTarget, ServerMessage, TermSize};
+use kmux_protocol::messages::{
+    AttentionKind, ClientCapabilities, PeerId, PeerTarget, ServerMessage, TermSize,
+};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::appearance::Appearance;
@@ -84,6 +86,18 @@ pub enum KeyResult {
     /// Core requests the frontend read the system clipboard and feed it back as
     /// a paste (the frontend forwards the text to `mgr.send_paste`).
     RequestPaste,
+    /// A program in a pane requested attention via `kmux notify` (issue #169).
+    /// The frontend raises a native desktop notification and, on click,
+    /// refocuses the window for `word_id` and selects `pane_id`. `attention_id`
+    /// dedups across a frontend's windows so exactly one notification is posted.
+    Attention {
+        word_id: String,
+        pane_id: String,
+        kind: AttentionKind,
+        title: String,
+        body: String,
+        attention_id: u64,
+    },
 }
 
 /// Action carried by a clickable top-bar segment. Frontend-neutral intent: a
