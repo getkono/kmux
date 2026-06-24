@@ -31,10 +31,17 @@ hk = "1.48.0"
 experimental = true
 
 [hooks]
-# After `mise install`, install hk's git hooks into .git/hooks (idempotent). The
-# `|| true` keeps a fresh checkout from failing the install if hk can't reach the
-# network to fetch its pkl schema on the very first run — rerun `mise run setup`.
-postinstall = "hk install || true"
+# After `mise install`, bootstrap the checkout: initialise the vendored ghostty
+# submodule and install hk's git hooks into .git/hooks. Both steps are idempotent
+# (cheap no-ops once set up). The per-step `|| true` keeps a fresh checkout from
+# failing the install when the network is unavailable on the very first run (the
+# submodule fetch and hk's pkl-schema fetch both need it) — rerun `mise run setup`
+# once online. This best-effort path can't mask a broken checkout: the build still
+# hard-fails later if vendor/ghostty is missing (kmux-ghostty-sys build.rs).
+postinstall = """
+git submodule update --init --recursive || true
+hk install || true
+"""
 
 # ── Tasks ─────────────────────────────────────────────────────────────────────
 # `mise run <task>` replaces the old `just <task>`. mise activates the pinned
@@ -117,5 +124,11 @@ run = "tokei --exclude vendor --exclude crates/kmuxd/src/eff_long_wordlist.txt"
 # output is visible (debug builds isolate their state under kmux-debug/).
 
 [tasks.setup]
-description = "Install hk's git hooks (fallback for the postinstall hook)"
-run = "hk install"
+description = "Initialize the ghostty submodule + install hk's git hooks (fallback for the postinstall hook)"
+# Same two steps as the postinstall hook, but strict: when invoked explicitly,
+# fail loudly so a setup problem isn't silently swallowed. mise runs the array
+# sequentially and aborts on the first non-zero exit.
+run = [
+  "git submodule update --init --recursive",
+  "hk install",
+]
