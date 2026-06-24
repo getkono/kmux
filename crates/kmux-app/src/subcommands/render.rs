@@ -31,15 +31,8 @@ pub fn session_rows(sessions: &[SessionEntry]) -> Vec<SessionRow> {
     let mut rows: Vec<SessionRow> = sessions
         .iter()
         .map(|e| {
-            let name = match &e.peer {
-                Some(p) => e
-                    .meta
-                    .name
-                    .strip_suffix(&format!(" @ {p}"))
-                    .unwrap_or(&e.meta.name)
-                    .to_string(),
-                None => e.meta.name.clone(),
-            };
+            // PEER already carries the machine, so show the undecorated name.
+            let name = e.base_name().to_string();
             SessionRow {
                 peer: e.peer.clone().unwrap_or_else(|| "local".to_string()),
                 name,

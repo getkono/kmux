@@ -407,14 +407,9 @@ impl AppCore {
                     .iter()
                     .filter(|e| e.peer.as_deref() == Some(peer.as_str()))
                 {
-                    // The hub decorates federated names as "name @ peer"; strip
-                    // the decoration since the row already sits under the remote.
-                    let name = e
-                        .meta
-                        .name
-                        .strip_suffix(&format!(" @ {peer}"))
-                        .unwrap_or(&e.meta.name)
-                        .to_string();
+                    // The row already sits under the remote, so show the
+                    // undecorated name (strip the hub's "name @ peer" suffix).
+                    let name = e.base_name().to_string();
                     if matches(&name) || matches(&e.meta.cwd) {
                         rows.push(LaunchRow::RemoteExisting {
                             peer: peer.clone(),
