@@ -1368,6 +1368,26 @@ mod tests {
     }
 
     #[test]
+    fn find_session_by_name_matches_federated_base_name() {
+        // The hub decorates a federated session as "name @ peer"; `--session proj`
+        // must still resolve it via the undecorated base name (issue #121).
+        let mut mgr = make_manager();
+        let mut entry = make_entry("eagle", "/home/user/proj");
+        entry.meta.name = "proj @ box:9000".to_string();
+        entry.peer = Some("box:9000".to_string());
+        mgr.session_list.push(entry);
+
+        // Base name resolves the federated session...
+        assert_eq!(mgr.find_session_by_name("proj"), Some("eagle".to_string()));
+        // ...as does the full decorated name and the word_id.
+        assert_eq!(
+            mgr.find_session_by_name("proj @ box:9000"),
+            Some("eagle".to_string())
+        );
+        assert_eq!(mgr.find_session_by_name("eagle"), Some("eagle".to_string()));
+    }
+
+    #[test]
     fn create_session_with_name_and_cwd_sends_correct_message() {
         let (mut mgr, mut rx) = make_connected_manager();
         mgr.create_session(Some("myapp"), Some("/opt/app"), TermSize::default());

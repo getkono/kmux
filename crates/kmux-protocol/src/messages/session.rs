@@ -433,6 +433,26 @@ pub struct SessionEntry {
     pub peer: Option<PeerId>,
 }
 
+impl SessionEntry {
+    /// The session's name without the ` @ {peer}` federation decoration the hub's
+    /// `localize_entry` adds to proxied sessions. Returns `meta.name` unchanged for
+    /// local sessions (`peer == None`) or when the suffix is somehow absent.
+    ///
+    /// Use this anywhere a raw session name is shown or matched (e.g. `kmux ls`
+    /// rows, launcher rows, `--session NAME` lookup) so federated sessions are not
+    /// double-decorated and resolve by their underlying name.
+    pub fn base_name(&self) -> &str {
+        match &self.peer {
+            Some(p) => self
+                .meta
+                .name
+                .strip_suffix(&format!(" @ {p}"))
+                .unwrap_or(&self.meta.name),
+            None => &self.meta.name,
+        }
+    }
+}
+
 /// A closed (inactive) session retained in the daemon's graveyard and offered
 /// for restore (issue #64). Lightweight: the heavy snapshot stays on the daemon,
 /// keyed by `meta.word_id`; the client only needs enough to render and order the
@@ -785,6 +805,32 @@ mod tests {
         let bytes = postcard::to_allocvec(&local).expect("serialize");
         let decoded: SessionEntry = postcard::from_bytes(&bytes).expect("deserialize");
         assert_eq!(decoded.peer, None);
+    }
+
+    #[test]
+    fn base_name_strips_peer_decoration() {
+        let entry = |name: &str, peer: Option<&str>| SessionEntry {
+            meta: SessionMeta {
+                index: 0,
+                word_id: "eagle".into(),
+                name: name.into(),
+                cwd: "/dev/kmux".into(),
+            },
+            panes: vec![],
+            tabs: vec![],
+            active_tab: 0,
+            peer: peer.map(Into::into),
+        };
+
+        // Local session: name returned unchanged.
+        assert_eq!(entry("kmux", None).base_name(), "kmux");
+        // Federated session: the hub's " @ {peer}" suffix is stripped.
+        assert_eq!(
+            entry("kmux @ alice@box:2222", Some("alice@box:2222")).base_name(),
+            "kmux"
+        );
+        // Defensive: a peer set but no matching suffix falls back to the raw name.
+        assert_eq!(entry("kmux", Some("box")).base_name(), "kmux");
     }
 
     #[test]
