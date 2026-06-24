@@ -26,6 +26,7 @@
 //! non-Rust frontend (e.g. the SwiftUI macOS app, via `kmux-ffi`) drives too.
 
 mod actions;
+mod attention;
 mod clients;
 mod convert;
 mod css;
@@ -324,6 +325,10 @@ fn build_ui(app: &Application, plan: &Plan, exit_error: Rc<RefCell<Option<String
     // they become native dialogs.
     let shell = shell::build(app, &drawing);
 
+    // Register this window for cross-window attention routing (issue #169): a
+    // `kmux notify` notification's click picks the best window for the session.
+    attention::register_window(&shell.window, &fe, &drawing);
+
     // Auto-pause the connection while the window is minimized (issue #68). The
     // GdkSurface — whose toplevel carries the minimized state — only exists once
     // the window is realized, so attach the watcher from `realize`. Focus loss
@@ -508,6 +513,16 @@ pub(crate) fn apply_effects(
             FrontendEffect::CopyToClipboard(text) => copy_to_clipboard(&text),
             FrontendEffect::RequestPaste => request_paste(fe, drawing),
             FrontendEffect::Quit => app.quit(),
+            // A `kmux notify` attention (#169): post one native notification
+            // (deduped across windows) that refocuses the session on click.
+            FrontendEffect::Attention {
+                word_id,
+                pane_id,
+                kind,
+                title,
+                body,
+                attention_id,
+            } => attention::surface(app, word_id, pane_id, kind, title, body, attention_id),
         }
     }
     redraw
