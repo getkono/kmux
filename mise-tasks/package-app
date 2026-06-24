@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+#MISE description="Assemble the distributable kmux.app bundle (macOS-only)."
+#USAGE arg "<dest>" help="Destination .app path (default ~/Applications/kmux.app)" default=""
+set -euo pipefail
+# Assemble a relocatable, distribution-ready kmux.app: the SwiftUI GUI exe plus
+# the daemon (kmuxd), the process-isolation worker (kmux-vt-worker), the thin
+# `kmux` CLI, and the libkmux_ghostty dylib those daemons load. Every Mach-O that
+# links libghostty is repointed to load it from Contents/Frameworks via an
+# @executable_path rpath, so the bundle runs from anywhere (Finder, /Applications,
+# ~/Applications) with no build tree on disk. Shared by `mise run install`
+# (local) and the release workflow (which codesigns + notarizes the result), so
+# the two layouts never drift. See docs/building-macos.md.
+[[ "$(uname -s)" == "Darwin" ]] || { echo "error: package-app is macOS-only (the .app bundle is macOS-only)" >&2; exit 1; }
+
+ver=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -n1)
+dest="${1:-$HOME/Applications/kmux.app}"
+
+echo "==> building release binaries (kmux, kmuxd, kmux-vt-worker)"
+cargo build --release -p kmux -p kmuxd -p kmux-vt-worker
+
+echo "==> building the SwiftUI app (release)"
+mise run gen-ffi-bindings release
+# KMUX_FFI_LIB overrides Package.swift's debug default to the absolute release
+# staticlib path (the path is relative to the package dir unless absolute).
+KMUX_FFI_LIB="$PWD/target/release/libkmux_ffi.a" \
+    swift build -c release --package-path kmux-swift
+exe="kmux-swift/.build/release/kmux-swift"
+[[ -x "$exe" ]] || { echo "error: swift build did not produce $exe" >&2; exit 1; }
+
+echo "==> assembling $dest"
+rm -rf "$dest"
+mkdir -p "$dest/Contents/MacOS" "$dest/Contents/Frameworks" "$dest/Contents/Resources"
+
+# GUI exe + the rust binaries it relies on, all in Contents/MacOS: the daemon
+# finds kmux-vt-worker beside its own exe (process isolation, issue #126), and
+# find_server_binary() finds kmuxd beside the GUI exe, so a Finder/Spotlight
+# launch (which gets the minimal launchd PATH, no ~/.cargo/bin) can auto-spawn
+# the local daemon. The `kmux` CLI is bundled so a Homebrew cask can link it onto
+# PATH from inside the app.
+cp "$exe" "$dest/Contents/MacOS/kmux-swift"
+cp target/release/kmuxd "$dest/Contents/MacOS/kmuxd"
+cp target/release/kmux-vt-worker "$dest/Contents/MacOS/kmux-vt-worker"
+cp target/release/kmux "$dest/Contents/MacOS/kmux"
+
+# Ship the Zig-built dylib in Frameworks/ (the codesigning-conventional home for
+# a bundled dylib). Resolve it from kmuxd's baked rpath — authoritative, it is
+# where the binary was linked to look — exactly like mise-tasks/package.
+libdir=$(otool -l target/release/kmuxd | awk '$1=="path"{print $2}' | grep -m1 kmux-ghostty-sys || true)
+[[ -n "$libdir" && -f "$libdir/libkmux_ghostty.dylib" ]] || { echo "error: could not locate libkmux_ghostty.dylib (rpath: ${libdir:-none})" >&2; exit 1; }
+cp "$libdir/libkmux_ghostty.dylib" "$dest/Contents/Frameworks/"
+
+# Repoint every libghostty consumer to load it from Contents/Frameworks. The
+# binaries live in Contents/MacOS, so @executable_path/../Frameworks resolves to
+# the bundled dylib regardless of where the .app sits on disk.
+for bin in kmuxd kmux-vt-worker; do
+    oldref=$(otool -L "$dest/Contents/MacOS/${bin}" | awk '/libkmux_ghostty/{print $1; exit}')
+    install_name_tool -change "$oldref" @rpath/libkmux_ghostty.dylib "$dest/Contents/MacOS/${bin}"
+    install_name_tool -add_rpath @executable_path/../Frameworks "$dest/Contents/MacOS/${bin}"
+done
+
+# Strip the rust binaries (local symbols). Leave kmux-swift for the codesign step
+# in CI; stripping after signing would invalidate the signature.
+strip -x "$dest/Contents/MacOS/kmuxd" "$dest/Contents/MacOS/kmux-vt-worker" "$dest/Contents/MacOS/kmux"
+
+cp kmux-swift/macos/kmux.icns "$dest/Contents/Resources/kmux.icns"
+sed "s/__VERSION__/${ver}/g" kmux-swift/macos/Info.plist > "$dest/Contents/Info.plist"
+
+echo "==> assembled $dest (kmux ${ver})"
