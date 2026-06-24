@@ -69,6 +69,11 @@ tokio = { version = "1.52.1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 toml = "1.1.2"
 tabled = "0.20.0"
+# The `log` facade. kmux logs through `tracing`, not `log`; this is only so
+# `init_logging` can cap tracing-subscriber's `tracing-log` bridge (see
+# crates/kmux-app/src/launch.rs) and silence uniffi 0.28's per-FFI-call
+# `log::debug!` scaffolding noise.
+log = "0.4"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 uniffi = "0.28"

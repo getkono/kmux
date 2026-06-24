@@ -98,6 +98,15 @@ pub fn init_logging(instance_id: &str) {
                 .init();
         }
     }
+    // Cap the `tracing-log` bridge at INFO. kmux logs through `tracing` directly,
+    // so this never touches our own events — but uniffi 0.28's `#[uniffi::export]`
+    // scaffolding emits a `log::debug!(<fn_name>)` on *every* FFI call (demoted to
+    // `trace!` upstream in 0.29). The SwiftUI pump calls ~20 driver getters per
+    // frame, so at `RUST_LOG=kmux=debug` those bridged records (`DEBUG kmux_ffi:
+    // tabs`, `mode`, …) bury everything else. Gating the `log` facade at the source
+    // drops them without an EnvFilter directive that would also silence the
+    // renderer's own `tracing::debug!` diagnostics (they share the `kmux_ffi` target).
+    log::set_max_level(log::LevelFilter::Info);
     tracing::info!(
         instance_id = %instance_id,
         version = concat!(
