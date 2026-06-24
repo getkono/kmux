@@ -169,6 +169,32 @@ Run `mise run test` and `mise run clippy` before submitting a PR (the hk
 pre-push hook runs these for you). The project uses conventional commits
 (`type: description`).
 
+Because kmux is dual-licensed (see [License](#license)), external contributors
+must sign the [Contributor License Agreement](CLA.md) before their pull request
+can be merged. A bot comments on your first PR with a one-line phrase to reply
+with; you only sign once. The CLA grants Kono the right to include your
+contribution under both the AGPL and the commercial license — it does not take
+away any of your own rights to your work.
+
 ## License
 
-All rights reserved.
+Copyright (C) 2026 Kono.
+
+kmux is dual-licensed under the **GNU Affero General Public License v3.0**
+([`LICENSE`](LICENSE)) **OR** a commercial license:
+
+- **Open source (default):** you may use, modify, and redistribute kmux under the
+  terms of the [AGPL-3.0](LICENSE). The community is the focus, and the AGPL keeps
+  kmux and its derivatives open — including over a network.
+- **Commercial:** organizations that want to use or modify kmux internally without
+  the AGPL's network-copyleft obligations can obtain a commercial license. No
+  commercial terms are published yet; the option is here to keep the door open.
+  To inquire, [open an issue](https://github.com/getkono/kmux/issues).
+
+The intent is to keep kmux genuinely open-source while leaving room for commercial
+use. All copyrights are retained by Kono.
+
+Unless you explicitly state otherwise, any contribution you submit for inclusion
+in kmux (as defined in the AGPL-3.0) shall be dual-licensed as above, under the
+terms of the [Contributor License Agreement](CLA.md), without any additional terms
+or conditions.
