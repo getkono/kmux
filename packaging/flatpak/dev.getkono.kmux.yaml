@@ -1,0 +1,65 @@
+# Flatpak manifest for the kmux GTK GUI. Packages the prebuilt release tarball on
+# the GNOME runtime (which provides GTK4 + libadwaita), so we don't rebuild the
+# Zig/ghostty + GTK stack inside the sandbox. Built in CI into a self-hosted
+# `.flatpak` bundle attached to the GitHub Release:
+#
+#   flatpak-builder --user --install --force-clean build packaging/flatpak/dev.getkono.kmux.yaml
+#   flatpak build-bundle <repo> kmux.flatpak dev.getkono.kmux
+#
+# `url`/`sha256` are bumped per release by the release workflow. A Flathub
+# submission (a from-source manifest, separate review) is tracked as a follow-up.
+app-id: dev.getkono.kmux
+runtime: org.gnome.Platform
+# Pin a runtime whose GTK4 + libadwaita ABI is >= the CI build runner's, so the
+# prebuilt kmux-gtk loads against it. Verify on a runtime bump.
+runtime-version: '48'
+sdk: org.gnome.Sdk
+command: kmux
+
+finish-args:
+  # GTK GUI.
+  - --socket=wayland
+  - --socket=fallback-x11
+  - --share=ipc
+  - --device=dri
+  # The daemon talks QUIC/TLS/SSH out to remote kmux servers.
+  - --share=network
+  # Shells spawned in panes need to see the user's files. Intentionally broad for
+  # a terminal multiplexer; a portal-based tightening is a follow-up. The daemon's
+  # Unix socket lives in the sandbox-private $XDG_RUNTIME_DIR (the GUI + daemon +
+  # worker all run inside this one sandbox instance), so no host socket sharing.
+  - --filesystem=home
+
+modules:
+  - name: kmux
+    buildsystem: simple
+    build-commands:
+      # Keep the relocatable tarball layout: all binaries + the shared library
+      # together in /app/lib/kmux (so $ORIGIN finds the dylib and siblings find
+      # each other), with the user-facing commands symlinked onto PATH in
+      # /app/bin. No patchelf needed.
+      - install -Dm755 kmux     /app/lib/kmux/kmux
+      - install -Dm755 kmuxd    /app/lib/kmux/kmuxd
+      - install -Dm755 kmux-gtk /app/lib/kmux/kmux-gtk
+      - install -Dm755 libkmux_ghostty.so /app/lib/kmux/libkmux_ghostty.so
+      - 'test -f kmux-vt-worker && install -Dm755 kmux-vt-worker /app/lib/kmux/kmux-vt-worker || true'
+      - mkdir -p /app/bin
+      - ln -sf ../lib/kmux/kmux     /app/bin/kmux
+      - ln -sf ../lib/kmux/kmuxd    /app/bin/kmuxd
+      - ln -sf ../lib/kmux/kmux-gtk /app/bin/kmux-gtk
+      # Desktop integration (id == app-id, so no rename needed).
+      - install -Dm644 share/applications/dev.getkono.kmux.desktop /app/share/applications/dev.getkono.kmux.desktop
+      - install -Dm644 share/icons/hicolor/scalable/apps/dev.getkono.kmux.svg /app/share/icons/hicolor/scalable/apps/dev.getkono.kmux.svg
+      - install -Dm644 dev.getkono.kmux.metainfo.xml /app/share/metainfo/dev.getkono.kmux.metainfo.xml
+    sources:
+      - type: archive
+        only-arches: [x86_64]
+        url: https://github.com/getkono/kmux/releases/download/v0.2.0/kmux-0.2.0-x86_64-unknown-linux-gnu.tar.gz
+        sha256: bf37a7cd0442a45297d6007111849cedfd4463a295e2b9d2716c21f80be87107
+      - type: archive
+        only-arches: [aarch64]
+        url: https://github.com/getkono/kmux/releases/download/v0.2.0/kmux-0.2.0-aarch64-unknown-linux-gnu.tar.gz
+        sha256: 057c884bcb3198a7b33f9ef748f24aad7f97162bfe5c2efa48d8a3d56ac5473e
+      # Not shipped in the tarball — taken from the repo (single source of truth).
+      - type: file
+        path: ../../crates/kmux-gtk/data/dev.getkono.kmux.metainfo.xml

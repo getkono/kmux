@@ -1,0 +1,72 @@
+# nfpm config for the FULL kmux package (GUI + daemon) → .deb and .rpm.
+# https://nfpm.goreleaser.com/configuration/
+#
+# Consumes the per-arch release tarball's already-built, already-stripped
+# binaries, extracted into dist/stage/ (after packaging/relocate-rpath.sh
+# repoints kmuxd + kmux-vt-worker to /usr/lib/kmux). nfpm translates `arch` (Go
+# name amd64/arm64) to the deb (amd64/arm64) and rpm (x86_64/aarch64) conventions
+# automatically. nfpm expands env vars in scalar fields (PKG_ARCH, PKG_VERSION)
+# but not in contents globs, so binary paths are the fixed dist/stage/ location.
+name: kmux
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+version_schema: semver
+section: utils
+priority: optional
+maintainer: "Kono <opensource@getkono.com>"
+vendor: "Kono"
+homepage: "https://github.com/getkono/kmux"
+license: "AGPL-3.0-only OR LicenseRef-Commercial"
+description: |
+  Terminal multiplexer and remote desktop (full install: GUI + daemon).
+  Connect to persistent terminal sessions over encrypted QUIC connections from a
+  native desktop GUI. Includes the GTK GUI client; for a server install without
+  the GUI use the kmux-headless package.
+
+overrides:
+  deb:
+    depends:
+      - libgtk-4-1
+      - libadwaita-1-0
+    replaces:
+      - kmux-headless
+    conflicts:
+      - kmux-headless
+  rpm:
+    depends:
+      - gtk4
+      - libadwaita
+    replaces:
+      - kmux-headless
+    conflicts:
+      - kmux-headless
+
+contents:
+  # Binaries → /usr/bin (kmuxd + kmux-vt-worker have rpath /usr/lib/kmux).
+  - src: dist/stage/kmux
+    dst: /usr/bin/kmux
+  - src: dist/stage/kmuxd
+    dst: /usr/bin/kmuxd
+  - src: dist/stage/kmux-vt-worker
+    dst: /usr/bin/kmux-vt-worker
+  - src: dist/stage/kmux-gtk
+    dst: /usr/bin/kmux-gtk
+  # Bundled Zig-built shared library → private libdir.
+  - src: dist/stage/libkmux_ghostty.so
+    dst: /usr/lib/kmux/libkmux_ghostty.so
+  # Desktop integration (from the repo, the single source of truth).
+  - src: crates/kmux-gtk/data/dev.getkono.kmux.desktop
+    dst: /usr/share/applications/dev.getkono.kmux.desktop
+  - src: crates/kmux-gtk/data/icons/dev.getkono.kmux.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/dev.getkono.kmux.svg
+  - src: crates/kmux-gtk/data/dev.getkono.kmux.metainfo.xml
+    dst: /usr/share/metainfo/dev.getkono.kmux.metainfo.xml
+  - src: LICENSE
+    dst: /usr/share/doc/kmux/LICENSE
+  - src: README.md
+    dst: /usr/share/doc/kmux/README.md
+
+scripts:
+  postinstall: ./packaging/nfpm/postinstall.sh
+  postremove: ./packaging/nfpm/postremove.sh

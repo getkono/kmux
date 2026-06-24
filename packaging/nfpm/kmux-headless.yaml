@@ -1,0 +1,46 @@
+# nfpm config for the HEADLESS kmux package (daemon + CLI, no GUI) → .deb/.rpm.
+# For servers: ships kmux, kmuxd, kmux-vt-worker, and libkmux_ghostty with no
+# GTK/libadwaita dependency and no desktop entry. Mutually exclusive with the
+# full `kmux` package. See packaging/nfpm/kmux.yaml for the shared notes.
+name: kmux-headless
+arch: ${PKG_ARCH}
+platform: linux
+version: ${PKG_VERSION}
+version_schema: semver
+section: utils
+priority: optional
+maintainer: "Kono <opensource@getkono.com>"
+vendor: "Kono"
+homepage: "https://github.com/getkono/kmux"
+license: "AGPL-3.0-only OR LicenseRef-Commercial"
+description: |
+  Terminal multiplexer and remote desktop daemon (headless: daemon + CLI only).
+  The server half of kmux for machines without a desktop — run kmuxd here and
+  connect from a full kmux GUI client over encrypted QUIC. No GUI, no GTK
+  dependency. Install the `kmux` package instead for the desktop GUI.
+
+overrides:
+  deb:
+    replaces:
+      - kmux
+    conflicts:
+      - kmux
+  rpm:
+    replaces:
+      - kmux
+    conflicts:
+      - kmux
+
+contents:
+  - src: dist/stage/kmux
+    dst: /usr/bin/kmux
+  - src: dist/stage/kmuxd
+    dst: /usr/bin/kmuxd
+  - src: dist/stage/kmux-vt-worker
+    dst: /usr/bin/kmux-vt-worker
+  - src: dist/stage/libkmux_ghostty.so
+    dst: /usr/lib/kmux/libkmux_ghostty.so
+  - src: LICENSE
+    dst: /usr/share/doc/kmux/LICENSE
+  - src: README.md
+    dst: /usr/share/doc/kmux/README.md
