@@ -3,6 +3,7 @@ mod daemon_cmd;
 mod debug;
 mod dry_run;
 mod list;
+mod notify;
 mod ps;
 pub mod render;
 pub use clients::{KickClientConfig, ListClientsConfig, run_kick_client, run_list_clients};
@@ -10,6 +11,7 @@ pub use daemon_cmd::run_daemon_command;
 pub use debug::run_debug_command;
 pub use dry_run::run_dry_run;
 pub use list::{ListSessionsConfig, run_list_sessions};
+pub use notify::{NotifyConfig, run_notify};
 pub use ps::{ProcessOverviewConfig, run_process_overview};
 
 use kmux_client::pipeline::ResolvedTarget;

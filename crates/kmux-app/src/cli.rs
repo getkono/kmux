@@ -172,6 +172,44 @@ pub enum Command {
         ssh_port: Option<u16>,
     },
 
+    /// Raise a desktop notification from inside a kmux pane (issue #169).
+    ///
+    /// Meant to be run by a program *inside* a pane — Claude Code's
+    /// `Stop` / `Notification` hooks are the motivating case — to ask the kmux
+    /// GUI showing this session to post an OS notification that refocuses the
+    /// window (and selects the pane) when clicked. The pane is read from the
+    /// `KMUX_PANE` environment variable kmux exports into every pane, so no
+    /// arguments are required when run inside one.
+    ///
+    /// If a Claude Code hook payload is piped on stdin, its `hook_event_name`
+    /// selects the kind (`Stop`/`SubagentStop` → turn-done, `Notification` →
+    /// needs-input) and its `message` fills the body — both overridable by flags.
+    Notify {
+        /// What happened: a turn finished or the program is waiting on you.
+        /// Defaults from a piped Claude hook payload, else `turn-done`.
+        #[arg(long, value_enum)]
+        kind: Option<AttentionKind>,
+
+        /// Notification title. Defaults to the session word + a short summary.
+        #[arg(long)]
+        title: Option<String>,
+
+        /// Notification body. Defaults to a piped Claude hook `message`, else
+        /// the kind summary.
+        #[arg(long)]
+        body: Option<String>,
+
+        /// Pane id (`<word>/<idx>`). Defaults to `$KMUX_PANE`.
+        #[arg(long)]
+        pane: Option<String>,
+
+        /// Target server: `[user@]host[:ssh-port]` or a `hosts.toml` alias.
+        /// Omit to use the local daemon (the usual case — the pane is local to
+        /// the daemon hosting it).
+        #[command(flatten)]
+        server_args: ServerArgs,
+    },
+
     /// Internal diagnostics (hidden). See `kmux debug tearing` (issue #72).
     #[command(hide = true)]
     Debug {
@@ -251,6 +289,27 @@ pub enum DaemonAction {
 pub enum OutputFormat {
     Table,
     Json,
+}
+
+/// CLI surface for [`kmux_protocol::messages::AttentionKind`] (issue #169).
+///
+/// A separate enum so the protocol crate stays free of a `clap` dependency.
+/// clap renders these as `turn-done` / `needs-input`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AttentionKind {
+    /// A unit of work finished (e.g. Claude Code's `Stop` hook).
+    TurnDone,
+    /// The program is blocked waiting on the user (e.g. Claude's `Notification`).
+    NeedsInput,
+}
+
+impl From<AttentionKind> for kmux_protocol::messages::AttentionKind {
+    fn from(k: AttentionKind) -> Self {
+        match k {
+            AttentionKind::TurnDone => kmux_protocol::messages::AttentionKind::TurnDone,
+            AttentionKind::NeedsInput => kmux_protocol::messages::AttentionKind::NeedsInput,
+        }
+    }
 }
 
 /// Resolved connection parameters for headless subcommands (e.g. list-sessions).

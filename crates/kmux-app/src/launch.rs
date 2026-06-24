@@ -14,9 +14,9 @@ use crate::appearance::Appearance;
 use crate::cli::{Cli, Command};
 use crate::config::{self, RendererKind};
 use crate::subcommands::{
-    KickClientConfig, ListClientsConfig, ListSessionsConfig, ProcessOverviewConfig, parse_target,
-    run_daemon_command, run_debug_command, run_dry_run, run_kick_client, run_list_clients,
-    run_list_sessions, run_process_overview,
+    KickClientConfig, ListClientsConfig, ListSessionsConfig, NotifyConfig, ProcessOverviewConfig,
+    parse_target, run_daemon_command, run_debug_command, run_dry_run, run_kick_client,
+    run_list_clients, run_list_sessions, run_notify, run_process_overview,
 };
 use crate::theme::Theme;
 
@@ -218,6 +218,24 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
                 ssh_port,
                 session,
                 client,
+            })
+            .await?;
+            return Ok(Launch::Done);
+        }
+        Some(Command::Notify {
+            kind,
+            title,
+            body,
+            pane,
+            server_args,
+        }) => {
+            run_notify(NotifyConfig {
+                server: server_args.server.as_deref(),
+                ssh_port: server_args.ssh_port,
+                pane,
+                kind: kind.map(Into::into),
+                title,
+                body,
             })
             .await?;
             return Ok(Launch::Done);
