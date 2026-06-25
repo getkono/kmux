@@ -17,7 +17,9 @@ pub mod tls;
 pub use transport::quic::{QUIC_IDLE_TIMEOUT_SECS, QUIC_KEEP_ALIVE_SECS};
 
 #[cfg(feature = "framing")]
-pub use codec::{Compressor, read_frame, write_frame, write_frame_compressed};
+pub use codec::{
+    Compressor, flush, read_frame, write_frame, write_frame_compressed, write_frame_compressed_into,
+};
 pub use codec::{ProtocolError, decode_client, decode_server, encode_client, encode_server};
 pub use endpoint::Endpoint;
 pub use messages::{

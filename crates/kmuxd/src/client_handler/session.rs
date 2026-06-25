@@ -4,7 +4,12 @@ use std::time::Duration;
 
 use kmux_protocol::TransportKind;
 use kmux_protocol::messages::{ErrorCode, ServerMessage, epoch_millis};
-use kmux_protocol::{decode_client, encode_server, read_frame, write_frame_compressed};
+use kmux_protocol::{decode_client, encode_server, read_frame, write_frame_compressed_into};
+
+/// Cap on how many queued messages one flush coalesces. Bounds batch memory and
+/// keeps flush latency tight under a sustained burst; the remainder stays queued
+/// for the next recv.
+const MAX_WRITE_BATCH: usize = 256;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{Instrument, Span, debug, info, warn};
@@ -23,7 +28,7 @@ pub fn build_attach_replay(attach_result: AttachResult, pane_id: &str) -> Vec<Se
     match attach_result {
         AttachResult::FullSnapshot(snapshot, seqno) => vec![ServerMessage::TerminalSnapshot {
             pane_id: pane_id.to_string(),
-            snapshot,
+            snapshot: std::sync::Arc::new(snapshot),
             seqno,
             sent_at_ms: epoch_millis(),
         }],
@@ -42,7 +47,7 @@ pub fn build_attach_replay(attach_result: AttachResult, pane_id: &str) -> Vec<Se
             },
             ServerMessage::TerminalSnapshot {
                 pane_id: pane_id.to_string(),
-                snapshot,
+                snapshot: std::sync::Arc::new(snapshot),
                 seqno,
                 sent_at_ms: epoch_millis(),
             },
@@ -96,28 +101,56 @@ pub async fn run_client_session<R, W, A, F>(
         async move {
             let mut ctrl_rx = ctrl_rx;
             let mut writer = writer;
-            while let Some(msg) = ctrl_rx.recv().await {
-                match encode_server(&msg) {
-                    Ok(bytes) => {
-                        crate::capture::record(msg.category(), &bytes);
-                        match write_frame_compressed(&mut writer, &bytes, writer_comp.compressor())
-                            .await
-                        {
-                            Ok(wire_len) => {
-                                writer_metrics
-                                    .bytes_out
-                                    .fetch_add(wire_len as u64, Ordering::Relaxed);
-                                // What the same frame would have cost uncompressed
-                                // (length prefix + codec tag + payload).
-                                writer_metrics
-                                    .bytes_out_uncompressed
-                                    .fetch_add(5 + bytes.len() as u64, Ordering::Relaxed);
-                                writer_metrics.msgs_out.fetch_add(1, Ordering::Relaxed);
-                            }
-                            Err(_) => break,
-                        }
+            // Batch all immediately-available messages into one flush. Each
+            // `write_frame_compressed_into` writes a whole frame without
+            // flushing; a single trailing flush then pushes the batch as far
+            // fewer TLS records / syscalls than the old one-flush-per-message
+            // loop. Per-frame compression and the one-frame-per-message wire
+            // format are unchanged, so the bytes on the wire are identical —
+            // only the flush boundaries move.
+            let mut batch: Vec<ServerMessage> = Vec::new();
+            'writer: while let Some(first) = ctrl_rx.recv().await {
+                batch.clear();
+                batch.push(first);
+                while batch.len() < MAX_WRITE_BATCH {
+                    match ctrl_rx.try_recv() {
+                        Ok(m) => batch.push(m),
+                        Err(_) => break,
                     }
-                    Err(e) => warn!("encode error: {e}"),
+                }
+                for msg in batch.drain(..) {
+                    match encode_server(&msg) {
+                        Ok(bytes) => {
+                            crate::capture::record(msg.category(), &bytes);
+                            match write_frame_compressed_into(
+                                &mut writer,
+                                &bytes,
+                                writer_comp.compressor(),
+                            )
+                            .await
+                            {
+                                Ok(wire_len) => {
+                                    writer_metrics
+                                        .bytes_out
+                                        .fetch_add(wire_len as u64, Ordering::Relaxed);
+                                    // What the same frame would have cost uncompressed
+                                    // (length prefix + codec tag + payload).
+                                    writer_metrics
+                                        .bytes_out_uncompressed
+                                        .fetch_add(5 + bytes.len() as u64, Ordering::Relaxed);
+                                    writer_metrics.msgs_out.fetch_add(1, Ordering::Relaxed);
+                                }
+                                // A write failure leaves only whole frames on the
+                                // wire (each frame is written in full before the
+                                // next); the client reconnects + resyncs.
+                                Err(_) => break 'writer,
+                            }
+                        }
+                        Err(e) => warn!("encode error: {e}"),
+                    }
+                }
+                if kmux_protocol::flush(&mut writer).await.is_err() {
+                    break;
                 }
             }
             let _ = writer.shutdown().await;

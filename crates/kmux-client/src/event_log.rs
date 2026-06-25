@@ -31,6 +31,14 @@ pub enum DiagEvent {
         prev_sent_at_ms: u64,
         next_sent_at_ms: u64,
     },
+    /// The daemon's authoritative grid digest for a seqno did not match the
+    /// client's reconstructed grid: the diff stream desynced. The client
+    /// resyncs. In a correct pipeline this never fires; the conformance and
+    /// e2e suites assert the count stays zero.
+    DigestMismatch {
+        session: String,
+        seqno: u64,
+    },
 }
 
 impl fmt::Display for DiagEvent {
@@ -62,6 +70,9 @@ impl fmt::Display for DiagEvent {
                     "Tear on '{session}': {prev_sent_at_ms}\u{2192}{next_sent_at_ms}ms"
                 )
             }
+            DiagEvent::DigestMismatch { session, seqno } => {
+                write!(f, "Grid digest mismatch on '{session}' at seqno {seqno}")
+            }
         }
     }
 }
@@ -75,6 +86,9 @@ pub struct DiagCounters {
     pub resyncs: u64,
     /// Partial logical frames painted (issue #72 tearing detector).
     pub tears: u64,
+    /// Grid-digest mismatches detected against the daemon's authoritative grid.
+    /// Expected to stay zero; non-zero means the diff stream desynced.
+    pub digest_mismatches: u64,
 }
 
 impl DiagCounters {
@@ -85,6 +99,7 @@ impl DiagCounters {
             DiagEvent::Lagged { .. } => self.lag_events += 1,
             DiagEvent::Resync { .. } => self.resyncs += 1,
             DiagEvent::Tear { .. } => self.tears += 1,
+            DiagEvent::DigestMismatch { .. } => self.digest_mismatches += 1,
         }
     }
 }

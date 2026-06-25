@@ -202,6 +202,24 @@ impl CellGrid {
         }
     }
 
+    /// Compute the live grid digest the daemon's `GridDigest` certifies — the
+    /// visible grid, cursor, modes, and scrollback envelope, excluding the
+    /// scrollback tail (see [`GridSnapshot::live_digest`]). Builds a tail-less
+    /// snapshot so the held scrollback is never cloned on the check path.
+    pub fn live_digest(&self) -> u128 {
+        GridSnapshot {
+            rows: self.rows as u16,
+            cols: self.cols as u16,
+            cells: self.cells.clone(),
+            cursor: self.cursor,
+            modes: self.modes,
+            history_total: self.scrollback.history_total(),
+            scrollback_base: self.scrollback.base_index(),
+            scrollback_tail: Vec::new(),
+        }
+        .live_digest()
+    }
+
     /// Apply a diff from the server -- only changed cells are updated.
     ///
     /// Scrollback no longer travels with the diff (v16); it arrives out-of-band
@@ -755,6 +773,16 @@ mod tests {
         for i in 0..a.scrollback_len() {
             assert_eq!(b.scrollback().get(i), a.scrollback().get(i), "line {i}");
         }
+
+        // The desync oracle's contract: a reconstructed grid hashes identically
+        // to its source snapshot. This is what lets the server certify a seqno
+        // with `digest(server_snapshot)` and the client confirm with
+        // `digest(client.to_snapshot())`.
+        assert_eq!(
+            a.to_snapshot().digest(),
+            b.to_snapshot().digest(),
+            "round-tripped grid must share the source digest"
+        );
     }
 
     #[test]
