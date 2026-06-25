@@ -15,6 +15,7 @@ pub const MAX_SCROLLBACK_LINES: usize = 50_000;
 /// `base_index` is the absolute index of `lines[0]`; when the buffer is
 /// full and a new line is appended, the front is evicted and `base_index`
 /// increments. `history_total()` is `base_index + lines.len()`.
+#[derive(Clone)]
 pub struct ScrollbackBuffer {
     lines: VecDeque<ScrollbackLine>,
     max_lines: usize,

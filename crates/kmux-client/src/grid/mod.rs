@@ -1,11 +1,14 @@
+mod content;
 mod scrollback;
 mod selection;
+mod view;
+pub use content::{ApplyEffect, GridContent, ScrollbackFixup};
 pub use scrollback::ScrollbackBuffer;
 pub use selection::{DEFAULT_BG, GridPos, MULTI_CLICK_TIMEOUT_MS, Selection, SelectionMode};
+pub use view::GridView;
 
 use kmux_protocol::messages::{
-    CellAttrs, CellState, CursorState, DiffOp, GridSnapshot, ScrollbackLine, TermModes,
-    TerminalDiff,
+    CellAttrs, CellState, CursorState, GridSnapshot, ScrollbackLine, TermModes, TerminalDiff,
 };
 
 pub const CELL_WIDTH: f32 = 8.0;
@@ -62,417 +65,212 @@ pub fn scrollback_display_row_at(
 
 /// Client-side grid state -- receives pre-resolved cells from the server.
 ///
-/// Unlike the old `TerminalBuffer` that wrapped `alacritty_terminal::Term`,
-/// this is a thin grid of `CellState` values. All VT parsing and color
-/// resolution happens on the server.
+/// A thin facade over two halves: the apply-mutated [`GridContent`] (cells,
+/// cursor, modes, scrollback) and the UI-owned [`GridView`] (scroll offset,
+/// selection). Keeping them separate lets the content be applied off the UI
+/// thread and published as an immutable snapshot while the view stays mutable
+/// and responsive on the UI thread (issue #182, §1). Renderers see this one
+/// facade and read whichever half they need.
 ///
 /// Rendering uses generation-based cache invalidation: the canvas cache is
 /// rebuilt whenever `cells_generation` changes, guaranteeing that every
 /// server-side change is reflected in the render.
 pub struct CellGrid {
-    cells: Vec<CellState>,
-    cursor: CursorState,
-    modes: TermModes,
+    content: GridContent,
+    view: GridView,
+    /// Mirror of `content.rows`/`content.cols`, kept in sync after every
+    /// dimension-changing apply so the historical `grid.rows` / `grid.cols`
+    /// field access on the facade stays valid.
     pub rows: usize,
     pub cols: usize,
-    /// Incremented only when cell ops are non-empty, or on snapshot/clear/resize.
-    cells_generation: u64,
-    /// Incremented on every update (cell, cursor-only, snapshot, clear, resize).
-    cursor_generation: u64,
-    /// Lines that have scrolled off the top of the visible area.
-    scrollback: ScrollbackBuffer,
-    /// Scroll offset from the bottom (0 = live view, >0 = scrolled into history).
-    scroll_offset: usize,
-    /// Current text selection, if any.
-    selection: Option<Selection>,
-    /// Highest `history_total` the server has reported. When greater than
-    /// `scrollback.history_total()`, there are scrollback lines the client has
-    /// not yet received — the session manager will issue `FetchHistory` to
-    /// fill the gap. Cleared when the gap closes.
-    pending_history_total: Option<u64>,
 }
 
 impl CellGrid {
     pub fn new(rows: usize, cols: usize) -> Self {
         Self {
-            cells: vec![CellState::default(); rows * cols],
-            cursor: CursorState::default(),
-            modes: TermModes::EMPTY,
+            content: GridContent::new(rows, cols),
+            view: GridView::new(),
             rows,
             cols,
-            cells_generation: 0,
-            cursor_generation: 0,
-            scrollback: ScrollbackBuffer::default(),
-            scroll_offset: 0,
-            selection: None,
-            pending_history_total: None,
         }
     }
 
-    /// Absolute `history_total` reported by the server but not yet satisfied
-    /// by `ScrollbackAppend`/`HistoryLines`. `None` when the client is caught
-    /// up. Sessions poll this to decide when to issue `FetchHistory`.
+    /// The apply-mutated content half.
+    pub fn content(&self) -> &GridContent {
+        &self.content
+    }
+
+    /// The UI-owned view half.
+    pub fn view(&self) -> &GridView {
+        &self.view
+    }
+
+    /// Keep the facade's mirrored `rows`/`cols` in step with the content.
+    fn sync_dims(&mut self) {
+        self.rows = self.content.rows;
+        self.cols = self.content.cols;
+    }
+
+    /// Absolute `history_total` reported by the server but not yet satisfied by
+    /// `ScrollbackAppend`/`HistoryLines`. `None` when the client is caught up.
     pub fn pending_history_gap(&self) -> Option<(u64, u64)> {
-        let have = self.scrollback.history_total();
-        self.pending_history_total
-            .and_then(|want| (want > have).then_some((have, want)))
+        self.content.pending_history_gap()
     }
 
     // ── Public accessors for renderers ──
 
     /// Access the flat cell buffer.
     pub fn cells(&self) -> &[CellState] {
-        &self.cells
+        self.content.cells()
     }
 
     /// Current cursor state.
     pub fn cursor(&self) -> &CursorState {
-        &self.cursor
+        self.content.cursor()
     }
 
     /// Access the scrollback buffer.
     pub fn scrollback(&self) -> &ScrollbackBuffer {
-        &self.scrollback
+        self.content.scrollback()
     }
 
     // ── State updates ──
 
     /// Replace the entire grid from a server snapshot.
-    ///
-    /// Rewrites the live viewport, cursor, and modes. Scrollback persists —
-    /// snapshots are sent on attach and after resize, and in both cases the
-    /// client's accumulated scrollback is still valid. The snapshot's
-    /// `scrollback_tail` / `history_total` fields seed the buffer's absolute
-    /// indices on fresh attach and reseat them on reattach. Only an explicit
-    /// reset (see `clear()`) wipes it.
     pub fn apply_snapshot(&mut self, snapshot: GridSnapshot) {
-        self.rows = snapshot.rows as usize;
-        self.cols = snapshot.cols as usize;
-        self.cells = snapshot.cells;
-        self.cursor = snapshot.cursor;
-        self.modes = snapshot.modes;
-        // Drop any scrollback the daemon has since evicted or wiped (e.g. a
-        // `clear` after we lagged). `scrollback_base` is its oldest serveable
-        // index. This runs UNCONDITIONALLY -- outside the `seed_tail` guard
-        // below -- because the leak case is "clear then resize": the client
-        // holds non-empty scrollback and the post-clear snapshot tail is empty,
-        // so `seed_tail` is skipped and the stale lines would otherwise survive.
-        self.scrollback.evict_before(snapshot.scrollback_base);
-        if !snapshot.scrollback_tail.is_empty() || self.scrollback.is_empty() {
-            self.scrollback
-                .seed_tail(snapshot.history_total, snapshot.scrollback_tail);
-        }
-        self.maybe_clear_history_gap();
-        self.scroll_offset = 0;
-        self.selection = None;
-        self.cells_generation += 1;
-        self.cursor_generation += 1;
+        let effect = self.content.apply_snapshot(snapshot);
+        self.sync_dims();
+        self.view.apply_effect(effect);
     }
 
-    /// Clear the pending-history-gap marker once the scrollback mirror has caught
-    /// up to (or past) the total we were waiting for. Called after any operation
-    /// that can grow `history_total()`.
-    fn maybe_clear_history_gap(&mut self) {
-        if self
-            .pending_history_total
-            .is_some_and(|want| want <= self.scrollback.history_total())
-        {
-            self.pending_history_total = None;
-        }
-    }
-
-    /// Export the current grid as a [`GridSnapshot`] — the inverse of
-    /// [`apply_snapshot`](Self::apply_snapshot).
-    ///
-    /// Re-serialises a live `CellGrid` so a fresh consumer can reconstruct the
-    /// exact view with no upstream round-trip (issue #121: the federation daemon
-    /// mints a snapshot for a newly-attaching GUI from its authoritative pane
-    /// mirror). The full held scrollback travels as `scrollback_tail` so the
-    /// consumer renders history immediately. The view-local `scroll_offset` and
-    /// `selection` are intentionally excluded from the wire snapshot.
+    /// Export the current grid as a [`GridSnapshot`].
     pub fn to_snapshot(&self) -> GridSnapshot {
-        GridSnapshot {
-            rows: self.rows as u16,
-            cols: self.cols as u16,
-            cells: self.cells.clone(),
-            cursor: self.cursor,
-            modes: self.modes,
-            history_total: self.scrollback.history_total(),
-            scrollback_base: self.scrollback.base_index(),
-            scrollback_tail: self.scrollback.tail(),
-        }
+        self.content.to_snapshot()
     }
 
-    /// Compute the live grid digest the daemon's `GridDigest` certifies — the
-    /// visible grid, cursor, modes, and scrollback envelope, excluding the
-    /// scrollback tail (see [`GridSnapshot::live_digest`]). Builds a tail-less
-    /// snapshot so the held scrollback is never cloned on the check path.
+    /// Compute the live grid digest the daemon's `GridDigest` certifies.
     pub fn live_digest(&self) -> u128 {
-        GridSnapshot {
-            rows: self.rows as u16,
-            cols: self.cols as u16,
-            cells: self.cells.clone(),
-            cursor: self.cursor,
-            modes: self.modes,
-            history_total: self.scrollback.history_total(),
-            scrollback_base: self.scrollback.base_index(),
-            scrollback_tail: Vec::new(),
-        }
-        .live_digest()
+        self.content.live_digest()
     }
 
     /// Apply a diff from the server -- only changed cells are updated.
-    ///
-    /// Scrollback no longer travels with the diff (v16); it arrives out-of-band
-    /// as `ScrollbackAppend`. `diff.history_total` is still used for
-    /// monotonicity checks: if the server reports more history than the client
-    /// has seen, we record the gap so the session manager can issue a
-    /// `FetchHistory` request.
     pub fn apply_diff(&mut self, diff: TerminalDiff) {
-        // A scrollback wipe (`clear`'s CSI 3J, `RIS`) must drop history BEFORE
-        // the gap check below, so any surviving lines arrive cleanly via the
-        // out-of-band append (which the relay orders after this diff) and no
-        // spurious gap is recorded. `history_total` stays monotonic across the
-        // wipe, so `reset_to(base)` re-anchors at the daemon's new oldest index.
-        let scrollback_reset = diff.scrollback_reset.is_some();
-        if let Some(base) = diff.scrollback_reset {
-            self.scrollback.reset_to(base);
-            self.scroll_offset = 0;
-            self.selection = None;
-            self.pending_history_total = None;
-        }
-
-        if diff.history_total > self.scrollback.history_total() {
-            self.pending_history_total = Some(diff.history_total);
-        }
-
-        let has_cell_ops = !diff.ops.is_empty();
-        for op in diff.ops {
-            match op {
-                DiffOp::Cell { row, col, cell } => {
-                    let idx = row as usize * self.cols + col as usize;
-                    if idx < self.cells.len() {
-                        self.cells[idx] = cell;
-                    }
-                }
-                DiffOp::Row {
-                    row,
-                    start_col,
-                    cells,
-                } => {
-                    let base = row as usize * self.cols + start_col as usize;
-                    for (i, cell) in cells.into_iter().enumerate() {
-                        let idx = base + i;
-                        if idx < self.cells.len() {
-                            self.cells[idx] = cell;
-                        }
-                    }
-                }
-                DiffOp::Clear => {
-                    self.cells.fill(CellState::default());
-                }
-            }
-        }
-        self.cursor = diff.cursor;
-        self.modes = diff.modes;
-        if has_cell_ops || scrollback_reset {
-            self.cells_generation += 1;
-        }
-        self.cursor_generation += 1;
+        let effect = self.content.apply_diff(diff);
+        self.view.apply_effect(effect);
     }
 
     /// Apply a cursor-only update (no cell changes).
     pub fn apply_cursor_update(&mut self, cursor: CursorState, modes: TermModes) {
-        self.cursor = cursor;
-        self.modes = modes;
-        self.cursor_generation += 1;
+        self.content.apply_cursor_update(cursor, modes);
     }
 
     /// Apply an out-of-band `ScrollbackAppend` from the daemon.
-    ///
-    /// `first_index` is the absolute index of the first line in `lines`. If
-    /// the client's buffer has a gap (its `history_total()` is less than
-    /// `first_index`), the buffer is cleared and a `FetchHistory` round-trip
-    /// (driven by the session manager) will reseed it.
     pub fn apply_scrollback_append(&mut self, first_index: u64, lines: Vec<ScrollbackLine>) {
-        if lines.is_empty() {
-            return;
-        }
-        let new_count = lines.len();
-        let old_len = self.scrollback.len();
-        let ok = self.scrollback.append_with_index(first_index, lines);
-        if !ok {
-            self.scrollback.clear();
-            self.selection = None;
-        } else {
-            let new_len = self.scrollback.len();
-            let evicted = (old_len + new_count).saturating_sub(new_len);
-            if let Some(sel) = &mut self.selection {
-                if evicted > 0 && sel.anchor.row < evicted {
-                    self.selection = None;
-                } else if let Some(sel) = &mut self.selection {
-                    let net = new_count - evicted;
-                    sel.anchor.row = sel.anchor.row.saturating_sub(evicted) + net;
-                    sel.end.row = sel.end.row.saturating_sub(evicted) + net;
-                }
-            }
-        }
-        self.maybe_clear_history_gap();
-        self.cells_generation += 1;
+        let effect = self.content.apply_scrollback_append(first_index, lines);
+        self.view.apply_effect(effect);
     }
 
-    /// Apply a `HistoryLines` reply. Used to fill gaps below the current
-    /// `base_index` (older history the user scrolled into) or to recover
-    /// from a detected gap. Only the portion newer than the current
-    /// `history_total()` is appended; the rest is discarded (future work:
-    /// support back-fill below `base_index` for deep scrollback).
+    /// Apply a `HistoryLines` reply (gap fill).
     pub fn apply_history_lines(
         &mut self,
         first_index: u64,
         lines: Vec<ScrollbackLine>,
-        _history_total: u64,
+        history_total: u64,
     ) {
-        if lines.is_empty() {
-            return;
-        }
-        let current_total = self.scrollback.history_total();
-        let line_count = lines.len() as u64;
-        let end_index = first_index + line_count;
-        if first_index == current_total {
-            let _ = self.scrollback.append_with_index(first_index, lines);
-            self.cells_generation += 1;
-        } else if first_index < current_total && end_index > current_total {
-            let skip = (current_total - first_index) as usize;
-            let tail: Vec<ScrollbackLine> = lines.into_iter().skip(skip).collect();
-            if !tail.is_empty() {
-                let _ = self.scrollback.append_with_index(current_total, tail);
-                self.cells_generation += 1;
-            }
-        }
-        // Else: reply is entirely older or duplicate; nothing to do until
-        // back-fill support lands in Phase C.
-        self.maybe_clear_history_gap();
+        self.content
+            .apply_history_lines(first_index, lines, history_total);
     }
 
     /// Whether the terminal is in application-cursor mode.
     pub fn app_cursor(&self) -> bool {
-        self.modes.app_cursor()
+        self.content.app_cursor()
     }
 
     /// Current terminal mode flags.
     pub fn modes(&self) -> TermModes {
-        self.modes
+        self.content.modes()
     }
 
     /// Reset to blank cells.
     pub fn clear(&mut self) {
-        self.cells.fill(CellState::default());
-        self.cursor = CursorState::default();
-        self.modes = TermModes::EMPTY;
-        self.scrollback.clear();
-        self.scroll_offset = 0;
-        self.selection = None;
-        self.pending_history_total = None;
-        self.cells_generation += 1;
-        self.cursor_generation += 1;
+        let effect = self.content.clear();
+        self.view.apply_effect(effect);
     }
 
     /// Resize the grid (server will send a fresh snapshot after resize).
-    ///
-    /// Scrollback is intentionally preserved across resize. The viewport is
-    /// zeroed and the incoming snapshot will populate it; previously-captured
-    /// scrollback lines remain at the width they were captured and are
-    /// wrap-rendered to the new viewport width.
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        self.rows = rows as usize;
-        self.cols = cols as usize;
-        self.cells = vec![CellState::default(); self.rows * self.cols];
-        self.scroll_offset = 0;
-        self.selection = None;
-        self.cells_generation += 1;
-        self.cursor_generation += 1;
+        let effect = self.content.resize(rows, cols);
+        self.sync_dims();
+        self.view.apply_effect(effect);
     }
 
     /// Generation counter that changes on every update (used to detect changes).
     pub fn generation(&self) -> u64 {
-        self.cursor_generation
+        self.content.generation()
     }
 
-    /// Generation counter that changes only when cells change (used for cache invalidation).
+    /// Generation counter that changes only when cells change (used for cache
+    /// invalidation).
     pub fn cells_generation(&self) -> u64 {
-        self.cells_generation
+        self.content.cells_generation()
     }
 
     /// Total number of **display rows** the scrollback would occupy at the
-    /// current viewport width. A single logical scrollback line that is
-    /// wider than the viewport contributes `ceil(effective_len / cols)` rows;
-    /// blank-suffix padding does not inflate the count.
+    /// current viewport width.
     pub fn total_scrollback_display_rows(&self) -> usize {
-        let cols = self.cols;
-        let mut total = 0usize;
-        for i in 0..self.scrollback.len() {
-            if let Some(line) = self.scrollback.get(i) {
-                total += display_rows_for_line(line, cols);
-            }
-        }
-        total
+        self.content.total_scrollback_display_rows()
     }
 
     /// Scroll up by `n` **display rows** into history. Capped at the total
     /// number of display rows currently in scrollback.
     pub fn scroll_up(&mut self, n: usize) {
-        let max_offset = self.total_scrollback_display_rows();
-        let new_offset = (self.scroll_offset + n).min(max_offset);
-        if new_offset != self.scroll_offset {
-            self.scroll_offset = new_offset;
-            self.cells_generation += 1;
+        let max_offset = self.content.total_scrollback_display_rows();
+        if self.view.scroll_up(n, max_offset) {
+            self.content.note_render_dirty();
         }
     }
 
     /// Scroll down by `n` lines toward live view.
     pub fn scroll_down(&mut self, n: usize) {
-        let new_offset = self.scroll_offset.saturating_sub(n);
-        if new_offset != self.scroll_offset {
-            self.scroll_offset = new_offset;
-            self.cells_generation += 1;
+        if self.view.scroll_down(n) {
+            self.content.note_render_dirty();
         }
     }
 
     /// Snap to the bottom (live view).
     pub fn scroll_to_bottom(&mut self) {
-        if self.scroll_offset > 0 {
-            self.scroll_offset = 0;
-            self.cells_generation += 1;
+        if self.view.scroll_to_bottom() {
+            self.content.note_render_dirty();
         }
     }
 
     /// Whether the view is scrolled up from live output.
     pub fn is_scrolled(&self) -> bool {
-        self.scroll_offset > 0
+        self.view.is_scrolled()
     }
 
     /// Current scroll offset (0 = live, >0 = scrolled into history).
     pub fn scroll_offset(&self) -> usize {
-        self.scroll_offset
+        self.view.scroll_offset()
     }
 
     /// Number of lines in scrollback history.
     pub fn scrollback_len(&self) -> usize {
-        self.scrollback.len()
+        self.content.scrollback_len()
     }
 
     // ── Selection ──
 
     pub fn selection(&self) -> Option<&Selection> {
-        self.selection.as_ref()
+        self.view.selection()
     }
 
     pub fn set_selection(&mut self, sel: Option<Selection>) {
-        self.selection = sel;
+        self.view.set_selection(sel);
     }
 
     pub fn clear_selection(&mut self) {
-        self.selection = None;
+        self.view.clear_selection();
     }
 
     /// For a visible display row `vr`, the absolute logical row it shows and the
@@ -480,24 +278,24 @@ impl CellGrid {
     ///
     /// While scrolled into history (`scroll_offset > 0`), the top rows show
     /// scrollback (a wide logical line wraps across several display rows, each
-    /// with a different `base_col`); the rest show the live grid. Mirrors the
-    /// row resolution in the renderers (`render.rs` / `ui/grid.rs`).
+    /// with a different `base_col`); the rest show the live grid.
     fn abs_row_base_at_visible(&self, vr: usize) -> (usize, usize) {
-        if self.scroll_offset > 0
-            && vr < self.scroll_offset
+        let scroll_offset = self.view.scroll_offset();
+        let scrollback = self.content.scrollback();
+        if scroll_offset > 0
+            && vr < scroll_offset
             && let Some((line_idx, col_start)) =
-                scrollback_display_row_at(&self.scrollback, self.cols, self.scroll_offset - 1 - vr)
+                scrollback_display_row_at(scrollback, self.cols, scroll_offset - 1 - vr)
         {
             return (line_idx, col_start);
         }
-        let grid_row = vr.saturating_sub(self.scroll_offset);
-        (self.scrollback.len() + grid_row, 0)
+        let grid_row = vr.saturating_sub(scroll_offset);
+        (scrollback.len() + grid_row, 0)
     }
 
     /// Map a *visible* viewport cell to an absolute [`GridPos`], accounting for
     /// the current scroll offset and scrollback line wrapping. Clamps `vr`/`vc`
-    /// to the grid. This is the single source of truth for pointer → grid
-    /// mapping across frontends (GTK `pos_at`, the FFI selection methods).
+    /// to the grid.
     pub fn visible_to_abs(&self, vr: usize, vc: usize) -> GridPos {
         let vr = vr.min(self.rows.saturating_sub(1));
         let vc = vc.min(self.cols.saturating_sub(1));
@@ -510,14 +308,8 @@ impl CellGrid {
 
     /// The selected column span on each *visible* display row, as
     /// `(visible_row, col_start, col_end)` (inclusive, viewport columns).
-    ///
-    /// Intersects the active selection (in absolute coordinates) with each
-    /// visible row's `(abs_row, base_col)` mapping, so it handles scrolled views
-    /// and wrapped scrollback lines uniformly. Empty when there is no selection
-    /// or it is degenerate (anchor == end). The single source of truth for the
-    /// selection wash on every frontend.
     pub fn visible_selection_spans(&self) -> Vec<(u16, u16, u16)> {
-        let Some(sel) = self.selection.as_ref() else {
+        let Some(sel) = self.view.selection() else {
             return Vec::new();
         };
         let (start, end) = (sel.start(), sel.end_pos());
@@ -552,88 +344,25 @@ impl CellGrid {
 
     /// Read the cell at an absolute grid position (scrollback + visible).
     pub fn cell_at(&self, pos: GridPos) -> Option<&CellState> {
-        let sb_len = self.scrollback.len();
-        if pos.row < sb_len {
-            self.scrollback
-                .get(pos.row)
-                .and_then(|line| line.get(pos.col))
-        } else {
-            let grid_row = pos.row - sb_len;
-            if grid_row < self.rows && pos.col < self.cols {
-                self.cells.get(grid_row * self.cols + pos.col)
-            } else {
-                None
-            }
-        }
+        self.content.cell_at(pos)
     }
 
     /// Find word boundaries around `pos` for double-click selection.
     pub fn find_word_boundaries(&self, pos: GridPos) -> (GridPos, GridPos) {
-        let ch = self.cell_at(pos).map(|c| c.c).unwrap_or(' ');
-        let is_word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~');
-
-        if is_word(ch) {
-            let mut start_col = pos.col;
-            while start_col > 0 {
-                let prev = GridPos {
-                    row: pos.row,
-                    col: start_col - 1,
-                };
-                if self.cell_at(prev).map(|c| is_word(c.c)).unwrap_or(false) {
-                    start_col -= 1;
-                } else {
-                    break;
-                }
-            }
-            // A wrapped scrollback line is wider than the viewport, so bound the
-            // rightward scan by the logical line's length (not `cols`) — else a
-            // double-click near the wrap point would truncate the word.
-            let max_col = if pos.row < self.scrollback.len() {
-                self.scrollback
-                    .get(pos.row)
-                    .map(|l| effective_line_len(l).saturating_sub(1))
-                    .unwrap_or(0)
-            } else {
-                self.cols.saturating_sub(1)
-            };
-            let mut end_col = pos.col;
-            while end_col < max_col {
-                let next = GridPos {
-                    row: pos.row,
-                    col: end_col + 1,
-                };
-                if self.cell_at(next).map(|c| is_word(c.c)).unwrap_or(false) {
-                    end_col += 1;
-                } else {
-                    break;
-                }
-            }
-            (
-                GridPos {
-                    row: pos.row,
-                    col: start_col,
-                },
-                GridPos {
-                    row: pos.row,
-                    col: end_col,
-                },
-            )
-        } else {
-            // Non-word: select just this character
-            (pos, pos)
-        }
+        self.content.find_word_boundaries(pos)
     }
 
     /// Extract the text covered by the current selection.
     pub fn selected_text(&self) -> Option<String> {
-        let sel = self.selection.as_ref()?;
+        let sel = self.view.selection()?;
         let start = sel.start();
         let end = sel.end_pos();
         if start == end {
             return None;
         }
 
-        let sb_len = self.scrollback.len();
+        let scrollback = self.content.scrollback();
+        let sb_len = scrollback.len();
         let mut result = String::new();
         for row in start.row..=end.row {
             let col_start = if row == start.row { start.col } else { 0 };
@@ -643,7 +372,7 @@ impl CellGrid {
             let col_end = if row == end.row {
                 end.col
             } else if row < sb_len {
-                self.scrollback
+                scrollback
                     .get(row)
                     .map(|l| effective_line_len(l).saturating_sub(1))
                     .unwrap_or(0)
@@ -681,7 +410,7 @@ impl Default for CellGrid {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kmux_protocol::messages::CellColor;
+    use kmux_protocol::messages::{CellColor, DiffOp};
 
     fn cell(c: char) -> CellState {
         CellState {
@@ -762,9 +491,9 @@ mod tests {
         // The reconstructed grid is observably identical to the original.
         assert_eq!(b.rows, a.rows);
         assert_eq!(b.cols, a.cols);
-        assert_eq!(b.cells, a.cells);
-        assert_eq!(b.cursor, a.cursor);
-        assert_eq!(b.modes, a.modes);
+        assert_eq!(b.cells(), a.cells());
+        assert_eq!(b.cursor(), a.cursor());
+        assert_eq!(b.modes(), a.modes());
         assert_eq!(
             b.scrollback().history_total(),
             a.scrollback().history_total()
@@ -863,9 +592,9 @@ mod tests {
             col: 3,
             cell: cell('X'),
         }]));
-        assert_eq!(grid.cells[163].c, 'X', "cell lands at row*cols + col");
-        assert_ne!(grid.cells[162].c, 'X', "the previous column is untouched");
-        assert_ne!(grid.cells[164].c, 'X', "the next column is untouched");
+        assert_eq!(grid.cells()[163].c, 'X', "cell lands at row*cols + col");
+        assert_ne!(grid.cells()[162].c, 'X', "the previous column is untouched");
+        assert_ne!(grid.cells()[164].c, 'X', "the next column is untouched");
     }
 
     #[test]
@@ -876,7 +605,7 @@ mod tests {
             col: 79,
             cell: cell('Z'),
         }]));
-        assert_eq!(grid.cells[1919].c, 'Z', "the last valid cell is written");
+        assert_eq!(grid.cells()[1919].c, 'Z', "the last valid cell is written");
         // row 24, col 0 → index 1920 == len → out of bounds; must be dropped.
         grid.apply_diff(cell_diff(vec![DiffOp::Cell {
             row: 24,
@@ -884,7 +613,7 @@ mod tests {
             cell: cell('!'),
         }]));
         assert_eq!(
-            grid.cells.len(),
+            grid.cells().len(),
             1920,
             "an out-of-bounds cell op never grows or panics"
         );
@@ -899,11 +628,12 @@ mod tests {
             start_col: 2,
             cells: line("abc"),
         }]));
-        assert_eq!(grid.cells[82].c, 'a');
-        assert_eq!(grid.cells[83].c, 'b');
-        assert_eq!(grid.cells[84].c, 'c');
+        assert_eq!(grid.cells()[82].c, 'a');
+        assert_eq!(grid.cells()[83].c, 'b');
+        assert_eq!(grid.cells()[84].c, 'c');
         assert_ne!(
-            grid.cells[81].c, 'a',
+            grid.cells()[81].c,
+            'a',
             "the cell before the run is untouched"
         );
 
@@ -914,11 +644,12 @@ mod tests {
             cells: line("YZ"),
         }]));
         assert_eq!(
-            grid.cells[1919].c, 'Y',
+            grid.cells()[1919].c,
+            'Y',
             "the in-bounds part of the run is written"
         );
         assert_eq!(
-            grid.cells.len(),
+            grid.cells().len(),
             1920,
             "the overflowing cell is dropped, no panic"
         );
@@ -935,11 +666,13 @@ mod tests {
             cell: cell('a'),
         }]));
         assert_eq!(
-            grid.cells_generation, 1,
+            grid.cells_generation(),
+            1,
             "cell ops bump the cells generation"
         );
         assert_eq!(
-            grid.cursor_generation, 1,
+            grid.generation(),
+            1,
             "every diff bumps the cursor generation"
         );
 
@@ -947,10 +680,11 @@ mod tests {
         // generation untouched but still advances the cursor generation.
         grid.apply_diff(cell_diff(vec![]));
         assert_eq!(
-            grid.cells_generation, 1,
+            grid.cells_generation(),
+            1,
             "an empty diff must not bump the cells generation"
         );
-        assert_eq!(grid.cursor_generation, 2);
+        assert_eq!(grid.generation(), 2);
     }
 
     #[test]
