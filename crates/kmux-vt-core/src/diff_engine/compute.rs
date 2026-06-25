@@ -137,6 +137,9 @@ impl<B: TerminalBackend> DiffEngine<B> {
         // Mirror every scrollback line before anything else touches it. This
         // makes the mirror authoritative: later we read `history_total` from
         // it and the relay emits the lines out-of-band as `ScrollbackAppend`.
+        // Lines are `Arc<[CellState]>`, so this `clone()` bumps refcounts and
+        // shares the same allocations the relay later forwards — no per-frame
+        // cell copy (issue #182).
         if !scrollback_lines.is_empty() {
             self.mirror.append(scrollback_lines.clone());
         }

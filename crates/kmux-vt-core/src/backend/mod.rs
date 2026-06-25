@@ -1,7 +1,9 @@
 use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 
-use kmux_protocol::messages::{CellState, CursorState, KeyEvent, TermModes, TermSize};
+use kmux_protocol::messages::{
+    CellState, CursorState, KeyEvent, ScrollbackLine, TermModes, TermSize,
+};
 
 pub mod ghostty;
 #[cfg(test)]
@@ -184,13 +186,14 @@ pub trait TerminalBackend: Send + 'static {
     /// Read `count` lines from the scrollback history starting at `start`.
     ///
     /// Index 0 is the oldest line in history. Each returned line is a
-    /// `Vec<CellState>` of length `cols`.
+    /// [`ScrollbackLine`] of length `cols`, shared by reference so the mirror
+    /// and the outgoing message need not deep-copy it (issue #182).
     fn read_history_lines(
         &self,
         _start: usize,
         _count: usize,
         _cols: usize,
-    ) -> Vec<Vec<CellState>> {
+    ) -> Vec<ScrollbackLine> {
         vec![]
     }
 

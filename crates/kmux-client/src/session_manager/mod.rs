@@ -1606,8 +1606,9 @@ mod tests {
             .in_flight_history_fetches
             .get("eagle/0")
             .expect("in-flight recorded");
-        let lines: Vec<Vec<kmux_protocol::messages::CellState>> =
-            (0..10).map(|_| Vec::new()).collect();
+        let lines: Vec<kmux_protocol::messages::ScrollbackLine> = (0..10)
+            .map(|_| Vec::<kmux_protocol::messages::CellState>::new().into())
+            .collect();
         mgr.handle_server_message(ServerMessage::HistoryLines {
             request_id,
             pane_id: "eagle/0".to_string(),

@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use kmux_client::grid::CellGrid;
 use kmux_protocol::messages::{
-    CellState, CursorState, GridSnapshot, KeyEvent, ServerMessage, SessionEventMsg, TermModes,
+    CursorState, GridSnapshot, KeyEvent, ScrollbackLine, ServerMessage, SessionEventMsg, TermModes,
     TermSize,
 };
 use kmux_pty::error::Result;
@@ -179,7 +179,7 @@ impl WorkerEngine {
         let _ = self.req_tx.send(WorkerRequest::Resize { size });
     }
 
-    pub(super) fn checkpoint_grid(&self, max_lines: usize) -> (GridSnapshot, Vec<Vec<CellState>>) {
+    pub(super) fn checkpoint_grid(&self, max_lines: usize) -> (GridSnapshot, Vec<ScrollbackLine>) {
         let mirror = self.mirror.lock().unwrap();
         let grid = mirror.to_snapshot();
         let sb = mirror.scrollback();
@@ -200,7 +200,7 @@ impl WorkerEngine {
         &self,
         start: u64,
         count: u32,
-    ) -> (u64, Vec<Vec<CellState>>, u64) {
+    ) -> (u64, Vec<ScrollbackLine>, u64) {
         let mirror = self.mirror.lock().unwrap();
         let sb = mirror.scrollback();
         let history_total = sb.history_total();

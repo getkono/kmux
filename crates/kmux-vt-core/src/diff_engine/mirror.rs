@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use kmux_protocol::messages::CellState;
+use kmux_protocol::messages::ScrollbackLine;
 
 /// Bounded, append-only mirror of a pane's scrollback history that is
 /// independent of the underlying VT backend.
@@ -21,7 +21,7 @@ use kmux_protocol::messages::CellState;
 /// expected to wrap, not truncate.
 pub struct ScrollbackMirror {
     base_index: u64,
-    lines: VecDeque<Vec<CellState>>,
+    lines: VecDeque<ScrollbackLine>,
     cap: usize,
 }
 
@@ -45,7 +45,7 @@ impl ScrollbackMirror {
     /// Returns the absolute index of the first line appended *in this call*
     /// and the number of lines appended. The returned index is what
     /// `ServerMessage::ScrollbackAppend.first_index` should use.
-    pub fn append(&mut self, new_lines: Vec<Vec<CellState>>) -> (u64, usize) {
+    pub fn append(&mut self, new_lines: Vec<ScrollbackLine>) -> (u64, usize) {
         let first_index = self.history_total();
         let count = new_lines.len();
         for line in new_lines {
@@ -95,7 +95,7 @@ impl ScrollbackMirror {
     /// If `start` is below `base_index`, the returned slice begins at
     /// `base_index` and the caller is told so via the returned `first_index`.
     /// If `start` is beyond `history_total()`, returns an empty vec.
-    pub fn range(&self, start: u64, count: u32) -> (u64, Vec<Vec<CellState>>) {
+    pub fn range(&self, start: u64, count: u32) -> (u64, Vec<ScrollbackLine>) {
         let total = self.history_total();
         if start >= total || count == 0 {
             return (start.max(self.base_index), Vec::new());
@@ -103,13 +103,14 @@ impl ScrollbackMirror {
         let effective_start = start.max(self.base_index);
         let offset = (effective_start - self.base_index) as usize;
         let end = (offset + count as usize).min(self.lines.len());
-        let slice: Vec<Vec<CellState>> = self.lines.range(offset..end).cloned().collect();
+        let slice: Vec<ScrollbackLine> = self.lines.range(offset..end).cloned().collect();
         (effective_start, slice)
     }
 
-    /// Return the last `n` lines (cloned) for attach/resize snapshots.
-    /// The returned slice is stored at `history_total() - lines.len()` onward.
-    pub fn tail(&self, n: usize) -> Vec<Vec<CellState>> {
+    /// Return the last `n` lines (shared `Arc` clones) for attach/resize
+    /// snapshots. The returned slice is stored at `history_total() - lines.len()`
+    /// onward.
+    pub fn tail(&self, n: usize) -> Vec<ScrollbackLine> {
         let take = n.min(self.lines.len());
         let start = self.lines.len() - take;
         self.lines.range(start..).cloned().collect()
@@ -125,11 +126,12 @@ impl ScrollbackMirror {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kmux_protocol::messages::CellState;
 
-    fn line(ch: char, cols: usize) -> Vec<CellState> {
+    fn line(ch: char, cols: usize) -> ScrollbackLine {
         let mut row = vec![CellState::default(); cols];
         row[0].c = ch;
-        row
+        row.into()
     }
 
     #[test]

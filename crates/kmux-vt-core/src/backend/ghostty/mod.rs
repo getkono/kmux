@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use kmux_ghostty::{EventSink, GhosttyError, GhosttyTerm, ProgressReport, ProgressState, TermSize};
 use kmux_protocol::messages::{
-    CellState, CursorState, KeyEvent as ProtoKeyEvent, PaneProgressState, TermModes,
+    CellState, CursorState, KeyEvent as ProtoKeyEvent, PaneProgressState, ScrollbackLine, TermModes,
 };
 
 use crate::backend::{BackendConfig, BackendEventSink, BackendSize, TerminalBackend};
@@ -210,7 +210,7 @@ impl TerminalBackend for GhosttyBackend {
         self.term.history_size()
     }
 
-    fn read_history_lines(&self, start: usize, count: usize, cols: usize) -> Vec<Vec<CellState>> {
+    fn read_history_lines(&self, start: usize, count: usize, cols: usize) -> Vec<ScrollbackLine> {
         match self.term.read_history(start, count, cols) {
             Ok(rows) => rows,
             Err(e) => {
@@ -282,7 +282,7 @@ mod tests {
         result: DiffResult,
     ) -> (
         kmux_protocol::messages::TerminalDiff,
-        Vec<Vec<kmux_protocol::messages::CellState>>,
+        Vec<kmux_protocol::messages::ScrollbackLine>,
     ) {
         match result {
             DiffResult::CellDiff {

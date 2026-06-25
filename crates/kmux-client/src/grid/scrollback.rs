@@ -1,6 +1,6 @@
 use std::collections::VecDeque;
 
-use kmux_protocol::messages::CellState;
+use kmux_protocol::messages::ScrollbackLine;
 
 /// Maximum number of scrollback lines per session kept on the client.
 ///
@@ -16,7 +16,7 @@ pub const MAX_SCROLLBACK_LINES: usize = 50_000;
 /// full and a new line is appended, the front is evicted and `base_index`
 /// increments. `history_total()` is `base_index + lines.len()`.
 pub struct ScrollbackBuffer {
-    lines: VecDeque<Vec<CellState>>,
+    lines: VecDeque<ScrollbackLine>,
     max_lines: usize,
     base_index: u64,
 }
@@ -44,7 +44,7 @@ impl ScrollbackBuffer {
     /// `first_index`. Returns `true` when the append was contiguous (i.e.
     /// `first_index == history_total()` on entry); `false` indicates a gap
     /// or overlap, in which case the caller should clear or request a fetch.
-    pub fn append_with_index(&mut self, first_index: u64, new_lines: Vec<Vec<CellState>>) -> bool {
+    pub fn append_with_index(&mut self, first_index: u64, new_lines: Vec<ScrollbackLine>) -> bool {
         let expected = self.history_total();
         if first_index != expected {
             return false;
@@ -62,7 +62,7 @@ impl ScrollbackBuffer {
     /// Legacy contiguous append when the caller has no absolute index
     /// (v14-style `TerminalDiff.scrollback_lines`). Assumes lines attach
     /// directly after the current end.
-    pub fn push_lines(&mut self, new_lines: Vec<Vec<CellState>>) {
+    pub fn push_lines(&mut self, new_lines: Vec<ScrollbackLine>) {
         let _ = self.append_with_index(self.history_total(), new_lines);
     }
 
@@ -70,7 +70,7 @@ impl ScrollbackBuffer {
     /// `history_total`. Used by `GridSnapshot::scrollback_tail` on attach
     /// or resize — preserves existing newer lines if the snapshot is
     /// strictly older.
-    pub fn seed_tail(&mut self, history_total: u64, tail: Vec<Vec<CellState>>) {
+    pub fn seed_tail(&mut self, history_total: u64, tail: Vec<ScrollbackLine>) {
         if tail.is_empty() && history_total <= self.history_total() {
             return;
         }
@@ -108,18 +108,18 @@ impl ScrollbackBuffer {
     /// The first line's absolute index is `base_index()` (equivalently
     /// `history_total() - len()`), so this pairs with `history_total()` and
     /// `base_index()` to fill the scrollback fields of a `GridSnapshot`.
-    pub fn tail(&self) -> Vec<Vec<CellState>> {
+    pub fn tail(&self) -> Vec<ScrollbackLine> {
         self.lines.iter().cloned().collect()
     }
 
     /// Get a scrollback line by buffer-local index.
-    pub fn get(&self, index: usize) -> Option<&Vec<CellState>> {
+    pub fn get(&self, index: usize) -> Option<&ScrollbackLine> {
         self.lines.get(index)
     }
 
     /// Get a scrollback line by absolute index. `None` if evicted or not
     /// yet received.
-    pub fn get_absolute(&self, abs: u64) -> Option<&Vec<CellState>> {
+    pub fn get_absolute(&self, abs: u64) -> Option<&ScrollbackLine> {
         if abs < self.base_index {
             return None;
         }
@@ -167,11 +167,12 @@ impl Default for ScrollbackBuffer {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kmux_protocol::messages::CellState;
 
-    fn line(c: char) -> Vec<CellState> {
+    fn line(c: char) -> ScrollbackLine {
         let mut row = vec![CellState::default(); 4];
         row[0].c = c;
-        row
+        row.into()
     }
 
     #[test]

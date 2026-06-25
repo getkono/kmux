@@ -4,7 +4,8 @@ pub use scrollback::ScrollbackBuffer;
 pub use selection::{DEFAULT_BG, GridPos, MULTI_CLICK_TIMEOUT_MS, Selection, SelectionMode};
 
 use kmux_protocol::messages::{
-    CellAttrs, CellState, CursorState, DiffOp, GridSnapshot, TermModes, TerminalDiff,
+    CellAttrs, CellState, CursorState, DiffOp, GridSnapshot, ScrollbackLine, TermModes,
+    TerminalDiff,
 };
 
 pub const CELL_WIDTH: f32 = 8.0;
@@ -293,7 +294,7 @@ impl CellGrid {
     /// the client's buffer has a gap (its `history_total()` is less than
     /// `first_index`), the buffer is cleared and a `FetchHistory` round-trip
     /// (driven by the session manager) will reseed it.
-    pub fn apply_scrollback_append(&mut self, first_index: u64, lines: Vec<Vec<CellState>>) {
+    pub fn apply_scrollback_append(&mut self, first_index: u64, lines: Vec<ScrollbackLine>) {
         if lines.is_empty() {
             return;
         }
@@ -328,7 +329,7 @@ impl CellGrid {
     pub fn apply_history_lines(
         &mut self,
         first_index: u64,
-        lines: Vec<Vec<CellState>>,
+        lines: Vec<ScrollbackLine>,
         _history_total: u64,
     ) {
         if lines.is_empty() {
@@ -342,7 +343,7 @@ impl CellGrid {
             self.cells_generation += 1;
         } else if first_index < current_total && end_index > current_total {
             let skip = (current_total - first_index) as usize;
-            let tail: Vec<Vec<CellState>> = lines.into_iter().skip(skip).collect();
+            let tail: Vec<ScrollbackLine> = lines.into_iter().skip(skip).collect();
             if !tail.is_empty() {
                 let _ = self.scrollback.append_with_index(current_total, tail);
                 self.cells_generation += 1;
@@ -710,7 +711,7 @@ mod tests {
 
     fn push_scrollback(grid: &mut CellGrid, lines: Vec<Vec<CellState>>) {
         let first_index = grid.scrollback().history_total();
-        grid.apply_scrollback_append(first_index, lines);
+        grid.apply_scrollback_append(first_index, lines.into_iter().map(Into::into).collect());
     }
 
     #[test]
@@ -988,7 +989,10 @@ mod tests {
 
         grid.apply_scrollback_append(
             0,
-            vec![line("a"), line("b"), line("c"), line("d"), line("e")],
+            vec![line("a"), line("b"), line("c"), line("d"), line("e")]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
         );
         assert_eq!(grid.pending_history_gap(), None);
     }

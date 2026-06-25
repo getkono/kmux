@@ -8,7 +8,7 @@ use super::session::{
     TabInfo, WordId,
 };
 use super::types::Compression;
-use super::vt::{CellState, CursorState, GridSnapshot, TermModes, TerminalDiff};
+use super::vt::{CursorState, GridSnapshot, ScrollbackLine, TermModes, TerminalDiff};
 
 /// Messages sent from server -> client.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -227,7 +227,7 @@ pub enum ServerMessage {
         first_index: u64,
         /// Appended lines, oldest first. Each line is stored at the column
         /// width it had when captured.
-        lines: Vec<Vec<CellState>>,
+        lines: Vec<ScrollbackLine>,
         seqno: SequenceNo,
         sent_at_ms: u64,
     },
@@ -240,7 +240,7 @@ pub enum ServerMessage {
         pane_id: PaneId,
         /// Absolute index of the first returned line.
         first_index: u64,
-        lines: Vec<Vec<CellState>>,
+        lines: Vec<ScrollbackLine>,
         /// Mirror's absolute line count at reply time. The oldest available
         /// line is at `history_total - mirror_capacity` (conceptually).
         history_total: u64,

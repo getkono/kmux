@@ -35,7 +35,7 @@ pub mod codec;
 use serde::{Deserialize, Serialize};
 
 use kmux_protocol::messages::{
-    CellState, CursorState, GridSnapshot, KeyEvent, TermModes, TermSize, TerminalDiff,
+    CursorState, GridSnapshot, KeyEvent, ScrollbackLine, TermModes, TermSize, TerminalDiff,
 };
 
 /// Version of the daemon ↔ worker IPC contract.
@@ -111,7 +111,7 @@ pub enum WorkerEvent {
     /// does.
     Diff {
         diff: TerminalDiff,
-        scrollback_lines: Vec<Vec<CellState>>,
+        scrollback_lines: Vec<ScrollbackLine>,
     },
     /// No cells changed, but the cursor position or terminal modes did.
     CursorOnly {
@@ -135,7 +135,7 @@ pub enum WorkerEvent {
     History {
         req_id: u64,
         first_index: u64,
-        lines: Vec<Vec<CellState>>,
+        lines: Vec<ScrollbackLine>,
         history_total: u64,
     },
     /// The PTY child exited (master returned EOF). The daemon surfaces this to
@@ -243,7 +243,7 @@ mod tests {
                 history_total: 3,
                 scrollback_reset: None,
             },
-            scrollback_lines: vec![vec![CellState::default(); 4]],
+            scrollback_lines: vec![vec![CellState::default(); 4].into()],
         });
         rt_event(&WorkerEvent::CursorOnly {
             cursor: CursorState::default(),
@@ -274,7 +274,7 @@ mod tests {
         rt_event(&WorkerEvent::History {
             req_id: 2,
             first_index: 10,
-            lines: vec![vec![CellState::default(); 2]],
+            lines: vec![vec![CellState::default(); 2].into()],
             history_total: 12,
         });
         for status in [

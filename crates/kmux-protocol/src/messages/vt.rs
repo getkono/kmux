@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 /// Portable cell color -- resolved to RGB on the server.
@@ -72,6 +74,18 @@ impl Default for CellState {
         }
     }
 }
+
+/// One scrollback line, shared by reference.
+///
+/// A whole row of cells captured at the width it had when it scrolled off.
+/// Lines are reference-counted so the daemon's `ScrollbackMirror` and the
+/// outgoing `ScrollbackAppend` / `GridSnapshot::scrollback_tail` can share the
+/// same allocation instead of deep-copying it on every scrolling frame, and so
+/// fanning one append out to N clients is N `Arc` bumps rather than N grid
+/// copies. Postcard serialises `Arc<[T]>` exactly as `[T]` (serde's `rc`
+/// feature is enabled workspace-wide), so this is byte-identical on the wire to
+/// the old `Vec<CellState>` — no protocol/state/worker version bump.
+pub type ScrollbackLine = Arc<[CellState]>;
 
 /// Cursor shape in the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,7 +236,7 @@ pub struct GridSnapshot {
     /// line's absolute index is `history_total - scrollback_tail.len()`.
     /// Empty when the pane has no scrollback yet.
     #[serde(default)]
-    pub scrollback_tail: Vec<Vec<CellState>>,
+    pub scrollback_tail: Vec<ScrollbackLine>,
 }
 
 /// A small, dependency-free, deterministic 128-bit FNV-1a hasher used to digest
@@ -308,7 +322,7 @@ impl GridSnapshot {
         h.write(&(self.scrollback_tail.len() as u64).to_le_bytes());
         for line in &self.scrollback_tail {
             h.write(&(line.len() as u64).to_le_bytes());
-            for cell in line {
+            for cell in line.iter() {
                 h.write_cell(cell);
             }
         }
@@ -367,6 +381,10 @@ mod digest_tests {
         }
     }
 
+    fn sb_line(cells: Vec<CellState>) -> ScrollbackLine {
+        cells.into()
+    }
+
     #[test]
     fn digest_is_stable_and_clone_equal() {
         let s = sample();
@@ -415,7 +433,7 @@ mod digest_tests {
         assert_ne!(base, sbbase.digest(), "scrollback_base");
 
         let mut tail = sample();
-        tail.scrollback_tail = vec![vec![glyph('a'), glyph('b')]];
+        tail.scrollback_tail = vec![sb_line(vec![glyph('a'), glyph('b')])];
         assert_ne!(base, tail.digest(), "scrollback tail content");
     }
 
@@ -425,7 +443,7 @@ mod digest_tests {
 
         // Tail *content* differs → full digest changes, live digest does not.
         let mut tail = sample();
-        tail.scrollback_tail = vec![vec![glyph('a')]];
+        tail.scrollback_tail = vec![sb_line(vec![glyph('a')])];
         // history_total/base unchanged, only the held tail content differs.
         assert_eq!(base, tail.live_digest(), "tail content excluded from live");
         assert_ne!(
@@ -462,13 +480,13 @@ mod digest_tests {
         in_grid.cells[5] = glyph('Z');
 
         let mut in_scrollback = sample();
-        in_scrollback.scrollback_tail = vec![vec![glyph('Z')]];
+        in_scrollback.scrollback_tail = vec![sb_line(vec![glyph('Z')])];
 
         assert_ne!(in_grid.digest(), in_scrollback.digest());
 
         // An empty scrollback line is still observable (its length prefix is fed).
         let mut empty_line = sample();
-        empty_line.scrollback_tail = vec![Vec::new()];
+        empty_line.scrollback_tail = vec![sb_line(Vec::new())];
         assert_ne!(sample().digest(), empty_line.digest());
     }
 }
