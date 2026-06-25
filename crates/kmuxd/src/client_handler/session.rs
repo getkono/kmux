@@ -9,7 +9,7 @@ use kmux_protocol::{decode_client, encode_server, read_frame, write_frame_compre
 /// Cap on how many queued messages one flush coalesces. Bounds batch memory and
 /// keeps flush latency tight under a sustained burst; the remainder stays queued
 /// for the next recv.
-const MAX_WRITE_BATCH: usize = 256;
+pub(crate) const MAX_WRITE_BATCH: usize = 256;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc};
 use tracing::{Instrument, Span, debug, info, warn};
