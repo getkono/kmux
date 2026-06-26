@@ -56,7 +56,10 @@ genuinely independent implementations, so agreement is meaningful — this is wh
 caught the `'\0'`-vs-`' '` blank-cell desync that prompted the
 `kmux-ghostty` `convert_cell` fix. `relay.rs`'s `relay_broadcast_reconstructs_*`
 test extends this through the *real* broadcast path (seqno allocation,
-`ScrollbackAppend` ordering incl. the reset-first rule, digest emission).
+`ScrollbackAppend` ordering incl. the reset-first rule, digest emission), and
+`oracle_survives_data_channel_overflow_lagged` drives the oracle through a forced
+slow-client overflow → `Lagged` → resync, asserting the digest stays clean across
+the recovery (issue #182, §5).
 
 ### 2. Live self-heal (production, in-band)
 
@@ -72,12 +75,25 @@ resync (`grid.clear()` + re-attach). This turns silent corruption into a detecte
 self-healing, *countable* event — the conformance and e2e suites assert the count
 stays zero.
 
-## What still needs more than a content digest
+## What needs more than a content digest
 
-The digest covers seams 2–5. It is **blind** to:
+The digest covers seams 2–5. It is **blind** to two classes of bug, each now
+carrying its own dedicated invariant (issue #182):
 
 - **render bugs** (seam 6): the `CellGrid` is correct, only the pixels are wrong.
-  Covered by the deterministic `kmux diagnostic` render patterns.
-- **read-during-apply tears** if grid application is ever moved off the UI thread:
-  a post-apply digest is green even if a painter observed a half-applied grid.
-  That work must carry its own generation-seqlock invariant (see PERFORMANCE.md).
+  The renderer's per-row dirty-row cache (§3) is verified by a frozen parity test
+  (`geometry::tests::dirty_row_cache_matches_full_rebuild`) that asserts the
+  cached `SceneGeometry` is byte-identical to a full rebuild across varied content
+  and an incremental-update sequence — structural proof a digest can't give.
+- **read-during-apply tears** now that grid application runs off the UI thread
+  (§1): a post-apply content digest would be green even if a painter observed a
+  half-applied grid. The off-thread apply publishes each frame as a whole,
+  immutable `Arc<GridContent>` via an `ArcSwap` double-buffer, so a reader's load
+  always returns a fully-constructed prior value — the `(generation, snapshot)`
+  pair lives in one allocation and can never tear. This invariant is verified by
+  a reader/writer property test (`tests/grid_apply_worker.rs`) that drives the
+  real apply worker against a concurrent reader and asserts no torn
+  `(dimensions, cells, generation)` tuple, plus that a worker-backed grid matches
+  a synchronous reference. (A `loom` model would be the textbook tool, but loom
+  disables `tokio`'s I/O under `--cfg loom`, which this crate's transport stack
+  needs; the real-threads property test stands in.)

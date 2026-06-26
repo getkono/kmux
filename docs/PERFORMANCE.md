@@ -38,52 +38,58 @@ CPU/scheduling, not transport or format.
 - **Connection pausing** (issue #68) and **transport hot-swap + scoring**
   (issue #69) — see [connection.md](connection.md), [connection-pause.md](connection-pause.md).
 
-## Open
+## Shipped: the CPU/scheduling follow-ups (issue #182)
 
-Ordered by estimated impact for the typical (one local GUI) case.
+The remaining items were CPU/scheduling, not transport or format. All five
+shipped, each gated on the oracle/conformance suite staying green.
 
 ### 1. Off-UI-thread client diff application
 
-**Now:** `CellGrid::apply_diff` runs on the iced/GTK UI tick
-(`crates/kmux-app/src/driver/mod.rs`), which also paints from the grid every
-frame. A large burst can momentarily block the UI.
+`CellGrid::apply_diff` no longer runs on the UI tick. A dedicated apply worker
+thread (owned by the `SessionManager`) holds the authoritative `GridContent` per
+pane; the UI enqueues content mutations and the worker republishes a whole,
+immutable `Arc<GridContent>` per touched pane through an **`ArcSwap`
+double-buffer** (`crates/kmux-client/src/grid/apply_worker.rs`). A large burst no
+longer blocks the UI. The `CellGrid` facade splits into apply-mutated content
+(off-thread) and UI-owned view state (scroll/selection), so the view stays
+responsive. The daemon's pane mirror and tests use the synchronous `Local`
+backing unchanged.
 
-**Change:** apply diffs on a worker thread and publish to the UI via a generation
-**seqlock** / double-buffer handoff, keeping `apply_diff` pure. **Highest risk:** a
-content digest is blind to read-during-apply tears, so this must carry its own
-invariant — verify with a `loom` model of the publish handoff, a reader/writer
-property test asserting no torn `(generation, snapshot)` pair, and a worker-side
-seqno-order assertion. Medium-large effort.
+We chose the Arc double-buffer over a hand-rolled seqlock: it is tear-free with
+no `unsafe`, the `(generation, snapshot)` pair lives in one allocation (nothing
+to tear against), and renderers keep a cheap shared borrow. A content digest is
+blind to read-during-apply tears, so the handoff carries its own invariant —
+verified by a reader/writer property test (real worker vs. a concurrent reader,
+no torn tuple) and the worker's per-pane order assertion. See
+[architecture-verification.md](architecture-verification.md).
 
 ### 2. Diff-engine scrollback mirror clone
 
-**Now:** `diff_engine` clones each frame's new scrollback lines into its mirror
-while also returning them for the `ScrollbackAppend` (`compute.rs`,
-`self.mirror.append(scrollback_lines.clone())`) — one full clone per scrolling
-frame.
-
-**Change:** share the lines (e.g. `Arc` per line) between the mirror and the
-outgoing message. Touches scrollback correctness, so gate on the conformance
-suite. Medium effort.
+Scrollback lines are now `Arc<[CellState]>` (`ScrollbackLine`) end to end —
+materialised once at the libghostty FFI boundary and shared by the daemon mirror,
+the `DiffResult`, the wire messages, and the client buffer. The per-frame
+`mirror.append(clone)` and the per-client fan-out are now `Arc` pointer bumps.
+postcard serialises `Arc<[T]>` byte-identically to `[T]` (serde `rc`), so there
+was **no PROTOCOL_VERSION / worker / state bump**.
 
 ### 3. Renderer dirty-row cache
 
-**Now:** the renderer rebuilds its draw cache when `cells_generation` changes,
-even if one cell moved.
-
-**Change:** track dirty rows and re-render only those. A content digest cannot
-cover render bugs — verify against the deterministic `kmux diagnostic` patterns,
-frozen once. Small-medium effort.
+`GridContent` stamps each row with the generation it last changed at
+(`row_generation`); `geometry::build_scene_cached` reuses the cell-layer geometry
+of unchanged rows and re-emits only dirty rows, rebuilding the cheap view
+overlays every frame. A content digest can't cover render bugs, so a frozen
+parity test asserts the cached scene is byte-identical to a full rebuild.
 
 ### 4. QUIC per-pane writer batching
 
-**Now:** flush-coalescing batching (Shipped) covers the merged TCP/UDS writer but
-not the QUIC `pane_uni_writer` (`crates/kmuxd/src/connection.rs`), which still
-flushes per message. QUIC's per-message flush is cheap, so this is low priority.
+The QUIC `pane_uni_writer` (`crates/kmuxd/src/connection.rs`) now drains a batch
+and flushes once, matching the merged TCP/UDS writer. Byte-identical wire output;
+QUIC's flush is cheap, so the win is modest (fewer await points, uniform shape).
 
-### 5. Impairment-harness extension
+### 5. Impairment-harness coverage
 
-The deterministic shim (`crates/kmuxd/src/impair.rs`, `KMUX_NET_DELAY_MS` etc.)
-covers QUIC latency only. Extend it to TCP/UDS and to forcing overflow→`Lagged`,
-and run the oracle under each variant, before relying on items 1–2 in production.
-Testing infrastructure, not a runtime change.
+The deterministic shim (`crates/kmuxd/src/impair.rs`, `KMUX_NET_*`) delays
+pane-data frames on **every** transport (QUIC `pane_uni_writer` + TCP/UDS
+`TcpAttacher`). The slow-client overflow→`Lagged` path is exercised under the
+oracle by `relay::tests::oracle_survives_data_channel_overflow_lagged`, which
+forces the overflow and asserts the digest stays clean across the resync.
