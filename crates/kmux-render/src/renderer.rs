@@ -89,6 +89,10 @@ pub struct TerminalRenderer {
     target: Target,
     width: u32,
     height: u32,
+    /// Per-row scene cache: reuses the cell-layer geometry of unchanged rows
+    /// across frames so a single-line update does not rebuild the whole scene
+    /// (issue #182, §3).
+    scene_cache: geometry::SceneCache,
 }
 
 impl TerminalRenderer {
@@ -257,6 +261,7 @@ impl TerminalRenderer {
             target,
             width,
             height,
+            scene_cache: geometry::SceneCache::default(),
         }
     }
 
@@ -335,7 +340,7 @@ impl TerminalRenderer {
         self.palette = frame.palette.clone();
 
         let cell: CellMetrics = *self.metrics.cell();
-        let scene = geometry::build_scene(frame, &cell);
+        let scene = geometry::build_scene_cached(frame, &cell, &mut self.scene_cache);
 
         self.queue.write_buffer(
             &self.globals_buf,

@@ -438,6 +438,13 @@ impl CellGrid {
             .wrapping_add(self.view_generation)
     }
 
+    /// The `cells_generation` at which live viewport `row` last changed — the
+    /// per-row dirty stamp a renderer keys its row cache on (issue #182, §3).
+    /// Only meaningful when not scrolled (`scroll_offset() == 0`).
+    pub fn row_generation(&self, row: usize) -> u64 {
+        self.content().row_generation(row)
+    }
+
     /// Total number of **display rows** the scrollback would occupy at the
     /// current viewport width.
     pub fn total_scrollback_display_rows(&self) -> usize {

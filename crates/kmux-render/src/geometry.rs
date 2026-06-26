@@ -337,11 +337,191 @@ pub fn build_scene(frame: &Frame<'_>, m: &CellMetrics) -> SceneGeometry {
     scene
 }
 
+/// One pane row's cached cell-layer geometry (issue #182, §3).
+#[derive(Default, Clone)]
+struct CachedRow {
+    /// `CellGrid::row_generation` the row was built at; a row is reused while
+    /// this matches. `u64::MAX` forces a (re)build.
+    row_gen: u64,
+    bg: Vec<SolidQuad>,
+    glyphs: Vec<GlyphQuad>,
+    rules: Vec<SolidQuad>,
+}
+
+/// Per-pane cached rows plus the identity of the grid they were built for.
+#[derive(Default)]
+struct PaneRowCache {
+    /// Address of the borrowed `CellGrid`; a pane reassigned to a different grid
+    /// (tab switch) rebuilds rather than reusing another grid's row stamps.
+    grid_id: usize,
+    rows: Vec<CachedRow>,
+}
+
+/// Frame-level signature: everything that changes the rendered cell layer beyond
+/// per-row grid content (palette, metrics, viewport size, pane geometry). Any
+/// change invalidates the whole cache — these are not tracked by `row_generation`.
+#[derive(PartialEq)]
+struct FrameSig {
+    palette: Theme,
+    metrics: CellMetrics,
+    width: u32,
+    height: u32,
+    panes: Vec<(u16, u16, u16, u16)>,
+}
+
+fn frame_sig(frame: &Frame<'_>, m: &CellMetrics) -> FrameSig {
+    FrameSig {
+        palette: frame.palette.clone(),
+        metrics: *m,
+        width: frame.width,
+        height: frame.height,
+        panes: frame
+            .panes
+            .iter()
+            .map(|p| (p.col, p.row, p.cols, p.rows))
+            .collect(),
+    }
+}
+
+/// Cross-frame cache for [`build_scene_cached`].
+#[derive(Default)]
+pub struct SceneCache {
+    sig: Option<FrameSig>,
+    panes: Vec<PaneRowCache>,
+    /// Rows (re)built during the most recent [`build_scene_cached`] call; the
+    /// rest were reused. Surfaced for tests + render-debug accounting.
+    rebuilt_rows: usize,
+}
+
+impl SceneCache {
+    /// Number of rows (re)built in the last `build_scene_cached` — the rest of
+    /// the visible rows were served from cache (issue #182, §3).
+    pub fn rebuilt_rows(&self) -> usize {
+        self.rebuilt_rows
+    }
+}
+
+/// Like [`build_scene`] but reuses the cell-layer geometry of rows that have not
+/// changed since the last frame, re-emitting only dirty rows (issue #182, §3).
+///
+/// Produces byte-identical output to [`build_scene`]: both share `emit_cell` /
+/// `emit_pane_overlays`, and a row is reused only when the frame signature is
+/// unchanged and `CellGrid::row_generation` matches — so a content change always
+/// rebuilds the affected row. Overlays (selection, cursor, focus, scroll) are
+/// rebuilt every frame. The fast path is the steady live case (unscrolled `Grid`
+/// panes); scrolled or packed panes fall back to a full emit.
+pub fn build_scene_cached(
+    frame: &Frame<'_>,
+    m: &CellMetrics,
+    cache: &mut SceneCache,
+) -> SceneGeometry {
+    let sig = frame_sig(frame, m);
+    let reusable = cache.sig.as_ref() == Some(&sig);
+    if cache.panes.len() != frame.panes.len() {
+        cache.panes.clear();
+        cache
+            .panes
+            .resize_with(frame.panes.len(), PaneRowCache::default);
+    }
+
+    let mut rebuilt = 0usize;
+    let mut scene = SceneGeometry::default();
+    for (pi, pane) in frame.panes.iter().enumerate() {
+        let ox = pane.col as f32 * m.cell_w;
+        let oy = pane.row as f32 * m.cell_h;
+
+        let grid = match &pane.cells {
+            CellSource::Grid(grid) if grid.scroll_offset() == 0 => Some(*grid),
+            _ => None,
+        };
+
+        if let Some(grid) = grid {
+            let grid_id = grid as *const CellGrid as usize;
+            let pc = &mut cache.panes[pi];
+            let nrows = pane.rows as usize;
+            // Invalidate this pane's rows if the frame signature changed, the
+            // grid identity changed, or the row count changed.
+            if !reusable || pc.grid_id != grid_id || pc.rows.len() != nrows {
+                pc.grid_id = grid_id;
+                pc.rows.clear();
+                pc.rows.resize(
+                    nrows,
+                    CachedRow {
+                        row_gen: u64::MAX,
+                        ..CachedRow::default()
+                    },
+                );
+            }
+            for vr in 0..nrows {
+                let row_gen = grid.row_generation(vr);
+                let row = &mut pc.rows[vr];
+                if row.row_gen != row_gen {
+                    let built = build_grid_row(frame, m, ox, oy, grid, vr);
+                    row.row_gen = row_gen;
+                    row.bg = built.bg_quads;
+                    row.glyphs = built.glyphs;
+                    row.rules = built.overlay_quads;
+                    rebuilt += 1;
+                }
+                scene.bg_quads.extend_from_slice(&row.bg);
+                scene.glyphs.extend_from_slice(&row.glyphs);
+                scene.overlay_quads.extend_from_slice(&row.rules);
+            }
+        } else {
+            // Scrolled or packed: no row cache, emit the cell layer directly.
+            cache.panes[pi] = PaneRowCache::default();
+            emit_pane_cells(&mut scene, frame, pane, m, ox, oy);
+        }
+
+        emit_pane_overlays(&mut scene, frame, pane, m, ox, oy);
+    }
+
+    cache.sig = Some(sig);
+    cache.rebuilt_rows = rebuilt;
+    scene
+}
+
+/// Build one unscrolled live `Grid` row's cell layer into a throwaway scene (its
+/// `bg_quads` / `glyphs` / `overlay_quads` are the row's backgrounds, glyphs, and
+/// rules). Mirrors the unscrolled branch of [`for_each_displayed_cell`] exactly.
+fn build_grid_row(
+    frame: &Frame<'_>,
+    m: &CellMetrics,
+    ox: f32,
+    oy: f32,
+    grid: &CellGrid,
+    vr: usize,
+) -> SceneGeometry {
+    let mut row = SceneGeometry::default();
+    let cols = grid.cols;
+    let cells = grid.cells();
+    let blank = CellState::default();
+    for vc in 0..cols {
+        let cell = cells.get(vr * cols + vc).unwrap_or(&blank);
+        let rc = resolve_grid_cell(cell, frame.palette);
+        emit_cell(&mut row, m, ox, oy, vr, vc, &rc);
+    }
+    row
+}
+
 fn emit_pane(scene: &mut SceneGeometry, frame: &Frame<'_>, pane: &PaneView<'_>, m: &CellMetrics) {
     let ox = pane.col as f32 * m.cell_w;
     let oy = pane.row as f32 * m.cell_h;
+    emit_pane_cells(scene, frame, pane, m, ox, oy);
+    emit_pane_overlays(scene, frame, pane, m, ox, oy);
+}
 
-    // Cells: backgrounds, glyphs, rules.
+/// Emit a pane's whole cell layer — backgrounds, glyphs, rules — for every
+/// displayed cell (scrollback-composited when scrolled). Shared by [`build_scene`]
+/// and the non-cacheable path of [`build_scene_cached`].
+fn emit_pane_cells(
+    scene: &mut SceneGeometry,
+    frame: &Frame<'_>,
+    pane: &PaneView<'_>,
+    m: &CellMetrics,
+    ox: f32,
+    oy: f32,
+) {
     match &pane.cells {
         CellSource::Grid(grid) => {
             for_each_displayed_cell(grid, |vr, vc, cell| {
@@ -359,7 +539,21 @@ fn emit_pane(scene: &mut SceneGeometry, frame: &Frame<'_>, pane: &PaneView<'_>, 
             }
         }
     }
+}
 
+/// Emit a pane's view-dependent overlays — selection wash, cursor, focus border,
+/// scroll indicator — in draw order, over the already-emitted cell layer. Split
+/// out so the dirty-row cache ([`build_scene_cached`]) rebuilds these every frame
+/// (they are cheap and depend on transient view state) while reusing the cell
+/// layer of unchanged rows.
+fn emit_pane_overlays(
+    scene: &mut SceneGeometry,
+    frame: &Frame<'_>,
+    pane: &PaneView<'_>,
+    m: &CellMetrics,
+    ox: f32,
+    oy: f32,
+) {
     // Selection wash (over glyphs, under the cursor).
     let wash = color::with_alpha(color::rgb(frame.palette.accent), SELECTION_WASH_ALPHA);
     for &(vr, c0, c1) in pane.selection {
@@ -718,6 +912,83 @@ mod tests {
             selection: sel,
             scroll: None,
         }
+    }
+
+    /// Issue #182, §3: the dirty-row cache must produce byte-identical geometry
+    /// to a full rebuild at every step — a parity a content digest can never give
+    /// (a digest is blind to render output). Frozen here against varied content
+    /// (every glyph/attr/colour path the `kmux diagnostic` patterns exercise) and
+    /// an incremental-update sequence, asserting both parity and that only the
+    /// genuinely-dirty rows are rebuilt.
+    #[test]
+    fn dirty_row_cache_matches_full_rebuild() {
+        use kmux_protocol::messages::{DiffOp, TermModes, TerminalDiff};
+
+        let m = CellMetrics::new(8.0, 16.0);
+        let rows = 6usize;
+        let cols = 10usize;
+        let mut initial =
+            vec![cell(' ', CellAttrs::DEFAULT_FG | CellAttrs::DEFAULT_BG); rows * cols];
+        for r in 0..rows {
+            for c in 0..cols {
+                let ch = char::from(b'A' + ((r * cols + c) % 26) as u8);
+                let attrs = match (r + c) % 4 {
+                    0 => 0,
+                    1 => CellAttrs::BOLD,
+                    2 => CellAttrs::UNDERLINE,
+                    _ => CellAttrs::ITALIC | CellAttrs::STRIKETHROUGH,
+                };
+                initial[r * cols + c] = cell(ch, attrs);
+            }
+        }
+        let mut grid = grid_with(initial, rows, cols);
+        let mut cache = SceneCache::default();
+
+        // Parity check + the count of rows actually rebuilt this frame.
+        let check = |grid: &CellGrid, cache: &mut SceneCache, sel: &[(u16, u16, u16)]| -> usize {
+            let p = pane(grid, sel);
+            let frame = Frame::single(400, 400, 1.0, theme(), true, p);
+            let cached = build_scene_cached(&frame, &m, cache);
+            let full = build_scene(&frame, &m);
+            assert_eq!(cached, full, "dirty-row cache diverged from full rebuild");
+            cache.rebuilt_rows()
+        };
+
+        // Cold cache: every visible row built.
+        assert_eq!(check(&grid, &mut cache, &[]), rows);
+        // Unchanged frame: every row reused.
+        assert_eq!(check(&grid, &mut cache, &[]), 0);
+        // A one-cell diff dirties exactly one row.
+        grid.apply_diff(TerminalDiff {
+            ops: vec![DiffOp::Cell {
+                row: 2,
+                col: 3,
+                cell: cell('Z', CellAttrs::BOLD),
+            }],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            history_total: 0,
+            scrollback_reset: None,
+        });
+        assert_eq!(check(&grid, &mut cache, &[]), 1);
+        // A selection is overlay-only: no row rebuilt, still parity.
+        assert_eq!(check(&grid, &mut cache, &[(1, 0, 4)]), 0);
+        // Resize changes the frame signature → full rebuild, still parity.
+        grid.resize(8, 12);
+        assert_eq!(check(&grid, &mut cache, &[]), 8);
+        // A scrolled pane falls back to a full emit and must still match.
+        grid.apply_scrollback_append(
+            0,
+            vec![vec![cell('q', 0); 12].into(), vec![cell('r', 0); 12].into()],
+        );
+        grid.scroll_up(2);
+        let p = pane(&grid, &[]);
+        let frame = Frame::single(400, 400, 1.0, theme(), true, p);
+        assert_eq!(
+            build_scene_cached(&frame, &m, &mut cache),
+            build_scene(&frame, &m),
+            "scrolled fallback diverged from full rebuild"
+        );
     }
 
     #[test]

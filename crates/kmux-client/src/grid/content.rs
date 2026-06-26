@@ -63,6 +63,11 @@ pub struct GridContent {
     /// not yet received — the session manager will issue `FetchHistory` to
     /// fill the gap. Cleared when the gap closes.
     pending_history_total: Option<u64>,
+    /// Per-row generation stamp (length `rows`): the `cells_generation` at which
+    /// each live row last changed. A renderer that cached the scene at
+    /// generation `g` need only rebuild rows whose stamp is `> g` (issue #182,
+    /// §3). Carried through the off-thread publish snapshot for free.
+    row_gens: Vec<u64>,
 }
 
 impl GridContent {
@@ -77,7 +82,23 @@ impl GridContent {
             cursor_generation: 0,
             scrollback: ScrollbackBuffer::default(),
             pending_history_total: None,
+            row_gens: vec![0; rows],
         }
+    }
+
+    /// Stamp every live row as changed at the current `cells_generation`. Used
+    /// when the whole viewport is rewritten (snapshot, clear, resize).
+    fn stamp_all_rows(&mut self) {
+        let stamp = self.cells_generation;
+        self.row_gens.clear();
+        self.row_gens.resize(self.rows, stamp);
+    }
+
+    /// The `cells_generation` at which live `row` last changed (0 if never, or
+    /// out of range). A renderer reuses a row's cached geometry while this is
+    /// unchanged. See [`row_gens`](Self::row_gens).
+    pub fn row_generation(&self, row: usize) -> u64 {
+        self.row_gens.get(row).copied().unwrap_or(0)
     }
 
     /// Absolute `history_total` reported by the server but not yet satisfied
@@ -136,6 +157,7 @@ impl GridContent {
         self.maybe_clear_history_gap();
         self.cells_generation += 1;
         self.cursor_generation += 1;
+        self.stamp_all_rows();
         ApplyEffect {
             reset_view: true,
             ..ApplyEffect::default()
@@ -218,6 +240,10 @@ impl GridContent {
         }
 
         let has_cell_ops = !diff.ops.is_empty();
+        // Rows touched this diff, stamped with the post-bump generation below so
+        // a renderer can rebuild only what changed (issue #182, §3).
+        let mut changed_rows: Vec<u16> = Vec::new();
+        let mut clear_all = false;
         for op in diff.ops {
             match op {
                 DiffOp::Cell { row, col, cell } => {
@@ -225,6 +251,7 @@ impl GridContent {
                     if idx < self.cells.len() {
                         self.cells[idx] = cell;
                     }
+                    changed_rows.push(row);
                 }
                 DiffOp::Row {
                     row,
@@ -238,9 +265,11 @@ impl GridContent {
                             self.cells[idx] = cell;
                         }
                     }
+                    changed_rows.push(row);
                 }
                 DiffOp::Clear => {
                     self.cells.fill(CellState::default());
+                    clear_all = true;
                 }
             }
         }
@@ -250,6 +279,17 @@ impl GridContent {
             self.cells_generation += 1;
         }
         self.cursor_generation += 1;
+        if has_cell_ops {
+            let stamp = self.cells_generation;
+            if clear_all {
+                self.row_gens.iter_mut().for_each(|g| *g = stamp);
+            }
+            for row in changed_rows {
+                if let Some(g) = self.row_gens.get_mut(row as usize) {
+                    *g = stamp;
+                }
+            }
+        }
         ApplyEffect {
             reset_view: scrollback_reset,
             ..ApplyEffect::default()
@@ -352,6 +392,7 @@ impl GridContent {
         self.pending_history_total = None;
         self.cells_generation += 1;
         self.cursor_generation += 1;
+        self.stamp_all_rows();
         ApplyEffect {
             reset_view: true,
             ..ApplyEffect::default()
@@ -370,6 +411,7 @@ impl GridContent {
         self.cells = vec![CellState::default(); self.rows * self.cols];
         self.cells_generation += 1;
         self.cursor_generation += 1;
+        self.stamp_all_rows();
         ApplyEffect {
             reset_view: true,
             ..ApplyEffect::default()
@@ -480,5 +522,71 @@ impl GridContent {
             // Non-word: select just this character
             (pos, pos)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kmux_protocol::messages::CursorState;
+
+    fn cell_diff(row: u16, col: u16, ch: char) -> TerminalDiff {
+        TerminalDiff {
+            ops: vec![DiffOp::Cell {
+                row,
+                col,
+                cell: CellState {
+                    c: ch,
+                    ..CellState::default()
+                },
+            }],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            history_total: 0,
+            scrollback_reset: None,
+        }
+    }
+
+    #[test]
+    fn row_generation_stamps_only_changed_rows() {
+        let mut g = GridContent::new(4, 8);
+        // A diff touching row 2 stamps only row 2 with the new cells_generation.
+        g.apply_diff(cell_diff(2, 1, 'X'));
+        let stamp = g.cells_generation();
+        assert_eq!(g.row_generation(2), stamp, "changed row carries the stamp");
+        for r in [0, 1, 3] {
+            assert_eq!(g.row_generation(r), 0, "untouched row {r} unchanged");
+        }
+
+        // A cursor-only diff (no cell ops) bumps no row generation.
+        g.apply_diff(TerminalDiff {
+            ops: vec![],
+            cursor: CursorState {
+                col: 3,
+                ..CursorState::default()
+            },
+            modes: TermModes::EMPTY,
+            history_total: 0,
+            scrollback_reset: None,
+        });
+        assert_eq!(g.row_generation(2), stamp, "cursor-only leaves row stamps");
+
+        // A full clear stamps every row at the new generation.
+        g.clear();
+        let after_clear = g.cells_generation();
+        for r in 0..4 {
+            assert_eq!(g.row_generation(r), after_clear, "clear stamps row {r}");
+        }
+    }
+
+    #[test]
+    fn resize_rebuilds_row_generations_to_new_height() {
+        let mut g = GridContent::new(3, 4);
+        g.resize(6, 8);
+        let stamp = g.cells_generation();
+        for r in 0..6 {
+            assert_eq!(g.row_generation(r), stamp);
+        }
+        assert_eq!(g.row_generation(6), 0, "out-of-range row reads 0");
     }
 }
