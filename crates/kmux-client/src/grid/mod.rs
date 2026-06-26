@@ -1,14 +1,20 @@
+mod apply_worker;
 mod content;
 mod scrollback;
 mod selection;
 mod view;
+pub use apply_worker::{ApplyHandle, ApplyJob, Published, WorkerNote};
 pub use content::{ApplyEffect, GridContent, ScrollbackFixup};
 pub use scrollback::ScrollbackBuffer;
 pub use selection::{DEFAULT_BG, GridPos, MULTI_CLICK_TIMEOUT_MS, Selection, SelectionMode};
 pub use view::GridView;
 
+use std::sync::Arc;
+use std::sync::mpsc::Sender;
+
 use kmux_protocol::messages::{
-    CellAttrs, CellState, CursorState, GridSnapshot, ScrollbackLine, TermModes, TerminalDiff,
+    CellAttrs, CellState, CursorState, GridSnapshot, PaneId, ScrollbackLine, SequenceNo, TermModes,
+    TerminalDiff,
 };
 
 pub const CELL_WIDTH: f32 = 8.0;
@@ -76,28 +82,77 @@ pub fn scrollback_display_row_at(
 /// rebuilt whenever `cells_generation` changes, guaranteeing that every
 /// server-side change is reflected in the render.
 pub struct CellGrid {
-    content: GridContent,
+    backing: GridBacking,
     view: GridView,
-    /// Mirror of `content.rows`/`content.cols`, kept in sync after every
-    /// dimension-changing apply so the historical `grid.rows` / `grid.cols`
-    /// field access on the facade stays valid.
+    /// Bumped on every view-only change (scrolling) so the renderer's
+    /// `cells_generation`-keyed cache invalidates even though the published
+    /// content did not change.
+    view_generation: u64,
+    /// Mirror of the content's `rows`/`cols`, kept in sync on construct, refresh,
+    /// and (Local) dimension-changing applies so `grid.rows` / `grid.cols` field
+    /// access on the facade stays valid.
     pub rows: usize,
     pub cols: usize,
 }
 
+/// Where a [`CellGrid`]'s content lives and how applies reach it.
+enum GridBacking {
+    /// Synchronous, self-contained content. Applies mutate it in place; reads
+    /// borrow it directly. Used by the daemon's pane mirror and by tests.
+    Local(GridContent),
+    /// Worker-backed (issue #182, §1): applies enqueue to the apply worker,
+    /// which owns the authoritative content and republishes it; reads borrow the
+    /// last-loaded immutable snapshot, refreshed each UI tick.
+    Published {
+        apply_tx: Sender<ApplyJob>,
+        pane_id: PaneId,
+        published: Published,
+        loaded: Arc<GridContent>,
+        /// Per-pane monotonic counter for the worker's contiguity assertion.
+        order: u64,
+    },
+}
+
 impl CellGrid {
+    /// A synchronous, self-contained grid (daemon mirror, tests).
     pub fn new(rows: usize, cols: usize) -> Self {
         Self {
-            content: GridContent::new(rows, cols),
+            backing: GridBacking::Local(GridContent::new(rows, cols)),
             view: GridView::new(),
+            view_generation: 0,
             rows,
             cols,
         }
     }
 
-    /// The apply-mutated content half.
+    /// A worker-backed facade for a client pane. Applies enqueue on `apply_tx`;
+    /// reads come from `published` (loaded immediately and refreshed each tick).
+    pub fn published(pane_id: PaneId, apply_tx: Sender<ApplyJob>, published: Published) -> Self {
+        let loaded = published.load_full();
+        let rows = loaded.rows;
+        let cols = loaded.cols;
+        Self {
+            backing: GridBacking::Published {
+                apply_tx,
+                pane_id,
+                published,
+                loaded,
+                order: 0,
+            },
+            view: GridView::new(),
+            view_generation: 0,
+            rows,
+            cols,
+        }
+    }
+
+    /// The currently-readable content half (live for `Local`, last-published
+    /// snapshot for `Published`).
     pub fn content(&self) -> &GridContent {
-        &self.content
+        match &self.backing {
+            GridBacking::Local(c) => c,
+            GridBacking::Published { loaded, .. } => loaded,
+        }
     }
 
     /// The UI-owned view half.
@@ -105,69 +160,169 @@ impl CellGrid {
         &self.view
     }
 
-    /// Keep the facade's mirrored `rows`/`cols` in step with the content.
-    fn sync_dims(&mut self) {
-        self.rows = self.content.rows;
-        self.cols = self.content.cols;
+    /// Reload the published content snapshot (no-op for `Local`). Called by the
+    /// `SessionManager` each UI tick before the grid is read/rendered. Returns
+    /// whether the content changed since the last refresh, so the driver can
+    /// repaint the final frame of a burst even after the message batch drains.
+    pub fn refresh(&mut self) -> bool {
+        let new = match &self.backing {
+            GridBacking::Published {
+                published, loaded, ..
+            } => {
+                let candidate = published.load_full();
+                // The worker republishes a fresh `Arc` for every touched pane, so
+                // pointer-identity is an exact "did anything apply" check.
+                if Arc::ptr_eq(loaded, &candidate) {
+                    return false;
+                }
+                candidate
+            }
+            GridBacking::Local(_) => return false,
+        };
+        self.rows = new.rows;
+        self.cols = new.cols;
+        if let GridBacking::Published { loaded, .. } = &mut self.backing {
+            *loaded = new;
+        }
+        true
+    }
+
+    /// Apply a view-state effect reported by the worker (`Published` panes). For
+    /// `Local` panes the effect is applied inline by the apply method itself.
+    pub fn apply_view_effect(&mut self, effect: ApplyEffect) {
+        self.view.apply_effect(effect);
+    }
+
+    /// Take and advance the per-pane apply order (Published backing only).
+    fn next_order(&mut self) -> u64 {
+        if let GridBacking::Published { order, .. } = &mut self.backing {
+            let o = *order;
+            *order += 1;
+            o
+        } else {
+            0
+        }
     }
 
     /// Absolute `history_total` reported by the server but not yet satisfied by
     /// `ScrollbackAppend`/`HistoryLines`. `None` when the client is caught up.
     pub fn pending_history_gap(&self) -> Option<(u64, u64)> {
-        self.content.pending_history_gap()
+        self.content().pending_history_gap()
     }
 
     // ── Public accessors for renderers ──
 
     /// Access the flat cell buffer.
     pub fn cells(&self) -> &[CellState] {
-        self.content.cells()
+        self.content().cells()
     }
 
     /// Current cursor state.
     pub fn cursor(&self) -> &CursorState {
-        self.content.cursor()
+        self.content().cursor()
     }
 
     /// Access the scrollback buffer.
     pub fn scrollback(&self) -> &ScrollbackBuffer {
-        self.content.scrollback()
+        self.content().scrollback()
     }
 
     // ── State updates ──
+    //
+    // `Local` backing applies in place and reconciles the view inline; the
+    // `Published` backing enqueues the mutation to the apply worker, which
+    // republishes the content and reports any view effect back as a `WorkerNote`.
 
     /// Replace the entire grid from a server snapshot.
     pub fn apply_snapshot(&mut self, snapshot: GridSnapshot) {
-        let effect = self.content.apply_snapshot(snapshot);
-        self.sync_dims();
-        self.view.apply_effect(effect);
+        let order = self.next_order();
+        match &mut self.backing {
+            GridBacking::Local(c) => {
+                let effect = c.apply_snapshot(snapshot);
+                let (r, cc) = (c.rows, c.cols);
+                self.rows = r;
+                self.cols = cc;
+                self.view.apply_effect(effect);
+            }
+            GridBacking::Published {
+                apply_tx, pane_id, ..
+            } => {
+                let _ = apply_tx.send(ApplyJob::Snapshot {
+                    pane_id: pane_id.clone(),
+                    order,
+                    snapshot: Box::new(snapshot),
+                });
+            }
+        }
     }
 
     /// Export the current grid as a [`GridSnapshot`].
     pub fn to_snapshot(&self) -> GridSnapshot {
-        self.content.to_snapshot()
+        self.content().to_snapshot()
     }
 
     /// Compute the live grid digest the daemon's `GridDigest` certifies.
     pub fn live_digest(&self) -> u128 {
-        self.content.live_digest()
+        self.content().live_digest()
     }
 
     /// Apply a diff from the server -- only changed cells are updated.
     pub fn apply_diff(&mut self, diff: TerminalDiff) {
-        let effect = self.content.apply_diff(diff);
-        self.view.apply_effect(effect);
+        let order = self.next_order();
+        match &mut self.backing {
+            GridBacking::Local(c) => {
+                let effect = c.apply_diff(diff);
+                self.view.apply_effect(effect);
+            }
+            GridBacking::Published {
+                apply_tx, pane_id, ..
+            } => {
+                let _ = apply_tx.send(ApplyJob::Diff {
+                    pane_id: pane_id.clone(),
+                    order,
+                    diff: Box::new(diff),
+                });
+            }
+        }
     }
 
     /// Apply a cursor-only update (no cell changes).
     pub fn apply_cursor_update(&mut self, cursor: CursorState, modes: TermModes) {
-        self.content.apply_cursor_update(cursor, modes);
+        let order = self.next_order();
+        match &mut self.backing {
+            GridBacking::Local(c) => c.apply_cursor_update(cursor, modes),
+            GridBacking::Published {
+                apply_tx, pane_id, ..
+            } => {
+                let _ = apply_tx.send(ApplyJob::Cursor {
+                    pane_id: pane_id.clone(),
+                    order,
+                    cursor,
+                    modes,
+                });
+            }
+        }
     }
 
     /// Apply an out-of-band `ScrollbackAppend` from the daemon.
     pub fn apply_scrollback_append(&mut self, first_index: u64, lines: Vec<ScrollbackLine>) {
-        let effect = self.content.apply_scrollback_append(first_index, lines);
-        self.view.apply_effect(effect);
+        let order = self.next_order();
+        match &mut self.backing {
+            GridBacking::Local(c) => {
+                let effect = c.apply_scrollback_append(first_index, lines);
+                self.view.apply_effect(effect);
+            }
+            GridBacking::Published {
+                apply_tx, pane_id, ..
+            } => {
+                let _ = apply_tx.send(ApplyJob::ScrollbackAppend {
+                    pane_id: pane_id.clone(),
+                    order,
+                    first_index,
+                    lines,
+                });
+            }
+        }
     }
 
     /// Apply a `HistoryLines` reply (gap fill).
@@ -177,70 +332,138 @@ impl CellGrid {
         lines: Vec<ScrollbackLine>,
         history_total: u64,
     ) {
-        self.content
-            .apply_history_lines(first_index, lines, history_total);
+        let order = self.next_order();
+        match &mut self.backing {
+            GridBacking::Local(c) => c.apply_history_lines(first_index, lines, history_total),
+            GridBacking::Published {
+                apply_tx, pane_id, ..
+            } => {
+                let _ = apply_tx.send(ApplyJob::HistoryLines {
+                    pane_id: pane_id.clone(),
+                    order,
+                    first_index,
+                    lines,
+                    history_total,
+                });
+            }
+        }
     }
 
     /// Whether the terminal is in application-cursor mode.
     pub fn app_cursor(&self) -> bool {
-        self.content.app_cursor()
+        self.content().app_cursor()
     }
 
     /// Current terminal mode flags.
     pub fn modes(&self) -> TermModes {
-        self.content.modes()
+        self.content().modes()
     }
 
     /// Reset to blank cells.
     pub fn clear(&mut self) {
-        let effect = self.content.clear();
-        self.view.apply_effect(effect);
+        let order = self.next_order();
+        match &mut self.backing {
+            GridBacking::Local(c) => {
+                let effect = c.clear();
+                self.view.apply_effect(effect);
+            }
+            GridBacking::Published {
+                apply_tx, pane_id, ..
+            } => {
+                let _ = apply_tx.send(ApplyJob::Clear {
+                    pane_id: pane_id.clone(),
+                    order,
+                });
+            }
+        }
     }
 
     /// Resize the grid (server will send a fresh snapshot after resize).
     pub fn resize(&mut self, rows: u16, cols: u16) {
-        let effect = self.content.resize(rows, cols);
-        self.sync_dims();
-        self.view.apply_effect(effect);
+        let order = self.next_order();
+        match &mut self.backing {
+            GridBacking::Local(c) => {
+                let effect = c.resize(rows, cols);
+                let (r, cc) = (c.rows, c.cols);
+                self.rows = r;
+                self.cols = cc;
+                self.view.apply_effect(effect);
+            }
+            GridBacking::Published {
+                apply_tx, pane_id, ..
+            } => {
+                let _ = apply_tx.send(ApplyJob::Resize {
+                    pane_id: pane_id.clone(),
+                    order,
+                    rows,
+                    cols,
+                });
+            }
+        }
     }
 
-    /// Generation counter that changes on every update (used to detect changes).
+    /// Request a digest check against the daemon-certified `hash` at `seqno`.
+    /// For `Local` backing the check runs inline and returns `Some(mismatch)`;
+    /// for `Published` it enqueues to the worker and returns `None` — a mismatch
+    /// arrives later as a [`WorkerNote::DigestMismatch`].
+    pub fn request_digest_check(&mut self, seqno: SequenceNo, hash: u128) -> Option<bool> {
+        match &mut self.backing {
+            GridBacking::Local(c) => {
+                Some(c.pending_history_gap().is_none() && c.live_digest() != hash)
+            }
+            GridBacking::Published {
+                apply_tx, pane_id, ..
+            } => {
+                let _ = apply_tx.send(ApplyJob::Digest {
+                    pane_id: pane_id.clone(),
+                    seqno,
+                    hash,
+                });
+                None
+            }
+        }
+    }
+
+    /// Generation counter that changes on every content update (cursor moves,
+    /// cells, snapshots). View-only changes do not advance it.
     pub fn generation(&self) -> u64 {
-        self.content.generation()
+        self.content().generation()
     }
 
-    /// Generation counter that changes only when cells change (used for cache
-    /// invalidation).
+    /// Generation counter that changes when cells change OR the view scrolls,
+    /// keyed by the renderer's draw cache.
     pub fn cells_generation(&self) -> u64 {
-        self.content.cells_generation()
+        self.content()
+            .cells_generation()
+            .wrapping_add(self.view_generation)
     }
 
     /// Total number of **display rows** the scrollback would occupy at the
     /// current viewport width.
     pub fn total_scrollback_display_rows(&self) -> usize {
-        self.content.total_scrollback_display_rows()
+        self.content().total_scrollback_display_rows()
     }
 
     /// Scroll up by `n` **display rows** into history. Capped at the total
     /// number of display rows currently in scrollback.
     pub fn scroll_up(&mut self, n: usize) {
-        let max_offset = self.content.total_scrollback_display_rows();
+        let max_offset = self.content().total_scrollback_display_rows();
         if self.view.scroll_up(n, max_offset) {
-            self.content.note_render_dirty();
+            self.view_generation = self.view_generation.wrapping_add(1);
         }
     }
 
     /// Scroll down by `n` lines toward live view.
     pub fn scroll_down(&mut self, n: usize) {
         if self.view.scroll_down(n) {
-            self.content.note_render_dirty();
+            self.view_generation = self.view_generation.wrapping_add(1);
         }
     }
 
     /// Snap to the bottom (live view).
     pub fn scroll_to_bottom(&mut self) {
         if self.view.scroll_to_bottom() {
-            self.content.note_render_dirty();
+            self.view_generation = self.view_generation.wrapping_add(1);
         }
     }
 
@@ -256,7 +479,7 @@ impl CellGrid {
 
     /// Number of lines in scrollback history.
     pub fn scrollback_len(&self) -> usize {
-        self.content.scrollback_len()
+        self.content().scrollback_len()
     }
 
     // ── Selection ──
@@ -281,7 +504,7 @@ impl CellGrid {
     /// with a different `base_col`); the rest show the live grid.
     fn abs_row_base_at_visible(&self, vr: usize) -> (usize, usize) {
         let scroll_offset = self.view.scroll_offset();
-        let scrollback = self.content.scrollback();
+        let scrollback = self.content().scrollback();
         if scroll_offset > 0
             && vr < scroll_offset
             && let Some((line_idx, col_start)) =
@@ -344,12 +567,12 @@ impl CellGrid {
 
     /// Read the cell at an absolute grid position (scrollback + visible).
     pub fn cell_at(&self, pos: GridPos) -> Option<&CellState> {
-        self.content.cell_at(pos)
+        self.content().cell_at(pos)
     }
 
     /// Find word boundaries around `pos` for double-click selection.
     pub fn find_word_boundaries(&self, pos: GridPos) -> (GridPos, GridPos) {
-        self.content.find_word_boundaries(pos)
+        self.content().find_word_boundaries(pos)
     }
 
     /// Extract the text covered by the current selection.
@@ -361,7 +584,7 @@ impl CellGrid {
             return None;
         }
 
-        let scrollback = self.content.scrollback();
+        let scrollback = self.content().scrollback();
         let sb_len = scrollback.len();
         let mut result = String::new();
         for row in start.row..=end.row {

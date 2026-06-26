@@ -382,17 +382,10 @@ impl GridContent {
     }
 
     /// Generation counter that changes only when cells change (used for cache
-    /// invalidation). Also bumped by the view when the user scrolls (see
-    /// [`note_render_dirty`](Self::note_render_dirty)).
+    /// invalidation). The facade folds in a view generation so scrolling also
+    /// invalidates the renderer cache.
     pub fn cells_generation(&self) -> u64 {
         self.cells_generation
-    }
-
-    /// Bump `cells_generation` to force a renderer cache rebuild for a view-only
-    /// change (scrolling) that did not touch cells. Kept on the content so the
-    /// generation a renderer keys on stays a single monotonic counter.
-    pub(super) fn note_render_dirty(&mut self) {
-        self.cells_generation += 1;
     }
 
     /// Total number of **display rows** the scrollback would occupy at the

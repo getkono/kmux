@@ -283,6 +283,12 @@ impl FrontendDriver {
             dirty = true;
         }
         dirty |= self.apply_settled_resize(now);
+        // Off-UI-thread grid apply (issue #182, §1): load any content the apply
+        // worker republished since last tick, then apply the view effects /
+        // resyncs it reported, before draining (and enqueueing) this tick's
+        // server messages.
+        dirty |= self.core.mgr.refresh_buffers();
+        dirty |= self.core.mgr.drain_apply_notes();
         dirty |= self.drain_server_messages(&mut effects);
         dirty |= self.poll_bootstrap_outcome();
         #[cfg(feature = "remote")]

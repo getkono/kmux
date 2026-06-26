@@ -20,7 +20,7 @@ use tracing::warn;
 use kmux_protocol::messages::ConnectionId;
 
 use crate::connection_state::ConnectionState;
-use crate::grid::CellGrid;
+use crate::grid::{ApplyHandle, CellGrid, WorkerNote};
 use crate::liveness::Liveness;
 use crate::metrics::{JsonlSink, MetricsStore};
 use crate::supervisor::RttSample;
@@ -115,8 +115,14 @@ pub struct SessionManager {
     pub(super) zoomed: bool,
     /// Rotating index into the preset [`LayoutScheme`]s for `cycle_layout`.
     pub(super) layout_scheme_idx: usize,
-    /// Terminal buffers keyed by pane_id.
+    /// Terminal buffers keyed by pane_id. Client panes are worker-backed
+    /// ([`CellGrid::published`]); content applies run off the UI thread on
+    /// [`Self::apply`] (issue #182, §1).
     pub buffers: HashMap<PaneId, CellGrid>,
+    /// Off-UI-thread grid apply worker, spawned lazily on the first real connect
+    /// (`set_ws_sender`/`apply_outcome`). `None` in tests, which drive
+    /// synchronous `Local` grids instead.
+    pub(super) apply: Option<ApplyHandle>,
     pub(super) pane_sync: HashMap<PaneId, PaneSync>,
     pub input_locked: HashMap<PaneId, bool>,
     /// Panes the user marked exempt from *auto*-pause (issue #68): they keep
@@ -224,6 +230,7 @@ impl SessionManager {
             zoomed: false,
             layout_scheme_idx: 0,
             buffers: HashMap::new(),
+            apply: None,
             pane_sync: HashMap::new(),
             input_locked: HashMap::new(),
             auto_pause_exempt_panes: HashSet::new(),
@@ -244,6 +251,94 @@ impl SessionManager {
             rtt_tx: None,
             transport_override: None,
             override_tx: None,
+        }
+    }
+
+    // ── Off-UI-thread grid apply worker (issue #182, §1) ──────────────────────
+
+    /// Spawn the apply worker on the first real connect. Idempotent. Not called
+    /// from tests (which set `ws_sender` directly), so test grids stay `Local`
+    /// and apply synchronously.
+    pub(super) fn ensure_worker(&mut self) {
+        if self.apply.is_none() {
+            self.apply = Some(ApplyHandle::spawn());
+        }
+    }
+
+    /// Get a pane's buffer, creating it if absent. A worker-backed
+    /// [`CellGrid::published`] when the worker is running, else a synchronous
+    /// `Local` grid (tests).
+    pub(super) fn ensure_pane(&mut self, pane_id: &str) -> &mut CellGrid {
+        if !self.buffers.contains_key(pane_id) {
+            let grid = match &self.apply {
+                Some(handle) => {
+                    let published = handle.register_pane(pane_id.to_string(), 24, 80);
+                    CellGrid::published(pane_id.to_string(), handle.sender(), published)
+                }
+                None => CellGrid::default(),
+            };
+            self.buffers.insert(pane_id.to_string(), grid);
+        }
+        self.buffers.get_mut(pane_id).expect("just inserted")
+    }
+
+    /// Reload every worker-backed pane's published content snapshot. Called at
+    /// the top of the UI tick before grids are read/rendered. Returns whether any
+    /// pane's content changed (so the driver repaints). No-op for `Local`.
+    pub fn refresh_buffers(&mut self) -> bool {
+        if self.apply.is_none() {
+            return false;
+        }
+        let mut changed = false;
+        for grid in self.buffers.values_mut() {
+            changed |= grid.refresh();
+        }
+        changed
+    }
+
+    /// Drain worker notes: apply view effects to the owning `GridView` and act on
+    /// digest mismatches (resync) and order gaps. Returns whether anything that
+    /// affects rendering changed.
+    pub fn drain_apply_notes(&mut self) -> bool {
+        let mut dirty = false;
+        let mut notes = Vec::new();
+        if let Some(handle) = &self.apply {
+            while let Some(note) = handle.try_recv_note() {
+                notes.push(note);
+            }
+        }
+        for note in notes {
+            match note {
+                WorkerNote::Effect { pane_id, effect } => {
+                    if let Some(grid) = self.buffers.get_mut(&pane_id) {
+                        grid.apply_view_effect(effect);
+                        dirty = true;
+                    }
+                }
+                WorkerNote::DigestMismatch { pane_id, seqno } => {
+                    self.metrics.record_digest_mismatch(&pane_id, seqno.0);
+                    self.metrics.record_resync(&pane_id, "grid digest mismatch");
+                    if let Some(grid) = self.buffers.get_mut(&pane_id) {
+                        grid.clear();
+                    }
+                    self.in_flight_history_fetches.remove(&pane_id);
+                    self.attach_fresh(pane_id);
+                    dirty = true;
+                }
+                WorkerNote::SeqnoGap { pane_id } => {
+                    self.metrics.record_resync(&pane_id, "apply order gap");
+                }
+            }
+        }
+        dirty
+    }
+
+    /// Drop all worker-side pane state on disconnect/reconnect (the buffers map
+    /// is cleared by the caller). The worker thread itself is kept alive for the
+    /// next connection.
+    pub(super) fn reset_apply_worker(&mut self) {
+        if let Some(handle) = &self.apply {
+            handle.reset();
         }
     }
 

@@ -53,6 +53,10 @@ serde_json = "1"
 postcard = { version = "1", features = ["alloc"] }
 quinn = "0.11"
 rand = "0.10.1"
+# Lock-free Arc double-buffer for the off-UI-thread grid publish handoff (#182).
+arc-swap = "1"
+# Property testing for that handoff (dev-only).
+proptest = "1"
 rcgen = "0.14.7"
 # Ed25519 sign/verify for cryptographic machine identity (issue #146). Already
 # in the tree transitively via rustls; pinned to the resolved version. Pulled

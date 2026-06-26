@@ -128,6 +128,9 @@ impl SessionManager {
     /// never outlive its sync state).
     fn forget_pane(&mut self, pane_id: &str) {
         self.buffers.remove(pane_id);
+        if let Some(handle) = &self.apply {
+            handle.forget_pane(pane_id.to_string());
+        }
         self.pane_sync.remove(pane_id);
         self.input_locked.remove(pane_id);
         self.in_flight_history_fetches.remove(pane_id);
@@ -219,7 +222,7 @@ impl SessionManager {
                 self.session_list = sessions.clone();
                 for entry in &sessions {
                     for pane in &entry.panes {
-                        self.buffers.entry(pane.pane_id.clone()).or_default();
+                        self.ensure_pane(&pane.pane_id);
                     }
                 }
                 // Resolve a deferred "focus the pane I just created" once its tab
@@ -257,7 +260,7 @@ impl SessionManager {
             ServerMessage::SessionCreated { entry, .. } => {
                 let word_id = entry.meta.word_id.clone();
                 for pane in &entry.panes {
-                    self.buffers.entry(pane.pane_id.clone()).or_default();
+                    self.ensure_pane(&pane.pane_id);
                 }
                 self.session_list.push(entry);
                 self.status_msg = format!("Session '{word_id}' created");
@@ -301,7 +304,7 @@ impl SessionManager {
                 size,
                 ..
             } => {
-                self.buffers.entry(pane_id.clone()).or_default();
+                self.ensure_pane(&pane_id);
                 // Record the new pane in the flat list for immediate chrome.
                 if let Some(entry) = self
                     .session_list
@@ -441,7 +444,7 @@ impl SessionManager {
                 layout,
                 ..
             } => {
-                self.buffers.entry(new_pane.pane_id.clone()).or_default();
+                self.ensure_pane(&new_pane.pane_id);
                 let new_idx = new_pane.pane_index;
                 if let Some(entry) = self
                     .session_list
@@ -472,7 +475,7 @@ impl SessionManager {
                 sent_at_ms,
             } => {
                 let start = Instant::now();
-                let grid = self.buffers.entry(pane_id.clone()).or_default();
+                let grid = self.ensure_pane(&pane_id);
                 // The client owns its freshly-decoded Arc (refcount 1), so this
                 // moves the grid out rather than cloning it.
                 grid.apply_snapshot(Arc::unwrap_or_clone(snapshot));
@@ -546,18 +549,25 @@ impl SessionManager {
                     self.pane_sync.get(&pane_id),
                     Some(PaneSync::Synced { expected }) if expected.0 == seqno.0 + 1
                 );
-                let mismatch = synced_here
-                    && self.buffers.get(&pane_id).is_some_and(|grid| {
-                        grid.pending_history_gap().is_none() && grid.live_digest() != hash
-                    });
-                if mismatch {
-                    self.metrics.record_digest_mismatch(&pane_id, seqno.0);
-                    self.metrics.record_resync(&pane_id, "grid digest mismatch");
-                    if let Some(grid) = self.buffers.get_mut(&pane_id) {
-                        grid.clear();
+                if synced_here {
+                    // A `Published` pane's content lives on the apply worker, so
+                    // the digest is checked there (in-order with the data it
+                    // certifies) and a mismatch returns via `WorkerNote`, handled
+                    // in `drain_apply_notes`. A `Local` pane checks inline and
+                    // returns `Some(mismatch)`.
+                    let inline_mismatch = self
+                        .buffers
+                        .get_mut(&pane_id)
+                        .and_then(|grid| grid.request_digest_check(seqno, hash));
+                    if inline_mismatch == Some(true) {
+                        self.metrics.record_digest_mismatch(&pane_id, seqno.0);
+                        self.metrics.record_resync(&pane_id, "grid digest mismatch");
+                        if let Some(grid) = self.buffers.get_mut(&pane_id) {
+                            grid.clear();
+                        }
+                        self.in_flight_history_fetches.remove(&pane_id);
+                        self.attach_fresh(pane_id);
                     }
-                    self.in_flight_history_fetches.remove(&pane_id);
-                    self.attach_fresh(pane_id);
                 }
             }
 
