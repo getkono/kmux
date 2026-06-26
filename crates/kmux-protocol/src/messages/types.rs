@@ -113,7 +113,11 @@ impl TransportKind {
 ///   broadcasts `SessionEventMsg::PaneAttention` (carrying an `AttentionKind`
 ///   and a server-assigned `attention_id` for client-side dedup) and replies
 ///   `ServerMessage::NotifyAccepted`.
-pub const PROTOCOL_VERSION: u32 = 35;
+/// - **36**: grid desync oracle. New `ServerMessage::GridDigest` carries a
+///   checksum of the daemon's authoritative grid at a seqno; a client verifies
+///   its reconstructed grid against it and resyncs on mismatch, so silent
+///   diff-stream corruption becomes a detected, self-healing event.
+pub const PROTOCOL_VERSION: u32 = 36;
 
 /// Wire compression algorithm negotiated for a connection.
 ///

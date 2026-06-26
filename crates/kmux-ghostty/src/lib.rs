@@ -26,7 +26,9 @@ use core::ffi::c_void;
 use std::ptr::NonNull;
 use std::sync::Arc;
 
-use kmux_protocol::messages::{CellColor, CellState, CursorShape, CursorState, TermModes};
+use kmux_protocol::messages::{
+    CellColor, CellState, CursorShape, CursorState, ScrollbackLine, TermModes,
+};
 use static_assertions::assert_impl_all;
 use static_assertions::assert_not_impl_any;
 use thiserror::Error;
@@ -462,13 +464,16 @@ impl GhosttyTerm {
     }
 
     /// Read `count` rows of scrollback starting at `start` (0 = oldest).
-    /// Returns one `Vec<CellState>` per row; `cols` is the row width.
+    /// Returns one [`ScrollbackLine`] per row; `cols` is the row width. Each
+    /// line is materialised straight into its shared `Arc<[CellState]>`
+    /// allocation, so the daemon's mirror and the outgoing `ScrollbackAppend`
+    /// share it without a further copy (issue #182).
     pub fn read_history(
         &self,
         start: usize,
         count: usize,
         cols: usize,
-    ) -> Result<Vec<Vec<CellState>>, GhosttyError> {
+    ) -> Result<Vec<ScrollbackLine>, GhosttyError> {
         if count == 0 || cols == 0 {
             return Ok(Vec::new());
         }
@@ -487,7 +492,7 @@ impl GhosttyTerm {
             )
         };
         map_rc(rc)?;
-        let mut out = Vec::with_capacity(filled);
+        let mut out: Vec<ScrollbackLine> = Vec::with_capacity(filled);
         for r in 0..filled {
             let base = r * cols;
             out.push(raw[base..base + cols].iter().map(convert_cell).collect());
@@ -506,7 +511,18 @@ impl Drop for GhosttyTerm {
 
 fn convert_cell(c: &sys::KmuxCell) -> CellState {
     CellState {
-        c: char::from_u32(c.codepoint).unwrap_or(' '),
+        // libghostty reports an empty cell as codepoint 0, which `char::from_u32`
+        // maps to NUL ('\0'). Normalise it to a space so "blank" has a single
+        // representation everywhere in the pipeline: `CellState::default()`,
+        // `DiffOp::Clear`, and the diff engine's blank baseline all use ' '.
+        // Without this, a program writing a literal space over a never-written
+        // cell yields no diff (' ' equals the ' ' baseline) while a fresh
+        // snapshot still carries the original '\0' — the two representations
+        // render identically but silently desync a client's grid from the
+        // server's (caught by the grid-digest oracle).
+        c: char::from_u32(c.codepoint)
+            .filter(|&ch| ch != '\0')
+            .unwrap_or(' '),
         fg: rgba_to_color(c.fg_rgba),
         bg: rgba_to_color(c.bg_rgba),
         attrs: kmux_protocol::messages::CellAttrs(c.attrs),

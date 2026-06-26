@@ -140,7 +140,7 @@ impl ServerApp {
         let Ok(relay) = get_pane_relay(&sessions, pane_id) else {
             return;
         };
-        let snapshot = relay.engine.snapshot();
+        let snapshot = std::sync::Arc::new(relay.engine.snapshot());
         let seqno = SequenceNo(relay.seqno_counter.fetch_add(1, Ordering::Relaxed));
         let msg = ServerMessage::TerminalSnapshot {
             pane_id: pane_id.to_string(),

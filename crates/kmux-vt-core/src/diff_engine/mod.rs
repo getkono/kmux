@@ -3,7 +3,7 @@ mod mirror;
 
 pub use mirror::ScrollbackMirror;
 
-use kmux_protocol::messages::{CellState, CursorState, GridSnapshot, TermModes};
+use kmux_protocol::messages::{CellState, CursorState, GridSnapshot, ScrollbackLine, TermModes};
 
 use crate::backend::{BackendSize, TerminalBackend};
 
@@ -32,8 +32,10 @@ pub enum DiffResult {
     CellDiff {
         diff: kmux_protocol::messages::TerminalDiff,
         /// Lines newly appended to the mirror during this frame, oldest
-        /// first. Empty if only viewport cells changed.
-        scrollback_lines: Vec<Vec<kmux_protocol::messages::CellState>>,
+        /// first. Empty if only viewport cells changed. Each line is an
+        /// `Arc` shared with the mirror, so handing it to the relay is a
+        /// pointer bump rather than a copy (issue #182).
+        scrollback_lines: Vec<ScrollbackLine>,
     },
     /// No cells changed, but cursor position or terminal modes changed.
     CursorOnly {
@@ -142,7 +144,7 @@ impl<B: TerminalBackend> DiffEngine<B> {
     /// Fetch up to `count` scrollback lines from the mirror starting at the
     /// given absolute index. Returns `(first_index, lines)` where
     /// `first_index >= start` (clamped to `base_index` if `start` is older).
-    pub fn mirror_range(&self, start: u64, count: u32) -> (u64, Vec<Vec<CellState>>) {
+    pub fn mirror_range(&self, start: u64, count: u32) -> (u64, Vec<ScrollbackLine>) {
         self.mirror.range(start, count)
     }
 
@@ -155,7 +157,7 @@ impl<B: TerminalBackend> DiffEngine<B> {
     ///
     /// `start` is the oldest-first index; `count` is the number of lines to
     /// return. Each returned line has `self.cols` cells.
-    pub fn read_history_lines(&self, start: usize, count: usize) -> Vec<Vec<CellState>> {
+    pub fn read_history_lines(&self, start: usize, count: usize) -> Vec<ScrollbackLine> {
         self.backend
             .read_history_lines(start, count, self.cols as usize)
     }

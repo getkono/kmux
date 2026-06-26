@@ -212,7 +212,7 @@ impl ProxiedPane {
             ServerMessage::TerminalSnapshot {
                 snapshot, seqno, ..
             } => {
-                self.mirror.apply_snapshot(snapshot.clone());
+                self.mirror.apply_snapshot((**snapshot).clone());
                 self.last_seqno = *seqno;
             }
             ServerMessage::TerminalUpdate { diff, seqno, .. } => {
@@ -1022,7 +1022,7 @@ impl PeerManager {
             let pane = guard.panes.get_mut(local_pane_id).unwrap();
             let minted = ServerMessage::TerminalSnapshot {
                 pane_id: local_pane_id.to_string(),
-                snapshot: pane.mirror.to_snapshot(),
+                snapshot: std::sync::Arc::new(pane.mirror.to_snapshot()),
                 seqno: pane.last_seqno,
                 sent_at_ms: epoch_millis(),
             };
@@ -1397,7 +1397,7 @@ mod tests {
     fn snapshot_msg(pane_id: &str) -> ServerMessage {
         ServerMessage::TerminalSnapshot {
             pane_id: pane_id.to_string(),
-            snapshot: GridSnapshot {
+            snapshot: std::sync::Arc::new(GridSnapshot {
                 rows: 1,
                 cols: 1,
                 cells: vec![],
@@ -1406,7 +1406,7 @@ mod tests {
                 history_total: 0,
                 scrollback_base: 0,
                 scrollback_tail: vec![],
-            },
+            }),
             seqno: SequenceNo(1),
             sent_at_ms: 0,
         }
@@ -1546,7 +1546,7 @@ mod tests {
         cells[2].c = 'Z';
         let msg = ServerMessage::TerminalSnapshot {
             pane_id: "hawk/0".to_string(),
-            snapshot: GridSnapshot {
+            snapshot: std::sync::Arc::new(GridSnapshot {
                 rows: 1,
                 cols: 3,
                 cells,
@@ -1555,7 +1555,7 @@ mod tests {
                 history_total: 0,
                 scrollback_base: 0,
                 scrollback_tail: vec![],
-            },
+            }),
             seqno: SequenceNo(7),
             sent_at_ms: 0,
         };

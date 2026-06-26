@@ -129,6 +129,15 @@ impl MetricsStore {
             .record_tear(session, prev_sent_at_ms, next_sent_at_ms);
     }
 
+    pub fn record_digest_mismatch(&mut self, session: &str, seqno: u64) {
+        self.render.record_digest_mismatch(session, seqno);
+    }
+
+    /// Count of grid-digest mismatches recorded so far (for diagnostics/tests).
+    pub fn digest_mismatch_count(&self) -> u64 {
+        self.render.diag_counters().digest_mismatches
+    }
+
     pub fn snapshot(&self, snapshot_mode: bool) -> MetricsSnapshot {
         self.render.snapshot(snapshot_mode)
     }

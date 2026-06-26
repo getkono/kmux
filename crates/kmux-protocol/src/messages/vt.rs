@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use serde::{Deserialize, Serialize};
 
 /// Portable cell color -- resolved to RGB on the server.
@@ -72,6 +74,18 @@ impl Default for CellState {
         }
     }
 }
+
+/// One scrollback line, shared by reference.
+///
+/// A whole row of cells captured at the width it had when it scrolled off.
+/// Lines are reference-counted so the daemon's `ScrollbackMirror` and the
+/// outgoing `ScrollbackAppend` / `GridSnapshot::scrollback_tail` can share the
+/// same allocation instead of deep-copying it on every scrolling frame, and so
+/// fanning one append out to N clients is N `Arc` bumps rather than N grid
+/// copies. Postcard serialises `Arc<[T]>` exactly as `[T]` (serde's `rc`
+/// feature is enabled workspace-wide), so this is byte-identical on the wire to
+/// the old `Vec<CellState>` — no protocol/state/worker version bump.
+pub type ScrollbackLine = Arc<[CellState]>;
 
 /// Cursor shape in the terminal.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -222,5 +236,257 @@ pub struct GridSnapshot {
     /// line's absolute index is `history_total - scrollback_tail.len()`.
     /// Empty when the pane has no scrollback yet.
     #[serde(default)]
-    pub scrollback_tail: Vec<Vec<CellState>>,
+    pub scrollback_tail: Vec<ScrollbackLine>,
+}
+
+/// A small, dependency-free, deterministic 128-bit FNV-1a hasher used to digest
+/// grid state for the desync oracle.
+///
+/// This is a *self-consistency* check between the server's authoritative grid
+/// and a client's reconstructed grid — not an adversarial hash — so a fast
+/// non-cryptographic function with a fixed basis is sufficient, and 128 bits
+/// keeps accidental collisions negligible (~2^-128). It is hand-rolled (rather
+/// than reusing `std::hash`) precisely because the result must be byte-stable
+/// across processes and Rust versions; `DefaultHasher` guarantees neither.
+struct Fnv1a128(u128);
+
+impl Fnv1a128 {
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+
+    fn new() -> Self {
+        Self(Self::OFFSET)
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &b in bytes {
+            self.0 ^= b as u128;
+            self.0 = self.0.wrapping_mul(Self::PRIME);
+        }
+    }
+
+    /// Feed one cell in a fixed field order. Shared by visible cells and
+    /// scrollback cells so both hash identically.
+    fn write_cell(&mut self, cell: &CellState) {
+        self.write(&(cell.c as u32).to_le_bytes());
+        self.write(&[cell.fg.r, cell.fg.g, cell.fg.b]);
+        self.write(&[cell.bg.r, cell.bg.g, cell.bg.b]);
+        self.write(&cell.attrs.0.to_le_bytes());
+    }
+
+    fn write_cursor(&mut self, cursor: &CursorState) {
+        self.write(&cursor.row.to_le_bytes());
+        self.write(&cursor.col.to_le_bytes());
+        // Map the shape to an explicit, stable discriminant — never rely on the
+        // enum's in-memory repr, which is not part of the wire contract.
+        let shape: u8 = match cursor.shape {
+            CursorShape::Block => 0,
+            CursorShape::Underline => 1,
+            CursorShape::Bar => 2,
+            CursorShape::HollowBlock => 3,
+            CursorShape::Hidden => 4,
+        };
+        self.write(&[shape, cursor.visible as u8, cursor.blink as u8]);
+    }
+
+    fn finish(self) -> u128 {
+        self.0
+    }
+}
+
+impl GridSnapshot {
+    /// Canonical 128-bit digest of the full grid state: dimensions, every cell
+    /// (row-major), cursor, modes, and the scrollback envelope
+    /// (`history_total`, `scrollback_base`, and the tail lines oldest-first).
+    ///
+    /// Two grids that render identically hash identically; any divergence in a
+    /// covered field changes the digest. The server computes this over its
+    /// VT-authoritative grid and the client over its reconstructed grid; an
+    /// inequality means the diff stream desynced (see `ServerMessage::GridDigest`).
+    ///
+    /// Variable-length fields are length-prefixed so two grids sharing a prefix
+    /// (e.g. one cell longer, or a char moved between the grid and scrollback)
+    /// can never collide.
+    pub fn digest(&self) -> u128 {
+        let mut h = Fnv1a128::new();
+        h.write(&self.rows.to_le_bytes());
+        h.write(&self.cols.to_le_bytes());
+        h.write(&(self.cells.len() as u64).to_le_bytes());
+        for cell in &self.cells {
+            h.write_cell(cell);
+        }
+        h.write_cursor(&self.cursor);
+        h.write(&self.modes.0.to_le_bytes());
+        h.write(&self.history_total.to_le_bytes());
+        h.write(&self.scrollback_base.to_le_bytes());
+        h.write(&(self.scrollback_tail.len() as u64).to_le_bytes());
+        for line in &self.scrollback_tail {
+            h.write(&(line.len() as u64).to_le_bytes());
+            for cell in line.iter() {
+                h.write_cell(cell);
+            }
+        }
+        h.finish()
+    }
+
+    /// Digest of the live state the wire-level oracle compares: the visible grid,
+    /// cursor, modes, and the scrollback *envelope* (`history_total` +
+    /// `scrollback_base`) — but NOT the scrollback tail contents.
+    ///
+    /// The tail is excluded on purpose. The server caps its snapshot tail at a
+    /// fixed window while a client accumulates full scrollback and may be
+    /// transiently behind during lazy `FetchHistory`, so hashing tail *contents*
+    /// would produce false mismatches. Tail content correctness is instead
+    /// covered exhaustively by the deterministic diff-pipeline conformance suite,
+    /// which controls both sides. This digest still catches viewport desync and
+    /// scrollback *count* corruption (reset/eviction), which is what the live
+    /// self-heal needs. See [`digest`](Self::digest) for the full version.
+    pub fn live_digest(&self) -> u128 {
+        let mut h = Fnv1a128::new();
+        h.write(&self.rows.to_le_bytes());
+        h.write(&self.cols.to_le_bytes());
+        h.write(&(self.cells.len() as u64).to_le_bytes());
+        for cell in &self.cells {
+            h.write_cell(cell);
+        }
+        h.write_cursor(&self.cursor);
+        h.write(&self.modes.0.to_le_bytes());
+        h.write(&self.history_total.to_le_bytes());
+        h.write(&self.scrollback_base.to_le_bytes());
+        h.finish()
+    }
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+
+    fn sample() -> GridSnapshot {
+        GridSnapshot {
+            rows: 2,
+            cols: 3,
+            cells: vec![CellState::default(); 6],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            history_total: 0,
+            scrollback_base: 0,
+            scrollback_tail: Vec::new(),
+        }
+    }
+
+    fn glyph(c: char) -> CellState {
+        CellState {
+            c,
+            ..CellState::default()
+        }
+    }
+
+    fn sb_line(cells: Vec<CellState>) -> ScrollbackLine {
+        cells.into()
+    }
+
+    #[test]
+    fn digest_is_stable_and_clone_equal() {
+        let s = sample();
+        assert_eq!(s.digest(), s.digest(), "same value must hash the same");
+        assert_eq!(s.clone().digest(), s.digest(), "a clone must hash equal");
+    }
+
+    #[test]
+    fn one_cell_mutation_changes_digest() {
+        let base = sample().digest();
+        let mut s = sample();
+        s.cells[4] = glyph('X');
+        assert_ne!(base, s.digest(), "a changed cell must change the digest");
+    }
+
+    #[test]
+    fn each_field_is_covered() {
+        let base = sample().digest();
+
+        let mut dims = sample();
+        dims.rows = 3;
+        assert_ne!(base, dims.digest(), "rows");
+
+        let mut cols = sample();
+        cols.cols = 4;
+        assert_ne!(base, cols.digest(), "cols");
+
+        let mut cur = sample();
+        cur.cursor.col = 1;
+        assert_ne!(base, cur.digest(), "cursor position");
+
+        let mut shape = sample();
+        shape.cursor.shape = CursorShape::Bar;
+        assert_ne!(base, shape.digest(), "cursor shape");
+
+        let mut modes = sample();
+        modes.modes = TermModes(TermModes::APP_CURSOR);
+        assert_ne!(base, modes.digest(), "modes");
+
+        let mut hist = sample();
+        hist.history_total = 7;
+        assert_ne!(base, hist.digest(), "history_total");
+
+        let mut sbbase = sample();
+        sbbase.scrollback_base = 3;
+        assert_ne!(base, sbbase.digest(), "scrollback_base");
+
+        let mut tail = sample();
+        tail.scrollback_tail = vec![sb_line(vec![glyph('a'), glyph('b')])];
+        assert_ne!(base, tail.digest(), "scrollback tail content");
+    }
+
+    #[test]
+    fn live_digest_ignores_tail_content_but_covers_envelope() {
+        let base = sample().live_digest();
+
+        // Tail *content* differs → full digest changes, live digest does not.
+        let mut tail = sample();
+        tail.scrollback_tail = vec![sb_line(vec![glyph('a')])];
+        // history_total/base unchanged, only the held tail content differs.
+        assert_eq!(base, tail.live_digest(), "tail content excluded from live");
+        assert_ne!(
+            sample().digest(),
+            tail.digest(),
+            "tail content in full digest"
+        );
+
+        // The envelope counts ARE covered (catches reset/eviction count drift).
+        let mut hist = sample();
+        hist.history_total = 9;
+        assert_ne!(base, hist.live_digest(), "history_total");
+
+        let mut sbbase = sample();
+        sbbase.scrollback_base = 4;
+        assert_ne!(base, sbbase.live_digest(), "scrollback_base");
+
+        // Viewport changes are covered.
+        let mut cellmut = sample();
+        cellmut.cells[0] = glyph('Q');
+        assert_ne!(base, cellmut.live_digest(), "viewport cell");
+
+        let mut cur = sample();
+        cur.cursor.row = 1;
+        assert_ne!(base, cur.live_digest(), "cursor");
+    }
+
+    #[test]
+    fn length_prefixes_prevent_boundary_collisions() {
+        // A char in the last grid cell vs. the same char as a one-cell
+        // scrollback line must not collide: the length prefixes disambiguate
+        // where the bytes belong.
+        let mut in_grid = sample();
+        in_grid.cells[5] = glyph('Z');
+
+        let mut in_scrollback = sample();
+        in_scrollback.scrollback_tail = vec![sb_line(vec![glyph('Z')])];
+
+        assert_ne!(in_grid.digest(), in_scrollback.digest());
+
+        // An empty scrollback line is still observable (its length prefix is fed).
+        let mut empty_line = sample();
+        empty_line.scrollback_tail = vec![sb_line(Vec::new())];
+        assert_ne!(sample().digest(), empty_line.digest());
+    }
 }

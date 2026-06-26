@@ -7,7 +7,7 @@
 
 use std::sync::{Arc, Mutex};
 
-use kmux_protocol::messages::{CellState, GridSnapshot, KeyEvent, TermSize};
+use kmux_protocol::messages::{GridSnapshot, KeyEvent, ScrollbackLine, TermSize};
 use kmux_pty::error::Result;
 use kmux_pty::session::PtyWriter;
 use tokio::task::JoinHandle;
@@ -45,7 +45,7 @@ impl InProcessEngine {
             .resize(BackendSize::from(size));
     }
 
-    pub(super) fn checkpoint_grid(&self, max_lines: usize) -> (GridSnapshot, Vec<Vec<CellState>>) {
+    pub(super) fn checkpoint_grid(&self, max_lines: usize) -> (GridSnapshot, Vec<ScrollbackLine>) {
         let ts = self.term_state.lock().unwrap();
         let grid = ts.snapshot();
         let size = ts.history_size();
@@ -63,7 +63,7 @@ impl InProcessEngine {
         &self,
         start: u64,
         count: u32,
-    ) -> (u64, Vec<Vec<CellState>>, u64) {
+    ) -> (u64, Vec<ScrollbackLine>, u64) {
         let ts = self.term_state.lock().unwrap();
         let (first_index, lines) = ts.mirror_range(start, count);
         (first_index, lines, ts.history_total())
