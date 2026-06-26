@@ -708,6 +708,146 @@ mod tests {
         );
     }
 
+    /// Issue #182, §5: force a per-client data-channel overflow → `Lagged`, then
+    /// drive the client's resync and assert the grid-digest oracle stays clean
+    /// across the recovery. A capacity-4 data channel that is never drained fills
+    /// after a few frames; `broadcast_to_clients` then surfaces a `Lagged` (the
+    /// issue #68 slow-client path) and drops the client. The client recovers
+    /// exactly as the session manager does — clear, re-attach from a fresh
+    /// snapshot — and the reconstructed grid must still match the authoritative
+    /// one, with every post-resync `GridDigest` agreeing.
+    #[test]
+    fn oracle_survives_data_channel_overflow_lagged() {
+        use kmux_client::grid::CellGrid;
+
+        let make_sender = |data_tx: mpsc::Sender<ServerMessage>| ClientSender {
+            data_tx,
+            ctrl_tx: mpsc::unbounded_channel().0, // replaced below per client
+            force_full_snapshot: false,
+            paused: false,
+            pause_auto: false,
+            no_auto_pause: false,
+            capabilities: Default::default(),
+            size: Default::default(),
+        };
+        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+
+        // A tiny, never-drained data channel overflows after a few frames.
+        let (data_tx, _data_rx_full) = mpsc::channel::<ServerMessage>(4);
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        clients.lock().unwrap().insert(
+            ClientId(1),
+            ClientSender {
+                ctrl_tx: ctrl_tx.clone(),
+                ..make_sender(data_tx)
+            },
+        );
+
+        let ts = test_term_state();
+        let scrollback = Arc::new(Mutex::new(DiffBuffer::new(256 * 1024)));
+        let seqno_counter = Arc::new(AtomicU64::new(0));
+        let mut prev_cursor = CursorState::default();
+        let mut prev_modes = TermModes::EMPTY;
+        let snapshot_fn = || ts.lock().unwrap().snapshot();
+
+        let mut grid = CellGrid::new(24, 80);
+        grid.apply_snapshot(snapshot_fn());
+
+        // Flood without draining: the channel fills and overflows to Lagged.
+        for i in 0..20 {
+            ts.lock().unwrap().feed(format!("line {i}\r\n").as_bytes());
+            let result = ts.lock().unwrap().compute_diff();
+            dispatch_diff_result(
+                "eagle/0",
+                result,
+                0,
+                &scrollback,
+                &clients,
+                &seqno_counter,
+                &mut prev_cursor,
+                &mut prev_modes,
+                &snapshot_fn,
+            );
+        }
+
+        let lagged = std::iter::from_fn(|| ctrl_rx.try_recv().ok())
+            .any(|m| matches!(m, ServerMessage::Lagged { .. }));
+        assert!(
+            lagged,
+            "an overflowed data channel must surface a Lagged frame"
+        );
+        assert!(
+            clients.lock().unwrap().is_empty(),
+            "the lagged client is dropped from the fan-out"
+        );
+
+        // Resync: re-attach from a fresh snapshot with a drained channel, exactly
+        // as the client's session manager does on Lagged.
+        grid.clear();
+        grid.apply_snapshot(snapshot_fn());
+        let (data_tx2, mut data_rx2) = mpsc::channel::<ServerMessage>(8192);
+        clients.lock().unwrap().insert(
+            ClientId(1),
+            ClientSender {
+                ctrl_tx,
+                ..make_sender(data_tx2)
+            },
+        );
+
+        // Drive more output (with a digest forced after each frame), then replay.
+        for i in 20..40 {
+            ts.lock().unwrap().feed(format!("more {i}\r\n").as_bytes());
+            let result = ts.lock().unwrap().compute_diff();
+            dispatch_diff_result(
+                "eagle/0",
+                result,
+                0,
+                &scrollback,
+                &clients,
+                &seqno_counter,
+                &mut prev_cursor,
+                &mut prev_modes,
+                &snapshot_fn,
+            );
+            let top = seqno_counter.load(Ordering::Relaxed);
+            if top > 0 {
+                broadcast_grid_digest("eagle/0", &clients, &snapshot_fn, SequenceNo(top - 1));
+            }
+        }
+
+        let mut digests_checked = 0;
+        while let Ok(msg) = data_rx2.try_recv() {
+            match msg {
+                ServerMessage::TerminalUpdate { diff, .. } => grid.apply_diff((*diff).clone()),
+                ServerMessage::ScrollbackAppend {
+                    first_index, lines, ..
+                } => grid.apply_scrollback_append(first_index, lines),
+                ServerMessage::CursorUpdate { cursor, modes, .. } => {
+                    grid.apply_cursor_update(cursor, modes)
+                }
+                ServerMessage::GridDigest { hash, .. } => {
+                    assert_eq!(
+                        grid.live_digest(),
+                        hash,
+                        "post-resync grid diverged from the certified digest"
+                    );
+                    digests_checked += 1;
+                }
+                other => panic!("unexpected broadcast message: {other:?}"),
+            }
+        }
+
+        assert!(
+            digests_checked > 0,
+            "the post-resync run must emit and check digests"
+        );
+        assert_eq!(
+            grid.to_snapshot().digest(),
+            snapshot_fn().digest(),
+            "grid recovered from Lagged must equal the authoritative snapshot"
+        );
+    }
+
     #[test]
     fn grid_digest_delivered_with_authoritative_hash() {
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);

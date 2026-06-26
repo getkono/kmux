@@ -11,6 +11,18 @@
 //! frames travel on a separate path and are never impaired, so the client's
 //! liveness timeout is unaffected.
 //!
+//! The delay covers **every transport's** per-pane sender: the QUIC
+//! `pane_uni_writer` (`connection.rs`) and the TCP/UDS `TcpAttacher`
+//! (`tcp_listener.rs`), each applied before the frame reaches the shared writer
+//! so batching never coalesces a delayed frame back together (issue #182, §5).
+//!
+//! The other adverse condition the grid-digest oracle must survive — a slow
+//! client whose per-client data channel overflows to `ServerMessage::Lagged`
+//! (issue #68) — is exercised deterministically by
+//! `relay::tests::oracle_survives_data_channel_overflow_lagged`, which forces
+//! the overflow with a tiny channel and asserts the digest stays clean across
+//! the resync.
+//!
 //! The shim is **zero-cost when unset**: [`config`] returns `None` and the
 //! writer hot paths skip the delay entirely. `KMUX_NET_SEED` makes the jitter
 //! reproducible across runs.
