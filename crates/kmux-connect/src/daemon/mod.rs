@@ -1,6 +1,7 @@
 mod lifecycle;
 pub use lifecycle::ensure_daemon;
 pub(crate) use lifecycle::find_server_binary;
+pub use lifecycle::{force_kill_daemon, pid_alive, running_daemon_pid, wait_for_exit};
 
 /// Resolve the `kmuxd` binary an auto-spawn would launch, using the same
 /// precedence as the spawn path (`KMUX_KMUXD` → exe sibling → debug
@@ -164,7 +165,12 @@ pub async fn ensure_compatible_daemon() -> anyhow::Result<DaemonStatus> {
     Ok(status)
 }
 
-/// Send a stop command to the running daemon via its Unix control socket.
+/// Request a graceful shutdown by sending `stop` to the daemon control socket.
+///
+/// This only *asks* the daemon to shut down — the `"ok"` reply is sent before
+/// the process actually exits, so it is **not** proof of termination. Callers
+/// that need to confirm the daemon is gone must follow up with
+/// [`wait_for_exit`] (and escalate via [`force_kill_daemon`] on timeout).
 pub async fn stop_daemon() -> anyhow::Result<()> {
     use kmux_protocol::control_rpc::StopResponse;
     let resp: StopResponse = control_request("stop").await?;
