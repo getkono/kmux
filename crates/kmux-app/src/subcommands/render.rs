@@ -59,6 +59,10 @@ pub struct ClientRow {
     pub id: u64,
     #[tabled(rename = "MACHINE")]
     pub machine: String,
+    #[tabled(rename = "FRONTEND")]
+    pub frontend: String,
+    #[tabled(rename = "BUILD")]
+    pub build: String,
     #[tabled(rename = "TRANSPORT")]
     pub transport: String,
     #[tabled(rename = "PANES")]
@@ -83,11 +87,21 @@ pub fn client_rows(entries: &[(String, Vec<ClientInfo>)]) -> Vec<ClientRow> {
                 .map(|p| p.to_string())
                 .collect::<Vec<_>>()
                 .join(",");
+            // Build identity (protocol 37): `<sha>[-dirty] (profile)`. Empty for
+            // a client too old to report it (older builds can't connect, so this
+            // is mostly a defensive fallback).
+            let build = match (c.build.as_str(), c.build_profile.as_str()) {
+                ("", _) => "<unknown>".to_string(),
+                (sha, "") => sha.to_string(),
+                (sha, profile) => format!("{sha} ({profile})"),
+            };
             rows.push(ClientRow {
                 session: word_id.clone(),
                 client,
                 id: c.client_id.0,
                 machine: identity::short(&c.machine_id).to_string(),
+                frontend: c.frontend.to_string(),
+                build,
                 transport: c.transport.clone(),
                 panes,
             });
