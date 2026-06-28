@@ -13,6 +13,7 @@ mod engine;
 mod federation;
 mod handoff;
 mod impair;
+mod log_writer;
 mod persist;
 mod process_stats;
 mod relay;
@@ -174,9 +175,14 @@ fn main() -> anyhow::Result<()> {
             .open(p)?)
     }) {
         Ok(file) => {
+            // `ResilientWriter` (not the stock `Mutex<File>`) so a write that
+            // fails on a full disk degrades to "no logs" instead of poisoning
+            // the lock and cascading into worker panics that kill the daemon —
+            // the root cause of `kmux daemon restart` failing under disk
+            // pressure. See `log_writer`.
             tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::from_default_env().add_directive("kmuxd=info".parse()?))
-                .with_writer(std::sync::Mutex::new(file))
+                .with_writer(log_writer::ResilientWriter::new(file))
                 .init();
         }
         Err(_) => {
