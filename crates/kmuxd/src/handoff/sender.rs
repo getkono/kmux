@@ -138,11 +138,15 @@ fn spawn_successor() -> anyhow::Result<()> {
     )?;
     let mut args: Vec<&str> = DAEMON_BOOT_ARGS.to_vec();
     args.push("--handoff");
+    // Capture the successor's pre-daemonize stdout+stderr in the boot log so a
+    // boot failure (full disk, panic during restore) is visible to `kmux daemon
+    // restart` instead of silently timing out the handoff.
+    let (out, err) = crate::boot_log_stdio();
     std::process::Command::new(&exe)
         .args(&args)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(out)
+        .stderr(err)
         .spawn()
         .with_context(|| format!("spawning {}", exe.display()))?;
     Ok(())

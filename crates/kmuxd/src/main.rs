@@ -465,15 +465,46 @@ fn cleanup_and_start_daemon() -> anyhow::Result<()> {
     // Resolve the path of the current executable (i.e., this very binary).
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("kmuxd"));
 
+    // Capture the spawned daemon's pre-daemonize stdout+stderr in the boot log
+    // (rather than discarding it) so a boot crash is diagnosable.
+    let (out, err) = boot_log_stdio();
     std::process::Command::new(&exe)
         .args(kmux_protocol::control_rpc::DAEMON_BOOT_ARGS)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(out)
+        .stderr(err)
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", exe.display()))?;
 
     Ok(())
+}
+
+/// Open the shared boot log (truncating) for a freshly-spawned daemon's
+/// stdout+stderr, falling back to `/dev/null` if it can't be created.
+///
+/// Used by every daemon-spawn path in this binary (`probe-or-start`, the
+/// graceful-restart successor) so a child that dies before it daemonizes (full
+/// disk, panic during restore, bind failure) leaves a trail at
+/// [`kmux_protocol::dirs::boot_log_path`] instead of vanishing. The boot log can
+/// contain the auth token, so it is created `0o600`.
+pub(crate) fn boot_log_stdio() -> (std::process::Stdio, std::process::Stdio) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let opened = kmux_protocol::dirs::boot_log_path().ok().and_then(|path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .ok()
+    });
+    match opened.and_then(|f| f.try_clone().ok().map(|c| (f, c))) {
+        Some((out, err)) => (
+            std::process::Stdio::from(out),
+            std::process::Stdio::from(err),
+        ),
+        None => (std::process::Stdio::null(), std::process::Stdio::null()),
+    }
 }
 
 fn generate_instance_id() -> String {

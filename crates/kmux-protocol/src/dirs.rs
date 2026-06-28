@@ -207,6 +207,18 @@ pub fn daemon_log_path() -> anyhow::Result<PathBuf> {
     Ok(state_dir()?.join("daemon.log"))
 }
 
+/// Path to the file that captures a freshly-spawned kmuxd's stdout+stderr
+/// before it daemonizes and switches to [`daemon_log_path`].
+///
+/// Lives in the runtime dir next to the socket/pid file. Every path that spawns
+/// a daemon — the client auto-spawn, `kmuxd probe-or-start`, and the
+/// graceful-restart successor — redirects the child here, so a boot crash
+/// (linker error, bind failure, full disk) leaves a trail instead of vanishing
+/// into `/dev/null`. `kmux daemon restart` reads its tail to explain a timeout.
+pub fn boot_log_path() -> anyhow::Result<PathBuf> {
+    Ok(runtime_dir()?.join("kmuxd-boot.log"))
+}
+
 /// Path to the per-connection log file for the given instance ID.
 ///
 /// Each client startup writes its connection metadata here upon successful authentication.
