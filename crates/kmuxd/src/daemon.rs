@@ -228,6 +228,7 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
                 session_count,
                 protocol_version: kmux_protocol::messages::PROTOCOL_VERSION,
                 kmuxd_version: env!("CARGO_PKG_VERSION").to_string(),
+                kmuxd_build: kmux_protocol::buildinfo::fingerprint(),
                 build_profile: Some(kmux_protocol::dirs::BuildProfile::CURRENT),
                 endpoints,
             };
@@ -294,6 +295,20 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
                 Ok(s) => s,
                 Err(e) => {
                     warn!("Failed to serialize sessions response: {e}");
+                    return;
+                }
+            };
+            json.push('\n');
+            if let Err(e) = write_half.write_all(json.as_bytes()).await {
+                warn!("Control socket write error: {e}");
+            }
+        }
+        "connections" => {
+            let resp = ctx.app.snapshot_connections().await;
+            let mut json = match serde_json::to_string(&resp) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to serialize connections response: {e}");
                     return;
                 }
             };

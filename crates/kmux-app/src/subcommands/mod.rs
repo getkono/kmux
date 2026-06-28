@@ -1,3 +1,4 @@
+mod client_cmd;
 mod clients;
 mod daemon_cmd;
 mod debug;
@@ -6,6 +7,7 @@ mod list;
 mod notify;
 mod ps;
 pub mod render;
+pub use client_cmd::run_client_command;
 pub use clients::{KickClientConfig, ListClientsConfig, run_kick_client, run_list_clients};
 pub use daemon_cmd::run_daemon_command;
 pub use debug::run_debug_command;

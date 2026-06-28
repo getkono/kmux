@@ -22,6 +22,34 @@ pub enum KickOutcome {
 }
 
 impl ServerApp {
+    /// Snapshot every live client connection with its build identity, for the
+    /// `connections` control RPC (backs `kmux client status`). Unlike
+    /// [`list_session_clients`](Self::list_session_clients) this is not scoped to
+    /// a session — it lists the whole connection registry.
+    pub async fn snapshot_connections(&self) -> kmux_protocol::control_rpc::ConnectionsResponse {
+        use kmux_protocol::control_rpc::{ConnectionSummary, ConnectionsResponse};
+        let conns = self.connections.read().await;
+        let mut connections: Vec<ConnectionSummary> = conns
+            .iter()
+            .map(|(id, c)| ConnectionSummary {
+                connection_id: *id,
+                label: c.label.clone(),
+                machine_id: c.machine_id.clone(),
+                frontend: c.client_kind.to_string(),
+                build: if c.client_git_dirty {
+                    format!("{}-dirty", c.client_git_sha)
+                } else {
+                    c.client_git_sha.clone()
+                },
+                build_profile: c.client_build_profile.clone(),
+                transport: c.transport.to_string(),
+                uptime_secs: c.metrics.created_at.elapsed().as_secs(),
+            })
+            .collect();
+        connections.sort_unstable_by_key(|c| c.connection_id);
+        ConnectionsResponse { connections }
+    }
+
     /// List the client connections attached to any pane of the locally-hosted
     /// session `word_id`, joined with each connection's identity (machine id,
     /// label, hostname). `requester` is marked `is_self`. Returns `None` when the

@@ -60,6 +60,9 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
                     println!("Sessions: {}", status.session_count);
                     println!("Protocol: {}", status.protocol_version);
                     println!("Version:  {}", status.kmuxd_version);
+                    if !status.kmuxd_build.is_empty() {
+                        println!("Build:    {}", status.kmuxd_build);
+                    }
                     println!(
                         "Profile:  daemon={daemon_profile} client={client}",
                         client = BuildProfile::CURRENT,
