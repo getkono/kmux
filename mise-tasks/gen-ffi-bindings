@@ -33,14 +33,18 @@ esac
 # with a different feature set (which would change the introspected library).
 featflag=()
 [[ -n "${KMUX_FFI_FEATURES:-}" ]] && featflag=(--features "$KMUX_FFI_FEATURES")
-cargo build $relflag "${featflag[@]}" -p kmux-ffi
+# `"${featflag[@]+"${featflag[@]}"}"` (not a bare `"${featflag[@]}"`): macOS ships
+# bash 3.2, where expanding an empty array under `set -u` aborts with "unbound
+# variable". The `+`-guard expands to nothing when empty and to the elements
+# otherwise — safe on bash 3.2 and 5.x alike (this task is macOS-only).
+cargo build $relflag "${featflag[@]+"${featflag[@]}"}" -p kmux-ffi
 out=$(mktemp -d)
 trap 'rm -rf "$out"' EXIT
 # `--no-format` skips uniffi's optional swiftformat pass: the bindings are
 # machine-generated (and gitignored), so formatting them is pointless, and
 # without it uniffi prints a benign "Unable to auto-format" warning whenever
 # swiftformat isn't installed (see issue #104).
-cargo run "${featflag[@]}" -p kmux-ffi --bin uniffi-bindgen -- \
+cargo run "${featflag[@]+"${featflag[@]}"}" -p kmux-ffi --bin uniffi-bindgen -- \
     generate --no-format --library "target/${profile}/libkmux_ffi.dylib" --language swift --out-dir "$out"
 mkdir -p kmux-swift/Sources/kmux_ffiFFI kmux-swift/Sources/KmuxBindings
 changed=0
