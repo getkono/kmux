@@ -118,42 +118,48 @@ pub async fn query_daemon() -> Option<DaemonStatus> {
 /// Use this instead of `ensure_daemon()` for every connection path that talks
 /// to the local daemon.
 pub async fn ensure_compatible_daemon() -> anyhow::Result<DaemonStatus> {
+    use kmux_protocol::compat::{self, BlockReason};
     use kmux_protocol::messages::PROTOCOL_VERSION;
 
     let status = lifecycle::ensure_daemon().await?;
-
-    if status.protocol_version != 0 && status.protocol_version != PROTOCOL_VERSION {
-        let hint = if status.protocol_version < PROTOCOL_VERSION {
-            "Hint: the running kmuxd is older than kmux. Run `kmux daemon restart` to update it."
-        } else {
-            "Hint: the running kmuxd is newer than kmux. Update the kmux client to match."
-        };
-        anyhow::bail!(
-            "protocol version mismatch: client={}, daemon={} ({})\n{}",
-            PROTOCOL_VERSION,
-            status.protocol_version,
-            status.kmuxd_version,
-            hint
-        );
-    }
 
     let socket = || {
         kmux_protocol::dirs::socket_path()
             .map(|p| p.display().to_string())
             .unwrap_or_else(|_| "<unknown>".to_string())
     };
-    match status.build_profile {
-        Some(p) if p == BuildProfile::CURRENT => {}
-        Some(p) => anyhow::bail!(
+
+    // One attach-gate policy, defined in `kmux_protocol::compat`; each refusal
+    // formats its own hint-rich message.
+    match compat::attach_block(status.protocol_version, status.build_profile) {
+        None => {}
+        Some(BlockReason::Protocol) => {
+            let hint = if status.protocol_version < PROTOCOL_VERSION {
+                "Hint: the running kmuxd is older than kmux. Run `kmux daemon restart` to update it."
+            } else {
+                "Hint: the running kmuxd is newer than kmux. Update the kmux client to match."
+            };
+            anyhow::bail!(
+                "protocol version mismatch: client={}, daemon={} ({})\n{}",
+                PROTOCOL_VERSION,
+                status.protocol_version,
+                status.kmuxd_version,
+                hint
+            );
+        }
+        Some(BlockReason::ProfileMismatch) => anyhow::bail!(
             "build profile mismatch: kmux is {client} but the daemon answering on \
              {socket} is {daemon}. Debug and release builds keep separate runtime \
              dirs, so the two never share sockets — run the matching kmux binary \
              or restart the daemon with a matching build.",
             client = BuildProfile::CURRENT,
-            daemon = p,
+            daemon = status
+                .build_profile
+                .map(|p| p.as_str())
+                .unwrap_or("<unknown>"),
             socket = socket(),
         ),
-        None => anyhow::bail!(
+        Some(BlockReason::ProfileUnknown) => anyhow::bail!(
             "daemon on {socket} did not report a build profile; refusing to attach \
              because we cannot verify it matches kmux ({client}). Restart the \
              daemon with a current kmuxd build.",

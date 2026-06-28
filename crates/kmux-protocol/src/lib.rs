@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod buildinfo;
 pub mod codec;
+pub mod compat;
 pub mod control_rpc;
 pub mod dirs;
 pub mod endpoint;

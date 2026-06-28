@@ -48,6 +48,7 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
         }
 
         DaemonAction::Status => {
+            use kmux_protocol::compat::{self, Match3};
             use kmux_protocol::dirs::BuildProfile;
             use kmux_protocol::messages::PROTOCOL_VERSION;
 
@@ -62,8 +63,9 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
                         .map(|p| p.as_str())
                         .unwrap_or("<unknown>");
                     let protocol_mismatch =
-                        status.protocol_version != 0 && status.protocol_version != PROTOCOL_VERSION;
-                    let profile_mismatch = status.build_profile != Some(BuildProfile::CURRENT);
+                        compat::protocol_match(status.protocol_version) == Match3::Differ;
+                    let profile_mismatch =
+                        compat::profile_match(status.build_profile) != Match3::Same;
 
                     println!("Status:   running");
                     println!("Socket:   {socket_display}");

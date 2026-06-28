@@ -144,44 +144,46 @@ async fn client_status() -> anyhow::Result<()> {
     println!("  Protocol: {PROTOCOL_VERSION}");
 
     // ── Skew warnings ───────────────────────────────────────────────────────
+    // Every comparison is classified through `kmux_protocol::compat`, the same
+    // SSoT the attach gate and `kmux daemon status` use.
+    use kmux_protocol::compat::{self, Match3};
     let mut warnings: Vec<String> = Vec::new();
     let mut notes: Vec<String> = Vec::new();
     if let Some(d) = &daemon {
         // The most consequential skew: a protocol gap means the CLI/GUI cannot
         // even connect to this daemon.
-        if d.protocol_version != 0 && d.protocol_version != PROTOCOL_VERSION {
+        if compat::protocol_match(d.protocol_version) == Match3::Differ {
             warnings.push(format!(
                 "CLI protocol ({PROTOCOL_VERSION}) differs from the daemon ({}) — they cannot \
                  connect. Run `kmux daemon restart` to update the daemon, or reinstall kmux.",
                 d.protocol_version
             ));
         }
-        if d.build_profile != Some(BuildProfile::CURRENT) {
+        if compat::profile_match(d.build_profile) != Match3::Same {
             warnings.push(format!(
                 "CLI profile ({}) differs from the daemon ({}).",
                 BuildProfile::CURRENT,
                 d.build_profile.map(|p| p.as_str()).unwrap_or("<unknown>"),
             ));
         }
-        if d.kmuxd_build.is_empty() {
-            notes.push(
+        match compat::build_match(&d.kmuxd_build, &cli_build) {
+            Match3::Unknown => notes.push(
                 "daemon build is unknown (it predates build reporting); reinstall/restart it to \
                  enable build-skew detection."
                     .to_string(),
-            );
-        } else if d.kmuxd_build != cli_build {
+            ),
             // The skew that hides in plain sight: the GUI launches the current
             // install while `kmux …` may run a stale CLI.
-            warnings.push(format!(
+            Match3::Differ => warnings.push(format!(
                 "CLI build ({cli_build}) differs from the daemon ({}). Reinstall kmux so the \
                  CLI matches.",
                 d.kmuxd_build
-            ));
+            )),
+            Match3::Same => {}
         }
         if let Some(c) = &gui_conn
-            && !c.build.is_empty()
             && !d.kmuxd_build.is_empty()
-            && c.build != d.kmuxd_build
+            && compat::build_match(&c.build, &d.kmuxd_build) == Match3::Differ
         {
             warnings.push(format!(
                 "GUI client build ({}) differs from the daemon ({}). Restart it: \
