@@ -176,6 +176,34 @@ where
     }
 }
 
+/// Ask a yes/no question on the terminal, returning `true` only on an explicit
+/// yes. Mirrors the nested-GUI guard in `kmux/src/main.rs`: the prompt goes to
+/// stderr, EOF (Ctrl-D) and an empty line are the safe default (`false`).
+///
+/// The caller is responsible for the no-TTY policy (this is only invoked once a
+/// TTY is confirmed); `default_no` controls which option is capitalized.
+pub(crate) fn confirm_yes_no(question: &str) -> std::io::Result<bool> {
+    use std::io::Write;
+
+    let mut err = std::io::stderr();
+    loop {
+        let _ = write!(err, "{question} [y/N] ");
+        let _ = err.flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            let _ = writeln!(err);
+            return Ok(false);
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "" | "n" | "no" => return Ok(false),
+            "y" | "yes" => return Ok(true),
+            _ => {
+                let _ = writeln!(err, "Please answer 'y' or 'n'.");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -229,6 +229,65 @@ fn empty_session_row(session: &str, id: &str) -> DaemonSessionRow {
     }
 }
 
+// ─── Stop summary row (kmux daemon stop) ──────────────────────────────────────
+
+#[derive(Tabled)]
+pub struct StopSummaryRow {
+    #[tabled(rename = "SESSION")]
+    pub session: String,
+    #[tabled(rename = "PANES")]
+    pub panes: usize,
+    #[tabled(rename = "CLIENTS")]
+    pub clients: String,
+    #[tabled(rename = "RUNNING")]
+    pub running: String,
+}
+
+/// Build the pre-shutdown summary shown by `kmux daemon stop` so the user sees
+/// exactly what they are about to terminate.
+///
+/// Sessions, pane counts, and attached clients come from the daemon's
+/// control-socket snapshot (`resp`). `processes_by_session` maps a session
+/// word-id to the distinct process names running across its panes; it is a
+/// best-effort data-plane enrichment, so it is empty when that query was skipped
+/// or failed — the RUNNING column then degrades to `-` and the summary still
+/// shows sessions and clients.
+pub fn stop_summary_rows(
+    resp: &SessionsResponse,
+    processes_by_session: &std::collections::HashMap<String, Vec<String>>,
+) -> Vec<StopSummaryRow> {
+    resp.sessions
+        .iter()
+        .map(|sc| {
+            let clients = if sc.connections.is_empty() {
+                "(none)".to_string()
+            } else {
+                let labels: Vec<String> = sc.connections.iter().map(|c| c.label.clone()).collect();
+                truncate_join(&labels, 2)
+            };
+            let running = match processes_by_session.get(&sc.meta.word_id) {
+                Some(names) if !names.is_empty() => truncate_join(names, 4),
+                _ => "-".to_string(),
+            };
+            StopSummaryRow {
+                session: sc.meta.name.clone(),
+                panes: sc.panes_count,
+                clients,
+                running,
+            }
+        })
+        .collect()
+}
+
+/// Join up to `max` items with ", ", appending " +N" when more were elided.
+fn truncate_join(items: &[String], max: usize) -> String {
+    if items.len() <= max {
+        items.join(", ")
+    } else {
+        format!("{}, +{}", items[..max].join(", "), items.len() - max)
+    }
+}
+
 // ─── Generic table / JSON renderer ───────────────────────────────────────────
 
 /// Print a table of `T` rows, or emit a "no items" message if the row slice is
@@ -394,6 +453,54 @@ mod tests {
             name: name.to_string(),
             cwd: "/home/user".to_string(),
         }
+    }
+
+    #[test]
+    fn stop_summary_joins_clients_and_processes() {
+        use std::collections::HashMap;
+
+        let resp = SessionsResponse {
+            sessions: vec![
+                SessionConnections {
+                    meta: make_meta("work", "eagle"),
+                    panes_count: 3,
+                    connections: vec![make_conn(1, "quic"), make_conn(2, "uds")],
+                },
+                SessionConnections {
+                    meta: make_meta("idle", "hippo"),
+                    panes_count: 1,
+                    connections: vec![],
+                },
+            ],
+            unattached: vec![],
+        };
+        let mut procs: HashMap<String, Vec<String>> = HashMap::new();
+        procs.insert(
+            "eagle".to_string(),
+            vec!["nvim".into(), "cargo".into(), "ssh".into()],
+        );
+        // 'hippo' intentionally absent → its RUNNING degrades to "-".
+
+        let rows = stop_summary_rows(&resp, &procs);
+        assert_eq!(rows.len(), 2);
+
+        assert_eq!(rows[0].session, "work");
+        assert_eq!(rows[0].panes, 3);
+        // Two identical labels in this fixture; both shown (cap is 2).
+        assert_eq!(rows[0].clients, "alice@host, alice@host");
+        assert_eq!(rows[0].running, "nvim, cargo, ssh");
+
+        // No clients and no process data → explicit placeholders, never blank.
+        assert_eq!(rows[1].clients, "(none)");
+        assert_eq!(rows[1].running, "-");
+    }
+
+    #[test]
+    fn truncate_join_elides_overflow() {
+        let three = vec!["a".to_string(), "b".to_string(), "c".to_string()];
+        assert_eq!(truncate_join(&three, 2), "a, b, +1");
+        assert_eq!(truncate_join(&three, 3), "a, b, c");
+        assert_eq!(truncate_join(&three, 5), "a, b, c");
     }
 
     #[test]

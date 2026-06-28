@@ -272,8 +272,15 @@ pub enum DebugAction {
 pub enum DaemonAction {
     /// Start the daemon in the background
     Start,
-    /// Gracefully stop the daemon
-    Stop,
+    /// Gracefully stop the daemon (shows a summary and confirms first)
+    Stop {
+        /// Skip the confirmation prompt (still a graceful, verified stop)
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Skip prompts; force-kill (SIGTERM→SIGKILL) if a graceful stop won't exit
+        #[arg(long)]
+        force: bool,
+    },
     /// Show daemon status (PID, uptime, port, session count)
     Status,
     /// Stop then restart the daemon
