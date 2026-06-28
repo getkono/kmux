@@ -629,6 +629,35 @@ mechanics (in-place binary swap, why the outgoing daemon must
 `docs/daemon-handoff.md` §"Upgrading a running daemon" and
 `docs/qa-daemon-upgrade.md`.
 
+### 14.2 Client-side `kmux daemon stop`: verified shutdown & force-kill
+
+The daemon's `stop` control handler replies `{"status":"ok"}` **before** the
+process has finished §14's shutdown sequence, so the reply is a receipt, not
+proof of exit. A daemon wedged mid-shutdown (e.g. a checkpoint write blocked on a
+full disk) used to make `kmux daemon stop` print "Daemon stopped" anyway — a
+false positive. The client (`kmux-app::subcommands::daemon_cmd::run_daemon_stop`,
+on primitives in `kmux-connect::daemon`) now *verifies* the outcome:
+
+1. **Responsive** (`query_daemon()` returns a live status): print a summary —
+   each session's pane count and attached clients (from the `sessions` control
+   RPC) enriched best-effort with the running processes per pane (a short,
+   time-boxed data-plane `ProcessOverview` query that reuses the existing
+   `DaemonStatus` so it can never *spawn* a daemon) — then confirm, send `stop`,
+   and **poll `pid_alive` until the PID dies or an 8 s deadline**. On timeout,
+   escalate to `SIGKILL` (`--force`, or a second prompt).
+2. **Unresponsive** (`query_daemon()` is `None` but `running_daemon_pid()` names
+   a live PID — the control socket is wedged): offer an OS force-kill
+   (`SIGTERM`→`SIGKILL`).
+3. **Not running**: say so and exit cleanly.
+
+`force_kill_daemon(pid, term_first, grace)` treats `ESRCH` as success, re-checks
+`pid_alive` after `SIGKILL`, and sweeps the stale pid/socket files via
+`cleanup_stale_daemon`. The invariant: **a success line is printed only when
+`pid_alive` is false.** `-y/--yes` skips the initial confirmation; `--force`
+skips all prompts and escalates; with neither flag and no TTY the command refuses
+rather than guess. The same `wait_for_exit` verification backs the
+hard-stop-then-respawn fallback in `kmux daemon restart`.
+
 ---
 
 ## 15. Runtime Directory Layout
