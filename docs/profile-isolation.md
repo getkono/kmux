@@ -45,6 +45,13 @@ isolation from it automatically.
 | | `kmux[-debug]/sessions/state.bin` | Daemon session checkpoint |
 | | `kmux[-debug]/recent_servers.json` | Recent servers UI cache |
 
+Client and daemon compute every path above through the **same**
+`kmux_protocol::dirs` helpers (`runtime_dir` / `socket_path` /
+`data_socket_path`), namespaced by the compile-time `KMUX_DIR_NAME`
+(`kmux` vs `kmux-debug`), so the two can never disagree on which socket to use —
+a debug client physically cannot reach a release daemon. The
+`runtime_paths_are_profile_isolated` test in `dirs.rs` pins this.
+
 ### What is shared (intentionally)
 
 Config files represent _user intent_ and should be consistent regardless of

@@ -59,12 +59,25 @@ After this call the process is a daemon with fresh file descriptors.
 Tracing is initialized after daemonization (so the child's fresh fds are used).
 
 ```
-Attempt to open $XDG_RUNTIME_DIR/kmux/kmuxd.log (append mode)
-  Success → log to file
+Attempt to open $XDG_STATE_HOME/kmux[-debug]/daemon.log (append mode)
+  Success → log to file (via ResilientWriter)
   Failure → log to stderr
 Log level: RUST_LOG env var, default "kmuxd=info"
 Each run tagged with a random 4-byte instance_id for log correlation
 ```
+
+The file writer is a `ResilientWriter` (`log_writer.rs`), **not** the stock
+`Mutex<File>`: a write that fails on a full disk is swallowed and the lock can
+never poison. This matters because logging is best-effort — without it, an
+ENOSPC write followed by a panic-while-holding-the-guard poisons the mutex, and
+every subsequent log call then panics, cascading across the tokio workers and
+killing the daemon. That was the observed cause of `kmux daemon restart` failing
+on a near-full disk: the graceful-handoff successor booted, could not write its
+log, and died. Two related diagnosability fixes ship alongside it: every
+daemon-spawn path (auto-spawn, `probe-or-start`, the handoff successor) now
+captures the child's pre-daemonize stdout/stderr in `kmuxd-boot.log`, and
+`kmux daemon restart` prints that log's tail when it times out instead of a bare
+"timed out" with no cause.
 
 ---
 
