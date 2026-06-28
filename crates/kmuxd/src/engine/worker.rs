@@ -52,6 +52,10 @@ pub struct WorkerEngine {
     /// Mirror of the worker's grid, fed from the event stream, so `snapshot()`
     /// and history reads stay synchronous on the daemon side.
     mirror: Arc<Mutex<CellGrid>>,
+    /// OS pid of the `kmux-vt-worker` subprocess (distinct from the shell pid the
+    /// worker adopts). Captured at spawn so status reporting can surface it; the
+    /// `Child` itself is owned by the supervisor task for reaping.
+    child_pid: u32,
     /// Supervisor task: reads worker events, fans out, reaps the child.
     supervisor: JoinHandle<()>,
     /// Writer task: drains `req_tx` onto the socket.
@@ -158,14 +162,22 @@ impl WorkerEngine {
             }
         });
 
+        // Capture the worker pid before the `Child` moves into the supervisor.
+        let child_pid = child.id();
         let supervisor = tokio::spawn(supervise(sock_rd, child, mirror.clone(), fanout));
 
         Ok(WorkerEngine {
             req_tx,
             mirror,
+            child_pid,
             supervisor,
             writer_task,
         })
+    }
+
+    /// OS pid of the worker subprocess, for status reporting.
+    pub(super) fn child_pid(&self) -> u32 {
+        self.child_pid
     }
 
     pub(super) fn snapshot(&self) -> GridSnapshot {

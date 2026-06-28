@@ -21,7 +21,9 @@ by `hk`; `mise install` (or `mise run setup`) installs them and initializes the
 
 ### Binaries
 
-- `kmux` — toolkit-free entrypoint (CLI + launcher): `cargo run -p kmux`
+- `kmux` — toolkit-free entrypoint (CLI + launcher): `cargo run -p kmux`.
+  `kmux open [user@host[:/path]]` is the explicit connect verb; the bare
+  positional `kmux <host/path>` stays as a shorthand fallback.
 - `kmuxd` — daemon: `cargo run -p kmuxd` (self-signed cert by default)
 - `kmux-gtk` (GTK4, Linux + macOS) and `kmux-swift` (native macOS) are the
   clients. See [docs/building-macos.md](docs/building-macos.md) and
@@ -53,6 +55,12 @@ These are strictly-typed config/CLI, not environment variables.
   (issue #146). See [docs/architecture-identity.md](docs/architecture-identity.md).
 - `kmux client status|logs|stop|restart` — manage the local singleton GUI client
   (mirror of `kmux daemon`); `status` warns on client↔daemon build/protocol skew.
+  See [docs/architecture-identity.md](docs/architecture-identity.md).
+- `kmux status [--format json]` — one health view across every kmux process:
+  daemon, GUI client, this CLI, and isolated per-pane VT workers, with skew
+  flagged via the shared `kmux-protocol::compat` SSoT. The scoped `daemon
+  status` / `client status` stay the detailed views. Exits non-zero when the
+  daemon is down or a blocking (protocol/profile) skew is present.
   See [docs/architecture-identity.md](docs/architecture-identity.md).
 - `kmux notify` — from inside a pane, raise a native desktop notification on the
   GUI showing that session; clicking it refocuses the window + pane (issue #169).

@@ -115,6 +115,14 @@ impl PaneEngine {
         matches!(self, Self::Worker(_))
     }
 
+    /// OS pid of the isolated worker subprocess, or `None` for an in-process pane.
+    pub fn worker_pid(&self) -> Option<u32> {
+        match self {
+            Self::InProcess(_) => None,
+            Self::Worker(e) => Some(e.child_pid()),
+        }
+    }
+
     /// Abort the pane's relay task and swap in a no-op handle, returning the real
     /// one so the caller can await its cancellation (used by handoff quiesce).
     pub fn abort_relay_task(&mut self) -> JoinHandle<()> {

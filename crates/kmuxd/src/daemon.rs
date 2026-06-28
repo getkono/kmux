@@ -317,6 +317,20 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
                 warn!("Control socket write error: {e}");
             }
         }
+        "workers" => {
+            let resp = ctx.app.snapshot_workers().await;
+            let mut json = match serde_json::to_string(&resp) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to serialize workers response: {e}");
+                    return;
+                }
+            };
+            json.push('\n');
+            if let Err(e) = write_half.write_all(json.as_bytes()).await {
+                warn!("Control socket write error: {e}");
+            }
+        }
         other => {
             warn!("Unknown control command: {other}");
         }
