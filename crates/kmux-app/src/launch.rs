@@ -160,10 +160,18 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
     };
 
     // Most subcommands are non-interactive and short-circuit before any frontend
-    // setup. `kmux diagnostic <test>` is the exception: it falls through to an
-    // interactive launch, carrying the emitter program to run in the session.
+    // setup. `kmux diagnostic <test>` and `kmux open` are the exceptions: they
+    // fall through to an interactive launch. `open` carries its own connection
+    // args (the explicit form of the bare positional); capture whichever applies
+    // into `connect` so the shared dry-run/interactive code below reads one source.
     let mut initial_program: Option<(String, Vec<String>)> = None;
+    let mut connect = cli.connect;
     match cli.command {
+        Some(Command::Open {
+            connect: open_connect,
+        }) => {
+            connect = open_connect;
+        }
         Some(Command::Daemon { action }) => {
             run_daemon_command(action).await?;
             return Ok(Launch::Done);
@@ -281,11 +289,11 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         None => {}
     }
 
-    if cli.connect.dry_run && cli.connect.test {
+    if connect.dry_run && connect.test {
         eprintln!("warning: --test implies --dry-run; running in --test mode.");
     }
-    if cli.connect.dry_run || cli.connect.test {
-        run_dry_run(&cli.connect.server_args, cli.connect.test).await?;
+    if connect.dry_run || connect.test {
+        run_dry_run(&connect.server_args, connect.test).await?;
         return Ok(Launch::Done);
     }
 
@@ -295,11 +303,10 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_default();
     let (target, parsed_server) = parse_target(
-        cli.connect.server_args.server.as_deref(),
-        cli.connect.server_args.ssh_port,
+        connect.server_args.server.as_deref(),
+        connect.server_args.ssh_port,
     );
-    let auto_cwd = cli
-        .connect
+    let auto_cwd = connect
         .cwd
         .or_else(|| parsed_server.as_ref().and_then(|p| p.path.clone()));
     let theme = config::resolve_theme(cli.theme.as_deref());
@@ -312,7 +319,7 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         target,
         initial_cwd,
         auto_cwd,
-        auto_session: cli.connect.session,
+        auto_session: connect.session,
         theme,
         font,
         appearance,

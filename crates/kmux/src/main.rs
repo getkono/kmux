@@ -222,17 +222,24 @@ fn swift_app_running() -> bool {
 /// (server / ssh-port / session / cwd / diagnostic), re-parsing the shared `Cli`.
 #[cfg(target_os = "macos")]
 fn build_launch_url(cli: &kmux_app::cli::Cli) -> String {
+    // `kmux open <host>` carries the connection args on the `Open` variant, while
+    // the bare `kmux <host>` carries them on the top-level flattened args. Both
+    // must produce the same URL, so source from whichever applies.
+    let connect = match &cli.command {
+        Some(kmux_app::cli::Command::Open { connect }) => connect,
+        _ => &cli.connect,
+    };
     let mut params: Vec<(&str, String)> = Vec::new();
-    if let Some(s) = &cli.connect.server_args.server {
+    if let Some(s) = &connect.server_args.server {
         params.push(("server", s.clone()));
     }
-    if let Some(p) = cli.connect.server_args.ssh_port {
+    if let Some(p) = connect.server_args.ssh_port {
         params.push(("ssh-port", p.to_string()));
     }
-    if let Some(s) = &cli.connect.session {
+    if let Some(s) = &connect.session {
         params.push(("session", s.clone()));
     }
-    if let Some(c) = &cli.connect.cwd {
+    if let Some(c) = &connect.cwd {
         params.push(("cwd", c.clone()));
     }
     if let Some(kmux_app::cli::Command::Diagnostic {
@@ -354,4 +361,25 @@ fn locate_binary(name: &str) -> anyhow::Result<std::path::PathBuf> {
     anyhow::bail!(
         "could not find the `{name}` binary; ensure it is installed alongside `kmux` or on PATH"
     )
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// `kmux open <host>` must build the same launch URL as the bare positional —
+    /// the host lives on the `Open` variant, so `build_launch_url` has to read it
+    /// from there (regression guard for the cross-frontend launch path).
+    #[test]
+    fn open_subcommand_url_includes_server() {
+        let cli = kmux_app::cli::Cli::parse_from(["kmux", "open", "host"]);
+        assert_eq!(build_launch_url(&cli), "kmux://new?server=host");
+    }
+
+    #[test]
+    fn bare_positional_url_includes_server() {
+        let cli = kmux_app::cli::Cli::parse_from(["kmux", "host"]);
+        assert_eq!(build_launch_url(&cli), "kmux://new?server=host");
+    }
 }

@@ -92,6 +92,18 @@ pub struct ConnectArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Open an interactive session on a server — the explicit form of
+    /// `kmux <host>`.
+    ///
+    /// `kmux open user@host:/path` is identical to the bare positional
+    /// `kmux user@host:/path`, which is retained as a shorthand. Takes the same
+    /// connection flags (`--session`, `--cwd`, `--ssh-port`, `--dry-run`,
+    /// `--test`) as the default connect action.
+    Open {
+        #[command(flatten)]
+        connect: ConnectArgs,
+    },
+
     /// Manage the local kmux daemon
     Daemon {
         #[command(subcommand)]
@@ -352,4 +364,74 @@ pub struct ResolvedConnection {
     /// TCP port for headless commands. Falls back to `port` if unset.
     pub tcp_port: Option<u16>,
     pub token: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    /// clap's own consistency check: catches a flattened-positional vs
+    /// subcommand-positional conflict at test time. The top-level positional
+    /// `server` and `kmux open`'s flattened `server` must coexist.
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    /// `kmux open <host>` resolves to the explicit verb, with the host on the
+    /// subcommand's flattened connect args.
+    #[test]
+    fn open_subcommand_captures_server() {
+        let cli = Cli::try_parse_from(["kmux", "open", "host"]).unwrap();
+        match cli.command {
+            Some(Command::Open { connect }) => {
+                assert_eq!(connect.server_args.server.as_deref(), Some("host"));
+            }
+            other => panic!("expected Open, got {other:?}"),
+        }
+    }
+
+    /// The bare positional `kmux <host>` is retained as a fallback: no
+    /// subcommand matches, so the host lands on the top-level connect args.
+    #[test]
+    fn bare_positional_is_fallback_connect() {
+        let cli = Cli::try_parse_from(["kmux", "host"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.connect.server_args.server.as_deref(), Some("host"));
+    }
+
+    /// `kmux open` carries the same connection flags as the default action.
+    #[test]
+    fn open_subcommand_accepts_connect_flags() {
+        let cli = Cli::try_parse_from(["kmux", "open", "-n", "host", "--session", "x"]).unwrap();
+        match cli.command {
+            Some(Command::Open { connect }) => {
+                assert!(connect.dry_run);
+                assert_eq!(connect.server_args.server.as_deref(), Some("host"));
+                assert_eq!(connect.session.as_deref(), Some("x"));
+            }
+            other => panic!("expected Open, got {other:?}"),
+        }
+    }
+
+    /// `kmux open` with no target is valid (opens the local daemon, like bare
+    /// `kmux`).
+    #[test]
+    fn open_subcommand_without_target_parses() {
+        let cli = Cli::try_parse_from(["kmux", "open"]).unwrap();
+        match cli.command {
+            Some(Command::Open { connect }) => {
+                assert!(connect.server_args.server.is_none());
+            }
+            other => panic!("expected Open, got {other:?}"),
+        }
+    }
+
+    /// A real subcommand still wins over the positional fallback.
+    #[test]
+    fn ls_subcommand_still_parses() {
+        let cli = Cli::try_parse_from(["kmux", "ls"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::ListSessions { .. })));
+    }
 }
