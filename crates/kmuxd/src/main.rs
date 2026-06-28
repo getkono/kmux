@@ -473,6 +473,15 @@ fn build_ssh_endpoints(quic_port: u16, tcp_port: u16) -> Vec<serde_json::Value> 
 }
 
 /// Remove stale daemon artifacts and spawn `kmuxd --daemon`.
+///
+/// Unlike the client auto-spawn path (`kmux-connect`'s `start_daemon`), this
+/// `probe-or-start` slow path does not take the client-side `daemon.spawn.lock`.
+/// It does not need to: the **authoritative** single-instance guard is the
+/// `flock` the daemonized grandchild holds on `daemon.pid` (see
+/// `daemon::daemonize_process`). If two `probe-or-start` invocations race here,
+/// each kills the stale pid and spawns, but only one daemonized child wins the
+/// pid-file lock; the loser exits before binding the control socket. Debug and
+/// release never collide because they resolve different runtime dirs entirely.
 fn cleanup_and_start_daemon() -> anyhow::Result<()> {
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;

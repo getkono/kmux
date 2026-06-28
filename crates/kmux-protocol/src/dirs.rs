@@ -315,6 +315,34 @@ mod tests {
         assert!(token_path().unwrap().ends_with("token"));
     }
 
+    /// Debug and release builds must resolve *different* runtime dirs, or a debug
+    /// client could attach to a release daemon (and vice-versa) over a shared
+    /// socket. The whole client↔daemon contract relies on both sides computing
+    /// the same profile-namespaced path here, so pin the namespace constant and
+    /// confirm the data-plane sockets are namespaced by it.
+    #[test]
+    fn runtime_paths_are_profile_isolated() {
+        // The test binary is built in debug, so the constant resolves to the
+        // debug namespace; release builds use the bare `kmux` namespace.
+        #[cfg(debug_assertions)]
+        assert_eq!(KMUX_DIR_NAME, "kmux-debug");
+        #[cfg(not(debug_assertions))]
+        assert_eq!(KMUX_DIR_NAME, "kmux");
+        assert_ne!("kmux", "kmux-debug", "the two profiles must never collide");
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        // Control + data sockets both sit under the profile-namespaced dir.
+        for p in [socket_path().unwrap(), data_socket_path().unwrap()] {
+            assert!(
+                p.starts_with(tmp.path().join(KMUX_DIR_NAME)),
+                "{} is not namespaced by {KMUX_DIR_NAME}",
+                p.display()
+            );
+        }
+    }
+
     #[test]
     fn state_dir_xdg() {
         let _guard = ENV_LOCK.lock().unwrap();

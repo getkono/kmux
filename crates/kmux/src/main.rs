@@ -280,12 +280,22 @@ fn default_app_bundle() -> std::path::PathBuf {
     home.join("Applications/kmux.app")
 }
 
-/// Other platforms have no supported desktop client.
+/// Other platforms have no supported desktop client yet.
+///
+/// Windows is not built. When it is, its singleton model must match the Unix
+/// one: a per-profile single-instance guard on top of the per-profile runtime
+/// dir that already isolates debug from release ([`kmux_protocol::dirs`]). The
+/// intended mechanism is a named mutex — `CreateMutexW` on a name that embeds the
+/// build profile (e.g. `Local\\kmux-{profile}`): the first launcher creates it
+/// and owns the window; a second sees `ERROR_ALREADY_EXISTS` and forwards its
+/// request to the running instance (the same handoff the GTK D-Bus `activate` /
+/// Swift `kmux://` routing perform today) rather than opening a rival process.
+/// See `docs/architecture-frontend.md`.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn launch_desktop() -> anyhow::Result<()> {
     anyhow::bail!(
-        "kmux: no desktop client for this platform; the GTK frontend (`kmux-gtk`) \
-         is supported on Linux and macOS"
+        "kmux: no desktop client for this platform yet; the GTK frontend \
+         (`kmux-gtk`) is supported on Linux and macOS"
     )
 }
 
