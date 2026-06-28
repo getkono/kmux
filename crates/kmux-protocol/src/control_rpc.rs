@@ -223,6 +223,42 @@ pub struct ConnectionInfo {
     pub last_rtt_ms: Option<u64>,
 }
 
+/// JSON response to the `"workers"` control command: the daemon's session
+/// isolation mode and every pane currently running in an isolated
+/// `kmux-vt-worker` subprocess (issue #126). Empty `workers` in `in-process`
+/// mode. Backs `kmux status`.
+#[derive(Serialize, Deserialize, Default)]
+pub struct WorkersResponse {
+    /// `"process"` (per-pane isolation) or `"in-process"` (the default).
+    #[serde(default)]
+    pub isolation_mode: String,
+    pub workers: Vec<WorkerInfo>,
+}
+
+/// One isolated pane worker in a [`WorkersResponse`].
+#[derive(Serialize, Deserialize, Clone)]
+pub struct WorkerInfo {
+    /// `{word_id}/{pane_index}` — the registry key shared with the checkpoint.
+    pub pane_id: String,
+    /// The session word-id the pane belongs to.
+    pub session_word_id: String,
+    /// The pane's index within its session.
+    pub pane_index: u32,
+    /// OS pid of the `kmux-vt-worker` subprocess.
+    pub worker_pid: u32,
+    /// Pane lifecycle status (`"running"` / `"exited"`), from the shell's state.
+    pub status: String,
+    /// Worker respawns recorded within the crash-loop window (60s).
+    #[serde(default)]
+    pub restart_count: usize,
+    /// Milliseconds since the most recent worker respawn (None if never).
+    #[serde(default)]
+    pub last_restart_ago_ms: Option<u64>,
+    /// Whether the worker may still be respawned (restart_count < the cap).
+    #[serde(default)]
+    pub within_restart_budget: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,6 +329,49 @@ mod tests {
         assert_eq!(resp.kmuxd_version, "");
         assert!(resp.build_profile.is_none());
         assert!(resp.endpoints.is_empty());
+    }
+
+    #[test]
+    fn workers_response_round_trips_through_json() {
+        let resp = WorkersResponse {
+            isolation_mode: "process".into(),
+            workers: vec![WorkerInfo {
+                pane_id: "eagle/1".into(),
+                session_word_id: "eagle".into(),
+                pane_index: 1,
+                worker_pid: 4242,
+                status: "running".into(),
+                restart_count: 2,
+                last_restart_ago_ms: Some(1500),
+                within_restart_budget: true,
+            }],
+        };
+
+        let json = serde_json::to_string(&resp).expect("serialize");
+        let back: WorkersResponse = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(back.isolation_mode, "process");
+        assert_eq!(back.workers.len(), 1);
+        let w = &back.workers[0];
+        assert_eq!(w.pane_id, "eagle/1");
+        assert_eq!(w.session_word_id, "eagle");
+        assert_eq!(w.pane_index, 1);
+        assert_eq!(w.worker_pid, 4242);
+        assert_eq!(w.status, "running");
+        assert_eq!(w.restart_count, 2);
+        assert_eq!(w.last_restart_ago_ms, Some(1500));
+        assert!(w.within_restart_budget);
+    }
+
+    #[test]
+    fn workers_response_defaults_to_empty_for_an_older_daemon() {
+        // A daemon predating worker reporting answers an unknown command by
+        // closing — but if a future field is dropped, the `#[serde(default)]`s
+        // must still yield an empty, in-process-looking report.
+        let minimal = r#"{"workers":[]}"#;
+        let resp: WorkersResponse = serde_json::from_str(minimal).expect("deserialize minimal");
+        assert_eq!(resp.isolation_mode, "");
+        assert!(resp.workers.is_empty());
     }
 
     #[test]

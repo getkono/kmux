@@ -212,6 +212,14 @@ pub async fn query_connections() -> anyhow::Result<kmux_protocol::control_rpc::C
     control_request("connections").await
 }
 
+/// Query the daemon for its isolated per-pane VT workers (issue #126). Used by
+/// `kmux status` to surface each worker's pid and crash-loop history. A daemon
+/// too old to know the `workers` command closes without replying, so this
+/// returns `Err` and the caller degrades gracefully.
+pub async fn query_workers() -> anyhow::Result<kmux_protocol::control_rpc::WorkersResponse> {
+    control_request("workers").await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

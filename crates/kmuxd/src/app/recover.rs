@@ -169,4 +169,26 @@ impl ServerApp {
         entry.push(now);
         true
     }
+
+    /// Read-only view of the crash-loop budget for `pane_id`, for status
+    /// reporting: respawns recorded within the live [`RESTART_WINDOW`], the age
+    /// of the most recent, and whether another respawn is still allowed. Mirrors
+    /// [`Self::allow_worker_restart`]'s windowing without mutating the log.
+    pub(super) fn worker_restart_stats(&self, pane_id: &str) -> (usize, Option<Duration>, bool) {
+        let now = Instant::now();
+        let log = self.worker_restart_log.lock().unwrap();
+        let Some(entry) = log.get(pane_id) else {
+            return (0, None, true);
+        };
+        let mut count = 0usize;
+        let mut newest: Option<Instant> = None;
+        for &t in entry.iter() {
+            if now.duration_since(t) < RESTART_WINDOW {
+                count += 1;
+                newest = Some(newest.map_or(t, |n| n.max(t)));
+            }
+        }
+        let last_age = newest.map(|t| now.duration_since(t));
+        (count, last_age, count < MAX_RESTARTS)
+    }
 }

@@ -849,6 +849,55 @@ impl ServerApp {
     /// Snapshot all sessions and their attached connections for the `"sessions"`
     /// control-socket command.  Both locks are held simultaneously to avoid
     /// tearing between the two maps.
+    /// Enumerate every pane currently running in an isolated `kmux-vt-worker`
+    /// subprocess, with its pid, status, and crash-loop history (issue #126).
+    /// In-process panes are skipped; the report is empty in `in-process` mode.
+    /// Backs the `"workers"` control command.
+    pub async fn snapshot_workers(&self) -> kmux_protocol::control_rpc::WorkersResponse {
+        use kmux_protocol::control_rpc::{WorkerInfo, WorkersResponse};
+        use kmux_protocol::messages::{SessionStatus, format_pane_id};
+
+        let isolation_mode = if self.session_isolation.is_process() {
+            "process"
+        } else {
+            "in-process"
+        }
+        .to_string();
+
+        let sessions = self.sessions.read().await;
+        let mut workers = Vec::new();
+        for (word_id, state) in sessions.iter() {
+            for (pane_index, relay) in state.panes.iter() {
+                let Some(worker_pid) = relay.engine.worker_pid() else {
+                    continue;
+                };
+                let pane_id = format_pane_id(word_id, *pane_index);
+                let (restart_count, last_age, within_budget) = self.worker_restart_stats(&pane_id);
+                let status = match relay.status {
+                    SessionStatus::Running => "running",
+                    SessionStatus::Exited { .. } => "exited",
+                }
+                .to_string();
+                workers.push(WorkerInfo {
+                    pane_id,
+                    session_word_id: word_id.clone(),
+                    pane_index: *pane_index,
+                    worker_pid,
+                    status,
+                    restart_count,
+                    last_restart_ago_ms: last_age.map(|d| d.as_millis() as u64),
+                    within_restart_budget: within_budget,
+                });
+            }
+        }
+        // Deterministic order (HashMap iteration is arbitrary) for stable output.
+        workers.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+        WorkersResponse {
+            isolation_mode,
+            workers,
+        }
+    }
+
     pub async fn snapshot_sessions_with_connections(&self) -> SessionsResponse {
         let sessions = self.sessions.read().await;
         let conns = self.connections.read().await;
