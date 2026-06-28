@@ -13,6 +13,7 @@ mod engine;
 mod federation;
 mod handoff;
 mod impair;
+mod log_writer;
 mod persist;
 mod process_stats;
 mod relay;
@@ -129,9 +130,46 @@ enum Command {
     },
 }
 
+/// The full multi-line version matrix for `kmuxd -V`, mirroring the client's
+/// `VersionInfo::long_string()` but built from this crate's own build env vars
+/// (the daemon does not link the client-side `kmux-app::version`). The const
+/// protocol number can't live in a clap derive literal, so we override the
+/// version at runtime below.
+fn long_version() -> String {
+    use std::fmt::Write;
+    let mut s = format!(
+        "{} ({}{}, {}, {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("BUILD_GIT_SHA"),
+        env!("BUILD_GIT_DIRTY_SUFFIX"),
+        env!("BUILD_DATE"),
+        env!("BUILD_PROFILE"),
+    );
+    let _ = write!(
+        s,
+        "\n  protocol:   {}",
+        kmux_protocol::messages::PROTOCOL_VERSION
+    );
+    let _ = write!(s, "\n  rustc:      {}", env!("BUILD_RUSTC_VERSION"));
+    let _ = write!(s, "\n  built:      {}", env!("BUILD_TIMESTAMP"));
+    s
+}
+
 fn main() -> anyhow::Result<()> {
     // Parse CLI before daemonizing so --help/--version work in the foreground.
-    let cli = Cli::parse();
+    // Override clap's compile-time one-line version with the full runtime matrix
+    // (the const protocol number can't be a derive literal), so `kmuxd -V`
+    // matches `kmux -V`.
+    let cli = {
+        use clap::{CommandFactory, FromArgMatches};
+        let version: &'static str = Box::leak(long_version().into_boxed_str());
+        let mut cmd = Cli::command().version(version);
+        let matches = cmd.get_matches_mut();
+        match Cli::from_arg_matches(&matches) {
+            Ok(cli) => cli,
+            Err(e) => e.format(&mut cmd).exit(),
+        }
+    };
 
     // probe-or-start: short-lived query/start, no need to daemonize or init full logging.
     if let Some(Command::ProbeOrStart) = cli.command {
@@ -174,9 +212,14 @@ fn main() -> anyhow::Result<()> {
             .open(p)?)
     }) {
         Ok(file) => {
+            // `ResilientWriter` (not the stock `Mutex<File>`) so a write that
+            // fails on a full disk degrades to "no logs" instead of poisoning
+            // the lock and cascading into worker panics that kill the daemon —
+            // the root cause of `kmux daemon restart` failing under disk
+            // pressure. See `log_writer`.
             tracing_subscriber::fmt()
                 .with_env_filter(EnvFilter::from_default_env().add_directive("kmuxd=info".parse()?))
-                .with_writer(std::sync::Mutex::new(file))
+                .with_writer(log_writer::ResilientWriter::new(file))
                 .init();
         }
         Err(_) => {
@@ -430,6 +473,15 @@ fn build_ssh_endpoints(quic_port: u16, tcp_port: u16) -> Vec<serde_json::Value> 
 }
 
 /// Remove stale daemon artifacts and spawn `kmuxd --daemon`.
+///
+/// Unlike the client auto-spawn path (`kmux-connect`'s `start_daemon`), this
+/// `probe-or-start` slow path does not take the client-side `daemon.spawn.lock`.
+/// It does not need to: the **authoritative** single-instance guard is the
+/// `flock` the daemonized grandchild holds on `daemon.pid` (see
+/// `daemon::daemonize_process`). If two `probe-or-start` invocations race here,
+/// each kills the stale pid and spawns, but only one daemonized child wins the
+/// pid-file lock; the loser exits before binding the control socket. Debug and
+/// release never collide because they resolve different runtime dirs entirely.
 fn cleanup_and_start_daemon() -> anyhow::Result<()> {
     use nix::sys::signal::{Signal, kill};
     use nix::unistd::Pid;
@@ -459,15 +511,46 @@ fn cleanup_and_start_daemon() -> anyhow::Result<()> {
     // Resolve the path of the current executable (i.e., this very binary).
     let exe = std::env::current_exe().unwrap_or_else(|_| std::path::PathBuf::from("kmuxd"));
 
+    // Capture the spawned daemon's pre-daemonize stdout+stderr in the boot log
+    // (rather than discarding it) so a boot crash is diagnosable.
+    let (out, err) = boot_log_stdio();
     std::process::Command::new(&exe)
         .args(kmux_protocol::control_rpc::DAEMON_BOOT_ARGS)
         .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        .stdout(out)
+        .stderr(err)
         .spawn()
         .map_err(|e| anyhow::anyhow!("failed to spawn {}: {e}", exe.display()))?;
 
     Ok(())
+}
+
+/// Open the shared boot log (truncating) for a freshly-spawned daemon's
+/// stdout+stderr, falling back to `/dev/null` if it can't be created.
+///
+/// Used by every daemon-spawn path in this binary (`probe-or-start`, the
+/// graceful-restart successor) so a child that dies before it daemonizes (full
+/// disk, panic during restore, bind failure) leaves a trail at
+/// [`kmux_protocol::dirs::boot_log_path`] instead of vanishing. The boot log can
+/// contain the auth token, so it is created `0o600`.
+pub(crate) fn boot_log_stdio() -> (std::process::Stdio, std::process::Stdio) {
+    use std::os::unix::fs::OpenOptionsExt;
+    let opened = kmux_protocol::dirs::boot_log_path().ok().and_then(|path| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(path)
+            .ok()
+    });
+    match opened.and_then(|f| f.try_clone().ok().map(|c| (f, c))) {
+        Some((out, err)) => (
+            std::process::Stdio::from(out),
+            std::process::Stdio::from(err),
+        ),
+        None => (std::process::Stdio::null(), std::process::Stdio::null()),
+    }
 }
 
 fn generate_instance_id() -> String {

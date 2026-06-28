@@ -210,6 +210,16 @@ pub enum Command {
         server_args: ServerArgs,
     },
 
+    /// Manage the local kmux GUI client (a singleton process).
+    ///
+    /// The singular `client` manages *this machine's* GUI client process
+    /// (status/logs/stop/restart), mirroring `kmux daemon`. (Distinct from the
+    /// plural `clients`, which lists the connections attached to a session.)
+    Client {
+        #[command(subcommand)]
+        action: ClientAction,
+    },
+
     /// Internal diagnostics (hidden). See `kmux debug tearing` (issue #72).
     #[command(hide = true)]
     Debug {
@@ -283,6 +293,22 @@ pub enum DaemonAction {
         #[arg(long, default_value = "table")]
         format: OutputFormat,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ClientAction {
+    /// Show the local GUI client's build/version and warn on client↔daemon skew
+    Status,
+    /// Print the client log file (use -f/--follow to stream new lines)
+    Logs {
+        /// Follow new log output (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+    },
+    /// Stop the running GUI client (the singleton process)
+    Stop,
+    /// Restart the GUI client (stop, then relaunch)
+    Restart,
 }
 
 #[derive(Debug, Clone, ValueEnum)]

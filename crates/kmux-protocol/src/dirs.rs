@@ -207,6 +207,18 @@ pub fn daemon_log_path() -> anyhow::Result<PathBuf> {
     Ok(state_dir()?.join("daemon.log"))
 }
 
+/// Path to the file that captures a freshly-spawned kmuxd's stdout+stderr
+/// before it daemonizes and switches to [`daemon_log_path`].
+///
+/// Lives in the runtime dir next to the socket/pid file. Every path that spawns
+/// a daemon — the client auto-spawn, `kmuxd probe-or-start`, and the
+/// graceful-restart successor — redirects the child here, so a boot crash
+/// (linker error, bind failure, full disk) leaves a trail instead of vanishing
+/// into `/dev/null`. `kmux daemon restart` reads its tail to explain a timeout.
+pub fn boot_log_path() -> anyhow::Result<PathBuf> {
+    Ok(runtime_dir()?.join("kmuxd-boot.log"))
+}
+
 /// Path to the per-connection log file for the given instance ID.
 ///
 /// Each client startup writes its connection metadata here upon successful authentication.
@@ -301,6 +313,34 @@ mod tests {
         assert!(pid_path().unwrap().ends_with("daemon.pid"));
         assert!(spawn_lock_path().unwrap().ends_with("daemon.spawn.lock"));
         assert!(token_path().unwrap().ends_with("token"));
+    }
+
+    /// Debug and release builds must resolve *different* runtime dirs, or a debug
+    /// client could attach to a release daemon (and vice-versa) over a shared
+    /// socket. The whole client↔daemon contract relies on both sides computing
+    /// the same profile-namespaced path here, so pin the namespace constant and
+    /// confirm the data-plane sockets are namespaced by it.
+    #[test]
+    fn runtime_paths_are_profile_isolated() {
+        // The test binary is built in debug, so the constant resolves to the
+        // debug namespace; release builds use the bare `kmux` namespace.
+        #[cfg(debug_assertions)]
+        assert_eq!(KMUX_DIR_NAME, "kmux-debug");
+        #[cfg(not(debug_assertions))]
+        assert_eq!(KMUX_DIR_NAME, "kmux");
+        assert_ne!("kmux", "kmux-debug", "the two profiles must never collide");
+
+        let _guard = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        // Control + data sockets both sit under the profile-namespaced dir.
+        for p in [socket_path().unwrap(), data_socket_path().unwrap()] {
+            assert!(
+                p.starts_with(tmp.path().join(KMUX_DIR_NAME)),
+                "{} is not namespaced by {KMUX_DIR_NAME}",
+                p.display()
+            );
+        }
     }
 
     #[test]

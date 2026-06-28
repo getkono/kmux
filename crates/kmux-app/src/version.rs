@@ -21,6 +21,11 @@ pub struct VersionInfo {
     pub git_dirty: bool,
     /// Build date, `YYYY-MM-DD`.
     pub build_date: &'static str,
+    /// Full UTC build timestamp, ISO-8601 (`YYYY-MM-DDThh:mm:ssZ`) — a superset
+    /// of [`build_date`](Self::build_date), shown by the multi-line `-V`.
+    pub build_timestamp: &'static str,
+    /// Full `rustc --version` string the binary was compiled with.
+    pub rustc: &'static str,
     /// Cargo profile the binary was built with (`"debug"` / `"release"`).
     pub build_profile: &'static str,
     /// Client↔daemon wire protocol ([`kmux_protocol::messages::PROTOCOL_VERSION`]).
@@ -42,6 +47,8 @@ impl VersionInfo {
             git_sha: env!("BUILD_GIT_SHA"),
             git_dirty: !env!("BUILD_GIT_DIRTY_SUFFIX").is_empty(),
             build_date: env!("BUILD_DATE"),
+            build_timestamp: env!("BUILD_TIMESTAMP"),
+            rustc: env!("BUILD_RUSTC_VERSION"),
             build_profile: env!("BUILD_PROFILE"),
             protocol: kmux_protocol::messages::PROTOCOL_VERSION,
             render_api: None,
@@ -89,6 +96,8 @@ impl VersionInfo {
         if let Some(abi) = self.ffi_abi {
             s.push_str(&format!("\n  FFI ABI:    {abi}"));
         }
+        s.push_str(&format!("\n  rustc:      {}", self.rustc));
+        s.push_str(&format!("\n  built:      {}", self.build_timestamp));
         s
     }
 }

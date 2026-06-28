@@ -117,7 +117,12 @@ impl TransportKind {
 ///   checksum of the daemon's authoritative grid at a seqno; a client verifies
 ///   its reconstructed grid against it and resyncs on mismatch, so silent
 ///   diff-stream corruption becomes a detected, self-healing event.
-pub const PROTOCOL_VERSION: u32 = 36;
+/// - **37**: client build identity. `ClientMessage::Auth` carries the frontend
+///   kind plus the client binary's git sha / dirty flag / build profile; the
+///   daemon records them per connection so `ClientInfo` (hence `kmux clients`)
+///   and the new `kmux client status` surface client↔daemon build skew that a
+///   matching protocol version alone cannot.
+pub const PROTOCOL_VERSION: u32 = 37;
 
 /// Wire compression algorithm negotiated for a connection.
 ///

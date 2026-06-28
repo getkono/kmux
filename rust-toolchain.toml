@@ -2,5 +2,9 @@
 # Pinned to an exact release (not the floating "stable" channel) so rustc and
 # rustfmt are reproducible across local dev and CI; bump deliberately. Mirrors
 # the `rust` pin in mise.toml.
+#
+# No `components` here on purpose: rustfmt + clippy come from rustup's default
+# profile (see mise.toml). Listing them re-resolved `rustfmt` to the legacy
+# `rustfmt-preview` component during an in-repo `cargo install`, which collided
+# with the default profile's `cargo-fmt` and failed `mise install` in CI.
 channel = "1.96.0"
-components = ["rustfmt", "clippy"]

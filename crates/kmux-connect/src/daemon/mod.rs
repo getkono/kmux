@@ -10,6 +10,14 @@ pub fn resolve_kmuxd_path() -> anyhow::Result<std::path::PathBuf> {
     find_server_binary()
 }
 
+/// The tail of the `kmuxd-boot.log`, formatted as an error suffix (or `""` when
+/// empty). Exposed so `kmux daemon restart` can explain a timeout by showing
+/// why a freshly-spawned daemon never came up — e.g. `No space left on device`
+/// — instead of a blind "timed out" with no cause.
+pub fn boot_log_hint() -> String {
+    lifecycle::format_boot_log_hint()
+}
+
 /// Protects XDG_RUNTIME_DIR mutations — shared across all daemon tests.
 #[cfg(test)]
 pub(super) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -34,6 +42,10 @@ pub struct DaemonStatus {
     pub session_count: usize,
     pub protocol_version: u32,
     pub kmuxd_version: String,
+    /// Build fingerprint of the running daemon, `<sha>[-dirty]` (empty when the
+    /// daemon predates this field). Compared against the client/CLI build to
+    /// surface skew that a matching protocol version alone cannot.
+    pub kmuxd_build: String,
     /// `None` when the daemon predates this field — treated as
     /// unverifiable and therefore rejected by `ensure_compatible_daemon`.
     pub build_profile: Option<BuildProfile>,
@@ -91,6 +103,7 @@ pub async fn query_daemon() -> Option<DaemonStatus> {
         session_count: resp.session_count,
         protocol_version: resp.protocol_version,
         kmuxd_version: resp.kmuxd_version,
+        kmuxd_build: resp.kmuxd_build,
         build_profile: resp.build_profile,
     })
 }
@@ -177,6 +190,14 @@ pub async fn restart_daemon() -> anyhow::Result<bool> {
 /// Query the daemon for its active sessions and per-connection metrics.
 pub async fn query_daemon_sessions() -> anyhow::Result<SessionsResponse> {
     control_request("sessions").await
+}
+
+/// Query the daemon for every live client connection with its build identity
+/// (protocol 37). Used by `kmux client status` to find the local GUI client's
+/// connection and compare its build against the daemon's.
+pub async fn query_connections() -> anyhow::Result<kmux_protocol::control_rpc::ConnectionsResponse>
+{
+    control_request("connections").await
 }
 
 #[cfg(test)]

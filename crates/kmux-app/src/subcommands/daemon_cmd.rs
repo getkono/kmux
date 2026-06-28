@@ -60,6 +60,9 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
                     println!("Sessions: {}", status.session_count);
                     println!("Protocol: {}", status.protocol_version);
                     println!("Version:  {}", status.kmuxd_version);
+                    if !status.kmuxd_build.is_empty() {
+                        println!("Build:    {}", status.kmuxd_build);
+                    }
                     println!(
                         "Profile:  daemon={daemon_profile} client={client}",
                         client = BuildProfile::CURRENT,
@@ -118,7 +121,10 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
                         }
                         if tokio::time::Instant::now() >= deadline {
                             anyhow::bail!(
-                                "timed out waiting for the successor daemon to take over"
+                                "timed out waiting for the successor daemon to take over. \
+                                 The previous daemon (PID {old_pid}) kept serving; running \
+                                 shells are intact.{}",
+                                kmux_client::daemon::boot_log_hint()
                             );
                         }
                     }
@@ -140,7 +146,11 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
                             anyhow::bail!("timed out waiting for daemon to stop");
                         }
                     }
-                    let status = kmux_client::daemon::ensure_compatible_daemon().await?;
+                    let status = kmux_client::daemon::ensure_compatible_daemon()
+                        .await
+                        .map_err(|e| {
+                            anyhow::anyhow!("{e}{}", kmux_client::daemon::boot_log_hint())
+                        })?;
                     println!(
                         "Daemon restarted — PID {}, port {}",
                         status.pid, status.port

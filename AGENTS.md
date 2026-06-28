@@ -49,7 +49,10 @@ These are strictly-typed config/CLI, not environment variables.
 - `kmux ls` / `kmux ps` (alias `top`) — list sessions / process overview.
   See [docs/architecture-process-overview.md](docs/architecture-process-overview.md).
 - `kmux clients [<session>]` / `kmux kick <session> <client>` — list the client
-  connections attached to sessions and detach one (issue #146).
+  connections attached to sessions (with FRONTEND/BUILD columns) and detach one
+  (issue #146). See [docs/architecture-identity.md](docs/architecture-identity.md).
+- `kmux client status|logs|stop|restart` — manage the local singleton GUI client
+  (mirror of `kmux daemon`); `status` warns on client↔daemon build/protocol skew.
   See [docs/architecture-identity.md](docs/architecture-identity.md).
 - `kmux notify` — from inside a pane, raise a native desktop notification on the
   GUI showing that session; clicking it refocuses the window + pane (issue #169).

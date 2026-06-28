@@ -108,6 +108,11 @@ pub(crate) fn run() -> anyhow::Result<()> {
 
 /// Run the GTK application for an interactive session built from `plan`.
 fn run_gui(plan: Plan) -> anyhow::Result<()> {
+    // Identify this process as the GTK frontend so every Auth frame it sends
+    // reports `frontend = gtk` (the daemon attributes the connection; `kmux
+    // clients` / `kmux client status` surface it). Set before any connection.
+    kmux_client::set_frontend_kind(kmux_protocol::messages::FrontendKind::Gtk);
+
     // Release builds keep the D-Bus single-instance lock (a second `kmux` routes
     // its `activate` to the primary, which opens a new window). Debug builds opt
     // OUT (`NON_UNIQUE`) so a freshly built `./kmux` always runs ITS OWN process

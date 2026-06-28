@@ -51,6 +51,10 @@ pub async fn handle_message<A: PaneAttacher>(
                 public_key,
                 hostname,
                 username,
+                client_kind,
+                client_git_sha,
+                client_git_dirty,
+                client_build_profile,
             } => {
                 if protocol_version != kmux_protocol::messages::PROTOCOL_VERSION {
                     state.send(auth_failure(format!(
@@ -78,6 +82,10 @@ pub async fn handle_message<A: PaneAttacher>(
                     username,
                     capabilities,
                     connection_id: incoming_conn_id,
+                    client_kind,
+                    client_git_sha,
+                    client_git_dirty,
+                    client_build_profile,
                 });
                 state.send(ServerMessage::AuthChallenge { nonce });
             }
@@ -108,6 +116,10 @@ pub async fn handle_message<A: PaneAttacher>(
                             machine_id: machine_id.clone(),
                             hostname: pending.hostname,
                             username: pending.username,
+                            client_kind: pending.client_kind,
+                            client_git_sha: pending.client_git_sha,
+                            client_git_dirty: pending.client_git_dirty,
+                            client_build_profile: pending.client_build_profile,
                         },
                     )
                     .await;
@@ -1025,6 +1037,10 @@ mod tests {
                 public_key: identity.public_key_bytes().to_vec(),
                 hostname: "host".to_string(),
                 username: "user".to_string(),
+                client_kind: kmux_protocol::messages::FrontendKind::Cli,
+                client_git_sha: String::new(),
+                client_git_dirty: false,
+                client_build_profile: String::new(),
             },
             &NoopAttacher,
         )
@@ -1130,6 +1146,10 @@ mod tests {
                 public_key: identity.public_key_bytes().to_vec(),
                 hostname: "h".to_string(),
                 username: "u".to_string(),
+                client_kind: kmux_protocol::messages::FrontendKind::Cli,
+                client_git_sha: String::new(),
+                client_git_dirty: false,
+                client_build_profile: String::new(),
             },
             &NoopAttacher,
         )

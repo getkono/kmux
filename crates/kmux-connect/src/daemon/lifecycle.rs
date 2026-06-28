@@ -53,11 +53,10 @@ pub(super) fn cleanup_stale_daemon() {
 }
 
 /// Path to the file that captures kmuxd's stdout+stderr across a spawn attempt.
-///
-/// Lives in the runtime dir alongside the socket/pid file so the user can tail
-/// it manually, and so we can include its contents in a startup-failure error.
+/// Delegates to the shared [`kmux_protocol::dirs::boot_log_path`] so every
+/// daemon-spawn site (here, `probe-or-start`, the handoff successor) agrees.
 fn boot_log_path() -> anyhow::Result<PathBuf> {
-    Ok(kmux_protocol::dirs::runtime_dir()?.join("kmuxd-boot.log"))
+    kmux_protocol::dirs::boot_log_path()
 }
 
 /// Spawn `kmuxd` with [`kmux_protocol::control_rpc::DAEMON_BOOT_ARGS`]
@@ -141,7 +140,7 @@ pub(crate) fn start_daemon() -> anyhow::Result<Option<std::process::Child>> {
 ///
 /// Returns `""` when the log is missing or empty. Capped at
 /// `BOOT_LOG_TAIL_MAX` bytes so a runaway log doesn't overwhelm the error.
-fn format_boot_log_hint() -> String {
+pub(super) fn format_boot_log_hint() -> String {
     let Ok(path) = boot_log_path() else {
         return String::new();
     };

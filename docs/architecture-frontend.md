@@ -330,6 +330,33 @@ toolkit), so `kmux daemon start`, `kmux ls`, `kmux --server …` work identicall
 on both platforms without loading GTK — only the interactive presentation is
 delegated to the per-platform frontend.
 
+### Client singleton (one GUI process per profile)
+
+A GUI client is a **singleton** process, so a second `kmux` launch opens a new
+window in the running instance rather than a rival process:
+
+- **Linux / GTK** — a release build keeps the D-Bus single-instance lock on the
+  `dev.getkono.kmux` app-id; a second launch routes its `activate` to the primary.
+  A *debug* build opts out (`gio::ApplicationFlags::NON_UNIQUE`) and the launcher
+  `pkill`s any prior dev instance, so a freshly built `./kmux` always runs its own
+  code — still exactly one process.
+- **macOS / Swift** — the singleton is the `CFBundleIdentifier`; subsequent
+  launches deliver a `kmux://` URL to the running app, which opens a window. The
+  dev path execs the bare `kmux-swift` (and the launcher kills the prior one).
+- **Windows** — not built yet. The intended guard is a per-profile **named mutex**
+  (`CreateMutexW` on `Local\kmux-{profile}`); a second launcher sees
+  `ERROR_ALREADY_EXISTS` and forwards its request to the running instance, the
+  same handoff the D-Bus / `kmux://` paths perform. The fallback `launch_desktop`
+  in `crates/kmux/src/main.rs` documents this and errors clearly until then.
+
+Debug and release never collide: they resolve **separate runtime dirs** (and so
+separate daemon sockets), and a connect refuses a cross-profile daemon
+(`ensure_compatible_daemon`). See [profile-isolation.md](profile-isolation.md).
+
+The singular **`kmux client`** command manages this singleton from the CLI —
+`status` (with client↔daemon build-skew warnings), `logs`, `stop`, `restart` —
+mirroring `kmux daemon`. See [architecture-identity.md](architecture-identity.md).
+
 ## Running
 
 - Dev entrypoint: `./kmux` — the one launcher, mirroring the installed binary. It

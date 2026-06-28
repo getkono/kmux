@@ -30,8 +30,8 @@ use std::time::Instant;
 use kmux_protocol::TransportKind;
 use kmux_protocol::control_rpc::{ConnectionInfo, SessionConnections, SessionsResponse};
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ConnectionId, InputMode, PaneId, PaneInfo, PaneProgressState,
-    SessionStatus, TermSize, epoch_millis,
+    ClientCapabilities, ClientId, ConnectionId, FrontendKind, InputMode, PaneId, PaneInfo,
+    PaneProgressState, SessionStatus, TermSize, epoch_millis,
 };
 use kmux_pty::events::SessionEvent;
 use kmux_pty::registry::SessionManager as PtyRegistry;
@@ -470,6 +470,14 @@ struct ConnectionState {
     /// Daemon-assigned user-readable label `username@hostname[#N]`, unique among
     /// live connections — the unit listed and kicked.
     label: String,
+    /// Client build identity reported in `Auth` (protocol 37): which frontend,
+    /// and the client binary's commit + profile. Surfaced by `kmux clients` and
+    /// `kmux client status` to spot a client built from a different commit than
+    /// the daemon even when the protocol version matches.
+    client_kind: FrontendKind,
+    client_git_sha: String,
+    client_git_dirty: bool,
+    client_build_profile: String,
 }
 
 /// The cryptographic identity a client presents at auth time (issue #146),
@@ -482,6 +490,14 @@ pub struct ClientIdentity {
     pub hostname: String,
     /// Client-reported OS username.
     pub username: String,
+    /// Which frontend opened the connection (CLI vs GUI). (protocol 37)
+    pub client_kind: FrontendKind,
+    /// Short git commit the client binary was built from. (protocol 37)
+    pub client_git_sha: String,
+    /// Whether the client build had uncommitted changes. (protocol 37)
+    pub client_git_dirty: bool,
+    /// Cargo profile of the client build. (protocol 37)
+    pub client_build_profile: String,
 }
 
 /// What [`ServerApp::register_client`] returns: the assigned ids, the previous
@@ -803,6 +819,10 @@ impl ServerApp {
                     hostname: identity.hostname,
                     username: identity.username,
                     label: label.clone(),
+                    client_kind: identity.client_kind,
+                    client_git_sha: identity.client_git_sha,
+                    client_git_dirty: identity.client_git_dirty,
+                    client_build_profile: identity.client_build_profile,
                 },
             );
             (label, conns.len())
@@ -1637,6 +1657,10 @@ mod tests {
             hostname: String::new(),
             username: String::new(),
             label: label.to_string(),
+            client_kind: kmux_protocol::messages::FrontendKind::Cli,
+            client_git_sha: String::new(),
+            client_git_dirty: false,
+            client_build_profile: String::new(),
         };
         let mut conns: HashMap<u64, super::ConnectionState> = HashMap::new();
         assert_eq!(super::assign_label("box", "alice", &conns), "alice@box");
@@ -1664,6 +1688,7 @@ mod tests {
                     machine_id: "m-a".into(),
                     hostname: "boxa".into(),
                     username: "alice".into(),
+                    ..Default::default()
                 },
             )
             .await;
@@ -1676,6 +1701,7 @@ mod tests {
                     machine_id: "m-b".into(),
                     hostname: "boxb".into(),
                     username: "bob".into(),
+                    ..Default::default()
                 },
             )
             .await;

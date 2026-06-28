@@ -1,8 +1,8 @@
 use super::category::MessageCategory;
 use super::key::KeyEvent;
 use super::session::{
-    AttentionKind, ClientCapabilities, ClientId, ConnectionId, LayoutScheme, PaneId, PeerId,
-    PeerTarget, RequestId, SequenceNo, SplitDir, TabIndex, TermSize, WordId,
+    AttentionKind, ClientCapabilities, ClientId, ConnectionId, FrontendKind, LayoutScheme, PaneId,
+    PeerId, PeerTarget, RequestId, SequenceNo, SplitDir, TabIndex, TermSize, WordId,
 };
 
 /// Messages sent from client -> server.
@@ -39,6 +39,21 @@ pub enum ClientMessage {
         /// per-connection label `username@hostname`.
         #[serde(default)]
         username: String,
+        /// Which frontend opened this connection (CLI vs GUI). (protocol 37)
+        #[serde(default)]
+        client_kind: FrontendKind,
+        /// Short git commit the client binary was built from. (protocol 37)
+        #[serde(default)]
+        client_git_sha: String,
+        /// Whether the client build had uncommitted changes. (protocol 37)
+        #[serde(default)]
+        client_git_dirty: bool,
+        /// Cargo profile of the client build (`"debug"`/`"release"`). The daemon
+        /// records all three so `kmux clients` / `kmux client status` can detect
+        /// a client whose build differs from the daemon's even when the protocol
+        /// version matches. (protocol 37)
+        #[serde(default)]
+        client_build_profile: String,
     },
 
     /// Second handshake message: the Ed25519 signature over the nonce the daemon
@@ -436,6 +451,10 @@ mod tests {
             public_key: Vec::new(),
             hostname: String::new(),
             username: String::new(),
+            client_kind: FrontendKind::Cli,
+            client_git_sha: String::new(),
+            client_git_dirty: false,
+            client_build_profile: String::new(),
         };
         let bytes = crate::encode_client(&msg).unwrap();
         let decoded = crate::decode_client(&bytes).unwrap();
@@ -842,6 +861,10 @@ mod tests {
                     public_key: Vec::new(),
                     hostname: String::new(),
                     username: String::new(),
+                    client_kind: FrontendKind::Cli,
+                    client_git_sha: String::new(),
+                    client_git_dirty: false,
+                    client_build_profile: String::new(),
                 },
                 MessageCategory::Bootstrap,
             ),

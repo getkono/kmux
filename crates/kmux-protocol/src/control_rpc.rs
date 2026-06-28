@@ -51,6 +51,12 @@ pub struct StatusResponse {
     pub protocol_version: u32,
     #[serde(default)]
     pub kmuxd_version: String,
+    /// Build fingerprint of the running daemon binary, `<sha>[-dirty]` — lets
+    /// `kmux daemon status` / `kmux client status` spot a daemon built from a
+    /// different commit than the CLI/GUI even when versions match. Empty when the
+    /// daemon predates this field.
+    #[serde(default)]
+    pub kmuxd_build: String,
     /// Cargo profile `kmuxd` was compiled with.
     ///
     /// `None` only when the peer predates this field — the client treats that
@@ -84,6 +90,38 @@ pub struct StopResponse {
 pub struct RestartResponse {
     pub status: String,
     pub handoff: bool,
+}
+
+/// JSON response to the `"connections"` control command: every live client
+/// connection the daemon holds, with its build identity (protocol 37).
+///
+/// Backs `kmux client status`, which has no session context and so cannot use
+/// the data-plane `ClientList` — it reads this straight off the control socket,
+/// the same local, no-data-plane-auth path `kmux daemon status` uses.
+#[derive(Serialize, Deserialize, Default)]
+pub struct ConnectionsResponse {
+    pub connections: Vec<ConnectionSummary>,
+}
+
+/// One live client connection in a [`ConnectionsResponse`].
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ConnectionSummary {
+    /// Underlying connection id (survives transport switches).
+    pub connection_id: u64,
+    /// Daemon-assigned user-readable label `username@hostname[#N]`.
+    pub label: String,
+    /// Cryptographic machine/user identity: hex SHA-256 of the public key.
+    pub machine_id: String,
+    /// Frontend that opened the connection (`cli` / `gtk` / `swift`).
+    pub frontend: String,
+    /// Build fingerprint of the client binary, `<sha>[-dirty]`.
+    pub build: String,
+    /// Cargo profile of the client build (`"debug"` / `"release"`).
+    pub build_profile: String,
+    /// Human-readable transport name (`quic` / `tcp` / `uds`).
+    pub transport: String,
+    /// Seconds since the connection was registered.
+    pub uptime_secs: u64,
 }
 
 /// Per-pane metadata sent in [`HandoffMessage::Hello`].
@@ -213,6 +251,7 @@ mod tests {
             session_count: 3,
             protocol_version: 23,
             kmuxd_version: "0.2.0".into(),
+            kmuxd_build: "abc1234".into(),
             build_profile: None,
             endpoints: vec![EndpointEntry {
                 kind: "quic".into(),

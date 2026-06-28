@@ -15,8 +15,8 @@ use crate::cli::{Cli, Command};
 use crate::config::{self, RendererKind};
 use crate::subcommands::{
     KickClientConfig, ListClientsConfig, ListSessionsConfig, NotifyConfig, ProcessOverviewConfig,
-    parse_target, run_daemon_command, run_debug_command, run_dry_run, run_kick_client,
-    run_list_clients, run_list_sessions, run_notify, run_process_overview,
+    parse_target, run_client_command, run_daemon_command, run_debug_command, run_dry_run,
+    run_kick_client, run_list_clients, run_list_sessions, run_notify, run_process_overview,
 };
 use crate::theme::Theme;
 
@@ -229,7 +229,14 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
             pane,
             server_args,
         }) => {
-            run_notify(NotifyConfig {
+            // Best-effort: `kmux notify` is a fire-and-forget hook (Claude Code
+            // Stop/Notification, shell `precmd`, …). A delivery failure — not in a
+            // pane, daemon down, version-skewed client/daemon, connection refused —
+            // must never surface as a non-zero exit, or every hook firing spams the
+            // caller (e.g. Claude Code's "Stop hook failed" warning after each
+            // turn). Log the reason to the client log and exit 0, mirroring the
+            // metrics sink's "must never take down the client" rule.
+            if let Err(e) = run_notify(NotifyConfig {
                 server: server_args.server.as_deref(),
                 ssh_port: server_args.ssh_port,
                 pane,
@@ -237,7 +244,14 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
                 title,
                 body,
             })
-            .await?;
+            .await
+            {
+                tracing::warn!(target: "kmux::notify", "notify not delivered: {e:#}");
+            }
+            return Ok(Launch::Done);
+        }
+        Some(Command::Client { action }) => {
+            run_client_command(action).await?;
             return Ok(Launch::Done);
         }
         Some(Command::Debug { action }) => {

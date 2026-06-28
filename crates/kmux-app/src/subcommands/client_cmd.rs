@@ -1,0 +1,300 @@
+//! `kmux client` — manage *this machine's* singleton GUI client process, the
+//! mirror of `kmux daemon` for the client side (issue: client↔daemon build skew).
+//!
+//! `status` compares the running GUI client, the local daemon, and this CLI by
+//! build, warning when they diverge (the silent skew where an installed CLI is
+//! older than the daemon it talks to). `logs` tails the client log; `stop` /
+//! `restart` drive the singleton process. The GUI clients are singletons (GTK
+//! D-Bus app-id in release; Swift `CFBundleIdentifier` + `kmux://` routing), so
+//! there is exactly one process to manage per profile.
+
+use std::time::Duration;
+
+use crate::cli::ClientAction;
+
+/// GUI client process name for this platform, or `None` where the GUI is not yet
+/// supported (Windows). Debug and release builds share the name; the per-profile
+/// *daemon socket* split is what keeps a debug and release client from colliding.
+#[cfg(target_os = "macos")]
+const GUI_PROCESS: Option<&str> = Some("kmux-swift");
+#[cfg(target_os = "linux")]
+const GUI_PROCESS: Option<&str> = Some("kmux-gtk");
+#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+const GUI_PROCESS: Option<&str> = None;
+
+pub async fn run_client_command(action: ClientAction) -> anyhow::Result<()> {
+    match action {
+        ClientAction::Status => client_status().await,
+        ClientAction::Logs { follow } => client_logs(follow).await,
+        ClientAction::Stop => {
+            client_stop();
+            Ok(())
+        }
+        ClientAction::Restart => client_restart(),
+    }
+}
+
+/// PIDs of running GUI client processes (via `pgrep -x`). Empty on unsupported
+/// platforms or when none run.
+fn gui_pids() -> Vec<u32> {
+    let Some(name) = GUI_PROCESS else {
+        return Vec::new();
+    };
+    match std::process::Command::new("pgrep")
+        .args(["-x", name])
+        .output()
+    {
+        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
+            .split_whitespace()
+            .filter_map(|s| s.parse::<u32>().ok())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// This machine's cryptographic identity (the `machine_id` the daemon records),
+/// so `status` can pick out *our* GUI connection from the registry.
+fn local_machine_id() -> Option<String> {
+    kmux_protocol::identity::Identity::load_or_create()
+        .ok()
+        .map(|id| id.fingerprint())
+}
+
+/// `<build> (<profile>)`, or `<unknown> (<profile>)` for an empty build.
+fn build_display(build: &str, profile: &str) -> String {
+    let b = if build.is_empty() { "<unknown>" } else { build };
+    if profile.is_empty() {
+        b.to_string()
+    } else {
+        format!("{b} ({profile})")
+    }
+}
+
+async fn client_status() -> anyhow::Result<()> {
+    use kmux_protocol::dirs::BuildProfile;
+    use kmux_protocol::messages::PROTOCOL_VERSION;
+
+    let cli_build = kmux_protocol::buildinfo::fingerprint();
+    let cli_profile = kmux_protocol::buildinfo::build_profile();
+
+    let daemon = kmux_client::daemon::query_daemon().await;
+    let pids = gui_pids();
+
+    // The GUI client's build is learned from the local daemon's connection
+    // registry (it has no control socket of its own). Match our machine's
+    // non-CLI connection.
+    let local_mid = local_machine_id();
+    let gui_conn = if daemon.is_some() {
+        kmux_client::daemon::query_connections()
+            .await
+            .ok()
+            .and_then(|resp| {
+                resp.connections.into_iter().find(|c| {
+                    c.frontend != "cli" && local_mid.as_deref().is_none_or(|m| m == c.machine_id)
+                })
+            })
+    } else {
+        None
+    };
+
+    // ── Client (the GUI singleton) ──────────────────────────────────────────
+    println!("Client:");
+    println!(
+        "  Frontend: {}",
+        GUI_PROCESS.unwrap_or("<unsupported on this platform>")
+    );
+    if pids.is_empty() {
+        println!("  Process:  not running");
+    } else {
+        let list = pids
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  Process:  running (PID {list})");
+    }
+    match (&daemon, &gui_conn) {
+        (Some(_), Some(c)) => {
+            println!("  Build:    {}", build_display(&c.build, &c.build_profile));
+            println!("  Attached: {} ({})", c.label, c.transport);
+        }
+        (Some(_), None) if !pids.is_empty() => {
+            println!("  Build:    <unknown — GUI running but not attached to the local daemon>");
+        }
+        (Some(_), None) => println!("  Build:    <none — no GUI client attached>"),
+        (None, _) => println!("  Build:    <unknown — local daemon not running>"),
+    }
+
+    // ── Daemon ──────────────────────────────────────────────────────────────
+    println!("Daemon:");
+    match &daemon {
+        Some(d) => {
+            let dprofile = d.build_profile.map(|p| p.as_str()).unwrap_or("<unknown>");
+            println!("  Build:    {}", build_display(&d.kmuxd_build, dprofile));
+            println!("  Version:  {}", d.kmuxd_version);
+            println!("  Protocol: {}", d.protocol_version);
+            println!("  PID:      {}", d.pid);
+        }
+        None => println!("  Status:   not running"),
+    }
+
+    // ── This CLI ────────────────────────────────────────────────────────────
+    println!("CLI:");
+    println!("  Build:    {}", build_display(&cli_build, cli_profile));
+    println!("  Protocol: {PROTOCOL_VERSION}");
+
+    // ── Skew warnings ───────────────────────────────────────────────────────
+    let mut warnings: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = Vec::new();
+    if let Some(d) = &daemon {
+        // The most consequential skew: a protocol gap means the CLI/GUI cannot
+        // even connect to this daemon.
+        if d.protocol_version != 0 && d.protocol_version != PROTOCOL_VERSION {
+            warnings.push(format!(
+                "CLI protocol ({PROTOCOL_VERSION}) differs from the daemon ({}) — they cannot \
+                 connect. Run `kmux daemon restart` to update the daemon, or reinstall kmux.",
+                d.protocol_version
+            ));
+        }
+        if d.build_profile != Some(BuildProfile::CURRENT) {
+            warnings.push(format!(
+                "CLI profile ({}) differs from the daemon ({}).",
+                BuildProfile::CURRENT,
+                d.build_profile.map(|p| p.as_str()).unwrap_or("<unknown>"),
+            ));
+        }
+        if d.kmuxd_build.is_empty() {
+            notes.push(
+                "daemon build is unknown (it predates build reporting); reinstall/restart it to \
+                 enable build-skew detection."
+                    .to_string(),
+            );
+        } else if d.kmuxd_build != cli_build {
+            // The skew that hides in plain sight: the GUI launches the current
+            // install while `kmux …` may run a stale CLI.
+            warnings.push(format!(
+                "CLI build ({cli_build}) differs from the daemon ({}). Reinstall kmux so the \
+                 CLI matches.",
+                d.kmuxd_build
+            ));
+        }
+        if let Some(c) = &gui_conn
+            && !c.build.is_empty()
+            && !d.kmuxd_build.is_empty()
+            && c.build != d.kmuxd_build
+        {
+            warnings.push(format!(
+                "GUI client build ({}) differs from the daemon ({}). Restart it: \
+                 `kmux client restart`.",
+                c.build, d.kmuxd_build
+            ));
+        }
+    }
+    for w in &warnings {
+        println!("⚠  {w}");
+    }
+    for n in &notes {
+        println!("ℹ  {n}");
+    }
+    if daemon.is_some() && warnings.is_empty() && notes.is_empty() {
+        println!("✓  client, daemon, and CLI builds all match.");
+    }
+
+    Ok(())
+}
+
+/// Tail the client log file, optionally following new output — the client-side
+/// counterpart of `kmux daemon logs`.
+async fn client_logs(follow: bool) -> anyhow::Result<()> {
+    use std::io;
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let log_path = kmux_protocol::dirs::client_log_path()?;
+    if !log_path.exists() {
+        eprintln!(
+            "Log file not found: {}\nHas a kmux client been run at least once?",
+            log_path.display()
+        );
+        std::process::exit(1);
+    }
+
+    let mut file = tokio::fs::File::open(&log_path).await?;
+    let mut buf = Vec::new();
+    file.read_to_end(&mut buf).await?;
+    io::Write::write_all(&mut io::stdout(), &buf)?;
+
+    if follow {
+        file.seek(std::io::SeekFrom::End(0)).await?;
+        let mut read_buf = vec![0u8; 4096];
+        loop {
+            tokio::time::sleep(Duration::from_millis(100)).await;
+            let n = file.read(&mut read_buf).await?;
+            if n > 0 {
+                io::Write::write_all(&mut io::stdout(), &read_buf[..n])?;
+                io::Write::flush(&mut io::stdout())?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Stop the running GUI client: SIGTERM each PID, then SIGKILL any that linger.
+fn client_stop() {
+    let pids = gui_pids();
+    if pids.is_empty() {
+        println!("No GUI client is running.");
+        return;
+    }
+    for pid in &pids {
+        terminate(*pid);
+    }
+    let list = pids
+        .iter()
+        .map(u32::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    println!("Stopped GUI client (PID {list}).");
+}
+
+/// SIGTERM a pid, then SIGKILL it if it is still alive after a short grace
+/// period. Uses the `kill` command so no extra dependency is needed.
+fn terminate(pid: u32) {
+    let pid = pid.to_string();
+    let _ = std::process::Command::new("kill").arg(&pid).status();
+    std::thread::sleep(Duration::from_millis(400));
+    if pid_alive(&pid) {
+        let _ = std::process::Command::new("kill")
+            .args(["-9", &pid])
+            .status();
+    }
+}
+
+fn pid_alive(pid: &str) -> bool {
+    std::process::Command::new("kill")
+        .args(["-0", pid])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+/// Stop the GUI client, then relaunch it through the launcher entrypoint.
+fn client_restart() -> anyhow::Result<()> {
+    client_stop();
+    // Let the singleton (D-Bus / bundle) lock clear before relaunching.
+    std::thread::sleep(Duration::from_millis(400));
+
+    // Spawn the launcher (`current_exe` is the `kmux` front door — or a frontend
+    // binary — both of which open the GUI when run with no subcommand). Detach
+    // it and clear `KMUX` so the relaunch isn't refused by the nested-kmux guard
+    // when this command is run from inside a pane.
+    let exe = std::env::current_exe()?;
+    std::process::Command::new(&exe)
+        .env_remove("KMUX")
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .map_err(|e| anyhow::anyhow!("failed to relaunch {}: {e}", exe.display()))?;
+    println!("Relaunched GUI client.");
+    Ok(())
+}
