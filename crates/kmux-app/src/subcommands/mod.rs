@@ -7,6 +7,7 @@ mod list;
 mod notify;
 mod ps;
 pub mod render;
+mod status;
 pub use client_cmd::run_client_command;
 pub use clients::{KickClientConfig, ListClientsConfig, run_kick_client, run_list_clients};
 pub use daemon_cmd::run_daemon_command;
@@ -15,6 +16,7 @@ pub use dry_run::run_dry_run;
 pub use list::{ListSessionsConfig, run_list_sessions};
 pub use notify::{NotifyConfig, run_notify};
 pub use ps::{ProcessOverviewConfig, run_process_overview};
+pub use status::run_status;
 
 use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::ssh::{self, ParsedServer};

@@ -11,16 +11,8 @@
 use std::time::Duration;
 
 use crate::cli::ClientAction;
-
-/// GUI client process name for this platform, or `None` where the GUI is not yet
-/// supported (Windows). Debug and release builds share the name; the per-profile
-/// *daemon socket* split is what keeps a debug and release client from colliding.
-#[cfg(target_os = "macos")]
-const GUI_PROCESS: Option<&str> = Some("kmux-swift");
-#[cfg(target_os = "linux")]
-const GUI_PROCESS: Option<&str> = Some("kmux-gtk");
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-const GUI_PROCESS: Option<&str> = None;
+// GUI-introspection helpers shared with `kmux status` (their SSoT home).
+use super::status::{GUI_PROCESS, build_display, gui_pids, local_machine_id};
 
 pub async fn run_client_command(action: ClientAction) -> anyhow::Result<()> {
     match action {
@@ -31,42 +23,6 @@ pub async fn run_client_command(action: ClientAction) -> anyhow::Result<()> {
             Ok(())
         }
         ClientAction::Restart => client_restart(),
-    }
-}
-
-/// PIDs of running GUI client processes (via `pgrep -x`). Empty on unsupported
-/// platforms or when none run.
-fn gui_pids() -> Vec<u32> {
-    let Some(name) = GUI_PROCESS else {
-        return Vec::new();
-    };
-    match std::process::Command::new("pgrep")
-        .args(["-x", name])
-        .output()
-    {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout)
-            .split_whitespace()
-            .filter_map(|s| s.parse::<u32>().ok())
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-/// This machine's cryptographic identity (the `machine_id` the daemon records),
-/// so `status` can pick out *our* GUI connection from the registry.
-fn local_machine_id() -> Option<String> {
-    kmux_protocol::identity::Identity::load_or_create()
-        .ok()
-        .map(|id| id.fingerprint())
-}
-
-/// `<build> (<profile>)`, or `<unknown> (<profile>)` for an empty build.
-fn build_display(build: &str, profile: &str) -> String {
-    let b = if build.is_empty() { "<unknown>" } else { build };
-    if profile.is_empty() {
-        b.to_string()
-    } else {
-        format!("{b} ({profile})")
     }
 }
 

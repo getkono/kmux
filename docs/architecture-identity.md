@@ -108,6 +108,18 @@ machine's* singleton GUI process and surfaces that skew:
 - `kmux client logs [-f]` tails the client log; `kmux client stop` / `restart`
   drive the singleton (found via `pgrep`, relaunched through the launcher).
 
+`kmux status` is the **unified overview** over all of the above: it folds the
+daemon, the GUI client, this CLI, and any isolated per-pane VT workers into one
+report (`--format json` for scripting), leaving `kmux client status` /
+`kmux daemon status` as the scoped detail views. It exits non-zero when the
+daemon is down or a *blocking* skew is present.
+
+The same/different/unknown classification and the blocking attach-gate policy
+are defined once in `kmux_protocol::compat` (`Match3`, `BlockReason`,
+`attach_block`) — the single source of truth shared by `ensure_compatible_daemon`
+(the connect gate), `kmux daemon status`, `kmux client status`, and `kmux status`.
+Each caller still formats its own prose; only the decision is centralized.
+
 ## Federation
 
 For a session proxied from a federated peer (issue #121), the local hub forwards
@@ -124,7 +136,8 @@ chooses local vs. forwarded via `ServerApp::is_federated_session`.
 | --- | --- | --- |
 | CLI | `kmux clients [<session>]` (`--format json`; FRONTEND/BUILD columns) | `kmux kick <session> <label-or-id>` |
 | CLI (local client) | `kmux client status` — GUI/daemon/CLI build + skew warnings | — |
-| Control socket | `kmux daemon sessions` shows label/machine id/hostname; `connections` lists all with build | — |
+| CLI (overview) | `kmux status` — daemon + GUI + CLI + workers in one view (`--format json`) | — |
+| Control socket | `kmux daemon sessions` shows label/machine id/hostname; `connections` lists all with build; `workers` lists isolated per-pane workers | — |
 | GTK | "Connected Clients" main-area view (`Ctrl+Shift+K`, menu, `/clients`) | per-row **Kick** button |
 | Swift | "Connected Clients" main-area view (`⌘⇧K`, menu) | per-row **Kick** button |
 

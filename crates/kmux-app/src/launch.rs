@@ -17,6 +17,7 @@ use crate::subcommands::{
     KickClientConfig, ListClientsConfig, ListSessionsConfig, NotifyConfig, ProcessOverviewConfig,
     parse_target, run_client_command, run_daemon_command, run_debug_command, run_dry_run,
     run_kick_client, run_list_clients, run_list_sessions, run_notify, run_process_overview,
+    run_status,
 };
 use crate::theme::Theme;
 
@@ -256,6 +257,10 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
             {
                 tracing::warn!(target: "kmux::notify", "notify not delivered: {e:#}");
             }
+            return Ok(Launch::Done);
+        }
+        Some(Command::Status { format }) => {
+            run_status(format).await?;
             return Ok(Launch::Done);
         }
         Some(Command::Client { action }) => {

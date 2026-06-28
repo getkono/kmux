@@ -104,6 +104,19 @@ pub enum Command {
         connect: ConnectArgs,
     },
 
+    /// Show one health view across every kmux process: the local daemon
+    /// (`kmuxd`), the GUI client singleton, this CLI, and any isolated per-pane
+    /// VT workers — flagging build/protocol skew between them.
+    ///
+    /// The scoped `kmux daemon status` / `kmux client status` remain the
+    /// detailed views; this is the at-a-glance overview. Exits non-zero when the
+    /// daemon is not running or a blocking (protocol/profile) skew is present.
+    Status {
+        /// Output format
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
+
     /// Manage the local kmux daemon
     Daemon {
         #[command(subcommand)]
