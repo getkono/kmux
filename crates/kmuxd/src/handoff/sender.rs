@@ -37,11 +37,27 @@ pub async fn run(app: &Arc<ServerApp>) -> anyhow::Result<()> {
     let _guard = PathGuard(path.clone());
 
     spawn_successor().context("spawning successor daemon")?;
+    info!(
+        "handoff: spawned successor; awaiting its connection within {SUCCESSOR_CONNECT_TIMEOUT:?}"
+    );
 
-    let (stream, _) = tokio::time::timeout(SUCCESSOR_CONNECT_TIMEOUT, listener.accept())
-        .await
-        .map_err(|_| anyhow!("successor did not connect within {SUCCESSOR_CONNECT_TIMEOUT:?}"))?
-        .context("accepting successor handoff connection")?;
+    let (stream, _) = match tokio::time::timeout(SUCCESSOR_CONNECT_TIMEOUT, listener.accept()).await
+    {
+        Err(_) => {
+            // The successor never connected — almost always a boot failure
+            // (full disk, panic during restore). Its output is in the boot log.
+            // Nothing destructive has happened yet, so the caller rolls back and
+            // keeps serving; surface why so the operator can act.
+            warn!(
+                "handoff: successor did not connect within {SUCCESSOR_CONNECT_TIMEOUT:?} \
+                 (check kmuxd-boot.log); rolling back and continuing to serve"
+            );
+            return Err(anyhow!(
+                "successor did not connect within {SUCCESSOR_CONNECT_TIMEOUT:?}"
+            ));
+        }
+        Ok(accepted) => accepted.context("accepting successor handoff connection")?,
+    };
 
     let panes = app.collect_handoff_panes().await;
     let live = panes.iter().filter(|p| p.has_live_fd).count();

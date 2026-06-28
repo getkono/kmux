@@ -140,7 +140,7 @@ pub(crate) fn start_daemon() -> anyhow::Result<Option<std::process::Child>> {
 ///
 /// Returns `""` when the log is missing or empty. Capped at
 /// `BOOT_LOG_TAIL_MAX` bytes so a runaway log doesn't overwhelm the error.
-fn format_boot_log_hint() -> String {
+pub(super) fn format_boot_log_hint() -> String {
     let Ok(path) = boot_log_path() else {
         return String::new();
     };

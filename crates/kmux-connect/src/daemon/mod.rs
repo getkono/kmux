@@ -10,6 +10,14 @@ pub fn resolve_kmuxd_path() -> anyhow::Result<std::path::PathBuf> {
     find_server_binary()
 }
 
+/// The tail of the `kmuxd-boot.log`, formatted as an error suffix (or `""` when
+/// empty). Exposed so `kmux daemon restart` can explain a timeout by showing
+/// why a freshly-spawned daemon never came up — e.g. `No space left on device`
+/// — instead of a blind "timed out" with no cause.
+pub fn boot_log_hint() -> String {
+    lifecycle::format_boot_log_hint()
+}
+
 /// Protects XDG_RUNTIME_DIR mutations — shared across all daemon tests.
 #[cfg(test)]
 pub(super) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
