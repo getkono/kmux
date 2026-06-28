@@ -122,7 +122,8 @@ where
 {
     use kmux_protocol::identity::Identity;
     use kmux_protocol::messages::{
-        ClientCapabilities, ClientMessage, PROTOCOL_VERSION, ServerMessage, version_mismatch_hint,
+        ClientCapabilities, ClientMessage, FrontendKind, PROTOCOL_VERSION, ServerMessage,
+        version_mismatch_hint,
     };
     use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
 
@@ -135,6 +136,11 @@ where
         public_key: identity.public_key_bytes().to_vec(),
         hostname: kmux_protocol::identity::local_hostname(),
         username: kmux_protocol::identity::local_username(),
+        // This is the CLI control path (kmux clients / kick); always a CLI build.
+        client_kind: FrontendKind::Cli,
+        client_git_sha: kmux_protocol::buildinfo::git_sha().to_string(),
+        client_git_dirty: kmux_protocol::buildinfo::git_dirty(),
+        client_build_profile: kmux_protocol::buildinfo::build_profile().to_string(),
     };
     write_frame(write_half, &encode_client(&auth)?).await?;
 

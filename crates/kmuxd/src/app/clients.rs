@@ -67,6 +67,13 @@ impl ServerApp {
                     attached_panes: panes,
                     uptime_secs: c.metrics.created_at.elapsed().as_secs(),
                     is_self: client_id == requester,
+                    frontend: c.client_kind,
+                    build: if c.client_git_dirty {
+                        format!("{}-dirty", c.client_git_sha)
+                    } else {
+                        c.client_git_sha.clone()
+                    },
+                    build_profile: c.client_build_profile.clone(),
                 })
             })
             .collect();

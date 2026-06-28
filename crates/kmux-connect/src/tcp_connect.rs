@@ -38,6 +38,13 @@ pub(crate) async fn send_auth_frame<W: AsyncWrite + Unpin>(
         public_key,
         hostname,
         username,
+        // Build identity, so the daemon can attribute the connection and detect a
+        // client whose build differs from its own (issue: build skew). The kind
+        // is the process-wide frontend; sha/profile come from this binary's build.
+        client_kind: crate::frontend_kind(),
+        client_git_sha: kmux_protocol::buildinfo::git_sha().to_string(),
+        client_git_dirty: kmux_protocol::buildinfo::git_dirty(),
+        client_build_profile: kmux_protocol::buildinfo::build_profile().to_string(),
     })
     .map_err(|e| format!("auth encode failed: {e}"))?;
     write_frame(writer, &auth_bytes)

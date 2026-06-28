@@ -255,6 +255,10 @@ mod tests {
             public_key: vec![1, 2, 3],
             hostname: "host".to_string(),
             username: "user".to_string(),
+            client_kind: FrontendKind::Cli,
+            client_git_sha: String::new(),
+            client_git_dirty: false,
+            client_build_profile: String::new(),
         };
         let bytes = encode_client(&msg).expect("encode");
         let decoded = decode_client(&bytes).expect("decode");

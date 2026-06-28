@@ -60,6 +60,31 @@ pub fn pane_word(pane_id: &str) -> Option<&str> {
 /// off [`PaneId`]).
 pub type TabIndex = u32;
 
+/// Which kmux frontend opened a connection, declared at Auth time so the daemon
+/// can attribute each connection (and `kmux clients` / `kmux client status` can
+/// distinguish a CLI invocation from a GUI client).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum FrontendKind {
+    /// A short-lived `kmux` CLI subcommand (`ls`, `clients`, `notify`, …).
+    #[default]
+    Cli,
+    /// The GTK desktop client (`kmux-gtk`).
+    Gtk,
+    /// The native macOS Swift app (`kmux-swift`).
+    Swift,
+}
+
+impl std::fmt::Display for FrontendKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let s = match self {
+            FrontendKind::Cli => "cli",
+            FrontendKind::Gtk => "gtk",
+            FrontendKind::Swift => "swift",
+        };
+        f.write_str(s)
+    }
+}
+
 /// Rendering capabilities self-declared by a client at Auth time.
 ///
 /// The daemon uses these to decide which PTY environment variables to set
@@ -320,6 +345,18 @@ pub struct ClientInfo {
     pub uptime_secs: u64,
     /// True for the connection that issued the list request (shown as "(you)").
     pub is_self: bool,
+    /// Which frontend opened the connection (CLI vs GUI). (protocol 37)
+    #[serde(default)]
+    pub frontend: FrontendKind,
+    /// Build fingerprint of the client binary, `<sha>[-dirty]` — lets `kmux
+    /// clients` / `kmux client status` spot a build that differs from the
+    /// daemon's even when the protocol version matches. (protocol 37)
+    #[serde(default)]
+    pub build: String,
+    /// Cargo profile the client binary was built with (`"debug"`/`"release"`).
+    /// (protocol 37)
+    #[serde(default)]
+    pub build_profile: String,
 }
 
 /// Orientation of a layout split.

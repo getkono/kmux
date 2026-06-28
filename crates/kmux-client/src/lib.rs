@@ -19,7 +19,9 @@ pub mod metrics;
 pub mod session_manager;
 pub mod transport;
 
-pub use kmux_connect::{connect, daemon, hosts, pipeline, ssh, supervisor, tcp_connect, token};
+pub use kmux_connect::{
+    connect, daemon, hosts, pipeline, set_frontend_kind, ssh, supervisor, tcp_connect, token,
+};
 
 use rand::Rng;
 

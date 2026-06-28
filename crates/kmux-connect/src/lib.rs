@@ -19,3 +19,26 @@ pub mod ssh;
 pub mod supervisor;
 pub mod tcp_connect;
 pub mod token;
+
+use std::sync::OnceLock;
+
+use kmux_protocol::messages::FrontendKind;
+
+/// Process-wide frontend identity, reported in every `Auth` frame this process
+/// sends (issue: client↔daemon build skew). It is a per-binary constant, so a
+/// `OnceLock` set once at startup is the right model — threading it through every
+/// connect/bootstrap signature would be noise.
+static FRONTEND_KIND: OnceLock<FrontendKind> = OnceLock::new();
+
+/// Record which frontend this process is. Called once at GUI startup
+/// (`kmux-gtk` → [`FrontendKind::Gtk`], `kmux-ffi`/Swift → [`FrontendKind::Swift`]);
+/// the toolkit-free CLI leaves it at the default [`FrontendKind::Cli`].
+pub fn set_frontend_kind(kind: FrontendKind) {
+    let _ = FRONTEND_KIND.set(kind);
+}
+
+/// The frontend identity set by [`set_frontend_kind`], or [`FrontendKind::Cli`]
+/// when unset (a plain `kmux` CLI invocation).
+pub(crate) fn frontend_kind() -> FrontendKind {
+    FRONTEND_KIND.get().copied().unwrap_or_default()
+}
