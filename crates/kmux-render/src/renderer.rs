@@ -146,63 +146,78 @@ impl TerminalRenderer {
         appearance: &Appearance,
         palette: &Theme,
     ) -> Result<Self, RenderError> {
-        let instance = wgpu::Instance::default();
-        let surface = unsafe {
-            instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(
-                layer_ptr as *mut std::ffi::c_void,
+        #[cfg(not(target_os = "macos"))]
+        {
+            // `wgpu::SurfaceTargetUnsafe::CoreAnimationLayer` exists only on Apple
+            // targets, so naming it off-Apple fails to compile. The GPU path on
+            // other platforms presents via the offscreen route and never reaches
+            // this constructor; keep the signature (uniffi exports it across
+            // platforms) but bail rather than reference the Apple-only variant.
+            let _ = (layer_ptr, width, height, scale, appearance, palette);
+            return Err(RenderError::Surface(
+                "CAMetalLayer surface is only available on macOS".to_string(),
+            ));
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let instance = wgpu::Instance::default();
+            let surface = unsafe {
+                instance.create_surface_unsafe(wgpu::SurfaceTargetUnsafe::CoreAnimationLayer(
+                    layer_ptr as *mut std::ffi::c_void,
+                ))
+            }
+            .map_err(|e| RenderError::Surface(e.to_string()))?;
+            let adapter = pollster::block_on(request_adapter(&instance, Some(&surface)))?;
+            let (device, queue) = pollster::block_on(request_device(&adapter))?;
+            let (width, height) = (width.max(1), height.max(1));
+
+            let caps = surface.get_capabilities(&adapter);
+            // Prefer a non-sRGB format so colors are written straight (no gamma),
+            // matching the offscreen/CPU path.
+            let format = caps
+                .formats
+                .iter()
+                .copied()
+                .find(|f| !f.is_srgb())
+                .unwrap_or_else(|| caps.formats[0]);
+            let config = wgpu::SurfaceConfiguration {
+                usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+                format,
+                width,
+                height,
+                present_mode: wgpu::PresentMode::Fifo,
+                alpha_mode: caps
+                    .alpha_modes
+                    .first()
+                    .copied()
+                    .unwrap_or(wgpu::CompositeAlphaMode::Auto),
+                view_formats: vec![],
+                desired_maximum_frame_latency: 2,
+            };
+            surface.configure(&device, &config);
+
+            let info = adapter.get_info();
+            tracing::info!(
+                adapter = %info.name,
+                backend = ?info.backend,
+                format = ?format,
+                width,
+                height,
+                scale,
+                "kmux-render: Metal surface renderer created"
+            );
+            Ok(Self::assemble(
+                device,
+                queue,
+                format,
+                Target::Surface { surface, config },
+                width,
+                height,
+                scale,
+                appearance,
+                palette,
             ))
         }
-        .map_err(|e| RenderError::Surface(e.to_string()))?;
-        let adapter = pollster::block_on(request_adapter(&instance, Some(&surface)))?;
-        let (device, queue) = pollster::block_on(request_device(&adapter))?;
-        let (width, height) = (width.max(1), height.max(1));
-
-        let caps = surface.get_capabilities(&adapter);
-        // Prefer a non-sRGB format so colors are written straight (no gamma),
-        // matching the offscreen/CPU path.
-        let format = caps
-            .formats
-            .iter()
-            .copied()
-            .find(|f| !f.is_srgb())
-            .unwrap_or_else(|| caps.formats[0]);
-        let config = wgpu::SurfaceConfiguration {
-            usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format,
-            width,
-            height,
-            present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: caps
-                .alpha_modes
-                .first()
-                .copied()
-                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
-            view_formats: vec![],
-            desired_maximum_frame_latency: 2,
-        };
-        surface.configure(&device, &config);
-
-        let info = adapter.get_info();
-        tracing::info!(
-            adapter = %info.name,
-            backend = ?info.backend,
-            format = ?format,
-            width,
-            height,
-            scale,
-            "kmux-render: Metal surface renderer created"
-        );
-        Ok(Self::assemble(
-            device,
-            queue,
-            format,
-            Target::Surface { surface, config },
-            width,
-            height,
-            scale,
-            appearance,
-            palette,
-        ))
     }
 
     /// Shared construction once a device/queue/target/format are chosen.
