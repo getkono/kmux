@@ -130,9 +130,46 @@ enum Command {
     },
 }
 
+/// The full multi-line version matrix for `kmuxd -V`, mirroring the client's
+/// `VersionInfo::long_string()` but built from this crate's own build env vars
+/// (the daemon does not link the client-side `kmux-app::version`). The const
+/// protocol number can't live in a clap derive literal, so we override the
+/// version at runtime below.
+fn long_version() -> String {
+    use std::fmt::Write;
+    let mut s = format!(
+        "{} ({}{}, {}, {})",
+        env!("CARGO_PKG_VERSION"),
+        env!("BUILD_GIT_SHA"),
+        env!("BUILD_GIT_DIRTY_SUFFIX"),
+        env!("BUILD_DATE"),
+        env!("BUILD_PROFILE"),
+    );
+    let _ = write!(
+        s,
+        "\n  protocol:   {}",
+        kmux_protocol::messages::PROTOCOL_VERSION
+    );
+    let _ = write!(s, "\n  rustc:      {}", env!("BUILD_RUSTC_VERSION"));
+    let _ = write!(s, "\n  built:      {}", env!("BUILD_TIMESTAMP"));
+    s
+}
+
 fn main() -> anyhow::Result<()> {
     // Parse CLI before daemonizing so --help/--version work in the foreground.
-    let cli = Cli::parse();
+    // Override clap's compile-time one-line version with the full runtime matrix
+    // (the const protocol number can't be a derive literal), so `kmuxd -V`
+    // matches `kmux -V`.
+    let cli = {
+        use clap::{CommandFactory, FromArgMatches};
+        let version: &'static str = Box::leak(long_version().into_boxed_str());
+        let mut cmd = Cli::command().version(version);
+        let matches = cmd.get_matches_mut();
+        match Cli::from_arg_matches(&matches) {
+            Ok(cli) => cli,
+            Err(e) => e.format(&mut cmd).exit(),
+        }
+    };
 
     // probe-or-start: short-lived query/start, no need to daemonize or init full logging.
     if let Some(Command::ProbeOrStart) = cli.command {

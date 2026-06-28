@@ -96,6 +96,8 @@ impl VersionInfo {
         if let Some(abi) = self.ffi_abi {
             s.push_str(&format!("\n  FFI ABI:    {abi}"));
         }
+        s.push_str(&format!("\n  rustc:      {}", self.rustc));
+        s.push_str(&format!("\n  built:      {}", self.build_timestamp));
         s
     }
 }
