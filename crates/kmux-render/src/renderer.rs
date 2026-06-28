@@ -48,7 +48,11 @@ pub struct RenderedPixels {
 enum Target {
     /// Render to an internal texture; `read_pixels` copies it out.
     Offscreen { texture: wgpu::Texture },
-    /// Render to and present a swapchain surface (no readback).
+    /// Render to and present a swapchain surface (no readback). Only ever
+    /// constructed by the macOS `CAMetalLayer` path (`new_for_metal_layer`); on
+    /// other platforms the GTK client uses the offscreen route, so the variant
+    /// is intentionally never built there (its match arms stay for one code path).
+    #[cfg_attr(not(target_os = "macos"), allow(dead_code))]
     Surface {
         surface: wgpu::Surface<'static>,
         config: wgpu::SurfaceConfiguration,
@@ -154,9 +158,9 @@ impl TerminalRenderer {
             // this constructor; keep the signature (uniffi exports it across
             // platforms) but bail rather than reference the Apple-only variant.
             let _ = (layer_ptr, width, height, scale, appearance, palette);
-            return Err(RenderError::Surface(
+            Err(RenderError::Surface(
                 "CAMetalLayer surface is only available on macOS".to_string(),
-            ));
+            ))
         }
         #[cfg(target_os = "macos")]
         {
