@@ -218,16 +218,29 @@ fn main() -> anyhow::Result<()> {
             // the root cause of `kmux daemon restart` failing under disk
             // pressure. See `log_writer`.
             tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::from_default_env().add_directive("kmuxd=info".parse()?))
+                .with_env_filter(
+                    EnvFilter::from_default_env()
+                        .add_directive("kmuxd=info".parse()?)
+                        // Surface forwarded libghostty-vt diagnostics — notably
+                        // unknown control sequences (issue #187).
+                        .add_directive("kmux::vt=warn".parse()?),
+                )
                 .with_writer(log_writer::ResilientWriter::new(file))
                 .init();
         }
         Err(_) => {
             tracing_subscriber::fmt()
-                .with_env_filter(EnvFilter::from_default_env().add_directive("kmuxd=info".parse()?))
+                .with_env_filter(
+                    EnvFilter::from_default_env()
+                        .add_directive("kmuxd=info".parse()?)
+                        .add_directive("kmux::vt=warn".parse()?),
+                )
                 .init();
         }
     }
+    // Route libghostty-vt's own diagnostics (unknown control sequences, …) into
+    // the daemon log now that tracing is up (issue #187).
+    backend::install_vt_log_forwarding();
     tracing::info!(
         instance_id = %instance_id,
         version = concat!(

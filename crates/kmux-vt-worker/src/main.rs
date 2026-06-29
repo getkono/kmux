@@ -58,6 +58,11 @@ fn main() -> anyhow::Result<()> {
         )
         .init();
 
+    // Route libghostty-vt's own diagnostics (unknown control sequences, …) into
+    // the worker's stderr, which the daemon captures (issue #187). The default
+    // `warn` filter already passes the `kmux::vt` target.
+    kmux_vt_core::backend::install_vt_log_forwarding();
+
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()

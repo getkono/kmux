@@ -9,8 +9,10 @@ mod control_event;
 pub mod ghostty;
 #[cfg(test)]
 pub mod mock;
+mod vt_log;
 
 pub use control_event::ControlEvent;
+pub use vt_log::install_vt_log_forwarding;
 
 /// Default maximum scrollback lines retained by the terminal emulator.
 pub const DEFAULT_SCROLLBACK: usize = 50_000;
