@@ -38,7 +38,7 @@ pub async fn tail_local_log(
     file.read_to_end(&mut buf).await?;
 
     let start = match lines {
-        Some(n) => tail_offset(&buf, n),
+        Some(n) => kmux_protocol::log_tail::last_n_lines_offset(&buf, n),
         None => 0,
     };
     let mut stdout = io::stdout();
@@ -59,63 +59,4 @@ pub async fn tail_local_log(
         }
     }
     Ok(())
-}
-
-/// Byte offset where the last `n` lines of `buf` begin.
-///
-/// Returns 0 when `buf` holds `n` lines or fewer. A single trailing newline is
-/// ignored so "last 1 line" is the final non-empty line, not the empty string
-/// after it.
-fn tail_offset(buf: &[u8], n: usize) -> usize {
-    if n == 0 {
-        return buf.len();
-    }
-    let end = if buf.last() == Some(&b'\n') {
-        buf.len() - 1
-    } else {
-        buf.len()
-    };
-    let mut count = 0;
-    let mut i = end;
-    while i > 0 {
-        if buf[i - 1] == b'\n' {
-            count += 1;
-            if count == n {
-                return i;
-            }
-        }
-        i -= 1;
-    }
-    0
-}
-
-#[cfg(test)]
-mod tests {
-    use super::tail_offset;
-
-    #[test]
-    fn tail_offset_trailing_newline() {
-        let buf = b"a\nb\nc\n";
-        assert_eq!(&buf[tail_offset(buf, 2)..], b"b\nc\n");
-        assert_eq!(&buf[tail_offset(buf, 1)..], b"c\n");
-    }
-
-    #[test]
-    fn tail_offset_no_trailing_newline() {
-        let buf = b"a\nb\nc";
-        assert_eq!(&buf[tail_offset(buf, 2)..], b"b\nc");
-        assert_eq!(&buf[tail_offset(buf, 1)..], b"c");
-    }
-
-    #[test]
-    fn tail_offset_more_than_available_returns_whole_buffer() {
-        let buf = b"a\nb\n";
-        assert_eq!(tail_offset(buf, 10), 0);
-    }
-
-    #[test]
-    fn tail_offset_edge_cases() {
-        assert_eq!(tail_offset(b"", 5), 0);
-        assert_eq!(tail_offset(b"abc\n", 0), 4); // -n 0 prints nothing
-    }
 }

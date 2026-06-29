@@ -311,6 +311,9 @@ pub enum DaemonAction {
     /// Stop then restart the daemon
     Restart,
     /// Print daemon log file (use -f/--follow to stream new lines)
+    ///
+    /// With `--server`, fetches the *remote* daemon's log over the data plane
+    /// (issue #187); without it, reads the local daemon log off disk.
     Logs {
         /// Follow new log output (like tail -f)
         #[arg(short, long)]
@@ -318,6 +321,13 @@ pub enum DaemonAction {
         /// Show only the last N lines (quick sanity check); omit to print all
         #[arg(short = 'n', long, value_name = "N")]
         lines: Option<usize>,
+        /// Read a remote daemon's log: `[user@]host[:ssh-port]` or a
+        /// `hosts.toml` alias. Omit to read the local daemon log off disk.
+        #[arg(long, add = ArgValueCandidates::new(crate::completion::server_candidates))]
+        server: Option<String>,
+        /// Override the SSH port for the target server.
+        #[arg(long)]
+        ssh_port: Option<u16>,
     },
     /// List sessions and their active connections
     Sessions {

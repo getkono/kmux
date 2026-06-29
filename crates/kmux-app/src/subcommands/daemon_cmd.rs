@@ -187,18 +187,81 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
             }
         }
 
-        DaemonAction::Logs { follow, lines } => {
-            let log_path = kmux_protocol::dirs::daemon_log_path()?;
-            super::logs::tail_local_log(
-                &log_path,
-                lines,
-                follow,
-                "Has the daemon been run at least once?",
-            )
-            .await?;
-        }
+        DaemonAction::Logs {
+            follow,
+            lines,
+            server,
+            ssh_port,
+        } => match server {
+            // Remote daemon: fetch its log over the data plane (issue #187).
+            Some(server) => fetch_remote_logs(&server, ssh_port, lines, follow).await?,
+            // Local daemon: read the log file straight off disk.
+            None => {
+                let log_path = kmux_protocol::dirs::daemon_log_path()?;
+                super::logs::tail_local_log(
+                    &log_path,
+                    lines,
+                    follow,
+                    "Has the daemon been run at least once?",
+                )
+                .await?;
+            }
+        },
     }
     Ok(())
+}
+
+/// Fetch (and optionally follow) a remote daemon's log over the data plane
+/// (issue #187): negotiate the connection, authenticate, send `FetchLogs`, then
+/// write each `LogChunk` to stdout until `LogEnd` — or indefinitely under
+/// `follow`. Mirrors the connect+auth flow of the other headless subcommands
+/// (`ls`/`ps`), reusing `resolve_connection` + `authenticate`.
+async fn fetch_remote_logs(
+    server: &str,
+    ssh_port: Option<u16>,
+    lines: Option<usize>,
+    follow: bool,
+) -> anyhow::Result<()> {
+    use kmux_protocol::messages::{ClientMessage, ServerMessage};
+    use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
+    use std::io::Write;
+    use tokio::net::TcpStream;
+
+    let conn = super::resolve_connection(Some(server), ssh_port).await?;
+    let tcp_port = conn.tcp_port.unwrap_or(conn.port);
+    let stream = TcpStream::connect(format!("{}:{}", conn.host, tcp_port))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to {}:{}: {e}", conn.host, tcp_port))?;
+    let (mut read_half, mut write_half) = stream.into_split();
+
+    super::authenticate(&mut read_half, &mut write_half, conn.token).await?;
+
+    const REQ: u64 = 1;
+    write_frame(
+        &mut write_half,
+        &encode_client(&ClientMessage::FetchLogs {
+            request_id: REQ,
+            lines: lines.map(|n| n as u32),
+            follow,
+        })?,
+    )
+    .await?;
+
+    let mut stdout = std::io::stdout();
+    loop {
+        let data = read_frame(&mut read_half)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("connection closed before the log stream ended"))?;
+        match decode_server(&data)? {
+            ServerMessage::LogChunk { request_id, data } if request_id == REQ => {
+                stdout.write_all(&data)?;
+                stdout.flush()?;
+            }
+            ServerMessage::LogEnd { request_id } if request_id == REQ => return Ok(()),
+            ServerMessage::Error { message, .. } => anyhow::bail!("{message}"),
+            _ => continue,
+        }
+    }
 }
 
 /// Stop the local daemon, *proving* it exited rather than trusting its reply.

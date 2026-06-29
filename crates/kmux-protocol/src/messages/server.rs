@@ -324,6 +324,21 @@ pub enum ServerMessage {
     /// notification is surfaced by the GUI clients; this just confirms the
     /// request reached the owning daemon (an unknown pane yields `Error`).
     NotifyAccepted { request_id: RequestId },
+
+    /// A chunk of the daemon's log file, in reply to
+    /// [`super::client::ClientMessage::FetchLogs`] (issue #187). `data` is raw
+    /// log bytes (UTF-8 lines); the client writes them straight to stdout. The
+    /// daemon may send many of these — the initial dump in pieces, then one per
+    /// batch of appended bytes while `follow` is set.
+    LogChunk {
+        request_id: RequestId,
+        data: Vec<u8>,
+    },
+
+    /// Terminates a non-`follow` [`super::client::ClientMessage::FetchLogs`]
+    /// stream (issue #187): all `LogChunk`s for `request_id` have been sent. A
+    /// `follow` stream never sends this — it ends when the connection closes.
+    LogEnd { request_id: RequestId },
 }
 
 impl ServerMessage {
@@ -363,7 +378,9 @@ impl ServerMessage {
             | Self::ClientListResult { .. }
             | Self::ClientKicked { .. }
             | Self::SessionKicked { .. }
-            | Self::NotifyAccepted { .. } => MessageCategory::Control,
+            | Self::NotifyAccepted { .. }
+            | Self::LogChunk { .. }
+            | Self::LogEnd { .. } => MessageCategory::Control,
             Self::Lagged { .. } | Self::SyncReset { .. } | Self::GridDigest { .. } => {
                 MessageCategory::Sync
             }
