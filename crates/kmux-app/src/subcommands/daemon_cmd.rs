@@ -187,42 +187,81 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
             }
         }
 
-        DaemonAction::Logs { follow } => {
-            use std::io;
-
-            let log_path = kmux_protocol::dirs::daemon_log_path()?;
-            if !log_path.exists() {
-                eprintln!(
-                    "Log file not found: {}\nHas the daemon been run at least once?",
-                    log_path.display()
-                );
-                std::process::exit(1);
+        DaemonAction::Logs {
+            follow,
+            lines,
+            server,
+            ssh_port,
+        } => match server {
+            // Remote daemon: fetch its log over the data plane (issue #187).
+            Some(server) => fetch_remote_logs(&server, ssh_port, lines, follow).await?,
+            // Local daemon: read the log file straight off disk.
+            None => {
+                let log_path = kmux_protocol::dirs::daemon_log_path()?;
+                super::logs::tail_local_log(
+                    &log_path,
+                    lines,
+                    follow,
+                    "Has the daemon been run at least once?",
+                )
+                .await?;
             }
-
-            use tokio::io::{AsyncReadExt, AsyncSeekExt};
-            let mut file = tokio::fs::File::open(&log_path).await?;
-
-            // Print all existing content.
-            let mut buf = Vec::new();
-            file.read_to_end(&mut buf).await?;
-            io::Write::write_all(&mut io::stdout(), &buf)?;
-
-            if follow {
-                // Seek to end and poll for new bytes.
-                file.seek(std::io::SeekFrom::End(0)).await?;
-                let mut read_buf = vec![0u8; 4096];
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    let n = file.read(&mut read_buf).await?;
-                    if n > 0 {
-                        io::Write::write_all(&mut io::stdout(), &read_buf[..n])?;
-                        io::Write::flush(&mut io::stdout())?;
-                    }
-                }
-            }
-        }
+        },
     }
     Ok(())
+}
+
+/// Fetch (and optionally follow) a remote daemon's log over the data plane
+/// (issue #187): negotiate the connection, authenticate, send `FetchLogs`, then
+/// write each `LogChunk` to stdout until `LogEnd` — or indefinitely under
+/// `follow`. Mirrors the connect+auth flow of the other headless subcommands
+/// (`ls`/`ps`), reusing `resolve_connection` + `authenticate`.
+async fn fetch_remote_logs(
+    server: &str,
+    ssh_port: Option<u16>,
+    lines: Option<usize>,
+    follow: bool,
+) -> anyhow::Result<()> {
+    use kmux_protocol::messages::{ClientMessage, ServerMessage};
+    use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
+    use std::io::Write;
+    use tokio::net::TcpStream;
+
+    let conn = super::resolve_connection(Some(server), ssh_port).await?;
+    let tcp_port = conn.tcp_port.unwrap_or(conn.port);
+    let stream = TcpStream::connect(format!("{}:{}", conn.host, tcp_port))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to {}:{}: {e}", conn.host, tcp_port))?;
+    let (mut read_half, mut write_half) = stream.into_split();
+
+    super::authenticate(&mut read_half, &mut write_half, conn.token).await?;
+
+    const REQ: u64 = 1;
+    write_frame(
+        &mut write_half,
+        &encode_client(&ClientMessage::FetchLogs {
+            request_id: REQ,
+            lines: lines.map(|n| n as u32),
+            follow,
+        })?,
+    )
+    .await?;
+
+    let mut stdout = std::io::stdout();
+    loop {
+        let data = read_frame(&mut read_half)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("connection closed before the log stream ended"))?;
+        match decode_server(&data)? {
+            ServerMessage::LogChunk { request_id, data } if request_id == REQ => {
+                stdout.write_all(&data)?;
+                stdout.flush()?;
+            }
+            ServerMessage::LogEnd { request_id } if request_id == REQ => return Ok(()),
+            ServerMessage::Error { message, .. } => anyhow::bail!("{message}"),
+            _ => continue,
+        }
+    }
 }
 
 /// Stop the local daemon, *proving* it exited rather than trusting its reply.

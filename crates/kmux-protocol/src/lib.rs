@@ -5,6 +5,7 @@ pub mod compat;
 pub mod control_rpc;
 pub mod dirs;
 pub mod endpoint;
+pub mod log_tail;
 pub mod messages;
 pub mod trace;
 pub mod transport;

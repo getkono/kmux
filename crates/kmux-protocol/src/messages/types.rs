@@ -122,7 +122,12 @@ impl TransportKind {
 ///   daemon records them per connection so `ClientInfo` (hence `kmux clients`)
 ///   and the new `kmux client status` surface client↔daemon build skew that a
 ///   matching protocol version alone cannot.
-pub const PROTOCOL_VERSION: u32 = 37;
+/// - **38**: remote daemon logs (issue #187). New `ClientMessage::FetchLogs`
+///   asks the daemon to stream its own log file over the data plane; the daemon
+///   replies with one or more `ServerMessage::LogChunk` and a terminating
+///   `ServerMessage::LogEnd` (or streams chunks indefinitely under `follow`), so
+///   `kmux daemon logs --server <host>` works across machines.
+pub const PROTOCOL_VERSION: u32 = 38;
 
 /// Wire compression algorithm negotiated for a connection.
 ///

@@ -66,6 +66,12 @@ These are strictly-typed config/CLI, not environment variables.
   GUI showing that session; clicking it refocuses the window + pane (issue #169).
   Reads `KMUX_PANE`/`KMUX_SESSION`; wired to Claude Code's `Stop`/`Notification`
   hooks. See [docs/architecture-claude-integration.md](docs/architecture-claude-integration.md).
+- `kmux daemon logs` / `kmux client logs` — print a process log; `-n N` shows the
+  last N lines, `-f/--follow` tails. `kmux daemon logs --server <host>` fetches a
+  *remote* daemon's log over the data plane (issue #187); the local form and
+  `client logs` read the file off disk. Unknown VT control sequences are logged
+  here under the `kmux::vt` target.
+  See [docs/architecture-vt-sequences.md](docs/architecture-vt-sequences.md).
 - `kmux debug paths` — print the active profile's log/state/runtime paths.
   Debug builds isolate state under `kmux-debug/`.
   See [docs/profile-isolation.md](docs/profile-isolation.md).

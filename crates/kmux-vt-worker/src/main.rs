@@ -34,7 +34,9 @@ use kmux_pty::PtyProcess;
 use kmux_pty::config::WindowSize;
 use kmux_pty::process::ExitStatus;
 use kmux_pty::session::{PtyReader, PtySession, PtyWriter};
-use kmux_vt_core::backend::{BackendConfig, BackendEventSink, BackendSize, CapabilityHandles};
+use kmux_vt_core::backend::{
+    BackendConfig, BackendEventSink, BackendSize, CapabilityHandles, ControlEvent,
+};
 use kmux_vt_core::diff_engine::DiffResult;
 use kmux_vt_core::term_state::{TermState, new_term_state};
 use kmux_worker_protocol::{
@@ -55,6 +57,11 @@ fn main() -> anyhow::Result<()> {
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
         .init();
+
+    // Route libghostty-vt's own diagnostics (unknown control sequences, …) into
+    // the worker's stderr, which the daemon captures (issue #187). The default
+    // `warn` filter already passes the `kmux::vt` target.
+    kmux_vt_core::backend::install_vt_log_forwarding();
 
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -437,21 +444,32 @@ struct WorkerEventSink {
 }
 
 impl BackendEventSink for WorkerEventSink {
-    fn on_title(&self, title: &str) {
-        let _ = self.events_tx.send(WorkerEvent::Title {
-            title: title.to_string(),
-        });
-    }
-
-    fn on_bell(&self) {
-        let _ = self.events_tx.send(WorkerEvent::Bell);
-    }
-
-    fn on_osc52_copy(&self, selection: &str, base64_data: &str) {
-        let _ = self.events_tx.send(WorkerEvent::Osc52 {
-            selection: selection.to_string(),
-            base64_data: base64_data.to_string(),
-        });
+    // The worker's single dispatch point for kmux's special VT sequences (issue
+    // #187), mirroring the daemon's `PaneEventSink`. See
+    // `kmux_vt_core::backend::ControlEvent` for the catalog.
+    fn on_control_event(&self, event: ControlEvent<'_>) {
+        match event {
+            ControlEvent::Title(title) => {
+                let _ = self.events_tx.send(WorkerEvent::Title {
+                    title: title.to_string(),
+                });
+            }
+            ControlEvent::Bell => {
+                let _ = self.events_tx.send(WorkerEvent::Bell);
+            }
+            ControlEvent::Osc52Copy {
+                selection,
+                base64_data,
+            } => {
+                let _ = self.events_tx.send(WorkerEvent::Osc52 {
+                    selection: selection.to_string(),
+                    base64_data: base64_data.to_string(),
+                });
+            }
+            // The worker protocol has no frame for progress / hyperlinks, so the
+            // process-isolation path does not forward them (unchanged behaviour).
+            ControlEvent::Progress { .. } | ControlEvent::Hyperlink { .. } => {}
+        }
     }
 }
 

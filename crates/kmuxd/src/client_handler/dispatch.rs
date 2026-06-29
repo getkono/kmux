@@ -522,6 +522,18 @@ pub async fn handle_message<A: PaneAttacher>(
             state.send(ServerMessage::ProcessOverviewResult { request_id, panes });
         }
 
+        // Stream this daemon's own log file back to the client (issue #187), so
+        // `kmux daemon logs --server <host>` can read a remote daemon's log. The
+        // local form reads the file off disk; only the daemon log is reachable
+        // across machines, so there is no federated/peer-forwarded variant.
+        ClientMessage::FetchLogs {
+            request_id,
+            lines,
+            follow,
+        } => {
+            handle_fetch_logs(state, request_id, lines, follow).await;
+        }
+
         ClientMessage::PtyInput { pane_id, data } => {
             if state.app.is_federated_pane(&pane_id) {
                 state
@@ -881,6 +893,109 @@ pub async fn handle_message<A: PaneAttacher>(
     }
 
     true
+}
+
+/// Chunk size for streaming a log file to a client (issue #187): large enough
+/// that framing overhead is negligible, small enough to bound per-message memory.
+const LOG_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Answer a [`ClientMessage::FetchLogs`] (issue #187): stream this daemon's own
+/// log file to the client over the control channel.
+///
+/// Sends the existing content (trimmed to the last `lines` lines when set) as
+/// `LogChunk`s, then either a terminating `LogEnd` or — under `follow` — spawns a
+/// detached task that tails the file and keeps pushing `LogChunk`s until the
+/// connection's writer is gone (its `ctrl_tx` is closed). The follow task checks
+/// `ctrl_tx.is_closed()` each tick so a disconnect during an idle log never
+/// leaks the task.
+async fn handle_fetch_logs(
+    state: &SharedClientState,
+    request_id: u64,
+    lines: Option<u32>,
+    follow: bool,
+) {
+    use tokio::io::{AsyncReadExt, AsyncSeekExt};
+
+    let path = match kmux_protocol::dirs::daemon_log_path() {
+        Ok(p) => p,
+        Err(e) => {
+            state.error(
+                Some(request_id),
+                ErrorCode::InternalError,
+                format!("daemon log path unavailable: {e}"),
+            );
+            return;
+        }
+    };
+
+    let mut file = match tokio::fs::File::open(&path).await {
+        Ok(f) => f,
+        Err(e) => {
+            state.error(
+                Some(request_id),
+                ErrorCode::InternalError,
+                format!("daemon log not readable at {}: {e}", path.display()),
+            );
+            return;
+        }
+    };
+
+    let mut buf = Vec::new();
+    if let Err(e) = file.read_to_end(&mut buf).await {
+        state.error(
+            Some(request_id),
+            ErrorCode::InternalError,
+            format!("reading daemon log failed: {e}"),
+        );
+        return;
+    }
+
+    let start = match lines {
+        Some(n) => kmux_protocol::log_tail::last_n_lines_offset(&buf, n as usize),
+        None => 0,
+    };
+    for chunk in buf[start..].chunks(LOG_CHUNK_BYTES) {
+        state.send(ServerMessage::LogChunk {
+            request_id,
+            data: chunk.to_vec(),
+        });
+    }
+
+    if !follow {
+        state.send(ServerMessage::LogEnd { request_id });
+        return;
+    }
+
+    // Follow: tail appended bytes from the current end of file. `read_to_end`
+    // already left the cursor at EOF, but seek explicitly to be sure.
+    let ctrl_tx = state.ctrl_tx.clone();
+    tokio::spawn(async move {
+        if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
+            return;
+        }
+        let mut read_buf = vec![0u8; LOG_CHUNK_BYTES];
+        loop {
+            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+            if ctrl_tx.is_closed() {
+                return;
+            }
+            match file.read(&mut read_buf).await {
+                Ok(0) => continue,
+                Ok(n) => {
+                    if ctrl_tx
+                        .send(ServerMessage::LogChunk {
+                            request_id,
+                            data: read_buf[..n].to_vec(),
+                        })
+                        .is_err()
+                    {
+                        return;
+                    }
+                }
+                Err(_) => return,
+            }
+        }
+    });
 }
 
 /// Maximum number of directory entries returned in a single `DirectoryListing`,

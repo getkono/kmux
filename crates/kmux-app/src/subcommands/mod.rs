@@ -4,6 +4,7 @@ mod daemon_cmd;
 mod debug;
 mod dry_run;
 mod list;
+mod logs;
 mod notify;
 mod ps;
 pub mod render;

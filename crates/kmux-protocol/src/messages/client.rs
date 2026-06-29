@@ -382,6 +382,19 @@ pub enum ClientMessage {
         title: String,
         body: String,
     },
+
+    /// Ask the daemon to stream its own log file back over the data plane (issue
+    /// #187), so `kmux daemon logs --server <host>` can read a remote daemon's
+    /// log (the local log is read off disk instead). The daemon replies with one
+    /// or more [`super::server::ServerMessage::LogChunk`] carrying raw log bytes,
+    /// then [`super::server::ServerMessage::LogEnd`] — unless `follow` is set, in
+    /// which case it keeps streaming appended bytes until the connection closes.
+    /// `lines`, when set, limits the initial dump to the last N lines.
+    FetchLogs {
+        request_id: RequestId,
+        lines: Option<u32>,
+        follow: bool,
+    },
 }
 
 impl ClientMessage {
@@ -426,7 +439,8 @@ impl ClientMessage {
             | Self::ClosePeer { .. }
             | Self::ClientList { .. }
             | Self::KickClient { .. }
-            | Self::Notify { .. } => MessageCategory::Control,
+            | Self::Notify { .. }
+            | Self::FetchLogs { .. } => MessageCategory::Control,
             Self::Auth { .. } | Self::AuthProof { .. } | Self::ChannelReady => {
                 MessageCategory::Bootstrap
             }
@@ -488,6 +502,47 @@ mod tests {
                 connection_id: Some(ConnectionId(99)),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn fetch_logs_messages_roundtrip() {
+        // Client → server: the fetch request.
+        let req = ClientMessage::FetchLogs {
+            request_id: 5,
+            lines: Some(200),
+            follow: true,
+        };
+        match crate::decode_client(&crate::encode_client(&req).unwrap()).unwrap() {
+            ClientMessage::FetchLogs {
+                request_id,
+                lines,
+                follow,
+            } => {
+                assert_eq!(request_id, 5);
+                assert_eq!(lines, Some(200));
+                assert!(follow);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Server → client: a chunk then the terminator.
+        let chunk = ServerMessage::LogChunk {
+            request_id: 5,
+            data: b"a log line\n".to_vec(),
+        };
+        match crate::decode_server(&crate::encode_server(&chunk).unwrap()).unwrap() {
+            ServerMessage::LogChunk { request_id, data } => {
+                assert_eq!(request_id, 5);
+                assert_eq!(data, b"a log line\n");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let end = ServerMessage::LogEnd { request_id: 5 };
+        assert!(matches!(
+            crate::decode_server(&crate::encode_server(&end).unwrap()).unwrap(),
+            ServerMessage::LogEnd { request_id: 5 }
         ));
     }
 

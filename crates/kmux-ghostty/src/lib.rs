@@ -156,6 +156,72 @@ pub trait EventSink: Send + Sync + 'static {
 pub struct NullSink;
 impl EventSink for NullSink {}
 
+// ─── Diagnostic-log forwarding (issue #187) ────────────────────────────────────
+
+/// Severity of a libghostty-vt diagnostic line, mirroring Zig's
+/// `std.log.Level`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VtLogLevel {
+    Error,
+    Warn,
+    Info,
+    Debug,
+}
+
+/// A handler for libghostty-vt's own diagnostic output. Receives the severity,
+/// the log scope name (e.g. `"stream"`), and the formatted message. Borrowed for
+/// the call only — copy anything you keep, and do not block.
+pub type VtLogHandler = fn(level: VtLogLevel, scope: &str, msg: &str);
+
+static VT_LOG_HANDLER: std::sync::OnceLock<VtLogHandler> = std::sync::OnceLock::new();
+
+/// Install a handler for libghostty-vt's `std.log` output — notably its
+/// `unimplemented CSI/ESC/OSC action` warnings for control sequences it does not
+/// handle (issue #187). Set once per process at startup; later calls are
+/// ignored. The unsafe FFI registration stays here so callers deal only in safe
+/// `&str`.
+pub fn set_log_handler(handler: VtLogHandler) {
+    if VT_LOG_HANDLER.set(handler).is_err() {
+        return; // already installed
+    }
+    // SAFETY: `vt_log_trampoline` is a valid `extern "C"` fn for the lifetime of
+    // the process; the Zig side only invokes it synchronously with borrowed
+    // pointers it owns.
+    unsafe { sys::kmux_ghostty_set_log_callback(Some(vt_log_trampoline)) };
+}
+
+/// C trampoline handed to the Zig wrapper: converts the borrowed byte slices to
+/// `&str` and dispatches to the installed [`VtLogHandler`]. Must never panic
+/// across the FFI boundary, so it uses lossy UTF-8 and a poison-tolerant lock
+/// is not needed (no lock here).
+unsafe extern "C" fn vt_log_trampoline(
+    level: u8,
+    scope_ptr: *const u8,
+    scope_len: usize,
+    msg_ptr: *const u8,
+    msg_len: usize,
+) {
+    let Some(handler) = VT_LOG_HANDLER.get() else {
+        return;
+    };
+    if scope_ptr.is_null() || msg_ptr.is_null() {
+        return;
+    }
+    // SAFETY: the Zig side passes valid, non-null pointers to `len`-byte buffers
+    // that live for the duration of this call.
+    let scope = unsafe { core::slice::from_raw_parts(scope_ptr, scope_len) };
+    let msg = unsafe { core::slice::from_raw_parts(msg_ptr, msg_len) };
+    let scope = String::from_utf8_lossy(scope);
+    let msg = String::from_utf8_lossy(msg);
+    let level = match level {
+        0 => VtLogLevel::Error,
+        1 => VtLogLevel::Warn,
+        2 => VtLogLevel::Info,
+        _ => VtLogLevel::Debug,
+    };
+    handler(level, &scope, &msg);
+}
+
 #[derive(Debug, Error)]
 pub enum GhosttyError {
     #[error("allocation failed inside libkmux_ghostty")]

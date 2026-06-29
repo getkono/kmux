@@ -20,7 +20,7 @@ use core::ffi::c_void;
 /// ABI version expected by this Rust crate. The Zig wrapper exports the same
 /// constant via [`kmux_ghostty_abi_version`]. Mismatch is a build-time
 /// inconsistency — safe wrappers must panic on mismatch.
-pub const EXPECTED_ABI_VERSION: u32 = 4;
+pub const EXPECTED_ABI_VERSION: u32 = 5;
 
 // Result codes returned by the Zig wrapper. `OK` is 0; everything else is
 // a negative error code. Kept in sync with `src/wrapper.zig`.
@@ -85,6 +85,19 @@ pub const SHAPE_UNDERLINE: u8 = 1;
 pub const SHAPE_BAR: u8 = 2;
 pub const SHAPE_HOLLOW_BLOCK: u8 = 3;
 pub const SHAPE_HIDDEN: u8 = 4;
+
+/// C signature of the diagnostic-log sink installed via
+/// [`kmux_ghostty_set_log_callback`] (issue #187). `level` matches Zig's
+/// `std.log.Level` ordinal (0=err, 1=warn, 2=info, 3=debug); the `scope` and
+/// `msg` slices are borrowed for the duration of the call only — the callee
+/// must copy anything it retains.
+pub type KmuxLogCallback = unsafe extern "C" fn(
+    level: u8,
+    scope_ptr: *const u8,
+    scope_len: usize,
+    msg_ptr: *const u8,
+    msg_len: usize,
+);
 
 /// Opaque terminal handle. Layout is private to the Zig wrapper.
 #[repr(C)]
@@ -187,6 +200,11 @@ unsafe extern "C" {
     /// ABI version baked into `libkmux_ghostty.a` at build time. Safe wrappers
     /// panic on mismatch with [`EXPECTED_ABI_VERSION`].
     pub fn kmux_ghostty_abi_version() -> u32;
+
+    /// Install a process-global sink for libghostty-vt's own `std.log` output
+    /// (issue #187) — notably its `unimplemented CSI/ESC/OSC action` warnings.
+    /// Pass `None` to clear. Set once at startup, before any terminal is created.
+    pub fn kmux_ghostty_set_log_callback(cb: Option<KmuxLogCallback>);
 
     /// Construct a new terminal. On success writes the handle into `*out` and
     /// returns [`KMUX_OK`].
@@ -379,6 +397,61 @@ mod tests {
             )
         };
         assert_eq!(rc, ENC_INVALID_ENUM);
+    }
+
+    /// Issue #187's crux: prove libghostty-vt's own `unimplemented …` warnings
+    /// actually route through wrapper.zig's `std_options.logFn` to the installed
+    /// callback. This must run against the *linked library* (where wrapper.zig is
+    /// the root module) — `zig build test` uses the test runner as root and would
+    /// bypass `std_options`, so the check lives here on the Rust side.
+    #[test]
+    fn unimplemented_sequence_invokes_log_callback() {
+        use std::sync::Mutex;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        static FIRED: AtomicBool = AtomicBool::new(false);
+        static MSG: Mutex<String> = Mutex::new(String::new());
+
+        unsafe extern "C" fn cb(
+            _level: u8,
+            _scope_ptr: *const u8,
+            _scope_len: usize,
+            msg_ptr: *const u8,
+            msg_len: usize,
+        ) {
+            let bytes = unsafe { core::slice::from_raw_parts(msg_ptr, msg_len) };
+            *MSG.lock().unwrap() = String::from_utf8_lossy(bytes).into_owned();
+            FIRED.store(true, Ordering::SeqCst);
+        }
+
+        unsafe { kmux_ghostty_set_log_callback(Some(cb)) };
+
+        let size = KmuxSize {
+            rows: 4,
+            cols: 20,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let sink = KmuxEventSink::default();
+        let mut term: *mut kmux_ghostty_term = core::ptr::null_mut();
+        let rc = unsafe { kmux_ghostty_new(&size, 1000, &sink, &mut term) };
+        assert_eq!(rc, KMUX_OK);
+
+        // `CSI <space> A` — cursor-up with an intermediate byte, which libghostty
+        // logs as "ignoring unimplemented CSI A with intermediates" at warn.
+        let seq = b"\x1b[ A";
+        let rc = unsafe { kmux_ghostty_feed(term, seq.as_ptr(), seq.len()) };
+        assert_eq!(rc, KMUX_OK);
+
+        assert!(FIRED.load(Ordering::SeqCst), "log callback never fired");
+        assert!(
+            MSG.lock().unwrap().contains("unimplemented"),
+            "unexpected message: {:?}",
+            MSG.lock().unwrap()
+        );
+
+        unsafe { kmux_ghostty_free(term) };
+        unsafe { kmux_ghostty_set_log_callback(None) };
     }
 
     #[test]

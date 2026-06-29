@@ -847,6 +847,11 @@ impl SessionManager {
             // the `kmux notify` CLI's own read loop, not the streaming session
             // manager — ignore here for exhaustiveness.
             ServerMessage::NotifyAccepted { .. } => {}
+
+            // Replies to `ClientMessage::FetchLogs` (issue #187). Consumed by the
+            // `kmux daemon logs --server` CLI read loop, never by the GUI session
+            // manager — ignore here for exhaustiveness.
+            ServerMessage::LogChunk { .. } | ServerMessage::LogEnd { .. } => {}
         }
         events
     }

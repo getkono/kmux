@@ -15,7 +15,7 @@ use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
 use crate::app::ClientMap;
-use crate::backend::BackendEventSink;
+use crate::backend::{BackendEventSink, ControlEvent};
 use crate::diff_engine::DiffResult;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::TermState;
@@ -103,7 +103,7 @@ pub async fn session_diff_loop(
                     && name != last_fg_name
                 {
                     last_fg_name = name.clone();
-                    title_sink.on_title(&name);
+                    title_sink.on_control_event(ControlEvent::Title(&name));
                 }
             }
         }
