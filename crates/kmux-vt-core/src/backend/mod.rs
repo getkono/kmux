@@ -5,9 +5,12 @@ use kmux_protocol::messages::{
     CellState, CursorState, KeyEvent, ScrollbackLine, TermModes, TermSize,
 };
 
+mod control_event;
 pub mod ghostty;
 #[cfg(test)]
 pub mod mock;
+
+pub use control_event::ControlEvent;
 
 /// Default maximum scrollback lines retained by the terminal emulator.
 pub const DEFAULT_SCROLLBACK: usize = 50_000;
@@ -65,32 +68,20 @@ pub struct CapabilityHandles {
     pub kitty_keyboard: Arc<AtomicBool>,
 }
 
-/// Backend-to-host event channel.
+/// Backend-to-host event channel: the single dispatch point for every control
+/// sequence kmux gives special treatment (issue #187).
 ///
-/// Implementations **MUST NOT block** — this trait is called from the VT
-/// parser loop.  Any I/O should be pushed to an unbounded `mpsc` channel and
-/// drained from a separate task.
+/// Each consumer implements one method and `match`es on [`ControlEvent`], so the
+/// whole of kmux's special VT behaviour is auditable from two `match`es (the
+/// daemon relay and the isolated VT worker) plus the [`ControlEvent`] catalog.
+///
+/// Implementations **MUST NOT block** — this is called from the VT parser loop.
+/// Any I/O should be pushed to an unbounded `mpsc` channel and drained from a
+/// separate task.
 pub trait BackendEventSink: Send + Sync + 'static {
-    fn on_title(&self, _title: &str) {}
-    fn on_bell(&self) {}
-    /// Called when the backend processes an OSC 52 clipboard write.
-    /// `selection` is the normalized target ("c"/"p"/"s"/"0".."7") and
-    /// `base64_data` is the still-encoded payload. `PaneEventSink` broadcasts
-    /// this to clients, which decode and apply it at their clipboard leaf.
-    fn on_osc52_copy(&self, _selection: &str, _base64_data: &str) {}
-    /// Called when the backend processes an OSC 9;4 progress report. `state` is
-    /// the progress state; `progress` is `0..=100` or `None`. `PaneEventSink`
-    /// stores the latest value and broadcasts `PaneProgressChanged` to clients.
-    fn on_progress(
-        &self,
-        _state: kmux_protocol::messages::PaneProgressState,
-        _progress: Option<u8>,
-    ) {
-    }
-    // libghostty-vt also surfaces OSC 8 hyperlinks; no production sink consumes
-    // them yet, so the default implementation drops silently.
-    #[allow(dead_code)]
-    fn on_hyperlink(&self, _id: Option<&str>, _uri: &str) {}
+    /// Handle one intercepted control sequence. The default drops it, so a sink
+    /// only matches the variants it cares about.
+    fn on_control_event(&self, _event: ControlEvent<'_>) {}
 }
 
 /// A no-op event sink used in tests that do not need backend events.

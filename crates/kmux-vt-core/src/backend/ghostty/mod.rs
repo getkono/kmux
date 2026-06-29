@@ -12,7 +12,7 @@ use kmux_protocol::messages::{
     CellState, CursorState, KeyEvent as ProtoKeyEvent, PaneProgressState, ScrollbackLine, TermModes,
 };
 
-use crate::backend::{BackendConfig, BackendEventSink, BackendSize, TerminalBackend};
+use crate::backend::{BackendConfig, BackendEventSink, BackendSize, ControlEvent, TerminalBackend};
 
 /// Map the VT-layer progress state onto the wire enum used by the relay/clients.
 fn map_progress_state(state: ProgressState) -> PaneProgressState {
@@ -33,11 +33,11 @@ struct EventSinkAdapter(Arc<dyn BackendEventSink>);
 
 impl EventSink for EventSinkAdapter {
     fn on_title(&self, title: &str) {
-        self.0.on_title(title);
+        self.0.on_control_event(ControlEvent::Title(title));
     }
 
     fn on_bell(&self) {
-        self.0.on_bell();
+        self.0.on_control_event(ControlEvent::Bell);
     }
 
     fn on_osc52(&self, selection: u8, base64: &[u8]) {
@@ -62,17 +62,22 @@ impl EventSink for EventSinkAdapter {
         // `base64` is the still-encoded OSC 52 payload. Decoding is done
         // downstream (client-side) so the kmuxd just needs a printable copy.
         if let Ok(s) = std::str::from_utf8(base64) {
-            self.0.on_osc52_copy(sel, s);
+            self.0.on_control_event(ControlEvent::Osc52Copy {
+                selection: sel,
+                base64_data: s,
+            });
         }
     }
 
     fn on_hyperlink(&self, id: Option<&str>, uri: &str) {
-        self.0.on_hyperlink(id, uri);
+        self.0.on_control_event(ControlEvent::Hyperlink { id, uri });
     }
 
     fn on_progress(&self, report: ProgressReport) {
-        self.0
-            .on_progress(map_progress_state(report.state), report.progress);
+        self.0.on_control_event(ControlEvent::Progress {
+            state: map_progress_state(report.state),
+            progress: report.progress,
+        });
     }
 }
 
@@ -145,7 +150,7 @@ impl TerminalBackend for GhosttyBackend {
             && title != self.last_title
         {
             self.last_title = title.clone();
-            self.events.on_title(&title);
+            self.events.on_control_event(ControlEvent::Title(&title));
         }
         // Same cold-attach rationale for OSC 9;4 progress: a script can emit it
         // before any client subscribes. PaneEventSink dedups, so the push
@@ -153,8 +158,10 @@ impl TerminalBackend for GhosttyBackend {
         let progress = self.term.progress();
         if progress != self.last_progress {
             self.last_progress = progress;
-            self.events
-                .on_progress(map_progress_state(progress.state), progress.progress);
+            self.events.on_control_event(ControlEvent::Progress {
+                state: map_progress_state(progress.state),
+                progress: progress.progress,
+            });
         }
     }
 
@@ -832,8 +839,10 @@ mod tests {
     fn event_sink_receives_title() {
         struct TitleCapture(Mutex<Vec<String>>);
         impl BackendEventSink for TitleCapture {
-            fn on_title(&self, title: &str) {
-                self.0.lock().unwrap().push(title.to_string());
+            fn on_control_event(&self, event: ControlEvent<'_>) {
+                if let ControlEvent::Title(title) = event {
+                    self.0.lock().unwrap().push(title.to_string());
+                }
             }
         }
 
@@ -869,8 +878,10 @@ mod tests {
     fn event_sink_receives_progress() {
         struct ProgressCapture(Mutex<Vec<(PaneProgressState, Option<u8>)>>);
         impl BackendEventSink for ProgressCapture {
-            fn on_progress(&self, state: PaneProgressState, progress: Option<u8>) {
-                self.0.lock().unwrap().push((state, progress));
+            fn on_control_event(&self, event: ControlEvent<'_>) {
+                if let ControlEvent::Progress { state, progress } = event {
+                    self.0.lock().unwrap().push((state, progress));
+                }
             }
         }
 

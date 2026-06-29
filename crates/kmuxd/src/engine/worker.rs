@@ -36,7 +36,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::app::{ClientMap, PaneEventSink};
-use crate::backend::BackendEventSink;
+use crate::backend::{BackendEventSink, ControlEvent};
 use crate::diff_engine::DiffResult;
 use crate::relay::dispatch_diff_result;
 use crate::scrollback::DiffBuffer;
@@ -393,12 +393,21 @@ fn handle_event(
                 &snapshot_fn,
             );
         }
-        WorkerEvent::Title { title } => fanout.event_sink.on_title(&title),
-        WorkerEvent::Bell => fanout.event_sink.on_bell(),
+        // Re-emit worker → daemon events through the same single dispatch the
+        // in-process path uses (issue #187).
+        WorkerEvent::Title { title } => {
+            fanout
+                .event_sink
+                .on_control_event(ControlEvent::Title(&title));
+        }
+        WorkerEvent::Bell => fanout.event_sink.on_control_event(ControlEvent::Bell),
         WorkerEvent::Osc52 {
             selection,
             base64_data,
-        } => fanout.event_sink.on_osc52_copy(&selection, &base64_data),
+        } => fanout.event_sink.on_control_event(ControlEvent::Osc52Copy {
+            selection: &selection,
+            base64_data: &base64_data,
+        }),
         WorkerEvent::ChildExit { status } => {
             fanout
                 .manager

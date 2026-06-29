@@ -131,6 +131,25 @@ impl PaneEventSink {
 }
 
 impl crate::backend::BackendEventSink for PaneEventSink {
+    // The daemon's single dispatch point for kmux's special VT sequences (issue
+    // #187). Every special behaviour the daemon performs lives in this `match`;
+    // see `kmux_vt_core::backend::ControlEvent` for the catalog.
+    fn on_control_event(&self, event: crate::backend::ControlEvent<'_>) {
+        use crate::backend::ControlEvent;
+        match event {
+            ControlEvent::Title(title) => self.on_title(title),
+            ControlEvent::Osc52Copy {
+                selection,
+                base64_data,
+            } => self.on_osc52_copy(selection, base64_data),
+            ControlEvent::Progress { state, progress } => self.on_progress(state, progress),
+            // Parsed but no client-facing wire event consumes them yet.
+            ControlEvent::Bell | ControlEvent::Hyperlink { .. } => {}
+        }
+    }
+}
+
+impl PaneEventSink {
     fn on_title(&self, title: &str) {
         {
             let mut current = self.title.lock().unwrap();
@@ -1076,7 +1095,7 @@ mod tests {
         use kmux_protocol::messages::{ServerMessage, SessionEventMsg};
         use tokio::sync::broadcast;
 
-        use crate::backend::BackendEventSink;
+        use crate::backend::{BackendEventSink, ControlEvent};
 
         let (tx, mut rx) = broadcast::channel(8);
         let sink = super::PaneEventSink::new(
@@ -1086,7 +1105,10 @@ mod tests {
             tx,
         );
 
-        sink.on_osc52_copy("c", "aGVsbG8=");
+        sink.on_control_event(ControlEvent::Osc52Copy {
+            selection: "c",
+            base64_data: "aGVsbG8=",
+        });
 
         match rx.try_recv().expect("event broadcast") {
             ServerMessage::Event {
