@@ -1,4 +1,4 @@
-use kmux_protocol::messages::{CellState, CursorState, TermModes};
+use kmux_protocol::messages::{CellState, CursorState, ScrollbackLine, TermModes};
 
 use super::{BackendConfig, BackendSize, TerminalBackend};
 
@@ -98,12 +98,12 @@ impl TerminalBackend for MockBackend {
         self.history_len
     }
 
-    fn read_history_lines(&self, start: usize, count: usize, _cols: usize) -> Vec<Vec<CellState>> {
+    fn read_history_lines(&self, start: usize, count: usize, _cols: usize) -> Vec<ScrollbackLine> {
         self.history_lines
             .iter()
             .skip(start)
             .take(count)
-            .cloned()
+            .map(|line| ScrollbackLine::from(line.as_slice()))
             .collect()
     }
 }

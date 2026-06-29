@@ -21,7 +21,9 @@ by `hk`; `mise install` (or `mise run setup`) installs them and initializes the
 
 ### Binaries
 
-- `kmux` — toolkit-free entrypoint (CLI + launcher): `cargo run -p kmux`
+- `kmux` — toolkit-free entrypoint (CLI + launcher): `cargo run -p kmux`.
+  `kmux open [user@host[:/path]]` is the explicit connect verb; the bare
+  positional `kmux <host/path>` stays as a shorthand fallback.
 - `kmuxd` — daemon: `cargo run -p kmuxd` (self-signed cert by default)
 - `kmux-gtk` (GTK4, Linux + macOS) and `kmux-swift` (native macOS) are the
   clients. See [docs/building-macos.md](docs/building-macos.md) and
@@ -49,12 +51,27 @@ These are strictly-typed config/CLI, not environment variables.
 - `kmux ls` / `kmux ps` (alias `top`) — list sessions / process overview.
   See [docs/architecture-process-overview.md](docs/architecture-process-overview.md).
 - `kmux clients [<session>]` / `kmux kick <session> <client>` — list the client
-  connections attached to sessions and detach one (issue #146).
+  connections attached to sessions (with FRONTEND/BUILD columns) and detach one
+  (issue #146). See [docs/architecture-identity.md](docs/architecture-identity.md).
+- `kmux client status|logs|stop|restart` — manage the local singleton GUI client
+  (mirror of `kmux daemon`); `status` warns on client↔daemon build/protocol skew.
+  See [docs/architecture-identity.md](docs/architecture-identity.md).
+- `kmux status [--format json]` — one health view across every kmux process:
+  daemon, GUI client, this CLI, and isolated per-pane VT workers, with skew
+  flagged via the shared `kmux-protocol::compat` SSoT. The scoped `daemon
+  status` / `client status` stay the detailed views. Exits non-zero when the
+  daemon is down or a blocking (protocol/profile) skew is present.
   See [docs/architecture-identity.md](docs/architecture-identity.md).
 - `kmux notify` — from inside a pane, raise a native desktop notification on the
   GUI showing that session; clicking it refocuses the window + pane (issue #169).
   Reads `KMUX_PANE`/`KMUX_SESSION`; wired to Claude Code's `Stop`/`Notification`
   hooks. See [docs/architecture-claude-integration.md](docs/architecture-claude-integration.md).
+- `kmux daemon logs` / `kmux client logs` — print a process log; `-n N` shows the
+  last N lines, `-f/--follow` tails. `kmux daemon logs --server <host>` fetches a
+  *remote* daemon's log over the data plane (issue #187); the local form and
+  `client logs` read the file off disk. Unknown VT control sequences are logged
+  here under the `kmux::vt` target.
+  See [docs/architecture-vt-sequences.md](docs/architecture-vt-sequences.md).
 - `kmux debug paths` — print the active profile's log/state/runtime paths.
   Debug builds isolate state under `kmux-debug/`.
   See [docs/profile-isolation.md](docs/profile-isolation.md).

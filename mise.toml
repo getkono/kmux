@@ -2,8 +2,13 @@
 # Pinned to ghostty v1.3.1's minimum_zig_version (build.zig.zon).
 zig = "0.15.2"
 # Pinned to an exact release (not floating "stable") for reproducible rustc +
-# rustfmt; mirrors rust-toolchain.toml. Bump deliberately.
-rust = "1.96.0"
+# rustfmt; mirrors rust-toolchain.toml. Bump deliberately. `profile = "default"`
+# pulls rustfmt + clippy from rustup's component set instead of leaning on
+# rust-toolchain.toml's `components`: that path re-resolved `rustfmt` to the
+# legacy `rustfmt-preview` component on a fresh in-repo `cargo install` and
+# collided with the already-present `cargo-fmt` ("detected conflict:
+# 'bin/cargo-fmt'"), which broke `mise install` (cargo-mutants/convco) in CI.
+rust = { version = "1.96.0", profile = "default" }
 # `mise run release` regenerates CHANGELOG.md from conventional commits via
 # git-cliff, and the release workflow shells out to `mise run package`. Pinning
 # both here means local dev and CI runners resolve identical versions.

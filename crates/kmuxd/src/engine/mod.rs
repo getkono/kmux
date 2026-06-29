@@ -20,7 +20,7 @@ mod worker;
 pub use in_process::InProcessEngine;
 pub use worker::{WorkerEngine, WorkerFanout};
 
-use kmux_protocol::messages::{CellState, GridSnapshot, KeyEvent, TermSize};
+use kmux_protocol::messages::{GridSnapshot, KeyEvent, ScrollbackLine, TermSize};
 use kmux_pty::error::Result;
 use tokio::task::JoinHandle;
 
@@ -59,7 +59,7 @@ impl PaneEngine {
 
     /// Snapshot the grid and read up to `max_lines` of scrollback history, for a
     /// persistence checkpoint.
-    pub fn checkpoint_grid(&self, max_lines: usize) -> (GridSnapshot, Vec<Vec<CellState>>) {
+    pub fn checkpoint_grid(&self, max_lines: usize) -> (GridSnapshot, Vec<ScrollbackLine>) {
         match self {
             Self::InProcess(e) => e.checkpoint_grid(max_lines),
             Self::Worker(e) => e.checkpoint_grid(max_lines),
@@ -67,7 +67,7 @@ impl PaneEngine {
     }
 
     /// Fetch a scrollback range as `(first_index, lines, history_total)`.
-    pub async fn fetch_history(&self, start: u64, count: u32) -> (u64, Vec<Vec<CellState>>, u64) {
+    pub async fn fetch_history(&self, start: u64, count: u32) -> (u64, Vec<ScrollbackLine>, u64) {
         match self {
             Self::InProcess(e) => e.mirror_range_and_total(start, count),
             Self::Worker(e) => e.mirror_range_and_total(start, count),
@@ -113,6 +113,14 @@ impl PaneEngine {
     /// Whether this pane runs in an isolated worker subprocess.
     pub fn is_worker(&self) -> bool {
         matches!(self, Self::Worker(_))
+    }
+
+    /// OS pid of the isolated worker subprocess, or `None` for an in-process pane.
+    pub fn worker_pid(&self) -> Option<u32> {
+        match self {
+            Self::InProcess(_) => None,
+            Self::Worker(e) => Some(e.child_pid()),
+        }
     }
 
     /// Abort the pane's relay task and swap in a no-op handle, returning the real

@@ -3,6 +3,7 @@ mod events;
 mod session;
 pub use dispatch::handle_message;
 pub use events::pty_event_to_msg;
+pub(crate) use session::MAX_WRITE_BATCH;
 pub use session::{build_attach_replay, run_client_session};
 
 use std::collections::HashMap;
@@ -12,7 +13,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use kmux_protocol::Compressor;
 use kmux_protocol::TransportKind;
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ConnectionId, ErrorCode, ServerMessage,
+    ClientCapabilities, ClientId, ConnectionId, ErrorCode, FrontendKind, ServerMessage,
 };
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -89,6 +90,12 @@ pub struct PendingAuth {
     pub username: String,
     pub capabilities: ClientCapabilities,
     pub connection_id: Option<ConnectionId>,
+    /// Client build identity from `Auth` (protocol 37), carried to
+    /// `register_client` once the signature is verified.
+    pub client_kind: FrontendKind,
+    pub client_git_sha: String,
+    pub client_git_dirty: bool,
+    pub client_build_profile: String,
 }
 
 /// Transport-independent state for a connected client.

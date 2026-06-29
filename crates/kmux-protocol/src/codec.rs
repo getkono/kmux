@@ -97,11 +97,28 @@ pub async fn write_frame<W: tokio::io::AsyncWriteExt + Unpin>(
 }
 
 /// Write a length-prefixed frame, compressing the payload when `comp` allows it
-/// and the result is actually smaller. Returns the number of bytes written to
-/// the wire (length prefix + tag + payload) so callers can account real
-/// bandwidth.
+/// and the result is actually smaller, then flush. Returns the number of bytes
+/// written to the wire (length prefix + tag + payload) so callers can account
+/// real bandwidth.
 #[cfg(feature = "framing")]
 pub async fn write_frame_compressed<W: tokio::io::AsyncWriteExt + Unpin>(
+    w: &mut W,
+    data: &[u8],
+    comp: Compressor,
+) -> Result<usize, ProtocolError> {
+    let n = write_frame_compressed_into(w, data, comp).await?;
+    w.flush().await?;
+    Ok(n)
+}
+
+/// Like [`write_frame_compressed`] but does NOT flush. For batching writers that
+/// drain several queued messages and issue a single [`flush`] afterwards,
+/// coalescing many small frames into far fewer TLS records / syscalls. The frame
+/// is written in full (header + payload) before returning, so a later flush — or
+/// a flush failure — can never tear a frame across the wire; the stream always
+/// contains a whole number of frames.
+#[cfg(feature = "framing")]
+pub async fn write_frame_compressed_into<W: tokio::io::AsyncWriteExt + Unpin>(
     w: &mut W,
     data: &[u8],
     comp: Compressor,
@@ -114,16 +131,35 @@ pub async fn write_frame_compressed<W: tokio::io::AsyncWriteExt + Unpin>(
         // Only keep the compressed form when it genuinely shrinks the frame;
         // otherwise the identity tag avoids ever growing past `data.len() + 1`.
         if compressed.len() < data.len() {
-            return write_tagged(w, FRAME_ZSTD, &compressed).await;
+            return write_tagged_into(w, FRAME_ZSTD, &compressed).await;
         }
     }
-    write_tagged(w, FRAME_RAW, data).await
+    write_tagged_into(w, FRAME_RAW, data).await
 }
 
-/// Write `[u32 len][u8 tag][payload]` where `len = payload.len() + 1`.
+/// Flush a writer after a batch of [`write_frame_compressed_into`] calls.
+#[cfg(feature = "framing")]
+pub async fn flush<W: tokio::io::AsyncWriteExt + Unpin>(w: &mut W) -> Result<(), ProtocolError> {
+    w.flush().await?;
+    Ok(())
+}
+
+/// Write `[u32 len][u8 tag][payload]` where `len = payload.len() + 1`, then flush.
 /// Returns the total bytes written to the wire.
 #[cfg(feature = "framing")]
 async fn write_tagged<W: tokio::io::AsyncWriteExt + Unpin>(
+    w: &mut W,
+    tag: u8,
+    payload: &[u8],
+) -> Result<usize, ProtocolError> {
+    let n = write_tagged_into(w, tag, payload).await?;
+    w.flush().await?;
+    Ok(n)
+}
+
+/// Write `[u32 len][u8 tag][payload]` without flushing.
+#[cfg(feature = "framing")]
+async fn write_tagged_into<W: tokio::io::AsyncWriteExt + Unpin>(
     w: &mut W,
     tag: u8,
     payload: &[u8],
@@ -142,7 +178,6 @@ async fn write_tagged<W: tokio::io::AsyncWriteExt + Unpin>(
     header[4] = tag;
     w.write_all(&header).await?;
     w.write_all(payload).await?;
-    w.flush().await?;
     Ok(4 + len as usize)
 }
 
@@ -220,6 +255,10 @@ mod tests {
             public_key: vec![1, 2, 3],
             hostname: "host".to_string(),
             username: "user".to_string(),
+            client_kind: FrontendKind::Cli,
+            client_git_sha: String::new(),
+            client_git_dirty: false,
+            client_build_profile: String::new(),
         };
         let bytes = encode_client(&msg).expect("encode");
         let decoded = decode_client(&bytes).expect("decode");
@@ -460,7 +499,7 @@ mod tests {
         };
         let msg = ServerMessage::TerminalSnapshot {
             pane_id: "eagle/0".to_string(),
-            snapshot,
+            snapshot: std::sync::Arc::new(snapshot),
             seqno: SequenceNo(99),
             sent_at_ms: 0,
         };
@@ -721,6 +760,68 @@ mod framing_tests {
 
         assert_eq!(got.len(), msgs.len());
         // `ServerMessage` is not `PartialEq`; compare by re-encoding.
+        for (sent, recv) in msgs.iter().zip(&got) {
+            assert_eq!(encode_server(sent).unwrap(), encode_server(recv).unwrap());
+        }
+    }
+
+    /// The batching writer contract: writing N frames with
+    /// `write_frame_compressed_into` followed by a single `flush` produces output
+    /// byte-identical to N flushing `write_frame_compressed` calls — batching only
+    /// moves flush boundaries, never the wire format — and the stream still
+    /// decodes back to the same messages.
+    #[tokio::test]
+    async fn batched_writes_are_byte_identical_to_per_frame() {
+        use crate::messages::ErrorCode;
+
+        let comp = Compressor::Zstd {
+            level: 3,
+            min_size: 256,
+        };
+        let msgs: Vec<ServerMessage> = (0..10)
+            .map(|i| {
+                if i % 2 == 0 {
+                    ServerMessage::Error {
+                        request_id: Some(i),
+                        code: ErrorCode::InternalError,
+                        message: "the quick brown fox ".repeat(40),
+                    }
+                } else {
+                    ServerMessage::Pong { seq: i }
+                }
+            })
+            .collect();
+
+        // One flush per frame (the pre-batching behaviour).
+        let mut individual = Vec::new();
+        for m in &msgs {
+            let bytes = encode_server(m).unwrap();
+            write_frame_compressed(&mut individual, &bytes, comp)
+                .await
+                .unwrap();
+        }
+
+        // Whole batch, one trailing flush.
+        let mut batched = Vec::new();
+        for m in &msgs {
+            let bytes = encode_server(m).unwrap();
+            write_frame_compressed_into(&mut batched, &bytes, comp)
+                .await
+                .unwrap();
+        }
+        flush(&mut batched).await.unwrap();
+
+        assert_eq!(
+            individual, batched,
+            "batching must not change the bytes on the wire"
+        );
+
+        let mut cursor = std::io::Cursor::new(batched);
+        let mut got = Vec::new();
+        while let Some(frame) = read_frame(&mut cursor).await.unwrap() {
+            got.push(decode_server(&frame).unwrap());
+        }
+        assert_eq!(got.len(), msgs.len());
         for (sent, recv) in msgs.iter().zip(&got) {
             assert_eq!(encode_server(sent).unwrap(), encode_server(recv).unwrap());
         }

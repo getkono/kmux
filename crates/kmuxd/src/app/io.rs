@@ -1,4 +1,4 @@
-use kmux_protocol::messages::{CellState, ClientId, InputMode, KeyEvent, TermSize};
+use kmux_protocol::messages::{ClientId, InputMode, KeyEvent, ScrollbackLine, TermSize};
 use kmux_pty::error::{KmuxError, Result};
 
 use crate::conversions::term_size_to_window;
@@ -172,7 +172,7 @@ impl ServerApp {
         pane_id: &str,
         start: u64,
         count: u32,
-    ) -> Result<(u64, Vec<Vec<CellState>>, u64)> {
+    ) -> Result<(u64, Vec<ScrollbackLine>, u64)> {
         let sessions = self.sessions.read().await;
         let relay = get_pane_relay(&sessions, pane_id)?;
         let (first_index, lines, history_total) = relay.engine.fetch_history(start, count).await;

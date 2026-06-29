@@ -1,8 +1,8 @@
 use super::category::MessageCategory;
 use super::key::KeyEvent;
 use super::session::{
-    AttentionKind, ClientCapabilities, ClientId, ConnectionId, LayoutScheme, PaneId, PeerId,
-    PeerTarget, RequestId, SequenceNo, SplitDir, TabIndex, TermSize, WordId,
+    AttentionKind, ClientCapabilities, ClientId, ConnectionId, FrontendKind, LayoutScheme, PaneId,
+    PeerId, PeerTarget, RequestId, SequenceNo, SplitDir, TabIndex, TermSize, WordId,
 };
 
 /// Messages sent from client -> server.
@@ -39,6 +39,21 @@ pub enum ClientMessage {
         /// per-connection label `username@hostname`.
         #[serde(default)]
         username: String,
+        /// Which frontend opened this connection (CLI vs GUI). (protocol 37)
+        #[serde(default)]
+        client_kind: FrontendKind,
+        /// Short git commit the client binary was built from. (protocol 37)
+        #[serde(default)]
+        client_git_sha: String,
+        /// Whether the client build had uncommitted changes. (protocol 37)
+        #[serde(default)]
+        client_git_dirty: bool,
+        /// Cargo profile of the client build (`"debug"`/`"release"`). The daemon
+        /// records all three so `kmux clients` / `kmux client status` can detect
+        /// a client whose build differs from the daemon's even when the protocol
+        /// version matches. (protocol 37)
+        #[serde(default)]
+        client_build_profile: String,
     },
 
     /// Second handshake message: the Ed25519 signature over the nonce the daemon
@@ -367,6 +382,19 @@ pub enum ClientMessage {
         title: String,
         body: String,
     },
+
+    /// Ask the daemon to stream its own log file back over the data plane (issue
+    /// #187), so `kmux daemon logs --server <host>` can read a remote daemon's
+    /// log (the local log is read off disk instead). The daemon replies with one
+    /// or more [`super::server::ServerMessage::LogChunk`] carrying raw log bytes,
+    /// then [`super::server::ServerMessage::LogEnd`] — unless `follow` is set, in
+    /// which case it keeps streaming appended bytes until the connection closes.
+    /// `lines`, when set, limits the initial dump to the last N lines.
+    FetchLogs {
+        request_id: RequestId,
+        lines: Option<u32>,
+        follow: bool,
+    },
 }
 
 impl ClientMessage {
@@ -411,7 +439,8 @@ impl ClientMessage {
             | Self::ClosePeer { .. }
             | Self::ClientList { .. }
             | Self::KickClient { .. }
-            | Self::Notify { .. } => MessageCategory::Control,
+            | Self::Notify { .. }
+            | Self::FetchLogs { .. } => MessageCategory::Control,
             Self::Auth { .. } | Self::AuthProof { .. } | Self::ChannelReady => {
                 MessageCategory::Bootstrap
             }
@@ -436,6 +465,10 @@ mod tests {
             public_key: Vec::new(),
             hostname: String::new(),
             username: String::new(),
+            client_kind: FrontendKind::Cli,
+            client_git_sha: String::new(),
+            client_git_dirty: false,
+            client_build_profile: String::new(),
         };
         let bytes = crate::encode_client(&msg).unwrap();
         let decoded = crate::decode_client(&bytes).unwrap();
@@ -469,6 +502,47 @@ mod tests {
                 connection_id: Some(ConnectionId(99)),
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn fetch_logs_messages_roundtrip() {
+        // Client → server: the fetch request.
+        let req = ClientMessage::FetchLogs {
+            request_id: 5,
+            lines: Some(200),
+            follow: true,
+        };
+        match crate::decode_client(&crate::encode_client(&req).unwrap()).unwrap() {
+            ClientMessage::FetchLogs {
+                request_id,
+                lines,
+                follow,
+            } => {
+                assert_eq!(request_id, 5);
+                assert_eq!(lines, Some(200));
+                assert!(follow);
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        // Server → client: a chunk then the terminator.
+        let chunk = ServerMessage::LogChunk {
+            request_id: 5,
+            data: b"a log line\n".to_vec(),
+        };
+        match crate::decode_server(&crate::encode_server(&chunk).unwrap()).unwrap() {
+            ServerMessage::LogChunk { request_id, data } => {
+                assert_eq!(request_id, 5);
+                assert_eq!(data, b"a log line\n");
+            }
+            other => panic!("unexpected: {other:?}"),
+        }
+
+        let end = ServerMessage::LogEnd { request_id: 5 };
+        assert!(matches!(
+            crate::decode_server(&crate::encode_server(&end).unwrap()).unwrap(),
+            ServerMessage::LogEnd { request_id: 5 }
         ));
     }
 
@@ -842,6 +916,10 @@ mod tests {
                     public_key: Vec::new(),
                     hostname: String::new(),
                     username: String::new(),
+                    client_kind: FrontendKind::Cli,
+                    client_git_sha: String::new(),
+                    client_git_dirty: false,
+                    client_build_profile: String::new(),
                 },
                 MessageCategory::Bootstrap,
             ),

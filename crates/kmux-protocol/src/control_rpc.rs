@@ -51,6 +51,12 @@ pub struct StatusResponse {
     pub protocol_version: u32,
     #[serde(default)]
     pub kmuxd_version: String,
+    /// Build fingerprint of the running daemon binary, `<sha>[-dirty]` — lets
+    /// `kmux daemon status` / `kmux client status` spot a daemon built from a
+    /// different commit than the CLI/GUI even when versions match. Empty when the
+    /// daemon predates this field.
+    #[serde(default)]
+    pub kmuxd_build: String,
     /// Cargo profile `kmuxd` was compiled with.
     ///
     /// `None` only when the peer predates this field — the client treats that
@@ -84,6 +90,38 @@ pub struct StopResponse {
 pub struct RestartResponse {
     pub status: String,
     pub handoff: bool,
+}
+
+/// JSON response to the `"connections"` control command: every live client
+/// connection the daemon holds, with its build identity (protocol 37).
+///
+/// Backs `kmux client status`, which has no session context and so cannot use
+/// the data-plane `ClientList` — it reads this straight off the control socket,
+/// the same local, no-data-plane-auth path `kmux daemon status` uses.
+#[derive(Serialize, Deserialize, Default)]
+pub struct ConnectionsResponse {
+    pub connections: Vec<ConnectionSummary>,
+}
+
+/// One live client connection in a [`ConnectionsResponse`].
+#[derive(Serialize, Deserialize, Clone)]
+pub struct ConnectionSummary {
+    /// Underlying connection id (survives transport switches).
+    pub connection_id: u64,
+    /// Daemon-assigned user-readable label `username@hostname[#N]`.
+    pub label: String,
+    /// Cryptographic machine/user identity: hex SHA-256 of the public key.
+    pub machine_id: String,
+    /// Frontend that opened the connection (`cli` / `gtk` / `swift`).
+    pub frontend: String,
+    /// Build fingerprint of the client binary, `<sha>[-dirty]`.
+    pub build: String,
+    /// Cargo profile of the client build (`"debug"` / `"release"`).
+    pub build_profile: String,
+    /// Human-readable transport name (`quic` / `tcp` / `uds`).
+    pub transport: String,
+    /// Seconds since the connection was registered.
+    pub uptime_secs: u64,
 }
 
 /// Per-pane metadata sent in [`HandoffMessage::Hello`].
@@ -185,6 +223,42 @@ pub struct ConnectionInfo {
     pub last_rtt_ms: Option<u64>,
 }
 
+/// JSON response to the `"workers"` control command: the daemon's session
+/// isolation mode and every pane currently running in an isolated
+/// `kmux-vt-worker` subprocess (issue #126). Empty `workers` in `in-process`
+/// mode. Backs `kmux status`.
+#[derive(Serialize, Deserialize, Default)]
+pub struct WorkersResponse {
+    /// `"process"` (per-pane isolation) or `"in-process"` (the default).
+    #[serde(default)]
+    pub isolation_mode: String,
+    pub workers: Vec<WorkerInfo>,
+}
+
+/// One isolated pane worker in a [`WorkersResponse`].
+#[derive(Serialize, Deserialize, Clone)]
+pub struct WorkerInfo {
+    /// `{word_id}/{pane_index}` — the registry key shared with the checkpoint.
+    pub pane_id: String,
+    /// The session word-id the pane belongs to.
+    pub session_word_id: String,
+    /// The pane's index within its session.
+    pub pane_index: u32,
+    /// OS pid of the `kmux-vt-worker` subprocess.
+    pub worker_pid: u32,
+    /// Pane lifecycle status (`"running"` / `"exited"`), from the shell's state.
+    pub status: String,
+    /// Worker respawns recorded within the crash-loop window (60s).
+    #[serde(default)]
+    pub restart_count: usize,
+    /// Milliseconds since the most recent worker respawn (None if never).
+    #[serde(default)]
+    pub last_restart_ago_ms: Option<u64>,
+    /// Whether the worker may still be respawned (restart_count < the cap).
+    #[serde(default)]
+    pub within_restart_budget: bool,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,6 +287,7 @@ mod tests {
             session_count: 3,
             protocol_version: 23,
             kmuxd_version: "0.2.0".into(),
+            kmuxd_build: "abc1234".into(),
             build_profile: None,
             endpoints: vec![EndpointEntry {
                 kind: "quic".into(),
@@ -254,6 +329,49 @@ mod tests {
         assert_eq!(resp.kmuxd_version, "");
         assert!(resp.build_profile.is_none());
         assert!(resp.endpoints.is_empty());
+    }
+
+    #[test]
+    fn workers_response_round_trips_through_json() {
+        let resp = WorkersResponse {
+            isolation_mode: "process".into(),
+            workers: vec![WorkerInfo {
+                pane_id: "eagle/1".into(),
+                session_word_id: "eagle".into(),
+                pane_index: 1,
+                worker_pid: 4242,
+                status: "running".into(),
+                restart_count: 2,
+                last_restart_ago_ms: Some(1500),
+                within_restart_budget: true,
+            }],
+        };
+
+        let json = serde_json::to_string(&resp).expect("serialize");
+        let back: WorkersResponse = serde_json::from_str(&json).expect("deserialize");
+
+        assert_eq!(back.isolation_mode, "process");
+        assert_eq!(back.workers.len(), 1);
+        let w = &back.workers[0];
+        assert_eq!(w.pane_id, "eagle/1");
+        assert_eq!(w.session_word_id, "eagle");
+        assert_eq!(w.pane_index, 1);
+        assert_eq!(w.worker_pid, 4242);
+        assert_eq!(w.status, "running");
+        assert_eq!(w.restart_count, 2);
+        assert_eq!(w.last_restart_ago_ms, Some(1500));
+        assert!(w.within_restart_budget);
+    }
+
+    #[test]
+    fn workers_response_defaults_to_empty_for_an_older_daemon() {
+        // A daemon predating worker reporting answers an unknown command by
+        // closing — but if a future field is dropped, the `#[serde(default)]`s
+        // must still yield an empty, in-process-looking report.
+        let minimal = r#"{"workers":[]}"#;
+        let resp: WorkersResponse = serde_json::from_str(minimal).expect("deserialize minimal");
+        assert_eq!(resp.isolation_mode, "");
+        assert!(resp.workers.is_empty());
     }
 
     #[test]

@@ -59,12 +59,25 @@ After this call the process is a daemon with fresh file descriptors.
 Tracing is initialized after daemonization (so the child's fresh fds are used).
 
 ```
-Attempt to open $XDG_RUNTIME_DIR/kmux/kmuxd.log (append mode)
-  Success → log to file
+Attempt to open $XDG_STATE_HOME/kmux[-debug]/daemon.log (append mode)
+  Success → log to file (via ResilientWriter)
   Failure → log to stderr
 Log level: RUST_LOG env var, default "kmuxd=info"
 Each run tagged with a random 4-byte instance_id for log correlation
 ```
+
+The file writer is a `ResilientWriter` (`log_writer.rs`), **not** the stock
+`Mutex<File>`: a write that fails on a full disk is swallowed and the lock can
+never poison. This matters because logging is best-effort — without it, an
+ENOSPC write followed by a panic-while-holding-the-guard poisons the mutex, and
+every subsequent log call then panics, cascading across the tokio workers and
+killing the daemon. That was the observed cause of `kmux daemon restart` failing
+on a near-full disk: the graceful-handoff successor booted, could not write its
+log, and died. Two related diagnosability fixes ship alongside it: every
+daemon-spawn path (auto-spawn, `probe-or-start`, the handoff successor) now
+captures the child's pre-daemonize stdout/stderr in `kmuxd-boot.log`, and
+`kmux daemon restart` prints that log's tail when it times out instead of a bare
+"timed out" with no cause.
 
 ---
 
@@ -615,6 +628,35 @@ mechanics (in-place binary swap, why the outgoing daemon must
 `shutdown_background()` to actually exit) and the full QA matrix are in
 `docs/daemon-handoff.md` §"Upgrading a running daemon" and
 `docs/qa-daemon-upgrade.md`.
+
+### 14.2 Client-side `kmux daemon stop`: verified shutdown & force-kill
+
+The daemon's `stop` control handler replies `{"status":"ok"}` **before** the
+process has finished §14's shutdown sequence, so the reply is a receipt, not
+proof of exit. A daemon wedged mid-shutdown (e.g. a checkpoint write blocked on a
+full disk) used to make `kmux daemon stop` print "Daemon stopped" anyway — a
+false positive. The client (`kmux-app::subcommands::daemon_cmd::run_daemon_stop`,
+on primitives in `kmux-connect::daemon`) now *verifies* the outcome:
+
+1. **Responsive** (`query_daemon()` returns a live status): print a summary —
+   each session's pane count and attached clients (from the `sessions` control
+   RPC) enriched best-effort with the running processes per pane (a short,
+   time-boxed data-plane `ProcessOverview` query that reuses the existing
+   `DaemonStatus` so it can never *spawn* a daemon) — then confirm, send `stop`,
+   and **poll `pid_alive` until the PID dies or an 8 s deadline**. On timeout,
+   escalate to `SIGKILL` (`--force`, or a second prompt).
+2. **Unresponsive** (`query_daemon()` is `None` but `running_daemon_pid()` names
+   a live PID — the control socket is wedged): offer an OS force-kill
+   (`SIGTERM`→`SIGKILL`).
+3. **Not running**: say so and exit cleanly.
+
+`force_kill_daemon(pid, term_first, grace)` treats `ESRCH` as success, re-checks
+`pid_alive` after `SIGKILL`, and sweeps the stale pid/socket files via
+`cleanup_stale_daemon`. The invariant: **a success line is printed only when
+`pid_alive` is false.** `-y/--yes` skips the initial confirmation; `--force`
+skips all prompts and escalates; with neither flag and no TTY the command refuses
+rather than guess. The same `wait_for_exit` verification backs the
+hard-stop-then-respawn fallback in `kmux daemon restart`.
 
 ---
 

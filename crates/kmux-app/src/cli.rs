@@ -92,6 +92,31 @@ pub struct ConnectArgs {
 
 #[derive(Subcommand, Debug)]
 pub enum Command {
+    /// Open an interactive session on a server — the explicit form of
+    /// `kmux <host>`.
+    ///
+    /// `kmux open user@host:/path` is identical to the bare positional
+    /// `kmux user@host:/path`, which is retained as a shorthand. Takes the same
+    /// connection flags (`--session`, `--cwd`, `--ssh-port`, `--dry-run`,
+    /// `--test`) as the default connect action.
+    Open {
+        #[command(flatten)]
+        connect: ConnectArgs,
+    },
+
+    /// Show one health view across every kmux process: the local daemon
+    /// (`kmuxd`), the GUI client singleton, this CLI, and any isolated per-pane
+    /// VT workers — flagging build/protocol skew between them.
+    ///
+    /// The scoped `kmux daemon status` / `kmux client status` remain the
+    /// detailed views; this is the at-a-glance overview. Exits non-zero when the
+    /// daemon is not running or a blocking (protocol/profile) skew is present.
+    Status {
+        /// Output format
+        #[arg(long, default_value = "table")]
+        format: OutputFormat,
+    },
+
     /// Manage the local kmux daemon
     Daemon {
         #[command(subcommand)]
@@ -210,6 +235,16 @@ pub enum Command {
         server_args: ServerArgs,
     },
 
+    /// Manage the local kmux GUI client (a singleton process).
+    ///
+    /// The singular `client` manages *this machine's* GUI client process
+    /// (status/logs/stop/restart), mirroring `kmux daemon`. (Distinct from the
+    /// plural `clients`, which lists the connections attached to a session.)
+    Client {
+        #[command(subcommand)]
+        action: ClientAction,
+    },
+
     /// Internal diagnostics (hidden). See `kmux debug tearing` (issue #72).
     #[command(hide = true)]
     Debug {
@@ -262,17 +297,37 @@ pub enum DebugAction {
 pub enum DaemonAction {
     /// Start the daemon in the background
     Start,
-    /// Gracefully stop the daemon
-    Stop,
+    /// Gracefully stop the daemon (shows a summary and confirms first)
+    Stop {
+        /// Skip the confirmation prompt (still a graceful, verified stop)
+        #[arg(short = 'y', long)]
+        yes: bool,
+        /// Skip prompts; force-kill (SIGTERM→SIGKILL) if a graceful stop won't exit
+        #[arg(long)]
+        force: bool,
+    },
     /// Show daemon status (PID, uptime, port, session count)
     Status,
     /// Stop then restart the daemon
     Restart,
     /// Print daemon log file (use -f/--follow to stream new lines)
+    ///
+    /// With `--server`, fetches the *remote* daemon's log over the data plane
+    /// (issue #187); without it, reads the local daemon log off disk.
     Logs {
         /// Follow new log output (like tail -f)
         #[arg(short, long)]
         follow: bool,
+        /// Show only the last N lines (quick sanity check); omit to print all
+        #[arg(short = 'n', long, value_name = "N")]
+        lines: Option<usize>,
+        /// Read a remote daemon's log: `[user@]host[:ssh-port]` or a
+        /// `hosts.toml` alias. Omit to read the local daemon log off disk.
+        #[arg(long, add = ArgValueCandidates::new(crate::completion::server_candidates))]
+        server: Option<String>,
+        /// Override the SSH port for the target server.
+        #[arg(long)]
+        ssh_port: Option<u16>,
     },
     /// List sessions and their active connections
     Sessions {
@@ -283,6 +338,25 @@ pub enum DaemonAction {
         #[arg(long, default_value = "table")]
         format: OutputFormat,
     },
+}
+
+#[derive(Subcommand, Debug)]
+pub enum ClientAction {
+    /// Show the local GUI client's build/version and warn on client↔daemon skew
+    Status,
+    /// Print the client log file (use -f/--follow to stream new lines)
+    Logs {
+        /// Follow new log output (like tail -f)
+        #[arg(short, long)]
+        follow: bool,
+        /// Show only the last N lines (quick sanity check); omit to print all
+        #[arg(short = 'n', long, value_name = "N")]
+        lines: Option<usize>,
+    },
+    /// Stop the running GUI client (the singleton process)
+    Stop,
+    /// Restart the GUI client (stop, then relaunch)
+    Restart,
 }
 
 #[derive(Debug, Clone, ValueEnum)]
@@ -319,4 +393,74 @@ pub struct ResolvedConnection {
     /// TCP port for headless commands. Falls back to `port` if unset.
     pub tcp_port: Option<u16>,
     pub token: String,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::{CommandFactory, Parser};
+
+    /// clap's own consistency check: catches a flattened-positional vs
+    /// subcommand-positional conflict at test time. The top-level positional
+    /// `server` and `kmux open`'s flattened `server` must coexist.
+    #[test]
+    fn cli_definition_is_valid() {
+        Cli::command().debug_assert();
+    }
+
+    /// `kmux open <host>` resolves to the explicit verb, with the host on the
+    /// subcommand's flattened connect args.
+    #[test]
+    fn open_subcommand_captures_server() {
+        let cli = Cli::try_parse_from(["kmux", "open", "host"]).unwrap();
+        match cli.command {
+            Some(Command::Open { connect }) => {
+                assert_eq!(connect.server_args.server.as_deref(), Some("host"));
+            }
+            other => panic!("expected Open, got {other:?}"),
+        }
+    }
+
+    /// The bare positional `kmux <host>` is retained as a fallback: no
+    /// subcommand matches, so the host lands on the top-level connect args.
+    #[test]
+    fn bare_positional_is_fallback_connect() {
+        let cli = Cli::try_parse_from(["kmux", "host"]).unwrap();
+        assert!(cli.command.is_none());
+        assert_eq!(cli.connect.server_args.server.as_deref(), Some("host"));
+    }
+
+    /// `kmux open` carries the same connection flags as the default action.
+    #[test]
+    fn open_subcommand_accepts_connect_flags() {
+        let cli = Cli::try_parse_from(["kmux", "open", "-n", "host", "--session", "x"]).unwrap();
+        match cli.command {
+            Some(Command::Open { connect }) => {
+                assert!(connect.dry_run);
+                assert_eq!(connect.server_args.server.as_deref(), Some("host"));
+                assert_eq!(connect.session.as_deref(), Some("x"));
+            }
+            other => panic!("expected Open, got {other:?}"),
+        }
+    }
+
+    /// `kmux open` with no target is valid (opens the local daemon, like bare
+    /// `kmux`).
+    #[test]
+    fn open_subcommand_without_target_parses() {
+        let cli = Cli::try_parse_from(["kmux", "open"]).unwrap();
+        match cli.command {
+            Some(Command::Open { connect }) => {
+                assert!(connect.server_args.server.is_none());
+            }
+            other => panic!("expected Open, got {other:?}"),
+        }
+    }
+
+    /// A real subcommand still wins over the positional fallback.
+    #[test]
+    fn ls_subcommand_still_parses() {
+        let cli = Cli::try_parse_from(["kmux", "ls"]).unwrap();
+        assert!(matches!(cli.command, Some(Command::ListSessions { .. })));
+    }
 }

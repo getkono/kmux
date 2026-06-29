@@ -57,6 +57,16 @@ headless `kmux ls` / `ps` / `clients` / `kick` subcommands, via a shared
 **its own** identity over the same path, so a peer's client list shows the hub as
 one distinct entity.
 
+Since `PROTOCOL_VERSION` 37 the `Auth` frame also carries the client's **build
+identity** — the frontend kind (`cli` / `gtk` / `swift`) plus the client binary's
+git sha, dirty flag, and build profile. The frontend kind is a process-wide
+constant set once at GUI startup (`kmux_connect::set_frontend_kind`, called by
+`kmux-gtk` → `Gtk` and `kmux-ffi` → `Swift`; the CLI default is `Cli`); the
+sha/profile come from `kmux_protocol::buildinfo` (captured by that crate's
+`build.rs`, so any binary linking it reports a consistent build). The daemon
+records them per connection (`PendingAuth` → `ClientIdentity` → `ConnectionState`
+→ `ClientInfo`).
+
 ## Listing & kicking
 
 New wire messages (`PROTOCOL_VERSION` 32):
@@ -75,6 +85,41 @@ New wire messages (`PROTOCOL_VERSION` 32):
 **Authorization:** any token-authenticated client may kick any other; identity is
 attribution/display only.
 
+`ClientInfo` (and so `kmux clients`) also carries each connection's `frontend`
+and `build` (`<sha>[-dirty]`) / `build_profile` (protocol 37), shown as the
+**FRONTEND** and **BUILD** columns.
+
+## Build skew & `kmux client`
+
+A matching `PROTOCOL_VERSION` does **not** mean the CLI, the GUI client, and the
+daemon are the same build — two commits can share a protocol. The classic trap:
+an install updates the GUI app bundle but leaves a stale `kmux`/`kmuxd` on
+`PATH`, so the GUI talks to a current daemon while `kmux …` runs old code.
+
+`kmux client` (singular — the client-side mirror of `kmux daemon`) manages *this
+machine's* singleton GUI process and surfaces that skew:
+
+- `kmux client status` reports the running GUI client, the local daemon, and the
+  CLI by build/protocol, and **warns** when they diverge (protocol gap → cannot
+  connect; build/profile mismatch → reinstall/restart). It reads the GUI client's
+  build from the daemon's connection registry via a local `connections` control
+  RPC (the GUI has no control socket of its own), and the daemon's own commit
+  from a `kmuxd_build` field added to the `status` control response.
+- `kmux client logs [-f]` tails the client log; `kmux client stop` / `restart`
+  drive the singleton (found via `pgrep`, relaunched through the launcher).
+
+`kmux status` is the **unified overview** over all of the above: it folds the
+daemon, the GUI client, this CLI, and any isolated per-pane VT workers into one
+report (`--format json` for scripting), leaving `kmux client status` /
+`kmux daemon status` as the scoped detail views. It exits non-zero when the
+daemon is down or a *blocking* skew is present.
+
+The same/different/unknown classification and the blocking attach-gate policy
+are defined once in `kmux_protocol::compat` (`Match3`, `BlockReason`,
+`attach_block`) — the single source of truth shared by `ensure_compatible_daemon`
+(the connect gate), `kmux daemon status`, `kmux client status`, and `kmux status`.
+Each caller still formats its own prose; only the decision is centralized.
+
 ## Federation
 
 For a session proxied from a federated peer (issue #121), the local hub forwards
@@ -89,8 +134,10 @@ chooses local vs. forwarded via `ServerApp::is_federated_session`.
 
 | Surface | List | Kick |
 | --- | --- | --- |
-| CLI | `kmux clients [<session>]` (`--format json`) | `kmux kick <session> <label-or-id>` |
-| Control socket | `kmux daemon sessions` shows label/machine id/hostname | — |
+| CLI | `kmux clients [<session>]` (`--format json`; FRONTEND/BUILD columns) | `kmux kick <session> <label-or-id>` |
+| CLI (local client) | `kmux client status` — GUI/daemon/CLI build + skew warnings | — |
+| CLI (overview) | `kmux status` — daemon + GUI + CLI + workers in one view (`--format json`) | — |
+| Control socket | `kmux daemon sessions` shows label/machine id/hostname; `connections` lists all with build; `workers` lists isolated per-pane workers | — |
 | GTK | "Connected Clients" main-area view (`Ctrl+Shift+K`, menu, `/clients`) | per-row **Kick** button |
 | Swift | "Connected Clients" main-area view (`⌘⇧K`, menu) | per-row **Kick** button |
 

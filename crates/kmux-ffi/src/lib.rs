@@ -1557,6 +1557,9 @@ impl KmuxDriver {
         // core, so the client log file and the daemon correlate by the same id.
         let instance_id = generate_instance_id();
         init_ffi_logging(&instance_id);
+        // Identify this process as the Swift frontend so every Auth frame reports
+        // `frontend = swift` for daemon-side attribution and `kmux clients`.
+        kmux_client::set_frontend_kind(kmux_protocol::messages::FrontendKind::Swift);
         tracing::info!(
             server = ?config.server,
             session = ?config.session,

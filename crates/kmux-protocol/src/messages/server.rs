@@ -8,7 +8,7 @@ use super::session::{
     TabInfo, WordId,
 };
 use super::types::Compression;
-use super::vt::{CellState, CursorState, GridSnapshot, TermModes, TerminalDiff};
+use super::vt::{CursorState, GridSnapshot, ScrollbackLine, TermModes, TerminalDiff};
 
 /// Messages sent from server -> client.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -151,6 +151,20 @@ pub enum ServerMessage {
     /// Full snapshot was sent because the requested seqno is no longer in the buffer.
     SyncReset { pane_id: PaneId },
 
+    /// A checksum of the server's authoritative grid as of `seqno`, certifying
+    /// the diff stream up to that point. Emitted on the same (data) channel as
+    /// the diffs it covers, so it can never overtake the frame it describes. A
+    /// client that has applied exactly up to `seqno` recomputes the digest over
+    /// its reconstructed grid (`GridSnapshot::live_digest`) and, on a mismatch,
+    /// resyncs — turning otherwise-silent diff-stream corruption into a detected,
+    /// self-healing, countable event. `hash` is a [`GridSnapshot::live_digest`]
+    /// (scrollback tail content excluded; the envelope counts are included).
+    GridDigest {
+        pane_id: PaneId,
+        seqno: SequenceNo,
+        hash: u128,
+    },
+
     /// Asynchronous lifecycle event.
     Event { event: SessionEventMsg },
 
@@ -177,9 +191,15 @@ pub enum ServerMessage {
     },
 
     /// Full grid snapshot for an attached pane (sent on attach/resize).
+    ///
+    /// `Arc`-wrapped so the daemon can fan the same snapshot out to several
+    /// clients (multiple GUIs on one session, federation mirrors,
+    /// force-full-snapshot viewers) with O(1) clones instead of deep-copying the
+    /// whole grid per recipient. Postcard serialises `Arc<T>` exactly as `T`, so
+    /// the wire format is unchanged.
     TerminalSnapshot {
         pane_id: PaneId,
-        snapshot: GridSnapshot,
+        snapshot: Arc<GridSnapshot>,
         seqno: SequenceNo,
         /// Wall-clock timestamp (ms since Unix epoch) when the server sent this message.
         sent_at_ms: u64,
@@ -207,7 +227,7 @@ pub enum ServerMessage {
         first_index: u64,
         /// Appended lines, oldest first. Each line is stored at the column
         /// width it had when captured.
-        lines: Vec<Vec<CellState>>,
+        lines: Vec<ScrollbackLine>,
         seqno: SequenceNo,
         sent_at_ms: u64,
     },
@@ -220,7 +240,7 @@ pub enum ServerMessage {
         pane_id: PaneId,
         /// Absolute index of the first returned line.
         first_index: u64,
-        lines: Vec<Vec<CellState>>,
+        lines: Vec<ScrollbackLine>,
         /// Mirror's absolute line count at reply time. The oldest available
         /// line is at `history_total - mirror_capacity` (conceptually).
         history_total: u64,
@@ -304,6 +324,21 @@ pub enum ServerMessage {
     /// notification is surfaced by the GUI clients; this just confirms the
     /// request reached the owning daemon (an unknown pane yields `Error`).
     NotifyAccepted { request_id: RequestId },
+
+    /// A chunk of the daemon's log file, in reply to
+    /// [`super::client::ClientMessage::FetchLogs`] (issue #187). `data` is raw
+    /// log bytes (UTF-8 lines); the client writes them straight to stdout. The
+    /// daemon may send many of these — the initial dump in pieces, then one per
+    /// batch of appended bytes while `follow` is set.
+    LogChunk {
+        request_id: RequestId,
+        data: Vec<u8>,
+    },
+
+    /// Terminates a non-`follow` [`super::client::ClientMessage::FetchLogs`]
+    /// stream (issue #187): all `LogChunk`s for `request_id` have been sent. A
+    /// `follow` stream never sends this — it ends when the connection closes.
+    LogEnd { request_id: RequestId },
 }
 
 impl ServerMessage {
@@ -343,8 +378,12 @@ impl ServerMessage {
             | Self::ClientListResult { .. }
             | Self::ClientKicked { .. }
             | Self::SessionKicked { .. }
-            | Self::NotifyAccepted { .. } => MessageCategory::Control,
-            Self::Lagged { .. } | Self::SyncReset { .. } => MessageCategory::Sync,
+            | Self::NotifyAccepted { .. }
+            | Self::LogChunk { .. }
+            | Self::LogEnd { .. } => MessageCategory::Control,
+            Self::Lagged { .. } | Self::SyncReset { .. } | Self::GridDigest { .. } => {
+                MessageCategory::Sync
+            }
             Self::AuthChallenge { .. } | Self::AuthResult { .. } | Self::ChannelSwitched { .. } => {
                 MessageCategory::Bootstrap
             }
@@ -421,7 +460,7 @@ mod tests {
             (
                 ServerMessage::TerminalSnapshot {
                     pane_id: "p".into(),
-                    snapshot: dummy_grid_snapshot(),
+                    snapshot: std::sync::Arc::new(dummy_grid_snapshot()),
                     seqno: SequenceNo(1),
                     sent_at_ms: 0,
                 },
@@ -608,6 +647,14 @@ mod tests {
             (
                 ServerMessage::SyncReset {
                     pane_id: "p".into(),
+                },
+                MessageCategory::Sync,
+            ),
+            (
+                ServerMessage::GridDigest {
+                    pane_id: "p".into(),
+                    seqno: SequenceNo(1),
+                    hash: 0,
                 },
                 MessageCategory::Sync,
             ),

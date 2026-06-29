@@ -52,6 +52,7 @@ impl SessionManager {
     /// connection-derived state. Returns the SSH context (if any) so the
     /// caller can spawn the tunnel-death monitor + supervisor.
     pub fn apply_outcome(&mut self, outcome: BootstrapOutcome) -> Option<SshContext> {
+        self.ensure_worker();
         self.ws_sender = Some(outcome.client_tx);
         self.host = outcome.host.clone();
         self.port = outcome.port;
@@ -81,6 +82,7 @@ impl SessionManager {
     }
 
     pub fn set_ws_sender(&mut self, sender: mpsc::UnboundedSender<ClientMessage>) {
+        self.ensure_worker();
         self.ws_sender = Some(sender);
         self.last_host = self.host.clone();
         self.last_port = self.port;
@@ -153,6 +155,7 @@ impl SessionManager {
 
     pub fn disconnect(&mut self) {
         self.ws_sender = None;
+        self.reset_apply_worker();
         self.buffers.clear();
         self.active_session = None;
         self.active_pane = None;

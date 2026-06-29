@@ -1,11 +1,15 @@
+mod client_cmd;
 mod clients;
 mod daemon_cmd;
 mod debug;
 mod dry_run;
 mod list;
+mod logs;
 mod notify;
 mod ps;
 pub mod render;
+mod status;
+pub use client_cmd::run_client_command;
 pub use clients::{KickClientConfig, ListClientsConfig, run_kick_client, run_list_clients};
 pub use daemon_cmd::run_daemon_command;
 pub use debug::run_debug_command;
@@ -13,6 +17,7 @@ pub use dry_run::run_dry_run;
 pub use list::{ListSessionsConfig, run_list_sessions};
 pub use notify::{NotifyConfig, run_notify};
 pub use ps::{ProcessOverviewConfig, run_process_overview};
+pub use status::run_status;
 
 use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::ssh::{self, ParsedServer};
@@ -122,7 +127,8 @@ where
 {
     use kmux_protocol::identity::Identity;
     use kmux_protocol::messages::{
-        ClientCapabilities, ClientMessage, PROTOCOL_VERSION, ServerMessage, version_mismatch_hint,
+        ClientCapabilities, ClientMessage, FrontendKind, PROTOCOL_VERSION, ServerMessage,
+        version_mismatch_hint,
     };
     use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
 
@@ -135,6 +141,11 @@ where
         public_key: identity.public_key_bytes().to_vec(),
         hostname: kmux_protocol::identity::local_hostname(),
         username: kmux_protocol::identity::local_username(),
+        // This is the CLI control path (kmux clients / kick); always a CLI build.
+        client_kind: FrontendKind::Cli,
+        client_git_sha: kmux_protocol::buildinfo::git_sha().to_string(),
+        client_git_dirty: kmux_protocol::buildinfo::git_dirty(),
+        client_build_profile: kmux_protocol::buildinfo::build_profile().to_string(),
     };
     write_frame(write_half, &encode_client(&auth)?).await?;
 
@@ -164,6 +175,34 @@ where
                 }
             }
             _ => continue,
+        }
+    }
+}
+
+/// Ask a yes/no question on the terminal, returning `true` only on an explicit
+/// yes. Mirrors the nested-GUI guard in `kmux/src/main.rs`: the prompt goes to
+/// stderr, EOF (Ctrl-D) and an empty line are the safe default (`false`).
+///
+/// The caller is responsible for the no-TTY policy (this is only invoked once a
+/// TTY is confirmed); `default_no` controls which option is capitalized.
+pub(crate) fn confirm_yes_no(question: &str) -> std::io::Result<bool> {
+    use std::io::Write;
+
+    let mut err = std::io::stderr();
+    loop {
+        let _ = write!(err, "{question} [y/N] ");
+        let _ = err.flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            let _ = writeln!(err);
+            return Ok(false);
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "" | "n" | "no" => return Ok(false),
+            "y" | "yes" => return Ok(true),
+            _ => {
+                let _ = writeln!(err, "Please answer 'y' or 'n'.");
+            }
         }
     }
 }

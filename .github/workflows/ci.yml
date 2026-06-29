@@ -25,6 +25,17 @@ jobs:
           install: true
           cache: true
 
+      # mise's cache stores its own tool dir but not the rustup toolchain, and a
+      # cache hit skips the rust (re)install — so the 1.96.0 toolchain that
+      # rust-toolchain.toml auto-provisions can land minimal, without rustfmt or
+      # clippy, and `cargo fmt`/`cargo clippy` below then fail with "'cargo-fmt'
+      # is not installed". Add the components explicitly: idempotent, and the
+      # modern names resolve to `rustfmt`/`clippy` (not the legacy `*-preview`),
+      # so this can't reintroduce the rustfmt-preview/cargo-fmt install conflict
+      # that the dropped rust-toolchain.toml `components` line used to trigger.
+      - name: Ensure rustfmt + clippy components
+        run: rustup component add rustfmt clippy
+
       - name: Cache cargo
         uses: actions/cache@v4
         with:
@@ -115,6 +126,11 @@ jobs:
         with:
           install: true
           cache: true
+
+      # See the Check job: a mise cache hit can leave the rust-toolchain.toml
+      # toolchain without rustfmt/clippy, so add them explicitly (idempotent).
+      - name: Ensure rustfmt + clippy components
+        run: rustup component add rustfmt clippy
 
       - name: Cache cargo
         uses: actions/cache@v4

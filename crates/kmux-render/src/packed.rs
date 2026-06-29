@@ -247,7 +247,13 @@ mod tests {
     #[test]
     fn encode_cells_composites_scrollback_when_scrolled() {
         let mut grid = CellGrid::new(2, 4);
-        grid.apply_scrollback_append(0, vec![line("AAAA"), line("BBBB")]);
+        grid.apply_scrollback_append(
+            0,
+            vec![line("AAAA"), line("BBBB")]
+                .into_iter()
+                .map(Into::into)
+                .collect(),
+        );
         grid.scroll_up(1); // top row shows the newest scrollback line ("BBBB")
         let packed = encode_cells(&grid, &theme());
         assert_eq!(packed.len(), 2 * 4 * PACKED_CELL_LEN);
@@ -260,7 +266,7 @@ mod tests {
     #[test]
     fn encode_cells_live_view_matches_raw_cells() {
         let mut grid = CellGrid::new(2, 4);
-        grid.apply_scrollback_append(0, vec![line("AAAA")]);
+        grid.apply_scrollback_append(0, vec![line("AAAA").into()]);
         let t = theme();
         let packed = encode_cells(&grid, &t);
         let mut expected = Vec::new();

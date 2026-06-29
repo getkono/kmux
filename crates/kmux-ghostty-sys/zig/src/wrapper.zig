@@ -21,10 +21,59 @@ const Terminal = gvt.Terminal;
 const Action = gvt.StreamAction;
 
 // -----------------------------------------------------------------------------
+// Diagnostic logging (issue #187)
+//
+// We are the *root module* of this shared library, so this `std_options`
+// governs every `std.log` call inside the linked libghostty-vt — including its
+// `unimplemented CSI/ESC/OSC action` warnings for control sequences it does not
+// handle. We forward those to a process-global C callback the Rust side installs
+// (`kmux_ghostty_set_log_callback`), which re-emits them under the `kmux::vt`
+// tracing target so unknown sequences surface in `kmux daemon logs`.
+// -----------------------------------------------------------------------------
+
+/// C signature of the log sink the Rust side installs. `level` matches
+/// `std.log.Level` (0=err, 1=warn, 2=info, 3=debug); `scope`/`msg` are borrowed
+/// for the duration of the call only.
+const LogCallback = *const fn (
+    level: u8,
+    scope_ptr: [*]const u8,
+    scope_len: usize,
+    msg_ptr: [*]const u8,
+    msg_len: usize,
+) callconv(.c) void;
+
+/// Process-global log sink. Set once at startup (before any pane exists) via
+/// `kmux_ghostty_set_log_callback`, then read from the VT parser threads — a
+/// set-once global, so the unsynchronized access is safe in practice.
+var log_callback: ?LogCallback = null;
+
+fn kmuxLogFn(
+    comptime level: std.log.Level,
+    comptime scope: @TypeOf(.EnumLiteral),
+    comptime format: []const u8,
+    args: anytype,
+) void {
+    const cb = log_callback orelse return;
+    var buf: [2048]u8 = undefined;
+    const msg = std.fmt.bufPrint(&buf, format, args) catch
+        "kmux: VT log message too long to format";
+    const scope_name = @tagName(scope);
+    cb(@intFromEnum(level), scope_name.ptr, scope_name.len, msg.ptr, msg.len);
+}
+
+pub const std_options: std.Options = .{
+    // Release builds default `log_level` to `.err`, which would drop the
+    // `unimplemented …` *warnings* before `kmuxLogFn` ever sees them. Pin
+    // `.warn` so the sequences we care about reach the sink.
+    .log_level = .warn,
+    .logFn = kmuxLogFn,
+};
+
+// -----------------------------------------------------------------------------
 // ABI constants
 // -----------------------------------------------------------------------------
 
-pub const ABI_VERSION: u32 = 4;
+pub const ABI_VERSION: u32 = 5;
 
 // Result codes. Must match the values `kmux-ghostty-sys::error` expects.
 const OK: i32 = 0;
@@ -616,6 +665,13 @@ export fn kmux_ghostty_abi_version() callconv(.c) u32 {
     return ABI_VERSION;
 }
 
+/// Install (or clear, with null) the process-global diagnostic-log sink
+/// (issue #187). Set once at startup before any terminal is created; see
+/// `kmuxLogFn` / `std_options`.
+export fn kmux_ghostty_set_log_callback(cb: ?LogCallback) callconv(.c) void {
+    log_callback = cb;
+}
+
 export fn kmux_ghostty_new(
     size_in: *const KmuxSize,
     scrollback: u32,
@@ -1205,6 +1261,12 @@ test "OSC 9;4 progress is stored and pullable" {
     kmux_ghostty_get_progress(w, &state, &value, &has);
     try std.testing.expectEqual(@as(u8, 0), state);
 }
+
+// NOTE: the "unknown sequence is forwarded to the log callback" check lives in
+// the Rust test suite (`kmux-ghostty-sys`), not here. `std_options` is only the
+// active log config when wrapper.zig is the *root module* — true for the linked
+// shared library, but NOT for `zig build test`, whose root is the test runner.
+// A Rust test links the real library, so it exercises the genuine routing.
 
 comptime {
     // Keep the ghostty-vt import live even when no test is run.

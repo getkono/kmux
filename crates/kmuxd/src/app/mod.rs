@@ -30,8 +30,8 @@ use std::time::Instant;
 use kmux_protocol::TransportKind;
 use kmux_protocol::control_rpc::{ConnectionInfo, SessionConnections, SessionsResponse};
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ConnectionId, InputMode, PaneId, PaneInfo, PaneProgressState,
-    SessionStatus, TermSize, epoch_millis,
+    ClientCapabilities, ClientId, ConnectionId, FrontendKind, InputMode, PaneId, PaneInfo,
+    PaneProgressState, SessionStatus, TermSize, epoch_millis,
 };
 use kmux_pty::events::SessionEvent;
 use kmux_pty::registry::SessionManager as PtyRegistry;
@@ -131,6 +131,25 @@ impl PaneEventSink {
 }
 
 impl crate::backend::BackendEventSink for PaneEventSink {
+    // The daemon's single dispatch point for kmux's special VT sequences (issue
+    // #187). Every special behaviour the daemon performs lives in this `match`;
+    // see `kmux_vt_core::backend::ControlEvent` for the catalog.
+    fn on_control_event(&self, event: crate::backend::ControlEvent<'_>) {
+        use crate::backend::ControlEvent;
+        match event {
+            ControlEvent::Title(title) => self.on_title(title),
+            ControlEvent::Osc52Copy {
+                selection,
+                base64_data,
+            } => self.on_osc52_copy(selection, base64_data),
+            ControlEvent::Progress { state, progress } => self.on_progress(state, progress),
+            // Parsed but no client-facing wire event consumes them yet.
+            ControlEvent::Bell | ControlEvent::Hyperlink { .. } => {}
+        }
+    }
+}
+
+impl PaneEventSink {
     fn on_title(&self, title: &str) {
         {
             let mut current = self.title.lock().unwrap();
@@ -313,7 +332,7 @@ impl PaneRelay {
                 size: new_size,
             },
         };
-        let snapshot = self.engine.snapshot();
+        let snapshot = std::sync::Arc::new(self.engine.snapshot());
         let snap_msg = kmux_protocol::messages::ServerMessage::TerminalSnapshot {
             pane_id: pane_id.to_string(),
             snapshot,
@@ -470,6 +489,14 @@ struct ConnectionState {
     /// Daemon-assigned user-readable label `username@hostname[#N]`, unique among
     /// live connections — the unit listed and kicked.
     label: String,
+    /// Client build identity reported in `Auth` (protocol 37): which frontend,
+    /// and the client binary's commit + profile. Surfaced by `kmux clients` and
+    /// `kmux client status` to spot a client built from a different commit than
+    /// the daemon even when the protocol version matches.
+    client_kind: FrontendKind,
+    client_git_sha: String,
+    client_git_dirty: bool,
+    client_build_profile: String,
 }
 
 /// The cryptographic identity a client presents at auth time (issue #146),
@@ -482,6 +509,14 @@ pub struct ClientIdentity {
     pub hostname: String,
     /// Client-reported OS username.
     pub username: String,
+    /// Which frontend opened the connection (CLI vs GUI). (protocol 37)
+    pub client_kind: FrontendKind,
+    /// Short git commit the client binary was built from. (protocol 37)
+    pub client_git_sha: String,
+    /// Whether the client build had uncommitted changes. (protocol 37)
+    pub client_git_dirty: bool,
+    /// Cargo profile of the client build. (protocol 37)
+    pub client_build_profile: String,
 }
 
 /// What [`ServerApp::register_client`] returns: the assigned ids, the previous
@@ -803,6 +838,10 @@ impl ServerApp {
                     hostname: identity.hostname,
                     username: identity.username,
                     label: label.clone(),
+                    client_kind: identity.client_kind,
+                    client_git_sha: identity.client_git_sha,
+                    client_git_dirty: identity.client_git_dirty,
+                    client_build_profile: identity.client_build_profile,
                 },
             );
             (label, conns.len())
@@ -829,6 +868,55 @@ impl ServerApp {
     /// Snapshot all sessions and their attached connections for the `"sessions"`
     /// control-socket command.  Both locks are held simultaneously to avoid
     /// tearing between the two maps.
+    /// Enumerate every pane currently running in an isolated `kmux-vt-worker`
+    /// subprocess, with its pid, status, and crash-loop history (issue #126).
+    /// In-process panes are skipped; the report is empty in `in-process` mode.
+    /// Backs the `"workers"` control command.
+    pub async fn snapshot_workers(&self) -> kmux_protocol::control_rpc::WorkersResponse {
+        use kmux_protocol::control_rpc::{WorkerInfo, WorkersResponse};
+        use kmux_protocol::messages::{SessionStatus, format_pane_id};
+
+        let isolation_mode = if self.session_isolation.is_process() {
+            "process"
+        } else {
+            "in-process"
+        }
+        .to_string();
+
+        let sessions = self.sessions.read().await;
+        let mut workers = Vec::new();
+        for (word_id, state) in sessions.iter() {
+            for (pane_index, relay) in state.panes.iter() {
+                let Some(worker_pid) = relay.engine.worker_pid() else {
+                    continue;
+                };
+                let pane_id = format_pane_id(word_id, *pane_index);
+                let (restart_count, last_age, within_budget) = self.worker_restart_stats(&pane_id);
+                let status = match relay.status {
+                    SessionStatus::Running => "running",
+                    SessionStatus::Exited { .. } => "exited",
+                }
+                .to_string();
+                workers.push(WorkerInfo {
+                    pane_id,
+                    session_word_id: word_id.clone(),
+                    pane_index: *pane_index,
+                    worker_pid,
+                    status,
+                    restart_count,
+                    last_restart_ago_ms: last_age.map(|d| d.as_millis() as u64),
+                    within_restart_budget: within_budget,
+                });
+            }
+        }
+        // Deterministic order (HashMap iteration is arbitrary) for stable output.
+        workers.sort_by(|a, b| a.pane_id.cmp(&b.pane_id));
+        WorkersResponse {
+            isolation_mode,
+            workers,
+        }
+    }
+
     pub async fn snapshot_sessions_with_connections(&self) -> SessionsResponse {
         let sessions = self.sessions.read().await;
         let conns = self.connections.read().await;
@@ -1007,7 +1095,7 @@ mod tests {
         use kmux_protocol::messages::{ServerMessage, SessionEventMsg};
         use tokio::sync::broadcast;
 
-        use crate::backend::BackendEventSink;
+        use crate::backend::{BackendEventSink, ControlEvent};
 
         let (tx, mut rx) = broadcast::channel(8);
         let sink = super::PaneEventSink::new(
@@ -1017,7 +1105,10 @@ mod tests {
             tx,
         );
 
-        sink.on_osc52_copy("c", "aGVsbG8=");
+        sink.on_control_event(ControlEvent::Osc52Copy {
+            selection: "c",
+            base64_data: "aGVsbG8=",
+        });
 
         match rx.try_recv().expect("event broadcast") {
             ServerMessage::Event {
@@ -1637,6 +1728,10 @@ mod tests {
             hostname: String::new(),
             username: String::new(),
             label: label.to_string(),
+            client_kind: kmux_protocol::messages::FrontendKind::Cli,
+            client_git_sha: String::new(),
+            client_git_dirty: false,
+            client_build_profile: String::new(),
         };
         let mut conns: HashMap<u64, super::ConnectionState> = HashMap::new();
         assert_eq!(super::assign_label("box", "alice", &conns), "alice@box");
@@ -1664,6 +1759,7 @@ mod tests {
                     machine_id: "m-a".into(),
                     hostname: "boxa".into(),
                     username: "alice".into(),
+                    ..Default::default()
                 },
             )
             .await;
@@ -1676,6 +1772,7 @@ mod tests {
                     machine_id: "m-b".into(),
                     hostname: "boxb".into(),
                     username: "bob".into(),
+                    ..Default::default()
                 },
             )
             .await;

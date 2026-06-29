@@ -20,7 +20,7 @@ use tracing::warn;
 use kmux_protocol::messages::ConnectionId;
 
 use crate::connection_state::ConnectionState;
-use crate::grid::CellGrid;
+use crate::grid::{ApplyHandle, CellGrid, WorkerNote};
 use crate::liveness::Liveness;
 use crate::metrics::{JsonlSink, MetricsStore};
 use crate::supervisor::RttSample;
@@ -115,8 +115,14 @@ pub struct SessionManager {
     pub(super) zoomed: bool,
     /// Rotating index into the preset [`LayoutScheme`]s for `cycle_layout`.
     pub(super) layout_scheme_idx: usize,
-    /// Terminal buffers keyed by pane_id.
+    /// Terminal buffers keyed by pane_id. Client panes are worker-backed
+    /// ([`CellGrid::published`]); content applies run off the UI thread on
+    /// [`Self::apply`] (issue #182, §1).
     pub buffers: HashMap<PaneId, CellGrid>,
+    /// Off-UI-thread grid apply worker, spawned lazily on the first real connect
+    /// (`set_ws_sender`/`apply_outcome`). `None` in tests, which drive
+    /// synchronous `Local` grids instead.
+    pub(super) apply: Option<ApplyHandle>,
     pub(super) pane_sync: HashMap<PaneId, PaneSync>,
     pub input_locked: HashMap<PaneId, bool>,
     /// Panes the user marked exempt from *auto*-pause (issue #68): they keep
@@ -224,6 +230,7 @@ impl SessionManager {
             zoomed: false,
             layout_scheme_idx: 0,
             buffers: HashMap::new(),
+            apply: None,
             pane_sync: HashMap::new(),
             input_locked: HashMap::new(),
             auto_pause_exempt_panes: HashSet::new(),
@@ -244,6 +251,94 @@ impl SessionManager {
             rtt_tx: None,
             transport_override: None,
             override_tx: None,
+        }
+    }
+
+    // ── Off-UI-thread grid apply worker (issue #182, §1) ──────────────────────
+
+    /// Spawn the apply worker on the first real connect. Idempotent. Not called
+    /// from tests (which set `ws_sender` directly), so test grids stay `Local`
+    /// and apply synchronously.
+    pub(super) fn ensure_worker(&mut self) {
+        if self.apply.is_none() {
+            self.apply = Some(ApplyHandle::spawn());
+        }
+    }
+
+    /// Get a pane's buffer, creating it if absent. A worker-backed
+    /// [`CellGrid::published`] when the worker is running, else a synchronous
+    /// `Local` grid (tests).
+    pub(super) fn ensure_pane(&mut self, pane_id: &str) -> &mut CellGrid {
+        if !self.buffers.contains_key(pane_id) {
+            let grid = match &self.apply {
+                Some(handle) => {
+                    let published = handle.register_pane(pane_id.to_string(), 24, 80);
+                    CellGrid::published(pane_id.to_string(), handle.sender(), published)
+                }
+                None => CellGrid::default(),
+            };
+            self.buffers.insert(pane_id.to_string(), grid);
+        }
+        self.buffers.get_mut(pane_id).expect("just inserted")
+    }
+
+    /// Reload every worker-backed pane's published content snapshot. Called at
+    /// the top of the UI tick before grids are read/rendered. Returns whether any
+    /// pane's content changed (so the driver repaints). No-op for `Local`.
+    pub fn refresh_buffers(&mut self) -> bool {
+        if self.apply.is_none() {
+            return false;
+        }
+        let mut changed = false;
+        for grid in self.buffers.values_mut() {
+            changed |= grid.refresh();
+        }
+        changed
+    }
+
+    /// Drain worker notes: apply view effects to the owning `GridView` and act on
+    /// digest mismatches (resync) and order gaps. Returns whether anything that
+    /// affects rendering changed.
+    pub fn drain_apply_notes(&mut self) -> bool {
+        let mut dirty = false;
+        let mut notes = Vec::new();
+        if let Some(handle) = &self.apply {
+            while let Some(note) = handle.try_recv_note() {
+                notes.push(note);
+            }
+        }
+        for note in notes {
+            match note {
+                WorkerNote::Effect { pane_id, effect } => {
+                    if let Some(grid) = self.buffers.get_mut(&pane_id) {
+                        grid.apply_view_effect(effect);
+                        dirty = true;
+                    }
+                }
+                WorkerNote::DigestMismatch { pane_id, seqno } => {
+                    self.metrics.record_digest_mismatch(&pane_id, seqno.0);
+                    self.metrics.record_resync(&pane_id, "grid digest mismatch");
+                    if let Some(grid) = self.buffers.get_mut(&pane_id) {
+                        grid.clear();
+                    }
+                    self.in_flight_history_fetches.remove(&pane_id);
+                    self.attach_fresh(pane_id);
+                    dirty = true;
+                }
+                WorkerNote::SeqnoGap { pane_id } => {
+                    self.metrics.record_resync(&pane_id, "apply order gap");
+                }
+            }
+        }
+        dirty
+    }
+
+    /// Drop all worker-side pane state on disconnect/reconnect (the buffers map
+    /// is cleared by the caller). The worker thread itself is kept alive for the
+    /// next connection.
+    pub(super) fn reset_apply_worker(&mut self) {
+        if let Some(handle) = &self.apply {
+            handle.reset();
         }
     }
 
@@ -1009,7 +1104,7 @@ mod tests {
         };
         mgr.handle_server_message(ServerMessage::TerminalSnapshot {
             pane_id: "eagle/0".to_string(),
-            snapshot,
+            snapshot: snapshot.into(),
             seqno: SequenceNo(5),
             sent_at_ms: 0,
         });
@@ -1606,8 +1701,9 @@ mod tests {
             .in_flight_history_fetches
             .get("eagle/0")
             .expect("in-flight recorded");
-        let lines: Vec<Vec<kmux_protocol::messages::CellState>> =
-            (0..10).map(|_| Vec::new()).collect();
+        let lines: Vec<kmux_protocol::messages::ScrollbackLine> = (0..10)
+            .map(|_| Vec::<kmux_protocol::messages::CellState>::new().into())
+            .collect();
         mgr.handle_server_message(ServerMessage::HistoryLines {
             request_id,
             pane_id: "eagle/0".to_string(),
@@ -1848,5 +1944,151 @@ mod tests {
             vec!["eagle/0"],
             "manual pause withholds the exempt pane, so it catches up on resume"
         );
+    }
+
+    // ── Grid-digest desync oracle (issue: grid verification spine) ──
+
+    /// A small populated snapshot used to seed a synced pane.
+    fn digest_snapshot() -> GridSnapshot {
+        use kmux_protocol::messages::{CellState, CursorState};
+        let mut cells = vec![CellState::default(); 6];
+        cells[0] = CellState {
+            c: 'A',
+            ..CellState::default()
+        };
+        GridSnapshot {
+            rows: 2,
+            cols: 3,
+            cells,
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            history_total: 0,
+            scrollback_base: 0,
+            scrollback_tail: Vec::new(),
+        }
+    }
+
+    /// Seed a pane synced at `seqno` from a snapshot. Returns the pane id.
+    fn seed_synced_pane(mgr: &mut SessionManager, seqno: u64) -> String {
+        let pane = "s1/0".to_string();
+        mgr.handle_server_message(ServerMessage::TerminalSnapshot {
+            pane_id: pane.clone(),
+            snapshot: digest_snapshot().into(),
+            seqno: SequenceNo(seqno),
+            sent_at_ms: 0,
+        });
+        pane
+    }
+
+    fn attach_count(rx: &mut mpsc::UnboundedReceiver<ClientMessage>) -> usize {
+        std::iter::from_fn(|| rx.try_recv().ok())
+            .filter(|m| matches!(m, ClientMessage::Attach { .. }))
+            .count()
+    }
+
+    #[test]
+    fn grid_digest_match_does_not_resync() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        let pane = seed_synced_pane(&mut mgr, 5);
+
+        // The daemon certifies seqno 5 with the live digest of the same grid.
+        let hash = digest_snapshot().live_digest();
+        mgr.handle_server_message(ServerMessage::GridDigest {
+            pane_id: pane.clone(),
+            seqno: SequenceNo(5),
+            hash,
+        });
+
+        assert_eq!(mgr.metrics.digest_mismatch_count(), 0);
+        assert!(
+            matches!(mgr.pane_sync.get(&pane), Some(PaneSync::Synced { expected }) if expected.0 == 6),
+            "a matching digest leaves sync state untouched"
+        );
+        assert_eq!(attach_count(&mut rx), 0, "no resync on a matching digest");
+    }
+
+    #[test]
+    fn grid_digest_mismatch_triggers_one_resync() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        let pane = seed_synced_pane(&mut mgr, 5);
+
+        mgr.handle_server_message(ServerMessage::GridDigest {
+            pane_id: pane.clone(),
+            seqno: SequenceNo(5),
+            hash: 0xdead_beef, // deliberately wrong
+        });
+
+        assert_eq!(mgr.metrics.digest_mismatch_count(), 1);
+        assert!(
+            matches!(mgr.pane_sync.get(&pane), Some(PaneSync::AwaitingSync)),
+            "a mismatch must drop the pane into AwaitingSync"
+        );
+        assert_eq!(
+            attach_count(&mut rx),
+            1,
+            "a mismatch triggers exactly one fresh Attach"
+        );
+    }
+
+    #[test]
+    fn grid_digest_for_stale_seqno_is_ignored() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        let pane = seed_synced_pane(&mut mgr, 5);
+
+        // Client is synced at seqno 5 (expects 6); a digest for an older seqno is
+        // stale and must be ignored, even with a wrong hash.
+        mgr.handle_server_message(ServerMessage::GridDigest {
+            pane_id: pane.clone(),
+            seqno: SequenceNo(3),
+            hash: 0xbad,
+        });
+
+        assert_eq!(mgr.metrics.digest_mismatch_count(), 0);
+        assert!(matches!(
+            mgr.pane_sync.get(&pane),
+            Some(PaneSync::Synced { .. })
+        ));
+        assert_eq!(attach_count(&mut rx), 0);
+    }
+
+    #[test]
+    fn grid_digest_skipped_while_history_fetch_pending() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        let pane = seed_synced_pane(&mut mgr, 5);
+
+        // A diff that reports more history than the client holds opens a pending
+        // scrollback gap (the client is legitimately behind on the envelope).
+        mgr.handle_server_message(ServerMessage::TerminalUpdate {
+            pane_id: pane.clone(),
+            diff: std::sync::Arc::new(kmux_protocol::messages::TerminalDiff {
+                ops: vec![],
+                cursor: kmux_protocol::messages::CursorState::default(),
+                modes: TermModes::EMPTY,
+                history_total: 50,
+                scrollback_reset: None,
+            }),
+            seqno: SequenceNo(6),
+            sent_at_ms: 0,
+        });
+        assert!(
+            mgr.buffers
+                .get(&pane)
+                .is_some_and(|g| g.pending_history_gap().is_some()),
+            "the diff must open a pending history gap"
+        );
+        let _ = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+
+        // A wrong digest while the fetch is outstanding must NOT resync.
+        mgr.handle_server_message(ServerMessage::GridDigest {
+            pane_id: pane.clone(),
+            seqno: SequenceNo(6),
+            hash: 0xdead,
+        });
+        assert_eq!(
+            mgr.metrics.digest_mismatch_count(),
+            0,
+            "no false mismatch while a history fetch is in flight"
+        );
+        assert_eq!(attach_count(&mut rx), 0);
     }
 }

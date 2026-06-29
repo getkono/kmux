@@ -131,6 +131,19 @@ The respawn task re-adopts the daemon's retained master fd into a fresh worker
 snapshot. A crash-loop guard bounds restarts to 3 per pane within 60s; past that
 the pane is left faulted.
 
+## Observability (`workers` control RPC)
+
+The daemon answers a `workers` command on its JSON control socket
+(`ServerApp::snapshot_workers`) with its isolation mode and, for every pane
+running in a worker, the pane id, the worker subprocess pid (`WorkerEngine`
+retains `child.id()` from spawn), lifecycle status, and the crash-loop history
+read from the existing restart log (`worker_restart_stats`: respawns within the
+60s window + remaining budget). `kmux status` surfaces this; an in-process daemon
+reports an empty list, and a daemon predating the command closes without
+replying, so the client degrades gracefully. Control-socket only — no
+`PROTOCOL_VERSION` / `kmux-worker-protocol` bump (new fields are
+`#[serde(default)]` for cross-build forward-compat).
+
 ## Interaction with handoff & federation
 
 - **Handoff** (`crate::handoff`, live daemon upgrade): the daemon still owns

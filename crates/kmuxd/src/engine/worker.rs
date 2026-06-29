@@ -20,7 +20,7 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use kmux_client::grid::CellGrid;
 use kmux_protocol::messages::{
-    CellState, CursorState, GridSnapshot, KeyEvent, ServerMessage, SessionEventMsg, TermModes,
+    CursorState, GridSnapshot, KeyEvent, ScrollbackLine, ServerMessage, SessionEventMsg, TermModes,
     TermSize,
 };
 use kmux_pty::error::Result;
@@ -36,7 +36,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
 use crate::app::{ClientMap, PaneEventSink};
-use crate::backend::BackendEventSink;
+use crate::backend::{BackendEventSink, ControlEvent};
 use crate::diff_engine::DiffResult;
 use crate::relay::dispatch_diff_result;
 use crate::scrollback::DiffBuffer;
@@ -52,6 +52,10 @@ pub struct WorkerEngine {
     /// Mirror of the worker's grid, fed from the event stream, so `snapshot()`
     /// and history reads stay synchronous on the daemon side.
     mirror: Arc<Mutex<CellGrid>>,
+    /// OS pid of the `kmux-vt-worker` subprocess (distinct from the shell pid the
+    /// worker adopts). Captured at spawn so status reporting can surface it; the
+    /// `Child` itself is owned by the supervisor task for reaping.
+    child_pid: u32,
     /// Supervisor task: reads worker events, fans out, reaps the child.
     supervisor: JoinHandle<()>,
     /// Writer task: drains `req_tx` onto the socket.
@@ -158,14 +162,22 @@ impl WorkerEngine {
             }
         });
 
+        // Capture the worker pid before the `Child` moves into the supervisor.
+        let child_pid = child.id();
         let supervisor = tokio::spawn(supervise(sock_rd, child, mirror.clone(), fanout));
 
         Ok(WorkerEngine {
             req_tx,
             mirror,
+            child_pid,
             supervisor,
             writer_task,
         })
+    }
+
+    /// OS pid of the worker subprocess, for status reporting.
+    pub(super) fn child_pid(&self) -> u32 {
+        self.child_pid
     }
 
     pub(super) fn snapshot(&self) -> GridSnapshot {
@@ -179,7 +191,7 @@ impl WorkerEngine {
         let _ = self.req_tx.send(WorkerRequest::Resize { size });
     }
 
-    pub(super) fn checkpoint_grid(&self, max_lines: usize) -> (GridSnapshot, Vec<Vec<CellState>>) {
+    pub(super) fn checkpoint_grid(&self, max_lines: usize) -> (GridSnapshot, Vec<ScrollbackLine>) {
         let mirror = self.mirror.lock().unwrap();
         let grid = mirror.to_snapshot();
         let sb = mirror.scrollback();
@@ -200,7 +212,7 @@ impl WorkerEngine {
         &self,
         start: u64,
         count: u32,
-    ) -> (u64, Vec<Vec<CellState>>, u64) {
+    ) -> (u64, Vec<ScrollbackLine>, u64) {
         let mirror = self.mirror.lock().unwrap();
         let sb = mirror.scrollback();
         let history_total = sb.history_total();
@@ -381,12 +393,21 @@ fn handle_event(
                 &snapshot_fn,
             );
         }
-        WorkerEvent::Title { title } => fanout.event_sink.on_title(&title),
-        WorkerEvent::Bell => fanout.event_sink.on_bell(),
+        // Re-emit worker → daemon events through the same single dispatch the
+        // in-process path uses (issue #187).
+        WorkerEvent::Title { title } => {
+            fanout
+                .event_sink
+                .on_control_event(ControlEvent::Title(&title));
+        }
+        WorkerEvent::Bell => fanout.event_sink.on_control_event(ControlEvent::Bell),
         WorkerEvent::Osc52 {
             selection,
             base64_data,
-        } => fanout.event_sink.on_osc52_copy(&selection, &base64_data),
+        } => fanout.event_sink.on_control_event(ControlEvent::Osc52Copy {
+            selection: &selection,
+            base64_data: &base64_data,
+        }),
         WorkerEvent::ChildExit { status } => {
             fanout
                 .manager

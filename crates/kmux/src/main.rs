@@ -222,17 +222,24 @@ fn swift_app_running() -> bool {
 /// (server / ssh-port / session / cwd / diagnostic), re-parsing the shared `Cli`.
 #[cfg(target_os = "macos")]
 fn build_launch_url(cli: &kmux_app::cli::Cli) -> String {
+    // `kmux open <host>` carries the connection args on the `Open` variant, while
+    // the bare `kmux <host>` carries them on the top-level flattened args. Both
+    // must produce the same URL, so source from whichever applies.
+    let connect = match &cli.command {
+        Some(kmux_app::cli::Command::Open { connect }) => connect,
+        _ => &cli.connect,
+    };
     let mut params: Vec<(&str, String)> = Vec::new();
-    if let Some(s) = &cli.connect.server_args.server {
+    if let Some(s) = &connect.server_args.server {
         params.push(("server", s.clone()));
     }
-    if let Some(p) = cli.connect.server_args.ssh_port {
+    if let Some(p) = connect.server_args.ssh_port {
         params.push(("ssh-port", p.to_string()));
     }
-    if let Some(s) = &cli.connect.session {
+    if let Some(s) = &connect.session {
         params.push(("session", s.clone()));
     }
-    if let Some(c) = &cli.connect.cwd {
+    if let Some(c) = &connect.cwd {
         params.push(("cwd", c.clone()));
     }
     if let Some(kmux_app::cli::Command::Diagnostic {
@@ -307,12 +314,22 @@ fn select_app_bundle(
     user.unwrap_or(system)
 }
 
-/// Other platforms have no supported desktop client.
+/// Other platforms have no supported desktop client yet.
+///
+/// Windows is not built. When it is, its singleton model must match the Unix
+/// one: a per-profile single-instance guard on top of the per-profile runtime
+/// dir that already isolates debug from release ([`kmux_protocol::dirs`]). The
+/// intended mechanism is a named mutex — `CreateMutexW` on a name that embeds the
+/// build profile (e.g. `Local\\kmux-{profile}`): the first launcher creates it
+/// and owns the window; a second sees `ERROR_ALREADY_EXISTS` and forwards its
+/// request to the running instance (the same handoff the GTK D-Bus `activate` /
+/// Swift `kmux://` routing perform today) rather than opening a rival process.
+/// See `docs/architecture-frontend.md`.
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn launch_desktop() -> anyhow::Result<()> {
     anyhow::bail!(
-        "kmux: no desktop client for this platform; the GTK frontend (`kmux-gtk`) \
-         is supported on Linux and macOS"
+        "kmux: no desktop client for this platform yet; the GTK frontend \
+         (`kmux-gtk`) is supported on Linux and macOS"
     )
 }
 
@@ -412,4 +429,25 @@ fn locate_binary(name: &str) -> anyhow::Result<std::path::PathBuf> {
     anyhow::bail!(
         "could not find the `{name}` binary; ensure it is installed alongside `kmux` or on PATH"
     )
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    /// `kmux open <host>` must build the same launch URL as the bare positional —
+    /// the host lives on the `Open` variant, so `build_launch_url` has to read it
+    /// from there (regression guard for the cross-frontend launch path).
+    #[test]
+    fn open_subcommand_url_includes_server() {
+        let cli = kmux_app::cli::Cli::parse_from(["kmux", "open", "host"]);
+        assert_eq!(build_launch_url(&cli), "kmux://new?server=host");
+    }
+
+    #[test]
+    fn bare_positional_url_includes_server() {
+        let cli = kmux_app::cli::Cli::parse_from(["kmux", "host"]);
+        assert_eq!(build_launch_url(&cli), "kmux://new?server=host");
+    }
 }

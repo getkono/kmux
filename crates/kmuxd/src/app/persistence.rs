@@ -1,6 +1,7 @@
 use std::sync::atomic::Ordering;
 
 use kmux_protocol::format_pane_id;
+use kmux_protocol::messages::CellState;
 
 use super::{ServerApp, SessionState};
 
@@ -61,7 +62,12 @@ impl ServerApp {
             let pane_id = format_pane_id(word_id, pane_index);
 
             // Snapshot grid state and extract scrollback for the checkpoint.
-            let (grid, scrollback_lines) = relay.engine.checkpoint_grid(MAX_SCROLLBACK_LINES);
+            // The checkpoint schema stores owned `Vec<CellState>` lines (frozen
+            // on-disk format); the engine now hands back shared `Arc` lines, so
+            // materialise them here on this cold path.
+            let (grid, scrollback_arc) = relay.engine.checkpoint_grid(MAX_SCROLLBACK_LINES);
+            let scrollback_lines: Vec<Vec<CellState>> =
+                scrollback_arc.iter().map(|line| line.to_vec()).collect();
 
             // Get child PID from the PTY registry.
             let child_pid = self.manager.child_pid(&pane_id).await.map(|p| p.as_raw());

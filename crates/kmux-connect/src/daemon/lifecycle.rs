@@ -53,11 +53,10 @@ pub(super) fn cleanup_stale_daemon() {
 }
 
 /// Path to the file that captures kmuxd's stdout+stderr across a spawn attempt.
-///
-/// Lives in the runtime dir alongside the socket/pid file so the user can tail
-/// it manually, and so we can include its contents in a startup-failure error.
+/// Delegates to the shared [`kmux_protocol::dirs::boot_log_path`] so every
+/// daemon-spawn site (here, `probe-or-start`, the handoff successor) agrees.
 fn boot_log_path() -> anyhow::Result<PathBuf> {
-    Ok(kmux_protocol::dirs::runtime_dir()?.join("kmuxd-boot.log"))
+    kmux_protocol::dirs::boot_log_path()
 }
 
 /// Spawn `kmuxd` with [`kmux_protocol::control_rpc::DAEMON_BOOT_ARGS`]
@@ -141,7 +140,7 @@ pub(crate) fn start_daemon() -> anyhow::Result<Option<std::process::Child>> {
 ///
 /// Returns `""` when the log is missing or empty. Capped at
 /// `BOOT_LOG_TAIL_MAX` bytes so a runaway log doesn't overwhelm the error.
-fn format_boot_log_hint() -> String {
+pub(super) fn format_boot_log_hint() -> String {
     let Ok(path) = boot_log_path() else {
         return String::new();
     };
@@ -304,7 +303,7 @@ pub async fn ensure_daemon() -> anyhow::Result<DaemonStatus> {
     }
 }
 
-pub(super) fn pid_alive(pid: u32) -> bool {
+pub fn pid_alive(pid: u32) -> bool {
     // kill(pid, 0) returns Ok if the process exists and we can signal it.
     kill(Pid::from_raw(pid as i32), None).is_ok()
 }
@@ -315,6 +314,101 @@ pub(super) fn read_pid_file(path: &std::path::Path) -> Option<u32> {
         .trim()
         .parse::<u32>()
         .ok()
+}
+
+/// Return the PID of a daemon that is *alive* per its pid file, regardless of
+/// whether it still answers on the control socket.
+///
+/// Backs the "unresponsive daemon" branch of `kmux daemon stop`: when
+/// [`query_daemon`](super::query_daemon) returns `None` but a live process owns
+/// the pid file, the control socket is wedged and the only way out is an OS
+/// signal. Returns `None` when there is no pid file, it is unparseable, or the
+/// PID it names is already dead.
+pub fn running_daemon_pid() -> Option<u32> {
+    let pid_path = kmux_protocol::dirs::pid_path().ok()?;
+    let pid = read_pid_file(&pid_path)?;
+    pid_alive(pid).then_some(pid)
+}
+
+/// Poll until `pid` is no longer alive or `timeout` elapses.
+///
+/// Returns `true` the moment the process is gone, `false` if it is still alive
+/// when the deadline passes. This is the verification step that stops
+/// `kmux daemon stop` from ever reporting success for a daemon that is wedged
+/// mid-shutdown — the previous behaviour trusted the daemon's `"ok"` reply,
+/// which is sent *before* the process actually exits.
+pub async fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if !pid_alive(pid) {
+            return true;
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+/// Force a daemon process to exit using OS signals, then verify it is gone.
+///
+/// `term_first` controls the escalation:
+/// - `true` (unresponsive daemon): send `SIGTERM`, give it `grace` to exit on
+///   its own, then `SIGKILL` if still alive.
+/// - `false` (a responsive daemon that already received a graceful `stop` but
+///   would not exit): skip straight to `SIGKILL` — re-asking for a graceful
+///   shutdown it is already ignoring would only waste `grace`.
+///
+/// `ESRCH` (no such process) is treated as success: the daemon is already gone.
+/// After a confirmed kill the stale pid/socket files are swept. Returns `Err`
+/// when the process is still alive after `SIGKILL` (e.g. uninterruptible sleep,
+/// or `EPERM`), so the caller never reports a kill that did not happen.
+///
+/// `nix` signalling is the platform-agnostic primitive across kmux's supported
+/// targets (macOS + Linux); the same `kill` path already backs
+/// [`cleanup_stale_daemon`].
+pub async fn force_kill_daemon(pid: u32, term_first: bool, grace: Duration) -> anyhow::Result<()> {
+    let nix_pid = Pid::from_raw(pid as i32);
+
+    if term_first {
+        match kill(nix_pid, Signal::SIGTERM) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::ESRCH) => {
+                cleanup_stale_daemon();
+                return Ok(());
+            }
+            Err(e) => {
+                return Err(anyhow::anyhow!("failed to SIGTERM daemon (PID {pid}): {e}"));
+            }
+        }
+        if wait_for_exit(pid, grace).await {
+            cleanup_stale_daemon();
+            return Ok(());
+        }
+    }
+
+    match kill(nix_pid, Signal::SIGKILL) {
+        Ok(()) => {}
+        Err(nix::errno::Errno::ESRCH) => {
+            cleanup_stale_daemon();
+            return Ok(());
+        }
+        Err(e) => {
+            return Err(anyhow::anyhow!("failed to SIGKILL daemon (PID {pid}): {e}"));
+        }
+    }
+
+    // SIGKILL cannot be caught, but process teardown is asynchronous — give the
+    // kernel a brief, bounded window to reap it before we verify.
+    if wait_for_exit(pid, Duration::from_secs(2)).await {
+        cleanup_stale_daemon();
+        Ok(())
+    } else {
+        Err(anyhow::anyhow!(
+            "daemon (PID {pid}) is still alive after SIGKILL; it may be stuck in \
+             uninterruptible sleep — inspect it manually"
+        ))
+    }
 }
 
 pub(crate) fn find_server_binary() -> anyhow::Result<std::path::PathBuf> {
@@ -585,6 +679,104 @@ mod tests {
             override_bin,
             "KMUX_KMUXD must win over sibling / target-dir / PATH resolution",
         );
+    }
+
+    #[tokio::test]
+    async fn wait_for_exit_times_out_for_live_pid() {
+        // A long-lived child stays alive past the deadline → wait_for_exit must
+        // report `false` (still running), never a spurious success.
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        assert!(!wait_for_exit(pid, Duration::from_millis(300)).await);
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    #[tokio::test]
+    async fn wait_for_exit_returns_true_once_pid_dies() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        let _ = child.kill();
+        let _ = child.wait(); // reap so the PID is fully gone, as init would
+        assert!(wait_for_exit(pid, Duration::from_secs(2)).await);
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn force_kill_daemon_terminates_a_live_process() {
+        // cleanup_stale_daemon (called on success) touches the runtime dir, so
+        // pin it to a tempdir like the other daemon tests.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep");
+        let pid = child.id();
+        // In production the daemon is reparented to init, which reaps it the
+        // instant it dies. Here the test process is the parent, so reap in the
+        // background to free the PID rather than leaving a zombie (which would
+        // still answer kill(pid, 0) and look "alive").
+        let reaper = std::thread::spawn(move || {
+            let mut child = child;
+            let _ = child.wait();
+        });
+
+        force_kill_daemon(pid, true, Duration::from_secs(1))
+            .await
+            .expect("force kill should terminate and verify the process");
+        reaper.join().unwrap();
+
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn force_kill_daemon_is_ok_when_already_gone() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+
+        let mut child = std::process::Command::new("true")
+            .spawn()
+            .expect("spawn true");
+        let pid = child.id();
+        let _ = child.wait(); // already exited and reaped → kill yields ESRCH
+
+        force_kill_daemon(pid, true, Duration::from_millis(100))
+            .await
+            .expect("killing an already-dead PID is success (ESRCH)");
+
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+    }
+
+    #[test]
+    fn running_daemon_pid_reports_live_and_absent() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+
+        // No pid file yet → None. (pid_path() materializes the runtime dir.)
+        let pid_path = kmux_protocol::dirs::pid_path().unwrap();
+        assert!(running_daemon_pid().is_none());
+
+        // Our own PID is alive → reported back.
+        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
+        assert_eq!(running_daemon_pid(), Some(std::process::id()));
+
+        // Unparseable pid file → None, never a panic.
+        std::fs::write(&pid_path, "not-a-pid").unwrap();
+        assert!(running_daemon_pid().is_none());
+
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
     }
 
     /// A stale `KMUX_KMUXD` (pointing at a non-existent path) must be ignored and

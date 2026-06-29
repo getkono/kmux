@@ -15,8 +15,9 @@ use crate::cli::{Cli, Command};
 use crate::config::{self, RendererKind};
 use crate::subcommands::{
     KickClientConfig, ListClientsConfig, ListSessionsConfig, NotifyConfig, ProcessOverviewConfig,
-    parse_target, run_daemon_command, run_debug_command, run_dry_run, run_kick_client,
-    run_list_clients, run_list_sessions, run_notify, run_process_overview,
+    parse_target, run_client_command, run_daemon_command, run_debug_command, run_dry_run,
+    run_kick_client, run_list_clients, run_list_sessions, run_notify, run_process_overview,
+    run_status,
 };
 use crate::theme::Theme;
 
@@ -160,10 +161,18 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
     };
 
     // Most subcommands are non-interactive and short-circuit before any frontend
-    // setup. `kmux diagnostic <test>` is the exception: it falls through to an
-    // interactive launch, carrying the emitter program to run in the session.
+    // setup. `kmux diagnostic <test>` and `kmux open` are the exceptions: they
+    // fall through to an interactive launch. `open` carries its own connection
+    // args (the explicit form of the bare positional); capture whichever applies
+    // into `connect` so the shared dry-run/interactive code below reads one source.
     let mut initial_program: Option<(String, Vec<String>)> = None;
+    let mut connect = cli.connect;
     match cli.command {
+        Some(Command::Open {
+            connect: open_connect,
+        }) => {
+            connect = open_connect;
+        }
         Some(Command::Daemon { action }) => {
             run_daemon_command(action).await?;
             return Ok(Launch::Done);
@@ -229,7 +238,14 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
             pane,
             server_args,
         }) => {
-            run_notify(NotifyConfig {
+            // Best-effort: `kmux notify` is a fire-and-forget hook (Claude Code
+            // Stop/Notification, shell `precmd`, …). A delivery failure — not in a
+            // pane, daemon down, version-skewed client/daemon, connection refused —
+            // must never surface as a non-zero exit, or every hook firing spams the
+            // caller (e.g. Claude Code's "Stop hook failed" warning after each
+            // turn). Log the reason to the client log and exit 0, mirroring the
+            // metrics sink's "must never take down the client" rule.
+            if let Err(e) = run_notify(NotifyConfig {
                 server: server_args.server.as_deref(),
                 ssh_port: server_args.ssh_port,
                 pane,
@@ -237,7 +253,18 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
                 title,
                 body,
             })
-            .await?;
+            .await
+            {
+                tracing::warn!(target: "kmux::notify", "notify not delivered: {e:#}");
+            }
+            return Ok(Launch::Done);
+        }
+        Some(Command::Status { format }) => {
+            run_status(format).await?;
+            return Ok(Launch::Done);
+        }
+        Some(Command::Client { action }) => {
+            run_client_command(action).await?;
             return Ok(Launch::Done);
         }
         Some(Command::Debug { action }) => {
@@ -267,11 +294,11 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         None => {}
     }
 
-    if cli.connect.dry_run && cli.connect.test {
+    if connect.dry_run && connect.test {
         eprintln!("warning: --test implies --dry-run; running in --test mode.");
     }
-    if cli.connect.dry_run || cli.connect.test {
-        run_dry_run(&cli.connect.server_args, cli.connect.test).await?;
+    if connect.dry_run || connect.test {
+        run_dry_run(&connect.server_args, connect.test).await?;
         return Ok(Launch::Done);
     }
 
@@ -281,11 +308,10 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         .and_then(|p| p.to_str().map(String::from))
         .unwrap_or_default();
     let (target, parsed_server) = parse_target(
-        cli.connect.server_args.server.as_deref(),
-        cli.connect.server_args.ssh_port,
+        connect.server_args.server.as_deref(),
+        connect.server_args.ssh_port,
     );
-    let auto_cwd = cli
-        .connect
+    let auto_cwd = connect
         .cwd
         .or_else(|| parsed_server.as_ref().and_then(|p| p.path.clone()));
     let theme = config::resolve_theme(cli.theme.as_deref());
@@ -298,7 +324,7 @@ pub async fn run_cli(instance_id: String) -> anyhow::Result<Launch> {
         target,
         initial_cwd,
         auto_cwd,
-        auto_session: cli.connect.session,
+        auto_session: connect.session,
         theme,
         font,
         appearance,

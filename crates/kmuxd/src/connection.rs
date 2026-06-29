@@ -2,7 +2,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use kmux_protocol::messages::{ErrorCode, ServerMessage};
-use kmux_protocol::{Compressor, encode_server, write_frame_compressed};
+use kmux_protocol::{Compressor, encode_server, write_frame_compressed_into};
 use quinn::Connection;
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -10,7 +10,7 @@ use tracing::{Instrument, debug};
 
 use crate::app::{AttachResult, ServerApp};
 use crate::client_handler::{
-    OutboundCompression, PaneAttacher, build_attach_replay, run_client_session,
+    MAX_WRITE_BATCH, OutboundCompression, PaneAttacher, build_attach_replay, run_client_session,
 };
 
 pub fn classify_error(e: &kmux_pty::error::KmuxError) -> ErrorCode {
@@ -64,13 +64,17 @@ async fn pane_uni_writer(
     client_rx: &mut mpsc::Receiver<ServerMessage>,
     comp_out: &OutboundCompression,
 ) {
+    // Replay frames are written as whole frames then flushed once.
     for msg in build_attach_replay(attach_result, &pane_id) {
-        if send_frame(&mut uni, &msg, comp_out.compressor())
+        if write_frame(&mut uni, &msg, comp_out.compressor())
             .await
             .is_err()
         {
             return;
         }
+    }
+    if kmux_protocol::flush(&mut uni).await.is_err() {
+        return;
     }
 
     // Network impairment shim (issue #72): per-pane jitter on live pane-data
@@ -78,27 +82,47 @@ async fn pane_uni_writer(
     let impair = crate::impair::config();
     let mut rng = impair.map(|c| c.rng_for(crate::impair::pane_salt(&pane_id)));
 
-    while let Some(msg) = client_rx.recv().await {
-        if let (Some(cfg), Some(rng)) = (impair, rng.as_mut()) {
-            crate::impair::maybe_delay(cfg, msg.category(), rng).await;
+    // Batch all immediately-available frames into one flush, mirroring the
+    // merged TCP/UDS writer (`run_client_session`). On QUIC the per-stream flush
+    // is cheap, so this mainly drops per-message await overhead and keeps the
+    // writer paths uniform; the bytes on the wire are unchanged.
+    let mut batch: Vec<ServerMessage> = Vec::new();
+    'writer: while let Some(first) = client_rx.recv().await {
+        batch.clear();
+        batch.push(first);
+        while batch.len() < MAX_WRITE_BATCH {
+            match client_rx.try_recv() {
+                Ok(m) => batch.push(m),
+                Err(_) => break,
+            }
         }
-        let write_start = Instant::now();
-        if send_frame(&mut uni, &msg, comp_out.compressor())
-            .await
-            .is_err()
-        {
+        for msg in batch.drain(..) {
+            if let (Some(cfg), Some(rng)) = (impair, rng.as_mut()) {
+                crate::impair::maybe_delay(cfg, msg.category(), rng).await;
+            }
+            let write_start = Instant::now();
+            if write_frame(&mut uni, &msg, comp_out.compressor())
+                .await
+                .is_err()
+            {
+                break 'writer;
+            }
+            let write_us = write_start.elapsed().as_micros();
+            if write_us > 1000 {
+                debug!(pane_id, write_us, "slow uni stream write");
+            }
+        }
+        if kmux_protocol::flush(&mut uni).await.is_err() {
             break;
-        }
-        let write_us = write_start.elapsed().as_micros();
-        if write_us > 1000 {
-            debug!(pane_id, write_us, "slow uni stream write");
         }
     }
 
     let _ = uni.finish();
 }
 
-async fn send_frame(
+/// Write one whole frame to the stream WITHOUT flushing. A trailing
+/// [`kmux_protocol::flush`] pushes a drained batch in one go.
+async fn write_frame(
     stream: &mut quinn::SendStream,
     msg: &ServerMessage,
     comp: Compressor,
@@ -108,7 +132,7 @@ async fn send_frame(
         debug!(frame_bytes = bytes.len(), "large frame");
     }
     crate::capture::record(msg.category(), &bytes);
-    write_frame_compressed(stream, &bytes, comp)
+    write_frame_compressed_into(stream, &bytes, comp)
         .await
         .map(|_| ())
 }
