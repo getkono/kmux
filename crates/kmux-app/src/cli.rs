@@ -315,6 +315,9 @@ pub enum DaemonAction {
         /// Follow new log output (like tail -f)
         #[arg(short, long)]
         follow: bool,
+        /// Show only the last N lines (quick sanity check); omit to print all
+        #[arg(short = 'n', long, value_name = "N")]
+        lines: Option<usize>,
     },
     /// List sessions and their active connections
     Sessions {
@@ -336,6 +339,9 @@ pub enum ClientAction {
         /// Follow new log output (like tail -f)
         #[arg(short, long)]
         follow: bool,
+        /// Show only the last N lines (quick sanity check); omit to print all
+        #[arg(short = 'n', long, value_name = "N")]
+        lines: Option<usize>,
     },
     /// Stop the running GUI client (the singleton process)
     Stop,

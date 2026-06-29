@@ -187,39 +187,15 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
             }
         }
 
-        DaemonAction::Logs { follow } => {
-            use std::io;
-
+        DaemonAction::Logs { follow, lines } => {
             let log_path = kmux_protocol::dirs::daemon_log_path()?;
-            if !log_path.exists() {
-                eprintln!(
-                    "Log file not found: {}\nHas the daemon been run at least once?",
-                    log_path.display()
-                );
-                std::process::exit(1);
-            }
-
-            use tokio::io::{AsyncReadExt, AsyncSeekExt};
-            let mut file = tokio::fs::File::open(&log_path).await?;
-
-            // Print all existing content.
-            let mut buf = Vec::new();
-            file.read_to_end(&mut buf).await?;
-            io::Write::write_all(&mut io::stdout(), &buf)?;
-
-            if follow {
-                // Seek to end and poll for new bytes.
-                file.seek(std::io::SeekFrom::End(0)).await?;
-                let mut read_buf = vec![0u8; 4096];
-                loop {
-                    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                    let n = file.read(&mut read_buf).await?;
-                    if n > 0 {
-                        io::Write::write_all(&mut io::stdout(), &read_buf[..n])?;
-                        io::Write::flush(&mut io::stdout())?;
-                    }
-                }
-            }
+            super::logs::tail_local_log(
+                &log_path,
+                lines,
+                follow,
+                "Has the daemon been run at least once?",
+            )
+            .await?;
         }
     }
     Ok(())

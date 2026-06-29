@@ -17,7 +17,7 @@ use super::status::{GUI_PROCESS, build_display, gui_pids, local_machine_id};
 pub async fn run_client_command(action: ClientAction) -> anyhow::Result<()> {
     match action {
         ClientAction::Status => client_status().await,
-        ClientAction::Logs { follow } => client_logs(follow).await,
+        ClientAction::Logs { follow, lines } => client_logs(follow, lines).await,
         ClientAction::Stop => {
             client_stop();
             Ok(())
@@ -162,38 +162,17 @@ async fn client_status() -> anyhow::Result<()> {
 }
 
 /// Tail the client log file, optionally following new output — the client-side
-/// counterpart of `kmux daemon logs`.
-async fn client_logs(follow: bool) -> anyhow::Result<()> {
-    use std::io;
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
+/// counterpart of `kmux daemon logs`. The GUI client is a local singleton, so
+/// this is always the local file (no remote form, unlike `kmux daemon logs`).
+async fn client_logs(follow: bool, lines: Option<usize>) -> anyhow::Result<()> {
     let log_path = kmux_protocol::dirs::client_log_path()?;
-    if !log_path.exists() {
-        eprintln!(
-            "Log file not found: {}\nHas a kmux client been run at least once?",
-            log_path.display()
-        );
-        std::process::exit(1);
-    }
-
-    let mut file = tokio::fs::File::open(&log_path).await?;
-    let mut buf = Vec::new();
-    file.read_to_end(&mut buf).await?;
-    io::Write::write_all(&mut io::stdout(), &buf)?;
-
-    if follow {
-        file.seek(std::io::SeekFrom::End(0)).await?;
-        let mut read_buf = vec![0u8; 4096];
-        loop {
-            tokio::time::sleep(Duration::from_millis(100)).await;
-            let n = file.read(&mut read_buf).await?;
-            if n > 0 {
-                io::Write::write_all(&mut io::stdout(), &read_buf[..n])?;
-                io::Write::flush(&mut io::stdout())?;
-            }
-        }
-    }
-    Ok(())
+    super::logs::tail_local_log(
+        &log_path,
+        lines,
+        follow,
+        "Has a kmux client been run at least once?",
+    )
+    .await
 }
 
 /// Stop the running GUI client: SIGTERM each PID, then SIGKILL any that linger.
