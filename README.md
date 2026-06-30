@@ -11,6 +11,88 @@ TODO
 - [x] Linux and macOS support (no Windows for now)
 - [x] `--dry-run` / `--test` connection diagnostics — trace the real bootstrap, verify with ping, exit. See [docs/connection.md](docs/connection.md#dry-run-diagnostics---dry-run---test).
 
+## Install
+
+kmux has two halves: a background **daemon** (`kmuxd`) that owns your terminal
+sessions, and a **client** that connects to it. A common setup runs the daemon on
+a server and a GUI client on your desktop, connected over encrypted QUIC — but
+both can also live on one machine.
+
+Pick the **full** install (desktop GUI + daemon) for a workstation, or the
+**headless** install (daemon + CLI only) for a server. For the complete
+reference — every distro, manual download + checksum verification, install
+layout, and offline installs — see [docs/installation.md](docs/installation.md).
+
+### Full (desktop GUI + daemon)
+
+**macOS** — the signed, notarized app:
+
+```bash
+brew install --cask getkono/tap/kmux
+```
+
+…or download the `.dmg` from the [latest release](https://github.com/getkono/kmux/releases/latest).
+
+**Linux** — a native package for your distro (the GUI's GTK4 + libadwaita runtime
+deps are pulled in automatically):
+
+| Distro | Command |
+| --- | --- |
+| Debian / Ubuntu | `sudo apt install ./kmux_<ver>_<arch>.deb` |
+| Fedora / RHEL | `sudo dnf install ./kmux-<ver>.<arch>.rpm` |
+| Arch (AUR) | `paru -S kmux-bin` |
+| Flatpak | `flatpak install ./kmux-<ver>-x86_64.flatpak` |
+
+Download the `.deb` / `.rpm` / `.flatpak` from the [latest release](https://github.com/getkono/kmux/releases/latest).
+Or use the universal installer (works on Linux and macOS; on macOS it installs the
+CLI + daemon and points you at the GUI app):
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/getkono/kmux/master/install.sh | sh
+```
+
+The `install.sh` GUI install needs GTK4 + libadwaita already present
+(`apt install libgtk-4-1 libadwaita-1-0`, `dnf install gtk4 libadwaita`,
+`pacman -S gtk4 libadwaita`); the native packages declare them for you.
+
+### Headless (server / daemon-only)
+
+No GUI, no GTK dependency — just `kmuxd` and the `kmux` CLI:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/getkono/kmux/master/install.sh | sh -s -- --headless
+```
+
+…or a native package / the Homebrew formula:
+
+| Method | Command |
+| --- | --- |
+| Debian / Ubuntu | `sudo apt install ./kmux-headless_<ver>_<arch>.deb` |
+| Fedora / RHEL | `sudo dnf install ./kmux-headless-<ver>.<arch>.rpm` |
+| Homebrew (incl. Linuxbrew) | `brew install getkono/tap/kmux` |
+
+Run `kmuxd` on the server, then connect from a full GUI client on your desktop
+(`kmux --server <host>`). See [Configuration](#configuration) for binding,
+certificates, and the auth token.
+
+### Verify, upgrade, uninstall
+
+```bash
+kmux --version            # check the install
+kmux                      # launch the GUI / connect (full install)
+```
+
+Re-run `install.sh` to upgrade; `install.sh --uninstall` to remove (your config +
+session state are left intact). Native packages upgrade through your package
+manager. If `~/.local/bin` isn't on your `PATH`, the installer prints the line to
+add.
+
+To enable dynamic tab-completion for `kmux` (subcommands, flags, themes,
+`hosts.toml` aliases, and live sessions), add one line to your shell config — see
+[docs/shell-completion.md](docs/shell-completion.md).
+
+To build from source instead, see [Building from source](#building-from-source).
+
 ## Architecture
 
 kmux uses a server/client split:
@@ -63,7 +145,32 @@ configuration.
 | **Command mode** | `/`-prefixed floating overlay (activated with **Ctrl+G** then `/`) for running commands such as switching sessions or attaching to servers. |
 | **Terminal backend** | The VT emulator running inside the daemon (currently [`libghostty-vt`](vendor/ghostty)); clients receive resolved cell data, never raw escape sequences. |
 
-## Prerequisites
+## Configuration
+
+Configure `kmuxd` with a TOML file (see [docs/connection.md](docs/connection.md)
+for the full schema):
+
+```
+$XDG_CONFIG_HOME/kmuxd/kmuxd.toml    (user)
+/etc/kmuxd/kmuxd.toml                (system)
+```
+
+Use `--config <path>` to specify a custom path, or `print-config` to dump
+effective defaults:
+
+```bash
+$ kmuxd print-config        # installed; from a source checkout: cargo run -p kmuxd -- print-config
+```
+
+To serve a custom certificate, set `[tls] cert` and `[tls] key` in `kmuxd.toml`
+(or pass `--cert`/`--key`); otherwise a self-signed certificate is generated.
+By default, the server binds to `0.0.0.0:8443` and prints a shared auth token on
+startup that clients present when connecting.
+
+## Building from source
+
+Build prerequisites (the installed packages above need none of these — they are
+only for building kmux yourself):
 
 - Rust toolchain (edition 2024) via [rustup](https://rustup.rs)
 - Zig `0.15.2`, managed via [mise](https://mise.jdx.dev) (`mise install` reads
@@ -91,8 +198,6 @@ configuration.
     `PKG_CONFIG=/usr/bin/pkg-config cargo run -p kmux-gtk`. See
     [docs/architecture-frontend.md](docs/architecture-frontend.md#building-and-running-kmux-gtk).
 
-## Quick start
-
 Start the server:
 
 ```bash
@@ -116,34 +221,12 @@ $ ./kmux daemon status     # run a CLI subcommand (no GUI)
 > If a `kmux-gtk` build fails with a `pkg-config` error about
 > `graphene-gobject-1.0` (or similar) not being found, your `PATH` has a
 > non-system `pkg-config` shadowing `/usr/bin/pkg-config`. Re-run as
-> `PKG_CONFIG=/usr/bin/pkg-config cargo run -p kmux-gtk`. See
-> [Prerequisites](#prerequisites).
+> `PKG_CONFIG=/usr/bin/pkg-config cargo run -p kmux-gtk`.
 
-By default, the server binds to `0.0.0.0:8443`.
-
-To enable dynamic tab-completion for `kmux` (subcommands, flags, themes,
-`hosts.toml` aliases, and live sessions), add one line to your shell config — see
-[docs/shell-completion.md](docs/shell-completion.md).
-
-## Server configuration
-
-Configure `kmuxd` with a TOML file (see [docs/connection.md](docs/connection.md)
-for the full schema):
-
-```
-$XDG_CONFIG_HOME/kmuxd/kmuxd.toml    (user)
-/etc/kmuxd/kmuxd.toml                (system)
-```
-
-Use `--config <path>` to specify a custom path, or `print-config` to dump
-effective defaults:
-
-```bash
-$ cargo run -p kmuxd -- print-config
-```
-
-To serve a custom certificate, set `[tls] cert` and `[tls] key` in `kmuxd.toml`
-(or pass `--cert`/`--key`); otherwise a self-signed certificate is generated.
+To install a from-source build the way the packages do (the `kmux` entrypoint +
+`kmuxd` to `~/.cargo/bin`, and the GUI as `~/Applications/kmux.app` on macOS or a
+`.desktop` entry on Linux), run `mise run install`. See
+[docs/building-macos.md](docs/building-macos.md) for the macOS app build.
 
 ## Development
 
@@ -162,6 +245,10 @@ format + lint auto-fix on commit (the fixes are auto-staged for you), and
 format/lint/tests on push. `mise install` installs hk, wires the hooks into git,
 and initializes the `vendor/ghostty/` submodule automatically; if any of that
 didn't take (e.g. no network on first run), run `mise run setup`.
+
+Releases are cut with `mise run release <ver>`; the tag-triggered workflow builds
+the tarballs, native packages, and the signed macOS app. See
+[docs/releasing.md](docs/releasing.md) and [packaging/](packaging).
 
 ## Contributing
 

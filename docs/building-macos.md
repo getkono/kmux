@@ -6,6 +6,13 @@ client on Linux. It drives the same toolkit-agnostic `FrontendDriver` (in
 [architecture-frontend.md](architecture-frontend.md#the-native-macos-frontend-kmux-swift)
 for the design; this doc is the build/run recipe.
 
+> To **install** kmux (not build it from source), see the
+> [README Install section](../README.md#install) /
+> [docs/installation.md](installation.md) — on macOS the GUI ships as a signed,
+> notarized app via the Homebrew cask or a `.dmg`. This doc covers the
+> from-source build; `mise run install` assembles the app bundle locally via the
+> shared `mise run package-app` task.
+
 ## Prerequisites
 
 - **Xcode** (or the Command Line Tools) — provides `swift` and the macOS SDK.
@@ -126,14 +133,19 @@ mise run install       # release build → ~/Applications/kmux.app + `kmux` & `k
    starts the GUI — and `kmux daemon …` / `kmux ls` run the CLI directly. (The
    former `kmux-swift/macos/kmux` shell launcher is gone — the `kmux` binary
    replaces it.) Then it:
-2. builds the release `kmux-ffi` staticlib + matching Swift bindings
-   (`mise run gen-ffi-bindings release`) and the app in release, linking that
-   archive (via `KMUX_FFI_LIB`, which overrides `Package.swift`'s debug default),
-3. assembles `~/Applications/kmux.app` — `Contents/MacOS/kmux-swift`, a copy of
-   `kmuxd` beside it, `Contents/Resources/kmux.icns`, and a versioned
-   `Contents/Info.plist` (from [`kmux-swift/macos/`](../kmux-swift/macos/)) — so
-   the app appears in Launchpad / Spotlight / Dock with its icon. This is the
-   macOS analog of kmux-gtk's `.desktop` entry + icon on Linux.
+2. delegates the bundle assembly to the shared `mise run package-app` task, which
+   builds the release `kmux-ffi` staticlib + matching Swift bindings
+   (`mise run gen-ffi-bindings release`) and the app in release (linking that
+   archive via `KMUX_FFI_LIB`, which overrides `Package.swift`'s debug default),
+   then assembles `~/Applications/kmux.app`:
+   `Contents/MacOS/{kmux-swift, kmuxd, kmux-vt-worker, kmux}`,
+   `Contents/Frameworks/libkmux_ghostty.dylib` (with the daemons' runpaths
+   repointed to `@executable_path/../Frameworks`), `Contents/Resources/kmux.icns`,
+   and a versioned `Contents/Info.plist` (from
+   [`kmux-swift/macos/`](../kmux-swift/macos/)) — so the app appears in Launchpad /
+   Spotlight / Dock with its icon (the macOS analog of kmux-gtk's `.desktop`
+   entry). `package-app` also produces the bundle the release workflow codesigns +
+   notarizes, so the local and released layouts never drift.
 
 `kmux` launches the bundle via `open` (LaunchServices) so each invocation gets
 its **own window**, routed to a running instance through the `kmux://` URL scheme
@@ -143,12 +155,15 @@ bundle location (default `~/Applications/kmux.app`). As a dev convenience, when
 — the layout the `dev` mise task sets up — `kmux` `exec`s it directly in the
 foreground, forwarding stdio so logs stream to the launching terminal.
 
-`kmuxd` is bundled *beside* the app exe because `find_server_binary()` checks the
-running exe's own directory before `PATH`: a Finder/Spotlight launch gets the
-minimal launchd `PATH` (no `~/.cargo/bin`), so without the sibling copy the app
-couldn't auto-spawn the local daemon. Both that copy and the `~/.cargo/bin` one
-resolve `libkmux_ghostty` via the rpath baked into the build tree (a from-source
-dev install, like `cargo install`), not a bundled dylib.
+`kmuxd` (and the `kmux-vt-worker` isolation subprocess) are bundled *beside* the
+app exe because `find_server_binary()` / the worker lookup check the running exe's
+own directory before `PATH`: a Finder/Spotlight launch gets the minimal launchd
+`PATH` (no `~/.cargo/bin`), so without the sibling copies the app couldn't
+auto-spawn the local daemon or its worker. Inside the bundle they load
+`libkmux_ghostty` from `Contents/Frameworks` via an `@executable_path` rpath, so
+the `.app` is self-contained and relocatable; the `~/.cargo/bin/kmuxd` from step 1
+instead resolves the library via the rpath baked into the build tree (a
+from-source dev install, like `cargo install`).
 
 ## End-to-end test against a local daemon
 
@@ -178,10 +193,11 @@ builds `kmux` and the GTK frontend `kmux-gtk` natively against Homebrew GTK
 
 ## Notes / limitations
 
-- `mise run install` assembles an `~/Applications/kmux.app` bundle, but it is **not
-  codesigned or notarized** yet (fine for a local from-source install; a
-  Gatekeeper-distributable build is a follow-up). Run via `./kmux` (or `swift
-  run` directly) it launches as a bare SwiftPM executable, setting
+- `mise run install` assembles an `~/Applications/kmux.app` bundle that is **not
+  codesigned** — fine for a local from-source install. The *distributed* app is
+  codesigned + notarized by the release workflow (Developer ID) and shipped as a
+  `.dmg` / Homebrew cask; see [docs/releasing.md](releasing.md). Run via `./kmux`
+  (or `swift run` directly) it launches as a bare SwiftPM executable, setting
   `NSApplication` to a regular foreground app via the `onAppear` hook.
 - The renderer uses the system monospaced face; a configurable font in
   Preferences is a follow-up.

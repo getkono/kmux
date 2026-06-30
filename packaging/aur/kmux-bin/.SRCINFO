@@ -1,0 +1,22 @@
+pkgbase = kmux-bin
+	pkgdesc = Terminal multiplexer and remote desktop with a native GUI (prebuilt)
+	pkgver = 0.2.0
+	pkgrel = 1
+	url = https://github.com/getkono/kmux
+	arch = x86_64
+	arch = aarch64
+	license = AGPL-3.0-only
+	license = LicenseRef-Commercial
+	makedepends = patchelf
+	depends = gtk4
+	depends = libadwaita
+	provides = kmux
+	conflicts = kmux
+	options = !strip
+	options = !debug
+	source_x86_64 = kmux-0.2.0-x86_64.tar.gz::https://github.com/getkono/kmux/releases/download/v0.2.0/kmux-0.2.0-x86_64-unknown-linux-gnu.tar.gz
+	sha256sums_x86_64 = bf37a7cd0442a45297d6007111849cedfd4463a295e2b9d2716c21f80be87107
+	source_aarch64 = kmux-0.2.0-aarch64.tar.gz::https://github.com/getkono/kmux/releases/download/v0.2.0/kmux-0.2.0-aarch64-unknown-linux-gnu.tar.gz
+	sha256sums_aarch64 = 057c884bcb3198a7b33f9ef748f24aad7f97162bfe5c2efa48d8a3d56ac5473e
+
+pkgname = kmux-bin

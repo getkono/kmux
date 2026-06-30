@@ -279,12 +279,39 @@ fn percent_encode(s: &str) -> String {
     out
 }
 
+/// The installed `kmux.app` location, used when `KMUX_APP` is unset. Two
+/// supported install layouts put the bundle in different places:
+/// - `mise run install` (from source) assembles it in `~/Applications/kmux.app`.
+/// - The Homebrew cask installs it to `/Applications/kmux.app`.
+///
+/// Prefer the per-user location, then the system one; if neither exists yet,
+/// fall back to the per-user path so the "not installed" error (see
+/// [`launch_desktop`]) names the place a from-source install would create.
 #[cfg(target_os = "macos")]
 fn default_app_bundle() -> std::path::PathBuf {
-    let home = std::env::var_os("HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_default();
-    home.join("Applications/kmux.app")
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    select_app_bundle(home.as_deref(), |p| p.exists())
+}
+
+/// Pure core of [`default_app_bundle`], split out for testing: the first
+/// candidate `exists` reports present (`~/Applications` before `/Applications`),
+/// else the per-user default (or the system path when there is no `HOME`).
+#[cfg(target_os = "macos")]
+fn select_app_bundle(
+    home: Option<&std::path::Path>,
+    exists: impl Fn(&std::path::Path) -> bool,
+) -> std::path::PathBuf {
+    let user = home.map(|h| h.join("Applications/kmux.app"));
+    let system = std::path::PathBuf::from("/Applications/kmux.app");
+    if let Some(user) = &user
+        && exists(user)
+    {
+        return user.clone();
+    }
+    if exists(&system) {
+        return system;
+    }
+    user.unwrap_or(system)
 }
 
 /// Other platforms have no supported desktop client yet.
@@ -335,6 +362,47 @@ fn kill_running(bin: &std::path::Path) {
         .args(["-f", path])
         .status();
     std::thread::sleep(std::time::Duration::from_millis(150));
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::select_app_bundle;
+    use std::path::{Path, PathBuf};
+
+    const HOME: &str = "/Users/test";
+
+    fn user() -> PathBuf {
+        PathBuf::from(HOME).join("Applications/kmux.app")
+    }
+
+    #[test]
+    fn prefers_user_bundle_when_present() {
+        // Both present → the per-user location wins (a from-source install).
+        let got = select_app_bundle(Some(Path::new(HOME)), |_| true);
+        assert_eq!(got, user());
+    }
+
+    #[test]
+    fn finds_cask_bundle_in_slash_applications() {
+        // Only /Applications exists (the Homebrew cask layout).
+        let got = select_app_bundle(Some(Path::new(HOME)), |p| {
+            p == Path::new("/Applications/kmux.app")
+        });
+        assert_eq!(got, PathBuf::from("/Applications/kmux.app"));
+    }
+
+    #[test]
+    fn defaults_to_user_path_when_neither_exists() {
+        // Not installed yet → name the per-user path the installer would create.
+        let got = select_app_bundle(Some(Path::new(HOME)), |_| false);
+        assert_eq!(got, user());
+    }
+
+    #[test]
+    fn uses_system_path_without_home() {
+        let got = select_app_bundle(None, |_| false);
+        assert_eq!(got, PathBuf::from("/Applications/kmux.app"));
+    }
 }
 
 /// Find a sibling binary `name`: next to the running executable first (the

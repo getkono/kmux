@@ -1,9 +1,20 @@
 name: Release
 
 # Cut a release with `mise run release <ver>` (bumps the version, tags v<ver>, pushes).
-# Pushing the tag fires this workflow, which builds native binaries for every
-# target and publishes them to the GitHub Release. Re-running on an existing tag
-# (push --force, or the workflow_dispatch button) replaces the assets in place.
+# Pushing the tag fires this workflow, which builds native binaries + native
+# packages for every target and publishes them to the GitHub Release. Re-running
+# on an existing tag (push --force, or the workflow_dispatch button) replaces the
+# assets in place.
+#
+# Distribution channels produced here:
+#   - tarballs (kmux, kmuxd, kmux-vt-worker, libkmux_ghostty, GTK GUI on Linux)
+#   - macOS: signed + notarized .app inside a .dmg (Developer ID; needs secrets)
+#   - Linux: .deb + .rpm (full `kmux` and headless `kmux-headless`) via nfpm
+#   - Linux: a .flatpak bundle (x86_64)
+#   - AUR `kmux-bin` push + Homebrew tap (getkono/homebrew-tap) bump
+#
+# Secret-gated legs (macOS signing, AUR, tap) stay dormant until their secrets
+# exist; see docs/releasing.md for the required secrets.
 on:
   push:
     tags: ["v*"]
@@ -18,13 +29,18 @@ permissions:
   contents: write
 
 jobs:
-  # Resolve the tag once and guard that the tagged Cargo.toml version matches it.
+  # Resolve the tag once, guard the Cargo.toml version, and surface which
+  # secret-gated legs are configured (job outputs can read secrets; job `if`
+  # conditions cannot, so we compute booleans here).
   prepare:
     name: Prepare
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.resolve.outputs.tag }}
       version: ${{ steps.resolve.outputs.version }}
+      has_signing: ${{ steps.secrets.outputs.has_signing }}
+      has_aur: ${{ steps.secrets.outputs.has_aur }}
+      has_tap: ${{ steps.secrets.outputs.has_tap }}
     steps:
       - id: resolve
         run: |
@@ -35,6 +51,12 @@ jobs:
           fi
           echo "tag=$tag" >>"$GITHUB_OUTPUT"
           echo "version=${tag#v}" >>"$GITHUB_OUTPUT"
+
+      - id: secrets
+        run: |
+          echo "has_signing=${{ secrets.MACOS_CERT_P12_BASE64 != '' }}" >>"$GITHUB_OUTPUT"
+          echo "has_aur=${{ secrets.AUR_SSH_PRIVATE_KEY != '' }}" >>"$GITHUB_OUTPUT"
+          echo "has_tap=${{ secrets.HOMEBREW_TAP_TOKEN != '' }}" >>"$GITHUB_OUTPUT"
 
       - uses: actions/checkout@v4
         with:
@@ -53,6 +75,7 @@ jobs:
   # Native build per target (no cross-compilation: the Zig/Ghostty FFI build is
   # easiest to keep correct on its own host). Mirrors ci.yml's submodule + mise +
   # cache setup. fail-fast: false so one target's failure leaves the others' assets.
+  # The macOS legs additionally build + sign + notarize the GUI .app into a .dmg.
   build:
     name: Build ${{ matrix.target }}
     needs: prepare
@@ -101,16 +124,53 @@ jobs:
           restore-keys: |
             ${{ matrix.target }}-zig-
 
-      # `mise run package` needs patchelf on Linux to repoint kmuxd's rpath to $ORIGIN.
+      # `mise run package` needs patchelf on Linux to repoint runpaths to $ORIGIN
+      # and builds the GTK frontend (kmux-gtk), which links GTK4 + libadwaita.
       # macOS uses install_name_tool, which ships with the Xcode command line tools.
-      # `mise run package` builds the GTK frontend (`kmux-gtk`) on Linux, which links
-      # GTK4 + libadwaita; patchelf repoints kmuxd's rpath to $ORIGIN.
       - name: Install GTK4 + libadwaita + patchelf (Linux)
         if: runner.os == 'Linux'
         run: sudo apt-get update && sudo apt-get install -y patchelf libgtk-4-dev libadwaita-1-dev
 
-      - name: Package
+      - name: Package tarball
         run: mise run package
+
+      # ---- macOS GUI: build + codesign + notarize the .app into a .dmg --------
+      - name: Set up signing keychain (macOS)
+        if: runner.os == 'macOS' && needs.prepare.outputs.has_signing == 'true'
+        env:
+          MACOS_CERT_P12_BASE64: ${{ secrets.MACOS_CERT_P12_BASE64 }}
+          MACOS_CERT_PASSWORD: ${{ secrets.MACOS_CERT_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          KEYCHAIN="$RUNNER_TEMP/kmux-signing.keychain-db"
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security set-keychain-settings -lut 21600 "$KEYCHAIN"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          echo "$MACOS_CERT_P12_BASE64" | base64 --decode > "$RUNNER_TEMP/cert.p12"
+          security import "$RUNNER_TEMP/cert.p12" -k "$KEYCHAIN" -P "$MACOS_CERT_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN"
+          security list-keychains -d user -s "$KEYCHAIN" $(security list-keychains -d user | tr -d '"')
+          rm -f "$RUNNER_TEMP/cert.p12"
+          echo "KEYCHAIN=$KEYCHAIN" >> "$GITHUB_ENV"
+
+      - name: Build + notarize app (macOS)
+        if: runner.os == 'macOS' && needs.prepare.outputs.has_signing == 'true'
+        env:
+          SIGN_IDENTITY: ${{ secrets.MACOS_SIGN_IDENTITY }}
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_API_KEY_P8_BASE64: ${{ secrets.ASC_API_KEY_P8_BASE64 }}
+        run: |
+          ver="${{ needs.prepare.outputs.version }}"
+          mise run package-app dist/kmux.app
+          echo "$ASC_API_KEY_P8_BASE64" | base64 --decode > "$RUNNER_TEMP/asc.p8"
+          export ASC_KEY_P8="$RUNNER_TEMP/asc.p8"
+          packaging/macos/package-dmg.sh dist/kmux.app "dist/kmux-${ver}-${{ matrix.target }}.dmg"
+          rm -f "$RUNNER_TEMP/asc.p8"
+
+      - name: Clean up keychain (macOS)
+        if: always() && runner.os == 'macOS' && needs.prepare.outputs.has_signing == 'true'
+        run: security delete-keychain "$RUNNER_TEMP/kmux-signing.keychain-db" 2>/dev/null || true
 
       - uses: actions/upload-artifact@v4
         with:
@@ -118,13 +178,120 @@ jobs:
           path: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
+            dist/*.dmg
+            dist/*.dmg.sha256
           if-no-files-found: error
 
-  # Generate the release notes from git-cliff and publish all artifacts. Re-running
-  # updates the existing release and replaces same-named assets (overwrite_files).
+  # Build .deb + .rpm (full `kmux` and headless `kmux-headless`) from the per-arch
+  # tarball with nfpm. The tarball keeps a relocatable $ORIGIN runpath; here we
+  # repoint kmuxd + kmux-vt-worker to the absolute FHS libdir.
+  package-linux:
+    name: Package Linux ${{ matrix.target }}
+    needs: [prepare, build]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - target: x86_64-unknown-linux-gnu
+            pkg_arch: amd64
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            pkg_arch: arm64
+            os: ubuntu-24.04-arm
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Download tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: kmux-${{ matrix.target }}
+          path: dist
+
+      - name: Stage binaries + repoint rpath for FHS
+        run: |
+          sudo apt-get update && sudo apt-get install -y patchelf
+          ver="${{ needs.prepare.outputs.version }}"
+          mkdir -p dist/stage
+          tar -C dist/stage --strip-components=1 -xzf "dist/kmux-${ver}-${{ matrix.target }}.tar.gz"
+          packaging/relocate-rpath.sh dist/stage /usr/lib/kmux
+
+      - name: Install nfpm
+        run: |
+          NFPM_VERSION=2.47.0
+          case "$(uname -m)" in
+            x86_64)  a=x86_64 ;;
+            aarch64) a=arm64 ;;
+            *) echo "unsupported arch $(uname -m)"; exit 1 ;;
+          esac
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${NFPM_VERSION}/nfpm_${NFPM_VERSION}_Linux_${a}.tar.gz" \
+            | sudo tar -C /usr/local/bin -xzf - nfpm
+
+      - name: Build deb + rpm
+        env:
+          PKG_ARCH: ${{ matrix.pkg_arch }}
+          PKG_VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          for cfg in kmux kmux-headless; do
+            nfpm package -f "packaging/nfpm/$cfg.yaml" -p deb -t dist
+            nfpm package -f "packaging/nfpm/$cfg.yaml" -p rpm -t dist
+          done
+          ls -l dist/*.deb dist/*.rpm
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kmux-pkg-${{ matrix.pkg_arch }}
+          path: |
+            dist/*.deb
+            dist/*.rpm
+          if-no-files-found: error
+
+  # Build a self-contained .flatpak bundle (x86_64) from the build artifact. Kept
+  # independent so a flatpak failure never blocks the rest of the release; the
+  # bundle is attached to the release by release-flatpak. aarch64 flatpak is a
+  # follow-up.
+  build-flatpak:
+    name: Build flatpak (x86_64)
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Download tarball
+        uses: actions/download-artifact@v4
+        with:
+          name: kmux-x86_64-unknown-linux-gnu
+          path: dist
+
+      - name: Install flatpak + GNOME runtime
+        run: |
+          sudo apt-get update && sudo apt-get install -y flatpak flatpak-builder python3-yaml
+          flatpak remote-add --if-not-exists flathub https://flathub.org/repo/flathub.flatpakrepo
+          flatpak install -y --noninteractive flathub org.gnome.Platform//48 org.gnome.Sdk//48
+
+      - name: Build bundle
+        run: |
+          ver="${{ needs.prepare.outputs.version }}"
+          packaging/flatpak/build-bundle.sh \
+            "dist/kmux-${ver}-x86_64-unknown-linux-gnu.tar.gz" \
+            "dist/kmux-${ver}-x86_64.flatpak"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: kmux-flatpak
+          path: dist/*.flatpak
+          if-no-files-found: error
+
+  # Generate the release notes from git-cliff and publish the tarballs, dmgs, and
+  # native packages. Re-running updates the existing release and replaces
+  # same-named assets (overwrite_files).
   release:
     name: Publish
-    needs: [prepare, build]
+    needs: [prepare, build, package-linux]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -140,7 +307,6 @@ jobs:
 
       - name: Generate release notes
         run: |
-          # --current = the section for the tag at HEAD (we checked out the tag).
           git cliff --current --strip all -o RELEASE_NOTES.md
           test -s RELEASE_NOTES.md || git cliff --latest --strip all -o RELEASE_NOTES.md
           test -s RELEASE_NOTES.md || git cliff --unreleased --strip all -o RELEASE_NOTES.md
@@ -149,6 +315,7 @@ jobs:
       - uses: actions/download-artifact@v4
         with:
           path: dist
+          pattern: kmux-*
           merge-multiple: true
 
       - name: Publish GitHub Release
@@ -160,5 +327,134 @@ jobs:
           files: |
             dist/*.tar.gz
             dist/*.tar.gz.sha256
-          fail_on_unmatched_files: true
+            dist/*.dmg
+            dist/*.dmg.sha256
+            dist/*.deb
+            dist/*.rpm
+          # dmg/deb/rpm may be absent (e.g. signing not configured), so do not
+          # fail on an unmatched pattern; the per-target uploads already guard the
+          # tarballs with if-no-files-found: error.
+          fail_on_unmatched_files: false
           overwrite_files: true
+
+  # Attach the flatpak bundle to the (now-published) release. Separate from
+  # `release` so a flatpak build failure can't strip the other assets.
+  release-flatpak:
+    name: Attach flatpak
+    needs: [prepare, build-flatpak, release]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: kmux-flatpak
+          path: dist
+      - uses: softprops/action-gh-release@v2.6.2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          files: dist/*.flatpak
+          overwrite_files: true
+
+  # Push the updated kmux-bin PKGBUILD to the AUR. Real tag pushes only (not
+  # workflow_dispatch re-runs), and only when AUR_SSH_PRIVATE_KEY is configured.
+  publish-aur:
+    name: Publish AUR
+    needs: [prepare, release]
+    if: needs.prepare.outputs.has_aur == 'true' && github.event_name == 'push'
+    runs-on: ubuntu-latest
+    container: archlinux:latest
+    steps:
+      - name: Install deps
+        run: pacman -Syu --noconfirm git openssh base-devel sudo
+
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Update + push PKGBUILD
+        env:
+          AUR_SSH_PRIVATE_KEY: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+        run: |
+          set -eu
+          ver="${{ needs.prepare.outputs.version }}"
+          tag="${{ needs.prepare.outputs.tag }}"
+          base="https://github.com/getkono/kmux/releases/download/${tag}"
+          sha_x86=$(curl -fsSL "${base}/kmux-${ver}-x86_64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
+          sha_arm=$(curl -fsSL "${base}/kmux-${ver}-aarch64-unknown-linux-gnu.tar.gz.sha256" | awk '{print $1}')
+
+          cd packaging/aur/kmux-bin
+          sed -i "s/^pkgver=.*/pkgver=${ver}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          sed -i "s/^sha256sums_x86_64=.*/sha256sums_x86_64=('${sha_x86}')/" PKGBUILD
+          sed -i "s/^sha256sums_aarch64=.*/sha256sums_aarch64=('${sha_arm}')/" PKGBUILD
+
+          # Regenerate .SRCINFO as a non-root user (makepkg refuses to run as root).
+          useradd -m builder
+          cp PKGBUILD /home/builder/PKGBUILD
+          chown builder /home/builder/PKGBUILD
+          sudo -u builder bash -c 'cd /home/builder && makepkg --printsrcinfo -p PKGBUILD' > .SRCINFO
+
+          install -d -m700 "$HOME/.ssh"
+          printf '%s\n' "$AUR_SSH_PRIVATE_KEY" > "$HOME/.ssh/id_aur"
+          chmod 600 "$HOME/.ssh/id_aur"
+          ssh-keyscan -H aur.archlinux.org >> "$HOME/.ssh/known_hosts" 2>/dev/null
+          export GIT_SSH_COMMAND="ssh -i $HOME/.ssh/id_aur -o StrictHostKeyChecking=accept-new"
+          git config --global user.name "kmux release bot"
+          git config --global user.email "opensource@getkono.com"
+          git config --global --add safe.directory '*'
+
+          repo=$(mktemp -d)
+          git clone ssh://aur@aur.archlinux.org/kmux-bin.git "$repo"
+          cp PKGBUILD .SRCINFO "$repo/"
+          cd "$repo"
+          git add -A
+          git commit -m "kmux ${ver}"
+          git push
+
+  # Bump the Homebrew tap (getkono/homebrew-tap) formula + cask to this release.
+  update-tap:
+    name: Update Homebrew tap
+    needs: [prepare, release]
+    if: needs.prepare.outputs.has_tap == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout kmux
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          path: kmux
+
+      - name: Checkout tap
+        uses: actions/checkout@v4
+        with:
+          repository: getkono/homebrew-tap
+          token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+          path: tap
+
+      - name: Render + commit formula/cask
+        run: |
+          set -eu
+          ver="${{ needs.prepare.outputs.version }}"
+          tag="${{ needs.prepare.outputs.tag }}"
+          base="https://github.com/getkono/kmux/releases/download/${tag}"
+          get() { curl -fsSL "$1" 2>/dev/null | awk '{print $1}'; }
+
+          export VERSION="$ver"
+          export SHA_TAR_ARM_MAC=$(get "${base}/kmux-${ver}-aarch64-apple-darwin.tar.gz.sha256")
+          export SHA_TAR_X86_MAC=$(get "${base}/kmux-${ver}-x86_64-apple-darwin.tar.gz.sha256")
+          export SHA_TAR_ARM_LIN=$(get "${base}/kmux-${ver}-aarch64-unknown-linux-gnu.tar.gz.sha256")
+          export SHA_TAR_X86_LIN=$(get "${base}/kmux-${ver}-x86_64-unknown-linux-gnu.tar.gz.sha256")
+          export SHA_DMG_ARM=$(get "${base}/kmux-${ver}-aarch64-apple-darwin.dmg.sha256")
+          export SHA_DMG_X86=$(get "${base}/kmux-${ver}-x86_64-apple-darwin.dmg.sha256")
+
+          kmux/packaging/homebrew/render.sh tap
+
+          cd tap
+          git config user.name "kmux release bot"
+          git config user.email "opensource@getkono.com"
+          if git status --porcelain | grep -q .; then
+            git add -A
+            git commit -m "kmux ${ver}"
+            git push
+          else
+            echo "tap already up to date"
+          fi

@@ -1,0 +1,61 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  AppStream metainfo for the kmux GTK GUI. Shipped to /usr/share/metainfo by the
+  deb/rpm packages and into /app/share/metainfo by the flatpak, so GNOME Software
+  / KDE Discover / `flatpak` list kmux with a name, summary, and icon. The
+  component id matches the desktop file (dev.getkono.kmux.desktop) and the app id
+  in crates/kmux-gtk/src/imp.rs.
+
+  Screenshots and a richer description are intentionally minimal for now and are
+  tracked as a follow-up before any Flathub submission.
+-->
+<component type="desktop-application">
+  <id>dev.getkono.kmux</id>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>AGPL-3.0-only OR LicenseRef-Commercial</project_license>
+
+  <name>kmux</name>
+  <summary>Terminal multiplexer and remote desktop client</summary>
+
+  <description>
+    <p>
+      kmux is a terminal multiplexer and session manager with remote desktop
+      capabilities. Connect to persistent terminal sessions over encrypted QUIC
+      connections from a native desktop GUI.
+    </p>
+    <p>
+      Sessions live in a background daemon (kmuxd) and survive client
+      disconnects, so you can detach from a desktop client and reconnect later —
+      locally or from another machine over the network.
+    </p>
+  </description>
+
+  <launchable type="desktop-id">dev.getkono.kmux.desktop</launchable>
+
+  <categories>
+    <category>System</category>
+    <category>TerminalEmulator</category>
+  </categories>
+
+  <keywords>
+    <keyword>terminal</keyword>
+    <keyword>multiplexer</keyword>
+    <keyword>session</keyword>
+    <keyword>remote</keyword>
+    <keyword>tmux</keyword>
+  </keywords>
+
+  <url type="homepage">https://github.com/getkono/kmux</url>
+  <url type="bugtracker">https://github.com/getkono/kmux/issues</url>
+  <url type="vcs-browser">https://github.com/getkono/kmux</url>
+
+  <developer id="dev.getkono">
+    <name>Kono</name>
+  </developer>
+
+  <content_rating type="oars-1.1" />
+
+  <releases>
+    <release version="0.2.0" date="2026-05-28" />
+  </releases>
+</component>

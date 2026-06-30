@@ -22,29 +22,15 @@ if [[ "$(uname -s)" == "Linux" ]]; then
     cp crates/kmux-gtk/data/icons/dev.getkono.kmux.svg "$icons/"
     echo "==> installed kmux + the kmux-gtk GUI + desktop entry (GTK4 + libadwaita are runtime deps)"
 elif [[ "$(uname -s)" == "Darwin" ]]; then
-    # Build the release FFI staticlib + matching Swift bindings, then the app
-    # in release linking that archive (KMUX_FFI_LIB overrides Package.swift's
-    # debug default to an absolute release path).
-    mise run gen-ffi-bindings release
-    KMUX_FFI_LIB="$PWD/target/release/libkmux_ffi.a" \
-        swift build -c release --package-path kmux-swift
-    exe="kmux-swift/.build/release/kmux-swift"
-    [[ -x "$exe" ]] || { echo "error: swift build did not produce $exe" >&2; exit 1; }
-    ver=$(sed -n '/^\[workspace\.package\]/,/^\[/{s/^version = "\(.*\)"/\1/p;}' Cargo.toml | head -n1)
-    # Assemble the kmux.app bundle in ~/Applications (user-level, no sudo) —
-    # the macOS analog of the Linux .desktop entry + icon.
+    # Assemble the distributable kmux.app in ~/Applications (user-level, no sudo)
+    # via the shared packaging task, so this local install and the CI-signed
+    # release bundle stay byte-for-byte identical in layout. package-app builds
+    # the SwiftUI app + bundles kmuxd, kmux-vt-worker, and libkmux_ghostty inside
+    # the .app (rpaths repointed to @executable_path/../Frameworks), so a
+    # Finder/Spotlight launch (minimal launchd PATH, no ~/.cargo/bin) can
+    # auto-spawn the local daemon and its isolation worker.
     app="$HOME/Applications/kmux.app"
-    rm -rf "$app"
-    mkdir -p "$app/Contents/MacOS" "$app/Contents/Resources"
-    cp "$exe" "$app/Contents/MacOS/kmux-swift"
-    # Bundle kmuxd beside the GUI exe: find_server_binary() looks in the
-    # running exe's own dir first, so a Finder/Spotlight launch (which gets
-    # the minimal launchd PATH, without ~/.cargo/bin) can still auto-spawn
-    # the local daemon. Its rpath points back into the build tree for
-    # libkmux_ghostty, same as the ~/.cargo/bin/kmuxd from `cargo install`.
-    cp target/release/kmuxd "$app/Contents/MacOS/kmuxd"
-    cp kmux-swift/macos/kmux.icns "$app/Contents/Resources/kmux.icns"
-    sed "s/__VERSION__/${ver}/g" kmux-swift/macos/Info.plist > "$app/Contents/Info.plist"
+    mise run package-app "$app"
     # Refresh Launch Services so Finder/Spotlight pick up the new bundle + icon.
     touch "$app"
     /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister -f "$app" 2>/dev/null || true

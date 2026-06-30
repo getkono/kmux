@@ -1,0 +1,25 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Hardened-runtime entitlements for the signed/notarized kmux.app (see
+  .github/workflows/release.yml and packaging/macos/package-dmg.sh).
+
+  - disable-library-validation: the app loads the bundled libkmux_ghostty.dylib
+    and spawns its own Team-signed helper executables (kmuxd, kmux-vt-worker), so
+    library validation must be relaxed. All helpers share the kmux Team ID.
+  - network client/server: the daemon makes outbound QUIC/TLS/SSH connections and
+    listens on a local Unix socket / loopback.
+
+  No App Sandbox: kmux needs arbitrary PTY/process access, which sandboxing would
+  break; Developer ID + notarization does not require it.
+-->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.cs.disable-library-validation</key>
+    <true/>
+    <key>com.apple.security.network.client</key>
+    <true/>
+    <key>com.apple.security.network.server</key>
+    <true/>
+</dict>
+</plist>
