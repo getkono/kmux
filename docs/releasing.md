@@ -26,7 +26,48 @@ user-facing install matrix is [docs/installation.md](installation.md).
 The crates are `publish = false` — kmux is **not** published to crates.io. The
 unit of distribution is the binary tarball, not a registry crate.
 
-## Versioning
+## Versioning policy
+
+kmux follows [semantic versioning](https://semver.org). **From v1.0.0 onward**,
+the release version is read as a compatibility-and-risk signal, not a literal
+count of API-breaking changes:
+
+- **Patch** (`1.0.0` → `1.0.1`) — the default, and the level we reach for on
+  almost every release. A patch is *non-breaking*: it preserves **forward
+  compatibility** and **supervision-free migration**. Concretely, upgrading is
+  safe and unattended — on-disk state migrates forward automatically (a newer
+  daemon reads and upgrades older checkpoints via the `STATE_VERSION` migration
+  chain), and a running daemon hands its live sessions to the new build without
+  dropping shells (see [`daemon-handoff.md`](daemon-handoff.md) and the
+  [upgrade QA matrix](qa-daemon-upgrade.md)). Most user-visible features land
+  here, so the patch number climbs freely — expect versions like `1.0.123`.
+- **Minor** (`1.0.x` → `1.1.0`) — a major overhaul carrying more upgrade risk.
+  We still aim to preserve compatibility and migration, but the change is large
+  enough that the bump signals "skim the changelog before upgrading".
+- **Major** (`1.x` → `2.0.0`) — a genuinely breaking change that cannot keep
+  forward compatibility or supervision-free migration. Avoided wherever
+  possible; reserved for the rare unavoidable case.
+
+Until v1.0.0 (the current `0.x` line) these guarantees are not yet in force; the
+policy above takes effect at the 1.0.0 release.
+
+### Release version vs. internal contract versions
+
+The release semver is a *user-facing* signal and is independent of the several
+monotonic integer versions that gate the wire and ABI contracts between kmux
+processes: the data protocol's `PROTOCOL_VERSION`, the `kmux-ffi` C ABI's
+`KMUX_FFI_ABI_VERSION`, the daemon↔worker `kmux-worker-protocol`, and
+`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION` (see the *Correctness* section of
+[`../CLAUDE.md`](../CLAUDE.md)). Those bump per change, and each connecting party
+refuses a mismatch — [`kmux-protocol::compat`](../crates/kmux-protocol/src/compat.rs)
+is the single source of truth for classifying a skew as compatible or blocking.
+A patch release may bump any of those integers: what makes it a patch is that the
+upgrade still migrates without supervision (the daemon hands off live sessions,
+state migrates forward, and any residual skew between mismatched binaries is
+surfaced as a clear, non-destructive block rather than silent breakage) — not
+that the internal numbers stayed fixed.
+
+## Version source of truth
 
 There is a single source of truth: `[workspace.package].version` in the root
 `Cargo.toml`. All seven crates inherit it via `version.workspace = true`, so a
