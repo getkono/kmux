@@ -432,7 +432,7 @@ fn locate_binary(name: &str) -> anyhow::Result<std::path::PathBuf> {
 }
 
 #[cfg(all(test, target_os = "macos"))]
-mod tests {
+mod tests_open {
     use super::*;
     use clap::Parser;
 

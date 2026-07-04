@@ -101,14 +101,17 @@ pub enum Action {
     Disconnect,
 
     // Pane / tab management.
-    // (`CreatePane`/`NextPane`/`PrevPane` map to tab operations — the
-    // user-facing "pane" the chrome shows as a tab is now a Tab.)
+    // (`CreatePane` maps to a tab operation — the user-facing "pane" the chrome
+    // shows as a tab is now a Tab.)
     CreatePane,
     ClosePane,
     /// Cancel the most recent soft-close before its grace window elapses (#86).
     UndoClose,
-    NextPane,
-    PrevPane,
+    NextTab,
+    PrevTab,
+    /// Cycle the focused pane within the active tab's leaf order (wraps).
+    NextPaneInTab,
+    PrevPaneInTab,
     CloseTab,
     RenameTab,
 

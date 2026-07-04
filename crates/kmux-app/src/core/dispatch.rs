@@ -52,8 +52,10 @@ impl AppCore {
             }
             Action::NextSession => self.mgr.cycle_session(1),
             Action::PrevSession => self.mgr.cycle_session(-1),
-            Action::NextPane => self.mgr.cycle_tab(1),
-            Action::PrevPane => self.mgr.cycle_tab(-1),
+            Action::NextTab => self.mgr.cycle_tab(1),
+            Action::PrevTab => self.mgr.cycle_tab(-1),
+            Action::NextPaneInTab => self.cycle_pane_in_tab(1),
+            Action::PrevPaneInTab => self.cycle_pane_in_tab(-1),
             Action::CloseTab => self.mgr.close_tab(),
             Action::RenameTab => {
                 if let (Some(word_id), Some(tab_index)) = (
@@ -501,6 +503,26 @@ impl AppCore {
         };
         if let Some(word) = self.mgr.active_session().map(|s| s.to_string()) {
             self.mgr.focus_pane(format_pane_id(&word, pane_index));
+        }
+    }
+
+    /// Cycle the focused pane within the active tab's leaf order by `delta`
+    /// (wraps at both ends). No-op when the active tab has no leaves.
+    fn cycle_pane_in_tab(&mut self, delta: i32) {
+        let Some(leaves) = self.mgr.active_layout().map(|l| l.leaves().to_vec()) else {
+            return;
+        };
+        if leaves.is_empty() {
+            return;
+        }
+        let focused = self.mgr.active_pane_id().and_then(pane_index);
+        let current = focused
+            .and_then(|idx| leaves.iter().position(|&p| p == idx))
+            .unwrap_or(0);
+        let len = leaves.len() as i32;
+        let next = (current as i32 + delta).rem_euclid(len) as usize;
+        if let Some(word) = self.mgr.active_session().map(|s| s.to_string()) {
+            self.mgr.focus_pane(format_pane_id(&word, leaves[next]));
         }
     }
 

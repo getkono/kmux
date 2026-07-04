@@ -30,8 +30,8 @@ fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
         ("new-pane", Action::CreatePane, &["<Ctrl><Shift>t"]),
         ("close-pane", Action::ClosePane, &["<Ctrl><Shift>q"]),
         ("undo-close", Action::UndoClose, &["<Ctrl><Shift>u"]),
-        ("next-pane", Action::NextPane, &["<Ctrl><Shift>Right"]),
-        ("prev-pane", Action::PrevPane, &["<Ctrl><Shift>Left"]),
+        ("next-tab", Action::NextTab, &["<Ctrl><Shift>Right"]),
+        ("prev-tab", Action::PrevTab, &["<Ctrl><Shift>Left"]),
         ("close-tab", Action::CloseTab, &[]),
         ("rename-tab", Action::RenameTab, &["<Shift>F2"]),
         // Tiling: split the focused pane and move focus between tiled panes.
