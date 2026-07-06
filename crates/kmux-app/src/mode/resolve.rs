@@ -93,8 +93,8 @@ pub(crate) fn resolve_session(key: &Key, _mods: Modifiers) -> (Option<Mode>, Act
             "X" => (None, Action::CloseSession),
             "x" => (Some(Mode::Normal), Action::ClosePane),
             "n" => (None, Action::NextSession),
-            "j" => (None, Action::NextPane),
-            "k" => (None, Action::PrevPane),
+            "j" => (None, Action::NextTab),
+            "k" => (None, Action::PrevTab),
             "r" => (None, Action::RenameSession),
             "d" => (Some(Mode::Normal), Action::Disconnect),
             "l" => (None, Action::ToggleInputLock),
@@ -112,11 +112,11 @@ pub(crate) fn resolve_session(key: &Key, _mods: Modifiers) -> (Option<Mode>, Act
             "9" => (Some(Mode::Normal), Action::JumpToSession(8)),
             _ => (None, Action::None),
         },
-        Key::Named(NamedKey::Tab) => (None, Action::NextPane),
+        Key::Named(NamedKey::Tab) => (None, Action::NextTab),
         Key::Named(NamedKey::ArrowRight) => (None, Action::NextSession),
         Key::Named(NamedKey::ArrowLeft) => (None, Action::PrevSession),
-        Key::Named(NamedKey::ArrowDown) => (None, Action::NextPane),
-        Key::Named(NamedKey::ArrowUp) => (None, Action::PrevPane),
+        Key::Named(NamedKey::ArrowDown) => (None, Action::NextTab),
+        Key::Named(NamedKey::ArrowUp) => (None, Action::PrevTab),
         Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::None),
         _ => (None, Action::None),
     }
@@ -426,7 +426,7 @@ mod tests {
             &Key::Named(NamedKey::Tab),
             Modifiers::empty(),
         );
-        assert_eq!(action, Action::NextPane);
+        assert_eq!(action, Action::NextTab);
     }
 
     #[test]

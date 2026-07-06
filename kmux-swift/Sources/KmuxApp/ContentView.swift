@@ -234,9 +234,9 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut("]", modifiers: [.command, .shift])
             Button("Previous Session") { model?.dispatch(.prevSession) }
                 .keyboardShortcut("[", modifiers: [.command, .shift])
-            Button("Next Tab") { model?.dispatch(.nextPane) }
+            Button("Next Tab") { model?.dispatch(.nextTab) }
                 .keyboardShortcut("]", modifiers: [.command, .option])
-            Button("Previous Tab") { model?.dispatch(.prevPane) }
+            Button("Previous Tab") { model?.dispatch(.prevTab) }
                 .keyboardShortcut("[", modifiers: [.command, .option])
             Button("Close Tab") { model?.dispatch(.closeTab) }
             Divider()
@@ -281,10 +281,14 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut(.upArrow, modifiers: [.command, .option])
             Button("Focus Down") { model?.dispatch(.focusDown) }
                 .keyboardShortcut(.downArrow, modifiers: [.command, .option])
-            Menu("Focus Pane") {
+            Button("Cycle Pane Next") { model?.dispatch(.nextPaneInTab) }
+                .keyboardShortcut(.tab, modifiers: .control)
+            Button("Cycle Pane Previous") { model?.dispatch(.prevPaneInTab) }
+                .keyboardShortcut(.tab, modifiers: [.control, .shift])
+            Menu("Focus Tab") {
                 ForEach(1...9, id: \.self) { n in
-                    Button("Pane \(n)") {
-                        model?.dispatch(.focusPaneAt(index: UInt32(n - 1)))
+                    Button("Tab \(n)") {
+                        model?.selectTab(UInt32(n - 1))
                     }
                     .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: .command)
                 }

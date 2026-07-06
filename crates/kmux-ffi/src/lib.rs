@@ -298,8 +298,11 @@ pub enum FfiAction {
     ClosePane,
     /// Cancel the most recent soft-close within its grace window (issue #86).
     UndoClose,
-    NextPane,
-    PrevPane,
+    NextTab,
+    PrevTab,
+    /// Cycle the focused pane within the active tab (wraps at ends).
+    NextPaneInTab,
+    PrevPaneInTab,
     CloseTab,
     RenameTab,
     // Tiling: split the focused pane, move focus, resize the split, swap panes.
@@ -366,8 +369,10 @@ impl From<FfiAction> for Action {
             FfiAction::CreatePane => Action::CreatePane,
             FfiAction::ClosePane => Action::ClosePane,
             FfiAction::UndoClose => Action::UndoClose,
-            FfiAction::NextPane => Action::NextPane,
-            FfiAction::PrevPane => Action::PrevPane,
+            FfiAction::NextTab => Action::NextTab,
+            FfiAction::PrevTab => Action::PrevTab,
+            FfiAction::NextPaneInTab => Action::NextPaneInTab,
+            FfiAction::PrevPaneInTab => Action::PrevPaneInTab,
             FfiAction::CloseTab => Action::CloseTab,
             FfiAction::RenameTab => Action::RenameTab,
             FfiAction::SplitRight => Action::SplitRight,
