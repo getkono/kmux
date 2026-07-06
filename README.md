@@ -1,5 +1,7 @@
 # kmux
 
+> Status: Active development - Linux and macOS GUIs are alpha quality. They measurably work mostly but underlying protocol features need to be refined in how they are done in the GUIs.
+
 A terminal multiplexer and session manager with remote desktop capabilities.
 Connect to persistent terminal sessions over encrypted QUIC connections
 from a native desktop GUI.
