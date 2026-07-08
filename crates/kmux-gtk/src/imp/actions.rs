@@ -30,9 +30,9 @@ fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
         ("new-pane", Action::CreatePane, &["<Ctrl><Shift>t"]),
         ("close-pane", Action::ClosePane, &["<Ctrl><Shift>q"]),
         ("undo-close", Action::UndoClose, &["<Ctrl><Shift>u"]),
-        ("next-tab", Action::NextTab, &["<Ctrl><Shift>Right"]),
-        ("prev-tab", Action::PrevTab, &["<Ctrl><Shift>Left"]),
-        ("close-tab", Action::CloseTab, &[]),
+        ("next-tab", Action::NextTab, &["<Ctrl>Page_Down"]),
+        ("prev-tab", Action::PrevTab, &["<Ctrl>Page_Up"]),
+        ("close-tab", Action::CloseTab, &["<Ctrl><Shift>w"]),
         ("rename-tab", Action::RenameTab, &["<Shift>F2"]),
         // Tiling: split the focused pane and move focus between tiled panes.
         (
@@ -70,18 +70,10 @@ fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
         ("cycle-layout", Action::CycleLayout, &["<Ctrl><Shift>space"]),
         ("zoom-pane", Action::ToggleZoom, &["<Ctrl><Shift>z"]),
         ("new-session", Action::CreateSession, &["<Ctrl><Shift>n"]),
-        ("close-session", Action::CloseSession, &["<Ctrl><Shift>w"]),
+        ("close-session", Action::CloseSession, &[]),
         ("rename-session", Action::RenameSession, &["F2"]),
-        (
-            "next-session",
-            Action::NextSession,
-            &["<Ctrl>Tab", "<Ctrl>Page_Down"],
-        ),
-        (
-            "prev-session",
-            Action::PrevSession,
-            &["<Ctrl><Shift>Tab", "<Ctrl>Page_Up"],
-        ),
+        ("next-session", Action::NextSession, &["<Ctrl>Tab"]),
+        ("prev-session", Action::PrevSession, &["<Ctrl><Shift>Tab"]),
         ("disconnect", Action::Disconnect, &[]),
         ("reconnect", Action::Reconnect, &["<Ctrl><Shift>r"]),
         ("toggle-lock", Action::ToggleInputLock, &["<Ctrl><Shift>l"]),
@@ -402,16 +394,16 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;Tab</property><property name="title">Previous session</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;1</property><property name="title">Jump to session 1–9</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">F2</property><property name="title">Rename session</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;w</property><property name="title">Close session</property></object></child>
           </object>
         </child>
         <child>
           <object class="GtkShortcutsGroup">
             <property name="title">Tabs</property>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;t</property><property name="title">New tab</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;Right</property><property name="title">Next tab</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;Left</property><property name="title">Previous tab</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;Page_Down</property><property name="title">Next tab</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;Page_Up</property><property name="title">Previous tab</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Shift&gt;F2</property><property name="title">Rename tab</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;w</property><property name="title">Close tab</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;q</property><property name="title">Close pane (soft, 3s undo)</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;u</property><property name="title">Undo close</property></object></child>
           </object>
@@ -468,6 +460,13 @@ mod tests {
             .map(|(_, a, _)| a)
     }
 
+    fn accels_for(name: &str) -> Option<&'static [&'static str]> {
+        dispatched_specs()
+            .into_iter()
+            .find(|(n, _, _)| *n == name)
+            .map(|(_, _, accels)| accels)
+    }
+
     #[test]
     fn signal_actions_use_posix_numbers() {
         assert_eq!(action_for("signal-term"), Some(Action::SendSignal(15)));
@@ -493,6 +492,8 @@ mod tests {
     fn core_commands_are_registered_with_expected_actions() {
         assert_eq!(action_for("new-pane"), Some(Action::CreatePane));
         assert_eq!(action_for("close-pane"), Some(Action::ClosePane));
+        assert_eq!(action_for("close-tab"), Some(Action::CloseTab));
+        assert_eq!(action_for("close-session"), Some(Action::CloseSession));
         assert_eq!(action_for("next-session"), Some(Action::NextSession));
         assert_eq!(action_for("copy"), Some(Action::CopySelection));
         assert_eq!(action_for("paste"), Some(Action::Paste));
@@ -502,6 +503,12 @@ mod tests {
             Some(Action::ToggleRenderDebug)
         );
         assert_eq!(action_for("reset-renderer"), Some(Action::ResetRenderer));
+    }
+
+    #[test]
+    fn close_tab_owns_terminal_close_accelerator() {
+        assert_eq!(accels_for("close-tab"), Some(&["<Ctrl><Shift>w"][..]));
+        assert_eq!(accels_for("close-session"), Some(&[][..]));
     }
 
     #[test]
@@ -515,6 +522,22 @@ mod tests {
             names.len(),
             count,
             "duplicate action name in dispatched_specs"
+        );
+    }
+
+    #[test]
+    fn every_dispatched_accelerator_is_unique() {
+        let mut accels: Vec<&str> = dispatched_specs()
+            .into_iter()
+            .flat_map(|(_, _, accels)| accels.iter().copied())
+            .collect();
+        accels.sort_unstable();
+        let count = accels.len();
+        accels.dedup();
+        assert_eq!(
+            accels.len(),
+            count,
+            "duplicate accelerator in dispatched_specs"
         );
     }
 }
