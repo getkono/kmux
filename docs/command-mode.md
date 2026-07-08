@@ -110,7 +110,7 @@ The full list lives in `cmd::registry::ALL`. Categories:
   `snapshot on|off`, `theme <name>`, `clear-history`.
 * **Connection** — `disconnect`, `reconnect`, `server` (open picker), `local`
   (switch to UDS).
-* **Sessions** — `session new [name] [cwd]`, `session close`,
+* **Sessions** — `session new [name] [cwd]`, `session close` (opens confirmation),
   `session rename <name>`, `session next`, `session prev`,
   `session switch <name|id|index>`, `session list`. All have `s …` aliases.
 * **Panes** — `pane new`, `pane close`, `pane next`, `pane prev`. `p …` aliases.

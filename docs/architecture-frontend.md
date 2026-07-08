@@ -52,8 +52,10 @@ The contract a frontend implements:
   produces actions is its own choice. The GTK frontend is **accelerators-only**:
   native GTK accelerators, menu items, and widgets bind straight to `Action`s /
   `TopBarAction`s, and any key the accelerators don't claim is forwarded to the
-  PTY. (The modal keymap `kmux_app::mode::resolve` remains available in the core
-  for any frontend that prefers a chord-based input model.) Plus
+  PTY. Destructive session close is still shared policy: `CloseSession` enters
+  `Mode::ConfirmCloseSession`, and only the confirmation action sends
+  `SessionClose`. (The modal keymap `kmux_app::mode::resolve` remains available
+  in the core for any frontend that prefers a chord-based input model.) Plus
   `core.set_term_size(size)` whenever the content
   area resizes (the frontend reports its geometry — the core never queries a
   terminal).
