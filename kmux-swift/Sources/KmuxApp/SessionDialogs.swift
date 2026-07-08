@@ -85,3 +85,29 @@ struct RenameTabSheet: View {
         renameTarget = nil
     }
 }
+
+/// Destructive session-close confirmation. Session close is intentionally not a
+/// one-keystroke action; the driver only closes after this sheet confirms.
+struct CloseSessionSheet: View {
+    @ObservedObject var model: KmuxModel
+    let name: String
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 14) {
+            Text("Close Session").font(.headline)
+            Text("Close session \"\(name)\" and all of its tabs and panes?")
+                .foregroundStyle(.secondary)
+            HStack {
+                Spacer()
+                Button("Cancel") { model.driver.cancelPicker() }
+                    .keyboardShortcut(.cancelAction)
+                Button("Close Session", role: .destructive) {
+                    model.confirmCloseSession()
+                }
+                .keyboardShortcut(.defaultAction)
+            }
+        }
+        .padding(20)
+        .frame(width: 360)
+    }
+}

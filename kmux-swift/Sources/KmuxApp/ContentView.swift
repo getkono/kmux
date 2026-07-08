@@ -69,6 +69,11 @@ struct ContentView: View {
         .sheet(isPresented: connectionPresented) {
             ConnectionView(model: model)
         }
+        .sheet(isPresented: closeSessionPresented) {
+            if case .confirmCloseSession(wordId: _, name: let name) = model.mode {
+                CloseSessionSheet(model: model, name: name)
+            }
+        }
         .sheet(item: $ui.renameTarget) { session in
             RenameSheet(model: model, session: session, renameTarget: $ui.renameTarget)
         }
@@ -176,6 +181,16 @@ struct ContentView: View {
         )
     }
 
+    private var closeSessionPresented: Binding<Bool> {
+        Binding(
+            get: {
+                if case .confirmCloseSession = model.mode { return true }
+                return false
+            },
+            set: { if !$0 { model.driver.cancelPicker() } }
+        )
+    }
+
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
         ToolbarItemGroup {
             ConnectionBadge(model: model)
@@ -239,6 +254,7 @@ struct KmuxCommands: Commands {
             Button("Previous Tab") { model?.dispatch(.prevTab) }
                 .keyboardShortcut("[", modifiers: [.command, .option])
             Button("Close Tab") { model?.dispatch(.closeTab) }
+                .keyboardShortcut("w")
             Divider()
             Button("Reconnect") { model?.dispatch(.reconnect) }
                 .keyboardShortcut("r")
@@ -313,7 +329,6 @@ struct KmuxCommands: Commands {
             Button("Toggle Zoom") { model?.dispatch(.toggleZoom) }
                 .keyboardShortcut("z", modifiers: [.command, .control])
             Button("Close Pane") { model?.dispatch(.closePane) }
-                .keyboardShortcut("w", modifiers: [.command, .shift])
             Button("Undo Close") { model?.dispatch(.undoClose) }
                 .keyboardShortcut("u", modifiers: [.command, .shift])
         }

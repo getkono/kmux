@@ -254,9 +254,7 @@ fn cmd_session_close(app: &mut AppCore, _args: &[String]) -> CommandResult {
     if app.mgr.active_session().is_none() {
         return Err("no active session".into());
     }
-    // Soft-close with a grace window + undo (issue #64), matching the keybinding;
-    // the session becomes restorable from the graveyard after the window.
-    app.soft_close_active_session();
+    app.confirm_close_active_session();
     Ok(CommandSuccess::Ok)
 }
 

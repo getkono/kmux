@@ -132,6 +132,11 @@ final class KmuxModel: ObservableObject {
         apply(driver.dispatch(action: action))
     }
 
+    /// Confirm a pending destructive session close.
+    func confirmCloseSession() {
+        apply(driver.confirmCloseSession())
+    }
+
     /// Kick a client connection from the listed session (issue #146). The
     /// connected-clients list refreshes on the next ~1 Hz poll.
     func kickClient(_ clientId: UInt64) {
