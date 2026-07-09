@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -407,12 +408,33 @@ impl SessionManager {
             ServerMessage::TabClosed {
                 word_id, tab_index, ..
             } => {
+                let mut closed_panes = Vec::new();
+                let mut next_tab = None;
                 if let Some(entry) = self
                     .session_list
                     .iter_mut()
                     .find(|e| e.meta.word_id == word_id)
                 {
+                    if let Some(tab) = entry.tabs.iter().find(|t| t.tab_index == tab_index) {
+                        closed_panes = tab.layout.leaves();
+                    }
                     entry.tabs.retain(|t| t.tab_index != tab_index);
+                    let live_panes = entry
+                        .tabs
+                        .iter()
+                        .flat_map(|t| t.layout.leaves())
+                        .collect::<HashSet<_>>();
+                    closed_panes.retain(|pane| !live_panes.contains(pane));
+                    entry
+                        .panes
+                        .retain(|pane| !closed_panes.contains(&pane.pane_index));
+                    if entry.active_tab == tab_index {
+                        entry.active_tab = entry.tabs.first().map(|t| t.tab_index).unwrap_or(0);
+                    }
+                    next_tab = entry.tabs.first().map(|t| t.tab_index);
+                }
+                for pane_index in closed_panes {
+                    self.forget_pane(&kmux_protocol::format_pane_id(&word_id, pane_index));
                 }
                 // If the closed tab was the one we were viewing, move to another.
                 if self.active_session.as_deref() == Some(word_id.as_str())
@@ -420,13 +442,7 @@ impl SessionManager {
                 {
                     self.active_tab = None;
                     self.visible_panes.clear();
-                    let next = self
-                        .session_list
-                        .iter()
-                        .find(|e| e.meta.word_id == word_id)
-                        .and_then(|e| e.tabs.first())
-                        .map(|t| t.tab_index);
-                    match next {
+                    match next_tab {
                         Some(t) => self.select_tab(t),
                         None => {
                             self.active_pane = None;

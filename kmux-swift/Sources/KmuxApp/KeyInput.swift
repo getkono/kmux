@@ -19,6 +19,13 @@ extension TerminalNSView {
 
         let mods = keyMods(event)
 
+        if let named = namedKey(for: event),
+            case .tab = named, mods.ctrl, !mods.alt, !mods.command
+        {
+            model.dispatch(mods.shift ? .prevTab : .nextTab)
+            return
+        }
+
         // ⌘ chords are app accelerators, not PTY input. Handle the standard
         // copy/paste here; let the menu (responder chain) claim the rest.
         if mods.command {

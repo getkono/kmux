@@ -182,7 +182,7 @@ surface):
 ## Keymap
 
 GTK uses reserved accelerators (it never shadows keys the inner program needs);
-the macOS app uses the parallel ⌘-based shortcuts in its "Pane" / "Session" menus.
+the macOS app uses the parallel native shortcuts in its "Pane" / "Session" menus.
 
 | Action | GTK (`kmux-gtk`) | macOS (`kmux-swift`) |
 |--------|------------------|----------------------|
@@ -196,7 +196,7 @@ the macOS app uses the parallel ⌘-based shortcuts in its "Pane" / "Session" me
 | Zoom focused pane | `Ctrl+Shift+Z` | `⌘⌃Z` |
 | Pane context menu | right-click a pane | right-click a pane |
 | New tab | `Ctrl+Shift+T` | `⌘T` |
-| Next / previous tab | `Ctrl+PageDown` / `Ctrl+PageUp` | `⌘⌥]` / `⌘⌥[` |
+| Next / previous tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` (`Ctrl+PageDown` / `Ctrl+PageUp`) | `Ctrl+Tab` / `Ctrl+Shift+Tab` |
 | Rename tab | `Shift+F2` | *(tab context menu → native sheet)* |
 | Close tab | `Ctrl+Shift+W` | `⌘W` |
 | Close pane | `Ctrl+Shift+Q` | *(pane context menu / menu)* |

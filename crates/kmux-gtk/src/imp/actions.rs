@@ -30,8 +30,16 @@ fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
         ("new-pane", Action::CreatePane, &["<Ctrl><Shift>t"]),
         ("close-pane", Action::ClosePane, &["<Ctrl><Shift>q"]),
         ("undo-close", Action::UndoClose, &["<Ctrl><Shift>u"]),
-        ("next-tab", Action::NextTab, &["<Ctrl>Page_Down"]),
-        ("prev-tab", Action::PrevTab, &["<Ctrl>Page_Up"]),
+        (
+            "next-tab",
+            Action::NextTab,
+            &["<Ctrl>Tab", "<Ctrl>Page_Down"],
+        ),
+        (
+            "prev-tab",
+            Action::PrevTab,
+            &["<Ctrl><Shift>Tab", "<Ctrl>Page_Up"],
+        ),
         ("close-tab", Action::CloseTab, &["<Ctrl><Shift>w"]),
         ("rename-tab", Action::RenameTab, &["<Shift>F2"]),
         // Tiling: split the focused pane and move focus between tiled panes.
@@ -72,8 +80,8 @@ fn dispatched_specs() -> Vec<(&'static str, Action, &'static [&'static str])> {
         ("new-session", Action::CreateSession, &["<Ctrl><Shift>n"]),
         ("close-session", Action::CloseSession, &[]),
         ("rename-session", Action::RenameSession, &["F2"]),
-        ("next-session", Action::NextSession, &["<Ctrl>Tab"]),
-        ("prev-session", Action::PrevSession, &["<Ctrl><Shift>Tab"]),
+        ("next-session", Action::NextSession, &[]),
+        ("prev-session", Action::PrevSession, &[]),
         ("disconnect", Action::Disconnect, &[]),
         ("reconnect", Action::Reconnect, &["<Ctrl><Shift>r"]),
         ("toggle-lock", Action::ToggleInputLock, &["<Ctrl><Shift>l"]),
@@ -390,8 +398,6 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
           <object class="GtkShortcutsGroup">
             <property name="title">Sessions</property>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;n</property><property name="title">New session</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;Tab</property><property name="title">Next session</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;Tab</property><property name="title">Previous session</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;1</property><property name="title">Jump to session 1–9</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">F2</property><property name="title">Rename session</property></object></child>
           </object>
@@ -400,8 +406,8 @@ const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
           <object class="GtkShortcutsGroup">
             <property name="title">Tabs</property>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;t</property><property name="title">New tab</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;Page_Down</property><property name="title">Next tab</property></object></child>
-            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;Page_Up</property><property name="title">Previous tab</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;Tab &lt;Ctrl&gt;Page_Down</property><property name="title">Next tab</property></object></child>
+            <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;Tab &lt;Ctrl&gt;Page_Up</property><property name="title">Previous tab</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Shift&gt;F2</property><property name="title">Rename tab</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;w</property><property name="title">Close tab</property></object></child>
             <child><object class="GtkShortcutsShortcut"><property name="accelerator">&lt;Ctrl&gt;&lt;Shift&gt;q</property><property name="title">Close pane (soft, 3s undo)</property></object></child>
@@ -509,6 +515,20 @@ mod tests {
     fn close_tab_owns_terminal_close_accelerator() {
         assert_eq!(accels_for("close-tab"), Some(&["<Ctrl><Shift>w"][..]));
         assert_eq!(accels_for("close-session"), Some(&[][..]));
+    }
+
+    #[test]
+    fn ctrl_tab_switches_tabs_not_sessions() {
+        assert_eq!(
+            accels_for("next-tab"),
+            Some(&["<Ctrl>Tab", "<Ctrl>Page_Down"][..])
+        );
+        assert_eq!(
+            accels_for("prev-tab"),
+            Some(&["<Ctrl><Shift>Tab", "<Ctrl>Page_Up"][..])
+        );
+        assert_eq!(accels_for("next-session"), Some(&[][..]));
+        assert_eq!(accels_for("prev-session"), Some(&[][..]));
     }
 
     #[test]

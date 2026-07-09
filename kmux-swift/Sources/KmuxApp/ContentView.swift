@@ -250,9 +250,9 @@ struct KmuxCommands: Commands {
             Button("Previous Session") { model?.dispatch(.prevSession) }
                 .keyboardShortcut("[", modifiers: [.command, .shift])
             Button("Next Tab") { model?.dispatch(.nextTab) }
-                .keyboardShortcut("]", modifiers: [.command, .option])
+                .keyboardShortcut(.tab, modifiers: .control)
             Button("Previous Tab") { model?.dispatch(.prevTab) }
-                .keyboardShortcut("[", modifiers: [.command, .option])
+                .keyboardShortcut(.tab, modifiers: [.control, .shift])
             Button("Close Tab") { model?.dispatch(.closeTab) }
                 .keyboardShortcut("w")
             Divider()
@@ -298,9 +298,7 @@ struct KmuxCommands: Commands {
             Button("Focus Down") { model?.dispatch(.focusDown) }
                 .keyboardShortcut(.downArrow, modifiers: [.command, .option])
             Button("Cycle Pane Next") { model?.dispatch(.nextPaneInTab) }
-                .keyboardShortcut(.tab, modifiers: .control)
             Button("Cycle Pane Previous") { model?.dispatch(.prevPaneInTab) }
-                .keyboardShortcut(.tab, modifiers: [.control, .shift])
             Menu("Focus Tab") {
                 ForEach(1...9, id: \.self) { n in
                     Button("Tab \(n)") {
