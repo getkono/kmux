@@ -112,6 +112,12 @@ pub struct PaneEventSink {
     title: Arc<Mutex<String>>,
     progress: Arc<Mutex<PaneProgress>>,
     vt_events: broadcast::Sender<kmux_protocol::messages::ServerMessage>,
+    /// Channel for terminal query replies (`ControlEvent::PtyResponse`) headed
+    /// back to the child PTY. Installed by the in-process engine via
+    /// [`set_pty_response_sender`](Self::set_pty_response_sender); left unset for
+    /// worker panes, which write their own replies. `OnceLock` so the sink stays
+    /// `&self` (it fires from the VT parser).
+    pty_response_tx: std::sync::OnceLock<mpsc::UnboundedSender<Vec<u8>>>,
 }
 
 impl PaneEventSink {
@@ -126,7 +132,16 @@ impl PaneEventSink {
             title,
             progress,
             vt_events,
+            pty_response_tx: std::sync::OnceLock::new(),
         }
+    }
+
+    /// Install the channel terminal query replies are pushed onto. Set once, by
+    /// the in-process engine before its VT loop starts (see
+    /// [`InProcessEngine::new`](crate::engine::InProcessEngine::new)); a second
+    /// call is ignored.
+    pub fn set_pty_response_sender(&self, tx: mpsc::UnboundedSender<Vec<u8>>) {
+        let _ = self.pty_response_tx.set(tx);
     }
 }
 
@@ -143,6 +158,16 @@ impl crate::backend::BackendEventSink for PaneEventSink {
                 base64_data,
             } => self.on_osc52_copy(selection, base64_data),
             ControlEvent::Progress { state, progress } => self.on_progress(state, progress),
+            // Terminal query reply → write it back to the child. This fires from
+            // the VT parser under the term-state lock, so we only copy out of the
+            // borrowed buffer and enqueue; the engine's drain task performs the
+            // (async, lock-free) PTY write. A worker pane never reaches here — it
+            // writes its own replies (see `kmux-vt-worker`).
+            ControlEvent::PtyResponse(bytes) => {
+                if let Some(tx) = self.pty_response_tx.get() {
+                    let _ = tx.send(bytes.to_vec());
+                }
+            }
             // Parsed but no client-facing wire event consumes them yet.
             ControlEvent::Bell | ControlEvent::Hyperlink { .. } => {}
         }
@@ -1289,9 +1314,11 @@ mod tests {
         PaneRelay {
             clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
             engine: crate::engine::PaneEngine::InProcess(crate::engine::InProcessEngine::new(
+                "test/0".to_string(),
                 term_state,
                 PtyWriter::sink().unwrap(),
                 tokio::task::spawn(async {}),
+                tokio::sync::mpsc::unbounded_channel().1,
             )),
             program: "/bin/sh".to_string(),
             args: vec![],

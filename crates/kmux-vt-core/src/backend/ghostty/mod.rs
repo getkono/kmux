@@ -79,6 +79,10 @@ impl EventSink for EventSinkAdapter {
             progress: report.progress,
         });
     }
+
+    fn on_pty_response(&self, bytes: &[u8]) {
+        self.0.on_control_event(ControlEvent::PtyResponse(bytes));
+    }
 }
 
 /// VT emulator backend powered by libghostty-vt v1.3.1.
@@ -388,10 +392,10 @@ mod tests {
     // `foreground` / `background` / `cursor`. Because the diff/snapshot
     // re-resolves every cell against the *live* palette on each frame, a colour
     // change shows up in both newly written and already-on-screen cells and is
-    // carried to clients as a diff. Queries (`key=?`) are parsed but
-    // deliberately not answered — kmux's VT layer never writes back to the PTY
-    // (`kmux_ghostty_feed` returns no response bytes), the same as every other
-    // VT query (DA/DSR/…). See `docs/terminal-backend.md`.
+    // carried to clients as a diff. Colour *queries* (`key=?`) are still not
+    // answered (kmux does not track queryable colour state end to end); the
+    // DA/DSR/DECRQM/size/kitty query family, by contrast, is now answered via
+    // `ControlEvent::PtyResponse`. See `docs/terminal-backend.md`.
 
     /// The resolved foreground of the (first) cell carrying `ch` in a fresh
     /// full-grid snapshot.
@@ -912,6 +916,42 @@ mod tests {
                 .any(|&(s, p)| s == PaneProgressState::Error && p == Some(30)),
             "expected progress event, got: {events:?}"
         );
+    }
+
+    #[test]
+    fn event_sink_receives_pty_response() {
+        // The DA/DSR query family is answered via ControlEvent::PtyResponse so
+        // the daemon can write the reply back to the child. Here we capture the
+        // reply at the backend boundary.
+        struct ResponseCapture(Mutex<Vec<u8>>);
+        impl BackendEventSink for ResponseCapture {
+            fn on_control_event(&self, event: ControlEvent<'_>) {
+                if let ControlEvent::PtyResponse(bytes) = event {
+                    self.0.lock().unwrap().extend_from_slice(bytes);
+                }
+            }
+        }
+
+        let sink = Arc::new(ResponseCapture(Mutex::new(vec![])));
+        let cfg = BackendConfig {
+            size: BackendSize {
+                rows: 24,
+                cols: 80,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            capabilities: CapabilityHandles {
+                kitty_graphics: Arc::new(AtomicBool::new(false)),
+                kitty_keyboard: Arc::new(AtomicBool::new(false)),
+            },
+            events: Arc::clone(&sink) as Arc<dyn BackendEventSink>,
+            scrollback: 1_000,
+        };
+
+        let mut backend = GhosttyBackend::new(cfg);
+        // DSR operating status → CSI 0 n.
+        backend.feed(b"\x1b[5n");
+        assert_eq!(sink.0.lock().unwrap().as_slice(), b"\x1b[0n");
     }
 
     // -------------------------------------------------------------------

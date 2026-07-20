@@ -186,6 +186,11 @@ impl ServerApp {
             None => {
                 // In-process: emulator + relay loop live in the daemon.
                 let (reader, writer) = session.split().await?;
+                // Terminal query replies (DSR/DA/…) the emulator generates are
+                // pushed onto this channel by the sink and drained to the PTY by
+                // the engine's writer task.
+                let (resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                title_sink.set_pty_response_sender(resp_tx);
                 let relay_sink =
                     Arc::clone(&title_sink) as Arc<dyn crate::backend::BackendEventSink>;
                 let term_state = Arc::new(Mutex::new(new_term_state(BackendConfig {
@@ -208,7 +213,11 @@ impl ServerApp {
                     self.manager.clone(),
                 ));
                 crate::engine::PaneEngine::InProcess(crate::engine::InProcessEngine::new(
-                    term_state, writer, task,
+                    pane_id.to_string(),
+                    term_state,
+                    writer,
+                    task,
+                    resp_rx,
                 ))
             }
         };

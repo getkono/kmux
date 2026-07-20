@@ -135,6 +135,10 @@ async fn run() -> anyhow::Result<()> {
     // process dying.
     session.set_keep_alive(true).await;
     let (reader, writer) = session.clone().split().await.context("split PTY")?;
+    // Share the PTY write half between the request loop (user input) and the
+    // terminal-query-reply drain below; `PtyWriter::write_all` serialises both
+    // through its interior mutex.
+    let writer = Arc::new(writer);
 
     // Capability atomics shared with the backend (updated by SetCapabilities).
     let kitty_graphics = Arc::new(AtomicBool::new(kitty_graphics));
@@ -144,6 +148,12 @@ async fn run() -> anyhow::Result<()> {
     // serialises socket writes (no concurrent writers).
     let (events_tx, mut events_rx) = mpsc::unbounded_channel::<WorkerEvent>();
 
+    // Terminal query replies (DSR/DA/…) the emulator generates during `feed` are
+    // written back to the PTY *here*, in the worker — never round-tripped through
+    // the daemon — so they share the writer's serialization with user input and
+    // the worker protocol stays unchanged.
+    let (pty_response_tx, pty_response_rx) = mpsc::unbounded_channel::<Vec<u8>>();
+
     let term_state = Arc::new(Mutex::new(new_term_state(BackendConfig {
         size: BackendSize::from(size),
         capabilities: CapabilityHandles {
@@ -152,6 +162,7 @@ async fn run() -> anyhow::Result<()> {
         },
         events: Arc::new(WorkerEventSink {
             events_tx: events_tx.clone(),
+            pty_response_tx,
         }),
         scrollback: scrollback as usize,
     })));
@@ -189,6 +200,15 @@ async fn run() -> anyhow::Result<()> {
         })
     };
 
+    // Drain terminal query replies queued by the event sink onto the PTY.
+    let response_task = {
+        let writer = writer.clone();
+        let pane_id = pane_id.clone();
+        tokio::spawn(async move {
+            pty_response_writer(pty_response_rx, writer, &pane_id).await;
+        })
+    };
+
     // Daemon → worker request loop runs on the main task until Shutdown or the
     // daemon closes the socket.
     request_loop(
@@ -204,6 +224,7 @@ async fn run() -> anyhow::Result<()> {
     debug!(pane_id, "worker shutting down");
     pty_task.abort();
     writer_task.abort();
+    response_task.abort();
     Ok(())
 }
 
@@ -441,6 +462,9 @@ async fn handle_request(
 /// channel send satisfies that.
 struct WorkerEventSink {
     events_tx: mpsc::UnboundedSender<WorkerEvent>,
+    /// Terminal query replies headed back to the child PTY. Drained by
+    /// `pty_response_writer` in this process — not forwarded to the daemon.
+    pty_response_tx: mpsc::UnboundedSender<Vec<u8>>,
 }
 
 impl BackendEventSink for WorkerEventSink {
@@ -466,9 +490,32 @@ impl BackendEventSink for WorkerEventSink {
                     base64_data: base64_data.to_string(),
                 });
             }
+            // Terminal query reply → write it to our PTY. Fires under the
+            // term-state lock in the read loop, so copy and enqueue only; the
+            // drain task performs the async write. Handled worker-locally, so
+            // (unlike input) it needs no worker-protocol frame.
+            ControlEvent::PtyResponse(bytes) => {
+                let _ = self.pty_response_tx.send(bytes.to_vec());
+            }
             // The worker protocol has no frame for progress / hyperlinks, so the
             // process-isolation path does not forward them (unchanged behaviour).
             ControlEvent::Progress { .. } | ControlEvent::Hyperlink { .. } => {}
+        }
+    }
+}
+
+/// Drain terminal query replies queued by [`WorkerEventSink`] and write each
+/// back to the child, in FIFO order, until the channel closes. Shares `writer`
+/// with the request loop, so `PtyWriter`'s interior mutex serialises replies
+/// with user input. Errors on a dying PTY are logged and skipped.
+async fn pty_response_writer(
+    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    writer: Arc<PtyWriter>,
+    pane_id: &str,
+) {
+    while let Some(bytes) = rx.recv().await {
+        if let Err(e) = writer.write_all(&bytes).await {
+            debug!(pane_id, "worker: PTY query-reply write failed: {e}");
         }
     }
 }

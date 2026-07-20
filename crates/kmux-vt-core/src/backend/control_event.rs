@@ -61,4 +61,12 @@ pub enum ControlEvent<'a> {
     /// gets the id/uri here too, but no client-facing wire event consumes it yet,
     /// so the daemon drops it.
     Hyperlink { id: Option<&'a str>, uri: &'a str },
+
+    /// **Terminal query reply** — bytes libghostty-vt generated in answer to a
+    /// query the child sent (DSR/DA/DECRQM/XTVERSION/size/kitty-keyboard). Unlike
+    /// every other variant, this does not go to clients: the daemon writes it
+    /// **back to the child PTY**, serialised with user input. Borrowed like the
+    /// rest of the catalog — the consumer copies it into an owned buffer and
+    /// enqueues it (the parser callback must not block on the PTY write).
+    PtyResponse(&'a [u8]),
 }

@@ -140,13 +140,54 @@ frame (`resolveCell` reads `term.colors.palette.current`). The consequence:
   libghostty-vt; the wrapper's `Stream` is created with `initAlloc`, so the
   allocating multi-key form is fully supported.
 
-**Query boundary (intentional).** Colour *queries* (`21;foreground=?`, `OSC 4;n;?`)
-are parsed but **not answered**: kmux's VT layer never writes back to the PTY —
-`kmux_ghostty_feed` returns no response bytes, and the readonly handler emits
-none. This is the same boundary that applies to every VT query kmux receives
-(DA/DSR/…); a malformed or query-only sequence is dropped without disturbing
-subsequent output. Adding a PTY write-back path for query replies is a
-cross-cutting concern, deliberately out of scope here.
+**Query boundary.** Colour *queries* (`21;foreground=?`, `OSC 4;n;?`) are
+parsed but **not answered**: kmux does not track queryable colour state end to
+end, so the readonly handler emits nothing for them. This is now the *exception*,
+not the rule — the DA/DSR/DECRQM/size/kitty-keyboard query family **is** answered
+(see [Terminal query replies](#terminal-query-replies-dsr--da--) below); a
+query-only colour sequence is simply dropped without disturbing subsequent
+output.
+
+## Terminal query replies (DSR / DA / …)
+
+Full-screen and interactive programs send terminal *queries* and block until the
+emulator replies — e.g. `vim` on `:q` and `fzf` during Bash completion both wait
+on a device-status report before repainting. libghostty's `ReadonlyHandler`
+drops every such query (it is built for replay tooling that never writes back),
+so kmux answers them itself.
+
+**What's answered** (`Handler.vt` in `wrapper.zig`, formatted from the live
+terminal state):
+
+| Query | Reply |
+|---|---|
+| DSR operating status (`CSI 5 n`) | `CSI 0 n` |
+| DSR cursor position (`CSI 6 n`) | `CSI y ; x R` (one-based; origin-mode aware) |
+| DA1 primary (`CSI c`) | `CSI ? 62 ; 22 c` (VT220 level 2 + colour) |
+| DA2 secondary (`CSI > c`) | `CSI > 1 ; 10 ; 0 c` |
+| DECRQM (`CSI ? m $ p`) | `CSI ? m ; c $ y` (`c` = 1 set / 2 reset / 0 unknown) |
+| Size in chars (`CSI 18 t`) | `CSI 8 ; rows ; cols t` |
+| Size in pixels (`CSI 14/16 t`) | `CSI 4/6 ; … t` — **only** when pixel dims are known |
+| XTVERSION (`CSI > q`) | `DCS > \| kmux ST` |
+| Kitty keyboard query (`CSI ? u`) | `CSI ? flags u` |
+
+Capability claims are deliberately conservative: kmux advertises no clipboard
+access in DA1 (its OSC 52 is copy-to-client only), reports its own identity in
+XTVERSION (never the vendored ghostty version), and answers no ENQ answerback.
+Pixel-denominated size reports are skipped when the drawable size is unknown
+(`0`) rather than answering with a bogus zero.
+
+**Path (in-process and isolated behave identically).** The wrapper hands reply
+bytes to a new `on_pty_response` FFI callback → `EventSink::on_pty_response` →
+`ControlEvent::PtyResponse`. Because that fires *inside* `feed()` under the
+terminal-state lock, the sink only copies the bytes and enqueues them onto an
+unbounded channel; a dedicated drain task writes them to the pane's `PtyWriter`,
+**sharing that writer's serialization with user input** (its interior mutex, so a
+reply can never interleave within a keystroke's bytes). In the process-isolated
+engine the reply is written by the *worker* — the same process that owns the PTY
+write half — so the worker protocol is unchanged (replies never cross the
+daemon↔worker socket). This is verified end-to-end for both engines in
+`crates/kmuxd/tests/query_response_e2e.rs`.
 
 ## Cursor rendering (in-cell)
 

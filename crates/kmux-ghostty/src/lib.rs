@@ -148,6 +148,12 @@ pub trait EventSink: Send + Sync + 'static {
     fn on_hyperlink(&self, _id: Option<&str>, _uri: &str) {}
     /// OSC 9;4 progress report (ConEmu/WT progress bar). Fired on each change.
     fn on_progress(&self, _report: ProgressReport) {}
+    /// Terminal-generated reply bytes that must be written back to the child
+    /// PTY (DSR/DA/DECRQM/XTVERSION/size/kitty-keyboard queries). `bytes` is
+    /// borrowed for the call only — copy it before enqueuing. The implementation
+    /// **must not** write to the PTY here (this fires inside [`GhosttyTerm::feed`],
+    /// under the terminal-state lock); enqueue and drain from a separate task.
+    fn on_pty_response(&self, _bytes: &[u8]) {}
 }
 
 /// A no-op sink useful for construction sites that do not route events
@@ -272,6 +278,7 @@ impl EventBridge {
             on_osc52: Some(trampoline_osc52),
             on_hyperlink: Some(trampoline_hyperlink),
             on_progress: Some(trampoline_progress),
+            on_pty_response: Some(trampoline_pty_response),
         }
     }
 }
@@ -333,6 +340,18 @@ unsafe extern "C" fn trampoline_progress(user: *mut c_void, state: u8, value: u8
     bridge
         .sink
         .on_progress(ProgressReport::from_raw(state, value, has));
+}
+
+unsafe extern "C" fn trampoline_pty_response(user: *mut c_void, ptr: *const u8, len: usize) {
+    let bridge = unsafe { &*(user as *const EventBridge) };
+    if ptr.is_null() || len == 0 {
+        return;
+    }
+    // SAFETY: the Zig side passes a valid, non-null pointer to a `len`-byte
+    // reply buffer that lives for the duration of this call. The sink copies
+    // what it keeps before returning.
+    let bytes = unsafe { std::slice::from_raw_parts(ptr, len) };
+    bridge.sink.on_pty_response(bytes);
 }
 
 /// Owned handle to a libghostty-vt terminal. One per kmux pane.
@@ -1150,6 +1169,63 @@ mod tests {
         // Remove clears the bar.
         term.feed(b"\x1b]9;4;0\x07").unwrap();
         assert_eq!(term.progress(), ProgressReport::none());
+    }
+
+    #[derive(Default)]
+    struct ResponseRecorder(Mutex<Vec<u8>>);
+    impl EventSink for ResponseRecorder {
+        fn on_pty_response(&self, bytes: &[u8]) {
+            self.0.lock().unwrap().extend_from_slice(bytes);
+        }
+    }
+
+    #[test]
+    fn dsr_cursor_position_writes_response() {
+        let rec = Arc::new(ResponseRecorder::default());
+        let mut term =
+            GhosttyTerm::new(size(10, 40), 100, rec.clone() as Arc<dyn EventSink>).unwrap();
+        // Place the cursor at row 3, col 5 (1-based) then request DSR CPR.
+        term.feed(b"\x1b[3;5H\x1b[6n").unwrap();
+        assert_eq!(rec.0.lock().unwrap().as_slice(), b"\x1b[3;5R");
+    }
+
+    #[test]
+    fn query_split_across_feeds_still_answers() {
+        // The parser must accumulate a query fed one byte at a time.
+        let rec = Arc::new(ResponseRecorder::default());
+        let mut term =
+            GhosttyTerm::new(size(4, 20), 100, rec.clone() as Arc<dyn EventSink>).unwrap();
+        for b in b"\x1b[5n" {
+            term.feed(std::slice::from_ref(b)).unwrap();
+        }
+        assert_eq!(rec.0.lock().unwrap().as_slice(), b"\x1b[0n");
+    }
+
+    #[test]
+    fn multiple_queries_in_one_feed_reply_in_fifo_order() {
+        let rec = Arc::new(ResponseRecorder::default());
+        let mut term =
+            GhosttyTerm::new(size(4, 20), 100, rec.clone() as Arc<dyn EventSink>).unwrap();
+        // DSR status, then DA1 primary, then size-in-chars: replies concatenate
+        // in the order the queries arrive.
+        term.feed(b"\x1b[5n\x1b[c\x1b[18t").unwrap();
+        assert_eq!(
+            rec.0.lock().unwrap().as_slice(),
+            b"\x1b[0n\x1b[?62;22c\x1b[8;4;20t"
+        );
+    }
+
+    #[test]
+    fn ordinary_output_after_query_still_renders() {
+        let rec = Arc::new(ResponseRecorder::default());
+        let mut term =
+            GhosttyTerm::new(size(4, 20), 100, rec.clone() as Arc<dyn EventSink>).unwrap();
+        term.feed(b"\x1b[6nok").unwrap();
+        assert_eq!(rec.0.lock().unwrap().as_slice(), b"\x1b[1;1R");
+        let mut out = vec![CellState::default(); 4 * 20];
+        term.fill_cells(&mut out).unwrap();
+        assert_eq!(out[0].c, 'o');
+        assert_eq!(out[1].c, 'k');
     }
 
     #[derive(Default)]

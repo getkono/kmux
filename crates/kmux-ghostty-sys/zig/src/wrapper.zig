@@ -73,7 +73,7 @@ pub const std_options: std.Options = .{
 // ABI constants
 // -----------------------------------------------------------------------------
 
-pub const ABI_VERSION: u32 = 5;
+pub const ABI_VERSION: u32 = 6;
 
 // Result codes. Must match the values `kmux-ghostty-sys::error` expects.
 const OK: i32 = 0;
@@ -255,6 +255,12 @@ const KmuxEventSink = extern struct {
     /// is 1 when the sequence carried a progress value (else 0 — e.g. remove /
     /// indeterminate), encoding ghostty's `?u8` across the C ABI.
     on_progress: ?*const fn (*anyopaque, u8, u8, u8) callconv(.c) void,
+    /// Terminal-generated reply bytes that must be written back to the child
+    /// PTY (DSR/DA/DECRQM/XTVERSION/size/kitty-keyboard queries). Fired
+    /// synchronously inside `feed`; the `ptr`/`len` buffer is borrowed for the
+    /// duration of the call only, so the Rust side copies it before enqueuing.
+    /// The daemon serialises these writes with user input onto the PTY.
+    on_pty_response: ?*const fn (*anyopaque, [*]const u8, usize) callconv(.c) void,
 };
 
 // -----------------------------------------------------------------------------
@@ -271,9 +277,98 @@ const Handler = struct {
     progress_state: *u8,
     progress_value: *u8,
     progress_has: *u8,
+    // Live pixel dimensions (0 = unknown), owned by the Wrapper. Read by the
+    // `size_report` handler so `CSI 14/16 t` can answer in pixels.
+    pixel_width: *u16,
+    pixel_height: *u16,
 
     pub fn deinit(self: *Handler) void {
         _ = self;
+    }
+
+    /// Write terminal-generated reply bytes back toward the child via the
+    /// response callback. A no-op when no sink is installed or `bytes` is
+    /// empty. See `on_pty_response`.
+    fn emitResponse(self: *Handler, bytes: []const u8) void {
+        if (bytes.len == 0) return;
+        if (self.sink.on_pty_response) |cb| {
+            if (self.sink.user) |u| cb(u, bytes.ptr, bytes.len);
+        }
+    }
+
+    /// DSR cursor position report (`CSI 6 n` → `CSI y ; x R`, one-based).
+    /// Origin mode (DECOM) reports relative to the scroll region, matching
+    /// xterm/ghostty.
+    fn reportCursorPosition(self: *Handler) void {
+        const term = self.terminal;
+        const cur = term.screens.active.cursor;
+        const origin = term.modes.get(.origin);
+        const y = if (origin) cur.y -| term.scrolling_region.top else cur.y;
+        const x = if (origin) cur.x -| term.scrolling_region.left else cur.x;
+        var buf: [32]u8 = undefined;
+        const resp = std.fmt.bufPrint(&buf, "\x1b[{};{}R", .{ y + 1, x + 1 }) catch return;
+        self.emitResponse(resp);
+    }
+
+    /// DECRQM reply for a mode ghostty-vt recognises (`CSI ? m ; c $ y`).
+    /// `c` is 1 (set) or 2 (reset); ANSI modes drop the `?` prefix.
+    fn reportMode(self: *Handler, mode: gvt.Mode) void {
+        const tag: gvt.modes.ModeTag = @bitCast(@intFromEnum(mode));
+        const code: u8 = if (self.terminal.modes.get(mode)) 1 else 2;
+        var buf: [32]u8 = undefined;
+        const resp = std.fmt.bufPrint(&buf, "\x1b[{s}{};{}$y", .{
+            if (tag.ansi) "" else "?",
+            tag.value,
+            code,
+        }) catch return;
+        self.emitResponse(resp);
+    }
+
+    /// DECRQM reply for a mode ghostty-vt does not recognise: `c` = 0.
+    fn reportModeUnknown(self: *Handler, mode_raw: u16, ansi: bool) void {
+        var buf: [32]u8 = undefined;
+        const resp = std.fmt.bufPrint(&buf, "\x1b[{s}{};0$y", .{
+            if (ansi) "" else "?",
+            mode_raw,
+        }) catch return;
+        self.emitResponse(resp);
+    }
+
+    /// XTWINOPS size reports (`CSI 14/16/18/21 t`). Pixel-denominated reports
+    /// are skipped when the pixel dimensions are unknown (0) so a program never
+    /// mis-scales against a bogus size; the character report always answers.
+    fn reportSize(self: *Handler, style: Action.Value(.size_report)) void {
+        const rows: u16 = self.terminal.rows;
+        const cols: u16 = self.terminal.cols;
+        const pw: u16 = self.pixel_width.*;
+        const ph: u16 = self.pixel_height.*;
+        var buf: [48]u8 = undefined;
+        const resp: ?[]const u8 = switch (style) {
+            // Text area, in pixels.
+            .csi_14_t => if (pw == 0 or ph == 0)
+                null
+            else
+                std.fmt.bufPrint(&buf, "\x1b[4;{};{}t", .{ ph, pw }) catch null,
+            // Single cell, in pixels (derived from the drawable area).
+            .csi_16_t => if (pw == 0 or ph == 0 or rows == 0 or cols == 0)
+                null
+            else
+                std.fmt.bufPrint(&buf, "\x1b[6;{};{}t", .{ ph / rows, pw / cols }) catch null,
+            // Text area, in characters.
+            .csi_18_t => std.fmt.bufPrint(&buf, "\x1b[8;{};{}t", .{ rows, cols }) catch null,
+            // Window title report is a surface concern; kmux does not answer.
+            .csi_21_t => null,
+        };
+        if (resp) |r| self.emitResponse(r);
+    }
+
+    /// Kitty keyboard protocol progressive-enhancement query (`CSI ? u` →
+    /// `CSI ? flags u`) reporting the active flags on the current screen.
+    fn reportKittyKeyboard(self: *Handler) void {
+        const flags = self.terminal.screens.active.kitty_keyboard.current().int();
+        var buf: [32]u8 = undefined;
+        const resp = std.fmt.bufPrint(&buf, "\x1b[?{}u", .{flags}) catch return;
+        self.emitResponse(resp);
     }
 
     pub fn vt(
@@ -363,6 +458,44 @@ const Handler = struct {
                 // `Wrapper.create` initialization).
                 self.terminal.modes.set(.cursor_blinking, true);
             },
+            // ── Terminal queries that require a reply (issue: query-response) ──
+            // libghostty's ReadonlyHandler drops all of these because it never
+            // writes back to the PTY. kmux answers them from the live terminal
+            // state and hands the bytes to the daemon via `on_pty_response`,
+            // which writes them to the child. Without this, full-screen programs
+            // (vim, fzf) stall waiting for a reply until a timeout or keypress.
+            // Capability claims are deliberately conservative — see the reply
+            // formatters above.
+            .device_status => switch (value.request) {
+                // DSR operating status (`CSI 5 n`) → "OK".
+                .operating_status => self.emitResponse("\x1b[0n"),
+                // DSR cursor position (`CSI 6 n`).
+                .cursor_position => self.reportCursorPosition(),
+                // Color-scheme report (`CSI ? 996 n`): kmux does not track a
+                // light/dark appearance, so it is left unanswered.
+                .color_scheme => {},
+            },
+            .device_attributes => switch (value) {
+                // DA1: VT220 level-2 conformance (62) + ANSI color (22). kmux
+                // does NOT advertise clipboard access (52): its OSC 52 support
+                // is copy-to-client only.
+                .primary => self.emitResponse("\x1b[?62;22c"),
+                // DA2: model 1 (VT220-class), firmware 10, ROM cartridge 0.
+                .secondary => self.emitResponse("\x1b[>1;10;0c"),
+                // Tertiary DA (DECRPTUI) is not answered.
+                else => {},
+            },
+            .request_mode => self.reportMode(value.mode),
+            .request_mode_unknown => self.reportModeUnknown(value.mode, value.ansi),
+            .size_report => self.reportSize(value),
+            // XTVERSION (`CSI > q`): report kmux's identity. Deliberately does
+            // not carry a version string (and never leaks the vendored ghostty
+            // version); programs use this only to detect the emulator.
+            .xtversion => self.emitResponse("\x1bP>|kmux\x1b\\"),
+            .kitty_keyboard_query => self.reportKittyKeyboard(),
+            // ENQ: kmux advertises no answerback string, so there is nothing to
+            // send. (A configurable answerback is a possible future extension.)
+            .enquiry => {},
             else => {
                 var inner = gvt.ReadonlyHandler.init(self.terminal);
                 defer inner.deinit();
@@ -437,6 +570,8 @@ const Wrapper = struct {
             .progress_state = &self.progress_state,
             .progress_value = &self.progress_value,
             .progress_has = &self.progress_has,
+            .pixel_width = &self.pixel_width,
+            .pixel_height = &self.pixel_height,
         });
 
         return self;
@@ -1096,6 +1231,7 @@ test "wrapper roundtrip: feed hello, read cells" {
         .on_osc52 = null,
         .on_hyperlink = null,
         .on_progress = null,
+        .on_pty_response = null,
     };
     const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
     defer w.destroy();
@@ -1120,6 +1256,7 @@ test "readCursor reports DECSCUSR blink request" {
         .on_osc52 = null,
         .on_hyperlink = null,
         .on_progress = null,
+        .on_pty_response = null,
     };
     const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
     defer w.destroy();
@@ -1148,6 +1285,7 @@ test "default cursor blinks without any DECSCUSR" {
         .on_osc52 = null,
         .on_hyperlink = null,
         .on_progress = null,
+        .on_pty_response = null,
     };
     const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
     defer w.destroy();
@@ -1182,6 +1320,7 @@ test "DEC mode 12 toggles cursor blink" {
         .on_osc52 = null,
         .on_hyperlink = null,
         .on_progress = null,
+        .on_pty_response = null,
     };
     const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
     defer w.destroy();
@@ -1206,6 +1345,7 @@ test "RIS restores the blinking default cursor" {
         .on_osc52 = null,
         .on_hyperlink = null,
         .on_progress = null,
+        .on_pty_response = null,
     };
     const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
     defer w.destroy();
@@ -1230,6 +1370,7 @@ test "OSC 9;4 progress is stored and pullable" {
         .on_osc52 = null,
         .on_hyperlink = null,
         .on_progress = null,
+        .on_pty_response = null,
     };
     const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, sink);
     defer w.destroy();
@@ -1260,6 +1401,91 @@ test "OSC 9;4 progress is stored and pullable" {
     try w.stream.nextSlice("\x1b]9;4;0\x07");
     kmux_ghostty_get_progress(w, &state, &value, &has);
     try std.testing.expectEqual(@as(u8, 0), state);
+}
+
+// ── Terminal query responses (issue: query-response) ────────────────────────
+// Zig-side sanity for the reply path; the exhaustive coverage (DA/DECRQM/size/
+// kitty, parser chunking, FIFO ordering) lives in the Rust suites.
+
+/// Captures response bytes emitted via `on_pty_response` for assertions.
+const ResponseCapture = struct {
+    buf: [256]u8 = undefined,
+    len: usize = 0,
+
+    fn cb(user: *anyopaque, ptr: [*]const u8, n: usize) callconv(.c) void {
+        const self: *ResponseCapture = @ptrCast(@alignCast(user));
+        const take = @min(n, self.buf.len - self.len);
+        @memcpy(self.buf[self.len .. self.len + take], ptr[0..take]);
+        self.len += take;
+    }
+
+    fn bytes(self: *const ResponseCapture) []const u8 {
+        return self.buf[0..self.len];
+    }
+};
+
+fn responseSink(cap: *ResponseCapture) KmuxEventSink {
+    return .{
+        .user = cap,
+        .on_title = null,
+        .on_bell = null,
+        .on_osc52 = null,
+        .on_hyperlink = null,
+        .on_progress = null,
+        .on_pty_response = ResponseCapture.cb,
+    };
+}
+
+test "DSR operating status replies CSI 0 n" {
+    const alloc = std.testing.allocator;
+    var cap: ResponseCapture = .{};
+    const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, responseSink(&cap));
+    defer w.destroy();
+
+    try w.stream.nextSlice("\x1b[5n");
+    try std.testing.expectEqualStrings("\x1b[0n", cap.bytes());
+}
+
+test "DSR cursor position reports one-based location" {
+    const alloc = std.testing.allocator;
+    var cap: ResponseCapture = .{};
+    const w = try Wrapper.create(alloc, .{ .rows = 10, .cols = 40, .pixel_width = 0, .pixel_height = 0 }, 1000, responseSink(&cap));
+    defer w.destroy();
+
+    // Move to row 3, col 5 (1-based), then query. Response echoes it back.
+    try w.stream.nextSlice("\x1b[3;5H\x1b[6n");
+    try std.testing.expectEqualStrings("\x1b[3;5R", cap.bytes());
+}
+
+test "DA1 primary reports a conservative VT220 identity" {
+    const alloc = std.testing.allocator;
+    var cap: ResponseCapture = .{};
+    const w = try Wrapper.create(alloc, .{ .rows = 4, .cols = 20, .pixel_width = 0, .pixel_height = 0 }, 1000, responseSink(&cap));
+    defer w.destroy();
+
+    try w.stream.nextSlice("\x1b[c");
+    try std.testing.expectEqualStrings("\x1b[?62;22c", cap.bytes());
+}
+
+test "size report CSI 18 t reports rows and cols" {
+    const alloc = std.testing.allocator;
+    var cap: ResponseCapture = .{};
+    const w = try Wrapper.create(alloc, .{ .rows = 24, .cols = 80, .pixel_width = 0, .pixel_height = 0 }, 1000, responseSink(&cap));
+    defer w.destroy();
+
+    try w.stream.nextSlice("\x1b[18t");
+    try std.testing.expectEqualStrings("\x1b[8;24;80t", cap.bytes());
+}
+
+test "size report CSI 14 t is silent when pixel dims are unknown" {
+    const alloc = std.testing.allocator;
+    var cap: ResponseCapture = .{};
+    const w = try Wrapper.create(alloc, .{ .rows = 24, .cols = 80, .pixel_width = 0, .pixel_height = 0 }, 1000, responseSink(&cap));
+    defer w.destroy();
+
+    // No pixel dimensions known → no reply (avoids a bogus 0-pixel report).
+    try w.stream.nextSlice("\x1b[14t");
+    try std.testing.expectEqual(@as(usize, 0), cap.len);
 }
 
 // NOTE: the "unknown sequence is forwarded to the log callback" check lives in

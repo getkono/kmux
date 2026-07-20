@@ -20,7 +20,7 @@ use core::ffi::c_void;
 /// ABI version expected by this Rust crate. The Zig wrapper exports the same
 /// constant via [`kmux_ghostty_abi_version`]. Mismatch is a build-time
 /// inconsistency — safe wrappers must panic on mismatch.
-pub const EXPECTED_ABI_VERSION: u32 = 5;
+pub const EXPECTED_ABI_VERSION: u32 = 6;
 
 // Result codes returned by the Zig wrapper. `OK` is 0; everything else is
 // a negative error code. Kept in sync with `src/wrapper.zig`.
@@ -175,6 +175,10 @@ pub struct KmuxEventSink {
     /// 4=pause), `progress` is 0..=100, and `has` is 1 when a progress value was
     /// carried (encodes ghostty's `?u8`).
     pub on_progress: Option<unsafe extern "C" fn(*mut c_void, u8, u8, u8)>,
+    /// Terminal-generated reply bytes for the child PTY (DSR/DA/DECRQM/…
+    /// queries). Args: `(user, ptr, len)`; the buffer is borrowed for the
+    /// duration of the call only.
+    pub on_pty_response: Option<unsafe extern "C" fn(*mut c_void, *const u8, usize)>,
 }
 
 // Safety: the sink is an inert vtable of function pointers plus an opaque
@@ -192,6 +196,7 @@ impl Default for KmuxEventSink {
             on_osc52: None,
             on_hyperlink: None,
             on_progress: None,
+            on_pty_response: None,
         }
     }
 }
