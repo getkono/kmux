@@ -40,6 +40,7 @@
 //! place `AppCore` is mutated, so there is no shared mutable cross-thread
 //! access. Off-main-thread calls are not part of the contract yet.
 
+use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, Once};
 
 use tokio::runtime::Runtime;
@@ -1486,6 +1487,27 @@ fn init_ffi_logging(instance_id: &str) {
     FFI_LOGGING.call_once(|| kmux_app::launch::init_logging(instance_id));
 }
 
+/// Resolve the startup directory for the native GUI.
+///
+/// Unlike a CLI process, an app bundle is not launched from a meaningful shell
+/// directory (macOS commonly gives it `/`). New GUI sessions therefore start
+/// in the user's home directory. Keep a current-directory fallback for unusual
+/// environments without `HOME`; explicit launch paths remain `auto_cwd` and
+/// take precedence later in [`AppCore::auto_select_session`].
+fn gui_initial_cwd() -> String {
+    select_gui_initial_cwd(
+        std::env::var_os("HOME").map(PathBuf::from).as_deref(),
+        std::env::current_dir().ok().as_deref(),
+    )
+}
+
+fn select_gui_initial_cwd(home: Option<&Path>, current_dir: Option<&Path>) -> String {
+    home.or(current_dir)
+        .and_then(Path::to_str)
+        .unwrap_or_default()
+        .to_string()
+}
+
 fn build_core(config: &DriverConfig, instance_id: String) -> AppCore {
     let (target, parsed_server) = parse_target(config.server.as_deref(), config.ssh_port);
     let auto_cwd = config
@@ -1497,10 +1519,7 @@ fn build_core(config: &DriverConfig, instance_id: String) -> AppCore {
     // `config.toml` (mirroring how `theme`/`cursor_blink` default here).
     let appearance = config::resolve_appearance(None);
     let cursor_blink = config::resolve_cursor_blink(config.cursor_blink);
-    let initial_cwd = std::env::current_dir()
-        .ok()
-        .and_then(|p| p.to_str().map(String::from))
-        .unwrap_or_default();
+    let initial_cwd = gui_initial_cwd();
     // `kmux diagnostic <test>` on macOS: the Swift app forwards the test name
     // here; resolve it to the same emitter command the GTK path uses (issue
     // #145). An unknown name or a missing `kmux` binary degrades to an ordinary
@@ -3073,6 +3092,27 @@ mod gpu_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gui_initial_cwd_prefers_home_over_process_directory() {
+        assert_eq!(
+            select_gui_initial_cwd(Some(Path::new("/Users/alice")), Some(Path::new("/"))),
+            "/Users/alice"
+        );
+    }
+
+    #[test]
+    fn gui_initial_cwd_falls_back_to_process_directory_without_home() {
+        assert_eq!(
+            select_gui_initial_cwd(None, Some(Path::new("/work/project"))),
+            "/work/project"
+        );
+    }
+
+    #[test]
+    fn gui_initial_cwd_is_empty_without_a_resolvable_directory() {
+        assert_eq!(select_gui_initial_cwd(None, None), "");
+    }
 
     #[test]
     fn named_key_codes_match_protocol() {
