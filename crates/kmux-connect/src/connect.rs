@@ -1,15 +1,13 @@
 #[cfg(feature = "remote")]
 use std::net::ToSocketAddrs;
 #[cfg(feature = "remote")]
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 #[cfg(feature = "remote")]
 use std::time::Duration;
 
 use kmux_protocol::messages::ClientMessage;
 #[cfg(feature = "remote")]
 use kmux_protocol::messages::{ClientCapabilities, ConnectionId, ServerMessage};
-#[cfg(feature = "remote")]
-use kmux_protocol::tls::{TofuStore, TofuVerifier};
 #[cfg(feature = "remote")]
 use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
 #[cfg(feature = "remote")]
@@ -59,7 +57,10 @@ pub async fn connect(
         None => return ConnectResult::Failed(format!("cannot resolve {host}:{port}")),
     };
 
-    let client_config = build_quinn_client_config(&host, port, accept_invalid_certs);
+    let client_config = match build_quinn_client_config(&host, port, accept_invalid_certs) {
+        Ok(config) => config,
+        Err(e) => return ConnectResult::Failed(e),
+    };
 
     let mut endpoint = match quinn::Endpoint::client("0.0.0.0:0".parse().unwrap()) {
         Ok(ep) => ep,
@@ -178,36 +179,13 @@ pub async fn connect(
 }
 
 #[cfg(feature = "remote")]
-fn build_quinn_client_config(host: &str, port: u16, accept_invalid: bool) -> quinn::ClientConfig {
+fn build_quinn_client_config(
+    host: &str,
+    port: u16,
+    accept_invalid: bool,
+) -> Result<quinn::ClientConfig, String> {
     let addr_key = format!("{host}:{port}");
-
-    // Load (or create empty) TOFU store from known_hosts.toml.
-    let store = {
-        let path = kmux_protocol::dirs::known_hosts_path()
-            .inspect_err(|e| warn!("cannot determine known_hosts path: {e}"))
-            .ok();
-        let store = path.and_then(|p| {
-            TofuStore::load(p)
-                .inspect_err(|e| warn!("failed to load known_hosts: {e}"))
-                .ok()
-        });
-        // Fall back to a temp-file-backed store if loading fails — still persists within
-        // this process run but won't survive across restarts.
-        match store {
-            Some(s) => Arc::new(Mutex::new(s)),
-            None => {
-                // Can't get a usable path; use an ephemeral in-memory store.
-                let tmp =
-                    std::env::temp_dir().join(format!("kmux-tofu-{}.toml", std::process::id()));
-                Arc::new(Mutex::new(TofuStore::load(tmp).unwrap_or_else(|_| {
-                    TofuStore::load(std::env::temp_dir().join("kmux-tofu-fallback.toml"))
-                        .unwrap_or_else(|_| unreachable!("empty TOFU store"))
-                })))
-            }
-        }
-    };
-
-    let verifier = TofuVerifier::new(addr_key, "quic", store, accept_invalid);
+    let verifier = crate::tcp_connect::build_tofu_verifier(addr_key, "quic", accept_invalid)?;
 
     let crypto = rustls::ClientConfig::builder()
         .dangerous()
@@ -229,5 +207,5 @@ fn build_quinn_client_config(host: &str, port: u16, accept_invalid: bool) -> qui
     )));
     config.transport_config(Arc::new(transport));
 
-    config
+    Ok(config)
 }

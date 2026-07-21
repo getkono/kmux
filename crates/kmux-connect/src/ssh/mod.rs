@@ -193,6 +193,14 @@ pub enum SshError {
     #[error("could not allocate a local port for the SSH tunnel: {0}")]
     LocalPortAllocFailed(String),
 
+    /// A host/user value would be ambiguous or unsafe to pass to OpenSSH.
+    #[error("invalid SSH {field} {value:?}: {reason}")]
+    InvalidTarget {
+        field: &'static str,
+        value: String,
+        reason: &'static str,
+    },
+
     /// `ssh -L -N` exited before the local forward came up.
     #[error(
         "SSH tunnel exited before becoming ready\n  ssh dest: {dest}\n  argv:     {argv}\n  exit:     {exit_code}\n  stderr:\n{stderr}"
