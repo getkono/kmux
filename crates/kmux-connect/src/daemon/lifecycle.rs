@@ -10,46 +10,57 @@ use super::{DaemonStatus, query_daemon};
 /// Maximum bytes of each log file to include in a failure error.
 const BOOT_LOG_TAIL_MAX: u64 = 8 * 1024;
 
-/// Remove stale daemon artifacts (zombie prevention).
+/// Remove daemon artifacts only when no process owns the PID-file lock.
 ///
 /// Handles three cases:
-/// 1. PID file exists, PID is dead → remove pid file.
-/// 2. PID file exists, PID is alive but socket is unresponsive → kill the zombie.
-/// 3. Socket file exists but connect fails → remove stale socket file.
-pub(super) fn cleanup_stale_daemon() {
-    let pid_path = match kmux_protocol::dirs::pid_path() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
-    let socket_path = match kmux_protocol::dirs::socket_path() {
-        Ok(p) => p,
-        Err(_) => return,
-    };
+///
+/// A held lock proves an active daemon owns the PID file. In that case the
+/// socket is preserved and automatic startup fails safely instead of making the
+/// existing listener unreachable or signalling an unverified PID.
+pub(super) fn cleanup_stale_daemon() -> anyhow::Result<()> {
+    use std::os::unix::io::AsRawFd;
+
+    let pid_path = kmux_protocol::dirs::pid_path()?;
+    let socket_path = kmux_protocol::dirs::socket_path()?;
 
     if pid_path.exists() {
-        if let Some(pid) = read_pid_file(&pid_path) {
-            if pid_alive(pid) {
-                // Process is alive but not responding on the socket — kill it.
-                let nix_pid = Pid::from_raw(pid as i32);
-                let _ = kill(nix_pid, Signal::SIGTERM);
-                // Give it a moment to exit, then SIGKILL if still alive.
-                std::thread::sleep(Duration::from_millis(500));
-                if pid_alive(pid) {
-                    let _ = kill(nix_pid, Signal::SIGKILL);
-                }
+        let pid_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pid_path)
+            .map_err(|e| anyhow::anyhow!("failed to inspect {}: {e}", pid_path.display()))?;
+        #[allow(deprecated)]
+        match nix::fcntl::flock(
+            pid_file.as_raw_fd(),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        ) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::EWOULDBLOCK) => {
+                let owner = read_pid_file(&pid_path)
+                    .map(|pid| format!("PID {pid}"))
+                    .unwrap_or_else(|| "an active process".to_string());
+                return Err(anyhow::anyhow!(
+                    "{owner} owns the daemon PID file but the control socket is unresponsive; \
+                     automatic startup left it untouched. Inspect `kmux daemon status` and \
+                     `kmux daemon logs`, then run `kmux daemon restart` if needed"
+                ));
             }
-            // PID is dead (or we just killed it) — remove the pid file.
-            let _ = std::fs::remove_file(&pid_path);
-        } else {
-            // Can't parse pid file — remove it.
-            let _ = std::fs::remove_file(&pid_path);
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "failed to lock {} while checking daemon ownership: {error}",
+                    pid_path.display()
+                ));
+            }
         }
+        std::fs::remove_file(&pid_path)
+            .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", pid_path.display()))?;
     }
 
-    // Remove stale socket if present.
     if socket_path.exists() {
-        let _ = std::fs::remove_file(&socket_path);
+        std::fs::remove_file(&socket_path)
+            .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", socket_path.display()))?;
     }
+    Ok(())
 }
 
 /// Path to the file that captures kmuxd's stdout+stderr across a spawn attempt.
@@ -84,7 +95,7 @@ fn boot_log_path() -> anyhow::Result<PathBuf> {
 pub(crate) fn start_daemon() -> anyhow::Result<Option<std::process::Child>> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    cleanup_stale_daemon();
+    cleanup_stale_daemon()?;
 
     // Acquire a non-blocking exclusive flock on the spawn lock to serialize
     // concurrent kmux invocations that all try to start a daemon at once.
@@ -273,10 +284,13 @@ pub async fn ensure_daemon() -> anyhow::Result<DaemonStatus> {
         // After 3 s with no response, try to clean up and restart once.
         if !retry_start && tokio::time::Instant::now() >= (deadline - Duration::from_secs(2)) {
             retry_start = true;
-            cleanup_stale_daemon();
-            if let Some(s) = start_daemon().ok().flatten() {
-                spawned = Some(s);
-                ever_spawned = true;
+            match start_daemon() {
+                Ok(Some(s)) => {
+                    spawned = Some(s);
+                    ever_spawned = true;
+                }
+                Ok(None) => {}
+                Err(error) => return Err(error),
             }
         }
     }
@@ -365,8 +379,8 @@ pub async fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
 /// or `EPERM`), so the caller never reports a kill that did not happen.
 ///
 /// `nix` signalling is the platform-agnostic primitive across kmux's supported
-/// targets (macOS + Linux); the same `kill` path already backs
-/// [`cleanup_stale_daemon`].
+/// targets (macOS + Linux). Automatic startup never uses this path; it relies
+/// on the PID-file lock in [`cleanup_stale_daemon`] instead.
 pub async fn force_kill_daemon(pid: u32, term_first: bool, grace: Duration) -> anyhow::Result<()> {
     let nix_pid = Pid::from_raw(pid as i32);
 
@@ -374,7 +388,7 @@ pub async fn force_kill_daemon(pid: u32, term_first: bool, grace: Duration) -> a
         match kill(nix_pid, Signal::SIGTERM) {
             Ok(()) => {}
             Err(nix::errno::Errno::ESRCH) => {
-                cleanup_stale_daemon();
+                let _ = cleanup_stale_daemon();
                 return Ok(());
             }
             Err(e) => {
@@ -382,7 +396,7 @@ pub async fn force_kill_daemon(pid: u32, term_first: bool, grace: Duration) -> a
             }
         }
         if wait_for_exit(pid, grace).await {
-            cleanup_stale_daemon();
+            let _ = cleanup_stale_daemon();
             return Ok(());
         }
     }
@@ -390,7 +404,7 @@ pub async fn force_kill_daemon(pid: u32, term_first: bool, grace: Duration) -> a
     match kill(nix_pid, Signal::SIGKILL) {
         Ok(()) => {}
         Err(nix::errno::Errno::ESRCH) => {
-            cleanup_stale_daemon();
+            let _ = cleanup_stale_daemon();
             return Ok(());
         }
         Err(e) => {
@@ -401,7 +415,7 @@ pub async fn force_kill_daemon(pid: u32, term_first: bool, grace: Duration) -> a
     // SIGKILL cannot be caught, but process teardown is asynchronous — give the
     // kernel a brief, bounded window to reap it before we verify.
     if wait_for_exit(pid, Duration::from_secs(2)).await {
-        cleanup_stale_daemon();
+        let _ = cleanup_stale_daemon();
         Ok(())
     } else {
         Err(anyhow::anyhow!(
@@ -498,6 +512,57 @@ mod tests {
         // no one is listening — connect will fail.
         std::fs::write(&socket_path, b"").unwrap();
         assert!(query_daemon().await.is_none());
+    }
+
+    #[test]
+    fn cleanup_preserves_files_owned_by_an_active_daemon_lock() {
+        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::io::AsRawFd;
+
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        let pid_path = kmux_protocol::dirs::pid_path().unwrap();
+        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
+        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
+        std::fs::write(&socket_path, b"socket placeholder").unwrap();
+        let held = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .mode(0o600)
+            .open(&pid_path)
+            .unwrap();
+        #[allow(deprecated)]
+        nix::fcntl::flock(
+            held.as_raw_fd(),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        )
+        .unwrap();
+
+        let error = cleanup_stale_daemon().unwrap_err();
+        assert!(error.to_string().contains("left it untouched"));
+        assert!(pid_path.exists());
+        assert!(socket_path.exists());
+
+        drop(held);
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+    }
+
+    #[test]
+    fn cleanup_removes_unlocked_stale_artifacts() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        let pid_path = kmux_protocol::dirs::pid_path().unwrap();
+        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
+        std::fs::write(&pid_path, "stale").unwrap();
+        std::fs::write(&socket_path, b"socket placeholder").unwrap();
+
+        cleanup_stale_daemon().unwrap();
+        assert!(!pid_path.exists());
+        assert!(!socket_path.exists());
+
+        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
     }
 
     #[test]

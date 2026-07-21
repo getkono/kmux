@@ -70,7 +70,7 @@ pub async fn handle_message<A: PaneAttacher>(
                 if !validate_token(&token, &state.app.auth_token) {
                     state.send(auth_failure("invalid token".to_string()));
                     warn!("authentication failed");
-                    return true;
+                    return false;
                 }
                 // Token accepted: challenge the client to prove it holds the
                 // private key behind `public_key` (issue #146).

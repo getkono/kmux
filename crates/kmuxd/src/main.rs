@@ -492,33 +492,53 @@ fn build_ssh_endpoints(quic_port: u16, tcp_port: u16) -> Vec<serde_json::Value> 
 /// It does not need to: the **authoritative** single-instance guard is the
 /// `flock` the daemonized grandchild holds on `daemon.pid` (see
 /// `daemon::daemonize_process`). If two `probe-or-start` invocations race here,
-/// each kills the stale pid and spawns, but only one daemonized child wins the
-/// pid-file lock; the loser exits before binding the control socket. Debug and
-/// release never collide because they resolve different runtime dirs entirely.
+/// only one daemonized child wins the pid-file lock; the loser exits before
+/// binding the control socket. Debug and release never collide because they
+/// resolve different runtime dirs entirely.
 fn cleanup_and_start_daemon() -> anyhow::Result<()> {
-    use nix::sys::signal::{Signal, kill};
-    use nix::unistd::Pid;
+    use std::os::unix::io::AsRawFd;
 
     let pid_path = kmux_protocol::dirs::pid_path()?;
     let socket_path = kmux_protocol::dirs::socket_path()?;
 
-    // If a stale PID file exists, kill the old process.
-    if pid_path.exists()
-        && let Ok(contents) = std::fs::read_to_string(&pid_path)
-        && let Ok(pid) = contents.trim().parse::<u32>()
-    {
-        let nix_pid = Pid::from_raw(pid as i32);
-        if kill(nix_pid, None).is_ok() {
-            let _ = kill(nix_pid, Signal::SIGTERM);
-            std::thread::sleep(std::time::Duration::from_millis(300));
-            if kill(nix_pid, None).is_ok() {
-                let _ = kill(nix_pid, Signal::SIGKILL);
+    // The daemonized child holds an exclusive flock on its PID file. A held
+    // lock proves ownership without trusting a possibly reused PID; preserve
+    // both artifacts and fail safely when that owner is unresponsive.
+    if pid_path.exists() {
+        let pid_file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&pid_path)
+            .map_err(|e| anyhow::anyhow!("failed to inspect {}: {e}", pid_path.display()))?;
+        #[allow(deprecated)]
+        match nix::fcntl::flock(
+            pid_file.as_raw_fd(),
+            nix::fcntl::FlockArg::LockExclusiveNonblock,
+        ) {
+            Ok(()) => {}
+            Err(nix::errno::Errno::EWOULDBLOCK) => {
+                let owner = std::fs::read_to_string(&pid_path)
+                    .ok()
+                    .and_then(|value| value.trim().parse::<u32>().ok())
+                    .map(|pid| format!("PID {pid}"))
+                    .unwrap_or_else(|| "an active process".to_string());
+                anyhow::bail!(
+                    "{owner} owns the daemon PID file but the control socket is unresponsive; \
+                     automatic startup left it untouched. Inspect `kmux daemon status` and \
+                     `kmux daemon logs`, then run `kmux daemon restart` if needed"
+                );
             }
+            Err(error) => anyhow::bail!(
+                "failed to lock {} while checking daemon ownership: {error}",
+                pid_path.display()
+            ),
         }
-        let _ = std::fs::remove_file(&pid_path);
+        std::fs::remove_file(&pid_path)
+            .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", pid_path.display()))?;
     }
     if socket_path.exists() {
-        let _ = std::fs::remove_file(&socket_path);
+        std::fs::remove_file(&socket_path)
+            .map_err(|e| anyhow::anyhow!("failed to remove {}: {e}", socket_path.display()))?;
     }
 
     // Resolve the path of the current executable (i.e., this very binary).
