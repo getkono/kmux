@@ -57,6 +57,9 @@ struct ConnectionBadge: View {
                 .help("Connection paused to save bandwidth")
             }
         }
+        // The native toolbar supplies the shared control background. Adding a
+        // second material capsule here produces nested pills on macOS 26.
+        .padding(.horizontal, 4)
         .contentShape(Rectangle())
         .onTapGesture(count: 2) { showTransportMenu = true }
         .help("Double-click to override the transport protocol")
@@ -77,17 +80,23 @@ struct ConnectionBanner: View {
 
     var body: some View {
         if let banner = banner {
-            HStack {
+            HStack(spacing: 10) {
+                Image(systemName: banner.reconnect ? "wifi.exclamationmark" : "arrow.triangle.2.circlepath")
+                    .foregroundStyle(banner.reconnect ? .orange : model.theme.chrome.accent)
                 Text(banner.text)
-                Spacer()
                 if banner.reconnect {
                     Button("Reconnect") { model.dispatch(.reconnect) }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
                 }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
-            .background(.regularMaterial)
-            .overlay(alignment: .bottom) { Divider() }
+            .background(.regularMaterial, in: Capsule())
+            .overlay { Capsule().stroke(model.theme.chrome.border) }
+            .shadow(color: .black.opacity(0.18), radius: 10, y: 4)
+            .padding(.top, 12)
+            .transition(.move(edge: .top).combined(with: .opacity))
         }
     }
 
@@ -109,14 +118,19 @@ struct SoftCloseBanner: View {
         if model.softClosePending {
             HStack(spacing: 10) {
                 Image(systemName: "trash")
-                Text("Pane closing…")
+                    .foregroundStyle(.secondary)
+                Text("Pane closing…").fontWeight(.medium)
                 Button("Undo") { model.dispatch(.undoClose) }
+                    .buttonStyle(.borderedProminent)
+                    .controlSize(.small)
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
             .background(.regularMaterial, in: Capsule())
-            .shadow(radius: 3)
-            .padding(.bottom, 12)
+            .overlay { Capsule().stroke(model.theme.chrome.border) }
+            .shadow(color: .black.opacity(0.24), radius: 12, y: 5)
+            .padding(.bottom, 16)
+            .transition(.move(edge: .bottom).combined(with: .opacity))
         }
     }
 }

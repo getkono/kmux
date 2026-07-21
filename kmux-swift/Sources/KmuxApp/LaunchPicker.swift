@@ -28,44 +28,85 @@ struct LauncherSheet: View {
 struct LaunchPicker: View {
     @ObservedObject var model: KmuxModel
     @State private var query = ""
+    @FocusState private var focused: Bool
 
     var body: some View {
-        VStack(spacing: 0) {
-            Text("Open or create a session")
-                .font(.headline)
-                .padding(.top, 14)
-
-            TextField("Filter sessions and remotes…", text: $query)
-                .textFieldStyle(.roundedBorder)
-                .padding(12)
-                .onChange(of: query) { _, value in model.driver.setPickerSearch(text: value) }
-                .onSubmit { model.activatePicker() }
-
-            Divider()
-
-            List(Array(rows.enumerated()), id: \.offset) { index, row in
-                LaunchRowView(model: model, row: row, selected: index == selected)
-                    .contentShape(Rectangle())
-                    .onTapGesture {
-                        model.driver.setPickerSelected(index: UInt32(index))
-                        model.activatePicker()
+        PaletteChrome(theme: model.theme) {
+            HStack(spacing: 12) {
+                Image(systemName: "rectangle.connected.to.line.below")
+                    .font(.title3.weight(.semibold))
+                    .foregroundStyle(model.theme.chrome.accent)
+                TextField("Search sessions and remotes…", text: $query)
+                    .textFieldStyle(.plain)
+                    .font(.title3)
+                    .focused($focused)
+                    .onChange(of: query) { _, value in
+                        model.driver.setPickerSearch(text: value)
                     }
+                    .onSubmit { model.activatePicker() }
+                ShortcutChip(text: "⌘O")
+            }
+        } content: {
+            ScrollViewReader { proxy in
+                ScrollView {
+                    LazyVStack(spacing: 3) {
+                        ForEach(Array(rows.enumerated()), id: \.offset) { index, row in
+                            LaunchRowView(
+                                model: model, row: row, selected: index == selected,
+                                activate: {
+                                    model.driver.setPickerSelected(index: UInt32(index))
+                                    model.activatePicker()
+                                }
+                            )
+                            .id(index)
+                        }
+                    }
+                    .padding(6)
+                }
+                .onChange(of: selected) { _, index in
+                    withAnimation(.easeOut(duration: 0.12)) {
+                        proxy.scrollTo(index, anchor: .center)
+                    }
+                }
             }
             .frame(height: 320)
-
+        } footer: {
             HStack {
-                Spacer()
                 Button("Cancel") { model.driver.cancelPicker() }
+                    .buttonStyle(.plain)
                     .keyboardShortcut(.cancelAction)
+                Spacer()
+                Text("↑↓  Navigate")
+                Text("↵  Open")
             }
-            .padding(12)
+            .font(.caption2)
+            .foregroundStyle(.secondary)
         }
-        .frame(width: 480)
-        .onAppear { query = model.launchPicker?.query ?? "" }
+        .frame(width: 640)
+        .onAppear {
+            query = model.launchPicker?.query ?? ""
+            focused = true
+        }
+        .onMoveCommand(perform: moveSelection)
+        .onExitCommand { model.driver.cancelPicker() }
     }
 
     private var rows: [FfiLaunchRow] { model.launchPicker?.rows ?? [] }
-    private var selected: Int { Int(model.launchPicker?.selected ?? 0) }
+    private var selected: Int {
+        guard !rows.isEmpty else { return 0 }
+        return min(Int(model.launchPicker?.selected ?? 0), rows.count - 1)
+    }
+
+    private func moveSelection(_ direction: MoveCommandDirection) {
+        guard !rows.isEmpty else { return }
+        let next: Int
+        switch direction {
+        case .up: next = max(0, selected - 1)
+        case .down: next = min(rows.count - 1, selected + 1)
+        default: return
+        }
+        model.driver.setPickerSelected(index: UInt32(next))
+    }
 }
 
 /// One launcher row: a leading glyph, label + detail, a remote's status / inline
@@ -74,8 +115,38 @@ private struct LaunchRowView: View {
     @ObservedObject var model: KmuxModel
     let row: FfiLaunchRow
     let selected: Bool
+    let activate: () -> Void
 
     var body: some View {
+        HStack(spacing: 4) {
+            Button(action: activate) {
+                rowLabel
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+            .accessibilityHint("Opens or expands this item")
+
+            if row.kind == .remote,
+                row.status == .connected || row.status == .connecting,
+                let peer = row.peer
+            {
+                Button { model.disconnectRemote(peer) } label: {
+                    Image(systemName: "xmark.circle")
+                        .frame(width: 28, height: 28)
+                }
+                .buttonStyle(.plain)
+                .help("Disconnect \(peer)")
+                .accessibilityLabel("Disconnect \(peer)")
+            }
+        }
+        .padding(.vertical, 3)
+        .padding(.horizontal, 10)
+        .frame(minHeight: 48)
+        .background(selected ? model.theme.chrome.selection : Color.clear)
+        .clipShape(RoundedRectangle(cornerRadius: ChromeMetrics.radius))
+    }
+
+    private var rowLabel: some View {
         HStack(spacing: 8) {
             if isChild {
                 Spacer().frame(width: 16)
@@ -102,19 +173,11 @@ private struct LaunchRowView: View {
 
             if row.kind == .remote {
                 statusView
-                if row.status == .connected || row.status == .connecting, let peer = row.peer {
-                    Button { model.disconnectRemote(peer) } label: {
-                        Image(systemName: "xmark.circle")
-                    }
-                    .buttonStyle(.borderless)
-                    .help("Disconnect")
-                }
             }
         }
-        .padding(.vertical, 3)
-        .padding(.horizontal, 6)
-        .background(selected ? Color.accentColor.opacity(0.18) : Color.clear)
-        .clipShape(RoundedRectangle(cornerRadius: 5))
+        .frame(maxWidth: .infinity, minHeight: 42, alignment: .leading)
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(selected ? .isSelected : [])
     }
 
     private var isChild: Bool {

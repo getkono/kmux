@@ -11,51 +11,83 @@ struct TabStrip: View {
     @ObservedObject var ui: UIState
 
     var body: some View {
-        HStack(spacing: 4) {
-            ForEach(model.tabs, id: \.tabIndex) { tab in
-                Button {
-                    model.selectTab(tab.tabIndex)
-                } label: {
-                    HStack(spacing: 4) {
-                        // Pause marker when any of the tab's panes is paused (issue #68).
-                        if tab.paused {
-                            Image(systemName: "pause.circle.fill")
-                                .font(.caption2)
-                                .foregroundStyle(.orange)
-                        }
-                        Text(tab.name)
-                            .lineLimit(1)
+        ScrollView(.horizontal) {
+            HStack(spacing: 5) {
+                ForEach(model.tabs, id: \.tabIndex) { tab in
+                    TabButton(tab: tab, theme: model.theme) {
+                        model.selectTab(tab.tabIndex)
                     }
-                    .padding(.horizontal, 10)
-                    .padding(.vertical, 4)
-                    // Plain buttons otherwise only hit-test their visible label
-                    // content, leaving most of the padded tab unclickable.
-                    .contentShape(Rectangle())
-                    .background(
-                        tab.active ? model.theme.accent.color.opacity(0.25) : Color.clear
-                    )
-                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                    .contextMenu {
+                        Button("Rename Tab…") { ui.renameTabTarget = tab }
+                        Button("Close Tab") {
+                            model.selectTab(tab.tabIndex)
+                            model.dispatch(.closeTab)
+                        }
+                    }
+                }
+                Button {
+                    model.dispatch(.createPane)
+                } label: {
+                    Image(systemName: "plus")
+                        .frame(width: 28, height: 28)
+                        .background(model.theme.chrome.hover, in: RoundedRectangle(cornerRadius: 7))
                 }
                 .buttonStyle(.plain)
-                .contextMenu {
-                    Button("Rename Tab…") { ui.renameTabTarget = tab }
-                    Button("Close Tab") {
-                        model.selectTab(tab.tabIndex)
-                        model.dispatch(.closeTab)
-                    }
+                .help("New tab (⌘T)")
+                .accessibilityLabel("New tab")
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 6)
+        }
+        .scrollIndicators(.hidden)
+        .frame(maxWidth: .infinity, alignment: .leading)
+        .background(model.theme.chrome.background)
+        .overlay(alignment: .bottom) { Divider().overlay(model.theme.chrome.border) }
+    }
+}
+
+private struct TabButton: View {
+    let tab: FfiTab
+    let theme: FfiTheme
+    let action: () -> Void
+    @State private var hovering = false
+
+    var body: some View {
+        Button(action: action) {
+            HStack(spacing: 7) {
+                Text("\(tab.tabIndex + 1)")
+                    .font(.caption2.monospacedDigit())
+                    .foregroundStyle(.secondary)
+                Text(tab.name)
+                    .font(.callout.weight(tab.active ? .semibold : .regular))
+                    .lineLimit(1)
+                if tab.paused {
+                    Image(systemName: "pause.fill")
+                        .font(.system(size: 8, weight: .bold))
+                        .foregroundStyle(.orange)
+                        .accessibilityLabel("Paused")
                 }
             }
-            Button {
-                model.dispatch(.createPane)
-            } label: {
-                Image(systemName: "plus")
+            .padding(.horizontal, 11)
+            .frame(minWidth: 76, maxWidth: 190, minHeight: 30)
+            .contentShape(Rectangle())
+            .background(background, in: RoundedRectangle(cornerRadius: 8, style: .continuous))
+            .overlay(alignment: .bottom) {
+                if tab.active {
+                    Capsule().fill(theme.chrome.accent).frame(height: 2).padding(.horizontal, 10)
+                }
             }
-            .buttonStyle(.plain)
-            .padding(.horizontal, 4)
-            Spacer()
         }
-        .padding(.horizontal, 6)
-        .padding(.vertical, 4)
-        .background(model.theme.statusBg.color)
+        .buttonStyle(.plain)
+        .onHover { hovering = $0 }
+        .animation(.easeOut(duration: 0.12), value: hovering)
+        .accessibilityLabel("Tab \(tab.tabIndex + 1), \(tab.name)")
+        .accessibilityAddTraits(tab.active ? [.isButton, .isSelected] : .isButton)
+    }
+
+    private var background: Color {
+        if tab.active { return theme.chrome.raised }
+        if hovering { return theme.chrome.hover }
+        return .clear
     }
 }

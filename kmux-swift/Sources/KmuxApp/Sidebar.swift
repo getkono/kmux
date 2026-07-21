@@ -25,36 +25,46 @@ struct Sidebar: View {
             }
         }
         .listStyle(.sidebar)
+        .scrollContentBackground(.hidden)
+        .background(model.theme.chrome.background)
         .safeAreaInset(edge: .bottom) {
             Button {
                 model.openLaunchPicker()
             } label: {
-                Label("New Session", systemImage: "plus")
-                    .frame(maxWidth: .infinity, alignment: .leading)
+                HStack {
+                    Label("New session", systemImage: "plus")
+                    Spacer()
+                    ShortcutChip(text: "⌘N")
+                }
+                .font(.callout.weight(.medium))
+                .padding(.horizontal, 10)
+                .frame(maxWidth: .infinity, minHeight: 36, alignment: .leading)
+                .background(model.theme.chrome.hover, in: RoundedRectangle(cornerRadius: 8))
             }
-            .buttonStyle(.borderless)
-            .padding(.horizontal, 12)
-            .padding(.vertical, 8)
+            .buttonStyle(.plain)
+            .accessibilityHint("Creates a session on the current host")
+            .padding(10)
+            .background(model.theme.chrome.background)
         }
     }
 
     @ViewBuilder
     private func rows(_ items: [IndexedSession]) -> some View {
         ForEach(items) { item in
-            SessionRow(session: item.session)
-                .contentShape(Rectangle())
-                .onTapGesture {
-                    model.dispatch(.jumpToSession(index: UInt32(item.index)))
-                }
-                .listRowBackground(
-                    item.session.active ? Color.accentColor.opacity(0.18) : Color.clear
-                )
+            Button {
+                model.dispatch(.jumpToSession(index: UInt32(item.index)))
+            } label: {
+                SessionRow(session: item.session)
+                    .contentShape(Rectangle())
+            }
+            .buttonStyle(.plain)
+                .accessibilityHint("Switches to this session")
                 .contextMenu {
                     Button("Rename…") { ui.renameTarget = item.session }
                     // Keep the whole session streaming through a background
                     // auto-pause (issue #68); checkmark reflects the current state.
                     Button {
-                        model.driver.toggleSessionNoAutoPause(wordId: item.session.wordId)
+                        _ = model.driver.toggleSessionNoAutoPause(wordId: item.session.wordId)
                     } label: {
                         if model.driver.sessionNoAutoPause(wordId: item.session.wordId) {
                             Label("Keep Streaming in Background", systemImage: "checkmark")
@@ -66,6 +76,8 @@ struct Sidebar: View {
                         model.driver.closeSession(wordId: item.session.wordId)
                     }
                 }
+                .listRowInsets(EdgeInsets(top: 2, leading: 8, bottom: 2, trailing: 8))
+                .listRowBackground(Color.clear)
         }
     }
 
@@ -104,19 +116,43 @@ private struct RemoteGroup: Identifiable {
 
 private struct SessionRow: View {
     let session: FfiSession
+    @Environment(\.colorScheme) private var colorScheme
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 2) {
-            Text(session.name)
-                .fontWeight(session.active ? .semibold : .regular)
-            if !session.cwd.isEmpty {
-                Text(session.cwd)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        HStack(spacing: 10) {
+            Image(systemName: "terminal")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(session.active ? Color.accentColor : .secondary)
+                .frame(width: 26, height: 26)
+                .background(.secondary.opacity(0.09), in: RoundedRectangle(cornerRadius: 7))
+
+            VStack(alignment: .leading, spacing: 3) {
+                Text(session.name)
+                    .font(.callout.weight(session.active ? .semibold : .medium))
                     .lineLimit(1)
-                    .truncationMode(.head)
+                if !session.cwd.isEmpty {
+                    Text(session.cwd)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                        .truncationMode(.head)
+                }
+            }
+            Spacer(minLength: 4)
+            if session.active {
+                Circle()
+                    .fill(Color.accentColor)
+                    .frame(width: 6, height: 6)
+                    .accessibilityLabel("Active session")
             }
         }
-        .padding(.vertical, 2)
+        .padding(.horizontal, 8)
+        .padding(.vertical, 7)
+        .background(
+            session.active ? Color.accentColor.opacity(colorScheme == .dark ? 0.20 : 0.12) : .clear,
+            in: RoundedRectangle(cornerRadius: ChromeMetrics.radius, style: .continuous)
+        )
+        .accessibilityElement(children: .combine)
+        .accessibilityAddTraits(session.active ? .isSelected : [])
     }
 }

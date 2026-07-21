@@ -101,7 +101,7 @@ struct ContentView: View {
 
     @ViewBuilder private var terminalDetail: some View {
         VStack(spacing: 0) {
-            if model.tabs.count > 1 {
+            if !model.tabs.isEmpty {
                 TabStrip(model: model, ui: ui)
             }
             ZStack(alignment: .top) {
@@ -193,25 +193,41 @@ struct ContentView: View {
     }
 
     @ToolbarContentBuilder private var toolbar: some ToolbarContent {
-        ToolbarItemGroup {
+        ToolbarItem(placement: .primaryAction) {
             ConnectionBadge(model: model)
-            Button { model.openLaunchPicker() } label: {
-                Image(systemName: "rectangle.connected.to.line.below")
-            }
-            .help("Open launcher (sessions & remotes)")
-            Button { ui.commandPalette = true } label: {
-                Image(systemName: "command")
-            }
-            .help("Command palette (⌘P)")
-            Button { model.dispatch(.reconnect) } label: {
-                Image(systemName: "arrow.clockwise")
-            }
-            .help("Reconnect")
-            Button { model.dispatch(.toggleInputLock) } label: {
-                Image(systemName: lockIcon)
-            }
-            .help("Toggle input lock")
         }
+        ToolbarItem(placement: .primaryAction) {
+            Button { ui.commandPalette = true } label: {
+                HStack(spacing: 7) {
+                    Image(systemName: "command")
+                    Text("Commands")
+                    ShortcutChip(text: "⌘P")
+                }
+            }
+            .help("Search commands (⌘P)")
+        }
+        ToolbarItem(placement: .primaryAction) {
+            Menu {
+                Button("Open Launcher…", systemImage: "rectangle.connected.to.line.below") {
+                    model.openLaunchPicker()
+                }
+                Button("Reconnect", systemImage: "arrow.clockwise") {
+                    model.dispatch(.reconnect)
+                }
+                Divider()
+                Button(inputLockLabel, systemImage: lockIcon) {
+                    model.dispatch(.toggleInputLock)
+                }
+            } label: {
+                Image(systemName: "ellipsis.circle")
+            }
+            .help("Session actions")
+        }
+    }
+
+    private var inputLockLabel: String {
+        if case .locked = model.mode { return "Unlock Input" }
+        return "Lock Input"
     }
 
     private var lockIcon: String {
@@ -255,6 +271,7 @@ struct KmuxCommands: Commands {
             Button("Previous Tab") { model?.dispatch(.prevTab) }
                 .keyboardShortcut("[", modifiers: [.command, .option])
             Button("Close Tab") { model?.dispatch(.closeTab) }
+                .keyboardShortcut("w", modifiers: .command)
             Button("Rename Tab…") { ui?.renameTabTarget = activeTab }
                 .keyboardShortcut(functionKey(NSF2FunctionKey), modifiers: .shift)
             Divider()
