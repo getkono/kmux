@@ -188,7 +188,8 @@ the macOS app uses the parallel ⌘-based shortcuts in its "Pane" / "Session" me
 |--------|------------------|----------------------|
 | Split right / down | `Ctrl+Shift+\` / `Ctrl+Shift+-` | `⌘D` / `⌘⇧D` |
 | Move focus | `Ctrl+Alt+←/→/↑/↓` | `⌘⌥←/→/↑/↓` |
-| Focus pane by number | `Alt+1…9` | `⌘1…9` |
+| Jump to session by number | `Ctrl+1…9` | `⌘1…9` |
+| Focus pane by number | `Alt+1…9` | `⌘⌥1…9` |
 | Resize (keyboard) | `Ctrl+Shift+Alt+←/→/↑/↓` | `⌘⌃←/→/↑/↓` |
 | Resize (mouse) | drag a divider · double-click → even | drag a divider · double-click → even |
 | Move pane (swap) | `Ctrl+Shift+,` / `Ctrl+Shift+.` | `⌘⌃[` / `⌘⌃]` |
@@ -197,9 +198,14 @@ the macOS app uses the parallel ⌘-based shortcuts in its "Pane" / "Session" me
 | Pane context menu | right-click a pane | right-click a pane |
 | New tab | `Ctrl+Shift+T` | `⌘T` |
 | Next / previous tab | `Ctrl+Shift+→` / `Ctrl+Shift+←` | `⌘⌥]` / `⌘⌥[` |
-| Rename tab | `Shift+F2` | *(tab context menu → native sheet)* |
+| Next / previous session | `Ctrl+Tab` / `Ctrl+Shift+Tab` | `Ctrl+Tab` / `Ctrl+Shift+Tab` (also `⌘⇧]` / `⌘⇧[`) |
+| Rename session / tab | `F2` / `Shift+F2` | `F2` / `Shift+F2` |
 | Close tab | *(tab-bar ✕ / menu)* | *(tab context menu / menu)* |
 | Close pane | `Ctrl+Shift+Q` | `⌘⇧W` |
+| Scroll history | `Shift+Page Up/Down` | `Shift+Page Up/Down` |
+| Toggle sidebar | `F9` | `F9` |
+| Toggle input lock | `Ctrl+Shift+L` | `⌘⇧L` |
+| Reset renderer | `Ctrl+Shift+F5` | `⌘⇧F5` |
 
 ## Versioning
 

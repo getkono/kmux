@@ -20,11 +20,14 @@ extension TerminalNSView {
         let mods = keyMods(event)
 
         // ⌘ chords are app accelerators, not PTY input. Handle the standard
-        // copy/paste here; let the menu (responder chain) claim the rest.
+        // copy/paste and alternate session-cycle chords here; let the menu
+        // (responder chain) claim the rest.
         if mods.command {
             switch event.charactersIgnoringModifiers {
             case "c": model.dispatch(.copySelection)
             case "v": model.dispatch(.paste)
+            case "]" where mods.shift: model.dispatch(.nextSession)
+            case "[" where mods.shift: model.dispatch(.prevSession)
             default: super.keyDown(with: event)
             }
             return

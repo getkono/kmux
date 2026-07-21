@@ -1,3 +1,4 @@
+import AppKit
 import SwiftUI
 
 import KmuxBindings
@@ -10,6 +11,7 @@ final class UIState: ObservableObject {
     @Published var help = false
     @Published var renameTarget: FfiSession?
     @Published var renameTabTarget: FfiTab?
+    @Published var columnVisibility: NavigationSplitViewVisibility = .all
 }
 
 /// Root view: a native split layout (sessions sidebar + terminal detail with a
@@ -18,7 +20,6 @@ final class UIState: ObservableObject {
 struct ContentView: View {
     @ObservedObject var model: KmuxModel
     @ObservedObject var ui: UIState
-    @State private var columnVisibility: NavigationSplitViewVisibility = .all
 
     /// At-a-glance dev-build marker (`kmux (dev) · <sha>[-dirty]`), or `nil` for a
     /// release build. Gated on the FFI build profile so it's truthful about the
@@ -38,7 +39,7 @@ struct ContentView: View {
     }
 
     var body: some View {
-        NavigationSplitView(columnVisibility: $columnVisibility) {
+        NavigationSplitView(columnVisibility: $ui.columnVisibility) {
             Sidebar(model: model, ui: ui)
                 .navigationSplitViewColumnWidth(min: 180, ideal: 220, max: 320)
         } detail: {
@@ -231,15 +232,20 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut("o")
             Divider()
             Button("Next Session") { model?.dispatch(.nextSession) }
-                .keyboardShortcut("]", modifiers: [.command, .shift])
+                .keyboardShortcut(.tab, modifiers: .control)
             Button("Previous Session") { model?.dispatch(.prevSession) }
-                .keyboardShortcut("[", modifiers: [.command, .shift])
+                .keyboardShortcut(.tab, modifiers: [.control, .shift])
             Button("Next Tab") { model?.dispatch(.nextTab) }
                 .keyboardShortcut("]", modifiers: [.command, .option])
             Button("Previous Tab") { model?.dispatch(.prevTab) }
                 .keyboardShortcut("[", modifiers: [.command, .option])
             Button("Close Tab") { model?.dispatch(.closeTab) }
+            Button("Rename Tab…") { ui?.renameTabTarget = activeTab }
+                .keyboardShortcut(functionKey(NSF2FunctionKey), modifiers: .shift)
             Divider()
+            Button("Rename Session…") { ui?.renameTarget = activeSession }
+                .keyboardShortcut(functionKey(NSF2FunctionKey), modifiers: [])
+            Button("Close Session") { model?.dispatch(.closeSession) }
             Button("Reconnect") { model?.dispatch(.reconnect) }
                 .keyboardShortcut("r")
             // Pause the connection to save bandwidth (issue #68). Shows a check
@@ -258,11 +264,14 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut("m", modifiers: [.command, .shift])
             Toggle("Connection Inspector", isOn: connectionBinding)
                 .keyboardShortcut("i", modifiers: [.command, .shift])
+            Button("Toggle Input Lock") { model?.dispatch(.toggleInputLock) }
+                .keyboardShortcut("l", modifiers: [.command, .shift])
             // Render-debug overlay + renderer reset (debugging cursor rendering).
-            // ⌘⇧G (⌘⇧D is Split Down); reset has no default shortcut.
+            // ⌘⇧G avoids Split Down's ⌘⇧D; reset parallels GTK's shifted F5.
             Toggle("Render Debug", isOn: renderDebugBinding)
                 .keyboardShortcut("g", modifiers: [.command, .shift])
             Button("Reset Renderer") { model?.dispatch(.resetRenderer) }
+                .keyboardShortcut(functionKey(NSF5FunctionKey), modifiers: [.command, .shift])
         }
         // Tiling: split the focused pane, move focus, resize, swap (the analog of
         // kmux-gtk's tiling accelerators). iTerm2-style split shortcuts; ⌘⌥ moves
@@ -282,15 +291,22 @@ struct KmuxCommands: Commands {
             Button("Focus Down") { model?.dispatch(.focusDown) }
                 .keyboardShortcut(.downArrow, modifiers: [.command, .option])
             Button("Cycle Pane Next") { model?.dispatch(.nextPaneInTab) }
-                .keyboardShortcut(.tab, modifiers: .control)
             Button("Cycle Pane Previous") { model?.dispatch(.prevPaneInTab) }
-                .keyboardShortcut(.tab, modifiers: [.control, .shift])
-            Menu("Focus Tab") {
+            Menu("Jump to Session") {
                 ForEach(1...9, id: \.self) { n in
-                    Button("Tab \(n)") {
-                        model?.selectTab(UInt32(n - 1))
+                    Button("Session \(n)") {
+                        model?.dispatch(.jumpToSession(index: UInt32(n - 1)))
                     }
                     .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: .command)
+                }
+            }
+            Menu("Focus Pane") {
+                ForEach(1...9, id: \.self) { n in
+                    Button("Pane \(n)") {
+                        model?.dispatch(.focusPaneAt(index: UInt32(n - 1)))
+                    }
+                    .keyboardShortcut(
+                        KeyEquivalent(Character("\(n)")), modifiers: [.command, .option])
                 }
             }
             Divider()
@@ -316,6 +332,15 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut("w", modifiers: [.command, .shift])
             Button("Undo Close") { model?.dispatch(.undoClose) }
                 .keyboardShortcut("u", modifiers: [.command, .shift])
+            Divider()
+            Button("Scroll History Page Up") { model?.dispatch(.scrollPageUp) }
+                .keyboardShortcut(functionKey(NSPageUpFunctionKey), modifiers: .shift)
+            Button("Scroll History Page Down") { model?.dispatch(.scrollPageDown) }
+                .keyboardShortcut(functionKey(NSPageDownFunctionKey), modifiers: .shift)
+        }
+        CommandGroup(after: .sidebar) {
+            Button("Toggle Sidebar") { toggleSidebar() }
+                .keyboardShortcut(functionKey(NSF9FunctionKey), modifiers: [])
         }
         CommandGroup(replacing: .help) {
             Button("kmux Help") { ui?.help = true }
@@ -327,6 +352,17 @@ struct KmuxCommands: Commands {
         CommandGroup(replacing: .appInfo) {
             Button("About kmux") { AboutPanel.show() }
         }
+    }
+
+    private var activeSession: FfiSession? { model?.sessions.first { $0.active } }
+    private var activeTab: FfiTab? { model?.tabs.first { $0.active } }
+
+    private func toggleSidebar() {
+        ui?.columnVisibility = ui?.columnVisibility == .detailOnly ? .all : .detailOnly
+    }
+
+    private func functionKey(_ value: Int) -> KeyEquivalent {
+        KeyEquivalent(Character(UnicodeScalar(value)!))
     }
 
     // Toggle bindings read/write the focused window's model; they read `false`
