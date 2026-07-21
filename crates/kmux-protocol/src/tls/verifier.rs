@@ -6,6 +6,9 @@
 //! 2. Try system/native root CA chain.  If CA-valid → auto-pin (quiet) + accept.
 //! 3. CA-invalid + existing pin → compare fingerprints; mismatch = hard fail.
 //! 4. CA-invalid + no pin → auto-pin with `tracing::warn!` + accept.
+//!
+//! Pin-store lock or persistence failures are hard failures unless certificate
+//! validation was explicitly disabled before the store was loaded.
 
 use std::sync::{Arc, Mutex};
 
@@ -35,20 +38,26 @@ pub struct TofuVerifier {
 }
 
 impl TofuVerifier {
-    /// Build a new verifier that loads native root CAs automatically.
-    pub fn new(
-        addr: String,
-        transport: &'static str,
-        store: Arc<Mutex<TofuStore>>,
-        accept_invalid_certs: bool,
-    ) -> Self {
+    /// Build a strict verifier that loads native root CAs automatically.
+    pub fn new(addr: String, transport: &'static str, store: Arc<Mutex<TofuStore>>) -> Self {
         let inner = build_native_ca_verifier();
         Self {
             addr,
             transport,
             store,
-            accept_invalid_certs,
+            accept_invalid_certs: false,
             inner,
+        }
+    }
+
+    /// Build an explicitly insecure verifier without loading or persisting pins.
+    pub fn accept_invalid(addr: String, transport: &'static str) -> Self {
+        Self {
+            addr,
+            transport,
+            store: Arc::new(Mutex::new(TofuStore::ephemeral())),
+            accept_invalid_certs: true,
+            inner: None,
         }
     }
 
@@ -83,6 +92,10 @@ impl ServerCertVerifier for TofuVerifier {
         }
 
         let fp = Fingerprint::from_cert(end_entity);
+        let mut store = self
+            .store
+            .lock()
+            .map_err(|_| Error::General("TOFU store lock poisoned".to_string()))?;
 
         // Step 1 — Try system CA validation.
         let ca_valid = self.inner.as_ref().is_some_and(|inner| {
@@ -93,21 +106,18 @@ impl ServerCertVerifier for TofuVerifier {
 
         if ca_valid {
             // Auto-pin CA-valid certs silently on first encounter.
-            if let Ok(mut store) = self.store.lock()
-                && store.lookup(&self.addr, self.transport).is_none()
-                && let Err(e) = store.pin(&self.addr, self.transport, &fp)
-            {
-                warn!(addr = %self.addr, "failed to auto-pin CA-valid cert: {e}");
+            if store.lookup(&self.addr, self.transport).is_none() {
+                store.pin(&self.addr, self.transport, &fp).map_err(|e| {
+                    Error::General(format!("failed to persist certificate pin: {e}"))
+                })?;
             }
             return Ok(ServerCertVerified::assertion());
         }
 
         // Step 2 — CA validation failed; consult TOFU store.
-        let pinned_hex: Option<String> = self.store.lock().ok().and_then(|store| {
-            store
-                .lookup(&self.addr, self.transport)
-                .map(|e| e.sha256.clone())
-        });
+        let pinned_hex = store
+            .lookup(&self.addr, self.transport)
+            .map(|entry| entry.sha256.clone());
 
         match pinned_hex {
             None => {
@@ -118,11 +128,9 @@ impl ServerCertVerifier for TofuVerifier {
                     fingerprint = %fp.to_hex(),
                     "TOFU: pinning certificate on first trust; verify fingerprint out-of-band"
                 );
-                if let Ok(mut store) = self.store.lock()
-                    && let Err(e) = store.pin(&self.addr, self.transport, &fp)
-                {
-                    warn!(addr = %self.addr, "failed to save TOFU pin: {e}");
-                }
+                store.pin(&self.addr, self.transport, &fp).map_err(|e| {
+                    Error::General(format!("failed to persist certificate pin: {e}"))
+                })?;
                 Ok(ServerCertVerified::assertion())
             }
             Some(hex) => {
@@ -248,21 +256,32 @@ mod tests {
 
     #[test]
     fn accept_invalid_certs_bypass() {
-        let dir = tempdir().unwrap();
-        let path = dir.path().join("known_hosts.toml");
-        let store = Arc::new(Mutex::new(TofuStore::load(path).unwrap()));
-        let v = TofuVerifier {
-            addr: "localhost:8443".to_string(),
-            transport: "quic",
-            store,
-            accept_invalid_certs: true,
-            inner: None,
-        };
+        let v = TofuVerifier::accept_invalid("localhost:8443".to_string(), "quic");
         let cert = self_signed_cert();
         let result = v.verify_server_cert(&cert, &[], &dummy_server_name(), &[], now());
         assert!(
             result.is_ok(),
             "accept_invalid_certs should bypass all checks"
+        );
+    }
+
+    #[test]
+    fn first_trust_rejects_when_pin_cannot_be_persisted() {
+        let dir = tempdir().unwrap();
+        let blocked_parent = dir.path().join("not-a-directory");
+        std::fs::write(&blocked_parent, b"block create_dir_all").unwrap();
+        let store = Arc::new(Mutex::new(
+            TofuStore::load(blocked_parent.join("known_hosts.toml")).unwrap(),
+        ));
+        let verifier = TofuVerifier::tofu_only("localhost:8443".into(), "quic", store);
+
+        let result =
+            verifier.verify_server_cert(&self_signed_cert(), &[], &dummy_server_name(), &[], now());
+        let error = result.expect_err("an unpersisted first pin must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("failed to persist certificate pin")
         );
     }
 

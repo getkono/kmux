@@ -106,6 +106,17 @@ impl TofuStore {
         Ok(Self { path, entries })
     }
 
+    /// Empty non-persistent store for an explicitly insecure verifier.
+    ///
+    /// The verifier returns before consulting this store; keeping it in-memory
+    /// avoids touching `known_hosts.toml` when certificate checks are disabled.
+    pub(crate) fn ephemeral() -> Self {
+        Self {
+            path: PathBuf::new(),
+            entries: Vec::new(),
+        }
+    }
+
     /// Find an existing pin for the given `(addr, transport)` pair.
     pub fn lookup(&self, addr: &str, transport: &str) -> Option<&TofuEntry> {
         self.entries

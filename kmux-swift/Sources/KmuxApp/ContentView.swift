@@ -70,6 +70,11 @@ struct ContentView: View {
         .sheet(isPresented: connectionPresented) {
             ConnectionView(model: model)
         }
+        .sheet(isPresented: closeSessionPresented) {
+            if case .confirmCloseSession(wordId: _, name: let name) = model.mode {
+                CloseSessionSheet(model: model, name: name)
+            }
+        }
         .sheet(item: $ui.renameTarget) { session in
             RenameSheet(model: model, session: session, renameTarget: $ui.renameTarget)
         }
@@ -174,6 +179,16 @@ struct ContentView: View {
         Binding(
             get: { model.connectionVisible },
             set: { if !$0 && model.connectionVisible { model.dispatch(.toggleConnection) } }
+        )
+    }
+
+    private var closeSessionPresented: Binding<Bool> {
+        Binding(
+            get: {
+                if case .confirmCloseSession = model.mode { return true }
+                return false
+            },
+            set: { if !$0 { model.driver.cancelPicker() } }
         )
     }
 

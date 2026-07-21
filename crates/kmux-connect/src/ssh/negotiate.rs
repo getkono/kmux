@@ -116,7 +116,8 @@ struct ProbeResult {
 }
 
 async fn run_probe(target: &RemoteTarget, ssh_dest: &str) -> Result<ProbeResult, SshError> {
-    let mut cmd = build_ssh_cmd(target, ssh_dest);
+    let mut cmd = build_ssh_cmd(target)?;
+    append_ssh_target_args(&mut cmd, target)?;
     cmd.arg("kmuxd").arg("probe-or-start");
     let argv = render_argv(&cmd);
     debug!(dest = %ssh_dest, argv = %argv, "Running kmuxd probe-or-start");
@@ -165,8 +166,74 @@ struct ProbeInfo {
 fn parse_probe_json(raw: &str) -> Result<ProbeInfo, SshError> {
     serde_json::from_str::<ProbeInfo>(raw).map_err(|e| SshError::BadProbeJson {
         error: e.to_string(),
-        raw: raw.to_owned(),
+        raw: redact_probe_output(raw),
     })
+}
+
+fn redact_probe_output(raw: &str) -> String {
+    if let Ok(mut value) = serde_json::from_str::<serde_json::Value>(raw) {
+        redact_json_tokens(&mut value);
+        if let Ok(redacted) = serde_json::to_string(&value) {
+            return redacted;
+        }
+    }
+
+    let mut out = raw.to_string();
+    let mut search_from = 0;
+    while let Some(rel) = out[search_from..].find("\"token\"") {
+        let key_start = search_from + rel;
+        let Some(colon_rel) = out[key_start..].find(':') else {
+            break;
+        };
+        let value_start = key_start + colon_rel + 1;
+        let Some(first_quote_rel) = out[value_start..].find('"') else {
+            search_from = value_start;
+            continue;
+        };
+        let string_start = value_start + first_quote_rel;
+        let mut escaped = false;
+        let mut string_end = None;
+        for (idx, ch) in out[string_start + 1..].char_indices() {
+            if escaped {
+                escaped = false;
+                continue;
+            }
+            if ch == '\\' {
+                escaped = true;
+                continue;
+            }
+            if ch == '"' {
+                string_end = Some(string_start + 1 + idx);
+                break;
+            }
+        }
+        let Some(end) = string_end else {
+            break;
+        };
+        out.replace_range(string_start + 1..end, "<redacted>");
+        search_from = string_start + "\"<redacted>\"".len();
+    }
+    out
+}
+
+fn redact_json_tokens(value: &mut serde_json::Value) {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, value) in map {
+                if key.eq_ignore_ascii_case("token") {
+                    *value = serde_json::Value::String("<redacted>".to_string());
+                } else {
+                    redact_json_tokens(value);
+                }
+            }
+        }
+        serde_json::Value::Array(values) => {
+            for value in values {
+                redact_json_tokens(value);
+            }
+        }
+        _ => {}
+    }
 }
 
 fn enforce_version(info: &ProbeInfo, ssh_dest: &str) -> Result<(), SshError> {
@@ -220,7 +287,7 @@ fn spawn_tunnel(
     remote_port: u16,
 ) -> Result<(Child, String, StderrBuf), SshError> {
     let forward_spec = format!("{local_port}:127.0.0.1:{remote_port}");
-    let mut cmd = build_ssh_cmd(target, ssh_dest);
+    let mut cmd = build_ssh_cmd(target)?;
     cmd.arg("-o")
         .arg("ExitOnForwardFailure=yes")
         .arg("-o")
@@ -229,8 +296,9 @@ fn spawn_tunnel(
         .arg("ServerAliveCountMax=3")
         .arg("-L")
         .arg(&forward_spec)
-        .arg("-N") // no remote command
-        .stdin(Stdio::null())
+        .arg("-N"); // no remote command
+    append_ssh_target_args(&mut cmd, target)?;
+    cmd.stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
     let argv = render_argv(&cmd);
@@ -347,7 +415,11 @@ fn ssh_program() -> String {
 ///   on mismatch. Matches the `connect_tcp_tls` TOFU model on the data plane.
 /// * `ConnectTimeout=10` — bound network failures so the user sees an error
 ///   instead of a hang when the host is unreachable.
-pub(super) fn build_ssh_cmd(target: &RemoteTarget, dest: &str) -> Command {
+pub(super) fn build_ssh_cmd(target: &RemoteTarget) -> Result<Command, SshError> {
+    validate_ssh_value("host", &target.host)?;
+    if let Some(user) = &target.user {
+        validate_ssh_value("user", user)?;
+    }
     let mut cmd = Command::new(ssh_program());
     cmd.arg("-o").arg("BatchMode=yes");
     cmd.arg("-o").arg("StrictHostKeyChecking=accept-new");
@@ -355,8 +427,43 @@ pub(super) fn build_ssh_cmd(target: &RemoteTarget, dest: &str) -> Command {
     if let Some(port) = target.ssh_port {
         cmd.arg("-p").arg(port.to_string());
     }
-    cmd.arg(dest);
-    cmd
+    Ok(cmd)
+}
+
+fn append_ssh_target_args(cmd: &mut Command, target: &RemoteTarget) -> Result<(), SshError> {
+    if let Some(user) = &target.user {
+        cmd.arg("-l").arg(user);
+    }
+    cmd.arg("--").arg(&target.host);
+    Ok(())
+}
+
+fn validate_ssh_value(field: &'static str, value: &str) -> Result<(), SshError> {
+    if value.is_empty() {
+        return Err(SshError::InvalidTarget {
+            field,
+            value: value.to_string(),
+            reason: "must not be empty",
+        });
+    }
+    if value.starts_with('-') {
+        return Err(SshError::InvalidTarget {
+            field,
+            value: value.to_string(),
+            reason: "must not start with '-'",
+        });
+    }
+    if value
+        .chars()
+        .any(|ch| ch.is_control() || ch.is_whitespace())
+    {
+        return Err(SshError::InvalidTarget {
+            field,
+            value: value.to_string(),
+            reason: "must not contain control characters or whitespace",
+        });
+    }
+    Ok(())
 }
 
 /// Render `cmd` as a shell-ish argv string for inclusion in error messages.
@@ -454,6 +561,73 @@ mod tests {
             SshError::BadProbeJson { raw, .. } => assert_eq!(raw, "not json"),
             other => panic!("expected BadProbeJson, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn parse_probe_json_redacts_token_on_malformed_output() {
+        let raw = r#"{"quic_port":1,"tcp_port":2,"token":"secret"} banner"#;
+        let err = parse_probe_json(raw).unwrap_err();
+        match err {
+            SshError::BadProbeJson { raw, .. } => {
+                assert!(raw.contains("<redacted>"));
+                assert!(!raw.contains("secret"));
+            }
+            other => panic!("expected BadProbeJson, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_ssh_cmd_inserts_separator_before_host() {
+        let target = RemoteTarget {
+            user: Some("alice".into()),
+            host: "devbox".into(),
+            ssh_port: Some(2222),
+        };
+        let mut cmd = build_ssh_cmd(&target).unwrap();
+        append_ssh_target_args(&mut cmd, &target).unwrap();
+        let args: Vec<_> = cmd
+            .as_std()
+            .get_args()
+            .map(|arg| arg.to_string_lossy().to_string())
+            .collect();
+        assert!(args.windows(2).any(|w| w == ["--", "devbox"]));
+        assert!(args.windows(2).any(|w| w == ["-l", "alice"]));
+        assert!(args.windows(2).any(|w| w == ["-p", "2222"]));
+    }
+
+    #[test]
+    fn build_ssh_cmd_rejects_option_like_host() {
+        let target = RemoteTarget {
+            user: None,
+            host: "-oProxyCommand=sh".into(),
+            ssh_port: None,
+        };
+        assert!(matches!(
+            build_ssh_cmd(&target),
+            Err(SshError::InvalidTarget { field: "host", .. })
+        ));
+    }
+
+    #[test]
+    fn build_ssh_cmd_allows_visible_unicode_targets() {
+        let target = RemoteTarget {
+            user: Some("álîçé".into()),
+            host: "開発".into(),
+            ssh_port: None,
+        };
+        assert!(build_ssh_cmd(&target).is_ok());
+    }
+
+    #[test]
+    fn invalid_target_error_escapes_control_characters() {
+        let target = RemoteTarget {
+            user: None,
+            host: "host\nforged".into(),
+            ssh_port: None,
+        };
+        let error = build_ssh_cmd(&target).unwrap_err().to_string();
+        assert!(error.contains("\\n"));
+        assert!(!error.contains("host\nforged"));
     }
 
     #[test]

@@ -128,11 +128,12 @@ struct HelpView: View {
 
     private static let shortcuts: [(String, String)] = [
         ("⌘N", "New session"),
-        ("⌘T", "New pane"),
+        ("⌘T", "New tab"),
+        ("⌘W", "Close tab"),
         ("⌘P", "Command palette"),
         ("⌘O", "Switch server"),
         ("⌘⇧] / ⌘⇧[", "Next / previous session"),
-        ("⌘⌥] / ⌘⌥[", "Next / previous pane"),
+        ("⌘⌥] / ⌘⌥[", "Next / previous tab"),
         ("⌘R", "Reconnect"),
         ("⌘C / ⌘V", "Copy selection / paste"),
         ("⌘⇧H", "Toggle performance HUD"),

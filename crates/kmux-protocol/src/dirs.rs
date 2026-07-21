@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use nix::unistd::getuid;
 
@@ -57,23 +57,95 @@ impl std::fmt::Display for BuildProfile {
 /// directory set by systemd/logind on Linux with tight permissions (mode
 /// 0700).
 ///
-/// Falls back to `/tmp/kmux-<uid>` when `XDG_RUNTIME_DIR` is unset (macOS,
-/// BSDs, containers, minimal Linux environments). The UID suffix prevents
-/// cross-user collisions, and `/tmp` is guaranteed on all POSIX systems.
+/// Falls back to `/tmp/kmux-<uid>/{KMUX_DIR_NAME}` when `XDG_RUNTIME_DIR` is
+/// unset (macOS, BSDs, containers, minimal Linux environments). The UID parent
+/// and profile directory are both verified as non-symlink, user-owned `0700`
+/// directories before any socket, PID, or token path is returned.
 pub fn runtime_dir() -> anyhow::Result<PathBuf> {
-    let base = match std::env::var("XDG_RUNTIME_DIR") {
-        Ok(val) => PathBuf::from(val),
+    let (base, secure_base) = match std::env::var("XDG_RUNTIME_DIR") {
+        Ok(val) => (PathBuf::from(val), false),
         Err(_) => {
             let uid = getuid().as_raw();
-            PathBuf::from(format!("/tmp/kmux-{uid}"))
+            (PathBuf::from(format!("/tmp/kmux-{uid}")), true)
         }
     };
+    create_runtime_dir(&base, secure_base)
+}
+
+fn create_runtime_dir(base: &Path, secure_base: bool) -> anyhow::Result<PathBuf> {
+    if secure_base {
+        create_private_dir(base)?;
+    } else if !base.is_dir() {
+        return Err(anyhow::anyhow!(
+            "runtime base {} is not an existing directory",
+            base.display()
+        ));
+    }
     let dir = base.join(KMUX_DIR_NAME);
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .create(&dir)
-        .map_err(|e| anyhow::anyhow!("failed to create runtime dir {}: {e}", dir.display()))?;
+    create_private_dir(&dir)?;
     Ok(dir)
+}
+
+#[cfg(unix)]
+fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
+    match std::fs::create_dir(dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) => {
+            return Err(anyhow::anyhow!(
+                "failed to create runtime dir {}: {error}",
+                dir.display()
+            ));
+        }
+    }
+    validate_private_dir(dir)
+}
+
+#[cfg(unix)]
+fn validate_private_dir(dir: &Path) -> anyhow::Result<()> {
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+    let meta = std::fs::symlink_metadata(dir)
+        .map_err(|e| anyhow::anyhow!("failed to stat runtime dir {}: {e}", dir.display()))?;
+    if meta.file_type().is_symlink() {
+        return Err(anyhow::anyhow!(
+            "runtime dir {} must not be a symlink",
+            dir.display()
+        ));
+    }
+    if !meta.is_dir() {
+        return Err(anyhow::anyhow!(
+            "runtime path {} is not a directory",
+            dir.display()
+        ));
+    }
+    let uid = getuid().as_raw();
+    if meta.uid() != uid {
+        return Err(anyhow::anyhow!(
+            "runtime dir {} is owned by uid {}, expected {}",
+            dir.display(),
+            meta.uid(),
+            uid
+        ));
+    }
+    let mode = meta.permissions().mode() & 0o777;
+    if mode != 0o700 {
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+            .map_err(|e| anyhow::anyhow!("failed to chmod runtime dir {}: {e}", dir.display()))?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn create_private_dir(dir: &Path) -> anyhow::Result<()> {
+    std::fs::create_dir(dir).or_else(|error| {
+        if error.kind() == std::io::ErrorKind::AlreadyExists {
+            Ok(())
+        } else {
+            Err(error)
+        }
+    })?;
+    Ok(())
 }
 
 /// Path to the daemon Unix domain socket (control channel).
@@ -302,6 +374,22 @@ mod tests {
         let dir = runtime_dir().unwrap();
         assert_eq!(dir, tmp.path().join(KMUX_DIR_NAME));
         assert!(dir.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn fallback_runtime_parent_must_not_be_a_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let redirected = tmp.path().join("redirected");
+        std::fs::create_dir(&redirected).unwrap();
+        let fallback = tmp.path().join("kmux-1234");
+        symlink(&redirected, &fallback).unwrap();
+
+        let error = create_runtime_dir(&fallback, true).unwrap_err();
+        assert!(error.to_string().contains("must not be a symlink"));
+        assert!(!redirected.join(KMUX_DIR_NAME).exists());
     }
 
     #[test]

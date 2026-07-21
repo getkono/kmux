@@ -40,12 +40,23 @@ pub fn theme_candidates() -> Vec<CompletionCandidate> {
     out
 }
 
-/// Candidates for the `server` positional: the alias keys from `hosts.toml`.
+/// Candidates for the `server` positional: configured SSH hosts.
 pub fn server_candidates() -> Vec<CompletionCandidate> {
-    kmux_client::hosts::HostsConfig::load()
-        .hosts
-        .into_keys()
-        .map(|alias| CompletionCandidate::new(alias).help(Some("hosts.toml alias".into())))
+    server_candidates_from_hosts(kmux_client::hosts::discover_ssh_hosts())
+}
+
+fn server_candidates_from_hosts(
+    hosts: impl IntoIterator<Item = kmux_client::hosts::DiscoveredSshHost>,
+) -> Vec<CompletionCandidate> {
+    hosts
+        .into_iter()
+        .map(|host| {
+            let help = match host.source {
+                kmux_client::hosts::SshHostSource::KmuxHostsToml => "hosts.toml alias",
+                kmux_client::hosts::SshHostSource::OpenSshConfig(_) => "ssh config host",
+            };
+            CompletionCandidate::new(host.alias).help(Some(help.into()))
+        })
         .collect()
 }
 
@@ -145,30 +156,31 @@ mod tests {
 
     #[test]
     fn server_candidates_list_hosts_toml_aliases() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let kmux_dir = tmp.path().join("kmux");
-        std::fs::create_dir_all(&kmux_dir).unwrap();
-        std::fs::write(
-            kmux_dir.join("hosts.toml"),
-            "[hosts.devbox]\nhostname = \"dev.example.com\"\n\n[hosts.prod]\nhostname = \"prod.internal\"\n",
-        )
-        .unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let mut vals = values(&server_candidates());
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        use kmux_client::hosts::{DiscoveredSshHost, SshHostSource};
+        let mut vals = values(&server_candidates_from_hosts([
+            DiscoveredSshHost {
+                alias: "devbox".into(),
+                user: None,
+                hostname: Some("dev.example.com".into()),
+                port: None,
+                source: SshHostSource::KmuxHostsToml,
+            },
+            DiscoveredSshHost {
+                alias: "prod".into(),
+                user: None,
+                hostname: Some("prod.internal".into()),
+                port: None,
+                source: SshHostSource::KmuxHostsToml,
+            },
+        ]));
 
         vals.sort();
         assert_eq!(vals, vec!["devbox".to_string(), "prod".to_string()]);
     }
 
     #[test]
-    fn server_candidates_empty_without_hosts_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let vals = values(&server_candidates());
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    fn server_candidates_empty_without_discovered_hosts() {
+        let vals = values(&server_candidates_from_hosts([]));
         assert!(vals.is_empty(), "expected no aliases, got {vals:?}");
     }
 

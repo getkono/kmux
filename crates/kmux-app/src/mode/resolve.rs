@@ -180,6 +180,17 @@ pub(crate) fn resolve_rename(key: &Key, mods: Modifiers) -> (Option<Mode>, Actio
     }
 }
 
+pub(crate) fn resolve_confirm_close_session(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+    if is_ctrl_c(key, mods) {
+        return (Some(Mode::Normal), Action::ExitToNormal);
+    }
+    match key {
+        Key::Named(NamedKey::Escape) => (Some(Mode::Normal), Action::ExitToNormal),
+        Key::Named(NamedKey::Enter) => (None, Action::ConfirmCloseSession),
+        _ => (None, Action::None),
+    }
+}
+
 /// Generic picker key resolver. `close`, `select`, `up`, `down`, `backspace`
 /// produce the mode transition / action for those keys. `char_action` maps typed
 /// characters to their picker-specific action variant.

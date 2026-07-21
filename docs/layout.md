@@ -136,14 +136,14 @@ tab closes the session.
 
 ### Soft-close (the 3-second undo, issue #86)
 
-Closing a pane (`Ctrl+Shift+Q` / `⌘⇧W`, or `/pane close`) is **deferred**, not immediate, so an accidental close is recoverable. This is purely **client-side** interaction policy in `kmux-app` — the wire `PaneClose` (and thus the kill) is simply withheld:
+Closing a pane (`Ctrl+Shift+Q`, or `/pane close`) is **deferred**, not immediate, so an accidental close is recoverable. This is purely **client-side** interaction policy in `kmux-app` — the wire `PaneClose` (and thus the kill) is simply withheld:
 
 - On a close request for a **healthy** pane (its shell is `Running`), `AppCore` records a `PendingClose { pane_id, deadline: now + SOFT_CLOSE_GRACE }` (3 s) instead of sending `PaneClose`. The frontends show an **Undo** affordance (a toast button on GTK, a banner on macOS); `Ctrl+Shift+U` / `⌘⇧U` also undoes.
 - The frontend pump (`FrontendDriver::tick`) calls `AppCore::fire_due_closes`, which sends the real `PaneClose` for each pane whose deadline has passed.
 - Cancelling — via **Undo** or by **re-selecting the pane** within the window — drops the `PendingClose`; the live shell was never touched, so the pane is restored as-is.
 - An already-**exited** pane (`is_pane_running` is false) skips the grace and closes at once.
 
-Re-opening *after* the kill is just an ordinary new pane/session — there is no special daemon-side resurrection (the kill is final once the wire `PaneClose` is sent). Tab and session close remain immediate (session close has its own confirmation dialog).
+Re-opening *after* the kill is just an ordinary new pane/session — there is no special daemon-side resurrection (the kill is final once the wire `PaneClose` is sent). Tab close remains immediate. Session close always enters a destructive confirmation dialog before the client sends `SessionClose`.
 
 ### Preset layouts (schemes)
 
@@ -182,7 +182,7 @@ surface):
 ## Keymap
 
 GTK uses reserved accelerators (it never shadows keys the inner program needs);
-the macOS app uses the parallel ⌘-based shortcuts in its "Pane" / "Session" menus.
+the macOS app uses the parallel native shortcuts in its "Pane" / "Session" menus.
 
 | Action | GTK (`kmux-gtk`) | macOS (`kmux-swift`) |
 |--------|------------------|----------------------|
@@ -202,6 +202,7 @@ the macOS app uses the parallel ⌘-based shortcuts in its "Pane" / "Session" me
 | Rename session / tab | `F2` / `Shift+F2` | `F2` / `Shift+F2` |
 | Close tab | *(tab-bar ✕ / menu)* | *(tab context menu / menu)* |
 | Close pane | `Ctrl+Shift+Q` | `⌘⇧W` |
+| Close session | menu, then confirm | sidebar/menu, then confirm |
 | Scroll history | `Shift+Page Up/Down` | `Shift+Page Up/Down` |
 | Toggle sidebar | `F9` | `F9` |
 | Toggle input lock | `Ctrl+Shift+L` | `⌘⇧L` |
@@ -216,6 +217,7 @@ the macOS app uses the parallel ⌘-based shortcuts in its "Pane" / "Session" me
 - `KMUX_FFI_ABI_VERSION` — gates the Swift tiling surface (`tabs`/`layout`/per-pane
   grid/`focus_pane`/`set_pane_sizes` + the tiling/scheme/zoom `FfiAction`s), plus
   the interactive-divider surface (`dividers`, `apply_divider_drag`,
-  `reset_divider`), `FfiAction::FocusPaneAt`, and `rename_tab`. Defined once in
-  `crates/kmux-ffi/src/lib.rs`; bumped whenever this surface changes (no value is
-  hardcoded on the Swift side — uniffi's binding-checksum check guards drift).
+  `reset_divider`), `FfiAction::FocusPaneAt`, `rename_tab`, and the session-close
+  confirmation mode. Defined once in `crates/kmux-ffi/src/lib.rs`; bumped whenever
+  this surface changes (no value is hardcoded on the Swift side — uniffi's
+  binding-checksum check guards drift).

@@ -12,25 +12,31 @@ impl SessionManager {
         let Some(entry) = self.session_list.iter().find(|e| e.meta.word_id == word_id) else {
             return;
         };
-        let tab_index = entry.active_tab;
+        let tab_index = entry
+            .tabs
+            .iter()
+            .find(|t| t.tab_index == entry.active_tab)
+            .or_else(|| entry.tabs.first())
+            .map(|t| t.tab_index);
         // The active tab's focus + visible set; fall back to the first pane if
         // the session has no tab metadata yet.
-        let (focus_idx, visible) = match entry.tabs.iter().find(|t| t.tab_index == tab_index) {
-            Some(t) => (
-                t.focused_pane,
-                t.layout
-                    .leaves()
-                    .into_iter()
-                    .map(|i| format_pane_id(&word_id, i))
-                    .collect::<Vec<_>>(),
-            ),
-            None => match entry.panes.first() {
-                Some(p) => (p.pane_index, vec![p.pane_id.clone()]),
-                None => (0, vec![]),
-            },
-        };
+        let (focus_idx, visible) =
+            match tab_index.and_then(|idx| entry.tabs.iter().find(|t| t.tab_index == idx)) {
+                Some(t) => (
+                    t.focused_pane,
+                    t.layout
+                        .leaves()
+                        .into_iter()
+                        .map(|i| format_pane_id(&word_id, i))
+                        .collect::<Vec<_>>(),
+                ),
+                None => match entry.panes.first() {
+                    Some(p) => (p.pane_index, vec![p.pane_id.clone()]),
+                    None => (0, vec![]),
+                },
+            };
         self.active_session = Some(word_id.clone());
-        self.active_tab = Some(tab_index);
+        self.active_tab = tab_index;
         self.set_visible_set(visible);
         self.focus_from_tab(&word_id, focus_idx);
     }

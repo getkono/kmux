@@ -12,6 +12,7 @@ use kmux_protocol::{decode_client, encode_server, read_frame, write_frame_compre
 pub(crate) const MAX_WRITE_BATCH: usize = 256;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::{broadcast, mpsc};
+use tokio::task::JoinHandle;
 use tracing::{Instrument, Span, debug, info, warn};
 
 use crate::app::{AttachResult, ConnectionMetrics, ServerApp};
@@ -53,6 +54,62 @@ pub fn build_attach_replay(attach_result: AttachResult, pane_id: &str) -> Vec<Se
             },
         ],
     }
+}
+
+fn spawn_authenticated_forwarders(
+    app: Arc<ServerApp>,
+    ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+    metrics: Arc<ConnectionMetrics>,
+    conn_span: Span,
+) -> (JoinHandle<()>, JoinHandle<()>, JoinHandle<()>) {
+    let mut event_rx = app.subscribe_events();
+    let event_tx = ctrl_tx.clone();
+    let event_task = tokio::spawn(
+        async move {
+            while let Ok(event) = event_rx.recv().await {
+                let msg = pty_event_to_msg(event);
+                let _ = event_tx.send(ServerMessage::Event { event: msg });
+            }
+        }
+        .instrument(conn_span.clone()),
+    );
+
+    let mut vt_rx = app.subscribe_vt_events();
+    let vt_tx = ctrl_tx.clone();
+    let vt_task = tokio::spawn(
+        async move {
+            loop {
+                match vt_rx.recv().await {
+                    Ok(msg) => {
+                        let _ = vt_tx.send(msg);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        }
+        .instrument(conn_span.clone()),
+    );
+
+    let ping_tx = ctrl_tx;
+    let ping_task = tokio::spawn(
+        async move {
+            let mut seq = 0u64;
+            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+            loop {
+                interval.tick().await;
+                *metrics.last_ping_sent.lock().unwrap() = Some((seq, std::time::Instant::now()));
+                if ping_tx.send(ServerMessage::Ping { seq }).is_err() {
+                    break;
+                }
+                seq += 1;
+            }
+        }
+        .instrument(conn_span),
+    );
+
+    (event_task, vt_task, ping_task)
 }
 
 /// Generic client session handler shared by QUIC and TCP connections.
@@ -97,7 +154,7 @@ pub async fn run_client_session<R, W, A, F>(
 
     let writer_metrics = Arc::clone(&metrics);
     let writer_comp = Arc::clone(&comp_out);
-    let writer_task = tokio::spawn(
+    let mut writer_task = tokio::spawn(
         async move {
             let mut ctrl_rx = ctrl_rx;
             let mut writer = writer;
@@ -158,57 +215,6 @@ pub async fn run_client_session<R, W, A, F>(
         .instrument(conn_span.clone()),
     );
 
-    let mut event_rx = app.subscribe_events();
-    let event_tx = ctrl_tx.clone();
-    let event_task = tokio::spawn(
-        async move {
-            while let Ok(event) = event_rx.recv().await {
-                let msg = pty_event_to_msg(event);
-                let _ = event_tx.send(ServerMessage::Event { event: msg });
-            }
-        }
-        .instrument(conn_span.clone()),
-    );
-
-    let mut vt_rx = app.subscribe_vt_events();
-    let vt_tx = ctrl_tx.clone();
-    let vt_task = tokio::spawn(
-        async move {
-            loop {
-                match vt_rx.recv().await {
-                    Ok(msg) => {
-                        let _ = vt_tx.send(msg);
-                    }
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
-        .instrument(conn_span.clone()),
-    );
-
-    let ping_tx = ctrl_tx.clone();
-    let ping_metrics = Arc::clone(&metrics);
-    let ping_task = tokio::spawn(
-        async move {
-            let mut seq = 0u64;
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-            loop {
-                interval.tick().await;
-                // Record send time before enqueueing so RTT calculation is not
-                // inflated by writer-task queue depth.
-                *ping_metrics.last_ping_sent.lock().unwrap() =
-                    Some((seq, std::time::Instant::now()));
-                if ping_tx.send(ServerMessage::Ping { seq }).is_err() {
-                    break;
-                }
-                seq += 1;
-            }
-        }
-        .instrument(conn_span.clone()),
-    );
-
     let attacher = make_attacher(ctrl_tx.clone(), Arc::clone(&comp_out));
     let mut state = SharedClientState::new(
         app.clone(),
@@ -218,6 +224,8 @@ pub async fn run_client_session<R, W, A, F>(
         Arc::clone(&metrics),
         comp_out,
     );
+    let mut authenticated_tasks: Option<(JoinHandle<()>, JoinHandle<()>, JoinHandle<()>)> = None;
+    let mut flush_before_close = false;
 
     loop {
         match read_frame(&mut reader).await {
@@ -235,8 +243,19 @@ pub async fn run_client_session<R, W, A, F>(
 
                 match decode_client(&data) {
                     Ok(client_msg) => {
+                        let was_authenticated = state.authenticated;
                         if !handle_message(&mut state, client_msg, &attacher).await {
+                            debug_assert!(!state.authenticated);
+                            flush_before_close = true;
                             break;
+                        }
+                        if !was_authenticated && state.authenticated {
+                            authenticated_tasks = Some(spawn_authenticated_forwarders(
+                                app.clone(),
+                                state.ctrl_tx.clone(),
+                                Arc::clone(&metrics),
+                                state.conn_span.clone(),
+                            ));
                         }
                     }
                     Err(e) => {
@@ -256,9 +275,11 @@ pub async fn run_client_session<R, W, A, F>(
         }
     }
 
-    event_task.abort();
-    ping_task.abort();
-    vt_task.abort();
+    if let Some((event_task, vt_task, ping_task)) = authenticated_tasks {
+        event_task.abort();
+        ping_task.abort();
+        vt_task.abort();
+    }
 
     let log_conn_id = state.connection_id.map(|c| c.0);
     if let Some(client_id) = state.client_id {
@@ -269,6 +290,128 @@ pub async fn run_client_session<R, W, A, F>(
     }
 
     drop(state);
-    writer_task.abort();
+    drop(attacher);
+    if flush_before_close {
+        // Authentication failures carry a useful AuthResult reason. Close the
+        // channel senders and give the writer a bounded opportunity to flush
+        // that frame before shutting down the transport.
+        if tokio::time::timeout(Duration::from_secs(1), &mut writer_task)
+            .await
+            .is_err()
+        {
+            writer_task.abort();
+        }
+    } else {
+        writer_task.abort();
+    }
     info!(conn_id = ?log_conn_id, "connection closed");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kmux_protocol::identity::Identity;
+    use kmux_protocol::messages::{
+        ClientCapabilities, ClientMessage, FrontendKind, PROTOCOL_VERSION,
+    };
+    use kmux_protocol::{decode_server, encode_client, write_frame};
+    use tokio::task::AbortHandle;
+
+    struct NoopAttacher;
+
+    impl PaneAttacher for NoopAttacher {
+        async fn start_pane_stream(
+            &self,
+            _pane_id: String,
+            _result: AttachResult,
+            _client_rx: mpsc::Receiver<ServerMessage>,
+        ) -> Result<AbortHandle, String> {
+            Err("not used in session tests".to_string())
+        }
+    }
+
+    fn auth(token: &str) -> ClientMessage {
+        let identity = Identity::generate();
+        ClientMessage::Auth {
+            token: token.to_string(),
+            protocol_version: PROTOCOL_VERSION,
+            capabilities: ClientCapabilities::default(),
+            connection_id: None,
+            public_key: identity.public_key_bytes().to_vec(),
+            hostname: "host".to_string(),
+            username: "user".to_string(),
+            client_kind: FrontendKind::Cli,
+            client_git_sha: String::new(),
+            client_git_dirty: false,
+            client_build_profile: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_session_emits_no_events_or_ping() {
+        let app = Arc::new(ServerApp::new("expected".to_string()));
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let session = tokio::spawn(run_client_session(
+            server_read,
+            server_write,
+            app,
+            TransportKind::Uds,
+            |_tx, _compression| NoopAttacher,
+            tracing::info_span!("pre_auth_test"),
+        ));
+
+        assert!(
+            tokio::time::timeout(Duration::from_millis(100), read_frame(&mut client_read))
+                .await
+                .is_err(),
+            "nothing may be forwarded before authentication"
+        );
+
+        client_write.shutdown().await.unwrap();
+        session.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn invalid_token_result_is_flushed_before_close() {
+        let app = Arc::new(ServerApp::new("expected".to_string()));
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let session = tokio::spawn(run_client_session(
+            server_read,
+            server_write,
+            app,
+            TransportKind::Uds,
+            |_tx, _compression| NoopAttacher,
+            tracing::info_span!("auth_reject_test"),
+        ));
+
+        let bytes = encode_client(&auth("wrong")).unwrap();
+        write_frame(&mut client_write, &bytes).await.unwrap();
+        let frame = tokio::time::timeout(Duration::from_secs(1), read_frame(&mut client_read))
+            .await
+            .expect("auth rejection should arrive promptly")
+            .unwrap()
+            .expect("auth rejection frame");
+        let message = decode_server(&frame).unwrap();
+        assert!(matches!(
+            message,
+            ServerMessage::AuthResult {
+                success: false,
+                reason: Some(ref reason),
+                ..
+            } if reason == "invalid token"
+        ));
+        assert!(
+            tokio::time::timeout(Duration::from_secs(1), read_frame(&mut client_read))
+                .await
+                .expect("server should close after the rejection")
+                .unwrap()
+                .is_none()
+        );
+
+        session.await.unwrap();
+    }
 }
