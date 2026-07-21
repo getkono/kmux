@@ -28,6 +28,9 @@ struct TabStrip: View {
                     }
                     .padding(.horizontal, 10)
                     .padding(.vertical, 4)
+                    // Plain buttons otherwise only hit-test their visible label
+                    // content, leaving most of the padded tab unclickable.
+                    .contentShape(Rectangle())
                     .background(
                         tab.active ? model.theme.accent.color.opacity(0.25) : Color.clear
                     )
