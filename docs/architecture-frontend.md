@@ -52,8 +52,10 @@ The contract a frontend implements:
   produces actions is its own choice. The GTK frontend is **accelerators-only**:
   native GTK accelerators, menu items, and widgets bind straight to `Action`s /
   `TopBarAction`s, and any key the accelerators don't claim is forwarded to the
-  PTY. (The modal keymap `kmux_app::mode::resolve` remains available in the core
-  for any frontend that prefers a chord-based input model.) Plus
+  PTY. Destructive session close is still shared policy: `CloseSession` enters
+  `Mode::ConfirmCloseSession`, and only the confirmation action sends
+  `SessionClose`. (The modal keymap `kmux_app::mode::resolve` remains available
+  in the core for any frontend that prefers a chord-based input model.) Plus
   `core.set_term_size(size)` whenever the content
   area resizes (the frontend reports its geometry — the core never queries a
   terminal).
@@ -140,10 +142,12 @@ model (`LaunchRow`) a dumb frontend renders as-is, in fixed order:
 1. `LocalNewSession { default_cwd }` — opens the directory browser seeded at the
    focused session's cwd (so "new session" never assumes the client's cwd).
 2. `LocalExisting { … }` — every local session.
-3. Per known remote (the in-session `peer_targets` registry, seeded from recents'
-   SSH entries + the CLI `--server` peer): a `Remote { peer, status, expanded }`
-   header, and when expanded **and** connected, a `RemoteNewSession` row plus a
-   `RemoteExisting` row per federated session.
+3. Per known remote (the in-session `peer_targets` registry, seeded from
+   `hosts.toml`, explicit OpenSSH `Host` entries, recent SSH entries, and the
+   CLI `--server` peer): a `Remote { peer, label, status, expanded }` header,
+   and when expanded **and** connected, a `RemoteNewSession` row plus a
+   `RemoteExisting` row per federated session. OpenSSH-discovered hosts connect
+   by alias so the `ssh` binary still applies the full OpenSSH config.
 4. `AddRemote` — always last.
 
 **Connect on focus.** Expanding a remote is the connect: `expand_remote(peer)`
@@ -161,8 +165,8 @@ frontend drives it like any picker. The two sub-forms are **frontend-owned** (th
 own native input widgets, not a char-by-char core buffer): `Mode::AddRemote`
 (submitted via `submit_add_remote(AddRemoteForm) -> Result<(), String>`) and
 `Mode::RemoteNewSession { peer }` (a path prompt → `submit_remote_new_session`).
-Direct (LAN/token) remotes live in-session only — their token is never written to
-disk; only SSH remotes are remembered.
+The add-remote form is SSH-only. Direct `PeerTarget` support remains a protocol
+and test/internal path, not a user-facing launcher option.
 
 Frontends stay thin: `kmux-gtk` renders the rows as rich `adw::ActionRow`s (status
 pill/spinner, inline disconnect, indented children) in `dialogs.rs` and groups its

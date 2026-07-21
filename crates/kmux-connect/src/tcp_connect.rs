@@ -190,9 +190,10 @@ pub async fn connect_tcp_tls(
     use rustls::pki_types::ServerName;
     use tokio_rustls::TlsConnector;
 
-    // Load (or create) TOFU store from known_hosts.toml.
-    let store = load_tofu_store();
-    let verifier = TofuVerifier::new(tofu_key, "tcp+tls", store, accept_invalid);
+    let verifier = match build_tofu_verifier(tofu_key, "tcp+tls", accept_invalid) {
+        Ok(verifier) => verifier,
+        Err(e) => return ConnectResult::Failed(e),
+    };
     let client_config = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(Arc::new(verifier))
@@ -338,28 +339,23 @@ pub async fn connect_uds(
     ConnectResult::Connected(client_tx)
 }
 
-/// Load the TOFU store from `known_hosts.toml`, or fall back to a temp-file
-/// backed in-memory store for this process run.
+/// Build a certificate verifier, loading the persistent pin store only when
+/// certificate checks are enabled.
 #[cfg(feature = "remote")]
-fn load_tofu_store() -> Arc<Mutex<TofuStore>> {
-    let path = kmux_protocol::dirs::known_hosts_path()
-        .inspect_err(|e| warn!("cannot determine known_hosts path: {e}"))
-        .ok();
-    let store = path.and_then(|p| {
-        TofuStore::load(p)
-            .inspect_err(|e| warn!("failed to load known_hosts: {e}"))
-            .ok()
-    });
-    match store {
-        Some(s) => Arc::new(Mutex::new(s)),
-        None => {
-            let tmp = std::env::temp_dir().join(format!("kmux-tofu-{}.toml", std::process::id()));
-            Arc::new(Mutex::new(TofuStore::load(tmp).unwrap_or_else(|_| {
-                TofuStore::load(std::env::temp_dir().join("kmux-tofu-fallback.toml"))
-                    .unwrap_or_else(|_| unreachable!("TOFU load from fallback path"))
-            })))
-        }
+pub(crate) fn build_tofu_verifier(
+    key: String,
+    transport: &'static str,
+    accept_invalid: bool,
+) -> Result<TofuVerifier, String> {
+    if accept_invalid {
+        return Ok(TofuVerifier::accept_invalid(key, transport));
     }
+    let path = kmux_protocol::dirs::known_hosts_path()
+        .map_err(|e| format!("cannot determine known_hosts path: {e}"))?;
+    TofuStore::load(path.clone())
+        .map(|store| Arc::new(Mutex::new(store)))
+        .map_err(|e| format!("failed to load known_hosts {}: {e}", path.display()))
+        .map(|store| TofuVerifier::new(key, transport, store))
 }
 
 #[cfg(feature = "remote")]

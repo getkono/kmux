@@ -43,6 +43,7 @@ pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
         Mode::RenameSession { .. } | Mode::RenameTab { .. } => {
             vec![("Enter", "Submit"), ("Esc", "Cancel")]
         }
+        Mode::ConfirmCloseSession { .. } => vec![("Enter", "Close"), ("Esc", "Cancel")],
         Mode::SessionPicker => vec![
             ("\u{2191}/\u{2193}", "Navigate"),
             ("Enter", "Select"),
@@ -89,6 +90,7 @@ pub fn mode_name(mode: &Mode) -> &'static str {
         Mode::Signal => "SIGNAL",
         Mode::RenameSession { .. } => "RENAME",
         Mode::RenameTab { .. } => "RENAME TAB",
+        Mode::ConfirmCloseSession { .. } => "CLOSE SESSION",
         Mode::SessionPicker => "SESSION PICKER",
         Mode::ProcessOverview => "PROCESSES",
         Mode::ConnectedClients => "CLIENTS",
@@ -118,6 +120,7 @@ pub fn mode_rgb(mode: &Mode, theme: &crate::theme::Theme) -> crate::theme::Rgb {
         Mode::Scroll => theme.yellow,
         Mode::Signal => theme.red,
         Mode::RenameSession { .. } | Mode::RenameTab { .. } => theme.orange,
+        Mode::ConfirmCloseSession { .. } => theme.red,
         Mode::SessionPicker => theme.accent,
         Mode::ProcessOverview => theme.accent,
         Mode::ConnectedClients => theme.accent,

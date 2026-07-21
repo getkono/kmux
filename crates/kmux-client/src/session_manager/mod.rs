@@ -1012,6 +1012,51 @@ mod tests {
     }
 
     #[test]
+    fn tab_closed_prunes_closed_panes_and_repairs_cached_active_tab() {
+        let (mut mgr, mut rx) = make_connected_manager();
+
+        mgr.session_list
+            .push(make_entry_with_tabs("eagle", "/home/user/proj", 2));
+        mgr.select_session("eagle".to_string());
+        mgr.select_tab(1);
+        while rx.try_recv().is_ok() {}
+
+        mgr.handle_server_message(ServerMessage::TabClosed {
+            request_id: 0,
+            word_id: "eagle".to_string(),
+            tab_index: 1,
+        });
+
+        let entry = mgr
+            .session_list
+            .iter()
+            .find(|entry| entry.meta.word_id == "eagle")
+            .expect("session remains after closing one tab");
+        assert_eq!(entry.active_tab, 0);
+        assert_eq!(
+            entry
+                .panes
+                .iter()
+                .map(|pane| pane.pane_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["eagle/0"]
+        );
+        assert!(mgr.pane_info("eagle/1").is_none());
+        assert_eq!(mgr.active_tab, Some(0));
+        assert_eq!(mgr.visible_panes(), &["eagle/0".to_string()]);
+
+        while rx.try_recv().is_ok() {}
+        mgr.select_session("eagle".to_string());
+        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        assert!(
+            msgs.iter().all(
+                |msg| !matches!(msg, ClientMessage::Attach { pane_id, .. } if pane_id == "eagle/1")
+            ),
+            "closed pane must not be re-attached: {msgs:?}",
+        );
+    }
+
+    #[test]
     fn layout_update_attaches_split_pane_without_detaching_sibling() {
         use kmux_protocol::messages::{LayoutNode, SplitDir};
         let (mut mgr, mut rx) = make_connected_manager();

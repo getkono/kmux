@@ -9,9 +9,8 @@ const CACHE_FILE: &str = "recent_servers.json";
 /// How the client connects to this server.
 ///
 /// Cache entries written by older builds may contain a `Direct { host, port }`
-/// variant. Those entries fail to deserialize; the loader falls back to an
-/// empty cache, which is harmless — the user simply loses their recent-servers
-/// list and rebuilds it on next use.
+/// variant. The loader drops those legacy entries individually while preserving
+/// valid local and SSH history.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ServerKind {
     Local,
@@ -27,8 +26,8 @@ impl ServerKind {
     /// hub, or `None` for the local daemon (which is the hub, never federated).
     ///
     /// `Direct` (LAN/token) peers are intentionally not persisted here — their
-    /// shared token must not sit in plaintext on disk — so they live only in the
-    /// in-session remote registry and are re-added via the add-remote form.
+    /// shared token must not sit in plaintext on disk. Direct targets remain an
+    /// internal protocol/test path rather than a launcher option.
     pub fn to_peer_target(&self, accept_invalid_certs: bool) -> Option<PeerTarget> {
         match self {
             ServerKind::Local => None,
@@ -101,6 +100,21 @@ pub struct RecentServersCache {
     servers: Vec<RecentServer>,
 }
 
+fn parse_servers(data: &str) -> Option<Vec<RecentServer>> {
+    match serde_json::from_str(data) {
+        Ok(servers) => Some(servers),
+        Err(_) => {
+            let values: Vec<serde_json::Value> = serde_json::from_str(data).ok()?;
+            Some(
+                values
+                    .into_iter()
+                    .filter_map(|value| serde_json::from_value(value).ok())
+                    .collect(),
+            )
+        }
+    }
+}
+
 impl RecentServersCache {
     /// Load the cache from disk, returning an empty cache on any error.
     pub fn load() -> Self {
@@ -110,7 +124,7 @@ impl RecentServersCache {
     fn try_load() -> Option<Self> {
         let path = kmux_protocol::dirs::state_dir().ok()?.join(CACHE_FILE);
         let data = std::fs::read_to_string(path).ok()?;
-        let servers: Vec<RecentServer> = serde_json::from_str(&data).ok()?;
+        let servers = parse_servers(&data)?;
         Some(Self { servers })
     }
 
@@ -221,5 +235,40 @@ mod tests {
     fn local_server_kind_has_no_peer_target() {
         assert!(ServerKind::Local.to_peer_target(false).is_none());
         assert!(ServerKind::Local.peer_id().is_none());
+    }
+
+    #[test]
+    fn legacy_direct_entry_is_dropped_without_losing_valid_history() {
+        let raw = serde_json::json!([
+            {
+                "server_string": "",
+                "display": "localhost",
+                "last_used": 3,
+                "sessions": [],
+                "kind": "Local"
+            },
+            {
+                "server_string": "old:443",
+                "display": "old:443",
+                "last_used": 2,
+                "sessions": [],
+                "kind": { "Direct": { "host": "old", "port": 443 } }
+            },
+            {
+                "server_string": "alice@box",
+                "display": "alice@box",
+                "last_used": 1,
+                "sessions": [],
+                "kind": {
+                    "Ssh": { "user": "alice", "host": "box", "ssh_port": null }
+                }
+            }
+        ])
+        .to_string();
+
+        let servers = parse_servers(&raw).expect("valid JSON array");
+        assert_eq!(servers.len(), 2);
+        assert!(matches!(servers[0].kind, ServerKind::Local));
+        assert!(matches!(servers[1].kind, ServerKind::Ssh { .. }));
     }
 }

@@ -82,7 +82,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 21;
+pub const KMUX_FFI_ABI_VERSION: u32 = 23;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -1242,22 +1242,18 @@ pub struct FfiLaunchPicker {
 /// Values for the add-remote form (issue #121), mirroring [`AddRemoteForm`].
 #[derive(uniffi::Record)]
 pub struct FfiAddRemoteForm {
-    pub use_ssh: bool,
     pub host: String,
     pub user: String,
     pub port: Option<u16>,
-    pub token: String,
     pub accept_invalid_certs: bool,
 }
 
 impl From<FfiAddRemoteForm> for AddRemoteForm {
     fn from(f: FfiAddRemoteForm) -> Self {
         AddRemoteForm {
-            use_ssh: f.use_ssh,
             host: f.host,
             user: f.user,
             port: f.port,
-            token: f.token,
             accept_invalid_certs: f.accept_invalid_certs,
         }
     }
@@ -1438,6 +1434,10 @@ pub enum FfiMode {
     ProcessOverview,
     /// Connected-clients main-area view (issue #146); rows via `client_rows()`.
     ConnectedClients,
+    ConfirmCloseSession {
+        word_id: String,
+        name: String,
+    },
     Command,
     Connecting {
         label: String,
@@ -1459,6 +1459,10 @@ fn mode_to_ffi(mode: &Mode) -> FfiMode {
         Mode::RemoteNewSession { peer } => FfiMode::RemoteNewSession { peer: peer.clone() },
         Mode::ProcessOverview => FfiMode::ProcessOverview,
         Mode::ConnectedClients => FfiMode::ConnectedClients,
+        Mode::ConfirmCloseSession { word_id, name } => FfiMode::ConfirmCloseSession {
+            word_id: word_id.clone(),
+            name: name.clone(),
+        },
         Mode::Help => FfiMode::Help,
         Mode::Command(_) => FfiMode::Command,
         Mode::Connecting { target_display } => FfiMode::Connecting {
@@ -2633,12 +2637,22 @@ impl KmuxDriver {
         core.needs_render = true;
     }
 
-    /// Close a session by word id.
+    /// Request confirmation before closing a session by word id.
     pub fn close_session(&self, word_id: String) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         let core = d.core_mut();
-        core.mgr.close_session(&word_id);
+        core.confirm_close_session(&word_id);
         core.needs_render = true;
+    }
+
+    /// Confirm the pending session close, if a close confirmation is open.
+    pub fn confirm_close_session(&self) -> Vec<FfiEffect> {
+        let mut d = self.inner.lock().expect("driver mutex poisoned");
+        self.rt
+            .block_on(d.dispatch_action(Action::ConfirmCloseSession))
+            .into_iter()
+            .map(FfiEffect::from)
+            .collect()
     }
 
     /// Whether the performance HUD ticker is shown.
@@ -3259,6 +3273,18 @@ mod tests {
         assert!(matches!(
             mode_to_ffi(&Mode::RemoteNewSession { peer: "alice@box".into() }),
             FfiMode::RemoteNewSession { peer } if peer == "alice@box"
+        ));
+    }
+
+    #[test]
+    fn mode_to_ffi_maps_session_close_confirmation() {
+        assert!(matches!(
+            mode_to_ffi(&Mode::ConfirmCloseSession {
+                word_id: "eagle".into(),
+                name: "build".into(),
+            }),
+            FfiMode::ConfirmCloseSession { word_id, name }
+                if word_id == "eagle" && name == "build"
         ));
     }
 

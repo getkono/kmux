@@ -216,11 +216,9 @@ fn cmd_connect(app: &mut AppCore, args: &[String]) -> CommandResult {
     let remote = kmux_client::ssh::resolve_remote_target(&parsed)
         .ok_or_else(|| format!("could not parse remote target '{target}'"))?;
     let form = crate::core::AddRemoteForm {
-        use_ssh: true,
         host: remote.host,
         user: remote.user.unwrap_or_default(),
         port: remote.ssh_port,
-        token: String::new(),
         accept_invalid_certs: app.mgr.accept_invalid_certs(),
     };
     app.submit_add_remote(form)?;
@@ -254,9 +252,7 @@ fn cmd_session_close(app: &mut AppCore, _args: &[String]) -> CommandResult {
     if app.mgr.active_session().is_none() {
         return Err("no active session".into());
     }
-    // Soft-close with a grace window + undo (issue #64), matching the keybinding;
-    // the session becomes restorable from the graveyard after the window.
-    app.soft_close_active_session();
+    app.confirm_close_active_session();
     Ok(CommandSuccess::Ok)
 }
 

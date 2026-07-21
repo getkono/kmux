@@ -31,6 +31,8 @@ pub enum Mode {
         tab_index: u32,
         buffer: String,
     },
+    /// Confirm a destructive session close before sending `SessionClose`.
+    ConfirmCloseSession { word_id: String, name: String },
     /// Floating session picker with search
     SessionPicker,
     /// Process overview (issue #122): a main-area view replacing the terminal,
@@ -91,6 +93,7 @@ pub enum Action {
     // Session management
     CreateSession,
     CloseSession,
+    ConfirmCloseSession,
     NextSession,
     PrevSession,
     JumpToSession(usize),
@@ -257,6 +260,7 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::Scroll => resolve_scroll(key, mods),
         Mode::Signal => resolve_signal(key, mods),
         Mode::RenameSession { .. } | Mode::RenameTab { .. } => resolve_rename(key, mods),
+        Mode::ConfirmCloseSession { .. } => resolve_confirm_close_session(key, mods),
         Mode::SessionPicker => resolve_session_picker(key, mods),
         Mode::ProcessOverview => resolve_process_overview(key, mods),
         Mode::ConnectedClients => resolve_connected_clients(key, mods),

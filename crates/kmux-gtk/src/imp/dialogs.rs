@@ -40,6 +40,7 @@ enum DialogKind {
     Launch,
     Command,
     Rename,
+    ConfirmCloseSession,
     Help,
     /// The add-a-remote form (issue #121): a native field form, not a list.
     AddRemote,
@@ -66,6 +67,7 @@ impl DialogKind {
             Mode::LaunchPicker => Some(DialogKind::Launch),
             Mode::Command(_) => Some(DialogKind::Command),
             Mode::RenameSession { .. } | Mode::RenameTab { .. } => Some(DialogKind::Rename),
+            Mode::ConfirmCloseSession { .. } => Some(DialogKind::ConfirmCloseSession),
             Mode::Help => Some(DialogKind::Help),
             Mode::AddRemote => Some(DialogKind::AddRemote),
             Mode::RemoteNewSession { .. } => Some(DialogKind::RemoteNew),
@@ -205,6 +207,7 @@ fn open_dialog(
 ) -> LiveDialog {
     match kind {
         DialogKind::Rename => open_rename(shell, fe),
+        DialogKind::ConfirmCloseSession => open_confirm_close_session(shell, fe),
         DialogKind::Help => open_help(shell),
         DialogKind::AddRemote => open_add_remote_dialog(shell, fe),
         DialogKind::RemoteNew => open_remote_new_dialog(shell, fe),
@@ -801,6 +804,51 @@ fn open_rename(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
     }
 }
 
+fn open_confirm_close_session(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
+    let name = {
+        let core = &fe.borrow().core;
+        match &core.mode {
+            Mode::ConfirmCloseSession { name, .. } => name.clone(),
+            _ => String::new(),
+        }
+    };
+    let body = if name.is_empty() {
+        "This will close the session and all of its tabs and panes.".to_string()
+    } else {
+        format!("Close session “{name}” and all of its tabs and panes?")
+    };
+    let dialog = adw::AlertDialog::new(Some("Close session?"), Some(&body));
+    dialog.add_response("cancel", "Cancel");
+    dialog.add_response("close", "Close Session");
+    dialog.set_response_appearance("close", adw::ResponseAppearance::Destructive);
+    dialog.set_default_response(Some("cancel"));
+    dialog.set_close_response("cancel");
+    {
+        let fe = fe.clone();
+        let shell = shell.clone();
+        dialog.connect_response(None, move |_d, resp| {
+            {
+                let mut f = fe.borrow_mut();
+                let action = if resp == "close" {
+                    Action::ConfirmCloseSession
+                } else {
+                    Action::ExitToNormal
+                };
+                let _ = futures::executor::block_on(f.core.dispatch_action(action));
+                f.core.needs_render = true;
+            }
+            shell.drawing.queue_draw();
+        });
+    }
+    dialog.present(Some(&shell.window));
+    LiveDialog {
+        kind: DialogKind::ConfirmCloseSession,
+        dialog: dialog.upcast(),
+        list: None,
+        search: None,
+    }
+}
+
 fn open_help(shell: &Rc<Shell>) -> LiveDialog {
     let text: String = mode::help_entries()
         .iter()
@@ -848,29 +896,17 @@ fn open_help(shell: &Rc<Shell>) -> LiveDialog {
 /// form shows an inline error and stays open; a good one connects on focus and
 /// returns to the launcher with the new remote expanded.
 fn open_add_remote_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
-    let kind = adw::ComboRow::new();
-    kind.set_title("Connection");
-    kind.set_model(Some(&gtk4::StringList::new(&["SSH", "Direct (TCP+TLS)"])));
     let host = adw::EntryRow::builder().title("Host").build();
-    let user = adw::EntryRow::builder()
-        .title("User (optional, SSH)")
-        .build();
-    let port = adw::EntryRow::builder()
-        .title("Port (required for Direct)")
-        .build();
-    let token = adw::PasswordEntryRow::builder()
-        .title("Token (Direct only)")
-        .build();
+    let user = adw::EntryRow::builder().title("User (optional)").build();
+    let port = adw::EntryRow::builder().title("Port (optional)").build();
     let certs = adw::SwitchRow::builder()
         .title("Accept invalid certificates")
         .build();
 
     let group = adw::PreferencesGroup::new();
-    group.add(&kind);
     group.add(&host);
     group.add(&user);
     group.add(&port);
-    group.add(&token);
     group.add(&certs);
 
     let error = Label::new(None);
@@ -929,20 +965,16 @@ fn open_add_remote_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Live
     {
         let fe = fe.clone();
         let shell = shell.clone();
-        let kind = kind.clone();
         let host = host.clone();
         let user = user.clone();
         let port = port.clone();
-        let token = token.clone();
         let certs = certs.clone();
         let error = error.clone();
         add.connect_clicked(move |_| {
             let form = AddRemoteForm {
-                use_ssh: kind.selected() == 0,
                 host: host.text().to_string(),
                 user: user.text().to_string(),
                 port: port.text().trim().parse::<u16>().ok(),
-                token: token.text().to_string(),
                 accept_invalid_certs: certs.is_active(),
             };
             let result = {

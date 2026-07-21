@@ -9,11 +9,9 @@ import KmuxBindings
 struct AddRemoteSheet: View {
     @ObservedObject var model: KmuxModel
 
-    @State private var useSsh = true
     @State private var host = ""
     @State private var user = ""
     @State private var port = ""
-    @State private var token = ""
     @State private var acceptInvalidCerts = false
     @State private var error: String?
 
@@ -25,20 +23,9 @@ struct AddRemoteSheet: View {
                 .padding(.horizontal, 16)
 
             Form {
-                Picker("Connection", selection: $useSsh) {
-                    Text("SSH").tag(true)
-                    Text("Direct (TCP+TLS)").tag(false)
-                }
-                .pickerStyle(.segmented)
-
                 TextField("Host", text: $host)
-                if useSsh {
-                    TextField("User (optional)", text: $user)
-                    TextField("Port (optional)", text: $port)
-                } else {
-                    TextField("Port", text: $port)
-                    SecureField("Token", text: $token)
-                }
+                TextField("User (optional)", text: $user)
+                TextField("Port (optional)", text: $port)
                 Toggle("Accept invalid certificates", isOn: $acceptInvalidCerts)
             }
             .formStyle(.grouped)
@@ -65,11 +52,9 @@ struct AddRemoteSheet: View {
 
     private func submit() {
         let form = FfiAddRemoteForm(
-            useSsh: useSsh,
             host: host,
             user: user,
             port: UInt16(port.trimmingCharacters(in: .whitespaces)),
-            token: token,
             acceptInvalidCerts: acceptInvalidCerts
         )
         if let err = model.submitAddRemote(form) {
