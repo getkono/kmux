@@ -216,11 +216,9 @@ fn cmd_connect(app: &mut AppCore, args: &[String]) -> CommandResult {
     let remote = kmux_client::ssh::resolve_remote_target(&parsed)
         .ok_or_else(|| format!("could not parse remote target '{target}'"))?;
     let form = crate::core::AddRemoteForm {
-        use_ssh: true,
         host: remote.host,
         user: remote.user.unwrap_or_default(),
         port: remote.ssh_port,
-        token: String::new(),
         accept_invalid_certs: app.mgr.accept_invalid_certs(),
     };
     app.submit_add_remote(form)?;

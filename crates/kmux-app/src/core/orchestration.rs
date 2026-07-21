@@ -394,7 +394,11 @@ impl AppCore {
             if matches(peer) || expanded {
                 rows.push(LaunchRow::Remote {
                     peer: peer.clone(),
-                    label: peer.clone(),
+                    label: self
+                        .peer_labels
+                        .get(peer)
+                        .cloned()
+                        .unwrap_or_else(|| peer.clone()),
                     status: status.clone(),
                     expanded,
                 });
@@ -724,38 +728,28 @@ impl AppCore {
             .insert(peer.to_string(), RemoteStatus::Idle);
     }
 
-    /// Build a [`PeerTarget`] from the add-remote form, register it in the
-    /// in-session remote list, remember it (SSH only — `Direct` tokens are never
-    /// written to disk), and connect to it (issue #121). Returns an error string
-    /// for the frontend to surface when the form is incomplete.
+    /// Build an SSH [`PeerTarget`] from the add-remote form, register it in the
+    /// in-session remote list, remember it, and connect to it (issue #121).
+    /// Returns an error string for the frontend to surface when incomplete.
     pub fn submit_add_remote(&mut self, form: AddRemoteForm) -> Result<(), String> {
         let host = form.host.trim();
         if host.is_empty() {
             return Err("host is required".into());
         }
-        let target = if form.use_ssh {
-            PeerTarget::Ssh {
-                user: (!form.user.trim().is_empty()).then(|| form.user.trim().to_string()),
-                host: host.to_string(),
-                ssh_port: form.port,
-                accept_invalid_certs: form.accept_invalid_certs,
-            }
-        } else {
-            let port = form
-                .port
-                .ok_or_else(|| "port is required for a direct connection".to_string())?;
-            if form.token.is_empty() {
-                return Err("token is required for a direct connection".into());
-            }
-            PeerTarget::Direct {
-                host: host.to_string(),
-                port,
-                token: form.token,
-                accept_invalid_certs: form.accept_invalid_certs,
-            }
+        let user = (!form.user.trim().is_empty()).then(|| form.user.trim().to_string());
+        let target = PeerTarget::Ssh {
+            user: user.clone(),
+            host: host.to_string(),
+            ssh_port: form.port,
+            accept_invalid_certs: form.accept_invalid_certs,
         };
         let peer = target.peer_id();
         self.peer_targets.insert(peer.clone(), target);
+        let label = match user {
+            Some(user) => format!("{user}@{host}"),
+            None => host.to_string(),
+        };
+        self.peer_labels.insert(peer.clone(), label);
         self.record_peer_in_recents(&peer);
         self.mode = Mode::Normal;
         self.expand_remote(peer);
@@ -995,11 +989,9 @@ mod tests {
     async fn add_remote_ssh_registers_records_and_connects() {
         let (mut core, mut rx) = connected_core();
         core.submit_add_remote(AddRemoteForm {
-            use_ssh: true,
             host: "box".into(),
             user: "alice".into(),
             port: Some(2222),
-            token: String::new(),
             accept_invalid_certs: false,
         })
         .expect("a complete SSH form is valid");
@@ -1017,25 +1009,6 @@ mod tests {
             }
         }
         assert!(saw_open, "adding a remote must connect to it");
-    }
-
-    #[test]
-    fn add_remote_direct_requires_port() {
-        let mut core = fixture_core();
-        let err = core
-            .submit_add_remote(AddRemoteForm {
-                use_ssh: false,
-                host: "10.0.0.5".into(),
-                user: String::new(),
-                port: None,
-                token: "tok".into(),
-                accept_invalid_certs: true,
-            })
-            .expect_err("a Direct remote without a port must be rejected");
-        assert!(
-            err.contains("port"),
-            "error should mention the missing port"
-        );
     }
 
     #[test]

@@ -81,7 +81,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 22;
+pub const KMUX_FFI_ABI_VERSION: u32 = 23;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -1241,22 +1241,18 @@ pub struct FfiLaunchPicker {
 /// Values for the add-remote form (issue #121), mirroring [`AddRemoteForm`].
 #[derive(uniffi::Record)]
 pub struct FfiAddRemoteForm {
-    pub use_ssh: bool,
     pub host: String,
     pub user: String,
     pub port: Option<u16>,
-    pub token: String,
     pub accept_invalid_certs: bool,
 }
 
 impl From<FfiAddRemoteForm> for AddRemoteForm {
     fn from(f: FfiAddRemoteForm) -> Self {
         AddRemoteForm {
-            use_ssh: f.use_ssh,
             host: f.host,
             user: f.user,
             port: f.port,
-            token: f.token,
             accept_invalid_certs: f.accept_invalid_certs,
         }
     }

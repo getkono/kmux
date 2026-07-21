@@ -12,6 +12,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::time::{Duration, Instant};
 
+use kmux_client::hosts::{DiscoveredSshHost, SshHostSource, discover_ssh_hosts};
 use kmux_client::pipeline::ResolvedTarget;
 use kmux_client::session_manager::SessionManager;
 use kmux_client::ssh::RemoteTarget;
@@ -210,18 +211,33 @@ pub fn relative_time_label(last_active_ms: u64) -> String {
 /// [`AppCore::submit_add_remote`].
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AddRemoteForm {
-    /// `true` for an SSH remote (the default), `false` for a `Direct` TCP+TLS one.
-    pub use_ssh: bool,
     /// Hostname / IP / SSH alias. Required.
     pub host: String,
     /// SSH user; empty means "default user" (SSH only).
     pub user: String,
-    /// SSH port override, or the `Direct` TCP+TLS port (required for `Direct`).
+    /// SSH port override.
     pub port: Option<u16>,
-    /// Shared token for a `Direct` peer (required; never persisted to disk).
-    pub token: String,
     /// Accept a self-signed / unpinned server certificate.
     pub accept_invalid_certs: bool,
+}
+
+fn discovered_peer(host: DiscoveredSshHost) -> (PeerId, PeerTarget, String) {
+    let label = host.display_label();
+    let (user, target_host, ssh_port) = match host.source {
+        SshHostSource::KmuxHostsToml => (
+            host.user,
+            host.hostname.unwrap_or_else(|| host.alias.clone()),
+            host.port,
+        ),
+        SshHostSource::OpenSshConfig(_) => (None, host.alias, None),
+    };
+    let target = PeerTarget::Ssh {
+        user,
+        host: target_host,
+        ssh_port,
+        accept_invalid_certs: false,
+    };
+    (target.peer_id(), target, label)
 }
 
 /// Why the connection is paused, surfaced to frontends for a status indicator
@@ -389,11 +405,13 @@ pub struct AppCore {
     /// tearing down the whole UI.
     pub peer_status: HashMap<PeerId, RemoteStatus>,
     /// In-session remote registry: the [`PeerTarget`] used to (re)connect each
-    /// known remote, keyed by [`PeerId`]. Seeded from recents (SSH) and the CLI
-    /// `--server` peer, extended by the add-remote form (incl. `Direct`, whose
-    /// token lives only here). The source of truth for connect and for
-    /// re-federation after a reconnect.
+    /// known remote, keyed by [`PeerId`]. Seeded from configured SSH hosts,
+    /// recents, and the CLI `--server` peer. The source of truth for connect
+    /// and for re-federation after a reconnect.
     pub peer_targets: HashMap<PeerId, PeerTarget>,
+    /// User-facing labels for peers in the launcher. Kept separate from
+    /// [`PeerId`] so routing keys do not become display strings.
+    pub peer_labels: HashMap<PeerId, String>,
 }
 
 impl AppCore {
@@ -486,15 +504,23 @@ impl AppCore {
         // server the user explicitly asked for).
         let recent_servers = RecentServersCache::load();
         let mut peer_targets: HashMap<PeerId, PeerTarget> = HashMap::new();
+        let mut peer_labels: HashMap<PeerId, String> = HashMap::new();
         for srv in recent_servers.servers() {
             if let (Some(id), Some(target)) = (srv.kind.peer_id(), srv.kind.to_peer_target(false)) {
+                peer_labels.entry(id.clone()).or_insert(srv.display.clone());
                 peer_targets.entry(id).or_insert(target);
             }
+        }
+        for host in discover_ssh_hosts() {
+            let (id, target, label) = discovered_peer(host);
+            peer_labels.entry(id.clone()).or_insert(label);
+            peer_targets.entry(id).or_insert(target);
         }
         let mut launch_expanded: HashSet<PeerId> = HashSet::new();
         if let Some(target) = &desired_peer {
             let id = target.peer_id();
             peer_targets.insert(id.clone(), target.clone());
+            peer_labels.entry(id.clone()).or_insert_with(|| id.clone());
             launch_expanded.insert(id);
         }
 
@@ -550,6 +576,7 @@ impl AppCore {
             launch_expanded,
             peer_status: HashMap::new(),
             peer_targets,
+            peer_labels,
         }
     }
 
@@ -779,6 +806,7 @@ impl AppCore {
             launch_expanded: HashSet::new(),
             peer_status: HashMap::new(),
             peer_targets: HashMap::new(),
+            peer_labels: HashMap::new(),
         }
     }
 }
@@ -814,6 +842,30 @@ mod tests {
         let mut core = new_local_core();
         core.is_local = false;
         core
+    }
+
+    #[test]
+    fn openssh_discovery_keeps_alias_as_the_authoritative_target() {
+        let discovered = DiscoveredSshHost {
+            alias: "prod".into(),
+            user: Some("wrong-if-forced".into()),
+            hostname: Some("wrong.example".into()),
+            port: Some(2200),
+            source: SshHostSource::OpenSshConfig("config".into()),
+        };
+
+        let (peer, target, label) = discovered_peer(discovered);
+        assert_eq!(peer, "prod");
+        assert_eq!(label, "prod");
+        assert_eq!(
+            target,
+            PeerTarget::Ssh {
+                user: None,
+                host: "prod".into(),
+                ssh_port: None,
+                accept_invalid_certs: false,
+            }
+        );
     }
 
     /// The performance HUD auto-shows on debug builds and stays hidden on
