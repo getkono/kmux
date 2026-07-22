@@ -4,7 +4,8 @@
 //! `Published` `CellGrid` uses, against a synchronous `Local` reference.
 
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::time::{Duration, Instant};
 
 use kmux_client::grid::{ApplyHandle, CellGrid};
 use kmux_protocol::messages::{CellState, CursorState, DiffOp, TermModes, TerminalDiff};
@@ -80,10 +81,13 @@ fn concurrent_reader_never_tears() {
     let handle = ApplyHandle::spawn();
     let published = handle.register_pane("p".into(), ROWS, COLS);
     let reader_slot = Arc::clone(&published);
+    let final_slot = Arc::clone(&published);
     let mut grid = CellGrid::published("p".into(), handle.sender(), published);
 
     let stop = Arc::new(AtomicBool::new(false));
+    let observed_generation = Arc::new(AtomicU64::new(0));
     let reader_stop = Arc::clone(&stop);
+    let reader_generation = Arc::clone(&observed_generation);
     let reader = std::thread::spawn(move || {
         let mut last_gen = 0u64;
         let mut reads = 0u64;
@@ -101,6 +105,7 @@ fn concurrent_reader_never_tears() {
                 "published generation went backwards"
             );
             last_gen = generation;
+            reader_generation.store(generation, Ordering::Relaxed);
             reads += 1;
         }
         reads
@@ -123,8 +128,23 @@ fn concurrent_reader_never_tears() {
     }
     handle.barrier();
 
+    // Do not let a fast writer finish and stop the reader before the scheduler
+    // gives it a turn. Require the reader to observe the final publication so
+    // this remains a real concurrent handoff test on single-core CI runners.
+    let final_generation = final_slot.load().cells_generation();
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while observed_generation.load(Ordering::Relaxed) < final_generation
+        && Instant::now() < deadline
+    {
+        std::thread::yield_now();
+    }
     stop.store(true, Ordering::Relaxed);
     let reads = reader.join().expect("reader thread");
+    assert_eq!(
+        observed_generation.load(Ordering::Relaxed),
+        final_generation,
+        "reader observed the final published generation"
+    );
     assert!(reads > 0, "reader observed at least one published snapshot");
 
     // Final published state reflects the whole burst.
