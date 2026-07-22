@@ -82,7 +82,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 23;
+pub const KMUX_FFI_ABI_VERSION: u32 = 24;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -891,13 +891,19 @@ pub struct FfiTab {
     /// Whether any pane of this tab is currently paused (issue #68); drives the
     /// tab strip's pause marker.
     pub paused: bool,
+    /// Whether any pane in this tab has an unread BEL or notification.
+    pub needs_attention: bool,
 }
 
-/// Tab name, falling back to its 1-based index (mirrors the client's
-/// `tab_label`).
-fn tab_label(index: u32, name: &str) -> String {
+/// Tab name, falling back to the focused pane's OSC title, then its 1-based
+/// index. An explicit tab rename always wins.
+fn tab_label(index: u32, name: &str, pane_title: &str) -> String {
     if name.trim().is_empty() {
-        format!("{}", index + 1)
+        if pane_title.trim().is_empty() {
+            format!("{}", index + 1)
+        } else {
+            pane_title.to_string()
+        }
     } else {
         name.to_string()
     }
@@ -1954,11 +1960,23 @@ impl KmuxDriver {
                     .leaves()
                     .iter()
                     .any(|idx| d.core().is_pane_paused(&format_pane_id(&word, *idx)));
+                let focused_pane = format_pane_id(&word, t.focused_pane);
+                let pane_title = d
+                    .mgr
+                    .pane_info(&focused_pane)
+                    .map(|pane| pane.title.as_str())
+                    .unwrap_or_default();
+                let needs_attention = t
+                    .layout
+                    .leaves()
+                    .iter()
+                    .any(|idx| d.mgr.pane_needs_attention(&format_pane_id(&word, *idx)));
                 FfiTab {
                     tab_index: t.tab_index,
-                    name: tab_label(t.tab_index, &t.name),
+                    name: tab_label(t.tab_index, &t.name, pane_title),
                     active: active == Some(t.tab_index),
                     paused,
+                    needs_attention,
                 }
             })
             .collect()
@@ -2128,6 +2146,15 @@ impl KmuxDriver {
         core.mgr.rename_tab(tab_index, &name);
         core.needs_render = true;
         vec![FfiEffect::NeedsRender]
+    }
+
+    /// Move a tab to a zero-based position in the active session.
+    pub fn reorder_tab(&self, tab_index: u32, new_position: u32) {
+        self.inner
+            .lock()
+            .unwrap()
+            .mgr
+            .reorder_tab(tab_index, new_position);
     }
 
     /// Cheap grid identity for a specific pane (per-tile change detection).
@@ -3180,9 +3207,10 @@ mod tests {
 
     #[test]
     fn tab_label_falls_back_to_one_based_index() {
-        assert_eq!(tab_label(0, ""), "1");
-        assert_eq!(tab_label(2, "   "), "3");
-        assert_eq!(tab_label(0, "build"), "build");
+        assert_eq!(tab_label(0, "", ""), "1");
+        assert_eq!(tab_label(2, "   ", "   "), "3");
+        assert_eq!(tab_label(0, "build", "vim"), "build");
+        assert_eq!(tab_label(0, "", "vim"), "vim");
     }
 
     #[test]

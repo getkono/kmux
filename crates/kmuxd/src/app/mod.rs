@@ -168,8 +168,9 @@ impl crate::backend::BackendEventSink for PaneEventSink {
                     let _ = tx.send(bytes.to_vec());
                 }
             }
-            // Parsed but no client-facing wire event consumes them yet.
-            ControlEvent::Bell | ControlEvent::Hyperlink { .. } => {}
+            ControlEvent::Bell => self.on_bell(),
+            // Parsed but no client-facing wire event consumes it yet.
+            ControlEvent::Hyperlink { .. } => {}
         }
     }
 }
@@ -190,6 +191,15 @@ impl PaneEventSink {
             },
         };
         // Ignore error: no receivers means no clients are currently connected.
+        let _ = self.vt_events.send(event);
+    }
+
+    fn on_bell(&self) {
+        let event = kmux_protocol::messages::ServerMessage::Event {
+            event: kmux_protocol::messages::SessionEventMsg::PaneBell {
+                pane_id: self.pane_id.clone(),
+            },
+        };
         let _ = self.vt_events.send(event);
     }
 

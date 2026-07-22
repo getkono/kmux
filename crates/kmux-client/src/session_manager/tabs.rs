@@ -208,6 +208,9 @@ impl SessionManager {
         };
         self.active_tab = Some(tab_index);
         self.set_visible_set(visible);
+        for pane_id in &self.visible_panes {
+            self.attention_panes.remove(pane_id);
+        }
         self.focus_from_tab(&word_id, focus_idx);
     }
 
@@ -242,6 +245,7 @@ impl SessionManager {
             return;
         }
         self.active_pane = Some(pane_id.clone());
+        self.attention_panes.remove(&pane_id);
         if let (Some(word_id), Some(tab_index)) = (self.active_session.clone(), self.active_tab)
             && let Some(idx) = pane_index(&pane_id)
         {
@@ -359,6 +363,18 @@ impl SessionManager {
             word_id,
             tab_index,
             new_name: new_name.to_string(),
+        });
+    }
+
+    /// Move a tab to a zero-based position in the active session.
+    pub fn reorder_tab(&mut self, tab_index: u32, new_position: u32) {
+        let Some(word_id) = self.active_session.clone() else {
+            return;
+        };
+        self.send_ws(ClientMessage::TabReorder {
+            word_id,
+            tab_index,
+            new_position,
         });
     }
 

@@ -52,6 +52,14 @@ impl SessionManager {
             .find(|p| p.pane_id == pane_id)
     }
 
+    pub fn pane_needs_attention(&self, pane_id: &str) -> bool {
+        self.attention_panes.contains(pane_id)
+    }
+
+    pub fn mark_pane_attention(&mut self, pane_id: String) {
+        self.attention_panes.insert(pane_id);
+    }
+
     pub fn buffer_mut(&mut self, pane_id: &str) -> Option<&mut CellGrid> {
         self.buffers.get_mut(pane_id)
     }

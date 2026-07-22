@@ -103,6 +103,9 @@ pub struct SessionManager {
     /// Panes currently attached + rendered: the leaves of the active tab's
     /// layout. `active_pane` is the focused one within this set.
     pub(super) visible_panes: Vec<PaneId>,
+    /// Panes with an unread BEL or explicit attention notification. Cleared
+    /// when the user selects the containing tab/pane.
+    pub(super) attention_panes: HashSet<PaneId>,
     /// Per-pane content size (each pane's resolved sub-rect), pushed by the
     /// frontend from the shared layout resolver. Attach/Resize use this; falls
     /// back to the full window size when unset (single-pane tabs).
@@ -225,6 +228,7 @@ impl SessionManager {
             active_tab: None,
             active_pane: None,
             visible_panes: Vec::new(),
+            attention_panes: HashSet::new(),
             pane_sizes: HashMap::new(),
             pending_select_pane: None,
             zoomed: false,
@@ -1057,6 +1061,29 @@ mod tests {
     }
 
     #[test]
+    fn bell_marks_a_tab_until_the_user_selects_it() {
+        let mut mgr = make_manager();
+        mgr.session_list
+            .push(make_entry_with_tabs("eagle", "/home/user/proj", 2));
+        mgr.select_session("eagle".to_string());
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: kmux_protocol::messages::SessionEventMsg::PaneBell {
+                pane_id: "eagle/1".to_string(),
+            },
+        });
+
+        assert!(matches!(
+            events.as_slice(),
+            [super::SessionEvent::PaneBell { pane_id }] if pane_id == "eagle/1"
+        ));
+        assert!(mgr.pane_needs_attention("eagle/1"));
+
+        mgr.select_tab(1);
+        assert!(!mgr.pane_needs_attention("eagle/1"));
+    }
+
+    #[test]
     fn layout_update_attaches_split_pane_without_detaching_sibling() {
         use kmux_protocol::messages::{LayoutNode, SplitDir};
         let (mut mgr, mut rx) = make_connected_manager();
@@ -1371,6 +1398,58 @@ mod tests {
             }
             other => panic!("expected TabRename, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn reorder_tab_sends_destination_position() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.active_session = Some("eagle".into());
+        mgr.reorder_tab(4, 1);
+        match rx.try_recv() {
+            Ok(ClientMessage::TabReorder {
+                word_id,
+                tab_index,
+                new_position,
+            }) => {
+                assert_eq!(word_id, "eagle");
+                assert_eq!(tab_index, 4);
+                assert_eq!(new_position, 1);
+            }
+            other => panic!("expected TabReorder, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn tabs_reordered_event_updates_cached_order() {
+        use kmux_protocol::messages::{SessionEventMsg, TabInfo};
+        let mut mgr = make_manager();
+        let mut entry = make_entry("eagle", "/p");
+        let first = entry.tabs[0].clone();
+        entry.tabs.push(TabInfo {
+            tab_index: 2,
+            name: "third".into(),
+            layout: first.layout.clone(),
+            focused_pane: first.focused_pane,
+        });
+        entry.tabs.push(TabInfo {
+            tab_index: 1,
+            name: "second".into(),
+            layout: first.layout,
+            focused_pane: first.focused_pane,
+        });
+        mgr.session_list.push(entry);
+        mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::TabsReordered {
+                word_id: "eagle".into(),
+                tab_indices: vec![2, 0, 1],
+            },
+        });
+        let order: Vec<_> = mgr.session_list[0]
+            .tabs
+            .iter()
+            .map(|tab| tab.tab_index)
+            .collect();
+        assert_eq!(order, vec![2, 0, 1]);
     }
 
     #[test]

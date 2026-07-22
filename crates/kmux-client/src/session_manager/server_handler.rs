@@ -34,6 +34,8 @@ pub enum SessionEvent {
     PaneClosed { pane_id: String },
     /// A pane's window title changed (OSC 0/2).
     PaneTitleChanged { pane_id: String, title: String },
+    /// A pane rang BEL; frontends surface this as unread tab attention.
+    PaneBell { pane_id: String },
     /// A pane's OSC 9;4 progress changed (ConEmu/WT progress bar). The frontend
     /// repaints the pane's progress bar from the cached `PaneInfo`.
     PaneProgressChanged {
@@ -621,6 +623,27 @@ impl SessionManager {
             }
 
             ServerMessage::Event {
+                event:
+                    SessionEventMsg::TabsReordered {
+                        word_id,
+                        tab_indices,
+                    },
+            } => {
+                if let Some(entry) = self
+                    .session_list
+                    .iter_mut()
+                    .find(|entry| entry.meta.word_id == word_id)
+                {
+                    entry.tabs.sort_by_key(|tab| {
+                        tab_indices
+                            .iter()
+                            .position(|index| *index == tab.tab_index)
+                            .unwrap_or(usize::MAX)
+                    });
+                }
+            }
+
+            ServerMessage::Event {
                 event: SessionEventMsg::PaneResized { pane_id, size },
             } => {
                 if let Some(grid) = self.buffers.get_mut(&pane_id) {
@@ -638,6 +661,13 @@ impl SessionManager {
                     }
                 }
                 events.push(SessionEvent::PaneTitleChanged { pane_id, title });
+            }
+
+            ServerMessage::Event {
+                event: SessionEventMsg::PaneBell { pane_id },
+            } => {
+                self.attention_panes.insert(pane_id.clone());
+                events.push(SessionEvent::PaneBell { pane_id });
             }
 
             ServerMessage::Event {
