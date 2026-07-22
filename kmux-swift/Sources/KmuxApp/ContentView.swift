@@ -239,6 +239,7 @@ struct ContentView: View {
 /// Native menu accelerators — the SwiftUI analog of kmux-gtk's `actions.rs`
 /// (`gio` actions bound to accelerators). Commands dispatch the same toolkit-
 /// agnostic `FfiAction`s the buttons do.
+@MainActor
 struct KmuxCommands: Commands {
     // The key window's model/UI (per-window, via focused-scene values). `nil`
     // when no terminal window is focused (e.g. only Preferences is open), in
