@@ -27,7 +27,7 @@ intercepted, and what kmux does with it:
 | Variant      | Sequence  | What kmux does                                              |
 |--------------|-----------|------------------------------------------------------------|
 | `Title`      | OSC 0 / 2 | store per-pane, broadcast `PaneTitleChanged`               |
-| `Bell`       | BEL       | surfaced; no client-facing wire event yet (dropped)        |
+| `Bell`       | BEL       | broadcast `PaneBell`; mark the owning tab for attention    |
 | `Osc52Copy`  | OSC 52    | broadcast `PaneClipboardCopy` (payload decoded client-side)|
 | `Progress`   | OSC 9;4   | store per-pane, broadcast `PaneProgressChanged`            |
 | `Hyperlink`  | OSC 8     | surfaced; no client-facing wire event yet (dropped)        |

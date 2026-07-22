@@ -188,7 +188,8 @@ the macOS app uses the parallel native shortcuts in its "Pane" / "Session" menus
 |--------|------------------|----------------------|
 | Split right / down | `Ctrl+Shift+\` / `Ctrl+Shift+-` | `⌘D` / `⌘⇧D` |
 | Move focus | `Ctrl+Alt+←/→/↑/↓` | `⌘⌥←/→/↑/↓` |
-| Jump to session by number | `Ctrl+1…9` | `⌘1…9` |
+| Select tab by number | *(unbound)* | `⌘1…9` |
+| Jump to session by number | `Ctrl+1…9` | `⌘⌃1…9` |
 | Focus pane by number | `Alt+1…9` | `⌘⌥1…9` |
 | Resize (keyboard) | `Ctrl+Shift+Alt+←/→/↑/↓` | `⌘⌃←/→/↑/↓` |
 | Resize (mouse) | drag a divider · double-click → even | drag a divider · double-click → even |
@@ -197,8 +198,8 @@ the macOS app uses the parallel native shortcuts in its "Pane" / "Session" menus
 | Zoom focused pane | `Ctrl+Shift+Z` | `⌘⌃Z` |
 | Pane context menu | right-click a pane | right-click a pane |
 | New tab | `Ctrl+Shift+T` | `⌘T` |
-| Next / previous tab | `Ctrl+Shift+→` / `Ctrl+Shift+←` | `⌘⌥]` / `⌘⌥[` |
-| Next / previous session | `Ctrl+Tab` / `Ctrl+Shift+Tab` | `Ctrl+Tab` / `Ctrl+Shift+Tab` (also `⌘⇧]` / `⌘⇧[`) |
+| Next / previous tab | `Ctrl+Tab` / `Ctrl+Shift+Tab` (also `Ctrl+PageDown/Up`) | `Ctrl+Tab` / `Ctrl+Shift+Tab` (also `⌘⌥]` / `⌘⌥[`) |
+| Next / previous session | *(unbound)* | `⌘⇧]` / `⌘⇧[` |
 | Rename session / tab | `F2` / `Shift+F2` | `F2` / `Shift+F2` |
 | Close tab | *(tab-bar ✕ / menu)* | *(tab context menu / menu)* |
 | Close pane | `Ctrl+Shift+Q` | `⌘⇧W` |
