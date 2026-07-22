@@ -262,19 +262,40 @@ struct KmuxCommands: Commands {
             Button("Open Launcher…") { model?.openLaunchPicker() }
                 .keyboardShortcut("o")
             Divider()
-            Button("Next Session") { model?.dispatch(.nextSession) }
-                .keyboardShortcut(.tab, modifiers: .control)
-            Button("Previous Session") { model?.dispatch(.prevSession) }
-                .keyboardShortcut(.tab, modifiers: [.control, .shift])
+            // Tabs — the inner loop. Ctrl+Tab / Ctrl+Shift+Tab is owned by
+            // KeyInput.keyDown (matching kmux-gtk and macOS terminals); a Tab-key
+            // menu accelerator is unreliable, so the menu carries the ⌘⌥[ ] alias.
+            // ⌘1…9 selects a tab by number (Safari-style).
             Button("Next Tab") { model?.dispatch(.nextTab) }
                 .keyboardShortcut("]", modifiers: [.command, .option])
             Button("Previous Tab") { model?.dispatch(.prevTab) }
                 .keyboardShortcut("[", modifiers: [.command, .option])
+            Menu("Select Tab") {
+                ForEach(1...9, id: \.self) { n in
+                    Button("Tab \(n)") { model?.selectTab(UInt32(n - 1)) }
+                        .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: .command)
+                }
+            }
             Button("Close Tab") { model?.dispatch(.closeTab) }
                 .keyboardShortcut("w", modifiers: .command)
             Button("Rename Tab…") { ui?.renameTabTarget = activeTab }
                 .keyboardShortcut(functionKey(NSF2FunctionKey), modifiers: .shift)
             Divider()
+            // Sessions — the outer loop. ⌘⇧[ ] cycles (mirrors Safari's tab keys);
+            // ⌘⌃1…9 jumps by number, kept distinct from ⌘1…9 (tab) and ⌘⌥1…9 (pane).
+            Button("Next Session") { model?.dispatch(.nextSession) }
+                .keyboardShortcut("]", modifiers: [.command, .shift])
+            Button("Previous Session") { model?.dispatch(.prevSession) }
+                .keyboardShortcut("[", modifiers: [.command, .shift])
+            Menu("Jump to Session") {
+                ForEach(1...9, id: \.self) { n in
+                    Button("Session \(n)") {
+                        model?.dispatch(.jumpToSession(index: UInt32(n - 1)))
+                    }
+                    .keyboardShortcut(
+                        KeyEquivalent(Character("\(n)")), modifiers: [.command, .control])
+                }
+            }
             Button("Rename Session…") { ui?.renameTarget = activeSession }
                 .keyboardShortcut(functionKey(NSF2FunctionKey), modifiers: [])
             Button("Close Session") { model?.dispatch(.closeSession) }
@@ -324,14 +345,6 @@ struct KmuxCommands: Commands {
                 .keyboardShortcut(.downArrow, modifiers: [.command, .option])
             Button("Cycle Pane Next") { model?.dispatch(.nextPaneInTab) }
             Button("Cycle Pane Previous") { model?.dispatch(.prevPaneInTab) }
-            Menu("Jump to Session") {
-                ForEach(1...9, id: \.self) { n in
-                    Button("Session \(n)") {
-                        model?.dispatch(.jumpToSession(index: UInt32(n - 1)))
-                    }
-                    .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: .command)
-                }
-            }
             Menu("Focus Pane") {
                 ForEach(1...9, id: \.self) { n in
                     Button("Pane \(n)") {

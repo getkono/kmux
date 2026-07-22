@@ -176,6 +176,11 @@ final class KmuxModel: ObservableObject {
         apply(driver.renameTab(tabIndex: index, name: name))
     }
 
+    /// Move a tab to a zero-based position; the daemon broadcasts the result.
+    func reorderTab(_ index: UInt32, to position: Int) {
+        driver.reorderTab(tabIndex: index, newPosition: UInt32(position))
+    }
+
     /// Focus a tiled pane within the active tab (a click on a tile). Updates the
     /// focused id optimistically so pointer coordinates map to the new pane right
     /// away; the next pump reconciles to the authoritative focus.

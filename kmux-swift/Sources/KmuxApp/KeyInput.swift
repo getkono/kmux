@@ -26,15 +26,13 @@ extension TerminalNSView {
             return
         }
 
-        // ⌘ chords are app accelerators, not PTY input. Handle the standard
-        // copy/paste and alternate session-cycle chords here; let the menu
-        // (responder chain) claim the rest.
+        // ⌘ chords are app accelerators, not PTY input. Handle copy/paste here
+        // (the terminal owns selection copy); the menu (responder chain) claims
+        // every other ⌘ accelerator, including session cycling (⌘⇧[ / ⌘⇧]).
         if mods.command {
             switch event.charactersIgnoringModifiers {
             case "c": model.dispatch(.copySelection)
             case "v": model.dispatch(.paste)
-            case "]" where mods.shift: model.dispatch(.nextSession)
-            case "[" where mods.shift: model.dispatch(.prevSession)
             default: super.keyDown(with: event)
             }
             return

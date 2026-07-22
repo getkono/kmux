@@ -1,4 +1,5 @@
 import SwiftUI
+import UniformTypeIdentifiers
 
 import KmuxBindings
 
@@ -9,6 +10,7 @@ import KmuxBindings
 struct TabStrip: View {
     @ObservedObject var model: KmuxModel
     @ObservedObject var ui: UIState
+    @State private var draggedTab: UInt32?
 
     var body: some View {
         ScrollView(.horizontal) {
@@ -17,6 +19,16 @@ struct TabStrip: View {
                     TabButton(tab: tab, theme: model.theme) {
                         model.selectTab(tab.tabIndex)
                     }
+                    .onDrag {
+                        draggedTab = tab.tabIndex
+                        return NSItemProvider(object: String(tab.tabIndex) as NSString)
+                    }
+                    .onDrop(
+                        of: [.text],
+                        delegate: TabDropDelegate(
+                            destination: tab.tabIndex,
+                            model: model,
+                            draggedTab: $draggedTab))
                     .contextMenu {
                         Button("Rename Tab…") { ui.renameTabTarget = tab }
                         Button("Close Tab") {
@@ -46,6 +58,26 @@ struct TabStrip: View {
     }
 }
 
+private struct TabDropDelegate: DropDelegate {
+    let destination: UInt32
+    let model: KmuxModel
+    @Binding var draggedTab: UInt32?
+
+    func performDrop(info: DropInfo) -> Bool {
+        guard let draggedTab,
+              draggedTab != destination,
+              let position = model.tabs.firstIndex(where: { $0.tabIndex == destination })
+        else { return false }
+        model.reorderTab(draggedTab, to: position)
+        self.draggedTab = nil
+        return true
+    }
+
+    func dropUpdated(info: DropInfo) -> DropProposal? {
+        DropProposal(operation: .move)
+    }
+}
+
 private struct TabButton: View {
     let tab: FfiTab
     let theme: FfiTheme
@@ -55,12 +87,15 @@ private struct TabButton: View {
     var body: some View {
         Button(action: action) {
             HStack(spacing: 7) {
-                Text("\(tab.tabIndex + 1)")
-                    .font(.caption2.monospacedDigit())
-                    .foregroundStyle(.secondary)
                 Text(tab.name)
                     .font(.callout.weight(tab.active ? .semibold : .regular))
                     .lineLimit(1)
+                if tab.needsAttention {
+                    Image(systemName: "bell.fill")
+                        .font(.system(size: 9, weight: .semibold))
+                        .foregroundStyle(theme.chrome.accent)
+                        .accessibilityLabel("Needs attention")
+                }
                 if tab.paused {
                     Image(systemName: "pause.fill")
                         .font(.system(size: 8, weight: .bold))
