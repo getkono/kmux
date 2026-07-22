@@ -540,6 +540,8 @@ pub enum SessionEventMsg {
     PaneResized { pane_id: PaneId, size: TermSize },
     /// A pane's program reported a new window title (OSC 0/2).
     PaneTitleChanged { pane_id: PaneId, title: String },
+    /// A pane's program rang the terminal bell (BEL).
+    PaneBell { pane_id: PaneId },
     /// A pane's program reported OSC 9;4 progress (ConEmu/WT progress bar).
     /// The daemon tracks the latest state per pane; this fires on every change.
     PaneProgressChanged {
@@ -594,6 +596,11 @@ pub enum SessionEventMsg {
         word_id: WordId,
         tab_index: TabIndex,
         name: String,
+    },
+    /// A session's authoritative tab order changed.
+    TabsReordered {
+        word_id: WordId,
+        tab_indices: Vec<TabIndex>,
     },
     /// A tab's layout tree and/or focus changed. Clients should reconcile to the
     /// authoritative tree carried by the next `LayoutUpdate` for this tab.

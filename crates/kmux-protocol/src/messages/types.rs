@@ -127,7 +127,7 @@ impl TransportKind {
 ///   replies with one or more `ServerMessage::LogChunk` and a terminating
 ///   `ServerMessage::LogEnd` (or streams chunks indefinitely under `follow`), so
 ///   `kmux daemon logs --server <host>` works across machines.
-pub const PROTOCOL_VERSION: u32 = 38;
+pub const PROTOCOL_VERSION: u32 = 40;
 
 /// Wire compression algorithm negotiated for a connection.
 ///

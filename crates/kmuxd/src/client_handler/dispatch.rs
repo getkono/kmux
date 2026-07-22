@@ -379,6 +379,24 @@ pub async fn handle_message<A: PaneAttacher>(
             Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
         },
 
+        ClientMessage::TabReorder {
+            word_id,
+            tab_index,
+            new_position,
+        } => match state
+            .app
+            .reorder_tab(&word_id, tab_index, new_position)
+            .await
+        {
+            Ok(tab_indices) => state
+                .app
+                .broadcast_session_event(SessionEventMsg::TabsReordered {
+                    word_id,
+                    tab_indices,
+                }),
+            Err(e) => state.error(None, classify_error(&e), e.to_string()),
+        },
+
         ClientMessage::PaneSplit {
             request_id,
             word_id,

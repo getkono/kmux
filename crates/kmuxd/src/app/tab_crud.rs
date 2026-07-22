@@ -36,6 +36,31 @@ pub enum PaneCloseOutcome {
 }
 
 impl ServerApp {
+    /// Move a tab and return the complete authoritative order.
+    pub async fn reorder_tab(
+        &self,
+        word_id: &str,
+        tab_index: u32,
+        new_position: u32,
+    ) -> Result<Vec<u32>> {
+        let mut sessions = self.sessions.write().await;
+        let state = sessions
+            .get_mut(word_id)
+            .ok_or_else(|| KmuxError::SessionNotFound {
+                name: word_id.to_string(),
+            })?;
+        let Some(old_position) = state.tabs.iter().position(|tab| tab.tab_index == tab_index)
+        else {
+            return Ok(state.tabs.iter().map(|tab| tab.tab_index).collect());
+        };
+        let tab = state.tabs.remove(old_position);
+        let destination = usize::try_from(new_position)
+            .unwrap_or(usize::MAX)
+            .min(state.tabs.len());
+        state.tabs.insert(destination, tab);
+        Ok(state.tabs.iter().map(|tab| tab.tab_index).collect())
+    }
+
     /// Create a new tab (with one fresh pane) inside an existing session.
     pub async fn create_tab(
         &self,

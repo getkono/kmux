@@ -169,6 +169,13 @@ pub enum ClientMessage {
         new_name: String,
     },
 
+    /// Move a tab to a new zero-based position in its session's tab strip.
+    TabReorder {
+        word_id: WordId,
+        tab_index: TabIndex,
+        new_position: u32,
+    },
+
     /// Split the focused (or named) pane within a tab, spawning a new pane (PTY)
     /// adjacent to it in `dir`. The server spawns the PTY, inserts its leaf into
     /// the tab's layout tree, and broadcasts the new tree via `PaneSplit` /
@@ -420,6 +427,7 @@ impl ClientMessage {
             | Self::TabCreate { .. }
             | Self::TabClose { .. }
             | Self::TabRename { .. }
+            | Self::TabReorder { .. }
             | Self::PaneSplit { .. }
             | Self::PaneSwap { .. }
             | Self::SetLayoutRatios { .. }

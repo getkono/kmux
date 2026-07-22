@@ -45,6 +45,7 @@ pub(super) fn rewrite_event_to_local(
         | PaneExited { pane_id, .. }
         | PaneResized { pane_id, .. }
         | PaneTitleChanged { pane_id, .. }
+        | PaneBell { pane_id }
         | PaneProgressChanged { pane_id, .. }
         | PaneClipboardCopy { pane_id, .. }
         | PaneClosed { pane_id }
@@ -61,6 +62,7 @@ pub(super) fn rewrite_event_to_local(
         | TabCreated { word_id, .. }
         | TabClosed { word_id, .. }
         | TabRenamed { word_id, .. }
+        | TabsReordered { word_id, .. }
         | LayoutChanged { word_id, .. } => {
             let local_word = remote_to_local.get(word_id.as_str())?.clone();
             *word_id = local_word.clone();
