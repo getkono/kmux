@@ -22,7 +22,7 @@ extension TerminalNSView {
         if let named = namedKey(for: event),
             case .tab = named, mods.ctrl, !mods.alt, !mods.command
         {
-            model.dispatch(mods.shift ? .prevTab : .nextTab)
+            model.cycleDisplayedTab(by: mods.shift ? -1 : 1)
             return
         }
 

@@ -11,15 +11,30 @@ struct TabStrip: View {
     @ObservedObject var model: KmuxModel
     @ObservedObject var ui: UIState
     @State private var draggedTab: UInt32?
+    @State private var previewOrder: [UInt32] = []
+
+    private var displayedTabs: [FfiTab] {
+        let tabsByID = Dictionary(uniqueKeysWithValues: model.tabs.map { ($0.tabIndex, $0) })
+        let ordered = previewOrder.compactMap { tabsByID[$0] }
+        return ordered.count == model.tabs.count ? ordered : model.tabs
+    }
 
     var body: some View {
         ScrollView(.horizontal) {
             HStack(spacing: 5) {
-                ForEach(model.tabs, id: \.tabIndex) { tab in
-                    TabButton(tab: tab, theme: model.theme) {
+                ForEach(displayedTabs, id: \.tabIndex) { tab in
+                    TabButton(
+                        tab: tab,
+                        theme: model.theme,
+                        isDragging: draggedTab == tab.tabIndex,
+                        displayedPosition: displayedTabs.firstIndex(where: {
+                            $0.tabIndex == tab.tabIndex
+                        }) ?? 0
+                    ) {
                         model.selectTab(tab.tabIndex)
                     }
                     .onDrag {
+                        previewOrder = model.tabs.map(\.tabIndex)
                         draggedTab = tab.tabIndex
                         return NSItemProvider(object: String(tab.tabIndex) as NSString)
                     }
@@ -28,7 +43,8 @@ struct TabStrip: View {
                         delegate: TabDropDelegate(
                             destination: tab.tabIndex,
                             model: model,
-                            draggedTab: $draggedTab))
+                            draggedTab: $draggedTab,
+                            previewOrder: $previewOrder))
                     .contextMenu {
                         Button("Rename Tab…") { ui.renameTabTarget = tab }
                         Button("Close Tab") {
@@ -50,11 +66,17 @@ struct TabStrip: View {
             }
             .padding(.horizontal, 8)
             .padding(.vertical, 6)
+            .animation(.snappy(duration: 0.24, extraBounce: 0.08), value: previewOrder)
         }
         .scrollIndicators(.hidden)
         .frame(maxWidth: .infinity, alignment: .leading)
         .background(model.theme.chrome.background)
         .overlay(alignment: .bottom) { Divider().overlay(model.theme.chrome.border) }
+        .onAppear { previewOrder = model.tabs.map(\.tabIndex) }
+        .onChange(of: model.tabs.map(\.tabIndex)) { _, newOrder in
+            guard draggedTab == nil else { return }
+            previewOrder = newOrder
+        }
     }
 }
 
@@ -62,13 +84,29 @@ private struct TabDropDelegate: DropDelegate {
     let destination: UInt32
     let model: KmuxModel
     @Binding var draggedTab: UInt32?
+    @Binding var previewOrder: [UInt32]
+
+    func dropEntered(info: DropInfo) {
+        guard let draggedTab,
+              draggedTab != destination,
+              let source = previewOrder.firstIndex(of: draggedTab),
+              let target = previewOrder.firstIndex(of: destination)
+        else { return }
+
+        withAnimation(.snappy(duration: 0.24, extraBounce: 0.08)) {
+            previewOrder.move(
+                fromOffsets: IndexSet(integer: source),
+                toOffset: target > source ? target + 1 : target)
+        }
+    }
 
     func performDrop(info: DropInfo) -> Bool {
         guard let draggedTab,
-              draggedTab != destination,
-              let position = model.tabs.firstIndex(where: { $0.tabIndex == destination })
+              let position = previewOrder.firstIndex(of: draggedTab)
         else { return false }
-        model.reorderTab(draggedTab, to: position)
+        if model.tabs.map(\.tabIndex) != previewOrder {
+            model.reorderTab(draggedTab, to: position)
+        }
         self.draggedTab = nil
         return true
     }
@@ -81,6 +119,8 @@ private struct TabDropDelegate: DropDelegate {
 private struct TabButton: View {
     let tab: FfiTab
     let theme: FfiTheme
+    let isDragging: Bool
+    let displayedPosition: Int
     let action: () -> Void
     @State private var hovering = false
 
@@ -114,9 +154,14 @@ private struct TabButton: View {
             }
         }
         .buttonStyle(.plain)
+        .opacity(isDragging ? 0.58 : 1)
+        .scaleEffect(isDragging ? 1.04 : 1)
+        .offset(y: isDragging ? -2 : 0)
+        .shadow(color: .black.opacity(isDragging ? 0.28 : 0), radius: 7, y: 3)
         .onHover { hovering = $0 }
         .animation(.easeOut(duration: 0.12), value: hovering)
-        .accessibilityLabel("Tab \(tab.tabIndex + 1), \(tab.name)")
+        .animation(.easeOut(duration: 0.16), value: isDragging)
+        .accessibilityLabel("Tab \(displayedPosition + 1), \(tab.name)")
         .accessibilityAddTraits(tab.active ? [.isButton, .isSelected] : .isButton)
     }
 

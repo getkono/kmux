@@ -160,6 +160,24 @@ final class KmuxModel: ObservableObject {
         apply(driver.selectTab(tabIndex: index))
     }
 
+    /// View the tab at a zero-based position in the currently displayed order.
+    func selectDisplayedTab(at position: Int) {
+        guard let tabID = tabID(atDisplayedPosition: position, in: tabs.map(\.tabIndex)) else {
+            return
+        }
+        selectTab(tabID)
+    }
+
+    /// Cycle through tabs in the same order as the tab strip.
+    func cycleDisplayedTab(by offset: Int) {
+        let orderedIDs = tabs.map(\.tabIndex)
+        let activeID = tabs.first(where: \.active)?.tabIndex
+        guard let tabID = cycledTabID(current: activeID, offset: offset, in: orderedIDs) else {
+            return
+        }
+        selectTab(tabID)
+    }
+
     /// Resize a split by dragging `div` so its boundary sits at `pointerCell`
     /// (cells along the divider's drag axis). Reuses the shared Rust math.
     func applyDividerDrag(_ div: FfiDivider, pointerCell: UInt32) {

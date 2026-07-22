@@ -266,13 +266,13 @@ struct KmuxCommands: Commands {
             // KeyInput.keyDown (matching kmux-gtk and macOS terminals); a Tab-key
             // menu accelerator is unreliable, so the menu carries the ⌘⌥[ ] alias.
             // ⌘1…9 selects a tab by number (Safari-style).
-            Button("Next Tab") { model?.dispatch(.nextTab) }
+            Button("Next Tab") { model?.cycleDisplayedTab(by: 1) }
                 .keyboardShortcut("]", modifiers: [.command, .option])
-            Button("Previous Tab") { model?.dispatch(.prevTab) }
+            Button("Previous Tab") { model?.cycleDisplayedTab(by: -1) }
                 .keyboardShortcut("[", modifiers: [.command, .option])
             Menu("Select Tab") {
                 ForEach(1...9, id: \.self) { n in
-                    Button("Tab \(n)") { model?.selectTab(UInt32(n - 1)) }
+                    Button("Tab \(n)") { model?.selectDisplayedTab(at: n - 1) }
                         .keyboardShortcut(KeyEquivalent(Character("\(n)")), modifiers: .command)
                 }
             }
