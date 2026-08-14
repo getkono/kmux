@@ -315,22 +315,27 @@ The first message on every connection must be `ClientMessage::Auth`.  Any
 other message before auth receives no response and the connection is closed.
 
 ```
-Auth { token, protocol_version, capabilities, connection_id }:
-  1. protocol_version != PROTOCOL_VERSION
-       → AuthResult { success: false, reason: "version mismatch" }
+Auth { token, protocol_range, protocol_capabilities, capabilities, connection_id }:
+  1. protocol ranges do not overlap (or the client reports only a legacy integer)
+       → AuthResult { success: false, reason: "protocol version mismatch" }
        → return false (close)
-  2. !validate_token(token, app.auth_token)   // constant-time compare
+  2. intersect protocol_capabilities with the daemon's supported set
+  3. !validate_token(token, app.auth_token)   // constant-time compare
        → AuthResult { success: false, reason: "invalid token" }
        → return true (keep reading; client may retry)
-  3. Success:
+  4. Success:
        (client_id, conn_id, metrics) = app.register_client(transport, metrics, connection_id)
        state.authenticated = true
-       AuthResult { success: true, client_id, connection_id, server_version }
+       AuthResult { success: true, client_id, connection_id,
+                    negotiated_protocol, negotiated_capabilities, server_version }
 ```
 
 `connection_id` in the `Auth` message supports **channel switching**: passing
 the `ConnectionId` from a previous session causes `register_client` to reuse
 the existing metrics rather than allocating a new `ConnectionId`.
+
+See [Data-Plane Protocol Versioning](architecture-protocol-versioning.md) for
+the permanent schema-evolution and negotiation rules.
 
 ---
 

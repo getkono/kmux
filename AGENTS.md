@@ -92,8 +92,9 @@ These are strictly-typed config/CLI, not environment variables.
 
 ## Correctness (IMPORTANT!)
 
-- Every component that talks to an external dependency is versioned and refuses a
-  mismatch: the data protocol (`PROTOCOL_VERSION`), the `kmux-ffi` C ABI
+- Every component that talks to an external dependency is versioned and rejects
+  incompatible peers: the data protocol (`PROTOCOL_RANGE` plus named
+  capabilities), the `kmux-ffi` C ABI
   (`KMUX_FFI_ABI_VERSION`), the daemon↔worker contract (`kmux-worker-protocol`),
   and `kmux-ghostty-sys` (`EXPECTED_ABI_VERSION`).
 - Every connecting party proves a cryptographic identity (issue #146): the daemon

@@ -141,7 +141,7 @@ read from the existing restart log (`worker_restart_stats`: respawns within the
 60s window + remaining budget). `kmux status` surfaces this; an in-process daemon
 reports an empty list, and a daemon predating the command closes without
 replying, so the client degrades gracefully. Control-socket only — no
-`PROTOCOL_VERSION` / `kmux-worker-protocol` bump (new fields are
+data-plane capability or `kmux-worker-protocol` bump (new fields are
 `#[serde(default)]` for cross-build forward-compat).
 
 ## Interaction with handoff & federation

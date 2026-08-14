@@ -104,8 +104,9 @@ through it:
   the `kmux/` and `kmux-debug/` logs at once.
 
 For remote (SSH / TCP / QUIC) connections the profile of the remote daemon is
-irrelevant; `PROTOCOL_VERSION` (u32) remains the only wire-level compatibility
-gate.
+irrelevant; the semantic `PROTOCOL_RANGE` overlap and negotiated named
+capabilities are the wire-level compatibility gates. See
+[Data-Plane Protocol Versioning](architecture-protocol-versioning.md).
 
 ## Port defaults
 

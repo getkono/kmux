@@ -53,15 +53,15 @@ policy above takes effect at the 1.0.0 release.
 
 ### Release version vs. internal contract versions
 
-The release semver is a *user-facing* signal and is independent of the several
-monotonic integer versions that gate the wire and ABI contracts between kmux
-processes: the data protocol's `PROTOCOL_VERSION`, the `kmux-ffi` C ABI's
+The release semver is a *user-facing* signal and is independent of the internal
+versions that gate wire and ABI contracts between kmux processes: the data
+protocol's semantic `PROTOCOL_RANGE` and named capabilities, the `kmux-ffi` C ABI's
 `KMUX_FFI_ABI_VERSION`, the daemon↔worker `kmux-worker-protocol`, and
 `kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION` (see the *Correctness* section of
 [`../CLAUDE.md`](../CLAUDE.md)). Those bump per change, and each connecting party
 refuses a mismatch — [`kmux-protocol::compat`](../crates/kmux-protocol/src/compat.rs)
 is the single source of truth for classifying a skew as compatible or blocking.
-A patch release may bump any of those integers: what makes it a patch is that the
+A patch release may evolve any of those contracts: what makes it a patch is that the
 upgrade still migrates without supervision (the daemon hands off live sessions,
 state migrates forward, and any residual skew between mismatched binaries is
 surfaced as a clear, non-destructive block rather than silent breakage) — not

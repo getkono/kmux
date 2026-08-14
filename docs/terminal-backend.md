@@ -132,8 +132,8 @@ frame (`resolveCell` reads `term.colors.palette.current`). The consequence:
 
 - A set/reset is reflected in **newly written** cells **and** in cells already
   on screen (the whole grid is re-resolved), and the change is carried to clients
-  as an ordinary `TerminalDiff` — no special palette message and no
-  `PROTOCOL_VERSION` bump.
+  as an ordinary `TerminalDiff` — no special palette message and no schema
+  change.
 - The kitty OSC 21 grammar (`21;<key>=<color>` to set, `21;<key>=` to reset,
   with `<key>` a palette index, `foreground`/`background`/`cursor`/… special, and
   colours as `#rrggbb`, `rgb:r/g/b`, `rgbi:…`, or CSS names) is parsed by

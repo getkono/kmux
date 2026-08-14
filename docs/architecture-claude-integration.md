@@ -100,10 +100,12 @@ Flags override the inferred values: `kmux notify --kind needs-input --title …
 
 ## Versioning
 
-The wire and FFI boundaries bump together (see the repo's "Correctness"
-invariants): `PROTOCOL_VERSION` for `ClientMessage::Notify` +
-`SessionEventMsg::PaneAttention` + `AttentionKind`, and `KMUX_FFI_ABI_VERSION`
-for `FfiEffect::Attention` + `FfiAttentionKind`.
+The data-plane and FFI boundaries evolve together (see the repo's "Correctness"
+invariants): the notification messages are guarded by their schema contract,
+while `KMUX_FFI_ABI_VERSION` covers `FfiEffect::Attention` +
+`FfiAttentionKind`. New optional message families should use a named protocol
+capability; see
+[Data-Plane Protocol Versioning](architecture-protocol-versioning.md).
 
 ## Follow-ups
 
