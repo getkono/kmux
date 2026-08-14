@@ -35,10 +35,10 @@ So the daemon verifies **proof-of-possession**:
 
 ```
 client                                  daemon
-  │  Auth { token, protocol_version,       │
-  │         public_key, hostname,          │
-  │         username }                      │
-  │ ─────────────────────────────────────► │  validate token + protocol
+  │  Auth { token, protocol_range,         │
+  │         protocol_capabilities,          │
+  │         public_key, hostname, username }│
+  │ ─────────────────────────────────────► │  negotiate protocol + validate token
   │                                         │  (reject → AuthResult{success:false})
   │  AuthChallenge { nonce }                │  random 32-byte nonce
   │ ◄───────────────────────────────────── │
@@ -57,7 +57,7 @@ headless `kmux ls` / `ps` / `clients` / `kick` subcommands, via a shared
 **its own** identity over the same path, so a peer's client list shows the hub as
 one distinct entity.
 
-Since `PROTOCOL_VERSION` 37 the `Auth` frame also carries the client's **build
+The `Auth` frame also carries the client's **build
 identity** — the frontend kind (`cli` / `gtk` / `swift`) plus the client binary's
 git sha, dirty flag, and build profile. The frontend kind is a process-wide
 constant set once at GUI startup (`kmux_connect::set_frontend_kind`, called by
@@ -91,8 +91,8 @@ and `build` (`<sha>[-dirty]`) / `build_profile` (protocol 37), shown as the
 
 ## Build skew & `kmux client`
 
-A matching `PROTOCOL_VERSION` does **not** mean the CLI, the GUI client, and the
-daemon are the same build — two commits can share a protocol. The classic trap:
+An overlapping `PROTOCOL_RANGE` does **not** mean the CLI, the GUI client, and
+the daemon are the same build — two commits can share a schema. The classic trap:
 an install updates the GUI app bundle but leaves a stale `kmux`/`kmuxd` on
 `PATH`, so the GUI talks to a current daemon while `kmux …` runs old code.
 

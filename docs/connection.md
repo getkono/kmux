@@ -119,7 +119,8 @@ Error handling during the race:
 | Any other error | Recorded with a per-strategy description; remaining strategies continue |
 | All strategies exhausted | `AllFailed(Vec<String>)` with per-strategy failure descriptions |
 
-`VersionMismatch` is never retried. If any strategy detects a protocol version mismatch, the entire bootstrap halts.
+`VersionMismatch` is never retried. If any strategy detects disjoint semantic
+protocol ranges or a legacy Postcard-only peer, the entire bootstrap halts.
 
 ### Strategy 1: UdsLocalBootstrap
 
@@ -146,8 +147,11 @@ Error handling during the race:
 
 This strategy is the escalation path when direct transports are unreachable or when the target is only reachable via SSH. Implemented in `crates/kmux-client/src/ssh/negotiate.rs`.
 
-1. Run `ssh user@host kmuxd probe-or-start` to obtain a JSON blob (token, endpoints, protocol version, daemon version).
-2. Verify `protocol_version` from the JSON response (see [Protocol Version Gate](#protocol-version-gate)).
+1. Run `ssh user@host kmuxd probe-or-start` to obtain a JSON blob (token,
+   endpoints, protocol range, daemon version).
+2. Verify that `protocol_range` overlaps the client's supported range (see
+   [Protocol Version Gate](#protocol-version-gate)). A response containing only
+   the frozen legacy `protocol_version` sentinel is rejected.
 3. **Pre-allocate a free local TCP port** by binding `127.0.0.1:0`, capturing the port, and dropping the listener. The kernel-chosen port is then passed verbatim to `-L`.
 4. Spawn `ssh -L <localport>:127.0.0.1:<remoteport> -N user@host` with `-o ExitOnForwardFailure=yes` so the process exits immediately if the remote forward can't be established.
 5. **Verify the tunnel by TCP-connecting to the local port** with exponential-backoff retries (40 ms → 500 ms cap, 15 s deadline). Concurrently watch the ssh child for an early exit; if it dies before the local port becomes connectable, surface the captured stderr.
@@ -272,7 +276,7 @@ All transports share the same wire format, implemented in `crates/kmux-protocol/
 [u32 big-endian length][u8 codec tag][payload…]
 ```
 
-The length prefix counts the 1-byte codec tag plus the (possibly compressed) payload. The payload is a postcard-serialized message; the codec tag is `0 = raw` or `1 = zstd` (per-frame, like HTTP `Content-Encoding`). The frame is **self-describing**, so `read_frame` decompresses purely from the tag with no per-connection state. `read_frame` / `write_frame` (identity) / `write_frame_compressed` are generic over any `AsyncRead + AsyncWrite` pair, making the codec transport-agnostic. Whether the writer compresses is a per-connection policy the daemon decides at auth — see [compression.md](compression.md).
+The length prefix counts the 1-byte codec tag plus the (possibly compressed) payload. The payload is a named-map MessagePack message; the codec tag is `2 = raw` or `3 = zstd` (per-frame, like HTTP `Content-Encoding`). Tags `0` and `1` are the retired Postcard codecs and are permanently reserved — a current reader rejects them with an upgrade error rather than misreading a positional payload. See [architecture-protocol-versioning.md](architecture-protocol-versioning.md). The frame is **self-describing**, so `read_frame` decompresses purely from the tag with no per-connection state. `read_frame` / `write_frame` (identity) / `write_frame_compressed` are generic over any `AsyncRead + AsyncWrite` pair, making the codec transport-agnostic. Whether the writer compresses is a per-connection policy the daemon decides at auth — see [compression.md](compression.md).
 
 ### Listener Trait
 
@@ -418,12 +422,23 @@ The `endpoints` array reflects the audience-filtered view for an SSH caller — 
 
 ## Protocol Version Gate
 
-Every `StatusResponse` carries `protocol_version`. The current value is `13`, defined as `PROTOCOL_VERSION` in `crates/kmux-protocol/src/messages/mod.rs`.
+Every current `StatusResponse` carries a semantic `protocol_range`, defined by
+`MIN_PROTOCOL_VERSION` and `PROTOCOL_VERSION` in
+`crates/kmux-protocol/src/messages/types.rs`.
 
-- The SSH bootstrap (`crates/kmux-client/src/ssh/negotiate.rs`) reads `protocol_version` from the `probe-or-start` JSON and compares it to `PROTOCOL_VERSION`.
+- The SSH bootstrap (`crates/kmux-connect/src/ssh/negotiate.rs`) reads
+  `protocol_range` from the `probe-or-start` JSON and negotiates the highest
+  version shared with `PROTOCOL_RANGE`.
 - A mismatch produces `SshError::VersionMismatch` → `BootstrapError::VersionMismatch`.
 - `bootstrap_race` propagates `VersionMismatch` immediately without attempting other strategies.
-- Daemons that predate the `protocol_version` field and omit it are accepted with a `tracing::warn!`. This grace period exists for rollout compatibility and may be removed in a future version.
+- The integer `protocol_version = 41` remains a frozen JSON sentinel for legacy
+  consumers. Daemons that omit `protocol_range` are rejected because their
+  Postcard data plane cannot decode current named MessagePack.
+
+The subsequent `Auth` exchange repeats range negotiation and intersects named
+capabilities, which prevents a stale or forged probe response from enabling
+unsupported traffic. See
+[Data-Plane Protocol Versioning](architecture-protocol-versioning.md).
 
 ---
 
@@ -452,7 +467,7 @@ No session state (panes, scrollback, environment) is lost during transport swaps
 | Tier 1 direct all fail AND SSH target known | Escalate to SSH bootstrap (logged) |
 | Tier 1 direct all fail AND no SSH info | Hard-fail `NoViablePath` |
 | Server announces only `tcp+tls://127.0.0.1:N` | Must use SSH bootstrap; data plane = TLS-TCP-over-forward |
-| Protocol version mismatch | Halt with `VersionMismatch { client, server }` — no retry |
+| Protocol ranges are disjoint or legacy-only | Halt with `VersionMismatch { client, server }` — no retry |
 | Remote `kmuxd` not installed (SSH) | Halt with `RemoteNotInstalled` |
 | Remote `kmuxd` installed but off (SSH) | `probe-or-start` starts it; bootstrap continues |
 | ICMP blocked | Irrelevant — RTT measured via `Ping`/`Pong` inside kmux protocol |
@@ -737,11 +752,13 @@ The body is rendered from a single toolkit-neutral snapshot, `kmux_app::core::Co
 
 - **Server / endpoint** — the user-facing target (`localhost` or `user@host`) plus the resolved data-plane `host:port`, and (remote only) whether TLS certs are verified.
 - **State / transport** — the `ConnectionState` badge (`CONNECTED · QUIC`…) and the active transport channel.
-- **Identity** — the server-assigned `connection_id` and `client_id`, the daemon's binary version, and the wire `PROTOCOL_VERSION` this client speaks.
+- **Identity** — the server-assigned `connection_id` and `client_id`, the daemon's binary version, and the negotiated wire protocol version.
 - **Latency** — the active transport's RTT summary (EWMA + recent avg/max + sample count), sourced from the client's `RttTracker` (the same Ping/Pong measurements that feed the transport scorer).
 - **Traffic** — per-transport byte/message totals from the client metrics (`NetworkMetrics::snapshot_by_transport`).
 
-Because it reads only already-collected client state, the inspector adds no protocol traffic and no `PROTOCOL_VERSION` bump; it does bump `KMUX_FFI_ABI_VERSION` (new FFI records + getters).
+Because it reads only already-collected client state, the inspector adds no
+protocol traffic or capability; it does bump `KMUX_FFI_ABI_VERSION` (new FFI
+records + getters).
 
 ---
 
@@ -838,7 +855,7 @@ Sessions are checkpointed to `$XDG_STATE_HOME/kmux/session_state.bin` (or `$HOME
 | `crates/kmux-protocol/src/transport/uds.rs` | UDS listener and client helpers |
 | `crates/kmux-protocol/src/tls/tofu.rs` | TOFU certificate pinning |
 | `crates/kmux-protocol/src/endpoint.rs` | `Endpoint` URL parser |
-| `crates/kmux-protocol/src/codec.rs` | `read_frame`/`write_frame` (postcard + length-prefix) |
+| `crates/kmux-protocol/src/codec.rs` | `read_frame`/`write_frame` (named MessagePack + length-prefix) |
 | `crates/kmux-protocol/src/control_rpc.rs` | Shared control-socket RPC types (`StatusResponse`, `SessionsResponse`, `ConnectionInfo`, …) |
 | `crates/kmux-client/src/bootstrap.rs` | Bootstrap strategies and `bootstrap_race` |
 | `crates/kmux-client/src/supervisor.rs` | `TransportSupervisor`, `TransportScorer`, `UpgradeSignal` |

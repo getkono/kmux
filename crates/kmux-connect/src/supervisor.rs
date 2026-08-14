@@ -1045,6 +1045,8 @@ mod tests {
             machine_id: None,
             label: None,
             server_machine_id: None,
+            negotiated_protocol: Some(kmux_protocol::messages::PROTOCOL_VERSION),
+            negotiated_capabilities: kmux_protocol::messages::protocol_capabilities(),
         }
     }
 
@@ -1096,6 +1098,8 @@ mod tests {
                 machine_id: None,
                 label: None,
                 server_machine_id: None,
+                negotiated_protocol: None,
+                negotiated_capabilities: Vec::new(),
             })
             .unwrap();
 

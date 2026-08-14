@@ -5,8 +5,8 @@
 //! represent whatever binary links it (the `kmux` CLI, `kmux-gtk`, `kmux-swift`),
 //! so every `ClientMessage::Auth` construction site can report a consistent
 //! client build identity in one place — used to detect client↔daemon build skew
-//! that a matching `PROTOCOL_VERSION` alone cannot (two builds of the same
-//! protocol but different commits).
+//! that an overlapping protocol range alone cannot (two builds of the same
+//! schema but different commits).
 
 /// Short git commit the client binary was built from (or `"unknown"`).
 pub fn git_sha() -> &'static str {

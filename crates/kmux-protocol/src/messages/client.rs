@@ -4,9 +4,11 @@ use super::session::{
     AttentionKind, ClientCapabilities, ClientId, ConnectionId, FrontendKind, LayoutScheme, PaneId,
     PeerId, PeerTarget, RequestId, SequenceNo, SplitDir, TabIndex, TermSize, WordId,
 };
+use super::types::ProtocolRange;
 
 /// Messages sent from client -> server.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "data")]
 pub enum ClientMessage {
     /// First message: authenticate with a shared token and declare capabilities
     /// and cryptographic identity (issue #146). The server validates the token,
@@ -15,8 +17,12 @@ pub enum ClientMessage {
     /// prove possession of the private key behind `public_key`.
     Auth {
         token: String,
-        /// Must equal `PROTOCOL_VERSION`; server rejects mismatches.
-        protocol_version: u32,
+        /// Inclusive data-plane schema range this client can speak.
+        protocol_range: ProtocolRange,
+        /// Optional named extensions this client understands. The daemon may
+        /// only use extensions present in the negotiated intersection.
+        #[serde(default)]
+        protocol_capabilities: Vec<String>,
         /// Rendering capabilities of this client.  The daemon uses these to
         /// set an appropriate shell environment and to configure the
         /// server-side VT emulator feature flags for each pane.
@@ -30,6 +36,7 @@ pub enum ClientMessage {
         /// SHA-256 fingerprint is the stable `machine_id`. Verified via the
         /// challenge–response below before the daemon trusts it.
         #[serde(default)]
+        #[serde(with = "serde_bytes")]
         public_key: Vec<u8>,
         /// Client-reported hostname (a friendly label; the cryptographic identity
         /// is `public_key`, not this).
@@ -60,7 +67,10 @@ pub enum ClientMessage {
     /// sent in [`super::server::ServerMessage::AuthChallenge`], proving the client
     /// holds the private key for the `public_key` it presented in [`Auth`]. On
     /// success the daemon replies with `AuthResult`.
-    AuthProof { signature: Vec<u8> },
+    AuthProof {
+        #[serde(with = "serde_bytes")]
+        signature: Vec<u8>,
+    },
 
     /// Signal to the server that this channel is ready to become the primary
     /// transport. Sent after a successful channel-switch `Auth`. The server
@@ -229,7 +239,11 @@ pub enum ClientMessage {
     },
 
     /// Send bytes to the PTY master (user keystrokes).
-    PtyInput { pane_id: PaneId, data: Vec<u8> },
+    PtyInput {
+        pane_id: PaneId,
+        #[serde(with = "serde_bytes")]
+        data: Vec<u8>,
+    },
 
     /// Batch of structured key events for one pane, encoded by the daemon
     /// in order before being written to the PTY.  Lets the client coalesce
@@ -460,14 +474,17 @@ impl ClientMessage {
 mod tests {
     use super::super::server::ServerMessage;
     use super::super::session::ConnectionId;
-    use super::super::types::{PROTOCOL_VERSION, version_mismatch_hint};
+    use super::super::types::{
+        PROTOCOL_RANGE, PROTOCOL_VERSION, protocol_capabilities, version_mismatch_hint,
+    };
     use super::*;
 
     #[test]
     fn auth_message_roundtrip_with_connection_id() {
         let msg = ClientMessage::Auth {
             token: "tok".to_string(),
-            protocol_version: PROTOCOL_VERSION,
+            protocol_range: PROTOCOL_RANGE,
+            protocol_capabilities: protocol_capabilities(),
             capabilities: ClientCapabilities::default(),
             connection_id: Some(ConnectionId(42)),
             public_key: Vec::new(),
@@ -501,6 +518,8 @@ mod tests {
             machine_id: None,
             label: None,
             server_machine_id: None,
+            negotiated_protocol: Some(PROTOCOL_VERSION),
+            negotiated_capabilities: protocol_capabilities(),
         };
         let bytes = crate::encode_server(&msg).unwrap();
         let decoded = crate::decode_server(&bytes).unwrap();
@@ -631,6 +650,8 @@ mod tests {
             machine_id: None,
             label: None,
             server_machine_id: None,
+            negotiated_protocol: None,
+            negotiated_capabilities: Vec::new(),
         };
         let bytes = crate::encode_server(&msg).unwrap();
         let decoded = crate::decode_server(&bytes).unwrap();
@@ -655,13 +676,13 @@ mod tests {
     #[test]
     fn version_mismatch_hint_older_client() {
         let hint = version_mismatch_hint("protocol version mismatch: client=12, server=13");
-        assert!(hint.contains("client is older"));
+        assert!(hint.contains("ranges overlap"));
     }
 
     #[test]
     fn version_mismatch_hint_newer_client() {
         let hint = version_mismatch_hint("protocol version mismatch: client=14, server=13");
-        assert!(hint.contains("client is newer"));
+        assert!(hint.contains("ranges overlap"));
     }
 
     #[test]
@@ -918,7 +939,8 @@ mod tests {
             (
                 ClientMessage::Auth {
                     token: "t".into(),
-                    protocol_version: PROTOCOL_VERSION,
+                    protocol_range: PROTOCOL_RANGE,
+                    protocol_capabilities: protocol_capabilities(),
                     capabilities: ClientCapabilities::default(),
                     connection_id: None,
                     public_key: Vec::new(),

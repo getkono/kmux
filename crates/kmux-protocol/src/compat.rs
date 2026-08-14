@@ -7,19 +7,18 @@
 //! blocking — while each caller keeps formatting its own user-facing prose.
 //!
 //! The reference is always *this* binary: [`protocol_match`] compares against
-//! [`PROTOCOL_VERSION`] and [`profile_match`] against [`BuildProfile::CURRENT`],
+//! [`PROTOCOL_RANGE`] and [`profile_match`] against [`BuildProfile::CURRENT`],
 //! both linked into whatever binary calls this.
 
 use crate::dirs::BuildProfile;
-use crate::messages::PROTOCOL_VERSION;
+use crate::messages::{PROTOCOL_RANGE, ProtocolRange, ProtocolVersion};
 
 /// Three-way comparison of a peer's reported field against ours.
 ///
-/// `Unknown` means the peer omitted the field — the wire sentinel `0` for the
-/// protocol version, `None` for the build profile, or an empty build
-/// fingerprint (a daemon predating that field). An `Unknown` is never *by
-/// itself* a wire error, though the attach gate treats an unknown profile as
-/// unverifiable (see [`attach_block`]).
+/// `Unknown` means the peer omitted the field — `None` for a protocol range or
+/// build profile, or an empty build fingerprint. Whether it blocks depends on
+/// the field: an absent protocol range is a legacy wire format and cannot be
+/// decoded, while an absent fingerprint remains advisory.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum Match3 {
     Same,
@@ -27,16 +26,22 @@ pub enum Match3 {
     Unknown,
 }
 
-/// Compare a peer's `protocol_version` against ours. The wire sentinel `0` (an
-/// old daemon that did not report one) is [`Match3::Unknown`].
-pub fn protocol_match(theirs: u32) -> Match3 {
-    if theirs == 0 {
-        Match3::Unknown
-    } else if theirs == PROTOCOL_VERSION {
-        Match3::Same
-    } else {
-        Match3::Differ
+/// Compare a peer's supported schema range against ours.
+///
+/// [`Match3::Same`] means *compatible*, not identical: the ranges overlap, so
+/// the two can settle on a shared version. `None` is a legacy daemon that only
+/// reported the retired monotonic integer.
+pub fn protocol_match(theirs: Option<ProtocolRange>) -> Match3 {
+    match theirs {
+        None => Match3::Unknown,
+        Some(range) if PROTOCOL_RANGE.negotiate(range).is_some() => Match3::Same,
+        Some(_) => Match3::Differ,
     }
+}
+
+/// Highest schema baseline supported by both peers.
+pub fn negotiate_protocol(theirs: ProtocolRange) -> Option<ProtocolVersion> {
+    PROTOCOL_RANGE.negotiate(theirs)
 }
 
 /// Compare a peer's build profile against ours. `None` (a daemon predating the
@@ -64,8 +69,10 @@ pub fn build_match(theirs: &str, ours: &str) -> Match3 {
 /// Why a local connection to a daemon is refused.
 #[derive(Debug, Clone, Copy, Eq, PartialEq)]
 pub enum BlockReason {
-    /// The protocol versions differ — the two cannot speak the wire format.
+    /// The supported protocol ranges do not overlap.
     Protocol,
+    /// The peer predates semantic range negotiation and speaks Postcard.
+    ProtocolUnknown,
     /// Debug vs release: they resolved different runtime dirs, so they never
     /// share a socket — attaching would target the wrong instance.
     ProfileMismatch,
@@ -77,15 +84,17 @@ pub enum BlockReason {
 /// The attach-gate policy enforced by `ensure_compatible_daemon` and surfaced
 /// (as the exit code) by `kmux daemon status` / `kmux status`.
 ///
-/// Blocking: a *differing* protocol version, or a profile that differs *or* is
-/// unknown. Protocol takes precedence over profile (its message is the more
-/// actionable one). A protocol `Unknown` (sentinel `0`) and any
-/// build-fingerprint skew are never blocking on their own — the first because an
-/// old daemon predates version reporting, the second because a fingerprint gap
-/// is advisory, not a wire incompatibility.
-pub fn attach_block(protocol: u32, profile: Option<BuildProfile>) -> Option<BlockReason> {
-    if protocol_match(protocol) == Match3::Differ {
-        return Some(BlockReason::Protocol);
+/// Blocking: a disjoint or absent protocol range, or a profile that differs or
+/// is unknown. Protocol takes precedence over profile because its message is
+/// more actionable. Build-fingerprint skew remains advisory.
+pub fn attach_block(
+    protocol: Option<ProtocolRange>,
+    profile: Option<BuildProfile>,
+) -> Option<BlockReason> {
+    match protocol_match(protocol) {
+        Match3::Differ => return Some(BlockReason::Protocol),
+        Match3::Unknown => return Some(BlockReason::ProtocolUnknown),
+        Match3::Same => {}
     }
     match profile_match(profile) {
         Match3::Same => None,
@@ -109,10 +118,10 @@ mod tests {
 
     #[test]
     fn protocol_match_classifies() {
-        assert_eq!(protocol_match(0), Match3::Unknown);
-        assert_eq!(protocol_match(PROTOCOL_VERSION), Match3::Same);
+        assert_eq!(protocol_match(None), Match3::Unknown);
+        assert_eq!(protocol_match(Some(PROTOCOL_RANGE)), Match3::Same);
         assert_eq!(
-            protocol_match(PROTOCOL_VERSION.wrapping_add(1)),
+            protocol_match(Some(ProtocolRange::exact(ProtocolVersion::new(2, 0, 0)))),
             Match3::Differ
         );
     }
@@ -134,22 +143,24 @@ mod tests {
     #[test]
     fn attach_block_allows_a_matching_daemon() {
         assert_eq!(
-            attach_block(PROTOCOL_VERSION, Some(BuildProfile::CURRENT)),
+            attach_block(Some(PROTOCOL_RANGE), Some(BuildProfile::CURRENT)),
             None
         );
     }
 
     #[test]
-    fn attach_block_tolerates_unknown_protocol_with_matching_profile() {
-        // Sentinel protocol 0 (old daemon) is not blocking on its own.
-        assert_eq!(attach_block(0, Some(BuildProfile::CURRENT)), None);
+    fn attach_block_refuses_unknown_protocol() {
+        assert_eq!(
+            attach_block(None, Some(BuildProfile::CURRENT)),
+            Some(BlockReason::ProtocolUnknown)
+        );
     }
 
     #[test]
     fn attach_block_refuses_protocol_mismatch() {
         assert_eq!(
             attach_block(
-                PROTOCOL_VERSION.wrapping_add(1),
+                Some(ProtocolRange::exact(ProtocolVersion::new(2, 0, 0))),
                 Some(BuildProfile::CURRENT)
             ),
             Some(BlockReason::Protocol)
@@ -159,21 +170,23 @@ mod tests {
     #[test]
     fn attach_block_refuses_profile_mismatch_and_unknown() {
         assert_eq!(
-            attach_block(PROTOCOL_VERSION, Some(other_profile())),
+            attach_block(Some(PROTOCOL_RANGE), Some(other_profile())),
             Some(BlockReason::ProfileMismatch)
         );
         assert_eq!(
-            attach_block(PROTOCOL_VERSION, None),
+            attach_block(Some(PROTOCOL_RANGE), None),
             Some(BlockReason::ProfileUnknown)
         );
-        // Protocol unknown still lets an unknown profile block.
-        assert_eq!(attach_block(0, None), Some(BlockReason::ProfileUnknown));
+        assert_eq!(attach_block(None, None), Some(BlockReason::ProtocolUnknown));
     }
 
     #[test]
     fn attach_block_protocol_takes_precedence_over_profile() {
         assert_eq!(
-            attach_block(PROTOCOL_VERSION.wrapping_add(1), None),
+            attach_block(
+                Some(ProtocolRange::exact(ProtocolVersion::new(2, 0, 0))),
+                None
+            ),
             Some(BlockReason::Protocol)
         );
     }

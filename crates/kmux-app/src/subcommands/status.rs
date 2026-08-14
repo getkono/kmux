@@ -13,7 +13,7 @@
 use kmux_protocol::compat::{self, Match3};
 use kmux_protocol::control_rpc::WorkerInfo;
 use kmux_protocol::dirs::BuildProfile;
-use kmux_protocol::messages::PROTOCOL_VERSION;
+use kmux_protocol::messages::PROTOCOL_RANGE;
 
 use crate::cli::OutputFormat;
 
@@ -92,7 +92,7 @@ struct DaemonSection {
     #[serde(skip_serializing_if = "Option::is_none")]
     session_count: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    protocol: Option<u32>,
+    protocol: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     version: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -130,7 +130,7 @@ struct WorkersSection {
 struct CliSection {
     build: String,
     profile: String,
-    protocol: u32,
+    protocol: String,
 }
 
 // ── Command ─────────────────────────────────────────────────────────────────
@@ -163,7 +163,7 @@ pub async fn run_status(format: OutputFormat) -> anyhow::Result<()> {
     // Blocking skew gates the exit code, exactly like `kmux daemon status`.
     let blocking = daemon
         .as_ref()
-        .and_then(|d| compat::attach_block(d.protocol_version, d.build_profile));
+        .and_then(|d| compat::attach_block(d.protocol_range, d.build_profile));
     let ok = daemon.is_some() && blocking.is_none();
 
     let warnings = collect_warnings(daemon.as_ref(), gui_conn.as_ref(), &cli_build);
@@ -191,7 +191,12 @@ pub async fn run_status(format: OutputFormat) -> anyhow::Result<()> {
             port: daemon.as_ref().map(|d| d.port),
             uptime_secs: daemon.as_ref().map(|d| d.uptime_secs),
             session_count: daemon.as_ref().map(|d| d.session_count),
-            protocol: daemon.as_ref().map(|d| d.protocol_version),
+            protocol: daemon.as_ref().map(|d| {
+                d.protocol_range.map_or_else(
+                    || format!("legacy-{}", d.protocol_version),
+                    |range| range.to_string(),
+                )
+            }),
             version: daemon.as_ref().map(|d| d.kmuxd_version.clone()),
             build: daemon
                 .as_ref()
@@ -222,7 +227,7 @@ pub async fn run_status(format: OutputFormat) -> anyhow::Result<()> {
         cli: CliSection {
             build: cli_build.clone(),
             profile: cli_profile.to_string(),
-            protocol: PROTOCOL_VERSION,
+            protocol: PROTOCOL_RANGE.to_string(),
         },
         warnings,
     };
@@ -249,11 +254,14 @@ fn collect_warnings(
     let Some(d) = daemon else {
         return warnings;
     };
-    if compat::protocol_match(d.protocol_version) == Match3::Differ {
+    if compat::protocol_match(d.protocol_range) != Match3::Same {
         warnings.push(format!(
-            "protocol skew: CLI {PROTOCOL_VERSION} vs daemon {} — they cannot connect. \
+            "protocol skew: CLI {PROTOCOL_RANGE} vs daemon {} — they cannot connect. \
              Run `kmux daemon restart` or reinstall kmux.",
-            d.protocol_version
+            d.protocol_range.map_or_else(
+                || format!("legacy-{}", d.protocol_version),
+                |range| range.to_string()
+            )
         ));
     }
     if compat::profile_match(d.build_profile) != Match3::Same {

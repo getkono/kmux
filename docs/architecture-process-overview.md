@@ -22,7 +22,7 @@ kmuxd: pane → child PID ──► ProcessSampler.sample ──► Vec<PaneProc
                                                           │  (+ federated peers,
                                                           │   pane ids localized)
                                 ProcessOverviewResult ◄───┘
-                                       │ (wire, postcard)
+                                       │ (wire, MessagePack)
 kmux-client: SessionManager.process_overview cache
                                        │
 kmux-app: build_overview_rows(session_list, snapshot) → Vec<OverviewRow>
@@ -105,6 +105,6 @@ so polling stops the moment the view closes.
 - **GPU usage is deferred.** The issue lists CPU/memory/GPU, but there is no
   cross-platform per-process GPU API (NVML covers NVIDIA on Linux; macOS exposes
   none). CPU + memory ship now; `ProcessSample` carries a `TODO(#122)` marking
-  where GPU fields would attach (a future `PROTOCOL_VERSION` bump).
+  where defaulted GPU fields or a capability-gated extension would attach.
 - Sorting/filtering, kill-from-overview, and column customization are possible
   follow-ups; the projection already carries the data they would need.

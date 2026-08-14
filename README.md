@@ -124,7 +124,8 @@ platform desktop app. See [docs/architecture-frontend.md](docs/architecture-fron
 The client connects to the server over QUIC (preferred), TCP+TLS (fallback), or
 UDS (local). See [docs/connection.md](docs/connection.md) for a full description
 of the two-phase connection model, transport selection, and `kmuxd.toml`
-configuration.
+configuration. The data-plane compatibility contract is documented in
+[docs/architecture-protocol-versioning.md](docs/architecture-protocol-versioning.md).
 
 ## Terminology
 

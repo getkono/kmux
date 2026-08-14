@@ -23,14 +23,17 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
         DaemonAction::Start => {
             // Check if already running.
             if let Some(status) = kmux_client::daemon::query_daemon().await {
-                use kmux_protocol::messages::PROTOCOL_VERSION;
-                if status.protocol_version != 0 && status.protocol_version != PROTOCOL_VERSION {
+                use kmux_protocol::compat::{self, Match3};
+                if compat::protocol_match(status.protocol_range) != Match3::Same {
                     anyhow::bail!(
                         "Daemon is running (PID {}) with protocol version {} but this client \
                          uses {}. Run `kmux daemon restart` to restart it.",
                         status.pid,
-                        status.protocol_version,
-                        PROTOCOL_VERSION
+                        status.protocol_range.map_or_else(
+                            || format!("legacy-{}", status.protocol_version),
+                            |range| range.to_string()
+                        ),
+                        kmux_protocol::messages::PROTOCOL_RANGE
                     );
                 }
                 println!(
@@ -50,7 +53,7 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
         DaemonAction::Status => {
             use kmux_protocol::compat::{self, Match3};
             use kmux_protocol::dirs::BuildProfile;
-            use kmux_protocol::messages::PROTOCOL_VERSION;
+            use kmux_protocol::messages::PROTOCOL_RANGE;
 
             let socket_display = kmux_protocol::dirs::socket_path()
                 .map(|p| p.display().to_string())
@@ -63,7 +66,7 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
                         .map(|p| p.as_str())
                         .unwrap_or("<unknown>");
                     let protocol_mismatch =
-                        compat::protocol_match(status.protocol_version) == Match3::Differ;
+                        compat::protocol_match(status.protocol_range) != Match3::Same;
                     let profile_mismatch =
                         compat::profile_match(status.build_profile) != Match3::Same;
 
@@ -73,7 +76,13 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
                     println!("Port:     {}", status.port);
                     println!("Uptime:   {}", render::format_uptime(status.uptime_secs));
                     println!("Sessions: {}", status.session_count);
-                    println!("Protocol: {}", status.protocol_version);
+                    println!(
+                        "Protocol: {}",
+                        status.protocol_range.map_or_else(
+                            || format!("legacy-{}", status.protocol_version),
+                            |range| range.to_string()
+                        )
+                    );
                     println!("Version:  {}", status.kmuxd_version);
                     if !status.kmuxd_build.is_empty() {
                         println!("Build:    {}", status.kmuxd_build);
@@ -84,7 +93,7 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
                     );
                     if protocol_mismatch {
                         println!(
-                            "Error:    protocol version mismatch (client={PROTOCOL_VERSION}). \
+                            "Error:    protocol version mismatch (client={PROTOCOL_RANGE}). \
                              Run `kmux daemon restart`."
                         );
                     }

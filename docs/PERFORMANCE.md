@@ -6,10 +6,36 @@ shipped, and what remains. For transport selection and latency scoring see
 optimizations be made safely see [architecture-verification.md](architecture-verification.md).
 
 The local GUI↔daemon path already uses the lowest-overhead options available: a
-**Unix domain socket** (`TransportKind::Uds`, no TLS, OS-enforced 0600), a compact
-**postcard** binary wire format framed as `[u32 len][u8 codec tag][payload]`, and
-**server-side VT parsing** so only changed cells travel. The remaining work is
-CPU/scheduling, not transport or format.
+**Unix domain socket** (`TransportKind::Uds`, no TLS, OS-enforced 0600), a
+named-map **MessagePack** wire format framed as `[u32 len][u8 codec tag][payload]`,
+and **server-side VT parsing** so only changed cells travel. The remaining work is
+mostly CPU/scheduling; the one open format cost is cell-run encoding, below.
+
+### Open: cell-run encoding overhead
+
+Named-map MessagePack repeats a field name per field, and `CellState` is a
+4-field struct with two nested 3-field `CellColor` maps — roughly 40 bytes per
+cell against the retired positional codec's ~9. Measured on a representative
+mixed-content grid:
+
+| Payload | Postcard (retired) | Named MessagePack | zstd-3 (Postcard → MessagePack) |
+|---|---:|---:|---|
+| `TerminalSnapshot`, 200×50 | 100,024 B | 428,768 B (4.29×) | 1,720 B → 2,721 B (1.58×) |
+| `TerminalUpdate`, 200-cell row | 2,024 B | 8,760 B (4.33×) | 157 B → 344 B (2.19×) |
+
+zstd absorbs most of it because the repeated keys are highly compressible, but
+compression is `auto` (off) on local UDS, so the local GUI path pays the raw
+ratio. On a socket that moves GB/s the bytes are cheap; the real cost is the
+per-cell serializer work.
+
+The fix is a packed columnar encoding for cell runs (`GridSnapshot::cells`,
+`DiffOp::Row::cells`, `ScrollbackLine`) — struct-of-arrays byte buffers instead
+of a map per cell. It is deliberately *not* bundled with the versioning
+migration: those types are also embedded in the daemon↔worker protocol and the
+on-disk checkpoint, so packing them changes three contracts at once. Under the
+new scheme it lands later as a negotiated capability with no protocol version
+bump, which is exactly the flexibility
+[architecture-protocol-versioning.md](architecture-protocol-versioning.md) buys.
 
 ## Shipped
 
@@ -69,8 +95,8 @@ Scrollback lines are now `Arc<[CellState]>` (`ScrollbackLine`) end to end —
 materialised once at the libghostty FFI boundary and shared by the daemon mirror,
 the `DiffResult`, the wire messages, and the client buffer. The per-frame
 `mirror.append(clone)` and the per-client fan-out are now `Arc` pointer bumps.
-postcard serialises `Arc<[T]>` byte-identically to `[T]` (serde `rc`), so there
-was **no PROTOCOL_VERSION / worker / state bump**.
+Serde's `rc` feature (enabled workspace-wide) serialises `Arc<[T]>` byte-identically
+to `[T]`, so there was **no protocol / worker / state version bump**.
 
 ### 3. Renderer dirty-row cache
 

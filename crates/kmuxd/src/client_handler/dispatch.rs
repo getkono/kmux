@@ -2,7 +2,8 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::Ordering;
 
 use kmux_protocol::messages::{
-    ClientMessage, Compression, DirEntry, ErrorCode, ServerMessage, SessionEventMsg, epoch_millis,
+    CAPABILITY_FRAME_ZSTD, ClientMessage, Compression, DirEntry, ErrorCode, ServerMessage,
+    SessionEventMsg, epoch_millis, negotiate_capabilities,
 };
 use kmux_protocol::parse_pane_id;
 use tokio::sync::mpsc;
@@ -28,6 +29,8 @@ fn auth_failure(reason: String) -> ServerMessage {
         machine_id: None,
         label: None,
         server_machine_id: None,
+        negotiated_protocol: None,
+        negotiated_capabilities: Vec::new(),
     }
 }
 
@@ -45,7 +48,8 @@ pub async fn handle_message<A: PaneAttacher>(
             // Step 1: validate token + protocol, then issue a signing challenge.
             ClientMessage::Auth {
                 token,
-                protocol_version,
+                protocol_range,
+                protocol_capabilities,
                 capabilities,
                 connection_id: incoming_conn_id,
                 public_key,
@@ -56,17 +60,20 @@ pub async fn handle_message<A: PaneAttacher>(
                 client_git_dirty,
                 client_build_profile,
             } => {
-                if protocol_version != kmux_protocol::messages::PROTOCOL_VERSION {
+                let Some(negotiated_protocol) =
+                    kmux_protocol::compat::negotiate_protocol(protocol_range)
+                else {
                     state.send(auth_failure(format!(
-                        "protocol version mismatch: client={protocol_version}, server={}",
-                        kmux_protocol::messages::PROTOCOL_VERSION
+                        "protocol version mismatch: client={protocol_range}, server={}",
+                        kmux_protocol::messages::PROTOCOL_RANGE
                     )));
                     warn!(
-                        "Protocol version mismatch: client={protocol_version}, server={}",
-                        kmux_protocol::messages::PROTOCOL_VERSION
+                        "Protocol version mismatch: client={protocol_range}, server={}",
+                        kmux_protocol::messages::PROTOCOL_RANGE
                     );
                     return false;
-                }
+                };
+                let negotiated_capabilities = negotiate_capabilities(&protocol_capabilities);
                 if !validate_token(&token, &state.app.auth_token) {
                     state.send(auth_failure("invalid token".to_string()));
                     warn!("authentication failed");
@@ -81,6 +88,8 @@ pub async fn handle_message<A: PaneAttacher>(
                     hostname,
                     username,
                     capabilities,
+                    negotiated_protocol,
+                    negotiated_capabilities,
                     connection_id: incoming_conn_id,
                     client_kind,
                     client_git_sha,
@@ -135,7 +144,11 @@ pub async fn handle_message<A: PaneAttacher>(
                 // The daemon decides compression from client locality + config
                 // (issue #59). Self-describing frames make this purely a sender
                 // policy: flip the shared toggle the writer/attacher tasks read.
-                let compress = state.app.compression.enabled_for(state.transport);
+                let compress = pending
+                    .negotiated_capabilities
+                    .iter()
+                    .any(|capability| capability == CAPABILITY_FRAME_ZSTD)
+                    && state.app.compression.enabled_for(state.transport);
                 state.comp_out.set_enabled(compress);
                 let server_machine_id = state.app.server_machine_id.clone();
                 state.send(ServerMessage::AuthResult {
@@ -148,6 +161,8 @@ pub async fn handle_message<A: PaneAttacher>(
                     machine_id: Some(machine_id),
                     label: Some(reg.label),
                     server_machine_id: (!server_machine_id.is_empty()).then_some(server_machine_id),
+                    negotiated_protocol: Some(pending.negotiated_protocol),
+                    negotiated_capabilities: pending.negotiated_capabilities,
                 });
                 info!(
                     conn_id = reg.connection_id.0,
@@ -1109,7 +1124,8 @@ mod tests {
     use kmux_protocol::Compressor;
     use kmux_protocol::TransportKind;
     use kmux_protocol::messages::{
-        ClientCapabilities, ClientMessage, Compression, PROTOCOL_VERSION, ServerMessage,
+        ClientCapabilities, ClientMessage, Compression, PROTOCOL_RANGE, ProtocolRange,
+        ProtocolVersion, ServerMessage, protocol_capabilities,
     };
     use tokio::sync::mpsc;
     use tokio::task::AbortHandle;
@@ -1157,14 +1173,18 @@ mod tests {
         (state, comp_out, ctrl_rx)
     }
 
-    async fn authenticate(state: &mut SharedClientState) {
+    async fn authenticate_with_capabilities(
+        state: &mut SharedClientState,
+        protocol_capabilities: Vec<String>,
+    ) {
         let identity = kmux_protocol::identity::Identity::generate();
         // Step 1: Auth → the daemon stashes a challenge in `state.pending_auth`.
         let ok = handle_message(
             state,
             ClientMessage::Auth {
                 token: "tok".to_string(),
-                protocol_version: PROTOCOL_VERSION,
+                protocol_range: PROTOCOL_RANGE,
+                protocol_capabilities,
                 capabilities: ClientCapabilities::default(),
                 connection_id: None,
                 public_key: identity.public_key_bytes().to_vec(),
@@ -1199,6 +1219,10 @@ mod tests {
             state.authenticated,
             "auth must succeed with a matching token + valid identity proof"
         );
+    }
+
+    async fn authenticate(state: &mut SharedClientState) {
+        authenticate_with_capabilities(state, protocol_capabilities()).await;
     }
 
     /// With `mode = always`, a networked transport negotiates zstd: the auth
@@ -1261,6 +1285,67 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn auth_does_not_use_unadvertised_compression_capability() {
+        let app = Arc::new(
+            ServerApp::new("tok".to_string()).with_compression(CompressionConfig {
+                mode: CompressionMode::Always,
+                ..CompressionConfig::default()
+            }),
+        );
+        let (mut state, comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::TcpTls);
+        authenticate_with_capabilities(&mut state, Vec::new()).await;
+
+        assert!(matches!(comp_out.compressor(), Compressor::Off));
+        assert!(matches!(
+            ctrl_rx.try_recv(),
+            Ok(ServerMessage::AuthChallenge { .. })
+        ));
+        assert!(matches!(
+            ctrl_rx.try_recv(),
+            Ok(ServerMessage::AuthResult {
+                success: true,
+                compression: None,
+                negotiated_capabilities,
+                ..
+            }) if negotiated_capabilities.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_disjoint_protocol_range_before_token_validation() {
+        let app = Arc::new(ServerApp::new("tok".to_string()));
+        let (mut state, _comp_out, mut ctrl_rx) = state_for(app, TransportKind::Uds);
+        let ok = handle_message(
+            &mut state,
+            ClientMessage::Auth {
+                token: "tok".to_string(),
+                protocol_range: ProtocolRange::exact(ProtocolVersion::new(2, 0, 0)),
+                protocol_capabilities: Vec::new(),
+                capabilities: ClientCapabilities::default(),
+                connection_id: None,
+                public_key: Vec::new(),
+                hostname: "host".to_string(),
+                username: "user".to_string(),
+                client_kind: kmux_protocol::messages::FrontendKind::Cli,
+                client_git_sha: String::new(),
+                client_git_dirty: false,
+                client_build_profile: String::new(),
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(!ok);
+        assert!(matches!(
+            ctrl_rx.try_recv(),
+            Ok(ServerMessage::AuthResult {
+                success: false,
+                reason: Some(reason),
+                ..
+            }) if reason.starts_with("protocol version mismatch:")
+        ));
+    }
+
     /// A valid token with an invalid identity signature is rejected and the
     /// connection is closed (issue #146): proof-of-possession is mandatory.
     #[tokio::test]
@@ -1273,7 +1358,8 @@ mod tests {
             &mut state,
             ClientMessage::Auth {
                 token: "tok".to_string(),
-                protocol_version: PROTOCOL_VERSION,
+                protocol_range: PROTOCOL_RANGE,
+                protocol_capabilities: protocol_capabilities(),
                 capabilities: ClientCapabilities::default(),
                 connection_id: None,
                 public_key: identity.public_key_bytes().to_vec(),

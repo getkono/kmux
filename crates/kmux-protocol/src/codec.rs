@@ -1,3 +1,4 @@
+use serde::Serialize;
 use thiserror::Error;
 
 use crate::messages::{ClientMessage, ServerMessage};
@@ -5,8 +6,10 @@ use crate::messages::{ClientMessage, ServerMessage};
 /// Errors that can occur during message encoding or decoding.
 #[derive(Debug, Error)]
 pub enum ProtocolError {
-    #[error("encode/decode error: {0}")]
-    Postcard(#[from] postcard::Error),
+    #[error("MessagePack encode error: {0}")]
+    MessagePackEncode(#[from] rmp_serde::encode::Error),
+    #[error("MessagePack decode error: {0}")]
+    MessagePackDecode(#[from] rmp_serde::decode::Error),
     #[error("I/O error: {0}")]
     Io(#[from] std::io::Error),
     #[error("frame too large: {size} bytes (max {max})")]
@@ -18,6 +21,8 @@ pub enum ProtocolError {
     /// a version skew or a corrupted stream.
     #[error("unknown frame codec tag: {0}")]
     UnknownCodec(u8),
+    #[error("legacy Postcard frame codec tag {0}; update kmux and kmuxd")]
+    LegacyPostcardCodec(u8),
     #[error("compression error: {0}")]
     Compress(String),
     #[error("decompression error: {0}")]
@@ -28,24 +33,28 @@ pub enum ProtocolError {
     DecompressedTooLarge { size: usize, max: usize },
 }
 
-/// Encode a `ClientMessage` into a postcard byte vector.
+/// Encode a `ClientMessage` into a named-map MessagePack byte vector.
 pub fn encode_client(msg: &ClientMessage) -> Result<Vec<u8>, ProtocolError> {
-    postcard::to_allocvec(msg).map_err(ProtocolError::Postcard)
+    encode_named(msg)
 }
 
-/// Decode a `ClientMessage` from a postcard byte slice.
+/// Decode a `ClientMessage` from a named-map MessagePack byte slice.
 pub fn decode_client(data: &[u8]) -> Result<ClientMessage, ProtocolError> {
-    postcard::from_bytes(data).map_err(ProtocolError::Postcard)
+    rmp_serde::from_slice(data).map_err(ProtocolError::MessagePackDecode)
 }
 
-/// Encode a `ServerMessage` into a postcard byte vector.
+/// Encode a `ServerMessage` into a named-map MessagePack byte vector.
 pub fn encode_server(msg: &ServerMessage) -> Result<Vec<u8>, ProtocolError> {
-    postcard::to_allocvec(msg).map_err(ProtocolError::Postcard)
+    encode_named(msg)
 }
 
-/// Decode a `ServerMessage` from a postcard byte slice.
+/// Decode a `ServerMessage` from a named-map MessagePack byte slice.
 pub fn decode_server(data: &[u8]) -> Result<ServerMessage, ProtocolError> {
-    postcard::from_bytes(data).map_err(ProtocolError::Postcard)
+    rmp_serde::from_slice(data).map_err(ProtocolError::MessagePackDecode)
+}
+
+fn encode_named(value: &impl Serialize) -> Result<Vec<u8>, ProtocolError> {
+    rmp_serde::to_vec_named(value).map_err(ProtocolError::MessagePackEncode)
 }
 
 //  Length-prefixed framing for async byte streams
@@ -58,9 +67,17 @@ pub fn decode_server(data: &[u8]) -> Result<ServerMessage, ProtocolError> {
 //
 //  See `docs/compression.md` for the negotiation model.
 
-/// Maximum on-wire frame size (16 MiB) -- prevents unbounded allocations from
+/// Maximum on-wire frame size (64 MiB) -- prevents unbounded allocations from
 /// malformed data. Bounds the length prefix (tag byte + payload).
-pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
+///
+/// Raised from 16 MiB with the named-map MessagePack migration: a `CellState`
+/// costs ~40 bytes named against ~9 positional, and the largest legitimate frame
+/// (`TerminalSnapshot` = a full grid plus `SNAPSHOT_TAIL_LINES` of scrollback)
+/// scales with `cols × (rows + 500)`. On a very wide window that crossed the old
+/// ceiling, so attaching would have failed. This matches
+/// [`MAX_DECOMPRESSED_SIZE`], keeping one bound for what a frame may cost in
+/// memory whether or not it arrived compressed.
+pub const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
 
 /// Maximum size a single frame may occupy *after* decompression (64 MiB).
 /// Guards against decompression bombs: a small compressed frame must never be
@@ -68,9 +85,13 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 pub const MAX_DECOMPRESSED_SIZE: usize = 64 * 1024 * 1024;
 
 /// Per-frame codec tag: the payload is stored verbatim (no compression).
-const FRAME_RAW: u8 = 0;
+const FRAME_RAW: u8 = 2;
 /// Per-frame codec tag: the payload is zstd-compressed.
-const FRAME_ZSTD: u8 = 1;
+const FRAME_ZSTD: u8 = 3;
+/// Protocol 40 used these tags for Postcard. They are reserved permanently so
+/// a skew cannot be mistaken for malformed MessagePack.
+const FRAME_LEGACY_POSTCARD_RAW: u8 = 0;
+const FRAME_LEGACY_POSTCARD_ZSTD: u8 = 1;
 
 /// Outbound per-connection compression policy applied by [`write_frame_compressed`].
 ///
@@ -212,6 +233,9 @@ pub async fn read_frame<R: tokio::io::AsyncReadExt + Unpin>(
     match tag {
         FRAME_RAW => Ok(Some(payload)),
         FRAME_ZSTD => Ok(Some(decompress_frame(&payload)?)),
+        FRAME_LEGACY_POSTCARD_RAW | FRAME_LEGACY_POSTCARD_ZSTD => {
+            Err(ProtocolError::LegacyPostcardCodec(tag))
+        }
         other => Err(ProtocolError::UnknownCodec(other)),
     }
 }
@@ -245,11 +269,34 @@ mod tests {
     use super::*;
     use crate::messages::*;
 
+    #[derive(serde::Serialize, serde::Deserialize)]
+    #[serde(tag = "type", content = "data")]
+    enum FutureClientMessage {
+        Auth {
+            token: String,
+            protocol_range: ProtocolRange,
+            #[serde(default)]
+            protocol_capabilities: Vec<String>,
+            capabilities: ClientCapabilities,
+            connection_id: Option<ConnectionId>,
+            public_key: Vec<u8>,
+            hostname: String,
+            username: String,
+            client_kind: FrontendKind,
+            client_git_sha: String,
+            client_git_dirty: bool,
+            client_build_profile: String,
+            #[serde(default)]
+            future_note: String,
+        },
+    }
+
     #[test]
     fn roundtrip_client_auth() {
         let msg = ClientMessage::Auth {
             token: "secret".to_string(),
-            protocol_version: PROTOCOL_VERSION,
+            protocol_range: PROTOCOL_RANGE,
+            protocol_capabilities: protocol_capabilities(),
             capabilities: ClientCapabilities::default(),
             connection_id: None,
             public_key: vec![1, 2, 3],
@@ -263,6 +310,66 @@ mod tests {
         let bytes = encode_client(&msg).expect("encode");
         let decoded = decode_client(&bytes).expect("decode");
         assert!(matches!(decoded, ClientMessage::Auth { token, .. } if token == "secret"));
+    }
+
+    #[test]
+    fn current_schema_ignores_future_named_fields() {
+        let future = FutureClientMessage::Auth {
+            token: "secret".into(),
+            protocol_range: PROTOCOL_RANGE,
+            protocol_capabilities: protocol_capabilities(),
+            capabilities: ClientCapabilities::default(),
+            connection_id: None,
+            public_key: vec![],
+            hostname: "host".into(),
+            username: "user".into(),
+            client_kind: FrontendKind::Cli,
+            client_git_sha: String::new(),
+            client_git_dirty: false,
+            client_build_profile: String::new(),
+            future_note: "ignored by 1.0".into(),
+        };
+        let bytes = encode_named(&future).expect("encode future schema");
+        assert!(matches!(
+            decode_client(&bytes).expect("decode with current schema"),
+            ClientMessage::Auth { token, .. } if token == "secret"
+        ));
+    }
+
+    #[test]
+    fn unit_variant_has_stable_named_messagepack_fixture() {
+        let bytes = encode_client(&ClientMessage::ChannelReady).expect("encode");
+        assert_eq!(
+            bytes,
+            [
+                0x81, 0xa4, b't', b'y', b'p', b'e', 0xac, b'C', b'h', b'a', b'n', b'n', b'e', b'l',
+                b'R', b'e', b'a', b'd', b'y',
+            ]
+        );
+    }
+
+    #[test]
+    fn future_schema_defaults_fields_missing_from_current_messages() {
+        let current = ClientMessage::Auth {
+            token: "secret".into(),
+            protocol_range: PROTOCOL_RANGE,
+            protocol_capabilities: protocol_capabilities(),
+            capabilities: ClientCapabilities::default(),
+            connection_id: None,
+            public_key: vec![],
+            hostname: "host".into(),
+            username: "user".into(),
+            client_kind: FrontendKind::Cli,
+            client_git_sha: String::new(),
+            client_git_dirty: false,
+            client_build_profile: String::new(),
+        };
+        let bytes = encode_client(&current).expect("encode current schema");
+        let decoded: FutureClientMessage = rmp_serde::from_slice(&bytes).expect("decode future");
+        assert!(matches!(
+            decoded,
+            FutureClientMessage::Auth { future_note, .. } if future_note.is_empty()
+        ));
     }
 
     #[test]
@@ -291,7 +398,7 @@ mod tests {
 
     #[test]
     fn roundtrip_client_session_create_on_peer() {
-        // The peer target must survive the postcard wire roundtrip so the hub
+        // The peer target must survive the wire roundtrip so the hub
         // can route the create to a federated remote (issue #121).
         let msg = ClientMessage::SessionCreate {
             request_id: 7,
@@ -432,6 +539,8 @@ mod tests {
             machine_id: None,
             label: None,
             server_machine_id: None,
+            negotiated_protocol: Some(PROTOCOL_VERSION),
+            negotiated_capabilities: protocol_capabilities(),
         };
         let bytes = encode_server(&msg).expect("encode");
         let decoded = decode_server(&bytes).expect("decode");
@@ -476,6 +585,48 @@ mod tests {
         let decoded = decode_server(&bytes).expect("decode");
         assert!(
             matches!(&decoded, ServerMessage::TerminalUpdate { pane_id, .. } if pane_id == "eagle/0")
+        );
+    }
+
+    /// The largest legitimate frame is a `TerminalSnapshot`: a full grid plus
+    /// the daemon's scrollback tail. Named-map MessagePack costs ~40 bytes per
+    /// cell, so this is the message that decides [`MAX_FRAME_SIZE`] — a ceiling
+    /// below it would break attach on a wide window rather than reject an
+    /// attack.
+    #[test]
+    fn worst_case_grid_snapshot_fits_in_a_frame() {
+        // A generously oversized terminal (a 5K display at a small font) and
+        // `kmux_vt_core::diff_engine::SNAPSHOT_TAIL_LINES`, which this crate
+        // cannot import (kmux-vt-core depends on kmux-protocol, not the
+        // reverse).
+        const ROWS: u16 = 200;
+        const COLS: u16 = 700;
+        const TAIL_LINES: usize = 500;
+
+        let snapshot = GridSnapshot {
+            rows: ROWS,
+            cols: COLS,
+            cells: vec![CellState::default(); ROWS as usize * COLS as usize],
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            history_total: TAIL_LINES as u64,
+            scrollback_base: 0,
+            scrollback_tail: vec![
+                std::sync::Arc::from(vec![CellState::default(); COLS as usize]);
+                TAIL_LINES
+            ],
+        };
+        let bytes = encode_server(&ServerMessage::TerminalSnapshot {
+            pane_id: "eagle/0".to_string(),
+            snapshot: std::sync::Arc::new(snapshot),
+            seqno: SequenceNo(1),
+            sent_at_ms: 0,
+        })
+        .expect("encode");
+        assert!(
+            bytes.len() < MAX_FRAME_SIZE as usize,
+            "worst-case snapshot is {} bytes, over the {MAX_FRAME_SIZE}-byte frame ceiling",
+            bytes.len(),
         );
     }
 
@@ -707,6 +858,18 @@ mod framing_tests {
         let mut cursor = std::io::Cursor::new(bytes);
         let result = read_frame(&mut cursor).await;
         assert!(matches!(result, Err(ProtocolError::UnknownCodec(0xFF))));
+    }
+
+    #[tokio::test]
+    async fn legacy_postcard_tags_are_rejected_with_upgrade_error() {
+        for tag in [FRAME_LEGACY_POSTCARD_RAW, FRAME_LEGACY_POSTCARD_ZSTD] {
+            let bytes = vec![0x00, 0x00, 0x00, 0x02, tag, 0x41];
+            let mut cursor = std::io::Cursor::new(bytes);
+            assert!(matches!(
+                read_frame(&mut cursor).await,
+                Err(ProtocolError::LegacyPostcardCodec(actual)) if actual == tag
+            ));
+        }
     }
 
     /// End-to-end over a real duplex pipe: a writer task compresses a realistic

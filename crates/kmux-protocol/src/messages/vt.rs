@@ -82,9 +82,9 @@ impl Default for CellState {
 /// outgoing `ScrollbackAppend` / `GridSnapshot::scrollback_tail` can share the
 /// same allocation instead of deep-copying it on every scrolling frame, and so
 /// fanning one append out to N clients is N `Arc` bumps rather than N grid
-/// copies. Postcard serialises `Arc<[T]>` exactly as `[T]` (serde's `rc`
-/// feature is enabled workspace-wide), so this is byte-identical on the wire to
-/// the old `Vec<CellState>` — no protocol/state/worker version bump.
+/// copies. Serde's `rc` feature (enabled workspace-wide) serialises `Arc<[T]>`
+/// exactly as `[T]`, so this is byte-identical on the wire to a plain
+/// `Vec<CellState>` under every codec — no protocol/state/worker version bump.
 pub type ScrollbackLine = Arc<[CellState]>;
 
 /// Cursor shape in the terminal.

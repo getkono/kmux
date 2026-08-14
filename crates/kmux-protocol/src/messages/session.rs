@@ -463,9 +463,8 @@ pub struct SessionEntry {
     /// peer's session list, so clients can group and attribute sessions by
     /// machine without parsing the decorated display name. This is a per-listing,
     /// hub-assigned attribute (not part of the immutable [`SessionMeta`], and not
-    /// persisted). `#[serde(default)]` keeps it optional in source; the
-    /// exact-match `PROTOCOL_VERSION` handshake guarantees both ends agree on the
-    /// wire shape.
+    /// persisted). `#[serde(default)]` lets older named schemas decode it as
+    /// absent.
     #[serde(default)]
     pub peer: Option<PeerId>,
 }
@@ -643,8 +642,8 @@ mod tests {
             pixel_width: 1920,
             pixel_height: 1080,
         };
-        let bytes = postcard::to_allocvec(&size).expect("serialize");
-        let decoded: TermSize = postcard::from_bytes(&bytes).expect("deserialize");
+        let bytes = rmp_serde::to_vec_named(&size).expect("serialize");
+        let decoded: TermSize = rmp_serde::from_slice(&bytes).expect("deserialize");
         assert_eq!(decoded.rows, 40);
         assert_eq!(decoded.cols, 120);
         assert_eq!(decoded.pixel_width, 1920);
@@ -703,8 +702,8 @@ mod tests {
         assert_eq!(direct.peer_id(), "127.0.0.1:8443");
 
         for t in [ssh, direct] {
-            let bytes = postcard::to_allocvec(&t).expect("serialize");
-            let decoded: PeerTarget = postcard::from_bytes(&bytes).expect("deserialize");
+            let bytes = rmp_serde::to_vec_named(&t).expect("serialize");
+            let decoded: PeerTarget = rmp_serde::from_slice(&bytes).expect("deserialize");
             assert_eq!(decoded, t);
         }
     }
@@ -715,8 +714,8 @@ mod tests {
             pane_id: "eagle/0".to_string(),
             title: "~/dev/kmux".to_string(),
         };
-        let bytes = postcard::to_allocvec(&msg).expect("serialize");
-        let decoded: SessionEventMsg = postcard::from_bytes(&bytes).expect("deserialize");
+        let bytes = rmp_serde::to_vec_named(&msg).expect("serialize");
+        let decoded: SessionEventMsg = rmp_serde::from_slice(&bytes).expect("deserialize");
         match decoded {
             SessionEventMsg::PaneTitleChanged { pane_id, title } => {
                 assert_eq!(pane_id, "eagle/0");
@@ -733,8 +732,8 @@ mod tests {
             selection: "c".to_string(),
             data: "aGVsbG8=".to_string(),
         };
-        let bytes = postcard::to_allocvec(&msg).expect("serialize");
-        let decoded: SessionEventMsg = postcard::from_bytes(&bytes).expect("deserialize");
+        let bytes = rmp_serde::to_vec_named(&msg).expect("serialize");
+        let decoded: SessionEventMsg = rmp_serde::from_slice(&bytes).expect("deserialize");
         match decoded {
             SessionEventMsg::PaneClipboardCopy {
                 pane_id,
@@ -767,8 +766,8 @@ mod tests {
                 },
             ],
         };
-        let bytes = postcard::to_allocvec(&tree).expect("serialize");
-        let decoded: LayoutNode = postcard::from_bytes(&bytes).expect("deserialize");
+        let bytes = rmp_serde::to_vec_named(&tree).expect("serialize");
+        let decoded: LayoutNode = rmp_serde::from_slice(&bytes).expect("deserialize");
         assert_eq!(decoded, tree);
         assert_eq!(decoded.leaves(), vec![0, 1, 2]);
     }
@@ -788,8 +787,8 @@ mod tests {
             },
             focused_pane: 6,
         };
-        let bytes = postcard::to_allocvec(&tab).expect("serialize");
-        let decoded: TabInfo = postcard::from_bytes(&bytes).expect("deserialize");
+        let bytes = rmp_serde::to_vec_named(&tab).expect("serialize");
+        let decoded: TabInfo = rmp_serde::from_slice(&bytes).expect("deserialize");
         assert_eq!(decoded.tab_index, 3);
         assert_eq!(decoded.name, "build");
         assert_eq!(decoded.focused_pane, 6);
@@ -815,8 +814,8 @@ mod tests {
             active_tab: 0,
             peer: None,
         };
-        let bytes = postcard::to_allocvec(&entry).expect("serialize");
-        let decoded: SessionEntry = postcard::from_bytes(&bytes).expect("deserialize");
+        let bytes = rmp_serde::to_vec_named(&entry).expect("serialize");
+        let decoded: SessionEntry = rmp_serde::from_slice(&bytes).expect("deserialize");
         assert_eq!(decoded.tabs.len(), 1);
         assert_eq!(decoded.active_tab, 0);
         assert_eq!(decoded.tabs[0].layout, LayoutNode::single(0));
@@ -825,7 +824,7 @@ mod tests {
     #[test]
     fn session_entry_peer_attribution_roundtrips() {
         // A federated entry carries its owning peer; a local entry leaves it
-        // None. Both must survive the postcard wire roundtrip (issue #121).
+        // None. Both must survive the wire roundtrip (issue #121).
         let federated = SessionEntry {
             meta: SessionMeta {
                 index: 2,
@@ -838,16 +837,16 @@ mod tests {
             active_tab: 0,
             peer: Some("alice@box:2222".into()),
         };
-        let bytes = postcard::to_allocvec(&federated).expect("serialize");
-        let decoded: SessionEntry = postcard::from_bytes(&bytes).expect("deserialize");
+        let bytes = rmp_serde::to_vec_named(&federated).expect("serialize");
+        let decoded: SessionEntry = rmp_serde::from_slice(&bytes).expect("deserialize");
         assert_eq!(decoded.peer.as_deref(), Some("alice@box:2222"));
 
         let local = SessionEntry {
             peer: None,
             ..federated
         };
-        let bytes = postcard::to_allocvec(&local).expect("serialize");
-        let decoded: SessionEntry = postcard::from_bytes(&bytes).expect("deserialize");
+        let bytes = rmp_serde::to_vec_named(&local).expect("serialize");
+        let decoded: SessionEntry = rmp_serde::from_slice(&bytes).expect("deserialize");
         assert_eq!(decoded.peer, None);
     }
 
@@ -898,8 +897,8 @@ mod tests {
                 tab_index: 0,
             },
         ] {
-            let bytes = postcard::to_allocvec(&msg).expect("serialize");
-            let decoded: SessionEventMsg = postcard::from_bytes(&bytes).expect("deserialize");
+            let bytes = rmp_serde::to_vec_named(&msg).expect("serialize");
+            let decoded: SessionEventMsg = rmp_serde::from_slice(&bytes).expect("deserialize");
             // Round-trips to an equal-shaped event (spot check the discriminant).
             assert_eq!(
                 std::mem::discriminant(&decoded),
@@ -919,8 +918,8 @@ mod tests {
                 pixel_height: 600,
             },
         };
-        let bytes = postcard::to_allocvec(&msg).expect("serialize");
-        let decoded: SessionEventMsg = postcard::from_bytes(&bytes).expect("deserialize");
+        let bytes = rmp_serde::to_vec_named(&msg).expect("serialize");
+        let decoded: SessionEventMsg = rmp_serde::from_slice(&bytes).expect("deserialize");
         match decoded {
             SessionEventMsg::PaneResized { pane_id, size } => {
                 assert_eq!(pane_id, "eagle/0");

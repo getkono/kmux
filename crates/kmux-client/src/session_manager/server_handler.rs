@@ -161,7 +161,7 @@ impl SessionManager {
         self.liveness.observe_inbound(Instant::now());
 
         // Attribute the wire cost of this frame to the currently tagged
-        // transport. We re-encode for the byte count; postcard is cheap
+        // transport. We re-encode for the byte count; MessagePack is cheap
         // enough that this is negligible next to decoding.
         let inbound_bytes = kmux_protocol::encode_server(&msg)
             .map(|b| b.len())
@@ -182,6 +182,8 @@ impl SessionManager {
                 machine_id,
                 label,
                 server_machine_id,
+                negotiated_protocol,
+                negotiated_capabilities,
             } => {
                 if success {
                     self.client_id = client_id;
@@ -190,9 +192,15 @@ impl SessionManager {
                     self.machine_id = machine_id;
                     self.label = label;
                     self.server_machine_id = server_machine_id;
+                    self.negotiated_protocol = negotiated_protocol;
+                    self.negotiated_capabilities = negotiated_capabilities;
                     // The daemon decides compression; frames self-describe, so
                     // this is informational only (see docs/compression.md).
-                    info!("Authenticated (wire compression: {compression:?})");
+                    info!(
+                        protocol = ?self.negotiated_protocol,
+                        capabilities = ?self.negotiated_capabilities,
+                        "Authenticated (wire compression: {compression:?})"
+                    );
                     events.push(SessionEvent::AuthOk);
                 } else {
                     warn!("Auth failed: {:?}", reason);

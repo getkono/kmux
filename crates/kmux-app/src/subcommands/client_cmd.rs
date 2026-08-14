@@ -28,7 +28,7 @@ pub async fn run_client_command(action: ClientAction) -> anyhow::Result<()> {
 
 async fn client_status() -> anyhow::Result<()> {
     use kmux_protocol::dirs::BuildProfile;
-    use kmux_protocol::messages::PROTOCOL_VERSION;
+    use kmux_protocol::messages::PROTOCOL_RANGE;
 
     let cli_build = kmux_protocol::buildinfo::fingerprint();
     let cli_profile = kmux_protocol::buildinfo::build_profile();
@@ -88,7 +88,13 @@ async fn client_status() -> anyhow::Result<()> {
             let dprofile = d.build_profile.map(|p| p.as_str()).unwrap_or("<unknown>");
             println!("  Build:    {}", build_display(&d.kmuxd_build, dprofile));
             println!("  Version:  {}", d.kmuxd_version);
-            println!("  Protocol: {}", d.protocol_version);
+            println!(
+                "  Protocol: {}",
+                d.protocol_range.map_or_else(
+                    || format!("legacy-{}", d.protocol_version),
+                    |range| range.to_string()
+                )
+            );
             println!("  PID:      {}", d.pid);
         }
         None => println!("  Status:   not running"),
@@ -97,7 +103,7 @@ async fn client_status() -> anyhow::Result<()> {
     // ── This CLI ────────────────────────────────────────────────────────────
     println!("CLI:");
     println!("  Build:    {}", build_display(&cli_build, cli_profile));
-    println!("  Protocol: {PROTOCOL_VERSION}");
+    println!("  Protocol: {PROTOCOL_RANGE}");
 
     // ── Skew warnings ───────────────────────────────────────────────────────
     // Every comparison is classified through `kmux_protocol::compat`, the same
@@ -108,11 +114,14 @@ async fn client_status() -> anyhow::Result<()> {
     if let Some(d) = &daemon {
         // The most consequential skew: a protocol gap means the CLI/GUI cannot
         // even connect to this daemon.
-        if compat::protocol_match(d.protocol_version) == Match3::Differ {
+        if compat::protocol_match(d.protocol_range) != Match3::Same {
             warnings.push(format!(
-                "CLI protocol ({PROTOCOL_VERSION}) differs from the daemon ({}) — they cannot \
+                "CLI protocol ({PROTOCOL_RANGE}) differs from the daemon ({}) — they cannot \
                  connect. Run `kmux daemon restart` to update the daemon, or reinstall kmux.",
-                d.protocol_version
+                d.protocol_range.map_or_else(
+                    || format!("legacy-{}", d.protocol_version),
+                    |range| range.to_string()
+                )
             ));
         }
         if compat::profile_match(d.build_profile) != Match3::Same {

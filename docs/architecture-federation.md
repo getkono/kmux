@@ -43,8 +43,10 @@ See `docs/architecture-frontend.md` for the client layering this builds on.
     `SessionCreate` upstream, draws a local `WordId` for the returned session, and
     registers the mapping (the create-time analog of `open_peer`'s adoption). The
     feed loop completes the request via a `pending_creates` oneshot, since it owns
-    the upstream stream. (postcard is positional, so adding a field is breaking →
-    the version bump, not just `#[serde(default)]`.)
+    the upstream stream. (This landed under the retired positional Postcard
+    codec, where adding a field was a wire break and needed a version bump.
+    Under the named-map schema a `#[serde(default)]` field is additive — see
+    [architecture-protocol-versioning.md](architecture-protocol-versioning.md).)
 - **`kmuxd` federation subsystem (PR3)** — `crates/kmuxd/src/federation/` behind the
   default-on `federation` cargo feature:
   - `PeerManager` on `ServerApp` keyed by `PeerId`; `open_peer` connects upstream via
@@ -265,9 +267,9 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   (all paths, including a committed handoff — peer links are not migrated); a `Drop` on
   `PeerConnection` makes "never leaks its tunnel" structural. Unit:
   `close_all_kills_tunnels_and_clears_peers`.
-- **PR6 — version guard — confirmed + tested.** A peer link is rejected on a
-  `PROTOCOL_VERSION` mismatch by the standard upstream `Auth` handshake (the remote
-  checks the version *before* the token), surfaced as `PeerError`. E2E
+- **PR6 — version guard — confirmed + tested.** A peer link is rejected when
+  its semantic protocol range does not overlap in the standard upstream `Auth`
+  handshake (the remote checks the range *before* the token), surfaced as `PeerError`. E2E
   `federation_surfaces_upstream_auth_rejection_as_peer_error` covers that branch via a
   wrong-token rejection (the same `AuthResult{success:false}` a version mismatch yields).
 - **PR6 — idle peer drop: intentionally not added.** The daemon's existing

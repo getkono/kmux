@@ -23,8 +23,10 @@ Every frame is self-describing:
 ```
 
 - `length` counts the codec tag byte plus the payload.
-- `codec tag`: `0` = raw (postcard), `1` = zstd-compressed postcard.
-- Bounds: on-wire `length` ≤ `MAX_FRAME_SIZE` (16 MiB); a zstd frame may not
+- `codec tag`: `2` = raw named MessagePack, `3` = zstd-compressed named
+  MessagePack. Tags `0` and `1` are permanently reserved for the retired
+  Postcard codec and produce an explicit upgrade error.
+- Bounds: on-wire `length` ≤ `MAX_FRAME_SIZE` (64 MiB); a zstd frame may not
   inflate past `MAX_DECOMPRESSED_SIZE` (64 MiB) — a decompression-bomb guard.
 
 Because the tag is per-frame (the HTTP `Content-Encoding`-per-message analogue),
@@ -50,13 +52,13 @@ it emits a raw frame, so a frame never grows beyond `payload + 1` byte.
 
 ## Negotiation
 
-The exact-match `PROTOCOL_VERSION` handshake already guarantees both peers share
-an identical codec set, so codec *support* never needs negotiating — only the
-per-connection *policy*. Mapped to HTTP:
+The client offers the `frame.zstd` named capability and the daemon returns the
+supported intersection. The daemon then chooses the per-connection *policy*.
+Mapped to HTTP:
 
 | HTTP | kmux |
 |---|---|
-| `Accept-Encoding` (client offers) | implied by the `PROTOCOL_VERSION` match |
+| `Accept-Encoding` (client offers) | `Auth.protocol_capabilities` contains `frame.zstd` |
 | `Content-Encoding` (server decides) | `ServerMessage::AuthResult.compression: Option<Compression>` |
 | per-message `Content-Encoding` | the per-frame codec tag |
 
@@ -64,8 +66,9 @@ The daemon is authoritative. On successful auth (`kmuxd`'s
 `client_handler/dispatch.rs`) it computes `compression.enabled_for(transport)`,
 flips the connection's shared `OutboundCompression` toggle that the writer and
 pane-attacher tasks read, and echoes the choice in `AuthResult.compression`. The
-client uses that only for observability — its `read_frame` decompresses
-regardless.
+client uses the response for observability; its `read_frame` handles either
+current codec tag on every frame. See
+[Data-Plane Protocol Versioning](architecture-protocol-versioning.md).
 
 **Direction (v1): downlink only** (server→client). That is the shell output #59
 targets, and self-describing frames mean the client needs zero writer changes.
@@ -98,8 +101,8 @@ level from the zstd frame, so neither appears on the wire.
 ratio/latency balance for terminal output: 3–8× on text at sub-millisecond
 per-frame compression and >1 GB/s decompression. It beats lz4 on ratio with a
 negligible speed difference at these small frame sizes, and beats zlib on both.
-`Compression` is an extensible enum, so adding lz4 or a dictionary variant later
-is a versioned, additive change.
+Adding lz4 or a dictionary variant later requires a distinct named capability
+and permanent codec tag before either side may send it.
 
 ## Strategy — to finalize (empirical)
 

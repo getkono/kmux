@@ -74,7 +74,7 @@ Build a successor with a changed constant, install it, then upgrade onto it.
 | # | Bump | Constant | Expected |
 | --- | --- | --- | --- |
 | E1 | Handoff protocol | `HANDOFF_PROTOCOL_VERSION` (`kmux-protocol/src/control_rpc.rs`) | Successor `Decline`s the live fd transfer → snapshot restore. Picture preserved; shells **respawned** (the `[kmux: session restored]` banner appears, per `SeedMode::Respawned`). |
-| E2 | Wire protocol | `PROTOCOL_VERSION` (`kmux-protocol/src/messages/types.rs`) | Client reconnect surfaces the documented mismatch + "run `kmux daemon restart`" guidance rather than corrupting the session. |
+| E2 | Wire protocol | Set a disjoint `PROTOCOL_RANGE` major (`kmux-protocol/src/messages/types.rs`) | Client reconnect surfaces the documented mismatch + "run `kmux daemon restart`" guidance rather than corrupting the session. |
 | E3 | Checkpoint schema | `STATE_VERSION` (`kmuxd/src/persist/mod.rs`) | A stale checkpoint is rejected cleanly (no panic); fresh sessions start. |
 | E4 | Library ABI | `kmux-ghostty-sys` `EXPECTED_ABI_VERSION` | A mismatched `libkmux_ghostty` is detected/refused at load rather than crashing the daemon. |
 

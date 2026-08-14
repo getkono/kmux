@@ -79,10 +79,10 @@ uniffi::setup_scaffolding!();
 
 /// ABI version of this FFI surface. Bumped on any breaking change to the
 /// exported types/functions, mirroring the repo's other versioned boundaries
-/// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol version).
+/// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol range).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 24;
+pub const KMUX_FFI_ABI_VERSION: u32 = 25;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -106,8 +106,8 @@ pub struct FfiVersionInfo {
     pub build_date: String,
     /// Cargo profile (`"debug"` / `"release"`).
     pub build_profile: String,
-    /// Client↔daemon wire protocol version.
-    pub protocol: u32,
+    /// Client↔daemon supported wire protocol range.
+    pub protocol: String,
     /// Renderer API version (this binary links `kmux-render`).
     pub render_api: u32,
     /// FFI C-ABI version ([`KMUX_FFI_ABI_VERSION`]).
@@ -844,7 +844,7 @@ pub struct FfiConnectionDetails {
     pub connection_id: Option<u64>,
     pub client_id: Option<u64>,
     pub server_version: Option<String>,
-    pub protocol_version: u32,
+    pub protocol_version: String,
     pub accept_invalid_certs: bool,
     pub rtt: Option<FfiRtt>,
     pub transports: Vec<FfiTransportTraffic>,

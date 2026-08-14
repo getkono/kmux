@@ -148,7 +148,7 @@ fn long_version() -> String {
     let _ = write!(
         s,
         "\n  protocol:   {}",
-        kmux_protocol::messages::PROTOCOL_VERSION
+        kmux_protocol::messages::PROTOCOL_RANGE
     );
     let _ = write!(s, "\n  rustc:      {}", env!("BUILD_RUSTC_VERSION"));
     let _ = write!(s, "\n  built:      {}", env!("BUILD_TIMESTAMP"));
@@ -254,7 +254,7 @@ fn main() -> anyhow::Result<()> {
             env!("BUILD_PROFILE"),
             ")"
         ),
-        protocol_version = kmux_protocol::messages::PROTOCOL_VERSION,
+        protocol_version = %kmux_protocol::messages::PROTOCOL_RANGE,
         "kmuxd started"
     );
 
@@ -344,8 +344,9 @@ fn main() -> anyhow::Result<()> {
 /// Queries the local daemon control socket. If the daemon is not running,
 /// starts it and polls until it responds.  Prints extended connection JSON to stdout.
 ///
-/// Output includes `protocol_version` and `kmuxd_version` so clients can detect
-/// mismatches before attempting a full connection.
+/// Output includes `protocol_range` and `kmuxd_version` so current clients can
+/// detect mismatches before attempting a full connection. `protocol_version`
+/// remains a frozen legacy sentinel for old probe consumers.
 async fn probe_or_start() -> anyhow::Result<()> {
     use std::time::Duration;
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -408,7 +409,8 @@ async fn probe_or_start() -> anyhow::Result<()> {
 
         // Build the extended probe-or-start JSON (backward-compatible: adds new fields).
         let json = serde_json::json!({
-            "protocol_version": kmux_protocol::messages::PROTOCOL_VERSION,
+            "protocol_version": kmux_protocol::messages::LEGACY_PROTOCOL_VERSION,
+            "protocol_range": kmux_protocol::messages::PROTOCOL_RANGE,
             "kmuxd_version": env!("CARGO_PKG_VERSION"),
             "quic_port": resp.port,
             "tcp_port": resp.tcp_port,

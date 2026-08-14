@@ -7,16 +7,20 @@ use super::session::{
     PaneId, PaneInfo, PeerId, RequestId, SequenceNo, SessionEntry, SessionEventMsg, TabIndex,
     TabInfo, WordId,
 };
-use super::types::Compression;
+use super::types::{Compression, ProtocolVersion};
 use super::vt::{CursorState, GridSnapshot, ScrollbackLine, TermModes, TerminalDiff};
 
 /// Messages sent from server -> client.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "type", content = "data")]
 pub enum ServerMessage {
     /// Challenge issued after a valid `Auth` (token + protocol accepted): the
     /// client must sign `nonce` with its identity private key and return the
     /// signature in [`super::client::ClientMessage::AuthProof`] (issue #146).
-    AuthChallenge { nonce: Vec<u8> },
+    AuthChallenge {
+        #[serde(with = "serde_bytes")]
+        nonce: Vec<u8>,
+    },
 
     /// Response to the `Auth` → `AuthChallenge` → `AuthProof` handshake.
     AuthResult {
@@ -51,6 +55,12 @@ pub enum ServerMessage {
         /// machine it is talking to. `None` on failure (issue #146).
         #[serde(default)]
         server_machine_id: Option<String>,
+        /// Highest schema baseline supported by both peers.
+        #[serde(default)]
+        negotiated_protocol: Option<ProtocolVersion>,
+        /// Optional extensions supported by both peers.
+        #[serde(default)]
+        negotiated_capabilities: Vec<String>,
     },
 
     /// Confirmation that the channel switch is complete. Sent in response to
@@ -195,8 +205,8 @@ pub enum ServerMessage {
     /// `Arc`-wrapped so the daemon can fan the same snapshot out to several
     /// clients (multiple GUIs on one session, federation mirrors,
     /// force-full-snapshot viewers) with O(1) clones instead of deep-copying the
-    /// whole grid per recipient. Postcard serialises `Arc<T>` exactly as `T`, so
-    /// the wire format is unchanged.
+    /// whole grid per recipient. Serde's `rc` feature serialises `Arc<T>`
+    /// exactly as `T`, so the wire format is unchanged.
     TerminalSnapshot {
         pane_id: PaneId,
         snapshot: Arc<GridSnapshot>,
@@ -332,6 +342,7 @@ pub enum ServerMessage {
     /// batch of appended bytes while `follow` is set.
     LogChunk {
         request_id: RequestId,
+        #[serde(with = "serde_bytes")]
         data: Vec<u8>,
     },
 
@@ -669,6 +680,8 @@ mod tests {
                     machine_id: None,
                     label: None,
                     server_machine_id: None,
+                    negotiated_protocol: Some(super::super::types::PROTOCOL_VERSION),
+                    negotiated_capabilities: super::super::types::protocol_capabilities(),
                 },
                 MessageCategory::Bootstrap,
             ),

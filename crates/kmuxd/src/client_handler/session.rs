@@ -312,7 +312,7 @@ mod tests {
     use super::*;
     use kmux_protocol::identity::Identity;
     use kmux_protocol::messages::{
-        ClientCapabilities, ClientMessage, FrontendKind, PROTOCOL_VERSION,
+        ClientCapabilities, ClientMessage, FrontendKind, PROTOCOL_RANGE, protocol_capabilities,
     };
     use kmux_protocol::{decode_server, encode_client, write_frame};
     use tokio::task::AbortHandle;
@@ -334,7 +334,8 @@ mod tests {
         let identity = Identity::generate();
         ClientMessage::Auth {
             token: token.to_string(),
-            protocol_version: PROTOCOL_VERSION,
+            protocol_range: PROTOCOL_RANGE,
+            protocol_capabilities: protocol_capabilities(),
             capabilities: ClientCapabilities::default(),
             connection_id: None,
             public_key: identity.public_key_bytes().to_vec(),

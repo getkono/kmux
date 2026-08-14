@@ -16,8 +16,8 @@ use crate::connect::ConnectResult;
 
 /// Encode and write the initial `Auth` frame on a freshly-opened control stream.
 ///
-/// Centralises the auth handshake payload — token + `PROTOCOL_VERSION` +
-/// capabilities + `connection_id` + this process's cryptographic identity claim
+/// Centralises the auth handshake payload — token + supported protocol range +
+/// named protocol/application capabilities + `connection_id` + this process's identity claim
 /// (public key + hostname/username, issue #146) — so every transport (UDS / TCP
 /// / TCP+TLS / QUIC) sends a byte-identical frame and a new `Auth` field is wired
 /// in exactly one place. The daemon replies with an `AuthChallenge` the caller
@@ -32,7 +32,8 @@ pub(crate) async fn send_auth_frame<W: AsyncWrite + Unpin>(
     let (public_key, hostname, username) = local_identity_claim();
     let auth_bytes = encode_client(&ClientMessage::Auth {
         token,
-        protocol_version: kmux_protocol::messages::PROTOCOL_VERSION,
+        protocol_range: kmux_protocol::messages::PROTOCOL_RANGE,
+        protocol_capabilities: kmux_protocol::messages::protocol_capabilities(),
         capabilities,
         connection_id,
         public_key,
@@ -94,7 +95,7 @@ pub fn answer_auth_challenge(
 /// Establish a TCP connection to `host:port` and authenticate with `token`.
 ///
 /// All messages (control + pane diffs) flow over a single TCP stream using
-/// the same length-prefixed postcard frame format as the QUIC transport.
+/// the same length-prefixed MessagePack frame format as the QUIC transport.
 /// The server interleaves `ServerMessage` values on the stream; the client
 /// dispatches them by message type (pane_id fields handle routing).
 ///

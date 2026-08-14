@@ -30,7 +30,7 @@ use tokio::process::{Child, ChildStderr, Command};
 use tokio::time::sleep;
 use tracing::{debug, info, warn};
 
-use kmux_protocol::messages::PROTOCOL_VERSION;
+use kmux_protocol::messages::{PROTOCOL_RANGE, ProtocolRange};
 
 use super::{ProbeFailureKind, RemoteTarget, SshError, SshSession};
 
@@ -155,9 +155,12 @@ struct ProbeInfo {
     quic_port: u16,
     tcp_port: u16,
     token: String,
-    /// `protocol_version` field added in Phase 7; older daemons omit it.
+    /// Frozen compatibility sentinel retained for legacy probe consumers.
     #[serde(default)]
     protocol_version: Option<u32>,
+    /// Semantic named-schema range used by current daemons.
+    #[serde(default)]
+    protocol_range: Option<ProtocolRange>,
     /// Reported daemon version string. Surfaced in success logs only.
     #[serde(default)]
     kmuxd_version: Option<String>,
@@ -237,19 +240,21 @@ fn redact_json_tokens(value: &mut serde_json::Value) {
 }
 
 fn enforce_version(info: &ProbeInfo, ssh_dest: &str) -> Result<(), SshError> {
-    match info.protocol_version {
-        Some(server_ver) if server_ver != PROTOCOL_VERSION => Err(SshError::VersionMismatch {
-            client: PROTOCOL_VERSION,
-            server: server_ver,
+    match info.protocol_range {
+        Some(server_range) if PROTOCOL_RANGE.negotiate(server_range).is_some() => Ok(()),
+        Some(server_range) => Err(SshError::VersionMismatch {
+            client: PROTOCOL_RANGE.to_string(),
+            server: server_range.to_string(),
         }),
-        Some(_) => Ok(()),
         None => {
-            warn!(
-                dest = %ssh_dest,
-                "Remote daemon did not report protocol_version; \
-                 update kmuxd to ensure compatibility"
-            );
-            Ok(())
+            warn!(dest = %ssh_dest, "remote daemon only reported a legacy protocol");
+            Err(SshError::VersionMismatch {
+                client: PROTOCOL_RANGE.to_string(),
+                server: info
+                    .protocol_version
+                    .map(|version| format!("legacy-{version}"))
+                    .unwrap_or_else(|| "legacy-unknown".to_string()),
+            })
         }
     }
 }
@@ -541,9 +546,10 @@ mod tests {
 
     #[test]
     fn probe_info_with_protocol_version() {
-        let json = r#"{"quic_port":8443,"tcp_port":8444,"token":"abc","protocol_version":13}"#;
+        let json = r#"{"quic_port":8443,"tcp_port":8444,"token":"abc","protocol_version":41,"protocol_range":{"min":{"major":1,"minor":0,"patch":0},"max":{"major":1,"minor":0,"patch":0}}}"#;
         let info: ProbeInfo = serde_json::from_str(json).unwrap();
-        assert_eq!(info.protocol_version, Some(13));
+        assert_eq!(info.protocol_version, Some(41));
+        assert_eq!(info.protocol_range, Some(PROTOCOL_RANGE));
         assert_eq!(info.tcp_port, 8444);
     }
 
@@ -636,7 +642,8 @@ mod tests {
             quic_port: 1,
             tcp_port: 2,
             token: "t".into(),
-            protocol_version: Some(PROTOCOL_VERSION),
+            protocol_version: Some(kmux_protocol::messages::LEGACY_PROTOCOL_VERSION),
+            protocol_range: Some(PROTOCOL_RANGE),
             kmuxd_version: None,
         };
         enforce_version(&info, "user@host").unwrap();
@@ -648,28 +655,35 @@ mod tests {
             quic_port: 1,
             tcp_port: 2,
             token: "t".into(),
-            protocol_version: Some(PROTOCOL_VERSION + 1),
+            protocol_version: Some(kmux_protocol::messages::LEGACY_PROTOCOL_VERSION),
+            protocol_range: Some(ProtocolRange::exact(
+                kmux_protocol::messages::ProtocolVersion::new(2, 0, 0),
+            )),
             kmuxd_version: None,
         };
         match enforce_version(&info, "user@host").unwrap_err() {
             SshError::VersionMismatch { client, server } => {
-                assert_eq!(client, PROTOCOL_VERSION);
-                assert_eq!(server, PROTOCOL_VERSION + 1);
+                assert_eq!(client, PROTOCOL_RANGE.to_string());
+                assert_eq!(server, "2.0.0");
             }
             other => panic!("expected VersionMismatch, got {other:?}"),
         }
     }
 
     #[test]
-    fn enforce_version_accepts_missing_version_with_warn() {
+    fn enforce_version_rejects_legacy_version() {
         let info = ProbeInfo {
             quic_port: 1,
             tcp_port: 2,
             token: "t".into(),
             protocol_version: None,
+            protocol_range: None,
             kmuxd_version: None,
         };
-        enforce_version(&info, "user@host").unwrap();
+        assert!(matches!(
+            enforce_version(&info, "user@host"),
+            Err(SshError::VersionMismatch { .. })
+        ));
     }
 
     // ── classify_probe_exit ──────────────────────────────────────────────────

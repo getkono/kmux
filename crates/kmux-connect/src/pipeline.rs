@@ -9,9 +9,7 @@
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use kmux_protocol::messages::{
-    ClientCapabilities, ClientMessage, ConnectionId, PROTOCOL_VERSION, ServerMessage,
-};
+use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ConnectionId, ServerMessage};
 use kmux_protocol::transport::bootstrap::EndpointAdvert;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
@@ -99,7 +97,7 @@ pub enum BootstrapError {
     #[error("daemon start failed: {0}")]
     DaemonStart(String),
     #[error("protocol version mismatch: client={client}, daemon={server}")]
-    VersionMismatch { client: u32, server: u32 },
+    VersionMismatch { client: String, server: String },
     #[error("SSH negotiation failed: {0}")]
     Ssh(#[from] SshError),
     #[error("{strategy} connect failed: {error}")]
@@ -157,7 +155,7 @@ pub enum BootstrapEvent<'a> {
         json: &'a str,
     },
     SshProtocolVersionOk {
-        version: u32,
+        version: String,
     },
     SshTunnelReady {
         local_port: u16,
@@ -171,7 +169,7 @@ pub enum BootstrapEvent<'a> {
         port: u16,
     },
     HandshakeAuthSent {
-        protocol_version: u32,
+        protocol_version: String,
         connection_id: Option<ConnectionId>,
     },
     HandshakeAuthResult {
@@ -231,7 +229,7 @@ impl BootstrapObserver for NoopObserver {
                 debug!("pipeline: ssh probe response received");
             }
             BootstrapEvent::SshProtocolVersionOk { version } => {
-                debug!(version, "pipeline: ssh protocol version ok");
+                debug!(%version, "pipeline: ssh protocol version ok");
             }
             BootstrapEvent::SshTunnelReady {
                 local_port,
@@ -386,10 +384,15 @@ async fn prepare_local_daemon(
         .map_err(|e| BootstrapError::DaemonStart(e.to_string()))?;
 
     // Version gate: refuse before opening the data socket.
-    if status.protocol_version != 0 && status.protocol_version != PROTOCOL_VERSION {
+    if kmux_protocol::compat::protocol_match(status.protocol_range)
+        != kmux_protocol::compat::Match3::Same
+    {
         return Err(BootstrapError::VersionMismatch {
-            client: PROTOCOL_VERSION,
-            server: status.protocol_version,
+            client: kmux_protocol::messages::PROTOCOL_RANGE.to_string(),
+            server: status
+                .protocol_range
+                .map(|range| range.to_string())
+                .unwrap_or_else(|| format!("legacy-{}", status.protocol_version)),
         });
     }
 
@@ -434,7 +437,7 @@ async fn prepare_ssh(
         json: &ssh.probe_json,
     });
     observer.on_event(&BootstrapEvent::SshProtocolVersionOk {
-        version: PROTOCOL_VERSION,
+        version: kmux_protocol::messages::PROTOCOL_RANGE.to_string(),
     });
     observer.on_event(&BootstrapEvent::SshTunnelReady {
         local_port: ssh.local_tcp_port,
@@ -566,7 +569,7 @@ async fn establish(
     };
 
     observer.on_event(&BootstrapEvent::HandshakeAuthSent {
-        protocol_version: PROTOCOL_VERSION,
+        protocol_version: kmux_protocol::messages::PROTOCOL_RANGE.to_string(),
         connection_id,
     });
 
@@ -653,8 +656,8 @@ async fn establish(
             // first, but remote/direct transports go through this path only).
             if reason.starts_with("protocol version mismatch:") {
                 Err(BootstrapError::VersionMismatch {
-                    client: PROTOCOL_VERSION,
-                    server: 0,
+                    client: kmux_protocol::messages::PROTOCOL_RANGE.to_string(),
+                    server: "unknown".to_string(),
                 })
             } else {
                 Err(BootstrapError::Auth(reason))
@@ -712,9 +715,11 @@ mod tests {
         let o = NoopObserver;
         o.on_event(&BootstrapEvent::ParsedTarget { target: &target });
         o.on_event(&BootstrapEvent::DaemonNotRunning);
-        o.on_event(&BootstrapEvent::SshProtocolVersionOk { version: 13 });
+        o.on_event(&BootstrapEvent::SshProtocolVersionOk {
+            version: "1.0.0".into(),
+        });
         o.on_event(&BootstrapEvent::HandshakeAuthSent {
-            protocol_version: 13,
+            protocol_version: "1.0.0".into(),
             connection_id: Some(ConnectionId(7)),
         });
         o.on_event(&BootstrapEvent::HandshakeAuthResult {

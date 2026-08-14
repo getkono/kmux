@@ -1019,11 +1019,11 @@ async fn concurrent_open_peer_to_same_target_converges_on_one_link() {
 /// cleanly as `PeerError` (not a hang or a half-open peer), and the local daemon
 /// keeps serving. This exercises the same `open_peer` branch a protocol-version
 /// mismatch hits — the remote rejects `Auth` with `AuthResult { success: false }`
-/// whether the cause is a bad token or an incompatible `PROTOCOL_VERSION`, and the
-/// version guard (`dispatch::handle_message`) is checked *before* the token — so a
+/// whether the cause is a bad token or a disjoint protocol range, and the range
+/// guard (`dispatch::handle_message`) is checked *before* the token — so a
 /// wrong token is a faithful, deterministic stand-in for the version-mismatch path
-/// (which cannot be provoked without building a second daemon at a different
-/// version).
+/// (which cannot be provoked without building a second daemon with a disjoint
+/// supported range).
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
 async fn federation_surfaces_upstream_auth_rejection_as_peer_error() {

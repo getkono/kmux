@@ -8,7 +8,7 @@
 //! reads this struct directly, `kmux-swift` maps it across the `kmux-ffi`
 //! boundary. See `docs/connection.md`.
 
-use kmux_protocol::messages::PROTOCOL_VERSION;
+use kmux_protocol::messages::PROTOCOL_RANGE;
 
 use super::AppCore;
 
@@ -59,7 +59,7 @@ pub struct ConnectionInfo {
     /// Daemon binary version reported at auth.
     pub server_version: Option<String>,
     /// Wire-protocol version this client speaks.
-    pub protocol_version: u32,
+    pub protocol_version: String,
     /// True when the client accepts invalid TLS certs (dev / self-signed).
     pub accept_invalid_certs: bool,
     /// Latency summary for the active transport.
@@ -107,7 +107,10 @@ impl AppCore {
             connection_id: mgr.connection_id.map(|c| c.0),
             client_id: mgr.client_id().map(|c| c.0),
             server_version: mgr.server_version.clone(),
-            protocol_version: PROTOCOL_VERSION,
+            protocol_version: mgr
+                .negotiated_protocol
+                .map(|version| version.to_string())
+                .unwrap_or_else(|| PROTOCOL_RANGE.to_string()),
             accept_invalid_certs: mgr.accept_invalid_certs(),
             rtt,
             transports,
@@ -118,7 +121,7 @@ impl AppCore {
 #[cfg(test)]
 mod tests {
     use kmux_client::session_manager::SessionManager;
-    use kmux_protocol::messages::{ClientCapabilities, PROTOCOL_VERSION};
+    use kmux_protocol::messages::{ClientCapabilities, PROTOCOL_RANGE};
 
     use crate::core::AppCore;
 
@@ -134,7 +137,7 @@ mod tests {
         let core = AppCore::for_test(mgr);
         let info = core.connection_info();
         // Protocol version is always the compiled-in wire version.
-        assert_eq!(info.protocol_version, PROTOCOL_VERSION);
+        assert_eq!(info.protocol_version, PROTOCOL_RANGE.to_string());
         // Default transport before any swap is QUIC.
         assert_eq!(info.transport, "QUIC");
         // No Ping/Pong yet → no RTT summary, no per-transport traffic.
