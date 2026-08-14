@@ -19,7 +19,3 @@ postcard.workspace = true
 # handoff path).
 nix.workspace = true
 tokio.workspace = true
-thiserror.workspace = true
-
-[dev-dependencies]
-tokio = { workspace = true, features = ["full"] }

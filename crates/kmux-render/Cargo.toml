@@ -18,7 +18,7 @@ description = "Cross-platform GPU-accelerated terminal cell-grid renderer (wgpu)
 # Frontends opt in via their own `gpu` feature. See docs/architecture-render.md.
 default = []
 text = ["dep:swash", "dep:etagere", "dep:fontdb"]
-gpu = ["text", "dep:wgpu", "dep:raw-window-handle", "dep:bytemuck", "dep:pollster"]
+gpu = ["text", "dep:wgpu", "dep:bytemuck", "dep:pollster"]
 
 [dependencies]
 kmux-protocol.workspace = true
@@ -37,6 +37,5 @@ fontdb = { workspace = true, optional = true }
 
 # `gpu` tier (the wgpu renderer).
 wgpu = { workspace = true, optional = true }
-raw-window-handle = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }

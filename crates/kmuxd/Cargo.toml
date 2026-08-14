@@ -45,6 +45,8 @@ kmux-connect = { workspace = true, optional = true }
 # worker's diff stream so the daemon can mint snapshots synchronously without an
 # IPC round-trip. `kmux-client` depends on `kmux-protocol`, never on `kmuxd`, so
 # no cycle. Lean (no remote transports) -- only the grid model is used.
+# tests/handoff_e2e.rs reuses it to drive a real daemon's control + data sockets
+# across a graceful restart, so it needs no separate dev-dependency entry.
 kmux-client.workspace = true
 # IPC contract for the isolated VT worker (issue #126).
 kmux-worker-protocol.workspace = true
@@ -62,20 +64,16 @@ kmux-vt-core.workspace = true
 tokio.workspace = true
 quinn.workspace = true
 rustls.workspace = true
-rustls-pemfile.workspace = true
-rcgen.workspace = true
 rand.workspace = true
 clap.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
-thiserror.workspace = true
 anyhow.workspace = true
 postcard.workspace = true
 # Cross-platform process stats (CPU/memory) for the process overview (issue
-# #122). Used to sample each pane's process tree. `default-features = false`
-# drops the disk/network/component probes we never query.
-sysinfo = { version = "0.33", default-features = false, features = ["system"] }
+# #122). Used to sample each pane's process tree.
+sysinfo.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -83,7 +81,3 @@ tempfile.workspace = true
 # `TermState` via `NullEventSink` (feature unification turns it on only for the
 # test build, not the production daemon).
 kmux-vt-core = { workspace = true, features = ["test-util"] }
-# Used only by tests/handoff_e2e.rs to drive a real daemon's control + data
-# sockets across a graceful restart. kmux-client depends on kmux-protocol (never
-# on kmuxd), so this introduces no dependency cycle.
-kmux-client.workspace = true
