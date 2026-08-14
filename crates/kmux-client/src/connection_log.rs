@@ -1,5 +1,5 @@
 use kmux_protocol::epoch_secs_to_ymd_hms;
-use kmux_protocol::messages::PROTOCOL_VERSION;
+use kmux_protocol::messages::PROTOCOL_RANGE;
 
 /// Write a per-connection metadata log entry to the connection log file.
 ///
@@ -24,7 +24,7 @@ pub fn write_connection_log(
         "instance_id: {instance_id}\n\
          client_version: {client_version}\n\
          server_version: {}\n\
-         protocol_version: {PROTOCOL_VERSION}\n\
+         protocol_version: {PROTOCOL_RANGE}\n\
          destination: {host}:{port}\n\
          transport: QUIC\n\
          connected_at: {connected_at}\n",

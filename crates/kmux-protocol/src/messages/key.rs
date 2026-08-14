@@ -167,7 +167,7 @@ mod tests {
     }
 
     #[test]
-    fn key_event_postcard_roundtrip() {
+    fn key_event_wire_roundtrip() {
         let ev = KeyEvent {
             code: KeyCode::Enter,
             mods: KeyMods::SHIFT | KeyMods::CTRL,
@@ -175,8 +175,8 @@ mod tests {
             text: String::new(),
             unshifted_codepoint: 0,
         };
-        let bytes = postcard::to_allocvec(&ev).unwrap();
-        let decoded: KeyEvent = postcard::from_bytes(&bytes).unwrap();
+        let bytes = rmp_serde::to_vec_named(&ev).unwrap();
+        let decoded: KeyEvent = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(decoded.code as u16, ev.code as u16);
         assert_eq!(decoded.mods, ev.mods);
         assert_eq!(decoded.action as u8, ev.action as u8);

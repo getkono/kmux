@@ -120,7 +120,7 @@ pub fn init_logging(instance_id: &str) {
             env!("BUILD_PROFILE"),
             ")"
         ),
-        protocol_version = kmux_protocol::messages::PROTOCOL_VERSION,
+        protocol_version = %kmux_protocol::messages::PROTOCOL_RANGE,
         "kmux started"
     );
 }

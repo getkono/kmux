@@ -13,7 +13,8 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use kmux_protocol::Compressor;
 use kmux_protocol::TransportKind;
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ConnectionId, ErrorCode, FrontendKind, ServerMessage,
+    ClientCapabilities, ClientId, ConnectionId, ErrorCode, FrontendKind, ProtocolVersion,
+    ServerMessage,
 };
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -89,6 +90,8 @@ pub struct PendingAuth {
     pub hostname: String,
     pub username: String,
     pub capabilities: ClientCapabilities,
+    pub negotiated_protocol: ProtocolVersion,
+    pub negotiated_capabilities: Vec<String>,
     pub connection_id: Option<ConnectionId>,
     /// Client build identity from `Auth` (protocol 37), carried to
     /// `register_client` once the signature is verified.

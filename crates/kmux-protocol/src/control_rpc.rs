@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::dirs::BuildProfile;
+use crate::messages::ProtocolRange;
 use crate::messages::SessionMeta;
 
 /// Canonical argv appended when the client spawns a local daemon.
@@ -47,8 +48,13 @@ pub struct StatusResponse {
     pub uptime_secs: u64,
     #[serde(default)]
     pub session_count: usize,
+    /// Frozen protocol-40 migration sentinel for legacy clients. New clients
+    /// use `protocol_range` below.
     #[serde(default)]
     pub protocol_version: u32,
+    /// Semantic data-plane schema range. `None` identifies a legacy daemon.
+    #[serde(default)]
+    pub protocol_range: Option<ProtocolRange>,
     #[serde(default)]
     pub kmuxd_version: String,
     /// Build fingerprint of the running daemon binary, `<sha>[-dirty]` — lets
@@ -285,7 +291,8 @@ mod tests {
             pid: 4242,
             uptime_secs: 90,
             session_count: 3,
-            protocol_version: 23,
+            protocol_version: crate::messages::LEGACY_PROTOCOL_VERSION,
+            protocol_range: Some(crate::messages::PROTOCOL_RANGE),
             kmuxd_version: "0.2.0".into(),
             kmuxd_build: "abc1234".into(),
             build_profile: None,
@@ -305,7 +312,11 @@ mod tests {
         assert_eq!(back.pid, 4242);
         assert_eq!(back.uptime_secs, 90);
         assert_eq!(back.session_count, 3);
-        assert_eq!(back.protocol_version, 23);
+        assert_eq!(
+            back.protocol_version,
+            crate::messages::LEGACY_PROTOCOL_VERSION
+        );
+        assert_eq!(back.protocol_range, Some(crate::messages::PROTOCOL_RANGE));
         assert_eq!(back.kmuxd_version, "0.2.0");
         assert!(back.build_profile.is_none());
         assert_eq!(back.endpoints.len(), 1);

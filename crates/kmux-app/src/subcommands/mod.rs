@@ -127,15 +127,15 @@ where
 {
     use kmux_protocol::identity::Identity;
     use kmux_protocol::messages::{
-        ClientCapabilities, ClientMessage, FrontendKind, PROTOCOL_VERSION, ServerMessage,
-        version_mismatch_hint,
+        ClientCapabilities, ClientMessage, FrontendKind, ServerMessage, version_mismatch_hint,
     };
     use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
 
     let identity = Identity::load_or_create()?;
     let auth = ClientMessage::Auth {
         token,
-        protocol_version: PROTOCOL_VERSION,
+        protocol_range: kmux_protocol::messages::PROTOCOL_RANGE,
+        protocol_capabilities: kmux_protocol::messages::protocol_capabilities(),
         capabilities: ClientCapabilities::default(),
         connection_id: None,
         public_key: identity.public_key_bytes().to_vec(),

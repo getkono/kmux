@@ -31,6 +31,7 @@ use tokio::net::UnixStream;
 
 use kmux_protocol::control_rpc::{SessionsResponse, StatusResponse};
 use kmux_protocol::dirs::BuildProfile;
+use kmux_protocol::messages::ProtocolRange;
 
 /// Connection parameters returned by the running daemon.
 #[derive(Debug)]
@@ -42,10 +43,11 @@ pub struct DaemonStatus {
     pub uptime_secs: u64,
     pub session_count: usize,
     pub protocol_version: u32,
+    pub protocol_range: Option<ProtocolRange>,
     pub kmuxd_version: String,
     /// Build fingerprint of the running daemon, `<sha>[-dirty]` (empty when the
     /// daemon predates this field). Compared against the client/CLI build to
-    /// surface skew that a matching protocol version alone cannot.
+    /// surface skew that an overlapping protocol range alone cannot.
     pub kmuxd_build: String,
     /// `None` when the daemon predates this field — treated as
     /// unverifiable and therefore rejected by `ensure_compatible_daemon`.
@@ -103,6 +105,7 @@ pub async fn query_daemon() -> Option<DaemonStatus> {
         uptime_secs: resp.uptime_secs,
         session_count: resp.session_count,
         protocol_version: resp.protocol_version,
+        protocol_range: resp.protocol_range,
         kmuxd_version: resp.kmuxd_version,
         kmuxd_build: resp.kmuxd_build,
         build_profile: resp.build_profile,
@@ -119,7 +122,7 @@ pub async fn query_daemon() -> Option<DaemonStatus> {
 /// to the local daemon.
 pub async fn ensure_compatible_daemon() -> anyhow::Result<DaemonStatus> {
     use kmux_protocol::compat::{self, BlockReason};
-    use kmux_protocol::messages::PROTOCOL_VERSION;
+    use kmux_protocol::messages::PROTOCOL_RANGE;
 
     let status = lifecycle::ensure_daemon().await?;
 
@@ -131,22 +134,28 @@ pub async fn ensure_compatible_daemon() -> anyhow::Result<DaemonStatus> {
 
     // One attach-gate policy, defined in `kmux_protocol::compat`; each refusal
     // formats its own hint-rich message.
-    match compat::attach_block(status.protocol_version, status.build_profile) {
+    match compat::attach_block(status.protocol_range, status.build_profile) {
         None => {}
         Some(BlockReason::Protocol) => {
-            let hint = if status.protocol_version < PROTOCOL_VERSION {
+            let daemon_range = status.protocol_range.expect("differing range is present");
+            let hint = if daemon_range.max < PROTOCOL_RANGE.min {
                 "Hint: the running kmuxd is older than kmux. Run `kmux daemon restart` to update it."
             } else {
                 "Hint: the running kmuxd is newer than kmux. Update the kmux client to match."
             };
             anyhow::bail!(
                 "protocol version mismatch: client={}, daemon={} ({})\n{}",
-                PROTOCOL_VERSION,
-                status.protocol_version,
+                PROTOCOL_RANGE,
+                daemon_range,
                 status.kmuxd_version,
                 hint
             );
         }
+        Some(BlockReason::ProtocolUnknown) => anyhow::bail!(
+            "legacy protocol version: daemon={} ({})\nHint: restart the daemon with a current kmuxd build.",
+            status.protocol_version,
+            status.kmuxd_version,
+        ),
         Some(BlockReason::ProfileMismatch) => anyhow::bail!(
             "build profile mismatch: kmux is {client} but the daemon answering on \
              {socket} is {daemon}. Debug and release builds keep separate runtime \
@@ -248,8 +257,7 @@ mod tests {
                 let response = format!(
                     "{{\"status\":\"running\",\"port\":9999,\"token\":\"tok\",\
                      \"pid\":{my_pid},\"uptime_secs\":42,\"session_count\":3,\
-                     \"protocol_version\":{},\"kmuxd_version\":\"0.0.0\"}}\n",
-                    kmux_protocol::messages::PROTOCOL_VERSION
+                     \"protocol_version\":41,\"protocol_range\":{{\"min\":{{\"major\":1,\"minor\":0,\"patch\":0}},\"max\":{{\"major\":1,\"minor\":0,\"patch\":0}}}},\"kmuxd_version\":\"0.0.0\"}}\n"
                 );
                 write_half.write_all(response.as_bytes()).await.unwrap();
             }
@@ -311,9 +319,6 @@ mod tests {
         let listener = UnixListener::bind(&socket_path).unwrap();
 
         let my_pid = std::process::id();
-        // Respond with a mismatched protocol_version.
-        let stale_version = kmux_protocol::messages::PROTOCOL_VERSION.wrapping_sub(1);
-
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let (read_half, mut write_half) = stream.into_split();
@@ -323,7 +328,7 @@ mod tests {
                 let response = format!(
                     "{{\"status\":\"running\",\"port\":9999,\"token\":\"tok\",\
                      \"pid\":{my_pid},\"uptime_secs\":0,\"session_count\":0,\
-                     \"protocol_version\":{stale_version},\"kmuxd_version\":\"0.0.0\"}}\n"
+                     \"protocol_version\":41,\"protocol_range\":{{\"min\":{{\"major\":2,\"minor\":0,\"patch\":0}},\"max\":{{\"major\":2,\"minor\":0,\"patch\":0}}}},\"kmuxd_version\":\"0.0.0\"}}\n"
                 );
                 write_half.write_all(response.as_bytes()).await.unwrap();
             }
@@ -361,8 +366,6 @@ mod tests {
             BuildProfile::Debug => "release",
             BuildProfile::Release => "debug",
         };
-        let proto = kmux_protocol::messages::PROTOCOL_VERSION;
-
         tokio::spawn(async move {
             while let Ok((stream, _)) = listener.accept().await {
                 let (read_half, mut write_half) = stream.into_split();
@@ -372,7 +375,7 @@ mod tests {
                 let response = format!(
                     "{{\"status\":\"running\",\"port\":9999,\"token\":\"tok\",\
                      \"pid\":{my_pid},\"uptime_secs\":0,\"session_count\":0,\
-                     \"protocol_version\":{proto},\"kmuxd_version\":\"0.0.0\",\
+                     \"protocol_version\":41,\"protocol_range\":{{\"min\":{{\"major\":1,\"minor\":0,\"patch\":0}},\"max\":{{\"major\":1,\"minor\":0,\"patch\":0}}}},\"kmuxd_version\":\"0.0.0\",\
                      \"build_profile\":\"{wrong_profile}\"}}\n"
                 );
                 write_half.write_all(response.as_bytes()).await.unwrap();

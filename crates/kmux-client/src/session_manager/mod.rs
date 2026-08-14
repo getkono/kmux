@@ -12,7 +12,7 @@ use std::time::Instant;
 
 use kmux_protocol::messages::{
     ClientCapabilities, ClientId, ClientInfo, ClientMessage, ClosedSessionEntry, PaneId,
-    PaneProcesses, SequenceNo, SessionEntry, TermSize, WordId,
+    PaneProcesses, ProtocolVersion, SequenceNo, SessionEntry, TermSize, WordId,
 };
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -162,6 +162,10 @@ pub struct SessionManager {
 
     /// Server binary version reported in `AuthResult`; populated on successful auth.
     pub server_version: Option<String>,
+    /// Data-plane schema baseline selected during authentication.
+    pub negotiated_protocol: Option<ProtocolVersion>,
+    /// Optional data-plane extensions supported by both peers.
+    pub negotiated_capabilities: Vec<String>,
 
     /// Connection identity assigned by the server. Persists across transport switches
     /// (QUIC ↔ TCP) so the daemon can transfer pane attachments to the new channel.
@@ -247,6 +251,8 @@ impl SessionManager {
             client_id: None,
             metrics: MetricsStore::in_memory(),
             server_version: None,
+            negotiated_protocol: None,
+            negotiated_capabilities: Vec::new(),
             connection_id: None,
             current_transport: TransportKind::Quic,
             last_term_size: TermSize::default(),
@@ -818,6 +824,8 @@ mod tests {
             machine_id: None,
             label: None,
             server_machine_id: None,
+            negotiated_protocol: None,
+            negotiated_capabilities: Vec::new(),
         });
         use super::server_handler::SessionEvent;
         assert!(matches!(events.as_slice(), [SessionEvent::AuthOk]));
@@ -842,6 +850,8 @@ mod tests {
             machine_id: None,
             label: None,
             server_machine_id: None,
+            negotiated_protocol: None,
+            negotiated_capabilities: Vec::new(),
         });
         assert!(matches!(
             events.as_slice(),

@@ -28,8 +28,8 @@ pub struct VersionInfo {
     pub rustc: &'static str,
     /// Cargo profile the binary was built with (`"debug"` / `"release"`).
     pub build_profile: &'static str,
-    /// Client↔daemon wire protocol ([`kmux_protocol::messages::PROTOCOL_VERSION`]).
-    pub protocol: u32,
+    /// Client↔daemon supported wire protocol range.
+    pub protocol: String,
     /// Renderer API version (`kmux_render::KMUX_RENDER_API_VERSION`) — set only by
     /// the GUI frontends that link `kmux-render`; `None` for the toolkit-free CLI
     /// (which doesn't link the renderer, so `kmux -V` omits it).
@@ -50,7 +50,7 @@ impl VersionInfo {
             build_timestamp: env!("BUILD_TIMESTAMP"),
             rustc: env!("BUILD_RUSTC_VERSION"),
             build_profile: env!("BUILD_PROFILE"),
-            protocol: kmux_protocol::messages::PROTOCOL_VERSION,
+            protocol: kmux_protocol::messages::PROTOCOL_RANGE.to_string(),
             render_api: None,
             ffi_abi: None,
         }

@@ -135,9 +135,9 @@ mod tests {
     #[test]
     fn connection_id_serialization_roundtrip() {
         let id = ConnectionId(0xdeadbeef_u64);
-        // Use postcard (the wire codec) for the roundtrip.
-        let bytes = postcard::to_allocvec(&id).unwrap();
-        let decoded: ConnectionId = postcard::from_bytes(&bytes).unwrap();
+        // Use named MessagePack (the wire codec) for the roundtrip.
+        let bytes = rmp_serde::to_vec_named(&id).unwrap();
+        let decoded: ConnectionId = rmp_serde::from_slice(&bytes).unwrap();
         assert_eq!(id, decoded);
     }
 }

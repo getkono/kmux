@@ -182,12 +182,12 @@ pub enum SshError {
     #[error("remote daemon returned malformed JSON: {error}\n  raw output:\n    {raw}")]
     BadProbeJson { error: String, raw: String },
 
-    /// Protocol-version gate: client and remote daemon don't agree.
+    /// Protocol-range gate: client and remote daemon have no common schema.
     #[error(
         "protocol version mismatch: client={client}, server={server} \
-         — update kmuxd or kmux to the same version"
+         — update kmuxd or kmux until their supported ranges overlap"
     )]
-    VersionMismatch { client: u32, server: u32 },
+    VersionMismatch { client: String, server: String },
 
     /// Could not pre-allocate a free local TCP port for the `-L` tunnel.
     #[error("could not allocate a local port for the SSH tunnel: {0}")]

@@ -4,7 +4,7 @@ use std::fmt;
 ///
 /// This enum is **not** serialised in wire messages (only used as `String` in
 /// `ChannelSwitched.old_transport`), so adding variants here is source-only and
-/// does not require a `PROTOCOL_VERSION` bump.
+/// does not touch [`PROTOCOL_RANGE`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TransportKind {
     /// QUIC/UDP transport (preferred; lower latency, multiplexed streams).
@@ -48,94 +48,152 @@ impl TransportKind {
         &["auto", "quic", "tcp-tls", "uds", "tcp"];
 }
 
-/// Current wire protocol version. Bump when the wire format changes.
+/// Semantic version of the named MessagePack data-plane schema.
 ///
-/// The client sends this in `ClientMessage::Auth` and the server rejects
-/// connections whose version does not match exactly. Because the wire codec
-/// (postcard) is positional, any field addition, removal, or reordering in
-/// `ClientMessage` or `ServerMessage` is a breaking change that requires a
-/// bump.
+/// Major versions are breaking. Minor versions may add defaulted fields or
+/// capability-gated messages. Patch versions change no schema semantics. Normal
+/// additive feature work advertises a named capability and therefore does not
+/// edit this shared constant; range changes are deliberate baseline-policy
+/// changes.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    Hash,
+    serde::Serialize,
+    serde::Deserialize,
+)]
+pub struct ProtocolVersion {
+    pub major: u16,
+    pub minor: u16,
+    pub patch: u16,
+}
+
+impl ProtocolVersion {
+    pub const fn new(major: u16, minor: u16, patch: u16) -> Self {
+        Self {
+            major,
+            minor,
+            patch,
+        }
+    }
+}
+
+impl fmt::Display for ProtocolVersion {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}.{}.{}", self.major, self.minor, self.patch)
+    }
+}
+
+/// Inclusive protocol-version range supported by a binary.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ProtocolRange {
+    pub min: ProtocolVersion,
+    pub max: ProtocolVersion,
+}
+
+impl ProtocolRange {
+    /// A range supporting exactly one version.
+    pub const fn exact(version: ProtocolVersion) -> Self {
+        Self {
+            min: version,
+            max: version,
+        }
+    }
+
+    /// Highest version both ranges support, or `None` when they cannot speak.
+    ///
+    /// A range must stay within a single major version: majors are, by
+    /// definition, mutually unintelligible schemas, so a binary cannot claim to
+    /// speak two of them over one connection. A cross-major range is therefore
+    /// treated as unusable rather than silently narrowed.
+    pub fn negotiate(self, other: Self) -> Option<ProtocolVersion> {
+        if self.min.major != self.max.major
+            || other.min.major != other.max.major
+            || self.max.major != other.max.major
+        {
+            return None;
+        }
+        let min = self.min.max(other.min);
+        let max = self.max.min(other.max);
+        (min <= max).then_some(max)
+    }
+}
+
+impl fmt::Display for ProtocolRange {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.min == self.max {
+            self.min.fmt(f)
+        } else {
+            write!(f, "{}..={}", self.min, self.max)
+        }
+    }
+}
+
+/// Newest schema version this build speaks (the top of [`PROTOCOL_RANGE`]).
+pub const PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0, 0);
+/// Oldest schema version this build still accepts from a peer.
+pub const MIN_PROTOCOL_VERSION: ProtocolVersion = ProtocolVersion::new(1, 0, 0);
+/// The range advertised in `Auth` and matched against the peer's.
 ///
-/// # When to bump
+/// Adding a feature does **not** belong here: use a defaulted field or a named
+/// capability. Widening or moving this range is a deliberate baseline-policy
+/// change — see `docs/architecture-protocol-versioning.md`.
+pub const PROTOCOL_RANGE: ProtocolRange = ProtocolRange {
+    min: MIN_PROTOCOL_VERSION,
+    max: PROTOCOL_VERSION,
+};
+
+/// Successor to the retired monotonic `PROTOCOL_VERSION: u32` (which ended at
+/// 40), frozen at 41 and never used for a compatibility decision.
 ///
-/// - Adding, removing, or reordering fields in any message variant.
-/// - Adding new enum variants (postcard encodes variant index as a varint).
-/// - Changing the semantics of an existing field in a way that old code would
-///   misinterpret.
-/// - Changing the wire framing (e.g. the per-frame codec tag added in v23 for
-///   protocol compression — see [`Compression`] and `docs/compression.md`).
+/// It stays in the JSON status/probe output for two reasons: consumers written
+/// against the old integer field keep parsing, and a protocol-40 peer reads 41
+/// as "newer than me" and refuses — instead of decoding a named-map frame with
+/// a positional Postcard decoder.
+pub const LEGACY_PROTOCOL_VERSION: u32 = 41;
+
+/// Per-frame zstd compression of the wire codec (frame codec tag 3).
+pub const CAPABILITY_FRAME_ZSTD: &str = "frame.zstd";
+/// Every optional capability this build implements.
 ///
-/// You do **not** need to bump for purely behavioural changes that leave the
-/// wire format unchanged (e.g. changing server-side timeout values).
+/// Extending this list is the normal way to ship an optional protocol feature:
+/// it is additive, needs no version bump, and appending a name conflicts far
+/// less than editing a shared integer.
+pub const PROTOCOL_CAPABILITIES: &[&str] = &[CAPABILITY_FRAME_ZSTD];
+
+/// Capabilities to offer in `ClientMessage::Auth`.
+pub fn protocol_capabilities() -> Vec<String> {
+    PROTOCOL_CAPABILITIES
+        .iter()
+        .map(|capability| (*capability).to_string())
+        .collect()
+}
+
+/// Intersect a peer's offered capabilities with ours.
 ///
-/// # History
-///
-/// - **23**: per-frame compression — `AuthResult.compression` and the
-///   self-describing frame codec tag.
-/// - **24**: connection pausing — `ClientMessage::SetPaused` (issue #68).
-/// - **25**: daemon federation — `ClientMessage::OpenPeer`/`ClosePeer`,
-///   `ServerMessage::PeerOpened`/`PeerClosed`/`PeerError`, and the `PeerTarget`
-///   addressing struct (issue #121).
-/// - **26**: `PeerTarget` becomes an enum with a `Direct { host, port, token }`
-///   TCP+TLS endpoint alongside `Ssh { .. }`, for LAN / same-host federation
-///   without SSH (issue #121).
-/// - **27**: federated session attribution and peer-routed creation —
-///   `SessionEntry.peer` (which machine a listed session lives on) and
-///   `ClientMessage::SessionCreate.peer` (create on a connected remote), for the
-///   unified session launcher (issue #121).
-/// - **28**: OSC 9;4 progress reporting — `PaneInfo.progress_state`/`progress`
-///   (carried in the snapshot so late clients see the current bar) and the
-///   `SessionEventMsg::PaneProgressChanged` event (issue #125).
-/// - **29**: cross-session process overview — `ClientMessage::ProcessOverview`
-///   and `ServerMessage::ProcessOverviewResult` carrying per-pane process trees
-///   (`PaneProcesses` / `ProcessSample`), federated across peers (issue #122).
-/// - **30**: `SessionEventMsg::PaneFaulted` — an isolated VT worker crashed and
-///   is being respawned; the shell survives (issue #126, process isolation).
-/// - **31**: removed the unused singular `ClientMessage::PtyKey`; clients only
-///   ever send `PtyKeyBatch` (a batch subsumes the single-key case).
-/// - **32**: reason-aware connection pause — `ClientMessage::SetPaused` gains an
-///   `auto` flag and a new `ClientMessage::SetPaneNoAutoPause` exempts a pane
-///   from auto-pause, so a backgrounded client can keep streaming chosen panes
-///   while pausing the rest (issue #68).
-/// - **33**: cryptographic identity + client management (issue #146).
-///   `ClientMessage::Auth` carries `public_key`/`hostname`/`username`; a
-///   challenge–response handshake adds `ServerMessage::AuthChallenge` and
-///   `ClientMessage::AuthProof`; `AuthResult` carries `machine_id`/`label`/
-///   `server_machine_id`. New `ClientMessage::ClientList`/`KickClient`,
-///   `ServerMessage::ClientListResult`/`ClientKicked`/`SessionKicked`, and the
-///   `ClientInfo` struct expose listing and per-connection kicking of clients.
-/// - **34**: restore closed sessions (issue #64). New
-///   `ClientMessage::SessionListClosed`/`SessionRestore` and
-///   `ServerMessage::ClosedSessionListResult` (carrying `ClosedSessionEntry`)
-///   let clients list and restore sessions retained in the daemon's graveyard.
-/// - **35**: Claude Code integration (issue #169). New `ClientMessage::Notify`
-///   lets a program inside a pane request a desktop notification; the daemon
-///   broadcasts `SessionEventMsg::PaneAttention` (carrying an `AttentionKind`
-///   and a server-assigned `attention_id` for client-side dedup) and replies
-///   `ServerMessage::NotifyAccepted`.
-/// - **36**: grid desync oracle. New `ServerMessage::GridDigest` carries a
-///   checksum of the daemon's authoritative grid at a seqno; a client verifies
-///   its reconstructed grid against it and resyncs on mismatch, so silent
-///   diff-stream corruption becomes a detected, self-healing event.
-/// - **37**: client build identity. `ClientMessage::Auth` carries the frontend
-///   kind plus the client binary's git sha / dirty flag / build profile; the
-///   daemon records them per connection so `ClientInfo` (hence `kmux clients`)
-///   and the new `kmux client status` surface client↔daemon build skew that a
-///   matching protocol version alone cannot.
-/// - **38**: remote daemon logs (issue #187). New `ClientMessage::FetchLogs`
-///   asks the daemon to stream its own log file over the data plane; the daemon
-///   replies with one or more `ServerMessage::LogChunk` and a terminating
-///   `ServerMessage::LogEnd` (or streams chunks indefinitely under `follow`), so
-///   `kmux daemon logs --server <host>` works across machines.
-pub const PROTOCOL_VERSION: u32 = 40;
+/// Names we do not know are ignored, never rejected: an older peer must be able
+/// to talk to a newer one that offers extensions it has never heard of.
+pub fn negotiate_capabilities(offered: &[String]) -> Vec<String> {
+    PROTOCOL_CAPABILITIES
+        .iter()
+        .filter(|ours| offered.iter().any(|theirs| theirs == *ours))
+        .map(|capability| (*capability).to_string())
+        .collect()
+}
 
 /// Wire compression algorithm negotiated for a connection.
 ///
 /// The daemon decides per connection whether to compress (see
 /// `docs/compression.md`) and echoes the chosen algorithm in
-/// [`ServerMessage::AuthResult`](crate::messages::ServerMessage). Because the
-/// exact-match `PROTOCOL_VERSION` handshake already guarantees both peers share
-/// an identical codec set, only the *policy* is negotiated, never *support*.
+/// [`ServerMessage::AuthResult`](crate::messages::ServerMessage). The
+/// [`CAPABILITY_FRAME_ZSTD`] handshake establishes that both peers *support* the
+/// codec; this enum then carries the daemon's per-connection *policy*.
 ///
 /// The level used by the compressor is a sender-side choice and is intentionally
 /// not on the wire — the decompressor reconstructs it from the zstd frame.
@@ -150,19 +208,13 @@ pub enum Compression {
 ///
 /// Expected format: `"protocol version mismatch: client=X, server=Y"`.
 pub fn version_mismatch_hint(reason: &str) -> &'static str {
-    if let Some(rest) = reason.strip_prefix("protocol version mismatch: client=") {
-        let parts: Vec<&str> = rest.splitn(2, ", server=").collect();
-        if parts.len() == 2
-            && let (Ok(client_v), Ok(server_v)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>())
-        {
-            return if client_v < server_v {
-                "Hint: your client is older than the server. Update kmux to match."
-            } else {
-                "Hint: your client is newer than the server. Update kmuxd to match."
-            };
-        }
+    if reason.starts_with("protocol version mismatch:") {
+        "Hint: update kmux and kmuxd until their supported protocol ranges overlap."
+    } else if reason.starts_with("legacy protocol version:") {
+        "Hint: update the legacy kmux or kmuxd binary before connecting."
+    } else {
+        ""
     }
-    ""
 }
 
 /// Return the current wall-clock time as milliseconds since the Unix epoch.
@@ -238,28 +290,51 @@ mod tests {
     }
 
     #[test]
-    fn version_mismatch_hint_reports_direction_and_boundary() {
-        assert!(
-            version_mismatch_hint("protocol version mismatch: client=12, server=13")
-                .contains("older")
-        );
-        assert!(
-            version_mismatch_hint("protocol version mismatch: client=14, server=13")
-                .contains("newer")
-        );
-        // Boundary: equal versions are not "older" (the comparison is strict <),
-        // so the hint falls to the newer-client branch.
-        assert!(
-            version_mismatch_hint("protocol version mismatch: client=13, server=13")
-                .contains("newer")
-        );
+    fn version_mismatch_hint_classifies_the_failure() {
+        let hint = version_mismatch_hint("protocol version mismatch: client=1.0.0, server=2.0.0");
+        assert!(hint.contains("ranges overlap"));
         // A reason that is not a version mismatch yields no hint.
         assert_eq!(version_mismatch_hint("connection refused"), "");
-        // Malformed (unparseable) versions also yield no hint.
-        assert_eq!(
-            version_mismatch_hint("protocol version mismatch: client=x, server=y"),
-            ""
+        // Formatting details do not suppress the safe range-overlap guidance.
+        assert!(
+            version_mismatch_hint("protocol version mismatch: client=x, server=y")
+                .contains("ranges overlap")
         );
+    }
+
+    #[test]
+    fn protocol_range_negotiates_highest_overlap() {
+        let ours = ProtocolRange {
+            min: ProtocolVersion::new(1, 1, 0),
+            max: ProtocolVersion::new(1, 4, 0),
+        };
+        let theirs = ProtocolRange {
+            min: ProtocolVersion::new(1, 2, 0),
+            max: ProtocolVersion::new(1, 3, 0),
+        };
+        assert_eq!(ours.negotiate(theirs), Some(ProtocolVersion::new(1, 3, 0)));
+    }
+
+    #[test]
+    fn protocol_range_rejects_disjoint_and_cross_major_ranges() {
+        let current = ProtocolRange::exact(ProtocolVersion::new(1, 0, 0));
+        assert_eq!(
+            current.negotiate(ProtocolRange::exact(ProtocolVersion::new(1, 1, 0))),
+            None
+        );
+        assert_eq!(
+            current.negotiate(ProtocolRange::exact(ProtocolVersion::new(2, 0, 0))),
+            None
+        );
+    }
+
+    #[test]
+    fn capability_negotiation_ignores_unknown_extensions() {
+        let offered = vec![
+            CAPABILITY_FRAME_ZSTD.to_string(),
+            "future.example".to_string(),
+        ];
+        assert_eq!(negotiate_capabilities(&offered), protocol_capabilities());
     }
 
     #[test]

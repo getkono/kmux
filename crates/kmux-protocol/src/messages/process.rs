@@ -32,7 +32,7 @@ pub struct ProcessSample {
     // TODO(#122): add `gpu_percent` / `gpu_mem_bytes` once a per-process GPU API
     // is available (NVML on NVIDIA/Linux; macOS has no public per-process GPU
     // API). Deferred deliberately so this surface stays cross-platform; adding
-    // the fields later is a `PROTOCOL_VERSION` bump.
+    // defaulted fields later is a schema-compatible change.
 }
 
 /// The process tree of a single pane: the pane's PTY child (the shell) plus all
@@ -65,8 +65,8 @@ mod tests {
             cpu_percent: 12.5,
             mem_bytes: 34_000_000,
         };
-        let bytes = postcard::to_allocvec(&sample).expect("serialize");
-        let decoded: ProcessSample = postcard::from_bytes(&bytes).expect("deserialize");
+        let bytes = rmp_serde::to_vec_named(&sample).expect("serialize");
+        let decoded: ProcessSample = rmp_serde::from_slice(&bytes).expect("deserialize");
         assert_eq!(decoded, sample);
     }
 
@@ -94,8 +94,8 @@ mod tests {
                 },
             ],
         };
-        let bytes = postcard::to_allocvec(&pane).expect("serialize");
-        let decoded: PaneProcesses = postcard::from_bytes(&bytes).expect("deserialize");
+        let bytes = rmp_serde::to_vec_named(&pane).expect("serialize");
+        let decoded: PaneProcesses = rmp_serde::from_slice(&bytes).expect("deserialize");
         assert_eq!(decoded, pane);
     }
 
@@ -106,8 +106,8 @@ mod tests {
             root_pid: None,
             processes: vec![],
         };
-        let bytes = postcard::to_allocvec(&pane).expect("serialize");
-        let decoded: PaneProcesses = postcard::from_bytes(&bytes).expect("deserialize");
+        let bytes = rmp_serde::to_vec_named(&pane).expect("serialize");
+        let decoded: PaneProcesses = rmp_serde::from_slice(&bytes).expect("deserialize");
         assert_eq!(decoded, pane);
         assert!(decoded.processes.is_empty());
         assert_eq!(decoded.root_pid, None);

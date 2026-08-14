@@ -43,7 +43,8 @@ bitflags = { workspace = true, features = ["serde"] }
 nix = { workspace = true, features = ["net", "user", "hostname"] }
 tokio-rustls = { workspace = true, optional = true }
 serde.workspace = true
-postcard.workspace = true
+rmp-serde.workspace = true
+serde_bytes.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 tokio = { workspace = true, optional = true }
