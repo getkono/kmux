@@ -49,6 +49,10 @@ jobs:
           path-to-signatures: 'signatures/version1/cla.json'
           # Unprotected on purpose — see the note at the top of this file.
           branch: 'cla-signatures'
-          # Bots and maintainers who hold copyright do not need to sign.
-          # Add maintainer GitHub usernames here as the team grows.
-          allowlist: 'dependabot[bot],*[bot]'
+          # Bots and maintainers who hold copyright do not need to sign — the
+          # CLA grants rights *to* Kono, so a Kono maintainer signing it is a
+          # no-op. Add maintainer GitHub usernames here as the team grows.
+          # Entries match the committer's GitHub login (or the raw git author
+          # name when a commit is not linked to an account); an entry
+          # containing `*` is treated as a glob.
+          allowlist: 'justin13888,dependabot[bot],*[bot]'
