@@ -88,7 +88,11 @@ These are strictly-typed config/CLI, not environment variables.
 - Conventional commits (`type: description`), enforced by the `commit-msg` +
   `pre-push` hk hooks and CI via `convco` (escape hatch: `git commit --no-verify`;
   check a range manually with `mise run commit-check <base>..HEAD`).
-- `thiserror` for error types, `anyhow` for application-level errors.
+- `thiserror` for error types, `anyhow` for application-level errors. Which
+  crate to use for every other job, where a version may be declared, and how
+  optional deps are feature-gated are normative in
+  [docs/crate-usage.md](docs/crate-usage.md) — read it before adding, removing,
+  or upgrading a dependency.
 
 ## Correctness (IMPORTANT!)
 
