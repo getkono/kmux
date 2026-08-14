@@ -1519,7 +1519,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "tracing",
 ]
@@ -1529,8 +1528,6 @@ name = "kmux-connect"
 version = "0.2.0"
 dependencies = [
  "anyhow",
- "bitflags",
- "futures",
  "kmux-protocol",
  "nix",
  "quinn",
@@ -1627,8 +1624,6 @@ dependencies = [
  "serde",
  "thiserror 2.0.18",
  "tokio",
- "tokio-test",
- "tracing",
 ]
 
 [[package]]
@@ -1642,7 +1637,6 @@ dependencies = [
  "kmux-client",
  "kmux-protocol",
  "pollster",
- "raw-window-handle",
  "swash",
  "thiserror 2.0.18",
  "tracing",
@@ -1682,7 +1676,6 @@ dependencies = [
  "nix",
  "postcard",
  "serde",
- "thiserror 2.0.18",
  "tokio",
 ]
 
@@ -1705,14 +1698,11 @@ dependencies = [
  "postcard",
  "quinn",
  "rand 0.10.1",
- "rcgen",
  "rustls",
- "rustls-pemfile",
  "serde",
  "serde_json",
  "sysinfo",
  "tempfile",
- "thiserror 2.0.18",
  "tokio",
  "toml 1.1.2+spec-1.1.0",
  "tracing",
@@ -3279,28 +3269,6 @@ checksum = "1729aa945f29d91ba541258c8df89027d5792d85a8841fb65e8bf0f4ede4ef61"
 dependencies = [
  "rustls",
  "tokio",
-]
-
-[[package]]
-name = "tokio-stream"
-version = "0.1.18"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32da49809aab5c3bc678af03902d4ccddea2a87d028d86392a4b1560c6906c70"
-dependencies = [
- "futures-core",
- "pin-project-lite",
- "tokio",
-]
-
-[[package]]
-name = "tokio-test"
-version = "0.4.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6d24790a10a7af737693a3e8f1d03faef7e6ca0cc99aae5066f533766de545"
-dependencies = [
- "futures-core",
- "tokio",
- "tokio-stream",
 ]
 
 [[package]]

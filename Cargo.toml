@@ -45,7 +45,6 @@ clap = { version = "4.6.1", features = ["derive", "unstable-ext"] }
 # `unstable-dynamic` and clap's `unstable-ext` track clap's minor version, so
 # keep this tilde-pinned in lockstep with clap (4.6.x). See docs/shell-completion.md.
 clap_complete = { version = "~4.6", features = ["unstable-dynamic"] }
-arboard = { version = "3", default-features = false }
 futures = "0.3"
 daemonize = "0.5"
 nix = { version = "0.31", features = ["fs", "net", "process", "signal", "socket", "term", "uio", "user"] }
@@ -83,6 +82,10 @@ tokio = { version = "1.52.1", features = ["full"] }
 tokio-rustls = { version = "0.26", default-features = false, features = ["ring", "tls12", "logging"] }
 toml = "1.1.2"
 tabled = "0.20.0"
+# Cross-platform process stats (CPU/memory) for the process overview (issue
+# #122). `default-features = false` drops the disk/network/component probes we
+# never query. Server-side only (kmuxd).
+sysinfo = { version = "0.33", default-features = false, features = ["system"] }
 # The `log` facade. kmux logs through `tracing`, not `log`; this is only so
 # `init_logging` can cap tracing-subscriber's `tracing-log` bridge (see
 # crates/kmux-app/src/launch.rs) and silence uniffi 0.28's per-FFI-call
@@ -94,17 +97,24 @@ uniffi = "0.28"
 zstd = "0.13"
 
 # GPU terminal rendering (kmux-render). Optional: only compiled when a frontend
-# enables its `gpu` feature. wgpu pins raw-window-handle 0.6; swash/etagere/fontdb
-# back the glyph atlas and font metrics. Versions verified to resolve on the
-# pinned rust 1.96.0 toolchain.
+# enables its `gpu` feature. swash/etagere/fontdb back the glyph atlas and font
+# metrics. Versions verified to resolve on the pinned rust 1.96.0 toolchain.
 wgpu = "29"
-raw-window-handle = "0.6"
 swash = "0.2"
 etagere = "0.3"
 fontdb = "0.23"
 bytemuck = { version = "1", features = ["derive"] }
 pollster = "0.4"
 
+# The GTK4 + libadwaita desktop stack (kmux-gtk). Target-gated by the member to
+# Linux + macOS, where the system packages exist; the pins live here anyway so
+# every external version has exactly one home. See docs/crate-usage.md.
+gtk4 = "0.9"
+adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
+pangocairo = "0.20"
+# fontconfig, via pango. Used to register the bundled symbol fallback font at
+# startup so Pango resolves Powerline/Nerd glyphs on the Cairo path (issue #145).
+fontconfig-sys = { package = "yeslogic-fontconfig-sys", version = "6" }
+
 # Dev dependencies
 tempfile = "3"
-tokio-test = "0.4"

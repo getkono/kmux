@@ -42,10 +42,10 @@ futures.workspace = true
 # two targets keeps the crate buildable on other OSes, where `src/main.rs`
 # compiles to a tiny stub binary.
 [target.'cfg(any(target_os = "linux", target_os = "macos"))'.dependencies]
-gtk4 = "0.9"
-adw = { package = "libadwaita", version = "0.7", features = ["v1_5"] }
-pangocairo = "0.20"
+gtk4.workspace = true
+adw.workspace = true
+pangocairo.workspace = true
 # Register the bundled symbol fallback font with fontconfig at startup so Pango's
 # automatic font fallback resolves Powerline/Nerd glyphs on the Cairo path (issue
 # #145). fontconfig is always present wherever GTK builds (pango links it).
-fontconfig-sys = { package = "yeslogic-fontconfig-sys", version = "6" }
+fontconfig-sys.workspace = true

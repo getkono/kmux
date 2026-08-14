@@ -9,15 +9,10 @@ publish.workspace = true
 description = "PTY management for kmux."
 
 [features]
-tracing = ["dep:tracing"]
 serde = ["dep:serde"]
 
 [dependencies]
 tokio.workspace = true
 nix.workspace = true
 thiserror.workspace = true
-tracing = { workspace = true, optional = true }
 serde = { workspace = true, optional = true }
-
-[dev-dependencies]
-tokio-test.workspace = true
