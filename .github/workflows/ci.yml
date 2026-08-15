@@ -253,7 +253,7 @@ jobs:
         run: mise run fmt-check
 
       - name: Clippy (kmux entrypoint + kmux-ffi + the client stack it wraps)
-        run: cargo clippy -p kmux -p kmux-ffi -p kmux-app -p kmux-client -p kmux-protocol -- -D warnings
+        run: cargo clippy -p kmux -p kmux-ffi -p kmux-app -p kmux-client -p kmux-protocol -p kmux-sys -- -D warnings
 
       - name: Build kmux + kmux-gtk (native GTK on macOS)
         run: cargo build -p kmux -p kmux-gtk

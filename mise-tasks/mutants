@@ -80,9 +80,29 @@ run_group() {
     cargo mutants --config "$config" -o "mutants.out/$name" "${pkgs[@]}" || true
 }
 
+# cargo-mutants creates its output directory but not the parent, so a fresh
+# checkout fails all three groups with "create output parent directory ... No
+# such file or directory" -- which `|| true` then swallows into a cheerful
+# "Sweep complete". Only the mutation gate noticed, by finding no outcomes.
+mkdir -p mutants.out
+
 run_group lib      .cargo/mutants.toml          "${LIB_CRATES[@]}"
 run_group bin      .cargo/mutants-bin.toml      "${BIN_CRATES[@]}"
 run_group bin-fast .cargo/mutants-bin-fast.toml "${BIN_FAST_CRATES[@]}"
 
 echo
-echo "Sweep complete. Per-group results under mutants.out/{lib,bin,bin-fast}/."
+# Say what is actually there. A group that failed to start leaves no
+# outcomes.json, and claiming a complete sweep over it is how a fabricated
+# result gets read as a real one.
+produced=()
+for g in lib bin bin-fast; do
+    [[ -f "mutants.out/$g/outcomes.json" ]] && produced+=("$g")
+done
+if [[ ${#produced[@]} -eq 3 ]]; then
+    echo "Sweep complete. Per-group results under mutants.out/{lib,bin,bin-fast}/."
+else
+    echo "Sweep INCOMPLETE: outcomes for [${produced[*]:-none}] only." >&2
+    echo "Run \`mise run mutants-gate\` to judge what there is; the missing groups" >&2
+    echo "did not start, so nothing can be concluded about their crates." >&2
+    exit 1
+fi

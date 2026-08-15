@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 #MISE description="Judge a cargo-mutants sweep: reject implausible results, then hold survivors against the baseline."
 #USAGE flag "--write" help="record the measured survivor counts as the new budget"
-#USAGE arg "<dir>" help="cargo-mutants output directory; defaults to whichever of mutants.out/{lib,bin,bin-fast} exist" var=true default=""
+#
+# Positional args are cargo-mutants output directories. Not declared with
+# `#USAGE arg` because `var=true` plus `default=""` is not valid usage KDL and
+# mise warns on every invocation; the default is computed below instead.
 #
 # `mise run mutants` writes one directory per crate-group; a scoped run writes
 # mutants.out directly. Either is fine — the gate merges whatever it is given.

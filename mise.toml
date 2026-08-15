@@ -30,7 +30,7 @@ hk = "1.48.0"
 # it vendors libgit2 with no openssl/system deps (just a C compiler); mise caches
 # the compiled binary like cargo-mutants above.
 "cargo:convco" = "0.6.4"
-"aqua:EmbarkStudios/cargo-deny" = "0.18.5"
+"aqua:EmbarkStudios/cargo-deny" = "0.20.2"
 "cargo:cargo-machete" = "0.9.1"
 
 [settings]
