@@ -77,7 +77,9 @@ fn forward(level: VtLogLevel, scope: &str, msg: &str) {
     let key = hasher.finish();
 
     let emit = {
-        let mut counts = dedup().lock().unwrap_or_else(|e| e.into_inner());
+        let mut counts = dedup()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         classify(&mut counts, key)
     };
 

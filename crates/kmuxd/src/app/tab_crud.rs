@@ -156,7 +156,7 @@ impl ServerApp {
             }
             state.tabs.retain(|t| t.tab_index != tab_index);
             if state.active_tab == tab_index {
-                state.active_tab = state.tabs.first().map(|t| t.tab_index).unwrap_or(0);
+                state.active_tab = state.tabs.first().map_or(0, |t| t.tab_index);
             }
             if state.tabs.is_empty() {
                 let word = word_id.to_string();

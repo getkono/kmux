@@ -424,7 +424,7 @@ impl FrontendDriver {
 
     /// Extract per-diff timing from a drained batch for the tearing detector and
     /// frame trace (issue #72). Returns `(applied, tick_cells)` where `applied`
-    /// is every seqno/sent_at/ops applied this tick and `tick_cells` is, per
+    /// is every `seqno/sent_at/ops` applied this tick and `tick_cells` is, per
     /// pane, the `(min, max)` `sent_at_ms` over cell diffs with `>= tear_min_ops`
     /// ops (the ones that count as logical-frame content).
     fn collect_tick_diagnostics(

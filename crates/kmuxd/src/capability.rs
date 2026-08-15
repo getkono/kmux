@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use kmux_protocol::messages::ClientCapabilities;
 
-/// Compute the kitty feature flags for a pane's backend by ANDing all
+/// Compute the kitty feature flags for a pane's backend by `ANDing` all
 /// attached clients' declared capabilities.
 ///
 /// Returns `(kitty_graphics, kitty_keyboard)`.

@@ -48,13 +48,12 @@ pub async fn connect(
     capabilities: ClientCapabilities,
     connection_id: Option<ConnectionId>,
 ) -> ConnectResult {
-    let addr = match format!("{host}:{port}")
+    let Some(addr) = format!("{host}:{port}")
         .to_socket_addrs()
         .ok()
         .and_then(|mut it| it.next())
-    {
-        Some(a) => a,
-        None => return ConnectResult::Failed(format!("cannot resolve {host}:{port}")),
+    else {
+        return ConnectResult::Failed(format!("cannot resolve {host}:{port}"));
     };
 
     let client_config = match build_quinn_client_config(&host, port, accept_invalid_certs) {
@@ -141,9 +140,9 @@ pub async fn connect(
             match conn.accept_uni().await {
                 Ok(mut uni) => {
                     let tx = uni_server_tx.clone();
-                    let permit = match Arc::clone(&sem).acquire_owned().await {
-                        Ok(p) => p,
-                        Err(_) => break, // semaphore closed
+                    // An acquire error means the semaphore is closed.
+                    let Ok(permit) = Arc::clone(&sem).acquire_owned().await else {
+                        break;
                     };
                     tokio::spawn(async move {
                         let _permit = permit; // held until task exits

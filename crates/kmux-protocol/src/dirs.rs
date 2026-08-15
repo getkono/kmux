@@ -223,7 +223,7 @@ impl Dirs {
 
     /// The client-side spawn lock.
     ///
-    /// `kmux-connect` flocks this file (LOCK_EX | LOCK_NB) to gate concurrent
+    /// `kmux-connect` flocks this file (`LOCK_EX` | `LOCK_NB`) to gate concurrent
     /// `kmux` invocations from racing to spawn a daemon. Distinct from
     /// [`Dirs::pid_path`] because `daemonize` also flocks the pid file from inside
     /// kmuxd's grandchild — sharing one file would self-deadlock.

@@ -89,7 +89,7 @@ impl SessionManager {
     /// Remove a named session and initiate graceful shutdown in the background.
     ///
     /// Returns immediately without waiting for the process to exit. The process
-    /// receives SIGTERM and will be SIGKILLed after the grace period if needed.
+    /// receives SIGTERM and will be `SIGKILLed` after the grace period if needed.
     pub async fn close_nowait(&self, name: &str) -> Result<()> {
         let session = {
             let mut sessions = self.sessions.lock().await;

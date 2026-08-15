@@ -236,11 +236,13 @@ async fn create_session_with_recorded_child(token: &str, cwd: &Path, pidfile: &P
 }
 
 /// B1: a real cross-process `restart` migrates the live shell — same process, new
-/// daemon — exercising spawn_successor → SCM_RIGHTS → restore_with_handoff.
+/// daemon — exercising `spawn_successor` → `SCM_RIGHTS` → `restore_with_handoff`.
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
 async fn live_restart_preserves_running_shell_across_processes() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     set_xdg(tmp.path());
     let cleanup = Cleanup::default();
@@ -309,7 +311,9 @@ async fn live_restart_preserves_running_shell_across_processes() {
 async fn in_place_binary_swap_still_hands_off() {
     use std::os::unix::fs::PermissionsExt;
 
-    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     set_xdg(tmp.path());
     let cleanup = Cleanup::default();

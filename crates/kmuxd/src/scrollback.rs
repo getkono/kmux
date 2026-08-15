@@ -9,7 +9,7 @@ use kmux_protocol::messages::{SequenceNo, TerminalDiff};
 /// evicted from the front. The live `TermState` surface is the authoritative
 /// snapshot -- no keyframes are stored here.
 pub struct DiffBuffer {
-    /// Each entry stores (seqno, diff, cached_estimated_size).
+    /// Each entry stores (seqno, diff, `cached_estimated_size`).
     diffs: VecDeque<(SequenceNo, Arc<TerminalDiff>, usize)>,
     total_estimated_size: usize,
     capacity: usize,

@@ -90,7 +90,7 @@ pub enum CellAdjust {
 
 impl Default for CellAdjust {
     fn default() -> Self {
-        CellAdjust::Pixels(0.0)
+        Self::Pixels(0.0)
     }
 }
 
@@ -112,8 +112,8 @@ impl CellAdjust {
     /// Apply this adjustment to a measured base dimension.
     pub fn apply(self, base: f64) -> f64 {
         match self {
-            CellAdjust::Pixels(px) => base + px as f64,
-            CellAdjust::Percent(p) => base * (1.0 + p as f64 / 100.0),
+            Self::Pixels(px) => base + px as f64,
+            Self::Percent(p) => base * (1.0 + p as f64 / 100.0),
         }
     }
 }

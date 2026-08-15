@@ -30,8 +30,8 @@ impl ServerKind {
     /// internal protocol/test path rather than a launcher option.
     pub fn to_peer_target(&self, accept_invalid_certs: bool) -> Option<PeerTarget> {
         match self {
-            ServerKind::Local => None,
-            ServerKind::Ssh {
+            Self::Local => None,
+            Self::Ssh {
                 user,
                 host,
                 ssh_port,

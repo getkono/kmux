@@ -272,7 +272,9 @@ async fn grid_text_until(
 /// A missing reply blocks the child forever and this times out.
 #[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global env for the whole test
 async fn assert_dsr_roundtrip(isolation: Option<&str>) {
-    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     set_xdg(tmp.path());
 

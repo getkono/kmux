@@ -158,8 +158,7 @@ fn select_target<'a>(windows: &'a [WindowEntry], word_id: &str) -> Option<&'a Wi
     let visible: Vec<&WindowEntry> = windows.iter().filter(|e| e.window.is_visible()).collect();
     let shows = |e: &WindowEntry| {
         e.fe.upgrade()
-            .map(|fe| fe.borrow().core.mgr.active_session() == Some(word_id))
-            .unwrap_or(false)
+            .is_some_and(|fe| fe.borrow().core.mgr.active_session() == Some(word_id))
     };
     visible
         .iter()

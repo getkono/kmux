@@ -3,7 +3,7 @@
 //! Aggregates the local daemon (`kmuxd`), the GUI client singleton
 //! (`kmux-swift` / `kmux-gtk`), this CLI, and any isolated per-pane VT workers
 //! into a single report, classifying compatibility through the shared
-//! [`kmux_protocol::compat`] SSoT. `kmux daemon status` and `kmux client status`
+//! [`kmux_protocol::compat`] `SSoT`. `kmux daemon status` and `kmux client status`
 //! remain the scoped, detailed views; this is the at-a-glance overview.
 //!
 //! Exit code: non-zero when the daemon is not running or a *blocking*
@@ -243,7 +243,7 @@ pub async fn run_status(format: OutputFormat) -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Skew warnings, classified through the shared `compat` SSoT. The same
+/// Skew warnings, classified through the shared `compat` `SSoT`. The same
 /// dimensions `kmux client status` reports, phrased for the overview.
 fn collect_warnings(
     daemon: Option<&kmux_client::daemon::DaemonStatus>,
@@ -268,7 +268,7 @@ fn collect_warnings(
         warnings.push(format!(
             "profile skew: CLI {} vs daemon {}.",
             BuildProfile::CURRENT,
-            d.build_profile.map(|p| p.as_str()).unwrap_or("<unknown>"),
+            d.build_profile.map_or("<unknown>", BuildProfile::as_str),
         ));
     }
     if compat::build_match(&d.kmuxd_build, cli_build) == Match3::Differ {

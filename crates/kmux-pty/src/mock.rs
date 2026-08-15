@@ -26,10 +26,10 @@ impl MockPty {
     ///
     /// Returns `(pty, handle)` where `pty` is used by the code under test
     /// and `handle` is used by the test to inject/inspect data.
-    pub fn new() -> (MockPty, MockPtyHandle) {
+    pub fn new() -> (Self, MockPtyHandle) {
         let (pty_side, test_side) = duplex(65536);
         (
-            MockPty { stream: pty_side },
+            Self { stream: pty_side },
             MockPtyHandle { stream: test_side },
         )
     }

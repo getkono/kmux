@@ -83,7 +83,5 @@ pub(super) fn resolve_cwd(desired: &Path) -> PathBuf {
 
 /// Return the user's home directory, falling back to `/`.
 pub(super) fn home_dir() -> PathBuf {
-    std::env::var_os("HOME")
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/"))
+    std::env::var_os("HOME").map_or_else(|| PathBuf::from("/"), PathBuf::from)
 }

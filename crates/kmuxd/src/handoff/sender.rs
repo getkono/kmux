@@ -150,7 +150,7 @@ pub async fn run(app: &Arc<ServerApp>) -> anyhow::Result<()> {
 fn spawn_successor() -> anyhow::Result<()> {
     let exe = resolve_successor_exe(
         std::env::current_exe().context("resolving current executable")?,
-        |p| p.exists(),
+        std::path::Path::exists,
     )?;
     let mut args: Vec<&str> = DAEMON_BOOT_ARGS.to_vec();
     args.push("--handoff");

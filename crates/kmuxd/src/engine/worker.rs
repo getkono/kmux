@@ -87,7 +87,7 @@ impl WorkerEngine {
         kitty_keyboard: bool,
         master_fd: OwnedFd,
         fanout: WorkerFanout,
-    ) -> anyhow::Result<WorkerEngine> {
+    ) -> anyhow::Result<Self> {
         let (daemon_end, worker_end) =
             std::os::unix::net::UnixStream::pair().context("worker socketpair")?;
         let worker_raw = worker_end.as_raw_fd();
@@ -166,7 +166,7 @@ impl WorkerEngine {
         let child_pid = child.id();
         let supervisor = tokio::spawn(supervise(sock_rd, child, mirror.clone(), fanout));
 
-        Ok(WorkerEngine {
+        Ok(Self {
             req_tx,
             mirror,
             child_pid,

@@ -106,7 +106,7 @@ pub fn sync(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
         let active = mgr.active_tab().map(|t| t.to_string()).unwrap_or_default();
         let word = mgr
             .active_session()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .unwrap_or_default();
         let want: Vec<(String, String)> = mgr
             .active_session_tabs()

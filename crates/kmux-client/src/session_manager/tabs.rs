@@ -55,8 +55,7 @@ impl SessionManager {
         self.active_session
             .as_ref()
             .and_then(|w| self.session_list.iter().find(|e| e.meta.word_id == *w))
-            .map(|e| e.tabs.as_slice())
-            .unwrap_or(&[])
+            .map_or(&[][..], |e| e.tabs.as_slice())
     }
 
     /// The cached layout tree of `(word_id, tab_index)`.
@@ -106,8 +105,7 @@ impl SessionManager {
             let changed = self
                 .pane_sizes
                 .get(&pane_id)
-                .map(|s| s.rows != size.rows || s.cols != size.cols)
-                .unwrap_or(true);
+                .is_none_or(|s| s.rows != size.rows || s.cols != size.cols);
             self.pane_sizes.insert(pane_id.clone(), size);
             if changed && self.pane_sync.contains_key(&pane_id) {
                 self.send_ws(ClientMessage::Resize { pane_id, size });
@@ -315,7 +313,7 @@ impl SessionManager {
         let Some(focused) = self.active_pane.as_deref().and_then(pane_index) else {
             return;
         };
-        let Some(leaves) = self.tab_layout(&word_id, tab_index).map(|l| l.leaves()) else {
+        let Some(leaves) = self.tab_layout(&word_id, tab_index).map(LayoutNode::leaves) else {
             return;
         };
         if leaves.len() < 2 {

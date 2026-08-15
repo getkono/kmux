@@ -1046,9 +1046,7 @@ const MAX_DIR_ENTRIES: usize = 2000;
 /// beyond normal filesystem permissions.
 fn list_directory(request_id: u64, requested: &str) -> ServerMessage {
     let target = if requested.is_empty() {
-        std::env::var_os("HOME")
-            .map(PathBuf::from)
-            .unwrap_or_else(|| PathBuf::from("."))
+        std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
     } else {
         PathBuf::from(requested)
     };

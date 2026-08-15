@@ -97,7 +97,7 @@ pub fn answer_auth_challenge(
 /// All messages (control + pane diffs) flow over a single TCP stream using
 /// the same length-prefixed MessagePack frame format as the QUIC transport.
 /// The server interleaves `ServerMessage` values on the stream; the client
-/// dispatches them by message type (pane_id fields handle routing).
+/// dispatches them by message type (`pane_id` fields handle routing).
 ///
 /// Pass `connection_id = Some(id)` to resume an existing session after a
 /// transport switch (e.g. QUIC → TCP fallback).

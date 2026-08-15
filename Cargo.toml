@@ -160,6 +160,12 @@ trivial_numeric_casts = "warn"
 # `crate::`/module qualifications and 2 elided lifetimes in paths.
 unused_qualifications = "warn"
 elided_lifetimes_in_paths = "warn"
+# 16 sites, all of them `Arc<Concrete> as Arc<dyn Trait>` or `&T as *const T`.
+# The cast is what stops the compiler from checking the target type, so each
+# one became a type-annotated binding instead. Note `Arc::clone(&x)` cannot
+# coerce (it infers `T` from the argument, not the annotation), so those sites
+# read `x.clone()`.
+trivial_casts = "warn"
 
 [workspace.lints.clippy]
 # `all` is clippy's default set and is already the effective gate via
@@ -235,3 +241,16 @@ if_not_else = "warn"
 unused_self = "warn"
 mem_forget = "warn"
 large_stack_arrays = "warn"
+
+# The mechanical batch: 531 sites cleared in one `cargo clippy --fix` pass
+# (`use_self` 312, `doc_markdown` 91, `redundant_closure_for_method_calls` 82,
+# plus stragglers), then 36 more by hand where no machine-applicable suggestion
+# exists — every `manual_let_else` and every `trivial_casts`. `use_self` is the
+# one worth stating a reason for: spelling the type where `Self` would do makes
+# a rename look like an edit in every impl block, and hides which mentions are
+# really about *this* type.
+use_self = "warn"
+doc_markdown = "warn"
+redundant_closure_for_method_calls = "warn"
+map_unwrap_or = "warn"
+manual_let_else = "warn"

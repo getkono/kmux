@@ -113,12 +113,12 @@ pub struct SharedClientState {
     pub machine_id: Option<String>,
     /// This connection's daemon-assigned user-readable label, once authenticated.
     pub label: Option<String>,
-    /// Output-forwarding task handles, keyed by pane_id.
+    /// Output-forwarding task handles, keyed by `pane_id`.
     pub attached: HashMap<String, AbortHandle>,
     /// Sender for the control-stream writer task.
     pub ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
     pub app: Arc<ServerApp>,
-    /// Connection-scoped tracing span; conn_id and client_id are recorded into
+    /// Connection-scoped tracing span; `conn_id` and `client_id` are recorded into
     /// it once authentication completes so every subsequent log line carries them.
     pub conn_span: Span,
     /// Transport kind that accepted this connection.

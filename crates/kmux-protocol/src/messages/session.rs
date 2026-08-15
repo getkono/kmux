@@ -77,9 +77,9 @@ pub enum FrontendKind {
 impl std::fmt::Display for FrontendKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let s = match self {
-            FrontendKind::Cli => "cli",
-            FrontendKind::Gtk => "gtk",
-            FrontendKind::Swift => "swift",
+            Self::Cli => "cli",
+            Self::Gtk => "gtk",
+            Self::Swift => "swift",
         };
         f.write_str(s)
     }
@@ -155,7 +155,7 @@ impl PeerTarget {
     /// policy/credentials, not identity (the same endpoint is one peer).
     pub fn peer_id(&self) -> PeerId {
         match self {
-            PeerTarget::Ssh {
+            Self::Ssh {
                 user,
                 host,
                 ssh_port,
@@ -170,18 +170,18 @@ impl PeerTarget {
                     None => base,
                 }
             }
-            PeerTarget::Direct { host, port, .. } => format!("{host}:{port}"),
+            Self::Direct { host, port, .. } => format!("{host}:{port}"),
         }
     }
 
     /// Whether to accept a self-signed / unpinned TLS certificate on the data plane.
     pub fn accept_invalid_certs(&self) -> bool {
         match self {
-            PeerTarget::Ssh {
+            Self::Ssh {
                 accept_invalid_certs,
                 ..
             }
-            | PeerTarget::Direct {
+            | Self::Direct {
                 accept_invalid_certs,
                 ..
             } => *accept_invalid_certs,
@@ -257,7 +257,7 @@ pub struct DirEntry {
     pub is_dir: bool,
 }
 
-/// OSC 9;4 (ConEmu / Windows-Terminal) progress-bar state reported by a pane.
+/// OSC 9;4 (`ConEmu` / Windows-Terminal) progress-bar state reported by a pane.
 /// Ghostty renders this as a thin bar in the window; kmux renders it per pane.
 /// `Remove` means no bar is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
@@ -404,14 +404,14 @@ pub enum LayoutNode {
         dir: SplitDir,
         /// Child weights in permille (0..=1000); same length as `children`.
         ratios: Vec<u16>,
-        children: Vec<LayoutNode>,
+        children: Vec<Self>,
     },
 }
 
 impl LayoutNode {
     /// A single-pane leaf layout (the default for a freshly created tab).
     pub fn single(pane_index: u32) -> Self {
-        LayoutNode::Leaf { pane_index }
+        Self::Leaf { pane_index }
     }
 
     /// Collect the `pane_index` of every leaf, left-to-right depth-first.
@@ -423,8 +423,8 @@ impl LayoutNode {
 
     fn collect_leaves(&self, out: &mut Vec<u32>) {
         match self {
-            LayoutNode::Leaf { pane_index } => out.push(*pane_index),
-            LayoutNode::Split { children, .. } => {
+            Self::Leaf { pane_index } => out.push(*pane_index),
+            Self::Split { children, .. } => {
                 for c in children {
                     c.collect_leaves(out);
                 }

@@ -61,7 +61,7 @@ fn server_candidates_from_hosts(
 }
 
 /// Candidates for `--session`: the local daemon's live session display names and
-/// word_ids (both accepted by `--session`).
+/// `word_ids` (both accepted by `--session`).
 ///
 /// The completer is a *synchronous* callback but [`run_cli`](crate::launch::run_cli)
 /// calls it from inside a Tokio runtime, so we cannot `block_on` directly (that
@@ -71,12 +71,11 @@ fn server_candidates_from_hosts(
 /// timeout — yields no candidates rather than blocking.
 pub fn session_candidates() -> Vec<CompletionCandidate> {
     std::thread::spawn(|| {
-        let rt = match tokio::runtime::Builder::new_current_thread()
+        let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
-        {
-            Ok(rt) => rt,
-            Err(_) => return Vec::new(),
+        else {
+            return Vec::new();
         };
         rt.block_on(async {
             let query = kmux_client::daemon::query_daemon_sessions();

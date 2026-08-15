@@ -38,7 +38,7 @@ async fn wait_for_exit(pid: Pid) -> ExitStatus {
     tokio::task::spawn_blocking(move || crate::process::blocking_wait(pid))
         .await
         .ok()
-        .and_then(|r| r.ok())
+        .and_then(std::result::Result::ok)
         .unwrap_or(ExitStatus::Unknown)
 }
 

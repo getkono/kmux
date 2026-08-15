@@ -47,11 +47,7 @@ impl ServerApp {
         };
 
         // Resolve CWD
-        let resolved_cwd = resolve_cwd(
-            cwd.as_deref()
-                .map(Path::new)
-                .unwrap_or_else(|| Path::new(".")),
-        );
+        let resolved_cwd = resolve_cwd(cwd.as_deref().map_or_else(|| Path::new("."), Path::new));
 
         // Default name = basename of cwd
         let display_name = name.unwrap_or_else(|| {
@@ -236,7 +232,11 @@ impl ServerApp {
         };
         let mut roots = Vec::with_capacity(pane_ids.len());
         for pane_id in pane_ids {
-            let pid = self.manager.child_pid(&pane_id).await.map(|p| p.as_raw());
+            let pid = self
+                .manager
+                .child_pid(&pane_id)
+                .await
+                .map(nix::unistd::Pid::as_raw);
             roots.push((pane_id, pid));
         }
         roots

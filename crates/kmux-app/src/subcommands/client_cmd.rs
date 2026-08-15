@@ -85,7 +85,7 @@ async fn client_status() -> anyhow::Result<()> {
     println!("Daemon:");
     match &daemon {
         Some(d) => {
-            let dprofile = d.build_profile.map(|p| p.as_str()).unwrap_or("<unknown>");
+            let dprofile = d.build_profile.map_or("<unknown>", BuildProfile::as_str);
             println!("  Build:    {}", build_display(&d.kmuxd_build, dprofile));
             println!("  Version:  {}", d.kmuxd_version);
             println!(
@@ -128,7 +128,7 @@ async fn client_status() -> anyhow::Result<()> {
             warnings.push(format!(
                 "CLI profile ({}) differs from the daemon ({}).",
                 BuildProfile::CURRENT,
-                d.build_profile.map(|p| p.as_str()).unwrap_or("<unknown>"),
+                d.build_profile.map_or("<unknown>", BuildProfile::as_str),
             ));
         }
         match compat::build_match(&d.kmuxd_build, &cli_build) {
@@ -219,8 +219,7 @@ fn pid_alive(pid: &str) -> bool {
     std::process::Command::new("kill")
         .args(["-0", pid])
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 /// Stop the GUI client, then relaunch it through the launcher entrypoint.

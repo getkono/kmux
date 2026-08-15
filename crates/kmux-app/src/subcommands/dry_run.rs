@@ -82,7 +82,7 @@ pub async fn run_dry_run(args: &ServerArgs, test_mode: bool) -> anyhow::Result<(
 
 /// Send a `Ping { seq: 0 }` and await `Pong { seq: 0 }` within [`PING_TIMEOUT`].
 ///
-/// Intervening messages (AuthResult, SessionListResult, etc.) are drained
+/// Intervening messages (`AuthResult`, `SessionListResult`, etc.) are drained
 /// and ignored — we only care that the control-plane is healthy end-to-end.
 async fn verify_ping(
     outcome: &BootstrapOutcome,

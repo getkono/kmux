@@ -189,7 +189,7 @@ fn short_id(machine_id: &str) -> String {
 fn panes_text(panes: &[u32]) -> String {
     panes
         .iter()
-        .map(|p| p.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(",")
 }

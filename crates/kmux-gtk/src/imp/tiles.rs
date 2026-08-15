@@ -123,7 +123,7 @@ pub fn divider_at(f: &Frontend, x: f64, y: f64, width_px: i32, height_px: i32) -
         };
         if along_ok && edge_dist <= DIVIDER_GRAB_PX {
             let key = edge_dist.max(0.0);
-            if best.as_ref().map(|(_, b)| key < *b).unwrap_or(true) {
+            if best.as_ref().is_none_or(|(_, b)| key < *b) {
                 best = Some((d, key));
             }
         }

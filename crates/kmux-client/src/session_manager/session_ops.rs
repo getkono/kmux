@@ -144,9 +144,9 @@ impl SessionManager {
             let rid = self.next_rid();
             self.send_ws(ClientMessage::SessionCreate {
                 request_id: rid,
-                name: name.map(|n| n.to_string()),
-                cwd: cwd.map(|c| c.to_string()),
-                program: program.map(|p| p.to_string()),
+                name: name.map(ToString::to_string),
+                cwd: cwd.map(ToString::to_string),
+                program: program.map(ToString::to_string),
                 args: args.to_vec(),
                 size,
                 // Local create; remote creates go through create_session_on_peer.
@@ -170,8 +170,8 @@ impl SessionManager {
             let rid = self.next_rid();
             self.send_ws(ClientMessage::SessionCreate {
                 request_id: rid,
-                name: name.map(|n| n.to_string()),
-                cwd: cwd.map(|c| c.to_string()),
+                name: name.map(ToString::to_string),
+                cwd: cwd.map(ToString::to_string),
                 program: None,
                 args: vec![],
                 size,
@@ -282,7 +282,7 @@ impl SessionManager {
         }
     }
 
-    /// Find the first session whose CWD exactly matches `cwd`, returning its word_id.
+    /// Find the first session whose CWD exactly matches `cwd`, returning its `word_id`.
     pub fn find_session_by_cwd(&self, cwd: &str) -> Option<String> {
         self.session_list
             .iter()
@@ -290,9 +290,9 @@ impl SessionManager {
             .map(|e| e.meta.word_id.clone())
     }
 
-    /// Find the first session whose display name or word_id matches `name`.
+    /// Find the first session whose display name or `word_id` matches `name`.
     ///
-    /// Matches the decorated display name, the word_id, and — for federated
+    /// Matches the decorated display name, the `word_id`, and — for federated
     /// sessions — the undecorated [`SessionEntry::base_name`], so `--session foo`
     /// resolves a remote session the hub lists as `"foo @ peer"` (issue #121). A
     /// local session named `foo` still wins by iteration order.

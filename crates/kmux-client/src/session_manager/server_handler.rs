@@ -127,7 +127,7 @@ impl SessionManager {
     }
 
     /// Drop every per-pane buffer and bookkeeping entry for a closed pane, keeping
-    /// the buffer / pane_sync / input-lock / fetch maps in lock-step (a pane must
+    /// the buffer / `pane_sync` / input-lock / fetch maps in lock-step (a pane must
     /// never outlive its sync state).
     fn forget_pane(&mut self, pane_id: &str) {
         self.buffers.remove(pane_id);
@@ -163,9 +163,7 @@ impl SessionManager {
         // Attribute the wire cost of this frame to the currently tagged
         // transport. We re-encode for the byte count; MessagePack is cheap
         // enough that this is negligible next to decoding.
-        let inbound_bytes = kmux_protocol::encode_server(&msg)
-            .map(|b| b.len())
-            .unwrap_or(0);
+        let inbound_bytes = kmux_protocol::encode_server(&msg).map_or(0, |b| b.len());
         let inbound_category = msg.category();
         if inbound_bytes > 0 {
             self.metrics.record_inbound(inbound_bytes, inbound_category);
@@ -439,7 +437,7 @@ impl SessionManager {
                         .panes
                         .retain(|pane| !closed_panes.contains(&pane.pane_index));
                     if entry.active_tab == tab_index {
-                        entry.active_tab = entry.tabs.first().map(|t| t.tab_index).unwrap_or(0);
+                        entry.active_tab = entry.tabs.first().map_or(0, |t| t.tab_index);
                     }
                     next_tab = entry.tabs.first().map(|t| t.tab_index);
                 }

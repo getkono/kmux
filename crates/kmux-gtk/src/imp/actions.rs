@@ -385,7 +385,7 @@ fn build_menu() -> gio::Menu {
     menu
 }
 
-/// The keyboard-shortcuts window, built from inline GtkBuilder XML (the standard
+/// The keyboard-shortcuts window, built from inline `GtkBuilder` XML (the standard
 /// way `GtkShortcutsWindow` is described).
 const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <interface>

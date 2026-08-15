@@ -46,7 +46,7 @@ pub struct Theme {
     pub orange: Rgb,
     pub status_bg: Rgb,
     /// Background of the inner-pane cursor for shapes that fill the cell
-    /// (Block, HollowBlock); also used as the foreground glyph color for
+    /// (Block, `HollowBlock`); also used as the foreground glyph color for
     /// Bar/Underline. Defaults to `fg` for high contrast against `bg`.
     pub cursor_bg: Rgb,
     /// Text color drawn on top of the Block cursor's background. Defaults to

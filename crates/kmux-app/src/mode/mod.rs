@@ -250,7 +250,7 @@ pub(super) fn is_mode_key(key: &Key, mods: Modifiers) -> bool {
     mods.contains(Modifiers::CTRL) && matches!(key, Key::Character(c) if c == "g")
 }
 
-/// Resolve a key press in the current mode into a (new_mode, action) pair.
+/// Resolve a key press in the current mode into a (`new_mode`, action) pair.
 pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     match mode {
         Mode::Normal => resolve_normal(key, mods),

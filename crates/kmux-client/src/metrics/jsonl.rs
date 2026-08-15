@@ -112,7 +112,7 @@ impl JsonlSink {
         &self.path
     }
 
-    /// Append a sample. Acquires LOCK_EX briefly, rotates if the file is
+    /// Append a sample. Acquires `LOCK_EX` briefly, rotates if the file is
     /// over [`ROTATE_BYTES`], writes one JSON line terminated by `\n`,
     /// releases the lock. Errors are logged but not propagated — metrics
     /// collection must never take down the client.

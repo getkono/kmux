@@ -329,8 +329,7 @@ impl PaneRelay {
         let (pixel_width, pixel_height) = map
             .values()
             .find(|s| s.size.rows == rows && s.size.cols == cols)
-            .map(|s| (s.size.pixel_width, s.size.pixel_height))
-            .unwrap_or((0, 0));
+            .map_or((0, 0), |s| (s.size.pixel_width, s.size.pixel_height));
         Some(TermSize {
             rows,
             cols,
@@ -418,7 +417,7 @@ impl TabState {
 /// State for one session: its metadata, all its panes, and its tabs.
 pub struct SessionState {
     pub meta: kmux_protocol::messages::SessionMeta,
-    /// Map of pane_index -> PaneRelay (the flat pool of PTYs; tabs reference
+    /// Map of `pane_index` -> `PaneRelay` (the flat pool of PTYs; tabs reference
     /// these by `pane_index`).
     pub panes: HashMap<u32, PaneRelay>,
     /// Next pane index to assign (monotonically increasing within this session).
@@ -485,7 +484,7 @@ pub struct ConnectionMetrics {
     pub last_activity_ms: AtomicU64,
     /// Epoch-ms timestamp of the last successful Pong from the client; 0 = none yet.
     pub last_pong_ms: AtomicU64,
-    /// Most recent measured ping RTT in milliseconds; u64::MAX = unknown.
+    /// Most recent measured ping RTT in milliseconds; `u64::MAX` = unknown.
     pub last_rtt_ms: AtomicU64,
     /// `(seq, Instant)` of the most recently sent server-originated Ping, used to
     /// compute RTT when the matching Pong arrives.
@@ -609,7 +608,7 @@ pub struct ServerApp {
     /// Pane VT-pipeline isolation mode (issue #126), resolved from `kmuxd.toml` /
     /// the `--session-isolation` flag.
     pub session_isolation: crate::config::SessionIsolationMode,
-    /// Map of word_id -> SessionState.
+    /// Map of `word_id` -> `SessionState`.
     pub(super) sessions: RwLock<HashMap<kmux_protocol::messages::WordId, SessionState>>,
     /// Monotonic session creation counter.
     pub(super) session_index_counter: AtomicU32,
@@ -621,7 +620,7 @@ pub struct ServerApp {
     /// `PaneAttention` broadcast so clients can dedup to one notification when
     /// several windows of one GUI process are attached to the session.
     next_attention_id: AtomicU64,
-    /// Map of ConnectionId -> ConnectionState for channel switching.
+    /// Map of `ConnectionId` -> `ConnectionState` for channel switching.
     connections: RwLock<HashMap<u64, ConnectionState>>,
     /// Word pool for assigning unique session IDs.
     pub(super) wordlist: Mutex<WordlistSampler>,
@@ -832,7 +831,7 @@ impl ServerApp {
     /// Returns a [`RegisteredClient`] whose `previous_transport` is `Some(old)`
     /// when a channel switch is in progress (the caller must remember this and
     /// send it back in `ChannelSwitched` once the new channel signals
-    /// `ChannelReady`); `None` when this is the first connection for the conn_id.
+    /// `ChannelReady`); `None` when this is the first connection for the `conn_id`.
     /// `identity` is the verified cryptographic identity (issue #146); on a fresh
     /// connection the daemon assigns a unique user-readable `label` derived from
     /// it. On resume the existing connection's label/identity are kept.

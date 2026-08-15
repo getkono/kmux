@@ -53,24 +53,21 @@ impl DialogKind {
     fn is_list(self) -> bool {
         matches!(
             self,
-            DialogKind::SessionPicker
-                | DialogKind::DirPicker
-                | DialogKind::Launch
-                | DialogKind::Command
+            Self::SessionPicker | Self::DirPicker | Self::Launch | Self::Command
         )
     }
 
     fn from_mode(mode: &Mode) -> Option<Self> {
         match mode {
-            Mode::SessionPicker => Some(DialogKind::SessionPicker),
-            Mode::DirectoryPicker => Some(DialogKind::DirPicker),
-            Mode::LaunchPicker => Some(DialogKind::Launch),
-            Mode::Command(_) => Some(DialogKind::Command),
-            Mode::RenameSession { .. } | Mode::RenameTab { .. } => Some(DialogKind::Rename),
-            Mode::ConfirmCloseSession { .. } => Some(DialogKind::ConfirmCloseSession),
-            Mode::Help => Some(DialogKind::Help),
-            Mode::AddRemote => Some(DialogKind::AddRemote),
-            Mode::RemoteNewSession { .. } => Some(DialogKind::RemoteNew),
+            Mode::SessionPicker => Some(Self::SessionPicker),
+            Mode::DirectoryPicker => Some(Self::DirPicker),
+            Mode::LaunchPicker => Some(Self::Launch),
+            Mode::Command(_) => Some(Self::Command),
+            Mode::RenameSession { .. } | Mode::RenameTab { .. } => Some(Self::Rename),
+            Mode::ConfirmCloseSession { .. } => Some(Self::ConfirmCloseSession),
+            Mode::Help => Some(Self::Help),
+            Mode::AddRemote => Some(Self::AddRemote),
+            Mode::RemoteNewSession { .. } => Some(Self::RemoteNew),
             _ => None,
         }
     }
@@ -184,7 +181,7 @@ fn reconcile_native(
 
     // Refresh the list contents of a live picker/command dialog on change.
     let kind = dialogs.current.borrow().as_ref().map(|d| d.kind);
-    if kind.is_some_and(|k| k.is_list()) {
+    if kind.is_some_and(DialogKind::is_list) {
         let sig = list_signature(&fe.borrow().core);
         if dialogs.list_sig.borrow().as_deref() != Some(sig.as_str()) {
             *dialogs.list_sig.borrow_mut() = Some(sig);
@@ -348,7 +345,7 @@ fn open_list_dialog(
         let shell = shell.clone();
         dialog.connect_closed(move |_| {
             let mut f = fe.borrow_mut();
-            if DialogKind::from_mode(&f.core.mode).is_some_and(|k| k.is_list()) {
+            if DialogKind::from_mode(&f.core.mode).is_some_and(DialogKind::is_list) {
                 f.core.mode = Mode::Normal;
                 f.core.needs_render = true;
             }
@@ -1360,8 +1357,7 @@ fn metrics_content(core: &AppCore) -> ScrolledWindow {
 
     let conn = mgr
         .connection_id
-        .map(|c| c.0.to_string())
-        .unwrap_or_else(|| "-".into());
+        .map_or_else(|| "-".into(), |c| c.0.to_string());
     card.append(&label(
         &format!("pid {}   connection {conn}", std::process::id()),
         "dim-label",
@@ -1483,12 +1479,8 @@ fn connection_content(core: &AppCore) -> ScrolledWindow {
     card.append(&label("Identity", "heading"));
     let conn = info
         .connection_id
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "-".into());
-    let client = info
-        .client_id
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "-".into());
+        .map_or_else(|| "-".into(), |c| c.to_string());
+    let client = info.client_id.map_or_else(|| "-".into(), |c| c.to_string());
     card.append(&label(
         &format!("connection {conn}   client {client}"),
         "monospace",
@@ -1504,8 +1496,7 @@ fn connection_content(core: &AppCore) -> ScrolledWindow {
         Some(rtt) => {
             let ewma = rtt
                 .ewma_ms
-                .map(|v| format!("{v:.1}ms"))
-                .unwrap_or_else(|| "-".into());
+                .map_or_else(|| "-".into(), |v| format!("{v:.1}ms"));
             card.append(&label(
                 &format!(
                     "ping {ewma} ewma   recent {:.1}/{:.1}ms   {} samples",

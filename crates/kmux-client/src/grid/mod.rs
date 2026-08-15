@@ -604,8 +604,7 @@ impl CellGrid {
             } else if row < sb_len {
                 scrollback
                     .get(row)
-                    .map(|l| effective_line_len(l).saturating_sub(1))
-                    .unwrap_or(0)
+                    .map_or(0, |l| effective_line_len(l).saturating_sub(1))
             } else {
                 self.cols.saturating_sub(1)
             };

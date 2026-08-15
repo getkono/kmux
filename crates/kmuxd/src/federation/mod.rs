@@ -571,13 +571,15 @@ impl PeerManager {
         {
             return Err("peer connection closed before session list".to_string());
         }
-        let remote_sessions = match recv_until(&mut server_rx, LIST_TIMEOUT, |m| {
+        let Some(ServerMessage::SessionListResult {
+            sessions: remote_sessions,
+            ..
+        }) = recv_until(&mut server_rx, LIST_TIMEOUT, |m| {
             matches!(m, ServerMessage::SessionListResult { .. })
         })
         .await
-        {
-            Some(ServerMessage::SessionListResult { sessions, .. }) => sessions,
-            _ => return Err("peer did not return a session list in time".to_string()),
+        else {
+            return Err("peer did not return a session list in time".to_string());
         };
 
         // 4. Register each remote session under a fresh local word. Park the SSH
@@ -588,14 +590,11 @@ impl PeerManager {
         let mut assigned_words: Vec<String> = Vec::new();
         for entry in remote_sessions {
             let remote_word = entry.meta.word_id.clone();
-            let local_word = match app.draw_word() {
-                Some(w) => w,
-                None => {
-                    for w in &assigned_words {
-                        app.release_word(w);
-                    }
-                    return Err("local session word pool exhausted".to_string());
+            let Some(local_word) = app.draw_word() else {
+                for w in &assigned_words {
+                    app.release_word(w);
                 }
+                return Err("local session word pool exhausted".to_string());
             };
             assigned_words.push(local_word.clone());
             conn.register_session(local_word, remote_word, entry, &peer_id);

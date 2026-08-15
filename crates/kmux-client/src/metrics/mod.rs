@@ -180,7 +180,7 @@ impl MetricsStore {
 
     /// Path where samples are persisted, if a sink is configured.
     pub fn sink_path(&self) -> Option<&std::path::Path> {
-        self.sink.as_ref().map(|s| s.path())
+        self.sink.as_ref().map(JsonlSink::path)
     }
 }
 

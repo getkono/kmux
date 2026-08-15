@@ -266,9 +266,9 @@ impl AppCore {
     ///    case-insensitive filter [`dir_picker_buffer`](AppCore::dir_picker_buffer).
     ///
     /// The entries/parent come from [`SessionManager::dir_listing`]; until the
-    /// first listing arrives only CreateHere is shown. Any listing `error` is
+    /// first listing arrives only `CreateHere` is shown. Any listing `error` is
     /// surfaced separately by [`AppCore::dir_browser_error`]; the rows still
-    /// include CreateHere (+ Up when known) so the user can always recover.
+    /// include `CreateHere` (+ Up when known) so the user can always recover.
     pub fn dir_browser_rows(&self) -> Vec<DirBrowserRow> {
         // Prefer the daemon's *canonical* listed path for "create here" so the
         // session is created in the directory actually resolved (which may
@@ -277,8 +277,7 @@ impl AppCore {
         let create_cwd = self
             .mgr
             .dir_listing()
-            .map(|l| l.path.clone())
-            .unwrap_or_else(|| self.dir_browser_cwd.clone());
+            .map_or_else(|| self.dir_browser_cwd.clone(), |l| l.path.clone());
         let mut rows = vec![DirBrowserRow::CreateHere { cwd: create_cwd }];
         let Some(listing) = self.mgr.dir_listing() else {
             return rows;
@@ -356,7 +355,7 @@ impl AppCore {
     pub fn launch_rows(&self) -> Vec<LaunchRow> {
         let q = self.launch_search.to_lowercase();
         let matches = |s: &str| q.is_empty() || s.to_lowercase().contains(&q);
-        let active = self.mgr.active_session().map(|s| s.to_string());
+        let active = self.mgr.active_session().map(ToString::to_string);
         let is_active = |word_id: &str| active.as_deref() == Some(word_id);
 
         let mut rows = Vec::new();
@@ -448,7 +447,7 @@ impl AppCore {
     }
 
     /// Returns sessions matching the current `session_picker_search` text
-    /// (case-insensitive on display name or word_id). An empty search matches
+    /// (case-insensitive on display name or `word_id`). An empty search matches
     /// every session. Shared by the session-picker overlay, its navigation
     /// bounds, and the Enter/click selection so the filter has one definition.
     pub fn session_picker_matches(&self) -> Vec<&SessionEntry> {
@@ -710,7 +709,7 @@ impl AppCore {
     /// connected (drop it explicitly via disconnect).
     pub fn collapse_remote(&mut self, peer: &str) {
         self.launch_expanded.remove(peer);
-        let active = self.mgr.active_session().map(|s| s.to_string());
+        let active = self.mgr.active_session().map(ToString::to_string);
         let in_use = self.mgr.session_list().iter().any(|e| {
             e.peer.as_deref() == Some(peer) && active.as_deref() == Some(e.meta.word_id.as_str())
         });

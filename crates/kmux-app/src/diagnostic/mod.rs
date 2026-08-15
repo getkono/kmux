@@ -47,46 +47,46 @@ pub enum DiagnosticTest {
 impl DiagnosticTest {
     /// The concrete patterns, in display order (excludes [`Self::All`], which is
     /// their concatenation).
-    pub const EACH: [DiagnosticTest; 5] = [
-        DiagnosticTest::Glyphs,
-        DiagnosticTest::Attrs,
-        DiagnosticTest::Colors,
-        DiagnosticTest::Unicode,
-        DiagnosticTest::Boxes,
+    pub const EACH: [Self; 5] = [
+        Self::Glyphs,
+        Self::Attrs,
+        Self::Colors,
+        Self::Unicode,
+        Self::Boxes,
     ];
 
     /// The kebab-case name used on the CLI and as the `--emit` argument.
     pub fn name(self) -> &'static str {
         match self {
-            DiagnosticTest::Glyphs => "glyphs",
-            DiagnosticTest::Attrs => "attrs",
-            DiagnosticTest::Colors => "colors",
-            DiagnosticTest::Unicode => "unicode",
-            DiagnosticTest::Boxes => "boxes",
-            DiagnosticTest::Progress => "progress",
-            DiagnosticTest::All => "all",
+            Self::Glyphs => "glyphs",
+            Self::Attrs => "attrs",
+            Self::Colors => "colors",
+            Self::Unicode => "unicode",
+            Self::Boxes => "boxes",
+            Self::Progress => "progress",
+            Self::All => "all",
         }
     }
 
     /// Parse a kebab-case test name (the inverse of [`name`](Self::name)).
     /// Used by the Swift/FFI path, which carries the test as a plain string.
-    pub fn from_name(name: &str) -> Option<DiagnosticTest> {
-        DiagnosticTest::EACH
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::EACH
             .into_iter()
-            .chain([DiagnosticTest::Progress, DiagnosticTest::All])
+            .chain([Self::Progress, Self::All])
             .find(|test| test.name() == name)
     }
 
     /// One-line description for the `kmux diagnostic` catalogue.
     pub fn description(self) -> &'static str {
         match self {
-            DiagnosticTest::Glyphs => "ASCII + common Unicode glyphs",
-            DiagnosticTest::Attrs => "text attributes across the four font faces",
-            DiagnosticTest::Colors => "16/256/truecolor ramps",
-            DiagnosticTest::Unicode => "wide CJK, emoji, combining marks",
-            DiagnosticTest::Boxes => "box-drawing alignment grid",
-            DiagnosticTest::Progress => "animated OSC 9;4 progress-bar states",
-            DiagnosticTest::All => "run every pattern above, in order",
+            Self::Glyphs => "ASCII + common Unicode glyphs",
+            Self::Attrs => "text attributes across the four font faces",
+            Self::Colors => "16/256/truecolor ramps",
+            Self::Unicode => "wide CJK, emoji, combining marks",
+            Self::Boxes => "box-drawing alignment grid",
+            Self::Progress => "animated OSC 9;4 progress-bar states",
+            Self::All => "run every pattern above, in order",
         }
     }
 }

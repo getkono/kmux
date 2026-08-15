@@ -247,8 +247,7 @@ fn attach_scroll(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
 fn pos_at(f: &Frontend, x: f64, y: f64, width_px: i32, height_px: i32) -> Option<GridPos> {
     let grid = f.core.mgr.active_grid()?;
     let (off_c, off_r) = super::tiles::focused_rect(f, width_px, height_px)
-        .map(|r| (r.col as f64, r.row as f64))
-        .unwrap_or((0.0, 0.0));
+        .map_or((0.0, 0.0), |r| (r.col as f64, r.row as f64));
     let col = ((x / f.metrics.cell_w) - off_c).floor().max(0.0) as usize;
     let vr = ((y / f.metrics.cell_h) - off_r).floor().max(0.0) as usize;
     Some(grid.visible_to_abs(vr, col))
@@ -268,8 +267,7 @@ fn viewport_cell(
 ) -> Option<(u16, u16)> {
     let grid = f.core.mgr.active_grid()?;
     let (off_c, off_r) = super::tiles::focused_rect(f, width_px, height_px)
-        .map(|r| (r.col as f64, r.row as f64))
-        .unwrap_or((0.0, 0.0));
+        .map_or((0.0, 0.0), |r| (r.col as f64, r.row as f64));
     let col = (((x / f.metrics.cell_w) - off_c).floor().max(0.0) as usize)
         .min(grid.cols.saturating_sub(1));
     let row = (((y / f.metrics.cell_h) - off_r).floor().max(0.0) as usize)
@@ -407,8 +405,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                             .core
                             .mgr
                             .active_grid()
-                            .map(|g| g.find_word_boundaries(pos))
-                            .unwrap_or((pos, pos));
+                            .map_or((pos, pos), |g| g.find_word_boundaries(pos));
                         Selection {
                             anchor: s,
                             end: e,
@@ -417,7 +414,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                     }
                     _ => {
                         drag.set(None);
-                        let cols = f.core.mgr.active_grid().map(|g| g.cols).unwrap_or(1);
+                        let cols = f.core.mgr.active_grid().map_or(1, |g| g.cols);
                         Selection {
                             anchor: GridPos {
                                 row: pos.row,
@@ -550,11 +547,9 @@ fn autoscroll_tick(fe: &Rc<RefCell<Frontend>>, area: &DrawingArea, drag: &Rc<Cel
     // Auto-scroll relative to the focused pane's tile, not the whole window, so
     // a drag near a tile edge (mid-window) scrolls correctly.
     let rect = super::tiles::focused_rect(&f, w, h);
-    let off_c = rect.map(|r| r.col as f64).unwrap_or(0.0);
-    let pane_top = rect.map(|r| r.row as f64 * cell_h).unwrap_or(0.0);
-    let pane_bottom = rect
-        .map(|r| (r.row + r.rows) as f64 * cell_h)
-        .unwrap_or(h as f64);
+    let off_c = rect.map_or(0.0, |r| r.col as f64);
+    let pane_top = rect.map_or(0.0, |r| r.row as f64 * cell_h);
+    let pane_bottom = rect.map_or(h as f64, |r| (r.row + r.rows) as f64 * cell_h);
     let Some(grid) = f.core.mgr.active_grid_mut() else {
         return;
     };
@@ -591,15 +586,13 @@ fn scroll_pane(f: &mut Frontend, pane_id: &str, col: u16, row: u16, lines: i32) 
         && f.core
             .mgr
             .buffer(pane_id)
-            .map(|g| g.modes().mouse_report())
-            .unwrap_or(false);
+            .is_some_and(|g| g.modes().mouse_report());
     if use_pty {
         let sgr = f
             .core
             .mgr
             .buffer(pane_id)
-            .map(|g| g.modes().sgr_mouse())
-            .unwrap_or(false);
+            .is_some_and(|g| g.modes().sgr_mouse());
         // 1-based terminal coordinates.
         let bytes = kmux_client::input::encode_mouse_scroll(col + 1, row + 1, lines, sgr);
         if !bytes.is_empty() {

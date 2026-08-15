@@ -124,7 +124,7 @@ fn spawn_authenticated_forwarders(
 /// same output channel as the writer task.
 ///
 /// `conn_span` is the per-connection tracing span (created by the caller with
-/// transport/remote/conn_id/client_id fields).  It is cloned onto each spawned
+/// `transport/remote/conn_id/client_id` fields).  It is cloned onto each spawned
 /// task so that every log line carries the connection context.  The caller must
 /// also `.instrument(conn_span)` the returned future so the main loop itself
 /// runs within the span.

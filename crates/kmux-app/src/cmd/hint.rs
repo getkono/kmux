@@ -47,12 +47,8 @@ pub fn build_hints(app: &AppCore) -> Vec<Hint> {
     // that distinguishes "still typing the last token" from "moved past it".
     let trimmed = buffer.trim_start();
     let leading_ws = buffer.len() - trimmed.len();
-    let ends_with_ws = !buffer.is_empty()
-        && buffer
-            .chars()
-            .next_back()
-            .map(|c| c.is_whitespace())
-            .unwrap_or(false);
+    let ends_with_ws =
+        !buffer.is_empty() && buffer.chars().next_back().is_some_and(char::is_whitespace);
 
     let tokens = tokenize(buffer).unwrap_or_default();
 
@@ -110,7 +106,7 @@ fn resolve_command_prefix(tokens: &[String], ends_with_ws: bool) -> Resolved {
                 continue;
             }
             let head = tokens[..nlen].join(" ");
-            if head.eq_ignore_ascii_case(nm) && best.map(|(_, prev)| nlen > prev).unwrap_or(true) {
+            if head.eq_ignore_ascii_case(nm) && best.is_none_or(|(_, prev)| nlen > prev) {
                 // Whole-name match; but if there are no extra tokens AND the
                 // buffer doesn't end in whitespace, the user might still be
                 // typing — don't lock in yet.
@@ -213,7 +209,7 @@ fn arg_value_hints(
         _ => Vec::new(),
     };
 
-    let mut all: Vec<String> = static_values.iter().map(|s| s.to_string()).collect();
+    let mut all: Vec<String> = static_values.iter().map(ToString::to_string).collect();
     all.extend(dynamic_values);
 
     let mut filtered: Vec<String> = all

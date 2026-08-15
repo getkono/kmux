@@ -522,8 +522,10 @@ fn cleanup_and_start_daemon() -> anyhow::Result<()> {
                 let owner = std::fs::read_to_string(&pid_path)
                     .ok()
                     .and_then(|value| value.trim().parse::<u32>().ok())
-                    .map(|pid| format!("PID {pid}"))
-                    .unwrap_or_else(|| "an active process".to_string());
+                    .map_or_else(
+                        || "an active process".to_string(),
+                        |pid| format!("PID {pid}"),
+                    );
                 anyhow::bail!(
                     "{owner} owns the daemon PID file but the control socket is unresponsive; \
                      automatic startup left it untouched. Inspect `kmux daemon status` and \

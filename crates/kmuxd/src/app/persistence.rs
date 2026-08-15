@@ -70,7 +70,11 @@ impl ServerApp {
                 scrollback_arc.iter().map(|line| line.to_vec()).collect();
 
             // Get child PID from the PTY registry.
-            let child_pid = self.manager.child_pid(&pane_id).await.map(|p| p.as_raw());
+            let child_pid = self
+                .manager
+                .child_pid(&pane_id)
+                .await
+                .map(nix::unistd::Pid::as_raw);
 
             persisted_panes.push(PersistedPane {
                 pane_index,

@@ -77,7 +77,7 @@ impl ServerApp {
             // Last pane in this tab → remove the tab.
             state.tabs.retain(|t| t.tab_index != tab_index);
             if state.active_tab == tab_index {
-                state.active_tab = state.tabs.first().map(|t| t.tab_index).unwrap_or(0);
+                state.active_tab = state.tabs.first().map_or(0, |t| t.tab_index);
             }
             if state.tabs.is_empty() {
                 let word = word_id.to_string();
@@ -191,8 +191,7 @@ impl ServerApp {
                 // the engine's writer task.
                 let (resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
                 title_sink.set_pty_response_sender(resp_tx);
-                let relay_sink =
-                    Arc::clone(&title_sink) as Arc<dyn crate::backend::BackendEventSink>;
+                let relay_sink: Arc<dyn crate::backend::BackendEventSink> = title_sink.clone();
                 let term_state = Arc::new(Mutex::new(new_term_state(BackendConfig {
                     size: BackendSize::from(size),
                     capabilities: CapabilityHandles {

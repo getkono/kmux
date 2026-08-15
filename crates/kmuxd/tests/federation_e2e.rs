@@ -279,9 +279,8 @@ async fn federated_pane(
     })
     .await
     .expect("expected a SessionListResult");
-    let sessions = match list {
-        ServerMessage::SessionListResult { sessions, .. } => sessions,
-        _ => unreachable!(),
+    let ServerMessage::SessionListResult { sessions, .. } = list else {
+        unreachable!("recv_until only yields a SessionListResult here")
     };
     sessions
         .iter()
@@ -297,7 +296,9 @@ async fn federated_pane(
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
 async fn gui_attaches_to_remote_session_through_local_daemon() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
     let cleanup = Cleanup::default();
 
@@ -374,9 +375,8 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
     })
     .await
     .expect("expected a SessionListResult");
-    let sessions = match list {
-        ServerMessage::SessionListResult { sessions, .. } => sessions,
-        _ => unreachable!(),
+    let ServerMessage::SessionListResult { sessions, .. } = list else {
+        unreachable!("recv_until only yields a SessionListResult here")
     };
     let entry = sessions
         .iter()
@@ -470,7 +470,9 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
 async fn gui_creates_a_session_on_a_federated_peer() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
     let cleanup = Cleanup::default();
 
@@ -576,14 +578,14 @@ async fn gui_creates_a_session_on_a_federated_peer() {
     gui_tx
         .send(ClientMessage::SessionList { request_id: 21 })
         .expect("send SessionList");
-    let sessions = match recv_until(&mut gui_rx, Duration::from_secs(5), |m| {
-        matches!(m, ServerMessage::SessionListResult { .. })
-    })
-    .await
-    .expect("expected a SessionListResult")
-    {
-        ServerMessage::SessionListResult { sessions, .. } => sessions,
-        _ => unreachable!(),
+    let ServerMessage::SessionListResult { sessions, .. } =
+        recv_until(&mut gui_rx, Duration::from_secs(5), |m| {
+            matches!(m, ServerMessage::SessionListResult { .. })
+        })
+        .await
+        .expect("expected a SessionListResult")
+    else {
+        unreachable!("recv_until only yields a SessionListResult here")
     };
     assert!(
         sessions
@@ -607,7 +609,9 @@ async fn gui_creates_a_session_on_a_federated_peer() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
 async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
     let cleanup = Cleanup::default();
 
@@ -758,7 +762,9 @@ async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
 async fn remote_daemon_death_is_isolated_from_local_daemon() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
     let cleanup = Cleanup::default();
 
@@ -885,7 +891,9 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
 async fn concurrent_open_peer_to_same_target_converges_on_one_link() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
     let cleanup = Cleanup::default();
 
@@ -1027,7 +1035,9 @@ async fn concurrent_open_peer_to_same_target_converges_on_one_link() {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
 async fn federation_surfaces_upstream_auth_rejection_as_peer_error() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
     let cleanup = Cleanup::default();
 

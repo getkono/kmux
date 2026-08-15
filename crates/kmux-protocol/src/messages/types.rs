@@ -20,10 +20,10 @@ pub enum TransportKind {
 impl fmt::Display for TransportKind {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            TransportKind::Quic => write!(f, "QUIC"),
-            TransportKind::Tcp => write!(f, "TCP"),
-            TransportKind::TcpTls => write!(f, "TCP+TLS"),
-            TransportKind::Uds => write!(f, "UDS"),
+            Self::Quic => write!(f, "QUIC"),
+            Self::Tcp => write!(f, "TCP"),
+            Self::TcpTls => write!(f, "TCP+TLS"),
+            Self::Uds => write!(f, "UDS"),
         }
     }
 }
@@ -32,12 +32,12 @@ impl TransportKind {
     /// Parse a user-facing transport name (case-insensitive) for the
     /// `/transport` override command (issue #69). Returns `None` for unknown
     /// names; the caller maps `"auto"` to *clearing* the override.
-    pub fn parse_cli(s: &str) -> Option<TransportKind> {
+    pub fn parse_cli(s: &str) -> Option<Self> {
         match s.to_ascii_lowercase().as_str() {
-            "quic" => Some(TransportKind::Quic),
-            "tcp-tls" | "tcptls" | "tls" => Some(TransportKind::TcpTls),
-            "tcp" => Some(TransportKind::Tcp),
-            "uds" | "unix" | "local" => Some(TransportKind::Uds),
+            "quic" => Some(Self::Quic),
+            "tcp-tls" | "tcptls" | "tls" => Some(Self::TcpTls),
+            "tcp" => Some(Self::Tcp),
+            "uds" | "unix" | "local" => Some(Self::Uds),
             _ => None,
         }
     }

@@ -13,7 +13,7 @@
 //!   window in the singleton instance.
 //!
 //! Prod vs dev split (see [`launch_desktop`]): a **release** build is the native
-//! singleton — it routes to / cold-starts the installed GUI (macOS LaunchServices
+//! singleton — it routes to / cold-starts the installed GUI (macOS `LaunchServices`
 //! plus the `kmux://` URL scheme; Linux D-Bus app-id). A **debug** build
 //! (`./kmux`, the `dev` mise task) instead **kills any stale instance and runs
 //! the freshly built binary directly**, so what you see is always the code you

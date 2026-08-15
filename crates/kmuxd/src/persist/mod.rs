@@ -81,7 +81,7 @@ pub struct PersistedDaemonState {
 /// One persisted session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSession {
-    /// Session-level metadata (word_id, name, cwd, index).
+    /// Session-level metadata (`word_id`, name, cwd, index).
     pub meta: SessionMeta,
     /// Next pane index to assign within this session.
     pub next_pane_index: u32,

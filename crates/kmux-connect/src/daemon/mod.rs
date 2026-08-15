@@ -19,7 +19,7 @@ pub fn boot_log_hint() -> String {
     lifecycle::format_boot_log_hint()
 }
 
-/// Protects XDG_RUNTIME_DIR mutations — shared across all daemon tests.
+/// Protects `XDG_RUNTIME_DIR` mutations — shared across all daemon tests.
 #[cfg(test)]
 pub(super) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -128,8 +128,7 @@ pub async fn ensure_compatible_daemon() -> anyhow::Result<DaemonStatus> {
 
     let socket = || {
         kmux_protocol::dirs::socket_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "<unknown>".to_string())
+            .map_or_else(|_| "<unknown>".to_string(), |p| p.display().to_string())
     };
 
     // One attach-gate policy, defined in `kmux_protocol::compat`; each refusal
@@ -164,8 +163,7 @@ pub async fn ensure_compatible_daemon() -> anyhow::Result<DaemonStatus> {
             client = BuildProfile::CURRENT,
             daemon = status
                 .build_profile
-                .map(|p| p.as_str())
-                .unwrap_or("<unknown>"),
+                .map_or("<unknown>", BuildProfile::as_str),
             socket = socket(),
         ),
         Some(BlockReason::ProfileUnknown) => anyhow::bail!(
@@ -239,7 +237,9 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
@@ -278,7 +278,9 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
@@ -311,7 +313,9 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
@@ -352,7 +356,9 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
@@ -396,7 +402,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn control_request_timeout_surfaces_error() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
@@ -417,7 +425,9 @@ mod tests {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 

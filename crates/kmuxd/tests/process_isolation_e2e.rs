@@ -249,7 +249,9 @@ fn find_worker_pid(daemon_pid: u32, timeout: Duration) -> Option<i32> {
 #[tokio::test]
 #[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global env for the whole test
 async fn worker_crash_is_isolated_from_the_daemon() {
-    let _env = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env = ENV_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
     let tmp = tempfile::tempdir().unwrap();
     set_xdg(tmp.path());
 

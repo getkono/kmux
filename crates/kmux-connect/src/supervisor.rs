@@ -165,8 +165,7 @@ impl TransportScorer {
         if health.failure_count > 0 {
             let in_window = health
                 .last_failure
-                .map(|t| t.elapsed() < FAILURE_WINDOW)
-                .unwrap_or(false);
+                .is_some_and(|t| t.elapsed() < FAILURE_WINDOW);
             if in_window {
                 score -= (health.failure_count as i32) * FAILURE_PENALTY_PER;
             }
@@ -389,7 +388,7 @@ impl TransportSupervisor {
         }
     }
 
-    /// Run the supervisor loop (blocking until upgrade_tx is dropped).
+    /// Run the supervisor loop (blocking until `upgrade_tx` is dropped).
     pub async fn run(mut self) {
         let mut interval = tokio::time::interval(PROBE_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

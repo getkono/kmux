@@ -340,7 +340,7 @@ pub struct AppCore {
     pub is_local: bool,
     pub initial_cwd: String,
     pub did_auto_select: bool,
-    /// CLI `--session` flag: auto-attach to a session by name or word_id.
+    /// CLI `--session` flag: auto-attach to a session by name or `word_id`.
     pub auto_session: Option<String>,
     /// Effective cwd from `--cwd` or `:path` in server string.
     pub auto_cwd: Option<String>,

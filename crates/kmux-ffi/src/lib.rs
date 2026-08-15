@@ -252,8 +252,8 @@ pub enum FfiAttentionKind {
 impl From<AttentionKind> for FfiAttentionKind {
     fn from(k: AttentionKind) -> Self {
         match k {
-            AttentionKind::TurnDone => FfiAttentionKind::TurnDone,
-            AttentionKind::NeedsInput => FfiAttentionKind::NeedsInput,
+            AttentionKind::TurnDone => Self::TurnDone,
+            AttentionKind::NeedsInput => Self::NeedsInput,
         }
     }
 }
@@ -261,13 +261,13 @@ impl From<AttentionKind> for FfiAttentionKind {
 impl From<FrontendEffect> for FfiEffect {
     fn from(e: FrontendEffect) -> Self {
         match e {
-            FrontendEffect::NeedsRender => FfiEffect::NeedsRender,
-            FrontendEffect::ForceClear => FfiEffect::ForceClear,
-            FrontendEffect::PaletteChanged => FfiEffect::PaletteChanged,
-            FrontendEffect::CopyToClipboard(text) => FfiEffect::CopyToClipboard { text },
-            FrontendEffect::RequestPaste => FfiEffect::RequestPaste,
-            FrontendEffect::Quit => FfiEffect::Quit,
-            FrontendEffect::ResetRenderer => FfiEffect::ResetRenderer,
+            FrontendEffect::NeedsRender => Self::NeedsRender,
+            FrontendEffect::ForceClear => Self::ForceClear,
+            FrontendEffect::PaletteChanged => Self::PaletteChanged,
+            FrontendEffect::CopyToClipboard(text) => Self::CopyToClipboard { text },
+            FrontendEffect::RequestPaste => Self::RequestPaste,
+            FrontendEffect::Quit => Self::Quit,
+            FrontendEffect::ResetRenderer => Self::ResetRenderer,
             FrontendEffect::Attention {
                 word_id,
                 pane_id,
@@ -275,7 +275,7 @@ impl From<FrontendEffect> for FfiEffect {
                 title,
                 body,
                 attention_id,
-            } => FfiEffect::Attention {
+            } => Self::Attention {
                 word_id,
                 pane_id,
                 kind: kind.into(),
@@ -366,54 +366,54 @@ pub enum FfiAction {
 impl From<FfiAction> for Action {
     fn from(a: FfiAction) -> Self {
         match a {
-            FfiAction::CreateSession => Action::CreateSession,
-            FfiAction::CloseSession => Action::CloseSession,
-            FfiAction::NextSession => Action::NextSession,
-            FfiAction::PrevSession => Action::PrevSession,
-            FfiAction::JumpToSession { index } => Action::JumpToSession(index as usize),
-            FfiAction::CreatePane => Action::CreatePane,
-            FfiAction::ClosePane => Action::ClosePane,
-            FfiAction::UndoClose => Action::UndoClose,
-            FfiAction::NextTab => Action::NextTab,
-            FfiAction::PrevTab => Action::PrevTab,
-            FfiAction::NextPaneInTab => Action::NextPaneInTab,
-            FfiAction::PrevPaneInTab => Action::PrevPaneInTab,
-            FfiAction::CloseTab => Action::CloseTab,
-            FfiAction::RenameTab => Action::RenameTab,
-            FfiAction::SplitRight => Action::SplitRight,
-            FfiAction::SplitDown => Action::SplitDown,
-            FfiAction::FocusLeft => Action::FocusLeft,
-            FfiAction::FocusRight => Action::FocusRight,
-            FfiAction::FocusUp => Action::FocusUp,
-            FfiAction::FocusDown => Action::FocusDown,
-            FfiAction::ResizeLeft => Action::ResizeLeft,
-            FfiAction::ResizeRight => Action::ResizeRight,
-            FfiAction::ResizeUp => Action::ResizeUp,
-            FfiAction::ResizeDown => Action::ResizeDown,
-            FfiAction::SwapNext => Action::SwapNext,
-            FfiAction::SwapPrev => Action::SwapPrev,
-            FfiAction::CycleLayout => Action::CycleLayout,
-            FfiAction::ToggleZoom => Action::ToggleZoom,
-            FfiAction::FocusPaneAt { index } => Action::FocusPaneAt(index),
-            FfiAction::ScrollUp { lines } => Action::ScrollUp(lines as usize),
-            FfiAction::ScrollDown { lines } => Action::ScrollDown(lines as usize),
-            FfiAction::ScrollPageUp => Action::ScrollPageUp,
-            FfiAction::ScrollPageDown => Action::ScrollPageDown,
-            FfiAction::ToggleHud => Action::ToggleHud,
-            FfiAction::ToggleMetrics => Action::ToggleMetrics,
-            FfiAction::ToggleProcessOverview => Action::ToggleProcessOverview,
-            FfiAction::ToggleConnectedClients => Action::ToggleConnectedClients,
-            FfiAction::ToggleConnection => Action::ToggleConnection,
-            FfiAction::ToggleRenderDebug => Action::ToggleRenderDebug,
-            FfiAction::ResetRenderer => Action::ResetRenderer,
-            FfiAction::ToggleInputLock => Action::ToggleInputLock,
-            FfiAction::TogglePause => Action::TogglePause,
-            FfiAction::ToggleFocusedPaneNoAutoPause => Action::ToggleFocusedPaneNoAutoPause,
-            FfiAction::ToggleActiveSessionNoAutoPause => Action::ToggleActiveSessionNoAutoPause,
-            FfiAction::CopySelection => Action::CopySelection,
-            FfiAction::Paste => Action::Paste,
-            FfiAction::Quit => Action::Quit,
-            FfiAction::Reconnect => Action::Reconnect,
+            FfiAction::CreateSession => Self::CreateSession,
+            FfiAction::CloseSession => Self::CloseSession,
+            FfiAction::NextSession => Self::NextSession,
+            FfiAction::PrevSession => Self::PrevSession,
+            FfiAction::JumpToSession { index } => Self::JumpToSession(index as usize),
+            FfiAction::CreatePane => Self::CreatePane,
+            FfiAction::ClosePane => Self::ClosePane,
+            FfiAction::UndoClose => Self::UndoClose,
+            FfiAction::NextTab => Self::NextTab,
+            FfiAction::PrevTab => Self::PrevTab,
+            FfiAction::NextPaneInTab => Self::NextPaneInTab,
+            FfiAction::PrevPaneInTab => Self::PrevPaneInTab,
+            FfiAction::CloseTab => Self::CloseTab,
+            FfiAction::RenameTab => Self::RenameTab,
+            FfiAction::SplitRight => Self::SplitRight,
+            FfiAction::SplitDown => Self::SplitDown,
+            FfiAction::FocusLeft => Self::FocusLeft,
+            FfiAction::FocusRight => Self::FocusRight,
+            FfiAction::FocusUp => Self::FocusUp,
+            FfiAction::FocusDown => Self::FocusDown,
+            FfiAction::ResizeLeft => Self::ResizeLeft,
+            FfiAction::ResizeRight => Self::ResizeRight,
+            FfiAction::ResizeUp => Self::ResizeUp,
+            FfiAction::ResizeDown => Self::ResizeDown,
+            FfiAction::SwapNext => Self::SwapNext,
+            FfiAction::SwapPrev => Self::SwapPrev,
+            FfiAction::CycleLayout => Self::CycleLayout,
+            FfiAction::ToggleZoom => Self::ToggleZoom,
+            FfiAction::FocusPaneAt { index } => Self::FocusPaneAt(index),
+            FfiAction::ScrollUp { lines } => Self::ScrollUp(lines as usize),
+            FfiAction::ScrollDown { lines } => Self::ScrollDown(lines as usize),
+            FfiAction::ScrollPageUp => Self::ScrollPageUp,
+            FfiAction::ScrollPageDown => Self::ScrollPageDown,
+            FfiAction::ToggleHud => Self::ToggleHud,
+            FfiAction::ToggleMetrics => Self::ToggleMetrics,
+            FfiAction::ToggleProcessOverview => Self::ToggleProcessOverview,
+            FfiAction::ToggleConnectedClients => Self::ToggleConnectedClients,
+            FfiAction::ToggleConnection => Self::ToggleConnection,
+            FfiAction::ToggleRenderDebug => Self::ToggleRenderDebug,
+            FfiAction::ResetRenderer => Self::ResetRenderer,
+            FfiAction::ToggleInputLock => Self::ToggleInputLock,
+            FfiAction::TogglePause => Self::TogglePause,
+            FfiAction::ToggleFocusedPaneNoAutoPause => Self::ToggleFocusedPaneNoAutoPause,
+            FfiAction::ToggleActiveSessionNoAutoPause => Self::ToggleActiveSessionNoAutoPause,
+            FfiAction::CopySelection => Self::CopySelection,
+            FfiAction::Paste => Self::Paste,
+            FfiAction::Quit => Self::Quit,
+            FfiAction::Reconnect => Self::Reconnect,
         }
     }
 }
@@ -433,9 +433,9 @@ pub enum FfiPauseState {
 impl From<PauseReason> for FfiPauseState {
     fn from(r: PauseReason) -> Self {
         match r {
-            PauseReason::None => FfiPauseState::Active,
-            PauseReason::Manual => FfiPauseState::PausedManual,
-            PauseReason::Auto => FfiPauseState::PausedBackground,
+            PauseReason::None => Self::Active,
+            PauseReason::Manual => Self::PausedManual,
+            PauseReason::Auto => Self::PausedBackground,
         }
     }
 }
@@ -498,32 +498,32 @@ pub enum FfiNamedKey {
 impl FfiNamedKey {
     fn to_code(&self) -> KeyCode {
         match self {
-            FfiNamedKey::Enter => KeyCode::Enter,
-            FfiNamedKey::Tab => KeyCode::Tab,
-            FfiNamedKey::Backspace => KeyCode::Backspace,
-            FfiNamedKey::Escape => KeyCode::Escape,
-            FfiNamedKey::ArrowUp => KeyCode::ArrowUp,
-            FfiNamedKey::ArrowDown => KeyCode::ArrowDown,
-            FfiNamedKey::ArrowLeft => KeyCode::ArrowLeft,
-            FfiNamedKey::ArrowRight => KeyCode::ArrowRight,
-            FfiNamedKey::PageUp => KeyCode::PageUp,
-            FfiNamedKey::PageDown => KeyCode::PageDown,
-            FfiNamedKey::Home => KeyCode::Home,
-            FfiNamedKey::End => KeyCode::End,
-            FfiNamedKey::Delete => KeyCode::Delete,
-            FfiNamedKey::Insert => KeyCode::Insert,
-            FfiNamedKey::F1 => KeyCode::F1,
-            FfiNamedKey::F2 => KeyCode::F2,
-            FfiNamedKey::F3 => KeyCode::F3,
-            FfiNamedKey::F4 => KeyCode::F4,
-            FfiNamedKey::F5 => KeyCode::F5,
-            FfiNamedKey::F6 => KeyCode::F6,
-            FfiNamedKey::F7 => KeyCode::F7,
-            FfiNamedKey::F8 => KeyCode::F8,
-            FfiNamedKey::F9 => KeyCode::F9,
-            FfiNamedKey::F10 => KeyCode::F10,
-            FfiNamedKey::F11 => KeyCode::F11,
-            FfiNamedKey::F12 => KeyCode::F12,
+            Self::Enter => KeyCode::Enter,
+            Self::Tab => KeyCode::Tab,
+            Self::Backspace => KeyCode::Backspace,
+            Self::Escape => KeyCode::Escape,
+            Self::ArrowUp => KeyCode::ArrowUp,
+            Self::ArrowDown => KeyCode::ArrowDown,
+            Self::ArrowLeft => KeyCode::ArrowLeft,
+            Self::ArrowRight => KeyCode::ArrowRight,
+            Self::PageUp => KeyCode::PageUp,
+            Self::PageDown => KeyCode::PageDown,
+            Self::Home => KeyCode::Home,
+            Self::End => KeyCode::End,
+            Self::Delete => KeyCode::Delete,
+            Self::Insert => KeyCode::Insert,
+            Self::F1 => KeyCode::F1,
+            Self::F2 => KeyCode::F2,
+            Self::F3 => KeyCode::F3,
+            Self::F4 => KeyCode::F4,
+            Self::F5 => KeyCode::F5,
+            Self::F6 => KeyCode::F6,
+            Self::F7 => KeyCode::F7,
+            Self::F8 => KeyCode::F8,
+            Self::F9 => KeyCode::F9,
+            Self::F10 => KeyCode::F10,
+            Self::F11 => KeyCode::F11,
+            Self::F12 => KeyCode::F12,
         }
     }
 }
@@ -540,9 +540,9 @@ pub enum FfiMouseButton {
 impl FfiMouseButton {
     fn to_client(&self) -> MouseButton {
         match self {
-            FfiMouseButton::Left => MouseButton::Left,
-            FfiMouseButton::Middle => MouseButton::Middle,
-            FfiMouseButton::Right => MouseButton::Right,
+            Self::Left => MouseButton::Left,
+            Self::Middle => MouseButton::Middle,
+            Self::Right => MouseButton::Right,
         }
     }
 }
@@ -558,9 +558,9 @@ pub enum FfiMouseKind {
 impl FfiMouseKind {
     fn to_client(&self) -> MouseEventKind {
         match self {
-            FfiMouseKind::Press => MouseEventKind::Press,
-            FfiMouseKind::Release => MouseEventKind::Release,
-            FfiMouseKind::Motion => MouseEventKind::Motion,
+            Self::Press => MouseEventKind::Press,
+            Self::Release => MouseEventKind::Release,
+            Self::Motion => MouseEventKind::Motion,
         }
     }
 }
@@ -737,11 +737,11 @@ pub struct FfiCellAdjust {
 impl From<&CellAdjust> for FfiCellAdjust {
     fn from(a: &CellAdjust) -> Self {
         match a {
-            CellAdjust::Pixels(v) => FfiCellAdjust {
+            CellAdjust::Pixels(v) => Self {
                 kind: FfiCellAdjustKind::Pixels,
                 value: *v,
             },
-            CellAdjust::Percent(v) => FfiCellAdjust {
+            CellAdjust::Percent(v) => Self {
                 kind: FfiCellAdjustKind::Percent,
                 value: *v,
             },
@@ -774,7 +774,11 @@ impl From<&Appearance> for FfiAppearance {
             family_bold_italic: a.family_bold_italic.clone(),
             size_pt: a.size_pt,
             style: a.style.clone(),
-            features: a.features.iter().map(|f| f.to_setting()).collect(),
+            features: a
+                .features
+                .iter()
+                .map(kmux_app::appearance::FontFeature::to_setting)
+                .collect(),
             cell_width_adjust: (&a.cell_width_adjust).into(),
             cell_height_adjust: (&a.cell_height_adjust).into(),
         }
@@ -794,11 +798,11 @@ pub enum FfiConnStatus {
 impl From<&ConnectionState> for FfiConnStatus {
     fn from(s: &ConnectionState) -> Self {
         match s {
-            ConnectionState::Idle => FfiConnStatus::Idle,
-            ConnectionState::Handshaking => FfiConnStatus::Handshaking,
-            ConnectionState::Connected { .. } => FfiConnStatus::Connected,
-            ConnectionState::Reconnecting { .. } => FfiConnStatus::Reconnecting,
-            ConnectionState::Disconnected { .. } => FfiConnStatus::Disconnected,
+            ConnectionState::Idle => Self::Idle,
+            ConnectionState::Handshaking => Self::Handshaking,
+            ConnectionState::Connected { .. } => Self::Connected,
+            ConnectionState::Reconnecting { .. } => Self::Reconnecting,
+            ConnectionState::Disconnected { .. } => Self::Disconnected,
         }
     }
 }
@@ -992,11 +996,11 @@ pub enum FfiProgressState {
 impl From<PaneProgressState> for FfiProgressState {
     fn from(s: PaneProgressState) -> Self {
         match s {
-            PaneProgressState::Remove => FfiProgressState::Remove,
-            PaneProgressState::Set => FfiProgressState::Set,
-            PaneProgressState::Error => FfiProgressState::Error,
-            PaneProgressState::Indeterminate => FfiProgressState::Indeterminate,
-            PaneProgressState::Pause => FfiProgressState::Pause,
+            PaneProgressState::Remove => Self::Remove,
+            PaneProgressState::Set => Self::Set,
+            PaneProgressState::Error => Self::Error,
+            PaneProgressState::Indeterminate => Self::Indeterminate,
+            PaneProgressState::Pause => Self::Pause,
         }
     }
 }
@@ -1168,7 +1172,7 @@ pub struct FfiDirRow {
     /// A user-facing label (the directory name, the parent path, or the
     /// "new session in …" affordance).
     pub label: String,
-    /// The target path this row acts on (the browsed dir for CreateHere, the
+    /// The target path this row acts on (the browsed dir for `CreateHere`, the
     /// parent for Up, the subdir for Enter).
     pub path: String,
 }
@@ -1187,7 +1191,7 @@ pub struct FfiDirBrowser {
     pub query: String,
     /// The highlighted row index.
     pub selected: u32,
-    /// The browsable rows in render order (CreateHere, optional Up, subdirs).
+    /// The browsable rows in render order (`CreateHere`, optional Up, subdirs).
     pub rows: Vec<FfiDirRow>,
     /// A listing error to surface (e.g. permission denied), if any.
     pub error: Option<String>,
@@ -1260,7 +1264,7 @@ pub struct FfiAddRemoteForm {
 
 impl From<FfiAddRemoteForm> for AddRemoteForm {
     fn from(f: FfiAddRemoteForm) -> Self {
-        AddRemoteForm {
+        Self {
             host: f.host,
             user: f.user,
             port: f.port,
@@ -1855,7 +1859,7 @@ impl KmuxDriver {
     /// The session list, with the active session flagged.
     pub fn sessions(&self) -> Vec<FfiSession> {
         let d = self.inner.lock().expect("driver mutex poisoned");
-        let active = d.mgr.active_session().map(|s| s.to_string());
+        let active = d.mgr.active_session().map(ToString::to_string);
         d.mgr
             .session_list()
             .iter()
@@ -1921,7 +1925,7 @@ impl KmuxDriver {
     /// The panes (tabs) of the active session, with the active pane flagged.
     pub fn panes(&self) -> Vec<FfiPane> {
         let d = self.inner.lock().expect("driver mutex poisoned");
-        let active = d.mgr.active_pane_id().map(|s| s.to_string());
+        let active = d.mgr.active_pane_id().map(ToString::to_string);
         d.mgr
             .active_session_panes()
             .iter()
@@ -1952,7 +1956,7 @@ impl KmuxDriver {
         let word = d
             .mgr
             .active_session()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .unwrap_or_default();
         d.mgr
             .active_session_tabs()
@@ -2015,7 +2019,7 @@ impl KmuxDriver {
     /// resolved sizes back via [`set_pane_sizes`](Self::set_pane_sizes).
     pub fn layout(&self, area_cols: u16, area_rows: u16) -> Vec<FfiPaneRect> {
         let d = self.inner.lock().expect("driver mutex poisoned");
-        let Some(word) = d.mgr.active_session().map(|s| s.to_string()) else {
+        let Some(word) = d.mgr.active_session().map(ToString::to_string) else {
             return Vec::new();
         };
         let focused = d.mgr.active_pane_id().and_then(pane_index);
@@ -2035,8 +2039,9 @@ impl KmuxDriver {
             let (progress_state, progress) = d
                 .mgr
                 .pane_info(&pane_id)
-                .map(|p| (p.progress_state.into(), p.progress))
-                .unwrap_or((FfiProgressState::Remove, None));
+                .map_or((FfiProgressState::Remove, None), |p| {
+                    (p.progress_state.into(), p.progress)
+                });
             let paused = d.core().is_pane_paused(&pane_id);
             let no_auto_pause = d.core().pane_no_auto_pause(&pane_id);
             FfiPaneRect {
@@ -2304,20 +2309,18 @@ impl KmuxDriver {
     /// frontend's `scroll_pane`.
     pub fn scroll_at(&self, col: u32, row: u32, lines: i32) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let Some(pane_id) = d.mgr.active_pane_id().map(|s| s.to_string()) else {
+        let Some(pane_id) = d.mgr.active_pane_id().map(ToString::to_string) else {
             return;
         };
         let use_pty = d
             .mgr
             .buffer(&pane_id)
-            .map(|g| g.modes().mouse_report())
-            .unwrap_or(false);
+            .is_some_and(|g| g.modes().mouse_report());
         if use_pty {
             let sgr = d
                 .mgr
                 .buffer(&pane_id)
-                .map(|g| g.modes().sgr_mouse())
-                .unwrap_or(false);
+                .is_some_and(|g| g.modes().sgr_mouse());
             let bytes = encode_mouse_scroll(col as u16 + 1, row as u16 + 1, lines, sgr);
             if !bytes.is_empty() {
                 d.send_input(bytes);
@@ -2510,7 +2513,7 @@ impl KmuxDriver {
             query: core.dir_picker_buffer.clone(),
             selected: core.dir_picker_selected as u32,
             rows,
-            error: core.dir_browser_error().map(|s| s.to_string()),
+            error: core.dir_browser_error().map(ToString::to_string),
         })
     }
 
@@ -2628,7 +2631,7 @@ impl KmuxDriver {
     }
 
     /// Activate directory-browser row `index` (a tap): selects it, then submits.
-    /// CreateHere creates the session and dismisses; Up / a subdirectory
+    /// `CreateHere` creates the session and dismisses; Up / a subdirectory
     /// navigate and keep the browser open (it refreshes when the listing lands).
     pub fn dir_browser_activate(&self, index: u32) -> Vec<FfiEffect> {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
@@ -2641,7 +2644,7 @@ impl KmuxDriver {
     }
 
     /// Create a new session in the directory currently being browsed (the
-    /// CreateHere affordance), regardless of the highlighted row.
+    /// `CreateHere` affordance), regardless of the highlighted row.
     pub fn dir_browser_open_here(&self) -> Vec<FfiEffect> {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         d.core_mut().set_picker_selected(0);
@@ -2867,7 +2870,7 @@ impl KmuxDriver {
     pub fn available_themes(&self) -> Vec<String> {
         theme::BUILTIN_THEMES
             .iter()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .collect()
     }
 

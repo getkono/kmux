@@ -4,14 +4,14 @@
 //! and the renderer ([`crate::renderer`]) only uploads it. It mirrors the draw
 //! order of the CPU renderers it replaces:
 //!
-//! 1. **bg_quads** — every cell's background (opaque; spacers included so
+//! 1. **`bg_quads`** — every cell's background (opaque; spacers included so
 //!    wide-char halves stay opaque).
 //! 2. **glyphs** — each cell's glyph in its foreground (dim → reduced alpha).
-//! 3. **overlay_quads** — underline/strikethrough rules, selection wash, the
+//! 3. **`overlay_quads`** — underline/strikethrough rules, selection wash, the
 //!    cursor (block fill / bar / underline / hollow outline), focus border, and
 //!    the scroll-indicator background — in that emission order, so the cursor
 //!    sits above the wash and the border above all.
-//! 4. **overlay_glyphs** — the block cursor's glyph (in `cursor_fg`, over its
+//! 4. **`overlay_glyphs`** — the block cursor's glyph (in `cursor_fg`, over its
 //!    fill) and the scroll-indicator text.
 //!
 //! The renderer draws the four lists in that order. Glyph quads carry only the
@@ -88,10 +88,10 @@ impl FaceStyle {
     /// The face implied by a cell's bold/italic attribute bits.
     pub fn from_attrs(a: CellAttrs) -> Self {
         match (a.contains(CellAttrs::BOLD), a.contains(CellAttrs::ITALIC)) {
-            (true, true) => FaceStyle::BoldItalic,
-            (true, false) => FaceStyle::Bold,
-            (false, true) => FaceStyle::Italic,
-            (false, false) => FaceStyle::Regular,
+            (true, true) => Self::BoldItalic,
+            (true, false) => Self::Bold,
+            (false, true) => Self::Italic,
+            (false, false) => Self::Regular,
         }
     }
 }
@@ -436,7 +436,7 @@ pub fn build_scene_cached(
         };
 
         if let Some(grid) = grid {
-            let grid_id = grid as *const CellGrid as usize;
+            let grid_id = std::ptr::from_ref(grid) as usize;
             let pc = &mut cache.panes[pi];
             let nrows = pane.rows as usize;
             // Invalidate this pane's rows if the frame signature changed, the
@@ -696,7 +696,7 @@ fn emit_cursor(
 }
 
 /// The solid rectangles a cursor of `shape` occupies, with cell top-left at
-/// `(x, y)` in physical px. Block → one full-cell rect; HollowBlock → four
+/// `(x, y)` in physical px. Block → one full-cell rect; `HollowBlock` → four
 /// outline rects (top, bottom, left, right — matching [`emit_outline`]);
 /// Underline/Bar → one thin rect; Hidden → none. The single definition shared by
 /// [`emit_cursor`] (the renderer) and [`cursor_geometry`] (debug tooling).

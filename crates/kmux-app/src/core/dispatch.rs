@@ -66,7 +66,7 @@ impl AppCore {
             Action::CloseTab => self.mgr.close_tab(),
             Action::RenameTab => {
                 if let (Some(word_id), Some(tab_index)) = (
-                    self.mgr.active_session().map(|s| s.to_string()),
+                    self.mgr.active_session().map(ToString::to_string),
                     self.mgr.active_tab(),
                 ) {
                     let buffer = self.mgr.active_tab_name().unwrap_or_default();
@@ -103,7 +103,7 @@ impl AppCore {
                 }
             }
             Action::RenameSession => {
-                if let Some(word_id) = self.mgr.active_session().map(|s| s.to_string()) {
+                if let Some(word_id) = self.mgr.active_session().map(ToString::to_string) {
                     let current_name = self
                         .mgr
                         .session_list()
@@ -177,7 +177,7 @@ impl AppCore {
                 self.mode = Mode::Normal;
             }
             Action::SendSignal(signal) => {
-                if let Some(pane_id) = self.mgr.active_pane_id().map(|s| s.to_string()) {
+                if let Some(pane_id) = self.mgr.active_pane_id().map(ToString::to_string) {
                     self.mgr.send_signal(&pane_id, signal);
                 }
             }
@@ -248,7 +248,11 @@ impl AppCore {
                 self.toggle_active_session_no_auto_pause();
             }
             Action::CopySelection => {
-                if let Some(text) = self.mgr.active_grid().and_then(|g| g.selected_text()) {
+                if let Some(text) = self
+                    .mgr
+                    .active_grid()
+                    .and_then(kmux_client::grid::CellGrid::selected_text)
+                {
                     return KeyResult::CopyToClipboard(text);
                 }
             }
@@ -427,12 +431,9 @@ impl AppCore {
                 // the live `Mode::Command` and we'll fall back to the selected
                 // hint if the typed buffer doesn't parse cleanly.
                 let hints = cmd::hint::build_hints(self);
-                let state =
-                    if let Mode::Command(s) = std::mem::replace(&mut self.mode, Mode::Normal) {
-                        s
-                    } else {
-                        return KeyResult::Continue;
-                    };
+                let Mode::Command(state) = std::mem::replace(&mut self.mode, Mode::Normal) else {
+                    return KeyResult::Continue;
+                };
                 let typed = state.buffer.trim().to_string();
                 if typed.is_empty() {
                     return KeyResult::Continue;
@@ -454,7 +455,7 @@ impl AppCore {
                 };
                 // Push the *typed* form into history (so users can recall what
                 // they actually pressed, not the auto-completed expansion).
-                if self.command_history.back().map(|s| s.as_str()) != Some(typed.as_str()) {
+                if self.command_history.back().map(String::as_str) != Some(typed.as_str()) {
                     self.command_history.push_back(typed.clone());
                     while self.command_history.len() > COMMAND_HISTORY_CAP {
                         self.command_history.pop_front();
@@ -491,7 +492,7 @@ impl AppCore {
             &crate::layout::LayoutConfig::default(),
         );
         if let Some(target) = crate::layout::focus_neighbor(&rects, focused, dir)
-            && let Some(word) = self.mgr.active_session().map(|s| s.to_string())
+            && let Some(word) = self.mgr.active_session().map(ToString::to_string)
         {
             self.mgr.focus_pane(format_pane_id(&word, target));
         }
@@ -508,7 +509,7 @@ impl AppCore {
         else {
             return;
         };
-        if let Some(word) = self.mgr.active_session().map(|s| s.to_string()) {
+        if let Some(word) = self.mgr.active_session().map(ToString::to_string) {
             self.mgr.focus_pane(format_pane_id(&word, pane_index));
         }
     }
@@ -528,7 +529,7 @@ impl AppCore {
             .unwrap_or(0);
         let len = leaves.len() as i32;
         let next = (current as i32 + delta).rem_euclid(len) as usize;
-        if let Some(word) = self.mgr.active_session().map(|s| s.to_string()) {
+        if let Some(word) = self.mgr.active_session().map(ToString::to_string) {
             self.mgr.focus_pane(format_pane_id(&word, leaves[next]));
         }
     }
@@ -552,9 +553,8 @@ impl AppCore {
     }
 
     fn command_hint_up(&mut self) {
-        let state = match &mut self.mode {
-            Mode::Command(s) => s,
-            _ => return,
+        let Mode::Command(state) = &mut self.mode else {
+            return;
         };
         if state.selected > 0 {
             state.selected -= 1;

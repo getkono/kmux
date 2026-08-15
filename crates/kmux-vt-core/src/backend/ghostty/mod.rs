@@ -849,6 +849,7 @@ mod tests {
 
         static SINK: OnceLock<Arc<TitleCapture>> = OnceLock::new();
         let sink = SINK.get_or_init(|| Arc::new(TitleCapture(Mutex::new(vec![]))));
+        let events: Arc<dyn BackendEventSink> = sink.clone();
 
         let cfg = BackendConfig {
             size: BackendSize {
@@ -861,7 +862,7 @@ mod tests {
                 kitty_graphics: Arc::new(AtomicBool::new(false)),
                 kitty_keyboard: Arc::new(AtomicBool::new(false)),
             },
-            events: Arc::clone(sink) as Arc<dyn BackendEventSink>,
+            events: Arc::clone(&events),
             scrollback: 1_000,
         };
 
@@ -887,6 +888,7 @@ mod tests {
         }
 
         let sink = Arc::new(ProgressCapture(Mutex::new(vec![])));
+        let events: Arc<dyn BackendEventSink> = sink.clone();
         let cfg = BackendConfig {
             size: BackendSize {
                 rows: 24,
@@ -898,7 +900,7 @@ mod tests {
                 kitty_graphics: Arc::new(AtomicBool::new(false)),
                 kitty_keyboard: Arc::new(AtomicBool::new(false)),
             },
-            events: Arc::clone(&sink) as Arc<dyn BackendEventSink>,
+            events: Arc::clone(&events),
             scrollback: 1_000,
         };
 
@@ -930,6 +932,7 @@ mod tests {
         }
 
         let sink = Arc::new(ResponseCapture(Mutex::new(vec![])));
+        let events: Arc<dyn BackendEventSink> = sink.clone();
         let cfg = BackendConfig {
             size: BackendSize {
                 rows: 24,
@@ -941,7 +944,7 @@ mod tests {
                 kitty_graphics: Arc::new(AtomicBool::new(false)),
                 kitty_keyboard: Arc::new(AtomicBool::new(false)),
             },
-            events: Arc::clone(&sink) as Arc<dyn BackendEventSink>,
+            events: Arc::clone(&events),
             scrollback: 1_000,
         };
 

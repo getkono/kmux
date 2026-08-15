@@ -51,8 +51,8 @@ pub enum ResolvedTarget {
 impl ResolvedTarget {
     pub fn label(&self) -> String {
         match self {
-            ResolvedTarget::LocalDaemon => "local-daemon".to_string(),
-            ResolvedTarget::Ssh { target, .. } => match &target.user {
+            Self::LocalDaemon => "local-daemon".to_string(),
+            Self::Ssh { target, .. } => match &target.user {
                 Some(u) => format!("ssh {u}@{}", target.host),
                 None => format!("ssh {}", target.host),
             },
@@ -87,7 +87,7 @@ pub struct BootstrapOutcome {
     pub connection_id: ConnectionId,
     pub server_version: Option<String>,
     pub is_local: bool,
-    /// `Some` for SSH targets; `None` for LocalDaemon / Direct.
+    /// `Some` for SSH targets; `None` for `LocalDaemon` / Direct.
     pub ssh_context: Option<SshContext>,
     pub bootstrap_elapsed: Duration,
 }
@@ -389,10 +389,10 @@ async fn prepare_local_daemon(
     {
         return Err(BootstrapError::VersionMismatch {
             client: kmux_protocol::messages::PROTOCOL_RANGE.to_string(),
-            server: status
-                .protocol_range
-                .map(|range| range.to_string())
-                .unwrap_or_else(|| format!("legacy-{}", status.protocol_version)),
+            server: status.protocol_range.map_or_else(
+                || format!("legacy-{}", status.protocol_version),
+                |range| range.to_string(),
+            ),
         });
     }
 
@@ -486,8 +486,7 @@ async fn establish(
     let uds_path_str;
     let (hs_host, hs_port): (&str, u16) = if plan.transport == TransportKind::Uds {
         uds_path_str = kmux_protocol::dirs::data_socket_path()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "?".to_string());
+            .map_or_else(|_| "?".to_string(), |p| p.to_string_lossy().into_owned());
         (&uds_path_str, 0)
     } else {
         (&plan.host, plan.port)

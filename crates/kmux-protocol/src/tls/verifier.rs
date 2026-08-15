@@ -217,7 +217,7 @@ fn build_native_ca_verifier() -> Option<Arc<dyn ServerCertVerifier>> {
     rustls::client::WebPkiServerVerifier::builder(Arc::new(roots))
         .build()
         .ok()
-        .map(|v| v as Arc<dyn ServerCertVerifier>)
+        .map(|v| -> Arc<dyn ServerCertVerifier> { v })
 }
 
 // ─── Tests ───────────────────────────────────────────────────────────────────

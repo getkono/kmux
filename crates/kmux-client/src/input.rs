@@ -1,6 +1,6 @@
 //! Mouse-event encoding and shared key helpers for the kmux client.
 //!
-//! Key encoding moved server-side in PROTOCOL_VERSION 18: the daemon owns a
+//! Key encoding moved server-side in `PROTOCOL_VERSION` 18: the daemon owns a
 //! per-pane Ghostty key encoder and decides the byte sequence for each
 //! keystroke based on what the inner program negotiated (DECCKM, kitty kbd
 //! flags, modifyOtherKeys).  The client now sends structured key events via
@@ -64,9 +64,9 @@ impl MouseButton {
     /// The low button bits of the xterm `cb` byte (left=0, middle=1, right=2).
     fn code(self) -> u8 {
         match self {
-            MouseButton::Left => 0,
-            MouseButton::Middle => 1,
-            MouseButton::Right => 2,
+            Self::Left => 0,
+            Self::Middle => 1,
+            Self::Right => 2,
         }
     }
 }

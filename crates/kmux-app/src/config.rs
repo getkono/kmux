@@ -35,8 +35,8 @@ impl RendererKind {
     /// (`"cairo"` / `"gpu"`).
     pub fn as_str(self) -> &'static str {
         match self {
-            RendererKind::Cairo => "cairo",
-            RendererKind::Gpu => "gpu",
+            Self::Cairo => "cairo",
+            Self::Gpu => "gpu",
         }
     }
 
@@ -44,8 +44,8 @@ impl RendererKind {
     /// Returns `None` for anything else.
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "cairo" => Some(RendererKind::Cairo),
-            "gpu" | "wgpu" => Some(RendererKind::Gpu),
+            "cairo" => Some(Self::Cairo),
+            "gpu" | "wgpu" => Some(Self::Gpu),
             _ => None,
         }
     }

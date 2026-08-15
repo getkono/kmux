@@ -56,15 +56,13 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
             use kmux_protocol::messages::PROTOCOL_RANGE;
 
             let socket_display = kmux_protocol::dirs::socket_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|e| format!("<error: {e}>"));
+                .map_or_else(|e| format!("<error: {e}>"), |p| p.display().to_string());
 
             match kmux_client::daemon::query_daemon().await {
                 Some(status) => {
                     let daemon_profile = status
                         .build_profile
-                        .map(|p| p.as_str())
-                        .unwrap_or("<unknown>");
+                        .map_or("<unknown>", BuildProfile::as_str);
                     let protocol_mismatch =
                         compat::protocol_match(status.protocol_range) != Match3::Same;
                     let profile_mismatch =
@@ -402,11 +400,11 @@ async fn collect_processes_by_session(
 ) -> std::collections::HashMap<String, Vec<String>> {
     use std::collections::HashMap;
 
-    let panes =
-        match tokio::time::timeout(PROCESS_QUERY_TIMEOUT, query_pane_processes(status)).await {
-            Ok(Ok(panes)) => panes,
-            _ => return HashMap::new(),
-        };
+    let Ok(Ok(panes)) =
+        tokio::time::timeout(PROCESS_QUERY_TIMEOUT, query_pane_processes(status)).await
+    else {
+        return HashMap::new();
+    };
 
     let mut by_session: HashMap<String, Vec<String>> = HashMap::new();
     for pane in panes {

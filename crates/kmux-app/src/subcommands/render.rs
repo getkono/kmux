@@ -84,7 +84,7 @@ pub fn client_rows(entries: &[(String, Vec<ClientInfo>)]) -> Vec<ClientRow> {
             let panes = c
                 .attached_panes
                 .iter()
-                .map(|p| p.to_string())
+                .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
             // Build identity (protocol 37): `<sha>[-dirty] (profile)`. Empty for
@@ -143,7 +143,7 @@ pub fn process_overview_rows(rows: &[OverviewRow]) -> Vec<ProcessRow> {
                 name,
                 cpu: format!("{:.1}", r.cpu_percent),
                 mem: format_bytes(r.mem_bytes),
-                pid: r.pid.map(|p| p.to_string()).unwrap_or_else(|| "-".into()),
+                pid: r.pid.map_or_else(|| "-".into(), |p| p.to_string()),
             }
         })
         .collect()

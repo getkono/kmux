@@ -36,9 +36,10 @@ pub(super) fn cleanup_stale_daemon() -> anyhow::Result<()> {
         ) {
             Ok(()) => {}
             Err(nix::errno::Errno::EWOULDBLOCK) => {
-                let owner = read_pid_file(&pid_path)
-                    .map(|pid| format!("PID {pid}"))
-                    .unwrap_or_else(|| "an active process".to_string());
+                let owner = read_pid_file(&pid_path).map_or_else(
+                    || "an active process".to_string(),
+                    |pid| format!("PID {pid}"),
+                );
                 return Err(anyhow::anyhow!(
                     "{owner} owns the daemon PID file but the control socket is unresponsive; \
                      automatic startup left it untouched. Inspect `kmux daemon status` and \
@@ -158,7 +159,7 @@ pub(super) fn format_boot_log_hint() -> String {
     let Ok(mut file) = std::fs::File::open(&path) else {
         return String::new();
     };
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let len = file.metadata().map_or(0, |m| m.len());
     if len == 0 {
         return String::new();
     }
@@ -196,8 +197,7 @@ fn daemon_log_size() -> u64 {
     kmux_protocol::dirs::daemon_log_path()
         .ok()
         .and_then(|p| std::fs::metadata(&p).ok())
-        .map(|m| m.len())
-        .unwrap_or(0)
+        .map_or(0, |m| m.len())
 }
 
 /// Read daemon.log from `from_offset` to the end and format it as an error suffix.
@@ -211,7 +211,7 @@ fn format_daemon_log_tail(from_offset: u64) -> String {
     let Ok(mut file) = std::fs::File::open(&path) else {
         return String::new();
     };
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let len = file.metadata().map_or(0, |m| m.len());
     if len <= from_offset {
         return String::new();
     }
@@ -533,7 +533,9 @@ mod tests {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
         let pid_path = kmux_protocol::dirs::pid_path().unwrap();
@@ -564,7 +566,9 @@ mod tests {
 
     #[test]
     fn cleanup_removes_unlocked_stale_artifacts() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
         let pid_path = kmux_protocol::dirs::pid_path().unwrap();
@@ -584,7 +588,9 @@ mod tests {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
@@ -633,7 +639,9 @@ mod tests {
 
     #[test]
     fn daemon_log_size_returns_zero_for_missing_file() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
         // No daemon.log — should not panic, should return 0.
@@ -643,7 +651,9 @@ mod tests {
 
     #[test]
     fn format_daemon_log_tail_empty_when_no_new_content() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
 
@@ -658,7 +668,9 @@ mod tests {
 
     #[test]
     fn format_daemon_log_tail_returns_only_new_content() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
 
@@ -698,7 +710,9 @@ mod tests {
     async fn ensure_daemon_surfaces_crash_stderr() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
@@ -744,7 +758,9 @@ mod tests {
     /// `target/debug/kmuxd` instead of an installed release one on `$PATH`.
     #[test]
     fn kmux_kmuxd_override_takes_precedence() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         let override_bin = tmp.path().join("my-kmuxd");
         std::fs::write(&override_bin, b"#!/bin/sh\n").unwrap();
@@ -791,7 +807,9 @@ mod tests {
     async fn force_kill_daemon_terminates_a_live_process() {
         // cleanup_stale_daemon (called on success) touches the runtime dir, so
         // pin it to a tempdir like the other daemon tests.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
@@ -820,7 +838,9 @@ mod tests {
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn force_kill_daemon_is_ok_when_already_gone() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
@@ -839,7 +859,9 @@ mod tests {
 
     #[test]
     fn running_daemon_pid_reports_live_and_absent() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
@@ -862,7 +884,9 @@ mod tests {
     /// never handed back, so resolution falls through to real discovery.
     #[test]
     fn stale_kmux_kmuxd_override_is_ignored() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         let missing = tmp.path().join("does-not-exist-kmuxd");
 
