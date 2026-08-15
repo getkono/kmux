@@ -81,3 +81,6 @@ tempfile.workspace = true
 # `TermState` via `NullEventSink` (feature unification turns it on only for the
 # test build, not the production daemon).
 kmux-vt-core = { workspace = true, features = ["test-util"] }
+
+[lints]
+workspace = true

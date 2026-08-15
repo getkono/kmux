@@ -49,3 +49,6 @@ pangocairo.workspace = true
 # automatic font fallback resolves Powerline/Nerd glyphs on the Cairo path (issue
 # #145). fontconfig is always present wherever GTK builds (pango links it).
 fontconfig-sys.workspace = true
+
+[lints]
+workspace = true

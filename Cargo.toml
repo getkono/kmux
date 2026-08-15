@@ -122,3 +122,61 @@ fontconfig-sys = { package = "yeslogic-fontconfig-sys", version = "6" }
 
 # Dev dependencies
 tempfile = "3"
+
+# ── Lints ─────────────────────────────────────────────────────────────────────
+# THE HARD GATE. Everything in these tables is at zero today, verified by a full
+# `cargo clippy --workspace --all-targets` run, and must stay at zero. Members
+# opt in with `[lints] workspace = true`.
+#
+# Levels are "warn", not "deny", on purpose: `mise run clippy` runs `-D warnings`
+# and promotes every one of them to an error in the hooks and in CI, while a
+# plain `cargo build` or rust-analyzer session stays readable.
+#
+# Lints that are NOT yet at zero are deliberately absent from this table. Putting
+# one here at any level would break the tree immediately, because -D warnings
+# makes "warn" fatal. They are instead injected by the lint gate as `-W` flags
+# and ratcheted per crate against quality-baseline.toml. Graduating one is a
+# two-line commit: drop it from the gate's list, add it here.
+#
+# Measured counts for the lints held back, so the next person does not have to
+# re-measure: clippy::str_to_string 715, unused_qualifications 65,
+# clippy::manual_let_else 18, trivial_casts 16, clippy::explicit_iter_loop 7,
+# clippy::ptr_as_ptr 5, clippy::implicit_clone 3, clippy::verbose_file_reads 2,
+# elided_lifetimes_in_paths 2.
+[workspace.lints.rust]
+# priority = -1 so the individual entries below can override the group; cargo
+# sorts by priority, then emits the flags left to right.
+future_incompatible = { level = "warn", priority = -1 }
+# Homoglyph and bidi source attacks.
+non_ascii_idents = "deny"
+# An `#[expect(...)]` whose violation no longer exists must be deleted. This is
+# what makes `#[allow]` -> `#[expect]` migration self-cleaning, and it is why
+# AGENTS.md requires `#[expect]` for every new suppression.
+unfulfilled_lint_expectations = "warn"
+unused_must_use = "deny"
+unused_extern_crates = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+trivial_numeric_casts = "warn"
+
+[workspace.lints.clippy]
+# `all` is clippy's default set and is already the effective gate via
+# `-D warnings`; stating it makes the baseline explicit rather than implied.
+all = { level = "warn", priority = -1 }
+# Manifest hygiene: every member already carries description/license/repository.
+cargo = { level = "warn", priority = -1 }
+# cargo-deny owns duplicate-version policy, with better diagnostics and an
+# explicit skip list; clippy's version is a flat, unactionable wall.
+multiple_crate_versions = "allow"
+
+# Placeholders and debug residue.
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+# Numeric and pointer hygiene. This workspace hand-rolls a MessagePack field
+# order and a C ABI, so a silent reinterpretation is a wire or FFI bug.
+cast_ptr_alignment = "deny"
+fn_to_numeric_cast_any = "deny"
+lossy_float_literal = "deny"
+rest_pat_in_fully_bound_structs = "warn"
+inefficient_to_string = "warn"

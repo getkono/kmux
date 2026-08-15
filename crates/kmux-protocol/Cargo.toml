@@ -66,3 +66,6 @@ tempfile.workspace = true
 zstd.workspace = true
 # Round-trip tests for the JSON control/handoff protocol (control_rpc.rs).
 serde_json.workspace = true
+
+[lints]
+workspace = true

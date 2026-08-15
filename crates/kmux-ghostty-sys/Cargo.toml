@@ -16,3 +16,6 @@ path = "src/lib.rs"
 [dependencies]
 
 [build-dependencies]
+
+[lints]
+workspace = true
