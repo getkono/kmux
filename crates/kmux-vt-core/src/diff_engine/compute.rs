@@ -18,56 +18,58 @@ impl<B: TerminalBackend> DiffEngine<B> {
         self.current_cells.fill(CellState::default());
         let (cursor_state, modes) = self.backend.fill_cells_and_cursor(&mut self.current_cells);
 
-        // Compare all rows, tracking clear-detection metadata inline to avoid
-        // a second O(rows*cols) scan.
+        // Compare all rows. A run of adjacent changed cells collapses into one
+        // `DiffOp::Row`; a lone changed cell becomes a `DiffOp::Cell`.
         let total = rows * cols;
         let mut ops = Vec::new();
         let mut total_changed: usize = 0;
-        let mut all_current_default = true;
         for r in 0..rows {
             let base = r * cols;
             let mut c = 0;
             while c < cols {
                 if self.current_cells[base + c] == self.prev_cells[base + c] {
-                    if all_current_default && self.current_cells[base + c] != CellState::default() {
-                        all_current_default = false;
-                    }
                     c += 1;
+                    continue;
+                }
+                let start = c;
+                c += 1;
+                while c < cols && self.current_cells[base + c] != self.prev_cells[base + c] {
+                    c += 1;
+                }
+                let run_len = c - start;
+                total_changed += run_len;
+                if run_len >= 2 {
+                    ops.push(DiffOp::Row {
+                        row: r as u16,
+                        start_col: start as u16,
+                        cells: self.current_cells[base + start..base + c].to_vec(),
+                    });
                 } else {
-                    let start = c;
-                    if all_current_default && self.current_cells[base + c] != CellState::default() {
-                        all_current_default = false;
-                    }
-                    c += 1;
-                    while c < cols && self.current_cells[base + c] != self.prev_cells[base + c] {
-                        if all_current_default
-                            && self.current_cells[base + c] != CellState::default()
-                        {
-                            all_current_default = false;
-                        }
-                        c += 1;
-                    }
-                    let run_len = c - start;
-                    total_changed += run_len;
-                    if run_len >= 2 {
-                        ops.push(DiffOp::Row {
-                            row: r as u16,
-                            start_col: start as u16,
-                            cells: self.current_cells[base + start..base + c].to_vec(),
-                        });
-                    } else {
-                        ops.push(DiffOp::Cell {
-                            row: r as u16,
-                            col: start as u16,
-                            cell: self.current_cells[base + start],
-                        });
-                    }
+                    ops.push(DiffOp::Cell {
+                        row: r as u16,
+                        col: start as u16,
+                        cell: self.current_cells[base + start],
+                    });
                 }
             }
         }
 
-        // Detect full-screen clear: if all current cells are default and more
-        // than half the screen changed, collapse into a single DiffOp::Clear.
+        // Detect a full-screen clear: every current cell is default and more
+        // than half the screen changed, so collapse into a single
+        // `DiffOp::Clear`. Note "every current cell", not "every changed cell":
+        // one surviving unchanged glyph has to defeat this, or the client wipes
+        // a cell the server still shows.
+        //
+        // This used to be threaded through the loop above "to avoid a second
+        // O(rows*cols) scan", at the cost of the same three lines in three
+        // places. It was never a second full scan: `all` stops at the first
+        // non-default cell, which on a screen with anything on it is one of the
+        // first few, and it runs to completion only when the screen really is
+        // blank — exactly the case with nothing else to do.
+        let blank = CellState::default();
+        let all_current_default = self.current_cells[..total]
+            .iter()
+            .all(|cell| *cell == blank);
         if !ops.is_empty() && all_current_default && total_changed > total / 2 {
             ops = vec![DiffOp::Clear];
         }
@@ -277,6 +279,35 @@ mod tests {
         assert!(
             matches!(diff.ops.as_slice(), [DiffOp::Clear]),
             "expected DiffOp::Clear, got {:?}",
+            diff.ops
+        );
+    }
+
+    #[test]
+    fn one_surviving_glyph_defeats_clear_detection() {
+        let mut engine = mock_engine(4, 4);
+        for cell in &mut engine.backend.cells {
+            *cell = CellState {
+                c: 'X',
+                ..CellState::default()
+            };
+        }
+        let _ = engine.compute_diff(); // consume the fill
+
+        // Erase 15 of 16 cells — over half the screen, so the changed-cell
+        // count alone would qualify for a Clear. The 16th is left alone, so it
+        // is both unchanged AND non-default: the clear scan must look at every
+        // current cell, not only the ones this diff touched. Collapsing to
+        // DiffOp::Clear here would blank a glyph the server still shows.
+        for cell in &mut engine.backend.cells[1..] {
+            *cell = CellState::default();
+        }
+        let DiffResult::CellDiff { diff, .. } = engine.compute_diff() else {
+            panic!("expected CellDiff");
+        };
+        assert!(
+            !diff.ops.iter().any(|op| matches!(op, DiffOp::Clear)),
+            "a surviving non-default cell must suppress DiffOp::Clear, got {:?}",
             diff.ops
         );
     }
