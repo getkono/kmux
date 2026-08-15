@@ -77,6 +77,7 @@ ratcheted = [
     "clippy::string_slice",
 ]
 mutants = []
+mutants = []
 
 [[lints]]
 crate = "kmux-app"
@@ -91,7 +92,7 @@ count = 2
 [[lints]]
 crate = "kmux-app"
 lint = "clippy::cast_precision_loss"
-count = 10
+count = 8
 
 [[lints]]
 crate = "kmux-app"
@@ -291,12 +292,12 @@ count = 2
 [[lints]]
 crate = "kmux-connect"
 lint = "clippy::missing_errors_doc"
-count = 12
+count = 19
 
 [[lints]]
 crate = "kmux-connect"
 lint = "clippy::missing_panics_doc"
-count = 2
+count = 1
 
 [[lints]]
 crate = "kmux-connect"
@@ -316,7 +317,7 @@ count = 3
 [[lints]]
 crate = "kmux-connect"
 lint = "clippy::unwrap_in_result"
-count = 2
+count = 3
 
 [[lints]]
 crate = "kmux-connect"
@@ -461,7 +462,7 @@ count = 5
 [[lints]]
 crate = "kmux-gtk"
 lint = "clippy::cast_precision_loss"
-count = 15
+count = 9
 
 [[lints]]
 crate = "kmux-gtk"
@@ -591,7 +592,7 @@ count = 1
 [[lints]]
 crate = "kmux-pty"
 lint = "missing_debug_implementations"
-count = 11
+count = 9
 
 [[lints]]
 crate = "kmux-pty"
@@ -726,7 +727,7 @@ count = 6
 [[lints]]
 crate = "kmux-vt-core"
 lint = "missing_docs"
-count = 29
+count = 28
 
 [[lints]]
 crate = "kmux-vt-worker"
@@ -878,7 +879,7 @@ count = 9
 
 [[allows]]
 crate = "kmux-connect"
-count = 18
+count = 6
 
 [[allows]]
 crate = "kmux-ghostty"
@@ -902,7 +903,7 @@ count = 2
 
 [[allows]]
 crate = "kmux-vt-core"
-count = 4
+count = 3
 
 [[allows]]
 crate = "kmuxd"
