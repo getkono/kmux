@@ -162,14 +162,18 @@ The tree does not satisfy every rule above yet. That is stated here rather than
 left implicit, because a normative document whose rules are quietly violated is
 the problem this one exists to fix.
 
-Measured 2026-08-15, on the branch that introduced this document:
+Measured 2026-08-15:
 
-| Rule | Violations today | Target |
-| --- | --- | --- |
-| R3 — no process-global env mutation | 91 `env::set_var` sites in 13 files | 0 |
-| R3/R13 — no test-only lock | 98 `ENV_LOCK` / `await_holding_lock` sites in 10 files | 0 |
-| R4 — no function over 100 lines | 45 functions, the largest 888 lines | 0, minus the exceptions register |
-| R5 — no double in a release build | 2 (`kmux-pty`'s `pub mod mock`) | 0 |
+| Rule | At branch start | Now | Target |
+| --- | --- | --- | --- |
+| R3 — no process-global env mutation | 91 sites / 13 files | **78 / 12** | 0 |
+| R3/R13 — no test-only lock | 98 sites / 10 files | **88 / 9** | 0 |
+| R4 — no function over 100 lines | 45 (largest 888 lines) | 45 | 0, minus the exceptions register |
+| R5 — no double in a release build | 2 (`kmux-pty`'s `pub mod mock`) | 2 | 0 |
+
+`kmux-protocol`'s `dirs` module is the first to reach zero on R3 and R13: the
+`Dirs` value replaced twelve unsafe environment overwrites and the module's own
+lock, and its tests went from 8 serialised to 17 parallel-safe ones.
 
 These are budgets, not aspirations: each one is recorded in
 `quality-baseline.toml` and may only shrink. CI fails both when a count rises
