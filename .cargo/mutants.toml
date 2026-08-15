@@ -31,9 +31,7 @@ additional_cargo_test_args = ["--lib"]
 timeout_multiplier = 5.0
 minimum_test_timeout = 30
 
-# Low-value files: raw C-ABI binding declarations and test-only mock backends
-# carry no business logic worth mutating.
-exclude_globs = [
-    "crates/kmux-ghostty-sys/src/**",
-    "**/mock.rs",
-]
+# Low-value files: raw C-ABI binding declarations carry no business logic worth
+# mutating. (`**/mock.rs` used to be excluded here too; the only such file was
+# kmux-pty's unused MockPty, now deleted.)
+exclude_globs = ["crates/kmux-ghostty-sys/src/**"]

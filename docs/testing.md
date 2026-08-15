@@ -74,8 +74,11 @@ not replace it with a runtime registry. *Enforced by:* `clippy::too_many_lines`.
 build.** A double used by another crate lives behind that crate's `test-util`
 feature and is consumed through `[dev-dependencies]`; `kmux-vt-core`'s
 `NullEventSink` is the reference implementation. A double used only in its own
-crate lives in a `#[cfg(test)] mod fixtures`. *Enforced by:* the audit snippet
-below.
+crate lives in a `#[cfg(test)] mod fixtures`. A double with **no** consumer is
+deleted, not gated: `kmux-pty`'s `MockPty` was 114 lines wrapping
+`tokio::io::duplex`, shipped in every release build, and had never been used by
+anything — feature-gating it would only have hidden that. *Enforced by:* the
+audit snippet below.
 
 **R6 — naming.** `fixture_*()` builds the state under test; `make_*()` /
 `sample_*()` build a value. Test functions are
@@ -169,7 +172,7 @@ Measured 2026-08-15:
 | R3 — no process-global env mutation | 91 sites / 13 files | **50 / 11** | 0 |
 | R3/R13 — no test-only lock | 98 sites / 10 files | **73 / 8** | 0 |
 | R4 — no function over 100 lines | 45 (largest 888 lines) | 45 | 0, minus the exceptions register |
-| R5 — no double in a release build | 2 (`kmux-pty`'s `pub mod mock`) | 2 | 0 |
+| R5 — no double in a release build | 2 (`kmux-pty`'s `pub mod mock`) | **0** | 0 — reached |
 | R12 — mutation score is the coverage bar | 3 crates fabricated, 5 never swept | scoring fixed; **no trustworthy sweep yet** | a recorded `[[mutants]]` budget per crate |
 
 Two modules have reached zero on R3 and R13, both by the same move — take the
