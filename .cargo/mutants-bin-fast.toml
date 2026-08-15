@@ -1,0 +1,19 @@
+# cargo-mutants configuration — small BIN-ONLY crates whose only tests are fast
+# integration suites.
+#
+# Applies to `kmux` (453 LOC) and `kmux-vt-worker` (546 LOC). Neither carries a
+# colocated `#[cfg(test)]` module, so `--bins` alone would compile a test binary
+# with zero tests in it and report every mutant as missed — technically honest,
+# but useless. Their real coverage lives in `tests/`:
+#
+#   kmux            tests/completion.rs, tests/diagnostic.rs  (drive the real binary)
+#   kmux-vt-worker  tests/worker_smoke.rs                     (spawns one subprocess)
+#
+# Those suites run in seconds, so including them per mutant is affordable here in
+# a way it is not for kmuxd (see .cargo/mutants-bin.toml).
+additional_cargo_test_args = ["--bins", "--tests"]
+
+timeout_multiplier = 5.0
+minimum_test_timeout = 30
+
+exclude_globs = ["**/mock.rs"]

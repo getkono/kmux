@@ -1,11 +1,88 @@
 #!/usr/bin/env bash
-#MISE description="Mutation testing (cargo-mutants, pinned via mise; config in .cargo/mutants.toml)."
+#MISE description="Mutation testing (cargo-mutants, pinned via mise; configs in .cargo/mutants*.toml)."
 #
-# Whole workspace by default; scope with args, e.g. `mise run mutants -- -p kmux-protocol`.
+# Whole workspace by default; scope with `-p`, e.g. `mise run mutants -- -p kmux-app`.
+# Any other flags are forwarded to cargo-mutants unchanged, e.g.
+# `mise run mutants -- --shard 1/16` or `mise run mutants -- -D pr.diff`.
+#
+# WHY THIS DISPATCHES. cargo-mutants passes `additional_cargo_test_args` through
+# verbatim and scopes the test phase to the mutated package. `--lib` hard-errors
+# with "no library targets found" on a bin-only package, and cargo-mutants reads
+# that non-zero exit as "mutant caught" — which is why the 2026-06-14 sweep
+# reported a bogus 100% for kmuxd (712/0), kmux-gtk (608/0) and kmux (15/0)
+# without testing a single mutant of them. There is no per-package config
+# section in cargo-mutants 27.1.0, so the flags are selected here, per crate,
+# via `--config`. See docs/testing.md §Mutation testing.
+#
 # cargo-mutants makes a full scratch copy (incl. a fresh target/) per job; the
 # default /tmp is often a small tmpfs that overflows mid-sweep, so anchor the
 # scratch trees on disk (override with $CARGO_MUTANTS_TMPDIR).
 set -euo pipefail
+
 export TMPDIR="${CARGO_MUTANTS_TMPDIR:-${XDG_CACHE_HOME:-$HOME/.cache}/cargo-mutants-tmp}"
 mkdir -p "$TMPDIR"
-cargo mutants "$@"
+
+# Crate groups, keyed by target shape. Keep in sync with .cargo/mutants*.toml
+# and with the `every_workspace_member_is_classified` assertion in
+# xtask/tests/dependency_direction.rs, which fails if a new crate is unlisted.
+LIB_CRATES=(
+    kmux-app kmux-client kmux-connect kmux-ffi kmux-ghostty kmux-protocol
+    kmux-pty kmux-render kmux-vt-core kmux-worker-protocol
+)
+BIN_CRATES=(kmuxd kmux-gtk)
+BIN_FAST_CRATES=(kmux kmux-vt-worker)
+# kmux-ghostty-sys is a lib crate but is excluded wholesale by exclude_globs:
+# raw C-ABI binding declarations carry no business logic worth mutating.
+
+config_for() {
+    local crate="$1" c
+    for c in "${BIN_CRATES[@]}"; do
+        [[ "$crate" == "$c" ]] && { echo ".cargo/mutants-bin.toml"; return; }
+    done
+    for c in "${BIN_FAST_CRATES[@]}"; do
+        [[ "$crate" == "$c" ]] && { echo ".cargo/mutants-bin-fast.toml"; return; }
+    done
+    echo ".cargo/mutants.toml"
+}
+
+# Scoped run: `-p <crate>` picks that crate's config and runs a single pass.
+# Multiple `-p` flags are only valid within one group; mixing shapes is what the
+# unscoped path below is for.
+scoped_crate=""
+prev=""
+for arg in "$@"; do
+    case "$prev" in
+        -p | --package) scoped_crate="$arg" ;;
+    esac
+    case "$arg" in
+        -p=* | --package=*) scoped_crate="${arg#*=}" ;;
+    esac
+    prev="$arg"
+done
+
+if [[ -n "$scoped_crate" ]]; then
+    exec cargo mutants --config "$(config_for "$scoped_crate")" "$@"
+fi
+
+# Unscoped: one pass per group, each into its own output directory so the
+# per-package outcomes can be merged afterwards (mutants.out/ is gitignored).
+# `|| true` keeps a group with surviving mutants from aborting the remaining
+# groups — cargo-mutants exits non-zero when any mutant is missed, and a sweep
+# that stops at the first crate with debt would never reach the others. The
+# authoritative pass/fail is the ratchet over the merged outcomes, not this
+# exit code.
+run_group() {
+    local name="$1" config="$2"
+    shift 2
+    local pkgs=()
+    for c in "$@"; do pkgs+=(-p "$c"); done
+    echo "==> mutants: $name (${#} crates, config $config)"
+    cargo mutants --config "$config" -o "mutants.out/$name" "${pkgs[@]}" || true
+}
+
+run_group lib      .cargo/mutants.toml          "${LIB_CRATES[@]}"
+run_group bin      .cargo/mutants-bin.toml      "${BIN_CRATES[@]}"
+run_group bin-fast .cargo/mutants-bin-fast.toml "${BIN_FAST_CRATES[@]}"
+
+echo
+echo "Sweep complete. Per-group results under mutants.out/{lib,bin,bin-fast}/."
