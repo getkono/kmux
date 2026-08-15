@@ -29,6 +29,11 @@ pub struct Baseline {
     /// One row per crate: how many `#[allow]` attributes it still carries.
     #[serde(default)]
     pub allows: Vec<AllowBudget>,
+    /// One row per crate: how many mutants its tests still fail to kill.
+    /// Absolute counts, not percentages, so adding well-tested code to a crate
+    /// cannot fail an unrelated PR by moving a ratio.
+    #[serde(default)]
+    pub mutants: Vec<MutantBudget>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,6 +60,13 @@ pub struct AllowBudget {
     #[serde(rename = "crate")]
     pub krate: String,
     pub count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub struct MutantBudget {
+    #[serde(rename = "crate")]
+    pub krate: String,
+    pub missed: usize,
 }
 
 /// What the gate found wrong. Every variant is a hard failure: a ratchet with a
@@ -164,6 +176,37 @@ impl Baseline {
             .collect()
     }
 
+    /// Surviving-mutant budgets keyed by crate.
+    pub fn mutant_budgets(&self) -> BTreeMap<String, usize> {
+        self.mutants
+            .iter()
+            .map(|b| (b.krate.clone(), b.missed))
+            .collect()
+    }
+
+    /// Replace the mutation table, leaving the lint tables untouched.
+    ///
+    /// The two halves are measured by different commands that take very
+    /// different amounts of time — a lint pass is seconds, a full sweep is
+    /// hours — so each writer has to carry the other's rows through unchanged
+    /// or one would silently erase the other.
+    #[must_use]
+    pub fn with_mutants(&self, missed: &BTreeMap<String, usize>) -> Self {
+        let mut rows: Vec<MutantBudget> = missed
+            .iter()
+            .filter(|&(_, &n)| n > 0)
+            .map(|(krate, &missed)| MutantBudget {
+                krate: krate.clone(),
+                missed,
+            })
+            .collect();
+        rows.sort();
+        Self {
+            mutants: rows,
+            ..self.clone()
+        }
+    }
+
     /// Rebuild from measured counts, keeping `meta` as-is apart from the
     /// toolchain stamp. Rows are sorted and zero counts dropped, so the file
     /// stays a description of what is left rather than a log of what was.
@@ -203,6 +246,9 @@ impl Baseline {
             },
             lints: rows,
             allows: allow_rows,
+            // Measured by `mutants-gate --write`, hours apart from this. Carry
+            // it through or a lint re-baseline would erase the sweep.
+            mutants: self.mutants.clone(),
         }
     }
 }
@@ -308,6 +354,10 @@ mod tests {
                 krate: "a".to_owned(),
                 count: 2,
             }],
+            mutants: vec![MutantBudget {
+                krate: "a".to_owned(),
+                missed: 5,
+            }],
         }
     }
 
@@ -359,9 +409,30 @@ mod tests {
     }
 
     #[test]
+    fn a_lint_rebaseline_does_not_erase_the_mutation_table() {
+        let out = sample().rewritten("1.2.3", &counts(&[]), &counts(&[]));
+        assert_eq!(out.mutants, sample().mutants);
+    }
+
+    #[test]
+    fn a_mutation_rebaseline_does_not_erase_the_lint_tables() {
+        let out = sample().with_mutants(&counts(&[("a", 3)]));
+        assert_eq!(out.lints, sample().lints);
+        assert_eq!(out.allows, sample().allows);
+        assert_eq!(out.mutants[0].missed, 3);
+    }
+
+    #[test]
+    fn a_crate_that_misses_nothing_gets_no_mutation_row() {
+        let out = sample().with_mutants(&counts(&[("a", 0)]));
+        assert_eq!(out.mutants, vec![]);
+    }
+
+    #[test]
     fn budgets_are_keyed_the_way_compare_expects() {
         let b = sample();
         assert_eq!(b.lint_budgets(), counts(&[("a/clippy::x", 7)]));
         assert_eq!(b.allow_budgets(), counts(&[("a", 2)]));
+        assert_eq!(b.mutant_budgets(), counts(&[("a", 5)]));
     }
 }

@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use xtask::baseline::{Baseline, Finding, compare};
 use xtask::graph::Graph;
-use xtask::lint;
+use xtask::{lint, mutants};
 
 /// Roots scanned for `#[allow]` attributes: the product crates and this crate.
 /// Tooling holds itself to the same bar as the code it gates.
@@ -20,6 +20,16 @@ fn main() -> Result<()> {
         Some("deps-graph") => print_graph(),
         Some("lint-flags") => print_lint_flags(),
         Some("lint-gate") => lint_gate(args.next().as_deref() == Some("--write")),
+        Some("mutants-gate") => {
+            let rest: Vec<String> = args.collect();
+            let write = rest.iter().any(|a| a == "--write");
+            let dirs: Vec<PathBuf> = rest
+                .iter()
+                .filter(|a| !a.starts_with("--"))
+                .map(PathBuf::from)
+                .collect();
+            mutants_gate(&dirs, write)
+        }
         Some(other) => bail!("unknown command `{other}`; known commands: {COMMANDS}"),
         None => {
             eprintln!("usage: cargo run -p xtask -- <command>");
@@ -37,7 +47,7 @@ fn main() -> Result<()> {
     }
 }
 
-const COMMANDS: &str = "deps-graph, lint-flags, lint-gate";
+const COMMANDS: &str = "deps-graph, lint-flags, lint-gate, mutants-gate";
 
 /// The checked-in budget, resolved relative to the workspace root.
 fn baseline_path() -> PathBuf {
@@ -178,6 +188,90 @@ fn lint_gate(write: bool) -> Result<()> {
     )
 }
 
+/// Judge one or more cargo-mutants output directories.
+///
+/// Two checks, in this order, because the second is meaningless without the
+/// first: is this sweep believable at all, and then is it within budget.
+fn mutants_gate(dirs: &[PathBuf], write: bool) -> Result<()> {
+    if dirs.is_empty() {
+        bail!("give at least one cargo-mutants output directory, e.g. mutants.out");
+    }
+    let sweeps: Vec<mutants::Sweep> = dirs
+        .iter()
+        .map(|d| mutants::read(&d.join("outcomes.json")))
+        .collect::<Result<_>>()?;
+    let sweep = mutants::merge(sweeps);
+
+    for report in sweep.packages.values() {
+        println!(
+            "{:<24} {:>5} caught {:>5} missed {:>5} timeout {:>5} unviable",
+            report.package, report.caught, report.missed, report.timeout, report.unviable
+        );
+    }
+
+    let mut failures: Vec<String> = mutants::implausible(&sweep);
+    if !failures.is_empty() {
+        // Do not compare counts. A fabricated 100% would sail through any
+        // budget, and recording one as a budget would enshrine it.
+        for f in &failures {
+            eprintln!("mutants gate: implausible result: {f}");
+        }
+        bail!(
+            "{} package(s) reported results that cannot be true. Fix the sweep, not the budget.",
+            failures.len()
+        );
+    }
+
+    let path = baseline_path();
+    let baseline = Baseline::load(&path)?;
+    let missed = mutants::missed_counts(&sweep);
+
+    if write {
+        let next = baseline.with_mutants(&missed);
+        write_baseline(&path, &next)?;
+        println!(
+            "wrote {} — {} surviving mutants across {} crates",
+            path.display(),
+            missed.values().sum::<usize>(),
+            next.mutants.len()
+        );
+        return Ok(());
+    }
+
+    // Only crates this sweep actually covered are judged. A sharded or scoped
+    // run legitimately says nothing about the rest, and treating silence as
+    // zero would report every uncovered crate's budget as stale.
+    let budgets: BTreeMap<String, usize> = baseline
+        .mutant_budgets()
+        .into_iter()
+        .filter(|(krate, _)| sweep.packages.contains_key(krate))
+        .collect();
+    report(
+        &mut failures,
+        "mutants",
+        &compare(&budgets, &missed),
+        &BTreeMap::new(),
+    );
+
+    if failures.is_empty() {
+        println!(
+            "mutants gate: {} surviving mutants across {} crates, all within budget",
+            missed.values().sum::<usize>(),
+            sweep.packages.len()
+        );
+        return Ok(());
+    }
+    for f in &failures {
+        eprintln!("mutants gate: {f}");
+    }
+    bail!(
+        "{} quality-gate failure(s). A surviving mutant is either killed by a new \
+         assertion or recorded, with a reason, in the Known-exceptions register in \
+         docs/testing.md.",
+        failures.len()
+    )
+}
+
 /// Turn findings into failure lines, naming a few offending sites for the
 /// regressions so the message is actionable without a second clippy run.
 fn report(
@@ -220,15 +314,7 @@ fn rewrite(
 ) -> Result<()> {
     let rustc = lint::rustc_version()?;
     let next = baseline.rewritten(&rustc, counts, allows);
-    let old = std::fs::read_to_string(path).unwrap_or_default();
-    let header = restamp_rustc(&header_of(&old), &rustc);
-    let body = toml::to_string_pretty(&Tables {
-        lints: next.lints.clone(),
-        allows: next.allows.clone(),
-    })
-    .context("serialize the quality baseline")?;
-    std::fs::write(path, format!("{header}\n{body}"))
-        .with_context(|| format!("write {}", path.display()))?;
+    write_baseline(path, &next)?;
 
     let before: usize = baseline.lints.iter().map(|b| b.count).sum();
     let after: usize = next.lints.iter().map(|b| b.count).sum();
@@ -246,6 +332,22 @@ fn rewrite(
 struct Tables {
     lints: Vec<xtask::baseline::Budget>,
     allows: Vec<xtask::baseline::AllowBudget>,
+    mutants: Vec<xtask::baseline::MutantBudget>,
+}
+
+/// Write a baseline, preserving the hand-written header and restamping the
+/// toolchain. Shared by both gates, so neither can erase the other's tables.
+fn write_baseline(path: &Path, next: &Baseline) -> Result<()> {
+    let old = std::fs::read_to_string(path).unwrap_or_default();
+    let header = restamp_rustc(&header_of(&old), &next.meta.rustc);
+    let body = toml::to_string_pretty(&Tables {
+        lints: next.lints.clone(),
+        allows: next.allows.clone(),
+        mutants: next.mutants.clone(),
+    })
+    .context("serialize the quality baseline")?;
+    std::fs::write(path, format!("{header}\n{body}"))
+        .with_context(|| format!("write {}", path.display()))
 }
 
 /// Everything above the first measured table: the file's explanatory comments

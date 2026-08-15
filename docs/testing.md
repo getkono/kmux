@@ -170,6 +170,7 @@ Measured 2026-08-15:
 | R3/R13 — no test-only lock | 98 sites / 10 files | **73 / 8** | 0 |
 | R4 — no function over 100 lines | 45 (largest 888 lines) | 45 | 0, minus the exceptions register |
 | R5 — no double in a release build | 2 (`kmux-pty`'s `pub mod mock`) | 2 | 0 |
+| R12 — mutation score is the coverage bar | 3 crates fabricated, 5 never swept | scoring fixed; **no trustworthy sweep yet** | a recorded `[[mutants]]` budget per crate |
 
 Two modules have reached zero on R3 and R13, both by the same move — take the
 thing the test needs to vary as a parameter:
@@ -180,6 +181,13 @@ thing the test needs to vary as a parameter:
 - `kmux-app::config` — the eight resolvers now take `&KmuxConfig`, so a test
   constructs a config value instead of writing a file and pointing
   `XDG_CONFIG_HOME` at it; 28 tests became 32, all parallel-safe.
+
+R12 is the one row that is not yet a number. The scoring bug is fixed and the
+believability check is in place, but a full sweep takes hours and none has run
+since, so `[[mutants]]` is empty and the per-PR CI job mutates only the diff —
+which needs no baseline, because its scope *is* the change under review. The
+weekly sweep is what fills the table in. Recording the June numbers instead
+would have been worse than recording nothing.
 
 These are budgets, not aspirations: each one is recorded in
 `quality-baseline.toml` and may only shrink. CI fails both when a count rises
@@ -235,13 +243,23 @@ cargo test -p kmux-render --features gpu   # the GPU tier (skips with no adapter
 
 mise run mutants                       # full sweep, one pass per crate group
 mise run mutants -- -p kmux-protocol   # one crate (config auto-selected)
-mise run mutants -- -D pr.diff         # only mutants on changed lines
+mise run mutants -- --in-diff pr.diff  # only mutants on changed lines
+mise run mutants-gate                  # judge the sweep, then check the budget
 ```
 
 Mutation configuration lives in `.cargo/mutants*.toml` — three files, one per
 crate target shape, because `--lib` hard-errors on a bin-only package and
 cargo-mutants misreads the error as a caught mutant. Results land in
 `mutants.out/` (gitignored).
+
+**Always read a sweep through `mise run mutants-gate`, never straight off the
+summary line.** The gate's first job is deciding whether the sweep can be true
+at all: it flags any package with a perfect score whose slowest catch finished
+in a fraction of the sweep's own baseline, which is the signature of a test
+command that failed before it ran anything. That is not a hypothetical — it is
+how 1,320 of the June sweep's 2,592 "caught" mutants came to be fabricated. When
+it fires, the budget comparison is skipped entirely, and `--write` refuses to
+record the sweep. See [docs/quality-gates.md](quality-gates.md).
 
 ## Auditing
 

@@ -1,0 +1,35 @@
+#!/usr/bin/env bash
+#MISE description="Judge a cargo-mutants sweep: reject implausible results, then hold survivors against the baseline."
+#USAGE flag "--write" help="record the measured survivor counts as the new budget"
+#USAGE arg "<dir>" help="cargo-mutants output directory; defaults to whichever of mutants.out/{lib,bin,bin-fast} exist" var=true default=""
+#
+# `mise run mutants` writes one directory per crate-group; a scoped run writes
+# mutants.out directly. Either is fine — the gate merges whatever it is given.
+#
+# The believability check runs FIRST and, when it fires, the budget comparison
+# is skipped entirely. A fabricated 100% sails through any budget, and recording
+# one with --write would enshrine it. See xtask/src/mutants.rs for the story
+# behind that check.
+set -euo pipefail
+
+write=""
+dirs=()
+for arg in "$@"; do
+    case "$arg" in
+        --write) write="--write" ;;
+        *) [[ -n "$arg" ]] && dirs+=("$arg") ;;
+    esac
+done
+
+if [[ ${#dirs[@]} -eq 0 ]]; then
+    for d in mutants.out/lib mutants.out/bin mutants.out/bin-fast mutants.out; do
+        [[ -f "$d/outcomes.json" ]] && dirs+=("$d")
+    done
+fi
+
+if [[ ${#dirs[@]} -eq 0 ]]; then
+    echo "mutants-gate: no outcomes.json found; run \`mise run mutants\` first" >&2
+    exit 1
+fi
+
+exec cargo run -q -p xtask -- mutants-gate $write "${dirs[@]}"

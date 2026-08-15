@@ -20,3 +20,4 @@
 pub mod baseline;
 pub mod graph;
 pub mod lint;
+pub mod mutants;
