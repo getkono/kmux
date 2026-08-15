@@ -72,8 +72,12 @@ use kmux_protocol::{format_pane_id, pane_index};
 // with the GPU renderer; see docs/architecture-render.md). The non-GPU Swift
 // path encodes through it here, so the bytes are identical to the renderer's.
 use kmux_render::packed;
+// `CursorView` is part of kmux-render's wgpu-free core and the render-debug
+// overlay reads it on the Cairo path too, so it must not sit behind `gpu` — the
+// lean build (`mise run build-no-gpu`) needs it.
+use kmux_render::CursorView;
 #[cfg(feature = "gpu")]
-use kmux_render::{CellSource, CursorView, Frame, PaneView, ScrollIndicator, TerminalRenderer};
+use kmux_render::{CellSource, Frame, PaneView, ScrollIndicator, TerminalRenderer};
 
 uniffi::setup_scaffolding!();
 
