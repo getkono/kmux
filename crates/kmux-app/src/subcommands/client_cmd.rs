@@ -27,7 +27,7 @@ pub async fn run_client_command(action: ClientAction) -> anyhow::Result<()> {
 }
 
 async fn client_status() -> anyhow::Result<()> {
-    use kmux_protocol::dirs::BuildProfile;
+    use kmux_protocol::compat::BuildProfile;
     use kmux_protocol::messages::PROTOCOL_RANGE;
 
     let cli_build = kmux_protocol::buildinfo::fingerprint();
@@ -174,7 +174,7 @@ async fn client_status() -> anyhow::Result<()> {
 /// counterpart of `kmux daemon logs`. The GUI client is a local singleton, so
 /// this is always the local file (no remote form, unlike `kmux daemon logs`).
 async fn client_logs(follow: bool, lines: Option<usize>) -> anyhow::Result<()> {
-    let log_path = kmux_protocol::dirs::client_log_path()?;
+    let log_path = kmux_sys::dirs::client_log_path()?;
     super::logs::tail_local_log(
         &log_path,
         lines,

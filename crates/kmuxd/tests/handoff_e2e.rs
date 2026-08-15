@@ -166,7 +166,7 @@ fn read_pid_file(path: &Path, timeout: Duration) -> Option<i32> {
 /// server-side. Returns the shell's PID.
 async fn create_session_with_recorded_child(token: &str, cwd: &Path, pidfile: &Path) -> i32 {
     let (srv_tx, mut srv_rx) = mpsc::unbounded_channel::<ServerMessage>();
-    let data_sock = kmux_protocol::dirs::data_socket_path().expect("data socket path");
+    let data_sock = kmux_sys::dirs::data_socket_path().expect("data socket path");
     let client_tx = match connect_uds(
         &data_sock,
         token.to_string(),

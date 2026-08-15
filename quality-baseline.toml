@@ -76,6 +76,8 @@ ratcheted = [
     "clippy::significant_drop_tightening",
     "clippy::string_slice",
 ]
+mutants = []
+
 [[lints]]
 crate = "kmux-app"
 lint = "clippy::cast_possible_truncation"
@@ -514,22 +516,12 @@ count = 5
 [[lints]]
 crate = "kmux-protocol"
 lint = "clippy::expect_used"
-count = 6
-
-[[lints]]
-crate = "kmux-protocol"
-lint = "clippy::items_after_statements"
-count = 1
+count = 3
 
 [[lints]]
 crate = "kmux-protocol"
 lint = "clippy::missing_errors_doc"
-count = 50
-
-[[lints]]
-crate = "kmux-protocol"
-lint = "clippy::missing_panics_doc"
-count = 2
+count = 10
 
 [[lints]]
 crate = "kmux-protocol"
@@ -538,13 +530,8 @@ count = 1
 
 [[lints]]
 crate = "kmux-protocol"
-lint = "clippy::significant_drop_tightening"
-count = 2
-
-[[lints]]
-crate = "kmux-protocol"
 lint = "clippy::string_slice"
-count = 10
+count = 8
 
 [[lints]]
 crate = "kmux-protocol"
@@ -554,12 +541,12 @@ count = 2
 [[lints]]
 crate = "kmux-protocol"
 lint = "missing_debug_implementations"
-count = 19
+count = 12
 
 [[lints]]
 crate = "kmux-protocol"
 lint = "missing_docs"
-count = 508
+count = 483
 
 [[lints]]
 crate = "kmux-pty"
@@ -660,6 +647,46 @@ count = 10
 crate = "kmux-render"
 lint = "missing_docs"
 count = 1
+
+[[lints]]
+crate = "kmux-sys"
+lint = "clippy::expect_used"
+count = 3
+
+[[lints]]
+crate = "kmux-sys"
+lint = "clippy::items_after_statements"
+count = 1
+
+[[lints]]
+crate = "kmux-sys"
+lint = "clippy::missing_errors_doc"
+count = 40
+
+[[lints]]
+crate = "kmux-sys"
+lint = "clippy::missing_panics_doc"
+count = 2
+
+[[lints]]
+crate = "kmux-sys"
+lint = "clippy::significant_drop_tightening"
+count = 2
+
+[[lints]]
+crate = "kmux-sys"
+lint = "clippy::string_slice"
+count = 2
+
+[[lints]]
+crate = "kmux-sys"
+lint = "missing_debug_implementations"
+count = 7
+
+[[lints]]
+crate = "kmux-sys"
+lint = "missing_docs"
+count = 26
 
 [[lints]]
 crate = "kmux-vt-core"
@@ -833,11 +860,6 @@ count = 1
 
 [[lints]]
 crate = "xtask"
-lint = "clippy::missing_errors_doc"
-count = 5
-
-[[lints]]
-crate = "xtask"
 lint = "clippy::unwrap_in_result"
 count = 1
 
@@ -845,11 +867,6 @@ count = 1
 crate = "xtask"
 lint = "missing_debug_implementations"
 count = 1
-
-[[lints]]
-crate = "xtask"
-lint = "missing_docs"
-count = 15
 
 [[allows]]
 crate = "kmux-app"

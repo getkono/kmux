@@ -1,7 +1,7 @@
 //! Rolling JSONL sink for cross-session metrics samples.
 //!
 //! Multiple concurrent `kmux` processes share a single file at
-//! `kmux_protocol::dirs::metrics_log_path()`. Every sample is appended as a
+//! `kmux_sys::dirs::metrics_log_path()`. Every sample is appended as a
 //! single JSON object on its own line, guarded by an advisory `flock`
 //! (exclusive for append, shared for read). The lock is held only for the
 //! duration of the write or read — microseconds — so contention between

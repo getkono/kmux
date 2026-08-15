@@ -230,7 +230,7 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
                 protocol_range: Some(kmux_protocol::messages::PROTOCOL_RANGE),
                 kmuxd_version: env!("CARGO_PKG_VERSION").to_string(),
                 kmuxd_build: kmux_protocol::buildinfo::fingerprint(),
-                build_profile: Some(kmux_protocol::dirs::BuildProfile::CURRENT),
+                build_profile: Some(kmux_protocol::compat::BuildProfile::CURRENT),
                 endpoints,
             };
             let mut json = match serde_json::to_string(&response) {

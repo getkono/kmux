@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ConnectionId, ServerMessage};
-use kmux_protocol::transport::bootstrap::EndpointAdvert;
+use kmux_sys::transport::bootstrap::EndpointAdvert;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -360,7 +360,7 @@ pub async fn run_bootstrap(
 async fn prepare_local_daemon(
     observer: &dyn BootstrapObserver,
 ) -> Result<ConnectPlan, BootstrapError> {
-    let socket = kmux_protocol::dirs::socket_path()
+    let socket = kmux_sys::dirs::socket_path()
         .map_err(|e| BootstrapError::DaemonStart(format!("socket path: {e}")))?;
     observer.on_event(&BootstrapEvent::DaemonQuery { socket: &socket });
 
@@ -485,7 +485,7 @@ async fn establish(
 ) -> Result<(mpsc::UnboundedSender<ClientMessage>, AuthOutcome), BootstrapError> {
     let uds_path_str;
     let (hs_host, hs_port): (&str, u16) = if plan.transport == TransportKind::Uds {
-        uds_path_str = kmux_protocol::dirs::data_socket_path()
+        uds_path_str = kmux_sys::dirs::data_socket_path()
             .map_or_else(|_| "?".to_string(), |p| p.to_string_lossy().into_owned());
         (&uds_path_str, 0)
     } else {
@@ -503,7 +503,7 @@ async fn establish(
     let sender_result = match plan.transport {
         TransportKind::Uds => {
             let socket_path =
-                kmux_protocol::dirs::data_socket_path().map_err(|e| BootstrapError::Connect {
+                kmux_sys::dirs::data_socket_path().map_err(|e| BootstrapError::Connect {
                     strategy: "uds",
                     error: format!("data socket path: {e}"),
                 })?;

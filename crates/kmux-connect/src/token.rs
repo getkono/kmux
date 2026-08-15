@@ -1,4 +1,4 @@
-use kmux_protocol::dirs::token_path;
+use kmux_sys::dirs::token_path;
 
 /// Try to read the auth token from the kmux runtime token file.
 /// Returns `None` if the file is missing or any I/O error occurs.

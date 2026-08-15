@@ -165,7 +165,7 @@ fn register_symbol_fallback_font() {
     use std::ffi::CString;
     use std::os::unix::ffi::OsStrExt;
 
-    let path = match kmux_protocol::dirs::runtime_dir() {
+    let path = match kmux_sys::dirs::runtime_dir() {
         Ok(dir) => dir.join("SymbolsNerdFontMono-Regular.ttf"),
         Err(e) => {
             tracing::warn!("symbol fallback font: cannot resolve runtime dir: {e}");

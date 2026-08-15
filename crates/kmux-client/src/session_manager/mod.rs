@@ -452,7 +452,7 @@ impl SessionManager {
     /// Enable rolling-JSONL persistence for this session's metrics. Called
     /// by the TUI after construction so tests stay filesystem-free.
     pub fn enable_metrics_persistence(&mut self) {
-        match kmux_protocol::dirs::metrics_log_path() {
+        match kmux_sys::dirs::metrics_log_path() {
             Ok(path) => {
                 self.metrics = MetricsStore::new(Some(JsonlSink::new(path)));
             }

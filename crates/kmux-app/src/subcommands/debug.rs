@@ -22,11 +22,11 @@ pub async fn run_debug_command(action: DebugAction) -> anyhow::Result<()> {
         } => {
             let daemon_path = match daemon_trace {
                 Some(p) => p,
-                None => kmux_protocol::dirs::daemon_trace_path()?,
+                None => kmux_sys::dirs::daemon_trace_path()?,
             };
             let client_path = match client_trace {
                 Some(p) => p,
-                None => kmux_protocol::dirs::client_trace_path()?,
+                None => kmux_sys::dirs::client_trace_path()?,
             };
             run_tearing_report(&daemon_path, &client_path, window_ms)
         }
@@ -42,7 +42,8 @@ pub async fn run_debug_command(action: DebugAction) -> anyhow::Result<()> {
 /// answer to "where are my dev logs / which daemon will start" — debug builds
 /// report the `kmux-debug/` dirs, release builds the `kmux/` dirs.
 fn print_paths() {
-    use kmux_protocol::dirs::{self, BuildProfile};
+    use kmux_protocol::compat::BuildProfile;
+    use kmux_sys::dirs;
 
     let line = |label: &str, resolved: anyhow::Result<std::path::PathBuf>| match resolved {
         Ok(p) => println!("{label:<13} {}", p.display()),

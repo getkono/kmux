@@ -25,7 +25,7 @@ pub fn theme_candidates() -> Vec<CompletionCandidate> {
         .map(|name| CompletionCandidate::new(*name).help(Some("built-in theme".into())))
         .collect();
 
-    if let Ok(dir) = kmux_protocol::dirs::config_dir()
+    if let Ok(dir) = kmux_sys::dirs::config_dir()
         && let Ok(entries) = std::fs::read_dir(dir.join("themes"))
     {
         for entry in entries.flatten() {

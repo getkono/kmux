@@ -74,6 +74,10 @@ impl Graph {
     /// verdict on the Linux and macOS CI runners. Do not "fix" this by adding
     /// `--filter-platform`; it would narrow the check to whatever host happens
     /// to run it.
+    ///
+    /// # Errors
+    /// If `cargo metadata` cannot be run, exits non-zero, or emits JSON this
+    /// does not understand.
     pub fn load() -> Result<Self> {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let out = std::process::Command::new(cargo)

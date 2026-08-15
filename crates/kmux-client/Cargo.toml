@@ -13,10 +13,11 @@ default = ["remote"]
 # Forward the remote-transport stack (QUIC/TCP+TLS/SSH) down to kmux-connect and
 # pull in the kmux-protocol TLS helpers it needs. Default-on for standalone
 # builds/tests; the workspace disables it so GUI frontends stay lean (issue #121).
-remote = ["kmux-connect/remote", "kmux-protocol/tls", "kmux-protocol/tcp-tls"]
+remote = ["kmux-connect/remote", "kmux-sys/tls", "kmux-sys/tcp-tls"]
 
 [dependencies]
-kmux-protocol = { workspace = true, features = ["framing", "uds"] }
+kmux-protocol = { workspace = true, features = ["framing"] }
+kmux-sys = { workspace = true, features = ["framing", "uds"] }
 kmux-connect = { workspace = true }
 arc-swap.workspace = true
 rand.workspace = true

@@ -1,6 +1,6 @@
 use kmux_protocol::control_rpc::{ConnectionInfo, SessionsResponse};
-use kmux_protocol::identity;
 use kmux_protocol::messages::{ClientInfo, SessionEntry};
+use kmux_sys::identity;
 use tabled::Table;
 use tabled::Tabled;
 use tabled::settings::Style;

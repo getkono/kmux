@@ -7,10 +7,10 @@ use tracing::{info, warn};
 use crate::config::{ListenKind, ServerConfig};
 use crate::tls::{CertMaterial, build_server_config};
 use kmux_protocol::messages::TransportKind;
-use kmux_protocol::transport::quic::QuicListener;
-use kmux_protocol::transport::tcp_tls::TlsTcpListener;
-use kmux_protocol::transport::uds::UdsListener;
-use kmux_protocol::transport::{AcceptError, IncomingSession, Listener};
+use kmux_sys::transport::quic::QuicListener;
+use kmux_sys::transport::tcp_tls::TlsTcpListener;
+use kmux_sys::transport::uds::UdsListener;
+use kmux_sys::transport::{AcceptError, IncomingSession, Listener};
 
 use crate::app::ServerApp;
 use crate::auth::{generate_token, persist_token};
@@ -29,7 +29,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     // predecessor holds its lock). Capture the predecessor's pid now — while its
     // pid file still exists — so we can write our own once it has exited.
     let predecessor_pid: Option<i32> = if handoff {
-        kmux_protocol::dirs::pid_path()
+        kmux_sys::dirs::pid_path()
             .ok()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|s| s.trim().parse::<i32>().ok())
@@ -81,7 +81,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     // Load (or generate on first run) this daemon's cryptographic identity, so it
     // can report its own `machine_id` to clients and present a verifiable identity
     // when federating to peers (issue #146).
-    let server_machine_id = match kmux_protocol::identity::Identity::load_or_create() {
+    let server_machine_id = match kmux_sys::identity::Identity::load_or_create() {
         Ok(id) => id.fingerprint(),
         Err(e) => {
             tracing::warn!("Failed to load identity key: {e}");
@@ -94,7 +94,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         .with_machine_id(server_machine_id)
         .with_session_isolation(cfg.session_isolation);
     // Closed-session graveyard (issue #64): retain closed sessions for restore.
-    match kmux_protocol::dirs::closed_sessions_path() {
+    match kmux_sys::dirs::closed_sessions_path() {
         Ok(path) => {
             app_builder = app_builder.with_closed_sessions(
                 cfg.closed_session_keep,
@@ -112,7 +112,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     // Restore persisted sessions from the previous daemon instance, if any.
     // With a successful handoff, panes named in `inherited` keep their live
     // process; the rest respawn from the snapshot exactly as a cold start would.
-    if let Ok(path) = kmux_protocol::dirs::session_state_path()
+    if let Ok(path) = kmux_sys::dirs::session_state_path()
         && path.exists()
     {
         match crate::persist::restore::read_checkpoint(&path) {
@@ -138,7 +138,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     // Load the closed-session graveyard (issue #64). Done after live restore so
     // it can drop any entry that collides with a just-restored live session
     // (live wins). Stale/over-cap entries are pruned on load; rewrite if so.
-    match kmux_protocol::dirs::closed_sessions_path() {
+    match kmux_sys::dirs::closed_sessions_path() {
         Ok(path) => match crate::persist::graveyard::read_graveyard(&path) {
             Ok(graveyard) => {
                 let found = graveyard.sessions.len();
@@ -166,7 +166,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
             loop {
                 interval.tick().await;
                 let state = persist_app.checkpoint_state().await;
-                match kmux_protocol::dirs::session_state_path() {
+                match kmux_sys::dirs::session_state_path() {
                     Ok(path) => {
                         if let Err(e) = crate::persist::checkpoint::write_checkpoint(&state, &path)
                         {
@@ -226,7 +226,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
             }
             ListenKind::Unix => {
                 let path = if listener_cfg.path == "auto" {
-                    kmux_protocol::dirs::data_socket_path()?
+                    kmux_sys::dirs::data_socket_path()?
                 } else {
                     std::path::PathBuf::from(&listener_cfg.path)
                 };
@@ -309,8 +309,8 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
 
     if daemon {
         let params = crate::daemon::ControlSocketParams {
-            socket_path: kmux_protocol::dirs::socket_path()?,
-            pid_path: kmux_protocol::dirs::pid_path()?,
+            socket_path: kmux_sys::dirs::socket_path()?,
+            pid_path: kmux_sys::dirs::pid_path()?,
             quic_port,
             tcp_port,
             token: token.clone(),
@@ -332,7 +332,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         // answers `status` (which reports the live pid), so this is not on the
         // critical path for clients.
         if handoff {
-            let pid_path = kmux_protocol::dirs::pid_path()?;
+            let pid_path = kmux_sys::dirs::pid_path()?;
             tokio::spawn(async move {
                 if let Some(raw) = predecessor_pid {
                     let pid = nix::unistd::Pid::from_raw(raw);
@@ -393,7 +393,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         info!("handoff committed; successor owns the live sessions");
     } else {
         let shutdown_state = app.checkpoint_state().await;
-        match kmux_protocol::dirs::session_state_path() {
+        match kmux_sys::dirs::session_state_path() {
             Ok(path) => {
                 if let Err(e) = crate::persist::checkpoint::write_checkpoint(&shutdown_state, &path)
                 {

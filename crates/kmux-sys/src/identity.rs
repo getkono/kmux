@@ -14,7 +14,7 @@
 //! identity whose private key they do not hold.
 //!
 //! The wire fields that carry public keys, signatures, and nonces are plain
-//! bytes in [`crate::messages`] and are always compiled; only this keypair logic
+//! bytes in [`kmux_protocol::messages`] and are always compiled; only this keypair logic
 //! is gated behind the `identity` feature (it pulls `ring` + `sha2`).
 
 use std::io::Write as _;

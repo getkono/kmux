@@ -26,7 +26,7 @@ mod listener {
 
     use thiserror::Error;
 
-    use crate::messages::TransportKind;
+    use kmux_protocol::messages::TransportKind;
 
     // ─── PeerInfo ─────────────────────────────────────────────────────────────
 

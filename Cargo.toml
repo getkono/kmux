@@ -18,6 +18,10 @@ publish = false
 # Internal crates
 kmux-pty = { path = "crates/kmux-pty" }
 kmux-protocol = { path = "crates/kmux-protocol" }
+# The host-facing half of the protocol stack: XDG paths, machine identity, TLS
+# material, transports. Split out of kmux-protocol so the wire types stay pure
+# data with no nix/rustls/ring/quinn behind them.
+kmux-sys = { path = "crates/kmux-sys" }
 # The client stack defaults to a lean, UDS-only build (no quinn/rustls/ssh): the
 # `remote` feature (default-on when each crate is built standalone) is disabled
 # here so GUI frontends inherit the lean stack and only `kmuxd` opts back in via
@@ -73,7 +77,7 @@ proptest = "1"
 rcgen = "0.14.7"
 # Ed25519 sign/verify for cryptographic machine identity (issue #146). Already
 # in the tree transitively via rustls; pinned to the resolved version. Pulled
-# only by kmux-protocol's `identity` feature.
+# only by kmux-sys's `identity` feature.
 ring = "0.17"
 sha2 = "0.11.0"
 rustls = { version = "0.23.28", default-features = false, features = ["ring", "logging", "std", "tls12"] }

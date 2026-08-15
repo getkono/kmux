@@ -189,7 +189,7 @@ fn main() -> anyhow::Result<()> {
     }
 
     if cli.daemon {
-        let pid_path = kmux_protocol::dirs::pid_path()?;
+        let pid_path = kmux_sys::dirs::pid_path()?;
         // A graceful-restart successor (`--handoff`) must NOT take the pid file
         // here: the predecessor still holds its `flock`. It writes the pid file
         // itself once the predecessor exits (see `startup::async_main`).
@@ -205,7 +205,7 @@ fn main() -> anyhow::Result<()> {
     // Initialize tracing after daemonize (child process has fresh fds).
     // Log to a persistent file; fall back to stderr if the path can't be opened.
     let instance_id = generate_instance_id();
-    match kmux_protocol::dirs::daemon_log_path().and_then(|p| {
+    match kmux_sys::dirs::daemon_log_path().and_then(|p| {
         Ok(std::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -354,7 +354,7 @@ async fn probe_or_start() -> anyhow::Result<()> {
 
     /// Query the Unix control socket and return the full status response on success.
     async fn query() -> Option<serde_json::Value> {
-        let socket_path = kmux_protocol::dirs::socket_path().ok()?;
+        let socket_path = kmux_sys::dirs::socket_path().ok()?;
         let stream =
             tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(&socket_path))
                 .await
@@ -500,8 +500,8 @@ fn build_ssh_endpoints(quic_port: u16, tcp_port: u16) -> Vec<serde_json::Value> 
 fn cleanup_and_start_daemon() -> anyhow::Result<()> {
     use std::os::unix::io::AsRawFd;
 
-    let pid_path = kmux_protocol::dirs::pid_path()?;
-    let socket_path = kmux_protocol::dirs::socket_path()?;
+    let pid_path = kmux_sys::dirs::pid_path()?;
+    let socket_path = kmux_sys::dirs::socket_path()?;
 
     // The daemonized child holds an exclusive flock on its PID file. A held
     // lock proves ownership without trusting a possibly reused PID; preserve
@@ -568,11 +568,11 @@ fn cleanup_and_start_daemon() -> anyhow::Result<()> {
 /// Used by every daemon-spawn path in this binary (`probe-or-start`, the
 /// graceful-restart successor) so a child that dies before it daemonizes (full
 /// disk, panic during restore, bind failure) leaves a trail at
-/// [`kmux_protocol::dirs::boot_log_path`] instead of vanishing. The boot log can
+/// [`kmux_sys::dirs::boot_log_path`] instead of vanishing. The boot log can
 /// contain the auth token, so it is created `0o600`.
 pub(crate) fn boot_log_stdio() -> (std::process::Stdio, std::process::Stdio) {
     use std::os::unix::fs::OpenOptionsExt;
-    let opened = kmux_protocol::dirs::boot_log_path().ok().and_then(|path| {
+    let opened = kmux_sys::dirs::boot_log_path().ok().and_then(|path| {
         std::fs::OpenOptions::new()
             .write(true)
             .create(true)

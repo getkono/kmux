@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::dirs::BuildProfile;
+use crate::compat::BuildProfile;
 use crate::messages::ProtocolRange;
 use crate::messages::SessionMeta;
 

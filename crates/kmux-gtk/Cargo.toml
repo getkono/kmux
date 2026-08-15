@@ -28,6 +28,7 @@ gpu = ["kmux-render/gpu"]
 kmux-app.workspace = true
 kmux-client.workspace = true
 kmux-protocol = { workspace = true, features = ["framing"] }
+kmux-sys.workspace = true
 # The wgpu-free core (geometry/cursor_geometry/CellMetrics) is always linked so
 # the render-debug overlay can report what the renderer computes even on the
 # Cairo path; the `gpu` feature layers on wgpu (`kmux-render/gpu`).

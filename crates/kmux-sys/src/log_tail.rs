@@ -1,7 +1,7 @@
 //! Shared "last N lines" computation for the log-tailing commands (issue #187).
 //!
 //! Used both by the local `kmux daemon logs` / `kmux client logs` reader and by
-//! the daemon when answering a remote [`crate::messages::ClientMessage::FetchLogs`]
+//! the daemon when answering a remote [`kmux_protocol::messages::ClientMessage::FetchLogs`]
 //! so it streams only the requested tail instead of the whole file.
 
 /// Byte offset where the last `n` lines of `buf` begin.

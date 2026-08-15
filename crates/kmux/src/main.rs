@@ -318,7 +318,7 @@ fn select_app_bundle(
 ///
 /// Windows is not built. When it is, its singleton model must match the Unix
 /// one: a per-profile single-instance guard on top of the per-profile runtime
-/// dir that already isolates debug from release ([`kmux_protocol::dirs`]). The
+/// dir that already isolates debug from release (`kmux_sys::dirs`). The
 /// intended mechanism is a named mutex — `CreateMutexW` on a name that embeds the
 /// build profile (e.g. `Local\\kmux-{profile}`): the first launcher creates it
 /// and owns the window; a second sees `ERROR_ALREADY_EXISTS` and forwards its

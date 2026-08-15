@@ -17,40 +17,6 @@ pub const KMUX_DIR_NAME: &str = "kmux-debug";
 #[cfg(not(debug_assertions))]
 pub const KMUX_DIR_NAME: &str = "kmux";
 
-/// Cargo build profile of a kmux binary.
-///
-/// Advertised by `kmuxd` in its status response and checked by `kmux` during
-/// the control-socket handshake: a mismatch means the client and the daemon
-/// resolved different runtime dirs (`kmux-debug/` vs `kmux/`), so the client
-/// would have silently attached to the wrong instance — we refuse.
-#[derive(Debug, Clone, Copy, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
-#[serde(rename_all = "lowercase")]
-pub enum BuildProfile {
-    Debug,
-    Release,
-}
-
-impl BuildProfile {
-    /// Profile the current crate was compiled with.
-    #[cfg(debug_assertions)]
-    pub const CURRENT: Self = Self::Debug;
-    #[cfg(not(debug_assertions))]
-    pub const CURRENT: Self = Self::Release;
-
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Debug => "debug",
-            Self::Release => "release",
-        }
-    }
-}
-
-impl std::fmt::Display for BuildProfile {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.write_str(self.as_str())
-    }
-}
-
 /// The three XDG base directories kmux resolves every path from.
 ///
 /// This type is the seam that keeps path resolution out of the process
@@ -216,7 +182,7 @@ impl Dirs {
     /// incoming daemon can pull live PTY master file descriptors across via
     /// `SCM_RIGHTS`. Distinct from the control and data sockets so the two daemons
     /// can overlap without contending for those fixed paths. See
-    /// [`super::control_rpc::HANDOFF_PROTOCOL_VERSION`] and `docs/daemon-handoff.md`.
+    /// [`kmux_protocol::control_rpc::HANDOFF_PROTOCOL_VERSION`] and `docs/daemon-handoff.md`.
     pub fn handoff_socket_path(&self) -> anyhow::Result<PathBuf> {
         Ok(self.runtime_dir()?.join("handoff.sock"))
     }
@@ -308,7 +274,7 @@ impl Dirs {
     /// The daemon's frame-trace JSONL (issue #72 diagnostics).
     ///
     /// Written by `kmuxd` when `KMUX_FRAME_TRACE` is set — one
-    /// [`crate::trace::DaemonDiffRecord`] per emitted diff. Consumed by the
+    /// [`kmux_protocol::trace::DaemonDiffRecord`] per emitted diff. Consumed by the
     /// `kmux debug tearing` analyzer.
     pub fn daemon_trace_path(&self) -> anyhow::Result<PathBuf> {
         Ok(self.state_dir()?.join("frame_trace_daemon.jsonl"))
@@ -317,7 +283,7 @@ impl Dirs {
     /// The client's frame-trace JSONL (issue #72 diagnostics).
     ///
     /// Written by the `kmux` client when `KMUX_FRAME_TRACE` is set — one
-    /// [`crate::trace::ClientTickRecord`] per pump tick. Consumed by the
+    /// [`kmux_protocol::trace::ClientTickRecord`] per pump tick. Consumed by the
     /// `kmux debug tearing` analyzer.
     pub fn client_trace_path(&self) -> anyhow::Result<PathBuf> {
         Ok(self.state_dir()?.join("frame_trace_client.jsonl"))

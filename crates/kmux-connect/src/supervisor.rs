@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "remote")]
 use kmux_protocol::messages::{ClientCapabilities, ConnectionId, ServerMessage};
 use kmux_protocol::messages::{ClientMessage, TransportKind};
-use kmux_protocol::transport::bootstrap::EndpointAdvert;
+use kmux_sys::transport::bootstrap::EndpointAdvert;
 use tokio::sync::mpsc;
 #[cfg(feature = "remote")]
 use tokio::sync::oneshot;
@@ -749,7 +749,7 @@ fn parse_host_port(address: &str) -> Option<(String, u16)> {
 mod tests {
     use super::*;
     use kmux_protocol::messages::TransportKind;
-    use kmux_protocol::transport::bootstrap::EndpointAdvert;
+    use kmux_sys::transport::bootstrap::EndpointAdvert;
 
     fn make_health(kind: TransportKind) -> EndpointHealth {
         EndpointHealth {

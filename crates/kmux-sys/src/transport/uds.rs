@@ -10,8 +10,8 @@ use std::pin::Pin;
 
 use tokio::net::UnixListener;
 
-use crate::messages::TransportKind;
 use crate::transport::{AcceptError, IncomingSession, Listener, PeerInfo};
+use kmux_protocol::messages::TransportKind;
 
 // ─── UdsListener ─────────────────────────────────────────────────────────────
 
@@ -22,7 +22,7 @@ use crate::transport::{AcceptError, IncomingSession, Listener, PeerInfo};
 /// binding to recover from a stale socket left by a previous daemon run.
 ///
 /// The data socket path is typically `$XDG_RUNTIME_DIR/kmux/daemon-data.sock`
-/// (see `kmux_protocol::dirs::data_socket_path`).
+/// (see `crate::dirs::data_socket_path`).
 pub struct UdsListener {
     inner: UnixListener,
     path: PathBuf,

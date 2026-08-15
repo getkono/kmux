@@ -310,11 +310,11 @@ pub async fn run_client_session<R, W, A, F>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kmux_protocol::identity::Identity;
     use kmux_protocol::messages::{
         ClientCapabilities, ClientMessage, FrontendKind, PROTOCOL_RANGE, protocol_capabilities,
     };
     use kmux_protocol::{decode_server, encode_client, write_frame};
+    use kmux_sys::identity::Identity;
     use tokio::task::AbortHandle;
 
     struct NoopAttacher;

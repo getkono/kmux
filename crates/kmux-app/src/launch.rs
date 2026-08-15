@@ -75,7 +75,7 @@ pub fn init_logging(instance_id: &str) {
     let log_file = if force_stderr {
         None
     } else {
-        kmux_protocol::dirs::client_log_path()
+        kmux_sys::dirs::client_log_path()
             .and_then(|p| {
                 Ok(std::fs::OpenOptions::new()
                     .create(true)

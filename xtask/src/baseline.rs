@@ -21,6 +21,7 @@ use serde::{Deserialize, Serialize};
 /// The parsed `quality-baseline.toml`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Baseline {
+    /// Hand-written policy: the toolchain stamp and which lints are ratcheted.
     pub meta: Meta,
     /// One row per (crate, lint). Rows are sorted on write so a diff shows only
     /// what actually changed.
@@ -36,6 +37,8 @@ pub struct Baseline {
     pub mutants: Vec<MutantBudget>,
 }
 
+/// The hand-written half of the baseline. `mise run baseline` preserves this
+/// block verbatim apart from the toolchain stamp, so its comments survive.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Meta {
     /// The toolchain the counts were measured on. A compiler upgrade changes
@@ -48,24 +51,35 @@ pub struct Meta {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// How many violations of one lint one crate is still allowed.
 pub struct Budget {
+    /// Crate the budget applies to.
     #[serde(rename = "crate")]
     pub krate: String,
+    /// Lint name as clippy reports it, e.g. `clippy::unwrap_used`.
     pub lint: String,
+    /// Violations remaining. May only shrink.
     pub count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// How many `#[allow]` attributes one crate is still allowed.
 pub struct AllowBudget {
+    /// Crate the budget applies to.
     #[serde(rename = "crate")]
     pub krate: String,
+    /// Suppressions remaining. May only shrink.
     pub count: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// How many mutants one crate's tests are still allowed to miss.
 pub struct MutantBudget {
+    /// Crate the budget applies to.
     #[serde(rename = "crate")]
     pub krate: String,
+    /// Surviving mutants. Absolute, not a ratio, so adding well-tested code to
+    /// a crate cannot fail an unrelated PR by moving a percentage.
     pub missed: usize,
 }
 
@@ -75,15 +89,21 @@ pub struct MutantBudget {
 pub enum Finding {
     /// More violations than budgeted. The regression case.
     Regressed {
+        /// Row key: `crate/lint` for lints, `crate` for the other tables.
         what: String,
+        /// What the baseline allows.
         budget: usize,
+        /// What was measured.
         observed: usize,
     },
     /// Fewer violations than budgeted — the code improved but the budget still
     /// claims the old number, so it no longer describes anything.
     Stale {
+        /// Row key: `crate/lint` for lints, `crate` for the other tables.
         what: String,
+        /// What the baseline allows.
         budget: usize,
+        /// What was measured.
         observed: usize,
     },
 }
@@ -153,6 +173,9 @@ pub fn compare(
 
 impl Baseline {
     /// Read the baseline from disk.
+    ///
+    /// # Errors
+    /// If the file cannot be read, or is not a valid baseline document.
     pub fn load(path: &std::path::Path) -> Result<Self> {
         let text = std::fs::read_to_string(path)
             .with_context(|| format!("read the quality baseline at {}", path.display()))?;

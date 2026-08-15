@@ -9,8 +9,8 @@ use std::pin::Pin;
 
 use tokio::net::TcpListener;
 
-use crate::messages::TransportKind;
 use crate::transport::{AcceptError, IncomingSession, Listener, PeerInfo};
+use kmux_protocol::messages::TransportKind;
 
 // ─── TlsTcpListener ──────────────────────────────────────────────────────────
 

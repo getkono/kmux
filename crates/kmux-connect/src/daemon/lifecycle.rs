@@ -20,8 +20,8 @@ const BOOT_LOG_TAIL_MAX: u64 = 8 * 1024;
 pub(super) fn cleanup_stale_daemon() -> anyhow::Result<()> {
     use std::os::unix::io::AsRawFd;
 
-    let pid_path = kmux_protocol::dirs::pid_path()?;
-    let socket_path = kmux_protocol::dirs::socket_path()?;
+    let pid_path = kmux_sys::dirs::pid_path()?;
+    let socket_path = kmux_sys::dirs::socket_path()?;
 
     if pid_path.exists() {
         let pid_file = std::fs::OpenOptions::new()
@@ -65,10 +65,10 @@ pub(super) fn cleanup_stale_daemon() -> anyhow::Result<()> {
 }
 
 /// Path to the file that captures kmuxd's stdout+stderr across a spawn attempt.
-/// Delegates to the shared [`kmux_protocol::dirs::boot_log_path`] so every
+/// Delegates to the shared [`kmux_sys::dirs::boot_log_path`] so every
 /// daemon-spawn site (here, `probe-or-start`, the handoff successor) agrees.
 fn boot_log_path() -> anyhow::Result<PathBuf> {
-    kmux_protocol::dirs::boot_log_path()
+    kmux_sys::dirs::boot_log_path()
 }
 
 /// Spawn `kmuxd` with [`kmux_protocol::control_rpc::DAEMON_BOOT_ARGS`]
@@ -100,7 +100,7 @@ pub(crate) fn start_daemon() -> anyhow::Result<Option<std::process::Child>> {
 
     // Acquire a non-blocking exclusive flock on the spawn lock to serialize
     // concurrent kmux invocations that all try to start a daemon at once.
-    let spawn_lock_path = kmux_protocol::dirs::spawn_lock_path()?;
+    let spawn_lock_path = kmux_sys::dirs::spawn_lock_path()?;
     let lock_file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -194,7 +194,7 @@ pub(super) fn format_boot_log_hint() -> String {
 /// Call this before spawning so `format_daemon_log_tail` can show only the new
 /// entries written by this particular spawn attempt.
 fn daemon_log_size() -> u64 {
-    kmux_protocol::dirs::daemon_log_path()
+    kmux_sys::dirs::daemon_log_path()
         .ok()
         .and_then(|p| std::fs::metadata(&p).ok())
         .map_or(0, |m| m.len())
@@ -205,7 +205,7 @@ fn daemon_log_size() -> u64 {
 /// Only shows content written after `from_offset` so old runtime log entries
 /// from a previous daemon instance do not appear in startup failure messages.
 fn format_daemon_log_tail(from_offset: u64) -> String {
-    let Ok(path) = kmux_protocol::dirs::daemon_log_path() else {
+    let Ok(path) = kmux_sys::dirs::daemon_log_path() else {
         return String::new();
     };
     let Ok(mut file) = std::fs::File::open(&path) else {
@@ -353,7 +353,7 @@ pub(super) fn read_pid_file(path: &std::path::Path) -> Option<u32> {
 /// signal. Returns `None` when there is no pid file, it is unparseable, or the
 /// PID it names is already dead.
 pub fn running_daemon_pid() -> Option<u32> {
-    let pid_path = kmux_protocol::dirs::pid_path().ok()?;
+    let pid_path = kmux_sys::dirs::pid_path().ok()?;
     let pid = read_pid_file(&pid_path)?;
     pid_alive(pid).then_some(pid)
 }
@@ -520,8 +520,8 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
         // Create the runtime dir and a dummy socket file (nothing listening).
-        let _ = kmux_protocol::dirs::runtime_dir().unwrap();
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
+        let _ = kmux_sys::dirs::runtime_dir().unwrap();
+        let socket_path = kmux_sys::dirs::socket_path().unwrap();
         // Create an empty file at the socket path so the path "exists" but
         // no one is listening — connect will fail.
         std::fs::write(&socket_path, b"").unwrap();
@@ -538,8 +538,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
-        let pid_path = kmux_protocol::dirs::pid_path().unwrap();
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
+        let pid_path = kmux_sys::dirs::pid_path().unwrap();
+        let socket_path = kmux_sys::dirs::socket_path().unwrap();
         std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
         std::fs::write(&socket_path, b"socket placeholder").unwrap();
         let held = std::fs::OpenOptions::new()
@@ -571,8 +571,8 @@ mod tests {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
-        let pid_path = kmux_protocol::dirs::pid_path().unwrap();
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
+        let pid_path = kmux_sys::dirs::pid_path().unwrap();
+        let socket_path = kmux_sys::dirs::socket_path().unwrap();
         std::fs::write(&pid_path, "stale").unwrap();
         std::fs::write(&socket_path, b"socket placeholder").unwrap();
 
@@ -594,7 +594,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
-        let lock_path = kmux_protocol::dirs::spawn_lock_path().unwrap();
+        let lock_path = kmux_sys::dirs::spawn_lock_path().unwrap();
         let held = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
@@ -617,7 +617,7 @@ mod tests {
             "expected Ok(None) when spawn lock is held"
         );
 
-        let pid_path = kmux_protocol::dirs::pid_path().unwrap();
+        let pid_path = kmux_sys::dirs::pid_path().unwrap();
         assert!(
             !pid_path.exists(),
             "start_daemon must not touch daemon.pid when contended"
@@ -657,7 +657,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
 
-        let log_path = kmux_protocol::dirs::daemon_log_path().unwrap();
+        let log_path = kmux_sys::dirs::daemon_log_path().unwrap();
         std::fs::write(&log_path, b"old line\n").unwrap();
         let offset = std::fs::metadata(&log_path).unwrap().len();
 
@@ -674,7 +674,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
 
-        let log_path = kmux_protocol::dirs::daemon_log_path().unwrap();
+        let log_path = kmux_sys::dirs::daemon_log_path().unwrap();
         std::fs::write(&log_path, b"old log line\n").unwrap();
         let offset = std::fs::metadata(&log_path).unwrap().len();
 
@@ -866,7 +866,7 @@ mod tests {
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
         // No pid file yet → None. (pid_path() materializes the runtime dir.)
-        let pid_path = kmux_protocol::dirs::pid_path().unwrap();
+        let pid_path = kmux_sys::dirs::pid_path().unwrap();
         assert!(running_daemon_pid().is_none());
 
         // Our own PID is alive → reported back.

@@ -145,7 +145,7 @@ struct Client {
 
 async fn connect_client(token: &str) -> Client {
     let (srv_tx, mut rx) = mpsc::unbounded_channel::<ServerMessage>();
-    let data_sock = kmux_protocol::dirs::data_socket_path().expect("data socket path");
+    let data_sock = kmux_sys::dirs::data_socket_path().expect("data socket path");
     let tx = match connect_uds(
         &data_sock,
         token.to_string(),

@@ -3,9 +3,9 @@ use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ConnectionId, ServerMessage};
-#[cfg(feature = "remote")]
-use kmux_protocol::tls::{TofuStore, TofuVerifier};
 use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
+#[cfg(feature = "remote")]
+use kmux_sys::tls::{TofuStore, TofuVerifier};
 use tokio::io::AsyncWrite;
 #[cfg(feature = "remote")]
 use tokio::net::TcpStream;
@@ -57,7 +57,7 @@ pub(crate) async fn send_auth_frame<W: AsyncWrite + Unpin>(
 /// local Ed25519 public key plus friendly hostname/username labels. A failure to
 /// load the key yields an empty key (the daemon then rejects the handshake).
 fn local_identity_claim() -> (Vec<u8>, String, String) {
-    let public_key = match kmux_protocol::identity::Identity::load_or_create() {
+    let public_key = match kmux_sys::identity::Identity::load_or_create() {
         Ok(id) => id.public_key_bytes().to_vec(),
         Err(e) => {
             warn!("failed to load identity key: {e}");
@@ -66,8 +66,8 @@ fn local_identity_claim() -> (Vec<u8>, String, String) {
     };
     (
         public_key,
-        kmux_protocol::identity::local_hostname(),
-        kmux_protocol::identity::local_username(),
+        kmux_sys::identity::local_hostname(),
+        kmux_sys::identity::local_username(),
     )
 }
 
@@ -78,7 +78,7 @@ pub fn answer_auth_challenge(
     client_tx: &mpsc::UnboundedSender<ClientMessage>,
     nonce: &[u8],
 ) -> bool {
-    let identity = match kmux_protocol::identity::Identity::load_or_create() {
+    let identity = match kmux_sys::identity::Identity::load_or_create() {
         Ok(id) => id,
         Err(e) => {
             warn!("failed to load identity to answer challenge: {e}");
@@ -351,7 +351,7 @@ pub(crate) fn build_tofu_verifier(
     if accept_invalid {
         return Ok(TofuVerifier::accept_invalid(key, transport));
     }
-    let path = kmux_protocol::dirs::known_hosts_path()
+    let path = kmux_sys::dirs::known_hosts_path()
         .map_err(|e| format!("cannot determine known_hosts path: {e}"))?;
     TofuStore::load(path.clone())
         .map(|store| Arc::new(Mutex::new(store)))

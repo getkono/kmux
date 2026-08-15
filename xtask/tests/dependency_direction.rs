@@ -33,6 +33,7 @@ const TOOLKIT_FREE: &[&str] = &[
     "kmux-ghostty-sys",
     "kmux-protocol",
     "kmux-pty",
+    "kmux-sys",
     "kmux-render",
     "kmux-vt-core",
     "kmux-vt-worker",
@@ -121,6 +122,28 @@ fn kmux_protocol_depends_on_no_internal_crate() {
         internal.is_empty(),
         "kmux-protocol is the shared vocabulary every other crate builds on, so it \
          must depend on no internal crate. It now reaches: {internal:?}"
+    );
+}
+
+/// The other half of the kmux-protocol/kmux-sys split: `kmux-sys` may depend on
+/// `kmux-protocol`, but nothing may push the arrow back the other way.
+///
+/// Stated separately from the assertion above because the two failures mean
+/// different things. That one says a pure crate stopped being pure; this one
+/// says the split has been quietly undone by re-exporting a path, an identity
+/// or a transport through the wire-format crate for convenience — which is
+/// exactly how the two ended up in one crate the first time.
+#[test]
+fn kmux_sys_depends_on_kmux_protocol_and_not_the_reverse() {
+    let g = Graph::load().expect("cargo metadata");
+    assert!(
+        g.reachable_from("kmux-sys").contains("kmux-protocol"),
+        "kmux-sys is the host-facing half and is expected to build on the wire types"
+    );
+    assert!(
+        !g.reachable_from("kmux-protocol").contains("kmux-sys"),
+        "kmux-protocol must not reach kmux-sys: the whole point of the split is that \
+         wire types and codec need no filesystem, network or crypto to be tested"
     );
 }
 

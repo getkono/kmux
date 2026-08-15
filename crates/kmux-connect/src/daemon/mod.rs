@@ -29,8 +29,8 @@ use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use kmux_protocol::compat::BuildProfile;
 use kmux_protocol::control_rpc::{SessionsResponse, StatusResponse};
-use kmux_protocol::dirs::BuildProfile;
 use kmux_protocol::messages::ProtocolRange;
 
 /// Connection parameters returned by the running daemon.
@@ -59,7 +59,7 @@ pub struct DaemonStatus {
 /// Returns an error if the daemon is unreachable, times out, or the response
 /// cannot be deserialized into `Resp`.
 async fn control_request<Resp: DeserializeOwned>(command: &str) -> anyhow::Result<Resp> {
-    let socket_path = kmux_protocol::dirs::socket_path()
+    let socket_path = kmux_sys::dirs::socket_path()
         .map_err(|e| anyhow::anyhow!("could not resolve socket path: {e}"))?;
 
     let stream = tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(&socket_path))
@@ -127,7 +127,7 @@ pub async fn ensure_compatible_daemon() -> anyhow::Result<DaemonStatus> {
     let status = ensure_daemon().await?;
 
     let socket = || {
-        kmux_protocol::dirs::socket_path()
+        kmux_sys::dirs::socket_path()
             .map_or_else(|_| "<unknown>".to_string(), |p| p.display().to_string())
     };
 
@@ -243,7 +243,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
+        let socket_path = kmux_sys::dirs::socket_path().unwrap();
         let listener = UnixListener::bind(&socket_path).unwrap();
 
         let my_pid = std::process::id();
@@ -284,7 +284,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
+        let socket_path = kmux_sys::dirs::socket_path().unwrap();
         let listener = UnixListener::bind(&socket_path).unwrap();
 
         tokio::spawn(async move {
@@ -319,7 +319,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
+        let socket_path = kmux_sys::dirs::socket_path().unwrap();
         let listener = UnixListener::bind(&socket_path).unwrap();
 
         let my_pid = std::process::id();
@@ -362,7 +362,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
+        let socket_path = kmux_sys::dirs::socket_path().unwrap();
         let listener = UnixListener::bind(&socket_path).unwrap();
 
         let my_pid = std::process::id();
@@ -431,7 +431,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
 
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
+        let socket_path = kmux_sys::dirs::socket_path().unwrap();
         let listener = UnixListener::bind(&socket_path).unwrap();
 
         // Serve three connections in order: accept, busy, then close-without-reply.

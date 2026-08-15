@@ -10,9 +10,9 @@
 //! (protocol/profile) skew is present — matching `kmux daemon status`. A
 //! not-running GUI and build-fingerprint skew are informational.
 
+use kmux_protocol::compat::BuildProfile;
 use kmux_protocol::compat::{self, Match3};
 use kmux_protocol::control_rpc::WorkerInfo;
-use kmux_protocol::dirs::BuildProfile;
 use kmux_protocol::messages::PROTOCOL_RANGE;
 
 use crate::cli::OutputFormat;
@@ -50,7 +50,7 @@ pub(crate) fn gui_pids() -> Vec<u32> {
 /// This machine's cryptographic identity (the `machine_id` the daemon records),
 /// so we can pick out *our* GUI connection from the registry.
 pub(crate) fn local_machine_id() -> Option<String> {
-    kmux_protocol::identity::Identity::load_or_create()
+    kmux_sys::identity::Identity::load_or_create()
         .ok()
         .map(|id| id.fingerprint())
 }

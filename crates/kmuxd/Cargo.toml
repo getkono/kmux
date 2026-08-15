@@ -28,7 +28,8 @@ federation = ["dep:kmux-connect", "kmux-connect/remote"]
 
 [dependencies]
 kmux-pty.workspace = true
-kmux-protocol = { workspace = true, features = [
+kmux-protocol = { workspace = true, features = ["framing"] }
+kmux-sys = { workspace = true, features = [
     "framing",
     "tls",
     "quic",

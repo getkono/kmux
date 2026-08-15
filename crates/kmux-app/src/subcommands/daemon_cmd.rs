@@ -51,11 +51,11 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
         }
 
         DaemonAction::Status => {
+            use kmux_protocol::compat::BuildProfile;
             use kmux_protocol::compat::{self, Match3};
-            use kmux_protocol::dirs::BuildProfile;
             use kmux_protocol::messages::PROTOCOL_RANGE;
 
-            let socket_display = kmux_protocol::dirs::socket_path()
+            let socket_display = kmux_sys::dirs::socket_path()
                 .map_or_else(|e| format!("<error: {e}>"), |p| p.display().to_string());
 
             match kmux_client::daemon::query_daemon().await {
@@ -204,7 +204,7 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
             Some(server) => fetch_remote_logs(&server, ssh_port, lines, follow).await?,
             // Local daemon: read the log file straight off disk.
             None => {
-                let log_path = kmux_protocol::dirs::daemon_log_path()?;
+                let log_path = kmux_sys::dirs::daemon_log_path()?;
                 super::logs::tail_local_log(
                     &log_path,
                     lines,

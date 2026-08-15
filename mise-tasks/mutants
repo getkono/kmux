@@ -27,7 +27,7 @@ mkdir -p "$TMPDIR"
 # xtask/tests/dependency_direction.rs, which fails if a new crate is unlisted.
 LIB_CRATES=(
     kmux-app kmux-client kmux-connect kmux-ffi kmux-ghostty kmux-protocol
-    kmux-pty kmux-render kmux-vt-core kmux-worker-protocol
+    kmux-pty kmux-render kmux-sys kmux-vt-core kmux-worker-protocol
 )
 BIN_CRATES=(kmuxd kmux-gtk)
 BIN_FAST_CRATES=(kmux kmux-vt-worker)

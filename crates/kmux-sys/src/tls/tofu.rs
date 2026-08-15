@@ -165,7 +165,7 @@ fn current_timestamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs();
-    let (y, mo, d, h, mi, s) = crate::messages::epoch_secs_to_ymd_hms(secs);
+    let (y, mo, d, h, mi, s) = kmux_protocol::messages::epoch_secs_to_ymd_hms(secs);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}Z")
 }
 

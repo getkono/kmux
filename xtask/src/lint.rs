@@ -98,6 +98,9 @@ pub fn package_name(package_id: &str) -> Option<String> {
 /// make the gate fail for reasons that have nothing to do with lints.
 /// `rendered` text is written to `out` as it is read, so output ordering
 /// matches an ordinary clippy run.
+///
+/// # Errors
+/// If the stream cannot be read, or `out` cannot be written to.
 pub fn measure(reader: impl std::io::BufRead, out: &mut impl std::io::Write) -> Result<Measured> {
     let mut measured = Measured::default();
     let mut seen: BTreeSet<(String, usize, usize, String)> = BTreeSet::new();
@@ -160,6 +163,9 @@ pub fn measure(reader: impl std::io::BufRead, out: &mut impl std::io::Write) -> 
 /// which the compiler deletes for you once it stops applying. `#[allow]` never
 /// expires, so what is left of it is a debt with a number, and this is that
 /// number. `#[expect]` is deliberately not counted.
+///
+/// # Errors
+/// If a root cannot be walked or one of its files cannot be read.
 pub fn count_allows(roots: &[&Path]) -> Result<BTreeMap<String, usize>> {
     let mut counts = BTreeMap::new();
     for root in roots {
@@ -219,6 +225,9 @@ fn rust_files(root: &Path) -> Result<Vec<std::path::PathBuf>> {
 /// The baseline records this so a toolchain upgrade cannot masquerade as a
 /// regression — or, worse, absorb one, by changing what a lint fires on in the
 /// same commit that changes the code.
+///
+/// # Errors
+/// If `rustc` cannot be run, or its output cannot be parsed.
 pub fn rustc_version() -> Result<String> {
     let out = std::process::Command::new("rustc")
         .arg("--version")

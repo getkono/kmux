@@ -125,11 +125,11 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
-    use kmux_protocol::identity::Identity;
     use kmux_protocol::messages::{
         ClientCapabilities, ClientMessage, FrontendKind, ServerMessage, version_mismatch_hint,
     };
     use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
+    use kmux_sys::identity::Identity;
 
     let identity = Identity::load_or_create()?;
     let auth = ClientMessage::Auth {
@@ -139,8 +139,8 @@ where
         capabilities: ClientCapabilities::default(),
         connection_id: None,
         public_key: identity.public_key_bytes().to_vec(),
-        hostname: kmux_protocol::identity::local_hostname(),
-        username: kmux_protocol::identity::local_username(),
+        hostname: kmux_sys::identity::local_hostname(),
+        username: kmux_sys::identity::local_username(),
         // This is the CLI control path (kmux clients / kick); always a CLI build.
         client_kind: FrontendKind::Cli,
         client_git_sha: kmux_protocol::buildinfo::git_sha().to_string(),

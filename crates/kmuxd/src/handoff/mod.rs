@@ -3,7 +3,7 @@
 //! survive a planned restart (issue #35).
 //!
 //! The two daemons exchange [`HandoffMessage`] frames over a dedicated Unix
-//! socket ([`kmux_protocol::dirs::Dirs::handoff_socket_path`]); the only payload carried out-of-band
+//! socket ([`kmux_sys::dirs::Dirs::handoff_socket_path`]); the only payload carried out-of-band
 //! is the PTY master fd, delivered via `SCM_RIGHTS` ancillary data. Because the
 //! successor receives its own `dup` of the same open file description, the child
 //! keeps its controlling terminal across the handoff and is merely reparented to

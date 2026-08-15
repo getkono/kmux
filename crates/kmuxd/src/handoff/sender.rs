@@ -30,7 +30,7 @@ const SUCCESSOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// caller releases sockets and exits). On `Err(_)` the handoff failed before the
 /// commit point and the daemon should resume normal operation.
 pub async fn run(app: &Arc<ServerApp>) -> anyhow::Result<()> {
-    let path = kmux_protocol::dirs::handoff_socket_path()?;
+    let path = kmux_sys::dirs::handoff_socket_path()?;
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)
         .with_context(|| format!("binding handoff socket {}", path.display()))?;
@@ -209,7 +209,7 @@ fn resolve_successor_exe(
 /// Write a fresh checkpoint to the standard session-state path.
 async fn write_checkpoint(app: &ServerApp) -> anyhow::Result<()> {
     let state = app.checkpoint_state().await;
-    let path = kmux_protocol::dirs::session_state_path()?;
+    let path = kmux_sys::dirs::session_state_path()?;
     crate::persist::checkpoint::write_checkpoint(&state, &path)?;
     Ok(())
 }

@@ -77,10 +77,16 @@ struct PhaseResult {
 /// What one package's mutants did.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct PackageReport {
+    /// Crate these mutants belong to.
     pub package: String,
+    /// Mutants some test failed on. A timeout is counted separately.
     pub caught: usize,
+    /// Mutants that survived: no assertion anywhere noticed the change.
     pub missed: usize,
+    /// Mutants that made the suite hang. Counted as caught — the suite
+    /// noticing is the point — but tracked apart because the cost differs.
     pub timeout: usize,
+    /// Mutants that did not compile, so they say nothing either way.
     pub unviable: usize,
     /// The longest test phase among this package's caught mutants. Zero when
     /// none were caught.
@@ -98,12 +104,16 @@ impl PackageReport {
 /// One sweep: the per-package tallies plus the baseline that calibrates them.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Sweep {
+    /// Per-crate tallies, keyed by crate name.
     pub packages: BTreeMap<String, PackageReport>,
     /// The baseline scenario's test-phase duration, if the sweep ran one.
     pub baseline_test: Option<f64>,
 }
 
 /// Parse one `outcomes.json`.
+///
+/// # Errors
+/// If the file cannot be read or is not a valid outcomes document.
 pub fn read(path: &Path) -> Result<Sweep> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read the mutation outcomes at {}", path.display()))?;
@@ -111,6 +121,9 @@ pub fn read(path: &Path) -> Result<Sweep> {
 }
 
 /// Parse an `outcomes.json` document.
+///
+/// # Errors
+/// If the text is not valid JSON in cargo-mutants' outcomes shape.
 pub fn parse(text: &str) -> Result<Sweep> {
     let doc: Outcomes = serde_json::from_str(text).context("decode outcomes.json")?;
     let mut sweep = Sweep::default();

@@ -3,7 +3,7 @@
 //! Frontend-agnostic: [`crate::config::resolve_theme`] returns a toolkit-neutral
 //! [`crate::theme::Theme`] which each frontend converts to its own color type.
 
-use kmux_protocol::dirs::Dirs;
+use kmux_sys::dirs::Dirs;
 use serde::{Deserialize, Serialize};
 use tracing::error;
 

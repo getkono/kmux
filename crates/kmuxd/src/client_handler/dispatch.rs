@@ -81,7 +81,7 @@ pub async fn handle_message<A: PaneAttacher>(
                 }
                 // Token accepted: challenge the client to prove it holds the
                 // private key behind `public_key` (issue #146).
-                let nonce = kmux_protocol::identity::random_nonce().to_vec();
+                let nonce = kmux_sys::identity::random_nonce().to_vec();
                 state.pending_auth = Some(PendingAuth {
                     nonce: nonce.clone(),
                     public_key,
@@ -108,13 +108,12 @@ pub async fn handle_message<A: PaneAttacher>(
                     );
                     return true;
                 };
-                if !kmux_protocol::identity::verify(&pending.public_key, &pending.nonce, &signature)
-                {
+                if !kmux_sys::identity::verify(&pending.public_key, &pending.nonce, &signature) {
                     state.send(auth_failure("identity verification failed".to_string()));
                     warn!("identity verification failed");
                     return false;
                 }
-                let machine_id = kmux_protocol::identity::fingerprint(&pending.public_key);
+                let machine_id = kmux_sys::identity::fingerprint(&pending.public_key);
                 let reg = state
                     .app
                     .register_client(
@@ -949,7 +948,7 @@ async fn handle_fetch_logs(
 ) {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    let path = match kmux_protocol::dirs::daemon_log_path() {
+    let path = match kmux_sys::dirs::daemon_log_path() {
         Ok(p) => p,
         Err(e) => {
             state.error(
@@ -984,7 +983,7 @@ async fn handle_fetch_logs(
     }
 
     let start = match lines {
-        Some(n) => kmux_protocol::log_tail::last_n_lines_offset(&buf, n as usize),
+        Some(n) => kmux_sys::log_tail::last_n_lines_offset(&buf, n as usize),
         None => 0,
     };
     for chunk in buf[start..].chunks(LOG_CHUNK_BYTES) {
@@ -1175,7 +1174,7 @@ mod tests {
         state: &mut SharedClientState,
         protocol_capabilities: Vec<String>,
     ) {
-        let identity = kmux_protocol::identity::Identity::generate();
+        let identity = kmux_sys::identity::Identity::generate();
         // Step 1: Auth → the daemon stashes a challenge in `state.pending_auth`.
         let ok = handle_message(
             state,
@@ -1350,7 +1349,7 @@ mod tests {
     async fn auth_rejects_invalid_signature() {
         let app = Arc::new(ServerApp::new("tok".to_string()));
         let (mut state, _comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::Uds);
-        let identity = kmux_protocol::identity::Identity::generate();
+        let identity = kmux_sys::identity::Identity::generate();
 
         let ok = handle_message(
             &mut state,

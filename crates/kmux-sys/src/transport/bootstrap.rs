@@ -15,7 +15,7 @@ use std::pin::Pin;
 use thiserror::Error;
 use tokio::sync::mpsc;
 
-use crate::messages::{ClientMessage, ConnectionId, ServerMessage, TransportKind};
+use kmux_protocol::messages::{ClientMessage, ConnectionId, ServerMessage, TransportKind};
 
 // ─── EndpointAdvert ──────────────────────────────────────────────────────────
 
@@ -110,7 +110,7 @@ pub trait Bootstrap: Send + Sync + 'static {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::messages::TransportKind;
+    use kmux_protocol::messages::TransportKind;
 
     #[test]
     fn endpoint_advert_equality() {
