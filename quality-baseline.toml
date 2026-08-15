@@ -109,7 +109,7 @@ count = 4
 [[lints]]
 crate = "kmux-app"
 lint = "clippy::items_after_statements"
-count = 24
+count = 12
 
 [[lints]]
 crate = "kmux-app"
@@ -129,7 +129,7 @@ count = 2
 [[lints]]
 crate = "kmux-app"
 lint = "clippy::needless_continue"
-count = 10
+count = 5
 
 [[lints]]
 crate = "kmux-app"
@@ -149,7 +149,7 @@ count = 2
 [[lints]]
 crate = "kmux-app"
 lint = "clippy::single_match_else"
-count = 6
+count = 5
 
 [[lints]]
 crate = "kmux-app"
