@@ -191,3 +191,26 @@ ptr_as_ptr = "warn"
 explicit_iter_loop = "warn"
 implicit_clone = "warn"
 verbose_file_reads = "warn"
+
+# Idioms measured at zero across the whole workspace, so adopting them costs no
+# source change — they exist to keep the count at zero. Each one is a pattern
+# that reads as a deliberate choice when you meet it in review but is almost
+# always an accident: a manual `Deref` call, a `FromIterator::from_iter` where
+# `.collect()` reads better, `&Option<&T>` (two indirections for one value), a
+# `filter().next()` that is `find()`, a `flat_map` over an `Option` that is
+# `and_then`, a byte-by-byte count that has a vectorised form, an
+# `ends_with(".TOML")` comparison that silently depends on case, a manual
+# range-check that `TryFrom` expresses, decomposed Unicode in a literal, and a
+# map whose values carry no information.
+explicit_deref_methods = "warn"
+from_iter_instead_of_collect = "warn"
+ref_option_ref = "warn"
+filter_map_next = "warn"
+flat_map_option = "warn"
+manual_ok_or = "warn"
+naive_bytecount = "warn"
+case_sensitive_file_extension_comparisons = "warn"
+checked_conversions = "warn"
+unicode_not_nfc = "warn"
+verbose_bit_mask = "warn"
+zero_sized_map_values = "warn"
