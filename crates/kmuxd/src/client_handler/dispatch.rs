@@ -1458,4 +1458,842 @@ mod tests {
             other => panic!("expected DirectoryListing, got {other:?}"),
         }
     }
+
+    // ─── Per-arm characterization ────────────────────────────────────────────
+    // One test per `ClientMessage` variant, against an authenticated client and
+    // an empty server (no sessions, no panes). These pin what each arm of
+    // `handle_message` does before it is split into per-domain handlers; see
+    // docs/testing.md R2 and R4. Every expectation below was read off the
+    // running code rather than invented; where the observed behaviour looks
+    // wrong it is recorded faithfully and flagged with `// SUSPECT:` instead of
+    // being "corrected" here.
+
+    use kmux_protocol::messages::{
+        AttentionKind, ClientId, KeyAction, KeyCode, KeyEvent, KeyMods, LayoutScheme, PeerTarget,
+        SplitDir, TermSize,
+    };
+
+    /// A word id no session uses, so every session-scoped arm takes its
+    /// not-found path.
+    const MISSING_WORD: &str = "nosuch";
+    /// A well-formed pane id (`word/index`) that parses but resolves to nothing.
+    const MISSING_PANE: &str = "nosuch/0";
+
+    /// An authenticated client on an empty server, with the handshake replies
+    /// already drained so an assertion sees only the arm under test.
+    async fn authenticated_client() -> (SharedClientState, mpsc::UnboundedReceiver<ServerMessage>) {
+        let app = Arc::new(ServerApp::new("tok".to_string()));
+        let (mut state, _comp_out, mut ctrl_rx) = state_for(app, TransportKind::Uds);
+        authenticate(&mut state).await;
+        while ctrl_rx.try_recv().is_ok() {}
+        (state, ctrl_rx)
+    }
+
+    /// Everything queued on the control channel, in order.
+    fn drain(ctrl_rx: &mut mpsc::UnboundedReceiver<ServerMessage>) -> Vec<ServerMessage> {
+        let mut out = Vec::new();
+        while let Ok(msg) = ctrl_rx.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+
+    /// Dispatch exactly one message to a freshly authenticated client on an
+    /// empty server; returns the keep-reading flag and everything it emitted.
+    async fn dispatch_one(msg: ClientMessage) -> (bool, Vec<ServerMessage>) {
+        let (mut state, mut ctrl_rx) = authenticated_client().await;
+        let keep = handle_message(&mut state, msg, &NoopAttacher).await;
+        let out = drain(&mut ctrl_rx);
+        (keep, out)
+    }
+
+    /// The single message an arm emitted; panics when it emitted zero or many.
+    fn only(msgs: Vec<ServerMessage>) -> ServerMessage {
+        assert_eq!(msgs.len(), 1, "expected exactly one reply, got {msgs:?}");
+        msgs.into_iter().next().expect("length asserted above")
+    }
+
+    /// The parts of the single `Error` an arm emitted.
+    fn only_error(msgs: Vec<ServerMessage>) -> (Option<u64>, ErrorCode, String) {
+        match only(msgs) {
+            ServerMessage::Error {
+                request_id,
+                code,
+                message,
+            } => (request_id, code, message),
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    /// A single printable keystroke, so `PtyKeyBatch` gets past its
+    /// empty-batch short circuit and reaches the pane lookup.
+    fn one_key() -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::A,
+            mods: KeyMods::empty(),
+            action: KeyAction::Press,
+            text: "a".to_string(),
+            unshifted_codepoint: u32::from('a'),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_client_is_told_to_send_auth_first() {
+        let app = Arc::new(ServerApp::new("tok".to_string()));
+        let (mut state, _comp_out, mut ctrl_rx) = state_for(app, TransportKind::Uds);
+        let keep = handle_message(&mut state, ClientMessage::Ping { seq: 1 }, &NoopAttacher).await;
+        assert!(keep, "the pre-auth gate keeps the connection open");
+        let (request_id, code, message) = only_error(drain(&mut ctrl_rx));
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::NotAuthenticated);
+        assert_eq!(message, "send Auth first");
+    }
+
+    #[tokio::test]
+    async fn a_second_auth_after_authentication_is_ignored_silently() {
+        let (keep, msgs) = dispatch_one(ClientMessage::Auth {
+            token: "tok".to_string(),
+            protocol_range: PROTOCOL_RANGE,
+            protocol_capabilities: protocol_capabilities(),
+            capabilities: ClientCapabilities::default(),
+            connection_id: None,
+            public_key: Vec::new(),
+            hostname: "host".to_string(),
+            username: "user".to_string(),
+            client_kind: kmux_protocol::messages::FrontendKind::Cli,
+            client_git_sha: String::new(),
+            client_git_dirty: false,
+            client_build_profile: String::new(),
+        })
+        .await;
+        assert!(keep);
+        assert!(
+            msgs.is_empty(),
+            "a duplicate Auth answers nothing: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stray_auth_proof_after_authentication_is_ignored_silently() {
+        let (keep, msgs) = dispatch_one(ClientMessage::AuthProof {
+            signature: vec![0u8; 64],
+        })
+        .await;
+        assert!(keep);
+        assert!(
+            msgs.is_empty(),
+            "a stray AuthProof answers nothing: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_ready_without_a_pending_swap_answers_nothing() {
+        let (keep, msgs) = dispatch_one(ClientMessage::ChannelReady).await;
+        assert!(keep);
+        assert!(msgs.is_empty(), "no swap was pending: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn channel_ready_reports_the_pending_swap_and_consumes_it() {
+        let (mut state, mut ctrl_rx) = authenticated_client().await;
+        state.pending_swap_from = Some(TransportKind::TcpTls);
+
+        let keep = handle_message(&mut state, ClientMessage::ChannelReady, &NoopAttacher).await;
+        assert!(keep);
+        match only(drain(&mut ctrl_rx)) {
+            ServerMessage::ChannelSwitched { old_transport } => {
+                assert_eq!(old_transport, "TCP+TLS");
+            }
+            other => panic!("expected ChannelSwitched, got {other:?}"),
+        }
+
+        // A duplicate `ChannelReady` must not re-emit a stale switch event.
+        let keep = handle_message(&mut state, ClientMessage::ChannelReady, &NoopAttacher).await;
+        assert!(keep);
+        assert!(drain(&mut ctrl_rx).is_empty(), "the swap was consumed");
+    }
+
+    #[tokio::test]
+    async fn session_create_on_an_unknown_peer_errors_naming_the_peer() {
+        // Only the federated branch is exercised: the local branch spawns a real
+        // PTY, which a unit test must not do.
+        let (keep, msgs) = dispatch_one(ClientMessage::SessionCreate {
+            request_id: 1,
+            name: None,
+            cwd: None,
+            program: None,
+            args: vec![],
+            size: TermSize::default(),
+            peer: Some("nosuchpeer".to_string()),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(1));
+        assert_eq!(code, ErrorCode::InternalError);
+        assert_eq!(message, "peer nosuchpeer is not connected");
+    }
+
+    #[tokio::test]
+    async fn session_close_of_an_unknown_session_reports_success() {
+        let (keep, msgs) = dispatch_one(ClientMessage::SessionClose {
+            request_id: 2,
+            word_id: MISSING_WORD.to_string(),
+        })
+        .await;
+        assert!(keep);
+        // SUSPECT: closing a session that does not exist answers `SessionClosed`
+        // rather than an `Error { SessionNotFound }` — `close_session` maps the
+        // missing entry to `Ok(None)`, so the client cannot tell a real close
+        // from a typo'd word id.
+        match only(msgs) {
+            ServerMessage::SessionClosed {
+                request_id,
+                word_id,
+                exit_code,
+            } => {
+                assert_eq!(request_id, 2);
+                assert_eq!(word_id, MISSING_WORD);
+                assert_eq!(exit_code, None);
+            }
+            other => panic!("expected SessionClosed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pane_create_for_an_unknown_session_errors_naming_the_word_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PaneCreate {
+            request_id: 3,
+            word_id: MISSING_WORD.to_string(),
+            program: None,
+            args: vec![],
+            size: TermSize::default(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(3));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    #[tokio::test]
+    async fn pane_close_of_an_unknown_pane_errors_naming_the_pane_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PaneClose {
+            request_id: 4,
+            pane_id: MISSING_PANE.to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(4));
+        // SUSPECT: a missing *pane* is reported as `SessionNotFound` even though
+        // `ErrorCode::PaneNotFound` exists and the message names a pane id. Every
+        // pane-scoped arm below shares this.
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn tab_create_for_an_unknown_session_errors_naming_the_word_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::TabCreate {
+            request_id: 5,
+            word_id: MISSING_WORD.to_string(),
+            program: None,
+            args: vec![],
+            size: TermSize::default(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(5));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    #[tokio::test]
+    async fn tab_close_of_an_unknown_session_reports_success() {
+        let (keep, msgs) = dispatch_one(ClientMessage::TabClose {
+            request_id: 6,
+            word_id: MISSING_WORD.to_string(),
+            tab_index: 0,
+        })
+        .await;
+        assert!(keep);
+        // SUSPECT: like `SessionClose`, closing a tab of a session that does not
+        // exist answers `TabClosed` — `close_tab` maps both a missing session and
+        // a missing tab to `Ok(false)`.
+        match only(msgs) {
+            ServerMessage::TabClosed {
+                request_id,
+                word_id,
+                tab_index,
+            } => {
+                assert_eq!(request_id, 6);
+                assert_eq!(word_id, MISSING_WORD);
+                assert_eq!(tab_index, 0);
+            }
+            other => panic!("expected TabClosed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn tab_rename_for_an_unknown_session_errors_naming_the_word_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::TabRename {
+            request_id: 7,
+            word_id: MISSING_WORD.to_string(),
+            tab_index: 0,
+            new_name: "renamed".to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(7));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    #[tokio::test]
+    async fn tab_reorder_for_an_unknown_session_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::TabReorder {
+            word_id: MISSING_WORD.to_string(),
+            tab_index: 0,
+            new_position: 1,
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        // `TabReorder` carries no request id, so the error cannot correlate.
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    #[tokio::test]
+    async fn pane_split_in_an_unknown_session_errors_naming_the_word_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PaneSplit {
+            request_id: 8,
+            word_id: MISSING_WORD.to_string(),
+            tab_index: 0,
+            from_pane: 0,
+            dir: SplitDir::Horizontal,
+            program: None,
+            args: vec![],
+            size: TermSize::default(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(8));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    #[tokio::test]
+    async fn pane_swap_in_an_unknown_session_answers_nothing() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PaneSwap {
+            word_id: MISSING_WORD.to_string(),
+            tab_index: 0,
+            a: 0,
+            b: 1,
+        })
+        .await;
+        assert!(keep);
+        // SUSPECT: the arm discards the `Err` with `if let Ok(..)`, so a swap
+        // against a session that does not exist is silently dropped — no layout
+        // broadcast and no error reaches the client.
+        assert!(msgs.is_empty(), "the failure is swallowed: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn set_layout_ratios_in_an_unknown_session_answers_nothing() {
+        let (keep, msgs) = dispatch_one(ClientMessage::SetLayoutRatios {
+            word_id: MISSING_WORD.to_string(),
+            tab_index: 0,
+            path: vec![],
+            ratios: vec![500, 500],
+        })
+        .await;
+        assert!(keep);
+        // SUSPECT: same swallowed `Err` as `PaneSwap`.
+        assert!(msgs.is_empty(), "the failure is swallowed: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn apply_layout_scheme_in_an_unknown_session_answers_nothing() {
+        let (keep, msgs) = dispatch_one(ClientMessage::ApplyLayoutScheme {
+            word_id: MISSING_WORD.to_string(),
+            tab_index: 0,
+            scheme: LayoutScheme::EvenHorizontal,
+        })
+        .await;
+        assert!(keep);
+        // SUSPECT: same swallowed `Err` as `PaneSwap`.
+        assert!(msgs.is_empty(), "the failure is swallowed: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn set_focus_in_an_unknown_session_answers_nothing() {
+        let (keep, msgs) = dispatch_one(ClientMessage::SetFocus {
+            word_id: MISSING_WORD.to_string(),
+            tab_index: 0,
+            pane_index: 0,
+        })
+        .await;
+        assert!(keep);
+        // SUSPECT: same swallowed `Err` as `PaneSwap`.
+        assert!(msgs.is_empty(), "the failure is swallowed: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn session_list_on_an_empty_server_returns_an_empty_list() {
+        let (keep, msgs) = dispatch_one(ClientMessage::SessionList { request_id: 9 }).await;
+        assert!(keep);
+        match only(msgs) {
+            ServerMessage::SessionListResult {
+                request_id,
+                sessions,
+            } => {
+                assert_eq!(request_id, 9);
+                assert!(sessions.is_empty(), "no sessions exist: {sessions:?}");
+            }
+            other => panic!("expected SessionListResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_list_closed_on_an_empty_server_returns_an_empty_graveyard() {
+        let (keep, msgs) = dispatch_one(ClientMessage::SessionListClosed { request_id: 10 }).await;
+        assert!(keep);
+        match only(msgs) {
+            ServerMessage::ClosedSessionListResult {
+                request_id,
+                sessions,
+            } => {
+                assert_eq!(request_id, 10);
+                assert!(sessions.is_empty(), "the graveyard is empty: {sessions:?}");
+            }
+            other => panic!("expected ClosedSessionListResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn session_restore_of_an_unknown_session_errors_naming_the_word_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::SessionRestore {
+            request_id: 11,
+            word_id: MISSING_WORD.to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(11));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    #[tokio::test]
+    async fn process_overview_on_an_empty_server_returns_no_panes() {
+        let (keep, msgs) = dispatch_one(ClientMessage::ProcessOverview { request_id: 12 }).await;
+        assert!(keep);
+        match only(msgs) {
+            ServerMessage::ProcessOverviewResult { request_id, panes } => {
+                assert_eq!(request_id, 12);
+                assert!(panes.is_empty(), "no panes exist: {panes:?}");
+            }
+            other => panic!("expected ProcessOverviewResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_logs_answers_a_request_correlated_terminated_stream() {
+        let (keep, msgs) = dispatch_one(ClientMessage::FetchLogs {
+            request_id: 21,
+            lines: Some(5),
+            follow: false,
+        })
+        .await;
+        assert!(keep);
+        // Whether the daemon log file exists depends on the machine's state dir,
+        // so the pinned invariants are the ones the arm controls: every reply
+        // carries this request id, and the stream is terminated exactly once —
+        // by `LogEnd` when the log was readable, by an `Error` when it was not.
+        assert!(!msgs.is_empty(), "the arm always answers");
+        for msg in &msgs {
+            let id = match msg {
+                ServerMessage::LogChunk { request_id, .. }
+                | ServerMessage::LogEnd { request_id } => Some(*request_id),
+                ServerMessage::Error { request_id, .. } => *request_id,
+                other => panic!("unexpected FetchLogs reply {other:?}"),
+            };
+            assert_eq!(id, Some(21), "reply not correlated: {msg:?}");
+        }
+        match msgs.last().expect("non-empty asserted above") {
+            ServerMessage::LogEnd { .. } => {}
+            ServerMessage::Error { code, .. } => assert_eq!(*code, ErrorCode::InternalError),
+            other => panic!("stream must end with LogEnd or Error, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn pty_input_to_an_unknown_pane_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PtyInput {
+            pane_id: MISSING_PANE.to_string(),
+            data: b"x".to_vec(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn pty_paste_to_an_unknown_pane_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PtyPaste {
+            pane_id: MISSING_PANE.to_string(),
+            data: "x".to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn pty_key_batch_to_an_unknown_pane_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PtyKeyBatch {
+            pane_id: MISSING_PANE.to_string(),
+            events: vec![one_key()],
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_pty_key_batch_answers_nothing_even_for_an_unknown_pane() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PtyKeyBatch {
+            pane_id: MISSING_PANE.to_string(),
+            events: vec![],
+        })
+        .await;
+        assert!(keep);
+        // `write_key_batch` short-circuits on an empty batch before the pane
+        // lookup, so the pane is never validated.
+        assert!(msgs.is_empty(), "nothing to write: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn resize_of_an_unknown_pane_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::Resize {
+            pane_id: MISSING_PANE.to_string(),
+            size: TermSize::default(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn attach_to_an_unknown_pane_errors_and_starts_no_stream() {
+        let (mut state, mut ctrl_rx) = authenticated_client().await;
+        let keep = handle_message(
+            &mut state,
+            ClientMessage::Attach {
+                pane_id: MISSING_PANE.to_string(),
+                last_seqno: None,
+                size: TermSize::default(),
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(keep);
+        assert!(
+            state.attached.is_empty(),
+            "a failed attach registers no forwarding task"
+        );
+        let (request_id, code, message) = only_error(drain(&mut ctrl_rx));
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn detach_from_a_pane_this_client_never_attached_answers_nothing() {
+        let (keep, msgs) = dispatch_one(ClientMessage::Detach {
+            pane_id: MISSING_PANE.to_string(),
+        })
+        .await;
+        assert!(keep);
+        assert!(msgs.is_empty(), "nothing was attached: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn signal_to_an_unknown_pane_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::Signal {
+            pane_id: MISSING_PANE.to_string(),
+            signal: 15,
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn request_input_lock_on_an_unknown_pane_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::RequestInputLock {
+            pane_id: MISSING_PANE.to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn release_input_lock_on_an_unknown_pane_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::ReleaseInputLock {
+            pane_id: MISSING_PANE.to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn session_rename_of_an_unknown_session_errors_naming_the_word_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::SessionRename {
+            request_id: 13,
+            word_id: MISSING_WORD.to_string(),
+            new_name: "renamed".to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(13));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    #[tokio::test]
+    async fn set_snapshot_mode_is_applied_without_a_reply() {
+        let (keep, msgs) = dispatch_one(ClientMessage::SetSnapshotMode { enabled: true }).await;
+        assert!(keep);
+        assert!(
+            msgs.is_empty(),
+            "snapshot mode is a silent connection setting: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_paused_is_applied_without_a_reply() {
+        let (keep, msgs) = dispatch_one(ClientMessage::SetPaused {
+            paused: true,
+            auto: false,
+        })
+        .await;
+        assert!(keep);
+        assert!(
+            msgs.is_empty(),
+            "pausing is a silent connection setting: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_pane_no_auto_pause_for_an_unknown_pane_answers_nothing() {
+        let (keep, msgs) = dispatch_one(ClientMessage::SetPaneNoAutoPause {
+            pane_id: MISSING_PANE.to_string(),
+            exempt: true,
+        })
+        .await;
+        assert!(keep);
+        // The exemption is a per-client preference, recorded without validating
+        // that the pane exists.
+        assert!(msgs.is_empty(), "no reply is defined: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn fetch_history_for_an_unknown_pane_errors_with_the_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::FetchHistory {
+            request_id: 14,
+            pane_id: MISSING_PANE.to_string(),
+            start_index: 0,
+            count: 10,
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(14));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn list_directory_of_a_missing_path_answers_a_listing_carrying_the_error() {
+        let (keep, msgs) = dispatch_one(ClientMessage::ListDirectory {
+            request_id: 15,
+            path: "/this/path/does/not/exist/kmux".to_string(),
+        })
+        .await;
+        assert!(keep);
+        match only(msgs) {
+            ServerMessage::DirectoryListing {
+                request_id,
+                path,
+                parent,
+                entries,
+                error,
+            } => {
+                assert_eq!(request_id, 15);
+                // The requested path is echoed back verbatim, not canonicalized.
+                assert_eq!(path, "/this/path/does/not/exist/kmux");
+                assert_eq!(parent, None);
+                assert!(entries.is_empty());
+                assert!(error.is_some(), "the IO failure is reported inline");
+            }
+            other => panic!("expected DirectoryListing, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn open_peer_that_cannot_be_reached_answers_peer_error_naming_the_peer() {
+        // Port 1 on loopback refuses immediately, so this exercises the failure
+        // branch without a live peer daemon.
+        let (keep, msgs) = dispatch_one(ClientMessage::OpenPeer {
+            request_id: 16,
+            target: PeerTarget::Direct {
+                host: "127.0.0.1".to_string(),
+                port: 1,
+                token: "tok".to_string(),
+                accept_invalid_certs: true,
+            },
+        })
+        .await;
+        assert!(keep);
+        match only(msgs) {
+            ServerMessage::PeerError {
+                request_id,
+                peer,
+                reason,
+            } => {
+                assert_eq!(request_id, 16);
+                assert_eq!(peer.as_deref(), Some("127.0.0.1:1"));
+                assert!(
+                    reason.starts_with("peer connect failed:"),
+                    "unexpected reason: {reason}"
+                );
+            }
+            other => panic!("expected PeerError, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn close_peer_that_was_never_opened_reports_success() {
+        let (keep, msgs) = dispatch_one(ClientMessage::ClosePeer {
+            request_id: 17,
+            peer: "nosuchpeer".to_string(),
+        })
+        .await;
+        assert!(keep);
+        // Closing is idempotent: an unknown peer is acknowledged, not refused.
+        match only(msgs) {
+            ServerMessage::PeerClosed { request_id, peer } => {
+                assert_eq!(request_id, 17);
+                assert_eq!(peer, "nosuchpeer");
+            }
+            other => panic!("expected PeerClosed, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn client_list_for_an_unknown_session_errors_with_the_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::ClientList {
+            request_id: 18,
+            word_id: MISSING_WORD.to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(18));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        // SUSPECT: unlike the app-layer errors above, this message does not name
+        // the word id the client asked about.
+        assert_eq!(message, "session not found");
+    }
+
+    #[tokio::test]
+    async fn kick_client_in_an_unknown_session_errors_with_the_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::KickClient {
+            request_id: 19,
+            word_id: MISSING_WORD.to_string(),
+            client_id: ClientId(42),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(19));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        // SUSPECT: as with `ClientList`, neither the word id nor the target
+        // client id appears in the message.
+        assert_eq!(message, "session not found");
+    }
+
+    #[tokio::test]
+    async fn notify_for_an_unknown_pane_errors_with_the_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::Notify {
+            request_id: 20,
+            pane_id: MISSING_PANE.to_string(),
+            kind: AttentionKind::TurnDone,
+            title: "title".to_string(),
+            body: "body".to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(20));
+        // SUSPECT: the protocol doc for `Notify` promises an error when "the pane
+        // is unknown", but the code reported is `SessionNotFound`, not
+        // `PaneNotFound`.
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn ping_is_answered_with_a_pong_carrying_the_same_seq() {
+        let (keep, msgs) = dispatch_one(ClientMessage::Ping { seq: 7 }).await;
+        assert!(keep);
+        match only(msgs) {
+            ServerMessage::Pong { seq } => assert_eq!(seq, 7),
+            other => panic!("expected Pong, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsolicited_pong_answers_nothing_and_records_no_rtt() {
+        let (mut state, mut ctrl_rx) = authenticated_client().await;
+        let keep = handle_message(&mut state, ClientMessage::Pong { seq: 7 }, &NoopAttacher).await;
+        assert!(keep);
+        assert!(drain(&mut ctrl_rx).is_empty(), "a Pong is not answered");
+        // No ping was ever sent, so both samples stay at their initial values:
+        // `u64::MAX` is the "no RTT measured yet" sentinel, `0` the "never".
+        assert_eq!(state.metrics.last_rtt_ms.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(state.metrics.last_pong_ms.load(Ordering::Relaxed), 0);
+    }
 }
