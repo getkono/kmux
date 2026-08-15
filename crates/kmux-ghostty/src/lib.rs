@@ -270,7 +270,7 @@ impl EventBridge {
     }
 
     fn as_c_sink(self: &mut Box<Self>) -> sys::KmuxEventSink {
-        let user = self.as_mut() as *mut Self as *mut c_void;
+        let user = (self.as_mut() as *mut Self).cast::<c_void>();
         sys::KmuxEventSink {
             user,
             on_title: Some(trampoline_title),

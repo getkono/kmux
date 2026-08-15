@@ -2825,7 +2825,7 @@ impl KmuxDriver {
             out.grid_rows = p.grid_rows as u32;
             out.scroll_offset = p.scroll_offset as u64;
             if let Some(c) = p.cursor {
-                let cv = kmux_render::CursorView {
+                let cv = CursorView {
                     col: c.col,
                     row: c.row,
                     shape: c.shape,

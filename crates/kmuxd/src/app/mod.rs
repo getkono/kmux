@@ -367,7 +367,7 @@ impl PaneRelay {
                 size: new_size,
             },
         };
-        let snapshot = std::sync::Arc::new(self.engine.snapshot());
+        let snapshot = Arc::new(self.engine.snapshot());
         let snap_msg = kmux_protocol::messages::ServerMessage::TerminalSnapshot {
             pane_id: pane_id.to_string(),
             snapshot,
@@ -651,7 +651,7 @@ pub struct ServerApp {
     worker_fault_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
     /// Per-pane restart timestamps, used to bound worker respawns (crash-loop
     /// guard); keyed by `pane_id`.
-    worker_restart_log: Mutex<HashMap<String, Vec<std::time::Instant>>>,
+    worker_restart_log: Mutex<HashMap<String, Vec<Instant>>>,
     /// Retained closed (inactive) sessions a user can restore (issue #64),
     /// newest-closed last. Persisted to its own `closed.bin` file, rewritten
     /// only when this set changes. See `app/graveyard.rs`.
@@ -921,7 +921,7 @@ impl ServerApp {
         let sessions = self.sessions.read().await;
         let mut workers = Vec::new();
         for (word_id, state) in sessions.iter() {
-            for (pane_index, relay) in state.panes.iter() {
+            for (pane_index, relay) in &state.panes {
                 let Some(worker_pid) = relay.engine.worker_pid() else {
                     continue;
                 };
@@ -1328,7 +1328,7 @@ mod tests {
                 term_state,
                 PtyWriter::sink().unwrap(),
                 tokio::task::spawn(async {}),
-                tokio::sync::mpsc::unbounded_channel().1,
+                mpsc::unbounded_channel().1,
             )),
             program: "/bin/sh".to_string(),
             args: vec![],

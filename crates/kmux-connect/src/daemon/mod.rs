@@ -93,7 +93,7 @@ async fn control_request<Resp: DeserializeOwned>(command: &str) -> anyhow::Resul
 pub async fn query_daemon() -> Option<DaemonStatus> {
     let resp: StatusResponse = control_request("status").await.ok()?;
 
-    if !lifecycle::pid_alive(resp.pid) {
+    if !pid_alive(resp.pid) {
         return None;
     }
 
@@ -124,7 +124,7 @@ pub async fn ensure_compatible_daemon() -> anyhow::Result<DaemonStatus> {
     use kmux_protocol::compat::{self, BlockReason};
     use kmux_protocol::messages::PROTOCOL_RANGE;
 
-    let status = lifecycle::ensure_daemon().await?;
+    let status = ensure_daemon().await?;
 
     let socket = || {
         kmux_protocol::dirs::socket_path()
@@ -263,7 +263,7 @@ mod tests {
             }
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
         let status = query_daemon().await;
         let status = status.expect("expected Some from mock daemon");
@@ -298,7 +298,7 @@ mod tests {
             }
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
         let resp = query_daemon_sessions().await.expect("should parse");
         assert!(resp.sessions.is_empty());
@@ -334,10 +334,10 @@ mod tests {
             }
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
         // ensure_compatible_daemon must error, not return Ok.
-        let result = super::ensure_compatible_daemon().await;
+        let result = ensure_compatible_daemon().await;
         assert!(result.is_err(), "expected Err on version mismatch");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -382,9 +382,9 @@ mod tests {
             }
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
-        let result = super::ensure_compatible_daemon().await;
+        let result = ensure_compatible_daemon().await;
         assert!(result.is_err(), "expected Err on build profile mismatch");
         let msg = result.unwrap_err().to_string();
         assert!(
@@ -448,20 +448,18 @@ mod tests {
             }
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        tokio::time::sleep(Duration::from_millis(10)).await;
 
         assert!(
-            super::restart_daemon()
-                .await
-                .expect("accepted reply parses"),
+            restart_daemon().await.expect("accepted reply parses"),
             "status=ok must report an accepted handoff"
         );
         assert!(
-            !super::restart_daemon().await.expect("busy reply parses"),
+            !restart_daemon().await.expect("busy reply parses"),
             "status=busy must report no handoff"
         );
         assert!(
-            super::restart_daemon().await.is_err(),
+            restart_daemon().await.is_err(),
             "a daemon that closes without replying must surface as Err (unsupported)"
         );
     }

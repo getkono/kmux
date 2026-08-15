@@ -121,13 +121,13 @@ impl ServerApp {
         let state = sessions
             .get_mut(word_id)
             .ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
+                name: pane_id.clone(),
             })?;
         let relay = state
             .panes
             .get_mut(&pane_index)
             .ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
+                name: pane_id.clone(),
             })?;
 
         let result = compute_replay(relay, last_seqno);
@@ -257,7 +257,7 @@ impl ServerApp {
     pub async fn detach_client_all(&self, client_id: ClientId) {
         let mut sessions = self.sessions.write().await;
         for state in sessions.values_mut() {
-            for (pane_index, relay) in state.panes.iter_mut() {
+            for (pane_index, relay) in &mut state.panes {
                 let pane_id = format_pane_id(&state.meta.word_id, *pane_index);
                 relay.clients.lock().unwrap().remove(&client_id);
                 relay.recompute_live_capabilities();

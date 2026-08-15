@@ -188,7 +188,7 @@ fn register_symbol_fallback_font() {
         let config = fontconfig_sys::FcConfigGetCurrent();
         fontconfig_sys::FcConfigAppFontAddFile(
             config,
-            c_path.as_ptr() as *const fontconfig_sys::FcChar8,
+            c_path.as_ptr().cast::<fontconfig_sys::FcChar8>(),
         )
     };
     if ok == 0 {

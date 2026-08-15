@@ -1411,7 +1411,7 @@ mod tests {
         };
         let grid_scene = build_scene(&Frame::single(100, 100, 1.0, theme(), true, grid_pane), &m);
 
-        let packed = crate::packed::encode_cells(&grid, theme());
+        let packed = packed::encode_cells(&grid, theme());
         let packed_pane = PaneView {
             col: 0,
             row: 0,

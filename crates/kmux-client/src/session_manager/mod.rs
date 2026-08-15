@@ -2194,7 +2194,7 @@ mod tests {
         // scrollback gap (the client is legitimately behind on the envelope).
         mgr.handle_server_message(ServerMessage::TerminalUpdate {
             pane_id: pane.clone(),
-            diff: std::sync::Arc::new(kmux_protocol::messages::TerminalDiff {
+            diff: Arc::new(kmux_protocol::messages::TerminalDiff {
                 ops: vec![],
                 cursor: kmux_protocol::messages::CursorState::default(),
                 modes: TermModes::EMPTY,

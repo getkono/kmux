@@ -131,9 +131,9 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
             match kmux_client::daemon::restart_daemon().await {
                 Ok(true) => {
                     // Wait for the successor (a distinct PID) to take over.
-                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
                     loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        tokio::time::sleep(Duration::from_millis(150)).await;
                         if let Some(s) = kmux_client::daemon::query_daemon().await
                             && s.pid != old_pid
                         {

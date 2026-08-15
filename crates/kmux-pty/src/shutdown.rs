@@ -108,7 +108,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
 
         // Process should be dead: kill(pid, 0) returns ESRCH
-        let alive = nix::sys::signal::kill(pid, None).is_ok();
+        let alive = kill(pid, None).is_ok();
         assert!(
             !alive,
             "process should be dead after graceful_shutdown_nowait"

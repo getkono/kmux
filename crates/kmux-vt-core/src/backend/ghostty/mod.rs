@@ -268,7 +268,7 @@ fn proto_key_to_ghostty(ev: &ProtoKeyEvent) -> kmux_ghostty::KeyEvent {
 // Acknowledge that `GhosttyError::Feed` is intentionally unused in the warm
 // path; keeping the variant lets callers of `kmux-ghostty` differentiate.
 const _: fn() = || {
-    let _ = std::mem::size_of::<GhosttyError>();
+    let _ = size_of::<GhosttyError>();
 };
 
 #[cfg(test)]
@@ -291,10 +291,7 @@ mod tests {
 
     fn expect_cell_diff_with_scrollback(
         result: DiffResult,
-    ) -> (
-        kmux_protocol::messages::TerminalDiff,
-        Vec<kmux_protocol::messages::ScrollbackLine>,
-    ) {
+    ) -> (kmux_protocol::messages::TerminalDiff, Vec<ScrollbackLine>) {
         match result {
             DiffResult::CellDiff {
                 diff,

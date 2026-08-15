@@ -174,7 +174,7 @@ impl ProxiedPane {
     /// is fed by the caller *before* this, so a dropped viewer never desyncs it.
     fn fan_out(&mut self, local_pane_id: &str, msg: &ServerMessage) {
         let mut dead: Vec<ClientId> = Vec::new();
-        for (&client_id, viewer) in self.viewers.iter() {
+        for (&client_id, viewer) in &self.viewers {
             // Paused viewers (issue #68) receive no terminal output and must never
             // be marked lagged or dropped when their channel fills — they resync on
             // resume via re-attach. Same rule as `relay::broadcast_to_clients`; an
@@ -1022,7 +1022,7 @@ impl PeerManager {
             let pane = guard.panes.get_mut(local_pane_id).unwrap();
             let minted = ServerMessage::TerminalSnapshot {
                 pane_id: local_pane_id.to_string(),
-                snapshot: std::sync::Arc::new(pane.mirror.to_snapshot()),
+                snapshot: Arc::new(pane.mirror.to_snapshot()),
                 seqno: pane.last_seqno,
                 sent_at_ms: epoch_millis(),
             };
@@ -1397,7 +1397,7 @@ mod tests {
     fn snapshot_msg(pane_id: &str) -> ServerMessage {
         ServerMessage::TerminalSnapshot {
             pane_id: pane_id.to_string(),
-            snapshot: std::sync::Arc::new(GridSnapshot {
+            snapshot: Arc::new(GridSnapshot {
                 rows: 1,
                 cols: 1,
                 cells: vec![],
@@ -1439,7 +1439,7 @@ mod tests {
 
     #[test]
     fn rewrite_event_to_local_translates_pane_and_word_events() {
-        let mut map = std::collections::HashMap::new();
+        let mut map = HashMap::new();
         map.insert("eagle".to_string(), "hawk".to_string());
 
         // A pane-scoped event rewrites the word portion of its pane ID.
@@ -1546,7 +1546,7 @@ mod tests {
         cells[2].c = 'Z';
         let msg = ServerMessage::TerminalSnapshot {
             pane_id: "hawk/0".to_string(),
-            snapshot: std::sync::Arc::new(GridSnapshot {
+            snapshot: Arc::new(GridSnapshot {
                 rows: 1,
                 cols: 3,
                 cells,

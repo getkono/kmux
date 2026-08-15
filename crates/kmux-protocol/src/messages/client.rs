@@ -895,7 +895,7 @@ mod tests {
                     word_id: "w".into(),
                     tab_index: 0,
                     from_pane: 0,
-                    dir: super::super::session::SplitDir::Horizontal,
+                    dir: SplitDir::Horizontal,
                     program: None,
                     args: vec![],
                     size: TermSize::default(),
@@ -924,7 +924,7 @@ mod tests {
                 ClientMessage::ApplyLayoutScheme {
                     word_id: "w".into(),
                     tab_index: 0,
-                    scheme: super::super::session::LayoutScheme::MainVertical,
+                    scheme: LayoutScheme::MainVertical,
                 },
                 MessageCategory::Control,
             ),

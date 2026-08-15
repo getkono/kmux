@@ -785,7 +785,7 @@ pub async fn handle_message<A: PaneAttacher>(
                             first_index,
                             lines,
                             history_total,
-                            sent_at_ms: kmux_protocol::messages::epoch_millis(),
+                            sent_at_ms: epoch_millis(),
                         });
                     }
                     Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
@@ -1143,7 +1143,7 @@ mod tests {
             _pane_id: String,
             _result: AttachResult,
             _client_rx: mpsc::Receiver<ServerMessage>,
-        ) -> impl std::future::Future<Output = Result<AbortHandle, String>> + Send {
+        ) -> impl Future<Output = Result<AbortHandle, String>> + Send {
             // Never invoked during auth; `ready` avoids an empty async block.
             std::future::ready(Err("noop".to_string()))
         }

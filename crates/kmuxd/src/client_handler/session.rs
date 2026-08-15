@@ -29,7 +29,7 @@ pub fn build_attach_replay(attach_result: AttachResult, pane_id: &str) -> Vec<Se
     match attach_result {
         AttachResult::FullSnapshot(snapshot, seqno) => vec![ServerMessage::TerminalSnapshot {
             pane_id: pane_id.to_string(),
-            snapshot: std::sync::Arc::new(snapshot),
+            snapshot: Arc::new(snapshot),
             seqno,
             sent_at_ms: epoch_millis(),
         }],
@@ -48,7 +48,7 @@ pub fn build_attach_replay(attach_result: AttachResult, pane_id: &str) -> Vec<Se
             },
             ServerMessage::TerminalSnapshot {
                 pane_id: pane_id.to_string(),
-                snapshot: std::sync::Arc::new(snapshot),
+                snapshot: Arc::new(snapshot),
                 seqno,
                 sent_at_ms: epoch_millis(),
             },

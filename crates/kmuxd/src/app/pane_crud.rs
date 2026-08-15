@@ -212,7 +212,7 @@ impl ServerApp {
                     seqno_counter.clone(),
                     self.manager.clone(),
                 ));
-                crate::engine::PaneEngine::InProcess(crate::engine::InProcessEngine::new(
+                PaneEngine::InProcess(crate::engine::InProcessEngine::new(
                     pane_id.to_string(),
                     term_state,
                     writer,

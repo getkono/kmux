@@ -139,10 +139,8 @@ tempfile = "3"
 # two-line commit: drop it from the gate's list, add it here.
 #
 # Measured counts for the lints held back, so the next person does not have to
-# re-measure: clippy::str_to_string 715, unused_qualifications 65,
-# clippy::manual_let_else 18, trivial_casts 16, clippy::explicit_iter_loop 7,
-# clippy::ptr_as_ptr 5, clippy::implicit_clone 3, clippy::verbose_file_reads 2,
-# elided_lifetimes_in_paths 2.
+# re-measure: clippy::str_to_string 715 (excluded on purpose — see below),
+# clippy::manual_let_else 18, trivial_casts 16.
 [workspace.lints.rust]
 # priority = -1 so the individual entries below can override the group; cargo
 # sorts by priority, then emits the flags left to right.
@@ -158,6 +156,10 @@ unused_extern_crates = "warn"
 unused_lifetimes = "warn"
 unused_macro_rules = "warn"
 trivial_numeric_casts = "warn"
+# Graduated from the ratchet once `cargo clippy --fix` cleared them: 65 redundant
+# `crate::`/module qualifications and 2 elided lifetimes in paths.
+unused_qualifications = "warn"
+elided_lifetimes_in_paths = "warn"
 
 [workspace.lints.clippy]
 # `all` is clippy's default set and is already the effective gate via
@@ -180,3 +182,12 @@ fn_to_numeric_cast_any = "deny"
 lossy_float_literal = "deny"
 rest_pat_in_fully_bound_structs = "warn"
 inefficient_to_string = "warn"
+# Graduated from the ratchet once `cargo clippy --fix` cleared them: raw pointer
+# casts became `.cast::<T>()`, `.iter_mut()` in a `for` became `&mut`,
+# `.to_string()` on a `String` became `.clone()`. `verbose_file_reads` has one
+# `#[expect]` in kmux-connect, where the read follows a seek and `fs::read`
+# would be wrong.
+ptr_as_ptr = "warn"
+explicit_iter_loop = "warn"
+implicit_clone = "warn"
+verbose_file_reads = "warn"

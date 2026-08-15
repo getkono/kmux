@@ -58,7 +58,7 @@ impl ServerApp {
         let word_id = &session_state.meta.word_id;
         let mut persisted_panes = Vec::with_capacity(session_state.panes.len());
 
-        for (&pane_index, relay) in session_state.panes.iter() {
+        for (&pane_index, relay) in &session_state.panes {
             let pane_id = format_pane_id(word_id, pane_index);
 
             // Snapshot grid state and extract scrollback for the checkpoint.

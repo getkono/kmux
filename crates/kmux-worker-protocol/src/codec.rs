@@ -55,7 +55,7 @@ pub async fn send_with_fd<M: Serialize>(
         .async_io(Interest::WRITABLE, || {
             let iov = [io::IoSlice::new(&frame)];
             let cmsg_buf;
-            let cmsgs: &[ControlMessage] = if let Some(arr) = &fds {
+            let cmsgs: &[ControlMessage<'_>] = if let Some(arr) = &fds {
                 cmsg_buf = [ControlMessage::ScmRights(arr.as_slice())];
                 &cmsg_buf
             } else {
@@ -194,7 +194,7 @@ mod tests {
         let (daemon, worker) = UnixStream::pair().expect("socketpair");
 
         // A throwaway fd to ship (read end of a pipe).
-        let (pipe_rd, mut pipe_wr) = std::io::pipe().expect("pipe");
+        let (pipe_rd, mut pipe_wr) = io::pipe().expect("pipe");
 
         let hello = WorkerRequest::Hello {
             version: WORKER_PROTOCOL_VERSION,

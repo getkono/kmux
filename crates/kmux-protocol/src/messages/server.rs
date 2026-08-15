@@ -567,10 +567,10 @@ mod tests {
                 ServerMessage::TabCreated {
                     request_id: 0,
                     word_id: "w".into(),
-                    tab: super::super::session::TabInfo {
+                    tab: TabInfo {
                         tab_index: 0,
                         name: "1".into(),
-                        layout: super::super::session::LayoutNode::single(0),
+                        layout: LayoutNode::single(0),
                         focused_pane: 0,
                     },
                 },
@@ -600,7 +600,7 @@ mod tests {
                         progress_state: Default::default(),
                         progress: None,
                     },
-                    layout: super::super::session::LayoutNode::single(0),
+                    layout: LayoutNode::single(0),
                 },
                 MessageCategory::Control,
             ),
@@ -608,7 +608,7 @@ mod tests {
                 ServerMessage::LayoutUpdate {
                     word_id: "w".into(),
                     tab_index: 0,
-                    layout: super::super::session::LayoutNode::single(0),
+                    layout: LayoutNode::single(0),
                     focused_pane: 0,
                 },
                 MessageCategory::Control,

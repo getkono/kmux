@@ -65,7 +65,7 @@ impl PtySession {
         Ok((
             PtyReader { io: reader_io },
             PtyWriter {
-                io: tokio::sync::Mutex::new(writer_io),
+                io: Mutex::new(writer_io),
             },
         ))
     }
@@ -186,7 +186,7 @@ pub struct PtyReader {
 /// mutability (AsyncWrite requires `&mut self`) and is never contested since
 /// only one task calls `write_all` at a time.
 pub struct PtyWriter {
-    io: tokio::sync::Mutex<crate::io::PtyMasterIo>,
+    io: Mutex<crate::io::PtyMasterIo>,
 }
 
 impl PtyWriter {
@@ -224,9 +224,7 @@ impl PtyWriter {
 
         let write_raw = write_fd.into_raw_fd();
         let io = crate::io::PtyMasterIo::new(write_raw).map_err(KmuxError::Io)?;
-        Ok(Self {
-            io: tokio::sync::Mutex::new(io),
-        })
+        Ok(Self { io: Mutex::new(io) })
     }
 }
 
@@ -346,9 +344,7 @@ mod tests {
             let mut output = Vec::new();
             let mut buf = [0u8; 256];
             loop {
-                match tokio::time::timeout(std::time::Duration::from_secs(5), reader.read(&mut buf))
-                    .await
-                {
+                match tokio::time::timeout(Duration::from_secs(5), reader.read(&mut buf)).await {
                     Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
                     Ok(Ok(n)) => {
                         output.extend_from_slice(&buf[..n]);

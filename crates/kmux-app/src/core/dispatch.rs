@@ -516,7 +516,7 @@ impl AppCore {
     /// Cycle the focused pane within the active tab's leaf order by `delta`
     /// (wraps at both ends). No-op when the active tab has no leaves.
     fn cycle_pane_in_tab(&mut self, delta: i32) {
-        let Some(leaves) = self.mgr.active_layout().map(|l| l.leaves().to_vec()) else {
+        let Some(leaves) = self.mgr.active_layout().map(|l| l.leaves().clone()) else {
             return;
         };
         if leaves.is_empty() {

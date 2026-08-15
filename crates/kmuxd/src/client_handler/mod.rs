@@ -76,7 +76,7 @@ pub trait PaneAttacher: Send + Sync {
         pane_id: String,
         result: AttachResult,
         client_rx: mpsc::Receiver<ServerMessage>,
-    ) -> impl std::future::Future<Output = Result<AbortHandle, String>> + Send;
+    ) -> impl Future<Output = Result<AbortHandle, String>> + Send;
 }
 
 // ─── Shared client state ──────────────────────────────────────────────────────

@@ -874,7 +874,7 @@ mod tests {
     fn federate_desired_peer_sends_open_peer_to_the_daemon() {
         use kmux_protocol::messages::ClientMessage;
         let mut core = fixture_core();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         core.mgr.set_ws_sender(tx);
         core.desired_peer = Some(PeerTarget::Ssh {
             user: Some("alice".into()),
@@ -901,7 +901,7 @@ mod tests {
     fn federate_desired_peer_is_a_noop_without_a_peer() {
         use kmux_protocol::messages::ClientMessage;
         let mut core = fixture_core();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         core.mgr.set_ws_sender(tx);
         core.desired_peer = None;
 
@@ -916,7 +916,7 @@ mod tests {
     fn peer_opened_rearms_auto_select_and_refreshes_list() {
         use kmux_protocol::messages::ClientMessage;
         let mut core = fixture_core();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         core.mgr.set_ws_sender(tx);
         core.did_auto_select = true; // suppressed at launch
         core.mode = Mode::Connecting {

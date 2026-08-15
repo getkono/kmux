@@ -167,6 +167,13 @@ pub(super) fn format_boot_log_hint() -> String {
         return String::new();
     }
     let mut bytes = Vec::new();
+    // Not `fs::read`: the seek above is the point — this reads only the tail of
+    // a log that may be arbitrarily large, and `fs::read` would start over at
+    // byte zero and pull the whole file into memory.
+    #[expect(
+        clippy::verbose_file_reads,
+        reason = "reads from a seek offset, which fs::read cannot express"
+    )]
     if file.read_to_end(&mut bytes).is_err() {
         return String::new();
     }
@@ -217,6 +224,13 @@ fn format_daemon_log_tail(from_offset: u64) -> String {
         return String::new();
     }
     let mut bytes = Vec::new();
+    // Not `fs::read`: the seek above is the point — this reads only the tail of
+    // a log that may be arbitrarily large, and `fs::read` would start over at
+    // byte zero and pull the whole file into memory.
+    #[expect(
+        clippy::verbose_file_reads,
+        reason = "reads from a seek offset, which fs::read cannot express"
+    )]
     if file.read_to_end(&mut bytes).is_err() {
         return String::new();
     }
@@ -425,13 +439,13 @@ pub async fn force_kill_daemon(pid: u32, term_first: bool, grace: Duration) -> a
     }
 }
 
-pub(crate) fn find_server_binary() -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn find_server_binary() -> anyhow::Result<PathBuf> {
     // 0. Explicit override (dev workflows, unusual layouts). Mirrors `KMUX_BIN`
     //    (diagnostic emitter) and `KMUX_APP` (macOS bundle). Honored only when it
     //    points at a real file, so a stale env var falls through to discovery
     //    rather than hard-failing.
     if let Some(path) = std::env::var_os("KMUX_KMUXD") {
-        let candidate = std::path::PathBuf::from(path);
+        let candidate = PathBuf::from(path);
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -472,7 +486,7 @@ pub(crate) fn find_server_binary() -> anyhow::Result<std::path::PathBuf> {
     ))
 }
 
-pub(super) fn which_server() -> anyhow::Result<std::path::PathBuf> {
+pub(super) fn which_server() -> anyhow::Result<PathBuf> {
     let path_var = std::env::var("PATH").unwrap_or_default();
     for dir in path_var.split(':') {
         let candidate = std::path::Path::new(dir).join("kmuxd");

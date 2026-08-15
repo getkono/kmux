@@ -37,7 +37,7 @@ impl PaneAttacher for QuicAttacher {
         pane_id: String,
         result: AttachResult,
         mut client_rx: mpsc::Receiver<ServerMessage>,
-    ) -> impl std::future::Future<Output = Result<AbortHandle, String>> + Send {
+    ) -> impl Future<Output = Result<AbortHandle, String>> + Send {
         let conn = self.conn.clone();
         let comp_out = Arc::clone(&self.comp_out);
         async move {

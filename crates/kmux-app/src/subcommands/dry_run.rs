@@ -160,7 +160,7 @@ async fn run_supervisor_phase(
     }
 
     if endpoints.is_empty() {
-        let _ = tokio::time::timeout(TEST_DURATION, async {
+        let _ = timeout(TEST_DURATION, async {
             while let Some(_msg) = srv_rx.recv().await {
                 // drain so the channel doesn't accumulate
             }

@@ -62,7 +62,7 @@ impl DiffBuffer {
     pub fn pending_stats(&self, after: SequenceNo) -> (usize, usize) {
         let mut count = 0;
         let mut bytes = 0;
-        for (seq, _, size) in self.diffs.iter() {
+        for (seq, _, size) in &self.diffs {
             if *seq > after {
                 count += 1;
                 bytes += *size;

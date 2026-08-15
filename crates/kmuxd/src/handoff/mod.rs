@@ -59,7 +59,7 @@ pub(crate) async fn write_frame(
         .async_io(Interest::WRITABLE, || {
             let iov = [io::IoSlice::new(&frame)];
             let cmsg_buf;
-            let cmsgs: &[ControlMessage] = if let Some(arr) = &fds {
+            let cmsgs: &[ControlMessage<'_>] = if let Some(arr) = &fds {
                 cmsg_buf = [ControlMessage::ScmRights(arr.as_slice())];
                 &cmsg_buf
             } else {
