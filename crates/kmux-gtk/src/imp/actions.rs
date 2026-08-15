@@ -278,7 +278,7 @@ fn add_preferences(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
     let fe = fe.clone();
     let s = shell.clone();
     act.connect_activate(move |_, _| {
-        prefs::open(&fe, &s.drawing);
+        prefs::open(&fe, &s);
     });
     shell.window.add_action(&act);
 }
