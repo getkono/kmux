@@ -54,9 +54,9 @@ daemonize.workspace = true
 nix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-kmux-ghostty.workspace = true
-# Direct dep (rather than only transitive via kmux-ghostty) so this crate's
-# build.rs receives `DEP_KMUX_GHOSTTY_LIB_DIR` and can embed the rpath.
+# Depended on for its build-script metadata, not its API: this is what makes
+# cargo hand kmuxd's own build.rs `DEP_KMUX_GHOSTTY_LIB_DIR`, which becomes the
+# rpath to libkmux_ghostty.so.
 kmux-ghostty-sys.workspace = true
 # Shared VT pipeline: `backend`, `diff_engine`, `term_state` re-exported at the
 # crate root. Same code the isolated kmux-vt-worker runs (issue #126).
@@ -84,3 +84,10 @@ kmux-vt-core = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
+
+# cargo-machete reads `use` statements, so a dependency used any other way looks
+# unused to it. An unexplained entry here is the thing to be suspicious of:
+# kmux-ghostty was reported alongside this one on the first `mise run
+# deps-audit` and turned out to be genuinely dead.
+[package.metadata.cargo-machete]
+ignored = ["kmux-ghostty-sys"]
