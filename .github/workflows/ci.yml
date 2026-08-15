@@ -60,8 +60,13 @@ jobs:
       - name: Format check
         run: mise run fmt-check
 
-      - name: Clippy
-        run: mise run clippy
+      # The lint gate subsumes `mise run clippy`: it runs the same pass with
+      # `-D warnings` and additionally injects the ratcheted lints with
+      # `--force-warn`, holding each crate's count against quality-baseline.toml.
+      # It fails on a new violation AND on a budget that has gone stale.
+      # See docs/quality-gates.md.
+      - name: Clippy + quality ratchet
+        run: mise run lint-gate
 
       # The GPU renderer (issue #132) is a default feature, so clippy/test above
       # already exercise it. This proves the wgpu-free path still compiles, so

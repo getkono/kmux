@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+#MISE description="Run clippy including the ratcheted lints and hold the counts against quality-baseline.toml."
+#USAGE flag "--write" help="rewrite the baseline from what was measured instead of failing on a mismatch"
+#
+# This is the gate `mise run clippy` cannot be. `clippy` runs `-D warnings`, so
+# every lint it knows about is pass/fail at zero; the lints kmux is still paying
+# down have thousands of violations between them and would break the tree on
+# arrival. Here they are injected with `--force-warn`, which outranks BOTH
+# `-D warnings` (so they stay warnings and get counted rather than failing the
+# compile) and any in-source `#[allow]` (so a budget cannot be paid down by
+# suppressing instead of fixing). Everything else still fails hard, exactly as
+# in `mise run clippy`.
+#
+# The lint list itself lives in quality-baseline.toml under [meta].ratcheted and
+# is read back out via `xtask lint-flags`, so there is no second copy here to
+# drift out of step with the budgets it goes with.
+#
+# clippy's JSON goes to a file rather than a pipe: `cargo run -p xtask` inside a
+# pipeline would block on the same build lock cargo clippy is holding.
+set -euo pipefail
+
+write=""
+[[ "${1:-}" == "--write" ]] && write="--write"
+
+cargo build -q -p xtask
+
+# Read into an array, one flag per line. Never `$(...)` unquoted: whether that
+# word-splits at all is shell-dependent, and when it does not, the entire lint
+# list reaches rustc as a single argument and every crate fails with
+# "Unrecognized option".
+flags=()
+while IFS= read -r flag; do flags+=("$flag"); done < <(cargo run -q -p xtask -- lint-flags)
+
+json="$(mktemp -t kmux-lint-gate.XXXXXX.json)"
+trap 'rm -f "$json"' EXIT
+
+set +e
+cargo clippy --workspace --all-targets --message-format=json -- -D warnings "${flags[@]}" >"$json"
+clippy_rc=$?
+set -e
+
+# Writing a baseline from a run that did not finish would record budgets that
+# are too loose for every crate cargo never got to. The gate refuses this too
+# (it sees the hard-lint errors), but a linker error or a build-script panic
+# produces no diagnostic at all, and only the exit code shows it.
+if [[ -n "$write" && $clippy_rc -ne 0 ]]; then
+    echo "lint-gate: cargo clippy exited $clippy_rc, so the run is incomplete;" >&2
+    echo "           refusing to write a baseline from a partial measurement." >&2
+    exit "$clippy_rc"
+fi
+
+cargo run -q -p xtask -- lint-gate $write <"$json"
+
+# Same reason, for the checking direction: a failure with no attributable
+# diagnostic would otherwise slip past a gate that only reads diagnostics.
+if [[ $clippy_rc -ne 0 ]]; then
+    echo "lint-gate: cargo clippy exited $clippy_rc with no diagnostic the gate could attribute" >&2
+    exit "$clippy_rc"
+fi

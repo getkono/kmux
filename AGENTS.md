@@ -85,7 +85,12 @@ These are strictly-typed config/CLI, not environment variables.
 - Document architectural changes in `docs/`.
 - Strict Rust — no `#[allow(unused)]` without justification. A new suppression
   uses `#[expect(..., reason = "...")]`, which fails the build once it stops
-  applying, rather than `#[allow]`, which never expires.
+  applying, rather than `#[allow]`, which never expires. Which lints are fatal,
+  which are ratcheted against `quality-baseline.toml`, and how to graduate one
+  from the second group to the first are normative in
+  [docs/quality-gates.md](docs/quality-gates.md) — read it before adding a lint,
+  a suppression, or a `#[allow]`. `mise run lint-gate` is the check; `mise run
+  baseline` records an improvement.
 - Tests assert on values, take paths and time as parameters instead of mutating
   the process, and dispatchers split into named per-message handlers rather than
   one large `match`. The tiers, the per-crate methodology, test doubles, naming,

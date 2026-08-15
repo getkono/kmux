@@ -1,22 +1,50 @@
 //! Command-line entrypoint for the workspace quality tooling. See `lib.rs` for
 //! why this crate exists and where it lives.
 
-use anyhow::{Result, bail};
+use std::collections::BTreeMap;
+use std::io::Write as _;
+use std::path::{Path, PathBuf};
+
+use anyhow::{Context, Result, bail};
+use xtask::baseline::{Baseline, Finding, compare};
 use xtask::graph::Graph;
+use xtask::lint;
+
+/// Roots scanned for `#[allow]` attributes: the product crates and this crate.
+/// Tooling holds itself to the same bar as the code it gates.
+const ALLOW_ROOTS: [&str; 2] = ["crates", "xtask"];
 
 fn main() -> Result<()> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
         Some("deps-graph") => print_graph(),
-        Some(other) => bail!("unknown command `{other}`; known commands: deps-graph"),
+        Some("lint-flags") => print_lint_flags(),
+        Some("lint-gate") => lint_gate(args.next().as_deref() == Some("--write")),
+        Some(other) => bail!("unknown command `{other}`; known commands: {COMMANDS}"),
         None => {
             eprintln!("usage: cargo run -p xtask -- <command>");
             eprintln!();
             eprintln!("commands:");
-            eprintln!("  deps-graph   print the workspace dependency graph as it is asserted on");
+            eprintln!(
+                "  deps-graph          print the workspace dependency graph as it is asserted on"
+            );
+            eprintln!("  lint-flags          print the --force-warn flags for the ratcheted lints");
+            eprintln!(
+                "  lint-gate [--write] compare a clippy JSON stream on stdin against the baseline"
+            );
             bail!("no command given")
         }
     }
+}
+
+const COMMANDS: &str = "deps-graph, lint-flags, lint-gate";
+
+/// The checked-in budget, resolved relative to the workspace root.
+fn baseline_path() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .unwrap_or(Path::new("."))
+        .join("quality-baseline.toml")
 }
 
 /// Print the internal dependency graph. This is the debugging counterpart to
@@ -38,4 +66,316 @@ fn print_graph() -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// Emit the `--force-warn` flags for every ratcheted lint, so the lint list has
+/// exactly one home (the baseline's `[meta].ratcheted`) and the mise task that
+/// runs clippy does not carry a second copy that can drift out of step.
+fn print_lint_flags() -> Result<()> {
+    let baseline = Baseline::load(&baseline_path())?;
+    // One token per line, `--force-warn=<lint>` rather than two words: the
+    // caller reads them into a shell array, and a two-word form would make the
+    // whole list depend on the caller's word splitting -- which differs between
+    // shells and fails by passing the entire list to rustc as one argument.
+    for lint in &baseline.meta.ratcheted {
+        println!("--force-warn={lint}");
+    }
+    Ok(())
+}
+
+/// Read a clippy JSON stream from stdin and hold it against the baseline.
+fn lint_gate(write: bool) -> Result<()> {
+    let path = baseline_path();
+    let baseline = Baseline::load(&path)?;
+
+    let mut stdout = std::io::stdout().lock();
+    let measured = lint::measure(std::io::stdin().lock(), &mut stdout)?;
+    stdout
+        .flush()
+        .context("flush the re-printed clippy output")?;
+
+    let allows = lint::count_allows(
+        &ALLOW_ROOTS
+            .iter()
+            .map(|r| baseline_path().parent().unwrap_or(Path::new(".")).join(r))
+            .collect::<Vec<_>>()
+            .iter()
+            .map(PathBuf::as_path)
+            .collect::<Vec<_>>(),
+    )?;
+
+    if write {
+        // A partial clippy run measures a subset of the tree, and writing that
+        // as a baseline records budgets that are too LOOSE — the exact failure
+        // this whole gate exists to make impossible. One hard-lint error stops
+        // cargo before the crates downstream of it are ever linted, so refuse.
+        if !measured.errors.is_empty() {
+            for err in &measured.errors {
+                eprintln!("baseline: hard lint: {err}");
+            }
+            bail!(
+                "refusing to write a baseline from a run with {} hard-lint error(s): \
+                 cargo stops at the first failing crate, so everything downstream \
+                 of it went unmeasured. Fix these, then re-run.",
+                measured.errors.len()
+            );
+        }
+        return rewrite(&path, &baseline, &measured.counts, &allows);
+    }
+
+    let rustc = lint::rustc_version()?;
+    let mut failures: Vec<String> = Vec::new();
+
+    if rustc != baseline.meta.rustc {
+        failures.push(format!(
+            "toolchain changed: baseline was measured on rustc {}, this is rustc {rustc}.\n  \
+             A compiler upgrade changes what fires, so re-measure deliberately \
+             (`mise run baseline`) in a commit of its own.",
+            baseline.meta.rustc
+        ));
+    }
+
+    // Hard-gate violations: lints the workspace already holds at zero, so no
+    // budget applies and nothing about the ratchet can excuse them.
+    for err in &measured.errors {
+        failures.push(format!("hard lint: {err}"));
+    }
+
+    // Budgets are only compared when the run finished. cargo stops at the first
+    // crate that fails, so every crate downstream of a hard-lint error goes
+    // unlinted and reads as zero violations — which the comparison would report
+    // as a dozen "stale budget" failures that vanish the moment the real error
+    // is fixed. Reporting those alongside the actual cause is worse than not
+    // reporting them: it buries it.
+    if measured.errors.is_empty() {
+        report(
+            &mut failures,
+            "lint",
+            &compare(&baseline.lint_budgets(), &measured.counts),
+            &measured.sites,
+        );
+        report(
+            &mut failures,
+            "#[allow] budget",
+            &compare(&baseline.allow_budgets(), &allows),
+            &BTreeMap::new(),
+        );
+    }
+
+    if failures.is_empty() {
+        let total: usize = measured.counts.values().sum();
+        println!("lint gate: {total} budgeted violations, all within budget");
+        return Ok(());
+    }
+    for f in &failures {
+        eprintln!("lint gate: {f}");
+    }
+    bail!(
+        "{} quality-gate failure(s). Fix the code, or — if a budget really must \
+         grow — edit {} deliberately so the increase shows up in review.",
+        failures.len(),
+        path.display()
+    )
+}
+
+/// Turn findings into failure lines, naming a few offending sites for the
+/// regressions so the message is actionable without a second clippy run.
+fn report(
+    failures: &mut Vec<String>,
+    label: &str,
+    findings: &[Finding],
+    sites: &BTreeMap<String, Vec<String>>,
+) {
+    for finding in findings {
+        let mut line = format!("{label}: {}", finding.render());
+        if finding.is_regression()
+            && let Finding::Regressed { what, .. } = finding
+            && let Some(where_) = sites.get(what)
+        {
+            let shown: Vec<&str> = where_.iter().take(5).map(String::as_str).collect();
+            line.push_str(&format!("\n  at {}", shown.join(", ")));
+            if where_.len() > shown.len() {
+                line.push_str(&format!(" (+{} more)", where_.len() - shown.len()));
+            }
+        }
+        failures.push(line);
+    }
+}
+
+/// Rewrite the baseline from what was just measured.
+///
+/// This is `mise run baseline`, and it is allowed to move a count in either
+/// direction — it is a deliberate, reviewable edit to a checked-in file. What
+/// makes the ratchet a ratchet is that CI never runs it.
+///
+/// Only the measured tables are regenerated. `[meta]` is hand-written policy
+/// (which lints are ratcheted, and why each one earns its place) and is carried
+/// through verbatim apart from the toolchain stamp, because a TOML serializer
+/// would drop every comment in it and the reasons are the valuable part.
+fn rewrite(
+    path: &Path,
+    baseline: &Baseline,
+    counts: &BTreeMap<String, usize>,
+    allows: &BTreeMap<String, usize>,
+) -> Result<()> {
+    let rustc = lint::rustc_version()?;
+    let next = baseline.rewritten(&rustc, counts, allows);
+    let old = std::fs::read_to_string(path).unwrap_or_default();
+    let header = restamp_rustc(&header_of(&old), &rustc);
+    let body = toml::to_string_pretty(&Tables {
+        lints: next.lints.clone(),
+        allows: next.allows.clone(),
+    })
+    .context("serialize the quality baseline")?;
+    std::fs::write(path, format!("{header}\n{body}"))
+        .with_context(|| format!("write {}", path.display()))?;
+
+    let before: usize = baseline.lints.iter().map(|b| b.count).sum();
+    let after: usize = next.lints.iter().map(|b| b.count).sum();
+    println!(
+        "wrote {} — {before} -> {after} budgeted violations across {} rows",
+        path.display(),
+        next.lints.len()
+    );
+    Ok(())
+}
+
+/// Just the measured half of the file, so the hand-written `[meta]` block above
+/// it can be preserved as text.
+#[derive(serde::Serialize)]
+struct Tables {
+    lints: Vec<xtask::baseline::Budget>,
+    allows: Vec<xtask::baseline::AllowBudget>,
+}
+
+/// Everything above the first measured table: the file's explanatory comments
+/// and the whole `[meta]` block, comments included.
+fn header_of(text: &str) -> String {
+    text.lines()
+        .take_while(|l| !l.starts_with("[["))
+        .map(|l| format!("{l}\n"))
+        .collect::<String>()
+        .trim_end()
+        .to_owned()
+}
+
+/// Update the `rustc = "..."` line inside a preserved header.
+///
+/// The stamp has to move with the measurement — a baseline that claims an older
+/// toolchain than the one it was taken on would fail the gate on the very next
+/// run, for a reason that has nothing to do with the code.
+fn restamp_rustc(header: &str, rustc: &str) -> String {
+    header
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with("rustc =") {
+                format!("rustc = \"{rustc}\"")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const HEADER: &str = "# why this file exists\n\n[meta]\nrustc = \"1.0.0\"\nratcheted = [\n    # because\n    \"clippy::x\",\n]\n";
+
+    #[test]
+    fn the_whole_hand_written_block_survives_a_rewrite_comments_included() {
+        let text = format!("{HEADER}\n[[lints]]\ncrate = \"a\"\n");
+        let header = header_of(&text);
+        assert!(header.contains("# why this file exists"));
+        assert!(
+            header.contains("# because"),
+            "comments inside [meta] are the valuable part"
+        );
+        assert!(
+            !header.contains("[[lints]]"),
+            "measured tables are regenerated, not preserved"
+        );
+    }
+
+    #[test]
+    fn a_file_that_is_only_measured_tables_yields_no_header() {
+        assert_eq!(header_of("[[lints]]\ncrate = \"a\"\n"), "");
+    }
+
+    #[test]
+    fn the_toolchain_stamp_moves_with_the_measurement() {
+        let out = restamp_rustc(HEADER, "9.9.9");
+        assert!(out.contains("rustc = \"9.9.9\""));
+        assert!(!out.contains("1.0.0"));
+        assert!(
+            out.contains("# because"),
+            "restamping must not touch anything else"
+        );
+    }
+
+    #[test]
+    fn a_regression_names_the_sites_that_caused_it() {
+        let mut failures = Vec::new();
+        let sites: BTreeMap<String, Vec<String>> = [(
+            "a/clippy::x".to_owned(),
+            vec!["a/src/one.rs:1".to_owned(), "a/src/two.rs:2".to_owned()],
+        )]
+        .into_iter()
+        .collect();
+        report(
+            &mut failures,
+            "lint",
+            &[Finding::Regressed {
+                what: "a/clippy::x".to_owned(),
+                budget: 0,
+                observed: 2,
+            }],
+            &sites,
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(
+            failures[0].contains("a/src/one.rs:1, a/src/two.rs:2"),
+            "{}",
+            failures[0]
+        );
+    }
+
+    #[test]
+    fn a_long_site_list_is_truncated_with_a_count_of_the_rest() {
+        let mut failures = Vec::new();
+        let all: Vec<String> = (0..9).map(|i| format!("a/src/f.rs:{i}")).collect();
+        let sites: BTreeMap<String, Vec<String>> =
+            [("a/clippy::x".to_owned(), all)].into_iter().collect();
+        report(
+            &mut failures,
+            "lint",
+            &[Finding::Regressed {
+                what: "a/clippy::x".to_owned(),
+                budget: 0,
+                observed: 9,
+            }],
+            &sites,
+        );
+        assert!(failures[0].contains("(+4 more)"), "{}", failures[0]);
+    }
+
+    #[test]
+    fn a_stale_budget_reports_without_sites() {
+        let mut failures = Vec::new();
+        report(
+            &mut failures,
+            "lint",
+            &[Finding::Stale {
+                what: "a/clippy::x".to_owned(),
+                budget: 3,
+                observed: 1,
+            }],
+            &BTreeMap::new(),
+        );
+        assert_eq!(failures.len(), 1);
+        assert!(failures[0].contains("stale"), "{}", failures[0]);
+        assert!(!failures[0].contains("\n  at "));
+    }
 }

@@ -17,4 +17,6 @@
 //! `xtask/tests/dependency_direction.rs` — so they ride the existing
 //! `mise run test`, CI, and the pre-push hook instead of needing their own step.
 
+pub mod baseline;
 pub mod graph;
+pub mod lint;
