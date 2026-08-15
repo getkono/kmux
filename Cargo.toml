@@ -53,7 +53,6 @@ clap = { version = "4.6.1", features = ["derive", "unstable-ext"] }
 # `unstable-dynamic` and clap's `unstable-ext` track clap's minor version, so
 # keep this tilde-pinned in lockstep with clap (4.6.x). See docs/shell-completion.md.
 clap_complete = { version = "~4.6", features = ["unstable-dynamic"] }
-futures = "0.3"
 daemonize = "0.5"
 nix = { version = "0.31", features = ["fs", "net", "process", "signal", "socket", "term", "uio", "user"] }
 serde_json = "1"

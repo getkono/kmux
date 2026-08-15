@@ -986,6 +986,10 @@ mod tests {
 
     // Async: submit_add_remote persists the SSH remote via record_connection,
     // whose save() spawns a blocking task that needs a runtime.
+    // Stays a `#[tokio::test]` although nothing here awaits: `add_remote`
+    // records the server, and `RecentServers::save` writes the cache from a
+    // `spawn_blocking`, which needs an ambient runtime. `dispatch_action` being
+    // synchronous does not make it runtime-free.
     #[tokio::test]
     async fn add_remote_ssh_registers_records_and_connects() {
         let (mut core, mut rx) = connected_core();
@@ -1251,8 +1255,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn submit_create_here_sends_session_create_with_browsed_cwd() {
+    #[test]
+    fn submit_create_here_sends_session_create_with_browsed_cwd() {
         let (mut core, mut rx) = connected_core();
         core.open_directory_browser();
         deliver_listing(&mut core, "/srv/app", Some("/srv"), &["sub"]);
@@ -1260,7 +1264,7 @@ mod tests {
 
         // Row 0 is CreateHere; submit it.
         core.dir_picker_selected = 0;
-        core.dispatch_action(Action::DirPickerSubmit).await;
+        core.dispatch_action(Action::DirPickerSubmit);
 
         assert_eq!(core.mode, Mode::Normal);
         match rx.try_recv().expect("a session create was sent") {
@@ -1271,8 +1275,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn submit_subdir_requests_new_listing_and_keeps_browser_open() {
+    #[test]
+    fn submit_subdir_requests_new_listing_and_keeps_browser_open() {
         let (mut core, mut rx) = connected_core();
         core.open_directory_browser();
         deliver_listing(&mut core, "/home/user", Some("/home"), &["dev"]);
@@ -1280,7 +1284,7 @@ mod tests {
 
         // Select the "dev" Enter row (row 2: CreateHere, Up, dev) and submit.
         core.dir_picker_selected = 2;
-        core.dispatch_action(Action::DirPickerSubmit).await;
+        core.dispatch_action(Action::DirPickerSubmit);
 
         // Navigation keeps the browser open and re-targets the browse dir.
         assert_eq!(core.mode, Mode::DirectoryPicker);
@@ -1291,15 +1295,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn submit_up_navigates_to_parent() {
+    #[test]
+    fn submit_up_navigates_to_parent() {
         let (mut core, mut rx) = connected_core();
         core.open_directory_browser();
         deliver_listing(&mut core, "/home/user", Some("/home"), &["dev"]);
         while rx.try_recv().is_ok() {}
 
         core.dir_picker_selected = 1; // the Up row
-        core.dispatch_action(Action::DirPickerSubmit).await;
+        core.dispatch_action(Action::DirPickerSubmit);
 
         assert_eq!(core.mode, Mode::DirectoryPicker);
         assert_eq!(core.dir_browser_cwd, "/home");
@@ -1309,8 +1313,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn submit_typed_absolute_path_navigates_when_unmatched() {
+    #[test]
+    fn submit_typed_absolute_path_navigates_when_unmatched() {
         let (mut core, mut rx) = connected_core();
         core.open_directory_browser();
         deliver_listing(&mut core, "/home/user", Some("/home"), &["dev"]);
@@ -1320,7 +1324,7 @@ mod tests {
         // CreateHere (row 0) is selected: the browser navigates to the typed path.
         core.dir_picker_selected = 0;
         core.dir_picker_buffer = "/var/log".into();
-        core.dispatch_action(Action::DirPickerSubmit).await;
+        core.dispatch_action(Action::DirPickerSubmit);
 
         assert_eq!(core.mode, Mode::DirectoryPicker);
         assert_eq!(core.dir_browser_cwd, "/var/log");
@@ -1333,8 +1337,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn create_session_action_uses_active_session_cwd() {
+    #[test]
+    fn create_session_action_uses_active_session_cwd() {
         let (mut core, mut rx) = connected_core();
         core.initial_cwd = "/fallback".into();
         core.mgr
@@ -1343,7 +1347,7 @@ mod tests {
         core.mgr.select_session("eagle".into());
         while rx.try_recv().is_ok() {}
 
-        core.dispatch_action(Action::CreateSession).await;
+        core.dispatch_action(Action::CreateSession);
 
         match rx.try_recv().expect("a session create was sent") {
             ClientMessage::SessionCreate { cwd, .. } => {
@@ -1353,15 +1357,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn create_session_action_falls_back_to_initial_cwd() {
+    #[test]
+    fn create_session_action_falls_back_to_initial_cwd() {
         let (mut core, mut rx) = connected_core();
         core.initial_cwd = "/fallback".into();
         while rx.try_recv().is_ok() {}
 
         // No active session: the action must still carry an explicit cwd rather
         // than letting the daemon resolve a bare path against its own cwd.
-        core.dispatch_action(Action::CreateSession).await;
+        core.dispatch_action(Action::CreateSession);
 
         match rx.try_recv().expect("a session create was sent") {
             ClientMessage::SessionCreate { cwd, .. } => {

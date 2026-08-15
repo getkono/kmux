@@ -681,9 +681,9 @@ impl FrontendDriver {
     /// Dispatch a toolkit-agnostic [`Action`]. Reconnect / server-switch results
     /// are applied internally (channel rebuild + bootstrap); clipboard / quit
     /// results are returned as [`FrontendEffect`]s.
-    pub async fn dispatch_action(&mut self, action: Action) -> Vec<FrontendEffect> {
+    pub fn dispatch_action(&mut self, action: Action) -> Vec<FrontendEffect> {
         let mut effects = Vec::new();
-        let result = self.core.dispatch_action(action).await;
+        let result = self.core.dispatch_action(action);
         self.handle_key_result(result, &mut effects);
         effects
     }

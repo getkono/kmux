@@ -1638,6 +1638,16 @@ impl KmuxDriver {
     /// SSH supervisor.
     pub fn tick(&self) -> Vec<FfiEffect> {
         let _guard = self.rt.enter();
+        // Reconnect results spawn from the driver, so keep a runtime guard.
+        let _guard = self.rt.enter();
+        // Reconnect results spawn from the driver, so keep a runtime guard.
+        let _guard = self.rt.enter();
+        // Reconnect results spawn from the driver, so keep a runtime guard.
+        let _guard = self.rt.enter();
+        // Reconnect results spawn from the driver, so keep a runtime guard.
+        let _guard = self.rt.enter();
+        // Reconnect results spawn from the driver, so keep a runtime guard.
+        let _guard = self.rt.enter();
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         d.tick().into_iter().map(FfiEffect::from).collect()
     }
@@ -1646,12 +1656,12 @@ impl KmuxDriver {
     /// server-switch are applied internally by the driver.
     pub fn dispatch(&self, action: FfiAction) -> Vec<FfiEffect> {
         let act = Action::from(action);
+        // A dispatch can spawn (Reconnect rebuilds the bootstrap task;
+        // RecentServers::save uses spawn_blocking), so hold a runtime guard
+        // even though the dispatch itself is synchronous.
+        let _guard = self.rt.enter();
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        // `dispatch_action` is async; `block_on` drives it to completion and
-        // provides the runtime context its internal spawns need. (Not combined
-        // with `rt.enter()`, which would make `block_on` panic.)
-        self.rt
-            .block_on(d.dispatch_action(act))
+        d.dispatch_action(act)
             .into_iter()
             .map(FfiEffect::from)
             .collect()
@@ -2426,14 +2436,17 @@ impl KmuxDriver {
     /// Parse and execute a `/`-command line in one shot (reconnect / server
     /// switch applied internally), returning any resulting effects.
     pub fn run_command(&self, input: String) -> Vec<FfiEffect> {
+        // A dispatch can spawn (Reconnect rebuilds the bootstrap task;
+        // RecentServers::save uses spawn_blocking), so hold a runtime guard
+        // even though the dispatch itself is synchronous.
+        let _guard = self.rt.enter();
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         d.core_mut().mode = Mode::Command(CommandState {
             buffer: input.clone(),
             cursor: input.len(),
             ..CommandState::default()
         });
-        self.rt
-            .block_on(d.dispatch_action(Action::CommandSubmit))
+        d.dispatch_action(Action::CommandSubmit)
             .into_iter()
             .map(FfiEffect::from)
             .collect()
@@ -2622,9 +2635,12 @@ impl KmuxDriver {
     /// path) refreshes the listing in place. Also honors a typed absolute path
     /// in the filter when it matches no listed row.
     pub fn submit_directory(&self) -> Vec<FfiEffect> {
+        // A dispatch can spawn (Reconnect rebuilds the bootstrap task;
+        // RecentServers::save uses spawn_blocking), so hold a runtime guard
+        // even though the dispatch itself is synchronous.
+        let _guard = self.rt.enter();
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        self.rt
-            .block_on(d.dispatch_action(Action::DirPickerSubmit))
+        d.dispatch_action(Action::DirPickerSubmit)
             .into_iter()
             .map(FfiEffect::from)
             .collect()
@@ -2634,10 +2650,13 @@ impl KmuxDriver {
     /// `CreateHere` creates the session and dismisses; Up / a subdirectory
     /// navigate and keep the browser open (it refreshes when the listing lands).
     pub fn dir_browser_activate(&self, index: u32) -> Vec<FfiEffect> {
+        // A dispatch can spawn (Reconnect rebuilds the bootstrap task;
+        // RecentServers::save uses spawn_blocking), so hold a runtime guard
+        // even though the dispatch itself is synchronous.
+        let _guard = self.rt.enter();
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         d.core_mut().set_picker_selected(index as usize);
-        self.rt
-            .block_on(d.dispatch_action(Action::DirPickerSubmit))
+        d.dispatch_action(Action::DirPickerSubmit)
             .into_iter()
             .map(FfiEffect::from)
             .collect()
@@ -2646,10 +2665,13 @@ impl KmuxDriver {
     /// Create a new session in the directory currently being browsed (the
     /// `CreateHere` affordance), regardless of the highlighted row.
     pub fn dir_browser_open_here(&self) -> Vec<FfiEffect> {
+        // A dispatch can spawn (Reconnect rebuilds the bootstrap task;
+        // RecentServers::save uses spawn_blocking), so hold a runtime guard
+        // even though the dispatch itself is synchronous.
+        let _guard = self.rt.enter();
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         d.core_mut().set_picker_selected(0);
-        self.rt
-            .block_on(d.dispatch_action(Action::DirPickerSubmit))
+        d.dispatch_action(Action::DirPickerSubmit)
             .into_iter()
             .map(FfiEffect::from)
             .collect()
@@ -2681,9 +2703,12 @@ impl KmuxDriver {
 
     /// Confirm the pending session close, if a close confirmation is open.
     pub fn confirm_close_session(&self) -> Vec<FfiEffect> {
+        // A dispatch can spawn (Reconnect rebuilds the bootstrap task;
+        // RecentServers::save uses spawn_blocking), so hold a runtime guard
+        // even though the dispatch itself is synchronous.
+        let _guard = self.rt.enter();
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        self.rt
-            .block_on(d.dispatch_action(Action::ConfirmCloseSession))
+        d.dispatch_action(Action::ConfirmCloseSession)
             .into_iter()
             .map(FfiEffect::from)
             .collect()

@@ -221,7 +221,7 @@ fn add_dispatch(
     act.connect_activate(move |_, _| {
         let effects = {
             let mut f = fe.borrow_mut();
-            let e = futures::executor::block_on(f.core.dispatch_action(action.clone()));
+            let e = f.core.dispatch_action(action.clone());
             f.core.needs_render = true;
             e
         };

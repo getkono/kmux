@@ -36,7 +36,6 @@ kmux-render.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-futures.workspace = true
 
 # The GTK4 + libadwaita stack is the desktop frontend on Linux (system packages)
 # and macOS (Homebrew: `brew install gtk4 libadwaita`). Gating the deps to those

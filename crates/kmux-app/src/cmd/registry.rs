@@ -745,7 +745,6 @@ mod tests {
             history_pos: None,
         });
         app.dispatch_action(crate::mode::Action::CommandSubmit)
-            .await
     }
 
     #[tokio::test]

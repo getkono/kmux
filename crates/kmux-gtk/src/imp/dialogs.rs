@@ -697,7 +697,7 @@ fn move_selection(core: &mut AppCore, down: bool) {
         (Some(DialogKind::Command), false) => Action::CommandHintUp,
         _ => return,
     };
-    let _ = futures::executor::block_on(core.dispatch_action(action));
+    let _ = core.dispatch_action(action);
 }
 
 /// Activate the current selection of the open list dialog.
@@ -705,12 +705,8 @@ fn activate_current(fe: &Rc<RefCell<Frontend>>, shell: &Rc<Shell>, app: &gtk4::A
     let effects = {
         let mut f = fe.borrow_mut();
         let e = match f.core.mode {
-            Mode::DirectoryPicker => {
-                futures::executor::block_on(f.core.dispatch_action(Action::DirPickerSubmit))
-            }
-            Mode::Command(_) => {
-                futures::executor::block_on(f.core.dispatch_action(Action::CommandSubmit))
-            }
+            Mode::DirectoryPicker => f.core.dispatch_action(Action::DirPickerSubmit),
+            Mode::Command(_) => f.core.dispatch_action(Action::CommandSubmit),
             _ => f.core.activate_picker_selection(),
         };
         f.core.needs_render = true;
@@ -781,11 +777,9 @@ fn open_rename(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
                     {
                         *buffer = entry.text().to_string();
                     }
-                    let _ =
-                        futures::executor::block_on(f.core.dispatch_action(Action::RenameSubmit));
+                    let _ = f.core.dispatch_action(Action::RenameSubmit);
                 } else {
-                    let _ =
-                        futures::executor::block_on(f.core.dispatch_action(Action::ExitToNormal));
+                    let _ = f.core.dispatch_action(Action::ExitToNormal);
                 }
                 f.core.needs_render = true;
             }
@@ -831,7 +825,7 @@ fn open_confirm_close_session(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> 
                 } else {
                     Action::ExitToNormal
                 };
-                let _ = futures::executor::block_on(f.core.dispatch_action(action));
+                let _ = f.core.dispatch_action(action);
                 f.core.needs_render = true;
             }
             shell.drawing.queue_draw();
@@ -948,9 +942,7 @@ fn open_add_remote_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Live
         cancel.connect_clicked(move |_| {
             {
                 let mut f = fe.borrow_mut();
-                let _ = futures::executor::block_on(
-                    f.core.dispatch_action(Action::LaunchOverlayCancel),
-                );
+                let _ = f.core.dispatch_action(Action::LaunchOverlayCancel);
                 f.core.needs_render = true;
             }
             dialog2.close();
@@ -1068,9 +1060,7 @@ fn open_remote_new_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Live
                     let cwd = entry.text().to_string();
                     f.core.submit_remote_new_session(peer.clone(), cwd);
                 } else {
-                    let _ = futures::executor::block_on(
-                        f.core.dispatch_action(Action::LaunchOverlayCancel),
-                    );
+                    let _ = f.core.dispatch_action(Action::LaunchOverlayCancel);
                 }
                 f.core.needs_render = true;
             }
@@ -1147,7 +1137,7 @@ fn update_toast(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Fronte
         toast.connect_button_clicked(move |_| {
             {
                 let mut f = fe.borrow_mut();
-                let _ = futures::executor::block_on(f.core.dispatch_action(Action::UndoClose));
+                let _ = f.core.dispatch_action(Action::UndoClose);
                 f.core.needs_render = true;
             }
             shell.drawing.queue_draw();

@@ -57,7 +57,7 @@ pub fn attach_keys(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
         if matches!(keyval, gdk::Key::Escape | gdk::Key::q) {
             {
                 let mut f = fe.borrow_mut();
-                futures::executor::block_on(f.core.dispatch_action(Action::ToggleProcessOverview));
+                f.core.dispatch_action(Action::ToggleProcessOverview);
                 f.core.needs_render = true;
             }
             drawing.grab_focus();

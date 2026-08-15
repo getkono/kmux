@@ -82,8 +82,7 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, _app: &Application) {
             };
             {
                 let mut f = fe.borrow_mut();
-                let _ =
-                    futures::executor::block_on(f.core.dispatch_action(Action::JumpToSession(si)));
+                let _ = f.core.dispatch_action(Action::JumpToSession(si));
                 f.core.needs_render = true;
             }
             // Return focus to the terminal so typing goes to the session.

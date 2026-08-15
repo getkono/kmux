@@ -139,7 +139,7 @@ fn focus(word_id: &str, pane_id: &str) {
                 .iter()
                 .position(|e| e.meta.word_id == word_id)
             {
-                futures::executor::block_on(f.core.dispatch_action(Action::JumpToSession(idx)));
+                f.core.dispatch_action(Action::JumpToSession(idx));
             }
             // Select the specific pane within the (now active) session.
             let _ = f

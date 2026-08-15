@@ -23,7 +23,13 @@ use super::{
 impl AppCore {
     /// Apply an [`Action`] to the core. Used both by the key path and by the
     /// command palette so a single source of truth governs behavior.
-    pub async fn dispatch_action(&mut self, action: Action) -> KeyResult {
+    ///
+    /// Synchronous. It was `async` for its whole life without ever awaiting
+    /// anything: every effect it produces is a `KeyResult` the caller acts on,
+    /// and the one path that needs a runtime (`FrontendDriver::reconnect` ->
+    /// `start_bootstrap`) spawns from the driver, above this. The `async` cost
+    /// 14 `block_on` calls in kmux-gtk, 6 in kmux-ffi, and a dependency.
+    pub fn dispatch_action(&mut self, action: Action) -> KeyResult {
         match action {
             // ForwardKey is handled frontend-side (it needs the raw toolkit
             // event); it never reaches the core dispatch.
@@ -1048,34 +1054,34 @@ mod tests {
         core
     }
 
-    #[tokio::test]
-    async fn close_pane_defers_then_undo_keeps_the_pane() {
+    #[test]
+    fn close_pane_defers_then_undo_keeps_the_pane() {
         use kmux_protocol::messages::SessionStatus;
         let mut core = core_with_active_pane(SessionStatus::Running);
         let nonce = core.soft_close_nonce;
 
         // Close → deferred, not killed immediately.
-        core.dispatch_action(Action::ClosePane).await;
+        core.dispatch_action(Action::ClosePane);
         assert!(core.is_pane_pending_close("eagle/0"));
         assert_eq!(core.soft_close_nonce, nonce + 1);
 
         // A second close keeps the existing deadline (no duplicate).
-        core.dispatch_action(Action::ClosePane).await;
+        core.dispatch_action(Action::ClosePane);
         assert_eq!(core.pending_closes.len(), 1);
 
         // Undo → cancelled; the shell was never touched.
-        core.dispatch_action(Action::UndoClose).await;
+        core.dispatch_action(Action::UndoClose);
         assert!(!core.has_pending_close());
     }
 
-    #[tokio::test]
-    async fn close_session_requires_confirmation() {
+    #[test]
+    fn close_session_requires_confirmation() {
         use kmux_protocol::messages::SessionStatus;
         let mut core = core_with_active_pane(SessionStatus::Running);
         core.mgr.active_session = Some("eagle".into());
 
         // Close → confirmation mode, not killed immediately.
-        core.dispatch_action(Action::CloseSession).await;
+        core.dispatch_action(Action::CloseSession);
         assert!(matches!(
             core.mode,
             Mode::ConfirmCloseSession { ref word_id, .. } if word_id == "eagle"
@@ -1083,7 +1089,7 @@ mod tests {
         assert!(!core.has_pending_close());
 
         // Cancel → normal mode; the live session was never touched.
-        core.dispatch_action(Action::ExitToNormal).await;
+        core.dispatch_action(Action::ExitToNormal);
         assert_eq!(core.mode, Mode::Normal);
     }
 
@@ -1098,20 +1104,20 @@ mod tests {
         ));
     }
 
-    #[tokio::test]
-    async fn toggle_render_debug_flips_flag() {
+    #[test]
+    fn toggle_render_debug_flips_flag() {
         let mut core = fixture_core();
         assert!(!core.render_debug_visible);
-        core.dispatch_action(Action::ToggleRenderDebug).await;
+        core.dispatch_action(Action::ToggleRenderDebug);
         assert!(core.render_debug_visible);
-        core.dispatch_action(Action::ToggleRenderDebug).await;
+        core.dispatch_action(Action::ToggleRenderDebug);
         assert!(!core.render_debug_visible);
     }
 
-    #[tokio::test]
-    async fn reset_renderer_signals_keyresult_and_forces_clear() {
+    #[test]
+    fn reset_renderer_signals_keyresult_and_forces_clear() {
         let mut core = fixture_core();
-        let result = core.dispatch_action(Action::ResetRenderer).await;
+        let result = core.dispatch_action(Action::ResetRenderer);
         assert!(matches!(result, KeyResult::ResetRenderer));
         assert!(core.force_clear); // full re-pack/repaint on the next tick
     }
@@ -1154,16 +1160,16 @@ mod tests {
         assert!(!core.has_pending_close());
     }
 
-    #[tokio::test]
-    async fn rename_tab_mode_edits_buffer_and_submits_to_normal() {
+    #[test]
+    fn rename_tab_mode_edits_buffer_and_submits_to_normal() {
         let mut core = fixture_core();
         core.mode = Mode::RenameTab {
             word_id: "w".into(),
             tab_index: 3,
             buffer: String::new(),
         };
-        core.dispatch_action(Action::RenameChar('h')).await;
-        core.dispatch_action(Action::RenameChar('i')).await;
+        core.dispatch_action(Action::RenameChar('h'));
+        core.dispatch_action(Action::RenameChar('i'));
         match &core.mode {
             Mode::RenameTab {
                 buffer, tab_index, ..
@@ -1173,12 +1179,12 @@ mod tests {
             }
             other => panic!("expected RenameTab, got {other:?}"),
         }
-        core.dispatch_action(Action::RenameBackspace).await;
+        core.dispatch_action(Action::RenameBackspace);
         if let Mode::RenameTab { buffer, .. } = &core.mode {
             assert_eq!(buffer, "h");
         }
         // Submitting a non-empty name leaves the rename mode for Normal.
-        core.dispatch_action(Action::RenameSubmit).await;
+        core.dispatch_action(Action::RenameSubmit);
         assert_eq!(core.mode, Mode::Normal);
     }
 
