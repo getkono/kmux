@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/*"]
+# `crates/*` is the product surface mapped by docs/crate-usage.md. `xtask` is
+# workspace tooling (the lint ratchet, the mutation gate, the dependency-direction
+# assertions) and is listed separately so the glob above keeps meaning "the
+# shipped crates" — see xtask/src/lib.rs.
+members = ["crates/*", "xtask"]
 resolver = "2"
 
 [workspace.package]
