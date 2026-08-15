@@ -20,12 +20,27 @@ const SESSION_QUERY_TIMEOUT: Duration = Duration::from_millis(200);
 /// Candidates for `--theme`: the built-in theme names plus any custom themes in
 /// `<config_dir>/themes/*.toml` (the same directory [`crate::config`] reads).
 pub fn theme_candidates() -> Vec<CompletionCandidate> {
+    kmux_sys::dirs::Dirs::from_env().map_or_else(
+        // No resolvable config dir still completes the built-ins: a broken
+        // HOME should degrade completion, not empty it.
+        |_| {
+            theme_candidates_in(&kmux_sys::dirs::Dirs::rooted(std::path::Path::new(
+                "/nonexistent",
+            )))
+        },
+        |dirs| theme_candidates_in(&dirs),
+    )
+}
+
+/// [`theme_candidates`], reading custom themes from `dirs` rather than the
+/// process environment. See docs/testing.md R3.
+pub fn theme_candidates_in(dirs: &kmux_sys::dirs::Dirs) -> Vec<CompletionCandidate> {
     let mut out: Vec<CompletionCandidate> = crate::theme::BUILTIN_THEMES
         .iter()
         .map(|name| CompletionCandidate::new(*name).help(Some("built-in theme".into())))
         .collect();
 
-    if let Ok(dir) = kmux_sys::dirs::config_dir()
+    if let Ok(dir) = dirs.config_dir()
         && let Ok(entries) = std::fs::read_dir(dir.join("themes"))
     {
         for entry in entries.flatten() {
@@ -70,7 +85,17 @@ fn server_candidates_from_hosts(
 /// bounded by `SESSION_QUERY_TIMEOUT`. Any error — no daemon, parse failure,
 /// timeout — yields no candidates rather than blocking.
 pub fn session_candidates() -> Vec<CompletionCandidate> {
-    std::thread::spawn(|| {
+    let Ok(socket) = kmux_sys::dirs::Dirs::from_env().and_then(|d| d.socket_path()) else {
+        return Vec::new();
+    };
+    session_candidates_at(&socket)
+}
+
+/// [`session_candidates`], querying `socket` rather than whatever the process
+/// environment resolves to. See docs/testing.md R3.
+pub fn session_candidates_at(socket: &std::path::Path) -> Vec<CompletionCandidate> {
+    let socket = socket.to_path_buf();
+    std::thread::spawn(move || {
         let Ok(rt) = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()
@@ -78,7 +103,7 @@ pub fn session_candidates() -> Vec<CompletionCandidate> {
             return Vec::new();
         };
         rt.block_on(async {
-            let query = kmux_client::daemon::query_daemon_sessions();
+            let query = kmux_client::daemon::query_daemon_sessions_at(&socket);
             match tokio::time::timeout(SESSION_QUERY_TIMEOUT, query).await {
                 Ok(Ok(resp)) => resp
                     .sessions
@@ -102,10 +127,6 @@ pub fn session_candidates() -> Vec<CompletionCandidate> {
 mod tests {
     use super::*;
 
-    /// Serializes `XDG_CONFIG_HOME` mutation across the whole `kmux-app` test
-    /// binary (shared with `config.rs`'s tests, which mutate the same var).
-    use crate::ENV_LOCK;
-
     /// The values of a candidate list, as plain strings, for easy assertions.
     fn values(candidates: &[CompletionCandidate]) -> Vec<String> {
         candidates
@@ -116,11 +137,10 @@ mod tests {
 
     #[test]
     fn theme_candidates_include_all_builtins() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let vals = values(&theme_candidates());
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let vals = values(&theme_candidates_in(&kmux_sys::dirs::Dirs::rooted(
+            tmp.path(),
+        )));
 
         for builtin in crate::theme::BUILTIN_THEMES {
             assert!(
@@ -132,16 +152,14 @@ mod tests {
 
     #[test]
     fn theme_candidates_include_custom_themes() {
-        let _guard = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
-        let themes_dir = tmp.path().join("kmux").join("themes");
+        let dirs = kmux_sys::dirs::Dirs::rooted(tmp.path());
+        let themes_dir = dirs.config_dir().unwrap().join("themes");
         std::fs::create_dir_all(&themes_dir).unwrap();
         std::fs::write(themes_dir.join("my-theme.toml"), "name = \"my-theme\"").unwrap();
         // A non-.toml file is ignored.
         std::fs::write(themes_dir.join("README.md"), "ignore me").unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let vals = values(&theme_candidates());
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+        let vals = values(&theme_candidates_in(&dirs));
 
         assert!(
             vals.iter().any(|v| v == "my-theme"),
@@ -185,13 +203,13 @@ mod tests {
 
     #[test]
     fn session_candidates_empty_when_no_daemon() {
-        // No daemon is running under the test's XDG_RUNTIME_DIR socket, so the
-        // query fails fast and returns nothing rather than hanging.
-        let _guard = ENV_LOCK.lock().unwrap();
+        // Nothing is listening on this socket, so the query fails fast and
+        // returns nothing rather than hanging.
         let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
-        let vals = session_candidates();
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+        let socket = kmux_sys::dirs::Dirs::rooted(tmp.path())
+            .socket_path()
+            .unwrap();
+        let vals = session_candidates_at(&socket);
         assert!(
             vals.is_empty(),
             "expected no sessions, got {:?}",

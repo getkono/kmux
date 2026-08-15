@@ -256,15 +256,24 @@ fn sleep_unless_stopped(stop: &std::sync::atomic::AtomicBool, dur: std::time::Du
 /// binary invoked as `kmux diagnostic <test> --emit`. Shared by the GTK `Plan`
 /// path and the Swift `build_core` path so both spawn an identical emitter.
 pub fn session_command(test: DiagnosticTest) -> anyhow::Result<(String, Vec<String>)> {
-    let kmux = locate_kmux_binary()?;
-    Ok((
+    Ok(session_command_for(&locate_kmux_binary()?, test))
+}
+
+/// The argv [`session_command`] builds, for an already-located binary.
+///
+/// Split out so the interesting half — which flags a given test emits — is
+/// testable without a locator that reads `KMUX_BIN` and the filesystem. See
+/// docs/testing.md R3.
+#[must_use]
+pub fn session_command_for(kmux: &std::path::Path, test: DiagnosticTest) -> (String, Vec<String>) {
+    (
         kmux.to_string_lossy().into_owned(),
         vec![
             "diagnostic".to_string(),
             test.name().to_string(),
             "--emit".to_string(),
         ],
-    ))
+    )
 }
 
 /// Locate the `kmux` entrypoint binary to run as the in-session emitter:
@@ -341,13 +350,12 @@ mod tests {
 
     #[test]
     fn session_command_passes_emit_flag() {
-        // Make the locator deterministic regardless of the test host.
-        unsafe { std::env::set_var("KMUX_BIN", std::env::current_exe().unwrap()) };
-        let (_, args) = session_command(DiagnosticTest::Glyphs).unwrap();
+        let kmux = std::path::Path::new("/opt/kmux/bin/kmux");
+        let (bin, args) = session_command_for(kmux, DiagnosticTest::Glyphs);
+        assert_eq!(bin, "/opt/kmux/bin/kmux");
         assert_eq!(args, vec!["diagnostic", "glyphs", "--emit"]);
 
-        let (_, args) = session_command(DiagnosticTest::Progress).unwrap();
+        let (_, args) = session_command_for(kmux, DiagnosticTest::Progress);
         assert_eq!(args, vec!["diagnostic", "progress", "--emit"]);
-        unsafe { std::env::remove_var("KMUX_BIN") };
     }
 }

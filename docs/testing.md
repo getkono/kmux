@@ -169,14 +169,16 @@ Measured 2026-08-15:
 
 | Rule | At branch start | Now | Target |
 | --- | --- | --- | --- |
-| R3 — no process-global env mutation | 91 sites / 13 files | **17 / 9** | 0 |
-| R3/R13 — no test-only lock | 98 sites / 10 files | **36 / 6** | 0 |
+| R3 — no process-global env mutation | 91 sites / 13 files | **9 / 7** | 0 |
+| R3/R13 — no test-only lock | 98 sites / 10 files | **31 / 4** | 0 |
 | R4 — no function over 100 lines | 45 (largest 888 lines) | 45 | 0, minus the exceptions register |
 | R5 — no double in a release build | 2 (`kmux-pty`'s `pub mod mock`) | **0** | 0 — reached |
 | R12 — mutation score is the coverage bar | 3 crates fabricated, 5 never swept | scoring fixed; **no trustworthy sweep yet** | a recorded `[[mutants]]` budget per crate |
 
-Two modules have reached zero on R3 and R13, both by the same move — take the
-thing the test needs to vary as a parameter:
+Three crates have reached zero on both, all by the same move — take the thing
+the test needs to vary as a parameter. What is left is four `kmuxd` e2e suites
+(which spawn real daemons and should be passing `Command::env` to the child
+instead) and three production reads that are not test isolation at all:
 
 - `kmux-protocol::dirs` — the `Dirs` value replaced twelve unsafe environment
   overwrites and the module's own lock; 8 serialised tests became 17
