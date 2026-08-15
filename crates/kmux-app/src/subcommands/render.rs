@@ -142,7 +142,7 @@ pub fn process_overview_rows(rows: &[OverviewRow]) -> Vec<ProcessRow> {
             ProcessRow {
                 name,
                 cpu: format!("{:.1}", r.cpu_percent),
-                mem: format_bytes(r.mem_bytes),
+                mem: crate::humanize::bytes(r.mem_bytes),
                 pid: r.pid.map_or_else(|| "-".into(), |p| p.to_string()),
             }
         })
@@ -210,8 +210,8 @@ fn connection_row(session: &str, id: &str, conn: &ConnectionInfo) -> DaemonSessi
         uptime: format_uptime(conn.uptime_secs),
         last_ping: format_ago_ms(conn.last_pong_ago_ms),
         rtt: format_rtt(conn.last_rtt_ms),
-        bytes_in: format_bytes(conn.bytes_in),
-        bytes_out: format_bytes(conn.bytes_out),
+        bytes_in: crate::humanize::bytes(conn.bytes_in),
+        bytes_out: crate::humanize::bytes(conn.bytes_out),
     }
 }
 
@@ -353,22 +353,6 @@ fn format_rtt(rtt_ms: Option<u64>) -> String {
     }
 }
 
-fn format_bytes(n: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
-    const GIB: u64 = 1024 * MIB;
-
-    if n >= GIB {
-        format!("{:.1} GiB", n as f64 / GIB as f64)
-    } else if n >= MIB {
-        format!("{:.1} MiB", n as f64 / MIB as f64)
-    } else if n >= KIB {
-        format!("{:.1} KiB", n as f64 / KIB as f64)
-    } else {
-        format!("{n} B")
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -501,15 +485,6 @@ mod tests {
         assert_eq!(truncate_join(&three, 2), "a, b, +1");
         assert_eq!(truncate_join(&three, 3), "a, b, c");
         assert_eq!(truncate_join(&three, 5), "a, b, c");
-    }
-
-    #[test]
-    fn format_bytes_scales() {
-        assert_eq!(format_bytes(0), "0 B");
-        assert_eq!(format_bytes(500), "500 B");
-        assert_eq!(format_bytes(1024), "1.0 KiB");
-        assert_eq!(format_bytes(1024 * 1024), "1.0 MiB");
-        assert_eq!(format_bytes(2 * 1024 * 1024 * 1024), "2.0 GiB");
     }
 
     #[test]

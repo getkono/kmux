@@ -130,7 +130,10 @@ fn make_row(r: &OverviewRow) -> ListBoxRow {
     }
     hb.append(&name);
     hb.append(&num_cell(&format!("{:.1}", r.cpu_percent), COL_CPU_CHARS));
-    hb.append(&num_cell(&format_bytes(r.mem_bytes), COL_MEM_CHARS));
+    hb.append(&num_cell(
+        &kmux_app::humanize::bytes_compact(r.mem_bytes),
+        COL_MEM_CHARS,
+    ));
     hb.append(&num_cell(
         &r.pid.map(|p| p.to_string()).unwrap_or_default(),
         COL_PID_CHARS,
@@ -159,22 +162,4 @@ fn num_cell(text: &str, chars: i32) -> Label {
     l.set_halign(Align::End);
     l.add_css_class("numeric");
     l
-}
-
-/// Human-readable byte size (kept local; mirrors the CLI's `kmux ps` formatter).
-fn format_bytes(n: u64) -> String {
-    const KIB: u64 = 1024;
-    const MIB: u64 = 1024 * KIB;
-    const GIB: u64 = 1024 * MIB;
-    if n == 0 {
-        String::new()
-    } else if n >= GIB {
-        format!("{:.1}G", n as f64 / GIB as f64)
-    } else if n >= MIB {
-        format!("{:.1}M", n as f64 / MIB as f64)
-    } else if n >= KIB {
-        format!("{:.1}K", n as f64 / KIB as f64)
-    } else {
-        format!("{n}B")
-    }
 }

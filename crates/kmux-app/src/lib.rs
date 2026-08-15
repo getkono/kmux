@@ -64,6 +64,10 @@ pub mod launch;
 
 /// Single source of build + version metadata ([`version::VersionInfo`]) surfaced
 /// by `kmux -V` and both GUIs' "About" panels.
+/// Rendering numbers the way a person reads them, in the two styles kmux
+/// shows: full units for CLI output, compact for a fixed-width GUI column.
+pub mod humanize;
+
 pub mod version;
 
 /// The frontend-agnostic client view-model ([`core::AppCore`]) and the
