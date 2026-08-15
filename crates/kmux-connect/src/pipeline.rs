@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ConnectionId, ServerMessage};
-use kmux_sys::transport::bootstrap::EndpointAdvert;
+use kmux_sys::transport::EndpointAdvert;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;

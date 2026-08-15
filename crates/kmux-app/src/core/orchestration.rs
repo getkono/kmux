@@ -14,7 +14,7 @@ use kmux_client::transport::TransportKind;
 use kmux_protocol::messages::{PeerId, PeerTarget, ServerMessage, SessionEntry};
 use kmux_protocol::pane_word;
 #[cfg(feature = "remote")]
-use kmux_sys::transport::bootstrap::EndpointAdvert;
+use kmux_sys::transport::EndpointAdvert;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};

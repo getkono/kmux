@@ -1,11 +1,37 @@
-// Transport-layer abstractions.
-//
-// Phase 3+: server-side `Listener` trait + `IncomingSession` for dispatching
-// accepted connections into `run_client_session`.
-// Phase 5+: `Bootstrap`, `SessionContext`, `EndpointAdvert`.
+//! Transport-layer abstractions: the server-side `Listener` trait, the
+//! per-transport connect/accept implementations, and the endpoints a server
+//! advertises for the data plane.
 
-#[cfg(feature = "framing")]
-pub mod bootstrap;
+use kmux_protocol::messages::TransportKind;
+
+/// A transport endpoint advertised by the server after authentication.
+///
+/// Populated from `AuthResult`. The client uses this list to open and rank
+/// data-plane transports once bootstrap has produced an authenticated channel.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointAdvert {
+    /// Transport kind for this endpoint.
+    pub kind: TransportKind,
+    /// Connection address: `"host:port"` for QUIC/TLS-TCP, absolute path for UDS.
+    pub address: String,
+}
+
+#[cfg(test)]
+mod endpoint_advert_tests {
+    use super::EndpointAdvert;
+    use kmux_protocol::messages::TransportKind;
+
+    #[test]
+    fn two_adverts_are_equal_when_kind_and_address_match() {
+        let advert = |address: &str| EndpointAdvert {
+            kind: TransportKind::Quic,
+            address: address.to_owned(),
+        };
+        assert_eq!(advert("host:8443"), advert("host:8443"));
+        assert_ne!(advert("host:8443"), advert("host:8444"));
+    }
+}
+
 pub mod quic;
 
 #[cfg(feature = "framing")]

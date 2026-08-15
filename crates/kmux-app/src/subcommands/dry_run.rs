@@ -21,7 +21,7 @@ use kmux_client::pipeline::{
 use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
 use kmux_protocol::messages::{ClientMessage, ServerMessage};
 #[cfg(feature = "remote")]
-use kmux_sys::transport::bootstrap::EndpointAdvert;
+use kmux_sys::transport::EndpointAdvert;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 

@@ -14,7 +14,7 @@
 use std::net::SocketAddr;
 
 use kmux_protocol::messages::TransportKind;
-use kmux_sys::transport::bootstrap::EndpointAdvert;
+use kmux_sys::transport::EndpointAdvert;
 
 use crate::config::{Audience, ListenConfig, ListenKind};
 

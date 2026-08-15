@@ -26,5 +26,4 @@ pub mod tls;
 // `kmux_protocol::` before the split.
 pub use transport::quic::{QUIC_IDLE_TIMEOUT_SECS, QUIC_KEEP_ALIVE_SECS};
 
-#[cfg(feature = "framing")]
-pub use transport::bootstrap::{Bootstrap, BootstrapError, EndpointAdvert, SessionContext};
+pub use transport::EndpointAdvert;
