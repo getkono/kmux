@@ -5,7 +5,7 @@
 //! (`kmux-gtk`, `kmux-swift`, …). It owns the *interaction policy* that is
 //! independent of any UI toolkit:
 //!
-//! - the modal keymap (`Mode`) and the [`Action`] vocabulary keys resolve to,
+//! - the modal keymap (`Mode`) and the [`crate::mode::Action`] vocabulary keys resolve to,
 //! - the `/`-command palette,
 //! - the `AppCore` view-model and connection-orchestration state machine,
 //! - the theme *spec* (a toolkit-neutral RGB palette) and config loading,

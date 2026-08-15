@@ -43,9 +43,9 @@ impl ServerApp {
         }
     }
 
-    /// Snapshot a single live session into a [`PersistedSession`] (issue #64).
+    /// Snapshot a single live session into a [`crate::persist::PersistedSession`] (issue #64).
     ///
-    /// Captures every pane's grid + scrollback (capped at [`MAX_SCROLLBACK_LINES`])
+    /// Captures every pane's grid + scrollback (capped at [`crate::persist::MAX_SCROLLBACK_LINES`])
     /// and the session's tabs. Shared by [`checkpoint_state`](Self::checkpoint_state)
     /// and the close-session path, which retains the snapshot in the graveyard.
     pub(super) async fn snapshot_session(

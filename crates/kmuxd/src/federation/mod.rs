@@ -5,7 +5,7 @@
 //!
 //! # Model
 //!
-//! [`PeerManager`] (held on [`ServerApp`](crate::app::ServerApp)) owns one
+//! [`PeerManager`] (held on [`ServerApp`]) owns one
 //! [`PeerConnection`] per distinct remote daemon, keyed by [`PeerId`]. Each
 //! connection holds the upstream `ClientMessage` sink (`client_tx`), a
 //! bidirectional `remote_word ↔ local_word` map, the proxied sessions (with
@@ -166,7 +166,7 @@ impl ProxiedPane {
 
     /// Fan an (already local-addressed) pane frame out to every viewer, applying
     /// the same backpressure policy as the local PTY relay
-    /// ([`crate::relay::broadcast_to_clients`]): a viewer whose **bounded** data
+    /// (`crate::relay::broadcast_to_clients`): a viewer whose **bounded** data
     /// channel is full is sent a [`ServerMessage::Lagged`] over its **unbounded**
     /// ctrl channel and dropped — it re-attaches and is served a fresh snapshot
     /// minted off the still-correct mirror, exactly as a lagging local client

@@ -403,7 +403,7 @@ pub struct TabState {
 }
 
 impl TabState {
-    /// Snapshot this tab as a wire [`TabInfo`].
+    /// Snapshot this tab as a wire [`kmux_protocol::messages::TabInfo`].
     pub fn to_info(&self) -> kmux_protocol::messages::TabInfo {
         kmux_protocol::messages::TabInfo {
             tab_index: self.tab_index,
@@ -450,7 +450,7 @@ impl SessionState {
         self.tabs.iter_mut().find(|t| t.tab_index == tab_index)
     }
 
-    /// Snapshot all tabs as wire [`TabInfo`]s.
+    /// Snapshot all tabs as wire [`kmux_protocol::messages::TabInfo`]s.
     pub fn tab_infos(&self) -> Vec<kmux_protocol::messages::TabInfo> {
         self.tabs.iter().map(TabState::to_info).collect()
     }
@@ -701,9 +701,9 @@ impl ServerApp {
     }
 
     /// Configure closed-session retention (from `kmuxd.toml`) and the on-disk
-    /// graveyard path. Builder-style, like [`with_compression`]. A
+    /// graveyard path. Builder-style, like [`Self::with_compression`]. A
     /// `ttl_days` of `0` disables age-based pruning; the count cap always
-    /// applies. See [`crate::config::ResolvedConfig`].
+    /// applies. See [`crate::config::ServerConfig`].
     pub fn with_closed_sessions(
         mut self,
         keep: u32,

@@ -26,7 +26,7 @@ pub struct Cli {
 
     /// Color theme: built-in name (one-dark, catppuccin-latte, catppuccin-frappe,
     /// catppuccin-macchiato, catppuccin-mocha, dracula) or a custom theme name
-    /// from ~/.config/kmux/themes/<name>.toml
+    /// from `~/.config/kmux/themes/<name>.toml`
     #[arg(long, global = true, add = ArgValueCandidates::new(crate::completion::theme_candidates))]
     pub theme: Option<String>,
 

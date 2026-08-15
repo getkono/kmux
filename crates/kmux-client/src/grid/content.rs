@@ -96,7 +96,7 @@ impl GridContent {
 
     /// The `cells_generation` at which live `row` last changed (0 if never, or
     /// out of range). A renderer reuses a row's cached geometry while this is
-    /// unchanged. See [`row_gens`](Self::row_gens).
+    /// unchanged. See `row_gens`.
     pub fn row_generation(&self, row: usize) -> u64 {
         self.row_gens.get(row).copied().unwrap_or(0)
     }

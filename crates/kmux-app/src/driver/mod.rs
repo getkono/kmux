@@ -1,7 +1,7 @@
-//! [`FrontendDriver`]: the toolkit-agnostic run-loop orchestration shared by
+//! [`crate::driver::FrontendDriver`]: the toolkit-agnostic run-loop orchestration shared by
 //! every frontend.
 //!
-//! [`AppCore`] is a passive state machine; *driving* it has always meant the
+//! [`crate::core::AppCore`] is a passive state machine; *driving* it has always meant the
 //! same arm-for-arm loop — own the four network channels, drain server messages,
 //! settle a debounced resize, handle the bootstrap outcome (and launch the SSH
 //! supervisor), apply a transport upgrade, react to a tunnel death, tick the
@@ -12,24 +12,24 @@
 //!
 //! `FrontendDriver` lifts that orchestration here. A frontend now:
 //!
-//! - builds an [`AppCore`] with its own capabilities, wraps it with
-//!   [`FrontendDriver::new`] (which creates the channels and kicks off the
+//! - builds an [`crate::core::AppCore`] with its own capabilities, wraps it with
+//!   [`crate::driver::FrontendDriver::new`] (which creates the channels and kicks off the
 //!   initial bootstrap),
-//! - calls [`FrontendDriver::tick`] once per frame from its own loop (a glib
-//!   timeout, a `CVDisplayLink`, …) and acts on the returned [`FrontendEffect`]s
+//! - calls [`crate::driver::FrontendDriver::tick`] once per frame from its own loop (a glib
+//!   timeout, a `CVDisplayLink`, …) and acts on the returned [`crate::driver::FrontendEffect`]s
 //!   (repaint, copy to clipboard, request paste, quit),
-//! - feeds input in via [`dispatch_action`](FrontendDriver::dispatch_action),
-//!   [`send_keys`](FrontendDriver::send_keys), [`request_resize`], the picker
+//! - feeds input in via [`dispatch_action`](crate::driver::FrontendDriver::dispatch_action),
+//!   [`send_keys`](crate::driver::FrontendDriver::send_keys), [`request_resize`], the picker
 //!   drivers, …,
-//! - reads state out via [`Deref`] to [`AppCore`] (`driver.mgr`, `driver.mode`,
-//!   `driver.palette`, …) plus [`active_grid`](FrontendDriver::active_grid) and
-//!   [`blink_on`](FrontendDriver::blink_on).
+//! - reads state out via [`Deref`](std::ops::Deref) to [`crate::core::AppCore`] (`driver.mgr`, `driver.mode`,
+//!   `driver.palette`, …) plus [`active_grid`](crate::driver::FrontendDriver::active_grid) and
+//!   [`blink_on`](crate::driver::FrontendDriver::blink_on).
 //!
 //! It owns no run loop and no runtime: it assumes an *ambient* tokio runtime
 //! (the spawning paths use the current `Handle`) exactly as the frontends do
 //! today, so the caller stays in control of the loop and the runtime.
 //!
-//! [`request_resize`]: FrontendDriver::request_resize
+//! [`request_resize`]: crate::driver::FrontendDriver::request_resize
 
 mod blink;
 mod clipboard;
@@ -133,7 +133,7 @@ pub enum FrontendEffect {
     /// it — hence this dedicated effect (see [`crate::mode::Action::ResetRenderer`]).
     ResetRenderer,
     /// The `/theme` palette changed; reload toolkit-specific chrome styling.
-    /// Implies a repaint. Read the new palette from [`FrontendDriver::palette`].
+    /// Implies a repaint. Read the new palette from [`crate::core::AppCore::palette`].
     PaletteChanged,
     /// Copy this (already NUL-sanitized) text to the system clipboard.
     CopyToClipboard(String),
@@ -689,7 +689,7 @@ impl FrontendDriver {
     }
 
     /// Apply a pointer-driven top-bar action (server badge / session picker /
-    /// pane tab click). Same effect handling as [`dispatch_action`].
+    /// pane tab click). Same effect handling as [`Self::dispatch_action`].
     pub fn apply_top_bar_action(
         &mut self,
         action: crate::core::TopBarAction,
@@ -702,7 +702,7 @@ impl FrontendDriver {
     }
 
     /// Activate the current picker's selection (a click on a list item). Same
-    /// effect handling as [`dispatch_action`].
+    /// effect handling as [`Self::dispatch_action`].
     pub fn activate_picker_selection(&mut self) -> Vec<FrontendEffect> {
         let mut effects = Vec::new();
         if let Some(result) = self.core.activate_picker_selection() {
@@ -810,7 +810,7 @@ impl FrontendDriver {
     /// Report whether the app window is backgrounded/minimized/occluded, for
     /// auto-pause (issue #68). Backgrounding arms a debounce (the connection
     /// auto-pauses from a later [`tick`](Self::tick) if still backgrounded after
-    /// [`AUTO_PAUSE_DEBOUNCE`]); foregrounding resumes immediately. A *manual*
+    /// `AUTO_PAUSE_DEBOUNCE`); foregrounding resumes immediately. A *manual*
     /// pause is unaffected and persists across focus changes.
     pub fn set_window_background(&mut self, backgrounded: bool) {
         if backgrounded {
@@ -864,7 +864,7 @@ impl FrontendDriver {
         self.core.render_debug_visible
     }
 
-    /// Assemble a [`RenderDebugSnapshot`] for the focused pane, supplying the
+    /// Assemble a [`crate::core::RenderDebugSnapshot`] for the focused pane, supplying the
     /// driver's current blink phase. The frontend passes its own pixel/scale/
     /// renderer context.
     pub fn render_debug_snapshot(

@@ -1,6 +1,6 @@
 //! Client configuration file and theme resolution.
 //!
-//! Frontend-agnostic: [`resolve_theme`] returns a toolkit-neutral
+//! Frontend-agnostic: [`crate::config::resolve_theme`] returns a toolkit-neutral
 //! [`crate::theme::Theme`] which each frontend converts to its own color type.
 
 use kmux_protocol::dirs::Dirs;

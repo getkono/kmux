@@ -4,7 +4,7 @@
 //! cell-geometry settings each frontend applies at its render leaf: `kmux-gtk`
 //! builds a `pango::FontDescription` + an `AttrFontFeatures` attribute list, the
 //! Swift app builds an `NSFont` + CoreText feature settings — both from the same
-//! [`Appearance`]. Nothing here depends on a UI toolkit.
+//! [`crate::appearance::Appearance`]. Nothing here depends on a UI toolkit.
 //!
 //! The settings track [Ghostty's config reference][ghostty] key names
 //! (`font-family`, `font-size`, `font-feature`, `adjust-cell-*`, …); see

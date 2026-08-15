@@ -85,7 +85,7 @@ fn attach_context_menu(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
 
 /// Divider interaction: a hover over a divider shows a resize cursor, and a
 /// primary-button drag on a divider adjusts the owning split's ratios live
-/// (reusing the keyboard-resize wire path, [`SessionManager::set_layout_ratios`]
+/// (reusing the keyboard-resize wire path, [`kmux_client::session_manager::SessionManager::set_layout_ratios`]
 /// via `ratios_for_drag`). Double-click-to-reset and text-selection suppression
 /// on dividers live in [`attach_selection`]'s press handler.
 fn attach_resize(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {

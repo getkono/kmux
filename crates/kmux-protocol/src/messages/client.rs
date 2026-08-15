@@ -65,7 +65,7 @@ pub enum ClientMessage {
 
     /// Second handshake message: the Ed25519 signature over the nonce the daemon
     /// sent in [`super::server::ServerMessage::AuthChallenge`], proving the client
-    /// holds the private key for the `public_key` it presented in [`Auth`]. On
+    /// holds the private key for the `public_key` it presented in [`ClientMessage::Auth`]. On
     /// success the daemon replies with `AuthResult`.
     AuthProof {
         #[serde(with = "serde_bytes")]

@@ -120,7 +120,7 @@ pub struct SessionManager {
     pub(super) layout_scheme_idx: usize,
     /// Terminal buffers keyed by `pane_id`. Client panes are worker-backed
     /// ([`CellGrid::published`]); content applies run off the UI thread on
-    /// [`Self::apply`] (issue #182, §1).
+    /// `Self::apply` (issue #182, §1).
     pub buffers: HashMap<PaneId, CellGrid>,
     /// Off-UI-thread grid apply worker, spawned lazily on the first real connect
     /// (`set_ws_sender`/`apply_outcome`). `None` in tests, which drive

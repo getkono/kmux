@@ -7,7 +7,7 @@
 //! duration of the write or read — microseconds — so contention between
 //! multiple clients is negligible even at the 10s flush cadence.
 //!
-//! When the file grows past [`ROTATE_BYTES`] it's renamed to
+//! When the file grows past `ROTATE_BYTES` it's renamed to
 //! `metrics.jsonl.1` (overwriting any prior generation) and a fresh file
 //! is started. One-generation rotation is deliberate: deeper history would
 //! warrant a real time-series store, not an ever-growing append log.
@@ -113,7 +113,7 @@ impl JsonlSink {
     }
 
     /// Append a sample. Acquires `LOCK_EX` briefly, rotates if the file is
-    /// over [`ROTATE_BYTES`], writes one JSON line terminated by `\n`,
+    /// over `ROTATE_BYTES`, writes one JSON line terminated by `\n`,
     /// releases the lock. Errors are logged but not propagated — metrics
     /// collection must never take down the client.
     pub fn append(&self, sample: &Sample) {

@@ -4,7 +4,7 @@
 //! write lock, then returns the new authoritative tree (and focus) so the caller
 //! ([`crate::client_handler`]) can reply to the requester and broadcast a
 //! `LayoutUpdate` to every other client viewing the tab. PTY spawning happens
-//! outside the lock (mirroring [`ServerApp::create_pane`]).
+//! outside the lock (mirroring `ServerApp::create_pane`).
 
 use std::path::PathBuf;
 

@@ -202,7 +202,7 @@ pub struct DriverConfig {
     /// falls back to the `cursor_blink` key in `config.toml`).
     pub cursor_blink: Option<bool>,
     /// Render diagnostic to launch instead of a shell session: a
-    /// [`DiagnosticTest`](kmux_app::diagnostic::DiagnosticTest) name
+    /// [`DiagnosticTest`] name
     /// (`glyphs`/`attrs`/…). `None` for an ordinary launch (issue #145).
     pub diagnostic: Option<String>,
     pub rows: u16,

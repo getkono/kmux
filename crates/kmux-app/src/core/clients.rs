@@ -12,7 +12,7 @@ use super::AppCore;
 
 impl AppCore {
     /// The client connections attached to the active session (issue #146), as of
-    /// the most recent [`SessionManager::request_client_list`] reply. Empty until
+    /// the most recent [`kmux_client::session_manager::SessionManager::request_client_list`] reply. Empty until
     /// the first reply or when no session is active.
     pub fn client_rows(&self) -> Vec<ClientInfo> {
         self.mgr.client_list.clone()

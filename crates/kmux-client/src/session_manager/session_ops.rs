@@ -131,7 +131,7 @@ impl SessionManager {
     /// Like [`create_session`](Self::create_session) but runs an explicit
     /// `program` (with `args`) in the initial pane instead of the system shell.
     /// Used by `kmux diagnostic <test>` to spawn the render-diagnostic emitter
-    /// (issue #145). `program == None` is equivalent to [`create_session`].
+    /// (issue #145). `program == None` is equivalent to [`Self::create_session`].
     pub fn create_session_with_program(
         &mut self,
         name: Option<&str>,
@@ -293,7 +293,7 @@ impl SessionManager {
     /// Find the first session whose display name or `word_id` matches `name`.
     ///
     /// Matches the decorated display name, the `word_id`, and — for federated
-    /// sessions — the undecorated [`SessionEntry::base_name`], so `--session foo`
+    /// sessions — the undecorated [`kmux_protocol::messages::session::SessionEntry::base_name`], so `--session foo`
     /// resolves a remote session the hub lists as `"foo @ peer"` (issue #121). A
     /// local session named `foo` still wins by iteration order.
     pub fn find_session_by_name(&self, name: &str) -> Option<String> {

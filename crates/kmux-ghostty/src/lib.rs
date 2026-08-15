@@ -1,4 +1,4 @@
-//! Safe Rust façade over [`kmux-ghostty-sys`]. Wraps the kmux-owned C ABI
+//! Safe Rust façade over [`kmux_ghostty_sys`]. Wraps the kmux-owned C ABI
 //! exposed by `libkmux_ghostty` (a Zig wrapper around libghostty-vt v1.3.1)
 //! in idiomatic, lifetime-checked types.
 //!
@@ -17,7 +17,7 @@
 //!
 //! [`GhosttyTerm`] is `Send` but **not** `Sync`: at most one caller may mutate
 //! or read the terminal at a time. kmuxd wraps it in `Arc<Mutex<DiffEngine<…>>>`
-//! to serialise access. Event callbacks fire synchronously inside [`feed`] —
+//! to serialise access. Event callbacks fire synchronously inside [`GhosttyTerm::feed`] —
 //! they borrow data from the Zig side and must not retain it past return.
 
 #![deny(missing_debug_implementations)]
@@ -457,7 +457,7 @@ impl GhosttyTerm {
     }
 
     /// Combined grid + cursor + modes read in one FFI crossing. Preferred on
-    /// the hot path where [`DiffEngine`] reads all three together.
+    /// the hot path where the diff engine reads all three together.
     pub fn fill_cells_and_cursor(
         &self,
         out: &mut [CellState],

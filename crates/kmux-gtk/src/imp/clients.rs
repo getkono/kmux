@@ -2,7 +2,7 @@
 //! terminal when [`Mode::ConnectedClients`] is active, listing the client
 //! connections attached to the active session — label, machine id, hostname,
 //! transport, panes — with a per-row **Kick** button. Rows come from the
-//! toolkit-agnostic [`AppCore::client_rows`] projection; this module renders them
+//! toolkit-agnostic [`kmux_app::core::AppCore::client_rows`] projection; this module renders them
 //! into a `GtkListBox` and is reconciled by the pump while the view is open (the
 //! driver re-requests the list at ~1 Hz, issue #146).
 

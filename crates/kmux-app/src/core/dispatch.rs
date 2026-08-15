@@ -696,7 +696,7 @@ impl AppCore {
     }
 
     /// Kick a client from the session whose list is currently shown (issue #146).
-    /// Uses [`SessionManager::client_list_word`] so the kick targets the listed
+    /// Uses [`kmux_client::session_manager::SessionManager::client_list_word`] so the kick targets the listed
     /// session even if the active session changed since the list was fetched.
     pub fn kick_listed_client(&mut self, client_id: kmux_protocol::messages::ClientId) {
         if let Some(word) = self.mgr.client_list_word.clone() {

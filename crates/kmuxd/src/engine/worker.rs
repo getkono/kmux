@@ -5,7 +5,7 @@
 //! over a socketpair, and keeps the authoritative master fd itself (so the shell
 //! survives a worker crash). A **supervisor task** drains the worker's event
 //! stream and fans diffs out to clients through the same
-//! [`dispatch_diff_result`](crate::relay::dispatch_diff_result) the in-process
+//! [`dispatch_diff_result`] the in-process
 //! relay uses — so a worker pane is byte-identical on the wire to an in-process
 //! one. A daemon-side [`CellGrid`] mirror, fed from that same stream, answers
 //! `snapshot()` synchronously (no IPC round-trip), which keeps the existing

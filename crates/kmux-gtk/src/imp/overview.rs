@@ -1,7 +1,7 @@
 //! Process overview (issue #122): a main-area view, swapped in over the terminal
 //! when [`Mode::ProcessOverview`] is active, listing every session's
 //! Tab → Pane → Process tree with CPU/memory. The rows come from the
-//! toolkit-agnostic [`AppCore::overview_rows`] projection; this module only
+//! toolkit-agnostic [`kmux_app::core::AppCore::overview_rows`] projection; this module only
 //! renders them into a `GtkListBox` and is reconciled by the pump while the view
 //! is open (the driver re-requests the snapshot at ~1 Hz, issue #122).
 

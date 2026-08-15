@@ -394,7 +394,7 @@ pub async fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
 ///
 /// `nix` signalling is the platform-agnostic primitive across kmux's supported
 /// targets (macOS + Linux). Automatic startup never uses this path; it relies
-/// on the PID-file lock in [`cleanup_stale_daemon`] instead.
+/// on the PID-file lock in `cleanup_stale_daemon` instead.
 pub async fn force_kill_daemon(pid: u32, term_first: bool, grace: Duration) -> anyhow::Result<()> {
     let nix_pid = Pid::from_raw(pid as i32);
 

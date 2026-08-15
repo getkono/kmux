@@ -271,7 +271,7 @@ pub struct AppCore {
     /// Whether the inner-pane cursor blinks. When `false`, a cursor that
     /// requested blinking (DECSCUSR `blinking_*` / DEC mode 12) is drawn steady.
     /// The blink phase is driven by the frontend pump
-    /// ([`crate::driver::blink`]); this gates whether it advances at all.
+    /// ([`crate::driver::advance_blink`]); this gates whether it advances at all.
     pub cursor_blink_enabled: bool,
 
     /// Current interaction mode (modal keymap state).
@@ -726,7 +726,7 @@ impl AppCore {
         self.render_frames.push_back(now);
     }
 
-    /// Rendering frames per second over the last [`RENDER_FPS_WINDOW`]. Reflects
+    /// Rendering frames per second over the last `RENDER_FPS_WINDOW`. Reflects
     /// actual repaints (gated by `needs_render`), so it idles near 0 and peaks at
     /// the ~60 Hz pump cap.
     pub fn render_fps(&self) -> u32 {

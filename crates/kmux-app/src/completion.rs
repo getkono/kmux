@@ -67,7 +67,7 @@ fn server_candidates_from_hosts(
 /// calls it from inside a Tokio runtime, so we cannot `block_on` directly (that
 /// panics with "Cannot start a runtime from within a runtime"). Instead we run
 /// the async query on a dedicated thread with its own current-thread runtime,
-/// bounded by [`SESSION_QUERY_TIMEOUT`]. Any error — no daemon, parse failure,
+/// bounded by `SESSION_QUERY_TIMEOUT`. Any error — no daemon, parse failure,
 /// timeout — yields no candidates rather than blocking.
 pub fn session_candidates() -> Vec<CompletionCandidate> {
     std::thread::spawn(|| {

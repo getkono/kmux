@@ -217,7 +217,7 @@ pub struct CursorRect {
 
 /// The cursor's pixel geometry for debug tooling: the cell origin plus the solid
 /// rectangles the renderer would fill. Built by [`cursor_geometry`], which shares
-/// [`cursor_shape_rects`] with [`emit_cursor`] so the debug overlay provably
+/// `cursor_shape_rects` with `emit_cursor` so the debug overlay provably
 /// matches what is drawn.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CursorGeometry {
@@ -230,7 +230,7 @@ pub struct CursorGeometry {
 }
 
 /// The cursor's solid-rect geometry for `cursor` at `pane_origin` (the pane's
-/// top-left in physical px), exactly the rects [`emit_cursor`] would emit.
+/// top-left in physical px), exactly the rects `emit_cursor` would emit.
 ///
 /// Range gating matches the renderer: an out-of-range cursor yields
 /// `in_range = false` with no rects. Blink gating is **not** applied — debug

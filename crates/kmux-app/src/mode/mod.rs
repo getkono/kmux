@@ -37,14 +37,14 @@ pub enum Mode {
     SessionPicker,
     /// Process overview (issue #122): a main-area view replacing the terminal,
     /// listing every session's Tab → Pane → Process tree with CPU/memory. The
-    /// frontend renders [`AppCore::overview_rows`] in a native scrollable table;
+    /// frontend renders [`crate::core::AppCore::overview_rows`] in a native scrollable table;
     /// the driver re-requests the snapshot at ~1 Hz while this mode is active.
     /// Esc / Ctrl+G exits.
     ProcessOverview,
     /// Connected clients (issue #146): a main-area view replacing the terminal,
     /// listing the client connections attached to the active session — each with
     /// its user-readable label, machine id, hostname, transport, and panes — with
-    /// a per-row Kick action. The frontend renders [`AppCore::client_rows`]. The
+    /// a per-row Kick action. The frontend renders [`crate::core::AppCore::client_rows`]. The
     /// driver re-requests the list at ~1 Hz while this mode is active. Esc / q exits.
     ConnectedClients,
     /// Help overlay
@@ -52,14 +52,14 @@ pub enum Mode {
     /// Directory picker for remote connections: type a path to open/create a session
     DirectoryPicker,
     /// Unified session launcher (issue #121): a searchable list to open or create
-    /// a session locally or on a remote. Rows come from [`AppCore::launch_rows`].
+    /// a session locally or on a remote. Rows come from [`crate::core::AppCore::launch_rows`].
     LaunchPicker,
     /// Add-a-remote form (issue #121). The frontend owns the native input fields
-    /// and calls [`AppCore::submit_add_remote`]; the core only opens/cancels.
+    /// and calls [`crate::core::AppCore::submit_add_remote`]; the core only opens/cancels.
     AddRemote,
     /// Prompt for the directory of a new session on a federated `peer` (issue
     /// #121). The frontend owns the path field and calls
-    /// [`AppCore::submit_remote_new_session`].
+    /// [`crate::core::AppCore::submit_remote_new_session`].
     RemoteNewSession { peer: String },
     /// Background bootstrap in progress. Input is held; Esc cancels.
     Connecting { target_display: String },

@@ -21,7 +21,7 @@ use super::{ClientMap, PaneEventSink, PaneProgress, PaneRelay, SCROLLBACK_CAPACI
 impl ServerApp {
     /// Gracefully close a single pane, collapsing its tab's layout tree.
     ///
-    /// Returns the child exit code (if known) and a [`PaneCloseOutcome`]
+    /// Returns the child exit code (if known) and a [`crate::app::PaneCloseOutcome`]
     /// describing how the tab/session changed, so the caller can broadcast the
     /// authoritative `LayoutUpdate` / tab-close event. If the pane was the last
     /// in its tab the tab is removed; if it was the last tab the session closes.

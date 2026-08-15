@@ -265,7 +265,7 @@ impl AppCore {
     /// 3. one [`DirBrowserRow::Enter`] per subdirectory whose name contains the
     ///    case-insensitive filter [`dir_picker_buffer`](AppCore::dir_picker_buffer).
     ///
-    /// The entries/parent come from [`SessionManager::dir_listing`]; until the
+    /// The entries/parent come from [`kmux_client::session_manager::SessionManager::dir_listing`]; until the
     /// first listing arrives only `CreateHere` is shown. Any listing `error` is
     /// surfaced separately by [`AppCore::dir_browser_error`]; the rows still
     /// include `CreateHere` (+ Up when known) so the user can always recover.

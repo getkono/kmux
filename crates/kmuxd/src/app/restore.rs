@@ -41,7 +41,7 @@ pub(super) enum SeedMode {
 }
 
 impl ServerApp {
-    /// Restore sessions from a [`PersistedDaemonState`], spawning a fresh shell
+    /// Restore sessions from a [`crate::persist::PersistedDaemonState`], spawning a fresh shell
     /// for every pane (replaying the old grid/scrollback as ANSI history).
     ///
     /// This is the cold-start path and the fallback when a graceful handoff is

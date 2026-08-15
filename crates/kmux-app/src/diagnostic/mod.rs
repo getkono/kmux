@@ -4,13 +4,13 @@
 //! running an automated emitter that paints a known terminal pattern (a glyph
 //! grid, attribute matrix, color ramps, box-drawing…), so a human can visually
 //! verify that the renderer-under-test draws it correctly. It complements the
-//! [render-debug](super::core::render_debug) tooling, which shows what the
+//! [render-debug](crate::core::RenderDebugSnapshot) tooling, which shows what the
 //! renderer was *handed*; this feeds it a *known input*.
 //!
 //! The emitter is the `kmux` binary itself in a hidden mode
-//! (`kmux diagnostic <test> --emit`): it writes [`patterns::pattern_bytes`] to
+//! (`kmux diagnostic <test> --emit`): it writes [`crate::diagnostic::pattern_bytes`] to
 //! stdout, then blocks on stdin so the pane stays visible. Both frontends resolve
-//! the same launch command via [`session_command`], so the pattern bytes have a
+//! the same launch command via [`crate::diagnostic::session_command`], so the pattern bytes have a
 //! single source of truth. Scope is the local daemon (the just-launched `kmux`
 //! binary is present and locatable on the daemon host).
 
