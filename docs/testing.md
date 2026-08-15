@@ -169,8 +169,8 @@ Measured 2026-08-15:
 
 | Rule | At branch start | Now | Target |
 | --- | --- | --- | --- |
-| R3 — no process-global env mutation | 91 sites / 13 files | **50 / 11** | 0 |
-| R3/R13 — no test-only lock | 98 sites / 10 files | **73 / 8** | 0 |
+| R3 — no process-global env mutation | 91 sites / 13 files | **17 / 9** | 0 |
+| R3/R13 — no test-only lock | 98 sites / 10 files | **36 / 6** | 0 |
 | R4 — no function over 100 lines | 45 (largest 888 lines) | 45 | 0, minus the exceptions register |
 | R5 — no double in a release build | 2 (`kmux-pty`'s `pub mod mock`) | **0** | 0 — reached |
 | R12 — mutation score is the coverage bar | 3 crates fabricated, 5 never swept | scoring fixed; **no trustworthy sweep yet** | a recorded `[[mutants]]` budget per crate |
@@ -212,18 +212,19 @@ Every tier above *pure* states in a comment why the tier below cannot cover it
 
 ## Per crate
 
-Counts are `#[test]` + `#[tokio::test]` functions, measured 2026-08-15.
+Counts are `#[test]` + `#[tokio::test]` functions, measured 2026-08-16.
 
 | Crate | Unit | Integ | What is tested | Doubles & seams | Not tested (→ exceptions) |
 | --- | --- | --- | --- | --- | --- |
-| `kmux-protocol` | 167 | — | codec byte fixtures, framing, version/capability negotiation, message categories | wire fixtures | — |
-| `kmux-app` | 293 | — | action dispatch, mode resolution, layout geometry, config resolution, command registry, driver tick | `AppCore::for_test`, `FrontendDriver::for_test` | `run_cli` process exit |
+| `kmux-protocol` | 124 | — | codec byte fixtures, framing, version/capability negotiation, message categories, compat classification | wire fixtures — the crate is pure data, so every test is tier *pure* | — |
+| `kmux-sys` | 51 | — | XDG path resolution rules, Ed25519 identity round-trip, TOFU store, transport constants | `Dirs::rooted` | real sockets, real TLS handshakes, keyring |
+| `kmux-app` | 300 | — | action dispatch, mode resolution, layout geometry, config resolution, command registry, driver tick | `AppCore::for_test`, `FrontendDriver::for_test` | `run_cli` process exit |
 | `kmuxd` | 174 | 18 | message handlers, app state, relay, auth, wordlist, persistence; grid conformance (R10); 5 e2e suites | `NoopAttacher`, `ServerApp::new`, `NullEventSink` (via `kmux-vt-core/test-util`) | fork/exec, `SCM_RIGHTS`, daemonize, `startup::async_main` |
 | `kmux-client` | 163 | 3 | server-message handling, grid apply, selection, input, liveness; grid-apply proptest (R10) | channel injection | — |
-| `kmux-connect` | 78 | — | bootstrap racing, daemon lifecycle, token handling, host parsing | `tempfile` state dirs | real sshd handshake, QUIC/TLS on the wire |
-| `kmux-vt-core` | 70 | — | diff engine, scrollback mirror, backend contract | `MockBackend`, `NullEventSink` (`test-util`) | real terminal emulation |
+| `kmux-connect` | 85 | — | bootstrap racing, daemon lifecycle, token handling, host parsing, attach-gate refusals | `Dirs::rooted` | real sshd handshake, QUIC/TLS on the wire |
+| `kmux-vt-core` | 71 | — | diff engine, scrollback mirror, backend contract | `MockBackend`, `NullEventSink` (`test-util`) | real terminal emulation |
 | `kmux-render` | 54 | — | geometry, packed format, atlas packing, colour, dirty-row parity | — | GPU adapter (skips cleanly, R11) |
-| `kmux-pty` | 35 | — | timeout policy, registry, expect parser, size math | `MockPty` | `forkpty`, real child spawn, termios |
+| `kmux-pty` | 34 | — | timeout policy, registry, expect parser, size math | — (`MockPty` deleted: 114 lines of `tokio::io::duplex` wrapper with no consumer) | `forkpty`, real child spawn, termios |
 | `kmux-ghostty` | 26 | — | safe façade, `Send`/`Sync` static assertions, event decode | `NullSink` | libghostty internals |
 | `kmux-ffi` | 17 | — | a few leaf conversions | — | `extern "C"` dispatch, uniffi object lifetimes |
 | `kmux-gtk` | 14 | — | keyval→protocol conversion, accel→action table | — | **all widget construction and the glib main loop** |
