@@ -59,9 +59,10 @@ fn main() {
         .status()
         .unwrap_or_else(|e| panic!("failed to invoke `zig build`: {e}"));
 
-    if !status.success() {
-        panic!("`zig build` for libkmux_ghostty failed (exit: {status:?})");
-    }
+    assert!(
+        status.success(),
+        "`zig build` for libkmux_ghostty failed (exit: {status:?})"
+    );
 
     let lib_dir = install_prefix.join("lib");
     println!("cargo:rustc-link-search=native={}", lib_dir.display());
@@ -82,13 +83,12 @@ fn main() {
 
 fn require_submodule(ghostty_dir: &Path) {
     let marker = ghostty_dir.join("build.zig.zon");
-    if !marker.exists() {
-        panic!(
-            "vendor/ghostty is not initialised (missing {}).\n\
-             Run: `git submodule update --init` at the repo root.",
-            marker.display()
-        );
-    }
+    assert!(
+        marker.exists(),
+        "vendor/ghostty is not initialised (missing {}).\n\
+         Run: `git submodule update --init` at the repo root.",
+        marker.display()
+    );
 }
 
 fn emit_rerun_hints(zig_src_dir: &Path, ghostty_dir: &Path) {
@@ -123,12 +123,11 @@ fn verify_zig_version(zig: &str) {
             )
         });
     let version = String::from_utf8_lossy(&out.stdout).trim().to_string();
-    if version != EXPECTED_ZIG_VERSION {
-        panic!(
-            "zig version mismatch: expected {EXPECTED_ZIG_VERSION}, found {version} (resolved `{zig}`).\n\
-             Run `mise install` to install the pinned zig. If it is already installed, \
-             a different `zig` (e.g. a Homebrew one) is shadowing it because mise is not \
-             active in this shell: build via `mise run build`, or set ZIG=\"$(mise which zig)\".",
-        );
-    }
+    assert!(
+        version == EXPECTED_ZIG_VERSION,
+        "zig version mismatch: expected {EXPECTED_ZIG_VERSION}, found {version} (resolved `{zig}`).\n\
+         Run `mise install` to install the pinned zig. If it is already installed, \
+         a different `zig` (e.g. a Homebrew one) is shadowing it because mise is not \
+         active in this shell: build via `mise run build`, or set ZIG=\"$(mise which zig)\".",
+    );
 }

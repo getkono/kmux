@@ -28,7 +28,12 @@ impl<B: TerminalBackend> DiffEngine<B> {
             let base = r * cols;
             let mut c = 0;
             while c < cols {
-                if self.current_cells[base + c] != self.prev_cells[base + c] {
+                if self.current_cells[base + c] == self.prev_cells[base + c] {
+                    if all_current_default && self.current_cells[base + c] != CellState::default() {
+                        all_current_default = false;
+                    }
+                    c += 1;
+                } else {
                     let start = c;
                     if all_current_default && self.current_cells[base + c] != CellState::default() {
                         all_current_default = false;
@@ -57,11 +62,6 @@ impl<B: TerminalBackend> DiffEngine<B> {
                             cell: self.current_cells[base + start],
                         });
                     }
-                } else {
-                    if all_current_default && self.current_cells[base + c] != CellState::default() {
-                        all_current_default = false;
-                    }
-                    c += 1;
                 }
             }
         }

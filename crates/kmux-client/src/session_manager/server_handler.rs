@@ -771,8 +771,7 @@ impl SessionManager {
             }
 
             ServerMessage::InputLockDenied { pane_id, holder } => {
-                self.status_msg =
-                    format!("Input lock denied on '{pane_id}' (held by {:?})", holder);
+                self.status_msg = format!("Input lock denied on '{pane_id}' (held by {holder:?})");
                 events.push(SessionEvent::InputLockDenied { pane_id, holder });
             }
 

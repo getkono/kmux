@@ -123,7 +123,7 @@ impl ServerApp {
             )));
         };
 
-        let entry = self.build_session_entry(&state);
+        let entry = Self::build_session_entry(&state);
         self.sessions
             .write()
             .await

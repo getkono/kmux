@@ -100,7 +100,9 @@ mod tests {
         let config = PtyConfig::new("/bin/sleep").args(["999"]);
         let pty = PtyProcess::spawn(&config).expect("spawn");
         let pid = pty.pid;
-        std::mem::forget(pty);
+        // Keep the fd alive without running Drop, so the shutdown path under
+        // test is the only thing signalling the child.
+        let _pty = std::mem::ManuallyDrop::new(pty);
 
         graceful_shutdown_nowait(pid, Some(Duration::from_millis(200)));
 
@@ -124,7 +126,9 @@ mod tests {
         let pty = PtyProcess::spawn(&config).expect("spawn");
         let pid = pty.pid;
         // Prevent the drop impl from racing
-        std::mem::forget(pty);
+        // Keep the fd alive without running Drop, so the shutdown path under
+        // test is the only thing signalling the child.
+        let _pty = std::mem::ManuallyDrop::new(pty);
 
         let status = graceful_shutdown(pid, Some(Duration::from_millis(500))).await;
         assert!(status.is_ok());

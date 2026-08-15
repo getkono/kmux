@@ -363,7 +363,7 @@ fn print_table(r: &StatusReport) {
     match r.workers.isolation_mode.as_str() {
         "daemon-down" => println!("  Isolation: <unknown — local daemon not running>"),
         "unavailable" => {
-            println!("  Isolation: unavailable (daemon predates worker reporting)")
+            println!("  Isolation: unavailable (daemon predates worker reporting)");
         }
         "process" => {
             if r.workers.workers.is_empty() {

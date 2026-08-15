@@ -321,16 +321,16 @@ impl GridContent {
         let new_count = lines.len();
         let old_len = self.scrollback.len();
         let ok = self.scrollback.append_with_index(first_index, lines);
-        let fixup = if !ok {
-            self.scrollback.clear();
-            ScrollbackFixup::Cleared
-        } else {
+        let fixup = if ok {
             let new_len = self.scrollback.len();
             let evicted = (old_len + new_count).saturating_sub(new_len);
             ScrollbackFixup::Shifted {
                 evicted,
                 net: new_count - evicted,
             }
+        } else {
+            self.scrollback.clear();
+            ScrollbackFixup::Cleared
         };
         self.maybe_clear_history_gap();
         self.cells_generation += 1;

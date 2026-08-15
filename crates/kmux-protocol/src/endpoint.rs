@@ -186,7 +186,7 @@ fn split_host_port(s: &str) -> Option<(String, u16)> {
     // so in `s`: `[` is at 0, host contents are at 1..bracket_end+1, `]` is at
     // bracket_end+1, `:` is at bracket_end+2, port starts at bracket_end+3.
     if let Some(bracket_end) = s.strip_prefix('[').and_then(|r| r.find(']')) {
-        let host = format!("[{}]", &s[1..bracket_end + 1]);
+        let host = format!("[{}]", &s[1..=bracket_end]);
         let after = &s[bracket_end + 3..]; // skip `]:` (]  is at bracket_end+1, : at bracket_end+2)
         let port: u16 = after.parse().ok()?;
         return Some((host, port));

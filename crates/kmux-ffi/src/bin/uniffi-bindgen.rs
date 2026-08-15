@@ -9,5 +9,5 @@
 //!   --language swift --out-dir crates/kmux-ffi/bindings/swift
 //! ```
 fn main() {
-    uniffi::uniffi_bindgen_main()
+    uniffi::uniffi_bindgen_main();
 }

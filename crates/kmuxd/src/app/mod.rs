@@ -988,10 +988,10 @@ impl ServerApp {
                     } else {
                         None
                     },
-                    last_rtt_ms: if last_rtt_ms != u64::MAX {
-                        Some(last_rtt_ms)
-                    } else {
+                    last_rtt_ms: if last_rtt_ms == u64::MAX {
                         None
+                    } else {
+                        Some(last_rtt_ms)
                     },
                 };
                 (state.client_id, info)

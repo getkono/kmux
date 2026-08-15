@@ -214,3 +214,24 @@ checked_conversions = "warn"
 unicode_not_nfc = "warn"
 verbose_bit_mask = "warn"
 zero_sized_map_values = "warn"
+
+# Graduated from the ratchet by clearing them: 57 sites over 13 lints, small
+# enough that recording them as a budget to pay down later would have cost more
+# than paying them now. Mostly `cargo clippy --fix`; the four that needed a
+# human are in the commit that cleared them (a 64 KiB stack array inside an
+# async fn, `mem::forget` where `ManuallyDrop` says what was meant, a method
+# taking `&self` it never read, and eleven builder methods whose return value
+# was silently discardable).
+uninlined_format_args = "warn"
+semicolon_if_nothing_returned = "warn"
+unnested_or_patterns = "warn"
+equatable_if_let = "warn"
+stable_sort_primitive = "warn"
+range_plus_one = "warn"
+redundant_else = "warn"
+manual_assert = "warn"
+return_self_not_must_use = "warn"
+if_not_else = "warn"
+unused_self = "warn"
+mem_forget = "warn"
+large_stack_arrays = "warn"

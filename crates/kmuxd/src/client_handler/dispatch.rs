@@ -832,7 +832,7 @@ pub async fn handle_message<A: PaneAttacher>(
                         clients,
                     }),
                     Err(reason) => {
-                        state.error(Some(request_id), ErrorCode::SessionNotFound, reason)
+                        state.error(Some(request_id), ErrorCode::SessionNotFound, reason);
                     }
                 }
             } else {

@@ -170,9 +170,8 @@ where
                 let hint = version_mismatch_hint(&reason_str);
                 if hint.is_empty() {
                     anyhow::bail!("Authentication failed: {reason_str}");
-                } else {
-                    anyhow::bail!("Authentication failed: {reason_str}\n{hint}");
                 }
+                anyhow::bail!("Authentication failed: {reason_str}\n{hint}");
             }
             _ => continue,
         }

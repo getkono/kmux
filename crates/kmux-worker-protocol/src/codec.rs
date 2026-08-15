@@ -85,6 +85,10 @@ pub async fn recv_with_fd<M: DeserializeOwned>(
 ) -> io::Result<(M, Option<OwnedFd>)> {
     let mut acc: Vec<u8> = Vec::new();
     let mut fd: Option<OwnedFd> = None;
+    // One heap buffer for the whole read, not a 64 KiB stack array rebuilt on
+    // every iteration: this lives inside an async fn, so a stack array of this
+    // size lands in the future itself.
+    let mut buf = vec![0u8; 65536];
 
     loop {
         if acc.len() >= 4 {
@@ -95,7 +99,6 @@ pub async fn recv_with_fd<M: DeserializeOwned>(
             }
         }
 
-        let mut buf = [0u8; 65536];
         let mut cmsg = nix::cmsg_space!(RawFd);
         let (n, got_fd) = stream
             .async_io(Interest::READABLE, || {

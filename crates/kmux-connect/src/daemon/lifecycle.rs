@@ -112,8 +112,8 @@ pub(crate) fn start_daemon() -> anyhow::Result<Option<std::process::Child>> {
     use nix::fcntl::{FlockArg, flock};
     use std::os::unix::io::AsRawFd;
     #[allow(deprecated)]
-    if let Err(nix::errno::Errno::EWOULDBLOCK) =
-        flock(lock_file.as_raw_fd(), FlockArg::LockExclusiveNonblock)
+    if flock(lock_file.as_raw_fd(), FlockArg::LockExclusiveNonblock)
+        == Err(nix::errno::Errno::EWOULDBLOCK)
     {
         // Another process is in the middle of starting a daemon — let the
         // caller retry query_daemon() rather than starting a second one.

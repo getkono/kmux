@@ -68,10 +68,8 @@ async fn run_inner(config: &PtyConfig) -> Result<CommandOutput> {
 
 /// PTY EOF manifests as EIO on Linux when the slave side is closed.
 fn is_eof_error(e: &std::io::Error) -> bool {
-    matches!(
-        e.raw_os_error(),
-        Some(nix::libc::EIO) | Some(nix::libc::EBADF)
-    ) || e.kind() == std::io::ErrorKind::UnexpectedEof
+    matches!(e.raw_os_error(), Some(nix::libc::EIO | nix::libc::EBADF))
+        || e.kind() == std::io::ErrorKind::UnexpectedEof
 }
 
 #[cfg(test)]

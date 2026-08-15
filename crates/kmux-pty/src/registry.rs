@@ -272,8 +272,7 @@ mod tests {
         // Should return well under the 5-second grace period
         assert!(
             elapsed < std::time::Duration::from_millis(200),
-            "close_nowait took {:?}, expected < 200ms",
-            elapsed
+            "close_nowait took {elapsed:?}, expected < 200ms"
         );
         assert!(!mgr.exists("gamma").await, "session should be removed");
     }

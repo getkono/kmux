@@ -52,7 +52,7 @@ pub(super) fn register_window(
             window: window.clone(),
             fe: Rc::downgrade(fe),
             drawing: drawing.clone(),
-        })
+        });
     });
     // Drop the entry when the window closes so a stale window is never a target.
     let win = window.clone();

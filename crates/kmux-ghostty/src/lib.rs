@@ -543,7 +543,7 @@ impl GhosttyTerm {
         let mut value = 0u8;
         let mut has = 0u8;
         unsafe {
-            sys::kmux_ghostty_get_progress(self.handle.as_ptr(), &mut state, &mut value, &mut has)
+            sys::kmux_ghostty_get_progress(self.handle.as_ptr(), &mut state, &mut value, &mut has);
         };
         ProgressReport::from_raw(state, value, has)
     }

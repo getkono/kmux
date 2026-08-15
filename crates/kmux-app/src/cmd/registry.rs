@@ -1069,7 +1069,7 @@ mod tests {
     #[test]
     fn no_duplicate_canonical_names() {
         let mut names: Vec<&str> = ALL.iter().map(|s| s.name).collect();
-        names.sort();
+        names.sort_unstable();
         let len = names.len();
         names.dedup();
         assert_eq!(len, names.len(), "duplicate canonical name in registry");
@@ -1087,7 +1087,7 @@ mod tests {
             }
         }
         let len = all.len();
-        all.sort();
+        all.sort_unstable();
         all.dedup();
         assert_eq!(len, all.len(), "duplicate name/alias across registry");
     }

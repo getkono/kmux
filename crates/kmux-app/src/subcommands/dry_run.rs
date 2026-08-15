@@ -217,7 +217,7 @@ async fn run_supervisor_phase(
     handle.abort();
     observer.line(
         "RESULT",
-        format!("supervisor ended; final observed transport {}", active),
+        format!("supervisor ended; final observed transport {active}"),
     );
     Ok(())
 }
@@ -329,11 +329,11 @@ impl BootstrapObserver for ConsoleObserver {
                 port,
             } => {
                 let addr = if *port > 0 {
-                    format!("{}:{}", host, port)
+                    format!("{host}:{port}")
                 } else {
                     host.to_string()
                 };
-                self.line("HANDSHAKE", format!("{} {}", transport, addr));
+                self.line("HANDSHAKE", format!("{transport} {addr}"));
             }
             BootstrapEvent::HandshakeAuthSent {
                 protocol_version,

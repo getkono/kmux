@@ -30,24 +30,28 @@ impl EnvBuilder {
     }
 
     /// Inherit all parent env vars (default).
+    #[must_use]
     pub fn inherit(mut self) -> Self {
         self.mode = EnvMode::Inherit;
         self
     }
 
     /// Inherit parent env, then apply these overrides.
+    #[must_use]
     pub fn extend(mut self, vars: HashMap<String, String>) -> Self {
         self.mode = EnvMode::Extend(vars);
         self
     }
 
     /// Use only these vars -- do not inherit parent environment.
+    #[must_use]
     pub fn explicit(mut self, vars: HashMap<String, String>) -> Self {
         self.mode = EnvMode::Explicit(vars);
         self
     }
 
     /// Whether to automatically set `TERM=xterm-256color` if not present.
+    #[must_use]
     pub fn auto_term(mut self, enabled: bool) -> Self {
         self.auto_term = enabled;
         self
@@ -120,6 +124,7 @@ impl PtyConfig {
         }
     }
 
+    #[must_use]
     pub fn args<I, S>(mut self, args: I) -> Self
     where
         I: IntoIterator<Item = S>,
@@ -129,31 +134,37 @@ impl PtyConfig {
         self
     }
 
+    #[must_use]
     pub fn env(mut self, env: EnvBuilder) -> Self {
         self.env = env;
         self
     }
 
+    #[must_use]
     pub fn cwd(mut self, path: impl Into<PathBuf>) -> Self {
         self.cwd = Some(path.into());
         self
     }
 
+    #[must_use]
     pub fn size(mut self, rows: u16, cols: u16) -> Self {
         self.size = WindowSize { rows, cols };
         self
     }
 
+    #[must_use]
     pub fn wall_clock_timeout(mut self, d: Duration) -> Self {
         self.timeouts.wall_clock = Some(d);
         self
     }
 
+    #[must_use]
     pub fn idle_timeout(mut self, d: Duration) -> Self {
         self.timeouts.idle = Some(d);
         self
     }
 
+    #[must_use]
     pub fn shutdown_grace(mut self, d: Duration) -> Self {
         self.timeouts.shutdown_grace = Some(d);
         self

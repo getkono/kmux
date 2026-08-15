@@ -345,7 +345,7 @@ mod tests {
             let mut buf = [0u8; 256];
             loop {
                 match tokio::time::timeout(Duration::from_secs(5), reader.read(&mut buf)).await {
-                    Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
+                    Ok(Ok(0) | Err(_)) | Err(_) => break,
                     Ok(Ok(n)) => {
                         output.extend_from_slice(&buf[..n]);
                         // PTY echoes our input back -- that's enough to verify

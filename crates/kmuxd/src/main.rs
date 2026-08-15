@@ -172,7 +172,7 @@ fn main() -> anyhow::Result<()> {
     };
 
     // probe-or-start: short-lived query/start, no need to daemonize or init full logging.
-    if let Some(Command::ProbeOrStart) = cli.command {
+    if matches!(cli.command, Some(Command::ProbeOrStart)) {
         let rt = tokio::runtime::Runtime::new()?;
         return rt.block_on(probe_or_start());
     }

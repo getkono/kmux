@@ -232,7 +232,7 @@ fn arg_value_hints(
         .into_iter()
         .take(MAX_HINTS)
         .map(|v| Hint {
-            display: format!("{:<22} <{}>", v, arg_label),
+            display: format!("{v:<22} <{arg_label}>"),
             summary: "",
             replacement: maybe_quote(&v),
             replace_from,

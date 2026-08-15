@@ -166,7 +166,7 @@ impl ServerApp {
 
     /// Build the wire [`SessionEntry`] for one live session (local; `peer: None`).
     /// Shared by [`list_sessions`](Self::list_sessions) and the restore path.
-    pub(super) fn build_session_entry(&self, state: &SessionState) -> SessionEntry {
+    pub(super) fn build_session_entry(state: &SessionState) -> SessionEntry {
         let mut panes: Vec<PaneInfo> = state
             .panes
             .iter()
@@ -193,10 +193,8 @@ impl ServerApp {
     /// List all active sessions with their pane metadata.
     pub async fn list_sessions(&self) -> Vec<SessionEntry> {
         let sessions = self.sessions.read().await;
-        let mut entries: Vec<SessionEntry> = sessions
-            .values()
-            .map(|state| self.build_session_entry(state))
-            .collect();
+        let mut entries: Vec<SessionEntry> =
+            sessions.values().map(Self::build_session_entry).collect();
         entries.sort_by_key(|e| e.meta.index);
         entries
     }

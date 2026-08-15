@@ -38,7 +38,7 @@ pub fn encode_mouse_scroll(col: u16, row: u16, lines: i32, sgr: bool) -> Vec<u8>
     for _ in 0..count.min(255) {
         if sgr {
             // SGR format: \x1b[<{button};{col};{row}M
-            let seq = format!("\x1b[<{};{};{}M", button, col, row);
+            let seq = format!("\x1b[<{button};{col};{row}M");
             out.extend_from_slice(seq.as_bytes());
         } else {
             // Legacy X10/normal format: \x1b[M{cb}{cx}{cy}

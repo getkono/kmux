@@ -338,11 +338,11 @@ impl FrontendDriver {
     /// Reflect a `/theme` palette change. The grid reads the palette live; this
     /// only flags the toolkit-specific chrome reload.
     fn detect_palette_change(&mut self) -> bool {
-        if self.core.palette != self.last_palette {
+        if self.core.palette == self.last_palette {
+            false
+        } else {
             self.last_palette = self.core.palette.clone();
             true
-        } else {
-            false
         }
     }
 
