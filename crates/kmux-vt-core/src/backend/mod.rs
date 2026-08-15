@@ -199,13 +199,3 @@ pub trait TerminalBackend: Send + 'static {
         Vec::new()
     }
 }
-
-/// Marker trait for future runtime backend selection.
-///
-/// Reserved: when vtable-erased backend switching is worth the cost, a factory
-/// registry will use this trait to construct backends by name.  Until then,
-/// selection is static via `ActiveBackend` in `term_state.rs`.
-#[allow(dead_code)]
-pub trait BackendFactory: Send + Sync + 'static {
-    fn name(&self) -> &'static str;
-}
