@@ -76,9 +76,6 @@ ratcheted = [
     "clippy::significant_drop_tightening",
     "clippy::string_slice",
 ]
-mutants = []
-mutants = []
-
 [[lints]]
 crate = "kmux-app"
 lint = "clippy::cast_possible_truncation"
@@ -137,7 +134,7 @@ count = 10
 [[lints]]
 crate = "kmux-app"
 lint = "clippy::needless_pass_by_value"
-count = 5
+count = 6
 
 [[lints]]
 crate = "kmux-app"
@@ -687,7 +684,7 @@ count = 7
 [[lints]]
 crate = "kmux-sys"
 lint = "missing_docs"
-count = 26
+count = 16
 
 [[lints]]
 crate = "kmux-vt-core"

@@ -328,10 +328,22 @@ fn rewrite(
 
 /// Just the measured half of the file, so the hand-written `[meta]` block above
 /// it can be preserved as text.
+///
+/// Every field is skipped when empty, and that is load-bearing rather than
+/// tidiness. TOML serializes an empty `Vec` as a bare `key = []`, and a bare
+/// key emitted before any table header belongs to whatever table precedes it —
+/// which here is the hand-written `[meta]`. `header_of` then preserves it as
+/// part of the header, so the next write appends another, and the file
+/// accumulates one `mutants = []` per run until it fails to parse on a
+/// duplicate key. With the field skipped, a non-empty `Vec<struct>` can only
+/// ever emit `[[name]]` sections, so the body cannot contain a bare key at all.
 #[derive(serde::Serialize)]
 struct Tables {
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     lints: Vec<xtask::baseline::Budget>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     allows: Vec<xtask::baseline::AllowBudget>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     mutants: Vec<xtask::baseline::MutantBudget>,
 }
 
@@ -346,8 +358,19 @@ fn write_baseline(path: &Path, next: &Baseline) -> Result<()> {
         mutants: next.mutants.clone(),
     })
     .context("serialize the quality baseline")?;
-    std::fs::write(path, format!("{header}\n{body}"))
-        .with_context(|| format!("write {}", path.display()))
+    let text = format!("{header}\n{body}");
+
+    // Read back what we are about to write. A gate that corrupts its own
+    // baseline fails every later run for a reason that has nothing to do with
+    // the code under test, and the corruption is invisible until then.
+    toml::from_str::<Baseline>(&text).with_context(|| {
+        format!(
+            "refusing to write {}: the generated file does not parse as a baseline",
+            path.display()
+        )
+    })?;
+
+    std::fs::write(path, text).with_context(|| format!("write {}", path.display()))
 }
 
 /// Everything above the first measured table: the file's explanatory comments
@@ -355,11 +378,19 @@ fn write_baseline(path: &Path, next: &Baseline) -> Result<()> {
 fn header_of(text: &str) -> String {
     text.lines()
         .take_while(|l| !l.starts_with("[["))
+        // A measured key at column zero is a previous write leaking into the
+        // header. Drop it rather than carry it forward: keeping it is what let
+        // one stray `mutants = []` become two and then a parse error.
+        .filter(|l| !MEASURED_KEYS.iter().any(|k| l.starts_with(k)))
         .map(|l| format!("{l}\n"))
         .collect::<String>()
         .trim_end()
         .to_owned()
 }
+
+/// Table names owned by the writer. Anything starting with one of these at
+/// column zero is generated, never hand-written.
+const MEASURED_KEYS: [&str; 3] = ["lints =", "allows =", "mutants ="];
 
 /// Update the `rustc = "..."` line inside a preserved header.
 ///
@@ -398,6 +429,18 @@ mod tests {
         assert!(
             !header.contains("[[lints]]"),
             "measured tables are regenerated, not preserved"
+        );
+    }
+
+    #[test]
+    fn a_measured_key_leaked_into_the_header_is_not_carried_forward() {
+        // The exact corruption: an empty table serialized as a bare key lands
+        // inside [meta], and preserving it appends another on the next write.
+        let text = format!("{HEADER}mutants = []\n\n[[lints]]\ncrate = \"a\"\n");
+        assert!(!header_of(&text).contains("mutants ="));
+        assert!(
+            header_of(&text).contains("# because"),
+            "real header survives"
         );
     }
 
