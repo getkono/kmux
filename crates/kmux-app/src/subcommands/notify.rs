@@ -7,10 +7,8 @@
 //! optional Claude Code hook payload piped on stdin enriches the kind/body.
 
 use kmux_protocol::messages::{AttentionKind, ClientMessage, ServerMessage};
-use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
-use tokio::net::TcpStream;
 
-use super::{authenticate, resolve_connection};
+use super::resolve_connection;
 
 pub struct NotifyConfig<'a> {
     pub server: Option<&'a str>,
@@ -50,35 +48,25 @@ pub async fn run_notify(cfg: NotifyConfig<'_>) -> anyhow::Result<()> {
         resolve_attention(cfg.kind, cfg.title, cfg.body, &session, hook.as_ref());
 
     let conn = resolve_connection(cfg.server, cfg.ssh_port).await?;
-    let tcp_port = conn.tcp_port.unwrap_or(conn.port);
-    let stream = TcpStream::connect(format!("{}:{}", conn.host, tcp_port))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to {}:{}: {e}", conn.host, tcp_port))?;
-    let (mut read_half, mut write_half) = stream.into_split();
-    authenticate(&mut read_half, &mut write_half, conn.token).await?;
+    let (mut read_half, mut write_half) = super::connect_authenticated(&conn).await?;
 
-    write_frame(
+    super::request_reply(
+        &mut read_half,
         &mut write_half,
-        &encode_client(&ClientMessage::Notify {
+        &ClientMessage::Notify {
             request_id: 1,
             pane_id: pane.clone(),
             kind,
             title,
             body,
-        })?,
+        },
+        "notify",
+        |msg| match msg {
+            ServerMessage::NotifyAccepted { .. } => Some(()),
+            _ => None,
+        },
     )
-    .await?;
-
-    loop {
-        let data = read_frame(&mut read_half)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Connection closed before notify ack"))?;
-        match decode_server(&data)? {
-            ServerMessage::NotifyAccepted { .. } => return Ok(()),
-            ServerMessage::Error { message, .. } => anyhow::bail!("notify failed: {message}"),
-            _ => continue,
-        }
-    }
+    .await
 }
 
 /// Read a Claude Code hook payload from stdin, if one is piped. Returns `None`

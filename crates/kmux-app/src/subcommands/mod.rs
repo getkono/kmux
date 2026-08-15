@@ -178,6 +178,70 @@ where
     }
 }
 
+/// Connect to `conn` over TCP and complete the auth handshake.
+///
+/// The six headless subcommands each open a socket, split it, and authenticate
+/// with the same three lines and the same error text. Having one copy means a
+/// change to how the CLI dials the daemon — a timeout, a different port
+/// preference, IPv6 — is one edit rather than six that can drift apart.
+pub(crate) async fn connect_authenticated(
+    conn: &ResolvedConnection,
+) -> anyhow::Result<(
+    tokio::net::tcp::OwnedReadHalf,
+    tokio::net::tcp::OwnedWriteHalf,
+)> {
+    let tcp_port = conn.tcp_port.unwrap_or(conn.port);
+    let stream = tokio::net::TcpStream::connect(format!("{}:{}", conn.host, tcp_port))
+        .await
+        .map_err(|e| anyhow::anyhow!("Failed to connect to {}:{}: {e}", conn.host, tcp_port))?;
+    let (mut read_half, mut write_half) = stream.into_split();
+    authenticate(&mut read_half, &mut write_half, conn.token.clone()).await?;
+    Ok((read_half, write_half))
+}
+
+/// Send one request and return the first reply `accept` recognises.
+///
+/// The daemon interleaves unrelated pushes on the same channel, so a one-shot
+/// request is always "write, then read until the answer arrives" — which the
+/// subcommands had each spelled out, eleven times, along with the two arms that
+/// are the same everywhere: `ServerMessage::Error` becomes an `Err` labelled
+/// with `what`, and a closed connection becomes an `Err` saying so. Only the
+/// arm that recognises the answer is per-call, and that is what `accept` is.
+///
+/// Any `Error` ends the call, not only one carrying a matching `request_id`.
+/// These are one-shot connections that issue a handful of requests in sequence,
+/// so there is no other request an error could belong to — and treating it as
+/// unrelated is what made `kmux ls` and `kmux ps` report "connection closed"
+/// instead of what the daemon actually said.
+pub(crate) async fn request_reply<R, W, T>(
+    read_half: &mut R,
+    write_half: &mut W,
+    request: &kmux_protocol::messages::ClientMessage,
+    what: &str,
+    accept: impl Fn(kmux_protocol::messages::ServerMessage) -> Option<T>,
+) -> anyhow::Result<T>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use kmux_protocol::messages::ServerMessage;
+    use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
+
+    write_frame(write_half, &encode_client(request)?).await?;
+    loop {
+        let data = read_frame(read_half)
+            .await?
+            .ok_or_else(|| anyhow::anyhow!("Connection closed before {what}"))?;
+        let msg = decode_server(&data)?;
+        if let ServerMessage::Error { message, .. } = &msg {
+            anyhow::bail!("{what} failed: {message}");
+        }
+        if let Some(value) = accept(msg) {
+            return Ok(value);
+        }
+    }
+}
+
 /// Ask a yes/no question on the terminal, returning `true` only on an explicit
 /// yes. Mirrors the nested-GUI guard in `kmux/src/main.rs`: the prompt goes to
 /// stderr, EOF (Ctrl-D) and an empty line are the safe default (`false`).

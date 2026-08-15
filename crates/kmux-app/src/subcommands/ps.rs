@@ -9,7 +9,7 @@
 use crate::cli::OutputFormat;
 use crate::core::build_overview_rows;
 
-use super::{authenticate, render, resolve_connection};
+use super::{render, resolve_connection};
 
 pub struct ProcessOverviewConfig<'a> {
     pub server: Option<&'a str>,
@@ -22,47 +22,34 @@ pub async fn run_process_overview(cfg: ProcessOverviewConfig<'_>) -> anyhow::Res
     let format = cfg.format;
 
     use kmux_protocol::messages::{ClientMessage, PaneProcesses, ServerMessage, SessionEntry};
-    use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
-    use tokio::net::TcpStream;
 
-    let tcp_port = conn.tcp_port.unwrap_or(conn.port);
-    let stream = TcpStream::connect(format!("{}:{}", conn.host, tcp_port))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to {}:{}: {e}", conn.host, tcp_port))?;
-    let (mut read_half, mut write_half) = stream.into_split();
-
-    // Authenticate (token + cryptographic identity challenge–response, issue #146).
-    authenticate(&mut read_half, &mut write_half, conn.token).await?;
+    let (mut read_half, mut write_half) = super::connect_authenticated(&conn).await?;
 
     // Fetch the session list (for the Session → Tab → Pane hierarchy).
-    write_frame(
+    let sessions: Vec<SessionEntry> = super::request_reply(
+        &mut read_half,
         &mut write_half,
-        &encode_client(&ClientMessage::SessionList { request_id: 1 })?,
+        &ClientMessage::SessionList { request_id: 1 },
+        "session list",
+        |msg| match msg {
+            ServerMessage::SessionListResult { sessions, .. } => Some(sessions),
+            _ => None,
+        },
     )
     .await?;
-    let sessions: Vec<SessionEntry> = loop {
-        let data = read_frame(&mut read_half)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Connection closed before session list"))?;
-        if let ServerMessage::SessionListResult { sessions, .. } = decode_server(&data)? {
-            break sessions;
-        }
-    };
 
     // Fetch the process snapshot, then join the two with the shared projection.
-    write_frame(
+    let panes: Vec<PaneProcesses> = super::request_reply(
+        &mut read_half,
         &mut write_half,
-        &encode_client(&ClientMessage::ProcessOverview { request_id: 2 })?,
+        &ClientMessage::ProcessOverview { request_id: 2 },
+        "process overview",
+        |msg| match msg {
+            ServerMessage::ProcessOverviewResult { panes, .. } => Some(panes),
+            _ => None,
+        },
     )
     .await?;
-    let panes: Vec<PaneProcesses> = loop {
-        let data = read_frame(&mut read_half)
-            .await?
-            .ok_or_else(|| anyhow::anyhow!("Connection closed before process overview"))?;
-        if let ServerMessage::ProcessOverviewResult { panes, .. } = decode_server(&data)? {
-            break panes;
-        }
-    };
 
     match format {
         OutputFormat::Table => {

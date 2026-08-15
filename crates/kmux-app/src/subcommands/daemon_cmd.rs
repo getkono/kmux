@@ -232,17 +232,12 @@ async fn fetch_remote_logs(
     use kmux_protocol::messages::{ClientMessage, ServerMessage};
     use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
     use std::io::Write;
-    use tokio::net::TcpStream;
-
     let conn = super::resolve_connection(Some(server), ssh_port).await?;
-    let tcp_port = conn.tcp_port.unwrap_or(conn.port);
-    let stream = TcpStream::connect(format!("{}:{}", conn.host, tcp_port))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to {}:{}: {e}", conn.host, tcp_port))?;
-    let (mut read_half, mut write_half) = stream.into_split();
+    let (mut read_half, mut write_half) = super::connect_authenticated(&conn).await?;
 
-    super::authenticate(&mut read_half, &mut write_half, conn.token).await?;
-
+    // Not `request_reply`: this is a stream, not a request. The daemon answers
+    // with many `LogChunk`s and (unless following) a terminating `LogEnd`, so
+    // the loop below has to keep reading past the first recognised reply.
     const REQ: u64 = 1;
     write_frame(
         &mut write_half,
