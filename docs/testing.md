@@ -166,14 +166,20 @@ Measured 2026-08-15:
 
 | Rule | At branch start | Now | Target |
 | --- | --- | --- | --- |
-| R3 — no process-global env mutation | 91 sites / 13 files | **78 / 12** | 0 |
-| R3/R13 — no test-only lock | 98 sites / 10 files | **88 / 9** | 0 |
+| R3 — no process-global env mutation | 91 sites / 13 files | **50 / 11** | 0 |
+| R3/R13 — no test-only lock | 98 sites / 10 files | **73 / 8** | 0 |
 | R4 — no function over 100 lines | 45 (largest 888 lines) | 45 | 0, minus the exceptions register |
 | R5 — no double in a release build | 2 (`kmux-pty`'s `pub mod mock`) | 2 | 0 |
 
-`kmux-protocol`'s `dirs` module is the first to reach zero on R3 and R13: the
-`Dirs` value replaced twelve unsafe environment overwrites and the module's own
-lock, and its tests went from 8 serialised to 17 parallel-safe ones.
+Two modules have reached zero on R3 and R13, both by the same move — take the
+thing the test needs to vary as a parameter:
+
+- `kmux-protocol::dirs` — the `Dirs` value replaced twelve unsafe environment
+  overwrites and the module's own lock; 8 serialised tests became 17
+  parallel-safe ones.
+- `kmux-app::config` — the eight resolvers now take `&KmuxConfig`, so a test
+  constructs a config value instead of writing a file and pointing
+  `XDG_CONFIG_HOME` at it; 28 tests became 32, all parallel-safe.
 
 These are budgets, not aspirations: each one is recorded in
 `quality-baseline.toml` and may only shrink. CI fails both when a count rises
