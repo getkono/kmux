@@ -69,3 +69,10 @@ serde_json.workspace = true
 
 [lints]
 workspace = true
+
+# serde_bytes is used through `#[serde(with = "serde_bytes")]` -- a string
+# literal in an attribute, not a `use`, so cargo-machete cannot see it. Dropping
+# it would silently re-encode every byte-slice field as an array of integers,
+# which is a wire-format change.
+[package.metadata.cargo-machete]
+ignored = ["serde_bytes"]

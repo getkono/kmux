@@ -39,18 +39,28 @@ implementations of this pattern.
 
 **R4 — no dead declarations.** A `[workspace.dependencies]` entry that no member
 references is a defect, and so is a member declaration the crate's source never
-names. Both are checked in [Auditing](#auditing) and both are currently at zero.
+names. Enforced by `mise run deps-audit` (cargo-machete) plus one grep; see
+[Auditing](#auditing). Both are at zero.
 
 **R5 — layering is a dependency rule, not a convention.** Nothing at or below
 `kmux-app` may depend on a UI toolkit; `kmux-protocol` depends on no internal
-crate; the graph stays acyclic. See
-[The workspace](#the-workspace) and
+crate; the graph stays acyclic. **Enforced** by
+`xtask/tests/dependency_direction.rs`, which reads the `cargo metadata` resolve
+graph and prints the shortest offending path on failure — this rule spent
+months as a true statement nothing checked. It rides `mise run test`. See
+[The workspace](#the-workspace),
+[docs/quality-gates.md](quality-gates.md) and
 [docs/architecture-frontend.md](architecture-frontend.md#layering).
 
 **R6 — anything crossing a process or ABI boundary is versioned.** New
 dependencies do not get to bypass the compatibility contracts listed under
 *Correctness* in [AGENTS.md](../AGENTS.md) — the data protocol, the `kmux-ffi` C
 ABI, the daemon↔worker contract, and `kmux-ghostty-sys`.
+
+**R7 — a third-party licence or advisory is a gate, not a footnote.** Every
+dependency's licence must be on the allow-list in `deny.toml`, and a RUSTSEC
+advisory is a build failure until it is either fixed or written down there with
+a reason. Enforced by `mise run deps-audit`.
 
 ## The workspace
 
@@ -303,8 +313,24 @@ pinned toolchain in `rust-toolchain.toml`. Releases do not touch
 
 ### Auditing
 
-No dedicated tooling is wired up. These three checks cover R1 and R4, run from
-the repository root, and all three are expected to print nothing:
+`mise run deps-audit` is the check that runs in CI. It is two tools:
+
+* **cargo-deny** (`deny.toml`) — third-party licence compatibility and RUSTSEC
+  advisories. The dual `AGPL-3.0-only OR LicenseRef-Commercial` licence makes
+  the first a commercial requirement rather than hygiene, and a daemon that
+  speaks QUIC and TLS to the network has no business carrying an unchecked
+  rustls/ring/quinn tree. The first run found three live vulnerabilities.
+* **cargo-machete** — a declared dependency whose crate never uses it. This
+  replaces the R4b grep below, which was a *name* check: it proved a crate was
+  mentioned somewhere, so a dependency named only in a comment passed. Its
+  first run found `kmux-ghostty` declared by `kmuxd` and used by nothing.
+  cargo-machete reads `use` statements, so a dependency used any other way —
+  `#[serde(with = "…")]`, or purely for its build-script metadata — needs a
+  `[package.metadata.cargo-machete] ignored = […]` entry in that manifest with
+  a comment saying why. Three exist today and each one says which.
+
+Two checks have no tool and are still greps, run from the repository root, both
+expected to print nothing:
 
 ```sh
 # R1 — a member declaring an inline version instead of `.workspace = true`.
@@ -318,22 +344,7 @@ awk '/^\[workspace.dependencies\]/{f=1;next} /^\[/{f=0} f && /^[a-zA-Z0-9_-]+ *=
   while read -r d; do
     grep -qE "^ *$d(\.workspace)? *=" crates/*/Cargo.toml || echo "dead: $d"
   done
-
-# R4b — a declared dependency its crate's source never names.
-for m in crates/*/Cargo.toml; do d=$(dirname "$m")
-  awk '/^\[/{f=($0 ~ /dependencies\]/)} f && /^[a-zA-Z0-9_-]+ *=/ \
-    {sub(/ *=.*/,"");sub(/\.workspace$/,"");print}' "$m" |
-    grep -v '^kmux' | sort -u | while read -r c; do
-      git grep -qw "$(echo "$c" | tr - _)" -- "$d" ":(exclude)$d/Cargo.toml" ||
-        echo "unused: $(basename "$d")/$c"
-    done
-done
 ```
-
-R4b is a name check, not a compiler check: it proves the crate is *mentioned*,
-which is enough to catch a stale declaration but will pass a dependency that is
-named only in a comment. Confirm a removal with `mise run clippy` and
-`mise run test`.
 
 `cargo tree -p <crate>` and `cargo tree -i <dep>` answer "who pulls this in?"
 when a lockfile diff is larger than expected.

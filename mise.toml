@@ -30,6 +30,8 @@ hk = "1.48.0"
 # it vendors libgit2 with no openssl/system deps (just a C compiler); mise caches
 # the compiled binary like cargo-mutants above.
 "cargo:convco" = "0.6.4"
+"aqua:EmbarkStudios/cargo-deny" = "0.18.5"
+"cargo:cargo-machete" = "0.9.1"
 
 [settings]
 # Required for the `[hooks]` block below (mise gates hooks behind this flag).
@@ -136,4 +138,20 @@ description = "Initialize the ghostty submodule + install hk's git hooks (fallba
 run = [
   "git submodule update --init --recursive",
   "hk install",
+]
+
+[tasks.lint-flags]
+description = "Print the --force-warn flags for the ratcheted lints (used by lint-gate)"
+run = "cargo run -q -p xtask -- lint-flags"
+
+[tasks.deps-audit]
+description = "Third-party dependency hygiene: licenses + advisories (cargo-deny) and unused deps (cargo-machete)"
+# cargo-deny covers what the dual AGPL/commercial license makes a commercial
+# requirement (third-party license compatibility) and what nothing checked
+# before (RUSTSEC advisories against a rustls/ring/quinn tree). cargo-machete
+# replaces the name-grep audit docs/crate-usage.md itself admits "is a name
+# check, not a compiler check".
+run = [
+  "cargo deny check",
+  "cargo machete --with-metadata",
 ]
