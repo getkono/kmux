@@ -417,17 +417,26 @@ impl Drop for SocketGuard {
 
 /// Whether a daemon is actually listening on `path`.
 ///
-/// A connect that succeeds means someone is accepting; `ECONNREFUSED` means the
-/// file outlived its daemon. Any other error is treated as live, because
-/// removing a socket we could not prove dead is the failure with teeth.
+/// Only a successful connect proves it. Two failures still mean "someone is
+/// there": `EAGAIN`, which a Unix socket returns when its accept backlog is
+/// full, and `EPERM`/`EACCES`, which means a socket we are not allowed to talk
+/// to. Everything else — refused, missing, or not a socket at all — means
+/// nothing is serving this path.
 ///
-/// Blocking, deliberately: both callers are lifecycle moments (binding at
-/// startup, cleaning up on exit) and one of them is a `Drop`, which cannot
+/// That last case is why this cannot be "any error other than refused is live".
+/// A regular file left at the socket path answers `ECONNREFUSED` on Linux and
+/// `ENOTSOCK` on macOS; treating the unfamiliar errno as liveness made the
+/// daemon refuse to start forever behind a stale file. CI caught it, on the
+/// platform this machine is not.
+///
+/// Blocking, deliberately: both callers are lifecycle moments — binding at
+/// startup and cleaning up on exit — and one of them is a `Drop`, which cannot
 /// await. Connecting to a Unix socket does not wait on the network.
 fn socket_is_live(path: &Path) -> bool {
+    use std::io::ErrorKind::{PermissionDenied, WouldBlock};
     match std::os::unix::net::UnixStream::connect(path) {
         Ok(_) => true,
-        Err(e) => e.kind() != std::io::ErrorKind::ConnectionRefused,
+        Err(e) => matches!(e.kind(), WouldBlock | PermissionDenied),
     }
 }
 
@@ -595,14 +604,29 @@ mod tests {
         assert_eq!(pid_file_pid(&pid), Some(222));
     }
 
+    /// Everything that is *not* a daemon accepting connections. The plain-file
+    /// case is the one that matters and the one that differs by platform: Linux
+    /// answers `ECONNREFUSED`, macOS `ENOTSOCK`, and a classification that keyed
+    /// on "refused" alone made a stale file block startup forever on macOS.
     #[test]
-    fn a_socket_with_nothing_behind_it_is_not_live() {
+    fn nothing_serving_a_path_is_not_live_whatever_the_errno() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        // A plain file at the socket path: connecting to it cannot succeed, and
-        // it is exactly what a killed daemon leaves behind.
-        let stale = tmp.path().join("stale.sock");
-        std::fs::write(&stale, b"").expect("write");
-        assert!(!socket_is_live(&stale));
+
+        let missing = tmp.path().join("never-existed.sock");
+        assert!(!socket_is_live(&missing), "no such file");
+
+        let plain_file = tmp.path().join("stale.sock");
+        std::fs::write(&plain_file, b"").expect("write");
+        assert!(!socket_is_live(&plain_file), "a regular file, not a socket");
+
+        let directory = tmp.path().join("a-directory");
+        std::fs::create_dir(&directory).expect("mkdir");
+        assert!(!socket_is_live(&directory), "a directory");
+
+        // A socket whose listener is gone: what a killed daemon leaves behind.
+        let orphan = tmp.path().join("orphan.sock");
+        drop(std::os::unix::net::UnixListener::bind(&orphan).expect("bind"));
+        assert!(!socket_is_live(&orphan), "a socket with no listener");
     }
 
     #[test]
