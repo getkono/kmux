@@ -171,7 +171,7 @@ Measured 2026-08-22:
 | --- | --- | --- | --- |
 | R3 — no process-global env mutation | 91 sites / 13 files | **5 / 3** | 0 |
 | R3/R13 — no test-only lock | 98 sites / 10 files | **0 / 0** | 0 — reached |
-| R4 — no function over 100 lines | 45 (largest 888 lines) | 43 (largest 261, a dispatch table) | 0, minus the exceptions register |
+| R4 — no function over 100 lines | 45 (largest 888 lines) | 45 (largest 394, a registered exception) | 0, minus the exceptions register |
 | R5 — no double in a release build | 2 (`kmux-pty`'s `pub mod mock`) | **0** | 0 — reached |
 | R12 — mutation score is the coverage bar | 3 crates fabricated, 5 never swept | scoring fixed; **no trustworthy sweep yet** | a recorded `[[mutants]]` budget per crate |
 
@@ -194,6 +194,17 @@ The five remaining R3 sites are three unit tests that point one XDG variable at
 a tempdir to exercise a path resolver, and one that clears two impairment knobs.
 Each is a single-variable read in the code under test rather than a whole
 subsystem's worth of state; they are listed in Known exceptions.
+
+R4's count did not fall, and that is the honest reading: the three god
+dispatchers were split, but what each leaves behind is a flat, exhaustive
+`match` that is still over 100 lines — 378 for `handle_server_message`, 260 for
+`handle_message`, 180 for `dispatch_action`. Keeping them flat is deliberate:
+exhaustiveness is what makes adding a message variant fail the build until
+someone decides what to do with it, and delegating to per-domain sub-routers
+would trade that for a shorter function. What moved is what the lint is
+actually a proxy for — logic per function. `handle_server_message` went from
+761 lines of reconciliation to a table over 52 named handlers, and the
+mutants that stand for "this message does nothing" went from 2 to 104.
 
 R12 is the one row that is not yet a number. The scoring bug is fixed and the
 believability check is in place, but a full sweep takes hours and none has run
