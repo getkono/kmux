@@ -969,8 +969,14 @@ impl SessionManager {
                     self.attach_fresh(pane);
                 }
                 None => {
+                    // Nothing left to show. The viewed tab and its attached set
+                    // must go with the session, or the client keeps rendering a
+                    // tab of a session it no longer considers active — and
+                    // `visible_panes` keeps naming the pane just forgotten.
                     self.active_session = None;
                     self.active_pane = None;
+                    self.active_tab = None;
+                    self.visible_panes.clear();
                 }
             }
         }
@@ -1504,11 +1510,12 @@ mod tests {
         );
         assert_eq!(mgr.active_session(), None);
         assert_eq!(mgr.active_pane_id(), None);
-        // SUSPECT: `active_tab` and `visible_panes` are left pointing at the
-        // session that just lost its last pane, so the client still believes it
-        // is viewing tab 0 of a session it no longer considers active.
-        assert_eq!(mgr.active_tab(), Some(0));
-        assert_eq!(mgr.visible_panes(), ["eagle/0"]);
+        // The viewed tab and its attached set go with the session: nothing is
+        // left to render, and `visible_panes` must not name the pane the same
+        // message just forgot.
+        assert_eq!(mgr.active_tab(), None);
+        assert!(mgr.visible_panes().is_empty());
+        assert!(mgr.render_layout().is_none(), "there is nothing to draw");
     }
 
     // ── TabCreated ──────────────────────────────────────────────────────────
