@@ -264,7 +264,28 @@ impl ServerApp {
                             None => {
                                 // Registered but unsplittable — drop it and fall
                                 // through to respawn so the pane is not lost.
-                                let _ = self.manager.close(pane_id).await;
+                                //
+                                // The child on the other end of this fd is the
+                                // user's live shell, inherited across a daemon
+                                // upgrade. If the close does not take, falling
+                                // through respawns a *second* shell for the same
+                                // pane and the first keeps running with nothing
+                                // holding it — detached, invisible, and for as
+                                // long as the machine is up. So the failure is
+                                // reported and the pid is killed directly.
+                                if let Err(e) = self.manager.close(pane_id).await {
+                                    warn!(
+                                        pane_id,
+                                        %e,
+                                        "restore: could not close an unsplittable \
+                                         inherited pane; killing its child directly \
+                                         so the respawn below does not orphan it"
+                                    );
+                                    let _ = nix::sys::signal::kill(
+                                        pid,
+                                        nix::sys::signal::Signal::SIGKILL,
+                                    );
+                                }
                             }
                         }
                     }
