@@ -883,6 +883,13 @@ impl SessionManager {
             ServerMessage::ClientKicked {
                 word_id, client_id, ..
             } => {
+                // The daemon acks the kick and pushes no refreshed list, so the
+                // connected-clients view would keep the row until its own ~1 Hz
+                // poll came round — a visible lag that reads as a failed kick.
+                // The ack is authoritative for the session it names.
+                if self.client_list_word.as_deref() == Some(word_id.as_str()) {
+                    self.client_list.retain(|c| c.client_id != client_id);
+                }
                 events.push(SessionEvent::ClientKicked { word_id, client_id });
             }
 
@@ -2785,6 +2792,25 @@ mod tests {
 
     // ── ClientListResult / ClientKicked / SessionKicked ─────────────────────
 
+    /// One connected-clients row, labelled `user{id}@host`.
+    fn sample_client(id: u64) -> ClientInfo {
+        ClientInfo {
+            client_id: ClientId(id),
+            connection_id: ConnectionId(id + 1),
+            label: format!("user{id}@host"),
+            machine_id: "abcd".to_string(),
+            hostname: "host".to_string(),
+            username: format!("user{id}"),
+            transport: "uds".to_string(),
+            attached_panes: vec![],
+            uptime_secs: 5,
+            is_self: false,
+            frontend: FrontendKind::Cli,
+            build: String::new(),
+            build_profile: String::new(),
+        }
+    }
+
     #[test]
     fn client_list_result_caches_the_clients_and_names_the_session() {
         let mut mgr = make_manager();
@@ -2793,19 +2819,10 @@ mod tests {
             request_id: 12,
             word_id: "eagle".to_string(),
             clients: vec![ClientInfo {
-                client_id: ClientId(1),
-                connection_id: ConnectionId(2),
-                label: "user@host".to_string(),
-                machine_id: "abcd".to_string(),
-                hostname: "host".to_string(),
-                username: "user".to_string(),
-                transport: "uds".to_string(),
                 attached_panes: vec![0],
-                uptime_secs: 5,
                 is_self: true,
-                frontend: FrontendKind::Cli,
-                build: String::new(),
-                build_profile: String::new(),
+                label: "user@host".to_string(),
+                ..sample_client(1)
             }],
         });
 
@@ -2821,25 +2838,17 @@ mod tests {
         assert_eq!(mgr.client_list_word.as_deref(), Some("eagle"));
     }
 
-    #[test]
-    fn client_kicked_acks_the_kick_without_pruning_the_cached_client_list() {
+    /// A manager whose cached client list for `word_id` holds `ids`.
+    fn manager_with_client_list(word_id: &str, ids: &[u64]) -> SessionManager {
         let mut mgr = make_manager();
-        mgr.client_list_word = Some("eagle".to_string());
-        mgr.client_list.push(ClientInfo {
-            client_id: ClientId(1),
-            connection_id: ConnectionId(2),
-            label: "user@host".to_string(),
-            machine_id: "abcd".to_string(),
-            hostname: "host".to_string(),
-            username: "user".to_string(),
-            transport: "uds".to_string(),
-            attached_panes: vec![],
-            uptime_secs: 5,
-            is_self: false,
-            frontend: FrontendKind::Cli,
-            build: String::new(),
-            build_profile: String::new(),
-        });
+        mgr.client_list_word = Some(word_id.to_string());
+        mgr.client_list = ids.iter().map(|id| sample_client(*id)).collect();
+        mgr
+    }
+
+    #[test]
+    fn client_kicked_prunes_the_kicked_connection_from_the_cached_list() {
+        let mut mgr = manager_with_client_list("eagle", &[1, 2]);
 
         let events = mgr.handle_server_message(ServerMessage::ClientKicked {
             request_id: 13,
@@ -2855,11 +2864,29 @@ mod tests {
             ),
             "{events:?}"
         );
-        // SUSPECT: the kicked connection stays in the cached `client_list`, so the
-        // connected-clients view keeps showing it until the caller happens to
-        // re-issue `request_client_list`.
-        assert_eq!(mgr.client_list.len(), 1);
-        assert_eq!(mgr.client_list[0].client_id, ClientId(1));
+        assert_eq!(
+            mgr.client_list
+                .iter()
+                .map(|c| c.client_id)
+                .collect::<Vec<_>>(),
+            vec![ClientId(2)],
+            "the row goes as soon as the kick is acked, not on the next poll"
+        );
+    }
+
+    #[test]
+    fn client_kicked_for_another_session_leaves_the_cached_list_alone() {
+        // The cache is scoped to one `client_list_word`; a `ClientId` is only
+        // meaningful next to the session the list was fetched for.
+        let mut mgr = manager_with_client_list("eagle", &[1, 2]);
+
+        mgr.handle_server_message(ServerMessage::ClientKicked {
+            request_id: 14,
+            word_id: "otter".to_string(),
+            client_id: ClientId(1),
+        });
+
+        assert_eq!(mgr.client_list.len(), 2);
     }
 
     #[test]
