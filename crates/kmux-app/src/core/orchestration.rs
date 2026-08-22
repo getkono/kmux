@@ -1236,6 +1236,70 @@ mod tests {
     }
 
     #[test]
+    fn peer_error_on_the_bootstrap_target_still_disconnects_globally() {
+        // The CLI `--server` peer failing during the initial bootstrap is the one
+        // attributed failure with nowhere to fall back to.
+        let mut core = fixture_core();
+        core.mode = Mode::Connecting {
+            target_display: "box".into(),
+        };
+        let target = PeerTarget::Ssh {
+            user: Some("alice".into()),
+            host: "box".into(),
+            ssh_port: None,
+            accept_invalid_certs: false,
+        };
+        let peer_id = target.peer_id();
+        core.desired_peer = Some(target);
+
+        core.handle_session_events(vec![SessionEvent::PeerError {
+            peer: Some(peer_id.clone()),
+            reason: "ssh: auth failed".into(),
+        }]);
+
+        match &core.mode {
+            Mode::Disconnected { reason } => assert!(reason.contains("ssh: auth failed")),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+        assert!(
+            !core.peer_status.contains_key(&peer_id),
+            "a global disconnect does not also mark the row"
+        );
+    }
+
+    #[test]
+    fn peer_error_on_another_peer_while_bootstrapping_stays_isolated() {
+        // Bootstrapping alone is not enough: only the peer the bootstrap is
+        // *waiting on* tears the client down. Any other remote failing at the
+        // same time is still just a bad row in the launcher.
+        let mut core = fixture_core();
+        core.mode = Mode::Connecting {
+            target_display: "box".into(),
+        };
+        core.desired_peer = Some(PeerTarget::Ssh {
+            user: Some("alice".into()),
+            host: "box".into(),
+            ssh_port: None,
+            accept_invalid_certs: false,
+        });
+
+        core.handle_session_events(vec![SessionEvent::PeerError {
+            peer: Some("bob@other".into()),
+            reason: "ssh: connect timeout".into(),
+        }]);
+
+        assert!(
+            !matches!(core.mode, Mode::Disconnected { .. }),
+            "an unrelated remote must not abort the bootstrap: {:?}",
+            core.mode
+        );
+        assert_eq!(
+            core.peer_status.get("bob@other"),
+            Some(&RemoteStatus::Error("ssh: connect timeout".into()))
+        );
+    }
+
+    #[test]
     fn unattributed_peer_error_surfaces_as_a_global_disconnect() {
         let mut core = fixture_core();
         // No peer attribution ⇒ the legacy global disconnect.

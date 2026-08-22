@@ -2343,6 +2343,67 @@ mod tests {
     }
 
     #[test]
+    fn a_pane_close_is_reconciled_from_any_one_trace_of_the_pane() {
+        // "Does the client still know this pane" is a disjunction over three
+        // maps, and the traces come and go independently: a pane listed in a
+        // `SessionEntry` may have no grid yet (nothing has attached), while a
+        // pane being resynced has a grid and sync state but was already pruned
+        // from the entry. Each one alone has to be enough, or a close arriving
+        // in that window is silently dropped.
+        let mut only_cached = make_manager();
+        only_cached.session_list.push(make_entry("eagle"));
+        assert!(
+            only_cached
+                .handle_server_message(ServerMessage::Event {
+                    event: SessionEventMsg::PaneClosed {
+                        pane_id: "eagle/0".to_string(),
+                    },
+                })
+                .len()
+                == 1,
+            "a pane known only from the session entry is still reconciled"
+        );
+        assert!(only_cached.session_list[0].panes.is_empty());
+
+        let mut only_buffered = make_manager();
+        only_buffered
+            .buffers
+            .insert("eagle/0".to_string(), CellGrid::new(4, 8));
+        assert!(
+            only_buffered
+                .handle_server_message(ServerMessage::Event {
+                    event: SessionEventMsg::PaneClosed {
+                        pane_id: "eagle/0".to_string(),
+                    },
+                })
+                .len()
+                == 1,
+            "a pane known only by its grid is still reconciled"
+        );
+        assert!(only_buffered.buffer("eagle/0").is_none());
+
+        let mut only_synced = make_manager();
+        only_synced.pane_sync.insert(
+            "eagle/0".to_string(),
+            PaneSync::Synced {
+                expected: SequenceNo(1),
+            },
+        );
+        assert!(
+            only_synced
+                .handle_server_message(ServerMessage::Event {
+                    event: SessionEventMsg::PaneClosed {
+                        pane_id: "eagle/0".to_string(),
+                    },
+                })
+                .len()
+                == 1,
+            "a pane known only by its sync state is still reconciled"
+        );
+        assert!(!only_synced.pane_sync.contains_key("eagle/0"));
+    }
+
+    #[test]
     fn a_session_closed_event_drops_the_session_exactly_as_the_reply_does() {
         let (mut mgr, _rx) = manager_on("eagle");
         synced_pane(&mut mgr, "eagle/0", 1);
@@ -2411,6 +2472,87 @@ mod tests {
         );
         assert_eq!(mgr.active_tab(), Some(0), "the view moves to the survivor");
         assert_eq!(mgr.visible_panes(), ["eagle/0"]);
+    }
+
+    /// A manager on `eagle` with tabs 0 and 1, viewing whichever `viewing` names.
+    fn manager_on_two_tabs(viewing: u32) -> SessionManager {
+        let (mut mgr, _rx) = manager_on("eagle");
+        mgr.session_list[0].panes.push(pane("eagle", 1));
+        mgr.session_list[0]
+            .tabs
+            .push(tab(1, LayoutNode::single(1), 1));
+        mgr.select_tab(viewing);
+        mgr
+    }
+
+    #[test]
+    fn closing_a_tab_that_is_not_being_viewed_leaves_the_view_where_it_is() {
+        // Only the tab actually on screen moves the view. Reacting to any close
+        // in the session would teleport a user out of the tab they are working
+        // in every time another client closed a background one.
+        let mut mgr = manager_on_two_tabs(1);
+
+        mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::TabClosed {
+                word_id: "eagle".to_string(),
+                tab_index: 0,
+            },
+        });
+
+        assert_eq!(mgr.active_tab(), Some(1), "the viewed tab is untouched");
+        assert_eq!(mgr.visible_panes(), ["eagle/1"]);
+        assert!(mgr.buffer("eagle/0").is_none(), "but tab 0's pane is gone");
+    }
+
+    #[test]
+    fn closing_a_tab_in_a_session_that_is_not_being_viewed_leaves_the_view_alone() {
+        let mut mgr = manager_on_two_tabs(0);
+        let mut other = make_entry("otter");
+        other.tabs.push(tab(1, LayoutNode::single(1), 1));
+        other.panes.push(pane("otter", 1));
+        mgr.session_list.push(other);
+
+        mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::TabClosed {
+                word_id: "otter".to_string(),
+                // Deliberately the same index this client is viewing in `eagle`:
+                // the session has to be checked as well, not just the index.
+                tab_index: 0,
+            },
+        });
+
+        assert_eq!(mgr.active_session(), Some("eagle"));
+        assert_eq!(mgr.active_tab(), Some(0), "the viewed tab is untouched");
+        assert_eq!(mgr.visible_panes(), ["eagle/0"]);
+        assert_eq!(
+            mgr.session_list[1]
+                .tabs
+                .iter()
+                .map(|t| t.tab_index)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "the other session's tab is still pruned"
+        );
+    }
+
+    #[test]
+    fn closing_a_background_tab_does_not_move_the_cached_active_tab() {
+        // `entry.active_tab` is the *session's* remembered tab, repaired only
+        // when the tab it names is the one that died.
+        let mut mgr = manager_on_two_tabs(0);
+        mgr.session_list[0].active_tab = 1;
+
+        mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::TabClosed {
+                word_id: "eagle".to_string(),
+                tab_index: 0,
+            },
+        });
+
+        assert_eq!(
+            mgr.session_list[0].active_tab, 1,
+            "a tab that was not the session's active one leaves it alone"
+        );
     }
 
     #[test]
