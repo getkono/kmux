@@ -290,7 +290,7 @@ impl From<FrontendEffect> for FfiEffect {
 /// A curated, toolkit-agnostic [`Action`] the frontend can dispatch by name.
 /// (The full `Action` vocabulary — per-character command-palette editing, modal
 /// keymap actions, … — is internal; a GUI binds widgets/accelerators to these.)
-#[derive(uniffi::Enum)]
+#[derive(uniffi::Enum, Debug, Clone, PartialEq, Eq)]
 pub enum FfiAction {
     CreateSession,
     CloseSession,
@@ -465,7 +465,7 @@ impl FfiKeyMods {
 /// [`KmuxDriver::send_char`]. Mirrors the named arm of the GTK frontend's
 /// `convert_to_protocol_key`. The daemon turns the resulting [`KeyEvent`] into
 /// bytes under the live terminal mode (DECCKM, kitty kbd, modifyOtherKeys).
-#[derive(uniffi::Enum)]
+#[derive(uniffi::Enum, Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FfiNamedKey {
     Enter,
     Tab,
@@ -496,7 +496,7 @@ pub enum FfiNamedKey {
 }
 
 impl FfiNamedKey {
-    fn to_code(&self) -> KeyCode {
+    fn to_code(self) -> KeyCode {
         match self {
             Self::Enter => KeyCode::Enter,
             Self::Tab => KeyCode::Tab,
@@ -3243,19 +3243,6 @@ mod tests {
     }
 
     #[test]
-    fn named_key_codes_match_protocol() {
-        assert_eq!(FfiNamedKey::Enter.to_code(), KeyCode::Enter);
-        assert_eq!(FfiNamedKey::Tab.to_code(), KeyCode::Tab);
-        assert_eq!(FfiNamedKey::Backspace.to_code(), KeyCode::Backspace);
-        assert_eq!(FfiNamedKey::Escape.to_code(), KeyCode::Escape);
-        assert_eq!(FfiNamedKey::ArrowUp.to_code(), KeyCode::ArrowUp);
-        assert_eq!(FfiNamedKey::ArrowRight.to_code(), KeyCode::ArrowRight);
-        assert_eq!(FfiNamedKey::PageDown.to_code(), KeyCode::PageDown);
-        assert_eq!(FfiNamedKey::F5.to_code(), KeyCode::F5);
-        assert_eq!(FfiNamedKey::F12.to_code(), KeyCode::F12);
-    }
-
-    #[test]
     fn key_mods_map_to_proto_bits() {
         let none = FfiKeyMods {
             shift: false,
@@ -3298,22 +3285,6 @@ mod tests {
         assert_eq!(tab_label(2, "   ", "   "), "3");
         assert_eq!(tab_label(0, "build", "vim"), "build");
         assert_eq!(tab_label(0, "", "vim"), "vim");
-    }
-
-    #[test]
-    fn toggle_pause_action_maps_to_core_action() {
-        assert!(matches!(
-            Action::from(FfiAction::TogglePause),
-            Action::TogglePause
-        ));
-        assert!(matches!(
-            Action::from(FfiAction::ToggleFocusedPaneNoAutoPause),
-            Action::ToggleFocusedPaneNoAutoPause
-        ));
-        assert!(matches!(
-            Action::from(FfiAction::ToggleActiveSessionNoAutoPause),
-            Action::ToggleActiveSessionNoAutoPause
-        ));
     }
 
     #[test]
@@ -3386,6 +3357,194 @@ mod tests {
         assert!(kmux_cursor_rects(0, 0, 4, 10, 5, 8.0, 16.0).is_empty());
         // And a code from a build that knows more shapes than this one.
         assert!(kmux_cursor_rects(0, 0, 200, 10, 5, 8.0, 16.0).is_empty());
+    }
+
+    // ─── Boundary parity ─────────────────────────────────────────────────────
+    //
+    // Both conversions below are one `match` of dozens of same-named arms, which
+    // is the shape a copy-paste transposes: `ArrowUp => ArrowDown` compiles, type
+    // checks, and silently breaks a key on macOS only. Rather than restate the
+    // mapping by hand — a second copy to transpose — these assert two properties
+    // the correct mapping has and a transposed one does not:
+    //
+    //   * **injectivity** — no two inputs land on the same output, so a
+    //     duplicated right-hand side is caught wherever it is;
+    //   * **name agreement** — each variant maps to the identically-named one,
+    //     which is the mapping's entire rule.
+    //
+    // A new variant added to either enum has to be added here too; the lists are
+    // the one place the test is not self-maintaining, so they are kept in source
+    // order to make a diff against the enum obvious.
+
+    /// Every [`FfiNamedKey`], in the order the enum declares them.
+    fn all_named_keys() -> Vec<FfiNamedKey> {
+        vec![
+            FfiNamedKey::Enter,
+            FfiNamedKey::Tab,
+            FfiNamedKey::Backspace,
+            FfiNamedKey::Escape,
+            FfiNamedKey::ArrowUp,
+            FfiNamedKey::ArrowDown,
+            FfiNamedKey::ArrowLeft,
+            FfiNamedKey::ArrowRight,
+            FfiNamedKey::PageUp,
+            FfiNamedKey::PageDown,
+            FfiNamedKey::Home,
+            FfiNamedKey::End,
+            FfiNamedKey::Delete,
+            FfiNamedKey::Insert,
+            FfiNamedKey::F1,
+            FfiNamedKey::F2,
+            FfiNamedKey::F3,
+            FfiNamedKey::F4,
+            FfiNamedKey::F5,
+            FfiNamedKey::F6,
+            FfiNamedKey::F7,
+            FfiNamedKey::F8,
+            FfiNamedKey::F9,
+            FfiNamedKey::F10,
+            FfiNamedKey::F11,
+            FfiNamedKey::F12,
+        ]
+    }
+
+    #[test]
+    fn every_named_key_maps_to_the_key_code_of_the_same_name() {
+        let keys = all_named_keys();
+        assert_eq!(keys.len(), 26, "a variant was added to FfiNamedKey");
+
+        for key in &keys {
+            assert_eq!(
+                format!("{key:?}"),
+                format!("{:?}", key.to_code()),
+                "{key:?} maps to a differently-named key code"
+            );
+        }
+    }
+
+    /// The other half. Name agreement catches a *swap* (`ArrowUp => ArrowDown`
+    /// and back); injectivity catches a *duplicate* (both arms landing on
+    /// `ArrowDown`), which a swap-only check would pass. Neither subsumes the
+    /// other, so both are here.
+    #[test]
+    fn no_two_named_keys_share_a_key_code() {
+        let mut seen: Vec<String> = all_named_keys()
+            .iter()
+            .map(|k| format!("{:?}", k.to_code()))
+            .collect();
+        let total = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(seen.len(), total, "two named keys map to the same key code");
+    }
+
+    /// Every [`FfiAction`] that carries no payload, in declaration order. The
+    /// four that do are asserted separately, since their names cannot match.
+    fn all_unit_actions() -> Vec<FfiAction> {
+        vec![
+            FfiAction::CreateSession,
+            FfiAction::CloseSession,
+            FfiAction::NextSession,
+            FfiAction::PrevSession,
+            FfiAction::CreatePane,
+            FfiAction::ClosePane,
+            FfiAction::UndoClose,
+            FfiAction::NextTab,
+            FfiAction::PrevTab,
+            FfiAction::NextPaneInTab,
+            FfiAction::PrevPaneInTab,
+            FfiAction::CloseTab,
+            FfiAction::RenameTab,
+            FfiAction::SplitRight,
+            FfiAction::SplitDown,
+            FfiAction::FocusLeft,
+            FfiAction::FocusRight,
+            FfiAction::FocusUp,
+            FfiAction::FocusDown,
+            FfiAction::ResizeLeft,
+            FfiAction::ResizeRight,
+            FfiAction::ResizeUp,
+            FfiAction::ResizeDown,
+            FfiAction::SwapNext,
+            FfiAction::SwapPrev,
+            FfiAction::CycleLayout,
+            FfiAction::ToggleZoom,
+            FfiAction::ScrollPageUp,
+            FfiAction::ScrollPageDown,
+            FfiAction::ToggleHud,
+            FfiAction::ToggleMetrics,
+            FfiAction::ToggleProcessOverview,
+            FfiAction::ToggleConnectedClients,
+            FfiAction::ToggleConnection,
+            FfiAction::ToggleRenderDebug,
+            FfiAction::ResetRenderer,
+            FfiAction::ToggleInputLock,
+            FfiAction::TogglePause,
+            FfiAction::ToggleFocusedPaneNoAutoPause,
+            FfiAction::ToggleActiveSessionNoAutoPause,
+            FfiAction::CopySelection,
+            FfiAction::Paste,
+            FfiAction::Quit,
+            FfiAction::Reconnect,
+        ]
+    }
+
+    #[test]
+    fn every_payload_free_action_maps_to_the_core_action_of_the_same_name() {
+        let actions = all_unit_actions();
+        assert_eq!(
+            actions.len(),
+            44,
+            "a payload-free variant was added to FfiAction"
+        );
+
+        for action in actions {
+            let name = format!("{action:?}");
+            let core: Action = action.into();
+            assert_eq!(
+                name,
+                format!("{core:?}"),
+                "{name} maps to a differently-named action"
+            );
+        }
+    }
+
+    #[test]
+    fn no_two_actions_share_a_core_action() {
+        let mut seen: Vec<String> = all_unit_actions()
+            .into_iter()
+            .map(|a| format!("{:?}", Action::from(a)))
+            .collect();
+        let total = seen.len();
+        seen.sort_unstable();
+        seen.dedup();
+        assert_eq!(
+            seen.len(),
+            total,
+            "two FFI actions map to the same core action"
+        );
+    }
+
+    /// The four that carry a payload: the value has to survive, and the widening
+    /// or narrowing has to be the right one.
+    #[test]
+    fn actions_carrying_a_payload_pass_it_through() {
+        assert_eq!(
+            Action::from(FfiAction::JumpToSession { index: 7 }),
+            Action::JumpToSession(7)
+        );
+        assert_eq!(
+            Action::from(FfiAction::FocusPaneAt { index: 3 }),
+            Action::FocusPaneAt(3)
+        );
+        assert_eq!(
+            Action::from(FfiAction::ScrollUp { lines: 12 }),
+            Action::ScrollUp(12)
+        );
+        assert_eq!(
+            Action::from(FfiAction::ScrollDown { lines: 12 }),
+            Action::ScrollDown(12)
+        );
     }
 
     #[test]
@@ -3495,27 +3654,6 @@ mod tests {
                 value
             } if value == 10.0
         ));
-    }
-
-    #[test]
-    fn tiling_actions_map_to_core_actions() {
-        assert_eq!(Action::from(FfiAction::SplitRight), Action::SplitRight);
-        assert_eq!(Action::from(FfiAction::FocusLeft), Action::FocusLeft);
-        assert_eq!(Action::from(FfiAction::ResizeDown), Action::ResizeDown);
-        assert_eq!(Action::from(FfiAction::SwapNext), Action::SwapNext);
-        assert_eq!(Action::from(FfiAction::RenameTab), Action::RenameTab);
-        assert_eq!(Action::from(FfiAction::CloseTab), Action::CloseTab);
-        assert_eq!(Action::from(FfiAction::CycleLayout), Action::CycleLayout);
-        assert_eq!(Action::from(FfiAction::ToggleZoom), Action::ToggleZoom);
-        assert_eq!(
-            Action::from(FfiAction::FocusPaneAt { index: 2 }),
-            Action::FocusPaneAt(2)
-        );
-        assert_eq!(Action::from(FfiAction::UndoClose), Action::UndoClose);
-        assert_eq!(
-            Action::from(FfiAction::ToggleConnection),
-            Action::ToggleConnection
-        );
     }
 
     #[test]

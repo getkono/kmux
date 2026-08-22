@@ -364,7 +364,7 @@ count = 83
 [[lints]]
 crate = "kmux-ffi"
 lint = "clippy::needless_pass_by_value"
-count = 24
+count = 23
 
 [[lints]]
 crate = "kmux-ffi"
@@ -394,7 +394,7 @@ count = 1
 [[lints]]
 crate = "kmux-ffi"
 lint = "missing_debug_implementations"
-count = 50
+count = 48
 
 [[lints]]
 crate = "kmux-ffi"
