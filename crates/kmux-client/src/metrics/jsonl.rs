@@ -1,13 +1,13 @@
 //! Rolling JSONL sink for cross-session metrics samples.
 //!
 //! Multiple concurrent `kmux` processes share a single file at
-//! `kmux_protocol::dirs::metrics_log_path()`. Every sample is appended as a
+//! `kmux_sys::dirs::metrics_log_path()`. Every sample is appended as a
 //! single JSON object on its own line, guarded by an advisory `flock`
 //! (exclusive for append, shared for read). The lock is held only for the
 //! duration of the write or read — microseconds — so contention between
 //! multiple clients is negligible even at the 10s flush cadence.
 //!
-//! When the file grows past [`ROTATE_BYTES`] it's renamed to
+//! When the file grows past `ROTATE_BYTES` it's renamed to
 //! `metrics.jsonl.1` (overwriting any prior generation) and a fresh file
 //! is started. One-generation rotation is deliberate: deeper history would
 //! warrant a real time-series store, not an ever-growing append log.
@@ -112,8 +112,8 @@ impl JsonlSink {
         &self.path
     }
 
-    /// Append a sample. Acquires LOCK_EX briefly, rotates if the file is
-    /// over [`ROTATE_BYTES`], writes one JSON line terminated by `\n`,
+    /// Append a sample. Acquires `LOCK_EX` briefly, rotates if the file is
+    /// over `ROTATE_BYTES`, writes one JSON line terminated by `\n`,
     /// releases the lock. Errors are logged but not propagated — metrics
     /// collection must never take down the client.
     pub fn append(&self, sample: &Sample) {

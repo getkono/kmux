@@ -13,8 +13,7 @@ fn main() {
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
     println!("cargo:rustc-env=BUILD_GIT_SHA={sha}");
 
     let dirty = Command::new("git")
@@ -22,8 +21,7 @@ fn main() {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
+        .is_some_and(|o| !o.stdout.is_empty());
     println!(
         "cargo:rustc-env=BUILD_GIT_DIRTY_SUFFIX={}",
         if dirty { "-dirty" } else { "" }

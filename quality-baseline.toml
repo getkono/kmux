@@ -1,0 +1,891 @@
+# The quality baseline: a budget that may only shrink.
+#
+# Every row records how many violations of a lint one crate still has. CI runs
+# `mise run lint-gate`, which fails when a count goes UP (a regression) and also
+# when a count goes DOWN without this file being updated, because a stale budget
+# is slack a later regression can hide in. Tighten it with `mise run baseline`,
+# which rewrites the measured tables from what was just measured; loosening is
+# always a manual edit here, visible in review. That asymmetry is the design.
+#
+# `mise run baseline` regenerates only the tables below. Everything down to the
+# first one -- these comments and the whole meta block, comments included -- is
+# hand-written policy and is carried through verbatim, apart from the toolchain
+# stamp.
+#
+# Deliberately NOT ratcheted: clippy::str_to_string, 715 sites. It fires on
+# `.to_string()` for a &str, which is idiomatic and reads better than the
+# `.to_owned()` it asks for; a 715-row budget would be noise standing in front
+# of signal.
+#
+# See docs/quality-gates.md.
+
+[meta]
+# Recorded so a toolchain upgrade cannot masquerade as a regression -- or, worse,
+# absorb one by changing what a lint fires on in the same commit that changes
+# the code. `mise run baseline` restamps it.
+rustc = "1.96.0"
+
+# The lints the gate injects with `--force-warn`, which outranks both
+# `-D warnings` (so these stay warnings and get counted instead of failing the
+# compile) and any in-source `#[allow]` (so a budget cannot be paid down by
+# suppressing rather than fixing). Grouped by what they are for, because a flat
+# list of 23 lint names tells the next person nothing about which ones matter.
+#
+# A lint that reaches zero everywhere moves out of this list and into
+# [workspace.lints] in the root Cargo.toml, where the compiler holds it at zero
+# for free. That migration is the point of the exercise.
+ratcheted = [
+    # Documentation. missing_docs is the bulk of the debt and the most
+    # mechanical part of it.
+    "missing_docs",
+    "missing_debug_implementations",
+    "clippy::missing_errors_doc",
+    "clippy::missing_panics_doc",
+
+    # Panics on production paths. A daemon that unwraps takes a user's session
+    # with it. clippy.toml exempts test code, where a panic IS the failure
+    # report -- see docs/testing.md R1.
+    "clippy::unwrap_used",
+    "clippy::expect_used",
+    "clippy::panic",
+    "clippy::unwrap_in_result",
+
+    # Numeric conversions. This workspace hand-rolls a wire format and a C ABI,
+    # so a silent truncation is a protocol bug, not a rounding error.
+    "clippy::cast_possible_truncation",
+    "clippy::cast_possible_wrap",
+    "clippy::cast_precision_loss",
+    "clippy::cast_sign_loss",
+
+    # Size and shape. too_many_lines is the executable form of docs/testing.md
+    # R4, and the one with the most leverage: a body-replacement mutant is
+    # generated per FUNCTION, so a 900-line dispatcher yields exactly one mutant
+    # covering 50 message types. Function size is a hard cap on how much
+    # resolution the mutation score can ever have.
+    "clippy::too_many_lines",
+    "clippy::cognitive_complexity",
+    "clippy::struct_excessive_bools",
+    "clippy::items_after_statements",
+    "clippy::match_same_arms",
+    "clippy::single_match_else",
+    "clippy::needless_continue",
+
+    # Ownership and locking.
+    "clippy::needless_pass_by_value",
+    "clippy::redundant_clone",
+    "clippy::significant_drop_tightening",
+    "clippy::string_slice",
+]
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::cast_possible_truncation"
+count = 25
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::cast_possible_wrap"
+count = 2
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::cast_precision_loss"
+count = 8
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::cast_sign_loss"
+count = 6
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::expect_used"
+count = 4
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::items_after_statements"
+count = 12
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::match_same_arms"
+count = 10
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::missing_errors_doc"
+count = 20
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::missing_panics_doc"
+count = 2
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::needless_continue"
+count = 5
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::needless_pass_by_value"
+count = 6
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::redundant_clone"
+count = 2
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::significant_drop_tightening"
+count = 2
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::single_match_else"
+count = 5
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::string_slice"
+count = 7
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::struct_excessive_bools"
+count = 1
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::too_many_lines"
+count = 7
+
+[[lints]]
+crate = "kmux-app"
+lint = "clippy::unwrap_used"
+count = 2
+
+[[lints]]
+crate = "kmux-app"
+lint = "missing_debug_implementations"
+count = 18
+
+[[lints]]
+crate = "kmux-app"
+lint = "missing_docs"
+count = 286
+
+[[lints]]
+crate = "kmux-client"
+lint = "clippy::cast_possible_truncation"
+count = 30
+
+[[lints]]
+crate = "kmux-client"
+lint = "clippy::cast_possible_wrap"
+count = 8
+
+[[lints]]
+crate = "kmux-client"
+lint = "clippy::cast_precision_loss"
+count = 4
+
+[[lints]]
+crate = "kmux-client"
+lint = "clippy::expect_used"
+count = 2
+
+[[lints]]
+crate = "kmux-client"
+lint = "clippy::items_after_statements"
+count = 2
+
+[[lints]]
+crate = "kmux-client"
+lint = "clippy::missing_errors_doc"
+count = 2
+
+[[lints]]
+crate = "kmux-client"
+lint = "clippy::missing_panics_doc"
+count = 1
+
+[[lints]]
+crate = "kmux-client"
+lint = "clippy::needless_pass_by_value"
+count = 3
+
+[[lints]]
+crate = "kmux-client"
+lint = "clippy::redundant_clone"
+count = 1
+
+[[lints]]
+crate = "kmux-client"
+lint = "clippy::single_match_else"
+count = 2
+
+[[lints]]
+crate = "kmux-client"
+lint = "clippy::too_many_lines"
+count = 2
+
+[[lints]]
+crate = "kmux-client"
+lint = "missing_debug_implementations"
+count = 17
+
+[[lints]]
+crate = "kmux-client"
+lint = "missing_docs"
+count = 309
+
+[[lints]]
+crate = "kmux-connect"
+lint = "clippy::cast_possible_truncation"
+count = 1
+
+[[lints]]
+crate = "kmux-connect"
+lint = "clippy::cast_possible_wrap"
+count = 3
+
+[[lints]]
+crate = "kmux-connect"
+lint = "clippy::cognitive_complexity"
+count = 3
+
+[[lints]]
+crate = "kmux-connect"
+lint = "clippy::expect_used"
+count = 4
+
+[[lints]]
+crate = "kmux-connect"
+lint = "clippy::items_after_statements"
+count = 5
+
+[[lints]]
+crate = "kmux-connect"
+lint = "clippy::match_same_arms"
+count = 2
+
+[[lints]]
+crate = "kmux-connect"
+lint = "clippy::missing_errors_doc"
+count = 19
+
+[[lints]]
+crate = "kmux-connect"
+lint = "clippy::missing_panics_doc"
+count = 1
+
+[[lints]]
+crate = "kmux-connect"
+lint = "clippy::single_match_else"
+count = 1
+
+[[lints]]
+crate = "kmux-connect"
+lint = "clippy::string_slice"
+count = 4
+
+[[lints]]
+crate = "kmux-connect"
+lint = "clippy::too_many_lines"
+count = 3
+
+[[lints]]
+crate = "kmux-connect"
+lint = "clippy::unwrap_in_result"
+count = 3
+
+[[lints]]
+crate = "kmux-connect"
+lint = "clippy::unwrap_used"
+count = 2
+
+[[lints]]
+crate = "kmux-connect"
+lint = "missing_debug_implementations"
+count = 10
+
+[[lints]]
+crate = "kmux-connect"
+lint = "missing_docs"
+count = 148
+
+[[lints]]
+crate = "kmux-ffi"
+lint = "clippy::cast_possible_truncation"
+count = 30
+
+[[lints]]
+crate = "kmux-ffi"
+lint = "clippy::cast_possible_wrap"
+count = 2
+
+[[lints]]
+crate = "kmux-ffi"
+lint = "clippy::cast_sign_loss"
+count = 4
+
+[[lints]]
+crate = "kmux-ffi"
+lint = "clippy::expect_used"
+count = 86
+
+[[lints]]
+crate = "kmux-ffi"
+lint = "clippy::items_after_statements"
+count = 1
+
+[[lints]]
+crate = "kmux-ffi"
+lint = "clippy::missing_errors_doc"
+count = 2
+
+[[lints]]
+crate = "kmux-ffi"
+lint = "clippy::missing_panics_doc"
+count = 83
+
+[[lints]]
+crate = "kmux-ffi"
+lint = "clippy::needless_pass_by_value"
+count = 23
+
+[[lints]]
+crate = "kmux-ffi"
+lint = "clippy::significant_drop_tightening"
+count = 20
+
+[[lints]]
+crate = "kmux-ffi"
+lint = "clippy::struct_excessive_bools"
+count = 2
+
+[[lints]]
+crate = "kmux-ffi"
+lint = "clippy::too_many_lines"
+count = 1
+
+[[lints]]
+crate = "kmux-ffi"
+lint = "clippy::unwrap_in_result"
+count = 1
+
+[[lints]]
+crate = "kmux-ffi"
+lint = "missing_debug_implementations"
+count = 48
+
+[[lints]]
+crate = "kmux-ffi"
+lint = "missing_docs"
+count = 303
+
+[[lints]]
+crate = "kmux-ghostty"
+lint = "clippy::missing_errors_doc"
+count = 7
+
+[[lints]]
+crate = "kmux-ghostty"
+lint = "clippy::missing_panics_doc"
+count = 2
+
+[[lints]]
+crate = "kmux-ghostty"
+lint = "clippy::panic"
+count = 3
+
+[[lints]]
+crate = "kmux-ghostty"
+lint = "clippy::struct_excessive_bools"
+count = 1
+
+[[lints]]
+crate = "kmux-ghostty"
+lint = "missing_docs"
+count = 114
+
+[[lints]]
+crate = "kmux-ghostty-sys"
+lint = "clippy::expect_used"
+count = 2
+
+[[lints]]
+crate = "kmux-ghostty-sys"
+lint = "clippy::panic"
+count = 2
+
+[[lints]]
+crate = "kmux-ghostty-sys"
+lint = "missing_docs"
+count = 78
+
+[[lints]]
+crate = "kmux-gtk"
+lint = "clippy::cast_possible_truncation"
+count = 34
+
+[[lints]]
+crate = "kmux-gtk"
+lint = "clippy::cast_possible_wrap"
+count = 5
+
+[[lints]]
+crate = "kmux-gtk"
+lint = "clippy::cast_precision_loss"
+count = 9
+
+[[lints]]
+crate = "kmux-gtk"
+lint = "clippy::cast_sign_loss"
+count = 23
+
+[[lints]]
+crate = "kmux-gtk"
+lint = "clippy::cognitive_complexity"
+count = 2
+
+[[lints]]
+crate = "kmux-gtk"
+lint = "clippy::expect_used"
+count = 2
+
+[[lints]]
+crate = "kmux-gtk"
+lint = "clippy::items_after_statements"
+count = 1
+
+[[lints]]
+crate = "kmux-gtk"
+lint = "clippy::needless_pass_by_value"
+count = 2
+
+[[lints]]
+crate = "kmux-gtk"
+lint = "clippy::redundant_clone"
+count = 12
+
+[[lints]]
+crate = "kmux-gtk"
+lint = "clippy::single_match_else"
+count = 1
+
+[[lints]]
+crate = "kmux-gtk"
+lint = "clippy::too_many_lines"
+count = 9
+
+[[lints]]
+crate = "kmux-protocol"
+lint = "clippy::cast_possible_truncation"
+count = 7
+
+[[lints]]
+crate = "kmux-protocol"
+lint = "clippy::cast_precision_loss"
+count = 5
+
+[[lints]]
+crate = "kmux-protocol"
+lint = "clippy::expect_used"
+count = 3
+
+[[lints]]
+crate = "kmux-protocol"
+lint = "clippy::missing_errors_doc"
+count = 10
+
+[[lints]]
+crate = "kmux-protocol"
+lint = "clippy::panic"
+count = 1
+
+[[lints]]
+crate = "kmux-protocol"
+lint = "clippy::string_slice"
+count = 8
+
+[[lints]]
+crate = "kmux-protocol"
+lint = "clippy::too_many_lines"
+count = 2
+
+[[lints]]
+crate = "kmux-protocol"
+lint = "missing_debug_implementations"
+count = 12
+
+[[lints]]
+crate = "kmux-protocol"
+lint = "missing_docs"
+count = 483
+
+[[lints]]
+crate = "kmux-pty"
+lint = "clippy::cast_sign_loss"
+count = 3
+
+[[lints]]
+crate = "kmux-pty"
+lint = "clippy::items_after_statements"
+count = 1
+
+[[lints]]
+crate = "kmux-pty"
+lint = "clippy::match_same_arms"
+count = 2
+
+[[lints]]
+crate = "kmux-pty"
+lint = "clippy::missing_errors_doc"
+count = 38
+
+[[lints]]
+crate = "kmux-pty"
+lint = "clippy::needless_continue"
+count = 4
+
+[[lints]]
+crate = "kmux-pty"
+lint = "clippy::significant_drop_tightening"
+count = 4
+
+[[lints]]
+crate = "kmux-pty"
+lint = "clippy::single_match_else"
+count = 1
+
+[[lints]]
+crate = "kmux-pty"
+lint = "clippy::string_slice"
+count = 1
+
+[[lints]]
+crate = "kmux-pty"
+lint = "missing_debug_implementations"
+count = 9
+
+[[lints]]
+crate = "kmux-pty"
+lint = "missing_docs"
+count = 64
+
+[[lints]]
+crate = "kmux-render"
+lint = "clippy::cast_possible_truncation"
+count = 19
+
+[[lints]]
+crate = "kmux-render"
+lint = "clippy::cast_possible_wrap"
+count = 4
+
+[[lints]]
+crate = "kmux-render"
+lint = "clippy::cast_precision_loss"
+count = 16
+
+[[lints]]
+crate = "kmux-render"
+lint = "clippy::cast_sign_loss"
+count = 8
+
+[[lints]]
+crate = "kmux-render"
+lint = "clippy::cognitive_complexity"
+count = 1
+
+[[lints]]
+crate = "kmux-render"
+lint = "clippy::expect_used"
+count = 1
+
+[[lints]]
+crate = "kmux-render"
+lint = "clippy::missing_errors_doc"
+count = 4
+
+[[lints]]
+crate = "kmux-render"
+lint = "clippy::too_many_lines"
+count = 1
+
+[[lints]]
+crate = "kmux-render"
+lint = "missing_debug_implementations"
+count = 10
+
+[[lints]]
+crate = "kmux-render"
+lint = "missing_docs"
+count = 1
+
+[[lints]]
+crate = "kmux-sys"
+lint = "clippy::expect_used"
+count = 3
+
+[[lints]]
+crate = "kmux-sys"
+lint = "clippy::items_after_statements"
+count = 1
+
+[[lints]]
+crate = "kmux-sys"
+lint = "clippy::missing_errors_doc"
+count = 40
+
+[[lints]]
+crate = "kmux-sys"
+lint = "clippy::missing_panics_doc"
+count = 2
+
+[[lints]]
+crate = "kmux-sys"
+lint = "clippy::significant_drop_tightening"
+count = 2
+
+[[lints]]
+crate = "kmux-sys"
+lint = "clippy::string_slice"
+count = 2
+
+[[lints]]
+crate = "kmux-sys"
+lint = "missing_debug_implementations"
+count = 7
+
+[[lints]]
+crate = "kmux-sys"
+lint = "missing_docs"
+count = 16
+
+[[lints]]
+crate = "kmux-vt-core"
+lint = "clippy::cast_possible_truncation"
+count = 8
+
+[[lints]]
+crate = "kmux-vt-core"
+lint = "clippy::cognitive_complexity"
+count = 1
+
+[[lints]]
+crate = "kmux-vt-core"
+lint = "clippy::expect_used"
+count = 1
+
+[[lints]]
+crate = "kmux-vt-core"
+lint = "clippy::match_same_arms"
+count = 1
+
+[[lints]]
+crate = "kmux-vt-core"
+lint = "clippy::significant_drop_tightening"
+count = 2
+
+[[lints]]
+crate = "kmux-vt-core"
+lint = "clippy::too_many_lines"
+count = 1
+
+[[lints]]
+crate = "kmux-vt-core"
+lint = "missing_debug_implementations"
+count = 6
+
+[[lints]]
+crate = "kmux-vt-core"
+lint = "missing_docs"
+count = 28
+
+[[lints]]
+crate = "kmux-vt-worker"
+lint = "clippy::cognitive_complexity"
+count = 1
+
+[[lints]]
+crate = "kmux-vt-worker"
+lint = "clippy::match_same_arms"
+count = 1
+
+[[lints]]
+crate = "kmux-vt-worker"
+lint = "clippy::needless_continue"
+count = 1
+
+[[lints]]
+crate = "kmux-vt-worker"
+lint = "clippy::needless_pass_by_value"
+count = 1
+
+[[lints]]
+crate = "kmux-vt-worker"
+lint = "clippy::too_many_lines"
+count = 1
+
+[[lints]]
+crate = "kmux-vt-worker"
+lint = "clippy::unwrap_used"
+count = 7
+
+[[lints]]
+crate = "kmux-worker-protocol"
+lint = "clippy::cast_possible_truncation"
+count = 1
+
+[[lints]]
+crate = "kmux-worker-protocol"
+lint = "clippy::missing_errors_doc"
+count = 4
+
+[[lints]]
+crate = "kmux-worker-protocol"
+lint = "missing_docs"
+count = 27
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::cast_possible_truncation"
+count = 16
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::cast_possible_wrap"
+count = 27
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::cognitive_complexity"
+count = 12
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::expect_used"
+count = 24
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::items_after_statements"
+count = 7
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::match_same_arms"
+count = 8
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::needless_continue"
+count = 5
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::needless_pass_by_value"
+count = 1
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::panic"
+count = 2
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::significant_drop_tightening"
+count = 53
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::single_match_else"
+count = 4
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::struct_excessive_bools"
+count = 1
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::too_many_lines"
+count = 13
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::unwrap_in_result"
+count = 1
+
+[[lints]]
+crate = "kmuxd"
+lint = "clippy::unwrap_used"
+count = 126
+
+[[lints]]
+crate = "kmuxd"
+lint = "missing_docs"
+count = 1
+
+[[lints]]
+crate = "xtask"
+lint = "clippy::expect_used"
+count = 1
+
+[[lints]]
+crate = "xtask"
+lint = "clippy::unwrap_in_result"
+count = 1
+
+[[lints]]
+crate = "xtask"
+lint = "missing_debug_implementations"
+count = 1
+
+[[allows]]
+crate = "kmux-app"
+count = 3
+
+[[allows]]
+crate = "kmux-client"
+count = 9
+
+[[allows]]
+crate = "kmux-connect"
+count = 6
+
+[[allows]]
+crate = "kmux-ghostty"
+count = 1
+
+[[allows]]
+crate = "kmux-ghostty-sys"
+count = 1
+
+[[allows]]
+crate = "kmux-gtk"
+count = 3
+
+[[allows]]
+crate = "kmux-protocol"
+count = 1
+
+[[allows]]
+crate = "kmux-render"
+count = 2
+
+[[allows]]
+crate = "kmux-vt-core"
+count = 1
+
+[[allows]]
+crate = "kmuxd"
+count = 8
+
+[[allows]]
+crate = "xtask"
+count = 3

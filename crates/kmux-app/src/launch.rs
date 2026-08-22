@@ -1,8 +1,8 @@
 //! Shared CLI front door for the kmux frontends.
 //!
-//! The `kmux` entrypoint and the GUI frontends call [`run_cli`]: it
+//! The `kmux` entrypoint and the GUI frontends call [`crate::launch::run_cli`]: it
 //! initializes logging, parses the CLI, runs any non-interactive subcommand
-//! (`ls`, `daemon`, `--dry-run`), or returns a frontend-agnostic [`Plan`]
+//! (`ls`, `daemon`, `--dry-run`), or returns a frontend-agnostic [`crate::launch::Plan`]
 //! describing the interactive session to launch. Each frontend then builds its
 //! own `AppCore` from the plan (supplying its own capabilities) and runs.
 
@@ -75,7 +75,7 @@ pub fn init_logging(instance_id: &str) {
     let log_file = if force_stderr {
         None
     } else {
-        kmux_protocol::dirs::client_log_path()
+        kmux_sys::dirs::client_log_path()
             .and_then(|p| {
                 Ok(std::fs::OpenOptions::new()
                     .create(true)

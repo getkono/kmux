@@ -5,7 +5,7 @@
 //!
 //! # Model
 //!
-//! [`PeerManager`] (held on [`ServerApp`](crate::app::ServerApp)) owns one
+//! [`PeerManager`] (held on [`ServerApp`]) owns one
 //! [`PeerConnection`] per distinct remote daemon, keyed by [`PeerId`]. Each
 //! connection holds the upstream `ClientMessage` sink (`client_tx`), a
 //! bidirectional `remote_word ↔ local_word` map, the proxied sessions (with
@@ -166,7 +166,7 @@ impl ProxiedPane {
 
     /// Fan an (already local-addressed) pane frame out to every viewer, applying
     /// the same backpressure policy as the local PTY relay
-    /// ([`crate::relay::broadcast_to_clients`]): a viewer whose **bounded** data
+    /// (`crate::relay::broadcast_to_clients`): a viewer whose **bounded** data
     /// channel is full is sent a [`ServerMessage::Lagged`] over its **unbounded**
     /// ctrl channel and dropped — it re-attaches and is served a fresh snapshot
     /// minted off the still-correct mirror, exactly as a lagging local client
@@ -174,7 +174,7 @@ impl ProxiedPane {
     /// is fed by the caller *before* this, so a dropped viewer never desyncs it.
     fn fan_out(&mut self, local_pane_id: &str, msg: &ServerMessage) {
         let mut dead: Vec<ClientId> = Vec::new();
-        for (&client_id, viewer) in self.viewers.iter() {
+        for (&client_id, viewer) in &self.viewers {
             // Paused viewers (issue #68) receive no terminal output and must never
             // be marked lagged or dropped when their channel fills — they resync on
             // resume via re-attach. Same rule as `relay::broadcast_to_clients`; an
@@ -571,13 +571,15 @@ impl PeerManager {
         {
             return Err("peer connection closed before session list".to_string());
         }
-        let remote_sessions = match recv_until(&mut server_rx, LIST_TIMEOUT, |m| {
+        let Some(ServerMessage::SessionListResult {
+            sessions: remote_sessions,
+            ..
+        }) = recv_until(&mut server_rx, LIST_TIMEOUT, |m| {
             matches!(m, ServerMessage::SessionListResult { .. })
         })
         .await
-        {
-            Some(ServerMessage::SessionListResult { sessions, .. }) => sessions,
-            _ => return Err("peer did not return a session list in time".to_string()),
+        else {
+            return Err("peer did not return a session list in time".to_string());
         };
 
         // 4. Register each remote session under a fresh local word. Park the SSH
@@ -588,14 +590,11 @@ impl PeerManager {
         let mut assigned_words: Vec<String> = Vec::new();
         for entry in remote_sessions {
             let remote_word = entry.meta.word_id.clone();
-            let local_word = match app.draw_word() {
-                Some(w) => w,
-                None => {
-                    for w in &assigned_words {
-                        app.release_word(w);
-                    }
-                    return Err("local session word pool exhausted".to_string());
+            let Some(local_word) = app.draw_word() else {
+                for w in &assigned_words {
+                    app.release_word(w);
                 }
+                return Err("local session word pool exhausted".to_string());
             };
             assigned_words.push(local_word.clone());
             conn.register_session(local_word, remote_word, entry, &peer_id);
@@ -1022,7 +1021,7 @@ impl PeerManager {
             let pane = guard.panes.get_mut(local_pane_id).unwrap();
             let minted = ServerMessage::TerminalSnapshot {
                 pane_id: local_pane_id.to_string(),
-                snapshot: std::sync::Arc::new(pane.mirror.to_snapshot()),
+                snapshot: Arc::new(pane.mirror.to_snapshot()),
                 seqno: pane.last_seqno,
                 sent_at_ms: epoch_millis(),
             };
@@ -1397,7 +1396,7 @@ mod tests {
     fn snapshot_msg(pane_id: &str) -> ServerMessage {
         ServerMessage::TerminalSnapshot {
             pane_id: pane_id.to_string(),
-            snapshot: std::sync::Arc::new(GridSnapshot {
+            snapshot: Arc::new(GridSnapshot {
                 rows: 1,
                 cols: 1,
                 cells: vec![],
@@ -1439,7 +1438,7 @@ mod tests {
 
     #[test]
     fn rewrite_event_to_local_translates_pane_and_word_events() {
-        let mut map = std::collections::HashMap::new();
+        let mut map = HashMap::new();
         map.insert("eagle".to_string(), "hawk".to_string());
 
         // A pane-scoped event rewrites the word portion of its pane ID.
@@ -1546,7 +1545,7 @@ mod tests {
         cells[2].c = 'Z';
         let msg = ServerMessage::TerminalSnapshot {
             pane_id: "hawk/0".to_string(),
-            snapshot: std::sync::Arc::new(GridSnapshot {
+            snapshot: Arc::new(GridSnapshot {
                 rows: 1,
                 cols: 3,
                 cells,

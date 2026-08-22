@@ -29,7 +29,7 @@ pub fn build_attach_replay(attach_result: AttachResult, pane_id: &str) -> Vec<Se
     match attach_result {
         AttachResult::FullSnapshot(snapshot, seqno) => vec![ServerMessage::TerminalSnapshot {
             pane_id: pane_id.to_string(),
-            snapshot: std::sync::Arc::new(snapshot),
+            snapshot: Arc::new(snapshot),
             seqno,
             sent_at_ms: epoch_millis(),
         }],
@@ -48,7 +48,7 @@ pub fn build_attach_replay(attach_result: AttachResult, pane_id: &str) -> Vec<Se
             },
             ServerMessage::TerminalSnapshot {
                 pane_id: pane_id.to_string(),
-                snapshot: std::sync::Arc::new(snapshot),
+                snapshot: Arc::new(snapshot),
                 seqno,
                 sent_at_ms: epoch_millis(),
             },
@@ -124,7 +124,7 @@ fn spawn_authenticated_forwarders(
 /// same output channel as the writer task.
 ///
 /// `conn_span` is the per-connection tracing span (created by the caller with
-/// transport/remote/conn_id/client_id fields).  It is cloned onto each spawned
+/// `transport/remote/conn_id/client_id` fields).  It is cloned onto each spawned
 /// task so that every log line carries the connection context.  The caller must
 /// also `.instrument(conn_span)` the returned future so the main loop itself
 /// runs within the span.
@@ -310,11 +310,11 @@ pub async fn run_client_session<R, W, A, F>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kmux_protocol::identity::Identity;
     use kmux_protocol::messages::{
         ClientCapabilities, ClientMessage, FrontendKind, PROTOCOL_RANGE, protocol_capabilities,
     };
     use kmux_protocol::{decode_server, encode_client, write_frame};
+    use kmux_sys::identity::Identity;
     use tokio::task::AbortHandle;
 
     struct NoopAttacher;

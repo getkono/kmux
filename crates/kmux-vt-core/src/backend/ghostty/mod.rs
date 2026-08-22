@@ -268,7 +268,7 @@ fn proto_key_to_ghostty(ev: &ProtoKeyEvent) -> kmux_ghostty::KeyEvent {
 // Acknowledge that `GhosttyError::Feed` is intentionally unused in the warm
 // path; keeping the variant lets callers of `kmux-ghostty` differentiate.
 const _: fn() = || {
-    let _ = std::mem::size_of::<GhosttyError>();
+    let _ = size_of::<GhosttyError>();
 };
 
 #[cfg(test)]
@@ -291,10 +291,7 @@ mod tests {
 
     fn expect_cell_diff_with_scrollback(
         result: DiffResult,
-    ) -> (
-        kmux_protocol::messages::TerminalDiff,
-        Vec<kmux_protocol::messages::ScrollbackLine>,
-    ) {
+    ) -> (kmux_protocol::messages::TerminalDiff, Vec<ScrollbackLine>) {
         match result {
             DiffResult::CellDiff {
                 diff,
@@ -852,6 +849,7 @@ mod tests {
 
         static SINK: OnceLock<Arc<TitleCapture>> = OnceLock::new();
         let sink = SINK.get_or_init(|| Arc::new(TitleCapture(Mutex::new(vec![]))));
+        let events: Arc<dyn BackendEventSink> = sink.clone();
 
         let cfg = BackendConfig {
             size: BackendSize {
@@ -864,7 +862,7 @@ mod tests {
                 kitty_graphics: Arc::new(AtomicBool::new(false)),
                 kitty_keyboard: Arc::new(AtomicBool::new(false)),
             },
-            events: Arc::clone(sink) as Arc<dyn BackendEventSink>,
+            events: Arc::clone(&events),
             scrollback: 1_000,
         };
 
@@ -890,6 +888,7 @@ mod tests {
         }
 
         let sink = Arc::new(ProgressCapture(Mutex::new(vec![])));
+        let events: Arc<dyn BackendEventSink> = sink.clone();
         let cfg = BackendConfig {
             size: BackendSize {
                 rows: 24,
@@ -901,7 +900,7 @@ mod tests {
                 kitty_graphics: Arc::new(AtomicBool::new(false)),
                 kitty_keyboard: Arc::new(AtomicBool::new(false)),
             },
-            events: Arc::clone(&sink) as Arc<dyn BackendEventSink>,
+            events: Arc::clone(&events),
             scrollback: 1_000,
         };
 
@@ -933,6 +932,7 @@ mod tests {
         }
 
         let sink = Arc::new(ResponseCapture(Mutex::new(vec![])));
+        let events: Arc<dyn BackendEventSink> = sink.clone();
         let cfg = BackendConfig {
             size: BackendSize {
                 rows: 24,
@@ -944,7 +944,7 @@ mod tests {
                 kitty_graphics: Arc::new(AtomicBool::new(false)),
                 kitty_keyboard: Arc::new(AtomicBool::new(false)),
             },
-            events: Arc::clone(&sink) as Arc<dyn BackendEventSink>,
+            events: Arc::clone(&events),
             scrollback: 1_000,
         };
 

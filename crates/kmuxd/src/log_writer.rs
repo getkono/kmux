@@ -51,7 +51,10 @@ pub struct ResilientGuard<W> {
 impl<W: Write> Write for ResilientGuard<W> {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         // Recover from a poisoned lock instead of panicking on it.
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         // Best-effort: a write failure (e.g. ENOSPC) must neither propagate as a
         // panic nor poison the lock. Report the bytes as "written" so the
         // subscriber treats the event as handled and moves on.
@@ -60,7 +63,10 @@ impl<W: Write> Write for ResilientGuard<W> {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        let mut guard = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let _ = guard.flush();
         Ok(())
     }

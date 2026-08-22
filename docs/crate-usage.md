@@ -39,18 +39,28 @@ implementations of this pattern.
 
 **R4 — no dead declarations.** A `[workspace.dependencies]` entry that no member
 references is a defect, and so is a member declaration the crate's source never
-names. Both are checked in [Auditing](#auditing) and both are currently at zero.
+names. Enforced by `mise run deps-audit` (cargo-machete) plus one grep; see
+[Auditing](#auditing). Both are at zero.
 
 **R5 — layering is a dependency rule, not a convention.** Nothing at or below
 `kmux-app` may depend on a UI toolkit; `kmux-protocol` depends on no internal
-crate; the graph stays acyclic. See
-[The workspace](#the-workspace) and
+crate; the graph stays acyclic. **Enforced** by
+`xtask/tests/dependency_direction.rs`, which reads the `cargo metadata` resolve
+graph and prints the shortest offending path on failure — this rule spent
+months as a true statement nothing checked. It rides `mise run test`. See
+[The workspace](#the-workspace),
+[docs/quality-gates.md](quality-gates.md) and
 [docs/architecture-frontend.md](architecture-frontend.md#layering).
 
 **R6 — anything crossing a process or ABI boundary is versioned.** New
 dependencies do not get to bypass the compatibility contracts listed under
 *Correctness* in [AGENTS.md](../AGENTS.md) — the data protocol, the `kmux-ffi` C
 ABI, the daemon↔worker contract, and `kmux-ghostty-sys`.
+
+**R7 — a third-party licence or advisory is a gate, not a footnote.** Every
+dependency's licence must be on the allow-list in `deny.toml`, and a RUSTSEC
+advisory is a build failure until it is either fixed or written down there with
+a reason. Enforced by `mise run deps-audit`.
 
 ## The workspace
 
@@ -61,8 +71,11 @@ it depends on.
 **Client stack**
 
 ```
-kmux-protocol      wire types, codec + framing, transports, TLS/TOFU,
-      ▲            identity, paths, version compat
+kmux-protocol      wire types, codec + framing, version compat. Pure data:
+      ▲            no filesystem, no network, no crypto
+      │
+kmux-sys           XDG paths, machine identity, TLS/TOFU, transports
+      ▲
       │
 kmux-connect       QUIC / TCP+TLS / UDS / SSH, supervision, daemon lifecycle
       ▲
@@ -86,7 +99,7 @@ kmux-app           interaction policy, run_cli, FrontendDriver
 **Server stack**
 
 ```
-                        kmux-protocol
+                    kmux-protocol / kmux-sys
                               ▲
       ┌───────────────────────┼───────────────────────┐
       │                       │                       │
@@ -119,21 +132,22 @@ on `kmuxd`, so no cycle exists.
 
 | Crate | Role | Internal deps | Design doc |
 | --- | --- | --- | --- |
-| `kmux-protocol` | Wire protocol, codec + framing, transports, TLS/TOFU, machine identity, path/profile resolution, version compat | — | [protocol-versioning](architecture-protocol-versioning.md), [connection](connection.md), [identity](architecture-identity.md) |
+| `kmux-protocol` | Wire protocol: message types, codec + framing, version compat. Pure data — no filesystem, network or crypto | — | [protocol-versioning](architecture-protocol-versioning.md) |
+| `kmux-sys` | The host-facing half: XDG path resolution, Ed25519 machine identity, TLS/TOFU material, the four transports, UDS peer credentials | `protocol` | [connection](connection.md), [identity](architecture-identity.md), [profile-isolation](profile-isolation.md) |
 | `kmux-pty` | PTY allocation, fd adoption (`from_inherited`), reader/writer split, resize | — | [daemon-handoff](daemon-handoff.md) |
 | `kmux-ghostty-sys` | Raw FFI to `libkmux_ghostty` (Zig wrapper over libghostty-vt). No Rust dependencies at all | — | [terminal-backend](terminal-backend.md) |
 | `kmux-ghostty` | Safe façade over `kmux-ghostty-sys` | `-sys`, `protocol` | [terminal-backend](terminal-backend.md) |
 | `kmux-vt-core` | Shared server-side VT pipeline: backend, diff engine, scrollback mirror | `protocol`, `ghostty` | [terminal-backend](terminal-backend.md), [process-isolation](architecture-process-isolation.md) |
 | `kmux-worker-protocol` | Daemon↔worker IPC contract. Server-side only; no GUI frontend may depend on it | `protocol` | [process-isolation](architecture-process-isolation.md) |
 | `kmux-vt-worker` | Isolated per-pane VT subprocess, so a terminal crash cannot take down `kmuxd` | `vt-core`, `worker-protocol`, `protocol`, `pty`, `ghostty-sys` | [process-isolation](architecture-process-isolation.md) |
-| `kmuxd` | The daemon: sessions, panes, relay, persistence, federation | `pty`, `protocol`, `client`, `worker-protocol`, `ghostty`, `ghostty-sys`, `vt-core`, `connect`\* | [multiplexer](multiplexer.md), [daemon-lifecycle](daemon-lifecycle.md) |
-| `kmux-connect` | Connection mechanism: QUIC/TCP+TLS/UDS/SSH transports, supervision, local daemon lifecycle | `protocol` | [connection](connection.md), [federation](architecture-federation.md) |
-| `kmux-client` | Client mechanism: `SessionManager`, `CellGrid`, key model | `protocol`, `connect` | [frontend](architecture-frontend.md) |
-| `kmux-app` | Interaction policy (toolkit-agnostic): modes/actions, `AppCore`, config + theme, `run_cli`, `FrontendDriver` | `client`, `protocol` | [frontend](architecture-frontend.md) |
+| `kmuxd` | The daemon: sessions, panes, relay, persistence, federation | `pty`, `protocol`, `sys`, `client`, `worker-protocol`, `ghostty-sys`, `vt-core`, `connect`\* | [multiplexer](multiplexer.md), [daemon-lifecycle](daemon-lifecycle.md) |
+| `kmux-connect` | Connection mechanism: QUIC/TCP+TLS/UDS/SSH transports, supervision, local daemon lifecycle | `protocol`, `sys` | [connection](connection.md), [federation](architecture-federation.md) |
+| `kmux-client` | Client mechanism: `SessionManager`, `CellGrid`, key model | `protocol`, `sys`, `connect` | [frontend](architecture-frontend.md) |
+| `kmux-app` | Interaction policy (toolkit-agnostic): modes/actions, `AppCore`, config + theme, `run_cli`, `FrontendDriver` | `client`, `protocol`, `sys` | [frontend](architecture-frontend.md) |
 | `kmux-render` | Shared wgpu cell-grid renderer; consumed by both frontends | `protocol`, `client`, `app` | [render](architecture-render.md) |
-| `kmux-gtk` | GTK4 + libadwaita frontend (Linux, also runnable on macOS) | `app`, `client`, `protocol`, `render` | [frontend](architecture-frontend.md) |
+| `kmux-gtk` | GTK4 + libadwaita frontend (Linux, also runnable on macOS) | `app`, `client`, `protocol`, `sys`, `render` | [frontend](architecture-frontend.md) |
 | `kmux-ffi` | uniffi C ABI exposing `FrontendDriver` to the SwiftUI macOS app | `app`, `client`, `protocol`, `render` | [building-macos](building-macos.md) |
-| `kmux` | Toolkit-free entrypoint: runs the shared CLI, else execs the platform frontend | `app`, `client` | [frontend](architecture-frontend.md) |
+| `kmux` | Toolkit-free entrypoint: runs the shared CLI, else execs the platform frontend | `app`, `client`, `sys` | [frontend](architecture-frontend.md) |
 
 \* optional, behind `kmuxd`'s `federation` feature.
 
@@ -145,6 +159,7 @@ compiles out a dependency subtree.
 | Crate | Feature | Default | What it turns on |
 | --- | --- | --- | --- |
 | `kmux-protocol` | `framing` | on | Length-prefixed async framing + per-frame zstd (`tokio`, `zstd`) |
+| `kmux-sys` | `framing` | on | Forwards `kmux-protocol/framing`; everything here that moves bytes needs it |
 | | `tls` | off | rustls stack, cert generation, TOFU store |
 | | `quic` / `tcp-tls` / `uds` | off | One transport each; the first two imply `tls` |
 | | `identity` | off | Ed25519 keypair persistence, sign, verify (`ring`, `sha2`) |
@@ -207,7 +222,7 @@ bug, so this table is the decision procedure:
 | `rmp-serde` (MessagePack, named) | **The data-plane protocol.** The named-map encoding *is* the protocol | `kmux-protocol` |
 | `postcard` | Worker IPC and on-disk daemon state — both internally versioned, neither crosses a version boundary | `kmux-worker-protocol`, `kmuxd` |
 | `serde_json` | The JSON control/handoff RPC, SSH negotiation, `--format json` CLI output, JSONL metrics | `kmux-connect`, `kmux-client`, `kmux-app`, `kmuxd`. `kmux-protocol` defines the RPC types but only needs it as a dev-dependency, for its own round-trip tests |
-| `toml` | Human-edited config and the TOFU store | `kmux-app`, `kmux-connect`, `kmuxd`, `kmux-protocol` |
+| `toml` | Human-edited config and the TOFU store | `kmux-app`, `kmux-connect`, `kmuxd`, `kmux-sys` |
 
 Supporting: `serde` (derives, everywhere), `serde_bytes` (`#[serde(with = ...)]`
 on byte-slice fields so MessagePack emits a `bin` blob rather than an integer
@@ -218,15 +233,15 @@ array), `zstd` (per-frame compression behind `kmux-protocol/framing`; see
 
 | Job | Crate | Notes |
 | --- | --- | --- |
-| QUIC | `quinn` | `kmux-protocol`, `kmux-connect` (both optional), `kmuxd` |
+| QUIC | `quinn` | `kmux-sys`, `kmux-connect` (both optional), `kmuxd` |
 | TLS | `rustls` + `tokio-rustls` | `ring` backend, no `aws-lc`. `default-features = false` keeps the feature set explicit |
-| Root certs / PEM / cert gen | `rustls-native-certs`, `rustls-pemfile`, `rcgen` | `kmux-protocol`'s `tls` feature only — do not re-declare downstream |
-| Ed25519 identity | `ring` | `kmux-protocol`'s `identity` feature. Already in-tree via rustls; pinned to the resolved version |
+| Root certs / PEM / cert gen | `rustls-native-certs`, `rustls-pemfile`, `rcgen` | `kmux-sys`'s `tls` feature only — do not re-declare downstream |
+| Ed25519 identity | `ring` | `kmux-sys`'s `identity` feature. Already in-tree via rustls; pinned to the resolved version |
 | Hashing | `sha2` | Machine-ID fingerprints (`identity`) and TOFU certificate fingerprints (`tls`) |
 | Random | `rand` | Session names, instance IDs, and the shared auth token (`kmuxd`, `kmux-client`) |
 
 Identity material does **not** go through `rand`: challenge nonces and Ed25519
-keys use `ring::rand::SystemRandom` in `crates/kmux-protocol/src/identity.rs`.
+keys use `ring::rand::SystemRandom` in `crates/kmux-sys/src/identity.rs`.
 Keep it that way — the signature scheme and its RNG should come from one crate.
 
 ### CLI and terminal output
@@ -303,8 +318,24 @@ pinned toolchain in `rust-toolchain.toml`. Releases do not touch
 
 ### Auditing
 
-No dedicated tooling is wired up. These three checks cover R1 and R4, run from
-the repository root, and all three are expected to print nothing:
+`mise run deps-audit` is the check that runs in CI. It is two tools:
+
+* **cargo-deny** (`deny.toml`) — third-party licence compatibility and RUSTSEC
+  advisories. The dual `AGPL-3.0-only OR LicenseRef-Commercial` licence makes
+  the first a commercial requirement rather than hygiene, and a daemon that
+  speaks QUIC and TLS to the network has no business carrying an unchecked
+  rustls/ring/quinn tree. The first run found three live vulnerabilities.
+* **cargo-machete** — a declared dependency whose crate never uses it. This
+  replaces the R4b grep below, which was a *name* check: it proved a crate was
+  mentioned somewhere, so a dependency named only in a comment passed. Its
+  first run found `kmux-ghostty` declared by `kmuxd` and used by nothing.
+  cargo-machete reads `use` statements, so a dependency used any other way —
+  `#[serde(with = "…")]`, or purely for its build-script metadata — needs a
+  `[package.metadata.cargo-machete] ignored = […]` entry in that manifest with
+  a comment saying why. Three exist today and each one says which.
+
+Two checks have no tool and are still greps, run from the repository root, both
+expected to print nothing:
 
 ```sh
 # R1 — a member declaring an inline version instead of `.workspace = true`.
@@ -318,22 +349,7 @@ awk '/^\[workspace.dependencies\]/{f=1;next} /^\[/{f=0} f && /^[a-zA-Z0-9_-]+ *=
   while read -r d; do
     grep -qE "^ *$d(\.workspace)? *=" crates/*/Cargo.toml || echo "dead: $d"
   done
-
-# R4b — a declared dependency its crate's source never names.
-for m in crates/*/Cargo.toml; do d=$(dirname "$m")
-  awk '/^\[/{f=($0 ~ /dependencies\]/)} f && /^[a-zA-Z0-9_-]+ *=/ \
-    {sub(/ *=.*/,"");sub(/\.workspace$/,"");print}' "$m" |
-    grep -v '^kmux' | sort -u | while read -r c; do
-      git grep -qw "$(echo "$c" | tr - _)" -- "$d" ":(exclude)$d/Cargo.toml" ||
-        echo "unused: $(basename "$d")/$c"
-    done
-done
 ```
-
-R4b is a name check, not a compiler check: it proves the crate is *mentioned*,
-which is enough to catch a stale declaration but will pass a dependency that is
-named only in a comment. Confirm a removal with `mise run clippy` and
-`mise run test`.
 
 `cargo tree -p <crate>` and `cargo tree -i <dep>` answer "who pulls this in?"
 when a lockfile diff is larger than expected.

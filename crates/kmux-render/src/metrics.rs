@@ -36,7 +36,7 @@ impl FontFace {
     /// Build a face from embedded/static bytes (a single-face file → index 0).
     /// Used for the bundled glyph fallback font ([`crate::fallback`]).
     pub fn from_static(bytes: &'static [u8]) -> Self {
-        FontFace {
+        Self {
             data: Arc::new(bytes.to_vec()),
             index: 0,
         }

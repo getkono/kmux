@@ -17,3 +17,6 @@ kmux-ghostty-sys.workspace = true
 kmux-protocol.workspace = true
 static_assertions.workspace = true
 thiserror.workspace = true
+
+[lints]
+workspace = true

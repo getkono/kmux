@@ -32,11 +32,11 @@ pub enum ParseError {
 impl ParseError {
     pub fn message(&self) -> String {
         match self {
-            ParseError::Empty => "empty command".into(),
-            ParseError::Unknown { typed } => format!("unknown command: /{typed}"),
-            ParseError::MissingArgs { usage } => format!("missing args — usage: {usage}"),
-            ParseError::TooManyArgs { usage } => format!("too many args — usage: {usage}"),
-            ParseError::UnclosedQuote => "unclosed quote".into(),
+            Self::Empty => "empty command".into(),
+            Self::Unknown { typed } => format!("unknown command: /{typed}"),
+            Self::MissingArgs { usage } => format!("missing args — usage: {usage}"),
+            Self::TooManyArgs { usage } => format!("too many args — usage: {usage}"),
+            Self::UnclosedQuote => "unclosed quote".into(),
         }
     }
 }
@@ -101,8 +101,7 @@ pub fn parse(input: &str, registry: &'static [CommandSpec]) -> Result<Parsed, Pa
         let max_len = spec.name.split_whitespace().count();
         for take in 1..=max_len.min(tokens.len()) {
             let head = tokens[..take].join(" ");
-            if spec.matches_command_part(&head) && best.map(|(_, prev)| take > prev).unwrap_or(true)
-            {
+            if spec.matches_command_part(&head) && best.is_none_or(|(_, prev)| take > prev) {
                 best = Some((spec, take));
             }
         }
@@ -111,9 +110,7 @@ pub fn parse(input: &str, registry: &'static [CommandSpec]) -> Result<Parsed, Pa
             let alen = alias.split_whitespace().count();
             for take in 1..=alen.min(tokens.len()) {
                 let head = tokens[..take].join(" ");
-                if head.eq_ignore_ascii_case(alias)
-                    && best.map(|(_, prev)| take > prev).unwrap_or(true)
-                {
+                if head.eq_ignore_ascii_case(alias) && best.is_none_or(|(_, prev)| take > prev) {
                     best = Some((spec, take));
                 }
             }

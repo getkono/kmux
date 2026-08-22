@@ -80,7 +80,10 @@ New wire messages (`PROTOCOL_VERSION` 32):
   reconciling the smallest-wins size) and pushes `SessionKicked { by_label }` to
   the target so its UI leaves the session. The target's connection stays alive;
   other connections — including others from the same machine — are untouched.
-- Errors use `ErrorCode::SessionNotFound` / `ClientNotFound`.
+- Errors use `ErrorCode::SessionNotFound` / `ClientNotFound`, and name what was
+  not found — the word id, and for `ClientNotFound` the client id as well. Both
+  messages used to be nameless (`"session not found"`), which told a caller
+  holding a stale word id and a stale client id nothing about which was stale.
 
 **Authorization:** any token-authenticated client may kick any other; identity is
 attribution/display only.

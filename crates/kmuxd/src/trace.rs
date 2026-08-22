@@ -49,7 +49,7 @@ fn build_sink() -> Option<DiffTraceSink> {
     if !enabled() {
         return None;
     }
-    let path = kmux_protocol::dirs::daemon_trace_path().ok()?;
+    let path = kmux_sys::dirs::daemon_trace_path().ok()?;
     match OpenOptions::new().create(true).append(true).open(&path) {
         Ok(file) => Some(DiffTraceSink {
             writer: Mutex::new(BufWriter::new(file)),
@@ -69,7 +69,7 @@ fn sink() -> Option<&'static DiffTraceSink> {
 pub fn init_and_log() {
     if let Some(s) = sink() {
         let _ = s; // touch to force init
-        if let Ok(path) = kmux_protocol::dirs::daemon_trace_path() {
+        if let Ok(path) = kmux_sys::dirs::daemon_trace_path() {
             info!(
                 "frame tracing ACTIVE (KMUX_FRAME_TRACE) — daemon diffs → {}",
                 path.display()

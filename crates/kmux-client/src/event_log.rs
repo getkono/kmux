@@ -44,23 +44,23 @@ pub enum DiagEvent {
 impl fmt::Display for DiagEvent {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DiagEvent::StaleDiscard { session } => {
+            Self::StaleDiscard { session } => {
                 write!(f, "Stale discard on '{session}'")
             }
-            DiagEvent::SeqnoGap {
+            Self::SeqnoGap {
                 session,
                 expected,
                 got,
             } => {
                 write!(f, "Seqno gap: {expected}\u{2192}{got} on '{session}'")
             }
-            DiagEvent::Lagged { session, missed } => {
+            Self::Lagged { session, missed } => {
                 write!(f, "Lagged on '{session}': missed {missed}")
             }
-            DiagEvent::Resync { session, reason } => {
+            Self::Resync { session, reason } => {
                 write!(f, "Resync '{session}': {reason}")
             }
-            DiagEvent::Tear {
+            Self::Tear {
                 session,
                 prev_sent_at_ms,
                 next_sent_at_ms,
@@ -70,7 +70,7 @@ impl fmt::Display for DiagEvent {
                     "Tear on '{session}': {prev_sent_at_ms}\u{2192}{next_sent_at_ms}ms"
                 )
             }
-            DiagEvent::DigestMismatch { session, seqno } => {
+            Self::DigestMismatch { session, seqno } => {
                 write!(f, "Grid digest mismatch on '{session}' at seqno {seqno}")
             }
         }

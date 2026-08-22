@@ -83,8 +83,20 @@ These are strictly-typed config/CLI, not environment variables.
   `run_cli`) → frontends (`kmux-gtk`, `kmux-swift` via `kmux-ffi`); `kmux` sits
   on top. See [docs/architecture-frontend.md](docs/architecture-frontend.md).
 - Document architectural changes in `docs/`.
-- Strict Rust — no `#[allow(unused)]` without justification.
-- Write tests for new functionality; keep functions small and focused.
+- Strict Rust — no `#[allow(unused)]` without justification. A new suppression
+  uses `#[expect(..., reason = "...")]`, which fails the build once it stops
+  applying, rather than `#[allow]`, which never expires. Which lints are fatal,
+  which are ratcheted against `quality-baseline.toml`, and how to graduate one
+  from the second group to the first are normative in
+  [docs/quality-gates.md](docs/quality-gates.md) — read it before adding a lint,
+  a suppression, or a `#[allow]`. `mise run lint-gate` is the check; `mise run
+  baseline` records an improvement.
+- Tests assert on values, take paths and time as parameters instead of mutating
+  the process, and dispatchers split into named per-message handlers rather than
+  one large `match`. The tiers, the per-crate methodology, test doubles, naming,
+  and the register of intentionally-untested areas are normative in
+  [docs/testing.md](docs/testing.md) — read it before adding a test, a test
+  double, or a `#[cfg(test)]` seam.
 - Conventional commits (`type: description`), enforced by the `commit-msg` +
   `pre-push` hk hooks and CI via `convco` (escape hatch: `git commit --no-verify`;
   check a range manually with `mise run commit-check <base>..HEAD`).
@@ -107,3 +119,10 @@ These are strictly-typed config/CLI, not environment variables.
   before trusting it, so no client can impersonate another. The shared token
   still gates access; identity is layered on top for attribution + management.
   See [docs/architecture-identity.md](docs/architecture-identity.md).
+- Coverage is measured by mutation score, not line count: `mise run mutants --
+  -p <crate>`. A mutant surviving in code you changed is either killed by a new
+  assertion or recorded, with a reason, in the Known-exceptions register in
+  [docs/testing.md](docs/testing.md). Both lib and bin crates are scored — the
+  flags must match each crate's target shape, or `--lib` hard-errors on a
+  bin-only package and cargo-mutants misreads the error as a caught mutant. See
+  `.cargo/mutants*.toml`.

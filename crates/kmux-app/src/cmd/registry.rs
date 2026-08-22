@@ -15,7 +15,7 @@ use super::spec::{ArgSpec, CommandResult, CommandSpec, CommandSuccess, Completer
 
 fn require_arg<'a>(args: &'a [String], idx: usize, name: &str) -> Result<&'a str, String> {
     args.get(idx)
-        .map(|s| s.as_str())
+        .map(String::as_str)
         .ok_or_else(|| format!("missing argument <{name}>"))
 }
 
@@ -262,7 +262,7 @@ fn cmd_session_rename(app: &mut AppCore, args: &[String]) -> CommandResult {
     if new_name.is_empty() {
         return Err("name cannot be empty".into());
     }
-    let Some(word_id) = app.mgr.active_session().map(|s| s.to_string()) else {
+    let Some(word_id) = app.mgr.active_session().map(ToString::to_string) else {
         return Err("no active session".into());
     };
     app.mgr.rename_session(&word_id, new_name);
@@ -369,7 +369,7 @@ fn cmd_signal(app: &mut AppCore, args: &[String]) -> CommandResult {
     require_connected(app)?;
     let name = require_arg(args, 0, "signal")?;
     let signum = signal_from_name(name)?;
-    let Some(pane_id) = app.mgr.active_pane_id().map(|s| s.to_string()) else {
+    let Some(pane_id) = app.mgr.active_pane_id().map(ToString::to_string) else {
         return Err("no active pane".into());
     };
     app.mgr.send_signal(&pane_id, signum);
@@ -745,7 +745,6 @@ mod tests {
             history_pos: None,
         });
         app.dispatch_action(crate::mode::Action::CommandSubmit)
-            .await
     }
 
     #[tokio::test]
@@ -805,7 +804,7 @@ mod tests {
     async fn submit_records_history() {
         let mut app = fixture_core();
         let _ = submit("hud", &mut app).await;
-        assert_eq!(app.command_history.back().map(|s| s.as_str()), Some("hud"));
+        assert_eq!(app.command_history.back().map(String::as_str), Some("hud"));
     }
 
     #[test]
@@ -1069,7 +1068,7 @@ mod tests {
     #[test]
     fn no_duplicate_canonical_names() {
         let mut names: Vec<&str> = ALL.iter().map(|s| s.name).collect();
-        names.sort();
+        names.sort_unstable();
         let len = names.len();
         names.dedup();
         assert_eq!(len, names.len(), "duplicate canonical name in registry");
@@ -1087,7 +1086,7 @@ mod tests {
             }
         }
         let len = all.len();
-        all.sort();
+        all.sort_unstable();
         all.dedup();
         assert_eq!(len, all.len(), "duplicate name/alias across registry");
     }

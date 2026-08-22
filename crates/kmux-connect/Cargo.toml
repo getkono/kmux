@@ -22,16 +22,17 @@ remote = [
     "dep:quinn",
     "dep:rustls",
     "dep:tokio-rustls",
-    "kmux-protocol/tls",
-    "kmux-protocol/tcp-tls",
+    "kmux-sys/tls",
+    "kmux-sys/tcp-tls",
 ]
 
 [dependencies]
+kmux-protocol.workspace = true
 # Default feature is `framing`; `uds` adds the local-socket transport. The
-# `remote` feature below pulls in `tls` + `tcp-tls` for the direct QUIC/TCP+TLS
-# paths. (We can't disable kmux-protocol's defaults from a workspace member, but
-# its only default is `framing`, which the base build needs anyway.)
-kmux-protocol = { workspace = true, features = ["uds", "identity"] }
+# `remote` feature above pulls in `tls` + `tcp-tls` for the direct QUIC/TCP+TLS
+# paths. (We can't disable a dependency's defaults from a workspace member, but
+# the only default here is `framing`, which the base build needs anyway.)
+kmux-sys = { workspace = true, features = ["uds", "identity"] }
 anyhow.workspace = true
 nix.workspace = true
 serde.workspace = true
@@ -46,3 +47,6 @@ toml.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[lints]
+workspace = true

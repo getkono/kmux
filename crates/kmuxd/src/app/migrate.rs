@@ -37,7 +37,7 @@ impl ServerApp {
             let pid = self.manager.child_pid(&pane_id).await;
             let alive = matches!(self.manager.is_exited(&pane_id).await, Some(false));
             out.push(HandoffPaneMeta {
-                pid: pid.map(|p| p.as_raw()).unwrap_or(0),
+                pid: pid.map_or(0, nix::unistd::Pid::as_raw),
                 has_live_fd: pid.is_some() && alive,
                 pane_id,
             });

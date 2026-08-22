@@ -41,7 +41,7 @@ pub(super) enum SeedMode {
 }
 
 impl ServerApp {
-    /// Restore sessions from a [`PersistedDaemonState`], spawning a fresh shell
+    /// Restore sessions from a [`crate::persist::PersistedDaemonState`], spawning a fresh shell
     /// for every pane (replaying the old grid/scrollback as ANSI history).
     ///
     /// This is the cold-start path and the fallback when a graceful handoff is
@@ -264,7 +264,28 @@ impl ServerApp {
                             None => {
                                 // Registered but unsplittable — drop it and fall
                                 // through to respawn so the pane is not lost.
-                                let _ = self.manager.close(pane_id).await;
+                                //
+                                // The child on the other end of this fd is the
+                                // user's live shell, inherited across a daemon
+                                // upgrade. If the close does not take, falling
+                                // through respawns a *second* shell for the same
+                                // pane and the first keeps running with nothing
+                                // holding it — detached, invisible, and for as
+                                // long as the machine is up. So the failure is
+                                // reported and the pid is killed directly.
+                                if let Err(e) = self.manager.close(pane_id).await {
+                                    warn!(
+                                        pane_id,
+                                        %e,
+                                        "restore: could not close an unsplittable \
+                                         inherited pane; killing its child directly \
+                                         so the respawn below does not orphan it"
+                                    );
+                                    let _ = nix::sys::signal::kill(
+                                        pid,
+                                        nix::sys::signal::Signal::SIGKILL,
+                                    );
+                                }
                             }
                         }
                     }
@@ -351,7 +372,7 @@ impl ServerApp {
         // Terminal query replies drain to the PTY via the in-process engine.
         let (resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         title_sink.set_pty_response_sender(resp_tx);
-        let relay_sink = Arc::clone(&title_sink) as Arc<dyn crate::backend::BackendEventSink>;
+        let relay_sink: Arc<dyn crate::backend::BackendEventSink> = title_sink.clone();
         let term_state = Arc::new(Mutex::new(new_term_state(BackendConfig {
             size: BackendSize::from(size),
             capabilities: CapabilityHandles {

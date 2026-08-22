@@ -24,7 +24,7 @@ impl PaneAttacher for TcpAttacher {
         pane_id: String,
         result: AttachResult,
         mut client_rx: mpsc::Receiver<ServerMessage>,
-    ) -> impl std::future::Future<Output = Result<AbortHandle, String>> + Send {
+    ) -> impl Future<Output = Result<AbortHandle, String>> + Send {
         let ctrl_tx = self.ctrl_tx.clone();
         async move {
             let handle = tokio::spawn(async move {

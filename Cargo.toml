@@ -1,5 +1,9 @@
 [workspace]
-members = ["crates/*"]
+# `crates/*` is the product surface mapped by docs/crate-usage.md. `xtask` is
+# workspace tooling (the lint ratchet, the mutation gate, the dependency-direction
+# assertions) and is listed separately so the glob above keeps meaning "the
+# shipped crates" — see xtask/src/lib.rs.
+members = ["crates/*", "xtask"]
 resolver = "2"
 
 [workspace.package]
@@ -14,6 +18,10 @@ publish = false
 # Internal crates
 kmux-pty = { path = "crates/kmux-pty" }
 kmux-protocol = { path = "crates/kmux-protocol" }
+# The host-facing half of the protocol stack: XDG paths, machine identity, TLS
+# material, transports. Split out of kmux-protocol so the wire types stay pure
+# data with no nix/rustls/ring/quinn behind them.
+kmux-sys = { path = "crates/kmux-sys" }
 # The client stack defaults to a lean, UDS-only build (no quinn/rustls/ssh): the
 # `remote` feature (default-on when each crate is built standalone) is disabled
 # here so GUI frontends inherit the lean stack and only `kmuxd` opts back in via
@@ -45,7 +53,6 @@ clap = { version = "4.6.1", features = ["derive", "unstable-ext"] }
 # `unstable-dynamic` and clap's `unstable-ext` track clap's minor version, so
 # keep this tilde-pinned in lockstep with clap (4.6.x). See docs/shell-completion.md.
 clap_complete = { version = "~4.6", features = ["unstable-dynamic"] }
-futures = "0.3"
 daemonize = "0.5"
 nix = { version = "0.31", features = ["fs", "net", "process", "signal", "socket", "term", "uio", "user"] }
 serde_json = "1"
@@ -69,7 +76,7 @@ proptest = "1"
 rcgen = "0.14.7"
 # Ed25519 sign/verify for cryptographic machine identity (issue #146). Already
 # in the tree transitively via rustls; pinned to the resolved version. Pulled
-# only by kmux-protocol's `identity` feature.
+# only by kmux-sys's `identity` feature.
 ring = "0.17"
 sha2 = "0.11.0"
 rustls = { version = "0.23.28", default-features = false, features = ["ring", "logging", "std", "tls12"] }
@@ -118,3 +125,135 @@ fontconfig-sys = { package = "yeslogic-fontconfig-sys", version = "6" }
 
 # Dev dependencies
 tempfile = "3"
+
+# ── Lints ─────────────────────────────────────────────────────────────────────
+# THE HARD GATE. Everything in these tables is at zero today, verified by a full
+# `cargo clippy --workspace --all-targets` run, and must stay at zero. Members
+# opt in with `[lints] workspace = true`.
+#
+# Levels are "warn", not "deny", on purpose: `mise run clippy` runs `-D warnings`
+# and promotes every one of them to an error in the hooks and in CI, while a
+# plain `cargo build` or rust-analyzer session stays readable.
+#
+# Lints that are NOT yet at zero are deliberately absent from this table. Putting
+# one here at any level would break the tree immediately, because -D warnings
+# makes "warn" fatal. They are instead injected by the lint gate as `-W` flags
+# and ratcheted per crate against quality-baseline.toml. Graduating one is a
+# two-line commit: drop it from the gate's list, add it here.
+#
+# Measured counts for the lints held back, so the next person does not have to
+# re-measure: clippy::str_to_string 715 (excluded on purpose — see below),
+# clippy::manual_let_else 18, trivial_casts 16.
+[workspace.lints.rust]
+# priority = -1 so the individual entries below can override the group; cargo
+# sorts by priority, then emits the flags left to right.
+future_incompatible = { level = "warn", priority = -1 }
+# Homoglyph and bidi source attacks.
+non_ascii_idents = "deny"
+# An `#[expect(...)]` whose violation no longer exists must be deleted. This is
+# what makes `#[allow]` -> `#[expect]` migration self-cleaning, and it is why
+# AGENTS.md requires `#[expect]` for every new suppression.
+unfulfilled_lint_expectations = "warn"
+unused_must_use = "deny"
+unused_extern_crates = "warn"
+unused_lifetimes = "warn"
+unused_macro_rules = "warn"
+trivial_numeric_casts = "warn"
+# Graduated from the ratchet once `cargo clippy --fix` cleared them: 65 redundant
+# `crate::`/module qualifications and 2 elided lifetimes in paths.
+unused_qualifications = "warn"
+elided_lifetimes_in_paths = "warn"
+# 16 sites, all of them `Arc<Concrete> as Arc<dyn Trait>` or `&T as *const T`.
+# The cast is what stops the compiler from checking the target type, so each
+# one became a type-annotated binding instead. Note `Arc::clone(&x)` cannot
+# coerce (it infers `T` from the argument, not the annotation), so those sites
+# read `x.clone()`.
+trivial_casts = "warn"
+
+[workspace.lints.clippy]
+# `all` is clippy's default set and is already the effective gate via
+# `-D warnings`; stating it makes the baseline explicit rather than implied.
+all = { level = "warn", priority = -1 }
+# Manifest hygiene: every member already carries description/license/repository.
+cargo = { level = "warn", priority = -1 }
+# cargo-deny owns duplicate-version policy, with better diagnostics and an
+# explicit skip list; clippy's version is a flat, unactionable wall.
+multiple_crate_versions = "allow"
+
+# Placeholders and debug residue.
+todo = "deny"
+unimplemented = "deny"
+dbg_macro = "deny"
+# Numeric and pointer hygiene. This workspace hand-rolls a MessagePack field
+# order and a C ABI, so a silent reinterpretation is a wire or FFI bug.
+cast_ptr_alignment = "deny"
+fn_to_numeric_cast_any = "deny"
+lossy_float_literal = "deny"
+rest_pat_in_fully_bound_structs = "warn"
+inefficient_to_string = "warn"
+# Graduated from the ratchet once `cargo clippy --fix` cleared them: raw pointer
+# casts became `.cast::<T>()`, `.iter_mut()` in a `for` became `&mut`,
+# `.to_string()` on a `String` became `.clone()`. `verbose_file_reads` has one
+# `#[expect]` in kmux-connect, where the read follows a seek and `fs::read`
+# would be wrong.
+ptr_as_ptr = "warn"
+explicit_iter_loop = "warn"
+implicit_clone = "warn"
+verbose_file_reads = "warn"
+
+# Idioms measured at zero across the whole workspace, so adopting them costs no
+# source change — they exist to keep the count at zero. Each one is a pattern
+# that reads as a deliberate choice when you meet it in review but is almost
+# always an accident: a manual `Deref` call, a `FromIterator::from_iter` where
+# `.collect()` reads better, `&Option<&T>` (two indirections for one value), a
+# `filter().next()` that is `find()`, a `flat_map` over an `Option` that is
+# `and_then`, a byte-by-byte count that has a vectorised form, an
+# `ends_with(".TOML")` comparison that silently depends on case, a manual
+# range-check that `TryFrom` expresses, decomposed Unicode in a literal, and a
+# map whose values carry no information.
+explicit_deref_methods = "warn"
+from_iter_instead_of_collect = "warn"
+ref_option_ref = "warn"
+filter_map_next = "warn"
+flat_map_option = "warn"
+manual_ok_or = "warn"
+naive_bytecount = "warn"
+case_sensitive_file_extension_comparisons = "warn"
+checked_conversions = "warn"
+unicode_not_nfc = "warn"
+verbose_bit_mask = "warn"
+zero_sized_map_values = "warn"
+
+# Graduated from the ratchet by clearing them: 57 sites over 13 lints, small
+# enough that recording them as a budget to pay down later would have cost more
+# than paying them now. Mostly `cargo clippy --fix`; the four that needed a
+# human are in the commit that cleared them (a 64 KiB stack array inside an
+# async fn, `mem::forget` where `ManuallyDrop` says what was meant, a method
+# taking `&self` it never read, and eleven builder methods whose return value
+# was silently discardable).
+uninlined_format_args = "warn"
+semicolon_if_nothing_returned = "warn"
+unnested_or_patterns = "warn"
+equatable_if_let = "warn"
+stable_sort_primitive = "warn"
+range_plus_one = "warn"
+redundant_else = "warn"
+manual_assert = "warn"
+return_self_not_must_use = "warn"
+if_not_else = "warn"
+unused_self = "warn"
+mem_forget = "warn"
+large_stack_arrays = "warn"
+
+# The mechanical batch: 531 sites cleared in one `cargo clippy --fix` pass
+# (`use_self` 312, `doc_markdown` 91, `redundant_closure_for_method_calls` 82,
+# plus stragglers), then 36 more by hand where no machine-applicable suggestion
+# exists — every `manual_let_else` and every `trivial_casts`. `use_self` is the
+# one worth stating a reason for: spelling the type where `Self` would do makes
+# a rename look like an edit in every impl block, and hides which mentions are
+# really about *this* type.
+use_self = "warn"
+doc_markdown = "warn"
+redundant_closure_for_method_calls = "warn"
+map_unwrap_or = "warn"
+manual_let_else = "warn"

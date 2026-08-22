@@ -44,7 +44,7 @@ pub struct RenderedPixels {
 }
 
 /// Where the renderer presents: an offscreen texture read back by the caller
-/// (GTK), or a platform surface presented directly (Swift/macOS CAMetalLayer).
+/// (GTK), or a platform surface presented directly (Swift/macOS `CAMetalLayer`).
 enum Target {
     /// Render to an internal texture; `read_pixels` copies it out.
     Offscreen { texture: wgpu::Texture },

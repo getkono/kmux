@@ -74,7 +74,7 @@ pub struct RenderMetrics {
     apply_duration: RingBuffer,
     batch_size: RingBuffer,
     last_diff_ops: usize,
-    /// End-to-end latency (sent_at → apply complete) for the most recent large diff (>100 ops).
+    /// End-to-end latency (`sent_at` → apply complete) for the most recent large diff (>100 ops).
     last_large_diff_ms: f64,
     counters: DiagCounters,
     event_log: EventLog,

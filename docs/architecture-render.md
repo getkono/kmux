@@ -167,18 +167,26 @@ GPU path it also shows the scene primitive counts. Toggle it:
 
 Compare the overlay's `px:` line against what you see drawn. The overlay's rect
 comes from `cursor_geometry`, which shares its per-shape rect math
-(`cursor_shape_rects`) with the renderer's `emit_cursor`, so it provably matches
-the GPU path. The **CPU** paths rasterize the cursor directly with their *own*
-constants — GTK Cairo and Swift CoreText both hardcode a **2px** bar/underline,
-while the renderer uses a scale-aware `cursor_thickness` (`(cell_h*0.1).max(1)`).
-That divergence is exactly the kind of bug the overlay surfaces.
+(`cursor_shape_rects`) with the renderer's `emit_cursor` — and, since the GTK
+Cairo path was moved onto it, with what Cairo fills. All three agree by
+construction rather than by inspection.
+
+They did not. Cairo and CoreText each rasterized the cursor with their own
+constants: a hardcoded **2px** bar/underline and a **1px** hollow outline,
+against the renderer's scale-aware `cursor_thickness` (`(cell_h*0.1).max(1)`).
+On a HiDPI display the cell doubles and those constants did not, so the same
+cursor was thinner on the CPU paths than under wgpu — the bug this overlay was
+built to surface, and which it did. Cairo now calls `cursor_geometry` directly;
+Swift reaches it through the `kmux_cursor_rects` FFI export, which exists for
+exactly this reason and returns the same rects.
 
 **Structured traces** — under the `kmux::render_debug` target:
 
-- `RUST_LOG="kmux::render_debug=trace"` — per-frame cursor geometry. The GPU path
-  logs `cursor_geometry`'s rect; the GTK Cairo path logs its hardcoded constants
-  *next to* the renderer's `cursor_thickness` (one line, side by side) — diffing
-  the two pinpoints a cursor mismatch. Also emits a one-shot line on renderer reset.
+- `RUST_LOG="kmux::render_debug=trace"` — per-frame cursor geometry from the GPU
+  path: `cursor_geometry`'s rect for each pane's cursor. The GTK Cairo path used
+  to log its own constants beside the renderer's for comparison; it now reads the
+  same function, so there is nothing left to compare. Also emits a one-shot line
+  on renderer reset.
 - `RUST_LOG=kmux_render=trace` — the renderer's own render/resize/atlas-rebuild
   lines (adapter, surface, frame skips).
 

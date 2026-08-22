@@ -525,8 +525,7 @@ mod tests {
         let msg = ctrl_rx.try_recv().expect("should receive Lagged on ctrl");
         assert!(
             matches!(&msg, ServerMessage::Lagged { pane_id, .. } if pane_id == "eagle/0"),
-            "expected Lagged message, got {:?}",
-            msg
+            "expected Lagged message, got {msg:?}"
         );
     }
 
@@ -686,7 +685,7 @@ mod tests {
                     first_index, lines, ..
                 } => grid.apply_scrollback_append(first_index, lines),
                 ServerMessage::CursorUpdate { cursor, modes, .. } => {
-                    grid.apply_cursor_update(cursor, modes)
+                    grid.apply_cursor_update(cursor, modes);
                 }
                 ServerMessage::GridDigest { hash, .. } => {
                     assert_eq!(
@@ -823,7 +822,7 @@ mod tests {
                     first_index, lines, ..
                 } => grid.apply_scrollback_append(first_index, lines),
                 ServerMessage::CursorUpdate { cursor, modes, .. } => {
-                    grid.apply_cursor_update(cursor, modes)
+                    grid.apply_cursor_update(cursor, modes);
                 }
                 ServerMessage::GridDigest { hash, .. } => {
                     assert_eq!(

@@ -1,7 +1,7 @@
 //! Toolkit-agnostic color palette (theme) model and loading.
 //!
 //! This is the single source of truth for kmux themes. Colors are stored as a
-//! plain [`Rgb`] triple; each frontend converts to its own color type at the
+//! plain [`crate::theme::Rgb`] triple; each frontend converts to its own color type at the
 //! render boundary (e.g. `kmux-gtk` maps `Rgb` to `gdk::RGBA`, and the Swift app
 //! to an `NSColor` via FFI). Nothing here depends on a UI toolkit.
 
@@ -46,7 +46,7 @@ pub struct Theme {
     pub orange: Rgb,
     pub status_bg: Rgb,
     /// Background of the inner-pane cursor for shapes that fill the cell
-    /// (Block, HollowBlock); also used as the foreground glyph color for
+    /// (Block, `HollowBlock`); also used as the foreground glyph color for
     /// Bar/Underline. Defaults to `fg` for high contrast against `bg`.
     pub cursor_bg: Rgb,
     /// Text color drawn on top of the Block cursor's background. Defaults to
@@ -57,7 +57,17 @@ pub struct Theme {
 /// Deserialisation shape for `themes/*.toml` files.
 #[derive(Debug, Deserialize)]
 struct ThemeFile {
-    #[allow(dead_code)]
+    /// Required of every theme file, and read by nobody.
+    ///
+    /// It is a schema requirement rather than data: a user theme loaded through
+    /// [`parse_theme_toml`] must declare a name, and the built-ins are selected
+    /// by the name the caller asked for, not by this one. Dropping the field
+    /// would make `name` a key serde silently ignores, which is a worse
+    /// contract than an unread one.
+    #[expect(
+        dead_code,
+        reason = "schema requirement: a theme file must name itself"
+    )]
     name: String,
     bg: String,
     fg: String,

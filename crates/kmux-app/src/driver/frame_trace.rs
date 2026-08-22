@@ -25,7 +25,7 @@ impl ClientTraceSink {
         if !enabled {
             return None;
         }
-        let path = kmux_protocol::dirs::client_trace_path().ok()?;
+        let path = kmux_sys::dirs::client_trace_path().ok()?;
         match OpenOptions::new().create(true).append(true).open(&path) {
             Ok(file) => {
                 tracing::info!("frame tracing ACTIVE — client ticks → {}", path.display());

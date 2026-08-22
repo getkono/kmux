@@ -8,9 +8,8 @@ impl SessionManager {
     /// Returns `Ok(pane_id)` if input is allowed on the active pane, or sets
     /// `status_msg` and returns `Err(false)` if the pane is locked.
     fn active_pane_unlocked(&mut self) -> Result<String, bool> {
-        let pane_id = match self.active_pane.clone() {
-            Some(p) => p,
-            None => return Err(true),
+        let Some(pane_id) = self.active_pane.clone() else {
+            return Err(true);
         };
         if self.input_locked.get(&pane_id).copied().unwrap_or(false) {
             self.status_msg = "Input locked on this pane".to_string();
@@ -187,8 +186,7 @@ impl SessionManager {
             return true;
         }
         parse_pane_id(pane_id)
-            .map(|(word_id, _)| self.auto_pause_exempt_sessions.contains(word_id))
-            .unwrap_or(false)
+            .is_some_and(|(word_id, _)| self.auto_pause_exempt_sessions.contains(word_id))
     }
 
     /// Whether the pane was explicitly marked exempt at the *pane* level (drives
@@ -259,9 +257,7 @@ impl SessionManager {
             self.auto_pause_exempt_sessions.remove(word_id);
         }
         for pane_id in self.visible_panes.clone() {
-            let in_session = parse_pane_id(&pane_id)
-                .map(|(w, _)| w == word_id)
-                .unwrap_or(false);
+            let in_session = parse_pane_id(&pane_id).is_some_and(|(w, _)| w == word_id);
             if in_session {
                 self.send_ws(ClientMessage::SetPaneNoAutoPause { pane_id, exempt });
             }

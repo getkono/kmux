@@ -5,7 +5,7 @@
 //! (`kmux-gtk`, `kmux-swift`, …). It owns the *interaction policy* that is
 //! independent of any UI toolkit:
 //!
-//! - the modal keymap (`Mode`) and the [`Action`] vocabulary keys resolve to,
+//! - the modal keymap (`Mode`) and the [`crate::mode::Action`] vocabulary keys resolve to,
 //! - the `/`-command palette,
 //! - the `AppCore` view-model and connection-orchestration state machine,
 //! - the theme *spec* (a toolkit-neutral RGB palette) and config loading,
@@ -64,6 +64,10 @@ pub mod launch;
 
 /// Single source of build + version metadata ([`version::VersionInfo`]) surfaced
 /// by `kmux -V` and both GUIs' "About" panels.
+/// Rendering numbers the way a person reads them, in the two styles kmux
+/// shows: full units for CLI output, compact for a fixed-width GUI column.
+pub mod humanize;
+
 pub mod version;
 
 /// The frontend-agnostic client view-model ([`core::AppCore`]) and the
@@ -73,9 +77,3 @@ pub mod core;
 /// The toolkit-agnostic run-loop driver ([`driver::FrontendDriver`]) that owns
 /// the network channels + pump shared by every frontend.
 pub mod driver;
-
-/// Serializes process-environment mutation (`XDG_CONFIG_HOME` / `XDG_RUNTIME_DIR`)
-/// across the whole `kmux-app` test binary, since several modules' tests redirect
-/// the same vars and Cargo runs tests in parallel threads within one process.
-#[cfg(test)]
-pub(crate) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

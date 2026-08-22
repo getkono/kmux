@@ -6,63 +6,34 @@ authors.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
-description = "Versioned wire protocol shared between kmux and kmuxd."
+description = "Versioned wire protocol shared between kmux and kmuxd: message types, codec, and compatibility classification. Pure data — see kmux-sys for paths, identity, TLS and transports."
 
 [features]
 default = ["framing"]
 # Length-prefixed async framing + per-frame zstd compression of the wire codec.
 framing = ["dep:tokio", "dep:zstd"]
-# TLS helpers (rustls, rcgen, TOFU store). Pulled in by quic and tcp-tls.
-tls = [
-    "dep:rustls",
-    "dep:rustls-pemfile",
-    "dep:rustls-native-certs",
-    "dep:rcgen",
-    "dep:sha2",
-    "dep:toml",
-]
-# Cryptographic machine/user identity: Ed25519 keypair persistence, fingerprint,
-# sign, and verify (issue #146). Only the keypair logic is gated; the wire fields
-# that carry public keys / signatures / nonces are plain bytes and always
-# compiled. Enabled by every crate that signs (clients) or verifies (daemon).
-identity = ["dep:ring", "dep:sha2"]
-# QUIC transport.
-quic = ["tls", "dep:quinn"]
-# TCP+TLS transport.
-tcp-tls = ["tls", "dep:tokio-rustls", "dep:tokio"]
-# Unix domain socket transport.
-uds = ["dep:tokio"]
-# Gate ClientTransport impls (client-side only builds).
-client = []
-# Gate Listener impls (server-side only builds).
-server = []
 
 [dependencies]
-anyhow.workspace = true
 bitflags = { workspace = true, features = ["serde"] }
-nix = { workspace = true, features = ["net", "user", "hostname"] }
-tokio-rustls = { workspace = true, optional = true }
 serde.workspace = true
 rmp-serde.workspace = true
 serde_bytes.workspace = true
 thiserror.workspace = true
-tracing.workspace = true
 tokio = { workspace = true, optional = true }
 zstd = { workspace = true, optional = true }
-quinn = { workspace = true, optional = true }
-# tls feature deps
-rustls = { workspace = true, optional = true }
-rustls-pemfile = { workspace = true, optional = true }
-rustls-native-certs = { workspace = true, optional = true }
-rcgen = { workspace = true, optional = true }
-sha2 = { workspace = true, optional = true }
-# Ed25519 sign/verify for the `identity` feature (issue #146).
-ring = { workspace = true, optional = true }
-toml = { workspace = true, optional = true }
 
 [dev-dependencies]
-tempfile.workspace = true
 # Used by the `compression_bench` example to sweep zstd levels offline.
 zstd.workspace = true
 # Round-trip tests for the JSON control/handoff protocol (control_rpc.rs).
 serde_json.workspace = true
+
+[lints]
+workspace = true
+
+# serde_bytes is used through `#[serde(with = "serde_bytes")]` -- a string
+# literal in an attribute, not a `use`, so cargo-machete cannot see it. Dropping
+# it would silently re-encode every byte-slice field as an array of integers,
+# which is a wire-format change.
+[package.metadata.cargo-machete]
+ignored = ["serde_bytes"]

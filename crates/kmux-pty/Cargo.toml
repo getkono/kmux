@@ -16,3 +16,6 @@ tokio.workspace = true
 nix.workspace = true
 thiserror.workspace = true
 serde = { workspace = true, optional = true }
+
+[lints]
+workspace = true

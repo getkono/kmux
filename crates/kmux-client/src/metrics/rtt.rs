@@ -82,7 +82,7 @@ impl RttTracker {
     }
 
     pub fn summary(&self, transport: &TransportKey) -> Option<RttSummary> {
-        self.per_transport.get(transport).map(|h| h.summary())
+        self.per_transport.get(transport).map(History::summary)
     }
 
     pub fn all_summaries(&self) -> Vec<(TransportKey, RttSummary)> {

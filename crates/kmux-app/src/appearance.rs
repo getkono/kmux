@@ -4,7 +4,7 @@
 //! cell-geometry settings each frontend applies at its render leaf: `kmux-gtk`
 //! builds a `pango::FontDescription` + an `AttrFontFeatures` attribute list, the
 //! Swift app builds an `NSFont` + CoreText feature settings — both from the same
-//! [`Appearance`]. Nothing here depends on a UI toolkit.
+//! [`crate::appearance::Appearance`]. Nothing here depends on a UI toolkit.
 //!
 //! The settings track [Ghostty's config reference][ghostty] key names
 //! (`font-family`, `font-size`, `font-feature`, `adjust-cell-*`, …); see
@@ -90,7 +90,7 @@ pub enum CellAdjust {
 
 impl Default for CellAdjust {
     fn default() -> Self {
-        CellAdjust::Pixels(0.0)
+        Self::Pixels(0.0)
     }
 }
 
@@ -112,8 +112,8 @@ impl CellAdjust {
     /// Apply this adjustment to a measured base dimension.
     pub fn apply(self, base: f64) -> f64 {
         match self {
-            CellAdjust::Pixels(px) => base + px as f64,
-            CellAdjust::Percent(p) => base * (1.0 + p as f64 / 100.0),
+            Self::Pixels(px) => base + px as f64,
+            Self::Percent(p) => base * (1.0 + p as f64 / 100.0),
         }
     }
 }

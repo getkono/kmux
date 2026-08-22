@@ -138,7 +138,7 @@ impl ServerApp {
 
         // Detach from every pane of this session, releasing any input lock and
         // reconciling the smallest-wins size so the kicked client no longer counts.
-        for (pane_index, relay) in state.panes.iter_mut() {
+        for (pane_index, relay) in &mut state.panes {
             let pane_id = format_pane_id(&state.meta.word_id, *pane_index);
             relay.clients.lock().unwrap().remove(&target);
             relay.recompute_live_capabilities();

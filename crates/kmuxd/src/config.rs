@@ -93,7 +93,7 @@ pub enum SessionIsolationMode {
 impl SessionIsolationMode {
     /// Whether per-pane worker subprocess isolation is requested.
     pub fn is_process(self) -> bool {
-        matches!(self, SessionIsolationMode::Process)
+        matches!(self, Self::Process)
     }
 }
 

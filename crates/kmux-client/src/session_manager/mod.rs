@@ -92,12 +92,12 @@ pub struct SessionManager {
     pub label: Option<String>,
     /// The daemon's own identity fingerprint, from `AuthResult`.
     pub server_machine_id: Option<String>,
-    /// Currently active session (word_id).
+    /// Currently active session (`word_id`).
     pub active_session: Option<WordId>,
     /// The tab currently viewed within `active_session` (client-local — which
     /// tab a client views is not shared, unlike the layout tree + focus).
     pub active_tab: Option<u32>,
-    /// The **focused** pane (pane_id = "{word_id}/{pane_index}") — the input
+    /// The **focused** pane (`pane_id` = "{`word_id}/{pane_index`}") — the input
     /// target and the highlighted leaf within the visible set.
     pub active_pane: Option<PaneId>,
     /// Panes currently attached + rendered: the leaves of the active tab's
@@ -118,9 +118,9 @@ pub struct SessionManager {
     pub(super) zoomed: bool,
     /// Rotating index into the preset [`LayoutScheme`]s for `cycle_layout`.
     pub(super) layout_scheme_idx: usize,
-    /// Terminal buffers keyed by pane_id. Client panes are worker-backed
+    /// Terminal buffers keyed by `pane_id`. Client panes are worker-backed
     /// ([`CellGrid::published`]); content applies run off the UI thread on
-    /// [`Self::apply`] (issue #182, §1).
+    /// `Self::apply` (issue #182, §1).
     pub buffers: HashMap<PaneId, CellGrid>,
     /// Off-UI-thread grid apply worker, spawned lazily on the first real connect
     /// (`set_ws_sender`/`apply_outcome`). `None` in tests, which drive
@@ -438,9 +438,7 @@ impl SessionManager {
         let Some(tx) = self.ws_sender.as_ref() else {
             return;
         };
-        let bytes = kmux_protocol::encode_client(&msg)
-            .map(|b| b.len())
-            .unwrap_or(0);
+        let bytes = kmux_protocol::encode_client(&msg).map_or(0, |b| b.len());
         let category = msg.category();
         if let Err(e) = tx.send(msg) {
             warn!("send_ws failed: {e}");
@@ -454,7 +452,7 @@ impl SessionManager {
     /// Enable rolling-JSONL persistence for this session's metrics. Called
     /// by the TUI after construction so tests stay filesystem-free.
     pub fn enable_metrics_persistence(&mut self) {
-        match kmux_protocol::dirs::metrics_log_path() {
+        match kmux_sys::dirs::metrics_log_path() {
             Ok(path) => {
                 self.metrics = MetricsStore::new(Some(JsonlSink::new(path)));
             }
@@ -2194,7 +2192,7 @@ mod tests {
         // scrollback gap (the client is legitimately behind on the envelope).
         mgr.handle_server_message(ServerMessage::TerminalUpdate {
             pane_id: pane.clone(),
-            diff: std::sync::Arc::new(kmux_protocol::messages::TerminalDiff {
+            diff: Arc::new(kmux_protocol::messages::TerminalDiff {
                 ops: vec![],
                 cursor: kmux_protocol::messages::CursorState::default(),
                 modes: TermModes::EMPTY,

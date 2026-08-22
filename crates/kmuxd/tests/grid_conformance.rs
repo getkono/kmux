@@ -151,7 +151,7 @@ fn conformance_scrollback_accumulation() {
     for n in 0..40 {
         chunks.push(format!("row number {n}\r\n").into_bytes());
     }
-    let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+    let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
     check_conformance(&refs);
 }
 
@@ -237,7 +237,7 @@ fn conformance_seeded_random_stream() {
                 chunks.push(chunk);
             }
         }
-        let refs: Vec<&[u8]> = chunks.iter().map(|c| c.as_slice()).collect();
+        let refs: Vec<&[u8]> = chunks.iter().map(Vec::as_slice).collect();
         // Surface which seed diverged if the oracle ever trips.
         std::panic::catch_unwind(|| check_conformance(&refs))
             .unwrap_or_else(|_| panic!("conformance diverged for seed {seed:#x}"));

@@ -64,7 +64,6 @@ impl From<BackendSize> for TermSize {
 /// the atomics are still populated because the kmux-protocol capability
 /// negotiation contract requires them and a future backend (or wire-level
 /// gating) may consume them.
-#[allow(dead_code)]
 pub struct CapabilityHandles {
     pub kitty_graphics: Arc<AtomicBool>,
     pub kitty_keyboard: Arc<AtomicBool>,
@@ -99,7 +98,6 @@ pub struct NullEventSink;
 impl BackendEventSink for NullEventSink {}
 
 /// Configuration passed to [`TerminalBackend::new`].
-#[allow(dead_code)]
 pub struct BackendConfig {
     pub size: BackendSize,
     /// Live kitty-graphics/keyboard toggles. Populated on every
@@ -198,14 +196,4 @@ pub trait TerminalBackend: Send + 'static {
     fn encode_key_event(&self, _event: &KeyEvent) -> Vec<u8> {
         Vec::new()
     }
-}
-
-/// Marker trait for future runtime backend selection.
-///
-/// Reserved: when vtable-erased backend switching is worth the cost, a factory
-/// registry will use this trait to construct backends by name.  Until then,
-/// selection is static via `ActiveBackend` in `term_state.rs`.
-#[allow(dead_code)]
-pub trait BackendFactory: Send + Sync + 'static {
-    fn name(&self) -> &'static str;
 }

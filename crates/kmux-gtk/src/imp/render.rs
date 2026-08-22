@@ -497,74 +497,57 @@ fn draw_cursor(
     // override it independently of the text foreground.
     let cur = palette.cursor_bg;
 
-    // Render-debug trace: the Cairo path's hardcoded cursor geometry (2px
-    // bar/underline below) side-by-side with what kmux-render's `cursor_geometry`
-    // would compute (scale-aware `cursor_thickness`). The divergence is the prime
-    // suspect for incorrect cursor rendering — enable with
-    // `RUST_LOG="kmux::render_debug=trace"`.
-    if tracing::enabled!(target: "kmux::render_debug", tracing::Level::TRACE) {
-        let rcell = kmux_render::CellMetrics::new(m.cell_w as f32, m.cell_h as f32);
-        let cv = kmux_render::CursorView {
-            col: cursor.col,
-            row: cursor.row,
-            shape: cursor.shape,
-            blink: cursor.blink,
-            visible: cursor.visible,
-        };
-        let geo = kmux_render::cursor_geometry(&cv, (0.0, 0.0), cols as u16, rows as u16, &rcell);
-        tracing::trace!(
-            target: "kmux::render_debug",
-            col = cursor.col,
-            row = cursor.row,
-            shape = ?cursor.shape,
-            cairo_x = x,
-            cairo_y = y,
-            cairo_bar_underline_thickness = 2.0_f64,
-            renderer_cursor_thickness = rcell.cursor_thickness,
-            renderer_rect0 = ?geo.rects.first(),
-            "cairo cursor vs kmux-render geometry"
+    // Geometry comes from `kmux-render`, not from here. The two renderers used
+    // to compute the cursor independently -- this path with a hardcoded 2px
+    // bar/underline and a 1px hollow outline, the GPU path with a scale-aware
+    // `cursor_thickness` of `max(cell_h * 0.1, 1.0)` -- so the same cursor was
+    // drawn differently depending on which renderer was selected, and visibly
+    // too thin under Cairo on a HiDPI display, where a cell is twice as tall
+    // and the bar stayed two physical pixels. The divergence was known: the
+    // code computed both and logged the difference.
+    //
+    // Both paths now derive `CellMetrics` the same way and read the same
+    // `cursor_shape_rects`, so the rects are identical, not merely similar.
+    // What is left here is Cairo's half of the job: filling them, and redrawing
+    // the glyph inside an inverted block.
+    let rcell = kmux_render::CellMetrics::new(m.cell_w as f32, m.cell_h as f32);
+    let view = kmux_render::CursorView {
+        col: cursor.col,
+        row: cursor.row,
+        shape: cursor.shape,
+        blink: cursor.blink,
+        visible: cursor.visible,
+    };
+    let geo = kmux_render::cursor_geometry(&view, (0.0, 0.0), cols as u16, rows as u16, &rcell);
+
+    src(cr, cur.r, cur.g, cur.b);
+    for rect in &geo.rects {
+        cr.rectangle(
+            f64::from(rect.x),
+            f64::from(rect.y),
+            f64::from(rect.w),
+            f64::from(rect.h),
         );
     }
+    let _ = cr.fill();
 
-    match cursor.shape {
-        CursorShape::Block => {
-            // Inverted block: fill with the cursor color, redraw the glyph in
-            // the theme's `cursor_fg` (defaults to `bg`) so it stays legible.
-            src(cr, cur.r, cur.g, cur.b);
-            cr.rectangle(x, y, m.cell_w, m.cell_h);
-            let _ = cr.fill();
-            if let Some(cs) = cells.get(cy * cols + cx)
-                && cs.c != ' '
-                && cs.c != '\0'
-                && !cs.c.is_control()
-                && !cs.attrs.contains(CellAttrs::WIDE_CHAR_SPACER)
-            {
-                let fg = palette.cursor_fg;
-                src(cr, fg.r, fg.g, fg.b);
-                layout.set_font_description(Some(&m.font));
-                let mut buf = [0u8; 4];
-                layout.set_text(cs.c.encode_utf8(&mut buf));
-                cr.move_to(x, y);
-                pangocairo::functions::show_layout(cr, layout);
-            }
-        }
-        CursorShape::HollowBlock => {
-            src(cr, cur.r, cur.g, cur.b);
-            cr.set_line_width(1.0);
-            cr.rectangle(x + 0.5, y + 0.5, m.cell_w - 1.0, m.cell_h - 1.0);
-            let _ = cr.stroke();
-        }
-        CursorShape::Underline => {
-            src(cr, cur.r, cur.g, cur.b);
-            cr.rectangle(x, y + m.cell_h - 2.0, m.cell_w, 2.0);
-            let _ = cr.fill();
-        }
-        CursorShape::Bar => {
-            src(cr, cur.r, cur.g, cur.b);
-            cr.rectangle(x, y, 2.0, m.cell_h);
-            let _ = cr.fill();
-        }
-        CursorShape::Hidden => {}
+    // An inverted block covers the glyph, so redraw it in the theme's
+    // `cursor_fg` (defaults to `bg`) to keep it legible. The other shapes leave
+    // the cell's own text alone.
+    if cursor.shape == CursorShape::Block
+        && let Some(cs) = cells.get(cy * cols + cx)
+        && cs.c != ' '
+        && cs.c != '\0'
+        && !cs.c.is_control()
+        && !cs.attrs.contains(CellAttrs::WIDE_CHAR_SPACER)
+    {
+        let fg = palette.cursor_fg;
+        src(cr, fg.r, fg.g, fg.b);
+        layout.set_font_description(Some(&m.font));
+        let mut buf = [0u8; 4];
+        layout.set_text(cs.c.encode_utf8(&mut buf));
+        cr.move_to(x, y);
+        pangocairo::functions::show_layout(cr, layout);
     }
 }
 

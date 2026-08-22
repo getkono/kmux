@@ -1,7 +1,7 @@
 //! Toolkit-agnostic tiling-layout resolver.
 //!
-//! Given a tab's server-authoritative [`LayoutNode`] tree and the available
-//! content area (in cells), [`resolve_layout`] produces one [`PaneRect`] per
+//! Given a tab's server-authoritative [`kmux_protocol::messages::LayoutNode`] tree and the available
+//! content area (in cells), [`crate::layout::resolve_layout`] produces one [`crate::layout::PaneRect`] per
 //! leaf, in cell coordinates. Every frontend (TUI, GTK, Swift via FFI) calls
 //! this — none reimplements it — so all clients viewing the same tab compute
 //! **identical** geometry for the same `(tree, area, config)`.
@@ -211,7 +211,7 @@ pub struct Divider {
 /// `n - 1` dividers; a single `Leaf` yields none — so a zoomed
 /// `render_layout()` (a single leaf) has zero dividers and nothing to drag.
 /// Order is depth-first, matching [`resolve_layout`]; divider hit cells fall in
-/// the exact gutters `resolve_layout` leaves blank (both use [`child_extents`]).
+/// the exact gutters `resolve_layout` leaves blank (both use `child_extents`).
 pub fn resolve_dividers(
     node: &LayoutNode,
     area_cols: u16,

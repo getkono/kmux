@@ -21,7 +21,7 @@ use kmux_client::pipeline::{
 use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
 use kmux_protocol::messages::{ClientMessage, ServerMessage};
 #[cfg(feature = "remote")]
-use kmux_protocol::transport::bootstrap::EndpointAdvert;
+use kmux_sys::transport::EndpointAdvert;
 use tokio::sync::mpsc;
 use tokio::time::timeout;
 
@@ -82,7 +82,7 @@ pub async fn run_dry_run(args: &ServerArgs, test_mode: bool) -> anyhow::Result<(
 
 /// Send a `Ping { seq: 0 }` and await `Pong { seq: 0 }` within [`PING_TIMEOUT`].
 ///
-/// Intervening messages (AuthResult, SessionListResult, etc.) are drained
+/// Intervening messages (`AuthResult`, `SessionListResult`, etc.) are drained
 /// and ignored — we only care that the control-plane is healthy end-to-end.
 async fn verify_ping(
     outcome: &BootstrapOutcome,
@@ -160,7 +160,7 @@ async fn run_supervisor_phase(
     }
 
     if endpoints.is_empty() {
-        let _ = tokio::time::timeout(TEST_DURATION, async {
+        let _ = timeout(TEST_DURATION, async {
             while let Some(_msg) = srv_rx.recv().await {
                 // drain so the channel doesn't accumulate
             }
@@ -217,7 +217,7 @@ async fn run_supervisor_phase(
     handle.abort();
     observer.line(
         "RESULT",
-        format!("supervisor ended; final observed transport {}", active),
+        format!("supervisor ended; final observed transport {active}"),
     );
     Ok(())
 }
@@ -329,11 +329,11 @@ impl BootstrapObserver for ConsoleObserver {
                 port,
             } => {
                 let addr = if *port > 0 {
-                    format!("{}:{}", host, port)
+                    format!("{host}:{port}")
                 } else {
                     host.to_string()
                 };
-                self.line("HANDSHAKE", format!("{} {}", transport, addr));
+                self.line("HANDSHAKE", format!("{transport} {addr}"));
             }
             BootstrapEvent::HandshakeAuthSent {
                 protocol_version,

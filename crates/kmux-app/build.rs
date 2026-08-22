@@ -13,8 +13,7 @@ fn emit_build_info() {
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
     println!("cargo:rustc-env=BUILD_GIT_SHA={sha}");
 
     let dirty = Command::new("git")
@@ -22,8 +21,7 @@ fn emit_build_info() {
         .output()
         .ok()
         .filter(|o| o.status.success())
-        .map(|o| !o.stdout.is_empty())
-        .unwrap_or(false);
+        .is_some_and(|o| !o.stdout.is_empty());
     println!(
         "cargo:rustc-env=BUILD_GIT_DIRTY_SUFFIX={}",
         if dirty { "-dirty" } else { "" }
@@ -35,8 +33,7 @@ fn emit_build_info() {
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
     println!("cargo:rustc-env=BUILD_DATE={date}");
 
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "unknown".to_string());
@@ -49,8 +46,7 @@ fn emit_build_info() {
         .and_then(|rustc| Command::new(rustc).arg("--version").output().ok())
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
     println!("cargo:rustc-env=BUILD_RUSTC_VERSION={rustc}");
 
     // Full UTC build timestamp (ISO-8601) — a superset of BUILD_DATE.
@@ -60,8 +56,7 @@ fn emit_build_info() {
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| String::from_utf8(o.stdout).ok())
-        .map(|s| s.trim().to_string())
-        .unwrap_or_else(|| "unknown".to_string());
+        .map_or_else(|| "unknown".to_string(), |s| s.trim().to_string());
     println!("cargo:rustc-env=BUILD_TIMESTAMP={timestamp}");
 
     println!("cargo:rerun-if-changed=../../.git/HEAD");

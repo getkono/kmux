@@ -81,7 +81,7 @@ pub struct PersistedDaemonState {
 /// One persisted session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PersistedSession {
-    /// Session-level metadata (word_id, name, cwd, index).
+    /// Session-level metadata (`word_id`, name, cwd, index).
     pub meta: SessionMeta,
     /// Next pane index to assign within this session.
     pub next_pane_index: u32,
@@ -209,7 +209,7 @@ mod tests {
                         rows: 24,
                         cols: 80,
                         cells: vec![
-                            kmux_protocol::messages::CellState {
+                            CellState {
                                 c: 'A',
                                 fg: CellColor::new(0xff, 0xff, 0xff),
                                 bg: CellColor::new(0x00, 0x00, 0x00),
@@ -223,7 +223,7 @@ mod tests {
                         scrollback_base: 0,
                         scrollback_tail: Vec::new(),
                     },
-                    scrollback_lines: vec![vec![kmux_protocol::messages::CellState::default(); 80]],
+                    scrollback_lines: vec![vec![CellState::default(); 80]],
                     cwd: "/home/user/project".to_string(),
                 }],
                 tabs: vec![PersistedTab {
@@ -334,7 +334,7 @@ mod tests {
 
     #[test]
     fn term_size_into_persisted_drops_pixel_dims() {
-        let ts = kmux_protocol::messages::TermSize {
+        let ts = TermSize {
             rows: 40,
             cols: 132,
             pixel_width: 1920,

@@ -4,14 +4,14 @@
 //! and the renderer ([`crate::renderer`]) only uploads it. It mirrors the draw
 //! order of the CPU renderers it replaces:
 //!
-//! 1. **bg_quads** — every cell's background (opaque; spacers included so
+//! 1. **`bg_quads`** — every cell's background (opaque; spacers included so
 //!    wide-char halves stay opaque).
 //! 2. **glyphs** — each cell's glyph in its foreground (dim → reduced alpha).
-//! 3. **overlay_quads** — underline/strikethrough rules, selection wash, the
+//! 3. **`overlay_quads`** — underline/strikethrough rules, selection wash, the
 //!    cursor (block fill / bar / underline / hollow outline), focus border, and
 //!    the scroll-indicator background — in that emission order, so the cursor
 //!    sits above the wash and the border above all.
-//! 4. **overlay_glyphs** — the block cursor's glyph (in `cursor_fg`, over its
+//! 4. **`overlay_glyphs`** — the block cursor's glyph (in `cursor_fg`, over its
 //!    fill) and the scroll-indicator text.
 //!
 //! The renderer draws the four lists in that order. Glyph quads carry only the
@@ -88,10 +88,10 @@ impl FaceStyle {
     /// The face implied by a cell's bold/italic attribute bits.
     pub fn from_attrs(a: CellAttrs) -> Self {
         match (a.contains(CellAttrs::BOLD), a.contains(CellAttrs::ITALIC)) {
-            (true, true) => FaceStyle::BoldItalic,
-            (true, false) => FaceStyle::Bold,
-            (false, true) => FaceStyle::Italic,
-            (false, false) => FaceStyle::Regular,
+            (true, true) => Self::BoldItalic,
+            (true, false) => Self::Bold,
+            (false, true) => Self::Italic,
+            (false, false) => Self::Regular,
         }
     }
 }
@@ -217,7 +217,7 @@ pub struct CursorRect {
 
 /// The cursor's pixel geometry for debug tooling: the cell origin plus the solid
 /// rectangles the renderer would fill. Built by [`cursor_geometry`], which shares
-/// [`cursor_shape_rects`] with [`emit_cursor`] so the debug overlay provably
+/// `cursor_shape_rects` with `emit_cursor` so the debug overlay provably
 /// matches what is drawn.
 #[derive(Debug, Clone, PartialEq)]
 pub struct CursorGeometry {
@@ -230,7 +230,7 @@ pub struct CursorGeometry {
 }
 
 /// The cursor's solid-rect geometry for `cursor` at `pane_origin` (the pane's
-/// top-left in physical px), exactly the rects [`emit_cursor`] would emit.
+/// top-left in physical px), exactly the rects `emit_cursor` would emit.
 ///
 /// Range gating matches the renderer: an out-of-range cursor yields
 /// `in_range = false` with no rects. Blink gating is **not** applied — debug
@@ -436,7 +436,7 @@ pub fn build_scene_cached(
         };
 
         if let Some(grid) = grid {
-            let grid_id = grid as *const CellGrid as usize;
+            let grid_id = std::ptr::from_ref(grid) as usize;
             let pc = &mut cache.panes[pi];
             let nrows = pane.rows as usize;
             // Invalidate this pane's rows if the frame signature changed, the
@@ -696,7 +696,7 @@ fn emit_cursor(
 }
 
 /// The solid rectangles a cursor of `shape` occupies, with cell top-left at
-/// `(x, y)` in physical px. Block → one full-cell rect; HollowBlock → four
+/// `(x, y)` in physical px. Block → one full-cell rect; `HollowBlock` → four
 /// outline rects (top, bottom, left, right — matching [`emit_outline`]);
 /// Underline/Bar → one thin rect; Hidden → none. The single definition shared by
 /// [`emit_cursor`] (the renderer) and [`cursor_geometry`] (debug tooling).
@@ -1200,6 +1200,73 @@ mod tests {
         assert_eq!((r.x, r.y), (8.0, 16.0)); // col 1, row 1 → 8×16 cells
     }
 
+    /// The property the Cairo path now depends on: for *every* shape, the rects
+    /// `cursor_geometry` reports are exactly the ones `emit_cursor` fills. Both
+    /// renderers read this function, so a divergence here is a cursor that looks
+    /// different depending on which renderer is selected — which is what the
+    /// hand-rolled Cairo geometry did, with a fixed 2px bar against this
+    /// scale-aware thickness.
+    #[test]
+    fn every_cursor_shape_reports_exactly_the_rects_the_renderer_fills() {
+        let m = CellMetrics::new(8.0, 16.0);
+        for shape in [
+            CursorShape::Block,
+            CursorShape::HollowBlock,
+            CursorShape::Underline,
+            CursorShape::Bar,
+        ] {
+            let grid = grid_with(vec![cell(' ', 0); 6], 2, 3);
+            let mut p = pane(&grid, &[]);
+            let cv = CursorView {
+                col: 1,
+                row: 1,
+                shape,
+                blink: false,
+                visible: true,
+            };
+            p.cursor = Some(cv);
+            let frame = Frame::single(100, 100, 1.0, theme(), true, p);
+            let scene = build_scene(&frame, &m);
+
+            let geo = cursor_geometry(&cv, (0.0, 0.0), 3, 2, &m);
+            let drawn: Vec<_> = scene
+                .overlay_quads
+                .iter()
+                .map(|q| (q.x, q.y, q.w, q.h))
+                .collect();
+            let reported: Vec<_> = geo.rects.iter().map(|r| (r.x, r.y, r.w, r.h)).collect();
+            assert_eq!(reported, drawn, "{shape:?}");
+            assert!(!reported.is_empty(), "{shape:?} must draw something");
+        }
+    }
+
+    /// Thickness scales with the cell, which is the whole reason a fixed 2px was
+    /// wrong: on a `HiDPI` display the cell doubles and the cursor did not.
+    #[test]
+    fn cursor_thickness_scales_with_the_cell_rather_than_being_fixed() {
+        let one_x = CellMetrics::new(8.0, 16.0);
+        let two_x = CellMetrics::new(16.0, 32.0);
+        assert!(
+            two_x.cursor_thickness > one_x.cursor_thickness,
+            "{} vs {}",
+            two_x.cursor_thickness,
+            one_x.cursor_thickness
+        );
+
+        let bar = CursorView {
+            col: 0,
+            row: 0,
+            shape: CursorShape::Bar,
+            blink: false,
+            visible: true,
+        };
+        let at = |m: &CellMetrics| cursor_geometry(&bar, (0.0, 0.0), 1, 1, m).rects[0].w;
+        assert_eq!(at(&one_x), one_x.cursor_thickness);
+        assert_eq!(at(&two_x), two_x.cursor_thickness);
+        // And never thinner than a physical pixel, however small the cell.
+        assert_eq!(at(&CellMetrics::new(2.0, 2.0)), 1.0);
+    }
+
     #[test]
     fn cursor_geometry_bar_underline_hollow_hidden() {
         let m = CellMetrics::new(8.0, 16.0);
@@ -1411,7 +1478,7 @@ mod tests {
         };
         let grid_scene = build_scene(&Frame::single(100, 100, 1.0, theme(), true, grid_pane), &m);
 
-        let packed = crate::packed::encode_cells(&grid, theme());
+        let packed = packed::encode_cells(&grid, theme());
         let packed_pane = PaneView {
             col: 0,
             row: 0,

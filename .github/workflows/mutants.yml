@@ -1,0 +1,119 @@
+name: Mutation sweep
+
+# The full sweep. Weekly rather than per-PR because it mutates ~5,000 functions
+# and each one rebuilds and re-runs a test binary; per-PR coverage comes from the
+# `--in-diff` job in ci.yml, whose cost tracks the size of the change.
+#
+# This is the only thing that fills in the `[[mutants]]` table in
+# quality-baseline.toml. It does not write it — a sweep proposes, a human commits
+# — but it uploads the outcomes and prints what the budgets would become.
+on:
+  schedule:
+    # 04:00 UTC on Sundays: after the week's merges, before anyone reads it.
+    - cron: "0 4 * * 0"
+  workflow_dispatch:
+    inputs:
+      shards:
+        description: "How many shards to split the sweep across"
+        default: "8"
+
+permissions:
+  contents: read
+
+jobs:
+  sweep:
+    name: Sweep ${{ matrix.shard }}/8
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      # One failing shard must not cancel the rest: a shard's exit code is
+      # non-zero whenever any mutant survives, which is the normal state of a
+      # codebase paying down mutation debt. The verdict comes from the gate in
+      # the `judge` job below, over the merged outcomes.
+      fail-fast: false
+      matrix:
+        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+
+      - name: Install system dependencies (GTK4 + libadwaita)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
+      - name: Install toolchains (mise)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache zig build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            vendor/ghostty/.zig-cache
+          key: ${{ runner.os }}-zig-${{ hashFiles('vendor/ghostty/build.zig', 'vendor/ghostty/build.zig.zon', 'crates/kmux-ghostty-sys/zig/**') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+
+      - name: Sweep
+        run: mise run mutants -- --shard ${{ matrix.shard }}/8
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-shard-${{ matrix.shard }}
+          path: mutants.out/
+          retention-days: 30
+
+  judge:
+    name: Judge the sweep
+    needs: sweep
+    if: always()
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchains (mise)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mutants-shard-*
+          path: shards/
+
+      # Every shard directory, in one call: the gate merges them, so a package
+      # split across shards is judged on its total rather than eight times on
+      # eight partial views.
+      - name: Believability check and budget comparison
+        run: |
+          dirs=$(find shards -name outcomes.json -printf '%h\n' | sort)
+          echo "merging: $dirs"
+          # shellcheck disable=SC2086
+          cargo run -q -p xtask -- mutants-gate $dirs
+
+      # The sweep proposes; a human commits. Printing the diff rather than
+      # opening a PR keeps the budget a deliberate, reviewed edit — the same
+      # rule the lint ratchet follows.
+      - name: What the budgets would become
+        if: always()
+        run: |
+          dirs=$(find shards -name outcomes.json -printf '%h\n' | sort)
+          # shellcheck disable=SC2086
+          cargo run -q -p xtask -- mutants-gate --write $dirs || true
+          git --no-pager diff -- quality-baseline.toml

@@ -211,10 +211,8 @@ fn run(rx: Receiver<ApplyJob>, note_tx: Sender<WorkerNote>) {
     let mut panes: HashMap<PaneId, PaneState> = HashMap::new();
     let mut touched: HashSet<PaneId> = HashSet::new();
     'main: loop {
-        let first = match rx.recv() {
-            Ok(job) => job,
-            Err(_) => break, // all senders dropped
-        };
+        // A recv error means every sender is gone, so there is no more work.
+        let Ok(first) = rx.recv() else { break };
         let mut batch = vec![first];
         while let Ok(job) = rx.try_recv() {
             batch.push(job);

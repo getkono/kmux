@@ -19,13 +19,13 @@ pub enum ExitStatus {
 impl ExitStatus {
     /// Returns `true` if the process exited with code 0.
     pub fn success(&self) -> bool {
-        matches!(self, ExitStatus::Code(0))
+        matches!(self, Self::Code(0))
     }
 
     /// Returns the exit code if this is a normal exit.
     pub fn code(&self) -> Option<i32> {
         match self {
-            ExitStatus::Code(c) => Some(*c),
+            Self::Code(c) => Some(*c),
             _ => None,
         }
     }
@@ -34,9 +34,9 @@ impl ExitStatus {
 impl std::fmt::Display for ExitStatus {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            ExitStatus::Code(c) => write!(f, "exit code {c}"),
-            ExitStatus::Signal(s) => write!(f, "killed by signal {s}"),
-            ExitStatus::Unknown => write!(f, "unknown exit status"),
+            Self::Code(c) => write!(f, "exit code {c}"),
+            Self::Signal(s) => write!(f, "killed by signal {s}"),
+            Self::Unknown => write!(f, "unknown exit status"),
         }
     }
 }

@@ -35,6 +35,29 @@ pub struct Hint {
 /// Maximum number of hints displayed at once.
 pub const MAX_HINTS: usize = 8;
 
+/// Hints for `input` as if it were typed into the palette, without entering it.
+///
+/// [`build_hints`] reads the buffer out of `Mode::Command`, because that is
+/// where the palette keeps it. A caller that only wants to *show* completions —
+/// the Swift app's palette, which owns its own text field — has no buffer there,
+/// and used to reach into `AppCore::mode`, swap a synthetic `Mode::Command` in,
+/// call `build_hints`, and swap the old mode back. That is a mutation dressed as
+/// a query, and it lived in the FFI layer. It lives here now, next to the reason
+/// it is needed, and the mode is guaranteed restored on the way out.
+pub fn hints_for(app: &mut AppCore, input: &str) -> Vec<Hint> {
+    let previous = std::mem::replace(
+        &mut app.mode,
+        Mode::Command(crate::mode::CommandState {
+            buffer: input.to_string(),
+            cursor: input.len(),
+            ..crate::mode::CommandState::default()
+        }),
+    );
+    let hints = build_hints(app);
+    app.mode = previous;
+    hints
+}
+
 /// Compute the current dropdown contents for the buffer in `app.mode`.
 /// Returns an empty vec if `app.mode` is not `Mode::Command`.
 pub fn build_hints(app: &AppCore) -> Vec<Hint> {
@@ -47,12 +70,8 @@ pub fn build_hints(app: &AppCore) -> Vec<Hint> {
     // that distinguishes "still typing the last token" from "moved past it".
     let trimmed = buffer.trim_start();
     let leading_ws = buffer.len() - trimmed.len();
-    let ends_with_ws = !buffer.is_empty()
-        && buffer
-            .chars()
-            .next_back()
-            .map(|c| c.is_whitespace())
-            .unwrap_or(false);
+    let ends_with_ws =
+        !buffer.is_empty() && buffer.chars().next_back().is_some_and(char::is_whitespace);
 
     let tokens = tokenize(buffer).unwrap_or_default();
 
@@ -110,7 +129,7 @@ fn resolve_command_prefix(tokens: &[String], ends_with_ws: bool) -> Resolved {
                 continue;
             }
             let head = tokens[..nlen].join(" ");
-            if head.eq_ignore_ascii_case(nm) && best.map(|(_, prev)| nlen > prev).unwrap_or(true) {
+            if head.eq_ignore_ascii_case(nm) && best.is_none_or(|(_, prev)| nlen > prev) {
                 // Whole-name match; but if there are no extra tokens AND the
                 // buffer doesn't end in whitespace, the user might still be
                 // typing — don't lock in yet.
@@ -213,7 +232,7 @@ fn arg_value_hints(
         _ => Vec::new(),
     };
 
-    let mut all: Vec<String> = static_values.iter().map(|s| s.to_string()).collect();
+    let mut all: Vec<String> = static_values.iter().map(ToString::to_string).collect();
     all.extend(dynamic_values);
 
     let mut filtered: Vec<String> = all
@@ -232,7 +251,7 @@ fn arg_value_hints(
         .into_iter()
         .take(MAX_HINTS)
         .map(|v| Hint {
-            display: format!("{:<22} <{}>", v, arg_label),
+            display: format!("{v:<22} <{arg_label}>"),
             summary: "",
             replacement: maybe_quote(&v),
             replace_from,

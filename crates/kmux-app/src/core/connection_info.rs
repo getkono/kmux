@@ -109,8 +109,7 @@ impl AppCore {
             server_version: mgr.server_version.clone(),
             protocol_version: mgr
                 .negotiated_protocol
-                .map(|version| version.to_string())
-                .unwrap_or_else(|| PROTOCOL_RANGE.to_string()),
+                .map_or_else(|| PROTOCOL_RANGE.to_string(), |version| version.to_string()),
             accept_invalid_certs: mgr.accept_invalid_certs(),
             rtt,
             transports,

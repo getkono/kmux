@@ -60,8 +60,13 @@ jobs:
       - name: Format check
         run: mise run fmt-check
 
-      - name: Clippy
-        run: mise run clippy
+      # The lint gate subsumes `mise run clippy`: it runs the same pass with
+      # `-D warnings` and additionally injects the ratcheted lints with
+      # `--force-warn`, holding each crate's count against quality-baseline.toml.
+      # It fails on a new violation AND on a budget that has gone stale.
+      # See docs/quality-gates.md.
+      - name: Clippy + quality ratchet
+        run: mise run lint-gate
 
       # The GPU renderer (issue #132) is a default feature, so clippy/test above
       # already exercise it. This proves the wgpu-free path still compiles, so
@@ -69,12 +74,105 @@ jobs:
       - name: Build without GPU (must stay wgpu-free)
         run: mise run build-no-gpu
 
+      # Rustdoc warnings are broken intra-doc links and malformed doc
+      # attributes: the docs say one thing and render another, which is worse
+      # than saying nothing. Free to hold at zero, so it is held at zero.
+      - name: Docs (warnings are errors)
+        env:
+          RUSTDOCFLAGS: -D warnings
+        run: mise run doc-check
+
       - name: Test
         # Includes the cross-process daemon handoff/upgrade integration tests
         # (crates/kmuxd/tests/handoff_e2e.rs), which spawn a real kmuxd and drive a
         # live `restart`. The Linux-specific `(deleted)`-inode upgrade path is
         # exercised here.
         run: mise run test
+
+  # Third-party dependency hygiene. Neither of these needs the workspace to
+  # build, so this job skips submodules, GTK and Zig entirely and finishes in
+  # under a minute — it reads Cargo.lock and the manifests, not object code.
+  deps:
+    name: Dependency audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchains (mise)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      # cargo-deny: licence compatibility (the dual AGPL/commercial licence
+      # makes this a commercial requirement, not hygiene) and RUSTSEC
+      # advisories against a rustls/ring/quinn tree. cargo-machete: unused
+      # dependencies, replacing the name-grep audit docs/crate-usage.md itself
+      # admits "is a name check, not a compiler check".
+      - name: Licences, advisories, unused deps
+        run: mise run deps-audit
+
+  # Mutation testing over the PR's own diff. Needs no baseline and cannot go
+  # stale, because its scope IS the change under review. A surviving mutant in
+  # code this PR touched means the change is not covered by any assertion.
+  # See docs/testing.md and docs/quality-gates.md.
+  mutants:
+    name: Mutation (diff)
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'skip-mutants')
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: true
+          fetch-depth: 0
+
+      - name: Install system dependencies (GTK4 + libadwaita)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-4-dev libadwaita-1-dev
+
+      - name: Install toolchains (mise)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Cache zig build artefacts
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cache/zig
+            vendor/ghostty/.zig-cache
+          key: ${{ runner.os }}-zig-${{ hashFiles('vendor/ghostty/build.zig', 'vendor/ghostty/build.zig.zon', 'crates/kmux-ghostty-sys/zig/**') }}
+          restore-keys: |
+            ${{ runner.os }}-zig-
+
+      - name: Mutate the diff
+        run: |
+          git diff "${{ github.event.pull_request.base.sha }}" > pr.diff
+          mise run mutants -- --in-diff pr.diff
+
+      # The gate's first job is deciding whether to believe the sweep at all —
+      # see xtask/src/mutants.rs for why that is not paranoia.
+      - name: Judge the sweep
+        if: always()
+        run: mise run mutants-gate
+
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: mutants-diff
+          path: mutants.out*/
 
   # Conventional-commit enforcement (issue #130): lint every commit in the PR via
   # convco — the same `mise run commit-check` the hk pre-push hook runs locally.
@@ -155,7 +253,7 @@ jobs:
         run: mise run fmt-check
 
       - name: Clippy (kmux entrypoint + kmux-ffi + the client stack it wraps)
-        run: cargo clippy -p kmux -p kmux-ffi -p kmux-app -p kmux-client -p kmux-protocol -- -D warnings
+        run: cargo clippy -p kmux -p kmux-ffi -p kmux-app -p kmux-client -p kmux-protocol -p kmux-sys -- -D warnings
 
       - name: Build kmux + kmux-gtk (native GTK on macOS)
         run: cargo build -p kmux -p kmux-gtk
