@@ -180,6 +180,46 @@ Peer attribution rides the protocol: `SessionEntry.peer` (set by the daemon's
 and `ClientMessage::SessionCreate.peer` routes creation to a federated peer — see
 [architecture-federation.md](architecture-federation.md).
 
+## Every lifecycle fact arrives twice
+
+The daemon reports each session/tab/pane mutation on two channels, and
+`handle_server_message` must handle both or a multi-client session drifts:
+
+| | who receives it | what it carries |
+|---|---|---|
+| **Reply** — `ServerMessage::{SessionCreated, SessionClosed, PaneCreated, PaneClosed, TabCreated, TabClosed, PaneSplit}` | the requesting connection only (`state.send`) | the whole record: a `SessionEntry`, a `PaneInfo`, a `TabInfo`, a `LayoutNode` |
+| **Broadcast** — `ServerMessage::Event { event: SessionEventMsg::… }` | **every** authenticated connection, requester included | an id and nothing else |
+
+`ServerApp::broadcast` filters by neither session nor attachment, and the PTY
+lifecycle bus (`PaneSpawned`, `PaneExited`, `PaneClosed`, `PaneResized`) is fanned
+out the same way, so a client receives events for sessions it has never listed.
+Three rules follow, and every new arm has to obey them:
+
+1. **The broadcast is the only notice a non-requesting client gets.** Handling
+   just the reply forms means a tab, pane or session another GUI touched stays in
+   this client's cache until an unrelated refresh happens by.
+2. **Handlers must be idempotent**, because the requester gets both forms. In
+   `session_manager/server_handler.rs` the shared facts (`PaneClosed`,
+   `SessionClosed`, `TabClosed`) route the two arms to one named handler via an
+   or-pattern, and each handler reconciles only when the client still holds state
+   for the thing that changed — so the second delivery is a silent no-op rather
+   than a duplicate `SessionEvent`.
+3. **A broadcast that carries no tree needs a `SessionList`.** `LayoutUpdate`
+   accompanies only `PaneSplit`, a surviving-tab `PaneClose`, and the four
+   fire-and-forget layout mutations — never `TabCreated`, `TabClosed`,
+   `SessionCreated` or `PaneSpawned`. The create broadcasts therefore request a
+   fresh list, and only when the cache does not already show the fact.
+
+A broadcast must not move the user's view the way its reply does: the
+`SessionCreated` reply selects the new session because this client asked for it,
+while the broadcast only refreshes — another client's new session must not yank
+this one's.
+
+`SessionEventMsg::LayoutChanged` is the single ignored broadcast (`kmuxd` never
+constructs it; `LayoutUpdate` supersedes it). It is an explicit arm rather than a
+`..` catch-all so that a new protocol variant fails to compile in the client
+instead of being silently dropped.
+
 ## `FrontendDriver`: the shared run loop
 
 Driving `AppCore` has always meant the same arm-for-arm orchestration: own the
