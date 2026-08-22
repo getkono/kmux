@@ -789,7 +789,7 @@ count = 12
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::expect_used"
-count = 25
+count = 24
 
 [[lints]]
 crate = "kmuxd"

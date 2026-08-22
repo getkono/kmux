@@ -9,7 +9,7 @@ use std::pin::Pin;
 
 use tokio::net::TcpListener;
 
-use crate::transport::{AcceptError, IncomingSession, Listener, PeerInfo};
+use crate::transport::{AcceptError, IncomingSession, Listener, PeerInfo, SessionExtra};
 use kmux_protocol::messages::TransportKind;
 
 // ─── TlsTcpListener ──────────────────────────────────────────────────────────
@@ -80,7 +80,7 @@ impl Listener for TlsTcpListener {
                     addr: Some(remote_addr),
                 },
                 span: conn_span,
-                extra: Box::new(()),
+                extra: SessionExtra::None,
             })
         })
     }
@@ -142,7 +142,7 @@ impl Listener for PlainTcpListener {
                     addr: Some(remote_addr),
                 },
                 span: conn_span,
-                extra: Box::new(()), // no transport-specific extra state for plain TCP
+                extra: SessionExtra::None, // no transport-specific extra state for plain TCP
             })
         })
     }

@@ -10,7 +10,7 @@ use kmux_protocol::messages::TransportKind;
 use kmux_sys::transport::quic::QuicListener;
 use kmux_sys::transport::tcp_tls::TlsTcpListener;
 use kmux_sys::transport::uds::UdsListener;
-use kmux_sys::transport::{AcceptError, IncomingSession, Listener};
+use kmux_sys::transport::{AcceptError, IncomingSession, Listener, SessionExtra};
 
 use crate::app::ServerApp;
 use crate::auth::{generate_token, persist_token};
@@ -416,12 +416,8 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
 async fn dispatch_session(session: IncomingSession, app: Arc<ServerApp>) {
     use tracing::Instrument;
     let span = session.span.clone();
-    match session.kind {
-        TransportKind::Quic => {
-            let conn = *session
-                .extra
-                .downcast::<quinn::Connection>()
-                .expect("QUIC IncomingSession must carry quinn::Connection in extra");
+    match session.extra {
+        SessionExtra::Quic(conn) => {
             crate::connection::handle_with_io(
                 session.read,
                 session.write,
@@ -433,12 +429,12 @@ async fn dispatch_session(session: IncomingSession, app: Arc<ServerApp>) {
             .instrument(span)
             .await;
         }
-        kind @ (TransportKind::Tcp | TransportKind::TcpTls | TransportKind::Uds) => {
+        SessionExtra::None => {
             crate::tcp_listener::handle_tcp_io(
                 session.read,
                 session.write,
                 app,
-                kind,
+                session.kind,
                 span.clone(),
             )
             .instrument(span)

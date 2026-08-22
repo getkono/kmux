@@ -41,11 +41,10 @@ pub mod tcp_tls;
 pub mod uds;
 
 #[cfg(feature = "framing")]
-pub use listener::{AcceptError, IncomingSession, Listener, PeerInfo};
+pub use listener::{AcceptError, IncomingSession, Listener, PeerInfo, SessionExtra};
 
 #[cfg(feature = "framing")]
 mod listener {
-    use std::any::Any;
     use std::future::Future;
     use std::net::SocketAddr;
     use std::pin::Pin;
@@ -83,16 +82,34 @@ mod listener {
     /// are the first accepted bidirectional stream; for TCP/UDS they are the
     /// socket halves after `split()`.
     ///
-    /// `extra` holds transport-specific state the dispatcher needs at the call
-    /// site (e.g. `quinn::Connection` for `QuicAttacher`).  Callers downcast it.
+    /// `extra` carries whatever the dispatcher needs beyond the I/O halves.
     pub struct IncomingSession {
         pub read: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         pub write: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
         pub kind: TransportKind,
         pub peer: PeerInfo,
         pub span: tracing::Span,
-        /// Transport-specific state; downcast at the dispatch site.
-        pub extra: Box<dyn Any + Send>,
+        /// Transport-specific state, paired with its transport by the type.
+        pub extra: SessionExtra,
+    }
+
+    /// Transport-specific state accompanying an [`IncomingSession`].
+    ///
+    /// This was a `Box<dyn Any + Send>` that the dispatcher downcast, with the
+    /// `kind` field as the only clue to what was inside — a pairing nothing
+    /// enforced, and whose one consumer wrote
+    /// `.downcast::<quinn::Connection>().expect(..)`. Any listener that ever
+    /// produced `kind: Quic` without a connection would take the daemon down.
+    /// As an enum the pairing is the type, so there is nothing left to get
+    /// wrong and nothing to assert at runtime.
+    #[derive(Debug)]
+    pub enum SessionExtra {
+        /// Nothing beyond the I/O halves: UDS, plain TCP, TCP+TLS.
+        None,
+        /// The QUIC connection, which the pane attacher needs in order to open
+        /// per-pane unidirectional streams.
+        #[cfg(feature = "quic")]
+        Quic(quinn::Connection),
     }
 
     // ─── Listener ─────────────────────────────────────────────────────────────

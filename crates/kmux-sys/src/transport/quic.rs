@@ -14,7 +14,7 @@ mod quic_listener {
 
     use quinn::Endpoint;
 
-    use crate::transport::{AcceptError, IncomingSession, Listener, PeerInfo};
+    use crate::transport::{AcceptError, IncomingSession, Listener, PeerInfo, SessionExtra};
     use kmux_protocol::messages::TransportKind;
 
     /// Server-side QUIC transport listener.
@@ -69,7 +69,7 @@ mod quic_listener {
                     kind: TransportKind::Quic,
                     peer: PeerInfo { addr: Some(remote) },
                     span: conn_span,
-                    extra: Box::new(conn),
+                    extra: SessionExtra::Quic(conn),
                 })
             })
         }
