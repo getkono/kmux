@@ -105,6 +105,9 @@ impl AppCore {
                 attention_id,
             } => self.on_pane_attention(word_id, pane_id, kind, title, body, attention_id),
             SessionEvent::PaneFaulted { pane_id } => self.on_pane_faulted(&pane_id),
+            SessionEvent::KickedFromSession { word_id, by_label } => {
+                self.on_kicked_from_session(&word_id, &by_label)
+            }
             SessionEvent::PeerOpened { peer } => self.on_peer_opened(peer),
             SessionEvent::PeerError { peer, reason } => self.on_peer_error(peer, reason),
             _ => None,
@@ -187,6 +190,19 @@ impl AppCore {
         self.mgr.set_status_msg(format!(
             "Pane '{pane_id}' is recovering (its terminal engine crashed)"
         ));
+        None
+    }
+
+    /// Issue #146. [`kmux_client::session_manager::SessionManager`] has already
+    /// dropped the session's grids — the daemon detached us from every one of
+    /// its pane relays, so no further frame is coming — and moved the view to
+    /// another session if there was one. All that is left is telling the user,
+    /// which nothing did: this event used to fall into the router's catch-all
+    /// and a kicked GUI just froze on the session's last frame.
+    fn on_kicked_from_session(&mut self, word_id: &str, by_label: &str) -> Option<KeyResult> {
+        warn!(%word_id, %by_label, "kicked from session");
+        self.mgr
+            .set_status_msg(format!("Kicked from '{word_id}' by {by_label}"));
         None
     }
 
@@ -966,6 +982,42 @@ mod tests {
         assert!(
             saw_list,
             "PeerOpened must refresh the federated session list"
+        );
+    }
+
+    #[test]
+    fn kicked_from_session_names_the_session_and_who_did_it() {
+        // Issue #146: this event used to fall into the catch-all, so a kicked
+        // GUI froze on the session's last frame with nothing said.
+        let mut core = fixture_core();
+
+        let effects = core.handle_session_events(vec![SessionEvent::KickedFromSession {
+            word_id: "eagle".into(),
+            by_label: "someone@else".into(),
+        }]);
+
+        assert!(effects.is_empty(), "no frontend effect: {effects:?}");
+        assert_eq!(core.mgr.status_msg(), "Kicked from 'eagle' by someone@else");
+    }
+
+    #[test]
+    fn pane_faulted_reports_recovery_rather_than_an_exit() {
+        // Issue #126: the shell survives and the daemon respawns the worker, so
+        // this must not look like a disconnect.
+        let mut core = fixture_core();
+
+        let effects = core.handle_session_events(vec![SessionEvent::PaneFaulted {
+            pane_id: "eagle/0".into(),
+        }]);
+
+        assert!(effects.is_empty(), "no frontend effect: {effects:?}");
+        assert_eq!(
+            core.mgr.status_msg(),
+            "Pane 'eagle/0' is recovering (its terminal engine crashed)"
+        );
+        assert!(
+            !matches!(core.mode, Mode::Disconnected { .. }),
+            "a worker crash is not a disconnect"
         );
     }
 

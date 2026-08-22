@@ -895,6 +895,7 @@ impl SessionManager {
 
             ServerMessage::SessionKicked { word_id, by_label } => {
                 warn!("kicked from session {word_id} by {by_label}");
+                self.leave_session(&word_id);
                 events.push(SessionEvent::KickedFromSession { word_id, by_label });
             }
 
@@ -1085,6 +1086,38 @@ impl SessionManager {
                 pane.status = SessionStatus::Exited { code, signal };
                 break;
             }
+        }
+    }
+
+    /// Detach locally from `word_id` after the daemon evicted this client from
+    /// it (issue #146).
+    ///
+    /// `ServerApp::kick_client_from_session` has already removed us from every
+    /// pane relay of that session and released any input lock we held, so the
+    /// cached grids can only go stale from here — no further frame for those
+    /// panes will ever arrive. Drop them and move the view elsewhere.
+    ///
+    /// The entry stays in `session_list`: the session still exists, the
+    /// connection stays authenticated, and nothing bars a re-attach — so the
+    /// session must remain offerable in the picker.
+    fn leave_session(&mut self, word_id: &str) {
+        for pane_id in self.session_pane_ids(word_id) {
+            self.forget_pane(&pane_id);
+        }
+        if self.active_session.as_deref() != Some(word_id) {
+            return;
+        }
+        self.active_session = None;
+        self.active_tab = None;
+        self.active_pane = None;
+        self.visible_panes.clear();
+        if let Some(next) = self
+            .session_list
+            .iter()
+            .map(|e| e.meta.word_id.clone())
+            .find(|w| w != word_id)
+        {
+            self.select_session(next);
         }
     }
 
@@ -2890,8 +2923,9 @@ mod tests {
     }
 
     #[test]
-    fn session_kicked_emits_the_eviction_without_leaving_the_session() {
+    fn session_kicked_drops_the_sessions_grids_and_leaves_the_view() {
         let (mut mgr, _rx) = manager_on("eagle");
+        synced_pane(&mut mgr, "eagle/0", 4);
 
         let events = mgr.handle_server_message(ServerMessage::SessionKicked {
             word_id: "eagle".to_string(),
@@ -2906,14 +2940,52 @@ mod tests {
             ),
             "{events:?}"
         );
-        // SUSPECT: the client stays fully attached — session, tab, pane and
-        // buffers are all untouched. `SessionEvent::KickedFromSession`'s doc says
-        // "The app should leave the session", but nothing consumes it: the event
-        // falls into `AppCore::handle_session_events`' `_ => {}`, so a kicked GUI
-        // keeps rendering a session the daemon has already detached it from.
-        assert_eq!(mgr.active_session(), Some("eagle"));
-        assert_eq!(mgr.active_pane_id(), Some("eagle/0"));
+        // The daemon has already removed this client from every pane relay of
+        // the session, so no further frame for `eagle/0` will ever arrive.
+        assert!(mgr.buffer("eagle/0").is_none(), "the stale grid is dropped");
+        assert!(!mgr.pane_sync.contains_key("eagle/0"));
+        assert_eq!(mgr.active_session(), None);
+        assert_eq!(mgr.active_tab(), None);
+        assert_eq!(mgr.active_pane_id(), None);
+        assert!(mgr.visible_panes().is_empty());
+        // The session itself survives: it still exists server-side, the
+        // connection stays authenticated, and there is no re-attach guard.
         assert_eq!(mgr.session_list().len(), 1);
+    }
+
+    #[test]
+    fn session_kicked_falls_back_to_another_session_when_there_is_one() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        mgr.session_list.push(make_entry("otter"));
+
+        mgr.handle_server_message(ServerMessage::SessionKicked {
+            word_id: "eagle".to_string(),
+            by_label: "someone@else".to_string(),
+        });
+
+        assert_eq!(mgr.active_session(), Some("otter"));
+        assert_eq!(mgr.active_pane_id(), Some("otter/0"));
+    }
+
+    #[test]
+    fn session_kicked_from_a_session_not_being_viewed_only_drops_its_grids() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        mgr.session_list.push(make_entry("otter"));
+        mgr.buffers
+            .insert("otter/0".to_string(), CellGrid::new(4, 8));
+
+        mgr.handle_server_message(ServerMessage::SessionKicked {
+            word_id: "otter".to_string(),
+            by_label: "someone@else".to_string(),
+        });
+
+        assert!(mgr.buffer("otter/0").is_none());
+        assert_eq!(
+            mgr.active_session(),
+            Some("eagle"),
+            "the viewed session is untouched"
+        );
+        assert_eq!(mgr.active_pane_id(), Some("eagle/0"));
     }
 
     // ── Peer{Opened,Error,Closed} ───────────────────────────────────────────
