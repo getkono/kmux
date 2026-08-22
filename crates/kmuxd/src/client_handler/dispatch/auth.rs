@@ -243,3 +243,258 @@ pub(super) fn on_channel_ready(state: &mut SharedClientState) {
         });
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::*;
+
+    /// With `mode = always`, a networked transport negotiates zstd: the auth
+    /// handler flips the shared toggle and advertises it in `AuthResult`.
+    #[tokio::test]
+    async fn auth_enables_compression_when_policy_says_so() {
+        let app = Arc::new(
+            ServerApp::new("tok".to_string()).with_compression(CompressionConfig {
+                mode: CompressionMode::Always,
+                ..CompressionConfig::default()
+            }),
+        );
+        let (mut state, comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::TcpTls);
+        authenticate(&mut state).await;
+
+        assert!(
+            matches!(comp_out.compressor(), Compressor::Zstd { .. }),
+            "writer-side compression must be enabled"
+        );
+        // The challenge precedes the result on the control channel.
+        assert!(matches!(
+            ctrl_rx.try_recv().expect("AuthChallenge queued"),
+            ServerMessage::AuthChallenge { .. }
+        ));
+        let auth = ctrl_rx.try_recv().expect("AuthResult queued");
+        assert!(matches!(
+            auth,
+            ServerMessage::AuthResult {
+                success: true,
+                compression: Some(Compression::Zstd),
+                ..
+            }
+        ));
+    }
+
+    /// Under the default `auto` mode a local UDS client is left uncompressed.
+    #[tokio::test]
+    async fn auth_leaves_uds_uncompressed_under_auto() {
+        let app = Arc::new(ServerApp::new("tok".to_string())); // default compression = auto
+        let (mut state, comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::Uds);
+        authenticate(&mut state).await;
+
+        assert!(
+            matches!(comp_out.compressor(), Compressor::Off),
+            "local UDS clients must stay uncompressed under auto"
+        );
+        // The challenge precedes the result on the control channel.
+        assert!(matches!(
+            ctrl_rx.try_recv().expect("AuthChallenge queued"),
+            ServerMessage::AuthChallenge { .. }
+        ));
+        let auth = ctrl_rx.try_recv().expect("AuthResult queued");
+        assert!(matches!(
+            auth,
+            ServerMessage::AuthResult {
+                success: true,
+                compression: None,
+                ..
+            }
+        ));
+    }
+
+    #[tokio::test]
+    async fn auth_does_not_use_unadvertised_compression_capability() {
+        let app = Arc::new(
+            ServerApp::new("tok".to_string()).with_compression(CompressionConfig {
+                mode: CompressionMode::Always,
+                ..CompressionConfig::default()
+            }),
+        );
+        let (mut state, comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::TcpTls);
+        authenticate_with_capabilities(&mut state, Vec::new()).await;
+
+        assert!(matches!(comp_out.compressor(), Compressor::Off));
+        assert!(matches!(
+            ctrl_rx.try_recv(),
+            Ok(ServerMessage::AuthChallenge { .. })
+        ));
+        assert!(matches!(
+            ctrl_rx.try_recv(),
+            Ok(ServerMessage::AuthResult {
+                success: true,
+                compression: None,
+                negotiated_capabilities,
+                ..
+            }) if negotiated_capabilities.is_empty()
+        ));
+    }
+
+    #[tokio::test]
+    async fn auth_rejects_disjoint_protocol_range_before_token_validation() {
+        let app = Arc::new(ServerApp::new("tok".to_string()));
+        let (mut state, _comp_out, mut ctrl_rx) = state_for(app, TransportKind::Uds);
+        let ok = handle_message(
+            &mut state,
+            ClientMessage::Auth {
+                token: "tok".to_string(),
+                protocol_range: ProtocolRange::exact(ProtocolVersion::new(2, 0, 0)),
+                protocol_capabilities: Vec::new(),
+                capabilities: ClientCapabilities::default(),
+                connection_id: None,
+                public_key: Vec::new(),
+                hostname: "host".to_string(),
+                username: "user".to_string(),
+                client_kind: kmux_protocol::messages::FrontendKind::Cli,
+                client_git_sha: String::new(),
+                client_git_dirty: false,
+                client_build_profile: String::new(),
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(!ok);
+        assert!(matches!(
+            ctrl_rx.try_recv(),
+            Ok(ServerMessage::AuthResult {
+                success: false,
+                reason: Some(reason),
+                ..
+            }) if reason.starts_with("protocol version mismatch:")
+        ));
+    }
+
+    /// A valid token with an invalid identity signature is rejected and the
+    /// connection is closed (issue #146): proof-of-possession is mandatory.
+    #[tokio::test]
+    async fn auth_rejects_invalid_signature() {
+        let app = Arc::new(ServerApp::new("tok".to_string()));
+        let (mut state, _comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::Uds);
+        let identity = kmux_sys::identity::Identity::generate();
+
+        let ok = handle_message(
+            &mut state,
+            ClientMessage::Auth {
+                token: "tok".to_string(),
+                protocol_range: PROTOCOL_RANGE,
+                protocol_capabilities: protocol_capabilities(),
+                capabilities: ClientCapabilities::default(),
+                connection_id: None,
+                public_key: identity.public_key_bytes().to_vec(),
+                hostname: "h".to_string(),
+                username: "u".to_string(),
+                client_kind: kmux_protocol::messages::FrontendKind::Cli,
+                client_git_sha: String::new(),
+                client_git_dirty: false,
+                client_build_profile: String::new(),
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(
+            ok,
+            "a valid token keeps the connection open for the proof step"
+        );
+        assert!(matches!(
+            ctrl_rx.try_recv(),
+            Ok(ServerMessage::AuthChallenge { .. })
+        ));
+
+        // A bogus signature must be rejected and the connection closed.
+        let ok = handle_message(
+            &mut state,
+            ClientMessage::AuthProof {
+                signature: vec![0u8; 64],
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(!ok, "an invalid proof must close the connection");
+        assert!(!state.authenticated);
+        assert!(matches!(
+            ctrl_rx.try_recv(),
+            Ok(ServerMessage::AuthResult { success: false, .. })
+        ));
+    }
+
+    #[tokio::test]
+    async fn an_unauthenticated_client_is_told_to_send_auth_first() {
+        let app = Arc::new(ServerApp::new("tok".to_string()));
+        let (mut state, _comp_out, mut ctrl_rx) = state_for(app, TransportKind::Uds);
+        let keep = handle_message(&mut state, ClientMessage::Ping { seq: 1 }, &NoopAttacher).await;
+        assert!(keep, "the pre-auth gate keeps the connection open");
+        let (request_id, code, message) = only_error(drain(&mut ctrl_rx));
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::NotAuthenticated);
+        assert_eq!(message, "send Auth first");
+    }
+
+    #[tokio::test]
+    async fn a_second_auth_after_authentication_is_ignored_silently() {
+        let (keep, msgs) = dispatch_one(ClientMessage::Auth {
+            token: "tok".to_string(),
+            protocol_range: PROTOCOL_RANGE,
+            protocol_capabilities: protocol_capabilities(),
+            capabilities: ClientCapabilities::default(),
+            connection_id: None,
+            public_key: Vec::new(),
+            hostname: "host".to_string(),
+            username: "user".to_string(),
+            client_kind: kmux_protocol::messages::FrontendKind::Cli,
+            client_git_sha: String::new(),
+            client_git_dirty: false,
+            client_build_profile: String::new(),
+        })
+        .await;
+        assert!(keep);
+        assert!(
+            msgs.is_empty(),
+            "a duplicate Auth answers nothing: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stray_auth_proof_after_authentication_is_ignored_silently() {
+        let (keep, msgs) = dispatch_one(ClientMessage::AuthProof {
+            signature: vec![0u8; 64],
+        })
+        .await;
+        assert!(keep);
+        assert!(
+            msgs.is_empty(),
+            "a stray AuthProof answers nothing: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn channel_ready_without_a_pending_swap_answers_nothing() {
+        let (keep, msgs) = dispatch_one(ClientMessage::ChannelReady).await;
+        assert!(keep);
+        assert!(msgs.is_empty(), "no swap was pending: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn channel_ready_reports_the_pending_swap_and_consumes_it() {
+        let (mut state, mut ctrl_rx) = authenticated_client().await;
+        state.pending_swap_from = Some(TransportKind::TcpTls);
+
+        let keep = handle_message(&mut state, ClientMessage::ChannelReady, &NoopAttacher).await;
+        assert!(keep);
+        match only(drain(&mut ctrl_rx)) {
+            ServerMessage::ChannelSwitched { old_transport } => {
+                assert_eq!(old_transport, "TCP+TLS");
+            }
+            other => panic!("expected ChannelSwitched, got {other:?}"),
+        }
+
+        // A duplicate `ChannelReady` must not re-emit a stale switch event.
+        let keep = handle_message(&mut state, ClientMessage::ChannelReady, &NoopAttacher).await;
+        assert!(keep);
+        assert!(drain(&mut ctrl_rx).is_empty(), "the swap was consumed");
+    }
+}

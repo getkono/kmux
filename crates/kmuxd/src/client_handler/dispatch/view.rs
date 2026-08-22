@@ -166,3 +166,95 @@ pub(super) async fn on_fetch_history(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::*;
+
+    #[tokio::test]
+    async fn attach_to_an_unknown_pane_errors_and_starts_no_stream() {
+        let (mut state, mut ctrl_rx) = authenticated_client().await;
+        let keep = handle_message(
+            &mut state,
+            ClientMessage::Attach {
+                pane_id: MISSING_PANE.to_string(),
+                last_seqno: None,
+                size: TermSize::default(),
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(keep);
+        assert!(
+            state.attached.is_empty(),
+            "a failed attach registers no forwarding task"
+        );
+        let (request_id, code, message) = only_error(drain(&mut ctrl_rx));
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn detach_from_a_pane_this_client_never_attached_answers_nothing() {
+        let (keep, msgs) = dispatch_one(ClientMessage::Detach {
+            pane_id: MISSING_PANE.to_string(),
+        })
+        .await;
+        assert!(keep);
+        assert!(msgs.is_empty(), "nothing was attached: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn set_snapshot_mode_is_applied_without_a_reply() {
+        let (keep, msgs) = dispatch_one(ClientMessage::SetSnapshotMode { enabled: true }).await;
+        assert!(keep);
+        assert!(
+            msgs.is_empty(),
+            "snapshot mode is a silent connection setting: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_paused_is_applied_without_a_reply() {
+        let (keep, msgs) = dispatch_one(ClientMessage::SetPaused {
+            paused: true,
+            auto: false,
+        })
+        .await;
+        assert!(keep);
+        assert!(
+            msgs.is_empty(),
+            "pausing is a silent connection setting: {msgs:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn set_pane_no_auto_pause_for_an_unknown_pane_answers_nothing() {
+        let (keep, msgs) = dispatch_one(ClientMessage::SetPaneNoAutoPause {
+            pane_id: MISSING_PANE.to_string(),
+            exempt: true,
+        })
+        .await;
+        assert!(keep);
+        // The exemption is a per-client preference, recorded without validating
+        // that the pane exists.
+        assert!(msgs.is_empty(), "no reply is defined: {msgs:?}");
+    }
+
+    #[tokio::test]
+    async fn fetch_history_for_an_unknown_pane_errors_with_the_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::FetchHistory {
+            request_id: 14,
+            pane_id: MISSING_PANE.to_string(),
+            start_index: 0,
+            count: 10,
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(14));
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
+    }
+}

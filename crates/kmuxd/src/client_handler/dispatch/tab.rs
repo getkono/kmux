@@ -7,7 +7,7 @@ use crate::connection::classify_error;
 use super::super::SharedClientState;
 use super::Spawn;
 
-/// Handle [`ClientMessage::TabCreate`].
+/// Handle [`ClientMessage::TabCreate`](kmux_protocol::messages::ClientMessage::TabCreate).
 pub(super) async fn on_tab_create(
     state: &mut SharedClientState,
     request_id: RequestId,
@@ -39,7 +39,7 @@ pub(super) async fn on_tab_create(
     }
 }
 
-/// Handle [`ClientMessage::TabClose`].
+/// Handle [`ClientMessage::TabClose`](kmux_protocol::messages::ClientMessage::TabClose).
 pub(super) async fn on_tab_close(
     state: &mut SharedClientState,
     request_id: RequestId,
@@ -67,7 +67,7 @@ pub(super) async fn on_tab_close(
     }
 }
 
-/// Handle [`ClientMessage::TabRename`].
+/// Handle [`ClientMessage::TabRename`](kmux_protocol::messages::ClientMessage::TabRename).
 pub(super) async fn on_tab_rename(
     state: &mut SharedClientState,
     request_id: RequestId,
@@ -87,7 +87,7 @@ pub(super) async fn on_tab_rename(
     }
 }
 
-/// Handle [`ClientMessage::TabReorder`].
+/// Handle [`ClientMessage::TabReorder`](kmux_protocol::messages::ClientMessage::TabReorder).
 pub(super) async fn on_tab_reorder(
     state: &mut SharedClientState,
     word_id: WordId,
@@ -106,5 +106,77 @@ pub(super) async fn on_tab_reorder(
                 tab_indices,
             }),
         Err(e) => state.error(None, classify_error(&e), e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::*;
+
+    #[tokio::test]
+    async fn tab_create_for_an_unknown_session_errors_naming_the_word_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::TabCreate {
+            request_id: 5,
+            word_id: MISSING_WORD.to_string(),
+            program: None,
+            args: vec![],
+            size: TermSize::default(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(5));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    #[tokio::test]
+    async fn tab_close_of_an_unknown_session_errors_naming_the_word_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::TabClose {
+            request_id: 6,
+            word_id: MISSING_WORD.to_string(),
+            tab_index: 0,
+        })
+        .await;
+        assert!(keep);
+        // A `TabClosed` reply also suppresses the session-event broadcast that
+        // follows it, so the old answer was a success the rest of the fleet
+        // never heard about.
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(6));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    #[tokio::test]
+    async fn tab_rename_for_an_unknown_session_errors_naming_the_word_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::TabRename {
+            request_id: 7,
+            word_id: MISSING_WORD.to_string(),
+            tab_index: 0,
+            new_name: "renamed".to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(7));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    #[tokio::test]
+    async fn tab_reorder_for_an_unknown_session_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::TabReorder {
+            word_id: MISSING_WORD.to_string(),
+            tab_index: 0,
+            new_position: 1,
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        // `TabReorder` carries no request id, so the error cannot correlate.
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
     }
 }

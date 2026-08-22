@@ -129,3 +129,119 @@ pub(super) async fn on_release_input_lock(
         Err(e) => state.error(None, classify_error(&e), e.to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::*;
+
+    #[tokio::test]
+    async fn pty_input_to_an_unknown_pane_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PtyInput {
+            pane_id: MISSING_PANE.to_string(),
+            data: b"x".to_vec(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn pty_paste_to_an_unknown_pane_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PtyPaste {
+            pane_id: MISSING_PANE.to_string(),
+            data: "x".to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn pty_key_batch_to_an_unknown_pane_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PtyKeyBatch {
+            pane_id: MISSING_PANE.to_string(),
+            events: vec![one_key()],
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn an_empty_pty_key_batch_to_an_unknown_pane_still_errors() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PtyKeyBatch {
+            pane_id: MISSING_PANE.to_string(),
+            events: vec![],
+        })
+        .await;
+        assert!(keep);
+        // Whether the pane exists cannot depend on how many keys were sent.
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn resize_of_an_unknown_pane_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::Resize {
+            pane_id: MISSING_PANE.to_string(),
+            size: TermSize::default(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn signal_to_an_unknown_pane_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::Signal {
+            pane_id: MISSING_PANE.to_string(),
+            signal: 15,
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn request_input_lock_on_an_unknown_pane_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::RequestInputLock {
+            pane_id: MISSING_PANE.to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn release_input_lock_on_an_unknown_pane_errors_without_a_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::ReleaseInputLock {
+            pane_id: MISSING_PANE.to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
+    }
+}

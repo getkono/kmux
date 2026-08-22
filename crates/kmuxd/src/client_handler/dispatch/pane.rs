@@ -46,7 +46,7 @@ pub(super) async fn on_pane_create(
     }
 }
 
-/// Handle [`ClientMessage::PaneClose`].
+/// Handle [`ClientMessage::PaneClose`](kmux_protocol::messages::ClientMessage::PaneClose).
 pub(super) async fn on_pane_close(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -88,7 +88,7 @@ pub(super) async fn on_pane_close(
     }
 }
 
-/// Handle [`ClientMessage::PaneSplit`].
+/// Handle [`ClientMessage::PaneSplit`](kmux_protocol::messages::ClientMessage::PaneSplit).
 pub(super) async fn on_pane_split(
     state: &mut SharedClientState,
     request_id: RequestId,
@@ -130,5 +130,64 @@ pub(super) async fn on_pane_split(
                 .broadcast_layout(&word_id, tab_index, layout, focused);
         }
         Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::*;
+
+    #[tokio::test]
+    async fn pane_create_for_an_unknown_session_errors_naming_the_word_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PaneCreate {
+            request_id: 3,
+            word_id: MISSING_WORD.to_string(),
+            program: None,
+            args: vec![],
+            size: TermSize::default(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(3));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    #[tokio::test]
+    async fn pane_close_of_an_unknown_pane_errors_naming_the_pane_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PaneClose {
+            request_id: 4,
+            pane_id: MISSING_PANE.to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(4));
+        // Every pane-scoped arm below reports `PaneNotFound`; the three ways a
+        // lookup can miss (unparseable id, unknown session, unknown index) are
+        // deliberately indistinguishable to the client.
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn pane_split_in_an_unknown_session_errors_naming_the_word_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::PaneSplit {
+            request_id: 8,
+            word_id: MISSING_WORD.to_string(),
+            tab_index: 0,
+            from_pane: 0,
+            dir: SplitDir::Horizontal,
+            program: None,
+            args: vec![],
+            size: TermSize::default(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(8));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
     }
 }

@@ -15,7 +15,7 @@ use crate::connection::classify_error;
 
 use super::super::SharedClientState;
 
-/// Handle [`ClientMessage::ProcessOverview`].
+/// Handle [`ClientMessage::ProcessOverview`](kmux_protocol::messages::ClientMessage::ProcessOverview).
 pub(super) async fn on_process_overview(state: &mut SharedClientState, request_id: RequestId) {
     // Merge the locally-hosted panes' process trees with every open
     // peer's (issue #122). Federation off ⇒ the federated half is empty.
@@ -24,12 +24,12 @@ pub(super) async fn on_process_overview(state: &mut SharedClientState, request_i
     state.send(ServerMessage::ProcessOverviewResult { request_id, panes });
 }
 
-/// Handle [`ClientMessage::ListDirectory`].
+/// Handle [`ClientMessage::ListDirectory`](kmux_protocol::messages::ClientMessage::ListDirectory).
 pub(super) fn on_list_directory(state: &mut SharedClientState, request_id: RequestId, path: &str) {
     state.send(list_directory(request_id, path));
 }
 
-/// Handle [`ClientMessage::Notify`].
+/// Handle [`ClientMessage::Notify`](kmux_protocol::messages::ClientMessage::Notify).
 pub(super) async fn on_notify(
     state: &mut SharedClientState,
     request_id: RequestId,
@@ -48,12 +48,12 @@ pub(super) async fn on_notify(
     }
 }
 
-/// Handle [`ClientMessage::Ping`].
+/// Handle [`ClientMessage::Ping`](kmux_protocol::messages::ClientMessage::Ping).
 pub(super) fn on_ping(state: &mut SharedClientState, seq: u64) {
     state.send(ServerMessage::Pong { seq });
 }
 
-/// Handle [`ClientMessage::Pong`].
+/// Handle [`ClientMessage::Pong`](kmux_protocol::messages::ClientMessage::Pong).
 pub(super) fn on_pong(state: &mut SharedClientState, seq: u64) {
     let sent = *state.metrics.last_ping_sent.lock().unwrap();
     if let Some((sent_seq, sent_at)) = sent
@@ -72,7 +72,7 @@ pub(super) fn on_pong(state: &mut SharedClientState, seq: u64) {
 /// that framing overhead is negligible, small enough to bound per-message memory.
 const LOG_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Answer a [`ClientMessage::FetchLogs`] (issue #187): stream this daemon's own
+/// Answer a [`ClientMessage::FetchLogs`](kmux_protocol::messages::ClientMessage::FetchLogs) (issue #187): stream this daemon's own
 /// log file to the client over the control channel.
 ///
 /// Sends the existing content (trimmed to the last `lines` lines when set) as
@@ -250,5 +250,185 @@ fn directory_error(request_id: u64, requested: &str, err: &std::io::Error) -> Se
         parent: None,
         entries: vec![],
         error: Some(err.to_string()),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::*;
+    use super::{Path, list_directory};
+
+    #[tokio::test]
+    async fn process_overview_on_an_empty_server_returns_no_panes() {
+        let (keep, msgs) = dispatch_one(ClientMessage::ProcessOverview { request_id: 12 }).await;
+        assert!(keep);
+        match only(msgs) {
+            ServerMessage::ProcessOverviewResult { request_id, panes } => {
+                assert_eq!(request_id, 12);
+                assert!(panes.is_empty(), "no panes exist: {panes:?}");
+            }
+            other => panic!("expected ProcessOverviewResult, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_logs_answers_a_request_correlated_terminated_stream() {
+        let (keep, msgs) = dispatch_one(ClientMessage::FetchLogs {
+            request_id: 21,
+            lines: Some(5),
+            follow: false,
+        })
+        .await;
+        assert!(keep);
+        // Whether the daemon log file exists depends on the machine's state dir,
+        // so the pinned invariants are the ones the arm controls: every reply
+        // carries this request id, and the stream is terminated exactly once —
+        // by `LogEnd` when the log was readable, by an `Error` when it was not.
+        assert!(!msgs.is_empty(), "the arm always answers");
+        for msg in &msgs {
+            let id = match msg {
+                ServerMessage::LogChunk { request_id, .. }
+                | ServerMessage::LogEnd { request_id } => Some(*request_id),
+                ServerMessage::Error { request_id, .. } => *request_id,
+                other => panic!("unexpected FetchLogs reply {other:?}"),
+            };
+            assert_eq!(id, Some(21), "reply not correlated: {msg:?}");
+        }
+        match msgs.last().expect("non-empty asserted above") {
+            ServerMessage::LogEnd { .. } => {}
+            ServerMessage::Error { code, .. } => assert_eq!(*code, ErrorCode::InternalError),
+            other => panic!("stream must end with LogEnd or Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_directory_returns_sorted_dirs_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("zebra")).unwrap();
+        std::fs::create_dir(tmp.path().join("Alpha")).unwrap();
+        std::fs::write(tmp.path().join("a_file.txt"), b"hi").unwrap();
+
+        let msg = list_directory(1, tmp.path().to_str().unwrap());
+        match msg {
+            ServerMessage::DirectoryListing {
+                request_id,
+                entries,
+                error,
+                parent,
+                ..
+            } => {
+                assert_eq!(request_id, 1);
+                assert!(error.is_none());
+                assert!(parent.is_some(), "a tempdir has a parent");
+                let names: Vec<&str> = entries.iter().map(|e| e.name.as_str()).collect();
+                // Files are excluded; dirs are sorted case-insensitively.
+                assert_eq!(names, vec!["Alpha", "zebra"]);
+                assert!(entries.iter().all(|e| e.is_dir));
+            }
+            other => panic!("expected DirectoryListing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_directory_reports_error_for_missing_path() {
+        let msg = list_directory(2, "/this/path/does/not/exist/kmux");
+        match msg {
+            ServerMessage::DirectoryListing {
+                path,
+                entries,
+                error,
+                ..
+            } => {
+                assert_eq!(path, "/this/path/does/not/exist/kmux");
+                assert!(entries.is_empty());
+                assert!(error.is_some());
+            }
+            other => panic!("expected DirectoryListing, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn list_directory_empty_path_resolves_a_default() {
+        // An empty path resolves to $HOME (or "."); either way it must not error
+        // in a normal environment and must echo a canonical, absolute path.
+        let msg = list_directory(3, "");
+        match msg {
+            ServerMessage::DirectoryListing { path, error, .. } => {
+                assert!(error.is_none(), "default dir should list: {error:?}");
+                assert!(
+                    Path::new(&path).is_absolute(),
+                    "canonicalized path should be absolute: {path}"
+                );
+            }
+            other => panic!("expected DirectoryListing, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn list_directory_of_a_missing_path_answers_a_listing_carrying_the_error() {
+        let (keep, msgs) = dispatch_one(ClientMessage::ListDirectory {
+            request_id: 15,
+            path: "/this/path/does/not/exist/kmux".to_string(),
+        })
+        .await;
+        assert!(keep);
+        match only(msgs) {
+            ServerMessage::DirectoryListing {
+                request_id,
+                path,
+                parent,
+                entries,
+                error,
+            } => {
+                assert_eq!(request_id, 15);
+                // The requested path is echoed back verbatim, not canonicalized.
+                assert_eq!(path, "/this/path/does/not/exist/kmux");
+                assert_eq!(parent, None);
+                assert!(entries.is_empty());
+                assert!(error.is_some(), "the IO failure is reported inline");
+            }
+            other => panic!("expected DirectoryListing, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn notify_for_an_unknown_pane_errors_with_the_request_id() {
+        let (keep, msgs) = dispatch_one(ClientMessage::Notify {
+            request_id: 20,
+            pane_id: MISSING_PANE.to_string(),
+            kind: AttentionKind::TurnDone,
+            title: "title".to_string(),
+            body: "body".to_string(),
+        })
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(20));
+        // The protocol doc for `Notify` promises an error when "the pane is
+        // unknown", and this is the code that says so.
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
+    }
+
+    #[tokio::test]
+    async fn ping_is_answered_with_a_pong_carrying_the_same_seq() {
+        let (keep, msgs) = dispatch_one(ClientMessage::Ping { seq: 7 }).await;
+        assert!(keep);
+        match only(msgs) {
+            ServerMessage::Pong { seq } => assert_eq!(seq, 7),
+            other => panic!("expected Pong, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn an_unsolicited_pong_answers_nothing_and_records_no_rtt() {
+        let (mut state, mut ctrl_rx) = authenticated_client().await;
+        let keep = handle_message(&mut state, ClientMessage::Pong { seq: 7 }, &NoopAttacher).await;
+        assert!(keep);
+        assert!(drain(&mut ctrl_rx).is_empty(), "a Pong is not answered");
+        // No ping was ever sent, so both samples stay at their initial values:
+        // `u64::MAX` is the "no RTT measured yet" sentinel, `0` the "never".
+        assert_eq!(state.metrics.last_rtt_ms.load(Ordering::Relaxed), u64::MAX);
+        assert_eq!(state.metrics.last_pong_ms.load(Ordering::Relaxed), 0);
     }
 }
