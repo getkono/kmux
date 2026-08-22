@@ -59,7 +59,7 @@ pub fn attach_keys(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
             {
                 let mut f = fe.borrow_mut();
                 f.core.dispatch_action(Action::ToggleConnectedClients);
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             drawing.grab_focus();
             return glib::Propagation::Stop;
@@ -149,7 +149,7 @@ fn make_row(r: &ClientInfo, fe: &Rc<RefCell<Frontend>>, shell: &Rc<Shell>) -> Li
             {
                 let mut f = fe.borrow_mut();
                 f.core.kick_listed_client(client_id);
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             drawing.grab_focus();
         });

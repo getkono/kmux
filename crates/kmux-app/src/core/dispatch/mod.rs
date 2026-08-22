@@ -593,7 +593,7 @@ impl AppCore {
             word_id: word_id.to_string(),
             name,
         };
-        self.needs_render = true;
+        self.request_render();
     }
 
     /// Cancel the most recently scheduled pane soft-close. Nothing was sent to

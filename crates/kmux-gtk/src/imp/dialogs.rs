@@ -283,7 +283,7 @@ fn open_list_dialog(
             {
                 let mut f = fe.borrow_mut();
                 set_search(&mut f.core, text);
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             shell.drawing.queue_draw();
         });
@@ -304,7 +304,7 @@ fn open_list_dialog(
             if let Some(down) = nav {
                 let mut f = fe.borrow_mut();
                 move_selection(&mut f.core, down);
-                f.core.needs_render = true;
+                f.core.request_render();
                 return glib::Propagation::Stop;
             }
             if matches!(keyval, gdk::Key::Return | gdk::Key::KP_Enter) {
@@ -347,7 +347,7 @@ fn open_list_dialog(
             let mut f = fe.borrow_mut();
             if DialogKind::from_mode(&f.core.mode).is_some_and(DialogKind::is_list) {
                 f.core.mode = Mode::Normal;
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             drop(f);
             // Return focus to the terminal so typing resumes there.
@@ -588,7 +588,7 @@ fn disconnect_button(peer: &str, shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) 
         {
             let mut f = fe.borrow_mut();
             f.core.disconnect_remote(&peer);
-            f.core.needs_render = true;
+            f.core.request_render();
         }
         shell.drawing.queue_draw();
     });
@@ -709,7 +709,7 @@ fn activate_current(fe: &Rc<RefCell<Frontend>>, shell: &Rc<Shell>, app: &gtk4::A
             Mode::Command(_) => f.core.dispatch_action(Action::CommandSubmit),
             _ => f.core.activate_picker_selection(),
         };
-        f.core.needs_render = true;
+        f.core.request_render();
         e
     };
     apply_effects(fe, effects, app, &shell.drawing);
@@ -781,7 +781,7 @@ fn open_rename(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
                 } else {
                     let _ = f.core.dispatch_action(Action::ExitToNormal);
                 }
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             shell.drawing.queue_draw();
         });
@@ -826,7 +826,7 @@ fn open_confirm_close_session(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> 
                     Action::ExitToNormal
                 };
                 let _ = f.core.dispatch_action(action);
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             shell.drawing.queue_draw();
         });
@@ -943,7 +943,7 @@ fn open_add_remote_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Live
             {
                 let mut f = fe.borrow_mut();
                 let _ = f.core.dispatch_action(Action::LaunchOverlayCancel);
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             dialog2.close();
         });
@@ -974,7 +974,7 @@ fn open_add_remote_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Live
                     // new remote is visible (expanded, connecting on focus).
                     f.core.open_launch_picker();
                 }
-                f.core.needs_render = true;
+                f.core.request_render();
                 r
             };
             match result {
@@ -995,7 +995,7 @@ fn open_add_remote_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Live
             let mut f = fe.borrow_mut();
             if matches!(f.core.mode, Mode::AddRemote) {
                 f.core.mode = Mode::Normal;
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             drop(f);
             shell.drawing.grab_focus();
@@ -1062,7 +1062,7 @@ fn open_remote_new_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Live
                 } else {
                     let _ = f.core.dispatch_action(Action::LaunchOverlayCancel);
                 }
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             shell.drawing.queue_draw();
         });
@@ -1138,7 +1138,7 @@ fn update_toast(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Fronte
             {
                 let mut f = fe.borrow_mut();
                 let _ = f.core.dispatch_action(Action::UndoClose);
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             shell.drawing.queue_draw();
         });

@@ -30,7 +30,7 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application) {
             {
                 let mut f = fe.borrow_mut();
                 f.core.apply_top_bar_action(TopBarAction::OpenLaunchPicker);
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             s.drawing.queue_draw();
         });
@@ -45,7 +45,7 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application) {
             let effects = {
                 let mut f = fe.borrow_mut();
                 let e = f.core.apply_top_bar_action(TopBarAction::Reconnect);
-                f.core.needs_render = true;
+                f.core.request_render();
                 e
             };
             apply_effects(&fe, effects, &app, &s.drawing);
@@ -64,7 +64,7 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application) {
                 {
                     let mut f = fe.borrow_mut();
                     f.core.open_transport_chooser();
-                    f.core.needs_render = true;
+                    f.core.request_render();
                 }
                 s.drawing.queue_draw();
             }

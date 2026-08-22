@@ -1780,7 +1780,7 @@ impl KmuxDriver {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         let core = d.core_mut();
         core.toggle_pane_no_auto_pause(&pane_id);
-        core.needs_render = true;
+        core.request_render();
         vec![FfiEffect::NeedsRender]
     }
 
@@ -1790,7 +1790,7 @@ impl KmuxDriver {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         let core = d.core_mut();
         core.toggle_session_no_auto_pause(&word_id);
-        core.needs_render = true;
+        core.request_render();
         vec![FfiEffect::NeedsRender]
     }
 
@@ -2006,7 +2006,7 @@ impl KmuxDriver {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         let core = d.core_mut();
         core.mgr.select_tab(tab_index);
-        core.needs_render = true;
+        core.request_render();
         vec![FfiEffect::NeedsRender]
     }
 
@@ -2017,7 +2017,7 @@ impl KmuxDriver {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         let core = d.core_mut();
         core.mgr.focus_pane(pane_id);
-        core.needs_render = true;
+        core.request_render();
         vec![FfiEffect::NeedsRender]
     }
 
@@ -2135,7 +2135,7 @@ impl KmuxDriver {
         };
         let core = d.core_mut();
         core.mgr.set_layout_ratios(divider.path, ratios);
-        core.needs_render = true;
+        core.request_render();
         vec![FfiEffect::NeedsRender]
     }
 
@@ -2153,7 +2153,7 @@ impl KmuxDriver {
         };
         let core = d.core_mut();
         core.mgr.set_layout_ratios(path, ratios);
-        core.needs_render = true;
+        core.request_render();
         vec![FfiEffect::NeedsRender]
     }
 
@@ -2163,7 +2163,7 @@ impl KmuxDriver {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         let core = d.core_mut();
         core.mgr.rename_tab(tab_index, &name);
-        core.needs_render = true;
+        core.request_render();
         vec![FfiEffect::NeedsRender]
     }
 
@@ -2570,7 +2570,7 @@ impl KmuxDriver {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         let core = d.core_mut();
         let result = core.submit_add_remote(form.into());
-        core.needs_render = true;
+        core.request_render();
         result.err()
     }
 
@@ -2581,7 +2581,7 @@ impl KmuxDriver {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         let core = d.core_mut();
         core.submit_remote_new_session(peer, cwd);
-        core.needs_render = true;
+        core.request_render();
     }
 
     /// Disconnect a federated remote (issue #121): drop its link and forget it.
@@ -2590,7 +2590,7 @@ impl KmuxDriver {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         let core = d.core_mut();
         core.disconnect_remote(&peer);
-        core.needs_render = true;
+        core.request_render();
     }
 
     /// Open the session picker.
@@ -2608,7 +2608,7 @@ impl KmuxDriver {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         let core = d.core_mut();
         core.set_picker_search(text);
-        core.needs_render = true;
+        core.request_render();
     }
 
     /// Set the open picker's highlighted row (hover/click).
@@ -2616,7 +2616,7 @@ impl KmuxDriver {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         let core = d.core_mut();
         core.set_picker_selected(index as usize);
-        core.needs_render = true;
+        core.request_render();
     }
 
     /// Activate the open picker's current selection (click / Enter). May switch
@@ -2682,7 +2682,7 @@ impl KmuxDriver {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         let core = d.core_mut();
         core.mode = Mode::Normal;
-        core.needs_render = true;
+        core.request_render();
     }
 
     /// Rename a session by word id (trims surrounding whitespace).
@@ -2690,7 +2690,7 @@ impl KmuxDriver {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         let core = d.core_mut();
         core.mgr.rename_session(&word_id, name.trim());
-        core.needs_render = true;
+        core.request_render();
     }
 
     /// Request confirmation before closing a session by word id.
@@ -2698,7 +2698,7 @@ impl KmuxDriver {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         let core = d.core_mut();
         core.confirm_close_session(&word_id);
-        core.needs_render = true;
+        core.request_render();
     }
 
     /// Confirm the pending session close, if a close confirmation is open.
@@ -2906,7 +2906,7 @@ impl KmuxDriver {
         if let Some(t) = theme::builtin_theme(&name) {
             let core = d.core_mut();
             core.palette = t;
-            core.needs_render = true;
+            core.request_render();
         }
     }
 
@@ -2934,7 +2934,7 @@ impl KmuxDriver {
                 return;
             }
             core.cursor_blink_enabled = enabled;
-            core.needs_render = true;
+            core.request_render();
         }
         // Persist (load-modify-save so theme/font are preserved), mirroring the
         // GTK preferences window.

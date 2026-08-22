@@ -70,7 +70,7 @@ fn attach_context_menu(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
             let mut f = fe.borrow_mut();
             if f.core.mgr.active_pane_id() != Some(pane_id.as_str()) {
                 f.core.mgr.focus_pane(pane_id);
-                f.core.needs_render = true;
+                f.core.request_render();
                 changed = true;
             }
         }
@@ -161,7 +161,7 @@ fn attach_resize(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
             };
             if let Some(ratios) = ratios_for_drag(&layout, &div, pointer_cell) {
                 f.core.mgr.set_layout_ratios(div.path.clone(), ratios);
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             drop(f);
             area.queue_draw();
@@ -189,7 +189,7 @@ fn attach_focus_click(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
             let mut f = fe.borrow_mut();
             if f.core.mgr.active_pane_id() != Some(pane_id.as_str()) {
                 f.core.mgr.focus_pane(pane_id);
-                f.core.needs_render = true;
+                f.core.request_render();
             }
         }
         area.grab_focus();
@@ -344,7 +344,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                         && let Some(ratios) = kmux_app::layout::even_ratios_at(&layout, &div.path)
                     {
                         f.core.mgr.set_layout_ratios(div.path.clone(), ratios);
-                        f.core.needs_render = true;
+                        f.core.request_render();
                     }
                 }
                 drag.set(None);

@@ -222,7 +222,7 @@ fn add_dispatch(
         let effects = {
             let mut f = fe.borrow_mut();
             let e = f.core.dispatch_action(action.clone());
-            f.core.needs_render = true;
+            f.core.request_render();
             e
         };
         apply_effects(&fe, effects, &app, &s.drawing);
@@ -241,7 +241,7 @@ fn add_command(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
             let mut f = fe.borrow_mut();
             if !matches!(f.core.mode, Mode::Command(_)) {
                 f.core.mode = Mode::Command(CommandState::default());
-                f.core.needs_render = true;
+                f.core.request_render();
             }
         }
         s.drawing.queue_draw();
@@ -257,7 +257,7 @@ fn add_open_launcher(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
         {
             let mut f = fe.borrow_mut();
             f.core.apply_top_bar_action(TopBarAction::OpenLaunchPicker);
-            f.core.needs_render = true;
+            f.core.request_render();
         }
         s.drawing.queue_draw();
     });

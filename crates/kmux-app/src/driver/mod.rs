@@ -309,8 +309,7 @@ impl FrontendDriver {
         self.tick_metrics(now);
         dirty |= self.tick_blink(now);
 
-        if self.core.needs_render {
-            self.core.needs_render = false;
+        if self.core.take_render_request() {
             dirty = true;
         }
         if self.core.force_clear {
@@ -750,7 +749,7 @@ impl FrontendDriver {
         let target = self.core.current_target();
         self.core
             .start_bootstrap(target, srv_tx, BootstrapPhase::Reconnect, bs_tx);
-        self.core.needs_render = true;
+        self.core.request_render();
     }
 
     /// Forward a batch of key events to the active pane's PTY, and reset the
@@ -887,6 +886,11 @@ impl FrontendDriver {
     /// Borrow the wrapped [`AppCore`] (mutate). See [`core`](Self::core).
     pub fn core_mut(&mut self) -> &mut AppCore {
         &mut self.core
+    }
+
+    /// Ask the frontend for a frame. See [`AppCore::request_render`].
+    pub fn request_render(&mut self) {
+        self.core.request_render();
     }
 }
 

@@ -603,7 +603,7 @@ impl AppCore {
         };
 
         self.mode = Mode::Connecting { target_display };
-        self.needs_render = true;
+        self.request_render();
 
         // Store a clone of the sender so the run loop's outcome arm can
         // pass it to `launch_ssh_supervisor` for SSH targets.

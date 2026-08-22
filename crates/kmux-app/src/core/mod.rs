@@ -365,8 +365,10 @@ pub struct AppCore {
     /// Persisted recent-servers cache.
     pub recent_servers: RecentServersCache,
 
-    /// Frontend should schedule a frame.
-    pub needs_render: bool,
+    /// Frontend should schedule a frame. Set through
+    /// [`request_render`](AppCore::request_render) and consumed once per tick by
+    /// [`FrontendDriver::tick`](crate::driver::FrontendDriver::tick).
+    needs_render: bool,
     /// Frontend should perform a full repaint (clear + redraw).
     pub force_clear: bool,
 
@@ -421,6 +423,28 @@ pub struct AppCore {
 }
 
 impl AppCore {
+    /// Ask the frontend for a frame.
+    ///
+    /// Replaces `core.needs_render = true`, which 59 sites across two frontend
+    /// crates used to write by hand — a `pub` field every caller had to remember
+    /// to set, and the single most-poked piece of `AppCore`. The flag is now
+    /// private: it is raised here and lowered once per tick by
+    /// [`FrontendDriver::tick`](crate::driver::FrontendDriver::tick).
+    pub fn request_render(&mut self) {
+        self.needs_render = true;
+    }
+
+    /// Whether a frame is owed. Consumed (and cleared) by the driver's tick.
+    #[must_use]
+    pub fn render_requested(&self) -> bool {
+        self.needs_render
+    }
+
+    /// Take the pending render request, if any.
+    pub(crate) fn take_render_request(&mut self) -> bool {
+        std::mem::take(&mut self.needs_render)
+    }
+
     /// Build the core view-model for a target. `capabilities` is detected by
     /// the frontend (it is terminal/toolkit-specific) and `term_size` is the
     /// frontend's initial content size.

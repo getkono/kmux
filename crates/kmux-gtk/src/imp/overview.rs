@@ -58,7 +58,7 @@ pub fn attach_keys(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
             {
                 let mut f = fe.borrow_mut();
                 f.core.dispatch_action(Action::ToggleProcessOverview);
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             drawing.grab_focus();
             return glib::Propagation::Stop;
