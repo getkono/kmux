@@ -64,7 +64,6 @@ impl From<BackendSize> for TermSize {
 /// the atomics are still populated because the kmux-protocol capability
 /// negotiation contract requires them and a future backend (or wire-level
 /// gating) may consume them.
-#[allow(dead_code)]
 pub struct CapabilityHandles {
     pub kitty_graphics: Arc<AtomicBool>,
     pub kitty_keyboard: Arc<AtomicBool>,
@@ -99,7 +98,6 @@ pub struct NullEventSink;
 impl BackendEventSink for NullEventSink {}
 
 /// Configuration passed to [`TerminalBackend::new`].
-#[allow(dead_code)]
 pub struct BackendConfig {
     pub size: BackendSize,
     /// Live kitty-graphics/keyboard toggles. Populated on every

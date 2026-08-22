@@ -33,7 +33,16 @@ pub enum BootstrapPath {
     /// Used to apply RFC-1918 `Lan` audience filtering for remote clients.
     /// Wired into the `AuthResult` endpoint advertisement in a future phase.
     /// Not yet used outside tests because `AuthResult` does not yet carry endpoint adverts.
-    #[allow(dead_code)]
+    // Read by `advert_for`'s audience filter below (loopback ⇒ `Local`,
+    // RFC-1918 ⇒ `Lan`) and constructed only by this module's tests, because
+    // `AuthResult` does not carry endpoint adverts yet. `cfg_attr` rather than a
+    // bare attribute because `expect` is evaluated per target: with the test
+    // target compiled in, the variant *is* constructed and the expectation would
+    // be unfulfilled. It expires either way once production builds one.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "awaiting endpoint adverts in AuthResult")
+    )]
     Network { peer: SocketAddr },
 }
 

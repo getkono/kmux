@@ -57,7 +57,17 @@ pub struct Theme {
 /// Deserialisation shape for `themes/*.toml` files.
 #[derive(Debug, Deserialize)]
 struct ThemeFile {
-    #[allow(dead_code)]
+    /// Required of every theme file, and read by nobody.
+    ///
+    /// It is a schema requirement rather than data: a user theme loaded through
+    /// [`parse_theme_toml`] must declare a name, and the built-ins are selected
+    /// by the name the caller asked for, not by this one. Dropping the field
+    /// would make `name` a key serde silently ignores, which is a worse
+    /// contract than an unread one.
+    #[expect(
+        dead_code,
+        reason = "schema requirement: a theme file must name itself"
+    )]
     name: String,
     bg: String,
     fg: String,

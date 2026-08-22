@@ -863,7 +863,7 @@ count = 1
 
 [[allows]]
 crate = "kmux-app"
-count = 4
+count = 3
 
 [[allows]]
 crate = "kmux-client"
@@ -895,11 +895,11 @@ count = 2
 
 [[allows]]
 crate = "kmux-vt-core"
-count = 3
+count = 1
 
 [[allows]]
 crate = "kmuxd"
-count = 9
+count = 8
 
 [[allows]]
 crate = "xtask"
