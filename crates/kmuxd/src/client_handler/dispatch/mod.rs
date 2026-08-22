@@ -1,57 +1,72 @@
-use std::path::{Path, PathBuf};
-use std::sync::atomic::Ordering;
+//! The client-message router.
+//!
+//! `handle_message` is a dispatch table and nothing else: every arm
+//! destructures its message and calls one named handler in the domain module
+//! that owns it. This is not only readability. cargo-mutants generates one
+//! body-replacement mutant **per function**, so the 887-line, 43-arm match this
+//! replaced produced exactly ONE mutant covering all 43 message types — any
+//! single test killed it and the other 42 were invisible to the metric. Forty
+//! handlers produce forty mutants, each killable only by an assertion about
+//! that message. See docs/testing.md R4 and docs/quality-gates.md.
+//!
+//! Handlers return `()`, not an effect type: no message a client sends after
+//! authenticating can close the connection, so there is nothing for the router
+//! to act on. The handshake is the exception and says so in its type — the
+//! pre-auth handlers return [`Flow`].
+//!
+//! The match stays flat and exhaustive rather than delegating to per-domain
+//! sub-routers. Exhaustiveness is the property worth keeping: adding a variant
+//! to `ClientMessage` fails this build until someone decides what the daemon
+//! does with it. That costs a table long enough to still trip
+//! `clippy::too_many_lines`, which the ratchet holds at its current count —
+//! the lint's job is to stop *logic* accumulating in one function, and there
+//! is none here.
 
-use kmux_protocol::messages::{
-    CAPABILITY_FRAME_ZSTD, ClientMessage, Compression, DirEntry, ErrorCode, LayoutNode,
-    ServerMessage, SessionEventMsg, epoch_millis, negotiate_capabilities,
-};
-use kmux_protocol::parse_pane_id;
-use tokio::sync::mpsc;
-use tracing::{debug, info, warn};
+mod auth;
+mod clients;
+mod diagnostics;
+mod input;
+mod layout;
+mod pane;
+mod peer;
+mod session;
+mod tab;
+mod view;
 
-use crate::app::{
-    AttachParams, AttachResult, ClientIdentity, InputLockOutcome, KickOutcome, PaneCloseOutcome,
-};
-use crate::auth::validate_token;
-use crate::connection::classify_error;
+use kmux_protocol::messages::{ClientMessage, TermSize};
 
-use super::{CLIENT_CHANNEL_CAPACITY, PaneAttacher, PendingAuth, SharedClientState};
+use super::{PaneAttacher, SharedClientState};
 
-/// Build a failed `AuthResult` carrying a human-readable `reason` (issue #146).
-fn auth_failure(reason: String) -> ServerMessage {
-    ServerMessage::AuthResult {
-        success: false,
-        reason: Some(reason),
-        client_id: None,
-        server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-        connection_id: None,
-        compression: None,
-        machine_id: None,
-        label: None,
-        server_machine_id: None,
-        negotiated_protocol: None,
-        negotiated_capabilities: Vec::new(),
+/// What the router does with the connection once a message has been handled.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Flow {
+    /// Keep reading from this connection.
+    Continue,
+    /// Close it. Only the handshake has grounds for this.
+    Close,
+}
+
+impl Flow {
+    /// The `bool` [`handle_message`] answers with: `true` keeps the read loop
+    /// going.
+    pub(crate) const fn keep_reading(self) -> bool {
+        matches!(self, Self::Continue)
     }
 }
 
-/// Answer one of the four layout-mutating messages.
+/// The three spawn parameters four different messages all carry.
 ///
-/// On success the daemon's new authoritative tree goes to everyone viewing the
-/// tab; on failure the requester is told. All four carry no `request_id` — they
-/// are fire-and-forget layout nudges — so the error is unaddressed, the same
-/// shape `Resize`, `Signal` and `PtyKeyBatch` already use.
-fn answer_layout_change(
-    state: &mut SharedClientState,
-    word_id: &str,
-    tab_index: u32,
-    result: kmux_pty::error::Result<(LayoutNode, u32)>,
-) {
-    match result {
-        Ok((layout, focused)) => state
-            .app
-            .broadcast_layout(word_id, tab_index, layout, focused),
-        Err(e) => state.error(None, classify_error(&e), e.to_string()),
-    }
+/// `SessionCreate`, `PaneCreate`, `TabCreate` and `PaneSplit` each say "make me
+/// a new PTY" and each carries the same trio to describe it. Passed as one value
+/// because positionally they are `Option<String>`, `Vec<String>` and a struct —
+/// three arguments a caller can transpose and the compiler cannot catch.
+pub(super) struct Spawn {
+    /// Program to run; `None` means the configured default shell.
+    pub program: Option<String>,
+    /// Arguments to `program`.
+    pub args: Vec<String>,
+    /// Initial terminal size for the new pane.
+    pub size: TermSize,
 }
 
 /// Dispatch a single [`ClientMessage`] for a connected client.
@@ -64,138 +79,9 @@ pub async fn handle_message<A: PaneAttacher>(
     attacher: &A,
 ) -> bool {
     if !state.authenticated {
-        match msg {
-            // Step 1: validate token + protocol, then issue a signing challenge.
-            ClientMessage::Auth {
-                token,
-                protocol_range,
-                protocol_capabilities,
-                capabilities,
-                connection_id: incoming_conn_id,
-                public_key,
-                hostname,
-                username,
-                client_kind,
-                client_git_sha,
-                client_git_dirty,
-                client_build_profile,
-            } => {
-                let Some(negotiated_protocol) =
-                    kmux_protocol::compat::negotiate_protocol(protocol_range)
-                else {
-                    state.send(auth_failure(format!(
-                        "protocol version mismatch: client={protocol_range}, server={}",
-                        kmux_protocol::messages::PROTOCOL_RANGE
-                    )));
-                    warn!(
-                        "Protocol version mismatch: client={protocol_range}, server={}",
-                        kmux_protocol::messages::PROTOCOL_RANGE
-                    );
-                    return false;
-                };
-                let negotiated_capabilities = negotiate_capabilities(&protocol_capabilities);
-                if !validate_token(&token, &state.app.auth_token) {
-                    state.send(auth_failure("invalid token".to_string()));
-                    warn!("authentication failed");
-                    return false;
-                }
-                // Token accepted: challenge the client to prove it holds the
-                // private key behind `public_key` (issue #146).
-                let nonce = kmux_sys::identity::random_nonce().to_vec();
-                state.pending_auth = Some(PendingAuth {
-                    nonce: nonce.clone(),
-                    public_key,
-                    hostname,
-                    username,
-                    capabilities,
-                    negotiated_protocol,
-                    negotiated_capabilities,
-                    connection_id: incoming_conn_id,
-                    client_kind,
-                    client_git_sha,
-                    client_git_dirty,
-                    client_build_profile,
-                });
-                state.send(ServerMessage::AuthChallenge { nonce });
-            }
-            // Step 2: verify the signature, then register the connection.
-            ClientMessage::AuthProof { signature } => {
-                let Some(pending) = state.pending_auth.take() else {
-                    state.error(
-                        None,
-                        ErrorCode::NotAuthenticated,
-                        "send Auth before AuthProof",
-                    );
-                    return true;
-                };
-                if !kmux_sys::identity::verify(&pending.public_key, &pending.nonce, &signature) {
-                    state.send(auth_failure("identity verification failed".to_string()));
-                    warn!("identity verification failed");
-                    return false;
-                }
-                let machine_id = kmux_sys::identity::fingerprint(&pending.public_key);
-                let reg = state
-                    .app
-                    .register_client(
-                        state.transport,
-                        std::sync::Arc::clone(&state.metrics),
-                        pending.connection_id,
-                        ClientIdentity {
-                            machine_id: machine_id.clone(),
-                            hostname: pending.hostname,
-                            username: pending.username,
-                            client_kind: pending.client_kind,
-                            client_git_sha: pending.client_git_sha,
-                            client_git_dirty: pending.client_git_dirty,
-                            client_build_profile: pending.client_build_profile,
-                        },
-                    )
-                    .await;
-                state.client_id = Some(reg.client_id);
-                state.connection_id = Some(reg.connection_id);
-                state.capabilities = pending.capabilities;
-                state.authenticated = true;
-                state.pending_swap_from = reg.previous_transport;
-                state.machine_id = Some(machine_id.clone());
-                state.label = Some(reg.label.clone());
-                state.conn_span.record("conn_id", reg.connection_id.0);
-                state.conn_span.record("client_id", reg.client_id.0);
-                // The daemon decides compression from client locality + config
-                // (issue #59). Self-describing frames make this purely a sender
-                // policy: flip the shared toggle the writer/attacher tasks read.
-                let compress = pending
-                    .negotiated_capabilities
-                    .iter()
-                    .any(|capability| capability == CAPABILITY_FRAME_ZSTD)
-                    && state.app.compression.enabled_for(state.transport);
-                state.comp_out.set_enabled(compress);
-                let server_machine_id = state.app.server_machine_id.clone();
-                state.send(ServerMessage::AuthResult {
-                    success: true,
-                    reason: None,
-                    client_id: Some(reg.client_id),
-                    server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
-                    connection_id: Some(reg.connection_id),
-                    compression: compress.then_some(Compression::Zstd),
-                    machine_id: Some(machine_id),
-                    label: Some(reg.label),
-                    server_machine_id: (!server_machine_id.is_empty()).then_some(server_machine_id),
-                    negotiated_protocol: Some(pending.negotiated_protocol),
-                    negotiated_capabilities: pending.negotiated_capabilities,
-                });
-                info!(
-                    conn_id = reg.connection_id.0,
-                    client_id = reg.client_id.0,
-                    label = state.label.as_deref().unwrap_or(""),
-                    compress,
-                    "client authenticated"
-                );
-            }
-            _ => {
-                state.error(None, ErrorCode::NotAuthenticated, "send Auth first");
-            }
-        }
-        return true;
+        return auth::handle_unauthenticated(state, msg)
+            .await
+            .keep_reading();
     }
 
     let client_id = state.client_id.expect("authenticated without client_id");
@@ -206,20 +92,7 @@ pub async fn handle_message<A: PaneAttacher>(
         // Already authenticated — a stray proof is ignored.
         ClientMessage::AuthProof { .. } => {}
 
-        ClientMessage::ChannelReady => {
-            // The previous transport was captured in `state.pending_swap_from`
-            // by the Auth handler at the moment register_client swapped it
-            // out. Consuming it here ensures the `ChannelSwitched` reply
-            // names the genuine prior transport, even if the registry's
-            // recorded transport has since changed (e.g. a third channel
-            // arrived). `take` clears the field so a stray duplicate
-            // ChannelReady doesn't re-emit a stale switch event.
-            if let Some(old) = state.pending_swap_from.take() {
-                state.send(ServerMessage::ChannelSwitched {
-                    old_transport: old.to_string(),
-                });
-            }
-        }
+        ClientMessage::ChannelReady => auth::on_channel_ready(state),
 
         ClientMessage::SessionCreate {
             request_id,
@@ -229,124 +102,39 @@ pub async fn handle_message<A: PaneAttacher>(
             args,
             size,
             peer,
-        } => match peer {
-            // Create on a federated peer (issue #121 launcher): the hub forwards
-            // the create upstream and registers the result under a local word,
-            // then replies SessionCreated exactly as for a local create.
-            Some(peer) => match state
-                .app
-                .create_remote_session(&peer, name, cwd, program, args, size)
-                .await
-            {
-                Ok(entry) => state.send(ServerMessage::SessionCreated { request_id, entry }),
-                Err(e) => state.error(Some(request_id), ErrorCode::InternalError, e),
-            },
-            None => match state
-                .app
-                .create_session(name, cwd, program, args, size, &state.capabilities)
-                .await
-            {
-                Ok(entry) => state.send(ServerMessage::SessionCreated { request_id, entry }),
-                Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
-            },
-        },
+        } => {
+            let spawn = Spawn {
+                program,
+                args,
+                size,
+            };
+            session::on_session_create(state, request_id, name, cwd, spawn, peer).await;
+        }
 
         ClientMessage::SessionClose {
             request_id,
             word_id,
-        } => {
-            let pane_ids: Vec<String> = state
-                .attached
-                .keys()
-                .filter(|k| k.starts_with(&format!("{word_id}/")))
-                .cloned()
-                .collect();
-            for pane_id in &pane_ids {
-                if let Some(handle) = state.attached.remove(pane_id) {
-                    handle.abort();
-                }
-                state.app.detach_from_pane(pane_id, client_id).await;
-            }
-            match state.app.close_session(&word_id).await {
-                Ok(exit_code) => state.send(ServerMessage::SessionClosed {
-                    request_id,
-                    word_id,
-                    exit_code,
-                }),
-                Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
-            }
-        }
+        } => session::on_session_close(state, client_id, request_id, word_id).await,
 
-        // `PaneCreate` is the legacy "new pane" intent; under the Session → Tab
-        // → Pane model it creates a new TAB (with one pane). The reply still
-        // names the new pane so existing clients attach to it as before.
         ClientMessage::PaneCreate {
             request_id,
             word_id,
             program,
             args,
             size,
-        } => match state
-            .app
-            .create_tab(&word_id, program, args, size, &state.capabilities)
-            .await
-        {
-            Ok((tab, pane)) => {
-                let tab_index = tab.tab_index;
-                state.send(ServerMessage::PaneCreated {
-                    request_id,
-                    pane_id: pane.pane_id,
-                    session_word_id: word_id.clone(),
-                    size,
-                });
-                state
-                    .app
-                    .broadcast_session_event(SessionEventMsg::TabCreated { word_id, tab_index });
-            }
-            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
-        },
+        } => {
+            let spawn = Spawn {
+                program,
+                args,
+                size,
+            };
+            pane::on_pane_create(state, request_id, word_id, spawn).await;
+        }
 
         ClientMessage::PaneClose {
             request_id,
             pane_id,
-        } => {
-            if let Some(handle) = state.attached.remove(&pane_id) {
-                handle.abort();
-            }
-            state.app.detach_from_pane(&pane_id, client_id).await;
-            match state.app.close_pane(&pane_id).await {
-                Ok((exit_code, outcome)) => {
-                    state.send(ServerMessage::PaneClosed {
-                        request_id,
-                        pane_id: pane_id.clone(),
-                        exit_code,
-                    });
-                    let word_id = parse_pane_id(&pane_id)
-                        .map(|(w, _)| w.to_string())
-                        .unwrap_or_default();
-                    match outcome {
-                        PaneCloseOutcome::TabUpdated {
-                            tab_index,
-                            layout,
-                            focused_pane,
-                        } => state
-                            .app
-                            .broadcast_layout(&word_id, tab_index, layout, focused_pane),
-                        PaneCloseOutcome::TabClosed { tab_index } => state
-                            .app
-                            .broadcast_session_event(SessionEventMsg::TabClosed {
-                                word_id,
-                                tab_index,
-                            }),
-                        PaneCloseOutcome::SessionClosed => state
-                            .app
-                            .broadcast_session_event(SessionEventMsg::SessionClosed { word_id }),
-                        PaneCloseOutcome::Gone => {}
-                    }
-                }
-                Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
-            }
-        }
+        } => pane::on_pane_close(state, client_id, request_id, pane_id).await,
 
         ClientMessage::TabCreate {
             request_id,
@@ -354,82 +142,33 @@ pub async fn handle_message<A: PaneAttacher>(
             program,
             args,
             size,
-        } => match state
-            .app
-            .create_tab(&word_id, program, args, size, &state.capabilities)
-            .await
-        {
-            Ok((tab, _pane)) => {
-                let tab_index = tab.tab_index;
-                state.send(ServerMessage::TabCreated {
-                    request_id,
-                    word_id: word_id.clone(),
-                    tab,
-                });
-                state
-                    .app
-                    .broadcast_session_event(SessionEventMsg::TabCreated { word_id, tab_index });
-            }
-            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
-        },
+        } => {
+            let spawn = Spawn {
+                program,
+                args,
+                size,
+            };
+            tab::on_tab_create(state, request_id, word_id, spawn).await;
+        }
 
         ClientMessage::TabClose {
             request_id,
             word_id,
             tab_index,
-        } => match state.app.close_tab(&word_id, tab_index).await {
-            Ok(session_closed) => {
-                state.send(ServerMessage::TabClosed {
-                    request_id,
-                    word_id: word_id.clone(),
-                    tab_index,
-                });
-                if session_closed {
-                    state
-                        .app
-                        .broadcast_session_event(SessionEventMsg::SessionClosed { word_id });
-                } else {
-                    state
-                        .app
-                        .broadcast_session_event(SessionEventMsg::TabClosed { word_id, tab_index });
-                }
-            }
-            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
-        },
+        } => tab::on_tab_close(state, request_id, word_id, tab_index).await,
 
         ClientMessage::TabRename {
             request_id,
             word_id,
             tab_index,
             new_name,
-        } => match state.app.rename_tab(&word_id, tab_index, &new_name).await {
-            Ok(()) => state
-                .app
-                .broadcast_session_event(SessionEventMsg::TabRenamed {
-                    word_id,
-                    tab_index,
-                    name: new_name,
-                }),
-            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
-        },
+        } => tab::on_tab_rename(state, request_id, word_id, tab_index, new_name).await,
 
         ClientMessage::TabReorder {
             word_id,
             tab_index,
             new_position,
-        } => match state
-            .app
-            .reorder_tab(&word_id, tab_index, new_position)
-            .await
-        {
-            Ok(tab_indices) => state
-                .app
-                .broadcast_session_event(SessionEventMsg::TabsReordered {
-                    word_id,
-                    tab_indices,
-                }),
-            Err(e) => state.error(None, classify_error(&e), e.to_string()),
-        },
+        } => tab::on_tab_reorder(state, word_id, tab_index, new_position).await,
 
         ClientMessage::PaneSplit {
             request_id,
@@ -440,326 +179,114 @@ pub async fn handle_message<A: PaneAttacher>(
             program,
             args,
             size,
-        } => match state
-            .app
-            .split_pane(
-                &word_id,
-                tab_index,
-                from_pane,
-                dir,
+        } => {
+            let spawn = Spawn {
                 program,
                 args,
                 size,
-                &state.capabilities,
-            )
-            .await
-        {
-            Ok((new_pane, layout, focused)) => {
-                state.send(ServerMessage::PaneSplit {
-                    request_id,
-                    word_id: word_id.clone(),
-                    tab_index,
-                    new_pane,
-                    layout: layout.clone(),
-                });
-                state
-                    .app
-                    .broadcast_layout(&word_id, tab_index, layout, focused);
-            }
-            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
-        },
+            };
+            pane::on_pane_split(state, request_id, word_id, tab_index, from_pane, dir, spawn).await;
+        }
 
         ClientMessage::PaneSwap {
             word_id,
             tab_index,
             a,
             b,
-        } => {
-            let result = state.app.swap_panes(&word_id, tab_index, a, b).await;
-            answer_layout_change(state, &word_id, tab_index, result);
-        }
+        } => layout::on_pane_swap(state, word_id, tab_index, a, b).await,
 
         ClientMessage::SetLayoutRatios {
             word_id,
             tab_index,
             path,
             ratios,
-        } => {
-            let result = state
-                .app
-                .set_layout_ratios(&word_id, tab_index, &path, &ratios)
-                .await;
-            answer_layout_change(state, &word_id, tab_index, result);
-        }
+        } => layout::on_set_layout_ratios(state, word_id, tab_index, path, ratios).await,
 
         ClientMessage::ApplyLayoutScheme {
             word_id,
             tab_index,
             scheme,
-        } => {
-            let result = state
-                .app
-                .apply_layout_scheme(&word_id, tab_index, scheme)
-                .await;
-            answer_layout_change(state, &word_id, tab_index, result);
-        }
+        } => layout::on_apply_layout_scheme(state, word_id, tab_index, scheme).await,
 
         ClientMessage::SetFocus {
             word_id,
             tab_index,
             pane_index,
-        } => {
-            let result = state
-                .app
-                .set_tab_focus(&word_id, tab_index, pane_index)
-                .await;
-            answer_layout_change(state, &word_id, tab_index, result);
-        }
+        } => layout::on_set_focus(state, word_id, tab_index, pane_index).await,
 
         ClientMessage::SessionList { request_id } => {
-            // Merge locally-hosted sessions with every open peer's proxied
-            // sessions (local IDs, peer-decorated names). Federation off ⇒ the
-            // federated list is empty and this is the original behaviour.
-            let mut sessions = state.app.list_sessions().await;
-            sessions.extend(state.app.list_federated_sessions());
-            state.send(ServerMessage::SessionListResult {
-                request_id,
-                sessions,
-            });
+            session::on_session_list(state, request_id).await;
         }
 
-        // Closed-session restore (issue #64). The graveyard is local-only, so
-        // these are not federated.
         ClientMessage::SessionListClosed { request_id } => {
-            state.send(ServerMessage::ClosedSessionListResult {
-                request_id,
-                sessions: state.app.closed_session_entries(),
-            });
+            session::on_session_list_closed(state, request_id);
         }
 
         ClientMessage::SessionRestore {
             request_id,
             word_id,
-        } => match state.app.restore_session(&word_id).await {
-            Ok(entry) => {
-                let restored = entry.meta.word_id.clone();
-                state.send(ServerMessage::SessionCreated { request_id, entry });
-                state
-                    .app
-                    .broadcast_session_event(SessionEventMsg::SessionCreated { word_id: restored });
-            }
-            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
-        },
+        } => session::on_session_restore(state, request_id, word_id).await,
 
         ClientMessage::ProcessOverview { request_id } => {
-            // Merge the locally-hosted panes' process trees with every open
-            // peer's (issue #122). Federation off ⇒ the federated half is empty.
-            let mut panes = state.app.local_process_overview().await;
-            panes.extend(state.app.collect_federated_process_overview().await);
-            state.send(ServerMessage::ProcessOverviewResult { request_id, panes });
+            diagnostics::on_process_overview(state, request_id).await;
         }
 
-        // Stream this daemon's own log file back to the client (issue #187), so
-        // `kmux daemon logs --server <host>` can read a remote daemon's log. The
-        // local form reads the file off disk; only the daemon log is reachable
-        // across machines, so there is no federated/peer-forwarded variant.
         ClientMessage::FetchLogs {
             request_id,
             lines,
             follow,
-        } => {
-            handle_fetch_logs(state, request_id, lines, follow).await;
-        }
+        } => diagnostics::on_fetch_logs(state, request_id, lines, follow).await,
 
         ClientMessage::PtyInput { pane_id, data } => {
-            if state.app.is_federated_pane(&pane_id) {
-                state
-                    .app
-                    .forward_peer_message(&pane_id, move |remote| ClientMessage::PtyInput {
-                        pane_id: remote,
-                        data,
-                    });
-            } else if let Err(e) = state.app.write_input(&pane_id, client_id, data).await {
-                state.error(None, classify_error(&e), e.to_string());
-            }
+            input::on_pty_input(state, client_id, pane_id, data).await;
         }
 
         ClientMessage::PtyPaste { pane_id, data } => {
-            if state.app.is_federated_pane(&pane_id) {
-                state
-                    .app
-                    .forward_peer_message(&pane_id, move |remote| ClientMessage::PtyPaste {
-                        pane_id: remote,
-                        data,
-                    });
-            } else if let Err(e) = state.app.write_paste(&pane_id, client_id, data).await {
-                state.error(None, classify_error(&e), e.to_string());
-            }
+            input::on_pty_paste(state, client_id, pane_id, data).await;
         }
 
         ClientMessage::PtyKeyBatch { pane_id, events } => {
-            if state.app.is_federated_pane(&pane_id) {
-                state.app.forward_peer_message(&pane_id, move |remote| {
-                    ClientMessage::PtyKeyBatch {
-                        pane_id: remote,
-                        events,
-                    }
-                });
-            } else if let Err(e) = state
-                .app
-                .write_key_batch(&pane_id, client_id, &events)
-                .await
-            {
-                state.error(None, classify_error(&e), e.to_string());
-            }
+            input::on_pty_key_batch(state, client_id, pane_id, events).await;
         }
 
         ClientMessage::Resize { pane_id, size } => {
-            // Federated panes reconcile smallest-wins across local viewers inside
-            // the peer subsystem (which forwards at most one upstream Resize),
-            // rather than forwarding this client's size verbatim.
-            if state.app.is_federated_pane(&pane_id) {
-                state.app.federated_resize(&pane_id, client_id, size);
-            } else if let Err(e) = state.app.resize(&pane_id, client_id, size).await {
-                state.error(None, classify_error(&e), e.to_string());
-            }
+            input::on_resize(state, client_id, pane_id, size).await;
         }
 
         ClientMessage::Attach {
             pane_id,
             last_seqno,
             size,
-        } => {
-            // If already attached, detach first (routes to the peer subsystem
-            // for federated panes, the local relay otherwise).
-            if let Some(old) = state.attached.remove(&pane_id) {
-                old.abort();
-                state.app.detach_pane_any(&pane_id, client_id).await;
-            }
+        } => view::on_attach(state, client_id, pane_id, last_seqno, size, attacher).await,
 
-            let (client_tx, client_rx) = mpsc::channel::<ServerMessage>(CLIENT_CHANNEL_CAPACITY);
+        ClientMessage::Detach { pane_id } => view::on_detach(state, client_id, pane_id).await,
 
-            if state.app.is_federated_pane(&pane_id) {
-                // Federated pane: register as a viewer and forward the `Attach`
-                // upstream. The remote's snapshot and diffs arrive asynchronously
-                // through the peer feed loop and are pumped to this client via
-                // `client_rx`, so the synchronous replay is empty — `Delta(vec![])`
-                // emits no initial frames (see `build_attach_replay`).
-                state.app.federated_attach(
-                    &pane_id,
-                    client_id,
-                    client_tx,
-                    state.ctrl_tx.clone(),
-                    last_seqno,
-                    size,
-                );
-                match attacher
-                    .start_pane_stream(pane_id.clone(), AttachResult::Delta(vec![]), client_rx)
-                    .await
-                {
-                    Ok(handle) => {
-                        state.attached.insert(pane_id, handle);
-                    }
-                    Err(e) => state.error(None, ErrorCode::InternalError, e),
-                }
-            } else {
-                match state
-                    .app
-                    .attach(AttachParams {
-                        pane_id: pane_id.clone(),
-                        client_id,
-                        last_seqno,
-                        size,
-                        data_tx: client_tx,
-                        ctrl_tx: state.ctrl_tx.clone(),
-                        capabilities: state.capabilities.clone(),
-                    })
-                    .await
-                {
-                    Ok(result) => {
-                        match attacher
-                            .start_pane_stream(pane_id.clone(), result, client_rx)
-                            .await
-                        {
-                            Ok(handle) => {
-                                state.attached.insert(pane_id, handle);
-                            }
-                            Err(e) => {
-                                state.error(None, ErrorCode::InternalError, e);
-                            }
-                        }
-                    }
-                    Err(e) => state.error(None, classify_error(&e), e.to_string()),
-                }
-            }
-        }
-
-        ClientMessage::Detach { pane_id } => {
-            if let Some(handle) = state.attached.remove(&pane_id) {
-                handle.abort();
-                state.app.detach_pane_any(&pane_id, client_id).await;
-                debug!("detached from pane '{pane_id}'");
-            }
-        }
-
-        ClientMessage::Signal { pane_id, signal } => {
-            if state.app.is_federated_pane(&pane_id) {
-                state
-                    .app
-                    .forward_peer_message(&pane_id, move |remote| ClientMessage::Signal {
-                        pane_id: remote,
-                        signal,
-                    });
-            } else if let Err(e) = state.app.send_signal(&pane_id, signal).await {
-                state.error(None, classify_error(&e), e.to_string());
-            }
-        }
+        ClientMessage::Signal { pane_id, signal } => input::on_signal(state, pane_id, signal).await,
 
         ClientMessage::RequestInputLock { pane_id } => {
-            match state.app.request_input_lock(&pane_id, client_id).await {
-                Ok(InputLockOutcome::Granted) => {
-                    state.send(ServerMessage::InputLockGranted { pane_id });
-                }
-                Ok(InputLockOutcome::Denied(holder)) => {
-                    state.send(ServerMessage::InputLockDenied { pane_id, holder });
-                }
-                Err(e) => state.error(None, classify_error(&e), e.to_string()),
-            }
+            input::on_request_input_lock(state, client_id, pane_id).await;
         }
 
         ClientMessage::ReleaseInputLock { pane_id } => {
-            match state.app.release_input_lock(&pane_id, client_id).await {
-                Ok(true) => state.send(ServerMessage::InputLockReleased { pane_id }),
-                Ok(false) => {}
-                Err(e) => state.error(None, classify_error(&e), e.to_string()),
-            }
+            input::on_release_input_lock(state, client_id, pane_id).await;
         }
 
         ClientMessage::SessionRename {
             request_id,
             word_id,
             new_name,
-        } => match state.app.rename_session(&word_id, &new_name).await {
-            Ok(()) => state.send(ServerMessage::SessionRenamed { word_id, new_name }),
-            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
-        },
+        } => session::on_session_rename(state, request_id, word_id, new_name).await,
 
         ClientMessage::SetSnapshotMode { enabled } => {
-            state.app.set_snapshot_mode(client_id, enabled).await;
-            debug!("client {client_id:?} snapshot mode = {enabled}");
+            view::on_set_snapshot_mode(state, client_id, enabled).await;
         }
 
         ClientMessage::SetPaused { paused, auto } => {
-            state.app.set_paused(client_id, paused, auto).await;
-            debug!("client {client_id:?} paused = {paused} (auto = {auto})");
+            view::on_set_paused(state, client_id, paused, auto).await;
         }
 
         ClientMessage::SetPaneNoAutoPause { pane_id, exempt } => {
-            state
-                .app
-                .set_pane_no_auto_pause(client_id, &pane_id, exempt)
-                .await;
-            debug!("client {client_id:?} pane {pane_id} no_auto_pause = {exempt}");
+            view::on_set_pane_no_auto_pause(state, client_id, pane_id, exempt).await;
         }
 
         ClientMessage::FetchHistory {
@@ -767,133 +294,30 @@ pub async fn handle_message<A: PaneAttacher>(
             pane_id,
             start_index,
             count,
-        } => {
-            // For a federated pane, forward the request upstream; the remote's
-            // `HistoryLines` reply is pane-scoped, so the feed loop translates it
-            // back to this viewer (matched by `request_id`).
-            if state.app.is_federated_pane(&pane_id) {
-                state.app.forward_peer_message(&pane_id, move |remote| {
-                    ClientMessage::FetchHistory {
-                        request_id,
-                        pane_id: remote,
-                        start_index,
-                        count,
-                    }
-                });
-            } else {
-                match state.app.fetch_history(&pane_id, start_index, count).await {
-                    Ok((first_index, lines, history_total)) => {
-                        state.send(ServerMessage::HistoryLines {
-                            request_id,
-                            pane_id,
-                            first_index,
-                            lines,
-                            history_total,
-                            sent_at_ms: epoch_millis(),
-                        });
-                    }
-                    Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
-                }
-            }
-        }
+        } => view::on_fetch_history(state, request_id, pane_id, start_index, count).await,
 
         ClientMessage::ListDirectory { request_id, path } => {
-            state.send(list_directory(request_id, &path));
+            diagnostics::on_list_directory(state, request_id, &path);
         }
 
         ClientMessage::OpenPeer { request_id, target } => {
-            // Ensure an upstream connection to the remote daemon and surface its
-            // sessions locally. With the `federation` feature off, `open_peer`
-            // returns a "not supported" error and this becomes a `PeerError`
-            // the client can surface.
-            let peer_hint = target.peer_id();
-            match state.app.open_peer(target).await {
-                Ok(peer) => state.send(ServerMessage::PeerOpened { request_id, peer }),
-                Err(reason) => state.send(ServerMessage::PeerError {
-                    request_id,
-                    peer: Some(peer_hint),
-                    reason,
-                }),
-            }
+            peer::on_open_peer(state, request_id, target).await;
         }
 
         ClientMessage::ClosePeer { request_id, peer } => {
-            state.app.close_peer(&peer);
-            state.send(ServerMessage::PeerClosed { request_id, peer });
+            peer::on_close_peer(state, request_id, peer);
         }
 
         ClientMessage::ClientList {
             request_id,
             word_id,
-        } => {
-            // Federated session ⇒ forward to the owning peer; otherwise build the
-            // list from this daemon's own connections (issue #146).
-            if state.app.is_federated_session(&word_id) {
-                match state.app.list_federated_session_clients(&word_id).await {
-                    Ok(clients) => state.send(ServerMessage::ClientListResult {
-                        request_id,
-                        word_id,
-                        clients,
-                    }),
-                    Err(reason) => {
-                        state.error(Some(request_id), ErrorCode::SessionNotFound, reason);
-                    }
-                }
-            } else {
-                match state.app.list_session_clients(&word_id, client_id).await {
-                    Some(clients) => state.send(ServerMessage::ClientListResult {
-                        request_id,
-                        word_id,
-                        clients,
-                    }),
-                    None => state.error(
-                        Some(request_id),
-                        ErrorCode::SessionNotFound,
-                        format!("session not found: {word_id}"),
-                    ),
-                }
-            }
-        }
+        } => clients::on_client_list(state, client_id, request_id, word_id).await,
 
         ClientMessage::KickClient {
             request_id,
             word_id,
             client_id: target,
-        } => {
-            if state.app.is_federated_session(&word_id) {
-                match state.app.kick_federated_client(&word_id, target).await {
-                    Ok(()) => state.send(ServerMessage::ClientKicked {
-                        request_id,
-                        word_id,
-                        client_id: target,
-                    }),
-                    Err(reason) => state.error(Some(request_id), ErrorCode::ClientNotFound, reason),
-                }
-            } else {
-                let by_label = state.label.clone().unwrap_or_default();
-                match state
-                    .app
-                    .kick_client_from_session(&word_id, target, &by_label)
-                    .await
-                {
-                    KickOutcome::Kicked => state.send(ServerMessage::ClientKicked {
-                        request_id,
-                        word_id,
-                        client_id: target,
-                    }),
-                    KickOutcome::SessionNotFound => state.error(
-                        Some(request_id),
-                        ErrorCode::SessionNotFound,
-                        format!("session not found: {word_id}"),
-                    ),
-                    KickOutcome::ClientNotFound => state.error(
-                        Some(request_id),
-                        ErrorCode::ClientNotFound,
-                        format!("client {} not attached to session {word_id}", target.0),
-                    ),
-                }
-            }
-        }
+        } => clients::on_kick_client(state, client_id, request_id, word_id, target).await,
 
         ClientMessage::Notify {
             request_id,
@@ -901,225 +325,24 @@ pub async fn handle_message<A: PaneAttacher>(
             kind,
             title,
             body,
-        } => match state
-            .app
-            .notify_pane_attention(&pane_id, kind, title, body)
-            .await
-        {
-            Ok(()) => state.send(ServerMessage::NotifyAccepted { request_id }),
-            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
-        },
+        } => diagnostics::on_notify(state, request_id, pane_id, kind, title, body).await,
 
-        ClientMessage::Ping { seq } => {
-            state.send(ServerMessage::Pong { seq });
-        }
+        ClientMessage::Ping { seq } => diagnostics::on_ping(state, seq),
 
-        ClientMessage::Pong { seq } => {
-            let sent = *state.metrics.last_ping_sent.lock().unwrap();
-            if let Some((sent_seq, sent_at)) = sent
-                && sent_seq == seq
-            {
-                let rtt_ms = sent_at.elapsed().as_millis() as u64;
-                state.metrics.last_rtt_ms.store(rtt_ms, Ordering::Relaxed);
-                state
-                    .metrics
-                    .last_pong_ms
-                    .store(epoch_millis(), Ordering::Relaxed);
-            }
-        }
+        ClientMessage::Pong { seq } => diagnostics::on_pong(state, seq),
     }
 
     true
 }
 
-/// Chunk size for streaming a log file to a client (issue #187): large enough
-/// that framing overhead is negligible, small enough to bound per-message memory.
-const LOG_CHUNK_BYTES: usize = 64 * 1024;
-
-/// Answer a [`ClientMessage::FetchLogs`] (issue #187): stream this daemon's own
-/// log file to the client over the control channel.
-///
-/// Sends the existing content (trimmed to the last `lines` lines when set) as
-/// `LogChunk`s, then either a terminating `LogEnd` or — under `follow` — spawns a
-/// detached task that tails the file and keeps pushing `LogChunk`s until the
-/// connection's writer is gone (its `ctrl_tx` is closed). The follow task checks
-/// `ctrl_tx.is_closed()` each tick so a disconnect during an idle log never
-/// leaks the task.
-async fn handle_fetch_logs(
-    state: &SharedClientState,
-    request_id: u64,
-    lines: Option<u32>,
-    follow: bool,
-) {
-    use tokio::io::{AsyncReadExt, AsyncSeekExt};
-
-    let path = match kmux_sys::dirs::daemon_log_path() {
-        Ok(p) => p,
-        Err(e) => {
-            state.error(
-                Some(request_id),
-                ErrorCode::InternalError,
-                format!("daemon log path unavailable: {e}"),
-            );
-            return;
-        }
-    };
-
-    let mut file = match tokio::fs::File::open(&path).await {
-        Ok(f) => f,
-        Err(e) => {
-            state.error(
-                Some(request_id),
-                ErrorCode::InternalError,
-                format!("daemon log not readable at {}: {e}", path.display()),
-            );
-            return;
-        }
-    };
-
-    let mut buf = Vec::new();
-    if let Err(e) = file.read_to_end(&mut buf).await {
-        state.error(
-            Some(request_id),
-            ErrorCode::InternalError,
-            format!("reading daemon log failed: {e}"),
-        );
-        return;
-    }
-
-    let start = match lines {
-        Some(n) => kmux_sys::log_tail::last_n_lines_offset(&buf, n as usize),
-        None => 0,
-    };
-    for chunk in buf[start..].chunks(LOG_CHUNK_BYTES) {
-        state.send(ServerMessage::LogChunk {
-            request_id,
-            data: chunk.to_vec(),
-        });
-    }
-
-    if !follow {
-        state.send(ServerMessage::LogEnd { request_id });
-        return;
-    }
-
-    // Follow: tail appended bytes from the current end of file. `read_to_end`
-    // already left the cursor at EOF, but seek explicitly to be sure.
-    let ctrl_tx = state.ctrl_tx.clone();
-    tokio::spawn(async move {
-        if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
-            return;
-        }
-        let mut read_buf = vec![0u8; LOG_CHUNK_BYTES];
-        loop {
-            tokio::time::sleep(std::time::Duration::from_millis(150)).await;
-            if ctrl_tx.is_closed() {
-                return;
-            }
-            match file.read(&mut read_buf).await {
-                Ok(0) => continue,
-                Ok(n) => {
-                    if ctrl_tx
-                        .send(ServerMessage::LogChunk {
-                            request_id,
-                            data: read_buf[..n].to_vec(),
-                        })
-                        .is_err()
-                    {
-                        return;
-                    }
-                }
-                Err(_) => return,
-            }
-        }
-    });
-}
-
-/// Maximum number of directory entries returned in a single `DirectoryListing`,
-/// to bound the reply size for very large directories.
-const MAX_DIR_ENTRIES: usize = 2000;
-
-/// Build the `DirectoryListing` reply for a `ListDirectory` request.
-///
-/// Resolves `requested` (empty ⇒ `$HOME`, else the daemon's `.`), canonicalizes
-/// it, and returns its **subdirectories only** (the browser is choosing a
-/// directory), sorted case-insensitively and capped at [`MAX_DIR_ENTRIES`]. On
-/// any IO error it returns `error: Some(..)` with empty `entries` and echoes the
-/// requested path so the client keeps showing where it tried to go. This reads
-/// the daemon's own filesystem (the user owns it), so no sandboxing is applied
-/// beyond normal filesystem permissions.
-fn list_directory(request_id: u64, requested: &str) -> ServerMessage {
-    let target = if requested.is_empty() {
-        std::env::var_os("HOME").map_or_else(|| PathBuf::from("."), PathBuf::from)
-    } else {
-        PathBuf::from(requested)
-    };
-
-    let canonical = match std::fs::canonicalize(&target) {
-        Ok(p) => p,
-        Err(e) => return directory_error(request_id, requested, &e),
-    };
-
-    let read = match std::fs::read_dir(&canonical) {
-        Ok(rd) => rd,
-        Err(e) => return directory_error(request_id, requested, &e),
-    };
-
-    let mut entries: Vec<DirEntry> = Vec::new();
-    for entry in read.flatten() {
-        // Skip entries whose metadata can't be read (e.g. dangling symlink) and
-        // anything that is not a directory — `file_type()` does not traverse
-        // symlinks, so a symlink loop can't recurse here.
-        match entry.file_type() {
-            Ok(ft) if ft.is_dir() => {}
-            Ok(ft) if ft.is_symlink() => {
-                // Resolve one level so symlinked directories still appear, but
-                // bail out gracefully if the link is broken or loops.
-                match std::fs::metadata(entry.path()) {
-                    Ok(md) if md.is_dir() => {}
-                    _ => continue,
-                }
-            }
-            _ => continue,
-        }
-        if let Some(name) = entry.file_name().to_str() {
-            entries.push(DirEntry {
-                name: name.to_string(),
-                is_dir: true,
-            });
-        }
-    }
-    entries.sort_by_key(|e| e.name.to_lowercase());
-    entries.truncate(MAX_DIR_ENTRIES);
-
-    let parent = canonical
-        .parent()
-        .and_then(Path::to_str)
-        .map(str::to_string);
-
-    ServerMessage::DirectoryListing {
-        request_id,
-        path: canonical.to_string_lossy().into_owned(),
-        parent,
-        entries,
-        error: None,
-    }
-}
-
-/// Build a failed `DirectoryListing` echoing the requested path.
-fn directory_error(request_id: u64, requested: &str, err: &std::io::Error) -> ServerMessage {
-    ServerMessage::DirectoryListing {
-        request_id,
-        path: requested.to_string(),
-        parent: None,
-        entries: vec![],
-        error: Some(err.to_string()),
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::path::Path;
+    use std::sync::atomic::Ordering;
+
+    use kmux_protocol::messages::ErrorCode;
+
+    use super::diagnostics::list_directory;
 
     use std::sync::Arc;
 
