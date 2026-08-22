@@ -2538,20 +2538,37 @@ mod tests {
     #[test]
     fn closing_a_background_tab_does_not_move_the_cached_active_tab() {
         // `entry.active_tab` is the *session's* remembered tab, repaired only
-        // when the tab it names is the one that died.
+        // when the tab it names is the one that died. Three tabs, remembering
+        // the LAST and closing the MIDDLE, so "leave it alone" and "repair it to
+        // the first survivor" give different answers — with two tabs they
+        // coincide and the distinction is untestable.
         let mut mgr = manager_on_two_tabs(0);
-        mgr.session_list[0].active_tab = 1;
+        mgr.session_list[0].panes.push(pane("eagle", 2));
+        mgr.session_list[0]
+            .tabs
+            .push(tab(2, LayoutNode::single(2), 2));
+        mgr.session_list[0].active_tab = 2;
 
         mgr.handle_server_message(ServerMessage::Event {
             event: SessionEventMsg::TabClosed {
                 word_id: "eagle".to_string(),
-                tab_index: 0,
+                tab_index: 1,
             },
         });
 
         assert_eq!(
-            mgr.session_list[0].active_tab, 1,
-            "a tab that was not the session's active one leaves it alone"
+            mgr.session_list[0].active_tab, 2,
+            "a tab that was not the session's active one leaves it alone \
+             (repairing would have reset it to the first survivor, 0)"
+        );
+        assert_eq!(
+            mgr.session_list[0]
+                .tabs
+                .iter()
+                .map(|t| t.tab_index)
+                .collect::<Vec<_>>(),
+            vec![0, 2],
+            "the closed tab is still pruned"
         );
     }
 
