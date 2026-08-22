@@ -2029,16 +2029,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_empty_pty_key_batch_answers_nothing_even_for_an_unknown_pane() {
+    async fn an_empty_pty_key_batch_to_an_unknown_pane_still_errors() {
         let (keep, msgs) = dispatch_one(ClientMessage::PtyKeyBatch {
             pane_id: MISSING_PANE.to_string(),
             events: vec![],
         })
         .await;
         assert!(keep);
-        // `write_key_batch` short-circuits on an empty batch before the pane
-        // lookup, so the pane is never validated.
-        assert!(msgs.is_empty(), "nothing to write: {msgs:?}");
+        // Whether the pane exists cannot depend on how many keys were sent.
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
     }
 
     #[tokio::test]

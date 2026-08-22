@@ -40,9 +40,6 @@ impl ServerApp {
         client_id: ClientId,
         events: &[KeyEvent],
     ) -> Result<()> {
-        if events.is_empty() {
-            return Ok(());
-        }
         let sessions = self.sessions.read().await;
         let relay = get_pane_relay(&sessions, pane_id)?;
         match &relay.input_mode {
@@ -51,6 +48,13 @@ impl ServerApp {
             InputMode::Locked(_) | InputMode::Disabled => {
                 return Err(KmuxError::Pty(nix::Error::EPERM));
             }
+        }
+        // Nothing to write — but only after the pane and the input lock have
+        // been checked, so the answer to "may I write here?" does not depend on
+        // how many keys were in the batch. Not activity, so no `last_active`
+        // stamp either.
+        if events.is_empty() {
+            return Ok(());
         }
         touch_session_for_pane(&sessions, pane_id);
         // The engine encodes each event against the emulator's live mode state
@@ -181,5 +185,84 @@ impl ServerApp {
         let relay = get_pane_relay(&sessions, pane_id)?;
         let (first_index, lines, history_total) = relay.engine.fetch_history(start, count).await;
         Ok((first_index, lines, history_total))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use kmux_protocol::format_pane_id;
+    use kmux_protocol::messages::ClientCapabilities;
+
+    /// A session running a long-lived childless process, plus its only pane id.
+    async fn app_with_one_pane() -> (ServerApp, String, String) {
+        let app = ServerApp::new("tok".to_string());
+        let entry = app
+            .create_session(
+                None,
+                Some("/tmp".to_string()),
+                Some("/bin/sleep".to_string()),
+                vec!["30".to_string()],
+                TermSize::default(),
+                &ClientCapabilities::default(),
+            )
+            .await
+            .expect("create_session");
+        let word = entry.meta.word_id;
+        let pane_id = format_pane_id(&word, 0);
+        (app, word, pane_id)
+    }
+
+    /// An empty batch used to return before the pane was ever looked up, so
+    /// `PtyKeyBatch { pane_id: "nosuch/0", events: [] }` succeeded.
+    #[tokio::test]
+    async fn an_empty_key_batch_to_an_unknown_pane_is_still_a_missing_pane() {
+        let app = ServerApp::new("tok".to_string());
+        let err = app
+            .write_key_batch("nosuch/0", ClientId(1), &[])
+            .await
+            .expect_err("the pane does not exist");
+        assert!(
+            matches!(&err, KmuxError::PaneNotFound { id } if id == "nosuch/0"),
+            "expected PaneNotFound, got {err:?}"
+        );
+    }
+
+    /// The input lock is the same answer for an empty batch as for a full one:
+    /// whether this client may write here does not depend on how much it sent.
+    #[tokio::test]
+    async fn an_empty_key_batch_respects_another_clients_input_lock() {
+        let (app, word, pane_id) = app_with_one_pane().await;
+        let holder = ClientId(1);
+        let other = ClientId(2);
+        assert!(matches!(
+            app.request_input_lock(&pane_id, holder).await,
+            Ok(InputLockOutcome::Granted)
+        ));
+
+        let err = app
+            .write_key_batch(&pane_id, other, &[])
+            .await
+            .expect_err("another client holds the lock");
+        assert!(
+            matches!(&err, KmuxError::Pty(errno) if *errno == nix::Error::EPERM),
+            "expected EPERM, got {err:?}"
+        );
+        // The holder itself still gets the no-op.
+        app.write_key_batch(&pane_id, holder, &[])
+            .await
+            .expect("the lock holder may write nothing");
+
+        let _ = app.close_session(&word).await;
+    }
+
+    /// The short circuit is still there — it just runs after validation.
+    #[tokio::test]
+    async fn an_empty_key_batch_to_an_open_pane_writes_nothing_and_succeeds() {
+        let (app, word, pane_id) = app_with_one_pane().await;
+        app.write_key_batch(&pane_id, ClientId(1), &[])
+            .await
+            .expect("an open pane accepts an empty batch");
+        let _ = app.close_session(&word).await;
     }
 }
