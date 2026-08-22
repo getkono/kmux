@@ -774,7 +774,7 @@ count = 27
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::cast_possible_truncation"
-count = 17
+count = 16
 
 [[lints]]
 crate = "kmuxd"
