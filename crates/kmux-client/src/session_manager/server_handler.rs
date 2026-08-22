@@ -776,7 +776,8 @@ impl SessionManager {
             }
 
             ServerMessage::InputLockDenied { pane_id, holder } => {
-                self.status_msg = format!("Input lock denied on '{pane_id}' (held by {holder:?})");
+                let who = self.client_label(holder);
+                self.status_msg = format!("Input lock denied on '{pane_id}' (held by {who})");
                 events.push(SessionEvent::InputLockDenied { pane_id, holder });
             }
 
@@ -1119,6 +1120,19 @@ impl SessionManager {
         {
             self.select_session(next);
         }
+    }
+
+    /// How to name `client_id` in text shown to a user.
+    ///
+    /// The wire carries only the opaque `ClientId`; the human label lives in
+    /// `ClientInfo`, which arrives with a `ClientListResult`. Use that when it
+    /// is cached, and otherwise the id in a form a person can act on — never the
+    /// Rust `Debug` rendering, which puts `ClientId(9)` in the status bar.
+    fn client_label(&self, client_id: ClientId) -> String {
+        self.client_list
+            .iter()
+            .find(|c| c.client_id == client_id)
+            .map_or_else(|| format!("client #{}", client_id.0), |c| c.label.clone())
     }
 
     /// The pane ids the cached entry for `word_id` owns.
@@ -2650,12 +2664,29 @@ mod tests {
             !mgr.is_input_locked("eagle/0"),
             "a denial records no local lock"
         );
+        // No `ClientListResult` has arrived, so the id is all there is — but it
+        // is rendered as something a person can act on, not as `ClientId(9)`.
         assert_eq!(
             mgr.status_msg(),
-            "Input lock denied on 'eagle/0' (held by ClientId(9))"
+            "Input lock denied on 'eagle/0' (held by client #9)"
         );
-        // SUSPECT: the status line is built with `{holder:?}`, so the user is
-        // shown the Rust debug form `ClientId(9)` rather than the holder's label.
+    }
+
+    #[test]
+    fn input_lock_denied_names_the_holder_when_its_label_is_cached() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        mgr.client_list_word = Some("eagle".to_string());
+        mgr.client_list = vec![sample_client(9)];
+
+        mgr.handle_server_message(ServerMessage::InputLockDenied {
+            pane_id: "eagle/0".to_string(),
+            holder: ClientId(9),
+        });
+
+        assert_eq!(
+            mgr.status_msg(),
+            "Input lock denied on 'eagle/0' (held by user9@host)"
+        );
     }
 
     #[test]
