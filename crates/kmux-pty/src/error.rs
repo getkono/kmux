@@ -27,6 +27,16 @@ pub enum KmuxError {
     #[error("session not found: {name}")]
     SessionNotFound { name: String },
 
+    /// A pane id that is well-formed but names no live pane — or is not
+    /// `word/index` at all. Distinct from [`Self::SessionNotFound`] so the
+    /// daemon can answer `ErrorCode::PaneNotFound`, which the protocol has
+    /// always defined and nothing ever sent.
+    #[error("pane not found: {id}")]
+    PaneNotFound {
+        /// The pane id exactly as the client sent it, `word/index` or not.
+        id: String,
+    },
+
     #[error("session already exists: {name}")]
     SessionAlreadyExists { name: String },
 

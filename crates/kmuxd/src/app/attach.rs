@@ -6,10 +6,10 @@ use kmux_protocol::messages::{
     ClientCapabilities, ClientId, GridSnapshot, InputMode, SequenceNo, ServerMessage, TermSize,
     TerminalDiff,
 };
-use kmux_pty::error::{KmuxError, Result};
+use kmux_pty::error::Result;
 use tokio::sync::mpsc;
 
-use super::helpers::parse_pane_id;
+use super::helpers::{pane_not_found, parse_pane_id};
 use super::{ClientSender, ServerApp};
 
 /// Maximum number of buffered diffs to replay on a delta attach/resume before
@@ -112,23 +112,17 @@ impl ServerApp {
             capabilities,
         } = params;
         let (word_id, pane_index) =
-            parse_pane_id(&pane_id).ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.clone(),
-            })?;
+            parse_pane_id(&pane_id).ok_or_else(|| pane_not_found(&pane_id))?;
 
         // Write lock needed so we can update relay.size via apply_effective_size.
         let mut sessions = self.sessions.write().await;
         let state = sessions
             .get_mut(word_id)
-            .ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.clone(),
-            })?;
+            .ok_or_else(|| pane_not_found(&pane_id))?;
         let relay = state
             .panes
             .get_mut(&pane_index)
-            .ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.clone(),
-            })?;
+            .ok_or_else(|| pane_not_found(&pane_id))?;
 
         let result = compute_replay(relay, last_seqno);
 

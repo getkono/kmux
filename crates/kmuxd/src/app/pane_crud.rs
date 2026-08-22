@@ -29,15 +29,11 @@ impl ServerApp {
         &self,
         pane_id: &str,
     ) -> Result<(Option<i32>, super::PaneCloseOutcome)> {
-        use kmux_pty::error::KmuxError;
-
         use super::PaneCloseOutcome;
-        use super::helpers::parse_pane_id;
+        use super::helpers::{as_pane_error, pane_not_found, parse_pane_id};
 
         let (word_id, pane_index) =
-            parse_pane_id(pane_id).ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
+            parse_pane_id(pane_id).ok_or_else(|| pane_not_found(pane_id))?;
 
         // Detach all clients from this pane
         {
@@ -49,7 +45,10 @@ impl ServerApp {
             }
         }
 
-        self.manager.close_nowait(pane_id).await?;
+        self.manager
+            .close_nowait(pane_id)
+            .await
+            .map_err(|e| as_pane_error(pane_id, e))?;
 
         // Remove the pane and collapse its tab's layout; remove the tab if it
         // becomes empty, and the session if it has no tabs left.

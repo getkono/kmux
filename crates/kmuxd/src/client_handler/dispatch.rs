@@ -1687,11 +1687,11 @@ mod tests {
         assert!(keep);
         let (request_id, code, message) = only_error(msgs);
         assert_eq!(request_id, Some(4));
-        // SUSPECT: a missing *pane* is reported as `SessionNotFound` even though
-        // `ErrorCode::PaneNotFound` exists and the message names a pane id. Every
-        // pane-scoped arm below shares this.
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+        // Every pane-scoped arm below reports `PaneNotFound`; the three ways a
+        // lookup can miss (unparseable id, unknown session, unknown index) are
+        // deliberately indistinguishable to the client.
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
     }
 
     #[tokio::test]
@@ -1944,8 +1944,8 @@ mod tests {
         assert!(keep);
         let (request_id, code, message) = only_error(msgs);
         assert_eq!(request_id, None);
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
     }
 
     #[tokio::test]
@@ -1958,8 +1958,8 @@ mod tests {
         assert!(keep);
         let (request_id, code, message) = only_error(msgs);
         assert_eq!(request_id, None);
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
     }
 
     #[tokio::test]
@@ -1972,8 +1972,8 @@ mod tests {
         assert!(keep);
         let (request_id, code, message) = only_error(msgs);
         assert_eq!(request_id, None);
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
     }
 
     #[tokio::test]
@@ -1999,8 +1999,8 @@ mod tests {
         assert!(keep);
         let (request_id, code, message) = only_error(msgs);
         assert_eq!(request_id, None);
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
     }
 
     #[tokio::test]
@@ -2023,8 +2023,8 @@ mod tests {
         );
         let (request_id, code, message) = only_error(drain(&mut ctrl_rx));
         assert_eq!(request_id, None);
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
     }
 
     #[tokio::test]
@@ -2047,8 +2047,8 @@ mod tests {
         assert!(keep);
         let (request_id, code, message) = only_error(msgs);
         assert_eq!(request_id, None);
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
     }
 
     #[tokio::test]
@@ -2060,8 +2060,8 @@ mod tests {
         assert!(keep);
         let (request_id, code, message) = only_error(msgs);
         assert_eq!(request_id, None);
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
     }
 
     #[tokio::test]
@@ -2073,8 +2073,8 @@ mod tests {
         assert!(keep);
         let (request_id, code, message) = only_error(msgs);
         assert_eq!(request_id, None);
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
     }
 
     #[tokio::test]
@@ -2141,8 +2141,8 @@ mod tests {
         assert!(keep);
         let (request_id, code, message) = only_error(msgs);
         assert_eq!(request_id, Some(14));
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
     }
 
     #[tokio::test]
@@ -2268,11 +2268,10 @@ mod tests {
         assert!(keep);
         let (request_id, code, message) = only_error(msgs);
         assert_eq!(request_id, Some(20));
-        // SUSPECT: the protocol doc for `Notify` promises an error when "the pane
-        // is unknown", but the code reported is `SessionNotFound`, not
-        // `PaneNotFound`.
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_PANE}"));
+        // The protocol doc for `Notify` promises an error when "the pane is
+        // unknown", and this is the code that says so.
+        assert_eq!(code, ErrorCode::PaneNotFound);
+        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
     }
 
     #[tokio::test]

@@ -6,7 +6,7 @@ use tracing::warn;
 
 use super::ServerApp;
 use super::attach::InputLockOutcome;
-use super::helpers::{get_pane_relay, get_pane_relay_mut, touch_session_for_pane};
+use super::helpers::{as_pane_error, get_pane_relay, get_pane_relay_mut, touch_session_for_pane};
 
 impl ServerApp {
     /// Forward user input bytes to a pane's PTY stdin.
@@ -125,7 +125,11 @@ impl ServerApp {
     /// Send a Unix signal to a pane's child process.
     pub async fn send_signal(&self, pane_id: &str, signal: i32) -> Result<()> {
         use nix::sys::signal::Signal;
-        let session = self.manager.get_session(pane_id).await?;
+        let session = self
+            .manager
+            .get_session(pane_id)
+            .await
+            .map_err(|e| as_pane_error(pane_id, e))?;
         let sig = Signal::try_from(signal).map_err(|_| KmuxError::Pty(nix::Error::EINVAL))?;
         session.send_signal(sig).await
     }
