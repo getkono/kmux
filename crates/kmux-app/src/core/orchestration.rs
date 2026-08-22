@@ -986,6 +986,140 @@ mod tests {
     }
 
     #[test]
+    fn auth_failed_enters_disconnected() {
+        let mut core = fixture_core();
+        core.mode = Mode::Connecting {
+            target_display: "box".into(),
+        };
+
+        let effects = core.handle_session_events(vec![SessionEvent::AuthFailed {
+            reason: "bad token".into(),
+        }]);
+
+        assert!(effects.is_empty(), "no frontend effect: {effects:?}");
+        assert!(
+            matches!(&core.mode, Mode::Disconnected { reason } if reason == "authentication failed"),
+            "{:?}",
+            core.mode
+        );
+    }
+
+    // `#[tokio::test]`: `on_auth_ok` records the server in `recent_servers`,
+    // which spawns its persistence task — the pure tier cannot host that.
+    #[tokio::test]
+    async fn auth_ok_leaves_the_connecting_overlay() {
+        let mut core = fixture_core();
+        core.mode = Mode::Connecting {
+            target_display: "box".into(),
+        };
+
+        let effects = core.handle_session_events(vec![SessionEvent::AuthOk]);
+
+        assert!(effects.is_empty(), "no frontend effect: {effects:?}");
+        assert!(matches!(core.mode, Mode::Normal), "{:?}", core.mode);
+    }
+
+    #[tokio::test]
+    async fn auth_ok_does_not_disturb_a_mode_other_than_connecting() {
+        // A re-auth on a reconnect must not throw the user out of whatever view
+        // they had open.
+        let mut core = fixture_core();
+        core.mode = Mode::SessionPicker;
+
+        core.handle_session_events(vec![SessionEvent::AuthOk]);
+
+        assert!(matches!(core.mode, Mode::SessionPicker), "{:?}", core.mode);
+    }
+
+    // `#[tokio::test]`: the arm writes through `recent_servers`, whose
+    // persistence task needs a reactor.
+    #[tokio::test]
+    async fn session_list_received_runs_auto_select_exactly_once() {
+        let mut core = fixture_core();
+        assert!(!core.did_auto_select);
+
+        let effects = core.handle_session_events(vec![SessionEvent::SessionListReceived]);
+
+        assert!(effects.is_empty(), "no frontend effect: {effects:?}");
+        assert!(
+            core.did_auto_select,
+            "the first list arms auto-select and latches it"
+        );
+
+        // A later refresh must not re-run it, or every list would yank the view.
+        core.mode = Mode::SessionPicker;
+        core.handle_session_events(vec![SessionEvent::SessionListReceived]);
+        assert!(matches!(core.mode, Mode::SessionPicker), "{:?}", core.mode);
+    }
+
+    #[test]
+    fn clipboard_copy_from_the_active_session_yields_the_decoded_text() {
+        let mut core = fixture_core();
+        core.mgr.active_session = Some("eagle".into());
+
+        let effects = core.handle_session_events(vec![SessionEvent::ClipboardCopy {
+            pane_id: "eagle/0".into(),
+            selection: "c".into(),
+            // "hi" in base64.
+            data: "aGk=".into(),
+        }]);
+
+        assert_eq!(
+            effects,
+            vec![KeyResult::CopyToClipboard("hi".into())],
+            "OSC 52 from the viewed session reaches the frontend"
+        );
+    }
+
+    #[test]
+    fn clipboard_copy_from_another_session_is_dropped() {
+        // The daemon broadcasts OSC 52 server-wide, so scoping to the viewed
+        // session is what stops a background pane clobbering the clipboard.
+        let mut core = fixture_core();
+        core.mgr.active_session = Some("eagle".into());
+
+        let effects = core.handle_session_events(vec![SessionEvent::ClipboardCopy {
+            pane_id: "otter/0".into(),
+            selection: "c".into(),
+            data: "aGk=".into(),
+        }]);
+
+        assert!(effects.is_empty(), "{effects:?}");
+    }
+
+    #[test]
+    fn pane_attention_marks_the_pane_and_relays_the_notification() {
+        use kmux_protocol::messages::AttentionKind;
+        let mut core = fixture_core();
+
+        let effects = core.handle_session_events(vec![SessionEvent::PaneAttention {
+            word_id: "eagle".into(),
+            pane_id: "eagle/0".into(),
+            kind: AttentionKind::TurnDone,
+            title: "kmux".into(),
+            body: "done".into(),
+            attention_id: 42,
+        }]);
+
+        assert_eq!(
+            effects,
+            vec![KeyResult::Attention {
+                word_id: "eagle".into(),
+                pane_id: "eagle/0".into(),
+                kind: AttentionKind::TurnDone,
+                title: "kmux".into(),
+                body: "done".into(),
+                attention_id: 42,
+            }],
+            "window choice and dedup are the frontend's, so this is a pure relay"
+        );
+        assert!(
+            core.mgr.pane_needs_attention("eagle/0"),
+            "the tab marker and the notification stay one decision"
+        );
+    }
+
+    #[test]
     fn kicked_from_session_names_the_session_and_who_did_it() {
         // Issue #146: this event used to fall into the catch-all, so a kicked
         // GUI froze on the session's last frame with nothing said.
