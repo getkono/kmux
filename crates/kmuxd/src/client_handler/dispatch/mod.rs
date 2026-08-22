@@ -352,7 +352,8 @@ pub(super) mod testing {
     pub(super) use kmux_protocol::messages::{
         AttentionKind, ClientCapabilities, ClientId, ClientMessage, Compression, ErrorCode,
         KeyAction, KeyCode, KeyEvent, KeyMods, LayoutScheme, PROTOCOL_RANGE, PeerTarget,
-        ProtocolRange, ProtocolVersion, ServerMessage, SplitDir, TermSize, protocol_capabilities,
+        ProtocolRange, ProtocolVersion, ServerMessage, SessionEventMsg, SplitDir, TermSize,
+        protocol_capabilities,
     };
     pub(super) use kmux_protocol::{Compressor, TransportKind};
     pub(super) use tokio::sync::mpsc;
@@ -520,6 +521,23 @@ pub(super) mod testing {
             text: "a".to_string(),
             unshifted_codepoint: u32::from('a'),
         }
+    }
+
+    /// The first broadcast session event matching `want`, from everything
+    /// currently queued on the server-wide channel.
+    ///
+    /// The channel carries every client's events, so a test looking for one has
+    /// to skip the rest rather than assume it arrived first.
+    pub(super) fn broadcast_event<T>(
+        events: &mut tokio::sync::broadcast::Receiver<ServerMessage>,
+        want: impl Fn(SessionEventMsg) -> Option<T>,
+    ) -> Option<T> {
+        std::iter::from_fn(|| events.try_recv().ok())
+            .filter_map(|msg| match msg {
+                ServerMessage::Event { event } => Some(event),
+                _ => None,
+            })
+            .find_map(want)
     }
 
     /// A session running one long-lived childless process, plus an authenticated

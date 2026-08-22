@@ -66,11 +66,21 @@ pub(super) async fn on_session_close(
         state.app.detach_from_pane(pane_id, client_id).await;
     }
     match state.app.close_session(&word_id).await {
-        Ok(exit_code) => state.send(ServerMessage::SessionClosed {
-            request_id,
-            word_id,
-            exit_code,
-        }),
+        Ok(exit_code) => {
+            state.send(ServerMessage::SessionClosed {
+                request_id,
+                word_id: word_id.clone(),
+                exit_code,
+            });
+            // Everyone else has to hear about it too. `TabClose` already
+            // broadcasts, and a session closing is the larger event: without
+            // this, another GUI keeps the session in its list -- as an entry
+            // whose panes drain one by one and then sits there empty -- until
+            // something unrelated makes it re-list.
+            state
+                .app
+                .broadcast_session_event(SessionEventMsg::SessionClosed { word_id });
+        }
         Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
     }
 }
@@ -123,7 +133,19 @@ pub(super) async fn on_session_rename(
     new_name: String,
 ) {
     match state.app.rename_session(&word_id, &new_name).await {
-        Ok(()) => state.send(ServerMessage::SessionRenamed { word_id, new_name }),
+        Ok(()) => {
+            state.send(ServerMessage::SessionRenamed {
+                word_id: word_id.clone(),
+                new_name: new_name.clone(),
+            });
+            // A name is shared state: every client showing this session in a
+            // picker or a tab bar is displaying the old one until it is told.
+            // `TabRename` already broadcasts; this did not, so a rename was
+            // visible only to whoever performed it.
+            state
+                .app
+                .broadcast_session_event(SessionEventMsg::SessionRenamed { word_id, new_name });
+        }
         Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
     }
 }
@@ -228,5 +250,83 @@ mod tests {
         assert_eq!(request_id, Some(13));
         assert_eq!(code, ErrorCode::SessionNotFound);
         assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    /// A session closing is not the requester's private news. Every other GUI
+    /// showing it keeps a stale entry — one whose panes drain away and then sits
+    /// there empty — until something unrelated makes it re-list.
+    #[tokio::test]
+    async fn closing_a_session_tells_every_client_not_only_the_requester() {
+        let (app, word, mut state, mut ctrl_rx) = app_with_one_session().await;
+        let mut events = app.subscribe_vt_events();
+
+        let keep = handle_message(
+            &mut state,
+            ClientMessage::SessionClose {
+                request_id: 30,
+                word_id: word.clone(),
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(keep);
+
+        // The requester still gets its correlated reply.
+        match only(drain(&mut ctrl_rx)) {
+            ServerMessage::SessionClosed {
+                request_id,
+                word_id: replied,
+                ..
+            } => {
+                assert_eq!(request_id, 30);
+                assert_eq!(replied, word);
+            }
+            other => panic!("expected SessionClosed, got {other:?}"),
+        }
+
+        // And everyone else hears it on the server-wide channel.
+        let broadcast = broadcast_event(&mut events, |e| match e {
+            SessionEventMsg::SessionClosed { word_id } => Some(word_id),
+            _ => None,
+        })
+        .expect("the close was broadcast to every client");
+        assert_eq!(broadcast, word);
+    }
+
+    /// A name is shared state: a rename by one GUI has to reach the others, or
+    /// their pickers and tab bars keep showing the old one.
+    #[tokio::test]
+    async fn renaming_a_session_tells_every_client_not_only_the_renamer() {
+        let (app, word, mut state, mut ctrl_rx) = app_with_one_session().await;
+        let mut events = app.subscribe_vt_events();
+
+        let keep = handle_message(
+            &mut state,
+            ClientMessage::SessionRename {
+                request_id: 31,
+                word_id: word.clone(),
+                new_name: "builds".to_string(),
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(keep);
+
+        match only(drain(&mut ctrl_rx)) {
+            ServerMessage::SessionRenamed { word_id, new_name } => {
+                assert_eq!(word_id, word);
+                assert_eq!(new_name, "builds");
+            }
+            other => panic!("expected SessionRenamed, got {other:?}"),
+        }
+
+        let broadcast = broadcast_event(&mut events, |e| match e {
+            SessionEventMsg::SessionRenamed { word_id, new_name } => Some((word_id, new_name)),
+            _ => None,
+        })
+        .expect("the rename was broadcast to every client");
+        assert_eq!(broadcast, (word.clone(), "builds".to_string()));
+
+        let _ = app.close_session(&word).await;
     }
 }
