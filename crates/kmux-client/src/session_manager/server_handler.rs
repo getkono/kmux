@@ -1407,11 +1407,14 @@ mod tests {
         assert!(events.is_empty(), "no UI event: {events:?}");
         assert_eq!(observe(&mgr), before, "the arm is log-only");
         assert_eq!(mgr.current_transport, transport_before);
-        // SUSPECT: `ChannelSwitched`'s protocol doc says "the client should close
-        // the old transport after receiving this", but the arm neither closes it
-        // nor tells anyone to — nothing is sent and no state moves. The old
-        // channel is only dropped if `apply_transport_upgrade` already replaced
-        // the sender, which this message cannot verify.
+        // Log-only is right, even though the protocol doc says "the client
+        // should close the old transport after receiving this". By the time this
+        // arrives the close has already happened: `drain_transport_upgrades`
+        // sends `ChannelReady` on the NEW sender and then immediately calls
+        // `apply_transport_upgrade`, which replaces `ws_sender` and drops the old
+        // one. This arm could not close anything anyway — a `SessionManager`
+        // holds an `mpsc` sender, never the socket. The doc describes the
+        // client's obligation, not this arm's.
         assert!(drain(&mut rx).is_empty(), "nothing is sent in reply");
         assert_eq!(inbound_msgs(&mgr), 1, "the frame is still accounted");
     }
@@ -1448,10 +1451,12 @@ mod tests {
             }],
         });
 
-        // SUSPECT: the graveyard is replaced but no `SessionEvent` is emitted, so
-        // a caller that issued `request_closed_sessions` has nothing to react to
-        // — unlike `SessionListResult` and `ProcessOverviewResult`, which both
-        // emit a "…Received" event. The launcher has to poll.
+        // Emitting nothing is enough, unlike `SessionListResult` and
+        // `ProcessOverviewResult`, which use their events to *act* (auto-select,
+        // re-request) rather than to repaint. The graveyard's only consumer is
+        // the launcher's "Restore" section, and `drain_server_messages` marks the
+        // frame dirty for ANY non-empty batch — so the reply repaints the tick it
+        // lands in. An event here would buy a redraw that already happens.
         assert!(events.is_empty(), "no UI event: {events:?}");
         let closed = mgr.closed_session_list();
         assert_eq!(closed.len(), 1, "the previous list is replaced, not merged");
@@ -1624,9 +1629,14 @@ mod tests {
             tab: tab(9, LayoutNode::single(0), 0),
         });
 
-        // SUSPECT: an unknown session silently discards the tab — no error, no
-        // event, no session-list refresh to reconcile against. The client's cache
-        // stays permanently short of a tab the daemon believes exists.
+        // Discarding is right for THIS arm. `ServerMessage::TabCreated` is the
+        // reply to a `TabCreate` that this client sent, naming a session it must
+        // already have had to name — so an unknown session here is unreachable in
+        // practice, and reacting would be inventing a recovery for a state the
+        // sender cannot produce. The reachable case is the *broadcast*
+        // (`Event{TabCreated}`), which another client's tab creation produces and
+        // which does refresh; see
+        // `a_tab_created_event_re_lists_because_the_broadcast_carries_no_layout`.
         assert!(events.is_empty(), "no UI event: {events:?}");
         assert_eq!(observe(&mgr), before);
         assert!(drain(&mut rx).is_empty());
@@ -1816,11 +1826,12 @@ mod tests {
         assert!(!mgr.in_flight_history_fetches.contains_key("eagle/0"));
         let grid = mgr.buffer("eagle/0").expect("buffer exists");
         assert_eq!((grid.cursor().row, grid.cursor().col), (0, 0));
-        // SUSPECT: unlike `Lagged` and the digest-mismatch path, `SyncReset` does
-        // not re-attach — it only parks the pane. The client sits in
-        // `AwaitingSync` (discarding everything) until the server volunteers a
-        // snapshot; if the server's `SyncReset` was not followed by one, the pane
-        // is dark forever with no client-side recovery.
+        // Parking without re-attaching is right, unlike `Lagged` and the
+        // digest-mismatch path. `SyncReset` is never sent alone: `attach_result_msgs`
+        // (kmuxd/src/client_handler/session.rs) builds `AttachResult::SyncReset`
+        // as the two-message sequence `[SyncReset, TerminalSnapshot]`, so the
+        // snapshot that lifts `AwaitingSync` is already in flight. Re-attaching
+        // here would race that snapshot and ask for a second one.
         assert!(drain(&mut rx).is_empty(), "nothing is sent in reply");
     }
 
@@ -1877,9 +1888,14 @@ mod tests {
             new_name: "builds".to_string(),
         });
 
-        // SUSPECT: a rename of a session the client has never heard of is
-        // reported to the UI as a successful rename, indistinguishable from a
-        // real one, while no cached name changed.
+        // Reporting the rename anyway is right. `on_session_rename`
+        // (kmuxd/src/client_handler/dispatch/session.rs) replies to the
+        // requesting client and broadcasts nothing — `SessionEventMsg::
+        // SessionRenamed` is never constructed by `kmuxd` at all — so the only
+        // client that sees this is the one that just renamed a session it named.
+        // An unknown word is therefore a race with its own first
+        // `SessionListResult`, and the rename is still a true fact about the
+        // server; suppressing it would lose it, since the reply is the only copy.
         assert!(
             matches!(
                 events.as_slice(),
@@ -1977,9 +1993,14 @@ mod tests {
         });
 
         assert!(events.is_empty(), "no UI event: {events:?}");
-        // SUSPECT: a tab missing from the daemon's order sorts to `usize::MAX`
-        // and silently moves to the end rather than being treated as a stale
-        // broadcast the client should ignore or refresh from.
+        // Sorting the unlisted tab to the end is the right fallback. `reorder_tab`
+        // (kmuxd/src/app/tab_crud.rs) always returns the session's COMPLETE tab
+        // order, on both its paths, so a short list can only mean the two sides
+        // disagree on membership — either the client cached a tab the daemon has
+        // dropped, or the broadcast was computed before a tab this client already
+        // knows about existed. `tab_indices` is authoritative for ordering, not
+        // for membership: dropping the unlisted tab would lose the second case,
+        // and membership is reconciled by `TabCreated`/`TabClosed` instead.
         assert_eq!(
             mgr.session_list[0]
                 .tabs
@@ -2074,9 +2095,14 @@ mod tests {
             },
         });
 
-        // SUSPECT: nothing is cached (there is no such pane) yet the frontend is
-        // told a title changed, so a stale broadcast can retitle whatever the UI
-        // happens to key the event to.
+        // Emitting for an uncached pane is expected, not a leak. `PaneEventSink`
+        // (kmuxd/src/app/mod.rs) puts every pane's title on the server-wide
+        // channel deliberately — "broadcasting server-wide rather than only to
+        // clients attached to this specific pane keeps the tab bar's titles live"
+        // — so a client that has not listed a session legitimately receives
+        // titles for panes it does not cache. The event carries the pane id and
+        // frontends read the title back out of the cached `PaneInfo`, so an
+        // unknown pane retitles nothing; the assertion below is that guarantee.
         assert!(
             matches!(
                 events.as_slice(),
@@ -2214,9 +2240,12 @@ mod tests {
             },
         });
 
-        // SUSPECT: a malformed pane id yields `word_id == pane_id`, so the
-        // frontend is asked to focus a session called "garbage" instead of the
-        // event being rejected.
+        // The fallback is unreachable defence, not a hole. `notify_pane_attention`
+        // (kmuxd/src/app/mod.rs) validates through `get_pane_relay`, which starts
+        // with `parse_pane_id(...).ok_or_else(pane_not_found)?` — an id with no
+        // parseable `word/index` is answered with an `Error` and never broadcast.
+        // Rejecting it a second time here would only trade an unreachable branch
+        // for another one, so the arm keeps the total fallback.
         assert!(
             matches!(
                 events.as_slice(),
@@ -2616,9 +2645,17 @@ mod tests {
             "{events:?}"
         );
         assert_eq!(mgr.status_msg(), "Error: session not found: nosuch");
-        // SUSPECT: neither the `request_id` nor the typed `ErrorCode` survives —
-        // the arm discards both, so no caller can correlate an error with the
-        // request that caused it or branch on the code.
+        // Discarding both is a limit worth stating rather than a bug to fix.
+        // `request_id` is structurally absent on roughly half the daemon's error
+        // paths — `SharedClientState::error` is called with `None` wherever the
+        // triggering `ClientMessage` has no id at all (every input, attach,
+        // reorder and layout message) — so it could not be a reliable
+        // correlation key even if it were carried. And the code has no consumer:
+        // the streaming session manager's only error surface is this status line,
+        // while the CLI paths that DO branch on `ErrorCode` correlate inside
+        // their own read loops and never construct a `SessionManager`. Carrying
+        // either into `SessionEvent::ServerError` would add a field nothing
+        // reads; the fix belongs with the first caller that needs it.
     }
 
     // ── InputLock{Granted,Denied,Released} ──────────────────────────────────
