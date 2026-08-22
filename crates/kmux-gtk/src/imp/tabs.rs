@@ -65,7 +65,7 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, _app: &Application) {
             };
             {
                 let mut f = fe.borrow_mut();
-                f.core.mgr.select_tab(tab_index);
+                f.core.mgr_mut().select_tab(tab_index);
                 f.core.request_render();
             }
             show_in_page(&s, &page);
@@ -87,7 +87,7 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, _app: &Application) {
             }
             if let Some(tab_index) = tab_index_for(&s, page) {
                 let mut f = fe.borrow_mut();
-                f.core.mgr.close_tab_index(tab_index);
+                f.core.mgr_mut().close_tab_index(tab_index);
                 f.core.request_render();
             }
             // Server-authoritative: keep the page until the tab actually closes.

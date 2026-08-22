@@ -52,7 +52,7 @@ pub fn push_sizes(fe: &Rc<RefCell<Frontend>>, width_px: i32, height_px: i32) {
             )
         })
         .collect();
-    f.core.mgr.set_pane_sizes(sizes);
+    f.core.mgr_mut().set_pane_sizes(sizes);
 }
 
 /// The pane id and its resolved cell rect at pixel `(x, y)` within the drawing,

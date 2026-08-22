@@ -344,7 +344,7 @@ count = 4
 [[lints]]
 crate = "kmux-ffi"
 lint = "clippy::expect_used"
-count = 85
+count = 86
 
 [[lints]]
 crate = "kmux-ffi"
@@ -369,7 +369,7 @@ count = 23
 [[lints]]
 crate = "kmux-ffi"
 lint = "clippy::significant_drop_tightening"
-count = 31
+count = 20
 
 [[lints]]
 crate = "kmux-ffi"
@@ -384,11 +384,6 @@ count = 1
 [[lints]]
 crate = "kmux-ffi"
 lint = "clippy::unwrap_in_result"
-count = 1
-
-[[lints]]
-crate = "kmux-ffi"
-lint = "clippy::unwrap_used"
 count = 1
 
 [[lints]]

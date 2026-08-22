@@ -35,6 +35,29 @@ pub struct Hint {
 /// Maximum number of hints displayed at once.
 pub const MAX_HINTS: usize = 8;
 
+/// Hints for `input` as if it were typed into the palette, without entering it.
+///
+/// [`build_hints`] reads the buffer out of `Mode::Command`, because that is
+/// where the palette keeps it. A caller that only wants to *show* completions —
+/// the Swift app's palette, which owns its own text field — has no buffer there,
+/// and used to reach into `AppCore::mode`, swap a synthetic `Mode::Command` in,
+/// call `build_hints`, and swap the old mode back. That is a mutation dressed as
+/// a query, and it lived in the FFI layer. It lives here now, next to the reason
+/// it is needed, and the mode is guaranteed restored on the way out.
+pub fn hints_for(app: &mut AppCore, input: &str) -> Vec<Hint> {
+    let previous = std::mem::replace(
+        &mut app.mode,
+        Mode::Command(crate::mode::CommandState {
+            buffer: input.to_string(),
+            cursor: input.len(),
+            ..crate::mode::CommandState::default()
+        }),
+    );
+    let hints = build_hints(app);
+    app.mode = previous;
+    hints
+}
+
 /// Compute the current dropdown contents for the buffer in `app.mode`.
 /// Returns an empty vec if `app.mode` is not `Mode::Command`.
 pub fn build_hints(app: &AppCore) -> Vec<Hint> {

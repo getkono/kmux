@@ -69,7 +69,7 @@ fn attach_context_menu(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
         if let Some(pane_id) = super::tiles::pane_at(&fe, x, y, area.width(), area.height()) {
             let mut f = fe.borrow_mut();
             if f.core.mgr.active_pane_id() != Some(pane_id.as_str()) {
-                f.core.mgr.focus_pane(pane_id);
+                f.core.mgr_mut().focus_pane(pane_id);
                 f.core.request_render();
                 changed = true;
             }
@@ -160,7 +160,7 @@ fn attach_resize(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                 return;
             };
             if let Some(ratios) = ratios_for_drag(&layout, &div, pointer_cell) {
-                f.core.mgr.set_layout_ratios(div.path.clone(), ratios);
+                f.core.mgr_mut().set_layout_ratios(div.path.clone(), ratios);
                 f.core.request_render();
             }
             drop(f);
@@ -188,7 +188,7 @@ fn attach_focus_click(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
         if let Some(pane_id) = super::tiles::pane_at(&fe, x, y, w, h) {
             let mut f = fe.borrow_mut();
             if f.core.mgr.active_pane_id() != Some(pane_id.as_str()) {
-                f.core.mgr.focus_pane(pane_id);
+                f.core.mgr_mut().focus_pane(pane_id);
                 f.core.request_render();
             }
         }
@@ -301,7 +301,7 @@ struct Drag {
 fn set_selection(fe: &Rc<RefCell<Frontend>>, area: &DrawingArea, sel: Option<Selection>) {
     {
         let mut f = fe.borrow_mut();
-        if let Some(g) = f.core.mgr.active_grid_mut() {
+        if let Some(g) = f.core.mgr_mut().active_grid_mut() {
             g.set_selection(sel);
         }
     }
@@ -343,7 +343,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                     if let Some(layout) = f.core.mgr.render_layout()
                         && let Some(ratios) = kmux_app::layout::even_ratios_at(&layout, &div.path)
                     {
-                        f.core.mgr.set_layout_ratios(div.path.clone(), ratios);
+                        f.core.mgr_mut().set_layout_ratios(div.path.clone(), ratios);
                         f.core.request_render();
                     }
                 }
@@ -361,7 +361,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                 let mods = mods_from_state(g.current_event_state(), true);
                 let forwarded = {
                     let mut f = fe.borrow_mut();
-                    f.core.mgr.report_mouse(
+                    f.core.mgr_mut().report_mouse(
                         false,
                         MouseEvent {
                             button: MouseButton::Left,
@@ -445,7 +445,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                 } {
                     let mods = mods_from_state(g.current_event_state(), false);
                     let mut f = fe.borrow_mut();
-                    f.core.mgr.report_mouse(
+                    f.core.mgr_mut().report_mouse(
                         false,
                         MouseEvent {
                             button: MouseButton::Left,
@@ -482,7 +482,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                 } {
                     let mods = mods_from_state(m.current_event_state(), false);
                     let mut f = fe.borrow_mut();
-                    f.core.mgr.report_mouse(
+                    f.core.mgr_mut().report_mouse(
                         true,
                         MouseEvent {
                             button: MouseButton::Left,
@@ -550,7 +550,7 @@ fn autoscroll_tick(fe: &Rc<RefCell<Frontend>>, area: &DrawingArea, drag: &Rc<Cel
     let off_c = rect.map_or(0.0, |r| r.col as f64);
     let pane_top = rect.map_or(0.0, |r| r.row as f64 * cell_h);
     let pane_bottom = rect.map_or(h as f64, |r| (r.row + r.rows) as f64 * cell_h);
-    let Some(grid) = f.core.mgr.active_grid_mut() else {
+    let Some(grid) = f.core.mgr_mut().active_grid_mut() else {
         return;
     };
     let cols = grid.cols;
@@ -596,9 +596,9 @@ fn scroll_pane(f: &mut Frontend, pane_id: &str, col: u16, row: u16, lines: i32) 
         // 1-based terminal coordinates.
         let bytes = kmux_client::input::encode_mouse_scroll(col + 1, row + 1, lines, sgr);
         if !bytes.is_empty() {
-            f.core.mgr.send_input(bytes);
+            f.core.mgr_mut().send_input(bytes);
         }
-    } else if let Some(grid) = f.core.mgr.buffer_mut(pane_id) {
+    } else if let Some(grid) = f.core.mgr_mut().buffer_mut(pane_id) {
         if lines > 0 {
             grid.scroll_up(lines as usize);
         } else {

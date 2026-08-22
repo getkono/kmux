@@ -148,7 +148,7 @@ fn make_row(r: &ClientInfo, fe: &Rc<RefCell<Frontend>>, shell: &Rc<Shell>) -> Li
         kick.connect_clicked(move |_| {
             {
                 let mut f = fe.borrow_mut();
-                f.core.kick_listed_client(client_id);
+                f.core.mutate(|c| c.kick_listed_client(client_id));
                 f.core.request_render();
             }
             drawing.grab_focus();

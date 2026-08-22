@@ -1833,9 +1833,7 @@ impl KmuxDriver {
     /// toggle (a manual pause still pauses it).
     pub fn toggle_pane_no_auto_pause(&self, pane_id: String) -> Vec<FfiEffect> {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let core = d.core_mut();
-        core.toggle_pane_no_auto_pause(&pane_id);
-        core.request_render();
+        d.mutate(|core| core.toggle_pane_no_auto_pause(&pane_id));
         vec![FfiEffect::NeedsRender]
     }
 
@@ -1843,9 +1841,7 @@ impl KmuxDriver {
     /// pane in the session inherits it. Drives the session context-menu toggle.
     pub fn toggle_session_no_auto_pause(&self, word_id: String) -> Vec<FfiEffect> {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let core = d.core_mut();
-        core.toggle_session_no_auto_pause(&word_id);
-        core.request_render();
+        d.mutate(|core| core.toggle_session_no_auto_pause(&word_id));
         vec![FfiEffect::NeedsRender]
     }
 
@@ -1984,7 +1980,7 @@ impl KmuxDriver {
     /// currently shown (issue #146). The list refreshes on the next poll.
     pub fn kick_client(&self, client_id: u64) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        d.kick_listed_client(kmux_protocol::messages::ClientId(client_id));
+        d.mutate(|core| core.kick_listed_client(kmux_protocol::messages::ClientId(client_id)));
     }
 
     /// The panes (tabs) of the active session, with the active pane flagged.
@@ -2059,9 +2055,7 @@ impl KmuxDriver {
     /// its pane set and focuses its pane. Signals a render.
     pub fn select_tab(&self, tab_index: u32) -> Vec<FfiEffect> {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let core = d.core_mut();
-        core.mgr.select_tab(tab_index);
-        core.request_render();
+        d.mutate(|core| core.mgr.select_tab(tab_index));
         vec![FfiEffect::NeedsRender]
     }
 
@@ -2070,9 +2064,7 @@ impl KmuxDriver {
     /// the server. Signals a render.
     pub fn focus_pane(&self, pane_id: String) -> Vec<FfiEffect> {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let core = d.core_mut();
-        core.mgr.focus_pane(pane_id);
-        core.request_render();
+        d.mutate(|core| core.mgr.focus_pane(pane_id));
         vec![FfiEffect::NeedsRender]
     }
 
@@ -2145,7 +2137,7 @@ impl KmuxDriver {
                 )
             })
             .collect();
-        d.mgr.set_pane_sizes(mapped);
+        d.mgr_mut().set_pane_sizes(mapped);
     }
 
     /// Enumerate the active tab's draggable dividers within an
@@ -2188,9 +2180,7 @@ impl KmuxDriver {
         else {
             return Vec::new();
         };
-        let core = d.core_mut();
-        core.mgr.set_layout_ratios(divider.path, ratios);
-        core.request_render();
+        d.mutate(|core| core.mgr.set_layout_ratios(divider.path, ratios));
         vec![FfiEffect::NeedsRender]
     }
 
@@ -2206,9 +2196,7 @@ impl KmuxDriver {
         let Some(ratios) = kmux_app::layout::even_ratios_at(&layout, &path) else {
             return Vec::new();
         };
-        let core = d.core_mut();
-        core.mgr.set_layout_ratios(path, ratios);
-        core.request_render();
+        d.mutate(|core| core.mgr.set_layout_ratios(path, ratios));
         vec![FfiEffect::NeedsRender]
     }
 
@@ -2216,9 +2204,7 @@ impl KmuxDriver {
     /// render.
     pub fn rename_tab(&self, tab_index: u32, name: String) -> Vec<FfiEffect> {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let core = d.core_mut();
-        core.mgr.rename_tab(tab_index, &name);
-        core.request_render();
+        d.mutate(|core| core.mgr.rename_tab(tab_index, &name));
         vec![FfiEffect::NeedsRender]
     }
 
@@ -2226,8 +2212,8 @@ impl KmuxDriver {
     pub fn reorder_tab(&self, tab_index: u32, new_position: u32) {
         self.inner
             .lock()
-            .unwrap()
-            .mgr
+            .expect("driver mutex poisoned")
+            .mgr_mut()
             .reorder_tab(tab_index, new_position);
     }
 
@@ -2297,7 +2283,7 @@ impl KmuxDriver {
     /// cells are mapped scroll-aware, so this works while scrolled into history.
     pub fn set_selection(&self, anchor_row: u32, anchor_col: u32, end_row: u32, end_col: u32) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        if let Some(grid) = d.mgr.active_grid_mut() {
+        if let Some(grid) = d.mgr_mut().active_grid_mut() {
             let anchor = grid.visible_to_abs(anchor_row as usize, anchor_col as usize);
             let end = grid.visible_to_abs(end_row as usize, end_col as usize);
             grid.set_selection(Some(Selection {
@@ -2311,7 +2297,7 @@ impl KmuxDriver {
     /// Select the word at a *visible* viewport cell (double-click).
     pub fn select_word_at(&self, row: u32, col: u32) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        if let Some(grid) = d.mgr.active_grid_mut() {
+        if let Some(grid) = d.mgr_mut().active_grid_mut() {
             let pos = grid.visible_to_abs(row as usize, col as usize);
             let (anchor, end) = grid.find_word_boundaries(pos);
             grid.set_selection(Some(Selection {
@@ -2325,7 +2311,7 @@ impl KmuxDriver {
     /// Select the whole line at a *visible* viewport row (triple-click).
     pub fn select_line_at(&self, row: u32) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        if let Some(grid) = d.mgr.active_grid_mut() {
+        if let Some(grid) = d.mgr_mut().active_grid_mut() {
             let cols = grid.cols;
             let abs_row = grid.visible_to_abs(row as usize, 0).row;
             grid.set_selection(Some(Selection {
@@ -2345,7 +2331,7 @@ impl KmuxDriver {
     /// Clear the active selection.
     pub fn clear_selection(&self) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        if let Some(grid) = d.mgr.active_grid_mut() {
+        if let Some(grid) = d.mgr_mut().active_grid_mut() {
             grid.clear_selection();
         }
     }
@@ -2390,7 +2376,7 @@ impl KmuxDriver {
             if !bytes.is_empty() {
                 d.send_input(bytes);
             }
-        } else if let Some(grid) = d.mgr.buffer_mut(&pane_id) {
+        } else if let Some(grid) = d.mgr_mut().buffer_mut(&pane_id) {
             if lines > 0 {
                 grid.scroll_up(lines as usize);
             } else {
@@ -2425,7 +2411,7 @@ impl KmuxDriver {
             row: row as u16 + 1,
             mods: mods.to_client(),
         };
-        d.mgr.report_mouse(button_held, ev)
+        d.mgr_mut().report_mouse(button_held, ev)
     }
 
     /// Scroll the active pane's *local* scrollback by `lines` display rows
@@ -2435,7 +2421,7 @@ impl KmuxDriver {
     /// GTK frontend's direct `grid.scroll_up/scroll_down`).
     pub fn scroll_lines(&self, lines: i32) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        if let Some(grid) = d.mgr.active_grid_mut() {
+        if let Some(grid) = d.mgr_mut().active_grid_mut() {
             if lines > 0 {
                 grid.scroll_up(lines as usize);
             } else {
@@ -2464,20 +2450,10 @@ impl KmuxDriver {
     /// field instead of driving `Mode::Command` char-by-char.
     pub fn command_hints(&self, input: String) -> Vec<FfiCommandHint> {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let core = d.core_mut();
-        // Hints are computed from the buffer in `Mode::Command`; flip into it
-        // transiently (atomic under the lock) and restore so this is a pure query.
-        let prev = std::mem::replace(
-            &mut core.mode,
-            Mode::Command(CommandState {
-                buffer: input.clone(),
-                cursor: input.len(),
-                ..CommandState::default()
-            }),
-        );
-        let hints = cmd::hint::build_hints(core);
-        core.mode = prev;
-        hints
+        // A query, so no render is requested. `hints_for` owns the mode swap it
+        // needs; this used to do it here, in the FFI layer, by reaching into
+        // `AppCore::mode` directly.
+        cmd::hint::hints_for(d.core_for_query(), &input)
             .into_iter()
             .map(|h| FfiCommandHint {
                 display: h.display,
@@ -2496,10 +2472,12 @@ impl KmuxDriver {
         // even though the dispatch itself is synchronous.
         let _guard = self.rt.enter();
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        d.core_mut().mode = Mode::Command(CommandState {
-            buffer: input.clone(),
-            cursor: input.len(),
-            ..CommandState::default()
+        d.mutate(|core| {
+            core.mode = Mode::Command(CommandState {
+                buffer: input.clone(),
+                cursor: input.len(),
+                ..CommandState::default()
+            });
         });
         d.dispatch_action(Action::CommandSubmit)
             .into_iter()
@@ -2623,10 +2601,7 @@ impl KmuxDriver {
     pub fn submit_add_remote(&self, form: FfiAddRemoteForm) -> Option<String> {
         let _guard = self.rt.enter();
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let core = d.core_mut();
-        let result = core.submit_add_remote(form.into());
-        core.request_render();
-        result.err()
+        d.mutate(|core| core.submit_add_remote(form.into())).err()
     }
 
     /// Create a new session on a federated `peer` at `cwd` (issue #121). An empty
@@ -2634,18 +2609,14 @@ impl KmuxDriver {
     pub fn submit_remote_new_session(&self, peer: String, cwd: String) {
         let _guard = self.rt.enter();
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let core = d.core_mut();
-        core.submit_remote_new_session(peer, cwd);
-        core.request_render();
+        d.mutate(|core| core.submit_remote_new_session(peer, cwd));
     }
 
     /// Disconnect a federated remote (issue #121): drop its link and forget it.
     pub fn disconnect_remote(&self, peer: String) {
         let _guard = self.rt.enter();
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let core = d.core_mut();
-        core.disconnect_remote(&peer);
-        core.request_render();
+        d.mutate(|core| core.disconnect_remote(&peer));
     }
 
     /// Open the session picker.
@@ -2661,17 +2632,13 @@ impl KmuxDriver {
     /// Set the open picker's search/filter text (resets the selection to row 0).
     pub fn set_picker_search(&self, text: String) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let core = d.core_mut();
-        core.set_picker_search(text);
-        core.request_render();
+        d.mutate(|core| core.set_picker_search(text));
     }
 
     /// Set the open picker's highlighted row (hover/click).
     pub fn set_picker_selected(&self, index: u32) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let core = d.core_mut();
-        core.set_picker_selected(index as usize);
-        core.request_render();
+        d.mutate(|core| core.set_picker_selected(index as usize));
     }
 
     /// Activate the open picker's current selection (click / Enter). May switch
@@ -2710,7 +2677,7 @@ impl KmuxDriver {
         // even though the dispatch itself is synchronous.
         let _guard = self.rt.enter();
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        d.core_mut().set_picker_selected(index as usize);
+        d.mutate(|core| core.set_picker_selected(index as usize));
         d.dispatch_action(Action::DirPickerSubmit)
             .into_iter()
             .map(FfiEffect::from)
@@ -2725,7 +2692,7 @@ impl KmuxDriver {
         // even though the dispatch itself is synchronous.
         let _guard = self.rt.enter();
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        d.core_mut().set_picker_selected(0);
+        d.mutate(|core| core.set_picker_selected(0));
         d.dispatch_action(Action::DirPickerSubmit)
             .into_iter()
             .map(FfiEffect::from)
@@ -2735,25 +2702,19 @@ impl KmuxDriver {
     /// Close any open picker / overlay (back to normal interaction).
     pub fn cancel_picker(&self) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let core = d.core_mut();
-        core.mode = Mode::Normal;
-        core.request_render();
+        d.mutate(|core| core.mode = Mode::Normal);
     }
 
     /// Rename a session by word id (trims surrounding whitespace).
     pub fn rename_session(&self, word_id: String, name: String) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let core = d.core_mut();
-        core.mgr.rename_session(&word_id, name.trim());
-        core.request_render();
+        d.mutate(|core| core.mgr.rename_session(&word_id, name.trim()));
     }
 
     /// Request confirmation before closing a session by word id.
     pub fn close_session(&self, word_id: String) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
-        let core = d.core_mut();
-        core.confirm_close_session(&word_id);
-        core.request_render();
+        d.mutate(|core| core.confirm_close_session(&word_id));
     }
 
     /// Confirm the pending session close, if a close confirmation is open.
@@ -2959,9 +2920,7 @@ impl KmuxDriver {
     pub fn set_theme(&self, name: String) {
         let mut d = self.inner.lock().expect("driver mutex poisoned");
         if let Some(t) = theme::builtin_theme(&name) {
-            let core = d.core_mut();
-            core.palette = t;
-            core.request_render();
+            d.mutate(|core| core.palette = t);
         }
     }
 
@@ -2984,12 +2943,10 @@ impl KmuxDriver {
     pub fn set_cursor_blink_enabled(&self, enabled: bool) {
         {
             let mut d = self.inner.lock().expect("driver mutex poisoned");
-            let core = d.core_mut();
-            if core.cursor_blink_enabled == enabled {
+            if d.cursor_blink_enabled == enabled {
                 return;
             }
-            core.cursor_blink_enabled = enabled;
-            core.request_render();
+            d.mutate(|core| core.cursor_blink_enabled = enabled);
         }
         // Persist (load-modify-save so theme/font are preserved), mirroring the
         // GTK preferences window.

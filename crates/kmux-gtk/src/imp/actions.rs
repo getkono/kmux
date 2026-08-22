@@ -240,8 +240,8 @@ fn add_command(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
         {
             let mut f = fe.borrow_mut();
             if !matches!(f.core.mode, Mode::Command(_)) {
-                f.core.mode = Mode::Command(CommandState::default());
-                f.core.request_render();
+                f.core
+                    .mutate(|c| c.mode = Mode::Command(CommandState::default()));
             }
         }
         s.drawing.queue_draw();

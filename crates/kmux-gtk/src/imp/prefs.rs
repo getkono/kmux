@@ -84,7 +84,8 @@ fn theme_row(
         };
         {
             let mut f = fe.borrow_mut();
-            f.core.palette = config::resolve_theme(Some(name));
+            f.core
+                .mutate(|c| c.palette = config::resolve_theme(Some(name)));
             f.core.request_render();
         }
         let mut cfg = config::load();
@@ -118,7 +119,7 @@ fn font_row(fe: &Rc<RefCell<Frontend>>, shell: &Rc<Shell>, drawing: &DrawingArea
         {
             let mut f = fe.borrow_mut();
             f.metrics = render::Metrics::measure(&drawing.pango_context(), &appearance);
-            f.core.appearance = appearance;
+            f.core.mutate(|c| c.appearance = appearance);
             f.core.request_render();
         }
         // Re-evaluate cols/rows at the new cell size, then repaint.
@@ -148,7 +149,7 @@ fn perf_counters_row(
         let on = row.is_active();
         {
             let mut f = fe.borrow_mut();
-            f.core.show_perf_counters = on;
+            f.core.mutate(|c| c.show_perf_counters = on);
             f.core.request_render();
         }
         let mut cfg = config::load();
@@ -176,7 +177,7 @@ fn cursor_blink_row(
         let on = row.is_active();
         {
             let mut f = fe.borrow_mut();
-            f.core.cursor_blink_enabled = on;
+            f.core.mutate(|c| c.cursor_blink_enabled = on);
             f.core.request_render();
         }
         let mut cfg = config::load();

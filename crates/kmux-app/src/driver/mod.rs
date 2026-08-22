@@ -39,7 +39,7 @@ pub use blink::{CURSOR_BLINK_HALF, advance_blink};
 pub use clipboard::sanitize_clipboard_text;
 
 use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::time::{Duration, Instant};
 
 use kmux_client::connection_state::DisconnectReason;
@@ -883,8 +883,40 @@ impl FrontendDriver {
         &self.core
     }
 
-    /// Borrow the wrapped [`AppCore`] (mutate). See [`core`](Self::core).
-    pub fn core_mut(&mut self) -> &mut AppCore {
+    /// Mutate the core, and ask for a frame.
+    ///
+    /// Every frontend mutation is followed by a render request, and the two used
+    /// to be separate statements at fifty-odd call sites across `kmux-ffi` and
+    /// `kmux-gtk`. Forgetting the second is silent: the state changes and the
+    /// user sees the previous frame until something unrelated repaints. Here the
+    /// request is not something a caller remembers.
+    ///
+    /// This replaces `core_mut()` and `DerefMut`, which handed every frontend a
+    /// `&mut` to all of `AppCore` for the sake of one field.
+    pub fn mutate<T>(&mut self, f: impl FnOnce(&mut AppCore) -> T) -> T {
+        let out = f(&mut self.core);
+        self.core.request_render();
+        out
+    }
+
+    /// Borrow the session manager mutably.
+    ///
+    /// The one piece of core state a frontend legitimately drives: selection,
+    /// scrolling, pane sizes and mouse reporting all live on it and all follow
+    /// the pointer, at a rate the driver's tick already repaints for. Naming it
+    /// is the point — with `DerefMut` gone, this is the only field of `AppCore`
+    /// a frontend can still reach into, instead of all forty-eight.
+    pub fn mgr_mut(&mut self) -> &mut kmux_client::session_manager::SessionManager {
+        &mut self.core.mgr
+    }
+
+    /// Borrow the core mutably *without* requesting a frame.
+    ///
+    /// For the one caller that mutates only to put the state back: building
+    /// command-palette hints needs a `Mode::Command` to read the buffer out of,
+    /// and restores the previous mode before returning. Nothing changed, so
+    /// nothing needs repainting.
+    pub fn core_for_query(&mut self) -> &mut AppCore {
         &mut self.core
     }
 
@@ -900,12 +932,6 @@ impl Deref for FrontendDriver {
     type Target = AppCore;
     fn deref(&self) -> &AppCore {
         &self.core
-    }
-}
-
-impl DerefMut for FrontendDriver {
-    fn deref_mut(&mut self) -> &mut AppCore {
-        &mut self.core
     }
 }
 
@@ -999,7 +1025,7 @@ mod tests {
         let (mut driver, _srv_tx, _bs_tx) = FrontendDriver::for_test(fixture_core());
         let other = crate::theme::builtin_theme("dracula").unwrap();
         assert_ne!(&driver.palette, &other, "fixture must differ from dracula");
-        driver.core_mut().palette = other;
+        driver.mutate(|core| core.palette = other);
         let effects = driver.tick();
         assert!(effects.contains(&FrontendEffect::PaletteChanged));
         assert!(effects.contains(&FrontendEffect::NeedsRender));

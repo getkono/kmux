@@ -63,7 +63,8 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, app: &Application) {
             if n_press == 2 {
                 {
                     let mut f = fe.borrow_mut();
-                    f.core.open_transport_chooser();
+                    f.core
+                        .mutate(kmux_app::core::AppCore::open_transport_chooser);
                     f.core.request_render();
                 }
                 s.drawing.queue_draw();

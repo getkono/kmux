@@ -282,7 +282,7 @@ fn open_list_dialog(
             let text = e.text().to_string();
             {
                 let mut f = fe.borrow_mut();
-                set_search(&mut f.core, text);
+                f.core.mutate(|c| set_search(c, text));
                 f.core.request_render();
             }
             shell.drawing.queue_draw();
@@ -303,7 +303,7 @@ fn open_list_dialog(
             };
             if let Some(down) = nav {
                 let mut f = fe.borrow_mut();
-                move_selection(&mut f.core, down);
+                f.core.mutate(|c| move_selection(c, down));
                 f.core.request_render();
                 return glib::Propagation::Stop;
             }
@@ -332,7 +332,7 @@ fn open_list_dialog(
             }
             {
                 let mut f = fe.borrow_mut();
-                f.core.set_picker_selected(idx as usize);
+                f.core.mutate(|c| c.set_picker_selected(idx as usize));
             }
             activate_current(&fe, &shell, &app);
         });
@@ -346,8 +346,7 @@ fn open_list_dialog(
         dialog.connect_closed(move |_| {
             let mut f = fe.borrow_mut();
             if DialogKind::from_mode(&f.core.mode).is_some_and(DialogKind::is_list) {
-                f.core.mode = Mode::Normal;
-                f.core.request_render();
+                f.core.mutate(|c| c.mode = Mode::Normal);
             }
             drop(f);
             // Return focus to the terminal so typing resumes there.
@@ -587,7 +586,7 @@ fn disconnect_button(peer: &str, shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) 
     btn.connect_clicked(move |_| {
         {
             let mut f = fe.borrow_mut();
-            f.core.disconnect_remote(&peer);
+            f.core.mutate(|c| c.disconnect_remote(&peer));
             f.core.request_render();
         }
         shell.drawing.queue_draw();
@@ -772,11 +771,14 @@ fn open_rename(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
             {
                 let mut f = fe.borrow_mut();
                 if resp == "rename" {
-                    if let Mode::RenameSession { buffer, .. } | Mode::RenameTab { buffer, .. } =
-                        &mut f.core.mode
-                    {
-                        *buffer = entry.text().to_string();
-                    }
+                    let typed = entry.text().to_string();
+                    f.core.mutate(|c| {
+                        if let Mode::RenameSession { buffer, .. } | Mode::RenameTab { buffer, .. } =
+                            &mut c.mode
+                        {
+                            *buffer = typed;
+                        }
+                    });
                     let _ = f.core.dispatch_action(Action::RenameSubmit);
                 } else {
                     let _ = f.core.dispatch_action(Action::ExitToNormal);
@@ -968,11 +970,11 @@ fn open_add_remote_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Live
             };
             let result = {
                 let mut f = fe.borrow_mut();
-                let r = f.core.submit_add_remote(form);
+                let r = f.core.mutate(|c| c.submit_add_remote(form));
                 if r.is_ok() {
                     // Core returns to Normal on success; reopen the launcher so the
                     // new remote is visible (expanded, connecting on focus).
-                    f.core.open_launch_picker();
+                    f.core.mutate(AppCore::open_launch_picker);
                 }
                 f.core.request_render();
                 r
@@ -994,8 +996,7 @@ fn open_add_remote_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Live
         dialog.connect_closed(move |_| {
             let mut f = fe.borrow_mut();
             if matches!(f.core.mode, Mode::AddRemote) {
-                f.core.mode = Mode::Normal;
-                f.core.request_render();
+                f.core.mutate(|c| c.mode = Mode::Normal);
             }
             drop(f);
             shell.drawing.grab_focus();
@@ -1058,7 +1059,8 @@ fn open_remote_new_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Live
                 let mut f = fe.borrow_mut();
                 if resp == "create" {
                     let cwd = entry.text().to_string();
-                    f.core.submit_remote_new_session(peer.clone(), cwd);
+                    f.core
+                        .mutate(|c| c.submit_remote_new_session(peer.clone(), cwd));
                 } else {
                     let _ = f.core.dispatch_action(Action::LaunchOverlayCancel);
                 }
@@ -1320,7 +1322,9 @@ fn update_metrics_dialog(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCe
             let fe = fe.clone();
             let shell = shell.clone();
             dialog.connect_closed(move |_| {
-                fe.borrow_mut().core.metrics_overlay_visible = false;
+                fe.borrow_mut()
+                    .core
+                    .mutate(|c| c.metrics_overlay_visible = false);
                 shell.drawing.grab_focus();
             });
         }
@@ -1419,7 +1423,9 @@ fn update_connection_dialog(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<Re
             let fe = fe.clone();
             let shell = shell.clone();
             dialog.connect_closed(move |_| {
-                fe.borrow_mut().core.connection_overlay_visible = false;
+                fe.borrow_mut()
+                    .core
+                    .mutate(|c| c.connection_overlay_visible = false);
                 shell.drawing.grab_focus();
             });
         }
