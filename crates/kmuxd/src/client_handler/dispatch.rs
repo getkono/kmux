@@ -1468,10 +1468,13 @@ mod tests {
     // One test per `ClientMessage` variant, against an authenticated client and
     // an empty server (no sessions, no panes). These pin what each arm of
     // `handle_message` does before it is split into per-domain handlers; see
-    // docs/testing.md R2 and R4. Every expectation below was read off the
-    // running code rather than invented; where the observed behaviour looks
-    // wrong it is recorded faithfully and flagged with `// SUSPECT:` instead of
-    // being "corrected" here.
+    // docs/testing.md R2 and R4. Every expectation was first read off the
+    // running code rather than invented, and where it looked wrong it was
+    // recorded faithfully and marked `// SUSPECT:` rather than "corrected"
+    // here — a characterization commit that changes behaviour characterizes
+    // nothing. The five findings that produced were then fixed in five
+    // `fix(kmuxd):` commits of their own, each flipping its assertion here;
+    // `git log --grep "^fix(kmuxd)" -- .` is the list.
 
     use kmux_protocol::messages::{
         AttentionKind, ClientId, KeyAction, KeyCode, KeyEvent, KeyMods, LayoutScheme, PeerTarget,
