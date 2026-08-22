@@ -19,23 +19,20 @@
 
 #![cfg(all(unix, feature = "federation"))]
 
-use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{Duration, Instant};
+mod harness;
 
-use kmux_client::connect::ConnectResult;
-use kmux_client::tcp_connect::connect_uds;
+use std::path::Path;
+use std::time::Duration;
+
+use harness::{
+    Cleanup, Daemon, Sandbox, connect_client, daemon_token, poll_until, read_pid_file, recv_until,
+};
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientMessage, PeerTarget, ServerMessage, SessionEventMsg, TermSize,
+    ClientMessage, PeerTarget, ServerMessage, SessionEventMsg, TermSize,
 };
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tokio::sync::mpsc;
-
-/// Serializes the test against any other that mutates process-global `XDG_*`
-/// env vars (the dirs helpers and the spawned daemons read them to resolve
-/// sockets). Held for the whole test.
-static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 const ATTACH_SIZE: TermSize = TermSize {
     rows: 24,
@@ -44,177 +41,32 @@ const ATTACH_SIZE: TermSize = TermSize {
     pixel_height: 0,
 };
 
-/// Point the current process's XDG dirs at an isolated temp dir. Spawned daemons
-/// inherit these; the kmux-client control helpers read them to resolve sockets.
-/// Caller must hold [`ENV_LOCK`].
-fn set_xdg(dir: &Path) {
-    for key in [
-        "XDG_RUNTIME_DIR",
-        "XDG_STATE_HOME",
-        "XDG_CONFIG_HOME",
-        "XDG_DATA_HOME",
-    ] {
-        // SAFETY: guarded by ENV_LOCK; no other test mutates env concurrently.
-        unsafe { std::env::set_var(key, dir) };
-    }
-}
-
-/// SIGKILLs every tracked PID on drop so a panicking test never leaks a daemon
-/// or an orphaned shell.
-#[derive(Default)]
-struct Cleanup {
-    pids: std::sync::Mutex<Vec<i32>>,
-}
-
-impl Cleanup {
-    fn track(&self, pid: i32) {
-        self.pids.lock().unwrap().push(pid);
-    }
-}
-
-impl Drop for Cleanup {
-    fn drop(&mut self) {
-        for &pid in self.pids.lock().unwrap().iter() {
-            let _ = kill(Pid::from_raw(pid), Signal::SIGKILL);
-        }
-    }
-}
-
-/// Spawn `exe` as a background daemon (isolated dirs already set) and return the
-/// PID the control socket reports once it is up. Binds loopback with an ephemeral
-/// TCP+TLS port so a second daemon can reach it for federation.
-async fn spawn_daemon(exe: &Path) -> u32 {
-    let mut child = Command::new(exe)
-        .args([
-            "--daemon",
-            "--bind",
-            "127.0.0.1",
-            "--port",
-            "0",
-            "--tcp-port",
-            "0",
-        ])
-        .stdin(std::process::Stdio::null())
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .spawn()
-        .expect("spawn kmuxd");
-    // The daemonize parent forks the real daemon and exits; reap it so it does
-    // not linger as a zombie. The daemon is tracked via the control socket.
-    let _ = child.wait();
-    wait_for_daemon()
-        .await
-        .expect("daemon did not come up within the deadline")
-}
-
-/// Poll the control socket (resolved from the *current* XDG dirs) until a live
-/// daemon is reported. Returns its PID, or `None` on timeout.
-async fn wait_for_daemon() -> Option<u32> {
-    let deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        if let Some(status) = kmux_client::daemon::query_daemon().await {
-            return Some(status.pid);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        tokio::time::sleep(Duration::from_millis(150)).await;
-    }
-}
-
-/// Await `f` becoming true (sync predicate), polling until `timeout`.
-async fn poll_until(timeout: Duration, mut f: impl FnMut() -> bool) -> bool {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if f() {
-            return true;
-        }
-        if Instant::now() >= deadline {
-            return false;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-}
-
-/// Receive from `rx` until a message matches `pred` or `timeout` elapses.
-async fn recv_until(
-    rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
-    timeout: Duration,
-    pred: impl Fn(&ServerMessage) -> bool,
-) -> Option<ServerMessage> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        let remaining = deadline.saturating_duration_since(Instant::now());
-        if remaining.is_zero() {
-            return None;
-        }
-        match tokio::time::timeout(remaining, rx.recv()).await {
-            Ok(Some(msg)) if pred(&msg) => return Some(msg),
-            Ok(Some(_)) => continue,
-            Ok(None) | Err(_) => return None,
-        }
-    }
-}
-
-/// Connect a mock client to the data UDS resolved from the current XDG dirs and
-/// authenticate. Returns the upstream sink and the server-message receiver.
+/// Connect a mock client to `sandbox`'s data UDS and authenticate. Returns the
+/// sink and the receiver separately, which is what lets one test drive two GUIs
+/// against one hub.
 async fn connect_authenticated(
+    sandbox: &Sandbox,
     token: &str,
 ) -> (
     mpsc::UnboundedSender<ClientMessage>,
     mpsc::UnboundedReceiver<ServerMessage>,
 ) {
-    let (srv_tx, mut srv_rx) = mpsc::unbounded_channel::<ServerMessage>();
-    let data_sock = kmux_sys::dirs::data_socket_path().expect("data socket path");
-    let client_tx = match connect_uds(
-        &data_sock,
-        token.to_string(),
-        srv_tx,
-        ClientCapabilities::default(),
-        None,
-    )
-    .await
-    {
-        ConnectResult::Connected(tx) => tx,
-        ConnectResult::Failed(e) => panic!("UDS connect failed: {e}"),
-    };
-    // Answer the identity challenge, then await the successful result (issue #146).
-    let auth = loop {
-        match recv_until(&mut srv_rx, Duration::from_secs(5), |m| {
-            matches!(
-                m,
-                ServerMessage::AuthChallenge { .. } | ServerMessage::AuthResult { .. }
-            )
-        })
-        .await
-        {
-            Some(ServerMessage::AuthChallenge { nonce }) => {
-                assert!(
-                    kmux_client::tcp_connect::answer_auth_challenge(&client_tx, &nonce),
-                    "answering the identity challenge must succeed"
-                );
-            }
-            other => break other,
-        }
-    };
-    assert!(
-        matches!(auth, Some(ServerMessage::AuthResult { success: true, .. })),
-        "expected a successful AuthResult"
-    );
-    (client_tx, srv_rx)
+    let client = connect_client(sandbox, token).await;
+    (client.tx, client.rx)
 }
 
-/// On the daemon reachable at the current XDG dirs, create a session whose pane
-/// prints `marker` then `exec`s an interactive shell (so it both shows the marker
+/// On the daemon in `sandbox`, create a session whose pane prints `marker` then
+/// `exec`s an interactive shell (so it both shows the marker
 /// in its grid and executes typed input). Records the shell's PID to `pidfile`.
 /// Returns `(remote_word_id, shell_pid)`.
 async fn create_remote_session(
+    sandbox: &Sandbox,
     token: &str,
     cwd: &Path,
     marker: &str,
     pidfile: &Path,
 ) -> (String, i32) {
-    let (client_tx, mut srv_rx) = connect_authenticated(token).await;
+    let (client_tx, mut srv_rx) = connect_authenticated(sandbox, token).await;
 
     let script = format!("echo $$ > {}; echo {marker}; exec sh", pidfile.display());
     client_tx
@@ -243,22 +95,6 @@ async fn create_remote_session(
     // Drop the client; the daemon keeps the session alive without it.
     drop(client_tx);
     (word_id, pid)
-}
-
-/// Block until `path` holds a parseable PID, or time out.
-fn read_pid_file(path: &Path, timeout: Duration) -> Option<i32> {
-    let deadline = Instant::now() + timeout;
-    loop {
-        if let Ok(text) = std::fs::read_to_string(path)
-            && let Ok(pid) = text.trim().parse::<i32>()
-        {
-            return Some(pid);
-        }
-        if Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
 }
 
 /// Flatten a grid snapshot's cells into a string (row-major) for marker scanning.
@@ -294,22 +130,16 @@ async fn federated_pane(
 /// The headline #121 path: one GUI attaches to a remote session *through* the
 /// local daemon over a single federated link, and both input and output flow.
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
 async fn gui_attaches_to_remote_session_through_local_daemon() {
-    let _env = ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
     let cleanup = Cleanup::default();
 
-    let remote_dir = tempfile::tempdir().unwrap();
-    let local_dir = tempfile::tempdir().unwrap();
+    let remote = Sandbox::new();
+    let local = Sandbox::new();
 
     // ── Remote daemon: host a real session with a known startup marker. ──
-    set_xdg(remote_dir.path());
-    let remote_pid = spawn_daemon(&exe).await;
+    let remote_pid = Daemon::new(&remote).spawn(None).await;
     cleanup.track(remote_pid as i32);
-    let remote_status = kmux_client::daemon::query_daemon()
+    let remote_status = kmux_client::daemon::query_daemon_at(&remote.socket_path())
         .await
         .expect("remote daemon status");
     let remote_token = remote_status.token.clone();
@@ -320,22 +150,18 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
     );
 
     const MARKER: &str = "FEDMARKER_OUTPUT";
-    let pidfile = remote_dir.path().join("shell.pid");
+    let pidfile = remote.path().join("shell.pid");
     let (remote_word, shell_pid) =
-        create_remote_session(&remote_token, remote_dir.path(), MARKER, &pidfile).await;
+        create_remote_session(&remote, &remote_token, remote.path(), MARKER, &pidfile).await;
     cleanup.track(shell_pid);
 
     // ── Local daemon: the per-user hub the GUI actually talks to. ──
-    set_xdg(local_dir.path());
-    let local_pid = spawn_daemon(&exe).await;
+    let local_pid = Daemon::new(&local).spawn(None).await;
     cleanup.track(local_pid as i32);
-    let local_token = kmux_client::daemon::query_daemon()
-        .await
-        .expect("local daemon status")
-        .token;
+    let local_token = daemon_token(&local).await;
 
     // ── Mock GUI → local daemon (UDS). ──
-    let (gui_tx, mut gui_rx) = connect_authenticated(&local_token).await;
+    let (gui_tx, mut gui_rx) = connect_authenticated(&local, &local_token).await;
 
     // 1. Federate the local daemon to the remote over a direct TCP+TLS endpoint.
     gui_tx
@@ -419,7 +245,7 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
 
     // 4. Input typed into the GUI must run on the *remote* PTY. Drive a `touch`
     //    and observe the file appear on the remote daemon's host.
-    let input_marker = remote_dir.path().join("fed_input_marker");
+    let input_marker = remote.path().join("fed_input_marker");
     assert!(!input_marker.exists());
     let cmd = format!("touch {}\n", input_marker.display());
     gui_tx
@@ -457,10 +283,8 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
 
     // ── Teardown. ──
     drop(gui_tx);
-    set_xdg(local_dir.path());
-    let _ = kmux_client::daemon::stop_daemon().await;
-    set_xdg(remote_dir.path());
-    let _ = kmux_client::daemon::stop_daemon().await;
+    let _ = kmux_client::daemon::stop_daemon_at(&local.socket_path()).await;
+    let _ = kmux_client::daemon::stop_daemon_at(&remote.socket_path()).await;
 }
 
 /// Creating a session on a federated peer (issue #121 launcher): the GUI sends
@@ -468,22 +292,16 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
 /// registers the result under a local word, and replies `SessionCreated` with the
 /// session attributed to its peer. The new session must run on the *remote* host.
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
 async fn gui_creates_a_session_on_a_federated_peer() {
-    let _env = ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
     let cleanup = Cleanup::default();
 
-    let remote_dir = tempfile::tempdir().unwrap();
-    let local_dir = tempfile::tempdir().unwrap();
+    let remote = Sandbox::new();
+    let local = Sandbox::new();
 
     // ── Remote daemon: starts with no sessions; the hub will create one on it. ──
-    set_xdg(remote_dir.path());
-    let remote_pid = spawn_daemon(&exe).await;
+    let remote_pid = Daemon::new(&remote).spawn(None).await;
     cleanup.track(remote_pid as i32);
-    let remote_status = kmux_client::daemon::query_daemon()
+    let remote_status = kmux_client::daemon::query_daemon_at(&remote.socket_path())
         .await
         .expect("remote daemon status");
     let remote_token = remote_status.token.clone();
@@ -491,15 +309,11 @@ async fn gui_creates_a_session_on_a_federated_peer() {
     assert!(remote_tcp != 0, "remote daemon must expose a TCP+TLS port");
 
     // ── Local hub daemon: what the GUI talks to. ──
-    set_xdg(local_dir.path());
-    let local_pid = spawn_daemon(&exe).await;
+    let local_pid = Daemon::new(&local).spawn(None).await;
     cleanup.track(local_pid as i32);
-    let local_token = kmux_client::daemon::query_daemon()
-        .await
-        .expect("local daemon status")
-        .token;
+    let local_token = daemon_token(&local).await;
 
-    let (gui_tx, mut gui_rx) = connect_authenticated(&local_token).await;
+    let (gui_tx, mut gui_rx) = connect_authenticated(&local, &local_token).await;
 
     // 1. Federate the hub to the remote.
     gui_tx
@@ -529,13 +343,13 @@ async fn gui_creates_a_session_on_a_federated_peer() {
 
     // 2. Create a new session ON the peer. The shell records its PID so we can
     //    prove a live *remote* PTY was spawned (and clean it up).
-    let pidfile = remote_dir.path().join("created.pid");
+    let pidfile = remote.path().join("created.pid");
     let script = format!("echo $$ > {}; exec sleep 600", pidfile.display());
     gui_tx
         .send(ClientMessage::SessionCreate {
             request_id: 20,
             name: Some("made-on-remote".into()),
-            cwd: Some(remote_dir.path().display().to_string()),
+            cwd: Some(remote.path().display().to_string()),
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), script],
             size: ATTACH_SIZE,
@@ -597,50 +411,38 @@ async fn gui_creates_a_session_on_a_federated_peer() {
 
     // ── Teardown. ──
     drop(gui_tx);
-    set_xdg(local_dir.path());
-    let _ = kmux_client::daemon::stop_daemon().await;
-    set_xdg(remote_dir.path());
-    let _ = kmux_client::daemon::stop_daemon().await;
+    let _ = kmux_client::daemon::stop_daemon_at(&local.socket_path()).await;
+    let _ = kmux_client::daemon::stop_daemon_at(&remote.socket_path()).await;
 }
 
 /// PR4 reconciliation: two local GUIs share **one** proxied pane over a single
 /// federated link. A smaller second viewer shrinks the shared pane (smallest-wins),
 /// and the late viewer is served the live mirror's content.
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
 async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
-    let _env = ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
     let cleanup = Cleanup::default();
 
-    let remote_dir = tempfile::tempdir().unwrap();
-    let local_dir = tempfile::tempdir().unwrap();
+    let remote = Sandbox::new();
+    let local = Sandbox::new();
 
     // Remote daemon hosting a marked session, then the local hub.
-    set_xdg(remote_dir.path());
-    let remote_pid = spawn_daemon(&exe).await;
+    let remote_pid = Daemon::new(&remote).spawn(None).await;
     cleanup.track(remote_pid as i32);
-    let remote_status = kmux_client::daemon::query_daemon()
+    let remote_status = kmux_client::daemon::query_daemon_at(&remote.socket_path())
         .await
         .expect("remote daemon status");
     let remote_token = remote_status.token.clone();
     let remote_tcp = remote_status.tcp_port;
 
     const MARKER: &str = "SHARED_PANE_MARKER";
-    let pidfile = remote_dir.path().join("shell.pid");
+    let pidfile = remote.path().join("shell.pid");
     let (_remote_word, shell_pid) =
-        create_remote_session(&remote_token, remote_dir.path(), MARKER, &pidfile).await;
+        create_remote_session(&remote, &remote_token, remote.path(), MARKER, &pidfile).await;
     cleanup.track(shell_pid);
 
-    set_xdg(local_dir.path());
-    let local_pid = spawn_daemon(&exe).await;
+    let local_pid = Daemon::new(&local).spawn(None).await;
     cleanup.track(local_pid as i32);
-    let local_token = kmux_client::daemon::query_daemon()
-        .await
-        .expect("local daemon status")
-        .token;
+    let local_token = daemon_token(&local).await;
 
     let big = TermSize {
         rows: 24,
@@ -656,7 +458,7 @@ async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
     };
 
     // GUI-1 federates and attaches at the LARGE size.
-    let (gui1_tx, mut gui1_rx) = connect_authenticated(&local_token).await;
+    let (gui1_tx, mut gui1_rx) = connect_authenticated(&local, &local_token).await;
     gui1_tx
         .send(ClientMessage::OpenPeer {
             request_id: 1,
@@ -705,7 +507,7 @@ async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
 
     // GUI-2 (a second connection to the SAME local daemon) sees the session via the
     // already-open peer — one shared upstream link — and attaches at the SMALL size.
-    let (gui2_tx, mut gui2_rx) = connect_authenticated(&local_token).await;
+    let (gui2_tx, mut gui2_rx) = connect_authenticated(&local, &local_token).await;
     let local_pane2 = federated_pane(&gui2_tx, &mut gui2_rx).await;
     assert_eq!(
         local_pane2, local_pane,
@@ -750,51 +552,45 @@ async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
     // ── Teardown. ──
     drop(gui1_tx);
     drop(gui2_tx);
-    set_xdg(local_dir.path());
-    let _ = kmux_client::daemon::stop_daemon().await;
-    set_xdg(remote_dir.path());
-    let _ = kmux_client::daemon::stop_daemon().await;
+    let _ = kmux_client::daemon::stop_daemon_at(&local.socket_path()).await;
+    let _ = kmux_client::daemon::stop_daemon_at(&remote.socket_path()).await;
 }
 
 /// PR6 hardening: when the remote daemon dies, the failure is isolated. The GUI's
 /// federated session is cleanly closed (not left hanging), and the local daemon
 /// keeps serving — proxied panes live apart from locally-hosted ones.
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
 async fn remote_daemon_death_is_isolated_from_local_daemon() {
-    let _env = ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
     let cleanup = Cleanup::default();
 
-    let remote_dir = tempfile::tempdir().unwrap();
-    let local_dir = tempfile::tempdir().unwrap();
+    let remote = Sandbox::new();
+    let local = Sandbox::new();
 
     // Remote daemon + a session, then the local hub.
-    set_xdg(remote_dir.path());
-    let remote_pid = spawn_daemon(&exe).await;
+    let remote_pid = Daemon::new(&remote).spawn(None).await;
     cleanup.track(remote_pid as i32);
-    let remote_status = kmux_client::daemon::query_daemon()
+    let remote_status = kmux_client::daemon::query_daemon_at(&remote.socket_path())
         .await
         .expect("remote daemon status");
     let remote_token = remote_status.token.clone();
     let remote_tcp = remote_status.tcp_port;
-    let pidfile = remote_dir.path().join("shell.pid");
-    let (_remote_word, shell_pid) =
-        create_remote_session(&remote_token, remote_dir.path(), "ISO_MARKER", &pidfile).await;
+    let pidfile = remote.path().join("shell.pid");
+    let (_remote_word, shell_pid) = create_remote_session(
+        &remote,
+        &remote_token,
+        remote.path(),
+        "ISO_MARKER",
+        &pidfile,
+    )
+    .await;
     cleanup.track(shell_pid);
 
-    set_xdg(local_dir.path());
-    let local_pid = spawn_daemon(&exe).await;
+    let local_pid = Daemon::new(&local).spawn(None).await;
     cleanup.track(local_pid as i32);
-    let local_token = kmux_client::daemon::query_daemon()
-        .await
-        .expect("local daemon status")
-        .token;
+    let local_token = daemon_token(&local).await;
 
     // GUI federates and attaches to the remote session through the local daemon.
-    let (gui_tx, mut gui_rx) = connect_authenticated(&local_token).await;
+    let (gui_tx, mut gui_rx) = connect_authenticated(&local, &local_token).await;
     gui_tx
         .send(ClientMessage::OpenPeer {
             request_id: 1,
@@ -860,7 +656,7 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
             request_id: 2,
             name: Some("local-after-death".into()),
             peer: None,
-            cwd: Some(local_dir.path().display().to_string()),
+            cwd: Some(local.path().display().to_string()),
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), "exec sleep 600".into()],
             size: ATTACH_SIZE,
@@ -877,8 +673,7 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
 
     // ── Teardown (remote already dead). ──
     drop(gui_tx);
-    set_xdg(local_dir.path());
-    let _ = kmux_client::daemon::stop_daemon().await;
+    let _ = kmux_client::daemon::stop_daemon_at(&local.socket_path()).await;
 }
 
 /// PR6 hardening: two GUIs federating the **same** remote target concurrently
@@ -889,42 +684,32 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
 /// duplicate link or a word index pointing at a connection that doesn't own it
 /// (which would make the federated pane un-attachable).
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
 async fn concurrent_open_peer_to_same_target_converges_on_one_link() {
-    let _env = ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
     let cleanup = Cleanup::default();
 
-    let remote_dir = tempfile::tempdir().unwrap();
-    let local_dir = tempfile::tempdir().unwrap();
+    let remote = Sandbox::new();
+    let local = Sandbox::new();
 
-    set_xdg(remote_dir.path());
-    let remote_pid = spawn_daemon(&exe).await;
+    let remote_pid = Daemon::new(&remote).spawn(None).await;
     cleanup.track(remote_pid as i32);
-    let remote_status = kmux_client::daemon::query_daemon()
+    let remote_status = kmux_client::daemon::query_daemon_at(&remote.socket_path())
         .await
         .expect("remote daemon status");
     let remote_token = remote_status.token.clone();
     let remote_tcp = remote_status.tcp_port;
 
     const MARKER: &str = "CONCURRENT_OPEN_MARKER";
-    let pidfile = remote_dir.path().join("shell.pid");
+    let pidfile = remote.path().join("shell.pid");
     let (_remote_word, shell_pid) =
-        create_remote_session(&remote_token, remote_dir.path(), MARKER, &pidfile).await;
+        create_remote_session(&remote, &remote_token, remote.path(), MARKER, &pidfile).await;
     cleanup.track(shell_pid);
 
-    set_xdg(local_dir.path());
-    let local_pid = spawn_daemon(&exe).await;
+    let local_pid = Daemon::new(&local).spawn(None).await;
     cleanup.track(local_pid as i32);
-    let local_token = kmux_client::daemon::query_daemon()
-        .await
-        .expect("local daemon status")
-        .token;
+    let local_token = daemon_token(&local).await;
 
-    let (gui1_tx, mut gui1_rx) = connect_authenticated(&local_token).await;
-    let (gui2_tx, mut gui2_rx) = connect_authenticated(&local_token).await;
+    let (gui1_tx, mut gui1_rx) = connect_authenticated(&local, &local_token).await;
+    let (gui2_tx, mut gui2_rx) = connect_authenticated(&local, &local_token).await;
 
     let target = || PeerTarget::Direct {
         host: "127.0.0.1".into(),
@@ -1017,10 +802,8 @@ async fn concurrent_open_peer_to_same_target_converges_on_one_link() {
     // ── Teardown. ──
     drop(gui1_tx);
     drop(gui2_tx);
-    set_xdg(local_dir.path());
-    let _ = kmux_client::daemon::stop_daemon().await;
-    set_xdg(remote_dir.path());
-    let _ = kmux_client::daemon::stop_daemon().await;
+    let _ = kmux_client::daemon::stop_daemon_at(&local.socket_path()).await;
+    let _ = kmux_client::daemon::stop_daemon_at(&remote.socket_path()).await;
 }
 
 /// PR6 hardening: an upstream peer link that **rejects authentication** surfaces
@@ -1033,37 +816,27 @@ async fn concurrent_open_peer_to_same_target_converges_on_one_link() {
 /// (which cannot be provoked without building a second daemon with a disjoint
 /// supported range).
 #[tokio::test]
-#[allow(clippy::await_holding_lock)] // ENV_LOCK guards process-global XDG vars for the whole test
 async fn federation_surfaces_upstream_auth_rejection_as_peer_error() {
-    let _env = ENV_LOCK
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner);
-    let exe = PathBuf::from(env!("CARGO_BIN_EXE_kmuxd"));
     let cleanup = Cleanup::default();
 
-    let remote_dir = tempfile::tempdir().unwrap();
-    let local_dir = tempfile::tempdir().unwrap();
+    let remote = Sandbox::new();
+    let local = Sandbox::new();
 
     // Remote daemon (real token), then the local hub.
-    set_xdg(remote_dir.path());
-    let remote_pid = spawn_daemon(&exe).await;
+    let remote_pid = Daemon::new(&remote).spawn(None).await;
     cleanup.track(remote_pid as i32);
-    let remote_status = kmux_client::daemon::query_daemon()
+    let remote_status = kmux_client::daemon::query_daemon_at(&remote.socket_path())
         .await
         .expect("remote daemon status");
     let remote_tcp = remote_status.tcp_port;
 
-    set_xdg(local_dir.path());
-    let local_pid = spawn_daemon(&exe).await;
+    let local_pid = Daemon::new(&local).spawn(None).await;
     cleanup.track(local_pid as i32);
-    let local_token = kmux_client::daemon::query_daemon()
-        .await
-        .expect("local daemon status")
-        .token;
+    let local_token = daemon_token(&local).await;
 
     // GUI federates with a WRONG token — the remote rejects authentication, the
     // same `AuthResult { success: false }` a version mismatch produces.
-    let (gui_tx, mut gui_rx) = connect_authenticated(&local_token).await;
+    let (gui_tx, mut gui_rx) = connect_authenticated(&local, &local_token).await;
     gui_tx
         .send(ClientMessage::OpenPeer {
             request_id: 1,
@@ -1100,7 +873,7 @@ async fn federation_surfaces_upstream_auth_rejection_as_peer_error() {
             request_id: 2,
             name: Some("local-after-reject".into()),
             peer: None,
-            cwd: Some(local_dir.path().display().to_string()),
+            cwd: Some(local.path().display().to_string()),
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), "exec sleep 600".into()],
             size: ATTACH_SIZE,
@@ -1117,8 +890,6 @@ async fn federation_surfaces_upstream_auth_rejection_as_peer_error() {
 
     // ── Teardown. ──
     drop(gui_tx);
-    set_xdg(local_dir.path());
-    let _ = kmux_client::daemon::stop_daemon().await;
-    set_xdg(remote_dir.path());
-    let _ = kmux_client::daemon::stop_daemon().await;
+    let _ = kmux_client::daemon::stop_daemon_at(&local.socket_path()).await;
+    let _ = kmux_client::daemon::stop_daemon_at(&remote.socket_path()).await;
 }

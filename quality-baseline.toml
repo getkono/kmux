@@ -789,7 +789,7 @@ count = 12
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::expect_used"
-count = 32
+count = 25
 
 [[lints]]
 crate = "kmuxd"
@@ -804,7 +804,7 @@ count = 8
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::needless_continue"
-count = 8
+count = 5
 
 [[lints]]
 crate = "kmuxd"
@@ -814,7 +814,7 @@ count = 1
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::panic"
-count = 4
+count = 2
 
 [[lints]]
 crate = "kmuxd"
@@ -834,7 +834,7 @@ count = 1
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::too_many_lines"
-count = 15
+count = 13
 
 [[lints]]
 crate = "kmuxd"
@@ -844,7 +844,7 @@ count = 1
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::unwrap_used"
-count = 133
+count = 126
 
 [[lints]]
 crate = "kmuxd"
@@ -904,7 +904,7 @@ count = 3
 
 [[allows]]
 crate = "kmuxd"
-count = 20
+count = 9
 
 [[allows]]
 crate = "xtask"

@@ -165,20 +165,18 @@ The tree does not satisfy every rule above yet. That is stated here rather than
 left implicit, because a normative document whose rules are quietly violated is
 the problem this one exists to fix.
 
-Measured 2026-08-15:
+Measured 2026-08-22:
 
 | Rule | At branch start | Now | Target |
 | --- | --- | --- | --- |
-| R3 — no process-global env mutation | 91 sites / 13 files | **9 / 7** | 0 |
-| R3/R13 — no test-only lock | 98 sites / 10 files | **31 / 4** | 0 |
-| R4 — no function over 100 lines | 45 (largest 888 lines) | 45 | 0, minus the exceptions register |
+| R3 — no process-global env mutation | 91 sites / 13 files | **5 / 3** | 0 |
+| R3/R13 — no test-only lock | 98 sites / 10 files | **0 / 0** | 0 — reached |
+| R4 — no function over 100 lines | 45 (largest 888 lines) | 43 (largest 261, a dispatch table) | 0, minus the exceptions register |
 | R5 — no double in a release build | 2 (`kmux-pty`'s `pub mod mock`) | **0** | 0 — reached |
 | R12 — mutation score is the coverage bar | 3 crates fabricated, 5 never swept | scoring fixed; **no trustworthy sweep yet** | a recorded `[[mutants]]` budget per crate |
 
-Three crates have reached zero on both, all by the same move — take the thing
-the test needs to vary as a parameter. What is left is four `kmuxd` e2e suites
-(which spawn real daemons and should be passing `Command::env` to the child
-instead) and three production reads that are not test isolation at all:
+Every case reached zero the same way — take the thing the test needs to vary and
+make it a parameter:
 
 - `kmux-protocol::dirs` — the `Dirs` value replaced twelve unsafe environment
   overwrites and the module's own lock; 8 serialised tests became 17
@@ -186,6 +184,16 @@ instead) and three production reads that are not test isolation at all:
 - `kmux-app::config` — the eight resolvers now take `&KmuxConfig`, so a test
   constructs a config value instead of writing a file and pointing
   `XDG_CONFIG_HOME` at it; 28 tests became 32, all parallel-safe.
+- The four `kmuxd` e2e suites — a `Sandbox` value hands the child daemon its
+  `XDG_*` through `Command::env` and resolves the test's own paths through
+  `Dirs::rooted` at the same root, so the four `ENV_LOCK`s went with it. That
+  lock never bought isolation anyway: it serialised tests within one binary
+  while two `cargo test` processes still shared the real `$XDG_RUNTIME_DIR`.
+
+The five remaining R3 sites are three unit tests that point one XDG variable at
+a tempdir to exercise a path resolver, and one that clears two impairment knobs.
+Each is a single-variable read in the code under test rather than a whole
+subsystem's worth of state; they are listed in Known exceptions.
 
 R12 is the one row that is not yet a number. The scoring bug is fixed and the
 believability check is in place, but a full sweep takes hours and none has run
@@ -325,3 +333,4 @@ Adding a row is a normative change: justify it in the commit that adds it.
 | `kmux-render` GPU adapter | No adapter on a headless runner | the pure tier always runs; GPU smoke skips cleanly (R11) |
 | `kmux-ghostty-sys` Zig internals and raw bindings | Not Rust; excluded from mutation by `exclude_globs` | `EXPECTED_ABI_VERSION` (R8); `kmux-vt-core`'s diff tests |
 | `KMUX_FFI_ABI_VERSION` bump on a surface change | Not machine-detectable | human review; the generated-bindings diff |
+| Five R3 env sites: `kmuxd::auth`, `kmuxd::impair`, `kmux-sys::identity` | Each is a single-variable read *inside the code under test* — the resolver's job is to read that variable, so parameterising it removes the thing being tested. Scoped to one test each, not a subsystem's state | the surrounding assertions; `Dirs::rooted` covers every path resolver that has a caller-supplied alternative |
