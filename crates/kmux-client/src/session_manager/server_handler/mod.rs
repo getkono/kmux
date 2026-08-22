@@ -1,10 +1,26 @@
 use std::collections::HashSet;
+mod attention;
+mod auth;
+mod clients;
+mod input_lock;
+mod pane;
+mod peer;
+mod query;
+mod session;
+mod stream;
+mod tab;
+
+use auth::AuthOutcome;
+
 use std::sync::Arc;
 use std::time::Instant;
 
 use kmux_protocol::messages::{
-    AttentionKind, ClientId, ClientMessage, PaneInfo, PaneProgressState, SequenceNo, ServerMessage,
-    SessionEventMsg, SessionStatus, epoch_millis,
+    AttentionKind, ClientId, ClientInfo, ClientMessage, ClosedSessionEntry, Compression,
+    ConnectionId, CursorState, DirEntry, GridSnapshot, LayoutNode, PaneId, PaneInfo, PaneProcesses,
+    PaneProgressState, PeerId, ProtocolVersion, RequestId, ScrollbackLine, SequenceNo,
+    ServerMessage, SessionEntry, SessionEventMsg, SessionStatus, TabIndex, TabInfo, TermModes,
+    TermSize, TerminalDiff, WordId, epoch_millis,
 };
 use tracing::{info, warn};
 
@@ -190,101 +206,38 @@ impl SessionManager {
                 server_machine_id,
                 negotiated_protocol,
                 negotiated_capabilities,
-            } => {
-                if success {
-                    self.client_id = client_id;
-                    self.server_version = server_version;
-                    self.connection_id = connection_id;
-                    self.machine_id = machine_id;
-                    self.label = label;
-                    self.server_machine_id = server_machine_id;
-                    self.negotiated_protocol = negotiated_protocol;
-                    self.negotiated_capabilities = negotiated_capabilities;
-                    // The daemon decides compression; frames self-describe, so
-                    // this is informational only (see docs/compression.md).
-                    info!(
-                        protocol = ?self.negotiated_protocol,
-                        capabilities = ?self.negotiated_capabilities,
-                        "Authenticated (wire compression: {compression:?})"
-                    );
-                    events.push(SessionEvent::AuthOk);
-                } else {
-                    warn!("Auth failed: {:?}", reason);
-                    let reason_str = reason.unwrap_or_default();
-                    let hint = kmux_protocol::messages::version_mismatch_hint(&reason_str);
-                    let msg = if hint.is_empty() {
-                        format!("Auth failed: {reason_str}")
-                    } else {
-                        format!("Auth failed: {reason_str} | {hint}")
-                    };
-                    self.ws_sender = None;
-                    self.set_connection_state(
-                        crate::connection_state::ConnectionState::Disconnected {
-                            reason: crate::connection_state::DisconnectReason::AuthFailed(msg),
-                        },
-                    );
-                    events.push(SessionEvent::AuthFailed { reason: reason_str });
-                }
-            }
+            } => events.extend(self.on_auth_result(AuthOutcome {
+                success,
+                reason,
+                client_id,
+                server_version,
+                connection_id,
+                compression,
+                machine_id,
+                label,
+                server_machine_id,
+                negotiated_protocol,
+                negotiated_capabilities,
+            })),
 
             ServerMessage::ChannelSwitched { old_transport } => {
-                let new_transport = self.current_transport;
-                info!(
-                    "Transport channel switched: {} -> {}",
-                    old_transport, new_transport
-                );
+                events.extend(self.on_channel_switched(&old_transport));
             }
 
             ServerMessage::SessionListResult { sessions, .. } => {
-                self.session_list = sessions.clone();
-                for entry in &sessions {
-                    for pane in &entry.panes {
-                        self.ensure_pane(&pane.pane_id);
-                    }
-                }
-                // Resolve a deferred "focus the pane I just created" once its tab
-                // is known; else pick an initial session; else re-sync the active
-                // session's tab after a refresh.
-                if let Some(pending) = self.pending_select_pane.take() {
-                    if self.locate_pane(&pending).is_some() {
-                        self.select_pane(pending);
-                    } else {
-                        self.pending_select_pane = Some(pending);
-                    }
-                } else if self.active_session.is_none() {
-                    if let Some(first) = sessions.first().map(|e| e.meta.word_id.clone()) {
-                        self.select_session(first);
-                    }
-                } else if self.visible_panes.is_empty()
-                    && let Some(word) = self.active_session.clone()
-                {
-                    self.select_session(word);
-                }
-                events.push(SessionEvent::SessionListReceived);
+                events.extend(self.on_session_list_result(&sessions));
             }
 
             ServerMessage::ClosedSessionListResult { sessions, .. } => {
-                // Already ordered most-recently-active first by the daemon. The
-                // launcher polls `closed_session_list()` when it opens (issue #64).
-                self.closed_sessions = sessions;
+                events.extend(self.on_closed_session_list_result(sessions));
             }
 
             ServerMessage::ProcessOverviewResult { panes, .. } => {
-                self.process_overview = panes;
-                events.push(SessionEvent::ProcessOverviewReceived);
+                events.extend(self.on_process_overview_result(panes));
             }
 
             ServerMessage::SessionCreated { entry, .. } => {
-                let word_id = entry.meta.word_id.clone();
-                for pane in &entry.panes {
-                    self.ensure_pane(&pane.pane_id);
-                }
-                self.session_list.push(entry);
-                self.status_msg = format!("Session '{word_id}' created");
-                // Switch to the new session (detaches the old visible set and
-                // attaches the new session's active tab).
-                self.select_session(word_id.clone());
-                events.push(SessionEvent::SessionCreated { word_id });
+                events.extend(self.on_session_created(entry));
             }
 
             // A session died. The requester gets the reply; every client gets the
@@ -292,54 +245,21 @@ impl SessionManager {
             ServerMessage::SessionClosed { word_id, .. }
             | ServerMessage::Event {
                 event: SessionEventMsg::SessionClosed { word_id },
-            } => {
-                events.extend(self.on_session_gone(word_id));
-            }
+            } => events.extend(self.on_session_closed(word_id)),
 
             ServerMessage::PaneCreated {
                 pane_id,
                 session_word_id,
                 size,
                 ..
-            } => {
-                self.ensure_pane(&pane_id);
-                // Record the new pane in the flat list for immediate chrome.
-                if let Some(entry) = self
-                    .session_list
-                    .iter_mut()
-                    .find(|e| e.meta.word_id == session_word_id)
-                {
-                    let pane_index = kmux_protocol::pane_index(&pane_id).unwrap_or(0);
-                    if !entry.panes.iter().any(|p| p.pane_id == pane_id) {
-                        entry.panes.push(PaneInfo {
-                            pane_id: pane_id.clone(),
-                            pane_index,
-                            program: String::new(),
-                            size,
-                            attached_clients: vec![],
-                            status: SessionStatus::Running,
-                            title: String::new(),
-                            progress_state: Default::default(),
-                            progress: None,
-                        });
-                    }
-                }
-                // `PaneCreate` creates a new tab server-side; its layout arrives
-                // with the refreshed session list. Defer focusing the new pane
-                // until then.
-                self.pending_select_pane = Some(pane_id.clone());
-                self.request_session_list();
-                events.push(SessionEvent::PaneCreated { pane_id });
-            }
+            } => events.extend(self.on_pane_created(pane_id, &session_word_id, size)),
 
             // A pane died. The requester gets the reply (with the exit code);
             // every client gets the PTY bus's broadcast of the same close.
             ServerMessage::PaneClosed { pane_id, .. }
             | ServerMessage::Event {
                 event: SessionEventMsg::PaneClosed { pane_id },
-            } => {
-                events.extend(self.on_pane_gone(pane_id));
-            }
+            } => events.extend(self.on_pane_closed(pane_id)),
 
             // ── Tab / layout reconciliation ─────────────────────────────────
             // `LayoutUpdate` is the authoritative tree (+ shared focus) broadcast
@@ -350,41 +270,12 @@ impl SessionManager {
                 tab_index,
                 layout,
                 focused_pane,
-            } => {
-                if let Some(tab) = self
-                    .session_list
-                    .iter_mut()
-                    .find(|e| e.meta.word_id == word_id)
-                    .and_then(|e| e.tabs.iter_mut().find(|t| t.tab_index == tab_index))
-                {
-                    tab.layout = layout;
-                    tab.focused_pane = focused_pane;
-                }
-                if self.active_session.as_deref() == Some(word_id.as_str())
-                    && self.active_tab == Some(tab_index)
-                    && let Some((focus_idx, visible)) = self.tab_view(&word_id, tab_index)
-                {
-                    self.set_visible_set(visible);
-                    self.focus_from_tab(&word_id, focus_idx);
-                }
-            }
+            } => events.extend(self.on_layout_update(&word_id, tab_index, layout, focused_pane)),
 
             // A tab was created (a different client, or via `TabCreate`). The
             // event carries the tab index but not its full layout, so refresh.
             ServerMessage::TabCreated { word_id, tab, .. } => {
-                let tab_index = tab.tab_index;
-                if let Some(entry) = self
-                    .session_list
-                    .iter_mut()
-                    .find(|e| e.meta.word_id == word_id)
-                    && !entry.tabs.iter().any(|t| t.tab_index == tab.tab_index)
-                {
-                    entry.tabs.push(tab);
-                }
-                // If this is our active session, switch to the new tab.
-                if self.active_session.as_deref() == Some(word_id.as_str()) {
-                    self.select_tab(tab_index);
-                }
+                events.extend(self.on_tab_created(&word_id, tab));
             }
 
             // A tab died. The requester gets the reply; every client gets the
@@ -395,9 +286,7 @@ impl SessionManager {
             }
             | ServerMessage::Event {
                 event: SessionEventMsg::TabClosed { word_id, tab_index },
-            } => {
-                self.on_tab_gone(&word_id, tab_index);
-            }
+            } => events.extend(self.on_tab_closed(&word_id, tab_index)),
 
             // The dedicated split reply: a new pane + the tab's new tree. Attach
             // the new pane (without detaching siblings) when it's our active tab.
@@ -407,68 +296,21 @@ impl SessionManager {
                 new_pane,
                 layout,
                 ..
-            } => {
-                self.ensure_pane(&new_pane.pane_id);
-                let new_idx = new_pane.pane_index;
-                if let Some(entry) = self
-                    .session_list
-                    .iter_mut()
-                    .find(|e| e.meta.word_id == word_id)
-                {
-                    if !entry.panes.iter().any(|p| p.pane_id == new_pane.pane_id) {
-                        entry.panes.push(new_pane);
-                    }
-                    if let Some(tab) = entry.tabs.iter_mut().find(|t| t.tab_index == tab_index) {
-                        tab.layout = layout;
-                        tab.focused_pane = new_idx;
-                    }
-                }
-                if self.active_session.as_deref() == Some(word_id.as_str())
-                    && self.active_tab == Some(tab_index)
-                    && let Some((focus_idx, visible)) = self.tab_view(&word_id, tab_index)
-                {
-                    self.set_visible_set(visible);
-                    self.focus_from_tab(&word_id, focus_idx);
-                }
-            }
+            } => events.extend(self.on_pane_split(&word_id, tab_index, new_pane, layout)),
 
             ServerMessage::TerminalSnapshot {
                 pane_id,
                 snapshot,
                 seqno,
                 sent_at_ms,
-            } => {
-                let start = Instant::now();
-                let grid = self.ensure_pane(&pane_id);
-                // The client owns its freshly-decoded Arc (refcount 1), so this
-                // moves the grid out rather than cloning it.
-                grid.apply_snapshot(Arc::unwrap_or_clone(snapshot));
-                self.mark_synced(pane_id, seqno, start, sent_at_ms);
-            }
+            } => events.extend(self.on_terminal_snapshot(pane_id, snapshot, seqno, sent_at_ms)),
 
             ServerMessage::TerminalUpdate {
                 pane_id,
                 diff,
                 seqno,
                 sent_at_ms,
-            } => {
-                if !self.check_pane_sync(&pane_id, seqno) {
-                    return events;
-                }
-                let start = Instant::now();
-                let diff = Arc::unwrap_or_clone(diff);
-                let op_count = diff.ops.len();
-                if let Some(grid) = self.buffers.get_mut(&pane_id) {
-                    grid.apply_diff(diff);
-                    self.metrics.record_diff_stats(op_count);
-                }
-                self.mark_synced(pane_id.clone(), seqno, start, sent_at_ms);
-                if op_count > 100 {
-                    let net_apply_ms = epoch_millis().saturating_sub(sent_at_ms) as f64;
-                    self.metrics.record_large_diff(net_apply_ms);
-                }
-                self.maybe_fetch_history(&pane_id);
-            }
+            } => events.extend(self.on_terminal_update(&pane_id, diff, seqno, sent_at_ms)),
 
             ServerMessage::CursorUpdate {
                 pane_id,
@@ -476,76 +318,21 @@ impl SessionManager {
                 modes,
                 seqno,
                 sent_at_ms,
-            } => {
-                if !self.check_pane_sync(&pane_id, seqno) {
-                    return events;
-                }
-                let start = Instant::now();
-                if let Some(grid) = self.buffers.get_mut(&pane_id) {
-                    grid.apply_cursor_update(cursor, modes);
-                }
-                self.mark_synced(pane_id, seqno, start, sent_at_ms);
-            }
+            } => events.extend(self.on_cursor_update(pane_id, cursor, modes, seqno, sent_at_ms)),
 
-            ServerMessage::SyncReset { pane_id } => {
-                if let Some(grid) = self.buffers.get_mut(&pane_id) {
-                    grid.clear();
-                }
-                self.in_flight_history_fetches.remove(&pane_id);
-                self.metrics.record_resync(&pane_id, "server sync reset");
-                self.pane_sync.insert(pane_id, PaneSync::AwaitingSync);
-            }
+            ServerMessage::SyncReset { pane_id } => events.extend(self.on_sync_reset(pane_id)),
 
             ServerMessage::GridDigest {
                 pane_id,
                 seqno,
                 hash,
-            } => {
-                // The digest certifies the grid as of `seqno`. Only verify when
-                // the pane is synced at EXACTLY that seqno (its next-expected is
-                // `seqno + 1`); otherwise the client is mid-stream, resyncing, or
-                // the digest is stale, and a comparison would be meaningless. The
-                // digest carries no new seqno and never advances sync state — it
-                // is a pure side-band check. Skip while a lazy `FetchHistory` is
-                // outstanding: the client is legitimately behind on the envelope
-                // counts the digest covers, so a mismatch would be a false alarm.
-                let synced_here = matches!(
-                    self.pane_sync.get(&pane_id),
-                    Some(PaneSync::Synced { expected }) if expected.0 == seqno.0 + 1
-                );
-                if synced_here {
-                    // A `Published` pane's content lives on the apply worker, so
-                    // the digest is checked there (in-order with the data it
-                    // certifies) and a mismatch returns via `WorkerNote`, handled
-                    // in `drain_apply_notes`. A `Local` pane checks inline and
-                    // returns `Some(mismatch)`.
-                    let inline_mismatch = self
-                        .buffers
-                        .get_mut(&pane_id)
-                        .and_then(|grid| grid.request_digest_check(seqno, hash));
-                    if inline_mismatch == Some(true) {
-                        self.metrics.record_digest_mismatch(&pane_id, seqno.0);
-                        self.metrics.record_resync(&pane_id, "grid digest mismatch");
-                        if let Some(grid) = self.buffers.get_mut(&pane_id) {
-                            grid.clear();
-                        }
-                        self.in_flight_history_fetches.remove(&pane_id);
-                        self.attach_fresh(pane_id);
-                    }
-                }
-            }
+            } => events.extend(self.on_grid_digest(pane_id, seqno, hash)),
 
             ServerMessage::Event {
                 event: SessionEventMsg::SessionRenamed { word_id, new_name },
             }
             | ServerMessage::SessionRenamed { word_id, new_name } => {
-                for entry in &mut self.session_list {
-                    if entry.meta.word_id == word_id {
-                        entry.meta.name = new_name.clone();
-                        break;
-                    }
-                }
-                events.push(SessionEvent::SessionRenamed { word_id, new_name });
+                events.extend(self.on_event_session_renamed(word_id, new_name));
             }
 
             // A tab was renamed (by this or another client). Update the cached
@@ -557,16 +344,7 @@ impl SessionManager {
                         tab_index,
                         name,
                     },
-            } => {
-                if let Some(entry) = self
-                    .session_list
-                    .iter_mut()
-                    .find(|e| e.meta.word_id == word_id)
-                    && let Some(tab) = entry.tabs.iter_mut().find(|t| t.tab_index == tab_index)
-                {
-                    tab.name = name;
-                }
-            }
+            } => events.extend(self.on_event_tab_renamed(&word_id, tab_index, name)),
 
             ServerMessage::Event {
                 event:
@@ -574,47 +352,19 @@ impl SessionManager {
                         word_id,
                         tab_indices,
                     },
-            } => {
-                if let Some(entry) = self
-                    .session_list
-                    .iter_mut()
-                    .find(|entry| entry.meta.word_id == word_id)
-                {
-                    entry.tabs.sort_by_key(|tab| {
-                        tab_indices
-                            .iter()
-                            .position(|index| *index == tab.tab_index)
-                            .unwrap_or(usize::MAX)
-                    });
-                }
-            }
+            } => events.extend(self.on_event_tabs_reordered(&word_id, &tab_indices)),
 
             ServerMessage::Event {
                 event: SessionEventMsg::PaneResized { pane_id, size },
-            } => {
-                if let Some(grid) = self.buffers.get_mut(&pane_id) {
-                    grid.resize(size.rows, size.cols);
-                }
-            }
+            } => events.extend(self.on_event_pane_resized(&pane_id, size)),
 
             ServerMessage::Event {
                 event: SessionEventMsg::PaneTitleChanged { pane_id, title },
-            } => {
-                for entry in &mut self.session_list {
-                    if let Some(pane) = entry.panes.iter_mut().find(|p| p.pane_id == pane_id) {
-                        pane.title = title.clone();
-                        break;
-                    }
-                }
-                events.push(SessionEvent::PaneTitleChanged { pane_id, title });
-            }
+            } => events.extend(self.on_event_pane_title_changed(pane_id, title)),
 
             ServerMessage::Event {
                 event: SessionEventMsg::PaneBell { pane_id },
-            } => {
-                self.attention_panes.insert(pane_id.clone());
-                events.push(SessionEvent::PaneBell { pane_id });
-            }
+            } => events.extend(self.on_event_pane_bell(pane_id)),
 
             ServerMessage::Event {
                 event:
@@ -623,22 +373,7 @@ impl SessionManager {
                         state,
                         progress,
                     },
-            } => {
-                // Update the cached snapshot so the frontend's per-pane progress
-                // bar repaints from `PaneInfo` on the next render tick.
-                for entry in &mut self.session_list {
-                    if let Some(pane) = entry.panes.iter_mut().find(|p| p.pane_id == pane_id) {
-                        pane.progress_state = state;
-                        pane.progress = progress;
-                        break;
-                    }
-                }
-                events.push(SessionEvent::PaneProgressChanged {
-                    pane_id,
-                    state,
-                    progress,
-                });
-            }
+            } => events.extend(self.on_event_pane_progress_changed(pane_id, state, progress)),
 
             ServerMessage::Event {
                 event:
@@ -647,15 +382,7 @@ impl SessionManager {
                         selection,
                         data,
                     },
-            } => {
-                // Pure relay: the app layer applies the active-pane policy and
-                // decodes the base64 payload at the clipboard leaf.
-                events.push(SessionEvent::ClipboardCopy {
-                    pane_id,
-                    selection,
-                    data,
-                });
-            }
+            } => events.extend(Self::on_event_pane_clipboard_copy(pane_id, selection, data)),
 
             ServerMessage::Event {
                 event:
@@ -666,21 +393,13 @@ impl SessionManager {
                         body,
                         attention_id,
                     },
-            } => {
-                // The session word the GUI focuses on click; derive it from the
-                // pane id (already local — federation rewrote it upstream).
-                let word_id = kmux_protocol::pane_word(&pane_id)
-                    .unwrap_or(&pane_id)
-                    .to_string();
-                events.push(SessionEvent::PaneAttention {
-                    word_id,
-                    pane_id,
-                    kind,
-                    title,
-                    body,
-                    attention_id,
-                });
-            }
+            } => events.extend(Self::on_event_pane_attention(
+                pane_id,
+                kind,
+                title,
+                body,
+                attention_id,
+            )),
 
             // A session was restored from the graveyard by some client. The
             // broadcast names only the word, so a client that does not already
@@ -688,34 +407,19 @@ impl SessionManager {
             // not *switch* to it — that would yank the view of every other GUI.
             ServerMessage::Event {
                 event: SessionEventMsg::SessionCreated { word_id },
-            } => {
-                let cached = self.knows_session(&word_id);
-                self.resync_unless_cached(cached);
-            }
+            } => events.extend(self.on_event_session_created(&word_id)),
 
             // A tab was created by some client. The broadcast carries the index
             // but no `TabInfo`, so the tree can only come from a fresh list.
             ServerMessage::Event {
                 event: SessionEventMsg::TabCreated { word_id, tab_index },
-            } => {
-                let cached = self
-                    .session_list
-                    .iter()
-                    .find(|e| e.meta.word_id == word_id)
-                    .is_none_or(|e| e.tabs.iter().any(|t| t.tab_index == tab_index));
-                self.resync_unless_cached(cached);
-            }
+            } => events.extend(self.on_event_tab_created(&word_id, tab_index)),
 
             // A pane was spawned — by a session/tab create, a split, or a
             // restore. Same shape: an id, no `PaneInfo`, no layout.
             ServerMessage::Event {
                 event: SessionEventMsg::PaneSpawned { pane_id },
-            } => {
-                let cached = kmux_protocol::pane_word(&pane_id)
-                    .is_none_or(|word_id| !self.knows_session(word_id))
-                    || self.knows_pane(&pane_id);
-                self.resync_unless_cached(cached);
-            }
+            } => events.extend(self.on_event_pane_spawned(&pane_id)),
 
             // The pane's child process exited on its own. The pane keeps its
             // slot in the layout tree until someone closes it, so this only
@@ -727,9 +431,7 @@ impl SessionManager {
                         code,
                         signal,
                     },
-            } => {
-                self.on_pane_exited(&pane_id, code, signal);
-            }
+            } => events.extend(self.on_event_pane_exited(&pane_id, code, signal)),
 
             // The pane's isolated VT worker crashed (issue #126). The shell is
             // untouched and the daemon respawns the worker, which resyncs this
@@ -737,11 +439,7 @@ impl SessionManager {
             // path — so no sync state is disturbed here, only the UI is told.
             ServerMessage::Event {
                 event: SessionEventMsg::PaneFaulted { pane_id },
-            } => {
-                warn!(%pane_id, "pane VT worker faulted; the daemon is respawning it");
-                self.status_msg = format!("Pane '{pane_id}' is recovering");
-                events.push(SessionEvent::PaneFaulted { pane_id });
-            }
+            } => events.extend(self.on_event_pane_faulted(pane_id)),
 
             // Never sent: `kmuxd` constructs no `LayoutChanged`, and the
             // authoritative `LayoutUpdate` supersedes it. Kept as an arm rather
@@ -749,42 +447,25 @@ impl SessionManager {
             // compile here instead of being silently dropped (docs/testing.md R4).
             ServerMessage::Event {
                 event: SessionEventMsg::LayoutChanged { .. },
-            } => {}
+            } => events.extend(Self::on_event_layout_changed()),
 
             ServerMessage::Lagged {
                 pane_id,
                 missed_count,
-            } => {
-                self.metrics.record_lag(&pane_id, missed_count);
-                self.metrics.record_resync(&pane_id, "lagged");
-                if let Some(grid) = self.buffers.get_mut(&pane_id) {
-                    grid.clear();
-                }
-                self.in_flight_history_fetches.remove(&pane_id);
-                self.attach_fresh(pane_id);
-            }
+            } => events.extend(self.on_lagged(pane_id, missed_count)),
 
-            ServerMessage::Error { message, .. } => {
-                self.status_msg = format!("Error: {message}");
-                events.push(SessionEvent::ServerError { message });
-            }
+            ServerMessage::Error { message, .. } => events.extend(self.on_error(message)),
 
             ServerMessage::InputLockGranted { pane_id } => {
-                self.input_locked.insert(pane_id.clone(), true);
-                self.status_msg = format!("Input lock acquired on '{pane_id}'");
-                events.push(SessionEvent::InputLockGranted { pane_id });
+                events.extend(self.on_input_lock_granted(pane_id));
             }
 
             ServerMessage::InputLockDenied { pane_id, holder } => {
-                let who = self.client_label(holder);
-                self.status_msg = format!("Input lock denied on '{pane_id}' (held by {who})");
-                events.push(SessionEvent::InputLockDenied { pane_id, holder });
+                events.extend(self.on_input_lock_denied(pane_id, holder));
             }
 
             ServerMessage::InputLockReleased { pane_id } => {
-                self.input_locked.insert(pane_id.clone(), false);
-                self.status_msg = format!("Input lock released on '{pane_id}'");
-                events.push(SessionEvent::InputLockReleased { pane_id });
+                events.extend(self.on_input_lock_released(pane_id));
             }
 
             ServerMessage::DirectoryListing {
@@ -793,21 +474,7 @@ impl SessionManager {
                 parent,
                 entries,
                 error,
-            } => {
-                // Drop stale replies: only the most recent request counts (the
-                // user may have navigated again before this listing returned).
-                if self.pending_dir_request != Some(request_id) {
-                    return events;
-                }
-                self.pending_dir_request = None;
-                self.dir_listing = Some(DirListing {
-                    path,
-                    parent,
-                    entries,
-                    error,
-                });
-                events.push(SessionEvent::DirectoryListed);
-            }
+            } => events.extend(self.on_directory_listing(request_id, path, parent, entries, error)),
 
             ServerMessage::ScrollbackAppend {
                 pane_id,
@@ -815,17 +482,13 @@ impl SessionManager {
                 lines,
                 seqno,
                 sent_at_ms,
-            } => {
-                if !self.check_pane_sync(&pane_id, seqno) {
-                    return events;
-                }
-                let start = Instant::now();
-                if let Some(grid) = self.buffers.get_mut(&pane_id) {
-                    grid.apply_scrollback_append(first_index, lines);
-                }
-                self.mark_synced(pane_id.clone(), seqno, start, sent_at_ms);
-                self.maybe_fetch_history(&pane_id);
-            }
+            } => events.extend(self.on_scrollback_append(
+                &pane_id,
+                first_index,
+                lines,
+                seqno,
+                sent_at_ms,
+            )),
 
             ServerMessage::HistoryLines {
                 request_id,
@@ -834,91 +497,61 @@ impl SessionManager {
                 lines,
                 history_total,
                 ..
-            } => {
-                if let Some(grid) = self.buffers.get_mut(&pane_id) {
-                    grid.apply_history_lines(first_index, lines, history_total);
-                }
-                // Clear only if this reply matches the in-flight request for
-                // this pane; otherwise a stale reply from a prior attach could
-                // unblock a fresher request.
-                if self
-                    .in_flight_history_fetches
-                    .get(&pane_id)
-                    .is_some_and(|rid| *rid == request_id)
-                {
-                    self.in_flight_history_fetches.remove(&pane_id);
-                }
-                self.maybe_fetch_history(&pane_id);
-            }
+            } => events.extend(self.on_history_lines(
+                request_id,
+                &pane_id,
+                first_index,
+                lines,
+                history_total,
+            )),
 
-            ServerMessage::Ping { seq } => {
-                self.send_ws(ClientMessage::Pong { seq });
-            }
+            ServerMessage::Ping { seq } => events.extend(self.on_ping(seq)),
 
             // Response to a client-initiated Ping; the liveness tracker
             // also refreshes on this (in addition to the general
             // `observe_inbound` at the top of this fn) so outstanding
             // ping seqs are cleared.
-            ServerMessage::Pong { seq } => {
-                if let Some(rtt) = self.liveness.on_pong(seq, Instant::now()) {
-                    let rtt_ms = rtt.as_secs_f64() * 1000.0;
-                    self.metrics.observe_rtt(rtt_ms);
-                    self.record_rtt_to_supervisor(rtt_ms);
-                }
-            }
+            ServerMessage::Pong { seq } => events.extend(self.on_pong(seq)),
 
             // Federation responses (issue #121). The local daemon sends these
             // after we issue `OpenPeer`/`ClosePeer` to federate a remote server.
             // The handshake challenge is consumed by the connection bootstrap; the
             // session manager never sees it in practice. Ignore for exhaustiveness.
-            ServerMessage::AuthChallenge { .. } => {}
+            ServerMessage::AuthChallenge { .. } => events.extend(Self::on_auth_challenge()),
 
             ServerMessage::ClientListResult {
                 word_id, clients, ..
-            } => {
-                self.client_list = clients;
-                self.client_list_word = Some(word_id.clone());
-                events.push(SessionEvent::ClientListReceived { word_id });
-            }
+            } => events.extend(self.on_client_list_result(word_id, clients)),
 
             ServerMessage::ClientKicked {
                 word_id, client_id, ..
-            } => {
-                // The daemon acks the kick and pushes no refreshed list, so the
-                // connected-clients view would keep the row until its own ~1 Hz
-                // poll came round — a visible lag that reads as a failed kick.
-                // The ack is authoritative for the session it names.
-                if self.client_list_word.as_deref() == Some(word_id.as_str()) {
-                    self.client_list.retain(|c| c.client_id != client_id);
-                }
-                events.push(SessionEvent::ClientKicked { word_id, client_id });
-            }
+            } => events.extend(self.on_client_kicked(word_id, client_id)),
 
             ServerMessage::SessionKicked { word_id, by_label } => {
-                warn!("kicked from session {word_id} by {by_label}");
-                self.leave_session(&word_id);
-                events.push(SessionEvent::KickedFromSession { word_id, by_label });
+                events.extend(self.on_session_kicked(word_id, by_label));
             }
 
-            ServerMessage::PeerOpened { peer, .. } => {
-                events.push(SessionEvent::PeerOpened { peer });
-            }
+            ServerMessage::PeerOpened { peer, .. } => events.extend(Self::on_peer_opened(peer)),
+
             ServerMessage::PeerError { peer, reason, .. } => {
-                events.push(SessionEvent::PeerError { peer, reason });
+                events.extend(Self::on_peer_error(peer, reason));
             }
+
             // A close ack needs no app-level reconciliation (the peer's sessions
             // simply stop appearing in the next `SessionList`).
-            ServerMessage::PeerClosed { .. } => {}
+            ServerMessage::PeerClosed { .. } => events.extend(Self::on_peer_closed()),
 
             // Reply to `ClientMessage::Notify` (issue #169). Consumed directly by
             // the `kmux notify` CLI's own read loop, not the streaming session
             // manager — ignore here for exhaustiveness.
-            ServerMessage::NotifyAccepted { .. } => {}
+            ServerMessage::NotifyAccepted { .. } => events.extend(Self::on_notify_accepted()),
 
             // Replies to `ClientMessage::FetchLogs` (issue #187). Consumed by the
             // `kmux daemon logs --server` CLI read loop, never by the GUI session
             // manager — ignore here for exhaustiveness.
-            ServerMessage::LogChunk { .. } | ServerMessage::LogEnd { .. } => {}
+            ServerMessage::LogChunk { .. } | ServerMessage::LogEnd { .. } => {
+                events.extend(Self::on_log_chunk());
+            }
         }
         events
     }
@@ -1288,7 +921,7 @@ mod tests {
     }
 
     /// An empty scrollback line (`Arc<[CellState]>`), the wire's line type.
-    fn sb_line() -> kmux_protocol::messages::ScrollbackLine {
+    fn sb_line() -> ScrollbackLine {
         Arc::from(Vec::new())
     }
 

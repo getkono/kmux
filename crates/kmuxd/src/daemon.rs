@@ -417,28 +417,51 @@ impl Drop for SocketGuard {
 
 /// Whether a daemon is actually listening on `path`.
 ///
-/// Only a successful connect proves it. Two failures still mean "someone is
-/// there": `EAGAIN`, which a Unix socket returns when its accept backlog is
-/// full, and `EPERM`/`EACCES`, which means a socket we are not allowed to talk
-/// to. Everything else — refused, missing, or not a socket at all — means
-/// nothing is serving this path.
+/// Only a successful connect proves it. `EPERM`/`EACCES` also means someone is
+/// there — a socket we are not allowed to talk to. Everything else, including a
+/// path that is not a socket at all, means nothing is serving it.
 ///
-/// That last case is why this cannot be "any error other than refused is live".
+/// That last part is why this cannot be "any error other than refused is live".
 /// A regular file left at the socket path answers `ECONNREFUSED` on Linux and
 /// `ENOTSOCK` on macOS; treating the unfamiliar errno as liveness made the
-/// daemon refuse to start forever behind a stale file. CI caught it, on the
-/// platform this machine is not.
+/// daemon refuse to start forever behind a stale file.
+///
+/// `EAGAIN` is retried rather than classified. A Unix socket returns it when the
+/// listener's accept backlog is momentarily full, but the kernel can also
+/// produce it under load for a socket with no listener at all — this test suite
+/// reproduced that roughly once in seven runs. Treating it as liveness outright
+/// would let a genuinely dead socket block startup; treating it as death would
+/// let a busy daemon be evicted. Asking again separates the two: a real listener
+/// is still there a moment later, a dead socket answers `ECONNREFUSED`. The
+/// budget is ~200ms, which a daemon start or exit can afford and which no
+/// observed spurious `EAGAIN` has outlasted.
 ///
 /// Blocking, deliberately: both callers are lifecycle moments — binding at
 /// startup and cleaning up on exit — and one of them is a `Drop`, which cannot
 /// await. Connecting to a Unix socket does not wait on the network.
 fn socket_is_live(path: &Path) -> bool {
     use std::io::ErrorKind::{PermissionDenied, WouldBlock};
-    match std::os::unix::net::UnixStream::connect(path) {
-        Ok(_) => true,
-        Err(e) => matches!(e.kind(), WouldBlock | PermissionDenied),
+    for attempt in 0..SOCKET_PROBE_ATTEMPTS {
+        match std::os::unix::net::UnixStream::connect(path) {
+            Ok(_) => return true,
+            Err(e) if e.kind() == PermissionDenied => return true,
+            Err(e) if e.kind() == WouldBlock => {
+                if attempt + 1 < SOCKET_PROBE_ATTEMPTS {
+                    std::thread::sleep(SOCKET_PROBE_BACKOFF);
+                }
+            }
+            Err(_) => return false,
+        }
     }
+    // Still busy after every attempt: assume a listener whose backlog is full.
+    // Refusing to start is recoverable; evicting a live daemon is not.
+    true
 }
+
+/// How many times [`socket_is_live`] asks before believing an `EAGAIN`.
+const SOCKET_PROBE_ATTEMPTS: u32 = 8;
+/// Pause between those attempts.
+const SOCKET_PROBE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(30);
 
 #[cfg(test)]
 mod tests {
@@ -626,7 +649,11 @@ mod tests {
         // A socket whose listener is gone: what a killed daemon leaves behind.
         let orphan = tmp.path().join("orphan.sock");
         drop(std::os::unix::net::UnixListener::bind(&orphan).expect("bind"));
-        assert!(!socket_is_live(&orphan), "a socket with no listener");
+        assert!(
+            !socket_is_live(&orphan),
+            "a socket with no listener, but connect said {:?}",
+            std::os::unix::net::UnixStream::connect(&orphan).map(|_| "connected")
+        );
     }
 
     #[test]

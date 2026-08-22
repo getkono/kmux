@@ -193,11 +193,6 @@ count = 4
 
 [[lints]]
 crate = "kmux-client"
-lint = "clippy::cognitive_complexity"
-count = 1
-
-[[lints]]
-crate = "kmux-client"
 lint = "clippy::expect_used"
 count = 2
 
@@ -205,11 +200,6 @@ count = 2
 crate = "kmux-client"
 lint = "clippy::items_after_statements"
 count = 2
-
-[[lints]]
-crate = "kmux-client"
-lint = "clippy::match_same_arms"
-count = 1
 
 [[lints]]
 crate = "kmux-client"
