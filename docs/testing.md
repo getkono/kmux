@@ -255,8 +255,21 @@ mise run mutants-gate                  # judge the sweep, then check the budget
 
 Mutation configuration lives in `.cargo/mutants*.toml` — three files, one per
 crate target shape, because `--lib` hard-errors on a bin-only package and
-cargo-mutants misreads the error as a caught mutant. Results land in
-`mutants.out/` (gitignored).
+cargo-mutants misreads the error as a caught mutant. An unscoped run makes one
+pass per group into `mutants.out/{lib,bin,bin-fast}/mutants.out/` — one level
+deeper than the group name, because cargo-mutants' `-o` names the *parent* and
+creates `mutants.out/` inside it. All gitignored.
+
+Every flag reaches all three passes, and each `==>` line echoes the flags it was
+given. That is there because they once did not: the wrapper forwarded only the
+crate list, so `--in-diff` and `--shard` were silently dropped — the per-PR job
+swept the whole workspace instead of the diff, and the weekly sweep's eight
+shards each ran the same full sweep. Both produced valid-looking results, which
+is the failure mode this document exists to distrust.
+
+A group with nothing to test under `--in-diff` or `--shard` says so and passes;
+a group that exits non-zero having written no outcomes did not run, and fails
+the sweep. Those two look identical from the filesystem alone.
 
 **Always read a sweep through `mise run mutants-gate`, never straight off the
 summary line.** The gate's first job is deciding whether the sweep can be true

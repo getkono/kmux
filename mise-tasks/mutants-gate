@@ -8,6 +8,8 @@
 #
 # `mise run mutants` writes one directory per crate-group; a scoped run writes
 # mutants.out directly. Either is fine — the gate merges whatever it is given.
+# cargo-mutants' `-o DIR` names the *parent* and creates `DIR/mutants.out/`
+# inside it, so a group's results live one level deeper than the group name.
 #
 # The believability check runs FIRST and, when it fires, the budget comparison
 # is skipped entirely. A fabricated 100% sails through any budget, and recording
@@ -25,7 +27,8 @@ for arg in "$@"; do
 done
 
 if [[ ${#dirs[@]} -eq 0 ]]; then
-    for d in mutants.out/lib mutants.out/bin mutants.out/bin-fast mutants.out; do
+    for d in mutants.out/lib/mutants.out mutants.out/bin/mutants.out \
+             mutants.out/bin-fast/mutants.out mutants.out; do
         [[ -f "$d/outcomes.json" ]] && dirs+=("$d")
     done
 fi

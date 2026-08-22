@@ -66,18 +66,43 @@ fi
 
 # Unscoped: one pass per group, each into its own output directory so the
 # per-package outcomes can be merged afterwards (mutants.out/ is gitignored).
+# Every flag the caller gave goes to all three groups. Empty-array expansion is
+# guarded below because `set -u` treats `"${a[@]}"` on an empty array as unbound
+# on bash < 4.4 (macOS ships 3.2).
+FORWARDED=("$@")
+
 # `|| true` keeps a group with surviving mutants from aborting the remaining
 # groups — cargo-mutants exits non-zero when any mutant is missed, and a sweep
 # that stops at the first crate with debt would never reach the others. The
 # authoritative pass/fail is the ratchet over the merged outcomes, not this
 # exit code.
+#
+# `$@` here is the crate list; the caller's own flags travel separately in
+# `FORWARDED`. An earlier version took only the crate list and dropped the
+# caller's flags on the floor, which meant `--in-diff pr.diff` (the per-PR CI
+# job) and `--shard n/8` (the weekly sweep) were silently ignored: the diff job
+# swept the whole workspace, and all eight shards did the same full sweep eight
+# times over. Nothing failed, so nothing said so — the same shape as the June
+# fabrication. The `==>` line now prints the flags that were actually passed,
+# so a CI log answers the question rather than implying it.
+# `-o DIR` names the *parent*: cargo-mutants creates `DIR/mutants.out/` inside
+# it. So a group's results are at `mutants.out/<group>/mutants.out/`, which is
+# what `group_outcomes` returns and what the gate is pointed at.
+group_outcomes() { echo "mutants.out/$1/mutants.out/outcomes.json"; }
+
+# Exit status per group, so "no outcomes" can be told apart from "did not run".
+declare -A GROUP_RC=()
+
 run_group() {
     local name="$1" config="$2"
     shift 2
     local pkgs=()
     for c in "$@"; do pkgs+=(-p "$c"); done
-    echo "==> mutants: $name (${#} crates, config $config)"
-    cargo mutants --config "$config" -o "mutants.out/$name" "${pkgs[@]}" || true
+    echo "==> mutants: $name (${#} crates, config $config, flags: ${FORWARDED[*]:-none})"
+    local rc=0
+    cargo mutants --config "$config" -o "mutants.out/$name" \
+        "${pkgs[@]}" ${FORWARDED[@]+"${FORWARDED[@]}"} || rc=$?
+    GROUP_RC["$name"]=$rc
 }
 
 # cargo-mutants creates its output directory but not the parent, so a fresh
@@ -94,15 +119,38 @@ echo
 # Say what is actually there. A group that failed to start leaves no
 # outcomes.json, and claiming a complete sweep over it is how a fabricated
 # result gets read as a real one.
+#
+# "No outcomes" is not by itself a failure: under `--in-diff` or `--shard` a
+# group can legitimately have nothing to test, and it says so by exiting 0.
+# What must never pass silently is a group that exited non-zero AND wrote
+# nothing — that one did not run, and its crates are unmeasured.
 produced=()
+empty=()
+failed=()
 for g in lib bin bin-fast; do
-    [[ -f "mutants.out/$g/outcomes.json" ]] && produced+=("$g")
+    if [[ -f "$(group_outcomes "$g")" ]]; then
+        produced+=("$g")
+    elif [[ "${GROUP_RC[$g]}" -eq 0 ]]; then
+        empty+=("$g")
+    else
+        failed+=("$g")
+    fi
 done
-if [[ ${#produced[@]} -eq 3 ]]; then
-    echo "Sweep complete. Per-group results under mutants.out/{lib,bin,bin-fast}/."
-else
-    echo "Sweep INCOMPLETE: outcomes for [${produced[*]:-none}] only." >&2
-    echo "Run \`mise run mutants-gate\` to judge what there is; the missing groups" >&2
-    echo "did not start, so nothing can be concluded about their crates." >&2
+
+[[ ${#produced[@]} -gt 0 ]] && echo "Measured: ${produced[*]}."
+[[ ${#empty[@]} -gt 0 ]] && echo "Nothing to test in: ${empty[*]} (scoped run)."
+if [[ ${#failed[@]} -gt 0 ]]; then
+    echo "Sweep INCOMPLETE: [${failed[*]}] exited non-zero and wrote no outcomes." >&2
+    echo "Those groups did not run, so nothing can be concluded about their crates." >&2
     exit 1
 fi
+if [[ ${#produced[@]} -eq 0 ]]; then
+    # Correct for a docs-only diff, and the shape a dropped scoping flag also
+    # takes. Said plainly rather than failed on: the gate has nothing to judge
+    # either way, and failing here would make a docs PR red.
+    echo "No mutants were generated. Expected for a diff that touches no Rust;"
+    echo "otherwise check that the scoping flags reached cargo-mutants (they are"
+    echo "echoed on each ==> line above)."
+    exit 0
+fi
+echo "Per-group results under mutants.out/{lib,bin,bin-fast}/mutants.out/."
