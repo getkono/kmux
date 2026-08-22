@@ -849,7 +849,7 @@ pub async fn handle_message<A: PaneAttacher>(
                     None => state.error(
                         Some(request_id),
                         ErrorCode::SessionNotFound,
-                        "session not found",
+                        format!("session not found: {word_id}"),
                     ),
                 }
             }
@@ -884,12 +884,12 @@ pub async fn handle_message<A: PaneAttacher>(
                     KickOutcome::SessionNotFound => state.error(
                         Some(request_id),
                         ErrorCode::SessionNotFound,
-                        "session not found",
+                        format!("session not found: {word_id}"),
                     ),
                     KickOutcome::ClientNotFound => state.error(
                         Some(request_id),
                         ErrorCode::ClientNotFound,
-                        "client not attached to session",
+                        format!("client {} not attached to session {word_id}", target.0),
                     ),
                 }
             }
@@ -2285,9 +2285,7 @@ mod tests {
         let (request_id, code, message) = only_error(msgs);
         assert_eq!(request_id, Some(18));
         assert_eq!(code, ErrorCode::SessionNotFound);
-        // SUSPECT: unlike the app-layer errors above, this message does not name
-        // the word id the client asked about.
-        assert_eq!(message, "session not found");
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
     }
 
     #[tokio::test]
@@ -2302,9 +2300,49 @@ mod tests {
         let (request_id, code, message) = only_error(msgs);
         assert_eq!(request_id, Some(19));
         assert_eq!(code, ErrorCode::SessionNotFound);
-        // SUSPECT: as with `ClientList`, neither the word id nor the target
-        // client id appears in the message.
-        assert_eq!(message, "session not found");
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    /// The other `KickClient` failure: the session is real, the client id is
+    /// not attached to it. Its message names both, so a caller looking at a log
+    /// line can tell which of the two was wrong.
+    #[tokio::test]
+    async fn kicking_a_client_that_is_not_attached_names_the_client_and_the_session() {
+        let app = Arc::new(ServerApp::new("tok".to_string()));
+        let entry = app
+            .create_session(
+                None,
+                Some("/tmp".to_string()),
+                Some("/bin/sleep".to_string()),
+                vec!["30".to_string()],
+                TermSize::default(),
+                &ClientCapabilities::default(),
+            )
+            .await
+            .expect("create_session");
+        let word = entry.meta.word_id.clone();
+
+        let (mut state, _comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::Uds);
+        authenticate(&mut state).await;
+        while ctrl_rx.try_recv().is_ok() {}
+
+        let keep = handle_message(
+            &mut state,
+            ClientMessage::KickClient {
+                request_id: 21,
+                word_id: word.clone(),
+                client_id: ClientId(42),
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(keep);
+        let (request_id, code, message) = only_error(drain(&mut ctrl_rx));
+        assert_eq!(request_id, Some(21));
+        assert_eq!(code, ErrorCode::ClientNotFound);
+        assert_eq!(message, format!("client 42 not attached to session {word}"));
+
+        let _ = app.close_session(&word).await;
     }
 
     #[tokio::test]
