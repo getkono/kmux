@@ -1635,29 +1635,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn session_close_of_an_unknown_session_reports_success() {
+    async fn session_close_of_an_unknown_session_errors_naming_the_word_id() {
         let (keep, msgs) = dispatch_one(ClientMessage::SessionClose {
             request_id: 2,
             word_id: MISSING_WORD.to_string(),
         })
         .await;
         assert!(keep);
-        // SUSPECT: closing a session that does not exist answers `SessionClosed`
-        // rather than an `Error { SessionNotFound }` — `close_session` maps the
-        // missing entry to `Ok(None)`, so the client cannot tell a real close
-        // from a typo'd word id.
-        match only(msgs) {
-            ServerMessage::SessionClosed {
-                request_id,
-                word_id,
-                exit_code,
-            } => {
-                assert_eq!(request_id, 2);
-                assert_eq!(word_id, MISSING_WORD);
-                assert_eq!(exit_code, None);
-            }
-            other => panic!("expected SessionClosed, got {other:?}"),
-        }
+        // A `SessionClosed` reply here would be indistinguishable from a real
+        // close, which is what the client treats as confirmation.
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(2));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
     }
 
     #[tokio::test]
@@ -1712,7 +1702,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn tab_close_of_an_unknown_session_reports_success() {
+    async fn tab_close_of_an_unknown_session_errors_naming_the_word_id() {
         let (keep, msgs) = dispatch_one(ClientMessage::TabClose {
             request_id: 6,
             word_id: MISSING_WORD.to_string(),
@@ -1720,21 +1710,13 @@ mod tests {
         })
         .await;
         assert!(keep);
-        // SUSPECT: like `SessionClose`, closing a tab of a session that does not
-        // exist answers `TabClosed` — `close_tab` maps both a missing session and
-        // a missing tab to `Ok(false)`.
-        match only(msgs) {
-            ServerMessage::TabClosed {
-                request_id,
-                word_id,
-                tab_index,
-            } => {
-                assert_eq!(request_id, 6);
-                assert_eq!(word_id, MISSING_WORD);
-                assert_eq!(tab_index, 0);
-            }
-            other => panic!("expected TabClosed, got {other:?}"),
-        }
+        // A `TabClosed` reply also suppresses the session-event broadcast that
+        // follows it, so the old answer was a success the rest of the fleet
+        // never heard about.
+        let (request_id, code, message) = only_error(msgs);
+        assert_eq!(request_id, Some(6));
+        assert_eq!(code, ErrorCode::SessionNotFound);
+        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
     }
 
     #[tokio::test]

@@ -15,7 +15,7 @@ use kmux_protocol::messages::{
 };
 use kmux_pty::error::{KmuxError, Result};
 
-use super::helpers::resolve_cwd;
+use super::helpers::{resolve_cwd, session_not_found, tab_not_found};
 use super::{ServerApp, TabState, layout};
 
 /// Result of removing a single pane from its tab.
@@ -116,15 +116,19 @@ impl ServerApp {
 
     /// Close an entire tab and every pane in it. If it was the session's last
     /// tab, the session is closed too. Returns `session_closed`.
+    ///
+    /// Errors if `word_id` names no live session or the session has no tab
+    /// `tab_index` — both used to answer `Ok(false)`, which is also what a
+    /// successful close of a non-final tab answers.
     pub async fn close_tab(&self, word_id: &str, tab_index: u32) -> Result<bool> {
         // Collect the tab's pane ids (under a read lock), then kill the PTYs.
         let pane_ids: Vec<(u32, String)> = {
             let sessions = self.sessions.read().await;
             let Some(state) = sessions.get(word_id) else {
-                return Ok(false);
+                return Err(session_not_found(word_id));
             };
             let Some(tab) = state.tab(tab_index) else {
-                return Ok(false);
+                return Err(tab_not_found(word_id, tab_index));
             };
             tab.layout
                 .leaves()
@@ -149,7 +153,10 @@ impl ServerApp {
         let session_closed = {
             let mut sessions = self.sessions.write().await;
             let Some(state) = sessions.get_mut(word_id) else {
-                return Ok(false);
+                // The session went away while its PTYs were being killed, which
+                // is what `session_closed` reports. Answering `false` here said
+                // the opposite.
+                return Ok(true);
             };
             for (idx, _) in &pane_ids {
                 state.panes.remove(idx);
@@ -355,5 +362,69 @@ impl ServerApp {
             tab.focused_pane = pane_index;
         }
         Ok((tab.layout.clone(), tab.focused_pane))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A session with one tab holding one pane, running a long-lived childless
+    /// process so the tab teardown is deterministic.
+    async fn app_with_one_session() -> (ServerApp, String) {
+        let app = ServerApp::new("tok".to_string());
+        let entry = app
+            .create_session(
+                None,
+                Some("/tmp".to_string()),
+                Some("/bin/sleep".to_string()),
+                vec!["30".to_string()],
+                TermSize::default(),
+                &ClientCapabilities::default(),
+            )
+            .await
+            .expect("create_session");
+        let word = entry.meta.word_id;
+        (app, word)
+    }
+
+    #[tokio::test]
+    async fn closing_a_tab_of_an_unknown_session_errors_instead_of_answering_false() {
+        let app = ServerApp::new("tok".to_string());
+        let err = app
+            .close_tab("nosuch", 0)
+            .await
+            .expect_err("a word id no session uses");
+        assert!(
+            matches!(&err, KmuxError::SessionNotFound { name } if name == "nosuch"),
+            "expected SessionNotFound naming the word id, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn closing_a_tab_a_live_session_does_not_have_errors_naming_the_tab() {
+        let (app, word) = app_with_one_session().await;
+        let err = app
+            .close_tab(&word, 7)
+            .await
+            .expect_err("tab 7 does not exist");
+        assert!(
+            matches!(&err, KmuxError::SessionNotFound { name } if *name == format!("{word} tab 7")),
+            "expected the error to locate the tab, got {err:?}"
+        );
+        // The failed close must leave the session's real tab alone.
+        assert_eq!(app.sessions.read().await[&word].tabs.len(), 1);
+
+        let _ = app.close_session(&word).await;
+    }
+
+    /// The happy path the not-found errors have to stay distinguishable from:
+    /// closing the only tab closes the session and answers `true`.
+    #[tokio::test]
+    async fn closing_the_last_tab_closes_the_session() {
+        let (app, word) = app_with_one_session().await;
+        let session_closed = app.close_tab(&word, 0).await.expect("close_tab");
+        assert!(session_closed, "the session had no other tab");
+        assert!(app.sessions.read().await.get(&word).is_none());
     }
 }

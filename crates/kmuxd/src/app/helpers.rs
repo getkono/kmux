@@ -17,6 +17,26 @@ pub(super) fn pane_not_found(pane_id: &str) -> KmuxError {
     }
 }
 
+/// The error every session lookup answers with when `word_id` names no live
+/// session.
+pub(super) fn session_not_found(word_id: &str) -> KmuxError {
+    KmuxError::SessionNotFound {
+        name: word_id.to_string(),
+    }
+}
+
+/// The error every tab lookup answers with when a live session has no tab
+/// `tab_index`.
+///
+/// The wire has no `ErrorCode::TabNotFound`, so this stays a `SessionNotFound`
+/// whose name locates the tab — the shape every tab-scoped operation in this
+/// module already built by hand.
+pub(super) fn tab_not_found(word_id: &str, tab_index: u32) -> KmuxError {
+    KmuxError::SessionNotFound {
+        name: format!("{word_id} tab {tab_index}"),
+    }
+}
+
 /// Re-label a PTY-registry miss as a pane miss.
 ///
 /// [`kmux_pty::registry::SessionManager`] is a registry of *named* PTYs and
