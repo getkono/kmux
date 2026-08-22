@@ -736,13 +736,15 @@ pub(crate) fn apply_hint_to_buffer(buffer: &str, hint: &cmd::hint::Hint) -> Stri
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::cmd::hint::Hint;
+pub(super) mod testing {
+    //! Fixtures shared by every action-handler test module.
+
     use kmux_client::session_manager::SessionManager;
     use kmux_protocol::messages::ClientCapabilities;
 
-    fn fixture_core() -> AppCore {
+    use super::super::AppCore;
+
+    pub(super) fn fixture_core() -> AppCore {
         let mgr = SessionManager::new(
             "127.0.0.1".into(),
             0,
@@ -754,7 +756,7 @@ mod tests {
     }
 
     /// A connected core with one active pane carrying `status` (issue #86 tests).
-    fn core_with_active_pane(status: kmux_protocol::messages::SessionStatus) -> AppCore {
+    pub(super) fn core_with_active_pane(status: kmux_protocol::messages::SessionStatus) -> AppCore {
         use kmux_protocol::messages::{
             LayoutNode, PaneInfo, SessionEntry, SessionMeta, TabInfo, TermSize,
         };
@@ -790,6 +792,13 @@ mod tests {
         core.mgr.active_pane = Some("eagle/0".into());
         core
     }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::testing::*;
+    use super::*;
+    use crate::cmd::hint::Hint;
 
     #[test]
     fn close_pane_defers_then_undo_keeps_the_pane() {

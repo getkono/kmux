@@ -62,6 +62,12 @@ pub struct PendingClose {
 /// This is the core → frontend control-flow channel: the frontend matches on
 /// it and performs the toolkit-specific follow-up (replace the server-message
 /// channel, exit the loop, …).
+///
+/// `Debug + PartialEq` because it is the value every action handler returns:
+/// without them an effect can only be pattern-matched, never asserted on, and
+/// the difference between "this action reconnects" and "this action does
+/// nothing" is exactly what a test needs to state.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyResult {
     Continue,
     Quit,

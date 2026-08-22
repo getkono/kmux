@@ -174,7 +174,7 @@ count = 2
 [[lints]]
 crate = "kmux-app"
 lint = "missing_debug_implementations"
-count = 19
+count = 18
 
 [[lints]]
 crate = "kmux-app"

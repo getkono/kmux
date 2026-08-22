@@ -23,3 +23,34 @@ impl AppCore {
         KeyResult::Continue
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::super::testing::fixture_core;
+    use super::*;
+
+    /// The frontend owns the renderer object, so the core cannot rebuild it —
+    /// it asks, via the return value, and sets the repaint flag it does own.
+    #[test]
+    fn resetting_the_renderer_asks_the_frontend_and_forces_a_repaint() {
+        let mut core = fixture_core();
+        core.force_clear = false;
+        assert_eq!(core.on_reset_renderer(), KeyResult::ResetRenderer);
+        assert!(core.force_clear, "the next frame must be a full repaint");
+    }
+
+    /// The flag is the core's; the daemon learns about it through the manager.
+    /// Toggling has to do both, in both directions — a toggle that only ever
+    /// turns snapshot mode *on* would pass a one-way test.
+    #[test]
+    fn snapshot_mode_toggles_in_both_directions() {
+        let mut core = fixture_core();
+        assert!(!core.force_snapshot_mode, "off by default");
+
+        assert_eq!(core.on_toggle_snapshot_mode(), KeyResult::Continue);
+        assert!(core.force_snapshot_mode);
+
+        core.on_toggle_snapshot_mode();
+        assert!(!core.force_snapshot_mode, "and back off again");
+    }
+}
