@@ -933,3 +933,1591 @@ impl SessionManager {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Characterization tests: one per arm of [`SessionManager::handle_server_message`].
+    //!
+    //! `handle_server_message` is a 753-line match over 47 `ServerMessage`
+    //! variants, and cargo-mutants generates one body-replacement mutant per
+    //! *function* — so the whole dispatcher yields exactly ONE mutant, which any
+    //! single test kills. These tests pin what each arm does today (the returned
+    //! `Vec<SessionEvent>` *and* the state it leaves behind) so the dispatcher can
+    //! be split into per-domain handlers without changing behaviour.
+    //!
+    //! Every expectation here was recorded empirically, not designed. Where the
+    //! observed behaviour looks wrong it is marked `// SUSPECT:` and left alone.
+
+    use kmux_protocol::messages::{
+        ClientCapabilities, ClientInfo, ClosedSessionEntry, ConnectionId, CursorState,
+        FrontendKind, LayoutNode, SessionEntry, SessionMeta, SplitDir, TabInfo, TermModes,
+        TermSize, TransportKind,
+    };
+    use tokio::sync::mpsc;
+
+    use super::*;
+    use crate::grid::CellGrid;
+
+    // ── Fixtures ────────────────────────────────────────────────────────────
+    //
+    // Deliberately local rather than shared with `session_manager/mod.rs`: this
+    // commit is a pure addition, and R1 of docs/testing.md wants a subject's
+    // tests in the subject's own file.
+
+    fn make_manager() -> SessionManager {
+        let mut mgr = SessionManager::new(
+            "127.0.0.1".to_string(),
+            8443,
+            "test-token".to_string(),
+            false,
+            ClientCapabilities::default(),
+        );
+        // Tag a transport so the per-message inbound accounting every arm shares
+        // is observable as a value (`inbound_msgs`).
+        mgr.tag_transport(TransportKind::Uds);
+        mgr
+    }
+
+    fn make_connected_manager() -> (SessionManager, mpsc::UnboundedReceiver<ClientMessage>) {
+        let mut mgr = make_manager();
+        let (tx, rx) = mpsc::unbounded_channel();
+        mgr.ws_sender = Some(tx);
+        mgr.connected = true;
+        (mgr, rx)
+    }
+
+    fn pane(word_id: &str, index: u32) -> PaneInfo {
+        PaneInfo {
+            pane_id: kmux_protocol::format_pane_id(word_id, index),
+            pane_index: index,
+            program: String::new(),
+            size: TermSize::default(),
+            attached_clients: vec![],
+            status: SessionStatus::Running,
+            title: String::new(),
+            progress_state: PaneProgressState::default(),
+            progress: None,
+        }
+    }
+
+    fn tab(tab_index: u32, layout: LayoutNode, focused_pane: u32) -> TabInfo {
+        TabInfo {
+            tab_index,
+            name: format!("{}", tab_index + 1),
+            layout,
+            focused_pane,
+        }
+    }
+
+    /// A session with one pane and one single-leaf tab.
+    fn make_entry(word_id: &str) -> SessionEntry {
+        SessionEntry {
+            meta: SessionMeta {
+                index: 0,
+                word_id: word_id.to_string(),
+                name: word_id.to_string(),
+                cwd: "/tmp".to_string(),
+            },
+            panes: vec![pane(word_id, 0)],
+            tabs: vec![tab(0, LayoutNode::single(0), 0)],
+            active_tab: 0,
+            peer: None,
+        }
+    }
+
+    /// A manager holding `word_id` as its selected session, with the session's
+    /// only pane focused. The outbound receiver is returned so attach/detach
+    /// traffic an arm generates can be asserted on.
+    fn manager_on(word_id: &str) -> (SessionManager, mpsc::UnboundedReceiver<ClientMessage>) {
+        let (mut mgr, rx) = make_connected_manager();
+        mgr.session_list.push(make_entry(word_id));
+        mgr.select_session(word_id.to_string());
+        (mgr, rx)
+    }
+
+    /// Park `pane_id` in `Synced { expected: seqno }` with a local grid, which is
+    /// the precondition every seqno-carrying arm checks.
+    fn synced_pane(mgr: &mut SessionManager, pane_id: &str, expected: u64) {
+        mgr.buffers.insert(pane_id.to_string(), CellGrid::new(4, 8));
+        mgr.pane_sync.insert(
+            pane_id.to_string(),
+            PaneSync::Synced {
+                expected: SequenceNo(expected),
+            },
+        );
+    }
+
+    /// An empty scrollback line (`Arc<[CellState]>`), the wire's line type.
+    fn sb_line() -> kmux_protocol::messages::ScrollbackLine {
+        Arc::from(Vec::new())
+    }
+
+    /// The pane's next-expected seqno, or `None` when it is awaiting a resync.
+    fn expected_seqno(mgr: &SessionManager, pane_id: &str) -> Option<u64> {
+        match mgr.pane_sync.get(pane_id) {
+            Some(PaneSync::Synced { expected }) => Some(expected.0),
+            _ => None,
+        }
+    }
+
+    fn awaiting_sync(mgr: &SessionManager, pane_id: &str) -> bool {
+        matches!(mgr.pane_sync.get(pane_id), Some(PaneSync::AwaitingSync))
+    }
+
+    /// Total inbound messages accounted to the tagged transport. Every arm
+    /// shares the accounting at the top of the dispatcher, so this is the value
+    /// that proves a "does nothing" arm still ran.
+    fn inbound_msgs(mgr: &SessionManager) -> u64 {
+        mgr.metrics
+            .network
+            .snapshot_by_transport()
+            .iter()
+            .map(|(_, c)| c.msgs_in)
+            .sum()
+    }
+
+    fn resyncs(mgr: &SessionManager) -> u64 {
+        mgr.metrics.snapshot(false).counters.resyncs
+    }
+
+    fn lag_events(mgr: &SessionManager) -> u64 {
+        mgr.metrics.snapshot(false).counters.lag_events
+    }
+
+    fn stale_discards(mgr: &SessionManager) -> u64 {
+        mgr.metrics.snapshot(false).counters.stale_discards
+    }
+
+    /// Everything an arm could observably touch, as one comparable value — so an
+    /// arm that does nothing is pinned by an `assert_eq!` rather than by the
+    /// absence of assertions (R2).
+    #[derive(Debug, PartialEq, Eq)]
+    struct Observable {
+        sessions: Vec<String>,
+        closed_sessions: usize,
+        process_overview: usize,
+        client_list: usize,
+        client_list_word: Option<String>,
+        status_msg: String,
+        active_session: Option<String>,
+        active_tab: Option<u32>,
+        active_pane: Option<String>,
+        visible_panes: Vec<String>,
+        buffers: Vec<String>,
+        attention_panes: Vec<String>,
+        input_locked: Vec<(String, bool)>,
+        dir_listing_path: Option<String>,
+    }
+
+    fn observe(mgr: &SessionManager) -> Observable {
+        let mut buffers: Vec<String> = mgr.buffers.keys().cloned().collect();
+        buffers.sort();
+        let mut attention_panes: Vec<String> = mgr.attention_panes.iter().cloned().collect();
+        attention_panes.sort();
+        let mut input_locked: Vec<(String, bool)> = mgr
+            .input_locked
+            .iter()
+            .map(|(k, v)| (k.clone(), *v))
+            .collect();
+        input_locked.sort();
+        Observable {
+            sessions: mgr
+                .session_list
+                .iter()
+                .map(|e| e.meta.word_id.clone())
+                .collect(),
+            closed_sessions: mgr.closed_sessions.len(),
+            process_overview: mgr.process_overview.len(),
+            client_list: mgr.client_list.len(),
+            client_list_word: mgr.client_list_word.clone(),
+            status_msg: mgr.status_msg.clone(),
+            active_session: mgr.active_session.clone(),
+            active_tab: mgr.active_tab,
+            active_pane: mgr.active_pane.clone(),
+            visible_panes: mgr.visible_panes.clone(),
+            buffers,
+            attention_panes,
+            input_locked,
+            dir_listing_path: mgr.dir_listing.as_ref().map(|d| d.path.clone()),
+        }
+    }
+
+    /// Every outbound message queued so far, in order.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<ClientMessage>) -> Vec<ClientMessage> {
+        let mut out = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            out.push(msg);
+        }
+        out
+    }
+
+    // ── ChannelSwitched ─────────────────────────────────────────────────────
+
+    #[test]
+    fn channel_switched_only_logs_and_changes_no_client_state() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+        let before = observe(&mgr);
+        let transport_before = mgr.current_transport;
+
+        let events = mgr.handle_server_message(ServerMessage::ChannelSwitched {
+            old_transport: "quic".to_string(),
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(observe(&mgr), before, "the arm is log-only");
+        assert_eq!(mgr.current_transport, transport_before);
+        // SUSPECT: `ChannelSwitched`'s protocol doc says "the client should close
+        // the old transport after receiving this", but the arm neither closes it
+        // nor tells anyone to — nothing is sent and no state moves. The old
+        // channel is only dropped if `apply_transport_upgrade` already replaced
+        // the sender, which this message cannot verify.
+        assert!(drain(&mut rx).is_empty(), "nothing is sent in reply");
+        assert_eq!(inbound_msgs(&mgr), 1, "the frame is still accounted");
+    }
+
+    // ── ClosedSessionListResult ─────────────────────────────────────────────
+
+    #[test]
+    fn closed_session_list_result_replaces_the_graveyard_and_emits_nothing() {
+        let mut mgr = make_manager();
+        mgr.closed_sessions.push(ClosedSessionEntry {
+            meta: SessionMeta {
+                index: 0,
+                word_id: "stale".to_string(),
+                name: "stale".to_string(),
+                cwd: "/tmp".to_string(),
+            },
+            last_active_ms: 1,
+            closed_at_ms: 2,
+            pane_count: 1,
+        });
+
+        let events = mgr.handle_server_message(ServerMessage::ClosedSessionListResult {
+            request_id: 7,
+            sessions: vec![ClosedSessionEntry {
+                meta: SessionMeta {
+                    index: 0,
+                    word_id: "otter".to_string(),
+                    name: "otter".to_string(),
+                    cwd: "/home".to_string(),
+                },
+                last_active_ms: 10,
+                closed_at_ms: 20,
+                pane_count: 3,
+            }],
+        });
+
+        // SUSPECT: the graveyard is replaced but no `SessionEvent` is emitted, so
+        // a caller that issued `request_closed_sessions` has nothing to react to
+        // — unlike `SessionListResult` and `ProcessOverviewResult`, which both
+        // emit a "…Received" event. The launcher has to poll.
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        let closed = mgr.closed_session_list();
+        assert_eq!(closed.len(), 1, "the previous list is replaced, not merged");
+        assert_eq!(closed[0].meta.word_id, "otter");
+        assert_eq!(closed[0].pane_count, 3);
+    }
+
+    // ── PaneClosed ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn pane_closed_forgets_the_pane_and_emits_pane_closed() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        synced_pane(&mut mgr, "eagle/0", 5);
+        mgr.input_locked.insert("eagle/0".to_string(), true);
+        mgr.in_flight_history_fetches
+            .insert("eagle/0".to_string(), 3);
+        mgr.active_pane = None;
+
+        let events = mgr.handle_server_message(ServerMessage::PaneClosed {
+            request_id: 1,
+            pane_id: "eagle/0".to_string(),
+            exit_code: Some(0),
+        });
+
+        assert!(
+            matches!(events.as_slice(), [SessionEvent::PaneClosed { pane_id }] if pane_id == "eagle/0"),
+            "{events:?}"
+        );
+        assert!(mgr.buffer("eagle/0").is_none(), "the buffer is dropped");
+        assert!(!mgr.pane_sync.contains_key("eagle/0"));
+        assert!(!mgr.is_input_locked("eagle/0"));
+        assert!(!mgr.in_flight_history_fetches.contains_key("eagle/0"));
+        assert!(
+            mgr.session_list[0].panes.is_empty(),
+            "the pane leaves the cached session entry"
+        );
+        // SUSPECT: only `panes` is pruned — the tab's layout tree still names
+        // pane index 0, so `visible_panes` / `tab_view` keep reporting a pane the
+        // client has just forgotten, until a `LayoutUpdate` arrives.
+        assert_eq!(mgr.session_list[0].tabs[0].layout.leaves(), vec![0]);
+        assert_eq!(mgr.visible_panes(), ["eagle/0"]);
+    }
+
+    #[test]
+    fn pane_closed_of_the_active_pane_falls_back_to_a_surviving_pane() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        let mut entry = make_entry("eagle");
+        entry.panes.push(pane("eagle", 1));
+        entry.tabs[0].layout = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![500, 500],
+            children: vec![LayoutNode::single(0), LayoutNode::single(1)],
+        };
+        mgr.session_list.push(entry);
+        mgr.select_session("eagle".to_string());
+        assert_eq!(mgr.active_pane_id(), Some("eagle/0"));
+        drain(&mut rx);
+
+        let events = mgr.handle_server_message(ServerMessage::PaneClosed {
+            request_id: 2,
+            pane_id: "eagle/0".to_string(),
+            exit_code: None,
+        });
+
+        assert!(
+            matches!(events.as_slice(), [SessionEvent::PaneClosed { pane_id }] if pane_id == "eagle/0"),
+            "{events:?}"
+        );
+        assert_eq!(mgr.active_session(), Some("eagle"));
+        assert_eq!(mgr.active_pane_id(), Some("eagle/1"));
+        assert!(
+            awaiting_sync(&mgr, "eagle/1"),
+            "the fallback pane is re-attached fresh"
+        );
+        assert!(
+            drain(&mut rx).iter().any(
+                |m| matches!(m, ClientMessage::Attach { pane_id, .. } if pane_id == "eagle/1")
+            ),
+            "the fallback pane is attached on the wire"
+        );
+    }
+
+    #[test]
+    fn pane_closed_of_the_only_pane_clears_the_active_session_and_pane() {
+        let (mut mgr, _rx) = manager_on("eagle");
+
+        let events = mgr.handle_server_message(ServerMessage::PaneClosed {
+            request_id: 3,
+            pane_id: "eagle/0".to_string(),
+            exit_code: Some(1),
+        });
+
+        assert!(
+            matches!(events.as_slice(), [SessionEvent::PaneClosed { pane_id }] if pane_id == "eagle/0"),
+            "{events:?}"
+        );
+        assert_eq!(mgr.active_session(), None);
+        assert_eq!(mgr.active_pane_id(), None);
+        // SUSPECT: `active_tab` and `visible_panes` are left pointing at the
+        // session that just lost its last pane, so the client still believes it
+        // is viewing tab 0 of a session it no longer considers active.
+        assert_eq!(mgr.active_tab(), Some(0));
+        assert_eq!(mgr.visible_panes(), ["eagle/0"]);
+    }
+
+    // ── TabCreated ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn tab_created_in_the_active_session_appends_the_tab_and_selects_it() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        mgr.session_list[0].panes.push(pane("eagle", 1));
+        drain(&mut rx);
+
+        let events = mgr.handle_server_message(ServerMessage::TabCreated {
+            request_id: 4,
+            word_id: "eagle".to_string(),
+            tab: tab(1, LayoutNode::single(1), 1),
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(
+            mgr.session_list[0]
+                .tabs
+                .iter()
+                .map(|t| t.tab_index)
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(mgr.active_tab(), Some(1));
+        assert_eq!(mgr.visible_panes(), ["eagle/1"]);
+        assert_eq!(mgr.active_pane_id(), Some("eagle/1"));
+        let sent = drain(&mut rx);
+        assert!(
+            sent.iter()
+                .any(|m| matches!(m, ClientMessage::Detach { pane_id } if pane_id == "eagle/0")),
+            "the old tab's pane is detached: {sent:?}"
+        );
+        assert!(
+            sent.iter().any(
+                |m| matches!(m, ClientMessage::Attach { pane_id, .. } if pane_id == "eagle/1")
+            ),
+            "the new tab's pane is attached: {sent:?}"
+        );
+    }
+
+    #[test]
+    fn tab_created_for_an_unknown_session_is_dropped_entirely() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+        let before = observe(&mgr);
+
+        let events = mgr.handle_server_message(ServerMessage::TabCreated {
+            request_id: 5,
+            word_id: "nosuch".to_string(),
+            tab: tab(9, LayoutNode::single(0), 0),
+        });
+
+        // SUSPECT: an unknown session silently discards the tab — no error, no
+        // event, no session-list refresh to reconcile against. The client's cache
+        // stays permanently short of a tab the daemon believes exists.
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(observe(&mgr), before);
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    // ── PaneSplit ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn pane_split_records_the_new_pane_and_focuses_it_in_the_active_tab() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+
+        let events = mgr.handle_server_message(ServerMessage::PaneSplit {
+            request_id: 6,
+            word_id: "eagle".to_string(),
+            tab_index: 0,
+            new_pane: pane("eagle", 1),
+            layout: LayoutNode::Split {
+                dir: SplitDir::Vertical,
+                ratios: vec![500, 500],
+                children: vec![LayoutNode::single(0), LayoutNode::single(1)],
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert!(
+            mgr.buffer("eagle/1").is_some(),
+            "the new pane gets a buffer"
+        );
+        assert_eq!(
+            mgr.session_list[0]
+                .panes
+                .iter()
+                .map(|p| p.pane_id.clone())
+                .collect::<Vec<_>>(),
+            vec!["eagle/0".to_string(), "eagle/1".to_string()]
+        );
+        assert_eq!(mgr.session_list[0].tabs[0].focused_pane, 1);
+        assert_eq!(mgr.visible_panes(), ["eagle/0", "eagle/1"]);
+        assert_eq!(mgr.active_pane_id(), Some("eagle/1"));
+        assert!(
+            drain(&mut rx).iter().any(
+                |m| matches!(m, ClientMessage::Attach { pane_id, .. } if pane_id == "eagle/1")
+            ),
+            "the sibling stays attached; only the new pane is attached"
+        );
+    }
+
+    #[test]
+    fn pane_split_for_an_unviewed_tab_updates_the_cache_without_retargeting_the_view() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        mgr.session_list[0]
+            .tabs
+            .push(tab(1, LayoutNode::single(1), 1));
+        drain(&mut rx);
+
+        let events = mgr.handle_server_message(ServerMessage::PaneSplit {
+            request_id: 7,
+            word_id: "eagle".to_string(),
+            tab_index: 1,
+            new_pane: pane("eagle", 2),
+            layout: LayoutNode::Split {
+                dir: SplitDir::Vertical,
+                ratios: vec![500, 500],
+                children: vec![LayoutNode::single(1), LayoutNode::single(2)],
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert!(
+            mgr.buffer("eagle/2").is_some(),
+            "the buffer is created even for an unviewed tab"
+        );
+        assert_eq!(mgr.session_list[0].tabs[1].focused_pane, 2);
+        assert_eq!(mgr.visible_panes(), ["eagle/0"], "the view is untouched");
+        assert_eq!(mgr.active_pane_id(), Some("eagle/0"));
+        assert!(drain(&mut rx).is_empty(), "no attach for an unviewed tab");
+    }
+
+    // ── CursorUpdate ────────────────────────────────────────────────────────
+
+    #[test]
+    fn cursor_update_applies_the_cursor_and_advances_the_expected_seqno() {
+        let mut mgr = make_manager();
+        synced_pane(&mut mgr, "eagle/0", 5);
+
+        let events = mgr.handle_server_message(ServerMessage::CursorUpdate {
+            pane_id: "eagle/0".to_string(),
+            cursor: CursorState {
+                row: 2,
+                col: 3,
+                ..Default::default()
+            },
+            modes: TermModes(TermModes::APP_CURSOR),
+            seqno: SequenceNo(5),
+            sent_at_ms: 1,
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        let grid = mgr.buffer("eagle/0").expect("buffer exists");
+        assert_eq!((grid.cursor().row, grid.cursor().col), (2, 3));
+        assert!(grid.app_cursor(), "modes are applied alongside the cursor");
+        assert_eq!(expected_seqno(&mgr, "eagle/0"), Some(6));
+    }
+
+    #[test]
+    fn cursor_update_for_a_pane_awaiting_sync_is_discarded_and_counted() {
+        let mut mgr = make_manager();
+        mgr.buffers
+            .insert("eagle/0".to_string(), CellGrid::new(4, 8));
+        mgr.pane_sync
+            .insert("eagle/0".to_string(), PaneSync::AwaitingSync);
+
+        let events = mgr.handle_server_message(ServerMessage::CursorUpdate {
+            pane_id: "eagle/0".to_string(),
+            cursor: CursorState {
+                row: 2,
+                col: 3,
+                ..Default::default()
+            },
+            modes: TermModes::EMPTY,
+            seqno: SequenceNo(5),
+            sent_at_ms: 1,
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(stale_discards(&mgr), 1, "the discard is counted");
+        let grid = mgr.buffer("eagle/0").expect("buffer exists");
+        assert_eq!((grid.cursor().row, grid.cursor().col), (0, 0));
+        assert!(
+            awaiting_sync(&mgr, "eagle/0"),
+            "still awaiting the snapshot"
+        );
+    }
+
+    #[test]
+    fn cursor_update_with_a_seqno_gap_resyncs_the_pane() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        synced_pane(&mut mgr, "eagle/0", 5);
+
+        let events = mgr.handle_server_message(ServerMessage::CursorUpdate {
+            pane_id: "eagle/0".to_string(),
+            cursor: CursorState::default(),
+            modes: TermModes::EMPTY,
+            seqno: SequenceNo(9),
+            sent_at_ms: 1,
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(resyncs(&mgr), 1);
+        assert!(awaiting_sync(&mgr, "eagle/0"));
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|m| matches!(m, ClientMessage::Attach { pane_id, last_seqno: None, .. } if pane_id == "eagle/0")),
+            "a gap re-attaches from scratch"
+        );
+    }
+
+    // ── SyncReset ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn sync_reset_clears_the_grid_and_parks_the_pane_awaiting_sync() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        synced_pane(&mut mgr, "eagle/0", 5);
+        mgr.in_flight_history_fetches
+            .insert("eagle/0".to_string(), 11);
+        mgr.buffers
+            .get_mut("eagle/0")
+            .expect("buffer exists")
+            .apply_cursor_update(
+                CursorState {
+                    row: 3,
+                    col: 3,
+                    ..Default::default()
+                },
+                TermModes::EMPTY,
+            );
+
+        let events = mgr.handle_server_message(ServerMessage::SyncReset {
+            pane_id: "eagle/0".to_string(),
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert!(awaiting_sync(&mgr, "eagle/0"));
+        assert_eq!(resyncs(&mgr), 1);
+        assert!(!mgr.in_flight_history_fetches.contains_key("eagle/0"));
+        let grid = mgr.buffer("eagle/0").expect("buffer exists");
+        assert_eq!((grid.cursor().row, grid.cursor().col), (0, 0));
+        // SUSPECT: unlike `Lagged` and the digest-mismatch path, `SyncReset` does
+        // not re-attach — it only parks the pane. The client sits in
+        // `AwaitingSync` (discarding everything) until the server volunteers a
+        // snapshot; if the server's `SyncReset` was not followed by one, the pane
+        // is dark forever with no client-side recovery.
+        assert!(drain(&mut rx).is_empty(), "nothing is sent in reply");
+    }
+
+    // ── SessionRenamed (event form and message form share one arm) ──────────
+
+    #[test]
+    fn session_renamed_event_updates_the_cached_name_and_emits_session_renamed() {
+        let (mut mgr, _rx) = manager_on("eagle");
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::SessionRenamed {
+                word_id: "eagle".to_string(),
+                new_name: "builds".to_string(),
+            },
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::SessionRenamed { word_id, new_name }]
+                    if word_id == "eagle" && new_name == "builds"
+            ),
+            "{events:?}"
+        );
+        assert_eq!(mgr.session_list[0].meta.name, "builds");
+    }
+
+    #[test]
+    fn session_renamed_message_takes_the_same_path_as_the_event() {
+        let (mut mgr, _rx) = manager_on("eagle");
+
+        let events = mgr.handle_server_message(ServerMessage::SessionRenamed {
+            word_id: "eagle".to_string(),
+            new_name: "builds".to_string(),
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::SessionRenamed { word_id, new_name }]
+                    if word_id == "eagle" && new_name == "builds"
+            ),
+            "{events:?}"
+        );
+        assert_eq!(mgr.session_list[0].meta.name, "builds");
+    }
+
+    #[test]
+    fn session_renamed_for_an_unknown_session_still_emits_the_rename() {
+        let (mut mgr, _rx) = manager_on("eagle");
+
+        let events = mgr.handle_server_message(ServerMessage::SessionRenamed {
+            word_id: "nosuch".to_string(),
+            new_name: "builds".to_string(),
+        });
+
+        // SUSPECT: a rename of a session the client has never heard of is
+        // reported to the UI as a successful rename, indistinguishable from a
+        // real one, while no cached name changed.
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::SessionRenamed { word_id, .. }] if word_id == "nosuch"
+            ),
+            "{events:?}"
+        );
+        assert_eq!(mgr.session_list[0].meta.name, "eagle");
+    }
+
+    // ── Event::TabRenamed ───────────────────────────────────────────────────
+
+    #[test]
+    fn tab_renamed_event_updates_the_cached_tab_name_and_emits_nothing() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        assert_eq!(mgr.session_list[0].tabs[0].name, "1");
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::TabRenamed {
+                word_id: "eagle".to_string(),
+                tab_index: 0,
+                name: "logs".to_string(),
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(mgr.session_list[0].tabs[0].name, "logs");
+        assert_eq!(mgr.active_tab_name().as_deref(), Some("logs"));
+    }
+
+    #[test]
+    fn tab_renamed_event_for_an_unknown_tab_changes_nothing() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        let before = observe(&mgr);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::TabRenamed {
+                word_id: "eagle".to_string(),
+                tab_index: 99,
+                name: "logs".to_string(),
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(observe(&mgr), before);
+        assert_eq!(mgr.session_list[0].tabs[0].name, "1");
+    }
+
+    // ── Event::TabsReordered ────────────────────────────────────────────────
+
+    #[test]
+    fn tabs_reordered_event_sorts_the_cached_tabs_into_the_given_order() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        mgr.session_list[0]
+            .tabs
+            .push(tab(1, LayoutNode::single(1), 1));
+        mgr.session_list[0]
+            .tabs
+            .push(tab(2, LayoutNode::single(2), 2));
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::TabsReordered {
+                word_id: "eagle".to_string(),
+                tab_indices: vec![2, 0, 1],
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(
+            mgr.session_list[0]
+                .tabs
+                .iter()
+                .map(|t| t.tab_index)
+                .collect::<Vec<_>>(),
+            vec![2, 0, 1]
+        );
+        assert_eq!(mgr.active_tab(), Some(0), "the viewed tab is unchanged");
+    }
+
+    #[test]
+    fn tabs_reordered_event_pushes_an_unlisted_tab_to_the_end() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        mgr.session_list[0]
+            .tabs
+            .push(tab(1, LayoutNode::single(1), 1));
+        mgr.session_list[0]
+            .tabs
+            .push(tab(2, LayoutNode::single(2), 2));
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::TabsReordered {
+                word_id: "eagle".to_string(),
+                tab_indices: vec![2, 0],
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        // SUSPECT: a tab missing from the daemon's order sorts to `usize::MAX`
+        // and silently moves to the end rather than being treated as a stale
+        // broadcast the client should ignore or refresh from.
+        assert_eq!(
+            mgr.session_list[0]
+                .tabs
+                .iter()
+                .map(|t| t.tab_index)
+                .collect::<Vec<_>>(),
+            vec![2, 0, 1]
+        );
+    }
+
+    // ── Event::PaneResized ──────────────────────────────────────────────────
+
+    #[test]
+    fn pane_resized_event_resizes_the_buffer_and_emits_nothing() {
+        let mut mgr = make_manager();
+        mgr.buffers
+            .insert("eagle/0".to_string(), CellGrid::new(4, 8));
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneResized {
+                pane_id: "eagle/0".to_string(),
+                size: TermSize {
+                    rows: 40,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        let grid = mgr.buffer("eagle/0").expect("buffer exists");
+        assert_eq!((grid.rows, grid.cols), (40, 120));
+    }
+
+    #[test]
+    fn pane_resized_event_for_an_unbuffered_pane_creates_nothing() {
+        let mut mgr = make_manager();
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneResized {
+                pane_id: "eagle/0".to_string(),
+                size: TermSize {
+                    rows: 40,
+                    cols: 120,
+                    pixel_width: 0,
+                    pixel_height: 0,
+                },
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert!(mgr.buffer("eagle/0").is_none(), "no buffer is conjured");
+        assert_eq!(inbound_msgs(&mgr), 1);
+    }
+
+    // ── Event::PaneTitleChanged ─────────────────────────────────────────────
+
+    #[test]
+    fn pane_title_changed_event_caches_the_title_and_emits_it() {
+        let (mut mgr, _rx) = manager_on("eagle");
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneTitleChanged {
+                pane_id: "eagle/0".to_string(),
+                title: "vim README.md".to_string(),
+            },
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::PaneTitleChanged { pane_id, title }]
+                    if pane_id == "eagle/0" && title == "vim README.md"
+            ),
+            "{events:?}"
+        );
+        assert_eq!(
+            mgr.pane_info("eagle/0").map(|p| p.title.as_str()),
+            Some("vim README.md")
+        );
+    }
+
+    #[test]
+    fn pane_title_changed_event_for_an_unknown_pane_still_emits_the_title() {
+        let (mut mgr, _rx) = manager_on("eagle");
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneTitleChanged {
+                pane_id: "nosuch/0".to_string(),
+                title: "vim".to_string(),
+            },
+        });
+
+        // SUSPECT: nothing is cached (there is no such pane) yet the frontend is
+        // told a title changed, so a stale broadcast can retitle whatever the UI
+        // happens to key the event to.
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::PaneTitleChanged { pane_id, .. }] if pane_id == "nosuch/0"
+            ),
+            "{events:?}"
+        );
+        assert_eq!(mgr.pane_info("eagle/0").map(|p| p.title.as_str()), Some(""));
+    }
+
+    // ── Event::PaneBell ─────────────────────────────────────────────────────
+
+    #[test]
+    fn pane_bell_event_marks_the_pane_for_attention_and_emits_pane_bell() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        assert!(!mgr.pane_needs_attention("eagle/0"));
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneBell {
+                pane_id: "eagle/0".to_string(),
+            },
+        });
+
+        assert!(
+            matches!(events.as_slice(), [SessionEvent::PaneBell { pane_id }] if pane_id == "eagle/0"),
+            "{events:?}"
+        );
+        assert!(mgr.pane_needs_attention("eagle/0"));
+    }
+
+    // ── Event::PaneProgressChanged ──────────────────────────────────────────
+
+    #[test]
+    fn pane_progress_changed_event_caches_the_state_and_emits_it() {
+        let (mut mgr, _rx) = manager_on("eagle");
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneProgressChanged {
+                pane_id: "eagle/0".to_string(),
+                state: PaneProgressState::Set,
+                progress: Some(42),
+            },
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::PaneProgressChanged { pane_id, state, progress }]
+                    if pane_id == "eagle/0"
+                        && *state == PaneProgressState::Set
+                        && *progress == Some(42)
+            ),
+            "{events:?}"
+        );
+        let info = mgr.pane_info("eagle/0").expect("pane is cached");
+        assert_eq!(info.progress_state, PaneProgressState::Set);
+        assert_eq!(info.progress, Some(42));
+    }
+
+    // ── Event::PaneClipboardCopy ────────────────────────────────────────────
+
+    #[test]
+    fn pane_clipboard_copy_event_relays_the_payload_undecoded_and_uncached() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        let before = observe(&mgr);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneClipboardCopy {
+                pane_id: "eagle/0".to_string(),
+                selection: "c".to_string(),
+                data: "aGVsbG8=".to_string(),
+            },
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::ClipboardCopy { pane_id, selection, data }]
+                    if pane_id == "eagle/0" && selection == "c" && data == "aGVsbG8="
+            ),
+            "the base64 payload is relayed verbatim: {events:?}"
+        );
+        assert_eq!(observe(&mgr), before, "a pure relay caches nothing");
+    }
+
+    // ── Event::PaneAttention ────────────────────────────────────────────────
+
+    #[test]
+    fn pane_attention_event_derives_the_word_id_from_the_pane_id() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        let before = observe(&mgr);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneAttention {
+                pane_id: "eagle/0".to_string(),
+                kind: AttentionKind::NeedsInput,
+                title: "kmux".to_string(),
+                body: "needs input".to_string(),
+                attention_id: 77,
+            },
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::PaneAttention {
+                    word_id, pane_id, kind, title, body, attention_id,
+                }] if word_id == "eagle"
+                    && pane_id == "eagle/0"
+                    && matches!(kind, AttentionKind::NeedsInput)
+                    && title == "kmux"
+                    && body == "needs input"
+                    && *attention_id == 77
+            ),
+            "{events:?}"
+        );
+        // Unlike `PaneBell`, the arm marks nothing: the unread flag is set by the
+        // app layer (`AppCore::handle_session_events` calls `mark_pane_attention`)
+        // so the notification and the tab marker stay one decision.
+        assert_eq!(observe(&mgr), before);
+        assert!(!mgr.pane_needs_attention("eagle/0"));
+    }
+
+    #[test]
+    fn pane_attention_with_an_unparsable_pane_id_uses_the_whole_id_as_the_word_id() {
+        let (mut mgr, _rx) = manager_on("eagle");
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneAttention {
+                pane_id: "garbage".to_string(),
+                kind: AttentionKind::TurnDone,
+                title: "t".to_string(),
+                body: "b".to_string(),
+                attention_id: 1,
+            },
+        });
+
+        // SUSPECT: a malformed pane id yields `word_id == pane_id`, so the
+        // frontend is asked to focus a session called "garbage" instead of the
+        // event being rejected.
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::PaneAttention { word_id, pane_id, .. }]
+                    if word_id == "garbage" && pane_id == "garbage"
+            ),
+            "{events:?}"
+        );
+        assert_eq!(mgr.active_session(), Some("eagle"), "nothing is refocused");
+    }
+
+    // ── Event { .. } — the ignored remainder ────────────────────────────────
+
+    #[test]
+    fn a_pane_exited_event_is_ignored_leaving_the_pane_cached() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        synced_pane(&mut mgr, "eagle/0", 1);
+        let before = observe(&mgr);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneExited {
+                pane_id: "eagle/0".to_string(),
+                code: Some(0),
+                signal: None,
+            },
+        });
+
+        // SUSPECT: `PaneExited`, `PaneClosed`, `PaneSpawned`, `PaneFaulted`,
+        // `SessionCreated`, `SessionClosed`, `TabCreated` and `TabClosed` all fall
+        // into the catch-all `Event { .. } => {}` even though the dispatcher has
+        // dedicated arms for the *reply* forms of the same facts. A pane another
+        // client closes therefore stays in `session_list` and `buffers` until an
+        // unrelated `SessionListResult` happens to arrive.
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(observe(&mgr), before);
+        assert_eq!(inbound_msgs(&mgr), 1, "the frame is still accounted");
+    }
+
+    #[test]
+    fn a_session_closed_event_is_ignored_leaving_the_session_cached() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        let before = observe(&mgr);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::SessionClosed {
+                word_id: "eagle".to_string(),
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(observe(&mgr), before);
+    }
+
+    // ── Lagged ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn lagged_clears_the_grid_counts_the_lag_and_reattaches_the_pane() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        synced_pane(&mut mgr, "eagle/0", 5);
+        mgr.in_flight_history_fetches
+            .insert("eagle/0".to_string(), 4);
+        mgr.buffers
+            .get_mut("eagle/0")
+            .expect("buffer exists")
+            .apply_cursor_update(
+                CursorState {
+                    row: 2,
+                    col: 2,
+                    ..Default::default()
+                },
+                TermModes::EMPTY,
+            );
+
+        let events = mgr.handle_server_message(ServerMessage::Lagged {
+            pane_id: "eagle/0".to_string(),
+            missed_count: 12,
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(lag_events(&mgr), 1);
+        assert_eq!(resyncs(&mgr), 1);
+        assert!(awaiting_sync(&mgr, "eagle/0"));
+        assert!(!mgr.in_flight_history_fetches.contains_key("eagle/0"));
+        let grid = mgr.buffer("eagle/0").expect("buffer exists");
+        assert_eq!((grid.cursor().row, grid.cursor().col), (0, 0));
+        assert!(
+            drain(&mut rx).iter().any(
+                |m| matches!(m, ClientMessage::Attach { pane_id, .. } if pane_id == "eagle/0")
+            ),
+            "the pane is re-attached"
+        );
+    }
+
+    // ── Error ───────────────────────────────────────────────────────────────
+
+    #[test]
+    fn error_sets_the_status_message_and_emits_server_error() {
+        let mut mgr = make_manager();
+
+        let events = mgr.handle_server_message(ServerMessage::Error {
+            request_id: Some(3),
+            code: kmux_protocol::messages::ErrorCode::SessionNotFound,
+            message: "session not found: nosuch".to_string(),
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::ServerError { message }] if message == "session not found: nosuch"
+            ),
+            "{events:?}"
+        );
+        assert_eq!(mgr.status_msg(), "Error: session not found: nosuch");
+        // SUSPECT: neither the `request_id` nor the typed `ErrorCode` survives —
+        // the arm discards both, so no caller can correlate an error with the
+        // request that caused it or branch on the code.
+    }
+
+    // ── InputLock{Granted,Denied,Released} ──────────────────────────────────
+
+    #[test]
+    fn input_lock_granted_marks_the_pane_locked_and_reports_it_in_the_status() {
+        let (mut mgr, _rx) = manager_on("eagle");
+
+        let events = mgr.handle_server_message(ServerMessage::InputLockGranted {
+            pane_id: "eagle/0".to_string(),
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::InputLockGranted { pane_id }] if pane_id == "eagle/0"
+            ),
+            "{events:?}"
+        );
+        assert!(mgr.is_input_locked("eagle/0"));
+        assert!(mgr.active_input_locked());
+        assert_eq!(mgr.status_msg(), "Input lock acquired on 'eagle/0'");
+    }
+
+    #[test]
+    fn input_lock_denied_reports_the_holder_without_recording_a_lock() {
+        let (mut mgr, _rx) = manager_on("eagle");
+
+        let events = mgr.handle_server_message(ServerMessage::InputLockDenied {
+            pane_id: "eagle/0".to_string(),
+            holder: ClientId(9),
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::InputLockDenied { pane_id, holder }]
+                    if pane_id == "eagle/0" && holder.0 == 9
+            ),
+            "{events:?}"
+        );
+        assert!(
+            !mgr.is_input_locked("eagle/0"),
+            "a denial records no local lock"
+        );
+        assert_eq!(
+            mgr.status_msg(),
+            "Input lock denied on 'eagle/0' (held by ClientId(9))"
+        );
+        // SUSPECT: the status line is built with `{holder:?}`, so the user is
+        // shown the Rust debug form `ClientId(9)` rather than the holder's label.
+    }
+
+    #[test]
+    fn input_lock_released_clears_the_lock_flag_and_reports_it_in_the_status() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        mgr.input_locked.insert("eagle/0".to_string(), true);
+
+        let events = mgr.handle_server_message(ServerMessage::InputLockReleased {
+            pane_id: "eagle/0".to_string(),
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::InputLockReleased { pane_id }] if pane_id == "eagle/0"
+            ),
+            "{events:?}"
+        );
+        assert!(!mgr.is_input_locked("eagle/0"));
+        assert_eq!(
+            mgr.input_locked.get("eagle/0"),
+            Some(&false),
+            "the entry is set to false rather than removed"
+        );
+        assert_eq!(mgr.status_msg(), "Input lock released on 'eagle/0'");
+    }
+
+    // ── ScrollbackAppend ────────────────────────────────────────────────────
+
+    #[test]
+    fn scrollback_append_appends_the_lines_and_advances_the_expected_seqno() {
+        let mut mgr = make_manager();
+        synced_pane(&mut mgr, "eagle/0", 5);
+
+        let events = mgr.handle_server_message(ServerMessage::ScrollbackAppend {
+            pane_id: "eagle/0".to_string(),
+            first_index: 0,
+            lines: vec![sb_line(); 2],
+            seqno: SequenceNo(5),
+            sent_at_ms: 1,
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(expected_seqno(&mgr, "eagle/0"), Some(6));
+        let grid = mgr.buffer("eagle/0").expect("buffer exists");
+        assert_eq!(grid.scrollback().len(), 2);
+        assert_eq!(grid.scrollback().history_total(), 2);
+    }
+
+    #[test]
+    fn scrollback_append_for_a_pane_awaiting_sync_is_discarded() {
+        let mut mgr = make_manager();
+        mgr.buffers
+            .insert("eagle/0".to_string(), CellGrid::new(4, 8));
+        mgr.pane_sync
+            .insert("eagle/0".to_string(), PaneSync::AwaitingSync);
+
+        let events = mgr.handle_server_message(ServerMessage::ScrollbackAppend {
+            pane_id: "eagle/0".to_string(),
+            first_index: 0,
+            lines: vec![sb_line(); 2],
+            seqno: SequenceNo(5),
+            sent_at_ms: 1,
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(stale_discards(&mgr), 1);
+        assert_eq!(
+            mgr.buffer("eagle/0")
+                .expect("buffer exists")
+                .scrollback()
+                .len(),
+            0
+        );
+        assert!(awaiting_sync(&mgr, "eagle/0"));
+    }
+
+    // ── Ping / Pong ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn ping_replies_with_a_pong_carrying_the_same_seq() {
+        let (mut mgr, mut rx) = make_connected_manager();
+
+        let events = mgr.handle_server_message(ServerMessage::Ping { seq: 88 });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert!(
+            matches!(drain(&mut rx).as_slice(), [ClientMessage::Pong { seq }] if *seq == 88),
+            "exactly one Pong, echoing the seq"
+        );
+    }
+
+    #[test]
+    fn ping_while_disconnected_sends_nothing_and_still_refreshes_liveness() {
+        let mut mgr = make_manager();
+        let now = Instant::now();
+
+        let events = mgr.handle_server_message(ServerMessage::Ping { seq: 88 });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert!(mgr.ws_sender.is_none(), "there is nowhere to reply");
+        assert!(
+            mgr.liveness.idle_since(now) < std::time::Duration::from_secs(1),
+            "the frame refreshed the liveness clock"
+        );
+        assert_eq!(inbound_msgs(&mgr), 1);
+    }
+
+    #[test]
+    fn pong_for_an_outstanding_ping_records_an_rtt_sample() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.set_connection_state(crate::connection_state::ConnectionState::Connected {
+            transport: TransportKind::Uds,
+        });
+        // Put a ping on the wire so its seq is outstanding; the reply below is
+        // what closes the round trip. Time is a parameter (R3), so the cadence
+        // is reached by passing a later instant rather than by sleeping.
+        mgr.maybe_send_client_ping(Instant::now() + crate::liveness::PING_INTERVAL);
+        let seq = match drain(&mut rx).as_slice() {
+            [ClientMessage::Ping { seq }] => *seq,
+            other => panic!("expected one Ping, got {other:?}"),
+        };
+
+        let events = mgr.handle_server_message(ServerMessage::Pong { seq });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(mgr.liveness.outstanding_count(), 0, "the seq is cleared");
+        let rtt = mgr.last_rtt_ms().expect("an RTT sample was recorded");
+        assert!(rtt >= 0.0, "rtt is a real measurement: {rtt}");
+        assert_eq!(mgr.active_rtt().expect("summary exists").sample_count, 1);
+    }
+
+    #[test]
+    fn pong_for_an_unknown_seq_records_no_rtt() {
+        let (mut mgr, _rx) = make_connected_manager();
+
+        let events = mgr.handle_server_message(ServerMessage::Pong { seq: 4242 });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(
+            mgr.last_rtt_ms(),
+            None,
+            "an unmatched Pong measures nothing"
+        );
+        assert_eq!(mgr.liveness.outstanding_count(), 0);
+    }
+
+    // ── AuthChallenge ───────────────────────────────────────────────────────
+
+    #[test]
+    fn auth_challenge_is_ignored_by_the_session_manager() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+        let before = observe(&mgr);
+
+        let events = mgr.handle_server_message(ServerMessage::AuthChallenge {
+            nonce: vec![1, 2, 3],
+        });
+
+        // The bootstrap consumes the challenge before the session manager runs;
+        // the arm exists only for exhaustiveness.
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(observe(&mgr), before);
+        assert!(drain(&mut rx).is_empty(), "no AuthProof is sent from here");
+        assert_eq!(inbound_msgs(&mgr), 1);
+    }
+
+    // ── ClientListResult / ClientKicked / SessionKicked ─────────────────────
+
+    #[test]
+    fn client_list_result_caches_the_clients_and_names_the_session() {
+        let mut mgr = make_manager();
+
+        let events = mgr.handle_server_message(ServerMessage::ClientListResult {
+            request_id: 12,
+            word_id: "eagle".to_string(),
+            clients: vec![ClientInfo {
+                client_id: ClientId(1),
+                connection_id: ConnectionId(2),
+                label: "user@host".to_string(),
+                machine_id: "abcd".to_string(),
+                hostname: "host".to_string(),
+                username: "user".to_string(),
+                transport: "uds".to_string(),
+                attached_panes: vec![0],
+                uptime_secs: 5,
+                is_self: true,
+                frontend: FrontendKind::Cli,
+                build: String::new(),
+                build_profile: String::new(),
+            }],
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::ClientListReceived { word_id }] if word_id == "eagle"
+            ),
+            "{events:?}"
+        );
+        assert_eq!(mgr.client_list.len(), 1);
+        assert_eq!(mgr.client_list[0].label, "user@host");
+        assert_eq!(mgr.client_list_word.as_deref(), Some("eagle"));
+    }
+
+    #[test]
+    fn client_kicked_acks_the_kick_without_pruning_the_cached_client_list() {
+        let mut mgr = make_manager();
+        mgr.client_list_word = Some("eagle".to_string());
+        mgr.client_list.push(ClientInfo {
+            client_id: ClientId(1),
+            connection_id: ConnectionId(2),
+            label: "user@host".to_string(),
+            machine_id: "abcd".to_string(),
+            hostname: "host".to_string(),
+            username: "user".to_string(),
+            transport: "uds".to_string(),
+            attached_panes: vec![],
+            uptime_secs: 5,
+            is_self: false,
+            frontend: FrontendKind::Cli,
+            build: String::new(),
+            build_profile: String::new(),
+        });
+
+        let events = mgr.handle_server_message(ServerMessage::ClientKicked {
+            request_id: 13,
+            word_id: "eagle".to_string(),
+            client_id: ClientId(1),
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::ClientKicked { word_id, client_id }]
+                    if word_id == "eagle" && client_id.0 == 1
+            ),
+            "{events:?}"
+        );
+        // SUSPECT: the kicked connection stays in the cached `client_list`, so the
+        // connected-clients view keeps showing it until the caller happens to
+        // re-issue `request_client_list`.
+        assert_eq!(mgr.client_list.len(), 1);
+        assert_eq!(mgr.client_list[0].client_id, ClientId(1));
+    }
+
+    #[test]
+    fn session_kicked_emits_the_eviction_without_leaving_the_session() {
+        let (mut mgr, _rx) = manager_on("eagle");
+
+        let events = mgr.handle_server_message(ServerMessage::SessionKicked {
+            word_id: "eagle".to_string(),
+            by_label: "someone@else".to_string(),
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::KickedFromSession { word_id, by_label }]
+                    if word_id == "eagle" && by_label == "someone@else"
+            ),
+            "{events:?}"
+        );
+        // SUSPECT: the client stays fully attached — session, tab, pane and
+        // buffers are all untouched. `SessionEvent::KickedFromSession`'s doc says
+        // "The app should leave the session", but nothing consumes it: the event
+        // falls into `AppCore::handle_session_events`' `_ => {}`, so a kicked GUI
+        // keeps rendering a session the daemon has already detached it from.
+        assert_eq!(mgr.active_session(), Some("eagle"));
+        assert_eq!(mgr.active_pane_id(), Some("eagle/0"));
+        assert_eq!(mgr.session_list().len(), 1);
+    }
+
+    // ── Peer{Opened,Error,Closed} ───────────────────────────────────────────
+
+    #[test]
+    fn peer_opened_emits_the_peer_without_refreshing_the_session_list() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+
+        let events = mgr.handle_server_message(ServerMessage::PeerOpened {
+            request_id: 14,
+            peer: "work".to_string(),
+        });
+
+        assert!(
+            matches!(events.as_slice(), [SessionEvent::PeerOpened { peer }] if peer == "work"),
+            "{events:?}"
+        );
+        // The refresh is deliberately the app layer's (`AppCore` re-arms
+        // auto-select and re-requests the list), so this arm sends nothing.
+        assert!(
+            drain(&mut rx).is_empty(),
+            "no session-list refresh is issued"
+        );
+        assert_eq!(mgr.session_list().len(), 1);
+    }
+
+    #[test]
+    fn peer_error_emits_the_reason_and_the_attributed_peer() {
+        let mut mgr = make_manager();
+
+        let events = mgr.handle_server_message(ServerMessage::PeerError {
+            request_id: 15,
+            peer: Some("work".to_string()),
+            reason: "ssh: connection refused".to_string(),
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::PeerError { peer, reason }]
+                    if peer.as_deref() == Some("work") && reason == "ssh: connection refused"
+            ),
+            "{events:?}"
+        );
+        // Unlike `Error`, a federation failure never touches `status_msg`; the app
+        // layer decides between a per-remote error row and a full disconnect.
+        assert_eq!(mgr.status_msg(), "");
+    }
+
+    #[test]
+    fn peer_error_without_attribution_emits_a_peerless_error() {
+        let mut mgr = make_manager();
+
+        let events = mgr.handle_server_message(ServerMessage::PeerError {
+            request_id: 16,
+            peer: None,
+            reason: "no peer".to_string(),
+        });
+
+        assert!(
+            matches!(
+                events.as_slice(),
+                [SessionEvent::PeerError { peer, reason }]
+                    if peer.is_none() && reason == "no peer"
+            ),
+            "{events:?}"
+        );
+        assert_eq!(mgr.status_msg(), "");
+    }
+
+    #[test]
+    fn peer_closed_is_ignored_and_leaves_the_peers_sessions_listed() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+        let before = observe(&mgr);
+
+        let events = mgr.handle_server_message(ServerMessage::PeerClosed {
+            request_id: 17,
+            peer: "work".to_string(),
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(observe(&mgr), before);
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(inbound_msgs(&mgr), 1);
+    }
+
+    // ── NotifyAccepted / LogChunk / LogEnd ──────────────────────────────────
+
+    #[test]
+    fn notify_accepted_is_ignored_by_the_streaming_session_manager() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+        let before = observe(&mgr);
+
+        let events = mgr.handle_server_message(ServerMessage::NotifyAccepted { request_id: 18 });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(observe(&mgr), before);
+        assert_eq!(inbound_msgs(&mgr), 1);
+    }
+
+    #[test]
+    fn log_chunk_and_log_end_are_ignored_by_the_streaming_session_manager() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+        let before = observe(&mgr);
+
+        let chunk = mgr.handle_server_message(ServerMessage::LogChunk {
+            request_id: 19,
+            data: b"a log line\n".to_vec(),
+        });
+        let end = mgr.handle_server_message(ServerMessage::LogEnd { request_id: 19 });
+
+        assert!(chunk.is_empty(), "no UI event: {chunk:?}");
+        assert!(end.is_empty(), "no UI event: {end:?}");
+        assert_eq!(observe(&mgr), before);
+        assert_eq!(inbound_msgs(&mgr), 2, "both frames are accounted");
+    }
+}
