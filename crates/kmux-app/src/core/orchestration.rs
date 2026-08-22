@@ -154,6 +154,17 @@ impl AppCore {
                     });
                 }
                 SessionEvent::PaneBell { .. } => {}
+                SessionEvent::PaneFaulted { pane_id } => {
+                    // Issue #126's user-facing half. The pane's shell survived —
+                    // the daemon holds the PTY master fd and is respawning the
+                    // worker, which resyncs the grid — so this is a transient
+                    // notice, not a disconnect and not an exit. Without it the
+                    // pane simply freezes and then repaints with no explanation.
+                    warn!(%pane_id, "pane VT worker crashed; recovering");
+                    self.mgr.set_status_msg(format!(
+                        "Pane '{pane_id}' is recovering (its terminal engine crashed)"
+                    ));
+                }
                 SessionEvent::PeerOpened { peer } => {
                     // The remote is now federated through the local daemon (issue
                     // #121). Mark it connected, re-arm auto-select, and refresh the

@@ -32,6 +32,14 @@ pub enum SessionEvent {
     PaneCreated { pane_id: String },
     /// A pane was closed.
     PaneClosed { pane_id: String },
+    /// A pane's isolated VT worker crashed (issue #126). The pane's shell is
+    /// still alive — the daemon holds the PTY master fd and respawns the worker,
+    /// resyncing the pane with a fresh snapshot — so the frontend surfaces this
+    /// as a transient "recovering" notice, never as an exit.
+    PaneFaulted {
+        /// The pane whose worker crashed.
+        pane_id: String,
+    },
     /// A pane's window title changed (OSC 0/2).
     PaneTitleChanged { pane_id: String, title: String },
     /// A pane rang BEL; frontends surface this as unread tab attention.
@@ -279,32 +287,13 @@ impl SessionManager {
                 events.push(SessionEvent::SessionCreated { word_id });
             }
 
-            ServerMessage::SessionClosed { word_id, .. } => {
-                // Remove all pane buffers for this session
-                let entry = self
-                    .session_list
-                    .iter()
-                    .find(|e| e.meta.word_id == word_id)
-                    .cloned();
-                if let Some(entry) = &entry {
-                    for pane in &entry.panes {
-                        self.forget_pane(&pane.pane_id);
-                    }
-                }
-                self.session_list.retain(|e| e.meta.word_id != word_id);
-
-                if self.active_session.as_deref() == Some(&word_id) {
-                    // The closed session's panes are gone server-side; clear local
-                    // view state and fall back to the first remaining session.
-                    self.active_session = None;
-                    self.active_tab = None;
-                    self.active_pane = None;
-                    self.visible_panes.clear();
-                    if let Some(next) = self.session_list.first().map(|e| e.meta.word_id.clone()) {
-                        self.select_session(next);
-                    }
-                }
-                events.push(SessionEvent::SessionClosed { word_id });
+            // A session died. The requester gets the reply; every client gets the
+            // broadcast when the session drained via its last tab or pane.
+            ServerMessage::SessionClosed { word_id, .. }
+            | ServerMessage::Event {
+                event: SessionEventMsg::SessionClosed { word_id },
+            } => {
+                events.extend(self.on_session_gone(word_id));
             }
 
             ServerMessage::PaneCreated {
@@ -343,28 +332,13 @@ impl SessionManager {
                 events.push(SessionEvent::PaneCreated { pane_id });
             }
 
-            ServerMessage::PaneClosed { pane_id, .. } => {
-                self.forget_pane(&pane_id);
-
-                // Remove pane from session_list
-                for entry in &mut self.session_list {
-                    entry.panes.retain(|p| p.pane_id != pane_id);
-                }
-
-                if self.active_pane.as_deref() == Some(&pane_id) {
-                    match self.find_fallback_pane() {
-                        Some((word_id, pane)) => {
-                            self.active_session = Some(word_id);
-                            self.active_pane = Some(pane.clone());
-                            self.attach_fresh(pane);
-                        }
-                        None => {
-                            self.active_session = None;
-                            self.active_pane = None;
-                        }
-                    }
-                }
-                events.push(SessionEvent::PaneClosed { pane_id });
+            // A pane died. The requester gets the reply (with the exit code);
+            // every client gets the PTY bus's broadcast of the same close.
+            ServerMessage::PaneClosed { pane_id, .. }
+            | ServerMessage::Event {
+                event: SessionEventMsg::PaneClosed { pane_id },
+            } => {
+                events.extend(self.on_pane_gone(pane_id));
             }
 
             // ── Tab / layout reconciliation ─────────────────────────────────
@@ -413,50 +387,16 @@ impl SessionManager {
                 }
             }
 
+            // A tab died. The requester gets the reply; every client gets the
+            // broadcast, which the daemon sends with no accompanying
+            // `LayoutUpdate` — this arm is the only reconciliation there is.
             ServerMessage::TabClosed {
                 word_id, tab_index, ..
+            }
+            | ServerMessage::Event {
+                event: SessionEventMsg::TabClosed { word_id, tab_index },
             } => {
-                let mut closed_panes = Vec::new();
-                let mut next_tab = None;
-                if let Some(entry) = self
-                    .session_list
-                    .iter_mut()
-                    .find(|e| e.meta.word_id == word_id)
-                {
-                    if let Some(tab) = entry.tabs.iter().find(|t| t.tab_index == tab_index) {
-                        closed_panes = tab.layout.leaves();
-                    }
-                    entry.tabs.retain(|t| t.tab_index != tab_index);
-                    let live_panes = entry
-                        .tabs
-                        .iter()
-                        .flat_map(|t| t.layout.leaves())
-                        .collect::<HashSet<_>>();
-                    closed_panes.retain(|pane| !live_panes.contains(pane));
-                    entry
-                        .panes
-                        .retain(|pane| !closed_panes.contains(&pane.pane_index));
-                    if entry.active_tab == tab_index {
-                        entry.active_tab = entry.tabs.first().map_or(0, |t| t.tab_index);
-                    }
-                    next_tab = entry.tabs.first().map(|t| t.tab_index);
-                }
-                for pane_index in closed_panes {
-                    self.forget_pane(&kmux_protocol::format_pane_id(&word_id, pane_index));
-                }
-                // If the closed tab was the one we were viewing, move to another.
-                if self.active_session.as_deref() == Some(word_id.as_str())
-                    && self.active_tab == Some(tab_index)
-                {
-                    self.active_tab = None;
-                    self.visible_panes.clear();
-                    match next_tab {
-                        Some(t) => self.select_tab(t),
-                        None => {
-                            self.active_pane = None;
-                        }
-                    }
-                }
+                self.on_tab_gone(&word_id, tab_index);
             }
 
             // The dedicated split reply: a new pane + the tab's new tree. Attach
@@ -742,7 +682,74 @@ impl SessionManager {
                 });
             }
 
-            ServerMessage::Event { .. } => {}
+            // A session was restored from the graveyard by some client. The
+            // broadcast names only the word, so a client that does not already
+            // have the entry re-lists; unlike the `SessionCreated` reply it must
+            // not *switch* to it — that would yank the view of every other GUI.
+            ServerMessage::Event {
+                event: SessionEventMsg::SessionCreated { word_id },
+            } => {
+                let cached = self.knows_session(&word_id);
+                self.resync_unless_cached(cached);
+            }
+
+            // A tab was created by some client. The broadcast carries the index
+            // but no `TabInfo`, so the tree can only come from a fresh list.
+            ServerMessage::Event {
+                event: SessionEventMsg::TabCreated { word_id, tab_index },
+            } => {
+                let cached = self
+                    .session_list
+                    .iter()
+                    .find(|e| e.meta.word_id == word_id)
+                    .is_none_or(|e| e.tabs.iter().any(|t| t.tab_index == tab_index));
+                self.resync_unless_cached(cached);
+            }
+
+            // A pane was spawned — by a session/tab create, a split, or a
+            // restore. Same shape: an id, no `PaneInfo`, no layout.
+            ServerMessage::Event {
+                event: SessionEventMsg::PaneSpawned { pane_id },
+            } => {
+                let cached = kmux_protocol::pane_word(&pane_id)
+                    .is_none_or(|word_id| !self.knows_session(word_id))
+                    || self.knows_pane(&pane_id);
+                self.resync_unless_cached(cached);
+            }
+
+            // The pane's child process exited on its own. The pane keeps its
+            // slot in the layout tree until someone closes it, so this only
+            // records the status.
+            ServerMessage::Event {
+                event:
+                    SessionEventMsg::PaneExited {
+                        pane_id,
+                        code,
+                        signal,
+                    },
+            } => {
+                self.on_pane_exited(&pane_id, code, signal);
+            }
+
+            // The pane's isolated VT worker crashed (issue #126). The shell is
+            // untouched and the daemon respawns the worker, which resyncs this
+            // client with a fresh snapshot through the normal `TerminalSnapshot`
+            // path — so no sync state is disturbed here, only the UI is told.
+            ServerMessage::Event {
+                event: SessionEventMsg::PaneFaulted { pane_id },
+            } => {
+                warn!(%pane_id, "pane VT worker faulted; the daemon is respawning it");
+                self.status_msg = format!("Pane '{pane_id}' is recovering");
+                events.push(SessionEvent::PaneFaulted { pane_id });
+            }
+
+            // Never sent: `kmuxd` constructs no `LayoutChanged`, and the
+            // authoritative `LayoutUpdate` supersedes it. Kept as an arm rather
+            // than a `..` catch-all so a new `SessionEventMsg` variant fails to
+            // compile here instead of being silently dropped (docs/testing.md R4).
+            ServerMessage::Event {
+                event: SessionEventMsg::LayoutChanged { .. },
+            } => {}
 
             ServerMessage::Lagged {
                 pane_id,
@@ -908,6 +915,176 @@ impl SessionManager {
     }
 }
 
+/// Lifecycle reconciliation shared by a fact's reply form and its broadcast form.
+///
+/// The daemon reports every session/tab/pane mutation twice. The requesting
+/// client gets a dedicated `ServerMessage` reply (`state.send`, one connection),
+/// and *every* connected client — the requester included — gets the same fact as
+/// a `SessionEventMsg` on the server-wide event channel: `ServerApp::broadcast`
+/// (`kmuxd/src/app/mod.rs`) filters by neither session nor attachment, and the
+/// PTY lifecycle bus (`kmuxd/src/client_handler/events.rs`) is fanned out the
+/// same way. Before this existed the client handled only the reply forms, so a
+/// tab, pane or session another GUI touched stayed in this client's cache until
+/// an unrelated refresh happened by.
+///
+/// Each handler below is therefore reached from both arms and must be
+/// idempotent. They are written as "reconcile only if the client still holds
+/// state for the thing that changed", which makes the second delivery a no-op
+/// and keeps the UI event exactly-once.
+impl SessionManager {
+    /// Whether the client still holds any state for `pane_id` — a decoded grid,
+    /// sync bookkeeping, or a cached [`PaneInfo`].
+    fn knows_pane(&self, pane_id: &str) -> bool {
+        self.buffers.contains_key(pane_id)
+            || self.pane_sync.contains_key(pane_id)
+            || self
+                .session_list
+                .iter()
+                .any(|e| e.panes.iter().any(|p| p.pane_id == pane_id))
+    }
+
+    /// Whether `word_id` is in the cached session list.
+    fn knows_session(&self, word_id: &str) -> bool {
+        self.session_list.iter().any(|e| e.meta.word_id == word_id)
+    }
+
+    /// Reconcile "the pane `pane_id` is gone": drop its buffers and bookkeeping,
+    /// prune it from the cached session entry, and move focus off it.
+    ///
+    /// Returns `None` when the client never knew the pane, which is also what
+    /// makes the requester's second delivery silent.
+    fn on_pane_gone(&mut self, pane_id: String) -> Option<SessionEvent> {
+        if !self.knows_pane(&pane_id) {
+            return None;
+        }
+        self.forget_pane(&pane_id);
+        for entry in &mut self.session_list {
+            entry.panes.retain(|p| p.pane_id != pane_id);
+        }
+        if self.active_pane.as_deref() == Some(&pane_id) {
+            match self.find_fallback_pane() {
+                Some((word_id, pane)) => {
+                    self.active_session = Some(word_id);
+                    self.active_pane = Some(pane.clone());
+                    self.attach_fresh(pane);
+                }
+                None => {
+                    self.active_session = None;
+                    self.active_pane = None;
+                }
+            }
+        }
+        Some(SessionEvent::PaneClosed { pane_id })
+    }
+
+    /// Reconcile "the session `word_id` is gone": forget every pane it owned,
+    /// drop the entry, and fall back to another session when it was the one
+    /// being viewed.
+    fn on_session_gone(&mut self, word_id: String) -> Option<SessionEvent> {
+        if !self.knows_session(&word_id) {
+            return None;
+        }
+        for pane_id in self.session_pane_ids(&word_id) {
+            self.forget_pane(&pane_id);
+        }
+        self.session_list.retain(|e| e.meta.word_id != word_id);
+
+        if self.active_session.as_deref() == Some(&word_id) {
+            // The closed session's panes are gone server-side; clear local
+            // view state and fall back to the first remaining session.
+            self.active_session = None;
+            self.active_tab = None;
+            self.active_pane = None;
+            self.visible_panes.clear();
+            if let Some(next) = self.session_list.first().map(|e| e.meta.word_id.clone()) {
+                self.select_session(next);
+            }
+        }
+        Some(SessionEvent::SessionClosed { word_id })
+    }
+
+    /// Reconcile "the tab `tab_index` of `word_id` is gone": drop it from the
+    /// cached entry, forget the panes it alone owned, and move to another tab
+    /// when it was the one being viewed.
+    fn on_tab_gone(&mut self, word_id: &str, tab_index: u32) {
+        let mut closed_panes = Vec::new();
+        let mut next_tab = None;
+        if let Some(entry) = self
+            .session_list
+            .iter_mut()
+            .find(|e| e.meta.word_id == word_id)
+        {
+            if let Some(tab) = entry.tabs.iter().find(|t| t.tab_index == tab_index) {
+                closed_panes = tab.layout.leaves();
+            }
+            entry.tabs.retain(|t| t.tab_index != tab_index);
+            let live_panes = entry
+                .tabs
+                .iter()
+                .flat_map(|t| t.layout.leaves())
+                .collect::<HashSet<_>>();
+            closed_panes.retain(|pane| !live_panes.contains(pane));
+            entry
+                .panes
+                .retain(|pane| !closed_panes.contains(&pane.pane_index));
+            if entry.active_tab == tab_index {
+                entry.active_tab = entry.tabs.first().map_or(0, |t| t.tab_index);
+            }
+            next_tab = entry.tabs.first().map(|t| t.tab_index);
+        }
+        for pane_index in closed_panes {
+            self.forget_pane(&kmux_protocol::format_pane_id(word_id, pane_index));
+        }
+        // If the closed tab was the one we were viewing, move to another.
+        if self.active_session.as_deref() == Some(word_id) && self.active_tab == Some(tab_index) {
+            self.active_tab = None;
+            self.visible_panes.clear();
+            match next_tab {
+                Some(t) => self.select_tab(t),
+                None => {
+                    self.active_pane = None;
+                }
+            }
+        }
+    }
+
+    /// Reconcile a *creation* broadcast.
+    ///
+    /// Unlike the reply forms, the broadcast forms carry an id and nothing else:
+    /// `SessionEventMsg::TabCreated` has no `TabInfo` and `PaneSpawned` no
+    /// `PaneInfo`, and the daemon sends no `LayoutUpdate` alongside either. A
+    /// fresh session list is therefore the only reconciliation available, so it
+    /// is requested exactly when the cache does not already show the fact —
+    /// which is what keeps the requesting client, whose reply carried the whole
+    /// record, from re-listing on its own change.
+    fn resync_unless_cached(&mut self, already_cached: bool) {
+        if !already_cached {
+            self.request_session_list();
+        }
+    }
+
+    /// Record that a pane's child process exited (the pane itself survives until
+    /// someone closes it, and the daemon leaves it in the layout tree), so
+    /// [`SessionManager::is_pane_running`] stops reporting it as live.
+    fn on_pane_exited(&mut self, pane_id: &str, code: Option<i32>, signal: Option<i32>) {
+        for entry in &mut self.session_list {
+            if let Some(pane) = entry.panes.iter_mut().find(|p| p.pane_id == pane_id) {
+                pane.status = SessionStatus::Exited { code, signal };
+                break;
+            }
+        }
+    }
+
+    /// The pane ids the cached entry for `word_id` owns.
+    fn session_pane_ids(&self, word_id: &str) -> Vec<String> {
+        self.session_list
+            .iter()
+            .find(|e| e.meta.word_id == word_id)
+            .map(|e| e.panes.iter().map(|p| p.pane_id.clone()).collect())
+            .unwrap_or_default()
+    }
+}
+
 impl SessionManager {
     /// Find the best fallback pane after the active pane closes.
     ///
@@ -945,8 +1122,11 @@ mod tests {
     //! `Vec<SessionEvent>` *and* the state it leaves behind) so the dispatcher can
     //! be split into per-domain handlers without changing behaviour.
     //!
-    //! Every expectation here was recorded empirically, not designed. Where the
-    //! observed behaviour looks wrong it is marked `// SUSPECT:` and left alone.
+    //! Every expectation here was recorded empirically, not designed. Each one
+    //! that looked wrong was then checked against what `kmuxd` actually sends;
+    //! the ones that survived that check became the `fix(client):` commits on
+    //! this branch, and the ones that did not carry a comment naming the
+    //! sender-side reason the behaviour is right as it stands.
 
     use kmux_protocol::messages::{
         ClientCapabilities, ClientInfo, ClosedSessionEntry, ConnectionId, CursorState,
@@ -1248,11 +1428,25 @@ mod tests {
             mgr.session_list[0].panes.is_empty(),
             "the pane leaves the cached session entry"
         );
-        // SUSPECT: only `panes` is pruned — the tab's layout tree still names
-        // pane index 0, so `visible_panes` / `tab_view` keep reporting a pane the
-        // client has just forgotten, until a `LayoutUpdate` arrives.
+        // Only `panes` is pruned; the tree still names pane index 0. That is
+        // correct: the tree is the daemon's to own, and `on_pane_close`
+        // (kmuxd/src/client_handler/dispatch/pane.rs) always follows a
+        // `PaneClosed` with exactly one of `LayoutUpdate` (the tab survives),
+        // `Event{TabClosed}` or `Event{SessionClosed}` — see the follow-up
+        // assertion below. Deriving a new tree here would only race the
+        // authoritative one.
         assert_eq!(mgr.session_list[0].tabs[0].layout.leaves(), vec![0]);
         assert_eq!(mgr.visible_panes(), ["eagle/0"]);
+
+        // This pane was the session's last, so the daemon's follow-up is
+        // `Event{SessionClosed}`, and that is what clears the stale tree.
+        mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::SessionClosed {
+                word_id: "eagle".to_string(),
+            },
+        });
+        assert!(mgr.session_list().is_empty());
+        assert!(mgr.visible_panes().is_empty());
     }
 
     #[test]
@@ -1973,37 +2167,95 @@ mod tests {
         assert_eq!(mgr.active_session(), Some("eagle"), "nothing is refocused");
     }
 
-    // ── Event { .. } — the ignored remainder ────────────────────────────────
+    // ── Event: the lifecycle broadcasts ─────────────────────────────────────
+    //
+    // The daemon reports every mutation twice — a reply to the requester, and a
+    // `SessionEventMsg` to every connected client. These pin the broadcast half,
+    // which is the only notice a GUI that did *not* make the request ever gets.
 
     #[test]
-    fn a_pane_exited_event_is_ignored_leaving_the_pane_cached() {
+    fn a_pane_exited_event_marks_the_pane_not_running_without_forgetting_it() {
         let (mut mgr, _rx) = manager_on("eagle");
         synced_pane(&mut mgr, "eagle/0", 1);
-        let before = observe(&mgr);
+        assert!(mgr.is_pane_running("eagle/0"));
 
         let events = mgr.handle_server_message(ServerMessage::Event {
             event: SessionEventMsg::PaneExited {
                 pane_id: "eagle/0".to_string(),
-                code: Some(0),
+                code: Some(3),
                 signal: None,
             },
         });
 
-        // SUSPECT: `PaneExited`, `PaneClosed`, `PaneSpawned`, `PaneFaulted`,
-        // `SessionCreated`, `SessionClosed`, `TabCreated` and `TabClosed` all fall
-        // into the catch-all `Event { .. } => {}` even though the dispatcher has
-        // dedicated arms for the *reply* forms of the same facts. A pane another
-        // client closes therefore stays in `session_list` and `buffers` until an
-        // unrelated `SessionListResult` happens to arrive.
         assert!(events.is_empty(), "no UI event: {events:?}");
-        assert_eq!(observe(&mgr), before);
-        assert_eq!(inbound_msgs(&mgr), 1, "the frame is still accounted");
+        assert!(
+            !mgr.is_pane_running("eagle/0"),
+            "the exit status reaches the cached PaneInfo"
+        );
+        assert_eq!(
+            mgr.pane_info("eagle/0").map(|p| p.status.clone()),
+            Some(SessionStatus::Exited {
+                code: Some(3),
+                signal: None
+            })
+        );
+        // The daemon leaves an exited pane in the layout tree until someone
+        // closes it, so the client must not forget it either.
+        assert!(mgr.buffer("eagle/0").is_some(), "the buffer survives");
+        assert_eq!(mgr.visible_panes(), ["eagle/0"]);
     }
 
     #[test]
-    fn a_session_closed_event_is_ignored_leaving_the_session_cached() {
+    fn a_pane_closed_event_forgets_the_pane_exactly_as_the_reply_does() {
         let (mut mgr, _rx) = manager_on("eagle");
-        let before = observe(&mgr);
+        synced_pane(&mut mgr, "eagle/0", 1);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneClosed {
+                pane_id: "eagle/0".to_string(),
+            },
+        });
+
+        assert!(
+            matches!(events.as_slice(), [SessionEvent::PaneClosed { pane_id }] if pane_id == "eagle/0"),
+            "{events:?}"
+        );
+        assert!(mgr.buffer("eagle/0").is_none(), "the buffer is dropped");
+        assert!(!mgr.pane_sync.contains_key("eagle/0"));
+        assert!(mgr.session_list[0].panes.is_empty());
+        assert_eq!(mgr.active_pane_id(), None);
+    }
+
+    #[test]
+    fn the_second_delivery_of_a_pane_close_is_a_silent_no_op() {
+        // `ServerApp::broadcast` excludes nobody, so the client that asked for
+        // the close receives its reply AND the broadcast. The reconciliation
+        // must not fire twice, or the UI is told a pane closed that it already
+        // forgot — and `find_fallback_pane` would re-run against a stale focus.
+        let (mut mgr, _rx) = manager_on("eagle");
+        synced_pane(&mut mgr, "eagle/0", 1);
+
+        let first = mgr.handle_server_message(ServerMessage::PaneClosed {
+            request_id: 1,
+            pane_id: "eagle/0".to_string(),
+            exit_code: Some(0),
+        });
+        let after_first = observe(&mgr);
+        let second = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneClosed {
+                pane_id: "eagle/0".to_string(),
+            },
+        });
+
+        assert_eq!(first.len(), 1, "the first delivery reports the close");
+        assert!(second.is_empty(), "the second reports nothing: {second:?}");
+        assert_eq!(observe(&mgr), after_first, "and changes nothing");
+    }
+
+    #[test]
+    fn a_session_closed_event_drops_the_session_exactly_as_the_reply_does() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        synced_pane(&mut mgr, "eagle/0", 1);
 
         let events = mgr.handle_server_message(ServerMessage::Event {
             event: SessionEventMsg::SessionClosed {
@@ -2011,8 +2263,236 @@ mod tests {
             },
         });
 
+        assert!(
+            matches!(events.as_slice(), [SessionEvent::SessionClosed { word_id }] if word_id == "eagle"),
+            "{events:?}"
+        );
+        assert!(mgr.session_list().is_empty(), "the entry is dropped");
+        assert!(mgr.buffer("eagle/0").is_none(), "its panes are forgotten");
+        assert_eq!(mgr.active_session(), None);
+        assert_eq!(mgr.active_tab(), None);
+        assert!(mgr.visible_panes().is_empty());
+    }
+
+    #[test]
+    fn a_session_closed_event_for_an_unknown_session_reports_nothing() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        let before = observe(&mgr);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::SessionClosed {
+                word_id: "nosuch".to_string(),
+            },
+        });
+
         assert!(events.is_empty(), "no UI event: {events:?}");
         assert_eq!(observe(&mgr), before);
+    }
+
+    #[test]
+    fn a_tab_closed_event_prunes_the_tab_and_moves_the_view_off_it() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        mgr.session_list[0].panes.push(pane("eagle", 1));
+        mgr.session_list[0]
+            .tabs
+            .push(tab(1, LayoutNode::single(1), 1));
+        mgr.select_tab(1);
+        assert_eq!(mgr.active_tab(), Some(1));
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::TabClosed {
+                word_id: "eagle".to_string(),
+                tab_index: 1,
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(
+            mgr.session_list[0]
+                .tabs
+                .iter()
+                .map(|t| t.tab_index)
+                .collect::<Vec<_>>(),
+            vec![0]
+        );
+        assert!(
+            mgr.buffer("eagle/1").is_none(),
+            "the tab's only pane is forgotten"
+        );
+        assert_eq!(mgr.active_tab(), Some(0), "the view moves to the survivor");
+        assert_eq!(mgr.visible_panes(), ["eagle/0"]);
+    }
+
+    #[test]
+    fn a_tab_created_event_re_lists_because_the_broadcast_carries_no_layout() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::TabCreated {
+                word_id: "eagle".to_string(),
+                tab_index: 1,
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|m| matches!(m, ClientMessage::SessionList { .. })),
+            "the tree can only come from a fresh session list"
+        );
+        assert_eq!(
+            mgr.active_tab(),
+            Some(0),
+            "another client's new tab does not yank this client's view"
+        );
+    }
+
+    #[test]
+    fn a_tab_created_event_for_a_tab_already_cached_sends_nothing() {
+        // The requesting client got the whole `TabInfo` in its reply and then
+        // receives the broadcast too; it must not re-list on its own change.
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::TabCreated {
+                word_id: "eagle".to_string(),
+                tab_index: 0,
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert!(drain(&mut rx).is_empty(), "no redundant refresh");
+    }
+
+    #[test]
+    fn a_tab_created_event_for_an_untracked_session_sends_nothing() {
+        // Broadcasts are server-wide, so events arrive for sessions this client
+        // has never listed. Re-listing on each would be a refresh storm.
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::TabCreated {
+                word_id: "nosuch".to_string(),
+                tab_index: 0,
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert!(drain(&mut rx).is_empty());
+    }
+
+    #[test]
+    fn a_pane_spawned_event_in_a_tracked_session_re_lists() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneSpawned {
+                pane_id: "eagle/1".to_string(),
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|m| matches!(m, ClientMessage::SessionList { .. })),
+            "the new pane's layout can only come from a fresh session list"
+        );
+    }
+
+    #[test]
+    fn a_pane_spawned_event_for_a_cached_pane_sends_nothing() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneSpawned {
+                pane_id: "eagle/0".to_string(),
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert!(drain(&mut rx).is_empty(), "no redundant refresh");
+    }
+
+    #[test]
+    fn a_session_created_event_re_lists_without_switching_to_it() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::SessionCreated {
+                word_id: "otter".to_string(),
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|m| matches!(m, ClientMessage::SessionList { .. })),
+            "a restored session surfaces via a fresh list"
+        );
+        assert_eq!(
+            mgr.active_session(),
+            Some("eagle"),
+            "unlike the reply arm, the broadcast never switches the view"
+        );
+    }
+
+    #[test]
+    fn a_pane_faulted_event_reports_recovery_without_disturbing_sync_state() {
+        // Issue #126: the shell survives and the daemon respawns the worker,
+        // resyncing through the ordinary `TerminalSnapshot` path — so the arm
+        // must not clear the grid or park the pane, only tell the UI.
+        let (mut mgr, mut rx) = manager_on("eagle");
+        synced_pane(&mut mgr, "eagle/0", 7);
+        drain(&mut rx);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneFaulted {
+                pane_id: "eagle/0".to_string(),
+            },
+        });
+
+        assert!(
+            matches!(events.as_slice(), [SessionEvent::PaneFaulted { pane_id }] if pane_id == "eagle/0"),
+            "{events:?}"
+        );
+        assert_eq!(mgr.status_msg(), "Pane 'eagle/0' is recovering");
+        assert_eq!(
+            expected_seqno(&mgr, "eagle/0"),
+            Some(7),
+            "sync state is untouched"
+        );
+        assert!(mgr.buffer("eagle/0").is_some(), "the grid is not cleared");
+        assert!(drain(&mut rx).is_empty(), "nothing is sent in reply");
+    }
+
+    #[test]
+    fn a_layout_changed_event_is_the_only_ignored_broadcast() {
+        // `kmuxd` never constructs it; the authoritative `LayoutUpdate`
+        // supersedes it. Pinned so the arm is not mistaken for dead weight.
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+        let before = observe(&mgr);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::LayoutChanged {
+                word_id: "eagle".to_string(),
+                tab_index: 0,
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert_eq!(observe(&mgr), before);
+        assert!(drain(&mut rx).is_empty());
+        assert_eq!(inbound_msgs(&mgr), 1, "the frame is still accounted");
     }
 
     // ── Lagged ──────────────────────────────────────────────────────────────
