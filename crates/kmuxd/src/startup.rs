@@ -321,6 +321,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
             handoff_in_progress: Arc::clone(&handoff_in_progress),
             listeners: resolved_listeners,
             public_host: cfg.advertise.public_host.clone(),
+            handoff_successor: handoff,
         };
         tokio::spawn(async move {
             crate::daemon::serve_control_socket(params).await;
