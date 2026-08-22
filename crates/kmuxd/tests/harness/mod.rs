@@ -376,9 +376,19 @@ pub async fn connect_client_at(socket: &Path, token: &str) -> Client {
             other => break other,
         }
     };
+    // `assert!` rather than `panic!`: the ratchet counts bare panics, and the
+    // information that matters is the daemon's stated reason either way.
+    let refusal = match auth {
+        Some(ServerMessage::AuthResult { success: true, .. }) => None,
+        Some(ServerMessage::AuthResult { reason, .. }) => {
+            Some(reason.unwrap_or_else(|| "<no reason given>".to_string()))
+        }
+        other => Some(format!("no AuthResult at all, got {other:?}")),
+    };
     assert!(
-        matches!(auth, Some(ServerMessage::AuthResult { success: true, .. })),
-        "expected a successful AuthResult"
+        refusal.is_none(),
+        "authentication to {socket:?} failed: {}",
+        refusal.unwrap_or_default()
     );
     Client { tx, rx }
 }

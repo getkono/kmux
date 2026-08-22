@@ -37,13 +37,22 @@ impl Identity {
     /// ([`crate::dirs::identity_key_path`]).
     pub fn load_or_create() -> anyhow::Result<Self> {
         let path = crate::dirs::identity_key_path()?;
-        let pkcs8 = match std::fs::read(&path) {
+        Self::load_or_create_at(&path)
+    }
+
+    /// [`load_or_create`](Self::load_or_create) against an explicit path, so the
+    /// creation race below can be tested without touching the real config dir.
+    ///
+    /// # Errors
+    ///
+    /// If `path` cannot be read or created, or holds something that is not a
+    /// valid PKCS#8 Ed25519 key. A key file that exists but does not parse is an
+    /// error rather than a silent regeneration: replacing it would change this
+    /// machine's identity without anyone asking.
+    pub fn load_or_create_at(path: &Path) -> anyhow::Result<Self> {
+        let pkcs8 = match std::fs::read(path) {
             Ok(bytes) => bytes,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-                let pkcs8 = generate_pkcs8()?;
-                persist_pkcs8(&path, &pkcs8)?;
-                pkcs8
-            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => create_pkcs8(path)?,
             Err(e) => {
                 return Err(anyhow::anyhow!(
                     "failed to read identity key {}: {e}",
@@ -145,16 +154,68 @@ fn generate_pkcs8() -> anyhow::Result<Vec<u8>> {
     Ok(doc.as_ref().to_vec())
 }
 
-fn persist_pkcs8(path: &Path, pkcs8: &[u8]) -> anyhow::Result<()> {
+/// Create the identity key file, or adopt the one a concurrent process created.
+///
+/// Returns the PKCS#8 bytes that are actually on disk afterwards, which may not
+/// be the ones generated here.
+///
+/// Every kmux process on a machine shares one key file, and they start
+/// concurrently — a GUI and a CLI, or several panes' worth of `kmux notify`.
+/// The previous version opened the target `truncate(true)` and wrote in place,
+/// which gives a reader two ways to lose: it can read a zero-length file
+/// between the truncate and the write, or a prefix of the key mid-write. Either
+/// is an "invalid identity key" for a process that did nothing wrong, and the
+/// daemon then refuses its handshake.
+///
+/// So: write the whole key to a private temporary file in the same directory,
+/// then `hard_link` it into place. `link(2)` fails with `EEXIST` rather than
+/// replacing, which makes it an atomic create-if-absent — the file is never
+/// visible at `path` in a partial state, and a loser adopts the winner's key
+/// instead of holding one that disagrees with disk.
+/// Distinguishes staging files written by two threads of one process.
+static NEXT_STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn create_pkcs8(path: &Path) -> anyhow::Result<Vec<u8>> {
+    let pkcs8 = generate_pkcs8()?;
+    // Same directory, so the link stays on one filesystem. The name carries both
+    // the pid and a per-process counter: two racing *processes* must not share a
+    // staging file, and neither must two racing threads inside one.
+    let seq = NEXT_STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let staging = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
+    write_private(&staging, &pkcs8)?;
+
+    let linked = std::fs::hard_link(&staging, path);
+    // The staging file has served its purpose either way.
+    let _ = std::fs::remove_file(&staging);
+
+    match linked {
+        Ok(()) => Ok(pkcs8),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Another process got there first. Its key is the machine's
+            // identity; ours was never visible to anyone.
+            std::fs::read(path)
+                .map_err(|e| anyhow::anyhow!("failed to read identity key {}: {e}", path.display()))
+        }
+        Err(e) => Err(anyhow::anyhow!(
+            "failed to create identity key {}: {e}",
+            path.display()
+        )),
+    }
+}
+
+/// Write `bytes` to a fresh mode-0600 file, refusing to overwrite one.
+fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
-        .create(true)
-        .truncate(true)
+        .create_new(true)
         .mode(0o600)
         .open(path)
-        .map_err(|e| anyhow::anyhow!("failed to create identity key {}: {e}", path.display()))?;
-    file.write_all(pkcs8)
-        .map_err(|e| anyhow::anyhow!("failed to write identity key {}: {e}", path.display()))?;
+        .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", path.display()))?;
+    file.write_all(bytes)
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
+    // Durable before it becomes visible under its real name.
+    file.sync_all()
+        .map_err(|e| anyhow::anyhow!("failed to flush {}: {e}", path.display()))?;
     Ok(())
 }
 
@@ -242,5 +303,91 @@ mod tests {
         assert_eq!(mode & 0o777, 0o600, "identity key must be mode 0600");
 
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+    }
+
+    /// Concurrent first use is the normal case: a GUI and a CLI start together,
+    /// or several panes run `kmux notify` at once. Every racer must end up with
+    /// the *same* identity, and none may see a half-written key.
+    #[test]
+    fn racing_first_use_converges_on_one_identity() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("identity.pk8");
+
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(8));
+        let prints: Vec<String> = std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| {
+                    let barrier = std::sync::Arc::clone(&barrier);
+                    let path = path.clone();
+                    scope.spawn(move || {
+                        barrier.wait();
+                        Identity::load_or_create_at(&path)
+                            .expect("no racer may see a partial key")
+                            .fingerprint()
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().expect("thread"))
+                .collect()
+        });
+
+        assert_eq!(prints.len(), 8);
+        assert!(
+            prints.windows(2).all(|w| w[0] == w[1]),
+            "all racers must adopt one identity, got {prints:?}"
+        );
+        // And it is the one on disk, so the next process agrees too.
+        let reloaded = Identity::load_or_create_at(&path).expect("reload");
+        assert_eq!(reloaded.fingerprint(), prints[0]);
+    }
+
+    /// The key file must never be observable in a partial state, so no staging
+    /// file may be left behind under a name a reader might mistake for it.
+    #[test]
+    fn creating_the_key_leaves_no_staging_file_behind() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("identity.pk8");
+        Identity::load_or_create_at(&path).expect("create");
+
+        let left: Vec<_> = std::fs::read_dir(tmp.path())
+            .expect("read_dir")
+            .filter_map(|e| e.ok().map(|e| e.file_name()))
+            .collect();
+        assert_eq!(
+            left,
+            vec![std::ffi::OsString::from("identity.pk8")],
+            "{left:?}"
+        );
+    }
+
+    /// The key is a private key. Mode 0600 is part of the contract, and the
+    /// staging-then-link route must not lose it.
+    #[test]
+    fn the_created_key_is_readable_only_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("identity.pk8");
+        Identity::load_or_create_at(&path).expect("create");
+        let mode = std::fs::metadata(&path)
+            .expect("metadata")
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// A key file that is present but not a valid PKCS#8 document is an error,
+    /// not something to silently regenerate over — regenerating would change the
+    /// machine's identity behind the user's back.
+    #[test]
+    fn a_corrupt_key_file_is_an_error_rather_than_a_silent_reset() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("identity.pk8");
+        std::fs::write(&path, b"not a key").expect("write");
+        let err = Identity::load_or_create_at(&path)
+            .map(|_| ())
+            .expect_err("corrupt key");
+        assert!(err.to_string().contains("invalid identity key"), "{err}");
     }
 }
