@@ -8,6 +8,15 @@
 //! (emitted as [`KeyResult::CopyToClipboard`] / [`KeyResult::RequestPaste`]
 //! effects that the frontend performs).
 
+mod browse;
+mod command;
+mod pane;
+mod picker;
+mod rename;
+mod render;
+mod scroll;
+mod session;
+
 use std::time::Instant;
 
 use kmux_protocol::{format_pane_id, pane_index};
@@ -16,8 +25,7 @@ use crate::cmd;
 use crate::mode::{Action, Mode};
 
 use super::{
-    AppCore, COMMAND_HISTORY_CAP, DirBrowserRow, KeyResult, LaunchRow, PendingClose,
-    SOFT_CLOSE_GRACE, TopBarAction,
+    AppCore, DirBrowserRow, KeyResult, LaunchRow, PendingClose, SOFT_CLOSE_GRACE, TopBarAction,
 };
 
 impl AppCore {
@@ -34,29 +42,14 @@ impl AppCore {
             // ForwardKey is handled frontend-side (it needs the raw toolkit
             // event); it never reaches the core dispatch.
             Action::ForwardKey => {}
-            Action::CreateSession => {
-                // Never assume where a new session opens: default to the focused
-                // session's cwd, falling back to the app's initial cwd. A bare
-                // create with no cwd would resolve against the *daemon's* working
-                // directory, not the user's.
-                let cwd = self
-                    .active_session_cwd()
-                    .unwrap_or_else(|| self.initial_cwd.clone());
-                self.mgr.create_session(None, Some(&cwd), self.term_size);
-            }
+            Action::CreateSession => return self.on_create_session(),
             Action::CreatePane => {
                 self.mgr.create_pane(self.term_size);
             }
             Action::CloseSession => {
                 self.confirm_close_active_session();
             }
-            Action::ConfirmCloseSession => {
-                if let Mode::ConfirmCloseSession { word_id, .. } =
-                    std::mem::replace(&mut self.mode, Mode::Normal)
-                {
-                    self.mgr.close_session(&word_id);
-                }
-            }
+            Action::ConfirmCloseSession => return self.on_confirm_close_session(),
             Action::ClosePane => {
                 self.soft_close_active_pane();
             }
@@ -70,19 +63,7 @@ impl AppCore {
             Action::NextPaneInTab => self.cycle_pane_in_tab(1),
             Action::PrevPaneInTab => self.cycle_pane_in_tab(-1),
             Action::CloseTab => self.mgr.close_tab(),
-            Action::RenameTab => {
-                if let (Some(word_id), Some(tab_index)) = (
-                    self.mgr.active_session().map(ToString::to_string),
-                    self.mgr.active_tab(),
-                ) {
-                    let buffer = self.mgr.active_tab_name().unwrap_or_default();
-                    self.mode = Mode::RenameTab {
-                        word_id,
-                        tab_index,
-                        buffer,
-                    };
-                }
-            }
+            Action::RenameTab => return self.on_rename_tab(),
             Action::SplitRight => self
                 .mgr
                 .split_focused(kmux_protocol::messages::SplitDir::Horizontal),
@@ -102,41 +83,10 @@ impl AppCore {
             Action::CycleLayout => self.mgr.cycle_layout(),
             Action::ToggleZoom => self.mgr.toggle_zoom(),
             Action::FocusPaneAt(i) => self.focus_pane_at(i),
-            Action::JumpToSession(idx) => {
-                if idx < self.mgr.session_list().len() {
-                    let word_id = self.mgr.session_list()[idx].meta.word_id.clone();
-                    self.mgr.select_session(word_id);
-                }
-            }
-            Action::RenameSession => {
-                if let Some(word_id) = self.mgr.active_session().map(ToString::to_string) {
-                    let current_name = self
-                        .mgr
-                        .session_list()
-                        .iter()
-                        .find(|e| e.meta.word_id == word_id)
-                        .map(|e| e.meta.name.clone())
-                        .unwrap_or_default();
-                    self.mode = Mode::RenameSession {
-                        buffer: current_name,
-                        word_id,
-                    };
-                }
-            }
-            Action::RenameChar(ch) => {
-                if let Mode::RenameSession { buffer, .. } | Mode::RenameTab { buffer, .. } =
-                    &mut self.mode
-                {
-                    buffer.push(ch);
-                }
-            }
-            Action::RenameBackspace => {
-                if let Mode::RenameSession { buffer, .. } | Mode::RenameTab { buffer, .. } =
-                    &mut self.mode
-                {
-                    buffer.pop();
-                }
-            }
+            Action::JumpToSession(idx) => return self.on_jump_to_session(idx),
+            Action::RenameSession => return self.on_rename_session(),
+            Action::RenameChar(ch) => return self.on_rename_char(ch),
+            Action::RenameBackspace => return self.on_rename_backspace(),
             Action::RenameSubmit => match std::mem::replace(&mut self.mode, Mode::Normal) {
                 Mode::RenameSession { buffer, word_id } => {
                     let new_name = buffer.trim().to_string();
@@ -158,57 +108,16 @@ impl AppCore {
             Action::SelectPickerEntry => {
                 self.select_session_picker_entry();
             }
-            Action::PickerUp => {
-                if self.session_picker_selected > 0 {
-                    self.session_picker_selected -= 1;
-                }
-            }
-            Action::PickerDown => {
-                // total rows = 1 ("[+] New session") + filtered sessions.
-                let total = self.session_picker_matches().len() + 1;
-                if self.session_picker_selected + 1 < total {
-                    self.session_picker_selected += 1;
-                }
-            }
-            Action::PickerSearchChar(ch) => {
-                self.session_picker_search.push(ch);
-                self.session_picker_selected = 0;
-            }
-            Action::PickerSearchBackspace => {
-                self.session_picker_search.pop();
-                self.session_picker_selected = 0;
-            }
-            Action::Disconnect => {
-                self.mgr.disconnect();
-                self.mode = Mode::Normal;
-            }
-            Action::SendSignal(signal) => {
-                if let Some(pane_id) = self.mgr.active_pane_id().map(ToString::to_string) {
-                    self.mgr.send_signal(&pane_id, signal);
-                }
-            }
-            Action::ScrollUp(n) => {
-                if let Some(grid) = self.mgr.active_grid_mut() {
-                    grid.scroll_up(n);
-                }
-            }
-            Action::ScrollDown(n) => {
-                if let Some(grid) = self.mgr.active_grid_mut() {
-                    grid.scroll_down(n);
-                }
-            }
-            Action::ScrollPageUp => {
-                if let Some(grid) = self.mgr.active_grid_mut() {
-                    let rows = grid.rows;
-                    grid.scroll_up(rows);
-                }
-            }
-            Action::ScrollPageDown => {
-                if let Some(grid) = self.mgr.active_grid_mut() {
-                    let rows = grid.rows;
-                    grid.scroll_down(rows);
-                }
-            }
+            Action::PickerUp => return self.on_picker_up(),
+            Action::PickerDown => return self.on_picker_down(),
+            Action::PickerSearchChar(ch) => return self.on_picker_search_char(ch),
+            Action::PickerSearchBackspace => return self.on_picker_search_backspace(),
+            Action::Disconnect => return self.on_disconnect(),
+            Action::SendSignal(signal) => return self.on_send_signal(signal),
+            Action::ScrollUp(n) => return self.on_scroll_up(n),
+            Action::ScrollDown(n) => return self.on_scroll_down(n),
+            Action::ScrollPageUp => return self.on_scroll_page_up(),
+            Action::ScrollPageDown => return self.on_scroll_page_down(),
             Action::ToggleHud => {
                 self.hud_visible = !self.hud_visible;
             }
@@ -227,20 +136,8 @@ impl AppCore {
             Action::ToggleRenderDebug => {
                 self.render_debug_visible = !self.render_debug_visible;
             }
-            Action::ResetRenderer => {
-                tracing::info!(
-                    target: "kmux::render_debug",
-                    "ResetRenderer requested: rebuilding renderer + atlas, full repaint"
-                );
-                // Force a full re-pack/repaint; the frontend rebuilds its own
-                // renderer/atlas on the resulting effect (it owns that object).
-                self.force_clear = true;
-                return KeyResult::ResetRenderer;
-            }
-            Action::ToggleSnapshotMode => {
-                self.force_snapshot_mode = !self.force_snapshot_mode;
-                self.mgr.set_snapshot_mode(self.force_snapshot_mode);
-            }
+            Action::ResetRenderer => return self.on_reset_renderer(),
+            Action::ToggleSnapshotMode => return self.on_toggle_snapshot_mode(),
             Action::ToggleInputLock => {
                 self.mgr.toggle_input_lock();
             }
@@ -253,59 +150,29 @@ impl AppCore {
             Action::ToggleActiveSessionNoAutoPause => {
                 self.toggle_active_session_no_auto_pause();
             }
-            Action::CopySelection => {
-                if let Some(text) = self
-                    .mgr
-                    .active_grid()
-                    .and_then(kmux_client::grid::CellGrid::selected_text)
-                {
-                    return KeyResult::CopyToClipboard(text);
-                }
-            }
+            Action::CopySelection => return self.on_copy_selection(),
             Action::Paste => {
                 return KeyResult::RequestPaste;
             }
             Action::ExitToNormal => {
                 self.mode = Mode::Normal;
             }
-            Action::DirPickerChar(ch) => {
-                self.dir_picker_buffer.push(ch);
-                self.dir_picker_selected = 0;
-            }
-            Action::DirPickerBackspace => {
-                self.dir_picker_buffer.pop();
-                self.dir_picker_selected = 0;
-            }
+            Action::DirPickerChar(ch) => return self.on_dir_picker_char(ch),
+            Action::DirPickerBackspace => return self.on_dir_picker_backspace(),
             Action::DirPickerUp => {
                 self.dir_picker_selected = self.dir_picker_selected.saturating_sub(1);
             }
-            Action::DirPickerDown => {
-                let count = self.dir_browser_rows().len();
-                if count > 0 && self.dir_picker_selected + 1 < count {
-                    self.dir_picker_selected += 1;
-                }
-            }
+            Action::DirPickerDown => return self.on_dir_picker_down(),
             Action::DirPickerSubmit => {
                 self.submit_dir_browser_row();
             }
             Action::DirPickerCancel => {}
-            Action::LaunchSearchChar(ch) => {
-                self.launch_search.push(ch);
-                self.launch_selected = 0;
-            }
-            Action::LaunchSearchBackspace => {
-                self.launch_search.pop();
-                self.launch_selected = 0;
-            }
+            Action::LaunchSearchChar(ch) => return self.on_launch_search_char(ch),
+            Action::LaunchSearchBackspace => return self.on_launch_search_backspace(),
             Action::LaunchUp => {
                 self.launch_selected = self.launch_selected.saturating_sub(1);
             }
-            Action::LaunchDown => {
-                let count = self.launch_rows().len();
-                if count > 0 && self.launch_selected + 1 < count {
-                    self.launch_selected += 1;
-                }
-            }
+            Action::LaunchDown => return self.on_launch_down(),
             Action::LaunchSelect => {
                 self.submit_launch_row();
             }
@@ -326,155 +193,25 @@ impl AppCore {
             Action::ForceRedraw => {
                 self.force_clear = true;
             }
-
             // ── Command palette editing ──────────────────────────────────────
-            Action::CommandChar(ch) => {
-                if let Mode::Command(state) = &mut self.mode {
-                    let pos = state.cursor.min(state.buffer.len());
-                    state.buffer.insert(pos, ch);
-                    state.cursor = pos + ch.len_utf8();
-                    state.selected = 0;
-                    state.history_pos = None;
-                }
-            }
-            Action::CommandBackspace => {
-                if let Mode::Command(state) = &mut self.mode {
-                    let pos = state.cursor.min(state.buffer.len());
-                    if pos > 0 {
-                        // Find the previous char boundary so we delete a full
-                        // grapheme rather than splitting a multi-byte char.
-                        let mut new_pos = pos - 1;
-                        while !state.buffer.is_char_boundary(new_pos) && new_pos > 0 {
-                            new_pos -= 1;
-                        }
-                        state.buffer.replace_range(new_pos..pos, "");
-                        state.cursor = new_pos;
-                        state.selected = 0;
-                        state.history_pos = None;
-                    }
-                }
-            }
-            Action::CommandLeft => {
-                if let Mode::Command(state) = &mut self.mode
-                    && state.cursor > 0
-                {
-                    let mut new_pos = state.cursor - 1;
-                    while !state.buffer.is_char_boundary(new_pos) && new_pos > 0 {
-                        new_pos -= 1;
-                    }
-                    state.cursor = new_pos;
-                }
-            }
-            Action::CommandRight => {
-                if let Mode::Command(state) = &mut self.mode
-                    && state.cursor < state.buffer.len()
-                {
-                    let mut new_pos = state.cursor + 1;
-                    while new_pos < state.buffer.len() && !state.buffer.is_char_boundary(new_pos) {
-                        new_pos += 1;
-                    }
-                    state.cursor = new_pos;
-                }
-            }
-            Action::CommandHome => {
-                if let Mode::Command(state) = &mut self.mode {
-                    state.cursor = 0;
-                }
-            }
-            Action::CommandEnd => {
-                if let Mode::Command(state) = &mut self.mode {
-                    state.cursor = state.buffer.len();
-                }
-            }
+            Action::CommandChar(ch) => return self.on_command_char(ch),
+            Action::CommandBackspace => return self.on_command_backspace(),
+            Action::CommandLeft => return self.on_command_left(),
+            Action::CommandRight => return self.on_command_right(),
+            Action::CommandHome => return self.on_command_home(),
+            Action::CommandEnd => return self.on_command_end(),
             Action::CommandHintUp => {
                 self.command_hint_up();
             }
             Action::CommandHintDown => {
                 self.command_hint_down();
             }
-            Action::CommandClearLine => {
-                if let Mode::Command(state) = &mut self.mode {
-                    state.buffer.clear();
-                    state.cursor = 0;
-                    state.selected = 0;
-                    state.history_pos = None;
-                }
-            }
-            Action::CommandDeleteWordBack => {
-                if let Mode::Command(state) = &mut self.mode {
-                    let mut end = state.cursor.min(state.buffer.len());
-                    // Skip trailing whitespace.
-                    while end > 0 {
-                        let prev = state.buffer[..end].chars().next_back();
-                        match prev {
-                            Some(c) if c.is_whitespace() => {
-                                end -= c.len_utf8();
-                            }
-                            _ => break,
-                        }
-                    }
-                    let mut start = end;
-                    while start > 0 {
-                        let prev = state.buffer[..start].chars().next_back();
-                        match prev {
-                            Some(c) if !c.is_whitespace() => {
-                                start -= c.len_utf8();
-                            }
-                            _ => break,
-                        }
-                    }
-                    state.buffer.replace_range(start..state.cursor, "");
-                    state.cursor = start;
-                    state.selected = 0;
-                    state.history_pos = None;
-                }
-            }
+            Action::CommandClearLine => return self.on_command_clear_line(),
+            Action::CommandDeleteWordBack => return self.on_command_delete_word_back(),
             Action::CommandComplete => {
                 self.command_apply_completion();
             }
-            Action::CommandSubmit => {
-                // Compute hints BEFORE we extract the state — they depend on
-                // the live `Mode::Command` and we'll fall back to the selected
-                // hint if the typed buffer doesn't parse cleanly.
-                let hints = cmd::hint::build_hints(self);
-                let Mode::Command(state) = std::mem::replace(&mut self.mode, Mode::Normal) else {
-                    return KeyResult::Continue;
-                };
-                let typed = state.buffer.trim().to_string();
-                if typed.is_empty() {
-                    return KeyResult::Continue;
-                }
-                // Pick the buffer to actually run. If the typed text already
-                // resolves to a known command, run it. Otherwise, if there's a
-                // highlighted hint that completes a command name, apply it
-                // (matches user expectation: "press Enter on the highlighted
-                // suggestion"). Falls back to typed on no hints.
-                let parses_cleanly = cmd::parse::parse(&typed, cmd::registry::ALL).is_ok();
-                let buf = if parses_cleanly {
-                    typed.clone()
-                } else if let Some(hint) =
-                    hints.get(state.selected.min(hints.len().saturating_sub(1)))
-                {
-                    apply_hint_to_buffer(&state.buffer, hint).trim().to_string()
-                } else {
-                    typed.clone()
-                };
-                // Push the *typed* form into history (so users can recall what
-                // they actually pressed, not the auto-completed expansion).
-                if self.command_history.back().map(String::as_str) != Some(typed.as_str()) {
-                    self.command_history.push_back(typed.clone());
-                    while self.command_history.len() > COMMAND_HISTORY_CAP {
-                        self.command_history.pop_front();
-                    }
-                }
-                let outcome = cmd::exec::run(self, &buf);
-                match outcome {
-                    cmd::exec::Outcome::Continue => {}
-                    cmd::exec::Outcome::Quit => return KeyResult::Quit,
-                    cmd::exec::Outcome::Reconnect => return KeyResult::Reconnect,
-                }
-            }
-
+            Action::CommandSubmit => return self.on_command_submit(),
             Action::None => {}
         }
 

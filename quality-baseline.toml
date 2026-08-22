@@ -99,7 +99,7 @@ count = 6
 [[lints]]
 crate = "kmux-app"
 lint = "clippy::cognitive_complexity"
-count = 2
+count = 1
 
 [[lints]]
 crate = "kmux-app"
