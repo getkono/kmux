@@ -98,11 +98,6 @@ count = 6
 
 [[lints]]
 crate = "kmux-app"
-lint = "clippy::cognitive_complexity"
-count = 1
-
-[[lints]]
-crate = "kmux-app"
 lint = "clippy::expect_used"
 count = 4
 
@@ -114,7 +109,7 @@ count = 12
 [[lints]]
 crate = "kmux-app"
 lint = "clippy::match_same_arms"
-count = 11
+count = 10
 
 [[lints]]
 crate = "kmux-app"

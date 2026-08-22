@@ -77,130 +77,152 @@ impl AppCore {
     /// only `CopyToClipboard`, from OSC 52 writes honored by the active-session
     /// policy. The frontend applies them with its own clipboard API.
     pub fn handle_session_events(&mut self, events: Vec<SessionEvent>) -> Vec<KeyResult> {
-        let mut effects = Vec::new();
-        for event in events {
-            match event {
-                SessionEvent::AuthFailed { reason } => {
-                    // SSH-only architecture: auth failure on the data plane
-                    // means the SSH tunnel is up but the daemon rejected the
-                    // token. Surface as a disconnect; the user can reconnect.
-                    // Log it too — every other GUI-visible disconnect path emits
-                    // a `warn!`, so this must as well or the overlay shows an
-                    // error with nothing in the client log to explain it.
-                    warn!(%reason, "authentication failed");
-                    self.mode = Mode::Disconnected {
-                        reason: "authentication failed".into(),
-                    };
-                }
-                SessionEvent::AuthOk => {
-                    if matches!(self.mode, Mode::Connecting { .. }) {
-                        self.mode = Mode::Normal;
-                    }
-                    info!("Auth succeeded");
-                    self.write_connection_log();
-                    // Record this server as recently used.
-                    self.recent_servers.record_connection(
-                        &self.server_string.clone(),
-                        &self.server_display.clone(),
-                        self.server_kind.clone(),
-                    );
-                }
-                SessionEvent::SessionListReceived => {
-                    // Update cached session list for current server (self-healing: stale
-                    // sessions that no longer exist on the server are silently dropped).
-                    let live_sessions = self.mgr.session_list().to_vec();
-                    let server_string = self.server_string.clone();
-                    self.recent_servers
-                        .update_sessions(&server_string, &live_sessions);
+        events
+            .into_iter()
+            .filter_map(|event| self.handle_session_event(event))
+            .collect()
+    }
 
-                    if !self.did_auto_select {
-                        self.did_auto_select = true;
-                        self.auto_select_session();
-                    }
-                }
-                SessionEvent::ClipboardCopy {
-                    pane_id,
-                    selection,
-                    data,
-                } => {
-                    if let Some(eff) = osc52_clipboard_effect(
-                        self.mgr.active_session(),
-                        &pane_id,
-                        &selection,
-                        &data,
-                    ) {
-                        effects.push(eff);
-                    }
-                }
-                SessionEvent::PaneAttention {
-                    word_id,
-                    pane_id,
-                    kind,
-                    title,
-                    body,
-                    attention_id,
-                } => {
-                    self.mgr.mark_pane_attention(pane_id.clone());
-                    // Pure relay to the frontend: window selection + dedup is
-                    // toolkit-specific (a frontend owns all its windows), so the
-                    // policy lives there (issue #169).
-                    effects.push(KeyResult::Attention {
-                        word_id,
-                        pane_id,
-                        kind,
-                        title,
-                        body,
-                        attention_id,
-                    });
-                }
-                SessionEvent::PaneBell { .. } => {}
-                SessionEvent::PaneFaulted { pane_id } => {
-                    // Issue #126's user-facing half. The pane's shell survived —
-                    // the daemon holds the PTY master fd and is respawning the
-                    // worker, which resyncs the grid — so this is a transient
-                    // notice, not a disconnect and not an exit. Without it the
-                    // pane simply freezes and then repaints with no explanation.
-                    warn!(%pane_id, "pane VT worker crashed; recovering");
-                    self.mgr.set_status_msg(format!(
-                        "Pane '{pane_id}' is recovering (its terminal engine crashed)"
-                    ));
-                }
-                SessionEvent::PeerOpened { peer } => {
-                    // The remote is now federated through the local daemon (issue
-                    // #121). Mark it connected, re-arm auto-select, and refresh the
-                    // list so the remote's sessions — not the pre-federation local
-                    // list — drive the picker.
-                    info!(%peer, "federated peer opened");
-                    self.peer_status.insert(peer, RemoteStatus::Connected);
-                    if matches!(self.mode, Mode::Connecting { .. }) {
-                        self.mode = Mode::Normal;
-                    }
-                    self.did_auto_select = false;
-                    self.mgr.request_session_list();
-                }
-                SessionEvent::PeerError { peer, reason } => {
-                    warn!(?peer, %reason, "federated peer failed to open");
-                    // Isolate a launcher-initiated failure to its remote (the row
-                    // shows the error). Only the CLI `--server` peer failing during
-                    // the initial bootstrap still surfaces as a global disconnect —
-                    // there is no other server to fall back to. A failure the daemon
-                    // could not attribute (peer: None) also disconnects globally.
-                    let bootstrapping = matches!(self.mode, Mode::Connecting { .. });
-                    let is_desired = matches!(
-                        (&peer, &self.desired_peer),
-                        (Some(p), Some(t)) if *p == t.peer_id()
-                    );
-                    match peer {
-                        Some(p) if !(bootstrapping && is_desired) => {
-                            self.peer_status.insert(p, RemoteStatus::Error(reason));
-                        }
-                        _ => self.enter_disconnected(DisconnectReason::BootstrapFailed(reason)),
-                    }
-                }
-                _ => {}
-            }
+    /// Route one [`SessionEvent`] to its named handler. Arms only destructure
+    /// and call (docs/testing.md R4); every handler returns the router's effect
+    /// type so a test can assert on what an arm decided, not merely that it ran.
+    fn handle_session_event(&mut self, event: SessionEvent) -> Option<KeyResult> {
+        match event {
+            SessionEvent::AuthFailed { reason } => self.on_auth_failed(&reason),
+            SessionEvent::AuthOk => self.on_auth_ok(),
+            SessionEvent::SessionListReceived => self.on_session_list_received(),
+            SessionEvent::ClipboardCopy {
+                pane_id,
+                selection,
+                data,
+            } => osc52_clipboard_effect(self.mgr.active_session(), &pane_id, &selection, &data),
+            SessionEvent::PaneAttention {
+                word_id,
+                pane_id,
+                kind,
+                title,
+                body,
+                attention_id,
+            } => self.on_pane_attention(word_id, pane_id, kind, title, body, attention_id),
+            SessionEvent::PaneFaulted { pane_id } => self.on_pane_faulted(&pane_id),
+            SessionEvent::PeerOpened { peer } => self.on_peer_opened(peer),
+            SessionEvent::PeerError { peer, reason } => self.on_peer_error(peer, reason),
+            _ => None,
         }
-        effects
+    }
+
+    /// SSH-only architecture: auth failure on the data plane means the SSH
+    /// tunnel is up but the daemon rejected the token. Surface as a disconnect;
+    /// the user can reconnect. Log it too — every other GUI-visible disconnect
+    /// path emits a `warn!`, so this must as well or the overlay shows an error
+    /// with nothing in the client log to explain it.
+    fn on_auth_failed(&mut self, reason: &str) -> Option<KeyResult> {
+        warn!(%reason, "authentication failed");
+        self.mode = Mode::Disconnected {
+            reason: "authentication failed".into(),
+        };
+        None
+    }
+
+    fn on_auth_ok(&mut self) -> Option<KeyResult> {
+        if matches!(self.mode, Mode::Connecting { .. }) {
+            self.mode = Mode::Normal;
+        }
+        info!("Auth succeeded");
+        self.write_connection_log();
+        // Record this server as recently used.
+        self.recent_servers.record_connection(
+            &self.server_string.clone(),
+            &self.server_display.clone(),
+            self.server_kind.clone(),
+        );
+        None
+    }
+
+    /// Update the cached session list for the current server (self-healing:
+    /// stale sessions that no longer exist on the server are silently dropped),
+    /// then run auto-select once.
+    fn on_session_list_received(&mut self) -> Option<KeyResult> {
+        let live_sessions = self.mgr.session_list().to_vec();
+        let server_string = self.server_string.clone();
+        self.recent_servers
+            .update_sessions(&server_string, &live_sessions);
+
+        if !self.did_auto_select {
+            self.did_auto_select = true;
+            self.auto_select_session();
+        }
+        None
+    }
+
+    /// Mark the pane unread, then relay to the frontend: window selection and
+    /// dedup are toolkit-specific (a frontend owns all its windows), so that
+    /// policy lives there (issue #169).
+    fn on_pane_attention(
+        &mut self,
+        word_id: String,
+        pane_id: String,
+        kind: kmux_protocol::messages::AttentionKind,
+        title: String,
+        body: String,
+        attention_id: u64,
+    ) -> Option<KeyResult> {
+        self.mgr.mark_pane_attention(pane_id.clone());
+        Some(KeyResult::Attention {
+            word_id,
+            pane_id,
+            kind,
+            title,
+            body,
+            attention_id,
+        })
+    }
+
+    /// Issue #126's user-facing half. The pane's shell survived — the daemon
+    /// holds the PTY master fd and is respawning the worker, which resyncs the
+    /// grid — so this is a transient notice, not a disconnect and not an exit.
+    /// Without it the pane simply freezes and then repaints with no explanation.
+    fn on_pane_faulted(&mut self, pane_id: &str) -> Option<KeyResult> {
+        warn!(%pane_id, "pane VT worker crashed; recovering");
+        self.mgr.set_status_msg(format!(
+            "Pane '{pane_id}' is recovering (its terminal engine crashed)"
+        ));
+        None
+    }
+
+    /// The remote is now federated through the local daemon (issue #121). Mark
+    /// it connected, re-arm auto-select, and refresh the list so the remote's
+    /// sessions — not the pre-federation local list — drive the picker.
+    fn on_peer_opened(&mut self, peer: String) -> Option<KeyResult> {
+        info!(%peer, "federated peer opened");
+        self.peer_status.insert(peer, RemoteStatus::Connected);
+        if matches!(self.mode, Mode::Connecting { .. }) {
+            self.mode = Mode::Normal;
+        }
+        self.did_auto_select = false;
+        self.mgr.request_session_list();
+        None
+    }
+
+    /// Isolate a launcher-initiated failure to its remote (the row shows the
+    /// error). Only the CLI `--server` peer failing during the initial bootstrap
+    /// still surfaces as a global disconnect — there is no other server to fall
+    /// back to. A failure the daemon could not attribute (`peer: None`) also
+    /// disconnects globally.
+    fn on_peer_error(&mut self, peer: Option<String>, reason: String) -> Option<KeyResult> {
+        warn!(?peer, %reason, "federated peer failed to open");
+        let bootstrapping = matches!(self.mode, Mode::Connecting { .. });
+        let is_desired = matches!(
+            (&peer, &self.desired_peer),
+            (Some(p), Some(t)) if *p == t.peer_id()
+        );
+        match peer {
+            Some(p) if !(bootstrapping && is_desired) => {
+                self.peer_status.insert(p, RemoteStatus::Error(reason));
+            }
+            _ => self.enter_disconnected(DisconnectReason::BootstrapFailed(reason)),
+        }
+        None
     }
 
     /// Auto-select or create a session based on CLI flags (--session, --cwd, :path).
