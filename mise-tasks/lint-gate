@@ -22,6 +22,9 @@ set -euo pipefail
 write=""
 [[ "${1:-}" == "--write" ]] && write="--write"
 
+# `xtask` is the gate's tool, not one of its measurement subjects, so it stays
+# in the shared build tree while the measurement below gets its own.
+SHARED_TARGET_DIR="${CARGO_TARGET_DIR:-target}"
 cargo build -q -p xtask
 
 # Read into an array, one flag per line. Never `$(...)` unquoted: whether that
@@ -33,6 +36,22 @@ while IFS= read -r flag; do flags+=("$flag"); done < <(cargo run -q -p xtask -- 
 
 json="$(mktemp -t kmux-lint-gate.XXXXXX.json)"
 trap 'rm -f "$json"' EXIT
+
+# A build cache of the gate's own, and never anyone else's.
+#
+# cargo emits diagnostics only for units it actually runs the driver on, and
+# replays them for units it considers fresh. Share a target dir with an ordinary
+# `cargo clippy` (different feature set, no `--force-warn`) and whole crates can
+# come back fresh with no diagnostics attached — which reads as "zero
+# violations" and turns every budget for that crate into a stale one. Observed:
+# a gate run immediately after `cargo clippy --all-features` reported 0 for all
+# of kmux-app, kmux-ffi and kmux-gtk; re-running alone gave the real counts.
+#
+# The gate's numbers have to be reproducible to be worth anything, so it pays
+# for its own tree. `xtask` still builds in the shared one — it is a tool here,
+# not a measurement subject.
+export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-target}/lint-gate"
+export CARGO_INCREMENTAL=0
 
 set +e
 cargo clippy --workspace --all-targets --message-format=json -- -D warnings "${flags[@]}" >"$json"
@@ -49,7 +68,7 @@ if [[ -n "$write" && $clippy_rc -ne 0 ]]; then
     exit "$clippy_rc"
 fi
 
-cargo run -q -p xtask -- lint-gate $write <"$json"
+CARGO_TARGET_DIR="${SHARED_TARGET_DIR}" cargo run -q -p xtask -- lint-gate $write <"$json"
 
 # Same reason, for the checking direction: a failure with no attributable
 # diagnostic would otherwise slip past a gate that only reads diagnostics.

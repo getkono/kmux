@@ -70,6 +70,26 @@ phantom "stale budget" lines. This failure mode is not hypothetical: it is
 exactly how the June 2026 mutation baseline came to report a fabricated 100% for
 three crates.
 
+**A build cache of its own.** The gate exports
+`CARGO_TARGET_DIR=target/lint-gate`. cargo emits diagnostics only for units it
+actually runs the driver on and replays them for units it considers fresh, so
+sharing a tree with an ordinary `cargo clippy` — different features, no
+`--force-warn` — lets whole crates come back fresh with nothing attached. A gate
+run immediately after `cargo clippy --all-features` reported **0 violations for
+all of kmux-app, kmux-ffi and kmux-gtk**; re-running it alone gave the real
+counts. Numbers that depend on what you happened to run beforehand are not
+measurements. The extra tree is the price.
+
+**The unmeasured sentinel.** Prevention is not proof, so the gate also refuses a
+result it should not believe: a crate whose *every* budgeted lint reads zero
+against a combined budget of ten or more did not get measured — it did not fix
+hundreds of violations across twenty lints at once. Ten is low enough that a
+small crate genuinely clearing out still passes. Like the mutation gate's
+believability check, this runs before the budget comparison and suppresses it,
+and `--write` refuses outright; unlike it, the danger is a budget silently
+tightened to zero, after which the next real violation reads as a regression
+from a clean sheet.
+
 ### Graduating a lint
 
 When a ratcheted lint reaches zero everywhere, it stops needing a budget and

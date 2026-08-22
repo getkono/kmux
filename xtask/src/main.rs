@@ -6,7 +6,7 @@ use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
-use xtask::baseline::{Baseline, Finding, compare};
+use xtask::baseline::{self, Baseline, Finding, compare};
 use xtask::graph::Graph;
 use xtask::{lint, mutants};
 
@@ -130,6 +130,19 @@ fn lint_gate(write: bool) -> Result<()> {
                 measured.errors.len()
             );
         }
+        // Same refusal for the other way a run comes back empty: no error, no
+        // diagnostics, because cargo replayed a cache the gate's flags never
+        // populated. Writing that records zeros for a crate nobody measured.
+        let unmeasured = baseline::implausibly_clear(&baseline.lint_budgets(), &measured.counts);
+        if !unmeasured.is_empty() {
+            for u in &unmeasured {
+                eprintln!("baseline: {u}");
+            }
+            bail!(
+                "refusing to write a baseline in which {} crate(s) reported nothing at all.",
+                unmeasured.len()
+            );
+        }
         return rewrite(&path, &baseline, &measured.counts, &allows);
     }
 
@@ -157,7 +170,23 @@ fn lint_gate(write: bool) -> Result<()> {
     // as a dozen "stale budget" failures that vanish the moment the real error
     // is fixed. Reporting those alongside the actual cause is worse than not
     // reporting them: it buries it.
-    if measured.errors.is_empty() {
+    // Believability before budget, the same order the mutation gate uses. A
+    // crate that reports nothing at all against a large budget was not measured;
+    // saying so beats twenty "stale budget" lines that invite someone to record
+    // zeros.
+    let unmeasured = if measured.errors.is_empty() {
+        baseline::implausibly_clear(&baseline.lint_budgets(), &measured.counts)
+    } else {
+        // A hard-lint error already explains every crate downstream of it
+        // reading as zero; repeating that as "unmeasured" would bury the one
+        // line that matters.
+        Vec::new()
+    };
+    for u in &unmeasured {
+        failures.push(format!("unmeasured: {u}"));
+    }
+
+    if measured.errors.is_empty() && unmeasured.is_empty() {
         report(
             &mut failures,
             "lint",
@@ -340,11 +369,11 @@ fn rewrite(
 #[derive(serde::Serialize)]
 struct Tables {
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    lints: Vec<xtask::baseline::Budget>,
+    lints: Vec<baseline::Budget>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    allows: Vec<xtask::baseline::AllowBudget>,
+    allows: Vec<baseline::AllowBudget>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
-    mutants: Vec<xtask::baseline::MutantBudget>,
+    mutants: Vec<baseline::MutantBudget>,
 }
 
 /// Write a baseline, preserving the hand-written header and restamping the

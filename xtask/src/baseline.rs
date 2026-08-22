@@ -145,6 +145,60 @@ impl Finding {
 /// a count of zero on that side, which gives the right verdict without a
 /// special case: a brand-new violation reads as `Regressed` from 0, and a
 /// budget whose violations are all gone reads as `Stale` to 0.
+/// Crates whose every budgeted lint measured zero against a budget this large.
+///
+/// A crate does not go from hundreds of violations across twenty lints to zero
+/// by accident. What does produce that shape is a measurement that never
+/// happened: cargo replaying a cache populated by a *different* flag set emits
+/// no diagnostics for units it considers fresh, and every one of that crate's
+/// budgets then reads as stale. Tightening them at that moment records zeros,
+/// after which the first real violation looks like a regression from a clean
+/// sheet — the same class of self-inflicted wound as the fabricated mutation
+/// baseline, arrived at from the opposite direction.
+///
+/// Ten is low enough that a small crate really clearing out still passes, and
+/// high enough that a lost measurement of a large one does not.
+const IMPLAUSIBLE_CLEARANCE: usize = 10;
+
+/// Crates that reported nothing at all against a substantial budget.
+///
+/// Returns one message per crate, empty when every crate either reported
+/// something or had little to report.
+#[must_use]
+pub fn implausibly_clear(
+    budgets: &BTreeMap<String, usize>,
+    observed: &BTreeMap<String, usize>,
+) -> Vec<String> {
+    let mut per_crate: BTreeMap<&str, (usize, usize)> = BTreeMap::new();
+    for (key, budget) in budgets {
+        let Some((krate, _lint)) = key.split_once('/') else {
+            continue;
+        };
+        let entry = per_crate.entry(krate).or_default();
+        entry.0 += budget;
+        entry.1 += observed.get(key).copied().unwrap_or(0);
+    }
+    per_crate
+        .into_iter()
+        .filter(|&(_, (budget, seen))| seen == 0 && budget >= IMPLAUSIBLE_CLEARANCE)
+        .map(|(krate, (budget, _))| {
+            format!(
+                "{krate}: every budgeted lint measured zero against a budget of {budget}. \
+                 That is a measurement that did not happen, not {budget} violations fixed \
+                 at once — check that clippy actually rebuilt this crate."
+            )
+        })
+        .collect()
+}
+
+/// Compare measured counts against budgets.
+///
+/// `observed` and `budgets` are both keyed by whatever identifies a row —
+/// `crate/lint` for lints, `crate` for allows — so this one function serves
+/// both tables. A key present on one side and absent on the other is treated as
+/// a count of zero on that side, which gives the right verdict without a
+/// special case: a brand-new violation reads as `Regressed` from 0, and a
+/// budget whose violations are all gone reads as `Stale` to 0.
 pub fn compare(
     budgets: &BTreeMap<String, usize>,
     observed: &BTreeMap<String, usize>,
@@ -457,5 +511,61 @@ mod tests {
         assert_eq!(b.lint_budgets(), counts(&[("a/clippy::x", 7)]));
         assert_eq!(b.allow_budgets(), counts(&[("a", 2)]));
         assert_eq!(b.mutant_budgets(), counts(&[("a", 5)]));
+    }
+
+    fn budgets(rows: &[(&str, usize)]) -> BTreeMap<String, usize> {
+        rows.iter().map(|&(k, v)| ((*k).to_string(), v)).collect()
+    }
+
+    /// The shape a lost measurement takes: every lint of one crate at zero,
+    /// against a budget far too large to have been cleared in one go.
+    #[test]
+    fn a_crate_reporting_nothing_against_a_large_budget_is_flagged() {
+        let found = implausibly_clear(
+            &budgets(&[
+                ("kmux-ffi/clippy::expect_used", 85),
+                ("kmux-ffi/missing_docs", 300),
+                ("kmux-app/clippy::unwrap_used", 4),
+            ]),
+            &budgets(&[("kmux-app/clippy::unwrap_used", 4)]),
+        );
+        assert_eq!(found.len(), 1, "{found:?}");
+        assert!(found[0].starts_with("kmux-ffi:"), "{found:?}");
+        assert!(
+            found[0].contains("385"),
+            "the budget it should have met: {found:?}"
+        );
+    }
+
+    /// One lint of a crate going quiet is ordinary progress, not a lost
+    /// measurement — the crate still reported something.
+    #[test]
+    fn a_crate_that_reports_some_violations_is_not_flagged() {
+        let found = implausibly_clear(
+            &budgets(&[
+                ("kmux-ffi/clippy::expect_used", 85),
+                ("kmux-ffi/missing_docs", 300),
+            ]),
+            &budgets(&[("kmux-ffi/missing_docs", 300)]),
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A small budget really can be cleared in one commit, so the sentinel must
+    /// not stand in the way of it.
+    #[test]
+    fn a_small_budget_cleared_entirely_is_allowed_through() {
+        let found = implausibly_clear(
+            &budgets(&[("kmux-sys/clippy::unwrap_used", 9)]),
+            &BTreeMap::new(),
+        );
+        assert!(found.is_empty(), "{found:?}");
+    }
+
+    /// A crate at zero budget cannot be under-measured relative to nothing.
+    #[test]
+    fn a_crate_with_no_budget_is_never_flagged() {
+        let found = implausibly_clear(&budgets(&[("kmux/missing_docs", 0)]), &BTreeMap::new());
+        assert!(found.is_empty(), "{found:?}");
     }
 }
