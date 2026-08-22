@@ -86,7 +86,7 @@ uniffi::setup_scaffolding!();
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol range).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 25;
+pub const KMUX_FFI_ABI_VERSION: u32 = 26;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -626,6 +626,61 @@ pub struct FfiCursorRect {
     pub y: f32,
     pub w: f32,
     pub h: f32,
+}
+
+/// The solid rects a cursor occupies, in physical px relative to the pane's
+/// top-left — exactly the rects the GPU renderer fills.
+///
+/// A CPU frontend needs these to *draw* the cursor, not only to inspect it.
+/// Both the wgpu path and the GTK Cairo path read
+/// [`kmux_render::cursor_geometry`]; before this existed, Swift's CoreText path
+/// had no way to and rasterized its own, with a hardcoded 2px bar/underline
+/// against the renderer's scale-aware thickness — so the same cursor looked
+/// different depending on the renderer, and too thin on a Retina display.
+///
+/// Free-standing rather than a `KmuxDriver` method: it is pure geometry over its
+/// arguments, so it neither needs nor should take the driver's lock on the draw
+/// path.
+///
+/// Takes the cursor's position and shape rather than an [`FfiCursor`] because
+/// `visible` and `blink` deliberately do not enter into it — geometry is what
+/// the cursor *would* occupy, and whether to draw it this frame is the caller's
+/// question (`FfiCursor::visible`, and the blink phase). A cursor outside the
+/// grid, or of a shape this build does not know, yields no rects, so a frontend
+/// can fill whatever it is handed without a range check of its own.
+#[uniffi::export]
+#[must_use]
+pub fn kmux_cursor_rects(
+    col: u32,
+    row: u32,
+    shape: u8,
+    cols: u32,
+    rows: u32,
+    cell_w: f32,
+    cell_h: f32,
+) -> Vec<FfiCursorRect> {
+    // Saturating rather than truncating: a coordinate too large for the grid's
+    // own type is out of range, and must read as out of range rather than
+    // wrapping to somewhere inside it.
+    let clamp = |v: u32| u16::try_from(v).unwrap_or(u16::MAX);
+    let view = CursorView {
+        col: clamp(col),
+        row: clamp(row),
+        shape: packed::cursor_shape_from_code(shape),
+        blink: false,
+        visible: true,
+    };
+    let cell = kmux_render::CellMetrics::new(cell_w, cell_h);
+    kmux_render::cursor_geometry(&view, (0.0, 0.0), clamp(cols), clamp(rows), &cell)
+        .rects
+        .into_iter()
+        .map(|r| FfiCursorRect {
+            x: r.x,
+            y: r.y,
+            w: r.w,
+            h: r.h,
+        })
+        .collect()
 }
 
 /// What the renderer is handed for the focused pane this frame, for the Swift
@@ -3285,6 +3340,52 @@ mod tests {
         // app, or in CI. uniffi's regenerated binding-checksum check is what
         // actually guards against stale bindings/dylib drift.
         assert_eq!(kmux_ffi_abi_version(), KMUX_FFI_ABI_VERSION);
+    }
+
+    /// The whole point of exporting this is that Swift draws what the other two
+    /// renderers draw. A shape whose rects diverge here is a cursor that looks
+    /// different on macOS, which is the bug this replaced.
+    #[test]
+    fn exported_cursor_rects_are_the_renderer_s_own() {
+        for code in 0_u8..=4 {
+            let exported = kmux_cursor_rects(2, 1, code, 10, 5, 8.0, 16.0);
+
+            let view = CursorView {
+                col: 2,
+                row: 1,
+                shape: packed::cursor_shape_from_code(code),
+                blink: false,
+                visible: true,
+            };
+            let expected = kmux_render::cursor_geometry(
+                &view,
+                (0.0, 0.0),
+                10,
+                5,
+                &kmux_render::CellMetrics::new(8.0, 16.0),
+            );
+            let got: Vec<_> = exported.iter().map(|r| (r.x, r.y, r.w, r.h)).collect();
+            let want: Vec<_> = expected
+                .rects
+                .iter()
+                .map(|r| (r.x, r.y, r.w, r.h))
+                .collect();
+            assert_eq!(got, want, "shape code {code}");
+        }
+    }
+
+    /// Out of range and hidden both draw nothing, so a frontend can fill
+    /// whatever it is handed without a range check of its own.
+    #[test]
+    fn a_cursor_with_nothing_to_draw_yields_no_rects() {
+        // Out of range in either axis, including a value too large for the
+        // grid's own u16.
+        assert!(kmux_cursor_rects(0, 99, 0, 10, 5, 8.0, 16.0).is_empty());
+        assert!(kmux_cursor_rects(u32::MAX, 0, 0, 10, 5, 8.0, 16.0).is_empty());
+        // Hidden.
+        assert!(kmux_cursor_rects(0, 0, 4, 10, 5, 8.0, 16.0).is_empty());
+        // And a code from a build that knows more shapes than this one.
+        assert!(kmux_cursor_rects(0, 0, 200, 10, 5, 8.0, 16.0).is_empty());
     }
 
     #[test]

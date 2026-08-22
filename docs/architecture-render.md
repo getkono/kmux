@@ -175,8 +175,10 @@ They did not. Cairo and CoreText each rasterized the cursor with their own
 constants: a hardcoded **2px** bar/underline and a **1px** hollow outline,
 against the renderer's scale-aware `cursor_thickness` (`(cell_h*0.1).max(1)`).
 On a HiDPI display the cell doubles and those constants did not, so the same
-cursor was thinner under Cairo than under wgpu — the bug this overlay was built
-to surface, and which it did.
+cursor was thinner on the CPU paths than under wgpu — the bug this overlay was
+built to surface, and which it did. Cairo now calls `cursor_geometry` directly;
+Swift reaches it through the `kmux_cursor_rects` FFI export, which exists for
+exactly this reason and returns the same rects.
 
 **Structured traces** — under the `kmux::render_debug` target:
 

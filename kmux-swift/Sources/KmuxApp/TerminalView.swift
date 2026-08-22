@@ -388,40 +388,47 @@ final class TerminalNSView: NSView {
         if cursor.blink && !model.blinkOn { return }
         guard let ctx = NSGraphicsContext.current?.cgContext else { return }
 
+        guard let snap = model.snapshot else { return }
+
+        // Geometry comes from `kmux-render`, the same function the wgpu and GTK
+        // Cairo paths draw from. This used to rasterize its own — a hardcoded
+        // 2pt bar/underline and a 1pt hollow outline — against the renderer's
+        // scale-aware `cursor_thickness`, so the same cursor was drawn
+        // differently depending on the renderer and was visibly too thin on a
+        // Retina display, where the cell doubles and a fixed 2pt does not.
+        let rects = kmuxCursorRects(
+            col: cursor.col,
+            row: cursor.row,
+            shape: cursor.shape,
+            cols: snap.cols,
+            rows: snap.rows,
+            cellW: Float(m.cellWidth),
+            cellH: Float(m.cellHeight)
+        )
+        guard !rects.isEmpty else { return }
+
+        ctx.setFillColor(theme.cursorBg.cgColor)
+        for r in rects {
+            ctx.fill(
+                CGRect(
+                    x: CGFloat(r.x), y: CGFloat(r.y),
+                    width: CGFloat(r.w), height: CGFloat(r.h)))
+        }
+
+        // An inverted block covers the glyph, so redraw it in `cursor_fg` to
+        // keep it legible. The other shapes leave the cell's own text alone.
+        guard cursor.shape == 0 else { return }
         let x = CGFloat(cursor.col) * m.cellWidth
         let y = CGFloat(cursor.row) * m.cellHeight
-        let rect = CGRect(x: x, y: y, width: m.cellWidth, height: m.cellHeight)
-
-        switch cursor.shape {
-        case 0:  // block: invert, then redraw the underlying glyph in cursor_fg
-            ctx.setFillColor(theme.cursorBg.cgColor)
-            ctx.fill(rect)
-            if let snap = model.snapshot {
-                let idx = Int(cursor.row) * Int(snap.cols) + Int(cursor.col)
-                if (idx + 1) * PackedCellLayout.stride <= snap.cells.count {
-                    let cell = snap.cells.withUnsafeBytes { PackedCellLayout.decode($0, idx) }
-                    if let ch = cell.character {
-                        let font = self.font(for: ch, bold: cell.bold, italic: cell.italic)
-                        NSAttributedString(
-                            string: String(ch),
-                            attributes: [.font: font, .foregroundColor: theme.cursorFg.nsColor]
-                        ).draw(at: CGPoint(x: x, y: y))
-                    }
-                }
-            }
-        case 3:  // hollow block: outline
-            ctx.setStrokeColor(theme.cursorBg.cgColor)
-            ctx.setLineWidth(1)
-            ctx.stroke(rect.insetBy(dx: 0.5, dy: 0.5))
-        case 1:  // underline: bar at the bottom
-            ctx.setFillColor(theme.cursorBg.cgColor)
-            ctx.fill(CGRect(x: x, y: y + m.cellHeight - 2, width: m.cellWidth, height: 2))
-        case 2:  // bar: bar at the left
-            ctx.setFillColor(theme.cursorBg.cgColor)
-            ctx.fill(CGRect(x: x, y: y, width: 2, height: m.cellHeight))
-        default:
-            break
-        }
+        let idx = Int(cursor.row) * Int(snap.cols) + Int(cursor.col)
+        guard (idx + 1) * PackedCellLayout.stride <= snap.cells.count else { return }
+        let cell = snap.cells.withUnsafeBytes { PackedCellLayout.decode($0, idx) }
+        guard let ch = cell.character else { return }
+        let font = self.font(for: ch, bold: cell.bold, italic: cell.italic)
+        NSAttributedString(
+            string: String(ch),
+            attributes: [.font: font, .foregroundColor: theme.cursorFg.nsColor]
+        ).draw(at: CGPoint(x: x, y: y))
     }
 
     private func drawSelection(_ ctx: CGContext, theme: FfiTheme, metrics m: TerminalMetrics) {
