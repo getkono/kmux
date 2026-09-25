@@ -153,6 +153,9 @@ mod listener {
     /// that has not finished by then is not going to.
     pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// Pause after a failed accept before the next one.
+    const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
     /// A connection a [`Listener`] accepted whose transport handshake has not
     /// run yet. The handshake is the part a peer can stall, so it runs in the
     /// connection's own task ([`PendingSession::establish`]), never on the
@@ -223,7 +226,12 @@ mod listener {
                     });
                 }
                 Err(AcceptError::Closed) => break,
-                Err(e) => tracing::warn!("accept error on {kind} listener: {e}"),
+                Err(e) => {
+                    tracing::warn!("accept error on {kind} listener: {e}");
+                    // Out of file descriptors fails every accept at once:
+                    // pause rather than spin until one is released.
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                }
             }
         }
     }
