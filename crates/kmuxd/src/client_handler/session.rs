@@ -19,7 +19,9 @@ use crate::app::{AttachResult, ConnectionMetrics, ServerApp};
 use crate::client_handler::{
     OutboundCompression, PaneAttacher, SharedClientState, handle_message, pty_event_to_msg,
 };
-use crate::outbound::{self, OUTBOUND_CAPACITY, OutboundRx, OutboundTx, close_channel};
+use crate::outbound::{
+    self, CloseReason, Closer, OUTBOUND_CAPACITY, OutboundRx, OutboundTx, close_channel,
+};
 
 /// Build the initial replay messages for a pane attach result.
 ///
@@ -113,8 +115,19 @@ fn spawn_authenticated_forwarders(
     (event_task, vt_task, ping_task)
 }
 
+/// Longest a single frame write, or a flush, may take before the connection
+/// is closed (issue #206). A peer that stops reading — its TCP window at zero —
+/// otherwise pins the writer task, and with it the connection, forever. Long
+/// enough for a large snapshot over a slow but live link.
+pub(crate) const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
 /// Drain a connection's outbound queue onto `writer` until every sender is
 /// gone or a write fails, then shut the transport down.
+///
+/// Every frame write and every flush must finish within `write_timeout`. One
+/// that does not closes the connection through `closer`
+/// ([`CloseReason::WriteTimeout`]); so does a failed write
+/// ([`CloseReason::WriteFailed`]), since nothing more can reach the client.
 ///
 /// Batches all immediately-available messages into one flush. Each
 /// `write_frame_compressed_into` writes a whole frame without flushing; a
@@ -127,6 +140,8 @@ async fn write_outbound<W: AsyncWrite + Unpin>(
     mut writer: W,
     metrics: Arc<ConnectionMetrics>,
     comp: Arc<OutboundCompression>,
+    closer: Closer,
+    write_timeout: Duration,
 ) {
     let mut batch: Vec<ServerMessage> = Vec::new();
     'writer: while let Some(first) = out_rx.recv().await {
@@ -141,36 +156,57 @@ async fn write_outbound<W: AsyncWrite + Unpin>(
         // The batch is off the queue: a lagged pane stream may resync.
         out_rx.mark_drained();
         for msg in batch.drain(..) {
-            match encode_server(&msg) {
-                Ok(bytes) => {
-                    crate::capture::record(msg.category(), &bytes);
-                    match write_frame_compressed_into(&mut writer, &bytes, comp.compressor()).await
-                    {
-                        Ok(wire_len) => {
-                            metrics
-                                .bytes_out
-                                .fetch_add(wire_len as u64, Ordering::Relaxed);
-                            // What the same frame would have cost uncompressed
-                            // (length prefix + codec tag + payload).
-                            metrics
-                                .bytes_out_uncompressed
-                                .fetch_add(5 + bytes.len() as u64, Ordering::Relaxed);
-                            metrics.msgs_out.fetch_add(1, Ordering::Relaxed);
-                        }
-                        // A write failure leaves only whole frames on the
-                        // wire (each frame is written in full before the
-                        // next); the client reconnects + resyncs.
-                        Err(_) => break 'writer,
-                    }
+            let bytes = match encode_server(&msg) {
+                Ok(bytes) => bytes,
+                Err(e) => {
+                    warn!("encode error: {e}");
+                    continue;
                 }
-                Err(e) => warn!("encode error: {e}"),
+            };
+            crate::capture::record(msg.category(), &bytes);
+            let write = write_frame_compressed_into(&mut writer, &bytes, comp.compressor());
+            match tokio::time::timeout(write_timeout, write).await {
+                Ok(Ok(wire_len)) => {
+                    metrics
+                        .bytes_out
+                        .fetch_add(wire_len as u64, Ordering::Relaxed);
+                    // What the same frame would have cost uncompressed
+                    // (length prefix + codec tag + payload).
+                    metrics
+                        .bytes_out_uncompressed
+                        .fetch_add(5 + bytes.len() as u64, Ordering::Relaxed);
+                    metrics.msgs_out.fetch_add(1, Ordering::Relaxed);
+                }
+                // A write failure leaves only whole frames on the wire (each
+                // frame is written in full before the next); the client
+                // reconnects + resyncs.
+                Ok(Err(_)) => {
+                    closer.close(CloseReason::WriteFailed);
+                    break 'writer;
+                }
+                Err(_) => {
+                    warn!(?write_timeout, "frame write timed out; peer is not reading");
+                    closer.close(CloseReason::WriteTimeout);
+                    break 'writer;
+                }
             }
         }
-        if kmux_protocol::flush(&mut writer).await.is_err() {
-            break;
+        match tokio::time::timeout(write_timeout, kmux_protocol::flush(&mut writer)).await {
+            Ok(Ok(())) => {}
+            Ok(Err(_)) => {
+                closer.close(CloseReason::WriteFailed);
+                break;
+            }
+            Err(_) => {
+                warn!(?write_timeout, "flush timed out; peer is not reading");
+                closer.close(CloseReason::WriteTimeout);
+                break;
+            }
         }
     }
-    let _ = writer.shutdown().await;
+    // Shutting a TLS stream down writes close_notify, which a stalled peer
+    // would block too.
+    let _ = tokio::time::timeout(write_timeout, writer.shutdown()).await;
 }
 
 /// Generic client session handler shared by QUIC and TCP connections.
@@ -212,11 +248,18 @@ pub async fn run_client_session<R, W, A, F>(
     ));
 
     let (closer, mut close_signal) = close_channel();
-    let (ctrl_tx, out_rx) = outbound::channel(OUTBOUND_CAPACITY, closer);
+    let (ctrl_tx, out_rx) = outbound::channel(OUTBOUND_CAPACITY, closer.clone());
 
     let mut writer_task = tokio::spawn(
-        write_outbound(out_rx, writer, Arc::clone(&metrics), Arc::clone(&comp_out))
-            .instrument(conn_span.clone()),
+        write_outbound(
+            out_rx,
+            writer,
+            Arc::clone(&metrics),
+            Arc::clone(&comp_out),
+            closer,
+            FRAME_WRITE_TIMEOUT,
+        )
+        .instrument(conn_span.clone()),
     );
 
     let attacher = make_attacher(ctrl_tx.clone(), Arc::clone(&comp_out));
@@ -415,5 +458,38 @@ mod tests {
         );
 
         session.await.unwrap();
+    }
+
+    /// A peer that stops reading fills its transport buffer, the frame write
+    /// blocks, and after `FRAME_WRITE_TIMEOUT` the connection is closed and
+    /// the writer ends. Before the timeout the writer waited forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_stops_reading_is_closed_after_the_write_timeout() {
+        // The client half is kept but never read, so writes block rather
+        // than fail.
+        let (server, _client) = tokio::io::duplex(64);
+        let (closer, mut signal) = close_channel();
+        let (out, out_rx) = outbound::channel(OUTBOUND_CAPACITY, closer.clone());
+        let started = tokio::time::Instant::now();
+        let writer = tokio::spawn(write_outbound(
+            out_rx,
+            server,
+            Arc::new(ConnectionMetrics::new()),
+            Arc::new(OutboundCompression::new(3, 1024)),
+            closer,
+            FRAME_WRITE_TIMEOUT,
+        ));
+
+        out.send(ServerMessage::LogChunk {
+            request_id: 1,
+            data: vec![0; 4096],
+        })
+        .expect("queued");
+
+        assert_eq!(signal.closed().await, CloseReason::WriteTimeout);
+        assert!(started.elapsed() >= FRAME_WRITE_TIMEOUT);
+        writer
+            .await
+            .expect("the writer ends instead of waiting forever");
     }
 }

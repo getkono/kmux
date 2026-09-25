@@ -47,6 +47,10 @@ pub enum CloseReason {
     /// A control message found the outbound queue full: the client stopped
     /// reading.
     OutboundOverflow,
+    /// A frame write or flush did not finish within the write timeout.
+    WriteTimeout,
+    /// A frame write or flush failed: the transport is gone.
+    WriteFailed,
 }
 
 /// Closes a connection. Cloned into everything that can decide to: the
