@@ -20,10 +20,10 @@ const POLL: Duration = Duration::from_millis(10);
 ///
 /// "Gone" means out of the process table: a zombie still answers
 /// `kill(pid, 0)`, so a child counts as dead only once something reaps it.
-/// The helper never reaps — every child `PtyProcess::spawn` starts is reaped by
-/// the crate's own exit task — so a test that waits on it is also asserting
-/// that the code under test reaped its child, rather than competing with that
-/// code for the `waitpid`.
+/// The helper never reaps, so it never competes for the `waitpid`: every child
+/// `PtyProcess::spawn` starts is reaped by its exit task (`spawn_wait_task`),
+/// whatever the code under test does. A `true` therefore proves the child was
+/// killed; it does not prove the code under test is what reaped it.
 ///
 /// Async so the probe yields to the runtime between checks: on a
 /// current-thread `#[tokio::test]` the task that is supposed to kill or reap
