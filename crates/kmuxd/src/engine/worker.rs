@@ -495,49 +495,76 @@ fn resolve_worker_exe() -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use std::os::fd::{AsFd, FromRawFd};
-
     use super::*;
 
-    /// A close-on-exec fd, as the socketpair end is, at a number above any a
-    /// shell opens for itself.
-    fn fixture_cloexec_fd() -> OwnedFd {
-        let stdout = std::io::stdout();
-        let raw = nix::fcntl::fcntl(stdout.as_fd(), nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(100))
-            .expect("F_DUPFD_CLOEXEC");
-        // SAFETY: F_DUPFD_CLOEXEC returned a fresh fd nothing else owns.
-        unsafe { OwnedFd::from_raw_fd(raw) }
+    /// Fd numbers the probe works with. They must be single digits: dash
+    /// (`/bin/sh` on Debian and Ubuntu) only parses fds 0-9 in a redirection,
+    /// so a probe of a higher number fails whatever the fd's state.
+    const PROBE_SRC: RawFd = 8;
+    const PROBE_TARGET: RawFd = 9;
+
+    /// Signature of `inherit_as`, so the probe can also run a no-op control.
+    type Inherit = fn(RawFd, RawFd) -> std::io::Result<()>;
+
+    /// In the forked child: put a close-on-exec copy of stdout at `src`, as the
+    /// socketpair end is close-on-exec, and close whatever the test harness
+    /// may have left open at `target`, so only `inherit` can open it.
+    ///
+    /// Async-signal-safe: only `dup2`, `fcntl` and `close`.
+    fn place_cloexec(src: RawFd, target: RawFd) -> std::io::Result<()> {
+        // SAFETY: fd juggling in the child's own table; a failure is -1 plus
+        // errno. Closing an fd that is not open only yields EBADF, ignored.
+        unsafe {
+            if src != target {
+                nix::libc::close(target);
+            }
+            if nix::libc::dup2(nix::libc::STDOUT_FILENO, src) == -1
+                || nix::libc::fcntl(src, nix::libc::F_SETFD, nix::libc::FD_CLOEXEC) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
     }
 
-    /// Whether `target` is open in a program exec'd after `inherit_as(fd,
-    /// target)` ran in its `pre_exec`. A real fork and exec, because what is
-    /// under test is the close-on-exec flag `exec` honours (R7).
-    fn target_open_after_exec(fd: &OwnedFd, target: RawFd) -> bool {
-        let raw = fd.as_raw_fd();
+    /// Whether `target` is open in a program exec'd after the child placed a
+    /// close-on-exec fd at `src` and ran `inherit(src, target)`. A real fork
+    /// and exec, because what is under test is the close-on-exec flag `exec`
+    /// honours (R7).
+    fn target_open_after_exec(src: RawFd, target: RawFd, inherit: Inherit) -> bool {
         let mut cmd = std::process::Command::new("/bin/sh");
         // `: >&N` fails unless fd N is open in the shell.
         cmd.args(["-c", &format!(": >&{target}")])
             .stderr(std::process::Stdio::null());
-        // SAFETY: `inherit_as` is async-signal-safe.
+        // SAFETY: `place_cloexec` and `inherit` are async-signal-safe.
         unsafe {
-            cmd.pre_exec(move || inherit_as(raw, target));
+            cmd.pre_exec(move || {
+                place_cloexec(src, target)?;
+                inherit(src, target)
+            });
         }
         cmd.status().expect("run sh").success()
+    }
+
+    /// Guards the probe: without `inherit_as` a close-on-exec fd must read as
+    /// closed, or the tests below could pass vacuously.
+    #[test]
+    fn probe_reports_a_cloexec_fd_as_closed() {
+        let open = target_open_after_exec(PROBE_TARGET, PROBE_TARGET, |_, _| Ok(()));
+        assert!(!open, "fd {PROBE_TARGET} survived exec despite FD_CLOEXEC");
     }
 
     /// The latent bug: a socket already at the target number was `dup2`ed onto
     /// itself, a no-op that left it close-on-exec.
     #[test]
     fn inherit_as_passes_an_fd_already_at_the_target_number() {
-        let fd = fixture_cloexec_fd();
-        let raw = fd.as_raw_fd();
-        assert!(target_open_after_exec(&fd, raw), "fd {raw} closed on exec");
+        let open = target_open_after_exec(PROBE_TARGET, PROBE_TARGET, inherit_as);
+        assert!(open, "fd {PROBE_TARGET} closed on exec");
     }
 
     #[test]
     fn inherit_as_passes_an_fd_under_a_new_number() {
-        let fd = fixture_cloexec_fd();
-        let target = fd.as_raw_fd() + 1;
-        assert!(target_open_after_exec(&fd, target), "fd {target} not open");
+        let open = target_open_after_exec(PROBE_SRC, PROBE_TARGET, inherit_as);
+        assert!(open, "fd {PROBE_TARGET} not open");
     }
 }
