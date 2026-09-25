@@ -75,13 +75,24 @@ impl Graph {
     /// `--filter-platform`; it would narrow the check to whatever host happens
     /// to run it.
     ///
+    /// `--all-features` for the same reason, along the other axis: without it
+    /// the graph holds only default features, so a toolkit dependency behind a
+    /// non-default feature of a crate at or below `kmux-app` would pass the "no
+    /// UI toolkit" assertion while being one `--features` away from breaking it.
+    ///
     /// # Errors
     /// If `cargo metadata` cannot be run, exits non-zero, or emits JSON this
     /// does not understand.
     pub fn load() -> Result<Self> {
         let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
         let out = std::process::Command::new(cargo)
-            .args(["metadata", "--format-version", "1", "--locked"])
+            .args([
+                "metadata",
+                "--format-version",
+                "1",
+                "--locked",
+                "--all-features",
+            ])
             .output()
             .context("running `cargo metadata`")?;
         anyhow::ensure!(
