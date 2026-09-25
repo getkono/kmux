@@ -232,7 +232,28 @@ request/response per connection:
 | `stop`     | `{"status":"ok"}` then triggers shutdown                  |
 | `sessions` | full per-session, per-connection snapshot with metrics    |
 
-A `SocketGuard` RAII struct removes the socket file and PID file on task exit.
+**Ownership.** A daemon never takes over a control socket another daemon is
+listening on: unlinking a live socket does not stop its daemon, it only makes it
+unreachable, leaving two daemons with the host's sessions split between them.
+`async_main` asks first (`daemon::ensure_no_live_daemon`) — before it restores
+the checkpoint, which respawns shells, and before it binds the data socket, which
+unlinks whatever is at its path — and exits with an error if something answers.
+`serve_control_socket` asks again at bind time, for a daemon that won a start
+race in between, and on a live answer shuts the whole daemon down rather than
+running on headless. A socket file nothing listens on is stale and removed. A
+graceful-restart successor (`--handoff`) skips both checks: its predecessor
+released the socket to it.
+
+"Is anything listening?" is answered by connecting (`socket_is_live`): a
+connection or `EPERM`/`EACCES` means live; `EAGAIN` is asked again up to eight
+times, 30 ms apart, and still-busy is treated as live; any other error — refused,
+`ENOTSOCK`, no such file — means nothing serves the path. The probe connects and
+closes without a request, which the serving daemon logs at debug level only.
+
+A `SocketGuard` RAII struct cleans up on task exit, removing only what is still
+this daemon's: the socket only if nothing is listening on it any more (a
+successor may already have bound the path), and the PID file only if it still
+holds this process's pid (a successor writes its own once the predecessor exits).
 
 The control socket task also installs its own SIGINT/SIGTERM handlers that
 `notify_waiters()` on the shared `Arc<Notify> shutdown`.
@@ -609,7 +630,8 @@ Triggered by SIGINT, SIGTERM, or `stop` via the control socket:
 2. app.checkpoint_state().await → write_checkpoint (shutdown checkpoint)
 3. endpoint.close(0u32, b"shutdown") for each QUIC endpoint
 4. async_main returns Ok(())
-5. Process exits; SocketGuard drop removes control socket + PID file
+5. Process exits; SocketGuard drop removes the control socket and PID file,
+   each only if it is still this daemon's (see §5.8)
 ```
 
 Client connections in progress are dropped ungracefully (no graceful disconnect
@@ -758,7 +780,7 @@ main()
       ├─ abort listener tasks
       ├─ checkpoint_state() + write_checkpoint()
       ├─ QUIC endpoint.close()
-      └─ exit (SocketGuard removes control socket + PID file)
+      └─ exit (SocketGuard removes control socket + PID file if still ours)
 ```
 
 ---

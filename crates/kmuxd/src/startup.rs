@@ -25,6 +25,15 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     crate::impair::init_and_log();
     crate::trace::init_and_log();
 
+    // Before anything with a side effect: restoring the checkpoint respawns
+    // shells, and binding the data socket unlinks whatever is at its path. A
+    // second daemon doing either while another is live splits the host's
+    // sessions between two daemons. A handoff successor is exempt — its
+    // predecessor released the sockets to it.
+    if daemon && !handoff {
+        crate::daemon::ensure_no_live_daemon(&kmux_sys::dirs::socket_path()?)?;
+    }
+
     // A handoff successor daemonized without taking the pid file (the
     // predecessor holds its lock). Capture the predecessor's pid now — while its
     // pid file still exists — so we can write our own once it has exited.
