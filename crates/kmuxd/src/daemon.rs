@@ -607,9 +607,11 @@ mod tests {
         while socket_is_live(path) {
             assert!(
                 Instant::now() < deadline,
-                "{} is still served",
-                path.display()
+                "{} is still served, connect said {:?}",
+                path.display(),
+                std::os::unix::net::UnixStream::connect(path).map(|_| "connected")
             );
+            std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }
 
@@ -827,12 +829,9 @@ mod tests {
 
         // A socket whose listener is gone: what a killed daemon leaves behind.
         let orphan = tmp.path().join("orphan.sock");
+        // `bind_and_close` is the assertion: it fails unless the socket stops
+        // being live once the (possibly briefly forked) listener is gone.
         bind_and_close(&orphan);
-        assert!(
-            !socket_is_live(&orphan),
-            "a socket with no listener, but connect said {:?}",
-            std::os::unix::net::UnixStream::connect(&orphan).map(|_| "connected")
-        );
     }
 
     #[test]
