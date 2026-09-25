@@ -11,11 +11,9 @@ on:
   schedule:
     # 04:00 UTC on Sundays: after the week's merges, before anyone reads it.
     - cron: "0 4 * * 0"
+  # Takes no inputs: the shard count is the fixed matrix below (8), and an
+  # input that did not reach the matrix or `--shard` only looked like a knob.
   workflow_dispatch:
-    inputs:
-      shards:
-        description: "How many shards to split the sweep across"
-        default: "8"
 
 permissions:
   contents: read
