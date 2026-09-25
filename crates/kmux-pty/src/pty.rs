@@ -320,12 +320,12 @@ mod tests {
         pty.set_keep_alive(true);
         drop(pty);
 
-        // Give the tokio runtime a moment to process any drop task.
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-
-        // The process should still be alive: kill(pid, 0) succeeds.
-        let alive = nix::sys::signal::kill(pid, None).is_ok();
-        assert!(alive, "process should still be alive after keep_alive drop");
+        // A negative claim needs a window: a regression that spawned a kill
+        // task from Drop would run within it, and `wait_until_dead` returns as
+        // soon as the child is gone, so only the passing case waits it out.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(200);
+        let died = crate::fixtures::wait_until_dead(pid, deadline).await;
+        assert!(!died, "process should still be alive after keep_alive drop");
 
         // Clean up: kill the process ourselves.
         let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);

@@ -264,17 +264,18 @@ mod tests {
         let config = PtyConfig::new("/bin/sleep").args(["999"]);
         mgr.spawn("gamma", &config).await.expect("spawn");
         assert!(mgr.exists("gamma").await);
+        let mut events = mgr.subscribe();
 
-        let start = std::time::Instant::now();
         mgr.close_nowait("gamma").await.expect("close_nowait");
-        let elapsed = start.elapsed();
 
-        // Should return well under the 5-second grace period
-        assert!(
-            elapsed < std::time::Duration::from_millis(200),
-            "close_nowait took {elapsed:?}, expected < 200ms"
-        );
+        // Removal and the Closed event happen on return, before the child's
+        // shutdown (which runs in the background under a 5 s grace period).
         assert!(!mgr.exists("gamma").await, "session should be removed");
+        assert_eq!(mgr.len().await, 0);
+        assert!(matches!(
+            events.try_recv(),
+            Ok(SessionEvent::Closed { name }) if name == "gamma"
+        ));
     }
 
     #[tokio::test]

@@ -23,6 +23,8 @@ pub mod config;
 pub mod error;
 pub mod events;
 pub mod expect;
+#[cfg(test)]
+mod fixtures;
 pub mod io;
 pub mod oneshot;
 pub mod platform;
