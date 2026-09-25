@@ -273,19 +273,8 @@ impl ServerApp {
                                 // holding it — detached, invisible, and for as
                                 // long as the machine is up. So the failure is
                                 // reported and the pid is killed directly.
-                                if let Err(e) = self.manager.close(pane_id).await {
-                                    warn!(
-                                        pane_id,
-                                        %e,
-                                        "restore: could not close an unsplittable \
-                                         inherited pane; killing its child directly \
-                                         so the respawn below does not orphan it"
-                                    );
-                                    let _ = nix::sys::signal::kill(
-                                        pid,
-                                        nix::sys::signal::Signal::SIGKILL,
-                                    );
-                                }
+                                let closed = self.manager.close(pane_id).await.map(drop);
+                                kill_if_close_failed(closed, pane_id, pid);
                             }
                         }
                     }
@@ -428,5 +417,63 @@ impl ServerApp {
             title,
             progress,
         }
+    }
+}
+
+/// Drop an inherited pane that could not be split: when closing it through the
+/// registry failed, SIGKILL its child directly, so the respawn that follows
+/// cannot leave the user's original shell running with nothing holding it.
+fn kill_if_close_failed(closed: kmux_pty::error::Result<()>, pane_id: &str, pid: Pid) {
+    if let Err(e) = closed {
+        warn!(
+            pane_id,
+            %e,
+            "restore: could not close an unsplittable inherited pane; killing its \
+             child directly so the respawn below does not orphan it"
+        );
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::{Child, Command};
+
+    use nix::unistd::Pid;
+
+    use super::kill_if_close_failed;
+
+    fn sleeper() -> (Child, Pid) {
+        let child = Command::new("/bin/sleep").arg("30").spawn().expect("spawn");
+        let pid = Pid::from_raw(i32::try_from(child.id()).expect("pid fits"));
+        (child, pid)
+    }
+
+    /// The close failed, so the respawn would give the pane a second shell:
+    /// the first one is killed rather than left running detached.
+    #[test]
+    fn a_failed_close_kills_the_inherited_child() {
+        let (mut child, pid) = sleeper();
+        kill_if_close_failed(Err(kmux_pty::error::KmuxError::Timeout), "eagle/0", pid);
+        let status = child.wait().expect("wait");
+        assert_eq!(
+            status.signal(),
+            Some(nix::sys::signal::Signal::SIGKILL as i32),
+            "{status:?}"
+        );
+    }
+
+    /// A close that took needs nothing more; the child is left to the registry.
+    #[test]
+    fn a_close_that_took_kills_nothing() {
+        let (mut child, pid) = sleeper();
+        kill_if_close_failed(Ok(()), "eagle/0", pid);
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "the child must still be running"
+        );
+        child.kill().expect("clean up");
+        let _ = child.wait();
     }
 }
