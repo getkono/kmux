@@ -885,7 +885,3 @@ count = 1
 [[allows]]
 crate = "kmuxd"
 count = 8
-
-[[allows]]
-crate = "xtask"
-count = 3

@@ -175,13 +175,27 @@ pub fn count_allows(roots: &[&Path]) -> Result<BTreeMap<String, usize>> {
             };
             let text = std::fs::read_to_string(&file)
                 .with_context(|| format!("read {}", file.display()))?;
-            let n = text.matches("#[allow(").count() + text.matches("#![allow(").count();
+            let n = allow_attributes_in(&text);
             if n > 0 {
                 *counts.entry(krate).or_default() += n;
             }
         }
     }
     Ok(counts)
+}
+
+/// The `#[allow(` / `#![allow(` attributes in one file's source.
+///
+/// Counted per line that *starts* with one, which is where rustfmt puts every
+/// attribute. Matching the text anywhere also counted the pattern inside
+/// comments, doc comments and string literals — this very module's own
+/// description of what it searches for was three of xtask's "suppressions".
+fn allow_attributes_in(source: &str) -> usize {
+    source
+        .lines()
+        .map(str::trim_start)
+        .filter(|line| line.starts_with("#[allow(") || line.starts_with("#![allow("))
+        .count()
 }
 
 /// The crate a source file belongs to: the first path component under
@@ -245,6 +259,24 @@ pub fn parse_rustc_version(text: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn allow_attributes_are_counted_and_mentions_of_them_are_not() {
+        // Built with escapes so no line of *this* file starts with the
+        // pattern, which would count toward xtask's own budget.
+        let source = [
+            "#![allow(dead_code)]",
+            "/// Count `#[allow(` attributes.",
+            "// #[allow(unused)] in a comment",
+            "    #[allow(clippy::too_many_arguments)]",
+            "fn f() {",
+            r##"    let pattern = "#[allow(";"##,
+            r##"    #[expect(unused, reason = "not counted")]"##,
+            "}",
+        ]
+        .join("\n");
+        assert_eq!(allow_attributes_in(&source), 2);
+    }
 
     #[test]
     fn a_package_id_with_an_explicit_name_resolves_to_that_name() {
