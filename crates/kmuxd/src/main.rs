@@ -15,6 +15,7 @@ mod federation;
 mod fixtures;
 mod handoff;
 mod impair;
+mod lock;
 mod log_writer;
 mod persist;
 mod process_stats;

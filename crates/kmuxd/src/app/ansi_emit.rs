@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use kmux_protocol::messages::{CellAttrs, CellState, GridSnapshot, SequenceNo};
 
 use crate::diff_engine::DiffResult;
+use crate::lock::lock_term_state;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::TermState;
 
@@ -135,7 +136,7 @@ pub(super) fn seed_pane_with_preamble(
     }
 
     let diff_opt = {
-        let mut ts = term_state.lock().unwrap();
+        let mut ts = lock_term_state(term_state);
         ts.feed(preamble);
         match ts.compute_diff() {
             DiffResult::CellDiff { diff: d, .. } => Some(d),

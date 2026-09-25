@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 use crate::app::ClientMap;
 use crate::backend::{BackendEventSink, ControlEvent};
 use crate::diff_engine::DiffResult;
+use crate::lock::lock_term_state;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::TermState;
 
@@ -59,7 +60,7 @@ pub async fn session_diff_loop(
                     Ok(n) => {
                         let cycle_start = Instant::now();
                         let mut total_bytes = n;
-                        let mut ts = term_state.lock().unwrap();
+                        let mut ts = lock_term_state(&term_state);
                         ts.feed(&buf[..n]);
                         // Coalesce: drain all immediately-available PTY output before
                         // computing the diff, so burst output (e.g. vim exit, large
@@ -160,12 +161,12 @@ fn flush_cell_diff(
 ) {
     let diff_start = Instant::now();
     let result = {
-        let mut ts = term_state.lock().unwrap();
+        let mut ts = lock_term_state(term_state);
         ts.compute_diff()
     };
     let diff_us = diff_start.elapsed().as_micros();
     // Force-full-snapshot clients are re-seeded straight from the emulator.
-    let snapshot_fn = || term_state.lock().unwrap().snapshot();
+    let snapshot_fn = || lock_term_state(term_state).snapshot();
     dispatch_diff_result(
         pane_id,
         result,
