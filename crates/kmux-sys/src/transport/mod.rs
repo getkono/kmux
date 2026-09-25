@@ -41,7 +41,7 @@ pub mod tcp_tls;
 pub mod uds;
 
 #[cfg(feature = "framing")]
-pub use listener::{AcceptError, IncomingSession, Listener, PeerInfo, SessionExtra};
+pub use listener::{AcceptError, IncomingSession, Listener, PeerInfo, SessionTransport};
 
 #[cfg(feature = "framing")]
 mod listener {
@@ -82,34 +82,60 @@ mod listener {
     /// are the first accepted bidirectional stream; for TCP/UDS they are the
     /// socket halves after `split()`.
     ///
-    /// `extra` carries whatever the dispatcher needs beyond the I/O halves.
+    /// `transport` names the transport and carries whatever the dispatcher
+    /// needs beyond the I/O halves.
     pub struct IncomingSession {
         pub read: Box<dyn tokio::io::AsyncRead + Unpin + Send>,
         pub write: Box<dyn tokio::io::AsyncWrite + Unpin + Send>,
-        pub kind: TransportKind,
         pub peer: PeerInfo,
         pub span: tracing::Span,
-        /// Transport-specific state, paired with its transport by the type.
-        pub extra: SessionExtra,
+        /// The transport, with its transport-specific state.
+        pub transport: SessionTransport,
     }
 
-    /// Transport-specific state accompanying an [`IncomingSession`].
+    impl IncomingSession {
+        /// Which transport this session arrived on.
+        pub fn kind(&self) -> TransportKind {
+            self.transport.kind()
+        }
+    }
+
+    /// The transport an [`IncomingSession`] arrived on, carrying the state that
+    /// transport needs.
     ///
-    /// This was a `Box<dyn Any + Send>` that the dispatcher downcast, with the
-    /// `kind` field as the only clue to what was inside — a pairing nothing
-    /// enforced, and whose one consumer wrote
-    /// `.downcast::<quinn::Connection>().expect(..)`. Any listener that ever
-    /// produced `kind: Quic` without a connection would take the daemon down.
-    /// As an enum the pairing is the type, so there is nothing left to get
-    /// wrong and nothing to assert at runtime.
+    /// This was a `kind: TransportKind` field beside a `Box<dyn Any + Send>`
+    /// that the dispatcher downcast — a pairing nothing enforced, and whose one
+    /// consumer wrote `.downcast::<quinn::Connection>().expect(..)`, so any
+    /// listener that produced `kind: Quic` without a connection would take the
+    /// daemon down. Splitting that into a `kind` field and a state enum still
+    /// let `kind: Quic` sit beside "no state" and quietly take the stream path.
+    /// With one enum there is no second field to disagree: a QUIC session
+    /// without its connection cannot be constructed.
     #[derive(Debug)]
-    pub enum SessionExtra {
-        /// Nothing beyond the I/O halves: UDS, plain TCP, TCP+TLS.
-        None,
-        /// The QUIC connection, which the pane attacher needs in order to open
+    pub enum SessionTransport {
+        /// Unix domain socket.
+        Uds,
+        /// Plain TCP.
+        Tcp,
+        /// TCP with TLS.
+        TcpTls,
+        /// QUIC, with the connection the pane attacher needs in order to open
         /// per-pane unidirectional streams.
         #[cfg(feature = "quic")]
         Quic(quinn::Connection),
+    }
+
+    impl SessionTransport {
+        /// The transport's wire-level kind.
+        pub fn kind(&self) -> TransportKind {
+            match self {
+                Self::Uds => TransportKind::Uds,
+                Self::Tcp => TransportKind::Tcp,
+                Self::TcpTls => TransportKind::TcpTls,
+                #[cfg(feature = "quic")]
+                Self::Quic(_) => TransportKind::Quic,
+            }
+        }
     }
 
     // ─── Listener ─────────────────────────────────────────────────────────────

@@ -10,7 +10,7 @@ use std::pin::Pin;
 
 use tokio::net::UnixListener;
 
-use crate::transport::{AcceptError, IncomingSession, Listener, PeerInfo, SessionExtra};
+use crate::transport::{AcceptError, IncomingSession, Listener, PeerInfo, SessionTransport};
 use kmux_protocol::messages::TransportKind;
 
 // ─── UdsListener ─────────────────────────────────────────────────────────────
@@ -75,10 +75,9 @@ impl Listener for UdsListener {
             Ok(IncomingSession {
                 read: Box::new(read),
                 write: Box::new(write),
-                kind: TransportKind::Uds,
                 peer: PeerInfo { addr: None },
                 span: conn_span,
-                extra: SessionExtra::None,
+                transport: SessionTransport::Uds,
             })
         })
     }
@@ -105,7 +104,7 @@ mod tests {
         });
 
         let session = listener.accept().await.expect("accept should succeed");
-        assert_eq!(session.kind, TransportKind::Uds);
+        assert_eq!(session.kind(), TransportKind::Uds);
         assert!(session.peer.addr.is_none());
     }
 
