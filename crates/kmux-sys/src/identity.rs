@@ -236,12 +236,18 @@ fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         .open(path)
         .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", path.display()))?;
     // Durable before it becomes visible under its real name.
-    let filled = file
-        .write_all(bytes)
-        .and_then(|()| file.sync_all())
-        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()));
+    fill_or_remove(path, move || {
+        file.write_all(bytes)?;
+        file.sync_all()
+    })
+}
+
+/// Run `fill` against a file this process just created at `path`; if it
+/// fails, remove the file so no partial content survives. `fill` owns (and
+/// drops) the open handle, so the file is closed before it is removed.
+fn fill_or_remove(path: &Path, fill: impl FnOnce() -> std::io::Result<()>) -> anyhow::Result<()> {
+    let filled = fill().map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()));
     if filled.is_err() {
-        drop(file);
         let _ = std::fs::remove_file(path);
     }
     filled
@@ -448,15 +454,51 @@ mod tests {
         assert!(entries(tmp.path()).is_empty(), "{:?}", entries(tmp.path()));
     }
 
-    /// `write_private` cleans up after itself too, whichever path it wrote.
+    /// `write_private` refuses a file it did not create and must not remove it.
     #[test]
-    fn write_private_removes_a_file_it_created_but_could_not_fill() {
+    fn write_private_leaves_an_existing_file_alone() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let path = tmp.path().join("key");
         std::fs::write(&path, b"someone else's").expect("write");
         // create_new refuses an existing file and must not remove it.
         write_private(&path, b"ours").expect_err("exists");
         assert_eq!(std::fs::read(&path).expect("read"), b"someone else's");
+    }
+
+    /// A file `write_private` created and then failed to fill (a full disk
+    /// mid-write) is removed, so no partial key survives. The failing writer
+    /// is injected after a real create, the same order `write_private` uses.
+    #[test]
+    fn write_private_removes_a_file_it_created_but_could_not_fill() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("key");
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .expect("create");
+
+        let err = fill_or_remove(&path, move || {
+            file.write_all(b"half")?;
+            Err(std::io::Error::other("no space left on device"))
+        })
+        .expect_err("the fill failed");
+
+        assert!(err.to_string().contains("no space left"), "{err}");
+        assert!(!path.exists(), "partial key left behind");
+        assert!(entries(tmp.path()).is_empty(), "{:?}", entries(tmp.path()));
+    }
+
+    /// A fill that succeeds keeps the file and its bytes.
+    #[test]
+    fn fill_or_remove_keeps_a_file_it_filled() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("key");
+        let mut file = std::fs::File::create(&path).expect("create");
+
+        fill_or_remove(&path, move || file.write_all(b"whole")).expect("filled");
+
+        assert_eq!(std::fs::read(&path).expect("read"), b"whole");
     }
 
     /// A filesystem without hard links refuses `link(2)` outright. That must
