@@ -51,6 +51,10 @@ pub enum CloseReason {
     WriteTimeout,
     /// A frame write or flush failed: the transport is gone.
     WriteFailed,
+    /// The connection did not authenticate within the auth deadline.
+    AuthDeadline,
+    /// No frame arrived within the pong deadline of an unanswered ping.
+    PongDeadline,
 }
 
 /// Closes a connection. Cloned into everything that can decide to: the

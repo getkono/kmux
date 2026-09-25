@@ -15,6 +15,7 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, Span, debug, info, warn};
 
+use super::liveness::{self, Liveness, PING_INTERVAL};
 use crate::app::{AttachResult, ConnectionMetrics, ServerApp};
 use crate::client_handler::{
     OutboundCompression, PaneAttacher, SharedClientState, handle_message, pty_event_to_msg,
@@ -63,6 +64,7 @@ fn spawn_authenticated_forwarders(
     app: Arc<ServerApp>,
     ctrl_tx: OutboundTx,
     metrics: Arc<ConnectionMetrics>,
+    liveness: Arc<Liveness>,
     conn_span: Span,
 ) -> (JoinHandle<()>, JoinHandle<()>, JoinHandle<()>) {
     let mut event_rx = app.subscribe_events();
@@ -98,7 +100,7 @@ fn spawn_authenticated_forwarders(
     let ping_task = tokio::spawn(
         async move {
             let mut seq = 0u64;
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            let mut interval = tokio::time::interval(PING_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
@@ -106,6 +108,7 @@ fn spawn_authenticated_forwarders(
                 if ping_tx.send(ServerMessage::Ping { seq }).is_err() {
                     break;
                 }
+                liveness.on_ping_sent(tokio::time::Instant::now());
                 seq += 1;
             }
         }
@@ -250,6 +253,13 @@ pub async fn run_client_session<R, W, A, F>(
     let (closer, mut close_signal) = close_channel();
     let (ctrl_tx, out_rx) = outbound::channel(OUTBOUND_CAPACITY, closer.clone());
 
+    // Closes the connection if it does not authenticate in time, or later
+    // stops answering pings.
+    let liveness = Arc::new(Liveness::new(tokio::time::Instant::now()));
+    let watchdog_task = tokio::spawn(
+        liveness::watchdog(Arc::clone(&liveness), closer.clone()).instrument(conn_span.clone()),
+    );
+
     let mut writer_task = tokio::spawn(
         write_outbound(
             out_rx,
@@ -293,6 +303,7 @@ pub async fn run_client_session<R, W, A, F>(
                     .bytes_in
                     .fetch_add(5 + data.len() as u64, Ordering::Relaxed);
                 metrics.msgs_in.fetch_add(1, Ordering::Relaxed);
+                liveness.on_inbound();
                 metrics
                     .last_activity_ms
                     .store(epoch_millis(), Ordering::Relaxed);
@@ -306,10 +317,12 @@ pub async fn run_client_session<R, W, A, F>(
                             break;
                         }
                         if !was_authenticated && state.authenticated {
+                            liveness.on_authenticated();
                             authenticated_tasks = Some(spawn_authenticated_forwarders(
                                 app.clone(),
                                 state.ctrl_tx.clone(),
                                 Arc::clone(&metrics),
+                                Arc::clone(&liveness),
                                 state.conn_span.clone(),
                             ));
                         }
@@ -331,6 +344,7 @@ pub async fn run_client_session<R, W, A, F>(
         }
     }
 
+    watchdog_task.abort();
     if let Some((event_task, vt_task, ping_task)) = authenticated_tasks {
         event_task.abort();
         ping_task.abort();
@@ -491,5 +505,32 @@ mod tests {
         writer
             .await
             .expect("the writer ends instead of waiting forever");
+    }
+
+    /// A socket that connects and sends nothing is closed once the auth
+    /// deadline passes; before it, such a socket held its tasks forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_unauthenticated_connection_is_closed_at_the_auth_deadline() {
+        let app = Arc::new(fixture_app());
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let started = tokio::time::Instant::now();
+
+        run_client_session(
+            server_read,
+            server_write,
+            app,
+            TransportKind::Uds,
+            |_tx, _compression| NoopAttacher,
+            tracing::info_span!("auth_deadline_test"),
+        )
+        .await;
+
+        assert!(started.elapsed() > liveness::AUTH_DEADLINE);
+        assert!(
+            read_frame(&mut client_read).await.unwrap().is_none(),
+            "the daemon closed the socket"
+        );
     }
 }

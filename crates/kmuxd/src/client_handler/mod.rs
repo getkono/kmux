@@ -1,5 +1,6 @@
 mod dispatch;
 mod events;
+mod liveness;
 mod session;
 pub use dispatch::handle_message;
 pub use events::pty_event_to_msg;
