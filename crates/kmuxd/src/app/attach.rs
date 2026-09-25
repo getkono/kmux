@@ -171,10 +171,16 @@ impl ServerApp {
     pub async fn resync_snapshot(&self, pane_id: &str) -> Option<(GridSnapshot, SequenceNo)> {
         let sessions = self.sessions.read().await;
         let relay = super::helpers::get_pane_relay(&sessions, pane_id).ok()?;
-        match compute_replay(relay, None) {
-            AttachResult::FullSnapshot(snapshot, seqno) => Some((snapshot, seqno)),
-            AttachResult::Delta(_) | AttachResult::SyncReset(..) => None,
-        }
+        // The seqno is read before the snapshot is taken. A diff the relay
+        // emits between the two reads is then already in the snapshot and
+        // forwarded again after it, where re-applying its absolute cell writes
+        // in order ends at the same grid. Read after, it would be labelled as
+        // covered and dropped without being in the snapshot.
+        let seqno = relay
+            .seqno_counter
+            .load(Ordering::Relaxed)
+            .saturating_sub(1);
+        Some((relay.engine.snapshot(), SequenceNo(seqno)))
     }
 
     /// Set the full-snapshot mode flag for a client across all attached panes.
