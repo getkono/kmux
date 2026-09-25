@@ -229,9 +229,8 @@ async fn fetch_remote_logs(
     lines: Option<usize>,
     follow: bool,
 ) -> anyhow::Result<()> {
-    use kmux_protocol::messages::{ClientMessage, ServerMessage};
-    use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
-    use std::io::Write;
+    use kmux_protocol::messages::ClientMessage;
+    use kmux_protocol::{encode_client, write_frame};
     let conn = super::resolve_connection(Some(server), ssh_port).await?;
     let (mut read_half, mut write_half) = super::connect_authenticated(&conn).await?;
 
@@ -249,17 +248,41 @@ async fn fetch_remote_logs(
     )
     .await?;
 
-    let mut stdout = std::io::stdout();
+    stream_logs(&mut read_half, &mut write_half, REQ, &mut std::io::stdout()).await
+}
+
+/// Copy the `LogChunk`s answering request `request_id` to `out` until its
+/// `LogEnd`, answering the daemon's pings on the way: a follow can outlast the
+/// daemon's pong deadline (issue #206), and a peer that never answers is
+/// closed as dead.
+async fn stream_logs<R, W>(
+    read_half: &mut R,
+    write_half: &mut W,
+    request_id: u64,
+    out: &mut impl std::io::Write,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
+    use kmux_protocol::messages::{ClientMessage, ServerMessage};
+    use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
     loop {
-        let data = read_frame(&mut read_half)
+        let data = read_frame(read_half)
             .await?
             .ok_or_else(|| anyhow::anyhow!("connection closed before the log stream ended"))?;
         match decode_server(&data)? {
-            ServerMessage::LogChunk { request_id, data } if request_id == REQ => {
-                stdout.write_all(&data)?;
-                stdout.flush()?;
+            ServerMessage::LogChunk {
+                request_id: id,
+                data,
+            } if id == request_id => {
+                out.write_all(&data)?;
+                out.flush()?;
             }
-            ServerMessage::LogEnd { request_id } if request_id == REQ => return Ok(()),
+            ServerMessage::LogEnd { request_id: id } if id == request_id => return Ok(()),
+            ServerMessage::Ping { seq } => {
+                write_frame(write_half, &encode_client(&ClientMessage::Pong { seq })?).await?;
+            }
             ServerMessage::Error { message, .. } => anyhow::bail!("{message}"),
             _ => continue,
         }
@@ -448,5 +471,55 @@ async fn query_pane_processes(
         if let ServerMessage::ProcessOverviewResult { panes, .. } = decode_server(&data)? {
             return Ok(panes);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kmux_protocol::messages::{ClientMessage, ServerMessage};
+    use kmux_protocol::{decode_client, encode_server, read_frame, write_frame};
+
+    use super::stream_logs;
+
+    /// The daemon interleaves pings with a followed log; each is answered with
+    /// its `Pong`, the other request's chunk is ignored, and this request's
+    /// chunks reach `out` until its `LogEnd`.
+    #[tokio::test]
+    async fn stream_logs_answers_pings_and_copies_only_its_own_chunks() {
+        let (client, daemon) = tokio::io::duplex(64 * 1024);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let (mut daemon_read, mut daemon_write) = tokio::io::split(daemon);
+        for msg in [
+            ServerMessage::LogChunk {
+                request_id: 1,
+                data: b"first ".to_vec(),
+            },
+            ServerMessage::Ping { seq: 9 },
+            ServerMessage::LogChunk {
+                request_id: 2,
+                data: b"not ours ".to_vec(),
+            },
+            ServerMessage::LogChunk {
+                request_id: 1,
+                data: b"second".to_vec(),
+            },
+            ServerMessage::LogEnd { request_id: 1 },
+        ] {
+            write_frame(&mut daemon_write, &encode_server(&msg).unwrap())
+                .await
+                .unwrap();
+        }
+
+        let mut out = Vec::new();
+        stream_logs(&mut client_read, &mut client_write, 1, &mut out)
+            .await
+            .expect("the stream ends with LogEnd");
+
+        assert_eq!(out, b"first second");
+        let frame = read_frame(&mut daemon_read).await.unwrap().expect("a Pong");
+        assert!(matches!(
+            decode_client(&frame).unwrap(),
+            ClientMessage::Pong { seq: 9 }
+        ));
     }
 }
