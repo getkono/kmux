@@ -1661,7 +1661,7 @@ mod tests {
     /// A test viewer with a bounded data channel and a throwaway ctrl channel.
     fn test_viewer(cap: usize, size: TermSize) -> (Viewer, mpsc::Receiver<ServerMessage>) {
         let (data_tx, data_rx) = mpsc::channel(cap);
-        let (ctrl_tx, _ctrl_rx) = crate::outbound::test_channel();
+        let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
         (
             Viewer {
                 data_tx,
@@ -1743,7 +1743,7 @@ mod tests {
         // A capacity-1 data channel pre-filled so the next send overflows; the
         // viewer must then get a `Lagged` on its ctrl channel and be removed.
         let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
-        let (ctrl_tx, mut ctrl_rx) = crate::outbound::test_channel();
+        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
         data_tx.try_send(snapshot_msg("hawk/0")).unwrap(); // fill to capacity
 
         let mut pane = ProxiedPane::new(sz(24, 80));
@@ -1777,7 +1777,7 @@ mod tests {
         // A paused viewer (issue #68) receives nothing and is retained even when its
         // channel is full — it resyncs on resume via re-attach, never lagged.
         let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
-        let (ctrl_tx, mut ctrl_rx) = crate::outbound::test_channel();
+        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
         data_tx.try_send(snapshot_msg("hawk/0")).unwrap(); // fill to capacity
 
         let mut pane = ProxiedPane::new(sz(24, 80));
@@ -1811,7 +1811,7 @@ mod tests {
         // An auto-paused viewer with a per-pane exemption keeps streaming through
         // the background pause (issue #68); a manual pause would still skip it.
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(8);
-        let (ctrl_tx, _ctrl_rx) = crate::outbound::test_channel();
+        let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
 
         let mut pane = ProxiedPane::new(sz(24, 80));
         pane.viewers.insert(
@@ -1836,7 +1836,7 @@ mod tests {
     #[test]
     fn fan_out_drops_closed_viewer_silently() {
         let (data_tx, data_rx) = mpsc::channel::<ServerMessage>(8);
-        let (ctrl_tx, mut ctrl_rx) = crate::outbound::test_channel();
+        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
         drop(data_rx); // receiver gone → channel closed
 
         let mut pane = ProxiedPane::new(sz(24, 80));

@@ -158,13 +158,6 @@ pub fn channel(capacity: usize, closer: Closer) -> (OutboundTx, OutboundRx) {
     )
 }
 
-/// A default-sized queue whose overflow closes nothing, for tests that only
-/// read what was sent.
-#[cfg(test)]
-pub fn test_channel() -> (OutboundTx, OutboundRx) {
-    channel(OUTBOUND_CAPACITY, close_channel().0)
-}
-
 impl OutboundTx {
     /// Queue a control message. Never dropped: if the queue is full the
     /// client has stopped reading, so the connection is closed instead.

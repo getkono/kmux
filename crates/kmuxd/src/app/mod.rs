@@ -1276,7 +1276,7 @@ mod tests {
 
     fn make_client(rows: u16, cols: u16) -> (ClientId, ClientSender) {
         let (data_tx, _data_rx) = mpsc::channel::<kmux_protocol::messages::ServerMessage>(16);
-        let (ctrl_tx, _ctrl_rx) = crate::outbound::test_channel();
+        let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
         let id = ClientId(rows as u64 * 1000 + cols as u64);
         let sender = ClientSender {
             data_tx,
@@ -1399,7 +1399,7 @@ mod tests {
 
         let mut relay = make_relay(24, 80);
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, mut ctrl_rx) = crate::outbound::test_channel();
+        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
         let id = ClientId(1);
         relay.clients.lock().unwrap().insert(
             id,
@@ -1504,7 +1504,7 @@ mod tests {
 
         let mut relay = make_relay(24, 80);
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, mut ctrl_rx) = crate::outbound::test_channel();
+        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
         relay.clients.lock().unwrap().insert(
             ClientId(1),
             ClientSender {
@@ -1633,7 +1633,7 @@ mod tests {
     ) -> AttachParams {
         use kmux_protocol::messages::ServerMessage;
         let (data_tx, _rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, _crx) = crate::outbound::test_channel();
+        let (ctrl_tx, _crx) = crate::fixtures::make_outbound();
         AttachParams {
             pane_id: "eagle/0".to_string(),
             client_id,
@@ -1798,7 +1798,7 @@ mod tests {
         // Attach a (channels dropped) and b (retain ctrl_rx to observe the kick).
         app.attach(attach_params(a.client_id, None)).await.unwrap();
         let (data_tx, _drx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, mut ctrl_rx_b) = crate::outbound::test_channel();
+        let (ctrl_tx, mut ctrl_rx_b) = crate::fixtures::make_outbound();
         app.attach(AttachParams {
             pane_id: "eagle/0".to_string(),
             client_id: b.client_id,

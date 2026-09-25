@@ -19,6 +19,7 @@ use crate::backend::{
     BackendConfig, BackendSize, CapabilityHandles, DEFAULT_SCROLLBACK, NullEventSink,
 };
 use crate::client_handler::{OutboundCompression, PaneAttacher, SharedClientState};
+use crate::outbound::{self, OUTBOUND_CAPACITY, OutboundRx, OutboundTx};
 use crate::persist::{PersistedPane, PersistedSession, PersistedTab, PersistedTermSize};
 use crate::term_state::{TermState, new_term_state};
 
@@ -51,12 +52,8 @@ impl PaneAttacher for NoopAttacher {
 pub(crate) fn fixture_client_state(
     app: Arc<ServerApp>,
     transport: TransportKind,
-) -> (
-    SharedClientState,
-    Arc<OutboundCompression>,
-    crate::outbound::OutboundRx,
-) {
-    let (ctrl_tx, ctrl_rx) = crate::outbound::test_channel();
+) -> (SharedClientState, Arc<OutboundCompression>, OutboundRx) {
+    let (ctrl_tx, ctrl_rx) = make_outbound();
     let comp_out = Arc::new(OutboundCompression::new(
         app.compression.level,
         app.compression.min_size,
@@ -70,6 +67,13 @@ pub(crate) fn fixture_client_state(
         Arc::clone(&comp_out),
     );
     (state, comp_out, ctrl_rx)
+}
+
+/// A default-sized connection outbound queue whose overflow closes nothing:
+/// the stand-in for a client's control channel in tests that only read what
+/// was sent.
+pub(crate) fn make_outbound() -> (OutboundTx, OutboundRx) {
+    outbound::channel(OUTBOUND_CAPACITY, outbound::close_channel().0)
 }
 
 /// A blank in-process terminal of `rows` × `cols`, with no event consumer and
