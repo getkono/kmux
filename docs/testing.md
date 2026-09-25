@@ -248,9 +248,9 @@ Counts are `#[test]` + `#[tokio::test]` functions, measured 2026-08-16.
 | Crate | Unit | Integ | What is tested | Doubles & seams | Not tested (→ exceptions) |
 | --- | --- | --- | --- | --- | --- |
 | `kmux-protocol` | 124 | — | codec byte fixtures, framing, version/capability negotiation, message categories, compat classification | wire fixtures — the crate is pure data, so every test is tier *pure* | — |
-| `kmux-sys` | 51 | — | XDG path resolution rules, Ed25519 identity round-trip, TOFU store, transport constants | `Dirs::rooted` | real sockets, real TLS handshakes, keyring |
+| `kmux-sys` | 51 | — | XDG path resolution rules, Ed25519 identity round-trip, TOFU store, transport constants; a stalled TLS handshake does not block the next accept, and times out (issue #206, loopback sockets, paused clock) | `Dirs::rooted` | QUIC handshakes, keyring |
 | `kmux-app` | 300 | — | action dispatch, mode resolution, layout geometry, config resolution, command registry, driver tick | `AppCore::for_test`, `FrontendDriver::for_test` | `run_cli` process exit |
-| `kmuxd` | 174 | 18 | message handlers, app state, relay, auth, wordlist, persistence; grid conformance (R10); 5 e2e suites | `crate::fixtures` (`fixture_app`, `fixture_client_state`, `NoopAttacher`, …), `NullEventSink` (via `kmux-vt-core/test-util`); e2e: `harness::{Sandbox, Daemon, Federation}` | fork/exec, `SCM_RIGHTS`, daemonize, `startup::async_main` |
+| `kmuxd` | 174 | 18 | message handlers, app state, relay, auth, wordlist, persistence; grid conformance (R10); 5 e2e suites; backpressure and lock discipline (issue #206): input queue full without blocking the `sessions` lock, bounded outbound queue with lag → `SyncReset` resync, write timeout, auth/pong deadlines (pure verdicts + paused-clock watchdog), per-hold relay byte cap, `term_state` poison recovery, task supervisor | `crate::fixtures` (`fixture_app`, `fixture_client_state`, `NoopAttacher`, …), `NullEventSink` (via `kmux-vt-core/test-util`); e2e: `harness::{Sandbox, Daemon, Federation}` | fork/exec, `SCM_RIGHTS`, daemonize, `startup::async_main` |
 | `kmux-client` | 163 | 3 | server-message handling, grid apply, selection, input, liveness; grid-apply proptest (R10) | channel injection | — |
 | `kmux-connect` | 85 | — | bootstrap racing, daemon lifecycle, token handling, host parsing, attach-gate refusals | `Dirs::rooted` | real sshd handshake, QUIC/TLS on the wire |
 | `kmux-vt-core` | 71 | — | diff engine, scrollback mirror, backend contract | `MockBackend`, `NullEventSink` (`test-util`) | real terminal emulation |
@@ -276,7 +276,10 @@ duplication they exist to remove.
 - **`kmuxd`'s `#[cfg(test)] mod fixtures`** (`crates/kmuxd/src/fixtures.rs`,
   R5): `fixture_app()` (an empty `ServerApp` accepting `FIXTURE_TOKEN`),
   `fixture_client_state(app, transport)` (a connection's `SharedClientState`,
-  its outbound compressor and its control-channel receiver), `NoopAttacher`,
+  its outbound compressor and the receiving end of its outbound queue),
+  `NoopAttacher`, `make_outbound()` (a default-sized outbound queue whose
+  overflow closes nothing — the stand-in for a client's control channel
+  wherever a test builds a `ClientSender` or viewer by hand),
   `fixture_term_state(rows, cols)`, `sample_grid()` and
   `sample_persisted_session(word, name, last_active_ms)`. The dispatch tests'
   `testing` module re-exports `FIXTURE_TOKEN`, `fixture_app`,

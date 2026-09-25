@@ -45,7 +45,8 @@ This document is the technical reference for the kmux connection subsystem as im
     - [Dry-run diagnostics (`--dry-run`, `--test`)](#dry-run-diagnostics---dry-run---test)
 17. [Daemon Binary Resolution](#daemon-binary-resolution)
 18. [Idle Shutdown](#idle-shutdown)
-19. [Key File Index](#key-file-index)
+19. [Server-Side Flow Control and Deadlines](#server-side-flow-control-and-deadlines)
+20. [Key File Index](#key-file-index)
 
 ---
 
@@ -280,22 +281,30 @@ The length prefix counts the 1-byte codec tag plus the (possibly compressed) pay
 
 ### Listener Trait
 
-The server accepts connections through a uniform `Listener` trait defined in `crates/kmux-protocol/src/transport/mod.rs`:
+The server accepts connections through a uniform `Listener` trait defined in `crates/kmux-sys/src/transport/mod.rs`:
 
 ```rust
 pub trait Listener: Send {
     fn kind(&self) -> TransportKind;
-    async fn accept(&mut self) -> Result<IncomingSession, AcceptError>;
+    /// Resolves as soon as the transport has a connection, before any handshake.
+    async fn accept(&mut self) -> Result<PendingSession, AcceptError>;
+}
+
+impl PendingSession {
+    /// Runs the TLS / QUIC handshake (none for UDS and plain TCP).
+    pub async fn establish(self, timeout: Duration) -> Result<IncomingSession, AcceptError>;
 }
 
 pub struct IncomingSession {
     pub read: Box<dyn AsyncRead + Unpin + Send>,
     pub write: Box<dyn AsyncWrite + Unpin + Send>,
-    pub extra: Box<dyn Any + Send>,  // QUIC carries quinn::Connection
-    pub kind: TransportKind,
+    pub peer: PeerInfo,
     pub span: tracing::Span,
+    pub transport: SessionTransport,  // QUIC carries its quinn::Connection
 }
 ```
+
+`serve(listener, HANDSHAKE_TIMEOUT, on_session)` is the accept loop: it spawns each pending connection's `establish` into that connection's own task, so a peer that stalls mid-handshake delays nobody else, and drops it after `HANDSHAKE_TIMEOUT` (10 s).
 
 The server dispatches all transports through a single `dispatch_session` → `run_client_session` path in `crates/kmuxd/src/client_handler/session.rs`. Transport-specific setup (e.g., stream opening for QUIC) occurs before the session handler is invoked; the handler itself is generic.
 
@@ -554,11 +563,12 @@ Both endpoints mirror the same policy (`crates/kmux-client/src/liveness.rs`,
 
 | Direction | Interval | Timeout |
 |-----------|----------|---------|
-| server → client `Ping` | 5 s | — |
+| server → client `Ping` | 5 s | 30 s after the oldest unanswered ping with no inbound frame → close |
 | client → server `Ping` | 5 s | 15 s silence → declare dead |
 
-The client resets its timeout on *any* inbound frame (not just `Pong`),
-so a chatty session never spuriously times out. `client_ping_due` on
+Both ends reset their timeout on *any* inbound frame (not just `Pong`),
+so a chatty session never spuriously times out. The daemon's side is
+described in [Server-Side Flow Control and Deadlines](#server-side-flow-control-and-deadlines). `client_ping_due` on
 the liveness tracker is sampled every second from the event loop —
 timers are cheap and the loop is already running for rendering.
 Worst-case detection of a hung daemon (kill -STOP, blackholed path) is
@@ -844,12 +854,69 @@ Sessions are checkpointed to `$XDG_STATE_HOME/kmux/session_state.bin` (or `$HOME
 
 ---
 
+## Server-Side Flow Control and Deadlines
+
+One slow pane, slow client or misbehaving peer must not stall the daemon or
+grow its memory without bound (issue #206). Every queue on the per-connection
+and per-pane paths is bounded, and every wait on a peer has a deadline.
+
+### Outbound queue (`crates/kmuxd/src/outbound.rs`)
+
+Everything the daemon sends a TCP/UDS client — replies, events, pings, and the
+pane data `TcpAttacher` forwards — goes through one bounded FIFO
+(`OUTBOUND_CAPACITY`, 1024 messages) that the connection's writer task drains.
+Two lanes share it, so order is kept:
+
+- **Control** (`OutboundTx::send`) is never dropped and may use the whole
+  queue. If even that is full, the client has stopped reading: the connection
+  is closed (`CloseReason::OutboundOverflow`) instead of a message being lost,
+  and the client reconnects and resyncs.
+- **Pane data** (`OutboundTx::try_send_data`) may not use the last quarter of
+  the queue, which stays free for control. When a frame does not fit, that
+  pane's stream is **lagged**: its frames are dropped (its per-pane channel is
+  kept drained, so the relay never marks the client `Lagged` itself) until the
+  writer has drained the queue to half. Then the stream sends `SyncReset` +
+  `TerminalSnapshot` — the shape of `AttachResult::SyncReset` — with a fresh
+  snapshot and its seqno, skips incremental frames the snapshot already covers,
+  and goes live. The client ends up with a correct grid without a round trip.
+  A pane the daemon cannot snapshot (a federated one) is sent `Lagged`
+  instead, and the client re-attaches.
+
+A log dump (`FetchLogs`) can exceed the queue, so it is sent from its own task
+that waits for room. QUIC pane streams are unaffected: each rides its own
+flow-controlled unidirectional stream. No wire message or capability was added,
+so `PROTOCOL_RANGE` is unchanged.
+
+### Deadlines
+
+| What | Deadline | On expiry |
+|------|----------|-----------|
+| TLS / QUIC handshake | `HANDSHAKE_TIMEOUT` 10 s, in the connection's own task | connection dropped; other accepts unaffected |
+| `Auth` + `AuthProof` after connect | `AUTH_DEADLINE` 30 s | `CloseReason::AuthDeadline` |
+| Any inbound frame after the oldest unanswered `Ping` | `PONG_DEADLINE` 30 s | `CloseReason::PongDeadline` |
+| Each frame write, each flush | `FRAME_WRITE_TIMEOUT` 30 s | `CloseReason::WriteTimeout` |
+
+The auth and pong checks are pure functions of instants (`auth_verdict`,
+`pong_verdict` in `crates/kmuxd/src/client_handler/liveness.rs`), evaluated
+once a second by a per-connection watchdog. The watchdog, the writer and the
+outbound queue all close a connection the same way — through its close signal,
+which the read loop selects on — and the reason is logged.
+
+### Per-pane input
+
+Client input is queued, not awaited: see
+[daemon-lifecycle.md §9.3a](daemon-lifecycle.md#93a-client-input-appiors-engine).
+A pane whose program stops reading fills its own bounded input queue and
+refuses further input with an error; no other pane or session waits on it.
+
+---
+
 ## Key File Index
 
 | File | Role |
 |------|------|
 | `crates/kmux-protocol/src/transport/bootstrap.rs` | `Bootstrap` trait, `SessionContext`, `EndpointAdvert`, `BootstrapError` |
-| `crates/kmux-protocol/src/transport/mod.rs` | `Listener` trait, `IncomingSession`, `PaneAttacher` |
+| `crates/kmux-sys/src/transport/mod.rs` | `Listener` trait, `PendingSession`, `IncomingSession`, `serve` accept loop |
 | `crates/kmux-protocol/src/transport/quic.rs` | QUIC listener and client helpers |
 | `crates/kmux-protocol/src/transport/tcp_tls.rs` | TLS-TCP listener and client helpers |
 | `crates/kmux-protocol/src/transport/uds.rs` | UDS listener and client helpers |
@@ -866,5 +933,7 @@ Sessions are checkpointed to `$XDG_STATE_HOME/kmux/session_state.bin` (or `$HOME
 | `crates/kmuxd/src/startup.rs` | Listener loop over `ServerConfig.listeners` |
 | `crates/kmuxd/src/app/mod.rs` | `ServerApp`, `ConnectionMetrics`, `snapshot_sessions_with_connections` |
 | `crates/kmuxd/src/daemon.rs` | Control socket server (`serve_control_socket`, status/stop/sessions commands) |
-| `crates/kmuxd/src/client_handler/session.rs` | `run_client_session` (generic over all transports; byte/activity instrumentation) |
+| `crates/kmuxd/src/client_handler/session.rs` | `run_client_session` (generic over all transports; byte/activity instrumentation; writer with `FRAME_WRITE_TIMEOUT`) |
+| `crates/kmuxd/src/client_handler/liveness.rs` | Auth and pong deadlines, the per-connection watchdog |
+| `crates/kmuxd/src/outbound.rs` | Bounded outbound queue, control/data lanes, lagged pane-stream resync, close signal |
 | `crates/kmux/src/subcommands/render.rs` | Centralised `tabled`-based table/JSON rendering for all CLI list output |
