@@ -34,6 +34,7 @@ too-many-lines-threshold = 100
 disallowed-methods = [
     { path = "std::env::set_var", reason = "process-global mutation; pass the value as a parameter or use Command::env (docs/testing.md R3)" },
     { path = "std::env::remove_var", reason = "process-global mutation; pass the value as a parameter or use Command::env (docs/testing.md R3)" },
+    { path = "std::env::set_current_dir", reason = "process-global mutation that races every concurrent spawn and relative path; give the child its directory (PtyConfig::cwd, Command::current_dir)" },
 ]
 
 # Identifiers `doc_markdown` would otherwise flag as needing backticks. Product

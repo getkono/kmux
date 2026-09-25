@@ -1,11 +1,11 @@
-use std::ffi::CString;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::pty::{ForkptyResult, forkpty};
-use nix::unistd::{Pid, execve};
+use nix::unistd::Pid;
 use tokio::sync::watch;
 
+use crate::child::ChildPlan;
 use crate::config::{PtyConfig, WindowSize};
 use crate::error::{KmuxError, Result};
 use crate::io::PtyMasterIo;
@@ -35,53 +35,27 @@ pub struct PtyProcess {
 
 impl PtyProcess {
     /// Spawn a child process in a new PTY.
+    ///
+    /// The child is a session leader (and so its own process group) with the
+    /// PTY as its controlling terminal. Before it runs the program it resets
+    /// the daemon's signal dispositions and mask, closes every inherited fd
+    /// past stdio, and changes to `config.cwd` — all in the child, so the
+    /// daemon's own working directory never changes. If it cannot change
+    /// directory or run the program it writes why to the PTY and exits 127.
     pub fn spawn(config: &PtyConfig) -> Result<Self> {
         let winsize = to_winsize(config.size);
-        let env_map = config.env.clone().build();
+        let plan = ChildPlan::new(config)?;
 
-        // Prepare C strings for exec
-        let program = CString::new(config.program.as_str())
-            .map_err(|_| KmuxError::Spawn("program name contains null byte".into()))?;
-
-        let mut argv: Vec<CString> = Vec::with_capacity(config.args.len() + 1);
-        argv.push(program.clone());
-        for arg in &config.args {
-            argv.push(
-                CString::new(arg.as_str())
-                    .map_err(|_| KmuxError::Spawn(format!("arg contains null byte: {arg}")))?,
-            );
-        }
-
-        let envp: Vec<CString> = env_map
-            .iter()
-            .map(|(k, v)| {
-                CString::new(format!("{k}={v}").as_str())
-                    .map_err(|_| KmuxError::Spawn("env var contains null byte".into()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Change working directory if specified
-        if let Some(cwd) = &config.cwd {
-            std::env::set_current_dir(cwd).map_err(KmuxError::Io)?;
-        }
-
-        // SAFETY: forkpty is unsafe; we uphold the contract by not using
-        // tokio/threads in the child before exec, and by not sharing the
-        // master fd across threads before returning from this function.
+        // SAFETY: the child branch calls only `ChildPlan::exec`, which makes
+        // async-signal-safe calls on memory prepared before the fork.
         let fork_result = unsafe { forkpty(Some(&winsize), None) }.map_err(KmuxError::Pty)?;
 
         match fork_result {
-            ForkptyResult::Child => {
-                // In child: exec the target program.
-                // If exec fails, exit immediately to avoid double-cleanup.
-                let _ = execve(&program, &argv, &envp);
-                // exec failed -- exit child with error code
-                unsafe { nix::libc::_exit(127) };
-            }
+            // SAFETY: we are the freshly forked child.
+            ForkptyResult::Child => unsafe { plan.exec() },
             ForkptyResult::Parent { child, master } => {
-                let master_fd: RawFd = master.into_raw_fd();
-                let io = PtyMasterIo::new(master_fd).map_err(KmuxError::Io)?;
                 let exit_rx = spawn_wait_task(child);
+                let io = PtyMasterIo::new(master.into_raw_fd()).map_err(KmuxError::Io)?;
                 Ok(Self {
                     io,
                     pid: child,
@@ -309,6 +283,115 @@ mod tests {
             "foreign child exit was not detected in time"
         );
         assert!(inherited.is_exited(), "is_exited should be true after exit");
+    }
+
+    /// A pane sees its terminal and nothing else: not another pane's master,
+    /// and not an fd some other part of the process opened without
+    /// close-on-exec (the pipe below plays that careless library). Needs a
+    /// real child to list its own fds (R7).
+    #[tokio::test]
+    async fn a_pane_inherits_no_fd_but_its_terminal() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        const INHERITED: i32 = 10;
+
+        let other = PtyProcess::spawn(&PtyConfig::new("/bin/cat")).expect("spawn");
+        let (read_end, _write_end) = nix::unistd::pipe().expect("pipe");
+        // SAFETY: F_DUPFD (not F_DUPFD_CLOEXEC) yields a fresh, inheritable
+        // fd this test owns; 200 keeps it clear of the child's own fds and
+        // under macOS's default limit of 256.
+        let leaky = unsafe {
+            OwnedFd::from_raw_fd(nix::libc::fcntl(
+                read_end.as_raw_fd(),
+                nix::libc::F_DUPFD,
+                200,
+            ))
+        };
+        assert!(leaky.as_raw_fd() >= 200, "precondition: the dup succeeded");
+
+        let output = crate::oneshot::run(&PtyConfig::new("/bin/ls").args(["/dev/fd"]))
+            .await
+            .expect("run");
+        let fds: Vec<i32> = output
+            .stdout_str()
+            .split_whitespace()
+            .filter_map(|word| word.parse().ok())
+            .collect();
+
+        // 0-2 are the terminal. Whatever `ls` opens to do the listing takes
+        // the lowest free numbers, just past them; anything far above was
+        // inherited. The leaky fd is far above; the other master usually is
+        // too, but not always (parallel tests free low numbers for reuse), so
+        // `io`'s close-on-exec test is what covers it whatever its number.
+        assert!(
+            fds.contains(&0) && fds.contains(&2),
+            "not a listing: {fds:?}"
+        );
+        assert!(
+            fds.iter().all(|&fd| fd < INHERITED),
+            "fds leaked into the pane: {fds:?} (other master {}, leaky {})",
+            other.master_fd(),
+            leaky.as_raw_fd()
+        );
+    }
+
+    /// Each child changes directory itself, so spawns racing each other each
+    /// land in their own directory, and the spawning process never moves.
+    /// Needs real children to report where they run (R7).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_spawns_each_run_in_their_own_directory() {
+        let before = std::env::current_dir().expect("cwd");
+        let dirs: Vec<tempfile::TempDir> = (0..8)
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+
+        let runs: Vec<_> = dirs
+            .iter()
+            .map(|dir| {
+                let config = PtyConfig::new("/bin/pwd").cwd(dir.path());
+                tokio::spawn(async move { crate::oneshot::run(&config).await })
+            })
+            .collect();
+        for (dir, run) in dirs.iter().zip(runs) {
+            let output = run.await.expect("join").expect("run");
+            let expected = dir.path().canonicalize().expect("canonical");
+            assert_eq!(output.stdout_str().trim(), expected.to_string_lossy());
+        }
+        assert_eq!(std::env::current_dir().expect("cwd"), before);
+    }
+
+    /// The daemon ignores `SIGPIPE` (the Rust runtime does), and an ignored
+    /// disposition survives `execve`. Reset in the child, `yes` dies of the
+    /// closed pipe silently instead of reporting a write error. Needs a real
+    /// child (R7).
+    #[tokio::test]
+    async fn a_pipeline_whose_reader_exits_ends_quietly() {
+        let config = PtyConfig::new("/bin/sh").args(["-c", "yes | head -1"]);
+        let output = crate::oneshot::run(&config).await.expect("run");
+        assert_eq!(output.stdout_str().trim_end(), "y");
+        assert_eq!(output.status, ExitStatus::Code(0));
+    }
+
+    /// A child that cannot change directory, or cannot run its program, says
+    /// why on the terminal and exits 127. Needs a real child (R7).
+    #[tokio::test]
+    async fn a_child_that_cannot_start_says_why_and_exits_127() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cases = [
+            (
+                PtyConfig::new("/bin/pwd").cwd(tmp.path().join("missing")),
+                "kmux: cannot chdir to ",
+            ),
+            (
+                PtyConfig::new("/nonexistent/program"),
+                "kmux: cannot exec /nonexistent/program: errno ",
+            ),
+        ];
+        for (config, diagnostic) in cases {
+            let output = crate::oneshot::run(&config).await.expect("run");
+            let text = output.stdout_str();
+            assert!(text.starts_with(diagnostic), "{text:?}");
+            assert_eq!(output.status, ExitStatus::Code(127), "{text:?}");
+        }
     }
 
     /// Verify that setting `keep_alive` prevents the Drop impl from sending

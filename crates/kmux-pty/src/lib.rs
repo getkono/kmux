@@ -19,6 +19,7 @@
 //! ```
 
 // Module declarations
+mod child;
 pub mod config;
 pub mod error;
 pub mod events;
