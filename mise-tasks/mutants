@@ -91,7 +91,10 @@ FORWARDED=("$@")
 group_outcomes() { echo "mutants.out/$1/mutants.out/outcomes.json"; }
 
 # Exit status per group, so "no outcomes" can be told apart from "did not run".
-declare -A GROUP_RC=()
+# Held in one plain variable per group (`RC_lib`, `RC_bin`, `RC_bin_fast`)
+# rather than an associative array: `declare -A` needs bash 4, and macOS ships
+# 3.2, where it aborts the whole unscoped run before any group starts.
+rc_var() { echo "RC_${1//-/_}"; }
 
 run_group() {
     local name="$1" config="$2"
@@ -102,7 +105,7 @@ run_group() {
     local rc=0
     cargo mutants --config "$config" -o "mutants.out/$name" \
         "${pkgs[@]}" ${FORWARDED[@]+"${FORWARDED[@]}"} || rc=$?
-    GROUP_RC["$name"]=$rc
+    printf -v "$(rc_var "$name")" '%s' "$rc"
 }
 
 # cargo-mutants creates its output directory but not the parent, so a fresh
@@ -110,6 +113,11 @@ run_group() {
 # such file or directory" -- which `|| true` then swallows into a cheerful
 # "Sweep complete". Only the mutation gate noticed, by finding no outcomes.
 mkdir -p mutants.out
+# Written below only when every group ran and none had anything to test, so
+# `mise run mutants-gate` can pass an empty scope without also passing a sweep
+# that never ran. Cleared first so a stale one cannot vouch for this run.
+NOTHING_IN_SCOPE=mutants.out/NOTHING_IN_SCOPE
+rm -f "$NOTHING_IN_SCOPE"
 
 run_group lib      .cargo/mutants.toml          "${LIB_CRATES[@]}"
 run_group bin      .cargo/mutants-bin.toml      "${BIN_CRATES[@]}"
@@ -128,9 +136,10 @@ produced=()
 empty=()
 failed=()
 for g in lib bin bin-fast; do
+    rc_name="$(rc_var "$g")"
     if [[ -f "$(group_outcomes "$g")" ]]; then
         produced+=("$g")
-    elif [[ "${GROUP_RC[$g]}" -eq 0 ]]; then
+    elif [[ "${!rc_name}" -eq 0 ]]; then
         empty+=("$g")
     else
         failed+=("$g")
@@ -151,6 +160,7 @@ if [[ ${#produced[@]} -eq 0 ]]; then
     echo "No mutants were generated. Expected for a diff that touches no Rust;"
     echo "otherwise check that the scoping flags reached cargo-mutants (they are"
     echo "echoed on each ==> line above)."
+    echo "every group exited 0 with nothing to test" > "$NOTHING_IN_SCOPE"
     exit 0
 fi
 echo "Per-group results under mutants.out/{lib,bin,bin-fast}/mutants.out/."

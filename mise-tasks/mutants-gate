@@ -34,6 +34,14 @@ if [[ ${#dirs[@]} -eq 0 ]]; then
 fi
 
 if [[ ${#dirs[@]} -eq 0 ]]; then
+    # `mise run mutants` leaves this marker only when every group ran, exited
+    # 0 and had nothing to test — a diff with no Rust mutants. That is a pass
+    # (docs/quality-gates.md: "a group with nothing in scope passes"); a sweep
+    # that did not run leaves neither outcomes nor the marker, and still fails.
+    if [[ -f mutants.out/NOTHING_IN_SCOPE ]]; then
+        echo "mutants-gate: nothing in scope — the sweep generated no mutants; passing"
+        exit 0
+    fi
     echo "mutants-gate: no outcomes.json found; run \`mise run mutants\` first" >&2
     exit 1
 fi

@@ -210,7 +210,10 @@ skipped with a `skip-mutants` label, which is visible on the PR.
 Scoping flags are forwarded to every crate-group pass and echoed on each `==>`
 line, so a CI log says what was actually swept rather than implying it. A group
 with nothing in scope passes; a group that exits non-zero having written no
-outcomes fails, because it did not run and its crates are unmeasured.
+outcomes fails, because it did not run and its crates are unmeasured. When every
+group ran and none had anything to test — a docs-only or xtask-only diff —
+`mise run mutants` leaves `mutants.out/NOTHING_IN_SCOPE`, and `mutants-gate`
+passes on that marker alone; with neither outcomes nor the marker it still fails.
 
 See [docs/testing.md](testing.md) for the methodology, the per-crate table, and
 the register of intentionally-untested areas.
