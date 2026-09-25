@@ -21,7 +21,7 @@ use super::{ClientMap, PaneEventSink, PaneProgress, PaneRelay, SCROLLBACK_CAPACI
 impl ServerApp {
     /// Gracefully close a single pane, collapsing its tab's layout tree.
     ///
-    /// Returns the child exit code (if known) and a [`PaneCloseOutcome`]
+    /// Returns the child exit code (if known) and a [`crate::app::PaneCloseOutcome`]
     /// describing how the tab/session changed, so the caller can broadcast the
     /// authoritative `LayoutUpdate` / tab-close event. If the pane was the last
     /// in its tab the tab is removed; if it was the last tab the session closes.
@@ -29,15 +29,11 @@ impl ServerApp {
         &self,
         pane_id: &str,
     ) -> Result<(Option<i32>, super::PaneCloseOutcome)> {
-        use kmux_pty::error::KmuxError;
-
         use super::PaneCloseOutcome;
-        use super::helpers::parse_pane_id;
+        use super::helpers::{as_pane_error, pane_not_found, parse_pane_id};
 
         let (word_id, pane_index) =
-            parse_pane_id(pane_id).ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
+            parse_pane_id(pane_id).ok_or_else(|| pane_not_found(pane_id))?;
 
         // Detach all clients from this pane
         {
@@ -49,7 +45,10 @@ impl ServerApp {
             }
         }
 
-        self.manager.close_nowait(pane_id).await?;
+        self.manager
+            .close_nowait(pane_id)
+            .await
+            .map_err(|e| as_pane_error(pane_id, e))?;
 
         // Remove the pane and collapse its tab's layout; remove the tab if it
         // becomes empty, and the session if it has no tabs left.
@@ -77,7 +76,7 @@ impl ServerApp {
             // Last pane in this tab → remove the tab.
             state.tabs.retain(|t| t.tab_index != tab_index);
             if state.active_tab == tab_index {
-                state.active_tab = state.tabs.first().map(|t| t.tab_index).unwrap_or(0);
+                state.active_tab = state.tabs.first().map_or(0, |t| t.tab_index);
             }
             if state.tabs.is_empty() {
                 let word = word_id.to_string();
@@ -191,8 +190,7 @@ impl ServerApp {
                 // the engine's writer task.
                 let (resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
                 title_sink.set_pty_response_sender(resp_tx);
-                let relay_sink =
-                    Arc::clone(&title_sink) as Arc<dyn crate::backend::BackendEventSink>;
+                let relay_sink: Arc<dyn crate::backend::BackendEventSink> = title_sink.clone();
                 let term_state = Arc::new(Mutex::new(new_term_state(BackendConfig {
                     size: BackendSize::from(size),
                     capabilities: CapabilityHandles {
@@ -212,7 +210,7 @@ impl ServerApp {
                     seqno_counter.clone(),
                     self.manager.clone(),
                 ));
-                crate::engine::PaneEngine::InProcess(crate::engine::InProcessEngine::new(
+                PaneEngine::InProcess(crate::engine::InProcessEngine::new(
                     pane_id.to_string(),
                     term_state,
                     writer,

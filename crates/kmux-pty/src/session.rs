@@ -65,7 +65,7 @@ impl PtySession {
         Ok((
             PtyReader { io: reader_io },
             PtyWriter {
-                io: tokio::sync::Mutex::new(writer_io),
+                io: Mutex::new(writer_io),
             },
         ))
     }
@@ -183,10 +183,10 @@ pub struct PtyReader {
 /// Write half of a split `PtySession`.
 ///
 /// Owns a dup'd PTY master fd; the inner `Mutex` here is solely for interior
-/// mutability (AsyncWrite requires `&mut self`) and is never contested since
+/// mutability (`AsyncWrite` requires `&mut self`) and is never contested since
 /// only one task calls `write_all` at a time.
 pub struct PtyWriter {
-    io: tokio::sync::Mutex<crate::io::PtyMasterIo>,
+    io: Mutex<crate::io::PtyMasterIo>,
 }
 
 impl PtyWriter {
@@ -224,9 +224,7 @@ impl PtyWriter {
 
         let write_raw = write_fd.into_raw_fd();
         let io = crate::io::PtyMasterIo::new(write_raw).map_err(KmuxError::Io)?;
-        Ok(Self {
-            io: tokio::sync::Mutex::new(io),
-        })
+        Ok(Self { io: Mutex::new(io) })
     }
 }
 
@@ -259,12 +257,9 @@ impl AsyncRead for PtySession {
         cx: &mut Context<'_>,
         buf: &mut ReadBuf<'_>,
     ) -> Poll<std::io::Result<()>> {
-        let mut guard = match self.inner.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
+        let Ok(mut guard) = self.inner.try_lock() else {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         };
         Pin::new(&mut guard.pty.io).poll_read(cx, buf)
     }
@@ -276,34 +271,25 @@ impl AsyncWrite for PtySession {
         cx: &mut Context<'_>,
         data: &[u8],
     ) -> Poll<std::io::Result<usize>> {
-        let mut guard = match self.inner.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
+        let Ok(mut guard) = self.inner.try_lock() else {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         };
         Pin::new(&mut guard.pty.io).poll_write(cx, data)
     }
 
     fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let mut guard = match self.inner.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
+        let Ok(mut guard) = self.inner.try_lock() else {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         };
         Pin::new(&mut guard.pty.io).poll_flush(cx)
     }
 
     fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
-        let mut guard = match self.inner.try_lock() {
-            Ok(g) => g,
-            Err(_) => {
-                cx.waker().wake_by_ref();
-                return Poll::Pending;
-            }
+        let Ok(mut guard) = self.inner.try_lock() else {
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
         };
         Pin::new(&mut guard.pty.io).poll_shutdown(cx)
     }
@@ -346,10 +332,8 @@ mod tests {
             let mut output = Vec::new();
             let mut buf = [0u8; 256];
             loop {
-                match tokio::time::timeout(std::time::Duration::from_secs(5), reader.read(&mut buf))
-                    .await
-                {
-                    Ok(Ok(0)) | Err(_) | Ok(Err(_)) => break,
+                match tokio::time::timeout(Duration::from_secs(5), reader.read(&mut buf)).await {
+                    Ok(Ok(0) | Err(_)) | Err(_) => break,
                     Ok(Ok(n)) => {
                         output.extend_from_slice(&buf[..n]);
                         // PTY echoes our input back -- that's enough to verify

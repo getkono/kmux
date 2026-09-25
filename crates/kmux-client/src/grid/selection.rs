@@ -9,14 +9,14 @@ pub struct GridPos {
 }
 
 impl GridPos {
-    pub fn min(a: GridPos, b: GridPos) -> GridPos {
+    pub fn min(a: Self, b: Self) -> Self {
         if (a.row, a.col) <= (b.row, b.col) {
             a
         } else {
             b
         }
     }
-    pub fn max(a: GridPos, b: GridPos) -> GridPos {
+    pub fn max(a: Self, b: Self) -> Self {
         if (a.row, a.col) >= (b.row, b.col) {
             a
         } else {

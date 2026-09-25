@@ -28,6 +28,7 @@ gpu = ["kmux-render/gpu"]
 kmux-app.workspace = true
 kmux-client.workspace = true
 kmux-protocol = { workspace = true, features = ["framing"] }
+kmux-sys.workspace = true
 # The wgpu-free core (geometry/cursor_geometry/CellMetrics) is always linked so
 # the render-debug overlay can report what the renderer computes even on the
 # Cairo path; the `gpu` feature layers on wgpu (`kmux-render/gpu`).
@@ -35,7 +36,6 @@ kmux-render.workspace = true
 anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
-futures.workspace = true
 
 # The GTK4 + libadwaita stack is the desktop frontend on Linux (system packages)
 # and macOS (Homebrew: `brew install gtk4 libadwaita`). Gating the deps to those
@@ -49,3 +49,6 @@ pangocairo.workspace = true
 # automatic font fallback resolves Powerline/Nerd glyphs on the Cairo path (issue
 # #145). fontconfig is always present wherever GTK builds (pango links it).
 fontconfig-sys.workspace = true
+
+[lints]
+workspace = true

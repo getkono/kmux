@@ -30,7 +30,7 @@ pub fn write_connection_log(
          connected_at: {connected_at}\n",
         server_version.unwrap_or("unknown"),
     );
-    match kmux_protocol::dirs::connection_log_path(instance_id) {
+    match kmux_sys::dirs::connection_log_path(instance_id) {
         Ok(path) => {
             if let Err(e) = std::fs::write(&path, &content) {
                 tracing::warn!("Failed to write connection log {}: {e}", path.display());

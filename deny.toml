@@ -1,0 +1,89 @@
+# cargo-deny policy. Run via `mise run deps-audit`.
+#
+# Two things nothing checked before this file existed:
+#
+# 1. **Licences.** kmux ships under AGPL-3.0-only OR LicenseRef-Commercial. The
+#    commercial half means a third-party licence that is fine for the AGPL build
+#    can still be a problem for the other, and "nobody has looked" is not a
+#    position to take with a dual licence.
+# 2. **Advisories.** A daemon that speaks QUIC and TLS to the network sits on
+#    rustls, ring and quinn, and had no RUSTSEC check at all. Adding this found
+#    three live vulnerabilities on the first run: a remote memory exhaustion in
+#    quinn-proto (unbounded out-of-order stream reassembly), a reachable panic
+#    in rustls-webpki's CRL parsing, and unsoundness in `anyhow::Error::
+#    downcast_mut`. All three were fixed by a lockfile update.
+
+[graph]
+# No `targets` filter on purpose. Restricting to the platforms we ship would
+# hide advisories in code that a contributor on another platform still builds,
+# and the union is the strictest reading — the same reasoning as the
+# dependency-direction assertions in xtask/tests/.
+all-features = true
+
+[advisories]
+version = 2
+# Strictest setting: flag unmaintained crates anywhere in the graph, not only
+# direct dependencies. Everything currently unmaintained is listed below with a
+# reason, so each one is a decision on the record rather than a whole category
+# switched off.
+unmaintained = "all"
+yanked = "deny"
+ignore = [
+    # Direct dependencies. Both are real debt and neither has a drop-in
+    # replacement that is a lockfile change; they need code.
+    { id = "RUSTSEC-2025-0069", reason = "daemonize: direct dep, no maintained equivalent. The daemon's double-fork is ~40 lines and vendoring it is the exit; tracked, not forgotten." },
+    { id = "RUSTSEC-2025-0134", reason = "rustls-pemfile: direct dep, superseded by rustls-pki-types' own PEM parsing. A real migration, not a version bump." },
+
+    # Transitive, no path to a fix from here: each is pinned by a dependency we
+    # do not control, and none is a vulnerability -- only an unmaintained
+    # notice.
+    { id = "RUSTSEC-2026-0192", reason = "ttf-parser, via fontdb -> kmux-render. fontdb has not moved to skrifa yet; we already depend on skrifa through swash, so the migration is upstream's." },
+    { id = "RUSTSEC-2025-0141", reason = "bincode 1.x, via uniffi's build-time tooling. Not in any shipped binary." },
+    { id = "RUSTSEC-2024-0436", reason = "paste, a build-time proc macro pulled by several dependencies. Expands to nothing at runtime." },
+    { id = "RUSTSEC-2026-0173", reason = "proc-macro-error2, build-time only, via uniffi." },
+    { id = "RUSTSEC-2023-0089", reason = "atomic-polyfill, via heapless via postcard. Reached only on targets without native atomics, which we do not build for." },
+]
+
+[licenses]
+version = 2
+# Permissive licences, plus the two weak-copyleft ones that are fine to link
+# against and are already in the tree for good reasons.
+allow = [
+    "MIT",
+    "Apache-2.0",
+    "Apache-2.0 WITH LLVM-exception",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "ISC",
+    "Zlib",
+    "Unlicense",
+    "CC0-1.0",
+    "Unicode-3.0",
+    # webpki-root-certs: a data licence over the Mozilla CA bundle, not code.
+    "CDLA-Permissive-2.0",
+    # uniffi. File-level copyleft: modifying a uniffi source file obliges us to
+    # publish that file, which linking against it does not.
+    "MPL-2.0",
+]
+# Our own crates are `publish = false` and carry `AGPL-3.0-only OR
+# LicenseRef-Commercial`, which is not an SPDX identifier cargo-deny can reason
+# about. They are the thing being licensed, not a third-party input.
+private = { ignore = true }
+
+exceptions = [
+    # UEFI runtime shims, reachable only on wasm/wasi targets we never build.
+    # The copyleft never reaches a shipped binary.
+    { name = "r-efi", allow = ["LGPL-2.1-or-later"] },
+]
+
+[bans]
+multiple-versions = "warn"
+# `wildcard` catches a `*` version requirement, which makes a build
+# non-reproducible. docs/crate-usage.md already requires every external version
+# to be declared exactly once, in [workspace.dependencies].
+wildcards = "deny"
+allow-wildcard-paths = true
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"

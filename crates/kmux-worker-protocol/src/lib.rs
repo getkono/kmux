@@ -306,7 +306,7 @@ mod tests {
         .expect("encode");
         match postcard::from_bytes::<WorkerRequest>(&bytes).expect("decode") {
             WorkerRequest::Hello { version, .. } => {
-                assert_ne!(version, WORKER_PROTOCOL_VERSION)
+                assert_ne!(version, WORKER_PROTOCOL_VERSION);
             }
             other => panic!("expected Hello, got {other:?}"),
         }

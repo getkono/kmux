@@ -65,8 +65,8 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, _app: &Application) {
             };
             {
                 let mut f = fe.borrow_mut();
-                f.core.mgr.select_tab(tab_index);
-                f.core.needs_render = true;
+                f.core.mgr_mut().select_tab(tab_index);
+                f.core.request_render();
             }
             show_in_page(&s, &page);
             s.drawing.grab_focus();
@@ -87,8 +87,8 @@ pub fn wire(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>, _app: &Application) {
             }
             if let Some(tab_index) = tab_index_for(&s, page) {
                 let mut f = fe.borrow_mut();
-                f.core.mgr.close_tab_index(tab_index);
-                f.core.needs_render = true;
+                f.core.mgr_mut().close_tab_index(tab_index);
+                f.core.request_render();
             }
             // Server-authoritative: keep the page until the tab actually closes.
             tv.close_page_finish(page, false);
@@ -106,7 +106,7 @@ pub fn sync(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
         let active = mgr.active_tab().map(|t| t.to_string()).unwrap_or_default();
         let word = mgr
             .active_session()
-            .map(|s| s.to_string())
+            .map(ToString::to_string)
             .unwrap_or_default();
         let want: Vec<(String, String)> = mgr
             .active_session_tabs()

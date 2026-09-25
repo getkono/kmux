@@ -1,0 +1,31 @@
+# cargo-mutants configuration — BIN-ONLY crates with heavy integration suites.
+#
+# Applies to `kmuxd` and `kmux-gtk`. See .cargo/mutants.toml for why the flags
+# must match the target shape (short version: `--lib` hard-errors on a bin-only
+# package and cargo-mutants misreads the error as "caught", which is what
+# produced the bogus 100% scores in the 2026-06-14 sweep).
+
+# `--bins` runs the unit tests compiled into the bin target — the 25 colocated
+# `#[cfg(test)]` modules in kmuxd, the 3 in kmux-gtk. `--tests` is deliberately
+# NOT passed: kmuxd's five `tests/` suites (handoff_e2e, federation_e2e,
+# process_isolation_e2e, query_response_e2e, grid_conformance) spawn real daemon
+# processes and real shells, which is far too slow to run once per mutant.
+#
+# Dropping `--lib` turns the old bogus 100% into an HONEST score: a bin crate
+# whose unit tests cannot reach a mutant now records it as missed, which is the
+# number the ratchet in quality-baseline.toml tracks.
+#
+# kmux-gtk is expected to score very low and stay there — GTK widget
+# construction needs a display and is untestable by policy (docs/testing.md
+# §Known exceptions). It is scored anyway rather than excluded, because an
+# honest low number that ratchets is worth more than a silent exclusion.
+additional_cargo_test_args = ["--bins"]
+
+timeout_multiplier = 5.0
+minimum_test_timeout = 30
+
+exclude_globs = [
+    "**/mock.rs",
+    # The EFF diceware wordlist — third-party data, not code we maintain.
+    "crates/kmuxd/src/eff_long_wordlist.txt",
+]

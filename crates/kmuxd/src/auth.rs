@@ -7,7 +7,7 @@ use rand::Rng;
 /// Persist `token` to the kmux runtime token file with mode 0600.
 /// Returns the path on success.
 pub fn persist_token(token: &str) -> anyhow::Result<PathBuf> {
-    let token_path = kmux_protocol::dirs::token_path()?;
+    let token_path = kmux_sys::dirs::token_path()?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -86,9 +86,7 @@ mod tests {
         // Verify path
         assert_eq!(
             path,
-            tmp.path()
-                .join(kmux_protocol::dirs::KMUX_DIR_NAME)
-                .join("token")
+            tmp.path().join(kmux_sys::dirs::KMUX_DIR_NAME).join("token")
         );
 
         // Verify contents

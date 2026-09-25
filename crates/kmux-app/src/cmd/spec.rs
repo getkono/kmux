@@ -91,7 +91,7 @@ pub struct ArgSpec {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Completer {
     None,
-    /// Active sessions: word_id and display name.
+    /// Active sessions: `word_id` and display name.
     Sessions,
     /// kill / term / stop / cont.
     Signals,

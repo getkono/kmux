@@ -53,24 +53,21 @@ impl DialogKind {
     fn is_list(self) -> bool {
         matches!(
             self,
-            DialogKind::SessionPicker
-                | DialogKind::DirPicker
-                | DialogKind::Launch
-                | DialogKind::Command
+            Self::SessionPicker | Self::DirPicker | Self::Launch | Self::Command
         )
     }
 
     fn from_mode(mode: &Mode) -> Option<Self> {
         match mode {
-            Mode::SessionPicker => Some(DialogKind::SessionPicker),
-            Mode::DirectoryPicker => Some(DialogKind::DirPicker),
-            Mode::LaunchPicker => Some(DialogKind::Launch),
-            Mode::Command(_) => Some(DialogKind::Command),
-            Mode::RenameSession { .. } | Mode::RenameTab { .. } => Some(DialogKind::Rename),
-            Mode::ConfirmCloseSession { .. } => Some(DialogKind::ConfirmCloseSession),
-            Mode::Help => Some(DialogKind::Help),
-            Mode::AddRemote => Some(DialogKind::AddRemote),
-            Mode::RemoteNewSession { .. } => Some(DialogKind::RemoteNew),
+            Mode::SessionPicker => Some(Self::SessionPicker),
+            Mode::DirectoryPicker => Some(Self::DirPicker),
+            Mode::LaunchPicker => Some(Self::Launch),
+            Mode::Command(_) => Some(Self::Command),
+            Mode::RenameSession { .. } | Mode::RenameTab { .. } => Some(Self::Rename),
+            Mode::ConfirmCloseSession { .. } => Some(Self::ConfirmCloseSession),
+            Mode::Help => Some(Self::Help),
+            Mode::AddRemote => Some(Self::AddRemote),
+            Mode::RemoteNewSession { .. } => Some(Self::RemoteNew),
             _ => None,
         }
     }
@@ -184,7 +181,7 @@ fn reconcile_native(
 
     // Refresh the list contents of a live picker/command dialog on change.
     let kind = dialogs.current.borrow().as_ref().map(|d| d.kind);
-    if kind.is_some_and(|k| k.is_list()) {
+    if kind.is_some_and(DialogKind::is_list) {
         let sig = list_signature(&fe.borrow().core);
         if dialogs.list_sig.borrow().as_deref() != Some(sig.as_str()) {
             *dialogs.list_sig.borrow_mut() = Some(sig);
@@ -285,8 +282,8 @@ fn open_list_dialog(
             let text = e.text().to_string();
             {
                 let mut f = fe.borrow_mut();
-                set_search(&mut f.core, text);
-                f.core.needs_render = true;
+                f.core.mutate(|c| set_search(c, text));
+                f.core.request_render();
             }
             shell.drawing.queue_draw();
         });
@@ -306,8 +303,8 @@ fn open_list_dialog(
             };
             if let Some(down) = nav {
                 let mut f = fe.borrow_mut();
-                move_selection(&mut f.core, down);
-                f.core.needs_render = true;
+                f.core.mutate(|c| move_selection(c, down));
+                f.core.request_render();
                 return glib::Propagation::Stop;
             }
             if matches!(keyval, gdk::Key::Return | gdk::Key::KP_Enter) {
@@ -335,7 +332,7 @@ fn open_list_dialog(
             }
             {
                 let mut f = fe.borrow_mut();
-                f.core.set_picker_selected(idx as usize);
+                f.core.mutate(|c| c.set_picker_selected(idx as usize));
             }
             activate_current(&fe, &shell, &app);
         });
@@ -348,9 +345,8 @@ fn open_list_dialog(
         let shell = shell.clone();
         dialog.connect_closed(move |_| {
             let mut f = fe.borrow_mut();
-            if DialogKind::from_mode(&f.core.mode).is_some_and(|k| k.is_list()) {
-                f.core.mode = Mode::Normal;
-                f.core.needs_render = true;
+            if DialogKind::from_mode(&f.core.mode).is_some_and(DialogKind::is_list) {
+                f.core.mutate(|c| c.mode = Mode::Normal);
             }
             drop(f);
             // Return focus to the terminal so typing resumes there.
@@ -590,8 +586,8 @@ fn disconnect_button(peer: &str, shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) 
     btn.connect_clicked(move |_| {
         {
             let mut f = fe.borrow_mut();
-            f.core.disconnect_remote(&peer);
-            f.core.needs_render = true;
+            f.core.mutate(|c| c.disconnect_remote(&peer));
+            f.core.request_render();
         }
         shell.drawing.queue_draw();
     });
@@ -700,7 +696,7 @@ fn move_selection(core: &mut AppCore, down: bool) {
         (Some(DialogKind::Command), false) => Action::CommandHintUp,
         _ => return,
     };
-    let _ = futures::executor::block_on(core.dispatch_action(action));
+    let _ = core.dispatch_action(action);
 }
 
 /// Activate the current selection of the open list dialog.
@@ -708,15 +704,11 @@ fn activate_current(fe: &Rc<RefCell<Frontend>>, shell: &Rc<Shell>, app: &gtk4::A
     let effects = {
         let mut f = fe.borrow_mut();
         let e = match f.core.mode {
-            Mode::DirectoryPicker => {
-                futures::executor::block_on(f.core.dispatch_action(Action::DirPickerSubmit))
-            }
-            Mode::Command(_) => {
-                futures::executor::block_on(f.core.dispatch_action(Action::CommandSubmit))
-            }
+            Mode::DirectoryPicker => f.core.dispatch_action(Action::DirPickerSubmit),
+            Mode::Command(_) => f.core.dispatch_action(Action::CommandSubmit),
             _ => f.core.activate_picker_selection(),
         };
-        f.core.needs_render = true;
+        f.core.request_render();
         e
     };
     apply_effects(fe, effects, app, &shell.drawing);
@@ -779,18 +771,19 @@ fn open_rename(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> LiveDialog {
             {
                 let mut f = fe.borrow_mut();
                 if resp == "rename" {
-                    if let Mode::RenameSession { buffer, .. } | Mode::RenameTab { buffer, .. } =
-                        &mut f.core.mode
-                    {
-                        *buffer = entry.text().to_string();
-                    }
-                    let _ =
-                        futures::executor::block_on(f.core.dispatch_action(Action::RenameSubmit));
+                    let typed = entry.text().to_string();
+                    f.core.mutate(|c| {
+                        if let Mode::RenameSession { buffer, .. } | Mode::RenameTab { buffer, .. } =
+                            &mut c.mode
+                        {
+                            *buffer = typed;
+                        }
+                    });
+                    let _ = f.core.dispatch_action(Action::RenameSubmit);
                 } else {
-                    let _ =
-                        futures::executor::block_on(f.core.dispatch_action(Action::ExitToNormal));
+                    let _ = f.core.dispatch_action(Action::ExitToNormal);
                 }
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             shell.drawing.queue_draw();
         });
@@ -834,8 +827,8 @@ fn open_confirm_close_session(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> 
                 } else {
                     Action::ExitToNormal
                 };
-                let _ = futures::executor::block_on(f.core.dispatch_action(action));
-                f.core.needs_render = true;
+                let _ = f.core.dispatch_action(action);
+                f.core.request_render();
             }
             shell.drawing.queue_draw();
         });
@@ -951,10 +944,8 @@ fn open_add_remote_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Live
         cancel.connect_clicked(move |_| {
             {
                 let mut f = fe.borrow_mut();
-                let _ = futures::executor::block_on(
-                    f.core.dispatch_action(Action::LaunchOverlayCancel),
-                );
-                f.core.needs_render = true;
+                let _ = f.core.dispatch_action(Action::LaunchOverlayCancel);
+                f.core.request_render();
             }
             dialog2.close();
         });
@@ -979,13 +970,13 @@ fn open_add_remote_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Live
             };
             let result = {
                 let mut f = fe.borrow_mut();
-                let r = f.core.submit_add_remote(form);
+                let r = f.core.mutate(|c| c.submit_add_remote(form));
                 if r.is_ok() {
                     // Core returns to Normal on success; reopen the launcher so the
                     // new remote is visible (expanded, connecting on focus).
-                    f.core.open_launch_picker();
+                    f.core.mutate(AppCore::open_launch_picker);
                 }
-                f.core.needs_render = true;
+                f.core.request_render();
                 r
             };
             match result {
@@ -1005,8 +996,7 @@ fn open_add_remote_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Live
         dialog.connect_closed(move |_| {
             let mut f = fe.borrow_mut();
             if matches!(f.core.mode, Mode::AddRemote) {
-                f.core.mode = Mode::Normal;
-                f.core.needs_render = true;
+                f.core.mutate(|c| c.mode = Mode::Normal);
             }
             drop(f);
             shell.drawing.grab_focus();
@@ -1069,13 +1059,12 @@ fn open_remote_new_dialog(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) -> Live
                 let mut f = fe.borrow_mut();
                 if resp == "create" {
                     let cwd = entry.text().to_string();
-                    f.core.submit_remote_new_session(peer.clone(), cwd);
+                    f.core
+                        .mutate(|c| c.submit_remote_new_session(peer.clone(), cwd));
                 } else {
-                    let _ = futures::executor::block_on(
-                        f.core.dispatch_action(Action::LaunchOverlayCancel),
-                    );
+                    let _ = f.core.dispatch_action(Action::LaunchOverlayCancel);
                 }
-                f.core.needs_render = true;
+                f.core.request_render();
             }
             shell.drawing.queue_draw();
         });
@@ -1150,8 +1139,8 @@ fn update_toast(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Fronte
         toast.connect_button_clicked(move |_| {
             {
                 let mut f = fe.borrow_mut();
-                let _ = futures::executor::block_on(f.core.dispatch_action(Action::UndoClose));
-                f.core.needs_render = true;
+                let _ = f.core.dispatch_action(Action::UndoClose);
+                f.core.request_render();
             }
             shell.drawing.queue_draw();
         });
@@ -1333,7 +1322,9 @@ fn update_metrics_dialog(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCe
             let fe = fe.clone();
             let shell = shell.clone();
             dialog.connect_closed(move |_| {
-                fe.borrow_mut().core.metrics_overlay_visible = false;
+                fe.borrow_mut()
+                    .core
+                    .mutate(|c| c.metrics_overlay_visible = false);
                 shell.drawing.grab_focus();
             });
         }
@@ -1360,8 +1351,7 @@ fn metrics_content(core: &AppCore) -> ScrolledWindow {
 
     let conn = mgr
         .connection_id
-        .map(|c| c.0.to_string())
-        .unwrap_or_else(|| "-".into());
+        .map_or_else(|| "-".into(), |c| c.0.to_string());
     card.append(&label(
         &format!("pid {}   connection {conn}", std::process::id()),
         "dim-label",
@@ -1433,7 +1423,9 @@ fn update_connection_dialog(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<Re
             let fe = fe.clone();
             let shell = shell.clone();
             dialog.connect_closed(move |_| {
-                fe.borrow_mut().core.connection_overlay_visible = false;
+                fe.borrow_mut()
+                    .core
+                    .mutate(|c| c.connection_overlay_visible = false);
                 shell.drawing.grab_focus();
             });
         }
@@ -1483,12 +1475,8 @@ fn connection_content(core: &AppCore) -> ScrolledWindow {
     card.append(&label("Identity", "heading"));
     let conn = info
         .connection_id
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "-".into());
-    let client = info
-        .client_id
-        .map(|c| c.to_string())
-        .unwrap_or_else(|| "-".into());
+        .map_or_else(|| "-".into(), |c| c.to_string());
+    let client = info.client_id.map_or_else(|| "-".into(), |c| c.to_string());
     card.append(&label(
         &format!("connection {conn}   client {client}"),
         "monospace",
@@ -1504,8 +1492,7 @@ fn connection_content(core: &AppCore) -> ScrolledWindow {
         Some(rtt) => {
             let ewma = rtt
                 .ewma_ms
-                .map(|v| format!("{v:.1}ms"))
-                .unwrap_or_else(|| "-".into());
+                .map_or_else(|| "-".into(), |v| format!("{v:.1}ms"));
             card.append(&label(
                 &format!(
                     "ping {ewma} ewma   recent {:.1}/{:.1}ms   {} samples",

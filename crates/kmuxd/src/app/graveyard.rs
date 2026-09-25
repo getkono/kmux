@@ -5,11 +5,11 @@
 //! age (TTL) cap, both configurable. It is persisted to its own `closed.bin`
 //! file (see `persist/graveyard.rs`), rewritten only when the set changes:
 //!
-//! - **close** (see `app/crud.rs`): snapshot → [`retain_closed_session`] →
+//! - **close** (see `app/crud.rs`): snapshot → [`crate::app::ServerApp::retain_closed_session`] →
 //!   *then* kill the processes, so the snapshot is durable even across a crash.
 //! - **restore** (see `app/restore.rs`): the entry is removed and the file
 //!   rewritten.
-//! - **TTL sweep**: [`sweep_graveyard`] runs on the periodic checkpoint tick and
+//! - **TTL sweep**: [`crate::app::ServerApp::sweep_graveyard`] runs on the periodic checkpoint tick and
 //!   rewrites the file only if it actually pruned something (so a steady state
 //!   costs zero extra I/O).
 
@@ -123,7 +123,7 @@ impl ServerApp {
             )));
         };
 
-        let entry = self.build_session_entry(&state);
+        let entry = Self::build_session_entry(&state);
         self.sessions
             .write()
             .await

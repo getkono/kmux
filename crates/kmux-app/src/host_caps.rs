@@ -30,8 +30,7 @@ fn from_env_values(
     let truecolor = matches!(colorterm.as_deref(), Some("truecolor" | "24bit"))
         || term
             .as_deref()
-            .map(|t| t.ends_with("-direct") || t.ends_with("-truecolor"))
-            .unwrap_or(false);
+            .is_some_and(|t| t.ends_with("-direct") || t.ends_with("-truecolor"));
 
     ClientCapabilities {
         truecolor,

@@ -26,11 +26,11 @@ pub struct Cli {
 
     /// Color theme: built-in name (one-dark, catppuccin-latte, catppuccin-frappe,
     /// catppuccin-macchiato, catppuccin-mocha, dracula) or a custom theme name
-    /// from ~/.config/kmux/themes/<name>.toml
+    /// from `~/.config/kmux/themes/<name>.toml`
     #[arg(long, global = true, add = ArgValueCandidates::new(crate::completion::theme_candidates))]
     pub theme: Option<String>,
 
-    /// GUI font as a Pango font-description string (e.g. "JetBrains Mono 12").
+    /// GUI font as a Pango font-description string (e.g. "`JetBrains` Mono 12").
     /// Falls back to the `font` key in ~/.config/kmux/config.toml, then
     /// "monospace 11". Deprecated in favor of the structured `font-family` /
     /// `font-size` config keys (see docs/appearance.md); still honored as the
@@ -70,7 +70,7 @@ pub struct ConnectArgs {
     #[command(flatten)]
     pub server_args: ServerArgs,
 
-    /// Auto-attach to a named session (by display name or word_id)
+    /// Auto-attach to a named session (by display name or `word_id`)
     #[arg(short, long, add = ArgValueCandidates::new(crate::completion::session_candidates))]
     pub session: Option<String>,
 
@@ -380,8 +380,8 @@ pub enum AttentionKind {
 impl From<AttentionKind> for kmux_protocol::messages::AttentionKind {
     fn from(k: AttentionKind) -> Self {
         match k {
-            AttentionKind::TurnDone => kmux_protocol::messages::AttentionKind::TurnDone,
-            AttentionKind::NeedsInput => kmux_protocol::messages::AttentionKind::NeedsInput,
+            AttentionKind::TurnDone => Self::TurnDone,
+            AttentionKind::NeedsInput => Self::NeedsInput,
         }
     }
 }

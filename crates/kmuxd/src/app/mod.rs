@@ -329,8 +329,7 @@ impl PaneRelay {
         let (pixel_width, pixel_height) = map
             .values()
             .find(|s| s.size.rows == rows && s.size.cols == cols)
-            .map(|s| (s.size.pixel_width, s.size.pixel_height))
-            .unwrap_or((0, 0));
+            .map_or((0, 0), |s| (s.size.pixel_width, s.size.pixel_height));
         Some(TermSize {
             rows,
             cols,
@@ -367,7 +366,7 @@ impl PaneRelay {
                 size: new_size,
             },
         };
-        let snapshot = std::sync::Arc::new(self.engine.snapshot());
+        let snapshot = Arc::new(self.engine.snapshot());
         let snap_msg = kmux_protocol::messages::ServerMessage::TerminalSnapshot {
             pane_id: pane_id.to_string(),
             snapshot,
@@ -404,7 +403,7 @@ pub struct TabState {
 }
 
 impl TabState {
-    /// Snapshot this tab as a wire [`TabInfo`].
+    /// Snapshot this tab as a wire [`kmux_protocol::messages::TabInfo`].
     pub fn to_info(&self) -> kmux_protocol::messages::TabInfo {
         kmux_protocol::messages::TabInfo {
             tab_index: self.tab_index,
@@ -418,7 +417,7 @@ impl TabState {
 /// State for one session: its metadata, all its panes, and its tabs.
 pub struct SessionState {
     pub meta: kmux_protocol::messages::SessionMeta,
-    /// Map of pane_index -> PaneRelay (the flat pool of PTYs; tabs reference
+    /// Map of `pane_index` -> `PaneRelay` (the flat pool of PTYs; tabs reference
     /// these by `pane_index`).
     pub panes: HashMap<u32, PaneRelay>,
     /// Next pane index to assign (monotonically increasing within this session).
@@ -451,7 +450,7 @@ impl SessionState {
         self.tabs.iter_mut().find(|t| t.tab_index == tab_index)
     }
 
-    /// Snapshot all tabs as wire [`TabInfo`]s.
+    /// Snapshot all tabs as wire [`kmux_protocol::messages::TabInfo`]s.
     pub fn tab_infos(&self) -> Vec<kmux_protocol::messages::TabInfo> {
         self.tabs.iter().map(TabState::to_info).collect()
     }
@@ -485,7 +484,7 @@ pub struct ConnectionMetrics {
     pub last_activity_ms: AtomicU64,
     /// Epoch-ms timestamp of the last successful Pong from the client; 0 = none yet.
     pub last_pong_ms: AtomicU64,
-    /// Most recent measured ping RTT in milliseconds; u64::MAX = unknown.
+    /// Most recent measured ping RTT in milliseconds; `u64::MAX` = unknown.
     pub last_rtt_ms: AtomicU64,
     /// `(seq, Instant)` of the most recently sent server-originated Ping, used to
     /// compute RTT when the matching Pong arrives.
@@ -609,7 +608,7 @@ pub struct ServerApp {
     /// Pane VT-pipeline isolation mode (issue #126), resolved from `kmuxd.toml` /
     /// the `--session-isolation` flag.
     pub session_isolation: crate::config::SessionIsolationMode,
-    /// Map of word_id -> SessionState.
+    /// Map of `word_id` -> `SessionState`.
     pub(super) sessions: RwLock<HashMap<kmux_protocol::messages::WordId, SessionState>>,
     /// Monotonic session creation counter.
     pub(super) session_index_counter: AtomicU32,
@@ -621,7 +620,7 @@ pub struct ServerApp {
     /// `PaneAttention` broadcast so clients can dedup to one notification when
     /// several windows of one GUI process are attached to the session.
     next_attention_id: AtomicU64,
-    /// Map of ConnectionId -> ConnectionState for channel switching.
+    /// Map of `ConnectionId` -> `ConnectionState` for channel switching.
     connections: RwLock<HashMap<u64, ConnectionState>>,
     /// Word pool for assigning unique session IDs.
     pub(super) wordlist: Mutex<WordlistSampler>,
@@ -651,7 +650,7 @@ pub struct ServerApp {
     worker_fault_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
     /// Per-pane restart timestamps, used to bound worker respawns (crash-loop
     /// guard); keyed by `pane_id`.
-    worker_restart_log: Mutex<HashMap<String, Vec<std::time::Instant>>>,
+    worker_restart_log: Mutex<HashMap<String, Vec<Instant>>>,
     /// Retained closed (inactive) sessions a user can restore (issue #64),
     /// newest-closed last. Persisted to its own `closed.bin` file, rewritten
     /// only when this set changes. See `app/graveyard.rs`.
@@ -702,9 +701,9 @@ impl ServerApp {
     }
 
     /// Configure closed-session retention (from `kmuxd.toml`) and the on-disk
-    /// graveyard path. Builder-style, like [`with_compression`]. A
+    /// graveyard path. Builder-style, like [`Self::with_compression`]. A
     /// `ttl_days` of `0` disables age-based pruning; the count cap always
-    /// applies. See [`crate::config::ResolvedConfig`].
+    /// applies. See [`crate::config::ServerConfig`].
     pub fn with_closed_sessions(
         mut self,
         keep: u32,
@@ -832,7 +831,7 @@ impl ServerApp {
     /// Returns a [`RegisteredClient`] whose `previous_transport` is `Some(old)`
     /// when a channel switch is in progress (the caller must remember this and
     /// send it back in `ChannelSwitched` once the new channel signals
-    /// `ChannelReady`); `None` when this is the first connection for the conn_id.
+    /// `ChannelReady`); `None` when this is the first connection for the `conn_id`.
     /// `identity` is the verified cryptographic identity (issue #146); on a fresh
     /// connection the daemon assigns a unique user-readable `label` derived from
     /// it. On resume the existing connection's label/identity are kept.
@@ -921,7 +920,7 @@ impl ServerApp {
         let sessions = self.sessions.read().await;
         let mut workers = Vec::new();
         for (word_id, state) in sessions.iter() {
-            for (pane_index, relay) in state.panes.iter() {
+            for (pane_index, relay) in &state.panes {
                 let Some(worker_pid) = relay.engine.worker_pid() else {
                     continue;
                 };
@@ -988,10 +987,10 @@ impl ServerApp {
                     } else {
                         None
                     },
-                    last_rtt_ms: if last_rtt_ms != u64::MAX {
-                        Some(last_rtt_ms)
-                    } else {
+                    last_rtt_ms: if last_rtt_ms == u64::MAX {
                         None
+                    } else {
+                        Some(last_rtt_ms)
                     },
                 };
                 (state.client_id, info)
@@ -1328,7 +1327,7 @@ mod tests {
                 term_state,
                 PtyWriter::sink().unwrap(),
                 tokio::task::spawn(async {}),
-                tokio::sync::mpsc::unbounded_channel().1,
+                mpsc::unbounded_channel().1,
             )),
             program: "/bin/sh".to_string(),
             args: vec![],

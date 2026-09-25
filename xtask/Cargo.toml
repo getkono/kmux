@@ -1,0 +1,21 @@
+[package]
+name = "xtask"
+description = "Workspace quality tooling: the lint ratchet, the mutation gate, and the dependency-direction assertions."
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish = false
+
+# Deliberately no new third-party crates: everything here is already declared in
+# [workspace.dependencies] for the product crates, so this tooling costs nothing
+# in the lockfile and stays R1/R4-clean (docs/crate-usage.md).
+[dependencies]
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+toml.workspace = true
+
+[lints]
+workspace = true

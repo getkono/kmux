@@ -9,7 +9,7 @@ use kmux_protocol::messages::{
 };
 use kmux_pty::error::{KmuxError, Result};
 
-use super::helpers::resolve_cwd;
+use super::helpers::{resolve_cwd, session_not_found};
 use super::{ServerApp, SessionState};
 
 impl ServerApp {
@@ -47,11 +47,7 @@ impl ServerApp {
         };
 
         // Resolve CWD
-        let resolved_cwd = resolve_cwd(
-            cwd.as_deref()
-                .map(Path::new)
-                .unwrap_or_else(|| Path::new(".")),
-        );
+        let resolved_cwd = resolve_cwd(cwd.as_deref().map_or_else(|| Path::new("."), Path::new));
 
         // Default name = basename of cwd
         let display_name = name.unwrap_or_else(|| {
@@ -136,11 +132,14 @@ impl ServerApp {
     /// intentionally **not** released — it stays reserved while the session is in
     /// the graveyard so a restore preserves its identity; it is freed only when
     /// the entry is evicted by the retention caps.
+    ///
+    /// Errors with [`KmuxError::SessionNotFound`] if `word_id` names no live
+    /// session, so a caller can tell a real close from a typo.
     pub async fn close_session(&self, word_id: &str) -> Result<Option<i32>> {
         let pane_ids: Vec<String> = {
             let sessions = self.sessions.read().await;
             let Some(state) = sessions.get(word_id) else {
-                return Ok(None);
+                return Err(session_not_found(word_id));
             };
             let snapshot = self.snapshot_session(state).await;
             let pane_ids = state
@@ -166,7 +165,7 @@ impl ServerApp {
 
     /// Build the wire [`SessionEntry`] for one live session (local; `peer: None`).
     /// Shared by [`list_sessions`](Self::list_sessions) and the restore path.
-    pub(super) fn build_session_entry(&self, state: &SessionState) -> SessionEntry {
+    pub(super) fn build_session_entry(state: &SessionState) -> SessionEntry {
         let mut panes: Vec<PaneInfo> = state
             .panes
             .iter()
@@ -193,10 +192,8 @@ impl ServerApp {
     /// List all active sessions with their pane metadata.
     pub async fn list_sessions(&self) -> Vec<SessionEntry> {
         let sessions = self.sessions.read().await;
-        let mut entries: Vec<SessionEntry> = sessions
-            .values()
-            .map(|state| self.build_session_entry(state))
-            .collect();
+        let mut entries: Vec<SessionEntry> =
+            sessions.values().map(Self::build_session_entry).collect();
         entries.sort_by_key(|e| e.meta.index);
         entries
     }
@@ -238,7 +235,11 @@ impl ServerApp {
         };
         let mut roots = Vec::with_capacity(pane_ids.len());
         for pane_id in pane_ids {
-            let pid = self.manager.child_pid(&pane_id).await.map(|p| p.as_raw());
+            let pid = self
+                .manager
+                .child_pid(&pane_id)
+                .await
+                .map(nix::unistd::Pid::as_raw);
             roots.push((pane_id, pid));
         }
         roots
@@ -306,5 +307,22 @@ mod tests {
 
         // Clean up the spawned child.
         let _ = app.close_session(&word).await;
+    }
+
+    /// Closing a word id no session uses must not look like a successful close.
+    /// `close_session` always answers `Ok(None)` on the happy path (the exit
+    /// code is never known here), so `Ok(None)` for a miss was the *same* value
+    /// -- the caller had nothing to branch on.
+    #[tokio::test]
+    async fn closing_an_unknown_session_errors_instead_of_answering_ok() {
+        let app = ServerApp::new("tok".to_string());
+        let err = app
+            .close_session("nosuch")
+            .await
+            .expect_err("a word id no session uses");
+        assert!(
+            matches!(&err, KmuxError::SessionNotFound { name } if name == "nosuch"),
+            "expected SessionNotFound naming the word id, got {err:?}"
+        );
     }
 }

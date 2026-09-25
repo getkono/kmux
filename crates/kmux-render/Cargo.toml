@@ -39,3 +39,6 @@ fontdb = { workspace = true, optional = true }
 wgpu = { workspace = true, optional = true }
 bytemuck = { workspace = true, optional = true }
 pollster = { workspace = true, optional = true }
+
+[lints]
+workspace = true

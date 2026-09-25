@@ -41,7 +41,7 @@ pub(super) enum SeedMode {
 }
 
 impl ServerApp {
-    /// Restore sessions from a [`PersistedDaemonState`], spawning a fresh shell
+    /// Restore sessions from a [`crate::persist::PersistedDaemonState`], spawning a fresh shell
     /// for every pane (replaying the old grid/scrollback as ANSI history).
     ///
     /// This is the cold-start path and the fallback when a graceful handoff is
@@ -250,23 +250,29 @@ impl ServerApp {
                     if let Err(e) = self.manager.register(pane_id, session).await {
                         warn!("restore: could not register inherited pane {pane_id}: {e}");
                     } else {
-                        match self.split_registered(pane_id).await {
-                            Some((reader, writer)) => {
-                                let relay = self.build_pane_relay(
-                                    pane_id,
-                                    persisted_pane,
-                                    reader,
-                                    writer,
-                                    SeedMode::Inherited,
-                                );
-                                return Some((relay, true));
-                            }
-                            None => {
-                                // Registered but unsplittable — drop it and fall
-                                // through to respawn so the pane is not lost.
-                                let _ = self.manager.close(pane_id).await;
-                            }
+                        if let Some((reader, writer)) = self.split_registered(pane_id).await {
+                            let relay = self.build_pane_relay(
+                                pane_id,
+                                persisted_pane,
+                                reader,
+                                writer,
+                                SeedMode::Inherited,
+                            );
+                            return Some((relay, true));
                         }
+                        // Registered but unsplittable — drop it and fall
+                        // through to respawn so the pane is not lost.
+                        //
+                        // The child on the other end of this fd is the user's
+                        // live shell, inherited across a daemon upgrade. If the
+                        // close does not take, falling through respawns a
+                        // *second* shell for the same pane and the first keeps
+                        // running with nothing holding it — detached,
+                        // invisible, and for as long as the machine is up. So
+                        // the failure is reported and the pid is killed
+                        // directly.
+                        let closed = self.manager.close(pane_id).await.map(drop);
+                        kill_if_close_failed(closed, pane_id, pid);
                     }
                 }
                 Err(e) => {
@@ -351,7 +357,7 @@ impl ServerApp {
         // Terminal query replies drain to the PTY via the in-process engine.
         let (resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
         title_sink.set_pty_response_sender(resp_tx);
-        let relay_sink = Arc::clone(&title_sink) as Arc<dyn crate::backend::BackendEventSink>;
+        let relay_sink: Arc<dyn crate::backend::BackendEventSink> = title_sink.clone();
         let term_state = Arc::new(Mutex::new(new_term_state(BackendConfig {
             size: BackendSize::from(size),
             capabilities: CapabilityHandles {
@@ -407,5 +413,63 @@ impl ServerApp {
             title,
             progress,
         }
+    }
+}
+
+/// Drop an inherited pane that could not be split: when closing it through the
+/// registry failed, SIGKILL its child directly, so the respawn that follows
+/// cannot leave the user's original shell running with nothing holding it.
+fn kill_if_close_failed(closed: kmux_pty::error::Result<()>, pane_id: &str, pid: Pid) {
+    if let Err(e) = closed {
+        warn!(
+            pane_id,
+            %e,
+            "restore: could not close an unsplittable inherited pane; killing its \
+             child directly so the respawn below does not orphan it"
+        );
+        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::unix::process::ExitStatusExt as _;
+    use std::process::{Child, Command};
+
+    use nix::unistd::Pid;
+
+    use super::kill_if_close_failed;
+
+    fn sleeper() -> (Child, Pid) {
+        let child = Command::new("/bin/sleep").arg("30").spawn().expect("spawn");
+        let pid = Pid::from_raw(i32::try_from(child.id()).expect("pid fits"));
+        (child, pid)
+    }
+
+    /// The close failed, so the respawn would give the pane a second shell:
+    /// the first one is killed rather than left running detached.
+    #[test]
+    fn a_failed_close_kills_the_inherited_child() {
+        let (mut child, pid) = sleeper();
+        kill_if_close_failed(Err(kmux_pty::error::KmuxError::Timeout), "eagle/0", pid);
+        let status = child.wait().expect("wait");
+        assert_eq!(
+            status.signal(),
+            Some(nix::sys::signal::Signal::SIGKILL as i32),
+            "{status:?}"
+        );
+    }
+
+    /// A close that took needs nothing more; the child is left to the registry.
+    #[test]
+    fn a_close_that_took_kills_nothing() {
+        let (mut child, pid) = sleeper();
+        kill_if_close_failed(Ok(()), "eagle/0", pid);
+        assert!(
+            child.try_wait().expect("try_wait").is_none(),
+            "the child must still be running"
+        );
+        child.kill().expect("clean up");
+        let _ = child.wait();
     }
 }

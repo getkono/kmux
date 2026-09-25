@@ -15,7 +15,7 @@ impl WordlistSampler {
     pub fn new() -> Self {
         let available: Vec<&'static str> = WORDLIST_RAW
             .lines()
-            .map(|l| l.trim())
+            .map(str::trim)
             .filter(|l| !l.is_empty())
             .collect();
         Self { available }

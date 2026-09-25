@@ -66,8 +66,7 @@ pub(super) fn emit_cells_line(out: &mut Vec<u8>, cells: &[CellState]) {
     let last_content = cells
         .iter()
         .rposition(|cell| cell.c != ' ')
-        .map(|i| i + 1)
-        .unwrap_or(0);
+        .map_or(0, |i| i + 1);
 
     #[derive(PartialEq)]
     struct StyleKey {

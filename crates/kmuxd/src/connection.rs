@@ -16,6 +16,7 @@ use crate::client_handler::{
 pub fn classify_error(e: &kmux_pty::error::KmuxError) -> ErrorCode {
     match e {
         kmux_pty::error::KmuxError::SessionNotFound { .. } => ErrorCode::SessionNotFound,
+        kmux_pty::error::KmuxError::PaneNotFound { .. } => ErrorCode::PaneNotFound,
         kmux_pty::error::KmuxError::SessionAlreadyExists { .. } => ErrorCode::SessionAlreadyExists,
         kmux_pty::error::KmuxError::Pty(err) if *err == nix::Error::EPERM => ErrorCode::InputLocked,
         _ => ErrorCode::InternalError,
@@ -37,7 +38,7 @@ impl PaneAttacher for QuicAttacher {
         pane_id: String,
         result: AttachResult,
         mut client_rx: mpsc::Receiver<ServerMessage>,
-    ) -> impl std::future::Future<Output = Result<AbortHandle, String>> + Send {
+    ) -> impl Future<Output = Result<AbortHandle, String>> + Send {
         let conn = self.conn.clone();
         let comp_out = Arc::clone(&self.comp_out);
         async move {
@@ -168,4 +169,55 @@ pub async fn handle_with_io<R, W>(
     )
     .instrument(conn_span)
     .await;
+}
+
+#[cfg(test)]
+mod classify_tests {
+    use super::classify_error;
+    use kmux_protocol::messages::ErrorCode;
+    use kmux_pty::error::KmuxError;
+
+    #[test]
+    fn each_lookup_miss_keeps_its_own_code() {
+        assert_eq!(
+            classify_error(&KmuxError::SessionNotFound {
+                name: "eagle".to_string()
+            }),
+            ErrorCode::SessionNotFound
+        );
+        assert_eq!(
+            classify_error(&KmuxError::PaneNotFound {
+                id: "eagle/0".to_string()
+            }),
+            ErrorCode::PaneNotFound,
+            "a pane miss must not be reported as a missing session"
+        );
+        assert_eq!(
+            classify_error(&KmuxError::SessionAlreadyExists {
+                name: "eagle".to_string()
+            }),
+            ErrorCode::SessionAlreadyExists
+        );
+    }
+
+    #[test]
+    fn only_eperm_among_pty_errnos_means_the_input_is_locked() {
+        assert_eq!(
+            classify_error(&KmuxError::Pty(nix::Error::EPERM)),
+            ErrorCode::InputLocked
+        );
+        assert_eq!(
+            classify_error(&KmuxError::Pty(nix::Error::EINVAL)),
+            ErrorCode::InternalError
+        );
+    }
+
+    #[test]
+    fn anything_unclassified_is_an_internal_error() {
+        assert_eq!(classify_error(&KmuxError::Closed), ErrorCode::InternalError);
+        assert_eq!(
+            classify_error(&KmuxError::Timeout),
+            ErrorCode::InternalError
+        );
+    }
 }

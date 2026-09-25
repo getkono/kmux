@@ -51,20 +51,18 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
         }
 
         DaemonAction::Status => {
+            use kmux_protocol::compat::BuildProfile;
             use kmux_protocol::compat::{self, Match3};
-            use kmux_protocol::dirs::BuildProfile;
             use kmux_protocol::messages::PROTOCOL_RANGE;
 
-            let socket_display = kmux_protocol::dirs::socket_path()
-                .map(|p| p.display().to_string())
-                .unwrap_or_else(|e| format!("<error: {e}>"));
+            let socket_display = kmux_sys::dirs::socket_path()
+                .map_or_else(|e| format!("<error: {e}>"), |p| p.display().to_string());
 
             match kmux_client::daemon::query_daemon().await {
                 Some(status) => {
                     let daemon_profile = status
                         .build_profile
-                        .map(|p| p.as_str())
-                        .unwrap_or("<unknown>");
+                        .map_or("<unknown>", BuildProfile::as_str);
                     let protocol_mismatch =
                         compat::protocol_match(status.protocol_range) != Match3::Same;
                     let profile_mismatch =
@@ -131,9 +129,9 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
             match kmux_client::daemon::restart_daemon().await {
                 Ok(true) => {
                     // Wait for the successor (a distinct PID) to take over.
-                    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+                    let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
                     loop {
-                        tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+                        tokio::time::sleep(Duration::from_millis(150)).await;
                         if let Some(s) = kmux_client::daemon::query_daemon().await
                             && s.pid != old_pid
                         {
@@ -206,7 +204,7 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
             Some(server) => fetch_remote_logs(&server, ssh_port, lines, follow).await?,
             // Local daemon: read the log file straight off disk.
             None => {
-                let log_path = kmux_protocol::dirs::daemon_log_path()?;
+                let log_path = kmux_sys::dirs::daemon_log_path()?;
                 super::logs::tail_local_log(
                     &log_path,
                     lines,
@@ -234,17 +232,12 @@ async fn fetch_remote_logs(
     use kmux_protocol::messages::{ClientMessage, ServerMessage};
     use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
     use std::io::Write;
-    use tokio::net::TcpStream;
-
     let conn = super::resolve_connection(Some(server), ssh_port).await?;
-    let tcp_port = conn.tcp_port.unwrap_or(conn.port);
-    let stream = TcpStream::connect(format!("{}:{}", conn.host, tcp_port))
-        .await
-        .map_err(|e| anyhow::anyhow!("Failed to connect to {}:{}: {e}", conn.host, tcp_port))?;
-    let (mut read_half, mut write_half) = stream.into_split();
+    let (mut read_half, mut write_half) = super::connect_authenticated(&conn).await?;
 
-    super::authenticate(&mut read_half, &mut write_half, conn.token).await?;
-
+    // Not `request_reply`: this is a stream, not a request. The daemon answers
+    // with many `LogChunk`s and (unless following) a terminating `LogEnd`, so
+    // the loop below has to keep reading past the first recognised reply.
     const REQ: u64 = 1;
     write_frame(
         &mut write_half,
@@ -402,11 +395,11 @@ async fn collect_processes_by_session(
 ) -> std::collections::HashMap<String, Vec<String>> {
     use std::collections::HashMap;
 
-    let panes =
-        match tokio::time::timeout(PROCESS_QUERY_TIMEOUT, query_pane_processes(status)).await {
-            Ok(Ok(panes)) => panes,
-            _ => return HashMap::new(),
-        };
+    let Ok(Ok(panes)) =
+        tokio::time::timeout(PROCESS_QUERY_TIMEOUT, query_pane_processes(status)).await
+    else {
+        return HashMap::new();
+    };
 
     let mut by_session: HashMap<String, Vec<String>> = HashMap::new();
     for pane in panes {

@@ -38,7 +38,7 @@ pub struct MetricsStore {
 
 impl MetricsStore {
     /// Build a store with persistence enabled. `sink_path` is typically
-    /// `kmux_protocol::dirs::metrics_log_path()`; pass `None` in tests
+    /// `kmux_sys::dirs::metrics_log_path()`; pass `None` in tests
     /// or when disk writes are unwelcome.
     pub fn new(sink: Option<JsonlSink>) -> Self {
         Self {
@@ -180,7 +180,7 @@ impl MetricsStore {
 
     /// Path where samples are persisted, if a sink is configured.
     pub fn sink_path(&self) -> Option<&std::path::Path> {
-        self.sink.as_ref().map(|s| s.path())
+        self.sink.as_ref().map(JsonlSink::path)
     }
 }
 

@@ -1,7 +1,10 @@
 mod lifecycle;
-pub use lifecycle::ensure_daemon;
 pub(crate) use lifecycle::find_server_binary;
-pub use lifecycle::{force_kill_daemon, pid_alive, running_daemon_pid, wait_for_exit};
+pub use lifecycle::{ensure_daemon, ensure_daemon_in};
+pub use lifecycle::{
+    force_kill_daemon, force_kill_daemon_in, pid_alive, running_daemon_pid, running_daemon_pid_in,
+    wait_for_exit,
+};
 
 /// Resolve the `kmuxd` binary an auto-spawn would launch, using the same
 /// precedence as the spawn path (`KMUX_KMUXD` → exe sibling → debug
@@ -19,18 +22,15 @@ pub fn boot_log_hint() -> String {
     lifecycle::format_boot_log_hint()
 }
 
-/// Protects XDG_RUNTIME_DIR mutations — shared across all daemon tests.
-#[cfg(test)]
-pub(super) static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
+use std::path::Path;
 use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 
+use kmux_protocol::compat::BuildProfile;
 use kmux_protocol::control_rpc::{SessionsResponse, StatusResponse};
-use kmux_protocol::dirs::BuildProfile;
 use kmux_protocol::messages::ProtocolRange;
 
 /// Connection parameters returned by the running daemon.
@@ -54,15 +54,24 @@ pub struct DaemonStatus {
     pub build_profile: Option<BuildProfile>,
 }
 
+/// The daemon control socket for this profile, resolved from the environment.
+///
+/// The single environment boundary of this module: every `*_at` function below
+/// takes the path instead, so a test can point it at a socket in its own
+/// tempdir (docs/testing.md R3).
+fn control_socket() -> anyhow::Result<std::path::PathBuf> {
+    kmux_sys::dirs::socket_path().map_err(|e| anyhow::anyhow!("could not resolve socket path: {e}"))
+}
+
 /// Send a single JSON command to the daemon control socket and parse the response.
 ///
 /// Returns an error if the daemon is unreachable, times out, or the response
 /// cannot be deserialized into `Resp`.
-async fn control_request<Resp: DeserializeOwned>(command: &str) -> anyhow::Result<Resp> {
-    let socket_path = kmux_protocol::dirs::socket_path()
-        .map_err(|e| anyhow::anyhow!("could not resolve socket path: {e}"))?;
-
-    let stream = tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(&socket_path))
+async fn control_request_at<Resp: DeserializeOwned>(
+    socket_path: &Path,
+    command: &str,
+) -> anyhow::Result<Resp> {
+    let stream = tokio::time::timeout(Duration::from_secs(2), UnixStream::connect(socket_path))
         .await
         .map_err(|_| anyhow::anyhow!("daemon is not running (connection timed out)"))?
         .map_err(|_| anyhow::anyhow!("daemon is not running"))?;
@@ -91,9 +100,14 @@ async fn control_request<Resp: DeserializeOwned>(command: &str) -> anyhow::Resul
 /// Returns `None` if the daemon is not reachable, not responding, or the PID
 /// reported by the daemon is no longer alive.
 pub async fn query_daemon() -> Option<DaemonStatus> {
-    let resp: StatusResponse = control_request("status").await.ok()?;
+    query_daemon_at(&control_socket().ok()?).await
+}
 
-    if !lifecycle::pid_alive(resp.pid) {
+/// [`query_daemon`] against an explicit control socket.
+pub async fn query_daemon_at(socket_path: &Path) -> Option<DaemonStatus> {
+    let resp: StatusResponse = control_request_at(socket_path, "status").await.ok()?;
+
+    if !pid_alive(resp.pid) {
         return None;
     }
 
@@ -121,63 +135,66 @@ pub async fn query_daemon() -> Option<DaemonStatus> {
 /// Use this instead of `ensure_daemon()` for every connection path that talks
 /// to the local daemon.
 pub async fn ensure_compatible_daemon() -> anyhow::Result<DaemonStatus> {
+    let status = ensure_daemon().await?;
+    let socket =
+        control_socket().map_or_else(|_| "<unknown>".to_string(), |p| p.display().to_string());
+
+    match attach_refusal(&status, &socket) {
+        Some(message) => Err(anyhow::anyhow!(message)),
+        None => Ok(status),
+    }
+}
+
+/// The attach gate as a pure function: `None` when `status` is compatible with
+/// this build, otherwise the refusal message to surface.
+///
+/// Split out from [`ensure_compatible_daemon`] so every refusal is testable by
+/// constructing a [`DaemonStatus`] — no daemon, no socket, no environment. The
+/// policy itself (which mismatches block) lives in `kmux_protocol::compat`;
+/// this only turns a [`compat::BlockReason`](kmux_protocol::compat::BlockReason)
+/// into a hint-rich message. `socket` is only ever interpolated into the text.
+fn attach_refusal(status: &DaemonStatus, socket: &str) -> Option<String> {
     use kmux_protocol::compat::{self, BlockReason};
     use kmux_protocol::messages::PROTOCOL_RANGE;
 
-    let status = lifecycle::ensure_daemon().await?;
-
-    let socket = || {
-        kmux_protocol::dirs::socket_path()
-            .map(|p| p.display().to_string())
-            .unwrap_or_else(|_| "<unknown>".to_string())
-    };
-
     // One attach-gate policy, defined in `kmux_protocol::compat`; each refusal
     // formats its own hint-rich message.
-    match compat::attach_block(status.protocol_range, status.build_profile) {
-        None => {}
-        Some(BlockReason::Protocol) => {
-            let daemon_range = status.protocol_range.expect("differing range is present");
-            let hint = if daemon_range.max < PROTOCOL_RANGE.min {
-                "Hint: the running kmuxd is older than kmux. Run `kmux daemon restart` to update it."
-            } else {
-                "Hint: the running kmuxd is newer than kmux. Update the kmux client to match."
-            };
-            anyhow::bail!(
-                "protocol version mismatch: client={}, daemon={} ({})\n{}",
-                PROTOCOL_RANGE,
-                daemon_range,
-                status.kmuxd_version,
-                hint
-            );
-        }
-        Some(BlockReason::ProtocolUnknown) => anyhow::bail!(
-            "legacy protocol version: daemon={} ({})\nHint: restart the daemon with a current kmuxd build.",
-            status.protocol_version,
-            status.kmuxd_version,
-        ),
-        Some(BlockReason::ProfileMismatch) => anyhow::bail!(
-            "build profile mismatch: kmux is {client} but the daemon answering on \
-             {socket} is {daemon}. Debug and release builds keep separate runtime \
-             dirs, so the two never share sockets — run the matching kmux binary \
-             or restart the daemon with a matching build.",
-            client = BuildProfile::CURRENT,
-            daemon = status
-                .build_profile
-                .map(|p| p.as_str())
-                .unwrap_or("<unknown>"),
-            socket = socket(),
-        ),
-        Some(BlockReason::ProfileUnknown) => anyhow::bail!(
-            "daemon on {socket} did not report a build profile; refusing to attach \
-             because we cannot verify it matches kmux ({client}). Restart the \
-             daemon with a current kmuxd build.",
-            client = BuildProfile::CURRENT,
-            socket = socket(),
-        ),
-    }
-
-    Ok(status)
+    Some(
+        match compat::attach_block(status.protocol_range, status.build_profile)? {
+            BlockReason::Protocol => {
+                let daemon_range = status.protocol_range.expect("differing range is present");
+                let hint = if daemon_range.max < PROTOCOL_RANGE.min {
+                    "Hint: the running kmuxd is older than kmux. Run `kmux daemon restart` to update it."
+                } else {
+                    "Hint: the running kmuxd is newer than kmux. Update the kmux client to match."
+                };
+                format!(
+                    "protocol version mismatch: client={}, daemon={} ({})\n{}",
+                    PROTOCOL_RANGE, daemon_range, status.kmuxd_version, hint
+                )
+            }
+            BlockReason::ProtocolUnknown => format!(
+                "legacy protocol version: daemon={} ({})\nHint: restart the daemon with a current kmuxd build.",
+                status.protocol_version, status.kmuxd_version,
+            ),
+            BlockReason::ProfileMismatch => format!(
+                "build profile mismatch: kmux is {client} but the daemon answering on \
+                 {socket} is {daemon}. Debug and release builds keep separate runtime \
+                 dirs, so the two never share sockets — run the matching kmux binary \
+                 or restart the daemon with a matching build.",
+                client = BuildProfile::CURRENT,
+                daemon = status
+                    .build_profile
+                    .map_or("<unknown>", BuildProfile::as_str),
+            ),
+            BlockReason::ProfileUnknown => format!(
+                "daemon on {socket} did not report a build profile; refusing to attach \
+                 because we cannot verify it matches kmux ({client}). Restart the \
+                 daemon with a current kmuxd build.",
+                client = BuildProfile::CURRENT,
+            ),
+        },
+    )
 }
 
 /// Request a graceful shutdown by sending `stop` to the daemon control socket.
@@ -187,8 +204,13 @@ pub async fn ensure_compatible_daemon() -> anyhow::Result<DaemonStatus> {
 /// that need to confirm the daemon is gone must follow up with
 /// [`wait_for_exit`] (and escalate via [`force_kill_daemon`] on timeout).
 pub async fn stop_daemon() -> anyhow::Result<()> {
+    stop_daemon_at(&control_socket()?).await
+}
+
+/// [`stop_daemon`] against an explicit control socket.
+pub async fn stop_daemon_at(socket_path: &Path) -> anyhow::Result<()> {
     use kmux_protocol::control_rpc::StopResponse;
-    let resp: StopResponse = control_request("stop").await?;
+    let resp: StopResponse = control_request_at(socket_path, "stop").await?;
     if resp.status != "ok" {
         return Err(anyhow::anyhow!("unexpected stop response: {}", resp.status));
     }
@@ -203,14 +225,24 @@ pub async fn stop_daemon() -> anyhow::Result<()> {
 /// so the response cannot be read) or is unreachable. The caller falls back to a
 /// hard stop-then-respawn restart in those cases.
 pub async fn restart_daemon() -> anyhow::Result<bool> {
+    restart_daemon_at(&control_socket()?).await
+}
+
+/// [`restart_daemon`] against an explicit control socket.
+pub async fn restart_daemon_at(socket_path: &Path) -> anyhow::Result<bool> {
     use kmux_protocol::control_rpc::RestartResponse;
-    let resp: RestartResponse = control_request("restart").await?;
+    let resp: RestartResponse = control_request_at(socket_path, "restart").await?;
     Ok(resp.status == "ok")
 }
 
 /// Query the daemon for its active sessions and per-connection metrics.
 pub async fn query_daemon_sessions() -> anyhow::Result<SessionsResponse> {
-    control_request("sessions").await
+    query_daemon_sessions_at(&control_socket()?).await
+}
+
+/// [`query_daemon_sessions`] against an explicit control socket.
+pub async fn query_daemon_sessions_at(socket_path: &Path) -> anyhow::Result<SessionsResponse> {
+    control_request_at(socket_path, "sessions").await
 }
 
 /// Query the daemon for every live client connection with its build identity
@@ -218,7 +250,14 @@ pub async fn query_daemon_sessions() -> anyhow::Result<SessionsResponse> {
 /// connection and compare its build against the daemon's.
 pub async fn query_connections() -> anyhow::Result<kmux_protocol::control_rpc::ConnectionsResponse>
 {
-    control_request("connections").await
+    query_connections_at(&control_socket()?).await
+}
+
+/// [`query_connections`] against an explicit control socket.
+pub async fn query_connections_at(
+    socket_path: &Path,
+) -> anyhow::Result<kmux_protocol::control_rpc::ConnectionsResponse> {
+    control_request_at(socket_path, "connections").await
 }
 
 /// Query the daemon for its isolated per-pane VT workers (issue #126). Used by
@@ -226,25 +265,195 @@ pub async fn query_connections() -> anyhow::Result<kmux_protocol::control_rpc::C
 /// too old to know the `workers` command closes without replying, so this
 /// returns `Err` and the caller degrades gracefully.
 pub async fn query_workers() -> anyhow::Result<kmux_protocol::control_rpc::WorkersResponse> {
-    control_request("workers").await
+    query_workers_at(&control_socket()?).await
+}
+
+/// [`query_workers`] against an explicit control socket.
+pub async fn query_workers_at(
+    socket_path: &Path,
+) -> anyhow::Result<kmux_protocol::control_rpc::WorkersResponse> {
+    control_request_at(socket_path, "workers").await
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    use kmux_protocol::messages::{PROTOCOL_RANGE, ProtocolVersion};
+
+    /// Every test that needs a control socket binds one inside its own
+    /// `tempfile::tempdir()` and passes the path in, so the module holds no
+    /// process-global state and runs fully in parallel (docs/testing.md R3/R13).
+    fn socket_in(tmp: &tempfile::TempDir) -> std::path::PathBuf {
+        tmp.path().join("daemon.sock")
+    }
+
+    /// A `DaemonStatus` with everything but the two compatibility-relevant
+    /// fields fixed, so an `attach_refusal` test states only what it varies.
+    fn status_with(
+        protocol_range: Option<ProtocolRange>,
+        build_profile: Option<BuildProfile>,
+    ) -> DaemonStatus {
+        DaemonStatus {
+            port: 9999,
+            tcp_port: 0,
+            token: "tok".to_string(),
+            pid: std::process::id(),
+            uptime_secs: 0,
+            session_count: 0,
+            protocol_version: 41,
+            protocol_range,
+            kmuxd_version: "9.9.9-test".to_string(),
+            kmuxd_build: "deadbeef".to_string(),
+            build_profile,
+        }
+    }
+
+    #[test]
+    fn attach_refusal_allows_a_matching_daemon() {
+        assert_eq!(
+            attach_refusal(
+                &status_with(Some(PROTOCOL_RANGE), Some(BuildProfile::CURRENT)),
+                "/run/kmux/daemon.sock",
+            ),
+            None,
+            "a daemon matching this build on both axes must not be refused"
+        );
+    }
+
+    /// Replaces the old test that stood up a fake daemon over a Unix socket just
+    /// to reach this branch: the refusal is a pure function of the status.
+    #[test]
+    fn attach_refusal_reports_a_newer_daemon_with_both_versions() {
+        let daemon_range = ProtocolRange::exact(ProtocolVersion::new(2, 0, 0));
+        let msg = attach_refusal(
+            &status_with(Some(daemon_range), Some(BuildProfile::CURRENT)),
+            "/run/kmux/daemon.sock",
+        )
+        .expect("a differing protocol range must block the attach");
+
+        assert!(
+            msg.contains("protocol version mismatch"),
+            "error should mention mismatch: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("client={PROTOCOL_RANGE}")),
+            "the refusal must name the client's range: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("daemon={daemon_range}")),
+            "the refusal must name the daemon's range: {msg}"
+        );
+        assert!(
+            msg.contains("9.9.9-test"),
+            "the refusal must name the daemon's version: {msg}"
+        );
+        assert!(
+            msg.contains("Update the kmux client"),
+            "a newer daemon must be fixed by updating the client: {msg}"
+        );
+    }
+
+    #[test]
+    fn attach_refusal_tells_an_older_daemon_to_restart_instead() {
+        let daemon_range = ProtocolRange::exact(ProtocolVersion::new(0, 9, 0));
+        let msg = attach_refusal(
+            &status_with(Some(daemon_range), Some(BuildProfile::CURRENT)),
+            "/run/kmux/daemon.sock",
+        )
+        .expect("a differing protocol range must block the attach");
+
+        assert!(
+            msg.contains(&format!("daemon={daemon_range}")),
+            "the refusal must name the daemon's range: {msg}"
+        );
+        assert!(
+            msg.contains("kmux daemon restart"),
+            "an older daemon is fixed by restarting it, not by updating kmux: {msg}"
+        );
+    }
+
+    #[test]
+    fn attach_refusal_reports_a_daemon_with_no_protocol_range() {
+        let msg = attach_refusal(
+            &status_with(None, Some(BuildProfile::CURRENT)),
+            "/run/kmux/daemon.sock",
+        )
+        .expect("an unverifiable protocol range must block the attach");
+
+        assert!(
+            msg.contains("legacy protocol version"),
+            "error should name the legacy case: {msg}"
+        );
+        assert!(
+            msg.contains("daemon=41"),
+            "the refusal must quote the frozen protocol_version it did report: {msg}"
+        );
+        assert!(msg.contains("9.9.9-test"), "{msg}");
+    }
+
+    /// Replaces the old fake-daemon test for the profile gate. The daemon
+    /// profile is flipped so the assertion is profile-agnostic.
+    #[test]
+    fn attach_refusal_reports_build_profile_mismatch_naming_both_sides() {
+        let wrong_profile = match BuildProfile::CURRENT {
+            BuildProfile::Debug => BuildProfile::Release,
+            BuildProfile::Release => BuildProfile::Debug,
+        };
+        let msg = attach_refusal(
+            &status_with(Some(PROTOCOL_RANGE), Some(wrong_profile)),
+            "/run/kmux/daemon.sock",
+        )
+        .expect("a mismatched build profile must block the attach");
+
+        assert!(
+            msg.contains("build profile mismatch"),
+            "error should mention build profile mismatch: {msg}"
+        );
+        assert!(
+            msg.contains(&format!("kmux is {}", BuildProfile::CURRENT)),
+            "the refusal must name the client's profile: {msg}"
+        );
+        assert!(
+            msg.contains(wrong_profile.as_str()),
+            "the refusal must name the daemon's profile: {msg}"
+        );
+        assert!(
+            msg.contains("/run/kmux/daemon.sock"),
+            "the refusal must name the socket that answered: {msg}"
+        );
+    }
+
+    #[test]
+    fn attach_refusal_reports_a_daemon_with_no_build_profile() {
+        let msg = attach_refusal(
+            &status_with(Some(PROTOCOL_RANGE), None),
+            "/run/kmux/daemon.sock",
+        )
+        .expect("an unverifiable build profile must block the attach");
+
+        assert!(
+            msg.contains("did not report a build profile"),
+            "error should name the unverifiable case: {msg}"
+        );
+        assert!(
+            msg.contains(&BuildProfile::CURRENT.to_string()),
+            "the refusal must name the client's profile: {msg}"
+        );
+        assert!(
+            msg.contains("/run/kmux/daemon.sock"),
+            "the refusal must name the socket that answered: {msg}"
+        );
+    }
+
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn query_daemon_parses_session_count() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
-
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = socket_in(&tmp);
+        let listener = UnixListener::bind(&socket_path).expect("bind control socket");
 
         let my_pid = std::process::id();
 
@@ -263,9 +472,7 @@ mod tests {
             }
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let status = query_daemon().await;
+        let status = query_daemon_at(&socket_path).await;
         let status = status.expect("expected Some from mock daemon");
         assert_eq!(status.port, 9999);
         assert_eq!(status.uptime_secs, 42);
@@ -273,17 +480,13 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn query_daemon_sessions_roundtrip() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
-
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = socket_in(&tmp);
+        let listener = UnixListener::bind(&socket_path).expect("bind control socket");
 
         tokio::spawn(async move {
             if let Ok((stream, _)) = listener.accept().await {
@@ -298,111 +501,26 @@ mod tests {
             }
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let resp = query_daemon_sessions().await.expect("should parse");
+        let resp = query_daemon_sessions_at(&socket_path)
+            .await
+            .expect("should parse");
         assert!(resp.sessions.is_empty());
         assert!(resp.unattached.is_empty());
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn ensure_compatible_daemon_rejects_version_mismatch() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
-
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
-
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
-        let listener = UnixListener::bind(&socket_path).unwrap();
-
-        let my_pid = std::process::id();
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let (read_half, mut write_half) = stream.into_split();
-                let mut reader = BufReader::new(read_half);
-                let mut line = String::new();
-                let _ = reader.read_line(&mut line).await;
-                let response = format!(
-                    "{{\"status\":\"running\",\"port\":9999,\"token\":\"tok\",\
-                     \"pid\":{my_pid},\"uptime_secs\":0,\"session_count\":0,\
-                     \"protocol_version\":41,\"protocol_range\":{{\"min\":{{\"major\":2,\"minor\":0,\"patch\":0}},\"max\":{{\"major\":2,\"minor\":0,\"patch\":0}}}},\"kmuxd_version\":\"0.0.0\"}}\n"
-                );
-                write_half.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        // ensure_compatible_daemon must error, not return Ok.
-        let result = super::ensure_compatible_daemon().await;
-        assert!(result.is_err(), "expected Err on version mismatch");
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("protocol version mismatch"),
-            "error should mention mismatch: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
-    async fn ensure_compatible_daemon_rejects_build_profile_mismatch() {
-        use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-        use tokio::net::UnixListener;
-
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
-
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
-        let listener = UnixListener::bind(&socket_path).unwrap();
-
-        let my_pid = std::process::id();
-        // Flip the profile so it never matches whatever the test binary was
-        // compiled with.
-        let wrong_profile = match BuildProfile::CURRENT {
-            BuildProfile::Debug => "release",
-            BuildProfile::Release => "debug",
-        };
-        tokio::spawn(async move {
-            while let Ok((stream, _)) = listener.accept().await {
-                let (read_half, mut write_half) = stream.into_split();
-                let mut reader = BufReader::new(read_half);
-                let mut line = String::new();
-                let _ = reader.read_line(&mut line).await;
-                let response = format!(
-                    "{{\"status\":\"running\",\"port\":9999,\"token\":\"tok\",\
-                     \"pid\":{my_pid},\"uptime_secs\":0,\"session_count\":0,\
-                     \"protocol_version\":41,\"protocol_range\":{{\"min\":{{\"major\":1,\"minor\":0,\"patch\":0}},\"max\":{{\"major\":1,\"minor\":0,\"patch\":0}}}},\"kmuxd_version\":\"0.0.0\",\
-                     \"build_profile\":\"{wrong_profile}\"}}\n"
-                );
-                write_half.write_all(response.as_bytes()).await.unwrap();
-            }
-        });
-
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
-        let result = super::ensure_compatible_daemon().await;
-        assert!(result.is_err(), "expected Err on build profile mismatch");
-        let msg = result.unwrap_err().to_string();
-        assert!(
-            msg.contains("build profile mismatch"),
-            "error should mention build profile mismatch: {msg}"
-        );
-    }
-
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn control_request_timeout_surfaces_error() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
-
+        let tmp = tempfile::tempdir().expect("tempdir");
         // No listener — should return an error, not hang.
-        let result: anyhow::Result<StatusResponse> = control_request("status").await;
-        assert!(result.is_err());
+        let result: anyhow::Result<StatusResponse> =
+            control_request_at(&socket_in(&tmp), "status").await;
+        let Err(error) = result else {
+            panic!("an absent daemon must surface as Err");
+        };
+        assert!(
+            error.to_string().contains("daemon is not running"),
+            "the error must say why the request failed: {error}"
+        );
     }
 
     /// The `restart` control RPC has three outcomes the `kmux daemon restart`
@@ -412,17 +530,13 @@ mod tests {
     ///   - connection closed without a reply → `Err` — daemon predates `restart`,
     ///     so the caller falls back to a hard stop-then-respawn.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn restart_daemon_maps_accepted_busy_and_unsupported() {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
         use tokio::net::UnixListener;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
-
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
-        let listener = UnixListener::bind(&socket_path).unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = socket_in(&tmp);
+        let listener = UnixListener::bind(&socket_path).expect("bind control socket");
 
         // Serve three connections in order: accept, busy, then close-without-reply.
         tokio::spawn(async move {
@@ -448,20 +562,20 @@ mod tests {
             }
         });
 
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-
         assert!(
-            super::restart_daemon()
+            restart_daemon_at(&socket_path)
                 .await
                 .expect("accepted reply parses"),
             "status=ok must report an accepted handoff"
         );
         assert!(
-            !super::restart_daemon().await.expect("busy reply parses"),
+            !restart_daemon_at(&socket_path)
+                .await
+                .expect("busy reply parses"),
             "status=busy must report no handoff"
         );
         assert!(
-            super::restart_daemon().await.is_err(),
+            restart_daemon_at(&socket_path).await.is_err(),
             "a daemon that closes without replying must surface as Err (unsupported)"
         );
     }

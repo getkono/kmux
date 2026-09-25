@@ -2,7 +2,7 @@
 //! terminal when [`Mode::ConnectedClients`] is active, listing the client
 //! connections attached to the active session — label, machine id, hostname,
 //! transport, panes — with a per-row **Kick** button. Rows come from the
-//! toolkit-agnostic [`AppCore::client_rows`] projection; this module renders them
+//! toolkit-agnostic [`kmux_app::core::AppCore::client_rows`] projection; this module renders them
 //! into a `GtkListBox` and is reconciled by the pump while the view is open (the
 //! driver re-requests the list at ~1 Hz, issue #146).
 
@@ -58,8 +58,8 @@ pub fn attach_keys(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
         if matches!(keyval, gdk::Key::Escape | gdk::Key::q) {
             {
                 let mut f = fe.borrow_mut();
-                futures::executor::block_on(f.core.dispatch_action(Action::ToggleConnectedClients));
-                f.core.needs_render = true;
+                f.core.dispatch_action(Action::ToggleConnectedClients);
+                f.core.request_render();
             }
             drawing.grab_focus();
             return glib::Propagation::Stop;
@@ -148,8 +148,8 @@ fn make_row(r: &ClientInfo, fe: &Rc<RefCell<Frontend>>, shell: &Rc<Shell>) -> Li
         kick.connect_clicked(move |_| {
             {
                 let mut f = fe.borrow_mut();
-                f.core.kick_listed_client(client_id);
-                f.core.needs_render = true;
+                f.core.mutate(|c| c.kick_listed_client(client_id));
+                f.core.request_render();
             }
             drawing.grab_focus();
         });
@@ -189,7 +189,7 @@ fn short_id(machine_id: &str) -> String {
 fn panes_text(panes: &[u32]) -> String {
     panes
         .iter()
-        .map(|p| p.to_string())
+        .map(ToString::to_string)
         .collect::<Vec<_>>()
         .join(",")
 }

@@ -43,9 +43,9 @@ impl ServerApp {
         }
     }
 
-    /// Snapshot a single live session into a [`PersistedSession`] (issue #64).
+    /// Snapshot a single live session into a [`crate::persist::PersistedSession`] (issue #64).
     ///
-    /// Captures every pane's grid + scrollback (capped at [`MAX_SCROLLBACK_LINES`])
+    /// Captures every pane's grid + scrollback (capped at [`crate::persist::MAX_SCROLLBACK_LINES`])
     /// and the session's tabs. Shared by [`checkpoint_state`](Self::checkpoint_state)
     /// and the close-session path, which retains the snapshot in the graveyard.
     pub(super) async fn snapshot_session(
@@ -58,7 +58,7 @@ impl ServerApp {
         let word_id = &session_state.meta.word_id;
         let mut persisted_panes = Vec::with_capacity(session_state.panes.len());
 
-        for (&pane_index, relay) in session_state.panes.iter() {
+        for (&pane_index, relay) in &session_state.panes {
             let pane_id = format_pane_id(word_id, pane_index);
 
             // Snapshot grid state and extract scrollback for the checkpoint.
@@ -70,7 +70,11 @@ impl ServerApp {
                 scrollback_arc.iter().map(|line| line.to_vec()).collect();
 
             // Get child PID from the PTY registry.
-            let child_pid = self.manager.child_pid(&pane_id).await.map(|p| p.as_raw());
+            let child_pid = self
+                .manager
+                .child_pid(&pane_id)
+                .await
+                .map(nix::unistd::Pid::as_raw);
 
             persisted_panes.push(PersistedPane {
                 pane_index,

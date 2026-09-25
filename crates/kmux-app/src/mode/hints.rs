@@ -1,6 +1,6 @@
 use super::Mode;
 
-/// Returns hint bar entries for a given mode: (key_label, description).
+/// Returns hint bar entries for a given mode: (`key_label`, description).
 pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
     match mode {
         Mode::Normal => vec![("Ctrl+G", "Mode select")],

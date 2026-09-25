@@ -263,7 +263,7 @@ pub fn resolve_remote_target(parsed: &ParsedServer) -> Option<RemoteTarget> {
     })
 }
 
-/// Apply per-host overrides from `hosts.toml` (ssh_port, user, hostname).
+/// Apply per-host overrides from `hosts.toml` (`ssh_port`, user, hostname).
 pub fn apply_host_overrides(target: &mut RemoteTarget) {
     let config = HostsConfig::load();
     if let Some(entry) = config.get(&target.host) {

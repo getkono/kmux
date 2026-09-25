@@ -107,11 +107,11 @@ pub fn build_overview_rows(
                 let pane_id = format_pane_id(&entry.meta.word_id, pane_index);
                 let info = entry.panes.iter().find(|p| p.pane_index == pane_index);
                 let pp = by_pane.get(pane_id.as_str()).copied();
-                let (p_cpu, p_mem) = pp.map(tree_totals).unwrap_or((0.0, 0));
+                let (p_cpu, p_mem) = pp.map_or((0.0, 0), tree_totals);
                 rows.push(OverviewRow {
                     depth: 2,
                     kind: OverviewRowKind::Pane,
-                    label: info.map(pane_label).unwrap_or_else(|| pane_id.clone()),
+                    label: info.map_or_else(|| pane_id.clone(), pane_label),
                     detail: pane_id.clone(),
                     cpu_percent: p_cpu,
                     mem_bytes: p_mem,
@@ -138,7 +138,7 @@ fn pane_label(info: &PaneInfo) -> String {
     }
 }
 
-/// Sum (cpu_percent, mem_bytes) over a pane's process subtree.
+/// Sum (`cpu_percent`, `mem_bytes`) over a pane's process subtree.
 fn tree_totals(pp: &PaneProcesses) -> (f32, u64) {
     pp.processes.iter().fold((0.0, 0), |(cpu, mem), p| {
         (cpu + p.cpu_percent, mem + p.mem_bytes)

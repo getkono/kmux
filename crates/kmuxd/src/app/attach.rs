@@ -6,10 +6,10 @@ use kmux_protocol::messages::{
     ClientCapabilities, ClientId, GridSnapshot, InputMode, SequenceNo, ServerMessage, TermSize,
     TerminalDiff,
 };
-use kmux_pty::error::{KmuxError, Result};
+use kmux_pty::error::Result;
 use tokio::sync::mpsc;
 
-use super::helpers::parse_pane_id;
+use super::helpers::{pane_not_found, parse_pane_id};
 use super::{ClientSender, ServerApp};
 
 /// Maximum number of buffered diffs to replay on a delta attach/resume before
@@ -36,9 +36,9 @@ pub struct AttachParams {
 /// Result of an attach operation describing what replay data to send.
 #[derive(Debug)]
 pub enum AttachResult {
-    /// Fresh attach or first-time connect: full grid snapshot from TermState.
+    /// Fresh attach or first-time connect: full grid snapshot from `TermState`.
     FullSnapshot(GridSnapshot, SequenceNo),
-    /// Delta replay: only diffs with seqno > last_seqno.
+    /// Delta replay: only diffs with seqno > `last_seqno`.
     Delta(Vec<(SequenceNo, Arc<TerminalDiff>)>),
     /// Requested seqno was too old; full snapshot sent, client must reset state.
     SyncReset(GridSnapshot, SequenceNo),
@@ -52,7 +52,7 @@ pub enum InputLockOutcome {
 
 /// Compute the catch-up payload for an attach/resume from a pane's relay state.
 ///
-/// - `None` last_seqno (fresh attach) → full snapshot.
+/// - `None` `last_seqno` (fresh attach) → full snapshot.
 /// - `Some(seq)` within the scrollback buffer → delta replay of the missed
 ///   diffs, unless they exceed the coalescing threshold (e.g. after a long
 ///   pause), in which case a single final-state snapshot (`SyncReset`) is sent.
@@ -112,23 +112,17 @@ impl ServerApp {
             capabilities,
         } = params;
         let (word_id, pane_index) =
-            parse_pane_id(&pane_id).ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.clone(),
-            })?;
+            parse_pane_id(&pane_id).ok_or_else(|| pane_not_found(&pane_id))?;
 
         // Write lock needed so we can update relay.size via apply_effective_size.
         let mut sessions = self.sessions.write().await;
         let state = sessions
             .get_mut(word_id)
-            .ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
+            .ok_or_else(|| pane_not_found(&pane_id))?;
         let relay = state
             .panes
             .get_mut(&pane_index)
-            .ok_or_else(|| KmuxError::SessionNotFound {
-                name: pane_id.to_string(),
-            })?;
+            .ok_or_else(|| pane_not_found(&pane_id))?;
 
         let result = compute_replay(relay, last_seqno);
 
@@ -140,8 +134,7 @@ impl ServerApp {
             // `paused` is cleared — resume reconciliation flows through here.
             let force_full_snapshot = clients
                 .get(&client_id)
-                .map(|s| s.force_full_snapshot)
-                .unwrap_or(false);
+                .is_some_and(|s| s.force_full_snapshot);
             clients.insert(
                 client_id,
                 ClientSender {
@@ -257,7 +250,7 @@ impl ServerApp {
     pub async fn detach_client_all(&self, client_id: ClientId) {
         let mut sessions = self.sessions.write().await;
         for state in sessions.values_mut() {
-            for (pane_index, relay) in state.panes.iter_mut() {
+            for (pane_index, relay) in &mut state.panes {
                 let pane_id = format_pane_id(&state.meta.word_id, *pane_index);
                 relay.clients.lock().unwrap().remove(&client_id);
                 relay.recompute_live_capabilities();

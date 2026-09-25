@@ -1,4 +1,4 @@
-//! Safe Rust façade over [`kmux-ghostty-sys`]. Wraps the kmux-owned C ABI
+//! Safe Rust façade over [`kmux_ghostty_sys`]. Wraps the kmux-owned C ABI
 //! exposed by `libkmux_ghostty` (a Zig wrapper around libghostty-vt v1.3.1)
 //! in idiomatic, lifetime-checked types.
 //!
@@ -17,7 +17,7 @@
 //!
 //! [`GhosttyTerm`] is `Send` but **not** `Sync`: at most one caller may mutate
 //! or read the terminal at a time. kmuxd wraps it in `Arc<Mutex<DiffEngine<…>>>`
-//! to serialise access. Event callbacks fire synchronously inside [`feed`] —
+//! to serialise access. Event callbacks fire synchronously inside [`GhosttyTerm::feed`] —
 //! they borrow data from the Zig side and must not retain it past return.
 
 #![deny(missing_debug_implementations)]
@@ -85,7 +85,7 @@ impl From<sys::KmuxSize> for TermSize {
     }
 }
 
-/// OSC 9;4 (ConEmu / Windows-Terminal) progress-report state.
+/// OSC 9;4 (`ConEmu` / Windows-Terminal) progress-report state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProgressState {
     /// Clear any progress indication (`OSC 9;4;0`).
@@ -270,7 +270,8 @@ impl EventBridge {
     }
 
     fn as_c_sink(self: &mut Box<Self>) -> sys::KmuxEventSink {
-        let user = self.as_mut() as *mut Self as *mut c_void;
+        let me: *mut Self = self.as_mut();
+        let user = me.cast::<c_void>();
         sys::KmuxEventSink {
             user,
             on_title: Some(trampoline_title),
@@ -456,7 +457,7 @@ impl GhosttyTerm {
     }
 
     /// Combined grid + cursor + modes read in one FFI crossing. Preferred on
-    /// the hot path where [`DiffEngine`] reads all three together.
+    /// the hot path where the diff engine reads all three together.
     pub fn fill_cells_and_cursor(
         &self,
         out: &mut [CellState],
@@ -543,7 +544,7 @@ impl GhosttyTerm {
         let mut value = 0u8;
         let mut has = 0u8;
         unsafe {
-            sys::kmux_ghostty_get_progress(self.handle.as_ptr(), &mut state, &mut value, &mut has)
+            sys::kmux_ghostty_get_progress(self.handle.as_ptr(), &mut state, &mut value, &mut has);
         };
         ProgressReport::from_raw(state, value, has)
     }
@@ -742,90 +743,90 @@ impl From<kmux_protocol::messages::KeyCode> for Key {
     fn from(code: kmux_protocol::messages::KeyCode) -> Self {
         use kmux_protocol::messages::KeyCode as P;
         match code {
-            P::Unidentified => Key::Unidentified,
-            P::A => Key::A,
-            P::B => Key::B,
-            P::C => Key::C,
-            P::D => Key::D,
-            P::E => Key::E,
-            P::F => Key::F,
-            P::G => Key::G,
-            P::H => Key::H,
-            P::I => Key::I,
-            P::J => Key::J,
-            P::K => Key::K,
-            P::L => Key::L,
-            P::M => Key::M,
-            P::N => Key::N,
-            P::O => Key::O,
-            P::P => Key::P,
-            P::Q => Key::Q,
-            P::R => Key::R,
-            P::S => Key::S,
-            P::T => Key::T,
-            P::U => Key::U,
-            P::V => Key::V,
-            P::W => Key::W,
-            P::X => Key::X,
-            P::Y => Key::Y,
-            P::Z => Key::Z,
-            P::Digit0 => Key::Digit0,
-            P::Digit1 => Key::Digit1,
-            P::Digit2 => Key::Digit2,
-            P::Digit3 => Key::Digit3,
-            P::Digit4 => Key::Digit4,
-            P::Digit5 => Key::Digit5,
-            P::Digit6 => Key::Digit6,
-            P::Digit7 => Key::Digit7,
-            P::Digit8 => Key::Digit8,
-            P::Digit9 => Key::Digit9,
-            P::Backquote => Key::Backquote,
-            P::Backslash => Key::Backslash,
-            P::BracketLeft => Key::BracketLeft,
-            P::BracketRight => Key::BracketRight,
-            P::Comma => Key::Comma,
-            P::Equal => Key::Equal,
-            P::Minus => Key::Minus,
-            P::Period => Key::Period,
-            P::Quote => Key::Quote,
-            P::Semicolon => Key::Semicolon,
-            P::Slash => Key::Slash,
-            P::Enter => Key::Enter,
-            P::Tab => Key::Tab,
-            P::Space => Key::Space,
-            P::Backspace => Key::Backspace,
-            P::Escape => Key::Escape,
-            P::Insert => Key::Insert,
-            P::Delete => Key::Delete,
-            P::Home => Key::Home,
-            P::End => Key::End,
-            P::PageUp => Key::PageUp,
-            P::PageDown => Key::PageDown,
-            P::ArrowUp => Key::ArrowUp,
-            P::ArrowDown => Key::ArrowDown,
-            P::ArrowLeft => Key::ArrowLeft,
-            P::ArrowRight => Key::ArrowRight,
-            P::F1 => Key::F1,
-            P::F2 => Key::F2,
-            P::F3 => Key::F3,
-            P::F4 => Key::F4,
-            P::F5 => Key::F5,
-            P::F6 => Key::F6,
-            P::F7 => Key::F7,
-            P::F8 => Key::F8,
-            P::F9 => Key::F9,
-            P::F10 => Key::F10,
-            P::F11 => Key::F11,
-            P::F12 => Key::F12,
-            P::ShiftLeft => Key::ShiftLeft,
-            P::ShiftRight => Key::ShiftRight,
-            P::ControlLeft => Key::ControlLeft,
-            P::ControlRight => Key::ControlRight,
-            P::AltLeft => Key::AltLeft,
-            P::AltRight => Key::AltRight,
-            P::MetaLeft => Key::MetaLeft,
-            P::MetaRight => Key::MetaRight,
-            P::CapsLock => Key::CapsLock,
+            P::Unidentified => Self::Unidentified,
+            P::A => Self::A,
+            P::B => Self::B,
+            P::C => Self::C,
+            P::D => Self::D,
+            P::E => Self::E,
+            P::F => Self::F,
+            P::G => Self::G,
+            P::H => Self::H,
+            P::I => Self::I,
+            P::J => Self::J,
+            P::K => Self::K,
+            P::L => Self::L,
+            P::M => Self::M,
+            P::N => Self::N,
+            P::O => Self::O,
+            P::P => Self::P,
+            P::Q => Self::Q,
+            P::R => Self::R,
+            P::S => Self::S,
+            P::T => Self::T,
+            P::U => Self::U,
+            P::V => Self::V,
+            P::W => Self::W,
+            P::X => Self::X,
+            P::Y => Self::Y,
+            P::Z => Self::Z,
+            P::Digit0 => Self::Digit0,
+            P::Digit1 => Self::Digit1,
+            P::Digit2 => Self::Digit2,
+            P::Digit3 => Self::Digit3,
+            P::Digit4 => Self::Digit4,
+            P::Digit5 => Self::Digit5,
+            P::Digit6 => Self::Digit6,
+            P::Digit7 => Self::Digit7,
+            P::Digit8 => Self::Digit8,
+            P::Digit9 => Self::Digit9,
+            P::Backquote => Self::Backquote,
+            P::Backslash => Self::Backslash,
+            P::BracketLeft => Self::BracketLeft,
+            P::BracketRight => Self::BracketRight,
+            P::Comma => Self::Comma,
+            P::Equal => Self::Equal,
+            P::Minus => Self::Minus,
+            P::Period => Self::Period,
+            P::Quote => Self::Quote,
+            P::Semicolon => Self::Semicolon,
+            P::Slash => Self::Slash,
+            P::Enter => Self::Enter,
+            P::Tab => Self::Tab,
+            P::Space => Self::Space,
+            P::Backspace => Self::Backspace,
+            P::Escape => Self::Escape,
+            P::Insert => Self::Insert,
+            P::Delete => Self::Delete,
+            P::Home => Self::Home,
+            P::End => Self::End,
+            P::PageUp => Self::PageUp,
+            P::PageDown => Self::PageDown,
+            P::ArrowUp => Self::ArrowUp,
+            P::ArrowDown => Self::ArrowDown,
+            P::ArrowLeft => Self::ArrowLeft,
+            P::ArrowRight => Self::ArrowRight,
+            P::F1 => Self::F1,
+            P::F2 => Self::F2,
+            P::F3 => Self::F3,
+            P::F4 => Self::F4,
+            P::F5 => Self::F5,
+            P::F6 => Self::F6,
+            P::F7 => Self::F7,
+            P::F8 => Self::F8,
+            P::F9 => Self::F9,
+            P::F10 => Self::F10,
+            P::F11 => Self::F11,
+            P::F12 => Self::F12,
+            P::ShiftLeft => Self::ShiftLeft,
+            P::ShiftRight => Self::ShiftRight,
+            P::ControlLeft => Self::ControlLeft,
+            P::ControlRight => Self::ControlRight,
+            P::AltLeft => Self::AltLeft,
+            P::AltRight => Self::AltRight,
+            P::MetaLeft => Self::MetaLeft,
+            P::MetaRight => Self::MetaRight,
+            P::CapsLock => Self::CapsLock,
         }
     }
 }
@@ -1100,8 +1101,7 @@ mod tests {
     #[test]
     fn event_sink_title_trampoline() {
         let rec = Arc::new(TitleRecorder::default());
-        let mut term =
-            GhosttyTerm::new(size(4, 20), 100, rec.clone() as Arc<dyn EventSink>).unwrap();
+        let mut term = GhosttyTerm::new(size(4, 20), 100, rec.clone()).unwrap();
         // OSC 0 ; hi BEL — sets window title.
         term.feed(b"\x1b]0;hello-world\x07").unwrap();
         let titles = rec.0.lock().unwrap().clone();
@@ -1130,8 +1130,7 @@ mod tests {
     #[test]
     fn event_sink_progress_trampoline() {
         let rec = Arc::new(ProgressRecorder::default());
-        let mut term =
-            GhosttyTerm::new(size(4, 20), 100, rec.clone() as Arc<dyn EventSink>).unwrap();
+        let mut term = GhosttyTerm::new(size(4, 20), 100, rec.clone()).unwrap();
         // OSC 9;4;2;30 — error state at 30%.
         term.feed(b"\x1b]9;4;2;30\x07").unwrap();
         let got = rec.0.lock().unwrap().clone();
@@ -1182,8 +1181,7 @@ mod tests {
     #[test]
     fn dsr_cursor_position_writes_response() {
         let rec = Arc::new(ResponseRecorder::default());
-        let mut term =
-            GhosttyTerm::new(size(10, 40), 100, rec.clone() as Arc<dyn EventSink>).unwrap();
+        let mut term = GhosttyTerm::new(size(10, 40), 100, rec.clone()).unwrap();
         // Place the cursor at row 3, col 5 (1-based) then request DSR CPR.
         term.feed(b"\x1b[3;5H\x1b[6n").unwrap();
         assert_eq!(rec.0.lock().unwrap().as_slice(), b"\x1b[3;5R");
@@ -1193,8 +1191,7 @@ mod tests {
     fn query_split_across_feeds_still_answers() {
         // The parser must accumulate a query fed one byte at a time.
         let rec = Arc::new(ResponseRecorder::default());
-        let mut term =
-            GhosttyTerm::new(size(4, 20), 100, rec.clone() as Arc<dyn EventSink>).unwrap();
+        let mut term = GhosttyTerm::new(size(4, 20), 100, rec.clone()).unwrap();
         for b in b"\x1b[5n" {
             term.feed(std::slice::from_ref(b)).unwrap();
         }
@@ -1204,8 +1201,7 @@ mod tests {
     #[test]
     fn multiple_queries_in_one_feed_reply_in_fifo_order() {
         let rec = Arc::new(ResponseRecorder::default());
-        let mut term =
-            GhosttyTerm::new(size(4, 20), 100, rec.clone() as Arc<dyn EventSink>).unwrap();
+        let mut term = GhosttyTerm::new(size(4, 20), 100, rec.clone()).unwrap();
         // DSR status, then DA1 primary, then size-in-chars: replies concatenate
         // in the order the queries arrive.
         term.feed(b"\x1b[5n\x1b[c\x1b[18t").unwrap();
@@ -1218,8 +1214,7 @@ mod tests {
     #[test]
     fn ordinary_output_after_query_still_renders() {
         let rec = Arc::new(ResponseRecorder::default());
-        let mut term =
-            GhosttyTerm::new(size(4, 20), 100, rec.clone() as Arc<dyn EventSink>).unwrap();
+        let mut term = GhosttyTerm::new(size(4, 20), 100, rec.clone()).unwrap();
         term.feed(b"\x1b[6nok").unwrap();
         assert_eq!(rec.0.lock().unwrap().as_slice(), b"\x1b[1;1R");
         let mut out = vec![CellState::default(); 4 * 20];
@@ -1250,7 +1245,7 @@ mod tests {
         let counter = Arc::new(AtomicUsize::new(0));
         let sink: Arc<DropCounter> = Arc::new(DropCounter(counter.clone()));
         let weak = Arc::downgrade(&sink);
-        let term = GhosttyTerm::new(size(3, 3), 10, sink as Arc<dyn EventSink>).unwrap();
+        let term = GhosttyTerm::new(size(3, 3), 10, sink).unwrap();
         // Terminal is alive: sink has two strong refs (ours just went; bridge has one).
         assert_eq!(weak.strong_count(), 1);
         drop(term);

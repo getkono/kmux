@@ -96,7 +96,7 @@ impl PtyMasterIo {
     pub fn try_read_raw(&self, buf: &mut [u8]) -> io::Result<usize> {
         let fd = self.inner.as_raw_fd();
         let n =
-            unsafe { nix::libc::read(fd, buf.as_mut_ptr() as *mut nix::libc::c_void, buf.len()) };
+            unsafe { nix::libc::read(fd, buf.as_mut_ptr().cast::<nix::libc::c_void>(), buf.len()) };
         if n < 0 {
             Err(io::Error::last_os_error())
         } else {
@@ -124,7 +124,7 @@ impl AsyncRead for PtyMasterIo {
                 let n = unsafe {
                     nix::libc::read(
                         fd,
-                        slice.as_mut_ptr() as *mut nix::libc::c_void,
+                        slice.as_mut_ptr().cast::<nix::libc::c_void>(),
                         slice.len(),
                     )
                 };
@@ -163,7 +163,7 @@ impl AsyncWrite for PtyMasterIo {
             let result = guard.try_io(|inner| {
                 let fd = inner.as_raw_fd();
                 let n = unsafe {
-                    nix::libc::write(fd, data.as_ptr() as *const nix::libc::c_void, data.len())
+                    nix::libc::write(fd, data.as_ptr().cast::<nix::libc::c_void>(), data.len())
                 };
                 if n < 0 {
                     Err(io::Error::last_os_error())

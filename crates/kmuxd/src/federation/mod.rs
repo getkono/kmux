@@ -5,7 +5,7 @@
 //!
 //! # Model
 //!
-//! [`PeerManager`] (held on [`ServerApp`](crate::app::ServerApp)) owns one
+//! [`PeerManager`] (held on [`ServerApp`]) owns one
 //! [`PeerConnection`] per distinct remote daemon, keyed by [`PeerId`]. Each
 //! connection holds the upstream `ClientMessage` sink (`client_tx`), a
 //! bidirectional `remote_word ↔ local_word` map, the proxied sessions (with
@@ -31,7 +31,7 @@
 //! `docs/architecture-federation.md`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kmux_client::grid::CellGrid;
@@ -166,7 +166,7 @@ impl ProxiedPane {
 
     /// Fan an (already local-addressed) pane frame out to every viewer, applying
     /// the same backpressure policy as the local PTY relay
-    /// ([`crate::relay::broadcast_to_clients`]): a viewer whose **bounded** data
+    /// (`crate::relay::broadcast_to_clients`): a viewer whose **bounded** data
     /// channel is full is sent a [`ServerMessage::Lagged`] over its **unbounded**
     /// ctrl channel and dropped — it re-attaches and is served a fresh snapshot
     /// minted off the still-correct mirror, exactly as a lagging local client
@@ -174,7 +174,7 @@ impl ProxiedPane {
     /// is fed by the caller *before* this, so a dropped viewer never desyncs it.
     fn fan_out(&mut self, local_pane_id: &str, msg: &ServerMessage) {
         let mut dead: Vec<ClientId> = Vec::new();
-        for (&client_id, viewer) in self.viewers.iter() {
+        for (&client_id, viewer) in &self.viewers {
             // Paused viewers (issue #68) receive no terminal output and must never
             // be marked lagged or dropped when their channel fills — they resync on
             // resume via re-attach. Same rule as `relay::broadcast_to_clients`; an
@@ -276,10 +276,11 @@ struct PeerConnection {
     /// #146). The feed loop completes the oneshot with the peer's connections when
     /// the matching `ClientListResult` arrives.
     pending_client_lists: HashMap<RequestId, oneshot::Sender<Vec<ClientInfo>>>,
-    /// In-flight hub-initiated `KickClient`s, keyed by upstream request id (issue
-    /// #146). The feed loop completes the oneshot when the matching `ClientKicked`
-    /// (Ok) or `Error` (Err) arrives.
-    pending_kicks: HashMap<RequestId, oneshot::Sender<Result<(), String>>>,
+    /// In-flight hub-initiated requests whose only answer is "done" or an error —
+    /// `KickClient` (issue #146), `SessionClose` and `TabClose` — keyed by
+    /// upstream request id. The feed loop completes the oneshot when the matching
+    /// `ClientKicked`/`SessionClosed`/`TabClosed` (Ok) or `Error` (Err) arrives.
+    pending_acks: HashMap<RequestId, oneshot::Sender<Result<(), String>>>,
     /// The background `ssh -L -N` tunnel process for an [`PeerTarget::Ssh`] peer,
     /// kept alive for the life of the connection (the `-L` forward dies with it).
     /// `None` for a [`PeerTarget::Direct`] peer. Killed on close/reap.
@@ -303,7 +304,7 @@ impl PeerConnection {
             pending_creates: HashMap::new(),
             pending_overviews: HashMap::new(),
             pending_client_lists: HashMap::new(),
-            pending_kicks: HashMap::new(),
+            pending_acks: HashMap::new(),
             ssh_tunnel: None,
             dead: false,
         }
@@ -571,13 +572,15 @@ impl PeerManager {
         {
             return Err("peer connection closed before session list".to_string());
         }
-        let remote_sessions = match recv_until(&mut server_rx, LIST_TIMEOUT, |m| {
+        let Some(ServerMessage::SessionListResult {
+            sessions: remote_sessions,
+            ..
+        }) = recv_until(&mut server_rx, LIST_TIMEOUT, |m| {
             matches!(m, ServerMessage::SessionListResult { .. })
         })
         .await
-        {
-            Some(ServerMessage::SessionListResult { sessions, .. }) => sessions,
-            _ => return Err("peer did not return a session list in time".to_string()),
+        else {
+            return Err("peer did not return a session list in time".to_string());
         };
 
         // 4. Register each remote session under a fresh local word. Park the SSH
@@ -588,14 +591,11 @@ impl PeerManager {
         let mut assigned_words: Vec<String> = Vec::new();
         for entry in remote_sessions {
             let remote_word = entry.meta.word_id.clone();
-            let local_word = match app.draw_word() {
-                Some(w) => w,
-                None => {
-                    for w in &assigned_words {
-                        app.release_word(w);
-                    }
-                    return Err("local session word pool exhausted".to_string());
+            let Some(local_word) = app.draw_word() else {
+                for w in &assigned_words {
+                    app.release_word(w);
                 }
+                return Err("local session word pool exhausted".to_string());
             };
             assigned_words.push(local_word.clone());
             conn.register_session(local_word, remote_word, entry, &peer_id);
@@ -932,6 +932,87 @@ impl PeerManager {
         local_word: &str,
         client_id: ClientId,
     ) -> Result<(), String> {
+        self.request_ack(local_word, "kick", |request_id, word_id| {
+            ClientMessage::KickClient {
+                request_id,
+                word_id,
+                client_id,
+            }
+        })
+        .await
+    }
+
+    /// Close the federated session `local_word` on its owning peer, then drop it
+    /// from this hub: its word leaves the index and returns to the pool, and its
+    /// proxied panes and listing go away. The peer's own `SessionClosed` event
+    /// still reaches this session's viewers through the feed loop.
+    pub async fn close_remote_session(
+        &self,
+        app: &ServerApp,
+        local_word: &str,
+    ) -> Result<(), String> {
+        self.request_ack(local_word, "session close", |request_id, word_id| {
+            ClientMessage::SessionClose {
+                request_id,
+                word_id,
+            }
+        })
+        .await?;
+        self.unregister_session(app, local_word);
+        Ok(())
+    }
+
+    /// Close tab `tab_index` of the federated session `local_word` on its owning
+    /// peer. The peer broadcasts the resulting `TabClosed` (or `SessionClosed`,
+    /// for its last tab) and the feed loop relays it to this session's viewers.
+    pub async fn close_remote_tab(&self, local_word: &str, tab_index: u32) -> Result<(), String> {
+        self.request_ack(local_word, "tab close", |request_id, word_id| {
+            ClientMessage::TabClose {
+                request_id,
+                word_id,
+                tab_index,
+            }
+        })
+        .await
+    }
+
+    /// Translate `local_word` to its remote word and forward `build(remote_word)`
+    /// to the owning peer, for a session-scoped message that carries no request
+    /// id (the layout nudges). The peer answers with a `LayoutUpdate`, which the
+    /// feed loop translates back and relays to this session's viewers.
+    pub fn forward_session_message(
+        &self,
+        local_word: &str,
+        build: impl FnOnce(String) -> ClientMessage,
+    ) -> Result<(), String> {
+        let conn = self
+            .conn_for_word(local_word)
+            .ok_or_else(|| format!("session {local_word} is not federated"))?;
+        // Past a poisoned lock rather than through it: this reads two fields
+        // and sends one message, which a panic elsewhere cannot have left
+        // half-done, and a layout nudge is no reason to take the daemon down.
+        let guard = conn.lock().unwrap_or_else(PoisonError::into_inner);
+        if guard.dead {
+            return Err("peer connection is closed".to_string());
+        }
+        let Some(remote_word) = guard.local_to_remote.get(local_word).cloned() else {
+            return Err(format!("session {local_word} is not federated"));
+        };
+        guard
+            .client_tx
+            .send(build(remote_word))
+            .map_err(|_| "peer connection is closed".to_string())
+    }
+
+    /// Send `build(request_id, remote_word)` for the federated session
+    /// `local_word` upstream and wait for the peer to confirm it or refuse it.
+    /// `what` names the request in the errors a user sees.
+    async fn request_ack(
+        &self,
+        local_word: &str,
+        what: &str,
+        build: impl FnOnce(RequestId, String) -> ClientMessage,
+    ) -> Result<(), String> {
         let conn = self
             .conn_for_word(local_word)
             .ok_or_else(|| format!("session {local_word} is not federated"))?;
@@ -945,28 +1026,48 @@ impl PeerManager {
             };
             let rid = guard.next_rid();
             let (tx, rx) = oneshot::channel();
-            guard.pending_kicks.insert(rid, tx);
-            if guard
-                .client_tx
-                .send(ClientMessage::KickClient {
-                    request_id: rid,
-                    word_id: remote_word,
-                    client_id,
-                })
-                .is_err()
-            {
-                guard.pending_kicks.remove(&rid);
-                return Err("peer connection closed before kick".to_string());
+            guard.pending_acks.insert(rid, tx);
+            if guard.client_tx.send(build(rid, remote_word)).is_err() {
+                guard.pending_acks.remove(&rid);
+                return Err(format!("peer connection closed before {what}"));
             }
             (rid, rx)
         };
         match tokio::time::timeout(CREATE_TIMEOUT, rx).await {
             Ok(Ok(result)) => result,
             _ => {
-                conn.lock().unwrap().pending_kicks.remove(&rid);
-                Err("peer did not confirm kick in time".to_string())
+                conn.lock().unwrap().pending_acks.remove(&rid);
+                Err(format!("peer did not confirm {what} in time"))
             }
         }
+    }
+
+    /// Forget the federated session `local_word`: its mappings, listing and
+    /// proxied panes, and its entry in the word index, returning the word to the
+    /// pool. A no-op for a word that is not federated.
+    ///
+    /// Proceeds past a poisoned lock: it only removes entries, which leaves the
+    /// maps consistent whatever state a panic elsewhere left them in.
+    fn unregister_session(&self, app: &ServerApp, local_word: &str) {
+        let Some(conn) = self.conn_for_word(local_word) else {
+            return;
+        };
+        {
+            let mut guard = conn.lock().unwrap_or_else(PoisonError::into_inner);
+            if let Some(remote_word) = guard.local_to_remote.remove(local_word) {
+                guard.remote_to_local.remove(&remote_word);
+            }
+            guard.sessions.remove(local_word);
+            let prefix = format!("{local_word}/");
+            guard
+                .panes
+                .retain(|pane_id, _| !pane_id.starts_with(&prefix));
+        }
+        self.word_index
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(local_word);
+        app.release_word(local_word);
     }
 
     /// Translate `local_pane_id` to its remote form and forward
@@ -1022,7 +1123,7 @@ impl PeerManager {
             let pane = guard.panes.get_mut(local_pane_id).unwrap();
             let minted = ServerMessage::TerminalSnapshot {
                 pane_id: local_pane_id.to_string(),
-                snapshot: std::sync::Arc::new(pane.mirror.to_snapshot()),
+                snapshot: Arc::new(pane.mirror.to_snapshot()),
                 seqno: pane.last_seqno,
                 sent_at_ms: epoch_millis(),
             };
@@ -1159,6 +1260,54 @@ impl PeerManager {
         let peer_id = self.word_index.lock().unwrap().get(local_word).cloned()?;
         self.peers.lock().unwrap().get(&peer_id).cloned()
     }
+
+    /// Publish a peer whose upstream link is a pair of channels instead of a
+    /// socket, proxying one empty session `remote_word` as `local_word`. Returns
+    /// what the hub sends upstream and the sender that plays the peer's replies
+    /// into the real feed loop.
+    #[cfg(test)]
+    pub(crate) fn install_channel_peer(
+        &self,
+        peer_id: &str,
+        local_word: &str,
+        remote_word: &str,
+    ) -> (
+        mpsc::UnboundedReceiver<ClientMessage>,
+        mpsc::UnboundedSender<ServerMessage>,
+    ) {
+        use kmux_protocol::messages::SessionMeta;
+
+        let (client_tx, client_rx) = mpsc::unbounded_channel();
+        let (server_tx, server_rx) = mpsc::unbounded_channel();
+        let mut conn = PeerConnection::new(client_tx.clone());
+        let entry = SessionEntry {
+            meta: SessionMeta {
+                index: 0,
+                word_id: remote_word.to_string(),
+                name: remote_word.to_string(),
+                cwd: "/".to_string(),
+            },
+            panes: vec![],
+            tabs: vec![],
+            active_tab: 0,
+            peer: None,
+        };
+        conn.register_session(
+            local_word.to_string(),
+            remote_word.to_string(),
+            entry,
+            peer_id,
+        );
+        let conn = Arc::new(Mutex::new(conn));
+        let feed = spawn_feed_loop(server_rx, client_tx, Arc::clone(&conn), peer_id.to_string());
+        conn.lock().unwrap().feed_task = Some(feed);
+        self.peers.lock().unwrap().insert(peer_id.to_string(), conn);
+        self.word_index
+            .lock()
+            .unwrap()
+            .insert(local_word.to_string(), peer_id.to_string());
+        (client_rx, server_tx)
+    }
 }
 
 /// Drain the upstream `ServerMessage` stream: answer keepalive pings, translate
@@ -1219,7 +1368,9 @@ fn spawn_feed_loop(
             // to the normal handling below.
             let response_rid = match &msg {
                 ServerMessage::SessionCreated { request_id, .. } => Some(*request_id),
-                ServerMessage::ClientKicked { request_id, .. } => Some(*request_id),
+                ServerMessage::ClientKicked { request_id, .. }
+                | ServerMessage::SessionClosed { request_id, .. }
+                | ServerMessage::TabClosed { request_id, .. } => Some(*request_id),
                 ServerMessage::Error {
                     request_id: Some(rid),
                     ..
@@ -1227,11 +1378,11 @@ fn spawn_feed_loop(
                 _ => None,
             };
             if let Some(rid) = response_rid {
-                // A pending kick takes priority for its id, then a pending create.
-                let kick_tx = conn.lock().unwrap().pending_kicks.remove(&rid);
-                if let Some(tx) = kick_tx {
+                // A pending ack (kick, session/tab close) takes priority for its
+                // id, then a pending create.
+                let ack_tx = conn.lock().unwrap().pending_acks.remove(&rid);
+                if let Some(tx) = ack_tx {
                     let result = match msg {
-                        ServerMessage::ClientKicked { .. } => Ok(()),
                         ServerMessage::Error { message, .. } => Err(message),
                         _ => Ok(()),
                     };
@@ -1397,7 +1548,7 @@ mod tests {
     fn snapshot_msg(pane_id: &str) -> ServerMessage {
         ServerMessage::TerminalSnapshot {
             pane_id: pane_id.to_string(),
-            snapshot: std::sync::Arc::new(GridSnapshot {
+            snapshot: Arc::new(GridSnapshot {
                 rows: 1,
                 cols: 1,
                 cells: vec![],
@@ -1439,7 +1590,7 @@ mod tests {
 
     #[test]
     fn rewrite_event_to_local_translates_pane_and_word_events() {
-        let mut map = std::collections::HashMap::new();
+        let mut map = HashMap::new();
         map.insert("eagle".to_string(), "hawk".to_string());
 
         // A pane-scoped event rewrites the word portion of its pane ID.
@@ -1546,7 +1697,7 @@ mod tests {
         cells[2].c = 'Z';
         let msg = ServerMessage::TerminalSnapshot {
             pane_id: "hawk/0".to_string(),
-            snapshot: std::sync::Arc::new(GridSnapshot {
+            snapshot: Arc::new(GridSnapshot {
                 rows: 1,
                 cols: 3,
                 cells,

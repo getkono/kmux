@@ -89,7 +89,7 @@ impl SessionManager {
     /// Remove a named session and initiate graceful shutdown in the background.
     ///
     /// Returns immediately without waiting for the process to exit. The process
-    /// receives SIGTERM and will be SIGKILLed after the grace period if needed.
+    /// receives SIGTERM and will be `SIGKILLed` after the grace period if needed.
     pub async fn close_nowait(&self, name: &str) -> Result<()> {
         let session = {
             let mut sessions = self.sessions.lock().await;
@@ -272,8 +272,7 @@ mod tests {
         // Should return well under the 5-second grace period
         assert!(
             elapsed < std::time::Duration::from_millis(200),
-            "close_nowait took {:?}, expected < 200ms",
-            elapsed
+            "close_nowait took {elapsed:?}, expected < 200ms"
         );
         assert!(!mgr.exists("gamma").await, "session should be removed");
     }

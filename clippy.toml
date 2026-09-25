@@ -1,0 +1,48 @@
+# Workspace clippy configuration.
+#
+# This file exists mainly to keep the strict "restriction"-flavoured lints
+# aimed at *production* code. `unwrap_used`/`expect_used`/`panic` are the right
+# bar for a daemon that must not take a user's session down, and exactly the
+# wrong bar for a test, where a panic IS the failure report. Without the
+# `*-in-tests` switches below, adopting them would mean ~900 `#[allow]`
+# attributes in colocated test modules — see docs/testing.md R1: tests live
+# beside the code they test, so there is no "tests are a separate crate" escape.
+allow-unwrap-in-tests = true
+allow-expect-in-tests = true
+allow-panic-in-tests = true
+allow-indexing-slicing-in-tests = true
+# Deliberately NOT allowed in tests: `dbg!` is denied workspace-wide because it
+# is debugging residue anywhere, and `unreachable!` in a test asserts a claim
+# about the code under test that should be written as an assertion instead.
+
+# Match the rust-toolchain.toml / mise.toml pin so clippy's msrv-aware lints
+# (`manual_let_else`, `unnested_or_patterns`, ...) suggest only what compiles.
+msrv = "1.96.0"
+
+# `too_many_lines` is the executable form of docs/testing.md R4: a 900-line
+# dispatcher yields exactly ONE body-replacement mutant, so function size is a
+# direct cap on how much resolution the mutation score can ever have. 100 lines
+# matches the R4 audit snippet in docs/testing.md, so the grep and the lint
+# always agree.
+too-many-lines-threshold = 100
+
+# Identifiers `doc_markdown` would otherwise flag as needing backticks. Product
+# and ecosystem nouns only — anything that is really a code path should get the
+# backticks instead of an entry here.
+doc-valid-idents = [
+    "GTK",
+    "GTK4",
+    "SwiftUI",
+    "SwiftPM",
+    "MessagePack",
+    "PTY",
+    "TTY",
+    "VTE",
+    "XDG",
+    "kmux",
+    "kmuxd",
+    "libadwaita",
+    "macOS",
+    "ghostty",
+    "..",
+]

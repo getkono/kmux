@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-use crate::dirs::BuildProfile;
+use crate::compat::BuildProfile;
 use crate::messages::ProtocolRange;
 use crate::messages::SessionMeta;
 
@@ -260,7 +260,7 @@ pub struct WorkerInfo {
     /// Milliseconds since the most recent worker respawn (None if never).
     #[serde(default)]
     pub last_restart_ago_ms: Option<u64>,
-    /// Whether the worker may still be respawned (restart_count < the cap).
+    /// Whether the worker may still be respawned (`restart_count` < the cap).
     #[serde(default)]
     pub within_restart_budget: bool,
 }

@@ -62,6 +62,12 @@ pub struct PendingClose {
 /// This is the core → frontend control-flow channel: the frontend matches on
 /// it and performs the toolkit-specific follow-up (replace the server-message
 /// channel, exit the loop, …).
+///
+/// `Debug + PartialEq` because it is the value every action handler returns:
+/// without them an effect can only be pattern-matched, never asserted on, and
+/// the difference between "this action reconnects" and "this action does
+/// nothing" is exactly what a test needs to state.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyResult {
     Continue,
     Quit,
@@ -271,7 +277,7 @@ pub struct AppCore {
     /// Whether the inner-pane cursor blinks. When `false`, a cursor that
     /// requested blinking (DECSCUSR `blinking_*` / DEC mode 12) is drawn steady.
     /// The blink phase is driven by the frontend pump
-    /// ([`crate::driver::blink`]); this gates whether it advances at all.
+    /// ([`crate::driver::advance_blink`]); this gates whether it advances at all.
     pub cursor_blink_enabled: bool,
 
     /// Current interaction mode (modal keymap state).
@@ -340,7 +346,7 @@ pub struct AppCore {
     pub is_local: bool,
     pub initial_cwd: String,
     pub did_auto_select: bool,
-    /// CLI `--session` flag: auto-attach to a session by name or word_id.
+    /// CLI `--session` flag: auto-attach to a session by name or `word_id`.
     pub auto_session: Option<String>,
     /// Effective cwd from `--cwd` or `:path` in server string.
     pub auto_cwd: Option<String>,
@@ -359,8 +365,10 @@ pub struct AppCore {
     /// Persisted recent-servers cache.
     pub recent_servers: RecentServersCache,
 
-    /// Frontend should schedule a frame.
-    pub needs_render: bool,
+    /// Frontend should schedule a frame. Set through
+    /// [`request_render`](AppCore::request_render) and consumed once per tick by
+    /// [`FrontendDriver::tick`](crate::driver::FrontendDriver::tick).
+    needs_render: bool,
     /// Frontend should perform a full repaint (clear + redraw).
     pub force_clear: bool,
 
@@ -415,6 +423,28 @@ pub struct AppCore {
 }
 
 impl AppCore {
+    /// Ask the frontend for a frame.
+    ///
+    /// Replaces `core.needs_render = true`, which 59 sites across two frontend
+    /// crates used to write by hand — a `pub` field every caller had to remember
+    /// to set, and the single most-poked piece of `AppCore`. The flag is now
+    /// private: it is raised here and lowered once per tick by
+    /// [`FrontendDriver::tick`](crate::driver::FrontendDriver::tick).
+    pub fn request_render(&mut self) {
+        self.needs_render = true;
+    }
+
+    /// Whether a frame is owed. Consumed (and cleared) by the driver's tick.
+    #[must_use]
+    pub fn render_requested(&self) -> bool {
+        self.needs_render
+    }
+
+    /// Take the pending render request, if any.
+    pub(crate) fn take_render_request(&mut self) -> bool {
+        std::mem::take(&mut self.needs_render)
+    }
+
     /// Build the core view-model for a target. `capabilities` is detected by
     /// the frontend (it is terminal/toolkit-specific) and `term_size` is the
     /// frontend's initial content size.
@@ -726,7 +756,7 @@ impl AppCore {
         self.render_frames.push_back(now);
     }
 
-    /// Rendering frames per second over the last [`RENDER_FPS_WINDOW`]. Reflects
+    /// Rendering frames per second over the last `RENDER_FPS_WINDOW`. Reflects
     /// actual repaints (gated by `needs_render`), so it idles near 0 and peaks at
     /// the ~60 Hz pump cap.
     pub fn render_fps(&self) -> u32 {

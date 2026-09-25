@@ -44,3 +44,6 @@ tracing.workspace = true
 thiserror.workspace = true
 # `cli` provides `uniffi_bindgen_main` for the `uniffi-bindgen` binary above.
 uniffi = { workspace = true, features = ["cli"] }
+
+[lints]
+workspace = true

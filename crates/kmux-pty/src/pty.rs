@@ -82,7 +82,7 @@ impl PtyProcess {
                 let master_fd: RawFd = master.into_raw_fd();
                 let io = PtyMasterIo::new(master_fd).map_err(KmuxError::Io)?;
                 let exit_rx = spawn_wait_task(child);
-                Ok(PtyProcess {
+                Ok(Self {
                     io,
                     pid: child,
                     exit_rx,
@@ -149,7 +149,7 @@ impl PtyProcess {
     pub fn from_inherited(fd: std::os::fd::OwnedFd, pid: Pid, size: WindowSize) -> Result<Self> {
         let io = PtyMasterIo::new(fd.into_raw_fd()).map_err(KmuxError::Io)?;
         let exit_rx = crate::process::spawn_kill_poll_task(pid);
-        Ok(PtyProcess {
+        Ok(Self {
             io,
             pid,
             exit_rx,

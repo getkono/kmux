@@ -38,7 +38,7 @@ pub async fn tail_local_log(
     file.read_to_end(&mut buf).await?;
 
     let start = match lines {
-        Some(n) => kmux_protocol::log_tail::last_n_lines_offset(&buf, n),
+        Some(n) => kmux_sys::log_tail::last_n_lines_offset(&buf, n),
         None => 0,
     };
     let mut stdout = io::stdout();

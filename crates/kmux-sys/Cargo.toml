@@ -1,0 +1,68 @@
+[package]
+name = "kmux-sys"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Host-facing side of the protocol stack: XDG path resolution, machine identity, TLS material, and the transport implementations."
+
+[features]
+default = ["framing"]
+# Length-prefixed async framing. Everything here that moves bytes needs it, so
+# it pulls kmux-protocol's codec along.
+framing = ["kmux-protocol/framing", "dep:tokio"]
+# TLS helpers (rustls, rcgen, TOFU store). Pulled in by quic and tcp-tls.
+tls = [
+    "dep:rustls",
+    "dep:rustls-pemfile",
+    "dep:rustls-native-certs",
+    "dep:rcgen",
+    "dep:sha2",
+    "dep:toml",
+]
+# Cryptographic machine/user identity: Ed25519 keypair persistence, fingerprint,
+# sign, and verify (issue #146). Only the keypair logic lives here; the wire
+# fields that carry public keys / signatures / nonces are plain bytes in
+# kmux-protocol and are always compiled.
+identity = ["dep:ring", "dep:sha2"]
+# QUIC transport.
+quic = ["tls", "dep:quinn"]
+# TCP+TLS transport.
+tcp-tls = ["tls", "dep:tokio-rustls", "dep:tokio"]
+# Unix domain socket transport.
+uds = ["dep:tokio"]
+# Gate ClientTransport impls (client-side only builds).
+client = []
+# Gate Listener impls (server-side only builds).
+server = []
+
+[dependencies]
+# The pure half. This direction is the point of the split: wire types and codec
+# know nothing about the filesystem, the network, or crypto, so they stay
+# testable with values alone.
+kmux-protocol.workspace = true
+anyhow.workspace = true
+nix = { workspace = true, features = ["net", "user", "hostname"] }
+serde.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio = { workspace = true, optional = true }
+tokio-rustls = { workspace = true, optional = true }
+quinn = { workspace = true, optional = true }
+# tls feature deps
+rustls = { workspace = true, optional = true }
+rustls-pemfile = { workspace = true, optional = true }
+rustls-native-certs = { workspace = true, optional = true }
+rcgen = { workspace = true, optional = true }
+sha2 = { workspace = true, optional = true }
+# Ed25519 sign/verify for the `identity` feature (issue #146).
+ring = { workspace = true, optional = true }
+toml = { workspace = true, optional = true }
+
+[dev-dependencies]
+tempfile.workspace = true
+
+[lints]
+workspace = true

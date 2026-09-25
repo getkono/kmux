@@ -38,7 +38,7 @@ async fn wait_for_exit(pid: Pid) -> ExitStatus {
     tokio::task::spawn_blocking(move || crate::process::blocking_wait(pid))
         .await
         .ok()
-        .and_then(|r| r.ok())
+        .and_then(std::result::Result::ok)
         .unwrap_or(ExitStatus::Unknown)
 }
 
@@ -100,7 +100,9 @@ mod tests {
         let config = PtyConfig::new("/bin/sleep").args(["999"]);
         let pty = PtyProcess::spawn(&config).expect("spawn");
         let pid = pty.pid;
-        std::mem::forget(pty);
+        // Keep the fd alive without running Drop, so the shutdown path under
+        // test is the only thing signalling the child.
+        let _pty = std::mem::ManuallyDrop::new(pty);
 
         graceful_shutdown_nowait(pid, Some(Duration::from_millis(200)));
 
@@ -108,7 +110,7 @@ mod tests {
         tokio::time::sleep(Duration::from_millis(400)).await;
 
         // Process should be dead: kill(pid, 0) returns ESRCH
-        let alive = nix::sys::signal::kill(pid, None).is_ok();
+        let alive = kill(pid, None).is_ok();
         assert!(
             !alive,
             "process should be dead after graceful_shutdown_nowait"
@@ -124,7 +126,9 @@ mod tests {
         let pty = PtyProcess::spawn(&config).expect("spawn");
         let pid = pty.pid;
         // Prevent the drop impl from racing
-        std::mem::forget(pty);
+        // Keep the fd alive without running Drop, so the shutdown path under
+        // test is the only thing signalling the child.
+        let _pty = std::mem::ManuallyDrop::new(pty);
 
         let status = graceful_shutdown(pid, Some(Duration::from_millis(500))).await;
         assert!(status.is_ok());

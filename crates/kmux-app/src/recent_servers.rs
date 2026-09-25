@@ -30,8 +30,8 @@ impl ServerKind {
     /// internal protocol/test path rather than a launcher option.
     pub fn to_peer_target(&self, accept_invalid_certs: bool) -> Option<PeerTarget> {
         match self {
-            ServerKind::Local => None,
-            ServerKind::Ssh {
+            Self::Local => None,
+            Self::Ssh {
                 user,
                 host,
                 ssh_port,
@@ -122,7 +122,7 @@ impl RecentServersCache {
     }
 
     fn try_load() -> Option<Self> {
-        let path = kmux_protocol::dirs::state_dir().ok()?.join(CACHE_FILE);
+        let path = kmux_sys::dirs::state_dir().ok()?.join(CACHE_FILE);
         let data = std::fs::read_to_string(path).ok()?;
         let servers = parse_servers(&data)?;
         Some(Self { servers })
@@ -132,7 +132,7 @@ impl RecentServersCache {
     ///
     /// Errors are silently ignored — cache loss is non-fatal.
     pub fn save(&self) {
-        let path = match kmux_protocol::dirs::state_dir().map(|d| d.join(CACHE_FILE)) {
+        let path = match kmux_sys::dirs::state_dir().map(|d| d.join(CACHE_FILE)) {
             Ok(p) => p,
             Err(e) => {
                 tracing::trace!("Cache error {e:?}");

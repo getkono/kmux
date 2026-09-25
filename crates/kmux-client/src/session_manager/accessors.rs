@@ -11,12 +11,12 @@ impl SessionManager {
         self.connected
     }
 
-    /// Active session word_id.
+    /// Active session `word_id`.
     pub fn active_session(&self) -> Option<&str> {
         self.active_session.as_deref()
     }
 
-    /// Active pane_id.
+    /// Active `pane_id`.
     pub fn active_pane_id(&self) -> Option<&str> {
         self.active_pane.as_deref()
     }
@@ -106,8 +106,7 @@ impl SessionManager {
     pub fn active_input_locked(&self) -> bool {
         self.active_pane
             .as_ref()
-            .map(|p| self.is_input_locked(p))
-            .unwrap_or(false)
+            .is_some_and(|p| self.is_input_locked(p))
     }
 
     pub fn client_id(&self) -> Option<ClientId> {
@@ -165,8 +164,7 @@ impl SessionManager {
         self.active_session
             .as_ref()
             .and_then(|wid| self.session_list.iter().find(|e| e.meta.word_id == *wid))
-            .map(|e| e.panes.as_slice())
-            .unwrap_or(&[])
+            .map_or(&[][..], |e| e.panes.as_slice())
     }
 
     /// The latest directory listing received from the daemon (in response to

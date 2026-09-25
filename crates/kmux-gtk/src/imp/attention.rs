@@ -52,7 +52,7 @@ pub(super) fn register_window(
             window: window.clone(),
             fe: Rc::downgrade(fe),
             drawing: drawing.clone(),
-        })
+        });
     });
     // Drop the entry when the window closes so a stale window is never a target.
     let win = window.clone();
@@ -139,7 +139,7 @@ fn focus(word_id: &str, pane_id: &str) {
                 .iter()
                 .position(|e| e.meta.word_id == word_id)
             {
-                futures::executor::block_on(f.core.dispatch_action(Action::JumpToSession(idx)));
+                f.core.dispatch_action(Action::JumpToSession(idx));
             }
             // Select the specific pane within the (now active) session.
             let _ = f
@@ -158,8 +158,7 @@ fn select_target<'a>(windows: &'a [WindowEntry], word_id: &str) -> Option<&'a Wi
     let visible: Vec<&WindowEntry> = windows.iter().filter(|e| e.window.is_visible()).collect();
     let shows = |e: &WindowEntry| {
         e.fe.upgrade()
-            .map(|fe| fe.borrow().core.mgr.active_session() == Some(word_id))
-            .unwrap_or(false)
+            .is_some_and(|fe| fe.borrow().core.mgr.active_session() == Some(word_id))
     };
     visible
         .iter()

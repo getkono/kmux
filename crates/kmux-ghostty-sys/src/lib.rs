@@ -349,11 +349,11 @@ mod tests {
     fn struct_layouts_match_wrapper() {
         // Sizes here are the contract the Zig wrapper assumes; changing them
         // requires a coordinated edit on the Zig side.
-        assert_eq!(core::mem::size_of::<KmuxSize>(), 8);
-        assert_eq!(core::mem::size_of::<KmuxCell>(), 16);
-        assert_eq!(core::mem::size_of::<KmuxCursor>(), 8);
-        assert_eq!(core::mem::size_of::<KmuxModes>(), 2);
-        assert_eq!(core::mem::size_of::<KmuxKeyEncodeOptions>(), 8);
+        assert_eq!(size_of::<KmuxSize>(), 8);
+        assert_eq!(size_of::<KmuxCell>(), 16);
+        assert_eq!(size_of::<KmuxCursor>(), 8);
+        assert_eq!(size_of::<KmuxModes>(), 2);
+        assert_eq!(size_of::<KmuxKeyEncodeOptions>(), 8);
     }
 
     /// Out-of-range ordinals must not segfault — the Zig wrapper validates

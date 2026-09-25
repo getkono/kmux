@@ -69,8 +69,8 @@ fn attach_context_menu(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
         if let Some(pane_id) = super::tiles::pane_at(&fe, x, y, area.width(), area.height()) {
             let mut f = fe.borrow_mut();
             if f.core.mgr.active_pane_id() != Some(pane_id.as_str()) {
-                f.core.mgr.focus_pane(pane_id);
-                f.core.needs_render = true;
+                f.core.mgr_mut().focus_pane(pane_id);
+                f.core.request_render();
                 changed = true;
             }
         }
@@ -85,7 +85,7 @@ fn attach_context_menu(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
 
 /// Divider interaction: a hover over a divider shows a resize cursor, and a
 /// primary-button drag on a divider adjusts the owning split's ratios live
-/// (reusing the keyboard-resize wire path, [`SessionManager::set_layout_ratios`]
+/// (reusing the keyboard-resize wire path, [`kmux_client::session_manager::SessionManager::set_layout_ratios`]
 /// via `ratios_for_drag`). Double-click-to-reset and text-selection suppression
 /// on dividers live in [`attach_selection`]'s press handler.
 fn attach_resize(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
@@ -160,8 +160,8 @@ fn attach_resize(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                 return;
             };
             if let Some(ratios) = ratios_for_drag(&layout, &div, pointer_cell) {
-                f.core.mgr.set_layout_ratios(div.path.clone(), ratios);
-                f.core.needs_render = true;
+                f.core.mgr_mut().set_layout_ratios(div.path.clone(), ratios);
+                f.core.request_render();
             }
             drop(f);
             area.queue_draw();
@@ -188,8 +188,8 @@ fn attach_focus_click(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
         if let Some(pane_id) = super::tiles::pane_at(&fe, x, y, w, h) {
             let mut f = fe.borrow_mut();
             if f.core.mgr.active_pane_id() != Some(pane_id.as_str()) {
-                f.core.mgr.focus_pane(pane_id);
-                f.core.needs_render = true;
+                f.core.mgr_mut().focus_pane(pane_id);
+                f.core.request_render();
             }
         }
         area.grab_focus();
@@ -247,8 +247,7 @@ fn attach_scroll(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
 fn pos_at(f: &Frontend, x: f64, y: f64, width_px: i32, height_px: i32) -> Option<GridPos> {
     let grid = f.core.mgr.active_grid()?;
     let (off_c, off_r) = super::tiles::focused_rect(f, width_px, height_px)
-        .map(|r| (r.col as f64, r.row as f64))
-        .unwrap_or((0.0, 0.0));
+        .map_or((0.0, 0.0), |r| (r.col as f64, r.row as f64));
     let col = ((x / f.metrics.cell_w) - off_c).floor().max(0.0) as usize;
     let vr = ((y / f.metrics.cell_h) - off_r).floor().max(0.0) as usize;
     Some(grid.visible_to_abs(vr, col))
@@ -268,8 +267,7 @@ fn viewport_cell(
 ) -> Option<(u16, u16)> {
     let grid = f.core.mgr.active_grid()?;
     let (off_c, off_r) = super::tiles::focused_rect(f, width_px, height_px)
-        .map(|r| (r.col as f64, r.row as f64))
-        .unwrap_or((0.0, 0.0));
+        .map_or((0.0, 0.0), |r| (r.col as f64, r.row as f64));
     let col = (((x / f.metrics.cell_w) - off_c).floor().max(0.0) as usize)
         .min(grid.cols.saturating_sub(1));
     let row = (((y / f.metrics.cell_h) - off_r).floor().max(0.0) as usize)
@@ -303,7 +301,7 @@ struct Drag {
 fn set_selection(fe: &Rc<RefCell<Frontend>>, area: &DrawingArea, sel: Option<Selection>) {
     {
         let mut f = fe.borrow_mut();
-        if let Some(g) = f.core.mgr.active_grid_mut() {
+        if let Some(g) = f.core.mgr_mut().active_grid_mut() {
             g.set_selection(sel);
         }
     }
@@ -345,8 +343,8 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                     if let Some(layout) = f.core.mgr.render_layout()
                         && let Some(ratios) = kmux_app::layout::even_ratios_at(&layout, &div.path)
                     {
-                        f.core.mgr.set_layout_ratios(div.path.clone(), ratios);
-                        f.core.needs_render = true;
+                        f.core.mgr_mut().set_layout_ratios(div.path.clone(), ratios);
+                        f.core.request_render();
                     }
                 }
                 drag.set(None);
@@ -363,7 +361,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                 let mods = mods_from_state(g.current_event_state(), true);
                 let forwarded = {
                     let mut f = fe.borrow_mut();
-                    f.core.mgr.report_mouse(
+                    f.core.mgr_mut().report_mouse(
                         false,
                         MouseEvent {
                             button: MouseButton::Left,
@@ -407,8 +405,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                             .core
                             .mgr
                             .active_grid()
-                            .map(|g| g.find_word_boundaries(pos))
-                            .unwrap_or((pos, pos));
+                            .map_or((pos, pos), |g| g.find_word_boundaries(pos));
                         Selection {
                             anchor: s,
                             end: e,
@@ -417,7 +414,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                     }
                     _ => {
                         drag.set(None);
-                        let cols = f.core.mgr.active_grid().map(|g| g.cols).unwrap_or(1);
+                        let cols = f.core.mgr.active_grid().map_or(1, |g| g.cols);
                         Selection {
                             anchor: GridPos {
                                 row: pos.row,
@@ -448,7 +445,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                 } {
                     let mods = mods_from_state(g.current_event_state(), false);
                     let mut f = fe.borrow_mut();
-                    f.core.mgr.report_mouse(
+                    f.core.mgr_mut().report_mouse(
                         false,
                         MouseEvent {
                             button: MouseButton::Left,
@@ -485,7 +482,7 @@ fn attach_selection(drawing: &DrawingArea, fe: &Rc<RefCell<Frontend>>) {
                 } {
                     let mods = mods_from_state(m.current_event_state(), false);
                     let mut f = fe.borrow_mut();
-                    f.core.mgr.report_mouse(
+                    f.core.mgr_mut().report_mouse(
                         true,
                         MouseEvent {
                             button: MouseButton::Left,
@@ -550,12 +547,10 @@ fn autoscroll_tick(fe: &Rc<RefCell<Frontend>>, area: &DrawingArea, drag: &Rc<Cel
     // Auto-scroll relative to the focused pane's tile, not the whole window, so
     // a drag near a tile edge (mid-window) scrolls correctly.
     let rect = super::tiles::focused_rect(&f, w, h);
-    let off_c = rect.map(|r| r.col as f64).unwrap_or(0.0);
-    let pane_top = rect.map(|r| r.row as f64 * cell_h).unwrap_or(0.0);
-    let pane_bottom = rect
-        .map(|r| (r.row + r.rows) as f64 * cell_h)
-        .unwrap_or(h as f64);
-    let Some(grid) = f.core.mgr.active_grid_mut() else {
+    let off_c = rect.map_or(0.0, |r| r.col as f64);
+    let pane_top = rect.map_or(0.0, |r| r.row as f64 * cell_h);
+    let pane_bottom = rect.map_or(h as f64, |r| (r.row + r.rows) as f64 * cell_h);
+    let Some(grid) = f.core.mgr_mut().active_grid_mut() else {
         return;
     };
     let cols = grid.cols;
@@ -591,21 +586,19 @@ fn scroll_pane(f: &mut Frontend, pane_id: &str, col: u16, row: u16, lines: i32) 
         && f.core
             .mgr
             .buffer(pane_id)
-            .map(|g| g.modes().mouse_report())
-            .unwrap_or(false);
+            .is_some_and(|g| g.modes().mouse_report());
     if use_pty {
         let sgr = f
             .core
             .mgr
             .buffer(pane_id)
-            .map(|g| g.modes().sgr_mouse())
-            .unwrap_or(false);
+            .is_some_and(|g| g.modes().sgr_mouse());
         // 1-based terminal coordinates.
         let bytes = kmux_client::input::encode_mouse_scroll(col + 1, row + 1, lines, sgr);
         if !bytes.is_empty() {
-            f.core.mgr.send_input(bytes);
+            f.core.mgr_mut().send_input(bytes);
         }
-    } else if let Some(grid) = f.core.mgr.buffer_mut(pane_id) {
+    } else if let Some(grid) = f.core.mgr_mut().buffer_mut(pane_id) {
         if lines > 0 {
             grid.scroll_up(lines as usize);
         } else {

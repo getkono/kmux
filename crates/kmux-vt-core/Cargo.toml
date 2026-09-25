@@ -18,3 +18,6 @@ test-util = []
 kmux-protocol.workspace = true
 kmux-ghostty.workspace = true
 tracing.workspace = true
+
+[lints]
+workspace = true

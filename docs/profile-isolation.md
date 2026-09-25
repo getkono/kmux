@@ -15,7 +15,7 @@ profiles share state files, and interference follows:
 
 ## Design
 
-The core mechanism is a single constant in `kmux-protocol::dirs`:
+The core mechanism is a single constant in `kmux-sys::dirs`:
 
 ```rust
 #[cfg(debug_assertions)]
@@ -46,7 +46,7 @@ isolation from it automatically.
 | | `kmux[-debug]/recent_servers.json` | Recent servers UI cache |
 
 Client and daemon compute every path above through the **same**
-`kmux_protocol::dirs` helpers (`runtime_dir` / `socket_path` /
+`kmux_sys::dirs` helpers (`runtime_dir` / `socket_path` /
 `data_socket_path`), namespaced by the compile-time `KMUX_DIR_NAME`
 (`kmux` vs `kmux-debug`), so the two can never disagree on which socket to use —
 a debug client physically cannot reach a release daemon. The
@@ -69,7 +69,7 @@ which profile is running:
 ## Profile matching for local connections
 
 The UDS path is itself the match signal.  When a debug `kmux` calls
-`ensure_daemon()` it queries `kmux_protocol::dirs::socket_path()`, which
+`ensure_daemon()` it queries `kmux_sys::dirs::socket_path()`, which
 resolves to the `kmux-debug` runtime subdirectory.  If no debug daemon is
 listening there, `start_daemon()` spawns one.
 

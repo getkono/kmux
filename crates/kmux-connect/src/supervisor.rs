@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 #[cfg(feature = "remote")]
 use kmux_protocol::messages::{ClientCapabilities, ConnectionId, ServerMessage};
 use kmux_protocol::messages::{ClientMessage, TransportKind};
-use kmux_protocol::transport::bootstrap::EndpointAdvert;
+use kmux_sys::transport::EndpointAdvert;
 use tokio::sync::mpsc;
 #[cfg(feature = "remote")]
 use tokio::sync::oneshot;
@@ -165,8 +165,7 @@ impl TransportScorer {
         if health.failure_count > 0 {
             let in_window = health
                 .last_failure
-                .map(|t| t.elapsed() < FAILURE_WINDOW)
-                .unwrap_or(false);
+                .is_some_and(|t| t.elapsed() < FAILURE_WINDOW);
             if in_window {
                 score -= (health.failure_count as i32) * FAILURE_PENALTY_PER;
             }
@@ -389,7 +388,7 @@ impl TransportSupervisor {
         }
     }
 
-    /// Run the supervisor loop (blocking until upgrade_tx is dropped).
+    /// Run the supervisor loop (blocking until `upgrade_tx` is dropped).
     pub async fn run(mut self) {
         let mut interval = tokio::time::interval(PROBE_INTERVAL);
         interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -750,7 +749,7 @@ fn parse_host_port(address: &str) -> Option<(String, u16)> {
 mod tests {
     use super::*;
     use kmux_protocol::messages::TransportKind;
-    use kmux_protocol::transport::bootstrap::EndpointAdvert;
+    use kmux_sys::transport::EndpointAdvert;
 
     fn make_health(kind: TransportKind) -> EndpointHealth {
         EndpointHealth {

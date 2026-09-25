@@ -221,8 +221,8 @@ fn add_dispatch(
     act.connect_activate(move |_, _| {
         let effects = {
             let mut f = fe.borrow_mut();
-            let e = futures::executor::block_on(f.core.dispatch_action(action.clone()));
-            f.core.needs_render = true;
+            let e = f.core.dispatch_action(action.clone());
+            f.core.request_render();
             e
         };
         apply_effects(&fe, effects, &app, &s.drawing);
@@ -240,8 +240,8 @@ fn add_command(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
         {
             let mut f = fe.borrow_mut();
             if !matches!(f.core.mode, Mode::Command(_)) {
-                f.core.mode = Mode::Command(CommandState::default());
-                f.core.needs_render = true;
+                f.core
+                    .mutate(|c| c.mode = Mode::Command(CommandState::default()));
             }
         }
         s.drawing.queue_draw();
@@ -257,7 +257,7 @@ fn add_open_launcher(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
         {
             let mut f = fe.borrow_mut();
             f.core.apply_top_bar_action(TopBarAction::OpenLaunchPicker);
-            f.core.needs_render = true;
+            f.core.request_render();
         }
         s.drawing.queue_draw();
     });
@@ -278,7 +278,7 @@ fn add_preferences(shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
     let fe = fe.clone();
     let s = shell.clone();
     act.connect_activate(move |_, _| {
-        prefs::open(&fe, &s.drawing);
+        prefs::open(&fe, &s);
     });
     shell.window.add_action(&act);
 }
@@ -385,7 +385,7 @@ fn build_menu() -> gio::Menu {
     menu
 }
 
-/// The keyboard-shortcuts window, built from inline GtkBuilder XML (the standard
+/// The keyboard-shortcuts window, built from inline `GtkBuilder` XML (the standard
 /// way `GtkShortcutsWindow` is described).
 const SHORTCUTS_XML: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
 <interface>

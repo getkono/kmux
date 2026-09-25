@@ -14,7 +14,7 @@ use kmux_client::transport::TransportKind;
 use kmux_protocol::messages::{PeerId, PeerTarget, ServerMessage, SessionEntry};
 use kmux_protocol::pane_word;
 #[cfg(feature = "remote")]
-use kmux_protocol::transport::bootstrap::EndpointAdvert;
+use kmux_sys::transport::EndpointAdvert;
 use std::time::Instant;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -77,119 +77,168 @@ impl AppCore {
     /// only `CopyToClipboard`, from OSC 52 writes honored by the active-session
     /// policy. The frontend applies them with its own clipboard API.
     pub fn handle_session_events(&mut self, events: Vec<SessionEvent>) -> Vec<KeyResult> {
-        let mut effects = Vec::new();
-        for event in events {
-            match event {
-                SessionEvent::AuthFailed { reason } => {
-                    // SSH-only architecture: auth failure on the data plane
-                    // means the SSH tunnel is up but the daemon rejected the
-                    // token. Surface as a disconnect; the user can reconnect.
-                    // Log it too — every other GUI-visible disconnect path emits
-                    // a `warn!`, so this must as well or the overlay shows an
-                    // error with nothing in the client log to explain it.
-                    warn!(%reason, "authentication failed");
-                    self.mode = Mode::Disconnected {
-                        reason: "authentication failed".into(),
-                    };
-                }
-                SessionEvent::AuthOk => {
-                    if matches!(self.mode, Mode::Connecting { .. }) {
-                        self.mode = Mode::Normal;
-                    }
-                    info!("Auth succeeded");
-                    self.write_connection_log();
-                    // Record this server as recently used.
-                    self.recent_servers.record_connection(
-                        &self.server_string.clone(),
-                        &self.server_display.clone(),
-                        self.server_kind.clone(),
-                    );
-                }
-                SessionEvent::SessionListReceived => {
-                    // Update cached session list for current server (self-healing: stale
-                    // sessions that no longer exist on the server are silently dropped).
-                    let live_sessions = self.mgr.session_list().to_vec();
-                    let server_string = self.server_string.clone();
-                    self.recent_servers
-                        .update_sessions(&server_string, &live_sessions);
+        events
+            .into_iter()
+            .filter_map(|event| self.handle_session_event(event))
+            .collect()
+    }
 
-                    if !self.did_auto_select {
-                        self.did_auto_select = true;
-                        self.auto_select_session();
-                    }
-                }
-                SessionEvent::ClipboardCopy {
-                    pane_id,
-                    selection,
-                    data,
-                } => {
-                    if let Some(eff) = osc52_clipboard_effect(
-                        self.mgr.active_session(),
-                        &pane_id,
-                        &selection,
-                        &data,
-                    ) {
-                        effects.push(eff);
-                    }
-                }
-                SessionEvent::PaneAttention {
-                    word_id,
-                    pane_id,
-                    kind,
-                    title,
-                    body,
-                    attention_id,
-                } => {
-                    self.mgr.mark_pane_attention(pane_id.clone());
-                    // Pure relay to the frontend: window selection + dedup is
-                    // toolkit-specific (a frontend owns all its windows), so the
-                    // policy lives there (issue #169).
-                    effects.push(KeyResult::Attention {
-                        word_id,
-                        pane_id,
-                        kind,
-                        title,
-                        body,
-                        attention_id,
-                    });
-                }
-                SessionEvent::PaneBell { .. } => {}
-                SessionEvent::PeerOpened { peer } => {
-                    // The remote is now federated through the local daemon (issue
-                    // #121). Mark it connected, re-arm auto-select, and refresh the
-                    // list so the remote's sessions — not the pre-federation local
-                    // list — drive the picker.
-                    info!(%peer, "federated peer opened");
-                    self.peer_status.insert(peer, RemoteStatus::Connected);
-                    if matches!(self.mode, Mode::Connecting { .. }) {
-                        self.mode = Mode::Normal;
-                    }
-                    self.did_auto_select = false;
-                    self.mgr.request_session_list();
-                }
-                SessionEvent::PeerError { peer, reason } => {
-                    warn!(?peer, %reason, "federated peer failed to open");
-                    // Isolate a launcher-initiated failure to its remote (the row
-                    // shows the error). Only the CLI `--server` peer failing during
-                    // the initial bootstrap still surfaces as a global disconnect —
-                    // there is no other server to fall back to. A failure the daemon
-                    // could not attribute (peer: None) also disconnects globally.
-                    let bootstrapping = matches!(self.mode, Mode::Connecting { .. });
-                    let is_desired = matches!(
-                        (&peer, &self.desired_peer),
-                        (Some(p), Some(t)) if *p == t.peer_id()
-                    );
-                    match peer {
-                        Some(p) if !(bootstrapping && is_desired) => {
-                            self.peer_status.insert(p, RemoteStatus::Error(reason));
-                        }
-                        _ => self.enter_disconnected(DisconnectReason::BootstrapFailed(reason)),
-                    }
-                }
-                _ => {}
+    /// Route one [`SessionEvent`] to its named handler. Arms only destructure
+    /// and call (docs/testing.md R4); every handler returns the router's effect
+    /// type so a test can assert on what an arm decided, not merely that it ran.
+    fn handle_session_event(&mut self, event: SessionEvent) -> Option<KeyResult> {
+        match event {
+            SessionEvent::AuthFailed { reason } => self.on_auth_failed(&reason),
+            SessionEvent::AuthOk => self.on_auth_ok(),
+            SessionEvent::SessionListReceived => self.on_session_list_received(),
+            SessionEvent::ClipboardCopy {
+                pane_id,
+                selection,
+                data,
+            } => osc52_clipboard_effect(self.mgr.active_session(), &pane_id, &selection, &data),
+            SessionEvent::PaneAttention {
+                word_id,
+                pane_id,
+                kind,
+                title,
+                body,
+                attention_id,
+            } => self.on_pane_attention(word_id, pane_id, kind, title, body, attention_id),
+            SessionEvent::PaneFaulted { pane_id } => self.on_pane_faulted(&pane_id),
+            SessionEvent::KickedFromSession { word_id, by_label } => {
+                self.on_kicked_from_session(&word_id, &by_label)
             }
+            SessionEvent::PeerOpened { peer } => self.on_peer_opened(peer),
+            SessionEvent::PeerError { peer, reason } => self.on_peer_error(peer, reason),
+            _ => None,
         }
-        effects
+    }
+
+    /// SSH-only architecture: auth failure on the data plane means the SSH
+    /// tunnel is up but the daemon rejected the token. Surface as a disconnect;
+    /// the user can reconnect. Log it too — every other GUI-visible disconnect
+    /// path emits a `warn!`, so this must as well or the overlay shows an error
+    /// with nothing in the client log to explain it.
+    fn on_auth_failed(&mut self, reason: &str) -> Option<KeyResult> {
+        warn!(%reason, "authentication failed");
+        self.mode = Mode::Disconnected {
+            reason: "authentication failed".into(),
+        };
+        None
+    }
+
+    fn on_auth_ok(&mut self) -> Option<KeyResult> {
+        if matches!(self.mode, Mode::Connecting { .. }) {
+            self.mode = Mode::Normal;
+        }
+        info!("Auth succeeded");
+        self.write_connection_log();
+        // Record this server as recently used.
+        self.recent_servers.record_connection(
+            &self.server_string.clone(),
+            &self.server_display.clone(),
+            self.server_kind.clone(),
+        );
+        None
+    }
+
+    /// Update the cached session list for the current server (self-healing:
+    /// stale sessions that no longer exist on the server are silently dropped),
+    /// then run auto-select once.
+    fn on_session_list_received(&mut self) -> Option<KeyResult> {
+        let live_sessions = self.mgr.session_list().to_vec();
+        let server_string = self.server_string.clone();
+        self.recent_servers
+            .update_sessions(&server_string, &live_sessions);
+
+        if !self.did_auto_select {
+            self.did_auto_select = true;
+            self.auto_select_session();
+        }
+        None
+    }
+
+    /// Mark the pane unread, then relay to the frontend: window selection and
+    /// dedup are toolkit-specific (a frontend owns all its windows), so that
+    /// policy lives there (issue #169).
+    fn on_pane_attention(
+        &mut self,
+        word_id: String,
+        pane_id: String,
+        kind: kmux_protocol::messages::AttentionKind,
+        title: String,
+        body: String,
+        attention_id: u64,
+    ) -> Option<KeyResult> {
+        self.mgr.mark_pane_attention(pane_id.clone());
+        Some(KeyResult::Attention {
+            word_id,
+            pane_id,
+            kind,
+            title,
+            body,
+            attention_id,
+        })
+    }
+
+    /// Issue #126's user-facing half. The pane's shell survived — the daemon
+    /// holds the PTY master fd and is respawning the worker, which resyncs the
+    /// grid — so this is a transient notice, not a disconnect and not an exit.
+    /// Without it the pane simply freezes and then repaints with no explanation.
+    fn on_pane_faulted(&mut self, pane_id: &str) -> Option<KeyResult> {
+        warn!(%pane_id, "pane VT worker crashed; recovering");
+        self.mgr.set_status_msg(format!(
+            "Pane '{pane_id}' is recovering (its terminal engine crashed)"
+        ));
+        None
+    }
+
+    /// Issue #146. [`kmux_client::session_manager::SessionManager`] has already
+    /// dropped the session's grids — the daemon detached us from every one of
+    /// its pane relays, so no further frame is coming — and moved the view to
+    /// another session if there was one. All that is left is telling the user,
+    /// which nothing did: this event used to fall into the router's catch-all
+    /// and a kicked GUI just froze on the session's last frame.
+    fn on_kicked_from_session(&mut self, word_id: &str, by_label: &str) -> Option<KeyResult> {
+        warn!(%word_id, %by_label, "kicked from session");
+        self.mgr
+            .set_status_msg(format!("Kicked from '{word_id}' by {by_label}"));
+        None
+    }
+
+    /// The remote is now federated through the local daemon (issue #121). Mark
+    /// it connected, re-arm auto-select, and refresh the list so the remote's
+    /// sessions — not the pre-federation local list — drive the picker.
+    fn on_peer_opened(&mut self, peer: String) -> Option<KeyResult> {
+        info!(%peer, "federated peer opened");
+        self.peer_status.insert(peer, RemoteStatus::Connected);
+        if matches!(self.mode, Mode::Connecting { .. }) {
+            self.mode = Mode::Normal;
+        }
+        self.did_auto_select = false;
+        self.mgr.request_session_list();
+        None
+    }
+
+    /// Isolate a launcher-initiated failure to its remote (the row shows the
+    /// error). Only the CLI `--server` peer failing during the initial bootstrap
+    /// still surfaces as a global disconnect — there is no other server to fall
+    /// back to. A failure the daemon could not attribute (`peer: None`) also
+    /// disconnects globally.
+    fn on_peer_error(&mut self, peer: Option<String>, reason: String) -> Option<KeyResult> {
+        warn!(?peer, %reason, "federated peer failed to open");
+        let bootstrapping = matches!(self.mode, Mode::Connecting { .. });
+        let is_desired = matches!(
+            (&peer, &self.desired_peer),
+            (Some(p), Some(t)) if *p == t.peer_id()
+        );
+        match peer {
+            Some(p) if !(bootstrapping && is_desired) => {
+                self.peer_status.insert(p, RemoteStatus::Error(reason));
+            }
+            _ => self.enter_disconnected(DisconnectReason::BootstrapFailed(reason)),
+        }
+        None
     }
 
     /// Auto-select or create a session based on CLI flags (--session, --cwd, :path).
@@ -265,10 +314,10 @@ impl AppCore {
     /// 3. one [`DirBrowserRow::Enter`] per subdirectory whose name contains the
     ///    case-insensitive filter [`dir_picker_buffer`](AppCore::dir_picker_buffer).
     ///
-    /// The entries/parent come from [`SessionManager::dir_listing`]; until the
-    /// first listing arrives only CreateHere is shown. Any listing `error` is
+    /// The entries/parent come from [`kmux_client::session_manager::SessionManager::dir_listing`]; until the
+    /// first listing arrives only `CreateHere` is shown. Any listing `error` is
     /// surfaced separately by [`AppCore::dir_browser_error`]; the rows still
-    /// include CreateHere (+ Up when known) so the user can always recover.
+    /// include `CreateHere` (+ Up when known) so the user can always recover.
     pub fn dir_browser_rows(&self) -> Vec<DirBrowserRow> {
         // Prefer the daemon's *canonical* listed path for "create here" so the
         // session is created in the directory actually resolved (which may
@@ -277,8 +326,7 @@ impl AppCore {
         let create_cwd = self
             .mgr
             .dir_listing()
-            .map(|l| l.path.clone())
-            .unwrap_or_else(|| self.dir_browser_cwd.clone());
+            .map_or_else(|| self.dir_browser_cwd.clone(), |l| l.path.clone());
         let mut rows = vec![DirBrowserRow::CreateHere { cwd: create_cwd }];
         let Some(listing) = self.mgr.dir_listing() else {
             return rows;
@@ -356,7 +404,7 @@ impl AppCore {
     pub fn launch_rows(&self) -> Vec<LaunchRow> {
         let q = self.launch_search.to_lowercase();
         let matches = |s: &str| q.is_empty() || s.to_lowercase().contains(&q);
-        let active = self.mgr.active_session().map(|s| s.to_string());
+        let active = self.mgr.active_session().map(ToString::to_string);
         let is_active = |word_id: &str| active.as_deref() == Some(word_id);
 
         let mut rows = Vec::new();
@@ -448,7 +496,7 @@ impl AppCore {
     }
 
     /// Returns sessions matching the current `session_picker_search` text
-    /// (case-insensitive on display name or word_id). An empty search matches
+    /// (case-insensitive on display name or `word_id`). An empty search matches
     /// every session. Shared by the session-picker overlay, its navigation
     /// bounds, and the Enter/click selection so the filter has one definition.
     pub fn session_picker_matches(&self) -> Vec<&SessionEntry> {
@@ -604,7 +652,7 @@ impl AppCore {
         };
 
         self.mode = Mode::Connecting { target_display };
-        self.needs_render = true;
+        self.request_render();
 
         // Store a clone of the sender so the run loop's outcome arm can
         // pass it to `launch_ssh_supervisor` for SSH targets.
@@ -710,7 +758,7 @@ impl AppCore {
     /// connected (drop it explicitly via disconnect).
     pub fn collapse_remote(&mut self, peer: &str) {
         self.launch_expanded.remove(peer);
-        let active = self.mgr.active_session().map(|s| s.to_string());
+        let active = self.mgr.active_session().map(ToString::to_string);
         let in_use = self.mgr.session_list().iter().any(|e| {
             e.peer.as_deref() == Some(peer) && active.as_deref() == Some(e.meta.word_id.as_str())
         });
@@ -874,7 +922,7 @@ mod tests {
     fn federate_desired_peer_sends_open_peer_to_the_daemon() {
         use kmux_protocol::messages::ClientMessage;
         let mut core = fixture_core();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         core.mgr.set_ws_sender(tx);
         core.desired_peer = Some(PeerTarget::Ssh {
             user: Some("alice".into()),
@@ -901,7 +949,7 @@ mod tests {
     fn federate_desired_peer_is_a_noop_without_a_peer() {
         use kmux_protocol::messages::ClientMessage;
         let mut core = fixture_core();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         core.mgr.set_ws_sender(tx);
         core.desired_peer = None;
 
@@ -916,7 +964,7 @@ mod tests {
     fn peer_opened_rearms_auto_select_and_refreshes_list() {
         use kmux_protocol::messages::ClientMessage;
         let mut core = fixture_core();
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel();
         core.mgr.set_ws_sender(tx);
         core.did_auto_select = true; // suppressed at launch
         core.mode = Mode::Connecting {
@@ -934,6 +982,176 @@ mod tests {
         assert!(
             saw_list,
             "PeerOpened must refresh the federated session list"
+        );
+    }
+
+    #[test]
+    fn auth_failed_enters_disconnected() {
+        let mut core = fixture_core();
+        core.mode = Mode::Connecting {
+            target_display: "box".into(),
+        };
+
+        let effects = core.handle_session_events(vec![SessionEvent::AuthFailed {
+            reason: "bad token".into(),
+        }]);
+
+        assert!(effects.is_empty(), "no frontend effect: {effects:?}");
+        assert!(
+            matches!(&core.mode, Mode::Disconnected { reason } if reason == "authentication failed"),
+            "{:?}",
+            core.mode
+        );
+    }
+
+    // `#[tokio::test]`: `on_auth_ok` records the server in `recent_servers`,
+    // which spawns its persistence task — the pure tier cannot host that.
+    #[tokio::test]
+    async fn auth_ok_leaves_the_connecting_overlay() {
+        let mut core = fixture_core();
+        core.mode = Mode::Connecting {
+            target_display: "box".into(),
+        };
+
+        let effects = core.handle_session_events(vec![SessionEvent::AuthOk]);
+
+        assert!(effects.is_empty(), "no frontend effect: {effects:?}");
+        assert!(matches!(core.mode, Mode::Normal), "{:?}", core.mode);
+    }
+
+    #[tokio::test]
+    async fn auth_ok_does_not_disturb_a_mode_other_than_connecting() {
+        // A re-auth on a reconnect must not throw the user out of whatever view
+        // they had open.
+        let mut core = fixture_core();
+        core.mode = Mode::SessionPicker;
+
+        core.handle_session_events(vec![SessionEvent::AuthOk]);
+
+        assert!(matches!(core.mode, Mode::SessionPicker), "{:?}", core.mode);
+    }
+
+    // `#[tokio::test]`: the arm writes through `recent_servers`, whose
+    // persistence task needs a reactor.
+    #[tokio::test]
+    async fn session_list_received_runs_auto_select_exactly_once() {
+        let mut core = fixture_core();
+        assert!(!core.did_auto_select);
+
+        let effects = core.handle_session_events(vec![SessionEvent::SessionListReceived]);
+
+        assert!(effects.is_empty(), "no frontend effect: {effects:?}");
+        assert!(
+            core.did_auto_select,
+            "the first list arms auto-select and latches it"
+        );
+
+        // A later refresh must not re-run it, or every list would yank the view.
+        core.mode = Mode::SessionPicker;
+        core.handle_session_events(vec![SessionEvent::SessionListReceived]);
+        assert!(matches!(core.mode, Mode::SessionPicker), "{:?}", core.mode);
+    }
+
+    #[test]
+    fn clipboard_copy_from_the_active_session_yields_the_decoded_text() {
+        let mut core = fixture_core();
+        core.mgr.active_session = Some("eagle".into());
+
+        let effects = core.handle_session_events(vec![SessionEvent::ClipboardCopy {
+            pane_id: "eagle/0".into(),
+            selection: "c".into(),
+            // "hi" in base64.
+            data: "aGk=".into(),
+        }]);
+
+        assert_eq!(
+            effects,
+            vec![KeyResult::CopyToClipboard("hi".into())],
+            "OSC 52 from the viewed session reaches the frontend"
+        );
+    }
+
+    #[test]
+    fn clipboard_copy_from_another_session_is_dropped() {
+        // The daemon broadcasts OSC 52 server-wide, so scoping to the viewed
+        // session is what stops a background pane clobbering the clipboard.
+        let mut core = fixture_core();
+        core.mgr.active_session = Some("eagle".into());
+
+        let effects = core.handle_session_events(vec![SessionEvent::ClipboardCopy {
+            pane_id: "otter/0".into(),
+            selection: "c".into(),
+            data: "aGk=".into(),
+        }]);
+
+        assert!(effects.is_empty(), "{effects:?}");
+    }
+
+    #[test]
+    fn pane_attention_marks_the_pane_and_relays_the_notification() {
+        use kmux_protocol::messages::AttentionKind;
+        let mut core = fixture_core();
+
+        let effects = core.handle_session_events(vec![SessionEvent::PaneAttention {
+            word_id: "eagle".into(),
+            pane_id: "eagle/0".into(),
+            kind: AttentionKind::TurnDone,
+            title: "kmux".into(),
+            body: "done".into(),
+            attention_id: 42,
+        }]);
+
+        assert_eq!(
+            effects,
+            vec![KeyResult::Attention {
+                word_id: "eagle".into(),
+                pane_id: "eagle/0".into(),
+                kind: AttentionKind::TurnDone,
+                title: "kmux".into(),
+                body: "done".into(),
+                attention_id: 42,
+            }],
+            "window choice and dedup are the frontend's, so this is a pure relay"
+        );
+        assert!(
+            core.mgr.pane_needs_attention("eagle/0"),
+            "the tab marker and the notification stay one decision"
+        );
+    }
+
+    #[test]
+    fn kicked_from_session_names_the_session_and_who_did_it() {
+        // Issue #146: this event used to fall into the catch-all, so a kicked
+        // GUI froze on the session's last frame with nothing said.
+        let mut core = fixture_core();
+
+        let effects = core.handle_session_events(vec![SessionEvent::KickedFromSession {
+            word_id: "eagle".into(),
+            by_label: "someone@else".into(),
+        }]);
+
+        assert!(effects.is_empty(), "no frontend effect: {effects:?}");
+        assert_eq!(core.mgr.status_msg(), "Kicked from 'eagle' by someone@else");
+    }
+
+    #[test]
+    fn pane_faulted_reports_recovery_rather_than_an_exit() {
+        // Issue #126: the shell survives and the daemon respawns the worker, so
+        // this must not look like a disconnect.
+        let mut core = fixture_core();
+
+        let effects = core.handle_session_events(vec![SessionEvent::PaneFaulted {
+            pane_id: "eagle/0".into(),
+        }]);
+
+        assert!(effects.is_empty(), "no frontend effect: {effects:?}");
+        assert_eq!(
+            core.mgr.status_msg(),
+            "Pane 'eagle/0' is recovering (its terminal engine crashed)"
+        );
+        assert!(
+            !matches!(core.mode, Mode::Disconnected { .. }),
+            "a worker crash is not a disconnect"
         );
     }
 
@@ -987,6 +1205,10 @@ mod tests {
 
     // Async: submit_add_remote persists the SSH remote via record_connection,
     // whose save() spawns a blocking task that needs a runtime.
+    // Stays a `#[tokio::test]` although nothing here awaits: `add_remote`
+    // records the server, and `RecentServers::save` writes the cache from a
+    // `spawn_blocking`, which needs an ambient runtime. `dispatch_action` being
+    // synchronous does not make it runtime-free.
     #[tokio::test]
     async fn add_remote_ssh_registers_records_and_connects() {
         let (mut core, mut rx) = connected_core();
@@ -1011,6 +1233,70 @@ mod tests {
             }
         }
         assert!(saw_open, "adding a remote must connect to it");
+    }
+
+    #[test]
+    fn peer_error_on_the_bootstrap_target_still_disconnects_globally() {
+        // The CLI `--server` peer failing during the initial bootstrap is the one
+        // attributed failure with nowhere to fall back to.
+        let mut core = fixture_core();
+        core.mode = Mode::Connecting {
+            target_display: "box".into(),
+        };
+        let target = PeerTarget::Ssh {
+            user: Some("alice".into()),
+            host: "box".into(),
+            ssh_port: None,
+            accept_invalid_certs: false,
+        };
+        let peer_id = target.peer_id();
+        core.desired_peer = Some(target);
+
+        core.handle_session_events(vec![SessionEvent::PeerError {
+            peer: Some(peer_id.clone()),
+            reason: "ssh: auth failed".into(),
+        }]);
+
+        match &core.mode {
+            Mode::Disconnected { reason } => assert!(reason.contains("ssh: auth failed")),
+            other => panic!("expected Disconnected, got {other:?}"),
+        }
+        assert!(
+            !core.peer_status.contains_key(&peer_id),
+            "a global disconnect does not also mark the row"
+        );
+    }
+
+    #[test]
+    fn peer_error_on_another_peer_while_bootstrapping_stays_isolated() {
+        // Bootstrapping alone is not enough: only the peer the bootstrap is
+        // *waiting on* tears the client down. Any other remote failing at the
+        // same time is still just a bad row in the launcher.
+        let mut core = fixture_core();
+        core.mode = Mode::Connecting {
+            target_display: "box".into(),
+        };
+        core.desired_peer = Some(PeerTarget::Ssh {
+            user: Some("alice".into()),
+            host: "box".into(),
+            ssh_port: None,
+            accept_invalid_certs: false,
+        });
+
+        core.handle_session_events(vec![SessionEvent::PeerError {
+            peer: Some("bob@other".into()),
+            reason: "ssh: connect timeout".into(),
+        }]);
+
+        assert!(
+            !matches!(core.mode, Mode::Disconnected { .. }),
+            "an unrelated remote must not abort the bootstrap: {:?}",
+            core.mode
+        );
+        assert_eq!(
+            core.peer_status.get("bob@other"),
+            Some(&RemoteStatus::Error("ssh: connect timeout".into()))
+        );
     }
 
     #[test]
@@ -1252,8 +1538,8 @@ mod tests {
         );
     }
 
-    #[tokio::test]
-    async fn submit_create_here_sends_session_create_with_browsed_cwd() {
+    #[test]
+    fn submit_create_here_sends_session_create_with_browsed_cwd() {
         let (mut core, mut rx) = connected_core();
         core.open_directory_browser();
         deliver_listing(&mut core, "/srv/app", Some("/srv"), &["sub"]);
@@ -1261,7 +1547,7 @@ mod tests {
 
         // Row 0 is CreateHere; submit it.
         core.dir_picker_selected = 0;
-        core.dispatch_action(Action::DirPickerSubmit).await;
+        core.dispatch_action(Action::DirPickerSubmit);
 
         assert_eq!(core.mode, Mode::Normal);
         match rx.try_recv().expect("a session create was sent") {
@@ -1272,8 +1558,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn submit_subdir_requests_new_listing_and_keeps_browser_open() {
+    #[test]
+    fn submit_subdir_requests_new_listing_and_keeps_browser_open() {
         let (mut core, mut rx) = connected_core();
         core.open_directory_browser();
         deliver_listing(&mut core, "/home/user", Some("/home"), &["dev"]);
@@ -1281,7 +1567,7 @@ mod tests {
 
         // Select the "dev" Enter row (row 2: CreateHere, Up, dev) and submit.
         core.dir_picker_selected = 2;
-        core.dispatch_action(Action::DirPickerSubmit).await;
+        core.dispatch_action(Action::DirPickerSubmit);
 
         // Navigation keeps the browser open and re-targets the browse dir.
         assert_eq!(core.mode, Mode::DirectoryPicker);
@@ -1292,15 +1578,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn submit_up_navigates_to_parent() {
+    #[test]
+    fn submit_up_navigates_to_parent() {
         let (mut core, mut rx) = connected_core();
         core.open_directory_browser();
         deliver_listing(&mut core, "/home/user", Some("/home"), &["dev"]);
         while rx.try_recv().is_ok() {}
 
         core.dir_picker_selected = 1; // the Up row
-        core.dispatch_action(Action::DirPickerSubmit).await;
+        core.dispatch_action(Action::DirPickerSubmit);
 
         assert_eq!(core.mode, Mode::DirectoryPicker);
         assert_eq!(core.dir_browser_cwd, "/home");
@@ -1310,8 +1596,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn submit_typed_absolute_path_navigates_when_unmatched() {
+    #[test]
+    fn submit_typed_absolute_path_navigates_when_unmatched() {
         let (mut core, mut rx) = connected_core();
         core.open_directory_browser();
         deliver_listing(&mut core, "/home/user", Some("/home"), &["dev"]);
@@ -1321,7 +1607,7 @@ mod tests {
         // CreateHere (row 0) is selected: the browser navigates to the typed path.
         core.dir_picker_selected = 0;
         core.dir_picker_buffer = "/var/log".into();
-        core.dispatch_action(Action::DirPickerSubmit).await;
+        core.dispatch_action(Action::DirPickerSubmit);
 
         assert_eq!(core.mode, Mode::DirectoryPicker);
         assert_eq!(core.dir_browser_cwd, "/var/log");
@@ -1334,8 +1620,8 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn create_session_action_uses_active_session_cwd() {
+    #[test]
+    fn create_session_action_uses_active_session_cwd() {
         let (mut core, mut rx) = connected_core();
         core.initial_cwd = "/fallback".into();
         core.mgr
@@ -1344,7 +1630,7 @@ mod tests {
         core.mgr.select_session("eagle".into());
         while rx.try_recv().is_ok() {}
 
-        core.dispatch_action(Action::CreateSession).await;
+        core.dispatch_action(Action::CreateSession);
 
         match rx.try_recv().expect("a session create was sent") {
             ClientMessage::SessionCreate { cwd, .. } => {
@@ -1354,15 +1640,15 @@ mod tests {
         }
     }
 
-    #[tokio::test]
-    async fn create_session_action_falls_back_to_initial_cwd() {
+    #[test]
+    fn create_session_action_falls_back_to_initial_cwd() {
         let (mut core, mut rx) = connected_core();
         core.initial_cwd = "/fallback".into();
         while rx.try_recv().is_ok() {}
 
         // No active session: the action must still carry an explicit cwd rather
         // than letting the daemon resolve a bare path against its own cwd.
-        core.dispatch_action(Action::CreateSession).await;
+        core.dispatch_action(Action::CreateSession);
 
         match rx.try_recv().expect("a session create was sent") {
             ClientMessage::SessionCreate { cwd, .. } => {

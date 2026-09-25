@@ -3,7 +3,7 @@
 //! survive a planned restart (issue #35).
 //!
 //! The two daemons exchange [`HandoffMessage`] frames over a dedicated Unix
-//! socket ([`dirs::handoff_socket_path`]); the only payload carried out-of-band
+//! socket ([`kmux_sys::dirs::Dirs::handoff_socket_path`]); the only payload carried out-of-band
 //! is the PTY master fd, delivered via `SCM_RIGHTS` ancillary data. Because the
 //! successor receives its own `dup` of the same open file description, the child
 //! keeps its controlling terminal across the handoff and is merely reparented to
@@ -59,7 +59,7 @@ pub(crate) async fn write_frame(
         .async_io(Interest::WRITABLE, || {
             let iov = [io::IoSlice::new(&frame)];
             let cmsg_buf;
-            let cmsgs: &[ControlMessage] = if let Some(arr) = &fds {
+            let cmsgs: &[ControlMessage<'_>] = if let Some(arr) = &fds {
                 cmsg_buf = [ControlMessage::ScmRights(arr.as_slice())];
                 &cmsg_buf
             } else {
@@ -88,6 +88,10 @@ pub(crate) async fn read_frame(
 ) -> io::Result<(HandoffMessage, Option<OwnedFd>)> {
     let mut acc: Vec<u8> = Vec::new();
     let mut fd: Option<OwnedFd> = None;
+    // One heap buffer for the whole read, not a 64 KiB stack array rebuilt on
+    // every iteration: this lives inside an async fn, so a stack array of this
+    // size lands in the future itself.
+    let mut buf = vec![0u8; 65536];
 
     loop {
         if acc.len() >= 4 {
@@ -99,7 +103,6 @@ pub(crate) async fn read_frame(
             }
         }
 
-        let mut buf = [0u8; 65536];
         let mut cmsg = nix::cmsg_space!(RawFd);
         let (n, got_fd) = stream
             .async_io(Interest::READABLE, || {

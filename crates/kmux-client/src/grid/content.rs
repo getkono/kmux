@@ -96,7 +96,7 @@ impl GridContent {
 
     /// The `cells_generation` at which live `row` last changed (0 if never, or
     /// out of range). A renderer reuses a row's cached geometry while this is
-    /// unchanged. See [`row_gens`](Self::row_gens).
+    /// unchanged. See `row_gens`.
     pub fn row_generation(&self, row: usize) -> u64 {
         self.row_gens.get(row).copied().unwrap_or(0)
     }
@@ -321,16 +321,16 @@ impl GridContent {
         let new_count = lines.len();
         let old_len = self.scrollback.len();
         let ok = self.scrollback.append_with_index(first_index, lines);
-        let fixup = if !ok {
-            self.scrollback.clear();
-            ScrollbackFixup::Cleared
-        } else {
+        let fixup = if ok {
             let new_len = self.scrollback.len();
             let evicted = (old_len + new_count).saturating_sub(new_len);
             ScrollbackFixup::Shifted {
                 evicted,
                 net: new_count - evicted,
             }
+        } else {
+            self.scrollback.clear();
+            ScrollbackFixup::Cleared
         };
         self.maybe_clear_history_gap();
         self.cells_generation += 1;
@@ -469,7 +469,7 @@ impl GridContent {
 
     /// Find word boundaries around `pos` for double-click selection.
     pub fn find_word_boundaries(&self, pos: GridPos) -> (GridPos, GridPos) {
-        let ch = self.cell_at(pos).map(|c| c.c).unwrap_or(' ');
+        let ch = self.cell_at(pos).map_or(' ', |c| c.c);
         let is_word = |c: char| c.is_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~');
 
         if is_word(ch) {
@@ -479,7 +479,7 @@ impl GridContent {
                     row: pos.row,
                     col: start_col - 1,
                 };
-                if self.cell_at(prev).map(|c| is_word(c.c)).unwrap_or(false) {
+                if self.cell_at(prev).is_some_and(|c| is_word(c.c)) {
                     start_col -= 1;
                 } else {
                     break;
@@ -491,8 +491,7 @@ impl GridContent {
             let max_col = if pos.row < self.scrollback.len() {
                 self.scrollback
                     .get(pos.row)
-                    .map(|l| effective_line_len(l).saturating_sub(1))
-                    .unwrap_or(0)
+                    .map_or(0, |l| effective_line_len(l).saturating_sub(1))
             } else {
                 self.cols.saturating_sub(1)
             };
@@ -502,7 +501,7 @@ impl GridContent {
                     row: pos.row,
                     col: end_col + 1,
                 };
-                if self.cell_at(next).map(|c| is_word(c.c)).unwrap_or(false) {
+                if self.cell_at(next).is_some_and(|c| is_word(c.c)) {
                     end_col += 1;
                 } else {
                     break;

@@ -10,7 +10,7 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ConnectionId, ServerMessage};
-use kmux_protocol::transport::bootstrap::EndpointAdvert;
+use kmux_sys::transport::EndpointAdvert;
 use thiserror::Error;
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::timeout;
@@ -51,8 +51,8 @@ pub enum ResolvedTarget {
 impl ResolvedTarget {
     pub fn label(&self) -> String {
         match self {
-            ResolvedTarget::LocalDaemon => "local-daemon".to_string(),
-            ResolvedTarget::Ssh { target, .. } => match &target.user {
+            Self::LocalDaemon => "local-daemon".to_string(),
+            Self::Ssh { target, .. } => match &target.user {
                 Some(u) => format!("ssh {u}@{}", target.host),
                 None => format!("ssh {}", target.host),
             },
@@ -87,7 +87,7 @@ pub struct BootstrapOutcome {
     pub connection_id: ConnectionId,
     pub server_version: Option<String>,
     pub is_local: bool,
-    /// `Some` for SSH targets; `None` for LocalDaemon / Direct.
+    /// `Some` for SSH targets; `None` for `LocalDaemon` / Direct.
     pub ssh_context: Option<SshContext>,
     pub bootstrap_elapsed: Duration,
 }
@@ -360,7 +360,7 @@ pub async fn run_bootstrap(
 async fn prepare_local_daemon(
     observer: &dyn BootstrapObserver,
 ) -> Result<ConnectPlan, BootstrapError> {
-    let socket = kmux_protocol::dirs::socket_path()
+    let socket = kmux_sys::dirs::socket_path()
         .map_err(|e| BootstrapError::DaemonStart(format!("socket path: {e}")))?;
     observer.on_event(&BootstrapEvent::DaemonQuery { socket: &socket });
 
@@ -389,10 +389,10 @@ async fn prepare_local_daemon(
     {
         return Err(BootstrapError::VersionMismatch {
             client: kmux_protocol::messages::PROTOCOL_RANGE.to_string(),
-            server: status
-                .protocol_range
-                .map(|range| range.to_string())
-                .unwrap_or_else(|| format!("legacy-{}", status.protocol_version)),
+            server: status.protocol_range.map_or_else(
+                || format!("legacy-{}", status.protocol_version),
+                |range| range.to_string(),
+            ),
         });
     }
 
@@ -485,9 +485,8 @@ async fn establish(
 ) -> Result<(mpsc::UnboundedSender<ClientMessage>, AuthOutcome), BootstrapError> {
     let uds_path_str;
     let (hs_host, hs_port): (&str, u16) = if plan.transport == TransportKind::Uds {
-        uds_path_str = kmux_protocol::dirs::data_socket_path()
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_else(|_| "?".to_string());
+        uds_path_str = kmux_sys::dirs::data_socket_path()
+            .map_or_else(|_| "?".to_string(), |p| p.to_string_lossy().into_owned());
         (&uds_path_str, 0)
     } else {
         (&plan.host, plan.port)
@@ -504,7 +503,7 @@ async fn establish(
     let sender_result = match plan.transport {
         TransportKind::Uds => {
             let socket_path =
-                kmux_protocol::dirs::data_socket_path().map_err(|e| BootstrapError::Connect {
+                kmux_sys::dirs::data_socket_path().map_err(|e| BootstrapError::Connect {
                     strategy: "uds",
                     error: format!("data socket path: {e}"),
                 })?;

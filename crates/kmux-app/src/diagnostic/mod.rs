@@ -4,13 +4,13 @@
 //! running an automated emitter that paints a known terminal pattern (a glyph
 //! grid, attribute matrix, color ramps, box-drawing…), so a human can visually
 //! verify that the renderer-under-test draws it correctly. It complements the
-//! [render-debug](super::core::render_debug) tooling, which shows what the
+//! [render-debug](crate::core::RenderDebugSnapshot) tooling, which shows what the
 //! renderer was *handed*; this feeds it a *known input*.
 //!
 //! The emitter is the `kmux` binary itself in a hidden mode
-//! (`kmux diagnostic <test> --emit`): it writes [`patterns::pattern_bytes`] to
+//! (`kmux diagnostic <test> --emit`): it writes [`crate::diagnostic::pattern_bytes`] to
 //! stdout, then blocks on stdin so the pane stays visible. Both frontends resolve
-//! the same launch command via [`session_command`], so the pattern bytes have a
+//! the same launch command via [`crate::diagnostic::session_command`], so the pattern bytes have a
 //! single source of truth. Scope is the local daemon (the just-launched `kmux`
 //! binary is present and locatable on the daemon host).
 
@@ -47,46 +47,46 @@ pub enum DiagnosticTest {
 impl DiagnosticTest {
     /// The concrete patterns, in display order (excludes [`Self::All`], which is
     /// their concatenation).
-    pub const EACH: [DiagnosticTest; 5] = [
-        DiagnosticTest::Glyphs,
-        DiagnosticTest::Attrs,
-        DiagnosticTest::Colors,
-        DiagnosticTest::Unicode,
-        DiagnosticTest::Boxes,
+    pub const EACH: [Self; 5] = [
+        Self::Glyphs,
+        Self::Attrs,
+        Self::Colors,
+        Self::Unicode,
+        Self::Boxes,
     ];
 
     /// The kebab-case name used on the CLI and as the `--emit` argument.
     pub fn name(self) -> &'static str {
         match self {
-            DiagnosticTest::Glyphs => "glyphs",
-            DiagnosticTest::Attrs => "attrs",
-            DiagnosticTest::Colors => "colors",
-            DiagnosticTest::Unicode => "unicode",
-            DiagnosticTest::Boxes => "boxes",
-            DiagnosticTest::Progress => "progress",
-            DiagnosticTest::All => "all",
+            Self::Glyphs => "glyphs",
+            Self::Attrs => "attrs",
+            Self::Colors => "colors",
+            Self::Unicode => "unicode",
+            Self::Boxes => "boxes",
+            Self::Progress => "progress",
+            Self::All => "all",
         }
     }
 
     /// Parse a kebab-case test name (the inverse of [`name`](Self::name)).
     /// Used by the Swift/FFI path, which carries the test as a plain string.
-    pub fn from_name(name: &str) -> Option<DiagnosticTest> {
-        DiagnosticTest::EACH
+    pub fn from_name(name: &str) -> Option<Self> {
+        Self::EACH
             .into_iter()
-            .chain([DiagnosticTest::Progress, DiagnosticTest::All])
+            .chain([Self::Progress, Self::All])
             .find(|test| test.name() == name)
     }
 
     /// One-line description for the `kmux diagnostic` catalogue.
     pub fn description(self) -> &'static str {
         match self {
-            DiagnosticTest::Glyphs => "ASCII + common Unicode glyphs",
-            DiagnosticTest::Attrs => "text attributes across the four font faces",
-            DiagnosticTest::Colors => "16/256/truecolor ramps",
-            DiagnosticTest::Unicode => "wide CJK, emoji, combining marks",
-            DiagnosticTest::Boxes => "box-drawing alignment grid",
-            DiagnosticTest::Progress => "animated OSC 9;4 progress-bar states",
-            DiagnosticTest::All => "run every pattern above, in order",
+            Self::Glyphs => "ASCII + common Unicode glyphs",
+            Self::Attrs => "text attributes across the four font faces",
+            Self::Colors => "16/256/truecolor ramps",
+            Self::Unicode => "wide CJK, emoji, combining marks",
+            Self::Boxes => "box-drawing alignment grid",
+            Self::Progress => "animated OSC 9;4 progress-bar states",
+            Self::All => "run every pattern above, in order",
         }
     }
 }
@@ -256,15 +256,24 @@ fn sleep_unless_stopped(stop: &std::sync::atomic::AtomicBool, dur: std::time::Du
 /// binary invoked as `kmux diagnostic <test> --emit`. Shared by the GTK `Plan`
 /// path and the Swift `build_core` path so both spawn an identical emitter.
 pub fn session_command(test: DiagnosticTest) -> anyhow::Result<(String, Vec<String>)> {
-    let kmux = locate_kmux_binary()?;
-    Ok((
+    Ok(session_command_for(&locate_kmux_binary()?, test))
+}
+
+/// The argv [`session_command`] builds, for an already-located binary.
+///
+/// Split out so the interesting half — which flags a given test emits — is
+/// testable without a locator that reads `KMUX_BIN` and the filesystem. See
+/// docs/testing.md R3.
+#[must_use]
+pub fn session_command_for(kmux: &std::path::Path, test: DiagnosticTest) -> (String, Vec<String>) {
+    (
         kmux.to_string_lossy().into_owned(),
         vec![
             "diagnostic".to_string(),
             test.name().to_string(),
             "--emit".to_string(),
         ],
-    ))
+    )
 }
 
 /// Locate the `kmux` entrypoint binary to run as the in-session emitter:
@@ -341,13 +350,12 @@ mod tests {
 
     #[test]
     fn session_command_passes_emit_flag() {
-        // Make the locator deterministic regardless of the test host.
-        unsafe { std::env::set_var("KMUX_BIN", std::env::current_exe().unwrap()) };
-        let (_, args) = session_command(DiagnosticTest::Glyphs).unwrap();
+        let kmux = std::path::Path::new("/opt/kmux/bin/kmux");
+        let (bin, args) = session_command_for(kmux, DiagnosticTest::Glyphs);
+        assert_eq!(bin, "/opt/kmux/bin/kmux");
         assert_eq!(args, vec!["diagnostic", "glyphs", "--emit"]);
 
-        let (_, args) = session_command(DiagnosticTest::Progress).unwrap();
+        let (_, args) = session_command_for(kmux, DiagnosticTest::Progress);
         assert_eq!(args, vec!["diagnostic", "progress", "--emit"]);
-        unsafe { std::env::remove_var("KMUX_BIN") };
     }
 }

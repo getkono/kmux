@@ -5,7 +5,7 @@
 //! over a socketpair, and keeps the authoritative master fd itself (so the shell
 //! survives a worker crash). A **supervisor task** drains the worker's event
 //! stream and fans diffs out to clients through the same
-//! [`dispatch_diff_result`](crate::relay::dispatch_diff_result) the in-process
+//! [`dispatch_diff_result`] the in-process
 //! relay uses — so a worker pane is byte-identical on the wire to an in-process
 //! one. A daemon-side [`CellGrid`] mirror, fed from that same stream, answers
 //! `snapshot()` synchronously (no IPC round-trip), which keeps the existing
@@ -87,7 +87,7 @@ impl WorkerEngine {
         kitty_keyboard: bool,
         master_fd: OwnedFd,
         fanout: WorkerFanout,
-    ) -> anyhow::Result<WorkerEngine> {
+    ) -> anyhow::Result<Self> {
         let (daemon_end, worker_end) =
             std::os::unix::net::UnixStream::pair().context("worker socketpair")?;
         let worker_raw = worker_end.as_raw_fd();
@@ -166,7 +166,7 @@ impl WorkerEngine {
         let child_pid = child.id();
         let supervisor = tokio::spawn(supervise(sock_rd, child, mirror.clone(), fanout));
 
-        Ok(WorkerEngine {
+        Ok(Self {
             req_tx,
             mirror,
             child_pid,

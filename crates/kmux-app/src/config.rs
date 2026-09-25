@@ -1,8 +1,9 @@
 //! Client configuration file and theme resolution.
 //!
-//! Frontend-agnostic: [`resolve_theme`] returns a toolkit-neutral
+//! Frontend-agnostic: [`crate::config::resolve_theme`] returns a toolkit-neutral
 //! [`crate::theme::Theme`] which each frontend converts to its own color type.
 
+use kmux_sys::dirs::Dirs;
 use serde::{Deserialize, Serialize};
 use tracing::error;
 
@@ -34,8 +35,8 @@ impl RendererKind {
     /// (`"cairo"` / `"gpu"`).
     pub fn as_str(self) -> &'static str {
         match self {
-            RendererKind::Cairo => "cairo",
-            RendererKind::Gpu => "gpu",
+            Self::Cairo => "cairo",
+            Self::Gpu => "gpu",
         }
     }
 
@@ -43,8 +44,8 @@ impl RendererKind {
     /// Returns `None` for anything else.
     pub fn parse(s: &str) -> Option<Self> {
         match s.trim().to_ascii_lowercase().as_str() {
-            "cairo" => Some(RendererKind::Cairo),
-            "gpu" | "wgpu" => Some(RendererKind::Gpu),
+            "cairo" => Some(Self::Cairo),
+            "gpu" | "wgpu" => Some(Self::Gpu),
             _ => None,
         }
     }
@@ -53,7 +54,7 @@ impl RendererKind {
 /// Top-level kmux configuration file (`~/.config/kmux/config.toml`).
 ///
 /// The file is optional; its absence is not an error.
-#[derive(Debug, Deserialize, Serialize, Default)]
+#[derive(Debug, Clone, Deserialize, Serialize, Default)]
 pub struct KmuxConfig {
     /// Theme ID: a built-in name or a custom theme filename (without `.toml`)
     /// located in `~/.config/kmux/themes/`.
@@ -125,10 +126,25 @@ pub fn load() -> KmuxConfig {
     load_config_file().unwrap_or_default()
 }
 
+/// Load `config.toml` from an explicit [`Dirs`], returning defaults if it is
+/// missing or unparseable.
+///
+/// The isolation seam for anything that reads config: a test builds a
+/// `Dirs::rooted(tmp)` instead of overwriting `XDG_CONFIG_HOME` in the running
+/// process (docs/testing.md R3).
+pub fn load_from(dirs: &Dirs) -> KmuxConfig {
+    read_config_file(dirs).unwrap_or_default()
+}
+
 /// Persist `cfg` to `<config_dir>/config.toml`, creating the directory if
 /// needed. Used by the GUI preferences window.
 pub fn save(cfg: &KmuxConfig) -> anyhow::Result<()> {
-    let dir = kmux_protocol::dirs::config_dir()?;
+    save_to(&Dirs::from_env()?, cfg)
+}
+
+/// Persist `cfg` under an explicit [`Dirs`]. See [`load_from`].
+pub fn save_to(dirs: &Dirs, cfg: &KmuxConfig) -> anyhow::Result<()> {
+    let dir = dirs.config_dir()?;
     std::fs::create_dir_all(&dir)?;
     let path = dir.join("config.toml");
     std::fs::write(&path, toml::to_string_pretty(cfg)?)?;
@@ -148,22 +164,43 @@ pub const DEFAULT_FONT: &str = "monospace 11";
 ///
 /// On any lookup failure the error is logged and the default is returned.
 pub fn resolve_theme(cli_theme: Option<&str>) -> Theme {
-    if let Some(name) = cli_theme {
-        if let Some(t) = load_theme_spec(name) {
-            return t;
-        }
-        // load_theme_spec already logged the error; fall through to default
-        return theme::default_theme();
-    }
+    resolve_theme_from(&load(), cli_theme)
+}
 
-    if let Some(cfg) = load_config_file()
-        && let Some(name) = cfg.theme
-        && let Some(t) = load_theme_spec(&name)
+/// [`resolve_theme`] against an already-loaded config.
+///
+/// Pure for a built-in theme name; a *custom* name still reads
+/// `<config_dir>/themes/<name>.toml`, which is the one part of theme resolution
+/// that cannot be a value.
+pub fn resolve_theme_from(cfg: &KmuxConfig, cli_theme: Option<&str>) -> Theme {
+    resolve_theme_inner(cfg, cli_theme, load_theme_spec)
+}
+
+/// [`resolve_theme_from`] against an explicit [`Dirs`], so a test can exercise
+/// the custom-theme-file path without touching the environment.
+pub fn resolve_theme_in(dirs: &Dirs, cfg: &KmuxConfig, cli_theme: Option<&str>) -> Theme {
+    resolve_theme_inner(cfg, cli_theme, |name| load_theme_spec_in(dirs, name))
+}
+
+/// The precedence rule, with theme lookup injected.
+///
+/// A CLI name is authoritative: if it does not resolve, fall back to the default
+/// rather than to the configured theme — otherwise `--theme` with a typo would
+/// silently look like it worked.
+fn resolve_theme_inner(
+    cfg: &KmuxConfig,
+    cli_theme: Option<&str>,
+    lookup: impl Fn(&str) -> Option<Theme>,
+) -> Theme {
+    if let Some(name) = cli_theme {
+        // `lookup` already logged any error.
+        return lookup(name).unwrap_or_else(theme::default_theme);
+    }
+    if let Some(name) = cfg.theme.as_deref()
+        && let Some(t) = lookup(name)
     {
         return t;
     }
-    // load_theme_spec already logged any error; fall through to default
-
     theme::default_theme()
 }
 
@@ -176,12 +213,15 @@ pub fn resolve_theme(cli_theme: Option<&str>) -> Theme {
 ///
 /// Blank values are ignored so they fall through to the next source.
 pub fn resolve_font(cli_font: Option<&str>) -> String {
+    resolve_font_from(&load(), cli_font)
+}
+
+/// [`resolve_font`] against an already-loaded config. Pure.
+pub fn resolve_font_from(cfg: &KmuxConfig, cli_font: Option<&str>) -> String {
     if let Some(font) = cli_font.map(str::trim).filter(|s| !s.is_empty()) {
         return font.to_string();
     }
-    if let Some(cfg) = load_config_file()
-        && let Some(font) = cfg.font.as_deref().map(str::trim).filter(|s| !s.is_empty())
-    {
+    if let Some(font) = cfg.font.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
         return font.to_string();
     }
     DEFAULT_FONT.to_string()
@@ -200,12 +240,20 @@ pub fn resolve_font(cli_font: Option<&str>) -> String {
 /// `cli_font` is the `--font` flag, forwarded to [`resolve_font`] for the legacy
 /// fallback (there are no per-field appearance CLI flags).
 pub fn resolve_appearance(cli_font: Option<&str>) -> Appearance {
+    resolve_appearance_from(&load(), cli_font)
+}
+
+/// [`resolve_appearance`] against an already-loaded config. Pure.
+///
+/// Taking the config as a value also removes a double read: the previous form
+/// loaded `config.toml` once here and again inside `resolve_font`.
+pub fn resolve_appearance_from(cfg: &KmuxConfig, cli_font: Option<&str>) -> Appearance {
     // Legacy font string (CLI `--font` > config `font` > DEFAULT_FONT) seeds the
     // family/size when the structured keys are absent.
-    let legacy = resolve_font(cli_font);
+    let legacy = resolve_font_from(cfg, cli_font);
     let (legacy_family, legacy_size) = appearance::parse_legacy_font(&legacy);
 
-    let cfg = load_config_file().unwrap_or_default();
+    let cfg = cfg.clone();
 
     let trimmed = |o: Option<String>| o.map(|s| s.trim().to_string()).filter(|s| !s.is_empty());
 
@@ -258,15 +306,12 @@ pub fn resolve_appearance(cli_font: Option<&str>) -> Appearance {
 /// 2. `cursor_blink` key in `~/.config/kmux/config.toml`
 /// 3. `true` (blink by default, matching real terminals)
 pub fn resolve_cursor_blink(cli_value: Option<bool>) -> bool {
-    if let Some(value) = cli_value {
-        return value;
-    }
-    if let Some(cfg) = load_config_file()
-        && let Some(value) = cfg.cursor_blink
-    {
-        return value;
-    }
-    true
+    resolve_cursor_blink_from(&load(), cli_value)
+}
+
+/// [`resolve_cursor_blink`] against an already-loaded config. Pure.
+pub fn resolve_cursor_blink_from(cfg: &KmuxConfig, cli_value: Option<bool>) -> bool {
+    cli_value.or(cfg.cursor_blink).unwrap_or(true)
 }
 
 /// Resolve the terminal renderer backend.
@@ -276,18 +321,24 @@ pub fn resolve_cursor_blink(cli_value: Option<bool>) -> bool {
 /// a singleton GUI client cannot honor a per-launch flag, so the choice lives in
 /// config and is read once at process start.
 pub fn resolve_renderer() -> RendererKind {
-    load_config_file()
-        .and_then(|cfg| cfg.renderer)
-        .unwrap_or_default()
+    resolve_renderer_from(&load())
+}
+
+/// [`resolve_renderer`] against an already-loaded config. Pure.
+pub fn resolve_renderer_from(cfg: &KmuxConfig) -> RendererKind {
+    cfg.renderer.unwrap_or_default()
 }
 
 /// Whether the `kmux` entrypoint should warn before opening a GUI inside a
 /// kmux-managed shell (issue #73). Defaults to `true`; the user's "start anyway
 /// from now on" choice persists `warn_nested = false`.
 pub fn warn_when_nested() -> bool {
-    load_config_file()
-        .and_then(|cfg| cfg.warn_nested)
-        .unwrap_or(true)
+    warn_when_nested_from(&load())
+}
+
+/// [`warn_when_nested`] against an already-loaded config. Pure.
+pub fn warn_when_nested_from(cfg: &KmuxConfig) -> bool {
+    cfg.warn_nested.unwrap_or(true)
 }
 
 /// Persist the nested-warning preference (issue #73), preserving the rest of the
@@ -302,9 +353,12 @@ pub fn set_warn_when_nested(value: bool) -> anyhow::Result<()> {
 /// (issue #61). `perf_counters` key in `~/.config/kmux/config.toml`; defaults to
 /// `true`. Hiding them also disables their per-frame calculation.
 pub fn resolve_perf_counters() -> bool {
-    load_config_file()
-        .and_then(|cfg| cfg.perf_counters)
-        .unwrap_or(true)
+    resolve_perf_counters_from(&load())
+}
+
+/// [`resolve_perf_counters`] against an already-loaded config. Pure.
+pub fn resolve_perf_counters_from(cfg: &KmuxConfig) -> bool {
+    cfg.perf_counters.unwrap_or(true)
 }
 
 /// Try to load a theme by name.
@@ -312,11 +366,27 @@ pub fn resolve_perf_counters() -> bool {
 /// Looks up built-in themes first, then `<config_dir>/themes/<name>.toml`.
 /// Returns `None` (and logs an error) if the theme cannot be found or parsed.
 fn load_theme_spec(name: &str) -> Option<Theme> {
+    // Built-ins resolve without touching the filesystem, so the common case
+    // never needs a config dir at all.
+    if let Some(t) = theme::builtin_theme(name) {
+        return Some(t);
+    }
+    match Dirs::from_env() {
+        Ok(dirs) => load_theme_spec_in(&dirs, name),
+        Err(e) => {
+            error!("could not resolve config dir for theme '{name}': {e}");
+            None
+        }
+    }
+}
+
+/// [`load_theme_spec`] against an explicit [`Dirs`]. See [`load_from`].
+fn load_theme_spec_in(dirs: &Dirs, name: &str) -> Option<Theme> {
     if let Some(t) = theme::builtin_theme(name) {
         return Some(t);
     }
 
-    let path = match kmux_protocol::dirs::config_dir() {
+    let path = match dirs.config_dir() {
         Ok(dir) => dir.join("themes").join(format!("{name}.toml")),
         Err(e) => {
             error!("could not resolve config dir for theme '{name}': {e}");
@@ -350,7 +420,17 @@ fn load_theme_spec(name: &str) -> Option<Theme> {
 ///
 /// Logs and returns `None` on parse errors; silently returns `None` if missing.
 fn load_config_file() -> Option<KmuxConfig> {
-    let path = match kmux_protocol::dirs::config_dir() {
+    match Dirs::from_env() {
+        Ok(dirs) => read_config_file(&dirs),
+        Err(e) => {
+            error!("could not resolve config dir: {e}");
+            None
+        }
+    }
+}
+
+fn read_config_file(dirs: &Dirs) -> Option<KmuxConfig> {
+    let path = match dirs.config_dir() {
         Ok(dir) => dir.join("config.toml"),
         Err(e) => {
             error!("could not resolve config dir: {e}");
@@ -380,47 +460,77 @@ mod tests {
     use super::*;
     use crate::theme::Rgb;
 
-    // Serialise all tests that mutate XDG_CONFIG_HOME to avoid races. Shared
-    // crate-wide so completion.rs's tests (which mutate the same var) cannot
-    // race these.
-    use crate::ENV_LOCK;
+    /// catppuccin-macchiato — the default theme's background.
+    const DEFAULT_BG: Rgb = Rgb::new(0x24, 0x27, 0x3a);
+
+    /// A config with nothing set, i.e. every resolver on its default path.
+    fn empty_config() -> KmuxConfig {
+        KmuxConfig::default()
+    }
+
+    fn config_from(toml_src: &str) -> KmuxConfig {
+        toml::from_str(toml_src).expect("fixture config parses")
+    }
+
+    // ── Theme ────────────────────────────────────────────────────────────────
 
     #[test]
-    fn test_resolve_cli_builtin() {
-        let theme = resolve_theme(Some("dracula"));
-        // dracula bg = #282a36
+    fn theme_cli_flag_selects_a_builtin() {
+        let theme = resolve_theme_from(&empty_config(), Some("dracula"));
         assert_eq!(theme.bg, Rgb::new(0x28, 0x2a, 0x36));
     }
 
     #[test]
-    fn test_resolve_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // With XDG_CONFIG_HOME pointing somewhere empty, no config file exists.
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let theme = resolve_theme(None);
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        // catppuccin-macchiato bg = #24273a
-        assert_eq!(theme.bg, Rgb::new(0x24, 0x27, 0x3a));
+    fn theme_defaults_when_neither_cli_nor_config_names_one() {
+        assert_eq!(resolve_theme_from(&empty_config(), None).bg, DEFAULT_BG);
     }
 
     #[test]
-    fn test_resolve_unknown_falls_back_to_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let theme = resolve_theme(Some("does-not-exist"));
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert_eq!(theme.bg, Rgb::new(0x24, 0x27, 0x3a));
+    fn theme_cli_flag_wins_over_the_config_key() {
+        let cfg = config_from(r#"theme = "dracula""#);
+        let theme = resolve_theme_from(&cfg, Some("nord"));
+        assert_ne!(
+            theme.bg,
+            Rgb::new(0x28, 0x2a, 0x36),
+            "--theme must override the configured theme, not be overridden by it"
+        );
     }
 
     #[test]
-    fn test_resolve_custom_theme_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let themes_dir = tmp.path().join("kmux").join("themes");
-        std::fs::create_dir_all(&themes_dir).unwrap();
-        let toml = r##"
+    fn theme_comes_from_the_config_key_when_no_cli_flag() {
+        let cfg = config_from(r#"theme = "dracula""#);
+        assert_eq!(
+            resolve_theme_from(&cfg, None).bg,
+            Rgb::new(0x28, 0x2a, 0x36)
+        );
+    }
+
+    #[test]
+    fn an_unknown_cli_theme_falls_back_to_the_default_not_to_the_config() {
+        // Precedence detail worth pinning: a typo in --theme must not silently
+        // hand back the configured theme, or the flag would look like it worked.
+        let cfg = config_from(r#"theme = "dracula""#);
+        assert_eq!(
+            resolve_theme_from(&cfg, Some("does-not-exist")).bg,
+            DEFAULT_BG
+        );
+    }
+
+    #[test]
+    fn an_unknown_config_theme_falls_back_to_the_default() {
+        let cfg = config_from(r#"theme = "does-not-exist""#);
+        assert_eq!(resolve_theme_from(&cfg, None).bg, DEFAULT_BG);
+    }
+
+    #[test]
+    fn a_custom_theme_file_is_loaded_from_the_config_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dirs = Dirs::rooted(tmp.path());
+        let themes = dirs.config_dir().expect("config dir").join("themes");
+        std::fs::create_dir_all(&themes).expect("create themes dir");
+        std::fs::write(
+            themes.join("my-theme.toml"),
+            r##"
 name      = "my-theme"
 bg        = "#ff0000"
 fg        = "#00ff00"
@@ -432,290 +542,277 @@ yellow    = "#cccccc"
 purple    = "#dddddd"
 orange    = "#eeeeee"
 status_bg = "#111111"
-"##;
-        std::fs::write(themes_dir.join("my-theme.toml"), toml).unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let theme = resolve_theme(Some("my-theme"));
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
+"##,
+        )
+        .expect("write theme");
+
+        let theme = resolve_theme_in(&dirs, &empty_config(), Some("my-theme"));
         assert_eq!(theme.bg, Rgb::new(0xff, 0x00, 0x00));
         assert_eq!(theme.fg, Rgb::new(0x00, 0xff, 0x00));
     }
 
     #[test]
-    fn test_config_file_theme_id() {
-        let cfg: KmuxConfig = toml::from_str(r#"theme = "dracula""#).unwrap();
-        assert_eq!(cfg.theme.as_deref(), Some("dracula"));
+    fn a_builtin_name_wins_over_a_same_named_file_and_needs_no_config_dir() {
+        // Built-ins short-circuit before any filesystem access, which is why the
+        // common case works even when the config dir cannot be resolved.
+        let dirs = Dirs::rooted(std::path::Path::new("/nonexistent-kmux-test-root"));
+        let theme = resolve_theme_in(&dirs, &empty_config(), Some("dracula"));
+        assert_eq!(theme.bg, Rgb::new(0x28, 0x2a, 0x36));
     }
 
-    #[test]
-    fn test_config_file_missing_theme_field() {
-        let cfg: KmuxConfig = toml::from_str("").unwrap();
-        assert!(cfg.theme.is_none());
-    }
+    // ── Font ─────────────────────────────────────────────────────────────────
 
     #[test]
     fn font_cli_flag_wins() {
-        assert_eq!(resolve_font(Some("JetBrains Mono 12")), "JetBrains Mono 12");
+        let cfg = config_from(r#"font = "Fira Code 13""#);
+        assert_eq!(
+            resolve_font_from(&cfg, Some("JetBrains Mono 12")),
+            "JetBrains Mono 12"
+        );
     }
 
     #[test]
-    fn font_blank_flag_falls_through_to_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let font = resolve_font(Some("   "));
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert_eq!(font, DEFAULT_FONT);
+    fn font_blank_cli_flag_falls_through_to_the_config() {
+        let cfg = config_from(r#"font = "Fira Code 13""#);
+        assert_eq!(resolve_font_from(&cfg, Some("   ")), "Fira Code 13");
     }
 
     #[test]
-    fn font_defaults_when_unset() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let font = resolve_font(None);
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert_eq!(font, DEFAULT_FONT);
+    fn font_comes_from_the_config_when_no_cli_flag() {
+        let cfg = config_from(r#"font = "Fira Code 13""#);
+        assert_eq!(resolve_font_from(&cfg, None), "Fira Code 13");
     }
 
     #[test]
-    fn font_from_config_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let kmux_dir = tmp.path().join("kmux");
-        std::fs::create_dir_all(&kmux_dir).unwrap();
-        std::fs::write(kmux_dir.join("config.toml"), "font = \"Fira Code 13\"\n").unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let font = resolve_font(None);
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert_eq!(font, "Fira Code 13");
+    fn font_defaults_when_nothing_is_set() {
+        assert_eq!(resolve_font_from(&empty_config(), None), DEFAULT_FONT);
+        assert_eq!(resolve_font_from(&empty_config(), Some("  ")), DEFAULT_FONT);
     }
 
     #[test]
-    fn config_file_parses_font_field() {
-        let cfg: KmuxConfig = toml::from_str(r#"font = "Fira Code 13""#).unwrap();
+    fn a_blank_config_font_falls_through_to_the_default() {
+        let cfg = config_from(r#"font = "   ""#);
+        assert_eq!(resolve_font_from(&cfg, None), DEFAULT_FONT);
+    }
+
+    // ── Cursor blink ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn cursor_blink_cli_flag_wins_over_the_config() {
+        let cfg = config_from("cursor_blink = false");
+        assert!(resolve_cursor_blink_from(&cfg, Some(true)));
+        let cfg = config_from("cursor_blink = true");
+        assert!(!resolve_cursor_blink_from(&cfg, Some(false)));
+    }
+
+    #[test]
+    fn cursor_blink_comes_from_the_config_when_no_cli_flag() {
+        let cfg = config_from("cursor_blink = false");
+        assert!(!resolve_cursor_blink_from(&cfg, None));
+    }
+
+    #[test]
+    fn cursor_blink_defaults_to_true() {
+        assert!(
+            resolve_cursor_blink_from(&empty_config(), None),
+            "real terminals blink by default"
+        );
+    }
+
+    // ── Renderer, nested warning, perf counters ──────────────────────────────
+
+    #[test]
+    fn renderer_defaults_to_cairo() {
+        assert_eq!(resolve_renderer_from(&empty_config()), RendererKind::Cairo);
+    }
+
+    #[test]
+    fn renderer_comes_from_the_config() {
+        assert_eq!(
+            resolve_renderer_from(&config_from(r#"renderer = "gpu""#)),
+            RendererKind::Gpu
+        );
+        assert_eq!(
+            resolve_renderer_from(&config_from(r#"renderer = "wgpu""#)),
+            RendererKind::Gpu,
+            "`wgpu` is kept as a backward-compatible alias"
+        );
+        assert_eq!(
+            resolve_renderer_from(&config_from(r#"renderer = "cairo""#)),
+            RendererKind::Cairo
+        );
+    }
+
+    #[test]
+    fn warn_when_nested_defaults_to_true_and_is_silenced_by_the_config() {
+        assert!(warn_when_nested_from(&empty_config()));
+        assert!(!warn_when_nested_from(&config_from("warn_nested = false")));
+    }
+
+    #[test]
+    fn perf_counters_default_to_true_and_are_hidden_by_the_config() {
+        assert!(resolve_perf_counters_from(&empty_config()));
+        assert!(!resolve_perf_counters_from(&config_from(
+            "perf_counters = false"
+        )));
+    }
+
+    // ── Appearance ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn appearance_defaults_when_nothing_is_set() {
+        let a = resolve_appearance_from(&empty_config(), None);
+        assert_eq!(a.family, appearance::DEFAULT_FAMILY);
+        assert_eq!(a.size_pt, appearance::DEFAULT_SIZE_PT);
+        assert!(a.features.is_empty());
+    }
+
+    #[test]
+    fn appearance_seeds_family_and_size_from_the_legacy_font_string() {
+        let a = resolve_appearance_from(&empty_config(), Some("Fira Code 14"));
+        assert_eq!(a.family, "Fira Code");
+        assert_eq!(a.size_pt, 14.0);
+    }
+
+    #[test]
+    fn appearance_structured_keys_win_over_the_legacy_font() {
+        let cfg = config_from(
+            r#"
+font = "Fira Code 14"
+font-family = "JetBrains Mono"
+font-size = 11.5
+"#,
+        );
+        let a = resolve_appearance_from(&cfg, None);
+        assert_eq!(a.family, "JetBrains Mono");
+        assert_eq!(a.size_pt, 11.5);
+    }
+
+    #[test]
+    fn appearance_falls_back_per_field_rather_than_all_or_nothing() {
+        // Only the family is set structurally; the size must still come from the
+        // legacy string rather than resetting to the default.
+        let cfg = config_from(
+            r#"
+font = "Fira Code 14"
+font-family = "JetBrains Mono"
+"#,
+        );
+        let a = resolve_appearance_from(&cfg, None);
+        assert_eq!(a.family, "JetBrains Mono");
+        assert_eq!(a.size_pt, 14.0, "size should survive from the legacy font");
+    }
+
+    #[test]
+    fn appearance_ignores_a_non_positive_font_size() {
+        let cfg = config_from("font-size = 0.0");
+        assert_eq!(
+            resolve_appearance_from(&cfg, None).size_pt,
+            appearance::DEFAULT_SIZE_PT
+        );
+    }
+
+    #[test]
+    fn appearance_parses_font_features_and_cell_adjustments() {
+        let cfg = config_from(
+            r#"
+font-feature = ["ss01", "-liga"]
+adjust-cell-width = "2"
+adjust-cell-height = "10%"
+"#,
+        );
+        let a = resolve_appearance_from(&cfg, None);
+        assert_eq!(a.features.len(), 2);
+        assert_ne!(a.cell_width_adjust, CellAdjust::default());
+        assert_ne!(a.cell_height_adjust, CellAdjust::default());
+    }
+
+    // ── File format ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn config_parses_theme_and_font_fields() {
+        let cfg = config_from(r#"theme = "dracula""#);
+        assert_eq!(cfg.theme.as_deref(), Some("dracula"));
+        let cfg = config_from(r#"font = "Fira Code 13""#);
         assert_eq!(cfg.font.as_deref(), Some("Fira Code 13"));
     }
 
     #[test]
-    fn cursor_blink_cli_flag_wins() {
-        assert!(!resolve_cursor_blink(Some(false)));
-        assert!(resolve_cursor_blink(Some(true)));
+    fn an_empty_config_leaves_every_field_unset() {
+        let cfg = config_from("");
+        assert!(cfg.theme.is_none());
+        assert!(cfg.font.is_none());
+        assert!(cfg.cursor_blink.is_none());
+        assert!(cfg.renderer.is_none());
     }
 
     #[test]
-    fn cursor_blink_defaults_to_true_when_unset() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let blink = resolve_cursor_blink(None);
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert!(blink, "the default cursor should blink");
-    }
-
-    #[test]
-    fn cursor_blink_from_config_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let kmux_dir = tmp.path().join("kmux");
-        std::fs::create_dir_all(&kmux_dir).unwrap();
-        std::fs::write(kmux_dir.join("config.toml"), "cursor_blink = false\n").unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let blink = resolve_cursor_blink(None);
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert!(!blink, "config cursor_blink=false should disable blinking");
-    }
-
-    #[test]
-    fn config_file_parses_cursor_blink_field() {
-        let cfg: KmuxConfig = toml::from_str("cursor_blink = false").unwrap();
-        assert_eq!(cfg.cursor_blink, Some(false));
-    }
-
-    #[test]
-    fn config_file_parses_warn_nested_field() {
-        // Both snake_case (canonical) and the kebab alias parse (issue #73).
-        let snake: KmuxConfig = toml::from_str("warn_nested = false").unwrap();
-        assert_eq!(snake.warn_nested, Some(false));
-        let kebab: KmuxConfig = toml::from_str("warn-nested = true").unwrap();
-        assert_eq!(kebab.warn_nested, Some(true));
-    }
-
-    #[test]
-    fn warn_nested_round_trips_through_save_format() {
-        // The "start anyway from now on" choice (issue #73) must survive a
-        // save → load cycle using the canonical key written by `config::save`.
-        let cfg = KmuxConfig {
-            warn_nested: Some(false),
-            ..Default::default()
-        };
-        let serialized = toml::to_string_pretty(&cfg).unwrap();
-        assert!(
-            serialized.contains("warn_nested = false"),
-            "expected canonical key, got: {serialized}"
+    fn structured_font_keys_accept_both_kebab_and_snake_case() {
+        let kebab = config_from(
+            r#"
+font-family = "JetBrains Mono"
+font-size = 12.0
+adjust-cell-width = "2"
+warn-nested = true
+perf-counters = false
+"#,
         );
-        let back: KmuxConfig = toml::from_str(&serialized).unwrap();
-        assert_eq!(back.warn_nested, Some(false));
+        let snake = config_from(
+            r#"
+font_family = "JetBrains Mono"
+font_size = 12.0
+adjust_cell_width = "2"
+warn_nested = true
+perf_counters = false
+"#,
+        );
+        assert_eq!(kebab.font_family, snake.font_family);
+        assert_eq!(kebab.font_size, snake.font_size);
+        assert_eq!(kebab.adjust_cell_width, snake.adjust_cell_width);
+        assert_eq!(kebab.warn_nested, snake.warn_nested);
+        assert_eq!(kebab.perf_counters, snake.perf_counters);
     }
 
     #[test]
-    fn renderer_kind_parses_tokens_and_alias() {
-        assert_eq!(RendererKind::parse("cairo"), Some(RendererKind::Cairo));
-        assert_eq!(RendererKind::parse("GPU"), Some(RendererKind::Gpu));
-        assert_eq!(RendererKind::parse("wgpu"), Some(RendererKind::Gpu));
-        assert_eq!(RendererKind::parse("metal"), None);
-        assert_eq!(RendererKind::Gpu.as_str(), "gpu");
-        assert_eq!(RendererKind::Cairo.as_str(), "cairo");
-    }
+    fn save_then_load_round_trips_through_an_isolated_config_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dirs = Dirs::rooted(tmp.path());
 
-    #[test]
-    fn config_file_parses_renderer_field_and_wgpu_alias() {
-        let gpu: KmuxConfig = toml::from_str(r#"renderer = "gpu""#).unwrap();
-        assert_eq!(gpu.renderer, Some(RendererKind::Gpu));
-        let alias: KmuxConfig = toml::from_str(r#"renderer = "wgpu""#).unwrap();
-        assert_eq!(alias.renderer, Some(RendererKind::Gpu));
-        let cairo: KmuxConfig = toml::from_str(r#"renderer = "cairo""#).unwrap();
-        assert_eq!(cairo.renderer, Some(RendererKind::Cairo));
-    }
-
-    #[test]
-    fn resolve_renderer_defaults_to_cairo_when_unset() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let r = resolve_renderer();
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert_eq!(r, RendererKind::Cairo);
-    }
-
-    #[test]
-    fn resolve_renderer_from_config_file() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let kmux_dir = tmp.path().join("kmux");
-        std::fs::create_dir_all(&kmux_dir).unwrap();
-        std::fs::write(kmux_dir.join("config.toml"), "renderer = \"gpu\"\n").unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let r = resolve_renderer();
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert_eq!(r, RendererKind::Gpu);
-    }
-
-    #[test]
-    fn config_file_parses_perf_counters_field() {
-        // Both snake_case (canonical) and the kebab alias parse (issue #61).
-        let snake: KmuxConfig = toml::from_str("perf_counters = false").unwrap();
-        assert_eq!(snake.perf_counters, Some(false));
-        let kebab: KmuxConfig = toml::from_str("perf-counters = true").unwrap();
-        assert_eq!(kebab.perf_counters, Some(true));
-    }
-
-    #[test]
-    fn save_then_load_round_trips() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
         let cfg = KmuxConfig {
             theme: Some("dracula".into()),
             font: Some("Fira Code 13".into()),
-            font_family: Some("JetBrains Mono".into()),
-            font_size: Some(14.0),
-            font_feature: Some(vec!["ss01".into(), "-liga".into()]),
-            adjust_cell_height: Some("10%".into()),
-            cursor_blink: Some(false),
+            warn_nested: Some(false),
+            perf_counters: Some(false),
+            renderer: Some(RendererKind::Gpu),
             ..KmuxConfig::default()
         };
-        let saved = save(&cfg);
-        let loaded = load();
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        saved.unwrap();
-        assert_eq!(loaded.theme.as_deref(), Some("dracula"));
-        assert_eq!(loaded.font.as_deref(), Some("Fira Code 13"));
-        assert_eq!(loaded.font_family.as_deref(), Some("JetBrains Mono"));
-        assert_eq!(loaded.font_size, Some(14.0));
-        assert_eq!(
-            loaded.font_feature.as_deref(),
-            Some(["ss01".to_string(), "-liga".to_string()].as_slice())
+        save_to(&dirs, &cfg).expect("save");
+
+        let read_back = load_from(&dirs);
+        assert_eq!(read_back.theme.as_deref(), Some("dracula"));
+        assert_eq!(read_back.font.as_deref(), Some("Fira Code 13"));
+        assert_eq!(read_back.warn_nested, Some(false));
+        assert_eq!(read_back.perf_counters, Some(false));
+        assert_eq!(read_back.renderer, Some(RendererKind::Gpu));
+    }
+
+    #[test]
+    fn loading_a_missing_config_yields_defaults_rather_than_failing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cfg = load_from(&Dirs::rooted(tmp.path()));
+        assert!(cfg.theme.is_none(), "a missing config file is not an error");
+    }
+
+    #[test]
+    fn loading_an_unparseable_config_yields_defaults_rather_than_failing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dirs = Dirs::rooted(tmp.path());
+        let dir = dirs.config_dir().expect("config dir");
+        std::fs::write(dir.join("config.toml"), "this is not = valid = toml").expect("write");
+        let cfg = load_from(&dirs);
+        assert!(
+            cfg.theme.is_none(),
+            "a corrupt config must degrade to defaults, not take down the client"
         );
-        assert_eq!(loaded.adjust_cell_height.as_deref(), Some("10%"));
-        assert_eq!(loaded.cursor_blink, Some(false));
-    }
-
-    #[test]
-    fn config_parses_structured_font_keys() {
-        let cfg: KmuxConfig = toml::from_str(
-            r#"
-font-family = "JetBrains Mono"
-font-size = 13.5
-font-feature = ["ss01", "-liga"]
-adjust-cell-width = "5"
-adjust-cell-height = "10%"
-"#,
-        )
-        .unwrap();
-        assert_eq!(cfg.font_family.as_deref(), Some("JetBrains Mono"));
-        assert_eq!(cfg.font_size, Some(13.5));
-        assert_eq!(
-            cfg.font_feature.as_deref(),
-            Some(["ss01".to_string(), "-liga".to_string()].as_slice())
-        );
-        assert_eq!(cfg.adjust_cell_width.as_deref(), Some("5"));
-        assert_eq!(cfg.adjust_cell_height.as_deref(), Some("10%"));
-    }
-
-    #[test]
-    fn config_accepts_snake_case_font_keys() {
-        // snake_case is the canonical kmux form (matching `cursor_blink`); the
-        // kebab-case aliases above are for Ghostty-config compatibility.
-        let cfg: KmuxConfig =
-            toml::from_str("font_family = \"Fira Code\"\nfont_size = 12\n").unwrap();
-        assert_eq!(cfg.font_family.as_deref(), Some("Fira Code"));
-        assert_eq!(cfg.font_size, Some(12.0));
-    }
-
-    #[test]
-    fn appearance_defaults_when_nothing_set() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let a = resolve_appearance(None);
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert_eq!(a.family, appearance::DEFAULT_FAMILY);
-        assert_eq!(a.size_pt, appearance::DEFAULT_SIZE_PT);
-        assert!(a.features.is_empty());
-        assert_eq!(a.cell_width_adjust, CellAdjust::default());
-    }
-
-    #[test]
-    fn appearance_seeds_family_size_from_legacy_font() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let kmux_dir = tmp.path().join("kmux");
-        std::fs::create_dir_all(&kmux_dir).unwrap();
-        std::fs::write(kmux_dir.join("config.toml"), "font = \"Fira Code 13\"\n").unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let a = resolve_appearance(None);
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert_eq!(a.family, "Fira Code");
-        assert_eq!(a.size_pt, 13.0);
-    }
-
-    #[test]
-    fn appearance_structured_keys_win_over_legacy_font() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        let kmux_dir = tmp.path().join("kmux");
-        std::fs::create_dir_all(&kmux_dir).unwrap();
-        std::fs::write(
-            kmux_dir.join("config.toml"),
-            "font = \"Fira Code 13\"\nfont-family = \"JetBrains Mono\"\nfont-size = 16\nfont-feature = [\"ss01\"]\n",
-        )
-        .unwrap();
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-        let a = resolve_appearance(None);
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-        assert_eq!(a.family, "JetBrains Mono");
-        assert_eq!(a.size_pt, 16.0);
-        assert_eq!(a.feature_string().as_deref(), Some("ss01=1"));
     }
 }

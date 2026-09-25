@@ -6,7 +6,7 @@ use std::time::Instant;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::announce::{BootstrapPath, build_endpoint_list};
 use crate::app::ServerApp;
@@ -83,12 +83,17 @@ pub struct ControlSocketParams {
     /// Resolved listener configs (with actual bound ports filled in).
     pub listeners: Vec<ListenConfig>,
     pub public_host: Option<String>,
+    /// True when this daemon is a graceful-restart successor, which is the one
+    /// case where taking over a socket another daemon is still listening on is
+    /// correct: the predecessor said `Released` before we got here.
+    pub handoff_successor: bool,
 }
 
 /// Bind the Unix control socket and serve status queries.
 ///
-/// Removes any stale socket file before binding. Each accepted connection
-/// receives exactly one request/response exchange then closes.
+/// Removes a *stale* socket file before binding — never a live one, unless this
+/// daemon is a handoff successor. Each accepted connection receives exactly one
+/// request/response exchange then closes.
 ///
 /// Run this as a `tokio::spawn`ed background task after the QUIC endpoint is
 /// bound and the actual port is known.
@@ -106,6 +111,7 @@ pub async fn serve_control_socket(params: ControlSocketParams) {
         handoff_in_progress,
         listeners,
         public_host,
+        handoff_successor,
     } = params;
 
     let ctx = RequestCtx {
@@ -120,10 +126,36 @@ pub async fn serve_control_socket(params: ControlSocketParams) {
         listeners,
         public_host,
     };
-    // Remove stale socket if it exists from a previous run.
+    // A socket file left by a previous run must go before we can bind. A socket
+    // file a *live* daemon is listening on must not: unlinking it does not stop
+    // that daemon, it only makes it unreachable, and the host is left with two
+    // daemons and its sessions split between them. Ask before removing.
+    //
+    // The handoff successor is the exception, and the only one: the predecessor
+    // sent `Released` precisely to say the socket is ours to take.
     if socket_path.exists() {
+        if !handoff_successor && socket_is_live(&socket_path) {
+            // `startup::async_main` already refused before restoring anything
+            // or binding the data socket (`ensure_no_live_daemon`); reaching
+            // here means another daemon won a start race since. Stop the whole
+            // daemon rather than only this task, or it runs on headless.
+            error!(
+                "another daemon is already listening on {}; refusing to start. \
+                 Use `kmux daemon stop` or `kmux daemon restart`.",
+                socket_path.display()
+            );
+            ctx.shutdown.notify_one();
+            return;
+        }
         let _ = std::fs::remove_file(&socket_path);
     }
+
+    // Declared *before* the listener so it drops *after* it. That ordering is
+    // what makes the guard's "is anything listening?" question meaningful on the
+    // way out: our own listener is already closed, so an answer is a
+    // successor's. It stays disarmed until the bind below succeeds — until then
+    // there is nothing of ours at either path.
+    let mut _guard = SocketGuard::for_this_process(socket_path.clone(), pid_path.clone());
 
     let listener = match UnixListener::bind(&socket_path) {
         Ok(l) => l,
@@ -135,15 +167,8 @@ pub async fn serve_control_socket(params: ControlSocketParams) {
             return;
         }
     };
+    _guard.armed = true;
     info!("Control socket listening on {}", socket_path.display());
-
-    // Register a cleanup guard so the socket file is removed when this task exits.
-    let socket_cleanup = socket_path.clone();
-    let pid_cleanup = pid_path.clone();
-    let _guard = SocketGuard {
-        socket_path: socket_cleanup,
-        pid_path: pid_cleanup,
-    };
 
     // Install signal handlers for graceful shutdown.
     let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
@@ -194,6 +219,13 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
         warn!("Control socket read error: {e}");
         return;
     }
+    // A connection closed without a request is an ownership probe
+    // (`socket_is_live`, run by every starting and exiting daemon), not a
+    // malformed request, so it is not worth a warning.
+    if line.trim().is_empty() {
+        debug!("control connection closed without a request (liveness probe)");
+        return;
+    }
 
     let req: ControlRequest = match serde_json::from_str(line.trim()) {
         Ok(r) => r,
@@ -230,7 +262,7 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
                 protocol_range: Some(kmux_protocol::messages::PROTOCOL_RANGE),
                 kmuxd_version: env!("CARGO_PKG_VERSION").to_string(),
                 kmuxd_build: kmux_protocol::buildinfo::fingerprint(),
-                build_profile: Some(kmux_protocol::dirs::BuildProfile::CURRENT),
+                build_profile: Some(kmux_protocol::compat::BuildProfile::CURRENT),
                 endpoints,
             };
             let mut json = match serde_json::to_string(&response) {
@@ -339,17 +371,153 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
 }
 
 /// RAII guard that removes the socket and PID files when dropped.
+/// Removes this daemon's socket and pid file on exit — and only ever *this*
+/// daemon's.
+///
+/// A graceful restart has the successor bind the same paths while the
+/// predecessor is still winding down, so a guard that unlinks by path alone can
+/// delete the file its replacement just created and leave the new daemon
+/// unreachable. Ownership is therefore established by asking, not by comparing
+/// identifiers:
+///
+/// * the **socket** — is anything listening on it? By the time this runs our own
+///   listener is closed (the guard is declared *before* it, so it drops
+///   *after*), which is what makes the answer mean something: an answer now is
+///   a successor's. Comparing device+inode instead does not work twice over — a
+///   filesystem reuses an inode as soon as its file is unlinked, and a bound
+///   socket's descriptor `fstat`s to the socket object, not to the filesystem
+///   node at the path.
+/// * the **pid file** — does it still hold our pid? It holds one number, and
+///   reading it back is exactly the check a would-be reader performs.
 struct SocketGuard {
     socket_path: PathBuf,
     pid_path: PathBuf,
+    /// This daemon's pid: the pid file is ours exactly when it holds this.
+    pid: u32,
+    /// Set once the socket is bound. Until then there is nothing of ours at
+    /// either path and the guard must keep its hands off.
+    armed: bool,
+}
+
+impl SocketGuard {
+    /// A disarmed guard for this process's socket and pid file.
+    ///
+    /// The pid is this process's own, not whatever the pid file holds now. A
+    /// graceful-restart successor starts while the file still names its
+    /// predecessor and writes its own pid only once the predecessor exits, so
+    /// reading the file here recorded the predecessor's pid, and the successor
+    /// then never removed its own pid file on shutdown.
+    fn for_this_process(socket_path: PathBuf, pid_path: PathBuf) -> Self {
+        Self {
+            socket_path,
+            pid_path,
+            pid: std::process::id(),
+            armed: false,
+        }
+    }
+}
+
+/// The pid a pid file holds, if it holds one.
+fn pid_file_pid(path: &Path) -> Option<u32> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<u32>()
+        .ok()
 }
 
 impl Drop for SocketGuard {
     fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.socket_path);
-        let _ = std::fs::remove_file(&self.pid_path);
+        if !self.armed {
+            return;
+        }
+        if !socket_is_live(&self.socket_path) {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+        if pid_file_pid(&self.pid_path) == Some(self.pid) {
+            let _ = std::fs::remove_file(&self.pid_path);
+        }
     }
 }
+
+/// Whether a daemon is actually listening on `path`.
+///
+/// Only a successful connect proves it. `EPERM`/`EACCES` also means someone is
+/// there — a socket we are not allowed to talk to. Everything else, including a
+/// path that is not a socket at all, means nothing is serving it.
+///
+/// That last part is why this cannot be "any error other than refused is live".
+/// A regular file left at the socket path answers `ECONNREFUSED` on Linux and
+/// `ENOTSOCK` on macOS; treating the unfamiliar errno as liveness made the
+/// daemon refuse to start forever behind a stale file.
+///
+/// `EAGAIN` is retried rather than classified. A Unix socket returns it when the
+/// listener's accept backlog is momentarily full, but the kernel can also
+/// produce it under load for a socket with no listener at all — this test suite
+/// reproduced that roughly once in seven runs. Treating it as liveness outright
+/// would let a genuinely dead socket block startup; treating it as death would
+/// let a busy daemon be evicted. Asking again separates the two: a real listener
+/// is still there a moment later, a dead socket answers `ECONNREFUSED`. The
+/// budget is ~200ms, which a daemon start or exit can afford and which no
+/// observed spurious `EAGAIN` has outlasted.
+///
+/// Blocking, deliberately: both callers are lifecycle moments — binding at
+/// startup and cleaning up on exit — and one of them is a `Drop`, which cannot
+/// await. Connecting to a Unix socket does not wait on the network.
+fn socket_is_live(path: &Path) -> bool {
+    probe_is_live(
+        || std::os::unix::net::UnixStream::connect(path).map(drop),
+        std::thread::sleep,
+    )
+}
+
+/// [`socket_is_live`]'s classification, over any `connect` attempt and pause —
+/// so each errno branch and the retry budget can be driven by a test.
+fn probe_is_live(
+    mut connect: impl FnMut() -> std::io::Result<()>,
+    mut pause: impl FnMut(std::time::Duration),
+) -> bool {
+    use std::io::ErrorKind::{PermissionDenied, WouldBlock};
+    for attempt in 0..SOCKET_PROBE_ATTEMPTS {
+        match connect() {
+            Ok(()) => return true,
+            Err(e) if e.kind() == PermissionDenied => return true,
+            Err(e) if e.kind() == WouldBlock => {
+                if attempt + 1 < SOCKET_PROBE_ATTEMPTS {
+                    pause(SOCKET_PROBE_BACKOFF);
+                }
+            }
+            Err(_) => return false,
+        }
+    }
+    // Still busy after every attempt: assume a listener whose backlog is full.
+    // Refusing to start is recoverable; evicting a live daemon is not.
+    true
+}
+
+/// Refuse to start while another daemon is listening on `socket_path`.
+///
+/// Called by `startup::async_main` before anything with side effects — before
+/// the session checkpoint is restored (which respawns shells) and before the
+/// data socket is bound (which unlinks the live daemon's). Checking only when
+/// the control socket is bound, as the first version did, came after both.
+/// A graceful-restart successor does not call this: the predecessor released
+/// the socket to it.
+pub fn ensure_no_live_daemon(socket_path: &Path) -> anyhow::Result<()> {
+    if socket_is_live(socket_path) {
+        anyhow::bail!(
+            "another daemon is already listening on {}; refusing to start. \
+             Use `kmux daemon stop` or `kmux daemon restart`.",
+            socket_path.display()
+        );
+    }
+    Ok(())
+}
+
+/// How many times [`socket_is_live`] asks before believing an `EAGAIN`.
+const SOCKET_PROBE_ATTEMPTS: u32 = 8;
+/// Pause between those attempts.
+const SOCKET_PROBE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(30);
 
 #[cfg(test)]
 mod tests {
@@ -357,12 +525,17 @@ mod tests {
     use std::time::Instant;
 
     use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-    use tokio::net::UnixStream;
+    use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::Notify;
 
     use kmux_protocol::control_rpc::SessionsResponse;
 
-    use super::{ControlSocketParams, serve_control_socket};
+    use std::path::Path;
+
+    use super::{
+        ControlSocketParams, SOCKET_PROBE_ATTEMPTS, SOCKET_PROBE_BACKOFF, SocketGuard,
+        ensure_no_live_daemon, pid_file_pid, probe_is_live, serve_control_socket, socket_is_live,
+    };
     use crate::app::ServerApp;
 
     #[tokio::test]
@@ -387,6 +560,7 @@ mod tests {
             handoff_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
             listeners: vec![],
             public_host: None,
+            handoff_successor: false,
         };
 
         tokio::spawn(serve_control_socket(params));
@@ -415,5 +589,267 @@ mod tests {
         assert!(resp.unattached.is_empty());
 
         shutdown.notify_waiters();
+    }
+
+    // ─── Socket ownership ────────────────────────────────────────────────────
+
+    fn guard_for(socket: &Path, pid_path: &Path, pid: u32) -> SocketGuard {
+        std::fs::write(pid_path, format!("{pid}\n")).expect("write pid file");
+        SocketGuard {
+            socket_path: socket.to_path_buf(),
+            pid,
+            pid_path: pid_path.to_path_buf(),
+            armed: true,
+        }
+    }
+
+    /// A graceful-restart successor starts while the pid file still names its
+    /// predecessor, and writes its own only once the predecessor has exited.
+    /// The guard must own the pid file by *this* process's pid, or the
+    /// successor never removes its pid file on shutdown.
+    #[test]
+    fn a_successors_guard_removes_the_pid_file_it_claimed_after_starting() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("ctrl.sock");
+        let pid = tmp.path().join("daemon.pid");
+        let predecessor = std::process::id().wrapping_add(1);
+        std::fs::write(&pid, format!("{predecessor}\n")).expect("predecessor's pid file");
+
+        let mut guard = SocketGuard::for_this_process(socket.clone(), pid.clone());
+        assert_eq!(guard.pid, std::process::id(), "not the predecessor's");
+        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind"));
+        guard.armed = true;
+        // The predecessor exits and the successor claims the pid file.
+        std::fs::write(&pid, std::process::id().to_string()).expect("claim");
+
+        drop(guard);
+        assert!(!pid.exists(), "the successor's own pid file is removed");
+        assert!(!socket.exists());
+    }
+
+    /// `EAGAIN` from a connect is asked about again rather than believed: a
+    /// dead socket answers refused a moment later, and is dead.
+    #[test]
+    fn a_probe_that_is_busy_and_then_refused_is_not_live() {
+        let mut answers = vec![
+            Err(std::io::ErrorKind::ConnectionRefused.into()),
+            Err(std::io::ErrorKind::WouldBlock.into()),
+        ];
+        let mut pauses = 0;
+        let live = probe_is_live(|| answers.pop().expect("asked too often"), |_| pauses += 1);
+        assert!(!live);
+        assert_eq!(pauses, 1, "one pause between the two asks");
+        assert!(answers.is_empty(), "asked exactly twice");
+    }
+
+    /// Busy on every one of the attempts: a listener whose backlog is full.
+    /// Refusing to start is recoverable; evicting a live daemon is not.
+    #[test]
+    fn a_probe_busy_for_the_whole_budget_is_live() {
+        let mut asks = 0;
+        let mut pauses = Vec::new();
+        let live = probe_is_live(
+            || {
+                asks += 1;
+                Err(std::io::ErrorKind::WouldBlock.into())
+            },
+            |d| pauses.push(d),
+        );
+        assert!(live);
+        assert_eq!(asks, SOCKET_PROBE_ATTEMPTS);
+        assert_eq!(
+            pauses,
+            vec![SOCKET_PROBE_BACKOFF; SOCKET_PROBE_ATTEMPTS as usize - 1],
+            "a pause between asks, none after the last"
+        );
+    }
+
+    /// A socket we may not connect to still has someone behind it.
+    #[test]
+    fn a_probe_refused_permission_is_live_without_asking_again() {
+        let mut asks = 0;
+        let live = probe_is_live(
+            || {
+                asks += 1;
+                Err(std::io::ErrorKind::PermissionDenied.into())
+            },
+            |_| panic!("no retry for a definite answer"),
+        );
+        assert!(live);
+        assert_eq!(asks, 1);
+    }
+
+    /// The early refusal `async_main` runs before restoring or binding anything.
+    #[test]
+    fn starting_is_refused_only_while_a_daemon_listens() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("ctrl.sock");
+        assert!(ensure_no_live_daemon(&socket).is_ok(), "nothing there");
+
+        let listener = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        let err = ensure_no_live_daemon(&socket).expect_err("a daemon is listening");
+        assert!(
+            err.to_string()
+                .contains("another daemon is already listening"),
+            "{err}"
+        );
+
+        drop(listener);
+        assert!(
+            ensure_no_live_daemon(&socket).is_ok(),
+            "a stale socket file"
+        );
+    }
+
+    /// The graceful-restart race: the successor binds the same path while the
+    /// predecessor is still winding down. A guard that unlinks by path alone
+    /// deletes the *successor's* socket and leaves the new daemon unreachable.
+    ///
+    /// Identity cannot be device+inode. A filesystem reuses an inode as soon as
+    /// its file is unlinked, so the successor's socket can land on the very
+    /// number the predecessor recorded — which is what happened on CI when this
+    /// compared them, and passed locally. Nor can it be the listener's own
+    /// descriptor: a bound Unix socket `fstat`s to the socket object, on a
+    /// different device from the filesystem node at its path.
+    #[test]
+    fn a_guard_does_not_remove_a_socket_a_successor_is_listening_on() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("ctrl.sock");
+        let pid = tmp.path().join("daemon.pid");
+        let guard = guard_for(&socket, &pid, 111);
+
+        // The successor takes over: binds the path and claims the pid file.
+        let _successor = std::os::unix::net::UnixListener::bind(&socket).expect("bind");
+        std::fs::write(&pid, "222\n").expect("rewrite");
+
+        drop(guard);
+        assert!(socket.exists(), "the successor's socket must survive");
+        assert_eq!(
+            pid_file_pid(&pid),
+            Some(222),
+            "and so must its pid file, untouched"
+        );
+    }
+
+    /// The ordinary case: our listener is gone and nothing took its place, so
+    /// both files are stale and ours to remove.
+    #[test]
+    fn a_guard_removes_the_socket_and_pid_file_it_bound() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("ctrl.sock");
+        let pid = tmp.path().join("daemon.pid");
+        let guard = guard_for(&socket, &pid, 111);
+
+        // Bound and then closed, exactly as on the way out.
+        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind"));
+
+        drop(guard);
+        assert!(!socket.exists());
+        assert!(!pid.exists());
+    }
+
+    /// A guard that never got as far as binding must not delete whatever it
+    /// finds at those paths.
+    #[test]
+    fn a_disarmed_guard_removes_nothing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("ctrl.sock");
+        let pid = tmp.path().join("daemon.pid");
+        std::fs::write(&socket, b"someone else").expect("write");
+        std::fs::write(&pid, std::process::id().to_string()).expect("write");
+
+        // Even a pid file naming this very process stays: nothing was bound.
+        drop(SocketGuard::for_this_process(socket.clone(), pid.clone()));
+        assert!(socket.exists(), "not ours, not ours to remove");
+        assert!(pid.exists());
+    }
+
+    /// A pid file another daemon has since claimed stays put even when the
+    /// socket half is stale.
+    #[test]
+    fn a_guard_leaves_a_pid_file_another_daemon_claimed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket = tmp.path().join("ctrl.sock");
+        let pid = tmp.path().join("daemon.pid");
+        let guard = guard_for(&socket, &pid, 111);
+        std::fs::write(&pid, "222\n").expect("rewrite");
+
+        drop(guard);
+        assert_eq!(pid_file_pid(&pid), Some(222));
+    }
+
+    /// Everything that is *not* a daemon accepting connections. The plain-file
+    /// case is the one that matters and the one that differs by platform: Linux
+    /// answers `ECONNREFUSED`, macOS `ENOTSOCK`, and a classification that keyed
+    /// on "refused" alone made a stale file block startup forever on macOS.
+    #[test]
+    fn nothing_serving_a_path_is_not_live_whatever_the_errno() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+
+        let missing = tmp.path().join("never-existed.sock");
+        assert!(!socket_is_live(&missing), "no such file");
+
+        let plain_file = tmp.path().join("stale.sock");
+        std::fs::write(&plain_file, b"").expect("write");
+        assert!(!socket_is_live(&plain_file), "a regular file, not a socket");
+
+        let directory = tmp.path().join("a-directory");
+        std::fs::create_dir(&directory).expect("mkdir");
+        assert!(!socket_is_live(&directory), "a directory");
+
+        // A socket whose listener is gone: what a killed daemon leaves behind.
+        let orphan = tmp.path().join("orphan.sock");
+        drop(std::os::unix::net::UnixListener::bind(&orphan).expect("bind"));
+        assert!(
+            !socket_is_live(&orphan),
+            "a socket with no listener, but connect said {:?}",
+            std::os::unix::net::UnixStream::connect(&orphan).map(|_| "connected")
+        );
+    }
+
+    #[test]
+    fn a_socket_someone_is_listening_on_is_live() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("live.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&path).expect("bind");
+        assert!(socket_is_live(&path));
+    }
+
+    /// The headline: a second daemon must not unlink a running daemon's socket.
+    /// Doing so does not stop it — it only makes it unreachable, leaving the
+    /// host with two daemons and its sessions split between them.
+    #[tokio::test]
+    async fn a_second_daemon_refuses_to_take_over_a_live_control_socket() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = tmp.path().join("ctrl.sock");
+        let pid_path = tmp.path().join("daemon.pid");
+
+        // Stand in for the incumbent: something bound and listening.
+        let incumbent = UnixListener::bind(&socket_path).expect("bind");
+
+        let params = ControlSocketParams {
+            socket_path: socket_path.clone(),
+            pid_path,
+            quic_port: 0,
+            tcp_port: 0,
+            token: "test-token".to_string(),
+            start_time: Instant::now(),
+            app: Arc::new(ServerApp::new("test-token".to_string())),
+            shutdown: Arc::new(Notify::new()),
+            restart: Arc::new(Notify::new()),
+            handoff_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            listeners: vec![],
+            public_host: None,
+            handoff_successor: false,
+        };
+        // Returns rather than binding, and leaves the incumbent's socket alone.
+        serve_control_socket(params).await;
+
+        assert!(socket_path.exists(), "the incumbent's socket must survive");
+        assert!(
+            socket_is_live(&socket_path),
+            "and must still be the incumbent's, not a replacement"
+        );
+        drop(incumbent);
     }
 }

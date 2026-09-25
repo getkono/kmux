@@ -105,6 +105,72 @@ impl ServerApp {
         }
     }
 
+    /// Close the federated session `word_id` on its owning peer and drop it from
+    /// this hub's listing. Errors when the peer is unknown/unreachable, refuses
+    /// the close, or without the feature.
+    pub async fn close_federated_session(&self, word_id: &str) -> Result<(), String> {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.close_remote_session(self, word_id).await
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = word_id;
+            Err("federation is not supported by this daemon yet".to_string())
+        }
+    }
+
+    /// Close tab `tab_index` of the federated session `word_id` on its owning
+    /// peer. Errors when the peer is unknown/unreachable, refuses the close, or
+    /// without the feature.
+    pub async fn close_federated_tab(&self, word_id: &str, tab_index: u32) -> Result<(), String> {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.close_remote_tab(word_id, tab_index).await
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (word_id, tab_index);
+            Err("federation is not supported by this daemon yet".to_string())
+        }
+    }
+
+    /// Forward a session-scoped message with no request id (a layout nudge) for
+    /// the federated session `word_id` to its owning peer, built from the
+    /// peer's word for it. Errors when the peer link is gone or without the
+    /// feature.
+    pub fn forward_federated_session(
+        &self,
+        word_id: &str,
+        build: impl FnOnce(String) -> ClientMessage,
+    ) -> Result<(), String> {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.forward_session_message(word_id, build)
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (word_id, build);
+            Err("federation is not supported by this daemon yet".to_string())
+        }
+    }
+
+    /// Proxy the empty remote session `remote_word` as `local_word` over a
+    /// channel pair standing in for a peer link; see
+    /// [`PeerManager::install_channel_peer`](crate::federation::PeerManager).
+    #[cfg(all(test, feature = "federation"))]
+    pub(crate) fn install_channel_peer(
+        &self,
+        local_word: &str,
+        remote_word: &str,
+    ) -> (
+        mpsc::UnboundedReceiver<ClientMessage>,
+        mpsc::UnboundedSender<ServerMessage>,
+    ) {
+        self.peer_manager
+            .install_channel_peer("peer:1", local_word, remote_word)
+    }
+
     /// Ensure an upstream connection to `target` exists and surface its sessions
     /// locally, returning the peer's stable [`PeerId`]. Without the feature this
     /// reports a "not supported" error the client already handles.

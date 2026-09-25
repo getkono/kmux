@@ -53,13 +53,13 @@ pub enum DisconnectReason {
 impl fmt::Display for DisconnectReason {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            DisconnectReason::ServerClosed => write!(f, "server closed connection"),
-            DisconnectReason::PingTimeout => write!(f, "ping timeout"),
-            DisconnectReason::SshTunnelDied => write!(f, "SSH tunnel died"),
-            DisconnectReason::AuthFailed(s) => write!(f, "auth failed: {s}"),
-            DisconnectReason::BootstrapFailed(s) => write!(f, "reconnect failed: {s}"),
-            DisconnectReason::UserInitiated => write!(f, "disconnected by user"),
-            DisconnectReason::Other(s) => write!(f, "{s}"),
+            Self::ServerClosed => write!(f, "server closed connection"),
+            Self::PingTimeout => write!(f, "ping timeout"),
+            Self::SshTunnelDied => write!(f, "SSH tunnel died"),
+            Self::AuthFailed(s) => write!(f, "auth failed: {s}"),
+            Self::BootstrapFailed(s) => write!(f, "reconnect failed: {s}"),
+            Self::UserInitiated => write!(f, "disconnected by user"),
+            Self::Other(s) => write!(f, "{s}"),
         }
     }
 }
@@ -68,20 +68,20 @@ impl fmt::Display for DisconnectReason {
 impl ConnectionState {
     pub fn badge_label(&self) -> String {
         match self {
-            ConnectionState::Idle => "IDLE".into(),
-            ConnectionState::Handshaking => "HANDSHAKING".into(),
-            ConnectionState::Connected { transport } => format!("CONNECTED · {transport}"),
-            ConnectionState::Reconnecting { attempt } => format!("RECONNECTING #{attempt}"),
-            ConnectionState::Disconnected { .. } => "DISCONNECTED".into(),
+            Self::Idle => "IDLE".into(),
+            Self::Handshaking => "HANDSHAKING".into(),
+            Self::Connected { transport } => format!("CONNECTED · {transport}"),
+            Self::Reconnecting { attempt } => format!("RECONNECTING #{attempt}"),
+            Self::Disconnected { .. } => "DISCONNECTED".into(),
         }
     }
 
     pub fn is_live(&self) -> bool {
-        matches!(self, ConnectionState::Connected { .. })
+        matches!(self, Self::Connected { .. })
     }
 
     pub fn is_disconnected(&self) -> bool {
-        matches!(self, ConnectionState::Disconnected { .. })
+        matches!(self, Self::Disconnected { .. })
     }
 }
 

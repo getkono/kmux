@@ -19,8 +19,8 @@ impl CellColor {
 /// Packed attribute bitfield.
 ///
 /// Bit layout: bold=0, italic=1, underline=2, strikethrough=3,
-/// inverse=4, hidden=5, dim=6, blink=7, wide_char=8, wide_char_spacer=9,
-/// default_fg=10, default_bg=11.
+/// inverse=4, hidden=5, dim=6, blink=7, `wide_char=8`, `wide_char_spacer=9`,
+/// `default_fg=10`, `default_bg=11`.
 ///
 /// `DEFAULT_FG` means the displayed foreground came from the terminal's
 /// "default foreground" colour (i.e. no explicit colour was set).  Clients
@@ -125,12 +125,12 @@ impl Default for CursorState {
 
 /// Terminal mode flags sent alongside diffs.
 ///
-/// Bit 0: APP_CURSOR (application cursor keys mode).
-/// Bit 1: BRACKETED_PASTE (DEC private mode 2004).
-/// Bit 2: MOUSE_REPORT_CLICK (DEC mode 1000 — normal mouse tracking).
-/// Bit 3: MOUSE_DRAG (DEC mode 1002 — button-event tracking).
-/// Bit 4: MOUSE_MOTION (DEC mode 1003 — any-event tracking).
-/// Bit 5: SGR_MOUSE (DEC mode 1006 — SGR extended coordinates).
+/// Bit 0: `APP_CURSOR` (application cursor keys mode).
+/// Bit 1: `BRACKETED_PASTE` (DEC private mode 2004).
+/// Bit 2: `MOUSE_REPORT_CLICK` (DEC mode 1000 — normal mouse tracking).
+/// Bit 3: `MOUSE_DRAG` (DEC mode 1002 — button-event tracking).
+/// Bit 4: `MOUSE_MOTION` (DEC mode 1003 — any-event tracking).
+/// Bit 5: `SGR_MOUSE` (DEC mode 1006 — SGR extended coordinates).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TermModes(pub u16);
 

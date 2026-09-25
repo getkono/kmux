@@ -1,7 +1,7 @@
-//! [`FrontendDriver`]: the toolkit-agnostic run-loop orchestration shared by
+//! [`crate::driver::FrontendDriver`]: the toolkit-agnostic run-loop orchestration shared by
 //! every frontend.
 //!
-//! [`AppCore`] is a passive state machine; *driving* it has always meant the
+//! [`crate::core::AppCore`] is a passive state machine; *driving* it has always meant the
 //! same arm-for-arm loop — own the four network channels, drain server messages,
 //! settle a debounced resize, handle the bootstrap outcome (and launch the SSH
 //! supervisor), apply a transport upgrade, react to a tunnel death, tick the
@@ -12,24 +12,24 @@
 //!
 //! `FrontendDriver` lifts that orchestration here. A frontend now:
 //!
-//! - builds an [`AppCore`] with its own capabilities, wraps it with
-//!   [`FrontendDriver::new`] (which creates the channels and kicks off the
+//! - builds an [`crate::core::AppCore`] with its own capabilities, wraps it with
+//!   [`crate::driver::FrontendDriver::new`] (which creates the channels and kicks off the
 //!   initial bootstrap),
-//! - calls [`FrontendDriver::tick`] once per frame from its own loop (a glib
-//!   timeout, a `CVDisplayLink`, …) and acts on the returned [`FrontendEffect`]s
+//! - calls [`crate::driver::FrontendDriver::tick`] once per frame from its own loop (a glib
+//!   timeout, a `CVDisplayLink`, …) and acts on the returned [`crate::driver::FrontendEffect`]s
 //!   (repaint, copy to clipboard, request paste, quit),
-//! - feeds input in via [`dispatch_action`](FrontendDriver::dispatch_action),
-//!   [`send_keys`](FrontendDriver::send_keys), [`request_resize`], the picker
+//! - feeds input in via [`dispatch_action`](crate::driver::FrontendDriver::dispatch_action),
+//!   [`send_keys`](crate::driver::FrontendDriver::send_keys), [`request_resize`], the picker
 //!   drivers, …,
-//! - reads state out via [`Deref`] to [`AppCore`] (`driver.mgr`, `driver.mode`,
-//!   `driver.palette`, …) plus [`active_grid`](FrontendDriver::active_grid) and
-//!   [`blink_on`](FrontendDriver::blink_on).
+//! - reads state out via [`Deref`](std::ops::Deref) to [`crate::core::AppCore`] (`driver.mgr`, `driver.mode`,
+//!   `driver.palette`, …) plus [`active_grid`](crate::driver::FrontendDriver::active_grid) and
+//!   [`blink_on`](crate::driver::FrontendDriver::blink_on).
 //!
 //! It owns no run loop and no runtime: it assumes an *ambient* tokio runtime
 //! (the spawning paths use the current `Handle`) exactly as the frontends do
 //! today, so the caller stays in control of the loop and the runtime.
 //!
-//! [`request_resize`]: FrontendDriver::request_resize
+//! [`request_resize`]: crate::driver::FrontendDriver::request_resize
 
 mod blink;
 mod clipboard;
@@ -39,7 +39,7 @@ pub use blink::{CURSOR_BLINK_HALF, advance_blink};
 pub use clipboard::sanitize_clipboard_text;
 
 use std::collections::HashMap;
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
 use std::time::{Duration, Instant};
 
 use kmux_client::connection_state::DisconnectReason;
@@ -133,7 +133,7 @@ pub enum FrontendEffect {
     /// it — hence this dedicated effect (see [`crate::mode::Action::ResetRenderer`]).
     ResetRenderer,
     /// The `/theme` palette changed; reload toolkit-specific chrome styling.
-    /// Implies a repaint. Read the new palette from [`FrontendDriver::palette`].
+    /// Implies a repaint. Read the new palette from [`crate::core::AppCore::palette`].
     PaletteChanged,
     /// Copy this (already NUL-sanitized) text to the system clipboard.
     CopyToClipboard(String),
@@ -309,8 +309,7 @@ impl FrontendDriver {
         self.tick_metrics(now);
         dirty |= self.tick_blink(now);
 
-        if self.core.needs_render {
-            self.core.needs_render = false;
+        if self.core.take_render_request() {
             dirty = true;
         }
         if self.core.force_clear {
@@ -338,11 +337,11 @@ impl FrontendDriver {
     /// Reflect a `/theme` palette change. The grid reads the palette live; this
     /// only flags the toolkit-specific chrome reload.
     fn detect_palette_change(&mut self) -> bool {
-        if self.core.palette != self.last_palette {
+        if self.core.palette == self.last_palette {
+            false
+        } else {
             self.last_palette = self.core.palette.clone();
             true
-        } else {
-            false
         }
     }
 
@@ -424,7 +423,7 @@ impl FrontendDriver {
 
     /// Extract per-diff timing from a drained batch for the tearing detector and
     /// frame trace (issue #72). Returns `(applied, tick_cells)` where `applied`
-    /// is every seqno/sent_at/ops applied this tick and `tick_cells` is, per
+    /// is every `seqno/sent_at/ops` applied this tick and `tick_cells` is, per
     /// pane, the `(min, max)` `sent_at_ms` over cell diffs with `>= tear_min_ops`
     /// ops (the ones that count as logical-frame content).
     fn collect_tick_diagnostics(
@@ -681,15 +680,15 @@ impl FrontendDriver {
     /// Dispatch a toolkit-agnostic [`Action`]. Reconnect / server-switch results
     /// are applied internally (channel rebuild + bootstrap); clipboard / quit
     /// results are returned as [`FrontendEffect`]s.
-    pub async fn dispatch_action(&mut self, action: Action) -> Vec<FrontendEffect> {
+    pub fn dispatch_action(&mut self, action: Action) -> Vec<FrontendEffect> {
         let mut effects = Vec::new();
-        let result = self.core.dispatch_action(action).await;
+        let result = self.core.dispatch_action(action);
         self.handle_key_result(result, &mut effects);
         effects
     }
 
     /// Apply a pointer-driven top-bar action (server badge / session picker /
-    /// pane tab click). Same effect handling as [`dispatch_action`].
+    /// pane tab click). Same effect handling as [`Self::dispatch_action`].
     pub fn apply_top_bar_action(
         &mut self,
         action: crate::core::TopBarAction,
@@ -702,7 +701,7 @@ impl FrontendDriver {
     }
 
     /// Activate the current picker's selection (a click on a list item). Same
-    /// effect handling as [`dispatch_action`].
+    /// effect handling as [`Self::dispatch_action`].
     pub fn activate_picker_selection(&mut self) -> Vec<FrontendEffect> {
         let mut effects = Vec::new();
         if let Some(result) = self.core.activate_picker_selection() {
@@ -750,7 +749,7 @@ impl FrontendDriver {
         let target = self.core.current_target();
         self.core
             .start_bootstrap(target, srv_tx, BootstrapPhase::Reconnect, bs_tx);
-        self.core.needs_render = true;
+        self.core.request_render();
     }
 
     /// Forward a batch of key events to the active pane's PTY, and reset the
@@ -810,7 +809,7 @@ impl FrontendDriver {
     /// Report whether the app window is backgrounded/minimized/occluded, for
     /// auto-pause (issue #68). Backgrounding arms a debounce (the connection
     /// auto-pauses from a later [`tick`](Self::tick) if still backgrounded after
-    /// [`AUTO_PAUSE_DEBOUNCE`]); foregrounding resumes immediately. A *manual*
+    /// `AUTO_PAUSE_DEBOUNCE`); foregrounding resumes immediately. A *manual*
     /// pause is unaffected and persists across focus changes.
     pub fn set_window_background(&mut self, backgrounded: bool) {
         if backgrounded {
@@ -864,7 +863,7 @@ impl FrontendDriver {
         self.core.render_debug_visible
     }
 
-    /// Assemble a [`RenderDebugSnapshot`] for the focused pane, supplying the
+    /// Assemble a [`crate::core::RenderDebugSnapshot`] for the focused pane, supplying the
     /// driver's current blink phase. The frontend passes its own pixel/scale/
     /// renderer context.
     pub fn render_debug_snapshot(
@@ -884,9 +883,46 @@ impl FrontendDriver {
         &self.core
     }
 
-    /// Borrow the wrapped [`AppCore`] (mutate). See [`core`](Self::core).
-    pub fn core_mut(&mut self) -> &mut AppCore {
+    /// Mutate the core, and ask for a frame.
+    ///
+    /// Every frontend mutation is followed by a render request, and the two used
+    /// to be separate statements at fifty-odd call sites across `kmux-ffi` and
+    /// `kmux-gtk`. Forgetting the second is silent: the state changes and the
+    /// user sees the previous frame until something unrelated repaints. Here the
+    /// request is not something a caller remembers.
+    ///
+    /// This replaces `core_mut()` and `DerefMut`, which handed every frontend a
+    /// `&mut` to all of `AppCore` for the sake of one field.
+    pub fn mutate<T>(&mut self, f: impl FnOnce(&mut AppCore) -> T) -> T {
+        let out = f(&mut self.core);
+        self.core.request_render();
+        out
+    }
+
+    /// Borrow the session manager mutably.
+    ///
+    /// The one piece of core state a frontend legitimately drives: selection,
+    /// scrolling, pane sizes and mouse reporting all live on it and all follow
+    /// the pointer, at a rate the driver's tick already repaints for. Naming it
+    /// is the point — with `DerefMut` gone, this is the only field of `AppCore`
+    /// a frontend can still reach into, instead of all forty-eight.
+    pub fn mgr_mut(&mut self) -> &mut kmux_client::session_manager::SessionManager {
+        &mut self.core.mgr
+    }
+
+    /// Borrow the core mutably *without* requesting a frame.
+    ///
+    /// For the one caller that mutates only to put the state back: building
+    /// command-palette hints needs a `Mode::Command` to read the buffer out of,
+    /// and restores the previous mode before returning. Nothing changed, so
+    /// nothing needs repainting.
+    pub fn core_for_query(&mut self) -> &mut AppCore {
         &mut self.core
+    }
+
+    /// Ask the frontend for a frame. See [`AppCore::request_render`].
+    pub fn request_render(&mut self) {
+        self.core.request_render();
     }
 }
 
@@ -896,12 +932,6 @@ impl Deref for FrontendDriver {
     type Target = AppCore;
     fn deref(&self) -> &AppCore {
         &self.core
-    }
-}
-
-impl DerefMut for FrontendDriver {
-    fn deref_mut(&mut self) -> &mut AppCore {
-        &mut self.core
     }
 }
 
@@ -995,7 +1025,7 @@ mod tests {
         let (mut driver, _srv_tx, _bs_tx) = FrontendDriver::for_test(fixture_core());
         let other = crate::theme::builtin_theme("dracula").unwrap();
         assert_ne!(&driver.palette, &other, "fixture must differ from dracula");
-        driver.core_mut().palette = other;
+        driver.mutate(|core| core.palette = other);
         let effects = driver.tick();
         assert!(effects.contains(&FrontendEffect::PaletteChanged));
         assert!(effects.contains(&FrontendEffect::NeedsRender));

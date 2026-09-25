@@ -290,7 +290,7 @@ mod tests {
     use super::*;
     use crate::persist::{PersistedDaemonState, STATE_VERSION};
 
-    fn write_state(state: &PersistedDaemonState, path: &std::path::Path) {
+    fn write_state(state: &PersistedDaemonState, path: &Path) {
         let bytes = postcard::to_allocvec(state).unwrap();
         std::fs::write(path, bytes).unwrap();
     }

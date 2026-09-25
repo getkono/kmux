@@ -47,7 +47,7 @@ const GLYPH_ATTRS: [wgpu::VertexAttribute; 3] =
 
 fn solid_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<SolidInstance>() as wgpu::BufferAddress,
+        array_stride: size_of::<SolidInstance>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &SOLID_ATTRS,
     }
@@ -55,7 +55,7 @@ fn solid_layout() -> wgpu::VertexBufferLayout<'static> {
 
 fn glyph_layout() -> wgpu::VertexBufferLayout<'static> {
     wgpu::VertexBufferLayout {
-        array_stride: std::mem::size_of::<GlyphInstance>() as wgpu::BufferAddress,
+        array_stride: size_of::<GlyphInstance>() as wgpu::BufferAddress,
         step_mode: wgpu::VertexStepMode::Instance,
         attributes: &GLYPH_ATTRS,
     }

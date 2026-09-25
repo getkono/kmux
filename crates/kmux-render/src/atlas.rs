@@ -303,7 +303,7 @@ mod tests {
         // A primary that definitely lacks these PUA glyphs: reuse a system face
         // if present, else the fallback itself (which maps them) — either way
         // the assertion below exercises the fallback branch for the system case.
-        let primary_font = primary.as_ref().and_then(|f| f.as_ref()).unwrap_or(fb);
+        let primary_font = primary.as_ref().and_then(FontFace::as_ref).unwrap_or(fb);
         let mut atlas = Atlas::new(256);
 
         for ch in ['\u{e0b0}', '\u{e0b1}', '\u{e0a0}', '\u{f015}'] {

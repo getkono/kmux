@@ -35,13 +35,10 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// predecessor is reachable or it declines/mismatches — the caller then falls
 /// back to a normal snapshot restore.
 pub async fn run() -> anyhow::Result<Option<Outcome>> {
-    let path = kmux_protocol::dirs::handoff_socket_path()?;
-    let stream = match connect_with_retry(&path).await {
-        Some(s) => s,
-        None => {
-            warn!("handoff: no predecessor handoff socket; falling back to snapshot restore");
-            return Ok(None);
-        }
+    let path = kmux_sys::dirs::handoff_socket_path()?;
+    let Some(stream) = connect_with_retry(&path).await else {
+        warn!("handoff: no predecessor handoff socket; falling back to snapshot restore");
+        return Ok(None);
     };
 
     // Handshake: read Hello, verify the protocol version.
@@ -77,8 +74,7 @@ pub async fn run() -> anyhow::Result<Option<Outcome>> {
         let pid = panes
             .iter()
             .find(|p| p.pane_id == pane_id)
-            .map(|p| p.pid)
-            .unwrap_or(0);
+            .map_or(0, |p| p.pid);
         inherited.insert(pane_id, (fd, Pid::from_raw(pid)));
         write_frame(&stream, &HandoffMessage::PaneFdAck, None).await?;
     }

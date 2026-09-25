@@ -65,7 +65,7 @@ pub enum ClientMessage {
 
     /// Second handshake message: the Ed25519 signature over the nonce the daemon
     /// sent in [`super::server::ServerMessage::AuthChallenge`], proving the client
-    /// holds the private key for the `public_key` it presented in [`Auth`]. On
+    /// holds the private key for the `public_key` it presented in [`ClientMessage::Auth`]. On
     /// success the daemon replies with `AuthResult`.
     AuthProof {
         #[serde(with = "serde_bytes")]
@@ -895,7 +895,7 @@ mod tests {
                     word_id: "w".into(),
                     tab_index: 0,
                     from_pane: 0,
-                    dir: super::super::session::SplitDir::Horizontal,
+                    dir: SplitDir::Horizontal,
                     program: None,
                     args: vec![],
                     size: TermSize::default(),
@@ -924,7 +924,7 @@ mod tests {
                 ClientMessage::ApplyLayoutScheme {
                     word_id: "w".into(),
                     tab_index: 0,
-                    scheme: super::super::session::LayoutScheme::MainVertical,
+                    scheme: LayoutScheme::MainVertical,
                 },
                 MessageCategory::Control,
             ),

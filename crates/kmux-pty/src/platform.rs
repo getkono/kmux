@@ -21,7 +21,7 @@ pub fn to_winsize(size: WindowSize) -> Winsize {
 pub fn set_winsize(fd: std::os::unix::io::RawFd, size: WindowSize) -> nix::Result<()> {
     let ws = to_winsize(size);
     // SAFETY: fd is a valid PTY master fd owned by the caller.
-    unsafe { nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, &ws as *const Winsize) };
+    unsafe { nix::libc::ioctl(fd, nix::libc::TIOCSWINSZ, &raw const ws) };
     Ok(())
 }
 

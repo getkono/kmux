@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+#MISE description="Re-measure the quality baseline and write quality-baseline.toml."
+#
+# The tightening half of the ratchet. Run it after clearing violations: it
+# rewrites every budget to what is actually there now, so an improvement is
+# recorded rather than left as slack a later regression could hide in.
+#
+# It will also *loosen* a budget, because it simply writes what it measures --
+# that is fine, because it is a deliberate edit to a checked-in file that shows
+# up in review. What makes this a ratchet is that CI never runs it: CI only ever
+# runs `mise run lint-gate`, which fails on a mismatch in either direction.
+set -euo pipefail
+exec "$(dirname "$0")/lint-gate" --write

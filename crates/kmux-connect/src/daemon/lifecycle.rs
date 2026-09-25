@@ -1,14 +1,26 @@
 use std::io::{Read, Seek, SeekFrom};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use kmux_sys::dirs::Dirs;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 
-use super::{DaemonStatus, query_daemon};
+use super::{DaemonStatus, query_daemon_at};
 
 /// Maximum bytes of each log file to include in a failure error.
 const BOOT_LOG_TAIL_MAX: u64 = 8 * 1024;
+
+/// The `KMUX_KMUXD` override, read once at the environment boundary.
+///
+/// Every function below takes the override as a parameter instead of reading it
+/// itself, so a test can pin a stub `kmuxd` without mutating the process
+/// environment (docs/testing.md R3). Returns the raw value; validity (`is_file`)
+/// is decided by [`find_server_binary_with`], so a stale override still falls
+/// through to discovery.
+fn kmuxd_override() -> Option<PathBuf> {
+    std::env::var_os("KMUX_KMUXD").map(PathBuf::from)
+}
 
 /// Remove daemon artifacts only when no process owns the PID-file lock.
 ///
@@ -17,11 +29,11 @@ const BOOT_LOG_TAIL_MAX: u64 = 8 * 1024;
 /// A held lock proves an active daemon owns the PID file. In that case the
 /// socket is preserved and automatic startup fails safely instead of making the
 /// existing listener unreachable or signalling an unverified PID.
-pub(super) fn cleanup_stale_daemon() -> anyhow::Result<()> {
+pub(super) fn cleanup_stale_daemon_in(dirs: &Dirs) -> anyhow::Result<()> {
     use std::os::unix::io::AsRawFd;
 
-    let pid_path = kmux_protocol::dirs::pid_path()?;
-    let socket_path = kmux_protocol::dirs::socket_path()?;
+    let pid_path = dirs.pid_path()?;
+    let socket_path = dirs.socket_path()?;
 
     if pid_path.exists() {
         let pid_file = std::fs::OpenOptions::new()
@@ -36,9 +48,10 @@ pub(super) fn cleanup_stale_daemon() -> anyhow::Result<()> {
         ) {
             Ok(()) => {}
             Err(nix::errno::Errno::EWOULDBLOCK) => {
-                let owner = read_pid_file(&pid_path)
-                    .map(|pid| format!("PID {pid}"))
-                    .unwrap_or_else(|| "an active process".to_string());
+                let owner = read_pid_file(&pid_path).map_or_else(
+                    || "an active process".to_string(),
+                    |pid| format!("PID {pid}"),
+                );
                 return Err(anyhow::anyhow!(
                     "{owner} owns the daemon PID file but the control socket is unresponsive; \
                      automatic startup left it untouched. Inspect `kmux daemon status` and \
@@ -64,10 +77,10 @@ pub(super) fn cleanup_stale_daemon() -> anyhow::Result<()> {
 }
 
 /// Path to the file that captures kmuxd's stdout+stderr across a spawn attempt.
-/// Delegates to the shared [`kmux_protocol::dirs::boot_log_path`] so every
-/// daemon-spawn site (here, `probe-or-start`, the handoff successor) agrees.
-fn boot_log_path() -> anyhow::Result<PathBuf> {
-    kmux_protocol::dirs::boot_log_path()
+/// Delegates to the shared [`Dirs::boot_log_path`] so every daemon-spawn site
+/// (here, `probe-or-start`, the handoff successor) agrees.
+fn boot_log_path_in(dirs: &Dirs) -> anyhow::Result<PathBuf> {
+    dirs.boot_log_path()
 }
 
 /// Spawn `kmuxd` with [`kmux_protocol::control_rpc::DAEMON_BOOT_ARGS`]
@@ -92,14 +105,17 @@ fn boot_log_path() -> anyhow::Result<PathBuf> {
 /// - `Ok(None)` if another process already holds the spawn lock (the caller
 ///   should just poll `query_daemon()`).
 /// - `Err(_)` for any other failure (bad binary, filesystem error, …).
-pub(crate) fn start_daemon() -> anyhow::Result<Option<std::process::Child>> {
+pub(crate) fn start_daemon_in(
+    dirs: &Dirs,
+    kmuxd: Option<&Path>,
+) -> anyhow::Result<Option<std::process::Child>> {
     use std::os::unix::fs::OpenOptionsExt;
 
-    cleanup_stale_daemon()?;
+    cleanup_stale_daemon_in(dirs)?;
 
     // Acquire a non-blocking exclusive flock on the spawn lock to serialize
     // concurrent kmux invocations that all try to start a daemon at once.
-    let spawn_lock_path = kmux_protocol::dirs::spawn_lock_path()?;
+    let spawn_lock_path = dirs.spawn_lock_path()?;
     let lock_file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -112,8 +128,8 @@ pub(crate) fn start_daemon() -> anyhow::Result<Option<std::process::Child>> {
     use nix::fcntl::{FlockArg, flock};
     use std::os::unix::io::AsRawFd;
     #[allow(deprecated)]
-    if let Err(nix::errno::Errno::EWOULDBLOCK) =
-        flock(lock_file.as_raw_fd(), FlockArg::LockExclusiveNonblock)
+    if flock(lock_file.as_raw_fd(), FlockArg::LockExclusiveNonblock)
+        == Err(nix::errno::Errno::EWOULDBLOCK)
     {
         // Another process is in the middle of starting a daemon — let the
         // caller retry query_daemon() rather than starting a second one.
@@ -122,10 +138,10 @@ pub(crate) fn start_daemon() -> anyhow::Result<Option<std::process::Child>> {
 
     // Resolve the server binary path. In development `kmuxd` is a
     // sibling binary; in an installed layout it must be on PATH.
-    let server_bin = find_server_binary()?;
+    let server_bin = find_server_binary_with(kmuxd)?;
 
     // Capture kmuxd's stdio so a crash during boot leaves a trail.
-    let log_path = boot_log_path()?;
+    let log_path = boot_log_path_in(dirs)?;
     let log_file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -152,13 +168,21 @@ pub(crate) fn start_daemon() -> anyhow::Result<Option<std::process::Child>> {
 /// Returns `""` when the log is missing or empty. Capped at
 /// `BOOT_LOG_TAIL_MAX` bytes so a runaway log doesn't overwhelm the error.
 pub(super) fn format_boot_log_hint() -> String {
-    let Ok(path) = boot_log_path() else {
+    let Ok(dirs) = Dirs::from_env() else {
+        return String::new();
+    };
+    format_boot_log_hint_in(&dirs)
+}
+
+/// [`format_boot_log_hint`] against an explicit [`Dirs`].
+fn format_boot_log_hint_in(dirs: &Dirs) -> String {
+    let Ok(path) = boot_log_path_in(dirs) else {
         return String::new();
     };
     let Ok(mut file) = std::fs::File::open(&path) else {
         return String::new();
     };
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let len = file.metadata().map_or(0, |m| m.len());
     if len == 0 {
         return String::new();
     }
@@ -167,6 +191,13 @@ pub(super) fn format_boot_log_hint() -> String {
         return String::new();
     }
     let mut bytes = Vec::new();
+    // Not `fs::read`: the seek above is the point — this reads only the tail of
+    // a log that may be arbitrarily large, and `fs::read` would start over at
+    // byte zero and pull the whole file into memory.
+    #[expect(
+        clippy::verbose_file_reads,
+        reason = "reads from a seek offset, which fs::read cannot express"
+    )]
     if file.read_to_end(&mut bytes).is_err() {
         return String::new();
     }
@@ -185,26 +216,25 @@ pub(super) fn format_boot_log_hint() -> String {
 ///
 /// Call this before spawning so `format_daemon_log_tail` can show only the new
 /// entries written by this particular spawn attempt.
-fn daemon_log_size() -> u64 {
-    kmux_protocol::dirs::daemon_log_path()
+fn daemon_log_size_in(dirs: &Dirs) -> u64 {
+    dirs.daemon_log_path()
         .ok()
         .and_then(|p| std::fs::metadata(&p).ok())
-        .map(|m| m.len())
-        .unwrap_or(0)
+        .map_or(0, |m| m.len())
 }
 
 /// Read daemon.log from `from_offset` to the end and format it as an error suffix.
 ///
 /// Only shows content written after `from_offset` so old runtime log entries
 /// from a previous daemon instance do not appear in startup failure messages.
-fn format_daemon_log_tail(from_offset: u64) -> String {
-    let Ok(path) = kmux_protocol::dirs::daemon_log_path() else {
+fn format_daemon_log_tail_in(dirs: &Dirs, from_offset: u64) -> String {
+    let Ok(path) = dirs.daemon_log_path() else {
         return String::new();
     };
     let Ok(mut file) = std::fs::File::open(&path) else {
         return String::new();
     };
-    let len = file.metadata().map(|m| m.len()).unwrap_or(0);
+    let len = file.metadata().map_or(0, |m| m.len());
     if len <= from_offset {
         return String::new();
     }
@@ -217,6 +247,13 @@ fn format_daemon_log_tail(from_offset: u64) -> String {
         return String::new();
     }
     let mut bytes = Vec::new();
+    // Not `fs::read`: the seek above is the point — this reads only the tail of
+    // a log that may be arbitrarily large, and `fs::read` would start over at
+    // byte zero and pull the whole file into memory.
+    #[expect(
+        clippy::verbose_file_reads,
+        reason = "reads from a seek offset, which fs::read cannot express"
+    )]
     if file.read_to_end(&mut bytes).is_err() {
         return String::new();
     }
@@ -238,18 +275,30 @@ fn format_daemon_log_tail(from_offset: u64) -> String {
 /// with the captured stdio, instead of waiting out the full timeout. A clean
 /// `exit(0)` is normal after the double-fork daemonization completes.
 pub async fn ensure_daemon() -> anyhow::Result<DaemonStatus> {
+    ensure_daemon_in(&Dirs::from_env()?, kmuxd_override().as_deref()).await
+}
+
+/// [`ensure_daemon`] against an explicit [`Dirs`] and an explicit `kmuxd`
+/// override (the `KMUX_KMUXD` value, or `None`).
+///
+/// This is the whole implementation; [`ensure_daemon`] only resolves the two
+/// environment inputs. A test builds `Dirs::rooted(tmp)` and points `kmuxd` at a
+/// stub binary, so nothing about it depends on process-global state.
+pub async fn ensure_daemon_in(dirs: &Dirs, kmuxd: Option<&Path>) -> anyhow::Result<DaemonStatus> {
+    let socket = dirs.socket_path()?;
+
     // Fast path — existing daemon.
-    if let Some(status) = query_daemon().await {
+    if let Some(status) = query_daemon_at(&socket).await {
         return Ok(status);
     }
 
     // Snapshot daemon log position so we only surface entries written by
     // this spawn attempt, not leftover lines from a previous daemon run.
-    let daemon_log_offset = daemon_log_size();
+    let daemon_log_offset = daemon_log_size_in(dirs);
 
     // Slow path — start a new daemon. `None` means another process is already
     // starting one; we just poll in that case.
-    let mut spawned = start_daemon()?;
+    let mut spawned = start_daemon_in(dirs, kmuxd)?;
     let mut ever_spawned = spawned.is_some();
 
     // Poll until the daemon is ready.
@@ -258,7 +307,7 @@ pub async fn ensure_daemon() -> anyhow::Result<DaemonStatus> {
     loop {
         tokio::time::sleep(Duration::from_millis(100)).await;
 
-        if let Some(status) = query_daemon().await {
+        if let Some(status) = query_daemon_at(&socket).await {
             return Ok(status);
         }
 
@@ -269,7 +318,7 @@ pub async fn ensure_daemon() -> anyhow::Result<DaemonStatus> {
             if !exit.success() {
                 return Err(anyhow::anyhow!(
                     "kmuxd exited with status {exit} before becoming ready{}",
-                    format_boot_log_hint()
+                    format_boot_log_hint_in(dirs)
                 ));
             }
             // exit(0) → daemonize()'s top-level process completed normally;
@@ -284,7 +333,7 @@ pub async fn ensure_daemon() -> anyhow::Result<DaemonStatus> {
         // After 3 s with no response, try to clean up and restart once.
         if !retry_start && tokio::time::Instant::now() >= (deadline - Duration::from_secs(2)) {
             retry_start = true;
-            match start_daemon() {
+            match start_daemon_in(dirs, kmuxd) {
                 Ok(Some(s)) => {
                     spawned = Some(s);
                     ever_spawned = true;
@@ -297,9 +346,9 @@ pub async fn ensure_daemon() -> anyhow::Result<DaemonStatus> {
 
     // Build a diagnostic hint: boot log (stderr captured during spawn) plus
     // any new daemon.log lines written by the grandchild after daemonizing.
-    let boot_hint = format_boot_log_hint();
+    let boot_hint = format_boot_log_hint_in(dirs);
     let daemon_hint = if ever_spawned {
-        format_daemon_log_tail(daemon_log_offset)
+        format_daemon_log_tail_in(dirs, daemon_log_offset)
     } else {
         String::new()
     };
@@ -322,7 +371,7 @@ pub fn pid_alive(pid: u32) -> bool {
     kill(Pid::from_raw(pid as i32), None).is_ok()
 }
 
-pub(super) fn read_pid_file(path: &std::path::Path) -> Option<u32> {
+pub(super) fn read_pid_file(path: &Path) -> Option<u32> {
     std::fs::read_to_string(path)
         .ok()?
         .trim()
@@ -339,7 +388,12 @@ pub(super) fn read_pid_file(path: &std::path::Path) -> Option<u32> {
 /// signal. Returns `None` when there is no pid file, it is unparseable, or the
 /// PID it names is already dead.
 pub fn running_daemon_pid() -> Option<u32> {
-    let pid_path = kmux_protocol::dirs::pid_path().ok()?;
+    running_daemon_pid_in(&Dirs::from_env().ok()?)
+}
+
+/// [`running_daemon_pid`] against an explicit [`Dirs`].
+pub fn running_daemon_pid_in(dirs: &Dirs) -> Option<u32> {
+    let pid_path = dirs.pid_path().ok()?;
     let pid = read_pid_file(&pid_path)?;
     pid_alive(pid).then_some(pid)
 }
@@ -380,15 +434,27 @@ pub async fn wait_for_exit(pid: u32, timeout: Duration) -> bool {
 ///
 /// `nix` signalling is the platform-agnostic primitive across kmux's supported
 /// targets (macOS + Linux). Automatic startup never uses this path; it relies
-/// on the PID-file lock in [`cleanup_stale_daemon`] instead.
+/// on the PID-file lock in `cleanup_stale_daemon` instead.
 pub async fn force_kill_daemon(pid: u32, term_first: bool, grace: Duration) -> anyhow::Result<()> {
+    force_kill_daemon_in(&Dirs::from_env()?, pid, term_first, grace).await
+}
+
+/// [`force_kill_daemon`] against an explicit [`Dirs`] — the sweep of the stale
+/// pid/socket files happens under `dirs`, so a test never touches the real
+/// runtime dir.
+pub async fn force_kill_daemon_in(
+    dirs: &Dirs,
+    pid: u32,
+    term_first: bool,
+    grace: Duration,
+) -> anyhow::Result<()> {
     let nix_pid = Pid::from_raw(pid as i32);
 
     if term_first {
         match kill(nix_pid, Signal::SIGTERM) {
             Ok(()) => {}
             Err(nix::errno::Errno::ESRCH) => {
-                let _ = cleanup_stale_daemon();
+                let _ = cleanup_stale_daemon_in(dirs);
                 return Ok(());
             }
             Err(e) => {
@@ -396,7 +462,7 @@ pub async fn force_kill_daemon(pid: u32, term_first: bool, grace: Duration) -> a
             }
         }
         if wait_for_exit(pid, grace).await {
-            let _ = cleanup_stale_daemon();
+            let _ = cleanup_stale_daemon_in(dirs);
             return Ok(());
         }
     }
@@ -404,7 +470,7 @@ pub async fn force_kill_daemon(pid: u32, term_first: bool, grace: Duration) -> a
     match kill(nix_pid, Signal::SIGKILL) {
         Ok(()) => {}
         Err(nix::errno::Errno::ESRCH) => {
-            let _ = cleanup_stale_daemon();
+            let _ = cleanup_stale_daemon_in(dirs);
             return Ok(());
         }
         Err(e) => {
@@ -415,7 +481,7 @@ pub async fn force_kill_daemon(pid: u32, term_first: bool, grace: Duration) -> a
     // SIGKILL cannot be caught, but process teardown is asynchronous — give the
     // kernel a brief, bounded window to reap it before we verify.
     if wait_for_exit(pid, Duration::from_secs(2)).await {
-        let _ = cleanup_stale_daemon();
+        let _ = cleanup_stale_daemon_in(dirs);
         Ok(())
     } else {
         Err(anyhow::anyhow!(
@@ -425,16 +491,22 @@ pub async fn force_kill_daemon(pid: u32, term_first: bool, grace: Duration) -> a
     }
 }
 
-pub(crate) fn find_server_binary() -> anyhow::Result<std::path::PathBuf> {
+pub(crate) fn find_server_binary() -> anyhow::Result<PathBuf> {
+    find_server_binary_with(kmuxd_override().as_deref())
+}
+
+/// [`find_server_binary`] with the `KMUX_KMUXD` override passed in rather than
+/// read from the environment, so a test can exercise each precedence step
+/// without mutating process-global state.
+pub(crate) fn find_server_binary_with(override_path: Option<&Path>) -> anyhow::Result<PathBuf> {
     // 0. Explicit override (dev workflows, unusual layouts). Mirrors `KMUX_BIN`
     //    (diagnostic emitter) and `KMUX_APP` (macOS bundle). Honored only when it
-    //    points at a real file, so a stale env var falls through to discovery
+    //    points at a real file, so a stale value falls through to discovery
     //    rather than hard-failing.
-    if let Some(path) = std::env::var_os("KMUX_KMUXD") {
-        let candidate = std::path::PathBuf::from(path);
-        if candidate.is_file() {
-            return Ok(candidate);
-        }
+    if let Some(candidate) = override_path
+        && candidate.is_file()
+    {
+        return Ok(candidate.to_path_buf());
     }
 
     // 1. Same directory as the running executable (typical installed layout).
@@ -455,7 +527,7 @@ pub(crate) fn find_server_binary() -> anyhow::Result<std::path::PathBuf> {
     //    baked at build time from the crate's `OUT_DIR` (see `build.rs`).
     #[cfg(debug_assertions)]
     if let Some(dir) = option_env!("KMUXD_TARGET_DIR") {
-        let candidate = std::path::Path::new(dir).join("kmuxd");
+        let candidate = Path::new(dir).join("kmuxd");
         if candidate.is_file() {
             return Ok(candidate);
         }
@@ -472,10 +544,14 @@ pub(crate) fn find_server_binary() -> anyhow::Result<std::path::PathBuf> {
     ))
 }
 
-pub(super) fn which_server() -> anyhow::Result<std::path::PathBuf> {
-    let path_var = std::env::var("PATH").unwrap_or_default();
+pub(super) fn which_server() -> anyhow::Result<PathBuf> {
+    which_server_on(&std::env::var("PATH").unwrap_or_default())
+}
+
+/// [`which_server`] with the search path passed in rather than read from `PATH`.
+pub(super) fn which_server_on(path_var: &str) -> anyhow::Result<PathBuf> {
     for dir in path_var.split(':') {
-        let candidate = std::path::Path::new(dir).join("kmuxd");
+        let candidate = Path::new(dir).join("kmuxd");
         if candidate.exists() {
             return Ok(candidate);
         }
@@ -485,33 +561,68 @@ pub(super) fn which_server() -> anyhow::Result<std::path::PathBuf> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::ENV_LOCK;
     use super::*;
+    use crate::daemon::stop_daemon_at;
 
-    #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // intentional: guard protects env var for the whole test
-    async fn query_nonexistent_socket_returns_none() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        // SAFETY: protected by ENV_LOCK; no concurrent test mutates XDG_RUNTIME_DIR.
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
-        // No socket exists — should return None quickly.
-        assert!(query_daemon().await.is_none());
+    /// Every test builds its own isolated tree. There is no lock and no
+    /// `set_var`: `Dirs::rooted` gives each test a private runtime/state dir, so
+    /// the whole module is parallel-safe (docs/testing.md R3/R13).
+    fn fixture() -> (tempfile::TempDir, Dirs) {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let dirs = Dirs::rooted(tmp.path());
+        (tmp, dirs)
+    }
+
+    /// Block until `path` can actually be `exec`d, then return.
+    ///
+    /// Writing a file and immediately exec-ing it is racy in a *multi-threaded*
+    /// process: if another thread forks while our write fd is still open (the
+    /// sibling tests here spawn `sleep`/`true`), the child inherits a writable
+    /// descriptor for the same inode until it reaches `exec`, and `execve`
+    /// answers `ETXTBSY` for that window. Nothing reopens the file for writing
+    /// afterwards, so one successful exec proves the window has closed for good.
+    ///
+    /// Serialising the module behind a lock used to hide this; the fix belongs
+    /// in the test that creates an executable, not in a global lock.
+    fn await_executable(path: &Path) {
+        for _ in 0..200 {
+            match std::process::Command::new(path)
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(mut child) => {
+                    let _ = child.wait();
+                    return;
+                }
+                Err(error) if error.raw_os_error() == Some(nix::errno::Errno::ETXTBSY as i32) => {
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("stub {} is not executable: {error}", path.display()),
+            }
+        }
+        panic!("stub {} stayed ETXTBSY for 2s", path.display());
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)] // intentional: guard protects env var for the whole test
+    async fn query_nonexistent_socket_returns_none() {
+        let (_tmp, dirs) = fixture();
+        let socket = dirs.socket_path().expect("socket path");
+        // No socket exists — should return None quickly.
+        assert!(query_daemon_at(&socket).await.is_none());
+    }
+
+    #[tokio::test]
     async fn query_stale_socket_returns_none() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        let (_tmp, dirs) = fixture();
         // Create the runtime dir and a dummy socket file (nothing listening).
-        let _ = kmux_protocol::dirs::runtime_dir().unwrap();
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
+        let _ = dirs.runtime_dir().expect("runtime dir");
+        let socket_path = dirs.socket_path().expect("socket path");
         // Create an empty file at the socket path so the path "exists" but
         // no one is listening — connect will fail.
-        std::fs::write(&socket_path, b"").unwrap();
-        assert!(query_daemon().await.is_none());
+        std::fs::write(&socket_path, b"").expect("write stale socket");
+        assert!(query_daemon_at(&socket_path).await.is_none());
     }
 
     #[test]
@@ -519,50 +630,48 @@ mod tests {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
-        let pid_path = kmux_protocol::dirs::pid_path().unwrap();
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
-        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
-        std::fs::write(&socket_path, b"socket placeholder").unwrap();
+        let (_tmp, dirs) = fixture();
+        let pid_path = dirs.pid_path().expect("pid path");
+        let socket_path = dirs.socket_path().expect("socket path");
+        std::fs::write(&pid_path, std::process::id().to_string()).expect("write pid file");
+        std::fs::write(&socket_path, b"socket placeholder").expect("write socket placeholder");
         let held = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .mode(0o600)
             .open(&pid_path)
-            .unwrap();
+            .expect("open pid file");
         #[allow(deprecated)]
         nix::fcntl::flock(
             held.as_raw_fd(),
             nix::fcntl::FlockArg::LockExclusiveNonblock,
         )
-        .unwrap();
+        .expect("take the pid-file lock");
 
-        let error = cleanup_stale_daemon().unwrap_err();
-        assert!(error.to_string().contains("left it untouched"));
+        let error = cleanup_stale_daemon_in(&dirs).expect_err("a held lock must refuse cleanup");
+        let msg = error.to_string();
+        assert!(msg.contains("left it untouched"), "{msg}");
+        assert!(
+            msg.contains(&format!("PID {}", std::process::id())),
+            "the refusal must name the process that owns the pid file: {msg}"
+        );
         assert!(pid_path.exists());
         assert!(socket_path.exists());
 
         drop(held);
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
     }
 
     #[test]
     fn cleanup_removes_unlocked_stale_artifacts() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
-        let pid_path = kmux_protocol::dirs::pid_path().unwrap();
-        let socket_path = kmux_protocol::dirs::socket_path().unwrap();
-        std::fs::write(&pid_path, "stale").unwrap();
-        std::fs::write(&socket_path, b"socket placeholder").unwrap();
+        let (_tmp, dirs) = fixture();
+        let pid_path = dirs.pid_path().expect("pid path");
+        let socket_path = dirs.socket_path().expect("socket path");
+        std::fs::write(&pid_path, "stale").expect("write pid file");
+        std::fs::write(&socket_path, b"socket placeholder").expect("write socket placeholder");
 
-        cleanup_stale_daemon().unwrap();
+        cleanup_stale_daemon_in(&dirs).expect("an unlocked pid file is stale and must be swept");
         assert!(!pid_path.exists());
         assert!(!socket_path.exists());
-
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
     }
 
     #[test]
@@ -570,34 +679,32 @@ mod tests {
         use std::os::unix::fs::OpenOptionsExt;
         use std::os::unix::io::AsRawFd;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        let (_tmp, dirs) = fixture();
 
-        let lock_path = kmux_protocol::dirs::spawn_lock_path().unwrap();
+        let lock_path = dirs.spawn_lock_path().expect("spawn lock path");
         let held = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
             .mode(0o600)
             .open(&lock_path)
-            .unwrap();
+            .expect("open spawn lock");
         #[allow(deprecated)]
         nix::fcntl::flock(
             held.as_raw_fd(),
             nix::fcntl::FlockArg::LockExclusiveNonblock,
         )
-        .unwrap();
+        .expect("take the spawn lock");
 
         // Spawn lock contended → start_daemon must short-circuit to Ok(None)
         // without spawning kmuxd or touching the pid file.
-        let result = start_daemon().expect("expected Ok, got Err");
+        let result = start_daemon_in(&dirs, None).expect("expected Ok, got Err");
         assert!(
             result.is_none(),
             "expected Ok(None) when spawn lock is held"
         );
 
-        let pid_path = kmux_protocol::dirs::pid_path().unwrap();
+        let pid_path = dirs.pid_path().expect("pid path");
         assert!(
             !pid_path.exists(),
             "start_daemon must not touch daemon.pid when contended"
@@ -607,60 +714,69 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn stop_daemon_not_running_returns_err() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        let (_tmp, dirs) = fixture();
+        let socket = dirs.socket_path().expect("socket path");
         // No socket present — stop should return an error.
-        let result = crate::daemon::stop_daemon().await;
-        assert!(result.is_err(), "expected error when daemon is not running");
+        let error = stop_daemon_at(&socket)
+            .await
+            .expect_err("expected error when daemon is not running");
+        assert!(
+            error.to_string().contains("daemon is not running"),
+            "the error must say why the stop failed: {error}"
+        );
     }
 
     #[test]
     fn daemon_log_size_returns_zero_for_missing_file() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let (_tmp, dirs) = fixture();
         // No daemon.log — should not panic, should return 0.
-        assert_eq!(daemon_log_size(), 0);
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        assert_eq!(daemon_log_size_in(&dirs), 0);
+    }
+
+    #[test]
+    fn daemon_log_size_reports_the_current_length() {
+        let (_tmp, dirs) = fixture();
+        let log_path = dirs.daemon_log_path().expect("daemon log path");
+        std::fs::write(&log_path, b"twelve bytes").expect("write daemon log");
+        assert_eq!(
+            daemon_log_size_in(&dirs),
+            12,
+            "the snapshot offset must be the real byte length, or the tail would \
+             replay old lines"
+        );
     }
 
     #[test]
     fn format_daemon_log_tail_empty_when_no_new_content() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let (_tmp, dirs) = fixture();
 
-        let log_path = kmux_protocol::dirs::daemon_log_path().unwrap();
-        std::fs::write(&log_path, b"old line\n").unwrap();
-        let offset = std::fs::metadata(&log_path).unwrap().len();
+        let log_path = dirs.daemon_log_path().expect("daemon log path");
+        std::fs::write(&log_path, b"old line\n").expect("write daemon log");
+        let offset = std::fs::metadata(&log_path).expect("stat daemon log").len();
 
         // Nothing written after the offset — should return empty.
-        assert_eq!(format_daemon_log_tail(offset), String::new());
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
+        assert_eq!(format_daemon_log_tail_in(&dirs, offset), String::new());
     }
 
     #[test]
     fn format_daemon_log_tail_returns_only_new_content() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_STATE_HOME", tmp.path()) };
+        let (_tmp, dirs) = fixture();
 
-        let log_path = kmux_protocol::dirs::daemon_log_path().unwrap();
-        std::fs::write(&log_path, b"old log line\n").unwrap();
-        let offset = std::fs::metadata(&log_path).unwrap().len();
+        let log_path = dirs.daemon_log_path().expect("daemon log path");
+        std::fs::write(&log_path, b"old log line\n").expect("write daemon log");
+        let offset = std::fs::metadata(&log_path).expect("stat daemon log").len();
 
         // Append a new line after the snapshot.
         use std::io::Write;
         let mut f = std::fs::OpenOptions::new()
             .append(true)
             .open(&log_path)
-            .unwrap();
-        writeln!(f, "Error: failed to bind port 8443: address already in use").unwrap();
+            .expect("append to daemon log");
+        writeln!(f, "Error: failed to bind port 8443: address already in use")
+            .expect("write new line");
 
-        let tail = format_daemon_log_tail(offset);
+        let tail = format_daemon_log_tail_in(&dirs, offset);
         assert!(
             tail.contains("failed to bind port 8443"),
             "should include new daemon log line: {tail}"
@@ -673,29 +789,47 @@ mod tests {
             tail.contains("daemon log"),
             "should label the section: {tail}"
         );
-        unsafe { std::env::remove_var("XDG_STATE_HOME") };
     }
 
-    /// Simulates the exact regression we just hit: kmuxd crashes before it can
+    #[test]
+    fn boot_log_hint_is_empty_without_a_boot_log_and_quotes_it_otherwise() {
+        let (_tmp, dirs) = fixture();
+        assert_eq!(
+            format_boot_log_hint_in(&dirs),
+            String::new(),
+            "no boot log means no suffix at all, not an empty header"
+        );
+
+        let path = boot_log_path_in(&dirs).expect("boot log path");
+        std::fs::write(&path, b"error while loading shared libraries\n").expect("write boot log");
+        let hint = format_boot_log_hint_in(&dirs);
+        assert!(
+            hint.contains("error while loading shared libraries"),
+            "the hint must carry kmuxd's captured output: {hint}"
+        );
+        assert!(
+            hint.contains(&path.display().to_string()),
+            "the hint must name the file it quoted: {hint}"
+        );
+    }
+
+    /// Simulates the exact regression we once hit: kmuxd crashes before it can
     /// daemonize (e.g. missing `.so`) and the client should surface stderr,
     /// not a generic timeout.
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn ensure_daemon_surfaces_crash_stderr() {
         use std::os::unix::fs::PermissionsExt;
 
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        let (tmp, dirs) = fixture();
 
         // Point the resolver straight at a stub "kmuxd" that prints a crash
-        // message and exits non-zero without ever binding a socket. Using
-        // `KMUX_KMUXD` (highest precedence) keeps this deterministic regardless
-        // of whether a real `target/<profile>/kmuxd` happens to be built — which
-        // the debug-only fallback in `find_server_binary` would otherwise prefer
+        // message and exits non-zero without ever binding a socket. Passing the
+        // override explicitly keeps this deterministic regardless of whether a
+        // real `target/<profile>/kmuxd` happens to be built — which the
+        // debug-only fallback in `find_server_binary` would otherwise prefer
         // over a stub planted on `$PATH`.
         let fake_dir = tmp.path().join("bin");
-        std::fs::create_dir_all(&fake_dir).unwrap();
+        std::fs::create_dir_all(&fake_dir).expect("create stub dir");
         let fake_kmuxd = fake_dir.join("kmuxd");
         std::fs::write(
             &fake_kmuxd,
@@ -703,14 +837,12 @@ mod tests {
              echo 'error while loading shared libraries: libkmux_ghostty.so' >&2\n\
              exit 127\n",
         )
-        .unwrap();
-        std::fs::set_permissions(&fake_kmuxd, std::fs::Permissions::from_mode(0o755)).unwrap();
+        .expect("write stub kmuxd");
+        std::fs::set_permissions(&fake_kmuxd, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod stub kmuxd");
+        await_executable(&fake_kmuxd);
 
-        unsafe { std::env::set_var("KMUX_KMUXD", &fake_kmuxd) };
-
-        let result = ensure_daemon().await;
-
-        unsafe { std::env::remove_var("KMUX_KMUXD") };
+        let result = ensure_daemon_in(&dirs, Some(&fake_kmuxd)).await;
 
         let err = result.expect_err("fake kmuxd should not produce a live daemon");
         let msg = err.to_string();
@@ -724,26 +856,60 @@ mod tests {
         );
     }
 
-    /// `KMUX_KMUXD` is the highest-precedence resolution step: when it points at
-    /// a real file it must win over the exe-sibling, debug `target/<profile>`,
-    /// and `$PATH` lookups — this is what lets the dev GUI tasks pin the debug
-    /// `target/debug/kmuxd` instead of an installed release one on `$PATH`.
+    /// The `KMUX_KMUXD` override is the highest-precedence resolution step: when
+    /// it points at a real file it must win over the exe-sibling, debug
+    /// `target/<profile>`, and `$PATH` lookups — this is what lets the dev GUI
+    /// tasks pin the debug `target/debug/kmuxd` instead of an installed release
+    /// one on `$PATH`.
     #[test]
     fn kmux_kmuxd_override_takes_precedence() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
         let override_bin = tmp.path().join("my-kmuxd");
-        std::fs::write(&override_bin, b"#!/bin/sh\n").unwrap();
-
-        unsafe { std::env::set_var("KMUX_KMUXD", &override_bin) };
-        let resolved = find_server_binary();
-        unsafe { std::env::remove_var("KMUX_KMUXD") };
+        std::fs::write(&override_bin, b"#!/bin/sh\n").expect("write override binary");
 
         assert_eq!(
-            resolved.expect("override file exists, so resolution must succeed"),
+            find_server_binary_with(Some(&override_bin))
+                .expect("override file exists, so resolution must succeed"),
             override_bin,
-            "KMUX_KMUXD must win over sibling / target-dir / PATH resolution",
+            "the override must win over sibling / target-dir / PATH resolution",
         );
+    }
+
+    /// A stale override (pointing at a non-existent path) must be ignored and
+    /// never handed back, so resolution falls through to real discovery.
+    #[test]
+    fn stale_kmux_kmuxd_override_is_ignored() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("does-not-exist-kmuxd");
+
+        if let Ok(path) = find_server_binary_with(Some(&missing)) {
+            assert_ne!(
+                path, missing,
+                "a non-existent override must never be returned"
+            );
+        }
+    }
+
+    #[test]
+    fn which_server_scans_the_path_in_order_and_reports_a_miss() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let empty = tmp.path().join("empty");
+        let filled = tmp.path().join("filled");
+        std::fs::create_dir_all(&empty).expect("create empty dir");
+        std::fs::create_dir_all(&filled).expect("create filled dir");
+        let kmuxd = filled.join("kmuxd");
+        std::fs::write(&kmuxd, b"#!/bin/sh\n").expect("write kmuxd");
+
+        let path_var = format!("{}:{}", empty.display(), filled.display());
+        assert_eq!(
+            which_server_on(&path_var).expect("kmuxd is on the search path"),
+            kmuxd,
+            "the first PATH entry holding a kmuxd wins"
+        );
+
+        let error = which_server_on(&empty.display().to_string())
+            .expect_err("an empty search path must not resolve");
+        assert!(error.to_string().contains("not found on PATH"), "{error}");
     }
 
     #[tokio::test]
@@ -773,13 +939,10 @@ mod tests {
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn force_kill_daemon_terminates_a_live_process() {
         // cleanup_stale_daemon (called on success) touches the runtime dir, so
-        // pin it to a tempdir like the other daemon tests.
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        // pin it to an isolated tree like the other daemon tests.
+        let (_tmp, dirs) = fixture();
 
         let child = std::process::Command::new("sleep")
             .arg("30")
@@ -795,20 +958,19 @@ mod tests {
             let _ = child.wait();
         });
 
-        force_kill_daemon(pid, true, Duration::from_secs(1))
+        force_kill_daemon_in(&dirs, pid, true, Duration::from_secs(1))
             .await
             .expect("force kill should terminate and verify the process");
-        reaper.join().unwrap();
-
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
+        reaper.join().expect("reaper thread");
+        assert!(
+            !pid_alive(pid),
+            "the process must be gone once we report success"
+        );
     }
 
     #[tokio::test]
-    #[allow(clippy::await_holding_lock)]
     async fn force_kill_daemon_is_ok_when_already_gone() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        let (_tmp, dirs) = fixture();
 
         let mut child = std::process::Command::new("true")
             .spawn()
@@ -816,51 +978,25 @@ mod tests {
         let pid = child.id();
         let _ = child.wait(); // already exited and reaped → kill yields ESRCH
 
-        force_kill_daemon(pid, true, Duration::from_millis(100))
+        force_kill_daemon_in(&dirs, pid, true, Duration::from_millis(100))
             .await
             .expect("killing an already-dead PID is success (ESRCH)");
-
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
     }
 
     #[test]
     fn running_daemon_pid_reports_live_and_absent() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        let (_tmp, dirs) = fixture();
 
         // No pid file yet → None. (pid_path() materializes the runtime dir.)
-        let pid_path = kmux_protocol::dirs::pid_path().unwrap();
-        assert!(running_daemon_pid().is_none());
+        let pid_path = dirs.pid_path().expect("pid path");
+        assert!(running_daemon_pid_in(&dirs).is_none());
 
         // Our own PID is alive → reported back.
-        std::fs::write(&pid_path, std::process::id().to_string()).unwrap();
-        assert_eq!(running_daemon_pid(), Some(std::process::id()));
+        std::fs::write(&pid_path, std::process::id().to_string()).expect("write pid file");
+        assert_eq!(running_daemon_pid_in(&dirs), Some(std::process::id()));
 
         // Unparseable pid file → None, never a panic.
-        std::fs::write(&pid_path, "not-a-pid").unwrap();
-        assert!(running_daemon_pid().is_none());
-
-        unsafe { std::env::remove_var("XDG_RUNTIME_DIR") };
-    }
-
-    /// A stale `KMUX_KMUXD` (pointing at a non-existent path) must be ignored and
-    /// never handed back, so resolution falls through to real discovery.
-    #[test]
-    fn stale_kmux_kmuxd_override_is_ignored() {
-        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-        let tmp = tempfile::tempdir().unwrap();
-        let missing = tmp.path().join("does-not-exist-kmuxd");
-
-        unsafe { std::env::set_var("KMUX_KMUXD", &missing) };
-        let resolved = find_server_binary();
-        unsafe { std::env::remove_var("KMUX_KMUXD") };
-
-        if let Ok(path) = resolved {
-            assert_ne!(
-                path, missing,
-                "a non-existent override must never be returned"
-            );
-        }
+        std::fs::write(&pid_path, "not-a-pid").expect("write pid file");
+        assert!(running_daemon_pid_in(&dirs).is_none());
     }
 }

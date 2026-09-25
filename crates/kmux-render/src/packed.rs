@@ -93,6 +93,19 @@ pub fn cursor_shape_code(shape: CursorShape) -> u8 {
     }
 }
 
+/// The inverse of [`cursor_shape_code`]. An unknown code is `Hidden`, which
+/// draws nothing — the safe reading of a value this build does not understand.
+#[must_use]
+pub fn cursor_shape_from_code(code: u8) -> CursorShape {
+    match code {
+        0 => CursorShape::Block,
+        1 => CursorShape::Underline,
+        2 => CursorShape::Bar,
+        3 => CursorShape::HollowBlock,
+        _ => CursorShape::Hidden,
+    }
+}
+
 /// A decoded packed cell: final (palette-resolved) colors + the character,
 /// attributes, and width. The renderer's `Packed` cell source reads these.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -218,6 +231,25 @@ mod tests {
             &theme(),
         );
         assert_eq!(spacer[14], 0, "spacer cell is zero-width");
+    }
+
+    #[test]
+    fn every_shape_code_round_trips() {
+        for shape in [
+            CursorShape::Block,
+            CursorShape::Underline,
+            CursorShape::Bar,
+            CursorShape::HollowBlock,
+            CursorShape::Hidden,
+        ] {
+            assert_eq!(
+                cursor_shape_from_code(cursor_shape_code(shape)),
+                shape,
+                "{shape:?}"
+            );
+        }
+        // A code from a newer peer draws nothing rather than guessing.
+        assert_eq!(cursor_shape_from_code(200), CursorShape::Hidden);
     }
 
     #[test]

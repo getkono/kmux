@@ -7,10 +7,10 @@ use serde::{Deserialize, Serialize};
 /// full `ClientMessage`/`ServerMessage` surface:
 ///
 /// - `Shell`     — PTY data flow (keystrokes in, screen updates out)
-/// - `Scrollback`— history hydration (FetchHistory / HistoryLines / ScrollbackAppend)
+/// - `Scrollback`— history hydration (`FetchHistory` / `HistoryLines` / `ScrollbackAppend`)
 /// - `Liveness`  — Ping / Pong keep-alive in both directions
 /// - `Control`   — session/pane lifecycle, input locks, lifecycle events, errors
-/// - `Sync`      — resync signals (Lagged / SyncReset)
+/// - `Sync`      — resync signals (Lagged / `SyncReset`)
 /// - `Bootstrap` — authentication and transport-switch handshake
 #[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum MessageCategory {
@@ -36,7 +36,7 @@ impl MessageCategory {
         }
     }
 
-    pub fn all() -> &'static [MessageCategory] {
+    pub fn all() -> &'static [Self] {
         &[
             Self::Shell,
             Self::Scrollback,

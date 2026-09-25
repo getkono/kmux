@@ -13,7 +13,7 @@
 //!   window in the singleton instance.
 //!
 //! Prod vs dev split (see [`launch_desktop`]): a **release** build is the native
-//! singleton — it routes to / cold-starts the installed GUI (macOS LaunchServices
+//! singleton — it routes to / cold-starts the installed GUI (macOS `LaunchServices`
 //! plus the `kmux://` URL scheme; Linux D-Bus app-id). A **debug** build
 //! (`./kmux`, the `dev` mise task) instead **kills any stale instance and runs
 //! the freshly built binary directly**, so what you see is always the code you
@@ -130,7 +130,7 @@ fn launch_desktop() -> anyhow::Result<()> {
 /// invocation gets its **own window**. When an instance is already running, the
 /// launch is routed to it through the `kmux://` URL scheme (it opens a new
 /// window for the URL); otherwise the app is cold-started with the same request
-/// forwarded on argv. Going through `open` (LaunchServices) — rather than a bare
+/// forwarded on argv. Going through `open` (`LaunchServices`) — rather than a bare
 /// exec of the bundle binary — is what makes the running-instance routing work,
 /// fixing repeated launches collapsing into one window. `KMUX_APP` overrides the
 /// bundle location (defaults to `~/Applications/kmux.app`).
@@ -145,9 +145,8 @@ fn launch_desktop() -> anyhow::Result<()> {
 fn launch_desktop() -> anyhow::Result<()> {
     use clap::Parser;
 
-    let app = std::env::var_os("KMUX_APP")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(default_app_bundle);
+    let app =
+        std::env::var_os("KMUX_APP").map_or_else(default_app_bundle, std::path::PathBuf::from);
 
     let url = build_launch_url(&kmux_app::cli::Cli::parse());
 
@@ -214,8 +213,7 @@ fn swift_app_running() -> bool {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|s| s.success())
 }
 
 /// Build the `kmux://new?…` URL the app turns into one window's `LaunchRequest`
@@ -269,7 +267,7 @@ fn percent_encode(s: &str) -> String {
     for &b in s.as_bytes() {
         match b {
             b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
-                out.push(b as char)
+                out.push(b as char);
             }
             _ => {
                 let _ = write!(out, "%{b:02X}");
@@ -290,7 +288,7 @@ fn percent_encode(s: &str) -> String {
 #[cfg(target_os = "macos")]
 fn default_app_bundle() -> std::path::PathBuf {
     let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
-    select_app_bundle(home.as_deref(), |p| p.exists())
+    select_app_bundle(home.as_deref(), std::path::Path::exists)
 }
 
 /// Pure core of [`default_app_bundle`], split out for testing: the first
@@ -318,7 +316,7 @@ fn select_app_bundle(
 ///
 /// Windows is not built. When it is, its singleton model must match the Unix
 /// one: a per-profile single-instance guard on top of the per-profile runtime
-/// dir that already isolates debug from release ([`kmux_protocol::dirs`]). The
+/// dir that already isolates debug from release (`kmux_sys::dirs`). The
 /// intended mechanism is a named mutex — `CreateMutexW` on a name that embeds the
 /// build profile (e.g. `Local\\kmux-{profile}`): the first launcher creates it
 /// and owns the window; a second sees `ERROR_ALREADY_EXISTS` and forwards its

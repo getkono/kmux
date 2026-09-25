@@ -90,8 +90,7 @@ fn nondeterministic_seed() -> u64 {
     // it). A coarse wall-clock seed is plenty for jitter we never verify.
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0x1234_5678_9ABC_DEF0)
+        .map_or(0x1234_5678_9ABC_DEF0, |d| d.as_nanos() as u64)
 }
 
 static IMPAIR: OnceLock<Option<ImpairConfig>> = OnceLock::new();
@@ -134,7 +133,7 @@ pub async fn maybe_delay(cfg: &ImpairConfig, category: MessageCategory, rng: &mu
     }
 }
 
-/// Tiny dependency-free seedable PRNG (SplitMix64). Deterministic given a seed;
+/// Tiny dependency-free seedable PRNG (`SplitMix64`). Deterministic given a seed;
 /// adequate for jitter we never statistically verify.
 pub struct SplitMix64 {
     state: u64,

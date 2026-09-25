@@ -250,10 +250,10 @@ fn enforce_version(info: &ProbeInfo, ssh_dest: &str) -> Result<(), SshError> {
             warn!(dest = %ssh_dest, "remote daemon only reported a legacy protocol");
             Err(SshError::VersionMismatch {
                 client: PROTOCOL_RANGE.to_string(),
-                server: info
-                    .protocol_version
-                    .map(|version| format!("legacy-{version}"))
-                    .unwrap_or_else(|| "legacy-unknown".to_string()),
+                server: info.protocol_version.map_or_else(
+                    || "legacy-unknown".to_string(),
+                    |version| format!("legacy-{version}"),
+                ),
             })
         }
     }

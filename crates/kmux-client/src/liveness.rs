@@ -15,7 +15,7 @@
 //!
 //! The tracker itself is pure — it takes an injected `now: Instant` so
 //! tests do not need tokio's time paused. The event loop calls
-//! [`Liveness::tick`] every render cycle and pulls any outbound ping via
+//! `Liveness::tick` every render cycle and pulls any outbound ping via
 //! [`Liveness::client_ping_due`].
 
 use std::collections::BTreeMap;

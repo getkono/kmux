@@ -1,7 +1,7 @@
 //! Smoke tests for the dynamic shell-completion hook wired into `run_cli`.
 //!
 //! These exercise the real `kmux` binary with the `COMPLETE` env var set, which
-//! is how a shell drives clap_complete's `CompleteEnv`. They prove the hook is
+//! is how a shell drives `clap_complete`'s `CompleteEnv`. They prove the hook is
 //! installed (and short-circuits before the GUI handoff) without depending on
 //! the unstable internal `_CLAP_COMPLETE_*` request protocol — we assert on the
 //! stable registration-script output. Value-level completion is covered by the

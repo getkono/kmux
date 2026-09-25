@@ -140,7 +140,7 @@ impl ServerApp {
         let Ok(relay) = get_pane_relay(&sessions, pane_id) else {
             return;
         };
-        let snapshot = std::sync::Arc::new(relay.engine.snapshot());
+        let snapshot = Arc::new(relay.engine.snapshot());
         let seqno = SequenceNo(relay.seqno_counter.fetch_add(1, Ordering::Relaxed));
         let msg = ServerMessage::TerminalSnapshot {
             pane_id: pane_id.to_string(),
@@ -182,7 +182,7 @@ impl ServerApp {
         };
         let mut count = 0usize;
         let mut newest: Option<Instant> = None;
-        for &t in entry.iter() {
+        for &t in entry {
             if now.duration_since(t) < RESTART_WINDOW {
                 count += 1;
                 newest = Some(newest.map_or(t, |n| n.max(t)));
