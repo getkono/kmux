@@ -80,24 +80,27 @@ impl PtySession {
         self.inner.lock().await.pty.wait().await
     }
 
-    /// Gracefully shut down the session.
-    pub async fn close(self) -> Result<ExitStatus> {
-        let pid = self.inner.lock().await.pty.pid;
-        graceful_shutdown(pid, self.shutdown_grace).await
+    /// Shut down the child and its process group (see [`graceful_shutdown`])
+    /// and return how the child ended.
+    ///
+    /// This handle keeps the master open until the child is gone, so the
+    /// terminal is hung up only after the process group has been signalled.
+    pub async fn close(self) -> ExitStatus {
+        let (pid, exit_rx) = {
+            let inner = self.inner.lock().await;
+            (inner.pty.pid, inner.pty.exit_rx.clone())
+        };
+        graceful_shutdown(pid, exit_rx, self.shutdown_grace).await
     }
 
-    /// Initiate graceful shutdown without waiting for the process to exit.
+    /// [`close`](Self::close) in a background task, returning immediately.
     ///
-    /// Sends SIGTERM and spawns a background task to SIGKILL + reap after the
-    /// grace period. Sets keep-alive on the inner `PtyProcess` so its `Drop`
-    /// impl does not race with the background task. Returns immediately.
-    pub async fn close_nowait(self) {
-        let (pid, grace) = {
-            let inner = self.inner.lock().await;
-            (inner.pty.pid, self.shutdown_grace)
-        };
-        self.set_keep_alive(true).await;
-        crate::shutdown::graceful_shutdown_nowait(pid, grace);
+    /// The task owns this handle, so the master fd is closed once the child
+    /// has exited (or been killed) — not leaked, and not closed early.
+    pub fn close_nowait(self) {
+        tokio::spawn(async move {
+            self.close().await;
+        });
     }
 
     /// Check if the child process has exited.
@@ -299,6 +302,100 @@ impl AsyncWrite for PtySession {
 mod tests {
     use super::*;
     use crate::config::PtyConfig;
+
+    fn open_fds() -> usize {
+        std::fs::read_dir("/dev/fd").expect("list fds").count()
+    }
+
+    fn open_and_close() {
+        let config = PtyConfig::new("/bin/sleep")
+            .args(["600"])
+            .shutdown_grace(Duration::from_secs(10));
+        PtySession::spawn(&config).expect("spawn").close_nowait();
+    }
+
+    /// Whether this process's open-fd count reaches `count` within 10 s.
+    async fn fd_count_settles_at(count: usize) -> bool {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while open_fds() != count {
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        true
+    }
+
+    /// Closing a pane gives back the fd it took. Counted in a child — this
+    /// same test binary, re-run on this one test — because a test running in
+    /// parallel in this process would move the count (R13); the count means
+    /// something only in a process doing nothing else (R7).
+    #[tokio::test]
+    async fn close_nowait_gives_back_every_fd_it_took() {
+        const CHILD: &str = "KMUX_PTY_TEST_FD_COUNT_CHILD";
+        const NAME: &str = "session::tests::close_nowait_gives_back_every_fd_it_took";
+        if std::env::var_os(CHILD).is_none() {
+            let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+                .args(["--exact", NAME, "--test-threads=1"])
+                .env(CHILD, "1")
+                .output()
+                .expect("re-run the test binary");
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // "1 passed" also proves the filter matched: one that selects
+            // nothing exits 0 too.
+            assert!(
+                out.status.success() && stdout.contains("1 passed"),
+                "{stdout}{}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            return;
+        }
+
+        let before = open_fds();
+        for _ in 0..10 {
+            open_and_close();
+        }
+        assert!(
+            fd_count_settles_at(before).await,
+            "{} fds open after 10 open/close cycles, {before} before",
+            open_fds()
+        );
+    }
+
+    /// `close_nowait` returns at once but still runs the whole cascade in the
+    /// background: a child that ignores `SIGHUP` and `SIGTERM` is left its
+    /// grace period, not killed on the spot, and killed once it runs out.
+    /// Needs a real child that ignores signals (R7).
+    #[tokio::test]
+    async fn close_nowait_grants_the_grace_period_then_kills() {
+        let grace = Duration::from_secs(1);
+        let config = PtyConfig::new("/bin/sh")
+            .args(["-c", "trap '' HUP TERM; echo ready; exec sleep 600"])
+            .shutdown_grace(grace);
+        let session = PtySession::spawn(&config).expect("spawn");
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 64];
+        while !String::from_utf8_lossy(&seen).contains("ready") {
+            let n = session.read_bytes(&mut buf).await.expect("read");
+            assert_ne!(n, 0, "EOF before ready");
+            seen.extend_from_slice(&buf[..n]);
+        }
+        let pid = session.child_pid().await;
+
+        let closed = std::time::Instant::now();
+        session.close_nowait();
+
+        let early = closed + grace / 5;
+        assert!(
+            !crate::fixtures::wait_until_dead(pid, early).await,
+            "killed before its grace period ran out"
+        );
+        let late = closed + grace + Duration::from_secs(10);
+        assert!(
+            crate::fixtures::wait_until_dead(pid, late).await,
+            "never killed"
+        );
+    }
 
     fn bash_config() -> PtyConfig {
         PtyConfig::new("/bin/bash").args(["-c", "read line; echo \"got: $line\""])

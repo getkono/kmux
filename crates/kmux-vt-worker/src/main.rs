@@ -131,8 +131,8 @@ async fn run() -> anyhow::Result<()> {
     let session = PtySession::from_process(pty);
     // A worker exit or crash must NOT kill the shell — the daemon holds the
     // authoritative master fd and will respawn us. keep_alive suppresses the
-    // SIGKILL in PtyProcess::drop; the leaked dup is moot since we are the
-    // process dying.
+    // SIGKILL in PtyProcess::drop; the daemon's copy of the master keeps the
+    // terminal up after ours closes.
     session.set_keep_alive(true).await;
     let (reader, writer) = session.clone().split().await.context("split PTY")?;
     // Share the PTY write half between the request loop (user input) and the

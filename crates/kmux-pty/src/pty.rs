@@ -2,6 +2,7 @@ use std::os::unix::io::{IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::pty::{ForkptyResult, forkpty};
+use nix::sys::signal::Signal;
 use nix::unistd::Pid;
 use tokio::sync::watch;
 
@@ -11,12 +12,13 @@ use crate::error::{KmuxError, Result};
 use crate::io::PtyMasterIo;
 use crate::platform::to_winsize;
 use crate::process::{ExitStatus, spawn_wait_task};
+use crate::shutdown::signal_group;
 
 /// A spawned PTY process.
 ///
 /// Owns the master fd (wrapped in `PtyMasterIo`) and the child PID.
-/// Dropping this struct triggers async cleanup (SIGKILL + fd close)
-/// unless [`PtyProcess::set_keep_alive`] has been called to suppress it.
+/// Dropping this struct SIGKILLs the child's process group and closes the fd,
+/// unless [`PtyProcess::set_keep_alive`] has been called to suppress the kill.
 pub struct PtyProcess {
     /// Async I/O handle over the PTY master fd.
     pub io: PtyMasterIo,
@@ -28,8 +30,8 @@ pub struct PtyProcess {
     pub size: WindowSize,
     /// When `true`, the `Drop` impl skips SIGKILL so the child remains alive.
     ///
-    /// Set this before dropping (e.g. on clean daemon shutdown) when the child
-    /// PTY process should survive for reattachment on the next daemon start.
+    /// Set this before dropping when another process now owns the child: a
+    /// handoff successor, or (inside a VT worker) the daemon.
     keep_alive: AtomicBool,
 }
 
@@ -55,7 +57,11 @@ impl PtyProcess {
             ForkptyResult::Child => unsafe { plan.exec() },
             ForkptyResult::Parent { child, master } => {
                 let exit_rx = spawn_wait_task(child);
-                let io = PtyMasterIo::new(master.into_raw_fd()).map_err(KmuxError::Io)?;
+                let io = PtyMasterIo::new(master.into_raw_fd()).map_err(|e| {
+                    // No handle will own this child, so nothing else would end it.
+                    signal_group(child, Signal::SIGKILL);
+                    KmuxError::Io(e)
+                })?;
                 Ok(Self {
                     io,
                     pid: child,
@@ -134,38 +140,21 @@ impl PtyProcess {
 }
 
 impl Drop for PtyProcess {
+    /// Kill the child's process group unless it has already exited or
+    /// keep-alive is set. The exit task (or, for an inherited child, its new
+    /// parent) collects the exit; nothing here waits.
+    ///
+    /// Dropping closes this handle's master fd. With keep-alive set the child
+    /// keeps its terminal through another copy of the master that is still
+    /// open: the one a handoff successor received over `SCM_RIGHTS`, or, inside
+    /// a VT worker, the daemon's own.
     fn drop(&mut self) {
         if self.keep_alive.load(Ordering::Relaxed) {
-            // Duplicate the PTY master fd before `PtyMasterIo` closes it.
-            //
-            // When the master fd closes the child receives SIGHUP (loss of
-            // controlling terminal) which would kill it. Duplicating the fd
-            // keeps the file description alive in the OS fd table so the child
-            // can be reattached by the next daemon instance. The duplicate is
-            // intentionally leaked (held open until this process exits), which
-            // is safe since the daemon is shutting down immediately after.
-            let raw = self.io.as_raw_fd();
-            // SAFETY: `raw` is a valid, open fd owned by `self.io`. The copy is
-            // close-on-exec like every other master fd: a leaked handle must
-            // not leak into a child as well.
-            let dup_fd = unsafe { nix::libc::fcntl(raw, nix::libc::F_DUPFD_CLOEXEC, 0) };
-            // `dup_fd` is a plain i32 with no Drop impl, so it is intentionally
-            // leaked — the fd stays open in the fd table.
-            let _ = dup_fd;
-            // Allow PtyMasterIo to drop (closes the original fd) without
-            // sending SIGKILL. The dup above keeps the terminal alive.
             return;
         }
-
+        // An exited child's pid may already be reaped and reused.
         if !self.is_exited() {
-            // Spawn a detached cleanup task: send SIGKILL, reap zombie
-            let pid = self.pid;
-            tokio::spawn(async move {
-                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-                // Give the kernel a moment, then reap
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let _ = nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
-            });
+            signal_group(self.pid, Signal::SIGKILL);
         }
     }
 }
@@ -258,7 +247,7 @@ mod tests {
             "child should still be alive after the original was dropped"
         );
 
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        let _ = nix::sys::signal::kill(pid, Signal::SIGKILL);
     }
 
     /// A foreign (inherited) child cannot be `waitpid`-ed, so exit is detected by
@@ -283,6 +272,29 @@ mod tests {
             "foreign child exit was not detected in time"
         );
         assert!(inherited.is_exited(), "is_exited should be true after exit");
+    }
+
+    /// Dropping a handle to a live child kills it (and its exit task collects
+    /// it). The child ignores `SIGHUP`, so the hangup from the master closing
+    /// cannot do the killing in Drop's place. Needs a real child (R7).
+    #[tokio::test]
+    async fn dropping_a_process_kills_its_child() {
+        use tokio::io::AsyncReadExt;
+
+        let script = "trap '' HUP; echo ready; exec sleep 600";
+        let mut pty =
+            PtyProcess::spawn(&PtyConfig::new("/bin/sh").args(["-c", script])).expect("spawn");
+        let mut seen = String::new();
+        let mut buf = [0u8; 64];
+        while !seen.contains("ready") {
+            let n = pty.io.read(&mut buf).await.expect("read");
+            assert_ne!(n, 0, "EOF before ready: {seen:?}");
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        let pid = pty.pid;
+        drop(pty);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        assert!(crate::fixtures::wait_until_dead(pid, deadline).await);
     }
 
     /// A pane sees its terminal and nothing else: not another pane's master,
@@ -396,11 +408,14 @@ mod tests {
 
     /// Verify that setting `keep_alive` prevents the Drop impl from sending
     /// SIGKILL: the child process should still be running after the
-    /// `PtyProcess` is dropped with `keep_alive = true`.
+    /// `PtyProcess` is dropped with `keep_alive = true`. As in a handoff, a
+    /// copy of the master stays open elsewhere — without one, closing the last
+    /// master would hang the terminal up.
     #[tokio::test]
     async fn keep_alive_prevents_sigkill_on_drop() {
         let pty = PtyProcess::spawn(&sleep_config()).expect("spawn failed");
         let pid = pty.pid;
+        let _successors_copy = pty.io.dup_owned().expect("dup");
 
         pty.set_keep_alive(true);
         drop(pty);
@@ -413,6 +428,6 @@ mod tests {
         assert!(!died, "process should still be alive after keep_alive drop");
 
         // Clean up: kill the process ourselves.
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        let _ = nix::sys::signal::kill(pid, Signal::SIGKILL);
     }
 }
