@@ -176,34 +176,58 @@ fn generate_pkcs8() -> anyhow::Result<Vec<u8>> {
 static NEXT_STAGING: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 fn create_pkcs8(path: &Path) -> anyhow::Result<Vec<u8>> {
-    let pkcs8 = generate_pkcs8()?;
+    install_pkcs8(path, &generate_pkcs8()?, write_private, |from, to| {
+        std::fs::hard_link(from, to)
+    })
+}
+
+/// [`create_pkcs8`] for a given key, with the private write and the link taken
+/// as parameters so their failure paths can be driven by a test.
+fn install_pkcs8(
+    path: &Path,
+    pkcs8: &[u8],
+    write: impl Fn(&Path, &[u8]) -> anyhow::Result<()>,
+    link: impl Fn(&Path, &Path) -> std::io::Result<()>,
+) -> anyhow::Result<Vec<u8>> {
     // Same directory, so the link stays on one filesystem. The name carries both
     // the pid and a per-process counter: two racing *processes* must not share a
     // staging file, and neither must two racing threads inside one.
     let seq = NEXT_STAGING.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let staging = path.with_extension(format!("tmp.{}.{seq}", std::process::id()));
-    write_private(&staging, &pkcs8)?;
-
-    let linked = std::fs::hard_link(&staging, path);
-    // The staging file has served its purpose either way.
+    // The staging file is removed however this goes — including a write that
+    // failed partway, which would otherwise leave part of a private key behind.
+    let linked = write(&staging, pkcs8).map(|()| link(&staging, path));
     let _ = std::fs::remove_file(&staging);
 
-    match linked {
-        Ok(()) => Ok(pkcs8),
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Another process got there first. Its key is the machine's
-            // identity; ours was never visible to anyone.
-            std::fs::read(path)
-                .map_err(|e| anyhow::anyhow!("failed to read identity key {}: {e}", path.display()))
-        }
-        Err(e) => Err(anyhow::anyhow!(
-            "failed to create identity key {}: {e}",
-            path.display()
-        )),
+    match linked? {
+        Ok(()) => Ok(pkcs8.to_vec()),
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => adopt_existing(path),
+        // A filesystem without hard links (some network and FUSE mounts refuse
+        // `link(2)` outright). Fall back to creating the key in place: still
+        // exclusive, so two racers cannot both win, though a reader racing the
+        // write can see it partial — the cost the link exists to avoid, paid
+        // only where the link cannot be had.
+        Err(link_err) => match write(path, pkcs8) {
+            Ok(()) => Ok(pkcs8.to_vec()),
+            Err(_) if path.exists() => adopt_existing(path),
+            Err(e) => Err(anyhow::anyhow!(
+                "failed to create identity key {} (hard link: {link_err}; direct: {e})",
+                path.display()
+            )),
+        },
     }
 }
 
-/// Write `bytes` to a fresh mode-0600 file, refusing to overwrite one.
+/// Another process created the key first. Its key is the machine's identity;
+/// ours was never visible to anyone.
+fn adopt_existing(path: &Path) -> anyhow::Result<Vec<u8>> {
+    std::fs::read(path)
+        .map_err(|e| anyhow::anyhow!("failed to read identity key {}: {e}", path.display()))
+}
+
+/// Write `bytes` to a fresh mode-0600 file, refusing to overwrite one. A file
+/// this call created and then failed to fill is removed again, so a failure
+/// never leaves a partial key behind.
 fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
     let mut file = std::fs::OpenOptions::new()
         .write(true)
@@ -211,12 +235,16 @@ fn write_private(path: &Path, bytes: &[u8]) -> anyhow::Result<()> {
         .mode(0o600)
         .open(path)
         .map_err(|e| anyhow::anyhow!("failed to create {}: {e}", path.display()))?;
-    file.write_all(bytes)
-        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()))?;
     // Durable before it becomes visible under its real name.
-    file.sync_all()
-        .map_err(|e| anyhow::anyhow!("failed to flush {}: {e}", path.display()))?;
-    Ok(())
+    let filled = file
+        .write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|e| anyhow::anyhow!("failed to write {}: {e}", path.display()));
+    if filled.is_err() {
+        drop(file);
+        let _ = std::fs::remove_file(path);
+    }
+    filled
 }
 
 fn hex_encode(bytes: &[u8]) -> String {
@@ -389,5 +417,86 @@ mod tests {
             .map(|_| ())
             .expect_err("corrupt key");
         assert!(err.to_string().contains("invalid identity key"), "{err}");
+    }
+
+    /// The names in `dir`, sorted.
+    fn entries(dir: &Path) -> Vec<String> {
+        let mut names: Vec<String> = std::fs::read_dir(dir)
+            .expect("read_dir")
+            .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort();
+        names
+    }
+
+    /// A staging write that fails partway (a full disk) must not leave part of
+    /// a private key behind in the config directory.
+    #[test]
+    fn a_failed_staging_write_leaves_no_partial_key_behind() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("identity.pk8");
+        let half_then_fail = |at: &Path, bytes: &[u8]| {
+            std::fs::write(at, &bytes[..bytes.len() / 2]).expect("half");
+            Err(anyhow::anyhow!("no space left on device"))
+        };
+
+        let err = install_pkcs8(&path, b"pkcs8-bytes", half_then_fail, |_, _| {
+            panic!("nothing to link after a failed write")
+        })
+        .expect_err("the write failed");
+        assert!(err.to_string().contains("no space left"), "{err}");
+        assert!(entries(tmp.path()).is_empty(), "{:?}", entries(tmp.path()));
+    }
+
+    /// `write_private` cleans up after itself too, whichever path it wrote.
+    #[test]
+    fn write_private_removes_a_file_it_created_but_could_not_fill() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("key");
+        std::fs::write(&path, b"someone else's").expect("write");
+        // create_new refuses an existing file and must not remove it.
+        write_private(&path, b"ours").expect_err("exists");
+        assert_eq!(std::fs::read(&path).expect("read"), b"someone else's");
+    }
+
+    /// A filesystem without hard links refuses `link(2)` outright. That must
+    /// not make the identity impossible to create: the key is created in
+    /// place instead, still exclusively and still 0600, and no staging file
+    /// remains.
+    #[test]
+    fn a_filesystem_without_hard_links_falls_back_to_creating_in_place() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("identity.pk8");
+
+        let key = install_pkcs8(&path, b"pkcs8-bytes", write_private, |_, _| {
+            Err(std::io::ErrorKind::Unsupported.into())
+        })
+        .expect("created in place");
+
+        assert_eq!(key, b"pkcs8-bytes");
+        assert_eq!(std::fs::read(&path).expect("read"), b"pkcs8-bytes");
+        let mode = std::fs::metadata(&path).expect("meta").permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+        assert_eq!(entries(tmp.path()), ["identity.pk8"]);
+    }
+
+    /// On that fallback, a racer that created the key first still wins: the
+    /// loser adopts the key on disk rather than failing or overwriting it.
+    #[test]
+    fn the_in_place_fallback_adopts_a_key_created_first() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let path = tmp.path().join("identity.pk8");
+        let winner = path.clone();
+
+        let key = install_pkcs8(&path, b"loser", write_private, move |_, _| {
+            // The winner lands between our staging write and our fallback.
+            std::fs::write(&winner, b"winner").expect("winner");
+            Err(std::io::ErrorKind::PermissionDenied.into())
+        })
+        .expect("adopts");
+
+        assert_eq!(key, b"winner");
+        assert_eq!(std::fs::read(&path).expect("read"), b"winner");
     }
 }
