@@ -95,28 +95,26 @@ impl Liveness {
         }
     }
 
-    fn state(&self) -> std::sync::MutexGuard<'_, State> {
-        lock_or_recover(&self.state, "connection liveness")
-    }
-
     /// A frame arrived: every ping so far is answered.
     pub(crate) fn on_inbound(&self) {
-        self.state().unanswered_since = None;
+        lock_or_recover(&self.state, "connection liveness").unanswered_since = None;
     }
 
     /// The connection authenticated: the auth deadline no longer applies.
     pub(crate) fn on_authenticated(&self) {
-        self.state().authenticated = true;
+        lock_or_recover(&self.state, "connection liveness").authenticated = true;
     }
 
     /// A ping went out at `now`. Only the oldest unanswered one counts.
     pub(crate) fn on_ping_sent(&self, now: Instant) {
-        self.state().unanswered_since.get_or_insert(now);
+        lock_or_recover(&self.state, "connection liveness")
+            .unanswered_since
+            .get_or_insert(now);
     }
 
     /// Whether the connection may stay open at `now`.
     pub(crate) fn verdict(&self, now: Instant) -> Verdict {
-        let state = self.state();
+        let state = lock_or_recover(&self.state, "connection liveness");
         match auth_verdict(state.connected_at, state.authenticated, now, AUTH_DEADLINE) {
             Verdict::Keep => pong_verdict(state.unanswered_since, now, PONG_DEADLINE),
             close => close,
@@ -220,7 +218,8 @@ mod tests {
         let live = std::sync::Arc::new(Liveness::new(started));
         tokio::spawn(watchdog(live, closer));
 
-        assert_eq!(signal.closed().await, CloseReason::AuthDeadline);
+        let reason = tokio::time::timeout(AUTH_DEADLINE * 2, signal.closed()).await;
+        assert_eq!(reason, Ok(CloseReason::AuthDeadline));
         let waited = started.elapsed();
         assert!(
             waited > AUTH_DEADLINE && waited <= AUTH_DEADLINE + WATCHDOG_TICK,

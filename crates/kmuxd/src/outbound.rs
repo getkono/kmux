@@ -179,9 +179,22 @@ impl OutboundTx {
 
     /// Queue a control message, waiting for room rather than closing the
     /// connection. For bulk replies the client asked for (a log dump) whose
-    /// producer can afford to wait.
-    pub async fn send_waiting(&self, msg: ServerMessage) -> Result<(), OutboundClosed> {
-        self.tx.send(msg).await.map_err(|_| OutboundClosed)
+    /// producer can afford to wait. Like pane data it leaves the control
+    /// reserve free, so a dump never starves replies, events or pings.
+    pub async fn send_waiting(&self, mut msg: ServerMessage) -> Result<(), OutboundClosed> {
+        loop {
+            self.data_room().await;
+            if self.tx.is_closed() {
+                return Err(OutboundClosed);
+            }
+            if self.tx.capacity() > self.reserve {
+                match self.tx.try_send(msg) {
+                    Ok(()) => return Ok(()),
+                    Err(TrySendError::Full(back)) => msg = back,
+                    Err(TrySendError::Closed(_)) => return Err(OutboundClosed),
+                }
+            }
+        }
     }
 
     /// Queue a pane-data message if that leaves the control reserve free.
@@ -351,8 +364,12 @@ pub async fn forward_pane_stream<R, F>(
                             }
                             Err(DataRejected::Closed) => return,
                             // Refilled meanwhile: a later resync starts over
-                            // with another `SyncReset`.
-                            Err(DataRejected::Congested) => Flow::Lagged { dropped },
+                            // with another `SyncReset`. Yield first, so a
+                            // queue that stays full cannot spin this task.
+                            Err(DataRejected::Congested) => {
+                                tokio::task::yield_now().await;
+                                Flow::Lagged { dropped }
+                            }
                         }
                     }
                     msg = client_rx.recv() => match msg {
@@ -529,6 +546,36 @@ mod tests {
         drop(rx);
         assert!(out.is_closed());
         assert_eq!(out.try_send_data(update(1)), Err(DataRejected::Closed));
+    }
+
+    /// A bulk reply waits for room without taking the control reserve, so a
+    /// ping still fits while it waits; it goes out once the writer drains.
+    #[tokio::test]
+    async fn send_waiting_leaves_the_control_reserve_free() {
+        let (out, mut rx) = channel(16, close_channel().0);
+        for seqno in 1..=12 {
+            out.try_send_data(update(seqno)).unwrap();
+        }
+        let bulk = out.clone();
+        let waiting = tokio::spawn(async move {
+            bulk.send_waiting(ServerMessage::LogEnd { request_id: 1 })
+                .await
+        });
+        tokio::task::yield_now().await;
+        assert_eq!(out.len(), 12, "the bulk reply waits outside the reserve");
+        out.send(ServerMessage::Pong { seq: 1 })
+            .expect("control still fits");
+
+        for _ in 0..13 {
+            next(&mut rx).await;
+        }
+        rx.mark_drained();
+        let sent = tokio::time::timeout(WAIT, waiting).await;
+        assert_eq!(sent.expect("sent in time").unwrap(), Ok(()));
+        assert!(matches!(
+            next(&mut rx).await,
+            ServerMessage::LogEnd { request_id: 1 }
+        ));
     }
 
     /// Control is never dropped: when it no longer fits, the connection is

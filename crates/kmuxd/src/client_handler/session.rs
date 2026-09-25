@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use kmux_protocol::TransportKind;
-use kmux_protocol::messages::{ErrorCode, ServerMessage, epoch_millis};
+use kmux_protocol::messages::{ErrorCode, ServerMessage, SessionEventMsg, epoch_millis};
 use kmux_protocol::{decode_client, encode_server, read_frame, write_frame_compressed_into};
 
 /// Cap on how many queued messages one flush coalesces. Bounds batch memory and
@@ -73,6 +73,33 @@ impl Drop for AuthenticatedTasks {
     }
 }
 
+/// VT events a flood of pane output can raise one per escape sequence: a
+/// bell per BEL byte, a title or progress change per OSC. `cat` of a binary
+/// file raises thousands, to every connection, attached to the pane or not.
+fn is_lossy_vt_event(msg: &ServerMessage) -> bool {
+    matches!(
+        msg,
+        ServerMessage::Event {
+            event: SessionEventMsg::PaneBell { .. }
+                | SessionEventMsg::PaneTitleChanged { .. }
+                | SessionEventMsg::PaneProgressChanged { .. }
+        }
+    )
+}
+
+/// Queue a server-wide VT event for this connection. A flood-prone one goes
+/// on the pane-data lane and is dropped when that is congested (issue #206):
+/// on the never-drop control lane, a burst from one pane would fill the queue
+/// and close every slow client's connection. Everything else (layout, tab
+/// lifecycle, clipboard) is control.
+fn forward_vt_event(out: &OutboundTx, msg: ServerMessage) {
+    if is_lossy_vt_event(&msg) {
+        let _ = out.try_send_data(msg);
+    } else {
+        let _ = out.send(msg);
+    }
+}
+
 fn spawn_authenticated_forwarders(
     app: Arc<ServerApp>,
     ctrl_tx: OutboundTx,
@@ -98,9 +125,7 @@ fn spawn_authenticated_forwarders(
         async move {
             loop {
                 match vt_rx.recv().await {
-                    Ok(msg) => {
-                        let _ = vt_tx.send(msg);
-                    }
+                    Ok(msg) => forward_vt_event(&vt_tx, msg),
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -509,7 +534,8 @@ mod tests {
         })
         .expect("queued");
 
-        assert_eq!(signal.closed().await, CloseReason::WriteTimeout);
+        let reason = tokio::time::timeout(FRAME_WRITE_TIMEOUT * 2, signal.closed()).await;
+        assert_eq!(reason, Ok(CloseReason::WriteTimeout));
         assert!(started.elapsed() >= FRAME_WRITE_TIMEOUT);
         writer
             .await
@@ -526,15 +552,17 @@ mod tests {
         let (mut client_read, _client_write) = tokio::io::split(client);
         let started = tokio::time::Instant::now();
 
-        run_client_session(
+        let session = run_client_session(
             server_read,
             server_write,
             app,
             TransportKind::Uds,
             |_tx, _compression| NoopAttacher,
             tracing::info_span!("auth_deadline_test"),
-        )
-        .await;
+        );
+        tokio::time::timeout(liveness::AUTH_DEADLINE * 2, session)
+            .await
+            .expect("the session ends at the auth deadline");
 
         assert!(started.elapsed() > liveness::AUTH_DEADLINE);
         assert!(
@@ -658,7 +686,10 @@ mod tests {
         let first_ping = tokio::time::Instant::now();
         assert_eq!(read_until(&mut client_read, pinged).await, 1);
 
-        session.await.unwrap();
+        tokio::time::timeout(liveness::PONG_DEADLINE * 2, session)
+            .await
+            .expect("the session ends at the pong deadline")
+            .unwrap();
         assert!(first_ping.elapsed() > liveness::PONG_DEADLINE);
         tokio::time::timeout(Duration::from_secs(10), async {
             while app.vt_subscriber_count() > 0 {
@@ -667,5 +698,36 @@ mod tests {
         })
         .await
         .expect("the connection's forwarders ended with it");
+    }
+
+    /// Flood-prone VT events are dropped when pane data is congested, while
+    /// other server-wide events still take the control lane.
+    #[tokio::test]
+    async fn forward_vt_event_drops_only_flood_prone_events_under_congestion() {
+        let (out, _rx) = outbound::channel(8, close_channel().0);
+        // 8 slots, 2 kept for control: fill the data share with control.
+        for seq in 0..6 {
+            out.send(ServerMessage::Pong { seq }).unwrap();
+        }
+        let pane_event = |event| ServerMessage::Event { event };
+        let pane_id = "eagle/0".to_string();
+
+        forward_vt_event(
+            &out,
+            pane_event(SessionEventMsg::PaneBell {
+                pane_id: pane_id.clone(),
+            }),
+        );
+        forward_vt_event(
+            &out,
+            pane_event(SessionEventMsg::PaneTitleChanged {
+                pane_id: pane_id.clone(),
+                title: "t".to_string(),
+            }),
+        );
+        assert_eq!(out.len(), 6, "a bell and a title are dropped");
+
+        forward_vt_event(&out, pane_event(SessionEventMsg::PaneClosed { pane_id }));
+        assert_eq!(out.len(), 7, "a lifecycle event is control");
     }
 }
