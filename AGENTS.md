@@ -79,9 +79,10 @@ These are strictly-typed config/CLI, not environment variables.
 ## Conventions
 
 - The client is layered so no UI toolkit is depended on at or below `kmux-app`:
-  `kmux-protocol` → `kmux-client` → `kmux-app` (policy + `FrontendDriver` +
-  `run_cli`) → frontends (`kmux-gtk`, `kmux-swift` via `kmux-ffi`); `kmux` sits
-  on top. See [docs/architecture-frontend.md](docs/architecture-frontend.md).
+  `kmux-protocol` → `kmux-sys` (host: dirs, identity, auth, transports) →
+  `kmux-client` → `kmux-app` (policy + `FrontendDriver` + `run_cli`) → frontends
+  (`kmux-gtk`, `kmux-swift` via `kmux-ffi`); `kmux` sits on top.
+  See [docs/architecture-frontend.md](docs/architecture-frontend.md).
 - Document architectural changes in `docs/`.
 - Strict Rust — no `#[allow(unused)]` without justification. A new suppression
   uses `#[expect(..., reason = "...")]`, which fails the build once it stops
