@@ -159,9 +159,15 @@ mod tests {
         let status = graceful_shutdown(reused, exit_rx, Some(DEADLINE)).await;
 
         assert_eq!(status, ExitStatus::Code(0));
-        let deadline = Instant::now() + Duration::from_millis(200);
-        let killed = crate::fixtures::wait_until_dead(reused, deadline).await;
-        assert!(!killed, "signalled a process that merely reused the pid");
+        // A killed bystander would linger as our unreaped zombie, which
+        // `kill(pid, 0)` still counts as alive; `try_wait` sees the exit. A
+        // signal already sent is delivered within the window.
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert_eq!(
+            bystander.try_wait().expect("try_wait"),
+            None,
+            "signalled a process that merely reused the pid"
+        );
         bystander.kill().expect("cleanup");
         bystander.wait().expect("reap");
     }
