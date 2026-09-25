@@ -10,7 +10,7 @@ use kmux_protocol::messages::TransportKind;
 use kmux_sys::transport::quic::QuicListener;
 use kmux_sys::transport::tcp_tls::TlsTcpListener;
 use kmux_sys::transport::uds::UdsListener;
-use kmux_sys::transport::{AcceptError, IncomingSession, Listener, SessionTransport};
+use kmux_sys::transport::{HANDSHAKE_TIMEOUT, IncomingSession, Listener, SessionTransport, serve};
 
 use crate::app::ServerApp;
 use crate::auth::{generate_token, persist_token};
@@ -249,24 +249,15 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     }
 
     // ── Spawn one accept-loop task per listener ────────────────────────────────
+    // Each connection's TLS/QUIC handshake runs in its own task under
+    // HANDSHAKE_TIMEOUT, so one stalled peer never delays the next accept.
     let mut listener_handles = Vec::new();
-    for mut listener in bound_listeners {
+    for listener in bound_listeners {
         let app = Arc::clone(&app);
-        let handle = tokio::spawn(async move {
-            loop {
-                match listener.accept().await {
-                    Ok(session) => {
-                        let app = Arc::clone(&app);
-                        tokio::spawn(async move {
-                            dispatch_session(session, app).await;
-                        });
-                    }
-                    Err(AcceptError::Closed) => break,
-                    Err(e) => warn!("accept error on {} listener: {e}", listener.kind()),
-                }
-            }
+        let on_session = Arc::new(move |session: IncomingSession| {
+            tokio::spawn(dispatch_session(session, Arc::clone(&app)));
         });
-        listener_handles.push(handle);
+        listener_handles.push(tokio::spawn(serve(listener, HANDSHAKE_TIMEOUT, on_session)));
     }
 
     let shutdown = Arc::new(Notify::new());

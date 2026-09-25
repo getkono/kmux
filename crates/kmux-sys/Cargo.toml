@@ -63,6 +63,9 @@ toml = { workspace = true, optional = true }
 
 [dev-dependencies]
 tempfile.workspace = true
+# Re-listed with `test-util` for `tokio::time::pause`: the handshake-timeout
+# test runs on the paused clock instead of sleeping (issue #206).
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true
