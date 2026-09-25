@@ -310,6 +310,120 @@ mod tests {
         }
     }
 
+    // ── request_reply / connect_authenticated ───────────────────────────────
+
+    use kmux_protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
+    use kmux_protocol::{decode_client, encode_server, read_frame, write_frame};
+
+    /// Play a daemon on the far end of an in-memory stream: read the one
+    /// request, answer with `replies` in order, then hang up. Returns the
+    /// request it read.
+    async fn daemon_answering(
+        mut stream: tokio::io::DuplexStream,
+        replies: Vec<ServerMessage>,
+    ) -> ClientMessage {
+        let frame = read_frame(&mut stream)
+            .await
+            .expect("read")
+            .expect("a request");
+        for reply in &replies {
+            write_frame(&mut stream, &encode_server(reply).expect("encode"))
+                .await
+                .expect("write");
+        }
+        decode_client(&frame).expect("decode")
+    }
+
+    /// Ask for the session list the way `kmux ls` and `kmux ps` do.
+    async fn list_sessions_against(replies: Vec<ServerMessage>) -> anyhow::Result<usize> {
+        let (client, daemon) = tokio::io::duplex(64 * 1024);
+        let daemon = tokio::spawn(daemon_answering(daemon, replies));
+        let (mut read_half, mut write_half) = tokio::io::split(client);
+        let result = request_reply(
+            &mut read_half,
+            &mut write_half,
+            &ClientMessage::SessionList { request_id: 1 },
+            "session list",
+            |msg| match msg {
+                ServerMessage::SessionListResult { sessions, .. } => Some(sessions.len()),
+                _ => None,
+            },
+        )
+        .await;
+        let request = daemon.await.expect("daemon task");
+        assert!(
+            matches!(request, ClientMessage::SessionList { request_id: 1 }),
+            "{request:?}"
+        );
+        result
+    }
+
+    /// What `kmux ls`/`kmux ps` used to lose: a refused request reported as
+    /// "connection closed" with the daemon's own explanation discarded.
+    #[tokio::test]
+    async fn a_daemon_error_is_the_error_the_user_sees() {
+        let err = list_sessions_against(vec![ServerMessage::Error {
+            request_id: Some(1),
+            code: ErrorCode::InternalError,
+            message: "the daemon is shutting down".to_string(),
+        }])
+        .await
+        .expect_err("the daemon refused");
+        assert_eq!(
+            err.to_string(),
+            "session list failed: the daemon is shutting down"
+        );
+    }
+
+    /// The daemon interleaves pushes on the same channel; they are skipped
+    /// until the answer arrives.
+    #[tokio::test]
+    async fn unrelated_pushes_are_skipped_until_the_answer() {
+        let count = list_sessions_against(vec![
+            ServerMessage::Ping { seq: 7 },
+            ServerMessage::SessionListResult {
+                request_id: 1,
+                sessions: vec![],
+            },
+        ])
+        .await
+        .expect("answered");
+        assert_eq!(count, 0);
+    }
+
+    #[tokio::test]
+    async fn a_connection_closed_before_the_answer_says_so() {
+        let err = list_sessions_against(vec![ServerMessage::Ping { seq: 1 }])
+            .await
+            .expect_err("no answer came");
+        assert_eq!(err.to_string(), "Connection closed before session list");
+    }
+
+    /// Nothing listening: the error names the address the CLI tried, not a
+    /// bare OS error.
+    #[tokio::test]
+    async fn connecting_to_a_closed_port_names_the_address() {
+        let port = {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
+            listener.local_addr().expect("addr").port()
+        };
+        let conn = ResolvedConnection {
+            host: "127.0.0.1".to_string(),
+            port: 1,
+            tcp_port: Some(port),
+            token: "tok".to_string(),
+        };
+        let err = connect_authenticated(&conn)
+            .await
+            .map(|_| ())
+            .expect_err("nothing is listening");
+        assert!(
+            err.to_string()
+                .starts_with(&format!("Failed to connect to 127.0.0.1:{port}: ")),
+            "{err}"
+        );
+    }
+
     #[test]
     fn ssh_port_flag_overrides_server_string() {
         let (target, _) = parse_target(Some("focalors:2222"), Some(2223));
