@@ -2,12 +2,18 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 
+use kmux_sys::dirs::Dirs;
 use rand::Rng;
 
-/// Persist `token` to the kmux runtime token file with mode 0600.
-/// Returns the path on success.
-pub fn persist_token(token: &str) -> anyhow::Result<PathBuf> {
-    let token_path = kmux_sys::dirs::token_path()?;
+/// Persist `token` to the kmux runtime token file in `dirs` with mode 0600,
+/// truncating any previous token. Returns the path on success.
+///
+/// The directories are a parameter so the write is testable against a
+/// `Dirs::rooted` tempdir without pointing the process-global
+/// `XDG_RUNTIME_DIR` at it (docs/testing.md R3); the daemon passes
+/// `Dirs::from_env()`.
+pub fn persist_token(dirs: &Dirs, token: &str) -> anyhow::Result<PathBuf> {
+    let token_path = dirs.token_path()?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -75,19 +81,15 @@ mod tests {
     }
 
     #[test]
-    fn persist_and_read_token() {
+    fn persist_token_writes_the_runtime_token_file_owner_only() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: single-threaded test, no concurrent env access
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        let dirs = Dirs::rooted(tmp.path());
 
         let token = generate_token();
-        let path = persist_token(&token).expect("persist_token");
+        let path = persist_token(&dirs, &token).expect("persist_token");
 
         // Verify path
-        assert_eq!(
-            path,
-            tmp.path().join(kmux_sys::dirs::KMUX_DIR_NAME).join("token")
-        );
+        assert_eq!(path, dirs.token_path().expect("token path"));
 
         // Verify contents
         let contents = std::fs::read_to_string(&path).expect("read token");

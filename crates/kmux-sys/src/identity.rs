@@ -316,29 +316,6 @@ mod tests {
         assert_ne!(random_nonce(), random_nonce());
     }
 
-    #[test]
-    fn load_or_create_persists_and_is_stable() {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: single-threaded test; no concurrent env access.
-        unsafe { std::env::set_var("XDG_CONFIG_HOME", tmp.path()) };
-
-        let first = Identity::load_or_create().expect("create");
-        let second = Identity::load_or_create().expect("load");
-        // Same persisted key → same identity on reload.
-        assert_eq!(first.fingerprint(), second.fingerprint());
-
-        // Key file exists, mode 0600.
-        use std::os::unix::fs::PermissionsExt as _;
-        let path = crate::dirs::identity_key_path().expect("path");
-        let mode = std::fs::metadata(&path)
-            .expect("metadata")
-            .permissions()
-            .mode();
-        assert_eq!(mode & 0o777, 0o600, "identity key must be mode 0600");
-
-        unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
-    }
-
     /// Concurrent first use is the normal case: a GUI and a CLI start together,
     /// or several panes run `kmux notify` at once. Every racer must end up with
     /// the *same* identity, and none may see a half-written key.

@@ -26,6 +26,16 @@ msrv = "1.96.0"
 # always agree.
 too-many-lines-threshold = 100
 
+# The executable form of docs/testing.md R3/R13: behaviour enters through
+# parameters, never through the process. Mutating the environment of a test
+# binary races every other test in it that reads the same variable, and in
+# production it is unsound once a second thread exists. Configure a child with
+# `Command::env`; inject a lookup (`fn(&str) -> Option<String>`) or a `Dirs`.
+disallowed-methods = [
+    { path = "std::env::set_var", reason = "process-global mutation; pass the value as a parameter or use Command::env (docs/testing.md R3)" },
+    { path = "std::env::remove_var", reason = "process-global mutation; pass the value as a parameter or use Command::env (docs/testing.md R3)" },
+]
+
 # Identifiers `doc_markdown` would otherwise flag as needing backticks. Product
 # and ecosystem nouns only — anything that is really a code path should get the
 # backticks instead of an entry here.

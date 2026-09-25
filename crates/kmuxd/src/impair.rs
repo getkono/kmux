@@ -42,22 +42,27 @@ pub struct ImpairConfig {
 }
 
 impl ImpairConfig {
-    /// Parse `KMUX_NET_DELAY_MS`, `KMUX_NET_JITTER_MS`, `KMUX_NET_SEED`.
-    /// Returns `None` when both delay and jitter are zero/absent (the shim is
-    /// then a complete no-op).
+    /// Parse `KMUX_NET_DELAY_MS`, `KMUX_NET_JITTER_MS`, `KMUX_NET_SEED` from
+    /// the process environment.
     fn from_env() -> Option<Self> {
-        let delay_ms = env_u64("KMUX_NET_DELAY_MS");
-        let jitter_ms = env_u64("KMUX_NET_JITTER_MS");
+        Self::from_lookup(|key| std::env::var(key).ok())
+    }
+
+    /// The parsing rules, with the variable lookup passed in so they are
+    /// testable without mutating the process environment (docs/testing.md R3).
+    /// Returns `None` when both delay and jitter are zero/absent (the shim is
+    /// then a complete no-op). An unparsable value reads as absent.
+    fn from_lookup(lookup: impl Fn(&str) -> Option<String>) -> Option<Self> {
+        let parse = |key: &str| lookup(key).and_then(|v| v.trim().parse::<u64>().ok());
+        let delay_ms = parse("KMUX_NET_DELAY_MS").unwrap_or(0);
+        let jitter_ms = parse("KMUX_NET_JITTER_MS").unwrap_or(0);
         if delay_ms == 0 && jitter_ms == 0 {
             return None;
         }
-        let seed = std::env::var("KMUX_NET_SEED")
-            .ok()
-            .and_then(|v| v.trim().parse::<u64>().ok());
         Some(Self {
             delay_ms,
             jitter_ms,
-            seed,
+            seed: parse("KMUX_NET_SEED"),
         })
     }
 
@@ -76,13 +81,6 @@ pub fn pane_salt(pane_id: &str) -> u64 {
     pane_id.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |h, b| {
         (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
     })
-}
-
-fn env_u64(key: &str) -> u64 {
-    std::env::var(key)
-        .ok()
-        .and_then(|v| v.trim().parse::<u64>().ok())
-        .unwrap_or(0)
 }
 
 fn nondeterministic_seed() -> u64 {
@@ -157,15 +155,72 @@ impl SplitMix64 {
 mod tests {
     use super::*;
 
-    #[test]
-    fn from_env_none_when_unset() {
-        // Both knobs absent → no impairment. (Env is process-global; this test
-        // relies on the vars not being set in the test environment.)
-        unsafe {
-            std::env::remove_var("KMUX_NET_DELAY_MS");
-            std::env::remove_var("KMUX_NET_JITTER_MS");
+    /// A lookup over a fixed table, standing in for the environment.
+    fn lookup<'a>(vars: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |key| {
+            vars.iter()
+                .find(|(k, _)| *k == key)
+                .map(|(_, v)| (*v).to_string())
         }
-        assert!(ImpairConfig::from_env().is_none());
+    }
+
+    #[test]
+    fn from_lookup_unset_is_none() {
+        assert!(ImpairConfig::from_lookup(lookup(&[])).is_none());
+    }
+
+    #[test]
+    fn from_lookup_zero_or_garbage_knobs_are_none() {
+        let vars = [("KMUX_NET_DELAY_MS", "0"), ("KMUX_NET_JITTER_MS", "lots")];
+        assert!(ImpairConfig::from_lookup(lookup(&vars)).is_none());
+    }
+
+    #[test]
+    fn from_lookup_parses_every_knob() {
+        let vars = [
+            ("KMUX_NET_DELAY_MS", " 40 "),
+            ("KMUX_NET_JITTER_MS", "15"),
+            ("KMUX_NET_SEED", "9"),
+        ];
+        let cfg = ImpairConfig::from_lookup(lookup(&vars)).expect("active");
+        assert_eq!((cfg.delay_ms, cfg.jitter_ms, cfg.seed), (40, 15, Some(9)));
+    }
+
+    /// `from_env`'s only job is reading the process environment, which a test
+    /// may not mutate (R3). So it is checked in a child — this same test binary,
+    /// re-run on this one test — handed the knobs through `Command::env` (R7:
+    /// the in-process tier cannot set them without mutating this process).
+    #[test]
+    fn from_env_reads_the_knobs_from_the_process_environment() {
+        const PROBE: &str = "KMUX_TEST_IMPAIR_FROM_ENV_CHILD";
+        const NAME: &str = "impair::tests::from_env_reads_the_knobs_from_the_process_environment";
+        if std::env::var_os(PROBE).is_some() {
+            let cfg = ImpairConfig::from_env().expect("the parent set the knobs");
+            assert_eq!((cfg.delay_ms, cfg.jitter_ms, cfg.seed), (40, 15, Some(9)));
+            return;
+        }
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", NAME, "--test-threads=1"])
+            .env(PROBE, "1")
+            .env("KMUX_NET_DELAY_MS", "40")
+            .env("KMUX_NET_JITTER_MS", "15")
+            .env("KMUX_NET_SEED", "9")
+            .output()
+            .expect("re-run the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // "1 passed" also proves the filter matched: a filter that selects
+        // nothing exits 0 too.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child from_env did not read the knobs:\n{stdout}"
+        );
+    }
+
+    #[test]
+    fn from_lookup_jitter_alone_activates_without_a_seed() {
+        let cfg =
+            ImpairConfig::from_lookup(lookup(&[("KMUX_NET_JITTER_MS", "5")])).expect("active");
+        assert_eq!((cfg.delay_ms, cfg.jitter_ms, cfg.seed), (0, 5, None));
     }
 
     #[test]
