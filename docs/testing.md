@@ -192,8 +192,9 @@ make it a parameter:
   `Dirs::rooted` at the same root, so the four `ENV_LOCK`s went with it. That
   lock never bought isolation anyway: it serialised tests within one binary
   while two `cargo test` processes still shared the real `$XDG_RUNTIME_DIR`.
-- The last five sites (issue #204) — `kmuxd::auth::persist_token` takes a
-  `&Dirs` (the daemon passes `Dirs::from_env()`, the test `Dirs::rooted`);
+- The last five sites (issue #204) — `kmuxd::auth::persist_token_in` takes a
+  `&Dirs` (the test passes `Dirs::rooted`; `persist_token` passes
+  `Dirs::from_env()` and is itself checked in a child process);
   `kmuxd::impair` parses through `ImpairConfig::from_lookup`, which takes the
   variable lookup as a parameter (`from_env` passes `std::env::var`, the tests
   a table, and `from_env` itself is checked in a child process handed the
@@ -284,8 +285,8 @@ duplication they exist to remove.
   `kill(pid, 0)` and returns whether the process is gone from the process
   table. It replaces a fixed sleep before a liveness assertion: a dying process
   is seen as soon as it is gone, and a deadline already passed is a single
-  probe. It never reaps, so a zombie counts as alive and a test that waits on it
-  also asserts that the code under test reaped its child.
+  probe. It never reaps, so a zombie counts as alive: waiting on it asserts
+  the child was both killed and reaped (by whichever task owns the `waitpid`).
 - **The `kmuxd/tests/harness`**: `Sandbox` (a private XDG root, R3),
   `Daemon` (spawn one into a sandbox), `Federation` (`spawn_pair()` starts a
   remote and a local hub; `open_peer()` federates them through a connected GUI

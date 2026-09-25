@@ -81,7 +81,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         Some(o) => o.token.clone(),
         None => generate_token(),
     };
-    match kmux_sys::dirs::Dirs::from_env().and_then(|dirs| persist_token(&dirs, &token)) {
+    match persist_token(&token) {
         Ok(path) => info!("Auth token persisted to {}", path.display()),
         Err(e) => tracing::warn!("Failed to persist auth token: {e}"),
     }
