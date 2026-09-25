@@ -47,15 +47,17 @@ pub struct FfiCursorRect {
     pub h: f32,
 }
 
-/// The solid rects a cursor occupies, in physical px relative to the pane's
-/// top-left — exactly the rects the GPU renderer fills.
+/// The solid rects a cursor occupies, relative to the pane's top-left, in the
+/// units of `cell_w`/`cell_h` — exactly the rects the GPU renderer fills for
+/// the same cell size.
 ///
 /// A CPU frontend needs these to *draw* the cursor, not only to inspect it.
 /// Both the wgpu path and the GTK Cairo path read
 /// [`kmux_render::cursor_geometry`]; before this existed, Swift's CoreText path
-/// had no way to and rasterized its own, with a hardcoded 2px bar/underline
-/// against the renderer's scale-aware thickness — so the same cursor looked
-/// different depending on the renderer, and too thin on a Retina display.
+/// had no way to and rasterized its own, with a fixed 2pt bar/underline against
+/// the renderer's thickness of 10% of the cell height — so the same cursor
+/// looked different depending on the renderer: thicker on CoreText for any
+/// cell under 20pt, thinner above.
 ///
 /// Free-standing rather than a `KmuxDriver` method: it is pure geometry over its
 /// arguments, so it neither needs nor should take the driver's lock on the draw

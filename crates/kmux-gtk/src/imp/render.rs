@@ -498,18 +498,21 @@ fn draw_cursor(
     let cur = palette.cursor_bg;
 
     // Geometry comes from `kmux-render`, not from here. The two renderers used
-    // to compute the cursor independently -- this path with a hardcoded 2px
-    // bar/underline and a 1px hollow outline, the GPU path with a scale-aware
-    // `cursor_thickness` of `max(cell_h * 0.1, 1.0)` -- so the same cursor was
-    // drawn differently depending on which renderer was selected, and visibly
-    // too thin under Cairo on a HiDPI display, where a cell is twice as tall
-    // and the bar stayed two physical pixels. The divergence was known: the
-    // code computed both and logged the difference.
+    // to compute the cursor independently -- this path with a fixed 2-unit
+    // bar/underline and a 1-unit hollow outline, the GPU path with a
+    // `cursor_thickness` of `max(cell_h * 0.1, 1.0)` that follows the font
+    // size -- so the same cursor was drawn differently depending on which
+    // renderer was selected: thicker under Cairo for any cell under 20 units
+    // tall (the common case), thinner above. The divergence was known: the code
+    // computed both and logged the difference.
     //
-    // Both paths now derive `CellMetrics` the same way and read the same
-    // `cursor_shape_rects`, so the rects are identical, not merely similar.
-    // What is left here is Cairo's half of the job: filling them, and redrawing
-    // the glyph inside an inverted block.
+    // Both paths now read the same `cursor_shape_rects`. One difference is
+    // left, and it is in the units: Cairo draws in logical units and the GPU
+    // path in physical pixels, so the 1.0 floor is one logical unit here and
+    // one physical pixel there. The two agree wherever the 10% rule is above
+    // the floor, i.e. for any cell 10 or more units tall.
+    // What is left here is Cairo's half of the job: filling the rects, and
+    // redrawing the glyph inside an inverted block.
     let rcell = kmux_render::CellMetrics::new(m.cell_w as f32, m.cell_h as f32);
     let view = kmux_render::CursorView {
         col: cursor.col,

@@ -391,11 +391,13 @@ final class TerminalNSView: NSView {
         guard let snap = model.snapshot else { return }
 
         // Geometry comes from `kmux-render`, the same function the wgpu and GTK
-        // Cairo paths draw from. This used to rasterize its own — a hardcoded
-        // 2pt bar/underline and a 1pt hollow outline — against the renderer's
-        // scale-aware `cursor_thickness`, so the same cursor was drawn
-        // differently depending on the renderer and was visibly too thin on a
-        // Retina display, where the cell doubles and a fixed 2pt does not.
+        // Cairo paths draw from. This used to rasterize its own — a fixed 2pt
+        // bar/underline and a 1pt hollow outline — against the renderer's
+        // `cursor_thickness` (10% of the cell height), so the same cursor was
+        // drawn differently depending on the renderer: thicker here for any
+        // cell under 20pt tall, thinner above. The 1.0 floor is in points here
+        // and in physical pixels on the GPU path, so the two still differ for
+        // cells under 10pt.
         let rects = kmuxCursorRects(
             col: cursor.col,
             row: cursor.row,

@@ -1240,8 +1240,8 @@ mod tests {
         }
     }
 
-    /// Thickness scales with the cell, which is the whole reason a fixed 2px was
-    /// wrong: on a `HiDPI` display the cell doubles and the cursor did not.
+    /// Thickness scales with the cell, which is the whole reason the CPU paths'
+    /// fixed 2 units were wrong: they matched this rule only for a 20-unit cell.
     #[test]
     fn cursor_thickness_scales_with_the_cell_rather_than_being_fixed() {
         let one_x = CellMetrics::new(8.0, 16.0);

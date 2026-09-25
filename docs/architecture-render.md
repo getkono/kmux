@@ -172,13 +172,22 @@ Cairo path was moved onto it, with what Cairo fills. All three agree by
 construction rather than by inspection.
 
 They did not. Cairo and CoreText each rasterized the cursor with their own
-constants: a hardcoded **2px** bar/underline and a **1px** hollow outline,
-against the renderer's scale-aware `cursor_thickness` (`(cell_h*0.1).max(1)`).
-On a HiDPI display the cell doubles and those constants did not, so the same
-cursor was thinner on the CPU paths than under wgpu — the bug this overlay was
-built to surface, and which it did. Cairo now calls `cursor_geometry` directly;
-Swift reaches it through the `kmux_cursor_rects` FFI export, which exists for
-exactly this reason and returns the same rects.
+constants: a fixed **2-unit** bar/underline and a **1-unit** hollow outline,
+against the renderer's `cursor_thickness` (`(cell_h*0.1).max(1)`), which follows
+the font size. The two agreed only for a 20-unit cell: the CPU paths drew a
+thicker cursor for anything smaller — the common case — and a thinner one for
+anything larger. (HiDPI does not enter into it: the CPU paths draw in logical
+units, which the display scales.) Surfacing that is what this overlay was built
+for, and it did. Cairo now calls `cursor_geometry` directly; Swift reaches it
+through the `kmux_cursor_rects` FFI export, which exists for exactly this reason
+and returns the same rects.
+
+One difference remains, and it is in the units rather than the rects: the CPU
+paths hand `cursor_geometry` logical units and the GPU path physical pixels, so
+the `max(1)` floor is one logical unit on the first and one physical pixel on
+the second. Wherever the 10% rule is above the floor — any cell 10 or more units
+tall — the three paths draw the same cursor; below that, the CPU paths' floor is
+the thicker one.
 
 **Structured traces** — under the `kmux::render_debug` target:
 
