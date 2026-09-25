@@ -196,7 +196,7 @@ mod tests {
 
     /// A session running a long-lived childless process, plus its only pane id.
     async fn app_with_one_pane() -> (ServerApp, String, String) {
-        let app = ServerApp::new("tok".to_string());
+        let app = crate::fixtures::fixture_app();
         let entry = app
             .create_session(
                 None,
@@ -217,7 +217,7 @@ mod tests {
     /// `PtyKeyBatch { pane_id: "nosuch/0", events: [] }` succeeded.
     #[tokio::test]
     async fn an_empty_key_batch_to_an_unknown_pane_is_still_a_missing_pane() {
-        let app = ServerApp::new("tok".to_string());
+        let app = crate::fixtures::fixture_app();
         let err = app
             .write_key_batch("nosuch/0", ClientId(1), &[])
             .await

@@ -270,7 +270,7 @@ mod tests {
     async fn local_process_overview_reports_pane_child() {
         let size = TermSize::default();
         let caps = ClientCapabilities::default();
-        let app = ServerApp::new("tok".to_string());
+        let app = crate::fixtures::fixture_app();
 
         // A long-lived, childless process makes the assertion deterministic.
         let entry = app
@@ -315,7 +315,7 @@ mod tests {
     /// -- the caller had nothing to branch on.
     #[tokio::test]
     async fn closing_an_unknown_session_errors_instead_of_answering_ok() {
-        let app = ServerApp::new("tok".to_string());
+        let app = crate::fixtures::fixture_app();
         let err = app
             .close_session("nosuch")
             .await

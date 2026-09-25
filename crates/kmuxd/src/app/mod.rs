@@ -1072,7 +1072,7 @@ mod tests {
     /// broadcasting a bogus attention to clients.
     #[tokio::test]
     async fn notify_pane_attention_rejects_unknown_pane() {
-        let app = ServerApp::new("tok".to_string());
+        let app = crate::fixtures::fixture_app();
         let result = app
             .notify_pane_attention(
                 "ghost/0",
@@ -1086,7 +1086,7 @@ mod tests {
 
     #[tokio::test]
     async fn conn_count_watch_tracks_register_and_unregister() {
-        let app = ServerApp::new("tok".to_string());
+        let app = crate::fixtures::fixture_app();
         let mut rx = app.conn_count_rx();
 
         // Initially 0.
@@ -1163,7 +1163,7 @@ mod tests {
 
     #[tokio::test]
     async fn register_client_assigns_fresh_ids_and_stores_metrics() {
-        let app = ServerApp::new("tok".to_string());
+        let app = crate::fixtures::fixture_app();
         let metrics = Arc::new(ConnectionMetrics::new());
         metrics.bytes_in.store(42, Ordering::Relaxed);
 
@@ -1191,7 +1191,7 @@ mod tests {
 
     #[tokio::test]
     async fn channel_switch_reuses_existing_metrics_and_reports_previous_transport() {
-        let app = ServerApp::new("tok".to_string());
+        let app = crate::fixtures::fixture_app();
         let original_metrics = Arc::new(ConnectionMetrics::new());
         original_metrics.bytes_in.store(100, Ordering::Relaxed);
 
@@ -1236,7 +1236,7 @@ mod tests {
 
     #[tokio::test]
     async fn unregister_removes_connection() {
-        let app = ServerApp::new("tok".to_string());
+        let app = crate::fixtures::fixture_app();
         let metrics = Arc::new(ConnectionMetrics::new());
         let conn_id = app
             .register_client(TransportKind::Uds, metrics, None, ClientIdentity::default())
@@ -1251,7 +1251,7 @@ mod tests {
 
     #[tokio::test]
     async fn snapshot_reports_correct_transport_label() {
-        let app = ServerApp::new("tok".to_string());
+        let app = crate::fixtures::fixture_app();
         let metrics = Arc::new(ConnectionMetrics::new());
         let _ = app
             .register_client(TransportKind::Uds, metrics, None, ClientIdentity::default())
@@ -1271,11 +1271,7 @@ mod tests {
 
     use super::{AttachParams, AttachResult, SessionState};
     use crate::app::{ClientSender, PaneRelay, SCROLLBACK_CAPACITY};
-    use crate::backend::{
-        BackendConfig, BackendSize, CapabilityHandles, DEFAULT_SCROLLBACK, NullEventSink,
-    };
     use crate::scrollback::DiffBuffer;
-    use crate::term_state::new_term_state;
 
     fn make_client(rows: u16, cols: u16) -> (ClientId, ClientSender) {
         let (data_tx, _data_rx) = mpsc::channel::<kmux_protocol::messages::ServerMessage>(16);
@@ -1303,21 +1299,7 @@ mod tests {
     fn make_relay(rows: u16, cols: u16) -> PaneRelay {
         use kmux_pty::session::PtyWriter;
         use std::sync::atomic::AtomicBool;
-        let cfg = BackendConfig {
-            size: BackendSize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            capabilities: CapabilityHandles {
-                kitty_graphics: Arc::new(AtomicBool::new(false)),
-                kitty_keyboard: Arc::new(AtomicBool::new(false)),
-            },
-            events: Arc::new(NullEventSink),
-            scrollback: DEFAULT_SCROLLBACK,
-        };
-        let term_state = Arc::new(Mutex::new(new_term_state(cfg)));
+        let term_state = crate::fixtures::fixture_term_state(rows, cols);
         let kitty_graphics_enabled = Arc::new(AtomicBool::new(false));
         let kitty_keyboard_enabled = Arc::new(AtomicBool::new(false));
         PaneRelay {
@@ -1625,7 +1607,7 @@ mod tests {
 
     async fn app_with_one_pane(word: &str) -> ServerApp {
         use kmux_protocol::messages::SessionMeta;
-        let app = ServerApp::new("tok".to_string());
+        let app = crate::fixtures::fixture_app();
         let relay = make_relay(24, 80);
         let session = SessionState {
             meta: SessionMeta {

@@ -11,6 +11,8 @@ mod daemon;
 mod engine;
 #[cfg(feature = "federation")]
 mod federation;
+#[cfg(test)]
+mod fixtures;
 mod handoff;
 mod impair;
 mod log_writer;

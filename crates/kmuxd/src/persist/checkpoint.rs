@@ -29,11 +29,8 @@ pub fn write_checkpoint(state: &PersistedDaemonState, path: &Path) -> anyhow::Re
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persist::PersistedTermSize;
+    use crate::fixtures::sample_persisted_session;
     use crate::persist::STATE_VERSION;
-    use kmux_protocol::messages::{
-        CursorState, GridSnapshot, SessionMeta, SessionStatus, TermModes,
-    };
 
     fn empty_state() -> PersistedDaemonState {
         PersistedDaemonState {
@@ -49,44 +46,7 @@ mod tests {
             version: STATE_VERSION,
             session_index_counter: 1,
             used_words: vec!["eagle".to_string()],
-            sessions: vec![crate::persist::PersistedSession {
-                meta: SessionMeta {
-                    index: 0,
-                    word_id: "eagle".to_string(),
-                    name: "test".to_string(),
-                    cwd: "/tmp".to_string(),
-                },
-                next_pane_index: 1,
-                panes: vec![crate::persist::PersistedPane {
-                    pane_index: 0,
-                    program: "/bin/sh".to_string(),
-                    args: vec![],
-                    size: PersistedTermSize { rows: 24, cols: 80 },
-                    status: SessionStatus::Running,
-                    child_pid: None,
-                    grid: GridSnapshot {
-                        rows: 24,
-                        cols: 80,
-                        cells: vec![Default::default(); 24 * 80],
-                        cursor: CursorState::default(),
-                        modes: TermModes::EMPTY,
-                        history_total: 0,
-                        scrollback_base: 0,
-                        scrollback_tail: Vec::new(),
-                    },
-                    scrollback_lines: vec![],
-                    cwd: "/tmp".to_string(),
-                }],
-                tabs: vec![crate::persist::PersistedTab {
-                    tab_index: 0,
-                    name: "1".to_string(),
-                    layout: kmux_protocol::messages::LayoutNode::single(0),
-                    focused_pane: 0,
-                }],
-                next_tab_index: 1,
-                active_tab: 0,
-                last_active_ms: 0,
-            }],
+            sessions: vec![sample_persisted_session("eagle", "test", 0)],
         }
     }
 

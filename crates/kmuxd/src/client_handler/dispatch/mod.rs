@@ -357,10 +357,9 @@ pub(super) mod testing {
     };
     pub(super) use kmux_protocol::{Compressor, TransportKind};
     pub(super) use tokio::sync::mpsc;
-    pub(super) use tokio::task::AbortHandle;
 
-    pub(super) use crate::app::{AttachResult, ConnectionMetrics, ServerApp};
-    pub(super) use crate::client_handler::{OutboundCompression, PaneAttacher, SharedClientState};
+    pub(super) use crate::app::ServerApp;
+    pub(super) use crate::client_handler::SharedClientState;
     pub(super) use crate::config::{CompressionConfig, CompressionMode};
 
     pub(super) use super::handle_message;
@@ -371,44 +370,11 @@ pub(super) mod testing {
     /// A well-formed pane id (`word/index`) that parses but resolves to nothing.
     pub(super) const MISSING_PANE: &str = "nosuch/0";
 
-    /// Auth doesn't attach panes, so a never-called stub attacher suffices.
-    pub(super) struct NoopAttacher;
-
-    impl PaneAttacher for NoopAttacher {
-        fn start_pane_stream(
-            &self,
-            _pane_id: String,
-            _result: AttachResult,
-            _client_rx: mpsc::Receiver<ServerMessage>,
-        ) -> impl Future<Output = Result<AbortHandle, String>> + Send {
-            // Never invoked during auth; `ready` avoids an empty async block.
-            std::future::ready(Err("noop".to_string()))
-        }
-    }
-
-    pub(super) fn state_for(
-        app: Arc<ServerApp>,
-        transport: TransportKind,
-    ) -> (
-        SharedClientState,
-        Arc<OutboundCompression>,
-        mpsc::UnboundedReceiver<ServerMessage>,
-    ) {
-        let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
-        let comp_out = Arc::new(OutboundCompression::new(
-            app.compression.level,
-            app.compression.min_size,
-        ));
-        let state = SharedClientState::new(
-            app,
-            ctrl_tx,
-            tracing::Span::none(),
-            transport,
-            Arc::new(ConnectionMetrics::new()),
-            Arc::clone(&comp_out),
-        );
-        (state, comp_out, ctrl_rx)
-    }
+    // The crate-wide builders (docs/testing.md R5), re-exported so a domain
+    // module's single glob import still covers everything.
+    pub(super) use crate::fixtures::{
+        FIXTURE_TOKEN, NoopAttacher, fixture_app, fixture_client_state,
+    };
 
     pub(super) async fn authenticate_with_capabilities(
         state: &mut SharedClientState,
@@ -419,7 +385,7 @@ pub(super) mod testing {
         let ok = handle_message(
             state,
             ClientMessage::Auth {
-                token: "tok".to_string(),
+                token: FIXTURE_TOKEN.to_string(),
                 protocol_range: PROTOCOL_RANGE,
                 protocol_capabilities,
                 capabilities: ClientCapabilities::default(),
@@ -466,8 +432,8 @@ pub(super) mod testing {
     /// already drained so an assertion sees only the arm under test.
     pub(super) async fn authenticated_client()
     -> (SharedClientState, mpsc::UnboundedReceiver<ServerMessage>) {
-        let app = Arc::new(ServerApp::new("tok".to_string()));
-        let (mut state, _comp_out, mut ctrl_rx) = state_for(app, TransportKind::Uds);
+        let app = Arc::new(fixture_app());
+        let (mut state, _comp_out, mut ctrl_rx) = fixture_client_state(app, TransportKind::Uds);
         authenticate(&mut state).await;
         while ctrl_rx.try_recv().is_ok() {}
         (state, ctrl_rx)
@@ -548,7 +514,7 @@ pub(super) mod testing {
         SharedClientState,
         mpsc::UnboundedReceiver<ServerMessage>,
     ) {
-        let app = Arc::new(ServerApp::new("tok".to_string()));
+        let app = Arc::new(fixture_app());
         let entry = app
             .create_session(
                 None,
@@ -561,7 +527,8 @@ pub(super) mod testing {
             .await
             .expect("create_session");
         let word = entry.meta.word_id;
-        let (mut state, _comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::Uds);
+        let (mut state, _comp_out, mut ctrl_rx) =
+            fixture_client_state(Arc::clone(&app), TransportKind::Uds);
         authenticate(&mut state).await;
         while ctrl_rx.try_recv().is_ok() {}
         (app, word, state, ctrl_rx)

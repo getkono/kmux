@@ -252,13 +252,12 @@ mod tests {
     /// handler flips the shared toggle and advertises it in `AuthResult`.
     #[tokio::test]
     async fn auth_enables_compression_when_policy_says_so() {
-        let app = Arc::new(
-            ServerApp::new("tok".to_string()).with_compression(CompressionConfig {
-                mode: CompressionMode::Always,
-                ..CompressionConfig::default()
-            }),
-        );
-        let (mut state, comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::TcpTls);
+        let app = Arc::new(fixture_app().with_compression(CompressionConfig {
+            mode: CompressionMode::Always,
+            ..CompressionConfig::default()
+        }));
+        let (mut state, comp_out, mut ctrl_rx) =
+            fixture_client_state(Arc::clone(&app), TransportKind::TcpTls);
         authenticate(&mut state).await;
 
         assert!(
@@ -284,8 +283,9 @@ mod tests {
     /// Under the default `auto` mode a local UDS client is left uncompressed.
     #[tokio::test]
     async fn auth_leaves_uds_uncompressed_under_auto() {
-        let app = Arc::new(ServerApp::new("tok".to_string())); // default compression = auto
-        let (mut state, comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::Uds);
+        let app = Arc::new(fixture_app()); // default compression = auto
+        let (mut state, comp_out, mut ctrl_rx) =
+            fixture_client_state(Arc::clone(&app), TransportKind::Uds);
         authenticate(&mut state).await;
 
         assert!(
@@ -310,13 +310,12 @@ mod tests {
 
     #[tokio::test]
     async fn auth_does_not_use_unadvertised_compression_capability() {
-        let app = Arc::new(
-            ServerApp::new("tok".to_string()).with_compression(CompressionConfig {
-                mode: CompressionMode::Always,
-                ..CompressionConfig::default()
-            }),
-        );
-        let (mut state, comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::TcpTls);
+        let app = Arc::new(fixture_app().with_compression(CompressionConfig {
+            mode: CompressionMode::Always,
+            ..CompressionConfig::default()
+        }));
+        let (mut state, comp_out, mut ctrl_rx) =
+            fixture_client_state(Arc::clone(&app), TransportKind::TcpTls);
         authenticate_with_capabilities(&mut state, Vec::new()).await;
 
         assert!(matches!(comp_out.compressor(), Compressor::Off));
@@ -337,12 +336,12 @@ mod tests {
 
     #[tokio::test]
     async fn auth_rejects_disjoint_protocol_range_before_token_validation() {
-        let app = Arc::new(ServerApp::new("tok".to_string()));
-        let (mut state, _comp_out, mut ctrl_rx) = state_for(app, TransportKind::Uds);
+        let app = Arc::new(fixture_app());
+        let (mut state, _comp_out, mut ctrl_rx) = fixture_client_state(app, TransportKind::Uds);
         let ok = handle_message(
             &mut state,
             ClientMessage::Auth {
-                token: "tok".to_string(),
+                token: FIXTURE_TOKEN.to_string(),
                 protocol_range: ProtocolRange::exact(ProtocolVersion::new(2, 0, 0)),
                 protocol_capabilities: Vec::new(),
                 capabilities: ClientCapabilities::default(),
@@ -373,14 +372,15 @@ mod tests {
     /// connection is closed (issue #146): proof-of-possession is mandatory.
     #[tokio::test]
     async fn auth_rejects_invalid_signature() {
-        let app = Arc::new(ServerApp::new("tok".to_string()));
-        let (mut state, _comp_out, mut ctrl_rx) = state_for(Arc::clone(&app), TransportKind::Uds);
+        let app = Arc::new(fixture_app());
+        let (mut state, _comp_out, mut ctrl_rx) =
+            fixture_client_state(Arc::clone(&app), TransportKind::Uds);
         let identity = kmux_sys::identity::Identity::generate();
 
         let ok = handle_message(
             &mut state,
             ClientMessage::Auth {
-                token: "tok".to_string(),
+                token: FIXTURE_TOKEN.to_string(),
                 protocol_range: PROTOCOL_RANGE,
                 protocol_capabilities: protocol_capabilities(),
                 capabilities: ClientCapabilities::default(),
@@ -424,8 +424,8 @@ mod tests {
 
     #[tokio::test]
     async fn an_unauthenticated_client_is_told_to_send_auth_first() {
-        let app = Arc::new(ServerApp::new("tok".to_string()));
-        let (mut state, _comp_out, mut ctrl_rx) = state_for(app, TransportKind::Uds);
+        let app = Arc::new(fixture_app());
+        let (mut state, _comp_out, mut ctrl_rx) = fixture_client_state(app, TransportKind::Uds);
         let keep = handle_message(&mut state, ClientMessage::Ping { seq: 1 }, &NoopAttacher).await;
         assert!(keep, "the pre-auth gate keeps the connection open");
         let (request_id, code, message) = only_error(drain(&mut ctrl_rx));
@@ -437,7 +437,7 @@ mod tests {
     #[tokio::test]
     async fn a_second_auth_after_authentication_is_ignored_silently() {
         let (keep, msgs) = dispatch_one(ClientMessage::Auth {
-            token: "tok".to_string(),
+            token: FIXTURE_TOKEN.to_string(),
             protocol_range: PROTOCOL_RANGE,
             protocol_capabilities: protocol_capabilities(),
             capabilities: ClientCapabilities::default(),
