@@ -23,6 +23,7 @@ mod process_stats;
 mod relay;
 mod scrollback;
 mod startup;
+mod supervisor;
 mod tcp_listener;
 mod tls;
 mod trace;

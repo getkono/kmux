@@ -166,29 +166,13 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         Err(e) => warn!("could not determine graveyard path: {e}"),
     }
 
-    // Periodic checkpoint task.
+    // Periodic checkpoint task, restarted if it panics (issue #206): without
+    // it sessions silently stop being persisted for the daemon's lifetime.
     {
         let persist_app = Arc::clone(&app);
-        tokio::spawn(async move {
-            let mut interval = tokio::time::interval(Duration::from_secs(30));
-            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-            loop {
-                interval.tick().await;
-                let state = persist_app.checkpoint_state().await;
-                match kmux_sys::dirs::session_state_path() {
-                    Ok(path) => {
-                        if let Err(e) = crate::persist::checkpoint::write_checkpoint(&state, &path)
-                        {
-                            warn!("periodic checkpoint failed: {e}");
-                        }
-                    }
-                    Err(e) => warn!("could not determine checkpoint path: {e}"),
-                }
-                // TTL-sweep the closed-session graveyard (issue #64); rewrites
-                // the graveyard file only if something actually expired.
-                persist_app.sweep_graveyard();
-            }
-        });
+        tokio::spawn(crate::supervisor::supervise("checkpoint", move || {
+            checkpoint_loop(Arc::clone(&persist_app))
+        }));
     }
 
     // ── Build and bind all configured listeners ────────────────────────────────
@@ -411,6 +395,29 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         endpoint.close(0u32.into(), b"shutdown");
     }
     Ok(())
+}
+
+/// Checkpoint every session to disk every 30 s, and TTL-sweep the
+/// closed-session graveyard, forever. Holds no state between iterations, so
+/// the supervisor can restart it after a panic.
+async fn checkpoint_loop(app: Arc<ServerApp>) {
+    let mut interval = tokio::time::interval(Duration::from_secs(30));
+    interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        interval.tick().await;
+        let state = app.checkpoint_state().await;
+        match kmux_sys::dirs::session_state_path() {
+            Ok(path) => {
+                if let Err(e) = crate::persist::checkpoint::write_checkpoint(&state, &path) {
+                    warn!("periodic checkpoint failed: {e}");
+                }
+            }
+            Err(e) => warn!("could not determine checkpoint path: {e}"),
+        }
+        // TTL-sweep the closed-session graveyard (issue #64); rewrites the
+        // graveyard file only if something actually expired.
+        app.sweep_graveyard();
+    }
 }
 
 /// Dispatch a newly accepted session to the appropriate transport handler.
