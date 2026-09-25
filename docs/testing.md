@@ -55,7 +55,9 @@ went unasserted.
 child process is configured with `Command::env`, never by mutating the parent's
 environment. Process-global mutation forces tests to serialise on a lock, and a
 per-file lock does not serialise against another file's.
-*Enforced by:* `clippy::disallowed_methods`, plus the audit snippets below.
+*Enforced by:* `clippy::disallowed_methods` — `clippy.toml` lists
+`std::env::set_var` and `std::env::remove_var`, so a new site fails
+`mise run clippy` / `mise run lint-gate` — plus the audit snippets below.
 
 **R4 — one match, many handlers.** A dispatcher over a message or action enum
 keeps a router whose arms only destructure and call. Each arm's logic is a named
@@ -144,7 +146,7 @@ Recorded so they are not re-proposed:
 
 - **A `Clock` trait.** The repo already injects time the idiomatic way — at the
   pure boundary, as a parameter: `Liveness::{observe_inbound, is_timed_out}(now)`,
-  `advance_blink(phase_start, now)`, `TimeoutPolicy::check(started_at)`. A trait
+  `advance_blink(phase_start, now)`, `TimeoutEnforcer::check(now)`. A trait
   would add a generic or a `dyn` field to four large structs and buy nothing
   `Instant` arithmetic does not already give a test. R3 is the rule; a
   trait is not.
@@ -166,11 +168,11 @@ The tree does not satisfy every rule above yet. That is stated here rather than
 left implicit, because a normative document whose rules are quietly violated is
 the problem this one exists to fix.
 
-Measured 2026-08-22:
+Measured 2026-08-22; the R3 row updated 2026-09-25 (issue #204):
 
 | Rule | At branch start | Now | Target |
 | --- | --- | --- | --- |
-| R3 — no process-global env mutation | 91 sites / 13 files | **5 / 3** | 0 |
+| R3 — no process-global env mutation | 91 sites / 13 files | **0 / 0** | 0 — reached |
 | R3/R13 — no test-only lock | 98 sites / 10 files | **0 / 0** | 0 — reached |
 | R4 — no function over 100 lines | 45 (largest 888 lines) | 45 (largest 394, a registered exception) | 0, minus the exceptions register |
 | R5 — no double in a release build | 2 (`kmux-pty`'s `pub mod mock`) | **0** | 0 — reached |
@@ -190,11 +192,15 @@ make it a parameter:
   `Dirs::rooted` at the same root, so the four `ENV_LOCK`s went with it. That
   lock never bought isolation anyway: it serialised tests within one binary
   while two `cargo test` processes still shared the real `$XDG_RUNTIME_DIR`.
-
-The five remaining R3 sites are three unit tests that point one XDG variable at
-a tempdir to exercise a path resolver, and one that clears two impairment knobs.
-Each is a single-variable read in the code under test rather than a whole
-subsystem's worth of state; they are listed in Known exceptions.
+- The last five sites (issue #204) — `kmuxd::auth::persist_token` takes a
+  `&Dirs` (the daemon passes `Dirs::from_env()`, the test `Dirs::rooted`);
+  `kmuxd::impair` parses through `ImpairConfig::from_lookup`, which takes the
+  variable lookup as a parameter (`from_env` passes `std::env::var`, the tests
+  a table, and `from_env` itself is checked in a child process handed the
+  knobs through `Command::env`); and `kmux-sys::identity`'s test, which
+  duplicated the `load_or_create_at(path)` tests beside it, was deleted. With
+  the count at zero, R3 graduated to a hard gate: `clippy.toml`'s
+  `disallowed-methods`.
 
 R4's count did not fall, and that is the honest reading: the three god
 dispatchers were split, but what each leaves behind is a flat, exhaustive
@@ -243,12 +249,12 @@ Counts are `#[test]` + `#[tokio::test]` functions, measured 2026-08-16.
 | `kmux-protocol` | 124 | — | codec byte fixtures, framing, version/capability negotiation, message categories, compat classification | wire fixtures — the crate is pure data, so every test is tier *pure* | — |
 | `kmux-sys` | 51 | — | XDG path resolution rules, Ed25519 identity round-trip, TOFU store, transport constants | `Dirs::rooted` | real sockets, real TLS handshakes, keyring |
 | `kmux-app` | 300 | — | action dispatch, mode resolution, layout geometry, config resolution, command registry, driver tick | `AppCore::for_test`, `FrontendDriver::for_test` | `run_cli` process exit |
-| `kmuxd` | 174 | 18 | message handlers, app state, relay, auth, wordlist, persistence; grid conformance (R10); 5 e2e suites | `NoopAttacher`, `ServerApp::new`, `NullEventSink` (via `kmux-vt-core/test-util`) | fork/exec, `SCM_RIGHTS`, daemonize, `startup::async_main` |
+| `kmuxd` | 174 | 18 | message handlers, app state, relay, auth, wordlist, persistence; grid conformance (R10); 5 e2e suites | `crate::fixtures` (`fixture_app`, `fixture_client_state`, `NoopAttacher`, …), `NullEventSink` (via `kmux-vt-core/test-util`); e2e: `harness::{Sandbox, Daemon, Federation}` | fork/exec, `SCM_RIGHTS`, daemonize, `startup::async_main` |
 | `kmux-client` | 163 | 3 | server-message handling, grid apply, selection, input, liveness; grid-apply proptest (R10) | channel injection | — |
 | `kmux-connect` | 85 | — | bootstrap racing, daemon lifecycle, token handling, host parsing, attach-gate refusals | `Dirs::rooted` | real sshd handshake, QUIC/TLS on the wire |
 | `kmux-vt-core` | 71 | — | diff engine, scrollback mirror, backend contract | `MockBackend`, `NullEventSink` (`test-util`) | real terminal emulation |
 | `kmux-render` | 54 | — | geometry, packed format, atlas packing, colour, dirty-row parity | — | GPU adapter (skips cleanly, R11) |
-| `kmux-pty` | 34 | — | timeout policy, registry, expect parser, size math | — (`MockPty` deleted: 114 lines of `tokio::io::duplex` wrapper with no consumer) | `forkpty`, real child spawn, termios |
+| `kmux-pty` | 34 | — | timeout policy, registry, expect parser, size math | `fixtures::wait_until_dead` (`MockPty` deleted: 114 lines of `tokio::io::duplex` wrapper with no consumer) | `forkpty`, real child spawn, termios |
 | `kmux-ghostty` | 26 | — | safe façade, `Send`/`Sync` static assertions, event decode | `NullSink` | libghostty internals |
 | `kmux-ffi` | 17 | — | a few leaf conversions | — | `extern "C"` dispatch, uniffi object lifetimes |
 | `kmux-gtk` | 14 | — | keyval→protocol conversion, accel→action table | — | **all widget construction and the glib main loop** |
@@ -261,10 +267,40 @@ Swift: `kmux-swift/Tests/KmuxAppTests/` — 11 `func test`, run by
 `mise run swift-test` in the macOS CI job. It is the coverage for `kmux-ffi`'s
 untestable half.
 
+## Shared fixtures and helpers
+
+Reach for these before writing a setup of your own; a second copy of one is the
+duplication they exist to remove.
+
+- **`kmuxd`'s `#[cfg(test)] mod fixtures`** (`crates/kmuxd/src/fixtures.rs`,
+  R5): `fixture_app()` (an empty `ServerApp` accepting `FIXTURE_TOKEN`),
+  `fixture_client_state(app, transport)` (a connection's `SharedClientState`,
+  its outbound compressor and its control-channel receiver), `NoopAttacher`,
+  `fixture_term_state(rows, cols)`, `sample_grid()` and
+  `sample_persisted_session(word, name, last_active_ms)`. The dispatch tests'
+  `testing` module re-exports `FIXTURE_TOKEN`, `fixture_app`,
+  `fixture_client_state` and `NoopAttacher`.
+- **`kmux-pty`'s `fixtures::wait_until_dead(pid, deadline)`** polls
+  `kill(pid, 0)` and returns whether the process is gone from the process
+  table. It replaces a fixed sleep before a liveness assertion: a dying process
+  is seen as soon as it is gone, and a deadline already passed is a single
+  probe. It never reaps, so a zombie counts as alive and a test that waits on it
+  also asserts that the code under test reaped its child.
+- **The `kmuxd/tests/harness`**: `Sandbox` (a private XDG root, R3),
+  `Daemon` (spawn one into a sandbox), `Federation` (`spawn_pair()` starts a
+  remote and a local hub; `open_peer()` federates them through a connected GUI
+  and returns it with the peer id), and `E2E_TIMEOUT`, the one bound on every
+  e2e wait. A shorter bound needs a comment saying why.
+- **`kmux-vt-worker` is a build prerequisite, not a test step.** `cargo test`
+  builds only a package's own binaries, so `mise run test` depends on the
+  `build-vt-worker` task and the harness only locates the binary, failing with
+  the command to run when it is missing. Running `cargo test -p kmuxd` by hand
+  needs `cargo build -p kmux-vt-worker` first.
+
 ## Running
 
 ```sh
-mise run test                          # the whole workspace; matches CI
+mise run test                          # the whole workspace; matches CI (builds kmux-vt-worker first)
 cargo test -p kmux-app                 # one crate
 mise run swift-test                    # the native macOS app
 cargo test -p kmux-render --features gpu   # the GPU tier (skips with no adapter)
@@ -343,8 +379,7 @@ Adding a row is a normative change: justify it in the commit that adds it.
 | `kmuxd::startup::async_main` (396 lines) | A linear boot script — bind, TLS, handoff, listeners, signals. Every split yields a function nothing can assert on without a live daemon. Exempt from R4 | the five `kmuxd/tests/*_e2e.rs` suites |
 | `kmuxd` fork/exec, `SCM_RIGHTS`, daemonize | Cannot run in-process | `handoff_e2e.rs`, `process_isolation_e2e.rs` |
 | `kmux-connect` real sshd handshake | Needs a live sshd in CI | `PeerTarget::Direct`, added precisely so federation is e2e-testable without sshd — see [architecture-federation.md](architecture-federation.md) |
-| `kmux-pty` `forkpty` and real child spawn | Process and tty syscalls | `MockPty`; the `kmuxd` e2e suites spawn real shells |
+| `kmux-pty` `forkpty` and real child spawn | Process and tty syscalls | `kmux-pty`'s own tests spawn real children and wait on them with `wait_until_dead`; the `kmuxd` e2e suites spawn real shells |
 | `kmux-render` GPU adapter | No adapter on a headless runner | the pure tier always runs; GPU smoke skips cleanly (R11) |
 | `kmux-ghostty-sys` Zig internals and raw bindings | Not Rust; excluded from mutation by `exclude_globs` | `EXPECTED_ABI_VERSION` (R8); `kmux-vt-core`'s diff tests |
 | `KMUX_FFI_ABI_VERSION` bump on a surface change | Not machine-detectable | human review; the generated-bindings diff |
-| Five R3 env sites: `kmuxd::auth`, `kmuxd::impair`, `kmux-sys::identity` | Each is a single-variable read *inside the code under test* — the resolver's job is to read that variable, so parameterising it removes the thing being tested. Scoped to one test each, not a subsystem's state | the surrounding assertions; `Dirs::rooted` covers every path resolver that has a caller-supplied alternative |
