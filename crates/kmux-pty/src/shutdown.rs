@@ -13,8 +13,12 @@ const DEFAULT_GRACE: Duration = Duration::from_secs(5);
 /// Shut down a PTY child and everything in its process group.
 ///
 /// The child is a session leader, so its pid is also its process group id,
-/// and signalling the group reaches the jobs and pipelines it started, not
-/// only the shell. The cascade:
+/// and signalling the group reaches everything in it: the shell, and the jobs
+/// and pipelines of a shell without job control. (A job-controlling shell puts
+/// each job in a group of its own; those go the way a closed terminal's do, by
+/// the shell forwarding `SIGHUP` and the kernel hanging up the foreground
+/// group.) A child that has already exited is not signalled at all. The
+/// cascade:
 ///
 /// 1. `SIGHUP` then `SIGTERM` to the group. `SIGHUP` is what closing a
 ///    terminal means: an interactive shell ignores `SIGTERM` but exits on
@@ -37,11 +41,19 @@ pub async fn graceful_shutdown(
     grace: Option<Duration>,
 ) -> ExitStatus {
     let grace = grace.unwrap_or(DEFAULT_GRACE);
+    // A child that has already exited has been reaped, and its pid — and, once
+    // its group empties, its process group id — may belong to someone else by
+    // now: another pane's shell, even. Signal nothing.
+    if let Some(status) = exit_rx.borrow().clone() {
+        return status;
+    }
     signal_group(pid, Signal::SIGHUP);
     signal_group(pid, Signal::SIGTERM);
     if let Ok(status) = timeout(grace, wait_for_exit(&mut exit_rx)).await {
-        // The child is reaped and its pid free for reuse, so only the group is
-        // signalled: its id stays reserved while it has members.
+        // The child exited just now, in response to the signals above. Its
+        // pid is free again, so only the group is signalled: a process group
+        // id is not reused while the group has members, and a group emptied
+        // this recently has had no time to see its id recycled.
         let _ = killpg(pid, Signal::SIGKILL);
         return status;
     }
@@ -57,10 +69,13 @@ pub async fn graceful_shutdown(
 /// only once it has run `setsid` — which may not have happened yet when a
 /// pane is closed the moment it opens. Until then there is no group to
 /// signal (`ESRCH`), but the pid is already the child's, and the child has
-/// not yet started anything else that would need reaching.
+/// not yet started anything else that would need reaching. The pid is
+/// signalled only then, so a leader that has its group never gets a signal
+/// twice (a shell's `trap` would run twice).
 pub(crate) fn signal_group(pid: Pid, signal: Signal) {
-    let _ = killpg(pid, signal);
-    let _ = kill(pid, signal);
+    if killpg(pid, signal) == Err(nix::errno::Errno::ESRCH) {
+        let _ = kill(pid, signal);
+    }
 }
 
 /// Resolve once `exit_rx` reports an exit. A channel whose sender is gone
@@ -122,6 +137,33 @@ mod tests {
         let pty = PtyProcess::spawn(&PtyConfig::new("/bin/sleep").args(["600"])).expect("spawn");
         let status = graceful_shutdown(pty.pid, pty.exit_rx.clone(), Some(DEADLINE)).await;
         assert_eq!(status, ExitStatus::Signal(Signal::SIGHUP as i32));
+    }
+
+    /// Closing a pane whose child has already exited signals nothing: its pid
+    /// has been reaped and may now be another process's. That reuse is
+    /// staged by pairing an exit channel that already reports an exit with
+    /// the pid of a live process leading its own group, which must survive.
+    /// Needs a real process to be (not) signalled (R7).
+    #[tokio::test]
+    async fn graceful_shutdown_of_an_exited_child_signals_nothing() {
+        use std::os::unix::process::CommandExt;
+
+        let mut bystander = std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .process_group(0)
+            .spawn()
+            .expect("spawn");
+        let reused = Pid::from_raw(i32::try_from(bystander.id()).expect("pid"));
+        let (_tx, exit_rx) = watch::channel(Some(ExitStatus::Code(0)));
+
+        let status = graceful_shutdown(reused, exit_rx, Some(DEADLINE)).await;
+
+        assert_eq!(status, ExitStatus::Code(0));
+        let deadline = Instant::now() + Duration::from_millis(200);
+        let killed = crate::fixtures::wait_until_dead(reused, deadline).await;
+        assert!(!killed, "signalled a process that merely reused the pid");
+        bystander.kill().expect("cleanup");
+        bystander.wait().expect("reap");
     }
 
     /// A background job is in the shell's process group, so closing reaches
