@@ -567,4 +567,19 @@ mod tests {
         let open = target_open_after_exec(PROBE_SRC, PROBE_TARGET, inherit_as);
         assert!(open, "fd {PROBE_TARGET} not open");
     }
+
+    /// A failed `fcntl`/`dup2` surfaces its errno, so `spawn` fails instead of
+    /// exec'ing a worker without its socket. Fd -1 is never open, so both calls
+    /// fail with EBADF without touching any fd in this process.
+    #[test]
+    fn inherit_as_reports_a_bad_fd() {
+        for target in [-1, PROBE_TARGET] {
+            let err = inherit_as(-1, target).expect_err("fd -1 is not open");
+            assert_eq!(
+                err.raw_os_error(),
+                Some(nix::libc::EBADF),
+                "target {target}"
+            );
+        }
+    }
 }
