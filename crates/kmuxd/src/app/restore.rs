@@ -250,33 +250,29 @@ impl ServerApp {
                     if let Err(e) = self.manager.register(pane_id, session).await {
                         warn!("restore: could not register inherited pane {pane_id}: {e}");
                     } else {
-                        match self.split_registered(pane_id).await {
-                            Some((reader, writer)) => {
-                                let relay = self.build_pane_relay(
-                                    pane_id,
-                                    persisted_pane,
-                                    reader,
-                                    writer,
-                                    SeedMode::Inherited,
-                                );
-                                return Some((relay, true));
-                            }
-                            None => {
-                                // Registered but unsplittable — drop it and fall
-                                // through to respawn so the pane is not lost.
-                                //
-                                // The child on the other end of this fd is the
-                                // user's live shell, inherited across a daemon
-                                // upgrade. If the close does not take, falling
-                                // through respawns a *second* shell for the same
-                                // pane and the first keeps running with nothing
-                                // holding it — detached, invisible, and for as
-                                // long as the machine is up. So the failure is
-                                // reported and the pid is killed directly.
-                                let closed = self.manager.close(pane_id).await.map(drop);
-                                kill_if_close_failed(closed, pane_id, pid);
-                            }
+                        if let Some((reader, writer)) = self.split_registered(pane_id).await {
+                            let relay = self.build_pane_relay(
+                                pane_id,
+                                persisted_pane,
+                                reader,
+                                writer,
+                                SeedMode::Inherited,
+                            );
+                            return Some((relay, true));
                         }
+                        // Registered but unsplittable — drop it and fall
+                        // through to respawn so the pane is not lost.
+                        //
+                        // The child on the other end of this fd is the user's
+                        // live shell, inherited across a daemon upgrade. If the
+                        // close does not take, falling through respawns a
+                        // *second* shell for the same pane and the first keeps
+                        // running with nothing holding it — detached,
+                        // invisible, and for as long as the machine is up. So
+                        // the failure is reported and the pid is killed
+                        // directly.
+                        let closed = self.manager.close(pane_id).await.map(drop);
+                        kill_if_close_failed(closed, pane_id, pid);
                     }
                 }
                 Err(e) => {

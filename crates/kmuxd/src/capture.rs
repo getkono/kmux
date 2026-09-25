@@ -256,7 +256,8 @@ mod tests {
             if self.truncate_fails {
                 return Err(io::Error::other("truncate refused"));
             }
-            self.bytes.truncate(usize::try_from(len).expect("fits"));
+            self.bytes
+                .truncate(usize::try_from(len).map_err(io::Error::other)?);
             Ok(())
         }
     }

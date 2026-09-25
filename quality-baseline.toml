@@ -664,7 +664,7 @@ count = 7
 [[lints]]
 crate = "kmux-sys"
 lint = "missing_docs"
-count = 16
+count = 15
 
 [[lints]]
 crate = "kmux-vt-core"
@@ -779,7 +779,7 @@ count = 7
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::match_same_arms"
-count = 8
+count = 7
 
 [[lints]]
 crate = "kmuxd"

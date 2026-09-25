@@ -31,7 +31,7 @@
 //! `docs/architecture-federation.md`.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kmux_client::grid::CellGrid;
@@ -988,7 +988,10 @@ impl PeerManager {
         let conn = self
             .conn_for_word(local_word)
             .ok_or_else(|| format!("session {local_word} is not federated"))?;
-        let guard = conn.lock().unwrap();
+        // Past a poisoned lock rather than through it: this reads two fields
+        // and sends one message, which a panic elsewhere cannot have left
+        // half-done, and a layout nudge is no reason to take the daemon down.
+        let guard = conn.lock().unwrap_or_else(PoisonError::into_inner);
         if guard.dead {
             return Err("peer connection is closed".to_string());
         }
@@ -1042,12 +1045,15 @@ impl PeerManager {
     /// Forget the federated session `local_word`: its mappings, listing and
     /// proxied panes, and its entry in the word index, returning the word to the
     /// pool. A no-op for a word that is not federated.
+    ///
+    /// Proceeds past a poisoned lock: it only removes entries, which leaves the
+    /// maps consistent whatever state a panic elsewhere left them in.
     fn unregister_session(&self, app: &ServerApp, local_word: &str) {
         let Some(conn) = self.conn_for_word(local_word) else {
             return;
         };
         {
-            let mut guard = conn.lock().unwrap();
+            let mut guard = conn.lock().unwrap_or_else(PoisonError::into_inner);
             if let Some(remote_word) = guard.local_to_remote.remove(local_word) {
                 guard.remote_to_local.remove(&remote_word);
             }
@@ -1057,7 +1063,10 @@ impl PeerManager {
                 .panes
                 .retain(|pane_id, _| !pane_id.starts_with(&prefix));
         }
-        self.word_index.lock().unwrap().remove(local_word);
+        self.word_index
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(local_word);
         app.release_word(local_word);
     }
 

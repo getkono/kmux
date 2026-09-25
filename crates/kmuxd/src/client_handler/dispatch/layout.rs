@@ -32,7 +32,7 @@ fn forwarded_to_peer(
     true
 }
 
-/// Handle [`ClientMessage::PaneSwap`](kmux_protocol::messages::ClientMessage::PaneSwap).
+/// Handle [`ClientMessage::PaneSwap`].
 pub(super) async fn on_pane_swap(
     state: &mut SharedClientState,
     word_id: WordId,
@@ -52,7 +52,7 @@ pub(super) async fn on_pane_swap(
     answer_layout_change(state, &word_id, tab_index, result);
 }
 
-/// Handle [`ClientMessage::SetLayoutRatios`](kmux_protocol::messages::ClientMessage::SetLayoutRatios).
+/// Handle [`ClientMessage::SetLayoutRatios`].
 pub(super) async fn on_set_layout_ratios(
     state: &mut SharedClientState,
     word_id: WordId,
@@ -75,7 +75,7 @@ pub(super) async fn on_set_layout_ratios(
     answer_layout_change(state, &word_id, tab_index, result);
 }
 
-/// Handle [`ClientMessage::ApplyLayoutScheme`](kmux_protocol::messages::ClientMessage::ApplyLayoutScheme).
+/// Handle [`ClientMessage::ApplyLayoutScheme`].
 pub(super) async fn on_apply_layout_scheme(
     state: &mut SharedClientState,
     word_id: WordId,
@@ -98,7 +98,7 @@ pub(super) async fn on_apply_layout_scheme(
     answer_layout_change(state, &word_id, tab_index, result);
 }
 
-/// Handle [`ClientMessage::SetFocus`](kmux_protocol::messages::ClientMessage::SetFocus).
+/// Handle [`ClientMessage::SetFocus`].
 pub(super) async fn on_set_focus(
     state: &mut SharedClientState,
     word_id: WordId,
