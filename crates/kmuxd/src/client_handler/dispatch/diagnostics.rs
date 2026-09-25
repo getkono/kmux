@@ -297,7 +297,8 @@ mod tests {
         assert!(keep);
         // The dump is sent from its own task: collect until the stream ends.
         let mut msgs = Vec::new();
-        while let Some(msg) = ctrl_rx.recv().await {
+        let wait = std::time::Duration::from_secs(10);
+        while let Ok(Some(msg)) = tokio::time::timeout(wait, ctrl_rx.recv()).await {
             let last = matches!(
                 msg,
                 ServerMessage::LogEnd { .. } | ServerMessage::Error { .. }

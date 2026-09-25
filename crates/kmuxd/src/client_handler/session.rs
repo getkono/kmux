@@ -60,13 +60,26 @@ pub fn build_attach_replay(attach_result: AttachResult, pane_id: &str) -> Vec<Se
     }
 }
 
+/// The tasks a connection runs once it has authenticated: the session-event
+/// and VT-event forwarders and the ping task. Aborted when dropped, so they
+/// end with the connection.
+struct AuthenticatedTasks([JoinHandle<()>; 3]);
+
+impl Drop for AuthenticatedTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
 fn spawn_authenticated_forwarders(
     app: Arc<ServerApp>,
     ctrl_tx: OutboundTx,
     metrics: Arc<ConnectionMetrics>,
     liveness: Arc<Liveness>,
     conn_span: Span,
-) -> (JoinHandle<()>, JoinHandle<()>, JoinHandle<()>) {
+) -> AuthenticatedTasks {
     let mut event_rx = app.subscribe_events();
     let event_tx = ctrl_tx.clone();
     let event_task = tokio::spawn(
@@ -115,7 +128,7 @@ fn spawn_authenticated_forwarders(
         .instrument(conn_span),
     );
 
-    (event_task, vt_task, ping_task)
+    AuthenticatedTasks([event_task, vt_task, ping_task])
 }
 
 /// Longest a single frame write, or a flush, may take before the connection
@@ -150,7 +163,7 @@ async fn write_outbound<W: AsyncWrite + Unpin>(
     'writer: while let Some(first) = out_rx.recv().await {
         batch.clear();
         batch.push(first);
-        while batch.len() < MAX_WRITE_BATCH {
+        for _ in 1..MAX_WRITE_BATCH {
             match out_rx.try_recv() {
                 Ok(m) => batch.push(m),
                 Err(_) => break,
@@ -281,7 +294,7 @@ pub async fn run_client_session<R, W, A, F>(
         Arc::clone(&metrics),
         comp_out,
     );
-    let mut authenticated_tasks: Option<(JoinHandle<()>, JoinHandle<()>, JoinHandle<()>)> = None;
+    let mut authenticated_tasks: Option<AuthenticatedTasks> = None;
     let mut flush_before_close = false;
 
     loop {
@@ -345,11 +358,7 @@ pub async fn run_client_session<R, W, A, F>(
     }
 
     watchdog_task.abort();
-    if let Some((event_task, vt_task, ping_task)) = authenticated_tasks {
-        event_task.abort();
-        ping_task.abort();
-        vt_task.abort();
-    }
+    drop(authenticated_tasks);
 
     let log_conn_id = state.connection_id.map(|c| c.0);
     if let Some(client_id) = state.client_id {
@@ -532,5 +541,131 @@ mod tests {
             read_frame(&mut client_read).await.unwrap().is_none(),
             "the daemon closed the socket"
         );
+    }
+
+    /// Every queued message reaches the peer as its own frame, in order, and
+    /// is counted; the writer ends cleanly once every sender is gone.
+    #[tokio::test]
+    async fn write_outbound_writes_each_frame_in_order_and_counts_it() {
+        let (server, mut client) = tokio::io::duplex(64 * 1024);
+        let (closer, _signal) = close_channel();
+        let (out, out_rx) = outbound::channel(OUTBOUND_CAPACITY, closer.clone());
+        let metrics = Arc::new(ConnectionMetrics::new());
+        let writer = tokio::spawn(write_outbound(
+            out_rx,
+            server,
+            Arc::clone(&metrics),
+            Arc::new(OutboundCompression::new(3, 1024)),
+            closer,
+            FRAME_WRITE_TIMEOUT,
+        ));
+        let payload_len = encode_server(&ServerMessage::Pong { seq: 3 })
+            .unwrap()
+            .len() as u64;
+
+        out.send(ServerMessage::Pong { seq: 3 }).unwrap();
+        out.send(ServerMessage::Pong { seq: 4 }).unwrap();
+        drop(out);
+        writer.await.expect("the writer ends once its queue closes");
+
+        for seq in [3, 4] {
+            let frame = read_frame(&mut client).await.unwrap().expect("a frame");
+            assert!(
+                matches!(decode_server(&frame).unwrap(), ServerMessage::Pong { seq: s } if s == seq)
+            );
+        }
+        assert!(
+            read_frame(&mut client).await.unwrap().is_none(),
+            "then shutdown"
+        );
+        assert_eq!(metrics.msgs_out.load(Ordering::Relaxed), 2);
+        // Uncompressed: a 4-byte length prefix and a 1-byte codec tag each.
+        assert_eq!(
+            metrics.bytes_out.load(Ordering::Relaxed),
+            2 * (5 + payload_len)
+        );
+        assert_eq!(
+            metrics.bytes_out_uncompressed.load(Ordering::Relaxed),
+            2 * (5 + payload_len)
+        );
+    }
+
+    /// Read frames until `want` picks one out.
+    async fn read_until<T>(
+        reader: &mut (impl AsyncRead + Unpin),
+        want: impl Fn(ServerMessage) -> Option<T>,
+    ) -> T {
+        loop {
+            let frame = read_frame(reader)
+                .await
+                .unwrap()
+                .expect("the session is open");
+            if let Some(found) = want(decode_server(&frame).unwrap()) {
+                return found;
+            }
+        }
+    }
+
+    /// Once authenticated, a client is pinged every `PING_INTERVAL`; one that
+    /// never answers is closed `PONG_DEADLINE` after the first unanswered
+    /// ping, and the connection's forwarding tasks end with it.
+    #[tokio::test(start_paused = true)]
+    async fn an_authenticated_client_that_never_answers_a_ping_is_closed() {
+        let app = Arc::new(fixture_app());
+        let (server, client) = tokio::io::duplex(1024 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let session = tokio::spawn(run_client_session(
+            server_read,
+            server_write,
+            Arc::clone(&app),
+            TransportKind::Uds,
+            |_tx, _compression| NoopAttacher,
+            tracing::info_span!("pong_deadline_test"),
+        ));
+
+        let identity = Identity::generate();
+        let mut hello = auth(crate::fixtures::FIXTURE_TOKEN);
+        if let ClientMessage::Auth { public_key, .. } = &mut hello {
+            *public_key = identity.public_key_bytes().to_vec();
+        }
+        write_frame(&mut client_write, &encode_client(&hello).unwrap())
+            .await
+            .unwrap();
+        let nonce = read_until(&mut client_read, |msg| match msg {
+            ServerMessage::AuthChallenge { nonce } => Some(nonce),
+            _ => None,
+        })
+        .await;
+        let proof = ClientMessage::AuthProof {
+            signature: identity.sign(&nonce),
+        };
+        write_frame(&mut client_write, &encode_client(&proof).unwrap())
+            .await
+            .unwrap();
+        let accepted = read_until(&mut client_read, |msg| match msg {
+            ServerMessage::AuthResult { success, .. } => Some(success),
+            _ => None,
+        })
+        .await;
+        assert!(accepted, "the handshake succeeds");
+
+        let pinged = |msg| match msg {
+            ServerMessage::Ping { seq } => Some(seq),
+            _ => None,
+        };
+        assert_eq!(read_until(&mut client_read, pinged).await, 0);
+        let first_ping = tokio::time::Instant::now();
+        assert_eq!(read_until(&mut client_read, pinged).await, 1);
+
+        session.await.unwrap();
+        assert!(first_ping.elapsed() > liveness::PONG_DEADLINE);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while app.vt_subscriber_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the connection's forwarders ended with it");
     }
 }

@@ -37,7 +37,6 @@ use super::{INPUT_QUEUE_CAPACITY, PaneInput, QueueRejected, rejected};
 use crate::app::{ClientMap, PaneEventSink};
 use crate::backend::{BackendEventSink, ControlEvent};
 use crate::diff_engine::DiffResult;
-use crate::lock::lock_or_recover;
 use crate::relay::dispatch_diff_result;
 use crate::scrollback::DiffBuffer;
 
@@ -190,18 +189,18 @@ impl WorkerEngine {
     }
 
     pub(super) fn snapshot(&self) -> GridSnapshot {
-        lock_or_recover(&self.mirror, "worker mirror").to_snapshot()
+        self.mirror.lock().unwrap().to_snapshot()
     }
 
     pub(super) fn resize_emulator(&self, size: TermSize) {
         // Resize the mirror viewport now (blanks it; the worker's repaint diff
         // refills it) and tell the worker to resize its emulator.
-        lock_or_recover(&self.mirror, "worker mirror").resize(size.rows, size.cols);
+        self.mirror.lock().unwrap().resize(size.rows, size.cols);
         let _ = self.req_tx.send(WorkerRequest::Resize { size });
     }
 
     pub(super) fn checkpoint_grid(&self, max_lines: usize) -> (GridSnapshot, Vec<ScrollbackLine>) {
-        let mirror = lock_or_recover(&self.mirror, "worker mirror");
+        let mirror = self.mirror.lock().unwrap();
         let grid = mirror.to_snapshot();
         let sb = mirror.scrollback();
         let total = sb.history_total();
@@ -222,7 +221,7 @@ impl WorkerEngine {
         start: u64,
         count: u32,
     ) -> (u64, Vec<ScrollbackLine>, u64) {
-        let mirror = lock_or_recover(&self.mirror, "worker mirror");
+        let mirror = self.mirror.lock().unwrap();
         let sb = mirror.scrollback();
         let history_total = sb.history_total();
         let first = start.max(sb.base_index());
@@ -330,7 +329,7 @@ fn handle_event(
     prev_cursor: &mut CursorState,
     prev_modes: &mut TermModes,
 ) {
-    let snapshot_fn = || lock_or_recover(mirror, "worker mirror").to_snapshot();
+    let snapshot_fn = || mirror.lock().unwrap().to_snapshot();
     match ev {
         WorkerEvent::Ready { .. } => {}
         WorkerEvent::Diff {
@@ -341,7 +340,7 @@ fn handle_event(
             // mid-fan-out sees this frame. apply_diff handles scrollback_reset;
             // append the new lines after so a reset can't drop them.
             {
-                let mut m = lock_or_recover(mirror, "worker mirror");
+                let mut m = mirror.lock().unwrap();
                 let first_index = diff
                     .history_total
                     .saturating_sub(scrollback_lines.len() as u64);
@@ -370,7 +369,7 @@ fn handle_event(
             modes,
             history_total,
         } => {
-            lock_or_recover(mirror, "worker mirror").apply_cursor_update(cursor, modes);
+            mirror.lock().unwrap().apply_cursor_update(cursor, modes);
             dispatch_diff_result(
                 &fanout.pane_id,
                 DiffResult::CursorOnly {
@@ -543,6 +542,39 @@ mod tests {
             });
         }
         cmd.status().expect("run sh").success()
+    }
+
+    /// Input is mapped onto its worker request, in order, and a full input
+    /// queue refuses more instead of waiting.
+    #[tokio::test]
+    async fn enqueue_input_maps_each_input_and_refuses_a_full_queue() {
+        let (req_tx, _req_rx) = mpsc::unbounded_channel();
+        let (input_tx, mut input_rx) = mpsc::channel(3);
+        let engine = WorkerEngine {
+            req_tx,
+            input_tx,
+            mirror: Arc::new(Mutex::new(CellGrid::new(1, 1))),
+            child_pid: 0,
+            supervisor: tokio::spawn(async {}),
+            writer_task: tokio::spawn(async {}),
+        };
+        engine
+            .enqueue_input(PaneInput::Bytes(b"b".to_vec()))
+            .unwrap();
+        engine.enqueue_input(PaneInput::Keys(vec![])).unwrap();
+        engine
+            .enqueue_input(PaneInput::Paste(b"p".to_vec()))
+            .unwrap();
+        assert!(matches!(
+            engine.enqueue_input(PaneInput::Bytes(vec![])),
+            Err(mpsc::error::TrySendError::Full(()))
+        ));
+
+        assert!(matches!(input_rx.try_recv(), Ok(WorkerRequest::Input { data }) if data == b"b"));
+        assert!(
+            matches!(input_rx.try_recv(), Ok(WorkerRequest::Keys { events }) if events.is_empty())
+        );
+        assert!(matches!(input_rx.try_recv(), Ok(WorkerRequest::Paste { data }) if data == b"p"));
     }
 
     /// Guards the probe: without `inherit_as` a close-on-exec fd must read as

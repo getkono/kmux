@@ -62,7 +62,7 @@ impl PaneOutput for PtyReader {
 
 /// Feed the `first` bytes already in `buf`, then whatever output is
 /// immediately available, into the emulator under one lock hold of at most
-/// `cap` bytes. Returns the bytes fed.
+/// `cap` bytes.
 ///
 /// Coalescing a burst (vim exit, a large `cat`) into one hold yields one diff
 /// instead of many intermediate ones; the cap bounds how long the hold lasts.
@@ -72,13 +72,16 @@ fn feed_capped(
     buf: &mut [u8],
     first: usize,
     cap: usize,
-) -> usize {
+) {
     let mut ts = lock_term_state(term_state);
     ts.feed(&buf[..first]);
     let mut total = first;
-    while total < cap {
-        let want = buf.len().min(cap - total);
-        match reader.try_read(&mut buf[..want]) {
+    loop {
+        let room = cap.saturating_sub(total).min(buf.len());
+        if room == 0 {
+            break;
+        }
+        match reader.try_read(&mut buf[..room]) {
             Ok(0) => break,
             Ok(m) => {
                 ts.feed(&buf[..m]);
@@ -87,7 +90,6 @@ fn feed_capped(
             Err(_) => break, // WouldBlock or error
         }
     }
-    total
 }
 
 /// Read PTY output in a loop, feed bytes through server-side VT emulation,
@@ -131,7 +133,7 @@ pub async fn session_diff_loop(
                     Ok(0) => break,
                     Ok(n) => {
                         let cycle_start = Instant::now();
-                        let total_bytes = feed_capped(
+                        feed_capped(
                             &term_state,
                             &mut reader,
                             &mut buf,
@@ -148,12 +150,7 @@ pub async fn session_diff_loop(
                             &mut prev_modes,
                         );
                         let cycle_us = cycle_start.elapsed().as_micros();
-                        debug!(
-                            pane_id,
-                            bytes = total_bytes,
-                            cycle_us,
-                            "PTY read-diff-broadcast cycle"
-                        );
+                        debug!(pane_id, cycle_us, "PTY read-diff-broadcast cycle");
                     }
                     Err(e) => {
                         warn!("PTY relay read error: {e}");
@@ -1171,5 +1168,32 @@ mod tests {
         // 2.5 caps take three holds: the lock is free before each one.
         assert_eq!(output.free_while_output_pending, 3);
         assert_eq!(diffs, 3, "one diff per lock hold");
+    }
+
+    /// The production `PaneOutput` is the PTY master: `read` returns what the
+    /// pane's program wrote, `try_read` reports `WouldBlock` once it is
+    /// drained, and `raw_fd` is the master the title poll queries. A real PTY
+    /// because what is under test is the forwarding to it (R7).
+    #[tokio::test]
+    async fn a_pty_reader_reads_the_panes_output_then_would_block() {
+        let (_session, mut reader, _writer) =
+            crate::fixtures::fixture_pty("printf hello; sleep 60").await;
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 64];
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !seen.ends_with(b"hello") {
+                let n = PaneOutput::read(&mut reader, &mut buf).await.unwrap();
+                seen.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("the pane's output arrives");
+
+        let drained = PaneOutput::try_read(&mut reader, &mut buf);
+        assert_eq!(
+            drained.map_err(|e| e.kind()),
+            Err(std::io::ErrorKind::WouldBlock)
+        );
+        assert_eq!(PaneOutput::raw_fd(&reader), Some(reader.as_raw_fd()));
     }
 }

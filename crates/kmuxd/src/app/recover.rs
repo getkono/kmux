@@ -201,3 +201,17 @@ impl ServerApp {
         (count, last_age, count < MAX_RESTARTS)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    /// The respawn task takes the fault channel, so a second call is a no-op
+    /// rather than a second consumer.
+    #[tokio::test]
+    async fn spawning_the_respawn_task_takes_the_fault_channel() {
+        let app = Arc::new(crate::fixtures::fixture_app());
+        app.spawn_worker_respawn_task();
+        assert!(app.worker_fault_rx.lock().unwrap().is_none());
+    }
+}

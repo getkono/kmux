@@ -59,13 +59,15 @@ where
     let mut consecutive_failures = 0u32;
     loop {
         let started = Instant::now();
-        let err = match tokio::spawn(make()).await {
+        let payload = match tokio::spawn(make()).await {
             Ok(()) => return restarts,
-            Err(err) if err.is_panic() => err,
-            Err(_) => {
-                warn!(task = name, "supervised task was cancelled");
-                return restarts;
-            }
+            Err(err) => match err.try_into_panic() {
+                Ok(payload) => payload,
+                Err(_) => {
+                    warn!(task = name, "supervised task was cancelled");
+                    return restarts;
+                }
+            },
         };
         if started.elapsed() >= STABLE_RUN {
             consecutive_failures = 0;
@@ -77,7 +79,6 @@ where
             RESTART_BACKOFF_BASE,
             RESTART_BACKOFF_MAX,
         );
-        let payload = err.into_panic();
         error!(
             task = name,
             panic = panic_message(payload.as_ref()),
@@ -140,5 +141,26 @@ mod tests {
             started.elapsed() >= RESTART_BACKOFF_BASE,
             "backed off first"
         );
+    }
+
+    /// Back-to-back panics back off longer each time: 1 s, then 2 s.
+    #[tokio::test(start_paused = true)]
+    async fn supervise_backs_off_longer_after_each_consecutive_panic() {
+        let runs = Arc::new(AtomicU32::new(0));
+        let counted = Arc::clone(&runs);
+        let started = Instant::now();
+
+        let restarts = supervise("test", move || {
+            let runs = Arc::clone(&counted);
+            async move {
+                let failing = runs.fetch_add(1, Ordering::SeqCst) < 2;
+                assert!(!failing, "the first two runs fail");
+            }
+        })
+        .await;
+
+        assert_eq!(restarts, 2);
+        assert_eq!(runs.load(Ordering::SeqCst), 3);
+        assert!(started.elapsed() >= RESTART_BACKOFF_BASE * 3);
     }
 }

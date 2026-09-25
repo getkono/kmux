@@ -193,3 +193,97 @@ async fn pty_response_writer(
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::time::Duration;
+
+    use kmux_protocol::messages::{KeyAction, KeyCode, KeyEvent, KeyMods};
+
+    use super::*;
+    use crate::fixtures::{fixture_pty, fixture_term_state};
+
+    /// A bound on waits for a real PTY.
+    const WAIT: Duration = Duration::from_secs(10);
+
+    fn key_a() -> KeyEvent {
+        KeyEvent {
+            code: KeyCode::A,
+            mods: KeyMods::empty(),
+            action: KeyAction::Press,
+            text: "a".to_string(),
+            unshifted_codepoint: u32::from('a'),
+        }
+    }
+
+    /// Bytes pass through, keys are encoded, and a paste is bracketed only
+    /// once the program has switched bracketed paste on.
+    #[test]
+    fn input_bytes_encodes_each_input_kind_against_the_live_modes() {
+        let ts = fixture_term_state(4, 20);
+        assert_eq!(input_bytes(&ts, PaneInput::Bytes(b"raw".to_vec())), b"raw");
+        assert_eq!(input_bytes(&ts, PaneInput::Keys(vec![key_a()])), b"a");
+        assert_eq!(input_bytes(&ts, PaneInput::Paste(b"p".to_vec())), b"p");
+
+        ts.lock().unwrap().feed(b"\x1b[?2004h");
+        assert_eq!(
+            input_bytes(&ts, PaneInput::Paste(b"p".to_vec())),
+            b"\x1b[200~p\x1b[201~"
+        );
+    }
+
+    fn engine_on(writer: PtyWriter) -> InProcessEngine {
+        InProcessEngine::new(
+            "eagle/0".to_string(),
+            fixture_term_state(4, 20),
+            writer,
+            tokio::spawn(async {}),
+            mpsc::unbounded_channel().1,
+        )
+    }
+
+    /// Queued input reaches the pane's program: `cat` echoes it back.
+    #[tokio::test]
+    async fn queued_input_is_written_to_the_pty() {
+        let (_session, mut reader, writer) = fixture_pty("cat").await;
+        let engine = engine_on(writer);
+        engine
+            .enqueue_input(PaneInput::Bytes(b"ping\n".to_vec()))
+            .expect("room in the queue");
+
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 256];
+        tokio::time::timeout(WAIT, async {
+            while !seen.windows(4).any(|w| w == b"ping") {
+                let n = reader.read(&mut buf).await.unwrap();
+                seen.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("the input reaches the program");
+    }
+
+    /// Dropping the engine stops its input writer even while that writer is
+    /// blocked on a program that never reads (`sleep`), so a closed pane
+    /// leaves no task holding its PTY.
+    #[tokio::test]
+    async fn dropping_the_engine_stops_a_blocked_input_writer() {
+        let (_session, _reader, writer) = fixture_pty("sleep 60").await;
+        let engine = engine_on(writer);
+        // Far more than a PTY's input buffer, so the write blocks.
+        engine
+            .enqueue_input(PaneInput::Bytes(vec![b'x'; 1024 * 1024]))
+            .expect("room in the queue");
+        let input_task = engine.input_task.abort_handle();
+        tokio::task::yield_now().await;
+
+        drop(engine);
+        tokio::time::timeout(WAIT, async {
+            while !input_task.is_finished() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the input writer ends with the engine");
+    }
+}

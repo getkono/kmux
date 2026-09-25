@@ -751,6 +751,13 @@ impl ServerApp {
         self.vt_events_tx.subscribe()
     }
 
+    /// How many subscribers the server-wide VT event channel has: one per
+    /// live authenticated connection's forwarder.
+    #[cfg(test)]
+    pub(crate) fn vt_subscriber_count(&self) -> usize {
+        self.vt_events_tx.receiver_count()
+    }
+
     /// Broadcast a server message to every connected client via the server-wide
     /// event channel. Used for layout updates and tab lifecycle events, which —
     /// like title changes — must reach all clients viewing a session, not just

@@ -170,8 +170,11 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     // it sessions silently stop being persisted for the daemon's lifetime.
     {
         let persist_app = Arc::clone(&app);
+        let state_path = kmux_sys::dirs::session_state_path()
+            .inspect_err(|e| warn!("could not determine checkpoint path: {e}"))
+            .ok();
         tokio::spawn(crate::supervisor::supervise("checkpoint", move || {
-            checkpoint_loop(Arc::clone(&persist_app))
+            checkpoint_loop(Arc::clone(&persist_app), state_path.clone())
         }));
     }
 
@@ -397,22 +400,20 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     Ok(())
 }
 
-/// Checkpoint every session to disk every 30 s, and TTL-sweep the
-/// closed-session graveyard, forever. Holds no state between iterations, so
-/// the supervisor can restart it after a panic.
-async fn checkpoint_loop(app: Arc<ServerApp>) {
+/// Checkpoint every session to `state_path` every 30 s, starting at once, and
+/// TTL-sweep the closed-session graveyard, forever. With no path only the
+/// sweep runs. Holds no state between iterations, so the supervisor can
+/// restart it after a panic.
+async fn checkpoint_loop(app: Arc<ServerApp>, state_path: Option<std::path::PathBuf>) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        let state = app.checkpoint_state().await;
-        match kmux_sys::dirs::session_state_path() {
-            Ok(path) => {
-                if let Err(e) = crate::persist::checkpoint::write_checkpoint(&state, &path) {
-                    warn!("periodic checkpoint failed: {e}");
-                }
+        if let Some(path) = &state_path {
+            let state = app.checkpoint_state().await;
+            if let Err(e) = crate::persist::checkpoint::write_checkpoint(&state, path) {
+                warn!("periodic checkpoint failed: {e}");
             }
-            Err(e) => warn!("could not determine checkpoint path: {e}"),
         }
         // TTL-sweep the closed-session graveyard (issue #64); rewrites the
         // graveyard file only if something actually expired.
@@ -451,5 +452,32 @@ async fn dispatch_session(session: IncomingSession, app: Arc<ServerApp>) {
             .instrument(span)
             .await;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The first checkpoint is written as soon as the loop starts, and reads
+    /// back as a daemon state.
+    #[tokio::test]
+    async fn checkpoint_loop_writes_a_readable_checkpoint_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.bin");
+        let app = Arc::new(crate::fixtures::fixture_app());
+        let task = tokio::spawn(checkpoint_loop(app, Some(path.clone())));
+
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !path.exists() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("a checkpoint is written");
+        task.abort();
+
+        let state = crate::persist::restore::read_checkpoint(&path).expect("readable");
+        assert!(state.sessions.is_empty());
     }
 }

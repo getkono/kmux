@@ -280,3 +280,42 @@ impl ServerApp {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use kmux_protocol::format_pane_id;
+    use kmux_protocol::messages::{ClientCapabilities, TermSize};
+
+    use crate::fixtures::fixture_app;
+
+    /// A lagged pane stream resyncs from a snapshot of the hosted pane at its
+    /// current size; a pane this daemon does not host has none.
+    #[tokio::test]
+    async fn resync_snapshot_answers_only_for_a_pane_this_daemon_hosts() {
+        let app = fixture_app();
+        let size = TermSize {
+            rows: 10,
+            cols: 30,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let entry = app
+            .create_session(
+                None,
+                Some("/tmp".to_string()),
+                Some("/bin/sleep".to_string()),
+                vec!["30".to_string()],
+                size,
+                &ClientCapabilities::default(),
+            )
+            .await
+            .expect("create_session");
+        let pane = format_pane_id(&entry.meta.word_id, 0);
+
+        let (snapshot, _seqno) = app.resync_snapshot(&pane).await.expect("a hosted pane");
+        assert_eq!((snapshot.rows, snapshot.cols), (10, 30));
+        assert!(app.resync_snapshot("nosuch/0").await.is_none());
+
+        let _ = app.close_session(&entry.meta.word_id).await;
+    }
+}

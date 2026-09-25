@@ -110,3 +110,43 @@ pub async fn handle_tcp_io<R, W>(
     .instrument(conn_span)
     .await;
 }
+
+#[cfg(test)]
+mod tests {
+    use kmux_protocol::messages::ErrorCode;
+    use kmux_protocol::{decode_server, read_frame, write_frame};
+
+    use super::*;
+    use crate::fixtures::fixture_app;
+
+    /// A stream connection is served by a client session: a frame that is
+    /// not a client message is answered with an `InvalidMessage` error.
+    #[tokio::test]
+    async fn handle_tcp_io_serves_the_connection() {
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        tokio::spawn(handle_tcp_io(
+            server_read,
+            server_write,
+            Arc::new(fixture_app()),
+            kmux_protocol::TransportKind::Uds,
+            tracing::Span::none(),
+        ));
+
+        write_frame(&mut client_write, b"not a message")
+            .await
+            .unwrap();
+        let frame = read_frame(&mut client_read)
+            .await
+            .unwrap()
+            .expect("a reply");
+        assert!(matches!(
+            decode_server(&frame).unwrap(),
+            ServerMessage::Error {
+                code: ErrorCode::InvalidMessage,
+                ..
+            }
+        ));
+    }
+}

@@ -283,23 +283,19 @@ pub async fn forward_pane_stream<R, F>(
     R: Fn() -> F,
     F: Future<Output = Option<(GridSnapshot, SequenceNo)>>,
 {
+    // The attach replay goes first, as pane data like any other frame; a lag
+    // discards what is left of it, since the resync snapshot supersedes it.
+    let mut replay = build_attach_replay(result, &pane_id).into_iter();
     let mut flow = Flow::Live;
-    for msg in build_attach_replay(result, &pane_id) {
-        flow = match (flow, out.try_send_data(msg)) {
-            (_, Err(DataRejected::Closed)) => return,
-            (Flow::Live, Ok(())) => Flow::Live,
-            (Flow::Live, Err(DataRejected::Congested)) => Flow::Lagged { dropped: 1 },
-            (Flow::Lagged { dropped }, _) => Flow::Lagged {
-                dropped: dropped + 1,
-            },
-        };
-    }
-
     let mut covered_through: Option<SequenceNo> = None;
     loop {
         flow = match flow {
             Flow::Live => {
-                let Some(msg) = client_rx.recv().await else {
+                let next = match replay.next() {
+                    Some(msg) => Some(msg),
+                    None => client_rx.recv().await,
+                };
+                let Some(msg) = next else {
                     return;
                 };
                 if let (Some(seqno), Some(covered)) = (incremental_seqno(&msg), covered_through)
@@ -324,10 +320,8 @@ pub async fn forward_pane_stream<R, F>(
                 tokio::select! {
                     biased;
                     () = out.data_room() => {
-                        if out.is_closed() {
-                            return;
-                        }
                         // The snapshot supersedes everything already waiting.
+                        replay = Vec::new().into_iter();
                         loop {
                             match client_rx.try_recv() {
                                 Ok(_) => dropped += 1,
@@ -418,8 +412,9 @@ mod tests {
     }
 
     /// Queue `count` updates (seqnos 1..=count) on a pane stream, as the relay
-    /// would, and start forwarding them into `out`.
+    /// would, and start forwarding `replay` and then them into `out`.
     fn forward(
+        replay: AttachResult,
         count: u64,
         out: &OutboundTx,
         resync: Option<(GridSnapshot, SequenceNo)>,
@@ -430,7 +425,7 @@ mod tests {
         }
         tokio::spawn(forward_pane_stream(
             PANE.to_string(),
-            AttachResult::Delta(vec![]),
+            replay,
             client_rx,
             out.clone(),
             move || std::future::ready(resync.clone()),
@@ -445,7 +440,12 @@ mod tests {
     #[tokio::test]
     async fn a_congested_pane_stream_stays_bounded_and_resyncs_once_the_client_reads() {
         let (out, mut rx) = channel(16, close_channel().0);
-        let client_tx = forward(50, &out, Some((sample_grid(), SequenceNo(60))));
+        let client_tx = forward(
+            AttachResult::Delta(vec![]),
+            50,
+            &out,
+            Some((sample_grid(), SequenceNo(60))),
+        );
 
         // 16 slots, 4 kept for control: 12 updates fit, the other 38 are
         // dropped (the stream is drained into the lag, not left to back up).
@@ -489,27 +489,46 @@ mod tests {
         );
     }
 
-    /// A pane the daemon cannot snapshot (a federated one) falls back to
-    /// `Lagged`, counting what it dropped, so the client re-attaches.
+    /// The attach replay is pane data too: it goes out first and counts
+    /// toward the bound. A pane the daemon cannot snapshot (a federated one)
+    /// then falls back to `Lagged`, counting what it dropped, so the client
+    /// re-attaches.
     #[tokio::test]
     async fn a_lagged_stream_without_a_snapshot_tells_the_client_it_lagged() {
         let (out, mut rx) = channel(16, close_channel().0);
-        let client_tx = forward(20, &out, None);
+        let replay = AttachResult::FullSnapshot(sample_grid(), SequenceNo(0));
+        let client_tx = forward(replay, 20, &out, None);
         until(|| client_tx.capacity() == 512).await;
 
-        for _ in 0..12 {
+        let msg = next(&mut rx).await;
+        assert!(
+            matches!(&msg, ServerMessage::TerminalSnapshot { seqno, .. } if *seqno == SequenceNo(0)),
+            "the replay goes first, got {msg:?}"
+        );
+        for seqno in 1..=11 {
             let msg = next(&mut rx).await;
             assert!(
-                matches!(msg, ServerMessage::TerminalUpdate { .. }),
-                "{msg:?}"
+                matches!(&msg, ServerMessage::TerminalUpdate { seqno: s, .. } if *s == SequenceNo(seqno)),
+                "expected update {seqno}, got {msg:?}"
             );
         }
         rx.mark_drained();
         let msg = next(&mut rx).await;
         assert!(
-            matches!(&msg, ServerMessage::Lagged { pane_id, missed_count: 8 } if pane_id == PANE),
-            "expected Lagged with 8 missed, got {msg:?}"
+            matches!(&msg, ServerMessage::Lagged { pane_id, missed_count: 9 } if pane_id == PANE),
+            "expected Lagged with 9 missed, got {msg:?}"
         );
+    }
+
+    /// A stream whose connection's writer has gone stops instead of waiting
+    /// for room that will never come.
+    #[tokio::test]
+    async fn is_closed_reports_the_writer_gone() {
+        let (out, rx) = channel(16, close_channel().0);
+        assert!(!out.is_closed());
+        drop(rx);
+        assert!(out.is_closed());
+        assert_eq!(out.try_send_data(update(1)), Err(DataRejected::Closed));
     }
 
     /// Control is never dropped: when it no longer fits, the connection is
