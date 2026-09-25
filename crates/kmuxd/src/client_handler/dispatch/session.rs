@@ -23,26 +23,32 @@ pub(super) async fn on_session_create(
         args,
         size,
     } = spawn;
-    match peer {
+    let created = match peer {
         // Create on a federated peer (issue #121 launcher): the hub forwards
         // the create upstream and registers the result under a local word,
         // then replies SessionCreated exactly as for a local create.
-        Some(peer) => match state
+        Some(peer) => state
             .app
             .create_remote_session(&peer, name, cwd, program, args, size)
             .await
-        {
-            Ok(entry) => state.send(ServerMessage::SessionCreated { request_id, entry }),
-            Err(e) => state.error(Some(request_id), ErrorCode::InternalError, e),
-        },
-        None => match state
+            .map_err(|e| (ErrorCode::InternalError, e)),
+        None => state
             .app
             .create_session(name, cwd, program, args, size, &state.capabilities)
             .await
-        {
-            Ok(entry) => state.send(ServerMessage::SessionCreated { request_id, entry }),
-            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
-        },
+            .map_err(|e| (classify_error(&e), e.to_string())),
+    };
+    match created {
+        Ok(entry) => {
+            let word_id = entry.meta.word_id.clone();
+            state.send(ServerMessage::SessionCreated { request_id, entry });
+            // The reply reaches the requester alone; every other GUI learns of
+            // the new session from this broadcast, as it does for a restore.
+            state
+                .app
+                .broadcast_session_event(SessionEventMsg::SessionCreated { word_id });
+        }
+        Err((code, message)) => state.error(Some(request_id), code, message),
     }
 }
 
@@ -433,6 +439,47 @@ mod tests {
         })
         .expect("the rename was broadcast to every client");
         assert_eq!(broadcast, (word.clone(), "builds".to_string()));
+
+        let _ = app.close_session(&word).await;
+    }
+
+    /// The `SessionCreated` reply reaches the creator alone. Without the
+    /// broadcast, a session created in one GUI never appeared in another.
+    #[tokio::test]
+    async fn creating_a_session_tells_every_client_not_only_the_creator() {
+        let (mut state, mut ctrl_rx) = authenticated_client().await;
+        let app = Arc::clone(&state.app);
+        let mut events = app.subscribe_vt_events();
+
+        let keep = handle_message(
+            &mut state,
+            ClientMessage::SessionCreate {
+                request_id: 32,
+                name: None,
+                cwd: Some("/tmp".to_string()),
+                program: Some("/bin/sleep".to_string()),
+                args: vec!["30".to_string()],
+                size: TermSize::default(),
+                peer: None,
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(keep);
+
+        let word = match only(drain(&mut ctrl_rx)) {
+            ServerMessage::SessionCreated { request_id, entry } => {
+                assert_eq!(request_id, 32);
+                entry.meta.word_id
+            }
+            other => panic!("expected SessionCreated, got {other:?}"),
+        };
+        let broadcast = broadcast_event(&mut events, |e| match e {
+            SessionEventMsg::SessionCreated { word_id } => Some(word_id),
+            _ => None,
+        })
+        .expect("the create was broadcast to every client");
+        assert_eq!(broadcast, word);
 
         let _ = app.close_session(&word).await;
     }
