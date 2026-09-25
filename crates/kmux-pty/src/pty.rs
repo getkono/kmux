@@ -293,6 +293,16 @@ mod tests {
         assert!(inherited.is_exited(), "is_exited should be true after exit");
     }
 
+    /// Signals are blocked only across the fork: the spawning thread gets its
+    /// own mask back, or it would never again see a signal sent to it. The
+    /// fork is real because the restore is on the parent's side of it (R7).
+    #[tokio::test]
+    async fn spawn_gives_the_spawning_thread_its_signal_mask_back() {
+        let before = SigSet::thread_get_mask().expect("mask");
+        let _pty = PtyProcess::spawn(&sleep_config()).expect("spawn");
+        assert_eq!(SigSet::thread_get_mask().expect("mask"), before);
+    }
+
     /// Dropping a handle to a live child kills it (and the reaper collects
     /// it). The child ignores `SIGHUP`, so the hangup from the master closing
     /// cannot do the killing in Drop's place. Needs a real child (R7).

@@ -172,6 +172,38 @@ mod tests {
         bystander.wait().expect("reap");
     }
 
+    /// Before the child's `setsid` no group carries its pid, and the signal
+    /// must still reach it. A child left in this process's group stands in
+    /// for one caught before `setsid` — it leads no group of its own. Needs a
+    /// real process to signal (R7).
+    #[test]
+    fn signal_group_reaches_a_child_that_leads_no_group_yet() {
+        use std::os::unix::process::ExitStatusExt;
+
+        let mut child = std::process::Command::new("/bin/sleep")
+            .arg("600")
+            .spawn()
+            .expect("spawn");
+        signal_group(
+            Pid::from_raw(i32::try_from(child.id()).expect("pid")),
+            Signal::SIGKILL,
+        );
+
+        let deadline = Instant::now() + DEADLINE;
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("try_wait") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                child.kill().expect("cleanup");
+                child.wait().expect("reap");
+                panic!("the signal never reached the child");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert_eq!(status.signal(), Some(Signal::SIGKILL as i32));
+    }
+
     /// A background job is in the shell's process group, so closing reaches
     /// it too. This one ignores `SIGHUP` — as a job does after `nohup` — so
     /// the kernel's hangup of the foreground group on the shell's exit would
