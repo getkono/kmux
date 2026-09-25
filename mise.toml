@@ -85,8 +85,18 @@ description = "Build the GUI crates without the GPU renderer (must stay wgpu-fre
 # target-gated Cairo path; kmux-ffi keeps only the packed-cell format.
 run = "cargo build -p kmux-gtk -p kmux-ffi --no-default-features"
 
+[tasks.build-vt-worker]
+description = "Build the kmux-vt-worker binary the kmuxd e2e suites spawn"
+# `cargo test` builds a package's own binaries for its integration tests
+# (`CARGO_BIN_EXE_*`) but never another package's, and kmux-vt-worker is its own
+# package. The process-isolation suites need it next to kmuxd in target/debug,
+# so it is built here, before the tests, rather than by a test shelling out to
+# cargo mid-run (which needed cargo at test time and fought the target-dir lock).
+run = "cargo build -p kmux-vt-worker"
+
 [tasks.test]
 description = "Run tests (whole workspace; matches CI)"
+depends = ["build-vt-worker"]
 run = "cargo test --workspace"
 
 # The SwiftPM build tree (kmux-swift/.build) is separate from cargo's target/ and

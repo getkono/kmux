@@ -272,7 +272,12 @@ jobs:
         # Closes the macOS coverage gap: the daemon's graceful handoff and the
         # in-place binary swap behave differently per platform (current_exe(),
         # SCM_RIGHTS), so the daemon must be exercised on macOS too — not only Linux.
-        run: cargo test -p kmuxd -p kmux-pty
+        # The process-isolation e2e suites spawn kmux-vt-worker, which cargo test
+        # does not build for kmuxd (another package), so build it first — the
+        # same prerequisite `mise run test` declares.
+        run: |
+          mise run build-vt-worker
+          cargo test -p kmuxd -p kmux-pty
 
       - name: Build + test the native macOS app (kmux-swift)
         run: |
