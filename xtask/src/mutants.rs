@@ -13,27 +13,24 @@
 //! A number that wrong is worse than no number: it was cited as evidence the
 //! daemon was well covered. So the gate does not only compare counts against a
 //! budget, it first asks whether the sweep it is reading could possibly be
-//! real. The tell is timing. A caught mutant runs the whole test binary, so it
-//! takes roughly as long as the baseline run; a mutant "caught" by a target
-//! that does not exist takes no time at all. That ratio is self-calibrating —
-//! no absolute threshold to tune per crate — and it makes the exact bug that
-//! produced the fabricated score impossible to reintroduce quietly.
+//! real. The tell is in each mutant's log. A caught mutant ran the test binary
+//! and some test in it failed, so its log shows the libtest harness starting —
+//! `running N tests`. A mutant "caught" by a target that does not exist has a
+//! log with cargo's error and no harness at all. That is evidence rather than
+//! inference, and it makes the exact bug that produced the fabricated score
+//! impossible to reintroduce quietly.
+//!
+//! An earlier version inferred it from timing — a catch faster than a fifth of
+//! the sweep's baseline, or than one second without one — and would have
+//! halted the gate on genuine perfect scores: a crate-group's baseline tests
+//! every crate in the group while a mutant's test phase tests only its own, and
+//! a small crate's whole suite runs well under a second.
 
 use std::collections::BTreeMap;
 use std::path::Path;
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
-
-/// A caught mutant whose test phase finished faster than this, in seconds, did
-/// not run a test suite. Backstop for when the baseline duration is unavailable.
-const IMPLAUSIBLY_FAST_SECS: f64 = 1.0;
-
-/// …or faster than this fraction of the sweep's own baseline test phase. A
-/// caught mutant runs the same test binary the baseline did and fails somewhere
-/// inside it, so anything under a fifth of the baseline means the binary was
-/// never reached.
-const IMPLAUSIBLE_FRACTION_OF_BASELINE: f64 = 0.2;
 
 #[derive(Debug, Deserialize)]
 struct Outcomes {
@@ -44,34 +41,27 @@ struct Outcomes {
 struct Outcome {
     scenario: Scenario,
     summary: String,
+    /// The mutant's log, relative to the output directory.
     #[serde(default)]
-    phase_results: Vec<PhaseResult>,
+    log_path: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
 #[serde(untagged)]
 enum Scenario {
-    /// A scenario with no payload. In practice `"Baseline"` — the unmutated
-    /// build, run once per sweep to prove the suite passes before anything is
-    /// mutated. Kept as a string rather than a unit so an unrecognised scalar
-    /// scenario from a future cargo-mutants is skipped rather than mistaken for
-    /// the baseline.
-    Named(String),
     Mutant {
         #[serde(rename = "Mutant")]
         mutant: MutantScenario,
     },
+    /// Anything else: in practice `"Baseline"`, the unmutated build run once
+    /// per sweep, or a scenario a future cargo-mutants adds. None of them is a
+    /// verdict on a package. Tried after `Mutant`, since it matches anything.
+    Other(serde::de::IgnoredAny),
 }
 
 #[derive(Debug, Deserialize)]
 struct MutantScenario {
     package: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct PhaseResult {
-    phase: String,
-    duration: f64,
 }
 
 /// What one package's mutants did.
@@ -88,9 +78,9 @@ pub struct PackageReport {
     pub timeout: usize,
     /// Mutants that did not compile, so they say nothing either way.
     pub unviable: usize,
-    /// The longest test phase among this package's caught mutants. Zero when
-    /// none were caught.
-    pub slowest_caught_test: f64,
+    /// Caught mutants whose log shows the test harness running — evidence the
+    /// catch came from a test, not from a test command that never started.
+    pub caught_ran_tests: usize,
 }
 
 impl PackageReport {
@@ -101,46 +91,54 @@ impl PackageReport {
     }
 }
 
-/// One sweep: the per-package tallies plus the baseline that calibrates them.
+/// One sweep: the per-package tallies.
 #[derive(Debug, Default, Clone, PartialEq)]
 pub struct Sweep {
     /// Per-crate tallies, keyed by crate name.
     pub packages: BTreeMap<String, PackageReport>,
-    /// The baseline scenario's test-phase duration, if the sweep ran one.
-    pub baseline_test: Option<f64>,
 }
 
-/// Parse one `outcomes.json`.
+/// Parse one `outcomes.json`, reading each caught mutant's log from beside it.
 ///
 /// # Errors
 /// If the file cannot be read or is not a valid outcomes document.
 pub fn read(path: &Path) -> Result<Sweep> {
     let text = std::fs::read_to_string(path)
         .with_context(|| format!("read the mutation outcomes at {}", path.display()))?;
-    parse(&text).with_context(|| format!("parse the mutation outcomes at {}", path.display()))
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    parse(&text, |log| std::fs::read_to_string(dir.join(log)).ok())
+        .with_context(|| format!("parse the mutation outcomes at {}", path.display()))
 }
 
-/// Parse an `outcomes.json` document.
+/// Whether a mutant's log shows the libtest harness starting: a line
+/// `running N test` or `running N tests`, which every test binary prints before
+/// running anything.
+fn shows_test_harness(log: &str) -> bool {
+    log.lines().any(|line| {
+        line.strip_prefix("running ")
+            .and_then(|rest| {
+                rest.strip_suffix(" tests")
+                    .or_else(|| rest.strip_suffix(" test"))
+            })
+            .is_some_and(|n| n.parse::<usize>().is_ok())
+    })
+}
+
+/// Parse an `outcomes.json` document. `log` returns the text of a mutant's log
+/// given its `log_path`, or `None` when it cannot be read.
 ///
 /// # Errors
 /// If the text is not valid JSON in cargo-mutants' outcomes shape.
-pub fn parse(text: &str) -> Result<Sweep> {
+pub fn parse(text: &str, log: impl Fn(&str) -> Option<String>) -> Result<Sweep> {
     let doc: Outcomes = serde_json::from_str(text).context("decode outcomes.json")?;
     let mut sweep = Sweep::default();
     for outcome in doc.outcomes {
-        let test_secs = outcome
-            .phase_results
-            .iter()
-            .find(|p| p.phase == "Test")
-            .map(|p| p.duration);
-        let package = match &outcome.scenario {
-            Scenario::Named(name) if name == "Baseline" => {
-                sweep.baseline_test = test_secs;
-                continue;
-            }
-            Scenario::Named(_) => continue,
-            Scenario::Mutant { mutant } => mutant.package.clone(),
+        // Other scenarios — the unmutated `Baseline`, and anything a future
+        // cargo-mutants adds — are not verdicts on a package.
+        let Scenario::Mutant { mutant } = &outcome.scenario else {
+            continue;
         };
+        let package = mutant.package.clone();
         let entry = sweep
             .packages
             .entry(package.clone())
@@ -151,7 +149,12 @@ pub fn parse(text: &str) -> Result<Sweep> {
         match outcome.summary.as_str() {
             "CaughtMutant" => {
                 entry.caught += 1;
-                entry.slowest_caught_test = entry.slowest_caught_test.max(test_secs.unwrap_or(0.0));
+                let ran = outcome
+                    .log_path
+                    .as_deref()
+                    .and_then(&log)
+                    .is_some_and(|text| shows_test_harness(&text));
+                entry.caught_ran_tests += usize::from(ran);
             }
             "MissedMutant" => entry.missed += 1,
             // A timeout is a catch: the mutant made the suite hang, which the
@@ -165,11 +168,7 @@ pub fn parse(text: &str) -> Result<Sweep> {
 }
 
 /// Merge sweeps — the unscoped run makes one pass per crate-group, each with
-/// its own output directory and its own baseline.
-///
-/// The merged baseline is the **smallest** of the inputs, because it is used as
-/// a lower bound on how long a real test run takes: taking the largest would
-/// let a slow group's baseline excuse a fast group's fabricated catches.
+/// its own output directory.
 pub fn merge(sweeps: impl IntoIterator<Item = Sweep>) -> Sweep {
     let mut out = Sweep::default();
     for sweep in sweeps {
@@ -182,55 +181,36 @@ pub fn merge(sweeps: impl IntoIterator<Item = Sweep>) -> Sweep {
             entry.missed += report.missed;
             entry.timeout += report.timeout;
             entry.unviable += report.unviable;
-            entry.slowest_caught_test = entry.slowest_caught_test.max(report.slowest_caught_test);
+            entry.caught_ran_tests += report.caught_ran_tests;
         }
-        out.baseline_test = match (out.baseline_test, sweep.baseline_test) {
-            (Some(a), Some(b)) => Some(a.min(b)),
-            (a, b) => a.or(b),
-        };
     }
     out
 }
 
 /// Packages whose results cannot be believed, with the reason.
 ///
-/// The condition is a perfect score reached implausibly fast. A perfect score
-/// alone is not suspicious — a small, well-tested module can earn one — and
-/// speed alone is not either. Together, on a package where every single mutant
-/// was caught, they are the signature of a test command that failed before it
-/// ran anything.
+/// The condition is a perfect score with no caught mutant whose log shows a
+/// test running. A perfect score alone is not suspicious — a small, well-tested
+/// crate can earn one — but a real catch always starts the test harness, so a
+/// package where every mutant was caught and not one catch did is the signature
+/// of a test command that failed before it ran anything. A package with a
+/// survivor is never flagged: the suite demonstrably ran.
 pub fn implausible(sweep: &Sweep) -> Vec<String> {
-    let mut found = Vec::new();
-    for report in sweep.packages.values() {
-        if report.missed > 0 || report.caught == 0 {
-            continue;
-        }
-        // The ratio is the real test, because it calibrates itself to the
-        // crate. The absolute threshold is only a fallback for when there is no
-        // usable baseline to calibrate against — including a baseline that is
-        // itself under a second, which is too short to divide by meaningfully.
-        let calibrator = sweep.baseline_test.filter(|b| *b >= IMPLAUSIBLY_FAST_SECS);
-        let flagged = match calibrator {
-            Some(b) => report.slowest_caught_test < b * IMPLAUSIBLE_FRACTION_OF_BASELINE,
-            None => report.slowest_caught_test < IMPLAUSIBLY_FAST_SECS,
-        };
-        if !flagged {
-            continue;
-        }
-        let against = calibrator.map_or_else(
-            || String::from("no usable baseline in this sweep"),
-            |b| format!("baseline test phase took {b:.2}s"),
-        );
-        found.push(format!(
-            "{}: {} caught, 0 missed, but the slowest catch took {:.2}s ({against}). \
-             A caught mutant runs the whole test binary; this one never reached it. \
-             Check that the crate's target shape matches its .cargo/mutants*.toml \
-             config — `--lib` hard-errors on a bin-only package, and cargo-mutants \
-             reads that error as a catch.",
-            report.package, report.caught, report.slowest_caught_test
-        ));
-    }
-    found
+    sweep
+        .packages
+        .values()
+        .filter(|r| r.missed == 0 && r.caught > 0 && r.caught_ran_tests == 0)
+        .map(|r| {
+            format!(
+                "{}: {} caught, 0 missed, but no caught mutant's log shows a test \
+                 running (`running N tests`). A caught mutant runs the test binary; \
+                 these never reached it. Check that the crate's target shape matches \
+                 its .cargo/mutants*.toml config — `--lib` hard-errors on a bin-only \
+                 package, and cargo-mutants reads that error as a catch.",
+                r.package, r.caught
+            )
+        })
+        .collect()
 }
 
 /// Missed-mutant counts keyed by package, in the form the ratchet compares.
@@ -246,36 +226,46 @@ pub fn missed_counts(sweep: &Sweep) -> BTreeMap<String, usize> {
 mod tests {
     use super::*;
 
-    /// Build an outcomes.json document from `(package, summary, test_secs)`
-    /// triples, plus an optional baseline test duration.
-    fn doc(baseline: Option<f64>, mutants: &[(&str, &str, f64)]) -> String {
-        let mut outcomes: Vec<String> = Vec::new();
-        if let Some(secs) = baseline {
+    /// What a real catch's log holds after the test command: the harness
+    /// starting, then a failure. Abridged from a real cargo-mutants 27 log.
+    const RAN: &str = "*** cargo test --package=a\n\nrunning 181 tests\n\
+                       test result: FAILED. 180 passed; 1 failed\n*** result: Failure(101)\n";
+    /// The June shape: cargo refusing before any test binary starts.
+    const NEVER_RAN: &str = "*** cargo test --package=kmuxd --lib\n\
+                             error: no library targets found in package `kmuxd`\n\
+                             *** result: Failure(101)\n";
+
+    /// Parse a sweep of `(package, summary, log)` mutants, where `log` is the
+    /// mutant's log text (`None`: cargo-mutants recorded no readable log).
+    fn sweep_of(mutants: &[(&str, &str, Option<&str>)]) -> Sweep {
+        let mut outcomes = vec![
+            r#"{"scenario":"Baseline","summary":"Success","log_path":"log/baseline.log"}"#
+                .to_string(),
+        ];
+        let mut logs = BTreeMap::new();
+        for (i, (pkg, summary, log)) in mutants.iter().enumerate() {
+            let path = format!("log/{i}.log");
+            if let Some(text) = log {
+                logs.insert(path.clone(), (*text).to_string());
+            }
             outcomes.push(format!(
-                r#"{{"scenario":"Baseline","summary":"Success","phase_results":[{{"phase":"Test","duration":{secs},"process_status":"Success"}}]}}"#
+                r#"{{"scenario":{{"Mutant":{{"package":"{pkg}","name":"n","file":"f"}}}},"summary":"{summary}","log_path":"{path}"}}"#
             ));
         }
-        for (pkg, summary, secs) in mutants {
-            outcomes.push(format!(
-                r#"{{"scenario":{{"Mutant":{{"package":"{pkg}","name":"n","file":"f"}}}},"summary":"{summary}","phase_results":[{{"phase":"Build","duration":1.0,"process_status":"Success"}},{{"phase":"Test","duration":{secs},"process_status":"Success"}}]}}"#
-            ));
-        }
-        format!(r#"{{"outcomes":[{}]}}"#, outcomes.join(","))
+        let text = format!(r#"{{"outcomes":[{}]}}"#, outcomes.join(","));
+        parse(&text, |path| logs.get(path).cloned()).expect("parse")
     }
 
     #[test]
     fn outcomes_are_tallied_per_package() {
-        let sweep = parse(&doc(
-            Some(4.0),
-            &[
-                ("a", "CaughtMutant", 3.0),
-                ("a", "MissedMutant", 3.0),
-                ("a", "Unviable", 0.0),
-                ("b", "Timeout", 30.0),
-            ],
-        ))
-        .expect("parse");
+        let sweep = sweep_of(&[
+            ("a", "CaughtMutant", Some(RAN)),
+            ("a", "MissedMutant", Some(RAN)),
+            ("a", "Unviable", None),
+            ("b", "Timeout", None),
+        ]);
         assert_eq!(sweep.packages["a"].caught, 1);
+        assert_eq!(sweep.packages["a"].caught_ran_tests, 1);
         assert_eq!(sweep.packages["a"].missed, 1);
         assert_eq!(sweep.packages["a"].unviable, 1);
         assert_eq!(
@@ -284,22 +274,26 @@ mod tests {
             "unviable mutants are not a verdict"
         );
         assert_eq!(sweep.packages["b"].timeout, 1);
-        assert_eq!(sweep.baseline_test, Some(4.0));
+        assert_eq!(sweep.packages.len(), 2, "the baseline is not a package");
+    }
+
+    #[test]
+    fn the_harness_line_is_recognised_in_both_numbers() {
+        assert!(shows_test_harness("running 1 test\n"));
+        assert!(shows_test_harness("x\nrunning 12 tests\ny"));
+        assert!(!shows_test_harness("running the build\n"));
+        assert!(!shows_test_harness("error: no library targets found\n"));
     }
 
     #[test]
     fn the_june_bug_is_reported_as_implausible() {
-        // The exact shape: every mutant "caught", each in about the tenth of a
-        // second `cargo test --lib` takes to fail with "no library targets".
-        let sweep = parse(&doc(
-            Some(9.5),
-            &[
-                ("kmuxd", "CaughtMutant", 0.10),
-                ("kmuxd", "CaughtMutant", 0.11),
-                ("kmuxd", "CaughtMutant", 0.09),
-            ],
-        ))
-        .expect("parse");
+        // The exact shape: every mutant "caught" by `cargo test --lib` failing
+        // with "no library targets" before any test binary started.
+        let sweep = sweep_of(&[
+            ("kmuxd", "CaughtMutant", Some(NEVER_RAN)),
+            ("kmuxd", "CaughtMutant", Some(NEVER_RAN)),
+            ("kmuxd", "CaughtMutant", Some(NEVER_RAN)),
+        ]);
         let found = implausible(&sweep);
         assert_eq!(found.len(), 1);
         assert!(
@@ -313,90 +307,71 @@ mod tests {
         );
     }
 
+    /// A small crate whose whole suite runs in a third of a second — measured
+    /// on a real crate: 0.33s catches against a 0.87s baseline, which the
+    /// timing rule this replaced flagged. What makes it real is the harness.
     #[test]
-    fn a_real_perfect_score_is_believed() {
-        let sweep = parse(&doc(
-            Some(4.0),
-            &[("a", "CaughtMutant", 3.9), ("a", "CaughtMutant", 4.2)],
-        ))
-        .expect("parse");
+    fn a_real_perfect_score_is_believed_however_fast() {
+        let sweep = sweep_of(&[
+            ("a", "CaughtMutant", Some(RAN)),
+            ("a", "CaughtMutant", Some(RAN)),
+        ]);
         assert_eq!(implausible(&sweep), Vec::<String>::new());
     }
 
     #[test]
     fn a_package_with_survivors_is_never_flagged() {
-        // Something survived, so the suite demonstrably ran. Fast catches here
-        // mean fast tests, not absent ones.
-        let sweep = parse(&doc(
-            Some(9.5),
-            &[("a", "CaughtMutant", 0.10), ("a", "MissedMutant", 0.10)],
-        ))
-        .expect("parse");
+        // Something survived, so the suite demonstrably ran.
+        let sweep = sweep_of(&[
+            ("a", "CaughtMutant", Some(NEVER_RAN)),
+            ("a", "MissedMutant", Some(RAN)),
+        ]);
         assert_eq!(implausible(&sweep), Vec::<String>::new());
     }
 
+    /// No readable log is no evidence of a real run.
     #[test]
-    fn a_baseline_exonerates_catches_that_are_fast_in_proportion_to_it() {
-        // A genuinely quick suite: the catches take nearly as long as the
-        // baseline, which is what a real run looks like at any scale.
-        let sweep = parse(&doc(Some(1.5), &[("a", "CaughtMutant", 1.4)])).expect("parse");
-        assert_eq!(implausible(&sweep), Vec::<String>::new());
-    }
-
-    #[test]
-    fn with_no_baseline_to_calibrate_against_the_absolute_backstop_applies() {
-        let sweep = parse(&doc(None, &[("a", "CaughtMutant", 0.30)])).expect("parse");
+    fn catches_without_a_log_are_not_believed() {
+        let sweep = sweep_of(&[("a", "CaughtMutant", None)]);
         assert_eq!(implausible(&sweep).len(), 1);
     }
 
     #[test]
-    fn a_baseline_too_short_to_divide_by_is_not_used_as_a_calibrator() {
-        // A sub-second baseline would "exonerate" a 0.1s catch at any ratio, so
-        // it is discarded and the absolute rule applies instead.
-        let sweep = parse(&doc(Some(0.4), &[("a", "CaughtMutant", 0.35)])).expect("parse");
-        assert_eq!(implausible(&sweep).len(), 1);
-        assert!(implausible(&sweep)[0].contains("no usable baseline"));
+    fn one_catch_that_ran_the_suite_vouches_for_the_command() {
+        let sweep = sweep_of(&[
+            ("a", "CaughtMutant", None),
+            ("a", "CaughtMutant", Some(RAN)),
+        ]);
+        assert_eq!(implausible(&sweep), Vec::<String>::new());
     }
 
     #[test]
     fn a_package_where_nothing_was_caught_is_not_flagged() {
-        let sweep = parse(&doc(Some(9.5), &[("a", "MissedMutant", 0.1)])).expect("parse");
+        let sweep = sweep_of(&[("a", "MissedMutant", Some(RAN))]);
         assert_eq!(implausible(&sweep), Vec::<String>::new());
     }
 
     #[test]
-    fn merging_sums_packages_and_keeps_the_strictest_baseline() {
-        let a = parse(&doc(Some(9.0), &[("p", "CaughtMutant", 8.0)])).expect("parse");
-        let b = parse(&doc(
-            Some(2.0),
-            &[("p", "MissedMutant", 0.0), ("q", "CaughtMutant", 1.9)],
-        ))
-        .expect("parse");
+    fn merging_sums_packages_and_their_evidence() {
+        let a = sweep_of(&[("p", "CaughtMutant", Some(RAN))]);
+        let b = sweep_of(&[
+            ("p", "MissedMutant", Some(RAN)),
+            ("q", "CaughtMutant", Some(NEVER_RAN)),
+        ]);
         let merged = merge([a, b]);
         assert_eq!(merged.packages["p"].caught, 1);
+        assert_eq!(merged.packages["p"].caught_ran_tests, 1);
         assert_eq!(merged.packages["p"].missed, 1);
+        assert_eq!(merged.packages["q"].caught_ran_tests, 0);
         assert_eq!(merged.packages.len(), 2);
-        assert_eq!(
-            merged.baseline_test,
-            Some(2.0),
-            "the smallest baseline is the honest lower bound on a real test run"
-        );
-    }
-
-    #[test]
-    fn merging_keeps_the_slowest_catch_seen_anywhere() {
-        let a = parse(&doc(None, &[("p", "CaughtMutant", 0.1)])).expect("parse");
-        let b = parse(&doc(None, &[("p", "CaughtMutant", 7.0)])).expect("parse");
-        assert_eq!(merge([a, b]).packages["p"].slowest_caught_test, 7.0);
     }
 
     #[test]
     fn missed_counts_include_packages_that_missed_nothing() {
-        let sweep = parse(&doc(
-            Some(4.0),
-            &[("a", "MissedMutant", 1.0), ("b", "CaughtMutant", 3.0)],
-        ))
-        .expect("parse");
+        let sweep = sweep_of(&[
+            ("a", "MissedMutant", Some(RAN)),
+            ("b", "CaughtMutant", Some(RAN)),
+        ]);
         // `b` has to appear with 0, or a budget row for it would read as stale
         // and a later regression in it would have nothing to be measured against.
         assert_eq!(missed_counts(&sweep)["a"], 1);
@@ -404,22 +379,26 @@ mod tests {
     }
 
     #[test]
-    fn an_unrecognised_scalar_scenario_is_skipped_not_taken_for_the_baseline() {
-        let text = r#"{"outcomes":[{"scenario":"SomethingNew","summary":"Success","phase_results":[{"phase":"Test","duration":99.0,"process_status":"Success"}]}]}"#;
-        let sweep = parse(text).expect("parse");
-        assert_eq!(sweep.baseline_test, None);
+    fn an_unrecognised_scalar_scenario_is_skipped() {
+        let text = r#"{"outcomes":[{"scenario":"SomethingNew","summary":"Success"}]}"#;
+        let sweep = parse(text, |_| None).expect("parse");
         assert!(sweep.packages.is_empty());
     }
 
+    /// `read` resolves each log against the directory `outcomes.json` is in.
     #[test]
-    fn a_sweep_with_no_test_phase_does_not_panic() {
-        let text = r#"{"outcomes":[{"scenario":{"Mutant":{"package":"a"}},"summary":"CaughtMutant","phase_results":[]}]}"#;
-        let sweep = parse(text).expect("parse");
-        assert_eq!(sweep.packages["a"].slowest_caught_test, 0.0);
-        assert_eq!(
-            implausible(&sweep).len(),
-            1,
-            "no timing at all is not evidence of a real run"
-        );
+    fn read_finds_the_logs_beside_the_outcomes() {
+        let dir = std::env::temp_dir().join(format!("xtask-mutants-read-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("log")).expect("mkdir");
+        std::fs::write(dir.join("log/m.log"), RAN).expect("log");
+        let outcomes = dir.join("outcomes.json");
+        std::fs::write(
+            &outcomes,
+            r#"{"outcomes":[{"scenario":{"Mutant":{"package":"a"}},"summary":"CaughtMutant","log_path":"log/m.log"}]}"#,
+        )
+        .expect("outcomes");
+        let ran = read(&outcomes).map(|s| s.packages["a"].caught_ran_tests);
+        std::fs::remove_dir_all(&dir).expect("clean up");
+        assert_eq!(ran.expect("read"), 1);
     }
 }
