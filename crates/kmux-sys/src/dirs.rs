@@ -37,8 +37,13 @@ pub struct Dirs {
     /// (`$XDG_RUNTIME_DIR`, created by systemd/logind), where kmux only creates
     /// the profile directory inside it.
     runtime_base_is_ours: bool,
-    config_base: PathBuf,
-    state_base: PathBuf,
+    /// The config and state bases, or why they could not be resolved. Kept as
+    /// a result rather than failing construction, so a caller that needs only
+    /// the runtime dir (`socket_path`, `ensure_daemon`, the pid lookups) works
+    /// without a resolvable home directory; the error surfaces from the
+    /// accessor that actually needs the base.
+    config_base: Result<PathBuf, String>,
+    state_base: Result<PathBuf, String>,
 }
 
 impl Dirs {
@@ -47,9 +52,14 @@ impl Dirs {
     /// The only reader of `XDG_RUNTIME_DIR`, `XDG_CONFIG_HOME`, `XDG_STATE_HOME`
     /// and `HOME` in the workspace. Resolve once, near the process entry point,
     /// and pass the value down.
+    ///
+    /// Never fails today — an unresolvable home directory is reported by
+    /// [`Dirs::config_dir`] and [`Dirs::state_dir`], the accessors that need it —
+    /// but stays fallible so a future base that must resolve up front does not
+    /// change every caller.
     pub fn from_env() -> anyhow::Result<Self> {
         let var = |k: &str| std::env::var(k).ok();
-        Self::resolve(
+        Ok(Self::resolve(
             var("XDG_RUNTIME_DIR"),
             var("XDG_CONFIG_HOME"),
             var("XDG_STATE_HOME"),
@@ -63,7 +73,7 @@ impl Dirs {
                         .ok_or_else(|| anyhow::anyhow!("could not determine home directory"))
                 })
             },
-        )
+        ))
     }
 
     /// The resolution rules, with the environment passed in.
@@ -75,37 +85,41 @@ impl Dirs {
     /// nothing left to get wrong.
     ///
     /// `home` is a closure and not a value so it is consulted only when a base
-    /// actually falls back to it: a process that needs the runtime dir alone is
-    /// unaffected by an unresolvable home directory, matching the behaviour of
-    /// the free functions before this type existed.
+    /// actually falls back to it, and a failure is kept against that base
+    /// rather than failing construction: a process that needs the runtime dir
+    /// alone is unaffected by an unresolvable home directory, matching the
+    /// behaviour of the free functions before this type existed.
     fn resolve(
         xdg_runtime: Option<String>,
         xdg_config: Option<String>,
         xdg_state: Option<String>,
         uid: u32,
         home: impl Fn() -> anyhow::Result<PathBuf>,
-    ) -> anyhow::Result<Self> {
+    ) -> Self {
         let (runtime_base, runtime_base_is_ours) = match xdg_runtime {
             Some(val) => (PathBuf::from(val), false),
             // No XDG_RUNTIME_DIR (macOS, BSDs, containers, minimal Linux). Fall
             // back to a uid-scoped dir under /tmp that we own and must lock down.
             None => (PathBuf::from(format!("/tmp/kmux-{uid}")), true),
         };
-        let config_base = match xdg_config {
-            Some(val) => PathBuf::from(val),
-            None => home()?.join(".config"),
-        };
-        let state_base = match xdg_state {
-            Some(val) => PathBuf::from(val),
-            None => home()?.join(".local").join("state"),
+        let under_home = |xdg: Option<String>, fallback: &[&str]| match xdg {
+            Some(val) => Ok(PathBuf::from(val)),
+            None => home()
+                .map(|h| fallback.iter().fold(h, |p, part| p.join(part)))
+                .map_err(|e| format!("{e:#}")),
         };
 
-        Ok(Self {
+        Self {
             runtime_base,
             runtime_base_is_ours,
-            config_base,
-            state_base,
-        })
+            config_base: under_home(xdg_config, &[".config"]),
+            state_base: under_home(xdg_state, &[".local", "state"]),
+        }
+    }
+
+    /// A base, or the reason it could not be resolved.
+    fn base(base: &Result<PathBuf, String>) -> anyhow::Result<&Path> {
+        base.as_deref().map_err(|e| anyhow::anyhow!("{e}"))
     }
 
     /// Bases under a single `root`, for tests and any caller with explicit paths.
@@ -118,8 +132,8 @@ impl Dirs {
         Self {
             runtime_base: root.join("run"),
             runtime_base_is_ours: true,
-            config_base: root.join("config"),
-            state_base: root.join("state"),
+            config_base: Ok(root.join("config")),
+            state_base: Ok(root.join("state")),
         }
     }
 
@@ -140,7 +154,7 @@ impl Dirs {
     /// literal `kmux`, not [`KMUX_DIR_NAME`]: config is shared across the debug
     /// and release profiles because it represents user intent, not runtime state.
     pub fn config_dir(&self) -> anyhow::Result<PathBuf> {
-        let dir = self.config_base.join("kmux");
+        let dir = Self::base(&self.config_base)?.join("kmux");
         create_dir_all_named(&dir, "config dir")?;
         Ok(dir)
     }
@@ -151,7 +165,7 @@ impl Dirs {
     /// `$XDG_STATE_HOME/{KMUX_DIR_NAME}`, falling back to
     /// `$HOME/.local/state/{KMUX_DIR_NAME}`.
     pub fn state_dir(&self) -> anyhow::Result<PathBuf> {
-        let dir = self.state_base.join(KMUX_DIR_NAME);
+        let dir = Self::base(&self.state_base)?.join(KMUX_DIR_NAME);
         create_dir_all_named(&dir, "state dir")?;
         Ok(dir)
     }
@@ -488,8 +502,7 @@ mod tests {
 
     #[test]
     fn xdg_runtime_dir_wins_and_is_not_ours_to_create() {
-        let d =
-            Dirs::resolve(Some("/run/user/1000".into()), None, None, 1000, home).expect("resolves");
+        let d = Dirs::resolve(Some("/run/user/1000".into()), None, None, 1000, home);
         assert_eq!(d.runtime_base, PathBuf::from("/run/user/1000"));
         assert!(
             !d.runtime_base_is_ours,
@@ -499,7 +512,7 @@ mod tests {
 
     #[test]
     fn missing_xdg_runtime_dir_falls_back_to_a_uid_scoped_tmp_dir_we_own() {
-        let d = Dirs::resolve(None, None, None, 4242, home).expect("resolves");
+        let d = Dirs::resolve(None, None, None, 4242, home);
         assert_eq!(
             d.runtime_base,
             PathBuf::from("/tmp/kmux-4242"),
@@ -513,9 +526,9 @@ mod tests {
 
     #[test]
     fn config_and_state_fall_back_to_the_xdg_defaults_under_home() {
-        let d = Dirs::resolve(Some("/run".into()), None, None, 1, home).expect("resolves");
-        assert_eq!(d.config_base, PathBuf::from("/home/ada/.config"));
-        assert_eq!(d.state_base, PathBuf::from("/home/ada/.local/state"));
+        let d = Dirs::resolve(Some("/run".into()), None, None, 1, home);
+        assert_eq!(d.config_base, Ok(PathBuf::from("/home/ada/.config")));
+        assert_eq!(d.state_base, Ok(PathBuf::from("/home/ada/.local/state")));
     }
 
     #[test]
@@ -526,28 +539,37 @@ mod tests {
             Some("/st".into()),
             1,
             || panic!("home must not be consulted when both XDG vars are set"),
-        )
-        .expect("resolves");
-        assert_eq!(d.config_base, PathBuf::from("/cfg"));
-        assert_eq!(d.state_base, PathBuf::from("/st"));
+        );
+        assert_eq!(d.config_base, Ok(PathBuf::from("/cfg")));
+        assert_eq!(d.state_base, Ok(PathBuf::from("/st")));
     }
 
+    /// Runtime-dir-only callers — `socket_path`, `ensure_daemon`, the pid
+    /// lookups — must keep working without a home directory. Resolving the
+    /// config and state bases eagerly made all of them fail; the error now
+    /// surfaces only from the accessor that needs the missing base.
     #[test]
-    fn an_unresolvable_home_only_fails_when_a_base_actually_needs_it() {
+    fn an_unresolvable_home_only_fails_the_accessor_that_needs_it() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let runtime = tmp.path().join("run");
+        std::fs::create_dir(&runtime).expect("mkdir");
         let no_home = || anyhow::bail!("no home");
-        // Both XDG bases present: home is never consulted, so this succeeds.
-        Dirs::resolve(
-            Some("/run".into()),
-            Some("/cfg".into()),
-            Some("/st".into()),
+
+        let d = Dirs::resolve(
+            Some(runtime.to_string_lossy().into_owned()),
+            None,
+            Some(tmp.path().join("st").to_string_lossy().into_owned()),
             1,
             no_home,
-        )
-        .expect("home is irrelevant when both XDG bases are set");
-        // A missing base forces the lookup, and the failure surfaces.
-        let err = Dirs::resolve(Some("/run".into()), None, Some("/st".into()), 1, no_home)
-            .expect_err("config base needs home");
-        assert!(err.to_string().contains("no home"));
+        );
+
+        assert_eq!(
+            d.socket_path().expect("the runtime dir needs no home"),
+            runtime.join(KMUX_DIR_NAME).join("daemon.sock")
+        );
+        assert!(d.state_dir().is_ok(), "state has its XDG base");
+        let err = d.config_dir().expect_err("config falls back to home");
+        assert!(err.to_string().contains("no home"), "{err}");
     }
 
     #[cfg(unix)]
