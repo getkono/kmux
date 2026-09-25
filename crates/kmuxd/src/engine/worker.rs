@@ -11,7 +11,7 @@
 //! `snapshot()` synchronously (no IPC round-trip), which keeps the existing
 //! synchronous attach/resize call sites unchanged.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -94,16 +94,11 @@ impl WorkerEngine {
 
         let exe = resolve_worker_exe()?;
         let mut cmd = std::process::Command::new(&exe);
-        cmd.env("KMUX_WORKER_SOCKET_FD", "3");
-        // SAFETY: dup2 is async-signal-safe; we only touch the raw socket fd we
-        // own. The child reads the socket from fd 3.
+        cmd.env("KMUX_WORKER_SOCKET_FD", WORKER_SOCKET_FD.to_string());
+        // SAFETY: `inherit_as` is async-signal-safe and touches only the raw
+        // socket fd we own.
         unsafe {
-            cmd.pre_exec(move || {
-                if nix::libc::dup2(worker_raw, 3) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+            cmd.pre_exec(move || inherit_as(worker_raw, WORKER_SOCKET_FD));
         }
         let child = cmd
             .spawn()
@@ -449,6 +444,32 @@ fn to_exit_status(status: ChildExitStatus) -> ExitStatus {
     }
 }
 
+/// The fd number the worker reads its socket from (`KMUX_WORKER_SOCKET_FD`).
+const WORKER_SOCKET_FD: RawFd = 3;
+
+/// In a forked child before `exec`: make `fd` survive `exec` as `target`.
+///
+/// `dup2` onto another number yields a copy without `FD_CLOEXEC`. When `fd`
+/// already *is* `target`, `dup2` does nothing and leaves the flag set (Rust
+/// opens every fd close-on-exec), so the program would start without it; the
+/// descriptor flags are cleared explicitly instead.
+///
+/// Async-signal-safe: only `fcntl`, `dup2` and reading `errno`.
+fn inherit_as(fd: RawFd, target: RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl/dup2 on an fd the caller owns; a failure is -1 plus errno.
+    let rc = unsafe {
+        if fd == target {
+            nix::libc::fcntl(fd, nix::libc::F_SETFD, 0)
+        } else {
+            nix::libc::dup2(fd, target)
+        }
+    };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Locate the `kmux-vt-worker` binary: `$KMUX_VT_WORKER_BIN`, else next to the
 /// running daemon, else fall back to the bare name on `PATH`.
 fn resolve_worker_exe() -> anyhow::Result<PathBuf> {
@@ -469,5 +490,54 @@ fn resolve_worker_exe() -> anyhow::Result<PathBuf> {
         Ok(candidate)
     } else {
         Ok(PathBuf::from("kmux-vt-worker"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::os::fd::{AsFd, FromRawFd};
+
+    use super::*;
+
+    /// A close-on-exec fd, as the socketpair end is, at a number above any a
+    /// shell opens for itself.
+    fn fixture_cloexec_fd() -> OwnedFd {
+        let stdout = std::io::stdout();
+        let raw = nix::fcntl::fcntl(stdout.as_fd(), nix::fcntl::FcntlArg::F_DUPFD_CLOEXEC(100))
+            .expect("F_DUPFD_CLOEXEC");
+        // SAFETY: F_DUPFD_CLOEXEC returned a fresh fd nothing else owns.
+        unsafe { OwnedFd::from_raw_fd(raw) }
+    }
+
+    /// Whether `target` is open in a program exec'd after `inherit_as(fd,
+    /// target)` ran in its `pre_exec`. A real fork and exec, because what is
+    /// under test is the close-on-exec flag `exec` honours (R7).
+    fn target_open_after_exec(fd: &OwnedFd, target: RawFd) -> bool {
+        let raw = fd.as_raw_fd();
+        let mut cmd = std::process::Command::new("/bin/sh");
+        // `: >&N` fails unless fd N is open in the shell.
+        cmd.args(["-c", &format!(": >&{target}")])
+            .stderr(std::process::Stdio::null());
+        // SAFETY: `inherit_as` is async-signal-safe.
+        unsafe {
+            cmd.pre_exec(move || inherit_as(raw, target));
+        }
+        cmd.status().expect("run sh").success()
+    }
+
+    /// The latent bug: a socket already at the target number was `dup2`ed onto
+    /// itself, a no-op that left it close-on-exec.
+    #[test]
+    fn inherit_as_passes_an_fd_already_at_the_target_number() {
+        let fd = fixture_cloexec_fd();
+        let raw = fd.as_raw_fd();
+        assert!(target_open_after_exec(&fd, raw), "fd {raw} closed on exec");
+    }
+
+    #[test]
+    fn inherit_as_passes_an_fd_under_a_new_number() {
+        let fd = fixture_cloexec_fd();
+        let target = fd.as_raw_fd() + 1;
+        assert!(target_open_after_exec(&fd, target), "fd {target} not open");
     }
 }
