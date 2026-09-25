@@ -17,6 +17,7 @@ mod handoff;
 mod impair;
 mod lock;
 mod log_writer;
+mod outbound;
 mod persist;
 mod process_stats;
 mod relay;

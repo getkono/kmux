@@ -320,7 +320,7 @@ impl ServerApp {
 
     /// Register a viewer of federated `pane_id` and forward an `Attach` upstream.
     /// `data_tx` is the viewer's bounded pane-stream channel; `ctrl_tx` is its
-    /// unbounded control channel, over which a `Lagged` is delivered out-of-band if
+    /// control lane (never dropped), over which a `Lagged` is delivered out-of-band if
     /// the data channel backs up (matching the local relay). Returns `true` when
     /// `pane_id` is federated (and the attach was forwarded), `false` otherwise.
     pub fn federated_attach(
@@ -328,7 +328,7 @@ impl ServerApp {
         pane_id: &str,
         client_id: ClientId,
         data_tx: mpsc::Sender<ServerMessage>,
-        ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+        ctrl_tx: crate::outbound::OutboundTx,
         last_seqno: Option<SequenceNo>,
         size: TermSize,
     ) -> bool {

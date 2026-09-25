@@ -75,13 +75,13 @@ pub struct PeerManager {
     word_index: Mutex<HashMap<String, PeerId>>,
 }
 
-/// One local GUI viewing a proxied pane: its bounded data channel, its unbounded
-/// ctrl channel (out-of-band signalling that bypasses data backpressure, e.g.
+/// One local GUI viewing a proxied pane: its bounded data channel, its ctrl
+/// lane (out-of-band signalling that bypasses data backpressure, e.g.
 /// `Lagged`), and its declared terminal size (used for smallest-wins upstream
 /// reconciliation).
 struct Viewer {
     data_tx: mpsc::Sender<ServerMessage>,
-    ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+    ctrl_tx: crate::outbound::OutboundTx,
     size: TermSize,
     /// Connection-pause state (issue #68). While paused this viewer receives no
     /// terminal-output frames (it is skipped in `fan_out`, never marked lagged) and
@@ -156,19 +156,19 @@ impl ProxiedPane {
         }
     }
 
-    /// The viewers' **unbounded ctrl** senders — the delivery path for session
+    /// The viewers' **ctrl** senders — the delivery path for session
     /// events and lifecycle signals, which must not be subject to the per-pane data
     /// backpressure (matching the local daemon, where events reach clients via the
-    /// unbounded writer channel, not the bounded pane stream).
-    fn viewer_ctrl_senders(&self) -> Vec<mpsc::UnboundedSender<ServerMessage>> {
+    /// connection's control lane, not the bounded pane stream).
+    fn viewer_ctrl_senders(&self) -> Vec<crate::outbound::OutboundTx> {
         self.viewers.values().map(|v| v.ctrl_tx.clone()).collect()
     }
 
     /// Fan an (already local-addressed) pane frame out to every viewer, applying
     /// the same backpressure policy as the local PTY relay
     /// (`crate::relay::broadcast_to_clients`): a viewer whose **bounded** data
-    /// channel is full is sent a [`ServerMessage::Lagged`] over its **unbounded**
-    /// ctrl channel and dropped — it re-attaches and is served a fresh snapshot
+    /// channel is full is sent a [`ServerMessage::Lagged`] over its **ctrl**
+    /// lane and dropped — it re-attaches and is served a fresh snapshot
     /// minted off the still-correct mirror, exactly as a lagging local client
     /// recovers. A viewer whose channel has closed is dropped silently. The mirror
     /// is fed by the caller *before* this, so a dropped viewer never desyncs it.
@@ -342,9 +342,9 @@ impl PeerConnection {
     /// The **ctrl** senders of every viewer of every proxied pane under
     /// `local_word` — the routing target for session-scoped events (titles, layout,
     /// lifecycle), which in local `kmuxd` reach all clients viewing a session, not
-    /// just one pane, and are delivered out-of-band (unbounded) so backpressure on a
+    /// just one pane, and are delivered out-of-band (control lane) so backpressure on a
     /// pane's content stream can never drop a title change or a `SessionClosed`.
-    fn viewers_under_word(&self, local_word: &str) -> Vec<mpsc::UnboundedSender<ServerMessage>> {
+    fn viewers_under_word(&self, local_word: &str) -> Vec<crate::outbound::OutboundTx> {
         let prefix = format!("{local_word}/");
         self.panes
             .iter()
@@ -1102,7 +1102,7 @@ impl PeerManager {
         local_pane_id: &str,
         client_id: ClientId,
         data_tx: mpsc::Sender<ServerMessage>,
-        ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+        ctrl_tx: crate::outbound::OutboundTx,
         last_seqno: Option<SequenceNo>,
         size: TermSize,
     ) -> bool {
@@ -1421,7 +1421,7 @@ fn spawn_feed_loop(
             // Session-scoped events (titles, layout, tab/session lifecycle): translate
             // the embedded word remote→local and fan out to every viewer under that
             // word, so a GUI viewing a federated session still receives its title and
-            // layout updates. These go over the viewers' unbounded ctrl channel
+            // layout updates. These go over the viewers' ctrl lane
             // (`viewers_under_word`), so — exactly as in the local daemon — a backed-up
             // pane content stream can never drop an event.
             let viewers = {
@@ -1454,7 +1454,7 @@ fn spawn_feed_loop(
         // cleans up instead of hanging, drop the panes (closing the pane streams),
         // and mark the connection dead for lazy reaping. Locally-hosted PTY panes
         // are untouched — they live in a separate relay. The `SessionClosed` goes
-        // over the unbounded ctrl channel so a viewer whose data stream happened to
+        // over the ctrl lane so a viewer whose data stream happened to
         // be full at death still learns the session ended (a bounded `try_send`
         // could drop it and the GUI would hang, since no further frames follow).
         {
@@ -1661,7 +1661,7 @@ mod tests {
     /// A test viewer with a bounded data channel and a throwaway ctrl channel.
     fn test_viewer(cap: usize, size: TermSize) -> (Viewer, mpsc::Receiver<ServerMessage>) {
         let (data_tx, data_rx) = mpsc::channel(cap);
-        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel();
+        let (ctrl_tx, _ctrl_rx) = crate::outbound::test_channel();
         (
             Viewer {
                 data_tx,
@@ -1743,7 +1743,7 @@ mod tests {
         // A capacity-1 data channel pre-filled so the next send overflows; the
         // viewer must then get a `Lagged` on its ctrl channel and be removed.
         let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
-        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, mut ctrl_rx) = crate::outbound::test_channel();
         data_tx.try_send(snapshot_msg("hawk/0")).unwrap(); // fill to capacity
 
         let mut pane = ProxiedPane::new(sz(24, 80));
@@ -1777,7 +1777,7 @@ mod tests {
         // A paused viewer (issue #68) receives nothing and is retained even when its
         // channel is full — it resyncs on resume via re-attach, never lagged.
         let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
-        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, mut ctrl_rx) = crate::outbound::test_channel();
         data_tx.try_send(snapshot_msg("hawk/0")).unwrap(); // fill to capacity
 
         let mut pane = ProxiedPane::new(sz(24, 80));
@@ -1811,7 +1811,7 @@ mod tests {
         // An auto-paused viewer with a per-pane exemption keeps streaming through
         // the background pause (issue #68); a manual pause would still skip it.
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(8);
-        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, _ctrl_rx) = crate::outbound::test_channel();
 
         let mut pane = ProxiedPane::new(sz(24, 80));
         pane.viewers.insert(
@@ -1836,7 +1836,7 @@ mod tests {
     #[test]
     fn fan_out_drops_closed_viewer_silently() {
         let (data_tx, data_rx) = mpsc::channel::<ServerMessage>(8);
-        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, mut ctrl_rx) = crate::outbound::test_channel();
         drop(data_rx); // receiver gone → channel closed
 
         let mut pane = ProxiedPane::new(sz(24, 80));

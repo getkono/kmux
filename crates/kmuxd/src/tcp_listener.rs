@@ -6,16 +6,19 @@ use tokio::task::AbortHandle;
 use tracing::Instrument;
 
 use crate::app::{AttachResult, ServerApp};
-use crate::client_handler::{PaneAttacher, build_attach_replay, run_client_session};
+use crate::client_handler::{PaneAttacher, run_client_session};
+use crate::outbound::{OutboundTx, forward_pane_stream};
 
 // ─── TCP-specific PaneAttacher ────────────────────────────────────────────────
 
-/// Forwards pane diffs from `client_rx` into the shared TCP control channel
-/// (`ctrl_tx`).  All messages are interleaved on the single TCP byte stream;
-/// the client demultiplexes them by the `pane_id` field carried in each
-/// `ServerMessage` variant.
+/// Forwards pane diffs from `client_rx` into the connection's outbound queue
+/// (`ctrl_tx`) as pane data. All messages are interleaved on the single TCP
+/// byte stream; the client demultiplexes them by the `pane_id` field carried
+/// in each `ServerMessage` variant. A congested queue lags the pane stream and
+/// resyncs it from `app` (see [`forward_pane_stream`]).
 pub(crate) struct TcpAttacher {
-    pub ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+    pub ctrl_tx: OutboundTx,
+    pub app: Arc<ServerApp>,
 }
 
 impl PaneAttacher for TcpAttacher {
@@ -23,34 +26,54 @@ impl PaneAttacher for TcpAttacher {
         &self,
         pane_id: String,
         result: AttachResult,
-        mut client_rx: mpsc::Receiver<ServerMessage>,
+        client_rx: mpsc::Receiver<ServerMessage>,
     ) -> impl Future<Output = Result<AbortHandle, String>> + Send {
         let ctrl_tx = self.ctrl_tx.clone();
+        let app = Arc::clone(&self.app);
         async move {
-            let handle = tokio::spawn(async move {
-                for msg in build_attach_replay(result, &pane_id) {
-                    if ctrl_tx.send(msg).is_err() {
-                        return;
-                    }
-                }
-                // Network impairment shim (issue #72): delay live pane-data
-                // frames before they reach the shared TCP writer. Applied here —
-                // not in the writer loop — so Ping/control are never blocked.
-                let impair = crate::impair::config();
-                let mut rng = impair.map(|c| c.rng_for(crate::impair::pane_salt(&pane_id)));
-                while let Some(msg) = client_rx.recv().await {
-                    if let (Some(cfg), Some(rng)) = (impair, rng.as_mut()) {
-                        crate::impair::maybe_delay(cfg, msg.category(), rng).await;
-                    }
-                    if ctrl_tx.send(msg).is_err() {
-                        break;
-                    }
-                }
-            })
+            // Network impairment shim (issue #72): delay live pane-data frames
+            // before they reach the shared TCP writer. Applied here — not in
+            // the writer loop — so Ping/control are never blocked.
+            let client_rx = match crate::impair::config() {
+                Some(cfg) => impaired(cfg, &pane_id, client_rx),
+                None => client_rx,
+            };
+            let resync_pane = pane_id.clone();
+            let handle = tokio::spawn(forward_pane_stream(
+                pane_id,
+                result,
+                client_rx,
+                ctrl_tx,
+                move || {
+                    let app = Arc::clone(&app);
+                    let pane_id = resync_pane.clone();
+                    async move { app.resync_snapshot(&pane_id).await }
+                },
+            ))
             .abort_handle();
             Ok(handle)
         }
     }
+}
+
+/// Re-queue `rx` through a task that applies the impairment shim's per-frame
+/// delay. Only built when the impairment knobs are set.
+fn impaired(
+    cfg: &'static crate::impair::ImpairConfig,
+    pane_id: &str,
+    mut rx: mpsc::Receiver<ServerMessage>,
+) -> mpsc::Receiver<ServerMessage> {
+    let (tx, delayed) = mpsc::channel(crate::client_handler::CLIENT_CHANNEL_CAPACITY);
+    let mut rng = cfg.rng_for(crate::impair::pane_salt(pane_id));
+    tokio::spawn(async move {
+        while let Some(msg) = rx.recv().await {
+            crate::impair::maybe_delay(cfg, msg.category(), &mut rng).await;
+            if tx.send(msg).await.is_err() {
+                break;
+            }
+        }
+    });
+    delayed
 }
 
 // ─── TCP session handler ──────────────────────────────────────────────────────
@@ -69,6 +92,7 @@ pub async fn handle_tcp_io<R, W>(
     R: tokio::io::AsyncRead + Unpin + Send,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
 {
+    let attacher_app = Arc::clone(&app);
     run_client_session(
         reader,
         writer,
@@ -77,7 +101,10 @@ pub async fn handle_tcp_io<R, W>(
         // The TCP/UDS attacher funnels pane diffs through `ctrl_tx`, so the
         // shared writer task compresses them; the per-connection policy is
         // unused here.
-        |ctrl_tx, _comp_out| TcpAttacher { ctrl_tx },
+        move |ctrl_tx, _comp_out| TcpAttacher {
+            ctrl_tx,
+            app: attacher_app,
+        },
         conn_span.clone(),
     )
     .instrument(conn_span)

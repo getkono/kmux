@@ -11,7 +11,7 @@ use kmux_protocol::{decode_client, encode_server, read_frame, write_frame_compre
 /// for the next recv.
 pub(crate) const MAX_WRITE_BATCH: usize = 256;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, Span, debug, info, warn};
 
@@ -19,6 +19,7 @@ use crate::app::{AttachResult, ConnectionMetrics, ServerApp};
 use crate::client_handler::{
     OutboundCompression, PaneAttacher, SharedClientState, handle_message, pty_event_to_msg,
 };
+use crate::outbound::{self, OUTBOUND_CAPACITY, OutboundRx, OutboundTx, close_channel};
 
 /// Build the initial replay messages for a pane attach result.
 ///
@@ -58,7 +59,7 @@ pub fn build_attach_replay(attach_result: AttachResult, pane_id: &str) -> Vec<Se
 
 fn spawn_authenticated_forwarders(
     app: Arc<ServerApp>,
-    ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+    ctrl_tx: OutboundTx,
     metrics: Arc<ConnectionMetrics>,
     conn_span: Span,
 ) -> (JoinHandle<()>, JoinHandle<()>, JoinHandle<()>) {
@@ -112,6 +113,66 @@ fn spawn_authenticated_forwarders(
     (event_task, vt_task, ping_task)
 }
 
+/// Drain a connection's outbound queue onto `writer` until every sender is
+/// gone or a write fails, then shut the transport down.
+///
+/// Batches all immediately-available messages into one flush. Each
+/// `write_frame_compressed_into` writes a whole frame without flushing; a
+/// single trailing flush then pushes the batch as far fewer TLS records /
+/// syscalls than one flush per message. Per-frame compression and the
+/// one-frame-per-message wire format are unchanged, so the bytes on the wire
+/// are identical — only the flush boundaries move.
+async fn write_outbound<W: AsyncWrite + Unpin>(
+    mut out_rx: OutboundRx,
+    mut writer: W,
+    metrics: Arc<ConnectionMetrics>,
+    comp: Arc<OutboundCompression>,
+) {
+    let mut batch: Vec<ServerMessage> = Vec::new();
+    'writer: while let Some(first) = out_rx.recv().await {
+        batch.clear();
+        batch.push(first);
+        while batch.len() < MAX_WRITE_BATCH {
+            match out_rx.try_recv() {
+                Ok(m) => batch.push(m),
+                Err(_) => break,
+            }
+        }
+        // The batch is off the queue: a lagged pane stream may resync.
+        out_rx.mark_drained();
+        for msg in batch.drain(..) {
+            match encode_server(&msg) {
+                Ok(bytes) => {
+                    crate::capture::record(msg.category(), &bytes);
+                    match write_frame_compressed_into(&mut writer, &bytes, comp.compressor()).await
+                    {
+                        Ok(wire_len) => {
+                            metrics
+                                .bytes_out
+                                .fetch_add(wire_len as u64, Ordering::Relaxed);
+                            // What the same frame would have cost uncompressed
+                            // (length prefix + codec tag + payload).
+                            metrics
+                                .bytes_out_uncompressed
+                                .fetch_add(5 + bytes.len() as u64, Ordering::Relaxed);
+                            metrics.msgs_out.fetch_add(1, Ordering::Relaxed);
+                        }
+                        // A write failure leaves only whole frames on the
+                        // wire (each frame is written in full before the
+                        // next); the client reconnects + resyncs.
+                        Err(_) => break 'writer,
+                    }
+                }
+                Err(e) => warn!("encode error: {e}"),
+            }
+        }
+        if kmux_protocol::flush(&mut writer).await.is_err() {
+            break;
+        }
+    }
+    let _ = writer.shutdown().await;
+}
+
 /// Generic client session handler shared by QUIC and TCP connections.
 ///
 /// Runs the event-forwarder, ping, writer, and read-dispatch loop that are
@@ -139,7 +200,7 @@ pub async fn run_client_session<R, W, A, F>(
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send + 'static,
     A: PaneAttacher,
-    F: FnOnce(mpsc::UnboundedSender<ServerMessage>, Arc<OutboundCompression>) -> A,
+    F: FnOnce(OutboundTx, Arc<OutboundCompression>) -> A,
 {
     let metrics = Arc::new(ConnectionMetrics::new());
 
@@ -150,69 +211,12 @@ pub async fn run_client_session<R, W, A, F>(
         app.compression.min_size,
     ));
 
-    let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let (closer, mut close_signal) = close_channel();
+    let (ctrl_tx, out_rx) = outbound::channel(OUTBOUND_CAPACITY, closer);
 
-    let writer_metrics = Arc::clone(&metrics);
-    let writer_comp = Arc::clone(&comp_out);
     let mut writer_task = tokio::spawn(
-        async move {
-            let mut ctrl_rx = ctrl_rx;
-            let mut writer = writer;
-            // Batch all immediately-available messages into one flush. Each
-            // `write_frame_compressed_into` writes a whole frame without
-            // flushing; a single trailing flush then pushes the batch as far
-            // fewer TLS records / syscalls than the old one-flush-per-message
-            // loop. Per-frame compression and the one-frame-per-message wire
-            // format are unchanged, so the bytes on the wire are identical —
-            // only the flush boundaries move.
-            let mut batch: Vec<ServerMessage> = Vec::new();
-            'writer: while let Some(first) = ctrl_rx.recv().await {
-                batch.clear();
-                batch.push(first);
-                while batch.len() < MAX_WRITE_BATCH {
-                    match ctrl_rx.try_recv() {
-                        Ok(m) => batch.push(m),
-                        Err(_) => break,
-                    }
-                }
-                for msg in batch.drain(..) {
-                    match encode_server(&msg) {
-                        Ok(bytes) => {
-                            crate::capture::record(msg.category(), &bytes);
-                            match write_frame_compressed_into(
-                                &mut writer,
-                                &bytes,
-                                writer_comp.compressor(),
-                            )
-                            .await
-                            {
-                                Ok(wire_len) => {
-                                    writer_metrics
-                                        .bytes_out
-                                        .fetch_add(wire_len as u64, Ordering::Relaxed);
-                                    // What the same frame would have cost uncompressed
-                                    // (length prefix + codec tag + payload).
-                                    writer_metrics
-                                        .bytes_out_uncompressed
-                                        .fetch_add(5 + bytes.len() as u64, Ordering::Relaxed);
-                                    writer_metrics.msgs_out.fetch_add(1, Ordering::Relaxed);
-                                }
-                                // A write failure leaves only whole frames on the
-                                // wire (each frame is written in full before the
-                                // next); the client reconnects + resyncs.
-                                Err(_) => break 'writer,
-                            }
-                        }
-                        Err(e) => warn!("encode error: {e}"),
-                    }
-                }
-                if kmux_protocol::flush(&mut writer).await.is_err() {
-                    break;
-                }
-            }
-            let _ = writer.shutdown().await;
-        }
-        .instrument(conn_span.clone()),
+        write_outbound(out_rx, writer, Arc::clone(&metrics), Arc::clone(&comp_out))
+            .instrument(conn_span.clone()),
     );
 
     let attacher = make_attacher(ctrl_tx.clone(), Arc::clone(&comp_out));
@@ -228,7 +232,16 @@ pub async fn run_client_session<R, W, A, F>(
     let mut flush_before_close = false;
 
     loop {
-        match read_frame(&mut reader).await {
+        // Every other branch closes the connection, so a read cancelled
+        // mid-frame is never resumed.
+        let frame = tokio::select! {
+            frame = read_frame(&mut reader) => frame,
+            reason = close_signal.closed() => {
+                warn!(conn_id = ?state.connection_id.map(|c| c.0), ?reason, "closing connection");
+                break;
+            }
+        };
+        match frame {
             Ok(Some(data)) => {
                 // Instrument inbound bytes on every frame, before auth. v1
                 // clients send uncompressed uplink, so wire size is the 5-byte

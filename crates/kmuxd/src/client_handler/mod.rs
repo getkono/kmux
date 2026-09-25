@@ -116,7 +116,7 @@ pub struct SharedClientState {
     /// Output-forwarding task handles, keyed by `pane_id`.
     pub attached: HashMap<String, AbortHandle>,
     /// Sender for the control-stream writer task.
-    pub ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+    pub ctrl_tx: crate::outbound::OutboundTx,
     pub app: Arc<ServerApp>,
     /// Connection-scoped tracing span; `conn_id` and `client_id` are recorded into
     /// it once authentication completes so every subsequent log line carries them.
@@ -139,7 +139,7 @@ pub struct SharedClientState {
 impl SharedClientState {
     pub fn new(
         app: Arc<ServerApp>,
-        ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+        ctrl_tx: crate::outbound::OutboundTx,
         conn_span: Span,
         transport: TransportKind,
         metrics: Arc<ConnectionMetrics>,

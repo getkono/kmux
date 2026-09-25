@@ -54,9 +54,9 @@ pub(crate) fn fixture_client_state(
 ) -> (
     SharedClientState,
     Arc<OutboundCompression>,
-    mpsc::UnboundedReceiver<ServerMessage>,
+    crate::outbound::OutboundRx,
 ) {
-    let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel();
+    let (ctrl_tx, ctrl_rx) = crate::outbound::test_channel();
     let comp_out = Arc::new(OutboundCompression::new(
         app.compression.level,
         app.compression.min_size,

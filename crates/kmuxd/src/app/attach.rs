@@ -29,7 +29,7 @@ pub struct AttachParams {
     pub last_seqno: Option<SequenceNo>,
     pub size: TermSize,
     pub data_tx: mpsc::Sender<ServerMessage>,
-    pub ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+    pub ctrl_tx: crate::outbound::OutboundTx,
     pub capabilities: ClientCapabilities,
 }
 
@@ -163,6 +163,18 @@ impl ServerApp {
         }
 
         Ok(result)
+    }
+
+    /// A fresh snapshot of a locally hosted pane and the seqno it is current
+    /// as of — what a lagged pane stream resyncs from (issue #206). `None` for
+    /// a pane this daemon does not host (gone, or federated).
+    pub async fn resync_snapshot(&self, pane_id: &str) -> Option<(GridSnapshot, SequenceNo)> {
+        let sessions = self.sessions.read().await;
+        let relay = super::helpers::get_pane_relay(&sessions, pane_id).ok()?;
+        match compute_replay(relay, None) {
+            AttachResult::FullSnapshot(snapshot, seqno) => Some((snapshot, seqno)),
+            AttachResult::Delta(_) | AttachResult::SyncReset(..) => None,
+        }
     }
 
     /// Set the full-snapshot mode flag for a client across all attached panes.

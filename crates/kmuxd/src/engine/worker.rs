@@ -307,8 +307,8 @@ async fn supervise(
     }
 }
 
-/// Tell attached clients the pane's worker crashed. Uses the unbounded control
-/// channel so the notice is never dropped (same channel `PaneEventSink` uses).
+/// Tell attached clients the pane's worker crashed. Uses the control lane so
+/// the notice is never dropped (same channel `PaneEventSink` uses).
 fn broadcast_fault(fanout: &WorkerFanout) {
     let msg = ServerMessage::Event {
         event: SessionEventMsg::PaneFaulted {

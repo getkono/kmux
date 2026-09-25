@@ -536,7 +536,7 @@ mod tests {
     #[test]
     fn broadcast_sends_lagged_via_ctrl_when_data_full() {
         let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
-        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, mut ctrl_rx) = crate::outbound::test_channel();
 
         data_tx.try_send(dummy_update("eagle/0")).unwrap();
 
@@ -574,7 +574,7 @@ mod tests {
     #[test]
     fn broadcast_removes_client_after_full() {
         let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
-        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, _ctrl_rx) = crate::outbound::test_channel();
 
         data_tx.try_send(dummy_update("eagle/0")).unwrap();
 
@@ -611,7 +611,7 @@ mod tests {
     #[test]
     fn broadcast_delivers_to_healthy_client() {
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, _ctrl_rx) = crate::outbound::test_channel();
 
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         clients.lock().unwrap().insert(
@@ -658,7 +658,7 @@ mod tests {
         use kmux_client::grid::CellGrid;
 
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(8192);
-        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, _ctrl_rx) = crate::outbound::test_channel();
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         clients.lock().unwrap().insert(
             ClientId(1),
@@ -763,7 +763,7 @@ mod tests {
 
         let make_sender = |data_tx: mpsc::Sender<ServerMessage>| ClientSender {
             data_tx,
-            ctrl_tx: mpsc::unbounded_channel().0, // replaced below per client
+            ctrl_tx: crate::outbound::test_channel().0, // replaced below per client
             force_full_snapshot: false,
             paused: false,
             pause_auto: false,
@@ -771,7 +771,7 @@ mod tests {
             capabilities: Default::default(),
             size: Default::default(),
         };
-        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, mut ctrl_rx) = crate::outbound::test_channel();
 
         // A tiny, never-drained data channel overflows after a few frames.
         let (data_tx, _data_rx_full) = mpsc::channel::<ServerMessage>(4);
@@ -892,7 +892,7 @@ mod tests {
     #[test]
     fn grid_digest_delivered_with_authoritative_hash() {
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, _ctrl_rx) = crate::outbound::test_channel();
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         clients.lock().unwrap().insert(
             ClientId(1),
@@ -939,7 +939,7 @@ mod tests {
         // Force-full-snapshot clients get whole snapshots and cannot desync, so
         // they must never receive a (meaningless) digest.
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, _ctrl_rx) = crate::outbound::test_channel();
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         clients.lock().unwrap().insert(
             ClientId(1),
@@ -973,9 +973,9 @@ mod tests {
     fn broadcast_skips_paused_client() {
         // A paused client receives nothing; an active client still does.
         let (paused_tx, mut paused_rx) = mpsc::channel::<ServerMessage>(16);
-        let (paused_ctrl_tx, _paused_ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (paused_ctrl_tx, _paused_ctrl_rx) = crate::outbound::test_channel();
         let (active_tx, mut active_rx) = mpsc::channel::<ServerMessage>(16);
-        let (active_ctrl_tx, _active_ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (active_ctrl_tx, _active_ctrl_rx) = crate::outbound::test_channel();
 
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         {
@@ -1037,7 +1037,7 @@ mod tests {
         // Even with a full data channel, a paused client is never marked lagged
         // or removed — it catches up on resume.
         let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
-        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, mut ctrl_rx) = crate::outbound::test_channel();
         data_tx.try_send(dummy_update("eagle/0")).unwrap(); // fill to capacity
 
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
@@ -1120,7 +1120,7 @@ mod tests {
     #[tokio::test]
     async fn a_flood_is_fed_in_capped_lock_holds_with_a_diff_between() {
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(4096);
-        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, _ctrl_rx) = crate::outbound::test_channel();
         let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
         clients.lock().unwrap().insert(
             ClientId(1),
