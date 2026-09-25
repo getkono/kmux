@@ -38,7 +38,8 @@ declared the crate layering normative for months while nothing checked it.
 same file as its subject. `tests/` is only for a suite that must cross the
 crate's public API or a process boundary. A unit test in `tests/` is a misfiled
 unit test, and a subject whose tests live in a *different* file (as
-`session_manager/mod.rs` does for `server_handler.rs`) has outgrown its module.
+`session_manager/mod.rs` once did for the single-file `server_handler.rs`) has
+outgrown its module.
 *Enforced by:* review.
 
 **R2 — every test asserts on a value.** A test whose only claim is that a call
@@ -178,7 +179,7 @@ Measured 2026-08-22:
 Every case reached zero the same way — take the thing the test needs to vary and
 make it a parameter:
 
-- `kmux-protocol::dirs` — the `Dirs` value replaced twelve unsafe environment
+- `kmux-sys::dirs` (then `kmux-protocol::dirs`) — the `Dirs` value replaced twelve unsafe environment
   overwrites and the module's own lock; 8 serialised tests became 17
   parallel-safe ones.
 - `kmux-app::config` — the eight resolvers now take `&KmuxConfig`, so a test

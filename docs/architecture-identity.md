@@ -12,7 +12,7 @@ A connection carries two distinct identifiers:
 
 1. **Machine id** — an **Ed25519 keypair**, one per `user@machine`, persisted as
    PKCS#8 (mode 0600) at `$XDG_CONFIG_HOME/kmux/identity.key` and generated lazily
-   on first use (`kmux_protocol::identity::Identity::load_or_create`). The id is
+   on first use (`kmux_sys::identity::Identity::load_or_create`). The id is
    the hex **SHA-256 fingerprint of the public key**. It is shared by the daemon
    and all of that user's client processes on the machine; multiple connections
    from one machine share it. Collision resistance of the hash plus
@@ -150,14 +150,15 @@ surfaced to the GUIs through `AppCore::client_rows` (and `kmux-ffi`'s
 
 ## Key files
 
-- Identity primitives: `crates/kmux-protocol/src/identity.rs` (feature `identity`),
-  `dirs::identity_key_path`.
+- Identity primitives: `crates/kmux-sys/src/identity.rs` (feature `identity`),
+  `kmux_sys::dirs::identity_key_path`.
 - Wire: `crates/kmux-protocol/src/messages/{client,server,session,types}.rs`.
-- Daemon: `crates/kmuxd/src/client_handler/dispatch.rs` (handshake + dispatch),
+- Daemon: `crates/kmuxd/src/client_handler/dispatch/` (handshake in `auth.rs`,
+  the router in `mod.rs`),
   `crates/kmuxd/src/app/{mod.rs,clients.rs,peer_api.rs}`,
   `crates/kmuxd/src/federation/mod.rs`.
 - Client: `crates/kmux-connect/src/{tcp_connect,pipeline,supervisor}.rs`,
-  `crates/kmux-client/src/session_manager/{connection,server_handler}.rs`.
+  `crates/kmux-client/src/session_manager/{connection.rs,server_handler/}`.
 - App + GUI: `crates/kmux-app/src/{mode,core,driver}`,
   `crates/kmux-gtk/src/imp/clients.rs`, `crates/kmux-ffi/src/lib.rs`,
   `kmux-swift/Sources/KmuxApp/ConnectedClientsView.swift`.

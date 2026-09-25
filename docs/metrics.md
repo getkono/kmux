@@ -63,7 +63,7 @@ categorised).
 ## Persistence: the rolling JSONL sink
 
 Path: `$XDG_STATE_HOME/kmux/metrics.jsonl`
-(via `kmux_protocol::dirs::metrics_log_path()`).
+(via `kmux_sys::dirs::metrics_log_path()`).
 
 Every 10 seconds (`METRICS_FLUSH_TICK` in `app/event_loop.rs`) the session
 calls `MetricsStore::flush_sample(conn_id)`, which:

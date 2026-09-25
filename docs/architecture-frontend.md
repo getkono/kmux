@@ -13,7 +13,10 @@ a thin presentation + input layer over it.
 kmux            ENTRYPOINT binary (toolkit-agnostic): shares run_cli; runs the
       ╎         subcommands, else execs the platform desktop app — kmux-gtk on
       ╎ (execs) Linux, the Swift kmux.app on macOS. Depends only on kmux-app.
-kmux-protocol   wire protocol, transport traits, dirs/paths, auth
+kmux-protocol   wire protocol and its codec
+      │
+kmux-sys        the host: dirs/paths (Dirs), identity key, auth token,
+      │         transport listeners/traits, TLS
       │
 kmux-client     MECHANISM: SessionManager, terminal grid model (CellGrid),
       │         transports/bootstrap/SSH/supervisor, key model (key::Key)
@@ -32,7 +35,7 @@ kmux-gtk              kmux-ffi              FRONTENDS
 ```
 
 **Hard rule:** nothing at or below `kmux-app` may depend on a UI toolkit.
-`kmux-app` depends only on `kmux-client` + `kmux-protocol` (plus `clap`/`tabled`
+`kmux-app` depends only on `kmux-client` + `kmux-protocol` + `kmux-sys` (plus `clap`/`tabled`
 for the CLI and `serde`/`toml` for config — none of which are UI toolkits).
 `gtk4`/`gdk`/`cairo` live **only** in `kmux-gtk`. This is enforceable:
 `cargo tree -p kmux-app` shows no `gtk4`.
@@ -199,7 +202,7 @@ Three rules follow, and every new arm has to obey them:
    just the reply forms means a tab, pane or session another GUI touched stays in
    this client's cache until an unrelated refresh happens by.
 2. **Handlers must be idempotent**, because the requester gets both forms. In
-   `session_manager/server_handler.rs` the shared facts (`PaneClosed`,
+   `session_manager/server_handler/mod.rs` the shared facts (`PaneClosed`,
    `SessionClosed`, `TabClosed`) route the two arms to one named handler via an
    or-pattern, and each handler reconciles only when the client still holds state
    for the thing that changed — so the second delivery is a silent no-op rather
@@ -602,7 +605,7 @@ picker-query surface.
   [building-macos.md](building-macos.md#install)).
 - **Windows.** A native Windows frontend would also drive `FrontendDriver`. The
   Unix-only client paths (`flock`, UDS, daemon spawn) need cfg-gating — see
-  `kmux-protocol/src/dirs.rs` for the path resolvers that would gain
+  `kmux-sys/src/dirs.rs` for the path resolvers that would gain
   `#[cfg(windows)]` branches.
 - **GTK render polish.** Partial damage tracking (`queue_draw_area`, keyed off
   `CellGrid::cells_generation`) and same-attr run batching in the Pango

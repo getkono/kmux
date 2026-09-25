@@ -275,7 +275,8 @@ Any of the three fires the shutdown path.
 ## 6. Steady State: Connection Dispatch
 
 `dispatch_session(session, app)` routes each new connection to the correct
-transport handler based on `session.kind`:
+transport handler based on `session.transport` (a `SessionTransport`; only its
+`Quic` variant carries the connection the QUIC handler needs):
 
 ```
 QUIC  → connection::handle_with_io(read, write, quinn_conn, app, ...)
@@ -689,7 +690,7 @@ hard-stop-then-respawn fallback in `kmux daemon restart`.
 
 ## 15. Runtime Directory Layout
 
-All paths resolve via `kmux_protocol::dirs`:
+All paths resolve via `kmux_sys::dirs`:
 
 ```
 $XDG_RUNTIME_DIR/kmux/
