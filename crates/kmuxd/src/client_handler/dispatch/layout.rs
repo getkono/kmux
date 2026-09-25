@@ -2,12 +2,35 @@
 //!
 //! None of them carries a `request_id`, so their replies are a broadcast to
 //! everyone viewing the tab rather than an answer to the sender.
+//!
+//! A federated session's tree lives on its peer, so for one of those the nudge
+//! is forwarded upstream under the peer's word; the peer's `LayoutUpdate` comes
+//! back through the federation feed loop to this session's viewers.
 
-use kmux_protocol::messages::{LayoutNode, LayoutScheme, TabIndex, WordId};
+use kmux_protocol::messages::{
+    ClientMessage, ErrorCode, LayoutNode, LayoutScheme, TabIndex, WordId,
+};
 
 use crate::connection::classify_error;
 
 use super::super::SharedClientState;
+
+/// Forward a layout nudge for a federated session to its peer, telling the
+/// requester when the peer link is gone. Returns `false`, forwarding nothing,
+/// when `word_id` is hosted here.
+fn forwarded_to_peer(
+    state: &mut SharedClientState,
+    word_id: &str,
+    build: impl FnOnce(String) -> ClientMessage,
+) -> bool {
+    if !state.app.is_federated_session(word_id) {
+        return false;
+    }
+    if let Err(e) = state.app.forward_federated_session(word_id, build) {
+        state.error(None, ErrorCode::InternalError, e);
+    }
+    true
+}
 
 /// Handle [`ClientMessage::PaneSwap`](kmux_protocol::messages::ClientMessage::PaneSwap).
 pub(super) async fn on_pane_swap(
@@ -17,6 +40,14 @@ pub(super) async fn on_pane_swap(
     a: u32,
     b: u32,
 ) {
+    if forwarded_to_peer(state, &word_id, |word_id| ClientMessage::PaneSwap {
+        word_id,
+        tab_index,
+        a,
+        b,
+    }) {
+        return;
+    }
     let result = state.app.swap_panes(&word_id, tab_index, a, b).await;
     answer_layout_change(state, &word_id, tab_index, result);
 }
@@ -29,6 +60,14 @@ pub(super) async fn on_set_layout_ratios(
     path: Vec<u32>,
     ratios: Vec<u16>,
 ) {
+    if forwarded_to_peer(state, &word_id, |word_id| ClientMessage::SetLayoutRatios {
+        word_id,
+        tab_index,
+        path: path.clone(),
+        ratios: ratios.clone(),
+    }) {
+        return;
+    }
     let result = state
         .app
         .set_layout_ratios(&word_id, tab_index, &path, &ratios)
@@ -43,6 +82,15 @@ pub(super) async fn on_apply_layout_scheme(
     tab_index: TabIndex,
     scheme: LayoutScheme,
 ) {
+    if forwarded_to_peer(state, &word_id, |word_id| {
+        ClientMessage::ApplyLayoutScheme {
+            word_id,
+            tab_index,
+            scheme,
+        }
+    }) {
+        return;
+    }
     let result = state
         .app
         .apply_layout_scheme(&word_id, tab_index, scheme)
@@ -57,6 +105,13 @@ pub(super) async fn on_set_focus(
     tab_index: TabIndex,
     pane_index: u32,
 ) {
+    if forwarded_to_peer(state, &word_id, |word_id| ClientMessage::SetFocus {
+        word_id,
+        tab_index,
+        pane_index,
+    }) {
+        return;
+    }
     let result = state
         .app
         .set_tab_focus(&word_id, tab_index, pane_index)
@@ -145,6 +200,78 @@ mod tests {
         }
 
         let _ = app.close_session(&word).await;
+    }
+
+    /// A federated session is not in the local map, so handling a layout nudge
+    /// locally would answer "session not found" on every pane click in it. The
+    /// nudge goes to the owning peer under the peer's word instead, and the
+    /// requester hears nothing until the peer's `LayoutUpdate` comes back.
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn a_layout_nudge_in_a_federated_session_is_forwarded_to_its_peer() {
+        let (mut state, mut ctrl_rx) = authenticated_client().await;
+        let (mut upstream, _peer) = state.app.install_channel_peer("fedlocal", "fedremote");
+
+        let nudges = [
+            ClientMessage::SetFocus {
+                word_id: "fedlocal".to_string(),
+                tab_index: 0,
+                pane_index: 1,
+            },
+            ClientMessage::PaneSwap {
+                word_id: "fedlocal".to_string(),
+                tab_index: 0,
+                a: 0,
+                b: 1,
+            },
+            ClientMessage::SetLayoutRatios {
+                word_id: "fedlocal".to_string(),
+                tab_index: 0,
+                path: vec![],
+                ratios: vec![300, 700],
+            },
+            ClientMessage::ApplyLayoutScheme {
+                word_id: "fedlocal".to_string(),
+                tab_index: 0,
+                scheme: LayoutScheme::EvenVertical,
+            },
+        ];
+        for nudge in nudges {
+            assert!(handle_message(&mut state, nudge, &NoopAttacher).await);
+        }
+        assert!(
+            drain(&mut ctrl_rx).is_empty(),
+            "a forwarded nudge must not answer the requester with an error"
+        );
+
+        // `ClientMessage` is not `PartialEq`; its `Debug` form names every field.
+        let forwarded: Vec<ClientMessage> =
+            std::iter::from_fn(|| upstream.try_recv().ok()).collect();
+        let expected = vec![
+            ClientMessage::SetFocus {
+                word_id: "fedremote".to_string(),
+                tab_index: 0,
+                pane_index: 1,
+            },
+            ClientMessage::PaneSwap {
+                word_id: "fedremote".to_string(),
+                tab_index: 0,
+                a: 0,
+                b: 1,
+            },
+            ClientMessage::SetLayoutRatios {
+                word_id: "fedremote".to_string(),
+                tab_index: 0,
+                path: vec![],
+                ratios: vec![300, 700],
+            },
+            ClientMessage::ApplyLayoutScheme {
+                word_id: "fedremote".to_string(),
+                tab_index: 0,
+                scheme: LayoutScheme::EvenVertical,
+            },
+        ];
+        assert_eq!(format!("{forwarded:?}"), format!("{expected:?}"));
     }
 
     #[tokio::test]

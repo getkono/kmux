@@ -63,9 +63,24 @@ pub(super) async fn on_session_close(
         if let Some(handle) = state.attached.remove(pane_id) {
             handle.abort();
         }
-        state.app.detach_from_pane(pane_id, client_id).await;
+        state.app.detach_pane_any(pane_id, client_id).await;
     }
-    match state.app.close_session(&word_id).await {
+    // A federated session is not in the local map: close it on its peer.
+    let result = if state.app.is_federated_session(&word_id) {
+        state
+            .app
+            .close_federated_session(&word_id)
+            .await
+            .map(|()| None)
+            .map_err(|e| (ErrorCode::InternalError, e))
+    } else {
+        state
+            .app
+            .close_session(&word_id)
+            .await
+            .map_err(|e| (classify_error(&e), e.to_string()))
+    };
+    match result {
         Ok(exit_code) => {
             state.send(ServerMessage::SessionClosed {
                 request_id,
@@ -81,7 +96,7 @@ pub(super) async fn on_session_close(
                 .app
                 .broadcast_session_event(SessionEventMsg::SessionClosed { word_id });
         }
-        Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
+        Err((code, message)) => state.error(Some(request_id), code, message),
     }
 }
 
@@ -189,6 +204,98 @@ mod tests {
         assert_eq!(request_id, Some(2));
         assert_eq!(code, ErrorCode::SessionNotFound);
         assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    /// A federated session is not in the local map; closing it has to ask its
+    /// peer, answer the requester only once the peer confirms, and drop the
+    /// session from this hub's listing.
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn session_close_of_a_federated_session_closes_it_on_the_peer() {
+        let (mut state, mut ctrl_rx) = authenticated_client().await;
+        let app = Arc::clone(&state.app);
+        let (mut upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
+
+        let peer_side = async move {
+            let asked = upstream.recv().await.expect("the close went upstream");
+            let ClientMessage::SessionClose {
+                request_id,
+                word_id,
+            } = asked
+            else {
+                panic!("expected SessionClose upstream, got {asked:?}");
+            };
+            assert_eq!(word_id, "fedremote");
+            peer.send(ServerMessage::SessionClosed {
+                request_id,
+                word_id,
+                exit_code: None,
+            })
+            .expect("feed loop is running");
+        };
+        let close = handle_message(
+            &mut state,
+            ClientMessage::SessionClose {
+                request_id: 4,
+                word_id: "fedlocal".to_string(),
+            },
+            &NoopAttacher,
+        );
+        let (keep, ()) = tokio::join!(close, peer_side);
+        assert!(keep);
+
+        match only(drain(&mut ctrl_rx)) {
+            ServerMessage::SessionClosed {
+                request_id,
+                word_id,
+                exit_code,
+            } => {
+                assert_eq!(request_id, 4);
+                assert_eq!(word_id, "fedlocal");
+                assert_eq!(exit_code, None);
+            }
+            other => panic!("expected SessionClosed, got {other:?}"),
+        }
+        assert!(!app.is_federated_session("fedlocal"));
+        assert!(app.list_federated_sessions().is_empty());
+    }
+
+    /// The peer refusing the close reaches the requester as an error carrying
+    /// its request id, and the session stays listed.
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn a_federated_session_close_the_peer_refuses_is_an_error() {
+        let (mut state, mut ctrl_rx) = authenticated_client().await;
+        let app = Arc::clone(&state.app);
+        let (mut upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
+
+        let peer_side = async move {
+            let Some(ClientMessage::SessionClose { request_id, .. }) = upstream.recv().await else {
+                panic!("expected SessionClose upstream");
+            };
+            peer.send(ServerMessage::Error {
+                request_id: Some(request_id),
+                code: ErrorCode::SessionNotFound,
+                message: "session not found: fedremote".to_string(),
+            })
+            .expect("feed loop is running");
+        };
+        let close = handle_message(
+            &mut state,
+            ClientMessage::SessionClose {
+                request_id: 5,
+                word_id: "fedlocal".to_string(),
+            },
+            &NoopAttacher,
+        );
+        let (keep, ()) = tokio::join!(close, peer_side);
+        assert!(keep);
+
+        let (request_id, code, message) = only_error(drain(&mut ctrl_rx));
+        assert_eq!(request_id, Some(5));
+        assert_eq!(code, ErrorCode::InternalError);
+        assert_eq!(message, "session not found: fedremote");
+        assert!(app.is_federated_session("fedlocal"));
     }
 
     #[tokio::test]

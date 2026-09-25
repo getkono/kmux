@@ -1,6 +1,8 @@
 //! Tab lifecycle within a session.
 
-use kmux_protocol::messages::{RequestId, ServerMessage, SessionEventMsg, TabIndex, WordId};
+use kmux_protocol::messages::{
+    ErrorCode, RequestId, ServerMessage, SessionEventMsg, TabIndex, WordId,
+};
 
 use crate::connection::classify_error;
 
@@ -46,6 +48,21 @@ pub(super) async fn on_tab_close(
     word_id: WordId,
     tab_index: TabIndex,
 ) {
+    // A federated session's tabs live on its peer. The peer broadcasts the
+    // resulting `TabClosed` (or `SessionClosed`, for its last tab), which the
+    // federation feed loop relays to this session's viewers, so only the
+    // requester's reply is sent from here.
+    if state.app.is_federated_session(&word_id) {
+        match state.app.close_federated_tab(&word_id, tab_index).await {
+            Ok(()) => state.send(ServerMessage::TabClosed {
+                request_id,
+                word_id,
+                tab_index,
+            }),
+            Err(e) => state.error(Some(request_id), ErrorCode::InternalError, e),
+        }
+        return;
+    }
     match state.app.close_tab(&word_id, tab_index).await {
         Ok(session_closed) => {
             state.send(ServerMessage::TabClosed {
@@ -146,6 +163,59 @@ mod tests {
         assert_eq!(request_id, Some(6));
         assert_eq!(code, ErrorCode::SessionNotFound);
         assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    /// A federated session's tabs live on its peer: the close is asked of the
+    /// peer under its word, and the requester's `TabClosed` waits for it.
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn tab_close_in_a_federated_session_closes_it_on_the_peer() {
+        let (mut state, mut ctrl_rx) = authenticated_client().await;
+        let app = Arc::clone(&state.app);
+        let (mut upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
+
+        let peer_side = async move {
+            let asked = upstream.recv().await.expect("the close went upstream");
+            let ClientMessage::TabClose {
+                request_id,
+                word_id,
+                tab_index,
+            } = asked
+            else {
+                panic!("expected TabClose upstream, got {asked:?}");
+            };
+            assert_eq!((word_id.as_str(), tab_index), ("fedremote", 1));
+            peer.send(ServerMessage::TabClosed {
+                request_id,
+                word_id,
+                tab_index,
+            })
+            .expect("feed loop is running");
+        };
+        let close = handle_message(
+            &mut state,
+            ClientMessage::TabClose {
+                request_id: 8,
+                word_id: "fedlocal".to_string(),
+                tab_index: 1,
+            },
+            &NoopAttacher,
+        );
+        let (keep, ()) = tokio::join!(close, peer_side);
+        assert!(keep);
+
+        match only(drain(&mut ctrl_rx)) {
+            ServerMessage::TabClosed {
+                request_id,
+                word_id,
+                tab_index,
+            } => {
+                assert_eq!(request_id, 8);
+                assert_eq!(word_id, "fedlocal");
+                assert_eq!(tab_index, 1);
+            }
+            other => panic!("expected TabClosed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
