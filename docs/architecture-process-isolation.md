@@ -79,6 +79,13 @@ exchange fd-less, length-prefixed postcard frames concurrently, reusing the
 This is the load-bearing invariant: when the worker dies, the daemon's fd keeps
 the PTY's file description open, so the shell receives no SIGHUP and survives.
 
+Every PTY master in the daemon is close-on-exec (issue #205), so a worker
+inherits no other pane's terminal when it is spawned: the master it gets is the
+one in `Hello`. The worker sets keep-alive on the session it adopts, so its exit
+or crash never signals the shell; the daemon, which forked the shell, is the one
+that reaps it and closes it (process group, `SIGHUP`/`SIGTERM`, then `SIGKILL`
+— `docs/daemon-lifecycle.md` §9.4).
+
 ## Diffs, seqnos, and the mirror
 
 The worker emits **unsequenced** `Diff`/`CursorOnly` events. A daemon-side

@@ -24,7 +24,9 @@ Two earlier primitives were inadequate and have been removed/repurposed:
 - **dup-and-leak on drop** (`PtyProcess` keep-alive) only kept a child alive
   *within the same process*; when the daemon exits the kernel closes every fd,
   so the child got `SIGHUP` anyway. Keep-alive now serves only to suppress
-  `SIGKILL` during the brief handoff overlap.
+  `SIGKILL` during the brief handoff overlap, and no longer leaks a dup at all
+  (issue #205): the successor's `SCM_RIGHTS` copy is what keeps the terminal
+  up.
 - **`/proc/<pid>/fd` reattach** was Linux-only (broken on macOS). `SCM_RIGHTS`
   is POSIX and works identically on Linux and macOS.
 
@@ -76,6 +78,14 @@ the `HandoffMessage` wire format.**
   cannot be `waitpid`-ed, so exit is surfaced by the relay loop's PTY-EOF break
   (`session_diff_loop` → `SessionManager::notify_exited` → `PaneExited`), backed
   by a `kill(pid, 0)` liveness poll (`spawn_kill_poll_task`).
+- **Closing an inherited pane.** The same poll is what close waits on:
+  `SIGHUP`+`SIGTERM` to the process group, then after the grace period
+  `SIGKILL` to the group, confirmed by the poll. `ECHILD` from a `waitpid` on a
+  foreign child is never taken for an exit, so a shell that ignores `SIGTERM`
+  cannot survive the close (issue #205; see `docs/daemon-lifecycle.md` §9.4).
+- **Only the intended fds cross.** Every PTY master is close-on-exec, so the
+  successor `N` inherits nothing by `exec`; it receives exactly the masters sent
+  as `PaneFd`, over `SCM_RIGHTS`.
 - **Seamless seed.** Inherited panes seed their emulator from the snapshot
   **without** the "[kmux: session restored]" separator (`SeedMode::Inherited`);
   respawned panes keep it (`SeedMode::Respawned`).
@@ -122,11 +132,12 @@ Two mechanics are load-bearing:
   `/proc/self/exe` reads back as `"<path> (deleted)"`, which it strips and
   resolves to the replacement so the new code runs rather than `ENOENT`-ing.
 - **The outgoing daemon must fully exit.** Its migrated PTY children are kept
-  alive, so their per-child `waitpid` reaper threads (`spawn_blocking`) never
-  return. `main` therefore detaches blocking threads via
-  `Runtime::shutdown_background()` instead of dropping the runtime (which would
-  *join* those threads and hang the old daemon forever — defeating issue #36's
-  "old daemon completely shut-off"). Process exit reaps the detached threads.
+  alive. They used to park a `waitpid` thread each in the runtime's blocking
+  pool, which dropping the runtime would *join* and hang on forever. Since
+  issue #205 one reaper thread outside the runtime watches every child, so
+  nothing in the pool waits on them; `main` still shuts the runtime down with
+  `Runtime::shutdown_background()` so that no other stuck blocking task can
+  defeat issue #36's "old daemon completely shut-off".
 
 Across a version bump the handoff degrades safely: a `HANDOFF_PROTOCOL_VERSION`
 mismatch → `Decline` → snapshot restore; a `PROTOCOL_VERSION` mismatch is caught

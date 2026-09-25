@@ -255,7 +255,7 @@ Counts are `#[test]` + `#[tokio::test]` functions, measured 2026-08-16.
 | `kmux-connect` | 85 | — | bootstrap racing, daemon lifecycle, token handling, host parsing, attach-gate refusals | `Dirs::rooted` | real sshd handshake, QUIC/TLS on the wire |
 | `kmux-vt-core` | 71 | — | diff engine, scrollback mirror, backend contract | `MockBackend`, `NullEventSink` (`test-util`) | real terminal emulation |
 | `kmux-render` | 54 | — | geometry, packed format, atlas packing, colour, dirty-row parity | — | GPU adapter (skips cleanly, R11) |
-| `kmux-pty` | 34 | — | timeout policy, registry, expect parser, size math | `fixtures::wait_until_dead` (`MockPty` deleted: 114 lines of `tokio::io::duplex` wrapper with no consumer) | `forkpty`, real child spawn, termios |
+| `kmux-pty` | 34 | — | timeout policy, registry, expect parser, size math; process hygiene (issue #205): close-on-exec masters, what a child inherits (fds, cwd, signal state), start failures, the reaper, process-group close, fd count across close cycles | `fixtures::wait_until_dead` (`MockPty` deleted: 114 lines of `tokio::io::duplex` wrapper with no consumer) | termios |
 | `kmux-ghostty` | 26 | — | safe façade, `Send`/`Sync` static assertions, event decode | `NullSink` | libghostty internals |
 | `kmux-ffi` | 17 | — | a few leaf conversions | — | `extern "C"` dispatch, uniffi object lifetimes |
 | `kmux-gtk` | 14 | — | keyval→protocol conversion, accel→action table | — | **all widget construction and the glib main loop** |
@@ -380,7 +380,7 @@ Adding a row is a normative change: justify it in the commit that adds it.
 | `kmuxd::startup::async_main` (396 lines) | A linear boot script — bind, TLS, handoff, listeners, signals. Every split yields a function nothing can assert on without a live daemon. Exempt from R4 | the five `kmuxd/tests/*_e2e.rs` suites |
 | `kmuxd` fork/exec, `SCM_RIGHTS`, daemonize | Cannot run in-process | `handoff_e2e.rs`, `process_isolation_e2e.rs` |
 | `kmux-connect` real sshd handshake | Needs a live sshd in CI | `PeerTarget::Direct`, added precisely so federation is e2e-testable without sshd — see [architecture-federation.md](architecture-federation.md) |
-| `kmux-pty` `forkpty` and real child spawn | Process and tty syscalls | `kmux-pty`'s own tests spawn real children and wait on them with `wait_until_dead`; the `kmuxd` e2e suites spawn real shells |
+| `kmux-pty` `forkpty` and real child spawn | Process and tty syscalls. The pre-`execve` child code (`child.rs`) runs in a forked process, so it is observed only through what the program then sees | `kmux-pty`'s own tests spawn real children, observe them from inside (`ls /dev/fd`, `pwd`, `yes \| head`) and wait on them with `wait_until_dead`; the `kmuxd` e2e suites spawn real shells |
 | `kmux-render` GPU adapter | No adapter on a headless runner | the pure tier always runs; GPU smoke skips cleanly (R11) |
 | `kmux-ghostty-sys` Zig internals and raw bindings | Not Rust; excluded from mutation by `exclude_globs` | `EXPECTED_ABI_VERSION` (R8); `kmux-vt-core`'s diff tests |
 | `KMUX_FFI_ABI_VERSION` bump on a surface change | Not machine-detectable | human review; the generated-bindings diff |
