@@ -276,7 +276,7 @@ mod tests {
         // Enqueue without yielding (`unconstrained` switches off tokio's
         // cooperative budget), so the pane's writer task cannot drain the
         // queue while it fills: exactly `INPUT_QUEUE_CAPACITY` inputs fit.
-        let overflow = tokio::task::unconstrained(async {
+        let fill = tokio::task::unconstrained(async {
             for i in 0..INPUT_QUEUE_CAPACITY {
                 app.write_input(&pane_id, client, vec![b'x'; 4096])
                     .await
@@ -284,8 +284,10 @@ mod tests {
             }
             app.write_input(&pane_id, client, b"one more".to_vec())
                 .await
-        })
-        .await;
+        });
+        let overflow = tokio::time::timeout(std::time::Duration::from_secs(10), fill)
+            .await
+            .expect("enqueueing never waits on the PTY");
         assert!(
             matches!(&overflow, Err(KmuxError::InputQueueFull { pane_id: p }) if *p == pane_id),
             "expected InputQueueFull, got {overflow:?}"
