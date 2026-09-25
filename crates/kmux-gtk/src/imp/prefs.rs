@@ -23,11 +23,26 @@ use super::{Frontend, render};
 /// with nothing logged and nothing shown. Surface it in both channels — a toast
 /// for the person who just clicked, and the log for `kmux client logs`.
 fn persist(shell: &Rc<Shell>, cfg: &config::KmuxConfig) {
-    if let Err(e) = config::save(cfg) {
-        tracing::error!(error = %e, "failed to persist preferences");
-        shell
-            .toasts
-            .add_toast(adw::Toast::new(&format!("Could not save preferences: {e}")));
+    persist_with(cfg, config::save, |message| {
+        shell.toasts.add_toast(adw::Toast::new(message));
+    });
+}
+
+/// [`persist`] with the save and the toast as parameters, so what a failed
+/// write shows the user is testable without a display. Returns whether the
+/// preferences reached disk.
+fn persist_with(
+    cfg: &config::KmuxConfig,
+    save: impl FnOnce(&config::KmuxConfig) -> anyhow::Result<()>,
+    toast: impl FnOnce(&str),
+) -> bool {
+    match save(cfg) {
+        Ok(()) => true,
+        Err(e) => {
+            tracing::error!(error = %e, "failed to persist preferences");
+            toast(&format!("Could not save preferences: {e}"));
+            false
+        }
     }
 }
 
@@ -109,13 +124,14 @@ fn font_row(fe: &Rc<RefCell<Frontend>>, shell: &Rc<Shell>, drawing: &DrawingArea
     let drawing = drawing.clone();
     row.connect_apply(move |row| {
         let spec = row.text().to_string();
-        // Persist the legacy font string first, then re-resolve the full
-        // appearance so any structured `font-*` / `adjust-cell-*` keys in
-        // config.toml still apply on top of the edited family + size.
+        // Persist the legacy font string, then resolve the full appearance from
+        // the edited config value — not from disk — so the new font applies
+        // live even when the save failed, and any structured `font-*` /
+        // `adjust-cell-*` keys still apply on top of the edited family + size.
         let mut cfg = config::load();
         cfg.font = Some(spec);
         persist(&shell, &cfg);
-        let appearance = config::resolve_appearance(None);
+        let appearance = config::resolve_appearance_from(&cfg, None);
         {
             let mut f = fe.borrow_mut();
             f.metrics = render::Metrics::measure(&drawing.pango_context(), &appearance);
@@ -186,4 +202,59 @@ fn cursor_blink_row(
         drawing.queue_draw();
     });
     row
+}
+
+#[cfg(test)]
+mod tests {
+    use std::cell::RefCell;
+
+    use kmux_app::config::KmuxConfig;
+
+    use super::persist_with;
+
+    /// A failed write used to be discarded: the setting looked applied and
+    /// reverted on restart. The person who changed it is told why.
+    #[test]
+    fn a_failed_save_is_shown_to_the_user() {
+        let shown = RefCell::new(Vec::new());
+        let saved = persist_with(
+            &KmuxConfig::default(),
+            |_| Err(anyhow::anyhow!("read-only file system")),
+            |message| shown.borrow_mut().push(message.to_string()),
+        );
+        assert!(!saved);
+        assert_eq!(
+            shown.into_inner(),
+            ["Could not save preferences: read-only file system"]
+        );
+    }
+
+    #[test]
+    fn a_successful_save_shows_nothing() {
+        let saved = persist_with(
+            &KmuxConfig::default(),
+            |_| Ok(()),
+            |message| panic!("nothing to report, got {message:?}"),
+        );
+        assert!(saved);
+    }
+
+    /// The save is handed the config being persisted, not a reloaded one.
+    #[test]
+    fn the_edited_config_is_what_gets_saved() {
+        let cfg = KmuxConfig {
+            font: Some("Iosevka 14".to_string()),
+            ..KmuxConfig::default()
+        };
+        let seen = RefCell::new(None);
+        persist_with(
+            &cfg,
+            |c| {
+                *seen.borrow_mut() = c.font.clone();
+                Ok(())
+            },
+            |_| {},
+        );
+        assert_eq!(seen.into_inner().as_deref(), Some("Iosevka 14"));
+    }
 }
