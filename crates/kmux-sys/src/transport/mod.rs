@@ -181,10 +181,21 @@ mod listener {
         }
 
         /// Run the handshake, giving up after `timeout`.
+        ///
+        /// # Errors
+        ///
+        /// [`AcceptError::HandshakeTimeout`] when it takes longer than
+        /// `timeout`, or the transport's own error when it fails.
         pub async fn establish(self, timeout: Duration) -> Result<IncomingSession, AcceptError> {
             tokio::time::timeout(timeout, self.handshake)
                 .await
                 .map_err(|_| AcceptError::HandshakeTimeout(timeout))?
+        }
+    }
+
+    impl std::fmt::Debug for PendingSession {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("PendingSession").finish_non_exhaustive()
         }
     }
 

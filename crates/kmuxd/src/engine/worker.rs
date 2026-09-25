@@ -245,7 +245,7 @@ impl WorkerEngine {
             PaneInput::Keys(events) => WorkerRequest::Keys { events },
             PaneInput::Paste(data) => WorkerRequest::Paste { data },
         };
-        self.input_tx.try_send(req).map_err(rejected)
+        self.input_tx.try_send(req).map_err(|e| rejected(&e))
     }
 
     pub(super) fn set_capabilities(&self, kitty_graphics: bool, kitty_keyboard: bool) {

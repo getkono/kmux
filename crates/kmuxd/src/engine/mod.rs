@@ -39,7 +39,7 @@ pub const INPUT_QUEUE_CAPACITY: usize = 256;
 pub(super) type QueueRejected = TrySendError<()>;
 
 /// Drop the payload a failed `try_send` hands back, keeping only why it failed.
-pub(super) fn rejected<T>(e: TrySendError<T>) -> QueueRejected {
+pub(super) fn rejected<T>(e: &TrySendError<T>) -> QueueRejected {
     match e {
         TrySendError::Full(_) => TrySendError::Full(()),
         TrySendError::Closed(_) => TrySendError::Closed(()),

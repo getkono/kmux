@@ -101,7 +101,7 @@ fn forward_vt_event(out: &OutboundTx, msg: ServerMessage) {
 }
 
 fn spawn_authenticated_forwarders(
-    app: Arc<ServerApp>,
+    app: &ServerApp,
     ctrl_tx: OutboundTx,
     metrics: Arc<ConnectionMetrics>,
     liveness: Arc<Liveness>,
@@ -185,7 +185,7 @@ async fn write_outbound<W: AsyncWrite + Unpin>(
     write_timeout: Duration,
 ) {
     let mut batch: Vec<ServerMessage> = Vec::new();
-    'writer: while let Some(first) = out_rx.recv().await {
+    while let Some(first) = out_rx.recv().await {
         batch.clear();
         batch.push(first);
         for _ in 1..MAX_WRITE_BATCH {
@@ -196,58 +196,67 @@ async fn write_outbound<W: AsyncWrite + Unpin>(
         }
         // The batch is off the queue: a lagged pane stream may resync.
         out_rx.mark_drained();
-        for msg in batch.drain(..) {
-            let bytes = match encode_server(&msg) {
-                Ok(bytes) => bytes,
-                Err(e) => {
-                    warn!("encode error: {e}");
-                    continue;
-                }
-            };
-            crate::capture::record(msg.category(), &bytes);
-            let write = write_frame_compressed_into(&mut writer, &bytes, comp.compressor());
-            match tokio::time::timeout(write_timeout, write).await {
-                Ok(Ok(wire_len)) => {
-                    metrics
-                        .bytes_out
-                        .fetch_add(wire_len as u64, Ordering::Relaxed);
-                    // What the same frame would have cost uncompressed
-                    // (length prefix + codec tag + payload).
-                    metrics
-                        .bytes_out_uncompressed
-                        .fetch_add(5 + bytes.len() as u64, Ordering::Relaxed);
-                    metrics.msgs_out.fetch_add(1, Ordering::Relaxed);
-                }
-                // A write failure leaves only whole frames on the wire (each
-                // frame is written in full before the next); the client
-                // reconnects + resyncs.
-                Ok(Err(_)) => {
-                    closer.close(CloseReason::WriteFailed);
-                    break 'writer;
-                }
-                Err(_) => {
-                    warn!(?write_timeout, "frame write timed out; peer is not reading");
-                    closer.close(CloseReason::WriteTimeout);
-                    break 'writer;
-                }
-            }
-        }
-        match tokio::time::timeout(write_timeout, kmux_protocol::flush(&mut writer)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(_)) => {
-                closer.close(CloseReason::WriteFailed);
-                break;
-            }
-            Err(_) => {
-                warn!(?write_timeout, "flush timed out; peer is not reading");
-                closer.close(CloseReason::WriteTimeout);
-                break;
-            }
+        if let Err(reason) =
+            write_batch(&mut writer, &mut batch, &metrics, &comp, write_timeout).await
+        {
+            closer.close(reason);
+            break;
         }
     }
     // Shutting a TLS stream down writes close_notify, which a stalled peer
     // would block too.
     let _ = tokio::time::timeout(write_timeout, writer.shutdown()).await;
+}
+
+/// Write every message in `batch` as its own frame, then flush once. Each
+/// write and the flush must finish within `write_timeout`.
+async fn write_batch<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    batch: &mut Vec<ServerMessage>,
+    metrics: &ConnectionMetrics,
+    comp: &OutboundCompression,
+    write_timeout: Duration,
+) -> Result<(), CloseReason> {
+    for msg in batch.drain(..) {
+        let bytes = match encode_server(&msg) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("encode error: {e}");
+                continue;
+            }
+        };
+        crate::capture::record(msg.category(), &bytes);
+        // A failed write leaves only whole frames on the wire (each frame is
+        // written in full before the next); the client reconnects + resyncs.
+        let write = write_frame_compressed_into(&mut *writer, &bytes, comp.compressor());
+        let wire_len = within(write_timeout, write).await?;
+        metrics
+            .bytes_out
+            .fetch_add(wire_len as u64, Ordering::Relaxed);
+        // What the same frame would have cost uncompressed (length prefix +
+        // codec tag + payload).
+        metrics
+            .bytes_out_uncompressed
+            .fetch_add(5 + bytes.len() as u64, Ordering::Relaxed);
+        metrics.msgs_out.fetch_add(1, Ordering::Relaxed);
+    }
+    within(write_timeout, kmux_protocol::flush(writer)).await
+}
+
+/// Await one write under `timeout`: a stall is [`CloseReason::WriteTimeout`],
+/// a failure [`CloseReason::WriteFailed`].
+async fn within<T, E>(
+    timeout: Duration,
+    write: impl Future<Output = Result<T, E>>,
+) -> Result<T, CloseReason> {
+    match tokio::time::timeout(timeout, write).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(CloseReason::WriteFailed),
+        Err(_) => {
+            warn!(?timeout, "write timed out; peer is not reading");
+            Err(CloseReason::WriteTimeout)
+        }
+    }
 }
 
 /// Generic client session handler shared by QUIC and TCP connections.
@@ -357,7 +366,7 @@ pub async fn run_client_session<R, W, A, F>(
                         if !was_authenticated && state.authenticated {
                             liveness.on_authenticated();
                             authenticated_tasks = Some(spawn_authenticated_forwarders(
-                                app.clone(),
+                                &app,
                                 state.ctrl_tx.clone(),
                                 Arc::clone(&metrics),
                                 Arc::clone(&liveness),

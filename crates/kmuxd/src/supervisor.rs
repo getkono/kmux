@@ -59,15 +59,13 @@ where
     let mut consecutive_failures = 0u32;
     loop {
         let started = Instant::now();
-        let payload = match tokio::spawn(make()).await {
+        let outcome = match tokio::spawn(make()).await {
             Ok(()) => return restarts,
-            Err(err) => match err.try_into_panic() {
-                Ok(payload) => payload,
-                Err(_) => {
-                    warn!(task = name, "supervised task was cancelled");
-                    return restarts;
-                }
-            },
+            Err(err) => err.try_into_panic(),
+        };
+        let Ok(payload) = outcome else {
+            warn!(task = name, "supervised task was cancelled");
+            return restarts;
         };
         if started.elapsed() >= STABLE_RUN {
             consecutive_failures = 0;

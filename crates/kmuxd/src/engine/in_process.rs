@@ -99,7 +99,7 @@ impl InProcessEngine {
     }
 
     pub(super) fn enqueue_input(&self, input: PaneInput) -> Result<(), QueueRejected> {
-        self.input_tx.try_send(input).map_err(rejected)
+        self.input_tx.try_send(input).map_err(|e| rejected(&e))
     }
 
     pub(super) fn abort_relay_task(&mut self) -> JoinHandle<()> {

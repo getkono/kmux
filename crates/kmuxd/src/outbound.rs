@@ -329,47 +329,18 @@ pub async fn forward_pane_stream<R, F>(
                     }
                 }
             }
-            Flow::Lagged { mut dropped } => {
+            Flow::Lagged { dropped } => {
                 tokio::select! {
                     biased;
                     () = out.data_room() => {
                         // The snapshot supersedes everything already waiting.
                         replay = Vec::new().into_iter();
-                        loop {
-                            match client_rx.try_recv() {
-                                Ok(_) => dropped += 1,
-                                Err(TryRecvError::Empty) => break,
-                                Err(TryRecvError::Disconnected) => return,
+                        match resync_lagged(&pane_id, &mut client_rx, &out, &resync, dropped).await {
+                            Some((flow, covered)) => {
+                                covered_through = covered.or(covered_through);
+                                flow
                             }
-                        }
-                        let Some((snapshot, seqno)) = resync().await else {
-                            let _ = out.send(ServerMessage::Lagged {
-                                pane_id: pane_id.clone(),
-                                missed_count: dropped,
-                            });
-                            return;
-                        };
-                        let reset = ServerMessage::SyncReset { pane_id: pane_id.clone() };
-                        let snapshot = ServerMessage::TerminalSnapshot {
-                            pane_id: pane_id.clone(),
-                            snapshot: Arc::new(snapshot),
-                            seqno,
-                            sent_at_ms: epoch_millis(),
-                        };
-                        match out.try_send_data(reset).and_then(|()| out.try_send_data(snapshot)) {
-                            Ok(()) => {
-                                info!(pane_id, dropped, "pane stream resynced after lag");
-                                covered_through = Some(seqno);
-                                Flow::Live
-                            }
-                            Err(DataRejected::Closed) => return,
-                            // Refilled meanwhile: a later resync starts over
-                            // with another `SyncReset`. Yield first, so a
-                            // queue that stays full cannot spin this task.
-                            Err(DataRejected::Congested) => {
-                                tokio::task::yield_now().await;
-                                Flow::Lagged { dropped }
-                            }
+                            None => return,
                         }
                     }
                     msg = client_rx.recv() => match msg {
@@ -379,6 +350,64 @@ pub async fn forward_pane_stream<R, F>(
                 }
             }
         };
+    }
+}
+
+/// Recover a lagged pane stream once the queue has room: discard what the lag
+/// left waiting, then send `SyncReset` + a fresh `TerminalSnapshot`. Returns
+/// the flow to continue with and, on success, the seqno the snapshot covers;
+/// `None` when the stream is over (the connection closed, the pane is gone,
+/// or it cannot be snapshotted and was sent `Lagged` instead).
+async fn resync_lagged<R, F>(
+    pane_id: &str,
+    client_rx: &mut mpsc::Receiver<ServerMessage>,
+    out: &OutboundTx,
+    resync: &R,
+    mut dropped: u64,
+) -> Option<(Flow, Option<SequenceNo>)>
+where
+    R: Fn() -> F,
+    F: Future<Output = Option<(GridSnapshot, SequenceNo)>>,
+{
+    loop {
+        match client_rx.try_recv() {
+            Ok(_) => dropped += 1,
+            Err(TryRecvError::Empty) => break,
+            Err(TryRecvError::Disconnected) => return None,
+        }
+    }
+    let Some((snapshot, seqno)) = resync().await else {
+        let _ = out.send(ServerMessage::Lagged {
+            pane_id: pane_id.to_string(),
+            missed_count: dropped,
+        });
+        return None;
+    };
+    let reset = ServerMessage::SyncReset {
+        pane_id: pane_id.to_string(),
+    };
+    let snapshot = ServerMessage::TerminalSnapshot {
+        pane_id: pane_id.to_string(),
+        snapshot: Arc::new(snapshot),
+        seqno,
+        sent_at_ms: epoch_millis(),
+    };
+    match out
+        .try_send_data(reset)
+        .and_then(|()| out.try_send_data(snapshot))
+    {
+        Ok(()) => {
+            info!(pane_id, dropped, "pane stream resynced after lag");
+            Some((Flow::Live, Some(seqno)))
+        }
+        Err(DataRejected::Closed) => None,
+        // Refilled meanwhile: a later resync starts over with another
+        // `SyncReset`. Yield first, so a queue that stays full cannot spin
+        // the stream's task.
+        Err(DataRejected::Congested) => {
+            tokio::task::yield_now().await;
+            Some((Flow::Lagged { dropped }, None))
+        }
     }
 }
 
