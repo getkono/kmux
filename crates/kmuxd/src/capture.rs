@@ -173,12 +173,22 @@ fn encode(category: MessageCategory, payload: &[u8]) -> Option<Vec<u8>> {
 pub fn record(category: MessageCategory, payload: &[u8]) {
     let Some(lock) = sink() else { return };
     let Ok(mut guard) = lock.lock() else { return };
-    let Some(capture) = guard.as_mut() else {
+    append_or_stop(&mut guard, category, payload);
+}
+
+/// Append to the capture in `slot`, and empty the slot on the first append
+/// that fails, so nothing is written after a failure.
+fn append_or_stop<F: CaptureFile>(
+    slot: &mut Option<Capture<F>>,
+    category: MessageCategory,
+    payload: &[u8],
+) {
+    let Some(capture) = slot.as_mut() else {
         return;
     };
     if let Err(stop) = capture.append(category, payload) {
         tracing::error!(%stop, "capture stopped");
-        *guard = None;
+        *slot = None;
     }
 }
 
@@ -302,6 +312,46 @@ mod tests {
             .append(MessageCategory::Control, b"payload")
             .expect_err("the disk fills mid-record");
         assert!(matches!(stop, CaptureStop::Torn { .. }), "{stop}");
+    }
+
+    /// The first failed append stops the capture: later frames are not
+    /// written, even once the disk has room again.
+    #[test]
+    fn a_failed_append_stops_the_capture() {
+        let mut slot = Some(
+            Capture::new(FullDisk {
+                bytes: Vec::new(),
+                room: 3,
+                truncate_fails: false,
+            })
+            .expect("opens"),
+        );
+
+        append_or_stop(&mut slot, MessageCategory::Control, b"payload");
+        assert!(slot.is_none(), "a failed append stops the capture");
+
+        append_or_stop(&mut slot, MessageCategory::Control, b"later");
+        assert!(slot.is_none(), "a stopped capture stays stopped");
+    }
+
+    /// A capture that keeps succeeding keeps capturing.
+    #[test]
+    fn a_successful_append_keeps_the_capture() {
+        let mut slot = Some(
+            Capture::new(FullDisk {
+                bytes: Vec::new(),
+                room: usize::MAX,
+                truncate_fails: false,
+            })
+            .expect("opens"),
+        );
+
+        append_or_stop(&mut slot, MessageCategory::Control, b"one");
+        append_or_stop(&mut slot, MessageCategory::Control, b"two");
+
+        let mut want = encode(MessageCategory::Control, b"one").expect("encodes");
+        want.extend(encode(MessageCategory::Control, b"two").expect("encodes"));
+        assert_eq!(slot.expect("still capturing").file.bytes, want);
     }
 
     /// Concatenated records must be walkable start to finish using only the
