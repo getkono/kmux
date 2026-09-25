@@ -128,10 +128,17 @@ fn null_terminated(strings: &[CString]) -> Vec<*const c_char> {
 /// async-signal-safe.
 fn fd_sweep_end() -> c_int {
     // SAFETY: sysconf has no preconditions.
-    let limit = unsafe { libc::sysconf(libc::_SC_OPEN_MAX) };
-    c_int::try_from(limit)
-        .unwrap_or(MAX_FD_SWEEP)
-        .clamp(0, MAX_FD_SWEEP)
+    sweep_end_for(unsafe { libc::sysconf(libc::_SC_OPEN_MAX) })
+}
+
+/// Where the sweep stops for an `_SC_OPEN_MAX` of `limit`. A limit `sysconf`
+/// cannot report (`-1`, or an unlimited value) sweeps up to the cap rather
+/// than closing nothing.
+fn sweep_end_for(limit: libc::c_long) -> c_int {
+    match c_int::try_from(limit) {
+        Ok(limit) if limit > 0 => limit.min(MAX_FD_SWEEP),
+        _ => MAX_FD_SWEEP,
+    }
 }
 
 /// Undo what the daemon did to its own signal state, which `execve` would
@@ -212,6 +219,20 @@ fn format_decimal(mut n: u32, buf: &mut [u8; 10]) -> &[u8] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sweep_end_follows_the_limit_up_to_the_cap() {
+        for (limit, end) in [
+            (256, 256),
+            (MAX_FD_SWEEP.into(), MAX_FD_SWEEP),
+            (1_048_576, MAX_FD_SWEEP),
+            (libc::c_long::MAX, MAX_FD_SWEEP),
+            (-1, MAX_FD_SWEEP),
+            (0, MAX_FD_SWEEP),
+        ] {
+            assert_eq!(sweep_end_for(limit), end, "{limit}");
+        }
+    }
 
     #[test]
     fn format_decimal_renders_every_digit_count() {

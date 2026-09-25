@@ -2,7 +2,7 @@ use std::os::unix::io::{IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::pty::{ForkptyResult, forkpty};
-use nix::sys::signal::Signal;
+use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
 use nix::unistd::Pid;
 use tokio::sync::watch;
 
@@ -52,9 +52,24 @@ impl PtyProcess {
         // child exits.
         let reaper = reaper()?;
 
+        // Block every signal on this thread across the fork, so the child
+        // starts with them blocked: one sent to it before it has reset its
+        // dispositions stays pending instead of running a daemon handler it
+        // inherited, and is delivered once `ChildPlan::exec` clears the mask.
+        let mut previous = SigSet::empty();
+        pthread_sigmask(
+            SigmaskHow::SIG_BLOCK,
+            Some(&SigSet::all()),
+            Some(&mut previous),
+        )
+        .map_err(KmuxError::Pty)?;
         // SAFETY: the child branch calls only `ChildPlan::exec`, which makes
         // async-signal-safe calls on memory prepared before the fork.
-        let fork_result = unsafe { forkpty(Some(&winsize), None) }.map_err(KmuxError::Pty)?;
+        let fork_result = unsafe { forkpty(Some(&winsize), None) };
+        if !matches!(fork_result, Ok(ForkptyResult::Child)) {
+            let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous), None);
+        }
+        let fork_result = fork_result.map_err(KmuxError::Pty)?;
 
         match fork_result {
             // SAFETY: we are the freshly forked child.
