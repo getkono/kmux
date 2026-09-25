@@ -92,11 +92,7 @@ async fn assert_dsr_roundtrip(isolated: bool) {
     )
     .await;
 
-    // The round-trip completes in tens of milliseconds when it works; this
-    // deadline only bounds how long a *broken* one takes to report. Ten seconds
-    // was tight enough to fail on a fully loaded machine while the child was
-    // still starting, which is a false failure, not a slow one.
-    let text = grid_text_until(&mut client, &pane, Duration::from_secs(30), |t| {
+    let text = grid_text_until(&mut client, &pane, harness::E2E_TIMEOUT, |t| {
         t.contains("[1;1R")
     })
     .await;

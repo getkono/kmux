@@ -451,7 +451,7 @@ mod tests {
 
     use super::*;
     use crate::app::ClientSender;
-    use crate::term_state::new_term_state;
+    use crate::fixtures::fixture_term_state;
     use kmux_protocol::messages::{CursorState, TermModes, TerminalDiff};
     use tokio::sync::mpsc;
 
@@ -468,27 +468,6 @@ mod tests {
             seqno: SequenceNo(1),
             sent_at_ms: 0,
         }
-    }
-
-    fn test_term_state() -> Arc<Mutex<TermState>> {
-        use crate::backend::{
-            BackendConfig, BackendSize, CapabilityHandles, DEFAULT_SCROLLBACK, NullEventSink,
-        };
-        use std::sync::Arc;
-        Arc::new(Mutex::new(new_term_state(BackendConfig {
-            size: BackendSize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            capabilities: CapabilityHandles {
-                kitty_graphics: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-                kitty_keyboard: Arc::new(std::sync::atomic::AtomicBool::new(false)),
-            },
-            events: Arc::new(NullEventSink),
-            scrollback: DEFAULT_SCROLLBACK,
-        })))
     }
 
     #[test]
@@ -513,7 +492,7 @@ mod tests {
             },
         );
 
-        let ts = test_term_state();
+        let ts = fixture_term_state(24, 80);
         broadcast_to_clients(
             "eagle/0",
             &dummy_update("eagle/0"),
@@ -551,7 +530,7 @@ mod tests {
             },
         );
 
-        let ts = test_term_state();
+        let ts = fixture_term_state(24, 80);
         broadcast_to_clients(
             "eagle/0",
             &dummy_update("eagle/0"),
@@ -586,7 +565,7 @@ mod tests {
             },
         );
 
-        let ts = test_term_state();
+        let ts = fixture_term_state(24, 80);
         broadcast_to_clients(
             "eagle/0",
             &dummy_update("eagle/0"),
@@ -632,7 +611,7 @@ mod tests {
             },
         );
 
-        let ts = test_term_state();
+        let ts = fixture_term_state(24, 80);
         let scrollback = Arc::new(Mutex::new(DiffBuffer::new(256 * 1024)));
         let seqno_counter = Arc::new(AtomicU64::new(0));
         let mut prev_cursor = CursorState::default();
@@ -742,7 +721,7 @@ mod tests {
             },
         );
 
-        let ts = test_term_state();
+        let ts = fixture_term_state(24, 80);
         let scrollback = Arc::new(Mutex::new(DiffBuffer::new(256 * 1024)));
         let seqno_counter = Arc::new(AtomicU64::new(0));
         let mut prev_cursor = CursorState::default();
@@ -866,7 +845,7 @@ mod tests {
             },
         );
 
-        let ts = test_term_state();
+        let ts = fixture_term_state(24, 80);
         let expected = ts.lock().unwrap().snapshot().live_digest();
         broadcast_grid_digest(
             "eagle/0",
@@ -913,7 +892,7 @@ mod tests {
             },
         );
 
-        let ts = test_term_state();
+        let ts = fixture_term_state(24, 80);
         broadcast_grid_digest(
             "eagle/0",
             &clients,
@@ -966,7 +945,7 @@ mod tests {
             );
         }
 
-        let ts = test_term_state();
+        let ts = fixture_term_state(24, 80);
         broadcast_to_clients(
             "eagle/0",
             &dummy_update("eagle/0"),
@@ -1013,7 +992,7 @@ mod tests {
             },
         );
 
-        let ts = test_term_state();
+        let ts = fixture_term_state(24, 80);
         broadcast_to_clients(
             "eagle/0",
             &dummy_update("eagle/0"),

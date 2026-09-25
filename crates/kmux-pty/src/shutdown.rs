@@ -106,13 +106,10 @@ mod tests {
 
         graceful_shutdown_nowait(pid, Some(Duration::from_millis(200)));
 
-        // Give the background task time to send SIGTERM and reap
-        tokio::time::sleep(Duration::from_millis(400)).await;
-
-        // Process should be dead: kill(pid, 0) returns ESRCH
-        let alive = kill(pid, None).is_ok();
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        let died = crate::fixtures::wait_until_dead(pid, deadline).await;
         assert!(
-            !alive,
+            died,
             "process should be dead after graceful_shutdown_nowait"
         );
     }

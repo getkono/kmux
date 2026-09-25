@@ -2,7 +2,7 @@
 //!
 //! Each of these suites used to carry its own copy of the same six or seven
 //! helpers, and — more consequentially — its own `ENV_LOCK`: a process-global
-//! mutex serialising `std::env::set_var` of the `XDG_*` variables so two tests
+//! mutex serialising writes to the process-wide `XDG_*` variables so two tests
 //! could not point at the same runtime directory at once.
 //!
 //! That lock never actually bought isolation. It serialises tests *within one
@@ -30,7 +30,9 @@ use std::time::{Duration, Instant};
 
 use kmux_client::connect::ConnectResult;
 use kmux_client::tcp_connect::connect_uds;
-use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ServerMessage, TermSize};
+use kmux_protocol::messages::{
+    ClientCapabilities, ClientMessage, PeerTarget, ServerMessage, TermSize,
+};
 use kmux_sys::dirs::Dirs;
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
@@ -44,6 +46,17 @@ pub const SIZE: TermSize = TermSize {
     pixel_width: 0,
     pixel_height: 0,
 };
+
+/// The bound on every e2e wait: a daemon coming up, a reply arriving, a child
+/// process writing its pid, a peer link opening.
+///
+/// One value, because these are all the same kind of wait — something that
+/// normally takes milliseconds, bounded only so a *broken* path reports instead
+/// of hanging. The bound is therefore generous: it costs time only when the test
+/// is already failing, and a tight one fails a correct daemon on a loaded CI
+/// runner (the DSR round-trip in `query_response_e2e` did exactly that at 10 s).
+/// A shorter bound needs a comment saying why at its call site.
+pub const E2E_TIMEOUT: Duration = Duration::from_secs(30);
 
 // ─── Sandbox ─────────────────────────────────────────────────────────────────
 
@@ -69,7 +82,7 @@ impl Sandbox {
         // A child resolving through `XDG_RUNTIME_DIR` treats the base as
         // someone else's (systemd's, normally) and creates only the profile
         // directory inside it -- so if nothing has made it, the daemon fails to
-        // start and the only symptom is a twenty-second wait.
+        // start and the only symptom is a full [`E2E_TIMEOUT`] wait.
         dirs.runtime_dir().expect("sandbox runtime dir");
         dirs.config_dir().expect("sandbox config dir");
         dirs.state_dir().expect("sandbox state dir");
@@ -190,18 +203,21 @@ pub fn read_pid_file(path: &Path, timeout: Duration) -> Option<i32> {
 
 // ─── The daemon under test ───────────────────────────────────────────────────
 
-/// Build the `kmux-vt-worker` binary next to `kmuxd` if it is not there yet.
+/// The `kmux-vt-worker` binary, which must already be built next to `kmuxd`.
+///
+/// `cargo test` builds only this package's binaries, and the worker is another
+/// package, so `mise run test` builds it first (the `build-vt-worker` task).
+/// The harness only locates it: building from inside a test needed cargo at
+/// test time and contended for the target-dir lock with the run it was part of.
 #[must_use]
-pub fn ensure_worker_binary(kmuxd_exe: &Path) -> PathBuf {
-    let worker = kmuxd_exe.with_file_name("kmux-vt-worker");
-    if !worker.exists() {
-        let status = Command::new(env!("CARGO"))
-            .args(["build", "-p", "kmux-vt-worker"])
-            .status()
-            .expect("run cargo build -p kmux-vt-worker");
-        assert!(status.success(), "failed to build kmux-vt-worker");
-    }
-    assert!(worker.exists(), "kmux-vt-worker not found at {worker:?}");
+pub fn worker_binary() -> PathBuf {
+    let worker = Path::new(env!("CARGO_BIN_EXE_kmuxd")).with_file_name("kmux-vt-worker");
+    assert!(
+        worker.exists(),
+        "kmux-vt-worker not found at {worker:?}. The process-isolation e2e tests \
+         need it built first: run `mise run test`, or `cargo build -p kmux-vt-worker` \
+         before `cargo test`."
+    );
     worker
 }
 
@@ -236,7 +252,7 @@ impl<'a> Daemon<'a> {
     /// exec. Passed to the child, not exported to this process.
     #[must_use]
     pub fn isolated(mut self) -> Self {
-        let worker = ensure_worker_binary(&self.exe);
+        let worker = worker_binary();
         self.isolation = Some("process");
         self.extra_env
             .push(("KMUX_VT_WORKER_BIN".to_string(), worker));
@@ -291,7 +307,7 @@ impl<'a> Daemon<'a> {
 /// `exclude` if given. Returns its pid.
 pub async fn wait_for_daemon(sandbox: &Sandbox, exclude: Option<u32>) -> Option<u32> {
     let socket = sandbox.socket_path();
-    let deadline = Instant::now() + Duration::from_secs(20);
+    let deadline = Instant::now() + E2E_TIMEOUT;
     loop {
         if let Some(status) = kmux_client::daemon::query_daemon_at(&socket).await
             && Some(status.pid) != exclude
@@ -305,12 +321,16 @@ pub async fn wait_for_daemon(sandbox: &Sandbox, exclude: Option<u32>) -> Option<
     }
 }
 
-/// The auth token a running daemon published into `sandbox`.
-pub async fn daemon_token(sandbox: &Sandbox) -> String {
+/// What a running daemon in `sandbox` reports on its control socket.
+pub async fn daemon_status(sandbox: &Sandbox) -> kmux_client::daemon::DaemonStatus {
     kmux_client::daemon::query_daemon_at(&sandbox.socket_path())
         .await
         .expect("daemon status")
-        .token
+}
+
+/// The auth token a running daemon published into `sandbox`.
+pub async fn daemon_token(sandbox: &Sandbox) -> String {
+    daemon_status(sandbox).await.token
 }
 
 // ─── A connected client ──────────────────────────────────────────────────────
@@ -362,7 +382,7 @@ pub async fn connect_client_at(socket: &Path, token: &str) -> Client {
         ConnectResult::Failed(e) => panic!("UDS connect failed: {e}"),
     };
     let auth = loop {
-        match recv_until(&mut rx, Duration::from_secs(5), |m| {
+        match recv_until(&mut rx, E2E_TIMEOUT, |m| {
             matches!(
                 m,
                 ServerMessage::AuthChallenge { .. } | ServerMessage::AuthResult { .. }
@@ -419,7 +439,7 @@ pub async fn create_and_attach(
             size: SIZE,
         })
         .expect("send SessionCreate");
-    let created = recv_until(&mut client.rx, Duration::from_secs(5), |m| {
+    let created = recv_until(&mut client.rx, E2E_TIMEOUT, |m| {
         matches!(m, ServerMessage::SessionCreated { .. })
     })
     .await
@@ -437,4 +457,103 @@ pub async fn create_and_attach(
         })
         .expect("send Attach");
     pane_id
+}
+
+// ─── Federation ──────────────────────────────────────────────────────────────
+
+/// Two sandboxed daemons for the federation suite: a *remote* reachable over
+/// TCP+TLS and a *local* hub the mock GUI talks to over its UDS.
+///
+/// Field order is drop order: `cleanup` SIGKILLs both daemons (and whatever
+/// else a test tracked) before the sandboxes delete the trees they run in.
+pub struct Federation {
+    pub cleanup: Cleanup,
+    pub remote: Sandbox,
+    pub local: Sandbox,
+    pub remote_pid: u32,
+    pub local_pid: u32,
+    /// The remote's auth token — what `OpenPeer` presents upstream.
+    pub remote_token: String,
+    /// The remote's ephemeral TCP+TLS port, the federation endpoint.
+    pub remote_tcp: u16,
+    /// The hub's auth token — what a GUI presents to the local daemon.
+    pub local_token: String,
+}
+
+impl Federation {
+    /// Start both daemons and read the tokens and port a test needs.
+    pub async fn spawn_pair() -> Self {
+        let cleanup = Cleanup::default();
+        let remote = Sandbox::new();
+        let local = Sandbox::new();
+
+        let remote_pid = Daemon::new(&remote).spawn(None).await;
+        cleanup.track(remote_pid as i32);
+        let remote_status = daemon_status(&remote).await;
+        assert_ne!(
+            remote_status.tcp_port, 0,
+            "remote daemon must expose an ephemeral TCP+TLS port for federation"
+        );
+
+        let local_pid = Daemon::new(&local).spawn(None).await;
+        cleanup.track(local_pid as i32);
+        let local_token = daemon_token(&local).await;
+
+        Self {
+            cleanup,
+            remote,
+            local,
+            remote_pid,
+            local_pid,
+            remote_token: remote_status.token,
+            remote_tcp: remote_status.tcp_port,
+            local_token,
+        }
+    }
+
+    /// The remote as a direct peer target, authenticating with `token`.
+    #[must_use]
+    pub fn remote_target(&self, token: &str) -> PeerTarget {
+        PeerTarget::Direct {
+            host: "127.0.0.1".into(),
+            port: self.remote_tcp,
+            token: token.to_string(),
+            accept_invalid_certs: true,
+        }
+    }
+
+    /// A GUI connected to the hub.
+    pub async fn connect_gui(&self) -> Client {
+        connect_client(&self.local, &self.local_token).await
+    }
+
+    /// Connect a GUI to the hub and federate the hub to the remote through it.
+    /// Returns the GUI and the peer id the hub assigned.
+    pub async fn open_peer(&self) -> (Client, String) {
+        let mut gui = self.connect_gui().await;
+        let sent = gui.tx.send(ClientMessage::OpenPeer {
+            request_id: 1,
+            target: self.remote_target(&self.remote_token),
+        });
+        assert!(sent.is_ok(), "send OpenPeer");
+        let reply = recv_until(&mut gui.rx, E2E_TIMEOUT, |m| {
+            matches!(
+                m,
+                ServerMessage::PeerOpened { .. } | ServerMessage::PeerError { .. }
+            )
+        })
+        .await;
+        let peer = match &reply {
+            Some(ServerMessage::PeerOpened { peer, .. }) => Some(peer.clone()),
+            _ => None,
+        };
+        assert!(peer.is_some(), "federation must open, got {reply:?}");
+        (gui, peer.unwrap_or_default())
+    }
+
+    /// Stop both daemons (a remote a test already killed is simply not there).
+    pub async fn shutdown(self) {
+        let _ = kmux_client::daemon::stop_daemon_at(&self.local.socket_path()).await;
+        let _ = kmux_client::daemon::stop_daemon_at(&self.remote.socket_path()).await;
+    }
 }

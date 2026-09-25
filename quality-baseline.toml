@@ -574,7 +574,7 @@ count = 9
 [[lints]]
 crate = "kmux-pty"
 lint = "missing_docs"
-count = 64
+count = 63
 
 [[lints]]
 crate = "kmux-render"
@@ -630,11 +630,6 @@ count = 1
 crate = "kmux-sys"
 lint = "clippy::expect_used"
 count = 3
-
-[[lints]]
-crate = "kmux-sys"
-lint = "clippy::items_after_statements"
-count = 1
 
 [[lints]]
 crate = "kmux-sys"
@@ -759,7 +754,7 @@ count = 16
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::cast_possible_wrap"
-count = 27
+count = 17
 
 [[lints]]
 crate = "kmuxd"
@@ -769,7 +764,7 @@ count = 12
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::expect_used"
-count = 24
+count = 23
 
 [[lints]]
 crate = "kmuxd"
@@ -814,7 +809,7 @@ count = 1
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::too_many_lines"
-count = 13
+count = 10
 
 [[lints]]
 crate = "kmuxd"

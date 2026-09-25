@@ -70,54 +70,13 @@ pub fn read_graveyard(path: &Path) -> anyhow::Result<PersistedGraveyard> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persist::{
-        PersistedClosedSession, PersistedPane, PersistedSession, PersistedTermSize,
-    };
-    use kmux_protocol::messages::{
-        CursorState, GridSnapshot, LayoutNode, SessionMeta, SessionStatus, TermModes,
-    };
+    use crate::fixtures::sample_persisted_session;
+    use crate::persist::PersistedClosedSession;
 
     fn sample_closed(word: &str, closed_at_ms: u64) -> PersistedClosedSession {
         PersistedClosedSession {
             closed_at_ms,
-            session: PersistedSession {
-                meta: SessionMeta {
-                    index: 0,
-                    word_id: word.to_string(),
-                    name: word.to_string(),
-                    cwd: "/tmp".to_string(),
-                },
-                next_pane_index: 1,
-                panes: vec![PersistedPane {
-                    pane_index: 0,
-                    program: "/bin/sh".to_string(),
-                    args: vec![],
-                    size: PersistedTermSize { rows: 24, cols: 80 },
-                    status: SessionStatus::Running,
-                    child_pid: None,
-                    grid: GridSnapshot {
-                        rows: 24,
-                        cols: 80,
-                        cells: vec![Default::default(); 24 * 80],
-                        cursor: CursorState::default(),
-                        modes: TermModes::EMPTY,
-                        history_total: 0,
-                        scrollback_base: 0,
-                        scrollback_tail: Vec::new(),
-                    },
-                    scrollback_lines: vec![],
-                    cwd: "/tmp".to_string(),
-                }],
-                tabs: vec![crate::persist::PersistedTab {
-                    tab_index: 0,
-                    name: "1".to_string(),
-                    layout: LayoutNode::single(0),
-                    focused_pane: 0,
-                }],
-                next_tab_index: 1,
-                active_tab: 0,
-                last_active_ms: closed_at_ms,
-            },
+            session: sample_persisted_session(word, word, closed_at_ms),
         }
     }
 

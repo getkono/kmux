@@ -2,12 +2,25 @@ use std::io::Write as _;
 use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::PathBuf;
 
+use kmux_sys::dirs::Dirs;
 use rand::Rng;
 
-/// Persist `token` to the kmux runtime token file with mode 0600.
-/// Returns the path on success.
+/// Persist `token` to this user's kmux runtime token file with mode 0600,
+/// truncating any previous token. Returns the path on success.
+///
+/// Resolves the directories from the process environment; [`persist_token_in`]
+/// is the same write against explicit directories.
 pub fn persist_token(token: &str) -> anyhow::Result<PathBuf> {
-    let token_path = kmux_sys::dirs::token_path()?;
+    persist_token_in(&Dirs::from_env()?, token)
+}
+
+/// [`persist_token`] into the runtime dir of `dirs`.
+///
+/// The directories are a parameter so the write is testable against a
+/// `Dirs::rooted` tempdir without pointing the process-global
+/// `XDG_RUNTIME_DIR` at it (docs/testing.md R3).
+pub fn persist_token_in(dirs: &Dirs, token: &str) -> anyhow::Result<PathBuf> {
+    let token_path = dirs.token_path()?;
     let mut file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
@@ -75,19 +88,15 @@ mod tests {
     }
 
     #[test]
-    fn persist_and_read_token() {
+    fn persist_token_in_writes_the_runtime_token_file_owner_only() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        // SAFETY: single-threaded test, no concurrent env access
-        unsafe { std::env::set_var("XDG_RUNTIME_DIR", tmp.path()) };
+        let dirs = Dirs::rooted(tmp.path());
 
         let token = generate_token();
-        let path = persist_token(&token).expect("persist_token");
+        let path = persist_token_in(&dirs, &token).expect("persist_token_in");
 
         // Verify path
-        assert_eq!(
-            path,
-            tmp.path().join(kmux_sys::dirs::KMUX_DIR_NAME).join("token")
-        );
+        assert_eq!(path, dirs.token_path().expect("token path"));
 
         // Verify contents
         let contents = std::fs::read_to_string(&path).expect("read token");
@@ -100,5 +109,42 @@ mod tests {
             .permissions()
             .mode();
         assert_eq!(mode & 0o777, 0o600, "token file must be mode 0600");
+    }
+
+    /// `persist_token`'s only job is resolving the runtime dir from the process
+    /// environment, which a test may not mutate (R3). So it is checked in a
+    /// child — this same test binary, re-run on this one test — handed
+    /// `XDG_RUNTIME_DIR` through `Command::env` (R7: the in-process tier cannot
+    /// set it without mutating this process).
+    #[test]
+    fn persist_token_resolves_the_runtime_dir_from_the_environment() {
+        const ROOT: &str = "KMUX_TEST_PERSIST_TOKEN_ROOT";
+        const NAME: &str =
+            "auth::tests::persist_token_resolves_the_runtime_dir_from_the_environment";
+        if let Some(root) = std::env::var_os(ROOT) {
+            let dirs = Dirs::rooted(std::path::Path::new(&root));
+            let path = persist_token("child-token").expect("persist_token");
+            assert_eq!(path, dirs.token_path().expect("token path"));
+            assert_eq!(std::fs::read_to_string(&path).expect("read"), "child-token");
+            return;
+        }
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // `Dirs::rooted` lays the runtime base out at `<root>/run`; create it,
+        // since a base named by `XDG_RUNTIME_DIR` is someone else's to create.
+        Dirs::rooted(tmp.path()).runtime_dir().expect("runtime dir");
+        let out = std::process::Command::new(std::env::current_exe().expect("test binary"))
+            .args(["--exact", NAME, "--test-threads=1"])
+            .env(ROOT, tmp.path())
+            .env("XDG_RUNTIME_DIR", tmp.path().join("run"))
+            .output()
+            .expect("re-run the test binary");
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        // "1 passed" also proves the filter matched: a filter that selects
+        // nothing exits 0 too.
+        assert!(
+            out.status.success() && stdout.contains("1 passed"),
+            "child persist_token did not write under XDG_RUNTIME_DIR:
+{stdout}"
+        );
     }
 }

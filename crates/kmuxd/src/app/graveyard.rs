@@ -218,52 +218,12 @@ impl ServerApp {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::persist::{PersistedPane, PersistedSession, PersistedTab, PersistedTermSize};
-    use kmux_protocol::messages::{
-        CursorState, GridSnapshot, LayoutNode, SessionMeta, SessionStatus, TermModes,
-    };
+    use crate::fixtures::sample_persisted_session;
 
     fn closed(word: &str, closed_at_ms: u64) -> PersistedClosedSession {
         PersistedClosedSession {
             closed_at_ms,
-            session: PersistedSession {
-                meta: SessionMeta {
-                    index: 0,
-                    word_id: word.to_string(),
-                    name: word.to_string(),
-                    cwd: "/tmp".to_string(),
-                },
-                next_pane_index: 1,
-                panes: vec![PersistedPane {
-                    pane_index: 0,
-                    program: "/bin/sh".to_string(),
-                    args: vec![],
-                    size: PersistedTermSize { rows: 24, cols: 80 },
-                    status: SessionStatus::Running,
-                    child_pid: None,
-                    grid: GridSnapshot {
-                        rows: 24,
-                        cols: 80,
-                        cells: vec![Default::default(); 24 * 80],
-                        cursor: CursorState::default(),
-                        modes: TermModes::EMPTY,
-                        history_total: 0,
-                        scrollback_base: 0,
-                        scrollback_tail: Vec::new(),
-                    },
-                    scrollback_lines: vec![],
-                    cwd: "/tmp".to_string(),
-                }],
-                tabs: vec![PersistedTab {
-                    tab_index: 0,
-                    name: "1".to_string(),
-                    layout: LayoutNode::single(0),
-                    focused_pane: 0,
-                }],
-                next_tab_index: 1,
-                active_tab: 0,
-                last_active_ms: closed_at_ms,
-            },
+            session: sample_persisted_session(word, word, closed_at_ms),
         }
     }
 
@@ -278,7 +238,7 @@ mod tests {
 
     #[test]
     fn count_cap_evicts_oldest() {
-        let mut app = ServerApp::new("tok".to_string());
+        let mut app = crate::fixtures::fixture_app();
         app.closed_session_keep = 2;
         app.closed_session_ttl_ms = 0; // disable TTL for this test
 
@@ -296,7 +256,7 @@ mod tests {
 
     #[test]
     fn ttl_prunes_stale_entries() {
-        let mut app = ServerApp::new("tok".to_string());
+        let mut app = crate::fixtures::fixture_app();
         app.closed_session_keep = 100;
         app.closed_session_ttl_ms = 1000; // 1 second
 
@@ -317,7 +277,7 @@ mod tests {
 
     #[test]
     fn prune_noop_when_within_caps() {
-        let mut app = ServerApp::new("tok".to_string());
+        let mut app = crate::fixtures::fixture_app();
         app.closed_session_keep = 10;
         app.closed_session_ttl_ms = 0;
         app.closed_sessions
@@ -333,7 +293,7 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("closed.bin");
-        let app = ServerApp::new("tok".to_string()).with_closed_sessions(20, 7, path.clone());
+        let app = crate::fixtures::fixture_app().with_closed_sessions(20, 7, path.clone());
 
         let entry = app
             .create_session(
@@ -356,7 +316,7 @@ mod tests {
         assert_eq!(on_disk.sessions[0].session.meta.word_id, word);
 
         // A fresh daemon loads it back into its in-memory graveyard.
-        let fresh = ServerApp::new("tok".to_string()).with_closed_sessions(20, 7, path);
+        let fresh = crate::fixtures::fixture_app().with_closed_sessions(20, 7, path);
         let graveyard =
             crate::persist::graveyard::read_graveyard(fresh.graveyard_path.as_ref().unwrap())
                 .unwrap();
@@ -368,7 +328,7 @@ mod tests {
     async fn close_then_restore_roundtrip() {
         use kmux_protocol::messages::{ClientCapabilities, TermSize};
 
-        let app = ServerApp::new("tok".to_string());
+        let app = crate::fixtures::fixture_app();
         let entry = app
             .create_session(
                 None,
@@ -401,7 +361,7 @@ mod tests {
 
     #[tokio::test]
     async fn load_drops_expired_and_reserves_words() {
-        let mut app = ServerApp::new("tok".to_string());
+        let mut app = crate::fixtures::fixture_app();
         app.closed_session_keep = 100;
         app.closed_session_ttl_ms = 1000;
 

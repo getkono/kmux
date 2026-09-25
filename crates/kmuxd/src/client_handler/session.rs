@@ -315,20 +315,8 @@ mod tests {
     };
     use kmux_protocol::{decode_server, encode_client, write_frame};
     use kmux_sys::identity::Identity;
-    use tokio::task::AbortHandle;
 
-    struct NoopAttacher;
-
-    impl PaneAttacher for NoopAttacher {
-        async fn start_pane_stream(
-            &self,
-            _pane_id: String,
-            _result: AttachResult,
-            _client_rx: mpsc::Receiver<ServerMessage>,
-        ) -> Result<AbortHandle, String> {
-            Err("not used in session tests".to_string())
-        }
-    }
+    use crate::fixtures::{NoopAttacher, fixture_app};
 
     fn auth(token: &str) -> ClientMessage {
         let identity = Identity::generate();
@@ -350,7 +338,7 @@ mod tests {
 
     #[tokio::test]
     async fn unauthenticated_session_emits_no_events_or_ping() {
-        let app = Arc::new(ServerApp::new("expected".to_string()));
+        let app = Arc::new(fixture_app());
         let (server, client) = tokio::io::duplex(64 * 1024);
         let (server_read, server_write) = tokio::io::split(server);
         let (mut client_read, mut client_write) = tokio::io::split(client);
@@ -376,7 +364,7 @@ mod tests {
 
     #[tokio::test]
     async fn invalid_token_result_is_flushed_before_close() {
-        let app = Arc::new(ServerApp::new("expected".to_string()));
+        let app = Arc::new(fixture_app());
         let (server, client) = tokio::io::duplex(64 * 1024);
         let (server_read, server_write) = tokio::io::split(server);
         let (mut client_read, mut client_write) = tokio::io::split(client);

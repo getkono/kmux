@@ -22,7 +22,7 @@ Run the whole matrix on **Linux (GTK client, `kmux-gtk`)** and **macOS (Swift ap
 | `live_pty_migrates_with_same_pid` (pre-existing) | `crates/kmuxd/src/app/migrate.rs` | In-process fd transfer keeps the same child PID. |
 | `pane_fd_round_trips_and_keeps_child_alive`, `hello_version_mismatch_round_trips_for_decline` (pre-existing) | `crates/kmuxd/src/handoff/mod.rs` | SCM_RIGHTS fd passing; version-mismatch → decline. |
 
-Run: `mise run test` (or `cargo test -p kmuxd -p kmux-pty -p kmux-client`).
+Run: `mise run test` (or `cargo build -p kmux-vt-worker && cargo test -p kmuxd -p kmux-pty -p kmux-client`).
 
 > **Note on what is *not* automated:** a successor built with a *different*
 > `HANDOFF_PROTOCOL_VERSION`/`STATE_VERSION` (needs a second build) and the real

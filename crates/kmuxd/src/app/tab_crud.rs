@@ -372,7 +372,7 @@ mod tests {
     /// A session with one tab holding one pane, running a long-lived childless
     /// process so the tab teardown is deterministic.
     async fn app_with_one_session() -> (ServerApp, String) {
-        let app = ServerApp::new("tok".to_string());
+        let app = crate::fixtures::fixture_app();
         let entry = app
             .create_session(
                 None,
@@ -390,7 +390,7 @@ mod tests {
 
     #[tokio::test]
     async fn closing_a_tab_of_an_unknown_session_errors_instead_of_answering_false() {
-        let app = ServerApp::new("tok".to_string());
+        let app = crate::fixtures::fixture_app();
         let err = app
             .close_tab("nosuch", 0)
             .await
