@@ -329,13 +329,13 @@ fn main() -> anyhow::Result<()> {
             .instrument(tracing::info_span!("instance", id = %instance_id)),
     );
 
-    // A graceful-restart predecessor deliberately keeps its migrated PTY children
-    // alive (they belong to the successor now), so the per-child `waitpid` reaper
-    // threads (`spawn_blocking`, see kmux_pty::process::spawn_wait_task) never
-    // return. Dropping the runtime *joins* those blocking threads, which would hang
-    // the outgoing daemon forever instead of letting it "completely shut-off"
-    // (issue #36). Detach them: shut the runtime down in the background and let
-    // process exit reap the threads.
+    // Shut the runtime down without joining its blocking pool. PTY children no
+    // longer park a blocking thread each (kmux-pty reaps them all from one
+    // dedicated thread outside this runtime, issue #205), so a graceful-restart
+    // predecessor whose migrated children live on no longer hangs here. What is
+    // left is defence: dropping the runtime would wait for any blocking task
+    // still running (a filesystem call stuck on a full or dead disk), and a
+    // daemon on its way out must "completely shut-off" (issue #36) regardless.
     rt.shutdown_background();
 
     result

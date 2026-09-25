@@ -1,22 +1,25 @@
-use std::ffi::CString;
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use nix::pty::{ForkptyResult, forkpty};
-use nix::unistd::{Pid, execve};
+use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
+use nix::unistd::Pid;
 use tokio::sync::watch;
 
+use crate::child::ChildPlan;
 use crate::config::{PtyConfig, WindowSize};
 use crate::error::{KmuxError, Result};
 use crate::io::PtyMasterIo;
 use crate::platform::to_winsize;
-use crate::process::{ExitStatus, spawn_wait_task};
+use crate::process::ExitStatus;
+use crate::reaper::reaper;
+use crate::shutdown::signal_group;
 
 /// A spawned PTY process.
 ///
 /// Owns the master fd (wrapped in `PtyMasterIo`) and the child PID.
-/// Dropping this struct triggers async cleanup (SIGKILL + fd close)
-/// unless [`PtyProcess::set_keep_alive`] has been called to suppress it.
+/// Dropping this struct SIGKILLs the child's process group and closes the fd,
+/// unless [`PtyProcess::set_keep_alive`] has been called to suppress the kill.
 pub struct PtyProcess {
     /// Async I/O handle over the PTY master fd.
     pub io: PtyMasterIo,
@@ -28,60 +31,56 @@ pub struct PtyProcess {
     pub size: WindowSize,
     /// When `true`, the `Drop` impl skips SIGKILL so the child remains alive.
     ///
-    /// Set this before dropping (e.g. on clean daemon shutdown) when the child
-    /// PTY process should survive for reattachment on the next daemon start.
+    /// Set this before dropping when another process now owns the child: a
+    /// handoff successor, or (inside a VT worker) the daemon.
     keep_alive: AtomicBool,
 }
 
 impl PtyProcess {
     /// Spawn a child process in a new PTY.
+    ///
+    /// The child is a session leader (and so its own process group) with the
+    /// PTY as its controlling terminal. Before it runs the program it resets
+    /// the daemon's signal dispositions and mask, closes every inherited fd
+    /// past stdio, and changes to `config.cwd` — all in the child, so the
+    /// daemon's own working directory never changes. If it cannot change
+    /// directory or run the program it writes why to the PTY and exits 127.
     pub fn spawn(config: &PtyConfig) -> Result<Self> {
         let winsize = to_winsize(config.size);
-        let env_map = config.env.clone().build();
+        let plan = ChildPlan::new(config)?;
+        // Before the fork, so the SIGCHLD handler is in place however soon the
+        // child exits.
+        let reaper = reaper()?;
 
-        // Prepare C strings for exec
-        let program = CString::new(config.program.as_str())
-            .map_err(|_| KmuxError::Spawn("program name contains null byte".into()))?;
-
-        let mut argv: Vec<CString> = Vec::with_capacity(config.args.len() + 1);
-        argv.push(program.clone());
-        for arg in &config.args {
-            argv.push(
-                CString::new(arg.as_str())
-                    .map_err(|_| KmuxError::Spawn(format!("arg contains null byte: {arg}")))?,
-            );
+        // Block every signal on this thread across the fork, so the child
+        // starts with them blocked: one sent to it before it has reset its
+        // dispositions stays pending instead of running a daemon handler it
+        // inherited, and is delivered once `ChildPlan::exec` clears the mask.
+        let mut previous = SigSet::empty();
+        pthread_sigmask(
+            SigmaskHow::SIG_BLOCK,
+            Some(&SigSet::all()),
+            Some(&mut previous),
+        )
+        .map_err(KmuxError::Pty)?;
+        // SAFETY: the child branch calls only `ChildPlan::exec`, which makes
+        // async-signal-safe calls on memory prepared before the fork.
+        let fork_result = unsafe { forkpty(Some(&winsize), None) };
+        if !matches!(fork_result, Ok(ForkptyResult::Child)) {
+            let _ = pthread_sigmask(SigmaskHow::SIG_SETMASK, Some(&previous), None);
         }
-
-        let envp: Vec<CString> = env_map
-            .iter()
-            .map(|(k, v)| {
-                CString::new(format!("{k}={v}").as_str())
-                    .map_err(|_| KmuxError::Spawn("env var contains null byte".into()))
-            })
-            .collect::<Result<Vec<_>>>()?;
-
-        // Change working directory if specified
-        if let Some(cwd) = &config.cwd {
-            std::env::set_current_dir(cwd).map_err(KmuxError::Io)?;
-        }
-
-        // SAFETY: forkpty is unsafe; we uphold the contract by not using
-        // tokio/threads in the child before exec, and by not sharing the
-        // master fd across threads before returning from this function.
-        let fork_result = unsafe { forkpty(Some(&winsize), None) }.map_err(KmuxError::Pty)?;
+        let fork_result = fork_result.map_err(KmuxError::Pty)?;
 
         match fork_result {
-            ForkptyResult::Child => {
-                // In child: exec the target program.
-                // If exec fails, exit immediately to avoid double-cleanup.
-                let _ = execve(&program, &argv, &envp);
-                // exec failed -- exit child with error code
-                unsafe { nix::libc::_exit(127) };
-            }
+            // SAFETY: we are the freshly forked child.
+            ForkptyResult::Child => unsafe { plan.exec() },
             ForkptyResult::Parent { child, master } => {
-                let master_fd: RawFd = master.into_raw_fd();
-                let io = PtyMasterIo::new(master_fd).map_err(KmuxError::Io)?;
-                let exit_rx = spawn_wait_task(child);
+                let exit_rx = reaper.watch(child);
+                let io = PtyMasterIo::new(master.into_raw_fd()).map_err(|e| {
+                    // No handle will own this child, so nothing else would end it.
+                    signal_group(child, Signal::SIGKILL);
+                    KmuxError::Io(e)
+                })?;
                 Ok(Self {
                     io,
                     pid: child,
@@ -160,36 +159,21 @@ impl PtyProcess {
 }
 
 impl Drop for PtyProcess {
+    /// Kill the child's process group unless it has already exited or
+    /// keep-alive is set. The reaper (or, for an inherited child, its new
+    /// parent) collects the exit; nothing here waits.
+    ///
+    /// Dropping closes this handle's master fd. With keep-alive set the child
+    /// keeps its terminal through another copy of the master that is still
+    /// open: the one a handoff successor received over `SCM_RIGHTS`, or, inside
+    /// a VT worker, the daemon's own.
     fn drop(&mut self) {
         if self.keep_alive.load(Ordering::Relaxed) {
-            // Duplicate the PTY master fd before `PtyMasterIo` closes it.
-            //
-            // When the master fd closes the child receives SIGHUP (loss of
-            // controlling terminal) which would kill it. Duplicating the fd
-            // keeps the file description alive in the OS fd table so the child
-            // can be reattached by the next daemon instance. The duplicate is
-            // intentionally leaked (held open until this process exits), which
-            // is safe since the daemon is shutting down immediately after.
-            let raw = self.io.as_raw_fd();
-            // SAFETY: `raw` is a valid, open fd owned by `self.io`.
-            let dup_fd = unsafe { nix::libc::dup(raw) };
-            // `dup_fd` is a plain i32 with no Drop impl, so it is intentionally
-            // leaked — the fd stays open in the fd table.
-            let _ = dup_fd;
-            // Allow PtyMasterIo to drop (closes the original fd) without
-            // sending SIGKILL. The dup above keeps the terminal alive.
             return;
         }
-
+        // An exited child's pid may already be reaped and reused.
         if !self.is_exited() {
-            // Spawn a detached cleanup task: send SIGKILL, reap zombie
-            let pid = self.pid;
-            tokio::spawn(async move {
-                let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
-                // Give the kernel a moment, then reap
-                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
-                let _ = nix::sys::wait::waitpid(pid, Some(nix::sys::wait::WaitPidFlag::WNOHANG));
-            });
+            signal_group(self.pid, Signal::SIGKILL);
         }
     }
 }
@@ -282,7 +266,7 @@ mod tests {
             "child should still be alive after the original was dropped"
         );
 
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        let _ = nix::sys::signal::kill(pid, Signal::SIGKILL);
     }
 
     /// A foreign (inherited) child cannot be `waitpid`-ed, so exit is detected by
@@ -309,13 +293,158 @@ mod tests {
         assert!(inherited.is_exited(), "is_exited should be true after exit");
     }
 
+    /// Signals are blocked only across the fork: the spawning thread gets its
+    /// own mask back, or it would never again see a signal sent to it. The
+    /// fork is real because the restore is on the parent's side of it (R7).
+    #[tokio::test]
+    async fn spawn_gives_the_spawning_thread_its_signal_mask_back() {
+        let before = SigSet::thread_get_mask().expect("mask");
+        let _pty = PtyProcess::spawn(&sleep_config()).expect("spawn");
+        assert_eq!(SigSet::thread_get_mask().expect("mask"), before);
+    }
+
+    /// Dropping a handle to a live child kills it (and the reaper collects
+    /// it). The child ignores `SIGHUP`, so the hangup from the master closing
+    /// cannot do the killing in Drop's place. Needs a real child (R7).
+    #[tokio::test]
+    async fn dropping_a_process_kills_its_child() {
+        use tokio::io::AsyncReadExt;
+
+        let script = "trap '' HUP; echo ready; exec sleep 600";
+        let mut pty =
+            PtyProcess::spawn(&PtyConfig::new("/bin/sh").args(["-c", script])).expect("spawn");
+        let mut seen = String::new();
+        let mut buf = [0u8; 64];
+        while !seen.contains("ready") {
+            let n = pty.io.read(&mut buf).await.expect("read");
+            assert_ne!(n, 0, "EOF before ready: {seen:?}");
+            seen.push_str(&String::from_utf8_lossy(&buf[..n]));
+        }
+        let pid = pty.pid;
+        drop(pty);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        assert!(crate::fixtures::wait_until_dead(pid, deadline).await);
+    }
+
+    /// A pane sees its terminal and nothing else: not another pane's master,
+    /// and not an fd some other part of the process opened without
+    /// close-on-exec (the pipe below plays that careless library). Needs a
+    /// real child to list its own fds (R7).
+    #[tokio::test]
+    async fn a_pane_inherits_no_fd_but_its_terminal() {
+        use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+        const INHERITED: i32 = 10;
+
+        let other = PtyProcess::spawn(&PtyConfig::new("/bin/cat")).expect("spawn");
+        let (read_end, _write_end) = nix::unistd::pipe().expect("pipe");
+        // SAFETY: F_DUPFD (not F_DUPFD_CLOEXEC) yields a fresh, inheritable
+        // fd this test owns; 200 keeps it clear of the child's own fds and
+        // under macOS's default limit of 256.
+        let leaky = unsafe {
+            OwnedFd::from_raw_fd(nix::libc::fcntl(
+                read_end.as_raw_fd(),
+                nix::libc::F_DUPFD,
+                200,
+            ))
+        };
+        assert!(leaky.as_raw_fd() >= 200, "precondition: the dup succeeded");
+
+        let output = crate::oneshot::run(&PtyConfig::new("/bin/ls").args(["/dev/fd"]))
+            .await
+            .expect("run");
+        let fds: Vec<i32> = output
+            .stdout_str()
+            .split_whitespace()
+            .filter_map(|word| word.parse().ok())
+            .collect();
+
+        // 0-2 are the terminal. Whatever `ls` opens to do the listing takes
+        // the lowest free numbers, just past them; anything far above was
+        // inherited. The leaky fd is far above; the other master usually is
+        // too, but not always (parallel tests free low numbers for reuse), so
+        // `io`'s close-on-exec test is what covers it whatever its number.
+        assert!(
+            fds.contains(&0) && fds.contains(&2),
+            "not a listing: {fds:?}"
+        );
+        assert!(
+            fds.iter().all(|&fd| fd < INHERITED),
+            "fds leaked into the pane: {fds:?} (other master {}, leaky {})",
+            other.master_fd(),
+            leaky.as_raw_fd()
+        );
+    }
+
+    /// Each child changes directory itself, so spawns racing each other each
+    /// land in their own directory, and the spawning process never moves.
+    /// Needs real children to report where they run (R7).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_spawns_each_run_in_their_own_directory() {
+        let before = std::env::current_dir().expect("cwd");
+        let dirs: Vec<tempfile::TempDir> = (0..8)
+            .map(|_| tempfile::tempdir().expect("tempdir"))
+            .collect();
+
+        let runs: Vec<_> = dirs
+            .iter()
+            .map(|dir| {
+                let config = PtyConfig::new("/bin/pwd").cwd(dir.path());
+                tokio::spawn(async move { crate::oneshot::run(&config).await })
+            })
+            .collect();
+        for (dir, run) in dirs.iter().zip(runs) {
+            let output = run.await.expect("join").expect("run");
+            let expected = dir.path().canonicalize().expect("canonical");
+            assert_eq!(output.stdout_str().trim(), expected.to_string_lossy());
+        }
+        assert_eq!(std::env::current_dir().expect("cwd"), before);
+    }
+
+    /// The daemon ignores `SIGPIPE` (the Rust runtime does), and an ignored
+    /// disposition survives `execve`. Reset in the child, `yes` dies of the
+    /// closed pipe silently instead of reporting a write error. Needs a real
+    /// child (R7).
+    #[tokio::test]
+    async fn a_pipeline_whose_reader_exits_ends_quietly() {
+        let config = PtyConfig::new("/bin/sh").args(["-c", "yes | head -1"]);
+        let output = crate::oneshot::run(&config).await.expect("run");
+        assert_eq!(output.stdout_str().trim_end(), "y");
+        assert_eq!(output.status, ExitStatus::Code(0));
+    }
+
+    /// A child that cannot change directory, or cannot run its program, says
+    /// why on the terminal and exits 127. Needs a real child (R7).
+    #[tokio::test]
+    async fn a_child_that_cannot_start_says_why_and_exits_127() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cases = [
+            (
+                PtyConfig::new("/bin/pwd").cwd(tmp.path().join("missing")),
+                "kmux: cannot chdir to ",
+            ),
+            (
+                PtyConfig::new("/nonexistent/program"),
+                "kmux: cannot exec /nonexistent/program: errno ",
+            ),
+        ];
+        for (config, diagnostic) in cases {
+            let output = crate::oneshot::run(&config).await.expect("run");
+            let text = output.stdout_str();
+            assert!(text.starts_with(diagnostic), "{text:?}");
+            assert_eq!(output.status, ExitStatus::Code(127), "{text:?}");
+        }
+    }
+
     /// Verify that setting `keep_alive` prevents the Drop impl from sending
     /// SIGKILL: the child process should still be running after the
-    /// `PtyProcess` is dropped with `keep_alive = true`.
+    /// `PtyProcess` is dropped with `keep_alive = true`. As in a handoff, a
+    /// copy of the master stays open elsewhere — without one, closing the last
+    /// master would hang the terminal up.
     #[tokio::test]
     async fn keep_alive_prevents_sigkill_on_drop() {
         let pty = PtyProcess::spawn(&sleep_config()).expect("spawn failed");
         let pid = pty.pid;
+        let _successors_copy = pty.io.dup_owned().expect("dup");
 
         pty.set_keep_alive(true);
         drop(pty);
@@ -328,6 +457,6 @@ mod tests {
         assert!(!died, "process should still be alive after keep_alive drop");
 
         // Clean up: kill the process ourselves.
-        let _ = nix::sys::signal::kill(pid, nix::sys::signal::Signal::SIGKILL);
+        let _ = nix::sys::signal::kill(pid, Signal::SIGKILL);
     }
 }

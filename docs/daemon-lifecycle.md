@@ -415,6 +415,94 @@ loop:
 Burst output (e.g. large `cat`) is coalesced into a single diff per read
 cycle, reducing redundant intermediate updates to clients.
 
+### 9.4 PTY Child Lifecycle (`kmux-pty`, issue #205)
+
+A daemon meant to run for months cannot leak an fd, a directory change or a
+process per pane. `kmux-pty` owns every step of a pane's child process:
+
+**Spawn** (`PtyProcess::spawn`, `child.rs`). `forkpty` makes the child a
+session leader (so its pid is also its process group id) with the PTY as its
+controlling terminal. The daemon is multithreaded, so between `fork` and
+`execve` the child makes only async-signal-safe calls, on memory `ChildPlan`
+prepared before the fork (argv/envp pointer arrays, the cwd as a C string). In
+order, the child:
+
+1. resets every signal disposition to `SIG_DFL` and clears the signal mask —
+   an ignored disposition survives `execve`, and the Rust runtime ignores
+   `SIGPIPE`, which would make `yes | head -1` report a broken pipe; the child
+   starts with every signal blocked (the parent blocks them across the fork),
+   so the mask is cleared only after the dispositions are safe;
+2. closes every fd from 3 up to the soft `RLIMIT_NOFILE` (capped at 65,536;
+   an unreportable limit sweeps to the cap), whoever opened it;
+3. `chdir`s to the pane's directory — in the child, so the daemon's own cwd
+   never changes and concurrent spawns cannot swap directories;
+4. `execve`s the program.
+
+If step 3 or 4 fails the child writes `kmux: cannot chdir to <dir>: errno N`
+(or `cannot exec <program>`) to the PTY and exits 127, the code a shell uses
+for a command it could not run. `clippy.toml` disallows
+`std::env::set_current_dir` so the daemon-wide `chdir` cannot come back.
+
+**Descriptors.** Every PTY master fd and every copy of it is close-on-exec:
+`PtyMasterIo::new` sets `FD_CLOEXEC` on whatever fd it adopts (a `forkpty`
+master, an `SCM_RIGHTS` arrival, a pipe), and its dups use `F_DUPFD_CLOEXEC`.
+So no child — a shell, a `kmux-vt-worker`, a handoff successor — inherits
+another pane's terminal. The one fd a worker or successor should hold is sent
+over `SCM_RIGHTS`, which does not depend on inheritance; on Linux the receiving
+`recvmsg` passes `MSG_CMSG_CLOEXEC` so the arrival is close-on-exec from its
+first instant. Step 2 above backs this up for fds kmux does not control.
+
+**Reaping** (`reaper.rs`). One thread, started on first spawn, reaps every PTY
+child in the process: on each `SIGCHLD` it calls `waitpid(pid, WNOHANG)` for
+each registered pid and publishes the status to that child's `watch` channel
+(`PtyProcess::exit_rx`). It never calls `waitpid(-1)`, which would steal the
+statuses of children other code reaps itself (a VT worker's
+`std::process::Child`, an SSH tunnel's `tokio::process::Child`). Registration
+checks the child once on the spot, so an exit that beat the registration is not
+lost. This replaced a blocking `waitpid` thread per pane, which parked one of
+tokio's 512 blocking threads for each pane's whole life. A child inherited over
+a handoff is not ours to `waitpid`; its channel is fed by a `kill(pid, 0)` poll
+instead.
+
+**Close** (`shutdown::graceful_shutdown`, `PtySession::close[_nowait]`). Pane
+close signals the child's process group, so whatever runs in it goes too — the
+shell, and the jobs and pipelines of a shell without job control:
+
+1. `SIGHUP`, then `SIGTERM`, to the group — `SIGHUP` because that is what
+   closing a terminal means, and an interactive shell ignores `SIGTERM`;
+2. wait up to the grace period (`PtyConfig::shutdown_grace`, default 5 s) for
+   the child's exit channel;
+3. `SIGKILL` the group — also ending a job that outlived the child by ignoring
+   both signals;
+4. if the child had not exited, wait up to the grace period again for the
+   `SIGKILL` to be confirmed through the same channel.
+
+A job-controlling (interactive) shell moves each job into a process group of
+its own, which these signals do not reach directly. Such jobs go the way a
+terminal emulator's do: the shell forwards `SIGHUP` to its jobs as it exits, and
+the kernel hangs up the terminal's foreground group when the session leader
+dies. A job that ignores `SIGHUP` in its own group (`nohup cmd &`) outlives the
+pane, as it would a closed terminal window.
+
+A pane whose child has already exited is closed without any signal: the child
+has been reaped, and its pid — and, once its group has emptied, its group id —
+may already belong to another process, another pane's shell included. A child
+closed the instant it spawned may not have called `setsid` yet; while it has no
+group of its own (`killpg` reports `ESRCH`) the signal goes to its pid. Signals
+are also blocked across the `fork` itself, so one sent to the child before it has
+reset its dispositions waits until they are `SIG_DFL` instead of running a daemon
+handler it inherited. The exit channel means
+"gone", never "not ours to wait on": for an inherited child it is the
+`kill(pid, 0)` poll, so `ECHILD` can no longer pass for an exit and skip the
+`SIGKILL`. `close_nowait` runs `close` in a task that owns the session, so the
+master fd is closed once the child is gone — not leaked, and not closed early.
+
+**Drop.** Dropping a `PtyProcess` whose child is still running `SIGKILL`s its
+group, unless keep-alive is set: the handoff predecessor and a VT worker set it,
+because another process then owns the child and holds its own copy of the
+master. Keep-alive no longer leaks a dup of the master; that copy elsewhere is
+what keeps the terminal from hanging up.
+
 ---
 
 ## 10. Persistence / Checkpointing (`persist/`, `app/persistence.rs`)
@@ -652,8 +740,8 @@ versioning, and fault-tolerance model: `docs/daemon-handoff.md`.
 
 This is the mechanism behind a **live upgrade** — `mise run upgrade-daemon` installs a
 new `kmuxd` and restarts onto it without dropping shells (issue #36). The upgrade
-mechanics (in-place binary swap, why the outgoing daemon must
-`shutdown_background()` to actually exit) and the full QA matrix are in
+mechanics (in-place binary swap, why the outgoing daemon shuts its runtime
+down with `shutdown_background()`) and the full QA matrix are in
 `docs/daemon-handoff.md` §"Upgrading a running daemon" and
 `docs/qa-daemon-upgrade.md`.
 

@@ -79,7 +79,7 @@ impl SessionManager {
                     name: name.to_string(),
                 })?
         };
-        let status = session.close().await?;
+        let status = session.close().await;
         self.events.emit(SessionEvent::Closed {
             name: name.to_string(),
         });
@@ -89,7 +89,7 @@ impl SessionManager {
     /// Remove a named session and initiate graceful shutdown in the background.
     ///
     /// Returns immediately without waiting for the process to exit. The process
-    /// receives SIGTERM and will be `SIGKILLed` after the grace period if needed.
+    /// group receives SIGHUP and SIGTERM, and SIGKILL after the grace period.
     pub async fn close_nowait(&self, name: &str) -> Result<()> {
         let session = {
             let mut sessions = self.sessions.lock().await;
@@ -99,7 +99,7 @@ impl SessionManager {
                     name: name.to_string(),
                 })?
         };
-        session.close_nowait().await;
+        session.close_nowait();
         self.events.emit(SessionEvent::Closed {
             name: name.to_string(),
         });

@@ -11,7 +11,7 @@
 //! `snapshot()` synchronously (no IPC round-trip), which keeps the existing
 //! synchronous attach/resize call sites unchanged.
 
-use std::os::fd::{AsRawFd, OwnedFd};
+use std::os::fd::{AsRawFd, OwnedFd, RawFd};
 use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
@@ -94,16 +94,11 @@ impl WorkerEngine {
 
         let exe = resolve_worker_exe()?;
         let mut cmd = std::process::Command::new(&exe);
-        cmd.env("KMUX_WORKER_SOCKET_FD", "3");
-        // SAFETY: dup2 is async-signal-safe; we only touch the raw socket fd we
-        // own. The child reads the socket from fd 3.
+        cmd.env("KMUX_WORKER_SOCKET_FD", WORKER_SOCKET_FD.to_string());
+        // SAFETY: `inherit_as` is async-signal-safe and touches only the raw
+        // socket fd we own.
         unsafe {
-            cmd.pre_exec(move || {
-                if nix::libc::dup2(worker_raw, 3) < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                Ok(())
-            });
+            cmd.pre_exec(move || inherit_as(worker_raw, WORKER_SOCKET_FD));
         }
         let child = cmd
             .spawn()
@@ -449,6 +444,32 @@ fn to_exit_status(status: ChildExitStatus) -> ExitStatus {
     }
 }
 
+/// The fd number the worker reads its socket from (`KMUX_WORKER_SOCKET_FD`).
+const WORKER_SOCKET_FD: RawFd = 3;
+
+/// In a forked child before `exec`: make `fd` survive `exec` as `target`.
+///
+/// `dup2` onto another number yields a copy without `FD_CLOEXEC`. When `fd`
+/// already *is* `target`, `dup2` does nothing and leaves the flag set (Rust
+/// opens every fd close-on-exec), so the program would start without it; the
+/// descriptor flags are cleared explicitly instead.
+///
+/// Async-signal-safe: only `fcntl`, `dup2` and reading `errno`.
+fn inherit_as(fd: RawFd, target: RawFd) -> std::io::Result<()> {
+    // SAFETY: fcntl/dup2 on an fd the caller owns; a failure is -1 plus errno.
+    let rc = unsafe {
+        if fd == target {
+            nix::libc::fcntl(fd, nix::libc::F_SETFD, 0)
+        } else {
+            nix::libc::dup2(fd, target)
+        }
+    };
+    if rc == -1 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
 /// Locate the `kmux-vt-worker` binary: `$KMUX_VT_WORKER_BIN`, else next to the
 /// running daemon, else fall back to the bare name on `PATH`.
 fn resolve_worker_exe() -> anyhow::Result<PathBuf> {
@@ -469,5 +490,96 @@ fn resolve_worker_exe() -> anyhow::Result<PathBuf> {
         Ok(candidate)
     } else {
         Ok(PathBuf::from("kmux-vt-worker"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Fd numbers the probe works with. They must be single digits: dash
+    /// (`/bin/sh` on Debian and Ubuntu) only parses fds 0-9 in a redirection,
+    /// so a probe of a higher number fails whatever the fd's state.
+    const PROBE_SRC: RawFd = 8;
+    const PROBE_TARGET: RawFd = 9;
+
+    /// Signature of `inherit_as`, so the probe can also run a no-op control.
+    type Inherit = fn(RawFd, RawFd) -> std::io::Result<()>;
+
+    /// In the forked child: put a close-on-exec copy of stdout at `src`, as the
+    /// socketpair end is close-on-exec, and close whatever the test harness
+    /// may have left open at `target`, so only `inherit` can open it.
+    ///
+    /// Async-signal-safe: only `dup2`, `fcntl` and `close`.
+    fn place_cloexec(src: RawFd, target: RawFd) -> std::io::Result<()> {
+        // SAFETY: fd juggling in the child's own table; a failure is -1 plus
+        // errno. Closing an fd that is not open only yields EBADF, ignored.
+        unsafe {
+            if src != target {
+                nix::libc::close(target);
+            }
+            if nix::libc::dup2(nix::libc::STDOUT_FILENO, src) == -1
+                || nix::libc::fcntl(src, nix::libc::F_SETFD, nix::libc::FD_CLOEXEC) == -1
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        Ok(())
+    }
+
+    /// Whether `target` is open in a program exec'd after the child placed a
+    /// close-on-exec fd at `src` and ran `inherit(src, target)`. A real fork
+    /// and exec, because what is under test is the close-on-exec flag `exec`
+    /// honours (R7).
+    fn target_open_after_exec(src: RawFd, target: RawFd, inherit: Inherit) -> bool {
+        let mut cmd = std::process::Command::new("/bin/sh");
+        // `: >&N` fails unless fd N is open in the shell.
+        cmd.args(["-c", &format!(": >&{target}")])
+            .stderr(std::process::Stdio::null());
+        // SAFETY: `place_cloexec` and `inherit` are async-signal-safe.
+        unsafe {
+            cmd.pre_exec(move || {
+                place_cloexec(src, target)?;
+                inherit(src, target)
+            });
+        }
+        cmd.status().expect("run sh").success()
+    }
+
+    /// Guards the probe: without `inherit_as` a close-on-exec fd must read as
+    /// closed, or the tests below could pass vacuously.
+    #[test]
+    fn probe_reports_a_cloexec_fd_as_closed() {
+        let open = target_open_after_exec(PROBE_TARGET, PROBE_TARGET, |_, _| Ok(()));
+        assert!(!open, "fd {PROBE_TARGET} survived exec despite FD_CLOEXEC");
+    }
+
+    /// The latent bug: a socket already at the target number was `dup2`ed onto
+    /// itself, a no-op that left it close-on-exec.
+    #[test]
+    fn inherit_as_passes_an_fd_already_at_the_target_number() {
+        let open = target_open_after_exec(PROBE_TARGET, PROBE_TARGET, inherit_as);
+        assert!(open, "fd {PROBE_TARGET} closed on exec");
+    }
+
+    #[test]
+    fn inherit_as_passes_an_fd_under_a_new_number() {
+        let open = target_open_after_exec(PROBE_SRC, PROBE_TARGET, inherit_as);
+        assert!(open, "fd {PROBE_TARGET} not open");
+    }
+
+    /// A failed `fcntl`/`dup2` surfaces its errno, so `spawn` fails instead of
+    /// exec'ing a worker without its socket. Fd -1 is never open, so both calls
+    /// fail with EBADF without touching any fd in this process.
+    #[test]
+    fn inherit_as_reports_a_bad_fd() {
+        for target in [-1, PROBE_TARGET] {
+            let err = inherit_as(-1, target).expect_err("fd -1 is not open");
+            assert_eq!(
+                err.raw_os_error(),
+                Some(nix::libc::EBADF),
+                "target {target}"
+            );
+        }
     }
 }

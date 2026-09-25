@@ -1,8 +1,5 @@
-use nix::sys::wait::{WaitStatus, waitpid};
 use nix::unistd::Pid;
 use tokio::sync::watch;
-
-use crate::error::{KmuxError, Result};
 
 /// Rich exit status for a PTY child process.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -39,46 +36,6 @@ impl std::fmt::Display for ExitStatus {
             Self::Unknown => write!(f, "unknown exit status"),
         }
     }
-}
-
-/// Wait for a child process to exit, blocking the current thread.
-///
-/// This is called from a `spawn_blocking` task so it doesn't stall the async executor.
-pub fn blocking_wait(pid: Pid) -> Result<ExitStatus> {
-    loop {
-        match waitpid(pid, None) {
-            Ok(WaitStatus::Exited(_, code)) => return Ok(ExitStatus::Code(code)),
-            Ok(WaitStatus::Signaled(_, sig, _)) => {
-                return Ok(ExitStatus::Signal(sig as i32));
-            }
-            Ok(WaitStatus::Stopped(_, _)) => {
-                // Child stopped (SIGSTOP/SIGTSTP) -- keep waiting
-                continue;
-            }
-            Ok(_) => return Ok(ExitStatus::Unknown),
-            Err(nix::Error::EINTR) => continue, // Interrupted, retry
-            Err(e) => return Err(KmuxError::Pty(e)),
-        }
-    }
-}
-
-/// Spawn an async task that waits for a child PID and signals completion
-/// via a `watch` channel.
-///
-/// Returns a receiver that yields `Some(ExitStatus)` when the child exits.
-pub fn spawn_wait_task(pid: Pid) -> watch::Receiver<Option<ExitStatus>> {
-    let (tx, rx) = watch::channel(None);
-    tokio::spawn(async move {
-        let result = tokio::task::spawn_blocking(move || blocking_wait(pid)).await;
-        let status = match result {
-            Ok(Ok(s)) => s,
-            Ok(Err(_)) => ExitStatus::Unknown,
-            Err(_) => ExitStatus::Unknown,
-        };
-        // Ignore send errors -- receiver may have been dropped
-        let _ = tx.send(Some(status));
-    });
-    rx
 }
 
 /// Spawn an async task that polls a *foreign* child PID for liveness and

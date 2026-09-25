@@ -29,3 +29,11 @@ exclude_globs = [
     # The EFF diceware wordlist — third-party data, not code we maintain.
     "crates/kmuxd/src/eff_long_wordlist.txt",
 ]
+
+# `kmuxd`'s `fn main` (CLI parse, daemonize, runtime build and teardown) is a
+# process entrypoint: no unit test can call it, so under `--bins` its
+# body-replacement mutant can only ever be "missed", and the per-PR diff job
+# (held to zero survivors) fails every change that so much as edits a comment
+# in it. The five `tests/` e2e suites, which spawn the real binary, are what
+# cover it. Recorded in docs/testing.md §Known exceptions.
+exclude_re = ['crates/kmuxd/src/main\.rs:.*replace main -> ']

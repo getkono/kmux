@@ -593,6 +593,35 @@ mod tests {
 
     // ─── Socket ownership ────────────────────────────────────────────────────
 
+    /// Return once nothing serves the socket at `path` any more.
+    ///
+    /// Dropping a listener does not close the socket while another process
+    /// holds a copy of its fd, and one briefly can: the other tests in this
+    /// binary spawn shells, and a child forked while the listener exists holds
+    /// every fd this process had open until its pre-`exec` sweep closes them —
+    /// a fraction of a millisecond, observed, but enough to answer a
+    /// `connect`. Waiting it out keeps these tests about the code under test,
+    /// not about what a parallel test happened to fork.
+    fn wait_until_unserved(path: &Path) {
+        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        while socket_is_live(path) {
+            assert!(
+                Instant::now() < deadline,
+                "{} is still served, connect said {:?}",
+                path.display(),
+                std::os::unix::net::UnixStream::connect(path).map(|_| "connected")
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    /// Bind `path` and close the listener again, as a daemon does on its way
+    /// out.
+    fn bind_and_close(path: &Path) {
+        drop(std::os::unix::net::UnixListener::bind(path).expect("bind"));
+        wait_until_unserved(path);
+    }
+
     fn guard_for(socket: &Path, pid_path: &Path, pid: u32) -> SocketGuard {
         std::fs::write(pid_path, format!("{pid}\n")).expect("write pid file");
         SocketGuard {
@@ -617,7 +646,7 @@ mod tests {
 
         let mut guard = SocketGuard::for_this_process(socket.clone(), pid.clone());
         assert_eq!(guard.pid, std::process::id(), "not the predecessor's");
-        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind"));
+        bind_and_close(&socket);
         guard.armed = true;
         // The predecessor exits and the successor claims the pid file.
         std::fs::write(&pid, std::process::id().to_string()).expect("claim");
@@ -695,6 +724,7 @@ mod tests {
         );
 
         drop(listener);
+        wait_until_unserved(&socket);
         assert!(
             ensure_no_live_daemon(&socket).is_ok(),
             "a stale socket file"
@@ -741,7 +771,7 @@ mod tests {
         let guard = guard_for(&socket, &pid, 111);
 
         // Bound and then closed, exactly as on the way out.
-        drop(std::os::unix::net::UnixListener::bind(&socket).expect("bind"));
+        bind_and_close(&socket);
 
         drop(guard);
         assert!(!socket.exists());
@@ -799,12 +829,9 @@ mod tests {
 
         // A socket whose listener is gone: what a killed daemon leaves behind.
         let orphan = tmp.path().join("orphan.sock");
-        drop(std::os::unix::net::UnixListener::bind(&orphan).expect("bind"));
-        assert!(
-            !socket_is_live(&orphan),
-            "a socket with no listener, but connect said {:?}",
-            std::os::unix::net::UnixStream::connect(&orphan).map(|_| "connected")
-        );
+        // `bind_and_close` is the assertion: it fails unless the socket stops
+        // being live once the (possibly briefly forked) listener is gone.
+        bind_and_close(&orphan);
     }
 
     #[test]
