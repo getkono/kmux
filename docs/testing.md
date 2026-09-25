@@ -209,7 +209,9 @@ mutants that stand for "this message does nothing" went from 2 to 104.
 R12 is the one row that is not yet a number. The scoring bug is fixed and the
 believability check is in place, but a full sweep takes hours and none has run
 since, so `[[mutants]]` is empty and the per-PR CI job mutates only the diff —
-which needs no baseline, because its scope *is* the change under review. The
+which needs no baseline, because its scope *is* the change under review, and
+which `mutants-gate --diff` holds to zero survivors whatever the table later
+records. The
 weekly sweep is what fills the table in. Recording the June numbers instead
 would have been worse than recording nothing.
 
@@ -292,9 +294,9 @@ the sweep. Those two look identical from the filesystem alone.
 
 **Always read a sweep through `mise run mutants-gate`, never straight off the
 summary line.** The gate's first job is deciding whether the sweep can be true
-at all: it flags any package with a perfect score whose slowest catch finished
-in a fraction of the sweep's own baseline, which is the signature of a test
-command that failed before it ran anything. That is not a hypothetical — it is
+at all: it flags any package with a perfect score where no caught mutant's log
+shows the test harness starting (`running N tests`), which is the signature of a
+test command that failed before it ran anything. That is not a hypothetical — it is
 how 1,320 of the June sweep's 2,592 "caught" mutants came to be fabricated. When
 it fires, the budget comparison is skipped entirely, and `--write` refuses to
 record the sweep. See [docs/quality-gates.md](quality-gates.md).

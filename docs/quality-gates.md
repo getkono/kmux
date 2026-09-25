@@ -190,22 +190,30 @@ with "no library targets found" and cargo-mutants read that failure, correctly
 by its own lights, as a catch. 1,320 of 2,592 "caught" mutants were fabricated,
 and the number was cited as evidence the daemon was well covered.
 
-The tell is timing: a caught mutant runs the whole test binary, so it takes
-roughly as long as the sweep's own baseline; a mutant "caught" by a target that
-does not exist takes no time at all. The gate flags any package with a perfect
-score whose slowest catch is under a fifth of the baseline (or, with no usable
-baseline, under a second). The ratio is self-calibrating, so there is no
-per-crate threshold to tune. `mise run mutants-gate --write` refuses to record
-a sweep it does not believe — recording a fabricated 100% would enshrine it.
+The tell is in each mutant's log: a caught mutant ran the test binary and some
+test in it failed, so its log shows the libtest harness starting (`running N
+tests`); a mutant "caught" by a target that does not exist has cargo's error and
+no harness at all. The gate flags any package with a perfect score where not one
+caught mutant's log shows the harness — evidence, not an inference, so there is
+no threshold to tune. (It used to infer this from timing, a catch under a fifth
+of the sweep's baseline or under a second without one, which would have flagged
+genuine perfect scores: a crate-group's baseline tests every crate in the group
+while a mutant's test phase tests only its own, and a small crate's whole suite
+runs well under a second.) `mise run mutants-gate --write` refuses to record a
+sweep it does not believe — recording a fabricated 100% would enshrine it.
 
 Budgets are absolute `missed` counts, not percentages, so adding well-tested
 code to a crate cannot fail an unrelated PR by moving a ratio. Only crates a
 sweep actually covered are judged, so a sharded or scoped run says nothing
 about the rest instead of reporting them all as stale.
 
-Per PR, CI mutates **the diff only** (`--in-diff`): it needs no baseline and
-cannot go stale, because its scope *is* the change under review. It can be
-skipped with a `skip-mutants` label, which is visible on the PR.
+Per PR, CI mutates **the diff only** (`--in-diff`) and judges it with
+`mutants-gate --diff`, which holds it to **zero** survivors rather than to the
+crates' `[[mutants]]` budgets: those count survivors across a whole crate, so
+held against the few mutants a diff generates they would read as stale and let
+that many new survivors through. That is why the diff job needs no baseline and
+cannot go stale — its scope *is* the change under review. It can be skipped with
+a `skip-mutants` label, which is visible on the PR.
 
 Scoping flags are forwarded to every crate-group pass and echoed on each `==>`
 line, so a CI log says what was actually swept rather than implying it. A group

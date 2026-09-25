@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #MISE description="Judge a cargo-mutants sweep: reject implausible results, then hold survivors against the baseline."
 #USAGE flag "--write" help="record the measured survivor counts as the new budget"
+#USAGE flag "--diff" help="judge a sweep scoped to a change (--in-diff): any survivor fails"
 #
 # Positional args are cargo-mutants output directories. Not declared with
 # `#USAGE arg` because `var=true` plus `default=""` is not valid usage KDL and
@@ -18,10 +19,14 @@
 set -euo pipefail
 
 write=""
+diff=""
 dirs=()
 for arg in "$@"; do
     case "$arg" in
         --write) write="--write" ;;
+        # A sweep scoped to a change (`mise run mutants -- --in-diff ...`): held
+        # to zero survivors, not to the whole-crate budgets.
+        --diff) diff="--diff" ;;
         *) [[ -n "$arg" ]] && dirs+=("$arg") ;;
     esac
 done
@@ -46,4 +51,4 @@ if [[ ${#dirs[@]} -eq 0 ]]; then
     exit 1
 fi
 
-exec cargo run -q -p xtask -- mutants-gate $write "${dirs[@]}"
+exec cargo run -q -p xtask -- mutants-gate $write $diff "${dirs[@]}"

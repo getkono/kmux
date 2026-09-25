@@ -23,12 +23,13 @@ fn main() -> Result<()> {
         Some("mutants-gate") => {
             let rest: Vec<String> = args.collect();
             let write = rest.iter().any(|a| a == "--write");
+            let diff = rest.iter().any(|a| a == "--diff");
             let dirs: Vec<PathBuf> = rest
                 .iter()
                 .filter(|a| !a.starts_with("--"))
                 .map(PathBuf::from)
                 .collect();
-            mutants_gate(&dirs, write)
+            mutants_gate(&dirs, write, diff)
         }
         Some(other) => bail!("unknown command `{other}`; known commands: {COMMANDS}"),
         None => {
@@ -221,9 +222,21 @@ fn lint_gate(write: bool) -> Result<()> {
 ///
 /// Two checks, in this order, because the second is meaningless without the
 /// first: is this sweep believable at all, and then is it within budget.
-fn mutants_gate(dirs: &[PathBuf], write: bool) -> Result<()> {
+///
+/// `diff` marks a sweep scoped to a change (`--in-diff`, the per-PR job). Its
+/// budget is zero survivors, not the crates' `[[mutants]]` rows: those count
+/// every survivor in a whole crate, so held against the few mutants a diff
+/// generates they read as stale and would let up to that many new survivors
+/// through. A diff sweep needs no baseline because its scope is the change.
+fn mutants_gate(dirs: &[PathBuf], write: bool, diff: bool) -> Result<()> {
     if dirs.is_empty() {
         bail!("give at least one cargo-mutants output directory, e.g. mutants.out");
+    }
+    if write && diff {
+        bail!(
+            "--write records whole-crate budgets; a --diff sweep covers only a change \
+             and cannot be one"
+        );
     }
     let sweeps: Vec<mutants::Sweep> = dirs
         .iter()
@@ -267,14 +280,7 @@ fn mutants_gate(dirs: &[PathBuf], write: bool) -> Result<()> {
         return Ok(());
     }
 
-    // Only crates this sweep actually covered are judged. A sharded or scoped
-    // run legitimately says nothing about the rest, and treating silence as
-    // zero would report every uncovered crate's budget as stale.
-    let budgets: BTreeMap<String, usize> = baseline
-        .mutant_budgets()
-        .into_iter()
-        .filter(|(krate, _)| sweep.packages.contains_key(krate))
-        .collect();
+    let budgets = budgets_for_sweep(baseline.mutant_budgets(), &sweep, diff);
     report(
         &mut failures,
         "mutants",
@@ -299,6 +305,25 @@ fn mutants_gate(dirs: &[PathBuf], write: bool) -> Result<()> {
          docs/testing.md.",
         failures.len()
     )
+}
+
+/// The `[[mutants]]` budgets a sweep is held to.
+///
+/// Only crates the sweep actually covered are judged: a sharded or scoped run
+/// legitimately says nothing about the rest, and treating silence as zero would
+/// report every uncovered crate's budget as stale. A diff sweep is held to zero
+/// survivors instead — see [`mutants_gate`].
+fn budgets_for_sweep(
+    all: BTreeMap<String, usize>,
+    sweep: &mutants::Sweep,
+    diff: bool,
+) -> BTreeMap<String, usize> {
+    if diff {
+        return BTreeMap::new();
+    }
+    all.into_iter()
+        .filter(|(krate, _)| sweep.packages.contains_key(krate))
+        .collect()
 }
 
 /// Turn findings into failure lines, naming a few offending sites for the
@@ -459,6 +484,40 @@ mod tests {
             !header.contains("[[lints]]"),
             "measured tables are regenerated, not preserved"
         );
+    }
+
+    fn sweep_covering(crates: &[&str]) -> mutants::Sweep {
+        let mut sweep = mutants::Sweep::default();
+        for krate in crates {
+            sweep.packages.insert(
+                (*krate).to_string(),
+                mutants::PackageReport {
+                    package: (*krate).to_string(),
+                    ..mutants::PackageReport::default()
+                },
+            );
+        }
+        sweep
+    }
+
+    #[test]
+    fn a_full_sweep_is_held_to_the_budgets_of_the_crates_it_covered() {
+        let all = BTreeMap::from([("a".to_string(), 4), ("b".to_string(), 2)]);
+        let budgets = budgets_for_sweep(all, &sweep_covering(&["a"]), false);
+        assert_eq!(budgets, BTreeMap::from([("a".to_string(), 4)]));
+    }
+
+    /// A diff sweep generates a few mutants of a crate, so a whole-crate budget
+    /// would read as stale and let that many new survivors through. Its budget
+    /// is zero.
+    #[test]
+    fn a_diff_sweep_is_held_to_zero_survivors_whatever_the_crate_budgets() {
+        let all = BTreeMap::from([("a".to_string(), 4)]);
+        let budgets = budgets_for_sweep(all, &sweep_covering(&["a"]), true);
+        assert!(budgets.is_empty());
+        let findings = compare(&budgets, &BTreeMap::from([("a".to_string(), 1)]));
+        assert!(findings.iter().all(Finding::is_regression), "{findings:?}");
+        assert_eq!(findings.len(), 1);
     }
 
     #[test]

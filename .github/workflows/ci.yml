@@ -113,8 +113,10 @@ jobs:
         run: mise run deps-audit
 
   # Mutation testing over the PR's own diff. Needs no baseline and cannot go
-  # stale, because its scope IS the change under review. A surviving mutant in
-  # code this PR touched means the change is not covered by any assertion.
+  # stale, because its scope IS the change under review: `mutants-gate --diff`
+  # holds it to zero survivors rather than to the whole-crate budgets. A
+  # surviving mutant in code this PR touched means the change is not covered by
+  # any assertion.
   # See docs/testing.md and docs/quality-gates.md.
   mutants:
     name: Mutation (diff)
@@ -166,7 +168,7 @@ jobs:
       # see xtask/src/mutants.rs for why that is not paranoia.
       - name: Judge the sweep
         if: always()
-        run: mise run mutants-gate
+        run: mise run mutants-gate --diff
 
       - uses: actions/upload-artifact@v4
         if: always()
