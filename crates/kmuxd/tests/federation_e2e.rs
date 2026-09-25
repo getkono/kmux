@@ -16,57 +16,34 @@
 //! This exercises `PeerManager::open_peer` (connect + auth + session list +
 //! local registration), the dispatch branching, and the upstream feed loop.
 //! Gated on the `federation` feature (default-on for kmuxd).
+//!
+//! Every test starts from [`Federation::spawn_pair`] (the two sandboxed
+//! daemons) and, where the link is expected to open, [`Federation::open_peer`].
 
 #![cfg(all(unix, feature = "federation"))]
 
 mod harness;
 
 use std::path::Path;
-use std::time::Duration;
 
 use harness::{
-    Cleanup, Daemon, Sandbox, connect_client, daemon_token, poll_until, read_pid_file, recv_until,
+    Client, E2E_TIMEOUT, Federation, SIZE as ATTACH_SIZE, connect_client, poll_until,
+    read_pid_file, recv_until,
 };
-use kmux_protocol::messages::{
-    ClientMessage, PeerTarget, ServerMessage, SessionEventMsg, TermSize,
-};
+use kmux_protocol::messages::{ClientMessage, ServerMessage, SessionEventMsg, TermSize};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tokio::sync::mpsc;
 
-const ATTACH_SIZE: TermSize = TermSize {
-    rows: 24,
-    cols: 80,
-    pixel_width: 0,
-    pixel_height: 0,
-};
-
-/// Connect a mock client to `sandbox`'s data UDS and authenticate. Returns the
-/// sink and the receiver separately, which is what lets one test drive two GUIs
-/// against one hub.
-async fn connect_authenticated(
-    sandbox: &Sandbox,
-    token: &str,
-) -> (
-    mpsc::UnboundedSender<ClientMessage>,
-    mpsc::UnboundedReceiver<ServerMessage>,
-) {
-    let client = connect_client(sandbox, token).await;
-    (client.tx, client.rx)
-}
-
-/// On the daemon in `sandbox`, create a session whose pane prints `marker` then
-/// `exec`s an interactive shell (so it both shows the marker
-/// in its grid and executes typed input). Records the shell's PID to `pidfile`.
-/// Returns `(remote_word_id, shell_pid)`.
-async fn create_remote_session(
-    sandbox: &Sandbox,
-    token: &str,
-    cwd: &Path,
-    marker: &str,
-    pidfile: &Path,
-) -> (String, i32) {
-    let (client_tx, mut srv_rx) = connect_authenticated(sandbox, token).await;
+/// On the remote daemon, create a session whose pane prints `marker` then
+/// `exec`s an interactive shell (so it both shows the marker in its grid and
+/// executes typed input). Records the shell's PID to `pidfile` and hands it to
+/// the fixture's cleanup. Returns the remote word id.
+async fn create_remote_session(fed: &Federation, marker: &str, pidfile: &Path) -> String {
+    let Client {
+        tx: client_tx,
+        rx: mut srv_rx,
+    } = connect_client(&fed.remote, &fed.remote_token).await;
 
     let script = format!("echo $$ > {}; echo {marker}; exec sh", pidfile.display());
     client_tx
@@ -74,14 +51,14 @@ async fn create_remote_session(
             request_id: 1,
             name: Some("fed-src".into()),
             peer: None,
-            cwd: Some(cwd.display().to_string()),
+            cwd: Some(fed.remote.path().display().to_string()),
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), script],
             size: ATTACH_SIZE,
         })
         .expect("send SessionCreate");
 
-    let created = recv_until(&mut srv_rx, Duration::from_secs(5), |m| {
+    let created = recv_until(&mut srv_rx, E2E_TIMEOUT, |m| {
         matches!(m, ServerMessage::SessionCreated { .. })
     })
     .await
@@ -91,10 +68,11 @@ async fn create_remote_session(
         _ => unreachable!(),
     };
 
-    let pid = read_pid_file(pidfile, Duration::from_secs(5)).expect("shell wrote its PID");
+    let pid = read_pid_file(pidfile, E2E_TIMEOUT).expect("shell wrote its PID");
+    fed.cleanup.track(pid);
     // Drop the client; the daemon keeps the session alive without it.
     drop(client_tx);
-    (word_id, pid)
+    word_id
 }
 
 /// Flatten a grid snapshot's cells into a string (row-major) for marker scanning.
@@ -110,7 +88,7 @@ async fn federated_pane(
 ) -> String {
     tx.send(ClientMessage::SessionList { request_id: 100 })
         .expect("send SessionList");
-    let list = recv_until(rx, Duration::from_secs(5), |m| {
+    let list = recv_until(rx, E2E_TIMEOUT, |m| {
         matches!(m, ServerMessage::SessionListResult { .. })
     })
     .await
@@ -131,72 +109,28 @@ async fn federated_pane(
 /// local daemon over a single federated link, and both input and output flow.
 #[tokio::test]
 async fn gui_attaches_to_remote_session_through_local_daemon() {
-    let cleanup = Cleanup::default();
-
-    let remote = Sandbox::new();
-    let local = Sandbox::new();
-
-    // ── Remote daemon: host a real session with a known startup marker. ──
-    let remote_pid = Daemon::new(&remote).spawn(None).await;
-    cleanup.track(remote_pid as i32);
-    let remote_status = kmux_client::daemon::query_daemon_at(&remote.socket_path())
-        .await
-        .expect("remote daemon status");
-    let remote_token = remote_status.token.clone();
-    let remote_tcp = remote_status.tcp_port;
-    assert!(
-        remote_tcp != 0,
-        "remote daemon must expose an ephemeral TCP+TLS port for federation"
-    );
-
+    // ── The remote hosts a real session with a known startup marker; the local
+    //    daemon is the per-user hub the GUI actually talks to. ──
+    let fed = Federation::spawn_pair().await;
     const MARKER: &str = "FEDMARKER_OUTPUT";
-    let pidfile = remote.path().join("shell.pid");
-    let (remote_word, shell_pid) =
-        create_remote_session(&remote, &remote_token, remote.path(), MARKER, &pidfile).await;
-    cleanup.track(shell_pid);
+    let pidfile = fed.remote.path().join("shell.pid");
+    let remote_word = create_remote_session(&fed, MARKER, &pidfile).await;
 
-    // ── Local daemon: the per-user hub the GUI actually talks to. ──
-    let local_pid = Daemon::new(&local).spawn(None).await;
-    cleanup.track(local_pid as i32);
-    let local_token = daemon_token(&local).await;
-
-    // ── Mock GUI → local daemon (UDS). ──
-    let (gui_tx, mut gui_rx) = connect_authenticated(&local, &local_token).await;
-
-    // 1. Federate the local daemon to the remote over a direct TCP+TLS endpoint.
-    gui_tx
-        .send(ClientMessage::OpenPeer {
-            request_id: 10,
-            target: PeerTarget::Direct {
-                host: "127.0.0.1".into(),
-                port: remote_tcp,
-                token: remote_token.clone(),
-                accept_invalid_certs: true,
-            },
-        })
-        .expect("send OpenPeer");
-    let opened = recv_until(&mut gui_rx, Duration::from_secs(15), |m| {
-        matches!(
-            m,
-            ServerMessage::PeerOpened { .. } | ServerMessage::PeerError { .. }
-        )
-    })
-    .await
-    .expect("expected a PeerOpened/PeerError reply");
-    match opened {
-        ServerMessage::PeerOpened { peer, .. } => {
-            assert_eq!(peer, format!("127.0.0.1:{remote_tcp}"));
-        }
-        ServerMessage::PeerError { reason, .. } => panic!("federation failed: {reason}"),
-        _ => unreachable!(),
-    }
+    // 1. A mock GUI federates the local daemon to the remote over a direct
+    //    TCP+TLS endpoint.
+    let (gui, peer) = fed.open_peer().await;
+    let Client {
+        tx: gui_tx,
+        rx: mut gui_rx,
+    } = gui;
+    assert_eq!(peer, format!("127.0.0.1:{}", fed.remote_tcp));
 
     // 2. The remote's session must appear in the local daemon's session list,
     //    under a *local* word ID (not the remote's) and a peer-decorated name.
     gui_tx
         .send(ClientMessage::SessionList { request_id: 11 })
         .expect("send SessionList");
-    let list = recv_until(&mut gui_rx, Duration::from_secs(5), |m| {
+    let list = recv_until(&mut gui_rx, E2E_TIMEOUT, |m| {
         matches!(m, ServerMessage::SessionListResult { .. })
     })
     .await
@@ -228,7 +162,7 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
         })
         .expect("send Attach");
     let want_pane = local_pane.clone();
-    let snapshot = recv_until(&mut gui_rx, Duration::from_secs(15), move |m| {
+    let snapshot = recv_until(&mut gui_rx, E2E_TIMEOUT, move |m| {
         matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == want_pane)
     })
     .await
@@ -245,7 +179,7 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
 
     // 4. Input typed into the GUI must run on the *remote* PTY. Drive a `touch`
     //    and observe the file appear on the remote daemon's host.
-    let input_marker = remote.path().join("fed_input_marker");
+    let input_marker = fed.remote.path().join("fed_input_marker");
     assert!(!input_marker.exists());
     let cmd = format!("touch {}\n", input_marker.display());
     gui_tx
@@ -255,7 +189,7 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
         })
         .expect("send PtyInput");
     assert!(
-        poll_until(Duration::from_secs(15), || input_marker.exists()).await,
+        poll_until(E2E_TIMEOUT, || input_marker.exists()).await,
         "GUI input must reach the remote PTY and create the marker file"
     );
 
@@ -270,7 +204,7 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
         })
         .expect("send title-setting input");
     let want_title_pane = local_pane.clone();
-    let title_evt = recv_until(&mut gui_rx, Duration::from_secs(15), move |m| {
+    let title_evt = recv_until(&mut gui_rx, E2E_TIMEOUT, move |m| {
         matches!(m, ServerMessage::Event {
             event: SessionEventMsg::PaneTitleChanged { pane_id, title },
         } if *pane_id == want_title_pane && title.contains("FEDTITLE_XYZ"))
@@ -283,8 +217,7 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
 
     // ── Teardown. ──
     drop(gui_tx);
-    let _ = kmux_client::daemon::stop_daemon_at(&local.socket_path()).await;
-    let _ = kmux_client::daemon::stop_daemon_at(&remote.socket_path()).await;
+    fed.shutdown().await;
 }
 
 /// Creating a session on a federated peer (issue #121 launcher): the GUI sends
@@ -293,70 +226,32 @@ async fn gui_attaches_to_remote_session_through_local_daemon() {
 /// session attributed to its peer. The new session must run on the *remote* host.
 #[tokio::test]
 async fn gui_creates_a_session_on_a_federated_peer() {
-    let cleanup = Cleanup::default();
-
-    let remote = Sandbox::new();
-    let local = Sandbox::new();
-
-    // ── Remote daemon: starts with no sessions; the hub will create one on it. ──
-    let remote_pid = Daemon::new(&remote).spawn(None).await;
-    cleanup.track(remote_pid as i32);
-    let remote_status = kmux_client::daemon::query_daemon_at(&remote.socket_path())
-        .await
-        .expect("remote daemon status");
-    let remote_token = remote_status.token.clone();
-    let remote_tcp = remote_status.tcp_port;
-    assert!(remote_tcp != 0, "remote daemon must expose a TCP+TLS port");
-
-    // ── Local hub daemon: what the GUI talks to. ──
-    let local_pid = Daemon::new(&local).spawn(None).await;
-    cleanup.track(local_pid as i32);
-    let local_token = daemon_token(&local).await;
-
-    let (gui_tx, mut gui_rx) = connect_authenticated(&local, &local_token).await;
+    // ── The remote starts with no sessions; the hub will create one on it. ──
+    let fed = Federation::spawn_pair().await;
 
     // 1. Federate the hub to the remote.
-    gui_tx
-        .send(ClientMessage::OpenPeer {
-            request_id: 10,
-            target: PeerTarget::Direct {
-                host: "127.0.0.1".into(),
-                port: remote_tcp,
-                token: remote_token.clone(),
-                accept_invalid_certs: true,
-            },
-        })
-        .expect("send OpenPeer");
-    let peer_id = match recv_until(&mut gui_rx, Duration::from_secs(15), |m| {
-        matches!(
-            m,
-            ServerMessage::PeerOpened { .. } | ServerMessage::PeerError { .. }
-        )
-    })
-    .await
-    .expect("expected a PeerOpened/PeerError reply")
-    {
-        ServerMessage::PeerOpened { peer, .. } => peer,
-        ServerMessage::PeerError { reason, .. } => panic!("federation failed: {reason}"),
-        _ => unreachable!(),
-    };
+    let (gui, peer_id) = fed.open_peer().await;
+    let Client {
+        tx: gui_tx,
+        rx: mut gui_rx,
+    } = gui;
 
     // 2. Create a new session ON the peer. The shell records its PID so we can
     //    prove a live *remote* PTY was spawned (and clean it up).
-    let pidfile = remote.path().join("created.pid");
+    let pidfile = fed.remote.path().join("created.pid");
     let script = format!("echo $$ > {}; exec sleep 600", pidfile.display());
     gui_tx
         .send(ClientMessage::SessionCreate {
             request_id: 20,
             name: Some("made-on-remote".into()),
-            cwd: Some(remote.path().display().to_string()),
+            cwd: Some(fed.remote.path().display().to_string()),
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), script],
             size: ATTACH_SIZE,
             peer: Some(peer_id.clone()),
         })
         .expect("send SessionCreate on peer");
-    let entry = match recv_until(&mut gui_rx, Duration::from_secs(15), |m| {
+    let entry = match recv_until(&mut gui_rx, E2E_TIMEOUT, |m| {
         matches!(
             m,
             ServerMessage::SessionCreated { .. } | ServerMessage::Error { .. }
@@ -384,16 +279,16 @@ async fn gui_creates_a_session_on_a_federated_peer() {
     );
 
     // 3. The shell really ran on the remote host: its PID file appears there.
-    let shell_pid = read_pid_file(&pidfile, Duration::from_secs(15))
-        .expect("peer-created shell must write PID");
-    cleanup.track(shell_pid);
+    let shell_pid =
+        read_pid_file(&pidfile, E2E_TIMEOUT).expect("peer-created shell must write PID");
+    fed.cleanup.track(shell_pid);
 
     // 4. The new session appears in the hub's merged list, attributed to its peer.
     gui_tx
         .send(ClientMessage::SessionList { request_id: 21 })
         .expect("send SessionList");
     let ServerMessage::SessionListResult { sessions, .. } =
-        recv_until(&mut gui_rx, Duration::from_secs(5), |m| {
+        recv_until(&mut gui_rx, E2E_TIMEOUT, |m| {
             matches!(m, ServerMessage::SessionListResult { .. })
         })
         .await
@@ -411,8 +306,7 @@ async fn gui_creates_a_session_on_a_federated_peer() {
 
     // ── Teardown. ──
     drop(gui_tx);
-    let _ = kmux_client::daemon::stop_daemon_at(&local.socket_path()).await;
-    let _ = kmux_client::daemon::stop_daemon_at(&remote.socket_path()).await;
+    fed.shutdown().await;
 }
 
 /// PR4 reconciliation: two local GUIs share **one** proxied pane over a single
@@ -420,29 +314,11 @@ async fn gui_creates_a_session_on_a_federated_peer() {
 /// and the late viewer is served the live mirror's content.
 #[tokio::test]
 async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
-    let cleanup = Cleanup::default();
-
-    let remote = Sandbox::new();
-    let local = Sandbox::new();
-
-    // Remote daemon hosting a marked session, then the local hub.
-    let remote_pid = Daemon::new(&remote).spawn(None).await;
-    cleanup.track(remote_pid as i32);
-    let remote_status = kmux_client::daemon::query_daemon_at(&remote.socket_path())
-        .await
-        .expect("remote daemon status");
-    let remote_token = remote_status.token.clone();
-    let remote_tcp = remote_status.tcp_port;
-
+    // Remote daemon hosting a marked session, and the local hub.
+    let fed = Federation::spawn_pair().await;
     const MARKER: &str = "SHARED_PANE_MARKER";
-    let pidfile = remote.path().join("shell.pid");
-    let (_remote_word, shell_pid) =
-        create_remote_session(&remote, &remote_token, remote.path(), MARKER, &pidfile).await;
-    cleanup.track(shell_pid);
-
-    let local_pid = Daemon::new(&local).spawn(None).await;
-    cleanup.track(local_pid as i32);
-    let local_token = daemon_token(&local).await;
+    let pidfile = fed.remote.path().join("shell.pid");
+    create_remote_session(&fed, MARKER, &pidfile).await;
 
     let big = TermSize {
         rows: 24,
@@ -458,30 +334,11 @@ async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
     };
 
     // GUI-1 federates and attaches at the LARGE size.
-    let (gui1_tx, mut gui1_rx) = connect_authenticated(&local, &local_token).await;
-    gui1_tx
-        .send(ClientMessage::OpenPeer {
-            request_id: 1,
-            target: PeerTarget::Direct {
-                host: "127.0.0.1".into(),
-                port: remote_tcp,
-                token: remote_token.clone(),
-                accept_invalid_certs: true,
-            },
-        })
-        .expect("send OpenPeer");
-    let opened = recv_until(&mut gui1_rx, Duration::from_secs(15), |m| {
-        matches!(
-            m,
-            ServerMessage::PeerOpened { .. } | ServerMessage::PeerError { .. }
-        )
-    })
-    .await
-    .expect("expected a peer reply");
-    assert!(
-        matches!(opened, ServerMessage::PeerOpened { .. }),
-        "federation must open: {opened:?}"
-    );
+    let (gui1, _peer) = fed.open_peer().await;
+    let Client {
+        tx: gui1_tx,
+        rx: mut gui1_rx,
+    } = gui1;
 
     let local_pane = federated_pane(&gui1_tx, &mut gui1_rx).await;
     gui1_tx
@@ -495,7 +352,7 @@ async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
     let want = local_pane.clone();
     let snap1 = recv_until(
         &mut gui1_rx,
-        Duration::from_secs(15),
+        E2E_TIMEOUT,
         move |m| matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == want),
     )
     .await
@@ -507,7 +364,10 @@ async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
 
     // GUI-2 (a second connection to the SAME local daemon) sees the session via the
     // already-open peer — one shared upstream link — and attaches at the SMALL size.
-    let (gui2_tx, mut gui2_rx) = connect_authenticated(&local, &local_token).await;
+    let Client {
+        tx: gui2_tx,
+        rx: mut gui2_rx,
+    } = fed.connect_gui().await;
     let local_pane2 = federated_pane(&gui2_tx, &mut gui2_rx).await;
     assert_eq!(
         local_pane2, local_pane,
@@ -525,7 +385,7 @@ async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
     let want2 = local_pane.clone();
     let snap2 = recv_until(
         &mut gui2_rx,
-        Duration::from_secs(15),
+        E2E_TIMEOUT,
         move |m| matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == want2),
     )
     .await
@@ -539,7 +399,7 @@ async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
     // receives a snapshot resized DOWN to 10 rows. With last-writer-wins this would
     // never arrive (GUI-2's larger... smaller size would be ignored or GUI-1 kept big).
     let want3 = local_pane.clone();
-    let shrunk = recv_until(&mut gui1_rx, Duration::from_secs(15), move |m| {
+    let shrunk = recv_until(&mut gui1_rx, E2E_TIMEOUT, move |m| {
         matches!(m, ServerMessage::TerminalSnapshot { pane_id, snapshot, .. }
             if *pane_id == want3 && snapshot.rows == 10)
     })
@@ -552,8 +412,7 @@ async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
     // ── Teardown. ──
     drop(gui1_tx);
     drop(gui2_tx);
-    let _ = kmux_client::daemon::stop_daemon_at(&local.socket_path()).await;
-    let _ = kmux_client::daemon::stop_daemon_at(&remote.socket_path()).await;
+    fed.shutdown().await;
 }
 
 /// PR6 hardening: when the remote daemon dies, the failure is isolated. The GUI's
@@ -561,59 +420,17 @@ async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
 /// keeps serving — proxied panes live apart from locally-hosted ones.
 #[tokio::test]
 async fn remote_daemon_death_is_isolated_from_local_daemon() {
-    let cleanup = Cleanup::default();
-
-    let remote = Sandbox::new();
-    let local = Sandbox::new();
-
-    // Remote daemon + a session, then the local hub.
-    let remote_pid = Daemon::new(&remote).spawn(None).await;
-    cleanup.track(remote_pid as i32);
-    let remote_status = kmux_client::daemon::query_daemon_at(&remote.socket_path())
-        .await
-        .expect("remote daemon status");
-    let remote_token = remote_status.token.clone();
-    let remote_tcp = remote_status.tcp_port;
-    let pidfile = remote.path().join("shell.pid");
-    let (_remote_word, shell_pid) = create_remote_session(
-        &remote,
-        &remote_token,
-        remote.path(),
-        "ISO_MARKER",
-        &pidfile,
-    )
-    .await;
-    cleanup.track(shell_pid);
-
-    let local_pid = Daemon::new(&local).spawn(None).await;
-    cleanup.track(local_pid as i32);
-    let local_token = daemon_token(&local).await;
+    // Remote daemon + a session, and the local hub.
+    let fed = Federation::spawn_pair().await;
+    let pidfile = fed.remote.path().join("shell.pid");
+    create_remote_session(&fed, "ISO_MARKER", &pidfile).await;
 
     // GUI federates and attaches to the remote session through the local daemon.
-    let (gui_tx, mut gui_rx) = connect_authenticated(&local, &local_token).await;
-    gui_tx
-        .send(ClientMessage::OpenPeer {
-            request_id: 1,
-            target: PeerTarget::Direct {
-                host: "127.0.0.1".into(),
-                port: remote_tcp,
-                token: remote_token.clone(),
-                accept_invalid_certs: true,
-            },
-        })
-        .expect("send OpenPeer");
-    let opened = recv_until(&mut gui_rx, Duration::from_secs(15), |m| {
-        matches!(
-            m,
-            ServerMessage::PeerOpened { .. } | ServerMessage::PeerError { .. }
-        )
-    })
-    .await
-    .expect("expected a peer reply");
-    assert!(
-        matches!(opened, ServerMessage::PeerOpened { .. }),
-        "federation must open: {opened:?}"
-    );
+    let (gui, _peer) = fed.open_peer().await;
+    let Client {
+        tx: gui_tx,
+        rx: mut gui_rx,
+    } = gui;
     let local_pane = federated_pane(&gui_tx, &mut gui_rx).await;
     let local_word = local_pane.split('/').next().unwrap().to_string();
     gui_tx
@@ -625,7 +442,7 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
         .expect("gui Attach");
     let want = local_pane.clone();
     assert!(
-        recv_until(&mut gui_rx, Duration::from_secs(15), move |m| {
+        recv_until(&mut gui_rx, E2E_TIMEOUT, move |m| {
             matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == want)
         })
         .await
@@ -634,11 +451,11 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
     );
 
     // Kill the remote daemon hard — its TCP link drops under the local daemon.
-    let _ = kill(Pid::from_raw(remote_pid as i32), Signal::SIGKILL);
+    let _ = kill(Pid::from_raw(fed.remote_pid as i32), Signal::SIGKILL);
 
     // Isolation #1: the GUI's federated session is closed cleanly, not hung.
     let want_word = local_word.clone();
-    let closed = recv_until(&mut gui_rx, Duration::from_secs(15), move |m| {
+    let closed = recv_until(&mut gui_rx, E2E_TIMEOUT, move |m| {
         matches!(m, ServerMessage::Event {
             event: SessionEventMsg::SessionClosed { word_id },
         } if *word_id == want_word)
@@ -656,13 +473,13 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
             request_id: 2,
             name: Some("local-after-death".into()),
             peer: None,
-            cwd: Some(local.path().display().to_string()),
+            cwd: Some(fed.local.path().display().to_string()),
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), "exec sleep 600".into()],
             size: ATTACH_SIZE,
         })
         .expect("send local SessionCreate");
-    let created = recv_until(&mut gui_rx, Duration::from_secs(10), |m| {
+    let created = recv_until(&mut gui_rx, E2E_TIMEOUT, |m| {
         matches!(m, ServerMessage::SessionCreated { .. })
     })
     .await;
@@ -673,7 +490,7 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
 
     // ── Teardown (remote already dead). ──
     drop(gui_tx);
-    let _ = kmux_client::daemon::stop_daemon_at(&local.socket_path()).await;
+    fed.shutdown().await;
 }
 
 /// PR6 hardening: two GUIs federating the **same** remote target concurrently
@@ -685,38 +502,23 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
 /// (which would make the federated pane un-attachable).
 #[tokio::test]
 async fn concurrent_open_peer_to_same_target_converges_on_one_link() {
-    let cleanup = Cleanup::default();
-
-    let remote = Sandbox::new();
-    let local = Sandbox::new();
-
-    let remote_pid = Daemon::new(&remote).spawn(None).await;
-    cleanup.track(remote_pid as i32);
-    let remote_status = kmux_client::daemon::query_daemon_at(&remote.socket_path())
-        .await
-        .expect("remote daemon status");
-    let remote_token = remote_status.token.clone();
-    let remote_tcp = remote_status.tcp_port;
-
+    let fed = Federation::spawn_pair().await;
     const MARKER: &str = "CONCURRENT_OPEN_MARKER";
-    let pidfile = remote.path().join("shell.pid");
-    let (_remote_word, shell_pid) =
-        create_remote_session(&remote, &remote_token, remote.path(), MARKER, &pidfile).await;
-    cleanup.track(shell_pid);
+    let pidfile = fed.remote.path().join("shell.pid");
+    create_remote_session(&fed, MARKER, &pidfile).await;
 
-    let local_pid = Daemon::new(&local).spawn(None).await;
-    cleanup.track(local_pid as i32);
-    let local_token = daemon_token(&local).await;
+    // Both opens are sent by hand rather than through `Federation::open_peer`,
+    // which awaits its reply: the point is two handshakes in flight at once.
+    let Client {
+        tx: gui1_tx,
+        rx: mut gui1_rx,
+    } = fed.connect_gui().await;
+    let Client {
+        tx: gui2_tx,
+        rx: mut gui2_rx,
+    } = fed.connect_gui().await;
 
-    let (gui1_tx, mut gui1_rx) = connect_authenticated(&local, &local_token).await;
-    let (gui2_tx, mut gui2_rx) = connect_authenticated(&local, &local_token).await;
-
-    let target = || PeerTarget::Direct {
-        host: "127.0.0.1".into(),
-        port: remote_tcp,
-        token: remote_token.clone(),
-        accept_invalid_certs: true,
-    };
+    let target = || fed.remote_target(&fed.remote_token);
     // Fire BOTH opens before awaiting either reply, so the two handshakes overlap
     // and race to publish — exactly the window the fix closes.
     gui1_tx
@@ -741,8 +543,8 @@ async fn concurrent_open_peer_to_same_target_converges_on_one_link() {
     // Disjoint mutable borrows (gui1_rx vs gui2_rx), so both futures poll under one
     // `join!` and the two opens are genuinely in flight at once.
     let (r1, r2) = tokio::join!(
-        recv_until(&mut gui1_rx, Duration::from_secs(15), is_peer_reply),
-        recv_until(&mut gui2_rx, Duration::from_secs(15), is_peer_reply),
+        recv_until(&mut gui1_rx, E2E_TIMEOUT, is_peer_reply),
+        recv_until(&mut gui2_rx, E2E_TIMEOUT, is_peer_reply),
     );
     let peer_of = |r: Option<ServerMessage>| match r {
         Some(ServerMessage::PeerOpened { peer, .. }) => peer,
@@ -759,7 +561,7 @@ async fn concurrent_open_peer_to_same_target_converges_on_one_link() {
     gui1_tx
         .send(ClientMessage::SessionList { request_id: 50 })
         .expect("send SessionList");
-    let list = recv_until(&mut gui1_rx, Duration::from_secs(5), |m| {
+    let list = recv_until(&mut gui1_rx, E2E_TIMEOUT, |m| {
         matches!(m, ServerMessage::SessionListResult { .. })
     })
     .await
@@ -790,7 +592,7 @@ async fn concurrent_open_peer_to_same_target_converges_on_one_link() {
         .expect("send Attach");
     let want = local_pane.clone();
     assert!(
-        recv_until(&mut gui1_rx, Duration::from_secs(15), move |m| {
+        recv_until(&mut gui1_rx, E2E_TIMEOUT, move |m| {
             matches!(m, ServerMessage::TerminalSnapshot { pane_id, snapshot, .. }
                 if *pane_id == want && snapshot_text(snapshot).contains(MARKER))
         })
@@ -802,8 +604,7 @@ async fn concurrent_open_peer_to_same_target_converges_on_one_link() {
     // ── Teardown. ──
     drop(gui1_tx);
     drop(gui2_tx);
-    let _ = kmux_client::daemon::stop_daemon_at(&local.socket_path()).await;
-    let _ = kmux_client::daemon::stop_daemon_at(&remote.socket_path()).await;
+    fed.shutdown().await;
 }
 
 /// PR6 hardening: an upstream peer link that **rejects authentication** surfaces
@@ -817,38 +618,21 @@ async fn concurrent_open_peer_to_same_target_converges_on_one_link() {
 /// supported range).
 #[tokio::test]
 async fn federation_surfaces_upstream_auth_rejection_as_peer_error() {
-    let cleanup = Cleanup::default();
-
-    let remote = Sandbox::new();
-    let local = Sandbox::new();
-
-    // Remote daemon (real token), then the local hub.
-    let remote_pid = Daemon::new(&remote).spawn(None).await;
-    cleanup.track(remote_pid as i32);
-    let remote_status = kmux_client::daemon::query_daemon_at(&remote.socket_path())
-        .await
-        .expect("remote daemon status");
-    let remote_tcp = remote_status.tcp_port;
-
-    let local_pid = Daemon::new(&local).spawn(None).await;
-    cleanup.track(local_pid as i32);
-    let local_token = daemon_token(&local).await;
+    let fed = Federation::spawn_pair().await;
 
     // GUI federates with a WRONG token — the remote rejects authentication, the
     // same `AuthResult { success: false }` a version mismatch produces.
-    let (gui_tx, mut gui_rx) = connect_authenticated(&local, &local_token).await;
+    let Client {
+        tx: gui_tx,
+        rx: mut gui_rx,
+    } = fed.connect_gui().await;
     gui_tx
         .send(ClientMessage::OpenPeer {
             request_id: 1,
-            target: PeerTarget::Direct {
-                host: "127.0.0.1".into(),
-                port: remote_tcp,
-                token: "definitely-not-the-remote-token".into(),
-                accept_invalid_certs: true,
-            },
+            target: fed.remote_target("definitely-not-the-remote-token"),
         })
         .expect("send OpenPeer");
-    let reply = recv_until(&mut gui_rx, Duration::from_secs(15), |m| {
+    let reply = recv_until(&mut gui_rx, E2E_TIMEOUT, |m| {
         matches!(
             m,
             ServerMessage::PeerOpened { .. } | ServerMessage::PeerError { .. }
@@ -873,14 +657,14 @@ async fn federation_surfaces_upstream_auth_rejection_as_peer_error() {
             request_id: 2,
             name: Some("local-after-reject".into()),
             peer: None,
-            cwd: Some(local.path().display().to_string()),
+            cwd: Some(fed.local.path().display().to_string()),
             program: Some("/bin/sh".into()),
             args: vec!["-c".into(), "exec sleep 600".into()],
             size: ATTACH_SIZE,
         })
         .expect("send local SessionCreate");
     assert!(
-        recv_until(&mut gui_rx, Duration::from_secs(10), |m| {
+        recv_until(&mut gui_rx, E2E_TIMEOUT, |m| {
             matches!(m, ServerMessage::SessionCreated { .. })
         })
         .await
@@ -890,6 +674,5 @@ async fn federation_surfaces_upstream_auth_rejection_as_peer_error() {
 
     // ── Teardown. ──
     drop(gui_tx);
-    let _ = kmux_client::daemon::stop_daemon_at(&local.socket_path()).await;
-    let _ = kmux_client::daemon::stop_daemon_at(&remote.socket_path()).await;
+    fed.shutdown().await;
 }

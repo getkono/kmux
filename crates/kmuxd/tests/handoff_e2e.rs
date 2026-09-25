@@ -14,7 +14,6 @@
 mod harness;
 
 use std::path::Path;
-use std::time::Duration;
 
 use harness::{
     Cleanup, Daemon, SIZE, Sandbox, connect_client, daemon_token, pid_alive, poll_until,
@@ -51,13 +50,13 @@ async fn create_session_with_recorded_child(
         })
         .expect("send SessionCreate");
 
-    let created = recv_until(&mut srv_rx, Duration::from_secs(5), |m| {
+    let created = recv_until(&mut srv_rx, harness::E2E_TIMEOUT, |m| {
         matches!(m, ServerMessage::SessionCreated { .. })
     })
     .await;
     assert!(created.is_some(), "expected a SessionCreated ack");
 
-    let pid = read_pid_file(pidfile, Duration::from_secs(5)).expect("shell wrote its PID");
+    let pid = read_pid_file(pidfile, harness::E2E_TIMEOUT).expect("shell wrote its PID");
     // Drop the client connection — the server keeps the session alive without it.
     drop(client_tx);
     pid
@@ -99,7 +98,7 @@ async fn live_restart_preserves_running_shell_across_processes() {
     cleanup.track(new_pid as i32);
     assert_ne!(new_pid, old_pid, "the successor must have a distinct PID");
     assert!(
-        poll_until(Duration::from_secs(15), || !pid_alive(old_pid as i32)).await,
+        poll_until(harness::E2E_TIMEOUT, || !pid_alive(old_pid as i32)).await,
         "the old daemon should exit after releasing its sockets"
     );
 

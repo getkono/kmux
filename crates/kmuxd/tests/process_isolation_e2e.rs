@@ -61,7 +61,7 @@ async fn worker_crash_is_isolated_from_the_daemon() {
     // the worker pane is live end-to-end through the daemon.
     let snap = recv_until(
         &mut client.rx,
-        Duration::from_secs(5),
+        harness::E2E_TIMEOUT,
         |m| matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == pane_a),
     )
     .await;
@@ -71,7 +71,7 @@ async fn worker_crash_is_isolated_from_the_daemon() {
     );
 
     // Find and abnormally kill the pane's worker.
-    let worker_pid = find_worker_pid(daemon_pid, Duration::from_secs(5))
+    let worker_pid = find_worker_pid(daemon_pid, harness::E2E_TIMEOUT)
         .expect("the isolated worker subprocess should be running");
     cleanup.track(worker_pid);
     assert!(
@@ -81,7 +81,7 @@ async fn worker_crash_is_isolated_from_the_daemon() {
     kill(Pid::from_raw(worker_pid), Signal::SIGKILL).expect("kill worker");
 
     // The client is told its pane faulted (not that the daemon died).
-    let faulted = recv_until(&mut client.rx, Duration::from_secs(10), |m| {
+    let faulted = recv_until(&mut client.rx, harness::E2E_TIMEOUT, |m| {
         matches!(
             m,
             ServerMessage::Event {
@@ -99,7 +99,7 @@ async fn worker_crash_is_isolated_from_the_daemon() {
     // and resyncs the client to the fresh emulator with a snapshot.
     let resync = recv_until(
         &mut client.rx,
-        Duration::from_secs(10),
+        harness::E2E_TIMEOUT,
         |m| matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == pane_a),
     )
     .await;
@@ -108,7 +108,7 @@ async fn worker_crash_is_isolated_from_the_daemon() {
         "the faulted pane should respawn its worker and resync the client"
     );
     assert!(
-        find_worker_pid(daemon_pid, Duration::from_secs(5)).is_some(),
+        find_worker_pid(daemon_pid, harness::E2E_TIMEOUT).is_some(),
         "a replacement worker should be running for the recovered pane"
     );
 
@@ -127,7 +127,7 @@ async fn worker_crash_is_isolated_from_the_daemon() {
     let pane_b = create_and_attach(&mut client_b, 2, None).await;
     let snap_b = recv_until(
         &mut client_b.rx,
-        Duration::from_secs(5),
+        harness::E2E_TIMEOUT,
         |m| matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == pane_b),
     )
     .await;
@@ -135,7 +135,7 @@ async fn worker_crash_is_isolated_from_the_daemon() {
         snap_b.is_some(),
         "a fresh isolated session must work after another worker crashed"
     );
-    if let Some(b) = find_worker_pid(daemon_pid, Duration::from_secs(5)) {
+    if let Some(b) = find_worker_pid(daemon_pid, harness::E2E_TIMEOUT) {
         cleanup.track(b);
     }
 }
