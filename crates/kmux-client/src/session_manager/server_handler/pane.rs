@@ -136,10 +136,12 @@ impl SessionManager {
 
     /// A pane was spawned — by a session/tab create, a split, or a
     /// restore. Same shape: an id, no `PaneInfo`, no layout.
+    ///
+    /// A pane of a session this client has not listed is news too: the client
+    /// lists every session, so an unlisted one was created since, possibly by
+    /// another GUI. Only an unparsable id is left alone.
     pub(super) fn on_event_pane_spawned(&mut self, pane_id: &str) -> Vec<SessionEvent> {
-        let cached = kmux_protocol::pane_word(pane_id)
-            .is_none_or(|word_id| !self.knows_session(word_id))
-            || self.knows_pane(pane_id);
+        let cached = kmux_protocol::pane_word(pane_id).is_none() || self.knows_pane(pane_id);
         self.resync_unless_cached(cached);
         Vec::new()
     }

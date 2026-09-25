@@ -603,12 +603,29 @@ impl SessionManager {
         for entry in &mut self.session_list {
             entry.panes.retain(|p| p.pane_id != pane_id);
         }
+        self.visible_panes.retain(|p| *p != pane_id);
         if self.active_pane.as_deref() == Some(&pane_id) {
+            // A sibling in the tab on screen is already attached: focus it.
+            // Otherwise the fallback may sit in another tab or session, so the
+            // whole view moves there — session, tab, visible set and focus
+            // together. Setting only `active_pane` left input going to a pane
+            // the user could not see, and a `SessionClosed` arriving after the
+            // session's `PaneClosed` broadcasts found the view half-moved.
+            if let Some(sibling) = self.visible_panes.first().cloned() {
+                self.active_pane = Some(sibling);
+                return Some(SessionEvent::PaneClosed { pane_id });
+            }
             match self.find_fallback_pane() {
                 Some((word_id, pane)) => {
-                    self.active_session = Some(word_id);
-                    self.active_pane = Some(pane.clone());
-                    self.attach_fresh(pane);
+                    if self.active_session.as_deref() == Some(word_id.as_str()) {
+                        // Nothing on screen survived, so the viewed tab is
+                        // spent; clearing it makes `select_pane` re-derive the
+                        // tab from the fallback's position.
+                        self.active_tab = None;
+                        self.select_pane(pane);
+                    } else {
+                        self.select_session(word_id);
+                    }
                 }
                 None => {
                     // Nothing left to show. The viewed tab and its attached set
@@ -795,8 +812,10 @@ impl SessionManager {
         {
             return Some((word_id.clone(), pane_id));
         }
-        // 2. Fall back to the first pane of any session.
-        self.session_list.first().and_then(|e| {
+        // 2. Fall back to the first pane of any session — skipping sessions
+        //    whose panes have all gone, such as one whose `PaneClosed`
+        //    broadcasts have drained it ahead of its `SessionClosed`.
+        self.session_list.iter().find_map(|e| {
             e.panes
                 .first()
                 .map(|p| (e.meta.word_id.clone(), p.pane_id.clone()))
@@ -1134,7 +1153,9 @@ mod tests {
         // assertion below. Deriving a new tree here would only race the
         // authoritative one.
         assert_eq!(mgr.session_list[0].tabs[0].layout.leaves(), vec![0]);
-        assert_eq!(mgr.visible_panes(), ["eagle/0"]);
+        // The attached set is the client's own, though: it must not keep
+        // naming a pane that no longer exists.
+        assert!(mgr.visible_panes().is_empty());
 
         // This pane was the session's last, so the daemon's follow-up is
         // `Event{SessionClosed}`, and that is what clears the stale tree.
@@ -1174,16 +1195,81 @@ mod tests {
         );
         assert_eq!(mgr.active_session(), Some("eagle"));
         assert_eq!(mgr.active_pane_id(), Some("eagle/1"));
+        assert_eq!(mgr.active_tab(), Some(0));
+        assert_eq!(mgr.visible_panes(), ["eagle/1"]);
         assert!(
-            awaiting_sync(&mgr, "eagle/1"),
-            "the fallback pane is re-attached fresh"
+            !drain(&mut rx)
+                .iter()
+                .any(|m| matches!(m, ClientMessage::Attach { .. })),
+            "the sibling on screen is already attached; re-attaching would wipe its grid"
         );
+    }
+
+    /// Another GUI closing this client's focused pane, when the survivor is in
+    /// another tab: the view has to move to that tab, or input goes to a pane
+    /// the user cannot see until some `LayoutUpdate` happens by.
+    #[test]
+    fn pane_closed_of_the_active_pane_moves_the_view_to_the_fallbacks_tab() {
+        let mut mgr = manager_on_two_tabs(0);
+        assert_eq!(mgr.active_pane_id(), Some("eagle/0"));
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneClosed {
+                pane_id: "eagle/0".to_string(),
+            },
+        });
+
         assert!(
-            drain(&mut rx).iter().any(
-                |m| matches!(m, ClientMessage::Attach { pane_id, .. } if pane_id == "eagle/1")
-            ),
-            "the fallback pane is attached on the wire"
+            matches!(events.as_slice(), [SessionEvent::PaneClosed { pane_id }] if pane_id == "eagle/0"),
+            "{events:?}"
         );
+        assert_eq!(mgr.active_session(), Some("eagle"));
+        assert_eq!(mgr.active_tab(), Some(1));
+        assert_eq!(mgr.visible_panes(), ["eagle/1"]);
+        assert_eq!(mgr.active_pane_id(), Some("eagle/1"));
+    }
+
+    /// Closing a viewed multi-pane session from another GUI: its `PaneClosed`
+    /// broadcasts can arrive before the `SessionClosed`. Once the last pane
+    /// goes, the fallback is another session, and the view must land on it
+    /// whole, since the later `SessionClosed` no longer sees the closed session
+    /// as active and so does not re-select.
+    #[test]
+    fn pane_close_broadcasts_before_the_session_close_leave_a_whole_view() {
+        let (mut mgr, _rx) = make_connected_manager();
+        let mut eagle = make_entry("eagle");
+        eagle.panes.push(pane("eagle", 1));
+        eagle.tabs[0].layout = LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![500, 500],
+            children: vec![LayoutNode::single(0), LayoutNode::single(1)],
+        };
+        mgr.session_list.push(eagle);
+        mgr.session_list.push(make_entry("otter"));
+        mgr.select_session("eagle".to_string());
+
+        for pane_id in ["eagle/0", "eagle/1"] {
+            mgr.handle_server_message(ServerMessage::Event {
+                event: SessionEventMsg::PaneClosed {
+                    pane_id: pane_id.to_string(),
+                },
+            });
+        }
+        let events = mgr.handle_server_message(ServerMessage::SessionClosed {
+            request_id: 9,
+            word_id: "eagle".to_string(),
+            exit_code: None,
+        });
+
+        assert!(
+            matches!(events.as_slice(), [SessionEvent::SessionClosed { word_id }] if word_id == "eagle"),
+            "{events:?}"
+        );
+        assert_eq!(mgr.active_session(), Some("otter"));
+        assert_eq!(mgr.active_tab(), Some(0));
+        assert_eq!(mgr.visible_panes(), ["otter/0"]);
+        assert_eq!(mgr.active_pane_id(), Some("otter/0"));
+        assert!(mgr.render_layout().is_some(), "there is a tab to draw");
     }
 
     #[test]
@@ -2285,6 +2371,29 @@ mod tests {
                 .any(|m| matches!(m, ClientMessage::SessionList { .. })),
             "the new pane's layout can only come from a fresh session list"
         );
+    }
+
+    /// A pane of a session this client has not listed means a session was
+    /// created since — possibly by another GUI — so it re-lists too.
+    #[test]
+    fn a_pane_spawned_event_in_an_unlisted_session_re_lists() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+
+        let events = mgr.handle_server_message(ServerMessage::Event {
+            event: SessionEventMsg::PaneSpawned {
+                pane_id: "otter/0".to_string(),
+            },
+        });
+
+        assert!(events.is_empty(), "no UI event: {events:?}");
+        assert!(
+            drain(&mut rx)
+                .iter()
+                .any(|m| matches!(m, ClientMessage::SessionList { .. })),
+            "a new session surfaces via a fresh list"
+        );
+        assert_eq!(mgr.active_session(), Some("eagle"), "the view stays put");
     }
 
     #[test]
