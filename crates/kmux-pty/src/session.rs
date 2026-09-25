@@ -351,6 +351,9 @@ mod tests {
             return;
         }
 
+        // Start the reaper first: its fds stay open for the life of the
+        // process, so they belong in the baseline.
+        crate::reaper::reaper().expect("reaper");
         let before = open_fds();
         for _ in 0..10 {
             open_and_close();

@@ -32,6 +32,7 @@ pub mod platform;
 pub mod probe;
 pub mod process;
 pub mod pty;
+mod reaper;
 pub mod registry;
 pub mod resize;
 pub mod session;

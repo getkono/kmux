@@ -11,7 +11,8 @@ use crate::config::{PtyConfig, WindowSize};
 use crate::error::{KmuxError, Result};
 use crate::io::PtyMasterIo;
 use crate::platform::to_winsize;
-use crate::process::{ExitStatus, spawn_wait_task};
+use crate::process::ExitStatus;
+use crate::reaper::reaper;
 use crate::shutdown::signal_group;
 
 /// A spawned PTY process.
@@ -47,6 +48,9 @@ impl PtyProcess {
     pub fn spawn(config: &PtyConfig) -> Result<Self> {
         let winsize = to_winsize(config.size);
         let plan = ChildPlan::new(config)?;
+        // Before the fork, so the SIGCHLD handler is in place however soon the
+        // child exits.
+        let reaper = reaper()?;
 
         // SAFETY: the child branch calls only `ChildPlan::exec`, which makes
         // async-signal-safe calls on memory prepared before the fork.
@@ -56,7 +60,7 @@ impl PtyProcess {
             // SAFETY: we are the freshly forked child.
             ForkptyResult::Child => unsafe { plan.exec() },
             ForkptyResult::Parent { child, master } => {
-                let exit_rx = spawn_wait_task(child);
+                let exit_rx = reaper.watch(child);
                 let io = PtyMasterIo::new(master.into_raw_fd()).map_err(|e| {
                     // No handle will own this child, so nothing else would end it.
                     signal_group(child, Signal::SIGKILL);
@@ -141,7 +145,7 @@ impl PtyProcess {
 
 impl Drop for PtyProcess {
     /// Kill the child's process group unless it has already exited or
-    /// keep-alive is set. The exit task (or, for an inherited child, its new
+    /// keep-alive is set. The reaper (or, for an inherited child, its new
     /// parent) collects the exit; nothing here waits.
     ///
     /// Dropping closes this handle's master fd. With keep-alive set the child
@@ -274,7 +278,7 @@ mod tests {
         assert!(inherited.is_exited(), "is_exited should be true after exit");
     }
 
-    /// Dropping a handle to a live child kills it (and its exit task collects
+    /// Dropping a handle to a live child kills it (and the reaper collects
     /// it). The child ignores `SIGHUP`, so the hangup from the master closing
     /// cannot do the killing in Drop's place. Needs a real child (R7).
     #[tokio::test]

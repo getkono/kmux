@@ -539,17 +539,17 @@ count = 1
 [[lints]]
 crate = "kmux-pty"
 lint = "clippy::match_same_arms"
-count = 2
+count = 1
 
 [[lints]]
 crate = "kmux-pty"
 lint = "clippy::missing_errors_doc"
-count = 38
+count = 35
 
 [[lints]]
 crate = "kmux-pty"
 lint = "clippy::needless_continue"
-count = 4
+count = 2
 
 [[lints]]
 crate = "kmux-pty"
