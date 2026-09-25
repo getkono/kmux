@@ -10,7 +10,9 @@
 //!
 //! `PaneRelay` holds a `PaneEngine` instead of touching `term_state`/`writer`
 //! directly, so every VT read (snapshot, history) and PTY write (input, keys,
-//! paste) routes through one seam that either variant can satisfy. The daemon's
+//! paste) routes through one seam that either variant can satisfy. Input is
+//! queued ([`PaneEngine::enqueue_input`]) and written by a per-pane task, never
+//! awaited by the caller (issue #206). The daemon's
 //! seqno counter, scrollback `DiffBuffer`, and client fan-out stay on
 //! `PaneRelay` and are shared by both variants.
 
@@ -21,8 +23,42 @@ pub use in_process::InProcessEngine;
 pub use worker::{WorkerEngine, WorkerFanout};
 
 use kmux_protocol::messages::{GridSnapshot, KeyEvent, ScrollbackLine, TermSize};
-use kmux_pty::error::Result;
+use kmux_pty::error::{KmuxError, Result};
+use tokio::sync::mpsc::error::TrySendError;
 use tokio::task::JoinHandle;
+
+/// Most client inputs a pane holds between arrival and its PTY write.
+///
+/// An input is one `PtyInput`, `PtyKeyBatch` or `PtyPaste` message, so this is
+/// hundreds of keystroke batches: far more than a person types ahead of a
+/// shell that is reading. It fills only when the child has stopped reading
+/// stdin, and from then on further input is refused instead of piling up.
+pub const INPUT_QUEUE_CAPACITY: usize = 256;
+
+/// Why an input was not queued. The rejected input itself is dropped.
+pub(super) type QueueRejected = TrySendError<()>;
+
+/// Drop the payload a failed `try_send` hands back, keeping only why it failed.
+pub(super) fn rejected<T>(e: TrySendError<T>) -> QueueRejected {
+    match e {
+        TrySendError::Full(_) => TrySendError::Full(()),
+        TrySendError::Closed(_) => TrySendError::Closed(()),
+    }
+}
+
+/// One client input for a pane, queued in arrival order and turned into PTY
+/// bytes by the pane's writer task.
+#[derive(Debug)]
+pub enum PaneInput {
+    /// Raw bytes, written as they are.
+    Bytes(Vec<u8>),
+    /// Key events, encoded against the emulator's live modes when written, so
+    /// a mode an earlier input switched is seen by a later one.
+    Keys(Vec<KeyEvent>),
+    /// Pasted text, wrapped in bracketed-paste markers when the emulator's
+    /// live modes ask for them.
+    Paste(Vec<u8>),
+}
 
 // Pane isolation is selected by `[daemon] session_isolation` in `kmuxd.toml`
 // (overridable with `kmuxd --session-isolation`), resolved into
@@ -74,30 +110,23 @@ impl PaneEngine {
         }
     }
 
-    /// Forward raw client bytes to the PTY.
-    pub async fn write_input(&self, data: &[u8]) -> Result<()> {
-        match self {
-            Self::InProcess(e) => e.write_input(data).await,
-            Self::Worker(e) => e.write_input(data).await,
-        }
-    }
-
-    /// Encode `events` against the emulator's live mode state and write the
-    /// bytes to the PTY (encoding stays with the emulator).
-    pub async fn write_keys(&self, events: &[KeyEvent]) -> Result<()> {
-        match self {
-            Self::InProcess(e) => e.write_keys(events).await,
-            Self::Worker(e) => e.write_keys(events).await,
-        }
-    }
-
-    /// Write a paste payload, wrapping it in bracketed-paste markers when the
-    /// emulator's live modes request it.
-    pub async fn write_paste(&self, data: &[u8]) -> Result<()> {
-        match self {
-            Self::InProcess(e) => e.write_paste(data).await,
-            Self::Worker(e) => e.write_paste(data).await,
-        }
+    /// Queue client input for the pane's writer task and return at once.
+    ///
+    /// The PTY write itself happens on that task, so a caller holding the
+    /// `sessions` lock never waits on a child that stopped reading stdin. A
+    /// full queue is refused with [`KmuxError::InputQueueFull`] rather than
+    /// waited on; a writer that is gone (pane closing) is [`KmuxError::Closed`].
+    pub fn enqueue_input(&self, pane_id: &str, input: PaneInput) -> Result<()> {
+        let queued = match self {
+            Self::InProcess(e) => e.enqueue_input(input),
+            Self::Worker(e) => e.enqueue_input(input),
+        };
+        queued.map_err(|e| match e {
+            TrySendError::Full(_) => KmuxError::InputQueueFull {
+                pane_id: pane_id.to_string(),
+            },
+            TrySendError::Closed(_) => KmuxError::Closed,
+        })
     }
 
     /// Push updated live kitty capability toggles to the emulator. In-process the
