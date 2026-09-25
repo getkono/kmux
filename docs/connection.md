@@ -882,8 +882,21 @@ Two lanes share it, so order is kept:
   A pane the daemon cannot snapshot (a federated one) is sent `Lagged`
   instead, and the client re-attaches.
 
+Server-wide VT events a flood of output can raise one per escape sequence —
+`PaneBell`, `PaneTitleChanged`, `PaneProgressChanged` — reach every connection,
+attached to the pane or not, so they ride the pane-data lane and are dropped
+when it is congested; on the control lane a `cat` of a binary file would fill a
+slow client's queue and close it. Layout, tab-lifecycle and clipboard events
+stay control.
+
 A log dump (`FetchLogs`) can exceed the queue, so it is sent from its own task
-that waits for room. QUIC pane streams are unaffected: each rides its own
+that waits for room — and, like pane data, leaves the control reserve free, so
+a dump never starves replies or pings.
+
+A resync snapshot is labelled with the seqno read *before* it is taken: a diff
+emitted in between is then forwarded again after the snapshot (re-applying its
+absolute cell writes in order ends at the same grid) rather than labelled as
+covered and lost. QUIC pane streams are unaffected: each rides its own
 flow-controlled unidirectional stream. No wire message or capability was added,
 so `PROTOCOL_RANGE` is unchanged.
 
@@ -895,6 +908,16 @@ so `PROTOCOL_RANGE` is unchanged.
 | `Auth` + `AuthProof` after connect | `AUTH_DEADLINE` 30 s | `CloseReason::AuthDeadline` |
 | Any inbound frame after the oldest unanswered `Ping` | `PONG_DEADLINE` 30 s | `CloseReason::PongDeadline` |
 | Each frame write, each flush | `FRAME_WRITE_TIMEOUT` 30 s | `CloseReason::WriteTimeout` |
+
+Answering `Ping` with `Pong` has always been part of the protocol, and every
+long-lived peer does (`kmux-client`, federation links); what is new is that the
+daemon enforces it, so no message or capability changed. The one peer that did
+not answer, `kmux daemon logs -f --server`, answers from this change on; one
+from an older build is closed after about 35 s of a quiet follow (accepted
+skew: the command is re-run).
+
+A listener whose `accept` fails (out of file descriptors) pauses 100 ms before
+the next attempt instead of spinning.
 
 The auth and pong checks are pure functions of instants (`auth_verdict`,
 `pong_verdict` in `crates/kmuxd/src/client_handler/liveness.rs`), evaluated
