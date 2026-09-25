@@ -48,11 +48,12 @@ pub(super) const SCROLLBACK_CAPACITY: usize = 10 * 1024 * 1024;
 /// Maximum number of active sessions per daemon.
 pub(super) const MAX_SESSIONS: usize = 1000;
 
-/// Per-client sender pair: bounded data channel (for diffs) + unbounded control
-/// channel (for notifications like `Lagged` that must never be dropped).
+/// Per-client sender pair: bounded data channel (for diffs) + the connection's
+/// control lane (for notifications like `Lagged` that must never be dropped; see
+/// [`crate::outbound`]).
 pub struct ClientSender {
     pub data_tx: mpsc::Sender<kmux_protocol::messages::ServerMessage>,
-    pub ctrl_tx: mpsc::UnboundedSender<kmux_protocol::messages::ServerMessage>,
+    pub ctrl_tx: crate::outbound::OutboundTx,
     /// When true, the relay sends full `TerminalSnapshot` messages instead
     /// of incremental `TerminalUpdate` diffs.
     pub force_full_snapshot: bool,
@@ -356,7 +357,7 @@ impl PaneRelay {
     /// Send a `PaneResized` event + a forced `TerminalSnapshot` to every
     /// attached client after a size change.
     ///
-    /// `ctrl_tx` channels are unbounded; `data_tx` sends are best-effort
+    /// `ctrl_tx` sends are never dropped; `data_tx` sends are best-effort
     /// (dropped silently if the channel is full — the next diff will repaint).
     pub fn broadcast_resize(&self, pane_id: &str, new_size: TermSize, seqno: u64) {
         use kmux_protocol::messages::{SequenceNo, SessionEventMsg, epoch_millis};
@@ -748,6 +749,13 @@ impl ServerApp {
         &self,
     ) -> broadcast::Receiver<kmux_protocol::messages::ServerMessage> {
         self.vt_events_tx.subscribe()
+    }
+
+    /// How many subscribers the server-wide VT event channel has: one per
+    /// live authenticated connection's forwarder.
+    #[cfg(test)]
+    pub(crate) fn vt_subscriber_count(&self) -> usize {
+        self.vt_events_tx.receiver_count()
     }
 
     /// Broadcast a server message to every connected client via the server-wide
@@ -1275,8 +1283,7 @@ mod tests {
 
     fn make_client(rows: u16, cols: u16) -> (ClientId, ClientSender) {
         let (data_tx, _data_rx) = mpsc::channel::<kmux_protocol::messages::ServerMessage>(16);
-        let (ctrl_tx, _ctrl_rx) =
-            mpsc::unbounded_channel::<kmux_protocol::messages::ServerMessage>();
+        let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
         let id = ClientId(rows as u64 * 1000 + cols as u64);
         let sender = ClientSender {
             data_tx,
@@ -1399,7 +1406,7 @@ mod tests {
 
         let mut relay = make_relay(24, 80);
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
         let id = ClientId(1);
         relay.clients.lock().unwrap().insert(
             id,
@@ -1504,7 +1511,7 @@ mod tests {
 
         let mut relay = make_relay(24, 80);
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
         relay.clients.lock().unwrap().insert(
             ClientId(1),
             ClientSender {
@@ -1633,7 +1640,7 @@ mod tests {
     ) -> AttachParams {
         use kmux_protocol::messages::ServerMessage;
         let (data_tx, _rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, _crx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, _crx) = crate::fixtures::make_outbound();
         AttachParams {
             pane_id: "eagle/0".to_string(),
             client_id,
@@ -1798,7 +1805,7 @@ mod tests {
         // Attach a (channels dropped) and b (retain ctrl_rx to observe the kick).
         app.attach(attach_params(a.client_id, None)).await.unwrap();
         let (data_tx, _drx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, mut ctrl_rx_b) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, mut ctrl_rx_b) = crate::fixtures::make_outbound();
         app.attach(AttachParams {
             pane_id: "eagle/0".to_string(),
             client_id: b.client_id,

@@ -29,7 +29,7 @@ pub struct AttachParams {
     pub last_seqno: Option<SequenceNo>,
     pub size: TermSize,
     pub data_tx: mpsc::Sender<ServerMessage>,
-    pub ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+    pub ctrl_tx: crate::outbound::OutboundTx,
     pub capabilities: ClientCapabilities,
 }
 
@@ -165,6 +165,24 @@ impl ServerApp {
         Ok(result)
     }
 
+    /// A fresh snapshot of a locally hosted pane and the seqno it is current
+    /// as of — what a lagged pane stream resyncs from (issue #206). `None` for
+    /// a pane this daemon does not host (gone, or federated).
+    pub async fn resync_snapshot(&self, pane_id: &str) -> Option<(GridSnapshot, SequenceNo)> {
+        let sessions = self.sessions.read().await;
+        let relay = super::helpers::get_pane_relay(&sessions, pane_id).ok()?;
+        // The seqno is read before the snapshot is taken. A diff the relay
+        // emits between the two reads is then already in the snapshot and
+        // forwarded again after it, where re-applying its absolute cell writes
+        // in order ends at the same grid. Read after, it would be labelled as
+        // covered and dropped without being in the snapshot.
+        let seqno = relay
+            .seqno_counter
+            .load(Ordering::Relaxed)
+            .saturating_sub(1);
+        Some((relay.engine.snapshot(), SequenceNo(seqno)))
+    }
+
     /// Set the full-snapshot mode flag for a client across all attached panes.
     pub async fn set_snapshot_mode(&self, client_id: ClientId, enabled: bool) {
         let sessions = self.sessions.read().await;
@@ -266,5 +284,44 @@ impl ServerApp {
                 }
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kmux_protocol::format_pane_id;
+    use kmux_protocol::messages::{ClientCapabilities, TermSize};
+
+    use crate::fixtures::fixture_app;
+
+    /// A lagged pane stream resyncs from a snapshot of the hosted pane at its
+    /// current size; a pane this daemon does not host has none.
+    #[tokio::test]
+    async fn resync_snapshot_answers_only_for_a_pane_this_daemon_hosts() {
+        let app = fixture_app();
+        let size = TermSize {
+            rows: 10,
+            cols: 30,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let entry = app
+            .create_session(
+                None,
+                Some("/tmp".to_string()),
+                Some("/bin/sleep".to_string()),
+                vec!["30".to_string()],
+                size,
+                &ClientCapabilities::default(),
+            )
+            .await
+            .expect("create_session");
+        let pane = format_pane_id(&entry.meta.word_id, 0);
+
+        let (snapshot, _seqno) = app.resync_snapshot(&pane).await.expect("a hosted pane");
+        assert_eq!((snapshot.rows, snapshot.cols), (10, 30));
+        assert!(app.resync_snapshot("nosuch/0").await.is_none());
+
+        let _ = app.close_session(&entry.meta.word_id).await;
     }
 }

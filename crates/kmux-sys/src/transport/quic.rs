@@ -14,7 +14,9 @@ mod quic_listener {
 
     use quinn::Endpoint;
 
-    use crate::transport::{AcceptError, IncomingSession, Listener, PeerInfo, SessionTransport};
+    use crate::transport::{
+        AcceptError, IncomingSession, Listener, PeerInfo, PendingSession, SessionTransport,
+    };
     use kmux_protocol::messages::TransportKind;
 
     /// Server-side QUIC transport listener.
@@ -39,39 +41,47 @@ mod quic_listener {
 
         fn accept(
             &mut self,
-        ) -> Pin<Box<dyn Future<Output = Result<IncomingSession, AcceptError>> + Send + '_>>
+        ) -> Pin<Box<dyn Future<Output = Result<PendingSession, AcceptError>> + Send + '_>>
         {
             let endpoint = self.endpoint.clone();
             Box::pin(async move {
                 let incoming = endpoint.accept().await.ok_or(AcceptError::Closed)?;
-                let conn = incoming
-                    .await
-                    .map_err(|e| AcceptError::Transport(e.to_string()))?;
-                let remote = conn.remote_address();
-
-                let conn_span = tracing::info_span!(
-                    "connection",
-                    transport = "quic",
-                    remote = %remote,
-                    conn_id = tracing::field::Empty,
-                    client_id = tracing::field::Empty,
-                );
-                tracing::info!(parent: &conn_span, "QUIC connection from {remote}");
-
-                let (ctrl_send, ctrl_recv) = conn
-                    .accept_bi()
-                    .await
-                    .map_err(|e| AcceptError::Transport(format!("accept bi: {e}")))?;
-
-                Ok(IncomingSession {
-                    read: Box::new(ctrl_recv),
-                    write: Box::new(ctrl_send),
-                    peer: PeerInfo { addr: Some(remote) },
-                    span: conn_span,
-                    transport: SessionTransport::Quic(conn),
-                })
+                // The QUIC handshake and the control stream belong to the
+                // connection's own task, like TLS's (issue #206).
+                Ok(PendingSession::new(establish(incoming)))
             })
         }
+    }
+
+    /// Complete an incoming QUIC connection: its handshake, then its
+    /// bidirectional control stream.
+    async fn establish(incoming: quinn::Incoming) -> Result<IncomingSession, AcceptError> {
+        let conn = incoming
+            .await
+            .map_err(|e| AcceptError::Transport(e.to_string()))?;
+        let remote = conn.remote_address();
+
+        let conn_span = tracing::info_span!(
+            "connection",
+            transport = "quic",
+            remote = %remote,
+            conn_id = tracing::field::Empty,
+            client_id = tracing::field::Empty,
+        );
+        tracing::info!(parent: &conn_span, "QUIC connection from {remote}");
+
+        let (ctrl_send, ctrl_recv) = conn
+            .accept_bi()
+            .await
+            .map_err(|e| AcceptError::Transport(format!("accept bi: {e}")))?;
+
+        Ok(IncomingSession {
+            read: Box::new(ctrl_recv),
+            write: Box::new(ctrl_send),
+            peer: PeerInfo { addr: Some(remote) },
+            span: conn_span,
+            transport: SessionTransport::Quic(conn),
+        })
     }
 }
 

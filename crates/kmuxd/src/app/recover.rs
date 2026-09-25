@@ -30,18 +30,27 @@ const MAX_RESTARTS: usize = 3;
 const RESTART_WINDOW: Duration = Duration::from_secs(60);
 
 impl ServerApp {
-    /// Spawn the background task that respawns crashed workers. Call once, after
-    /// the `ServerApp` is wrapped in its `Arc`.
+    /// Spawn the background task that respawns crashed workers, restarted if
+    /// it panics (issue #206). Call once, after the `ServerApp` is wrapped in
+    /// its `Arc`.
     pub(crate) fn spawn_worker_respawn_task(self: &Arc<Self>) {
-        let Some(mut rx) = self.worker_fault_rx.lock().unwrap().take() else {
+        let Some(rx) = self.worker_fault_rx.lock().unwrap().take() else {
             return; // already started
         };
+        // Shared so a restarted run picks up the same fault channel; an async
+        // mutex is released, not poisoned, when a run panics.
+        let rx = Arc::new(tokio::sync::Mutex::new(rx));
         let app = Arc::clone(self);
-        tokio::spawn(async move {
-            while let Some(pane_id) = rx.recv().await {
-                app.recover_faulted_worker(&pane_id).await;
+        tokio::spawn(crate::supervisor::supervise("worker-respawn", move || {
+            let rx = Arc::clone(&rx);
+            let app = Arc::clone(&app);
+            async move {
+                let mut rx = rx.lock().await;
+                while let Some(pane_id) = rx.recv().await {
+                    app.recover_faulted_worker(&pane_id).await;
+                }
             }
-        });
+        }));
     }
 
     /// Respawn the isolated worker for a faulted pane, re-adopting the live PTY.
@@ -190,5 +199,19 @@ impl ServerApp {
         }
         let last_age = newest.map(|t| now.duration_since(t));
         (count, last_age, count < MAX_RESTARTS)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    /// The respawn task takes the fault channel, so a second call is a no-op
+    /// rather than a second consumer.
+    #[tokio::test]
+    async fn spawning_the_respawn_task_takes_the_fault_channel() {
+        let app = Arc::new(crate::fixtures::fixture_app());
+        app.spawn_worker_respawn_task();
+        assert!(app.worker_fault_rx.lock().unwrap().is_none());
     }
 }

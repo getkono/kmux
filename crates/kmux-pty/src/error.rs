@@ -43,6 +43,14 @@ pub enum KmuxError {
     #[error("PTY is closed")]
     Closed,
 
+    /// The pane's input queue is full: its child has stopped reading stdin
+    /// and the input was dropped rather than waited on (issue #206).
+    #[error("input queue full for pane {pane_id}: its program is not reading input")]
+    InputQueueFull {
+        /// The pane whose queue is full.
+        pane_id: String,
+    },
+
     #[error("send on closed channel")]
     ChannelClosed,
 

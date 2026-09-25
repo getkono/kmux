@@ -41,13 +41,18 @@ pub mod tcp_tls;
 pub mod uds;
 
 #[cfg(feature = "framing")]
-pub use listener::{AcceptError, IncomingSession, Listener, PeerInfo, SessionTransport};
+pub use listener::{
+    AcceptError, HANDSHAKE_TIMEOUT, IncomingSession, Listener, PeerInfo, PendingSession,
+    SessionTransport, serve,
+};
 
 #[cfg(feature = "framing")]
 mod listener {
     use std::future::Future;
     use std::net::SocketAddr;
     use std::pin::Pin;
+    use std::sync::Arc;
+    use std::time::Duration;
 
     use thiserror::Error;
 
@@ -72,6 +77,9 @@ mod listener {
         Io(#[from] std::io::Error),
         #[error("transport error: {0}")]
         Transport(String),
+        /// The transport handshake (TLS, QUIC) did not finish in time.
+        #[error("handshake did not finish within {0:?}")]
+        HandshakeTimeout(Duration),
     }
 
     // ─── IncomingSession ──────────────────────────────────────────────────────
@@ -138,6 +146,59 @@ mod listener {
         }
     }
 
+    // ─── PendingSession ───────────────────────────────────────────────────────
+
+    /// Longest a transport handshake (TLS, QUIC) may take before the
+    /// connection is dropped (issue #206). Generous for a slow link; a peer
+    /// that has not finished by then is not going to.
+    pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+
+    /// Pause after a failed accept before the next one.
+    const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
+
+    /// A connection a [`Listener`] accepted whose transport handshake has not
+    /// run yet. The handshake is the part a peer can stall, so it runs in the
+    /// connection's own task ([`PendingSession::establish`]), never on the
+    /// accept loop, where one peer that stops mid-handshake used to block
+    /// every later accept on the same listener.
+    pub struct PendingSession {
+        handshake: Pin<Box<dyn Future<Output = Result<IncomingSession, AcceptError>> + Send>>,
+    }
+
+    impl PendingSession {
+        /// A connection whose handshake is `handshake`.
+        pub fn new(
+            handshake: impl Future<Output = Result<IncomingSession, AcceptError>> + Send + 'static,
+        ) -> Self {
+            Self {
+                handshake: Box::pin(handshake),
+            }
+        }
+
+        /// A connection with no handshake to run (UDS, plain TCP).
+        pub fn ready(session: IncomingSession) -> Self {
+            Self::new(std::future::ready(Ok(session)))
+        }
+
+        /// Run the handshake, giving up after `timeout`.
+        ///
+        /// # Errors
+        ///
+        /// [`AcceptError::HandshakeTimeout`] when it takes longer than
+        /// `timeout`, or the transport's own error when it fails.
+        pub async fn establish(self, timeout: Duration) -> Result<IncomingSession, AcceptError> {
+            tokio::time::timeout(timeout, self.handshake)
+                .await
+                .map_err(|_| AcceptError::HandshakeTimeout(timeout))?
+        }
+    }
+
+    impl std::fmt::Debug for PendingSession {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            f.debug_struct("PendingSession").finish_non_exhaustive()
+        }
+    }
+
     // ─── Listener ─────────────────────────────────────────────────────────────
 
     /// A server-side transport listener.
@@ -147,9 +208,42 @@ mod listener {
     pub trait Listener: Send {
         fn kind(&self) -> TransportKind;
 
-        /// Accept the next incoming session.
+        /// Accept the next connection. Resolves as soon as the transport has
+        /// one, before any handshake: that is [`PendingSession::establish`].
         fn accept(
             &mut self,
-        ) -> Pin<Box<dyn Future<Output = Result<IncomingSession, AcceptError>> + Send + '_>>;
+        ) -> Pin<Box<dyn Future<Output = Result<PendingSession, AcceptError>> + Send + '_>>;
+    }
+
+    /// Accept connections on `listener` until it closes, completing each
+    /// one's handshake in its own task under `handshake_timeout` and handing
+    /// the established session to `on_session`. A handshake that fails or
+    /// times out drops that connection only.
+    pub async fn serve(
+        mut listener: Box<dyn Listener>,
+        handshake_timeout: Duration,
+        on_session: Arc<dyn Fn(IncomingSession) + Send + Sync>,
+    ) {
+        let kind = listener.kind();
+        loop {
+            match listener.accept().await {
+                Ok(pending) => {
+                    let on_session = Arc::clone(&on_session);
+                    tokio::spawn(async move {
+                        match pending.establish(handshake_timeout).await {
+                            Ok(session) => on_session(session),
+                            Err(e) => tracing::warn!("{kind} handshake failed: {e}"),
+                        }
+                    });
+                }
+                Err(AcceptError::Closed) => break,
+                Err(e) => {
+                    tracing::warn!("accept error on {kind} listener: {e}");
+                    // Out of file descriptors fails every accept at once:
+                    // pause rather than spin until one is released.
+                    tokio::time::sleep(ACCEPT_ERROR_BACKOFF).await;
+                }
+            }
+        }
     }
 }

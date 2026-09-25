@@ -20,10 +20,8 @@ use std::sync::{Arc, Mutex};
 use anyhow::Context;
 use kmux_client::grid::CellGrid;
 use kmux_protocol::messages::{
-    CursorState, GridSnapshot, KeyEvent, ScrollbackLine, ServerMessage, SessionEventMsg, TermModes,
-    TermSize,
+    CursorState, GridSnapshot, ScrollbackLine, ServerMessage, SessionEventMsg, TermModes, TermSize,
 };
-use kmux_pty::error::Result;
 use kmux_pty::process::ExitStatus;
 use kmux_pty::registry::SessionManager;
 use kmux_worker_protocol::{
@@ -35,6 +33,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
+use super::{INPUT_QUEUE_CAPACITY, PaneInput, QueueRejected, rejected};
 use crate::app::{ClientMap, PaneEventSink};
 use crate::backend::{BackendEventSink, ControlEvent};
 use crate::diff_engine::DiffResult;
@@ -47,8 +46,12 @@ const WORKER_BIN_ENV: &str = "KMUX_VT_WORKER_BIN";
 
 /// Daemon-side handle to one pane's isolated VT worker.
 pub struct WorkerEngine {
-    /// Outbound requests; drained by the writer task onto the socket.
+    /// Outbound control requests (resize, capabilities, shutdown); drained by
+    /// the writer task onto the socket ahead of queued input.
     req_tx: mpsc::UnboundedSender<WorkerRequest>,
+    /// Client input for the worker, bounded like the in-process pane's queue:
+    /// a worker whose PTY stopped taking input refuses more (issue #206).
+    input_tx: mpsc::Sender<WorkerRequest>,
     /// Mirror of the worker's grid, fed from the event stream, so `snapshot()`
     /// and history reads stay synchronous on the daemon side.
     mirror: Arc<Mutex<CellGrid>>,
@@ -58,7 +61,7 @@ pub struct WorkerEngine {
     child_pid: u32,
     /// Supervisor task: reads worker events, fans out, reaps the child.
     supervisor: JoinHandle<()>,
-    /// Writer task: drains `req_tx` onto the socket.
+    /// Writer task: drains `req_tx` and `input_tx` onto the socket.
     writer_task: JoinHandle<()>,
 }
 
@@ -147,9 +150,18 @@ impl WorkerEngine {
 
         let (sock_rd, mut sock_wr) = stream.into_split();
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<WorkerRequest>();
+        let (input_tx, mut input_rx) = mpsc::channel::<WorkerRequest>(INPUT_QUEUE_CAPACITY);
 
         let writer_task = tokio::spawn(async move {
-            while let Some(req) = req_rx.recv().await {
+            loop {
+                // Control first: a resize or shutdown is not queued behind
+                // input the worker may be slow to take.
+                let req = tokio::select! {
+                    biased;
+                    req = req_rx.recv() => req,
+                    req = input_rx.recv() => req,
+                };
+                let Some(req) = req else { break };
                 if let Err(e) = codec::send_msg(&mut sock_wr, &req).await {
                     debug!("worker request writer stopping: {e}");
                     break;
@@ -163,6 +175,7 @@ impl WorkerEngine {
 
         Ok(Self {
             req_tx,
+            input_tx,
             mirror,
             child_pid,
             supervisor,
@@ -226,28 +239,13 @@ impl WorkerEngine {
         (first, lines, history_total)
     }
 
-    pub(super) async fn write_input(&self, data: &[u8]) -> Result<()> {
-        let _ = self.req_tx.send(WorkerRequest::Input {
-            data: data.to_vec(),
-        });
-        Ok(())
-    }
-
-    pub(super) async fn write_keys(&self, events: &[KeyEvent]) -> Result<()> {
-        if events.is_empty() {
-            return Ok(());
-        }
-        let _ = self.req_tx.send(WorkerRequest::Keys {
-            events: events.to_vec(),
-        });
-        Ok(())
-    }
-
-    pub(super) async fn write_paste(&self, data: &[u8]) -> Result<()> {
-        let _ = self.req_tx.send(WorkerRequest::Paste {
-            data: data.to_vec(),
-        });
-        Ok(())
+    pub(super) fn enqueue_input(&self, input: PaneInput) -> Result<(), QueueRejected> {
+        let req = match input {
+            PaneInput::Bytes(data) => WorkerRequest::Input { data },
+            PaneInput::Keys(events) => WorkerRequest::Keys { events },
+            PaneInput::Paste(data) => WorkerRequest::Paste { data },
+        };
+        self.input_tx.try_send(req).map_err(|e| rejected(&e))
     }
 
     pub(super) fn set_capabilities(&self, kitty_graphics: bool, kitty_keyboard: bool) {
@@ -308,8 +306,8 @@ async fn supervise(
     }
 }
 
-/// Tell attached clients the pane's worker crashed. Uses the unbounded control
-/// channel so the notice is never dropped (same channel `PaneEventSink` uses).
+/// Tell attached clients the pane's worker crashed. Uses the control lane so
+/// the notice is never dropped (same channel `PaneEventSink` uses).
 fn broadcast_fault(fanout: &WorkerFanout) {
     let msg = ServerMessage::Event {
         event: SessionEventMsg::PaneFaulted {
@@ -544,6 +542,39 @@ mod tests {
             });
         }
         cmd.status().expect("run sh").success()
+    }
+
+    /// Input is mapped onto its worker request, in order, and a full input
+    /// queue refuses more instead of waiting.
+    #[tokio::test]
+    async fn enqueue_input_maps_each_input_and_refuses_a_full_queue() {
+        let (req_tx, _req_rx) = mpsc::unbounded_channel();
+        let (input_tx, mut input_rx) = mpsc::channel(3);
+        let engine = WorkerEngine {
+            req_tx,
+            input_tx,
+            mirror: Arc::new(Mutex::new(CellGrid::new(1, 1))),
+            child_pid: 0,
+            supervisor: tokio::spawn(async {}),
+            writer_task: tokio::spawn(async {}),
+        };
+        engine
+            .enqueue_input(PaneInput::Bytes(b"b".to_vec()))
+            .unwrap();
+        engine.enqueue_input(PaneInput::Keys(vec![])).unwrap();
+        engine
+            .enqueue_input(PaneInput::Paste(b"p".to_vec()))
+            .unwrap();
+        assert!(matches!(
+            engine.enqueue_input(PaneInput::Bytes(vec![])),
+            Err(mpsc::error::TrySendError::Full(()))
+        ));
+
+        assert!(matches!(input_rx.try_recv(), Ok(WorkerRequest::Input { data }) if data == b"b"));
+        assert!(
+            matches!(input_rx.try_recv(), Ok(WorkerRequest::Keys { events }) if events.is_empty())
+        );
+        assert!(matches!(input_rx.try_recv(), Ok(WorkerRequest::Paste { data }) if data == b"p"));
     }
 
     /// Guards the probe: without `inherit_as` a close-on-exec fd must read as

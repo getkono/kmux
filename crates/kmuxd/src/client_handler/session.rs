@@ -3,7 +3,7 @@ use std::sync::atomic::Ordering;
 use std::time::Duration;
 
 use kmux_protocol::TransportKind;
-use kmux_protocol::messages::{ErrorCode, ServerMessage, epoch_millis};
+use kmux_protocol::messages::{ErrorCode, ServerMessage, SessionEventMsg, epoch_millis};
 use kmux_protocol::{decode_client, encode_server, read_frame, write_frame_compressed_into};
 
 /// Cap on how many queued messages one flush coalesces. Bounds batch memory and
@@ -11,13 +11,17 @@ use kmux_protocol::{decode_client, encode_server, read_frame, write_frame_compre
 /// for the next recv.
 pub(crate) const MAX_WRITE_BATCH: usize = 256;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
-use tokio::sync::{broadcast, mpsc};
+use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{Instrument, Span, debug, info, warn};
 
+use super::liveness::{self, Liveness, PING_INTERVAL};
 use crate::app::{AttachResult, ConnectionMetrics, ServerApp};
 use crate::client_handler::{
     OutboundCompression, PaneAttacher, SharedClientState, handle_message, pty_event_to_msg,
+};
+use crate::outbound::{
+    self, CloseReason, Closer, OUTBOUND_CAPACITY, OutboundRx, OutboundTx, close_channel,
 };
 
 /// Build the initial replay messages for a pane attach result.
@@ -56,12 +60,53 @@ pub fn build_attach_replay(attach_result: AttachResult, pane_id: &str) -> Vec<Se
     }
 }
 
+/// The tasks a connection runs once it has authenticated: the session-event
+/// and VT-event forwarders and the ping task. Aborted when dropped, so they
+/// end with the connection.
+struct AuthenticatedTasks([JoinHandle<()>; 3]);
+
+impl Drop for AuthenticatedTasks {
+    fn drop(&mut self) {
+        for task in &self.0 {
+            task.abort();
+        }
+    }
+}
+
+/// VT events a flood of pane output can raise one per escape sequence: a
+/// bell per BEL byte, a title or progress change per OSC. `cat` of a binary
+/// file raises thousands, to every connection, attached to the pane or not.
+fn is_lossy_vt_event(msg: &ServerMessage) -> bool {
+    matches!(
+        msg,
+        ServerMessage::Event {
+            event: SessionEventMsg::PaneBell { .. }
+                | SessionEventMsg::PaneTitleChanged { .. }
+                | SessionEventMsg::PaneProgressChanged { .. }
+        }
+    )
+}
+
+/// Queue a server-wide VT event for this connection. A flood-prone one goes
+/// on the pane-data lane and is dropped when that is congested (issue #206):
+/// on the never-drop control lane, a burst from one pane would fill the queue
+/// and close every slow client's connection. Everything else (layout, tab
+/// lifecycle, clipboard) is control.
+fn forward_vt_event(out: &OutboundTx, msg: ServerMessage) {
+    if is_lossy_vt_event(&msg) {
+        let _ = out.try_send_data(msg);
+    } else {
+        let _ = out.send(msg);
+    }
+}
+
 fn spawn_authenticated_forwarders(
-    app: Arc<ServerApp>,
-    ctrl_tx: mpsc::UnboundedSender<ServerMessage>,
+    app: &ServerApp,
+    ctrl_tx: OutboundTx,
     metrics: Arc<ConnectionMetrics>,
+    liveness: Arc<Liveness>,
     conn_span: Span,
-) -> (JoinHandle<()>, JoinHandle<()>, JoinHandle<()>) {
+) -> AuthenticatedTasks {
     let mut event_rx = app.subscribe_events();
     let event_tx = ctrl_tx.clone();
     let event_task = tokio::spawn(
@@ -80,9 +125,7 @@ fn spawn_authenticated_forwarders(
         async move {
             loop {
                 match vt_rx.recv().await {
-                    Ok(msg) => {
-                        let _ = vt_tx.send(msg);
-                    }
+                    Ok(msg) => forward_vt_event(&vt_tx, msg),
                     Err(broadcast::error::RecvError::Lagged(_)) => continue,
                     Err(broadcast::error::RecvError::Closed) => break,
                 }
@@ -95,7 +138,7 @@ fn spawn_authenticated_forwarders(
     let ping_task = tokio::spawn(
         async move {
             let mut seq = 0u64;
-            let mut interval = tokio::time::interval(Duration::from_secs(5));
+            let mut interval = tokio::time::interval(PING_INTERVAL);
             interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
             loop {
                 interval.tick().await;
@@ -103,13 +146,117 @@ fn spawn_authenticated_forwarders(
                 if ping_tx.send(ServerMessage::Ping { seq }).is_err() {
                     break;
                 }
+                liveness.on_ping_sent(tokio::time::Instant::now());
                 seq += 1;
             }
         }
         .instrument(conn_span),
     );
 
-    (event_task, vt_task, ping_task)
+    AuthenticatedTasks([event_task, vt_task, ping_task])
+}
+
+/// Longest a single frame write, or a flush, may take before the connection
+/// is closed (issue #206). A peer that stops reading — its TCP window at zero —
+/// otherwise pins the writer task, and with it the connection, forever. Long
+/// enough for a large snapshot over a slow but live link.
+pub(crate) const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Drain a connection's outbound queue onto `writer` until every sender is
+/// gone or a write fails, then shut the transport down.
+///
+/// Every frame write and every flush must finish within `write_timeout`. One
+/// that does not closes the connection through `closer`
+/// ([`CloseReason::WriteTimeout`]); so does a failed write
+/// ([`CloseReason::WriteFailed`]), since nothing more can reach the client.
+///
+/// Batches all immediately-available messages into one flush. Each
+/// `write_frame_compressed_into` writes a whole frame without flushing; a
+/// single trailing flush then pushes the batch as far fewer TLS records /
+/// syscalls than one flush per message. Per-frame compression and the
+/// one-frame-per-message wire format are unchanged, so the bytes on the wire
+/// are identical — only the flush boundaries move.
+async fn write_outbound<W: AsyncWrite + Unpin>(
+    mut out_rx: OutboundRx,
+    mut writer: W,
+    metrics: Arc<ConnectionMetrics>,
+    comp: Arc<OutboundCompression>,
+    closer: Closer,
+    write_timeout: Duration,
+) {
+    let mut batch: Vec<ServerMessage> = Vec::new();
+    while let Some(first) = out_rx.recv().await {
+        batch.clear();
+        batch.push(first);
+        for _ in 1..MAX_WRITE_BATCH {
+            match out_rx.try_recv() {
+                Ok(m) => batch.push(m),
+                Err(_) => break,
+            }
+        }
+        // The batch is off the queue: a lagged pane stream may resync.
+        out_rx.mark_drained();
+        if let Err(reason) =
+            write_batch(&mut writer, &mut batch, &metrics, &comp, write_timeout).await
+        {
+            closer.close(reason);
+            break;
+        }
+    }
+    // Shutting a TLS stream down writes close_notify, which a stalled peer
+    // would block too.
+    let _ = tokio::time::timeout(write_timeout, writer.shutdown()).await;
+}
+
+/// Write every message in `batch` as its own frame, then flush once. Each
+/// write and the flush must finish within `write_timeout`.
+async fn write_batch<W: AsyncWrite + Unpin>(
+    writer: &mut W,
+    batch: &mut Vec<ServerMessage>,
+    metrics: &ConnectionMetrics,
+    comp: &OutboundCompression,
+    write_timeout: Duration,
+) -> Result<(), CloseReason> {
+    for msg in batch.drain(..) {
+        let bytes = match encode_server(&msg) {
+            Ok(bytes) => bytes,
+            Err(e) => {
+                warn!("encode error: {e}");
+                continue;
+            }
+        };
+        crate::capture::record(msg.category(), &bytes);
+        // A failed write leaves only whole frames on the wire (each frame is
+        // written in full before the next); the client reconnects + resyncs.
+        let write = write_frame_compressed_into(&mut *writer, &bytes, comp.compressor());
+        let wire_len = within(write_timeout, write).await?;
+        metrics
+            .bytes_out
+            .fetch_add(wire_len as u64, Ordering::Relaxed);
+        // What the same frame would have cost uncompressed (length prefix +
+        // codec tag + payload).
+        metrics
+            .bytes_out_uncompressed
+            .fetch_add(5 + bytes.len() as u64, Ordering::Relaxed);
+        metrics.msgs_out.fetch_add(1, Ordering::Relaxed);
+    }
+    within(write_timeout, kmux_protocol::flush(writer)).await
+}
+
+/// Await one write under `timeout`: a stall is [`CloseReason::WriteTimeout`],
+/// a failure [`CloseReason::WriteFailed`].
+async fn within<T, E>(
+    timeout: Duration,
+    write: impl Future<Output = Result<T, E>>,
+) -> Result<T, CloseReason> {
+    match tokio::time::timeout(timeout, write).await {
+        Ok(Ok(value)) => Ok(value),
+        Ok(Err(_)) => Err(CloseReason::WriteFailed),
+        Err(_) => {
+            warn!(?timeout, "write timed out; peer is not reading");
+            Err(CloseReason::WriteTimeout)
+        }
+    }
 }
 
 /// Generic client session handler shared by QUIC and TCP connections.
@@ -139,7 +286,7 @@ pub async fn run_client_session<R, W, A, F>(
     R: AsyncRead + Unpin + Send,
     W: AsyncWrite + Unpin + Send + 'static,
     A: PaneAttacher,
-    F: FnOnce(mpsc::UnboundedSender<ServerMessage>, Arc<OutboundCompression>) -> A,
+    F: FnOnce(OutboundTx, Arc<OutboundCompression>) -> A,
 {
     let metrics = Arc::new(ConnectionMetrics::new());
 
@@ -150,68 +297,25 @@ pub async fn run_client_session<R, W, A, F>(
         app.compression.min_size,
     ));
 
-    let (ctrl_tx, ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+    let (closer, mut close_signal) = close_channel();
+    let (ctrl_tx, out_rx) = outbound::channel(OUTBOUND_CAPACITY, closer.clone());
 
-    let writer_metrics = Arc::clone(&metrics);
-    let writer_comp = Arc::clone(&comp_out);
+    // Closes the connection if it does not authenticate in time, or later
+    // stops answering pings.
+    let liveness = Arc::new(Liveness::new(tokio::time::Instant::now()));
+    let watchdog_task = tokio::spawn(
+        liveness::watchdog(Arc::clone(&liveness), closer.clone()).instrument(conn_span.clone()),
+    );
+
     let mut writer_task = tokio::spawn(
-        async move {
-            let mut ctrl_rx = ctrl_rx;
-            let mut writer = writer;
-            // Batch all immediately-available messages into one flush. Each
-            // `write_frame_compressed_into` writes a whole frame without
-            // flushing; a single trailing flush then pushes the batch as far
-            // fewer TLS records / syscalls than the old one-flush-per-message
-            // loop. Per-frame compression and the one-frame-per-message wire
-            // format are unchanged, so the bytes on the wire are identical —
-            // only the flush boundaries move.
-            let mut batch: Vec<ServerMessage> = Vec::new();
-            'writer: while let Some(first) = ctrl_rx.recv().await {
-                batch.clear();
-                batch.push(first);
-                while batch.len() < MAX_WRITE_BATCH {
-                    match ctrl_rx.try_recv() {
-                        Ok(m) => batch.push(m),
-                        Err(_) => break,
-                    }
-                }
-                for msg in batch.drain(..) {
-                    match encode_server(&msg) {
-                        Ok(bytes) => {
-                            crate::capture::record(msg.category(), &bytes);
-                            match write_frame_compressed_into(
-                                &mut writer,
-                                &bytes,
-                                writer_comp.compressor(),
-                            )
-                            .await
-                            {
-                                Ok(wire_len) => {
-                                    writer_metrics
-                                        .bytes_out
-                                        .fetch_add(wire_len as u64, Ordering::Relaxed);
-                                    // What the same frame would have cost uncompressed
-                                    // (length prefix + codec tag + payload).
-                                    writer_metrics
-                                        .bytes_out_uncompressed
-                                        .fetch_add(5 + bytes.len() as u64, Ordering::Relaxed);
-                                    writer_metrics.msgs_out.fetch_add(1, Ordering::Relaxed);
-                                }
-                                // A write failure leaves only whole frames on the
-                                // wire (each frame is written in full before the
-                                // next); the client reconnects + resyncs.
-                                Err(_) => break 'writer,
-                            }
-                        }
-                        Err(e) => warn!("encode error: {e}"),
-                    }
-                }
-                if kmux_protocol::flush(&mut writer).await.is_err() {
-                    break;
-                }
-            }
-            let _ = writer.shutdown().await;
-        }
+        write_outbound(
+            out_rx,
+            writer,
+            Arc::clone(&metrics),
+            Arc::clone(&comp_out),
+            closer,
+            FRAME_WRITE_TIMEOUT,
+        )
         .instrument(conn_span.clone()),
     );
 
@@ -224,11 +328,20 @@ pub async fn run_client_session<R, W, A, F>(
         Arc::clone(&metrics),
         comp_out,
     );
-    let mut authenticated_tasks: Option<(JoinHandle<()>, JoinHandle<()>, JoinHandle<()>)> = None;
+    let mut authenticated_tasks: Option<AuthenticatedTasks> = None;
     let mut flush_before_close = false;
 
     loop {
-        match read_frame(&mut reader).await {
+        // Every other branch closes the connection, so a read cancelled
+        // mid-frame is never resumed.
+        let frame = tokio::select! {
+            frame = read_frame(&mut reader) => frame,
+            reason = close_signal.closed() => {
+                warn!(conn_id = ?state.connection_id.map(|c| c.0), ?reason, "closing connection");
+                break;
+            }
+        };
+        match frame {
             Ok(Some(data)) => {
                 // Instrument inbound bytes on every frame, before auth. v1
                 // clients send uncompressed uplink, so wire size is the 5-byte
@@ -237,6 +350,7 @@ pub async fn run_client_session<R, W, A, F>(
                     .bytes_in
                     .fetch_add(5 + data.len() as u64, Ordering::Relaxed);
                 metrics.msgs_in.fetch_add(1, Ordering::Relaxed);
+                liveness.on_inbound();
                 metrics
                     .last_activity_ms
                     .store(epoch_millis(), Ordering::Relaxed);
@@ -250,10 +364,12 @@ pub async fn run_client_session<R, W, A, F>(
                             break;
                         }
                         if !was_authenticated && state.authenticated {
+                            liveness.on_authenticated();
                             authenticated_tasks = Some(spawn_authenticated_forwarders(
-                                app.clone(),
+                                &app,
                                 state.ctrl_tx.clone(),
                                 Arc::clone(&metrics),
+                                Arc::clone(&liveness),
                                 state.conn_span.clone(),
                             ));
                         }
@@ -275,11 +391,8 @@ pub async fn run_client_session<R, W, A, F>(
         }
     }
 
-    if let Some((event_task, vt_task, ping_task)) = authenticated_tasks {
-        event_task.abort();
-        ping_task.abort();
-        vt_task.abort();
-    }
+    watchdog_task.abort();
+    drop(authenticated_tasks);
 
     let log_conn_id = state.connection_id.map(|c| c.0);
     if let Some(client_id) = state.client_id {
@@ -402,5 +515,228 @@ mod tests {
         );
 
         session.await.unwrap();
+    }
+
+    /// A peer that stops reading fills its transport buffer, the frame write
+    /// blocks, and after `FRAME_WRITE_TIMEOUT` the connection is closed and
+    /// the writer ends. Before the timeout the writer waited forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_that_stops_reading_is_closed_after_the_write_timeout() {
+        // The client half is kept but never read, so writes block rather
+        // than fail.
+        let (server, _client) = tokio::io::duplex(64);
+        let (closer, mut signal) = close_channel();
+        let (out, out_rx) = outbound::channel(OUTBOUND_CAPACITY, closer.clone());
+        let started = tokio::time::Instant::now();
+        let writer = tokio::spawn(write_outbound(
+            out_rx,
+            server,
+            Arc::new(ConnectionMetrics::new()),
+            Arc::new(OutboundCompression::new(3, 1024)),
+            closer,
+            FRAME_WRITE_TIMEOUT,
+        ));
+
+        out.send(ServerMessage::LogChunk {
+            request_id: 1,
+            data: vec![0; 4096],
+        })
+        .expect("queued");
+
+        let reason = tokio::time::timeout(FRAME_WRITE_TIMEOUT * 2, signal.closed()).await;
+        assert_eq!(reason, Ok(CloseReason::WriteTimeout));
+        assert!(started.elapsed() >= FRAME_WRITE_TIMEOUT);
+        writer
+            .await
+            .expect("the writer ends instead of waiting forever");
+    }
+
+    /// A socket that connects and sends nothing is closed once the auth
+    /// deadline passes; before it, such a socket held its tasks forever.
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_unauthenticated_connection_is_closed_at_the_auth_deadline() {
+        let app = Arc::new(fixture_app());
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, _client_write) = tokio::io::split(client);
+        let started = tokio::time::Instant::now();
+
+        let session = run_client_session(
+            server_read,
+            server_write,
+            app,
+            TransportKind::Uds,
+            |_tx, _compression| NoopAttacher,
+            tracing::info_span!("auth_deadline_test"),
+        );
+        tokio::time::timeout(liveness::AUTH_DEADLINE * 2, session)
+            .await
+            .expect("the session ends at the auth deadline");
+
+        assert!(started.elapsed() > liveness::AUTH_DEADLINE);
+        assert!(
+            read_frame(&mut client_read).await.unwrap().is_none(),
+            "the daemon closed the socket"
+        );
+    }
+
+    /// Every queued message reaches the peer as its own frame, in order, and
+    /// is counted; the writer ends cleanly once every sender is gone.
+    #[tokio::test]
+    async fn write_outbound_writes_each_frame_in_order_and_counts_it() {
+        let (server, mut client) = tokio::io::duplex(64 * 1024);
+        let (closer, _signal) = close_channel();
+        let (out, out_rx) = outbound::channel(OUTBOUND_CAPACITY, closer.clone());
+        let metrics = Arc::new(ConnectionMetrics::new());
+        let writer = tokio::spawn(write_outbound(
+            out_rx,
+            server,
+            Arc::clone(&metrics),
+            Arc::new(OutboundCompression::new(3, 1024)),
+            closer,
+            FRAME_WRITE_TIMEOUT,
+        ));
+        let payload_len = encode_server(&ServerMessage::Pong { seq: 3 })
+            .unwrap()
+            .len() as u64;
+
+        out.send(ServerMessage::Pong { seq: 3 }).unwrap();
+        out.send(ServerMessage::Pong { seq: 4 }).unwrap();
+        drop(out);
+        writer.await.expect("the writer ends once its queue closes");
+
+        for seq in [3, 4] {
+            let frame = read_frame(&mut client).await.unwrap().expect("a frame");
+            assert!(
+                matches!(decode_server(&frame).unwrap(), ServerMessage::Pong { seq: s } if s == seq)
+            );
+        }
+        assert!(
+            read_frame(&mut client).await.unwrap().is_none(),
+            "then shutdown"
+        );
+        assert_eq!(metrics.msgs_out.load(Ordering::Relaxed), 2);
+        // Uncompressed: a 4-byte length prefix and a 1-byte codec tag each.
+        assert_eq!(
+            metrics.bytes_out.load(Ordering::Relaxed),
+            2 * (5 + payload_len)
+        );
+        assert_eq!(
+            metrics.bytes_out_uncompressed.load(Ordering::Relaxed),
+            2 * (5 + payload_len)
+        );
+    }
+
+    /// Read frames until `want` picks one out.
+    async fn read_until<T>(
+        reader: &mut (impl AsyncRead + Unpin),
+        want: impl Fn(ServerMessage) -> Option<T>,
+    ) -> T {
+        loop {
+            let frame = read_frame(reader)
+                .await
+                .unwrap()
+                .expect("the session is open");
+            if let Some(found) = want(decode_server(&frame).unwrap()) {
+                return found;
+            }
+        }
+    }
+
+    /// Once authenticated, a client is pinged every `PING_INTERVAL`; one that
+    /// never answers is closed `PONG_DEADLINE` after the first unanswered
+    /// ping, and the connection's forwarding tasks end with it.
+    #[tokio::test(start_paused = true)]
+    async fn an_authenticated_client_that_never_answers_a_ping_is_closed() {
+        let app = Arc::new(fixture_app());
+        let (server, client) = tokio::io::duplex(1024 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let session = tokio::spawn(run_client_session(
+            server_read,
+            server_write,
+            Arc::clone(&app),
+            TransportKind::Uds,
+            |_tx, _compression| NoopAttacher,
+            tracing::info_span!("pong_deadline_test"),
+        ));
+
+        let identity = Identity::generate();
+        let mut hello = auth(crate::fixtures::FIXTURE_TOKEN);
+        if let ClientMessage::Auth { public_key, .. } = &mut hello {
+            *public_key = identity.public_key_bytes().to_vec();
+        }
+        write_frame(&mut client_write, &encode_client(&hello).unwrap())
+            .await
+            .unwrap();
+        let nonce = read_until(&mut client_read, |msg| match msg {
+            ServerMessage::AuthChallenge { nonce } => Some(nonce),
+            _ => None,
+        })
+        .await;
+        let proof = ClientMessage::AuthProof {
+            signature: identity.sign(&nonce),
+        };
+        write_frame(&mut client_write, &encode_client(&proof).unwrap())
+            .await
+            .unwrap();
+        let accepted = read_until(&mut client_read, |msg| match msg {
+            ServerMessage::AuthResult { success, .. } => Some(success),
+            _ => None,
+        })
+        .await;
+        assert!(accepted, "the handshake succeeds");
+
+        let pinged = |msg| match msg {
+            ServerMessage::Ping { seq } => Some(seq),
+            _ => None,
+        };
+        assert_eq!(read_until(&mut client_read, pinged).await, 0);
+        let first_ping = tokio::time::Instant::now();
+        assert_eq!(read_until(&mut client_read, pinged).await, 1);
+
+        tokio::time::timeout(liveness::PONG_DEADLINE * 2, session)
+            .await
+            .expect("the session ends at the pong deadline")
+            .unwrap();
+        assert!(first_ping.elapsed() > liveness::PONG_DEADLINE);
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while app.vt_subscriber_count() > 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the connection's forwarders ended with it");
+    }
+
+    /// Flood-prone VT events are dropped when pane data is congested, while
+    /// other server-wide events still take the control lane.
+    #[tokio::test]
+    async fn forward_vt_event_drops_only_flood_prone_events_under_congestion() {
+        let (out, _rx) = outbound::channel(8, close_channel().0);
+        // 8 slots, 2 kept for control: fill the data share with control.
+        for seq in 0..6 {
+            out.send(ServerMessage::Pong { seq }).unwrap();
+        }
+        let pane_event = |event| ServerMessage::Event { event };
+        let pane_id = "eagle/0".to_string();
+
+        forward_vt_event(
+            &out,
+            pane_event(SessionEventMsg::PaneBell {
+                pane_id: pane_id.clone(),
+            }),
+        );
+        forward_vt_event(
+            &out,
+            pane_event(SessionEventMsg::PaneTitleChanged {
+                pane_id: pane_id.clone(),
+                title: "t".to_string(),
+            }),
+        );
+        assert_eq!(out.len(), 6, "a bell and a title are dropped");
+
+        forward_vt_event(&out, pane_event(SessionEventMsg::PaneClosed { pane_id }));
+        assert_eq!(out.len(), 7, "a lifecycle event is control");
     }
 }

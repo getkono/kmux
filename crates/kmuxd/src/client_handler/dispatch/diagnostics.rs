@@ -127,22 +127,31 @@ pub(super) async fn on_fetch_logs(
         Some(n) => kmux_sys::log_tail::last_n_lines_offset(&buf, n as usize),
         None => 0,
     };
-    for chunk in buf[start..].chunks(LOG_CHUNK_BYTES) {
-        state.send(ServerMessage::LogChunk {
-            request_id,
-            data: chunk.to_vec(),
-        });
-    }
 
-    if !follow {
-        state.send(ServerMessage::LogEnd { request_id });
-        return;
-    }
-
-    // Follow: tail appended bytes from the current end of file. `read_to_end`
-    // already left the cursor at EOF, but seek explicitly to be sure.
+    // The dump can be far larger than the connection's bounded outbound queue
+    // (issue #206), so it is sent from its own task that waits for room,
+    // leaving the read loop free to keep taking the client's frames.
     let ctrl_tx = state.ctrl_tx.clone();
     tokio::spawn(async move {
+        for chunk in buf[start..].chunks(LOG_CHUNK_BYTES) {
+            let chunk = ServerMessage::LogChunk {
+                request_id,
+                data: chunk.to_vec(),
+            };
+            if ctrl_tx.send_waiting(chunk).await.is_err() {
+                return;
+            }
+        }
+        if !follow {
+            let _ = ctrl_tx
+                .send_waiting(ServerMessage::LogEnd { request_id })
+                .await;
+            return;
+        }
+
+        // Follow: tail appended bytes from the current end of file.
+        // `read_to_end` already left the cursor at EOF, but seek explicitly
+        // to be sure.
         if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
             return;
         }
@@ -156,10 +165,11 @@ pub(super) async fn on_fetch_logs(
                 Ok(0) => continue,
                 Ok(n) => {
                     if ctrl_tx
-                        .send(ServerMessage::LogChunk {
+                        .send_waiting(ServerMessage::LogChunk {
                             request_id,
                             data: read_buf[..n].to_vec(),
                         })
+                        .await
                         .is_err()
                     {
                         return;
@@ -273,13 +283,31 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_logs_answers_a_request_correlated_terminated_stream() {
-        let (keep, msgs) = dispatch_one(ClientMessage::FetchLogs {
-            request_id: 21,
-            lines: Some(5),
-            follow: false,
-        })
+        let (mut state, mut ctrl_rx) = authenticated_client().await;
+        let keep = handle_message(
+            &mut state,
+            ClientMessage::FetchLogs {
+                request_id: 21,
+                lines: Some(5),
+                follow: false,
+            },
+            &NoopAttacher,
+        )
         .await;
         assert!(keep);
+        // The dump is sent from its own task: collect until the stream ends.
+        let mut msgs = Vec::new();
+        let wait = std::time::Duration::from_secs(10);
+        while let Ok(Some(msg)) = tokio::time::timeout(wait, ctrl_rx.recv()).await {
+            let last = matches!(
+                msg,
+                ServerMessage::LogEnd { .. } | ServerMessage::Error { .. }
+            );
+            msgs.push(msg);
+            if last {
+                break;
+            }
+        }
         // Whether the daemon log file exists depends on the machine's state dir,
         // so the pinned invariants are the ones the arm controls: every reply
         // carries this request id, and the stream is terminated exactly once —
