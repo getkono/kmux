@@ -21,8 +21,80 @@ use crate::lock::lock_term_state;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::TermState;
 
+/// Most PTY output fed to a pane's emulator per `term_state` lock hold.
+///
+/// Between holds the relay releases the lock and emits a diff, so under a
+/// sustained flood (`cat /dev/urandom`) snapshots, resizes and attaches for the
+/// pane still get the lock, and clients still see output progress. Before this
+/// cap one hold drained the PTY until it would block, which a flood never does.
+pub(crate) const MAX_FEED_BYTES_PER_LOCK: usize = 256 * 1024;
+
+/// Where the relay loop reads a pane's output from: the PTY master in
+/// production, an in-memory script in tests.
+pub(crate) trait PaneOutput: Send {
+    /// Wait for output and read it into `buf`; `Ok(0)` is end of file.
+    fn read(
+        &mut self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = kmux_pty::error::Result<usize>> + Send;
+    /// Read output that is already available, without waiting.
+    fn try_read(&mut self, buf: &mut [u8]) -> std::io::Result<usize>;
+    /// The PTY master, for the foreground-process title poll.
+    fn raw_fd(&self) -> Option<RawFd>;
+}
+
+impl PaneOutput for PtyReader {
+    fn read(
+        &mut self,
+        buf: &mut [u8],
+    ) -> impl Future<Output = kmux_pty::error::Result<usize>> + Send {
+        Self::read(self, buf)
+    }
+
+    fn try_read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        Self::try_read(self, buf)
+    }
+
+    fn raw_fd(&self) -> Option<RawFd> {
+        Some(self.as_raw_fd())
+    }
+}
+
+/// Feed the `first` bytes already in `buf`, then whatever output is
+/// immediately available, into the emulator under one lock hold of at most
+/// `cap` bytes. Returns the bytes fed.
+///
+/// Coalescing a burst (vim exit, a large `cat`) into one hold yields one diff
+/// instead of many intermediate ones; the cap bounds how long the hold lasts.
+fn feed_capped(
+    term_state: &Mutex<TermState>,
+    reader: &mut impl PaneOutput,
+    buf: &mut [u8],
+    first: usize,
+    cap: usize,
+) -> usize {
+    let mut ts = lock_term_state(term_state);
+    ts.feed(&buf[..first]);
+    let mut total = first;
+    while total < cap {
+        let want = buf.len().min(cap - total);
+        match reader.try_read(&mut buf[..want]) {
+            Ok(0) => break,
+            Ok(m) => {
+                ts.feed(&buf[..m]);
+                total += m;
+            }
+            Err(_) => break, // WouldBlock or error
+        }
+    }
+    total
+}
+
 /// Read PTY output in a loop, feed bytes through server-side VT emulation,
 /// and immediately compute + broadcast cell diffs after each read.
+///
+/// Each cycle holds the `term_state` lock for at most
+/// [`MAX_FEED_BYTES_PER_LOCK`] bytes, then releases it and emits a diff.
 ///
 /// Also polls the foreground process name every 500 ms via `tcgetpgrp` so
 /// pane titles update as the user switches between commands, even when the
@@ -32,7 +104,7 @@ use crate::term_state::TermState;
 // struct would only add indirection at the three call sites.
 #[allow(clippy::too_many_arguments)]
 pub async fn session_diff_loop(
-    mut reader: PtyReader,
+    mut reader: impl PaneOutput,
     pane_id: String,
     title_sink: Arc<dyn BackendEventSink>,
     clients: ClientMap,
@@ -41,7 +113,7 @@ pub async fn session_diff_loop(
     seqno_counter: Arc<AtomicU64>,
     manager: Arc<SessionManager>,
 ) {
-    let master_fd = reader.as_raw_fd();
+    let master_fd = reader.raw_fd();
     let mut buf = vec![0u8; 65536];
     let mut prev_cursor = CursorState::default();
     let mut prev_modes = TermModes::EMPTY;
@@ -59,23 +131,13 @@ pub async fn session_diff_loop(
                     Ok(0) => break,
                     Ok(n) => {
                         let cycle_start = Instant::now();
-                        let mut total_bytes = n;
-                        let mut ts = lock_term_state(&term_state);
-                        ts.feed(&buf[..n]);
-                        // Coalesce: drain all immediately-available PTY output before
-                        // computing the diff, so burst output (e.g. vim exit, large
-                        // cat) produces a single diff instead of many intermediate ones.
-                        loop {
-                            match reader.try_read(&mut buf) {
-                                Ok(0) => break,
-                                Ok(m) => {
-                                    ts.feed(&buf[..m]);
-                                    total_bytes += m;
-                                }
-                                Err(_) => break, // WouldBlock or error
-                            }
-                        }
-                        drop(ts);
+                        let total_bytes = feed_capped(
+                            &term_state,
+                            &mut reader,
+                            &mut buf,
+                            n,
+                            MAX_FEED_BYTES_PER_LOCK,
+                        );
                         flush_cell_diff(
                             &pane_id,
                             &term_state,
@@ -100,7 +162,7 @@ pub async fn session_diff_loop(
                 }
             }
             _ = poll_interval.tick() => {
-                if let Some(name) = foreground_process_name(master_fd)
+                if let Some(name) = master_fd.and_then(foreground_process_name)
                     && name != last_fg_name
                 {
                     last_fg_name = name.clone();
@@ -1011,5 +1073,103 @@ mod tests {
             1,
             "paused client must not be removed"
         );
+    }
+
+    /// Pane output scripted in memory. Every `read` — the only point where the
+    /// relay does not hold the lock — also tries `term_state`, recording
+    /// whether another task could have taken it there.
+    struct ScriptedOutput {
+        data: Vec<u8>,
+        pos: usize,
+        term_state: Arc<Mutex<TermState>>,
+        free_while_output_pending: usize,
+    }
+
+    impl ScriptedOutput {
+        fn take(&mut self, buf: &mut [u8]) -> usize {
+            let n = buf.len().min(self.data.len() - self.pos);
+            buf[..n].copy_from_slice(&self.data[self.pos..self.pos + n]);
+            self.pos += n;
+            n
+        }
+    }
+
+    impl PaneOutput for &mut ScriptedOutput {
+        async fn read(&mut self, buf: &mut [u8]) -> kmux_pty::error::Result<usize> {
+            if self.pos < self.data.len() && self.term_state.try_lock().is_ok() {
+                self.free_while_output_pending += 1;
+            }
+            Ok(self.take(buf))
+        }
+
+        fn try_read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            match self.take(buf) {
+                0 => Err(std::io::ErrorKind::WouldBlock.into()),
+                n => Ok(n),
+            }
+        }
+
+        fn raw_fd(&self) -> Option<RawFd> {
+            None
+        }
+    }
+
+    /// A flood larger than the per-hold cap is fed in several lock holds, with
+    /// the lock free and a diff emitted between them. Before the cap, one hold
+    /// drained everything the reader had and emitted one diff at the end.
+    #[tokio::test]
+    async fn a_flood_is_fed_in_capped_lock_holds_with_a_diff_between() {
+        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(4096);
+        let (ctrl_tx, _ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
+        clients.lock().unwrap().insert(
+            ClientId(1),
+            ClientSender {
+                data_tx,
+                ctrl_tx,
+                force_full_snapshot: false,
+                paused: false,
+                pause_auto: false,
+                no_auto_pause: false,
+                capabilities: Default::default(),
+                size: Default::default(),
+            },
+        );
+        let ts = fixture_term_state(24, 80);
+        let mut flood = Vec::new();
+        let mut line = 0u64;
+        while flood.len() < MAX_FEED_BYTES_PER_LOCK * 5 / 2 {
+            flood.extend_from_slice(format!("line {line}\r\n").as_bytes());
+            line += 1;
+        }
+        let mut output = ScriptedOutput {
+            data: flood,
+            pos: 0,
+            term_state: Arc::clone(&ts),
+            free_while_output_pending: 0,
+        };
+
+        session_diff_loop(
+            &mut output,
+            "eagle/0".to_string(),
+            Arc::new(crate::backend::NullEventSink),
+            clients,
+            Arc::new(Mutex::new(DiffBuffer::new(256 * 1024))),
+            Arc::clone(&ts),
+            Arc::new(AtomicU64::new(1)),
+            Arc::new(SessionManager::new()),
+        )
+        .await;
+
+        let mut diffs = 0;
+        while let Ok(msg) = data_rx.try_recv() {
+            if matches!(msg, ServerMessage::TerminalUpdate { .. }) {
+                diffs += 1;
+            }
+        }
+        assert_eq!(output.pos, output.data.len(), "the whole flood was fed");
+        // 2.5 caps take three holds: the lock is free before each one.
+        assert_eq!(output.free_while_output_pending, 3);
+        assert_eq!(diffs, 3, "one diff per lock hold");
     }
 }
