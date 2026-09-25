@@ -171,8 +171,10 @@ impl Drop for PtyProcess {
             // intentionally leaked (held open until this process exits), which
             // is safe since the daemon is shutting down immediately after.
             let raw = self.io.as_raw_fd();
-            // SAFETY: `raw` is a valid, open fd owned by `self.io`.
-            let dup_fd = unsafe { nix::libc::dup(raw) };
+            // SAFETY: `raw` is a valid, open fd owned by `self.io`. The copy is
+            // close-on-exec like every other master fd: a leaked handle must
+            // not leak into a child as well.
+            let dup_fd = unsafe { nix::libc::fcntl(raw, nix::libc::F_DUPFD_CLOEXEC, 0) };
             // `dup_fd` is a plain i32 with no Drop impl, so it is intentionally
             // leaked — the fd stays open in the fd table.
             let _ = dup_fd;

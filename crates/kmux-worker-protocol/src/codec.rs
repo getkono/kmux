@@ -74,6 +74,15 @@ pub async fn send_with_fd<M: Serialize>(
     Ok(())
 }
 
+/// `recvmsg` flags for a frame that may carry a PTY master fd. Where the
+/// platform can, the received fd is close-on-exec from the moment it exists,
+/// so a child forked concurrently never inherits it; elsewhere (macOS) it
+/// gains the flag when `kmux_pty` adopts it.
+#[cfg(any(target_os = "linux", target_os = "android"))]
+const RECV_FLAGS: MsgFlags = MsgFlags::MSG_CMSG_CLOEXEC;
+#[cfg(not(any(target_os = "linux", target_os = "android")))]
+const RECV_FLAGS: MsgFlags = MsgFlags::empty();
+
 /// Read one handshake frame, returning the message and any fd it carried.
 ///
 /// Accumulates across `recvmsg` calls in case of a short read; an inbound fd
@@ -103,13 +112,8 @@ pub async fn recv_with_fd<M: DeserializeOwned>(
         let (n, got_fd) = stream
             .async_io(Interest::READABLE, || {
                 let mut iov = [io::IoSliceMut::new(&mut buf)];
-                let r = recvmsg::<()>(
-                    stream.as_raw_fd(),
-                    &mut iov,
-                    Some(&mut cmsg),
-                    MsgFlags::empty(),
-                )
-                .map_err(errno_to_io)?;
+                let r = recvmsg::<()>(stream.as_raw_fd(), &mut iov, Some(&mut cmsg), RECV_FLAGS)
+                    .map_err(errno_to_io)?;
                 if r.flags.contains(MsgFlags::MSG_CTRUNC) {
                     return Err(io::Error::other(
                         "worker handshake: truncated ancillary data (fd lost)",
