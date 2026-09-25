@@ -429,9 +429,11 @@ order, the child:
 
 1. resets every signal disposition to `SIG_DFL` and clears the signal mask —
    an ignored disposition survives `execve`, and the Rust runtime ignores
-   `SIGPIPE`, which would make `yes | head -1` report a broken pipe;
-2. closes every fd from 3 up to the soft `RLIMIT_NOFILE` (capped at 65,536),
-   whoever opened it;
+   `SIGPIPE`, which would make `yes | head -1` report a broken pipe; the child
+   starts with every signal blocked (the parent blocks them across the fork),
+   so the mask is cleared only after the dispositions are safe;
+2. closes every fd from 3 up to the soft `RLIMIT_NOFILE` (capped at 65,536;
+   an unreportable limit sweeps to the cap), whoever opened it;
 3. `chdir`s to the pane's directory — in the child, so the daemon's own cwd
    never changes and concurrent spawns cannot swap directories;
 4. `execve`s the program.
@@ -463,8 +465,8 @@ a handoff is not ours to `waitpid`; its channel is fed by a `kill(pid, 0)` poll
 instead.
 
 **Close** (`shutdown::graceful_shutdown`, `PtySession::close[_nowait]`). Pane
-close signals the process group, so a shell's background jobs and pipelines
-go with it:
+close signals the child's process group, so whatever runs in it goes too — the
+shell, and the jobs and pipelines of a shell without job control:
 
 1. `SIGHUP`, then `SIGTERM`, to the group — `SIGHUP` because that is what
    closing a terminal means, and an interactive shell ignores `SIGTERM`;
@@ -475,8 +477,21 @@ go with it:
 4. if the child had not exited, wait up to the grace period again for the
    `SIGKILL` to be confirmed through the same channel.
 
-Each signal goes to the group *and* to the pid, because a child closed the
-instant it spawned may not have called `setsid` yet. The exit channel means
+A job-controlling (interactive) shell moves each job into a process group of
+its own, which these signals do not reach directly. Such jobs go the way a
+terminal emulator's do: the shell forwards `SIGHUP` to its jobs as it exits, and
+the kernel hangs up the terminal's foreground group when the session leader
+dies. A job that ignores `SIGHUP` in its own group (`nohup cmd &`) outlives the
+pane, as it would a closed terminal window.
+
+A pane whose child has already exited is closed without any signal: the child
+has been reaped, and its pid — and, once its group has emptied, its group id —
+may already belong to another process, another pane's shell included. A child
+closed the instant it spawned may not have called `setsid` yet; while it has no
+group of its own (`killpg` reports `ESRCH`) the signal goes to its pid. Signals
+are also blocked across the `fork` itself, so one sent to the child before it has
+reset its dispositions waits until they are `SIG_DFL` instead of running a daemon
+handler it inherited. The exit channel means
 "gone", never "not ours to wait on": for an inherited child it is the
 `kill(pid, 0)` poll, so `ECHILD` can no longer pass for an exit and skip the
 `SIGKILL`. `close_nowait` runs `close` in a task that owns the session, so the

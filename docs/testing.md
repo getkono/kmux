@@ -255,7 +255,7 @@ Counts are `#[test]` + `#[tokio::test]` functions, measured 2026-08-16.
 | `kmux-connect` | 85 | — | bootstrap racing, daemon lifecycle, token handling, host parsing, attach-gate refusals | `Dirs::rooted` | real sshd handshake, QUIC/TLS on the wire |
 | `kmux-vt-core` | 71 | — | diff engine, scrollback mirror, backend contract | `MockBackend`, `NullEventSink` (`test-util`) | real terminal emulation |
 | `kmux-render` | 54 | — | geometry, packed format, atlas packing, colour, dirty-row parity | — | GPU adapter (skips cleanly, R11) |
-| `kmux-pty` | 34 | — | timeout policy, registry, expect parser, size math; process hygiene (issue #205): close-on-exec masters, what a child inherits (fds, cwd, signal state), start failures, the reaper, process-group close, fd count across close cycles | `fixtures::wait_until_dead` (`MockPty` deleted: 114 lines of `tokio::io::duplex` wrapper with no consumer) | termios |
+| `kmux-pty` | 52 | — | timeout policy, registry, expect parser, size math; process hygiene (issue #205): close-on-exec masters, what a child inherits (fds, cwd, signal state), start failures, the reaper, process-group close (and none for an exited child), fd count across close cycles | `fixtures::wait_until_dead` (`MockPty` deleted: 114 lines of `tokio::io::duplex` wrapper with no consumer) | termios |
 | `kmux-ghostty` | 26 | — | safe façade, `Send`/`Sync` static assertions, event decode | `NullSink` | libghostty internals |
 | `kmux-ffi` | 17 | — | a few leaf conversions | — | `extern "C"` dispatch, uniffi object lifetimes |
 | `kmux-gtk` | 14 | — | keyval→protocol conversion, accel→action table | — | **all widget construction and the glib main loop** |
