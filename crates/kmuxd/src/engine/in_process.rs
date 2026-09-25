@@ -71,10 +71,7 @@ impl InProcessEngine {
     }
 
     pub(super) fn resize_emulator(&self, size: TermSize) {
-        self.term_state
-            .lock()
-            .unwrap()
-            .resize(BackendSize::from(size));
+        lock_term_state(&self.term_state).resize(BackendSize::from(size));
     }
 
     pub(super) fn checkpoint_grid(&self, max_lines: usize) -> (GridSnapshot, Vec<ScrollbackLine>) {
@@ -216,6 +213,27 @@ mod tests {
         }
     }
 
+    /// History reads go to the emulator's scrollback mirror: the first
+    /// index served, the lines, and the total ever scrolled off.
+    #[tokio::test]
+    async fn mirror_range_and_total_reads_the_scrollback_mirror() {
+        let engine = InProcessEngine {
+            term_state: fixture_term_state(2, 10),
+            input_tx: mpsc::channel(1).0,
+            input_task: tokio::spawn(async {}),
+            task: tokio::spawn(async {}),
+            response_task: tokio::spawn(async {}),
+        };
+        {
+            let mut ts = engine.term_state.lock().unwrap();
+            ts.feed(b"one\r\ntwo\r\nthree\r\nfour");
+            // The mirror is filled as diffs are computed, as the relay does.
+            let _ = ts.compute_diff();
+        }
+        let (first, lines, total) = engine.mirror_range_and_total(1, 5);
+        assert_eq!((first, lines.len(), total), (1, 1, 2));
+    }
+
     /// Bytes pass through, keys are encoded, and a paste is bracketed only
     /// once the program has switched bracketed paste on.
     #[test]
@@ -242,7 +260,8 @@ mod tests {
         )
     }
 
-    /// Queued input reaches the pane's program: `cat` echoes it back.
+    /// Queued input reaches the pane's program: `cat` echoes it back. A real
+    /// PTY because the writer's only output is the PTY (R7).
     #[tokio::test]
     async fn queued_input_is_written_to_the_pty() {
         let (_session, mut reader, writer) = fixture_pty("cat").await;
@@ -263,19 +282,16 @@ mod tests {
         .expect("the input reaches the program");
     }
 
-    /// Dropping the engine stops its input writer even while that writer is
-    /// blocked on a program that never reads (`sleep`), so a closed pane
-    /// leaves no task holding its PTY.
+    /// Dropping the engine stops its input writer outright, rather than
+    /// leaving it to end once its queue closes: a writer blocked on a program
+    /// that never reads would otherwise hold the PTY past the pane's close.
+    /// A sender kept open stands in for that busy writer, so only the abort
+    /// can end the task.
     #[tokio::test]
-    async fn dropping_the_engine_stops_a_blocked_input_writer() {
-        let (_session, _reader, writer) = fixture_pty("sleep 60").await;
-        let engine = engine_on(writer);
-        // Far more than a PTY's input buffer, so the write blocks.
-        engine
-            .enqueue_input(PaneInput::Bytes(vec![b'x'; 1024 * 1024]))
-            .expect("room in the queue");
+    async fn dropping_the_engine_stops_its_input_writer() {
+        let engine = engine_on(PtyWriter::sink().unwrap());
+        let _still_open = engine.input_tx.clone();
         let input_task = engine.input_task.abort_handle();
-        tokio::task::yield_now().await;
 
         drop(engine);
         tokio::time::timeout(WAIT, async {
