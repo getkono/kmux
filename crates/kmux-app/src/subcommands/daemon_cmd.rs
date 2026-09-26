@@ -478,7 +478,7 @@ async fn query_pane_processes(
 mod tests {
     use kmux_protocol::messages::{ClientMessage, ErrorCode, ServerMessage};
     use kmux_protocol::{decode_client, encode_server, read_frame, write_frame};
-    use tokio::io::{DuplexStream, ReadHalf, WriteHalf};
+    use tokio::io::{AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 
     use super::stream_logs;
 
@@ -497,7 +497,10 @@ mod tests {
                 .await
                 .unwrap();
         }
-        drop(daemon_write);
+        // Half-close: the client reads EOF after the last message even
+        // while the test keeps the daemon's read half to check its Pongs, so a
+        // stream that misses its end fails instead of waiting forever.
+        daemon_write.shutdown().await.unwrap();
         (tokio::io::split(client), daemon_read)
     }
 
