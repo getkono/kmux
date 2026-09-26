@@ -56,11 +56,12 @@ After this call the process is a daemon with fresh file descriptors.
 
 ## 3. Logging Initialization
 
-Tracing is initialized after daemonization (so the child's fresh fds are used).
+Tracing is initialized after daemonization (so the child's fresh fds are used),
+and after `kmuxd.toml` is read, since the config says how the log rotates.
 
 ```
 Attempt to open $XDG_STATE_HOME/kmux[-debug]/daemon.log (append mode)
-  Success → log to file (via ResilientWriter)
+  Success → log to file (RotatingFile under ResilientWriter)
   Failure → log to stderr
 Log level: RUST_LOG env var, default "kmuxd=info"
 Each run tagged with a random 4-byte instance_id for log correlation
@@ -78,6 +79,39 @@ daemon-spawn path (auto-spawn, `probe-or-start`, the handoff successor) now
 captures the child's pre-daemonize stdout/stderr in `kmuxd-boot.log`, and
 `kmux daemon restart` prints that log's tail when it times out instead of a bare
 "timed out" with no cause.
+
+### 3.1 Log rotation (issue #207)
+
+Under the `ResilientWriter` is a `RotatingFile` (`log_writer.rs`), so a daemon
+that runs for months does not fill its disk with one log. Once the next event
+would take `daemon.log` past `log_max_size_mib`, the file is renamed to
+`daemon.log.1` (the older ones shift up to `daemon.log.<log_keep_files>`, the
+oldest is dropped) and a new `daemon.log` is started:
+
+```toml
+[daemon]
+log_max_size_mib = 10   # 0 = never roll over
+log_keep_files = 5      # rolled-over files kept beside daemon.log; 0 = none
+```
+
+- **Whole lines only.** `tracing` hands each event to the writer in one write,
+  and rotation only happens between two writes, so a line is never split across
+  files and none is lost at the boundary. The size already on disk counts, so a
+  restarted daemon picks up where its predecessor left off.
+- **A failed rotation loses nothing.** When the rename fails (a full or
+  read-only disk), the daemon keeps appending to the file it has and tries again
+  after another `log_max_size_mib`. `ResilientWriter` still swallows the write
+  errors of a full disk.
+- **Two writers.** During a graceful restart the predecessor and the successor
+  both append to `daemon.log`. Before each write the writer checks the file at
+  the path is still the one it holds (device + inode) and reopens it if not, so
+  whichever process rotates, the other follows at its next line; the same check
+  recovers from an operator deleting the file.
+- **Readers.** `kmux daemon logs` (local, and `--server` through `FetchLogs`)
+  reads the current `daemon.log`. With `-f` the follower
+  (`kmux_sys::log_tail::read_appended`) notices when the file it is reading has
+  been moved aside, drains what the old file received before the move, and
+  continues from the start of the new one.
 
 ---
 
@@ -116,6 +150,8 @@ audience = "any"            # any | local | lan | ssh-only
 idle_shutdown_secs = 0       # seconds with no client before exiting; 0 (default) = never
 closed_session_keep = 20      # retained closed sessions for restore (issue #64)
 closed_session_ttl_days = 7   # drop closed sessions older than this; 0 = no age cap
+log_max_size_mib = 10         # roll daemon.log over at this size; 0 = never (issue #207)
+log_keep_files = 5            # rolled-over daemon.log.N files kept; 0 = none
 
 [advertise]
 public_host = "example.com" # override advertised hostname

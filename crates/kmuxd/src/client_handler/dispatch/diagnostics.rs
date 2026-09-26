@@ -141,6 +141,7 @@ async fn stream_log_file(
     // (issue #206), so it is sent from its own task that waits for room,
     // leaving the read loop free to keep taking the client's frames.
     let ctrl_tx = state.ctrl_tx.clone();
+    let path = path.to_path_buf();
     tokio::spawn(async move {
         for chunk in buf[start..].chunks(LOG_CHUNK_BYTES) {
             let chunk = ServerMessage::LogChunk {
@@ -158,9 +159,9 @@ async fn stream_log_file(
             return;
         }
 
-        // Follow: tail appended bytes from the current end of file.
-        // `read_to_end` already left the cursor at EOF, but seek explicitly
-        // to be sure.
+        // Follow: tail appended bytes from the current end of file, across
+        // a rotation of the log (issue #207). `read_to_end` already left the
+        // cursor at EOF, but seek explicitly to be sure.
         if file.seek(std::io::SeekFrom::End(0)).await.is_err() {
             return;
         }
@@ -170,7 +171,7 @@ async fn stream_log_file(
             if ctrl_tx.is_closed() {
                 return;
             }
-            match file.read(&mut read_buf).await {
+            match kmux_sys::log_tail::read_appended(&path, &mut file, &mut read_buf).await {
                 Ok(0) => continue,
                 Ok(n) => {
                     if ctrl_tx

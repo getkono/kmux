@@ -46,12 +46,13 @@ pub async fn tail_local_log(
     stdout.flush()?;
 
     if follow {
-        // Seek to end and poll for new bytes.
+        // Seek to end and poll for new bytes, following the log across a
+        // rotation (issue #207).
         file.seek(io::SeekFrom::End(0)).await?;
         let mut read_buf = vec![0u8; 4096];
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let n = file.read(&mut read_buf).await?;
+            let n = kmux_sys::log_tail::read_appended(path, &mut file, &mut read_buf).await?;
             if n > 0 {
                 stdout.write_all(&read_buf[..n])?;
                 stdout.flush()?;

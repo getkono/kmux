@@ -122,6 +122,14 @@ pub struct DaemonConfig {
     /// older than this are pruned. `0` disables age-based pruning.
     #[serde(default = "default_closed_session_ttl_days")]
     pub closed_session_ttl_days: u32,
+    /// Roll `daemon.log` over once it reaches this many MiB (issue #207).
+    /// `0` never rolls it over.
+    #[serde(default = "default_log_max_size_mib")]
+    pub log_max_size_mib: u64,
+    /// How many rolled-over logs (`daemon.log.1` … `daemon.log.<n>`) to keep
+    /// beside the current one. `0` keeps none.
+    #[serde(default = "default_log_keep_files")]
+    pub log_keep_files: u32,
 }
 
 impl Default for DaemonConfig {
@@ -131,8 +139,29 @@ impl Default for DaemonConfig {
             session_isolation: SessionIsolationMode::default(),
             closed_session_keep: default_closed_session_keep(),
             closed_session_ttl_days: default_closed_session_ttl_days(),
+            log_max_size_mib: default_log_max_size_mib(),
+            log_keep_files: default_log_keep_files(),
         }
     }
+}
+
+impl DaemonConfig {
+    /// When the daemon log rolls over, in the writer's terms.
+    pub fn log_rotation(&self) -> crate::log_writer::Rotation {
+        crate::log_writer::Rotation {
+            max_bytes: self.log_max_size_mib.saturating_mul(1024 * 1024),
+            keep: self.log_keep_files,
+        }
+    }
+}
+
+/// Default `daemon.log` size cap, in MiB (issue #207).
+fn default_log_max_size_mib() -> u64 {
+    10
+}
+/// Default number of rolled-over daemon logs kept (issue #207).
+fn default_log_keep_files() -> u32 {
+    5
 }
 
 /// Default count cap for the closed-session graveyard (issue #64).
@@ -722,6 +751,27 @@ idle_shutdown_secs = 60
         let parsed: ConfigFile = toml::from_str("").unwrap();
         let resolved = ServerConfig::resolve(parsed).unwrap();
         assert_eq!(resolved.idle_shutdown_secs, 0);
+    }
+
+    /// The daemon log is capped by default, and both knobs are read from
+    /// `[daemon]`.
+    #[test]
+    fn log_rotation_defaults_to_ten_mib_times_five_and_parses() {
+        let default = ConfigFile::default().daemon.log_rotation();
+        assert_eq!(default.max_bytes, 10 * 1024 * 1024);
+        assert_eq!(default.keep, 5);
+
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+[daemon]
+log_max_size_mib = 3
+log_keep_files = 2
+"#,
+        )
+        .unwrap();
+        let rotation = cfg.daemon.log_rotation();
+        assert_eq!(rotation.max_bytes, 3 * 1024 * 1024);
+        assert_eq!(rotation.keep, 2);
     }
 
     #[test]

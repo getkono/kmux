@@ -207,15 +207,17 @@ fn main() -> anyhow::Result<()> {
         // After this point we are in the daemonized child process with fresh fds.
     }
 
+    // Load the config before logging starts: it says how the log rotates.
+    let (mut cfg_file, cfg_source) = config::load_config(cli.config.as_deref())?;
+
     // Initialize tracing after daemonize (child process has fresh fds).
-    // Log to a persistent file; fall back to stderr if the path can't be opened.
+    // Log to a persistent file, rolled over by size (issue #207); fall back to
+    // stderr if the path can't be opened.
     let instance_id = generate_instance_id();
-    match kmux_sys::dirs::daemon_log_path().and_then(|p| {
-        Ok(std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(p)?)
-    }) {
+    let rotation = cfg_file.daemon.log_rotation();
+    match kmux_sys::dirs::daemon_log_path()
+        .and_then(|p| Ok(log_writer::RotatingFile::open(p, rotation)?))
+    {
         Ok(file) => {
             // `ResilientWriter` (not the stock `Mutex<File>`) so a write that
             // fails on a full disk degrades to "no logs" instead of poisoning
@@ -263,8 +265,7 @@ fn main() -> anyhow::Result<()> {
         "kmuxd started"
     );
 
-    // Load config and apply deprecated CLI overrides.
-    let (mut cfg_file, cfg_source) = config::load_config(cli.config.as_deref())?;
+    // Apply deprecated CLI overrides to the config loaded above.
     if cfg_source.is_none() {
         // No config file found: write a default template on first run.
         if let Ok(xdg_cfg) = std::env::var("XDG_CONFIG_HOME") {
