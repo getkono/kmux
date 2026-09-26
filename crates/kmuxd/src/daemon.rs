@@ -97,7 +97,10 @@ pub struct ControlSocketParams {
 ///
 /// Run this as a `tokio::spawn`ed background task after the QUIC endpoint is
 /// bound and the actual port is known.
-pub async fn serve_control_socket(params: ControlSocketParams) {
+///
+/// Serves until `stop` resolves (the daemon passes [`termination_signal`]),
+/// then asks the daemon to shut down and removes the socket and pid files.
+pub async fn serve_control_socket(params: ControlSocketParams, stop: impl Future<Output = ()>) {
     let ControlSocketParams {
         socket_path,
         pid_path,
@@ -170,16 +173,7 @@ pub async fn serve_control_socket(params: ControlSocketParams) {
     _guard.armed = true;
     info!("Control socket listening on {}", socket_path.display());
 
-    // Install signal handlers for graceful shutdown.
-    let mut sigterm = match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-    {
-        Ok(s) => s,
-        Err(e) => {
-            error!("Failed to install SIGTERM handler: {e}");
-            return;
-        }
-    };
-
+    tokio::pin!(stop);
     loop {
         tokio::select! {
             accept_result = listener.accept() => {
@@ -195,19 +189,36 @@ pub async fn serve_control_socket(params: ControlSocketParams) {
                     }
                 }
             }
-            _ = tokio::signal::ctrl_c() => {
-                info!("Received SIGINT, shutting down daemon");
-                ctx.shutdown.notify_waiters();
-                break;
-            }
-            _ = sigterm.recv() => {
-                info!("Received SIGTERM, shutting down daemon");
+            () = &mut stop => {
                 ctx.shutdown.notify_waiters();
                 break;
             }
         }
     }
     // _guard drops here, cleaning up socket and pid files.
+}
+
+/// A future that resolves on the daemon's first SIGINT or SIGTERM.
+///
+/// Installing these handlers is process-wide and permanent: from then on the
+/// process no longer dies of either signal. So only the daemon itself may
+/// call this — never a unit test. cargo-mutants stops a timed-out test binary
+/// with SIGTERM, and a binary that swallowed it ran on as an orphan, spinning
+/// in the hung mutant and starving every later build on the runner (the #206
+/// mutation job overran its hour that way). See docs/testing.md.
+///
+/// # Errors
+///
+/// When the SIGTERM handler cannot be installed.
+pub fn termination_signal() -> std::io::Result<impl Future<Output = ()> + Send> {
+    use tokio::signal::unix::{SignalKind, signal};
+    let mut sigterm = signal(SignalKind::terminate())?;
+    Ok(async move {
+        tokio::select! {
+            _ = tokio::signal::ctrl_c() => info!("Received SIGINT, shutting down daemon"),
+            _ = sigterm.recv() => info!("Received SIGTERM, shutting down daemon"),
+        }
+    })
 }
 
 async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestCtx) {
@@ -563,7 +574,12 @@ mod tests {
             handoff_successor: false,
         };
 
-        tokio::spawn(serve_control_socket(params));
+        // A stand-in for `termination_signal`: a unit test must not install
+        // the real SIGTERM/SIGINT handlers (see its doc).
+        let (stop_tx, stop_rx) = tokio::sync::oneshot::channel::<()>();
+        let served = tokio::spawn(serve_control_socket(params, async {
+            let _ = stop_rx.await;
+        }));
         // Allow the socket task to bind before connecting.
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;
 
@@ -588,7 +604,18 @@ mod tests {
         assert!(resp.sessions.is_empty());
         assert!(resp.unattached.is_empty());
 
-        shutdown.notify_waiters();
+        // Stopping asks the daemon to shut down and ends the task. (Its
+        // socket cleanup is the guard's, tested below; asserting it here would
+        // race the shells other tests fork, which briefly hold the fd.)
+        let shutdown_requested = shutdown.notified();
+        stop_tx.send(()).unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(2), shutdown_requested)
+            .await
+            .expect("stop asks the daemon to shut down");
+        tokio::time::timeout(std::time::Duration::from_secs(2), served)
+            .await
+            .expect("the control socket stops serving")
+            .unwrap();
     }
 
     // ─── Socket ownership ────────────────────────────────────────────────────
@@ -870,7 +897,7 @@ mod tests {
             handoff_successor: false,
         };
         // Returns rather than binding, and leaves the incumbent's socket alone.
-        serve_control_socket(params).await;
+        serve_control_socket(params, std::future::pending()).await;
 
         assert!(socket_path.exists(), "the incumbent's socket must survive");
         assert!(

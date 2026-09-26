@@ -62,6 +62,12 @@ flows through the daemon's normal snapshot-attach path.
   and a paused client is **never** marked `Lagged` or dropped even if its bounded
   data channel fills. An auto-pause-exempt pane keeps streaming through a
   background pause. The client catches up on resume.
+- Pausing is a bandwidth choice, not flow control. Flow control is separate and
+  always on: a client that simply reads slowly fills its connection's bounded
+  outbound queue, and its pane streams lag and resync with `SyncReset` +
+  `TerminalSnapshot` once it catches up (issue #206; see
+  [connection.md](connection.md#server-side-flow-control-and-deadlines)). A
+  paused client sends no pane data into that queue, so it never lags there.
 - A paused client **still counts toward the effective (smallest-wins) pane size**,
   so pausing never reflows the PTY for other attached clients.
 - `attach()` **preserves connection-level flags** (`force_full_snapshot`) across a

@@ -4,6 +4,7 @@ use std::sync::{Arc, Mutex};
 use kmux_protocol::messages::{CellAttrs, CellState, GridSnapshot, SequenceNo};
 
 use crate::diff_engine::DiffResult;
+use crate::lock::lock_term_state;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::TermState;
 
@@ -135,7 +136,7 @@ pub(super) fn seed_pane_with_preamble(
     }
 
     let diff_opt = {
-        let mut ts = term_state.lock().unwrap();
+        let mut ts = lock_term_state(term_state);
         ts.feed(preamble);
         match ts.compute_diff() {
             DiffResult::CellDiff { diff: d, .. } => Some(d),
@@ -146,5 +147,28 @@ pub(super) fn seed_pane_with_preamble(
     if let Some(diff) = diff_opt {
         let seqno = SequenceNo(seqno_counter.fetch_add(1, Ordering::Relaxed));
         scrollback.lock().unwrap().push(seqno, Arc::new(diff));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::fixtures::fixture_term_state;
+
+    /// A restored pane's preamble is fed to its emulator and recorded as the
+    /// first replayable diff, so a client attaching right away sees it.
+    #[test]
+    fn seeding_a_pane_records_the_preamble_as_its_first_diff() {
+        let ts = fixture_term_state(4, 20);
+        let scrollback = Arc::new(Mutex::new(DiffBuffer::new(64 * 1024)));
+        let seqno = Arc::new(AtomicU64::new(1));
+
+        seed_pane_with_preamble(&ts, &scrollback, &seqno, b"hi");
+
+        assert_eq!(seqno.load(Ordering::Relaxed), 2);
+        assert_eq!(
+            scrollback.lock().unwrap().oldest_seqno(),
+            Some(SequenceNo(1))
+        );
     }
 }

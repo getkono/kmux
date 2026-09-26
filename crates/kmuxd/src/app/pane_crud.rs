@@ -188,7 +188,7 @@ impl ServerApp {
                 // Terminal query replies (DSR/DA/…) the emulator generates are
                 // pushed onto this channel by the sink and drained to the PTY by
                 // the engine's writer task.
-                let (resp_tx, resp_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+                let (resp_tx, resp_rx) = crate::engine::pty_response_channel();
                 title_sink.set_pty_response_sender(resp_tx);
                 let relay_sink: Arc<dyn crate::backend::BackendEventSink> = title_sink.clone();
                 let term_state = Arc::new(Mutex::new(new_term_state(BackendConfig {

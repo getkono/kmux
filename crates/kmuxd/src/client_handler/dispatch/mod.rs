@@ -356,7 +356,6 @@ pub(super) mod testing {
         protocol_capabilities,
     };
     pub(super) use kmux_protocol::{Compressor, TransportKind};
-    pub(super) use tokio::sync::mpsc;
 
     pub(super) use crate::app::ServerApp;
     pub(super) use crate::client_handler::SharedClientState;
@@ -430,8 +429,7 @@ pub(super) mod testing {
 
     /// An authenticated client on an empty server, with the handshake replies
     /// already drained so an assertion sees only the arm under test.
-    pub(super) async fn authenticated_client()
-    -> (SharedClientState, mpsc::UnboundedReceiver<ServerMessage>) {
+    pub(super) async fn authenticated_client() -> (SharedClientState, crate::outbound::OutboundRx) {
         let app = Arc::new(fixture_app());
         let (mut state, _comp_out, mut ctrl_rx) = fixture_client_state(app, TransportKind::Uds);
         authenticate(&mut state).await;
@@ -440,9 +438,7 @@ pub(super) mod testing {
     }
 
     /// Everything queued on the control channel, in order.
-    pub(super) fn drain(
-        ctrl_rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
-    ) -> Vec<ServerMessage> {
+    pub(super) fn drain(ctrl_rx: &mut crate::outbound::OutboundRx) -> Vec<ServerMessage> {
         let mut out = Vec::new();
         while let Ok(msg) = ctrl_rx.try_recv() {
             out.push(msg);
@@ -512,7 +508,7 @@ pub(super) mod testing {
         Arc<ServerApp>,
         String,
         SharedClientState,
-        mpsc::UnboundedReceiver<ServerMessage>,
+        crate::outbound::OutboundRx,
     ) {
         let app = Arc::new(fixture_app());
         let entry = app

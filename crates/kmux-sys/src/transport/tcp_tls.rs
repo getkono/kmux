@@ -9,7 +9,9 @@ use std::pin::Pin;
 
 use tokio::net::TcpListener;
 
-use crate::transport::{AcceptError, IncomingSession, Listener, PeerInfo, SessionTransport};
+use crate::transport::{
+    AcceptError, IncomingSession, Listener, PeerInfo, PendingSession, SessionTransport,
+};
 use kmux_protocol::messages::TransportKind;
 
 // ─── TlsTcpListener ──────────────────────────────────────────────────────────
@@ -53,34 +55,36 @@ impl Listener for TlsTcpListener {
         TransportKind::TcpTls
     }
 
+    /// Accepts the TCP connection only; the TLS handshake is the returned
+    /// [`PendingSession`]'s, so a client that never sends a `ClientHello`
+    /// delays nobody but itself.
     fn accept(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<IncomingSession, AcceptError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PendingSession, AcceptError>> + Send + '_>> {
         Box::pin(async move {
             let (stream, remote_addr) = self.inner.accept().await.map_err(AcceptError::Io)?;
-            let tls_stream = self
-                .acceptor
-                .accept(stream)
-                .await
-                .map_err(AcceptError::Io)?;
-            let conn_span = tracing::info_span!(
-                "connection",
-                transport = "tcp+tls",
-                remote = ?remote_addr,
-                conn_id = tracing::field::Empty,
-                client_id = tracing::field::Empty,
-            );
-            tracing::info!(parent: &conn_span, remote = ?remote_addr, "TCP+TLS connection accepted");
-            let (read, write) = tokio::io::split(tls_stream);
-            Ok(IncomingSession {
-                read: Box::new(read),
-                write: Box::new(write),
-                peer: PeerInfo {
-                    addr: Some(remote_addr),
-                },
-                span: conn_span,
-                transport: SessionTransport::TcpTls,
-            })
+            let acceptor = self.acceptor.clone();
+            Ok(PendingSession::new(async move {
+                let tls_stream = acceptor.accept(stream).await.map_err(AcceptError::Io)?;
+                let conn_span = tracing::info_span!(
+                    "connection",
+                    transport = "tcp+tls",
+                    remote = ?remote_addr,
+                    conn_id = tracing::field::Empty,
+                    client_id = tracing::field::Empty,
+                );
+                tracing::info!(parent: &conn_span, remote = ?remote_addr, "TCP+TLS connection accepted");
+                let (read, write) = tokio::io::split(tls_stream);
+                Ok(IncomingSession {
+                    read: Box::new(read),
+                    write: Box::new(write),
+                    peer: PeerInfo {
+                        addr: Some(remote_addr),
+                    },
+                    span: conn_span,
+                    transport: SessionTransport::TcpTls,
+                })
+            }))
         })
     }
 }
@@ -121,7 +125,7 @@ impl Listener for PlainTcpListener {
 
     fn accept(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<IncomingSession, AcceptError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PendingSession, AcceptError>> + Send + '_>> {
         Box::pin(async move {
             let (stream, remote_addr) = self.inner.accept().await.map_err(AcceptError::Io)?;
             let conn_span = tracing::info_span!(
@@ -133,7 +137,7 @@ impl Listener for PlainTcpListener {
             );
             tracing::info!(parent: &conn_span, remote = ?remote_addr, "TCP connection accepted");
             let (read, write) = tokio::io::split(stream);
-            Ok(IncomingSession {
+            Ok(PendingSession::ready(IncomingSession {
                 read: Box::new(read),
                 write: Box::new(write),
                 peer: PeerInfo {
@@ -141,7 +145,7 @@ impl Listener for PlainTcpListener {
                 },
                 span: conn_span,
                 transport: SessionTransport::Tcp,
-            })
+            }))
         })
     }
 }
@@ -169,5 +173,91 @@ mod tests {
             .await
             .expect("should bind");
         assert!(listener.local_port().unwrap() > 0);
+    }
+
+    /// A bound on real-socket waits; the handshake timeout under test is an
+    /// hour, so reaching it would mean the accept loop was blocked.
+    #[cfg(feature = "tcp-tls")]
+    const WAIT: std::time::Duration = std::time::Duration::from_secs(10);
+
+    #[cfg(feature = "tcp-tls")]
+    async fn tls_listener() -> TlsTcpListener {
+        use crate::tls::CertMaterial;
+        let material = CertMaterial::self_signed().expect("self-signed cert");
+        let tls_config = crate::tls::build_server_config(material).expect("server config");
+        TlsTcpListener::bind("127.0.0.1:0".parse().unwrap(), tls_config)
+            .await
+            .expect("should bind")
+    }
+
+    /// One TCP client connects and never sends a `ClientHello`; a well-behaved
+    /// TLS client that connects after it is still accepted. With the handshake
+    /// on the accept loop, the first client blocked every later accept.
+    #[cfg(feature = "tcp-tls")]
+    #[tokio::test]
+    async fn a_stalled_tls_handshake_does_not_delay_the_next_accept() {
+        use std::sync::Arc;
+
+        use rustls::pki_types::ServerName;
+
+        use crate::tls::TofuVerifier;
+        use crate::transport::serve;
+
+        let listener = tls_listener().await;
+        let addr = listener.local_addr().unwrap();
+        let (tx, mut accepted) = tokio::sync::mpsc::unbounded_channel();
+        tokio::spawn(serve(
+            Box::new(listener),
+            std::time::Duration::from_secs(3600),
+            Arc::new(move |session: IncomingSession| {
+                let _ = tx.send(session.peer.addr);
+            }),
+        ));
+
+        let _stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+
+        let config = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(TofuVerifier::accept_invalid(
+                addr.to_string(),
+                "tcp+tls",
+            )))
+            .with_no_client_auth();
+        let tcp = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let client_addr = tcp.local_addr().unwrap();
+        let _tls = tokio::time::timeout(
+            WAIT,
+            tokio_rustls::TlsConnector::from(Arc::new(config))
+                .connect(ServerName::try_from("localhost").unwrap(), tcp),
+        )
+        .await
+        .expect("the handshake is not stuck behind the stalled client")
+        .expect("TLS handshake");
+
+        let peer = tokio::time::timeout(WAIT, accepted.recv())
+            .await
+            .expect("the second client is accepted")
+            .expect("serve is running");
+        assert_eq!(peer, Some(client_addr), "only the TLS client got through");
+    }
+
+    /// A handshake that never finishes is given up after the timeout, on the
+    /// paused clock.
+    #[cfg(feature = "tcp-tls")]
+    #[tokio::test(start_paused = true)]
+    async fn a_handshake_that_never_finishes_times_out() {
+        let mut listener = tls_listener().await;
+        let addr = listener.local_addr().unwrap();
+        let _stalled = tokio::net::TcpStream::connect(addr).await.unwrap();
+        let pending = listener.accept().await.expect("the TCP accept succeeds");
+
+        let timeout = std::time::Duration::from_secs(10);
+        let started = tokio::time::Instant::now();
+        let result = pending.establish(timeout).await;
+        assert!(
+            matches!(result, Err(AcceptError::HandshakeTimeout(t)) if t == timeout),
+            "expected a handshake timeout"
+        );
+        assert!(started.elapsed() >= timeout);
     }
 }

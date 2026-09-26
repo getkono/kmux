@@ -2,6 +2,7 @@ use kmux_protocol::messages::{ClientId, InputMode, KeyEvent, ScrollbackLine, Ter
 use kmux_pty::error::{KmuxError, Result};
 
 use crate::conversions::term_size_to_window;
+use crate::engine::PaneInput;
 use tracing::warn;
 
 use super::ServerApp;
@@ -9,36 +10,55 @@ use super::attach::InputLockOutcome;
 use super::helpers::{as_pane_error, get_pane_relay, get_pane_relay_mut, touch_session_for_pane};
 
 impl ServerApp {
-    /// Forward user input bytes to a pane's PTY stdin.
+    /// Queue user input bytes for a pane's PTY stdin.
+    ///
+    /// Like every input path, this validates and enqueues under the `sessions`
+    /// read lock and returns without awaiting the PTY (issue #206): a child
+    /// that stopped reading fills its pane's queue, and then this returns
+    /// [`KmuxError::InputQueueFull`] instead of blocking every session behind it.
     pub async fn write_input(
         &self,
         pane_id: &str,
         client_id: ClientId,
         data: Vec<u8>,
     ) -> Result<()> {
-        let sessions = self.sessions.read().await;
-        let relay = get_pane_relay(&sessions, pane_id)?;
-        match &relay.input_mode {
-            InputMode::Open => {}
-            InputMode::Locked(holder) if *holder == client_id => {}
-            InputMode::Locked(_) | InputMode::Disabled => {
-                return Err(KmuxError::Pty(nix::Error::EPERM));
-            }
-        }
-        touch_session_for_pane(&sessions, pane_id);
-        relay.engine.write_input(&data).await
+        self.enqueue_input(pane_id, client_id, PaneInput::Bytes(data))
+            .await
     }
 
-    /// Encode a batch of key events in order using the pane's live Ghostty
-    /// mode state and concatenate the encoded bytes into a single PTY
-    /// write.  Each event sees the state left by the previous event in the
-    /// batch — important for sequences that toggle modes mid-batch (e.g.
-    /// pressing the key that disables modifyOtherKeys then a follow-up).
+    /// Queue a batch of key events for a pane. The pane's writer encodes them
+    /// in order against the emulator's live mode state and writes the bytes
+    /// as one PTY write, so each event sees the state left by the previous one
+    /// (important for sequences that toggle modes mid-batch).
     pub async fn write_key_batch(
         &self,
         pane_id: &str,
         client_id: ClientId,
         events: &[KeyEvent],
+    ) -> Result<()> {
+        self.enqueue_input(pane_id, client_id, PaneInput::Keys(events.to_vec()))
+            .await
+    }
+
+    /// Queue pasted clipboard text for a pane's PTY stdin.
+    pub async fn write_paste(
+        &self,
+        pane_id: &str,
+        client_id: ClientId,
+        data: String,
+    ) -> Result<()> {
+        self.enqueue_input(pane_id, client_id, PaneInput::Paste(data.into_bytes()))
+            .await
+    }
+
+    /// Validate `client_id` may write to `pane_id`, then hand `input` to the
+    /// pane's writer queue. The `sessions` guard is held only for the lookup,
+    /// the input-lock check and the enqueue, none of which await.
+    async fn enqueue_input(
+        &self,
+        pane_id: &str,
+        client_id: ClientId,
+        input: PaneInput,
     ) -> Result<()> {
         let sessions = self.sessions.read().await;
         let relay = get_pane_relay(&sessions, pane_id)?;
@@ -53,35 +73,11 @@ impl ServerApp {
         // been checked, so the answer to "may I write here?" does not depend on
         // how many keys were in the batch. Not activity, so no `last_active`
         // stamp either.
-        if events.is_empty() {
+        if matches!(&input, PaneInput::Keys(events) if events.is_empty()) {
             return Ok(());
         }
         touch_session_for_pane(&sessions, pane_id);
-        // The engine encodes each event against the emulator's live mode state
-        // (in-process under the term_state lock; in a worker it owns that state)
-        // so a mode-mutating sequence from an earlier event is visible to later
-        // ones in the batch, then writes the bytes to the PTY.
-        relay.engine.write_keys(events).await
-    }
-
-    /// Paste clipboard text into a pane's PTY stdin.
-    pub async fn write_paste(
-        &self,
-        pane_id: &str,
-        client_id: ClientId,
-        data: String,
-    ) -> Result<()> {
-        let sessions = self.sessions.read().await;
-        let relay = get_pane_relay(&sessions, pane_id)?;
-        match &relay.input_mode {
-            InputMode::Open => {}
-            InputMode::Locked(holder) if *holder == client_id => {}
-            InputMode::Locked(_) | InputMode::Disabled => {
-                return Err(KmuxError::Pty(nix::Error::EPERM));
-            }
-        }
-        touch_session_for_pane(&sessions, pane_id);
-        relay.engine.write_paste(data.as_bytes()).await
+        relay.engine.enqueue_input(pane_id, input)
     }
 
     /// Resize a pane's PTY and its server-side terminal emulator.
@@ -263,6 +259,54 @@ mod tests {
         app.write_key_batch(&pane_id, ClientId(1), &[])
             .await
             .expect("an open pane accepts an empty batch");
+        let _ = app.close_session(&word).await;
+    }
+
+    /// A pane whose child never reads stdin (`sleep`) fills its input queue,
+    /// and then input is refused with a typed error instead of blocking; a
+    /// `sessions.write()` operation (a resize) still completes. Before the
+    /// queue, `write_input` awaited the PTY write under the `sessions` read
+    /// lock, so every `sessions.write()` in the daemon waited behind it.
+    #[tokio::test]
+    async fn a_full_input_queue_refuses_input_and_blocks_no_other_session_op() {
+        use crate::engine::INPUT_QUEUE_CAPACITY;
+
+        let (app, word, pane_id) = app_with_one_pane().await;
+        let client = ClientId(1);
+        // Enqueue without yielding (`unconstrained` switches off tokio's
+        // cooperative budget), so the pane's writer task cannot drain the
+        // queue while it fills: exactly `INPUT_QUEUE_CAPACITY` inputs fit.
+        let fill = tokio::task::unconstrained(async {
+            for i in 0..INPUT_QUEUE_CAPACITY {
+                app.write_input(&pane_id, client, vec![b'x'; 4096])
+                    .await
+                    .unwrap_or_else(|e| panic!("input {i} must fit the queue: {e}"));
+            }
+            app.write_input(&pane_id, client, b"one more".to_vec())
+                .await
+        });
+        let overflow = tokio::time::timeout(std::time::Duration::from_secs(10), fill)
+            .await
+            .expect("enqueueing never waits on the PTY");
+        assert!(
+            matches!(&overflow, Err(KmuxError::InputQueueFull { pane_id: p }) if *p == pane_id),
+            "expected InputQueueFull, got {overflow:?}"
+        );
+
+        let bigger = TermSize {
+            rows: 30,
+            cols: 100,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            app.resize(&pane_id, client, bigger),
+        )
+        .await
+        .expect("a resize must not wait behind queued input")
+        .expect("resize");
+
         let _ = app.close_session(&word).await;
     }
 }

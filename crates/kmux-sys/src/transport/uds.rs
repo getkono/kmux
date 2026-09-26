@@ -10,7 +10,9 @@ use std::pin::Pin;
 
 use tokio::net::UnixListener;
 
-use crate::transport::{AcceptError, IncomingSession, Listener, PeerInfo, SessionTransport};
+use crate::transport::{
+    AcceptError, IncomingSession, Listener, PeerInfo, PendingSession, SessionTransport,
+};
 use kmux_protocol::messages::TransportKind;
 
 // ─── UdsListener ─────────────────────────────────────────────────────────────
@@ -61,7 +63,7 @@ impl Listener for UdsListener {
 
     fn accept(
         &mut self,
-    ) -> Pin<Box<dyn Future<Output = Result<IncomingSession, AcceptError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<PendingSession, AcceptError>> + Send + '_>> {
         Box::pin(async move {
             let (stream, _addr) = self.inner.accept().await.map_err(AcceptError::Io)?;
             let conn_span = tracing::info_span!(
@@ -72,13 +74,13 @@ impl Listener for UdsListener {
             );
             tracing::info!(parent: &conn_span, "UDS connection accepted");
             let (read, write) = tokio::io::split(stream);
-            Ok(IncomingSession {
+            Ok(PendingSession::ready(IncomingSession {
                 read: Box::new(read),
                 write: Box::new(write),
                 peer: PeerInfo { addr: None },
                 span: conn_span,
                 transport: SessionTransport::Uds,
-            })
+            }))
         })
     }
 }
@@ -103,7 +105,13 @@ mod tests {
                 .expect("connect should succeed");
         });
 
-        let session = listener.accept().await.expect("accept should succeed");
+        let session = listener
+            .accept()
+            .await
+            .expect("accept should succeed")
+            .establish(crate::transport::HANDSHAKE_TIMEOUT)
+            .await
+            .expect("UDS has no handshake");
         assert_eq!(session.kind(), TransportKind::Uds);
         assert!(session.peer.addr.is_none());
     }

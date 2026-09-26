@@ -82,6 +82,10 @@ tempfile.workspace = true
 # `TermState` via `NullEventSink` (feature unification turns it on only for the
 # test build, not the production daemon).
 kmux-vt-core = { workspace = true, features = ["test-util"] }
+# Re-listed with `test-util` for `tokio::time::pause`: the deadline and timeout
+# tests (write timeout, auth/pong watchdog, task supervisor backoff) run on the
+# paused clock instead of sleeping (issue #206). Test builds only.
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

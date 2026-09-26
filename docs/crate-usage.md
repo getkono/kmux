@@ -356,6 +356,20 @@ when a lockfile diff is larger than expected.
 
 ## Known exceptions
 
+- **`tokio` is re-listed in `kmuxd`'s and `kmux-sys`'s `[dev-dependencies]`**
+  with `test-util`, the feature behind `tokio::time::pause`. It widens the
+  regular dependency's features for test builds only (R2) — deadline and
+  timeout tests run on the paused clock instead of sleeping (issue #206) — and
+  is not a second declaration of the crate, like `kmux-vt-core`'s `test-util`
+  re-listing in `kmuxd`.
+- **`kmux-sys` re-lists itself in its own `[dev-dependencies]`** with its
+  gated features (`uds`, `tcp-tls`, `quic`, `server`, `client`, `identity`).
+  `cargo test -p kmux-sys` builds only the default `framing` otherwise, so the
+  listener and identity tests — and every cargo-mutants mutant in that code —
+  were silently compiled out. Like the `tokio` re-listing it widens features
+  for test builds only; dev edges are outside the acyclicity check, and
+  cargo-machete is told to ignore it because it is used by being compiled,
+  not by a `use`.
 - **`kmux-ghostty-sys` declares no Rust dependencies at all.** It links a Zig
   static library and is versioned by `EXPECTED_ABI_VERSION` instead. See
   [terminal-backend.md](terminal-backend.md).

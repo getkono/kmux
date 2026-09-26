@@ -35,3 +35,12 @@ minimum_test_timeout = 30
 # mutating. (`**/mock.rs` used to be excluded here too; the only such file was
 # kmux-pty's unused MockPty, now deleted.)
 exclude_globs = ["crates/kmux-ghostty-sys/src/**"]
+
+# `kmux daemon logs --server`'s entrypoint resolves a remote daemon, connects
+# and authenticates before handing the stream to `stream_logs`, which is where
+# the logic is and what the unit tests drive. With no daemon to reach, its
+# body-replacement mutant can only be "missed". Recorded in docs/testing.md
+# §Known exceptions.
+exclude_re = [
+    'crates/kmux-app/src/subcommands/daemon_cmd\.rs:.*replace fetch_remote_logs -> ',
+]

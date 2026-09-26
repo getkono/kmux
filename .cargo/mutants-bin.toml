@@ -35,5 +35,10 @@ exclude_globs = [
 # body-replacement mutant can only ever be "missed", and the per-PR diff job
 # (held to zero survivors) fails every change that so much as edits a comment
 # in it. The five `tests/` e2e suites, which spawn the real binary, are what
-# cover it. Recorded in docs/testing.md §Known exceptions.
-exclude_re = ['crates/kmuxd/src/main\.rs:.*replace main -> ']
+# cover it. `startup::async_main`, the linear boot script `main` runs (bind,
+# TLS, handoff, listeners, signals), is the same case. Both are recorded in
+# docs/testing.md §Known exceptions.
+exclude_re = [
+    'crates/kmuxd/src/main\.rs:.*replace main -> ',
+    'crates/kmuxd/src/startup\.rs:.*replace async_main -> ',
+]

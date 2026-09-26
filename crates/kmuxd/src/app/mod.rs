@@ -48,11 +48,12 @@ pub(super) const SCROLLBACK_CAPACITY: usize = 10 * 1024 * 1024;
 /// Maximum number of active sessions per daemon.
 pub(super) const MAX_SESSIONS: usize = 1000;
 
-/// Per-client sender pair: bounded data channel (for diffs) + unbounded control
-/// channel (for notifications like `Lagged` that must never be dropped).
+/// Per-client sender pair: bounded data channel (for diffs) + the connection's
+/// control lane (for notifications like `Lagged` that must never be dropped; see
+/// [`crate::outbound`]).
 pub struct ClientSender {
     pub data_tx: mpsc::Sender<kmux_protocol::messages::ServerMessage>,
-    pub ctrl_tx: mpsc::UnboundedSender<kmux_protocol::messages::ServerMessage>,
+    pub ctrl_tx: crate::outbound::OutboundTx,
     /// When true, the relay sends full `TerminalSnapshot` messages instead
     /// of incremental `TerminalUpdate` diffs.
     pub force_full_snapshot: bool,
@@ -117,7 +118,7 @@ pub struct PaneEventSink {
     /// [`set_pty_response_sender`](Self::set_pty_response_sender); left unset for
     /// worker panes, which write their own replies. `OnceLock` so the sink stays
     /// `&self` (it fires from the VT parser).
-    pty_response_tx: std::sync::OnceLock<mpsc::UnboundedSender<Vec<u8>>>,
+    pty_response_tx: std::sync::OnceLock<mpsc::Sender<Vec<u8>>>,
 }
 
 impl PaneEventSink {
@@ -140,7 +141,7 @@ impl PaneEventSink {
     /// the in-process engine before its VT loop starts (see
     /// [`InProcessEngine::new`](crate::engine::InProcessEngine::new)); a second
     /// call is ignored.
-    pub fn set_pty_response_sender(&self, tx: mpsc::UnboundedSender<Vec<u8>>) {
+    pub fn set_pty_response_sender(&self, tx: mpsc::Sender<Vec<u8>>) {
         let _ = self.pty_response_tx.set(tx);
     }
 }
@@ -163,11 +164,7 @@ impl crate::backend::BackendEventSink for PaneEventSink {
             // borrowed buffer and enqueue; the engine's drain task performs the
             // (async, lock-free) PTY write. A worker pane never reaches here — it
             // writes its own replies (see `kmux-vt-worker`).
-            ControlEvent::PtyResponse(bytes) => {
-                if let Some(tx) = self.pty_response_tx.get() {
-                    let _ = tx.send(bytes.to_vec());
-                }
-            }
+            ControlEvent::PtyResponse(bytes) => self.on_pty_response(bytes),
             ControlEvent::Bell => self.on_bell(),
             // Parsed but no client-facing wire event consumes it yet.
             ControlEvent::Hyperlink { .. } => {}
@@ -176,6 +173,21 @@ impl crate::backend::BackendEventSink for PaneEventSink {
 }
 
 impl PaneEventSink {
+    /// Queue a terminal query reply for the child. Dropped when the queue is
+    /// full: the child floods queries without reading its input, so it would
+    /// never see the reply, and queuing it anyway grows without bound.
+    fn on_pty_response(&self, bytes: &[u8]) {
+        let Some(tx) = self.pty_response_tx.get() else {
+            return;
+        };
+        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(bytes.to_vec()) {
+            tracing::debug!(
+                pane_id = self.pane_id,
+                "terminal query reply dropped: the child is not reading its input"
+            );
+        }
+    }
+
     fn on_title(&self, title: &str) {
         {
             let mut current = self.title.lock().unwrap();
@@ -356,7 +368,7 @@ impl PaneRelay {
     /// Send a `PaneResized` event + a forced `TerminalSnapshot` to every
     /// attached client after a size change.
     ///
-    /// `ctrl_tx` channels are unbounded; `data_tx` sends are best-effort
+    /// `ctrl_tx` sends are never dropped; `data_tx` sends are best-effort
     /// (dropped silently if the channel is full — the next diff will repaint).
     pub fn broadcast_resize(&self, pane_id: &str, new_size: TermSize, seqno: u64) {
         use kmux_protocol::messages::{SequenceNo, SessionEventMsg, epoch_millis};
@@ -748,6 +760,13 @@ impl ServerApp {
         &self,
     ) -> broadcast::Receiver<kmux_protocol::messages::ServerMessage> {
         self.vt_events_tx.subscribe()
+    }
+
+    /// How many subscribers the server-wide VT event channel has: one per
+    /// live authenticated connection's forwarder.
+    #[cfg(test)]
+    pub(crate) fn vt_subscriber_count(&self) -> usize {
+        self.vt_events_tx.receiver_count()
     }
 
     /// Broadcast a server message to every connected client via the server-wide
@@ -1161,6 +1180,38 @@ mod tests {
         }
     }
 
+    /// Terminal query replies queue up to the reply capacity and no further:
+    /// a child flooding queries without reading its input cannot grow the
+    /// daemon's memory (issue #206).
+    #[test]
+    fn pane_event_sink_bounds_queued_pty_responses() {
+        use std::sync::Mutex;
+
+        use tokio::sync::broadcast;
+
+        use crate::backend::{BackendEventSink, ControlEvent};
+        use crate::engine::{PTY_RESPONSE_CAPACITY, pty_response_channel};
+
+        let sink = super::PaneEventSink::new(
+            "eagle/0".to_string(),
+            Arc::new(Mutex::new(String::new())),
+            Arc::new(Mutex::new(super::PaneProgress::default())),
+            broadcast::channel(8).0,
+        );
+        let (tx, mut rx) = pty_response_channel();
+        sink.set_pty_response_sender(tx);
+
+        for _ in 0..PTY_RESPONSE_CAPACITY + 5 {
+            sink.on_control_event(ControlEvent::PtyResponse(b"\x1b[1;1R"));
+        }
+        let mut queued = 0;
+        while let Ok(reply) = rx.try_recv() {
+            assert_eq!(reply, b"\x1b[1;1R");
+            queued += 1;
+        }
+        assert_eq!(queued, PTY_RESPONSE_CAPACITY);
+    }
+
     #[tokio::test]
     async fn register_client_assigns_fresh_ids_and_stores_metrics() {
         let app = crate::fixtures::fixture_app();
@@ -1275,8 +1326,7 @@ mod tests {
 
     fn make_client(rows: u16, cols: u16) -> (ClientId, ClientSender) {
         let (data_tx, _data_rx) = mpsc::channel::<kmux_protocol::messages::ServerMessage>(16);
-        let (ctrl_tx, _ctrl_rx) =
-            mpsc::unbounded_channel::<kmux_protocol::messages::ServerMessage>();
+        let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
         let id = ClientId(rows as u64 * 1000 + cols as u64);
         let sender = ClientSender {
             data_tx,
@@ -1309,7 +1359,7 @@ mod tests {
                 term_state,
                 PtyWriter::sink().unwrap(),
                 tokio::task::spawn(async {}),
-                mpsc::unbounded_channel().1,
+                crate::engine::pty_response_channel().1,
             )),
             program: "/bin/sh".to_string(),
             args: vec![],
@@ -1399,7 +1449,7 @@ mod tests {
 
         let mut relay = make_relay(24, 80);
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
         let id = ClientId(1);
         relay.clients.lock().unwrap().insert(
             id,
@@ -1504,7 +1554,7 @@ mod tests {
 
         let mut relay = make_relay(24, 80);
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, mut ctrl_rx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
         relay.clients.lock().unwrap().insert(
             ClientId(1),
             ClientSender {
@@ -1633,7 +1683,7 @@ mod tests {
     ) -> AttachParams {
         use kmux_protocol::messages::ServerMessage;
         let (data_tx, _rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, _crx) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, _crx) = crate::fixtures::make_outbound();
         AttachParams {
             pane_id: "eagle/0".to_string(),
             client_id,
@@ -1798,7 +1848,7 @@ mod tests {
         // Attach a (channels dropped) and b (retain ctrl_rx to observe the kick).
         app.attach(attach_params(a.client_id, None)).await.unwrap();
         let (data_tx, _drx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, mut ctrl_rx_b) = mpsc::unbounded_channel::<ServerMessage>();
+        let (ctrl_tx, mut ctrl_rx_b) = crate::fixtures::make_outbound();
         app.attach(AttachParams {
             pane_id: "eagle/0".to_string(),
             client_id: b.client_id,

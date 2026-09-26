@@ -162,14 +162,23 @@ previous sessions are restored before accepting new connections.  See
 A background Tokio task checkpoints session state every 30 seconds:
 
 ```
-tokio::spawn:
+tokio::spawn(supervise("checkpoint", checkpoint_loop)):
   loop:
     interval.tick() // every 30 s, MissedTickBehavior::Skip
     state = app.checkpoint_state().await
     write_checkpoint(&state, session_state_path)
+    app.sweep_graveyard()
 ```
 
 Missed ticks are skipped so a slow checkpoint does not cause thundering writes.
+
+The loop runs under `supervisor::supervise` (issue #206). A bare
+`tokio::spawn` that panics just ends, and on a server that never restarts that
+meant sessions silently stopped being persisted for good. The supervisor runs
+each attempt as its own task; when one panics it logs the panic payload at
+`error!`, waits a backoff (1 s, doubling per consecutive failure up to 60 s,
+reset after a 60 s healthy run) and starts the loop again. The worker-respawn
+task (`app/recover.rs`) runs under the same supervisor.
 
 ### 5.5 Listener Binding
 
@@ -189,18 +198,24 @@ updated so `announce.rs` can advertise the real port.
 
 ### 5.6 Accept Loop Tasks
 
-One background Tokio task is spawned per bound listener:
+One background Tokio task per bound listener runs `kmux_sys::transport::serve`:
 
 ```
-tokio::spawn:
+tokio::spawn(serve(listener, HANDSHAKE_TIMEOUT, on_session)):
   loop:
-    session = listener.accept().await
-      Ok(session)         → tokio::spawn(dispatch_session(session, app))
-      Err(Closed)         → break
-      Err(other)          → warn + continue
+    pending = listener.accept().await       // transport-level accept only
+      Ok(pending) → tokio::spawn:
+                      session = pending.establish(HANDSHAKE_TIMEOUT).await
+                        Ok(session) → tokio::spawn(dispatch_session(session, app))
+                        Err(e)      → warn, drop this connection only
+      Err(Closed) → break
+      Err(other)  → warn + continue
 ```
 
-Each accepted connection gets its own Tokio task.
+The TLS and QUIC handshakes are part of `establish`, in the connection's own
+task, under `HANDSHAKE_TIMEOUT` (10 s). They used to run inside `accept` on the
+loop itself, so one client that connected and never finished its handshake
+blocked every later accept on that listener (issue #206).
 
 ### 5.7 Idle-Shutdown Watcher (Optional)
 
@@ -294,33 +309,42 @@ Both paths create a transport-specific `PaneAttacher` and then call the shared
 
 ### 7.1 Spawn Supporting Tasks
 
-Three background tasks are started:
+Two tasks start with the connection, and three more once it authenticates:
 
 ```
-writer_task:  ctrl_rx → encode → write_frame (tracks bytes_out, msgs_out)
-event_task:   app.subscribe_events() → pty_event_to_msg → ctrl_tx
-ping_task:    every 5 s: send Ping{seq}, record send time for RTT
+writer_task:   outbound queue → encode → write_frame, each write and flush
+               under FRAME_WRITE_TIMEOUT (tracks bytes_out, msgs_out)
+watchdog_task: every 1 s: close the connection past the auth or pong deadline
+event_task:    app.subscribe_events() → pty_event_to_msg → ctrl_tx   (after auth)
+vt_task:       app.subscribe_vt_events() → ctrl_tx                   (after auth)
+ping_task:     every 5 s: send Ping{seq}, record send time for RTT   (after auth)
 ```
 
-All three tasks are instrumented with the per-connection tracing span.
+All of them are instrumented with the per-connection tracing span. The
+outbound queue is bounded; see [connection.md](connection.md#server-side-flow-control-and-deadlines)
+for its two lanes, how a lagged pane stream recovers, and the deadlines.
 
 ### 7.2 Read-Dispatch Loop
 
 ```
 loop:
-  data = read_frame(&mut reader)
-    Some(data) → decode_client(data) → handle_message(state, msg, attacher)
-                  returns false → break
-    None       → debug "control stream closed" → break
-    Err        → warn → break
+  select:
+    data = read_frame(&mut reader)
+      Some(data) → decode_client(data) → handle_message(state, msg, attacher)
+                    returns false → break
+      None       → debug "control stream closed" → break
+      Err        → warn → break
+    reason = close_signal.closed()   // watchdog, write timeout, outbound overflow
+      → warn "closing connection" reason → break
 ```
 
 Inbound byte/message counters and `last_activity_ms` are updated on every
-frame, before auth.
+frame, before auth, and every frame answers any outstanding ping.
 
 ### 7.3 Connection Teardown
 
 ```
+watchdog_task.abort()
 event_task.abort()
 ping_task.abort()
 app.detach_client_all(client_id)     // remove from all pane ClientMaps
@@ -399,21 +423,51 @@ spawn_pane_relay(pane_id, program, args, size, cwd, capabilities):
 ```
 loop:
   n = reader.read(buf, 65536)
-  ts.feed(buf[..n])
-  // coalesce: drain all immediately-available bytes before diffing
-  loop: ts.feed(buf[..try_read()])  until WouldBlock
+  lock term_state                       // lock_term_state: recovers from poison
+    ts.feed(buf[..n])
+    // coalesce: drain immediately-available bytes before diffing,
+    // at most MAX_FEED_BYTES_PER_LOCK (256 KiB) per lock hold
+    loop: ts.feed(buf[..try_read()])  until WouldBlock or the cap
+  unlock
   flush_cell_diff(pane_id, term_state, scrollback, clients, seqno_counter, ...)
     - compute diff vs previous cursor/modes snapshot
     - seqno = seqno_counter.fetch_add(1)
     - store (seqno, diff) in DiffBuffer
     - for each client in ClientMap:
-        send TerminalUpdate via ctrl_tx (unbounded; never dropped)
-        also send via data_tx (bounded; dropped if full)
+        try_send TerminalUpdate via data_tx (bounded); a full channel sends
+        Lagged via ctrl_tx and drops the client from the pane
   log cycle timing at DEBUG
 ```
 
 Burst output (e.g. large `cat`) is coalesced into a single diff per read
-cycle, reducing redundant intermediate updates to clients.
+cycle, reducing redundant intermediate updates to clients. The per-hold cap
+exists for a sustained flood (`cat /dev/urandom`), which never reaches
+`WouldBlock`: without it the lock was never released, and snapshots, resizes
+and attaches for the pane starved (issue #206). With it, a flood is fed in
+256 KiB holds with the lock free and a diff emitted between them.
+
+Every `term_state` lock goes through `lock::lock_term_state`. A panic while
+the emulator is held poisons the mutex; `lock().unwrap()` then panicked on
+every later lock and the pane was dead for the daemon's life. The helper logs
+at `error!`, clears the poison and continues with the inner value, the same
+recovery `log_writer::ResilientWriter` uses.
+
+### 9.3a Client Input (`app/io.rs`, `engine/`)
+
+`write_input`, `write_key_batch` and `write_paste` validate the pane and its
+input lock under the `sessions` read lock, enqueue a `PaneInput` on the pane's
+bounded input queue (`INPUT_QUEUE_CAPACITY`, 256 inputs) with `try_send`, and
+release the lock. They never await the PTY. A per-pane writer task drains the
+queue to the PTY, encoding keys and wrapping pastes against the emulator's live
+modes at write time.
+
+Before issue #206 the PTY write was awaited under the `sessions` lock, so a
+pane whose child stopped reading stdin blocked once the kernel buffer filled,
+and every `sessions.write()` in the daemon (create, close, resize, attach)
+waited behind it. Now a stuck child fills only its own pane's queue, and further
+input to that pane is refused with `KmuxError::InputQueueFull` (reported to the
+client as an `InternalError`). A worker-isolated pane has the same bound on its
+input requests, sent to the worker after its control requests.
 
 ### 9.4 PTY Child Lifecycle (`kmux-pty`, issue #205)
 
