@@ -17,6 +17,7 @@ use tokio::net::UnixListener;
 use tracing::{info, warn};
 
 use crate::app::ServerApp;
+use crate::persist::checkpoint::Checkpointer;
 
 use super::{PathGuard, read_frame, write_frame};
 
@@ -29,7 +30,13 @@ const SUCCESSOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// On `Ok(())` the handoff committed and `app` must not serve further (the
 /// caller releases sockets and exits). On `Err(_)` the handoff failed before the
 /// commit point and the daemon should resume normal operation.
-pub async fn run(app: &Arc<ServerApp>) -> anyhow::Result<()> {
+pub async fn run(
+    app: &Arc<ServerApp>,
+    checkpointer: Option<&Arc<Checkpointer>>,
+) -> anyhow::Result<()> {
+    // Without a checkpoint the successor has nothing to rebuild the panes
+    // from; refuse before anything has started.
+    let checkpointer = checkpointer.context("no checkpoint path; cannot hand off")?;
     let path = kmux_sys::dirs::handoff_socket_path()?;
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)
@@ -86,7 +93,7 @@ pub async fn run(app: &Arc<ServerApp>) -> anyhow::Result<()> {
             // The successor will respawn from the checkpoint, so make sure a
             // fresh one is on disk. Children are NOT kept alive — this degrades
             // to today's restart behavior.
-            write_checkpoint(app).await?;
+            write_checkpoint(app, checkpointer).await?;
             let _ = write_frame(&stream, &HandoffMessage::Released, None).await;
             return Ok(());
         }
@@ -136,7 +143,7 @@ pub async fn run(app: &Arc<ServerApp>) -> anyhow::Result<()> {
     // exactly what we consumed; anything after sits in the kernel buffer for it.
     app.manager.set_all_keep_alive(true).await;
     app.quiesce_relays().await;
-    write_checkpoint(app).await?;
+    write_checkpoint(app, checkpointer).await?;
 
     // Tell the successor it may bind the control/data sockets; then we exit.
     let _ = write_frame(&stream, &HandoffMessage::Released, None).await;
@@ -206,12 +213,11 @@ fn resolve_successor_exe(
     )
 }
 
-/// Write a fresh checkpoint to the standard session-state path.
-async fn write_checkpoint(app: &ServerApp) -> anyhow::Result<()> {
+/// Write the final checkpoint the successor restores from, durably and off
+/// the runtime (issue #207).
+async fn write_checkpoint(app: &ServerApp, checkpointer: &Arc<Checkpointer>) -> anyhow::Result<()> {
     let state = app.checkpoint_state().await;
-    let path = kmux_sys::dirs::session_state_path()?;
-    crate::persist::checkpoint::write_checkpoint(&state, &path)?;
-    Ok(())
+    checkpointer.write_final_in_background(state).await
 }
 
 #[cfg(test)]

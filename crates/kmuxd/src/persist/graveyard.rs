@@ -14,8 +14,8 @@ use super::{GRAVEYARD_VERSION, PersistedGraveyard};
 /// Atomically write the graveyard to `path`.
 ///
 /// Writes to a `.tmp` sibling first, then renames into place so a crash during
-/// the write cannot corrupt the existing graveyard file (mirrors
-/// [`super::checkpoint::write_checkpoint`]).
+/// the write cannot corrupt the existing graveyard file. Unlike the live
+/// checkpoint ([`super::checkpoint::Checkpointer`]) it is not `fsync`ed.
 pub fn write_graveyard(graveyard: &PersistedGraveyard, path: &Path) -> anyhow::Result<()> {
     let bytes = postcard::to_allocvec(graveyard)
         .map_err(|e| anyhow::anyhow!("graveyard serialization failed: {e}"))?;

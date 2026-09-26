@@ -201,12 +201,15 @@ A background Tokio task checkpoints session state every 30 seconds:
 tokio::spawn(supervise("checkpoint", checkpoint_loop)):
   loop:
     interval.tick() // every 30 s, MissedTickBehavior::Skip
-    state = app.checkpoint_state().await
-    write_checkpoint(&state, session_state_path)
+    state = app.checkpoint_state().await          // on the runtime
+    checkpointer.write_in_background(state)       // spawn_blocking; skipped if unchanged
     app.sweep_graveyard()
 ```
 
 Missed ticks are skipped so a slow checkpoint does not cause thundering writes.
+The write itself (serialize, `fsync`, rename, `fsync` the directory) runs on the
+blocking pool, never on a runtime thread, and a state identical to the last one
+written is not written again (issue #207). See §10.2.
 
 The loop runs under `supervisor::supervise` (issue #206). A bare
 `tokio::spawn` that panics just ends, and on a server that never restarts that
@@ -615,15 +618,35 @@ PersistedDaemonState { version, session_index_counter, sessions, used_words }
 `snapshot_session()` builds one `PersistedSession`; `checkpoint_state()` maps it
 over the live sessions, and the close path (§11b) reuses it for the graveyard.
 
-### 10.2 `write_checkpoint(state, path)`
+### 10.2 `Checkpointer` (`persist/checkpoint.rs`, issue #207)
+
+One `Checkpointer` per daemon is the only writer of the checkpoint file; the
+periodic loop, the shutdown path and a graceful handoff share it, and its lock
+serialises them (they used to race on the same `.bin.tmp`).
 
 ```
 bytes = postcard::to_allocvec(state)
-write bytes → path.with_extension("bin.tmp")
-rename "bin.tmp" → "bin"          // atomic; crash-safe
+write bytes → path.with_extension("bin.tmp"); fsync it
+rename "bin.tmp" → "bin"
+fsync the directory
 ```
 
-The atomic rename ensures a crash during the write never leaves a corrupt file.
+- **Durable.** The rename alone is atomic but not durable: after a power loss it
+  can survive while the data it points at does not, leaving an empty or torn
+  checkpoint. The two `fsync`s close that.
+- **Skipped when unchanged.** `write` compares the serialized bytes with the last
+  write that *succeeded* (length plus a 64-bit hash) and returns
+  `Written::Unchanged` instead of rewriting an idle daemon's state every 30 s. A
+  failed write records nothing, so the next tick retries.
+- **Off the runtime.** `write_in_background` / `write_final_in_background` run
+  the write on `spawn_blocking`; only `checkpoint_state()` (which reads the
+  sessions under their locks) stays on the runtime.
+- **Sealed after the last write.** `write_final` (shutdown, handoff) writes even
+  an unchanged state and then seals the file: a later `write` returns
+  `Written::Sealed`, so a periodic tick landing after a handoff cannot replace
+  the state the successor restores from.
+
+No on-disk format changed, so `STATE_VERSION` is unchanged.
 
 ### 10.3 Schema Versioning
 
@@ -806,7 +829,7 @@ Triggered by SIGINT, SIGTERM, or `stop` via the control socket:
 
 ```
 1. Abort all listener accept loop JoinHandles
-2. app.checkpoint_state().await → write_checkpoint (shutdown checkpoint)
+2. app.checkpoint_state().await → checkpointer.write_final_in_background (shutdown checkpoint)
 3. endpoint.close(0u32, b"shutdown") for each QUIC endpoint
 4. async_main returns Ok(())
 5. Process exits; SocketGuard drop removes the control socket and PID file,
@@ -957,7 +980,7 @@ main()
   │
   └─ SHUTDOWN
       ├─ abort listener tasks
-      ├─ checkpoint_state() + write_checkpoint()
+      ├─ checkpoint_state() + checkpointer.write_final_in_background()
       ├─ QUIC endpoint.close()
       └─ exit (SocketGuard removes control socket + PID file if still ours)
 ```
@@ -1072,8 +1095,8 @@ one returned by `register_client`.
 `cleanup_and_start_daemon` sends SIGTERM, sleeps 300 ms, then unconditionally
 removes the PID file before spawning the new daemon.  If the old daemon is
 mid-checkpoint and takes longer than 300 ms to flush, SIGKILL races with the
-atomic rename in `write_checkpoint`, potentially leaving a `.bin.tmp` orphan
-and losing the checkpoint.
+atomic rename in `Checkpointer::write_final`, potentially leaving a `.bin.tmp`
+orphan and losing the shutdown checkpoint (the previous one survives intact).
 
 **Fix:** After SIGKILL, wait briefly for the process table entry to disappear
 (poll `kill(pid, 0)`) before removing the PID file and spawning the new daemon.
