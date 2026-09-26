@@ -1,9 +1,9 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
 use tokio::sync::Notify;
 use tracing::{debug, error, info, warn};
@@ -46,6 +46,18 @@ pub fn daemonize_process(pid_path: Option<&Path>) -> anyhow::Result<()> {
 
     Ok(())
 }
+
+/// Longest one control connection may take, from its accept to its reply
+/// written (issue #207). A request is one line and its answer one line, so a
+/// healthy exchange takes milliseconds; a client that connects and sends
+/// nothing, or stops reading its answer, is dropped after this instead of
+/// holding a task and a file descriptor for the daemon's lifetime.
+pub(crate) const CONTROL_DEADLINE: Duration = Duration::from_secs(10);
+
+/// Longest control request read, in bytes. A request is a short JSON line; a
+/// longer one is cut off here and then fails to parse, rather than being
+/// buffered without limit while the daemon waits for its newline.
+const MAX_CONTROL_REQUEST: u64 = 64 * 1024;
 
 /// Shared state used to respond to each control socket request.
 #[derive(Clone)]
@@ -180,9 +192,7 @@ pub async fn serve_control_socket(params: ControlSocketParams, stop: impl Future
                 match accept_result {
                     Ok((stream, _)) => {
                         let ctx = ctx.clone();
-                        tokio::spawn(async move {
-                            handle_control_connection(stream, ctx).await;
-                        });
+                        tokio::spawn(serve_control_connection(stream, ctx, CONTROL_DEADLINE));
                     }
                     Err(e) => {
                         warn!("Control socket accept error: {e}");
@@ -221,9 +231,27 @@ pub fn termination_signal() -> std::io::Result<impl Future<Output = ()> + Send> 
     })
 }
 
+/// Serve one control connection, giving up after `deadline` (see
+/// [`CONTROL_DEADLINE`]). Returns whether it finished in time.
+async fn serve_control_connection(
+    stream: tokio::net::UnixStream,
+    ctx: RequestCtx,
+    deadline: Duration,
+) -> bool {
+    let served = tokio::time::timeout(deadline, handle_control_connection(stream, ctx)).await;
+    if served.is_ok() {
+        return true;
+    }
+    warn!(
+        ?deadline,
+        "control connection did not finish in time; dropped"
+    );
+    false
+}
+
 async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestCtx) {
     let (read_half, mut write_half) = stream.into_split();
-    let mut reader = BufReader::new(read_half);
+    let mut reader = BufReader::new(read_half).take(MAX_CONTROL_REQUEST);
     let mut line = String::new();
 
     if let Err(e) = reader.read_line(&mut line).await {
@@ -486,7 +514,7 @@ fn socket_is_live(path: &Path) -> bool {
 /// so each errno branch and the retry budget can be driven by a test.
 fn probe_is_live(
     mut connect: impl FnMut() -> std::io::Result<()>,
-    mut pause: impl FnMut(std::time::Duration),
+    mut pause: impl FnMut(Duration),
 ) -> bool {
     use std::io::ErrorKind::{PermissionDenied, WouldBlock};
     for attempt in 0..SOCKET_PROBE_ATTEMPTS {
@@ -528,14 +556,14 @@ pub fn ensure_no_live_daemon(socket_path: &Path) -> anyhow::Result<()> {
 /// How many times [`socket_is_live`] asks before believing an `EAGAIN`.
 const SOCKET_PROBE_ATTEMPTS: u32 = 8;
 /// Pause between those attempts.
-const SOCKET_PROBE_BACKOFF: std::time::Duration = std::time::Duration::from_millis(30);
+const SOCKET_PROBE_BACKOFF: Duration = Duration::from_millis(30);
 
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::time::Instant;
+    use std::time::{Duration, Instant};
 
-    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
     use tokio::net::{UnixListener, UnixStream};
     use tokio::sync::Notify;
 
@@ -544,10 +572,66 @@ mod tests {
     use std::path::Path;
 
     use super::{
-        ControlSocketParams, SOCKET_PROBE_ATTEMPTS, SOCKET_PROBE_BACKOFF, SocketGuard,
-        ensure_no_live_daemon, pid_file_pid, probe_is_live, serve_control_socket, socket_is_live,
+        CONTROL_DEADLINE, ControlSocketParams, MAX_CONTROL_REQUEST, RequestCtx,
+        SOCKET_PROBE_ATTEMPTS, SOCKET_PROBE_BACKOFF, SocketGuard, ensure_no_live_daemon,
+        pid_file_pid, probe_is_live, serve_control_connection, serve_control_socket,
+        socket_is_live,
     };
     use crate::app::ServerApp;
+
+    /// What a control connection needs to answer, for a daemon with no
+    /// sessions.
+    fn fixture_ctx() -> RequestCtx {
+        RequestCtx {
+            quic_port: 0,
+            tcp_port: 0,
+            token: "test-token".to_string(),
+            start_time: Instant::now(),
+            app: Arc::new(ServerApp::new("test-token".to_string())),
+            shutdown: Arc::new(Notify::new()),
+            restart: Arc::new(Notify::new()),
+            handoff_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            listeners: vec![],
+            public_host: None,
+        }
+    }
+
+    /// A client that connects and never sends a request is dropped at the
+    /// deadline, and sees its connection closed (issue #207).
+    #[tokio::test(start_paused = true)]
+    async fn a_silent_control_client_is_dropped_at_the_deadline() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let started = tokio::time::Instant::now();
+
+        let finished = serve_control_connection(server, fixture_ctx(), CONTROL_DEADLINE).await;
+
+        assert!(!finished);
+        assert!(started.elapsed() >= CONTROL_DEADLINE);
+        let mut buf = [0u8; 8];
+        let read = client.read(&mut buf).await;
+        assert_eq!(read.unwrap(), 0, "the daemon closed its end");
+    }
+
+    /// A request past the length cap is cut off and refused at once, not
+    /// buffered while the daemon waits for a newline that never comes. On the
+    /// real clock (the exchange is real socket I/O); the deadline is far
+    /// beyond the test's own bound, so only the cap can end it in time.
+    #[tokio::test]
+    async fn an_oversized_control_request_is_refused_without_waiting() {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let far = Duration::from_secs(600);
+        let serving = tokio::spawn(serve_control_connection(server, fixture_ctx(), far));
+        let flood = vec![b'x'; usize::try_from(MAX_CONTROL_REQUEST).unwrap() + 1];
+        // The daemon stops reading at the cap and closes, so the tail of the
+        // flood may meet a closed socket.
+        let _ = client.write_all(&flood).await;
+
+        let finished = tokio::time::timeout(Duration::from_secs(10), serving).await;
+        assert!(finished.expect("refused without waiting").unwrap());
+        let mut reply = Vec::new();
+        client.read_to_end(&mut reply).await.unwrap();
+        assert!(reply.is_empty(), "no answer to a malformed request");
+    }
 
     #[tokio::test]
     async fn sessions_command_roundtrips_empty_response() {
@@ -581,7 +665,7 @@ mod tests {
             let _ = stop_rx.await;
         }));
         // Allow the socket task to bind before connecting.
-        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        tokio::time::sleep(Duration::from_millis(20)).await;
 
         let stream = UnixStream::connect(&socket_path).await.unwrap();
         let (read_half, mut write_half) = stream.into_split();
@@ -592,13 +676,10 @@ mod tests {
 
         let mut reader = BufReader::new(read_half);
         let mut line = String::new();
-        tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            reader.read_line(&mut line),
-        )
-        .await
-        .expect("timed out")
-        .unwrap();
+        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
+            .await
+            .expect("timed out")
+            .unwrap();
 
         let resp: SessionsResponse = serde_json::from_str(line.trim()).unwrap();
         assert!(resp.sessions.is_empty());
@@ -609,10 +690,10 @@ mod tests {
         // race the shells other tests fork, which briefly hold the fd.)
         let shutdown_requested = shutdown.notified();
         stop_tx.send(()).unwrap();
-        tokio::time::timeout(std::time::Duration::from_secs(2), shutdown_requested)
+        tokio::time::timeout(Duration::from_secs(2), shutdown_requested)
             .await
             .expect("stop asks the daemon to shut down");
-        tokio::time::timeout(std::time::Duration::from_secs(2), served)
+        tokio::time::timeout(Duration::from_secs(2), served)
             .await
             .expect("the control socket stops serving")
             .unwrap();
@@ -630,7 +711,7 @@ mod tests {
     /// `connect`. Waiting it out keeps these tests about the code under test,
     /// not about what a parallel test happened to fork.
     fn wait_until_unserved(path: &Path) {
-        let deadline = Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = Instant::now() + Duration::from_secs(5);
         while socket_is_live(path) {
             assert!(
                 Instant::now() < deadline,
@@ -638,7 +719,7 @@ mod tests {
                 path.display(),
                 std::os::unix::net::UnixStream::connect(path).map(|_| "connected")
             );
-            std::thread::sleep(std::time::Duration::from_millis(1));
+            std::thread::sleep(Duration::from_millis(1));
         }
     }
 

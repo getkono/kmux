@@ -247,6 +247,14 @@ request/response per connection:
 | `stop`     | `{"status":"ok"}` then triggers shutdown                  |
 | `sessions` | full per-session, per-connection snapshot with metrics    |
 
+**Deadline (issue #207).** Each connection runs in its own task under
+`CONTROL_DEADLINE` (10 s), from accept to reply written, and its request is read
+through a 64 KiB cap (`MAX_CONTROL_REQUEST`). A local client that connects and
+never sends a request, sends an endless line, or stops reading its reply is
+dropped at the deadline instead of holding a task and a file descriptor for the
+daemon's lifetime. An oversized request is cut off at the cap, fails to parse,
+and is answered with nothing.
+
 **Ownership.** A daemon never takes over a control socket another daemon is
 listening on: unlinking a live socket does not stop its daemon, it only makes it
 unreachable, leaving two daemons with the host's sessions split between them.
