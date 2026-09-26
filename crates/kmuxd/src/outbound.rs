@@ -183,17 +183,20 @@ impl OutboundTx {
     /// reserve free, so a dump never starves replies, events or pings.
     pub async fn send_waiting(&self, mut msg: ServerMessage) -> Result<(), OutboundClosed> {
         loop {
-            self.data_room().await;
-            if self.tx.is_closed() {
-                return Err(OutboundClosed);
-            }
             if self.tx.capacity() > self.reserve {
                 match self.tx.try_send(msg) {
                     Ok(()) => return Ok(()),
                     Err(TrySendError::Full(back)) => msg = back,
                     Err(TrySendError::Closed(_)) => return Err(OutboundClosed),
                 }
+            } else if self.tx.is_closed() {
+                return Err(OutboundClosed);
             }
+            self.data_room().await;
+            // Another producer may have refilled the queue since the wait
+            // ended; let it and the writer run before trying again, so a
+            // queue that stays full cannot spin this task.
+            tokio::task::yield_now().await;
         }
     }
 
@@ -558,11 +561,16 @@ mod tests {
                 "expected update {seqno}, got {msg:?}"
             );
         }
+        // Five more frames are waiting when the queue drains: the resync
+        // discards them too, and counts them.
+        for seqno in 21..=25 {
+            client_tx.try_send(update(seqno)).unwrap();
+        }
         rx.mark_drained();
         let msg = next(&mut rx).await;
         assert!(
-            matches!(&msg, ServerMessage::Lagged { pane_id, missed_count: 9 } if pane_id == PANE),
-            "expected Lagged with 9 missed, got {msg:?}"
+            matches!(&msg, ServerMessage::Lagged { pane_id, missed_count: 14 } if pane_id == PANE),
+            "expected Lagged with 14 missed, got {msg:?}"
         );
     }
 
@@ -577,8 +585,40 @@ mod tests {
         assert_eq!(out.try_send_data(update(1)), Err(DataRejected::Closed));
     }
 
+    /// Let every other ready task run a few rounds.
+    async fn settle() {
+        for _ in 0..16 {
+            tokio::task::yield_now().await;
+        }
+    }
+
+    /// A bulk reply with room outside the control reserve goes straight out.
+    #[tokio::test]
+    async fn send_waiting_sends_at_once_while_there_is_room() {
+        let (out, mut rx) = channel(16, close_channel().0);
+        for seqno in 1..=11 {
+            out.try_send_data(update(seqno)).unwrap();
+        }
+        let sent = tokio::time::timeout(
+            WAIT,
+            out.send_waiting(ServerMessage::LogEnd { request_id: 1 }),
+        )
+        .await;
+        assert_eq!(sent, Ok(Ok(())), "one slot above the reserve is room");
+        assert_eq!(out.len(), 12);
+        for _ in 0..11 {
+            next(&mut rx).await;
+        }
+        assert!(matches!(
+            next(&mut rx).await,
+            ServerMessage::LogEnd { request_id: 1 }
+        ));
+    }
+
     /// A bulk reply waits for room without taking the control reserve, so a
-    /// ping still fits while it waits; it goes out once the writer drains.
+    /// ping still fits while it waits. It stays waiting until the writer has
+    /// drained the queue to half, not merely below the reserve, then goes out
+    /// behind everything already queued.
     #[tokio::test]
     async fn send_waiting_leaves_the_control_reserve_free() {
         let (out, mut rx) = channel(16, close_channel().0);
@@ -590,21 +630,53 @@ mod tests {
             bulk.send_waiting(ServerMessage::LogEnd { request_id: 1 })
                 .await
         });
-        tokio::task::yield_now().await;
+        settle().await;
         assert_eq!(out.len(), 12, "the bulk reply waits outside the reserve");
         out.send(ServerMessage::Pong { seq: 1 })
             .expect("control still fits");
 
-        for _ in 0..13 {
+        // Two taken: 5 free, above the reserve of 4 but short of half (8).
+        for _ in 0..2 {
+            next(&mut rx).await;
+        }
+        rx.mark_drained();
+        settle().await;
+        assert_eq!(
+            out.len(),
+            11,
+            "still waiting for the queue to drain to half"
+        );
+
+        // Three more: 8 free, half the queue.
+        for _ in 0..3 {
             next(&mut rx).await;
         }
         rx.mark_drained();
         let sent = tokio::time::timeout(WAIT, waiting).await;
         assert_eq!(sent.expect("sent in time").unwrap(), Ok(()));
+        for _ in 0..8 {
+            next(&mut rx).await;
+        }
         assert!(matches!(
             next(&mut rx).await,
             ServerMessage::LogEnd { request_id: 1 }
         ));
+    }
+
+    /// A bulk reply waiting on a queue whose writer has gone gives up.
+    #[tokio::test]
+    async fn send_waiting_fails_once_the_writer_is_gone() {
+        let (out, rx) = channel(16, close_channel().0);
+        for seqno in 1..=12 {
+            out.try_send_data(update(seqno)).unwrap();
+        }
+        drop(rx);
+        let sent = tokio::time::timeout(
+            WAIT,
+            out.send_waiting(ServerMessage::LogEnd { request_id: 1 }),
+        )
+        .await;
+        assert_eq!(sent, Ok(Err(OutboundClosed)));
     }
 
     /// Control is never dropped: when it no longer fits, the connection is
