@@ -46,7 +46,7 @@ impl InProcessEngine {
         term_state: Arc<Mutex<TermState>>,
         writer: PtyWriter,
         task: JoinHandle<()>,
-        response_rx: mpsc::UnboundedReceiver<Vec<u8>>,
+        response_rx: mpsc::Receiver<Vec<u8>>,
     ) -> Self {
         let writer = Arc::new(writer);
         let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE_CAPACITY);
@@ -181,7 +181,7 @@ fn input_bytes(term_state: &Mutex<TermState>, input: PaneInput) -> Vec<u8> {
 /// dying pane) is logged and skipped so shutdown never blocks.
 async fn pty_response_writer(
     pane_id: String,
-    mut rx: mpsc::UnboundedReceiver<Vec<u8>>,
+    mut rx: mpsc::Receiver<Vec<u8>>,
     writer: Arc<PtyWriter>,
 ) {
     while let Some(bytes) = rx.recv().await {
@@ -256,7 +256,7 @@ mod tests {
             fixture_term_state(4, 20),
             writer,
             tokio::spawn(async {}),
-            mpsc::unbounded_channel().1,
+            crate::engine::pty_response_channel().1,
         )
     }
 

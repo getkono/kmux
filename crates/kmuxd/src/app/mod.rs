@@ -118,7 +118,7 @@ pub struct PaneEventSink {
     /// [`set_pty_response_sender`](Self::set_pty_response_sender); left unset for
     /// worker panes, which write their own replies. `OnceLock` so the sink stays
     /// `&self` (it fires from the VT parser).
-    pty_response_tx: std::sync::OnceLock<mpsc::UnboundedSender<Vec<u8>>>,
+    pty_response_tx: std::sync::OnceLock<mpsc::Sender<Vec<u8>>>,
 }
 
 impl PaneEventSink {
@@ -141,7 +141,7 @@ impl PaneEventSink {
     /// the in-process engine before its VT loop starts (see
     /// [`InProcessEngine::new`](crate::engine::InProcessEngine::new)); a second
     /// call is ignored.
-    pub fn set_pty_response_sender(&self, tx: mpsc::UnboundedSender<Vec<u8>>) {
+    pub fn set_pty_response_sender(&self, tx: mpsc::Sender<Vec<u8>>) {
         let _ = self.pty_response_tx.set(tx);
     }
 }
@@ -164,11 +164,7 @@ impl crate::backend::BackendEventSink for PaneEventSink {
             // borrowed buffer and enqueue; the engine's drain task performs the
             // (async, lock-free) PTY write. A worker pane never reaches here — it
             // writes its own replies (see `kmux-vt-worker`).
-            ControlEvent::PtyResponse(bytes) => {
-                if let Some(tx) = self.pty_response_tx.get() {
-                    let _ = tx.send(bytes.to_vec());
-                }
-            }
+            ControlEvent::PtyResponse(bytes) => self.on_pty_response(bytes),
             ControlEvent::Bell => self.on_bell(),
             // Parsed but no client-facing wire event consumes it yet.
             ControlEvent::Hyperlink { .. } => {}
@@ -177,6 +173,21 @@ impl crate::backend::BackendEventSink for PaneEventSink {
 }
 
 impl PaneEventSink {
+    /// Queue a terminal query reply for the child. Dropped when the queue is
+    /// full: the child floods queries without reading its input, so it would
+    /// never see the reply, and queuing it anyway grows without bound.
+    fn on_pty_response(&self, bytes: &[u8]) {
+        let Some(tx) = self.pty_response_tx.get() else {
+            return;
+        };
+        if let Err(mpsc::error::TrySendError::Full(_)) = tx.try_send(bytes.to_vec()) {
+            tracing::debug!(
+                pane_id = self.pane_id,
+                "terminal query reply dropped: the child is not reading its input"
+            );
+        }
+    }
+
     fn on_title(&self, title: &str) {
         {
             let mut current = self.title.lock().unwrap();
@@ -1169,6 +1180,38 @@ mod tests {
         }
     }
 
+    /// Terminal query replies queue up to the reply capacity and no further:
+    /// a child flooding queries without reading its input cannot grow the
+    /// daemon's memory (issue #206).
+    #[test]
+    fn pane_event_sink_bounds_queued_pty_responses() {
+        use std::sync::Mutex;
+
+        use tokio::sync::broadcast;
+
+        use crate::backend::{BackendEventSink, ControlEvent};
+        use crate::engine::{PTY_RESPONSE_CAPACITY, pty_response_channel};
+
+        let sink = super::PaneEventSink::new(
+            "eagle/0".to_string(),
+            Arc::new(Mutex::new(String::new())),
+            Arc::new(Mutex::new(super::PaneProgress::default())),
+            broadcast::channel(8).0,
+        );
+        let (tx, mut rx) = pty_response_channel();
+        sink.set_pty_response_sender(tx);
+
+        for _ in 0..PTY_RESPONSE_CAPACITY + 5 {
+            sink.on_control_event(ControlEvent::PtyResponse(b"\x1b[1;1R"));
+        }
+        let mut queued = 0;
+        while let Ok(reply) = rx.try_recv() {
+            assert_eq!(reply, b"\x1b[1;1R");
+            queued += 1;
+        }
+        assert_eq!(queued, PTY_RESPONSE_CAPACITY);
+    }
+
     #[tokio::test]
     async fn register_client_assigns_fresh_ids_and_stores_metrics() {
         let app = crate::fixtures::fixture_app();
@@ -1316,7 +1359,7 @@ mod tests {
                 term_state,
                 PtyWriter::sink().unwrap(),
                 tokio::task::spawn(async {}),
-                mpsc::unbounded_channel().1,
+                crate::engine::pty_response_channel().1,
             )),
             program: "/bin/sh".to_string(),
             args: vec![],

@@ -35,6 +35,23 @@ use tokio::task::JoinHandle;
 /// stdin, and from then on further input is refused instead of piling up.
 pub const INPUT_QUEUE_CAPACITY: usize = 256;
 
+/// Most terminal query replies (DSR, DA, …) an in-process pane holds on their
+/// way back to its child. A program that queries answers before it asks again,
+/// so this fills only when the child floods queries without reading its
+/// input; further replies are then dropped (issue #206), since a child that
+/// does not read stdin cannot use them anyway.
+pub const PTY_RESPONSE_CAPACITY: usize = 64;
+
+/// The channel a pane's event sink queues terminal query replies on and its
+/// [`InProcessEngine`] drains to the PTY. Bounded: see
+/// [`PTY_RESPONSE_CAPACITY`].
+pub fn pty_response_channel() -> (
+    tokio::sync::mpsc::Sender<Vec<u8>>,
+    tokio::sync::mpsc::Receiver<Vec<u8>>,
+) {
+    tokio::sync::mpsc::channel(PTY_RESPONSE_CAPACITY)
+}
+
 /// Why an input was not queued. The rejected input itself is dropped.
 pub(super) type QueueRejected = TrySendError<()>;
 
