@@ -15,6 +15,11 @@
 //! runtime spawned the child — a test's runtime, or a daemon runtime being
 //! torn down — and it is not a blocking-pool thread, so it never holds up a
 //! runtime's shutdown.
+//!
+//! Starting it can fail (no thread or runtime to be had under memory or thread
+//! pressure). Only a success is kept: a failure fails the spawn that asked,
+//! and the next spawn tries again, so one transient failure does not disable
+//! every later pane of a long-running daemon (issue #207).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock, PoisonError};
@@ -35,17 +40,38 @@ pub(crate) struct Reaper {
     children: Mutex<HashMap<Pid, ExitSender>>,
 }
 
-static REAPER: OnceLock<std::result::Result<Reaper, String>> = OnceLock::new();
+static REAPER: OnceLock<Reaper> = OnceLock::new();
 
-/// The reaper, started on first use.
+/// Serialises start attempts, so two first spawns cannot start two reapers.
+static STARTING: Mutex<()> = Mutex::new(());
+
+/// The reaper, started on first use; a failed start is retried by the next
+/// call.
 ///
 /// Returns once its `SIGCHLD` handler is installed, so a child forked after
 /// this returns cannot exit unobserved. Call it *before* forking.
 pub(crate) fn reaper() -> Result<&'static Reaper> {
-    REAPER
-        .get_or_init(start)
-        .as_ref()
+    get_or_start(&REAPER, &STARTING, start)
         .map_err(|e| KmuxError::Spawn(format!("child reaper unavailable: {e}")))
+}
+
+/// The value in `cell`, or the one `start` builds, stored only when it
+/// succeeds: an error is returned to this caller and the next call runs
+/// `start` again. `starting` keeps two callers from running `start` at once.
+fn get_or_start<'a, T>(
+    cell: &'a OnceLock<T>,
+    starting: &Mutex<()>,
+    start: impl FnOnce() -> std::result::Result<T, String>,
+) -> std::result::Result<&'a T, String> {
+    if let Some(value) = cell.get() {
+        return Ok(value);
+    }
+    let _starting = starting.lock().unwrap_or_else(PoisonError::into_inner);
+    if let Some(value) = cell.get() {
+        return Ok(value);
+    }
+    let value = start()?;
+    Ok(cell.get_or_init(|| value))
 }
 
 fn start() -> std::result::Result<Reaper, String> {
@@ -87,7 +113,7 @@ fn run(ready: &std::sync::mpsc::Sender<std::result::Result<(), String>>) {
         // `recv` returns `None` only if the signal driver goes away, which it
         // cannot while this runtime is blocked on this future.
         while sigchld.recv().await.is_some() {
-            if let Some(Ok(reaper)) = REAPER.get() {
+            if let Some(reaper) = REAPER.get() {
                 reaper.reap_exited();
             }
         }
@@ -151,6 +177,23 @@ fn classify(result: nix::Result<WaitStatus>) -> Option<ExitStatus> {
 mod tests {
     use super::*;
     use nix::sys::signal::Signal;
+
+    /// A failed start is not remembered: the next call starts again, and the
+    /// value it builds is kept for every call after it.
+    #[test]
+    fn a_failed_start_is_retried_and_a_success_is_kept() {
+        let cell = OnceLock::new();
+        let starting = Mutex::new(());
+
+        let failed = get_or_start(&cell, &starting, || Err::<u32, _>("no thread".into()));
+        assert_eq!(failed, Err("no thread".to_string()));
+        assert_eq!(get_or_start(&cell, &starting, || Ok(7)), Ok(&7));
+        assert_eq!(
+            get_or_start(&cell, &starting, || Ok(8)),
+            Ok(&7),
+            "started once"
+        );
+    }
 
     #[test]
     fn classify_maps_every_wait_status() {

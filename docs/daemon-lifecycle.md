@@ -516,7 +516,10 @@ checks the child once on the spot, so an exit that beat the registration is not
 lost. This replaced a blocking `waitpid` thread per pane, which parked one of
 tokio's 512 blocking threads for each pane's whole life. A child inherited over
 a handoff is not ours to `waitpid`; its channel is fed by a `kill(pid, 0)` poll
-instead.
+instead. Only a *successful* start of the reaper is kept: a start that fails (no
+thread or runtime under memory or thread pressure) fails the spawn that asked for
+it, and the next spawn tries again, so one transient failure no longer disables
+every later pane of a long-running daemon (issue #207).
 
 **Close** (`shutdown::graceful_shutdown`, `PtySession::close[_nowait]`). Pane
 close signals the child's process group, so whatever runs in it goes too — the
