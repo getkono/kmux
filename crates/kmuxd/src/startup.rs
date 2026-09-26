@@ -310,8 +310,9 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
             public_host: cfg.advertise.public_host.clone(),
             handoff_successor: handoff,
         };
+        let stop = crate::daemon::termination_signal()?;
         tokio::spawn(async move {
-            crate::daemon::serve_control_socket(params).await;
+            crate::daemon::serve_control_socket(params, stop).await;
         });
 
         // A handoff successor must claim the pid file itself (it daemonized
