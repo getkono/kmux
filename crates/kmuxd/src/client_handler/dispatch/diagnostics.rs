@@ -87,21 +87,30 @@ pub(super) async fn on_fetch_logs(
     lines: Option<u32>,
     follow: bool,
 ) {
+    match kmux_sys::dirs::daemon_log_path() {
+        Ok(path) => stream_log_file(state, &path, request_id, lines, follow).await,
+        Err(e) => state.error(
+            Some(request_id),
+            ErrorCode::InternalError,
+            format!("daemon log path unavailable: {e}"),
+        ),
+    }
+}
+
+/// Stream the log file at `path` for request `request_id`: what
+/// [`on_fetch_logs`] does once it has resolved the daemon's log path. The
+/// path is a parameter so tests stream a file of their own rather than
+/// whatever the machine's state dir holds.
+async fn stream_log_file(
+    state: &SharedClientState,
+    path: &Path,
+    request_id: u64,
+    lines: Option<u32>,
+    follow: bool,
+) {
     use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-    let path = match kmux_sys::dirs::daemon_log_path() {
-        Ok(p) => p,
-        Err(e) => {
-            state.error(
-                Some(request_id),
-                ErrorCode::InternalError,
-                format!("daemon log path unavailable: {e}"),
-            );
-            return;
-        }
-    };
-
-    let mut file = match tokio::fs::File::open(&path).await {
+    let mut file = match tokio::fs::File::open(path).await {
         Ok(f) => f,
         Err(e) => {
             state.error(
@@ -266,7 +275,7 @@ fn directory_error(request_id: u64, requested: &str, err: &std::io::Error) -> Se
 #[cfg(test)]
 mod tests {
     use super::super::testing::*;
-    use super::{Path, list_directory};
+    use super::{Path, list_directory, stream_log_file};
 
     #[tokio::test]
     async fn process_overview_on_an_empty_server_returns_no_panes() {
@@ -327,6 +336,76 @@ mod tests {
             ServerMessage::Error { code, .. } => assert_eq!(*code, ErrorCode::InternalError),
             other => panic!("stream must end with LogEnd or Error, got {other:?}"),
         }
+    }
+
+    /// Collect replies until `LogEnd`, or until none arrives for a while.
+    async fn log_replies(ctrl_rx: &mut crate::outbound::OutboundRx) -> Vec<ServerMessage> {
+        let mut msgs = Vec::new();
+        let quiet = std::time::Duration::from_millis(600);
+        while let Ok(Some(msg)) = tokio::time::timeout(quiet, ctrl_rx.recv()).await {
+            let end = matches!(msg, ServerMessage::LogEnd { .. });
+            msgs.push(msg);
+            if end {
+                break;
+            }
+        }
+        msgs
+    }
+
+    fn chunk_data(msgs: &[ServerMessage]) -> Vec<u8> {
+        msgs.iter()
+            .filter_map(|msg| match msg {
+                ServerMessage::LogChunk {
+                    request_id: 7,
+                    data,
+                } => Some(data.clone()),
+                _ => None,
+            })
+            .flatten()
+            .collect()
+    }
+
+    /// Without `follow`, the (trimmed) log is sent and the stream ends.
+    #[tokio::test]
+    async fn a_log_dump_sends_the_last_lines_then_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("kmuxd.log");
+        std::fs::write(&log, b"one\ntwo\nthree\n").unwrap();
+        let (state, mut ctrl_rx) = authenticated_client().await;
+
+        stream_log_file(&state, &log, 7, Some(2), false).await;
+        let msgs = log_replies(&mut ctrl_rx).await;
+
+        assert_eq!(chunk_data(&msgs), b"two\nthree\n");
+        assert!(
+            matches!(msgs.last(), Some(ServerMessage::LogEnd { request_id: 7 })),
+            "the dump ends with LogEnd: {msgs:?}"
+        );
+    }
+
+    /// With `follow`, the stream stays open and carries what is appended.
+    #[tokio::test]
+    async fn a_followed_log_streams_appended_lines_and_never_ends() {
+        let tmp = tempfile::tempdir().unwrap();
+        let log = tmp.path().join("kmuxd.log");
+        std::fs::write(&log, b"before\n").unwrap();
+        let (state, mut ctrl_rx) = authenticated_client().await;
+
+        stream_log_file(&state, &log, 7, None, true).await;
+        let first = log_replies(&mut ctrl_rx).await;
+        assert_eq!(chunk_data(&first), b"before\n");
+
+        let mut file = std::fs::OpenOptions::new().append(true).open(&log).unwrap();
+        std::io::Write::write_all(&mut file, b"after\n").unwrap();
+        let more = log_replies(&mut ctrl_rx).await;
+        assert_eq!(chunk_data(&more), b"after\n");
+        assert!(
+            first
+                .iter()
+                .chain(&more)
+                .all(|msg| !matches!(msg, ServerMessage::LogEnd { .. })),
+            "a follow does not end"
+        );
     }
 
     #[test]
