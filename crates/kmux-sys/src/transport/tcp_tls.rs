@@ -209,6 +209,7 @@ mod tests {
         tokio::spawn(serve(
             Box::new(listener),
             std::time::Duration::from_secs(3600),
+            crate::transport::MAX_PENDING_HANDSHAKES,
             Arc::new(move |session: IncomingSession| {
                 let _ = tx.send(session.peer.addr);
             }),

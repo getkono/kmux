@@ -304,7 +304,7 @@ pub struct IncomingSession {
 }
 ```
 
-`serve(listener, HANDSHAKE_TIMEOUT, on_session)` is the accept loop: it spawns each pending connection's `establish` into that connection's own task, so a peer that stalls mid-handshake delays nobody else, and drops it after `HANDSHAKE_TIMEOUT` (10 s).
+`serve(listener, HANDSHAKE_TIMEOUT, MAX_PENDING_HANDSHAKES, on_session)` is the accept loop: it spawns each pending connection's `establish` into that connection's own task, so a peer that stalls mid-handshake delays nobody else, and drops it after `HANDSHAKE_TIMEOUT` (10 s). At most `MAX_PENDING_HANDSHAKES` (64) handshakes run at once per listener (issue #207): with that many in flight the loop stops accepting until one ends, so a flood of connections that never finish their handshake waits in the kernel's backlog (or the QUIC endpoint's queue) rather than in the daemon's memory.
 
 The server dispatches all transports through a single `dispatch_session` → `run_client_session` path in `crates/kmuxd/src/client_handler/session.rs`. Transport-specific setup (e.g., stream opening for QUIC) occurs before the session handler is invoked; the handler itself is generic.
 
@@ -909,7 +909,7 @@ so `PROTOCOL_RANGE` is unchanged.
 
 | What | Deadline | On expiry |
 |------|----------|-----------|
-| TLS / QUIC handshake | `HANDSHAKE_TIMEOUT` 10 s, in the connection's own task | connection dropped; other accepts unaffected |
+| TLS / QUIC handshake | `HANDSHAKE_TIMEOUT` 10 s, in the connection's own task; at most `MAX_PENDING_HANDSHAKES` (64) at once per listener | connection dropped; other accepts unaffected |
 | `Auth` + `AuthProof` after connect | `AUTH_DEADLINE` 30 s | `CloseReason::AuthDeadline` |
 | Any inbound frame after the oldest unanswered `Ping` is written | `PONG_DEADLINE` 30 s | `CloseReason::PongDeadline` |
 | Each frame write, each flush | `FRAME_WRITE_TIMEOUT` 30 s | `CloseReason::WriteTimeout` |

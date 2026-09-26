@@ -213,7 +213,8 @@ tokio::spawn(serve(listener, HANDSHAKE_TIMEOUT, on_session)):
 ```
 
 The TLS and QUIC handshakes are part of `establish`, in the connection's own
-task, under `HANDSHAKE_TIMEOUT` (10 s). They used to run inside `accept` on the
+task, under `HANDSHAKE_TIMEOUT` (10 s), and at most `MAX_PENDING_HANDSHAKES`
+(64) of them run at once per listener (issue #207). They used to run inside `accept` on the
 loop itself, so one client that connected and never finished its handshake
 blocked every later accept on that listener (issue #206).
 

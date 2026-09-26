@@ -42,8 +42,8 @@ pub mod uds;
 
 #[cfg(feature = "framing")]
 pub use listener::{
-    AcceptError, HANDSHAKE_TIMEOUT, IncomingSession, Listener, PeerInfo, PendingSession,
-    SessionTransport, serve,
+    AcceptError, HANDSHAKE_TIMEOUT, IncomingSession, Listener, MAX_PENDING_HANDSHAKES, PeerInfo,
+    PendingSession, SessionTransport, serve,
 };
 
 #[cfg(feature = "framing")]
@@ -153,6 +153,14 @@ mod listener {
     /// that has not finished by then is not going to.
     pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
+    /// Most connections a listener handshakes at once (issue #207). Each
+    /// in-flight handshake is a task, a socket and TLS state; past this many,
+    /// the listener stops accepting until one finishes or times out, and
+    /// further connections wait in the kernel's accept backlog (TCP, UDS) or
+    /// the QUIC endpoint's queue instead of in the daemon's memory. Far above
+    /// what legitimate clients produce, which reconnect a handful at a time.
+    pub const MAX_PENDING_HANDSHAKES: usize = 64;
+
     /// Pause after a failed accept before the next one.
     const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -218,18 +226,28 @@ mod listener {
     /// Accept connections on `listener` until it closes, completing each
     /// one's handshake in its own task under `handshake_timeout` and handing
     /// the established session to `on_session`. A handshake that fails or
-    /// times out drops that connection only.
+    /// times out drops that connection only. At most `max_handshakes` run at
+    /// once: with that many in flight, the next accept waits for one of them
+    /// to end.
     pub async fn serve(
         mut listener: Box<dyn Listener>,
         handshake_timeout: Duration,
+        max_handshakes: usize,
         on_session: Arc<dyn Fn(IncomingSession) + Send + Sync>,
     ) {
         let kind = listener.kind();
+        let slots = Arc::new(tokio::sync::Semaphore::new(max_handshakes));
         loop {
+            // The semaphore is never closed, so this only waits.
+            let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
+                break;
+            };
             match listener.accept().await {
                 Ok(pending) => {
                     let on_session = Arc::clone(&on_session);
                     tokio::spawn(async move {
+                        // Held until the handshake ends, either way.
+                        let _slot = slot;
                         match pending.establish(handshake_timeout).await {
                             Ok(session) => on_session(session),
                             Err(e) => tracing::warn!("{kind} handshake failed: {e}"),
@@ -253,8 +271,21 @@ mod listener {
 
         use super::*;
 
-        /// A listener that plays back `accepts`, then reports itself closed.
-        struct Scripted(VecDeque<Result<PendingSession, AcceptError>>);
+        /// A listener that plays back `accepts`, then reports itself closed,
+        /// counting the accepts it was asked for.
+        struct Scripted {
+            accepts: VecDeque<Result<PendingSession, AcceptError>>,
+            asked: Arc<std::sync::atomic::AtomicUsize>,
+        }
+
+        impl Scripted {
+            fn new(accepts: impl IntoIterator<Item = Result<PendingSession, AcceptError>>) -> Self {
+                Self {
+                    accepts: accepts.into_iter().collect(),
+                    asked: Arc::default(),
+                }
+            }
+        }
 
         impl Listener for Scripted {
             fn kind(&self) -> TransportKind {
@@ -265,7 +296,8 @@ mod listener {
                 &mut self,
             ) -> Pin<Box<dyn Future<Output = Result<PendingSession, AcceptError>> + Send + '_>>
             {
-                let next = self.0.pop_front().unwrap_or(Err(AcceptError::Closed));
+                self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                let next = self.accepts.pop_front().unwrap_or(Err(AcceptError::Closed));
                 Box::pin(std::future::ready(next))
             }
         }
@@ -286,16 +318,17 @@ mod listener {
         /// listener closes.
         #[tokio::test(start_paused = true)]
         async fn serve_backs_off_after_a_failed_accept_and_ends_when_the_listener_closes() {
-            let listener = Scripted(VecDeque::from([
+            let listener = Scripted::new([
                 Err(AcceptError::Io(std::io::Error::other("EMFILE"))),
                 Ok(PendingSession::ready(uds_session())),
-            ]));
+            ]);
             let (tx, mut served) = tokio::sync::mpsc::unbounded_channel();
             let started = tokio::time::Instant::now();
 
             serve(
                 Box::new(listener),
                 HANDSHAKE_TIMEOUT,
+                MAX_PENDING_HANDSHAKES,
                 Arc::new(move |session: IncomingSession| {
                     let _ = tx.send(session.kind());
                 }),
@@ -304,6 +337,31 @@ mod listener {
 
             assert!(started.elapsed() >= ACCEPT_ERROR_BACKOFF);
             assert_eq!(served.recv().await, Some(TransportKind::Uds));
+        }
+
+        /// With `max_handshakes` handshakes stalled, the listener accepts
+        /// nothing more until one of them times out and frees its slot
+        /// (issue #207).
+        #[tokio::test(start_paused = true)]
+        async fn serve_accepts_no_more_than_the_cap_while_handshakes_are_pending() {
+            let stalled = || Ok(PendingSession::new(std::future::pending()));
+            let listener = Scripted::new([stalled(), stalled(), stalled()]);
+            let asked = Arc::clone(&listener.asked);
+            let accepts = move || asked.load(std::sync::atomic::Ordering::SeqCst);
+            let started = tokio::time::Instant::now();
+            let serving = tokio::spawn(serve(
+                Box::new(listener),
+                HANDSHAKE_TIMEOUT,
+                2,
+                Arc::new(|_: IncomingSession| {}),
+            ));
+
+            tokio::time::sleep(HANDSHAKE_TIMEOUT / 2).await;
+            assert_eq!(accepts(), 2, "the third accept waits for a slot");
+
+            serving.await.unwrap();
+            assert!(started.elapsed() >= HANDSHAKE_TIMEOUT);
+            assert_eq!(accepts(), 4, "the rest once the stalled ones timed out");
         }
 
         #[test]
