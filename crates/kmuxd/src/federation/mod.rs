@@ -1421,9 +1421,12 @@ fn spawn_feed_loop(
             // Session-scoped events (titles, layout, tab/session lifecycle): translate
             // the embedded word remote→local and fan out to every viewer under that
             // word, so a GUI viewing a federated session still receives its title and
-            // layout updates. These go over the viewers' ctrl lane
-            // (`viewers_under_word`), so — exactly as in the local daemon — a backed-up
-            // pane content stream can never drop an event.
+            // layout updates. They take the same lanes as the local daemon's
+            // (`forward_vt_event`): layout and lifecycle go over the viewers' ctrl
+            // lane, so a backed-up pane content stream can never drop one, while a
+            // flood-prone bell/title/progress event is dropped when the viewer's
+            // pane data is congested, rather than filling the never-drop lane and
+            // closing every slow viewer (issue #206).
             let viewers = {
                 let guard = conn.lock().unwrap();
                 match &mut msg {
@@ -1444,7 +1447,7 @@ fn spawn_feed_loop(
             };
             if let Some(viewers) = viewers {
                 for tx in viewers {
-                    let _ = tx.send(msg.clone());
+                    crate::client_handler::forward_vt_event(&tx, msg.clone());
                 }
             }
         }
