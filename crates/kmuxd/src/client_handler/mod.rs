@@ -4,7 +4,7 @@ mod liveness;
 mod session;
 pub use dispatch::handle_message;
 pub use events::pty_event_to_msg;
-pub(crate) use session::{MAX_WRITE_BATCH, forward_vt_event};
+pub(crate) use session::{FRAME_WRITE_TIMEOUT, MAX_WRITE_BATCH, forward_vt_event, within};
 pub use session::{build_attach_replay, run_client_session};
 
 use std::collections::HashMap;

@@ -913,6 +913,7 @@ so `PROTOCOL_RANGE` is unchanged.
 | `Auth` + `AuthProof` after connect | `AUTH_DEADLINE` 30 s | `CloseReason::AuthDeadline` |
 | Any inbound frame after the oldest unanswered `Ping` is written | `PONG_DEADLINE` 30 s | `CloseReason::PongDeadline` |
 | Each frame write, each flush | `FRAME_WRITE_TIMEOUT` 30 s | `CloseReason::WriteTimeout` |
+| Each frame write, each flush, and the `FIN` on a QUIC pane stream | `FRAME_WRITE_TIMEOUT` 30 s | the QUIC connection is closed (application code 1) |
 
 Answering `Ping` with `Pong` has always been part of the protocol, and every
 long-lived peer does (`kmux-client`, federation links); what is new is that the
@@ -923,6 +924,13 @@ skew: the command is re-run).
 
 A listener whose `accept` fails (out of file descriptors) pauses 100 ms before
 the next attempt instead of spinning.
+
+A QUIC pane stream (`pane_uni_writer` in `crates/kmuxd/src/connection.rs`)
+is written under the same `FRAME_WRITE_TIMEOUT` (issue #207). A client that stops
+reading one pane's stream fills that stream's flow-control window, and the
+write used to wait forever, pinning the pane's writer task and its queue. On a
+stall the daemon now closes the whole QUIC connection, exactly as a stalled
+control stream does, and the client reconnects and resyncs.
 
 The pong clock starts when the writer puts the `Ping` on the wire, not when it
 is queued: a ping waiting behind a log dump or pane data on a slow link has not
