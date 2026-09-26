@@ -13,7 +13,7 @@ pub(crate) const MAX_WRITE_BATCH: usize = 256;
 use tokio::io::{AsyncRead, AsyncWrite, AsyncWriteExt};
 use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
-use tracing::{Instrument, Span, debug, info, warn};
+use tracing::{Instrument, Span, debug, error, info, warn};
 
 use super::liveness::{self, Liveness, PING_INTERVAL};
 use crate::app::{AttachResult, ConnectionMetrics, ServerApp};
@@ -92,7 +92,7 @@ fn is_lossy_vt_event(msg: &ServerMessage) -> bool {
 /// on the never-drop control lane, a burst from one pane would fill the queue
 /// and close every slow client's connection. Everything else (layout, tab
 /// lifecycle, clipboard) is control.
-fn forward_vt_event(out: &OutboundTx, msg: ServerMessage) {
+pub(crate) fn forward_vt_event(out: &OutboundTx, msg: ServerMessage) {
     if is_lossy_vt_event(&msg) {
         let _ = out.try_send_data(msg);
     } else {
@@ -104,7 +104,6 @@ fn spawn_authenticated_forwarders(
     app: &ServerApp,
     ctrl_tx: OutboundTx,
     metrics: Arc<ConnectionMetrics>,
-    liveness: Arc<Liveness>,
     conn_span: Span,
 ) -> AuthenticatedTasks {
     let mut event_rx = app.subscribe_events();
@@ -143,10 +142,12 @@ fn spawn_authenticated_forwarders(
             loop {
                 interval.tick().await;
                 *metrics.last_ping_sent.lock().unwrap() = Some((seq, std::time::Instant::now()));
+                // The pong clock starts when the writer puts the ping on the
+                // wire (`write_batch`), not here: queued behind a log dump or
+                // pane data, it may not go out for a while.
                 if ping_tx.send(ServerMessage::Ping { seq }).is_err() {
                     break;
                 }
-                liveness.on_ping_sent(tokio::time::Instant::now());
                 seq += 1;
             }
         }
@@ -176,12 +177,16 @@ pub(crate) const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
 /// syscalls than one flush per message. Per-frame compression and the
 /// one-frame-per-message wire format are unchanged, so the bytes on the wire
 /// are identical — only the flush boundaries move.
+///
+/// A `Ping` starts `liveness`'s pong clock once it is written, so the time a
+/// ping spends queued behind other frames is not counted against the client.
 async fn write_outbound<W: AsyncWrite + Unpin>(
     mut out_rx: OutboundRx,
     mut writer: W,
     metrics: Arc<ConnectionMetrics>,
     comp: Arc<OutboundCompression>,
     closer: Closer,
+    liveness: Arc<Liveness>,
     write_timeout: Duration,
 ) {
     let mut batch: Vec<ServerMessage> = Vec::new();
@@ -196,8 +201,15 @@ async fn write_outbound<W: AsyncWrite + Unpin>(
         }
         // The batch is off the queue: a lagged pane stream may resync.
         out_rx.mark_drained();
-        if let Err(reason) =
-            write_batch(&mut writer, &mut batch, &metrics, &comp, write_timeout).await
+        if let Err(reason) = write_batch(
+            &mut writer,
+            &mut batch,
+            &metrics,
+            &comp,
+            &liveness,
+            write_timeout,
+        )
+        .await
         {
             closer.close(reason);
             break;
@@ -209,12 +221,14 @@ async fn write_outbound<W: AsyncWrite + Unpin>(
 }
 
 /// Write every message in `batch` as its own frame, then flush once. Each
-/// write and the flush must finish within `write_timeout`.
+/// write and the flush must finish within `write_timeout`. A written `Ping`
+/// is recorded in `liveness`.
 async fn write_batch<W: AsyncWrite + Unpin>(
     writer: &mut W,
     batch: &mut Vec<ServerMessage>,
     metrics: &ConnectionMetrics,
     comp: &OutboundCompression,
+    liveness: &Liveness,
     write_timeout: Duration,
 ) -> Result<(), CloseReason> {
     for msg in batch.drain(..) {
@@ -230,6 +244,9 @@ async fn write_batch<W: AsyncWrite + Unpin>(
         // written in full before the next); the client reconnects + resyncs.
         let write = write_frame_compressed_into(&mut *writer, &bytes, comp.compressor());
         let wire_len = within(write_timeout, write).await?;
+        if matches!(msg, ServerMessage::Ping { .. }) {
+            liveness.on_ping_sent(tokio::time::Instant::now());
+        }
         metrics
             .bytes_out
             .fetch_add(wire_len as u64, Ordering::Relaxed);
@@ -314,6 +331,7 @@ pub async fn run_client_session<R, W, A, F>(
             Arc::clone(&metrics),
             Arc::clone(&comp_out),
             closer,
+            Arc::clone(&liveness),
             FRAME_WRITE_TIMEOUT,
         )
         .instrument(conn_span.clone()),
@@ -338,6 +356,16 @@ pub async fn run_client_session<R, W, A, F>(
             frame = read_frame(&mut reader) => frame,
             reason = close_signal.closed() => {
                 warn!(conn_id = ?state.connection_id.map(|c| c.0), ?reason, "closing connection");
+                break;
+            }
+            // The writer only ends on its own when it has failed (and closed
+            // the connection) or panicked. Either way nothing more reaches the
+            // client, so a connection left open would be a silent one: no
+            // replies, no pings, and so no pong deadline to end it.
+            ended = &mut writer_task => {
+                if let Err(e) = ended {
+                    error!(conn_id = ?state.connection_id.map(|c| c.0), "outbound writer failed: {e}");
+                }
                 break;
             }
         };
@@ -369,7 +397,6 @@ pub async fn run_client_session<R, W, A, F>(
                                 &app,
                                 state.ctrl_tx.clone(),
                                 Arc::clone(&metrics),
-                                Arc::clone(&liveness),
                                 state.conn_span.clone(),
                             ));
                         }
@@ -404,6 +431,8 @@ pub async fn run_client_session<R, W, A, F>(
 
     drop(state);
     drop(attacher);
+    // An ended writer (the select arm above) never sets `flush_before_close`,
+    // so its finished handle is only aborted, a no-op, never awaited again.
     if flush_before_close {
         // Authentication failures carry a useful AuthResult reason. Close the
         // channel senders and give the writer a bounded opportunity to flush
@@ -534,6 +563,7 @@ mod tests {
             Arc::new(ConnectionMetrics::new()),
             Arc::new(OutboundCompression::new(3, 1024)),
             closer,
+            Arc::new(Liveness::new(tokio::time::Instant::now())),
             FRAME_WRITE_TIMEOUT,
         ));
 
@@ -549,6 +579,60 @@ mod tests {
         writer
             .await
             .expect("the writer ends instead of waiting forever");
+    }
+
+    /// A ping queued behind frames the client has not taken yet does not
+    /// start the pong clock; writing it does. A client draining a large
+    /// reply over a slow link is not closed for a ping it has not seen.
+    #[tokio::test(start_paused = true)]
+    async fn the_pong_clock_starts_when_the_ping_is_written_not_queued() {
+        use liveness::{PONG_DEADLINE, Verdict};
+
+        // Small enough that the first frame fills it and the ping waits.
+        let (server, mut client) = tokio::io::duplex(64);
+        let (closer, _signal) = close_channel();
+        let (out, out_rx) = outbound::channel(OUTBOUND_CAPACITY, closer.clone());
+        let liveness = Arc::new(Liveness::new(tokio::time::Instant::now()));
+        liveness.on_authenticated();
+        tokio::spawn(write_outbound(
+            out_rx,
+            server,
+            Arc::new(ConnectionMetrics::new()),
+            Arc::new(OutboundCompression::new(3, 1024)),
+            closer,
+            Arc::clone(&liveness),
+            // Far beyond this test, so only the pong clock is in play.
+            Duration::from_secs(24 * 3600),
+        ));
+        out.send(ServerMessage::LogChunk {
+            request_id: 1,
+            data: vec![0; 4096],
+        })
+        .unwrap();
+        out.send(ServerMessage::Ping { seq: 0 }).unwrap();
+
+        tokio::time::sleep(PONG_DEADLINE * 2).await;
+        assert_eq!(
+            liveness.verdict(tokio::time::Instant::now()),
+            Verdict::Keep,
+            "the ping is still queued"
+        );
+
+        // The client reads: the chunk and then the ping go out.
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(10), read_frame(&mut client))
+                .await
+                .expect("a frame")
+                .unwrap()
+                .expect("the stream is open");
+        }
+        let written = tokio::time::Instant::now();
+        assert_eq!(liveness.verdict(written + PONG_DEADLINE), Verdict::Keep);
+        assert_eq!(
+            liveness.verdict(written + PONG_DEADLINE + Duration::from_secs(1)),
+            Verdict::Close(CloseReason::PongDeadline),
+            "the clock started when the ping was written"
+        );
     }
 
     /// A socket that connects and sends nothing is closed once the auth
@@ -594,6 +678,7 @@ mod tests {
             Arc::clone(&metrics),
             Arc::new(OutboundCompression::new(3, 1024)),
             closer,
+            Arc::new(Liveness::new(tokio::time::Instant::now())),
             FRAME_WRITE_TIMEOUT,
         ));
         let payload_len = encode_server(&ServerMessage::Pong { seq: 3 })
@@ -627,20 +712,27 @@ mod tests {
         );
     }
 
-    /// Read frames until `want` picks one out.
+    /// Read frames until `want` picks one out. Bounded, so a session that
+    /// stops sending fails the test instead of hanging it (on the paused
+    /// clock the bound passes as soon as nothing else is scheduled).
     async fn read_until<T>(
         reader: &mut (impl AsyncRead + Unpin),
         want: impl Fn(ServerMessage) -> Option<T>,
     ) -> T {
-        loop {
-            let frame = read_frame(reader)
-                .await
-                .unwrap()
-                .expect("the session is open");
-            if let Some(found) = want(decode_server(&frame).unwrap()) {
-                return found;
+        let read = async {
+            loop {
+                let frame = read_frame(&mut *reader)
+                    .await
+                    .unwrap()
+                    .expect("the session is open");
+                if let Some(found) = want(decode_server(&frame).unwrap()) {
+                    return found;
+                }
             }
-        }
+        };
+        tokio::time::timeout(Duration::from_secs(60), read)
+            .await
+            .expect("the awaited frame within the bound")
     }
 
     /// Once authenticated, a client is pinged every `PING_INTERVAL`; one that
@@ -700,9 +792,11 @@ mod tests {
             .expect("the session ends at the pong deadline")
             .unwrap();
         assert!(first_ping.elapsed() > liveness::PONG_DEADLINE);
+        // Sleeps, not yields: a yield loop never lets the paused clock
+        // advance, so the bound would never pass.
         tokio::time::timeout(Duration::from_secs(10), async {
             while app.vt_subscriber_count() > 0 {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(1)).await;
             }
         })
         .await
@@ -738,5 +832,62 @@ mod tests {
 
         forward_vt_event(&out, pane_event(SessionEventMsg::PaneClosed { pane_id }));
         assert_eq!(out.len(), 7, "a lifecycle event is control");
+    }
+
+    /// A transport whose every write panics, as a bug in the write path would.
+    struct PanickingWriter;
+
+    impl AsyncWrite for PanickingWriter {
+        fn poll_write(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            _buf: &[u8],
+        ) -> std::task::Poll<std::io::Result<usize>> {
+            panic!("write path bug");
+        }
+
+        fn poll_flush(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+
+        fn poll_shutdown(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// A writer that dies without closing the connection (a panic) ends the
+    /// session at once. Before, nothing more reached the client, not even a
+    /// ping, so an authenticated connection it left open had no pong
+    /// deadline to close it; here, unauthenticated, only the auth deadline
+    /// would have.
+    #[tokio::test(start_paused = true)]
+    async fn a_writer_that_dies_ends_the_session() {
+        let app = Arc::new(fixture_app());
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let (server_read, _server_write) = tokio::io::split(server);
+        let (_client_read, mut client_write) = tokio::io::split(client);
+        let session = tokio::spawn(run_client_session(
+            server_read,
+            PanickingWriter,
+            app,
+            TransportKind::Uds,
+            |_tx, _compression| NoopAttacher,
+            tracing::info_span!("writer_death_test"),
+        ));
+
+        // Any reply sets the writer off.
+        write_frame(&mut client_write, b"not a message")
+            .await
+            .unwrap();
+        tokio::time::timeout(liveness::AUTH_DEADLINE / 2, session)
+            .await
+            .expect("the session ends with its writer, not at a deadline")
+            .unwrap();
     }
 }

@@ -121,7 +121,10 @@ mod tests {
 
     /// A stream connection is served by a client session: a frame that is
     /// not a client message is answered with an `InvalidMessage` error.
-    #[tokio::test]
+    ///
+    /// On the paused clock: a session that never replies is closed at the
+    /// auth deadline without the test waiting it out in real time.
+    #[tokio::test(start_paused = true)]
     async fn handle_tcp_io_serves_the_connection() {
         let (server, client) = tokio::io::duplex(64 * 1024);
         let (server_read, server_write) = tokio::io::split(server);
