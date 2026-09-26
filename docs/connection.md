@@ -827,17 +827,25 @@ Debug builds use `$XDG_RUNTIME_DIR/kmux-debug/` for all runtime files (control s
 
 ## Idle Shutdown
 
-`kmuxd` exits automatically when no clients have been connected for `idle_shutdown_secs` seconds (default: 30). This is configured in `kmuxd.toml`:
+Idle shutdown is **off by default** (`idle_shutdown_secs = 0`, issue #207).
+`kmuxd` is meant to run for months: a laptop sleep or a network drop that
+disconnects every client must not end it, and ending it ends every shell it
+hosts. An operator who wants a daemon that exits once nobody is attached opts in
+in `kmuxd.toml`:
 
 ```toml
 [daemon]
-# Set to 0 to disable idle shutdown (daemon runs until explicitly stopped).
-idle_shutdown_secs = 30
+# Exit after this many seconds with no client connected. 0 (the default) disables it.
+idle_shutdown_secs = 300
 ```
+
+A `kmuxd.toml` written by an older daemon's first run pins `idle_shutdown_secs = 30`
+(the template serialized every default). Delete the line, or set it to `0`, to
+get the new behaviour.
 
 ### Mechanism
 
-`ServerApp` maintains a `tokio::sync::watch` channel that broadcasts the live connection count. `startup.rs` spawns an idle-watcher task that:
+`ServerApp` maintains a `tokio::sync::watch` channel that broadcasts the live connection count. When `idle_shutdown_secs > 0`, `startup.rs` spawns an idle-watcher task that:
 
 1. Waits for the count to change.
 2. When the count drops to 0, starts a debounce timer of `idle_shutdown_secs`.
@@ -846,11 +854,20 @@ idle_shutdown_secs = 30
 
 ### Debounce rationale
 
-The two-phase connection model has a brief gap between bootstrap and data-plane transport selection. The 30 s debounce is long enough for any reconnect flow to complete, but short enough to prevent orphaned daemons accumulating on a shared machine. Disable it (`idle_shutdown_secs = 0`) only when running `kmuxd` as a long-lived service that must survive temporary client disconnects without restarting.
+The two-phase connection model has a brief gap between bootstrap and data-plane transport selection, and a client switching transports disconnects before it reconnects. Keep the window well above that gap — tens of seconds at least — so a reconnect flow never races the timer.
 
-### Session persistence
+### What survives an idle shutdown
 
-Sessions are checkpointed to `$XDG_STATE_HOME/kmux/session_state.bin` (or `$HOME/.local/state/kmux/`) on idle shutdown (same path as the periodic 30 s checkpoint). A freshly started daemon reads this checkpoint and restores any live PTY processes, so session state is preserved across idle restarts.
+An idle shutdown is an ordinary daemon exit, so the **processes do not survive
+it**: every PTY master closes when the daemon exits, so each shell gets `SIGHUP`
+and its jobs go with it, exactly as on `kmux daemon stop`. What survives is the
+**checkpoint**: sessions are written to `$XDG_STATE_HOME/kmux/session_state.bin`
+(or `$HOME/.local/state/kmux/`) on the way out, the same file the periodic
+checkpoint keeps current. The next daemon reads it and **respawns** each pane —
+a fresh shell in the same working directory, seeded with the old screen and
+scrollback behind a "[kmux: session restored]" separator. Only a graceful
+restart (`kmux daemon restart`, [daemon-handoff.md](daemon-handoff.md)) keeps
+the running processes.
 
 ---
 

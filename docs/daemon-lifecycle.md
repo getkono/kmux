@@ -113,7 +113,7 @@ enabled  = true
 audience = "any"            # any | local | lan | ssh-only
 
 [daemon]
-idle_shutdown_secs = 30      # 0 = disabled
+idle_shutdown_secs = 0       # seconds with no client before exiting; 0 (default) = never
 closed_session_keep = 20      # retained closed sessions for restore (issue #64)
 closed_session_ttl_days = 7   # drop closed sessions older than this; 0 = no age cap
 
@@ -219,7 +219,7 @@ blocked every later accept on that listener (issue #206).
 
 ### 5.7 Idle-Shutdown Watcher (Optional)
 
-When `idle_shutdown_secs > 0`:
+Off by default (issue #207). When `idle_shutdown_secs > 0`:
 
 ```
 tokio::spawn:
@@ -985,8 +985,9 @@ if the query fails.
 
 The idle-shutdown watcher fires when no clients are *connected*, regardless of
 whether any sessions contain live activity (e.g. a long-running process).  A
-daemon with no attached clients but running background jobs will shut down
-and lose those jobs.
+daemon with idle shutdown enabled, no attached clients, and running background
+jobs will shut down and lose those jobs. Idle shutdown is off by default
+(issue #207), so this bites only an operator who opted in.
 
 **Fix:** Add an opt-in `idle_shutdown_mode` config key (`connections` vs
 `activity`).  In `activity` mode, also monitor `last_activity_ms` across all

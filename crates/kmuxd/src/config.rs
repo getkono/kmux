@@ -102,11 +102,12 @@ impl SessionIsolationMode {
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// Exit when no clients have been connected for this many seconds.
-    /// `0` disables idle shutdown (daemon runs until explicitly stopped).
-    ///
-    /// Note: the debounce applies per-transport-disconnect. A 30 s window
-    /// is long enough for clients to reconnect across transport switches.
-    #[serde(default = "default_idle_shutdown_secs")]
+    /// `0` (the default) disables idle shutdown: the daemon runs until it is
+    /// explicitly stopped, so a laptop sleep or a network drop that
+    /// disconnects every client does not end it (issue #207). An idle
+    /// shutdown ends the daemon's shells with it; only the checkpointed
+    /// picture of each pane survives into the next daemon.
+    #[serde(default)]
     pub idle_shutdown_secs: u64,
     /// Pane isolation mode (issue #126). `in-process` (default) keeps the
     /// emulator in the daemon; `process` runs each pane's VT pipeline in an
@@ -126,16 +127,12 @@ pub struct DaemonConfig {
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            idle_shutdown_secs: default_idle_shutdown_secs(),
+            idle_shutdown_secs: 0,
             session_isolation: SessionIsolationMode::default(),
             closed_session_keep: default_closed_session_keep(),
             closed_session_ttl_days: default_closed_session_ttl_days(),
         }
     }
-}
-
-fn default_idle_shutdown_secs() -> u64 {
-    30
 }
 
 /// Default count cap for the closed-session graveyard (issue #64).
@@ -717,11 +714,14 @@ idle_shutdown_secs = 60
         assert_eq!(resolved.idle_shutdown_secs, 60);
     }
 
+    /// A long-running daemon does not exit when its last client goes away
+    /// unless told to (issue #207): off both built in and for an empty file.
     #[test]
-    fn daemon_idle_shutdown_default_is_30() {
-        // Only test the ConfigFile default — resolve() requires TLS when QUIC/TCP+TLS are enabled.
-        let cfg = ConfigFile::default();
-        assert_eq!(cfg.daemon.idle_shutdown_secs, 30);
+    fn daemon_idle_shutdown_is_off_by_default() {
+        assert_eq!(ConfigFile::default().daemon.idle_shutdown_secs, 0);
+        let parsed: ConfigFile = toml::from_str("").unwrap();
+        let resolved = ServerConfig::resolve(parsed).unwrap();
+        assert_eq!(resolved.idle_shutdown_secs, 0);
     }
 
     #[test]
