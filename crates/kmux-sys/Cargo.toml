@@ -66,6 +66,17 @@ tempfile.workspace = true
 # Re-listed with `test-util` for `tokio::time::pause`: the handshake-timeout
 # test runs on the paused clock instead of sleeping (issue #206).
 tokio = { workspace = true, features = ["test-util"] }
+# The crate itself, re-listed with its gated features so its own unit tests
+# build the code they cover. `cargo test -p kmux-sys` (which is how
+# cargo-mutants runs them) otherwise builds only the default `framing`, and every
+# test and mutant behind `uds`, `tcp-tls`, `quic` or `identity` silently drops
+# out. Dev edges only: the dependency graph stays acyclic.
+kmux-sys = { workspace = true, features = ["uds", "tcp-tls", "quic", "server", "client", "identity"] }
 
 [lints]
 workspace = true
+
+# The self re-listing above is used by being compiled, never by a `use`
+# (the crate's code says `crate::`), so cargo-machete cannot see it.
+[package.metadata.cargo-machete]
+ignored = ["kmux-sys"]

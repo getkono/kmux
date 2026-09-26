@@ -246,4 +246,70 @@ mod listener {
             }
         }
     }
+
+    #[cfg(test)]
+    mod tests {
+        use std::collections::VecDeque;
+
+        use super::*;
+
+        /// A listener that plays back `accepts`, then reports itself closed.
+        struct Scripted(VecDeque<Result<PendingSession, AcceptError>>);
+
+        impl Listener for Scripted {
+            fn kind(&self) -> TransportKind {
+                TransportKind::Uds
+            }
+
+            fn accept(
+                &mut self,
+            ) -> Pin<Box<dyn Future<Output = Result<PendingSession, AcceptError>> + Send + '_>>
+            {
+                let next = self.0.pop_front().unwrap_or(Err(AcceptError::Closed));
+                Box::pin(std::future::ready(next))
+            }
+        }
+
+        fn uds_session() -> IncomingSession {
+            let (read, write) = tokio::io::split(tokio::io::duplex(64).0);
+            IncomingSession {
+                read: Box::new(read),
+                write: Box::new(write),
+                peer: PeerInfo { addr: None },
+                span: tracing::Span::none(),
+                transport: SessionTransport::Uds,
+            }
+        }
+
+        /// A failed accept costs one backoff and not the listener: the next
+        /// connection is still handed on, and `serve` returns once the
+        /// listener closes.
+        #[tokio::test(start_paused = true)]
+        async fn serve_backs_off_after_a_failed_accept_and_ends_when_the_listener_closes() {
+            let listener = Scripted(VecDeque::from([
+                Err(AcceptError::Io(std::io::Error::other("EMFILE"))),
+                Ok(PendingSession::ready(uds_session())),
+            ]));
+            let (tx, mut served) = tokio::sync::mpsc::unbounded_channel();
+            let started = tokio::time::Instant::now();
+
+            serve(
+                Box::new(listener),
+                HANDSHAKE_TIMEOUT,
+                Arc::new(move |session: IncomingSession| {
+                    let _ = tx.send(session.kind());
+                }),
+            )
+            .await;
+
+            assert!(started.elapsed() >= ACCEPT_ERROR_BACKOFF);
+            assert_eq!(served.recv().await, Some(TransportKind::Uds));
+        }
+
+        #[test]
+        fn a_pending_session_debugs_without_its_handshake() {
+            let pending = PendingSession::new(std::future::pending());
+            assert_eq!(format!("{pending:?}"), "PendingSession { .. }");
+        }
+    }
 }

@@ -1622,6 +1622,7 @@ version = "0.2.0"
 dependencies = [
  "anyhow",
  "kmux-protocol",
+ "kmux-sys",
  "nix",
  "quinn",
  "rcgen",
