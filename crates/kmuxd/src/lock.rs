@@ -11,6 +11,10 @@
 //! The emulator may be mid-update when its holder panicked. A grid that is
 //! briefly wrong is repaired by the next diff or by a client resync; a pane
 //! that never produces output again is not repaired by anything.
+//!
+//! What this recovers is the *lock*, for everyone else who takes it. The task
+//! that panicked is still gone: a panic in the pane's own relay loop, which is
+//! not supervised, still ends that pane's output.
 
 use std::sync::{Mutex, MutexGuard};
 

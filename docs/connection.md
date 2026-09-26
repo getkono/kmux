@@ -857,8 +857,12 @@ Sessions are checkpointed to `$XDG_STATE_HOME/kmux/session_state.bin` (or `$HOME
 ## Server-Side Flow Control and Deadlines
 
 One slow pane, slow client or misbehaving peer must not stall the daemon or
-grow its memory without bound (issue #206). Every queue on the per-connection
-and per-pane paths is bounded, and every wait on a peer has a deadline.
+grow its memory without bound (issue #206). Every queue a client or a pane's
+program can fill — a connection's outbound queue, a pane's input queue and its
+terminal-query replies — is bounded, and every wait on a peer has a deadline.
+Two internal channels are not yet bounded: the daemon's request channel to a
+`kmux-vt-worker` and a federation link's upstream channels; both are fed at the
+rate the daemon itself produces, not by a peer.
 
 ### Outbound queue (`crates/kmuxd/src/outbound.rs`)
 
@@ -887,7 +891,8 @@ Server-wide VT events a flood of output can raise one per escape sequence —
 attached to the pane or not, so they ride the pane-data lane and are dropped
 when it is congested; on the control lane a `cat` of a binary file would fill a
 slow client's queue and close it. Layout, tab-lifecycle and clipboard events
-stay control.
+stay control. Events a federation link relays from a remote daemon take the
+same lanes (`forward_vt_event`).
 
 A log dump (`FetchLogs`) can exceed the queue, so it is sent from its own task
 that waits for room — and, like pane data, leaves the control reserve free, so
@@ -906,7 +911,7 @@ so `PROTOCOL_RANGE` is unchanged.
 |------|----------|-----------|
 | TLS / QUIC handshake | `HANDSHAKE_TIMEOUT` 10 s, in the connection's own task | connection dropped; other accepts unaffected |
 | `Auth` + `AuthProof` after connect | `AUTH_DEADLINE` 30 s | `CloseReason::AuthDeadline` |
-| Any inbound frame after the oldest unanswered `Ping` | `PONG_DEADLINE` 30 s | `CloseReason::PongDeadline` |
+| Any inbound frame after the oldest unanswered `Ping` is written | `PONG_DEADLINE` 30 s | `CloseReason::PongDeadline` |
 | Each frame write, each flush | `FRAME_WRITE_TIMEOUT` 30 s | `CloseReason::WriteTimeout` |
 
 Answering `Ping` with `Pong` has always been part of the protocol, and every
@@ -918,6 +923,11 @@ skew: the command is re-run).
 
 A listener whose `accept` fails (out of file descriptors) pauses 100 ms before
 the next attempt instead of spinning.
+
+The pong clock starts when the writer puts the `Ping` on the wire, not when it
+is queued: a ping waiting behind a log dump or pane data on a slow link has not
+reached the client, and a peer that stops reading is caught by the write
+timeout instead.
 
 The auth and pong checks are pure functions of instants (`auth_verdict`,
 `pong_verdict` in `crates/kmuxd/src/client_handler/liveness.rs`), evaluated
@@ -931,6 +941,9 @@ Client input is queued, not awaited: see
 [daemon-lifecycle.md §9.3a](daemon-lifecycle.md#93a-client-input-appiors-engine).
 A pane whose program stops reading fills its own bounded input queue and
 refuses further input with an error; no other pane or session waits on it.
+The replies the emulator generates for the program's terminal queries (DSR,
+DA, …) queue on a bounded channel too (`PTY_RESPONSE_CAPACITY`, 64): a program
+that floods queries without reading its input has further replies dropped.
 
 ---
 

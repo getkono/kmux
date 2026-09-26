@@ -248,7 +248,7 @@ Counts are `#[test]` + `#[tokio::test]` functions, measured 2026-08-16.
 | Crate | Unit | Integ | What is tested | Doubles & seams | Not tested (→ exceptions) |
 | --- | --- | --- | --- | --- | --- |
 | `kmux-protocol` | 124 | — | codec byte fixtures, framing, version/capability negotiation, message categories, compat classification | wire fixtures — the crate is pure data, so every test is tier *pure* | — |
-| `kmux-sys` | 51 | — | XDG path resolution rules, Ed25519 identity round-trip, TOFU store, transport constants; a stalled TLS handshake does not block the next accept, and times out (issue #206, loopback sockets, paused clock) | `Dirs::rooted` | QUIC handshakes, keyring |
+| `kmux-sys` | 64 | — | XDG path resolution rules, Ed25519 identity round-trip, TOFU store, transport constants; a stalled TLS handshake does not block the next accept, and times out; a QUIC connection establishes off the accept with its control stream; the accept loop backs off after a failed accept (issue #206, loopback sockets, paused clock). The crate re-lists itself as a dev-dependency with its transport and `identity` features, so `cargo test -p kmux-sys` — and so cargo-mutants — builds the listeners these tests cover | `Dirs::rooted` | keyring |
 | `kmux-app` | 300 | — | action dispatch, mode resolution, layout geometry, config resolution, command registry, driver tick | `AppCore::for_test`, `FrontendDriver::for_test` | `run_cli` process exit |
 | `kmuxd` | 174 | 18 | message handlers, app state, relay, auth, wordlist, persistence; grid conformance (R10); 5 e2e suites; backpressure and lock discipline (issue #206): input queue full without blocking the `sessions` lock, bounded outbound queue with lag → `SyncReset` resync, write timeout, auth/pong deadlines (pure verdicts + paused-clock watchdog), per-hold relay byte cap, `term_state` poison recovery, task supervisor | `crate::fixtures` (`fixture_app`, `fixture_client_state`, `NoopAttacher`, …), `NullEventSink` (via `kmux-vt-core/test-util`); e2e: `harness::{Sandbox, Daemon, Federation}` | fork/exec, `SCM_RIGHTS`, daemonize, `startup::async_main` |
 | `kmux-client` | 163 | 3 | server-message handling, grid apply, selection, input, liveness; grid-apply proptest (R10) | channel injection | — |
@@ -329,6 +329,25 @@ swept the whole workspace instead of the diff, and the weekly sweep's eight
 shards each ran the same full sweep. Both produced valid-looking results, which
 is the failure mode this document exists to distrust.
 
+A mutant that hangs a test is recorded as a timeout, which counts as caught,
+but it costs the whole per-mutant timeout, and the per-PR job has an hour. Two
+rules keep hung mutants cheap:
+
+- **A test that waits, waits bounded.** Every wait on a channel, a socket or a
+  task sits under `tokio::time::timeout`, and a polling loop sleeps rather than
+  `yield_now`s — on the paused clock a yield loop never lets time advance, so
+  the bound never passes. A half-closed `tokio::io::duplex` (`shutdown()` the
+  write half) gives a reader EOF where a merely dropped `WriteHalf` does not.
+- **No unit test installs a process-wide signal handler.** cargo-mutants stops
+  a timed-out test binary with `SIGTERM`. Once any test in the binary has
+  called `tokio::signal::unix::signal(SignalKind::terminate())` or
+  `tokio::signal::ctrl_c()`, that signal no longer kills the process: the hung
+  binary runs on as an orphan, and one spinning in its mutant starves every
+  later build on the runner. That is how #206's mutation job overran its hour —
+  a control-socket test installed the daemon's handlers, and build times grew
+  sixfold as orphans piled up. The handlers are installed only by
+  `daemon::termination_signal`, which the daemon passes in and tests replace.
+
 A group with nothing to test under `--in-diff` or `--shard` says so and passes;
 a group that exits non-zero having written no outcomes did not run, and fails
 the sweep. Those two look identical from the filesystem alone.
@@ -380,7 +399,7 @@ Adding a row is a normative change: justify it in the commit that adds it.
 | --- | --- | --- |
 | `kmux-gtk` widget construction and the glib main loop | Needs a display server and GTK's callback graph; a widget abstraction would be a second untested UI framework | pure conversions in `imp/convert.rs` and `imp/actions.rs`; manual QA; `./kmux` |
 | `kmux-ffi` `extern "C"` dispatch and uniffi object lifetimes | The boundary is generated; asserting on it tests uniffi, not kmux | `mise run swift-test` on macOS CI; `KMUX_FFI_ABI_VERSION` under R8 |
-| `kmuxd::startup::async_main` (396 lines) | A linear boot script — bind, TLS, handoff, listeners, signals. Every split yields a function nothing can assert on without a live daemon. Exempt from R4, and its body-replacement mutant is excluded by `exclude_re` in `.cargo/mutants-bin.toml` like `fn main`'s (issue #206) | the five `kmuxd/tests/*_e2e.rs` suites |
+| `kmuxd::startup::async_main` (383 lines) | A linear boot script — bind, TLS, handoff, listeners, signals. Every split yields a function nothing can assert on without a live daemon. Exempt from R4, and its body-replacement mutant is excluded by `exclude_re` in `.cargo/mutants-bin.toml` like `fn main`'s (issue #206) | the five `kmuxd/tests/*_e2e.rs` suites |
 | `kmuxd` fork/exec, `SCM_RIGHTS`, daemonize | Cannot run in-process | `handoff_e2e.rs`, `process_isolation_e2e.rs` |
 | `kmuxd`'s `fn main` | A process entrypoint (CLI parse, daemonize, runtime build and teardown) no unit test can call, so its body-replacement mutant is always missed under `--bins`; excluded by `exclude_re` in `.cargo/mutants-bin.toml` so a comment edit in it does not fail the zero-survivor diff job (issue #205) | the five `kmuxd/tests/*_e2e.rs` suites, which spawn the binary |
 | `kmux-app`'s `fetch_remote_logs` (`kmux daemon logs --server`) | Resolves, connects to and authenticates with a remote daemon before streaming; with no daemon to reach, its body-replacement mutant is always missed, so `exclude_re` in `.cargo/mutants.toml` excludes it (issue #206) | `stream_logs`, the stream loop it hands off to, is unit-tested over `tokio::io::duplex` |

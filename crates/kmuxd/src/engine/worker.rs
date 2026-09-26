@@ -155,7 +155,10 @@ impl WorkerEngine {
         let writer_task = tokio::spawn(async move {
             loop {
                 // Control first: a resize or shutdown is not queued behind
-                // input the worker may be slow to take.
+                // input still waiting on the daemon's side. (Once on the
+                // socket, the worker handles requests in order, so one it is
+                // stuck writing to a child that does not read still delays
+                // what follows it.)
                 let req = tokio::select! {
                     biased;
                     req = req_rx.recv() => req,
