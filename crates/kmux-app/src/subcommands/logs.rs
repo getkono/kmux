@@ -67,19 +67,30 @@ async fn tail_local_log_to(
         let mut read_buf = vec![0u8; 4096];
         loop {
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let n = kmux_sys::log_tail::read_appended(path, &mut file, &mut read_buf).await?;
-            if n > 0 {
-                out.write_all(&read_buf[..n])?;
-                out.flush()?;
-            }
+            forward_appended(path, &mut file, &mut read_buf, out).await?;
         }
     }
     Ok(())
 }
 
+/// One step of `-f`: copy what the followed log gained since the last step
+/// (across a rotation, see [`kmux_sys::log_tail::read_appended`]) to `out`,
+/// and return how many bytes that was. Nothing new writes nothing.
+async fn forward_appended(
+    path: &Path,
+    file: &mut tokio::fs::File,
+    buf: &mut [u8],
+    out: &mut impl Write,
+) -> anyhow::Result<usize> {
+    let n = kmux_sys::log_tail::read_appended(path, file, buf).await?;
+    out.write_all(&buf[..n])?;
+    out.flush()?;
+    Ok(n)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::tail_local_log_to;
+    use super::{forward_appended, tail_local_log_to};
 
     /// Without `follow`, the last `lines` lines of the log are written out
     /// and the call returns.
@@ -95,5 +106,43 @@ mod tests {
             .unwrap();
 
         assert_eq!(out, b"two\nthree\n");
+    }
+
+    /// A follow step forwards exactly what was appended, nothing when
+    /// nothing was, and carries on in the new file after a rotation.
+    #[tokio::test]
+    async fn a_follow_step_forwards_what_the_log_gained() {
+        use std::io::Write;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("daemon.log");
+        std::fs::write(&path, b"old\n").unwrap();
+        let mut file = tokio::fs::File::open(&path).await.unwrap();
+        let mut buf = [0u8; 64];
+        let mut out = Vec::new();
+
+        let n = forward_appended(&path, &mut file, &mut buf, &mut out).await;
+        assert_eq!(n.unwrap(), 4);
+        assert_eq!(out, b"old\n");
+
+        let n = forward_appended(&path, &mut file, &mut buf, &mut out).await;
+        assert_eq!(n.unwrap(), 0, "nothing new");
+        assert_eq!(out, b"old\n");
+
+        let mut log = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&path)
+            .unwrap();
+        log.write_all(b"new\n").unwrap();
+        std::fs::rename(&path, tmp.path().join("daemon.log.1")).unwrap();
+        std::fs::write(&path, b"rotated\n").unwrap();
+
+        forward_appended(&path, &mut file, &mut buf, &mut out)
+            .await
+            .unwrap();
+        forward_appended(&path, &mut file, &mut buf, &mut out)
+            .await
+            .unwrap();
+        assert_eq!(out, b"old\nnew\nrotated\n");
     }
 }

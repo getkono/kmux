@@ -27,7 +27,7 @@ use tokio::net::{UnixListener, UnixStream};
 use tracing::{info, warn};
 
 use crate::app::ServerApp;
-use crate::persist::checkpoint::Checkpointer;
+use crate::persist::checkpoint::{Checkpointer, SealedCheckpoint};
 
 use super::{PathGuard, STEP_TIMEOUT, read_frame_within, write_frame_within};
 
@@ -46,14 +46,19 @@ const HOLD_TIMEOUT: Duration = Duration::from_secs(5);
 /// moment the successor's `Ack` arrives, so a caller that abandons this future
 /// (a SIGTERM mid-handoff) can still tell whether the successor owns the
 /// sessions.
+///
+/// The final checkpoint consumes `checkpointer` (left `None`) once the
+/// handoff commits or is declined; a rollback puts it back, unsealed.
 pub async fn run(
-    app: Arc<ServerApp>,
-    checkpointer: Option<Arc<Checkpointer>>,
-    committed: Arc<AtomicBool>,
+    app: &Arc<ServerApp>,
+    checkpointer: &mut Option<Checkpointer>,
+    committed: &AtomicBool,
 ) -> anyhow::Result<()> {
     // Without a checkpoint the successor has nothing to rebuild the panes
     // from; refuse before anything has started.
-    let checkpointer = checkpointer.context("no checkpoint path; cannot hand off")?;
+    if checkpointer.is_none() {
+        bail!("no checkpoint path; cannot hand off");
+    }
     let path = kmux_sys::dirs::handoff_socket_path()?;
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)
@@ -83,7 +88,7 @@ pub async fn run(
         Ok(accepted) => accepted.context("accepting successor handoff connection")?,
     };
 
-    drive(&app, &stream, &checkpointer, &committed, STEP_TIMEOUT).await
+    drive(app, &stream, checkpointer, committed, STEP_TIMEOUT).await
 }
 
 /// How a handoff that reached its end ended.
@@ -101,18 +106,60 @@ enum Ending {
 async fn drive(
     app: &ServerApp,
     stream: &UnixStream,
-    checkpointer: &Arc<Checkpointer>,
+    checkpointer: &mut Option<Checkpointer>,
     committed: &AtomicBool,
     step: Duration,
 ) -> anyhow::Result<()> {
-    match transfer(app, stream, checkpointer, committed, step).await {
+    let mut final_checkpoint = FinalCheckpoint {
+        slot: checkpointer,
+        sealed: None,
+    };
+    match transfer(app, stream, &mut final_checkpoint, committed, step).await {
         Ok(ending) => {
+            final_checkpoint.keep_sealed();
             finish(app, stream, ending, step).await;
             Ok(())
         }
         Err(e) => {
-            roll_back(app, stream, checkpointer, &e, step).await;
+            drop(final_checkpoint);
+            roll_back(app, stream, &e, step).await;
             Err(e)
+        }
+    }
+}
+
+/// The final checkpoint of a handoff that has not ended yet. A handoff that
+/// rolls back after writing it — or whose sender panics — must leave the
+/// checkpoint accepting writes again, so dropping this unseals it and puts the
+/// [`Checkpointer`] back in its slot. Only [`Self::keep_sealed`], on commit or
+/// decline, keeps it sealed.
+struct FinalCheckpoint<'a> {
+    slot: &'a mut Option<Checkpointer>,
+    sealed: Option<SealedCheckpoint>,
+}
+
+impl FinalCheckpoint<'_> {
+    /// Write the final checkpoint the successor restores from, durably and
+    /// off the runtime, sealing it against later periodic writes.
+    async fn write(&mut self, app: &ServerApp) -> anyhow::Result<()> {
+        let state = app.checkpoint_state().await;
+        let sealed = Checkpointer::write_final_from(self.slot, state)
+            .await
+            .context("writing the final checkpoint")?;
+        self.sealed = Some(sealed);
+        Ok(())
+    }
+
+    /// The handoff ended: the checkpoint stays sealed for good.
+    fn keep_sealed(mut self) {
+        self.sealed = None;
+    }
+}
+
+impl Drop for FinalCheckpoint<'_> {
+    fn drop(&mut self) {
+        if let Some(sealed) = self.sealed.take() {
+            *self.slot = Some(sealed.unseal());
         }
     }
 }
@@ -123,7 +170,7 @@ async fn drive(
 async fn transfer(
     app: &ServerApp,
     stream: &UnixStream,
-    checkpointer: &Arc<Checkpointer>,
+    final_checkpoint: &mut FinalCheckpoint<'_>,
     committed: &AtomicBool,
     step: Duration,
 ) -> anyhow::Result<Ending> {
@@ -150,7 +197,7 @@ async fn transfer(
             // The successor will respawn from the checkpoint, so make sure a
             // fresh one is on disk. Children are NOT kept alive — this degrades
             // to today's restart behavior.
-            write_final_checkpoint(app, checkpointer).await?;
+            final_checkpoint.write(app).await?;
             return Ok(Ending::Declined);
         }
         other => bail!("handoff: expected Accept/Decline, got {other:?}"),
@@ -164,7 +211,7 @@ async fn transfer(
     if !app.hold_relays(HOLD_TIMEOUT).await {
         bail!("handoff: PTY readers did not park within {HOLD_TIMEOUT:?}");
     }
-    write_final_checkpoint(app, checkpointer).await?;
+    final_checkpoint.write(app).await?;
 
     write_frame_within(stream, &HandoffMessage::Complete, None, step).await?;
     match read_frame_within(stream, step).await?.0 {
@@ -231,17 +278,11 @@ async fn finish(app: &ServerApp, stream: &UnixStream, ending: Ending, step: Dura
 }
 
 /// Undo everything [`transfer`] did before failing, and tell the successor to
-/// stand down: the readers run again, the checkpoint accepts writes again.
-async fn roll_back(
-    app: &ServerApp,
-    stream: &UnixStream,
-    checkpointer: &Checkpointer,
-    cause: &anyhow::Error,
-    step: Duration,
-) {
+/// stand down: the readers run again. (The checkpoint was unsealed as the
+/// [`FinalCheckpoint`] dropped.)
+async fn roll_back(app: &ServerApp, stream: &UnixStream, cause: &anyhow::Error, step: Duration) {
     warn!("handoff: rolling back before the commit point: {cause:#}");
     app.release_relays().await;
-    checkpointer.unseal();
     let abort = HandoffMessage::Abort {
         reason: format!("{cause:#}"),
     };
@@ -312,23 +353,9 @@ fn resolve_successor_exe(
     )
 }
 
-/// Write the final checkpoint the successor restores from, durably and off
-/// the runtime, sealing it against later periodic writes (issue #207).
-async fn write_final_checkpoint(
-    app: &ServerApp,
-    checkpointer: &Arc<Checkpointer>,
-) -> anyhow::Result<()> {
-    let state = app.checkpoint_state().await;
-    checkpointer
-        .write_final_in_background(state)
-        .await
-        .context("writing the final checkpoint")
-}
-
 #[cfg(test)]
 mod tests {
     use std::path::{Path, PathBuf};
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, Ordering};
     use std::time::Duration;
 
@@ -351,6 +378,8 @@ mod tests {
         Cooperates,
         /// Accept, then answer nothing more.
         StallsAfterAccept,
+        /// Accept and acknowledge every fd, but never `Complete`.
+        StallsAtComplete,
         /// Decline the live transfer.
         Declines,
     }
@@ -365,7 +394,9 @@ mod tests {
             Successor::Declines => HandoffMessage::Decline {
                 reason: "test".into(),
             },
-            Successor::Cooperates | Successor::StallsAfterAccept => HandoffMessage::Accept,
+            Successor::Cooperates | Successor::StallsAfterAccept | Successor::StallsAtComplete => {
+                HandoffMessage::Accept
+            }
         };
         write_frame(&stream, &answer, None)
             .await
@@ -374,9 +405,10 @@ mod tests {
         let mut seen = Vec::new();
         while let Ok((msg, fd)) = read_frame(&stream).await {
             let reply = match (&msg, script) {
-                (HandoffMessage::PaneFd { .. }, Successor::Cooperates) => {
-                    Some(HandoffMessage::PaneFdAck)
-                }
+                (
+                    HandoffMessage::PaneFd { .. },
+                    Successor::Cooperates | Successor::StallsAtComplete,
+                ) => Some(HandoffMessage::PaneFdAck),
                 (HandoffMessage::Complete, Successor::Cooperates) => Some(HandoffMessage::Ack),
                 _ => None,
             };
@@ -389,7 +421,7 @@ mod tests {
     }
 
     /// A predecessor with one live pane (`cat`), and its checkpoint writer.
-    async fn fixture_predecessor(checkpoint_dir: &Path) -> (ServerApp, Arc<Checkpointer>) {
+    async fn fixture_predecessor(checkpoint_dir: &Path) -> (ServerApp, Option<Checkpointer>) {
         let app = crate::fixtures::fixture_app();
         let size = TermSize {
             rows: 4,
@@ -407,8 +439,8 @@ mod tests {
         )
         .await
         .expect("a session");
-        let checkpointer = Arc::new(Checkpointer::new(checkpoint_dir.join("state.bin")));
-        (app, checkpointer)
+        let checkpointer = Checkpointer::new(checkpoint_dir.join("state.bin"));
+        (app, Some(checkpointer))
     }
 
     fn names(frames: &[(HandoffMessage, bool)]) -> Vec<String> {
@@ -430,14 +462,16 @@ mod tests {
     #[tokio::test]
     async fn a_cooperating_successor_commits_the_handoff() {
         let tmp = tempfile::tempdir().unwrap();
-        let (app, checkpointer) = fixture_predecessor(tmp.path()).await;
+        let (app, mut checkpointer) = fixture_predecessor(tmp.path()).await;
+        let periodic = checkpointer.as_ref().unwrap().periodic();
         let (ours, theirs) = UnixStream::pair().unwrap();
         let successor = tokio::spawn(successor(theirs, Successor::Cooperates));
         let committed = AtomicBool::new(false);
 
-        drive(&app, &ours, &checkpointer, &committed, STEP)
+        drive(&app, &ours, &mut checkpointer, &committed, STEP)
             .await
             .expect("committed");
+        assert!(checkpointer.is_none(), "the final write consumed it");
         drop(ours);
         let seen = successor.await.unwrap();
 
@@ -447,7 +481,7 @@ mod tests {
         let state = crate::persist::restore::read_checkpoint(&tmp.path().join("state.bin"))
             .expect("the final checkpoint is on disk");
         assert_eq!(state.sessions.len(), 1);
-        let later = checkpointer.write(&state).unwrap();
+        let later = periodic.write(&state).unwrap();
         assert_eq!(later, Written::Sealed);
     }
 
@@ -457,13 +491,14 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_successor_that_stalls_after_accept_times_out_and_rolls_back() {
         let tmp = tempfile::tempdir().unwrap();
-        let (app, checkpointer) = fixture_predecessor(tmp.path()).await;
+        let (app, mut checkpointer) = fixture_predecessor(tmp.path()).await;
+        let periodic = checkpointer.as_ref().unwrap().periodic();
         let (ours, theirs) = UnixStream::pair().unwrap();
         let successor = tokio::spawn(successor(theirs, Successor::StallsAfterAccept));
         let committed = AtomicBool::new(false);
         let started = tokio::time::Instant::now();
 
-        let err = drive(&app, &ours, &checkpointer, &committed, STEP)
+        let err = drive(&app, &ours, &mut checkpointer, &committed, STEP)
             .await
             .expect_err("times out");
         drop(ours);
@@ -474,7 +509,39 @@ mod tests {
         assert!(!committed.load(Ordering::SeqCst));
         assert_eq!(names(&seen), ["PaneFd", "Abort"]);
         let state = app.checkpoint_state().await;
-        assert_ne!(checkpointer.write(&state).unwrap(), Written::Sealed);
+        assert_ne!(periodic.write(&state).unwrap(), Written::Sealed);
+        assert!(checkpointer.is_some());
+    }
+
+    /// A successor that never acknowledges `Complete` makes the handoff roll
+    /// back after its final checkpoint was written: the checkpointer is handed
+    /// back unsealed, so periodic writes resume and a later shutdown can make
+    /// its own final write.
+    #[tokio::test(start_paused = true)]
+    async fn a_rollback_after_the_final_checkpoint_unseals_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (app, mut checkpointer) = fixture_predecessor(tmp.path()).await;
+        let periodic = checkpointer.as_ref().unwrap().periodic();
+        let (ours, theirs) = UnixStream::pair().unwrap();
+        let successor = tokio::spawn(successor(theirs, Successor::StallsAtComplete));
+        let committed = AtomicBool::new(false);
+
+        let err = drive(&app, &ours, &mut checkpointer, &committed, STEP)
+            .await
+            .expect_err("times out waiting for Ack");
+        drop(ours);
+        let seen = successor.await.unwrap();
+
+        assert!(format!("{err:#}").contains("timed out"), "{err:#}");
+        assert_eq!(names(&seen), ["PaneFd", "Complete", "Abort"]);
+        let returned = checkpointer.take().expect("handed back");
+        let mut state = app.checkpoint_state().await;
+        state.session_index_counter += 1;
+        assert_eq!(periodic.write(&state).unwrap(), Written::Wrote);
+        returned
+            .write_final_in_background(state)
+            .await
+            .expect("a later final write");
     }
 
     /// A final checkpoint that cannot be written fails the handoff before
@@ -484,12 +551,12 @@ mod tests {
     async fn a_failed_final_checkpoint_fails_before_complete() {
         let tmp = tempfile::tempdir().unwrap();
         let (app, _) = fixture_predecessor(tmp.path()).await;
-        let unwritable = Arc::new(Checkpointer::new(tmp.path().join("missing/state.bin")));
+        let mut unwritable = Some(Checkpointer::new(tmp.path().join("missing/state.bin")));
         let (ours, theirs) = UnixStream::pair().unwrap();
         let successor = tokio::spawn(successor(theirs, Successor::Cooperates));
         let committed = AtomicBool::new(false);
 
-        let err = drive(&app, &ours, &unwritable, &committed, STEP)
+        let err = drive(&app, &ours, &mut unwritable, &committed, STEP)
             .await
             .expect_err("the checkpoint fails");
         drop(ours);
@@ -498,6 +565,7 @@ mod tests {
         assert!(format!("{err:#}").contains("final checkpoint"), "{err:#}");
         assert!(!committed.load(Ordering::SeqCst));
         assert_eq!(names(&seen), ["PaneFd", "Abort"], "no Complete was sent");
+        assert!(unwritable.is_some(), "a failed final write hands it back");
     }
 
     /// A successor that declines gets the final checkpoint written for its
@@ -505,12 +573,12 @@ mod tests {
     #[tokio::test]
     async fn a_declined_handoff_writes_the_checkpoint_then_releases() {
         let tmp = tempfile::tempdir().unwrap();
-        let (app, checkpointer) = fixture_predecessor(tmp.path()).await;
+        let (app, mut checkpointer) = fixture_predecessor(tmp.path()).await;
         let (ours, theirs) = UnixStream::pair().unwrap();
         let successor = tokio::spawn(successor(theirs, Successor::Declines));
         let committed = AtomicBool::new(false);
 
-        drive(&app, &ours, &checkpointer, &committed, STEP)
+        drive(&app, &ours, &mut checkpointer, &committed, STEP)
             .await
             .expect("declined is an end, not a failure");
         drop(ours);

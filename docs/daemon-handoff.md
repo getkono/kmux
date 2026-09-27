@@ -87,7 +87,7 @@ the `HandoffMessage` wire format.**
   `Released`). Output produced in the gap stays buffered in the kernel PTY and is
   drained by N. So no two readers ever race on a master, and no bytes are lost.
 - **Checkpoint before the commit point.** The final checkpoint is written,
-  `fsync`ed and sealed (`Checkpointer::write_final`) before `Complete` is sent,
+  `fsync`ed and sealed (`Checkpointer::write_final_from`) before `Complete` is sent,
   so nothing fallible remains after N's `Ack` (issue #207). It used to be written
   after the `Ack`, and a failed write there was treated as a rollback although N
   already held every fd. The snapshot N seeds from reflects exactly the bytes O

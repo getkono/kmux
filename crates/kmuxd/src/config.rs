@@ -479,6 +479,23 @@ impl ServerConfig {
             closed_session_ttl_days: file.daemon.closed_session_ttl_days,
         })
     }
+
+    /// The warning to log at startup when idle shutdown is on, or `None`.
+    ///
+    /// Idle shutdown is off by default since issue #207, but a `kmuxd.toml`
+    /// template written by an older daemon's first run pins
+    /// `idle_shutdown_secs = 30`. Such a file is not migrated; the warning
+    /// makes the setting, and what it costs, visible instead.
+    pub fn idle_shutdown_warning(&self) -> Option<String> {
+        let secs = self.idle_shutdown_secs;
+        (secs > 0).then(|| {
+            format!(
+                "idle shutdown is on: kmuxd exits after {secs}s with no clients connected, \
+                 ending every shell it runs. Set [daemon] idle_shutdown_secs = 0 in kmuxd.toml \
+                 (the default) to keep the daemon running until it is stopped"
+            )
+        })
+    }
 }
 
 // ─── Loading ─────────────────────────────────────────────────────────────────
@@ -531,14 +548,34 @@ fn search_paths() -> Vec<PathBuf> {
 }
 
 /// Write the default config to a path (used on first run to create a template).
+///
+/// Every setting is written commented out, so the file documents the defaults
+/// without pinning them: a later release that changes a default (as issue
+/// #207 did for `idle_shutdown_secs`) still reaches a host whose template was
+/// written by an older daemon.
 pub fn write_default_config(path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let cfg = ConfigFile::default();
-    let toml_str = toml::to_string_pretty(&cfg)?;
-    std::fs::write(path, toml_str)?;
+    std::fs::write(path, default_config_template()?)?;
     Ok(())
+}
+
+/// The first-run `kmuxd.toml`: the built-in defaults, every line commented out.
+fn default_config_template() -> anyhow::Result<String> {
+    let defaults = toml::to_string_pretty(&ConfigFile::default())?;
+    let mut template = String::from(
+        "# kmuxd configuration. Every setting below is commented out and shows its\n\
+         # built-in default; uncomment a line to change it.\n\n",
+    );
+    for line in defaults.lines() {
+        if !line.is_empty() {
+            template.push_str("# ");
+        }
+        template.push_str(line);
+        template.push('\n');
+    }
+    Ok(template)
 }
 
 #[cfg(test)]
@@ -728,6 +765,43 @@ self_signed = true
         assert_eq!(cfg.version, 1);
     }
 
+    /// The first-run template pins nothing: every line is blank or a comment,
+    /// so it parses to the built-in defaults, and it still shows each default
+    /// once uncommented (issue #207).
+    #[test]
+    fn the_default_config_template_shows_the_defaults_commented_out() {
+        let template = default_config_template().unwrap();
+        assert!(
+            template
+                .lines()
+                .all(|line| line.is_empty() || line.starts_with('#')),
+            "{template}"
+        );
+        assert!(
+            template.contains("\n# idle_shutdown_secs = 0\n"),
+            "{template}"
+        );
+        assert!(template.contains("\n# [daemon]\n"), "{template}");
+        assert!(
+            !template.contains("# \n"),
+            "blank lines stay blank: {template}"
+        );
+
+        let parsed: ConfigFile = toml::from_str(&template).unwrap();
+        assert_eq!(parsed.daemon.idle_shutdown_secs, 0);
+
+        // Uncomment everything past the header paragraph.
+        let uncommented: String = template
+            .lines()
+            .skip_while(|line| !line.is_empty())
+            .map(|line| line.strip_prefix("# ").unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let shown: ConfigFile = toml::from_str(&uncommented).unwrap();
+        assert_eq!(shown.daemon.log_max_size_mib, 10);
+        assert_eq!(shown.listen.len(), 3);
+    }
+
     #[test]
     fn daemon_idle_shutdown_parses() {
         let toml = r#"
@@ -751,6 +825,26 @@ idle_shutdown_secs = 60
         let parsed: ConfigFile = toml::from_str("").unwrap();
         let resolved = ServerConfig::resolve(parsed).unwrap();
         assert_eq!(resolved.idle_shutdown_secs, 0);
+        assert_eq!(resolved.idle_shutdown_warning(), None);
+    }
+
+    /// An enabled idle shutdown (e.g. the `30` an older first-run template
+    /// pinned) is warned about at startup, naming the timeout and the fix.
+    #[test]
+    fn an_enabled_idle_shutdown_is_warned_about() {
+        let parsed: ConfigFile = toml::from_str("[daemon]\nidle_shutdown_secs = 30\n").unwrap();
+        let resolved = ServerConfig::resolve(parsed).unwrap();
+        let warning = resolved.idle_shutdown_warning().expect("a warning");
+        assert!(warning.contains("after 30s"), "{warning}");
+        assert!(warning.contains("idle_shutdown_secs = 0"), "{warning}");
+
+        let one: ConfigFile = toml::from_str("[daemon]\nidle_shutdown_secs = 1\n").unwrap();
+        assert!(
+            ServerConfig::resolve(one)
+                .unwrap()
+                .idle_shutdown_warning()
+                .is_some()
+        );
     }
 
     /// The daemon log is capped by default, and both knobs are read from

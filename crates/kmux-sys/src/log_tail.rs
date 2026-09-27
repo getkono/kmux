@@ -49,6 +49,15 @@ pub fn names_same_file(path: &Path, open: &std::fs::Metadata) -> bool {
         .is_ok_and(|at_path| at_path.dev() == open.dev() && at_path.ino() == open.ino())
 }
 
+/// The `n`th rotated file of the log at `path`: `daemon.log` → `daemon.log.<n>`.
+/// `1` is the newest; the daemon's rotation (issue #207) and the readers that
+/// follow it share this naming.
+pub fn rotated_log_path(path: &Path, n: u32) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(format!(".{n}"));
+    std::path::PathBuf::from(name)
+}
+
 /// Read what has been appended to a followed log since the last read,
 /// following it across a rotation (issue #207).
 ///
@@ -86,7 +95,8 @@ pub async fn read_appended(
 
 #[cfg(test)]
 mod tests {
-    use super::{last_n_lines_offset, names_same_file};
+    use super::{last_n_lines_offset, names_same_file, rotated_log_path};
+    use std::path::Path;
 
     #[test]
     fn trailing_newline() {
@@ -114,6 +124,14 @@ mod tests {
     }
 
     #[test]
+    fn a_rotated_log_path_appends_its_number() {
+        assert_eq!(
+            rotated_log_path(Path::new("/l/daemon.log"), 3),
+            Path::new("/l/daemon.log.3")
+        );
+    }
+
+    #[test]
     fn a_path_names_its_file_until_the_file_is_moved_or_removed() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("daemon.log");
@@ -129,6 +147,7 @@ mod tests {
 
     /// A follower drains the old file after its rotation, then carries on
     /// with the new one from its start; with nothing new it reads nothing.
+    #[cfg(feature = "framing")]
     #[tokio::test]
     async fn read_appended_follows_the_log_across_a_rotation() {
         use std::io::Write;
@@ -164,6 +183,7 @@ mod tests {
 
     /// While the log has been moved away and not yet recreated, the follower
     /// keeps the file it has.
+    #[cfg(feature = "framing")]
     #[tokio::test]
     async fn read_appended_keeps_the_old_file_until_a_new_one_exists() {
         let dir = tempfile::tempdir().unwrap();

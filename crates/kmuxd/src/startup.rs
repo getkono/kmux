@@ -16,7 +16,7 @@ use kmux_sys::transport::{HANDSHAKE_TIMEOUT, IncomingSession, Listener, SessionT
 use crate::app::ServerApp;
 use crate::auth::{generate_token, persist_token};
 use crate::handoff::receiver::Outcome;
-use crate::persist::checkpoint::Checkpointer;
+use crate::persist::checkpoint::{Checkpointer, PeriodicCheckpointer};
 use crate::term_state;
 use crate::tls;
 
@@ -172,18 +172,19 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
 
     // The one writer of the checkpoint file: the periodic loop, the shutdown
     // path and a graceful handoff all go through it (issue #207).
-    let checkpointer = kmux_sys::dirs::session_state_path()
+    // The final write of a shutdown or handoff consumes it (`None` afterwards).
+    let mut checkpointer = kmux_sys::dirs::session_state_path()
         .inspect_err(|e| warn!("could not determine checkpoint path: {e}"))
         .ok()
-        .map(|path| Arc::new(Checkpointer::new(path)));
+        .map(Checkpointer::new);
 
     // Periodic checkpoint task, restarted if it panics (issue #206): without
     // it sessions silently stop being persisted for the daemon's lifetime.
     {
         let persist_app = Arc::clone(&app);
-        let checkpointer = checkpointer.clone();
+        let periodic = checkpointer.as_ref().map(Checkpointer::periodic);
         tokio::spawn(crate::supervisor::supervise("checkpoint", move || {
-            checkpoint_loop(Arc::clone(&persist_app), checkpointer.clone())
+            checkpoint_loop(Arc::clone(&persist_app), periodic.clone())
         }));
     }
 
@@ -263,6 +264,9 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     let handoff_in_progress = Arc::new(AtomicBool::new(false));
 
     // Spawn idle-shutdown watcher when configured.
+    if let Some(warning) = cfg.idle_shutdown_warning() {
+        warn!("{warning}");
+    }
     if cfg.idle_shutdown_secs > 0 {
         let idle_secs = cfg.idle_shutdown_secs;
         let mut count_rx = app.conn_count_rx();
@@ -363,10 +367,11 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
             _ = shutdown.notified() => { info!("Shutdown requested via control socket"); break; }
             _ = restart.notified(), if in_flight.is_none() => {
                 info!("Graceful restart requested; beginning live PTY handoff");
-                in_flight = Some(HandoffInFlight::start(&app, checkpointer.clone()));
+                in_flight = Some(HandoffInFlight::start(&app, checkpointer.take()));
             }
-            committed = handoff_finished(&mut in_flight, &app, checkpointer.as_deref()) => {
+            (committed, returned) = handoff_finished(&mut in_flight, &app) => {
                 in_flight = None;
+                checkpointer = returned;
                 if committed {
                     handed_off = true;
                     break;
@@ -378,7 +383,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     }
     // A shutdown signal mid-handoff stops it; it may have committed already.
     if let Some(handoff) = in_flight.take() {
-        handed_off = handoff.abandon(&app, checkpointer.as_deref()).await;
+        (handed_off, checkpointer) = handoff.abandon(&app).await;
     }
 
     // Abort listener tasks.
@@ -397,10 +402,10 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     // already wrote a fresh (post-quiesce) checkpoint and owns the live PTYs.
     if handed_off {
         info!("handoff committed; successor owns the live sessions");
-    } else if let Some(checkpointer) = &checkpointer {
+    } else if checkpointer.is_some() {
         let shutdown_state = app.checkpoint_state().await;
-        match checkpointer.write_final_in_background(shutdown_state).await {
-            Ok(()) => info!("session state checkpointed on shutdown"),
+        match Checkpointer::write_final_from(&mut checkpointer, shutdown_state).await {
+            Ok(_sealed) => info!("session state checkpointed on shutdown"),
             Err(e) => warn!("shutdown checkpoint failed: {e}"),
         }
     }
@@ -417,7 +422,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
 /// written on the blocking pool, and an unchanged state is not rewritten
 /// (issue #207). Holds no state between iterations, so the supervisor can
 /// restart it after a panic.
-async fn checkpoint_loop(app: Arc<ServerApp>, checkpointer: Option<Arc<Checkpointer>>) {
+async fn checkpoint_loop(app: Arc<ServerApp>, checkpointer: Option<PeriodicCheckpointer>) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
@@ -438,43 +443,49 @@ async fn checkpoint_loop(app: Arc<ServerApp>, checkpointer: Option<Arc<Checkpoin
 /// rather than inline in the main loop, so SIGTERM and SIGINT are serviced
 /// while it runs (issue #207).
 struct HandoffInFlight {
-    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    task: tokio::task::JoinHandle<Ended>,
     /// Set by the sender the moment the successor's `Ack` arrives.
     committed: Arc<AtomicBool>,
 }
 
+/// What a handoff task returns: how it ended, and the checkpointer back
+/// unless the handoff's final write consumed it.
+type Ended = (anyhow::Result<()>, Option<Checkpointer>);
+
 impl HandoffInFlight {
-    fn start(app: &Arc<ServerApp>, checkpointer: Option<Arc<Checkpointer>>) -> Self {
+    /// Start a handoff that owns `checkpointer` until it ends.
+    fn start(app: &Arc<ServerApp>, checkpointer: Option<Checkpointer>) -> Self {
         let committed = Arc::new(AtomicBool::new(false));
-        let task = tokio::spawn(crate::handoff::sender::run(
-            Arc::clone(app),
-            checkpointer,
-            Arc::clone(&committed),
-        ));
+        let app = Arc::clone(app);
+        let flag = Arc::clone(&committed);
+        let task = tokio::spawn(async move {
+            let mut checkpointer = checkpointer;
+            let result = crate::handoff::sender::run(&app, &mut checkpointer, &flag).await;
+            (result, checkpointer)
+        });
         Self { task, committed }
     }
 
     /// Stop the handoff, for a shutdown signal that arrived mid-way. Returns
-    /// whether it had committed.
-    async fn abandon(self, app: &ServerApp, checkpointer: Option<&Checkpointer>) -> bool {
+    /// whether it had committed, and the checkpointer if it came back.
+    async fn abandon(self, app: &ServerApp) -> (bool, Option<Checkpointer>) {
         self.task.abort();
         let ended = self.task.await;
-        settle_handoff(ended, &self.committed, app, checkpointer).await
+        settle_handoff(ended, &self.committed, app).await
     }
 }
 
-/// Wait for the handoff in flight to end, and return whether it committed.
-/// Never resolves while there is none.
+/// Wait for the handoff in flight to end, and return whether it committed,
+/// with the checkpointer if it came back. Never resolves while there is none.
 async fn handoff_finished(
     in_flight: &mut Option<HandoffInFlight>,
     app: &ServerApp,
-    checkpointer: Option<&Checkpointer>,
-) -> bool {
+) -> (bool, Option<Checkpointer>) {
     let Some(handoff) = in_flight else {
         return std::future::pending().await;
     };
     let ended = (&mut handoff.task).await;
-    settle_handoff(ended, &handoff.committed, app, checkpointer).await
+    settle_handoff(ended, &handoff.committed, app).await
 }
 
 /// Make the daemon consistent with how a handoff ended, whether the sender
@@ -485,28 +496,30 @@ async fn handoff_finished(
 /// alive through our exit even if the sender never got that far. A handoff
 /// that returned `Ok` without committing was declined, and the successor
 /// restores from our final checkpoint. Anything else leaves this daemon
-/// serving: its readers are released and its checkpoint unsealed, which the
-/// sender's own rollback does too unless it panicked or was aborted.
+/// serving: its readers are released, which the sender's own rollback does
+/// too unless it panicked or was aborted. Its checkpoint was unsealed as the
+/// sender's final checkpoint dropped; a panicked or aborted sender's
+/// checkpointer is lost with it, so no final write is left to make.
 async fn settle_handoff(
-    ended: Result<anyhow::Result<()>, tokio::task::JoinError>,
+    ended: Result<Ended, tokio::task::JoinError>,
     committed: &AtomicBool,
     app: &ServerApp,
-    checkpointer: Option<&Checkpointer>,
-) -> bool {
+) -> (bool, Option<Checkpointer>) {
+    let (result, checkpointer) = match ended {
+        Ok((result, checkpointer)) => (Ok(result), checkpointer),
+        Err(e) => (Err(e), None),
+    };
     if committed.load(Ordering::SeqCst) {
         app.manager.set_all_keep_alive(true).await;
-        return true;
+        return (true, checkpointer);
     }
-    match ended {
-        Ok(Ok(())) => return true,
+    match result {
+        Ok(Ok(())) => return (true, checkpointer),
         Ok(Err(e)) => warn!("handoff rolled back: {e:#}"),
         Err(e) => warn!("handoff task ended early: {e}"),
     }
     app.release_relays().await;
-    if let Some(checkpointer) = checkpointer {
-        checkpointer.unseal();
-    }
-    false
+    (false, checkpointer)
 }
 
 /// Dispatch a newly accepted session to the appropriate transport handler.
@@ -553,7 +566,7 @@ mod tests {
         committed: bool,
     ) -> HandoffInFlight {
         HandoffInFlight {
-            task: tokio::spawn(task),
+            task: tokio::spawn(async move { (task.await, None) }),
             committed: Arc::new(AtomicBool::new(committed)),
         }
     }
@@ -565,20 +578,18 @@ mod tests {
     async fn a_finished_handoff_reports_whether_it_hands_over() {
         let app = crate::fixtures::fixture_app();
         let mut none = None;
-        let waited = tokio::time::timeout(
-            Duration::from_millis(50),
-            handoff_finished(&mut none, &app, None),
-        )
-        .await;
+        let waited =
+            tokio::time::timeout(Duration::from_millis(50), handoff_finished(&mut none, &app))
+                .await;
         assert!(waited.is_err(), "nothing in flight never finishes");
 
         let mut declined = Some(fixture_handoff(async { Ok(()) }, false));
-        assert!(handoff_finished(&mut declined, &app, None).await);
+        assert!(handoff_finished(&mut declined, &app).await.0);
         let mut failed = Some(fixture_handoff(
             async { Err(anyhow::anyhow!("no Ack")) },
             false,
         ));
-        assert!(!handoff_finished(&mut failed, &app, None).await);
+        assert!(!handoff_finished(&mut failed, &app).await.0);
     }
 
     /// A handoff stopped by a shutdown signal counts as handed over only if
@@ -587,40 +598,42 @@ mod tests {
     async fn an_abandoned_handoff_hands_over_only_if_it_had_committed() {
         let app = crate::fixtures::fixture_app();
         let stuck = || std::future::pending::<anyhow::Result<()>>();
-        assert!(fixture_handoff(stuck(), true).abandon(&app, None).await);
-        assert!(!fixture_handoff(stuck(), false).abandon(&app, None).await);
+        assert!(fixture_handoff(stuck(), true).abandon(&app).await.0);
+        assert!(!fixture_handoff(stuck(), false).abandon(&app).await.0);
     }
 
     /// How a handoff ended decides whether this daemon exits: a commit (even
     /// one whose sender then failed) or a decline hands over; a failure, a
-    /// panic or an abort before the commit point leaves it serving, with its
-    /// checkpoint accepting writes again.
+    /// panic or an abort before the commit point leaves it serving, with the
+    /// checkpointer it handed back.
     #[tokio::test]
     async fn settling_a_handoff_hands_over_only_when_committed_or_declined() {
         let app = crate::fixtures::fixture_app();
         let tmp = tempfile::tempdir().unwrap();
-        let checkpointer = Checkpointer::new(tmp.path().join("state.bin"));
-        let state = app.checkpoint_state().await;
         let committed = AtomicBool::new(true);
         let not_committed = AtomicBool::new(false);
         let aborted = {
-            let task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+            let task = tokio::spawn(std::future::pending::<Ended>());
             task.abort();
             task.await
         };
+        let checkpointer = || Some(Checkpointer::new(tmp.path().join("state.bin")));
 
-        let failed = || Ok(Err(anyhow::anyhow!("no Ack")));
-        assert!(settle_handoff(failed(), &committed, &app, Some(&checkpointer)).await);
-        assert!(settle_handoff(Ok(Ok(())), &not_committed, &app, None).await);
-
-        checkpointer.write_final(&state).unwrap();
-        assert!(!settle_handoff(failed(), &not_committed, &app, Some(&checkpointer)).await);
-        assert_eq!(
-            checkpointer.write(&state).unwrap(),
-            crate::persist::checkpoint::Written::Unchanged,
-            "unsealed"
+        let failed = |c| Ok((Err(anyhow::anyhow!("no Ack")), c));
+        assert!(settle_handoff(failed(None), &committed, &app).await.0);
+        assert!(
+            settle_handoff(Ok((Ok(()), None)), &not_committed, &app)
+                .await
+                .0
         );
-        assert!(!settle_handoff(aborted, &not_committed, &app, None).await);
+
+        let (handed_over, back) =
+            settle_handoff(failed(checkpointer()), &not_committed, &app).await;
+        assert!(!handed_over);
+        assert!(back.is_some(), "the rolled-back handoff's checkpointer");
+        let (handed_over, back) = settle_handoff(aborted, &not_committed, &app).await;
+        assert!(!handed_over);
+        assert!(back.is_none());
     }
 
     /// The first checkpoint is written as soon as the loop starts, and reads
@@ -630,8 +643,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.bin");
         let app = Arc::new(crate::fixtures::fixture_app());
-        let checkpointer = Arc::new(Checkpointer::new(path.clone()));
-        let task = tokio::spawn(checkpoint_loop(app, Some(checkpointer)));
+        let checkpointer = Checkpointer::new(path.clone());
+        let task = tokio::spawn(checkpoint_loop(app, Some(checkpointer.periodic())));
 
         tokio::time::timeout(Duration::from_secs(10), async {
             while !path.exists() {
