@@ -11,10 +11,10 @@ use tracing::{Instrument, debug};
 
 use crate::app::{AttachResult, ServerApp};
 use crate::client_handler::{
-    FRAME_WRITE_TIMEOUT, MAX_WRITE_BATCH, OutboundCompression, PaneAttacher, build_attach_replay,
-    run_client_session, within,
+    MAX_WRITE_BATCH, OutboundCompression, PaneAttacher, build_attach_replay, run_client_session,
+    within,
 };
-use crate::outbound::CloseReason;
+use crate::outbound::{CloseReason, OutboundTx};
 
 pub fn classify_error(e: &kmux_pty::error::KmuxError) -> ErrorCode {
     match e {
@@ -33,6 +33,11 @@ struct QuicAttacher {
     conn: Connection,
     /// Shared outbound compression policy for this connection's pane streams.
     comp_out: Arc<OutboundCompression>,
+    /// The connection's control channel, where a stalled pane's resync goes.
+    ctrl_tx: OutboundTx,
+    /// How long a pane stream may refuse frames before it is reset:
+    /// [`PANE_STREAM_STALL_TIMEOUT`] outside tests.
+    stall_timeout: Duration,
 }
 
 impl PaneAttacher for QuicAttacher {
@@ -44,23 +49,29 @@ impl PaneAttacher for QuicAttacher {
     ) -> impl Future<Output = Result<AbortHandle, String>> + Send {
         let conn = self.conn.clone();
         let comp_out = Arc::clone(&self.comp_out);
+        let ctrl_tx = self.ctrl_tx.clone();
+        let stall_timeout = self.stall_timeout;
         async move {
-            let uni_stream = conn
+            let mut uni_stream = conn
                 .open_uni()
                 .await
                 .map_err(|e| format!("failed to open uni stream: {e}"))?;
             let handle = tokio::spawn(async move {
                 let written = pane_uni_writer(
-                    uni_stream,
+                    &mut uni_stream,
                     result,
                     &pane_id,
                     &mut client_rx,
                     &comp_out,
-                    FRAME_WRITE_TIMEOUT,
+                    stall_timeout,
                 )
                 .await;
-                if closes_connection(written) {
-                    conn.close(PANE_WRITE_TIMEOUT_CODE.into(), b"pane stream write timeout");
+                if let Some(resync) = stall_resync(written, &pane_id) {
+                    // Only this stream: the connection and its other panes
+                    // carry on. The pane's queue closes with this task, so
+                    // the relay drops it until the client re-attaches.
+                    let _ = uni_stream.reset(PANE_STREAM_STALLED_CODE.into());
+                    let _ = ctrl_tx.send(resync);
                 }
             })
             .abort_handle();
@@ -71,29 +82,49 @@ impl PaneAttacher for QuicAttacher {
 
 // ─── QUIC pane stream writer ──────────────────────────────────────────────────
 
-/// QUIC application error code a connection is closed with when one of its
-/// pane streams stops taking frames.
-const PANE_WRITE_TIMEOUT_CODE: u32 = 1;
+/// Longest a QUIC pane stream may refuse frames before it is reset
+/// (issue #207): 30 s past the QUIC idle timeout.
+///
+/// A pane stream stops taking frames when the client stops reading it — or
+/// when nothing reaches the client at all: a laptop asleep, a network gone.
+/// The second is the connection's business, not the stream's: with keep-alives
+/// every 15 s the connection outlives any outage shorter than its idle
+/// timeout, and past that it closes, failing every stream's write at once.
+/// Holding a stream at least that long means a stall reset never fires during
+/// an outage the connection would have ridden out, so a network drop or a
+/// sleep costs no pane a resync. What is left is a client that is reachable —
+/// it answers keep-alives — but has not read this stream for five and a half
+/// minutes: that stream alone is reset.
+pub(crate) const PANE_STREAM_STALL_TIMEOUT: Duration =
+    Duration::from_secs(kmux_sys::QUIC_IDLE_TIMEOUT_SECS + 30);
 
-/// Whether a pane stream's end closes the whole QUIC connection. A client that
-/// stopped reading one pane's stream is treated like one that stopped reading
-/// the control stream: the connection closes, and the client reconnects and
-/// resyncs (issue #207). A stream that ended or failed on its own does not.
-fn closes_connection(written: Result<(), CloseReason>) -> bool {
-    written == Err(CloseReason::WriteTimeout)
+/// QUIC application error code a stalled pane stream is reset with.
+const PANE_STREAM_STALLED_CODE: u32 = 1;
+
+/// What the client is told when its pane stream ended as `written`: for a
+/// stall, the stream is reset and the client gets a `Lagged` on the control
+/// stream, which it answers by re-attaching the pane — the existing
+/// `SyncReset` + snapshot resync, on a fresh stream (issue #207). A stream
+/// that ended or failed on its own needs no resync: either the pane closed or
+/// the connection is going.
+fn stall_resync(written: Result<(), CloseReason>, pane_id: &str) -> Option<ServerMessage> {
+    (written == Err(CloseReason::WriteTimeout)).then(|| ServerMessage::Lagged {
+        pane_id: pane_id.to_string(),
+        missed_count: 1,
+    })
 }
 
 /// Write initial replay data + live diffs on a server-initiated unidirectional
 /// stream, until the pane's queue closes or a write fails.
 ///
 /// Every frame write and every flush must finish within `write_timeout`
-/// (issue #207), as on the TCP/UDS writer: a client that stops reading a pane
-/// stream fills its QUIC flow-control window, and the write would otherwise
-/// wait forever, pinning this task and the pane's queue. Such a stall is
+/// (issue #207): a client that stops reading a pane stream fills its QUIC
+/// flow-control window, and the write would otherwise wait forever, pinning
+/// this task and the pane's queue. Such a stall is
 /// [`CloseReason::WriteTimeout`]; a failed write is
 /// [`CloseReason::WriteFailed`].
 async fn pane_uni_writer<W: AsyncWrite + Unpin>(
-    mut uni: W,
+    uni: &mut W,
     attach_result: AttachResult,
     pane_id: &str,
     client_rx: &mut mpsc::Receiver<ServerMessage>,
@@ -102,13 +133,9 @@ async fn pane_uni_writer<W: AsyncWrite + Unpin>(
 ) -> Result<(), CloseReason> {
     // Replay frames are written as whole frames then flushed once.
     for msg in build_attach_replay(attach_result, pane_id) {
-        within(
-            write_timeout,
-            write_frame(&mut uni, &msg, comp_out.compressor()),
-        )
-        .await?;
+        within(write_timeout, write_frame(uni, &msg, comp_out.compressor())).await?;
     }
-    within(write_timeout, kmux_protocol::flush(&mut uni)).await?;
+    within(write_timeout, kmux_protocol::flush(uni)).await?;
 
     // Network impairment shim (issue #72): per-pane jitter on live pane-data
     // frames only. `None` (no env knobs) skips the delay entirely.
@@ -134,21 +161,18 @@ async fn pane_uni_writer<W: AsyncWrite + Unpin>(
                 crate::impair::maybe_delay(cfg, msg.category(), rng).await;
             }
             let write_start = Instant::now();
-            within(
-                write_timeout,
-                write_frame(&mut uni, &msg, comp_out.compressor()),
-            )
-            .await?;
+            within(write_timeout, write_frame(uni, &msg, comp_out.compressor())).await?;
             let write_us = write_start.elapsed().as_micros();
             if write_us > 1000 {
                 debug!(pane_id, write_us, "slow uni stream write");
             }
         }
-        within(write_timeout, kmux_protocol::flush(&mut uni)).await?;
+        within(write_timeout, kmux_protocol::flush(uni)).await?;
     }
 
-    // Finishing the stream (a QUIC `FIN`) must not wait forever either.
-    let _ = tokio::time::timeout(write_timeout, uni.shutdown()).await;
+    // Finish the stream (a QUIC `FIN`). quinn queues it and returns at once;
+    // it never waits for the peer, so this needs no timeout.
+    let _ = uni.shutdown().await;
     Ok(())
 }
 
@@ -192,9 +216,11 @@ pub async fn handle_with_io<R, W>(
         writer,
         app,
         transport,
-        |_ctrl_tx, comp_out| QuicAttacher {
+        |ctrl_tx, comp_out| QuicAttacher {
             conn: conn.clone(),
             comp_out,
+            ctrl_tx,
+            stall_timeout: PANE_STREAM_STALL_TIMEOUT,
         },
         conn_span.clone(),
     )
@@ -272,41 +298,41 @@ mod pane_writer_tests {
     #[tokio::test(start_paused = true)]
     async fn a_pane_stream_nobody_reads_times_out() {
         // The client half is kept but never read, so writes block.
-        let (server, _client) = tokio::io::duplex(64);
+        let (mut server, _client) = tokio::io::duplex(64);
         let (tx, mut rx) = mpsc::channel(4);
         tx.send(frame()).await.unwrap();
         let started = tokio::time::Instant::now();
 
         let written = pane_uni_writer(
-            server,
+            &mut server,
             AttachResult::Delta(vec![]),
             "eagle/0",
             &mut rx,
             &OutboundCompression::new(3, 1024),
-            FRAME_WRITE_TIMEOUT,
+            PANE_STREAM_STALL_TIMEOUT,
         )
         .await;
 
         assert_eq!(written, Err(CloseReason::WriteTimeout));
-        assert!(started.elapsed() >= FRAME_WRITE_TIMEOUT);
+        assert!(started.elapsed() >= PANE_STREAM_STALL_TIMEOUT);
     }
 
     /// A client that reads gets each queued frame, and the stream is finished
     /// once the pane's queue closes.
     #[tokio::test]
     async fn a_read_pane_stream_carries_the_frames_then_ends() {
-        let (server, mut client) = tokio::io::duplex(64 * 1024);
+        let (mut server, mut client) = tokio::io::duplex(64 * 1024);
         let (tx, mut rx) = mpsc::channel(4);
         tx.send(frame()).await.unwrap();
         drop(tx);
 
         let written = pane_uni_writer(
-            server,
+            &mut server,
             AttachResult::Delta(vec![]),
             "eagle/0",
             &mut rx,
             &OutboundCompression::new(3, 1024),
-            FRAME_WRITE_TIMEOUT,
+            PANE_STREAM_STALL_TIMEOUT,
         )
         .await;
 
@@ -318,31 +344,208 @@ mod pane_writer_tests {
         assert!(wire.ends_with(&expected));
     }
 
+    /// Whether `msg` is the `Lagged` a stall of `pane` sends.
+    fn is_lagged(msg: &ServerMessage, pane: &str) -> bool {
+        matches!(
+            msg,
+            ServerMessage::Lagged { pane_id, missed_count: 1 } if pane_id == pane
+        )
+    }
+
+    /// Only a stall asks the client to resync the pane; a stream that ended
+    /// or failed on its own does not.
     #[test]
-    fn only_a_stalled_pane_stream_closes_the_connection() {
-        assert!(closes_connection(Err(CloseReason::WriteTimeout)));
-        assert!(!closes_connection(Err(CloseReason::WriteFailed)));
-        assert!(!closes_connection(Ok(())));
+    fn only_a_stalled_pane_stream_is_resynced() {
+        let resync = stall_resync(Err(CloseReason::WriteTimeout), "eagle/0");
+        assert!(is_lagged(&resync.expect("a resync"), "eagle/0"));
+        assert!(stall_resync(Err(CloseReason::WriteFailed), "eagle/0").is_none());
+        assert!(stall_resync(Ok(()), "eagle/0").is_none());
+    }
+
+    /// The stall timeout outlasts the QUIC idle timeout, so an outage the
+    /// connection rides out never resets a pane stream.
+    #[test]
+    fn a_stall_outlasts_the_quic_idle_timeout() {
+        assert!(PANE_STREAM_STALL_TIMEOUT > Duration::from_secs(kmux_sys::QUIC_IDLE_TIMEOUT_SECS));
     }
 
     /// A stream the client has gone from fails the write at once.
     #[tokio::test]
     async fn a_pane_stream_whose_client_is_gone_fails() {
-        let (server, client) = tokio::io::duplex(64);
+        let (mut server, client) = tokio::io::duplex(64);
         drop(client);
         let (tx, mut rx) = mpsc::channel(4);
         tx.send(frame()).await.unwrap();
 
         let written = pane_uni_writer(
-            server,
+            &mut server,
             AttachResult::Delta(vec![]),
             "eagle/0",
             &mut rx,
             &OutboundCompression::new(3, 1024),
-            FRAME_WRITE_TIMEOUT,
+            PANE_STREAM_STALL_TIMEOUT,
         )
         .await;
 
         assert_eq!(written, Err(CloseReason::WriteFailed));
+    }
+
+    // ─── On a real QUIC connection ───────────────────────────────────────────
+    //
+    // A reset is a QUIC frame; `duplex` has no equivalent, so these run over
+    // loopback on the real clock, with a short stall timeout.
+
+    /// A bound on every loopback wait.
+    const WAIT: Duration = Duration::from_secs(10);
+
+    /// The stall timeout the loopback tests use.
+    const SHORT_STALL: Duration = Duration::from_millis(200);
+
+    /// A connected QUIC client and server over loopback.
+    async fn quic_pair() -> (quinn::Endpoint, quinn::Endpoint, Connection, Connection) {
+        use kmux_sys::tls::{CertMaterial, TofuVerifier, build_server_config};
+
+        let tls = build_server_config(CertMaterial::self_signed().unwrap()).unwrap();
+        let crypto = quinn::crypto::rustls::QuicServerConfig::try_from(tls).unwrap();
+        let server = quinn::Endpoint::server(
+            quinn::ServerConfig::with_crypto(Arc::new(crypto)),
+            "127.0.0.1:0".parse().unwrap(),
+        )
+        .unwrap();
+        let addr = server.local_addr().unwrap();
+
+        let crypto = rustls::ClientConfig::builder()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(TofuVerifier::accept_invalid(
+                addr.to_string(),
+                "quic",
+            )))
+            .with_no_client_auth();
+        let crypto = quinn::crypto::rustls::QuicClientConfig::try_from(crypto).unwrap();
+        let mut client = quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).unwrap();
+        client.set_default_client_config(quinn::ClientConfig::new(Arc::new(crypto)));
+
+        let connecting = client.connect(addr, "localhost").unwrap();
+        let accepting = async { server.accept().await.expect("an attempt").await };
+        let (client_conn, server_conn) =
+            tokio::time::timeout(WAIT, async { tokio::join!(connecting, accepting) })
+                .await
+                .expect("the handshake completes");
+        (client, server, client_conn.unwrap(), server_conn.unwrap())
+    }
+
+    fn attacher(conn: Connection, ctrl_tx: OutboundTx) -> QuicAttacher {
+        QuicAttacher {
+            conn,
+            comp_out: Arc::new(OutboundCompression::new(3, 1024)),
+            ctrl_tx,
+            stall_timeout: SHORT_STALL,
+        }
+    }
+
+    /// A frame too big to compress well, so the flow-control window fills.
+    fn big_frame() -> ServerMessage {
+        let data = (0..64 * 1024u32).map(|i| (i.wrapping_mul(2_654_435_761) >> 24) as u8);
+        ServerMessage::LogChunk {
+            request_id: 1,
+            data: data.collect(),
+        }
+    }
+
+    /// A pane stream the client stops reading is reset — that stream only:
+    /// the connection stays open — and the client is sent a `Lagged` for the
+    /// pane on the control channel, so it re-attaches and resyncs
+    /// (issue #207).
+    #[tokio::test]
+    async fn a_stalled_pane_stream_is_reset_alone_and_the_pane_resynced() {
+        let (_client, _server, client_conn, server_conn) = quic_pair().await;
+        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
+        let (tx, rx) = mpsc::channel(8);
+        let feeding = tokio::spawn(async move {
+            // More than any receive window: the stream stalls on its own.
+            while tx.send(big_frame()).await.is_ok() {}
+        });
+
+        let handle = attacher(server_conn.clone(), ctrl_tx)
+            .start_pane_stream("eagle/0".to_string(), AttachResult::Delta(vec![]), rx)
+            .await
+            .expect("the stream opens");
+
+        let resync = tokio::time::timeout(WAIT, async {
+            loop {
+                if let Ok(msg) = ctrl_rx.try_recv() {
+                    return msg;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("a resync is sent");
+        assert!(is_lagged(&resync, "eagle/0"), "got {resync:?}");
+        tokio::time::timeout(WAIT, async {
+            while !handle.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the writer ends");
+        feeding
+            .await
+            .expect("the pane queue closes with the writer");
+
+        let mut uni = tokio::time::timeout(WAIT, client_conn.accept_uni())
+            .await
+            .expect("bounded")
+            .expect("the pane stream");
+        let read = tokio::time::timeout(WAIT, uni.read_to_end(usize::MAX))
+            .await
+            .expect("bounded");
+        assert!(
+            matches!(
+                read,
+                Err(quinn::ReadToEndError::Read(quinn::ReadError::Reset(code)))
+                    if code == PANE_STREAM_STALLED_CODE.into()
+            ),
+            "reset with the stall code, got {read:?}"
+        );
+        assert_eq!(
+            server_conn.close_reason(),
+            None,
+            "the connection stays open"
+        );
+        assert_eq!(client_conn.close_reason(), None);
+    }
+
+    /// A pane stream the client reads is neither reset nor resynced.
+    #[tokio::test]
+    async fn a_read_pane_stream_is_not_reset() {
+        let (_client, _server, client_conn, server_conn) = quic_pair().await;
+        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
+        let (tx, rx) = mpsc::channel(8);
+        tx.send(big_frame()).await.unwrap();
+        drop(tx);
+
+        let handle = attacher(server_conn.clone(), ctrl_tx)
+            .start_pane_stream("eagle/0".to_string(), AttachResult::Delta(vec![]), rx)
+            .await
+            .expect("the stream opens");
+        let mut uni = tokio::time::timeout(WAIT, client_conn.accept_uni())
+            .await
+            .expect("bounded")
+            .expect("the pane stream");
+        let wire = tokio::time::timeout(WAIT, uni.read_to_end(usize::MAX))
+            .await
+            .expect("bounded")
+            .expect("finished, not reset");
+        let expected = encode_server(&big_frame()).unwrap();
+        assert!(wire.ends_with(&expected));
+        tokio::time::timeout(WAIT, async {
+            while !handle.is_finished() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the writer ends");
+        assert!(ctrl_rx.try_recv().is_err(), "no resync");
     }
 }
