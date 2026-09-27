@@ -956,6 +956,38 @@ mod tests {
         assert_eq!(sup.active_transport, TransportKind::Quic);
     }
 
+    /// A forced transport whose probe fails is recorded against its endpoint,
+    /// and the supervisor stays on the active one.
+    #[tokio::test]
+    async fn a_forced_transport_that_cannot_be_reached_is_charged_a_failure() {
+        let (srv_tx, _srv_rx) = mpsc::unbounded_channel();
+        let (up_tx, mut up_rx) = mpsc::channel(1);
+        let mut sup = TransportSupervisor::new(SupervisorParams {
+            endpoints: vec![EndpointAdvert {
+                kind: TransportKind::Uds,
+                address: "/nonexistent/kmux/daemon-data.sock".into(),
+            }],
+            resume: ResumeFrom {
+                connection_id: ConnectionId(1),
+                instance: None,
+            },
+            token: "tok".into(),
+            capabilities: ClientCapabilities::default(),
+            accept_invalid_certs: false,
+            active_transport: TransportKind::TcpTls,
+            is_local: true,
+            server_tx: srv_tx,
+            upgrade_tx: up_tx,
+            rtt_rx: None,
+            forced: None,
+            override_rx: None,
+        });
+        sup.ensure_active(TransportKind::Uds).await;
+        assert_eq!(sup.endpoints[0].failure_count, 1);
+        assert_eq!(sup.active_transport, TransportKind::TcpTls);
+        assert!(up_rx.try_recv().is_err(), "no swap");
+    }
+
     // ── apply_rtt ─────────────────────────────────────────────────────────────
 
     #[test]
@@ -1077,6 +1109,9 @@ mod tests {
 
     // ── spawn_auth_intercept ───────────────────────────────────────────────────
 
+    /// A bound on every forwarder wait: its verdict is immediate.
+    const WAIT: Duration = Duration::from_secs(5);
+
     /// The connection the forwarder tests' probe resumes, and its run.
     const PROBED: ConnectionId = ConnectionId(9);
     const RUN: kmux_protocol::messages::DaemonInstanceId =
@@ -1136,7 +1171,10 @@ mod tests {
         intercept_tx.send(ok_auth_result()).unwrap();
 
         // Auth oneshot resolves Ok.
-        assert!(matches!(auth_rx.await, Ok(Ok(()))));
+        assert!(matches!(
+            timeout(WAIT, auth_rx).await.expect("the probe's verdict"),
+            Ok(Ok(()))
+        ));
         // The AuthResult is also forwarded to the outer channel so the
         // SessionManager continues to see every server message.
         assert!(matches!(
@@ -1167,7 +1205,7 @@ mod tests {
             })
             .unwrap();
 
-        match auth_rx.await {
+        match timeout(WAIT, auth_rx).await.expect("the probe's verdict") {
             Ok(Err(reason)) => assert_eq!(reason, "bad token"),
             other => panic!("expected Err(bad token), got {other:?}"),
         }
@@ -1218,7 +1256,10 @@ mod tests {
         }
         intercept_tx.send(fresh).unwrap();
         intercept_tx.send(ServerMessage::Ping { seq: 3 }).unwrap();
-        assert!(matches!(auth_rx.await, Ok(Err(_))));
+        assert!(matches!(
+            timeout(WAIT, auth_rx).await.expect("the probe's verdict"),
+            Ok(Err(_))
+        ));
         assert!(matches!(
             outer_rx.recv().await,
             Some(ServerMessage::Ping { seq: 3 })
@@ -1233,7 +1274,10 @@ mod tests {
         let (intercept_tx, auth_rx, mut outer_rx) = forwarder_under_test();
 
         intercept_tx.send(ok_auth_result()).unwrap();
-        assert!(matches!(auth_rx.await, Ok(Ok(()))));
+        assert!(matches!(
+            timeout(WAIT, auth_rx).await.expect("the probe's verdict"),
+            Ok(Ok(()))
+        ));
 
         // A subsequent non-AuthResult message must still be forwarded.
         intercept_tx.send(ServerMessage::Ping { seq: 1 }).unwrap();
