@@ -57,13 +57,23 @@ impl SessionManager {
     /// Bring the viewed tab of `word` in line with the freshly listed layout:
     /// re-select the session when its tab is gone or nothing is visible, else
     /// attach and detach to match the tab's panes.
+    ///
+    /// A federated session is only re-selected when nothing is visible: the
+    /// hub's cached entry for it does not follow the peer's layout and tab
+    /// changes, so its listed layout may be older than what this client shows.
     fn reconcile_viewed_tab(&mut self, word: WordId) {
+        let federated = self
+            .session_list
+            .iter()
+            .any(|e| e.meta.word_id == word && e.peer.is_some());
         let view = self
             .active_tab
             .and_then(|tab_index| self.tab_view(&word, tab_index));
         match view {
-            Some((_, visible)) if !self.visible_panes.is_empty() => self.set_visible_set(visible),
-            _ => self.select_session(word),
+            _ if self.visible_panes.is_empty() => self.select_session(word),
+            _ if federated => {}
+            Some((_, visible)) => self.set_visible_set(visible),
+            None => self.select_session(word),
         }
     }
 

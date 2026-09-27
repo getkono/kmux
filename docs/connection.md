@@ -457,7 +457,7 @@ unsupported traffic. See
 
 ## ConnectionId and Session Resumption
 
-`ConnectionId` is a server-assigned `u64` provided in the first `AuthResult`. It names a client's *registration* on the daemon — its `ClientId`, label, identity and input locks — and a client presents it again whenever it opens a new channel: a transport swap, or a reconnect (issue #208).
+`ConnectionId` is a server-assigned `u64` provided in the first `AuthResult`. It names a client's *registration* on the daemon — its `ClientId` (which its pane attachments and input locks are keyed by), label and identity — and a client presents it again whenever it opens a new channel: a transport swap, or a reconnect (issue #208).
 
 **Resume.** A new channel's `Auth` carries the existing `connection_id`. After the identity proof, `ServerApp::register_client` resumes the registration only if both hold:
 
@@ -471,11 +471,11 @@ Otherwise the channel registers a fresh connection with fresh ids. `RegisteredCl
 1. it detaches only the pane attachments made **through this channel** (`ServerApp::detach_channel`, matched by the channel's control lane) — a pane the resuming channel re-attached under the same `ClientId` is left alone; and
 2. it releases the registration only if its generation is still current (`ServerApp::release_connection`). A superseded channel ending leaves the registration to the channel that resumed it.
 
-**Replay.** Pane streams are not moved by the daemon. After any (re)connect the client re-attaches each pane it shows with `Attach { last_seqno }`, the last seqno it applied, and `compute_replay` answers from the pane's retained diffs: exactly the missed `TerminalUpdate`s when the buffer still covers `last_seqno` (and the backlog is under the coalescing threshold), otherwise `SyncReset` + a fresh `TerminalSnapshot`.
+**Replay.** Pane streams are not moved by the daemon: a pane stays attached through the channel that attached it, and a new channel re-attaches it. Replay is per pane, so it is the same for a resumed and a fresh connection: a client that re-attaches with `Attach { last_seqno }`, the last seqno it applied, is answered by `compute_replay` from the pane's retained diffs — exactly the missed `TerminalUpdate`s when the buffer still covers `last_seqno` (and the backlog is under the coalescing threshold), otherwise `SyncReset` + a fresh `TerminalSnapshot`.
 
 **Transport swap.** When the supervisor promotes a new transport, the resumed channel sends `ChannelReady`, the daemon answers `ChannelSwitched { old_transport }`, and `apply_transport_upgrade` replaces the active sender; the old transport is dropped, and its loop's teardown is the superseded case above.
 
-**Missed server events.** Every connection forwards two server-wide broadcasts (PTY lifecycle events; VT, layout and tab events). A connection that falls behind one is sent an unsolicited `SessionListResult` with `request_id = RESYNC_REQUEST_ID` (`u64::MAX`) — every session with its tabs and layouts — and the forwarder carries on. The client treats any session list as the whole truth: sessions it no longer lists are closed as if their `SessionClosed` had arrived, and the viewed tab is reconciled against its listed layout.
+**Missed server events.** Every connection forwards two server-wide broadcasts (PTY lifecycle events; VT, layout and tab events). A connection that falls behind one is sent an unsolicited `SessionListResult` with `request_id = RESYNC_REQUEST_ID` (`u64::MAX`) — every session with its tabs and layouts — and the forwarder carries on. The list is queued while the session map is read-locked, so a local session created or closed at the same moment either shows in it or has its own reply queued after it. The client treats any session list as the whole truth: sessions it no longer lists are closed as if their `SessionClosed` had arrived, and the viewed tab of a local session is reconciled against its listed layout. A federated session's view is left as shown, because the hub's cached entry for it does not follow the peer's layout and tab changes.
 
 ---
 

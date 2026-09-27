@@ -1160,6 +1160,33 @@ mod tests {
         assert_eq!(attached, vec!["eagle/1".to_string()]);
     }
 
+    /// A viewed federated session keeps what it shows: the hub's cached
+    /// layout for it may be older than the layout updates this client
+    /// already applied.
+    #[test]
+    fn a_resync_list_leaves_a_viewed_federated_session_as_shown() {
+        let (mut mgr, mut rx) = manager_on("hawk");
+        drain(&mut rx);
+        let mut stale = make_entry("hawk");
+        stale.peer = Some("peer:1".to_string());
+        stale.panes.push(pane("hawk", 1));
+        stale.tabs = vec![tab(0, LayoutNode::single(1), 1)];
+
+        mgr.handle_server_message(ServerMessage::SessionListResult {
+            request_id: kmux_protocol::messages::RESYNC_REQUEST_ID,
+            sessions: vec![stale],
+        });
+
+        assert_eq!(observe(&mgr).visible_panes, vec!["hawk/0".to_string()]);
+        assert!(
+            drain(&mut rx).iter().all(|msg| !matches!(
+                msg,
+                ClientMessage::Attach { .. } | ClientMessage::Detach { .. }
+            )),
+            "nothing is attached or detached"
+        );
+    }
+
     /// A viewed session showing nothing is selected afresh, which also
     /// focuses a pane.
     #[test]
