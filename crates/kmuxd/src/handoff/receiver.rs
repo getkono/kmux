@@ -17,8 +17,8 @@ use std::collections::HashMap;
 use std::os::fd::OwnedFd;
 use std::time::Duration;
 
-use anyhow::anyhow;
-use kmux_protocol::control_rpc::{HANDOFF_PROTOCOL_VERSION, HandoffMessage};
+use anyhow::{anyhow, bail};
+use kmux_protocol::control_rpc::{HANDOFF_PROTOCOL_VERSION, HandoffMessage, HandoffPaneMeta};
 use nix::unistd::Pid;
 use tokio::net::UnixStream;
 use tracing::{info, warn};
@@ -133,71 +133,20 @@ async fn exits_within(alive: &impl Fn() -> bool, grace: Duration) -> bool {
 async fn exchange(stream: &UnixStream, step: Duration) -> Result<Outcome, (Lost, anyhow::Error)> {
     let before_ack = |e: anyhow::Error| (Lost::BeforeAck, e);
 
-    // Handshake: read Hello, verify the protocol version.
-    let (hello, _) = read_frame_within(stream, step)
-        .await
-        .map_err(|e| before_ack(e.into()))?;
-    let HandoffMessage::Hello {
-        version,
-        token,
-        panes,
-    } = hello
-    else {
-        return Err(before_ack(anyhow!(
-            "handoff: expected Hello, got {hello:?}"
-        )));
-    };
-
+    let (version, token, panes) = read_hello(stream, step).await.map_err(before_ack)?;
     if version != HANDOFF_PROTOCOL_VERSION {
-        let reason = format!("predecessor handoff version {version} != {HANDOFF_PROTOCOL_VERSION}");
-        warn!("handoff: {reason}; declining live migration, will snapshot-restore");
-        write_frame_within(stream, &HandoffMessage::Decline { reason }, None, step)
-            .await
-            .map_err(|e| before_ack(e.into()))?;
-        // The predecessor writes its final checkpoint, then says whether it
-        // exits (Released) or keeps serving (Abort).
-        return match read_frame_within(stream, step).await {
-            Ok((HandoffMessage::Released, _)) => Ok(Outcome::Restore),
-            Ok((HandoffMessage::Abort { reason }, _)) => Ok(stand_down(&reason)),
-            Ok((other, _)) => Err(before_ack(anyhow!(
-                "handoff: expected Released after Decline, got {other:?}"
-            ))),
-            Err(e) => Err(before_ack(e.into())),
-        };
+        return decline(stream, step, version).await.map_err(before_ack);
     }
-
     write_frame_within(stream, &HandoffMessage::Accept, None, step)
         .await
         .map_err(|e| before_ack(e.into()))?;
 
-    // Pull one fd per live pane, lock-step.
-    let live = panes.iter().filter(|p| p.has_live_fd).count();
-    let mut inherited: HashMap<String, (OwnedFd, Pid)> = HashMap::with_capacity(live);
-    for _ in 0..live {
-        let (msg, fd) = read_frame_within(stream, step)
-            .await
-            .map_err(|e| before_ack(e.into()))?;
-        let pane_id = match msg {
-            HandoffMessage::PaneFd { pane_id } => pane_id,
-            HandoffMessage::Abort { reason } => return Ok(stand_down(&reason)),
-            other => {
-                return Err(before_ack(anyhow!(
-                    "handoff: expected PaneFd, got {other:?}"
-                )));
-            }
-        };
-        let fd =
-            fd.ok_or_else(|| before_ack(anyhow!("handoff: PaneFd for {pane_id} carried no fd")))?;
-        let pid = panes
-            .iter()
-            .find(|p| p.pane_id == pane_id)
-            .map_or(0, |p| p.pid);
-        inherited.insert(pane_id, (fd, Pid::from_raw(pid)));
-        write_frame_within(stream, &HandoffMessage::PaneFdAck, None, step)
-            .await
-            .map_err(|e| before_ack(e.into()))?;
-    }
-
+    let Some(inherited) = receive_fds(stream, step, &panes)
+        .await
+        .map_err(before_ack)?
+    else {
+        return Ok(Outcome::StandDown);
+    };
     match read_frame_within(stream, step)
         .await
         .map_err(|e| before_ack(e.into()))?
@@ -211,16 +160,79 @@ async fn exchange(stream: &UnixStream, step: Duration) -> Result<Outcome, (Lost,
             )));
         }
     }
-
     // We hold every live fd and the predecessor's final checkpoint is on
     // disk. Our Ack is its commit point — if it arrives.
-    let inherited = Inherited { token, inherited };
+    acknowledge(stream, step, Inherited { token, inherited }).await
+}
+
+/// Read the predecessor's `Hello`: its protocol version, token and panes.
+async fn read_hello(
+    stream: &UnixStream,
+    step: Duration,
+) -> anyhow::Result<(u32, String, Vec<HandoffPaneMeta>)> {
+    match read_frame_within(stream, step).await?.0 {
+        HandoffMessage::Hello {
+            version,
+            token,
+            panes,
+        } => Ok((version, token, panes)),
+        other => bail!("handoff: expected Hello, got {other:?}"),
+    }
+}
+
+/// Decline a predecessor of another protocol `version`. It writes its final
+/// checkpoint, then says whether it exits (`Released`: restore from that
+/// checkpoint) or keeps serving (`Abort`).
+async fn decline(stream: &UnixStream, step: Duration, version: u32) -> anyhow::Result<Outcome> {
+    let reason = format!("predecessor handoff version {version} != {HANDOFF_PROTOCOL_VERSION}");
+    warn!("handoff: {reason}; declining live migration, will snapshot-restore");
+    write_frame_within(stream, &HandoffMessage::Decline { reason }, None, step).await?;
+    match read_frame_within(stream, step).await?.0 {
+        HandoffMessage::Released => Ok(Outcome::Restore),
+        HandoffMessage::Abort { reason } => Ok(stand_down(&reason)),
+        other => bail!("handoff: expected Released after Decline, got {other:?}"),
+    }
+}
+
+/// Pull one fd per live pane, lock-step. `None` when the predecessor aborts.
+async fn receive_fds(
+    stream: &UnixStream,
+    step: Duration,
+    panes: &[HandoffPaneMeta],
+) -> anyhow::Result<Option<HashMap<String, (OwnedFd, Pid)>>> {
+    let live = panes.iter().filter(|p| p.has_live_fd).count();
+    let mut inherited = HashMap::with_capacity(live);
+    for _ in 0..live {
+        let (msg, fd) = read_frame_within(stream, step).await?;
+        let pane_id = match msg {
+            HandoffMessage::PaneFd { pane_id } => pane_id,
+            HandoffMessage::Abort { reason } => {
+                stand_down(&reason);
+                return Ok(None);
+            }
+            other => bail!("handoff: expected PaneFd, got {other:?}"),
+        };
+        let fd = fd.ok_or_else(|| anyhow!("handoff: PaneFd for {pane_id} carried no fd"))?;
+        let pid = panes
+            .iter()
+            .find(|p| p.pane_id == pane_id)
+            .map_or(0, |p| p.pid);
+        inherited.insert(pane_id, (fd, Pid::from_raw(pid)));
+        write_frame_within(stream, &HandoffMessage::PaneFdAck, None, step).await?;
+    }
+    Ok(Some(inherited))
+}
+
+/// Send our `Ack` and learn whether the predecessor committed (`Released`)
+/// or timed out waiting for it and rolled back (`Abort`).
+async fn acknowledge(
+    stream: &UnixStream,
+    step: Duration,
+    inherited: Inherited,
+) -> Result<Outcome, (Lost, anyhow::Error)> {
     if let Err(e) = write_frame_within(stream, &HandoffMessage::Ack, None, step).await {
         return Err((Lost::AfterAck(inherited), e.into()));
     }
-
-    // The predecessor says whether it committed (Released) or timed out
-    // waiting for our Ack and rolled back (Abort).
     match read_frame_within(stream, step).await {
         Ok((HandoffMessage::Released, _)) => {
             info!(

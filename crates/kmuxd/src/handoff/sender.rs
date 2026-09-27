@@ -20,7 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use anyhow::{Context, anyhow, bail};
-use kmux_protocol::control_rpc::{DAEMON_BOOT_ARGS, HANDOFF_PROTOCOL_VERSION, HandoffMessage};
+use kmux_protocol::control_rpc::{
+    DAEMON_BOOT_ARGS, HANDOFF_PROTOCOL_VERSION, HandoffMessage, HandoffPaneMeta,
+};
 use tokio::net::{UnixListener, UnixStream};
 use tracing::{info, warn};
 
@@ -154,8 +156,36 @@ async fn transfer(
         other => bail!("handoff: expected Accept/Decline, got {other:?}"),
     }
 
-    // Stream each live fd, lock-step (one in flight at a time), so each frame is
-    // delivered to the successor with exactly its own fd.
+    stream_fds(app, stream, &panes, step).await?;
+
+    // Park every PTY reader, then snapshot: the successor seeds from exactly
+    // what we consumed, and anything after sits in the kernel buffer for it.
+    // Both happen before `Complete`, so a failure still rolls back.
+    if !app.hold_relays(HOLD_TIMEOUT).await {
+        bail!("handoff: PTY readers did not park within {HOLD_TIMEOUT:?}");
+    }
+    write_final_checkpoint(app, checkpointer).await?;
+
+    write_frame_within(stream, &HandoffMessage::Complete, None, step).await?;
+    match read_frame_within(stream, step).await?.0 {
+        HandoffMessage::Ack => {
+            // Commit point: the successor holds every live fd and the
+            // checkpoint it restores from is on disk.
+            committed.store(true, Ordering::SeqCst);
+            Ok(Ending::Committed)
+        }
+        other => bail!("handoff: expected Ack, got {other:?}"),
+    }
+}
+
+/// Stream each live pane's master fd, lock-step (one in flight at a time), so
+/// each frame is delivered to the successor with exactly its own fd.
+async fn stream_fds(
+    app: &ServerApp,
+    stream: &UnixStream,
+    panes: &[HandoffPaneMeta],
+    step: Duration,
+) -> anyhow::Result<()> {
     for meta in panes.iter().filter(|p| p.has_live_fd) {
         let fd = app
             .manager
@@ -178,25 +208,7 @@ async fn transfer(
             ),
         }
     }
-
-    // Park every PTY reader, then snapshot: the successor seeds from exactly
-    // what we consumed, and anything after sits in the kernel buffer for it.
-    // Both happen before `Complete`, so a failure still rolls back.
-    if !app.hold_relays(HOLD_TIMEOUT).await {
-        bail!("handoff: PTY readers did not park within {HOLD_TIMEOUT:?}");
-    }
-    write_final_checkpoint(app, checkpointer).await?;
-
-    write_frame_within(stream, &HandoffMessage::Complete, None, step).await?;
-    match read_frame_within(stream, step).await?.0 {
-        HandoffMessage::Ack => {
-            // Commit point: the successor holds every live fd and the
-            // checkpoint it restores from is on disk.
-            committed.store(true, Ordering::SeqCst);
-            Ok(Ending::Committed)
-        }
-        other => bail!("handoff: expected Ack, got {other:?}"),
-    }
+    Ok(())
 }
 
 /// After the commit point. Nothing here can undo the handoff: a failure is

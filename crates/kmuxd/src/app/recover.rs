@@ -183,7 +183,10 @@ impl ServerApp {
     /// The log gains an entry per pane that ever faulted; without this a
     /// daemon that runs for months keeps one for every pane it ever closed.
     pub(super) fn forget_worker_restarts(&self, pane_id: &str) {
-        self.worker_restart_log.lock().unwrap().remove(pane_id);
+        self.worker_restart_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(pane_id);
     }
 
     /// Read-only view of the crash-loop budget for `pane_id`, for status

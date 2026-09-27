@@ -120,9 +120,13 @@ mod tests {
 
     /// Whether the pane's emulator shows `text` anywhere on its grid.
     async fn grid_shows(app: &ServerApp, pane_id: &str, text: &str) -> bool {
-        let sessions = app.sessions.read().await;
-        let relay = super::super::helpers::get_pane_relay(&sessions, pane_id).expect("the pane");
-        let snapshot = relay.engine.snapshot();
+        let snapshot = {
+            let sessions = app.sessions.read().await;
+            super::super::helpers::get_pane_relay(&sessions, pane_id)
+                .expect("the pane")
+                .engine
+                .snapshot()
+        };
         let chars: String = snapshot.cells.iter().map(|c| c.c).collect();
         chars.contains(text)
     }

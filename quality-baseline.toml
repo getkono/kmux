@@ -759,7 +759,7 @@ count = 17
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::cognitive_complexity"
-count = 12
+count = 11
 
 [[lints]]
 crate = "kmuxd"

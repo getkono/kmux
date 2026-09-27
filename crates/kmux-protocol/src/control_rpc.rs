@@ -185,7 +185,10 @@ pub enum HandoffMessage {
     Released,
     /// O → N: O rolled the handoff back before its commit point and keeps
     /// serving; N must exit without serving (issue #207).
-    Abort { reason: String },
+    Abort {
+        /// Why O rolled back, for N's log.
+        reason: String,
+    },
 }
 
 /// JSON response to the `"sessions"` control command.

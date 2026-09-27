@@ -459,14 +459,7 @@ async fn end_worker(child: &mut Child, end: StreamEnd, pane_id: &str, grace: Dur
         warn!(pane_id, ?end, "killing isolated VT worker");
         let _ = child.start_kill();
     }
-    let status = match tokio::time::timeout(grace, child.wait()).await {
-        Ok(status) => status,
-        Err(_) => {
-            warn!(pane_id, "isolated VT worker did not exit; killing it");
-            let _ = child.start_kill();
-            child.wait().await
-        }
-    };
+    let status = reap_within(child, grace, pane_id).await;
     match status {
         Ok(status) => {
             let faulted = !status.success();
@@ -478,6 +471,20 @@ async fn end_worker(child: &mut Child, end: StreamEnd, pane_id: &str, grace: Dur
             false
         }
     }
+}
+
+/// Wait for `child` to exit, killing it if it has not within `grace`.
+async fn reap_within(
+    child: &mut Child,
+    grace: Duration,
+    pane_id: &str,
+) -> std::io::Result<std::process::ExitStatus> {
+    if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
+        return status;
+    }
+    warn!(pane_id, "isolated VT worker did not exit; killing it");
+    let _ = child.start_kill();
+    child.wait().await
 }
 
 /// Tell attached clients the pane's worker crashed. Uses the control lane so
