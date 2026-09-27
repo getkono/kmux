@@ -54,9 +54,10 @@ pub fn names_same_file(path: &Path, open: &std::fs::Metadata) -> bool {
 ///
 /// Returns 0 when nothing new is there yet. Once the file being read no longer
 /// sits at `path` and has been read to its end, `file` is replaced with the
-/// file now at `path`, read from its start. The old file is drained first, so
-/// the lines it received before the rotation are not skipped. While nothing
-/// exists at `path` the old file is kept.
+/// file now at `path`, read from its start. Whether it moved is checked
+/// *before* reading, so every line the old file received — up to its rename
+/// and after — is read before the switch. While nothing exists at `path` the
+/// old file is kept.
 ///
 /// # Errors
 ///
@@ -69,16 +70,9 @@ pub async fn read_appended(
 ) -> std::io::Result<usize> {
     use tokio::io::AsyncReadExt;
 
+    let rotated = !names_same_file(path, &file.metadata().await?);
     let n = file.read(buf).await?;
-    if n > 0 {
-        return Ok(n);
-    }
-    if names_same_file(path, &file.metadata().await?) {
-        return Ok(0);
-    }
-    // Rotated: whatever reached the old file before its rename is there now.
-    let n = file.read(buf).await?;
-    if n > 0 {
+    if n > 0 || !rotated {
         return Ok(n);
     }
     match tokio::fs::File::open(path).await {
