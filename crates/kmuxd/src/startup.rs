@@ -260,6 +260,9 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     let handoff_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Spawn idle-shutdown watcher when configured.
+    if let Some(warning) = cfg.idle_shutdown_warning() {
+        warn!("{warning}");
+    }
     if cfg.idle_shutdown_secs > 0 {
         let idle_secs = cfg.idle_shutdown_secs;
         let mut count_rx = app.conn_count_rx();

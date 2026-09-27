@@ -840,8 +840,10 @@ idle_shutdown_secs = 300
 ```
 
 A `kmuxd.toml` written by an older daemon's first run pins `idle_shutdown_secs = 30`
-(the template serialized every default). Delete the line, or set it to `0`, to
-get the new behaviour.
+(the template serialized every default). Such files are not migrated; instead
+the daemon logs a warning at startup whenever idle shutdown is on. Delete the
+line, or set it to `0`, to get the new behaviour. Templates written from now on
+show every default commented out, so they pin nothing.
 
 ### Mechanism
 
