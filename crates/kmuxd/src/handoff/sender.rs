@@ -30,13 +30,18 @@ const SUCCESSOR_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 /// On `Ok(())` the handoff committed and `app` must not serve further (the
 /// caller releases sockets and exits). On `Err(_)` the handoff failed before the
 /// commit point and the daemon should resume normal operation.
+///
+/// Once the final checkpoint is written, `checkpointer` is consumed (left
+/// `None`); a failed final write puts it back.
 pub async fn run(
     app: &Arc<ServerApp>,
-    checkpointer: Option<&Arc<Checkpointer>>,
+    checkpointer: &mut Option<Checkpointer>,
 ) -> anyhow::Result<()> {
     // Without a checkpoint the successor has nothing to rebuild the panes
     // from; refuse before anything has started.
-    let checkpointer = checkpointer.context("no checkpoint path; cannot hand off")?;
+    if checkpointer.is_none() {
+        bail!("no checkpoint path; cannot hand off");
+    }
     let path = kmux_sys::dirs::handoff_socket_path()?;
     let _ = std::fs::remove_file(&path);
     let listener = UnixListener::bind(&path)
@@ -94,7 +99,7 @@ pub async fn run(
             // fresh one is on disk. Children are NOT kept alive — this degrades
             // to today's restart behavior.
             let state = app.checkpoint_state().await;
-            checkpointer.write_final_in_background(state).await?;
+            Checkpointer::write_final_from(checkpointer, state).await?;
             let _ = write_frame(&stream, &HandoffMessage::Released, None).await;
             return Ok(());
         }
@@ -145,7 +150,7 @@ pub async fn run(
     app.manager.set_all_keep_alive(true).await;
     app.quiesce_relays().await;
     let state = app.checkpoint_state().await;
-    checkpointer.write_final_in_background(state).await?;
+    Checkpointer::write_final_from(checkpointer, state).await?;
 
     // Tell the successor it may bind the control/data sockets; then we exit.
     let _ = write_frame(&stream, &HandoffMessage::Released, None).await;
