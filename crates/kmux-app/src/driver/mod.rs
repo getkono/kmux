@@ -1313,6 +1313,13 @@ mod tests {
 
         assert!(matches!(driver.mode, Mode::Normal));
         assert_eq!(driver.reconnect.attempt(), Some(2));
+        assert!(
+            matches!(
+                driver.mgr.connection_state(),
+                ConnectionState::Reconnecting { .. }
+            ),
+            "still reconnecting, not disconnected"
+        );
         assert_eq!(
             driver.reconnect.next_in(t0),
             Some(kmux_client::backoff::next_delay(1, 0))
@@ -1341,6 +1348,7 @@ mod tests {
 
         assert!(!driver.reconnect.is_active());
         assert!(matches!(driver.mode, Mode::Disconnected { .. }));
+        assert!(driver.mgr.connection_state().is_disconnected());
         assert_eq!(driver.outage.dropped(), 1);
         assert_eq!(driver.last_exit_error.as_deref(), Some("auth rejected"));
     }
@@ -1552,6 +1560,12 @@ mod tests {
         let _ = driver.tick();
         assert_eq!(driver.last_exit_error.as_deref(), Some("boom"));
         assert!(matches!(driver.mode, Mode::Disconnected { .. }));
+        assert!(matches!(
+            driver.mgr.connection_state(),
+            ConnectionState::Disconnected {
+                reason: DisconnectReason::BootstrapFailed(reason)
+            } if reason == "boom"
+        ));
     }
 
     // ── Keyboard-triggered resume (issue #165) ───────────────────────────────

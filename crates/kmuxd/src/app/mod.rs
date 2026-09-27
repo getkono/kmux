@@ -1760,6 +1760,20 @@ mod tests {
         );
     }
 
+    /// A `last_seqno` the pane no longer retains the diffs after cannot be
+    /// replayed: the client is reset with a snapshot.
+    #[tokio::test]
+    async fn compute_replay_from_a_seqno_older_than_the_retained_diffs_resets() {
+        use super::attach::compute_replay;
+        use kmux_protocol::messages::SequenceNo;
+        let relay = make_relay(24, 80);
+        push_seqnos(&relay, 3..=5);
+        match compute_replay(&relay, Some(SequenceNo(1))) {
+            AttachResult::SyncReset(_, seqno) => assert_eq!(seqno, SequenceNo(5)),
+            other => panic!("expected SyncReset, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
     async fn compute_replay_delta_over_threshold_coalesces_to_syncreset() {
         use super::attach::{MAX_RESUME_DELTA_DIFFS, compute_replay};

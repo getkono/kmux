@@ -7,7 +7,10 @@
 //!   variant exactly once, and nothing else;
 //! - the timing table lists every constant in [`crate::timing`], with its
 //!   value;
-//! - every test a state table says pins a transition exists.
+//! - every test a state table says pins a transition exists, as a test.
+//!
+//! What a row claims — the answer, the ordering, that a named test asserts
+//! the transition — is prose, held to the code by review.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -179,8 +182,29 @@ fn the_timing_table_is_the_timing_module() {
     );
 }
 
-/// Every `fn name` defined anywhere under `crates/`.
-fn functions_in_the_workspace() -> BTreeSet<String> {
+/// The list above is every `pub const` in `timing.rs`, so a constant added
+/// there fails until it is listed — and so documented.
+#[test]
+fn the_timing_list_is_every_constant_in_the_module() {
+    let declared: BTreeSet<String> = include_str!("timing.rs")
+        .lines()
+        .filter_map(|line| line.strip_prefix("pub const "))
+        .filter_map(|rest| {
+            rest.split_once(':')
+                .map(|(name, _)| name.trim().to_string())
+        })
+        .collect();
+    let listed: BTreeSet<String> = timing_constants()
+        .into_iter()
+        .map(|(name, _)| name.to_string())
+        .collect();
+    assert_eq!(declared, listed);
+}
+
+/// Every test function under `crates/`: an `fn` whose item carries a
+/// `#[test]` or `#[tokio::test…]` attribute (doc comments and further
+/// attributes may sit between the two).
+fn tests_in_the_workspace() -> BTreeSet<String> {
     fn walk(dir: &Path, out: &mut BTreeSet<String>) {
         for entry in std::fs::read_dir(dir).expect("readable source tree") {
             let path: PathBuf = entry.expect("dir entry").path();
@@ -188,13 +212,23 @@ fn functions_in_the_workspace() -> BTreeSet<String> {
                 walk(&path, out);
             } else if path.extension().is_some_and(|ext| ext == "rs") {
                 let source = std::fs::read_to_string(&path).expect("readable source");
-                for rest in source.split("fn ").skip(1) {
-                    let name: String = rest
-                        .chars()
-                        .take_while(|c| c.is_alphanumeric() || *c == '_')
-                        .collect();
-                    if !name.is_empty() {
+                let mut in_test_item = false;
+                for line in source.lines().map(str::trim_start) {
+                    if line.starts_with("#[test]") || line.starts_with("#[tokio::test") {
+                        in_test_item = true;
+                    } else if in_test_item
+                        && let Some(rest) = line
+                            .strip_prefix("async fn ")
+                            .or_else(|| line.strip_prefix("fn "))
+                    {
+                        let name: String = rest
+                            .chars()
+                            .take_while(|c| c.is_alphanumeric() || *c == '_')
+                            .collect();
                         out.insert(name);
+                        in_test_item = false;
+                    } else if !(line.starts_with("#[") || line.starts_with("///")) {
+                        in_test_item = false;
                     }
                 }
             }
@@ -208,7 +242,7 @@ fn functions_in_the_workspace() -> BTreeSet<String> {
 
 #[test]
 fn every_test_a_state_table_names_exists() {
-    let defined = functions_in_the_workspace();
+    let defined = tests_in_the_workspace();
     let tables: Vec<&str> = SPEC
         .split("<!-- spec:")
         .skip(1)
@@ -227,7 +261,7 @@ fn every_test_a_state_table_names_exists() {
             for test in tests {
                 assert!(
                     defined.contains(test),
-                    "{name}: `{test}` is not a function in crates/"
+                    "{name}: `{test}` is not a test in crates/"
                 );
             }
         }
