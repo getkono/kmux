@@ -1166,6 +1166,83 @@ impl ServerApp {
 }
 
 #[cfg(test)]
+pub(super) mod fixtures {
+    //! Relays built by hand for the app's unit tests (docs/testing.md R5).
+
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Arc, Mutex};
+
+    use kmux_protocol::messages::TermSize;
+
+    use super::{PaneRelay, SCROLLBACK_CAPACITY};
+    use crate::scrollback::DiffBuffer;
+
+    /// A pane relay of `rows` × `cols` with no child behind it.
+    pub(super) fn fixture_relay(rows: u16, cols: u16) -> PaneRelay {
+        use kmux_pty::session::PtyWriter;
+        use std::sync::atomic::AtomicBool;
+        let term_state = crate::fixtures::fixture_term_state(rows, cols);
+        let kitty_graphics_enabled = Arc::new(AtomicBool::new(false));
+        let kitty_keyboard_enabled = Arc::new(AtomicBool::new(false));
+        PaneRelay {
+            clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
+            engine: crate::engine::PaneEngine::InProcess(crate::engine::InProcessEngine::new(
+                "test/0".to_string(),
+                term_state,
+                PtyWriter::sink().unwrap(),
+                tokio::task::spawn(async {}),
+                crate::engine::hold::channel().0,
+                crate::engine::pty_response_channel().1,
+            )),
+            program: "/bin/sh".to_string(),
+            args: vec![],
+            size: TermSize {
+                rows,
+                cols,
+                pixel_width: 0,
+                pixel_height: 0,
+            },
+            scrollback: Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY))),
+            seqno_counter: Arc::new(AtomicU64::new(1)),
+            input_mode: kmux_protocol::messages::InputMode::Open,
+            status: kmux_protocol::messages::SessionStatus::Running,
+            kitty_graphics_enabled,
+            kitty_keyboard_enabled,
+            title: Arc::new(Mutex::new(String::new())),
+            progress: Arc::new(Mutex::new(super::PaneProgress::default())),
+        }
+    }
+
+    /// Buffer diffs `range` as if the pane had produced them: the seqno
+    /// counter moves past the last one, as the relay's would.
+    pub(super) fn push_seqnos(relay: &PaneRelay, range: std::ops::RangeInclusive<u64>) {
+        use kmux_protocol::messages::{
+            CellState, CursorState, DiffOp, SequenceNo, TermModes, TerminalDiff,
+        };
+        relay
+            .seqno_counter
+            .store(range.end() + 1, Ordering::Relaxed);
+        let mut buf = relay.scrollback.lock().unwrap();
+        for n in range {
+            buf.push(
+                SequenceNo(n),
+                Arc::new(TerminalDiff {
+                    ops: vec![DiffOp::Cell {
+                        row: 0,
+                        col: 0,
+                        cell: CellState::default(),
+                    }],
+                    cursor: CursorState::default(),
+                    modes: TermModes::EMPTY,
+                    history_total: 0,
+                    scrollback_reset: None,
+                }),
+            );
+        }
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::Ordering;
@@ -1407,13 +1484,12 @@ mod tests {
     // ─── Size negotiation unit tests ──────────────────────────────────────────
 
     use kmux_protocol::messages::{ClientCapabilities, ClientId, TermSize};
-    use std::sync::Mutex;
     use std::sync::atomic::AtomicU64;
     use tokio::sync::mpsc;
 
+    use super::fixtures::{fixture_relay, push_seqnos};
     use super::{AttachParams, AttachResult, SessionState};
-    use crate::app::{ClientSender, PaneRelay, SCROLLBACK_CAPACITY};
-    use crate::scrollback::DiffBuffer;
+    use crate::app::ClientSender;
 
     fn make_client(rows: u16, cols: u16) -> (ClientId, ClientSender) {
         let (data_tx, _data_rx) = mpsc::channel::<kmux_protocol::messages::ServerMessage>(16);
@@ -1437,44 +1513,9 @@ mod tests {
         (id, sender)
     }
 
-    fn make_relay(rows: u16, cols: u16) -> PaneRelay {
-        use kmux_pty::session::PtyWriter;
-        use std::sync::atomic::AtomicBool;
-        let term_state = crate::fixtures::fixture_term_state(rows, cols);
-        let kitty_graphics_enabled = Arc::new(AtomicBool::new(false));
-        let kitty_keyboard_enabled = Arc::new(AtomicBool::new(false));
-        PaneRelay {
-            clients: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            engine: crate::engine::PaneEngine::InProcess(crate::engine::InProcessEngine::new(
-                "test/0".to_string(),
-                term_state,
-                PtyWriter::sink().unwrap(),
-                tokio::task::spawn(async {}),
-                crate::engine::hold::channel().0,
-                crate::engine::pty_response_channel().1,
-            )),
-            program: "/bin/sh".to_string(),
-            args: vec![],
-            size: TermSize {
-                rows,
-                cols,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            scrollback: Arc::new(Mutex::new(DiffBuffer::new(SCROLLBACK_CAPACITY))),
-            seqno_counter: Arc::new(AtomicU64::new(1)),
-            input_mode: kmux_protocol::messages::InputMode::Open,
-            status: kmux_protocol::messages::SessionStatus::Running,
-            kitty_graphics_enabled,
-            kitty_keyboard_enabled,
-            title: Arc::new(Mutex::new(String::new())),
-            progress: Arc::new(Mutex::new(super::PaneProgress::default())),
-        }
-    }
-
     #[tokio::test]
     async fn effective_size_min_wins() {
-        let relay = make_relay(24, 80);
+        let relay = fixture_relay(24, 80);
         let (id_a, sender_a) = make_client(24, 80);
         let (id_b, sender_b) = make_client(40, 120);
         relay.clients.lock().unwrap().insert(id_a, sender_a);
@@ -1487,13 +1528,13 @@ mod tests {
 
     #[tokio::test]
     async fn effective_size_no_clients_returns_none() {
-        let relay = make_relay(24, 80);
+        let relay = fixture_relay(24, 80);
         assert!(relay.effective_size().is_none());
     }
 
     #[tokio::test]
     async fn apply_effective_size_returns_none_when_unchanged() {
-        let mut relay = make_relay(24, 80);
+        let mut relay = fixture_relay(24, 80);
         let (id, sender) = make_client(24, 80);
         relay.clients.lock().unwrap().insert(id, sender);
         // effective == current → no resize
@@ -1502,7 +1543,7 @@ mod tests {
 
     #[tokio::test]
     async fn apply_effective_size_resizes_emulator_when_changed() {
-        let mut relay = make_relay(24, 80);
+        let mut relay = fixture_relay(24, 80);
         let (id, sender) = make_client(40, 120);
         relay.clients.lock().unwrap().insert(id, sender);
         // effective (40×120) differs from relay.size (24×80)
@@ -1515,7 +1556,7 @@ mod tests {
 
     #[tokio::test]
     async fn detach_keeps_last_effective_size() {
-        let mut relay = make_relay(80, 200);
+        let mut relay = fixture_relay(80, 200);
         let (id_a, sender_a) = make_client(24, 80);
         let (id_b, sender_b) = make_client(40, 120);
         relay.clients.lock().unwrap().insert(id_a, sender_a);
@@ -1539,7 +1580,7 @@ mod tests {
             CursorState, SequenceNo, ServerMessage, SessionEventMsg, TermModes, TerminalDiff,
         };
 
-        let mut relay = make_relay(24, 80);
+        let mut relay = fixture_relay(24, 80);
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
         let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
         let id = ClientId(1);
@@ -1620,7 +1661,7 @@ mod tests {
     async fn paused_client_still_counts_toward_effective_size() {
         // Pausing must never reflow the PTY for other clients: a paused client
         // keeps constraining the smallest-wins effective size (issue #68).
-        let relay = make_relay(80, 200);
+        let relay = fixture_relay(80, 200);
         let (id_paused, mut sender_paused) = make_client(24, 80);
         sender_paused.paused = true;
         let (id_active, sender_active) = make_client(40, 120);
@@ -1644,7 +1685,7 @@ mod tests {
     async fn broadcast_resize_skips_paused_client() {
         use kmux_protocol::messages::ServerMessage;
 
-        let mut relay = make_relay(24, 80);
+        let mut relay = fixture_relay(24, 80);
         let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
         let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
         relay.clients.lock().unwrap().insert(
@@ -1682,117 +1723,10 @@ mod tests {
 
     // ─── Resume reconciliation (issue #68) ────────────────────────────────────
 
-    /// Buffer diffs `range` as if the pane had produced them: the seqno
-    /// counter moves past the last one, as the relay's would.
-    fn push_seqnos(relay: &PaneRelay, range: std::ops::RangeInclusive<u64>) {
-        use kmux_protocol::messages::{
-            CellState, CursorState, DiffOp, SequenceNo, TermModes, TerminalDiff,
-        };
-        relay
-            .seqno_counter
-            .store(range.end() + 1, Ordering::Relaxed);
-        let mut buf = relay.scrollback.lock().unwrap();
-        for n in range {
-            buf.push(
-                SequenceNo(n),
-                Arc::new(TerminalDiff {
-                    ops: vec![DiffOp::Cell {
-                        row: 0,
-                        col: 0,
-                        cell: CellState::default(),
-                    }],
-                    cursor: CursorState::default(),
-                    modes: TermModes::EMPTY,
-                    history_total: 0,
-                    scrollback_reset: None,
-                }),
-            );
-        }
-    }
-
-    #[tokio::test]
-    async fn compute_replay_fresh_attach_returns_full_snapshot() {
-        use super::attach::compute_replay;
-        let relay = make_relay(24, 80);
-        assert!(matches!(
-            compute_replay(&relay, None),
-            AttachResult::FullSnapshot(..)
-        ));
-    }
-
-    #[tokio::test]
-    async fn compute_replay_delta_under_threshold_returns_delta() {
-        use super::attach::compute_replay;
-        use kmux_protocol::messages::SequenceNo;
-        let relay = make_relay(24, 80);
-        push_seqnos(&relay, 1..=5);
-        match compute_replay(&relay, Some(SequenceNo(1))) {
-            AttachResult::Delta(diffs) => {
-                let seqs: Vec<u64> = diffs.iter().map(|(s, _)| s.0).collect();
-                assert_eq!(
-                    seqs,
-                    vec![2, 3, 4, 5],
-                    "replays only diffs after last_seqno"
-                );
-            }
-            other => panic!("expected Delta, got a different variant: {other:?}"),
-        }
-    }
-
-    /// A `last_seqno` past anything this pane produced was issued by another
-    /// daemon run (a client that predates the run check, or a stale one): a
-    /// delta from it would be empty and leave the client showing the old
-    /// run's screen, so it is answered with a fresh snapshot.
-    #[tokio::test]
-    async fn compute_replay_from_a_seqno_this_pane_never_reached_resets() {
-        use super::attach::compute_replay;
-        use kmux_protocol::messages::SequenceNo;
-        let relay = make_relay(24, 80);
-        push_seqnos(&relay, 1..=5);
-        match compute_replay(&relay, Some(SequenceNo(6))) {
-            AttachResult::SyncReset(_, seqno) => assert_eq!(seqno, SequenceNo(5)),
-            other => panic!("expected SyncReset, got {other:?}"),
-        }
-        assert!(
-            matches!(
-                compute_replay(&relay, Some(SequenceNo(5))),
-                AttachResult::Delta(diffs) if diffs.is_empty()
-            ),
-            "the current seqno itself is in step: nothing to replay"
-        );
-    }
-
-    /// A `last_seqno` the pane no longer retains the diffs after cannot be
-    /// replayed: the client is reset with a snapshot.
-    #[tokio::test]
-    async fn compute_replay_from_a_seqno_older_than_the_retained_diffs_resets() {
-        use super::attach::compute_replay;
-        use kmux_protocol::messages::SequenceNo;
-        let relay = make_relay(24, 80);
-        push_seqnos(&relay, 3..=5);
-        match compute_replay(&relay, Some(SequenceNo(1))) {
-            AttachResult::SyncReset(_, seqno) => assert_eq!(seqno, SequenceNo(5)),
-            other => panic!("expected SyncReset, got {other:?}"),
-        }
-    }
-
-    #[tokio::test]
-    async fn compute_replay_delta_over_threshold_coalesces_to_syncreset() {
-        use super::attach::{MAX_RESUME_DELTA_DIFFS, compute_replay};
-        use kmux_protocol::messages::SequenceNo;
-        let relay = make_relay(24, 80);
-        // More buffered diffs than the coalescing threshold allows to replay.
-        push_seqnos(&relay, 1..=(MAX_RESUME_DELTA_DIFFS as u64 + 50));
-        assert!(matches!(
-            compute_replay(&relay, Some(SequenceNo(1))),
-            AttachResult::SyncReset(..)
-        ));
-    }
-
     async fn app_with_one_pane(word: &str) -> ServerApp {
         use kmux_protocol::messages::SessionMeta;
         let app = crate::fixtures::fixture_app();
-        let relay = make_relay(24, 80);
+        let relay = fixture_relay(24, 80);
         let session = SessionState {
             meta: SessionMeta {
                 index: 0,
