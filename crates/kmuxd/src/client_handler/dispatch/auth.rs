@@ -251,6 +251,31 @@ pub(super) fn on_channel_ready(state: &mut SharedClientState) {
 mod tests {
     use super::super::testing::*;
 
+    /// A channel that resumes a connection holds the bumped generation, so
+    /// its own teardown later releases the registration; the channel it
+    /// superseded holds the old one (issue #208).
+    #[tokio::test]
+    async fn a_resuming_channel_holds_the_bumped_generation() {
+        let app = Arc::new(fixture_app());
+        let identity = kmux_sys::identity::Identity::generate();
+        let (mut first, _c1, _r1) = fixture_client_state(Arc::clone(&app), TransportKind::Tcp);
+        authenticate_as(&mut first, &identity, protocol_capabilities(), None).await;
+        let (mut second, _c2, _r2) = fixture_client_state(Arc::clone(&app), TransportKind::Quic);
+        authenticate_as(
+            &mut second,
+            &identity,
+            protocol_capabilities(),
+            first.connection_id,
+        )
+        .await;
+
+        assert_eq!(first.generation, 0);
+        assert_eq!(second.generation, 1);
+        assert_eq!(second.connection_id, first.connection_id);
+        assert_eq!(second.client_id, first.client_id);
+        assert_eq!(second.pending_swap_from, Some(TransportKind::Tcp));
+    }
+
     /// With `mode = always`, a networked transport negotiates zstd: the auth
     /// handler flips the shared toggle and advertises it in `AuthResult`.
     #[tokio::test]

@@ -229,12 +229,12 @@ impl OutboundTx {
         }
     }
 
-    /// Whether the writer has stopped.
     /// Whether `other` feeds the same queue — the same connection's channel.
     pub fn same_channel(&self, other: &Self) -> bool {
         self.tx.same_channel(&other.tx)
     }
 
+    /// Whether the writer has stopped.
     pub fn is_closed(&self) -> bool {
         self.tx.is_closed()
     }

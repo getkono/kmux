@@ -13,11 +13,11 @@ pub const RESYNC_REQUEST_ID: RequestId = RequestId::MAX;
 ///
 /// Survives transport switches: when a client re-authenticates on a new channel
 /// (QUIC ↔ TCP), or reconnects while the daemon still holds the old channel, it
-/// passes its `ConnectionId` and keeps its registration — label, client id and
-/// input locks — provided it proves the same identity (`machine_id`) the
-/// connection was registered with (issue #208). Pane streams do not move by
-/// themselves: the client re-attaches each pane with its `last_seqno` and is
-/// sent what it missed.
+/// passes its `ConnectionId` and keeps its registration — client id and label —
+/// provided it proves the same identity (`machine_id`) the connection was
+/// registered with (issue #208). Pane streams do not move by themselves: a
+/// client re-attaches each pane, with its `last_seqno` to be sent only what it
+/// missed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConnectionId(pub u64);
 
