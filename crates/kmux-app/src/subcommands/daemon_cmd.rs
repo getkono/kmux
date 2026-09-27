@@ -131,37 +131,9 @@ pub async fn run_daemon_command(action: DaemonAction) -> anyhow::Result<()> {
             // to a hard stop-then-respawn against a daemon too old to support it.
             match kmux_client::daemon::restart_daemon().await {
                 Ok(RestartReply::Accepted { attempt }) => {
-                    // Wait for the successor (a distinct PID) to take over, or
-                    // for the daemon to report that the handoff stood down.
-                    let deadline = tokio::time::Instant::now() + handoff_timeouts::RESTART_WAIT;
-                    loop {
-                        tokio::time::sleep(Duration::from_millis(150)).await;
-                        if let Some(s) = kmux_client::daemon::query_daemon().await
-                            && s.pid != old_pid
-                        {
-                            println!(
-                                "Daemon restarted (live handoff) — PID {}, port {}",
-                                s.pid, s.port
-                            );
-                            return Ok(());
-                        }
-                        let report = kmux_client::daemon::query_handoff().await.ok();
-                        if let Some(why) = report.as_ref().and_then(|r| stood_down(r, attempt)) {
-                            anyhow::bail!(
-                                "handoff stood down: {why}. The previous daemon (PID {old_pid}) \
-                                 kept serving; running shells are intact.{}",
-                                kmux_client::daemon::boot_log_hint()
-                            );
-                        }
-                        if tokio::time::Instant::now() >= deadline {
-                            anyhow::bail!(
-                                "timed out waiting for the successor daemon to take over. \
-                                 The previous daemon (PID {old_pid}) kept serving; running \
-                                 shells are intact.{}",
-                                kmux_client::daemon::boot_log_hint()
-                            );
-                        }
-                    }
+                    let probe = || probe_takeover(old_pid, attempt);
+                    let ended = wait_for_takeover(old_pid, attempt, probe, TAKEOVER_POLL).await;
+                    report_takeover(ended, old_pid)?;
                 }
                 Ok(RestartReply::Busy) => {
                     anyhow::bail!("a restart is already in progress");
@@ -486,6 +458,130 @@ async fn query_pane_processes(
     }
 }
 
+/// How often `kmux daemon restart` looks for the handoff's outcome.
+const TAKEOVER_POLL: Duration = Duration::from_millis(150);
+
+/// How long neither daemon may answer, with the old one gone, before a
+/// restart is taken to have stopped the daemon rather than handed it off: the
+/// successor answers once it has restored the sessions.
+const STOPPED_GRACE: Duration = Duration::from_secs(10);
+
+/// How long a restart waits on a daemon that does not report its handoffs
+/// (it predates the `handoff` control command).
+const LEGACY_RESTART_WAIT: Duration = Duration::from_secs(15);
+
+/// What one look at the restart's progress found.
+#[derive(Debug, Clone, Default)]
+struct TakeoverProbe {
+    /// The daemon answering the control socket: its pid and port.
+    daemon: Option<(u32, u16)>,
+    /// The daemon's report on its handoffs, when asked and answered.
+    report: Option<HandoffReport>,
+    /// Whether the daemon that was asked to restart is still running.
+    old_alive: bool,
+}
+
+/// How a graceful restart ended, as `kmux daemon restart` sees it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Takeover {
+    /// A successor answers: this pid and port.
+    HandedOff(u32, u16),
+    /// The handoff stood down, for this reason; the old daemon serves on.
+    StoodDown(String),
+    /// The old daemon is gone and nothing answers: it stopped mid-handoff.
+    Stopped,
+    /// Neither happened in time.
+    TimedOut,
+}
+
+/// Look at the restart's progress: who answers, how handoff `attempt`
+/// stands (only asked of a daemon that numbers its handoffs), and whether
+/// the old daemon `old_pid` runs.
+async fn probe_takeover(old_pid: u32, attempt: u64) -> TakeoverProbe {
+    let daemon = kmux_client::daemon::query_daemon()
+        .await
+        .map(|s| (s.pid, s.port));
+    let report = if attempt == 0 {
+        None
+    } else {
+        kmux_client::daemon::query_handoff().await.ok()
+    };
+    TakeoverProbe {
+        daemon,
+        report,
+        old_alive: kmux_client::daemon::pid_alive(old_pid),
+    }
+}
+
+/// Poll `probe` every `every` until a successor answers in place of
+/// `old_pid`, handoff `attempt` stood down, or the old daemon stopped with
+/// nothing taking over — or give up after `RESTART_WAIT` (`LEGACY_RESTART_WAIT`
+/// for a daemon that does not number its handoffs).
+async fn wait_for_takeover<F>(
+    old_pid: u32,
+    attempt: u64,
+    mut probe: impl FnMut() -> F,
+    every: Duration,
+) -> Takeover
+where
+    F: Future<Output = TakeoverProbe>,
+{
+    let start = tokio::time::Instant::now();
+    let wait = if attempt == 0 {
+        LEGACY_RESTART_WAIT
+    } else {
+        handoff_timeouts::RESTART_WAIT
+    };
+    let mut unanswered_since = None;
+    loop {
+        tokio::time::sleep(every).await;
+        let seen = probe().await;
+        let now = tokio::time::Instant::now();
+        match seen.daemon {
+            Some((pid, port)) if pid != old_pid => return Takeover::HandedOff(pid, port),
+            None if !seen.old_alive => {
+                let since = *unanswered_since.get_or_insert(now);
+                if now.duration_since(since) >= STOPPED_GRACE {
+                    return Takeover::Stopped;
+                }
+            }
+            _ => unanswered_since = None,
+        }
+        if let Some(why) = seen.report.as_ref().and_then(|r| stood_down(r, attempt)) {
+            return Takeover::StoodDown(why.to_string());
+        }
+        if now.duration_since(start) >= wait {
+            return Takeover::TimedOut;
+        }
+    }
+}
+
+/// Tell the user how a graceful restart of the daemon `old_pid` `ended`.
+fn report_takeover(ended: Takeover, old_pid: u32) -> anyhow::Result<()> {
+    let hint = kmux_client::daemon::boot_log_hint;
+    match ended {
+        Takeover::HandedOff(pid, port) => {
+            println!("Daemon restarted (live handoff) — PID {pid}, port {port}");
+            Ok(())
+        }
+        Takeover::StoodDown(why) => anyhow::bail!(
+            "handoff stood down: {why}. The previous daemon (PID {old_pid}) kept serving; \
+             running shells are intact.{}",
+            hint()
+        ),
+        Takeover::Stopped => anyhow::bail!(
+            "the daemon (PID {old_pid}) stopped during the handoff and no successor took \
+             over; run `kmux daemon start`.{}",
+            hint()
+        ),
+        Takeover::TimedOut => anyhow::bail!(
+            "timed out waiting for the successor daemon to take over. The previous daemon \
+             (PID {old_pid}) kept serving; running shells are intact.{}",
+            hint()
+        ),
+    }
+}
+
 /// Why handoff number `attempt` stood down, once `report` says it has: it is
 /// that handoff (a daemon that does not number them reports none), it ended,
 /// and it rolled back.
@@ -503,7 +599,103 @@ mod tests {
     use kmux_protocol::{decode_client, encode_server, read_frame, write_frame};
     use tokio::io::{AsyncWriteExt, DuplexStream, ReadHalf, WriteHalf};
 
-    use super::{stood_down, stream_logs};
+    use super::{
+        STOPPED_GRACE, Takeover, TakeoverProbe, report_takeover, stood_down, stream_logs,
+        wait_for_takeover,
+    };
+
+    /// A scripted sequence of probes, the last repeated forever.
+    fn script(probes: Vec<TakeoverProbe>) -> impl FnMut() -> std::future::Ready<TakeoverProbe> {
+        let mut probes = probes.into_iter().peekable();
+        let mut last = TakeoverProbe::default();
+        move || {
+            if let Some(next) = probes.next() {
+                last = next;
+            }
+            std::future::ready(last.clone())
+        }
+    }
+
+    /// The old daemon's pid; the script says whether it runs.
+    const OLD: u32 = 4242;
+
+    fn serving(pid: u32, alive: bool) -> TakeoverProbe {
+        TakeoverProbe {
+            daemon: Some((pid, 7)),
+            report: None,
+            old_alive: alive,
+        }
+    }
+
+    /// A restart ends when a successor answers, when its handoff stood down,
+    /// or — a daemon that numbers no handoffs — after the legacy wait.
+    #[tokio::test(start_paused = true)]
+    async fn a_restart_ends_on_a_successor_or_a_stand_down() {
+        let every = std::time::Duration::from_millis(100);
+        let took = wait_for_takeover(
+            OLD,
+            3,
+            script(vec![serving(OLD, true), serving(9, false)]),
+            every,
+        )
+        .await;
+        assert_eq!(took, Takeover::HandedOff(9, 7));
+
+        let mut rolled_back = serving(OLD, true);
+        rolled_back.report = Some(HandoffReport {
+            attempt: 3,
+            in_progress: false,
+            stood_down: Some("no Ack".into()),
+        });
+        let ended = wait_for_takeover(OLD, 3, script(vec![rolled_back]), every).await;
+        assert_eq!(ended, Takeover::StoodDown("no Ack".into()));
+
+        let started = tokio::time::Instant::now();
+        let ended = wait_for_takeover(OLD, 0, script(vec![serving(OLD, true)]), every).await;
+        assert_eq!(ended, Takeover::TimedOut);
+        // Exactly: the wait ends on the first look at or past its bound.
+        assert_eq!(started.elapsed(), super::LEGACY_RESTART_WAIT);
+    }
+
+    /// With the old daemon gone and nothing answering for the grace period,
+    /// the restart stopped the daemon; a successor that answers within it is
+    /// a handoff, not a stop.
+    #[tokio::test(start_paused = true)]
+    async fn a_daemon_gone_with_no_successor_stopped() {
+        let every = std::time::Duration::from_millis(100);
+        let gone = TakeoverProbe::default();
+        let started = tokio::time::Instant::now();
+        let ended = wait_for_takeover(OLD, 3, script(vec![gone.clone()]), every).await;
+        assert_eq!(ended, Takeover::Stopped);
+        // Unanswered from the first look, and stopped on the first look a
+        // whole grace period later.
+        assert_eq!(started.elapsed(), every + STOPPED_GRACE);
+
+        let mut late = vec![gone.clone(); 20];
+        late.push(serving(9, false));
+        let ended = wait_for_takeover(OLD, 3, script(late), every).await;
+        assert_eq!(ended, Takeover::HandedOff(9, 7));
+
+        let started = tokio::time::Instant::now();
+        let ended = wait_for_takeover(OLD, 3, script(vec![serving(OLD, true)]), every).await;
+        assert_eq!(ended, Takeover::TimedOut);
+        assert_eq!(
+            started.elapsed(),
+            kmux_protocol::control_rpc::handoff_timeouts::RESTART_WAIT
+        );
+    }
+
+    /// Only a handoff is reported as success; each other end says why.
+    #[test]
+    fn a_takeover_is_reported_by_how_it_ended() {
+        assert!(report_takeover(Takeover::HandedOff(9, 7), OLD).is_ok());
+        let said = |ended| report_takeover(ended, OLD).unwrap_err().to_string();
+        assert!(
+            said(Takeover::StoodDown("no Ack".into())).starts_with("handoff stood down: no Ack")
+        );
+        assert!(said(Takeover::Stopped).contains("stopped during the handoff"));
+        assert!(said(Takeover::TimedOut).contains("timed out"));
+    }
 
     /// `kmux daemon restart` reports a stand-down only for its own handoff,
     /// once that handoff has ended, and only when the daemon numbers them.

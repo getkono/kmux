@@ -332,10 +332,12 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
             let pid_path = kmux_sys::dirs::pid_path()?;
             tokio::spawn(async move {
                 if let Some(pid) = predecessor {
-                    let deadline = Instant::now() + handoff_timeouts::PID_FILE_CLAIM;
-                    while nix::sys::signal::kill(pid, None).is_ok() && Instant::now() < deadline {
-                        tokio::time::sleep(handoff_timeouts::PREDECESSOR_POLL).await;
-                    }
+                    let alive = move || nix::sys::signal::kill(pid, None).is_ok();
+                    crate::handoff::receiver::exits_within(
+                        &alive,
+                        handoff_timeouts::PID_FILE_CLAIM,
+                    )
+                    .await;
                 }
                 match std::fs::write(&pid_path, std::process::id().to_string()) {
                     Ok(()) => info!("claimed pid file after predecessor exit"),
@@ -661,11 +663,17 @@ mod tests {
     #[tokio::test]
     async fn a_stopped_handoff_rolls_back_unless_it_had_committed() {
         let app = crate::fixtures::fixture_app();
-        let settled = fixture_handoff(until_cancelled, false).stop(&app).await;
+        let guard = Duration::from_secs(10);
+        let stop = |committed| fixture_handoff(until_cancelled, committed).stop(&app);
+        let settled = tokio::time::timeout(guard, stop(false))
+            .await
+            .expect("the signal stops it");
         let why = settled.rolled_back.expect("rolled back");
         assert!(why.contains("shutting down"), "{why}");
 
-        let settled = fixture_handoff(until_cancelled, true).stop(&app).await;
+        let settled = tokio::time::timeout(guard, stop(true))
+            .await
+            .expect("the signal stops it");
         assert!(settled.rolled_back.is_none(), "committed: handed over");
     }
 
