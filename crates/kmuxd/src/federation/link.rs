@@ -232,15 +232,15 @@ pub(super) enum LinkEnd {
 }
 
 /// Run the link to `peer_id` over `server_rx` for as long as the peer is
-/// open: feed it, and re-open it with `connector` whenever it drops.
+/// open: feed it, and re-open it with the connection's connector whenever it
+/// drops.
 pub(super) fn spawn_link(
     app: Weak<ServerApp>,
     conn: Arc<Mutex<PeerConnection>>,
     peer_id: PeerId,
     server_rx: mpsc::UnboundedReceiver<ServerMessage>,
-    connector: Connector,
 ) -> JoinHandle<()> {
-    tokio::spawn(run_link(app, conn, peer_id, server_rx, connector))
+    tokio::spawn(run_link(app, conn, peer_id, server_rx))
 }
 
 async fn run_link(
@@ -248,14 +248,13 @@ async fn run_link(
     conn: Arc<Mutex<PeerConnection>>,
     peer_id: PeerId,
     mut server_rx: mpsc::UnboundedReceiver<ServerMessage>,
-    connector: Connector,
 ) {
     loop {
         let end = feed::feed(&app, &conn, &peer_id, &mut server_rx).await;
         warn!(%peer_id, ?end, "federation link down; the peer is unreachable");
         link_down(&conn);
         broadcast_sessions(&app).await;
-        let upstream = reopen(&peer_id, &connector).await;
+        let upstream = reopen(&peer_id, &conn).await;
         let Some(app_now) = app.upgrade() else {
             return;
         };
@@ -280,14 +279,21 @@ pub(super) fn link_down(conn: &Mutex<PeerConnection>) {
     guard.pending_acks.clear();
 }
 
-/// Retry `connector` with backoff until it opens a link. Closing the peer
-/// (by the user, or the daemon shutting down) aborts the link task, and with
-/// it this loop.
-async fn reopen(peer_id: &str, connector: &Connector) -> Upstream {
+/// Retry `conn`'s connector with backoff until it opens a link, reading it
+/// afresh each attempt (a reopen may have re-targeted the peer). Closing the
+/// peer (by the user, or the daemon shutting down) aborts the link task, and
+/// with it this loop.
+async fn reopen(peer_id: &str, conn: &Mutex<PeerConnection>) -> Upstream {
     let seed = jitter_seed();
     let mut attempt = 0;
     loop {
         tokio::time::sleep(next_delay(attempt, seed)).await;
+        let connector = Arc::clone(
+            &conn
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .connector,
+        );
         match connector().await {
             Ok(upstream) => return upstream,
             Err(e) => warn!(%peer_id, attempt, "re-opening the federation link failed: {e}"),
@@ -528,11 +534,12 @@ mod tests {
     }
 
     /// A peer that keeps talking is never called unreachable: every frame
-    /// resets the deadline.
+    /// resets the deadline. Each ping carries the next sequence number.
     #[tokio::test(start_paused = true)]
     async fn a_peer_that_answers_stays_reachable() {
         let app = Arc::new(fixture_app());
         let (mut upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let mut seqs = Vec::new();
         for _ in 0..5 {
             let seq = next_upstream(&mut upstream, |m| match m {
                 ClientMessage::Ping { seq } => Some(*seq),
@@ -540,7 +547,9 @@ mod tests {
             })
             .await;
             peer.send(ServerMessage::Pong { seq }).unwrap();
+            seqs.push(seq);
         }
+        assert_eq!(seqs, vec![0, 1, 2, 3, 4]);
         let listed = app.list_federated_sessions();
         assert!(!listed[0].peer_unreachable);
     }

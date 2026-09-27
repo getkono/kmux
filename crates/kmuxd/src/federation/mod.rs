@@ -300,11 +300,16 @@ struct PeerConnection {
     /// re-opened (issue #208). Its sessions stay listed, flagged
     /// `peer_unreachable`, and requests for them fail at once.
     dead: bool,
+    /// How the link is re-opened when it drops. Read afresh on every attempt,
+    /// so re-opening an unreachable peer with a new target (a Direct peer's
+    /// rotated token) takes effect on the next attempt (issue #208).
+    connector: link::Connector,
 }
 
 impl PeerConnection {
-    fn new(client_tx: mpsc::UnboundedSender<ClientMessage>) -> Self {
+    fn new(client_tx: mpsc::UnboundedSender<ClientMessage>, connector: link::Connector) -> Self {
         Self {
+            connector,
             client_tx,
             remote_to_local: HashMap::new(),
             local_to_remote: HashMap::new(),
@@ -321,10 +326,12 @@ impl PeerConnection {
         }
     }
 
-    /// Re-attach every proxied pane that has viewers on a re-opened link
-    /// (issue #208), asking for a snapshot: the peer may be a new daemon run,
-    /// whose seqnos start over. The snapshot re-seeds the mirror and resyncs
-    /// every viewer.
+    /// Re-attach every proxied pane still held (those with a viewer, whose
+    /// session the peer still lists) on a re-opened link (issue #208), asking
+    /// for a snapshot: the peer may be a new daemon run, whose seqnos start
+    /// over. The snapshot re-seeds the mirror and is fanned out like any
+    /// frame, so it resyncs every streaming viewer; a paused one catches up
+    /// from the mirror when it resumes and re-attaches.
     fn reattach_panes(&self) {
         for (local_pane, pane) in &self.panes {
             let Some((local_word, idx)) = parse_pane_id(local_pane) else {
@@ -466,21 +473,38 @@ impl PeerManager {
         Self::default()
     }
 
+    /// Whether `peer_id` is open already, so [`Self::open_peer`] reuses it. An
+    /// unreachable one is re-opened with `target` from its next attempt on:
+    /// the peer may be back under a new token (issue #208).
+    fn reuse_peer(&self, peer_id: &str, target: &PeerTarget) -> bool {
+        let Some(conn) = self.peers.lock().unwrap().get(peer_id).cloned() else {
+            return false;
+        };
+        let retargeted = {
+            let mut guard = lock(&conn);
+            if guard.dead {
+                guard.connector = link::connector_for(target.clone());
+            }
+            guard.dead
+        };
+        debug!(%peer_id, retargeted, "reusing an open peer connection");
+        true
+    }
+
     /// Ensure an upstream connection to `target` exists and surface its sessions
     /// locally, returning the peer's [`PeerId`]. Idempotent: an open peer is
     /// reused, reachable or not — an unreachable one's link is being re-opened
-    /// already (issue #208). Performs the connect + auth + session-list
-    /// handshake inline, so the caller awaits a fully-registered peer before
-    /// replying `PeerOpened`; from then on the peer's link supervisor keeps
-    /// the link up.
+    /// already (issue #208), from now on with `target`. Performs the connect +
+    /// auth + session-list handshake inline, so the caller awaits a
+    /// fully-registered peer before replying `PeerOpened`; from then on the
+    /// peer's link supervisor keeps the link up.
     pub async fn open_peer(
         &self,
         app: &Arc<ServerApp>,
         target: PeerTarget,
     ) -> Result<PeerId, String> {
         let peer_id = target.peer_id();
-        if self.peers.lock().unwrap().contains_key(&peer_id) {
-            debug!(%peer_id, "reusing existing peer connection");
+        if self.reuse_peer(&peer_id, &target) {
             return Ok(peer_id);
         }
 
@@ -494,7 +518,7 @@ impl PeerManager {
         // Register each remote session under a fresh local word. Park the SSH
         // tunnel (if any) on the connection — disarming the guard — so it lives
         // as long as the link and is killed by `close_peer`.
-        let mut conn = PeerConnection::new(client_tx);
+        let mut conn = PeerConnection::new(client_tx, link::connector_for(target));
         conn.ssh_tunnel = tunnel.disarm();
         let mut assigned_words: Vec<String> = Vec::new();
         for entry in remote_sessions {
@@ -529,7 +553,6 @@ impl PeerManager {
                     Arc::clone(&conn),
                     peer_id.clone(),
                     server_rx,
-                    link::connector_for(target),
                 );
                 conn.lock().unwrap().feed_task = Some(task);
                 peers.insert(peer_id.clone(), Arc::clone(&conn));
@@ -1264,7 +1287,7 @@ impl PeerManager {
     ) {
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (server_tx, server_rx) = mpsc::unbounded_channel();
-        let mut conn = PeerConnection::new(client_tx);
+        let mut conn = PeerConnection::new(client_tx, connector);
         conn.register_session(
             local_word.to_string(),
             remote_word.to_string(),
@@ -1277,7 +1300,6 @@ impl PeerManager {
             Arc::clone(&conn),
             peer_id.to_string(),
             server_rx,
-            connector,
         );
         conn.lock().unwrap().feed_task = Some(task);
         self.peers.lock().unwrap().insert(peer_id.to_string(), conn);
@@ -1472,7 +1494,7 @@ mod tests {
     #[test]
     fn peer_connection_translates_panes_both_ways() {
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut conn = PeerConnection::new(tx);
+        let mut conn = PeerConnection::new(tx, no_reconnect());
         conn.register_session(
             "hawk".to_string(),
             "eagle".to_string(),
@@ -1752,7 +1774,7 @@ mod tests {
 
         let mgr = PeerManager::new();
         let (tx, _rx) = mpsc::unbounded_channel();
-        let mut conn = PeerConnection::new(tx);
+        let mut conn = PeerConnection::new(tx, no_reconnect());
         let child = tokio::process::Command::new("sleep")
             .arg("60")
             .spawn()
@@ -1821,5 +1843,42 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(gone, "a dropped TunnelGuard must kill the tunnel process");
+    }
+
+    /// Opening a peer that is open already reuses it without dialling. A live
+    /// one keeps its link as it is; an unreachable one is re-opened with the
+    /// new target from then on — a restarted Direct peer's token rotates, and
+    /// the token is not part of its id (issue #208).
+    #[tokio::test]
+    async fn reopening_an_unreachable_peer_retargets_its_link() {
+        let app = Arc::new(crate::fixtures::fixture_app());
+        let (_upstream, _peer) = app.peer_manager.install_channel_peer(
+            &app,
+            "box:9000",
+            "fedlocal",
+            "fedremote",
+            no_reconnect(),
+        );
+        let conn = Arc::clone(&app.peer_manager.peers.lock().unwrap()["box:9000"]);
+        let before = Arc::clone(&lock(&conn).connector);
+        let target = PeerTarget::Direct {
+            host: "box".to_string(),
+            port: 9000,
+            token: "rotated".to_string(),
+            accept_invalid_certs: true,
+        };
+
+        let reopened = app.peer_manager.open_peer(&app, target.clone()).await;
+        assert_eq!(reopened, Ok("box:9000".to_string()));
+        assert!(Arc::ptr_eq(&before, &lock(&conn).connector), "live: kept");
+
+        lock(&conn).dead = true;
+        let reopened = app.peer_manager.open_peer(&app, target).await;
+        assert_eq!(reopened, Ok("box:9000".to_string()));
+        assert!(
+            !Arc::ptr_eq(&before, &lock(&conn).connector),
+            "unreachable: re-targeted"
+        );
+        assert_eq!(app.list_federated_sessions().len(), 1, "still one peer");
     }
 }

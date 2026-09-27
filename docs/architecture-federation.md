@@ -254,7 +254,16 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
     session still listed keeps its local word, a new one draws one, one no longer
     listed is closed. Every proxied pane with viewers is re-attached **for a
     snapshot** (the peer may be a new daemon run, whose seqnos start over), which
-    re-seeds the mirror and resyncs every viewer, and every client is sent the list.
+    re-seeds the mirror and resyncs every streaming viewer (a paused one catches up
+    when it resumes), and every client is sent the list.
+  - **Ordered lists.** Every add or remove of a peer's session (a reconcile, the
+    peer's `SessionClosed`, `close_peer`, `create_remote_session`'s registration)
+    holds `PeerManager`'s membership gate together with the broadcast of that change,
+    and every session list takes its federated entries (and is queued or broadcast)
+    under the same gate, after the local session map's read lock. So a list taken
+    before a federated session closed cannot reach a client after its `SessionClosed`
+    and bring it back, and a re-list racing a create cannot register one session
+    under two words.
   - **When a session closes.** Only when the peer reports it closed (its
     `SessionClosed` event, or its session list no longer naming it) — then for every
     client, not just the session's viewers — or when the user closes the peer
@@ -265,7 +274,10 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
     `SessionListResult` from the peer — that answer, or the peer's own resync after
     the link lagged — is reconciled the same way.
   - **`open_peer`** reuses an open peer, reachable or not (an unreachable one is being
-    re-opened already), so the lazy reaping of dead peers is gone.
+    re-opened already), so the lazy reaping of dead peers is gone. Reusing an
+    unreachable peer re-targets it: the connection's connector, which the supervisor
+    reads afresh on each attempt, is replaced by one for the new `PeerTarget` — a
+    restarted Direct peer rotates its token, which is not part of its `PeerId`.
   Tests: the supervisor on the paused clock over a channel-played peer
   (`federation::link` — dropped link → unreachable → re-linked under the same word,
   panes re-attached for a snapshot; a silent peer is pinged then declared unreachable;
