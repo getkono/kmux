@@ -350,8 +350,8 @@ pub(super) mod testing {
     pub(super) use std::sync::atomic::Ordering;
 
     pub(super) use kmux_protocol::messages::{
-        AttentionKind, ClientCapabilities, ClientId, ClientMessage, Compression, ErrorCode,
-        KeyAction, KeyCode, KeyEvent, KeyMods, LayoutScheme, PROTOCOL_RANGE, PeerTarget,
+        AttentionKind, AuthFailure, ClientCapabilities, ClientId, ClientMessage, Compression,
+        ErrorCode, KeyAction, KeyCode, KeyEvent, KeyMods, LayoutScheme, PROTOCOL_RANGE, PeerTarget,
         ProtocolRange, ProtocolVersion, ServerMessage, SessionEventMsg, SplitDir, TermSize,
         protocol_capabilities,
     };

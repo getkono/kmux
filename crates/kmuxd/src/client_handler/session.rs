@@ -580,6 +580,7 @@ mod tests {
             ServerMessage::AuthResult {
                 success: false,
                 reason: Some(ref reason),
+                failure: Some(kmux_protocol::messages::AuthFailure::BadToken),
                 ..
             } if reason == "invalid token"
         ));

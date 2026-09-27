@@ -5,8 +5,8 @@
 //! the one place in the dispatcher that can decide to hang up.
 
 use kmux_protocol::messages::{
-    CAPABILITY_FRAME_ZSTD, ClientCapabilities, ClientMessage, Compression, ConnectionId, ErrorCode,
-    FrontendKind, ProtocolRange, ServerMessage, negotiate_capabilities,
+    AuthFailure, CAPABILITY_FRAME_ZSTD, ClientCapabilities, ClientMessage, Compression,
+    ConnectionId, ErrorCode, FrontendKind, ProtocolRange, ServerMessage, negotiate_capabilities,
 };
 use tracing::{info, warn};
 
@@ -16,12 +16,14 @@ use crate::auth::validate_token;
 use super::super::{PendingAuth, SharedClientState};
 use super::Flow;
 
-/// Build a failed `AuthResult` carrying a human-readable `reason` (issue #146).
-fn auth_failure(reason: String) -> ServerMessage {
+/// Build a failed `AuthResult`: the typed `failure` a client decides on, and
+/// its text as the `reason` a person (or a client that predates `failure`)
+/// reads.
+fn auth_failure(failure: AuthFailure) -> ServerMessage {
     ServerMessage::AuthResult {
         success: false,
-        reason: Some(reason),
-        failure: None,
+        reason: Some(failure.to_string()),
+        failure: Some(failure),
         client_id: None,
         server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         connection_id: None,
@@ -111,11 +113,10 @@ pub(super) struct AuthRequest {
 pub(super) fn on_auth(state: &mut SharedClientState, req: AuthRequest) -> Flow {
     let Some(negotiated_protocol) = kmux_protocol::compat::negotiate_protocol(req.protocol_range)
     else {
-        state.send(auth_failure(format!(
-            "protocol version mismatch: client={}, server={}",
-            req.protocol_range,
-            kmux_protocol::messages::PROTOCOL_RANGE
-        )));
+        state.send(auth_failure(AuthFailure::ProtocolMismatch {
+            client: req.protocol_range,
+            daemon: kmux_protocol::messages::PROTOCOL_RANGE,
+        }));
         warn!(
             "Protocol version mismatch: client={}, server={}",
             req.protocol_range,
@@ -125,7 +126,7 @@ pub(super) fn on_auth(state: &mut SharedClientState, req: AuthRequest) -> Flow {
     };
     let negotiated_capabilities = negotiate_capabilities(&req.protocol_capabilities);
     if !validate_token(&req.token, &state.app.auth_token) {
-        state.send(auth_failure("invalid token".to_string()));
+        state.send(auth_failure(AuthFailure::BadToken));
         warn!("authentication failed");
         return Flow::Close;
     }
@@ -165,7 +166,7 @@ pub(super) async fn on_auth_proof(state: &mut SharedClientState, signature: Vec<
         return Flow::Continue;
     };
     if !kmux_sys::identity::verify(&pending.public_key, &pending.nonce, &signature) {
-        state.send(auth_failure("identity verification failed".to_string()));
+        state.send(auth_failure(AuthFailure::IdentityRejected));
         warn!("identity verification failed");
         return Flow::Close;
     }
@@ -388,13 +389,17 @@ mod tests {
         )
         .await;
         assert!(!ok);
+        let client = ProtocolRange::exact(ProtocolVersion::new(2, 0, 0));
         assert!(matches!(
             ctrl_rx.try_recv(),
             Ok(ServerMessage::AuthResult {
                 success: false,
                 reason: Some(reason),
+                failure: Some(AuthFailure::ProtocolMismatch { client: c, daemon }),
                 ..
             }) if reason.starts_with("protocol version mismatch:")
+                && c == client
+                && daemon == PROTOCOL_RANGE
         ));
     }
 
@@ -448,7 +453,11 @@ mod tests {
         assert!(!state.authenticated);
         assert!(matches!(
             ctrl_rx.try_recv(),
-            Ok(ServerMessage::AuthResult { success: false, .. })
+            Ok(ServerMessage::AuthResult {
+                success: false,
+                failure: Some(AuthFailure::IdentityRejected),
+                ..
+            })
         ));
     }
 
