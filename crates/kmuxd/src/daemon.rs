@@ -10,9 +10,10 @@ use tracing::{debug, error, info, warn};
 use crate::announce::{BootstrapPath, build_endpoint_list};
 use crate::app::ServerApp;
 use crate::config::ListenConfig;
-use crate::handoff::HandoffStatus;
+use crate::handoff::{BegunHandoff, HandoffStatus};
 use kmux_protocol::control_rpc::{
-    ControlRequest, EndpointEntry, RestartResponse, StatusResponse, StopResponse,
+    ControlError, ControlErrorKind, ControlRequest, EndpointEntry, RestartResponse, StatusResponse,
+    StopResponse,
 };
 
 /// Daemonize the current process (double-fork), optionally writing+locking the
@@ -235,12 +236,26 @@ pub fn termination_signal() -> std::io::Result<impl Future<Output = ()> + Send> 
 
 /// Serve one control connection, giving up after `deadline` (see
 /// [`CONTROL_DEADLINE`]). Returns whether it finished in time.
+///
+/// A connection cut off by the deadline is sent a
+/// [`ControlErrorKind::DeadlineExceeded`] reply first, unless its own reply
+/// had already begun. That reply is written without waiting (the deadline is
+/// the only wait), so a client that is not reading may not get it.
 async fn serve_control_connection(
     stream: tokio::net::UnixStream,
     ctx: RequestCtx,
     deadline: Duration,
 ) -> bool {
-    let served = tokio::time::timeout(deadline, handle_control_connection(stream, ctx)).await;
+    let (read_half, write_half) = stream.into_split();
+    let mut reply = Reply {
+        out: write_half,
+        started: false,
+    };
+    let served = tokio::time::timeout(
+        deadline,
+        handle_control_connection(read_half, &mut reply, ctx),
+    )
+    .await;
     if served.is_ok() {
         return true;
     }
@@ -248,11 +263,71 @@ async fn serve_control_connection(
         ?deadline,
         "control connection did not finish in time; dropped"
     );
+    if !reply.started {
+        let line = error_line(
+            ControlErrorKind::DeadlineExceeded,
+            format!("no complete exchange within {deadline:?}"),
+        );
+        let _ = reply.out.try_write(line.as_bytes());
+    }
     false
 }
 
-async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestCtx) {
-    let (read_half, mut write_half) = stream.into_split();
+/// The answering half of a control connection.
+struct Reply {
+    out: tokio::net::unix::OwnedWriteHalf,
+    /// Whether any reply has begun, after which no other may be sent.
+    started: bool,
+}
+
+impl Reply {
+    /// Send `body` as the one reply line, or an
+    /// [`ControlErrorKind::Internal`] error if it cannot be serialized.
+    async fn send(&mut self, body: &impl serde::Serialize) {
+        let line = match serde_json::to_string(body) {
+            Ok(mut json) => {
+                json.push('\n');
+                json
+            }
+            Err(e) => {
+                warn!("Failed to serialize control response: {e}");
+                error_line(ControlErrorKind::Internal, e.to_string())
+            }
+        };
+        self.started = true;
+        if let Err(e) = self.out.write_all(line.as_bytes()).await {
+            warn!("Control socket write error: {e}");
+        }
+    }
+
+    /// Refuse the request with a typed error reply.
+    async fn refuse(&mut self, kind: ControlErrorKind, message: String) {
+        warn!(?kind, "control request refused: {message}");
+        self.send(&ControlError {
+            error: kind,
+            message,
+        })
+        .await;
+    }
+}
+
+/// A [`ControlError`] reply line.
+fn error_line(kind: ControlErrorKind, message: String) -> String {
+    let error = ControlError {
+        error: kind,
+        message,
+    };
+    // Two plain fields: serializing it cannot fail.
+    let mut line = serde_json::to_string(&error).unwrap_or_default();
+    line.push('\n');
+    line
+}
+
+async fn handle_control_connection(
+    read_half: tokio::net::unix::OwnedReadHalf,
+    reply: &mut Reply,
+    ctx: RequestCtx,
+) {
     let mut reader = BufReader::new(read_half).take(MAX_CONTROL_REQUEST);
     let mut line = String::new();
 
@@ -267,162 +342,107 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
         debug!("control connection closed without a request (liveness probe)");
         return;
     }
+    // Cut off at the cap with no end of line in sight: the rest is not read.
+    if reader.limit() == 0 && !line.ends_with('\n') {
+        let message = format!("a request is at most {MAX_CONTROL_REQUEST} bytes");
+        reply.refuse(ControlErrorKind::TooLarge, message).await;
+        return;
+    }
 
     let req: ControlRequest = match serde_json::from_str(line.trim()) {
         Ok(r) => r,
         Err(e) => {
-            warn!("Invalid control request: {e}");
+            reply
+                .refuse(ControlErrorKind::Malformed, format!("invalid request: {e}"))
+                .await;
             return;
         }
     };
 
     match req.command.as_str() {
-        "status" => {
-            let session_count = ctx.app.list_sessions().await.len();
-            let adverts = build_endpoint_list(
-                &ctx.listeners,
-                BootstrapPath::Uds,
-                ctx.public_host.as_deref(),
-            );
-            let endpoints = adverts
-                .into_iter()
-                .map(|a| EndpointEntry {
-                    kind: format!("{}", a.kind),
-                    address: a.address,
-                })
-                .collect();
-            let response = StatusResponse {
-                status: "running".to_string(),
-                port: ctx.quic_port,
-                tcp_port: ctx.tcp_port,
-                token: ctx.token.clone(),
-                pid: std::process::id(),
-                uptime_secs: ctx.start_time.elapsed().as_secs(),
-                session_count,
-                protocol_version: kmux_protocol::messages::LEGACY_PROTOCOL_VERSION,
-                protocol_range: Some(kmux_protocol::messages::PROTOCOL_RANGE),
-                kmuxd_version: env!("CARGO_PKG_VERSION").to_string(),
-                kmuxd_build: kmux_protocol::buildinfo::fingerprint(),
-                build_profile: Some(kmux_protocol::compat::BuildProfile::CURRENT),
-                endpoints,
-            };
-            let mut json = match serde_json::to_string(&response) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to serialize status response: {e}");
-                    return;
-                }
-            };
-            json.push('\n');
-            if let Err(e) = write_half.write_all(json.as_bytes()).await {
-                warn!("Control socket write error: {e}");
-            }
-        }
+        "status" => reply.send(&status_response(&ctx).await).await,
         "stop" => {
-            let response = StopResponse {
-                status: "ok".to_string(),
-            };
-            let mut json = match serde_json::to_string(&response) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to serialize stop response: {e}");
-                    return;
-                }
-            };
-            json.push('\n');
-            if let Err(e) = write_half.write_all(json.as_bytes()).await {
-                warn!("Control socket write error: {e}");
-            }
+            reply
+                .send(&StopResponse {
+                    status: "ok".to_string(),
+                })
+                .await;
             info!("Received stop command, shutting down daemon");
             ctx.shutdown.notify_waiters();
         }
-        "restart" => {
-            // Refuse a second concurrent handoff.
-            let attempt = ctx.handoff.begin();
-            let busy = attempt.is_none();
-            let response = RestartResponse {
-                status: if busy { "busy" } else { "ok" }.to_string(),
-                handoff: true,
-                attempt: attempt.unwrap_or_default(),
-            };
-            let mut json = match serde_json::to_string(&response) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to serialize restart response: {e}");
-                    return;
-                }
-            };
-            json.push('\n');
-            if let Err(e) = write_half.write_all(json.as_bytes()).await {
-                warn!("Control socket write error: {e}");
-            }
-            if busy {
-                warn!("restart command ignored: a handoff is already in progress");
-            } else {
-                info!("Received restart command, beginning graceful handoff");
-                // Wake the main task; it runs the handoff and reports a
-                // rollback through `ctx.handoff`.
-                ctx.restart.notify_one();
-            }
-        }
-        "handoff" => {
-            let mut json = match serde_json::to_string(&ctx.handoff.report()) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to serialize handoff report: {e}");
-                    return;
-                }
-            };
-            json.push('\n');
-            if let Err(e) = write_half.write_all(json.as_bytes()).await {
-                warn!("Control socket write error: {e}");
-            }
-        }
+        "restart" => on_restart(&ctx, reply).await,
+        "handoff" => reply.send(&ctx.handoff.report()).await,
         "sessions" => {
-            let resp = ctx.app.snapshot_sessions_with_connections().await;
-            let mut json = match serde_json::to_string(&resp) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to serialize sessions response: {e}");
-                    return;
-                }
-            };
-            json.push('\n');
-            if let Err(e) = write_half.write_all(json.as_bytes()).await {
-                warn!("Control socket write error: {e}");
-            }
+            reply
+                .send(&ctx.app.snapshot_sessions_with_connections().await)
+                .await;
         }
-        "connections" => {
-            let resp = ctx.app.snapshot_connections().await;
-            let mut json = match serde_json::to_string(&resp) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to serialize connections response: {e}");
-                    return;
-                }
-            };
-            json.push('\n');
-            if let Err(e) = write_half.write_all(json.as_bytes()).await {
-                warn!("Control socket write error: {e}");
-            }
-        }
-        "workers" => {
-            let resp = ctx.app.snapshot_workers().await;
-            let mut json = match serde_json::to_string(&resp) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!("Failed to serialize workers response: {e}");
-                    return;
-                }
-            };
-            json.push('\n');
-            if let Err(e) = write_half.write_all(json.as_bytes()).await {
-                warn!("Control socket write error: {e}");
-            }
-        }
+        "connections" => reply.send(&ctx.app.snapshot_connections().await).await,
+        "workers" => reply.send(&ctx.app.snapshot_workers().await).await,
         other => {
-            warn!("Unknown control command: {other}");
+            reply
+                .refuse(
+                    ControlErrorKind::UnknownCommand,
+                    format!("unknown command: {other}"),
+                )
+                .await;
         }
+    }
+}
+
+/// The `status` command's reply.
+async fn status_response(ctx: &RequestCtx) -> StatusResponse {
+    let session_count = ctx.app.list_sessions().await.len();
+    let adverts = build_endpoint_list(
+        &ctx.listeners,
+        BootstrapPath::Uds,
+        ctx.public_host.as_deref(),
+    );
+    let endpoints = adverts
+        .into_iter()
+        .map(|a| EndpointEntry {
+            kind: format!("{}", a.kind),
+            address: a.address,
+        })
+        .collect();
+    StatusResponse {
+        status: "running".to_string(),
+        port: ctx.quic_port,
+        tcp_port: ctx.tcp_port,
+        token: ctx.token.clone(),
+        pid: std::process::id(),
+        uptime_secs: ctx.start_time.elapsed().as_secs(),
+        session_count,
+        protocol_version: kmux_protocol::messages::LEGACY_PROTOCOL_VERSION,
+        protocol_range: Some(kmux_protocol::messages::PROTOCOL_RANGE),
+        kmuxd_version: env!("CARGO_PKG_VERSION").to_string(),
+        kmuxd_build: kmux_protocol::buildinfo::fingerprint(),
+        build_profile: Some(kmux_protocol::compat::BuildProfile::CURRENT),
+        endpoints,
+    }
+}
+
+/// The `restart` command: begin a handoff and wake the daemon to run it, or
+/// answer `busy` while one runs. The handoff is handed to the daemon only
+/// once the reply is written; a connection cut off before then rolls it back
+/// (see [`HandoffStatus::begin`]).
+async fn on_restart(ctx: &RequestCtx, reply: &mut Reply) {
+    let begun = ctx.handoff.begin();
+    let response = RestartResponse {
+        status: if begun.is_some() { "ok" } else { "busy" }.to_string(),
+        handoff: true,
+        attempt: begun.as_ref().map_or(0, BegunHandoff::attempt),
+    };
+    reply.send(&response).await;
+    match begun {
+        Some(begun) => {
+            info!("Received restart command, beginning graceful handoff");
+            // Wake the main task; it runs the handoff and reports a
+            // rollback through `ctx.handoff`.
+            ctx.restart.notify_one();
+            begun.hand_over();
+        }
+        None => warn!("restart command ignored: a handoff is already in progress"),
     }
 }
 
@@ -595,6 +615,8 @@ mod tests {
         socket_is_live,
     };
     use crate::app::ServerApp;
+    use crate::fixtures::{FIXTURE_TOKEN, fixture_app};
+    use kmux_protocol::control_rpc::{ControlError, ControlErrorKind, StatusResponse};
 
     /// What a control connection needs to answer, for a daemon with no
     /// sessions.
@@ -602,9 +624,9 @@ mod tests {
         RequestCtx {
             quic_port: 0,
             tcp_port: 0,
-            token: "test-token".to_string(),
+            token: FIXTURE_TOKEN.to_string(),
             start_time: Instant::now(),
-            app: Arc::new(ServerApp::new("test-token".to_string())),
+            app: Arc::new(fixture_app()),
             shutdown: Arc::new(Notify::new()),
             restart: Arc::new(Notify::new()),
             handoff: Arc::default(),
@@ -613,8 +635,37 @@ mod tests {
         }
     }
 
+    /// Send `request` on a fresh control connection, half-close, and return
+    /// whether the daemon finished in time and everything it answered.
+    async fn exchange(request: &[u8]) -> (bool, String) {
+        let (mut client, server) = UnixStream::pair().unwrap();
+        let serving = tokio::spawn(serve_control_connection(
+            server,
+            fixture_ctx(),
+            CONTROL_DEADLINE,
+        ));
+        client.write_all(request).await.unwrap();
+        client.shutdown().await.unwrap();
+        let mut reply = String::new();
+        tokio::time::timeout(CONTROL_DEADLINE, client.read_to_string(&mut reply))
+            .await
+            .expect("answered in time")
+            .unwrap();
+        let finished = tokio::time::timeout(CONTROL_DEADLINE, serving)
+            .await
+            .expect("the connection ends")
+            .unwrap();
+        (finished, reply)
+    }
+
+    /// The error a reply line carries.
+    fn refusal(reply: &str) -> ControlErrorKind {
+        let error: ControlError = serde_json::from_str(reply.trim()).expect("an error reply");
+        error.error
+    }
+
     /// A client that connects and never sends a request is dropped at the
-    /// deadline, and sees its connection closed (issue #207).
+    /// deadline, told so, and sees its connection closed (issue #207).
     #[tokio::test(start_paused = true)]
     async fn a_silent_control_client_is_dropped_at_the_deadline() {
         let (mut client, server) = UnixStream::pair().unwrap();
@@ -624,32 +675,73 @@ mod tests {
 
         assert!(!finished);
         assert!(started.elapsed() >= CONTROL_DEADLINE);
-        let mut buf = [0u8; 8];
-        let read = client.read(&mut buf).await;
-        assert_eq!(read.unwrap(), 0, "the daemon closed its end");
+        let mut reply = String::new();
+        client.read_to_string(&mut reply).await.unwrap();
+        assert_eq!(refusal(&reply), ControlErrorKind::DeadlineExceeded);
+        assert!(reply.ends_with('\n'), "one whole line");
     }
 
-    /// A request past the length cap is cut off and refused at once, not
-    /// buffered while the daemon waits for a newline that never comes. On the
-    /// real clock (the exchange is real socket I/O); the deadline is far
-    /// beyond the test's own bound, so only the cap can end it in time.
+    /// A request that reaches the length cap with no end of line is cut off
+    /// and refused as too large at once, not buffered while the daemon waits
+    /// for a newline that never comes. On the real clock (the exchange is
+    /// real socket I/O); only the cap can end it inside the test's bound.
     #[tokio::test]
     async fn an_oversized_control_request_is_refused_without_waiting() {
-        let (mut client, server) = UnixStream::pair().unwrap();
-        let far = Duration::from_secs(600);
-        let serving = tokio::spawn(serve_control_connection(server, fixture_ctx(), far));
-        let flood = vec![b'x'; usize::try_from(MAX_CONTROL_REQUEST).unwrap() + 1];
-        // The daemon stops reading at the cap and closes, so the tail of the
-        // flood may meet a closed socket.
-        let _ = client.write_all(&flood).await;
+        let flood = vec![b'x'; usize::try_from(MAX_CONTROL_REQUEST).unwrap()];
+        let (finished, reply) = exchange(&flood).await;
+        assert!(finished);
+        assert_eq!(refusal(&reply), ControlErrorKind::TooLarge);
+    }
 
-        let finished = tokio::time::timeout(Duration::from_secs(10), serving).await;
-        assert!(finished.expect("refused without waiting").unwrap());
-        // Closing with the flood's tail unread resets the connection on
-        // Linux; either way, nothing was answered.
-        let mut reply = Vec::new();
-        let _ = client.read_to_end(&mut reply).await;
-        assert!(reply.is_empty(), "no answer to a malformed request");
+    /// A request well past a line's usual length but inside the cap is
+    /// answered: the cap is 64 KiB, not a few hundred bytes.
+    #[tokio::test]
+    async fn a_long_request_inside_the_cap_is_answered() {
+        let padding = " ".repeat(4096);
+        let request = format!("{{\"command\":\"handoff\"{padding}}}\n");
+        let (finished, reply) = exchange(request.as_bytes()).await;
+        assert!(finished);
+        let report: kmux_protocol::control_rpc::HandoffReport =
+            serde_json::from_str(reply.trim()).expect("the handoff report");
+        assert_eq!(report.attempt, 0);
+    }
+
+    /// A request the client ends by closing, with no newline, is still one
+    /// request, not a truncated one.
+    #[tokio::test]
+    async fn a_request_ended_by_closing_is_answered() {
+        let (_, reply) = exchange(br#"{"command":"handoff"}"#).await;
+        let report: kmux_protocol::control_rpc::HandoffReport =
+            serde_json::from_str(reply.trim()).expect("the handoff report");
+        assert!(!report.in_progress);
+    }
+
+    /// Garbage and an unknown command are each refused with their own error
+    /// reply rather than a silent close (issue #207).
+    #[tokio::test]
+    async fn a_bad_request_is_refused_with_a_typed_error() {
+        let (finished, reply) = exchange(b"not json\n").await;
+        assert!(finished);
+        assert_eq!(refusal(&reply), ControlErrorKind::Malformed);
+        let (_, reply) = exchange(b"{\"command\":\"frobnicate\"}\n").await;
+        let error: ControlError = serde_json::from_str(reply.trim()).unwrap();
+        assert_eq!(error.error, ControlErrorKind::UnknownCommand);
+        assert_eq!(error.message, "unknown command: frobnicate");
+    }
+
+    /// `status` reports this daemon: its pid, ports, token and profile.
+    #[tokio::test]
+    async fn status_reports_this_daemon() {
+        let (_, reply) = exchange(b"{\"command\":\"status\"}\n").await;
+        let status: StatusResponse = serde_json::from_str(reply.trim()).expect("a status");
+        assert_eq!(status.status, "running");
+        assert_eq!(status.pid, std::process::id());
+        assert_eq!(status.token, FIXTURE_TOKEN);
+        assert_eq!(status.session_count, 0);
+        assert_eq!(
+            status.protocol_range,
+            Some(kmux_protocol::messages::PROTOCOL_RANGE)
+        );
     }
 
     /// Send one control `command` to the socket at `path` and read the reply.

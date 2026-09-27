@@ -91,8 +91,22 @@ async fn control_request_at<Resp: DeserializeOwned>(
         .map_err(|_| anyhow::anyhow!("daemon did not respond in time"))?
         .map_err(|e| anyhow::anyhow!("failed to read response: {e}"))?;
 
-    serde_json::from_str(line.trim())
-        .map_err(|e| anyhow::anyhow!("invalid response from daemon: {e}"))
+    parse_control_reply(&line)
+}
+
+/// A control reply line: the command's own reply, or the daemon's
+/// [`ControlError`](kmux_protocol::control_rpc::ControlError) in its place,
+/// which is an `Err` naming what the daemon refused (issue #207).
+fn parse_control_reply<Resp: DeserializeOwned>(line: &str) -> anyhow::Result<Resp> {
+    let line = line.trim();
+    if let Ok(refused) = serde_json::from_str::<kmux_protocol::control_rpc::ControlError>(line) {
+        anyhow::bail!(
+            "the daemon refused the request ({:?}): {}",
+            refused.error,
+            refused.message
+        );
+    }
+    serde_json::from_str(line).map_err(|e| anyhow::anyhow!("invalid response from daemon: {e}"))
 }
 
 /// Query a running daemon via its Unix control socket.
@@ -636,6 +650,33 @@ mod tests {
         assert!(
             restart_daemon_at(&socket_path).await.is_err(),
             "a daemon that closes without replying must surface as Err (unsupported)"
+        );
+    }
+
+    /// A daemon's error reply is an `Err` that says what it refused, not an
+    /// unparseable reply; a command's own reply parses as before.
+    #[test]
+    fn a_control_error_reply_is_an_error_naming_the_refusal() {
+        use kmux_protocol::control_rpc::StopResponse;
+
+        let refused = parse_control_reply::<StopResponse>(
+            "{\"error\":\"unknown_command\",\"message\":\"unknown command: frob\"}\n",
+        )
+        .err()
+        .expect("an error reply is an Err");
+        assert_eq!(
+            refused.to_string(),
+            "the daemon refused the request (UnknownCommand): unknown command: frob"
+        );
+        let ok: StopResponse = parse_control_reply("{\"status\":\"ok\"}\n").expect("a reply");
+        assert_eq!(ok.status, "ok");
+        let garbled = parse_control_reply::<StopResponse>("nonsense")
+            .err()
+            .expect("an Err");
+        assert!(
+            garbled
+                .to_string()
+                .starts_with("invalid response from daemon")
         );
     }
 

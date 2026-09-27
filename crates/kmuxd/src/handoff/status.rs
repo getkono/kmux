@@ -14,8 +14,12 @@ pub struct HandoffStatus {
 }
 
 impl HandoffStatus {
-    /// Begin a handoff, and return its number — or `None` while one runs.
-    pub fn begin(&self) -> Option<u64> {
+    /// Begin a handoff, or `None` while one runs. The handoff counts as
+    /// running from here, so a second `restart` is `busy`; until
+    /// [`BegunHandoff::hand_over`] passes it to the daemon's main task, the
+    /// returned guard rolls it back when dropped, so a restart request cut
+    /// off before the handoff started never leaves every later one `busy`.
+    pub fn begin(&self) -> Option<BegunHandoff<'_>> {
         let mut report = self.lock();
         if report.in_progress {
             return None;
@@ -23,7 +27,11 @@ impl HandoffStatus {
         report.attempt += 1;
         report.in_progress = true;
         report.stood_down = None;
-        Some(report.attempt)
+        Some(BegunHandoff {
+            status: self,
+            attempt: report.attempt,
+            handed_over: false,
+        })
     }
 
     /// The handoff rolled back, for `why`: this daemon serves on, and a new
@@ -41,6 +49,39 @@ impl HandoffStatus {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HandoffReport> {
         self.report.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+}
+
+/// Why a handoff rolled back whose request was cut off before it started.
+pub const CUT_OFF: &str = "the restart request was cut off before the handoff started";
+
+/// A handoff [`HandoffStatus::begin`] started and nobody has run yet.
+#[derive(Debug)]
+#[must_use = "dropping it rolls the handoff back"]
+pub struct BegunHandoff<'a> {
+    status: &'a HandoffStatus,
+    attempt: u64,
+    handed_over: bool,
+}
+
+impl BegunHandoff<'_> {
+    /// The handoff's number.
+    pub fn attempt(&self) -> u64 {
+        self.attempt
+    }
+
+    /// The daemon's main task has been told to run it, and owns it now: it
+    /// reports the outcome.
+    pub fn hand_over(mut self) {
+        self.handed_over = true;
+    }
+}
+
+impl Drop for BegunHandoff<'_> {
+    fn drop(&mut self) {
+        if !self.handed_over {
+            self.status.rolled_back(CUT_OFF.to_string());
+        }
     }
 }
 
@@ -69,8 +110,10 @@ mod tests {
         let status = HandoffStatus::default();
         assert_eq!(status.report(), HandoffReport::default());
 
-        assert_eq!(status.begin(), Some(1));
-        assert_eq!(status.begin(), None, "busy");
+        let first = status.begin().expect("the first begins");
+        assert_eq!(first.attempt(), 1);
+        first.hand_over();
+        assert!(status.begin().is_none(), "busy");
         let running = status.report();
         assert!(running.in_progress);
         assert_eq!(running.attempt, 1);
@@ -80,8 +123,31 @@ mod tests {
         assert!(!report.in_progress);
         assert_eq!(report.stood_down.as_deref(), Some("no Ack"));
 
-        assert_eq!(status.begin(), Some(2));
+        let second = status.begin().expect("a new one begins");
+        assert_eq!(second.attempt(), 2);
+        second.hand_over();
         assert_eq!(status.report().stood_down, None, "cleared for the new one");
+    }
+
+    /// A handoff begun and never handed over (its restart request was cut
+    /// off) rolls back, so the next restart is not refused as busy.
+    #[test]
+    fn a_handoff_never_handed_over_rolls_back() {
+        let status = HandoffStatus::default();
+        let cut_off = status.begin().expect("begins");
+        assert!(status.report().in_progress);
+        drop(cut_off);
+
+        let report = status.report();
+        assert!(!report.in_progress);
+        assert_eq!(report.stood_down.as_deref(), Some(CUT_OFF));
+        let next = status.begin().expect("not busy");
+        assert_eq!(next.attempt(), 2);
+        next.hand_over();
+        assert!(
+            status.report().in_progress,
+            "a handed-over one keeps running"
+        );
     }
 
     #[test]
