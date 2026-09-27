@@ -221,51 +221,40 @@ mod tests {
     use super::*;
 
     #[test]
-    fn signal_k_is_sigkill() {
-        assert_eq!(signal_from_key("k"), Some(9));
+    fn signal_from_key_menu_keys_map_to_unix_signals() {
+        let cases = [
+            ("k", Some(9)),
+            ("t", Some(15)),
+            ("s", Some(19)),
+            ("c", Some(18)),
+            ("z", None),
+        ];
+        for (key, want) in cases {
+            assert_eq!(signal_from_key(key), want, "key {key:?}");
+        }
     }
 
     #[test]
-    fn signal_unknown_is_none() {
-        assert_eq!(signal_from_key("z"), None);
+    fn encode_mouse_scroll_direction_count_and_format_encode_per_line() {
+        let cases: [(&str, i32, bool, &[u8]); 6] = [
+            ("sgr up", 1, true, b"\x1b[<64;10;5M"),
+            ("sgr down", -1, true, b"\x1b[<65;10;5M"),
+            ("legacy up", 1, false, &[0x1b, b'[', b'M', 96, 42, 37]),
+            ("legacy down", -1, false, &[0x1b, b'[', b'M', 97, 42, 37]),
+            (
+                "three lines repeat",
+                3,
+                true,
+                b"\x1b[<64;10;5M\x1b[<64;10;5M\x1b[<64;10;5M",
+            ),
+            ("zero lines is empty", 0, true, b""),
+        ];
+        for (label, lines, sgr, want) in cases {
+            assert_eq!(encode_mouse_scroll(10, 5, lines, sgr), want, "{label}");
+        }
     }
 
-    #[test]
-    fn sgr_scroll_up() {
-        let bytes = encode_mouse_scroll(10, 5, 1, true);
-        assert_eq!(bytes, b"\x1b[<64;10;5M");
-    }
-
-    #[test]
-    fn sgr_scroll_down() {
-        let bytes = encode_mouse_scroll(10, 5, -1, true);
-        assert_eq!(bytes, b"\x1b[<65;10;5M");
-    }
-
-    #[test]
-    fn legacy_scroll_up() {
-        let bytes = encode_mouse_scroll(10, 5, 1, false);
-        assert_eq!(bytes, &[0x1b, b'[', b'M', 96, 42, 37]);
-    }
-
-    #[test]
-    fn legacy_scroll_down() {
-        let bytes = encode_mouse_scroll(10, 5, -1, false);
-        assert_eq!(bytes, &[0x1b, b'[', b'M', 97, 42, 37]);
-    }
-
-    #[test]
-    fn multiple_lines_generate_multiple_sequences() {
-        let bytes = encode_mouse_scroll(1, 1, 3, true);
-        assert_eq!(bytes, b"\x1b[<64;1;1M\x1b[<64;1;1M\x1b[<64;1;1M");
-    }
-
-    #[test]
-    fn zero_lines_produces_empty() {
-        let bytes = encode_mouse_scroll(1, 1, 0, true);
-        assert!(bytes.is_empty());
-    }
-
+    /// A press/release/motion at column 10, row 5.
     fn ev(button: MouseButton, kind: MouseEventKind, mods: MouseMods) -> MouseEvent {
         MouseEvent {
             button,
@@ -276,179 +265,112 @@ mod tests {
         }
     }
 
-    #[test]
-    fn sgr_button_press_left() {
-        let bytes = encode_mouse_button(
-            &ev(
-                MouseButton::Left,
-                MouseEventKind::Press,
-                MouseMods::default(),
-            ),
-            true,
-        );
-        assert_eq!(bytes, b"\x1b[<0;10;5M");
-    }
+    const NO_MODS: MouseMods = MouseMods {
+        ctrl: false,
+        alt: false,
+        shift: false,
+    };
 
     #[test]
-    fn sgr_button_release_keeps_button_uses_lowercase_m() {
-        let bytes = encode_mouse_button(
-            &ev(
-                MouseButton::Left,
-                MouseEventKind::Release,
-                MouseMods::default(),
-            ),
-            true,
-        );
-        assert_eq!(bytes, b"\x1b[<0;10;5m");
-    }
-
-    #[test]
-    fn sgr_motion_sets_the_32_bit() {
-        let bytes = encode_mouse_button(
-            &ev(
-                MouseButton::Left,
-                MouseEventKind::Motion,
-                MouseMods::default(),
-            ),
-            true,
-        );
-        assert_eq!(bytes, b"\x1b[<32;10;5M");
-    }
-
-    #[test]
-    fn sgr_middle_and_right_button_codes() {
-        let mid = encode_mouse_button(
-            &ev(
-                MouseButton::Middle,
-                MouseEventKind::Press,
-                MouseMods::default(),
-            ),
-            true,
-        );
-        assert_eq!(mid, b"\x1b[<1;10;5M");
-        let right = encode_mouse_button(
-            &ev(
-                MouseButton::Right,
-                MouseEventKind::Press,
-                MouseMods::default(),
-            ),
-            true,
-        );
-        assert_eq!(right, b"\x1b[<2;10;5M");
-    }
-
-    #[test]
-    fn sgr_modifiers_add_4_8_16() {
-        let mods = MouseMods {
+    fn encode_mouse_button_sgr_packs_button_mods_and_motion_into_cb() {
+        use MouseButton::{Left, Middle, Right};
+        use MouseEventKind::{Motion, Press, Release};
+        let all = MouseMods {
             ctrl: true,
             alt: true,
             shift: true,
         };
-        // 0 (left) + 4 (shift) + 8 (alt) + 16 (ctrl) = 28
-        let bytes = encode_mouse_button(&ev(MouseButton::Left, MouseEventKind::Press, mods), true);
-        assert_eq!(bytes, b"\x1b[<28;10;5M");
+        let cases = [
+            ("left press", ev(Left, Press, NO_MODS), "\x1b[<0;10;5M"),
+            ("middle press", ev(Middle, Press, NO_MODS), "\x1b[<1;10;5M"),
+            ("right press", ev(Right, Press, NO_MODS), "\x1b[<2;10;5M"),
+            // Release keeps the real button and ends in lowercase `m`.
+            ("left release", ev(Left, Release, NO_MODS), "\x1b[<0;10;5m"),
+            ("motion +32", ev(Left, Motion, NO_MODS), "\x1b[<32;10;5M"),
+            // shift 4 + alt 8 + ctrl 16 = 28
+            ("all mods", ev(Left, Press, all), "\x1b[<28;10;5M"),
+        ];
+        for (label, event, want) in cases {
+            assert_eq!(
+                encode_mouse_button(&event, true),
+                want.as_bytes(),
+                "{label}"
+            );
+        }
     }
 
     #[test]
-    fn legacy_button_press_left() {
-        let bytes = encode_mouse_button(
-            &ev(
-                MouseButton::Left,
-                MouseEventKind::Press,
-                MouseMods::default(),
-            ),
-            false,
-        );
-        // cb=0+32=32, cx=10+32=42, cy=5+32=37
-        assert_eq!(bytes, &[0x1b, b'[', b'M', 32, 42, 37]);
+    fn encode_mouse_button_legacy_offsets_by_32_and_collapses_release_to_3() {
+        use MouseButton::{Left, Right};
+        use MouseEventKind::{Motion, Press, Release};
+        // (label, event, cb before the +32 offset)
+        let cases = [
+            ("left press", ev(Left, Press, NO_MODS), 0),
+            ("motion +32", ev(Left, Motion, NO_MODS), 32),
+            // Legacy has no per-button release.
+            ("right release is 3", ev(Right, Release, NO_MODS), 3),
+        ];
+        for (label, event, cb) in cases {
+            // cx = 10 + 32 = 42, cy = 5 + 32 = 37
+            assert_eq!(
+                encode_mouse_button(&event, false),
+                [0x1b, b'[', b'M', cb + 32, 42, 37],
+                "{label}"
+            );
+        }
     }
 
     #[test]
-    fn legacy_release_reports_button_3() {
-        let bytes = encode_mouse_button(
-            &ev(
-                MouseButton::Right,
-                MouseEventKind::Release,
-                MouseMods::default(),
-            ),
-            false,
-        );
-        // release collapses to button 3 regardless of which button: cb=3+32=35
-        assert_eq!(bytes, &[0x1b, b'[', b'M', 35, 42, 37]);
-    }
-
-    #[test]
-    fn legacy_motion_sets_the_32_bit() {
-        let bytes = encode_mouse_button(
-            &ev(
-                MouseButton::Left,
-                MouseEventKind::Motion,
-                MouseMods::default(),
-            ),
-            false,
-        );
-        // button 0 + motion 32 = 32, cb=32+32=64
-        assert_eq!(bytes, &[0x1b, b'[', b'M', 64, 42, 37]);
-    }
-
-    #[test]
-    fn legacy_coordinates_saturate_at_223() {
-        let bytes = encode_mouse_button(
-            &MouseEvent {
-                button: MouseButton::Left,
-                kind: MouseEventKind::Press,
-                col: 300,
-                row: 1,
-                mods: MouseMods::default(),
-            },
-            false,
-        );
+    fn encode_mouse_button_legacy_coordinates_saturate_at_223() {
+        let event = MouseEvent {
+            button: MouseButton::Left,
+            kind: MouseEventKind::Press,
+            col: 300,
+            row: 1,
+            mods: MouseMods::default(),
+        };
         // col clamps to 223, +32 = 255; row 1 + 32 = 33
-        assert_eq!(bytes, &[0x1b, b'[', b'M', 32, 255, 33]);
-    }
-
-    #[test]
-    fn lowercase_letter_maps_to_physical_key() {
-        let (code, text, unshifted) = char_to_proto_key('a');
-        assert_eq!(code, ProtoKey::A);
-        assert_eq!(text, "a");
-        assert_eq!(unshifted, 'a' as u32);
-    }
-
-    #[test]
-    fn uppercase_letter_shares_physical_key_with_unshifted_codepoint() {
-        let (code, text, unshifted) = char_to_proto_key('A');
-        assert_eq!(code, ProtoKey::A, "physical key is layout-independent");
-        assert_eq!(text, "A", "text preserves the shifted glyph");
-        assert_eq!(unshifted, 'a' as u32);
-    }
-
-    #[test]
-    fn digit_maps_to_physical_key() {
-        assert_eq!(char_to_proto_key('5').0, ProtoKey::Digit5);
-    }
-
-    #[test]
-    fn space_maps_to_physical_space() {
-        assert_eq!(char_to_proto_key(' ').0, ProtoKey::Space);
-    }
-
-    #[test]
-    fn punctuation_falls_back_to_unidentified_with_text() {
-        let (code, text, unshifted) = char_to_proto_key('!');
-        assert_eq!(code, ProtoKey::Unidentified);
-        assert_eq!(text, "!");
         assert_eq!(
-            unshifted, '!' as u32,
-            "ascii punctuation still reports a codepoint"
+            encode_mouse_button(&event, false),
+            [0x1b, b'[', b'M', 32, 255, 33]
         );
     }
 
     #[test]
-    fn non_ascii_has_zero_unshifted_codepoint() {
-        let (code, text, unshifted) = char_to_proto_key('é');
-        assert_eq!(code, ProtoKey::Unidentified);
-        assert_eq!(text, "é");
-        assert_eq!(unshifted, 0);
+    fn char_to_proto_key_letters_and_digits_get_distinct_physical_keys() {
+        let chars: Vec<char> = ('a'..='z').chain('0'..='9').collect();
+        let mut seen = std::collections::HashSet::new();
+        for c in chars {
+            let (key, text, unshifted) = char_to_proto_key(c);
+            assert_ne!(key, ProtoKey::Unidentified, "{c:?} has a physical key");
+            assert!(seen.insert(key as u16), "{c:?} maps to a duplicate key");
+            assert_eq!((text, unshifted), (c.to_string(), c as u32), "{c:?}");
+            let upper = c.to_ascii_uppercase();
+            assert_eq!(
+                char_to_proto_key(upper),
+                (key, upper.to_string(), c as u32),
+                "{upper:?} shares {c:?}'s key and unshifted codepoint, keeps its glyph"
+            );
+        }
+    }
+
+    #[test]
+    fn char_to_proto_key_named_examples_map_to_expected_triples() {
+        let cases = [
+            ('a', ProtoKey::A, 'a' as u32),
+            ('5', ProtoKey::Digit5, '5' as u32),
+            (' ', ProtoKey::Space, ' ' as u32),
+            // ASCII punctuation has no physical key but still reports a codepoint.
+            ('!', ProtoKey::Unidentified, '!' as u32),
+            // Non-ASCII has no unshifted codepoint.
+            ('é', ProtoKey::Unidentified, 0),
+        ];
+        for (c, key, unshifted) in cases {
+            assert_eq!(
+                char_to_proto_key(c),
+                (key, c.to_string(), unshifted),
+                "{c:?}"
+            );
+        }
     }
 }

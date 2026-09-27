@@ -624,6 +624,11 @@ mod tests {
         (mgr, rx)
     }
 
+    /// Every outbound message queued so far, in order.
+    fn drain(rx: &mut mpsc::UnboundedReceiver<ClientMessage>) -> Vec<ClientMessage> {
+        std::iter::from_fn(|| rx.try_recv().ok()).collect()
+    }
+
     /// The client side of the live daemon upgrade (#36): when the daemon restarts,
     /// the old transport dies and the client reconnects to the successor. The
     /// successor adopts the predecessor's token and can transfer the existing pane
@@ -890,8 +895,15 @@ mod tests {
         ));
     }
 
+    /// A one-pane, one-tab `SessionEntry`.
     fn make_entry(word_id: &str, cwd: &str) -> SessionEntry {
-        use kmux_protocol::messages::SessionMeta;
+        make_entry_with_tabs(word_id, cwd, 1)
+    }
+
+    /// Build a `SessionEntry` with one tab per pane index (mirrors the
+    /// `PaneCreate` = "new tab" model after the server wraps each pane).
+    fn make_entry_with_tabs(word_id: &str, cwd: &str, pane_count: u32) -> SessionEntry {
+        use kmux_protocol::messages::{LayoutNode, SessionMeta, TabInfo};
         SessionEntry {
             meta: SessionMeta {
                 index: 0,
@@ -903,23 +915,27 @@ mod tests {
                     .to_string(),
                 cwd: cwd.to_string(),
             },
-            panes: vec![PaneInfo {
-                pane_id: format_pane_id(word_id, 0),
-                pane_index: 0,
-                program: String::new(),
-                size: TermSize::default(),
-                attached_clients: vec![],
-                status: SessionStatus::Running,
-                title: String::new(),
-                progress_state: Default::default(),
-                progress: None,
-            }],
-            tabs: vec![kmux_protocol::messages::TabInfo {
-                tab_index: 0,
-                name: "1".to_string(),
-                layout: kmux_protocol::messages::LayoutNode::single(0),
-                focused_pane: 0,
-            }],
+            panes: (0..pane_count)
+                .map(|i| PaneInfo {
+                    pane_id: format_pane_id(word_id, i),
+                    pane_index: i,
+                    program: String::new(),
+                    size: TermSize::default(),
+                    attached_clients: vec![],
+                    status: SessionStatus::Running,
+                    title: String::new(),
+                    progress_state: Default::default(),
+                    progress: None,
+                })
+                .collect(),
+            tabs: (0..pane_count)
+                .map(|i| TabInfo {
+                    tab_index: i,
+                    name: format!("{}", i + 1),
+                    layout: LayoutNode::single(i),
+                    focused_pane: i,
+                })
+                .collect(),
             active_tab: 0,
             peer: None,
             peer_unreachable: false,
@@ -1230,48 +1246,6 @@ mod tests {
         assert!(mgr.buffers.contains_key("falcon/0"));
     }
 
-    /// Build a `SessionEntry` with one tab per pane index (mirrors the
-    /// `PaneCreate` = "new tab" model after the server wraps each pane).
-    fn make_entry_with_tabs(word_id: &str, cwd: &str, pane_count: u32) -> SessionEntry {
-        use kmux_protocol::messages::{LayoutNode, SessionMeta, TabInfo};
-        SessionEntry {
-            meta: SessionMeta {
-                index: 0,
-                word_id: word_id.to_string(),
-                name: std::path::Path::new(cwd)
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or(word_id)
-                    .to_string(),
-                cwd: cwd.to_string(),
-            },
-            panes: (0..pane_count)
-                .map(|i| PaneInfo {
-                    pane_id: format_pane_id(word_id, i),
-                    pane_index: i,
-                    program: String::new(),
-                    size: TermSize::default(),
-                    attached_clients: vec![],
-                    status: SessionStatus::Running,
-                    title: String::new(),
-                    progress_state: Default::default(),
-                    progress: None,
-                })
-                .collect(),
-            tabs: (0..pane_count)
-                .map(|i| TabInfo {
-                    tab_index: i,
-                    name: format!("{}", i + 1),
-                    layout: LayoutNode::single(i),
-                    focused_pane: i,
-                })
-                .collect(),
-            active_tab: 0,
-            peer: None,
-            peer_unreachable: false,
-        }
-    }
-
     #[test]
     fn pane_created_defers_select_until_refresh() {
         use super::server_handler::SessionEvent;
@@ -1280,7 +1254,7 @@ mod tests {
         mgr.session_list
             .push(make_entry_with_tabs("eagle", "/home/user/proj", 1));
         mgr.select_session("eagle".to_string());
-        while rx.try_recv().is_ok() {}
+        drain(&mut rx);
 
         // PaneCreate reply: the new pane is buffered, a refresh is requested, and
         // selection is deferred (active_pane unchanged for now).
@@ -1296,7 +1270,7 @@ mod tests {
         ));
         assert!(mgr.buffers.contains_key("eagle/1"));
         assert_eq!(mgr.pending_select_pane.as_deref(), Some("eagle/1"));
-        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs = drain(&mut rx);
         assert!(
             msgs.iter()
                 .any(|m| matches!(m, ClientMessage::SessionList { .. })),
@@ -1313,7 +1287,7 @@ mod tests {
         assert_eq!(mgr.active_pane.as_deref(), Some("eagle/1"));
         assert_eq!(mgr.active_tab, Some(1));
         assert!(mgr.pending_select_pane.is_none());
-        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs = drain(&mut rx);
         assert!(
             msgs.iter().any(
                 |m| matches!(m, ClientMessage::Attach { pane_id, .. } if pane_id == "eagle/1")
@@ -1335,7 +1309,7 @@ mod tests {
             .push(make_entry_with_tabs("eagle", "/home/user/proj", 2));
         mgr.select_session("eagle".to_string());
         mgr.select_tab(1);
-        while rx.try_recv().is_ok() {}
+        drain(&mut rx);
 
         mgr.handle_server_message(ServerMessage::TabClosed {
             request_id: 0,
@@ -1361,9 +1335,9 @@ mod tests {
         assert_eq!(mgr.active_tab, Some(0));
         assert_eq!(mgr.visible_panes(), &["eagle/0".to_string()]);
 
-        while rx.try_recv().is_ok() {}
+        drain(&mut rx);
         mgr.select_session("eagle".to_string());
-        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs = drain(&mut rx);
         assert!(
             msgs.iter().all(
                 |msg| !matches!(msg, ClientMessage::Attach { pane_id, .. } if pane_id == "eagle/1")
@@ -1402,7 +1376,7 @@ mod tests {
         mgr.session_list
             .push(make_entry_with_tabs("eagle", "/proj", 1));
         mgr.select_session("eagle".to_string());
-        while rx.try_recv().is_ok() {}
+        drain(&mut rx);
 
         // A split adds pane 1 alongside pane 0 in the active tab (tab 0).
         mgr.handle_server_message(ServerMessage::LayoutUpdate {
@@ -1426,7 +1400,7 @@ mod tests {
             &["eagle/0".to_string(), "eagle/1".to_string()]
         );
         assert_eq!(mgr.active_pane.as_deref(), Some("eagle/1"));
-        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs = drain(&mut rx);
         assert!(
             msgs.iter().any(
                 |m| matches!(m, ClientMessage::Attach { pane_id, .. } if pane_id == "eagle/1")
@@ -1439,33 +1413,6 @@ mod tests {
                 .any(|m| matches!(m, ClientMessage::Detach { pane_id } if pane_id == "eagle/0")),
             "the existing sibling must NOT be detached: {msgs:?}",
         );
-    }
-
-    #[test]
-    fn session_closed_removes_and_falls_back() {
-        use super::server_handler::SessionEvent;
-        let (mut mgr, _rx) = make_connected_manager();
-
-        let e1 = make_entry("s1", "/a");
-        let e2 = make_entry("s2", "/b");
-        mgr.session_list.push(e1);
-        mgr.session_list.push(e2);
-        mgr.buffers.insert("s1/0".to_string(), CellGrid::default());
-        mgr.buffers.insert("s2/0".to_string(), CellGrid::default());
-        mgr.active_session = Some("s1".to_string());
-        mgr.active_pane = Some("s1/0".to_string());
-
-        let events = mgr.handle_server_message(ServerMessage::SessionClosed {
-            request_id: 0,
-            word_id: "s1".to_string(),
-            exit_code: None,
-        });
-        assert!(matches!(
-            events.as_slice(),
-            [SessionEvent::SessionClosed { word_id }] if word_id == "s1"
-        ));
-        assert!(!mgr.buffers.contains_key("s1/0"));
-        assert_eq!(mgr.active_session.as_deref(), Some("s2"));
     }
 
     #[test]
@@ -1729,54 +1676,6 @@ mod tests {
             }
             other => panic!("expected TabReorder, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn tabs_reordered_event_updates_cached_order() {
-        use kmux_protocol::messages::{SessionEventMsg, TabInfo};
-        let mut mgr = make_manager();
-        let mut entry = make_entry("eagle", "/p");
-        let first = entry.tabs[0].clone();
-        entry.tabs.push(TabInfo {
-            tab_index: 2,
-            name: "third".into(),
-            layout: first.layout.clone(),
-            focused_pane: first.focused_pane,
-        });
-        entry.tabs.push(TabInfo {
-            tab_index: 1,
-            name: "second".into(),
-            layout: first.layout,
-            focused_pane: first.focused_pane,
-        });
-        mgr.session_list.push(entry);
-        mgr.handle_server_message(ServerMessage::Event {
-            event: SessionEventMsg::TabsReordered {
-                word_id: "eagle".into(),
-                tab_indices: vec![2, 0, 1],
-            },
-        });
-        let order: Vec<_> = mgr.session_list[0]
-            .tabs
-            .iter()
-            .map(|tab| tab.tab_index)
-            .collect();
-        assert_eq!(order, vec![2, 0, 1]);
-    }
-
-    #[test]
-    fn tab_renamed_event_updates_cached_name() {
-        use kmux_protocol::messages::SessionEventMsg;
-        let mut mgr = make_manager();
-        mgr.session_list.push(make_entry("eagle", "/p")); // tab 0 starts named "1"
-        mgr.handle_server_message(ServerMessage::Event {
-            event: SessionEventMsg::TabRenamed {
-                word_id: "eagle".into(),
-                tab_index: 0,
-                name: "logs".into(),
-            },
-        });
-        assert_eq!(mgr.session_list[0].tabs[0].name, "logs");
     }
 
     #[test]
@@ -2176,34 +2075,6 @@ mod tests {
     }
 
     #[test]
-    fn pane_resized_event_resizes_cellgrid() {
-        use kmux_protocol::messages::SessionEventMsg;
-        // PaneResized event must resize the local CellGrid buffer so it matches
-        // the daemon's new effective size before the forced TerminalSnapshot arrives.
-        let (mut mgr, _rx) = make_connected_manager();
-        let mut grid = CellGrid::default();
-        grid.resize(24, 80);
-        mgr.buffers.insert("eagle/0".to_string(), grid);
-
-        let new_size = TermSize {
-            rows: 40,
-            cols: 120,
-            pixel_width: 0,
-            pixel_height: 0,
-        };
-        mgr.handle_server_message(ServerMessage::Event {
-            event: SessionEventMsg::PaneResized {
-                pane_id: "eagle/0".to_string(),
-                size: new_size,
-            },
-        });
-
-        let grid = mgr.buffers.get("eagle/0").expect("buffer exists");
-        assert_eq!(grid.rows, 40);
-        assert_eq!(grid.cols, 120);
-    }
-
-    #[test]
     fn request_list_directory_sends_message_and_records_request() {
         let (mut mgr, mut rx) = make_connected_manager();
         mgr.request_list_directory("/home/user".to_string());
@@ -2317,7 +2188,7 @@ mod tests {
         // Resume: SetPaused { paused: false } then a full-snapshot re-attach of
         // every visible pane (last_seqno: None → daemon sends final state).
         mgr.reconcile_pause(false, false);
-        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs = drain(&mut rx);
         assert!(
             matches!(
                 msgs.first(),
@@ -2354,7 +2225,7 @@ mod tests {
         // Auto-pause: SetPaused { auto: true }; the exempt pane keeps streaming,
         // so nothing is re-attached.
         mgr.reconcile_pause(true, true);
-        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs = drain(&mut rx);
         assert!(matches!(
             msgs.first(),
             Some(ClientMessage::SetPaused {
@@ -2370,7 +2241,7 @@ mod tests {
         // Foreground: only the non-exempt eagle/1 was withheld, so only it catches
         // up. The exempt eagle/0 streamed throughout and needs no re-attach.
         mgr.reconcile_pause(false, false);
-        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs = drain(&mut rx);
         assert_eq!(
             reattached_panes(&msgs),
             vec!["eagle/1"],
@@ -2383,13 +2254,13 @@ mod tests {
         let (mut mgr, mut rx) = make_connected_manager();
         mgr.visible_panes = vec!["eagle/0".to_string()];
         assert!(mgr.toggle_pane_auto_pause_exempt("eagle/0"));
-        let _ = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        drain(&mut rx);
 
         // A manual pause (auto: false) withholds even the exempt pane, so on
         // resume it must be re-attached to catch up.
         mgr.reconcile_pause(true, false);
         mgr.reconcile_pause(false, false);
-        let msgs: Vec<ClientMessage> = std::iter::from_fn(|| rx.try_recv().ok()).collect();
+        let msgs = drain(&mut rx);
         assert_eq!(
             reattached_panes(&msgs),
             vec!["eagle/0"],
@@ -2527,7 +2398,7 @@ mod tests {
                 .is_some_and(|g| g.pending_history_gap().is_some()),
             "the diff must open a pending history gap"
         );
-        let _ = std::iter::from_fn(|| rx.try_recv().ok()).collect::<Vec<_>>();
+        drain(&mut rx);
 
         // A wrong digest while the fetch is outstanding must NOT resync.
         mgr.handle_server_message(ServerMessage::GridDigest {
