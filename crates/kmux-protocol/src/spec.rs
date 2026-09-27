@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use serde::de::DeserializeOwned;
 
-use crate::messages::{ClientMessage, ServerMessage};
+use crate::messages::{ClientMessage, Federation, ServerMessage, every_client_message};
 use crate::timing;
 
 /// The specification, as the build that tests it sees it.
@@ -114,6 +114,59 @@ fn the_catalogue_lists_every_server_message_and_no_other() {
         &first_column(&table("server-messages")),
         &variants::<ServerMessage>(),
     );
+}
+
+/// The variant name a message is sent under (its serde `type` tag).
+fn variant_name(msg: &ClientMessage) -> String {
+    serde_json::to_value(msg).expect("serializable")["type"]
+        .as_str()
+        .expect("a type tag")
+        .to_string()
+}
+
+/// The per-variant samples cover every variant once, so a property checked
+/// over them is checked for every message, and a new variant fails here
+/// until it has a sample.
+#[test]
+fn every_client_message_samples_each_variant_once() {
+    let names: Vec<String> = every_client_message().iter().map(variant_name).collect();
+    assert_lists_exactly("every_client_message", &names, &variants::<ClientMessage>());
+}
+
+/// The catalogue's **Federated** column is [`ClientMessage::federation`],
+/// message by message: what a hub does with a request for a session it
+/// proxies is specified, and specified as built (issue #227).
+#[test]
+fn the_catalogue_states_each_client_messages_federation() {
+    let header = SPEC
+        .split_once("<!-- spec:client-messages -->")
+        .and_then(|(_, after)| after.lines().find(|line| line.starts_with('|')))
+        .expect("the catalogue's header");
+    let column = header
+        .trim_matches('|')
+        .split('|')
+        .position(|cell| cell.trim() == "Federated")
+        .expect("a Federated column");
+    let rows = table("client-messages");
+    for mut msg in every_client_message() {
+        let name = variant_name(&msg);
+        let row = rows
+            .iter()
+            .find(|row| code_spans(&row[0]).first() == Some(&name.as_str()))
+            .unwrap_or_else(|| panic!("`{name}` is not in the catalogue"));
+        let built = match msg.federation() {
+            Federation::Forward { .. } => "forwarded",
+            Federation::Aggregate => "aggregated",
+            Federation::Hub => "hub",
+        };
+        let documented = row[column].split([' ', ',', ';', ':']).next();
+        assert_eq!(
+            documented,
+            Some(built),
+            "`{name}`: the catalogue says {:?}",
+            row[column]
+        );
+    }
 }
 
 /// Every constant in [`crate::timing`], by name.

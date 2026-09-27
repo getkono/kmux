@@ -175,57 +175,63 @@ before sending it — none today, the column exists so the first one is recorded
 here. A `request_id` is chosen by the client, counts up from 0, and is echoed
 in the reply; `RESYNC_REQUEST_ID` (`u64::MAX`) marks an unsolicited session
 list. A message with no `request_id` field is answered, on failure, with
-`Error { request_id: None }`; so is every request made before the handshake. "Federated" describes a request for a session a hub proxies from a peer
-([architecture-federation.md](architecture-federation.md)).
+`Error { request_id: None }`; so is every request made before the handshake.
+**Federated** is what a hub does with the message when the session it names
+is one the hub proxies from a peer: *forwarded* to the peer under the peer's
+ids, *aggregated* across the hub's viewers, or answered by the *hub* alone
+([architecture-federation.md](architecture-federation.md)). The `spec` tests
+hold the column to `ClientMessage::federation`, variant by variant; until the
+hub follows it for every message, [Known gaps](#known-gaps) lists where it
+does not.
 
 ### Client → daemon
 
 <!-- spec:client-messages -->
-| Message | Answer | Also | Idem. | Cap. |
-|---|---|---|---|---|
-| `Auth` | `AuthChallenge`; a refusal is `AuthResult { failure }`, then close | — | resend before `AuthProof` replaces the challenge; ignored once authenticated | — |
-| `AuthProof` | `AuthResult { success: true }`; a bad signature is `AuthResult { IdentityRejected }`, then close; with no challenge, `Error NotAuthenticated` | — | ignored once authenticated | — |
-| `ChannelReady` | `ChannelSwitched { old_transport }` if this channel resumed a registration, else nothing | — | yes: the pending switch is consumed | — |
-| `SessionCreate` | `SessionCreated`; `Error` | `Event SessionCreated`, `PaneSpawned` | no: creates another | — |
-| `SessionClose` | `SessionClosed`; `Error SessionNotFound` (federated: `InternalError` when the peer refuses or is unreachable) | `Event SessionClosed` | effect yes; a second is `SessionNotFound` | — |
-| `SessionList` | `SessionListResult` (local then federated sessions) | — | yes | — |
-| `ProcessOverview` | `ProcessOverviewResult` (local and every peer's panes) | — | yes | — |
-| `SessionRename` | `SessionRenamed` (no `request_id`); `Error SessionNotFound` | `Event SessionRenamed` | yes | — |
-| `SessionListClosed` | `ClosedSessionListResult` | — | yes | — |
-| `SessionRestore` | `SessionCreated`; `Error` | `Event SessionCreated`, `PaneSpawned` | no: a second is `SessionNotFound` | — |
-| `PaneCreate` | `PaneCreated` (the pane opens in a new tab); `Error` | `Event TabCreated`, `PaneSpawned` | no | — |
-| `PaneClose` | `PaneClosed`; `Error PaneNotFound` | `Event PaneClosed`, and `LayoutUpdate`, or `Event TabClosed` / `SessionClosed` when it was the last | no: a second is `PaneNotFound` | — |
-| `TabCreate` | `TabCreated`; `Error` | `Event TabCreated`, `PaneSpawned` | no | — |
-| `TabClose` | `TabClosed`; `Error SessionNotFound` (federated: `InternalError`) | `Event TabClosed`, or `SessionClosed` for the last tab | effect yes | — |
-| `TabRename` | nothing; `Error SessionNotFound` | `Event TabRenamed` | yes | — |
-| `TabReorder` | nothing; `Error SessionNotFound` | `Event TabsReordered` | yes | — |
-| `PaneSplit` | `PaneSplit`; `Error` | `LayoutUpdate`, `PaneSpawned` | no | — |
-| `PaneSwap` | nothing; `Error SessionNotFound` (federated: `InternalError` when the link is down) | `LayoutUpdate` | no: a second undoes the first | — |
-| `SetLayoutRatios` | nothing; as `PaneSwap` | `LayoutUpdate` | yes | — |
-| `ApplyLayoutScheme` | nothing; as `PaneSwap`; an `Unknown` scheme is ignored | `LayoutUpdate` | yes | — |
-| `SetFocus` | nothing; as `PaneSwap` | `LayoutUpdate` | yes | — |
-| `PtyInput` | nothing; `Error PaneNotFound` / `InputLocked` / `InternalError` (queue full) | — | no: bytes are written again | — |
-| `PtyKeyBatch` | as `PtyInput` | — | no | — |
-| `PtyPaste` | as `PtyInput` | — | no | — |
-| `Resize` | nothing; `Error PaneNotFound` | if the pane's smallest-wins size changes: `Event PaneResized` (to everyone, and again to each viewer) and a `TerminalSnapshot` to each viewer | yes | — |
-| `Attach` | the pane's replay on its data path: `TerminalSnapshot`, the missed `TerminalUpdate`s, or `SyncReset` + `TerminalSnapshot`; `Error PaneNotFound`, or `InternalError` when a QUIC pane stream cannot be opened | maybe a resize | yes: re-attaching replaces the attachment | — |
-| `Detach` | nothing | maybe a resize | yes | — |
-| `Signal` | nothing; `Error PaneNotFound` / `InternalError` (an invalid signal) / `InputLocked` (the kernel refused it, `EPERM`) | — | no | — |
-| `RequestInputLock` | `InputLockGranted` or `InputLockDenied { holder }`; `Error PaneNotFound` | — | yes | — |
-| `ReleaseInputLock` | `InputLockReleased` if this client held it, else nothing; `Error PaneNotFound` | — | effect yes | — |
-| `SetSnapshotMode` | nothing | — | yes | — |
-| `SetPaused` | nothing | — | yes | — |
-| `SetPaneNoAutoPause` | nothing | — | yes | — |
-| `FetchHistory` | `HistoryLines`; `Error PaneNotFound` | — | yes | — |
-| `Ping` | `Pong { seq }` | — | yes | — |
-| `Pong` | nothing (records a round trip if `seq` is the last ping's) | — | yes | — |
-| `ListDirectory` | `DirectoryListing` (a failure is its `error`, never `Error`) | — | yes | — |
-| `OpenPeer` | `PeerOpened`, or `PeerError` | — | yes: an open peer is reused | — |
-| `ClosePeer` | `PeerClosed`, even for an unknown peer | `Event SessionClosed` per peer session | yes | — |
-| `ClientList` | `ClientListResult`; `Error SessionNotFound` | — | yes | — |
-| `KickClient` | `ClientKicked`; `Error SessionNotFound` / `ClientNotFound` | `SessionKicked` to the kicked connection | effect yes | — |
-| `Notify` | `NotifyAccepted`; `Error PaneNotFound` | `Event PaneAttention` (a fresh `attention_id` each time) | no | — |
-| `FetchLogs` | `LogChunk`s, then `LogEnd` unless `follow`; `Error InternalError` | — | yes (each `follow` is another tail) | — |
+| Message | Answer | Also | Idem. | Cap. | Federated |
+|---|---|---|---|---|---|
+| `Auth` | `AuthChallenge`; a refusal is `AuthResult { failure }`, then close | — | resend before `AuthProof` replaces the challenge; ignored once authenticated | — | hub |
+| `AuthProof` | `AuthResult { success: true }`; a bad signature is `AuthResult { IdentityRejected }`, then close; with no challenge, `Error NotAuthenticated` | — | ignored once authenticated | — | hub |
+| `ChannelReady` | `ChannelSwitched { old_transport }` if this channel resumed a registration, else nothing | — | yes: the pending switch is consumed | — | hub |
+| `SessionCreate` | `SessionCreated`; `Error` | `Event SessionCreated`, `PaneSpawned` | no: creates another | — | forwarded, when `peer` names one (a local create is the hub's) |
+| `SessionClose` | `SessionClosed`; `Error SessionNotFound` (federated: `InternalError` when the peer refuses or is unreachable) | `Event SessionClosed` | effect yes; a second is `SessionNotFound` | — | forwarded; on the answer the hub drops the session for every client |
+| `SessionList` | `SessionListResult` (local then federated sessions) | — | yes | — | hub: its own sessions and every peer's |
+| `ProcessOverview` | `ProcessOverviewResult` (local and every peer's panes) | — | yes | — | hub: its own panes and every peer's |
+| `SessionRename` | `SessionRenamed` (no `request_id`); `Error SessionNotFound` | `Event SessionRenamed` | yes | — | forwarded |
+| `SessionListClosed` | `ClosedSessionListResult` | — | yes | — | hub: its own closed sessions only (#228) |
+| `SessionRestore` | `SessionCreated`; `Error` | `Event SessionCreated`, `PaneSpawned` | no: a second is `SessionNotFound` | — | hub: its own closed sessions only (#228) |
+| `PaneCreate` | `PaneCreated` (the pane opens in a new tab); `Error` | `Event TabCreated`, `PaneSpawned` | no | — | forwarded |
+| `PaneClose` | `PaneClosed`; `Error PaneNotFound` | `Event PaneClosed`, and `LayoutUpdate`, or `Event TabClosed` / `SessionClosed` when it was the last | no: a second is `PaneNotFound` | — | forwarded |
+| `TabCreate` | `TabCreated`; `Error` | `Event TabCreated`, `PaneSpawned` | no | — | forwarded |
+| `TabClose` | `TabClosed`; `Error SessionNotFound` (federated: `InternalError`) | `Event TabClosed`, or `SessionClosed` for the last tab | effect yes | — | forwarded |
+| `TabRename` | nothing; `Error SessionNotFound` | `Event TabRenamed` | yes | — | forwarded |
+| `TabReorder` | nothing; `Error SessionNotFound` | `Event TabsReordered` | yes | — | forwarded |
+| `PaneSplit` | `PaneSplit`; `Error` | `LayoutUpdate`, `PaneSpawned` | no | — | forwarded |
+| `PaneSwap` | nothing; `Error SessionNotFound` (federated: `InternalError` when the link is down) | `LayoutUpdate` | no: a second undoes the first | — | forwarded |
+| `SetLayoutRatios` | nothing; as `PaneSwap` | `LayoutUpdate` | yes | — | forwarded |
+| `ApplyLayoutScheme` | nothing; as `PaneSwap`; an `Unknown` scheme is ignored | `LayoutUpdate` | yes | — | forwarded |
+| `SetFocus` | nothing; as `PaneSwap` | `LayoutUpdate` | yes | — | forwarded |
+| `PtyInput` | nothing; `Error PaneNotFound` / `InputLocked` / `InternalError` (queue full) | — | no: bytes are written again | — | forwarded, unless another viewer holds the hub's input lock (`InputLocked`) |
+| `PtyKeyBatch` | as `PtyInput` | — | no | — | forwarded, as `PtyInput` |
+| `PtyPaste` | as `PtyInput` | — | no | — | forwarded, as `PtyInput` |
+| `Resize` | nothing; `Error PaneNotFound` | if the pane's smallest-wins size changes: `Event PaneResized` (to everyone, and again to each viewer) and a `TerminalSnapshot` to each viewer | yes | — | aggregated: the peer is sent one smallest-wins size |
+| `Attach` | the pane's replay on its data path: `TerminalSnapshot`, the missed `TerminalUpdate`s, or `SyncReset` + `TerminalSnapshot`; `Error PaneNotFound`, or `InternalError` when a QUIC pane stream cannot be opened | maybe a resize | yes: re-attaching replaces the attachment | — | aggregated: attached upstream for the first viewer; later ones are served from the hub's mirror |
+| `Detach` | nothing | maybe a resize | yes | — | aggregated: detached upstream after the last viewer |
+| `Signal` | nothing; `Error PaneNotFound` / `InternalError` (an invalid signal) / `InputLocked` (the kernel refused it, `EPERM`) | — | no | — | forwarded |
+| `RequestInputLock` | `InputLockGranted` or `InputLockDenied { holder }`; `Error PaneNotFound` | — | yes | — | aggregated: not yet — answered by the hub (see Known gaps) |
+| `ReleaseInputLock` | `InputLockReleased` if this client held it, else nothing; `Error PaneNotFound` | — | effect yes | — | aggregated: not yet — answered by the hub (see Known gaps) |
+| `SetSnapshotMode` | nothing | — | yes | — | hub: local panes only (see Known gaps) |
+| `SetPaused` | nothing | — | yes | — | hub: applies to proxied panes too |
+| `SetPaneNoAutoPause` | nothing | — | yes | — | hub: applies to proxied panes too |
+| `FetchHistory` | `HistoryLines`; `Error PaneNotFound` | — | yes | — | forwarded |
+| `Ping` | `Pong { seq }` | — | yes | — | hub |
+| `Pong` | nothing (records a round trip if `seq` is the last ping's) | — | yes | — | hub |
+| `ListDirectory` | `DirectoryListing` (a failure is its `error`, never `Error`) | — | yes | — | hub: the hub's own filesystem |
+| `OpenPeer` | `PeerOpened`, or `PeerError` | — | yes: an open peer is reused | — | hub |
+| `ClosePeer` | `PeerClosed`, even for an unknown peer | `Event SessionClosed` per peer session | yes | — | hub |
+| `ClientList` | `ClientListResult`; `Error SessionNotFound` | — | yes | — | forwarded |
+| `KickClient` | `ClientKicked`; `Error SessionNotFound` / `ClientNotFound` | `SessionKicked` to the kicked connection | effect yes | — | forwarded |
+| `Notify` | `NotifyAccepted`; `Error PaneNotFound` | `Event PaneAttention` (a fresh `attention_id` each time) | no | — | forwarded |
+| `FetchLogs` | `LogChunk`s, then `LogEnd` unless `follow`; `Error InternalError` | — | yes (each `follow` is another tail) | — | hub: the hub's own log |
 
 Notes that apply to rows above:
 
