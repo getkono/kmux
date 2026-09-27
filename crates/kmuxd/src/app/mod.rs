@@ -1991,6 +1991,19 @@ mod tests {
         assert_ne!(late.connection_id, first.connection_id);
     }
 
+    /// A session list names the local sessions, then every open peer's
+    /// proxied ones — what `SessionList` answers and a lag resync sends.
+    #[tokio::test]
+    async fn all_sessions_lists_local_sessions_then_federated_ones() {
+        let app = app_with_one_pane("eagle").await;
+        let (_upstream, _peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let words = |entries: Vec<kmux_protocol::messages::SessionEntry>| -> Vec<String> {
+            entries.into_iter().map(|e| e.meta.word_id).collect()
+        };
+        assert_eq!(words(app.list_sessions().await), vec!["eagle"]);
+        assert_eq!(words(app.all_sessions().await), vec!["eagle", "fedlocal"]);
+    }
+
     /// A client that resumes re-attaches each pane with the last seqno it
     /// applied and is sent exactly what it missed; one whose seqno is older
     /// than the pane's retained diffs is reset to a fresh snapshot.
