@@ -1,5 +1,6 @@
 use std::os::unix::io::{IntoRawFd, RawFd};
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, PoisonError};
 
 use nix::pty::{ForkptyResult, forkpty};
 use nix::sys::signal::{SigSet, SigmaskHow, Signal, pthread_sigmask};
@@ -14,6 +15,12 @@ use crate::platform::to_winsize;
 use crate::process::ExitStatus;
 use crate::reaper::reaper;
 use crate::shutdown::signal_group;
+
+/// Held across every `forkpty`. macOS's `forkpty` is not safe to call from
+/// two threads at once: raced, it fails without setting `errno` (nix reports
+/// `UnknownErrno`), so a pane spawned while another is spawning could fail
+/// to start. Uncontended it costs nothing that forking does not dwarf.
+static FORKPTY: Mutex<()> = Mutex::new(());
 
 /// A spawned PTY process.
 ///
@@ -63,6 +70,9 @@ impl PtyProcess {
             Some(&mut previous),
         )
         .map_err(KmuxError::Pty)?;
+        // One `forkpty` at a time (see [`FORKPTY`]). The child never releases
+        // it: it only execs, and unlocking is not async-signal-safe.
+        let serial = FORKPTY.lock().unwrap_or_else(PoisonError::into_inner);
         // SAFETY: the child branch calls only `ChildPlan::exec`, which makes
         // async-signal-safe calls on memory prepared before the fork.
         let fork_result = unsafe { forkpty(Some(&winsize), None) };
@@ -75,6 +85,7 @@ impl PtyProcess {
             // SAFETY: we are the freshly forked child.
             ForkptyResult::Child => unsafe { plan.exec() },
             ForkptyResult::Parent { child, master } => {
+                drop(serial);
                 let exit_rx = reaper.watch(child);
                 let io = PtyMasterIo::new(master.into_raw_fd()).map_err(|e| {
                     // No handle will own this child, so nothing else would end it.
@@ -377,11 +388,13 @@ mod tests {
 
     /// Each child changes directory itself, so spawns racing each other each
     /// land in their own directory, and the spawning process never moves.
-    /// Needs real children to report where they run (R7).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    /// Enough of them on enough threads that unserialised `forkpty`s collide
+    /// on macOS (14 runs in 20 failed without [`FORKPTY`]). Needs real
+    /// children to report where they run (R7).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 16)]
     async fn concurrent_spawns_each_run_in_their_own_directory() {
         let before = std::env::current_dir().expect("cwd");
-        let dirs: Vec<tempfile::TempDir> = (0..8)
+        let dirs: Vec<tempfile::TempDir> = (0..32)
             .map(|_| tempfile::tempdir().expect("tempdir"))
             .collect();
 
