@@ -138,15 +138,15 @@ impl AppCore {
         }
     }
 
-    /// SSH-only architecture: auth failure on the data plane means the SSH
-    /// tunnel is up but the daemon rejected the token. Surface as a disconnect;
-    /// the user can reconnect. Log it too — every other GUI-visible disconnect
-    /// path emits a `warn!`, so this must as well or the overlay shows an error
-    /// with nothing in the client log to explain it.
+    /// The daemon refused the handshake. Surface it as a disconnect that says
+    /// why (`reason` carries the refusal and, for a protocol mismatch, the
+    /// upgrade hint); the user can reconnect. Log it too — every other
+    /// GUI-visible disconnect path emits a `warn!`, so this must as well or the
+    /// overlay shows an error with nothing in the client log to explain it.
     fn on_auth_failed(&mut self, reason: &str) -> Option<KeyResult> {
         warn!(%reason, "authentication failed");
         self.mode = Mode::Disconnected {
-            reason: "authentication failed".into(),
+            reason: format!("authentication failed: {reason}"),
         };
         None
     }
@@ -1104,7 +1104,7 @@ mod tests {
 
         assert!(effects.is_empty(), "no frontend effect: {effects:?}");
         assert!(
-            matches!(&core.mode, Mode::Disconnected { reason } if reason == "authentication failed"),
+            matches!(&core.mode, Mode::Disconnected { reason } if reason == "authentication failed: bad token"),
             "{:?}",
             core.mode
         );

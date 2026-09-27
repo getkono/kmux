@@ -1,5 +1,7 @@
 use serde::{Deserialize, Serialize};
 
+use super::wire_enum::wire_enum;
+
 pub type RequestId = u64;
 
 /// The `request_id` of a `SessionListResult` nobody asked for: the daemon
@@ -75,6 +77,7 @@ pub type TabIndex = u32;
 /// can attribute each connection (and `kmux clients` / `kmux client status` can
 /// distinguish a CLI invocation from a GUI client).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum FrontendKind {
     /// A short-lived `kmux` CLI subcommand (`ls`, `clients`, `notify`, …).
     #[default]
@@ -83,6 +86,24 @@ pub enum FrontendKind {
     Gtk,
     /// The native macOS Swift app (`kmux-swift`).
     Swift,
+    /// A frontend this build does not know, from a newer peer.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
+    #[serde(other)]
+    Unknown,
+}
+wire_enum!(FrontendKind);
+
+impl FrontendKind {
+    /// What to send for this value: itself, or — since `Unknown` is never
+    /// sent — `Cli`, which is also what a receiver assumes when the field is
+    /// absent.
+    #[must_use]
+    pub fn sendable(self) -> Self {
+        match self {
+            Self::Unknown => Self::Cli,
+            known => known,
+        }
+    }
 }
 
 impl std::fmt::Display for FrontendKind {
@@ -91,6 +112,7 @@ impl std::fmt::Display for FrontendKind {
             Self::Cli => "cli",
             Self::Gtk => "gtk",
             Self::Swift => "swift",
+            Self::Unknown => "unknown",
         };
         f.write_str(s)
     }
@@ -131,6 +153,7 @@ pub type PeerId = String;
 /// `PeerTarget` and proxies that peer's sessions to local GUIs. The daemon maps
 /// this onto `kmux_connect`'s connect mechanism.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum PeerTarget {
     /// Reach the peer over SSH: `kmuxd probe-or-start` over SSH, then TCP+TLS
     /// through the resulting `-L` tunnel. The default for `--server user@host`.
@@ -157,7 +180,13 @@ pub enum PeerTarget {
         /// Accept a self-signed / unpinned TLS certificate on the data plane.
         accept_invalid_certs: bool,
     },
+    /// A kind of target this build does not know, from a newer client. The
+    /// daemon answers it with `PeerError`.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
+    #[serde(other)]
+    Unknown,
 }
+wire_enum!(PeerTarget);
 
 impl PeerTarget {
     /// The stable [`PeerId`] for this target: SSH → `"user@host"` (suffixed
@@ -182,6 +211,7 @@ impl PeerTarget {
                 }
             }
             Self::Direct { host, port, .. } => format!("{host}:{port}"),
+            Self::Unknown => "unknown".to_string(),
         }
     }
 
@@ -196,6 +226,7 @@ impl PeerTarget {
                 accept_invalid_certs,
                 ..
             } => *accept_invalid_certs,
+            Self::Unknown => false,
         }
     }
 }
@@ -272,6 +303,7 @@ pub struct DirEntry {
 /// Ghostty renders this as a thin bar in the window; kmux renders it per pane.
 /// `Remove` means no bar is shown.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum PaneProgressState {
     /// No progress bar (cleared, or never set).
     #[default]
@@ -284,6 +316,24 @@ pub enum PaneProgressState {
     Indeterminate,
     /// Paused / warning.
     Pause,
+    /// A state this build does not know, from a newer daemon; shown as no
+    /// bar.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
+    #[serde(other)]
+    Unknown,
+}
+wire_enum!(PaneProgressState);
+
+impl PaneProgressState {
+    /// What to send for this value: itself, or — since `Unknown` is never
+    /// sent — `Remove`, the state it is shown as.
+    #[must_use]
+    pub fn sendable(self) -> Self {
+        match self {
+            Self::Unknown => Self::Remove,
+            known => known,
+        }
+    }
 }
 
 /// Why a pane is asking for the user's attention (issue #169).
@@ -293,6 +343,7 @@ pub enum PaneProgressState {
 /// its lifecycle to one of these so the client can word the notification
 /// appropriately.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum AttentionKind {
     /// The program finished a unit of work and is idle (e.g. Claude Code's
     /// `Stop` hook — a turn completed).
@@ -300,6 +351,24 @@ pub enum AttentionKind {
     /// The program is blocked waiting on the user (e.g. Claude Code's
     /// `Notification` hook — a permission prompt or idle input).
     NeedsInput,
+    /// A reason this build does not know, from a newer peer; worded as a
+    /// plain request for attention.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
+    #[serde(other)]
+    Unknown,
+}
+wire_enum!(AttentionKind);
+
+impl AttentionKind {
+    /// What to send for this value: itself, or — since `Unknown` is never
+    /// sent — `TurnDone`, the plain request for attention it is shown as.
+    #[must_use]
+    pub fn sendable(self) -> Self {
+        match self {
+            Self::Unknown => Self::TurnDone,
+            known => known,
+        }
+    }
 }
 
 /// Snapshot of a single pane within a session.
@@ -384,6 +453,7 @@ pub enum SplitDir {
 /// into from its current set of panes (in their existing leaf order), à la tmux's
 /// preset layouts. Used by `ApplyLayoutScheme`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum LayoutScheme {
     /// All panes in a single row (one horizontal split).
     EvenHorizontal,
@@ -393,7 +463,13 @@ pub enum LayoutScheme {
     MainVertical,
     /// A large "main" pane on top; the rest in a row along the bottom.
     MainHorizontal,
+    /// A scheme this build does not know, from a newer client; the daemon
+    /// leaves the layout as it is.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
+    #[serde(other)]
+    Unknown,
 }
+wire_enum!(LayoutScheme);
 
 /// A resolution-independent tiling layout for one tab.
 ///
@@ -537,6 +613,7 @@ pub enum InputMode {
 
 /// Lifecycle event relayed from the server's event bus.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(remote = "Self")]
 pub enum SessionEventMsg {
     /// A new session (with its initial pane) was created.
     SessionCreated { word_id: WordId },
@@ -619,13 +696,13 @@ pub enum SessionEventMsg {
         word_id: WordId,
         tab_indices: Vec<TabIndex>,
     },
-    /// A tab's layout tree and/or focus changed. Clients should reconcile to the
-    /// authoritative tree carried by the next `LayoutUpdate` for this tab.
-    LayoutChanged {
-        word_id: WordId,
-        tab_index: TabIndex,
-    },
+    /// An event this build does not know, from a newer daemon; receivers
+    /// ignore it.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
+    #[serde(other)]
+    Unknown,
 }
+wire_enum!(SessionEventMsg);
 
 #[cfg(test)]
 mod tests {
@@ -940,6 +1017,45 @@ mod tests {
     }
 
     #[test]
+    fn frontend_kind_names() {
+        let names: Vec<String> = [
+            FrontendKind::Cli,
+            FrontendKind::Gtk,
+            FrontendKind::Swift,
+            FrontendKind::Unknown,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(names, ["cli", "gtk", "swift", "unknown"]);
+    }
+
+    #[test]
+    fn an_unknown_peer_target_names_no_endpoint_and_trusts_no_certificate() {
+        assert_eq!(PeerTarget::Unknown.peer_id(), "unknown");
+        assert!(!PeerTarget::Unknown.accept_invalid_certs());
+    }
+
+    #[test]
+    fn unknown_is_sent_as_the_value_it_is_shown_as() {
+        assert_eq!(FrontendKind::Unknown.sendable(), FrontendKind::Cli);
+        assert_eq!(FrontendKind::Gtk.sendable(), FrontendKind::Gtk);
+        assert_eq!(
+            PaneProgressState::Unknown.sendable(),
+            PaneProgressState::Remove
+        );
+        assert_eq!(
+            PaneProgressState::Error.sendable(),
+            PaneProgressState::Error
+        );
+        assert_eq!(AttentionKind::Unknown.sendable(), AttentionKind::TurnDone);
+        assert_eq!(
+            AttentionKind::NeedsInput.sendable(),
+            AttentionKind::NeedsInput
+        );
+    }
+
+    #[test]
     fn tab_lifecycle_events_roundtrip() {
         for msg in [
             SessionEventMsg::TabCreated {
@@ -954,10 +1070,6 @@ mod tests {
                 word_id: "eagle".into(),
                 tab_index: 1,
                 name: "logs".into(),
-            },
-            SessionEventMsg::LayoutChanged {
-                word_id: "eagle".into(),
-                tab_index: 0,
             },
         ] {
             let bytes = rmp_serde::to_vec_named(&msg).expect("serialize");
@@ -992,23 +1104,4 @@ mod tests {
             _ => panic!("wrong variant"),
         }
     }
-}
-
-/// Error codes for structured error responses.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum ErrorCode {
-    AuthFailed,
-    SessionNotFound,
-    SessionAlreadyExists,
-    NotAuthenticated,
-    InvalidMessage,
-    InternalError,
-    InputLocked,
-    InputDisabled,
-    /// The daemon has reached the 1000 active session limit.
-    SessionLimitReached,
-    /// The specified pane was not found.
-    PaneNotFound,
-    /// The specified client connection was not found / not attached (issue #146).
-    ClientNotFound,
 }

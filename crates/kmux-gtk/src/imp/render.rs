@@ -258,14 +258,15 @@ fn paint_pause_badge(cr: &cairo::Context, palette: &Palette, px: f64, py: f64, p
 }
 
 /// The `(color, width-fraction)` for a pane's OSC 9;4 progress bar, or `None`
-/// when no bar should be drawn (`Remove`). `Indeterminate` fills the full width;
+/// when no bar should be drawn (`Remove`, or a state from a newer daemon this
+/// build does not know). `Indeterminate` fills the full width;
 /// the numeric states use `progress`/100. Colours: set→accent, error→red,
 /// pause→orange.
 fn progress_bar_fill(info: &PaneInfo, palette: &Palette) -> Option<((u8, u8, u8), f64)> {
     use kmux_protocol::messages::PaneProgressState as S;
     let frac = f64::from(info.progress.unwrap_or(0).min(100)) / 100.0;
     let (c, fraction) = match info.progress_state {
-        S::Remove => return None,
+        S::Remove | S::Unknown => return None,
         S::Set => (palette.accent, frac),
         S::Error => (palette.red, frac),
         S::Pause => (palette.orange, frac),
@@ -643,4 +644,59 @@ fn ensure_monospace(mut desc: pango::FontDescription, size_pt: f32) -> pango::Fo
         desc.set_size((size_pt * pango::SCALE as f32) as i32);
     }
     desc
+}
+
+#[cfg(test)]
+mod tests {
+    use kmux_protocol::messages::{PaneProgressState, SessionStatus, TermSize};
+
+    use super::*;
+
+    fn pane(progress_state: PaneProgressState, progress: Option<u8>) -> PaneInfo {
+        PaneInfo {
+            pane_id: "eagle/0".into(),
+            pane_index: 0,
+            program: "sh".into(),
+            size: TermSize::default(),
+            attached_clients: vec![],
+            status: SessionStatus::Running,
+            title: String::new(),
+            progress_state,
+            progress,
+        }
+    }
+
+    fn rgb(c: kmux_app::theme::Rgb) -> (u8, u8, u8) {
+        (c.r, c.g, c.b)
+    }
+
+    #[test]
+    fn a_progress_bar_takes_its_colour_from_the_state_and_its_width_from_the_percentage() {
+        let palette = kmux_app::theme::default_theme();
+        let fill = |state, progress| progress_bar_fill(&pane(state, progress), &palette);
+        assert_eq!(
+            fill(PaneProgressState::Set, Some(40)),
+            Some((rgb(palette.accent), 0.4))
+        );
+        assert_eq!(
+            fill(PaneProgressState::Error, Some(250)),
+            Some((rgb(palette.red), 1.0)),
+            "a percentage past 100 is a full bar"
+        );
+        assert_eq!(
+            fill(PaneProgressState::Pause, None),
+            Some((rgb(palette.orange), 0.0))
+        );
+        assert_eq!(
+            fill(PaneProgressState::Indeterminate, Some(10)),
+            Some((rgb(palette.accent), 1.0)),
+            "busy with no known share fills the width"
+        );
+        assert_eq!(fill(PaneProgressState::Remove, Some(50)), None);
+        assert_eq!(
+            fill(PaneProgressState::Unknown, Some(50)),
+            None,
+            "a state from a newer daemon draws no bar"
+        );
+    }
 }

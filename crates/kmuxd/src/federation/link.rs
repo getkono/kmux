@@ -135,6 +135,9 @@ async fn plan_for(target: PeerTarget) -> Result<PeerConnectPlan, String> {
                 ssh_tunnel: Some(ssh.tunnel_process),
             })
         }
+        // Refused before it gets here (`on_open_peer`); kept as an answer
+        // rather than a panic.
+        PeerTarget::Unknown => Err(crate::app::UNSUPPORTED_PEER_TARGET.to_string()),
     }
 }
 
@@ -589,6 +592,7 @@ mod tests {
         ServerMessage::AuthResult {
             success,
             reason: reason.map(str::to_string),
+            failure: None,
             client_id: None,
             server_version: None,
             connection_id: None,

@@ -11,6 +11,8 @@ use kmux_protocol::messages::{
     ClientMessage, ErrorCode, LayoutNode, LayoutScheme, TabIndex, WordId,
 };
 
+use tracing::debug;
+
 use crate::connection::classify_error;
 
 use super::super::SharedClientState;
@@ -82,6 +84,12 @@ pub(super) async fn on_apply_layout_scheme(
     tab_index: TabIndex,
     scheme: LayoutScheme,
 ) {
+    if scheme == LayoutScheme::Unknown {
+        // A newer client's scheme: nothing to apply here, and nothing to pass
+        // on, since `Unknown` is never sent.
+        debug!(%word_id, tab_index, "ignoring a layout scheme this daemon does not know");
+        return;
+    }
     if forwarded_to_peer(state, &word_id, |word_id| {
         ClientMessage::ApplyLayoutScheme {
             word_id,
@@ -303,6 +311,21 @@ mod tests {
         assert_eq!(request_id, None);
         assert_eq!(code, ErrorCode::SessionNotFound);
         assert_eq!(message, format!("session not found: {MISSING_WORD}"));
+    }
+
+    /// A scheme a newer client sent that this daemon does not know is ignored
+    /// before anything is looked up or forwarded: not even the missing
+    /// session is reported.
+    #[tokio::test]
+    async fn an_unknown_layout_scheme_is_ignored() {
+        let (keep, msgs) = dispatch_one(ClientMessage::ApplyLayoutScheme {
+            word_id: MISSING_WORD.to_string(),
+            tab_index: 0,
+            scheme: LayoutScheme::Unknown,
+        })
+        .await;
+        assert!(keep);
+        assert!(msgs.is_empty(), "{msgs:?}");
     }
 
     #[tokio::test]

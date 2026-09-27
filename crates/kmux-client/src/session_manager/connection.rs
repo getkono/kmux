@@ -219,57 +219,12 @@ impl SessionManager {
         self.token = token;
     }
 
-    /// Attempt to switch the active transport to QUIC.
+    /// Make `new_sender`, already authenticated on `new_kind` with this
+    /// connection's `ConnectionId`, the active transport.
     ///
-    /// Called when the `TransportSupervisor` signals a successful QUIC probe.
-    /// The new QUIC sender must already be authenticated (i.e., the server has
-    /// received `Auth { connection_id: Some(...) }` and sent back
-    /// `AuthResult { success: true }`).
-    ///
-    /// The caller is responsible for sending `ClientMessage::ChannelReady` on
-    /// the new sender before calling this method.
-    pub fn apply_quic_upgrade(&mut self, new_sender: mpsc::UnboundedSender<ClientMessage>) {
-        let old_transport = self.current_transport;
-        // Drop the old sender, closing the old transport channel.
-        let _ = self.ws_sender.replace(new_sender);
-        self.current_transport = TransportKind::Quic;
-        self.set_connection_state(ConnectionState::Connected {
-            transport: TransportKind::Quic,
-        });
-        self.liveness.reset(Instant::now());
-        self.tag_transport(TransportKind::Quic);
-        info!(
-            "Transport channel upgraded: {} -> {}",
-            old_transport,
-            TransportKind::Quic
-        );
-    }
-
-    /// Switch the active transport to TCP+TLS (fallback).
-    ///
-    /// Called when QUIC drops and a TCP+TLS-over-SSH tunnel has been re-established.
-    /// `new_sender` must already be authenticated on the TCP+TLS transport with the
-    /// existing `connection_id`.
-    pub fn apply_tcp_fallback(&mut self, new_sender: mpsc::UnboundedSender<ClientMessage>) {
-        let old_transport = self.current_transport;
-        let _ = self.ws_sender.replace(new_sender);
-        self.current_transport = TransportKind::TcpTls;
-        self.set_connection_state(ConnectionState::Connected {
-            transport: TransportKind::TcpTls,
-        });
-        self.liveness.reset(Instant::now());
-        self.tag_transport(TransportKind::TcpTls);
-        info!(
-            "Transport channel fell back: {} -> {}",
-            old_transport,
-            TransportKind::TcpTls
-        );
-    }
-
-    /// Apply any transport upgrade, choosing the correct method based on `kind`.
-    ///
-    /// Used by the `TransportSupervisor` so it can signal upgrades without
-    /// knowing which specific method to call.
+    /// Driven by the `TransportSupervisor`'s `UpgradeSignal`: the caller sends
+    /// `ChannelReady` on `new_sender` first, and dropping the old sender closes
+    /// the old channel.
     pub fn apply_transport_upgrade(
         &mut self,
         new_sender: mpsc::UnboundedSender<ClientMessage>,

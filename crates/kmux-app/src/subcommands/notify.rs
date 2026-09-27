@@ -115,7 +115,9 @@ fn resolve_attention(
     });
 
     let summary = match kind {
-        AttentionKind::TurnDone => "finished a turn",
+        // `Unknown` is not reachable from the CLI's own flag; it is worded as
+        // the plain kind, like everywhere else.
+        AttentionKind::TurnDone | AttentionKind::Unknown => "finished a turn",
         AttentionKind::NeedsInput => "needs your input",
     };
 

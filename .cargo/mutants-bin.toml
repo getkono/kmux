@@ -54,4 +54,8 @@ exclude_re = [
     # into an `adw::Banner`, which needs a display: the registered GTK
     # widget exception (issue #208).
     'crates/kmux-gtk/src/imp/dialogs\.rs:.*replace update_banner with ',
+    # kmux-gtk's attention `surface` posts a `gio::Notification` through the
+    # running `GApplication`, which needs a display: the same registered
+    # widget exception. Its decision, `priority`, is unit-tested (issue #209).
+    'crates/kmux-gtk/src/imp/attention\.rs:.*replace surface with ',
 ]

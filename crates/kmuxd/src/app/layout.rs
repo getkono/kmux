@@ -273,24 +273,23 @@ fn is_leaf(pane_index: u32) -> impl Fn(&LayoutNode) -> bool {
 }
 
 /// Regenerate a tree from `leaves` (in order) into a preset [`LayoutScheme`]. A
-/// single pane is always a bare leaf regardless of scheme.
-pub fn apply_scheme(leaves: &[u32], scheme: LayoutScheme) -> LayoutNode {
-    match leaves {
+/// single pane is always a bare leaf regardless of scheme. `None` for a scheme
+/// this build does not know (from a newer client): the layout stays as it is.
+pub fn apply_scheme(leaves: &[u32], scheme: LayoutScheme) -> Option<LayoutNode> {
+    let arrange: fn(&[u32]) -> LayoutNode = match scheme {
+        LayoutScheme::EvenHorizontal => |l| even_split(l, SplitDir::Horizontal),
+        LayoutScheme::EvenVertical => |l| even_split(l, SplitDir::Vertical),
+        // Main on the left (horizontal outer split), stack in a right column.
+        LayoutScheme::MainVertical => |l| main_split(l, SplitDir::Horizontal, SplitDir::Vertical),
+        // Main on top (vertical outer split), stack in a bottom row.
+        LayoutScheme::MainHorizontal => |l| main_split(l, SplitDir::Vertical, SplitDir::Horizontal),
+        LayoutScheme::Unknown => return None,
+    };
+    Some(match leaves {
         [] => LayoutNode::single(0),
         [only] => LayoutNode::single(*only),
-        _ => match scheme {
-            LayoutScheme::EvenHorizontal => even_split(leaves, SplitDir::Horizontal),
-            LayoutScheme::EvenVertical => even_split(leaves, SplitDir::Vertical),
-            // Main on the left (horizontal outer split), stack in a right column.
-            LayoutScheme::MainVertical => {
-                main_split(leaves, SplitDir::Horizontal, SplitDir::Vertical)
-            }
-            // Main on top (vertical outer split), stack in a bottom row.
-            LayoutScheme::MainHorizontal => {
-                main_split(leaves, SplitDir::Vertical, SplitDir::Horizontal)
-            }
-        },
-    }
+        _ => arrange(leaves),
+    })
 }
 
 /// One flat split of all `leaves` in `dir`, evenly weighted.
@@ -494,7 +493,7 @@ mod tests {
 
     #[test]
     fn scheme_even_horizontal_is_one_flat_row() {
-        let tree = apply_scheme(&[0, 1, 2], LayoutScheme::EvenHorizontal);
+        let tree = apply_scheme(&[0, 1, 2], LayoutScheme::EvenHorizontal).unwrap();
         match &tree {
             LayoutNode::Split { dir, children, .. } => {
                 assert_eq!(*dir, SplitDir::Horizontal);
@@ -514,7 +513,7 @@ mod tests {
     #[test]
     fn scheme_main_vertical_is_main_plus_stack() {
         // Main pane 0 on the left; 1 & 2 stacked on the right.
-        let tree = apply_scheme(&[0, 1, 2], LayoutScheme::MainVertical);
+        let tree = apply_scheme(&[0, 1, 2], LayoutScheme::MainVertical).unwrap();
         match &tree {
             LayoutNode::Split { dir, children, .. } => {
                 assert_eq!(*dir, SplitDir::Horizontal);
@@ -536,13 +535,21 @@ mod tests {
 
     #[test]
     fn scheme_single_pane_stays_a_leaf() {
-        assert_eq!(apply_scheme(&[5], LayoutScheme::MainVertical), leaf(5));
+        assert_eq!(
+            apply_scheme(&[5], LayoutScheme::MainVertical),
+            Some(leaf(5))
+        );
+    }
+
+    #[test]
+    fn an_unknown_scheme_leaves_the_layout_alone() {
+        assert_eq!(apply_scheme(&[0, 1], LayoutScheme::Unknown), None);
     }
 
     #[test]
     fn scheme_two_panes_main_is_a_simple_split() {
         // With only one pane in the stack, the stack is a bare leaf, not a split.
-        let tree = apply_scheme(&[0, 1], LayoutScheme::MainHorizontal);
+        let tree = apply_scheme(&[0, 1], LayoutScheme::MainHorizontal).unwrap();
         match &tree {
             LayoutNode::Split { dir, children, .. } => {
                 assert_eq!(*dir, SplitDir::Vertical);

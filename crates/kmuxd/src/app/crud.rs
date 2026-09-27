@@ -33,8 +33,8 @@ impl ServerApp {
         {
             let sessions = self.sessions.read().await;
             if sessions.len() >= super::MAX_SESSIONS {
-                return Err(KmuxError::SessionAlreadyExists {
-                    name: format!("session limit ({}) reached", super::MAX_SESSIONS),
+                return Err(KmuxError::SessionLimit {
+                    max: super::MAX_SESSIONS,
                 });
             }
         }
@@ -44,9 +44,9 @@ impl ServerApp {
             let mut wl = self.wordlist.lock().unwrap();
             let mut rng = self.rng.lock().unwrap();
             wl.draw(&mut *rng)
-                .ok_or_else(|| KmuxError::SessionAlreadyExists {
-                    name: "word pool exhausted".to_string(),
-                })?
+                // Federated sessions draw from the same pool, so it can run
+                // dry before `sessions` holds the limit.
+                .ok_or(KmuxError::SessionWordsExhausted)?
         };
 
         // Resolve CWD

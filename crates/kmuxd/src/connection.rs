@@ -21,6 +21,8 @@ pub fn classify_error(e: &kmux_pty::error::KmuxError) -> ErrorCode {
         kmux_pty::error::KmuxError::SessionNotFound { .. } => ErrorCode::SessionNotFound,
         kmux_pty::error::KmuxError::PaneNotFound { .. } => ErrorCode::PaneNotFound,
         kmux_pty::error::KmuxError::SessionAlreadyExists { .. } => ErrorCode::SessionAlreadyExists,
+        kmux_pty::error::KmuxError::SessionLimit { .. }
+        | kmux_pty::error::KmuxError::SessionWordsExhausted => ErrorCode::SessionLimitReached,
         kmux_pty::error::KmuxError::Pty(err) if *err == nix::Error::EPERM => ErrorCode::InputLocked,
         _ => ErrorCode::InternalError,
     }
@@ -254,6 +256,16 @@ mod classify_tests {
                 name: "eagle".to_string()
             }),
             ErrorCode::SessionAlreadyExists
+        );
+        assert_eq!(
+            classify_error(&KmuxError::SessionLimit { max: 1000 }),
+            ErrorCode::SessionLimitReached,
+            "the limit is not a name clash"
+        );
+        assert_eq!(
+            classify_error(&KmuxError::SessionWordsExhausted),
+            ErrorCode::SessionLimitReached,
+            "running out of session words is the limit, reached another way"
         );
     }
 

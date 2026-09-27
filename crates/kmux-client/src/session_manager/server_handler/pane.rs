@@ -114,14 +114,6 @@ impl SessionManager {
         Vec::new()
     }
 
-    /// Never sent: `kmuxd` constructs no `LayoutChanged`, and the
-    /// authoritative `LayoutUpdate` supersedes it. Kept as an arm rather
-    /// than a `..` catch-all so a new `SessionEventMsg` variant fails to
-    /// compile here instead of being silently dropped (docs/testing.md R4).
-    pub(super) fn on_event_layout_changed() -> Vec<SessionEvent> {
-        Vec::new()
-    }
-
     /// Handle a `Event` frame carrying `SessionEventMsg::PaneResized`.
     pub(super) fn on_event_pane_resized(
         &mut self,

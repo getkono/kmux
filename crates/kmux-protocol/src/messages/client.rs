@@ -474,9 +474,7 @@ impl ClientMessage {
 mod tests {
     use super::super::server::ServerMessage;
     use super::super::session::ConnectionId;
-    use super::super::types::{
-        PROTOCOL_RANGE, PROTOCOL_VERSION, protocol_capabilities, version_mismatch_hint,
-    };
+    use super::super::types::{PROTOCOL_RANGE, PROTOCOL_VERSION, protocol_capabilities};
     use super::*;
 
     #[test]
@@ -511,6 +509,7 @@ mod tests {
         let msg = ServerMessage::AuthResult {
             success: true,
             reason: None,
+            failure: None,
             client_id: None,
             server_version: None,
             connection_id: Some(ConnectionId(99)),
@@ -639,10 +638,16 @@ mod tests {
     }
 
     #[test]
-    fn version_mismatch_auth_result_roundtrip() {
+    fn failed_auth_result_carries_its_typed_failure() {
+        use super::super::error::AuthFailure;
+        let failure = AuthFailure::ProtocolMismatch {
+            client: PROTOCOL_RANGE,
+            daemon: PROTOCOL_RANGE,
+        };
         let msg = ServerMessage::AuthResult {
             success: false,
-            reason: Some("protocol version mismatch: client=12, server=13".to_string()),
+            reason: Some(failure.to_string()),
+            failure: Some(failure),
             client_id: None,
             server_version: Some("0.1.0".to_string()),
             connection_id: None,
@@ -654,41 +659,19 @@ mod tests {
             negotiated_capabilities: Vec::new(),
         };
         let bytes = crate::encode_server(&msg).unwrap();
-        let decoded = crate::decode_server(&bytes).unwrap();
-        match decoded {
+        match crate::decode_server(&bytes).unwrap() {
             ServerMessage::AuthResult {
                 success,
                 reason,
-                server_version,
+                failure: decoded,
                 ..
             } => {
                 assert!(!success);
-                assert_eq!(
-                    reason.as_deref(),
-                    Some("protocol version mismatch: client=12, server=13")
-                );
-                assert_eq!(server_version.as_deref(), Some("0.1.0"));
+                assert_eq!(decoded, Some(failure));
+                assert_eq!(reason, Some(failure.to_string()));
             }
-            _ => panic!("expected AuthResult"),
+            other => panic!("expected AuthResult, got {other:?}"),
         }
-    }
-
-    #[test]
-    fn version_mismatch_hint_older_client() {
-        let hint = version_mismatch_hint("protocol version mismatch: client=12, server=13");
-        assert!(hint.contains("ranges overlap"));
-    }
-
-    #[test]
-    fn version_mismatch_hint_newer_client() {
-        let hint = version_mismatch_hint("protocol version mismatch: client=14, server=13");
-        assert!(hint.contains("ranges overlap"));
-    }
-
-    #[test]
-    fn version_mismatch_hint_not_a_mismatch() {
-        let hint = version_mismatch_hint("invalid token");
-        assert!(hint.is_empty());
     }
 
     #[test]

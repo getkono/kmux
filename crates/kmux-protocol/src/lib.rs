@@ -17,5 +17,4 @@ pub use messages::{
     ErrorCode, GridSnapshot, PaneId, PaneInfo, RequestId, ServerMessage, SessionEntry,
     SessionEventMsg, SessionMeta, TermModes, TermSize, TerminalDiff, TransportKind, WordId,
     epoch_secs_to_ymd_hms, format_pane_id, pane_index, pane_word, parse_pane_id,
-    version_mismatch_hint,
 };

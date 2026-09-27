@@ -2,14 +2,15 @@
 
 use super::*;
 
-/// The eleven fields of `ServerMessage::AuthResult`, carried as one value.
+/// The twelve fields of `ServerMessage::AuthResult`, carried as one value.
 ///
-/// A struct rather than eleven parameters: they arrive together, they are read
+/// A struct rather than twelve parameters: they arrive together, they are read
 /// together, and eight of them are `Option<String>` — eight chances to transpose
 /// two arguments the compiler cannot tell apart.
 pub(super) struct AuthOutcome {
     pub success: bool,
     pub reason: Option<String>,
+    pub failure: Option<AuthFailure>,
     pub client_id: Option<ClientId>,
     pub server_version: Option<String>,
     pub connection_id: Option<ConnectionId>,
@@ -28,6 +29,7 @@ impl SessionManager {
         let AuthOutcome {
             success,
             reason,
+            failure,
             client_id,
             server_version,
             connection_id,
@@ -56,19 +58,17 @@ impl SessionManager {
             );
             events.push(SessionEvent::AuthOk);
         } else {
-            warn!("Auth failed: {:?}", reason);
-            let reason_str = reason.unwrap_or_default();
-            let hint = kmux_protocol::messages::version_mismatch_hint(&reason_str);
-            let msg = if hint.is_empty() {
-                format!("Auth failed: {reason_str}")
-            } else {
-                format!("Auth failed: {reason_str} | {hint}")
+            warn!(?failure, "Auth failed: {:?}", reason);
+            let reason_str = kmux_protocol::messages::refusal_reason(reason, failure);
+            let msg = match failure.as_ref().and_then(AuthFailure::hint) {
+                Some(hint) => format!("{reason_str} | {hint}"),
+                None => reason_str,
             };
             self.ws_sender = None;
             self.set_connection_state(crate::connection_state::ConnectionState::Disconnected {
-                reason: crate::connection_state::DisconnectReason::AuthFailed(msg),
+                reason: crate::connection_state::DisconnectReason::AuthFailed(msg.clone()),
             });
-            events.push(SessionEvent::AuthFailed { reason: reason_str });
+            events.push(SessionEvent::AuthFailed { reason: msg });
         }
         events
     }
