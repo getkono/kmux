@@ -8,7 +8,7 @@ pub use kmux_sys::tls::{CertMaterial, build_server_config};
 /// Build a `quinn::ServerConfig` from a `rustls::ServerConfig`.
 ///
 /// Applies the shared QUIC idle-timeout and keep-alive intervals from
-/// `kmux_sys::transport::quic`.
+/// `kmux_protocol::timing`.
 pub fn build_quinn_config(tls_config: rustls::ServerConfig) -> Result<quinn::ServerConfig> {
     let mut server_config = quinn::ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(tls_config)

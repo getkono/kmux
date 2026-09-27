@@ -58,11 +58,12 @@ not restate.
   under local session words, to every local client. Losing, re-opening and
   closing that link is described in
   [architecture-federation.md](architecture-federation.md).
-- **Remote transports are the federation link's and the CLI's.** The SSH
-  bootstrap, TCP+TLS and QUIC and the `TransportSupervisor` below are the
-  mechanism behind a remote link: the hub's federation link (TCP+TLS), and the
-  `remote`-feature CLI paths (`kmux --dry-run` / `--test` against `user@host`,
-  `kmux daemon logs --server`). They are not part of the GUI's own connection.
+- **Remote transports are the federation link's and the CLI's.** A hub
+  reaches its peer with the SSH negotiation below (or directly) and TCP+TLS;
+  the `remote`-feature CLI paths (`kmux --dry-run` / `--test` against
+  `user@host`, `kmux daemon logs --server`) use the SSH bootstrap, and the
+  `--test` diagnostic also runs the `TransportSupervisor`. None of this is part
+  of the GUI's own connection.
 
 Daemon data-plane ports (QUIC, TCP+TLS) are ephemeral — bound on port `0`, the
 OS assigns them, and they are advertised in the SSH `probe-or-start` reply. They
@@ -98,8 +99,8 @@ daemon answers is `BootstrapError::Connect`, which a retry may get past.
    daemon's status; start it (`kmux_connect::daemon::ensure_daemon`, see
    [Daemon Binary Resolution](#daemon-binary-resolution)) if nothing answers.
 2. Refuse, before opening the data plane, a daemon whose `protocol_range` does
-   not overlap ours or whose build profile differs (`kmux_protocol::compat`):
-   a debug client never attaches to a release daemon.
+   not overlap ours (`kmux_protocol::compat::protocol_match`). A debug and a
+   release build never meet here: each resolves its own runtime directory.
 3. Connect to the data socket (`daemon-data.sock`) and authenticate with the
    token the status reply carried.
 
@@ -174,10 +175,13 @@ Tunnel-only options:
 
 ## Transport supervision
 
-An SSH-bootstrapped link (the CLI's; the GUI's link is local) runs a
-`TransportSupervisor` (`crates/kmux-connect/src/supervisor.rs`), which probes
-the other transports the daemon advertised (`EndpointAdvert { kind, address }`,
-`crates/kmux-sys/src/transport/mod.rs`) and promotes a better one.
+An SSH-bootstrapped link can run a `TransportSupervisor`
+(`crates/kmux-connect/src/supervisor.rs`) — the CLI's `--test` does — which
+probes candidate transports (`EndpointAdvert { kind, address }`,
+`crates/kmux-sys/src/transport/mod.rs`) and promotes a better one. The
+candidates are the tunnelled TCP+TLS link itself and direct QUIC to the
+remote's `quic_port` from the `probe-or-start` reply; the reply's endpoint list
+is not read.
 
 A **probe** connects on the candidate transport and authenticates with the
 link's `connection_id` and the daemon run that assigned it; it succeeds only if
@@ -254,12 +258,12 @@ The server dispatches all transports through a single `dispatch_session` → `ru
 ### UDS Auth and Permissions
 
 - The data socket lives at `$XDG_RUNTIME_DIR/kmux/daemon-data.sock`. This is separate from the control socket at `daemon.sock`.
-- The socket is created with mode 0600 via umask, restricting access to the owning user.
+- The socket's mode is set to 0600 right after it is bound, restricting access to the owning user.
 - Authentication is the same handshake as on every transport: the token and the identity proof. `kmuxd.toml`'s `[auth] allow_peer_cred` is parsed and logged but not enforced — a matching peer UID is not accepted in lieu of the token.
 
 ### TLS Trust (TOFU)
 
-TLS certificate trust uses a Trust-on-First-Use (TOFU) model implemented in `crates/kmux-sys/src/tls/tofu.rs`. The trust store lives at `~/.config/kmux/known_hosts.toml`.
+TLS certificate trust uses a Trust-on-First-Use (TOFU) model: the pin store is `crates/kmux-sys/src/tls/tofu.rs`, the verification flow `crates/kmux-sys/src/tls/verifier.rs`. The trust store lives at `~/.config/kmux/known_hosts.toml`.
 
 Trust resolution flow:
 
@@ -341,7 +345,7 @@ The `audience` field on each listener controls which callers receive that endpoi
 | `any` | Always announced to all callers |
 | `local` | Only UDS control-socket clients or loopback peers |
 | `lan` | Only RFC-1918 / link-local peers (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16) |
-| `ssh-only` | Only inside SSH `probe-or-start` JSON responses |
+| `ssh-only` | Meant only for SSH `probe-or-start` replies. Today the probe forwards the daemon's own status list, which is built for the local (UDS) view and so omits `ssh-only` endpoints; only for a daemon that sends no list does the probe build the SSH view itself |
 
 ---
 
@@ -377,8 +381,8 @@ none answers — and prints:
   refused ([architecture-protocol-versioning.md](architecture-protocol-versioning.md)).
   The `protocol_range` printed is the probing `kmuxd` binary's own, which is the
   running daemon's unless the binary on `$PATH` was replaced while it ran.
-- The client tunnels to `tcp_port`; the endpoint list feeds the transport
-  supervisor. The subsequent `Auth` negotiates the range again, so a stale or
+- The client tunnels to `tcp_port`, and a transport supervisor probes QUIC on
+  `quic_port`; the endpoint list is diagnostic only. The subsequent `Auth` negotiates the range again, so a stale or
   forged reply cannot enable anything the daemon does not speak.
 
 ---
@@ -582,7 +586,7 @@ All `SshError` variants render with multi-line context (argv, exit, stderr tail)
 | QUIC connection refused, TLS-TCP works | UDP blocked by firewall | Normal; `TransportSupervisor` will stick with TLS-TCP |
 | TLS fingerprint mismatch | Server cert rotated | Delete the stale entry from `~/.config/kmux/known_hosts.toml` |
 | All transports fail | No network path | Check firewall; verify `kmuxd` is listening on correct ports |
-| Sessions lost after restart | Checkpoint failed | Check disk space; `$XDG_DATA_HOME/kmux/session_state.bin` |
+| Sessions lost after restart | Checkpoint failed | Check disk space; `$XDG_STATE_HOME/kmux/sessions/state.bin` (`kmux debug paths` prints it) |
 | (dev) GUI shows "daemon start failed" / never connects, nothing in `kmux/client.log` | Debug build logs + spawns under `kmux-debug/`; resolution must reach `target/debug/kmuxd`, not a release `kmuxd` on `$PATH` | Use `./kmux` (it builds + pins `KMUX_KMUXD=target/debug/kmuxd`); inspect with `kmux debug paths` + `mise run tail-client-log` |
 
 ### Dry-run diagnostics (`--dry-run`, `--test`)
@@ -705,7 +709,7 @@ Every place that spawns `kmuxd` uses one of two strategies. They are intentional
 
 > Why the debug-profile preference matters: before it, a debug GUI with no `kmuxd` sibling fell through to `$PATH` and auto-spawned an installed **release** `~/.cargo/bin/kmuxd`. That daemon writes its socket under `kmux/` while the debug client polls `kmux-debug/`, so the client never sees it and times out — i.e. "the dev build doesn't start the daemon". Prod is unaffected (`mise run install` bundles a matching release `kmuxd` beside the GUI).
 
-Once the binary is located, `start_daemon()` spawns it with the canonical argv:
+Once the binary is located, `start_daemon_in()` spawns it with the canonical argv:
 
 ```
 kmuxd --daemon --bind 0.0.0.0 --port 0
@@ -773,8 +777,8 @@ A client reconnecting after a drop, or switching transports, is disconnected for
 An idle shutdown is an ordinary daemon exit, so the **processes do not survive
 it**: every PTY master closes when the daemon exits, so each shell gets `SIGHUP`
 and its jobs go with it, exactly as on `kmux daemon stop`. What survives is the
-**checkpoint**: sessions are written to `$XDG_STATE_HOME/kmux/session_state.bin`
-(or `$HOME/.local/state/kmux/`) on the way out, the same file the periodic
+**checkpoint**: sessions are written to `$XDG_STATE_HOME/kmux/sessions/state.bin`
+(or `$HOME/.local/state/kmux/sessions/`) on the way out, the same file the periodic
 checkpoint keeps current. The next daemon reads it and **respawns** each pane —
 a fresh shell in the same working directory, seeded with the old screen and
 scrollback behind a "[kmux: session restored]" separator. Only a graceful

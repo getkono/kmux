@@ -38,7 +38,8 @@ pub const PONG_DEADLINE: Duration = Duration::from_secs(30);
 pub const AUTH_DEADLINE: Duration = Duration::from_secs(30);
 
 /// How long a client waits for the `AuthResult` after sending `Auth`, before
-/// it gives the connection up.
+/// it gives the connection up. A federation hub waits this long for each
+/// handshake message in turn, so its worst case is twice this.
 pub const AUTH_REPLY_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long the daemon waits, after queueing a refused `AuthResult`, for its
@@ -73,11 +74,12 @@ pub const PANE_STREAM_STALL_TIMEOUT: Duration =
 /// take, end to end.
 pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How long a hub waits for its peer's `SessionListResult`.
+/// How long a hub waits for its peer's `SessionListResult` or
+/// `ClientListResult`.
 pub const PEER_LIST_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How long a hub waits for its peer to confirm a session it asked it to
-/// create.
+/// How long a hub waits for its peer to confirm a request it forwarded: a
+/// session created, closed or a tab closed, a client kicked.
 pub const PEER_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a hub waits for its peer's process overview before answering

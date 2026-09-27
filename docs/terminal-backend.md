@@ -376,7 +376,7 @@ for them gets a clamped response starting at `base_index`.
   scrolled off, as of this frame). New scrollback lines are not inlined in the
   diff; they travel in a separate `ScrollbackAppend`.
 - `GridSnapshot` carries `history_total: u64` and `scrollback_tail:
-  Vec<Vec<CellState>>` (the last `SNAPSHOT_TAIL_LINES = 500` lines of the
+  Vec<ScrollbackLine>` (the last `SNAPSHOT_TAIL_LINES = 500` lines of the
   mirror). Reattaching clients render scrollback immediately without a
   round-trip.
 - New `ServerMessage::ScrollbackAppend { pane_id, first_index, lines, seqno,
@@ -534,7 +534,7 @@ through every captured row even if lines are wider than the viewport.
 ## Persistence decoupling
 
 Disk format uses `PersistedTermSize { rows: u16, cols: u16 }` (no pixel fields).
-This keeps the on-disk `STATE_VERSION = 2` unchanged — old checkpoints load
+This kept the on-disk `STATE_VERSION` unchanged — old checkpoints load
 cleanly.  A translation shim pads `pixel_width = 0, pixel_height = 0` on read;
 the reverse conversion drops them on write.
 
