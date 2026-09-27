@@ -40,6 +40,13 @@ pub enum KmuxError {
     #[error("session already exists: {name}")]
     SessionAlreadyExists { name: String },
 
+    /// The daemon already runs as many sessions as it allows.
+    #[error("session limit ({max}) reached")]
+    SessionLimit {
+        /// The limit.
+        max: usize,
+    },
+
     #[error("PTY is closed")]
     Closed,
 
