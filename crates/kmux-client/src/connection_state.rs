@@ -24,10 +24,12 @@ pub enum ConnectionState {
     Handshaking,
     /// Authenticated and carrying traffic on `transport`.
     Connected { transport: TransportKind },
-    /// A drop has happened and the client is actively re-running the bootstrap.
-    /// `attempt` starts at 1.
+    /// The live link dropped and is being re-established on its own, with
+    /// backoff (issue #208): `attempt` (from 1) is the attempt under way or
+    /// next due.
     Reconnecting { attempt: u32 },
-    /// Dropped and waiting for the user to confirm a reconnect.
+    /// Not connected, and not retrying on its own (a failed first connect, a
+    /// refused handshake, or the user disconnected); a reconnect is manual.
     Disconnected { reason: DisconnectReason },
 }
 

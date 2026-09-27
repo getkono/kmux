@@ -8,6 +8,7 @@
 //! paths so existing `kmux_client::{...}` consumers — and internal
 //! `crate::{pipeline,supervisor,…}` references — keep resolving unchanged.
 
+pub mod backoff;
 pub mod connection_log;
 pub mod connection_state;
 pub mod event_log;

@@ -77,6 +77,7 @@ impl SessionManager {
         );
 
         self.request_session_list();
+        self.resume_visible_panes();
 
         outcome.ssh_context
     }
@@ -191,6 +192,16 @@ impl SessionManager {
     pub fn prepare_reconnect(&mut self) {
         self.ws_sender = None;
         self.set_connection_state(ConnectionState::Handshaking);
+    }
+
+    /// Like [`Self::prepare_reconnect`], for automatic reconnect attempt
+    /// `attempt` (1-based, issue #208): the state reads `Reconnecting`, so the
+    /// badge shows the retry rather than a first handshake.
+    pub fn begin_reconnect_attempt(&mut self, attempt: u32) {
+        self.ws_sender = None;
+        // The next link needs the pause state again (issue #68).
+        self.pause_applied = (false, false);
+        self.set_connection_state(ConnectionState::Reconnecting { attempt });
     }
 
     pub fn set_connection_params(&mut self, host: String, port: u16, token: String) {

@@ -512,9 +512,32 @@ impl SessionManager {
         });
     }
 
+    /// Re-attach every visible pane on a new link (issue #208). A pane in sync
+    /// resumes from the last seqno it applied, so the daemon replays just what
+    /// it missed (or resets it past its retained diffs); any other pane is
+    /// attached afresh. Nothing is visible on a first connect, so this only
+    /// acts on a reconnect.
+    pub(super) fn resume_visible_panes(&mut self) {
+        for pane_id in self.visible_panes.clone() {
+            match self.pane_sync.get(&pane_id) {
+                Some(PaneSync::Synced { expected }) => {
+                    let last_seqno = SequenceNo(expected.0.saturating_sub(1));
+                    self.attach_with(pane_id, Some(last_seqno));
+                }
+                _ => self.attach_fresh(pane_id),
+            }
+        }
+    }
+
     pub(super) fn attach_fresh(&mut self, pane_id: String) {
         self.pane_sync
             .insert(pane_id.clone(), PaneSync::AwaitingSync);
+        self.attach_with(pane_id, None);
+    }
+
+    /// Send the `Attach` for `pane_id` resuming after `last_seqno` (`None`:
+    /// from a fresh snapshot), then re-assert its auto-pause exemption.
+    fn attach_with(&mut self, pane_id: String, last_seqno: Option<SequenceNo>) {
         self.in_flight_history_fetches.remove(&pane_id);
         // Use the pane's resolved sub-rect size if the frontend has set one;
         // otherwise the full window size (correct for a single-pane tab).
@@ -526,7 +549,7 @@ impl SessionManager {
         let exempt = self.is_pane_auto_pause_exempt(&pane_id);
         self.send_ws(ClientMessage::Attach {
             pane_id: pane_id.clone(),
-            last_seqno: None,
+            last_seqno,
             size,
         });
         // The daemon resets a pane's auto-pause exemption on attach, so re-assert
@@ -637,6 +660,98 @@ mod tests {
             Some(cid),
             "prepare_reconnect must preserve connection_id so the successor can \
              transfer pane streams"
+        );
+    }
+
+    /// An automatic reconnect attempt shows as `Reconnecting { attempt }`,
+    /// with the dead sender gone and the identity kept (issue #208).
+    #[test]
+    fn a_reconnect_attempt_reads_reconnecting_with_its_number() {
+        use kmux_protocol::messages::ConnectionId;
+
+        use crate::connection_state::ConnectionState;
+
+        let (mut mgr, _rx) = make_connected_manager();
+        mgr.connection_id = Some(ConnectionId(7));
+        mgr.pause_applied = (true, false);
+        mgr.begin_reconnect_attempt(3);
+        assert_eq!(
+            mgr.pause_applied,
+            (false, false),
+            "the next link needs the pause state again"
+        );
+        assert_eq!(
+            mgr.connection_state(),
+            &ConnectionState::Reconnecting { attempt: 3 }
+        );
+        assert!(mgr.ws_sender.is_none());
+        assert_eq!(mgr.connection_id, Some(ConnectionId(7)));
+    }
+
+    /// On a new link every visible pane is re-attached: one in sync resumes
+    /// after the last seqno it applied, so the daemon replays only what it
+    /// missed; one still awaiting its snapshot starts afresh (issue #208).
+    /// Before, a reconnect re-attached nothing and the panes stayed blank.
+    #[test]
+    fn a_new_link_resumes_every_visible_pane_from_its_last_seqno() {
+        use kmux_protocol::messages::ConnectionId;
+
+        use crate::connection_state::DisconnectReason;
+        use crate::pipeline::BootstrapOutcome;
+        use crate::transport::TransportKind;
+
+        let (mut mgr, _old_rx) = make_connected_manager();
+        mgr.visible_panes = vec!["eagle/0".to_string(), "eagle/1".to_string()];
+        mgr.pane_sync.insert(
+            "eagle/0".to_string(),
+            PaneSync::Synced {
+                expected: SequenceNo(42),
+            },
+        );
+        mgr.pane_sync
+            .insert("eagle/1".to_string(), PaneSync::AwaitingSync);
+        mgr.mark_connection_lost_with(DisconnectReason::ServerClosed);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        mgr.apply_outcome(BootstrapOutcome {
+            client_tx: tx,
+            transport: TransportKind::Uds,
+            host: String::new(),
+            port: 0,
+            token: String::new(),
+            capabilities: ClientCapabilities::default(),
+            accept_invalid_certs: false,
+            connection_id: ConnectionId(9),
+            server_version: None,
+            is_local: true,
+            ssh_context: None,
+            bootstrap_elapsed: std::time::Duration::ZERO,
+        });
+
+        let mut attached = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let ClientMessage::Attach {
+                pane_id,
+                last_seqno,
+                ..
+            } = msg
+            {
+                attached.push((pane_id, last_seqno));
+            }
+        }
+        assert_eq!(
+            attached,
+            vec![
+                ("eagle/0".to_string(), Some(SequenceNo(41))),
+                ("eagle/1".to_string(), None),
+            ]
+        );
+        assert!(
+            matches!(
+                mgr.pane_sync.get("eagle/0"),
+                Some(PaneSync::Synced { expected }) if expected.0 == 42
+            ),
+            "a resumed pane stays in sync to take the replayed diffs"
         );
     }
 
