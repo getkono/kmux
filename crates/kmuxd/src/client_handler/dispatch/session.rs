@@ -109,12 +109,13 @@ pub(super) async fn on_session_close(
 /// Handle [`ClientMessage::SessionList`](kmux_protocol::messages::ClientMessage::SessionList).
 pub(super) async fn on_session_list(state: &mut SharedClientState, request_id: RequestId) {
     // Merge locally-hosted sessions with every open peer's proxied
-    // sessions (local IDs, peer-decorated names). Federation off ⇒ the
-    // federated list is empty and this is the original behaviour.
-    state.send(ServerMessage::SessionListResult {
-        request_id,
-        sessions: state.app.all_sessions().await,
-    });
+    // sessions (local IDs, peer-decorated names), queued in order with
+    // every session change (issue #208). Federation off ⇒ the federated
+    // list is empty. A closed queue closes the connection on its own.
+    let _ = state
+        .app
+        .send_session_list(&state.ctrl_tx, request_id)
+        .await;
 }
 
 /// Closed-session restore (issue #64). The graveyard is local-only, so

@@ -119,7 +119,11 @@ async fn forward_broadcast<T: Clone>(
             Ok(item) => deliver(&out, item),
             Err(broadcast::error::RecvError::Lagged(missed)) => {
                 warn!(missed, "server events lagged; resyncing the session list");
-                if app.send_session_list_resync(&out).await.is_err() {
+                if app
+                    .send_session_list(&out, kmux_protocol::messages::RESYNC_REQUEST_ID)
+                    .await
+                    .is_err()
+                {
                     break;
                 }
             }

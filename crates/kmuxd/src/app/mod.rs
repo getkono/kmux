@@ -1992,16 +1992,34 @@ mod tests {
     }
 
     /// A session list names the local sessions, then every open peer's
-    /// proxied ones — what `SessionList` answers and a lag resync sends.
+    /// proxied ones, under the request id asked for — what `SessionList`
+    /// answers and a lag resync sends.
     #[tokio::test]
-    async fn all_sessions_lists_local_sessions_then_federated_ones() {
+    async fn a_session_list_names_local_sessions_then_federated_ones() {
+        use kmux_protocol::messages::ServerMessage;
+
         let app = app_with_one_pane("eagle").await;
         let (_upstream, _peer) = app.install_channel_peer("fedlocal", "fedremote");
-        let words = |entries: Vec<kmux_protocol::messages::SessionEntry>| -> Vec<String> {
-            entries.into_iter().map(|e| e.meta.word_id).collect()
+        let words: Vec<String> = app
+            .list_sessions()
+            .await
+            .into_iter()
+            .map(|e| e.meta.word_id)
+            .collect();
+        assert_eq!(words, vec!["eagle"]);
+
+        let (out, mut rx) = crate::fixtures::make_outbound();
+        app.send_session_list(&out, 5).await.expect("queued");
+        let Ok(ServerMessage::SessionListResult {
+            request_id,
+            sessions,
+        }) = rx.try_recv()
+        else {
+            panic!("a session list is queued");
         };
-        assert_eq!(words(app.list_sessions().await), vec!["eagle"]);
-        assert_eq!(words(app.all_sessions().await), vec!["eagle", "fedlocal"]);
+        assert_eq!(request_id, 5);
+        let words: Vec<String> = sessions.into_iter().map(|e| e.meta.word_id).collect();
+        assert_eq!(words, vec!["eagle", "fedlocal"]);
     }
 
     /// A client that resumes re-attaches each pane with the last seqno it
