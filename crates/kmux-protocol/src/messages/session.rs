@@ -730,6 +730,34 @@ wire_enum!(SessionEventMsg);
 mod tests {
     use super::*;
 
+    /// `value` decodes from its own bytes into something that re-encodes to
+    /// the same bytes: the round-trip check for a type that is not `PartialEq`.
+    fn assert_survives_the_wire<T>(value: &T)
+    where
+        T: Serialize + serde::de::DeserializeOwned + std::fmt::Debug,
+    {
+        let bytes = rmp_serde::to_vec_named(value).expect("serialize");
+        let decoded: T = rmp_serde::from_slice(&bytes).expect("deserialize");
+        let again = rmp_serde::to_vec_named(&decoded).expect("re-serialize");
+        assert_eq!(again, bytes, "{value:?}");
+    }
+
+    fn sample_entry(name: &str, peer: Option<&str>) -> SessionEntry {
+        SessionEntry {
+            meta: SessionMeta {
+                index: 2,
+                word_id: "eagle".into(),
+                name: name.into(),
+                cwd: "/dev/kmux".into(),
+            },
+            panes: vec![],
+            tabs: vec![],
+            active_tab: 0,
+            peer: peer.map(Into::into),
+            peer_unreachable: false,
+        }
+    }
+
     #[test]
     fn pane_id_roundtrips_and_rejects_malformed() {
         assert_eq!(format_pane_id("eagle", 0), "eagle/0");
@@ -749,22 +777,6 @@ mod tests {
         // format -> parse round-trip.
         let id = format_pane_id("falcon", 5);
         assert_eq!(parse_pane_id(&id), Some(("falcon", 5)));
-    }
-
-    #[test]
-    fn term_size_pixel_fields_roundtrip() {
-        let size = TermSize {
-            rows: 40,
-            cols: 120,
-            pixel_width: 1920,
-            pixel_height: 1080,
-        };
-        let bytes = rmp_serde::to_vec_named(&size).expect("serialize");
-        let decoded: TermSize = rmp_serde::from_slice(&bytes).expect("deserialize");
-        assert_eq!(decoded.rows, 40);
-        assert_eq!(decoded.cols, 120);
-        assert_eq!(decoded.pixel_width, 1920);
-        assert_eq!(decoded.pixel_height, 1080);
     }
 
     #[test]
@@ -826,46 +838,6 @@ mod tests {
     }
 
     #[test]
-    fn pane_title_changed_roundtrips() {
-        let msg = SessionEventMsg::PaneTitleChanged {
-            pane_id: "eagle/0".to_string(),
-            title: "~/dev/kmux".to_string(),
-        };
-        let bytes = rmp_serde::to_vec_named(&msg).expect("serialize");
-        let decoded: SessionEventMsg = rmp_serde::from_slice(&bytes).expect("deserialize");
-        match decoded {
-            SessionEventMsg::PaneTitleChanged { pane_id, title } => {
-                assert_eq!(pane_id, "eagle/0");
-                assert_eq!(title, "~/dev/kmux");
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
-    fn pane_clipboard_copy_roundtrips() {
-        let msg = SessionEventMsg::PaneClipboardCopy {
-            pane_id: "eagle/0".to_string(),
-            selection: "c".to_string(),
-            data: "aGVsbG8=".to_string(),
-        };
-        let bytes = rmp_serde::to_vec_named(&msg).expect("serialize");
-        let decoded: SessionEventMsg = rmp_serde::from_slice(&bytes).expect("deserialize");
-        match decoded {
-            SessionEventMsg::PaneClipboardCopy {
-                pane_id,
-                selection,
-                data,
-            } => {
-                assert_eq!(pane_id, "eagle/0");
-                assert_eq!(selection, "c");
-                assert_eq!(data, "aGVsbG8=");
-            }
-            _ => panic!("wrong variant"),
-        }
-    }
-
-    #[test]
     fn layout_node_nested_roundtrips() {
         // A 2-level tree: a horizontal split whose right child is a vertical split.
         let tree = LayoutNode::Split {
@@ -889,8 +861,10 @@ mod tests {
         assert_eq!(decoded.leaves(), vec![0, 1, 2]);
     }
 
+    /// A local entry (with a tab over a nested layout) and a federated one
+    /// carrying its owning peer (issue #121) both survive the wire.
     #[test]
-    fn tab_info_roundtrips() {
+    fn session_entry_survives_the_wire() {
         let tab = TabInfo {
             tab_index: 3,
             name: "build".into(),
@@ -904,69 +878,13 @@ mod tests {
             },
             focused_pane: 6,
         };
-        let bytes = rmp_serde::to_vec_named(&tab).expect("serialize");
-        let decoded: TabInfo = rmp_serde::from_slice(&bytes).expect("deserialize");
-        assert_eq!(decoded.tab_index, 3);
-        assert_eq!(decoded.name, "build");
-        assert_eq!(decoded.focused_pane, 6);
-        assert_eq!(decoded.layout.leaves(), vec![5, 6]);
-    }
-
-    #[test]
-    fn session_entry_with_tabs_roundtrips() {
-        let entry = SessionEntry {
-            meta: SessionMeta {
-                index: 0,
-                word_id: "eagle".into(),
-                name: "kmux".into(),
-                cwd: "/dev/kmux".into(),
-            },
-            panes: vec![],
-            tabs: vec![TabInfo {
-                tab_index: 0,
-                name: "1".into(),
-                layout: LayoutNode::single(0),
-                focused_pane: 0,
-            }],
-            active_tab: 0,
-            peer: None,
-            peer_unreachable: false,
-        };
-        let bytes = rmp_serde::to_vec_named(&entry).expect("serialize");
-        let decoded: SessionEntry = rmp_serde::from_slice(&bytes).expect("deserialize");
-        assert_eq!(decoded.tabs.len(), 1);
-        assert_eq!(decoded.active_tab, 0);
-        assert_eq!(decoded.tabs[0].layout, LayoutNode::single(0));
-    }
-
-    #[test]
-    fn session_entry_peer_attribution_roundtrips() {
-        // A federated entry carries its owning peer; a local entry leaves it
-        // None. Both must survive the wire roundtrip (issue #121).
-        let federated = SessionEntry {
-            meta: SessionMeta {
-                index: 2,
-                word_id: "eagle".into(),
-                name: "kmux".into(),
-                cwd: "/dev/kmux".into(),
-            },
-            panes: vec![],
-            tabs: vec![],
-            active_tab: 0,
-            peer: Some("alice@box:2222".into()),
-            peer_unreachable: false,
-        };
-        let bytes = rmp_serde::to_vec_named(&federated).expect("serialize");
-        let decoded: SessionEntry = rmp_serde::from_slice(&bytes).expect("deserialize");
-        assert_eq!(decoded.peer.as_deref(), Some("alice@box:2222"));
-
         let local = SessionEntry {
-            peer: None,
-            ..federated
+            tabs: vec![tab],
+            active_tab: 3,
+            ..sample_entry("kmux", None)
         };
-        let bytes = rmp_serde::to_vec_named(&local).expect("serialize");
-        let decoded: SessionEntry = rmp_serde::from_slice(&bytes).expect("deserialize");
-        assert_eq!(decoded.peer, None);
+        assert_survives_the_wire(&local);
+        assert_survives_the_wire(&sample_entry("kmux", Some("alice@box:2222")));
     }
 
     /// An unreachable peer's session says so on the wire, and an entry from a
@@ -981,26 +899,16 @@ mod tests {
             active_tab: TabIndex,
             peer: Option<PeerId>,
         }
-        let meta = SessionMeta {
-            index: 0,
-            word_id: "eagle".into(),
-            name: "kmux @ box".into(),
-            cwd: "/".into(),
-        };
         let unreachable = SessionEntry {
-            meta: meta.clone(),
-            panes: vec![],
-            tabs: vec![],
-            active_tab: 0,
-            peer: Some("box".into()),
             peer_unreachable: true,
+            ..sample_entry("kmux @ box", Some("box"))
         };
         let bytes = rmp_serde::to_vec_named(&unreachable).expect("serialize");
         let decoded: SessionEntry = rmp_serde::from_slice(&bytes).expect("deserialize");
         assert!(decoded.peer_unreachable);
 
         let older = OlderSessionEntry {
-            meta,
+            meta: unreachable.meta,
             panes: vec![],
             tabs: vec![],
             active_tab: 0,
@@ -1013,20 +921,7 @@ mod tests {
 
     #[test]
     fn base_name_strips_peer_decoration() {
-        let entry = |name: &str, peer: Option<&str>| SessionEntry {
-            meta: SessionMeta {
-                index: 0,
-                word_id: "eagle".into(),
-                name: name.into(),
-                cwd: "/dev/kmux".into(),
-            },
-            panes: vec![],
-            tabs: vec![],
-            active_tab: 0,
-            peer: peer.map(Into::into),
-            peer_unreachable: false,
-        };
-
+        let entry = sample_entry;
         // Local session: name returned unchanged.
         assert_eq!(entry("kmux", None).base_name(), "kmux");
         // Federated session: the hub's " @ {peer}" suffix is stripped.
@@ -1078,8 +973,18 @@ mod tests {
     }
 
     #[test]
-    fn tab_lifecycle_events_roundtrip() {
-        for msg in [
+    fn session_events_survive_the_wire() {
+        let pane = || "eagle/0".to_string();
+        let events = [
+            SessionEventMsg::PaneTitleChanged {
+                pane_id: pane(),
+                title: "~/dev/kmux".into(),
+            },
+            SessionEventMsg::PaneClipboardCopy {
+                pane_id: pane(),
+                selection: "c".into(),
+                data: "aGVsbG8=".into(),
+            },
             SessionEventMsg::TabCreated {
                 word_id: "eagle".into(),
                 tab_index: 1,
@@ -1093,37 +998,25 @@ mod tests {
                 tab_index: 1,
                 name: "logs".into(),
             },
-        ] {
-            let bytes = rmp_serde::to_vec_named(&msg).expect("serialize");
-            let decoded: SessionEventMsg = rmp_serde::from_slice(&bytes).expect("deserialize");
-            // Round-trips to an equal-shaped event (spot check the discriminant).
-            assert_eq!(
-                std::mem::discriminant(&decoded),
-                std::mem::discriminant(&msg)
-            );
-        }
-    }
-
-    #[test]
-    fn pane_resized_carries_term_size() {
-        let msg = SessionEventMsg::PaneResized {
-            pane_id: "eagle/0".to_string(),
-            size: TermSize {
-                rows: 30,
-                cols: 100,
-                pixel_width: 1000,
-                pixel_height: 600,
+            SessionEventMsg::PaneResized {
+                pane_id: pane(),
+                size: TermSize {
+                    rows: 30,
+                    cols: 100,
+                    pixel_width: 1000,
+                    pixel_height: 600,
+                },
             },
-        };
-        let bytes = rmp_serde::to_vec_named(&msg).expect("serialize");
-        let decoded: SessionEventMsg = rmp_serde::from_slice(&bytes).expect("deserialize");
-        match decoded {
-            SessionEventMsg::PaneResized { pane_id, size } => {
-                assert_eq!(pane_id, "eagle/0");
-                assert_eq!(size.rows, 30);
-                assert_eq!(size.pixel_width, 1000);
-            }
-            _ => panic!("wrong variant"),
+            SessionEventMsg::PaneAttention {
+                pane_id: pane(),
+                kind: AttentionKind::TurnDone,
+                title: "Claude".into(),
+                body: "finished a turn".into(),
+                attention_id: 42,
+            },
+        ];
+        for event in &events {
+            assert_survives_the_wire(event);
         }
     }
 }

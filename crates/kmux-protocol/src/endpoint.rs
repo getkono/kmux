@@ -220,208 +220,98 @@ mod tests {
 
     use super::*;
 
-    // ── quic:// ──────────────────────────────────────────────────────────────
+    fn quic(host: &str, port: u16) -> Endpoint {
+        Endpoint::Quic {
+            host: host.into(),
+            port,
+        }
+    }
 
-    #[test]
-    fn parse_quic_url() {
-        assert_eq!(
-            Endpoint::parse("quic://host.example:8443").unwrap(),
-            Endpoint::Quic {
-                host: "host.example".into(),
-                port: 8443,
-            }
-        );
+    fn ssh(user: Option<&str>, host: &str, ssh_port: Option<u16>) -> Endpoint {
+        Endpoint::Ssh {
+            user: user.map(Into::into),
+            host: host.into(),
+            ssh_port,
+        }
     }
 
     #[test]
-    fn parse_quic_ipv6() {
-        assert_eq!(
-            Endpoint::parse("quic://[::1]:8443").unwrap(),
-            Endpoint::Quic {
-                host: "[::1]".into(),
-                port: 8443,
-            }
-        );
-    }
-
-    // ── tcp+tls:// ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_tcp_tls_url() {
-        assert_eq!(
-            Endpoint::parse("tcp+tls://prod.example.com:8444").unwrap(),
-            Endpoint::TcpTls {
-                host: "prod.example.com".into(),
-                port: 8444,
-            }
-        );
-    }
-
-    // ── unix:// ──────────────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_unix_absolute() {
-        assert_eq!(
-            Endpoint::parse("unix:///run/user/1000/kmux/daemon-data.sock").unwrap(),
-            Endpoint::Unix(PathBuf::from("/run/user/1000/kmux/daemon-data.sock")),
-        );
-    }
-
-    // ── ssh:// ───────────────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_ssh_url_user_host_port() {
-        assert_eq!(
-            Endpoint::parse("ssh://alice@example.com:2222").unwrap(),
-            Endpoint::Ssh {
-                user: Some("alice".into()),
-                host: "example.com".into(),
-                ssh_port: Some(2222),
-            }
-        );
+    fn parse_accepts_every_grammar_form() {
+        let cases = [
+            ("quic://host.example:8443", quic("host.example", 8443)),
+            ("quic://[::1]:8443", quic("[::1]", 8443)),
+            (
+                "tcp+tls://prod.example.com:8444",
+                Endpoint::TcpTls {
+                    host: "prod.example.com".into(),
+                    port: 8444,
+                },
+            ),
+            (
+                "unix:///run/user/1000/kmux/daemon-data.sock",
+                Endpoint::Unix(PathBuf::from("/run/user/1000/kmux/daemon-data.sock")),
+            ),
+            (
+                "ssh://alice@example.com:2222",
+                ssh(Some("alice"), "example.com", Some(2222)),
+            ),
+            (
+                "ssh://alice@example.com",
+                ssh(Some("alice"), "example.com", None),
+            ),
+            ("ssh://example.com", ssh(None, "example.com", None)),
+            // user@host sugar
+            (
+                "alice@host.example",
+                ssh(Some("alice"), "host.example", None),
+            ),
+            (
+                "alice@host.example:2222",
+                ssh(Some("alice"), "host.example", Some(2222)),
+            ),
+            // host:port is QUIC sugar
+            ("myserver.local:9000", quic("myserver.local", 9000)),
+            ("@prod", Endpoint::Alias("prod".into())),
+            // A bare name with no ':' and no '@' is treated as an alias.
+            ("devbox", Endpoint::Alias("devbox".into())),
+        ];
+        for (input, expected) in cases {
+            assert_eq!(Endpoint::parse(input), Ok(expected), "input {input:?}");
+        }
     }
 
     #[test]
-    fn parse_ssh_url_user_host_no_port() {
-        assert_eq!(
-            Endpoint::parse("ssh://alice@example.com").unwrap(),
-            Endpoint::Ssh {
-                user: Some("alice".into()),
-                host: "example.com".into(),
-                ssh_port: None,
-            }
-        );
+    fn display_is_canonical_and_parses_back() {
+        let cases = [
+            (quic("host.example", 8443), "quic://host.example:8443"),
+            (
+                Endpoint::TcpTls {
+                    host: "host.example".into(),
+                    port: 8444,
+                },
+                "tcp+tls://host.example:8444",
+            ),
+            (
+                Endpoint::Unix(PathBuf::from("/run/user/1000/kmux/daemon-data.sock")),
+                "unix:///run/user/1000/kmux/daemon-data.sock",
+            ),
+            (
+                ssh(Some("alice"), "example.com", Some(2222)),
+                "ssh://alice@example.com:2222",
+            ),
+            (Endpoint::Alias("prod".into()), "@prod"),
+        ];
+        for (ep, expected) in cases {
+            let shown = ep.to_string();
+            assert_eq!(shown, expected, "display of {ep:?}");
+            assert_eq!(Endpoint::parse(&shown), Ok(ep), "parse back {shown:?}");
+        }
     }
 
     #[test]
-    fn parse_ssh_url_no_user() {
-        assert_eq!(
-            Endpoint::parse("ssh://example.com").unwrap(),
-            Endpoint::Ssh {
-                user: None,
-                host: "example.com".into(),
-                ssh_port: None,
-            }
-        );
-    }
-
-    // ── user@host sugar ───────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_user_at_host() {
-        assert_eq!(
-            Endpoint::parse("alice@host.example").unwrap(),
-            Endpoint::Ssh {
-                user: Some("alice".into()),
-                host: "host.example".into(),
-                ssh_port: None,
-            }
-        );
-    }
-
-    #[test]
-    fn parse_user_at_host_with_port() {
-        assert_eq!(
-            Endpoint::parse("alice@host.example:2222").unwrap(),
-            Endpoint::Ssh {
-                user: Some("alice".into()),
-                host: "host.example".into(),
-                ssh_port: Some(2222),
-            }
-        );
-    }
-
-    // ── host:port QUIC sugar ──────────────────────────────────────────────────
-
-    #[test]
-    fn parse_host_port_is_quic() {
-        assert_eq!(
-            Endpoint::parse("myserver.local:9000").unwrap(),
-            Endpoint::Quic {
-                host: "myserver.local".into(),
-                port: 9000,
-            }
-        );
-    }
-
-    // ── @alias ────────────────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_alias() {
-        assert_eq!(
-            Endpoint::parse("@prod").unwrap(),
-            Endpoint::Alias("prod".into()),
-        );
-    }
-
-    #[test]
-    fn parse_bare_name_is_alias() {
-        // A bare name with no ':' and no '@' is treated as an alias.
-        assert_eq!(
-            Endpoint::parse("devbox").unwrap(),
-            Endpoint::Alias("devbox".into()),
-        );
-    }
-
-    // ── Display ───────────────────────────────────────────────────────────────
-
-    #[test]
-    fn display_roundtrips_quic() {
-        let ep = Endpoint::Quic {
-            host: "host.example".into(),
-            port: 8443,
-        };
-        assert_eq!(ep.to_string(), "quic://host.example:8443");
-    }
-
-    #[test]
-    fn display_roundtrips_tcp_tls() {
-        let ep = Endpoint::TcpTls {
-            host: "host.example".into(),
-            port: 8444,
-        };
-        assert_eq!(ep.to_string(), "tcp+tls://host.example:8444");
-    }
-
-    #[test]
-    fn display_roundtrips_unix() {
-        let ep = Endpoint::Unix(PathBuf::from("/run/user/1000/kmux/daemon-data.sock"));
-        assert_eq!(
-            ep.to_string(),
-            "unix:///run/user/1000/kmux/daemon-data.sock"
-        );
-    }
-
-    #[test]
-    fn display_roundtrips_ssh_full() {
-        let ep = Endpoint::Ssh {
-            user: Some("alice".into()),
-            host: "example.com".into(),
-            ssh_port: Some(2222),
-        };
-        assert_eq!(ep.to_string(), "ssh://alice@example.com:2222");
-    }
-
-    #[test]
-    fn display_roundtrips_alias() {
-        let ep = Endpoint::Alias("prod".into());
-        assert_eq!(ep.to_string(), "@prod");
-    }
-
-    // ── Error cases ───────────────────────────────────────────────────────────
-
-    #[test]
-    fn parse_empty_string_errors() {
-        assert!(Endpoint::parse("").is_err());
-    }
-
-    #[test]
-    fn parse_quic_no_port_errors() {
-        assert!(Endpoint::parse("quic://host.example").is_err());
-    }
-
-    #[test]
-    fn parse_empty_alias_errors() {
-        assert!(Endpoint::parse("@").is_err());
+    fn parse_rejects_malformed_input() {
+        for input in ["", "quic://host.example", "@"] {
+            assert!(Endpoint::parse(input).is_err(), "input {input:?}");
+        }
     }
 }

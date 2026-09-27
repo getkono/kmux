@@ -173,27 +173,10 @@ mod tests {
         assert_eq!(refusal_reason(None, None), "rejected");
     }
 
-    /// A newer daemon's refusal decodes as `Unknown`, whatever its shape.
+    /// A known error code is sent as its bare name (decoding an unknown one is
+    /// pinned by `wire_enum::fixtures::error_code`).
     #[test]
-    fn an_unknown_auth_failure_decodes_to_unknown() {
-        #[derive(Serialize)]
-        enum Newer {
-            RateLimited { retry_after_secs: u32 },
-        }
-        let bytes = rmp_serde::to_vec_named(&Newer::RateLimited {
-            retry_after_secs: 3,
-        })
-        .expect("encode");
-        let back: AuthFailure = rmp_serde::from_slice(&bytes).expect("decode");
-        assert_eq!(back, AuthFailure::Unknown);
-    }
-
-    /// A newer daemon's error code decodes as `Unknown`.
-    #[test]
-    fn an_unknown_error_code_decodes_to_unknown() {
-        let bytes = rmp_serde::to_vec_named("TabNotFound").expect("encode");
-        let back: ErrorCode = rmp_serde::from_slice(&bytes).expect("decode");
-        assert_eq!(back, ErrorCode::Unknown);
+    fn a_known_error_code_encodes_as_its_bare_name() {
         let known = rmp_serde::to_vec_named(&ErrorCode::PaneNotFound).expect("encode");
         assert_eq!(
             known,
