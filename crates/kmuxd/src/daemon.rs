@@ -329,27 +329,29 @@ async fn handle_control_connection(
     ctx: RequestCtx,
 ) {
     let mut reader = BufReader::new(read_half).take(MAX_CONTROL_REQUEST);
-    let mut line = String::new();
+    // Bytes, not a `String`: a request that is not UTF-8 (or is cut off at the
+    // cap inside a character) still gets its typed refusal below.
+    let mut line = Vec::new();
 
-    if let Err(e) = reader.read_line(&mut line).await {
+    if let Err(e) = reader.read_until(b'\n', &mut line).await {
         warn!("Control socket read error: {e}");
         return;
     }
     // A connection closed without a request is an ownership probe
     // (`socket_is_live`, run by every starting and exiting daemon), not a
     // malformed request, so it is not worth a warning.
-    if line.trim().is_empty() {
+    if line.trim_ascii().is_empty() {
         debug!("control connection closed without a request (liveness probe)");
         return;
     }
     // Cut off at the cap with no end of line in sight: the rest is not read.
-    if reader.limit() == 0 && !line.ends_with('\n') {
+    if reader.limit() == 0 && !line.ends_with(b"\n") {
         let message = format!("a request is at most {MAX_CONTROL_REQUEST} bytes");
         reply.refuse(ControlErrorKind::TooLarge, message).await;
         return;
     }
 
-    let req: ControlRequest = match serde_json::from_str(line.trim()) {
+    let req: ControlRequest = match serde_json::from_slice(line.trim_ascii()) {
         Ok(r) => r,
         Err(e) => {
             reply
@@ -722,6 +724,8 @@ mod tests {
         let (finished, reply) = exchange(b"not json\n").await;
         assert!(finished);
         assert_eq!(refusal(&reply), ControlErrorKind::Malformed);
+        let (_, reply) = exchange(b"\xff\xfe\n").await;
+        assert_eq!(refusal(&reply), ControlErrorKind::Malformed, "not UTF-8");
         let (_, reply) = exchange(b"{\"command\":\"frobnicate\"}\n").await;
         let error: ControlError = serde_json::from_str(reply.trim()).unwrap();
         assert_eq!(error.error, ControlErrorKind::UnknownCommand);
