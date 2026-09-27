@@ -628,8 +628,10 @@ mod tests {
 
         let finished = tokio::time::timeout(Duration::from_secs(10), serving).await;
         assert!(finished.expect("refused without waiting").unwrap());
+        // Closing with the flood's tail unread resets the connection on
+        // Linux; either way, nothing was answered.
         let mut reply = Vec::new();
-        client.read_to_end(&mut reply).await.unwrap();
+        let _ = client.read_to_end(&mut reply).await;
         assert!(reply.is_empty(), "no answer to a malformed request");
     }
 
