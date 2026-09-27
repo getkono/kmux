@@ -178,3 +178,19 @@ pub fn help_entries() -> Vec<(&'static str, &'static str)> {
         ("Ctrl+Alt+R", "Reconnect now"),
     ]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Disconnected offers "Reconnect now" and quit — no `y` confirmation
+    /// any more (issue #208) — and the help lists the same chord.
+    #[test]
+    fn disconnected_hints_offer_reconnect_now_not_a_confirmation() {
+        let hints = mode_hints(&Mode::Disconnected {
+            reason: "auth failed".to_string(),
+        });
+        assert_eq!(hints, vec![("Ctrl+Alt+R", "Reconnect now"), ("q", "Quit")]);
+        assert!(help_entries().contains(&("Ctrl+Alt+R", "Reconnect now")));
+    }
+}

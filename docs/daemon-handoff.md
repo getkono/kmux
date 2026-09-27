@@ -57,7 +57,8 @@ O: set_all_keep_alive ; quiesce relays    (nothing here can fail the handoff)
 O ──Released──▶ N ; O exits (releases listeners, control/data sockets, pid file)
 N: restore_with_handoff(checkpoint, inherited fds) ; bind sockets ;
    claim pid file once O (by its verified pid) has exited ; serve
-client: reconnect (new ports, adopted token) ; re-attach with last_seqno
+client: reconnect on its own (new ports, adopted token) ; re-attach each pane
+        afresh — a new daemon process, so a snapshot (issue #208)
 
 any failure before the commit point — including SIGINT/SIGTERM to O:
 O: release the readers ; unseal the checkpoint ; reopen pane creation ;
@@ -301,7 +302,9 @@ cross-process tests in `crates/kmuxd/tests/handoff_e2e.rs`.
 
 - **Listening sockets / the QUIC endpoint are not migrated.** Ephemeral ports and
   the auth token rotate; connected clients reconnect via the existing logic
-  (re-auth with the adopted token, re-attach with `last_seqno`). The successor
+  (re-auth with the adopted token; a GUI reconnects automatically and, seeing a
+  new daemon pid, re-attaches every pane for a snapshot and drops the input it
+  held during the gap — issue #208, see connection.md). The successor
   adopts the predecessor's token so re-auth is seamless. True zero-downtime
   *client* connections (passing listener fds) is a possible future follow-up.
 - `relay.rs::foreground_process_name` still reads `/proc/<pgid>/comm` (Linux-only
