@@ -385,7 +385,7 @@ async fn apply_events(
             }
         }
     });
-    let _reader = AbortOnDrop(reader);
+    let _reader = crate::supervisor::AbortOnDrop(reader);
 
     let mut prev_cursor = CursorState::default();
     let mut prev_modes = TermModes::EMPTY;
@@ -443,16 +443,6 @@ fn output_waiting(master: BorrowedFd<'_>) -> bool {
     let ready = unsafe { poll(&raw mut probe, 1, 0) };
     // Only POLLIN was asked for, so a ready fd without a hang-up has output.
     ready == 1 && probe.revents & POLLHUP == 0
-}
-
-/// Aborts a task when dropped, so the socket reader never outlives the
-/// supervisor that owns it (an aborted supervisor included).
-struct AbortOnDrop(JoinHandle<()>);
-
-impl Drop for AbortOnDrop {
-    fn drop(&mut self) {
-        self.0.abort();
-    }
 }
 
 /// Reap the worker (the daemon's direct child) so it does not linger as a

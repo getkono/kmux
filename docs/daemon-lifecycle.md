@@ -500,6 +500,16 @@ release the lock. They never await the PTY. A per-pane writer task drains the
 queue to the PTY, encoding keys and wrapping pastes against the emulator's live
 modes at write time.
 
+The writer runs under `supervisor::supervise` (issue #207). A panic while it
+encodes an input (a key against a broken emulator state) used to end the task,
+and with it every later keystroke for that pane, silently. Now the input being
+encoded is lost, the panic is logged at `error!`, and after the supervisor's
+backoff a new writer takes over the same queue, which an async mutex shares
+between runs. Input queued in the meantime waits in the queue. Dropping the
+engine (pane close) aborts the supervisor, and the supervisor aborts the run in
+flight with it (`AbortOnDrop`), so a writer blocked on a program that never
+reads still does not outlive its pane.
+
 Before issue #206 the PTY write was awaited under the `sessions` lock, so a
 pane whose child stopped reading stdin blocked once the kernel buffer filled,
 and every `sessions.write()` in the daemon (create, close, resize, attach)
