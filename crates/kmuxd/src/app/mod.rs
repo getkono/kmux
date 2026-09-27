@@ -1995,7 +1995,7 @@ mod tests {
     /// proxied ones — what `SessionList` answers and a lag resync sends.
     #[tokio::test]
     async fn all_sessions_lists_local_sessions_then_federated_ones() {
-        let app = app_with_one_pane("eagle").await;
+        let app = Arc::new(app_with_one_pane("eagle").await);
         let (_upstream, _peer) = app.install_channel_peer("fedlocal", "fedremote");
         let words = |entries: Vec<kmux_protocol::messages::SessionEntry>| -> Vec<String> {
             entries.into_iter().map(|e| e.meta.word_id).collect()

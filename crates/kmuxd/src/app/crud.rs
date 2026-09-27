@@ -123,6 +123,7 @@ impl ServerApp {
             // Local session: federated attribution is added by the hub's
             // `localize_entry` only when proxying a remote peer.
             peer: None,
+            peer_unreachable: false,
         })
     }
 
@@ -190,6 +191,7 @@ impl ServerApp {
             tabs: state.tab_infos(),
             active_tab: state.active_tab,
             peer: None,
+            peer_unreachable: false,
         }
     }
 
@@ -215,6 +217,17 @@ impl ServerApp {
         let mut sessions = self.list_sessions().await;
         sessions.extend(self.list_federated_sessions());
         sessions
+    }
+
+    /// An unsolicited `SessionListResult` (`RESYNC_REQUEST_ID`) of every
+    /// session, for broadcasting to every client when the list changed under
+    /// them all at once — a federated peer went unreachable or came back
+    /// (issue #208).
+    pub async fn session_list_resync_message(&self) -> ServerMessage {
+        ServerMessage::SessionListResult {
+            request_id: kmux_protocol::messages::RESYNC_REQUEST_ID,
+            sessions: self.all_sessions().await,
+        }
     }
 
     /// Queue on `out` an unsolicited `SessionListResult` (`RESYNC_REQUEST_ID`)

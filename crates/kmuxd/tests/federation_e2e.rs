@@ -416,8 +416,9 @@ async fn two_guis_share_one_proxied_pane_with_smallest_wins() {
 }
 
 /// PR6 hardening: when the remote daemon dies, the failure is isolated. The GUI's
-/// federated session is cleanly closed (not left hanging), and the local daemon
-/// keeps serving — proxied panes live apart from locally-hosted ones.
+/// federated session is listed as unreachable (not closed, not left hanging;
+/// issue #208), and the local daemon keeps serving — proxied panes live apart
+/// from locally-hosted ones.
 #[tokio::test]
 async fn remote_daemon_death_is_isolated_from_local_daemon() {
     // Remote daemon + a session, and the local hub.
@@ -453,17 +454,13 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
     // Kill the remote daemon hard — its TCP link drops under the local daemon.
     let _ = kill(Pid::from_raw(fed.remote_pid as i32), Signal::SIGKILL);
 
-    // Isolation #1: the GUI's federated session is closed cleanly, not hung.
-    let want_word = local_word.clone();
-    let closed = recv_until(&mut gui_rx, E2E_TIMEOUT, move |m| {
-        matches!(m, ServerMessage::Event {
-            event: SessionEventMsg::SessionClosed { word_id },
-        } if *word_id == want_word)
-    })
-    .await;
-    assert!(
-        closed.is_some(),
-        "a dead peer must surface as SessionClosed for its federated session"
+    // Isolation #1: the GUI's federated session is not closed, and not hung:
+    // it is listed as unreachable while the hub keeps re-opening the link
+    // (issue #208).
+    assert_eq!(
+        await_peer_state(&mut gui_rx, &local_word).await,
+        Some(true),
+        "a dead peer must surface as an unreachable session, not a closed one"
     );
 
     // Isolation #2: the local daemon is unaffected — its connection to the GUI is
@@ -489,6 +486,94 @@ async fn remote_daemon_death_is_isolated_from_local_daemon() {
     );
 
     // ── Teardown (remote already dead). ──
+    drop(gui_tx);
+    fed.shutdown().await;
+}
+
+/// The next session list the hub sends that names `local_word`: whether it
+/// flags the word's peer unreachable. `None` if none arrives in time. Fails
+/// if any message on the way closes `local_word` — a peer blip must not
+/// (issue #208).
+async fn await_peer_state(
+    rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
+    local_word: &str,
+) -> Option<bool> {
+    let read = async {
+        loop {
+            match rx.recv().await? {
+                ServerMessage::Event {
+                    event: SessionEventMsg::SessionClosed { word_id },
+                } => assert_ne!(word_id, local_word, "the session must not be closed"),
+                ServerMessage::SessionListResult { sessions, .. } => {
+                    if let Some(entry) = sessions.iter().find(|e| e.meta.word_id == local_word) {
+                        return Some(entry.peer_unreachable);
+                    }
+                }
+                _ => {}
+            }
+        }
+    };
+    tokio::time::timeout(E2E_TIMEOUT, read).await.ok().flatten()
+}
+
+/// Issue #208: a peer whose link goes silent (here, a frozen remote daemon)
+/// is called unreachable once the hub's inbound deadline passes — its
+/// session listed and flagged, closed for no one. When the peer answers
+/// again, the hub re-opens the link on its own: the session is back under the
+/// same local word, and re-attaching its pane shows what was on screen.
+///
+/// Out of process because the silence is a real peer's: a frozen daemon, which
+/// no channel stand-in reproduces (the in-memory tier covers the same
+/// supervisor on the paused clock, in `federation::link`).
+#[tokio::test]
+async fn a_frozen_peer_is_unreachable_then_restored_under_the_same_word() {
+    const MARKER: &str = "FEDMARKER_RESTORED";
+    let fed = Federation::spawn_pair().await;
+    let pidfile = fed.remote.path().join("shell.pid");
+    create_remote_session(&fed, MARKER, &pidfile).await;
+    let (gui, _peer) = fed.open_peer().await;
+    let Client {
+        tx: gui_tx,
+        rx: mut gui_rx,
+    } = gui;
+    let local_pane = federated_pane(&gui_tx, &mut gui_rx).await;
+    let local_word = local_pane.split('/').next().unwrap().to_string();
+
+    // Freeze the remote: its link goes silent, but nothing closes it.
+    let remote = Pid::from_raw(i32::try_from(fed.remote_pid).unwrap_or(i32::MAX));
+    kill(remote, Signal::SIGSTOP).expect("freeze the remote");
+    let unreachable = await_peer_state(&mut gui_rx, &local_word).await;
+    // Thaw it before asserting, so a failure does not leave it frozen.
+    kill(remote, Signal::SIGCONT).expect("thaw the remote");
+    assert_eq!(unreachable, Some(true), "the silent peer is unreachable");
+
+    assert_eq!(
+        await_peer_state(&mut gui_rx, &local_word).await,
+        Some(false),
+        "the peer comes back under the same local word"
+    );
+    gui_tx
+        .send(ClientMessage::Attach {
+            pane_id: local_pane.clone(),
+            last_seqno: None,
+            size: ATTACH_SIZE,
+        })
+        .expect("gui Attach");
+    let want = local_pane.clone();
+    let snapshot = recv_until(
+        &mut gui_rx,
+        E2E_TIMEOUT,
+        move |m| matches!(m, ServerMessage::TerminalSnapshot { pane_id, .. } if *pane_id == want),
+    )
+    .await;
+    let Some(ServerMessage::TerminalSnapshot { snapshot, .. }) = snapshot else {
+        panic!("the restored pane attaches: {snapshot:?}");
+    };
+    assert!(
+        snapshot_text(&snapshot).contains(MARKER),
+        "the restored pane shows what the remote session printed"
+    );
+
     drop(gui_tx);
     fed.shutdown().await;
 }

@@ -914,6 +914,7 @@ mod tests {
             tabs: vec![tab(0, LayoutNode::single(0), 0)],
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         }
     }
 

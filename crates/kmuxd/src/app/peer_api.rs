@@ -160,21 +160,29 @@ impl ServerApp {
     /// [`PeerManager::install_channel_peer`](crate::federation::PeerManager).
     #[cfg(all(test, feature = "federation"))]
     pub(crate) fn install_channel_peer(
-        &self,
+        self: &std::sync::Arc<Self>,
         local_word: &str,
         remote_word: &str,
     ) -> (
         mpsc::UnboundedReceiver<ClientMessage>,
         mpsc::UnboundedSender<ServerMessage>,
     ) {
-        self.peer_manager
-            .install_channel_peer("peer:1", local_word, remote_word)
+        self.peer_manager.install_channel_peer(
+            self,
+            "peer:1",
+            local_word,
+            remote_word,
+            crate::federation::no_reconnect(),
+        )
     }
 
     /// Ensure an upstream connection to `target` exists and surface its sessions
     /// locally, returning the peer's stable [`PeerId`]. Without the feature this
     /// reports a "not supported" error the client already handles.
-    pub async fn open_peer(&self, target: PeerTarget) -> Result<PeerId, String> {
+    pub async fn open_peer(
+        self: &std::sync::Arc<Self>,
+        target: PeerTarget,
+    ) -> Result<PeerId, String> {
         #[cfg(feature = "federation")]
         {
             self.peer_manager.open_peer(self, target).await

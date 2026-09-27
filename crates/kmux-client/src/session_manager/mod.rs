@@ -861,6 +861,7 @@ mod tests {
             }],
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         }
     }
 
@@ -1154,6 +1155,7 @@ mod tests {
                 .collect(),
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         }
     }
 
@@ -1679,6 +1681,7 @@ mod tests {
             tabs: vec![],
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         });
         mgr.session_list.push(SessionEntry {
             meta: SessionMeta {
@@ -1691,6 +1694,7 @@ mod tests {
             tabs: vec![],
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         });
 
         assert_eq!(mgr.display_name_for("alpha"), "src (proj-a)");
@@ -1711,8 +1715,21 @@ mod tests {
             tabs: vec![],
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         });
         assert_eq!(mgr.display_name_for("eagle"), "myapp");
+    }
+
+    /// A session whose peer is unreachable says so wherever its name shows
+    /// (issue #208).
+    #[test]
+    fn display_name_marks_a_session_whose_peer_is_unreachable() {
+        let mut mgr = make_manager();
+        let mut entry = make_entry("hawk", "/srv/app");
+        entry.peer = Some("box".to_string());
+        entry.peer_unreachable = true;
+        mgr.session_list.push(entry);
+        assert_eq!(mgr.display_name_for("hawk"), "app · unreachable");
     }
 
     #[test]

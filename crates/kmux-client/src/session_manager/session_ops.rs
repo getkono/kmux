@@ -304,11 +304,23 @@ impl SessionManager {
     }
 
     /// Compute the display name for a session, disambiguating by parent directory
-    /// if multiple sessions share the same name.
+    /// if multiple sessions share the same name, and marking one whose peer is
+    /// unreachable (issue #208).
     pub fn display_name_for(&self, word_id: &str) -> String {
         let Some(entry) = self.session_list.iter().find(|e| e.meta.word_id == word_id) else {
             return word_id.to_string();
         };
+        let name = self.disambiguated_name(entry);
+        if entry.peer_unreachable {
+            format!("{name} · unreachable")
+        } else {
+            name
+        }
+    }
+
+    /// `entry`'s name, with its parent directory when another listed session
+    /// has the same name.
+    fn disambiguated_name(&self, entry: &kmux_protocol::messages::SessionEntry) -> String {
         let name = &entry.meta.name;
         let cwd = &entry.meta.cwd;
 

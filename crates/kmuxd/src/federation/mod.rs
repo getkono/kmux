@@ -35,22 +35,27 @@ use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
 use kmux_client::grid::CellGrid;
-use kmux_connect::connect::ConnectResult;
-use kmux_connect::ssh::{self, RemoteTarget};
-use kmux_connect::tcp_connect::connect_tcp_tls;
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ClientInfo, ClientMessage, PaneProcesses, PeerId, PeerTarget,
-    RequestId, SequenceNo, ServerMessage, SessionEntry, SessionEventMsg, TermSize, epoch_millis,
+    ClientId, ClientInfo, ClientMessage, PaneProcesses, PeerId, PeerTarget, RequestId, SequenceNo,
+    ServerMessage, SessionEntry, SessionEventMsg, TermSize, epoch_millis,
 };
 use kmux_protocol::{format_pane_id, parse_pane_id};
 
+mod feed;
+pub(crate) mod link;
 mod translate;
 use tokio::sync::{mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
-use translate::{localize_entry, msg_pane_id, rewrite_event_to_local, set_msg_pane_id};
+use translate::localize_entry;
 
 use crate::app::ServerApp;
+
+/// Lock a peer connection, past a poisoned lock: every update to it is a
+/// whole-field write, which a panic elsewhere cannot leave half done.
+fn lock(conn: &Mutex<PeerConnection>) -> std::sync::MutexGuard<'_, PeerConnection> {
+    conn.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 /// How long [`PeerManager::open_peer`] waits for the upstream `AuthResult`.
 const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
@@ -285,9 +290,9 @@ struct PeerConnection {
     /// kept alive for the life of the connection (the `-L` forward dies with it).
     /// `None` for a [`PeerTarget::Direct`] peer. Killed on close/reap.
     ssh_tunnel: Option<tokio::process::Child>,
-    /// Set by the feed loop when the upstream link closes. A dead connection is
-    /// reaped lazily on the next `open_peer` to the same peer (which holds the
-    /// `&ServerApp` needed to release the local words), so re-federation works.
+    /// The link is down: the peer is unreachable and its link is being
+    /// re-opened (issue #208). Its sessions stay listed, flagged
+    /// `peer_unreachable`, and requests for them fail at once.
     dead: bool,
 }
 
@@ -307,6 +312,45 @@ impl PeerConnection {
             pending_acks: HashMap::new(),
             ssh_tunnel: None,
             dead: false,
+        }
+    }
+
+    /// Re-attach every proxied pane that has viewers on a re-opened link
+    /// (issue #208), asking for a snapshot: the peer may be a new daemon run,
+    /// whose seqnos start over. The snapshot re-seeds the mirror and resyncs
+    /// every viewer.
+    fn reattach_panes(&self) {
+        for (local_pane, pane) in &self.panes {
+            let Some((local_word, idx)) = parse_pane_id(local_pane) else {
+                continue;
+            };
+            let Some(remote_word) = self.local_to_remote.get(local_word) else {
+                continue;
+            };
+            let _ = self.client_tx.send(ClientMessage::Attach {
+                pane_id: format_pane_id(remote_word, idx),
+                last_seqno: None,
+                size: pane.upstream_size,
+            });
+        }
+    }
+
+    /// Keep the cached tab `tab_index` of `local_word` in line with a layout
+    /// update the peer sent, so the next session list shows it (issue #208).
+    fn cache_layout(
+        &mut self,
+        local_word: &str,
+        tab_index: u32,
+        layout: &kmux_protocol::messages::LayoutNode,
+        focused_pane: u32,
+    ) {
+        if let Some(tab) = self
+            .sessions
+            .get_mut(local_word)
+            .and_then(|entry| entry.tabs.iter_mut().find(|t| t.tab_index == tab_index))
+        {
+            tab.layout = layout.clone();
+            tab.focused_pane = focused_pane;
         }
     }
 
@@ -390,30 +434,15 @@ impl Drop for PeerConnection {
     }
 }
 
-/// A resolved TCP+TLS endpoint for an upstream peer link. Both [`PeerTarget`]
-/// variants reduce to this: `Direct` is the endpoint verbatim; `Ssh` is the
-/// loopback end of an `-L` tunnel (with the tunnel child retained so it outlives
-/// the connection). From here the connect/auth/list/register path is identical.
-struct PeerConnectPlan {
-    host: String,
-    port: u16,
-    /// TOFU identity for cert pinning — for SSH this is the *real* remote
-    /// `host:tcp_port`, not the ephemeral loopback the tunnel listens on.
-    tofu_key: String,
-    token: String,
-    accept_invalid: bool,
-    ssh_tunnel: Option<tokio::process::Child>,
-}
-
 /// Kills a parked SSH `-L` tunnel on drop unless [`disarm`](Self::disarm)ed.
 /// `tokio::process::Child` is not kill-on-drop, so any error between
 /// `ssh::negotiate` and a fully-registered peer would otherwise leak the
 /// process. Disarmed once the tunnel is parked on the live [`PeerConnection`].
-struct TunnelGuard(Option<tokio::process::Child>);
+pub(crate) struct TunnelGuard(pub(crate) Option<tokio::process::Child>);
 
 impl TunnelGuard {
     /// Take the child out, disarming the guard (the caller owns teardown now).
-    fn disarm(&mut self) -> Option<tokio::process::Child> {
+    pub(super) fn disarm(&mut self) -> Option<tokio::process::Child> {
         self.0.take()
     }
 }
@@ -432,161 +461,34 @@ impl PeerManager {
     }
 
     /// Ensure an upstream connection to `target` exists and surface its sessions
-    /// locally, returning the peer's [`PeerId`]. Idempotent: an already-open peer
-    /// is reused. Performs the connect + auth + session-list handshake inline, so
-    /// the caller awaits a fully-registered peer before replying `PeerOpened`.
-    pub async fn open_peer(&self, app: &ServerApp, target: PeerTarget) -> Result<PeerId, String> {
+    /// locally, returning the peer's [`PeerId`]. Idempotent: an open peer is
+    /// reused, reachable or not — an unreachable one's link is being re-opened
+    /// already (issue #208). Performs the connect + auth + session-list
+    /// handshake inline, so the caller awaits a fully-registered peer before
+    /// replying `PeerOpened`; from then on the peer's link supervisor keeps
+    /// the link up.
+    pub async fn open_peer(
+        &self,
+        app: &Arc<ServerApp>,
+        target: PeerTarget,
+    ) -> Result<PeerId, String> {
         let peer_id = target.peer_id();
-
-        // Reuse a live peer; reap a dead one (its upstream closed) so this becomes
-        // a fresh federation rather than handing back a defunct connection.
-        let existing_dead = self
-            .peers
-            .lock()
-            .unwrap()
-            .get(&peer_id)
-            .map(|c| c.lock().unwrap().dead);
-        match existing_dead {
-            Some(false) => {
-                debug!(%peer_id, "reusing existing peer connection");
-                return Ok(peer_id);
-            }
-            Some(true) => self.reap_dead_peer(app, &peer_id),
-            None => {}
+        if self.peers.lock().unwrap().contains_key(&peer_id) {
+            debug!(%peer_id, "reusing existing peer connection");
+            return Ok(peer_id);
         }
 
-        // Resolve the target to a TCP+TLS endpoint. A `Direct` peer is that
-        // endpoint verbatim; an `Ssh` peer first negotiates a `-L` tunnel
-        // (`kmuxd probe-or-start` over SSH, then forward a loopback port) and is
-        // reached over TCP+TLS through it — identical from here on. The tunnel
-        // child is carried in the plan so it can be parked on the connection.
-        let plan = match target {
-            PeerTarget::Direct {
-                host,
-                port,
-                token,
-                accept_invalid_certs,
-            } => PeerConnectPlan {
-                tofu_key: format!("{host}:{port}"),
-                host,
-                port,
-                token,
-                accept_invalid: accept_invalid_certs,
-                ssh_tunnel: None,
-            },
-            PeerTarget::Ssh {
-                user,
-                host,
-                ssh_port,
-                accept_invalid_certs,
-            } => {
-                let remote = RemoteTarget {
-                    user,
-                    host,
-                    ssh_port,
-                };
-                let ssh = ssh::negotiate(&remote)
-                    .await
-                    .map_err(|e| format!("SSH peer negotiation failed: {e}"))?;
-                PeerConnectPlan {
-                    tofu_key: format!("{}:{}", ssh.remote_host, ssh.remote_tcp_port),
-                    host: "127.0.0.1".to_string(),
-                    port: ssh.local_tcp_port,
-                    token: ssh.token,
-                    accept_invalid: accept_invalid_certs,
-                    ssh_tunnel: Some(ssh.tunnel_process),
-                }
-            }
-        };
-
-        let PeerConnectPlan {
-            host,
-            port,
-            tofu_key,
-            token,
-            accept_invalid,
-            ssh_tunnel,
-        } = plan;
-        // Hold the SSH tunnel in a kill-on-drop guard so any early-return error
-        // path below (connect, auth, or session-list failure/timeout) tears down
-        // the `ssh -L` process — `tokio::process::Child` is not kill-on-drop. The
-        // guard is disarmed at step 4 once the tunnel is parked on the connection.
-        let mut tunnel = TunnelGuard(ssh_tunnel);
-
-        // 1. Open the upstream link. `connect_tcp_tls` sends `Auth` itself and
-        //    forwards every `ServerMessage` (incl. `AuthResult`) to `server_tx`.
-        let (server_tx, mut server_rx) = mpsc::unbounded_channel::<ServerMessage>();
-        let client_tx = match connect_tcp_tls(
-            host,
-            port,
-            tofu_key,
-            token,
-            server_tx,
-            ClientCapabilities::default(),
-            None,
-            accept_invalid,
-        )
-        .await
-        {
-            ConnectResult::Connected(tx) => tx,
-            ConnectResult::Failed(e) => return Err(format!("peer connect failed: {e}")),
-        };
-
-        // 2. Answer the identity challenge with our own key, then await the
-        //    authentication result (issue #146). The hub authenticates upstream as
-        //    a distinct cryptographic entity, so the peer's client list shows it as
-        //    one connection.
-        loop {
-            match recv_until(&mut server_rx, AUTH_TIMEOUT, |m| {
-                matches!(
-                    m,
-                    ServerMessage::AuthChallenge { .. } | ServerMessage::AuthResult { .. }
-                )
-            })
-            .await
-            {
-                Some(ServerMessage::AuthChallenge { nonce }) => {
-                    if !kmux_connect::tcp_connect::answer_auth_challenge(&client_tx, &nonce) {
-                        return Err("failed to answer peer identity challenge".to_string());
-                    }
-                }
-                Some(ServerMessage::AuthResult { success: true, .. }) => break,
-                Some(ServerMessage::AuthResult {
-                    success: false,
-                    reason,
-                    ..
-                }) => {
-                    return Err(format!(
-                        "peer rejected authentication: {}",
-                        reason.unwrap_or_else(|| "unknown reason".to_string())
-                    ));
-                }
-                _ => return Err("peer did not complete authentication in time".to_string()),
-            }
-        }
-
-        // 3. Fetch the remote session list.
-        if client_tx
-            .send(ClientMessage::SessionList { request_id: 1 })
-            .is_err()
-        {
-            return Err("peer connection closed before session list".to_string());
-        }
-        let Some(ServerMessage::SessionListResult {
+        let link::Upstream {
+            client_tx,
+            server_rx,
             sessions: remote_sessions,
-            ..
-        }) = recv_until(&mut server_rx, LIST_TIMEOUT, |m| {
-            matches!(m, ServerMessage::SessionListResult { .. })
-        })
-        .await
-        else {
-            return Err("peer did not return a session list in time".to_string());
-        };
+            mut tunnel,
+        } = link::connect_upstream(target.clone()).await?;
 
-        // 4. Register each remote session under a fresh local word. Park the SSH
-        //    tunnel (if any) on the connection — disarming the guard — so it lives
-        //    as long as the link and is killed by `close_peer`/`reap_dead_peer`.
-        let mut conn = PeerConnection::new(client_tx.clone());
+        // Register each remote session under a fresh local word. Park the SSH
+        // tunnel (if any) on the connection — disarming the guard — so it lives
+        // as long as the link and is killed by `close_peer`.
+        let mut conn = PeerConnection::new(client_tx);
         conn.ssh_tunnel = tunnel.disarm();
         let mut assigned_words: Vec<String> = Vec::new();
         for entry in remote_sessions {
@@ -601,27 +503,29 @@ impl PeerManager {
             conn.register_session(local_word, remote_word, entry, &peer_id);
         }
 
-        // 5. Publish the peer. The reuse check at the top of `open_peer` is not
-        //    atomic with this insert across the `await`-heavy connect above, so two
-        //    GUIs federating the *same* target concurrently can both reach here.
-        //    Decide the winner under a single `peers` lock — the winner spawns its
-        //    feed loop and inserts; a loser tears its duplicate down (closing the
-        //    redundant upstream link + SSH tunnel and releasing its drawn words) and
-        //    reuses the winner — so a race can never leak a connection or corrupt the
-        //    word index. The word index is published only by the winner, while still
-        //    holding `peers`, so a lookup that sees a word also finds its connection.
+        // Publish the peer. The reuse check at the top of `open_peer` is not
+        // atomic with this insert across the `await`-heavy connect above, so two
+        // GUIs federating the *same* target concurrently can both reach here.
+        // Decide the winner under a single `peers` lock — the winner spawns its
+        // link and inserts; a loser tears its duplicate down (closing the
+        // redundant upstream link + SSH tunnel and releasing its drawn words) and
+        // reuses the winner — so a race can never leak a connection or corrupt the
+        // word index. The word index is published only by the winner, while still
+        // holding `peers`, so a lookup that sees a word also finds its connection.
         let conn = Arc::new(Mutex::new(conn));
         let won = {
             let mut peers = self.peers.lock().unwrap();
-            let taken = peers
-                .get(&peer_id)
-                .is_some_and(|existing| !existing.lock().unwrap().dead);
-            if taken {
+            if peers.contains_key(&peer_id) {
                 false
             } else {
-                let feed =
-                    spawn_feed_loop(server_rx, client_tx, Arc::clone(&conn), peer_id.clone());
-                conn.lock().unwrap().feed_task = Some(feed);
+                let task = link::spawn_link(
+                    Arc::downgrade(app),
+                    Arc::clone(&conn),
+                    peer_id.clone(),
+                    server_rx,
+                    link::connector_for(target),
+                );
+                conn.lock().unwrap().feed_task = Some(task);
                 peers.insert(peer_id.clone(), Arc::clone(&conn));
                 let mut idx = self.word_index.lock().unwrap();
                 for w in &assigned_words {
@@ -632,7 +536,7 @@ impl PeerManager {
         };
 
         if !won {
-            // Lost the race: tear down this duplicate (no feed loop was spawned, so
+            // Lost the race: tear down this duplicate (no link was spawned, so
             // dropping `conn` closes its `client_tx` and the upstream link) and
             // return the drawn words to the pool.
             if let Some(mut child) = conn.lock().unwrap().ssh_tunnel.take() {
@@ -647,6 +551,53 @@ impl PeerManager {
 
         info!(%peer_id, sessions = assigned_words.len(), "federated peer opened");
         Ok(peer_id)
+    }
+
+    /// Bring the hub's listing of `peer_id`'s sessions in line with the list
+    /// the peer just sent (issue #208) — on a re-opened link, or when the
+    /// peer's sessions changed. A session the peer still lists keeps its local
+    /// word (its entry refreshed); a new one draws a word; one the peer no
+    /// longer lists is closed here, for every client.
+    fn reconcile_sessions(
+        &self,
+        app: &ServerApp,
+        conn: &Arc<Mutex<PeerConnection>>,
+        peer_id: &str,
+        listed: Vec<SessionEntry>,
+    ) {
+        let gone: Vec<String> = {
+            let guard = lock(conn);
+            guard
+                .local_to_remote
+                .iter()
+                .filter(|(_, remote)| !listed.iter().any(|e| e.meta.word_id == **remote))
+                .map(|(local, _)| local.clone())
+                .collect()
+        };
+        for local_word in gone {
+            self.unregister_session(app, &local_word);
+            app.broadcast_session_event(SessionEventMsg::SessionClosed {
+                word_id: local_word,
+            });
+        }
+        for entry in listed {
+            let remote_word = entry.meta.word_id.clone();
+            let known = lock(conn).remote_to_local.get(&remote_word).cloned();
+            if let Some(local_word) = known {
+                let localized = localize_entry(entry, &local_word, peer_id);
+                lock(conn).sessions.insert(local_word, localized);
+                continue;
+            }
+            let Some(local_word) = app.draw_word() else {
+                warn!(%peer_id, "local session word pool exhausted; a peer session is not listed");
+                continue;
+            };
+            lock(conn).register_session(local_word.clone(), remote_word, entry, peer_id);
+            self.word_index
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .insert(local_word, peer_id.to_string());
+        }
     }
 
     /// Create a new session on an already-federated peer: forward a
@@ -721,8 +672,22 @@ impl PeerManager {
         };
 
         // Register under a fresh local word and publish it to the word index, so
-        // the new session is addressable and its panes route as federated.
+        // the new session is addressable and its panes route as federated. The
+        // peer's `SessionCreated` event may have made the hub re-list the
+        // peer's sessions first; then the session is already registered, and
+        // keeps the word it got (issue #208).
         let remote_word = remote_entry.meta.word_id.clone();
+        let registered = {
+            let guard = conn.lock().unwrap();
+            guard
+                .remote_to_local
+                .get(&remote_word)
+                .and_then(|local| guard.sessions.get(local))
+                .cloned()
+        };
+        if let Some(entry) = registered {
+            return Ok(entry);
+        }
         let local_word = app
             .draw_word()
             .ok_or_else(|| "local session word pool exhausted".to_string())?;
@@ -741,6 +706,10 @@ impl PeerManager {
 
     /// Tear down the upstream connection to `peer_id`, release its local words,
     /// and abort its feed loop. No-op when the peer is unknown.
+    ///
+    /// The user closing the peer is one of the two things that close its
+    /// sessions (the other is the peer closing them): every client is sent
+    /// `SessionClosed` for each (issue #208).
     pub fn close_peer(&self, app: &ServerApp, peer_id: &str) {
         let conn = self.peers.lock().unwrap().remove(peer_id);
         let Some(conn) = conn else { return };
@@ -755,26 +724,11 @@ impl PeerManager {
         for local_word in guard.local_to_remote.keys() {
             idx.remove(local_word);
             app.release_word(local_word);
+            app.broadcast_session_event(SessionEventMsg::SessionClosed {
+                word_id: local_word.clone(),
+            });
         }
         info!(%peer_id, "federated peer closed");
-    }
-
-    /// Remove a peer whose upstream link already died (feed loop set `dead`),
-    /// releasing its local words back to the pool and clearing the word index so a
-    /// fresh `open_peer` to the same address starts clean.
-    fn reap_dead_peer(&self, app: &ServerApp, peer_id: &str) {
-        let conn = self.peers.lock().unwrap().remove(peer_id);
-        let Some(conn) = conn else { return };
-        let mut guard = conn.lock().unwrap();
-        if let Some(mut child) = guard.ssh_tunnel.take() {
-            let _ = child.start_kill();
-        }
-        let mut idx = self.word_index.lock().unwrap();
-        for local_word in guard.local_to_remote.keys() {
-            idx.remove(local_word);
-            app.release_word(local_word);
-        }
-        debug!(%peer_id, "reaped dead peer before re-federation");
     }
 
     /// Tear every peer down for daemon shutdown: abort each feed loop and kill each
@@ -817,11 +771,18 @@ impl PeerManager {
     }
 
     /// Proxied sessions across all peers (local IDs, peer-decorated names).
+    ///
+    /// The sessions of a peer whose link is down are listed too, flagged
+    /// `peer_unreachable` (issue #208).
     pub fn list_sessions(&self) -> Vec<SessionEntry> {
         let peers = self.peers.lock().unwrap();
         let mut out = Vec::new();
         for conn in peers.values() {
-            out.extend(conn.lock().unwrap().sessions.values().cloned());
+            let guard = conn.lock().unwrap();
+            out.extend(guard.sessions.values().cloned().map(|entry| SessionEntry {
+                peer_unreachable: guard.dead,
+                ..entry
+            }));
         }
         out
     }
@@ -1266,45 +1227,40 @@ impl PeerManager {
     }
 
     /// Publish a peer whose upstream link is a pair of channels instead of a
-    /// socket, proxying one empty session `remote_word` as `local_word`. Returns
-    /// what the hub sends upstream and the sender that plays the peer's replies
-    /// into the real feed loop.
+    /// socket, proxying one empty session `remote_word` as `local_word`, and
+    /// re-opened (when it drops) by `connector`. Returns what the hub sends
+    /// upstream and the sender that plays the peer's replies into the real
+    /// link supervisor.
     #[cfg(test)]
     pub(crate) fn install_channel_peer(
         &self,
+        app: &Arc<ServerApp>,
         peer_id: &str,
         local_word: &str,
         remote_word: &str,
+        connector: link::Connector,
     ) -> (
         mpsc::UnboundedReceiver<ClientMessage>,
         mpsc::UnboundedSender<ServerMessage>,
     ) {
-        use kmux_protocol::messages::SessionMeta;
-
         let (client_tx, client_rx) = mpsc::unbounded_channel();
         let (server_tx, server_rx) = mpsc::unbounded_channel();
-        let mut conn = PeerConnection::new(client_tx.clone());
-        let entry = SessionEntry {
-            meta: SessionMeta {
-                index: 0,
-                word_id: remote_word.to_string(),
-                name: remote_word.to_string(),
-                cwd: "/".to_string(),
-            },
-            panes: vec![],
-            tabs: vec![],
-            active_tab: 0,
-            peer: None,
-        };
+        let mut conn = PeerConnection::new(client_tx);
         conn.register_session(
             local_word.to_string(),
             remote_word.to_string(),
-            entry,
+            sample_remote_entry(remote_word),
             peer_id,
         );
         let conn = Arc::new(Mutex::new(conn));
-        let feed = spawn_feed_loop(server_rx, client_tx, Arc::clone(&conn), peer_id.to_string());
-        conn.lock().unwrap().feed_task = Some(feed);
+        let task = link::spawn_link(
+            Arc::downgrade(app),
+            Arc::clone(&conn),
+            peer_id.to_string(),
+            server_rx,
+            connector,
+        );
+        conn.lock().unwrap().feed_task = Some(task);
         self.peers.lock().unwrap().insert(peer_id.to_string(), conn);
         self.word_index
             .lock()
@@ -1314,177 +1270,35 @@ impl PeerManager {
     }
 }
 
-/// Drain the upstream `ServerMessage` stream: answer keepalive pings, translate
-/// pane IDs from remote to local, and fan each pane frame out to its viewers.
-fn spawn_feed_loop(
-    mut server_rx: mpsc::UnboundedReceiver<ServerMessage>,
-    client_tx: mpsc::UnboundedSender<ClientMessage>,
-    conn: Arc<Mutex<PeerConnection>>,
-    peer_id: PeerId,
-) -> JoinHandle<()> {
-    tokio::spawn(async move {
-        while let Some(mut msg) = server_rx.recv().await {
-            // Answer keepalive pings so the upstream considers us live.
-            if let ServerMessage::Ping { seq } = msg {
-                let _ = client_tx.send(ClientMessage::Pong { seq });
-                continue;
-            }
+/// An empty remote session `remote_word`, as a peer lists it.
+#[cfg(test)]
+pub(crate) fn sample_remote_entry(remote_word: &str) -> SessionEntry {
+    use kmux_protocol::messages::{LayoutNode, SessionMeta, TabInfo};
+    SessionEntry {
+        meta: SessionMeta {
+            index: 0,
+            word_id: remote_word.to_string(),
+            name: remote_word.to_string(),
+            cwd: "/".to_string(),
+        },
+        panes: vec![],
+        tabs: vec![TabInfo {
+            tab_index: 0,
+            name: "1".to_string(),
+            layout: LayoutNode::single(0),
+            focused_pane: 0,
+        }],
+        active_tab: 0,
+        peer: None,
+        peer_unreachable: false,
+    }
+}
 
-            // Route process-overview responses (issue #122) to the waiting
-            // collector, translating each pane id remote→local. This frame is
-            // neither pane- nor session-scoped, so it must be handled before the
-            // routing below. Panes whose word we no longer map are dropped.
-            if let ServerMessage::ProcessOverviewResult { request_id, panes } = &msg {
-                let mut guard = conn.lock().unwrap();
-                if let Some(tx) = guard.pending_overviews.remove(request_id) {
-                    let localized: Vec<PaneProcesses> = panes
-                        .iter()
-                        .filter_map(|p| {
-                            Some(PaneProcesses {
-                                pane_id: guard.to_local_pane(&p.pane_id)?,
-                                ..p.clone()
-                            })
-                        })
-                        .collect();
-                    drop(guard);
-                    let _ = tx.send(localized);
-                }
-                continue;
-            }
-
-            // Route client-list responses (issue #146) to the waiting requester.
-            // The peer's `ClientInfo`s are relayed verbatim (their ids/labels are
-            // meaningful on that host). A response we are not waiting on is dropped.
-            if let ServerMessage::ClientListResult { request_id, .. } = &msg {
-                if let Some(tx) = conn.lock().unwrap().pending_client_lists.remove(request_id)
-                    && let ServerMessage::ClientListResult { clients, .. } = msg
-                {
-                    let _ = tx.send(clients);
-                }
-                continue;
-            }
-
-            // Route responses to hub-initiated requests (create-on-peer, kick) back
-            // to the waiting oneshot. `SessionCreated` carries the *remote* entry;
-            // `create_remote_session` (holding `&ServerApp`) draws the local word
-            // and registers it. `ClientKicked`/`Error` complete a pending kick. An
-            // `Error`/`SessionCreated` whose id we are not waiting on falls through
-            // to the normal handling below.
-            let response_rid = match &msg {
-                ServerMessage::SessionCreated { request_id, .. } => Some(*request_id),
-                ServerMessage::ClientKicked { request_id, .. }
-                | ServerMessage::SessionClosed { request_id, .. }
-                | ServerMessage::TabClosed { request_id, .. } => Some(*request_id),
-                ServerMessage::Error {
-                    request_id: Some(rid),
-                    ..
-                } => Some(*rid),
-                _ => None,
-            };
-            if let Some(rid) = response_rid {
-                // A pending ack (kick, session/tab close) takes priority for its
-                // id, then a pending create.
-                let ack_tx = conn.lock().unwrap().pending_acks.remove(&rid);
-                if let Some(tx) = ack_tx {
-                    let result = match msg {
-                        ServerMessage::Error { message, .. } => Err(message),
-                        _ => Ok(()),
-                    };
-                    let _ = tx.send(result);
-                    continue;
-                }
-                let create_tx = conn.lock().unwrap().pending_creates.remove(&rid);
-                if let Some(tx) = create_tx {
-                    let result = match msg {
-                        ServerMessage::SessionCreated { entry, .. } => Ok(entry),
-                        ServerMessage::Error { message, .. } => Err(message),
-                        _ => continue,
-                    };
-                    let _ = tx.send(result);
-                    continue;
-                }
-            }
-
-            // Pane-scoped frames: translate the pane ID remote→local, feed the
-            // pane's mirror (so a late local attacher can be served from it), then
-            // fan out to that pane's viewers. `fan_out` applies the relay's
-            // backpressure policy: a full viewer is sent `Lagged` (out-of-band) and
-            // dropped, then resyncs on re-attach from the just-updated mirror.
-            if let Some(remote_pane) = msg_pane_id(&msg).map(str::to_string) {
-                let mut guard = conn.lock().unwrap();
-                if let Some(local_pane) = guard.to_local_pane(&remote_pane) {
-                    set_msg_pane_id(&mut msg, local_pane.clone());
-                    if let Some(pane) = guard.panes.get_mut(&local_pane) {
-                        pane.apply_to_mirror(&msg);
-                        pane.fan_out(&local_pane, &msg);
-                    }
-                }
-                continue;
-            }
-
-            // Session-scoped events (titles, layout, tab/session lifecycle): translate
-            // the embedded word remote→local and fan out to every viewer under that
-            // word, so a GUI viewing a federated session still receives its title and
-            // layout updates. They take the same lanes as the local daemon's
-            // (`forward_vt_event`): layout and lifecycle go over the viewers' ctrl
-            // lane, so a backed-up pane content stream can never drop one, while a
-            // flood-prone bell/title/progress event is dropped when the viewer's
-            // pane data is congested, rather than filling the never-drop lane and
-            // closing every slow viewer (issue #206).
-            let viewers = {
-                let guard = conn.lock().unwrap();
-                match &mut msg {
-                    ServerMessage::Event { event } => {
-                        rewrite_event_to_local(event, &guard.remote_to_local)
-                            .map(|local_word| guard.viewers_under_word(&local_word))
-                    }
-                    ServerMessage::LayoutUpdate { word_id, .. } => guard
-                        .remote_to_local
-                        .get(word_id.as_str())
-                        .cloned()
-                        .map(|local_word| {
-                            *word_id = local_word.clone();
-                            guard.viewers_under_word(&local_word)
-                        }),
-                    _ => None,
-                }
-            };
-            if let Some(viewers) = viewers {
-                for tx in viewers {
-                    crate::client_handler::forward_vt_event(&tx, msg.clone());
-                }
-            }
-        }
-
-        // The upstream link closed (remote daemon gone, network dropped). Isolate
-        // the failure: tell every viewer its proxied session ended so the GUI
-        // cleans up instead of hanging, drop the panes (closing the pane streams),
-        // and mark the connection dead for lazy reaping. Locally-hosted PTY panes
-        // are untouched — they live in a separate relay. The `SessionClosed` goes
-        // over the ctrl lane so a viewer whose data stream happened to
-        // be full at death still learns the session ended (a bounded `try_send`
-        // could drop it and the GUI would hang, since no further frames follow).
-        {
-            let mut guard = conn.lock().unwrap();
-            guard.dead = true;
-            let words: Vec<String> = guard.sessions.keys().cloned().collect();
-            for local_word in &words {
-                let closed = ServerMessage::Event {
-                    event: SessionEventMsg::SessionClosed {
-                        word_id: local_word.clone(),
-                    },
-                };
-                for tx in guard.viewers_under_word(local_word) {
-                    let _ = tx.send(closed.clone());
-                }
-            }
-            // Drop panes (closing pane streams) and sessions (so a post-death
-            // `SessionList` no longer lists this peer's now-gone sessions).
-            guard.panes.clear();
-            guard.sessions.clear();
-        }
-        debug!(%peer_id, "federation feed loop ended (upstream closed); viewers notified");
-    })
+/// A connector that never re-opens a link: for a channel peer whose test does
+/// not re-open it.
+#[cfg(test)]
+pub(crate) fn no_reconnect() -> link::Connector {
+    Arc::new(|| Box::pin(async { Err("a channel peer is not re-opened".to_string()) }))
 }
 
 /// Receive from `rx` until a message satisfies `pred` or `timeout` elapses,
@@ -1549,6 +1363,7 @@ mod tests {
             }],
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         }
     }
 

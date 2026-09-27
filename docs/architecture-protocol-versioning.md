@@ -75,6 +75,11 @@ Compatible changes:
 - Add a named struct field with `#[serde(default)]` on receivers that may read
   messages from older senders.
 - Add optional output metadata that older named-map readers can ignore.
+  Example: `SessionEntry::peer_unreachable` (issue #208), a `#[serde(default)]`
+  flag an older client ignores and an older daemon never sets; and an
+  unsolicited `SessionListResult` with `request_id = RESYNC_REQUEST_ID`, an
+  existing variant every client already accepts. Neither needed a range bump
+  or a capability.
 - Add a new message or behavior behind a named negotiated capability.
 - Add a capability without changing `PROTOCOL_VERSION` or
   `MIN_PROTOCOL_VERSION`.

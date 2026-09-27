@@ -227,18 +227,55 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   workspace `cargo build`/`clippy` still compiles every crate with `remote` on (each lib crate
   is a build root with its own default), so the gated paths are always linted; the leanness
   only materializes when a GUI binary is built in an invocation that excludes `kmuxd`.
-- **PR6 — peer-down isolation + version guard — landed.** When the upstream link
-  closes (remote daemon gone, network dropped), the feed loop **isolates** the
-  failure: it sends every viewer a `SessionClosed` for its proxied session (so the
-  GUI cleans up instead of hanging), drops the panes/sessions, and marks the
-  connection `dead`. Locally-hosted PTY panes are untouched (separate relay). A dead
-  peer is **reaped lazily** on the next `open_peer` to the same address — releasing
-  its local words and clearing the word index — so re-federation starts clean
-  (`open_peer` holds the `&ServerApp` needed to return words to the pool, avoiding a
-  `Weak<ServerApp>` back-reference). Protocol-version mismatch is already rejected by
-  the upstream `Auth` handshake (`open_peer` surfaces it as a `PeerError`). E2E:
-  `remote_daemon_death_is_isolated_from_local_daemon` SIGKILLs the remote and asserts
-  the GUI gets `SessionClosed` while the local daemon keeps serving new sessions.
+- **PR6 — peer-down isolation + version guard — landed; superseded by the link
+  supervisor below (issue #208).** A peer going down is isolated: locally-hosted PTY
+  panes are untouched (separate relay), and the local daemon keeps serving. It no
+  longer closes the peer's sessions: see **Peer unreachable and re-link**. Protocol-version
+  mismatch is rejected by the upstream `Auth` handshake (`open_peer` surfaces it as a
+  `PeerError`). E2E: `remote_daemon_death_is_isolated_from_local_daemon` SIGKILLs the
+  remote and asserts the GUI's session is listed unreachable — never closed — while the
+  local daemon keeps serving new sessions.
+- **Peer unreachable and re-link (issue #208).** Each peer's link runs under one
+  supervisor task (`federation/link.rs`, `spawn_link`), whose feed loop
+  (`federation/feed.rs`) is the old one split into one handler per frame family:
+  - **Liveness.** The hub pings the peer every `UPSTREAM_PING_INTERVAL` (5 s) and
+    closes the link once the peer has been silent — not a frame, not a pong — past
+    `UPSTREAM_DEADLINE` (15 s; `upstream_silent(last_inbound, now)`). Before, it only
+    answered the peer's pings, so a black-holed link was never noticed.
+  - **Unreachable.** When the link ends (closed, failed, or silent) the peer is marked
+    down (`dead`): its sessions stay listed — under the same local words, flagged
+    `SessionEntry::peer_unreachable` — its proxied panes and their viewers are kept,
+    requests to it fail at once, and every client is sent the session list (an
+    unsolicited `SessionListResult`, `RESYNC_REQUEST_ID`). No `SessionClosed` is sent.
+  - **Re-link.** The supervisor re-opens the link with `kmux_client::backoff` (the
+    GUI's policy), each attempt bounded by `CONNECT_ATTEMPT_TIMEOUT` (20 s); an SSH
+    peer is re-negotiated each time, so a restarted remote (new token, new port) is
+    found again. On success the peer's list is reconciled (`reconcile_sessions`): a
+    session still listed keeps its local word, a new one draws one, one no longer
+    listed is closed. Every proxied pane with viewers is re-attached **for a
+    snapshot** (the peer may be a new daemon run, whose seqnos start over), which
+    re-seeds the mirror and resyncs every viewer, and every client is sent the list.
+  - **When a session closes.** Only when the peer reports it closed (its
+    `SessionClosed` event, or its session list no longer naming it) — then for every
+    client, not just the session's viewers — or when the user closes the peer
+    (`close_peer` sends each client a `SessionClosed` for every one of its sessions).
+  - **A current listing.** The hub keeps its cached entries in line with the peer: a
+    `LayoutUpdate` patches the cached tab, and a session or tab created, closed or
+    renamed on the peer makes the hub ask for the peer's list again; a
+    `SessionListResult` from the peer — that answer, or the peer's own resync after
+    the link lagged — is reconciled the same way.
+  - **`open_peer`** reuses an open peer, reachable or not (an unreachable one is being
+    re-opened already), so the lazy reaping of dead peers is gone.
+  Tests: the supervisor on the paused clock over a channel-played peer
+  (`federation::link` — dropped link → unreachable → re-linked under the same word,
+  panes re-attached for a snapshot; a silent peer is pinged then declared unreachable;
+  an answering one stays reachable; a closed peer is not re-opened), the frame handlers
+  (`federation::feed`), and the E2E
+  `a_frozen_peer_is_unreachable_then_restored_under_the_same_word` (SIGSTOP the remote,
+  assert unreachable and no `SessionClosed`, SIGCONT, assert the same word back and the
+  marker still on screen). GUIs show the state: the session's display name gains
+  `· unreachable` (GTK sidebar and header), and the Swift sidebar row says
+  "Unreachable — reconnecting" (`FfiSession::unreachable`, FFI ABI 28).
 - **PR6 — viewer backpressure parity — landed.** A proxied pane's frames are fanned
   out by `ProxiedPane::fan_out`, which applies the **same** policy as the local PTY
   relay (`relay::broadcast_to_clients`): a viewer whose bounded data channel is full is
@@ -283,13 +320,13 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   still connected would remove its sessions from the picker mid-use, so a separate
   debounced peer-idle-drop is both redundant (zero-GUI case) and wrong (GUI-connected
   case).
-- **PR6 remaining** (future): **transparent upstream reconnect/backoff** — a *transient*
-  upstream blip (remote alive, network hiccup) currently surfaces as `SessionClosed`,
-  and recovery relies on the GUI re-issuing `OpenPeer` on its next local (re)connect
-  (#121 GUI rewire). Reconnecting in-daemon (reuse `kmux-connect` `recovery`, preserve
-  the local words, re-attach panes) is deferred: it needs remote-restart semantics
-  (a restarted remote has *different* session words, so a silent re-map would be wrong)
-  and a reachable flaky remote to verify, neither of which is in CI scope.
+- **Transparent upstream reconnect — landed (issue #208).** See **Peer unreachable and
+  re-link** above. A restarted remote restores its sessions under their own words
+  (checkpoints, handoff), so the reconciled list maps them back to the same local
+  words; a session the remote no longer has is closed rather than silently re-mapped.
+  A `PeerTarget::Direct` peer is re-opened with the token and port it was opened
+  with, so a remote restarted with a new token or port is re-found only through an
+  `Ssh` target (the production path).
 
 ## Resolved — federation addressing & testability
 
