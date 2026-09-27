@@ -129,7 +129,7 @@ count = 5
 [[lints]]
 crate = "kmux-app"
 lint = "clippy::needless_pass_by_value"
-count = 6
+count = 5
 
 [[lints]]
 crate = "kmux-app"
@@ -239,7 +239,7 @@ count = 17
 [[lints]]
 crate = "kmux-client"
 lint = "missing_docs"
-count = 307
+count = 306
 
 [[lints]]
 crate = "kmux-connect"
@@ -804,7 +804,7 @@ count = 2
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::too_many_lines"
-count = 7
+count = 6
 
 [[lints]]
 crate = "kmuxd"
@@ -842,7 +842,7 @@ count = 3
 
 [[allows]]
 crate = "kmux-client"
-count = 9
+count = 8
 
 [[allows]]
 crate = "kmux-connect"
