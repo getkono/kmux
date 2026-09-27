@@ -404,7 +404,13 @@ mod tests {
             &identity,
         )
         .await;
-        daemon.await.expect("daemon task");
+        // Hang up first, so a daemon still waiting on a frame the client never
+        // sent sees the end of the stream instead of waiting forever.
+        drop((read_half, write_half));
+        tokio::time::timeout(std::time::Duration::from_secs(5), daemon)
+            .await
+            .expect("the daemon's script ends")
+            .expect("the daemon's script ran");
         result
     }
 
