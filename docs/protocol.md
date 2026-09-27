@@ -542,6 +542,13 @@ mistaken for intent:
 - **A peer that is itself a hub** answers a forwarded request only once its
   own peer has, after its `Pong`s, so the first hub cannot route those answers.
   Chained hubs are not supported.
+- **A proxied pane's lock holder can miss its own release in one race.** The
+  race: the hub gives back a stale grant (see
+  [Federated requests](#federated-requests)), and the holder releases before
+  the peer has answered the give-back. The peer then takes the holder's
+  release as a non-holder's and answers nothing. The hub, seeing the holder
+  still holding, asks for the lock again for it. The holder keeps the lock
+  until it releases again.
 - **`ListDirectory` lists the hub's filesystem**, even when the directory is
   for a session to be created on a peer.
 - **`LayoutUpdate` is not sent on attach**: a client learns a tab's layout from
