@@ -139,8 +139,9 @@ The daemon queues every message for a connection on one of two lanes (see
   proxies, the hub's pane-scoped answers from the peer (`PaneCreated`,
   `PaneClosed`, `HistoryLines`, the input-lock replies) travel this way too.
 - The flood-prone events `PaneBell`, `PaneTitleChanged` and
-  `PaneProgressChanged` go on the shared queue's data lane on TCP and UDS
-  (droppable), and on the control stream on QUIC.
+  `PaneProgressChanged` are queued on the data lane of the connection's shared
+  queue on every transport, so they may be dropped under congestion; on QUIC
+  that queue is written to the control stream, not a pane stream.
 
 What is guaranteed:
 
@@ -267,7 +268,7 @@ Notes that apply to rows above:
 | `Lagged` | push: this client's pane stream overflowed | control | may overtake pane frames; the client clears the pane and re-attaches | — |
 | `SyncReset` | push, inside an attach replay or a congestion resync | pane data | immediately followed by `TerminalSnapshot` | — |
 | `GridDigest` | push, every 32nd seqno by default | pane data (lossy) | after the frames it covers; checked only when the client is at exactly that seqno; a mismatch re-attaches | — |
-| `Event` | broadcast of a `SessionEventMsg` | control, but on TCP and UDS `PaneBell` / `PaneTitleChanged` / `PaneProgressChanged` go on the droppable data lane | after the reply that caused it; `Unknown` is ignored | — |
+| `Event` | broadcast of a `SessionEventMsg` | control, but `PaneBell` / `PaneTitleChanged` / `PaneProgressChanged` are queued droppable | after the reply that caused it; `Unknown` is ignored | — |
 | `Error` | reply | control | see [Error model](#error-model) | — |
 | `Ping` | push every `PING_INTERVAL` | control | answered with `Pong` | — |
 | `Pong` | reply to `Ping` | control | — | — |
@@ -357,7 +358,7 @@ tables.
 | (daemon) | `Attach { Some(n) }` past the pane's current seqno | `SyncReset` + snapshot | `compute_replay_from_a_seqno_this_pane_never_reached_resets` |
 | (daemon) | a viewer's pane stream is full | `Lagged` on control; the viewer is dropped from the pane | `broadcast_sends_lagged_via_ctrl_when_data_full`, `broadcast_removes_client_after_full` |
 | (daemon) | the shared TCP/UDS queue is congested | pane frames dropped, then `SyncReset` + snapshot | `a_congested_pane_stream_stays_bounded_and_resyncs_once_the_client_reads` |
-| any | `Detach` | detached; nothing is answered, and the pane keeps its size | `detach_from_a_pane_this_client_never_attached_answers_nothing`, `detach_keeps_last_effective_size` |
+| any | `Detach` | detached; nothing is answered | `detach_from_a_pane_this_client_never_attached_answers_nothing` |
 
 ### Pause (a connection, [connection-pause.md](connection-pause.md))
 
