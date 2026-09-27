@@ -1,4 +1,6 @@
-//! The exported GPU renderer object (issue #132), behind the `gpu` feature.
+//! The exported GPU renderer object (issue #132). Compiled only with the `gpu`
+//! feature (the `mod` declaration in `lib.rs` is gated), so nothing in here
+//! repeats the `cfg`.
 
 use super::*;
 
@@ -8,13 +10,11 @@ use super::*;
 /// (all calls on the Swift main thread). It reads the active tab's grids +
 /// layout from a [`KmuxDriver`] and presents directly to the layer — no
 /// readback. Built only with the `gpu` feature; the default staticlib omits it.
-#[cfg(feature = "gpu")]
 #[derive(uniffi::Object)]
 pub struct KmuxRenderer {
     inner: Mutex<TerminalRenderer>,
 }
 
-#[cfg(feature = "gpu")]
 #[uniffi::export]
 impl KmuxRenderer {
     /// Build a renderer bound to a `CAMetalLayer` pointer, using the driver's
@@ -102,7 +102,6 @@ impl KmuxRenderer {
 /// Assemble the active tab's frame from the driver and render it. Mirrors the
 /// GTK `render_gpu::paint` frame assembly — both read the shared layout + grids
 /// and build an identical [`Frame`] with `CellSource::Grid`.
-#[cfg(feature = "gpu")]
 fn render_active_tab(
     renderer: &mut TerminalRenderer,
     d: &FrontendDriver,
@@ -191,7 +190,7 @@ fn render_active_tab(
     }
 }
 
-#[cfg(all(test, feature = "gpu"))]
+#[cfg(test)]
 mod gpu_tests {
     #[test]
     fn render_api_matches_expected() {

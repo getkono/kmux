@@ -89,6 +89,7 @@ mod input;
 mod layout;
 mod palette;
 mod picker;
+#[cfg(feature = "gpu")]
 mod renderer;
 mod session;
 mod status;
