@@ -671,6 +671,17 @@ mod tests {
         // whole grace period later.
         assert_eq!(started.elapsed(), every + STOPPED_GRACE);
 
+        // Nothing answering is no stop while the old daemon still runs
+        // (it is busy handing off), however long that lasts.
+        let busy = TakeoverProbe {
+            old_alive: true,
+            ..TakeoverProbe::default()
+        };
+        let mut slow = vec![busy; 150];
+        slow.push(serving(9, false));
+        let ended = wait_for_takeover(OLD, 3, script(slow), every).await;
+        assert_eq!(ended, Takeover::HandedOff(9, 7));
+
         let mut late = vec![gone.clone(); 20];
         late.push(serving(9, false));
         let ended = wait_for_takeover(OLD, 3, script(late), every).await;
