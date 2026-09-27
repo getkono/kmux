@@ -1434,7 +1434,7 @@ mod tests {
 
     // ── Directory browser ────────────────────────────────────────────────────
 
-    use crate::fixtures::fixture_session_entry;
+    use crate::fixtures::sample_session_entry;
     use crate::mode::Action;
     use kmux_protocol::messages::{ClientMessage, DirEntry, SessionMeta};
     use tokio::sync::mpsc::UnboundedReceiver;
@@ -1495,7 +1495,7 @@ mod tests {
         core.initial_cwd = "/fallback".into();
         core.mgr
             .session_list
-            .push(fixture_session_entry("eagle", "/home/user/proj"));
+            .push(sample_session_entry("eagle", "/home/user/proj"));
         core.mgr.select_session("eagle".into());
         while rx.try_recv().is_ok() {}
 
@@ -1638,7 +1638,7 @@ mod tests {
         core.initial_cwd = "/fallback".into();
         core.mgr
             .session_list
-            .push(fixture_session_entry("eagle", "/home/user/proj"));
+            .push(sample_session_entry("eagle", "/home/user/proj"));
         core.mgr.select_session("eagle".into());
         while rx.try_recv().is_ok() {}
 
@@ -1669,7 +1669,7 @@ mod tests {
         core.initial_cwd = "/fallback".into();
         core.mgr
             .session_list
-            .push(fixture_session_entry("eagle", "/home/user/proj"));
+            .push(sample_session_entry("eagle", "/home/user/proj"));
         core.peer_targets.insert(
             "alice@box".into(),
             PeerTarget::Ssh {

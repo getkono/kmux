@@ -22,7 +22,7 @@ pub(crate) fn fixture_core() -> AppCore {
 
 /// A local session `word` rooted at `cwd`: one tab holding one running pane
 /// `"{word}/0"`.
-pub(crate) fn fixture_session_entry(word: &str, cwd: &str) -> SessionEntry {
+pub(crate) fn sample_session_entry(word: &str, cwd: &str) -> SessionEntry {
     SessionEntry {
         meta: SessionMeta {
             index: 0,

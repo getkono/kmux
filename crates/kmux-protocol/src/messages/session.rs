@@ -738,6 +738,9 @@ mod tests {
     {
         let bytes = rmp_serde::to_vec_named(value).expect("serialize");
         let decoded: T = rmp_serde::from_slice(&bytes).expect("deserialize");
+        // Compared through `Debug` (not every type here is `PartialEq`): a
+        // field dropped both ways would still re-encode to the same bytes.
+        assert_eq!(format!("{decoded:?}"), format!("{value:?}"));
         let again = rmp_serde::to_vec_named(&decoded).expect("re-serialize");
         assert_eq!(again, bytes, "{value:?}");
     }

@@ -338,6 +338,22 @@ mod tests {
         }
     }
 
+    /// The public entry points wire parsing to `resolve_with`. An explicit
+    /// user and port win over this user's `hosts.toml` and `$USER`, so the
+    /// result does not depend on either.
+    #[test]
+    fn parse_remote_target_resolves_an_explicit_user_host_and_port() {
+        let target = parse_remote_target("someone@kmux-test.invalid:2222").expect("a target");
+        assert_eq!(
+            (
+                target.user.as_deref(),
+                target.host.as_str(),
+                target.ssh_port
+            ),
+            (Some("someone"), "kmux-test.invalid", Some(2222))
+        );
+    }
+
     /// The user comes from `user@`, then the `hosts.toml` entry, then `$USER`;
     /// a port in the server string is always the SSH port.
     #[test]

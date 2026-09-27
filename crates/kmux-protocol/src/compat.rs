@@ -176,7 +176,7 @@ mod tests {
     /// The full protocol x profile truth table: a protocol verdict (mismatch,
     /// then unknown) takes precedence over any profile verdict.
     #[test]
-    fn attach_block_truth_table() {
+    fn attach_block_lets_through_only_a_matching_protocol_and_profile() {
         let other_protocol = ProtocolRange::exact(ProtocolVersion::new(2, 0, 0));
         let protocols = [
             ("same", Some(PROTOCOL_RANGE)),

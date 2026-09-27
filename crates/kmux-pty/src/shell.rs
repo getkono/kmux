@@ -61,6 +61,14 @@ mod tests {
         assert!(result.is_err());
     }
 
+    /// `detect_shell` is `shell_from` over this process's `$SHELL`, read and
+    /// never set (R3).
+    #[test]
+    fn detect_shell_resolves_this_processs_shell_variable() {
+        let expected = shell_from(std::env::var("SHELL").ok()).ok();
+        assert_eq!(detect_shell().ok(), expected);
+    }
+
     #[test]
     fn shell_from_prefers_shell_env_and_falls_back_to_sh() {
         let cases = [

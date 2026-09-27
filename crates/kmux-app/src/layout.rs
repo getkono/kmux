@@ -590,7 +590,7 @@ mod tests {
     }
 
     /// `[0 | 1 | 2]` at 30/30/40%.
-    fn fixture_three_way() -> LayoutNode {
+    fn sample_three_way() -> LayoutNode {
         LayoutNode::Split {
             dir: SplitDir::Horizontal,
             ratios: vec![300, 300, 400],
@@ -599,7 +599,7 @@ mod tests {
     }
 
     /// Tall left pane 0; the right half split into 1 (top) over 2 (bottom).
-    fn fixture_l_shape() -> LayoutNode {
+    fn sample_l_shape() -> LayoutNode {
         LayoutNode::Split {
             dir: SplitDir::Horizontal,
             ratios: vec![500, 500],
@@ -658,7 +658,7 @@ mod tests {
 
     #[test]
     fn nested_split_resolves_recursively() {
-        let tree = fixture_l_shape();
+        let tree = sample_l_shape();
         let rects = resolve_layout(&tree, 80, 24, &cfg_no_gutter());
         assert_eq!(rects.len(), 3);
         // Leaf order is depth-first left-to-right.
@@ -689,7 +689,7 @@ mod tests {
     fn focus_neighbor_moves_vertically_within_a_column() {
         // Horizontal moves across uneven columns are pinned by
         // `focus_neighbor_breaks_distance_ties_by_perpendicular_overlap`.
-        let rects = resolve_layout(&fixture_l_shape(), 80, 24, &cfg_no_gutter());
+        let rects = resolve_layout(&sample_l_shape(), 80, 24, &cfg_no_gutter());
         // From the top-right pane, down goes to the bottom-right pane.
         assert_eq!(focus_neighbor(&rects, 1, FocusDir::Down), Some(2));
         assert_eq!(focus_neighbor(&rects, 2, FocusDir::Up), Some(1));
@@ -734,7 +734,7 @@ mod tests {
 
     #[test]
     fn resize_picks_nearest_ancestor_on_each_axis() {
-        let tree = fixture_l_shape();
+        let tree = sample_l_shape();
         // Horizontal resize of pane 1 acts on the root split (child 1 = the
         // right subtree), growing the whole right column.
         let (path, ratios) = resize_split(&tree, 1, FocusDir::Right, 50).unwrap();
@@ -793,7 +793,7 @@ mod tests {
 
     #[test]
     fn dividers_three_way_has_two() {
-        let tree = fixture_three_way();
+        let tree = sample_three_way();
         let divs = resolve_dividers(&tree, 100, 24, &cfg_no_gutter());
         assert_eq!(divs.len(), 2);
         assert_eq!(divs[0].before, 0);
@@ -803,7 +803,7 @@ mod tests {
 
     #[test]
     fn dividers_nested_both_axes() {
-        let tree = fixture_l_shape();
+        let tree = sample_l_shape();
         let divs = resolve_dividers(&tree, 80, 24, &cfg_no_gutter());
         assert_eq!(divs.len(), 2);
         // Root horizontal divider between the left pane and the right column.
@@ -822,7 +822,7 @@ mod tests {
         // Each flat-split divider sits in the gutter right after the matching
         // pane rect — proving `resolve_dividers` and `resolve_layout` share
         // `child_extents` and never drift.
-        let tree = fixture_three_way();
+        let tree = sample_three_way();
         let rects = resolve_layout(&tree, 100, 24, &LayoutConfig::default());
         let divs = resolve_dividers(&tree, 100, 24, &LayoutConfig::default());
         for d in &divs {
@@ -862,7 +862,7 @@ mod tests {
 
     #[test]
     fn drag_only_touches_the_pair_in_a_three_way() {
-        let tree = fixture_three_way();
+        let tree = sample_three_way();
         let divs = resolve_dividers(&tree, 100, 24, &cfg_no_gutter());
         // Drag the first divider (between panes 0 and 1); pane 2 is untouched.
         let ratios = ratios_for_drag(&tree, &divs[0], 15).unwrap();
@@ -926,7 +926,7 @@ mod tests {
     fn resize_split_handles_a_flat_three_way_split() {
         // The 2-pane tests never exercise n > 2. Growing the middle pane trades
         // only with its next sibling, leaving the first pane untouched.
-        let tree = fixture_three_way();
+        let tree = sample_three_way();
         let (path, ratios) = resize_split(&tree, 1, FocusDir::Right, 50).unwrap();
         assert_eq!(path, Vec::<u32>::new());
         assert_eq!(ratios, vec![300, 350, 350], "pane 1 grows into pane 2 only");

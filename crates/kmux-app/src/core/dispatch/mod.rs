@@ -747,7 +747,7 @@ pub(super) mod testing {
     pub(super) fn core_with_active_pane(status: kmux_protocol::messages::SessionStatus) -> AppCore {
         let mut core = fixture_core();
         core.mgr.connected = true;
-        let mut entry = crate::fixtures::fixture_session_entry("eagle", "/");
+        let mut entry = crate::fixtures::sample_session_entry("eagle", "/");
         entry.panes[0].status = status;
         core.mgr.session_list = vec![entry];
         core.mgr.active_pane = Some("eagle/0".into());

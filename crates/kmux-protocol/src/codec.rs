@@ -327,9 +327,13 @@ mod tests {
                 size,
             },
         ];
+        // `ClientMessage` has no `PartialEq`, so the decoded value is compared
+        // through `Debug`: re-encoding alone would pass a field that encode
+        // and decode both drop, since it decodes to its default every time.
         for msg in every_client_message().into_iter().chain(non_default) {
             let bytes = encode_client(&msg).expect("encode");
             let decoded = decode_client(&bytes).expect("decode");
+            assert_eq!(format!("{decoded:?}"), format!("{msg:?}"));
             assert_eq!(
                 encode_client(&decoded).expect("re-encode"),
                 bytes,
