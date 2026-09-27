@@ -57,6 +57,8 @@ pub enum InputLockOutcome {
 ///   diffs, unless they exceed the coalescing threshold (e.g. after a long
 ///   pause), in which case a single final-state snapshot (`SyncReset`) is sent.
 /// - `Some(seq)` older than the buffer → `SyncReset` with a fresh snapshot.
+/// - `Some(seq)` past the pane's current seqno → `SyncReset`: that seqno was
+///   issued by another daemon run, whose screen the client is showing.
 pub(super) fn compute_replay(
     relay: &super::PaneRelay,
     last_seqno: Option<SequenceNo>,
@@ -73,6 +75,10 @@ pub(super) fn compute_replay(
         None => {
             let snapshot = relay.engine.snapshot();
             AttachResult::FullSnapshot(snapshot, current_seqno())
+        }
+        Some(seq) if seq > current_seqno() => {
+            let snapshot = relay.engine.snapshot();
+            AttachResult::SyncReset(snapshot, current_seqno())
         }
         Some(seq) => {
             let buf = relay.scrollback.lock().unwrap();

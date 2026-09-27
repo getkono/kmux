@@ -1662,10 +1662,15 @@ mod tests {
 
     // ─── Resume reconciliation (issue #68) ────────────────────────────────────
 
+    /// Buffer diffs `range` as if the pane had produced them: the seqno
+    /// counter moves past the last one, as the relay's would.
     fn push_seqnos(relay: &PaneRelay, range: std::ops::RangeInclusive<u64>) {
         use kmux_protocol::messages::{
             CellState, CursorState, DiffOp, SequenceNo, TermModes, TerminalDiff,
         };
+        relay
+            .seqno_counter
+            .store(range.end() + 1, Ordering::Relaxed);
         let mut buf = relay.scrollback.lock().unwrap();
         for n in range {
             buf.push(
@@ -1712,6 +1717,29 @@ mod tests {
             }
             other => panic!("expected Delta, got a different variant: {other:?}"),
         }
+    }
+
+    /// A `last_seqno` past anything this pane produced was issued by another
+    /// daemon run (a client that predates the run check, or a stale one): a
+    /// delta from it would be empty and leave the client showing the old
+    /// run's screen, so it is answered with a fresh snapshot.
+    #[tokio::test]
+    async fn compute_replay_from_a_seqno_this_pane_never_reached_resets() {
+        use super::attach::compute_replay;
+        use kmux_protocol::messages::SequenceNo;
+        let relay = make_relay(24, 80);
+        push_seqnos(&relay, 1..=5);
+        match compute_replay(&relay, Some(SequenceNo(6))) {
+            AttachResult::SyncReset(_, seqno) => assert_eq!(seqno, SequenceNo(5)),
+            other => panic!("expected SyncReset, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                compute_replay(&relay, Some(SequenceNo(5))),
+                AttachResult::Delta(diffs) if diffs.is_empty()
+            ),
+            "the current seqno itself is in step: nothing to replay"
+        );
     }
 
     #[tokio::test]
