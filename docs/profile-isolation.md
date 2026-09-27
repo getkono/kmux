@@ -38,7 +38,7 @@ isolation from it automatically.
 | | `kmux[-debug]/daemon.pid` | PID lockfile |
 | | `kmux[-debug]/token` | Auth token |
 | | `kmux[-debug]/kmuxd-boot.log` | Daemon boot log (captured stdout/stderr) |
-| `$XDG_STATE_HOME` | `kmux[-debug]/daemon.log` | Daemon tracing log |
+| `$XDG_STATE_HOME` | `kmux[-debug]/daemon.log` | Daemon tracing log (+ rotated `.1` … `.N`, issue #207) |
 | | `kmux[-debug]/client.log` | Client tracing log |
 | | `kmux[-debug]/connections/<id>.log` | Per-connection metadata log |
 | | `kmux[-debug]/metrics.jsonl` | Rolling metrics JSONL (+ rotated `.1`) |

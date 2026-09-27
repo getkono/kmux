@@ -212,39 +212,66 @@ fn format_boot_log_hint_in(dirs: &Dirs) -> String {
     )
 }
 
-/// Return the current byte length of the daemon log, or 0 if it does not exist.
-///
-/// Call this before spawning so `format_daemon_log_tail` can show only the new
-/// entries written by this particular spawn attempt.
-fn daemon_log_size_in(dirs: &Dirs) -> u64 {
-    dirs.daemon_log_path()
-        .ok()
-        .and_then(|p| std::fs::metadata(&p).ok())
-        .map_or(0, |m| m.len())
+/// Where the daemon log stood before a spawn: its length, and which file it
+/// was, so a rotation during the spawn can be told apart (issue #207).
+#[derive(Debug)]
+struct DaemonLogMark {
+    offset: u64,
+    file: Option<std::fs::Metadata>,
 }
 
-/// Read daemon.log from `from_offset` to the end and format it as an error suffix.
+/// Mark the daemon log's current end, or its absence.
 ///
-/// Only shows content written after `from_offset` so old runtime log entries
-/// from a previous daemon instance do not appear in startup failure messages.
-fn format_daemon_log_tail_in(dirs: &Dirs, from_offset: u64) -> String {
-    let Ok(path) = dirs.daemon_log_path() else {
-        return String::new();
-    };
-    let Ok(mut file) = std::fs::File::open(&path) else {
-        return String::new();
-    };
-    let len = file.metadata().map_or(0, |m| m.len());
-    if len <= from_offset {
-        return String::new();
+/// Call this before spawning so `format_daemon_log_tail_in` can show only the
+/// new entries written by this particular spawn attempt.
+fn daemon_log_mark_in(dirs: &Dirs) -> DaemonLogMark {
+    let file = dirs
+        .daemon_log_path()
+        .ok()
+        .and_then(|p| std::fs::metadata(&p).ok());
+    DaemonLogMark {
+        offset: file.as_ref().map_or(0, std::fs::Metadata::len),
+        file,
     }
-    let read_from = if len - from_offset > BOOT_LOG_TAIL_MAX {
-        len - BOOT_LOG_TAIL_MAX
-    } else {
-        from_offset
+}
+
+/// Everything written to the daemon log since `mark`, at most
+/// `BOOT_LOG_TAIL_MAX` bytes of it (the newest).
+///
+/// When the log was rotated since the mark, the marked file now sits at
+/// `daemon.log.1`: its part after the mark comes first, then the whole of the
+/// new `daemon.log`. Otherwise only `daemon.log` after the mark is read.
+fn daemon_log_since(path: &Path, mark: &DaemonLogMark) -> Vec<u8> {
+    let mut bytes = Vec::new();
+    let current_from = match &mark.file {
+        Some(marked) if kmux_sys::log_tail::names_same_file(path, marked) => mark.offset,
+        Some(marked) => {
+            let rotated = kmux_sys::log_tail::rotated_log_path(path, 1);
+            if kmux_sys::log_tail::names_same_file(&rotated, marked) {
+                bytes = read_tail_from(&rotated, mark.offset);
+            }
+            0
+        }
+        None => 0,
     };
+    bytes.extend(read_tail_from(path, current_from));
+    let keep_from = bytes
+        .len()
+        .saturating_sub(usize::try_from(BOOT_LOG_TAIL_MAX).unwrap_or(usize::MAX));
+    bytes.split_off(keep_from)
+}
+
+/// The bytes of `path` from `from` to its end, at most the last
+/// `BOOT_LOG_TAIL_MAX`; empty when it cannot be read.
+fn read_tail_from(path: &Path, from: u64) -> Vec<u8> {
+    let Ok(mut file) = std::fs::File::open(path) else {
+        return Vec::new();
+    };
+    // A `from` at or past the end reads nothing.
+    let len = file.metadata().map_or(0, |m| m.len());
+    let read_from = from.max(len.saturating_sub(BOOT_LOG_TAIL_MAX));
     if file.seek(SeekFrom::Start(read_from)).is_err() {
-        return String::new();
+        return Vec::new();
     }
     let mut bytes = Vec::new();
     // Not `fs::read`: the seek above is the point — this reads only the tail of
@@ -255,8 +282,21 @@ fn format_daemon_log_tail_in(dirs: &Dirs, from_offset: u64) -> String {
         reason = "reads from a seek offset, which fs::read cannot express"
     )]
     if file.read_to_end(&mut bytes).is_err() {
-        return String::new();
+        return Vec::new();
     }
+    bytes
+}
+
+/// The daemon log written since `mark`, formatted as an error suffix.
+///
+/// Only shows content written after the mark so old runtime log entries from
+/// a previous daemon instance do not appear in startup failure messages — and
+/// follows a rotation the new daemon's first lines may have caused.
+fn format_daemon_log_tail_in(dirs: &Dirs, mark: &DaemonLogMark) -> String {
+    let Ok(path) = dirs.daemon_log_path() else {
+        return String::new();
+    };
+    let bytes = daemon_log_since(&path, mark);
     let tail = String::from_utf8_lossy(&bytes);
     let trimmed = tail.trim_end();
     if trimmed.is_empty() {
@@ -294,7 +334,7 @@ pub async fn ensure_daemon_in(dirs: &Dirs, kmuxd: Option<&Path>) -> anyhow::Resu
 
     // Snapshot daemon log position so we only surface entries written by
     // this spawn attempt, not leftover lines from a previous daemon run.
-    let daemon_log_offset = daemon_log_size_in(dirs);
+    let daemon_log_mark = daemon_log_mark_in(dirs);
 
     // Slow path — start a new daemon. `None` means another process is already
     // starting one; we just poll in that case.
@@ -348,7 +388,7 @@ pub async fn ensure_daemon_in(dirs: &Dirs, kmuxd: Option<&Path>) -> anyhow::Resu
     // any new daemon.log lines written by the grandchild after daemonizing.
     let boot_hint = format_boot_log_hint_in(dirs);
     let daemon_hint = if ever_spawned {
-        format_daemon_log_tail_in(dirs, daemon_log_offset)
+        format_daemon_log_tail_in(dirs, &daemon_log_mark)
     } else {
         String::new()
     };
@@ -728,19 +768,21 @@ mod tests {
     }
 
     #[test]
-    fn daemon_log_size_returns_zero_for_missing_file() {
+    fn daemon_log_mark_is_zero_and_fileless_for_a_missing_log() {
         let (_tmp, dirs) = fixture();
-        // No daemon.log — should not panic, should return 0.
-        assert_eq!(daemon_log_size_in(&dirs), 0);
+        // No daemon.log — should not panic, should mark offset 0 and no file.
+        let mark = daemon_log_mark_in(&dirs);
+        assert_eq!(mark.offset, 0);
+        assert!(mark.file.is_none());
     }
 
     #[test]
-    fn daemon_log_size_reports_the_current_length() {
+    fn daemon_log_mark_reports_the_current_length() {
         let (_tmp, dirs) = fixture();
         let log_path = dirs.daemon_log_path().expect("daemon log path");
         std::fs::write(&log_path, b"twelve bytes").expect("write daemon log");
         assert_eq!(
-            daemon_log_size_in(&dirs),
+            daemon_log_mark_in(&dirs).offset,
             12,
             "the snapshot offset must be the real byte length, or the tail would \
              replay old lines"
@@ -753,10 +795,10 @@ mod tests {
 
         let log_path = dirs.daemon_log_path().expect("daemon log path");
         std::fs::write(&log_path, b"old line\n").expect("write daemon log");
-        let offset = std::fs::metadata(&log_path).expect("stat daemon log").len();
+        let mark = daemon_log_mark_in(&dirs);
 
-        // Nothing written after the offset — should return empty.
-        assert_eq!(format_daemon_log_tail_in(&dirs, offset), String::new());
+        // Nothing written after the mark — should return empty.
+        assert_eq!(format_daemon_log_tail_in(&dirs, &mark), String::new());
     }
 
     #[test]
@@ -765,7 +807,7 @@ mod tests {
 
         let log_path = dirs.daemon_log_path().expect("daemon log path");
         std::fs::write(&log_path, b"old log line\n").expect("write daemon log");
-        let offset = std::fs::metadata(&log_path).expect("stat daemon log").len();
+        let mark = daemon_log_mark_in(&dirs);
 
         // Append a new line after the snapshot.
         use std::io::Write;
@@ -776,7 +818,7 @@ mod tests {
         writeln!(f, "Error: failed to bind port 8443: address already in use")
             .expect("write new line");
 
-        let tail = format_daemon_log_tail_in(&dirs, offset);
+        let tail = format_daemon_log_tail_in(&dirs, &mark);
         assert!(
             tail.contains("failed to bind port 8443"),
             "should include new daemon log line: {tail}"
@@ -788,6 +830,98 @@ mod tests {
         assert!(
             tail.contains("daemon log"),
             "should label the section: {tail}"
+        );
+    }
+
+    /// A log that did not exist at the mark is new from its first byte.
+    #[test]
+    fn format_daemon_log_tail_reads_a_log_created_since_the_mark_whole() {
+        let (_tmp, dirs) = fixture();
+        let mark = daemon_log_mark_in(&dirs);
+        let log_path = dirs.daemon_log_path().expect("daemon log path");
+        std::fs::write(&log_path, b"first line\n").expect("write daemon log");
+
+        let tail = format_daemon_log_tail_in(&dirs, &mark);
+        assert!(tail.ends_with("---\nfirst line"), "{tail}");
+    }
+
+    /// The new daemon's first line rotated the log: the old file's part after
+    /// the mark, now in `daemon.log.1`, comes before the new file's lines, and
+    /// nothing from before the mark is shown (issue #207).
+    #[test]
+    fn format_daemon_log_tail_follows_a_rotation_since_the_mark() {
+        use std::io::Write;
+
+        let (_tmp, dirs) = fixture();
+        let log_path = dirs.daemon_log_path().expect("daemon log path");
+        std::fs::write(&log_path, b"old log line\n").expect("write daemon log");
+        let mark = daemon_log_mark_in(&dirs);
+
+        let mut old = std::fs::OpenOptions::new()
+            .append(true)
+            .open(&log_path)
+            .expect("append to daemon log");
+        old.write_all(b"before rotation\n").expect("write");
+        let rotated = kmux_sys::log_tail::rotated_log_path(&log_path, 1);
+        std::fs::rename(&log_path, &rotated).expect("rotate");
+        std::fs::write(&log_path, b"Error: after rotation\n").expect("new log");
+
+        let tail = format_daemon_log_tail_in(&dirs, &mark);
+        assert!(
+            tail.ends_with("---\nbefore rotation\nError: after rotation"),
+            "both files' new lines, oldest first: {tail}"
+        );
+    }
+
+    /// A `daemon.log.1` that is not the marked file (the log was removed, not
+    /// rotated) is not quoted; only the new `daemon.log` is.
+    #[test]
+    fn format_daemon_log_tail_ignores_a_rotated_file_it_did_not_mark() {
+        let (_tmp, dirs) = fixture();
+        let log_path = dirs.daemon_log_path().expect("daemon log path");
+        std::fs::write(&log_path, b"marked\n").expect("write daemon log");
+        let mark = daemon_log_mark_in(&dirs);
+
+        // Held open so the removed file keeps its inode: Linux hands a freed
+        // inode straight to the next file created, which would make the stray
+        // file below *be* the marked one by (dev, inode).
+        let _removed = std::fs::File::open(&log_path).expect("open daemon log");
+        std::fs::remove_file(&log_path).expect("remove");
+        let rotated = kmux_sys::log_tail::rotated_log_path(&log_path, 1);
+        std::fs::write(&rotated, b"marked\nunrelated\n").expect("stray rotated file");
+        std::fs::write(&log_path, b"fresh\n").expect("new log");
+
+        let tail = format_daemon_log_tail_in(&dirs, &mark);
+        assert!(tail.ends_with("---\nfresh"), "{tail}");
+    }
+
+    /// At most `BOOT_LOG_TAIL_MAX` bytes are quoted, the newest ones, across
+    /// both files; each file is read from its mark or its last
+    /// `BOOT_LOG_TAIL_MAX` bytes, whichever is later.
+    #[test]
+    fn the_daemon_log_tail_is_capped_across_a_rotation() {
+        let (_tmp, dirs) = fixture();
+        let log_path = dirs.daemon_log_path().expect("daemon log path");
+        std::fs::write(&log_path, b"").expect("write daemon log");
+        let mark = daemon_log_mark_in(&dirs);
+
+        let max = usize::try_from(BOOT_LOG_TAIL_MAX).unwrap();
+        let rotated = kmux_sys::log_tail::rotated_log_path(&log_path, 1);
+        std::fs::write(&log_path, "a".repeat(max)).expect("fill");
+        std::fs::rename(&log_path, &rotated).expect("rotate");
+        std::fs::write(&log_path, "b".repeat(10)).expect("new log");
+
+        let bytes = daemon_log_since(&log_path, &mark);
+        assert_eq!(bytes.len(), max);
+        assert!(bytes.ends_with(b"abbbbbbbbbb"), "the newest bytes are kept");
+
+        std::fs::write(&rotated, "c".repeat(max + 5)).expect("overfill");
+        assert_eq!(read_tail_from(&rotated, 0).len(), max, "capped");
+        assert_eq!(read_tail_from(&rotated, 3).len(), max, "capped past a mark");
+        assert_eq!(read_tail_from(&rotated, 10).len(), max - 5, "from the mark");
+        assert!(
+            read_tail_from(&rotated, 1 << 20).is_empty(),
+            "mark past the end"
         );
     }
 

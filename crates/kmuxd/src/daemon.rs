@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
@@ -11,6 +10,7 @@ use tracing::{debug, error, info, warn};
 use crate::announce::{BootstrapPath, build_endpoint_list};
 use crate::app::ServerApp;
 use crate::config::ListenConfig;
+use crate::handoff::HandoffStatus;
 use kmux_protocol::control_rpc::{
     ControlRequest, EndpointEntry, RestartResponse, StatusResponse, StopResponse,
 };
@@ -70,8 +70,9 @@ struct RequestCtx {
     shutdown: Arc<Notify>,
     /// Signals `async_main` to begin a graceful live-PTY handoff.
     restart: Arc<Notify>,
-    /// Guards against concurrent restarts; set while a handoff is in flight.
-    handoff_in_progress: Arc<AtomicBool>,
+    /// Whether a handoff is in flight (a second `restart` is refused), and
+    /// why the latest stood down.
+    handoff: Arc<HandoffStatus>,
     listeners: Vec<ListenConfig>,
     public_host: Option<String>,
 }
@@ -90,8 +91,9 @@ pub struct ControlSocketParams {
     pub shutdown: Arc<Notify>,
     /// Signals `async_main` to begin a graceful live-PTY handoff.
     pub restart: Arc<Notify>,
-    /// Guards against concurrent restarts; set while a handoff is in flight.
-    pub handoff_in_progress: Arc<AtomicBool>,
+    /// Whether a handoff is in flight (a second `restart` is refused), and
+    /// why the latest stood down.
+    pub handoff: Arc<HandoffStatus>,
     /// Resolved listener configs (with actual bound ports filled in).
     pub listeners: Vec<ListenConfig>,
     pub public_host: Option<String>,
@@ -123,7 +125,7 @@ pub async fn serve_control_socket(params: ControlSocketParams, stop: impl Future
         app,
         shutdown,
         restart,
-        handoff_in_progress,
+        handoff,
         listeners,
         public_host,
         handoff_successor,
@@ -137,7 +139,7 @@ pub async fn serve_control_socket(params: ControlSocketParams, stop: impl Future
         app,
         shutdown: Arc::clone(&shutdown),
         restart,
-        handoff_in_progress,
+        handoff,
         listeners,
         public_host,
     };
@@ -336,10 +338,12 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
         }
         "restart" => {
             // Refuse a second concurrent handoff.
-            let busy = ctx.handoff_in_progress.swap(true, Ordering::SeqCst);
+            let attempt = ctx.handoff.begin();
+            let busy = attempt.is_none();
             let response = RestartResponse {
                 status: if busy { "busy" } else { "ok" }.to_string(),
                 handoff: true,
+                attempt: attempt.unwrap_or_default(),
             };
             let mut json = match serde_json::to_string(&response) {
                 Ok(s) => s,
@@ -356,9 +360,22 @@ async fn handle_control_connection(stream: tokio::net::UnixStream, ctx: RequestC
                 warn!("restart command ignored: a handoff is already in progress");
             } else {
                 info!("Received restart command, beginning graceful handoff");
-                // Wake the main task; it consumes the in-progress flag and clears
-                // it if the handoff rolls back.
+                // Wake the main task; it runs the handoff and reports a
+                // rollback through `ctx.handoff`.
                 ctx.restart.notify_one();
+            }
+        }
+        "handoff" => {
+            let mut json = match serde_json::to_string(&ctx.handoff.report()) {
+                Ok(s) => s,
+                Err(e) => {
+                    warn!("Failed to serialize handoff report: {e}");
+                    return;
+                }
+            };
+            json.push('\n');
+            if let Err(e) = write_half.write_all(json.as_bytes()).await {
+                warn!("Control socket write error: {e}");
             }
         }
         "sessions" => {
@@ -500,10 +517,10 @@ impl Drop for SocketGuard {
 /// budget is ~200ms, which a daemon start or exit can afford and which no
 /// observed spurious `EAGAIN` has outlasted.
 ///
-/// Blocking, deliberately: both callers are lifecycle moments — binding at
-/// startup and cleaning up on exit — and one of them is a `Drop`, which cannot
-/// await. Connecting to a Unix socket does not wait on the network.
-fn socket_is_live(path: &Path) -> bool {
+/// Blocking, deliberately: every caller is a lifecycle moment — binding at
+/// startup, cleaning up on exit, a handoff successor that could not reach its
+/// predecessor — and one of them is a `Drop`, which cannot await. Connecting to a Unix socket does not wait on the network.
+pub(crate) fn socket_is_live(path: &Path) -> bool {
     probe_is_live(
         || std::os::unix::net::UnixStream::connect(path).map(drop),
         std::thread::sleep,
@@ -590,7 +607,7 @@ mod tests {
             app: Arc::new(ServerApp::new("test-token".to_string())),
             shutdown: Arc::new(Notify::new()),
             restart: Arc::new(Notify::new()),
-            handoff_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            handoff: Arc::default(),
             listeners: vec![],
             public_host: None,
         }
@@ -635,6 +652,79 @@ mod tests {
         assert!(reply.is_empty(), "no answer to a malformed request");
     }
 
+    /// Send one control `command` to the socket at `path` and read the reply.
+    async fn ask(path: &Path, command: &str) -> String {
+        let stream = UnixStream::connect(path).await.unwrap();
+        let (read_half, mut write_half) = stream.into_split();
+        let request = format!("{{\"command\":\"{command}\"}}\n");
+        write_half.write_all(request.as_bytes()).await.unwrap();
+        let mut line = String::new();
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            BufReader::new(read_half).read_line(&mut line),
+        )
+        .await
+        .expect("timed out")
+        .unwrap();
+        line
+    }
+
+    /// `restart` begins a numbered handoff and wakes the daemon, a second is
+    /// `busy`, and `handoff` reports it — then why it stood down (issue #207).
+    #[tokio::test]
+    async fn restart_numbers_the_handoff_and_handoff_reports_it() {
+        use kmux_protocol::control_rpc::{HandoffReport, RestartResponse};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let socket_path = tmp.path().join("ctrl.sock");
+        let restart = Arc::new(Notify::new());
+        let handoff = Arc::new(crate::handoff::HandoffStatus::default());
+        let params = ControlSocketParams {
+            socket_path: socket_path.clone(),
+            pid_path: tmp.path().join("daemon.pid"),
+            quic_port: 0,
+            tcp_port: 0,
+            token: "test-token".to_string(),
+            start_time: Instant::now(),
+            app: Arc::new(ServerApp::new("test-token".to_string())),
+            shutdown: Arc::new(Notify::new()),
+            restart: Arc::clone(&restart),
+            handoff: Arc::clone(&handoff),
+            listeners: vec![],
+            public_host: None,
+            handoff_successor: false,
+        };
+        let served = tokio::spawn(serve_control_socket(params, std::future::pending()));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while UnixStream::connect(&socket_path).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the control socket binds");
+
+        let woken = restart.notified();
+        let first: RestartResponse =
+            serde_json::from_str(ask(&socket_path, "restart").await.trim()).unwrap();
+        assert_eq!((first.status.as_str(), first.attempt), ("ok", 1));
+        tokio::time::timeout(Duration::from_secs(2), woken)
+            .await
+            .expect("the daemon is told to hand off");
+        let second: RestartResponse =
+            serde_json::from_str(ask(&socket_path, "restart").await.trim()).unwrap();
+        assert_eq!(second.status, "busy");
+
+        let running: HandoffReport =
+            serde_json::from_str(ask(&socket_path, "handoff").await.trim()).unwrap();
+        assert!(running.in_progress);
+        assert_eq!(running.attempt, 1);
+        handoff.rolled_back("no Ack".into());
+        let ended: HandoffReport =
+            serde_json::from_str(ask(&socket_path, "handoff").await.trim()).unwrap();
+        assert_eq!(ended.stood_down.as_deref(), Some("no Ack"));
+        served.abort();
+    }
+
     #[tokio::test]
     async fn sessions_command_roundtrips_empty_response() {
         let tmp = tempfile::tempdir().unwrap();
@@ -654,7 +744,7 @@ mod tests {
             app,
             shutdown: Arc::clone(&shutdown),
             restart: Arc::new(Notify::new()),
-            handoff_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            handoff: Arc::default(),
             listeners: vec![],
             public_host: None,
             handoff_successor: false,
@@ -974,7 +1064,7 @@ mod tests {
             app: Arc::new(ServerApp::new("test-token".to_string())),
             shutdown: Arc::new(Notify::new()),
             restart: Arc::new(Notify::new()),
-            handoff_in_progress: Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            handoff: Arc::default(),
             listeners: vec![],
             public_host: None,
             handoff_successor: false,

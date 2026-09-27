@@ -272,8 +272,9 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   handshake (the remote checks the range *before* the token), surfaced as `PeerError`. E2E
   `federation_surfaces_upstream_auth_rejection_as_peer_error` covers that branch via a
   wrong-token rejection (the same `AuthResult{success:false}` a version mismatch yields).
-- **PR6 — idle peer drop: intentionally not added.** The daemon's existing
-  idle-shutdown (`startup.rs`, debounced on client count → 0) already drops the whole
+- **PR6 — idle peer drop: intentionally not added.** The daemon's opt-in
+  idle-shutdown (`startup.rs`, debounced on client count → 0; off by default since
+  issue #207) drops the whole
   daemon — peers and their links included — when no GUI is connected, which is the only
   case where dropping an upstream is unambiguously safe. Dropping a peer while a GUI is
   still connected would remove its sessions from the picker mid-use, so a separate

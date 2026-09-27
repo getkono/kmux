@@ -274,7 +274,7 @@ count = 2
 [[lints]]
 crate = "kmux-connect"
 lint = "clippy::missing_errors_doc"
-count = 19
+count = 17
 
 [[lints]]
 crate = "kmux-connect"
@@ -759,7 +759,7 @@ count = 17
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::cognitive_complexity"
-count = 12
+count = 10
 
 [[lints]]
 crate = "kmuxd"
@@ -789,7 +789,7 @@ count = 2
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::significant_drop_tightening"
-count = 53
+count = 51
 
 [[lints]]
 crate = "kmuxd"
@@ -814,7 +814,7 @@ count = 1
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::unwrap_used"
-count = 116
+count = 114
 
 [[lints]]
 crate = "kmuxd"

@@ -381,6 +381,7 @@ impl ServerApp {
         );
         seed_pane_with_preamble(&term_state, &scrollback, &seqno_counter, &preamble);
 
+        let (hold, hold_point) = crate::engine::hold::channel();
         let task = tokio::spawn(session_diff_loop(
             reader,
             pane_id.to_string(),
@@ -390,6 +391,7 @@ impl ServerApp {
             term_state.clone(),
             seqno_counter.clone(),
             self.manager.clone(),
+            hold_point,
         ));
 
         PaneRelay {
@@ -399,6 +401,7 @@ impl ServerApp {
                 term_state,
                 writer,
                 task,
+                hold,
                 resp_rx,
             )),
             program: persisted_pane.program.clone(),

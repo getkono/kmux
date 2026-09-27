@@ -16,11 +16,12 @@
 //! seqno counter, scrollback `DiffBuffer`, and client fan-out stay on
 //! `PaneRelay` and are shared by both variants.
 
+pub mod hold;
 mod in_process;
 mod worker;
 
 pub use in_process::InProcessEngine;
-pub use worker::{WorkerEngine, WorkerFanout};
+pub use worker::{FaultCause, WorkerEngine, WorkerFanout, WorkerFault};
 
 use kmux_protocol::messages::{GridSnapshot, KeyEvent, ScrollbackLine, TermSize};
 use kmux_pty::error::{KmuxError, Result};
@@ -166,6 +167,25 @@ impl PaneEngine {
         match self {
             Self::InProcess(_) => None,
             Self::Worker(e) => Some(e.child_pid()),
+        }
+    }
+
+    /// Park the pane's PTY reader between two reads (see [`hold`]): the
+    /// relay loop's, or — for a worker pane — the worker's, which answers once
+    /// every event for what it read is in the daemon's mirror (issue #207).
+    /// The future resolves once the reader is parked, or gone.
+    pub fn hold_reader(&self) -> std::pin::Pin<Box<dyn Future<Output = ()> + Send + 'static>> {
+        match self {
+            Self::InProcess(e) => Box::pin(e.hold_reader()),
+            Self::Worker(e) => Box::pin(e.hold_reader()),
+        }
+    }
+
+    /// Let a reader parked by [`Self::hold_reader`] go on.
+    pub fn release_reader(&self) {
+        match self {
+            Self::InProcess(e) => e.release_reader(),
+            Self::Worker(e) => e.release_reader(),
         }
     }
 

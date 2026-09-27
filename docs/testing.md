@@ -259,7 +259,7 @@ Counts are `#[test]` + `#[tokio::test]` functions, measured 2026-08-16.
 | `kmux-ghostty` | 26 | — | safe façade, `Send`/`Sync` static assertions, event decode | `NullSink` | libghostty internals |
 | `kmux-ffi` | 17 | — | a few leaf conversions | — | `extern "C"` dispatch, uniffi object lifetimes |
 | `kmux-gtk` | 14 | — | keyval→protocol conversion, accel→action table | — | **all widget construction and the glib main loop** |
-| `kmux-vt-worker` | 0 | 1 | subprocess smoke | — | fd adoption over `SCM_RIGHTS` |
+| `kmux-vt-worker` | 0 | 1 | subprocess smoke: PTY output becomes diffs, a heartbeat `Ping` is answered, and a `Hold` parks the PTY reader until `Release` (issue #207) | — | fd adoption over `SCM_RIGHTS` |
 | `kmux-ghostty-sys` | 6 | — | ABI version constant | — | Zig internals, all raw bindings |
 | `kmux-worker-protocol` | 6 | — | postcard roundtrip, version constant | — | — |
 | `kmux` | 6 | 6 | CLI parse, completion, diagnostic, binary location | real-binary invocation | `exec` of the platform frontend |
@@ -347,6 +347,8 @@ rules keep hung mutants cheap:
   a control-socket test installed the daemon's handlers, and build times grew
   sixfold as orphans piled up. The handlers are installed only by
   `daemon::termination_signal`, which the daemon passes in and tests replace.
+  A handoff is stopped for a shutdown by a `handoff::Cancel` signal the daemon
+  fires on SIGTERM, so its tests fire one by hand instead of sending a signal.
 
 A group with nothing to test under `--in-diff` or `--shard` says so and passes;
 a group that exits non-zero having written no outcomes did not run, and fails
@@ -403,6 +405,12 @@ Adding a row is a normative change: justify it in the commit that adds it.
 | `kmuxd` fork/exec, `SCM_RIGHTS`, daemonize | Cannot run in-process | `handoff_e2e.rs`, `process_isolation_e2e.rs` |
 | `kmuxd`'s `fn main` | A process entrypoint (CLI parse, daemonize, runtime build and teardown) no unit test can call, so its body-replacement mutant is always missed under `--bins`; excluded by `exclude_re` in `.cargo/mutants-bin.toml` so a comment edit in it does not fail the zero-survivor diff job (issue #205) | the five `kmuxd/tests/*_e2e.rs` suites, which spawn the binary |
 | `kmux-app`'s `fetch_remote_logs` (`kmux daemon logs --server`) | Resolves, connects to and authenticates with a remote daemon before streaming; with no daemon to reach, its body-replacement mutant is always missed, so `exclude_re` in `.cargo/mutants.toml` excludes it (issue #206) | `stream_logs`, the stream loop it hands off to, is unit-tested over `tokio::io::duplex` |
+| `kmux-app`'s `tail_local_log` (`kmux daemon logs` / `kmux client logs` on this machine) | Hands stdout to `tail_local_log_to`; its `Ok(())` mutant is observable only on the process's stdout, so `exclude_re` in `.cargo/mutants.toml` excludes it (issue #207) | `tail_local_log_to`, driven with a buffer; the rotation-following read (`kmux_sys::log_tail::read_appended`) is unit-tested in `kmux-sys` |
+| `kmux-app`'s `run_daemon_command` and `probe_takeover` (`kmux daemon …`) | The dispatcher's arms talk to this profile's real daemon and print to stdout, and `probe_takeover` is the one look at the real daemon a restart polls; their mutants are excluded by `exclude_re` in `.cargo/mutants.toml` (issue #207) | the restart's logic — `wait_for_takeover` (paused clock, scripted probes), `report_takeover`, `stood_down` — is unit-tested; `handoff_e2e.rs` runs a real restart |
+| `kmux-connect`'s `query_handoff` | Resolves this profile's control socket, then calls `query_handoff_at`; its `Ok(Default::default())` mutant is excluded by `exclude_re` in `.cargo/mutants.toml` (issue #207) | `query_handoff_at`, against a stand-in control socket |
+| `kmuxd`'s `handoff::sender::run` and `hand_off` | Bind the real handoff socket and spawn a successor daemon, so no unit test can call them; their body-replacement mutants are excluded by `exclude_re` in `.cargo/mutants-bin.toml` (issue #207) | `handoff_e2e.rs`, which runs a real handoff end to end and a successor that stands down; the pieces they call are unit-tested where they live: the protocol drive (`drive`, over a socket pair against a scripted successor, including a shutdown signal before the `Ack` is read), `await_successor` and `Successor::stop` (against real `sh`/`sleep` children, never the test process itself), `resolve_successor_exe` in `handoff/sender.rs`, the frame codec, `Cancel` and `peer_pid` in `handoff/mod.rs`, the pane-creation gate in `app/migrate.rs`, and the final checkpoint write (`Checkpointer::write_final_from`) in `persist/checkpoint.rs` |
+| `kmuxd`'s `handoff::receiver::run` | Resolves the real handoff and control socket paths; with no predecessor to reach it waits out `PREDECESSOR_CONNECT` | `handoff_e2e.rs` (a successor with no handoff socket stands down, exit code 75, while a daemon serves); `pull`, `unreachable_predecessor` and `connect_with_retry` are unit-tested on the paused clock, with every `Abort` branch driven against a predecessor already gone |
+| `kmuxd`'s `RotatingFile::flush` | An equivalent mutant: it forwards to `File::flush`, which does nothing for an unbuffered `File`, so `Ok(())` is the same function; excluded by `exclude_re` in `.cargo/mutants-bin.toml` (issue #207) | — |
 | `kmux-connect` real sshd handshake | Needs a live sshd in CI | `PeerTarget::Direct`, added precisely so federation is e2e-testable without sshd — see [architecture-federation.md](architecture-federation.md) |
 | `kmux-pty` `forkpty` and real child spawn | Process and tty syscalls. The pre-`execve` child code (`child.rs`) runs in a forked process, so it is observed only through what the program then sees | `kmux-pty`'s own tests spawn real children, observe them from inside (`ls /dev/fd`, `pwd`, `yes \| head`) and wait on them with `wait_until_dead`; the `kmuxd` e2e suites spawn real shells |
 | `kmux-render` GPU adapter | No adapter on a headless runner | the pure tier always runs; GPU smoke skips cleanly (R11) |

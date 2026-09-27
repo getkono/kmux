@@ -1,16 +1,72 @@
 //! Server-side support for graceful daemon handoff (issue #35): building the
-//! pane manifest advertised to a successor daemon and quiescing the relay loops
-//! before each live PTY master fd is migrated.
+//! pane manifest advertised to a successor daemon, holding the relay loops for
+//! the final checkpoint (and releasing them on a rollback), and quiescing them
+//! once the handoff has committed.
 //!
 //! The transport and orchestration live in [`crate::handoff`]; see
 //! `docs/daemon-handoff.md` for the full sequence.
 
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
+
 use kmux_protocol::control_rpc::HandoffPaneMeta;
 use kmux_protocol::format_pane_id;
+use kmux_pty::error::{KmuxError, Result};
+use tokio::sync::{OwnedRwLockReadGuard, OwnedRwLockWriteGuard};
 
 use super::ServerApp;
 
+/// Pane creation closed for a graceful handoff; admitted again when dropped
+/// (a rollback), unless kept by [`ServerApp::keep_pane_creation_closed`].
+pub struct PaneCreationClosed(
+    #[expect(dead_code, reason = "held for its drop")] OwnedRwLockWriteGuard<()>,
+);
+
+/// Admission for one pane creation: while held, no handoff can advertise the
+/// panes without the new one.
+pub struct PaneCreationAdmitted(
+    #[expect(dead_code, reason = "held for its drop")] OwnedRwLockReadGuard<()>,
+);
+
 impl ServerApp {
+    /// Admit one pane creation, to be held from before its PTY spawns until
+    /// the pane is in `sessions` (issue #207). Refused with
+    /// [`KmuxError::HandoffInProgress`] while a handoff runs, and never
+    /// waited on: a pane created now would be neither handed over nor frozen
+    /// for the final checkpoint.
+    pub(super) fn admit_pane_creation(&self) -> Result<PaneCreationAdmitted> {
+        if self.pane_creation_ended.load(Ordering::SeqCst) {
+            return Err(KmuxError::HandoffInProgress);
+        }
+        Arc::clone(&self.pane_gate)
+            .try_read_owned()
+            .map(PaneCreationAdmitted)
+            .map_err(|_| KmuxError::HandoffInProgress)
+    }
+
+    /// Wait until no handoff runs, for work that must not happen during one
+    /// — respawning a worker, whose new reader a handoff could not have
+    /// frozen. `None` once a handoff has committed: this daemon is exiting.
+    pub(super) async fn wait_for_pane_admission(&self) -> Option<PaneCreationAdmitted> {
+        let admitted = PaneCreationAdmitted(Arc::clone(&self.pane_gate).read_owned().await);
+        (!self.pane_creation_ended.load(Ordering::SeqCst)).then_some(admitted)
+    }
+
+    /// Close pane creation for a handoff, once the creations already under
+    /// way have finished (their panes are then advertised).
+    pub async fn close_pane_creation(&self) -> PaneCreationClosed {
+        PaneCreationClosed(Arc::clone(&self.pane_gate).write_owned().await)
+    }
+
+    /// Keep pane creation closed for good: the handoff committed and this
+    /// daemon is exiting.
+    pub fn keep_pane_creation_closed(&self, closed: PaneCreationClosed) {
+        // Before the gate opens, so no creation slips in between.
+        self.pane_creation_ended.store(true, Ordering::SeqCst);
+        drop(closed);
+    }
+
     /// Build the per-pane manifest advertised to a successor daemon.
     ///
     /// Each entry records the child PID and whether it is still live, so the
@@ -45,6 +101,46 @@ impl ServerApp {
         out
     }
 
+    /// Park every pane's PTY reader between two reads, for a handoff's final
+    /// checkpoint (issue #207): once this returns `true`, the checkpoint holds
+    /// exactly the output this daemon consumed. An in-process pane's relay
+    /// loop parks; a worker pane's worker parks and says so after every event
+    /// for what it read, so the mirror the checkpoint reads is complete. Unlike
+    /// [`Self::quiesce_relays`] it can be undone, by
+    /// [`Self::release_relays`], so a handoff that fails afterwards rolls back
+    /// to panes that read again.
+    ///
+    /// Returns `false`, with every reader released again, when one has not
+    /// parked within `timeout` — a worker blocked writing input to a child
+    /// that does not read its stdin reads no request until that write is done,
+    /// the hold included, and so fails the handoff rather than delays it.
+    pub async fn hold_relays(&self, timeout: Duration) -> bool {
+        let holds: Vec<_> = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .values()
+                .flat_map(|state| state.panes.values())
+                .map(|relay| relay.engine.hold_reader())
+                .collect()
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        for hold in holds {
+            if tokio::time::timeout_at(deadline, hold).await.is_err() {
+                self.release_relays().await;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Let every reader parked by [`Self::hold_relays`] go on.
+    pub async fn release_relays(&self) {
+        let sessions = self.sessions.read().await;
+        for relay in sessions.values().flat_map(|state| state.panes.values()) {
+            relay.engine.release_reader();
+        }
+    }
+
     /// Abort every pane's relay read task and wait for them to stop.
     ///
     /// After this returns, the outgoing daemon reads no PTY masters, so the
@@ -72,10 +168,109 @@ impl ServerApp {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::time::Duration;
 
     use kmux_protocol::messages::{ClientCapabilities, TermSize};
 
     use super::ServerApp;
+
+    /// Whether the pane's emulator shows `text` anywhere on its grid.
+    async fn grid_shows(app: &ServerApp, pane_id: &str, text: &str) -> bool {
+        let snapshot = {
+            let sessions = app.sessions.read().await;
+            super::super::helpers::get_pane_relay(&sessions, pane_id)
+                .expect("the pane")
+                .engine
+                .snapshot()
+        };
+        let chars: String = snapshot.cells.iter().map(|c| c.c).collect();
+        chars.contains(text)
+    }
+
+    /// While a handoff has pane creation closed, a new session is refused
+    /// with a typed error rather than created unseen; a rollback admits
+    /// creations again, and a commit never does (issue #207).
+    #[tokio::test]
+    async fn pane_creation_is_refused_while_a_handoff_runs() {
+        use kmux_pty::error::KmuxError;
+
+        let app = crate::fixtures::fixture_app();
+        let size = TermSize {
+            rows: 4,
+            cols: 20,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let caps = ClientCapabilities::default();
+        let create =
+            || app.create_session(None, None, Some("/bin/cat".into()), vec![], size, &caps);
+
+        let closed = app.close_pane_creation().await;
+        let refused = create().await;
+        assert!(
+            matches!(refused, Err(KmuxError::HandoffInProgress)),
+            "{refused:?}"
+        );
+        assert!(app.list_sessions().await.is_empty(), "nothing created");
+
+        drop(closed);
+        create().await.expect("admitted after a rollback");
+
+        app.keep_pane_creation_closed(app.close_pane_creation().await);
+        assert!(matches!(
+            app.admit_pane_creation(),
+            Err(KmuxError::HandoffInProgress)
+        ));
+    }
+
+    /// While the readers are held, a pane's output waits in the PTY instead
+    /// of reaching its emulator; once released, it is read and shown. A real
+    /// PTY, because what is held is the read of it (R7).
+    #[tokio::test]
+    async fn held_relays_read_nothing_until_released() {
+        let app = crate::fixtures::fixture_app();
+        let size = TermSize {
+            rows: 4,
+            cols: 40,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let entry = app
+            .create_session(
+                None,
+                None,
+                Some("/bin/cat".into()),
+                vec![],
+                size,
+                &ClientCapabilities::default(),
+            )
+            .await
+            .expect("a session");
+        let pane_id = kmux_protocol::format_pane_id(&entry.meta.word_id, 0);
+
+        assert!(app.hold_relays(Duration::from_secs(10)).await, "parked");
+        app.write_input(
+            &pane_id,
+            kmux_protocol::messages::ClientId(1),
+            b"held\n".to_vec(),
+        )
+        .await
+        .expect("queued");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !grid_shows(&app, &pane_id, "held").await,
+            "nothing read while held"
+        );
+
+        app.release_relays().await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !grid_shows(&app, &pane_id, "held").await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("read once released");
+    }
 
     /// End-to-end (in-process) live migration: a session's PTY child is handed
     /// off to a successor `ServerApp` by transferring its master fd, and the

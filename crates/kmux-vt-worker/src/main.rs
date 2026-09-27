@@ -26,7 +26,7 @@ use std::time::Duration;
 use anyhow::Context;
 use nix::unistd::Pid;
 use tokio::net::unix::OwnedReadHalf;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::time::MissedTickBehavior;
 use tracing::{debug, warn};
 
@@ -180,6 +180,8 @@ async fn run() -> anyhow::Result<()> {
 
     // --- Steady state: split the socket for concurrent I/O. ---
     let (mut sock_rd, mut sock_wr) = stream.into_split();
+    // A handoff's hold on the PTY reader: `Some(id)` while one is asked for.
+    let (hold_tx, hold_rx) = watch::channel(None);
 
     let writer_task = tokio::spawn(async move {
         while let Some(ev) = events_rx.recv().await {
@@ -196,7 +198,7 @@ async fn run() -> anyhow::Result<()> {
         let session = session.clone();
         let pane_id = pane_id.clone();
         tokio::spawn(async move {
-            pty_read_loop(reader, term_state, events_tx, session, &pane_id).await;
+            pty_read_loop(reader, term_state, events_tx, hold_rx, session, &pane_id).await;
         })
     };
 
@@ -211,15 +213,15 @@ async fn run() -> anyhow::Result<()> {
 
     // Daemon → worker request loop runs on the main task until Shutdown or the
     // daemon closes the socket.
-    request_loop(
-        &mut sock_rd,
-        &term_state,
-        &writer,
-        &kitty_graphics,
-        &kitty_keyboard,
-        &events_tx,
-    )
-    .await;
+    let shared = Shared {
+        term_state: &term_state,
+        writer: &writer,
+        kitty_graphics: &kitty_graphics,
+        kitty_keyboard: &kitty_keyboard,
+        events_tx: &events_tx,
+        hold: &hold_tx,
+    };
+    request_loop(&mut sock_rd, &shared).await;
 
     debug!(pane_id, "worker shutting down");
     pty_task.abort();
@@ -231,10 +233,16 @@ async fn run() -> anyhow::Result<()> {
 /// Read PTY output, feed the emulator, and emit computed diffs — the worker's
 /// half of `kmuxd`'s `session_diff_loop`. Also polls the foreground process name
 /// so pane titles track command switches even without OSC 0/2.
+///
+/// A hold (`Some(id)` on `hold`, from [`WorkerRequest::Hold`]) parks the loop
+/// between two reads: it answers [`WorkerEvent::Held`] — after every event for
+/// what it read, which went out on the same channel first — and reads nothing
+/// until the hold is released (issue #207).
 async fn pty_read_loop(
     mut reader: PtyReader,
     term_state: Arc<Mutex<TermState>>,
     events_tx: mpsc::UnboundedSender<WorkerEvent>,
+    mut hold: watch::Receiver<Option<u64>>,
     session: PtySession,
     pane_id: &str,
 ) {
@@ -248,30 +256,19 @@ async fn pty_read_loop(
 
     loop {
         tokio::select! {
+            biased;
+            id = hold_requested(hold.clone()) => park(&mut hold, id, &events_tx).await,
             result = reader.read(&mut buf) => {
-                match result {
+                let n = match result {
                     Ok(0) => break,
-                    Ok(n) => {
-                        {
-                            // Hold the lock only for feed+coalesce; never across
-                            // an await. Matches the in-process relay exactly.
-                            let mut ts = term_state.lock().unwrap();
-                            ts.feed(&buf[..n]);
-                            loop {
-                                match reader.try_read(&mut buf) {
-                                    Ok(0) => break,
-                                    Ok(m) => ts.feed(&buf[..m]),
-                                    Err(_) => break, // WouldBlock or error
-                                }
-                            }
-                        }
-                        emit_diff(&term_state, &events_tx);
-                    }
+                    Ok(n) => n,
                     Err(e) => {
                         warn!(pane_id, "worker PTY read error: {e}");
                         break;
                     }
-                }
+                };
+                feed_available(&mut reader, &mut buf, n, &term_state);
+                emit_diff(&term_state, &events_tx);
             }
             _ = poll.tick() => {
                 if let Some(name) = foreground_process_name(master_fd)
@@ -284,17 +281,61 @@ async fn pty_read_loop(
         }
     }
 
-    // PTY master returned EOF: the child exited. Report it so the daemon can
-    // surface the runtime exit to clients (the sole exit signal for a foreign
-    // child that cannot be `waitpid`-ed).
-    let status = match tokio::time::timeout(Duration::from_secs(2), session.wait()).await {
-        Ok(s) => s,
-        Err(_) => ExitStatus::Unknown,
-    };
+    report_child_exit(&session, &events_tx, pane_id).await;
+}
+
+/// The PTY master returned EOF: the child exited. Report it so the daemon can
+/// surface the runtime exit to clients (the sole exit signal for a foreign
+/// child that cannot be `waitpid`-ed).
+async fn report_child_exit(
+    session: &PtySession,
+    events_tx: &mpsc::UnboundedSender<WorkerEvent>,
+    pane_id: &str,
+) {
+    let status = tokio::time::timeout(Duration::from_secs(2), session.wait())
+        .await
+        .unwrap_or(ExitStatus::Unknown);
     debug!(pane_id, ?status, "worker pane child exited");
     let _ = events_tx.send(WorkerEvent::ChildExit {
         status: to_wire_status(status),
     });
+}
+
+/// Feed the `n` bytes just read into `buf`, and whatever else the PTY has
+/// ready, to the emulator under one lock hold — never across an await.
+/// Matches the in-process relay exactly.
+fn feed_available(reader: &mut PtyReader, buf: &mut [u8], n: usize, term_state: &Mutex<TermState>) {
+    let mut ts = term_state.lock().unwrap();
+    ts.feed(&buf[..n]);
+    loop {
+        match reader.try_read(buf) {
+            Ok(0) => break,
+            Ok(m) => ts.feed(&buf[..m]),
+            Err(_) => break, // WouldBlock or error
+        }
+    }
+}
+
+/// The id of the hold asked for on `hold`, once one is. Never resolves once
+/// holds can no longer come (their sender is gone).
+async fn hold_requested(mut hold: watch::Receiver<Option<u64>>) -> u64 {
+    if let Ok(held) = hold.wait_for(Option::is_some).await
+        && let Some(id) = *held
+    {
+        return id;
+    }
+    std::future::pending().await
+}
+
+/// Park the PTY reader for hold `id`: say so, then wait until the hold is
+/// released or replaced by another (or can no longer be, its sender gone).
+async fn park(
+    hold: &mut watch::Receiver<Option<u64>>,
+    id: u64,
+    events_tx: &mpsc::UnboundedSender<WorkerEvent>,
+) {
+    let _ = events_tx.send(WorkerEvent::Held { id });
+    let _ = hold.wait_for(|held| *held != Some(id)).await;
 }
 
 /// Compute one diff and emit it as a [`WorkerEvent`]. The daemon stamps the
@@ -330,28 +371,23 @@ fn emit_diff(term_state: &Arc<Mutex<TermState>>, events_tx: &mpsc::UnboundedSend
     }
 }
 
+/// What the request loop acts on.
+struct Shared<'a> {
+    term_state: &'a Arc<Mutex<TermState>>,
+    writer: &'a PtyWriter,
+    kitty_graphics: &'a Arc<AtomicBool>,
+    kitty_keyboard: &'a Arc<AtomicBool>,
+    events_tx: &'a mpsc::UnboundedSender<WorkerEvent>,
+    /// The PTY reader's hold: `Some(id)` while a handoff asks for one.
+    hold: &'a watch::Sender<Option<u64>>,
+}
+
 /// Handle daemon → worker requests until Shutdown or the socket closes.
-async fn request_loop(
-    sock_rd: &mut OwnedReadHalf,
-    term_state: &Arc<Mutex<TermState>>,
-    writer: &PtyWriter,
-    kitty_graphics: &Arc<AtomicBool>,
-    kitty_keyboard: &Arc<AtomicBool>,
-    events_tx: &mpsc::UnboundedSender<WorkerEvent>,
-) {
+async fn request_loop(sock_rd: &mut OwnedReadHalf, shared: &Shared<'_>) {
     loop {
         match codec::recv_msg::<_, WorkerRequest>(sock_rd).await {
             Ok(Some(req)) => {
-                if handle_request(
-                    req,
-                    term_state,
-                    writer,
-                    kitty_graphics,
-                    kitty_keyboard,
-                    events_tx,
-                )
-                .await
-                {
+                if handle_request(req, shared).await {
                     break; // Shutdown
                 }
             }
@@ -365,14 +401,15 @@ async fn request_loop(
 }
 
 /// Apply one request. Returns `true` on [`WorkerRequest::Shutdown`].
-async fn handle_request(
-    req: WorkerRequest,
-    term_state: &Arc<Mutex<TermState>>,
-    writer: &PtyWriter,
-    kitty_graphics: &Arc<AtomicBool>,
-    kitty_keyboard: &Arc<AtomicBool>,
-    events_tx: &mpsc::UnboundedSender<WorkerEvent>,
-) -> bool {
+async fn handle_request(req: WorkerRequest, shared: &Shared<'_>) -> bool {
+    let Shared {
+        term_state,
+        writer,
+        kitty_graphics,
+        kitty_keyboard,
+        events_tx,
+        ..
+    } = *shared;
     match req {
         WorkerRequest::Hello { .. } => {
             warn!("worker: unexpected Hello after handshake; ignoring");
@@ -453,8 +490,35 @@ async fn handle_request(
             kitty_keyboard.store(kk, Ordering::Relaxed);
         }
         WorkerRequest::Shutdown => return true,
+        WorkerRequest::Ping { .. } | WorkerRequest::Hold { .. } | WorkerRequest::Release => {
+            handle_liveness(&req, shared);
+        }
     }
     false
+}
+
+/// The heartbeat and the reader hold (issue #207).
+fn handle_liveness(req: &WorkerRequest, shared: &Shared<'_>) {
+    match *req {
+        WorkerRequest::Ping { seq } => {
+            // Answer only once the emulator is free: a worker wedged inside
+            // it answers nothing, which is what the daemon's hang check needs.
+            drop(
+                shared
+                    .term_state
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner),
+            );
+            let _ = shared.events_tx.send(WorkerEvent::Pong { seq });
+        }
+        WorkerRequest::Hold { id } => {
+            shared.hold.send_replace(Some(id));
+        }
+        WorkerRequest::Release => {
+            shared.hold.send_replace(None);
+        }
+        _ => {}
+    }
 }
 
 /// Bridges the `kmux-vt-core` backend event callbacks onto the worker's event

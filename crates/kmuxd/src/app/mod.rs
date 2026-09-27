@@ -654,15 +654,15 @@ pub struct ServerApp {
     /// the scan off the async runtime via `spawn_blocking`. Refreshes lazily, so
     /// it is free until a client opens the overview.
     pub(super) sampler: Arc<Mutex<crate::process_stats::ProcessSampler>>,
-    /// Pane ids whose isolated VT worker crashed, reported by worker supervisors
-    /// for respawn (issue #126). Drained by the task spawned in
+    /// Panes whose isolated VT worker crashed or hung, reported by worker
+    /// supervisors for respawn (issue #126). Drained by the task spawned in
     /// [`ServerApp::spawn_worker_respawn_task`].
-    worker_fault_tx: mpsc::UnboundedSender<String>,
+    worker_fault_tx: mpsc::UnboundedSender<crate::engine::WorkerFault>,
     /// Receiver half, taken once by `spawn_worker_respawn_task`.
-    worker_fault_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    worker_fault_rx: Mutex<Option<mpsc::UnboundedReceiver<crate::engine::WorkerFault>>>,
     /// Per-pane restart timestamps, used to bound worker respawns (crash-loop
-    /// guard); keyed by `pane_id`.
-    worker_restart_log: Mutex<HashMap<String, Vec<Instant>>>,
+    /// guard; crashes and hangs each have a budget); keyed by `pane_id`.
+    worker_restart_log: Mutex<HashMap<String, recover::RestartLog>>,
     /// Retained closed (inactive) sessions a user can restore (issue #64),
     /// newest-closed last. Persisted to its own `closed.bin` file, rewritten
     /// only when this set changes. See `app/graveyard.rs`.
@@ -676,6 +676,14 @@ pub struct ServerApp {
     /// On-disk graveyard file path. `None` (the default, e.g. in tests) keeps
     /// the graveyard in memory only and skips all graveyard disk I/O.
     pub(super) graveyard_path: Option<std::path::PathBuf>,
+    /// Pane creation holds this for reading from before its PTY spawns until
+    /// the pane is in `sessions`; a graceful handoff holds it for writing
+    /// from before it advertises the panes, so a pane is either advertised or
+    /// refused, never created unseen (issue #207). See `app/migrate.rs`.
+    pane_gate: Arc<RwLock<()>>,
+    /// Set by a handoff that committed: this daemon is exiting and creates
+    /// no pane again, gate or no gate.
+    pane_creation_ended: AtomicBool,
 }
 
 impl ServerApp {
@@ -709,6 +717,8 @@ impl ServerApp {
             closed_session_keep: crate::config::DEFAULT_CLOSED_SESSION_KEEP as usize,
             closed_session_ttl_ms: crate::config::default_closed_session_ttl_ms(),
             graveyard_path: None,
+            pane_gate: Arc::new(RwLock::new(())),
+            pane_creation_ended: AtomicBool::new(false),
         }
     }
 
@@ -729,7 +739,7 @@ impl ServerApp {
     }
 
     /// Clone the sender worker supervisors use to report a crash for respawn.
-    pub(crate) fn worker_fault_tx(&self) -> mpsc::UnboundedSender<String> {
+    pub(crate) fn worker_fault_tx(&self) -> mpsc::UnboundedSender<crate::engine::WorkerFault> {
         self.worker_fault_tx.clone()
     }
 
@@ -1359,6 +1369,7 @@ mod tests {
                 term_state,
                 PtyWriter::sink().unwrap(),
                 tokio::task::spawn(async {}),
+                crate::engine::hold::channel().0,
                 crate::engine::pty_response_channel().1,
             )),
             program: "/bin/sh".to_string(),

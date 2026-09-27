@@ -194,28 +194,34 @@ fn main() -> anyhow::Result<()> {
     }
 
     if cli.daemon {
-        let pid_path = kmux_sys::dirs::pid_path()?;
-        // A graceful-restart successor (`--handoff`) must NOT take the pid file
-        // here: the predecessor still holds its `flock`. It writes the pid file
-        // itself once the predecessor exits (see `startup::async_main`).
-        let pid_arg = if cli.handoff {
-            None
+        if cli.handoff {
+            // A graceful-restart successor does not fork: it stays its
+            // predecessor's direct child — spawned in a process group of its
+            // own, in `/`, with no terminal and its output in the boot log —
+            // so the predecessor can stop it and learn how it exited (issue
+            // #207). Of the rest of what `daemonize` does, only the umask is
+            // left to set. Nor does it take the pid file: the predecessor
+            // still holds its `flock`. It writes the pid file itself once the
+            // predecessor exits (see `startup::async_main`).
+            nix::sys::stat::umask(nix::sys::stat::Mode::from_bits_truncate(0o077));
         } else {
-            Some(pid_path.as_path())
-        };
-        daemon::daemonize_process(pid_arg)?;
-        // After this point we are in the daemonized child process with fresh fds.
+            daemon::daemonize_process(Some(&kmux_sys::dirs::pid_path()?))?;
+            // After this point we are in the daemonized child process with
+            // fresh fds.
+        }
     }
 
+    // Load the config before logging starts: it says how the log rotates.
+    let (mut cfg_file, cfg_source) = config::load_config(cli.config.as_deref())?;
+
     // Initialize tracing after daemonize (child process has fresh fds).
-    // Log to a persistent file; fall back to stderr if the path can't be opened.
+    // Log to a persistent file, rolled over by size (issue #207); fall back to
+    // stderr if the path can't be opened.
     let instance_id = generate_instance_id();
-    match kmux_sys::dirs::daemon_log_path().and_then(|p| {
-        Ok(std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(p)?)
-    }) {
+    let rotation = cfg_file.daemon.log_rotation();
+    match kmux_sys::dirs::daemon_log_path()
+        .and_then(|p| Ok(log_writer::RotatingFile::open(p, rotation)?))
+    {
         Ok(file) => {
             // `ResilientWriter` (not the stock `Mutex<File>`) so a write that
             // fails on a full disk degrades to "no logs" instead of poisoning
@@ -263,8 +269,7 @@ fn main() -> anyhow::Result<()> {
         "kmuxd started"
     );
 
-    // Load config and apply deprecated CLI overrides.
-    let (mut cfg_file, cfg_source) = config::load_config(cli.config.as_deref())?;
+    // Apply deprecated CLI overrides to the config loaded above.
     if cfg_source.is_none() {
         // No config file found: write a default template on first run.
         if let Ok(xdg_cfg) = std::env::var("XDG_CONFIG_HOME") {
@@ -341,7 +346,28 @@ fn main() -> anyhow::Result<()> {
     // daemon on its way out must "completely shut-off" (issue #36) regardless.
     rt.shutdown_background();
 
+    if let Some(code) = stood_down_exit_code(&result) {
+        // Not a failure: another daemon serves, and the one that spawned
+        // this successor tells the two apart by this code (issue #207).
+        if let Err(e) = &result {
+            tracing::warn!("{e:#}");
+            eprintln!("{e:#}");
+        }
+        std::process::exit(code);
+    }
     result
+}
+
+/// The exit code for a daemon run that ended in `result`, when it is not the
+/// usual one: a handoff successor that stood down exits with
+/// [`kmux_protocol::control_rpc::HANDOFF_STOOD_DOWN_EXIT_CODE`].
+fn stood_down_exit_code(result: &anyhow::Result<()>) -> Option<i32> {
+    let stood_down = result
+        .as_ref()
+        .err()?
+        .downcast_ref::<handoff::StoodDown>()
+        .is_some();
+    stood_down.then_some(kmux_protocol::control_rpc::HANDOFF_STOOD_DOWN_EXIT_CODE)
 }
 
 /// Implementation of the `probe-or-start` subcommand.
@@ -599,4 +625,25 @@ fn generate_instance_id() -> String {
     let mut bytes = [0u8; 4];
     rand::rng().fill_bytes(&mut bytes);
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use kmux_protocol::control_rpc::HANDOFF_STOOD_DOWN_EXIT_CODE;
+
+    use super::stood_down_exit_code;
+
+    /// Only a successor that stood down exits with its own code; a failure
+    /// keeps the usual one.
+    #[test]
+    fn only_a_stand_down_has_its_own_exit_code() {
+        let stood_down: anyhow::Result<()> =
+            Err(crate::handoff::StoodDown("the predecessor rolled back".into()).into());
+        assert_eq!(
+            stood_down_exit_code(&stood_down),
+            Some(HANDOFF_STOOD_DOWN_EXIT_CODE)
+        );
+        assert_eq!(stood_down_exit_code(&Err(anyhow::anyhow!("boom"))), None);
+        assert_eq!(stood_down_exit_code(&Ok(())), None);
+    }
 }

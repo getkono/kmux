@@ -7,9 +7,11 @@
 //! contract between the two:
 //!
 //! - [`WorkerRequest`] — daemon → worker (input, keys, resize, snapshot/history
-//!   requests, capability toggles, shutdown).
+//!   requests, capability toggles, heartbeat pings, reader hold/release,
+//!   shutdown).
 //! - [`WorkerEvent`] — worker → daemon (computed diffs, cursor-only updates,
-//!   title/bell/OSC 52 events, snapshot/history responses, child-exit, fault).
+//!   title/bell/OSC 52 events, snapshot/history responses, heartbeat pongs,
+//!   the reader parked, child-exit, fault).
 //!
 //! # Transport
 //!
@@ -43,7 +45,12 @@ use kmux_protocol::messages::{
 /// Bump on ANY change to [`WorkerRequest`], [`WorkerEvent`], or their payloads'
 /// wire layout. Postcard is not self-describing, so a field add/remove or
 /// variant reorder is a silent wire break — the version check is the guard.
-pub const WORKER_PROTOCOL_VERSION: u32 = 1;
+///
+/// 2 (issue #207): the heartbeat ([`WorkerRequest::Ping`] /
+/// [`WorkerEvent::Pong`]) and the reader hold for a handoff's final
+/// checkpoint ([`WorkerRequest::Hold`] / [`WorkerEvent::Held`] /
+/// [`WorkerRequest::Release`]).
+pub const WORKER_PROTOCOL_VERSION: u32 = 2;
 
 /// Daemon → worker control frames.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -95,6 +102,24 @@ pub enum WorkerRequest {
     /// Graceful shutdown: drain and exit 0. The shell survives because the
     /// daemon holds the authoritative master fd.
     Shutdown,
+    /// Heartbeat (version 2): answer [`WorkerEvent::Pong`] with the same
+    /// `seq`. A worker's output says nothing about whether it is alive — an
+    /// unchanged screen sends nothing — so the daemon asks.
+    Ping {
+        /// Echoed in the `Pong`, to match it to this ping.
+        seq: u64,
+    },
+    /// Park the PTY reader between two reads (version 2), for a graceful
+    /// handoff's final checkpoint: once every event for what it read is sent,
+    /// answer [`WorkerEvent::Held`] with the same `id` and read nothing more
+    /// until [`WorkerRequest::Release`].
+    Hold {
+        /// Echoed in the `Held`, so a late answer to an earlier hold is
+        /// not taken for this one.
+        id: u64,
+    },
+    /// Let a reader parked by [`WorkerRequest::Hold`] go on (version 2).
+    Release,
 }
 
 /// Worker → daemon event frames.
@@ -145,6 +170,17 @@ pub enum WorkerEvent {
     /// Rust panic in the safe glue (a libghostty-vt memory fault gives no such
     /// warning — the daemon detects that purely from the worker's signal death).
     Fault { detail: String },
+    /// Reply to [`WorkerRequest::Ping`] (version 2).
+    Pong {
+        /// The `seq` of the ping answered.
+        seq: u64,
+    },
+    /// Reply to [`WorkerRequest::Hold`] (version 2): the reader is parked,
+    /// and every event for what it read came before this one.
+    Held {
+        /// The `id` of the hold answered.
+        id: u64,
+    },
 }
 
 /// How the PTY child terminated, mirrored from `kmux_pty::ExitStatus` so this
@@ -224,6 +260,9 @@ mod tests {
             kitty_keyboard: true,
         });
         rt_request(&WorkerRequest::Shutdown);
+        rt_request(&WorkerRequest::Ping { seq: 9 });
+        rt_request(&WorkerRequest::Hold { id: 3 });
+        rt_request(&WorkerRequest::Release);
     }
 
     #[test]
@@ -287,6 +326,8 @@ mod tests {
         rt_event(&WorkerEvent::Fault {
             detail: "poisoned term_state mutex".into(),
         });
+        rt_event(&WorkerEvent::Pong { seq: 9 });
+        rt_event(&WorkerEvent::Held { id: 3 });
     }
 
     #[test]

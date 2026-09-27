@@ -75,6 +75,11 @@ fd-carrying handshake is lock-step. After it, both ends split the stream and
 exchange fd-less, length-prefixed postcard frames concurrently, reusing the
 `kmux-protocol` codec.
 
+The worker must answer `Hello` with `Ready` within `READY_TIMEOUT` (10 s, issue
+#207). One that fails the handshake or never answers is killed and reaped on
+the spot, and pane creation falls back to the in-process engine instead of
+hanging.
+
 **The daemon retains the authoritative master fd** (the worker holds a dup).
 This is the load-bearing invariant: when the worker dies, the daemon's fd keeps
 the PTY's file description open, so the shell receives no SIGHUP and survives.
@@ -126,17 +131,58 @@ own executable, else on `PATH`.
 A worker death is just a task seeing its socket EOF — the daemon is structurally
 unaffected. The supervisor reaps the child and inspects its exit status: a clean
 exit (code 0) is the pane-close/handoff path; a signal death (SIGSEGV/SIGABRT)
-or non-zero exit is a **crash**, on which it:
+or non-zero exit is a **crash**.
+
+The supervisor never waits on a worker in a way that can hang the daemon
+(issue #207):
+
+- **Asynchronous reaping.** The worker is a `tokio::process::Child`, waited on
+  with `.await`. It used to be a `std::process::Child` whose blocking `wait()`
+  ran on a runtime thread, which blocked that thread for good when the worker
+  was still alive. A supervisor aborted by a pane close or a handoff drops the
+  `Child` unreaped, and tokio reaps it in the background.
+- **A bad stream kills the worker first.** A frame that fails to read or decode
+  (`StreamEnd::Corrupt`) means the worker is running but its stream cannot be
+  trusted, so it is killed before it is reaped. A worker that closed its stream
+  gets `EXIT_GRACE` (5 s) to exit on its own before it is killed too.
+- **Hang detection by heartbeat.** Every `LIVENESS_INTERVAL` (5 s) the
+  supervisor sends `WorkerRequest::Ping { seq }` (ahead of queued input, on the
+  control lane) unless one is already unanswered; the worker answers
+  `WorkerEvent::Pong { seq }` from its request loop, after taking the
+  emulator's lock — so a worker wedged in the emulator, or with its runtime
+  stuck, answers nothing. A ping unanswered for `PONG_DEADLINE` (30 s) is a
+  hang (`StreamEnd::Hung`), and the worker is killed. It used to be inferred
+  from output: a worker that sent nothing while its PTY had output waiting was
+  taken for hung, but a worker whose reads leave the screen unchanged sends no
+  diff, so healthy workers were killed. The one legitimate way for a worker to
+  leave a ping unread is to be blocked writing input to a child that does not
+  read its stdin (the request loop reads the next request only once that write
+  is done). The supervisor keeps a dup of the pane's master and, at each check,
+  polls it for `POLLOUT` with a zero timeout: while the PTY takes no input, the
+  deadline restarts, so only a worker that leaves a ping unanswered for 30 s
+  with room to write is hung. `WORKER_PROTOCOL_VERSION` 1 → 2.
+- **The socket is read by a task of its own** that feeds a bounded channel, so
+  the periodic check never cancels a frame half-read.
+
+A killed worker faults its pane like a crash. On a fault the supervisor:
 
 1. broadcasts `SessionEventMsg::PaneFaulted` to the pane's attached clients
    (PROTOCOL_VERSION 28), and
-2. reports the pane id on a channel to a single daemon-level respawn task
-   (`app::recover`) — never re-entrantly from the dying supervisor.
+2. reports the pane and the cause (`FaultCause::Crash` or `FaultCause::Hang`)
+   on a channel to a single daemon-level respawn task (`app::recover`) — never
+   re-entrantly from the dying supervisor.
 
 The respawn task re-adopts the daemon's retained master fd into a fresh worker
 (the shell is still alive), swaps the engine, and resyncs attached clients with a
-snapshot. A crash-loop guard bounds restarts to 3 per pane within 60s; past that
-the pane is left faulted.
+snapshot. A crash-loop guard bounds restarts after a crash to 3 per pane within
+60s; restarts after a hang have a budget of their own, 3 per pane within 10
+minutes (a hang takes at least the heartbeat deadline to detect, and says
+nothing about the emulator crashing), so hangs never use up the crash budget.
+Past either the pane is left faulted. A respawn waits while a graceful handoff
+runs — a new worker would read a PTY the handoff froze — and none happens once
+a handoff has committed. Closing a pane (directly, or with its tab or session)
+drops its entry from the restart log (`forget_worker_restarts`), so the log does
+not grow by one entry for every pane a long-running daemon ever faulted.
 
 ## Observability (`workers` control RPC)
 
@@ -144,8 +190,9 @@ The daemon answers a `workers` command on its JSON control socket
 (`ServerApp::snapshot_workers`) with its isolation mode and, for every pane
 running in a worker, the pane id, the worker subprocess pid (`WorkerEngine`
 retains `child.id()` from spawn), lifecycle status, and the crash-loop history
-read from the existing restart log (`worker_restart_stats`: respawns within the
-60s window + remaining budget). `kmux status` surfaces this; an in-process daemon
+read from the existing restart log (`worker_restart_stats`: respawns within
+their windows, crashes and hangs together, + whether both budgets allow
+another). `kmux status` surfaces this; an in-process daemon
 reports an empty list, and a daemon predating the command closes without
 replying, so the client degrades gracefully. Control-socket only — no
 data-plane capability or `kmux-worker-protocol` bump (new fields are
@@ -154,8 +201,19 @@ data-plane capability or `kmux-worker-protocol` bump (new fields are
 ## Interaction with handoff & federation
 
 - **Handoff** (`crate::handoff`, live daemon upgrade): the daemon still owns
-  every PTY master fd, so the fd-migration path is unchanged. `quiesce_relays`
-  calls `PaneEngine::abort_relay_task`, which for a worker sends `Shutdown`
+  every PTY master fd, so the fd-migration path is unchanged. A worker pane is
+  held for the final checkpoint like an in-process one (issue #207): the daemon
+  sends `WorkerRequest::Hold { id }`, the worker parks its PTY reader between
+  two reads and answers `WorkerEvent::Held { id }` after every event for what
+  it read, so the daemon-side mirror the checkpoint reads holds exactly what
+  the worker consumed; `WorkerRequest::Release` lets it go on after a
+  rollback. The ids keep a late answer to a hold that timed out from passing
+  for the next one. Client input for a held worker waits in the daemon's
+  input queue until the release: a held reader can leave the child blocked on
+  output, a child blocked there stops reading stdin, and input sent to the
+  worker then would block its request loop — with the `Release` queued behind
+  it, freezing the pane for good after a rollback. After the commit point `quiesce_relays` calls
+  `PaneEngine::abort_relay_task`, which for a worker sends `Shutdown`
   (releasing the worker's dup) before aborting. The successor daemon respawns
   fresh workers post-restore in whatever isolation mode it is configured for;
   live worker migration across a handoff is intentionally not attempted.

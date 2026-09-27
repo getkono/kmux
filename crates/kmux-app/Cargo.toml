@@ -38,6 +38,9 @@ tokio.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Re-listed with `test-util` for `tokio::time::pause`: the restart-outcome
+# wait (`kmux daemon restart`) is tested on the paused clock (issue #207).
+tokio = { workspace = true, features = ["test-util"] }
 
 [lints]
 workspace = true

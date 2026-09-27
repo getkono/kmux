@@ -17,6 +17,7 @@ use tracing::{debug, warn};
 use crate::app::ClientMap;
 use crate::backend::{BackendEventSink, ControlEvent};
 use crate::diff_engine::DiffResult;
+use crate::engine::hold::HoldPoint;
 use crate::lock::lock_term_state;
 use crate::scrollback::DiffBuffer;
 use crate::term_state::TermState;
@@ -101,6 +102,10 @@ fn feed_capped(
 /// Also polls the foreground process name every 500 ms via `tcgetpgrp` so
 /// pane titles update as the user switches between commands, even when the
 /// shell does not emit OSC 0/2 sequences.
+///
+/// A hold on `hold` (a graceful handoff's final checkpoint, issue #207) parks
+/// the loop between two reads — everything read so far fed and broadcast —
+/// until it is released.
 // Each parameter is a distinct shared handle the loop fans output into
 // (emulator, scrollback, client map, seqno, registry); bundling them into a
 // struct would only add indirection at the three call sites.
@@ -114,6 +119,7 @@ pub async fn session_diff_loop(
     term_state: Arc<Mutex<TermState>>,
     seqno_counter: Arc<AtomicU64>,
     manager: Arc<SessionManager>,
+    mut hold: HoldPoint,
 ) {
     let master_fd = reader.raw_fd();
     let mut buf = vec![0u8; 65536];
@@ -128,6 +134,8 @@ pub async fn session_diff_loop(
 
     loop {
         tokio::select! {
+            biased;
+            () = hold.requested() => hold.park().await,
             result = reader.read(&mut buf) => {
                 match result {
                     Ok(0) => break,
@@ -1155,6 +1163,7 @@ mod tests {
             Arc::clone(&ts),
             Arc::new(AtomicU64::new(1)),
             Arc::new(SessionManager::new()),
+            crate::engine::hold::channel().1,
         )
         .await;
 
