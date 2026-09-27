@@ -671,19 +671,21 @@ impl FrontendDriver {
 
     /// Apply transport upgrades and react to a dead SSH tunnel: whether either
     /// changed what is shown.
-    #[cfg(feature = "remote")]
     fn drain_remote(&mut self, now: Instant) -> bool {
-        [
+        // One body for both builds, so the mutation job (default features)
+        // mutates the code it compiles: a lean (UDS-only) build has no
+        // transport supervisor and no tunnel, and so nothing to drain.
+        #[cfg(feature = "remote")]
+        let changed = [
             self.drain_transport_upgrades(),
             self.drain_tunnel_deaths(now),
-        ]
-        .contains(&true)
-    }
-
-    /// A lean (UDS-only) build has no transport supervisor and no tunnel.
-    #[cfg(not(feature = "remote"))]
-    fn drain_remote(&mut self, _now: Instant) -> bool {
-        false
+        ];
+        #[cfg(not(feature = "remote"))]
+        let changed = {
+            let _ = (&*self, now);
+            [false]
+        };
+        changed.contains(&true)
     }
 
     /// Apply any better-transport signals from the background probe.
