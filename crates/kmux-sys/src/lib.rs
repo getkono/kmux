@@ -24,6 +24,5 @@ pub mod tls;
 
 // QUIC transport constants — re-exported for the callers that had them from
 // `kmux_protocol::` before the split.
-pub use transport::quic::{QUIC_IDLE_TIMEOUT_SECS, QUIC_KEEP_ALIVE_SECS};
 
 pub use transport::EndpointAdvert;

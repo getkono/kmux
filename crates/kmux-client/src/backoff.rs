@@ -14,14 +14,10 @@
 
 use std::time::Duration;
 
-/// The delay before the first retry (attempt 0), before jitter.
-pub const BACKOFF_MIN: Duration = Duration::from_millis(250);
-
-/// The longest delay between two attempts: the doubling stops here.
-pub const BACKOFF_MAX: Duration = Duration::from_secs(15);
-
-/// The most jitter may shorten a delay by, in thousandths of it.
-pub const BACKOFF_JITTER_CAP_PERMILLE: u32 = 200;
+/// The delay before the first retry (attempt 0) before jitter, the longest
+/// delay between two attempts, and the most jitter may shorten a delay by, in
+/// thousandths of it — specified in `docs/protocol.md`.
+pub use kmux_protocol::timing::{BACKOFF_JITTER_CAP_PERMILLE, BACKOFF_MAX, BACKOFF_MIN};
 
 /// The delay before retry `attempt` (0-based), jittered by `jitter_seed`.
 ///

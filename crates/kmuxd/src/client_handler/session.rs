@@ -190,7 +190,7 @@ fn spawn_authenticated_forwarders(
 /// is closed (issue #206). A peer that stops reading — its TCP window at zero —
 /// otherwise pins the writer task, and with it the connection, forever. Long
 /// enough for a large snapshot over a slow but live link.
-pub(crate) const FRAME_WRITE_TIMEOUT: Duration = Duration::from_secs(30);
+pub(crate) use kmux_protocol::timing::FRAME_WRITE_TIMEOUT;
 
 /// Drain a connection's outbound queue onto `writer` until every sender is
 /// gone or a write fails, then shut the transport down.
@@ -485,7 +485,7 @@ pub async fn run_client_session<R, W, A, F>(
         // Authentication failures carry a useful AuthResult reason. Close the
         // channel senders and give the writer a bounded opportunity to flush
         // that frame before shutting down the transport.
-        if tokio::time::timeout(Duration::from_secs(1), &mut writer_task)
+        if tokio::time::timeout(kmux_protocol::timing::AUTH_REFUSAL_FLUSH, &mut writer_task)
             .await
             .is_err()
         {

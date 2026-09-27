@@ -97,8 +97,7 @@ impl PaneAttacher for QuicAttacher {
 /// sleep costs no pane a resync. What is left is a client that is reachable —
 /// it answers keep-alives — but has not read this stream for five and a half
 /// minutes: that stream alone is reset.
-pub(crate) const PANE_STREAM_STALL_TIMEOUT: Duration =
-    Duration::from_secs(kmux_sys::QUIC_IDLE_TIMEOUT_SECS + 30);
+pub(crate) use kmux_protocol::timing::PANE_STREAM_STALL_TIMEOUT;
 
 /// QUIC application error code a stalled pane stream is reset with.
 const PANE_STREAM_STALLED_CODE: u32 = 1;
@@ -382,7 +381,7 @@ mod pane_writer_tests {
     /// connection rides out never resets a pane stream.
     #[test]
     fn a_stall_outlasts_the_quic_idle_timeout() {
-        assert!(PANE_STREAM_STALL_TIMEOUT > Duration::from_secs(kmux_sys::QUIC_IDLE_TIMEOUT_SECS));
+        assert!(PANE_STREAM_STALL_TIMEOUT > kmux_protocol::timing::QUIC_IDLE_TIMEOUT);
         assert_eq!(
             PANE_STREAM_STALL_TIMEOUT,
             Duration::from_secs(330),

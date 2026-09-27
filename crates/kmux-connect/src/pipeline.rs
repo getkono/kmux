@@ -28,7 +28,7 @@ use kmux_protocol::TransportKind;
 /// How long to wait for `AuthResult` after sending `Auth` on a transport.
 /// Must be long enough for SSH + TLS handshake + first frame round-trip
 /// on a slow link, but short enough to fail visibly rather than hang.
-const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+use kmux_protocol::timing::AUTH_REPLY_TIMEOUT as AUTH_TIMEOUT;
 
 // ─── Public types ─────────────────────────────────────────────────────────
 

@@ -2,8 +2,6 @@
 use std::net::ToSocketAddrs;
 #[cfg(feature = "remote")]
 use std::sync::Arc;
-#[cfg(feature = "remote")]
-use std::time::Duration;
 
 use kmux_protocol::messages::ClientMessage;
 #[cfg(feature = "remote")]
@@ -208,10 +206,9 @@ fn build_quinn_client_config(
 fn client_transport_config() -> quinn::TransportConfig {
     let mut transport = quinn::TransportConfig::default();
     transport.max_idle_timeout(Some(
-        quinn::IdleTimeout::try_from(Duration::from_secs(kmux_sys::QUIC_IDLE_TIMEOUT_SECS))
-            .unwrap(),
+        quinn::IdleTimeout::try_from(kmux_protocol::timing::QUIC_IDLE_TIMEOUT).unwrap(),
     ));
-    transport.keep_alive_interval(Some(Duration::from_secs(kmux_sys::QUIC_KEEP_ALIVE_SECS)));
+    transport.keep_alive_interval(Some(kmux_protocol::timing::QUIC_KEEP_ALIVE));
     transport.max_concurrent_uni_streams(quinn::VarInt::from_u32(MAX_PANE_STREAMS));
     transport
 }
@@ -219,6 +216,8 @@ fn client_transport_config() -> quinn::TransportConfig {
 #[cfg(all(test, feature = "remote"))]
 mod tests {
     use std::collections::HashSet;
+
+    use std::time::Duration;
 
     use kmux_protocol::encode_server;
 

@@ -57,18 +57,14 @@ fn lock(conn: &Mutex<PeerConnection>) -> std::sync::MutexGuard<'_, PeerConnectio
     conn.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// How long [`PeerManager::open_peer`] waits for the upstream `AuthResult`.
-const AUTH_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long [`PeerManager::open_peer`] waits for the upstream session list.
-const LIST_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long [`PeerManager::create_remote_session`] waits for the upstream
-/// `SessionCreated` (or `Error`) when creating a session on a federated peer.
-const CREATE_TIMEOUT: Duration = Duration::from_secs(10);
-/// How long [`PeerManager::collect_process_overview`] waits for each peer's
-/// `ProcessOverviewResult` (issue #122). Short, because the overview polls ~1 Hz
-/// and a slow/dead peer should not stall the whole snapshot — it just contributes
-/// nothing this round.
-const OVERVIEW_TIMEOUT: Duration = Duration::from_secs(2);
+/// How long the hub waits for its peer's `AuthResult`, session list, created
+/// session and process overview. The overview's is short: the overview polls
+/// ~1 Hz and a slow or dead peer should not stall the whole snapshot — it just
+/// contributes nothing this round (issue #122). See `docs/protocol.md`.
+use kmux_protocol::timing::{
+    AUTH_REPLY_TIMEOUT as AUTH_TIMEOUT, PEER_CREATE_TIMEOUT as CREATE_TIMEOUT,
+    PEER_LIST_TIMEOUT as LIST_TIMEOUT, PEER_OVERVIEW_TIMEOUT as OVERVIEW_TIMEOUT,
+};
 
 /// Owns every upstream peer connection and routes federated traffic.
 #[derive(Default)]
