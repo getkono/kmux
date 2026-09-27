@@ -194,75 +194,36 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_all_builtins_parse() {
-        for name in BUILTIN_THEMES {
-            assert!(
-                builtin_theme(name).is_some(),
-                "built-in theme '{name}' failed to parse"
-            );
+    fn builtin_theme_unknown_name_returns_none() {
+        assert!(builtin_theme("nonexistent").is_none());
+    }
+
+    /// `None` = rejected with `InvalidColor`.
+    #[test]
+    fn parse_hex_accepts_six_digits_with_or_without_hash() {
+        let macchiato_bg = Rgb::new(0x24, 0x27, 0x3a);
+        let cases = [
+            ("#24273a", Some(macchiato_bg)),
+            ("24273a", Some(macchiato_bg)),
+            ("#abc", None),
+            ("#zzzzzz", None),
+        ];
+        for (input, expected) in cases {
+            match (parse_hex("bg", input), expected) {
+                (Ok(got), Some(want)) => assert_eq!(got, want, "{input}"),
+                (Err(ThemeError::InvalidColor { .. }), None) => {}
+                (got, _) => panic!("{input}: expected {expected:?}, got {got:?}"),
+            }
         }
     }
 
     #[test]
-    fn test_unknown_builtin_returns_none() {
-        assert!(builtin_theme("nonexistent").is_none());
-    }
-
-    #[test]
-    fn test_hex_parse_valid() {
-        let color = parse_hex("bg", "#24273a").unwrap();
-        assert_eq!(color, Rgb::new(0x24, 0x27, 0x3a));
-    }
-
-    #[test]
-    fn test_hex_parse_valid_no_hash() {
-        let color = parse_hex("bg", "24273a").unwrap();
-        assert_eq!(color, Rgb::new(0x24, 0x27, 0x3a));
-    }
-
-    #[test]
-    fn test_hex_parse_invalid_length() {
-        assert!(matches!(
-            parse_hex("bg", "#abc"),
-            Err(ThemeError::InvalidColor { .. })
-        ));
-    }
-
-    #[test]
-    fn test_hex_parse_invalid_chars() {
-        assert!(matches!(
-            parse_hex("bg", "#zzzzzz"),
-            Err(ThemeError::InvalidColor { .. })
-        ));
-    }
-
-    #[test]
-    fn test_default_theme_is_macchiato() {
-        let theme = default_theme();
-        // bg = #24273a
-        assert_eq!(theme.bg, Rgb::new(0x24, 0x27, 0x3a));
-    }
-
-    #[test]
-    fn cursor_colors_default_to_fg_and_bg() {
-        // A theme TOML with no cursor_* keys should fall back to fg/bg so every
-        // theme has a high-contrast cursor without per-theme tuning.
-        let toml = r##"
-name = "test"
-bg = "#000000"
-fg = "#ffffff"
-fg_dim = "#888888"
-accent = "#0000ff"
-green = "#00ff00"
-red = "#ff0000"
-yellow = "#ffff00"
-purple = "#ff00ff"
-orange = "#ff8800"
-status_bg = "#222222"
-"##;
-        let theme = parse_theme_toml(toml).unwrap();
-        assert_eq!(theme.cursor_bg, theme.fg);
-        assert_eq!(theme.cursor_fg, theme.bg);
+    fn default_theme_is_catppuccin_macchiato() {
+        assert_eq!(
+            default_theme(),
+            builtin_theme("catppuccin-macchiato").expect("builtin")
+        );
+        assert_eq!(default_theme().bg, Rgb::new(0x24, 0x27, 0x3a));
     }
 
     #[test]
@@ -309,10 +270,12 @@ cursor_fg = "#123456"
 
     #[test]
     fn all_builtins_have_cursor_colors() {
-        // Built-in themes omit the cursor_* keys, so they should default to
-        // fg/bg — never an unset/zeroed value.
+        // Every built-in parses, and built-ins omit the cursor_* keys, so this
+        // also pins the fg/bg cursor fallback of `ThemeFile::into_theme` — the
+        // same path a custom theme TOML takes.
         for name in BUILTIN_THEMES {
-            let theme = builtin_theme(name).unwrap();
+            let theme = builtin_theme(name)
+                .unwrap_or_else(|| panic!("built-in theme '{name}' failed to parse"));
             assert_eq!(theme.cursor_bg, theme.fg, "{name} cursor_bg should be fg");
             assert_eq!(theme.cursor_fg, theme.bg, "{name} cursor_fg should be bg");
         }

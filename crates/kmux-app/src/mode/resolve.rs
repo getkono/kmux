@@ -375,13 +375,72 @@ pub(crate) fn resolve_command(key: &Key, mods: Modifiers) -> (Option<Mode>, Acti
 mod tests {
     use kmux_client::key::{Key, Modifiers, NamedKey};
 
-    use crate::mode::{Action, Mode, resolve};
+    use crate::mode::{Action, CommandState, Mode, resolve};
 
+    fn ch(s: &str) -> Key {
+        Key::Character(s.into())
+    }
+
+    fn named(k: NamedKey) -> Key {
+        Key::Named(k)
+    }
+
+    fn rename(buffer: &str) -> Mode {
+        Mode::RenameSession {
+            word_id: "abc".into(),
+            buffer: buffer.into(),
+        }
+    }
+
+    /// `(label, mode, key, mods, expected resolve() result)`.
+    type Case = (&'static str, Mode, Key, Modifiers, (Option<Mode>, Action));
+
+    /// One row per binding: `(label, mode, key, mods, expected (mode, action))`.
+    /// Text-input submits (rename / command Enter) must resolve to `None` mode:
+    /// the action handler `mem::replace`s the state out before leaving the mode.
     #[test]
-    fn ctrl_g_enters_mode_select() {
-        let (mode, action) = resolve(&Mode::Normal, &Key::Character("g".into()), Modifiers::CTRL);
-        assert_eq!(mode, Some(Mode::Select));
-        assert_eq!(action, Action::None);
+    fn resolve_binding_table_yields_expected_transition_and_action() {
+        let none = Modifiers::empty();
+        let ctrl = Modifiers::CTRL;
+        let cmd = || Mode::Command(CommandState::default());
+        let to_normal = |a| (Some(Mode::Normal), a);
+        let stay = |a| (None, a);
+        #[rustfmt::skip]
+        let cases: Vec<Case> = vec![
+            ("normal ctrl+g enters select", Mode::Normal, ch("g"), ctrl, (Some(Mode::Select), Action::None)),
+            ("normal plain key forwards", Mode::Normal, ch("a"), none, stay(Action::ForwardKey)),
+            ("locked ctrl+g unlocks", Mode::Locked, ch("g"), ctrl, to_normal(Action::None)),
+            ("select s enters session", Mode::Select, ch("s"), none, (Some(Mode::Session), Action::None)),
+            ("select ctrl+/ enters command", Mode::Select, ch("/"), ctrl, (Some(cmd()), Action::None)),
+            ("select bare / enters command", Mode::Select, ch("/"), none, (Some(cmd()), Action::None)),
+            // Some terminals encode Ctrl+/ as the raw US byte with no CTRL modifier.
+            ("select legacy US byte enters command", Mode::Select, ch("\u{1f}"), none, (Some(cmd()), Action::None)),
+            ("session c creates session", Mode::Session, ch("c"), none, to_normal(Action::CreateSession)),
+            ("session p creates pane", Mode::Session, ch("p"), none, to_normal(Action::CreatePane)),
+            ("session x closes pane", Mode::Session, ch("x"), none, to_normal(Action::ClosePane)),
+            ("session X closes session", Mode::Session, ch("X"), none, stay(Action::CloseSession)),
+            ("session tab next tab", Mode::Session, named(NamedKey::Tab), none, stay(Action::NextTab)),
+            ("session esc exits", Mode::Session, named(NamedKey::Escape), none, to_normal(Action::None)),
+            ("signal k sends sigkill", Mode::Signal, ch("k"), none, to_normal(Action::SendSignal(9))),
+            ("session picker ctrl+c closes", Mode::SessionPicker, ch("c"), ctrl, to_normal(Action::CloseSessionPicker)),
+            ("session picker esc closes", Mode::SessionPicker, named(NamedKey::Escape), none, to_normal(Action::CloseSessionPicker)),
+            ("session picker enter selects", Mode::SessionPicker, named(NamedKey::Enter), none, to_normal(Action::SelectPickerEntry)),
+            ("dir picker ctrl+c cancels", Mode::DirectoryPicker, ch("c"), ctrl, to_normal(Action::DirPickerCancel)),
+            ("rename ctrl+c cancels", rename("x"), ch("c"), ctrl, to_normal(Action::None)),
+            ("rename esc cancels", rename(""), named(NamedKey::Escape), none, to_normal(Action::None)),
+            ("rename enter submits in place", rename("new name"), named(NamedKey::Enter), none, stay(Action::RenameSubmit)),
+            ("command esc cancels", cmd(), named(NamedKey::Escape), none, to_normal(Action::None)),
+            ("command ctrl+c cancels", cmd(), ch("c"), ctrl, to_normal(Action::None)),
+            ("command enter submits in place", cmd(), named(NamedKey::Enter), none, stay(Action::CommandSubmit)),
+            ("command tab completes", cmd(), named(NamedKey::Tab), none, stay(Action::CommandComplete)),
+            ("command char inserts", cmd(), ch("a"), none, stay(Action::CommandChar('a'))),
+            // The legacy US byte re-arriving mid-command must not insert garbage.
+            ("command control char filtered", cmd(), ch("\u{1f}"), none, stay(Action::None)),
+            ("command ctrl+u clears line", cmd(), ch("u"), ctrl, stay(Action::CommandClearLine)),
+        ];
+        for (label, mode, key, mods, expected) in cases {
+            assert_eq!(resolve(&mode, &key, mods), expected, "{label}");
+        }
     }
 
     /// No keystroke confirms a reconnect any more (issue #208): `y` and Enter
@@ -420,297 +479,5 @@ mod tests {
             resolve(&disconnected, &Key::Character("q".into()), none),
             (None, Action::Quit)
         );
-    }
-
-    #[test]
-    fn mode_select_s_enters_session() {
-        let (mode, _) = resolve(
-            &Mode::Select,
-            &Key::Character("s".into()),
-            Modifiers::empty(),
-        );
-        assert_eq!(mode, Some(Mode::Session));
-    }
-
-    #[test]
-    fn session_c_creates_session() {
-        let (mode, action) = resolve(
-            &Mode::Session,
-            &Key::Character("c".into()),
-            Modifiers::empty(),
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-        assert_eq!(action, Action::CreateSession);
-    }
-
-    #[test]
-    fn session_p_creates_pane() {
-        let (mode, action) = resolve(
-            &Mode::Session,
-            &Key::Character("p".into()),
-            Modifiers::empty(),
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-        assert_eq!(action, Action::CreatePane);
-    }
-
-    #[test]
-    fn session_x_closes_pane() {
-        let (_, action) = resolve(
-            &Mode::Session,
-            &Key::Character("x".into()),
-            Modifiers::empty(),
-        );
-        assert_eq!(action, Action::ClosePane);
-    }
-
-    #[test]
-    fn session_shift_x_closes_session() {
-        let (_, action) = resolve(
-            &Mode::Session,
-            &Key::Character("X".into()),
-            Modifiers::empty(),
-        );
-        assert_eq!(action, Action::CloseSession);
-    }
-
-    #[test]
-    fn session_tab_next_pane() {
-        let (_, action) = resolve(
-            &Mode::Session,
-            &Key::Named(NamedKey::Tab),
-            Modifiers::empty(),
-        );
-        assert_eq!(action, Action::NextTab);
-    }
-
-    #[test]
-    fn normal_keys_forward_to_pty() {
-        let (mode, action) = resolve(
-            &Mode::Normal,
-            &Key::Character("a".into()),
-            Modifiers::empty(),
-        );
-        assert_eq!(mode, None);
-        assert_eq!(action, Action::ForwardKey);
-    }
-
-    #[test]
-    fn locked_ctrl_g_unlocks() {
-        let (mode, _) = resolve(&Mode::Locked, &Key::Character("g".into()), Modifiers::CTRL);
-        assert_eq!(mode, Some(Mode::Normal));
-    }
-
-    #[test]
-    fn ctrl_c_cancels_session_picker() {
-        let (mode, action) = resolve(
-            &Mode::SessionPicker,
-            &Key::Character("c".into()),
-            Modifiers::CTRL,
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-        assert_eq!(action, Action::CloseSessionPicker);
-    }
-
-    #[test]
-    fn ctrl_c_cancels_directory_picker() {
-        let (mode, action) = resolve(
-            &Mode::DirectoryPicker,
-            &Key::Character("c".into()),
-            Modifiers::CTRL,
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-        assert_eq!(action, Action::DirPickerCancel);
-    }
-
-    #[test]
-    fn ctrl_c_cancels_rename_mode() {
-        let (mode, _) = resolve(
-            &Mode::RenameSession {
-                word_id: "abc".into(),
-                buffer: "x".into(),
-            },
-            &Key::Character("c".into()),
-            Modifiers::CTRL,
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-    }
-
-    #[test]
-    fn signal_k_sends_sigkill() {
-        let (mode, action) = resolve(
-            &Mode::Signal,
-            &Key::Character("k".into()),
-            Modifiers::empty(),
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-        assert_eq!(action, Action::SendSignal(9));
-    }
-
-    #[test]
-    fn escape_exits_session_mode() {
-        let (mode, _) = resolve(
-            &Mode::Session,
-            &Key::Named(NamedKey::Escape),
-            Modifiers::empty(),
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-    }
-
-    #[test]
-    fn session_picker_esc_closes() {
-        let (mode, action) = resolve(
-            &Mode::SessionPicker,
-            &Key::Named(NamedKey::Escape),
-            Modifiers::empty(),
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-        assert_eq!(action, Action::CloseSessionPicker);
-    }
-
-    #[test]
-    fn session_picker_enter_selects() {
-        let (mode, action) = resolve(
-            &Mode::SessionPicker,
-            &Key::Named(NamedKey::Enter),
-            Modifiers::empty(),
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-        assert_eq!(action, Action::SelectPickerEntry);
-    }
-
-    // Regression test: rename-submit must NOT pre-transition the mode so that
-    // the action handler can extract data via mem::replace.
-
-    #[test]
-    fn rename_enter_does_not_change_mode() {
-        let (mode, action) = resolve(
-            &Mode::RenameSession {
-                word_id: "abc".into(),
-                buffer: "new name".into(),
-            },
-            &Key::Named(NamedKey::Enter),
-            Modifiers::empty(),
-        );
-        // mode must be None so the action handler can mem::replace the RenameSession
-        assert_eq!(mode, None);
-        assert_eq!(action, Action::RenameSubmit);
-    }
-
-    // ── Command palette ──────────────────────────────────────────────────
-
-    fn assert_enters_command(key: Key, mods: Modifiers) {
-        let (mode, action) = resolve(&Mode::Select, &key, mods);
-        assert!(
-            matches!(mode, Some(Mode::Command(_))),
-            "expected Mode::Command, got {mode:?}"
-        );
-        assert_eq!(action, Action::None);
-    }
-
-    #[test]
-    fn ctrl_slash_in_select_enters_command_mode() {
-        assert_enters_command(Key::Character("/".into()), Modifiers::CTRL);
-    }
-
-    #[test]
-    fn bare_slash_in_select_enters_command_mode() {
-        assert_enters_command(Key::Character("/".into()), Modifiers::empty());
-    }
-
-    #[test]
-    fn legacy_us_byte_in_select_enters_command_mode() {
-        // Some terminals encode Ctrl+/ as the raw `\x1f` byte without a
-        // CONTROL modifier. The activation must still fire.
-        assert_enters_command(Key::Character("\u{1f}".into()), Modifiers::empty());
-    }
-
-    #[test]
-    fn esc_cancels_command_mode() {
-        let (mode, action) = resolve(
-            &Mode::Command(crate::mode::CommandState::default()),
-            &Key::Named(NamedKey::Escape),
-            Modifiers::empty(),
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-        assert_eq!(action, Action::None);
-    }
-
-    #[test]
-    fn ctrl_c_cancels_command_mode() {
-        let (mode, _) = resolve(
-            &Mode::Command(crate::mode::CommandState::default()),
-            &Key::Character("c".into()),
-            Modifiers::CTRL,
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-    }
-
-    #[test]
-    fn enter_in_command_mode_emits_submit_without_pre_transition() {
-        let (mode, action) = resolve(
-            &Mode::Command(crate::mode::CommandState::default()),
-            &Key::Named(NamedKey::Enter),
-            Modifiers::empty(),
-        );
-        // Mode must be None so the action handler can mem::replace the state.
-        assert_eq!(mode, None);
-        assert_eq!(action, Action::CommandSubmit);
-    }
-
-    #[test]
-    fn tab_in_command_mode_emits_complete() {
-        let (_, action) = resolve(
-            &Mode::Command(crate::mode::CommandState::default()),
-            &Key::Named(NamedKey::Tab),
-            Modifiers::empty(),
-        );
-        assert_eq!(action, Action::CommandComplete);
-    }
-
-    #[test]
-    fn char_in_command_mode_emits_command_char() {
-        let (_, action) = resolve(
-            &Mode::Command(crate::mode::CommandState::default()),
-            &Key::Character("a".into()),
-            Modifiers::empty(),
-        );
-        assert_eq!(action, Action::CommandChar('a'));
-    }
-
-    #[test]
-    fn control_char_in_command_mode_does_not_insert() {
-        // The legacy US byte that re-arrives mid-command must not be inserted
-        // as garbage — it should be filtered.
-        let (_, action) = resolve(
-            &Mode::Command(crate::mode::CommandState::default()),
-            &Key::Character("\u{1f}".into()),
-            Modifiers::empty(),
-        );
-        assert_eq!(action, Action::None);
-    }
-
-    #[test]
-    fn ctrl_u_clears_line_in_command_mode() {
-        let (_, action) = resolve(
-            &Mode::Command(crate::mode::CommandState::default()),
-            &Key::Character("u".into()),
-            Modifiers::CTRL,
-        );
-        assert_eq!(action, Action::CommandClearLine);
-    }
-
-    #[test]
-    fn rename_escape_cancels() {
-        let (mode, action) = resolve(
-            &Mode::RenameSession {
-                word_id: "abc".into(),
-                buffer: String::new(),
-            },
-            &Key::Named(NamedKey::Escape),
-            Modifiers::empty(),
-        );
-        assert_eq!(mode, Some(Mode::Normal));
-        assert_eq!(action, Action::None);
     }
 }

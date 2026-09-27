@@ -277,20 +277,9 @@ fn find_last_token_start(buffer: &str, token: &str) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use kmux_client::session_manager::SessionManager;
-    use kmux_protocol::messages::ClientCapabilities;
 
     fn empty_app(buffer: &str) -> AppCore {
-        // Cheaply build a core fixture without booting the runtime. We only set
-        // the fields the hint engine reads.
-        let mgr = SessionManager::new(
-            "127.0.0.1".into(),
-            8443,
-            "tok".into(),
-            true,
-            ClientCapabilities::default(),
-        );
-        let mut core = AppCore::for_test(mgr);
+        let mut core = crate::fixtures::fixture_core();
         core.mode = Mode::Command(crate::mode::CommandState {
             buffer: buffer.to_string(),
             cursor: buffer.len(),

@@ -250,40 +250,30 @@ mod tests {
         String::from_utf8(pattern_bytes(test)).expect("pattern bytes are valid UTF-8")
     }
 
+    /// Each single pattern paints the content it exists to stress.
     #[test]
-    fn every_pattern_is_nonempty_valid_utf8() {
-        for test in [
-            DiagnosticTest::Glyphs,
-            DiagnosticTest::Attrs,
-            DiagnosticTest::Colors,
-            DiagnosticTest::Unicode,
-            DiagnosticTest::Boxes,
-            DiagnosticTest::Progress,
-            DiagnosticTest::All,
-        ] {
+    fn each_pattern_contains_its_signature_content() {
+        let cases: [(DiagnosticTest, &[&str]); 6] = [
+            (DiagnosticTest::Glyphs, &["A", "z", "0", "~", "!", "@"]),
+            (DiagnosticTest::Attrs, &["[1m", "[3m", "[4m", "[9m", "[7m"]),
+            // 256-color and truecolor background SGR.
+            (DiagnosticTest::Colors, &["48;5;", "48;2;"]),
+            (
+                DiagnosticTest::Unicode,
+                &["|你|好|", "e\u{0301}", "👨\u{200d}👩"],
+            ),
+            (
+                DiagnosticTest::Boxes,
+                &["┌───┬───┐", "╔═══╦═══╗", "╰───┴───╯"],
+            ),
+            // The static progress fallback is one OSC 9;4 frame.
+            (DiagnosticTest::Progress, &["\x1b]9;4;1;50\x07"]),
+        ];
+        for (test, markers) in cases {
             let s = render(test);
-            assert!(!s.is_empty(), "{} pattern is empty", test.name());
-        }
-    }
-
-    #[test]
-    fn progress_fallback_emits_osc_9_4() {
-        let s = render(DiagnosticTest::Progress);
-        assert!(s.contains("\x1b]9;4;"), "progress fallback missing OSC 9;4");
-    }
-
-    #[test]
-    fn colors_uses_indexed_and_truecolor_sgr() {
-        let s = render(DiagnosticTest::Colors);
-        assert!(s.contains("48;5;"), "missing 256-color background SGR");
-        assert!(s.contains("48;2;"), "missing truecolor background SGR");
-    }
-
-    #[test]
-    fn attrs_exercises_the_sgr_codes() {
-        let s = render(DiagnosticTest::Attrs);
-        for sgr in ["[1m", "[3m", "[4m", "[9m", "[7m"] {
-            assert!(s.contains(sgr), "attrs missing SGR {sgr}");
+            for m in markers {
+                assert!(s.contains(m), "{} pattern missing {m:?}", test.name());
+            }
         }
     }
 
@@ -296,14 +286,6 @@ mod tests {
                 "`all` missing the {} section",
                 test.name()
             );
-        }
-    }
-
-    #[test]
-    fn glyphs_covers_printable_ascii() {
-        let s = render(DiagnosticTest::Glyphs);
-        for ch in ['A', 'z', '0', '~', '!', '@'] {
-            assert!(s.contains(ch), "glyphs missing ASCII {ch:?}");
         }
     }
 }

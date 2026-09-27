@@ -460,9 +460,6 @@ mod tests {
     use super::*;
     use crate::theme::Rgb;
 
-    /// catppuccin-macchiato — the default theme's background.
-    const DEFAULT_BG: Rgb = Rgb::new(0x24, 0x27, 0x3a);
-
     /// A config with nothing set, i.e. every resolver on its default path.
     fn empty_config() -> KmuxConfig {
         KmuxConfig::default()
@@ -474,52 +471,30 @@ mod tests {
 
     // ── Theme ────────────────────────────────────────────────────────────────
 
+    /// `--theme` beats the `theme` key beats the default; an unknown name at
+    /// either level falls back to the default. `(label, config, cli, expected)`.
     #[test]
-    fn theme_cli_flag_selects_a_builtin() {
-        let theme = resolve_theme_from(&empty_config(), Some("dracula"));
-        assert_eq!(theme.bg, Rgb::new(0x28, 0x2a, 0x36));
-    }
-
-    #[test]
-    fn theme_defaults_when_neither_cli_nor_config_names_one() {
-        assert_eq!(resolve_theme_from(&empty_config(), None).bg, DEFAULT_BG);
-    }
-
-    #[test]
-    fn theme_cli_flag_wins_over_the_config_key() {
-        let cfg = config_from(r#"theme = "dracula""#);
-        let theme = resolve_theme_from(&cfg, Some("nord"));
-        assert_ne!(
-            theme.bg,
-            Rgb::new(0x28, 0x2a, 0x36),
-            "--theme must override the configured theme, not be overridden by it"
-        );
-    }
-
-    #[test]
-    fn theme_comes_from_the_config_key_when_no_cli_flag() {
-        let cfg = config_from(r#"theme = "dracula""#);
-        assert_eq!(
-            resolve_theme_from(&cfg, None).bg,
-            Rgb::new(0x28, 0x2a, 0x36)
-        );
-    }
-
-    #[test]
-    fn an_unknown_cli_theme_falls_back_to_the_default_not_to_the_config() {
-        // Precedence detail worth pinning: a typo in --theme must not silently
-        // hand back the configured theme, or the flag would look like it worked.
-        let cfg = config_from(r#"theme = "dracula""#);
-        assert_eq!(
-            resolve_theme_from(&cfg, Some("does-not-exist")).bg,
-            DEFAULT_BG
-        );
-    }
-
-    #[test]
-    fn an_unknown_config_theme_falls_back_to_the_default() {
-        let cfg = config_from(r#"theme = "does-not-exist""#);
-        assert_eq!(resolve_theme_from(&cfg, None).bg, DEFAULT_BG);
+    fn resolve_theme_follows_cli_then_config_then_default() {
+        let dracula = r#"theme = "dracula""#;
+        #[rustfmt::skip]
+        let cases = [
+            ("cli flag selects a builtin", "", Some("dracula"), "dracula"),
+            ("nothing set", "", None, "catppuccin-macchiato"),
+            ("cli flag wins over config", dracula, Some("one-dark"), "one-dark"),
+            ("config key without cli flag", dracula, None, "dracula"),
+            // A typo in --theme must not silently hand back the configured
+            // theme, or the flag would look like it worked.
+            ("unknown cli theme", dracula, Some("does-not-exist"), "catppuccin-macchiato"),
+            ("unknown config theme", r#"theme = "does-not-exist""#, None, "catppuccin-macchiato"),
+        ];
+        for (label, toml_src, cli, expected) in cases {
+            let want = theme::builtin_theme(expected).expect("expected theme is a builtin");
+            assert_eq!(
+                resolve_theme_from(&config_from(toml_src), cli),
+                want,
+                "{label}"
+            );
+        }
     }
 
     #[test]
@@ -562,61 +537,63 @@ status_bg = "#111111"
 
     // ── Font ─────────────────────────────────────────────────────────────────
 
+    /// A non-blank `--font` beats a non-blank `font` key beats the default.
+    /// `(label, config, cli, expected)`.
     #[test]
-    fn font_cli_flag_wins() {
-        let cfg = config_from(r#"font = "Fira Code 13""#);
-        assert_eq!(
-            resolve_font_from(&cfg, Some("JetBrains Mono 12")),
-            "JetBrains Mono 12"
-        );
-    }
-
-    #[test]
-    fn font_blank_cli_flag_falls_through_to_the_config() {
-        let cfg = config_from(r#"font = "Fira Code 13""#);
-        assert_eq!(resolve_font_from(&cfg, Some("   ")), "Fira Code 13");
-    }
-
-    #[test]
-    fn font_comes_from_the_config_when_no_cli_flag() {
-        let cfg = config_from(r#"font = "Fira Code 13""#);
-        assert_eq!(resolve_font_from(&cfg, None), "Fira Code 13");
-    }
-
-    #[test]
-    fn font_defaults_when_nothing_is_set() {
-        assert_eq!(resolve_font_from(&empty_config(), None), DEFAULT_FONT);
-        assert_eq!(resolve_font_from(&empty_config(), Some("  ")), DEFAULT_FONT);
-    }
-
-    #[test]
-    fn a_blank_config_font_falls_through_to_the_default() {
-        let cfg = config_from(r#"font = "   ""#);
-        assert_eq!(resolve_font_from(&cfg, None), DEFAULT_FONT);
+    fn resolve_font_skips_blank_values_down_to_the_default() {
+        let fira = r#"font = "Fira Code 13""#;
+        #[rustfmt::skip]
+        let cases = [
+            ("cli flag wins", fira, Some("JetBrains Mono 12"), "JetBrains Mono 12"),
+            ("blank cli falls through to config", fira, Some("   "), "Fira Code 13"),
+            ("config without cli flag", fira, None, "Fira Code 13"),
+            ("nothing set", "", None, DEFAULT_FONT),
+            ("blank cli, no config", "", Some("  "), DEFAULT_FONT),
+            ("blank config", r#"font = "   ""#, None, DEFAULT_FONT),
+        ];
+        for (label, toml_src, cli, expected) in cases {
+            assert_eq!(
+                resolve_font_from(&config_from(toml_src), cli),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     // ── Cursor blink ─────────────────────────────────────────────────────────
 
+    /// CLI beats config beats the default (on — real terminals blink).
+    /// `(label, config, cli, expected)`.
     #[test]
-    fn cursor_blink_cli_flag_wins_over_the_config() {
-        let cfg = config_from("cursor_blink = false");
-        assert!(resolve_cursor_blink_from(&cfg, Some(true)));
-        let cfg = config_from("cursor_blink = true");
-        assert!(!resolve_cursor_blink_from(&cfg, Some(false)));
-    }
-
-    #[test]
-    fn cursor_blink_comes_from_the_config_when_no_cli_flag() {
-        let cfg = config_from("cursor_blink = false");
-        assert!(!resolve_cursor_blink_from(&cfg, None));
-    }
-
-    #[test]
-    fn cursor_blink_defaults_to_true() {
-        assert!(
-            resolve_cursor_blink_from(&empty_config(), None),
-            "real terminals blink by default"
-        );
+    fn resolve_cursor_blink_follows_cli_then_config_then_default() {
+        let cases = [
+            (
+                "cli on over config off",
+                "cursor_blink = false",
+                Some(true),
+                true,
+            ),
+            (
+                "cli off over config on",
+                "cursor_blink = true",
+                Some(false),
+                false,
+            ),
+            (
+                "config off without cli",
+                "cursor_blink = false",
+                None,
+                false,
+            ),
+            ("nothing set", "", None, true),
+        ];
+        for (label, toml_src, cli, expected) in cases {
+            assert_eq!(
+                resolve_cursor_blink_from(&config_from(toml_src), cli),
+                expected,
+                "{label}"
+            );
+        }
     }
 
     // ── Renderer, nested warning, perf counters ──────────────────────────────
@@ -728,14 +705,6 @@ adjust-cell-height = "10%"
     }
 
     // ── File format ──────────────────────────────────────────────────────────
-
-    #[test]
-    fn config_parses_theme_and_font_fields() {
-        let cfg = config_from(r#"theme = "dracula""#);
-        assert_eq!(cfg.theme.as_deref(), Some("dracula"));
-        let cfg = config_from(r#"font = "Fira Code 13""#);
-        assert_eq!(cfg.font.as_deref(), Some("Fira Code 13"));
-    }
 
     #[test]
     fn an_empty_config_leaves_every_field_unset() {

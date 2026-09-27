@@ -571,6 +571,42 @@ mod tests {
         LayoutNode::Leaf { pane_index: i }
     }
 
+    fn split(dir: SplitDir, a: u32, b: u32) -> LayoutNode {
+        LayoutNode::Split {
+            dir,
+            ratios: vec![500, 500],
+            children: vec![leaf(a), leaf(b)],
+        }
+    }
+
+    /// `[a | b]`, even halves.
+    fn hsplit(a: u32, b: u32) -> LayoutNode {
+        split(SplitDir::Horizontal, a, b)
+    }
+
+    /// `a` over `b`, even halves.
+    fn vsplit(a: u32, b: u32) -> LayoutNode {
+        split(SplitDir::Vertical, a, b)
+    }
+
+    /// `[0 | 1 | 2]` at 30/30/40%.
+    fn fixture_three_way() -> LayoutNode {
+        LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![300, 300, 400],
+            children: vec![leaf(0), leaf(1), leaf(2)],
+        }
+    }
+
+    /// Tall left pane 0; the right half split into 1 (top) over 2 (bottom).
+    fn fixture_l_shape() -> LayoutNode {
+        LayoutNode::Split {
+            dir: SplitDir::Horizontal,
+            ratios: vec![500, 500],
+            children: vec![leaf(0), vsplit(1, 2)],
+        }
+    }
+
     #[test]
     fn single_leaf_fills_area() {
         let rects = resolve_layout(&leaf(0), 80, 24, &cfg_no_gutter());
@@ -589,11 +625,7 @@ mod tests {
 
     #[test]
     fn horizontal_split_halves_width_and_tiles_exactly() {
-        let tree = LayoutNode::Split {
-            dir: SplitDir::Horizontal,
-            ratios: vec![500, 500],
-            children: vec![leaf(0), leaf(1)],
-        };
+        let tree = hsplit(0, 1);
         let rects = resolve_layout(&tree, 80, 24, &cfg_no_gutter());
         assert_eq!(rects.len(), 2);
         assert_eq!(rects[0].col, 0);
@@ -615,11 +647,7 @@ mod tests {
 
     #[test]
     fn gutters_are_subtracted_before_apportioning() {
-        let tree = LayoutNode::Split {
-            dir: SplitDir::Horizontal,
-            ratios: vec![500, 500],
-            children: vec![leaf(0), leaf(1)],
-        };
+        let tree = hsplit(0, 1);
         // 1-col gutter: 81 - 1 = 80 split into 40/40, gutter at col 40.
         let rects = resolve_layout(&tree, 81, 24, &LayoutConfig::default());
         assert_eq!(rects[0].col, 0);
@@ -630,19 +658,7 @@ mod tests {
 
     #[test]
     fn nested_split_resolves_recursively() {
-        // Left half a single pane; right half split vertically into two.
-        let tree = LayoutNode::Split {
-            dir: SplitDir::Horizontal,
-            ratios: vec![500, 500],
-            children: vec![
-                leaf(0),
-                LayoutNode::Split {
-                    dir: SplitDir::Vertical,
-                    ratios: vec![500, 500],
-                    children: vec![leaf(1), leaf(2)],
-                },
-            ],
-        };
+        let tree = fixture_l_shape();
         let rects = resolve_layout(&tree, 80, 24, &cfg_no_gutter());
         assert_eq!(rects.len(), 3);
         // Leaf order is depth-first left-to-right.
@@ -658,25 +674,9 @@ mod tests {
     }
 
     #[test]
-    fn resolution_is_deterministic() {
-        let tree = LayoutNode::Split {
-            dir: SplitDir::Horizontal,
-            ratios: vec![300, 300, 400],
-            children: vec![leaf(0), leaf(1), leaf(2)],
-        };
-        let a = resolve_layout(&tree, 97, 31, &LayoutConfig::default());
-        let b = resolve_layout(&tree, 97, 31, &LayoutConfig::default());
-        assert_eq!(a, b, "same input must yield identical rects");
-    }
-
-    #[test]
     fn focus_neighbor_horizontal() {
         // Two panes side by side: 0 | 1.
-        let tree = LayoutNode::Split {
-            dir: SplitDir::Horizontal,
-            ratios: vec![500, 500],
-            children: vec![leaf(0), leaf(1)],
-        };
+        let tree = hsplit(0, 1);
         let rects = resolve_layout(&tree, 80, 24, &cfg_no_gutter());
         assert_eq!(focus_neighbor(&rects, 0, FocusDir::Right), Some(1));
         assert_eq!(focus_neighbor(&rects, 1, FocusDir::Left), Some(0));
@@ -686,36 +686,13 @@ mod tests {
     }
 
     #[test]
-    fn focus_neighbor_prefers_overlap() {
-        // Left tall pane 0; right side split into top (1) and bottom (2).
-        let tree = LayoutNode::Split {
-            dir: SplitDir::Horizontal,
-            ratios: vec![500, 500],
-            children: vec![
-                leaf(0),
-                LayoutNode::Split {
-                    dir: SplitDir::Vertical,
-                    ratios: vec![500, 500],
-                    children: vec![leaf(1), leaf(2)],
-                },
-            ],
-        };
-        let rects = resolve_layout(&tree, 80, 24, &cfg_no_gutter());
-        // Moving right from the tall left pane lands on the top-right pane
-        // (first by distance tie, then it overlaps rows 0..12).
-        let n = focus_neighbor(&rects, 0, FocusDir::Right);
-        assert!(n == Some(1) || n == Some(2));
+    fn focus_neighbor_moves_vertically_within_a_column() {
+        // Horizontal moves across uneven columns are pinned by
+        // `focus_neighbor_breaks_distance_ties_by_perpendicular_overlap`.
+        let rects = resolve_layout(&fixture_l_shape(), 80, 24, &cfg_no_gutter());
         // From the top-right pane, down goes to the bottom-right pane.
         assert_eq!(focus_neighbor(&rects, 1, FocusDir::Down), Some(2));
         assert_eq!(focus_neighbor(&rects, 2, FocusDir::Up), Some(1));
-    }
-
-    fn hsplit(a: u32, b: u32) -> LayoutNode {
-        LayoutNode::Split {
-            dir: SplitDir::Horizontal,
-            ratios: vec![500, 500],
-            children: vec![leaf(a), leaf(b)],
-        }
     }
 
     #[test]
@@ -757,18 +734,7 @@ mod tests {
 
     #[test]
     fn resize_picks_nearest_ancestor_on_each_axis() {
-        // Left leaf 0; right half is a vertical split of 1 (top) / 2 (bottom).
-        let tree = LayoutNode::Split {
-            dir: SplitDir::Horizontal,
-            ratios: vec![500, 500],
-            children: vec![leaf(0), {
-                LayoutNode::Split {
-                    dir: SplitDir::Vertical,
-                    ratios: vec![500, 500],
-                    children: vec![leaf(1), leaf(2)],
-                }
-            }],
-        };
+        let tree = fixture_l_shape();
         // Horizontal resize of pane 1 acts on the root split (child 1 = the
         // right subtree), growing the whole right column.
         let (path, ratios) = resize_split(&tree, 1, FocusDir::Right, 50).unwrap();
@@ -802,14 +768,6 @@ mod tests {
 
     // ── Dividers ─────────────────────────────────────────────────────────────
 
-    fn vsplit(a: u32, b: u32) -> LayoutNode {
-        LayoutNode::Split {
-            dir: SplitDir::Vertical,
-            ratios: vec![500, 500],
-            children: vec![leaf(a), leaf(b)],
-        }
-    }
-
     #[test]
     fn dividers_single_leaf_is_empty() {
         // A single leaf (also what a zoomed `render_layout()` collapses to) has
@@ -835,11 +793,7 @@ mod tests {
 
     #[test]
     fn dividers_three_way_has_two() {
-        let tree = LayoutNode::Split {
-            dir: SplitDir::Horizontal,
-            ratios: vec![300, 300, 400],
-            children: vec![leaf(0), leaf(1), leaf(2)],
-        };
+        let tree = fixture_three_way();
         let divs = resolve_dividers(&tree, 100, 24, &cfg_no_gutter());
         assert_eq!(divs.len(), 2);
         assert_eq!(divs[0].before, 0);
@@ -849,12 +803,7 @@ mod tests {
 
     #[test]
     fn dividers_nested_both_axes() {
-        // Left leaf 0; right half a vertical split of 1 (top) / 2 (bottom).
-        let tree = LayoutNode::Split {
-            dir: SplitDir::Horizontal,
-            ratios: vec![500, 500],
-            children: vec![leaf(0), vsplit(1, 2)],
-        };
+        let tree = fixture_l_shape();
         let divs = resolve_dividers(&tree, 80, 24, &cfg_no_gutter());
         assert_eq!(divs.len(), 2);
         // Root horizontal divider between the left pane and the right column.
@@ -873,11 +822,7 @@ mod tests {
         // Each flat-split divider sits in the gutter right after the matching
         // pane rect — proving `resolve_dividers` and `resolve_layout` share
         // `child_extents` and never drift.
-        let tree = LayoutNode::Split {
-            dir: SplitDir::Horizontal,
-            ratios: vec![300, 300, 400],
-            children: vec![leaf(0), leaf(1), leaf(2)],
-        };
+        let tree = fixture_three_way();
         let rects = resolve_layout(&tree, 100, 24, &LayoutConfig::default());
         let divs = resolve_dividers(&tree, 100, 24, &LayoutConfig::default());
         for d in &divs {
@@ -916,21 +861,8 @@ mod tests {
     }
 
     #[test]
-    fn drag_is_deterministic() {
-        let tree = hsplit(0, 1);
-        let divs = resolve_dividers(&tree, 97, 31, &LayoutConfig::default());
-        let a = ratios_for_drag(&tree, &divs[0], 30);
-        let b = ratios_for_drag(&tree, &divs[0], 30);
-        assert_eq!(a, b);
-    }
-
-    #[test]
     fn drag_only_touches_the_pair_in_a_three_way() {
-        let tree = LayoutNode::Split {
-            dir: SplitDir::Horizontal,
-            ratios: vec![300, 300, 400],
-            children: vec![leaf(0), leaf(1), leaf(2)],
-        };
+        let tree = fixture_three_way();
         let divs = resolve_dividers(&tree, 100, 24, &cfg_no_gutter());
         // Drag the first divider (between panes 0 and 1); pane 2 is untouched.
         let ratios = ratios_for_drag(&tree, &divs[0], 15).unwrap();
@@ -994,11 +926,7 @@ mod tests {
     fn resize_split_handles_a_flat_three_way_split() {
         // The 2-pane tests never exercise n > 2. Growing the middle pane trades
         // only with its next sibling, leaving the first pane untouched.
-        let tree = LayoutNode::Split {
-            dir: SplitDir::Horizontal,
-            ratios: vec![300, 300, 400],
-            children: vec![leaf(0), leaf(1), leaf(2)],
-        };
+        let tree = fixture_three_way();
         let (path, ratios) = resize_split(&tree, 1, FocusDir::Right, 50).unwrap();
         assert_eq!(path, Vec::<u32>::new());
         assert_eq!(ratios, vec![300, 350, 350], "pane 1 grows into pane 2 only");
