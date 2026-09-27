@@ -208,7 +208,9 @@ impl OutageInput {
         };
         self.keystrokes = 0;
         self.first_held_at = None;
-        if self.dropped > 0 {
+        // Report this outage's drops once: a later flush with no outage in
+        // between (a manual reconnect) must not bring an old notice back.
+        if self.dropped > 0 && self.dropped_notice_until.is_none() {
             self.dropped_notice_until = Some(now + DROPPED_NOTICE);
         }
         sent
@@ -501,6 +503,11 @@ mod tests {
 
         assert_eq!(input.dropped_notice(now + DROPPED_NOTICE / 2), Some(259));
         assert_eq!(input.dropped_notice(now + DROPPED_NOTICE), None);
+
+        // A later flush with no outage in between does not bring it back.
+        let later = now + DROPPED_NOTICE * 2;
+        input.flush(later, true);
+        assert_eq!(input.dropped_notice(later), None);
 
         // The next outage starts from nothing dropped.
         input.begin();
