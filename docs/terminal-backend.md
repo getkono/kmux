@@ -97,21 +97,25 @@ degrades gracefully when `0` is passed to the emulator.
 
 ```rust
 pub trait BackendEventSink: Send + Sync + 'static {
-    fn on_title(&self, _title: &str) {}
-    fn on_bell(&self) {}
-    fn on_osc52_copy(&self, _selection: &str, _base64_data: &str) {}
-    fn on_progress(&self, _state: PaneProgressState, _progress: Option<u8>) {}
-    fn on_hyperlink(&self, _id: Option<&str>, _uri: &str) {}
+    fn on_control_event(&self, _event: ControlEvent<'_>) {}
 }
 ```
 
-**All implementations MUST NOT block.** The sink is called from inside the VT
-parser loop (`feed()`).  Any I/O must be pushed to an unbounded `mpsc` channel
-and drained from a separate task.
+One method, one value: every VT sequence kmux intercepts arrives as a variant
+of `ControlEvent` (`crates/kmux-vt-core/src/backend/control_event.rs`) —
+`Title`, `Bell`, `Osc52Copy`, `Progress`, `Hyperlink` and `PtyResponse` — and
+each consumer handles it in one `match` (the daemon's `PaneEventSink`, the
+isolated worker's `WorkerEventSink`). What each interception is for is in
+[architecture-vt-sequences.md](architecture-vt-sequences.md).
 
-`GhosttyBackend` installs a thin adapter that forwards libghostty-vt events to
-whichever `Arc<dyn BackendEventSink>` the host passes in.  `NullEventSink`
-(no-op) is used in code paths that do not need backend events.
+**All implementations MUST NOT block.** The sink is called from inside the VT
+parser loop (`feed()`), and a variant's borrowed payload lives only for the
+call. Any I/O must be pushed to a channel and drained from a separate task.
+
+`GhosttyBackend` installs a thin adapter (`EventSinkAdapter`) that turns each
+libghostty-vt callback into a `ControlEvent` for whichever
+`Arc<dyn BackendEventSink>` the host passes in. `NullEventSink` (no-op, behind
+the `test-util` feature) is used in tests that do not need backend events.
 
 ## Dynamic colours: OSC 4 / 10 / 11 / 104 and the kitty colour protocol (OSC 21)
 
@@ -439,7 +443,7 @@ Implements [#125](https://github.com/getkono/kmux/issues/125):
 the ConEmu / Windows-Terminal progress report (`OSC 9 ; 4 ; state ; pct`), which
 Ghostty renders as a thin bar. libghostty-vt already parses it into a
 `progress_report` action; the kmux Zig wrapper now intercepts it (C ABI v4) and
-the daemon surfaces it through `BackendEventSink::on_progress`.
+the daemon surfaces it as `ControlEvent::Progress`.
 
 - `PaneInfo` carries `progress_state: PaneProgressState` (`Remove`/`Set`/`Error`/
   `Indeterminate`/`Pause`, `Remove` until the program emits one) and
@@ -447,7 +451,7 @@ the daemon surfaces it through `BackendEventSink::on_progress`.
   the daemon from `PaneRelay.progress`, so a late-attaching client sees the
   current bar in the snapshot — the cross-client tracking the issue requires.
 - New `SessionEventMsg::PaneProgressChanged { pane_id, state, progress }`,
-  broadcast like `PaneTitleChanged`: `PaneEventSink::on_progress` dedups against
+  broadcast like `PaneTitleChanged`: `PaneEventSink` dedups a `Progress` against
   the relay's stored state, stores the new value, and pushes the event to every
   attached client. `GhosttyBackend::feed` also pulls `term.progress()` (the same
   cold-attach guard as the title) so a report that fires before any subscriber

@@ -260,7 +260,7 @@ can tile several panes). The end-to-end path reuses the OSC 0/2 title pipeline:
 ```
 libghostty-vt parses 9;4 → kmux Zig wrapper Handler.vt(.progress_report)  (C ABI v4)
   → kmux-ghostty EventSink::on_progress(ProgressReport)
-  → kmuxd BackendEventSink::on_progress(PaneProgressState, Option<u8>)
+  → kmuxd BackendEventSink::on_control_event(ControlEvent::Progress { state, progress })
   → PaneEventSink: dedup + store in PaneRelay.progress + broadcast PaneProgressChanged
                    (+ PaneInfo snapshot carries it, so late clients see the bar)
   → client SessionManager updates cached PaneInfo
