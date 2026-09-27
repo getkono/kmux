@@ -262,6 +262,13 @@ mod listener {
         /// [`AcceptError::HandshakeTimeout`] when it takes longer than
         /// `timeout`, or the transport's own error when it fails.
         pub async fn establish(self, timeout: Duration) -> Result<IncomingSession, AcceptError> {
+            #[cfg_attr(
+                not(feature = "quic"),
+                expect(
+                    clippy::infallible_destructuring_match,
+                    reason = "a second variant exists with the `quic` feature"
+                )
+            )]
             let handshake = match self.stage {
                 Stage::Handshake(handshake) => handshake,
                 #[cfg(feature = "quic")]
