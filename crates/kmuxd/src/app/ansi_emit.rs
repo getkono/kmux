@@ -203,21 +203,36 @@ mod tests {
             .collect()
     }
 
-    /// A pane inherited across a handoff shows exactly the screen it had: the
-    /// same rows in the same places and the cursor where it was. A line break
-    /// after the last row once scrolled the whole screen up a line, taking
-    /// the top row off it — a fresh shell's prompt, which is often all there is.
+    /// A pane inherited across a handoff shows exactly the screen it had: its
+    /// history above, the same rows in the same places, and the cursor where
+    /// it was. A line break after the last row once scrolled the whole screen
+    /// up a line, taking the top row into the history — a fresh shell's
+    /// prompt, which is often all there is.
     #[test]
     fn an_inherited_screen_is_seeded_exactly() {
         let before = fixture_term_state(4, 20);
-        lock_term_state(&before).feed(b"top\r\n\r\nthird\r\nlast\x1b[2;3H");
+        // Styled cells, so the seed has to reproduce attributes and colours,
+        // not just text.
+        lock_term_state(&before)
+            .feed(b"\x1b[1;31mtop\x1b[0m\r\n\r\nthird\r\n\x1b[4;44mlast\x1b[0m\x1b[2;3H");
         let snapshot = lock_term_state(&before).snapshot();
+        let mut history = vec![CellState::default(); 20];
+        for (cell, c) in history.iter_mut().zip("older".chars()) {
+            cell.c = c;
+        }
 
         let after = fixture_term_state(4, 20);
-        lock_term_state(&after).feed(&snapshot_to_ansi(&snapshot, &[], false));
+        let preamble = snapshot_to_ansi(&snapshot, &[history], false);
+        let diffs = Arc::new(Mutex::new(DiffBuffer::new(64 * 1024)));
+        seed_pane_with_preamble(&after, &diffs, &Arc::new(AtomicU64::new(1)), &preamble);
         let seeded = lock_term_state(&after).snapshot();
 
         assert_eq!(rows_of(&seeded), ["top", "", "third", "last"]);
+        assert!(
+            seeded.cells == snapshot.cells,
+            "every cell, styled as it was"
+        );
         assert_eq!((seeded.cursor.row, seeded.cursor.col), (1, 2));
+        assert_eq!(seeded.history_total, 1, "the one history line, no more");
     }
 }

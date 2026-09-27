@@ -1314,8 +1314,16 @@ mod tests {
         // nowhere left to put it, not until the first `EAGAIN`.
         let chunk = [b'x'; 4096];
         let mut written = 0usize;
+        // The verdict is the poll that ended the loop, not a second one: a
+        // flush still in flight could free room again between the two.
         let deadline = std::time::Instant::now() + GUARD;
-        while !input_blocked(master) && std::time::Instant::now() < deadline {
+        let blocked = loop {
+            if input_blocked(master) {
+                break true;
+            }
+            if std::time::Instant::now() >= deadline {
+                break false;
+            }
             match nix::unistd::write(master, &chunk) {
                 Ok(n) => written += n,
                 Err(nix::errno::Errno::EAGAIN) => {
@@ -1323,8 +1331,8 @@ mod tests {
                 }
                 Err(e) => panic!("write to the master: {e}"),
             }
-        }
-        assert!(input_blocked(master), "still room after {written} bytes");
+        };
+        assert!(blocked, "still room after {written} bytes");
     }
 
     /// A worker whose stream went bad is killed rather than waited on; one

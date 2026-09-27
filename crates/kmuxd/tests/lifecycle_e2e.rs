@@ -60,9 +60,9 @@ async fn a_shell_exit_reaches_the_attached_client_with_its_status() {
 /// that missed more than is worth replaying is reset with a fresh snapshot
 /// instead. (The other way to fall that far behind, a seqno older than the
 /// 10 MiB of diffs a pane keeps, is answered the same way; `compute_replay`'s
-/// unit tests pin both.) The output the client misses
-/// is typed by a second client that never leaves, and that client's screen
-/// says when it has happened.
+/// unit tests pin both.) The output the client misses is typed by a second
+/// client that never leaves, and that client's screen says when it has
+/// happened.
 #[tokio::test]
 async fn a_returning_client_is_sent_what_it_missed_or_reset_when_too_far_behind() {
     let sandbox = Sandbox::new();

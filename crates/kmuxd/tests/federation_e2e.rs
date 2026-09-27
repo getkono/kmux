@@ -70,8 +70,8 @@ fn snapshot_text(snapshot: &GridSnapshot) -> String {
     snapshot.cells.iter().map(|c| c.c).collect()
 }
 
-/// Send `request` to the hub as `gui` and return the first thing `want` picks
-/// out of what the hub sends back.
+/// Send `request` as `gui` and return the first thing `want` picks out of
+/// what the daemon sends back.
 async fn ask<T>(
     gui: &mut Client,
     request: ClientMessage,

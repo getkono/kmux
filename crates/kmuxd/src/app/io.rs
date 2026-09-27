@@ -259,22 +259,19 @@ mod tests {
     async fn the_input_lock_is_held_by_one_client_until_it_releases() {
         let (app, word, pane_id) = app_with_one_pane().await;
         let (holder, other) = (ClientId(1), ClientId(2));
+        // Granted is `Ok`, denied is `Err` naming the holder.
         let request = async |client| match app.request_input_lock(&pane_id, client).await {
-            Ok(InputLockOutcome::Granted) => Some(client),
-            Ok(InputLockOutcome::Denied(holder)) => Some(holder),
-            Err(_) => None,
+            Ok(InputLockOutcome::Granted) => Ok(()),
+            Ok(InputLockOutcome::Denied(holder)) => Err(Some(holder)),
+            Err(_) => Err(None),
         };
 
-        assert_eq!(request(holder).await, Some(holder), "granted");
-        assert_eq!(request(holder).await, Some(holder), "granted again");
-        assert_eq!(
-            request(other).await,
-            Some(holder),
-            "denied, naming the holder"
-        );
+        assert_eq!(request(holder).await, Ok(()), "granted");
+        assert_eq!(request(holder).await, Ok(()), "granted again");
+        assert_eq!(request(other).await, Err(Some(holder)), "denied");
         assert!(!app.release_input_lock(&pane_id, other).await.unwrap());
         assert!(app.release_input_lock(&pane_id, holder).await.unwrap());
-        assert_eq!(request(other).await, Some(other), "open again");
+        assert_eq!(request(other).await, Ok(()), "open again");
 
         let _ = app.close_session(&word).await;
     }
