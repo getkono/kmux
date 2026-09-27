@@ -281,7 +281,7 @@ alternative backends.
 | `OSC 7 … BEL/ST` | Set current working directory | **Unimplemented** | URI not extracted or forwarded |
 | `OSC 8 ; … ; uri BEL/ST` | Hyperlink | **Unimplemented** | `ControlEvent::Hyperlink` seam exists; no forwarding yet |
 | `OSC 10 / 11 BEL/ST` | Query default fg/bg colour | **Partial** | Parsed; query responses not implemented (no back-channel to the application from the emulator) |
-| `OSC 52 ; … BEL/ST` | Clipboard write (set) | **Stable** | `on_osc52_copy()` broadcasts `PaneClipboardCopy` server-wide; the client writes it to the system clipboard, honoring writes from any pane in the session it is viewing (last-in-wins). Clipboard *read* (`OSC 52 ; … ; ?`) is not answered (no client→server clipboard channel) |
+| `OSC 52 ; … BEL/ST` | Clipboard write (set) | **Stable** | `ControlEvent::Osc52Copy` broadcasts `PaneClipboardCopy` server-wide; the client writes it to the system clipboard, honoring writes from any pane in the session it is viewing (last-in-wins). Clipboard *read* (`OSC 52 ; … ; ?`) is not answered (no client→server clipboard channel) |
 | `OSC 133 / 633` | Shell integration / semantic zones | **Not planned** | |
 | `OSC 1337` | iTerm2 inline images | **Unimplemented** | Parsed by libghostty-vt; image data dropped silently (Phase A) |
 | `OSC 9 ; 4 ; state ; pct BEL/ST` | ConEmu / Windows Terminal progress report | **Stable** | `ControlEvent::Progress` stores the latest state per pane in the relay (carried in the `PaneInfo` snapshot so late clients see it) and broadcasts `PaneProgressChanged`; rendered as a per-pane progress bar (Cairo + Swift). Tested in `event_sink_receives_progress` (issue #125) |
