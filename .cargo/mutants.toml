@@ -58,4 +58,10 @@ exclude_re = [
     # `query_handoff` only resolves this profile's control socket and calls
     # `query_handoff_at`, which is tested against a stand-in socket.
     'crates/kmux-connect/src/daemon/mod\.rs:.*replace query_handoff -> ',
+    # `KmuxDriver::connection_banner` only locks the driver and converts
+    # `FrontendDriver::connection_banner`, whose logic is unit-tested in
+    # kmux-app; a `KmuxDriver` owns a runtime and bootstraps a daemon, so no
+    # Rust test builds one — the registered kmux-ffi dispatch exception
+    # (issue #208).
+    'crates/kmux-ffi/src/driver\.rs:.*replace KmuxDriver::connection_banner -> ',
 ]

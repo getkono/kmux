@@ -73,19 +73,21 @@ struct ConnectionBadge: View {
     }
 }
 
-/// Connecting / disconnected banner over the terminal, driven by `mode()` —
-/// the analog of kmux-gtk's `adw::Banner`.
+/// Connection banner over the terminal — the analog of kmux-gtk's
+/// `adw::Banner`: the connecting / disconnected modes from `mode()`, else the
+/// driver's link banner (automatic reconnect, unreachable daemon, dropped
+/// keystrokes; issue #208).
 struct ConnectionBanner: View {
     @ObservedObject var model: KmuxModel
 
     var body: some View {
         if let banner = banner {
             HStack(spacing: 10) {
-                Image(systemName: banner.reconnect ? "wifi.exclamationmark" : "arrow.triangle.2.circlepath")
-                    .foregroundStyle(banner.reconnect ? .orange : model.theme.chrome.accent)
+                Image(systemName: banner.button != nil ? "wifi.exclamationmark" : "arrow.triangle.2.circlepath")
+                    .foregroundStyle(banner.button != nil ? .orange : model.theme.chrome.accent)
                 Text(banner.text)
-                if banner.reconnect {
-                    Button("Reconnect") { model.dispatch(.reconnect) }
+                if let label = banner.button {
+                    Button(label) { model.dispatch(.reconnect) }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                 }
@@ -100,11 +102,13 @@ struct ConnectionBanner: View {
         }
     }
 
-    private var banner: (text: String, reconnect: Bool)? {
+    private var banner: (text: String, button: String?)? {
         switch model.mode {
-        case .connecting(let label): return ("Connecting to \(label)…", false)
-        case .disconnected(let reason): return ("Disconnected: \(reason)", true)
-        default: return nil
+        case .connecting(let label): return ("Connecting to \(label)…", nil)
+        case .disconnected(let reason): return ("Disconnected: \(reason)", "Reconnect")
+        default:
+            guard let link = model.connectionBanner else { return nil }
+            return (link.text, link.reconnecting ? "Reconnect now" : nil)
         }
     }
 }

@@ -155,14 +155,39 @@ fn conn_visual(state: &ConnectionState) -> (&'static str, &'static str, &'static
         ConnectionState::Connected { .. } => {
             ("network-transmit-receive-symbolic", "Connected", "success")
         }
-        ConnectionState::Handshaking | ConnectionState::Reconnecting { .. } => {
-            ("network-transmit-symbolic", "Connecting…", "warning")
-        }
+        ConnectionState::Handshaking => ("network-transmit-symbolic", "Connecting…", "warning"),
+        ConnectionState::Reconnecting { .. } => (
+            "network-transmit-symbolic",
+            "Reconnecting — click to retry now",
+            "warning",
+        ),
         ConnectionState::Disconnected { .. } => (
             "network-offline-symbolic",
             "Disconnected — click to reconnect",
             "error",
         ),
         ConnectionState::Idle => ("network-idle-symbolic", "Idle", "dim-label"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use kmux_client::connection_state::ConnectionState;
+
+    use super::conn_visual;
+
+    /// A link being retried says so, and that a click retries now (issue
+    /// #208).
+    #[test]
+    fn conn_visual_names_a_reconnect_as_such() {
+        assert_eq!(
+            conn_visual(&ConnectionState::Reconnecting { attempt: 3 }),
+            (
+                "network-transmit-symbolic",
+                "Reconnecting — click to retry now",
+                "warning"
+            )
+        );
+        assert_eq!(conn_visual(&ConnectionState::Handshaking).1, "Connecting…");
     }
 }

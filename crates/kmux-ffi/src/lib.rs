@@ -113,7 +113,7 @@ pub use renderer::KmuxRenderer;
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol range).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 26;
+pub const KMUX_FFI_ABI_VERSION: u32 = 27;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.

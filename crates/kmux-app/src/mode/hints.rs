@@ -69,7 +69,7 @@ pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
         Mode::AddRemote => vec![("Enter", "Add"), ("Esc", "Cancel")],
         Mode::RemoteNewSession { .. } => vec![("Enter", "Create"), ("Esc", "Cancel")],
         Mode::Connecting { .. } => vec![("Esc", "Cancel")],
-        Mode::Disconnected { .. } => vec![("y/Enter", "Reconnect"), ("q", "Quit")],
+        Mode::Disconnected { .. } => vec![("Ctrl+Alt+R", "Reconnect now"), ("q", "Quit")],
         Mode::Command(_) => vec![
             ("Tab", "Complete"),
             ("\u{2191}/\u{2193}", "Hint"),
@@ -175,6 +175,6 @@ pub fn help_entries() -> Vec<(&'static str, &'static str)> {
         ("Shift+PgUp/Dn", "Quick scroll"),
         ("Ctrl+Shift+C", "Copy selection"),
         ("Ctrl+Shift+V", "Paste"),
-        ("Ctrl+Alt+R", "Force reconnect"),
+        ("Ctrl+Alt+R", "Reconnect now"),
     ]
 }

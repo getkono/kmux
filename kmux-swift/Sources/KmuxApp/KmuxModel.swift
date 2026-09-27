@@ -43,6 +43,10 @@ final class KmuxModel: ObservableObject {
     /// Whether a pane is in its soft-close grace window (issue #86), driving the
     /// "Undo close" banner.
     @Published private(set) var softClosePending = false
+    /// The link banner (issue #208): an automatic reconnect in progress, an
+    /// unreachable daemon, or keystrokes an outage dropped. `nil` when there
+    /// is nothing to say.
+    @Published private(set) var connectionBanner: FfiConnectionBanner?
     /// Whether the connection inspector sheet is open (issue #60).
     @Published private(set) var connectionVisible = false
     /// Whether the render-debug overlay is shown (what the renderer is handed
@@ -459,6 +463,8 @@ final class KmuxModel: ObservableObject {
         if met != metricsVisible { metricsVisible = met }
         let pendingClose = driver.softClosePending()
         if pendingClose != softClosePending { softClosePending = pendingClose }
+        let banner = driver.connectionBanner()
+        if banner != connectionBanner { connectionBanner = banner }
         let connVisible = driver.connectionVisible()
         if connVisible != connectionVisible { connectionVisible = connVisible }
         let rd = driver.renderDebugVisible()

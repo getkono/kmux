@@ -571,7 +571,7 @@ pub static ALL: &[CommandSpec] = &[
     CommandSpec {
         name: "reconnect",
         aliases: &[],
-        summary: "Force a reconnect",
+        summary: "Reconnect now (also skips the wait between automatic retries)",
         args: NO_ARGS,
         run: cmd_reconnect,
     },

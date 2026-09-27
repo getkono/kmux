@@ -34,6 +34,34 @@ pub struct FfiConnInfo {
     pub transport_overridden: bool,
 }
 
+/// The link banner (issue #208): reconnecting, unreachable, or keystrokes an
+/// outage dropped. Mirrors `kmux_app::driver::ConnectionBanner`.
+#[derive(Debug, uniffi::Record)]
+pub struct FfiConnectionBanner {
+    /// The line to show.
+    pub text: String,
+    /// The link is down and being retried: offer "Reconnect now".
+    pub reconnecting: bool,
+    /// The retries have gone on long enough to call the daemon unreachable.
+    pub unreachable: bool,
+    /// Keystrokes held for delivery on reconnect.
+    pub queued: u64,
+    /// Keystrokes the outage dropped.
+    pub dropped: u64,
+}
+
+impl From<kmux_app::driver::ConnectionBanner> for FfiConnectionBanner {
+    fn from(b: kmux_app::driver::ConnectionBanner) -> Self {
+        Self {
+            text: b.text,
+            reconnecting: b.reconnecting,
+            unreachable: b.unreachable,
+            queued: b.queued,
+            dropped: b.dropped,
+        }
+    }
+}
+
 /// Recent round-trip-time summary for the active transport (connection
 /// inspector). Mirrors `kmux_app::core::RttInfo`.
 #[derive(uniffi::Record)]

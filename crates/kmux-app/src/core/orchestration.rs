@@ -30,7 +30,14 @@ use super::{AppCore, KeyResult};
 #[derive(Debug)]
 pub enum BootstrapPhase {
     Initial,
+    /// A reconnect the user asked for: the connecting overlay shows.
     Reconnect,
+    /// Automatic reconnect attempt `attempt` after the link dropped (issue
+    /// #208): the UI stays as it is and the connection badge reads
+    /// `Reconnecting`.
+    Resume {
+        attempt: u32,
+    },
 }
 
 /// Result sent from the background bootstrap task to the frontend's run loop.
@@ -620,38 +627,28 @@ impl AppCore {
         phase: BootstrapPhase,
         outcome_tx: mpsc::UnboundedSender<BootstrapTaskResult>,
     ) {
-        if matches!(phase, BootstrapPhase::Reconnect) {
-            info!(
-                connection_id = self.mgr.connection_id.map(|c| c.0),
-                "reconnect requested",
-            );
+        match phase {
+            BootstrapPhase::Resume { attempt } => {
+                info!(
+                    connection_id = self.mgr.connection_id.map(|c| c.0),
+                    attempt, "automatic reconnect attempt",
+                );
+                self.mgr.begin_reconnect_attempt(attempt);
+            }
+            BootstrapPhase::Initial | BootstrapPhase::Reconnect => {
+                let reconnecting = matches!(phase, BootstrapPhase::Reconnect);
+                if reconnecting {
+                    info!(
+                        connection_id = self.mgr.connection_id.map(|c| c.0),
+                        "reconnect requested",
+                    );
+                }
+                self.mgr.prepare_reconnect();
+                self.mode = Mode::Connecting {
+                    target_display: connecting_label(&target, reconnecting),
+                };
+            }
         }
-        self.mgr.prepare_reconnect();
-
-        let target_display = match (&target, &phase) {
-            (ResolvedTarget::LocalDaemon, BootstrapPhase::Initial) => {
-                "Connecting to local daemon…".to_string()
-            }
-            (ResolvedTarget::LocalDaemon, BootstrapPhase::Reconnect) => {
-                "Reconnecting to local daemon…".to_string()
-            }
-            (ResolvedTarget::Ssh { target, .. }, BootstrapPhase::Initial) => {
-                let h = match &target.user {
-                    Some(u) => format!("{u}@{}", target.host),
-                    None => target.host.clone(),
-                };
-                format!("Connecting via SSH to {h}…")
-            }
-            (ResolvedTarget::Ssh { target, .. }, BootstrapPhase::Reconnect) => {
-                let h = match &target.user {
-                    Some(u) => format!("{u}@{}", target.host),
-                    None => target.host.clone(),
-                };
-                format!("Reconnecting via SSH to {h}…")
-            }
-        };
-
-        self.mode = Mode::Connecting { target_display };
         self.request_render();
 
         // Store a clone of the sender so the run loop's outcome arm can
@@ -869,6 +866,25 @@ impl AppCore {
                 other => format!("bootstrap failed: {}", other.badge_label()),
             };
             self.mode = Mode::Disconnected { reason };
+        }
+    }
+}
+
+/// What the connecting overlay says for a user-visible bootstrap of `target`.
+fn connecting_label(target: &ResolvedTarget, reconnecting: bool) -> String {
+    let verb = if reconnecting {
+        "Reconnecting"
+    } else {
+        "Connecting"
+    };
+    match target {
+        ResolvedTarget::LocalDaemon => format!("{verb} to local daemon…"),
+        ResolvedTarget::Ssh { target, .. } => {
+            let h = match &target.user {
+                Some(u) => format!("{u}@{}", target.host),
+                None => target.host.clone(),
+            };
+            format!("{verb} via SSH to {h}…")
         }
     }
 }
