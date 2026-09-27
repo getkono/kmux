@@ -671,9 +671,13 @@ async fn establish(
                 Err(BootstrapError::Auth(reason))
             }
         }
-        Ok(Err(_)) => Err(BootstrapError::Auth(
-            "auth forwarder dropped before AuthResult".into(),
-        )),
+        // The link closed before the daemon answered — it went away mid
+        // handshake (a crash, a restart). Not a refusal: a retry may well
+        // succeed (issue #208).
+        Ok(Err(_)) => Err(BootstrapError::Connect {
+            strategy: "handshake",
+            error: "the connection closed before the daemon answered".into(),
+        }),
         Err(_) => Err(BootstrapError::AuthTimeout(AUTH_TIMEOUT)),
     }
 }
