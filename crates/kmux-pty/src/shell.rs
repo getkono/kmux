@@ -7,7 +7,12 @@ use std::path::Path;
 /// 1. `$SHELL` environment variable
 /// 2. `/bin/sh` as a universal fallback
 pub fn detect_shell() -> Result<String> {
-    if let Ok(shell) = std::env::var("SHELL")
+    shell_from(std::env::var("SHELL").ok())
+}
+
+/// [`detect_shell`] given the value of `$SHELL`.
+fn shell_from(shell_env: Option<String>) -> Result<String> {
+    if let Some(shell) = shell_env
         && !shell.is_empty()
     {
         validate_shell(&shell)?;
@@ -57,8 +62,20 @@ mod tests {
     }
 
     #[test]
-    fn detect_returns_something() {
-        let shell = detect_shell().expect("should detect a shell");
-        assert!(!shell.is_empty());
+    fn shell_from_prefers_shell_env_and_falls_back_to_sh() {
+        let cases = [
+            // Any existing executable passes validation; not the fallback.
+            (Some("/usr/bin/env"), "/usr/bin/env"),
+            (None, "/bin/sh"),
+            (Some(""), "/bin/sh"),
+        ];
+        for (env, expected) in cases {
+            assert_eq!(
+                shell_from(env.map(Into::into)).expect("a shell"),
+                expected,
+                "$SHELL = {env:?}"
+            );
+        }
+        assert!(shell_from(Some("/nonexistent/shell/path".into())).is_err());
     }
 }
