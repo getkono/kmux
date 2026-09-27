@@ -602,9 +602,12 @@ fn probe_verdict(expected: ResumeFrom, msg: &ServerMessage) -> Option<Result<(),
             *failure,
         )));
     }
+    // A link made to a daemon that sent no run can be resumed only by a daemon
+    // that still sends none: one that does is a newer build, so another run.
     let same_run = match (expected.instance, *daemon_instance) {
         (Some(ours), Some(theirs)) => ours == theirs,
-        _ => true,
+        (None, Some(_)) => false,
+        (_, None) => true,
     };
     Some(
         if same_run && *connection_id == Some(expected.connection_id) {
@@ -1242,6 +1245,14 @@ mod tests {
         assert_eq!(
             probe_verdict(expected, &ServerMessage::Ping { seq: 1 }),
             None
+        );
+        let before_runs = ResumeFrom {
+            connection_id: PROBED,
+            instance: None,
+        };
+        assert!(
+            matches!(probe_verdict(before_runs, &ok_auth_result()), Some(Err(_))),
+            "a daemon that now names its run is not the one that named none"
         );
     }
 
