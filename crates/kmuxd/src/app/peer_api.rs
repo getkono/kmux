@@ -268,6 +268,70 @@ impl ServerApp {
         }
     }
 
+    /// `RequestInputLock` on the proxied pane `pane_id`: the hub arbitrates
+    /// its own clients and holds the peer's lock for the one holding its own
+    /// (issue #227).
+    pub fn federated_request_input_lock(
+        &self,
+        from: &Requester,
+        pane_id: &str,
+    ) -> Result<(), Refusal> {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.request_input_lock(from, pane_id)
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (from, pane_id);
+            Ok(())
+        }
+    }
+
+    /// `ReleaseInputLock` on the proxied pane `pane_id`: passed on for the
+    /// holder only (issue #227).
+    pub fn federated_release_input_lock(
+        &self,
+        from: &Requester,
+        pane_id: &str,
+    ) -> Result<(), Refusal> {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.release_input_lock(from, pane_id)
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (from, pane_id);
+            Ok(())
+        }
+    }
+
+    /// Snapshot mode for every proxied pane `client_id` views (issue #227).
+    /// Complements [`ServerApp::set_snapshot_mode`]'s local panes.
+    pub fn set_federated_snapshot_mode(&self, client_id: ClientId, enabled: bool) {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.set_snapshot_mode(client_id, enabled);
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (client_id, enabled);
+        }
+    }
+
+    /// Detach `client_id`'s channel `ctrl` from every proxied pane it views
+    /// and release its input locks there (issue #227). Complements
+    /// [`ServerApp::detach_channel`]'s local panes.
+    pub fn detach_federated_channel(&self, client_id: ClientId, ctrl: &OutboundTx) {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.detach_channel(client_id, ctrl);
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (client_id, ctrl);
+        }
+    }
+
     /// Register a viewer of federated `pane_id` and forward an `Attach` upstream.
     /// `data_tx` is the viewer's bounded pane-stream channel; `ctrl_tx` is its
     /// control lane (never dropped), over which a `Lagged` is delivered out-of-band if
@@ -346,6 +410,14 @@ impl Requester {
     /// The client `id`, answered on its control lane `ctrl`.
     pub(crate) fn client(id: ClientId, ctrl: OutboundTx) -> Self {
         Self::Client { id, ctrl }
+    }
+
+    /// The client this is, if it is one.
+    pub(crate) fn client_id(&self) -> Option<ClientId> {
+        match self {
+            Self::Hub => None,
+            Self::Client { id, .. } => Some(*id),
+        }
     }
 
     /// Whether `self` and `other` are the same sender: the hub, or one

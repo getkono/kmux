@@ -205,16 +205,16 @@ to `ClientMessage::federation`, variant by variant.
 | `SetLayoutRatios` | nothing; as `PaneSwap` | `LayoutUpdate` | yes | — | forwarded |
 | `ApplyLayoutScheme` | nothing; as `PaneSwap`; an `Unknown` scheme is ignored | `LayoutUpdate` | yes | — | forwarded |
 | `SetFocus` | nothing; as `PaneSwap` | `LayoutUpdate` | yes | — | forwarded |
-| `PtyInput` | nothing; `Error PaneNotFound` / `InputLocked` / `InternalError` (queue full) | — | no: bytes are written again | — | forwarded |
+| `PtyInput` | nothing; `Error PaneNotFound` / `InputLocked` / `InternalError` (queue full) | — | no: bytes are written again | — | forwarded, unless another viewer holds the hub's input lock (`InputLocked`) |
 | `PtyKeyBatch` | as `PtyInput` | — | no | — | forwarded, as `PtyInput` |
 | `PtyPaste` | as `PtyInput` | — | no | — | forwarded, as `PtyInput` |
 | `Resize` | nothing; `Error PaneNotFound` | if the pane's smallest-wins size changes: `Event PaneResized` (to everyone, and again to each viewer) and a `TerminalSnapshot` to each viewer | yes | — | aggregated: the peer is sent one smallest-wins size |
 | `Attach` | the pane's replay on its data path: `TerminalSnapshot`, the missed `TerminalUpdate`s, or `SyncReset` + `TerminalSnapshot`; `Error PaneNotFound`, or `InternalError` when a QUIC pane stream cannot be opened | maybe a resize | yes: re-attaching replaces the attachment | — | aggregated: attached upstream for the first viewer; later ones are served from the hub's mirror |
 | `Detach` | nothing | maybe a resize | yes | — | aggregated: detached upstream after the last viewer |
 | `Signal` | nothing; `Error PaneNotFound` / `InternalError` (an invalid signal) / `InputLocked` (the kernel refused it, `EPERM`) | — | no | — | forwarded |
-| `RequestInputLock` | `InputLockGranted` or `InputLockDenied { holder }`; `Error PaneNotFound` | — | yes | — | aggregated: not yet — answered by the hub (see Known gaps) |
-| `ReleaseInputLock` | `InputLockReleased` if this client held it, else nothing; `Error PaneNotFound` | — | effect yes | — | aggregated: not yet — answered by the hub (see Known gaps) |
-| `SetSnapshotMode` | nothing | — | yes | — | hub: local panes only (see Known gaps) |
+| `RequestInputLock` | `InputLockGranted` or `InputLockDenied { holder }`; `Error PaneNotFound` | — | yes | — | aggregated: the hub arbitrates its viewers and holds the peer's lock for the one holding its own |
+| `ReleaseInputLock` | `InputLockReleased` if this client held it, else nothing; `Error PaneNotFound` | — | effect yes | — | aggregated: forwarded for the holder only |
+| `SetSnapshotMode` | nothing | — | yes | — | hub: applies to proxied panes too |
 | `SetPaused` | nothing | — | yes | — | hub: applies to proxied panes too |
 | `SetPaneNoAutoPause` | nothing | — | yes | — | hub: applies to proxied panes too |
 | `FetchHistory` | `HistoryLines`; `Error PaneNotFound` | — | yes | — | forwarded |
@@ -271,7 +271,7 @@ Notes that apply to rows above:
 | `HistoryLines` | reply to `FetchHistory` | control | — | — |
 | `InputLockGranted` | reply to `RequestInputLock` | control | — | — |
 | `InputLockDenied` | reply to `RequestInputLock` | control | names the holder | — |
-| `InputLockReleased` | reply to `ReleaseInputLock` | control | — | — |
+| `InputLockReleased` | reply to `ReleaseInputLock`; pushed by a hub to a proxied pane's lock holder when the peer's link drops | control | the client stops holding the lock | — |
 | `SessionRenamed` | reply to `SessionRename` | control | before its event; handled like it | — |
 | `DirectoryListing` | reply to `ListDirectory` | control | — | — |
 | `PeerOpened` | reply to `OpenPeer` | control | the peer's sessions arrive in the next session list | — |
@@ -299,13 +299,26 @@ A hub is one client to each peer, speaking for all of its own
   answer. The peer's own error codes pass through.
 - **aggregated** — the hub keeps per-viewer state for the pane and combines
   its viewers into what it sends: one upstream attachment and one
-  smallest-wins size.
+  smallest-wins size, and one input lock. The hub arbitrates the lock between
+  its own clients: another holder is answered `InputLockDenied` without asking
+  the peer. The hub holds the peer's lock for the local holder, refuses the
+  others' input with `InputLocked`, and releases the peer's lock when the
+  holder detaches, its channel ends or its session closes. The lock belongs
+  to a viewer of the pane: a grant for a client that stopped viewing it while
+  it asked is given back to the peer at once. Should that give-back reach the
+  peer after it granted the lock again for the holder here, the hub asks for
+  it again. When the peer refuses the hub or the holder, the holder here loses
+  the lock too. A re-attach on a new channel (a resume) takes the lock along. Two requests made while the
+  lock was free are both granted by the peer, which sees one client, so the
+  hub denies the second, naming the first. A holder the peer names in its own
+  `InputLockDenied` — one of the peer's direct clients — is in the peer's
+  numbering.
 - **hub** — about the connection, the hub, or every session. The hub answers
-  it and sends the peer nothing. `SetPaused` and `SetPaneNoAutoPause` apply to
-  a client's proxied panes as to its local ones.
+  it and sends the peer nothing. `SetSnapshotMode`, `SetPaused` and
+  `SetPaneNoAutoPause` apply to a client's proxied panes as to its local ones.
 
-**Answers without a `request_id`** — an `Error { request_id: None }` and
-`SessionRenamed` — go to the client whose message
+**Answers without a `request_id`** — an `Error { request_id: None }`,
+`SessionRenamed`, and the lock replies — go to the client whose message
 caused them. A daemon handles one connection's messages in order and
 answers each before it reads the next, on one ordered lane. So the hub groups
 what it sends into runs, one per sender in a row, and pings the peer when the
@@ -316,13 +329,19 @@ costs no extra frame.
 **Refusals.** A forwarded request the hub cannot send is refused at once,
 under its own `request_id`: `InternalError` for an unknown or unreachable
 peer, `SessionNotFound` / `PaneNotFound` for a session the hub no longer
-proxies. A request still waiting when the link drops is answered
-`InternalError`. No forwarded request waits on a timer: its answer
+proxies, `InputLocked` for input under another viewer's lock. A request still
+waiting when the link drops is answered `InternalError`, and a lock holder is
+sent `InputLockReleased`. No forwarded request waits on a timer: its answer
 comes before the `Pong` to the next ping.
 
 **Frames.** The peer's events and `LayoutUpdate`s are broadcast to every
 client under local ids, as a local daemon broadcasts its own. A pane's stream
-frames go to its viewers, and feed the hub's mirror of the pane.
+frames go to its viewers, and feed the hub's mirror of the pane. The peer's
+`GridDigest` is checked against the mirror at that seqno. If it agrees, it is
+relayed to the viewers, which check their own grids (lossy, never lagging
+anyone). If it does not, the hub re-attaches upstream for a snapshot, which
+re-seeds the mirror and resyncs every viewer. An upstream `Lagged` does the
+same.
 
 ## State machines
 
@@ -415,7 +434,7 @@ tables.
 | absent | two `OpenPeer`s for one target race | one link; the loser torn down | `the_loser_of_a_concurrent_open_is_torn_down`, `concurrent_open_peer_to_same_target_converges_on_one_link` |
 | linked | the peer answers pings | linked | `a_peer_that_answers_stays_reachable` |
 | linked | the link closes | unreachable: sessions kept, flagged `peer_unreachable` | `a_dropped_link_leaves_the_peer_unreachable_then_relinks_under_the_same_word`, `remote_daemon_death_is_isolated_from_local_daemon` |
-| linked | the link closes with forwarded requests waiting | unreachable; each waiting request answered `InternalError` | `a_dropped_link_answers_what_was_in_flight` |
+| linked | the link closes with forwarded requests waiting | unreachable; each waiting request answered `InternalError`, each lock holder `InputLockReleased` | `a_dropped_link_answers_what_was_in_flight` |
 | linked | the peer is silent for `SILENCE_TIMEOUT` | unreachable | `a_silent_peer_is_pinged_then_declared_unreachable`, `upstream_silent_only_past_the_deadline` |
 | unreachable | a re-open succeeds | linked; sessions reconciled under their words; every proxied pane re-attached for a snapshot | `a_dropped_link_leaves_the_peer_unreachable_then_relinks_under_the_same_word`, `a_frozen_peer_is_unreachable_then_restored_under_the_same_word` |
 | unreachable | a re-open is refused | unreachable; the error names the refusal and its remedy | `a_handshake_fails_on_an_unanswered_challenge_a_refusal_or_silence`, `a_refusal_names_its_remedy` |
@@ -517,22 +536,19 @@ reconnects ([connection.md](connection.md#automatic-reconnect-issue-208)).
 What the protocol does today that it should not, recorded so it is not
 mistaken for intent:
 
-- **A hub does not arbitrate a proxied pane's input lock.** `RequestInputLock`
-  and `ReleaseInputLock` for a proxied pane are answered by the hub, which does
-  not host it, with `PaneNotFound` (#227).
-- **A hub does not relay `GridDigest`**, so a proxied pane's viewers are not
-  verified end to end, and it does not check its own mirror either; an
-  upstream `Lagged` is passed to the viewers, who re-attach to the mirror that
-  missed the frames (#227).
-- **`SetSnapshotMode` does not reach proxied panes**, and a client whose
-  channel ends stays a viewer of its proxied panes until the next frame drops
-  it (#227).
 - **A peer's closed sessions cannot be listed or restored through a hub.**
   `SessionListClosed` and `SessionRestore` are the hub's own graveyard only
   (#228).
 - **A peer that is itself a hub** answers a forwarded request only once its
   own peer has, after its `Pong`s, so the first hub cannot route those answers.
   Chained hubs are not supported.
+- **A proxied pane's lock holder can miss its own release in one race.** The
+  race: the hub gives back a stale grant (see
+  [Federated requests](#federated-requests)), and the holder releases before
+  the peer has answered the give-back. The peer then takes the holder's
+  release as a non-holder's and answers nothing. The hub, seeing the holder
+  still holding, asks for the lock again for it. The holder keeps the lock
+  until it releases again.
 - **`ListDirectory` lists the hub's filesystem**, even when the directory is
   for a session to be created on a peer.
 - **`LayoutUpdate` is not sent on attach**: a client learns a tab's layout from

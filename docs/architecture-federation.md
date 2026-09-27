@@ -2,8 +2,8 @@
 
 Status: **PR3 + PR4 core landed — multiple GUIs share one proxied pane over a
 single upstream link, with smallest-wins sizing and zero-round-trip late attach.
-GUI lean-down (PR5), federation hardening (PR6) and request parity (issue
-#227) have landed; input-lock arbitration, pause-union and capability merge
+GUI lean-down (PR5), federation hardening (PR6), request parity (issue #227)
+and input-lock arbitration have landed; pause-union and capability merge
 remain.**
 
 ## Goal
@@ -175,8 +175,8 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
     `Detach` upstream on all-paused and re-`Attach` on first-resume — deferred because
     that resume cost (a fresh upstream snapshot) is a real trade-off vs. keeping the
     mirror warm, and the win only matters under sustained all-paused.
-  - capability union upstream / filter downstream; and input-lock arbitration across
-    local viewers.
+  - capability union upstream / filter downstream. (Input-lock arbitration across
+    local viewers landed with issue #227; see **Request parity**.)
 - **PR5 prerequisite — SSH peer federation — landed.** `open_peer` now serves
   `PeerTarget::Ssh` as well as `Direct`: it negotiates the `-L` tunnel via
   `kmux-connect`'s `ssh::negotiate` and connects over TCP+TLS through it, sharing the
@@ -404,32 +404,45 @@ typed error, never answered by a hub that does not host it and never dropped.
   rewrites the word or pane to the peer's and the `request_id` into the hub's
   own number space, then sends it up the link. It refuses at once, under the
   request's own id, what it cannot send: `InternalError` for an unknown or
-  unreachable peer, and `SessionNotFound` / `PaneNotFound`. A close first
-  detaches the closer from what it closes, as locally.
+  unreachable peer, `SessionNotFound` / `PaneNotFound`, and `InputLocked` for
+  input under another viewer's lock. A close first detaches the closer from
+  what it closes, as locally.
 - **Answers routed per request** (`federation/routes.rs`). An answer with an id
   goes back through a `Route` to its sender alone, under the sender's id and
   word. A `SessionCreated` is registered first, and a `SessionClosed` drops
   the session for every client after the sender has its answer. The peer's own
-  error codes pass through. An answer without an id (`Error`, `SessionRenamed`)
-  goes to the sender of the oldest *run*: the hub groups what
+  error codes pass through. An answer without an id (`Error`, `SessionRenamed`,
+  the lock replies) goes to the sender of the oldest *run*: the hub groups what
   it sends by sender and pings the peer when the sender changes, and a peer
   answers one connection's messages in order, before the `Pong`. Nothing waits
   on a timer. A dropped link answers every waiting request `InternalError`
   (`fail_in_flight`). A route the peer answered with nothing (`TabRename`) goes
   with its run. This depends on the peer answering in order, which a peer that
   is itself a hub does not, so chained hubs are not supported.
-
-Not yet (#227, the next change): input-lock arbitration across a hub's
-viewers, `SetSnapshotMode` for proxied viewers, detaching a proxied viewer
-when its channel ends, and relaying and checking `GridDigest`.
+- **Input lock** — *aggregated*. The hub keeps the holder among its own
+  clients (`PeerConnection::input_locks`) and denies the others locally. It
+  holds the peer's lock for the holder, refuses the others' input, and releases
+  the peer's lock when the holder detaches, its channel ends (even after a
+  closed pane stream dropped it as a viewer) or its session closes. Two grants
+  the peer gave while the lock was free keep one holder. A grant for a client
+  that stopped viewing the pane is given back at once, and asked for again if
+  the give-back overtook a newer holder's grant. A peer's refusal ends the
+  holder's lock here too. A resumed holder's re-attach keeps its lock. A
+  dropped link tells the holder `InputLockReleased`.
+- **Hub parity.** `SetSnapshotMode` reaches proxied viewers (they are sent the
+  mirror in place of each frame), and a channel's end detaches its proxied
+  viewers (`PeerManager::detach_channel`). The peer's `GridDigest` is checked
+  against the mirror, and relayed or answered with a resync
+  ([architecture-verification.md](architecture-verification.md)); so is an
+  upstream `Lagged`.
 
 Not covered: a peer's *closed* sessions (`SessionListClosed`,
 `SessionRestore`) are the hub's own graveyard only (#228).
 
 Tests: `federation::forward` (every shape of answer routed back, answers
-without an id to the right sender, refusals, the create, a dropped link),
-`federation::routes` (runs, barriers, routes), `federation::feed` (events
-broadcast), `dispatch::federated` (the router), and
+without an id to the right sender, refusals, the create, the lock, a dropped
+link), `federation::routes` (runs, barriers, routes), `federation::feed` (events
+broadcast, digest relay and resync), `dispatch::federated` (the router), and
 the E2E `a_proxied_sessions_tabs_and_panes_are_managed_through_the_hub` and
 `a_proxied_panes_history_answers_only_the_client_that_asked`.
 

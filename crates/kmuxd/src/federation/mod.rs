@@ -107,10 +107,16 @@ struct Viewer {
     /// it keeps streaming through a background auto-pause, but a manual pause
     /// still stops it. Mirrors `ClientSender.no_auto_pause` (issue #68).
     no_auto_pause: bool,
+    /// The client asked for whole snapshots instead of diffs
+    /// (`SetSnapshotMode`): each content frame reaches it as a snapshot
+    /// minted from the mirror, and no digest does. Mirrors
+    /// `ClientSender.force_full_snapshot` (issue #227).
+    snapshot_mode: bool,
 }
 
 impl Viewer {
-    /// A viewer streaming at `size`: not paused, not exempt from auto-pause.
+    /// A viewer streaming at `size`: not paused, not exempt from auto-pause,
+    /// taking diffs.
     fn new(
         data_tx: mpsc::Sender<ServerMessage>,
         ctrl_tx: crate::outbound::OutboundTx,
@@ -123,6 +129,7 @@ impl Viewer {
             paused: false,
             pause_auto: false,
             no_auto_pause: false,
+            snapshot_mode: false,
         }
     }
 
@@ -195,6 +202,25 @@ impl ProxiedPane {
         }
     }
 
+    /// Whether the mirror agrees with the peer's digest of its grid at
+    /// `seqno`. A mirror at another seqno cannot be checked and passes, as a
+    /// client does (`docs/architecture-verification.md`).
+    fn digest_matches(&self, seqno: SequenceNo, hash: u128) -> bool {
+        seqno != self.last_seqno || self.mirror.live_digest() == hash
+    }
+
+    /// Fan a digest out to every viewer reconstructing the pane from diffs.
+    /// Best effort, as `relay::broadcast_grid_digest`: a full channel just
+    /// misses this check, and no viewer is lagged or dropped for it. A
+    /// paused viewer, or one taking snapshots, is skipped.
+    fn fan_out_digest(&self, msg: &ServerMessage) {
+        for viewer in self.viewers.values() {
+            if !viewer.output_paused() && !viewer.snapshot_mode {
+                let _ = viewer.data_tx.try_send(msg.clone());
+            }
+        }
+    }
+
     /// Fan an (already local-addressed) pane frame out to every viewer, applying
     /// the same backpressure policy as the local PTY relay
     /// (`crate::relay::broadcast_to_clients`): a viewer whose **bounded** data
@@ -203,8 +229,12 @@ impl ProxiedPane {
     /// minted off the still-correct mirror, exactly as a lagging local client
     /// recovers. A viewer whose channel has closed is dropped silently. The mirror
     /// is fed by the caller *before* this, so a dropped viewer never desyncs it.
+    ///
+    /// A viewer in snapshot mode is sent the mirror instead, minted once per
+    /// frame, as the relay does for a `force_full_snapshot` client.
     fn fan_out(&mut self, local_pane_id: &str, msg: &ServerMessage) {
         let mut dead: Vec<ClientId> = Vec::new();
+        let mut minted: Option<ServerMessage> = None;
         for (&client_id, viewer) in &self.viewers {
             // Paused viewers (issue #68) receive no terminal output and must never
             // be marked lagged or dropped when their channel fills — they resync on
@@ -213,7 +243,12 @@ impl ProxiedPane {
             if viewer.output_paused() {
                 continue;
             }
-            match viewer.data_tx.try_send(msg.clone()) {
+            let outgoing = if viewer.snapshot_mode {
+                minted.get_or_insert_with(|| self.mint(local_pane_id))
+            } else {
+                msg
+            };
+            match viewer.data_tx.try_send(outgoing.clone()) {
                 Ok(()) => {}
                 Err(mpsc::error::TrySendError::Full(_)) => {
                     // Out-of-band so it lands even though the data channel is full;
@@ -298,6 +333,9 @@ struct PeerConnection {
     /// process trees — already translated to local pane ids — when the matching
     /// `ProcessOverviewResult` arrives.
     pending_overviews: HashMap<RequestId, oneshot::Sender<Vec<PaneProcesses>>>,
+    /// The local client holding the hub's input lock on a proxied pane, by
+    /// local pane id; the hub holds the peer's lock for it (issue #227).
+    input_locks: HashMap<String, Requester>,
     /// The background `ssh -L -N` tunnel process for an [`PeerTarget::Ssh`] peer,
     /// kept alive for the life of the connection (the `-L` forward dies with it).
     /// `None` for a [`PeerTarget::Direct`] peer. Killed on close/reap.
@@ -324,6 +362,7 @@ impl PeerConnection {
             feed_task: None,
             routes: routes::Routes::default(),
             pending_overviews: HashMap::new(),
+            input_locks: HashMap::new(),
             ssh_tunnel: None,
             dead: false,
         }
@@ -344,7 +383,8 @@ impl PeerConnection {
 
     /// Ask the peer for a fresh snapshot of the proxied pane `local_pane`,
     /// re-attaching it: the snapshot re-seeds the mirror and resyncs every
-    /// viewer. For a relink.
+    /// viewer. For a relink, an upstream `Lagged`, and a mirror its digest
+    /// disowns.
     fn resync(&mut self, local_pane: &str) {
         let Some(size) = self.panes.get(local_pane).map(|pane| pane.upstream_size) else {
             return;
@@ -455,14 +495,159 @@ impl PeerConnection {
         );
     }
 
-    /// Remove `client_id` as a viewer of the proxied pane `local_pane`. The
-    /// last viewer to leave detaches the pane upstream and drops the mirror;
+    /// Keep the hub's input lock in step with the peer's lock reply `msg` to
+    /// `from`, and return what `from` is answered.
+    ///
+    /// - A grant makes `from` the holder — unless another client of this hub
+    ///   holds the lock already: both asked while it was free, and the peer,
+    ///   seeing one client, granted both. `from` is then denied, naming the
+    ///   holder.
+    /// - A grant for a client that no longer views the pane (it detached
+    ///   while it asked) is given back to the peer at once, since nothing
+    ///   would release it later; `from` is still answered, as a local daemon
+    ///   answers before the detach.
+    /// - A release frees the lock when `from` held it.
+    /// - The give-back of a stale grant can reach the peer after it granted
+    ///   the lock again for a client that holds it here: the peer's
+    ///   confirmation of the give-back makes the hub ask for the lock again,
+    ///   and should the peer refuse, the holder here is told it is released.
+    fn on_lock_reply(&mut self, from: &Requester, msg: ServerMessage) -> ServerMessage {
+        match &msg {
+            ServerMessage::InputLockGranted { pane_id } => {
+                if let Some(holder) = self.input_locks.get(pane_id).and_then(Requester::client_id)
+                    && Some(holder) != from.client_id()
+                {
+                    return ServerMessage::InputLockDenied {
+                        pane_id: pane_id.clone(),
+                        holder,
+                    };
+                }
+                let viewing = from.client_id().is_some_and(|id| {
+                    self.panes
+                        .get(pane_id)
+                        .is_some_and(|pane| pane.viewers.contains_key(&id))
+                });
+                if viewing {
+                    self.input_locks.insert(pane_id.clone(), from.clone());
+                } else if let Some(remote_pane) = self.to_remote_pane(pane_id) {
+                    self.send(
+                        &Requester::Hub,
+                        ClientMessage::ReleaseInputLock {
+                            pane_id: remote_pane,
+                        },
+                    );
+                }
+            }
+            ServerMessage::InputLockReleased { pane_id } => self.lock_released(pane_id, from),
+            ServerMessage::InputLockDenied { pane_id, .. } => self.lock_refused(pane_id, from),
+            _ => {}
+        }
+        msg
+    }
+
+    /// The peer released the lock on `local_pane` for `from`. The holder's
+    /// own release frees it here. The hub's own (a stale grant given back)
+    /// may have reached the peer after it granted the lock again for the
+    /// holder here, so the hub asks for it again.
+    fn lock_released(&mut self, local_pane: &str, from: &Requester) {
+        let Some(holder) = self
+            .input_locks
+            .get(local_pane)
+            .and_then(Requester::client_id)
+        else {
+            return;
+        };
+        if from.client_id() == Some(holder) {
+            self.input_locks.remove(local_pane);
+        } else if from.client_id().is_none() {
+            self.relock(local_pane);
+        }
+    }
+
+    /// The peer refused the lock on `local_pane` to the hub asking again for
+    /// the holder here, or to the holder asking again itself: the peer no
+    /// longer holds it for the hub, so the holder here does not either. It
+    /// is told so when the hub asked (it hears the refusal itself otherwise).
+    fn lock_refused(&mut self, local_pane: &str, from: &Requester) {
+        let Some(holder) = self
+            .input_locks
+            .get(local_pane)
+            .and_then(Requester::client_id)
+        else {
+            return;
+        };
+        let hub_asked = from.client_id().is_none();
+        if !(hub_asked || from.client_id() == Some(holder)) {
+            return;
+        }
+        if let Some(holder) = self.input_locks.remove(local_pane)
+            && hub_asked
+        {
+            holder.answer(ServerMessage::InputLockReleased {
+                pane_id: local_pane.to_string(),
+            });
+        }
+    }
+
+    /// Ask the peer again, as the hub, for the lock on `local_pane` a client
+    /// here holds.
+    fn relock(&mut self, local_pane: &str) {
+        if let Some(remote_pane) = self.to_remote_pane(local_pane) {
+            self.send(
+                &Requester::Hub,
+                ClientMessage::RequestInputLock {
+                    pane_id: remote_pane,
+                },
+            );
+        }
+    }
+
+    /// Give back to the peer every lock `holder` holds on this link, whether
+    /// or not it still views the pane: its channel ended (a viewer dropped
+    /// for a closed data channel is no longer a viewer, but still holds its
+    /// lock).
+    fn release_locks_of(&mut self, holder: &Requester) {
+        let held: Vec<String> = self
+            .input_locks
+            .iter()
+            .filter(|(_, locker)| locker.is(holder))
+            .map(|(pane, _)| pane.clone())
+            .collect();
+        for local_pane in held {
+            self.input_locks.remove(&local_pane);
+            if let Some(remote_pane) = self.to_remote_pane(&local_pane) {
+                self.send(
+                    &Requester::Hub,
+                    ClientMessage::ReleaseInputLock {
+                        pane_id: remote_pane,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Remove `client_id` as a viewer of the proxied pane `local_pane`, and
+    /// release the input lock it held there, as a local detach does. The last
+    /// viewer to leave detaches the pane upstream and drops the mirror;
     /// otherwise the smallest-wins size is reconciled (a departing viewer may
     /// have been the smallest).
     fn release_viewer(&mut self, local_pane: &str, client_id: ClientId) {
         let Some(remote_pane) = self.to_remote_pane(local_pane) else {
             return;
         };
+        if self
+            .input_locks
+            .get(local_pane)
+            .is_some_and(|holder| holder.client_id() == Some(client_id))
+        {
+            self.input_locks.remove(local_pane);
+            self.send(
+                &Requester::Hub,
+                ClientMessage::ReleaseInputLock {
+                    pane_id: remote_pane.clone(),
+                },
+            );
+        }
         let became_empty = match self.panes.get_mut(local_pane) {
             Some(pane) => {
                 pane.viewers.remove(&client_id);
@@ -893,6 +1078,9 @@ impl PeerManager {
             guard
                 .panes
                 .retain(|pane_id, _| !pane_id.starts_with(&prefix));
+            guard
+                .input_locks
+                .retain(|pane_id, _| !pane_id.starts_with(&prefix));
         }
         self.word_index
             .lock()
@@ -930,9 +1118,22 @@ impl PeerManager {
             return false;
         };
         let from = Requester::client(client_id, ctrl_tx.clone());
-        let viewer = Viewer::new(data_tx, ctrl_tx, size);
+        // A client re-attaching on a new channel (a resume) takes its lock
+        // there, so the old channel's end leaves it held.
+        if let Some(holder) = guard.input_locks.get_mut(local_pane_id)
+            && holder.client_id() == Some(client_id)
+        {
+            *holder = from.clone();
+        }
+        let mut viewer = Viewer::new(data_tx, ctrl_tx, size);
         if let Some(pane) = guard.panes.get_mut(local_pane_id) {
             // Late viewer: mint from the mirror, register, then reconcile size.
+            // A re-attach keeps the client's snapshot mode, as a local one
+            // keeps `force_full_snapshot`.
+            viewer.snapshot_mode = pane
+                .viewers
+                .get(&client_id)
+                .is_some_and(|old| old.snapshot_mode);
             let _ = viewer.data_tx.try_send(pane.mint(local_pane_id));
             pane.viewers.insert(client_id, viewer);
             guard.reconcile_size(local_pane_id, &remote_pane);
@@ -987,6 +1188,45 @@ impl PeerManager {
         };
         if let Some(conn) = self.conn_for_word(local_word) {
             lock(&conn).release_viewer(local_pane_id, client_id);
+        }
+    }
+
+    /// Detach `client_id` from every proxied pane it views through the
+    /// channel whose control lane is `ctrl`, and release its input locks
+    /// there: the channel ended. Mirrors [`ServerApp::detach_channel`] for
+    /// local panes, which it complements (issue #227).
+    pub fn detach_channel(&self, client_id: ClientId, ctrl: &crate::outbound::OutboundTx) {
+        let conns: Vec<_> = self.peers.lock().unwrap().values().cloned().collect();
+        for conn in conns {
+            let mut guard = lock(&conn);
+            let viewed: Vec<String> = guard
+                .panes
+                .iter()
+                .filter(|(_, pane)| {
+                    pane.viewers
+                        .get(&client_id)
+                        .is_some_and(|viewer| viewer.ctrl_tx.same_channel(ctrl))
+                })
+                .map(|(pane_id, _)| pane_id.clone())
+                .collect();
+            for pane_id in viewed {
+                guard.release_viewer(&pane_id, client_id);
+            }
+            guard.release_locks_of(&Requester::client(client_id, ctrl.clone()));
+        }
+    }
+
+    /// Turn snapshot mode on or off for every proxied pane `client_id` views
+    /// (`SetSnapshotMode`, issue #227). Complements
+    /// [`ServerApp::set_snapshot_mode`], which covers local panes.
+    pub fn set_snapshot_mode(&self, client_id: ClientId, enabled: bool) {
+        let conns: Vec<_> = self.peers.lock().unwrap().values().cloned().collect();
+        for conn in conns {
+            for pane in lock(&conn).panes.values_mut() {
+                if let Some(viewer) = pane.viewers.get_mut(&client_id) {
+                    viewer.snapshot_mode = enabled;
+                }
+            }
         }
     }
 
@@ -1482,6 +1722,7 @@ mod tests {
                 paused: false,
                 pause_auto: false,
                 no_auto_pause: false,
+                snapshot_mode: false,
             },
         );
 
@@ -1516,6 +1757,7 @@ mod tests {
                 paused: true,
                 pause_auto: false,
                 no_auto_pause: false,
+                snapshot_mode: false,
             },
         );
 
@@ -1549,6 +1791,7 @@ mod tests {
                 paused: true,
                 pause_auto: true,
                 no_auto_pause: true,
+                snapshot_mode: false,
             },
         );
 
@@ -1575,6 +1818,7 @@ mod tests {
                 paused: false,
                 pause_auto: false,
                 no_auto_pause: false,
+                snapshot_mode: false,
             },
         );
 
@@ -1588,6 +1832,78 @@ mod tests {
             ctrl_rx.try_recv().is_err(),
             "a closed viewer gets no Lagged — it is simply gone"
         );
+    }
+
+    /// A viewer in snapshot mode is sent the mirror in place of each frame,
+    /// as the relay sends a `force_full_snapshot` client (issue #227).
+    #[test]
+    fn a_snapshot_mode_viewer_is_sent_the_mirror() {
+        let mut pane = ProxiedPane::new(sz(24, 80));
+        let (diffs, mut diffs_rx) = test_viewer(8, sz(24, 80));
+        let (mut snaps, mut snaps_rx) = test_viewer(8, sz(24, 80));
+        snaps.snapshot_mode = true;
+        pane.viewers.insert(ClientId(1), diffs);
+        pane.viewers.insert(ClientId(2), snaps);
+        let reset = ServerMessage::SyncReset {
+            pane_id: "hawk/0".to_string(),
+        };
+        pane.fan_out("hawk/0", &reset);
+        assert!(matches!(
+            diffs_rx.try_recv(),
+            Ok(ServerMessage::SyncReset { .. })
+        ));
+        assert!(matches!(
+            snaps_rx.try_recv(),
+            Ok(ServerMessage::TerminalSnapshot { pane_id, .. }) if pane_id == "hawk/0"
+        ));
+    }
+
+    /// A digest reaches only a streaming viewer that takes diffs, and a full
+    /// channel just misses it: nobody is lagged or dropped for a digest
+    /// (issue #227).
+    #[test]
+    fn a_digest_reaches_streaming_diff_viewers_and_lags_none() {
+        let mut pane = ProxiedPane::new(sz(24, 80));
+        let (diffs, mut diffs_rx) = test_viewer(8, sz(24, 80));
+        let (mut snaps, mut snaps_rx) = test_viewer(8, sz(24, 80));
+        snaps.snapshot_mode = true;
+        let (mut paused, mut paused_rx) = test_viewer(8, sz(24, 80));
+        paused.paused = true;
+        let (full, _full_rx) = test_viewer(1, sz(24, 80));
+        full.data_tx.try_send(snapshot_msg("hawk/0")).unwrap();
+        for (id, viewer) in [(1, diffs), (2, snaps), (3, paused), (4, full)] {
+            pane.viewers.insert(ClientId(id), viewer);
+        }
+        let digest = ServerMessage::GridDigest {
+            pane_id: "hawk/0".to_string(),
+            seqno: SequenceNo(0),
+            hash: 7,
+        };
+        pane.fan_out_digest(&digest);
+        assert!(matches!(
+            diffs_rx.try_recv(),
+            Ok(ServerMessage::GridDigest { .. })
+        ));
+        assert!(
+            snaps_rx.try_recv().is_err(),
+            "a snapshot taker checks nothing"
+        );
+        assert!(
+            paused_rx.try_recv().is_err(),
+            "a paused viewer is sent nothing"
+        );
+        assert_eq!(pane.viewers.len(), 4, "the full viewer is kept");
+    }
+
+    /// The mirror is checked only at the seqno it is at: there it has to
+    /// match the peer's digest; at another it passes.
+    #[test]
+    fn a_digest_is_checked_only_at_the_mirrors_seqno() {
+        let pane = ProxiedPane::new(sz(24, 80));
+        let own = pane.mirror.live_digest();
+        assert!(pane.digest_matches(SequenceNo(0), own));
+        assert!(!pane.digest_matches(SequenceNo(0), own ^ 1));
+        assert!(pane.digest_matches(SequenceNo(5), own ^ 1));
     }
 
     #[test]
@@ -1772,6 +2088,108 @@ mod tests {
         assert!(gone, "the loser's tunnel is killed");
         assert!(alive(winner), "the winner's tunnel lives on");
         app.peer_manager.close_all();
+    }
+
+    /// A client's snapshot mode reaches the proxied panes it views, and the
+    /// end of its channel detaches it from them — the last viewer detaching
+    /// the pane upstream — and releases its input lock there, as a local
+    /// daemon does (issue #227).
+    #[tokio::test(start_paused = true)]
+    async fn snapshot_mode_and_a_channels_end_reach_proxied_panes() {
+        let app = Arc::new(crate::fixtures::fixture_app());
+        let (mut upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let (ctrl, mut answers) = crate::fixtures::make_outbound();
+        let (data_tx, mut data_rx) = mpsc::channel(8);
+        let pane = "fedlocal/0";
+        assert!(app.federated_attach(pane, ClientId(1), data_tx, ctrl.clone(), sz(24, 80)));
+        let bound = Duration::from_secs(60);
+
+        app.set_snapshot_mode(ClientId(1), true).await;
+        peer.send(ServerMessage::SyncReset {
+            pane_id: "fedremote/0".to_string(),
+        })
+        .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(bound, data_rx.recv()).await,
+            Ok(Some(ServerMessage::TerminalSnapshot { .. }))
+        ));
+        // A re-attach keeps the mode.
+        let (data_tx, mut data_rx) = mpsc::channel(8);
+        assert!(app.federated_attach(pane, ClientId(1), data_tx, ctrl.clone(), sz(24, 80)));
+        let _minted = tokio::time::timeout(bound, data_rx.recv()).await;
+        peer.send(ServerMessage::SyncReset {
+            pane_id: "fedremote/0".to_string(),
+        })
+        .unwrap();
+        assert!(matches!(
+            tokio::time::timeout(bound, data_rx.recv()).await,
+            Ok(Some(ServerMessage::TerminalSnapshot { .. }))
+        ));
+
+        app.peer_manager
+            .request_input_lock(&Requester::client(ClientId(1), ctrl.clone()), pane)
+            .unwrap();
+        peer.send(ServerMessage::InputLockGranted {
+            pane_id: "fedremote/0".to_string(),
+        })
+        .unwrap();
+        tokio::time::timeout(bound, answers.recv())
+            .await
+            .expect("granted");
+        while upstream.try_recv().is_ok() {}
+
+        app.detach_channel(ClientId(1), &ctrl).await;
+        let sent: Vec<String> = std::iter::from_fn(|| upstream.try_recv().ok())
+            .filter(|m| !matches!(m, ClientMessage::Ping { .. }))
+            .map(|m| format!("{m:?}"))
+            .collect();
+        assert_eq!(
+            sent,
+            [
+                "ReleaseInputLock { pane_id: \"fedremote/0\" }",
+                "Detach { pane_id: \"fedremote/0\" }"
+            ]
+        );
+        assert!(
+            lock(&app.peer_manager.peers.lock().unwrap()["peer:1"])
+                .panes
+                .is_empty()
+        );
+
+        // A holder whose pane stream closed is dropped as a viewer by the
+        // next frame, but its channel's end still gives the lock back.
+        let (ctrl, mut answers) = crate::fixtures::make_outbound();
+        let (data_tx, data_rx) = mpsc::channel(8);
+        assert!(app.federated_attach(pane, ClientId(2), data_tx, ctrl.clone(), sz(24, 80)));
+        app.peer_manager
+            .request_input_lock(&Requester::client(ClientId(2), ctrl.clone()), pane)
+            .unwrap();
+        // The peer answers every ping it was sent before the grant.
+        while let Ok(msg) = upstream.try_recv() {
+            if let ClientMessage::Ping { seq } = msg {
+                peer.send(ServerMessage::Pong { seq }).unwrap();
+            }
+        }
+        peer.send(ServerMessage::InputLockGranted {
+            pane_id: "fedremote/0".to_string(),
+        })
+        .unwrap();
+        tokio::time::timeout(bound, answers.recv())
+            .await
+            .expect("granted");
+        drop(data_rx);
+        peer.send(ServerMessage::SyncReset {
+            pane_id: "fedremote/0".to_string(),
+        })
+        .unwrap();
+        tokio::time::sleep(Duration::from_millis(10)).await;
+        while upstream.try_recv().is_ok() {}
+        app.detach_channel(ClientId(2), &ctrl).await;
+        let sent: Vec<String> = std::iter::from_fn(|| upstream.try_recv().ok())
+            .filter(|m| !matches!(m, ClientMessage::Ping { .. }))
+            .map(|m| format!("{m:?}"))
+            .collect();
+        assert_eq!(sent, ["ReleaseInputLock { pane_id: \"fedremote/0\" }"]);
     }
 
     /// Opening a peer that is open already reuses it without dialling. A live

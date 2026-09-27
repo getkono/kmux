@@ -109,6 +109,7 @@ pub(super) fn msg_pane_id(msg: &ServerMessage) -> Option<&str> {
         | TerminalSnapshot { pane_id, .. }
         | CursorUpdate { pane_id, .. }
         | ScrollbackAppend { pane_id, .. }
+        | GridDigest { pane_id, .. }
         | SyncReset { pane_id }
         | Lagged { pane_id, .. } => Some(pane_id.as_str()),
         _ => None,
@@ -123,6 +124,7 @@ pub(super) fn set_msg_pane_id(msg: &mut ServerMessage, new_id: String) {
         | TerminalSnapshot { pane_id, .. }
         | CursorUpdate { pane_id, .. }
         | ScrollbackAppend { pane_id, .. }
+        | GridDigest { pane_id, .. }
         | SyncReset { pane_id }
         | Lagged { pane_id, .. } => *pane_id = new_id,
         _ => warn!("set_msg_pane_id called on a message with no pane_id"),
@@ -177,8 +179,12 @@ pub(super) fn set_reply_request_id(msg: &mut ServerMessage, id: RequestId) {
 /// The peer's word for the session an answer without a request id names,
 /// if it names one (an `Error` names none).
 pub(super) fn reply_word(msg: &ServerMessage) -> Option<&str> {
+    use ServerMessage::*;
     match msg {
-        ServerMessage::SessionRenamed { word_id, .. } => Some(word_id),
+        SessionRenamed { word_id, .. } => Some(word_id),
+        InputLockGranted { pane_id }
+        | InputLockDenied { pane_id, .. }
+        | InputLockReleased { pane_id } => parse_pane_id(pane_id).map(|(word, _)| word),
         _ => None,
     }
 }
