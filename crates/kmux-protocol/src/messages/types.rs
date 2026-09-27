@@ -213,7 +213,7 @@ pub enum Compression {
     Zstd,
     /// An algorithm this build does not know, from a newer daemon. Only
     /// observability reads this field, so nothing depends on it.
-    /// Sent only to relay a value received as `Unknown`.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
     #[serde(other)]
     Unknown,
 }

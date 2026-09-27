@@ -87,11 +87,23 @@ pub enum FrontendKind {
     /// The native macOS Swift app (`kmux-swift`).
     Swift,
     /// A frontend this build does not know, from a newer peer.
-    /// Sent only to relay a value received as `Unknown`.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
     #[serde(other)]
     Unknown,
 }
 wire_enum!(FrontendKind);
+
+impl FrontendKind {
+    /// What to send for this value: itself, or — since `Unknown` is never
+    /// sent — `Cli`, which is also what a receiver assumes when the field is
+    /// absent.
+    pub fn sendable(self) -> Self {
+        match self {
+            Self::Unknown => Self::Cli,
+            known => known,
+        }
+    }
+}
 
 impl std::fmt::Display for FrontendKind {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -169,7 +181,7 @@ pub enum PeerTarget {
     },
     /// A kind of target this build does not know, from a newer client. The
     /// daemon answers it with `PeerError`.
-    /// Sent only to relay a value received as `Unknown`.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
     #[serde(other)]
     Unknown,
 }
@@ -305,11 +317,22 @@ pub enum PaneProgressState {
     Pause,
     /// A state this build does not know, from a newer daemon; shown as no
     /// bar.
-    /// Sent only to relay a value received as `Unknown`.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
     #[serde(other)]
     Unknown,
 }
 wire_enum!(PaneProgressState);
+
+impl PaneProgressState {
+    /// What to send for this value: itself, or — since `Unknown` is never
+    /// sent — `Remove`, the state it is shown as.
+    pub fn sendable(self) -> Self {
+        match self {
+            Self::Unknown => Self::Remove,
+            known => known,
+        }
+    }
+}
 
 /// Why a pane is asking for the user's attention (issue #169).
 ///
@@ -328,11 +351,22 @@ pub enum AttentionKind {
     NeedsInput,
     /// A reason this build does not know, from a newer peer; worded as a
     /// plain request for attention.
-    /// Sent only to relay a value received as `Unknown`.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
     #[serde(other)]
     Unknown,
 }
 wire_enum!(AttentionKind);
+
+impl AttentionKind {
+    /// What to send for this value: itself, or — since `Unknown` is never
+    /// sent — `TurnDone`, the plain request for attention it is shown as.
+    pub fn sendable(self) -> Self {
+        match self {
+            Self::Unknown => Self::TurnDone,
+            known => known,
+        }
+    }
+}
 
 /// Snapshot of a single pane within a session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -428,7 +462,7 @@ pub enum LayoutScheme {
     MainHorizontal,
     /// A scheme this build does not know, from a newer client; the daemon
     /// leaves the layout as it is.
-    /// Sent only to relay a value received as `Unknown`.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
     #[serde(other)]
     Unknown,
 }
@@ -661,7 +695,7 @@ pub enum SessionEventMsg {
     },
     /// An event this build does not know, from a newer daemon; receivers
     /// ignore it.
-    /// Sent only to relay a value received as `Unknown`.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
     #[serde(other)]
     Unknown,
 }
@@ -977,6 +1011,25 @@ mod tests {
         );
         // Defensive: a peer set but no matching suffix falls back to the raw name.
         assert_eq!(entry("kmux", Some("box")).base_name(), "kmux");
+    }
+
+    #[test]
+    fn unknown_is_sent_as_the_value_it_is_shown_as() {
+        assert_eq!(FrontendKind::Unknown.sendable(), FrontendKind::Cli);
+        assert_eq!(FrontendKind::Gtk.sendable(), FrontendKind::Gtk);
+        assert_eq!(
+            PaneProgressState::Unknown.sendable(),
+            PaneProgressState::Remove
+        );
+        assert_eq!(
+            PaneProgressState::Error.sendable(),
+            PaneProgressState::Error
+        );
+        assert_eq!(AttentionKind::Unknown.sendable(), AttentionKind::TurnDone);
+        assert_eq!(
+            AttentionKind::NeedsInput.sendable(),
+            AttentionKind::NeedsInput
+        );
     }
 
     #[test]

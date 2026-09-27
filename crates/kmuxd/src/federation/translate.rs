@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 
-use kmux_protocol::messages::{ServerMessage, SessionEntry, SessionEventMsg};
+use kmux_protocol::messages::{ClientInfo, ServerMessage, SessionEntry, SessionEventMsg};
 use kmux_protocol::{format_pane_id, parse_pane_id};
 use tracing::warn;
 
@@ -28,8 +28,18 @@ pub(super) fn localize_entry(
     for pane in &mut entry.panes {
         pane.pane_id = format_pane_id(local_word, pane.pane_index);
         pane.attached_clients.clear();
+        pane.progress_state = pane.progress_state.sendable();
     }
     entry
+}
+
+/// A peer's client list, with any frontend this hub does not know reported
+/// as one it does: the hub never sends `Unknown` on.
+pub(super) fn sendable_clients(mut clients: Vec<ClientInfo>) -> Vec<ClientInfo> {
+    for client in &mut clients {
+        client.frontend = client.frontend.sendable();
+    }
+    clients
 }
 
 /// Rewrite the word (or pane) a [`SessionEventMsg`] references from remote to
@@ -40,6 +50,13 @@ pub(super) fn rewrite_event_to_local(
     remote_to_local: &HashMap<String, String>,
 ) -> Option<String> {
     use SessionEventMsg::*;
+    // A value this hub does not know is passed on as the one it is shown as:
+    // the hub never sends `Unknown` on.
+    match event {
+        PaneProgressChanged { state, .. } => *state = state.sendable(),
+        PaneAttention { kind, .. } => *kind = kind.sendable(),
+        _ => {}
+    }
     match event {
         PaneSpawned { pane_id }
         | PaneExited { pane_id, .. }

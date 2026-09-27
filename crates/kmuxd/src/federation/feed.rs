@@ -13,7 +13,7 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use super::link::{LinkEnd, UPSTREAM_PING_INTERVAL, broadcast_sessions, upstream_silent};
-use super::translate::{msg_pane_id, rewrite_event_to_local, set_msg_pane_id};
+use super::translate::{msg_pane_id, rewrite_event_to_local, sendable_clients, set_msg_pane_id};
 use super::{PeerConnection, lock};
 use crate::app::ServerApp;
 
@@ -90,7 +90,7 @@ pub(super) fn on_upstream(
             ..
         } => {
             if let Some(tx) = lock(conn).pending_client_lists.remove(&request_id) {
-                let _ = tx.send(clients);
+                let _ = tx.send(sendable_clients(clients));
             }
             Next::Continue
         }

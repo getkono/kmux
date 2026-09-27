@@ -1439,10 +1439,13 @@ async fn recv_until(
 
 #[cfg(test)]
 mod tests {
-    use super::translate::{localize_entry, msg_pane_id, rewrite_event_to_local, set_msg_pane_id};
+    use super::translate::{
+        localize_entry, msg_pane_id, rewrite_event_to_local, sendable_clients, set_msg_pane_id,
+    };
     use super::*;
     use kmux_protocol::messages::{
-        GridSnapshot, PaneInfo, SequenceNo, SessionMeta, SessionStatus, TabInfo,
+        ClientInfo, ConnectionId, FrontendKind, GridSnapshot, PaneInfo, SequenceNo, SessionMeta,
+        SessionStatus, TabInfo,
     };
 
     fn sample_entry(word: &str, name: &str) -> SessionEntry {
@@ -1511,6 +1514,81 @@ mod tests {
         assert!(local.panes[0].attached_clients.is_empty());
         // Tabs reference pane_index, not the word, so they survive unchanged.
         assert_eq!(local.tabs[0].tab_index, 0);
+    }
+
+    /// A value a newer peer sent that this hub does not know is passed on as
+    /// the known value it is shown as, never as `Unknown` (protocol 1.1).
+    #[test]
+    fn a_hub_passes_unknown_values_on_as_known_ones() {
+        use kmux_protocol::messages::{AttentionKind, PaneProgressState};
+
+        let mut remote = sample_entry("eagle", "work");
+        remote.panes[0].progress_state = PaneProgressState::Unknown;
+        let local = localize_entry(remote, "hawk", "box:9000");
+        assert_eq!(local.panes[0].progress_state, PaneProgressState::Remove);
+
+        let map = HashMap::from([("eagle".to_string(), "hawk".to_string())]);
+        let mut progress = SessionEventMsg::PaneProgressChanged {
+            pane_id: "eagle/0".into(),
+            state: PaneProgressState::Unknown,
+            progress: Some(3),
+        };
+        assert_eq!(
+            rewrite_event_to_local(&mut progress, &map).as_deref(),
+            Some("hawk")
+        );
+        assert!(matches!(
+            progress,
+            SessionEventMsg::PaneProgressChanged {
+                state: PaneProgressState::Remove,
+                ..
+            }
+        ));
+        let mut attention = SessionEventMsg::PaneAttention {
+            pane_id: "eagle/0".into(),
+            kind: AttentionKind::Unknown,
+            title: "t".into(),
+            body: "b".into(),
+            attention_id: 1,
+        };
+        assert_eq!(
+            rewrite_event_to_local(&mut attention, &map).as_deref(),
+            Some("hawk")
+        );
+        assert!(matches!(
+            attention,
+            SessionEventMsg::PaneAttention {
+                kind: AttentionKind::TurnDone,
+                ..
+            }
+        ));
+        let mut unknown = SessionEventMsg::Unknown;
+        assert_eq!(rewrite_event_to_local(&mut unknown, &map), None);
+
+        let clients = sendable_clients(vec![
+            sample_client_info(FrontendKind::Unknown),
+            sample_client_info(FrontendKind::Swift),
+        ]);
+        let frontends: Vec<_> = clients.iter().map(|c| c.frontend).collect();
+        assert_eq!(frontends, vec![FrontendKind::Cli, FrontendKind::Swift]);
+    }
+
+    fn sample_client_info(frontend: FrontendKind) -> ClientInfo {
+        ClientInfo {
+            client_id: ClientId(1),
+            connection_id: ConnectionId(1),
+            label: "u@h".into(),
+            machine_id: "m".into(),
+            hostname: "h".into(),
+            username: "u".into(),
+            transport: "uds".into(),
+            attached_panes: vec![],
+            uptime_secs: 0,
+            is_self: false,
+            frontend,
+            build: String::new(),
+            build_profile: String::new(),
+        }
     }
 
     #[test]

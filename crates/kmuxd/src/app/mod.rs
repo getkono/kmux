@@ -859,7 +859,7 @@ impl ServerApp {
         let attention_id = self.next_attention_id.fetch_add(1, Ordering::Relaxed);
         self.broadcast_session_event(kmux_protocol::messages::SessionEventMsg::PaneAttention {
             pane_id: pane_id.to_string(),
-            kind,
+            kind: kind.sendable(),
             title,
             body,
             attention_id,

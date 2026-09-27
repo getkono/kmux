@@ -36,7 +36,7 @@ pub enum ErrorCode {
     /// The client connection named by the request is not attached (issue #146).
     ClientNotFound,
     /// A code this build does not know, from a newer daemon.
-    /// Sent only to relay a value received as `Unknown`.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
     #[serde(other)]
     Unknown,
 }
@@ -66,7 +66,7 @@ pub enum AuthFailure {
     /// presented in `Auth`.
     IdentityRejected,
     /// A refusal this build does not know, from a newer daemon.
-    /// Sent only to relay a value received as `Unknown`.
+    /// Never sent (`docs/architecture-protocol-versioning.md`).
     #[serde(other)]
     Unknown,
 }

@@ -91,16 +91,19 @@ still decodes. A known name with a malformed payload is still an error.
 | `AuthFailure` | `AuthResult.failure` | Treats it as a refusal without a hint; shows `reason` |
 | `Compression` | `AuthResult.compression` | Nothing: the field is informational, frames self-describe |
 | `SessionEventMsg` | `ServerMessage::Event` | Ignores the event; a hub does not relay it |
-| `PaneProgressState` | `PaneInfo`, `PaneProgressChanged` | Draws no progress bar |
-| `AttentionKind` | `Notify`, `PaneAttention` | Words it as a plain request for attention |
-| `FrontendKind` | `Auth.client_kind`, `ClientInfo.frontend` | Shows `unknown` |
+| `PaneProgressState` | `PaneInfo`, `PaneProgressChanged` | Treats it as `Remove`: no progress bar |
+| `AttentionKind` | `Notify`, `PaneAttention` | Treats it as `TurnDone`, the plain request for attention |
+| `FrontendKind` | `Auth.client_kind`, `ClientInfo.frontend` | Shows `unknown`; reports it as `Cli` |
 | `PeerTarget` | `OpenPeer.target` | The daemon answers `PeerError` |
-| `LayoutScheme` | `ApplyLayoutScheme.scheme` | The daemon leaves the layout as it is |
+| `LayoutScheme` | `ApplyLayoutScheme.scheme` | The daemon ignores the request |
 
-A build never originates `Unknown`. It sends one only when it relays a value
-it received as `Unknown` (a hub forwarding a peer's event, a daemon reporting a
-client's `client_kind`); the receiver then treats it like the variant it
-stands for.
+**A build never sends `Unknown`.** Where it passes on a value it received as
+`Unknown`, it sends the known value that one is treated as (`sendable()` on
+`AttentionKind`, `PaneProgressState` and `FrontendKind`): a daemon broadcasting
+a newer client's `Notify`, reporting its `client_kind`, or a hub relaying a
+peer's events, session list and client list. A hub drops an unknown event, and a
+daemon neither applies nor forwards an unknown layout scheme. So a `1.1.0` build
+never puts a value on the wire a `1.0.0` peer cannot decode.
 
 The other nested enums stay strict, because an older build cannot act
 correctly on a value it does not understand, or because the enum also crosses a
