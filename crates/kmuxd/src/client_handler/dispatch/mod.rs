@@ -351,9 +351,9 @@ pub(super) mod testing {
 
     pub(super) use kmux_protocol::messages::{
         AttentionKind, AuthFailure, ClientCapabilities, ClientId, ClientMessage, Compression,
-        ErrorCode, KeyAction, KeyCode, KeyEvent, KeyMods, LayoutScheme, PROTOCOL_RANGE, PeerTarget,
-        ProtocolRange, ProtocolVersion, ServerMessage, SessionEventMsg, SplitDir, TermSize,
-        protocol_capabilities,
+        DaemonInstanceId, ErrorCode, KeyAction, KeyCode, KeyEvent, KeyMods, LayoutScheme,
+        PROTOCOL_RANGE, PeerTarget, ProtocolRange, ProtocolVersion, ResumeFrom, ServerMessage,
+        SessionEventMsg, SplitDir, TermSize, protocol_capabilities,
     };
     pub(super) use kmux_protocol::{Compressor, TransportKind};
 
@@ -389,7 +389,7 @@ pub(super) mod testing {
         state: &mut SharedClientState,
         identity: &kmux_sys::identity::Identity,
         protocol_capabilities: Vec<String>,
-        connection_id: Option<kmux_protocol::messages::ConnectionId>,
+        resume: Option<ResumeFrom>,
     ) {
         // Step 1: Auth → the daemon stashes a challenge in `state.pending_auth`.
         let ok = handle_message(
@@ -399,7 +399,8 @@ pub(super) mod testing {
                 protocol_range: PROTOCOL_RANGE,
                 protocol_capabilities,
                 capabilities: ClientCapabilities::default(),
-                connection_id,
+                connection_id: resume.map(|from| from.connection_id),
+                resume_instance: resume.and_then(|from| from.instance),
                 public_key: identity.public_key_bytes().to_vec(),
                 hostname: "host".to_string(),
                 username: "user".to_string(),

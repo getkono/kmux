@@ -194,10 +194,13 @@ impl SessionManager {
         }
 
         match msg {
+            // The run the link reached (`daemon_instance`) is taken from the
+            // bootstrap outcome, which decides the resume before this arrives.
             ServerMessage::AuthResult {
                 success,
                 reason,
                 failure,
+                daemon_instance: _,
                 client_id,
                 server_version,
                 connection_id,

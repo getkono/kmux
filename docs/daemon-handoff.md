@@ -300,11 +300,15 @@ cross-process tests in `crates/kmuxd/tests/handoff_e2e.rs`.
 
 ## Out of scope
 
-- **Listening sockets / the QUIC endpoint are not migrated.** Ephemeral ports and
-  the auth token rotate; connected clients reconnect via the existing logic
+- **Listening sockets / the QUIC endpoint are not migrated.** Ephemeral ports
+  change, and the token does too when the successor falls back to restoring
+  from the checkpoint (one that adopts the live panes adopts the token);
+  connected clients
+  reconnect via the existing logic
   (re-auth with the adopted token; a GUI reconnects automatically and, seeing a
-  new daemon pid, re-attaches every pane for a snapshot and drops the input it
-  held during the gap — issue #208, see connection.md). The successor
+  new daemon run — the successor's `AuthResult.daemon_instance` differs — re-attaches
+  every pane for a snapshot and drops the input it held during the gap — issue #208,
+  see connection.md). The successor
   adopts the predecessor's token so re-auth is seamless. True zero-downtime
   *client* connections (passing listener fds) is a possible future follow-up.
 - `relay.rs::foreground_process_name` still reads `/proc/<pgid>/comm` (Linux-only

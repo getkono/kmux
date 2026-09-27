@@ -22,7 +22,8 @@ use kmux_connect::connect::ConnectResult;
 use kmux_connect::ssh::{self, RemoteTarget};
 use kmux_connect::tcp_connect::connect_tcp_tls;
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientMessage, PeerId, PeerTarget, ServerMessage, SessionEntry,
+    AuthFailure, ClientCapabilities, ClientMessage, PeerId, PeerTarget, ServerMessage,
+    SessionEntry, refusal_reason,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -184,6 +185,28 @@ pub(super) async fn connect_upstream(target: PeerTarget) -> Result<Upstream, Str
     })
 }
 
+/// Why the peer refused the link, for the log and for `PeerError`: the
+/// refusal and, where there is one, what to do about it. A peer refusing the
+/// token is up but no longer the run the token was issued by — a `kmuxd`
+/// started outright issues a new one — and nothing the hub holds can re-open
+/// it (see `docs/architecture-federation.md`, "Re-discovering a restarted
+/// peer").
+pub(super) fn refused(reason: Option<String>, failure: Option<AuthFailure>) -> String {
+    let text = refusal_reason(reason, failure);
+    let remedy = match failure {
+        Some(AuthFailure::BadToken) => Some(
+            "the peer issues a new token when it restarts: open it again with the new one \
+             (an SSH peer is re-negotiated and never needs this)",
+        ),
+        Some(other) => other.hint(),
+        None => None,
+    };
+    match remedy {
+        Some(remedy) => format!("peer rejected authentication: {text} ({remedy})"),
+        None => format!("peer rejected authentication: {text}"),
+    }
+}
+
 /// The handshake on an opened link: answer the identity challenge with
 /// `answer` (our own key, in production), await the authentication result,
 /// then fetch the peer's session list. The hub authenticates upstream as a
@@ -212,13 +235,9 @@ pub(super) async fn handshake(
             Some(ServerMessage::AuthResult {
                 success: false,
                 reason,
+                failure,
                 ..
-            }) => {
-                return Err(format!(
-                    "peer rejected authentication: {}",
-                    reason.unwrap_or_else(|| "unknown reason".to_string())
-                ));
-            }
+            }) => return Err(refused(reason, failure)),
             _ => return Err("peer did not complete authentication in time".to_string()),
         }
     }
@@ -329,7 +348,10 @@ async fn reopen(peer_id: &str, conn: &Mutex<PeerConnection>) -> Upstream {
 
 /// Put `upstream` in the dead link's place: reconcile the peer's sessions,
 /// send on the new link, park its tunnel, and re-attach every proxied pane
-/// (for a snapshot: the peer may be a new daemon run). Returns what to feed,
+/// for a snapshot — whatever run the peer is. A snapshot is right for a new
+/// run, whose seqnos start over, and for the same one: a seqno replay would
+/// carry only the diffs, not the scrollback appended while the link was down,
+/// and the hub's mirror has no way to fetch that back. Returns what to feed,
 /// or `None` when the user closed the peer during the reopen: the new link
 /// is then dropped (its tunnel killed) and nothing is registered for it.
 ///
@@ -588,14 +610,15 @@ mod tests {
         assert!(!listed[0].peer_unreachable);
     }
 
-    fn auth_result(success: bool, reason: Option<&str>) -> ServerMessage {
+    fn auth_result(success: bool, failure: Option<AuthFailure>) -> ServerMessage {
         ServerMessage::AuthResult {
             success,
-            reason: reason.map(str::to_string),
-            failure: None,
+            reason: failure.map(|f| f.to_string()),
+            failure,
             client_id: None,
             server_version: None,
             connection_id: None,
+            daemon_instance: None,
             compression: None,
             machine_id: None,
             label: None,
@@ -671,11 +694,8 @@ mod tests {
             Err("failed to answer peer identity challenge".to_string())
         );
         let (result, _, sent) =
-            run_handshake(vec![auth_result(false, Some("bad token"))], true).await;
-        assert_eq!(
-            result,
-            Err("peer rejected authentication: bad token".to_string())
-        );
+            run_handshake(vec![auth_result(false, Some(AuthFailure::BadToken))], true).await;
+        assert_eq!(result, Err(refused(None, Some(AuthFailure::BadToken))));
         assert!(sent.is_empty(), "no list asked for");
         let (result, _, _) = run_handshake(vec![auth_result(true, None)], true).await;
         assert_eq!(
@@ -686,6 +706,37 @@ mod tests {
         assert_eq!(
             result,
             Err("peer did not complete authentication in time".to_string())
+        );
+    }
+
+    /// A refused link says why, and what to do about it where anything can
+    /// be done: a rotated token needs the peer opened again with the new one.
+    #[test]
+    fn a_refusal_names_its_remedy() {
+        use kmux_protocol::messages::{PROTOCOL_RANGE, ProtocolRange, ProtocolVersion};
+
+        let token = refused(None, Some(AuthFailure::BadToken));
+        assert!(
+            token.starts_with("peer rejected authentication: invalid token ("),
+            "{token}"
+        );
+        assert!(token.contains("new token"), "{token}");
+        let mismatch = refused(
+            None,
+            Some(AuthFailure::ProtocolMismatch {
+                client: PROTOCOL_RANGE,
+                daemon: ProtocolRange::exact(ProtocolVersion::new(2, 0, 0)),
+            }),
+        );
+        assert!(mismatch.contains("ranges overlap"), "{mismatch}");
+        assert_eq!(
+            refused(Some("go away".into()), None),
+            "peer rejected authentication: go away",
+            "an older peer's text, with nothing to add"
+        );
+        assert_eq!(
+            refused(None, Some(AuthFailure::IdentityRejected)),
+            "peer rejected authentication: identity verification failed"
         );
     }
 

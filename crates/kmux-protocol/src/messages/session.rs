@@ -17,11 +17,34 @@ pub const RESYNC_REQUEST_ID: RequestId = RequestId::MAX;
 /// (QUIC ↔ TCP), or reconnects while the daemon still holds the old channel, it
 /// passes its `ConnectionId` and keeps its registration — client id and label —
 /// provided it proves the same identity (`machine_id`) the connection was
-/// registered with (issue #208). Pane streams do not move by themselves: a
-/// client re-attaches each pane, with its `last_seqno` to be sent only what it
-/// missed.
+/// registered with (issue #208), and names the same daemon run
+/// ([`DaemonInstanceId`]). Pane streams do not move by themselves: a client
+/// re-attaches each pane, with its `last_seqno` to be sent only what it missed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConnectionId(pub u64);
+
+/// One run of one daemon: drawn at random when a `kmuxd` process starts, and
+/// sent in every successful `AuthResult`.
+///
+/// Everything a run numbers — connection ids, client ids, pane seqnos — starts
+/// over in the next run, so "the same daemon" means "the same instance id", not
+/// the same pid (a restarted daemon may reuse one) or the same address. A
+/// handoff successor is a new process and so a new run. Only equality means
+/// anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct DaemonInstanceId(pub u64);
+
+/// A registration a client asks to resume on a new channel: the
+/// [`ConnectionId`] the daemon assigned, and the run that assigned it (`None`
+/// when that daemon predates [`DaemonInstanceId`]). Travels as `Auth`'s
+/// `connection_id` and `resume_instance`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeFrom {
+    /// The registration to take over.
+    pub connection_id: ConnectionId,
+    /// The daemon run that registration belongs to.
+    pub instance: Option<DaemonInstanceId>,
+}
 
 /// Unique word-based session identifier (a single word from the EFF long wordlist).
 /// Example: `"eagle"`, `"falcon"`.

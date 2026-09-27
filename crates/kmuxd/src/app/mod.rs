@@ -31,8 +31,8 @@ use std::time::Instant;
 use kmux_protocol::TransportKind;
 use kmux_protocol::control_rpc::{ConnectionInfo, SessionConnections, SessionsResponse};
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ConnectionId, FrontendKind, InputMode, PaneId, PaneInfo,
-    PaneProgressState, SessionStatus, TermSize, epoch_millis,
+    ClientCapabilities, ClientId, ConnectionId, DaemonInstanceId, FrontendKind, InputMode, PaneId,
+    PaneInfo, PaneProgressState, ResumeFrom, SessionStatus, TermSize, epoch_millis,
 };
 use kmux_pty::events::SessionEvent;
 use kmux_pty::registry::SessionManager as PtyRegistry;
@@ -600,6 +600,11 @@ pub enum Resume {
     /// The registration was made by another machine: refused, and this is a
     /// fresh connection. A token alone takes nothing over.
     OtherMachine,
+    /// The `connection_id` was assigned by another daemon run (a
+    /// predecessor, or a daemon since restarted): refused, and this is a
+    /// fresh connection. The same number in this run names someone else's
+    /// registration, if anyone's.
+    OtherRun,
 }
 
 /// Compose a user-readable connection label `username@hostname`, appending a
@@ -655,6 +660,9 @@ pub struct ServerApp {
     next_client_id: AtomicU64,
     /// Monotonic connection ID counter.
     next_connection_id: AtomicU64,
+    /// This run's identity, drawn at random when the process starts and sent
+    /// in every successful `AuthResult`. A handoff successor draws its own.
+    pub instance_id: DaemonInstanceId,
     /// Monotonic attention ID counter (issue #169). Stamped onto every
     /// `PaneAttention` broadcast so clients can dedup to one notification when
     /// several windows of one GUI process are attached to the session.
@@ -728,6 +736,7 @@ impl ServerApp {
             session_index_counter: AtomicU32::new(0),
             next_client_id: AtomicU64::new(1),
             next_connection_id: AtomicU64::new(1),
+            instance_id: DaemonInstanceId(rand::random()),
             next_attention_id: AtomicU64::new(1),
             connections: RwLock::new(HashMap::new()),
             wordlist: Mutex::new(WordlistSampler::new()),
@@ -876,10 +885,12 @@ impl ServerApp {
     /// on a new channel (a transport switch, or a reconnect that arrives while
     /// the old channel's loop is still alive).
     ///
-    /// A resume needs `incoming_conn_id` to name a live registration **and**
-    /// `identity.machine_id` to equal the one that registration was made with
-    /// (issue #208): a token alone does not let one machine take over another's
-    /// connection and its attachments. A resume bumps the registration's
+    /// A resume needs `resume_from` to name a live registration of **this**
+    /// run — its `instance` equal to [`Self::instance_id`], or absent from a
+    /// client that predates it — **and** `identity.machine_id` to equal the one
+    /// that registration was made with (issue #208): a token alone does not
+    /// let one machine take over another's connection and its attachments,
+    /// and a number from another run names nothing of the client's. A resume bumps the registration's
     /// generation and returns `previous_transport: Some(old)`, which the caller
     /// sends back in `ChannelSwitched` once the new channel signals
     /// `ChannelReady`; the label and identity are kept. Anything else — no id,
@@ -890,14 +901,17 @@ impl ServerApp {
         &self,
         transport: TransportKind,
         new_metrics: Arc<ConnectionMetrics>,
-        incoming_conn_id: Option<ConnectionId>,
+        resume_from: Option<ResumeFrom>,
         identity: ClientIdentity,
     ) -> RegisteredClient {
-        let resume = match incoming_conn_id {
+        let resume = match resume_from {
             None => Resume::NotRequested,
-            Some(conn_id) => {
+            Some(from) if from.instance.is_some_and(|run| run != self.instance_id) => {
+                Resume::OtherRun
+            }
+            Some(from) => {
                 match self
-                    .resume_connection(conn_id, transport, &identity.machine_id)
+                    .resume_connection(from.connection_id, transport, &identity.machine_id)
                     .await
                 {
                     Ok(resumed) => return resumed,
@@ -1155,6 +1169,7 @@ mod tests {
     use std::sync::atomic::Ordering;
 
     use kmux_protocol::TransportKind;
+    use kmux_protocol::messages::ResumeFrom;
 
     use super::{ClientIdentity, ConnectionMetrics, KickOutcome, ServerApp};
 
@@ -1335,7 +1350,10 @@ mod tests {
             .register_client(
                 TransportKind::Quic,
                 Arc::clone(&new_metrics),
-                Some(conn_id),
+                Some(ResumeFrom {
+                    connection_id: conn_id,
+                    instance: None,
+                }),
                 ClientIdentity::default(),
             )
             .await;
@@ -1662,10 +1680,15 @@ mod tests {
 
     // ─── Resume reconciliation (issue #68) ────────────────────────────────────
 
+    /// Buffer diffs `range` as if the pane had produced them: the seqno
+    /// counter moves past the last one, as the relay's would.
     fn push_seqnos(relay: &PaneRelay, range: std::ops::RangeInclusive<u64>) {
         use kmux_protocol::messages::{
             CellState, CursorState, DiffOp, SequenceNo, TermModes, TerminalDiff,
         };
+        relay
+            .seqno_counter
+            .store(range.end() + 1, Ordering::Relaxed);
         let mut buf = relay.scrollback.lock().unwrap();
         for n in range {
             buf.push(
@@ -1712,6 +1735,29 @@ mod tests {
             }
             other => panic!("expected Delta, got a different variant: {other:?}"),
         }
+    }
+
+    /// A `last_seqno` past anything this pane produced was issued by another
+    /// daemon run (a client that predates the run check, or a stale one): a
+    /// delta from it would be empty and leave the client showing the old
+    /// run's screen, so it is answered with a fresh snapshot.
+    #[tokio::test]
+    async fn compute_replay_from_a_seqno_this_pane_never_reached_resets() {
+        use super::attach::compute_replay;
+        use kmux_protocol::messages::SequenceNo;
+        let relay = make_relay(24, 80);
+        push_seqnos(&relay, 1..=5);
+        match compute_replay(&relay, Some(SequenceNo(6))) {
+            AttachResult::SyncReset(_, seqno) => assert_eq!(seqno, SequenceNo(5)),
+            other => panic!("expected SyncReset, got {other:?}"),
+        }
+        assert!(
+            matches!(
+                compute_replay(&relay, Some(SequenceNo(5))),
+                AttachResult::Delta(diffs) if diffs.is_empty()
+            ),
+            "the current seqno itself is in step: nothing to replay"
+        );
     }
 
     #[tokio::test]
@@ -1842,7 +1888,10 @@ mod tests {
             .register_client(
                 TransportKind::Quic,
                 Arc::new(ConnectionMetrics::new()),
-                Some(first.connection_id),
+                Some(ResumeFrom {
+                    connection_id: first.connection_id,
+                    instance: None,
+                }),
                 machine("m-a"),
             )
             .await;
@@ -1905,7 +1954,10 @@ mod tests {
             .register_client(
                 TransportKind::Quic,
                 Arc::new(ConnectionMetrics::new()),
-                Some(first.connection_id),
+                Some(ResumeFrom {
+                    connection_id: first.connection_id,
+                    instance: None,
+                }),
                 machine("m-a"),
             )
             .await;
@@ -1936,7 +1988,10 @@ mod tests {
             .register_client(
                 TransportKind::Tcp,
                 Arc::new(ConnectionMetrics::new()),
-                Some(first.connection_id),
+                Some(ResumeFrom {
+                    connection_id: first.connection_id,
+                    instance: None,
+                }),
                 machine("m-b"),
             )
             .await;
@@ -1950,6 +2005,63 @@ mod tests {
                 .await,
             "the original registration is untouched"
         );
+    }
+
+    /// A connection id from another daemon run names nothing of the
+    /// client's — here it names a live registration of this run, made by the
+    /// same machine — so it takes nothing over, while the same id with this
+    /// run's instance resumes (issue #209).
+    #[tokio::test]
+    async fn resume_from_another_daemon_run_registers_a_fresh_connection() {
+        use kmux_protocol::messages::DaemonInstanceId;
+
+        let app = crate::fixtures::fixture_app();
+        let first = app
+            .register_client(
+                TransportKind::Tcp,
+                Arc::new(ConnectionMetrics::new()),
+                None,
+                machine("m-a"),
+            )
+            .await;
+        let stale = app
+            .register_client(
+                TransportKind::Quic,
+                Arc::new(ConnectionMetrics::new()),
+                Some(ResumeFrom {
+                    connection_id: first.connection_id,
+                    instance: Some(DaemonInstanceId(app.instance_id.0.wrapping_add(1))),
+                }),
+                machine("m-a"),
+            )
+            .await;
+        assert_eq!(stale.resume, super::Resume::OtherRun);
+        assert_ne!(stale.connection_id, first.connection_id);
+        assert_eq!(stale.generation, 0);
+        assert!(stale.previous_transport.is_none());
+
+        let resumed = app
+            .register_client(
+                TransportKind::Quic,
+                Arc::new(ConnectionMetrics::new()),
+                Some(ResumeFrom {
+                    connection_id: first.connection_id,
+                    instance: Some(app.instance_id),
+                }),
+                machine("m-a"),
+            )
+            .await;
+        assert_eq!(resumed.resume, super::Resume::Resumed);
+        assert_eq!(resumed.connection_id, first.connection_id);
+        assert_eq!(resumed.generation, 1);
+    }
+
+    /// Each daemon run draws its own instance id.
+    #[test]
+    fn every_run_has_its_own_instance_id() {
+        let a = crate::fixtures::fixture_app();
+        let b = crate::fixtures::fixture_app();
+        assert_ne!(a.instance_id, b.instance_id);
     }
 
     /// Only the generation a registration currently holds releases it.
@@ -1968,7 +2080,10 @@ mod tests {
             .register_client(
                 TransportKind::Tcp,
                 Arc::new(ConnectionMetrics::new()),
-                Some(first.connection_id),
+                Some(ResumeFrom {
+                    connection_id: first.connection_id,
+                    instance: None,
+                }),
                 machine("m-a"),
             )
             .await;
@@ -1984,7 +2099,10 @@ mod tests {
             .register_client(
                 TransportKind::Tcp,
                 Arc::new(ConnectionMetrics::new()),
-                Some(first.connection_id),
+                Some(ResumeFrom {
+                    connection_id: first.connection_id,
+                    instance: None,
+                }),
                 machine("m-a"),
             )
             .await;
@@ -2051,7 +2169,10 @@ mod tests {
             .register_client(
                 TransportKind::Quic,
                 Arc::new(ConnectionMetrics::new()),
-                Some(first.connection_id),
+                Some(ResumeFrom {
+                    connection_id: first.connection_id,
+                    instance: None,
+                }),
                 machine("m-a"),
             )
             .await;

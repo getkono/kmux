@@ -516,6 +516,7 @@ mod tests {
             protocol_capabilities: protocol_capabilities(),
             capabilities: ClientCapabilities::default(),
             connection_id: None,
+            resume_instance: None,
             public_key: identity.public_key_bytes().to_vec(),
             hostname: "host".to_string(),
             username: "user".to_string(),

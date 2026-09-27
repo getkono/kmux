@@ -2,7 +2,7 @@ use std::path::Path;
 #[cfg(feature = "remote")]
 use std::sync::{Arc, Mutex};
 
-use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ConnectionId, ServerMessage};
+use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ResumeFrom, ServerMessage};
 use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
 #[cfg(feature = "remote")]
 use kmux_sys::tls::{TofuStore, TofuVerifier};
@@ -17,7 +17,8 @@ use crate::connect::ConnectResult;
 /// Encode and write the initial `Auth` frame on a freshly-opened control stream.
 ///
 /// Centralises the auth handshake payload — token + supported protocol range +
-/// named protocol/application capabilities + `connection_id` + this process's identity claim
+/// named protocol/application capabilities + the registration to resume
+/// (`connection_id` + `resume_instance`) + this process's identity claim
 /// (public key + hostname/username, issue #146) — so every transport (UDS / TCP
 /// / TCP+TLS / QUIC) sends a byte-identical frame and a new `Auth` field is wired
 /// in exactly one place. The daemon replies with an `AuthChallenge` the caller
@@ -27,15 +28,36 @@ pub(crate) async fn send_auth_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     token: String,
     capabilities: ClientCapabilities,
-    connection_id: Option<ConnectionId>,
+    resume: Option<ResumeFrom>,
 ) -> Result<(), String> {
-    let (public_key, hostname, username) = local_identity_claim();
-    let auth_bytes = encode_client(&ClientMessage::Auth {
+    let auth_bytes = encode_client(&auth_message(
+        token,
+        capabilities,
+        resume,
+        local_identity_claim(),
+    ))
+    .map_err(|e| format!("auth encode failed: {e}"))?;
+    write_frame(writer, &auth_bytes)
+        .await
+        .map_err(|e| format!("auth write failed: {e}"))
+}
+
+/// The `Auth` message [`send_auth_frame`] sends, for this process's identity
+/// claim `(public_key, hostname, username)`: a resumed registration carries
+/// its `connection_id` and the daemon run that assigned it.
+fn auth_message(
+    token: String,
+    capabilities: ClientCapabilities,
+    resume: Option<ResumeFrom>,
+    (public_key, hostname, username): (Vec<u8>, String, String),
+) -> ClientMessage {
+    ClientMessage::Auth {
         token,
         protocol_range: kmux_protocol::messages::PROTOCOL_RANGE,
         protocol_capabilities: kmux_protocol::messages::protocol_capabilities(),
         capabilities,
-        connection_id,
+        connection_id: resume.map(|from| from.connection_id),
+        resume_instance: resume.and_then(|from| from.instance),
         public_key,
         hostname,
         username,
@@ -46,11 +68,7 @@ pub(crate) async fn send_auth_frame<W: AsyncWrite + Unpin>(
         client_git_sha: kmux_protocol::buildinfo::git_sha().to_string(),
         client_git_dirty: kmux_protocol::buildinfo::git_dirty(),
         client_build_profile: kmux_protocol::buildinfo::build_profile().to_string(),
-    })
-    .map_err(|e| format!("auth encode failed: {e}"))?;
-    write_frame(writer, &auth_bytes)
-        .await
-        .map_err(|e| format!("auth write failed: {e}"))
+    }
 }
 
 /// This process's identity claim for the `Auth` handshake (issue #146): the
@@ -99,7 +117,7 @@ pub fn answer_auth_challenge(
 /// The server interleaves `ServerMessage` values on the stream; the client
 /// dispatches them by message type (`pane_id` fields handle routing).
 ///
-/// Pass `connection_id = Some(id)` to resume an existing session after a
+/// Pass `resume = Some(..)` to resume an existing session after a
 /// transport switch (e.g. QUIC → TCP fallback).
 #[cfg(feature = "remote")]
 pub async fn connect_tcp(
@@ -108,7 +126,7 @@ pub async fn connect_tcp(
     token: String,
     server_tx: mpsc::UnboundedSender<ServerMessage>,
     capabilities: ClientCapabilities,
-    connection_id: Option<ConnectionId>,
+    resume: Option<ResumeFrom>,
 ) -> ConnectResult {
     let stream = match TcpStream::connect(format!("{host}:{port}")).await {
         Ok(s) => s,
@@ -123,7 +141,7 @@ pub async fn connect_tcp(
     let (mut read_half, mut write_half) = stream.into_split();
 
     // Authenticate immediately.
-    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, connection_id).await {
+    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, resume).await {
         return ConnectResult::Failed(e);
     }
 
@@ -185,7 +203,7 @@ pub async fn connect_tcp_tls(
     token: String,
     server_tx: mpsc::UnboundedSender<ServerMessage>,
     capabilities: ClientCapabilities,
-    connection_id: Option<ConnectionId>,
+    resume: Option<ResumeFrom>,
     accept_invalid: bool,
 ) -> ConnectResult {
     use rustls::pki_types::ServerName;
@@ -225,7 +243,7 @@ pub async fn connect_tcp_tls(
 
     let (mut read_half, mut write_half) = tokio::io::split(tls_stream);
 
-    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, connection_id).await {
+    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, resume).await {
         return ConnectResult::Failed(e);
     }
 
@@ -279,7 +297,7 @@ pub async fn connect_uds(
     token: String,
     server_tx: mpsc::UnboundedSender<ServerMessage>,
     capabilities: ClientCapabilities,
-    connection_id: Option<ConnectionId>,
+    resume: Option<ResumeFrom>,
 ) -> ConnectResult {
     let socket_path = socket_path.as_ref();
 
@@ -295,7 +313,7 @@ pub async fn connect_uds(
 
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
-    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, connection_id).await {
+    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, resume).await {
         return ConnectResult::Failed(e);
     }
 
@@ -367,4 +385,62 @@ fn set_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
     let fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(stream.as_raw_fd()) };
     setsockopt(&fd, sockopt::KeepAlive, &true)
         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+}
+
+#[cfg(test)]
+mod tests {
+    use kmux_protocol::messages::{ConnectionId, DaemonInstanceId, PROTOCOL_RANGE};
+
+    use super::*;
+
+    fn claim() -> (Vec<u8>, String, String) {
+        (vec![7; 32], "host".into(), "user".into())
+    }
+
+    #[test]
+    fn an_auth_resumes_the_connection_in_the_run_that_assigned_it() {
+        let resume = ResumeFrom {
+            connection_id: ConnectionId(4),
+            instance: Some(DaemonInstanceId(9)),
+        };
+        match auth_message(
+            "tok".into(),
+            ClientCapabilities::default(),
+            Some(resume),
+            claim(),
+        ) {
+            ClientMessage::Auth {
+                token,
+                protocol_range,
+                connection_id,
+                resume_instance,
+                public_key,
+                hostname,
+                username,
+                ..
+            } => {
+                assert_eq!(token, "tok");
+                assert_eq!(protocol_range, PROTOCOL_RANGE);
+                assert_eq!(connection_id, Some(ConnectionId(4)));
+                assert_eq!(resume_instance, Some(DaemonInstanceId(9)));
+                assert_eq!(
+                    (public_key, hostname, username),
+                    (vec![7; 32], "host".to_string(), "user".to_string())
+                );
+            }
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_first_auth_resumes_nothing() {
+        assert!(matches!(
+            auth_message("tok".into(), ClientCapabilities::default(), None, claim()),
+            ClientMessage::Auth {
+                connection_id: None,
+                resume_instance: None,
+                ..
+            }
+        ));
+    }
 }
