@@ -875,3 +875,59 @@ count = 1
 [[allows]]
 crate = "kmuxd"
 count = 7
+
+[[mutants]]
+crate = "kmux"
+missed = 27
+
+[[mutants]]
+crate = "kmux-app"
+missed = 669
+
+[[mutants]]
+crate = "kmux-client"
+missed = 300
+
+[[mutants]]
+crate = "kmux-connect"
+missed = 149
+
+[[mutants]]
+crate = "kmux-ffi"
+missed = 176
+
+[[mutants]]
+crate = "kmux-ghostty"
+missed = 35
+
+[[mutants]]
+crate = "kmux-gtk"
+missed = 727
+
+[[mutants]]
+crate = "kmux-protocol"
+missed = 37
+
+[[mutants]]
+crate = "kmux-pty"
+missed = 65
+
+[[mutants]]
+crate = "kmux-render"
+missed = 320
+
+[[mutants]]
+crate = "kmux-sys"
+missed = 27
+
+[[mutants]]
+crate = "kmux-vt-core"
+missed = 61
+
+[[mutants]]
+crate = "kmux-vt-worker"
+missed = 8
+
+[[mutants]]
+crate = "kmuxd"
+missed = 329

@@ -177,7 +177,7 @@ rows 2026-09-27 (issue #211):
 | R3/R13 — no test-only lock | 98 sites / 10 files | **0 / 0** | 0 — reached |
 | R4 — no function over 100 lines | 45 (largest 888 lines) | 34 by the audit snippet (largest 417, `async_main`, a registered exception) | 0, minus the exceptions register |
 | R5 — no double in a release build | 2 (`kmux-pty`'s `pub mod mock`) | **0** | 0 — reached |
-| R12 — mutation score is the coverage bar | 3 crates fabricated, 5 never swept | scoring fixed; the first weekly sweep ran 7 of its 8 shards, so **no complete sweep yet** | a recorded `[[mutants]]` budget per crate |
+| R12 — mutation score is the coverage bar | 3 crates fabricated, 5 never swept | **a budget per crate**, from the first complete sweep (2,930 missed, most in `kmux-gtk`, `kmux-app`, `kmuxd` and `kmux-render`) | budgets that only shrink |
 
 Every case reached zero the same way — take the thing the test needs to vary and
 make it a parameter:
@@ -215,18 +215,18 @@ actually a proxy for — logic per function. `handle_server_message` went from
 761 lines of reconciliation to a table over 52 named handlers, and the
 mutants that stand for "this message does nothing" went from 2 to 104.
 
-R12 is the one row that is not yet a number. The scoring bug is fixed and the
-believability check is in place. The first scheduled sweep (2026-09-27) was
-believable but not whole: its shards were numbered 1-8 where cargo-mutants
-counts from 0, so shard 8/8 refused to start and shard 0/8 — an eighth of the
-mutants — never ran, while the judge merged the other seven as if they were
-everything. Budgets read off it would be too tight by whatever that eighth
-misses, so `[[mutants]]` stays empty; the shards now run 0-7, and the judge
-refuses a sweep with fewer than eight. Meanwhile the per-PR CI job mutates only
-the diff — which needs no baseline, because its scope *is* the change under
-review, and which `mutants-gate --diff` holds to zero survivors whatever the
-table later records. The weekly sweep is what fills the table in. Recording the
-June numbers instead would have been worse than recording nothing.
+R12 became a number on 2026-09-27. The scoring bug was fixed and the
+believability check in place, but the first scheduled sweep was believable and
+not whole: its shards were numbered 1-8 where cargo-mutants counts from 0, so
+shard 8/8 refused to start and shard 0/8 — an eighth of the mutants — never
+ran, while the judge merged the other seven as if they were everything. The
+shards now run 0-7 and the judge refuses a sweep unless all eight finished. The
+`[[mutants]]` budgets were recorded from the first complete one (run
+36339914509, at the head of the #211 lifecycle branch, before the suite's
+de-duplication, which deleted only tests another test pins). Per PR, CI still
+mutates only the diff — which needs no baseline, because its scope *is* the
+change under review, and which `mutants-gate --diff` holds to zero survivors
+whatever the table records; the weekly sweep holds the table.
 
 These are budgets, not aspirations: each one is recorded in
 `quality-baseline.toml` and may only shrink. CI fails both when a count rises
