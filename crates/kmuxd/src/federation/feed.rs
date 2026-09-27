@@ -506,18 +506,22 @@ mod tests {
             word_id: "fedremote".to_string(),
             exit_code: None,
         };
-        let frames = if event_first {
-            [event, ack]
+        // Each frame is taken in whole before the next is sent, so with the
+        // ack first `close_remote_session` itself closes the session.
+        let settle = || tokio::time::sleep(std::time::Duration::from_millis(10));
+        if event_first {
+            peer.send(event).unwrap();
+            settle().await;
+            assert!(!app.is_federated_session("fedlocal"), "the event closed it");
+            peer.send(ack).unwrap();
+            closing.await.unwrap().expect("closed");
         } else {
-            [ack, event]
-        };
-        for frame in frames {
-            peer.send(frame).unwrap();
+            peer.send(ack).unwrap();
+            closing.await.unwrap().expect("closed");
+            assert!(!app.is_federated_session("fedlocal"), "the close did");
+            peer.send(event).unwrap();
+            settle().await;
         }
-        closing.await.unwrap().expect("closed");
-        // Let the feed take in the frame after the ack too.
-        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        assert!(!app.is_federated_session("fedlocal"));
         let mut closed = Vec::new();
         while let Ok(msg) = broadcasts.try_recv() {
             closed.extend(closed_word(&msg));

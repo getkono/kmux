@@ -998,15 +998,31 @@ impl PeerManager {
         })
         .await?;
         let _membership = self.membership();
-        if remote_word.is_some()
-            && lock(&conn).local_to_remote.get(local_word) == remote_word.as_ref()
-        {
+        if remote_word.is_some_and(|remote| self.still_names(local_word, &conn, &remote)) {
             self.unregister_session(app, local_word);
             app.broadcast_session_event(SessionEventMsg::SessionClosed {
                 word_id: local_word.to_string(),
             });
         }
         Ok(())
+    }
+
+    /// Whether `local_word` still names `conn`'s session `remote_word`: not
+    /// closed by the peer's own event, nor released by `close_peer` (which
+    /// leaves the connection's maps as they were) and drawn again since.
+    /// Asked under the membership gate.
+    fn still_names(
+        &self,
+        local_word: &str,
+        conn: &Arc<Mutex<PeerConnection>>,
+        remote_word: &str,
+    ) -> bool {
+        self.conn_for_word(local_word)
+            .is_some_and(|open| Arc::ptr_eq(&open, conn))
+            && lock(conn)
+                .local_to_remote
+                .get(local_word)
+                .is_some_and(|mapped| mapped == remote_word)
     }
 
     /// Close tab `tab_index` of the federated session `local_word` on its owning
@@ -1887,6 +1903,29 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
         assert!(gone, "a dropped TunnelGuard must kill the tunnel process");
+    }
+
+    /// A word still names a peer's session only while that peer is open and
+    /// maps it to that same remote session (issue #208).
+    #[tokio::test]
+    async fn a_word_names_a_peer_session_only_while_both_hold() {
+        let app = Arc::new(crate::fixtures::fixture_app());
+        let (_upstream, _peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let mgr = &app.peer_manager;
+        let conn = Arc::clone(&mgr.peers.lock().unwrap()["peer:1"]);
+        assert!(mgr.still_names("fedlocal", &conn, "fedremote"));
+        assert!(!mgr.still_names("fedlocal", &conn, "other"));
+        assert!(!mgr.still_names("unknown", &conn, "fedremote"));
+        app.close_peer("peer:1");
+        assert_eq!(
+            lock(&conn)
+                .local_to_remote
+                .get("fedlocal")
+                .map(String::as_str),
+            Some("fedremote"),
+            "close_peer leaves the connection's maps"
+        );
+        assert!(!mgr.still_names("fedlocal", &conn, "fedremote"));
     }
 
     /// Opening a peer that is open already reuses it without dialling. A live
