@@ -401,13 +401,20 @@ impl PeerConnection {
         }
     }
 
-    /// Send `msg` up the link on behalf of `from`, pinging first when that
-    /// ends another sender's run (see [`routes`]). Whether the link took it.
-    fn send(&mut self, from: &Requester, msg: ClientMessage) -> bool {
+    /// `from` is about to send: ping first when that ends another sender's
+    /// run (see [`routes`]).
+    fn barrier(&mut self, from: &Requester) {
         if let Some(seq) = self.routes.sent(from) {
             let _ = self.client_tx.send(ClientMessage::Ping { seq });
         }
-        self.client_tx.send(msg).is_ok()
+    }
+
+    /// Send `msg` up the link on behalf of `from`, after its barrier. A
+    /// closed link drops it: the link is being closed, and its end answers
+    /// what was waiting.
+    fn send(&mut self, from: &Requester, msg: ClientMessage) {
+        self.barrier(from);
+        let _ = self.client_tx.send(msg);
     }
 
     /// Ping the peer: its `Pong` also marks everything sent before as
