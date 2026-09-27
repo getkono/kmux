@@ -26,6 +26,9 @@ impl ServerApp {
         use std::collections::HashMap;
         use std::sync::atomic::Ordering;
 
+        // Held until the pane is in `sessions`, so a handoff never misses it.
+        let _admitted = self.admit_pane_creation()?;
+
         // Check the session limit
         {
             let sessions = self.sessions.read().await;
@@ -156,6 +159,7 @@ impl ServerApp {
 
         for pane_id in &pane_ids {
             let _ = self.manager.close_nowait(pane_id).await;
+            self.forget_worker_restarts(pane_id);
         }
 
         self.sessions.write().await.remove(word_id);

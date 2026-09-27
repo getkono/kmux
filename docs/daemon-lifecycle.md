@@ -321,7 +321,9 @@ unlinks whatever is at its path — and exits with an error if something answers
 race in between, and on a live answer shuts the whole daemon down rather than
 running on headless. A socket file nothing listens on is stale and removed. A
 graceful-restart successor (`--handoff`) skips both checks: its predecessor
-released the socket to it.
+released the socket to it. The one successor that asks too is one that could
+not reach its predecessor's handoff socket: a daemon still answering the control
+socket is serving, so it stands down (issue #207, `docs/daemon-handoff.md`).
 
 "Is anything listening?" is answered by connecting (`socket_is_live`): a
 connection or `EPERM`/`EACCES` means live; `EAGAIN` is asked again up to eight
@@ -525,6 +527,16 @@ release the lock. They never await the PTY. A per-pane writer task drains the
 queue to the PTY, encoding keys and wrapping pastes against the emulator's live
 modes at write time.
 
+The writer runs under `supervisor::supervise` (issue #207). A panic while it
+encodes an input (a key against a broken emulator state) used to end the task,
+and with it every later keystroke for that pane, silently. Now the input being
+encoded is lost, the panic is logged at `error!`, and after the supervisor's
+backoff a new writer takes over the same queue, which an async mutex shares
+between runs. Input queued in the meantime waits in the queue. Dropping the
+engine (pane close) aborts the supervisor, and the supervisor aborts the run in
+flight with it (`AbortOnDrop`), so a writer blocked on a program that never
+reads still does not outlive its pane.
+
 Before issue #206 the PTY write was awaited under the `sessions` lock, so a
 pane whose child stopped reading stdin blocked once the kernel buffer filled,
 and every `sessions.write()` in the daemon (create, close, resize, attach)
@@ -681,7 +693,11 @@ fsync the directory
   state the successor restores from. A failed final write hands the
   checkpointer back unsealed (`FinalWriteFailed`); `write_final_from` does
   this through the `Option` slot, which the handoff sender and the shutdown
-  path share.
+  path share. A successful one returns a `SealedCheckpoint`: dropping it keeps
+  the file sealed for good, and `unseal()` hands the checkpointer back for a
+  handoff that rolls back after its final write (the sender's
+  `FinalCheckpoint` guard does this on drop, so a rolled-back — or panicked —
+  handoff never leaves the periodic writes refused).
 
 No on-disk format changed, so `STATE_VERSION` is unchanged.
 
@@ -881,12 +897,24 @@ message is sent).
 `restart` via the control socket takes a **distinct** path (`handoff::sender`):
 the daemon spawns a successor and streams each pane's live PTY master fd to it
 over `handoff.sock` (`SCM_RIGHTS`), so running shells survive the restart.
-Instead of the abort→checkpoint→exit sequence above, the outgoing daemon
-quiesces its relays *after* the successor confirms it holds every fd, writes a
-post-quiesce checkpoint, releases its sockets, and exits; the successor adopts
-the auth token and rebuilds each pane around the inherited fd. On any failure it
-rolls back (or the successor falls back to snapshot restore). Full sequence,
-versioning, and fault-tolerance model: `docs/daemon-handoff.md`.
+Instead of the abort→checkpoint→exit sequence above, the outgoing daemon parks
+its PTY readers and writes its final checkpoint once the successor holds every
+fd, then commits on the successor's `Ack`, stops the readers, releases its
+sockets, and exits; the successor adopts the auth token and rebuilds each pane
+around the inherited fd. The handoff runs as a task of its own, so SIGINT and
+SIGTERM are still serviced while it runs, and every frame is bounded (issue
+#207). On any failure before the commit point it rolls back and tells the
+successor to stand down; a SIGINT/SIGTERM before the commit point is such a
+failure (the handoff rolls back, the successor stands down, and this daemon
+shuts down as usual — both stop). The successor is the predecessor's direct
+child (it does not daemonize), so the predecessor also kills one that never
+connects or does not exit after standing down. A successor that stands down
+exits with `HANDOFF_STOOD_DOWN_EXIT_CODE` (75), not 1; the predecessor keeps
+the reason, and `kmux daemon restart` reports it (`handoff stood down: …`)
+from the `handoff` control command instead of timing out. No pane can be
+created while a handoff runs (`KmuxError::HandoffInProgress`). Full sequence,
+versioning, timeouts (`control_rpc::handoff_timeouts`) and fault-tolerance
+model: `docs/daemon-handoff.md`.
 
 This is the mechanism behind a **live upgrade** — `mise run upgrade-daemon` installs a
 new `kmuxd` and restarts onto it without dropping shells (issue #36). The upgrade

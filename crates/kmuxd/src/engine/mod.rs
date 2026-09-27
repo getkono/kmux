@@ -16,6 +16,7 @@
 //! seqno counter, scrollback `DiffBuffer`, and client fan-out stay on
 //! `PaneRelay` and are shared by both variants.
 
+pub mod hold;
 mod in_process;
 mod worker;
 
@@ -166,6 +167,24 @@ impl PaneEngine {
         match self {
             Self::InProcess(_) => None,
             Self::Worker(e) => Some(e.child_pid()),
+        }
+    }
+
+    /// Park the pane's PTY reader between two reads (see [`hold`]). `None` for
+    /// a worker pane: its worker reads the PTY itself, and a handoff leaves it
+    /// running until the commit point.
+    pub fn hold_reader(&self) -> Option<impl Future<Output = ()> + Send + 'static> {
+        match self {
+            Self::InProcess(e) => Some(e.hold_reader()),
+            Self::Worker(_) => None,
+        }
+    }
+
+    /// Let a reader parked by [`Self::hold_reader`] go on.
+    pub fn release_reader(&self) {
+        match self {
+            Self::InProcess(e) => e.release_reader(),
+            Self::Worker(_) => {}
         }
     }
 

@@ -90,7 +90,10 @@ async fn live_restart_preserves_running_shell_across_processes() {
     let accepted = kmux_client::daemon::restart_daemon_at(&sandbox.socket_path())
         .await
         .expect("restart control request");
-    assert!(accepted, "daemon should accept the graceful handoff");
+    assert!(
+        matches!(accepted, kmux_client::daemon::RestartReply::Accepted { .. }),
+        "daemon should accept the graceful handoff"
+    );
 
     let new_pid = wait_for_daemon(&sandbox, Some(old_pid))
         .await
@@ -155,7 +158,10 @@ async fn in_place_binary_swap_still_hands_off() {
     let accepted = kmux_client::daemon::restart_daemon_at(&sandbox.socket_path())
         .await
         .expect("restart control request");
-    assert!(accepted, "daemon should accept the graceful handoff");
+    assert!(
+        matches!(accepted, kmux_client::daemon::RestartReply::Accepted { .. }),
+        "daemon should accept the graceful handoff"
+    );
 
     let new_pid = wait_for_daemon(&sandbox, Some(old_pid))
         .await
@@ -166,6 +172,52 @@ async fn in_place_binary_swap_still_hands_off() {
         pid_alive(child),
         "the running shell must survive an in-place daemon upgrade"
     );
+
+    let _ = kmux_client::daemon::stop_daemon_at(&sandbox.socket_path()).await;
+}
+
+/// B3 (issue #207): a successor that finds no handoff socket while another
+/// daemon still serves stands down — exiting with its own code, without
+/// restoring or binding anything — instead of serving beside it.
+#[tokio::test]
+async fn a_successor_without_a_predecessor_socket_stands_down_while_one_serves() {
+    let sandbox = Sandbox::new();
+    let cleanup = Cleanup::default();
+    let serving = Daemon::new(&sandbox).spawn(None).await;
+    cleanup.track(serving.cast_signed());
+
+    let mut cmd = std::process::Command::new(env!("CARGO_BIN_EXE_kmuxd"));
+    cmd.args([
+        "--daemon",
+        "--handoff",
+        "--bind",
+        "127.0.0.1",
+        "--port",
+        "0",
+    ])
+    .stdin(std::process::Stdio::null())
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::null());
+    sandbox.env(&mut cmd);
+    let mut successor = cmd.spawn().expect("spawn a successor");
+
+    let exited = poll_until(harness::E2E_TIMEOUT, || {
+        matches!(successor.try_wait(), Ok(Some(_)))
+    })
+    .await;
+    if !exited {
+        let _ = successor.kill();
+    }
+    let status = successor.wait().expect("reaped");
+    assert!(exited, "the successor must stand down, not serve");
+    assert_eq!(
+        status.code(),
+        Some(kmux_protocol::control_rpc::HANDOFF_STOOD_DOWN_EXIT_CODE)
+    );
+    let status = kmux_client::daemon::query_daemon_at(&sandbox.socket_path())
+        .await
+        .expect("the serving daemon still answers");
+    assert_eq!(status.pid, serving, "and it is the one that was serving");
 
     let _ = kmux_client::daemon::stop_daemon_at(&sandbox.socket_path()).await;
 }

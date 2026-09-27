@@ -6,13 +6,28 @@
 //! [`supervise`] runs such a task, and when it panics logs the payload at
 //! `error!`, waits a backoff that grows with repeated failures
 //! ([`restart_delay`]) and starts it again.
+//!
+//! Dropping (or aborting) the supervising future stops the run in flight
+//! too, so a supervised task owned by something with a shorter life than the
+//! daemon — a pane's input writer — ends with its owner.
 
 use std::any::Any;
 use std::future::Future;
 use std::time::Duration;
 
+use tokio::task::JoinHandle;
 use tokio::time::Instant;
 use tracing::{error, warn};
+
+/// Aborts a task when dropped, so a task never outlives the owner that
+/// holds this handle — an aborted owner included.
+pub(crate) struct AbortOnDrop<T>(pub(crate) JoinHandle<T>);
+
+impl<T> Drop for AbortOnDrop<T> {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
 
 /// Delay before the first restart after a panic.
 const RESTART_BACKOFF_BASE: Duration = Duration::from_secs(1);
@@ -59,7 +74,8 @@ where
     let mut consecutive_failures = 0u32;
     loop {
         let started = Instant::now();
-        let outcome = match tokio::spawn(make()).await {
+        let mut run = AbortOnDrop(tokio::spawn(make()));
+        let outcome = match (&mut run.0).await {
             Ok(()) => return restarts,
             Err(err) => err.try_into_panic(),
         };
@@ -139,6 +155,38 @@ mod tests {
             started.elapsed() >= RESTART_BACKOFF_BASE,
             "backed off first"
         );
+    }
+
+    /// Aborting the supervisor stops the run it is supervising: the run's
+    /// end of a channel is dropped, so the other end sees it close.
+    #[tokio::test]
+    async fn aborting_the_supervisor_stops_the_supervised_run() {
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<()>(1);
+        let supervisor = tokio::spawn(supervise("test", move || {
+            let tx = tx.clone();
+            async move {
+                let _held = tx;
+                std::future::pending::<()>().await;
+            }
+        }));
+        // Wait until the run holds its sender, then abort the supervisor.
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while rx.sender_strong_count() < 2 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .expect("the run starts");
+        supervisor.abort();
+
+        let closed = tokio::time::timeout(Duration::from_secs(10), async {
+            while rx.sender_strong_count() > 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "the run was stopped with its supervisor");
+        assert!(rx.recv().await.is_none());
     }
 
     /// Back-to-back panics back off longer each time: 1 s, then 2 s.

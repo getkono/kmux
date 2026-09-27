@@ -49,6 +49,7 @@ impl ServerApp {
             .close_nowait(pane_id)
             .await
             .map_err(|e| as_pane_error(pane_id, e))?;
+        self.forget_worker_restarts(pane_id);
 
         // Remove the pane and collapse its tab's layout; remove the tab if it
         // becomes empty, and the session if it has no tabs left.
@@ -200,6 +201,7 @@ impl ServerApp {
                     events: title_sink,
                     scrollback: DEFAULT_SCROLLBACK,
                 })));
+                let (hold, hold_point) = crate::engine::hold::channel();
                 let task = tokio::spawn(session_diff_loop(
                     reader,
                     pane_id.to_string(),
@@ -209,12 +211,14 @@ impl ServerApp {
                     term_state.clone(),
                     seqno_counter.clone(),
                     self.manager.clone(),
+                    hold_point,
                 ));
                 PaneEngine::InProcess(crate::engine::InProcessEngine::new(
                     pane_id.to_string(),
                     term_state,
                     writer,
                     task,
+                    hold,
                     resp_rx,
                 ))
             }

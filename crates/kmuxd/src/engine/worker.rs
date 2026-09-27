@@ -10,12 +10,21 @@
 //! one. A daemon-side [`CellGrid`] mirror, fed from that same stream, answers
 //! `snapshot()` synchronously (no IPC round-trip), which keeps the existing
 //! synchronous attach/resize call sites unchanged.
+//!
+//! Nothing about a worker may hang the daemon (issue #207). The worker must
+//! answer `Hello` within [`READY_TIMEOUT`]; its child handle is a
+//! `tokio::process::Child`, waited on asynchronously, never with a blocking
+//! `wait` on a runtime thread; a stream that goes bad gets the worker killed
+//! before it is reaped; and a worker that has sent nothing for
+//! [`NO_PROGRESS_DEADLINE`] while its PTY holds unread output is taken for
+//! hung and killed. Each of those ends counts as a crash, so the pane is
+//! faulted and its worker respawned.
 
-use std::os::fd::{AsRawFd, OwnedFd, RawFd};
-use std::os::unix::process::CommandExt;
+use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicU64;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use anyhow::Context;
 use kmux_client::grid::CellGrid;
@@ -27,8 +36,9 @@ use kmux_pty::registry::SessionManager;
 use kmux_worker_protocol::{
     ChildExitStatus, WORKER_PROTOCOL_VERSION, WorkerEvent, WorkerRequest, codec,
 };
+use tokio::io::AsyncRead;
 use tokio::net::UnixStream;
-use tokio::net::unix::OwnedReadHalf;
+use tokio::process::Child;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
@@ -43,6 +53,27 @@ use crate::scrollback::DiffBuffer;
 /// Env var overriding the worker binary path. Normally the daemon finds
 /// `kmux-vt-worker` next to its own executable; tests and packagers can override.
 const WORKER_BIN_ENV: &str = "KMUX_VT_WORKER_BIN";
+
+/// Longest a freshly spawned worker may take to answer `Hello` with `Ready`.
+/// A worker that does not is killed and the pane falls back to in-process.
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// How often a quiet worker is checked for a hang.
+const LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
+
+/// A worker that has sent nothing for this long while its PTY has output
+/// waiting is hung: a healthy one drains the PTY and emits a diff for every
+/// read. Output that never stops arriving keeps a healthy worker talking, and
+/// a quiet PTY gives a healthy worker nothing to say, so neither trips it.
+const NO_PROGRESS_DEADLINE: Duration = Duration::from_secs(30);
+
+/// How long a worker that closed its event stream gets to exit on its own
+/// before it is killed.
+const EXIT_GRACE: Duration = Duration::from_secs(5);
+
+/// Events buffered between the task reading the worker's socket and the
+/// supervisor applying them.
+const EVENT_BUFFER: usize = 64;
 
 /// Daemon-side handle to one pane's isolated VT worker.
 pub struct WorkerEngine {
@@ -59,7 +90,9 @@ pub struct WorkerEngine {
     /// worker adopts). Captured at spawn so status reporting can surface it; the
     /// `Child` itself is owned by the supervisor task for reaping.
     child_pid: u32,
-    /// Supervisor task: reads worker events, fans out, reaps the child.
+    /// Supervisor task: reads worker events, fans out, reaps the child. When
+    /// it is aborted (pane close, handoff) the `Child` it owned is dropped
+    /// unreaped and tokio reaps it in the background.
     supervisor: JoinHandle<()>,
     /// Writer task: drains `req_tx` and `input_tx` onto the socket.
     writer_task: JoinHandle<()>,
@@ -95,15 +128,21 @@ impl WorkerEngine {
             std::os::unix::net::UnixStream::pair().context("worker socketpair")?;
         let worker_raw = worker_end.as_raw_fd();
 
+        // A dup of the master kept by the supervisor, to see whether the PTY
+        // has output the worker has not read (the hang check).
+        let pty_probe = master_fd
+            .try_clone()
+            .context("dup PTY master for probing")?;
+
         let exe = resolve_worker_exe()?;
-        let mut cmd = std::process::Command::new(&exe);
+        let mut cmd = tokio::process::Command::new(&exe);
         cmd.env("KMUX_WORKER_SOCKET_FD", WORKER_SOCKET_FD.to_string());
         // SAFETY: `inherit_as` is async-signal-safe and touches only the raw
         // socket fd we own.
         unsafe {
             cmd.pre_exec(move || inherit_as(worker_raw, WORKER_SOCKET_FD));
         }
-        let child = cmd
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawn worker binary {}", exe.display()))?;
         drop(worker_end); // the parent no longer needs the worker end
@@ -113,34 +152,20 @@ impl WorkerEngine {
             .context("worker socket nonblocking")?;
         let stream = UnixStream::from_std(daemon_end).context("adopt worker socket")?;
 
-        // Handshake: Hello (carrying the PTY fd) -> Ready.
-        codec::send_with_fd(
-            &stream,
-            &WorkerRequest::Hello {
-                version: WORKER_PROTOCOL_VERSION,
-                pane_id: fanout.pane_id.clone(),
-                pid,
-                size,
-                scrollback: scrollback_lines,
-                kitty_graphics,
-                kitty_keyboard,
-            },
-            Some(master_fd.as_raw_fd()),
-        )
-        .await
-        .context("send Hello")?;
-        drop(master_fd); // the worker holds its own dup now
-        let (ready, _fd) = codec::recv_with_fd::<WorkerEvent>(&stream)
-            .await
-            .context("recv Ready")?;
-        match ready {
-            WorkerEvent::Ready { version } if version == WORKER_PROTOCOL_VERSION => {}
-            WorkerEvent::Ready { version } => {
-                anyhow::bail!(
-                    "worker protocol mismatch: worker={version}, daemon={WORKER_PROTOCOL_VERSION}"
-                )
-            }
-            other => anyhow::bail!("expected Ready from worker, got {other:?}"),
+        // Handshake: Hello (carrying the PTY fd) -> Ready. A worker that
+        // fails it, or never answers, is killed and reaped here.
+        let hello = WorkerRequest::Hello {
+            version: WORKER_PROTOCOL_VERSION,
+            pane_id: fanout.pane_id.clone(),
+            pid,
+            size,
+            scrollback: scrollback_lines,
+            kitty_graphics,
+            kitty_keyboard,
+        };
+        if let Err(e) = handshake(&stream, &hello, master_fd, READY_TIMEOUT).await {
+            let _ = child.kill().await;
+            return Err(e);
         }
 
         let mirror = Arc::new(Mutex::new(CellGrid::new(
@@ -173,8 +198,8 @@ impl WorkerEngine {
         });
 
         // Capture the worker pid before the `Child` moves into the supervisor.
-        let child_pid = child.id();
-        let supervisor = tokio::spawn(supervise(sock_rd, child, mirror.clone(), fanout));
+        let child_pid = child.id().unwrap_or_default();
+        let supervisor = tokio::spawn(supervise(sock_rd, child, pty_probe, mirror.clone(), fanout));
 
         Ok(Self {
             req_tx,
@@ -268,45 +293,198 @@ impl WorkerEngine {
     }
 }
 
+/// Send `Hello` with the PTY master fd and wait up to `timeout` for a `Ready`
+/// carrying this build's protocol version. The master is closed on our side
+/// once sent: the worker holds its own dup.
+async fn handshake(
+    stream: &UnixStream,
+    hello: &WorkerRequest,
+    master_fd: OwnedFd,
+    timeout: Duration,
+) -> anyhow::Result<()> {
+    codec::send_with_fd(stream, hello, Some(master_fd.as_raw_fd()))
+        .await
+        .context("send Hello")?;
+    drop(master_fd);
+    let (ready, _fd) = tokio::time::timeout(timeout, codec::recv_with_fd::<WorkerEvent>(stream))
+        .await
+        .map_err(|_| anyhow::anyhow!("worker sent no Ready within {timeout:?}"))?
+        .context("recv Ready")?;
+    match ready {
+        WorkerEvent::Ready { version } if version == WORKER_PROTOCOL_VERSION => Ok(()),
+        WorkerEvent::Ready { version } => {
+            anyhow::bail!(
+                "worker protocol mismatch: worker={version}, daemon={WORKER_PROTOCOL_VERSION}"
+            )
+        }
+        other => anyhow::bail!("expected Ready from worker, got {other:?}"),
+    }
+}
+
+/// How a worker's event stream ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum StreamEnd {
+    /// The worker closed it: it is exiting.
+    Closed,
+    /// A frame failed to read or decode: the worker is still running but
+    /// its stream can no longer be trusted.
+    Corrupt,
+    /// The worker went quiet while its PTY held unread output.
+    Hung,
+}
+
 /// Read the worker's event stream, fan it out to clients, and reap the child.
 ///
 /// When the worker dies abnormally (a SIGSEGV in libghostty-vt, or any non-zero
 /// exit) — as opposed to the clean exit triggered by a pane close or handoff —
 /// the daemon is unaffected (this is just a task seeing EOF); we surface a
 /// [`SessionEventMsg::PaneFaulted`] to attached clients so the crash is visible.
+/// A corrupt stream or a hang is ended the same way, by killing the worker.
 /// The shell survives because the daemon still holds the PTY master fd.
 async fn supervise(
-    mut sock_rd: OwnedReadHalf,
-    child: std::process::Child,
+    sock_rd: impl AsyncRead + Unpin + Send + 'static,
+    mut child: Child,
+    pty_probe: OwnedFd,
     mirror: Arc<Mutex<CellGrid>>,
     fanout: WorkerFanout,
 ) {
-    let mut prev_cursor = CursorState::default();
-    let mut prev_modes = TermModes::EMPTY;
-
-    loop {
-        match codec::recv_msg::<_, WorkerEvent>(&mut sock_rd).await {
-            Ok(Some(ev)) => {
-                handle_event(ev, &mirror, &fanout, &mut prev_cursor, &mut prev_modes);
-            }
-            Ok(None) => {
-                debug!(pane_id = %fanout.pane_id, "worker closed its event stream");
-                break;
-            }
-            Err(e) => {
-                warn!(pane_id = %fanout.pane_id, "worker event read error: {e}");
-                break;
-            }
-        }
-    }
-
-    if reap_child(child, &fanout.pane_id) {
-        warn!(pane_id = %fanout.pane_id, "isolated VT worker crashed; surfacing fault (daemon and other sessions unaffected)");
+    let output_waiting = || output_waiting(pty_probe.as_fd());
+    let end = apply_events(sock_rd, &mirror, &fanout, output_waiting, LIVENESS_INTERVAL).await;
+    if end_worker(&mut child, end, &fanout.pane_id, EXIT_GRACE).await {
+        warn!(pane_id = %fanout.pane_id, ?end, "isolated VT worker crashed; surfacing fault (daemon and other sessions unaffected)");
         broadcast_fault(&fanout);
         // Ask the daemon to respawn the worker (the shell is still alive). If the
         // respawn channel is gone (shutdown), the pane simply stays faulted.
         let _ = fanout.fault_tx.send(fanout.pane_id.clone());
     }
+}
+
+/// Apply the worker's events until its stream ends or it hangs, checking
+/// every `check_every` whether it has gone quiet while `output_waiting` says
+/// its PTY has output for it.
+///
+/// The socket is read by a task of its own feeding a bounded channel, so the
+/// periodic check never cancels a frame half-read.
+async fn apply_events(
+    mut sock_rd: impl AsyncRead + Unpin + Send + 'static,
+    mirror: &Arc<Mutex<CellGrid>>,
+    fanout: &WorkerFanout,
+    output_waiting: impl Fn() -> bool,
+    check_every: Duration,
+) -> StreamEnd {
+    let (tx, mut rx) = mpsc::channel(EVENT_BUFFER);
+    let reader = tokio::spawn(async move {
+        loop {
+            let frame = codec::recv_msg::<_, WorkerEvent>(&mut sock_rd).await;
+            let more = matches!(frame, Ok(Some(_)));
+            if tx.send(frame).await.is_err() {
+                break;
+            }
+            if !more {
+                break;
+            }
+        }
+    });
+    let _reader = crate::supervisor::AbortOnDrop(reader);
+
+    let mut prev_cursor = CursorState::default();
+    let mut prev_modes = TermModes::EMPTY;
+    let mut last_heard = tokio::time::Instant::now();
+    let mut check = tokio::time::interval(check_every);
+    check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            frame = rx.recv() => match frame {
+                Some(Ok(Some(ev))) => {
+                    last_heard = tokio::time::Instant::now();
+                    handle_event(ev, mirror, fanout, &mut prev_cursor, &mut prev_modes);
+                }
+                Some(Ok(None)) | None => {
+                    debug!(pane_id = %fanout.pane_id, "worker closed its event stream");
+                    return StreamEnd::Closed;
+                }
+                Some(Err(e)) => {
+                    warn!(pane_id = %fanout.pane_id, "worker event read error: {e}");
+                    return StreamEnd::Corrupt;
+                }
+            },
+            _ = check.tick() => {
+                if is_hung(last_heard.elapsed(), output_waiting()) {
+                    return StreamEnd::Hung;
+                }
+            }
+        }
+    }
+}
+
+/// Whether a worker that has been quiet for `quiet_for` is hung, given
+/// whether its PTY has output waiting (see [`NO_PROGRESS_DEADLINE`]).
+fn is_hung(quiet_for: Duration, output_waiting: bool) -> bool {
+    output_waiting && quiet_for >= NO_PROGRESS_DEADLINE
+}
+
+/// Whether the PTY behind `master` (a dup of its master) has output nobody
+/// has read yet: readable, and not merely at end of file.
+///
+/// A zero-timeout `poll`, since `FIONREAD` on a PTY master reads 0 on macOS.
+/// Once the pane's program has exited the master reports `POLLHUP` (with
+/// `POLLIN` on some systems) for good, and a worker with nothing left to do
+/// must not look hung, so a hang-up is not output. A failed `poll` is no
+/// output either.
+fn output_waiting(master: BorrowedFd<'_>) -> bool {
+    use nix::libc::{POLLHUP, POLLIN, poll, pollfd};
+
+    let mut probe = pollfd {
+        fd: master.as_raw_fd(),
+        events: POLLIN,
+        revents: 0,
+    };
+    // SAFETY: one valid pollfd for the call; the fd is borrowed and outlives it.
+    let ready = unsafe { poll(&raw mut probe, 1, 0) };
+    // Only POLLIN was asked for, so a ready fd without a hang-up has output.
+    ready == 1 && probe.revents & POLLHUP == 0
+}
+
+/// Reap the worker (the daemon's direct child) so it does not linger as a
+/// zombie, and report whether it died abnormally. A clean exit (code 0) is the
+/// pane-close / handoff path; a signal death (SIGSEGV/SIGABRT) or non-zero exit
+/// is a crash that should fault the pane.
+///
+/// A worker whose stream went bad or which hung is still running, so it is
+/// killed first; one that closed its stream gets `grace` ([`EXIT_GRACE`]) to
+/// exit before it is killed too. The wait is asynchronous: it never blocks a
+/// runtime thread, however the worker ended.
+async fn end_worker(child: &mut Child, end: StreamEnd, pane_id: &str, grace: Duration) -> bool {
+    if end != StreamEnd::Closed {
+        warn!(pane_id, ?end, "killing isolated VT worker");
+        let _ = child.start_kill();
+    }
+    let status = reap_within(child, grace, pane_id).await;
+    match status {
+        Ok(status) => {
+            let faulted = !status.success();
+            debug!(pane_id, ?status, faulted, "worker reaped");
+            faulted
+        }
+        Err(e) => {
+            warn!(pane_id, "worker wait failed: {e}");
+            false
+        }
+    }
+}
+
+/// Wait for `child` to exit, killing it if it has not within `grace`.
+async fn reap_within(
+    child: &mut Child,
+    grace: Duration,
+    pane_id: &str,
+) -> std::io::Result<std::process::ExitStatus> {
+    if let Ok(status) = tokio::time::timeout(grace, child.wait()).await {
+        return status;
+    }
+    warn!(pane_id, "isolated VT worker did not exit; killing it");
+    let _ = child.start_kill();
+    child.wait().await
 }
 
 /// Tell attached clients the pane's worker crashed. Uses the control lane so
@@ -418,25 +596,6 @@ fn handle_event(
     }
 }
 
-/// Reap the worker (the daemon's direct child) so it does not linger as a
-/// zombie, and report whether it died abnormally. A clean exit (code 0) is the
-/// pane-close / handoff path; a signal death (SIGSEGV/SIGABRT) or non-zero exit
-/// is a crash that should fault the pane. The worker has already exited by the
-/// time we get here (we observed its socket EOF), so `wait` returns promptly.
-fn reap_child(mut child: std::process::Child, pane_id: &str) -> bool {
-    match child.wait() {
-        Ok(status) => {
-            let faulted = !status.success();
-            debug!(pane_id, ?status, faulted, "worker reaped");
-            faulted
-        }
-        Err(e) => {
-            warn!(pane_id, "worker wait failed: {e}");
-            false
-        }
-    }
-}
-
 fn to_exit_status(status: ChildExitStatus) -> ExitStatus {
     match status {
         ChildExitStatus::Code(c) => ExitStatus::Code(c),
@@ -496,6 +655,8 @@ fn resolve_worker_exe() -> anyhow::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    use std::os::unix::process::CommandExt;
+
     use super::*;
 
     /// Fd numbers the probe works with. They must be single digits: dash
@@ -578,6 +739,247 @@ mod tests {
             matches!(input_rx.try_recv(), Ok(WorkerRequest::Keys { events }) if events.is_empty())
         );
         assert!(matches!(input_rx.try_recv(), Ok(WorkerRequest::Paste { data }) if data == b"p"));
+    }
+
+    /// A stand-in worker process: `sh -c script`, spawned as the daemon
+    /// spawns a worker, so it is reaped the same way.
+    fn fixture_worker(script: &str) -> Child {
+        tokio::process::Command::new("/bin/sh")
+            .args(["-c", script])
+            .spawn()
+            .expect("spawn a stand-in worker")
+    }
+
+    /// The fan-out a worker pane owns, with the title its events update and
+    /// the channel its faults are reported on.
+    fn fixture_fanout() -> (
+        WorkerFanout,
+        Arc<Mutex<String>>,
+        mpsc::UnboundedReceiver<String>,
+    ) {
+        let title = Arc::new(Mutex::new(String::new()));
+        let (fault_tx, fault_rx) = mpsc::unbounded_channel();
+        let fanout = WorkerFanout {
+            pane_id: "eagle/0".to_string(),
+            clients: Arc::default(),
+            scrollback: Arc::new(Mutex::new(DiffBuffer::new(1024))),
+            seqno_counter: Arc::new(AtomicU64::new(1)),
+            event_sink: Arc::new(PaneEventSink::new(
+                "eagle/0".to_string(),
+                Arc::clone(&title),
+                Arc::default(),
+                tokio::sync::broadcast::channel(8).0,
+            )),
+            manager: Arc::new(SessionManager::new()),
+            fault_tx,
+        };
+        (fanout, title, fault_rx)
+    }
+
+    fn fixture_mirror() -> Arc<Mutex<CellGrid>> {
+        Arc::new(Mutex::new(CellGrid::new(1, 1)))
+    }
+
+    /// A bound on waits for a real process; the code under test has its own.
+    const GUARD: Duration = Duration::from_secs(10);
+
+    /// A worker that answers `Hello` with a matching `Ready` passes the
+    /// handshake; one of another protocol version, or one that answers
+    /// something else, fails it.
+    #[tokio::test]
+    async fn the_handshake_wants_a_ready_of_this_protocol_version() {
+        let hello = WorkerRequest::Shutdown;
+        let answers = [
+            (
+                WorkerEvent::Ready {
+                    version: WORKER_PROTOCOL_VERSION,
+                },
+                true,
+            ),
+            (
+                WorkerEvent::Ready {
+                    version: WORKER_PROTOCOL_VERSION + 1,
+                },
+                false,
+            ),
+            (WorkerEvent::Bell, false),
+        ];
+        for (answer, accepted) in answers {
+            let (daemon, worker) = UnixStream::pair().unwrap();
+            codec::send_with_fd(&worker, &answer, None).await.unwrap();
+            let fd = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+            let shook = handshake(&daemon, &hello, fd, GUARD).await;
+            assert_eq!(shook.is_ok(), accepted, "{answer:?}: {shook:?}");
+        }
+    }
+
+    /// A worker that never answers `Hello` fails the handshake at the
+    /// timeout instead of hanging pane creation (issue #207).
+    #[tokio::test(start_paused = true)]
+    async fn a_worker_that_never_sends_ready_times_out() {
+        let (daemon, _silent_worker) = UnixStream::pair().unwrap();
+        let fd = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+        let started = tokio::time::Instant::now();
+
+        let shook = handshake(&daemon, &WorkerRequest::Shutdown, fd, READY_TIMEOUT).await;
+
+        let err = shook.expect_err("no Ready");
+        assert!(err.to_string().contains("no Ready"), "{err}");
+        assert!(started.elapsed() >= READY_TIMEOUT);
+    }
+
+    /// A worker that sends a garbage frame is killed and reaped, the pane is
+    /// reported faulted for a respawn, and the supervisor returns: nothing
+    /// waits on the still-running worker (issue #207).
+    #[tokio::test]
+    async fn a_worker_sending_a_garbage_frame_is_killed_reaped_and_faulted() {
+        let (daemon, mut worker) = UnixStream::pair().unwrap();
+        let child = fixture_worker("sleep 30");
+        let pid = nix::unistd::Pid::from_raw(i32::try_from(child.id().unwrap()).unwrap());
+        let (fanout, _title, mut faults) = fixture_fanout();
+        let probe = OwnedFd::from(std::fs::File::open("/dev/null").unwrap());
+        // A well-framed payload that is not a `WorkerEvent`.
+        kmux_protocol::codec::write_frame(&mut worker, &[0xff, 0xff, 0xff])
+            .await
+            .unwrap();
+
+        let (sock_rd, _sock_wr) = daemon.into_split();
+        tokio::time::timeout(
+            GUARD,
+            supervise(sock_rd, child, probe, fixture_mirror(), fanout),
+        )
+        .await
+        .expect("the supervisor returns without waiting on the worker");
+
+        assert_eq!(faults.try_recv().as_deref(), Ok("eagle/0"));
+        assert_eq!(
+            nix::sys::signal::kill(pid, None),
+            Err(nix::errno::Errno::ESRCH),
+            "killed and reaped"
+        );
+    }
+
+    /// Every event before the stream closes is applied, in order, and a
+    /// closed stream ends the supervision as `Closed`.
+    #[tokio::test]
+    async fn events_are_applied_until_the_stream_closes() {
+        let (daemon, mut worker) = UnixStream::pair().unwrap();
+        let (fanout, title, _faults) = fixture_fanout();
+        for name in ["first", "second"] {
+            let ev = WorkerEvent::Title {
+                title: name.to_string(),
+            };
+            codec::send_msg(&mut worker, &ev).await.unwrap();
+        }
+        drop(worker);
+
+        let end = apply_events(daemon, &fixture_mirror(), &fanout, || false, GUARD).await;
+
+        assert_eq!(end, StreamEnd::Closed);
+        assert_eq!(*title.lock().unwrap(), "second");
+    }
+
+    /// A worker that goes quiet while its PTY holds unread output is taken
+    /// for hung once the no-progress deadline passes; with nothing to read,
+    /// a quiet worker is left alone.
+    #[tokio::test(start_paused = true)]
+    async fn a_quiet_worker_is_hung_only_while_output_waits() {
+        let (fanout, _title, _faults) = fixture_fanout();
+        let (daemon, _quiet_worker) = UnixStream::pair().unwrap();
+        let started = tokio::time::Instant::now();
+        let end = apply_events(
+            daemon,
+            &fixture_mirror(),
+            &fanout,
+            || true,
+            LIVENESS_INTERVAL,
+        )
+        .await;
+        assert_eq!(end, StreamEnd::Hung);
+        assert!(started.elapsed() >= NO_PROGRESS_DEADLINE);
+
+        let (daemon, _quiet_worker) = UnixStream::pair().unwrap();
+        let idle = tokio::time::timeout(
+            NO_PROGRESS_DEADLINE * 3,
+            apply_events(
+                daemon,
+                &fixture_mirror(),
+                &fanout,
+                || false,
+                LIVENESS_INTERVAL,
+            ),
+        )
+        .await;
+        assert!(idle.is_err(), "an idle worker is not hung");
+    }
+
+    #[test]
+    fn a_worker_is_hung_after_the_deadline_with_output_waiting() {
+        let just_under = NO_PROGRESS_DEADLINE - Duration::from_millis(1);
+        let cases = [
+            (NO_PROGRESS_DEADLINE, true, true),
+            (NO_PROGRESS_DEADLINE * 2, true, true),
+            (just_under, true, false),
+            (NO_PROGRESS_DEADLINE, false, false),
+        ];
+        for (quiet_for, waiting, hung) in cases {
+            assert_eq!(is_hung(quiet_for, waiting), hung, "{quiet_for:?} {waiting}");
+        }
+    }
+
+    /// A PTY master shows output waiting once the program wrote some nobody
+    /// read, and none once that output is read or the program has exited. A
+    /// real PTY, because the readiness is the kernel's (R7).
+    #[tokio::test]
+    async fn output_waiting_reads_the_pty_masters_readiness() {
+        let (_session, mut reader, writer) =
+            crate::fixtures::fixture_pty("printf ready; read line; exit 0").await;
+        let fd = reader.as_raw_fd();
+        // SAFETY: the reader keeps the fd open for the whole test.
+        let master = unsafe { BorrowedFd::borrow_raw(fd) };
+        let until = |want: bool| async move {
+            while output_waiting(master) != want {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        };
+
+        tokio::time::timeout(GUARD, until(true))
+            .await
+            .expect("the output shows up");
+        let mut buf = [0u8; 64];
+        let n = reader.read(&mut buf).await.unwrap();
+        assert_eq!(&buf[..n], b"ready");
+        assert!(!output_waiting(master), "read, so nothing waits");
+
+        // Let the program exit; its echo is read away, and the hang-up that
+        // follows is not output.
+        writer.write_all(b"\n").await.unwrap();
+        tokio::time::timeout(GUARD, async {
+            while reader.read(&mut buf).await.is_ok_and(|n| n > 0) {}
+        })
+        .await
+        .expect("the program exits");
+        assert!(!output_waiting(master), "a hang-up is not output");
+    }
+
+    /// A worker whose stream went bad is killed rather than waited on; one
+    /// that closed its stream is waited on and, exiting cleanly, is not a
+    /// fault; one that closed its stream but never exits is killed after the
+    /// grace period.
+    #[tokio::test]
+    async fn ending_a_worker_kills_it_unless_it_closed_its_stream() {
+        let mut running = fixture_worker("sleep 30");
+        assert!(end_worker(&mut running, StreamEnd::Corrupt, "eagle/0", GUARD).await);
+
+        let mut hung = fixture_worker("sleep 30");
+        assert!(end_worker(&mut hung, StreamEnd::Hung, "eagle/0", GUARD).await);
+
+        let mut exiting = fixture_worker("sleep 0.2");
+        assert!(!end_worker(&mut exiting, StreamEnd::Closed, "eagle/0", GUARD).await);
+
+        let mut lingering = fixture_worker("sleep 30");
+        let grace = Duration::from_millis(50);
+        assert!(end_worker(&mut lingering, StreamEnd::Closed, "eagle/0", grace).await);
     }
 
     /// Guards the probe: without `inherit_as` a close-on-exec fd must read as

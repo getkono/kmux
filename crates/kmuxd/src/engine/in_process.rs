@@ -3,7 +3,7 @@
 //! This is the default path. Reads are the same `term_state` lock the call
 //! sites used before the [`PaneEngine`](super::PaneEngine) seam was introduced;
 //! client input goes through a bounded queue drained by the pane's input
-//! writer task (issue #206).
+//! writer task (issue #206), which is restarted if it panics (issue #207).
 
 use std::sync::{Arc, Mutex};
 
@@ -12,6 +12,7 @@ use kmux_pty::session::PtyWriter;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use super::hold::HoldControl;
 use super::{INPUT_QUEUE_CAPACITY, PaneInput, QueueRejected, rejected};
 use crate::backend::BackendSize;
 use crate::lock::lock_term_state;
@@ -24,10 +25,13 @@ pub struct InProcessEngine {
     /// Client input waiting for [`pty_input_writer`]. Bounded: a pane whose
     /// child stopped reading refuses input instead of growing without limit.
     input_tx: mpsc::Sender<PaneInput>,
-    /// Drains `input_tx` to the PTY. Aborted on drop.
+    /// Supervises the writer that drains `input_tx` to the PTY, restarting it
+    /// after a panic. Aborted on drop, which stops the writer too.
     input_task: JoinHandle<()>,
     /// Background relay task (`session_diff_loop`) reading the PTY.
     task: JoinHandle<()>,
+    /// Parks and releases that task's reads (a handoff's final checkpoint).
+    hold: HoldControl,
     /// Drains terminal query replies (DSR/DA/…) queued by the pane's event sink
     /// and writes them to `writer`. Aborted on drop.
     response_task: JoinHandle<()>,
@@ -46,22 +50,59 @@ impl InProcessEngine {
         term_state: Arc<Mutex<TermState>>,
         writer: PtyWriter,
         task: JoinHandle<()>,
+        hold: HoldControl,
         response_rx: mpsc::Receiver<Vec<u8>>,
+    ) -> Self {
+        Self::with_encoder(
+            pane_id,
+            term_state,
+            writer,
+            task,
+            hold,
+            response_rx,
+            input_bytes,
+        )
+    }
+
+    /// [`Self::new`], turning input into PTY bytes with `encode`.
+    fn with_encoder(
+        pane_id: String,
+        term_state: Arc<Mutex<TermState>>,
+        writer: PtyWriter,
+        task: JoinHandle<()>,
+        hold: HoldControl,
+        response_rx: mpsc::Receiver<Vec<u8>>,
+        encode: Encoder,
     ) -> Self {
         let writer = Arc::new(writer);
         let (input_tx, input_rx) = mpsc::channel(INPUT_QUEUE_CAPACITY);
-        let input_task = tokio::spawn(pty_input_writer(
-            pane_id.clone(),
-            input_rx,
-            Arc::clone(&term_state),
-            Arc::clone(&writer),
-        ));
+        // Shared so a restarted writer takes over the same queue; an async
+        // mutex is released, not poisoned, when a run panics.
+        let input_rx = Arc::new(tokio::sync::Mutex::new(input_rx));
+        let input_task = {
+            let pane_id = pane_id.clone();
+            let term_state = Arc::clone(&term_state);
+            let writer = Arc::clone(&writer);
+            tokio::spawn(async move {
+                crate::supervisor::supervise("pane-input", move || {
+                    pty_input_writer(
+                        pane_id.clone(),
+                        Arc::clone(&input_rx),
+                        Arc::clone(&term_state),
+                        Arc::clone(&writer),
+                        encode,
+                    )
+                })
+                .await;
+            })
+        };
         let response_task = tokio::spawn(pty_response_writer(pane_id, response_rx, writer));
         Self {
             term_state,
             input_tx,
             input_task,
             task,
+            hold,
             response_task,
         }
     }
@@ -102,6 +143,14 @@ impl InProcessEngine {
         self.input_tx.try_send(input).map_err(|e| rejected(&e))
     }
 
+    pub(super) fn hold_reader(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.hold.hold()
+    }
+
+    pub(super) fn release_reader(&self) {
+        self.hold.release();
+    }
+
     pub(super) fn abort_relay_task(&mut self) -> JoinHandle<()> {
         self.task.abort();
         std::mem::replace(&mut self.task, tokio::spawn(async {}))
@@ -120,20 +169,29 @@ impl Drop for InProcessEngine {
     }
 }
 
+/// Turns one input into the bytes written to the PTY: [`input_bytes`], or a
+/// stand-in in tests.
+type Encoder = fn(&Mutex<TermState>, PaneInput) -> Vec<u8>;
+
 /// Write a pane's queued client input to its PTY, in arrival order, until the
 /// queue closes (pane teardown). This is the only place client input awaits
 /// the PTY, and it holds no daemon lock while it does: a child that stops
 /// reading blocks this task and fills this pane's queue, nothing else.
 ///
-/// A write error (a closed PTY on a dying pane) is logged and skipped.
+/// A write error (a closed PTY on a dying pane) is logged and skipped. A panic
+/// (encoding a key against a broken emulator state) loses the input being
+/// encoded; the supervisor restarts the writer on the same queue, so the
+/// pane's input is not disabled for the rest of its life (issue #207).
 async fn pty_input_writer(
     pane_id: String,
-    mut rx: mpsc::Receiver<PaneInput>,
+    rx: Arc<tokio::sync::Mutex<mpsc::Receiver<PaneInput>>>,
     term_state: Arc<Mutex<TermState>>,
     writer: Arc<PtyWriter>,
+    encode: Encoder,
 ) {
+    let mut rx = rx.lock().await;
     while let Some(input) = rx.recv().await {
-        let bytes = input_bytes(&term_state, input);
+        let bytes = encode(&term_state, input);
         if bytes.is_empty() {
             continue;
         }
@@ -222,6 +280,7 @@ mod tests {
             input_tx: mpsc::channel(1).0,
             input_task: tokio::spawn(async {}),
             task: tokio::spawn(async {}),
+            hold: crate::engine::hold::channel().0,
             response_task: tokio::spawn(async {}),
         };
         {
@@ -250,12 +309,58 @@ mod tests {
         );
     }
 
+    /// A panic while encoding one input loses that input only: the writer is
+    /// restarted on the same queue and later input still reaches the program
+    /// (issue #207). A real PTY because the writer's only output is the PTY
+    /// (R7); the restart waits out the supervisor's first backoff, 1 s.
+    #[tokio::test]
+    async fn a_panic_while_encoding_input_does_not_disable_the_pane() {
+        fn panics_on_boom(ts: &Mutex<TermState>, input: PaneInput) -> Vec<u8> {
+            if matches!(&input, PaneInput::Bytes(b) if b == b"boom") {
+                panic!("encoding failed");
+            }
+            input_bytes(ts, input)
+        }
+        let (_session, mut reader, writer) = fixture_pty("cat").await;
+        let engine = InProcessEngine::with_encoder(
+            "eagle/0".to_string(),
+            fixture_term_state(4, 20),
+            writer,
+            tokio::spawn(async {}),
+            crate::engine::hold::channel().0,
+            crate::engine::pty_response_channel().1,
+            panics_on_boom,
+        );
+        engine
+            .enqueue_input(PaneInput::Bytes(b"boom".to_vec()))
+            .expect("room in the queue");
+        engine
+            .enqueue_input(PaneInput::Bytes(b"ping\n".to_vec()))
+            .expect("room in the queue");
+
+        let mut seen = Vec::new();
+        let mut buf = [0u8; 256];
+        tokio::time::timeout(WAIT, async {
+            while !seen.windows(4).any(|w| w == b"ping") {
+                let n = reader.read(&mut buf).await.unwrap();
+                seen.extend_from_slice(&buf[..n]);
+            }
+        })
+        .await
+        .expect("input after the panic reaches the program");
+        assert!(
+            !seen.windows(4).any(|w| w == b"boom"),
+            "the input that panicked is dropped"
+        );
+    }
+
     fn engine_on(writer: PtyWriter) -> InProcessEngine {
         InProcessEngine::new(
             "eagle/0".to_string(),
             fixture_term_state(4, 20),
             writer,
             tokio::spawn(async {}),
+            crate::engine::hold::channel().0,
             crate::engine::pty_response_channel().1,
         )
     }

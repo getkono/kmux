@@ -152,6 +152,23 @@ pub struct PeriodicCheckpointer {
     shared: Arc<Shared>,
 }
 
+/// A checkpoint sealed by a final write. Dropping it leaves the checkpoint
+/// sealed for good; [`Self::unseal`] takes the owner back for a handoff that
+/// rolled back after its final write and carries on serving.
+#[derive(Debug)]
+pub struct SealedCheckpoint {
+    checkpointer: Checkpointer,
+}
+
+impl SealedCheckpoint {
+    /// Accept periodic writes again, and hand the owner back so it can make
+    /// another final write later.
+    pub fn unseal(self) -> Checkpointer {
+        self.checkpointer.shared.lock().sealed = false;
+        self.checkpointer
+    }
+}
+
 /// A final write that failed: the error, and the [`Checkpointer`] back,
 /// unsealed, so its owner can carry on or try again.
 #[derive(Debug)]
@@ -186,8 +203,9 @@ impl Checkpointer {
     /// Write `state` whether or not it changed, then seal the checkpoint so
     /// no later [`PeriodicCheckpointer::write`] replaces it. For the last
     /// write of a daemon that is shutting down or handing off. Consumes the
-    /// checkpointer, so there is no later final write. Runs on the blocking
-    /// pool, so the `fsync`s never stall a runtime thread.
+    /// checkpointer, so there is no later final write unless the returned
+    /// [`SealedCheckpoint`] is unsealed. Runs on the blocking pool, so the `fsync`s
+    /// never stall a runtime thread.
     ///
     /// # Errors
     ///
@@ -197,17 +215,20 @@ impl Checkpointer {
     pub async fn write_final_in_background(
         self,
         state: PersistedDaemonState,
-    ) -> Result<(), FinalWriteFailed> {
+    ) -> Result<SealedCheckpoint, FinalWriteFailed> {
         let shared = Arc::clone(&self.shared);
         let result =
             tokio::task::spawn_blocking(move || shared.lock().write_final(&shared.path, &state))
                 .await
                 .map_err(anyhow::Error::from)
                 .and_then(|written| written);
-        result.map_err(|error| FinalWriteFailed {
-            checkpointer: self,
-            error,
-        })
+        match result {
+            Ok(()) => Ok(SealedCheckpoint { checkpointer: self }),
+            Err(error) => Err(FinalWriteFailed {
+                checkpointer: self,
+                error,
+            }),
+        }
     }
 
     /// Make the final write with the checkpointer in `slot`, leaving the slot
@@ -220,7 +241,7 @@ impl Checkpointer {
     pub async fn write_final_from(
         slot: &mut Option<Self>,
         state: PersistedDaemonState,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<SealedCheckpoint> {
         let checkpointer = slot
             .take()
             .ok_or_else(|| anyhow::anyhow!("the final checkpoint was already written"))?;
@@ -476,6 +497,36 @@ mod tests {
 
         assert_eq!(checkpointer.write(&empty_state()).unwrap(), Written::Sealed);
         assert_eq!(read_back(&path).used_words, vec!["eagle"], "sealed");
+    }
+
+    /// Unsealing (a handoff that rolled back after its final write) hands
+    /// the checkpointer back and accepts periodic writes again; the final
+    /// write still counts as the last one written, so the same state is not
+    /// written twice.
+    #[tokio::test]
+    async fn an_unsealed_checkpoint_accepts_writes_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.bin");
+        let owner = Checkpointer::new(path.clone());
+        let checkpointer = owner.periodic();
+        let sealed = owner
+            .write_final_in_background(one_session_state())
+            .await
+            .unwrap();
+        assert_eq!(checkpointer.write(&empty_state()).unwrap(), Written::Sealed);
+
+        let owner = sealed.unseal();
+        assert_eq!(
+            checkpointer.write(&one_session_state()).unwrap(),
+            Written::Unchanged
+        );
+        assert_eq!(checkpointer.write(&empty_state()).unwrap(), Written::Wrote);
+        assert!(read_back(&path).used_words.is_empty());
+        owner
+            .write_final_in_background(one_session_state())
+            .await
+            .unwrap();
+        assert_eq!(read_back(&path).used_words, vec!["eagle"]);
     }
 
     /// A final write that fails hands the checkpointer back unsealed: the

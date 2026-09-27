@@ -179,6 +179,16 @@ impl ServerApp {
         true
     }
 
+    /// Drop `pane_id`'s restart history once the pane is closed (issue #207).
+    /// The log gains an entry per pane that ever faulted; without this a
+    /// daemon that runs for months keeps one for every pane it ever closed.
+    pub(super) fn forget_worker_restarts(&self, pane_id: &str) {
+        self.worker_restart_log
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(pane_id);
+    }
+
     /// Read-only view of the crash-loop budget for `pane_id`, for status
     /// reporting: respawns recorded within the live [`RESTART_WINDOW`], the age
     /// of the most recent, and whether another respawn is still allowed. Mirrors
@@ -205,6 +215,47 @@ impl ServerApp {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+
+    use kmux_protocol::messages::{ClientCapabilities, TermSize};
+
+    /// Closing a pane, a tab or a session forgets the restart history of the
+    /// panes it closed (issue #207), and only theirs.
+    #[tokio::test]
+    async fn closing_a_pane_forgets_its_worker_restarts() {
+        let app = crate::fixtures::fixture_app();
+        let size = TermSize {
+            rows: 4,
+            cols: 20,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let caps = ClientCapabilities::default();
+        let mut pane_ids = Vec::new();
+        for _ in 0..3 {
+            let entry = app
+                .create_session(None, None, Some("/bin/cat".into()), vec![], size, &caps)
+                .await
+                .expect("a session");
+            let pane_id = kmux_protocol::format_pane_id(&entry.meta.word_id, 0);
+            assert!(app.allow_worker_restart(&pane_id));
+            assert_eq!(app.worker_restart_stats(&pane_id).0, 1);
+            pane_ids.push((entry.meta.word_id, pane_id));
+        }
+        let [(_, by_pane), (word, by_tab), (session, by_session)] =
+            <[_; 3]>::try_from(pane_ids).unwrap();
+
+        app.close_pane(&by_pane).await.expect("close the pane");
+        assert_eq!(app.worker_restart_stats(&by_pane).0, 0);
+        assert_eq!(app.worker_restart_stats(&by_tab).0, 1, "others kept");
+
+        app.close_tab(&word, 0).await.expect("close the tab");
+        assert_eq!(app.worker_restart_stats(&by_tab).0, 0);
+
+        app.close_session(&session)
+            .await
+            .expect("close the session");
+        assert_eq!(app.worker_restart_stats(&by_session).0, 0);
+    }
 
     /// The respawn task takes the fault channel, so a second call is a no-op
     /// rather than a second consumer.

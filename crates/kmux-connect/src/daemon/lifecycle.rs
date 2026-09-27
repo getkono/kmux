@@ -882,6 +882,10 @@ mod tests {
         std::fs::write(&log_path, b"marked\n").expect("write daemon log");
         let mark = daemon_log_mark_in(&dirs);
 
+        // Held open so the removed file keeps its inode: Linux hands a freed
+        // inode straight to the next file created, which would make the stray
+        // file below *be* the marked one by (dev, inode).
+        let _removed = std::fs::File::open(&log_path).expect("open daemon log");
         std::fs::remove_file(&log_path).expect("remove");
         let rotated = kmux_sys::log_tail::rotated_log_path(&log_path, 1);
         std::fs::write(&rotated, b"marked\nunrelated\n").expect("stray rotated file");

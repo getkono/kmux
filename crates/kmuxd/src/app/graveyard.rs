@@ -98,6 +98,7 @@ impl ServerApp {
     /// A failed restore leaves the snapshot in the graveyard (and its word
     /// reserved) so the user can retry; the entry is only removed on success.
     pub(crate) async fn restore_session(&self, word_id: &str) -> Result<SessionEntry> {
+        let _admitted = self.admit_pane_creation()?;
         let snapshot = {
             let guard = self.closed_sessions.lock().unwrap();
             guard

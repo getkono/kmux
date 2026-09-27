@@ -70,6 +70,8 @@ impl ServerApp {
         size: TermSize,
         seed_caps: &ClientCapabilities,
     ) -> Result<(TabInfo, PaneInfo)> {
+        // Held until the pane is in `sessions`, so a handoff never misses it.
+        let _admitted = self.admit_pane_creation()?;
         // Reserve a pane index, a tab index, and resolve the CWD under a short lock.
         let (pane_index, tab_index, pane_id, cwd) = {
             let mut sessions = self.sessions.write().await;
@@ -148,6 +150,7 @@ impl ServerApp {
                 }
             }
             let _ = self.manager.close_nowait(pane_id).await;
+            self.forget_worker_restarts(pane_id);
         }
 
         let session_closed = {
@@ -212,6 +215,8 @@ impl ServerApp {
         size: TermSize,
         seed_caps: &ClientCapabilities,
     ) -> Result<(PaneInfo, LayoutNode, u32)> {
+        // Held until the pane is in `sessions`, so a handoff never misses it.
+        let _admitted = self.admit_pane_creation()?;
         // Validate the tab/pane and reserve a pane index + CWD under the lock.
         let (new_index, pane_id, cwd) = {
             let mut sessions = self.sessions.write().await;
