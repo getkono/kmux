@@ -9,10 +9,12 @@
 //!
 //! [`wire_enum!`] closes that gap. The enum keeps its derived encoding
 //! (`#[serde(remote = "Self")]` turns the derive into inherent functions) and
-//! gains a `Deserialize` that reads the variant name first: a name the derived
-//! code knows is decoded by it, unchanged; any other name has its payload
-//! skipped and becomes the enum's `Unknown` variant. The frame around it still
-//! decodes, and the receiver decides what an `Unknown` means (see
+//! gains a `Deserialize` that reads the variant name itself and hands the
+//! derived code a variant whose payload it controls. A name the derived code
+//! knows is decoded by it, unchanged; any other name is, through
+//! `#[serde(other)]`, the unit `Unknown`, and asking a unit variant for its
+//! payload skips whatever the payload is. The frame around it still decodes,
+//! and the receiver decides what an `Unknown` means (see
 //! `docs/architecture-protocol-versioning.md`, "Unknown variants").
 //!
 //! This relies on a self-describing codec (`deserialize_any`), which the
@@ -33,12 +35,9 @@ use serde::de::{
 ///
 /// Implemented by [`wire_enum!`]; not meant to be implemented by hand.
 pub trait WireEnum: Sized {
-    /// Decode with the derived (strict) implementation.
+    /// Decode with the derived implementation, whose `#[serde(other)]` maps a
+    /// name it does not know to `Unknown`.
     fn decode_known<'de, D: Deserializer<'de>>(d: D) -> Result<Self, D::Error>;
-    /// The fallback for a variant this build does not know.
-    fn unknown() -> Self;
-    /// Whether this value is the fallback.
-    fn is_unknown(&self) -> bool;
 }
 
 /// Implement `Serialize`, `Deserialize` and [`WireEnum`] for an enum declared
@@ -62,14 +61,6 @@ macro_rules! wire_enum {
             fn decode_known<'de, D: ::serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
                 <$ty>::deserialize(d)
             }
-
-            fn unknown() -> Self {
-                Self::Unknown
-            }
-
-            fn is_unknown(&self) -> bool {
-                matches!(self, Self::Unknown)
-            }
         }
     };
 }
@@ -79,13 +70,6 @@ pub(crate) use wire_enum;
 /// `Unknown` fallback.
 pub fn deserialize<'de, D: Deserializer<'de>, T: WireEnum>(d: D) -> Result<T, D::Error> {
     d.deserialize_any(LenientVisitor(PhantomData))
-}
-
-/// Whether `tag` names no variant this build knows. The derived code answers:
-/// decoding the bare name gives `Unknown` (via `#[serde(other)]`) exactly when
-/// it is not one of the enum's own names.
-fn is_unknown_tag<T: WireEnum, E: de::Error>(tag: &str) -> bool {
-    matches!(T::decode_known(StrDeserializer::<E>::new(tag)), Ok(value) if value.is_unknown())
 }
 
 struct LenientVisitor<T>(PhantomData<T>);
@@ -102,17 +86,14 @@ impl<'de, T: WireEnum> Visitor<'de> for LenientVisitor<T> {
         T::decode_known(StrDeserializer::<E>::new(tag))
     }
 
-    /// Any other variant is a one-entry map from its name to its payload.
+    /// Any other variant is a one-entry map from its name to its payload. An
+    /// unknown name decodes as the unit `Unknown`, whose
+    /// [`Payload::unit_variant`] skips the payload.
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<T, A::Error> {
         let Some(tag) = map.next_key::<String>()? else {
             return Err(de::Error::invalid_length(0, &self));
         };
-        let value = if is_unknown_tag::<T, A::Error>(&tag) {
-            map.next_value::<IgnoredAny>()?;
-            T::unknown()
-        } else {
-            T::decode_known(EnumAccessDeserializer::new(Tagged { tag, map: &mut map }))?
-        };
+        let value = T::decode_known(EnumAccessDeserializer::new(Tagged { tag, map: &mut map }))?;
         if map.next_key::<IgnoredAny>()?.is_some() {
             return Err(de::Error::invalid_length(2, &self));
         }
@@ -147,6 +128,8 @@ struct Payload<'a, A>(&'a mut A);
 impl<'de, A: MapAccess<'de>> VariantAccess<'de> for Payload<'_, A> {
     type Error = A::Error;
 
+    /// Skip the payload, whatever it is: a unit variant sent as a map, or an
+    /// unknown variant (which decodes as the unit `Unknown`) with data.
     fn unit_variant(self) -> Result<(), A::Error> {
         self.0.next_value::<IgnoredAny>().map(|_| ())
     }
@@ -329,6 +312,23 @@ mod tests {
         }
         let bytes = rmp_serde::to_vec_named(&Corrupt::Newtype("not a u32".into())).expect("encode");
         assert!(rmp_serde::from_slice::<Current>(&bytes).is_err());
+    }
+
+    #[test]
+    fn a_known_unit_variant_sent_as_a_map_decodes() {
+        let bytes = rmp_serde::to_vec_named(&std::collections::BTreeMap::from([("Unit", ())]))
+            .expect("encode");
+        assert_eq!(
+            rmp_serde::from_slice::<Current>(&bytes).expect("decode"),
+            Current::Unit
+        );
+    }
+
+    #[test]
+    fn a_value_that_is_no_variant_is_an_error_saying_what_was_expected() {
+        let bytes = rmp_serde::to_vec_named(&5u8).expect("encode");
+        let err = rmp_serde::from_slice::<Current>(&bytes).expect_err("not a variant");
+        assert!(err.to_string().contains("an enum variant name"), "{err}");
     }
 
     #[test]
