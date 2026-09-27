@@ -304,7 +304,11 @@ pub struct IncomingSession {
 }
 ```
 
-`serve(listener, HANDSHAKE_TIMEOUT, MAX_PENDING_HANDSHAKES, on_session)` is the accept loop: it spawns each pending connection's `establish` into that connection's own task, so a peer that stalls mid-handshake delays nobody else, and drops it after `HANDSHAKE_TIMEOUT` (10 s). At most `MAX_PENDING_HANDSHAKES` (64) handshakes run at once per listener (issue #207): with that many in flight the loop stops accepting until one ends, so a flood of connections that never finish their handshake waits in the kernel's backlog (or the QUIC endpoint's queue) rather than in the daemon's memory.
+`serve(listener, HANDSHAKE_TIMEOUT, HandshakeLimits::DAEMON, on_session)` is the accept loop: it spawns each pending connection's `establish` into that connection's own task, so a peer that stalls mid-handshake delays nobody else, and drops it after `HANDSHAKE_TIMEOUT` (10 s).
+
+**Handshake admission (issue #207, `crates/kmux-sys/src/transport/admission.rs`).** Every listener binds `0.0.0.0`, so anyone who can reach the port can start a handshake. The accept loop bounds how many run at once: `MAX_PENDING_HANDSHAKES` (64) in all and `MAX_PENDING_HANDSHAKES_PER_SOURCE` (8) from one source, where a source is an IPv4 address or an IPv6 /64. A connection that finds either bound reached is **refused at once**: the TCP socket is closed, the QUIC attempt is answered with a refusal. The loop never waits for a slot, so nothing queues behind a full listener, neither in the kernel's backlog nor in the QUIC endpoint, where each waiting attempt holds its buffered initial packets. One source that opens connections and never finishes them fills its own eight slots and nobody else's; starving real clients takes many distinct sources. A slot is given back when its handshake finishes, fails or times out.
+
+QUIC can be sent from a spoofed address, which would let an attacker charge its handshakes to someone else's source. So once `QUIC_RETRY_ABOVE` (8) handshakes are in flight, a QUIC client that has not yet proved its address is sent a stateless Retry (QUIC address validation) before it is counted: the daemon keeps no state for it, and only a client that receives packets at its claimed address comes back, with a token that validates it. Below that load a connect skips the extra round trip. `HandshakeLimits::new` refuses a zero bound with a typed `HandshakeLimitsError`, since a listener allowed no handshakes could serve nobody.
 
 The server dispatches all transports through a single `dispatch_session` → `run_client_session` path in `crates/kmuxd/src/client_handler/session.rs`. Transport-specific setup (e.g., stream opening for QUIC) occurs before the session handler is invoked; the handler itself is generic.
 
@@ -928,11 +932,11 @@ so `PROTOCOL_RANGE` is unchanged.
 
 | What | Deadline | On expiry |
 |------|----------|-----------|
-| TLS / QUIC handshake | `HANDSHAKE_TIMEOUT` 10 s, in the connection's own task; at most `MAX_PENDING_HANDSHAKES` (64) at once per listener | connection dropped; other accepts unaffected |
+| TLS / QUIC handshake | `HANDSHAKE_TIMEOUT` 10 s, in the connection's own task; at most 64 at once per listener and 8 per source, the rest refused at once | connection dropped; other accepts unaffected |
 | `Auth` + `AuthProof` after connect | `AUTH_DEADLINE` 30 s | `CloseReason::AuthDeadline` |
 | Any inbound frame after the oldest unanswered `Ping` is written | `PONG_DEADLINE` 30 s | `CloseReason::PongDeadline` |
 | Each frame write, each flush | `FRAME_WRITE_TIMEOUT` 30 s | `CloseReason::WriteTimeout` |
-| Each frame write, each flush, and the `FIN` on a QUIC pane stream | `FRAME_WRITE_TIMEOUT` 30 s | the QUIC connection is closed (application code 1) |
+| Each frame write and each flush on a QUIC pane stream | `PANE_STREAM_STALL_TIMEOUT` 330 s | that stream is reset (application code 1) and the pane resynced; the connection stays up |
 
 Answering `Ping` with `Pong` has always been part of the protocol, and every
 long-lived peer does (`kmux-client`, federation links); what is new is that the
@@ -945,11 +949,25 @@ A listener whose `accept` fails (out of file descriptors) pauses 100 ms before
 the next attempt instead of spinning.
 
 A QUIC pane stream (`pane_uni_writer` in `crates/kmuxd/src/connection.rs`)
-is written under the same `FRAME_WRITE_TIMEOUT` (issue #207). A client that stops
-reading one pane's stream fills that stream's flow-control window, and the
-write used to wait forever, pinning the pane's writer task and its queue. On a
-stall the daemon now closes the whole QUIC connection, exactly as a stalled
-control stream does, and the client reconnects and resyncs.
+has a write timeout too (issue #207). A client that stops reading one pane's
+stream fills that stream's flow-control window, and the write used to wait
+forever, pinning the pane's writer task and its queue. A stall now costs that
+stream alone: it is reset (application code 1), its task ends and the pane's
+queue closes with it, and the client is sent `Lagged` for the pane on the
+control stream. When it reads that, it re-attaches the pane and gets the usual
+`SyncReset` + snapshot on a fresh stream. The connection and every other pane
+carry on.
+
+The stall timeout, `PANE_STREAM_STALL_TIMEOUT`, is 330 s: 30 s past the QUIC
+idle timeout (300 s, with keep-alives every 15 s). A stream also stops taking
+frames when nothing reaches the client at all, a laptop asleep or a network
+gone, and that is the connection's business: it rides out any outage shorter
+than its idle timeout and closes after one longer, which fails every stream's
+write at once. With the stall timeout past the idle timeout, an outage never
+resets a pane stream the connection would have kept, so sleep or a dropped
+network costs no pane a resync. What remains is a client that answers
+keep-alives but has not read this stream for five and a half minutes. The
+`FIN` that ends a stream is not timed: quinn queues it and returns at once.
 
 The pong clock starts when the writer puts the `Ping` on the wire, not when it
 is queued: a ping waiting behind a log dump or pane data on a slow link has not
