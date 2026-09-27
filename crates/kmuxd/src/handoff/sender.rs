@@ -93,7 +93,8 @@ pub async fn run(
             // The successor will respawn from the checkpoint, so make sure a
             // fresh one is on disk. Children are NOT kept alive — this degrades
             // to today's restart behavior.
-            write_checkpoint(app, checkpointer).await?;
+            let state = app.checkpoint_state().await;
+            checkpointer.write_final_in_background(state).await?;
             let _ = write_frame(&stream, &HandoffMessage::Released, None).await;
             return Ok(());
         }
@@ -143,7 +144,8 @@ pub async fn run(
     // exactly what we consumed; anything after sits in the kernel buffer for it.
     app.manager.set_all_keep_alive(true).await;
     app.quiesce_relays().await;
-    write_checkpoint(app, checkpointer).await?;
+    let state = app.checkpoint_state().await;
+    checkpointer.write_final_in_background(state).await?;
 
     // Tell the successor it may bind the control/data sockets; then we exit.
     let _ = write_frame(&stream, &HandoffMessage::Released, None).await;
@@ -211,13 +213,6 @@ fn resolve_successor_exe(
         "cannot locate the daemon binary to re-exec ({}); was it removed mid-upgrade?",
         exe.display()
     )
-}
-
-/// Write the final checkpoint the successor restores from, durably and off
-/// the runtime (issue #207).
-async fn write_checkpoint(app: &ServerApp, checkpointer: &Arc<Checkpointer>) -> anyhow::Result<()> {
-    let state = app.checkpoint_state().await;
-    checkpointer.write_final_in_background(state).await
 }
 
 #[cfg(test)]

@@ -13,7 +13,22 @@ use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
 
-/// Print a local log file to stdout, then optionally follow it.
+/// Print a local log file to stdout, then optionally follow it: see
+/// [`tail_local_log_to`], which this runs against stdout.
+///
+/// # Errors
+///
+/// As [`tail_local_log_to`].
+pub async fn tail_local_log(
+    path: &Path,
+    lines: Option<usize>,
+    follow: bool,
+    not_found_hint: &str,
+) -> anyhow::Result<()> {
+    tail_local_log_to(path, lines, follow, not_found_hint, &mut io::stdout()).await
+}
+
+/// Print a local log file to `out`, then optionally follow it.
 ///
 /// * `lines` — `Some(n)` prints only the last `n` lines of the existing content;
 ///   `None` prints the whole file.
@@ -22,11 +37,12 @@ use tokio::io::{AsyncReadExt, AsyncSeekExt};
 ///
 /// Exits the process with status 1 if the file does not exist, printing
 /// `not_found_hint` so the caller can explain which process populates it.
-pub async fn tail_local_log(
+async fn tail_local_log_to(
     path: &Path,
     lines: Option<usize>,
     follow: bool,
     not_found_hint: &str,
+    out: &mut impl Write,
 ) -> anyhow::Result<()> {
     if !path.exists() {
         eprintln!("Log file not found: {}\n{not_found_hint}", path.display());
@@ -41,9 +57,8 @@ pub async fn tail_local_log(
         Some(n) => kmux_sys::log_tail::last_n_lines_offset(&buf, n),
         None => 0,
     };
-    let mut stdout = io::stdout();
-    stdout.write_all(&buf[start..])?;
-    stdout.flush()?;
+    out.write_all(&buf[start..])?;
+    out.flush()?;
 
     if follow {
         // Seek to end and poll for new bytes, following the log across a
@@ -54,10 +69,31 @@ pub async fn tail_local_log(
             tokio::time::sleep(Duration::from_millis(100)).await;
             let n = kmux_sys::log_tail::read_appended(path, &mut file, &mut read_buf).await?;
             if n > 0 {
-                stdout.write_all(&read_buf[..n])?;
-                stdout.flush()?;
+                out.write_all(&read_buf[..n])?;
+                out.flush()?;
             }
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::tail_local_log_to;
+
+    /// Without `follow`, the last `lines` lines of the log are written out
+    /// and the call returns.
+    #[tokio::test]
+    async fn tail_local_log_writes_the_last_lines_and_returns() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("daemon.log");
+        std::fs::write(&path, b"one\ntwo\nthree\n").unwrap();
+        let mut out = Vec::new();
+
+        tail_local_log_to(&path, Some(2), false, "hint", &mut out)
+            .await
+            .unwrap();
+
+        assert_eq!(out, b"two\nthree\n");
+    }
 }

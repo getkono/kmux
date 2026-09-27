@@ -380,20 +380,51 @@ mod tests {
     }
 
     /// A rotation that cannot move the file keeps writing to it, losing
-    /// nothing.
+    /// nothing, and tries again only once another `max_bytes` has been
+    /// written. Written through `write`, so its byte count is what times the
+    /// retry.
     #[test]
-    fn a_failed_rotation_keeps_writing_to_the_current_file() {
+    fn a_failed_rotation_keeps_writing_and_retries_after_another_cap() {
         let (_root, path, mut log) = fixture_log(Rotation {
-            max_bytes: 4,
+            max_bytes: 10,
             keep: 1,
         });
         // A non-empty directory where `.1` should go makes the rename fail.
-        std::fs::create_dir_all(rotated_path(&path, 1).join("blocker")).unwrap();
-        log.write_all(b"one\n").unwrap();
-        log.write_all(b"two\n").unwrap();
-        assert_eq!(log.write(b"six\n").unwrap(), 4);
+        let blocker = rotated_path(&path, 1);
+        std::fs::create_dir_all(blocker.join("blocker")).unwrap();
+        for line in [b"one\n", b"two\n", b"six\n"] {
+            assert_eq!(log.write(line).unwrap(), 4);
+        }
+        assert_eq!(
+            read(&path),
+            "one\ntwo\nsix\n",
+            "the third line failed to rotate"
+        );
 
-        assert_eq!(read(&path), "one\ntwo\nsix\n");
+        // The blocker is gone, but the retry waits for another 10 bytes.
+        std::fs::remove_dir_all(&blocker).unwrap();
+        assert_eq!(log.write(b"ten\n").unwrap(), 4);
+        assert!(!blocker.exists(), "no rotation yet");
+        assert_eq!(log.write(b"end\n").unwrap(), 4);
+        assert_eq!(read(&blocker), "one\ntwo\nsix\nten\n");
+        assert_eq!(read(&path), "end\n");
+    }
+
+    /// An older file that cannot be shifted up fails the rotation as a
+    /// whole, rather than letting the current file overwrite `.1`.
+    #[test]
+    fn a_rotation_that_cannot_shift_the_older_files_keeps_them() {
+        let (_root, path, mut log) = fixture_log(Rotation {
+            max_bytes: 6,
+            keep: 2,
+        });
+        log.write_all(b"line0\n").unwrap();
+        log.write_all(b"line1\n").unwrap(); // line0 → .1
+        std::fs::create_dir_all(rotated_path(&path, 2).join("blocker")).unwrap();
+        log.write_all(b"line2\n").unwrap(); // .1 → .2 fails
+
+        assert_eq!(read(&rotated_path(&path, 1)), "line0\n", ".1 kept");
+        assert_eq!(read(&path), "line1\nline2\n");
     }
 
     /// When another writer rotated the log, or it was removed, the next line
