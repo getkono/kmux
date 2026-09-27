@@ -43,6 +43,10 @@ exclude_globs = ["crates/kmux-ghostty-sys/src/**"]
 # §Known exceptions.
 exclude_re = [
     'crates/kmux-app/src/subcommands/daemon_cmd\.rs:.*replace fetch_remote_logs -> ',
+    # `authenticate` only loads this user's real machine identity and calls
+    # `authenticate_as`, which the unit tests drive over an in-memory stream
+    # with a generated identity (issue #209).
+    'crates/kmux-app/src/subcommands/mod\.rs:.*replace authenticate -> ',
     # `tail_local_log` only hands stdout to `tail_local_log_to`, which the
     # unit tests drive with a buffer; its `Ok(())` mutant is observable only
     # on the process's stdout (issue #207).

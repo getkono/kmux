@@ -645,3 +645,58 @@ fn ensure_monospace(mut desc: pango::FontDescription, size_pt: f32) -> pango::Fo
     }
     desc
 }
+
+#[cfg(test)]
+mod tests {
+    use kmux_protocol::messages::{PaneProgressState, SessionStatus, TermSize};
+
+    use super::*;
+
+    fn pane(progress_state: PaneProgressState, progress: Option<u8>) -> PaneInfo {
+        PaneInfo {
+            pane_id: "eagle/0".into(),
+            pane_index: 0,
+            program: "sh".into(),
+            size: TermSize::default(),
+            attached_clients: vec![],
+            status: SessionStatus::Running,
+            title: String::new(),
+            progress_state,
+            progress,
+        }
+    }
+
+    fn rgb(c: kmux_app::theme::Rgb) -> (u8, u8, u8) {
+        (c.r, c.g, c.b)
+    }
+
+    #[test]
+    fn a_progress_bar_takes_its_colour_from_the_state_and_its_width_from_the_percentage() {
+        let palette = kmux_app::theme::default_theme();
+        let fill = |state, progress| progress_bar_fill(&pane(state, progress), &palette);
+        assert_eq!(
+            fill(PaneProgressState::Set, Some(40)),
+            Some((rgb(palette.accent), 0.4))
+        );
+        assert_eq!(
+            fill(PaneProgressState::Error, Some(250)),
+            Some((rgb(palette.red), 1.0)),
+            "a percentage past 100 is a full bar"
+        );
+        assert_eq!(
+            fill(PaneProgressState::Pause, None),
+            Some((rgb(palette.orange), 0.0))
+        );
+        assert_eq!(
+            fill(PaneProgressState::Indeterminate, Some(10)),
+            Some((rgb(palette.accent), 1.0)),
+            "busy with no known share fills the width"
+        );
+        assert_eq!(fill(PaneProgressState::Remove, Some(50)), None);
+        assert_eq!(
+            fill(PaneProgressState::Unknown, Some(50)),
+            None,
+            "a state from a newer daemon draws no bar"
+        );
+    }
+}

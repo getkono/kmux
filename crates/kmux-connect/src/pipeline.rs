@@ -491,6 +491,32 @@ struct Refusal {
     failure: Option<AuthFailure>,
 }
 
+/// The handshake's outcome, when `msg` is the `AuthResult` that ends it.
+fn captured_auth(msg: &ServerMessage) -> Option<Result<AuthOutcome, Refusal>> {
+    let ServerMessage::AuthResult {
+        success,
+        reason,
+        failure,
+        connection_id,
+        server_version,
+        ..
+    } = msg
+    else {
+        return None;
+    };
+    Some(if *success {
+        Ok(AuthOutcome {
+            connection_id: connection_id.unwrap_or(ConnectionId(0)),
+            server_version: server_version.clone(),
+        })
+    } else {
+        Err(Refusal {
+            reason: kmux_protocol::messages::refusal_reason(reason.clone(), *failure),
+            failure: *failure,
+        })
+    })
+}
+
 impl Refusal {
     /// The bootstrap error a refusal becomes. Decided on the typed reason:
     /// the text is for people, and an older daemon's text is all it sent.
@@ -636,31 +662,10 @@ async fn establish(
                 tcp_connect::answer_auth_challenge(&challenge_tx, nonce);
                 continue;
             }
-            if let (Some(_), ServerMessage::AuthResult { .. }) = (&auth_tx, &msg) {
-                let captured = match &msg {
-                    ServerMessage::AuthResult {
-                        success: true,
-                        connection_id,
-                        server_version,
-                        ..
-                    } => Ok(AuthOutcome {
-                        connection_id: connection_id.unwrap_or(ConnectionId(0)),
-                        server_version: server_version.clone(),
-                    }),
-                    ServerMessage::AuthResult {
-                        success: false,
-                        reason,
-                        failure,
-                        ..
-                    } => Err(Refusal {
-                        reason: kmux_protocol::messages::refusal_reason(reason.clone(), *failure),
-                        failure: *failure,
-                    }),
-                    _ => unreachable!(),
-                };
-                if let Some(tx) = auth_tx.take() {
-                    let _ = tx.send(captured);
-                }
+            if let Some(captured) = auth_tx.as_ref().and_then(|_| captured_auth(&msg))
+                && let Some(tx) = auth_tx.take()
+            {
+                let _ = tx.send(captured);
             }
             if forwarder_outer.send(msg).is_err() {
                 break;
@@ -729,6 +734,39 @@ mod tests {
             accept_invalid_certs: false,
         };
         assert_eq!(s.label(), "ssh alice@srv");
+    }
+
+    fn auth_result(success: bool, failure: Option<AuthFailure>) -> ServerMessage {
+        ServerMessage::AuthResult {
+            success,
+            reason: None,
+            failure,
+            client_id: None,
+            server_version: success.then(|| "9.9.9".to_string()),
+            connection_id: success.then_some(ConnectionId(4)),
+            compression: None,
+            machine_id: None,
+            label: None,
+            server_machine_id: None,
+            negotiated_protocol: None,
+            negotiated_capabilities: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_handshake_ends_on_its_auth_result() {
+        assert!(captured_auth(&ServerMessage::Ping { seq: 1 }).is_none());
+        assert!(captured_auth(&ServerMessage::AuthChallenge { nonce: vec![1] }).is_none());
+        assert!(matches!(
+            captured_auth(&auth_result(true, None)),
+            Some(Ok(AuthOutcome { connection_id: ConnectionId(4), server_version: Some(v) }))
+                if v == "9.9.9"
+        ));
+        assert!(matches!(
+            captured_auth(&auth_result(false, Some(AuthFailure::BadToken))),
+            Some(Err(Refusal { reason, failure: Some(AuthFailure::BadToken) }))
+                if reason == "invalid token"
+        ));
     }
 
     #[test]

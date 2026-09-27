@@ -92,15 +92,20 @@ pub(super) fn surface(
 
     let notif = gio::Notification::new(&title);
     notif.set_body(Some(&body));
-    // A blocked agent (NeedsInput) is more urgent than a completed turn, or
-    // than a reason from a newer daemon this build does not know.
-    notif.set_priority(match kind {
-        AttentionKind::NeedsInput => gio::NotificationPriority::Urgent,
-        AttentionKind::TurnDone | AttentionKind::Unknown => gio::NotificationPriority::Normal,
-    });
+    notif.set_priority(priority(kind));
     let target = (word_id, pane_id).to_variant();
     notif.set_default_action_and_target_value(FULL_ACTION, Some(&target));
     app.send_notification(Some(&format!("kmux-attention-{attention_id}")), &notif);
+}
+
+/// How urgent an attention of `kind` is: a blocked agent (`NeedsInput`)
+/// more than a completed turn, or a reason from a newer daemon this build does
+/// not know.
+fn priority(kind: AttentionKind) -> gio::NotificationPriority {
+    match kind {
+        AttentionKind::NeedsInput => gio::NotificationPriority::Urgent,
+        AttentionKind::TurnDone | AttentionKind::Unknown => gio::NotificationPriority::Normal,
+    }
 }
 
 /// Register the app-scoped focus action once. A notification click routes here
@@ -168,4 +173,24 @@ fn select_target<'a>(windows: &'a [WindowEntry], word_id: &str) -> Option<&'a Wi
         .or_else(|| visible.iter().copied().find(|e| shows(e)))
         .or_else(|| visible.iter().copied().find(|e| e.window.is_active()))
         .or_else(|| visible.first().copied())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_program_waiting_on_the_user_is_urgent() {
+        assert_eq!(
+            priority(AttentionKind::NeedsInput),
+            gio::NotificationPriority::Urgent
+        );
+        for kind in [AttentionKind::TurnDone, AttentionKind::Unknown] {
+            assert_eq!(
+                priority(kind),
+                gio::NotificationPriority::Normal,
+                "{kind:?}"
+            );
+        }
+    }
 }

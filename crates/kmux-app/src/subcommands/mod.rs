@@ -114,8 +114,9 @@ pub async fn resolve_connection(
 }
 
 /// Run the full `Auth → AuthChallenge → AuthProof → AuthResult` handshake on a
-/// raw framed stream for the headless one-shot subcommands (issue #146). Returns
-/// once the daemon confirms authentication, or an error on rejection.
+/// raw framed stream for the headless one-shot subcommands (issue #146), as
+/// this user's machine identity. Returns once the daemon confirms
+/// authentication, or an error on rejection.
 pub(crate) async fn authenticate<R, W>(
     read_half: &mut R,
     write_half: &mut W,
@@ -125,13 +126,26 @@ where
     R: tokio::io::AsyncRead + Unpin,
     W: tokio::io::AsyncWrite + Unpin,
 {
+    let identity = kmux_sys::identity::Identity::load_or_create()?;
+    authenticate_as(read_half, write_half, token, &identity).await
+}
+
+/// [`authenticate`] as `identity`.
+async fn authenticate_as<R, W>(
+    read_half: &mut R,
+    write_half: &mut W,
+    token: String,
+    identity: &kmux_sys::identity::Identity,
+) -> anyhow::Result<()>
+where
+    R: tokio::io::AsyncRead + Unpin,
+    W: tokio::io::AsyncWrite + Unpin,
+{
     use kmux_protocol::messages::{
         AuthFailure, ClientCapabilities, ClientMessage, FrontendKind, ServerMessage, refusal_reason,
     };
     use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
-    use kmux_sys::identity::Identity;
 
-    let identity = Identity::load_or_create()?;
     let auth = ClientMessage::Auth {
         token,
         protocol_range: kmux_protocol::messages::PROTOCOL_RANGE,
@@ -356,6 +370,97 @@ mod tests {
             "{request:?}"
         );
         result
+    }
+
+    /// Authenticate against a daemon that answers the `Auth` with `replies`
+    /// (after a challenge, when `challenge` is set), then hangs up.
+    async fn authenticate_against(replies: Vec<ServerMessage>) -> anyhow::Result<()> {
+        let (client, mut daemon) = tokio::io::duplex(64 * 1024);
+        let identity = kmux_sys::identity::Identity::generate();
+        let daemon = tokio::spawn(async move {
+            let auth = read_frame(&mut daemon).await.expect("read").expect("Auth");
+            assert!(matches!(
+                decode_client(&auth).expect("decode"),
+                ClientMessage::Auth { .. }
+            ));
+            for reply in &replies {
+                write_frame(&mut daemon, &encode_server(reply).expect("encode"))
+                    .await
+                    .expect("write");
+                if matches!(reply, ServerMessage::AuthChallenge { .. }) {
+                    let proof = read_frame(&mut daemon).await.expect("read").expect("proof");
+                    assert!(matches!(
+                        decode_client(&proof).expect("decode"),
+                        ClientMessage::AuthProof { .. }
+                    ));
+                }
+            }
+        });
+        let (mut read_half, mut write_half) = tokio::io::split(client);
+        let result = authenticate_as(
+            &mut read_half,
+            &mut write_half,
+            "tok".to_string(),
+            &identity,
+        )
+        .await;
+        daemon.await.expect("daemon task");
+        result
+    }
+
+    fn auth_result(failure: Option<kmux_protocol::messages::AuthFailure>) -> ServerMessage {
+        ServerMessage::AuthResult {
+            success: failure.is_none(),
+            reason: failure.map(|f| f.to_string()),
+            failure,
+            client_id: None,
+            server_version: None,
+            connection_id: None,
+            compression: None,
+            machine_id: None,
+            label: None,
+            server_machine_id: None,
+            negotiated_protocol: None,
+            negotiated_capabilities: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn the_cli_answers_the_challenge_then_is_let_in() {
+        authenticate_against(vec![
+            ServerMessage::AuthChallenge { nonce: vec![1; 32] },
+            auth_result(None),
+        ])
+        .await
+        .expect("authenticated");
+    }
+
+    /// A refused CLI handshake says why, and for a protocol mismatch what to
+    /// do about it.
+    #[tokio::test]
+    async fn a_refused_cli_handshake_says_why() {
+        use kmux_protocol::messages::{
+            AuthFailure, PROTOCOL_RANGE, ProtocolRange, ProtocolVersion,
+        };
+
+        let err = authenticate_against(vec![auth_result(Some(AuthFailure::BadToken))])
+            .await
+            .expect_err("refused");
+        assert_eq!(err.to_string(), "Authentication failed: invalid token");
+
+        let mismatch = AuthFailure::ProtocolMismatch {
+            client: PROTOCOL_RANGE,
+            daemon: ProtocolRange::exact(ProtocolVersion::new(2, 0, 0)),
+        };
+        let err = authenticate_against(vec![auth_result(Some(mismatch))])
+            .await
+            .expect_err("refused");
+        assert_eq!(
+            err.to_string(),
+            format!(
+                "Authentication failed: {mismatch}\nHint: update kmux and kmuxd until their supported protocol ranges overlap."
+            )
+        );
     }
 
     /// What `kmux ls`/`kmux ps` used to lose: a refused request reported as

@@ -443,12 +443,14 @@ impl SessionManager {
                 event: SessionEventMsg::PaneFaulted { pane_id },
             } => events.extend(self.on_event_pane_faulted(pane_id)),
 
-            // An event from a newer daemon. An arm rather than a `..`
-            // catch-all, so a variant this build adds fails to compile here
-            // instead of being silently dropped (docs/testing.md R4).
+            // An event from a newer daemon, which this build does not know:
+            // ignored (`docs/architecture-protocol-versioning.md`, "Unknown
+            // variants"). An arm rather than a `..` catch-all, so a variant this
+            // build adds fails to compile here instead of being silently dropped
+            // (docs/testing.md R4).
             ServerMessage::Event {
                 event: SessionEventMsg::Unknown,
-            } => events.extend(Self::on_event_unknown()),
+            } => debug!("ignoring a session event this build does not know"),
 
             ServerMessage::Lagged {
                 pane_id,

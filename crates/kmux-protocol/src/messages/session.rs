@@ -1017,6 +1017,26 @@ mod tests {
     }
 
     #[test]
+    fn frontend_kind_names() {
+        let names: Vec<String> = [
+            FrontendKind::Cli,
+            FrontendKind::Gtk,
+            FrontendKind::Swift,
+            FrontendKind::Unknown,
+        ]
+        .iter()
+        .map(ToString::to_string)
+        .collect();
+        assert_eq!(names, ["cli", "gtk", "swift", "unknown"]);
+    }
+
+    #[test]
+    fn an_unknown_peer_target_names_no_endpoint_and_trusts_no_certificate() {
+        assert_eq!(PeerTarget::Unknown.peer_id(), "unknown");
+        assert!(!PeerTarget::Unknown.accept_invalid_certs());
+    }
+
+    #[test]
     fn unknown_is_sent_as_the_value_it_is_shown_as() {
         assert_eq!(FrontendKind::Unknown.sendable(), FrontendKind::Cli);
         assert_eq!(FrontendKind::Gtk.sendable(), FrontendKind::Gtk);

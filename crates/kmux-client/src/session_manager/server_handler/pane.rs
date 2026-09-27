@@ -114,14 +114,6 @@ impl SessionManager {
         Vec::new()
     }
 
-    /// A `SessionEventMsg` from a newer daemon, which this build does not
-    /// know: ignored (`docs/architecture-protocol-versioning.md`, "Unknown
-    /// variants").
-    pub(super) fn on_event_unknown() -> Vec<SessionEvent> {
-        debug!("ignoring a session event this build does not know");
-        Vec::new()
-    }
-
     /// Handle a `Event` frame carrying `SessionEventMsg::PaneResized`.
     pub(super) fn on_event_pane_resized(
         &mut self,
