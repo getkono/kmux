@@ -274,7 +274,7 @@ count = 2
 [[lints]]
 crate = "kmux-connect"
 lint = "clippy::missing_errors_doc"
-count = 19
+count = 17
 
 [[lints]]
 crate = "kmux-connect"

@@ -205,8 +205,7 @@ mod tests {
         drop(closed);
         create().await.expect("admitted after a rollback");
 
-        let closed = app.close_pane_creation().await;
-        app.keep_pane_creation_closed(closed);
+        app.keep_pane_creation_closed(app.close_pane_creation().await);
         assert!(matches!(
             app.admit_pane_creation(),
             Err(KmuxError::HandoffInProgress)
