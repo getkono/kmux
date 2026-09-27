@@ -64,4 +64,7 @@ exclude_re = [
     # Rust test builds one — the registered kmux-ffi dispatch exception
     # (issue #208).
     'crates/kmux-ffi/src/driver\.rs:.*replace KmuxDriver::connection_banner -> ',
+    # Likewise `KmuxDriver::sessions` only locks the driver and maps each entry
+    # through `FfiSession::from_entry`, which is unit-tested (issue #208).
+    'crates/kmux-ffi/src/driver\.rs:.*replace KmuxDriver::sessions -> ',
 ]

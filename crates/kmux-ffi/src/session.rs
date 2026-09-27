@@ -118,6 +118,23 @@ pub struct FfiSession {
     pub unreachable: bool,
 }
 
+impl FfiSession {
+    /// The row for `entry`, flagged active when it is the `active` session.
+    pub(crate) fn from_entry(
+        entry: &kmux_protocol::messages::SessionEntry,
+        active: Option<&str>,
+    ) -> Self {
+        Self {
+            active: active == Some(entry.meta.word_id.as_str()),
+            word_id: entry.meta.word_id.clone(),
+            name: entry.meta.name.clone(),
+            cwd: entry.meta.cwd.clone(),
+            peer: entry.peer.clone(),
+            unreachable: entry.peer_unreachable,
+        }
+    }
+}
+
 /// One pane (tab) in the active session.
 #[derive(uniffi::Record)]
 pub struct FfiPane {

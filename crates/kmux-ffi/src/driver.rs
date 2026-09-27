@@ -309,14 +309,7 @@ impl KmuxDriver {
         d.mgr
             .session_list()
             .iter()
-            .map(|e| FfiSession {
-                active: active.as_deref() == Some(e.meta.word_id.as_str()),
-                word_id: e.meta.word_id.clone(),
-                name: e.meta.name.clone(),
-                cwd: e.meta.cwd.clone(),
-                peer: e.peer.clone(),
-                unreachable: e.peer_unreachable,
-            })
+            .map(|e| FfiSession::from_entry(e, active.as_deref()))
             .collect()
     }
 
