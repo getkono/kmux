@@ -15,10 +15,17 @@
 //! answer `Hello` within [`READY_TIMEOUT`]; its child handle is a
 //! `tokio::process::Child`, waited on asynchronously, never with a blocking
 //! `wait` on a runtime thread; a stream that goes bad gets the worker killed
-//! before it is reaped; and a worker that has sent nothing for
-//! [`NO_PROGRESS_DEADLINE`] while its PTY holds unread output is taken for
-//! hung and killed. Each of those ends counts as a crash, so the pane is
-//! faulted and its worker respawned.
+//! before it is reaped; and a worker that leaves a heartbeat `Ping` unanswered
+//! for [`PONG_DEADLINE`] — while nothing legitimate holds it up — is taken
+//! for hung and killed. Its output says nothing either way: a worker whose
+//! screen does not change sends none. Each of those ends faults the pane and
+//! respawns its worker; a hang counts against a budget of its own
+//! ([`FaultCause::Hang`]), not the crash budget.
+//!
+//! For a graceful handoff's final checkpoint the worker parks its PTY reader
+//! on request ([`WorkerEngine::hold_reader`]): it answers `Held` after every
+//! event for what it read, so the daemon's mirror — which the checkpoint is
+//! taken from — holds exactly what the worker consumed.
 
 use std::os::fd::{AsFd, AsRawFd, BorrowedFd, OwnedFd, RawFd};
 use std::path::PathBuf;
@@ -39,7 +46,7 @@ use kmux_worker_protocol::{
 use tokio::io::AsyncRead;
 use tokio::net::UnixStream;
 use tokio::process::Child;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio::task::JoinHandle;
 use tracing::{debug, warn};
 
@@ -58,14 +65,15 @@ const WORKER_BIN_ENV: &str = "KMUX_VT_WORKER_BIN";
 /// A worker that does not is killed and the pane falls back to in-process.
 const READY_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// How often a quiet worker is checked for a hang.
+/// How often the supervisor pings its worker, and checks the ping it is
+/// waiting on.
 const LIVENESS_INTERVAL: Duration = Duration::from_secs(5);
 
-/// A worker that has sent nothing for this long while its PTY has output
-/// waiting is hung: a healthy one drains the PTY and emits a diff for every
-/// read. Output that never stops arriving keeps a healthy worker talking, and
-/// a quiet PTY gives a healthy worker nothing to say, so neither trips it.
-const NO_PROGRESS_DEADLINE: Duration = Duration::from_secs(30);
+/// A worker that leaves a ping unanswered this long is hung. Time the worker
+/// spends blocked writing input to a child that does not read its stdin does
+/// not count: it reads the next request, the ping, only once that write is
+/// done (see [`input_blocked`]).
+const PONG_DEADLINE: Duration = Duration::from_secs(30);
 
 /// How long a worker that closed its event stream gets to exit on its own
 /// before it is killed.
@@ -96,6 +104,41 @@ pub struct WorkerEngine {
     supervisor: JoinHandle<()>,
     /// Writer task: drains `req_tx` and `input_tx` onto the socket.
     writer_task: JoinHandle<()>,
+    /// Where the worker's PTY reader stands, set by the supervisor.
+    parked: watch::Receiver<Parked>,
+    /// The id of the next hold asked for.
+    next_hold: AtomicU64,
+    /// Whether client input waits on the daemon's side (from a hold until
+    /// its release), so a worker whose reader is parked is never blocked
+    /// writing input when the `Release` comes.
+    input_held: watch::Sender<bool>,
+}
+
+/// Where a worker's PTY reader stands, as its event stream says.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Parked {
+    /// Reading, as far as the daemon knows.
+    Reading,
+    /// Parked for the hold with this id.
+    Held(u64),
+    /// The worker is gone: it reads nothing any more.
+    Gone,
+}
+
+/// Why a worker was faulted, for its respawn budget (issue #207).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FaultCause {
+    /// It died, or its stream went bad.
+    Crash,
+    /// It left a heartbeat unanswered and was killed.
+    Hang,
+}
+
+/// A worker that ended abnormally: its pane, and why.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkerFault {
+    pub pane_id: String,
+    pub cause: FaultCause,
 }
 
 /// Everything the supervisor needs to fan a worker's output out to clients —
@@ -107,8 +150,9 @@ pub struct WorkerFanout {
     pub seqno_counter: Arc<AtomicU64>,
     pub event_sink: Arc<PaneEventSink>,
     pub manager: Arc<SessionManager>,
-    /// Reports this pane id for respawn when the worker crashes (issue #126).
-    pub fault_tx: mpsc::UnboundedSender<String>,
+    /// Reports this pane for respawn when the worker crashes or hangs
+    /// (issue #126).
+    pub fault_tx: mpsc::UnboundedSender<WorkerFault>,
 }
 
 impl WorkerEngine {
@@ -177,29 +221,21 @@ impl WorkerEngine {
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<WorkerRequest>();
         let (input_tx, mut input_rx) = mpsc::channel::<WorkerRequest>(INPUT_QUEUE_CAPACITY);
 
+        let (input_held, input_hold) = watch::channel(false);
         let writer_task = tokio::spawn(async move {
-            loop {
-                // Control first: a resize or shutdown is not queued behind
-                // input still waiting on the daemon's side. (Once on the
-                // socket, the worker handles requests in order, so one it is
-                // stuck writing to a child that does not read still delays
-                // what follows it.)
-                let req = tokio::select! {
-                    biased;
-                    req = req_rx.recv() => req,
-                    req = input_rx.recv() => req,
-                };
-                let Some(req) = req else { break };
-                if let Err(e) = codec::send_msg(&mut sock_wr, &req).await {
-                    debug!("worker request writer stopping: {e}");
-                    break;
-                }
-            }
+            write_requests(&mut sock_wr, &mut req_rx, &mut input_rx, input_hold).await;
         });
 
         // Capture the worker pid before the `Child` moves into the supervisor.
         let child_pid = child.id().unwrap_or_default();
-        let supervisor = tokio::spawn(supervise(sock_rd, child, pty_probe, mirror.clone(), fanout));
+        let (parked_tx, parked) = watch::channel(Parked::Reading);
+        let worker = Worker {
+            child,
+            pty_probe,
+            req_tx: req_tx.clone(),
+            parked: parked_tx,
+        };
+        let supervisor = tokio::spawn(supervise(sock_rd, worker, mirror.clone(), fanout));
 
         Ok(Self {
             req_tx,
@@ -208,6 +244,9 @@ impl WorkerEngine {
             child_pid,
             supervisor,
             writer_task,
+            parked,
+            next_hold: AtomicU64::new(1),
+            input_held,
         })
     }
 
@@ -283,6 +322,29 @@ impl WorkerEngine {
         });
     }
 
+    /// Ask the worker to park its PTY reader (issue #207). The future
+    /// resolves once it has — every event for what it read applied to the
+    /// mirror — or once the worker is gone, which reads nothing either.
+    pub(super) fn hold_reader(&self) -> impl Future<Output = ()> + Send + 'static {
+        let id = self
+            .next_hold
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.input_held.send_replace(true);
+        let _ = self.req_tx.send(WorkerRequest::Hold { id });
+        let mut parked = self.parked.clone();
+        async move {
+            let _ = parked
+                .wait_for(|p| *p == Parked::Held(id) || *p == Parked::Gone)
+                .await;
+        }
+    }
+
+    /// Let a reader parked by [`Self::hold_reader`] go on.
+    pub(super) fn release_reader(&self) {
+        let _ = self.req_tx.send(WorkerRequest::Release);
+        self.input_held.send_replace(false);
+    }
+
     pub(super) fn abort_relay_task(&mut self) -> JoinHandle<()> {
         // Ask the worker to exit cleanly (releasing its PTY dup), then stop our
         // tasks. The shell survives because the daemon holds the master fd.
@@ -290,6 +352,43 @@ impl WorkerEngine {
         self.writer_task.abort();
         self.supervisor.abort();
         std::mem::replace(&mut self.supervisor, tokio::spawn(async {}))
+    }
+}
+
+/// Write the worker's requests onto its socket until either queue closes or
+/// a write fails: control requests first, so a resize or shutdown is not
+/// queued behind input still waiting on the daemon's side, and input only
+/// while `input_hold` is false.
+///
+/// Once on the socket the worker handles requests in order, so input it is
+/// stuck writing to a child that does not read delays what follows it. While
+/// a handoff holds the worker's reader that child may be blocked on output
+/// nobody reads, and input sent then would block the worker for good — with
+/// the hold's `Release` stuck behind it (issue #207). So input waits here
+/// until the hold is released.
+async fn write_requests(
+    sock_wr: &mut (impl tokio::io::AsyncWrite + Unpin),
+    req_rx: &mut mpsc::UnboundedReceiver<WorkerRequest>,
+    input_rx: &mut mpsc::Receiver<WorkerRequest>,
+    mut input_hold: watch::Receiver<bool>,
+) {
+    let mut hold_alive = true;
+    loop {
+        let input_open = !*input_hold.borrow_and_update();
+        let req = tokio::select! {
+            biased;
+            req = req_rx.recv() => req,
+            changed = input_hold.changed(), if hold_alive => {
+                hold_alive = changed.is_ok();
+                continue;
+            }
+            req = input_rx.recv(), if input_open => req,
+        };
+        let Some(req) = req else { break };
+        if let Err(e) = codec::send_msg(sock_wr, &req).await {
+            debug!("worker request writer stopping: {e}");
+            break;
+        }
     }
 }
 
@@ -329,8 +428,20 @@ enum StreamEnd {
     /// A frame failed to read or decode: the worker is still running but
     /// its stream can no longer be trusted.
     Corrupt,
-    /// The worker went quiet while its PTY held unread output.
+    /// The worker left a heartbeat unanswered.
     Hung,
+}
+
+/// The worker process a supervisor owns, and its lines back to it.
+struct Worker {
+    child: Child,
+    /// A dup of the PTY master, to tell a worker blocked on a child that does
+    /// not read its input from a hung one.
+    pty_probe: OwnedFd,
+    /// For heartbeat pings.
+    req_tx: mpsc::UnboundedSender<WorkerRequest>,
+    /// Where the worker's PTY reader stands, for [`WorkerEngine::hold_reader`].
+    parked: watch::Sender<Parked>,
 }
 
 /// Read the worker's event stream, fan it out to clients, and reap the child.
@@ -343,25 +454,103 @@ enum StreamEnd {
 /// The shell survives because the daemon still holds the PTY master fd.
 async fn supervise(
     sock_rd: impl AsyncRead + Unpin + Send + 'static,
-    mut child: Child,
-    pty_probe: OwnedFd,
+    mut worker: Worker,
     mirror: Arc<Mutex<CellGrid>>,
     fanout: WorkerFanout,
 ) {
-    let output_waiting = || output_waiting(pty_probe.as_fd());
-    let end = apply_events(sock_rd, &mirror, &fanout, output_waiting, LIVENESS_INTERVAL).await;
-    if end_worker(&mut child, end, &fanout.pane_id, EXIT_GRACE).await {
+    let req_tx = worker.req_tx.clone();
+    let probe = worker.pty_probe.as_fd();
+    let liveness = Liveness {
+        ping: move |seq| {
+            let _ = req_tx.send(WorkerRequest::Ping { seq });
+        },
+        input_blocked: || input_blocked(probe),
+        every: LIVENESS_INTERVAL,
+    };
+    let end = apply_events(sock_rd, &mirror, &fanout, &liveness, &worker.parked).await;
+    // Whatever held its reader can stop waiting: a worker on its way out
+    // reads nothing more.
+    worker.parked.send_replace(Parked::Gone);
+    if end_worker(&mut worker.child, end, &fanout.pane_id, EXIT_GRACE).await {
         warn!(pane_id = %fanout.pane_id, ?end, "isolated VT worker crashed; surfacing fault (daemon and other sessions unaffected)");
         broadcast_fault(&fanout);
         // Ask the daemon to respawn the worker (the shell is still alive). If the
         // respawn channel is gone (shutdown), the pane simply stays faulted.
-        let _ = fanout.fault_tx.send(fanout.pane_id.clone());
+        let cause = if end == StreamEnd::Hung {
+            FaultCause::Hang
+        } else {
+            FaultCause::Crash
+        };
+        let _ = fanout.fault_tx.send(WorkerFault {
+            pane_id: fanout.pane_id.clone(),
+            cause,
+        });
     }
 }
 
-/// Apply the worker's events until its stream ends or it hangs, checking
-/// every `check_every` whether it has gone quiet while `output_waiting` says
-/// its PTY has output for it.
+/// How the supervisor asks its worker whether it is alive.
+struct Liveness<P, B> {
+    /// Send `Ping { seq }`.
+    ping: P,
+    /// Whether the worker's child is not reading its input, so a worker
+    /// writing that input is blocked, not hung.
+    input_blocked: B,
+    /// How often to ping, and check the ping waited on.
+    every: Duration,
+}
+
+/// What a heartbeat check calls for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Beat {
+    /// Send this ping.
+    Ping(u64),
+    /// Wait for the ping already sent.
+    Wait,
+    /// The worker is hung.
+    Hung,
+}
+
+/// The heartbeat's state: the ping waited on, if any.
+#[derive(Debug, Default)]
+struct Heartbeat {
+    next_seq: u64,
+    /// The unanswered ping, and since when it counts as unanswered.
+    waiting: Option<(u64, tokio::time::Instant)>,
+}
+
+impl Heartbeat {
+    /// A check at `now`: ping when nothing is waited on; otherwise the worker
+    /// is hung once the ping has been unanswered for [`PONG_DEADLINE`] — not
+    /// counting any time its child was not reading input (`input_blocked`),
+    /// when the worker cannot read the ping.
+    fn check(&mut self, now: tokio::time::Instant, input_blocked: bool) -> Beat {
+        match &mut self.waiting {
+            None => {
+                let seq = self.next_seq;
+                self.next_seq += 1;
+                self.waiting = Some((seq, now));
+                Beat::Ping(seq)
+            }
+            Some((_, since)) if input_blocked => {
+                *since = now;
+                Beat::Wait
+            }
+            Some((_, since)) if now.duration_since(*since) >= PONG_DEADLINE => Beat::Hung,
+            Some(_) => Beat::Wait,
+        }
+    }
+
+    /// The worker answered ping `seq`.
+    fn pong(&mut self, seq: u64) {
+        if self.waiting.is_some_and(|(waited, _)| waited == seq) {
+            self.waiting = None;
+        }
+    }
+}
+
+/// Apply the worker's events until its stream ends or it hangs, pinging it
+/// through `liveness` (see [`Heartbeat`]) and reporting its reader parked on
+/// `parked`.
 ///
 /// The socket is read by a task of its own feeding a bounded channel, so the
 /// periodic check never cancels a frame half-read.
@@ -369,8 +558,8 @@ async fn apply_events(
     mut sock_rd: impl AsyncRead + Unpin + Send + 'static,
     mirror: &Arc<Mutex<CellGrid>>,
     fanout: &WorkerFanout,
-    output_waiting: impl Fn() -> bool,
-    check_every: Duration,
+    liveness: &Liveness<impl Fn(u64), impl Fn() -> bool>,
+    parked: &watch::Sender<Parked>,
 ) -> StreamEnd {
     let (tx, mut rx) = mpsc::channel(EVENT_BUFFER);
     let reader = tokio::spawn(async move {
@@ -389,14 +578,17 @@ async fn apply_events(
 
     let mut prev_cursor = CursorState::default();
     let mut prev_modes = TermModes::EMPTY;
-    let mut last_heard = tokio::time::Instant::now();
-    let mut check = tokio::time::interval(check_every);
+    let mut heartbeat = Heartbeat::default();
+    let mut check = tokio::time::interval(liveness.every);
     check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
         tokio::select! {
             frame = rx.recv() => match frame {
+                Some(Ok(Some(WorkerEvent::Pong { seq }))) => heartbeat.pong(seq),
+                Some(Ok(Some(WorkerEvent::Held { id }))) => {
+                    parked.send_replace(Parked::Held(id));
+                }
                 Some(Ok(Some(ev))) => {
-                    last_heard = tokio::time::Instant::now();
                     handle_event(ev, mirror, fanout, &mut prev_cursor, &mut prev_modes);
                 }
                 Some(Ok(None)) | None => {
@@ -409,40 +601,34 @@ async fn apply_events(
                 }
             },
             _ = check.tick() => {
-                if is_hung(last_heard.elapsed(), output_waiting()) {
-                    return StreamEnd::Hung;
+                let now = tokio::time::Instant::now();
+                match heartbeat.check(now, (liveness.input_blocked)()) {
+                    Beat::Ping(seq) => (liveness.ping)(seq),
+                    Beat::Wait => {}
+                    Beat::Hung => return StreamEnd::Hung,
                 }
             }
         }
     }
 }
 
-/// Whether a worker that has been quiet for `quiet_for` is hung, given
-/// whether its PTY has output waiting (see [`NO_PROGRESS_DEADLINE`]).
-fn is_hung(quiet_for: Duration, output_waiting: bool) -> bool {
-    output_waiting && quiet_for >= NO_PROGRESS_DEADLINE
-}
-
-/// Whether the PTY behind `master` (a dup of its master) has output nobody
-/// has read yet: readable, and not merely at end of file.
-///
-/// A zero-timeout `poll`, since `FIONREAD` on a PTY master reads 0 on macOS.
-/// Once the pane's program has exited the master reports `POLLHUP` (with
-/// `POLLIN` on some systems) for good, and a worker with nothing left to do
-/// must not look hung, so a hang-up is not output. A failed `poll` is no
-/// output either.
-fn output_waiting(master: BorrowedFd<'_>) -> bool {
-    use nix::libc::{POLLHUP, POLLIN, poll, pollfd};
+/// Whether the PTY behind `master` (a dup of its master) takes no more input
+/// now: its child is not reading stdin, and a worker writing input to it is
+/// blocked there until it does — unable to read the next request, a ping
+/// included. A zero-timeout `poll` for `POLLOUT`; a failed one, or a
+/// hang-up (the child is gone, so writes fail rather than block), is not
+/// blocked.
+fn input_blocked(master: BorrowedFd<'_>) -> bool {
+    use nix::libc::{POLLOUT, poll, pollfd};
 
     let mut probe = pollfd {
         fd: master.as_raw_fd(),
-        events: POLLIN,
+        events: POLLOUT,
         revents: 0,
     };
     // SAFETY: one valid pollfd for the call; the fd is borrowed and outlives it.
     let ready = unsafe { poll(&raw mut probe, 1, 0) };
-    // Only POLLIN was asked for, so a ready fd without a hang-up has output.
-    ready == 1 && probe.revents & POLLHUP == 0
+    ready == 0
 }
 
 /// Reap the worker (the daemon's direct child) so it does not linger as a
@@ -591,8 +777,12 @@ fn handle_event(
             warn!(pane_id = %fanout.pane_id, "worker reported fault: {detail}");
         }
         // The daemon answers snapshot/history from its mirror, so it never asks
-        // the worker; ignore any unsolicited response.
-        WorkerEvent::Snapshot { .. } | WorkerEvent::History { .. } => {}
+        // the worker; ignore any unsolicited response. Heartbeat and hold
+        // answers are the supervisor's (`apply_events`), not the pane's.
+        WorkerEvent::Snapshot { .. }
+        | WorkerEvent::History { .. }
+        | WorkerEvent::Pong { .. }
+        | WorkerEvent::Held { .. } => {}
     }
 }
 
@@ -721,6 +911,9 @@ mod tests {
             child_pid: 0,
             supervisor: tokio::spawn(async {}),
             writer_task: tokio::spawn(async {}),
+            parked: watch::channel(Parked::Reading).1,
+            next_hold: AtomicU64::new(1),
+            input_held: watch::channel(false).0,
         };
         engine
             .enqueue_input(PaneInput::Bytes(b"b".to_vec()))
@@ -741,6 +934,99 @@ mod tests {
         assert!(matches!(input_rx.try_recv(), Ok(WorkerRequest::Paste { data }) if data == b"p"));
     }
 
+    /// A hold asks the worker to park with a fresh id and resolves once the
+    /// worker says it parked for that id — not for an older one — or is
+    /// gone; a release lets the worker go on (issue #207).
+    #[tokio::test]
+    async fn a_hold_resolves_once_the_worker_parked_for_it() {
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let (parked_tx, parked) = watch::channel(Parked::Reading);
+        let engine = WorkerEngine {
+            req_tx,
+            input_tx: mpsc::channel(1).0,
+            mirror: fixture_mirror(),
+            child_pid: 0,
+            supervisor: tokio::spawn(async {}),
+            writer_task: tokio::spawn(async {}),
+            parked,
+            next_hold: AtomicU64::new(1),
+            input_held: watch::channel(false).0,
+        };
+        let pending = Duration::from_millis(50);
+
+        let hold = tokio::spawn(engine.hold_reader());
+        assert!(matches!(
+            req_rx.recv().await,
+            Some(WorkerRequest::Hold { id: 1 })
+        ));
+        parked_tx.send_replace(Parked::Held(0));
+        tokio::time::sleep(pending).await;
+        assert!(!hold.is_finished(), "an older hold's answer");
+        parked_tx.send_replace(Parked::Held(1));
+        tokio::time::timeout(GUARD, hold)
+            .await
+            .expect("parked")
+            .unwrap();
+
+        let hold = engine.hold_reader();
+        assert!(matches!(
+            req_rx.recv().await,
+            Some(WorkerRequest::Hold { id: 2 })
+        ));
+        parked_tx.send_replace(Parked::Gone);
+        tokio::time::timeout(GUARD, hold)
+            .await
+            .expect("a gone worker reads nothing");
+
+        engine.release_reader();
+        assert!(matches!(req_rx.recv().await, Some(WorkerRequest::Release)));
+    }
+
+    /// The next request the worker end reads, within [`GUARD`].
+    async fn next_request(worker: &mut UnixStream) -> Option<WorkerRequest> {
+        tokio::time::timeout(GUARD, codec::recv_msg::<_, WorkerRequest>(worker))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Control requests go out ahead of queued input, and input waits while
+    /// a hold is on — so a held worker is never blocked writing input when
+    /// the hold's `Release` comes — then goes out once it is released.
+    #[tokio::test]
+    async fn input_waits_while_held_and_control_goes_first() {
+        let (daemon, mut worker) = UnixStream::pair().unwrap();
+        let (_daemon_rd, mut sock_wr) = daemon.into_split();
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let (input_tx, mut input_rx) = mpsc::channel(4);
+        let (held, input_hold) = watch::channel(true);
+        input_tx
+            .try_send(WorkerRequest::Paste { data: vec![1] })
+            .unwrap();
+        req_tx.send(WorkerRequest::Release).unwrap();
+        let writer = tokio::spawn(async move {
+            write_requests(&mut sock_wr, &mut req_rx, &mut input_rx, input_hold).await;
+        });
+
+        assert!(matches!(
+            next_request(&mut worker).await,
+            Some(WorkerRequest::Release)
+        ));
+        let quiet = tokio::time::timeout(
+            Duration::from_millis(100),
+            codec::recv_msg::<_, WorkerRequest>(&mut worker),
+        )
+        .await;
+        assert!(quiet.is_err(), "input waits while held");
+        held.send_replace(false);
+        assert!(matches!(
+            next_request(&mut worker).await,
+            Some(WorkerRequest::Paste { .. })
+        ));
+        drop((req_tx, input_tx));
+        tokio::time::timeout(GUARD, writer).await.unwrap().unwrap();
+    }
+
     /// A stand-in worker process: `sh -c script`, spawned as the daemon
     /// spawns a worker, so it is reaped the same way.
     fn fixture_worker(script: &str) -> Child {
@@ -755,7 +1041,7 @@ mod tests {
     fn fixture_fanout() -> (
         WorkerFanout,
         Arc<Mutex<String>>,
-        mpsc::UnboundedReceiver<String>,
+        mpsc::UnboundedReceiver<WorkerFault>,
     ) {
         let title = Arc::new(Mutex::new(String::new()));
         let (fault_tx, fault_rx) = mpsc::unbounded_channel();
@@ -844,14 +1130,21 @@ mod tests {
             .unwrap();
 
         let (sock_rd, _sock_wr) = daemon.into_split();
-        tokio::time::timeout(
-            GUARD,
-            supervise(sock_rd, child, probe, fixture_mirror(), fanout),
-        )
-        .await
-        .expect("the supervisor returns without waiting on the worker");
+        let (parked, parked_rx) = watch::channel(Parked::Reading);
+        let worker = Worker {
+            child,
+            pty_probe: probe,
+            req_tx: mpsc::unbounded_channel().0,
+            parked,
+        };
+        tokio::time::timeout(GUARD, supervise(sock_rd, worker, fixture_mirror(), fanout))
+            .await
+            .expect("the supervisor returns without waiting on the worker");
 
-        assert_eq!(faults.try_recv().as_deref(), Ok("eagle/0"));
+        let fault = faults.try_recv().expect("a fault");
+        assert_eq!(fault.pane_id, "eagle/0");
+        assert_eq!(fault.cause, FaultCause::Crash);
+        assert_eq!(*parked_rx.borrow(), Parked::Gone, "a hold stops waiting");
         assert_eq!(
             nix::sys::signal::kill(pid, None),
             Err(nix::errno::Errno::ESRCH),
@@ -871,95 +1164,160 @@ mod tests {
             };
             codec::send_msg(&mut worker, &ev).await.unwrap();
         }
+        codec::send_msg(&mut worker, &WorkerEvent::Held { id: 5 })
+            .await
+            .unwrap();
         drop(worker);
 
-        let end = apply_events(daemon, &fixture_mirror(), &fanout, || false, GUARD).await;
+        let (parked, parked_rx) = watch::channel(Parked::Reading);
+        let liveness = unanswered(false);
+        let end = apply_events(daemon, &fixture_mirror(), &fanout, &liveness, &parked).await;
 
         assert_eq!(end, StreamEnd::Closed);
         assert_eq!(*title.lock().unwrap(), "second");
+        assert_eq!(
+            *parked_rx.borrow(),
+            Parked::Held(5),
+            "Held parks the reader"
+        );
     }
 
-    /// A worker that goes quiet while its PTY holds unread output is taken
-    /// for hung once the no-progress deadline passes; with nothing to read,
-    /// a quiet worker is left alone.
+    /// A heartbeat that never answers, with the child's input `blocked` or
+    /// not.
+    fn unanswered(blocked: bool) -> Liveness<impl Fn(u64), impl Fn() -> bool> {
+        Liveness {
+            ping: |_| {},
+            input_blocked: move || blocked,
+            every: LIVENESS_INTERVAL,
+        }
+    }
+
+    /// A worker that answers every ping is never taken for hung, though it
+    /// sends nothing else at all — an unchanged screen sends no output, which
+    /// is why liveness is asked, not inferred (issue #207).
     #[tokio::test(start_paused = true)]
-    async fn a_quiet_worker_is_hung_only_while_output_waits() {
+    async fn a_worker_that_answers_pings_is_never_hung() {
         let (fanout, _title, _faults) = fixture_fanout();
-        let (daemon, _quiet_worker) = UnixStream::pair().unwrap();
-        let started = tokio::time::Instant::now();
-        let end = apply_events(
-            daemon,
-            &fixture_mirror(),
-            &fanout,
-            || true,
-            LIVENESS_INTERVAL,
+        let (daemon, worker) = UnixStream::pair().unwrap();
+        let (pings_tx, mut pings) = mpsc::unbounded_channel();
+        let (_worker_rd, mut worker_wr) = worker.into_split();
+        let answering = tokio::spawn(async move {
+            while let Some(seq) = pings.recv().await {
+                let pong = WorkerEvent::Pong { seq };
+                if codec::send_msg(&mut worker_wr, &pong).await.is_err() {
+                    break;
+                }
+            }
+        });
+        let liveness = Liveness {
+            ping: move |seq| {
+                let _ = pings_tx.send(seq);
+            },
+            input_blocked: || false,
+            every: LIVENESS_INTERVAL,
+        };
+        let (parked, _) = watch::channel(Parked::Reading);
+
+        let alive = tokio::time::timeout(
+            PONG_DEADLINE * 3,
+            apply_events(daemon, &fixture_mirror(), &fanout, &liveness, &parked),
         )
         .await;
-        assert_eq!(end, StreamEnd::Hung);
-        assert!(started.elapsed() >= NO_PROGRESS_DEADLINE);
+        assert!(alive.is_err(), "not hung");
+        answering.abort();
+    }
 
-        let (daemon, _quiet_worker) = UnixStream::pair().unwrap();
-        let idle = tokio::time::timeout(
-            NO_PROGRESS_DEADLINE * 3,
+    /// A worker that leaves a ping unanswered past the deadline is hung —
+    /// unless its child is not reading input, which blocks a healthy worker
+    /// from reading the ping at all.
+    #[tokio::test(start_paused = true)]
+    async fn an_unanswered_ping_is_a_hang_unless_the_input_is_blocked() {
+        let (fanout, _title, _faults) = fixture_fanout();
+        let (parked, _) = watch::channel(Parked::Reading);
+
+        let (daemon, _silent) = UnixStream::pair().unwrap();
+        let started = tokio::time::Instant::now();
+        let end = tokio::time::timeout(
+            PONG_DEADLINE * 3,
             apply_events(
                 daemon,
                 &fixture_mirror(),
                 &fanout,
-                || false,
-                LIVENESS_INTERVAL,
+                &unanswered(false),
+                &parked,
+            ),
+        )
+        .await
+        .expect("a hang is called by the deadline");
+        assert_eq!(end, StreamEnd::Hung);
+        assert!(started.elapsed() >= PONG_DEADLINE);
+
+        let (daemon, _silent) = UnixStream::pair().unwrap();
+        let blocked = tokio::time::timeout(
+            PONG_DEADLINE * 3,
+            apply_events(
+                daemon,
+                &fixture_mirror(),
+                &fanout,
+                &unanswered(true),
+                &parked,
             ),
         )
         .await;
-        assert!(idle.is_err(), "an idle worker is not hung");
+        assert!(blocked.is_err(), "blocked on input, not hung");
     }
 
+    /// The heartbeat pings when nothing is waited on, takes only the answer
+    /// to the ping it waits on, and calls a hang at the deadline — counting
+    /// from the last time the input was seen blocked.
     #[test]
-    fn a_worker_is_hung_after_the_deadline_with_output_waiting() {
-        let just_under = NO_PROGRESS_DEADLINE - Duration::from_millis(1);
-        let cases = [
-            (NO_PROGRESS_DEADLINE, true, true),
-            (NO_PROGRESS_DEADLINE * 2, true, true),
-            (just_under, true, false),
-            (NO_PROGRESS_DEADLINE, false, false),
-        ];
-        for (quiet_for, waiting, hung) in cases {
-            assert_eq!(is_hung(quiet_for, waiting), hung, "{quiet_for:?} {waiting}");
-        }
+    fn the_heartbeat_waits_out_the_deadline_from_the_last_block() {
+        let start = tokio::time::Instant::now();
+        let mut beat = Heartbeat::default();
+        assert_eq!(beat.check(start, false), Beat::Ping(0));
+        beat.pong(7);
+        let just_under = start + PONG_DEADLINE - Duration::from_millis(1);
+        assert_eq!(beat.check(just_under, false), Beat::Wait, "another pong");
+        assert_eq!(beat.check(start + PONG_DEADLINE, false), Beat::Hung);
+
+        let blocked_at = start + PONG_DEADLINE;
+        assert_eq!(beat.check(blocked_at, true), Beat::Wait, "blocked");
+        let later = blocked_at + PONG_DEADLINE - Duration::from_millis(1);
+        assert_eq!(beat.check(later, false), Beat::Wait);
+        assert_eq!(beat.check(blocked_at + PONG_DEADLINE, false), Beat::Hung);
+
+        beat.pong(0);
+        assert_eq!(beat.check(later, false), Beat::Ping(1), "answered");
     }
 
-    /// A PTY master shows output waiting once the program wrote some nobody
-    /// read, and none once that output is read or the program has exited. A
-    /// real PTY, because the readiness is the kernel's (R7).
+    /// A PTY master takes input while its child reads (or has room for it),
+    /// and none once a child that does not read has filled its input buffer.
+    /// A real PTY in raw mode, because the readiness is the kernel's (R7).
     #[tokio::test]
-    async fn output_waiting_reads_the_pty_masters_readiness() {
-        let (_session, mut reader, writer) =
-            crate::fixtures::fixture_pty("printf ready; read line; exit 0").await;
+    async fn input_blocked_reads_the_pty_masters_readiness() {
+        let (_session, mut reader, _writer) =
+            crate::fixtures::fixture_pty("stty raw -echo; printf ready; exec sleep 30").await;
         let fd = reader.as_raw_fd();
         // SAFETY: the reader keeps the fd open for the whole test.
         let master = unsafe { BorrowedFd::borrow_raw(fd) };
-        let until = |want: bool| async move {
-            while output_waiting(master) != want {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        };
-
-        tokio::time::timeout(GUARD, until(true))
-            .await
-            .expect("the output shows up");
         let mut buf = [0u8; 64];
-        let n = reader.read(&mut buf).await.unwrap();
+        let n = tokio::time::timeout(GUARD, reader.read(&mut buf))
+            .await
+            .expect("the child is ready")
+            .unwrap();
         assert_eq!(&buf[..n], b"ready");
-        assert!(!output_waiting(master), "read, so nothing waits");
+        assert!(!input_blocked(master), "room for input");
 
-        // Let the program exit; its echo is read away, and the hang-up that
-        // follows is not output.
-        writer.write_all(b"\n").await.unwrap();
-        tokio::time::timeout(GUARD, async {
-            while reader.read(&mut buf).await.is_ok_and(|n| n > 0) {}
-        })
-        .await
-        .expect("the program exits");
-        assert!(!output_waiting(master), "a hang-up is not output");
+        let chunk = [b'x'; 4096];
+        let mut written = 0usize;
+        while !input_blocked(master) && written < 1 << 20 {
+            match nix::unistd::write(master, &chunk) {
+                Ok(n) => written += n,
+                Err(nix::errno::Errno::EAGAIN) => break,
+                Err(e) => panic!("write to the master: {e}"),
+            }
+        }
+        assert!(input_blocked(master), "full after {written} bytes");
     }
 
     /// A worker whose stream went bad is killed rather than waited on; one

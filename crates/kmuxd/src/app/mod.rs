@@ -654,15 +654,15 @@ pub struct ServerApp {
     /// the scan off the async runtime via `spawn_blocking`. Refreshes lazily, so
     /// it is free until a client opens the overview.
     pub(super) sampler: Arc<Mutex<crate::process_stats::ProcessSampler>>,
-    /// Pane ids whose isolated VT worker crashed, reported by worker supervisors
-    /// for respawn (issue #126). Drained by the task spawned in
+    /// Panes whose isolated VT worker crashed or hung, reported by worker
+    /// supervisors for respawn (issue #126). Drained by the task spawned in
     /// [`ServerApp::spawn_worker_respawn_task`].
-    worker_fault_tx: mpsc::UnboundedSender<String>,
+    worker_fault_tx: mpsc::UnboundedSender<crate::engine::WorkerFault>,
     /// Receiver half, taken once by `spawn_worker_respawn_task`.
-    worker_fault_rx: Mutex<Option<mpsc::UnboundedReceiver<String>>>,
+    worker_fault_rx: Mutex<Option<mpsc::UnboundedReceiver<crate::engine::WorkerFault>>>,
     /// Per-pane restart timestamps, used to bound worker respawns (crash-loop
-    /// guard); keyed by `pane_id`.
-    worker_restart_log: Mutex<HashMap<String, Vec<Instant>>>,
+    /// guard; crashes and hangs each have a budget); keyed by `pane_id`.
+    worker_restart_log: Mutex<HashMap<String, recover::RestartLog>>,
     /// Retained closed (inactive) sessions a user can restore (issue #64),
     /// newest-closed last. Persisted to its own `closed.bin` file, rewritten
     /// only when this set changes. See `app/graveyard.rs`.
@@ -739,7 +739,7 @@ impl ServerApp {
     }
 
     /// Clone the sender worker supervisors use to report a crash for respawn.
-    pub(crate) fn worker_fault_tx(&self) -> mpsc::UnboundedSender<String> {
+    pub(crate) fn worker_fault_tx(&self) -> mpsc::UnboundedSender<crate::engine::WorkerFault> {
         self.worker_fault_tx.clone()
     }
 

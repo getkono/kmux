@@ -66,10 +66,31 @@ async fn create_session_with_recorded_child(
 /// daemon — exercising `spawn_successor` → `SCM_RIGHTS` → `restore_with_handoff`.
 #[tokio::test]
 async fn live_restart_preserves_running_shell_across_processes() {
+    live_restart_preserves_the_shell(false).await.unwrap();
+}
+
+/// B1 with the pane in an isolated VT worker (issue #207): the worker parks
+/// its PTY reader for the final checkpoint (`Hold`/`Held` over the worker
+/// protocol) and the handoff still commits with the shell alive.
+#[tokio::test]
+async fn live_restart_preserves_a_worker_panes_shell() {
+    live_restart_preserves_the_shell(true).await.unwrap();
+}
+
+/// B1's body, for a predecessor with isolated panes or not.
+async fn live_restart_preserves_the_shell(isolated: bool) -> anyhow::Result<()> {
+    use anyhow::Context as _;
+
     let sandbox = Sandbox::new();
     let cleanup = Cleanup::default();
 
-    let old_pid = Daemon::new(&sandbox).spawn(None).await;
+    let predecessor = Daemon::new(&sandbox);
+    let predecessor = if isolated {
+        predecessor.isolated()
+    } else {
+        predecessor
+    };
+    let old_pid = predecessor.spawn(None).await;
     cleanup.track(old_pid as i32);
 
     let token = daemon_token(&sandbox).await;
@@ -81,7 +102,7 @@ async fn live_restart_preserves_running_shell_across_processes() {
     assert!(
         kmux_client::daemon::query_daemon_at(&sandbox.socket_path())
             .await
-            .unwrap()
+            .context("the daemon answers")?
             .session_count
             >= 1,
         "the session should be present before the restart"
@@ -89,7 +110,7 @@ async fn live_restart_preserves_running_shell_across_processes() {
 
     let accepted = kmux_client::daemon::restart_daemon_at(&sandbox.socket_path())
         .await
-        .expect("restart control request");
+        .context("restart control request")?;
     assert!(
         matches!(accepted, kmux_client::daemon::RestartReply::Accepted { .. }),
         "daemon should accept the graceful handoff"
@@ -97,7 +118,7 @@ async fn live_restart_preserves_running_shell_across_processes() {
 
     let new_pid = wait_for_daemon(&sandbox, Some(old_pid))
         .await
-        .expect("a successor daemon should take over");
+        .context("a successor daemon should take over")?;
     cleanup.track(new_pid as i32);
     assert_ne!(new_pid, old_pid, "the successor must have a distinct PID");
     assert!(
@@ -113,13 +134,14 @@ async fn live_restart_preserves_running_shell_across_processes() {
     assert!(
         kmux_client::daemon::query_daemon_at(&sandbox.socket_path())
             .await
-            .unwrap()
+            .context("the successor answers")?
             .session_count
             >= 1,
         "the session must persist across the restart"
     );
 
     let _ = kmux_client::daemon::stop_daemon_at(&sandbox.socket_path()).await;
+    Ok(())
 }
 
 /// B2: replacing the daemon binary in place (as `cargo install` does) before

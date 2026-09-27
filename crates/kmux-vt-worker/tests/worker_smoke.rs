@@ -16,6 +16,30 @@ use kmux_pty::config::PtyConfig;
 use kmux_worker_protocol::{WORKER_PROTOCOL_VERSION, WorkerEvent, WorkerRequest, codec};
 use tokio::net::UnixStream;
 
+fn is_nonempty_diff(ev: &WorkerEvent) -> bool {
+    matches!(ev, WorkerEvent::Diff { diff, .. } if !diff.ops.is_empty())
+}
+
+/// The next event `wanted` picks out, skipping the rest; `None` when the
+/// stream ends or none comes within five seconds of the last.
+async fn next_event(
+    rd: &mut tokio::net::unix::OwnedReadHalf,
+    wanted: impl Fn(&WorkerEvent) -> bool,
+) -> Option<WorkerEvent> {
+    loop {
+        let ev = tokio::time::timeout(
+            Duration::from_secs(5),
+            codec::recv_msg::<_, WorkerEvent>(rd),
+        )
+        .await
+        .ok()?
+        .ok()??;
+        if wanted(&ev) {
+            return Some(ev);
+        }
+    }
+}
+
 /// A pane running in a real worker subprocess turns PTY output into cell diffs:
 /// `cat` echoes the input we write, the PTY surfaces it, and the worker emits a
 /// non-empty `Diff`. This exercises the whole boundary — fd passing, handshake,
@@ -52,6 +76,9 @@ async fn worker_processes_pty_and_emits_diff() {
     }
     let mut child = cmd.spawn().expect("spawn worker");
     drop(worker_end); // parent no longer needs the worker end
+    // A failed assertion must not leave the worker (or the shell) running: a
+    // starved worker never sees its socket close.
+    let _cleanup = KillOnDrop(vec![child.id().cast_signed(), pid]);
 
     daemon_end.set_nonblocking(true).expect("nonblocking");
     let stream = UnixStream::from_std(daemon_end).expect("tokio stream");
@@ -113,11 +140,113 @@ async fn worker_processes_pty_and_emits_diff() {
         "worker should emit a non-empty cell diff after input echoes through the PTY"
     );
 
-    // Clean shutdown; reap the worker and the shell.
-    let _ = codec::send_msg(&mut wr, &WorkerRequest::Shutdown).await;
-    let _ = child.wait();
+    heartbeat_and_hold(&mut rd, &mut wr)
+        .await
+        .expect("heartbeat and hold");
+
+    // The shell exiting is reported: the PTY's EOF is the only exit signal
+    // for a child the worker cannot `waitpid`.
     let _ = nix::sys::signal::kill(
         nix::unistd::Pid::from_raw(pid),
         nix::sys::signal::Signal::SIGKILL,
     );
+    let exit = next_event(&mut rd, |ev| matches!(ev, WorkerEvent::ChildExit { .. })).await;
+    assert!(exit.is_some(), "the child's exit is reported");
+
+    // Clean shutdown; reap the worker and the shell.
+    // Bounded: a worker that ignored `Shutdown` must fail the test, not hang it.
+    let _ = codec::send_msg(&mut wr, &WorkerRequest::Shutdown).await;
+    let exited = reap_within(&mut child, Duration::from_secs(10)).await;
+    let _ = nix::sys::signal::kill(
+        nix::unistd::Pid::from_raw(pid),
+        nix::sys::signal::Signal::SIGKILL,
+    );
+    assert!(
+        exited.is_some_and(|status| status.success()),
+        "the worker exits cleanly on Shutdown: {exited:?}"
+    );
+}
+
+/// Heartbeat (issue #207): a ping is answered with its own sequence number;
+/// a hold parks the reader until released, and can be taken again.
+async fn heartbeat_and_hold(
+    rd: &mut tokio::net::unix::OwnedReadHalf,
+    wr: &mut tokio::net::unix::OwnedWriteHalf,
+) -> std::io::Result<()> {
+    codec::send_msg(wr, &WorkerRequest::Ping { seq: 41 }).await?;
+    let pong = next_event(rd, |ev| matches!(ev, WorkerEvent::Pong { .. })).await;
+    assert!(
+        matches!(pong, Some(WorkerEvent::Pong { seq: 41 })),
+        "{pong:?}"
+    );
+
+    // A hold parks the reader: it says so, and the pane's output waits in the
+    // PTY until the hold is released.
+    codec::send_msg(wr, &WorkerRequest::Hold { id: 7 }).await?;
+    let held = next_event(rd, |ev| matches!(ev, WorkerEvent::Held { .. })).await;
+    assert!(
+        matches!(held, Some(WorkerEvent::Held { id: 7 })),
+        "{held:?}"
+    );
+    let input = WorkerRequest::Input {
+        data: b"held\n".to_vec(),
+    };
+    codec::send_msg(wr, &input).await?;
+    // Nothing is read while held, and the worker says `Held` once, not
+    // again and again.
+    let read_or_held_again =
+        |ev: &WorkerEvent| is_nonempty_diff(ev) || matches!(ev, WorkerEvent::Held { .. });
+    let while_held = tokio::time::timeout(
+        Duration::from_millis(500),
+        next_event(rd, read_or_held_again),
+    )
+    .await;
+    assert!(while_held.is_err(), "nothing while held: {while_held:?}");
+    codec::send_msg(wr, &WorkerRequest::Release).await?;
+    assert!(
+        next_event(rd, is_nonempty_diff).await.is_some(),
+        "read once released"
+    );
+    // And it can be held again, for a later handoff.
+    codec::send_msg(wr, &WorkerRequest::Hold { id: 8 }).await?;
+    let held = next_event(rd, |ev| matches!(ev, WorkerEvent::Held { .. })).await;
+    assert!(
+        matches!(held, Some(WorkerEvent::Held { id: 8 })),
+        "{held:?}"
+    );
+    codec::send_msg(wr, &WorkerRequest::Release).await
+}
+
+/// Wait up to `timeout` for `child` to exit, killing it if it has not.
+async fn reap_within(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> Option<std::process::ExitStatus> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Ok(Some(status)) = child.try_wait() {
+            return Some(status);
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// SIGKILLs these pids when dropped, however the test ends. Killing one
+/// already gone is harmless.
+struct KillOnDrop(Vec<i32>);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        for &pid in &self.0 {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
+    }
 }
