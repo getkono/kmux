@@ -47,6 +47,11 @@ pub enum KmuxError {
         max: usize,
     },
 
+    /// Every session word is in use — by local sessions and the federated
+    /// ones drawn from the same pool — so no new session can be named.
+    #[error("no session word is free: close a session, or a federated peer")]
+    SessionWordsExhausted,
+
     #[error("PTY is closed")]
     Closed,
 

@@ -46,9 +46,7 @@ impl ServerApp {
             wl.draw(&mut *rng)
                 // Federated sessions draw from the same pool, so it can run
                 // dry before `sessions` holds the limit.
-                .ok_or(KmuxError::SessionLimit {
-                    max: super::MAX_SESSIONS,
-                })?
+                .ok_or(KmuxError::SessionWordsExhausted)?
         };
 
         // Resolve CWD
