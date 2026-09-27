@@ -8,7 +8,7 @@ use crate::connection::classify_error;
 
 use super::super::SharedClientState;
 
-/// Handle [`ClientMessage::PtyInput`].
+/// Handle [`ClientMessage::PtyInput`](kmux_protocol::messages::ClientMessage::PtyInput).
 pub(super) async fn on_pty_input(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -20,7 +20,7 @@ pub(super) async fn on_pty_input(
     }
 }
 
-/// Handle [`ClientMessage::PtyPaste`].
+/// Handle [`ClientMessage::PtyPaste`](kmux_protocol::messages::ClientMessage::PtyPaste).
 pub(super) async fn on_pty_paste(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -32,7 +32,7 @@ pub(super) async fn on_pty_paste(
     }
 }
 
-/// Handle [`ClientMessage::PtyKeyBatch`].
+/// Handle [`ClientMessage::PtyKeyBatch`](kmux_protocol::messages::ClientMessage::PtyKeyBatch).
 pub(super) async fn on_pty_key_batch(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -48,7 +48,7 @@ pub(super) async fn on_pty_key_batch(
     }
 }
 
-/// Handle [`ClientMessage::Resize`].
+/// Handle [`ClientMessage::Resize`](kmux_protocol::messages::ClientMessage::Resize).
 pub(super) async fn on_resize(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -65,14 +65,14 @@ pub(super) async fn on_resize(
     }
 }
 
-/// Handle [`ClientMessage::Signal`].
+/// Handle [`ClientMessage::Signal`](kmux_protocol::messages::ClientMessage::Signal).
 pub(super) async fn on_signal(state: &mut SharedClientState, pane_id: PaneId, signal: i32) {
     if let Err(e) = state.app.send_signal(&pane_id, signal).await {
         state.error(None, classify_error(&e), e.to_string());
     }
 }
 
-/// Handle [`ClientMessage::RequestInputLock`].
+/// Handle [`ClientMessage::RequestInputLock`](kmux_protocol::messages::ClientMessage::RequestInputLock).
 pub(super) async fn on_request_input_lock(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -89,7 +89,7 @@ pub(super) async fn on_request_input_lock(
     }
 }
 
-/// Handle [`ClientMessage::ReleaseInputLock`].
+/// Handle [`ClientMessage::ReleaseInputLock`](kmux_protocol::messages::ClientMessage::ReleaseInputLock).
 pub(super) async fn on_release_input_lock(
     state: &mut SharedClientState,
     client_id: ClientId,

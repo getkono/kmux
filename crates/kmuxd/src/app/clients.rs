@@ -1,7 +1,7 @@
 //! Client-management endpoints for locally-hosted sessions (issue #146): list the
 //! connections attached to a session, and kick one connection out of it. The
-//! dispatch layer routes federated sessions to the owning peer instead (see
-//! [`super::ServerApp::is_federated_session`]).
+//! dispatch layer sends a federated session's requests to its peer instead (see
+//! [`super::ServerApp::is_forwarded_request`]).
 
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;

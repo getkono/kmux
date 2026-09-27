@@ -12,7 +12,7 @@ use crate::connection::classify_error;
 
 use super::super::{CLIENT_CHANNEL_CAPACITY, PaneAttacher, SharedClientState};
 
-/// Handle [`ClientMessage::Attach`].
+/// Handle [`ClientMessage::Attach`](kmux_protocol::messages::ClientMessage::Attach).
 pub(super) async fn on_attach<A: PaneAttacher>(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -80,7 +80,7 @@ pub(super) async fn on_attach<A: PaneAttacher>(
     }
 }
 
-/// Handle [`ClientMessage::Detach`].
+/// Handle [`ClientMessage::Detach`](kmux_protocol::messages::ClientMessage::Detach).
 pub(super) async fn on_detach(state: &mut SharedClientState, client_id: ClientId, pane_id: PaneId) {
     if let Some(handle) = state.attached.remove(&pane_id) {
         handle.abort();
@@ -89,7 +89,7 @@ pub(super) async fn on_detach(state: &mut SharedClientState, client_id: ClientId
     }
 }
 
-/// Handle [`ClientMessage::SetSnapshotMode`].
+/// Handle [`ClientMessage::SetSnapshotMode`](kmux_protocol::messages::ClientMessage::SetSnapshotMode).
 pub(super) async fn on_set_snapshot_mode(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -99,7 +99,7 @@ pub(super) async fn on_set_snapshot_mode(
     debug!("client {client_id:?} snapshot mode = {enabled}");
 }
 
-/// Handle [`ClientMessage::SetPaused`].
+/// Handle [`ClientMessage::SetPaused`](kmux_protocol::messages::ClientMessage::SetPaused).
 pub(super) async fn on_set_paused(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -110,7 +110,7 @@ pub(super) async fn on_set_paused(
     debug!("client {client_id:?} paused = {paused} (auto = {auto})");
 }
 
-/// Handle [`ClientMessage::SetPaneNoAutoPause`].
+/// Handle [`ClientMessage::SetPaneNoAutoPause`](kmux_protocol::messages::ClientMessage::SetPaneNoAutoPause).
 pub(super) async fn on_set_pane_no_auto_pause(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -124,7 +124,7 @@ pub(super) async fn on_set_pane_no_auto_pause(
     debug!("client {client_id:?} pane {pane_id} no_auto_pause = {exempt}");
 }
 
-/// Handle [`ClientMessage::FetchHistory`].
+/// Handle [`ClientMessage::FetchHistory`](kmux_protocol::messages::ClientMessage::FetchHistory).
 pub(super) async fn on_fetch_history(
     state: &mut SharedClientState,
     request_id: RequestId,
