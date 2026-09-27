@@ -12,8 +12,12 @@ pub const RESYNC_REQUEST_ID: RequestId = RequestId::MAX;
 /// Opaque connection identity assigned by the server on first authentication.
 ///
 /// Survives transport switches: when a client re-authenticates on a new channel
-/// (QUIC ↔ TCP) it passes its `ConnectionId` so the server can transfer all
-/// pane attachments to the new transport without the client needing to re-attach.
+/// (QUIC ↔ TCP), or reconnects while the daemon still holds the old channel, it
+/// passes its `ConnectionId` and keeps its registration — label, client id and
+/// input locks — provided it proves the same identity (`machine_id`) the
+/// connection was registered with (issue #208). Pane streams do not move by
+/// themselves: the client re-attaches each pane with its `last_seqno` and is
+/// sent what it missed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct ConnectionId(pub u64);
 

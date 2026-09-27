@@ -188,6 +188,7 @@ pub(super) async fn on_auth_proof(state: &mut SharedClientState, signature: Vec<
         .await;
     state.client_id = Some(reg.client_id);
     state.connection_id = Some(reg.connection_id);
+    state.generation = reg.generation;
     state.capabilities = pending.capabilities;
     state.authenticated = true;
     state.pending_swap_from = reg.previous_transport;
@@ -222,6 +223,8 @@ pub(super) async fn on_auth_proof(state: &mut SharedClientState, signature: Vec<
         conn_id = reg.connection_id.0,
         client_id = reg.client_id.0,
         label = state.label.as_deref().unwrap_or(""),
+        generation = reg.generation,
+        resume = ?reg.resume,
         compress,
         "client authenticated"
     );

@@ -447,8 +447,11 @@ frame, before auth, and every frame answers any outstanding ping.
 watchdog_task.abort()
 event_task.abort()
 ping_task.abort()
-app.detach_client_all(client_id)     // remove from all pane ClientMaps
-app.unregister_client(conn_id)       // decrement conn_count_watch
+release_channel(&state)              // detach the panes attached through this
+                                     // channel; release the registration (and
+                                     // decrement conn_count_watch) only if this
+                                     // channel's generation is still current
+                                     // (issue #208, see connection.md)
 writer_task.abort()
 log "connection closed"
 ```

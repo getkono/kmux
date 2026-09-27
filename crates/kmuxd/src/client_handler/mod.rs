@@ -5,6 +5,9 @@ mod session;
 pub use dispatch::handle_message;
 pub use events::pty_event_to_msg;
 pub(crate) use session::{MAX_WRITE_BATCH, forward_vt_event, within};
+// The app's resume tests drive a channel's teardown directly.
+#[cfg(test)]
+pub(crate) use session::release_channel;
 pub use session::{build_attach_replay, run_client_session};
 
 use std::collections::HashMap;
@@ -107,6 +110,9 @@ pub struct SharedClientState {
     pub authenticated: bool,
     pub client_id: Option<ClientId>,
     pub connection_id: Option<ConnectionId>,
+    /// The registration generation this channel holds (issue #208); only the
+    /// current one releases the registration when its loop ends.
+    pub generation: u64,
     pub capabilities: ClientCapabilities,
     /// Set after a valid `Auth`; consumed when `AuthProof` arrives (issue #146).
     pub pending_auth: Option<PendingAuth>,
@@ -150,6 +156,7 @@ impl SharedClientState {
             authenticated: false,
             client_id: None,
             connection_id: None,
+            generation: 0,
             capabilities: ClientCapabilities::default(),
             pending_auth: None,
             machine_id: None,

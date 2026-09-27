@@ -301,6 +301,30 @@ pub(crate) async fn within<T, E>(
     }
 }
 
+/// What an authenticated channel's loop releases as it ends (issue #208): the
+/// pane attachments made through this channel, and the connection's
+/// registration if this channel still holds it. A channel a resume superseded
+/// leaves the registration — and every pane the resuming channel re-attached —
+/// to the channel that took over.
+pub(crate) async fn release_channel(state: &SharedClientState) {
+    let (Some(client_id), Some(conn_id)) = (state.client_id, state.connection_id) else {
+        return;
+    };
+    state.app.detach_channel(client_id, &state.ctrl_tx).await;
+    let released = state
+        .app
+        .release_connection(conn_id, state.generation)
+        .await;
+    // `released = false`: a resume superseded this channel, and the
+    // registration stays with the channel that took over.
+    debug!(
+        conn_id = conn_id.0,
+        generation = state.generation,
+        released,
+        "channel released"
+    );
+}
+
 /// Generic client session handler shared by QUIC and TCP connections.
 ///
 /// Runs the event-forwarder, ping, writer, and read-dispatch loop that are
@@ -447,12 +471,7 @@ pub async fn run_client_session<R, W, A, F>(
     drop(authenticated_tasks);
 
     let log_conn_id = state.connection_id.map(|c| c.0);
-    if let Some(client_id) = state.client_id {
-        app.detach_client_all(client_id).await;
-    }
-    if let Some(conn_id) = state.connection_id {
-        app.unregister_client(conn_id).await;
-    }
+    release_channel(&state).await;
 
     drop(state);
     drop(attacher);
