@@ -30,8 +30,28 @@ pub(crate) async fn send_auth_frame<W: AsyncWrite + Unpin>(
     capabilities: ClientCapabilities,
     resume: Option<ResumeFrom>,
 ) -> Result<(), String> {
-    let (public_key, hostname, username) = local_identity_claim();
-    let auth_bytes = encode_client(&ClientMessage::Auth {
+    let auth_bytes = encode_client(&auth_message(
+        token,
+        capabilities,
+        resume,
+        local_identity_claim(),
+    ))
+    .map_err(|e| format!("auth encode failed: {e}"))?;
+    write_frame(writer, &auth_bytes)
+        .await
+        .map_err(|e| format!("auth write failed: {e}"))
+}
+
+/// The `Auth` message [`send_auth_frame`] sends, for this process's identity
+/// claim `(public_key, hostname, username)`: a resumed registration carries
+/// its `connection_id` and the daemon run that assigned it.
+fn auth_message(
+    token: String,
+    capabilities: ClientCapabilities,
+    resume: Option<ResumeFrom>,
+    (public_key, hostname, username): (Vec<u8>, String, String),
+) -> ClientMessage {
+    ClientMessage::Auth {
         token,
         protocol_range: kmux_protocol::messages::PROTOCOL_RANGE,
         protocol_capabilities: kmux_protocol::messages::protocol_capabilities(),
@@ -48,11 +68,7 @@ pub(crate) async fn send_auth_frame<W: AsyncWrite + Unpin>(
         client_git_sha: kmux_protocol::buildinfo::git_sha().to_string(),
         client_git_dirty: kmux_protocol::buildinfo::git_dirty(),
         client_build_profile: kmux_protocol::buildinfo::build_profile().to_string(),
-    })
-    .map_err(|e| format!("auth encode failed: {e}"))?;
-    write_frame(writer, &auth_bytes)
-        .await
-        .map_err(|e| format!("auth write failed: {e}"))
+    }
 }
 
 /// This process's identity claim for the `Auth` handshake (issue #146): the
@@ -369,4 +385,62 @@ fn set_tcp_keepalive(stream: &TcpStream) -> std::io::Result<()> {
     let fd = unsafe { std::os::unix::io::BorrowedFd::borrow_raw(stream.as_raw_fd()) };
     setsockopt(&fd, sockopt::KeepAlive, &true)
         .map_err(|e| std::io::Error::from_raw_os_error(e as i32))
+}
+
+#[cfg(test)]
+mod tests {
+    use kmux_protocol::messages::{ConnectionId, DaemonInstanceId, PROTOCOL_RANGE};
+
+    use super::*;
+
+    fn claim() -> (Vec<u8>, String, String) {
+        (vec![7; 32], "host".into(), "user".into())
+    }
+
+    #[test]
+    fn an_auth_resumes_the_connection_in_the_run_that_assigned_it() {
+        let resume = ResumeFrom {
+            connection_id: ConnectionId(4),
+            instance: Some(DaemonInstanceId(9)),
+        };
+        match auth_message(
+            "tok".into(),
+            ClientCapabilities::default(),
+            Some(resume),
+            claim(),
+        ) {
+            ClientMessage::Auth {
+                token,
+                protocol_range,
+                connection_id,
+                resume_instance,
+                public_key,
+                hostname,
+                username,
+                ..
+            } => {
+                assert_eq!(token, "tok");
+                assert_eq!(protocol_range, PROTOCOL_RANGE);
+                assert_eq!(connection_id, Some(ConnectionId(4)));
+                assert_eq!(resume_instance, Some(DaemonInstanceId(9)));
+                assert_eq!(
+                    (public_key, hostname, username),
+                    (vec![7; 32], "host".to_string(), "user".to_string())
+                );
+            }
+            other => panic!("expected Auth, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_first_auth_resumes_nothing() {
+        assert!(matches!(
+            auth_message("tok".into(), ClientCapabilities::default(), None, claim()),
+            ClientMessage::Auth {
+                connection_id: None,
+                resume_instance: None,
+                ..
+            }
+        ));
+    }
 }

@@ -71,4 +71,18 @@ exclude_re = [
     # Likewise `KmuxDriver::sessions` only locks the driver and maps each entry
     # through `FfiSession::from_entry`, which is unit-tested (issue #208).
     'crates/kmux-ffi/src/driver\.rs:.*replace KmuxDriver::sessions -> ',
+    # The live connection's drivers, each needing a real daemon or SSH peer
+    # to reach (issue #209). `SessionManager::connect` runs the bootstrap
+    # against its target and hands the outcome to `apply_outcome`;
+    # `TransportSupervisor::run` loops over probes of real endpoints until its
+    # caller hangs up; `launch_ssh_supervisor` and `run_supervisor_phase`
+    # spawn that loop for an SSH link; `send_auth_frame` loads this user's real
+    # identity and writes the frame. The decisions they make are unit-tested:
+    # `apply_outcome` and `resume_from`, `ensure_active` and `probe_verdict`,
+    # `auth_message`.
+    'crates/kmux-client/src/session_manager/connection\.rs:.*replace SessionManager::connect -> ',
+    'crates/kmux-connect/src/supervisor\.rs:.*replace TransportSupervisor::run with ',
+    'crates/kmux-app/src/core/orchestration\.rs:.*replace AppCore::launch_ssh_supervisor with ',
+    'crates/kmux-app/src/subcommands/dry_run\.rs:.*replace run_supervisor_phase -> ',
+    'crates/kmux-connect/src/tcp_connect\.rs:.*replace send_auth_frame -> ',
 ]
