@@ -134,7 +134,10 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
     attach/resize/detach recompute it and forward **at most one** upstream `Resize`,
     only when it changes (vs. PR3's verbatim per-client forwarding);
   - **single upstream attach** — only the **first** viewer of a pane forwards `Attach`
-    upstream; the **last** to leave forwards `Detach`;
+    upstream; the **last** to leave forwards `Detach`. That `Attach` always asks for a
+    snapshot (`last_seqno: None`), whatever seqno the viewer resumes from (a GUI
+    reconnecting re-attaches with its `last_seqno`, issue #208): the mirror is new, and
+    a delta on top of a blank mirror would leave every later viewer a wrong grid;
   - **zero-round-trip late attach** — a second viewer is served a snapshot minted from
     the live mirror via `to_snapshot()` (stamped with the mirror's seqno so its later
     diffs line up), no upstream round-trip.

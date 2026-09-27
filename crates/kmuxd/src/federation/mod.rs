@@ -1097,13 +1097,17 @@ impl PeerManager {
     /// snapshot back); a **later** viewer is served a snapshot minted from the live
     /// mirror with **no upstream round-trip**, then the upstream size is reconciled
     /// (smallest-wins). Returns `false` when the pane is not federated.
+    ///
+    /// The first viewer always asks the remote for a snapshot, whatever seqno
+    /// the viewer resumes from (issue #208): the hub's mirror is new and blank,
+    /// and a delta on top of it would leave every later viewer a wrong grid.
+    /// The viewer is served that snapshot too, which resyncs it.
     pub fn attach_viewer(
         &self,
         local_pane_id: &str,
         client_id: ClientId,
         data_tx: mpsc::Sender<ServerMessage>,
         ctrl_tx: crate::outbound::OutboundTx,
-        last_seqno: Option<SequenceNo>,
         size: TermSize,
     ) -> bool {
         let Some((local_word, idx)) = parse_pane_id(local_pane_id) else {
@@ -1159,7 +1163,7 @@ impl PeerManager {
             guard.panes.insert(local_pane_id.to_string(), pane);
             let _ = guard.client_tx.send(ClientMessage::Attach {
                 pane_id: remote_pane,
-                last_seqno,
+                last_seqno: None,
                 size,
             });
         }

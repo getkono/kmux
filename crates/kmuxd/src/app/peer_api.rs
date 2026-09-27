@@ -12,8 +12,8 @@
 //! locally-hosted one.
 
 use kmux_protocol::messages::{
-    ClientId, ClientInfo, ClientMessage, PaneProcesses, PeerId, PeerTarget, SequenceNo,
-    ServerMessage, SessionEntry, TermSize,
+    ClientId, ClientInfo, ClientMessage, PaneProcesses, PeerId, PeerTarget, ServerMessage,
+    SessionEntry, TermSize,
 };
 use tokio::sync::mpsc;
 
@@ -329,17 +329,16 @@ impl ServerApp {
         client_id: ClientId,
         data_tx: mpsc::Sender<ServerMessage>,
         ctrl_tx: crate::outbound::OutboundTx,
-        last_seqno: Option<SequenceNo>,
         size: TermSize,
     ) -> bool {
         #[cfg(feature = "federation")]
         {
             self.peer_manager
-                .attach_viewer(pane_id, client_id, data_tx, ctrl_tx, last_seqno, size)
+                .attach_viewer(pane_id, client_id, data_tx, ctrl_tx, size)
         }
         #[cfg(not(feature = "federation"))]
         {
-            let _ = (pane_id, client_id, data_tx, ctrl_tx, last_seqno, size);
+            let _ = (pane_id, client_id, data_tx, ctrl_tx, size);
             false
         }
     }
