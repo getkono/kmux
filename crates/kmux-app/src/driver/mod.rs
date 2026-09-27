@@ -1165,13 +1165,15 @@ mod tests {
     ) {
         let (mut driver, srv_tx, bs_tx) = FrontendDriver::for_test(fixture_core());
         let (tx, rx) = mpsc::unbounded_channel();
-        driver.core.mgr.apply_outcome(link(tx, Some(DAEMON_PID)));
+        driver.core.mgr.apply_outcome(link(tx, Some(DAEMON_RUN)));
         driver.core.mgr.active_pane = Some("eagle/0".to_string());
         (driver, srv_tx, bs_tx, rx)
     }
 
-    /// The pid of the daemon `live_driver` is linked to.
-    const DAEMON_PID: u32 = 4242;
+    use kmux_protocol::messages::DaemonInstanceId;
+
+    /// The daemon run `live_driver` is linked to.
+    const DAEMON_RUN: DaemonInstanceId = DaemonInstanceId(4242);
 
     /// A key typing `c`.
     fn typed(c: char) -> KeyEvent {
@@ -1198,13 +1200,13 @@ mod tests {
 
     /// A successful local bootstrap whose link sends into `tx`.
     fn outcome(tx: mpsc::UnboundedSender<ClientMessage>) -> BootstrapTaskResult {
-        BootstrapTaskResult::Success(Box::new(link(tx, Some(DAEMON_PID))))
+        BootstrapTaskResult::Success(Box::new(link(tx, Some(DAEMON_RUN))))
     }
 
-    /// A local link sending into `tx`, to daemon `pid`.
+    /// A local link sending into `tx`, to daemon run `run`.
     fn link(
         tx: mpsc::UnboundedSender<ClientMessage>,
-        pid: Option<u32>,
+        run: Option<DaemonInstanceId>,
     ) -> kmux_client::pipeline::BootstrapOutcome {
         use kmux_client::pipeline::BootstrapOutcome;
         use kmux_client::transport::TransportKind as Link;
@@ -1222,7 +1224,7 @@ mod tests {
             is_local: true,
             ssh_context: None,
             bootstrap_elapsed: Duration::ZERO,
-            daemon_pid: pid,
+            daemon_instance: run,
         }
     }
 

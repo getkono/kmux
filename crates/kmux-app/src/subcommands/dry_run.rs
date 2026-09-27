@@ -174,7 +174,10 @@ async fn run_supervisor_phase(
 
     let supervisor = TransportSupervisor::new(SupervisorParams {
         endpoints,
-        connection_id: outcome.connection_id,
+        resume: kmux_protocol::messages::ResumeFrom {
+            connection_id: outcome.connection_id,
+            instance: outcome.daemon_instance,
+        },
         token: outcome.token.clone(),
         capabilities: outcome.capabilities.clone(),
         accept_invalid_certs: outcome.accept_invalid_certs,

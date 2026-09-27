@@ -10,7 +10,8 @@ use std::path::Path;
 use std::time::{Duration, Instant};
 
 use kmux_protocol::messages::{
-    AuthFailure, ClientCapabilities, ClientMessage, ConnectionId, ServerMessage,
+    AuthFailure, ClientCapabilities, ClientMessage, ConnectionId, DaemonInstanceId, ResumeFrom,
+    ServerMessage,
 };
 use kmux_sys::transport::EndpointAdvert;
 use thiserror::Error;
@@ -92,11 +93,12 @@ pub struct BootstrapOutcome {
     /// `Some` for SSH targets; `None` for `LocalDaemon` / Direct.
     pub ssh_context: Option<SshContext>,
     pub bootstrap_elapsed: Duration,
-    /// The pid of the daemon process this link reached, when known (the local
-    /// daemon's control socket reports it). A reconnect that reaches another
-    /// pid reached another daemon run, whose pane seqnos start over — so the
-    /// client must not resume panes from the old run's seqnos (issue #208).
-    pub daemon_pid: Option<u32>,
+    /// The daemon run this link reached (`AuthResult`'s `daemon_instance`);
+    /// `None` from a daemon that predates it. A reconnect that reaches another
+    /// run — whose pane seqnos and shells start over — must not resume panes
+    /// from the old run's seqnos, nor deliver input held for its shells
+    /// (issue #208). A pid cannot tell: a restarted daemon may reuse one.
+    pub daemon_instance: Option<DaemonInstanceId>,
 }
 
 #[derive(Debug, Error)]
@@ -298,7 +300,6 @@ struct ConnectPlan {
     accept_invalid_certs: bool,
     is_local: bool,
     ssh_context: Option<SshContext>,
-    daemon_pid: Option<u32>,
 }
 
 /// Bootstrap `target`, emitting one [`BootstrapEvent`] per step through
@@ -312,7 +313,7 @@ struct ConnectPlan {
 pub async fn run_bootstrap(
     target: ResolvedTarget,
     capabilities: ClientCapabilities,
-    connection_id: Option<ConnectionId>,
+    resume: Option<ResumeFrom>,
     server_tx: mpsc::UnboundedSender<ServerMessage>,
     observer: &dyn BootstrapObserver,
 ) -> Result<BootstrapOutcome, BootstrapError> {
@@ -340,14 +341,8 @@ pub async fn run_bootstrap(
         }
     };
 
-    let (client_tx, auth) = establish(
-        &plan,
-        connection_id,
-        capabilities.clone(),
-        server_tx,
-        observer,
-    )
-    .await?;
+    let (client_tx, auth) =
+        establish(&plan, resume, capabilities.clone(), server_tx, observer).await?;
 
     Ok(BootstrapOutcome {
         client_tx,
@@ -362,7 +357,7 @@ pub async fn run_bootstrap(
         is_local: plan.is_local,
         ssh_context: plan.ssh_context,
         bootstrap_elapsed: start.elapsed(),
-        daemon_pid: plan.daemon_pid,
+        daemon_instance: auth.daemon_instance,
     })
 }
 
@@ -422,7 +417,6 @@ async fn prepare_local_daemon(
         accept_invalid_certs: true,
         is_local: true,
         ssh_context: None,
-        daemon_pid: Some(status.pid),
     })
 }
 
@@ -475,13 +469,13 @@ async fn prepare_ssh(
             endpoints,
             probe_json: ssh.probe_json,
         }),
-        daemon_pid: None,
     })
 }
 
 struct AuthOutcome {
     connection_id: ConnectionId,
     server_version: Option<String>,
+    daemon_instance: Option<DaemonInstanceId>,
 }
 
 /// A refused handshake: the daemon's words and, from a daemon that sends it,
@@ -499,6 +493,7 @@ fn captured_auth(msg: &ServerMessage) -> Option<Result<AuthOutcome, Refusal>> {
         failure,
         connection_id,
         server_version,
+        daemon_instance,
         ..
     } = msg
     else {
@@ -508,6 +503,7 @@ fn captured_auth(msg: &ServerMessage) -> Option<Result<AuthOutcome, Refusal>> {
         Ok(AuthOutcome {
             connection_id: connection_id.unwrap_or(ConnectionId(0)),
             server_version: server_version.clone(),
+            daemon_instance: *daemon_instance,
         })
     } else {
         Err(Refusal {
@@ -538,7 +534,7 @@ impl Refusal {
 /// is surfaced synchronously to `run_bootstrap`.
 async fn establish(
     plan: &ConnectPlan,
-    connection_id: Option<ConnectionId>,
+    resume: Option<ResumeFrom>,
     capabilities: ClientCapabilities,
     outer_tx: mpsc::UnboundedSender<ServerMessage>,
     observer: &dyn BootstrapObserver,
@@ -572,7 +568,7 @@ async fn establish(
                 plan.token.clone(),
                 intercept_tx,
                 capabilities,
-                connection_id,
+                resume,
             )
             .await
         }
@@ -585,7 +581,7 @@ async fn establish(
                 plan.accept_invalid_certs,
                 intercept_tx,
                 capabilities,
-                connection_id,
+                resume,
             )
             .await
         }
@@ -602,7 +598,7 @@ async fn establish(
                 plan.token.clone(),
                 intercept_tx,
                 capabilities,
-                connection_id,
+                resume,
                 plan.accept_invalid_certs,
             )
             .await
@@ -629,7 +625,7 @@ async fn establish(
 
     observer.on_event(&BootstrapEvent::HandshakeAuthSent {
         protocol_version: kmux_protocol::messages::PROTOCOL_RANGE.to_string(),
-        connection_id,
+        connection_id: resume.map(|from| from.connection_id),
     });
 
     let client_tx = match sender_result {
@@ -744,6 +740,7 @@ mod tests {
             client_id: None,
             server_version: success.then(|| "9.9.9".to_string()),
             connection_id: success.then_some(ConnectionId(4)),
+            daemon_instance: success.then_some(DaemonInstanceId(3)),
             compression: None,
             machine_id: None,
             label: None,
@@ -759,8 +756,11 @@ mod tests {
         assert!(captured_auth(&ServerMessage::AuthChallenge { nonce: vec![1] }).is_none());
         assert!(matches!(
             captured_auth(&auth_result(true, None)),
-            Some(Ok(AuthOutcome { connection_id: ConnectionId(4), server_version: Some(v) }))
-                if v == "9.9.9"
+            Some(Ok(AuthOutcome {
+                connection_id: ConnectionId(4),
+                server_version: Some(v),
+                daemon_instance: Some(DaemonInstanceId(3)),
+            })) if v == "9.9.9"
         ));
         assert!(matches!(
             captured_auth(&auth_result(false, Some(AuthFailure::BadToken))),

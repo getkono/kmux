@@ -125,8 +125,10 @@ Compatible changes:
   Example: `SessionEntry::peer_unreachable` (issue #208), a `#[serde(default)]`
   flag an older client ignores and an older daemon never sets; and an
   unsolicited `SessionListResult` with `request_id = RESYNC_REQUEST_ID`, an
-  existing variant every client already accepts. Neither needed a range bump
-  or a capability.
+  existing variant every client already accepts; and `AuthResult.daemon_instance`
+  with `Auth.resume_instance` (issue #209), which a daemon that predates them
+  never sends and never reads — it resumes on the `connection_id` alone, as
+  before. None of them needed a range bump or a capability.
 - Add a new message or behavior behind a named negotiated capability.
 - Add a capability without changing `PROTOCOL_VERSION` or
   `MIN_PROTOCOL_VERSION`.

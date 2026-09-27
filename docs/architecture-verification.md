@@ -75,6 +75,17 @@ resync (`grid.clear()` + re-attach). This turns silent corruption into a detecte
 self-healing, *countable* event — the conformance and e2e suites assert the count
 stays zero.
 
+The digest is a backstop for corruption *within* one daemon run. It is not what
+keeps a client from resuming a pane across runs — a restarted daemon numbers its
+seqnos from scratch, so an old run's `last_seqno` could line up with the new
+run's by accident and a diff would land on the wrong screen, caught only by the
+next (1-in-32) digest. That is ruled out before any frame flows: a client
+resumes a pane from its seqno only when the link reached the same run
+(`AuthResult.daemon_instance`, `SessionManager::link_reached_same_daemon`), a
+federation hub likewise (`reattach_panes`), and a daemon answers a `last_seqno`
+past the pane's current seqno with `SyncReset` (`compute_replay`). See
+[connection.md](connection.md#connectionid-and-session-resumption).
+
 ## What needs more than a content digest
 
 The digest covers seams 2–5. It is **blind** to two classes of bug, each now

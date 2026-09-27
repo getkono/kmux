@@ -5,8 +5,9 @@ use super::error::AuthFailure;
 use super::error::ErrorCode;
 use super::process::PaneProcesses;
 use super::session::{
-    ClientId, ClientInfo, ClosedSessionEntry, ConnectionId, DirEntry, LayoutNode, PaneId, PaneInfo,
-    PeerId, RequestId, SequenceNo, SessionEntry, SessionEventMsg, TabIndex, TabInfo, WordId,
+    ClientId, ClientInfo, ClosedSessionEntry, ConnectionId, DaemonInstanceId, DirEntry, LayoutNode,
+    PaneId, PaneInfo, PeerId, RequestId, SequenceNo, SessionEntry, SessionEventMsg, TabIndex,
+    TabInfo, WordId,
 };
 use super::types::{Compression, ProtocolVersion};
 use super::vt::{CursorState, GridSnapshot, ScrollbackLine, TermModes, TerminalDiff};
@@ -42,6 +43,12 @@ pub enum ServerMessage {
         /// when re-authenticating on a new transport channel.
         #[serde(default)]
         connection_id: Option<ConnectionId>,
+        /// This daemon run's identity; `Some` on success. The client presents
+        /// it again as `Auth::resume_instance`, and compares it across a
+        /// reconnect to know whether it reached the same run (whose seqnos and
+        /// shells carry on). An older daemon leaves it unset.
+        #[serde(default)]
+        daemon_instance: Option<DaemonInstanceId>,
         /// Compression the daemon chose for this connection (HTTP
         /// `Content-Encoding` analogue). `None` = uncompressed. The daemon
         /// decides based on client locality and config; the client only needs
@@ -685,6 +692,7 @@ mod tests {
                     client_id: None,
                     server_version: None,
                     connection_id: None,
+                    daemon_instance: None,
                     compression: None,
                     machine_id: None,
                     label: None,

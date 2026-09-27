@@ -569,7 +569,7 @@ impl AppCore {
             let _ = monitor_tx.send(()).await;
         });
 
-        let Some(conn_id) = self.mgr.connection_id else {
+        let Some(resume) = self.mgr.resume_from() else {
             // apply_outcome always sets connection_id on success; missing
             // here implies a misordered caller. Skip supervisor rather
             // than panic so the TCP+TLS path keeps working.
@@ -608,7 +608,7 @@ impl AppCore {
         tokio::spawn(async move {
             let supervisor = TransportSupervisor::new(SupervisorParams {
                 endpoints,
-                connection_id: conn_id,
+                resume,
                 token,
                 capabilities,
                 accept_invalid_certs: accept_invalid,
@@ -684,7 +684,7 @@ impl AppCore {
         self.cancel_tx = Some(cancel_tx);
 
         let capabilities = self.mgr.capabilities().clone();
-        let connection_id = self.mgr.connection_id;
+        let resume = self.mgr.resume_from();
 
         tokio::spawn(async move {
             tokio::select! {
@@ -693,7 +693,7 @@ impl AppCore {
                 result = pipeline::run_bootstrap(
                     target,
                     capabilities,
-                    connection_id,
+                    resume,
                     srv_tx,
                     &NoopObserver,
                 ) => {
