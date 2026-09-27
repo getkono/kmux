@@ -55,13 +55,15 @@ async fn create_session_with_recorded_child(
         matches!(m, ServerMessage::SessionCreated { .. })
     })
     .await;
-    let Some(ServerMessage::SessionCreated { entry, .. }) = created else {
-        panic!("expected a SessionCreated ack, got {created:?}");
+    let word = match created {
+        Some(ServerMessage::SessionCreated { entry, .. }) => entry.meta.word_id,
+        _ => String::new(),
     };
+    assert!(!word.is_empty(), "expected a SessionCreated ack");
     let pid = read_pid_file(pidfile, harness::E2E_TIMEOUT)
         .await
         .expect("shell wrote its PID");
-    (format!("{}/0", entry.meta.word_id), pid)
+    (format!("{word}/0"), pid)
 }
 
 /// B1: a real cross-process `restart` migrates the live shell — same process, new
