@@ -34,6 +34,34 @@ pub struct FfiConnInfo {
     pub transport_overridden: bool,
 }
 
+/// The link banner (issue #208): reconnecting, unreachable, or keystrokes an
+/// outage dropped. Mirrors `kmux_app::driver::ConnectionBanner`.
+#[derive(Debug, uniffi::Record)]
+pub struct FfiConnectionBanner {
+    /// The line to show.
+    pub text: String,
+    /// The link is down and being retried: offer "Reconnect now".
+    pub reconnecting: bool,
+    /// The retries have gone on long enough to call the daemon unreachable.
+    pub unreachable: bool,
+    /// Keystrokes held for delivery on reconnect.
+    pub queued: u64,
+    /// Keystrokes the outage dropped.
+    pub dropped: u64,
+}
+
+impl From<kmux_app::driver::ConnectionBanner> for FfiConnectionBanner {
+    fn from(b: kmux_app::driver::ConnectionBanner) -> Self {
+        Self {
+            text: b.text,
+            reconnecting: b.reconnecting,
+            unreachable: b.unreachable,
+            queued: b.queued,
+            dropped: b.dropped,
+        }
+    }
+}
+
 /// Recent round-trip-time summary for the active transport (connection
 /// inspector). Mirrors `kmux_app::core::RttInfo`.
 #[derive(uniffi::Record)]
@@ -85,6 +113,26 @@ pub struct FfiSession {
     /// The federated peer this session lives on (issue #121), or `None` for a
     /// local session. Lets the sidebar group sessions by machine.
     pub peer: Option<String>,
+    /// The session's peer is unreachable: the hub lost its link and is
+    /// re-opening it (issue #208).
+    pub unreachable: bool,
+}
+
+impl FfiSession {
+    /// The row for `entry`, flagged active when it is the `active` session.
+    pub(crate) fn from_entry(
+        entry: &kmux_protocol::messages::SessionEntry,
+        active: Option<&str>,
+    ) -> Self {
+        Self {
+            active: active == Some(entry.meta.word_id.as_str()),
+            word_id: entry.meta.word_id.clone(),
+            name: entry.meta.name.clone(),
+            cwd: entry.meta.cwd.clone(),
+            peer: entry.peer.clone(),
+            unreachable: entry.peer_unreachable,
+        }
+    }
 }
 
 /// One pane (tab) in the active session.

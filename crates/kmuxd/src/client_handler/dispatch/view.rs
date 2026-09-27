@@ -37,14 +37,9 @@ pub(super) async fn on_attach<A: PaneAttacher>(
         // through the peer feed loop and are pumped to this client via
         // `client_rx`, so the synchronous replay is empty — `Delta(vec![])`
         // emits no initial frames (see `build_attach_replay`).
-        state.app.federated_attach(
-            &pane_id,
-            client_id,
-            client_tx,
-            state.ctrl_tx.clone(),
-            last_seqno,
-            size,
-        );
+        state
+            .app
+            .federated_attach(&pane_id, client_id, client_tx, state.ctrl_tx.clone(), size);
         match attacher
             .start_pane_stream(pane_id.clone(), AttachResult::Delta(vec![]), client_rx)
             .await
@@ -170,6 +165,37 @@ pub(super) async fn on_fetch_history(
 #[cfg(test)]
 mod tests {
     use super::super::testing::*;
+
+    /// A client resuming a federated pane from its seqno (as after a
+    /// reconnect) still makes the hub ask the peer for a snapshot: the hub's
+    /// mirror of a pane with no viewer is new, and only a snapshot seeds it
+    /// right for every viewer (issue #208).
+    #[cfg(feature = "federation")]
+    #[tokio::test]
+    async fn resuming_a_federated_pane_asks_the_peer_for_a_snapshot() {
+        let (mut state, _ctrl_rx) = authenticated_client().await;
+        let (mut upstream, _peer) = state.app.install_channel_peer("fedlocal", "fedremote");
+
+        handle_message(
+            &mut state,
+            ClientMessage::Attach {
+                pane_id: "fedlocal/0".to_string(),
+                last_seqno: Some(kmux_protocol::messages::SequenceNo(41)),
+                size: TermSize::default(),
+            },
+            &NoopAttacher,
+        )
+        .await;
+
+        let sent = upstream.try_recv().expect("an upstream Attach");
+        assert!(
+            matches!(
+                &sent,
+                ClientMessage::Attach { pane_id, last_seqno: None, .. } if pane_id == "fedremote/0"
+            ),
+            "{sent:?}"
+        );
+    }
 
     #[tokio::test]
     async fn attach_to_an_unknown_pane_errors_and_starts_no_stream() {

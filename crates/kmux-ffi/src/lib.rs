@@ -113,7 +113,7 @@ pub use renderer::KmuxRenderer;
 /// (`kmux-ghostty-sys`'s `EXPECTED_ABI_VERSION`, the wire protocol range).
 /// The Swift wrapper asserts this on startup, on top of uniffi's built-in
 /// binding-checksum check.
-pub const KMUX_FFI_ABI_VERSION: u32 = 26;
+pub const KMUX_FFI_ABI_VERSION: u32 = 28;
 
 /// Returns [`KMUX_FFI_ABI_VERSION`]. A free function so the Swift wrapper can
 /// check it before constructing a driver.
@@ -270,6 +270,35 @@ mod tests {
             command: false,
         };
         assert_eq!(ctrl.to_proto(), KeyMods::CTRL);
+    }
+
+    /// A session row carries its entry's fields, whether it is the active
+    /// one, and whether its peer is unreachable (issue #208).
+    #[test]
+    fn a_session_row_carries_its_entry_and_flags() {
+        let entry = |word: &str, unreachable: bool| kmux_protocol::messages::SessionEntry {
+            meta: kmux_protocol::messages::SessionMeta {
+                index: 0,
+                word_id: word.to_string(),
+                name: format!("{word} name"),
+                cwd: "/tmp".to_string(),
+            },
+            panes: Vec::new(),
+            tabs: Vec::new(),
+            active_tab: 0,
+            peer: unreachable.then(|| "box:9000".to_string()),
+            peer_unreachable: unreachable,
+        };
+        let row = FfiSession::from_entry(&entry("hawk", true), Some("hawk"));
+        assert!(row.active && row.unreachable);
+        assert_eq!(
+            (row.word_id.as_str(), row.name.as_str(), row.cwd.as_str()),
+            ("hawk", "hawk name", "/tmp")
+        );
+        assert_eq!(row.peer.as_deref(), Some("box:9000"));
+        let row = FfiSession::from_entry(&entry("owl", false), Some("hawk"));
+        assert!(!row.active && !row.unreachable && row.peer.is_none());
+        assert!(!FfiSession::from_entry(&entry("owl", false), None).active);
     }
 
     #[test]

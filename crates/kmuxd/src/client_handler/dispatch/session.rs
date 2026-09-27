@@ -71,8 +71,10 @@ pub(super) async fn on_session_close(
         }
         state.app.detach_pane_any(pane_id, client_id).await;
     }
-    // A federated session is not in the local map: close it on its peer.
-    let result = if state.app.is_federated_session(&word_id) {
+    // A federated session is not in the local map: close it on its peer, which
+    // also tells every client (under the federation membership gate).
+    let federated = state.app.is_federated_session(&word_id);
+    let result = if federated {
         state
             .app
             .close_federated_session(&word_id)
@@ -98,9 +100,11 @@ pub(super) async fn on_session_close(
             // this, another GUI keeps the session in its list -- as an entry
             // whose panes drain one by one and then sits there empty -- until
             // something unrelated makes it re-list.
-            state
-                .app
-                .broadcast_session_event(SessionEventMsg::SessionClosed { word_id });
+            if !federated {
+                state
+                    .app
+                    .broadcast_session_event(SessionEventMsg::SessionClosed { word_id });
+            }
         }
         Err((code, message)) => state.error(Some(request_id), code, message),
     }

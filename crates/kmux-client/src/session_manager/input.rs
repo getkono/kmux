@@ -39,16 +39,40 @@ impl SessionManager {
     /// out-of-band signals).  Use [`Self::send_key_batch`] for actual
     /// keystrokes so the daemon can encode them with live mode state.
     pub fn send_input(&mut self, data: Vec<u8>) -> bool {
+        let built = self.input_message(data);
+        self.send_built(built)
+    }
+
+    /// The `PtyInput` carrying `data` to the active pane, without sending it.
+    ///
+    /// # Errors
+    ///
+    /// `Err(accepted)` when there is nothing to send: `false` if the input is
+    /// suppressed or the pane locked, `true` if there is simply no active pane.
+    pub fn input_message(&mut self, data: Vec<u8>) -> Result<ClientMessage, bool> {
         if self.input_suppressed() {
-            return false;
+            return Err(false);
         }
-        match self.active_pane_unlocked() {
-            Ok(pane_id) => {
-                self.send_ws(ClientMessage::PtyInput { pane_id, data });
+        let pane_id = self.active_pane_unlocked()?;
+        Ok(ClientMessage::PtyInput { pane_id, data })
+    }
+
+    /// Send what an `*_message` builder produced; report whether the input
+    /// was accepted.
+    fn send_built(&mut self, built: Result<ClientMessage, bool>) -> bool {
+        match built {
+            Ok(msg) => {
+                self.send_ws(msg);
                 true
             }
-            Err(ok) => ok,
+            Err(accepted) => accepted,
         }
+    }
+
+    /// Send an input message built earlier — held while the link was down
+    /// (issue #208) — as it is.
+    pub fn send_prepared(&mut self, msg: ClientMessage) {
+        self.send_ws(msg);
     }
 
     /// Forward a pointer event to the active pane's inner program when it has
@@ -102,39 +126,50 @@ impl SessionManager {
     /// bytes always match what the inner program negotiated (DECCKM, kitty
     /// kbd flags, modifyOtherKeys, …).
     pub fn send_key_batch(&mut self, events: Vec<KeyEvent>) -> bool {
+        let built = self.key_batch_message(events);
+        self.send_built(built)
+    }
+
+    /// The `PtyKeyBatch` carrying `events` to the active pane, without
+    /// sending it.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::input_message`], and `Err(true)` for an empty batch.
+    pub fn key_batch_message(&mut self, events: Vec<KeyEvent>) -> Result<ClientMessage, bool> {
         if self.input_suppressed() {
-            return false;
+            return Err(false);
         }
         if events.is_empty() {
-            return true;
+            return Err(true);
         }
-        match self.active_pane_unlocked() {
-            Ok(pane_id) => {
-                self.send_ws(ClientMessage::PtyKeyBatch { pane_id, events });
-                true
-            }
-            Err(ok) => ok,
-        }
+        let pane_id = self.active_pane_unlocked()?;
+        Ok(ClientMessage::PtyKeyBatch { pane_id, events })
     }
 
     /// Send a paste string for the active pane.
     pub fn send_paste(&mut self, text: String) -> bool {
+        let built = self.paste_message(text);
+        self.send_built(built)
+    }
+
+    /// The `PtyPaste` carrying `text` to the active pane, without sending it.
+    ///
+    /// # Errors
+    ///
+    /// As for [`Self::key_batch_message`].
+    pub fn paste_message(&mut self, text: String) -> Result<ClientMessage, bool> {
         if self.input_suppressed() {
-            return false;
+            return Err(false);
         }
         if text.is_empty() {
-            return true;
+            return Err(true);
         }
-        match self.active_pane_unlocked() {
-            Ok(pane_id) => {
-                self.send_ws(ClientMessage::PtyPaste {
-                    pane_id,
-                    data: text,
-                });
-                true
-            }
-            Err(ok) => ok,
-        }
+        let pane_id = self.active_pane_unlocked()?;
+        Ok(ClientMessage::PtyPaste {
+            pane_id,
+            data: text,
+        })
     }
 
     /// Send a resize event for the given pane and resize the local buffer.

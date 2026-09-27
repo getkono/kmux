@@ -69,7 +69,7 @@ pub fn mode_hints(mode: &Mode) -> Vec<(&'static str, &'static str)> {
         Mode::AddRemote => vec![("Enter", "Add"), ("Esc", "Cancel")],
         Mode::RemoteNewSession { .. } => vec![("Enter", "Create"), ("Esc", "Cancel")],
         Mode::Connecting { .. } => vec![("Esc", "Cancel")],
-        Mode::Disconnected { .. } => vec![("y/Enter", "Reconnect"), ("q", "Quit")],
+        Mode::Disconnected { .. } => vec![("Ctrl+Alt+R", "Reconnect now"), ("q", "Quit")],
         Mode::Command(_) => vec![
             ("Tab", "Complete"),
             ("\u{2191}/\u{2193}", "Hint"),
@@ -175,6 +175,22 @@ pub fn help_entries() -> Vec<(&'static str, &'static str)> {
         ("Shift+PgUp/Dn", "Quick scroll"),
         ("Ctrl+Shift+C", "Copy selection"),
         ("Ctrl+Shift+V", "Paste"),
-        ("Ctrl+Alt+R", "Force reconnect"),
+        ("Ctrl+Alt+R", "Reconnect now"),
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Disconnected offers "Reconnect now" and quit — no `y` confirmation
+    /// any more (issue #208) — and the help lists the same chord.
+    #[test]
+    fn disconnected_hints_offer_reconnect_now_not_a_confirmation() {
+        let hints = mode_hints(&Mode::Disconnected {
+            reason: "auth failed".to_string(),
+        });
+        assert_eq!(hints, vec![("Ctrl+Alt+R", "Reconnect now"), ("q", "Quit")]);
+        assert!(help_entries().contains(&("Ctrl+Alt+R", "Reconnect now")));
+    }
 }

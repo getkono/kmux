@@ -478,6 +478,13 @@ pub struct SessionEntry {
     /// absent.
     #[serde(default)]
     pub peer: Option<PeerId>,
+    /// Whether this federated session's peer is unreachable right now (issue
+    /// #208): the hub lost its link to the peer and is re-opening it. The
+    /// session is still listed — under the same word — and comes back when the
+    /// link does. Always `false` for a local session. `#[serde(default)]`: an
+    /// older daemon never sets it, and an older client ignores it.
+    #[serde(default)]
+    pub peer_unreachable: bool,
 }
 
 impl SessionEntry {
@@ -824,6 +831,7 @@ mod tests {
             }],
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         };
         let bytes = rmp_serde::to_vec_named(&entry).expect("serialize");
         let decoded: SessionEntry = rmp_serde::from_slice(&bytes).expect("deserialize");
@@ -847,6 +855,7 @@ mod tests {
             tabs: vec![],
             active_tab: 0,
             peer: Some("alice@box:2222".into()),
+            peer_unreachable: false,
         };
         let bytes = rmp_serde::to_vec_named(&federated).expect("serialize");
         let decoded: SessionEntry = rmp_serde::from_slice(&bytes).expect("deserialize");
@@ -859,6 +868,48 @@ mod tests {
         let bytes = rmp_serde::to_vec_named(&local).expect("serialize");
         let decoded: SessionEntry = rmp_serde::from_slice(&bytes).expect("deserialize");
         assert_eq!(decoded.peer, None);
+    }
+
+    /// An unreachable peer's session says so on the wire, and an entry from a
+    /// daemon that predates the field reads as reachable (issue #208).
+    #[test]
+    fn session_entry_peer_unreachable_roundtrips_and_defaults_to_reachable() {
+        #[derive(Serialize)]
+        struct OlderSessionEntry {
+            meta: SessionMeta,
+            panes: Vec<PaneInfo>,
+            tabs: Vec<TabInfo>,
+            active_tab: TabIndex,
+            peer: Option<PeerId>,
+        }
+        let meta = SessionMeta {
+            index: 0,
+            word_id: "eagle".into(),
+            name: "kmux @ box".into(),
+            cwd: "/".into(),
+        };
+        let unreachable = SessionEntry {
+            meta: meta.clone(),
+            panes: vec![],
+            tabs: vec![],
+            active_tab: 0,
+            peer: Some("box".into()),
+            peer_unreachable: true,
+        };
+        let bytes = rmp_serde::to_vec_named(&unreachable).expect("serialize");
+        let decoded: SessionEntry = rmp_serde::from_slice(&bytes).expect("deserialize");
+        assert!(decoded.peer_unreachable);
+
+        let older = OlderSessionEntry {
+            meta,
+            panes: vec![],
+            tabs: vec![],
+            active_tab: 0,
+            peer: Some("box".into()),
+        };
+        let bytes = rmp_serde::to_vec_named(&older).expect("serialize");
+        let decoded: SessionEntry = rmp_serde::from_slice(&bytes).expect("deserialize");
+        assert!(!decoded.peer_unreachable);
     }
 
     #[test]
@@ -874,6 +925,7 @@ mod tests {
             tabs: vec![],
             active_tab: 0,
             peer: peer.map(Into::into),
+            peer_unreachable: false,
         };
 
         // Local session: name returned unchanged.

@@ -4,7 +4,7 @@ This document is the technical reference for the kmux connection subsystem as im
 
 > See also [connection-pause.md](connection-pause.md) for bandwidth-saving connection pausing (issue #68): how a paused client stops receiving terminal output and catches up to the final state on resume.
 
-> **Invariant (as of the SSH-strict change).** The production initial-connect and reconnect paths are SSH-only for remote targets: `kmux <user@host>` (or any non-empty server string) flows through `SshBootstrap`. The `QuicDirectBootstrap` and `TlsTcpDirectBootstrap` strategies still exist in `bootstrap.rs` and remain used by the post-auth `TransportSupervisor` for data-plane upgrades (e.g. SSH-bootstrapped session swaps to direct QUIC for performance), but they are not part of the initial handshake.
+> **Invariant: the GUI never dials a remote.** A GUI (GTK or Swift) always bootstraps to its **local** daemon over UDS (`ResolvedTarget::LocalDaemon`, `AppCore::current_target`), and reconnects to it the same way. A remote host is reached through that daemon's federation: the GUI sends `OpenPeer` and the local `kmuxd` holds the one upstream link to the remote `kmuxd` (SSH-negotiated or direct TCP+TLS) — see [architecture-federation.md](architecture-federation.md). The SSH bootstrap, the direct QUIC/TCP+TLS strategies and the `TransportSupervisor` described below are the mechanism behind a remote link (the hub's federation link, the `remote`-feature CLI paths such as `--dry-run`/`--test`); they are not part of the GUI's own connection.
 >
 > Daemon data-plane ports (QUIC, TCP+TLS) are ephemeral — bound on port `0`, the OS assigns them, and they're advertised to the client in the SSH `probe-or-start` response. They never appear on a user-facing CLI surface. The only user-typeable port is the **SSH** port (`host:2222` or `--ssh-port 2222`).
 
@@ -475,7 +475,7 @@ Otherwise the channel registers a fresh connection with fresh ids. `RegisteredCl
 
 **Transport swap.** When the supervisor promotes a new transport, the resumed channel sends `ChannelReady`, the daemon answers `ChannelSwitched { old_transport }`, and `apply_transport_upgrade` replaces the active sender; the old transport is dropped, and its loop's teardown is the superseded case above.
 
-**Missed server events.** Every connection forwards two server-wide broadcasts (PTY lifecycle events; VT, layout and tab events). A connection that falls behind one is sent an unsolicited `SessionListResult` with `request_id = RESYNC_REQUEST_ID` (`u64::MAX`) — every session with its tabs and layouts — and the forwarder carries on. Every session list — this resync and every answer to `SessionList` (`ServerApp::send_session_list`) — is queued while the session map is read-locked, so a local session created, closed or re-laid-out at the same moment either shows in it or has its own reply and event queued after it. The client treats any session list as the whole truth: sessions it no longer lists are closed as if their `SessionClosed` had arrived, and the viewed tab of a local session is reconciled against its listed layout. A federated session's view is left as shown, because the hub's cached entry for it does not follow the peer's layout and tab changes.
+**Missed server events.** Every connection forwards two server-wide broadcasts (PTY lifecycle events; VT, layout and tab events). A connection that falls behind one is sent an unsolicited `SessionListResult` with `request_id = RESYNC_REQUEST_ID` (`u64::MAX`) — every session with its tabs and layouts — and the forwarder carries on. Every session list — this resync and every answer to `SessionList` (`ServerApp::send_session_list`) — is queued while the session map is read-locked, so a local session created, closed or re-laid-out at the same moment either shows in it or has its own reply and event queued after it. The client treats any session list as the whole truth: sessions it no longer lists are closed as if their `SessionClosed` had arrived, and the viewed tab of a local session is reconciled against its listed layout. A federated session's view is left as shown: the hub's cached entry for it follows the peer's layout updates and re-lists the peer on a tab or session change, but only once that event has crossed the federation link, so it can trail what the peer's own events have already told the client. Federated sessions join every list under the federation membership gate, which each add or remove of a peer's session holds together with its own event, so a list never undoes a federated close either (see [architecture-federation.md](architecture-federation.md)).
 
 ---
 
@@ -584,80 +584,121 @@ described in [Server-Side Flow Control and Deadlines](#server-side-flow-control-
 the liveness tracker is sampled every second from the event loop —
 timers are cheap and the loop is already running for rendering.
 Worst-case detection of a hung daemon (kill -STOP, blackholed path) is
-bounded at ~15 s.
+bounded at ~15 s (`kmux_client::liveness::TIMEOUT`); there is no 60 s
+client timer, whatever an older revision of this document said.
 
 ### ConnectionState machine
 
 ```
-          ┌─────┐
-          │Idle │──── initial connect ───▶┐
-          └─────┘                         │
-                                          ▼
-                              ┌─────────────────┐
-                              │   Handshaking   │
-                              └─────────────────┘
-                                  │         │
-                     auth ok      │         │ bootstrap failed
-                                  ▼         ▼
-                    ┌───────────────────┐  ┌──────────────────┐
-                    │Connected{transport}│  │Disconnected{...}│
-                    └───────────────────┘  └──────────────────┘
-                          │       ▲                ▲
-        liveness timeout /│       │                │ user chooses y/Enter
-        server close /    │       │                │
-        tunnel died       │       │                │
-                          ▼       │                │
-                    ┌──────────────────┐           │
-                    │Disconnected{...} │───────────┘
-                    └──────────────────┘
+      ┌─────┐
+      │Idle │── first connect ──▶┌─────────────┐── bootstrap failed ──▶┌────────────────────┐
+      └─────┘                    │ Handshaking │                       │ Disconnected{…}    │
+                                 └─────────────┘                       │ (Mode::Disconnected│
+                                        │ auth ok                      │  manual Reconnect) │
+                                        ▼                              └────────────────────┘
+                              ┌────────────────────┐                     │ Reconnect / Ctrl+Alt+R
+                ┌────────────▶│Connected{transport}│◀── auth ok ─ Handshaking ◀┘
+                │             └────────────────────┘
+                │                       │ server closed / ping timeout (15 s) /
+                │ attempt               │ SSH tunnel died
+                │ succeeds              ▼
+                │             ┌────────────────────┐  attempt fails:
+                └─────────────│Reconnecting{attempt}│◀─ attempt+1 after
+                              └────────────────────┘   next_delay(attempt)
 ```
 
-There is exactly one source of truth (`ConnectionState`); the TUI
-badge, the session manager's legacy `connected: bool`, and the disconnect
-overlay all read from it.
+There is exactly one source of truth (`ConnectionState`); the header
+badge (`badge_label`: `RECONNECTING #n`), the session manager's legacy
+`connected: bool`, and the connection banner all read from it.
 
-### Freeze-and-confirm UX
+### Automatic reconnect (issue #208)
 
-When a drop is detected (channel closed, ping timeout, SSH tunnel died)
-the event loop does **not** auto-retry. Instead:
+A link that drops once it is up is re-established on its own; nothing
+asks the user to confirm. `FrontendDriver` (kmux-app, so GTK and Swift
+share it) holds the policy, all of it pure and tested with injected time
+in `driver/reconnect.rs`:
 
-1. `SessionManager::mark_connection_lost_with(reason)` moves the state
-   to `Disconnected { reason }`.
-2. `Mode::Disconnected { reason }` is set in the TUI. The event loop
-   continues to render, but key input stops forwarding to PTYs — only
-   `y` / `Enter` (confirm reconnect) and `q` (quit) are handled.
-3. A centred overlay shows the reason and the prompt. Pressing `y`
-   calls `App::attempt_reconnect`, which re-runs the original bootstrap
-   flow (SSH re-negotiation + `connect_via_ssh_session`, or a fresh
-   `mgr.connect` for direct/local targets).
+1. **Detection** — the server channel closed, the liveness timeout, or
+   the SSH tunnel died — while the state is `Connected`. The mode (and so
+   the UI) is left as it is; the state becomes `Reconnecting { attempt: 1 }`.
+2. **Schedule** (`Reconnect`). Attempt *n* starts
+   `kmux_client::backoff::next_delay(n − 1, seed)` after the drop or the
+   previous failure: `BACKOFF_MIN` (250 ms) doubling to `BACKOFF_MAX`
+   (15 s), less up to `BACKOFF_JITTER_CAP_PERMILLE` (20 %) of jitter from a
+   per-link seed. Each attempt is a `BootstrapPhase::Resume { attempt }`
+   bootstrap, which re-presents the `connection_id` and shows no
+   connecting overlay. A failure a retry may get past (the daemon is
+   starting, restarting, or not answering) schedules the next attempt, for
+   as long as it takes; a **refusal** — the daemon's protocol range or the
+   token (`BootstrapTaskResult::Refused`) — ends the retries in
+   `Mode::Disconnected`.
+3. **On success** every visible pane is re-attached. If the link reached
+   the **same daemon run** as before (the same pid, which the local
+   daemon's control socket reports; `SessionManager::link_reached_same_daemon`),
+   a pane in sync is re-attached with `Attach { last_seqno }` — the last
+   seqno it applied — so the daemon replays exactly what it missed, or
+   resets it with a snapshot past its retained diffs (see
+   [ConnectionId and Session Resumption](#connectionid-and-session-resumption)).
+   A new run (a restart, a handoff) numbers its panes' diffs from scratch,
+   so every pane is then attached afresh. Then the input held during the
+   outage is sent, in order.
+4. **Input during the outage** (`OutageInput`). Keystrokes and pastes
+   typed while reconnecting are held — up to `OUTAGE_INPUT_CAPACITY` (256)
+   keystrokes, a paste counting as one — and flushed in order on
+   reconnect. What does not fit is dropped and counted, and so is the whole
+   buffer when the link reached another daemon run (its shells are not the
+   ones typed at), when the oldest input is more than
+   `OUTAGE_INPUT_MAX_AGE` (30 s) old, or when the retries end in a refusal.
+   Raw input writes (mouse reports) are not held. UI commands issued
+   meanwhile (a split, a new tab) are not held either.
+5. **What the user sees** (`connection_banner`). A banner, rendered by
+   GTK's `adw::Banner` and Swift's `ConnectionBanner` (FFI
+   `KmuxDriver::connection_banner`): `Reconnecting… attempt n, next try in
+   s s`, becoming `Daemon unreachable · retrying (attempt n)` after
+   `UNREACHABLE_AFTER_ATTEMPTS` (5) failures, followed by the queued and
+   dropped keystroke counts and the last attempt's error, with a
+   **Reconnect now** button. For `DROPPED_NOTICE` (8 s) after the link is
+   back it reports the keystrokes the outage dropped. The driver repaints
+   whenever the banner changes (each countdown second, an attempt
+   starting, the notice expiring), so a frontend that reads it on repaint
+   stays current.
 
-`Ctrl+Alt+R` from `Mode::Normal` triggers the same reconnect path
-without waiting for the liveness timeout — useful when the link feels
-degraded but has not yet tripped the 60 s timer.
+**Reconnect now** — the banner button, the header connection button, the
+reconnect accelerator (Ctrl+Shift+R on GTK, ⌘R on macOS), the
+`/reconnect` command — starts the waiting attempt at once. With no outage
+under way it is the manual reconnect: a fresh bootstrap behind the
+connecting overlay. (`Ctrl+Alt+R` is the same action in the kmux-app key
+resolver.)
+
+`Mode::Disconnected` remains for the cases no retry fixes by itself: the
+first connect failed, the handshake was refused, a manual reconnect
+failed, or the user cancelled or disconnected. Input to panes is frozen
+there; the **Reconnect** button or accelerator reconnects. The `y`/Enter
+confirmation prompt is gone.
+
+A re-federated peer's `PeerOpened` after an automatic reconnect does not
+re-run the first-connect session auto-select, so the session picker does
+not pop over the session in use.
 
 ### "Server is down" case
 
-The issue originally asked for ICMP-based "restart daemon over SSH."
-That is replaced by two existing pieces:
-
-- If the user originally connected via SSH (`self.ssh_target` is set),
-  reconnect re-runs `ssh::negotiate`, which invokes `kmuxd
-  probe-or-start` on the remote host. `probe-or-start` starts the
-  daemon if it is missing, matching the issue's intent.
-- If the user connected directly and the server is gone, the bootstrap
-  race fails and the overlay reason reads `reconnect failed: …`. The
-  user must fix the daemon manually or use the server picker to switch
-  to an SSH target. This is deliberate — we never silently initiate
-  OS-level actions the user did not authorise.
+The GUI's target is always its local daemon, and a local bootstrap
+auto-starts it (`kmux_connect::daemon::ensure_daemon`), so an automatic attempt also
+restarts a daemon that crashed. It restarts one stopped on purpose too: the
+daemon has no way to tell its clients a stop is deliberate, so `kmux daemon
+stop` while a GUI is open is followed by a fresh daemon within a second. To
+stop for good, quit the GUI first (or `kmux client stop`). A remote host that is down is the
+federation link's concern: see
+[architecture-federation.md](architecture-federation.md).
 
 ### Tracing
 
-Disconnect and reconnect events are emitted with structured fields on
-the connection span:
+Disconnect and reconnect events are emitted with structured fields:
 
 ```
-WARN connection dropped connection_id=… transport=QUIC reason="ping timeout"
-INFO reconnect requested connection_id=…
+WARN connection dropped; reconnecting connection_id=… transport=UDS reason="server closed connection"
+INFO automatic reconnect attempt connection_id=… attempt=2
+INFO reconnect requested connection_id=…   (a manual reconnect)
 ```
 
 Filter with `RUST_LOG=kmux_client=debug,kmux=info` to watch the
@@ -976,6 +1017,14 @@ resets a pane stream the connection would have kept, so sleep or a dropped
 network costs no pane a resync. What remains is a client that answers
 keep-alives but has not read this stream for five and a half minutes. The
 `FIN` that ends a stream is not timed: quinn queues it and returns at once.
+
+The client reads every pane stream as soon as it arrives, each in its own
+task (`kmux_connect::connect::accept_pane_streams`), and grants the server
+`MAX_PANE_STREAMS` (4096) concurrent uni streams (issue #208). It used to
+cap its readers at 64 and leave QUIC's default credit of 100, so with more
+than 64 attached panes the extras went unread: an idle one showed nothing,
+a busy one filled its window and was reset and re-attached every 330 s,
+and past 100 the daemon's `open_uni` waited for credit with no timeout.
 
 The pong clock starts when the writer puts the `Ping` on the wire, not when it
 is queued: a ping waiting behind a log dump or pane data on a slow link has not

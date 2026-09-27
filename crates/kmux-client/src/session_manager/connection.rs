@@ -77,8 +77,18 @@ impl SessionManager {
         );
 
         self.request_session_list();
+        self.previous_daemon_pid = self.daemon_pid;
+        self.daemon_pid = outcome.daemon_pid;
+        self.resume_visible_panes(self.link_reached_same_daemon());
 
         outcome.ssh_context
+    }
+
+    /// Whether the last link reached the same daemon run as the one before it
+    /// (issue #208): only then do its panes resume from their seqnos, and is
+    /// input held during the outage still meant for the same shells.
+    pub fn link_reached_same_daemon(&self) -> bool {
+        self.daemon_pid.is_some() && self.daemon_pid == self.previous_daemon_pid
     }
 
     pub fn set_ws_sender(&mut self, sender: mpsc::UnboundedSender<ClientMessage>) {
@@ -191,6 +201,16 @@ impl SessionManager {
     pub fn prepare_reconnect(&mut self) {
         self.ws_sender = None;
         self.set_connection_state(ConnectionState::Handshaking);
+    }
+
+    /// Like [`Self::prepare_reconnect`], for automatic reconnect attempt
+    /// `attempt` (1-based, issue #208): the state reads `Reconnecting`, so the
+    /// badge shows the retry rather than a first handshake.
+    pub fn begin_reconnect_attempt(&mut self, attempt: u32) {
+        self.ws_sender = None;
+        // The next link needs the pause state again (issue #68).
+        self.pause_applied = (false, false);
+        self.set_connection_state(ConnectionState::Reconnecting { attempt });
     }
 
     pub fn set_connection_params(&mut self, host: String, port: u16, token: String) {

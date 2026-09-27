@@ -282,6 +282,17 @@ impl KmuxDriver {
         }
     }
 
+    /// The link banner to show, if any (issue #208): the automatic reconnect
+    /// in progress, an unreachable daemon, or keystrokes an outage dropped.
+    pub fn connection_banner(&self) -> Option<FfiConnectionBanner> {
+        // Only reads: a poisoned lock still holds a readable driver.
+        self.inner
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .connection_banner()
+            .map(FfiConnectionBanner::from)
+    }
+
     /// Whether a pane is in its soft-close grace window (issue #86), so the
     /// frontend can show an "Undo" affordance.
     pub fn soft_close_pending(&self) -> bool {
@@ -298,13 +309,7 @@ impl KmuxDriver {
         d.mgr
             .session_list()
             .iter()
-            .map(|e| FfiSession {
-                active: active.as_deref() == Some(e.meta.word_id.as_str()),
-                word_id: e.meta.word_id.clone(),
-                name: e.meta.name.clone(),
-                cwd: e.meta.cwd.clone(),
-                peer: e.peer.clone(),
-            })
+            .map(|e| FfiSession::from_entry(e, active.as_deref()))
             .collect()
     }
 

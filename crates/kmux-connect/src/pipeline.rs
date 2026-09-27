@@ -90,6 +90,11 @@ pub struct BootstrapOutcome {
     /// `Some` for SSH targets; `None` for `LocalDaemon` / Direct.
     pub ssh_context: Option<SshContext>,
     pub bootstrap_elapsed: Duration,
+    /// The pid of the daemon process this link reached, when known (the local
+    /// daemon's control socket reports it). A reconnect that reaches another
+    /// pid reached another daemon run, whose pane seqnos start over — so the
+    /// client must not resume panes from the old run's seqnos (issue #208).
+    pub daemon_pid: Option<u32>,
 }
 
 #[derive(Debug, Error)]
@@ -291,6 +296,7 @@ struct ConnectPlan {
     accept_invalid_certs: bool,
     is_local: bool,
     ssh_context: Option<SshContext>,
+    daemon_pid: Option<u32>,
 }
 
 /// Bootstrap `target`, emitting one [`BootstrapEvent`] per step through
@@ -354,6 +360,7 @@ pub async fn run_bootstrap(
         is_local: plan.is_local,
         ssh_context: plan.ssh_context,
         bootstrap_elapsed: start.elapsed(),
+        daemon_pid: plan.daemon_pid,
     })
 }
 
@@ -413,6 +420,7 @@ async fn prepare_local_daemon(
         accept_invalid_certs: true,
         is_local: true,
         ssh_context: None,
+        daemon_pid: Some(status.pid),
     })
 }
 
@@ -465,6 +473,7 @@ async fn prepare_ssh(
             endpoints,
             probe_json: ssh.probe_json,
         }),
+        daemon_pid: None,
     })
 }
 
@@ -662,9 +671,13 @@ async fn establish(
                 Err(BootstrapError::Auth(reason))
             }
         }
-        Ok(Err(_)) => Err(BootstrapError::Auth(
-            "auth forwarder dropped before AuthResult".into(),
-        )),
+        // The link closed before the daemon answered — it went away mid
+        // handshake (a crash, a restart). Not a refusal: a retry may well
+        // succeed (issue #208).
+        Ok(Err(_)) => Err(BootstrapError::Connect {
+            strategy: "handshake",
+            error: "the connection closed before the daemon answered".into(),
+        }),
         Err(_) => Err(BootstrapError::AuthTimeout(AUTH_TIMEOUT)),
     }
 }

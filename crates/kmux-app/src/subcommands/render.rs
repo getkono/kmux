@@ -572,6 +572,7 @@ mod tests {
             }],
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         }];
         let rows = session_rows(&sessions);
         assert_eq!(rows.len(), 1);
@@ -592,6 +593,7 @@ mod tests {
             tabs: vec![],
             active_tab: 0,
             peer: peer.map(String::from),
+            peer_unreachable: false,
         };
         // Deliberately out of order: a remote, then a local, then another remote.
         let sessions = vec![

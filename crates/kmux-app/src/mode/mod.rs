@@ -63,8 +63,11 @@ pub enum Mode {
     RemoteNewSession { peer: String },
     /// Background bootstrap in progress. Input is held; Esc cancels.
     Connecting { target_display: String },
-    /// Connection dropped. Input to panes is frozen; the overlay asks the
-    /// user to confirm a reconnect.
+    /// No connection, and none coming on its own: the first connect failed,
+    /// the handshake was refused, or the user cancelled or disconnected. Input
+    /// to panes is frozen and the banner offers "Reconnect". A link that drops
+    /// once up never lands here — the driver reconnects it automatically while
+    /// the UI stays live (issue #208).
     Disconnected { reason: String },
     /// Command palette: type `/<command> [args]` with autocomplete hints.
     /// Activated by Ctrl+G then Ctrl+/ (or `/`).
@@ -269,7 +272,7 @@ pub fn resolve(mode: &Mode, key: &Key, mods: Modifiers) -> (Option<Mode>, Action
         Mode::LaunchPicker => resolve_launch_picker(key, mods),
         Mode::AddRemote | Mode::RemoteNewSession { .. } => resolve_launch_overlay(key),
         Mode::Connecting { .. } => resolve_connecting(key, mods),
-        Mode::Disconnected { .. } => resolve_disconnected(key),
+        Mode::Disconnected { .. } => resolve_disconnected(key, mods),
         Mode::Command(_) => resolve_command(key, mods),
     }
 }

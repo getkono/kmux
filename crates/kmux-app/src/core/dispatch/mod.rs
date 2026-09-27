@@ -788,6 +788,7 @@ pub(super) mod testing {
             }],
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         }];
         core.mgr.active_pane = Some("eagle/0".into());
         core

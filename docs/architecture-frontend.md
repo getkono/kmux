@@ -251,7 +251,11 @@ debounce, the blink phase, and the `/theme` change detection. A frontend:
   `activate_picker_selection` (these now return `Vec<FrontendEffect>` and apply
   reconnect / server-switch **internally** — the channel rebuild no longer lives
   in the frontend), plus `send_keys`, `send_input`, `feed_paste`,
-  `request_resize` / `set_term_size`, `reconnect`,
+  `request_resize` / `set_term_size`, `reconnect` ("reconnect now"; a dropped
+  link is also retried automatically, and input typed meanwhile is held — see
+  [connection.md](connection.md#automatic-reconnect-issue-208)),
+- reads `connection_banner()` — the one line both frontends show about the
+  link (reconnecting, unreachable, dropped keystrokes) — each pump,
 - reads state out via `Deref<Target = AppCore>` (`driver.mgr`, `driver.mode`,
   `driver.palette`, …) plus `driver.active_grid()` and `driver.blink_on()`.
 

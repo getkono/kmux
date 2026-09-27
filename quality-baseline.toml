@@ -174,7 +174,7 @@ count = 18
 [[lints]]
 crate = "kmux-app"
 lint = "missing_docs"
-count = 286
+count = 285
 
 [[lints]]
 crate = "kmux-client"
@@ -294,7 +294,7 @@ count = 4
 [[lints]]
 crate = "kmux-connect"
 lint = "clippy::too_many_lines"
-count = 3
+count = 2
 
 [[lints]]
 crate = "kmux-connect"
@@ -759,7 +759,7 @@ count = 17
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::cognitive_complexity"
-count = 10
+count = 9
 
 [[lints]]
 crate = "kmuxd"
@@ -774,7 +774,7 @@ count = 7
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::match_same_arms"
-count = 7
+count = 6
 
 [[lints]]
 crate = "kmuxd"
@@ -789,7 +789,7 @@ count = 2
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::significant_drop_tightening"
-count = 50
+count = 48
 
 [[lints]]
 crate = "kmuxd"
@@ -804,7 +804,7 @@ count = 1
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::too_many_lines"
-count = 9
+count = 7
 
 [[lints]]
 crate = "kmuxd"
@@ -814,7 +814,7 @@ count = 1
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::unwrap_used"
-count = 114
+count = 103
 
 [[lints]]
 crate = "kmuxd"

@@ -9,6 +9,13 @@ fn is_ctrl_c(key: &Key, mods: Modifiers) -> bool {
     mods.contains(Modifiers::CTRL) && matches!(key, Key::Character(c) if c == "c")
 }
 
+/// Ctrl+Alt+R, "reconnect now".
+fn is_reconnect_now(key: &Key, mods: Modifiers) -> bool {
+    mods.contains(Modifiers::CTRL)
+        && mods.contains(Modifiers::ALT)
+        && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("r"))
+}
+
 pub(crate) fn resolve_normal(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
     if is_mode_key(key, mods) {
         return (Some(Mode::Select), Action::None);
@@ -16,10 +23,7 @@ pub(crate) fn resolve_normal(key: &Key, mods: Modifiers) -> (Option<Mode>, Actio
 
     // Ctrl+Alt+R: force a reconnect even without dropping first. Useful when
     // the link is degraded but has not yet tripped the liveness timeout.
-    if mods.contains(Modifiers::CTRL)
-        && mods.contains(Modifiers::ALT)
-        && matches!(key, Key::Character(c) if c.eq_ignore_ascii_case("r"))
-    {
+    if is_reconnect_now(key, mods) {
         return (None, Action::Reconnect);
     }
 
@@ -148,12 +152,14 @@ pub(crate) fn resolve_signal(key: &Key, _mods: Modifiers) -> (Option<Mode>, Acti
     }
 }
 
-/// Keys accepted while disconnected. Everything else is dropped (so pane
-/// input is effectively frozen) and the overlay stays up.
-pub(crate) fn resolve_disconnected(key: &Key) -> (Option<Mode>, Action) {
+/// Keys accepted while disconnected for good (a transient drop reconnects on
+/// its own and never enters this mode): Ctrl+Alt+R reconnects now, `q` quits.
+/// Everything else is dropped, so no keystroke is taken as a confirmation.
+pub(crate) fn resolve_disconnected(key: &Key, mods: Modifiers) -> (Option<Mode>, Action) {
+    if is_reconnect_now(key, mods) {
+        return (None, Action::Reconnect);
+    }
     match key {
-        Key::Character(c) if c == "y" || c == "Y" => (None, Action::Reconnect),
-        Key::Named(NamedKey::Enter) => (None, Action::Reconnect),
         Key::Character(c) if c == "q" || c == "Q" => (None, Action::Quit),
         _ => (None, Action::None),
     }
@@ -376,6 +382,44 @@ mod tests {
         let (mode, action) = resolve(&Mode::Normal, &Key::Character("g".into()), Modifiers::CTRL);
         assert_eq!(mode, Some(Mode::Select));
         assert_eq!(action, Action::None);
+    }
+
+    /// No keystroke confirms a reconnect any more (issue #208): `y` and Enter
+    /// do nothing while disconnected; Ctrl+Alt+R reconnects now and `q`
+    /// quits.
+    #[test]
+    fn disconnected_takes_only_reconnect_now_and_quit() {
+        let disconnected = Mode::Disconnected {
+            reason: "auth failed".into(),
+        };
+        let none = Modifiers::empty();
+        for key in [
+            Key::Character("y".into()),
+            Key::Character("Y".into()),
+            Key::Named(NamedKey::Enter),
+            Key::Character("r".into()),
+        ] {
+            assert_eq!(resolve(&disconnected, &key, none), (None, Action::None));
+        }
+        for half_chord in [Modifiers::CTRL, Modifiers::ALT] {
+            assert_eq!(
+                resolve(&disconnected, &Key::Character("r".into()), half_chord),
+                (None, Action::None),
+                "Ctrl+Alt+R takes both modifiers"
+            );
+        }
+        assert_eq!(
+            resolve(
+                &disconnected,
+                &Key::Character("r".into()),
+                Modifiers::CTRL | Modifiers::ALT
+            ),
+            (None, Action::Reconnect)
+        );
+        assert_eq!(
+            resolve(&disconnected, &Key::Character("q".into()), none),
+            (None, Action::Quit)
+        );
     }
 
     #[test]

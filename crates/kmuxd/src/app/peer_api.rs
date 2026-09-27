@@ -12,8 +12,8 @@
 //! locally-hosted one.
 
 use kmux_protocol::messages::{
-    ClientId, ClientInfo, ClientMessage, PaneProcesses, PeerId, PeerTarget, SequenceNo,
-    ServerMessage, SessionEntry, TermSize,
+    ClientId, ClientInfo, ClientMessage, PaneProcesses, PeerId, PeerTarget, ServerMessage,
+    SessionEntry, TermSize,
 };
 use tokio::sync::mpsc;
 
@@ -28,6 +28,16 @@ impl ServerApp {
         let mut wl = self.wordlist.lock().unwrap();
         let mut rng = self.rng.lock().unwrap();
         wl.draw(&mut rng)
+    }
+
+    /// How many session words the shared pool holds, for tests to see a
+    /// word drawn or returned.
+    #[cfg(all(test, feature = "federation"))]
+    pub(crate) fn available_words(&self) -> usize {
+        self.wordlist
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .available_count()
     }
 
     /// Return a session word to the shared pool (called when a peer closes).
@@ -160,21 +170,29 @@ impl ServerApp {
     /// [`PeerManager::install_channel_peer`](crate::federation::PeerManager).
     #[cfg(all(test, feature = "federation"))]
     pub(crate) fn install_channel_peer(
-        &self,
+        self: &std::sync::Arc<Self>,
         local_word: &str,
         remote_word: &str,
     ) -> (
         mpsc::UnboundedReceiver<ClientMessage>,
         mpsc::UnboundedSender<ServerMessage>,
     ) {
-        self.peer_manager
-            .install_channel_peer("peer:1", local_word, remote_word)
+        self.peer_manager.install_channel_peer(
+            self,
+            "peer:1",
+            local_word,
+            remote_word,
+            crate::federation::no_reconnect(),
+        )
     }
 
     /// Ensure an upstream connection to `target` exists and surface its sessions
     /// locally, returning the peer's stable [`PeerId`]. Without the feature this
     /// reports a "not supported" error the client already handles.
-    pub async fn open_peer(&self, target: PeerTarget) -> Result<PeerId, String> {
+    pub async fn open_peer(
+        self: &std::sync::Arc<Self>,
+        target: PeerTarget,
+    ) -> Result<PeerId, String> {
         #[cfg(feature = "federation")]
         {
             self.peer_manager.open_peer(self, target).await
@@ -285,6 +303,15 @@ impl ServerApp {
         }
     }
 
+    /// Call `publish` with [`Self::list_federated_sessions`] while no peer's
+    /// sessions can be added or removed, so what it sends is ordered against
+    /// every such change's own event (issue #208).
+    pub fn publish_federated_sessions<T>(&self, publish: impl FnOnce(Vec<SessionEntry>) -> T) -> T {
+        #[cfg(feature = "federation")]
+        let _membership = self.peer_manager.membership();
+        publish(self.list_federated_sessions())
+    }
+
     /// The process overview of every open peer (issue #122), with pane ids
     /// translated to local form, to be merged into the hub's
     /// `ProcessOverviewResult`. Empty without the feature.
@@ -329,17 +356,16 @@ impl ServerApp {
         client_id: ClientId,
         data_tx: mpsc::Sender<ServerMessage>,
         ctrl_tx: crate::outbound::OutboundTx,
-        last_seqno: Option<SequenceNo>,
         size: TermSize,
     ) -> bool {
         #[cfg(feature = "federation")]
         {
             self.peer_manager
-                .attach_viewer(pane_id, client_id, data_tx, ctrl_tx, last_seqno, size)
+                .attach_viewer(pane_id, client_id, data_tx, ctrl_tx, size)
         }
         #[cfg(not(feature = "federation"))]
         {
-            let _ = (pane_id, client_id, data_tx, ctrl_tx, last_seqno, size);
+            let _ = (pane_id, client_id, data_tx, ctrl_tx, size);
             false
         }
     }

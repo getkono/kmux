@@ -247,6 +247,7 @@ mod tests {
                 .collect(),
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         }
     }
 

@@ -50,4 +50,8 @@ exclude_re = [
     # which does nothing (a `File` is unbuffered), so `Ok(())` is the same
     # function (issue #207).
     'crates/kmuxd/src/log_writer\.rs:.*replace <impl Write for RotatingFile>::flush -> ',
+    # kmux-gtk's `update_banner` only pushes `banner_content` (unit-tested)
+    # into an `adw::Banner`, which needs a display: the registered GTK
+    # widget exception (issue #208).
+    'crates/kmux-gtk/src/imp/dialogs\.rs:.*replace update_banner with ',
 ]

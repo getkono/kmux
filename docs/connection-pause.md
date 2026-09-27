@@ -94,7 +94,10 @@ flows through the daemon's normal snapshot-attach path.
 - The auto-pause exemption lives on the `SessionManager` (`auto_pause_exempt_panes`
   / `auto_pause_exempt_sessions`), so `attach_fresh` re-asserts it after each
   `Attach`. `pause_applied` mirrors the last `(paused, auto)` pushed, and is reset
-  on disconnect so a reconnect re-sends.
+  on disconnect and at every automatic reconnect attempt (issue #208), so the
+  next link is sent the pause state again. The panes a reconnect re-attaches
+  resume from their last seqno (`Attach { last_seqno }`); a pause still
+  reconciles through the snapshot re-attach described above.
 - `AppCore` holds two independent pause sources — `manual_pause` (the
   `TogglePause` action) and `auto_pause` (window backgrounded) — whose **OR** is
   the effective state (`is_paused`). A manual pause **persists across focus

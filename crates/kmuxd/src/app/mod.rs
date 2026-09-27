@@ -1998,7 +1998,7 @@ mod tests {
     async fn a_session_list_names_local_sessions_then_federated_ones() {
         use kmux_protocol::messages::ServerMessage;
 
-        let app = app_with_one_pane("eagle").await;
+        let app = Arc::new(app_with_one_pane("eagle").await);
         let (_upstream, _peer) = app.install_channel_peer("fedlocal", "fedremote");
         let words: Vec<String> = app
             .list_sessions()

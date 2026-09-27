@@ -171,6 +171,13 @@ pub struct SessionManager {
     /// (QUIC ↔ TCP) so the daemon can transfer pane attachments to the new channel.
     pub connection_id: Option<ConnectionId>,
 
+    /// The pid of the daemon the last link reached, when known. A new link
+    /// to the same pid may resume panes from their seqnos; another pid is
+    /// another daemon run, whose seqnos start over (issue #208).
+    daemon_pid: Option<u32>,
+    /// The pid the link before the last one reached.
+    previous_daemon_pid: Option<u32>,
+
     /// The active transport kind (QUIC or TCP).
     pub current_transport: TransportKind,
 
@@ -254,6 +261,8 @@ impl SessionManager {
             negotiated_protocol: None,
             negotiated_capabilities: Vec::new(),
             connection_id: None,
+            daemon_pid: None,
+            previous_daemon_pid: None,
             current_transport: TransportKind::Quic,
             last_term_size: TermSize::default(),
             connection_state: ConnectionState::Idle,
@@ -512,9 +521,33 @@ impl SessionManager {
         });
     }
 
+    /// Re-attach every visible pane on a new link (issue #208). On the same
+    /// daemon run a pane in sync resumes from the last seqno it applied, so
+    /// the daemon replays just what it missed (or resets it past its retained
+    /// diffs); any other pane — and every pane on another daemon run, whose
+    /// seqnos start over — is attached afresh. Nothing is visible on a first
+    /// connect, so this only acts on a reconnect.
+    pub(super) fn resume_visible_panes(&mut self, same_daemon: bool) {
+        for pane_id in self.visible_panes.clone() {
+            match self.pane_sync.get(&pane_id) {
+                Some(PaneSync::Synced { expected }) if same_daemon => {
+                    let last_seqno = SequenceNo(expected.0.saturating_sub(1));
+                    self.attach_with(pane_id, Some(last_seqno));
+                }
+                _ => self.attach_fresh(pane_id),
+            }
+        }
+    }
+
     pub(super) fn attach_fresh(&mut self, pane_id: String) {
         self.pane_sync
             .insert(pane_id.clone(), PaneSync::AwaitingSync);
+        self.attach_with(pane_id, None);
+    }
+
+    /// Send the `Attach` for `pane_id` resuming after `last_seqno` (`None`:
+    /// from a fresh snapshot), then re-assert its auto-pause exemption.
+    fn attach_with(&mut self, pane_id: String, last_seqno: Option<SequenceNo>) {
         self.in_flight_history_fetches.remove(&pane_id);
         // Use the pane's resolved sub-rect size if the frontend has set one;
         // otherwise the full window size (correct for a single-pane tab).
@@ -526,7 +559,7 @@ impl SessionManager {
         let exempt = self.is_pane_auto_pause_exempt(&pane_id);
         self.send_ws(ClientMessage::Attach {
             pane_id: pane_id.clone(),
-            last_seqno: None,
+            last_seqno,
             size,
         });
         // The daemon resets a pane's auto-pause exemption on attach, so re-assert
@@ -640,6 +673,168 @@ mod tests {
         );
     }
 
+    /// An automatic reconnect attempt shows as `Reconnecting { attempt }`,
+    /// with the dead sender gone and the identity kept (issue #208).
+    #[test]
+    fn a_reconnect_attempt_reads_reconnecting_with_its_number() {
+        use kmux_protocol::messages::ConnectionId;
+
+        use crate::connection_state::ConnectionState;
+
+        let (mut mgr, _rx) = make_connected_manager();
+        mgr.connection_id = Some(ConnectionId(7));
+        mgr.pause_applied = (true, false);
+        mgr.begin_reconnect_attempt(3);
+        assert_eq!(
+            mgr.pause_applied,
+            (false, false),
+            "the next link needs the pause state again"
+        );
+        assert_eq!(
+            mgr.connection_state(),
+            &ConnectionState::Reconnecting { attempt: 3 }
+        );
+        assert!(mgr.ws_sender.is_none());
+        assert_eq!(mgr.connection_id, Some(ConnectionId(7)));
+    }
+
+    /// On a new link every visible pane is re-attached: one in sync resumes
+    /// after the last seqno it applied, so the daemon replays only what it
+    /// missed; one still awaiting its snapshot starts afresh (issue #208).
+    /// Before, a reconnect re-attached nothing and the panes stayed blank.
+    #[test]
+    fn a_new_link_resumes_every_visible_pane_from_its_last_seqno() {
+        let (attached, mgr) = reconnect_to_daemon(Some(7), Some(7));
+        assert!(mgr.link_reached_same_daemon());
+        assert_eq!(
+            attached,
+            vec![
+                ("eagle/0".to_string(), Some(SequenceNo(41))),
+                ("eagle/1".to_string(), None),
+            ]
+        );
+        assert!(
+            matches!(
+                mgr.pane_sync.get("eagle/0"),
+                Some(PaneSync::Synced { expected }) if expected.0 == 42
+            ),
+            "a resumed pane stays in sync to take the replayed diffs"
+        );
+    }
+
+    /// A new link to another daemon run (another pid, as after a restart or
+    /// a handoff) — or to one whose pid is unknown — attaches every pane
+    /// afresh: that run's seqnos start over, so an old run's seqno would ask
+    /// for the wrong diffs.
+    #[test]
+    fn a_new_link_to_another_daemon_run_attaches_every_pane_afresh() {
+        for (before, after) in [(Some(7), Some(8)), (Some(7), None), (None, None)] {
+            let (attached, mgr) = reconnect_to_daemon(before, after);
+            assert!(!mgr.link_reached_same_daemon());
+            assert_eq!(
+                attached,
+                vec![("eagle/0".to_string(), None), ("eagle/1".to_string(), None)],
+                "pid {before:?} then {after:?}"
+            );
+            assert!(matches!(
+                mgr.pane_sync.get("eagle/0"),
+                Some(PaneSync::AwaitingSync)
+            ));
+        }
+    }
+
+    /// A manager showing `eagle/0` (in sync, expecting seqno 42) and `eagle/1`
+    /// (awaiting its snapshot) on a link to daemon pid `before`, reconnected
+    /// to pid `after`: the `Attach`es the new link carried, and the manager.
+    fn reconnect_to_daemon(
+        before: Option<u32>,
+        after: Option<u32>,
+    ) -> (Vec<(String, Option<SequenceNo>)>, SessionManager) {
+        use kmux_protocol::messages::ConnectionId;
+
+        use crate::connection_state::DisconnectReason;
+        use crate::pipeline::BootstrapOutcome;
+        use crate::transport::TransportKind;
+
+        let (mut mgr, _old_rx) = make_connected_manager();
+        mgr.daemon_pid = before;
+        mgr.visible_panes = vec!["eagle/0".to_string(), "eagle/1".to_string()];
+        mgr.pane_sync.insert(
+            "eagle/0".to_string(),
+            PaneSync::Synced {
+                expected: SequenceNo(42),
+            },
+        );
+        mgr.pane_sync
+            .insert("eagle/1".to_string(), PaneSync::AwaitingSync);
+        mgr.mark_connection_lost_with(DisconnectReason::ServerClosed);
+
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        mgr.apply_outcome(BootstrapOutcome {
+            client_tx: tx,
+            transport: TransportKind::Uds,
+            host: String::new(),
+            port: 0,
+            token: String::new(),
+            capabilities: ClientCapabilities::default(),
+            accept_invalid_certs: false,
+            connection_id: ConnectionId(9),
+            server_version: None,
+            is_local: true,
+            ssh_context: None,
+            bootstrap_elapsed: std::time::Duration::ZERO,
+            daemon_pid: after,
+        });
+
+        let mut attached = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            if let ClientMessage::Attach {
+                pane_id,
+                last_seqno,
+                ..
+            } = msg
+            {
+                attached.push((pane_id, last_seqno));
+            }
+        }
+        (attached, mgr)
+    }
+
+    /// The input builders address the active pane, and `send_prepared` puts
+    /// a built message on the link as it is (issue #208).
+    #[test]
+    fn input_builders_address_the_active_pane_and_send_prepared_sends_it() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.active_pane = Some("eagle/0".to_string());
+
+        let keys = mgr.key_batch_message(vec![enter_key()]);
+        assert!(
+            matches!(&keys, Ok(ClientMessage::PtyKeyBatch { pane_id, events }) if pane_id == "eagle/0" && events.len() == 1)
+        );
+        assert!(matches!(
+            mgr.paste_message("hi".to_string()),
+            Ok(ClientMessage::PtyPaste { pane_id, data }) if pane_id == "eagle/0" && data == "hi"
+        ));
+        assert!(matches!(
+            mgr.input_message(vec![1]),
+            Ok(ClientMessage::PtyInput { pane_id, data }) if pane_id == "eagle/0" && data == [1]
+        ));
+        assert!(matches!(mgr.key_batch_message(vec![]), Err(true)));
+        assert!(matches!(mgr.paste_message(String::new()), Err(true)));
+
+        mgr.send_prepared(keys.unwrap_or_else(|_| unreachable!("built above")));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMessage::PtyKeyBatch { pane_id, .. }) if pane_id == "eagle/0"
+        ));
+
+        assert!(mgr.send_paste("hi".to_string()), "a paste is accepted");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMessage::PtyPaste { data, .. }) if data == "hi"
+        ));
+    }
+
     fn make_entry(word_id: &str, cwd: &str) -> SessionEntry {
         use kmux_protocol::messages::SessionMeta;
         SessionEntry {
@@ -672,6 +867,7 @@ mod tests {
             }],
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         }
     }
 
@@ -965,6 +1161,7 @@ mod tests {
                 .collect(),
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         }
     }
 
@@ -1490,6 +1687,7 @@ mod tests {
             tabs: vec![],
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         });
         mgr.session_list.push(SessionEntry {
             meta: SessionMeta {
@@ -1502,6 +1700,7 @@ mod tests {
             tabs: vec![],
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         });
 
         assert_eq!(mgr.display_name_for("alpha"), "src (proj-a)");
@@ -1522,8 +1721,21 @@ mod tests {
             tabs: vec![],
             active_tab: 0,
             peer: None,
+            peer_unreachable: false,
         });
         assert_eq!(mgr.display_name_for("eagle"), "myapp");
+    }
+
+    /// A session whose peer is unreachable says so wherever its name shows
+    /// (issue #208).
+    #[test]
+    fn display_name_marks_a_session_whose_peer_is_unreachable() {
+        let mut mgr = make_manager();
+        let mut entry = make_entry("hawk", "/srv/app");
+        entry.peer = Some("box".to_string());
+        entry.peer_unreachable = true;
+        mgr.session_list.push(entry);
+        assert_eq!(mgr.display_name_for("hawk"), "app · unreachable");
     }
 
     #[test]

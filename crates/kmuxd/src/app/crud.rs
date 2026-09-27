@@ -123,6 +123,7 @@ impl ServerApp {
             // Local session: federated attribution is added by the hub's
             // `localize_entry` only when proxying a remote peer.
             peer: None,
+            peer_unreachable: false,
         })
     }
 
@@ -190,6 +191,7 @@ impl ServerApp {
             tabs: state.tab_infos(),
             active_tab: state.active_tab,
             peer: None,
+            peer_unreachable: false,
         }
     }
 
@@ -206,6 +208,26 @@ impl ServerApp {
             sessions.values().map(Self::build_session_entry).collect();
         entries.sort_by_key(|e| e.meta.index);
         entries
+    }
+
+    /// Broadcast to every client an unsolicited `SessionListResult`
+    /// (`RESYNC_REQUEST_ID`) of every session, for when the list changed
+    /// under them all at once: a federated peer went unreachable or came back
+    /// (issue #208). Sent under the session read lock and the federation
+    /// membership gate, like [`Self::send_session_list`], so it cannot
+    /// overtake a concurrent change's own event.
+    #[cfg(feature = "federation")]
+    pub async fn broadcast_session_list(&self) {
+        let sessions = self.sessions.read().await;
+        let mut entries = Self::sorted_entries(&sessions);
+        self.publish_federated_sessions(|federated| {
+            entries.extend(federated);
+            self.broadcast(ServerMessage::SessionListResult {
+                request_id: kmux_protocol::messages::RESYNC_REQUEST_ID,
+                sessions: entries,
+            });
+        });
+        drop(sessions);
     }
 
     /// Queue on `out` a `SessionListResult` for `request_id` carrying every
@@ -227,10 +249,12 @@ impl ServerApp {
     ) -> std::result::Result<(), crate::outbound::OutboundClosed> {
         let sessions = self.sessions.read().await;
         let mut entries = Self::sorted_entries(&sessions);
-        entries.extend(self.list_federated_sessions());
-        let sent = out.send(ServerMessage::SessionListResult {
-            request_id,
-            sessions: entries,
+        let sent = self.publish_federated_sessions(|federated| {
+            entries.extend(federated);
+            out.send(ServerMessage::SessionListResult {
+                request_id,
+                sessions: entries,
+            })
         });
         drop(sessions);
         sent

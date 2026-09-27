@@ -23,6 +23,7 @@ use gtk4::{
 };
 
 use kmux_app::core::{AddRemoteForm, AppCore, LaunchRow, RemoteStatus};
+use kmux_app::driver::ConnectionBanner;
 use kmux_app::mode::{Action, Mode};
 use kmux_app::{cmd, mode};
 
@@ -1086,26 +1087,14 @@ fn clear(b: &GtkBox) {
 
 // ── Connection banner + status toasts ──
 
-/// Drive the connecting/disconnected banner from the connection mode. The
-/// banner's button (reconnect) is wired once in `main::build_ui`.
+/// Drive the connection banner: the connecting/disconnected modes, else the
+/// driver's link banner (automatic reconnect, unreachable daemon, keystrokes an
+/// outage dropped — issue #208). The banner's button (reconnect) is wired once
+/// in `main::build_ui`.
 fn update_banner(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Frontend>>) {
     let (sig, title, button, revealed) = {
         let core = &fe.borrow().core;
-        match &core.mode {
-            Mode::Connecting { target_display } => (
-                format!("c|{target_display}"),
-                format!("Connecting to {target_display}…"),
-                None,
-                true,
-            ),
-            Mode::Disconnected { reason } => (
-                format!("d|{reason}"),
-                format!("Disconnected — {reason}"),
-                Some("Reconnect"),
-                true,
-            ),
-            _ => ("n".to_string(), String::new(), None, false),
-        }
+        banner_content(&core.mode, core.connection_banner())
     };
     if dialogs.banner_sig.borrow().as_deref() == Some(sig.as_str()) {
         return;
@@ -1114,6 +1103,36 @@ fn update_banner(dialogs: &Rc<Dialogs>, shell: &Rc<Shell>, fe: &Rc<RefCell<Front
     shell.banner.set_title(&title);
     shell.banner.set_button_label(button);
     shell.banner.set_revealed(revealed);
+}
+
+/// What the connection banner shows for `mode` and the driver's `link`
+/// banner: `(signature, title, button label, revealed)`. The signature
+/// changes exactly when the banner must be redrawn.
+fn banner_content(
+    mode: &Mode,
+    link: Option<ConnectionBanner>,
+) -> (String, String, Option<&'static str>, bool) {
+    match (mode, link) {
+        (Mode::Connecting { target_display }, _) => (
+            format!("c|{target_display}"),
+            format!("Connecting to {target_display}…"),
+            None,
+            true,
+        ),
+        (Mode::Disconnected { reason }, _) => (
+            format!("d|{reason}"),
+            format!("Disconnected — {reason}"),
+            Some("Reconnect"),
+            true,
+        ),
+        (_, Some(banner)) => (
+            format!("r|{}", banner.text),
+            banner.text,
+            banner.reconnecting.then_some("Reconnect now"),
+            true,
+        ),
+        (_, None) => ("n".to_string(), String::new(), None, false),
+    }
 }
 
 /// Surface a newly-set status message as a transient toast. While a pane is in
@@ -1548,4 +1567,55 @@ fn label(text: &str, css: &str) -> Label {
     l.add_css_class(css);
     l.set_halign(Align::Start);
     l
+}
+
+#[cfg(test)]
+mod tests {
+    use kmux_app::driver::ConnectionBanner;
+    use kmux_app::mode::Mode;
+
+    use super::banner_content;
+
+    fn link(reconnecting: bool) -> ConnectionBanner {
+        ConnectionBanner {
+            text: "Reconnecting… attempt 2".to_string(),
+            reconnecting,
+            unreachable: false,
+            queued: 0,
+            dropped: 0,
+        }
+    }
+
+    /// The disconnected mode wins over the link banner; otherwise the link
+    /// banner shows, with "Reconnect now" only while the link is retried;
+    /// with neither, the banner hides (issue #208).
+    #[test]
+    fn banner_content_prefers_the_mode_then_the_link_banner() {
+        let disconnected = Mode::Disconnected {
+            reason: "auth failed".to_string(),
+        };
+        assert_eq!(
+            banner_content(&disconnected, Some(link(true))),
+            (
+                "d|auth failed".to_string(),
+                "Disconnected — auth failed".to_string(),
+                Some("Reconnect"),
+                true
+            )
+        );
+        assert_eq!(
+            banner_content(&Mode::Normal, Some(link(true))),
+            (
+                "r|Reconnecting… attempt 2".to_string(),
+                "Reconnecting… attempt 2".to_string(),
+                Some("Reconnect now"),
+                true
+            )
+        );
+        assert_eq!(banner_content(&Mode::Normal, Some(link(false))).2, None);
+        assert_eq!(
+            banner_content(&Mode::Normal, None),
+            ("n".to_string(), String::new(), None, false)
+        );
+    }
 }
