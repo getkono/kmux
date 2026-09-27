@@ -344,12 +344,15 @@ mod tests {
     }
 
     /// A session the peer closes is closed on the hub too — for every client,
-    /// not just its viewers — and forgotten (issue #208).
+    /// not just its viewers — and forgotten, its word back in the pool
+    /// (issues #202, #208).
     #[tokio::test(start_paused = true)]
     async fn a_session_the_peer_closes_is_closed_for_every_client() {
         let app = Arc::new(fixture_app());
         let mut broadcasts = app.subscribe_vt_events();
-        let (_upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let local = app.draw_word().expect("a word");
+        let pool = app.available_words();
+        let (_upstream, peer) = app.install_channel_peer(&local, "fedremote");
 
         peer.send(ServerMessage::Event {
             event: SessionEventMsg::SessionClosed {
@@ -360,10 +363,11 @@ mod tests {
 
         assert_eq!(
             broadcast_matching(&mut broadcasts, closed_word).await,
-            "fedlocal"
+            local
         );
-        assert!(!app.is_federated_session("fedlocal"));
+        assert!(!app.is_federated_session(&local));
         assert!(app.list_federated_sessions().is_empty());
+        assert_eq!(app.available_words(), pool + 1, "the word is returned");
     }
 
     /// A viewer of the proxied pane `fedlocal/0` on the peer
