@@ -230,14 +230,13 @@ mod listener {
         }
 
         /// Whether this is a QUIC client that has not proved it can receive
-        /// packets at its source address, and may be asked to.
+        /// packets at its source address. quinn guarantees such a client may
+        /// be sent a Retry.
         pub fn needs_address_validation(&self) -> bool {
             match &self.stage {
                 Stage::Handshake(_) => false,
                 #[cfg(feature = "quic")]
-                Stage::Quic(incoming) => {
-                    !incoming.remote_address_validated() && incoming.may_retry()
-                }
+                Stage::Quic(incoming) => !incoming.remote_address_validated(),
             }
         }
 
