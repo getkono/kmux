@@ -87,7 +87,7 @@ pub fn client_rows(entries: &[(String, Vec<ClientInfo>)]) -> Vec<ClientRow> {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            // Build identity (protocol 37): `<sha>[-dirty] (profile)`. Empty for
+            // Build identity: `<sha>[-dirty] (profile)`. Empty for
             // a client too old to report it (older builds can't connect, so this
             // is mostly a defensive fallback).
             let build = match (c.build.as_str(), c.build_profile.as_str()) {
@@ -358,6 +358,54 @@ mod tests {
     use super::*;
     use kmux_protocol::control_rpc::{SessionConnections, SessionsResponse};
     use kmux_protocol::messages::SessionMeta;
+
+    fn client(label: &str, is_self: bool, build: &str, profile: &str) -> ClientInfo {
+        use kmux_protocol::messages::{ClientId, ConnectionId, FrontendKind};
+        ClientInfo {
+            client_id: ClientId(7),
+            connection_id: ConnectionId(3),
+            label: label.into(),
+            machine_id: "0123456789abcdef0123456789abcdef".into(),
+            hostname: "h".into(),
+            username: "u".into(),
+            transport: "uds".into(),
+            attached_panes: vec![0, 2],
+            uptime_secs: 5,
+            is_self,
+            frontend: FrontendKind::Gtk,
+            build: build.into(),
+            build_profile: profile.into(),
+        }
+    }
+
+    #[test]
+    fn client_rows_mark_the_requester_and_render_the_build() {
+        let rows = client_rows(&[(
+            "eagle".to_string(),
+            vec![
+                client("u@h", true, "abc123", "debug"),
+                client("u@h#2", false, "abc123", ""),
+                client("v@h", false, "", "release"),
+            ],
+        )]);
+        let summary: Vec<(String, String, String)> = rows
+            .iter()
+            .map(|r| (r.client.clone(), r.build.clone(), r.panes.clone()))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("u@h (you)".into(), "abc123 (debug)".into(), "0,2".into()),
+                ("u@h#2".into(), "abc123".into(), "0,2".into()),
+                ("v@h".into(), "<unknown>".into(), "0,2".into()),
+            ]
+        );
+        assert_eq!(rows[0].session, "eagle");
+        assert_eq!(rows[0].id, 7);
+        assert_eq!(rows[0].frontend, "gtk");
+        assert_eq!(rows[0].transport, "uds");
+        assert_eq!(rows[0].machine, "0123456789ab");
+    }
 
     #[test]
     fn process_overview_rows_indent_and_format() {

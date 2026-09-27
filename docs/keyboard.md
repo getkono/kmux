@@ -60,7 +60,7 @@ daemon can encode them under whatever protocol the inner program negotiated.
 
 ## Daemon side
 
-`crates/kmuxd/src/backend/ghostty/mod.rs::GhosttyBackend::encode_key_event`
+`crates/kmux-vt-core/src/backend/ghostty/mod.rs::GhosttyBackend::encode_key_event`
 queries the live `gvt.input.KeyEncodeOptions` from the pane's Ghostty
 terminal (kitty flags via the new `kmux_ghostty_kitty_flags` FFI getter,
 DECCKM via `kmux_ghostty_modes`, etc.) and calls
@@ -83,12 +83,12 @@ later ones.
 | (nothing) | Ctrl+Up | `KeyCode::ArrowUp, mods: CTRL` | `\x1b[1;5A` |
 
 Test coverage in `crates/kmux-ghostty/src/lib.rs::tests::encode_*` and
-`crates/kmuxd/src/backend/ghostty/mod.rs::tests::encode_key_event_*`.
+`crates/kmux-vt-core/src/backend/ghostty/mod.rs::tests::encode_key_event_*`.
 
 ## kmux-internal keys
 
 `Ctrl+G` (and other mode-trigger keybindings; see
-`crates/kmux/src/mode/resolve.rs`) are intercepted *before* the encoder is
+`crates/kmux-app/src/mode/resolve.rs`) are intercepted *before* the encoder is
 called — they never reach the daemon and never become `PtyKey` events.
 Mode-internal Tab/Enter (command palette completion, connect-form field
 navigation) are similarly consumed locally.
@@ -102,7 +102,7 @@ never reach the daemon or the inner program.
 
 ## Backwards compatibility
 
-The protocol bumped from `PROTOCOL_VERSION = 17` to `18` when `PtyKey` /
-`PtyKeyBatch` were added.  Old clients refuse to connect to new daemons
-and vice versa — users update both binaries together.  See
-`version_mismatch_hint` in `kmux-protocol::messages::types`.
+`PtyKey` / `PtyKeyBatch` are part of the protocol's 1.0.0 baseline, so every
+compatible peer speaks them. How peers negotiate a common protocol version (and
+reject incompatible ones) is described in
+[architecture-protocol-versioning.md](architecture-protocol-versioning.md).

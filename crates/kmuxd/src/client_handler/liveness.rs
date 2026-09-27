@@ -16,19 +16,15 @@ use tracing::warn;
 use crate::lock::lock_or_recover;
 use crate::outbound::{CloseReason, Closer};
 
-/// How often the daemon pings an authenticated client.
-pub(crate) const PING_INTERVAL: Duration = Duration::from_secs(5);
-
-/// How long an unauthenticated connection may take to complete `Auth` and
-/// `AuthProof`. A client does both on connect, so this is spent only by a
-/// socket that sends nothing (or garbage).
-pub(crate) const AUTH_DEADLINE: Duration = Duration::from_secs(30);
-
-/// How long after a ping the daemon waits for any inbound frame (a `Pong`, or
-/// anything else) before it closes the connection. Six ping intervals: a live
-/// client also pings on its own every five seconds, so only a peer that has
-/// gone silent in both directions reaches it.
-pub(crate) const PONG_DEADLINE: Duration = Duration::from_secs(30);
+/// How often the daemon pings an authenticated client; how long an
+/// unauthenticated connection may take to complete `Auth` and `AuthProof` (a
+/// client does both on connect, so this is spent only by a socket that sends
+/// nothing, or garbage); and how long after a ping the daemon waits for any
+/// inbound frame — a `Pong`, or anything else — before it closes the
+/// connection (six ping intervals: a live client also pings on its own, so only
+/// a peer that has gone silent in both directions reaches it). Shared with the
+/// client and specified in `docs/protocol.md`.
+pub(crate) use kmux_protocol::timing::{AUTH_DEADLINE, PING_INTERVAL, PONG_DEADLINE};
 
 /// How often the watchdog checks the deadlines; the resolution of both.
 const WATCHDOG_TICK: Duration = Duration::from_secs(1);

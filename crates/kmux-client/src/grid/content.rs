@@ -218,8 +218,8 @@ impl GridContent {
 
     /// Apply a diff from the server -- only changed cells are updated.
     ///
-    /// Scrollback no longer travels with the diff (v16); it arrives out-of-band
-    /// as `ScrollbackAppend`. `diff.history_total` is still used for
+    /// Scrollback does not travel with the diff; it arrives out-of-band as
+    /// `ScrollbackAppend`. `diff.history_total` is still used for
     /// monotonicity checks: if the server reports more history than the client
     /// has seen, we record the gap so the session manager can issue a
     /// `FetchHistory` request. A scrollback-reset diff returns `reset_view`.

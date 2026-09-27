@@ -15,7 +15,6 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, Weak};
-use std::time::Duration;
 
 use kmux_client::backoff::{jitter_seed, next_delay};
 use kmux_connect::connect::ConnectResult;
@@ -34,16 +33,16 @@ use super::{AUTH_TIMEOUT, LIST_TIMEOUT, PeerConnection, TunnelGuard, feed, recv_
 use crate::app::ServerApp;
 
 /// How often the hub pings its peer, so the peer's silence is noticed even
-/// when nothing else flows.
-pub(super) const UPSTREAM_PING_INTERVAL: Duration = Duration::from_secs(5);
-
-/// How long the peer may stay silent — not a frame, not a pong — before the
-/// hub closes the link and calls the peer unreachable. Three missed pings.
-pub(super) const UPSTREAM_DEADLINE: Duration = Duration::from_secs(15);
-
-/// The longest one attempt to re-open a link may take; a black-holed host
-/// would otherwise hold the handshake forever.
-pub(super) const CONNECT_ATTEMPT_TIMEOUT: Duration = Duration::from_secs(20);
+/// when nothing else flows; how long the peer may stay silent — not a frame,
+/// not a pong — before the hub closes the link and calls the peer unreachable
+/// (three missed pings); and the longest one attempt to re-open a link may
+/// take, since a black-holed host would otherwise hold the handshake forever.
+/// A hub is a client of its peer, so these are the client's timings
+/// (`docs/protocol.md`).
+pub(super) use kmux_protocol::timing::{
+    PEER_CONNECT_TIMEOUT as CONNECT_ATTEMPT_TIMEOUT, PING_INTERVAL as UPSTREAM_PING_INTERVAL,
+    SILENCE_TIMEOUT as UPSTREAM_DEADLINE,
+};
 
 /// Whether a peer last heard from at `last_inbound` has been silent too long
 /// at `now`.
@@ -506,6 +505,7 @@ pub(crate) mod testing {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::time::Duration;
 
     use kmux_protocol::messages::{ClientId, TermSize};
 

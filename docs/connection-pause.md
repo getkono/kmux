@@ -22,13 +22,11 @@ issue's "reconcile on the daemon so only the final state is sent over."
 ## Wire protocol
 
 `ClientMessage::SetPaused { paused, auto }` — connection-level (all of the
-client's panes), mirroring `SetSnapshotMode`. The original pause shipped in
-protocol v24 (`SetPaused { paused }`, bumped 23 → 24).
+client's panes), mirroring `SetSnapshotMode`.
 
-**Reason-aware pause + per-pane exemption (v32).** `SetPaused` gained an `auto`
-flag and a companion `ClientMessage::SetPaneNoAutoPause { pane_id, exempt }`
-arrived, so a backgrounded client can keep streaming chosen panes while pausing
-the rest (`PROTOCOL_VERSION` 31 → 32):
+**Reason-aware pause + per-pane exemption.** `SetPaused` carries an `auto`
+flag, and a companion `ClientMessage::SetPaneNoAutoPause { pane_id, exempt }`
+lets a backgrounded client keep streaming chosen panes while pausing the rest:
 
 - `auto = true` is the debounced background auto-pause; `auto = false` is an
   explicit manual pause. When both sources are active the client sends

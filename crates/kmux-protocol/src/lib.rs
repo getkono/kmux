@@ -4,6 +4,9 @@ pub mod compat;
 pub mod control_rpc;
 pub mod endpoint;
 pub mod messages;
+#[cfg(test)]
+mod spec;
+pub mod timing;
 pub mod trace;
 
 #[cfg(feature = "framing")]

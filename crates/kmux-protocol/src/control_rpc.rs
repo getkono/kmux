@@ -151,8 +151,9 @@ pub struct StatusResponse {
     pub uptime_secs: u64,
     #[serde(default)]
     pub session_count: usize,
-    /// Frozen protocol-40 migration sentinel for legacy clients. New clients
-    /// use `protocol_range` below.
+    /// Migration sentinel for legacy clients, frozen at 41, the successor of
+    /// the retired integer protocol version. New clients use `protocol_range`
+    /// below.
     #[serde(default)]
     pub protocol_version: u32,
     /// Semantic data-plane schema range. `None` identifies a legacy daemon.
@@ -221,7 +222,7 @@ pub struct HandoffReport {
 }
 
 /// JSON response to the `"connections"` control command: every live client
-/// connection the daemon holds, with its build identity (protocol 37).
+/// connection the daemon holds, with its build identity.
 ///
 /// Backs `kmux client status`, which has no session context and so cannot use
 /// the data-plane `ClientList` — it reads this straight off the control socket,

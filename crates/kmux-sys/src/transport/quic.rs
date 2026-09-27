@@ -1,8 +1,3 @@
-/// QUIC idle timeout in seconds (shared by client and server transport configs).
-pub const QUIC_IDLE_TIMEOUT_SECS: u64 = 300;
-/// QUIC keep-alive interval in seconds (shared by client and server transport configs).
-pub const QUIC_KEEP_ALIVE_SECS: u64 = 15;
-
 /// `QuicListener`: accepts QUIC connections from a `quinn::Endpoint` and
 /// yields `IncomingSession` values for dispatch into `run_client_session`.
 ///

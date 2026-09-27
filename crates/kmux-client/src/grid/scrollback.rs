@@ -61,7 +61,7 @@ impl ScrollbackBuffer {
     }
 
     /// Legacy contiguous append when the caller has no absolute index
-    /// (v14-style `TerminalDiff.scrollback_lines`). Assumes lines attach
+    /// (the retired inline `TerminalDiff.scrollback_lines` style). Assumes lines attach
     /// directly after the current end.
     pub fn push_lines(&mut self, new_lines: Vec<ScrollbackLine>) {
         let _ = self.append_with_index(self.history_total(), new_lines);

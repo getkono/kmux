@@ -28,12 +28,12 @@ consumes it through two crates:
 - `kmux-ghostty` — safe Rust façade: `GhosttyTerm` owning the opaque
   handle, `EventSink` trampolines, `Send` assertion, typed errors.
 
-`GhosttyBackend` in `crates/kmuxd/src/backend/ghostty/mod.rs` wraps
+`GhosttyBackend` in `crates/kmux-vt-core/src/backend/ghostty/mod.rs` wraps
 `GhosttyTerm` with the kmuxd `TerminalBackend` trait.
 
 ## `TerminalBackend` trait
 
-Located in `crates/kmuxd/src/backend/mod.rs`.
+Located in `crates/kmux-vt-core/src/backend/mod.rs`.
 
 ### Key design properties
 
@@ -118,7 +118,7 @@ whichever `Arc<dyn BackendEventSink>` the host passes in.  `NullEventSink`
 Programs that re-theme the terminal at runtime — set a palette entry, change the
 default foreground/background/cursor, or push/pop the colour stack — use OSC
 sequences. kmux supports the **set/reset** half of these end-to-end and is
-verified by tests (`osc21_*` in `crates/kmuxd/src/backend/ghostty/mod.rs`,
+verified by tests (`osc21_*` in `crates/kmux-vt-core/src/backend/ghostty/mod.rs`,
 issue #39).
 
 **How it works.** The kmux Zig wrapper (`wrapper.zig`) intercepts only
@@ -210,7 +210,7 @@ block shape.
 Themes default `cursor_bg = fg` and `cursor_fg = bg` so contrast is good on every
 theme without per-theme tuning; both are overridable in `themes/*.toml` (see
 [themes.md](themes.md)). The GTK painter is
-`crates/kmux-gtk/src/render.rs::draw_cursor`; the Swift renderer paints the same
+`draw_cursor` in `crates/kmux-gtk/src/imp/render.rs`; the Swift renderer paints the same
 shapes from the FFI `grid_snapshot` cursor fields.
 
 ### Blink
@@ -297,7 +297,7 @@ The current implementation acquires a single write lock for the entire
 emulator-resize + broadcast sequence; only the async `TIOCSWINSZ` call happens
 outside the lock.
 
-## Protocol v14 contract
+## Pixel-aware `TermSize` on the wire
 
 `TermSize` on the wire now carries pixel dimensions:
 
@@ -327,9 +327,8 @@ Two scrollback regressions surfaced after the libghostty-vt port:
 
 The fix layers an authoritative, backend-independent history record inside
 the daemon and addresses each line by a monotonic absolute index that both
-sides share. Phase B (protocol v15) added the mirror and the indexing;
-Phase C will drop inline `scrollback_lines` from `TerminalDiff` entirely
-and move to lazy fetch.
+sides share. Phase B added the mirror and the indexing; Phase C moves to lazy
+fetch.
 
 ### Invariants
 
@@ -353,7 +352,7 @@ and move to lazy fetch.
 
 ### `ScrollbackMirror` (daemon)
 
-Located at `crates/kmuxd/src/diff_engine/mirror.rs`.
+Located at `crates/kmux-vt-core/src/diff_engine/mirror.rs`.
 
 ```rust
 pub struct ScrollbackMirror {
@@ -367,20 +366,17 @@ Addressable API: `append`, `reset`, `history_total`, `base_index`,
 `range(start, count)`, `tail(n)`, `tail_first_index(n)`. When the ring is full,
 the oldest line is evicted and `base_index` advances. `reset()` drops every
 held line and advances `base_index` to `history_total()` (used on an
-inner-program scrollback wipe — see [v22](#wire-changes-v22--scrollback-wipe-on-clear)).
+inner-program scrollback wipe — see [Scrollback wipe on `clear`](#scrollback-wipe-on-clear)).
 Indices below `base_index` are unrecoverable from the mirror; a client that asks
 for them gets a clamped response starting at `base_index`.
 
-### Wire changes (v15)
+### Scrollback wire messages
 
-`PROTOCOL_VERSION` = **15**. Added fields/messages:
-
-- `TerminalDiff` gains `history_total: u64` (monotonic count of lines ever
-  scrolled off, as of this frame). `scrollback_lines` still present in v15
-  for backwards compatibility with clients that don't track
-  `ScrollbackAppend`; removed in v16.
-- `GridSnapshot` gains `history_total: u64` and `scrollback_tail:
-  Vec<Vec<CellState>>` (the last `SNAPSHOT_TAIL_LINES = 500` lines of the
+- `TerminalDiff` carries `history_total: u64` (monotonic count of lines ever
+  scrolled off, as of this frame). New scrollback lines are not inlined in the
+  diff; they travel in a separate `ScrollbackAppend`.
+- `GridSnapshot` carries `history_total: u64` and `scrollback_tail:
+  Vec<ScrollbackLine>` (the last `SNAPSHOT_TAIL_LINES = 500` lines of the
   mirror). Reattaching clients render scrollback immediately without a
   round-trip.
 - New `ServerMessage::ScrollbackAppend { pane_id, first_index, lines, seqno,
@@ -388,17 +384,15 @@ for them gets a clamped response starting at `base_index`.
   client applies them in order.
 - New `ClientMessage::FetchHistory { request_id, pane_id, start_index: u64,
   count: u32 }` and reply `ServerMessage::HistoryLines { request_id,
-  pane_id, first_index: u64, lines, history_total: u64 }`. Wired in v15;
-  exercised on the client in Phase C.
+  pane_id, first_index: u64, lines, history_total: u64 }`. Wired on the
+  daemon; exercised on the client in Phase C.
 
-Postcard is not self-describing — any struct field or enum variant change
-is a wire break, which is why v14 → v15 → v16 each bump the version.
+Message semantics are catalogued normatively in
+[protocol.md](protocol.md#message-catalogue).
 
-### Wire changes (v17)
+### Pane titles on the wire
 
-`PROTOCOL_VERSION` = **17**. Added fields/messages:
-
-- `PaneInfo` gains `title: String` (latest OSC 0/2 window title; empty until
+- `PaneInfo` carries `title: String` (latest OSC 0/2 window title; empty until
   the program emits one). Populated by the daemon from `PaneRelay.title`.
 - New `SessionEventMsg::PaneTitleChanged { pane_id, title }` broadcast by the
   daemon whenever the pane's VT emulator reports a new title. Production
@@ -406,29 +400,26 @@ is a wire break, which is why v14 → v15 → v16 each bump the version.
   sink stores the title on the relay and pushes the event to every attached
   client on the unbounded control channel (non-blocking; VT-parser-safe).
 
-### Wire changes (v19)
+### Cursor blink on the wire
 
-`PROTOCOL_VERSION` = **19** (builds on v18, which added structured key input —
-`PtyKey` / `PtyKeyBatch`). Added field:
-
-- `CursorState` gains `blink: bool` — the inner program's DECSCUSR blink request
+- `CursorState` carries `blink: bool` — the inner program's DECSCUSR blink request
   (see [Blink](#blink)). The FFI `KmuxCursor` carries it too, so the
   `kmux-ghostty` ABI version is bumped **2 → 3**. A bare `steady → blinking`
   DECSCUSR toggle with no cell change still reaches clients as a `CursorOnly`
   diff (the diff engine compares the whole `CursorState`).
 
-### Wire changes (v22) — scrollback wipe on `clear`
+### Scrollback wipe on `clear`
 
-`PROTOCOL_VERSION` = **22**. Fixes [#57](https://github.com/getkono/kmux/issues/57):
+Fixes [#57](https://github.com/getkono/kmux/issues/57):
 `clear` (`CSI 3J`), `Ctrl+L`, and `RIS` (`ESC c` / `tput reset`) blanked the
 viewport but left the old scrollback recoverable, because the daemon mirror is
 append-only and never shrank when the backend's history did.
 
-- `TerminalDiff` gains `scrollback_reset: Option<u64>`. `Some(base)` means the
+- `TerminalDiff` carries `scrollback_reset: Option<u64>`. `Some(base)` means the
   inner program wiped scrollback this frame; the client drops every line below
   `base` (its new oldest index) **before** applying the diff. Because it rides
   the diff, it is replayed from the `DiffBuffer` on a `Delta` reattach.
-- `GridSnapshot` gains `scrollback_base: u64` (the mirror's `base_index`). On
+- `GridSnapshot` carries `scrollback_base: u64` (the mirror's `base_index`). On
   `apply_snapshot` the client unconditionally evicts everything below it — this
   covers the *clear-then-resize* reconnect where the snapshot tail is empty but
   stale lines are still held (so the `seed_tail` guard alone would miss them).
@@ -442,15 +433,15 @@ surviving scrollback, and stamps `scrollback_reset` with the post-reset base.
 OSC 133 `scrollClear` path), the relay emits the `TerminalUpdate` **before** the
 `ScrollbackAppend` so the client wipes before the survivors land.
 
-### Wire changes (v28) — OSC 9;4 progress
+### OSC 9;4 progress
 
-`PROTOCOL_VERSION` = **28**. Implements [#125](https://github.com/getkono/kmux/issues/125):
+Implements [#125](https://github.com/getkono/kmux/issues/125):
 the ConEmu / Windows-Terminal progress report (`OSC 9 ; 4 ; state ; pct`), which
 Ghostty renders as a thin bar. libghostty-vt already parses it into a
 `progress_report` action; the kmux Zig wrapper now intercepts it (C ABI v4) and
 the daemon surfaces it through `BackendEventSink::on_progress`.
 
-- `PaneInfo` gains `progress_state: PaneProgressState` (`Remove`/`Set`/`Error`/
+- `PaneInfo` carries `progress_state: PaneProgressState` (`Remove`/`Set`/`Error`/
   `Indeterminate`/`Pause`, `Remove` until the program emits one) and
   `progress: Option<u8>` (`0..=100`, `None` for value-less states). Populated by
   the daemon from `PaneRelay.progress`, so a late-attaching client sees the
@@ -509,16 +500,18 @@ pub struct ScrollbackBuffer {
   holds fewer, empty it and re-anchor at `base`. Called unconditionally from
   `apply_snapshot` against `GridSnapshot::scrollback_base`.
 
-`apply_diff` derives `first_index = history_total - scrollback_lines.len()`
-and calls `append_with_index`. `apply_scrollback_append` handles the
-out-of-band variant. `apply_history_lines` fills gaps at the current head
+`apply_diff` uses `history_total` only for gap detection (scrollback lines
+never ride the diff); `apply_scrollback_append` appends the out-of-band
+`ScrollbackAppend` lines via `append_with_index`. `apply_history_lines` fills gaps at the current head
 (skips lines the buffer already has).
 
 ### Wrap-aware rendering
 
 A scrollback line captured at 200 cols and rendered in an 80-col viewport
-must span multiple viewport rows, not get clipped. `crates/kmux/src/ui/grid.rs`
-and the helpers in `crates/kmux-client/src/grid/mod.rs` implement this:
+must span multiple viewport rows, not get clipped. The helpers in
+`crates/kmux-client/src/grid/mod.rs` implement this, consumed by the shared
+`crates/kmux-render/src/geometry.rs` (GPU + FFI packing) and the GTK Cairo
+painter `crates/kmux-gtk/src/imp/render.rs`:
 
 - `effective_line_len(line)` — cells up to the last non-blank.
 - `display_rows_for_line(line, cols)` — `max(1, ceil(effective / cols))`.
@@ -532,7 +525,6 @@ through every captured row even if lines are wider than the viewport.
 
 ### What isn't in Phase B
 
-- `scrollback_lines` is still on `TerminalDiff` (dropped in v16).
 - The client does not yet issue `FetchHistory` on scroll-into-gap (Phase C).
 - Daemon-restart persistence of the mirror is not implemented but the
   layout (bounded VecDeque + `base_index`) is chosen so a later change can
@@ -542,7 +534,7 @@ through every captured row even if lines are wider than the viewport.
 ## Persistence decoupling
 
 Disk format uses `PersistedTermSize { rows: u16, cols: u16 }` (no pixel fields).
-This keeps the on-disk `STATE_VERSION = 2` unchanged — old checkpoints load
+This kept the on-disk `STATE_VERSION` unchanged — old checkpoints load
 cleanly.  A translation shim pads `pixel_width = 0, pixel_height = 0` on read;
 the reverse conversion drops them on write.
 
@@ -588,7 +580,8 @@ RGBA, bg RGBA, the `CellAttrs` bits (`u16`), width, reserved — with
 never needs the theme to paint a cell. It is generation-gated (`grid_info`
 exposes `generation` + `cells_generation`) so the renderer re-fetches only
 changed frames, and versioned via `KMUX_FFI_ABI_VERSION`. See
-[architecture-frontend.md](architecture-frontend.md) and `kmux-ffi/src/cells.rs`.
+[architecture-frontend.md](architecture-frontend.md), `crates/kmux-ffi/src/grid.rs`,
+and the shared encoder `crates/kmux-render/src/packed.rs`.
 
 ## Reserved: runtime backend selection
 
@@ -610,7 +603,7 @@ the daemon or wire side assumes libghostty-vt specifically — adding a second
 backend is a self-contained change to a new `backend/<name>/` submodule plus
 a type swap in `term_state.rs`.
 
-1. Implement `TerminalBackend` in `crates/kmuxd/src/backend/<name>/mod.rs`.
+1. Implement `TerminalBackend` in `crates/kmux-vt-core/src/backend/<name>/mod.rs`.
    Wire `BackendConfig.events` to the backend's title/bell/OSC callbacks
    without blocking.
 2. Port the behavioural suite in `backend/ghostty/mod.rs` verbatim — those

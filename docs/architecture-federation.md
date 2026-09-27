@@ -26,12 +26,12 @@ See `docs/architecture-frontend.md` for the client layering this builds on.
 - **`CellGrid::to_snapshot()`** (`crates/kmux-client/src/grid/mod.rs`) — inverse of
   `apply_snapshot`; lets a cached grid mirror be re-serialised into a `GridSnapshot`
   for a newly-attaching GUI with no upstream round-trip. Round-trip tested.
-- **Federation wire protocol, `PROTOCOL_VERSION = 26`** (`crates/kmux-protocol`):
+- **Federation wire protocol** (`crates/kmux-protocol`):
   - `ClientMessage::OpenPeer { request_id, target: PeerTarget }` / `ClosePeer { request_id, peer }`
   - `ServerMessage::PeerOpened` / `PeerClosed` / `PeerError`
   - `PeerTarget::{Ssh { user, host, ssh_port, accept_invalid_certs }, Direct { host, port,
     token, accept_invalid_certs }}` with `peer_id()` → `"user@host[:port]"` / `"host:port"`.
-- **Peer attribution + peer-routed create, `PROTOCOL_VERSION = 26 → 27`** (the
+- **Peer attribution + peer-routed create** (the
   launcher; see [architecture-frontend.md](architecture-frontend.md)):
   - `SessionEntry.peer: Option<PeerId>` — machine-readable "which machine is this
     session on", set by the daemon's `localize_entry` (it had only the decorated
@@ -54,7 +54,7 @@ See `docs/architecture-frontend.md` for the client layering this builds on.
     fetches the remote `SessionList`, and registers each remote session under a
     **freshly-drawn local `WordId`** (from the same `WordlistSampler` as local sessions,
     so no collisions), holding the bidirectional `remote_word ↔ local_word` map.
-  - **Dispatch branching** (`client_handler/dispatch.rs`) routes `Attach` / `PtyInput` /
+  - **Dispatch branching** (`client_handler/dispatch/`) routes `Attach` / `PtyInput` /
     `PtyKey*` / `PtyPaste` / `Resize` / `Detach` for a federated pane to the peer (ID
     translated, forwarded upstream) instead of the local relay; `SessionList` merges the
     proxied sessions (peer-decorated names). The dispatch layer carries **no `#[cfg]`** —
@@ -95,7 +95,7 @@ for the upstream**, with dispatch branching federated vs. local:
    `SessionList` the remote, register its sessions locally with **freshly-drawn local
    `WordId`s** (reuse the `WordlistSampler`), reply `PeerOpened`. Behind a
    `federation` cargo feature until PR5.
-3. **Dispatch branching** (`client_handler/dispatch.rs`, injection points identified):
+3. **Dispatch branching** (`client_handler/dispatch/`, injection points identified):
    `Attach` / `PtyInput` / `PtyKey*` / `Resize` / `RequestInputLock` / `Detach` for a
    federated pane route to `PeerManager` (translate local→remote id, forward upstream)
    instead of `app.*`. Track per-connection federated attachments in `SharedClientState`.

@@ -63,7 +63,7 @@ the recovery (issue #182, §5).
 
 ### 2. Live self-heal (production, in-band)
 
-`ServerMessage::GridDigest { pane_id, seqno, hash }` (PROTOCOL_VERSION 36) carries
+`ServerMessage::GridDigest { pane_id, seqno, hash }` carries
 the server's `live_digest` for a seqno. It is emitted on the **data** channel,
 right after the diffs it certifies, so it can never overtake them; throttled in
 production (`KMUX_GRID_DIGEST_INTERVAL`, default 1-in-32; `=1` per-frame for tests).

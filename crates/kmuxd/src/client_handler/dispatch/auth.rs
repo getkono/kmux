@@ -522,6 +522,28 @@ mod tests {
         assert_eq!(message, "send Auth first");
     }
 
+    /// A proof with no challenge behind it is a client out of step, not an
+    /// attack: refused, and the connection kept so it can start with `Auth`.
+    #[tokio::test]
+    async fn an_auth_proof_without_a_challenge_is_refused_without_closing() {
+        let app = Arc::new(fixture_app());
+        let (mut state, _comp_out, mut ctrl_rx) = fixture_client_state(app, TransportKind::Uds);
+        let keep = handle_message(
+            &mut state,
+            ClientMessage::AuthProof {
+                signature: vec![0; 64],
+            },
+            &NoopAttacher,
+        )
+        .await;
+        assert!(keep);
+        assert!(!state.authenticated);
+        let (request_id, code, message) = only_error(drain(&mut ctrl_rx));
+        assert_eq!(request_id, None);
+        assert_eq!(code, ErrorCode::NotAuthenticated);
+        assert_eq!(message, "send Auth before AuthProof");
+    }
+
     #[tokio::test]
     async fn a_second_auth_after_authentication_is_ignored_silently() {
         let (keep, msgs) = dispatch_one(ClientMessage::Auth {

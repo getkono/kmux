@@ -708,6 +708,13 @@ mod tests {
         let (attached, mgr) = reconnect_to_daemon(Some(7), Some(7));
         assert!(mgr.link_reached_same_daemon());
         assert_eq!(
+            mgr.connection_state(),
+            &super::ConnectionState::Connected {
+                transport: crate::transport::TransportKind::Uds
+            },
+            "the new link is the live one"
+        );
+        assert_eq!(
             attached,
             vec![
                 ("eagle/0".to_string(), Some(SequenceNo(41))),
@@ -720,6 +727,36 @@ mod tests {
                 Some(PaneSync::Synced { expected }) if expected.0 == 42
             ),
             "a resumed pane stays in sync to take the replayed diffs"
+        );
+    }
+
+    /// A transport the supervisor promoted becomes the live one: its sender
+    /// replaces the old, whose drop closes the old channel.
+    #[test]
+    fn a_transport_swap_makes_the_new_channel_the_live_one() {
+        use crate::transport::TransportKind;
+
+        let (mut mgr, mut old_rx) = make_connected_manager();
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        mgr.apply_transport_upgrade(tx, TransportKind::Quic);
+        assert_eq!(
+            mgr.connection_state(),
+            &super::ConnectionState::Connected {
+                transport: TransportKind::Quic
+            }
+        );
+        assert_eq!(mgr.current_transport, TransportKind::Quic);
+        mgr.request_session_list();
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMessage::SessionList { .. })
+        ));
+        assert!(
+            matches!(
+                old_rx.try_recv(),
+                Err(mpsc::error::TryRecvError::Disconnected)
+            ),
+            "the old channel's sender is dropped"
         );
     }
 

@@ -74,7 +74,7 @@ session list. The dispatch handler merges local + federated and replies once.
   (mirrors `SessionList`/`SessionListResult`).
 - `PaneProcesses { pane_id, root_pid, processes: Vec<ProcessSample> }`;
   `ProcessSample { pid, ppid, name, cmd, cpu_percent, mem_bytes }`.
-- Added in `PROTOCOL_VERSION` **28**.
+- Part of the protocol's 1.0.0 baseline.
 
 ### Client + projection
 

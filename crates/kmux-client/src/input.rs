@@ -1,6 +1,6 @@
 //! Mouse-event encoding and shared key helpers for the kmux client.
 //!
-//! Key encoding moved server-side in `PROTOCOL_VERSION` 18: the daemon owns a
+//! Key encoding lives server-side: the daemon owns a
 //! per-pane Ghostty key encoder and decides the byte sequence for each
 //! keystroke based on what the inner program negotiated (DECCKM, kitty kbd
 //! flags, modifyOtherKeys).  The client now sends structured key events via

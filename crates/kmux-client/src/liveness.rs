@@ -23,8 +23,7 @@ use std::time::{Duration, Instant};
 
 use kmux_protocol::messages::ClientMessage;
 
-pub const PING_INTERVAL: Duration = Duration::from_secs(5);
-pub const TIMEOUT: Duration = Duration::from_secs(15);
+pub use kmux_protocol::timing::{PING_INTERVAL, SILENCE_TIMEOUT as TIMEOUT};
 
 /// Tracker state. Reset on every new connection via [`Liveness::reset`].
 #[derive(Debug)]

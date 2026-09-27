@@ -167,7 +167,7 @@ The supervisor never waits on a worker in a way that can hang the daemon
 A killed worker faults its pane like a crash. On a fault the supervisor:
 
 1. broadcasts `SessionEventMsg::PaneFaulted` to the pane's attached clients
-   (PROTOCOL_VERSION 28), and
+   (part of the data protocol's 1.0.0 baseline), and
 2. reports the pane and the cause (`FaultCause::Crash` or `FaultCause::Hang`)
    on a channel to a single daemon-level respawn task (`app::recover`) — never
    re-entrantly from the dying supervisor.

@@ -17,7 +17,7 @@ Run the whole matrix on **Linux (GTK client, `kmux-gtk`)** and **macOS (Swift ap
 | `live_restart_preserves_running_shell_across_processes` | `crates/kmuxd/tests/handoff_e2e.rs` | A real cross-process `restart` migrates a live shell (same PID), session persists, old daemon exits. |
 | `in_place_binary_swap_still_hands_off` | `crates/kmuxd/tests/handoff_e2e.rs` | After an atomic in-place binary replace, a successor still takes over (the `(deleted)`-inode regression). |
 | `handoff::sender::tests::*` | `crates/kmuxd/src/handoff/sender.rs` | `resolve_successor_exe` strips the `(deleted)` marker, prefers the replacement, errors when nothing exists. |
-| `restart_daemon_maps_accepted_busy_and_unsupported` | `crates/kmux-client/src/daemon/mod.rs` | The `restart` RPC contract: accepted / busy / old-daemon-fallback. |
+| `restart_daemon_maps_accepted_busy_and_unsupported` | `crates/kmux-connect/src/daemon/mod.rs` | The `restart` RPC contract: accepted / busy / old-daemon-fallback. |
 | `reconnect_preserves_connection_id_for_handoff` | `crates/kmux-client/src/session_manager/mod.rs` | The client keeps its `connection_id` across the drop so the successor can transfer pane streams. |
 | `live_pty_migrates_with_same_pid` (pre-existing) | `crates/kmuxd/src/app/migrate.rs` | In-process fd transfer keeps the same child PID. |
 | `pane_fd_round_trips_and_keeps_child_alive`, `hello_version_mismatch_round_trips_for_decline` (pre-existing) | `crates/kmuxd/src/handoff/mod.rs` | SCM_RIGHTS fd passing; version-mismatch → decline. |

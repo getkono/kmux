@@ -541,7 +541,7 @@ struct ConnectionState {
     /// Daemon-assigned user-readable label `username@hostname[#N]`, unique among
     /// live connections — the unit listed and kicked.
     label: String,
-    /// Client build identity reported in `Auth` (protocol 37): which frontend,
+    /// Client build identity reported in `Auth`: which frontend,
     /// and the client binary's commit + profile. Surfaced by `kmux clients` and
     /// `kmux client status` to spot a client built from a different commit than
     /// the daemon even when the protocol version matches.
@@ -561,13 +561,13 @@ pub struct ClientIdentity {
     pub hostname: String,
     /// Client-reported OS username.
     pub username: String,
-    /// Which frontend opened the connection (CLI vs GUI). (protocol 37)
+    /// Which frontend opened the connection (CLI vs GUI).
     pub client_kind: FrontendKind,
-    /// Short git commit the client binary was built from. (protocol 37)
+    /// Short git commit the client binary was built from.
     pub client_git_sha: String,
-    /// Whether the client build had uncommitted changes. (protocol 37)
+    /// Whether the client build had uncommitted changes.
     pub client_git_dirty: bool,
-    /// Cargo profile of the client build. (protocol 37)
+    /// Cargo profile of the client build.
     pub client_build_profile: String,
 }
 
@@ -1758,6 +1758,20 @@ mod tests {
             ),
             "the current seqno itself is in step: nothing to replay"
         );
+    }
+
+    /// A `last_seqno` the pane no longer retains the diffs after cannot be
+    /// replayed: the client is reset with a snapshot.
+    #[tokio::test]
+    async fn compute_replay_from_a_seqno_older_than_the_retained_diffs_resets() {
+        use super::attach::compute_replay;
+        use kmux_protocol::messages::SequenceNo;
+        let relay = make_relay(24, 80);
+        push_seqnos(&relay, 3..=5);
+        match compute_replay(&relay, Some(SequenceNo(1))) {
+            AttachResult::SyncReset(_, seqno) => assert_eq!(seqno, SequenceNo(5)),
+            other => panic!("expected SyncReset, got {other:?}"),
+        }
     }
 
     #[tokio::test]

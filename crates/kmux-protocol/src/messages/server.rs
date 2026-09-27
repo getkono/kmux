@@ -159,8 +159,9 @@ pub enum ServerMessage {
     },
 
     /// Authoritative layout state for one tab. Broadcast to every client viewing
-    /// the tab after **any** layout mutation (split, close, swap, resize, focus)
-    /// and sent on (re)attach. Clients replace their cached tree wholesale — they
+    /// the tab after **any** layout mutation (split, close, swap, resize, focus);
+    /// not sent on attach — a client learns a tab's tree from the session list.
+    /// Clients replace their cached tree wholesale — they
     /// never merge — so concurrent client edits resolve last-writer-wins.
     LayoutUpdate {
         word_id: WordId,

@@ -211,9 +211,11 @@ the macOS app uses the parallel native shortcuts in its "Pane" / "Session" menus
 
 ## Versioning
 
-- `PROTOCOL_VERSION = 21` — the tab + layout messages (`PaneSplit`, `PaneSwap`,
-  `SetLayoutRatios`, `SetFocus`, `Tab*`, `ApplyLayoutScheme`, `LayoutUpdate`).
-- `STATE_VERSION = 3` — daemon checkpoint persistence; the v2→v3 migration wraps
+- Data protocol — the tab + layout messages (`PaneSplit`, `PaneSwap`,
+  `SetLayoutRatios`, `SetFocus`, `Tab*`, `ApplyLayoutScheme`, `LayoutUpdate`) are
+  part of the protocol's 1.0.0 baseline; version negotiation is described in
+  [architecture-protocol-versioning.md](architecture-protocol-versioning.md).
+- `STATE_VERSION` — daemon checkpoint persistence; the v2→v3 migration wraps
   each persisted session's panes in a default one-tab-one-pane layout.
 - `KMUX_FFI_ABI_VERSION` — gates the Swift tiling surface (`tabs`/`layout`/per-pane
   grid/`focus_pane`/`set_pane_sizes` + the tiling/scheme/zoom `FfiAction`s), plus

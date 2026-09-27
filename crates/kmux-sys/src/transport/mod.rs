@@ -161,7 +161,7 @@ mod listener {
     /// Longest a transport handshake (TLS, QUIC) may take before the
     /// connection is dropped (issue #206). Generous for a slow link; a peer
     /// that has not finished by then is not going to.
-    pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
+    pub use kmux_protocol::timing::TRANSPORT_HANDSHAKE_TIMEOUT as HANDSHAKE_TIMEOUT;
 
     /// Pause after a failed accept before the next one.
     const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);

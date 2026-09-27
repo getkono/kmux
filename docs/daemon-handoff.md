@@ -289,8 +289,9 @@ has N wait for `Released` after a `Decline`; a version-1 O answers a `Decline`
 with `Released` too, and a version-1 N restores without waiting; version 3 adds
 O's pid to `Hello`, so the upgrade from a released, version-1 daemon — like one
 from a version-2 build — snapshot-restores once: shells do not survive that
-restart; see §Mixed versions); a `PROTOCOL_VERSION` mismatch is caught
-by the client on reconnect (it surfaces the documented "run `kmux daemon
+restart; see §Mixed versions); a data-protocol range mismatch (see
+[architecture-protocol-versioning.md](architecture-protocol-versioning.md)) is
+caught by the client on reconnect (it surfaces the documented "run `kmux daemon
 restart`" guidance); the on-disk checkpoint is versioned by `STATE_VERSION`.
 
 QA for the full upgrade surface — real workloads, the version-bump matrix,

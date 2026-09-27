@@ -52,9 +52,9 @@ pub const PROBE_INTERVAL: Duration = Duration::from_secs(30);
 /// would otherwise look like a successful upgrade and silently disconnect
 /// the live channel when the rejected `AuthResult` arrives).
 #[cfg(feature = "remote")]
-const PROBE_AUTH_TIMEOUT: Duration = Duration::from_secs(10);
+use kmux_protocol::timing::AUTH_REPLY_TIMEOUT as PROBE_AUTH_TIMEOUT;
 /// Hard cap on the underlying connect call. Quinn's handshake otherwise
-/// respects `QUIC_IDLE_TIMEOUT_SECS` (300 s), so a port that silently
+/// respects `QUIC_IDLE_TIMEOUT` (300 s), so a port that silently
 /// drops UDP would block the supervisor loop for five minutes per probe
 /// — long enough that no second scorer log ever reaches the user. With
 /// this timeout, a stuck probe surfaces as a `warn!` within ~10 s and

@@ -98,7 +98,7 @@ where the session is created. Because the daemon may be remote (over SSH), a
 native OS file chooser is wrong: the browser lists the **daemon host's**
 directories over the wire protocol.
 
-Flow (protocol round-trip, `PROTOCOL_VERSION` 22 → **23**):
+Flow (a protocol round-trip):
 
 1. `AppCore::open_directory_browser` seeds `dir_browser_cwd` from the active
    session's cwd (else `initial_cwd`), clears the filter, and calls
@@ -468,7 +468,8 @@ ignores it) and links the `kmux-ffi` staticlib.
   binding-checksum check). Beyond lifecycle + `tick` → `FfiEffect`s it exposes: a
   generation-gated packed-cell `grid_snapshot` (16-byte cells, `DEFAULT_*`
   resolved against the palette in Rust, scrollback composited into the visible
-  rows when scrolled — see `kmux-ffi/src/cells.rs`); structured
+  rows when scrolled — see `crates/kmux-ffi/src/grid.rs` and the shared encoder
+  `crates/kmux-render/src/packed.rs`); structured
   **mode-aware** key input (`send_char` / `send_named_key`, routed through the
   daemon's Ghostty encoder via `send_keys`, so no escape sequences are
   hand-rolled); the **tiling surface** — `tabs()` + `select_tab`, `layout(area)`
