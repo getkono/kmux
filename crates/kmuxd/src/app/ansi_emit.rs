@@ -20,7 +20,8 @@ use crate::term_state::TermState;
 ///
 /// `separator` is `true` when a fresh shell was respawned (the marker
 /// distinguishes the old history from the new prompt) and `false` for a live PTY
-/// inherited across a handoff (seamless — there is no respawn boundary).
+/// inherited across a handoff (seamless — there is no respawn boundary, so the
+/// cursor goes back where the live program left it).
 pub(super) fn snapshot_to_ansi(
     snapshot: &GridSnapshot,
     scrollback_lines: &[Vec<CellState>],
@@ -37,7 +38,9 @@ pub(super) fn snapshot_to_ansi(
         emit_cells_line(&mut out, line);
     }
 
-    // Emit the visible viewport rows.
+    // Emit the visible viewport rows, with a line break only *between* them:
+    // one after the last row would scroll the whole screen up a line and the
+    // top row into the history.
     let rows = snapshot.rows as usize;
     let cols = snapshot.cols as usize;
     for row in 0..rows {
@@ -45,23 +48,36 @@ pub(super) fn snapshot_to_ansi(
         if base + cols > snapshot.cells.len() {
             break;
         }
-        emit_cells_line(&mut out, &snapshot.cells[base..base + cols]);
+        if row > 0 {
+            out.extend_from_slice(b"\r\n");
+        }
+        emit_cells(&mut out, &snapshot.cells[base..base + cols]);
     }
 
     // Dim separator visually distinguishing the restored history from the new
     // shell. Omitted for inherited live PTYs, where the handoff is seamless.
     if separator {
-        out.extend_from_slice(b"\x1b[2m[kmux: session restored]\x1b[0m\r\n");
+        out.extend_from_slice(b"\r\n\x1b[2m[kmux: session restored]\x1b[0m\r\n");
+    } else {
+        let cursor = &snapshot.cursor;
+        let at = format!("\x1b[{};{}H", cursor.row + 1, cursor.col + 1);
+        out.extend_from_slice(at.as_bytes());
     }
 
     out
 }
 
-/// Emit one row of cells as ANSI bytes into `out`, followed by `\r\n`.
+/// [`emit_cells`], followed by `\r\n`.
+fn emit_cells_line(out: &mut Vec<u8>, cells: &[CellState]) {
+    emit_cells(out, cells);
+    out.extend_from_slice(b"\r\n");
+}
+
+/// Emit one row of cells as ANSI bytes into `out`, ending with the SGR reset.
 ///
 /// Trailing spaces are trimmed.  SGR sequences are coalesced so that only one
 /// escape is emitted per style-change boundary.
-pub(super) fn emit_cells_line(out: &mut Vec<u8>, cells: &[CellState]) {
+fn emit_cells(out: &mut Vec<u8>, cells: &[CellState]) {
     use std::fmt::Write as FmtWrite;
 
     let last_content = cells
@@ -116,7 +132,7 @@ pub(super) fn emit_cells_line(out: &mut Vec<u8>, cells: &[CellState]) {
         }
     }
 
-    out.extend_from_slice(b"\x1b[0m\r\n");
+    out.extend_from_slice(b"\x1b[0m");
 }
 
 /// Feed preamble bytes into `term_state`, compute the resulting diff, and push
@@ -170,5 +186,38 @@ mod tests {
             scrollback.lock().unwrap().oldest_seqno(),
             Some(SequenceNo(1))
         );
+    }
+
+    /// The text of `rows` × `cols` cells, one string per row.
+    fn rows_of(snapshot: &GridSnapshot) -> Vec<String> {
+        snapshot
+            .cells
+            .chunks(usize::from(snapshot.cols))
+            .map(|row| {
+                row.iter()
+                    .map(|c| c.c)
+                    .collect::<String>()
+                    .trim_end()
+                    .to_string()
+            })
+            .collect()
+    }
+
+    /// A pane inherited across a handoff shows exactly the screen it had: the
+    /// same rows in the same places and the cursor where it was. A line break
+    /// after the last row once scrolled the whole screen up a line, taking
+    /// the top row off it — a fresh shell's prompt, which is often all there is.
+    #[test]
+    fn an_inherited_screen_is_seeded_exactly() {
+        let before = fixture_term_state(4, 20);
+        lock_term_state(&before).feed(b"top\r\n\r\nthird\r\nlast\x1b[2;3H");
+        let snapshot = lock_term_state(&before).snapshot();
+
+        let after = fixture_term_state(4, 20);
+        lock_term_state(&after).feed(&snapshot_to_ansi(&snapshot, &[], false));
+        let seeded = lock_term_state(&after).snapshot();
+
+        assert_eq!(rows_of(&seeded), ["top", "", "third", "last"]);
+        assert_eq!((seeded.cursor.row, seeded.cursor.col), (1, 2));
     }
 }
