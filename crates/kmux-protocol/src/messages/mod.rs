@@ -6,6 +6,7 @@ pub mod vt;
 
 mod client;
 mod error;
+mod federation;
 mod server;
 mod types;
 pub(crate) mod wire_enum;
@@ -13,6 +14,7 @@ pub(crate) mod wire_enum;
 pub use category::MessageCategory;
 pub use client::*;
 pub use error::*;
+pub use federation::*;
 pub use key::*;
 pub use process::*;
 pub use server::*;

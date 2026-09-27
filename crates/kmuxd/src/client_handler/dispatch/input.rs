@@ -1,66 +1,45 @@
 //! Everything that reaches a PTY: keys, paste, resize, signals, and the
 //! exclusive input lock that arbitrates between clients competing for one pane.
 
-use kmux_protocol::messages::{ClientId, ClientMessage, KeyEvent, PaneId, ServerMessage, TermSize};
+use kmux_protocol::messages::{ClientId, KeyEvent, PaneId, ServerMessage, TermSize};
 
 use crate::app::InputLockOutcome;
 use crate::connection::classify_error;
 
 use super::super::SharedClientState;
 
-/// Handle [`ClientMessage::PtyInput`].
+/// Handle [`ClientMessage::PtyInput`](kmux_protocol::messages::ClientMessage::PtyInput).
 pub(super) async fn on_pty_input(
     state: &mut SharedClientState,
     client_id: ClientId,
     pane_id: PaneId,
     data: Vec<u8>,
 ) {
-    if state.app.is_federated_pane(&pane_id) {
-        state
-            .app
-            .forward_peer_message(&pane_id, move |remote| ClientMessage::PtyInput {
-                pane_id: remote,
-                data,
-            });
-    } else if let Err(e) = state.app.write_input(&pane_id, client_id, data).await {
+    if let Err(e) = state.app.write_input(&pane_id, client_id, data).await {
         state.error(None, classify_error(&e), e.to_string());
     }
 }
 
-/// Handle [`ClientMessage::PtyPaste`].
+/// Handle [`ClientMessage::PtyPaste`](kmux_protocol::messages::ClientMessage::PtyPaste).
 pub(super) async fn on_pty_paste(
     state: &mut SharedClientState,
     client_id: ClientId,
     pane_id: PaneId,
     data: String,
 ) {
-    if state.app.is_federated_pane(&pane_id) {
-        state
-            .app
-            .forward_peer_message(&pane_id, move |remote| ClientMessage::PtyPaste {
-                pane_id: remote,
-                data,
-            });
-    } else if let Err(e) = state.app.write_paste(&pane_id, client_id, data).await {
+    if let Err(e) = state.app.write_paste(&pane_id, client_id, data).await {
         state.error(None, classify_error(&e), e.to_string());
     }
 }
 
-/// Handle [`ClientMessage::PtyKeyBatch`].
+/// Handle [`ClientMessage::PtyKeyBatch`](kmux_protocol::messages::ClientMessage::PtyKeyBatch).
 pub(super) async fn on_pty_key_batch(
     state: &mut SharedClientState,
     client_id: ClientId,
     pane_id: PaneId,
     events: Vec<KeyEvent>,
 ) {
-    if state.app.is_federated_pane(&pane_id) {
-        state
-            .app
-            .forward_peer_message(&pane_id, move |remote| ClientMessage::PtyKeyBatch {
-                pane_id: remote,
-                events,
-            });
-    } else if let Err(e) = state
+    if let Err(e) = state
         .app
         .write_key_batch(&pane_id, client_id, &events)
         .await
@@ -69,7 +48,7 @@ pub(super) async fn on_pty_key_batch(
     }
 }
 
-/// Handle [`ClientMessage::Resize`].
+/// Handle [`ClientMessage::Resize`](kmux_protocol::messages::ClientMessage::Resize).
 pub(super) async fn on_resize(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -86,21 +65,14 @@ pub(super) async fn on_resize(
     }
 }
 
-/// Handle [`ClientMessage::Signal`].
+/// Handle [`ClientMessage::Signal`](kmux_protocol::messages::ClientMessage::Signal).
 pub(super) async fn on_signal(state: &mut SharedClientState, pane_id: PaneId, signal: i32) {
-    if state.app.is_federated_pane(&pane_id) {
-        state
-            .app
-            .forward_peer_message(&pane_id, move |remote| ClientMessage::Signal {
-                pane_id: remote,
-                signal,
-            });
-    } else if let Err(e) = state.app.send_signal(&pane_id, signal).await {
+    if let Err(e) = state.app.send_signal(&pane_id, signal).await {
         state.error(None, classify_error(&e), e.to_string());
     }
 }
 
-/// Handle [`ClientMessage::RequestInputLock`].
+/// Handle [`ClientMessage::RequestInputLock`](kmux_protocol::messages::ClientMessage::RequestInputLock).
 pub(super) async fn on_request_input_lock(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -117,7 +89,7 @@ pub(super) async fn on_request_input_lock(
     }
 }
 
-/// Handle [`ClientMessage::ReleaseInputLock`].
+/// Handle [`ClientMessage::ReleaseInputLock`](kmux_protocol::messages::ClientMessage::ReleaseInputLock).
 pub(super) async fn on_release_input_lock(
     state: &mut SharedClientState,
     client_id: ClientId,
