@@ -252,16 +252,14 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
     peer is re-negotiated each time, so a restarted remote (new token, new port) is
     found again. On success the peer's list is reconciled (`reconcile_sessions`): a
     session still listed keeps its local word, a new one draws one, one no longer
-    listed is closed. Every proxied pane with viewers is re-attached. If the peer is
-    the **same daemon run** as before (its `AuthResult.daemon_instance`, kept on the
-    `PeerConnection`) and the pane's mirror is in step (seeded by a snapshot, none
-    asked for since), it resumes from the seqno the mirror reached: the peer replays
-    only what the link missed, or answers `SyncReset` and a snapshot when that is too
-    much, and the frames continue the seqnos every viewer already has. Otherwise — a
-    new run, whose seqnos start over, or a peer that sends no instance id — it is
-    re-attached **for a snapshot**, which re-seeds the mirror and resyncs every
-    streaming viewer (a paused one catches up when it resumes). Then every client is
-    sent the list.
+    listed is closed. Every proxied pane with viewers is re-attached **for a
+    snapshot**, whichever daemon run the peer now is: a new run numbers its seqnos
+    from scratch, and even the same run's replay (`Attach { last_seqno }`) carries
+    only the diffs, not the scrollback appended while the link was down, which the
+    hub's mirror has no way to fetch back. The snapshot re-seeds the mirror and
+    resyncs every streaming viewer (a paused one catches up when it resumes). Then
+    every client is sent the list. The hub therefore never has to decide whether it
+    reached the same run.
   - **Ordered lists.** Every add or remove of a peer's session (a reconcile, the
     peer's `SessionClosed`, `close_remote_session`, `close_peer`,
     `create_remote_session`'s registration)
@@ -294,8 +292,7 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
     restarted Direct peer rotates its token, which is not part of its `PeerId`.
   Tests: the supervisor on the paused clock over a channel-played peer
   (`federation::link` — dropped link → unreachable → re-linked under the same word,
-  panes re-attached for a snapshot; a re-linked pane resumes from its seqno only in
-  the same daemon run (`a_relinked_pane_resumes_only_in_the_same_daemon_run`); a silent peer is pinged then declared unreachable;
+  panes re-attached for a snapshot; a silent peer is pinged then declared unreachable;
   an answering one stays reachable; a closed peer is not re-opened), the frame handlers
   (`federation::feed`), and the E2E
   `a_frozen_peer_is_unreachable_then_restored_under_the_same_word` (SIGSTOP the remote,
@@ -360,15 +357,15 @@ What the link finds again by itself, and what it cannot:
 
 | The peer … | `Ssh` target | `Direct` target |
 |---|---|---|
-| dropped off the network, came back | re-linked; same run → panes resume from their seqnos | same |
-| restarted through a handoff (`kmux daemon restart`: the successor adopts the token, but listens on new ports unless they are pinned — `--tcp-port` or a `[[listen]]` block in `kmuxd.toml`) | re-linked (`probe-or-start` hands over the ports); new run → panes re-attached for a snapshot | re-linked if the peer's TCP port is pinned, as above; otherwise **not re-linked** — nothing listens on the old port |
-| restarted outright (a new token, and new ports unless pinned) | re-linked: `probe-or-start` over SSH hands over the new token and ports | **not re-linked**: every attempt is refused (`AuthFailure::BadToken`), or finds nothing on the old port |
+| dropped off the network (or froze), came back | re-linked | re-linked |
+| restarted through a handoff (`kmux daemon restart`) | re-linked: `probe-or-start` over SSH hands over the successor's ports | **not re-linked**: the successor is started with `--port 0` and listens on new ports (and issues a new token when it falls back to restoring from the checkpoint rather than adopting live panes) |
+| restarted outright | re-linked: `probe-or-start` hands over the new token and ports | **not re-linked**: nothing listens on the old port, or — for a peer started by hand with a fixed `--tcp-port` — every attempt is refused (`AuthFailure::BadToken`) |
 
 The `Direct` cells are the remaining limit. A `Direct` target carries the one
-address and token the peer had when the user opened it; an unpinned port is
-chosen afresh by each process, and a `kmuxd` started outright issues a new
-random token (`startup.rs`; only a handoff successor adopts its predecessor's) —
-by design, so a token from one run is worthless in the next. The hub has no channel
+address and token the peer had when the user opened it, and a restarted peer
+changes one or both: every `kmuxd` the daemon lifecycle starts binds ephemeral
+ports, and one started outright issues a new random token (`startup.rs`) — by
+design, so a token from one run is worthless in the next. The hub has no channel
 to learn the new one: learning it is exactly what SSH does for an `Ssh` target,
 and a `Direct` target is, by definition, one without SSH. Making it automatic
 needs a trust decision this change does not take, in one of two shapes: a token
