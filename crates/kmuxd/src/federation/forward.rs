@@ -144,17 +144,23 @@ impl PeerManager {
             }
             Target::Peer(peer) => *peer = None,
         }
-        if let Some(seq) = guard.routes.sent(&from) {
-            let _ = guard.client_tx.send(ClientMessage::Ping { seq });
-        }
-        if let (Some(rid), Some(client_rid)) = (request_id, client_rid) {
-            *rid = guard.routes.route(Route {
-                from,
-                request_id: client_rid,
-                local_word,
-            });
-        }
+        guard.barrier(&from);
+        let routed = match (request_id, client_rid) {
+            (Some(rid), Some(client_rid)) => {
+                *rid = guard.routes.route(Route {
+                    from,
+                    request_id: client_rid,
+                    local_word,
+                });
+                Some(*rid)
+            }
+            _ => None,
+        };
         if guard.client_tx.send(msg).is_err() {
+            // Refused here, so the link's end must not answer it again.
+            if let Some(rid) = routed {
+                guard.routes.take(rid);
+            }
             return Err(refuse(
                 ErrorCode::InternalError,
                 "the peer's link closed".to_string(),
@@ -358,6 +364,21 @@ mod tests {
         }
     }
 
+    /// A pane as a peer describes it, attached to one of the peer's clients.
+    fn sample_pane(pane_id: &str) -> kmux_protocol::messages::PaneInfo {
+        kmux_protocol::messages::PaneInfo {
+            pane_id: pane_id.to_string(),
+            pane_index: 1,
+            program: "sh".to_string(),
+            size: TermSize::default(),
+            attached_clients: vec![ClientId(7)],
+            status: kmux_protocol::messages::SessionStatus::Running,
+            title: String::new(),
+            progress_state: Default::default(),
+            progress: None,
+        }
+    }
+
     fn tab() -> TabInfo {
         TabInfo {
             tab_index: 1,
@@ -503,6 +524,26 @@ mod tests {
                 "TabClosed { request_id: 13, word_id: \"fedlocal\"",
             ),
             (
+                ClientMessage::PaneSplit {
+                    request_id: 19,
+                    word_id: "fedlocal".into(),
+                    tab_index: 0,
+                    from_pane: 0,
+                    dir: kmux_protocol::messages::SplitDir::Vertical,
+                    program: None,
+                    args: vec![],
+                    size,
+                },
+                ServerMessage::PaneSplit {
+                    request_id: 0,
+                    word_id: "fedremote".into(),
+                    tab_index: 0,
+                    new_pane: sample_pane("fedremote/1"),
+                    layout: LayoutNode::single(1),
+                },
+                "PaneSplit { request_id: 19, word_id: \"fedlocal\", tab_index: 0, new_pane: PaneInfo { pane_id: \"fedlocal/1\"",
+            ),
+            (
                 ClientMessage::ClientList {
                     request_id: 15,
                     word_id: "fedlocal".into(),
@@ -601,7 +642,7 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn a_request_that_cannot_be_forwarded_is_refused_at_once() {
         let mut hub = fixture_hub();
-        let (from, _answers) = client(1);
+        let (from, mut answers) = client(1);
         let refused = |msg| hub.app.peer_manager.forward(from.clone(), msg).unwrap_err();
         let create = ClientMessage::SessionCreate {
             request_id: 1,
@@ -651,6 +692,19 @@ mod tests {
             .expect("ignored");
         assert!(hub.upstream.try_recv().is_err(), "nothing went up");
 
+        // A request the link will not take is refused here, and its route
+        // with it: the link's end must not answer it a second time.
+        drop(hub.upstream);
+        let refusal = refused(ClientMessage::SessionRename {
+            request_id: 3,
+            word_id: "fedlocal".into(),
+            new_name: "n".into(),
+        });
+        assert_eq!(
+            (refusal.request_id, refusal.code),
+            (Some(3), ErrorCode::InternalError)
+        );
+
         // An unreachable peer refuses everything.
         let conn = Arc::clone(&hub.app.peer_manager.peers.lock().unwrap()["peer:1"]);
         crate::federation::link::link_down(&conn);
@@ -663,6 +717,7 @@ mod tests {
             (refusal.request_id, refusal.code),
             (Some(4), ErrorCode::InternalError)
         );
+        assert!(answers.try_recv().is_err(), "nothing is answered twice");
     }
 
     /// Which messages the hub forwards: those naming a session it proxies,

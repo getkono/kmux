@@ -174,23 +174,11 @@ pub(super) fn set_reply_request_id(msg: &mut ServerMessage, id: RequestId) {
     }
 }
 
-/// The peer's word for the session an answer names, if it names one.
+/// The peer's word for the session an answer without a request id names,
+/// if it names one (an `Error` names none).
 pub(super) fn reply_word(msg: &ServerMessage) -> Option<&str> {
-    use ServerMessage::*;
     match msg {
-        SessionClosed { word_id, .. }
-        | SessionRenamed { word_id, .. }
-        | TabCreated { word_id, .. }
-        | TabClosed { word_id, .. }
-        | PaneSplit { word_id, .. }
-        | ClientListResult { word_id, .. }
-        | ClientKicked { word_id, .. } => Some(word_id),
-        PaneCreated { pane_id, .. }
-        | PaneClosed { pane_id, .. }
-        | HistoryLines { pane_id, .. }
-        | InputLockGranted { pane_id }
-        | InputLockDenied { pane_id, .. }
-        | InputLockReleased { pane_id } => parse_pane_id(pane_id).map(|(word, _)| word),
+        ServerMessage::SessionRenamed { word_id, .. } => Some(word_id),
         _ => None,
     }
 }

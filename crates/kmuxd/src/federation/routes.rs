@@ -10,7 +10,7 @@
 //!   and keeps a [`Route`] from that id back to the client and the id it
 //!   used.
 //! - **An answer without one** — an `Error { request_id: None }` for input,
-//!   a `Signal`, a layout nudge or an `Attach`; the input-lock replies; and
+//!   a `Signal`, a layout nudge or an `Attach`; and
 //!   `SessionRenamed`. A peer handles one connection's messages in order and
 //!   answers each before it reads the next (`client_handler::session`), on
 //!   one ordered lane. So the answer belongs to the *oldest* message the peer

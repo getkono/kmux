@@ -470,11 +470,11 @@ mod tests {
         assert_eq!(ids, vec!["fedlocal/0".to_string()]);
     }
 
-    /// Close `fedlocal` from the hub while the peer answers with its ack and
-    /// its own `SessionClosed` event — the event first when `event_first`.
-    /// Returns the requester's answer and every `SessionClosed` word
+    /// Close `fedlocal` from the hub while the peer answers with `said` —
+    /// its ack and its own `SessionClosed` event, in some order, or the ack
+    /// alone. Returns the requester's answer and every `SessionClosed` word
     /// broadcast by then.
-    async fn close_federated(event_first: bool) -> (ServerMessage, Vec<String>) {
+    async fn close_federated(said: &[&str]) -> (ServerMessage, Vec<String>) {
         let app = Arc::new(fixture_app());
         let mut broadcasts = app.subscribe_vt_events();
         let (mut upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
@@ -506,12 +506,9 @@ mod tests {
             word_id: "fedremote".to_string(),
             exit_code: None,
         };
-        if event_first {
-            peer.send(event).unwrap();
-            peer.send(ack).unwrap();
-        } else {
-            peer.send(ack).unwrap();
-            peer.send(event).unwrap();
+        for frame in said {
+            let msg = if *frame == "ack" { &ack } else { &event };
+            peer.send(msg.clone()).unwrap();
         }
         let answer = tokio::time::timeout(WAIT, answers.recv())
             .await
@@ -528,11 +525,12 @@ mod tests {
 
     /// Closing a federated session from the hub tells every client once,
     /// whichever of the peer's ack and its own `SessionClosed` event lands
-    /// first — the second finds the session already gone (issue #208).
+    /// first — the second finds the session already gone (issue #208) — and
+    /// the ack alone closes it too (issue #227).
     #[tokio::test(start_paused = true)]
     async fn closing_a_federated_session_tells_every_client_once() {
-        for event_first in [false, true] {
-            let (answer, closed) = close_federated(event_first).await;
+        for said in [&["ack", "event"][..], &["event", "ack"], &["ack"]] {
+            let (answer, closed) = close_federated(said).await;
             assert!(
                 matches!(&answer, ServerMessage::SessionClosed { request_id: 40, word_id, .. }
                     if word_id == "fedlocal"),

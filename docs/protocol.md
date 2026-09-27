@@ -205,7 +205,7 @@ to `ClientMessage::federation`, variant by variant.
 | `SetLayoutRatios` | nothing; as `PaneSwap` | `LayoutUpdate` | yes | — | forwarded |
 | `ApplyLayoutScheme` | nothing; as `PaneSwap`; an `Unknown` scheme is ignored | `LayoutUpdate` | yes | — | forwarded |
 | `SetFocus` | nothing; as `PaneSwap` | `LayoutUpdate` | yes | — | forwarded |
-| `PtyInput` | nothing; `Error PaneNotFound` / `InputLocked` / `InternalError` (queue full) | — | no: bytes are written again | — | forwarded, unless another viewer holds the hub's input lock (`InputLocked`) |
+| `PtyInput` | nothing; `Error PaneNotFound` / `InputLocked` / `InternalError` (queue full) | — | no: bytes are written again | — | forwarded |
 | `PtyKeyBatch` | as `PtyInput` | — | no | — | forwarded, as `PtyInput` |
 | `PtyPaste` | as `PtyInput` | — | no | — | forwarded, as `PtyInput` |
 | `Resize` | nothing; `Error PaneNotFound` | if the pane's smallest-wins size changes: `Event PaneResized` (to everyone, and again to each viewer) and a `TerminalSnapshot` to each viewer | yes | — | aggregated: the peer is sent one smallest-wins size |
