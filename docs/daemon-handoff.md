@@ -301,7 +301,9 @@ cross-process tests in `crates/kmuxd/tests/handoff_e2e.rs`.
 ## Out of scope
 
 - **Listening sockets / the QUIC endpoint are not migrated.** Ephemeral ports
-  change (the token does not: the successor adopts it); connected clients
+  change, and the token does too when the successor falls back to restoring
+  from the checkpoint (one that adopts the live panes adopts the token);
+  connected clients
   reconnect via the existing logic
   (re-auth with the adopted token; a GUI reconnects automatically and, seeing a
   new daemon run — the successor's `AuthResult.daemon_instance` differs — re-attaches

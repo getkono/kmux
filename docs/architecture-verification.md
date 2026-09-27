@@ -82,7 +82,8 @@ run's by accident and a diff would land on the wrong screen, caught only by the
 next (1-in-32) digest. That is ruled out before any frame flows: a client
 resumes a pane from its seqno only when the link reached the same run
 (`AuthResult.daemon_instance`, `SessionManager::link_reached_same_daemon`), a
-federation hub likewise (`reattach_panes`), and a daemon answers a `last_seqno`
+federation hub always re-attaches for a snapshot (`reattach_panes`), and a
+daemon answers a `last_seqno`
 past the pane's current seqno with `SyncReset` (`compute_replay`). See
 [connection.md](connection.md#connectionid-and-session-resumption).
 
