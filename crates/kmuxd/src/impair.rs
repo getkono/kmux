@@ -164,26 +164,39 @@ mod tests {
         }
     }
 
+    /// Which knob sets activate impairment, and what they parse to as
+    /// `(delay_ms, jitter_ms, seed)`.
     #[test]
-    fn from_lookup_unset_is_none() {
-        assert!(ImpairConfig::from_lookup(lookup(&[])).is_none());
-    }
-
-    #[test]
-    fn from_lookup_zero_or_garbage_knobs_are_none() {
-        let vars = [("KMUX_NET_DELAY_MS", "0"), ("KMUX_NET_JITTER_MS", "lots")];
-        assert!(ImpairConfig::from_lookup(lookup(&vars)).is_none());
-    }
-
-    #[test]
-    fn from_lookup_parses_every_knob() {
-        let vars = [
-            ("KMUX_NET_DELAY_MS", " 40 "),
-            ("KMUX_NET_JITTER_MS", "15"),
-            ("KMUX_NET_SEED", "9"),
+    fn from_lookup_activates_only_on_a_nonzero_delay_or_jitter() {
+        type Vars = &'static [(&'static str, &'static str)];
+        type Parsed = Option<(u64, u64, Option<u64>)>;
+        let cases: [(&str, Vars, Parsed); 4] = [
+            ("unset", &[], None),
+            (
+                "zero or garbage knobs",
+                &[("KMUX_NET_DELAY_MS", "0"), ("KMUX_NET_JITTER_MS", "lots")],
+                None,
+            ),
+            (
+                "every knob, whitespace trimmed",
+                &[
+                    ("KMUX_NET_DELAY_MS", " 40 "),
+                    ("KMUX_NET_JITTER_MS", "15"),
+                    ("KMUX_NET_SEED", "9"),
+                ],
+                Some((40, 15, Some(9))),
+            ),
+            (
+                "jitter alone, no seed",
+                &[("KMUX_NET_JITTER_MS", "5")],
+                Some((0, 5, None)),
+            ),
         ];
-        let cfg = ImpairConfig::from_lookup(lookup(&vars)).expect("active");
-        assert_eq!((cfg.delay_ms, cfg.jitter_ms, cfg.seed), (40, 15, Some(9)));
+        for (label, vars, want) in cases {
+            let got = ImpairConfig::from_lookup(lookup(vars))
+                .map(|cfg| (cfg.delay_ms, cfg.jitter_ms, cfg.seed));
+            assert_eq!(got, want, "{label}");
+        }
     }
 
     /// `from_env`'s only job is reading the process environment, which a test
@@ -216,19 +229,20 @@ mod tests {
         );
     }
 
+    /// The published `SplitMix64` reference outputs for seed 0, so a seeded
+    /// impairment run replays the same delays on every build.
     #[test]
-    fn from_lookup_jitter_alone_activates_without_a_seed() {
-        let cfg =
-            ImpairConfig::from_lookup(lookup(&[("KMUX_NET_JITTER_MS", "5")])).expect("active");
-        assert_eq!((cfg.delay_ms, cfg.jitter_ms, cfg.seed), (0, 5, None));
-    }
-
-    #[test]
-    fn splitmix_is_deterministic() {
-        let mut a = SplitMix64::new(42);
-        let mut b = SplitMix64::new(42);
-        assert_eq!(a.next_u64(), b.next_u64());
-        assert_eq!(a.next_u64(), b.next_u64());
+    fn splitmix_matches_the_reference_sequence() {
+        let mut rng = SplitMix64::new(0);
+        let got: Vec<u64> = (0..3).map(|_| rng.next_u64()).collect();
+        assert_eq!(
+            got,
+            [
+                0xE220_A839_7B1D_CDAF,
+                0x6E78_9E6A_A1B9_65F4,
+                0x06C4_5D18_8009_454F
+            ]
+        );
     }
 
     #[test]

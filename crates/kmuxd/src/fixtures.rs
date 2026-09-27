@@ -16,7 +16,7 @@ use kmux_pty::session::{PtyReader, PtySession, PtyWriter};
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
 
-use crate::app::{AttachResult, ConnectionMetrics, ServerApp};
+use crate::app::{AttachResult, ClientSender, ConnectionMetrics, ServerApp};
 use crate::backend::{
     BackendConfig, BackendSize, CapabilityHandles, DEFAULT_SCROLLBACK, NullEventSink,
 };
@@ -85,6 +85,24 @@ pub(crate) async fn fixture_pty(script: &str) -> (PtySession, PtyReader, PtyWrit
 /// was sent.
 pub(crate) fn make_outbound() -> (OutboundTx, OutboundRx) {
     outbound::channel(OUTBOUND_CAPACITY, outbound::close_channel().0)
+}
+
+/// A streaming client on `data_tx`/`ctrl_tx`: not paused, diff mode, default
+/// capabilities and size. Override a field with struct-update syntax.
+pub(crate) fn make_client_sender(
+    data_tx: mpsc::Sender<ServerMessage>,
+    ctrl_tx: OutboundTx,
+) -> ClientSender {
+    ClientSender {
+        data_tx,
+        ctrl_tx,
+        force_full_snapshot: false,
+        paused: false,
+        pause_auto: false,
+        no_auto_pause: false,
+        capabilities: Default::default(),
+        size: Default::default(),
+    }
 }
 
 /// A blank in-process terminal of `rows` × `cols`, with no event consumer and

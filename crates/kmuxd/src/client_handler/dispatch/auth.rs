@@ -326,90 +326,76 @@ mod tests {
         ));
     }
 
-    /// With `mode = always`, a networked transport negotiates zstd: the auth
-    /// handler flips the shared toggle and advertises it in `AuthResult`.
+    /// Whether auth turns zstd on: the writer-side toggle and what
+    /// `AuthResult` advertises must agree. `always` compresses a networked
+    /// transport; the default `auto` leaves a local UDS client alone; and a
+    /// client that did not advertise the `frame.zstd` capability is never sent
+    /// compressed frames, whatever the policy.
     #[tokio::test]
-    async fn auth_enables_compression_when_policy_says_so() {
-        let app = Arc::new(fixture_app().with_compression(CompressionConfig {
+    async fn auth_negotiates_compression_from_policy_transport_and_capability() {
+        let always = CompressionConfig {
             mode: CompressionMode::Always,
             ..CompressionConfig::default()
-        }));
-        let (mut state, comp_out, mut ctrl_rx) =
-            fixture_client_state(Arc::clone(&app), TransportKind::TcpTls);
-        authenticate(&mut state).await;
+        };
+        let cases = [
+            (
+                "always over TCP+TLS",
+                always.clone(),
+                TransportKind::TcpTls,
+                true,
+                Some(Compression::Zstd),
+            ),
+            (
+                "auto over UDS",
+                CompressionConfig::default(),
+                TransportKind::Uds,
+                true,
+                None,
+            ),
+            (
+                "always, capability not advertised",
+                always,
+                TransportKind::TcpTls,
+                false,
+                None,
+            ),
+        ];
+        for (label, policy, transport, advertise, want) in cases {
+            let app = Arc::new(fixture_app().with_compression(policy));
+            let (mut state, comp_out, mut ctrl_rx) = fixture_client_state(app, transport);
+            let caps = if advertise {
+                protocol_capabilities()
+            } else {
+                Vec::new()
+            };
+            authenticate_with_capabilities(&mut state, caps).await;
 
-        assert!(
-            matches!(comp_out.compressor(), Compressor::Zstd { .. }),
-            "writer-side compression must be enabled"
-        );
-        // The challenge precedes the result on the control channel.
-        assert!(matches!(
-            ctrl_rx.try_recv().expect("AuthChallenge queued"),
-            ServerMessage::AuthChallenge { .. }
-        ));
-        let auth = ctrl_rx.try_recv().expect("AuthResult queued");
-        assert!(matches!(
-            auth,
-            ServerMessage::AuthResult {
-                success: true,
-                compression: Some(Compression::Zstd),
-                ..
+            let writer_on = matches!(comp_out.compressor(), Compressor::Zstd { .. });
+            assert_eq!(
+                writer_on,
+                want.is_some(),
+                "{label}: writer-side compression"
+            );
+            // The challenge precedes the result on the control channel.
+            assert!(
+                matches!(ctrl_rx.try_recv(), Ok(ServerMessage::AuthChallenge { .. })),
+                "{label}: AuthChallenge queued first"
+            );
+            match ctrl_rx.try_recv() {
+                Ok(ServerMessage::AuthResult {
+                    success: true,
+                    compression,
+                    negotiated_capabilities,
+                    ..
+                }) => {
+                    assert_eq!(compression, want, "{label}: advertised compression");
+                    if !advertise {
+                        assert!(negotiated_capabilities.is_empty(), "{label}");
+                    }
+                }
+                other => panic!("{label}: expected a successful AuthResult, got {other:?}"),
             }
-        ));
-    }
-
-    /// Under the default `auto` mode a local UDS client is left uncompressed.
-    #[tokio::test]
-    async fn auth_leaves_uds_uncompressed_under_auto() {
-        let app = Arc::new(fixture_app()); // default compression = auto
-        let (mut state, comp_out, mut ctrl_rx) =
-            fixture_client_state(Arc::clone(&app), TransportKind::Uds);
-        authenticate(&mut state).await;
-
-        assert!(
-            matches!(comp_out.compressor(), Compressor::Off),
-            "local UDS clients must stay uncompressed under auto"
-        );
-        // The challenge precedes the result on the control channel.
-        assert!(matches!(
-            ctrl_rx.try_recv().expect("AuthChallenge queued"),
-            ServerMessage::AuthChallenge { .. }
-        ));
-        let auth = ctrl_rx.try_recv().expect("AuthResult queued");
-        assert!(matches!(
-            auth,
-            ServerMessage::AuthResult {
-                success: true,
-                compression: None,
-                ..
-            }
-        ));
-    }
-
-    #[tokio::test]
-    async fn auth_does_not_use_unadvertised_compression_capability() {
-        let app = Arc::new(fixture_app().with_compression(CompressionConfig {
-            mode: CompressionMode::Always,
-            ..CompressionConfig::default()
-        }));
-        let (mut state, comp_out, mut ctrl_rx) =
-            fixture_client_state(Arc::clone(&app), TransportKind::TcpTls);
-        authenticate_with_capabilities(&mut state, Vec::new()).await;
-
-        assert!(matches!(comp_out.compressor(), Compressor::Off));
-        assert!(matches!(
-            ctrl_rx.try_recv(),
-            Ok(ServerMessage::AuthChallenge { .. })
-        ));
-        assert!(matches!(
-            ctrl_rx.try_recv(),
-            Ok(ServerMessage::AuthResult {
-                success: true,
-                compression: None,
-                negotiated_capabilities,
-                ..
-            }) if negotiated_capabilities.is_empty()
-        ));
+        }
     }
 
     #[tokio::test]

@@ -95,9 +95,27 @@ mod tests {
         }
     }
 
+    /// A capability is on for the pane only when every attached client has it;
+    /// with no client attached, none is. Yields `(kitty_graphics, kitty_keyboard)`.
     #[test]
-    fn intersect_empty_is_false_false() {
-        assert_eq!(intersect_for_atomics([].iter()), (false, false));
+    fn intersect_ands_each_flag_across_clients() {
+        let cases: [(&str, Vec<ClientCapabilities>, (bool, bool)); 4] = [
+            ("no clients", vec![], (false, false)),
+            ("one client", vec![caps(true, false, true)], (true, false)),
+            (
+                "one lacks keyboard",
+                vec![caps(true, true, true), caps(true, false, true)],
+                (true, false),
+            ),
+            (
+                "one lacks graphics",
+                vec![caps(true, true, true), caps(false, true, true)],
+                (false, true),
+            ),
+        ];
+        for (label, clients, want) in cases {
+            assert_eq!(intersect_for_atomics(clients.iter()), want, "{label}");
+        }
     }
 
     /// Spawned shells must carry the `KMUX` marker so the `kmux` entrypoint can
@@ -120,26 +138,6 @@ mod tests {
         let env = pane_spawn_env(&ClientCapabilities::default(), "eagle/3");
         assert_eq!(env.get("KMUX_PANE").map(String::as_str), Some("eagle/3"));
         assert_eq!(env.get("KMUX_SESSION").map(String::as_str), Some("eagle"));
-    }
-
-    #[test]
-    fn intersect_single_client_passes_through() {
-        let c = caps(true, false, true);
-        assert_eq!(intersect_for_atomics([c].iter()), (true, false));
-    }
-
-    #[test]
-    fn intersect_two_clients_ands_flags() {
-        let a = caps(true, true, true);
-        let b = caps(true, false, true);
-        assert_eq!(intersect_for_atomics([a, b].iter()), (true, false));
-    }
-
-    #[test]
-    fn intersect_one_without_graphics_disables_it() {
-        let a = caps(true, true, true);
-        let b = caps(false, true, true);
-        assert_eq!(intersect_for_atomics([a, b].iter()), (false, true));
     }
 
     #[test]

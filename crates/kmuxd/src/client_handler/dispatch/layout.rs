@@ -100,28 +100,58 @@ fn answer_layout_change(
 mod tests {
     use super::super::testing::*;
 
+    /// No `request_id` on the wire for the four layout nudges, so the error is
+    /// unaddressed — the shape `Resize` and `Signal` already use.
     #[tokio::test]
-    async fn pane_swap_in_an_unknown_session_errors_without_a_request_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::PaneSwap {
-            word_id: MISSING_WORD.to_string(),
-            tab_index: 0,
-            a: 0,
-            b: 1,
-        })
+    async fn layout_nudges_in_an_unknown_session_error_without_a_request_id() {
+        let word_id = || MISSING_WORD.to_string();
+        assert_all_rejected(vec![
+            session_not_found(
+                "PaneSwap",
+                None,
+                ClientMessage::PaneSwap {
+                    word_id: word_id(),
+                    tab_index: 0,
+                    a: 0,
+                    b: 1,
+                },
+            ),
+            session_not_found(
+                "SetLayoutRatios",
+                None,
+                ClientMessage::SetLayoutRatios {
+                    word_id: word_id(),
+                    tab_index: 0,
+                    path: vec![],
+                    ratios: vec![500, 500],
+                },
+            ),
+            session_not_found(
+                "ApplyLayoutScheme",
+                None,
+                ClientMessage::ApplyLayoutScheme {
+                    word_id: word_id(),
+                    tab_index: 0,
+                    scheme: LayoutScheme::EvenHorizontal,
+                },
+            ),
+            session_not_found(
+                "SetFocus",
+                None,
+                ClientMessage::SetFocus {
+                    word_id: word_id(),
+                    tab_index: 0,
+                    pane_index: 0,
+                },
+            ),
+        ])
         .await;
-        assert!(keep);
-        // No `request_id` on the wire for the four layout nudges, so the error
-        // is unaddressed — the shape `Resize` and `Signal` already use.
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, None);
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
     }
 
     /// The other half of the four layout arms: a call that succeeds must still
     /// broadcast the daemon's new authoritative tree and send the requester
     /// nothing. Without this, an arm that reported every outcome as an error
-    /// would pass the four not-found tests above.
+    /// would pass the not-found table above.
     #[tokio::test]
     async fn a_layout_change_that_succeeds_broadcasts_and_answers_nothing() {
         let (app, word, mut state, mut ctrl_rx) = app_with_one_session().await;
@@ -231,37 +261,6 @@ mod tests {
         assert_eq!(format!("{forwarded:?}"), format!("{expected:?}"));
     }
 
-    #[tokio::test]
-    async fn set_layout_ratios_in_an_unknown_session_errors_without_a_request_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::SetLayoutRatios {
-            word_id: MISSING_WORD.to_string(),
-            tab_index: 0,
-            path: vec![],
-            ratios: vec![500, 500],
-        })
-        .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, None);
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
-    }
-
-    #[tokio::test]
-    async fn apply_layout_scheme_in_an_unknown_session_errors_without_a_request_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::ApplyLayoutScheme {
-            word_id: MISSING_WORD.to_string(),
-            tab_index: 0,
-            scheme: LayoutScheme::EvenHorizontal,
-        })
-        .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, None);
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
-    }
-
     /// A scheme a newer client sent that this daemon does not know is ignored
     /// before anything is looked up or forwarded: not even the missing
     /// session is reported.
@@ -275,20 +274,5 @@ mod tests {
         .await;
         assert!(keep);
         assert!(msgs.is_empty(), "{msgs:?}");
-    }
-
-    #[tokio::test]
-    async fn set_focus_in_an_unknown_session_errors_without_a_request_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::SetFocus {
-            word_id: MISSING_WORD.to_string(),
-            tab_index: 0,
-            pane_index: 0,
-        })
-        .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, None);
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
     }
 }

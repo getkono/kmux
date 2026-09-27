@@ -692,17 +692,6 @@ token_file = "/etc/kmuxd/token"
     }
 
     #[test]
-    fn audience_ssh_only_parses() {
-        let toml = r#"
-[[listen]]
-kind = "tcp+tls"
-audience = "ssh-only"
-"#;
-        let cfg: ConfigFile = toml::from_str(toml).unwrap();
-        assert_eq!(cfg.listen[0].audience, Audience::SshOnly);
-    }
-
-    #[test]
     fn self_signed_tls_parses() {
         let toml = r#"
 [tls]
@@ -710,84 +699,6 @@ self_signed = true
 "#;
         let cfg: ConfigFile = toml::from_str(toml).unwrap();
         assert!(cfg.tls.self_signed);
-    }
-
-    #[test]
-    fn server_config_resolve_fails_with_no_enabled_listeners() {
-        let mut cfg = ConfigFile::default();
-        for l in &mut cfg.listen {
-            l.enabled = false;
-        }
-        assert!(ServerConfig::resolve(cfg).is_err());
-    }
-
-    #[test]
-    fn server_config_resolve_ok_without_tls_cert() {
-        // No cert/key configured → self-signed is the default, so resolve must
-        // succeed even with QUIC/TCP+TLS listeners enabled (issue #100).
-        let cfg = ConfigFile {
-            tls: TlsConfig::default(),
-            listen: vec![ListenConfig {
-                kind: ListenKind::Quic,
-                bind: "::".into(),
-                port: 0,
-                enabled: true,
-                path: "auto".into(),
-                audience: Audience::Any,
-                priority: 0,
-            }],
-            ..ConfigFile::default()
-        };
-        ServerConfig::resolve(cfg).unwrap();
-    }
-
-    #[test]
-    fn server_config_resolve_fails_with_half_set_cert_pair() {
-        // A cert without its key (or vice versa) is a misconfiguration.
-        let cert_only = ConfigFile {
-            tls: TlsConfig {
-                cert: Some("/etc/kmuxd/cert.pem".into()),
-                key: None,
-                ..TlsConfig::default()
-            },
-            ..ConfigFile::default()
-        };
-        assert!(ServerConfig::resolve(cert_only).is_err());
-
-        let key_only = ConfigFile {
-            tls: TlsConfig {
-                cert: None,
-                key: Some("/etc/kmuxd/key.pem".into()),
-                ..TlsConfig::default()
-            },
-            ..ConfigFile::default()
-        };
-        assert!(ServerConfig::resolve(key_only).is_err());
-    }
-
-    #[test]
-    fn server_config_resolve_accepts_deprecated_self_signed() {
-        // The deprecated `self_signed` knob is ignored but must still resolve
-        // cleanly so legacy config files keep working (issue #100).
-        let cfg = ConfigFile {
-            tls: TlsConfig {
-                self_signed: true,
-                ..TlsConfig::default()
-            },
-            ..ConfigFile::default()
-        };
-        ServerConfig::resolve(cfg).unwrap();
-    }
-
-    #[test]
-    fn write_and_read_default_config() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kmuxd.toml");
-        write_default_config(&path).unwrap();
-        assert!(path.exists());
-        let content = std::fs::read_to_string(&path).unwrap();
-        let cfg: ConfigFile = toml::from_str(&content).unwrap();
-        assert_eq!(cfg.version, 1);
     }
 
     /// The first-run template pins nothing: every line is blank or a comment,
@@ -930,18 +841,6 @@ port = 8443
     }
 
     #[test]
-    fn written_default_config_has_no_port_field() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("kmuxd.toml");
-        write_default_config(&path).unwrap();
-        let content = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            !content.contains("port"),
-            "default config must not contain a port field"
-        );
-    }
-
-    #[test]
     fn compression_defaults_are_auto_level3() {
         let cfg = CompressionConfig::default();
         assert_eq!(cfg.mode, CompressionMode::Auto);
@@ -985,17 +884,73 @@ min_size = 128
         assert!(!never.enabled_for(TransportKind::Quic));
     }
 
+    /// The written first-run config parses, and names neither `port` (skipped,
+    /// so `deny_unknown_fields` would reject it) nor the deprecated
+    /// `self_signed` (issue #100).
     #[test]
-    fn written_default_config_has_no_self_signed_field() {
-        // `self_signed` is deprecated and `skip_serializing`, so freshly written
-        // configs must not mention it (issue #100).
+    fn written_default_config_parses_without_retired_fields() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("kmuxd.toml");
         write_default_config(&path).unwrap();
         let content = std::fs::read_to_string(&path).unwrap();
-        assert!(
-            !content.contains("self_signed"),
-            "default config must not contain a self_signed field"
-        );
+        let cfg: ConfigFile = toml::from_str(&content).unwrap();
+        assert_eq!(cfg.version, 1);
+        for retired in ["port", "self_signed"] {
+            assert!(
+                !content.contains(retired),
+                "default config must not contain a {retired} field"
+            );
+        }
+    }
+
+    /// Which configs `ServerConfig::resolve` accepts. No cert/key means
+    /// self-signed, so TLS listeners resolve without one; a half-set pair is a
+    /// misconfiguration; the deprecated `self_signed` knob is ignored but must
+    /// still resolve so legacy files keep working (issue #100).
+    #[test]
+    fn server_config_resolve_accepts_only_coherent_configs() {
+        let tls = |cert: Option<&str>, key: Option<&str>, self_signed: bool| ConfigFile {
+            tls: TlsConfig {
+                cert: cert.map(Into::into),
+                key: key.map(Into::into),
+                self_signed,
+            },
+            ..ConfigFile::default()
+        };
+        let mut no_listeners = ConfigFile::default();
+        for l in &mut no_listeners.listen {
+            l.enabled = false;
+        }
+        let quic_without_cert = ConfigFile {
+            tls: TlsConfig::default(),
+            listen: vec![ListenConfig {
+                kind: ListenKind::Quic,
+                bind: "::".into(),
+                port: 0,
+                enabled: true,
+                path: "auto".into(),
+                audience: Audience::Any,
+                priority: 0,
+            }],
+            ..ConfigFile::default()
+        };
+        let cases = [
+            ("no enabled listeners", no_listeners, false),
+            ("QUIC without a TLS cert", quic_without_cert, true),
+            (
+                "cert without key",
+                tls(Some("/etc/kmuxd/cert.pem"), None, false),
+                false,
+            ),
+            (
+                "key without cert",
+                tls(None, Some("/etc/kmuxd/key.pem"), false),
+                false,
+            ),
+            ("deprecated self_signed", tls(None, None, true), true),
+        ];
+        for (label, cfg, ok) in cases {
+            assert_eq!(ServerConfig::resolve(cfg).is_ok(), ok, "{label}");
+        }
     }
 }

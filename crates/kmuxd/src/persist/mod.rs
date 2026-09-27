@@ -246,7 +246,7 @@ mod tests {
         let decoded: PersistedDaemonState =
             postcard::from_bytes(&encoded).expect("deserialization failed");
 
-        assert_eq!(decoded.version, original.version);
+        assert_eq!(decoded.version, STATE_VERSION);
         assert_eq!(
             decoded.session_index_counter,
             original.session_index_counter
@@ -273,14 +273,6 @@ mod tests {
         assert_eq!(pane.grid.cells.len(), 24 * 80);
         assert_eq!(pane.scrollback_lines.len(), 1);
         assert_eq!(pane.cwd, "/home/user/project");
-    }
-
-    #[test]
-    fn version_field_preserved() {
-        let state = sample_state();
-        let encoded = postcard::to_allocvec(&state).unwrap();
-        let decoded: PersistedDaemonState = postcard::from_bytes(&encoded).unwrap();
-        assert_eq!(decoded.version, STATE_VERSION);
     }
 
     #[test]

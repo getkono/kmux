@@ -255,17 +255,16 @@ mod tests {
 
     #[tokio::test]
     async fn fetch_history_for_an_unknown_pane_errors_with_the_request_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::FetchHistory {
-            request_id: 14,
-            pane_id: MISSING_PANE.to_string(),
-            start_index: 0,
-            count: 10,
-        })
+        assert_all_rejected(vec![pane_not_found(
+            "FetchHistory",
+            Some(14),
+            ClientMessage::FetchHistory {
+                request_id: 14,
+                pane_id: MISSING_PANE.to_string(),
+                start_index: 0,
+                count: 10,
+            },
+        )])
         .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, Some(14));
-        assert_eq!(code, ErrorCode::PaneNotFound);
-        assert_eq!(message, format!("pane not found: {MISSING_PANE}"));
     }
 }

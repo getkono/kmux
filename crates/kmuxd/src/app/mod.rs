@@ -1250,7 +1250,44 @@ mod tests {
     use kmux_protocol::TransportKind;
     use kmux_protocol::messages::ResumeFrom;
 
-    use super::{ClientIdentity, ConnectionMetrics, KickOutcome, ServerApp};
+    use super::{ClientIdentity, ConnectionMetrics, KickOutcome, RegisteredClient, ServerApp};
+
+    /// Register a fresh connection over `transport` as `identity`, with
+    /// metrics nothing inspects.
+    async fn register(
+        app: &ServerApp,
+        transport: TransportKind,
+        identity: ClientIdentity,
+    ) -> RegisteredClient {
+        app.register_client(
+            transport,
+            Arc::new(ConnectionMetrics::new()),
+            None,
+            identity,
+        )
+        .await
+    }
+
+    /// Resume `from`'s connection over `transport` as `identity`, naming no
+    /// daemon run.
+    async fn resume(
+        app: &ServerApp,
+        transport: TransportKind,
+        from: &RegisteredClient,
+        identity: ClientIdentity,
+    ) -> RegisteredClient {
+        let from = ResumeFrom {
+            connection_id: from.connection_id,
+            instance: None,
+        };
+        app.register_client(
+            transport,
+            Arc::new(ConnectionMetrics::new()),
+            Some(from),
+            identity,
+        )
+        .await
+    }
 
     /// `notify_pane_attention` rejects an unknown pane (issue #169) rather than
     /// broadcasting a bogus attention to clients.
@@ -1276,22 +1313,13 @@ mod tests {
         // Initially 0.
         assert_eq!(*rx.borrow(), 0);
 
-        let m1 = Arc::new(ConnectionMetrics::new());
-        let c1 = app
-            .register_client(
-                TransportKind::Uds,
-                Arc::clone(&m1),
-                None,
-                ClientIdentity::default(),
-            )
+        let c1 = register(&app, TransportKind::Uds, ClientIdentity::default())
             .await
             .connection_id;
         rx.changed().await.unwrap();
         assert_eq!(*rx.borrow(), 1);
 
-        let m2 = Arc::new(ConnectionMetrics::new());
-        let c2 = app
-            .register_client(TransportKind::Tcp, m2, None, ClientIdentity::default())
+        let c2 = register(&app, TransportKind::Tcp, ClientIdentity::default())
             .await
             .connection_id;
         rx.changed().await.unwrap();
@@ -1304,6 +1332,9 @@ mod tests {
         assert!(app.release_connection(c2, 0).await);
         rx.changed().await.unwrap();
         assert_eq!(*rx.borrow(), 0);
+        // A released connection is gone from the snapshot too.
+        let snap = app.snapshot_sessions_with_connections().await;
+        assert!(snap.unattached.is_empty());
     }
 
     #[test]
@@ -1403,6 +1434,7 @@ mod tests {
         let snap = app.snapshot_sessions_with_connections().await;
         assert_eq!(snap.unattached.len(), 1);
         assert_eq!(snap.unattached[0].bytes_in, 50);
+        assert_eq!(snap.unattached[0].transport, "UDS");
     }
 
     #[tokio::test]
@@ -1453,34 +1485,6 @@ mod tests {
         assert_eq!(snap.unattached[0].bytes_in, 100);
     }
 
-    #[tokio::test]
-    async fn unregister_removes_connection() {
-        let app = crate::fixtures::fixture_app();
-        let metrics = Arc::new(ConnectionMetrics::new());
-        let conn_id = app
-            .register_client(TransportKind::Uds, metrics, None, ClientIdentity::default())
-            .await
-            .connection_id;
-        assert!(app.release_connection(conn_id, 0).await);
-
-        // After unregister, snapshot_sessions_with_connections returns no unattached.
-        let snap = app.snapshot_sessions_with_connections().await;
-        assert!(snap.unattached.is_empty());
-    }
-
-    #[tokio::test]
-    async fn snapshot_reports_correct_transport_label() {
-        let app = crate::fixtures::fixture_app();
-        let metrics = Arc::new(ConnectionMetrics::new());
-        let _ = app
-            .register_client(TransportKind::Uds, metrics, None, ClientIdentity::default())
-            .await;
-
-        let snap = app.snapshot_sessions_with_connections().await;
-        assert_eq!(snap.unattached.len(), 1);
-        assert_eq!(snap.unattached[0].transport, "UDS");
-    }
-
     // ─── Size negotiation unit tests ──────────────────────────────────────────
 
     use kmux_protocol::messages::{ClientCapabilities, ClientId, TermSize};
@@ -1491,33 +1495,37 @@ mod tests {
     use super::{AttachParams, AttachResult, SessionState};
     use crate::app::ClientSender;
 
-    fn make_client(rows: u16, cols: u16) -> (ClientId, ClientSender) {
-        let (data_tx, _data_rx) = mpsc::channel::<kmux_protocol::messages::ServerMessage>(16);
-        let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
+    /// A streaming client of `rows` × `cols`, with the receiving ends of its
+    /// data and control channels.
+    fn make_client(
+        rows: u16,
+        cols: u16,
+    ) -> (
+        ClientId,
+        ClientSender,
+        mpsc::Receiver<kmux_protocol::messages::ServerMessage>,
+        crate::outbound::OutboundRx,
+    ) {
+        let (data_tx, data_rx) = mpsc::channel(16);
+        let (ctrl_tx, ctrl_rx) = crate::fixtures::make_outbound();
         let id = ClientId(rows as u64 * 1000 + cols as u64);
         let sender = ClientSender {
-            data_tx,
-            ctrl_tx,
-            force_full_snapshot: false,
-            paused: false,
-            pause_auto: false,
-            no_auto_pause: false,
-            capabilities: ClientCapabilities::default(),
             size: TermSize {
                 rows,
                 cols,
                 pixel_width: 0,
                 pixel_height: 0,
             },
+            ..crate::fixtures::make_client_sender(data_tx, ctrl_tx)
         };
-        (id, sender)
+        (id, sender, data_rx, ctrl_rx)
     }
 
     #[tokio::test]
     async fn effective_size_min_wins() {
         let relay = fixture_relay(24, 80);
-        let (id_a, sender_a) = make_client(24, 80);
-        let (id_b, sender_b) = make_client(40, 120);
+        let (id_a, sender_a, ..) = make_client(24, 80);
+        let (id_b, sender_b, ..) = make_client(40, 120);
         relay.clients.lock().unwrap().insert(id_a, sender_a);
         relay.clients.lock().unwrap().insert(id_b, sender_b);
 
@@ -1535,7 +1543,7 @@ mod tests {
     #[tokio::test]
     async fn apply_effective_size_returns_none_when_unchanged() {
         let mut relay = fixture_relay(24, 80);
-        let (id, sender) = make_client(24, 80);
+        let (id, sender, ..) = make_client(24, 80);
         relay.clients.lock().unwrap().insert(id, sender);
         // effective == current → no resize
         assert!(relay.apply_effective_size().is_none());
@@ -1544,7 +1552,7 @@ mod tests {
     #[tokio::test]
     async fn apply_effective_size_resizes_emulator_when_changed() {
         let mut relay = fixture_relay(24, 80);
-        let (id, sender) = make_client(40, 120);
+        let (id, sender, ..) = make_client(40, 120);
         relay.clients.lock().unwrap().insert(id, sender);
         // effective (40×120) differs from relay.size (24×80)
         let new_size = relay.apply_effective_size().expect("should resize");
@@ -1557,8 +1565,8 @@ mod tests {
     #[tokio::test]
     async fn detach_keeps_last_effective_size() {
         let mut relay = fixture_relay(80, 200);
-        let (id_a, sender_a) = make_client(24, 80);
-        let (id_b, sender_b) = make_client(40, 120);
+        let (id_a, sender_a, ..) = make_client(24, 80);
+        let (id_b, sender_b, ..) = make_client(40, 120);
         relay.clients.lock().unwrap().insert(id_a, sender_a);
         relay.clients.lock().unwrap().insert(id_b, sender_b);
         // Effective = 24×80; apply it.
@@ -1581,27 +1589,9 @@ mod tests {
         };
 
         let mut relay = fixture_relay(24, 80);
-        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
-        let id = ClientId(1);
-        relay.clients.lock().unwrap().insert(
-            id,
-            ClientSender {
-                data_tx: data_tx.clone(),
-                ctrl_tx,
-                force_full_snapshot: false,
-                paused: false,
-                pause_auto: false,
-                no_auto_pause: false,
-                capabilities: ClientCapabilities::default(),
-                size: TermSize {
-                    rows: 40,
-                    cols: 120,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                },
-            },
-        );
+        let (id, sender, mut data_rx, mut ctrl_rx) = make_client(40, 120);
+        let data_tx = sender.data_tx.clone();
+        relay.clients.lock().unwrap().insert(id, sender);
 
         let new_size = relay.apply_effective_size().expect("size must change");
         relay.broadcast_resize("pane-1", new_size, 42);
@@ -1662,9 +1652,9 @@ mod tests {
         // Pausing must never reflow the PTY for other clients: a paused client
         // keeps constraining the smallest-wins effective size (issue #68).
         let relay = fixture_relay(80, 200);
-        let (id_paused, mut sender_paused) = make_client(24, 80);
+        let (id_paused, mut sender_paused, ..) = make_client(24, 80);
         sender_paused.paused = true;
-        let (id_active, sender_active) = make_client(40, 120);
+        let (id_active, sender_active, ..) = make_client(40, 120);
         relay
             .clients
             .lock()
@@ -1683,30 +1673,11 @@ mod tests {
 
     #[tokio::test]
     async fn broadcast_resize_skips_paused_client() {
-        use kmux_protocol::messages::ServerMessage;
-
         let mut relay = fixture_relay(24, 80);
-        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
-        relay.clients.lock().unwrap().insert(
-            ClientId(1),
-            ClientSender {
-                data_tx,
-                ctrl_tx,
-                force_full_snapshot: false,
-                paused: true,
-                pause_auto: false,
-                no_auto_pause: false,
-                // Larger than relay.size so apply_effective_size would change.
-                capabilities: ClientCapabilities::default(),
-                size: TermSize {
-                    rows: 40,
-                    cols: 120,
-                    pixel_width: 0,
-                    pixel_height: 0,
-                },
-            },
-        );
+        // Larger than relay.size so apply_effective_size would change.
+        let (id, mut sender, mut data_rx, mut ctrl_rx) = make_client(40, 120);
+        sender.paused = true;
+        relay.clients.lock().unwrap().insert(id, sender);
 
         let new_size = relay.apply_effective_size().expect("size must change");
         relay.broadcast_resize("pane-1", new_size, 42);
@@ -1745,14 +1716,19 @@ mod tests {
         app
     }
 
+    /// Attach parameters for `client_id` on `eagle/0` at 24 × 80, with the
+    /// receiving ends of the data and control channels they carry.
     fn attach_params(
         client_id: ClientId,
         last_seqno: Option<kmux_protocol::messages::SequenceNo>,
-    ) -> AttachParams {
-        use kmux_protocol::messages::ServerMessage;
-        let (data_tx, _rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, _crx) = crate::fixtures::make_outbound();
-        AttachParams {
+    ) -> (
+        AttachParams,
+        mpsc::Receiver<kmux_protocol::messages::ServerMessage>,
+        crate::outbound::OutboundRx,
+    ) {
+        let (data_tx, data_rx) = mpsc::channel(16);
+        let (ctrl_tx, ctrl_rx) = crate::fixtures::make_outbound();
+        let params = AttachParams {
             pane_id: "eagle/0".to_string(),
             client_id,
             last_seqno,
@@ -1765,7 +1741,8 @@ mod tests {
             data_tx,
             ctrl_tx,
             capabilities: ClientCapabilities::default(),
-        }
+        };
+        (params, data_rx, ctrl_rx)
     }
 
     // ─── Resume (issue #208) ──────────────────────────────────────────────────
@@ -1780,7 +1757,7 @@ mod tests {
     /// A channel's state after it registered (or resumed) as `reg`.
     fn channel_state(
         app: &Arc<ServerApp>,
-        reg: &super::RegisteredClient,
+        reg: &RegisteredClient,
     ) -> crate::client_handler::SharedClientState {
         let (mut state, _comp, _rx) =
             crate::fixtures::fixture_client_state(Arc::clone(app), TransportKind::Tcp);
@@ -1798,7 +1775,7 @@ mod tests {
     ) -> AttachResult {
         let params = AttachParams {
             ctrl_tx: state.ctrl_tx.clone(),
-            ..attach_params(state.client_id.unwrap(), last_seqno)
+            ..attach_params(state.client_id.unwrap(), last_seqno).0
         };
         app.attach(params).await.unwrap()
     }
@@ -1823,28 +1800,11 @@ mod tests {
     #[tokio::test]
     async fn a_superseded_channel_ending_leaves_the_resumed_connection_intact() {
         let app = Arc::new(app_with_one_pane("eagle").await);
-        let first = app
-            .register_client(
-                TransportKind::Tcp,
-                Arc::new(ConnectionMetrics::new()),
-                None,
-                machine("m-a"),
-            )
-            .await;
+        let first = register(&app, TransportKind::Tcp, machine("m-a")).await;
         let old = channel_state(&app, &first);
         attach_through(&app, &old, None).await;
 
-        let resumed = app
-            .register_client(
-                TransportKind::Quic,
-                Arc::new(ConnectionMetrics::new()),
-                Some(ResumeFrom {
-                    connection_id: first.connection_id,
-                    instance: None,
-                }),
-                machine("m-a"),
-            )
-            .await;
+        let resumed = resume(&app, TransportKind::Quic, &first, machine("m-a")).await;
         assert_eq!(first.resume, super::Resume::NotRequested);
         assert_eq!(
             (
@@ -1890,27 +1850,10 @@ mod tests {
     #[tokio::test]
     async fn a_superseded_channel_ending_releases_only_its_own_attachments() {
         let app = Arc::new(app_with_one_pane("eagle").await);
-        let first = app
-            .register_client(
-                TransportKind::Tcp,
-                Arc::new(ConnectionMetrics::new()),
-                None,
-                machine("m-a"),
-            )
-            .await;
+        let first = register(&app, TransportKind::Tcp, machine("m-a")).await;
         let old = channel_state(&app, &first);
         attach_through(&app, &old, None).await;
-        let resumed = app
-            .register_client(
-                TransportKind::Quic,
-                Arc::new(ConnectionMetrics::new()),
-                Some(ResumeFrom {
-                    connection_id: first.connection_id,
-                    instance: None,
-                }),
-                machine("m-a"),
-            )
-            .await;
+        let resumed = resume(&app, TransportKind::Quic, &first, machine("m-a")).await;
 
         crate::client_handler::release_channel(&old).await;
         assert!(eagle_attachment(&app, first.client_id).await.is_none());
@@ -1926,25 +1869,8 @@ mod tests {
     #[tokio::test]
     async fn resume_with_another_machines_identity_registers_a_fresh_connection() {
         let app = crate::fixtures::fixture_app();
-        let first = app
-            .register_client(
-                TransportKind::Tcp,
-                Arc::new(ConnectionMetrics::new()),
-                None,
-                machine("m-a"),
-            )
-            .await;
-        let other = app
-            .register_client(
-                TransportKind::Tcp,
-                Arc::new(ConnectionMetrics::new()),
-                Some(ResumeFrom {
-                    connection_id: first.connection_id,
-                    instance: None,
-                }),
-                machine("m-b"),
-            )
-            .await;
+        let first = register(&app, TransportKind::Tcp, machine("m-a")).await;
+        let other = resume(&app, TransportKind::Tcp, &first, machine("m-b")).await;
         assert_ne!(other.client_id, first.client_id);
         assert_ne!(other.connection_id, first.connection_id);
         assert_eq!(other.generation, 0);
@@ -1966,14 +1892,7 @@ mod tests {
         use kmux_protocol::messages::DaemonInstanceId;
 
         let app = crate::fixtures::fixture_app();
-        let first = app
-            .register_client(
-                TransportKind::Tcp,
-                Arc::new(ConnectionMetrics::new()),
-                None,
-                machine("m-a"),
-            )
-            .await;
+        let first = register(&app, TransportKind::Tcp, machine("m-a")).await;
         let stale = app
             .register_client(
                 TransportKind::Quic,
@@ -2018,25 +1937,8 @@ mod tests {
     #[tokio::test]
     async fn release_connection_honours_only_the_current_generation() {
         let app = crate::fixtures::fixture_app();
-        let first = app
-            .register_client(
-                TransportKind::Tcp,
-                Arc::new(ConnectionMetrics::new()),
-                None,
-                machine("m-a"),
-            )
-            .await;
-        let resumed = app
-            .register_client(
-                TransportKind::Tcp,
-                Arc::new(ConnectionMetrics::new()),
-                Some(ResumeFrom {
-                    connection_id: first.connection_id,
-                    instance: None,
-                }),
-                machine("m-a"),
-            )
-            .await;
+        let first = register(&app, TransportKind::Tcp, machine("m-a")).await;
+        let resumed = resume(&app, TransportKind::Tcp, &first, machine("m-a")).await;
         assert!(!app.release_connection(first.connection_id, 0).await);
         assert!(app.release_connection(first.connection_id, 1).await);
         assert!(
@@ -2045,17 +1947,7 @@ mod tests {
         );
 
         // A resume after the registration is released is a fresh connection.
-        let late = app
-            .register_client(
-                TransportKind::Tcp,
-                Arc::new(ConnectionMetrics::new()),
-                Some(ResumeFrom {
-                    connection_id: first.connection_id,
-                    instance: None,
-                }),
-                machine("m-a"),
-            )
-            .await;
+        let late = resume(&app, TransportKind::Tcp, &first, machine("m-a")).await;
         assert_eq!(late.resume, super::Resume::UnknownConnection);
         assert_ne!(late.connection_id, first.connection_id);
     }
@@ -2099,14 +1991,7 @@ mod tests {
         use kmux_protocol::messages::{SequenceNo, ServerMessage};
 
         let app = Arc::new(app_with_one_pane("eagle").await);
-        let first = app
-            .register_client(
-                TransportKind::Tcp,
-                Arc::new(ConnectionMetrics::new()),
-                None,
-                machine("m-a"),
-            )
-            .await;
+        let first = register(&app, TransportKind::Tcp, machine("m-a")).await;
         attach_through(&app, &channel_state(&app, &first), None).await;
         // The pane advances past what the client applied (seqno 6)…
         let sessions = app.sessions.read().await;
@@ -2115,17 +2000,7 @@ mod tests {
             .seqno_counter
             .store(11, Ordering::Relaxed);
         drop(sessions);
-        let resumed = app
-            .register_client(
-                TransportKind::Quic,
-                Arc::new(ConnectionMetrics::new()),
-                Some(ResumeFrom {
-                    connection_id: first.connection_id,
-                    instance: None,
-                }),
-                machine("m-a"),
-            )
-            .await;
+        let resumed = resume(&app, TransportKind::Quic, &first, machine("m-a")).await;
         let new = channel_state(&app, &resumed);
 
         // …and the resumed channel is sent exactly the missing diffs.
@@ -2166,7 +2041,7 @@ mod tests {
     async fn set_paused_marks_client_across_panes() {
         let app = app_with_one_pane("eagle").await;
         let client_id = ClientId(1);
-        app.attach(attach_params(client_id, None)).await.unwrap();
+        app.attach(attach_params(client_id, None).0).await.unwrap();
 
         app.set_paused(client_id, true, true).await;
         {
@@ -2192,7 +2067,7 @@ mod tests {
     async fn auto_pause_exempt_pane_keeps_streaming_until_manual() {
         let app = app_with_one_pane("eagle").await;
         let client_id = ClientId(1);
-        app.attach(attach_params(client_id, None)).await.unwrap();
+        app.attach(attach_params(client_id, None).0).await.unwrap();
         app.set_pane_no_auto_pause(client_id, "eagle/0", true).await;
 
         // Auto-pause: an exempt pane is NOT output-paused.
@@ -2226,12 +2101,12 @@ mod tests {
         let app = app_with_one_pane("eagle").await;
         let client_id = ClientId(1);
 
-        app.attach(attach_params(client_id, None)).await.unwrap();
+        app.attach(attach_params(client_id, None).0).await.unwrap();
         app.set_snapshot_mode(client_id, true).await;
         app.set_paused(client_id, true, false).await;
 
         // Resume: client re-attaches the pane with its last seqno.
-        app.attach(attach_params(client_id, Some(SequenceNo(1))))
+        app.attach(attach_params(client_id, Some(SequenceNo(1))).0)
             .await
             .unwrap();
 
@@ -2281,53 +2156,21 @@ mod tests {
         use kmux_protocol::messages::ServerMessage;
         let app = app_with_one_pane("eagle").await;
 
-        let a = app
-            .register_client(
-                TransportKind::Uds,
-                Arc::new(ConnectionMetrics::new()),
-                None,
-                ClientIdentity {
-                    machine_id: "m-a".into(),
-                    hostname: "boxa".into(),
-                    username: "alice".into(),
-                    ..Default::default()
-                },
-            )
-            .await;
-        let b = app
-            .register_client(
-                TransportKind::Tcp,
-                Arc::new(ConnectionMetrics::new()),
-                None,
-                ClientIdentity {
-                    machine_id: "m-b".into(),
-                    hostname: "boxb".into(),
-                    username: "bob".into(),
-                    ..Default::default()
-                },
-            )
-            .await;
+        let identity = |machine_id: &str, hostname: &str, username: &str| ClientIdentity {
+            machine_id: machine_id.into(),
+            hostname: hostname.into(),
+            username: username.into(),
+            ..Default::default()
+        };
+        let a = register(&app, TransportKind::Uds, identity("m-a", "boxa", "alice")).await;
+        let b = register(&app, TransportKind::Tcp, identity("m-b", "boxb", "bob")).await;
 
         // Attach a (channels dropped) and b (retain ctrl_rx to observe the kick).
-        app.attach(attach_params(a.client_id, None)).await.unwrap();
-        let (data_tx, _drx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, mut ctrl_rx_b) = crate::fixtures::make_outbound();
-        app.attach(AttachParams {
-            pane_id: "eagle/0".to_string(),
-            client_id: b.client_id,
-            last_seqno: None,
-            size: TermSize {
-                rows: 24,
-                cols: 80,
-                pixel_width: 0,
-                pixel_height: 0,
-            },
-            data_tx,
-            ctrl_tx,
-            capabilities: ClientCapabilities::default(),
-        })
-        .await
-        .unwrap();
+        app.attach(attach_params(a.client_id, None).0)
+            .await
+            .unwrap();
+        let (params_b, _data_rx_b, mut ctrl_rx_b) = attach_params(b.client_id, None);
+        app.attach(params_b).await.unwrap();
 
         // List shows both connections; the requester is marked self.
         let clients = app

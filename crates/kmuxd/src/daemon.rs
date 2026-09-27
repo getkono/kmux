@@ -625,7 +625,6 @@ mod tests {
         pid_file_pid, probe_is_live, serve_control_connection, serve_control_socket,
         socket_is_live,
     };
-    use crate::app::ServerApp;
     use crate::config::{Audience, ListenConfig, ListenKind};
     use crate::fixtures::{FIXTURE_TOKEN, fixture_app};
     use kmux_protocol::control_rpc::{
@@ -785,6 +784,37 @@ mod tests {
         );
     }
 
+    /// Control-socket parameters for a fresh daemon with no sessions, its
+    /// socket and pid file under `dir`.
+    fn fixture_socket_params(dir: &Path) -> ControlSocketParams {
+        ControlSocketParams {
+            socket_path: dir.join("ctrl.sock"),
+            pid_path: dir.join("daemon.pid"),
+            quic_port: 0,
+            tcp_port: 0,
+            token: FIXTURE_TOKEN.to_string(),
+            start_time: Instant::now(),
+            app: Arc::new(fixture_app()),
+            shutdown: Arc::new(Notify::new()),
+            restart: Arc::new(Notify::new()),
+            handoff: Arc::default(),
+            listeners: vec![],
+            public_host: None,
+            handoff_successor: false,
+        }
+    }
+
+    /// Return once the control socket at `path` accepts a connection.
+    async fn wait_until_served(path: &Path) {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while UnixStream::connect(path).await.is_err() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the control socket binds");
+    }
+
     /// Send one control `command` to the socket at `path` and read the reply.
     async fn ask(path: &Path, command: &str) -> String {
         let stream = UnixStream::connect(path).await.unwrap();
@@ -809,32 +839,16 @@ mod tests {
         use kmux_protocol::control_rpc::{HandoffReport, RestartResponse};
 
         let tmp = tempfile::tempdir().unwrap();
-        let socket_path = tmp.path().join("ctrl.sock");
         let restart = Arc::new(Notify::new());
         let handoff = Arc::new(crate::handoff::HandoffStatus::default());
         let params = ControlSocketParams {
-            socket_path: socket_path.clone(),
-            pid_path: tmp.path().join("daemon.pid"),
-            quic_port: 0,
-            tcp_port: 0,
-            token: "test-token".to_string(),
-            start_time: Instant::now(),
-            app: Arc::new(ServerApp::new("test-token".to_string())),
-            shutdown: Arc::new(Notify::new()),
             restart: Arc::clone(&restart),
             handoff: Arc::clone(&handoff),
-            listeners: vec![],
-            public_host: None,
-            handoff_successor: false,
+            ..fixture_socket_params(tmp.path())
         };
+        let socket_path = params.socket_path.clone();
         let served = tokio::spawn(serve_control_socket(params, std::future::pending()));
-        tokio::time::timeout(Duration::from_secs(5), async {
-            while UnixStream::connect(&socket_path).await.is_err() {
-                tokio::time::sleep(Duration::from_millis(10)).await;
-            }
-        })
-        .await
-        .expect("the control socket binds");
+        wait_until_served(&socket_path).await;
 
         let woken = restart.notified();
         let first: RestartResponse =
@@ -861,27 +875,12 @@ mod tests {
     #[tokio::test]
     async fn sessions_command_roundtrips_empty_response() {
         let tmp = tempfile::tempdir().unwrap();
-        let socket_path = tmp.path().join("ctrl.sock");
-        let pid_path = tmp.path().join("daemon.pid");
-
-        let app = Arc::new(ServerApp::new("test-token".to_string()));
         let shutdown = Arc::new(Notify::new());
-
         let params = ControlSocketParams {
-            socket_path: socket_path.clone(),
-            pid_path: pid_path.clone(),
-            quic_port: 0,
-            tcp_port: 0,
-            token: "test-token".to_string(),
-            start_time: Instant::now(),
-            app,
             shutdown: Arc::clone(&shutdown),
-            restart: Arc::new(Notify::new()),
-            handoff: Arc::default(),
-            listeners: vec![],
-            public_host: None,
-            handoff_successor: false,
+            ..fixture_socket_params(tmp.path())
         };
+        let socket_path = params.socket_path.clone();
 
         // A stand-in for `termination_signal`: a unit test must not install
         // the real SIGTERM/SIGINT handlers (see its doc).
@@ -889,24 +888,10 @@ mod tests {
         let served = tokio::spawn(serve_control_socket(params, async {
             let _ = stop_rx.await;
         }));
-        // Allow the socket task to bind before connecting.
-        tokio::time::sleep(Duration::from_millis(20)).await;
+        wait_until_served(&socket_path).await;
 
-        let stream = UnixStream::connect(&socket_path).await.unwrap();
-        let (read_half, mut write_half) = stream.into_split();
-        write_half
-            .write_all(b"{\"command\":\"sessions\"}\n")
-            .await
-            .unwrap();
-
-        let mut reader = BufReader::new(read_half);
-        let mut line = String::new();
-        tokio::time::timeout(Duration::from_secs(2), reader.read_line(&mut line))
-            .await
-            .expect("timed out")
-            .unwrap();
-
-        let resp: SessionsResponse = serde_json::from_str(line.trim()).unwrap();
+        let resp: SessionsResponse =
+            serde_json::from_str(ask(&socket_path, "sessions").await.trim()).unwrap();
         assert!(resp.sessions.is_empty());
         assert!(resp.unattached.is_empty());
 
@@ -1181,27 +1166,12 @@ mod tests {
     #[tokio::test]
     async fn a_second_daemon_refuses_to_take_over_a_live_control_socket() {
         let tmp = tempfile::tempdir().expect("tempdir");
-        let socket_path = tmp.path().join("ctrl.sock");
-        let pid_path = tmp.path().join("daemon.pid");
+        let params = fixture_socket_params(tmp.path());
+        let socket_path = params.socket_path.clone();
 
         // Stand in for the incumbent: something bound and listening.
         let incumbent = UnixListener::bind(&socket_path).expect("bind");
 
-        let params = ControlSocketParams {
-            socket_path: socket_path.clone(),
-            pid_path,
-            quic_port: 0,
-            tcp_port: 0,
-            token: "test-token".to_string(),
-            start_time: Instant::now(),
-            app: Arc::new(ServerApp::new("test-token".to_string())),
-            shutdown: Arc::new(Notify::new()),
-            restart: Arc::new(Notify::new()),
-            handoff: Arc::default(),
-            listeners: vec![],
-            public_host: None,
-            handoff_successor: false,
-        };
         // Returns rather than binding, and leaves the incumbent's socket alone.
         serve_control_socket(params, std::future::pending()).await;
 

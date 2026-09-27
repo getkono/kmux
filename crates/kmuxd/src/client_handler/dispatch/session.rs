@@ -146,40 +146,55 @@ mod tests {
     use super::super::testing::*;
 
     #[tokio::test]
-    async fn session_create_on_an_unknown_peer_errors_naming_the_peer() {
-        // Only the federated branch is exercised: the local branch spawns a real
-        // PTY, which a unit test must not do.
-        let (keep, msgs) = dispatch_one(ClientMessage::SessionCreate {
-            request_id: 1,
-            name: None,
-            cwd: None,
-            program: None,
-            args: vec![],
-            size: TermSize::default(),
-            peer: Some("nosuchpeer".to_string()),
-        })
+    async fn session_ops_on_an_unknown_target_error_with_the_request_id() {
+        let word_id = || MISSING_WORD.to_string();
+        assert_all_rejected(vec![
+            // Only the federated branch of `SessionCreate` is exercised: the
+            // local branch spawns a real PTY, which a unit test must not do.
+            Rejected {
+                label: "SessionCreate on an unknown peer",
+                msg: ClientMessage::SessionCreate {
+                    request_id: 1,
+                    name: None,
+                    cwd: None,
+                    program: None,
+                    args: vec![],
+                    size: TermSize::default(),
+                    peer: Some("nosuchpeer".to_string()),
+                },
+                request_id: Some(1),
+                code: ErrorCode::InternalError,
+                message: "peer nosuchpeer is not connected".to_string(),
+            },
+            // A `SessionClosed` reply here would be indistinguishable from a
+            // real close, which is what the client treats as confirmation.
+            session_not_found(
+                "SessionClose",
+                Some(2),
+                ClientMessage::SessionClose {
+                    request_id: 2,
+                    word_id: word_id(),
+                },
+            ),
+            session_not_found(
+                "SessionRestore",
+                Some(11),
+                ClientMessage::SessionRestore {
+                    request_id: 11,
+                    word_id: word_id(),
+                },
+            ),
+            session_not_found(
+                "SessionRename",
+                Some(13),
+                ClientMessage::SessionRename {
+                    request_id: 13,
+                    word_id: word_id(),
+                    new_name: "renamed".to_string(),
+                },
+            ),
+        ])
         .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, Some(1));
-        assert_eq!(code, ErrorCode::InternalError);
-        assert_eq!(message, "peer nosuchpeer is not connected");
-    }
-
-    #[tokio::test]
-    async fn session_close_of_an_unknown_session_errors_naming_the_word_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::SessionClose {
-            request_id: 2,
-            word_id: MISSING_WORD.to_string(),
-        })
-        .await;
-        assert!(keep);
-        // A `SessionClosed` reply here would be indistinguishable from a real
-        // close, which is what the client treats as confirmation.
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, Some(2));
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
     }
 
     #[tokio::test]
@@ -212,35 +227,6 @@ mod tests {
             }
             other => panic!("expected ClosedSessionListResult, got {other:?}"),
         }
-    }
-
-    #[tokio::test]
-    async fn session_restore_of_an_unknown_session_errors_naming_the_word_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::SessionRestore {
-            request_id: 11,
-            word_id: MISSING_WORD.to_string(),
-        })
-        .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, Some(11));
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
-    }
-
-    #[tokio::test]
-    async fn session_rename_of_an_unknown_session_errors_naming_the_word_id() {
-        let (keep, msgs) = dispatch_one(ClientMessage::SessionRename {
-            request_id: 13,
-            word_id: MISSING_WORD.to_string(),
-            new_name: "renamed".to_string(),
-        })
-        .await;
-        assert!(keep);
-        let (request_id, code, message) = only_error(msgs);
-        assert_eq!(request_id, Some(13));
-        assert_eq!(code, ErrorCode::SessionNotFound);
-        assert_eq!(message, format!("session not found: {MISSING_WORD}"));
     }
 
     /// A session closing is not the requester's private news. Every other GUI

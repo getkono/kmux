@@ -519,7 +519,9 @@ mod tests {
 
     use super::*;
     use crate::app::ClientSender;
-    use crate::fixtures::fixture_term_state;
+    use crate::fixtures::{fixture_term_state, make_client_sender, make_outbound};
+    use crate::outbound::OutboundRx;
+    use kmux_client::grid::CellGrid;
     use kmux_protocol::messages::{CursorState, TermModes, TerminalDiff};
     use tokio::sync::mpsc;
 
@@ -538,36 +540,60 @@ mod tests {
         }
     }
 
-    #[test]
-    fn broadcast_sends_lagged_via_ctrl_when_data_full() {
-        let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
-        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
+    /// A streaming client with a `cap`-slot data channel, plus its receivers.
+    fn streaming_client(cap: usize) -> (ClientSender, mpsc::Receiver<ServerMessage>, OutboundRx) {
+        let (data_tx, data_rx) = mpsc::channel(cap);
+        let (ctrl_tx, ctrl_rx) = make_outbound();
+        (make_client_sender(data_tx, ctrl_tx), data_rx, ctrl_rx)
+    }
 
-        data_tx.try_send(dummy_update("eagle/0")).unwrap();
+    fn client_map(clients: impl IntoIterator<Item = (ClientId, ClientSender)>) -> ClientMap {
+        Arc::new(Mutex::new(clients.into_iter().collect::<HashMap<_, _>>()))
+    }
 
-        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        clients.lock().unwrap().insert(
-            ClientId(1),
-            ClientSender {
-                data_tx,
-                ctrl_tx,
-                force_full_snapshot: false,
-                paused: false,
-                pause_auto: false,
-                no_auto_pause: false,
-                capabilities: Default::default(),
-                size: Default::default(),
-            },
+    /// A map holding one streaming client, `ClientId(1)`, whose data channel
+    /// has `cap` slots.
+    fn one_client(cap: usize) -> (ClientMap, mpsc::Receiver<ServerMessage>, OutboundRx) {
+        let (sender, data_rx, ctrl_rx) = streaming_client(cap);
+        (client_map([(ClientId(1), sender)]), data_rx, ctrl_rx)
+    }
+
+    /// Change `ClientId(1)` in `clients`.
+    fn edit_client(clients: &ClientMap, edit: impl FnOnce(&mut ClientSender)) {
+        edit(
+            clients
+                .lock()
+                .unwrap()
+                .get_mut(&ClientId(1))
+                .expect("one_client registered ClientId(1)"),
         );
+    }
 
+    /// Occupy `ClientId(1)`'s only data slot so the next frame overflows it.
+    fn fill_data_channel(clients: &ClientMap) {
+        edit_client(clients, |c| {
+            c.data_tx.try_send(dummy_update("eagle/0")).unwrap();
+        });
+    }
+
+    /// Broadcast one `TerminalUpdate` for `eagle/0` on a blank 24×80 pane.
+    fn broadcast_update(clients: &ClientMap) {
         let ts = fixture_term_state(24, 80);
         broadcast_to_clients(
             "eagle/0",
             &dummy_update("eagle/0"),
-            &clients,
+            clients,
             &|| ts.lock().unwrap().snapshot(),
             SequenceNo(1),
         );
+    }
+
+    #[test]
+    fn broadcast_sends_lagged_via_ctrl_when_data_full() {
+        let (clients, _data_rx, mut ctrl_rx) = one_client(1);
+        fill_data_channel(&clients);
+
+        broadcast_update(&clients);
 
         let msg = ctrl_rx.try_recv().expect("should receive Lagged on ctrl");
         assert!(
@@ -578,34 +604,10 @@ mod tests {
 
     #[test]
     fn broadcast_removes_client_after_full() {
-        let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
-        let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
+        let (clients, _data_rx, _ctrl_rx) = one_client(1);
+        fill_data_channel(&clients);
 
-        data_tx.try_send(dummy_update("eagle/0")).unwrap();
-
-        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        clients.lock().unwrap().insert(
-            ClientId(42),
-            ClientSender {
-                data_tx,
-                ctrl_tx,
-                force_full_snapshot: false,
-                paused: false,
-                pause_auto: false,
-                no_auto_pause: false,
-                capabilities: Default::default(),
-                size: Default::default(),
-            },
-        );
-
-        let ts = fixture_term_state(24, 80);
-        broadcast_to_clients(
-            "eagle/0",
-            &dummy_update("eagle/0"),
-            &clients,
-            &|| ts.lock().unwrap().snapshot(),
-            SequenceNo(1),
-        );
+        broadcast_update(&clients);
 
         assert!(
             clients.lock().unwrap().is_empty(),
@@ -615,32 +617,9 @@ mod tests {
 
     #[test]
     fn broadcast_delivers_to_healthy_client() {
-        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
+        let (clients, mut data_rx, _ctrl_rx) = one_client(16);
 
-        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        clients.lock().unwrap().insert(
-            ClientId(1),
-            ClientSender {
-                data_tx,
-                ctrl_tx,
-                force_full_snapshot: false,
-                paused: false,
-                pause_auto: false,
-                no_auto_pause: false,
-                capabilities: Default::default(),
-                size: Default::default(),
-            },
-        );
-
-        let ts = fixture_term_state(24, 80);
-        broadcast_to_clients(
-            "eagle/0",
-            &dummy_update("eagle/0"),
-            &clients,
-            &|| ts.lock().unwrap().snapshot(),
-            SequenceNo(1),
-        );
+        broadcast_update(&clients);
 
         let msg = data_rx
             .try_recv()
@@ -650,84 +629,75 @@ mod tests {
         assert_eq!(clients.lock().unwrap().len(), 1);
     }
 
-    /// End-to-end through the *real* broadcast path: drive `dispatch_diff_result`
-    /// for a scripted byte stream with a digest forced after each frame, then
-    /// reconstruct the screen on a `CellGrid` from exactly the messages a client
-    /// receives. Every emitted `GridDigest` must match the reconstructed grid,
-    /// and the final grid must equal the server's authoritative snapshot. This
-    /// exercises what the Stage 1 conformance test cannot: real seqno allocation,
-    /// `TerminalUpdate`/`ScrollbackAppend`/`CursorUpdate` ordering (including the
-    /// reset-first rule), and the wire-level digest agreement.
-    #[test]
-    fn relay_broadcast_reconstructs_and_digests_match() {
-        use kmux_client::grid::CellGrid;
+    /// One pane's relay state driven by hand: the emulator plus everything
+    /// `dispatch_diff_result` threads between frames.
+    struct RelayHarness {
+        ts: Arc<Mutex<TermState>>,
+        scrollback: Arc<Mutex<DiffBuffer>>,
+        seqno_counter: Arc<AtomicU64>,
+        prev_cursor: CursorState,
+        prev_modes: TermModes,
+    }
 
-        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(8192);
-        let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
-        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        clients.lock().unwrap().insert(
-            ClientId(1),
-            ClientSender {
-                data_tx,
-                ctrl_tx,
-                force_full_snapshot: false,
-                paused: false,
-                pause_auto: false,
-                no_auto_pause: false,
-                capabilities: Default::default(),
-                size: Default::default(),
-            },
-        );
+    impl RelayHarness {
+        fn new() -> Self {
+            Self {
+                ts: fixture_term_state(24, 80),
+                scrollback: Arc::new(Mutex::new(DiffBuffer::new(256 * 1024))),
+                seqno_counter: Arc::new(AtomicU64::new(0)),
+                prev_cursor: CursorState::default(),
+                prev_modes: TermModes::EMPTY,
+            }
+        }
 
-        let ts = fixture_term_state(24, 80);
-        let scrollback = Arc::new(Mutex::new(DiffBuffer::new(256 * 1024)));
-        let seqno_counter = Arc::new(AtomicU64::new(0));
-        let mut prev_cursor = CursorState::default();
-        let mut prev_modes = TermModes::EMPTY;
-        let snapshot_fn = || ts.lock().unwrap().snapshot();
+        fn snapshot(&self) -> GridSnapshot {
+            self.ts.lock().unwrap().snapshot()
+        }
 
-        // Seed the client exactly as a fresh attach would.
-        let mut grid = CellGrid::new(24, 80);
-        grid.apply_snapshot(snapshot_fn());
+        /// A client grid seeded exactly as a fresh attach would.
+        fn attached_grid(&self) -> CellGrid {
+            let mut grid = CellGrid::new(24, 80);
+            grid.apply_snapshot(self.snapshot());
+            grid
+        }
 
-        let script: &[&[u8]] = &[
-            b"hello \x1b[31mworld\x1b[0m",
-            b"\r\nsecond line with a space",
-            b"\x1b[2J\x1b[Hcleared",
-            // Overflow the viewport to exercise ScrollbackAppend ordering.
-            b"\r\nA\r\nB\r\nC\r\nD\r\nE\r\nF\r\nG\r\nH\r\nI\r\nJ\r\nK\r\nL\r\nM\r\nN\r\nO\r\nP\r\nQ\r\nR\r\nS\r\nT\r\nU\r\nV\r\nW\r\nX\r\nY\r\nZ\r\n",
-            b"\x1bcfresh after reset",
-        ];
-        for chunk in script {
-            ts.lock().unwrap().feed(chunk);
-            let result = ts.lock().unwrap().compute_diff();
+        /// Feed `chunk` and broadcast its diff through the real relay path;
+        /// with `digest`, then force a `GridDigest` certifying the latest
+        /// seqno (bypassing the production throttle so every frame is checked).
+        fn emit(&mut self, clients: &ClientMap, chunk: &[u8], digest: bool) {
+            self.ts.lock().unwrap().feed(chunk);
+            let result = self.ts.lock().unwrap().compute_diff();
+            let ts = Arc::clone(&self.ts);
+            let snapshot_fn = move || ts.lock().unwrap().snapshot();
             dispatch_diff_result(
                 "eagle/0",
                 result,
                 0,
-                &scrollback,
-                &clients,
-                &seqno_counter,
-                &mut prev_cursor,
-                &mut prev_modes,
+                &self.scrollback,
+                clients,
+                &self.seqno_counter,
+                &mut self.prev_cursor,
+                &mut self.prev_modes,
                 &snapshot_fn,
             );
-            // Force a digest certifying the latest emitted seqno (bypassing the
-            // production throttle so every frame is checked).
-            let top = seqno_counter.load(Ordering::Relaxed);
-            if top > 0 {
-                broadcast_grid_digest("eagle/0", &clients, &snapshot_fn, SequenceNo(top - 1));
+            let top = self.seqno_counter.load(Ordering::Relaxed);
+            if digest && top > 0 {
+                broadcast_grid_digest("eagle/0", clients, &snapshot_fn, SequenceNo(top - 1));
             }
         }
+    }
 
-        // Replay the client's inbound stream in order, asserting digests as they
-        // arrive (the grid is at the certified seqno by construction here).
+    /// Apply everything queued for a client to `grid` in order, asserting each
+    /// `GridDigest` against the grid as it arrives (the grid is at the
+    /// certified seqno by construction). Returns how many digests were checked.
+    fn replay_checking_digests(
+        grid: &mut CellGrid,
+        data_rx: &mut mpsc::Receiver<ServerMessage>,
+    ) -> usize {
         let mut digests_checked = 0;
         while let Ok(msg) = data_rx.try_recv() {
             match msg {
-                ServerMessage::TerminalUpdate { diff, .. } => {
-                    grid.apply_diff((*diff).clone());
-                }
+                ServerMessage::TerminalUpdate { diff, .. } => grid.apply_diff((*diff).clone()),
                 ServerMessage::ScrollbackAppend {
                     first_index, lines, ..
                 } => grid.apply_scrollback_append(first_index, lines),
@@ -745,11 +715,40 @@ mod tests {
                 other => panic!("unexpected broadcast message: {other:?}"),
             }
         }
+        digests_checked
+    }
 
+    /// End-to-end through the *real* broadcast path: drive `dispatch_diff_result`
+    /// for a scripted byte stream with a digest forced after each frame, then
+    /// reconstruct the screen on a `CellGrid` from exactly the messages a client
+    /// receives. Every emitted `GridDigest` must match the reconstructed grid,
+    /// and the final grid must equal the server's authoritative snapshot. This
+    /// exercises what the Stage 1 conformance test cannot: real seqno allocation,
+    /// `TerminalUpdate`/`ScrollbackAppend`/`CursorUpdate` ordering (including the
+    /// reset-first rule), and the wire-level digest agreement.
+    #[test]
+    fn relay_broadcast_reconstructs_and_digests_match() {
+        let (clients, mut data_rx, _ctrl_rx) = one_client(8192);
+        let mut relay = RelayHarness::new();
+        let mut grid = relay.attached_grid();
+
+        let script: &[&[u8]] = &[
+            b"hello \x1b[31mworld\x1b[0m",
+            b"\r\nsecond line with a space",
+            b"\x1b[2J\x1b[Hcleared",
+            // Overflow the viewport to exercise ScrollbackAppend ordering.
+            b"\r\nA\r\nB\r\nC\r\nD\r\nE\r\nF\r\nG\r\nH\r\nI\r\nJ\r\nK\r\nL\r\nM\r\nN\r\nO\r\nP\r\nQ\r\nR\r\nS\r\nT\r\nU\r\nV\r\nW\r\nX\r\nY\r\nZ\r\n",
+            b"\x1bcfresh after reset",
+        ];
+        for chunk in script {
+            relay.emit(&clients, chunk, true);
+        }
+
+        let digests_checked = replay_checking_digests(&mut grid, &mut data_rx);
         assert!(digests_checked > 0, "the run must emit and check digests");
         assert_eq!(
             grid.to_snapshot().digest(),
-            snapshot_fn().digest(),
+            relay.snapshot().digest(),
             "final reconstructed grid must equal the authoritative snapshot"
         );
     }
@@ -764,56 +763,14 @@ mod tests {
     /// one, with every post-resync `GridDigest` agreeing.
     #[test]
     fn oracle_survives_data_channel_overflow_lagged() {
-        use kmux_client::grid::CellGrid;
-
-        let make_sender = |data_tx: mpsc::Sender<ServerMessage>| ClientSender {
-            data_tx,
-            ctrl_tx: crate::fixtures::make_outbound().0, // replaced below per client
-            force_full_snapshot: false,
-            paused: false,
-            pause_auto: false,
-            no_auto_pause: false,
-            capabilities: Default::default(),
-            size: Default::default(),
-        };
-        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
-
         // A tiny, never-drained data channel overflows after a few frames.
-        let (data_tx, _data_rx_full) = mpsc::channel::<ServerMessage>(4);
-        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        clients.lock().unwrap().insert(
-            ClientId(1),
-            ClientSender {
-                ctrl_tx: ctrl_tx.clone(),
-                ..make_sender(data_tx)
-            },
-        );
-
-        let ts = fixture_term_state(24, 80);
-        let scrollback = Arc::new(Mutex::new(DiffBuffer::new(256 * 1024)));
-        let seqno_counter = Arc::new(AtomicU64::new(0));
-        let mut prev_cursor = CursorState::default();
-        let mut prev_modes = TermModes::EMPTY;
-        let snapshot_fn = || ts.lock().unwrap().snapshot();
-
-        let mut grid = CellGrid::new(24, 80);
-        grid.apply_snapshot(snapshot_fn());
+        let (clients, _data_rx_full, mut ctrl_rx) = one_client(4);
+        let mut relay = RelayHarness::new();
+        let mut grid = relay.attached_grid();
 
         // Flood without draining: the channel fills and overflows to Lagged.
         for i in 0..20 {
-            ts.lock().unwrap().feed(format!("line {i}\r\n").as_bytes());
-            let result = ts.lock().unwrap().compute_diff();
-            dispatch_diff_result(
-                "eagle/0",
-                result,
-                0,
-                &scrollback,
-                &clients,
-                &seqno_counter,
-                &mut prev_cursor,
-                &mut prev_modes,
-                &snapshot_fn,
-            );
+            relay.emit(&clients, format!("line {i}\r\n").as_bytes(), false);
         }
 
         let lagged = std::iter::from_fn(|| ctrl_rx.try_recv().ok())
@@ -830,88 +787,29 @@ mod tests {
         // Resync: re-attach from a fresh snapshot with a drained channel, exactly
         // as the client's session manager does on Lagged.
         grid.clear();
-        grid.apply_snapshot(snapshot_fn());
-        let (data_tx2, mut data_rx2) = mpsc::channel::<ServerMessage>(8192);
-        clients.lock().unwrap().insert(
-            ClientId(1),
-            ClientSender {
-                ctrl_tx,
-                ..make_sender(data_tx2)
-            },
-        );
+        grid.apply_snapshot(relay.snapshot());
+        let (resynced, mut data_rx, _ctrl_rx) = streaming_client(8192);
+        clients.lock().unwrap().insert(ClientId(1), resynced);
 
-        // Drive more output (with a digest forced after each frame), then replay.
         for i in 20..40 {
-            ts.lock().unwrap().feed(format!("more {i}\r\n").as_bytes());
-            let result = ts.lock().unwrap().compute_diff();
-            dispatch_diff_result(
-                "eagle/0",
-                result,
-                0,
-                &scrollback,
-                &clients,
-                &seqno_counter,
-                &mut prev_cursor,
-                &mut prev_modes,
-                &snapshot_fn,
-            );
-            let top = seqno_counter.load(Ordering::Relaxed);
-            if top > 0 {
-                broadcast_grid_digest("eagle/0", &clients, &snapshot_fn, SequenceNo(top - 1));
-            }
+            relay.emit(&clients, format!("more {i}\r\n").as_bytes(), true);
         }
 
-        let mut digests_checked = 0;
-        while let Ok(msg) = data_rx2.try_recv() {
-            match msg {
-                ServerMessage::TerminalUpdate { diff, .. } => grid.apply_diff((*diff).clone()),
-                ServerMessage::ScrollbackAppend {
-                    first_index, lines, ..
-                } => grid.apply_scrollback_append(first_index, lines),
-                ServerMessage::CursorUpdate { cursor, modes, .. } => {
-                    grid.apply_cursor_update(cursor, modes);
-                }
-                ServerMessage::GridDigest { hash, .. } => {
-                    assert_eq!(
-                        grid.live_digest(),
-                        hash,
-                        "post-resync grid diverged from the certified digest"
-                    );
-                    digests_checked += 1;
-                }
-                other => panic!("unexpected broadcast message: {other:?}"),
-            }
-        }
-
+        let digests_checked = replay_checking_digests(&mut grid, &mut data_rx);
         assert!(
             digests_checked > 0,
             "the post-resync run must emit and check digests"
         );
         assert_eq!(
             grid.to_snapshot().digest(),
-            snapshot_fn().digest(),
+            relay.snapshot().digest(),
             "grid recovered from Lagged must equal the authoritative snapshot"
         );
     }
 
     #[test]
     fn grid_digest_delivered_with_authoritative_hash() {
-        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
-        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        clients.lock().unwrap().insert(
-            ClientId(1),
-            ClientSender {
-                data_tx,
-                ctrl_tx,
-                force_full_snapshot: false,
-                paused: false,
-                pause_auto: false,
-                no_auto_pause: false,
-                capabilities: Default::default(),
-                size: Default::default(),
-            },
-        );
+        let (clients, mut data_rx, _ctrl_rx) = one_client(16);
 
         let ts = fixture_term_state(24, 80);
         let expected = ts.lock().unwrap().snapshot().live_digest();
@@ -943,22 +841,8 @@ mod tests {
     fn grid_digest_skips_snapshot_mode_client() {
         // Force-full-snapshot clients get whole snapshots and cannot desync, so
         // they must never receive a (meaningless) digest.
-        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(16);
-        let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
-        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        clients.lock().unwrap().insert(
-            ClientId(1),
-            ClientSender {
-                data_tx,
-                ctrl_tx,
-                force_full_snapshot: true,
-                paused: false,
-                pause_auto: false,
-                no_auto_pause: false,
-                capabilities: Default::default(),
-                size: Default::default(),
-            },
-        );
+        let (clients, mut data_rx, _ctrl_rx) = one_client(16);
+        edit_client(&clients, |c| c.force_full_snapshot = true);
 
         let ts = fixture_term_state(24, 80);
         broadcast_grid_digest(
@@ -977,50 +861,20 @@ mod tests {
     #[test]
     fn broadcast_skips_paused_client() {
         // A paused client receives nothing; an active client still does.
-        let (paused_tx, mut paused_rx) = mpsc::channel::<ServerMessage>(16);
-        let (paused_ctrl_tx, _paused_ctrl_rx) = crate::fixtures::make_outbound();
-        let (active_tx, mut active_rx) = mpsc::channel::<ServerMessage>(16);
-        let (active_ctrl_tx, _active_ctrl_rx) = crate::fixtures::make_outbound();
-
-        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        {
-            let mut map = clients.lock().unwrap();
-            map.insert(
+        let (paused, mut paused_rx, _paused_ctrl_rx) = streaming_client(16);
+        let (active, mut active_rx, _active_ctrl_rx) = streaming_client(16);
+        let clients = client_map([
+            (
                 ClientId(1),
                 ClientSender {
-                    data_tx: paused_tx,
-                    ctrl_tx: paused_ctrl_tx,
-                    force_full_snapshot: false,
                     paused: true,
-                    pause_auto: false,
-                    no_auto_pause: false,
-                    capabilities: Default::default(),
-                    size: Default::default(),
+                    ..paused
                 },
-            );
-            map.insert(
-                ClientId(2),
-                ClientSender {
-                    data_tx: active_tx,
-                    ctrl_tx: active_ctrl_tx,
-                    force_full_snapshot: false,
-                    paused: false,
-                    pause_auto: false,
-                    no_auto_pause: false,
-                    capabilities: Default::default(),
-                    size: Default::default(),
-                },
-            );
-        }
+            ),
+            (ClientId(2), active),
+        ]);
 
-        let ts = fixture_term_state(24, 80);
-        broadcast_to_clients(
-            "eagle/0",
-            &dummy_update("eagle/0"),
-            &clients,
-            &|| ts.lock().unwrap().snapshot(),
-            SequenceNo(1),
-        );
+        broadcast_update(&clients);
 
         assert!(
             paused_rx.try_recv().is_err(),
@@ -1041,33 +895,11 @@ mod tests {
     fn paused_client_not_marked_lagged_when_data_full() {
         // Even with a full data channel, a paused client is never marked lagged
         // or removed — it catches up on resume.
-        let (data_tx, _data_rx) = mpsc::channel::<ServerMessage>(1);
-        let (ctrl_tx, mut ctrl_rx) = crate::fixtures::make_outbound();
-        data_tx.try_send(dummy_update("eagle/0")).unwrap(); // fill to capacity
+        let (clients, _data_rx, mut ctrl_rx) = one_client(1);
+        edit_client(&clients, |c| c.paused = true);
+        fill_data_channel(&clients);
 
-        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        clients.lock().unwrap().insert(
-            ClientId(7),
-            ClientSender {
-                data_tx,
-                ctrl_tx,
-                force_full_snapshot: false,
-                paused: true,
-                pause_auto: false,
-                no_auto_pause: false,
-                capabilities: Default::default(),
-                size: Default::default(),
-            },
-        );
-
-        let ts = fixture_term_state(24, 80);
-        broadcast_to_clients(
-            "eagle/0",
-            &dummy_update("eagle/0"),
-            &clients,
-            &|| ts.lock().unwrap().snapshot(),
-            SequenceNo(2),
-        );
+        broadcast_update(&clients);
 
         assert!(
             ctrl_rx.try_recv().is_err(),
@@ -1124,22 +956,7 @@ mod tests {
     /// drained everything the reader had and emitted one diff at the end.
     #[tokio::test]
     async fn a_flood_is_fed_in_capped_lock_holds_with_a_diff_between() {
-        let (data_tx, mut data_rx) = mpsc::channel::<ServerMessage>(4096);
-        let (ctrl_tx, _ctrl_rx) = crate::fixtures::make_outbound();
-        let clients: ClientMap = Arc::new(Mutex::new(HashMap::new()));
-        clients.lock().unwrap().insert(
-            ClientId(1),
-            ClientSender {
-                data_tx,
-                ctrl_tx,
-                force_full_snapshot: false,
-                paused: false,
-                pause_auto: false,
-                no_auto_pause: false,
-                capabilities: Default::default(),
-                size: Default::default(),
-            },
-        );
+        let (clients, mut data_rx, _ctrl_rx) = one_client(4096);
         let ts = fixture_term_state(24, 80);
         let mut flood = Vec::new();
         let mut line = 0u64;
