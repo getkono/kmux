@@ -30,15 +30,17 @@ use harness::{
     Client, E2E_TIMEOUT, Federation, SIZE as ATTACH_SIZE, connect_client, poll_until,
     read_pid_file, recv_until,
 };
-use kmux_protocol::messages::{ClientMessage, ServerMessage, SessionEventMsg, TermSize};
+use kmux_protocol::messages::{
+    ClientMessage, ServerMessage, SessionEntry, SessionEventMsg, TermSize,
+};
 use nix::sys::signal::{Signal, kill};
 use nix::unistd::Pid;
 use tokio::sync::mpsc;
 
-/// On the remote daemon, create a session whose pane prints `marker` then
-/// `exec`s an interactive shell (so it both shows the marker in its grid and
-/// executes typed input). Records the shell's PID to `pidfile` and hands it to
-/// the fixture's cleanup. Returns the remote word id.
+/// On the remote daemon, create a session named `marker` whose pane prints
+/// `marker` then `exec`s an interactive shell (so it both shows the marker in
+/// its grid and executes typed input). Records the shell's PID to `pidfile`
+/// and hands it to the fixture's cleanup. Returns the remote word id.
 async fn create_remote_session(fed: &Federation, marker: &str, pidfile: &Path) -> String {
     let Client {
         tx: client_tx,
@@ -49,7 +51,7 @@ async fn create_remote_session(fed: &Federation, marker: &str, pidfile: &Path) -
     client_tx
         .send(ClientMessage::SessionCreate {
             request_id: 1,
-            name: Some("fed-src".into()),
+            name: Some(marker.into()),
             peer: None,
             cwd: Some(fed.remote.path().display().to_string()),
             program: Some("/bin/sh".into()),
@@ -576,6 +578,118 @@ async fn a_frozen_peer_is_unreachable_then_restored_under_the_same_word() {
 
     drop(gui_tx);
     fed.shutdown().await;
+}
+
+/// Issue #202: a federated session its peer closes leaves the hub's list,
+/// whether a client attached straight to the peer closed it or the hub closed
+/// its last tab. (A pane whose shell exits keeps its slot until someone closes
+/// it, so that closes no session; a peer that is lost keeps its sessions
+/// listed as unreachable, see
+/// `remote_daemon_death_is_isolated_from_local_daemon`.)
+///
+/// Out of process because each close is the real peer's own: its close
+/// handling and the `SessionClosed` it sends the hub over the link. The feed's
+/// routing of that event is pinned in-memory in `federation::feed`.
+#[tokio::test]
+async fn a_session_its_peer_closes_leaves_the_hubs_list() {
+    const PEER_CLOSES: &str = "FED_PEER_CLOSES";
+    const LAST_TAB: &str = "FED_LAST_TAB";
+    let fed = Federation::spawn_pair().await;
+    let peer_word =
+        create_remote_session(&fed, PEER_CLOSES, &fed.remote.path().join("peer.pid")).await;
+    create_remote_session(&fed, LAST_TAB, &fed.remote.path().join("tab.pid")).await;
+    let (gui, _peer) = fed.open_peer().await;
+    let Client {
+        tx: gui_tx,
+        rx: mut gui_rx,
+    } = gui;
+    let listed = hub_list(&gui_tx, &mut gui_rx)
+        .await
+        .expect("the hub's list");
+    let peer_closes = word_named(&listed, PEER_CLOSES).expect("the hub lists it");
+    let last_tab = word_named(&listed, LAST_TAB).expect("the hub lists it");
+
+    // A client attached straight to the peer closes the session there.
+    let remote = connect_client(&fed.remote, &fed.remote_token).await;
+    remote
+        .tx
+        .send(ClientMessage::SessionClose {
+            request_id: 1,
+            word_id: peer_word,
+        })
+        .expect("send SessionClose to the peer");
+    let listed = await_closed(&gui_tx, &mut gui_rx, &peer_closes).await;
+    assert!(
+        listed.as_ref().is_some_and(|l| !l.contains(&peer_closes)),
+        "the hub drops {peer_closes}: {listed:?}"
+    );
+
+    // The hub closes the session's last tab on the peer.
+    gui_tx
+        .send(ClientMessage::TabClose {
+            request_id: 2,
+            word_id: last_tab.clone(),
+            tab_index: 0,
+        })
+        .expect("send TabClose to the hub");
+    let listed = await_closed(&gui_tx, &mut gui_rx, &last_tab).await;
+    assert!(
+        listed.as_ref().is_some_and(|l| !l.contains(&last_tab)),
+        "the hub drops {last_tab}: {listed:?}"
+    );
+
+    drop(remote);
+    drop(gui_tx);
+    fed.shutdown().await;
+}
+
+/// The hub's local word for the remote session named `name` in `sessions`.
+fn word_named(sessions: &[SessionEntry], name: &str) -> Option<String> {
+    let prefix = format!("{name} @ ");
+    sessions
+        .iter()
+        .find(|e| e.meta.name.starts_with(&prefix))
+        .map(|e| e.meta.word_id.clone())
+}
+
+/// Ask the hub for its session list. `None` if it does not answer in time.
+async fn hub_list(
+    tx: &mpsc::UnboundedSender<ClientMessage>,
+    rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
+) -> Option<Vec<SessionEntry>> {
+    tx.send(ClientMessage::SessionList { request_id: 100 })
+        .ok()?;
+    match recv_until(rx, E2E_TIMEOUT, |m| {
+        matches!(
+            m,
+            ServerMessage::SessionListResult {
+                request_id: 100,
+                ..
+            }
+        )
+    })
+    .await?
+    {
+        ServerMessage::SessionListResult { sessions, .. } => Some(sessions),
+        _ => None,
+    }
+}
+
+/// Wait for the hub to tell its client `local_word` closed, then return the
+/// words the hub lists after it. `None` if either does not come in time.
+async fn await_closed(
+    tx: &mpsc::UnboundedSender<ClientMessage>,
+    rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
+    local_word: &str,
+) -> Option<Vec<String>> {
+    recv_until(rx, E2E_TIMEOUT, |m| {
+        matches!(m, ServerMessage::Event {
+            event: SessionEventMsg::SessionClosed { word_id },
+        } if word_id == local_word)
+    })
+    .await?;
+    let listed = hub_list(tx, rx).await?;
+    Some(listed.into_iter().map(|e| e.meta.word_id).collect())
 }
 
 /// PR6 hardening: two GUIs federating the **same** remote target concurrently
