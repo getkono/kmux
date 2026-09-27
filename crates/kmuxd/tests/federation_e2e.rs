@@ -875,3 +875,188 @@ async fn federation_surfaces_upstream_auth_rejection_as_peer_error() {
     drop(gui_tx);
     fed.shutdown().await;
 }
+
+/// Send `request` to the hub as `gui` and return the first thing `want` picks
+/// out of what the hub sends back.
+async fn ask<T>(
+    gui: &mut Client,
+    request: ClientMessage,
+    want: impl Fn(&ServerMessage) -> Option<T>,
+) -> T {
+    let what = format!("{request:?}");
+    gui.tx.send(request).expect("send to the hub");
+    let found = tokio::time::timeout(E2E_TIMEOUT, async {
+        loop {
+            let msg = gui.rx.recv().await?;
+            if let Some(found) = want(&msg) {
+                return Some(found);
+            }
+        }
+    })
+    .await
+    .ok()
+    .flatten();
+    found.unwrap_or_else(|| panic!("no answer to {what} within {E2E_TIMEOUT:?}"))
+}
+
+/// Out of process because each request is carried out by the real peer: its
+/// own handlers answer under its own ids, and the hub relays the answer under
+/// the GUI's (issue #227). The routing itself is pinned in memory in
+/// `federation::forward`.
+#[tokio::test]
+async fn a_proxied_sessions_tabs_and_panes_are_managed_through_the_hub() {
+    const MARKER: &str = "FED_MANAGED";
+    let fed = Federation::spawn_pair().await;
+    create_remote_session(&fed, MARKER, &fed.remote.path().join("managed.pid")).await;
+    let (mut gui, _peer) = fed.open_peer().await;
+    let listed = hub_list(&gui.tx, &mut gui.rx)
+        .await
+        .expect("the hub's list");
+    let word = word_named(&listed, MARKER).expect("the hub lists it");
+    let sleeper = || Some("/bin/sleep".to_string());
+    let long = || vec!["600".to_string()];
+
+    let create = ClientMessage::TabCreate {
+        request_id: 1,
+        word_id: word.clone(),
+        program: sleeper(),
+        args: long(),
+        size: ATTACH_SIZE,
+    };
+    let (tab_word, tab_index, focused) = ask(&mut gui, create, |m| match m {
+        ServerMessage::TabCreated {
+            request_id: 1,
+            word_id,
+            tab,
+        } => Some((word_id.clone(), tab.tab_index, tab.focused_pane)),
+        _ => None,
+    })
+    .await;
+    assert_eq!(tab_word, word);
+
+    let split = ClientMessage::PaneSplit {
+        request_id: 2,
+        word_id: word.clone(),
+        tab_index,
+        from_pane: focused,
+        dir: kmux_protocol::messages::SplitDir::Vertical,
+        program: sleeper(),
+        args: long(),
+        size: ATTACH_SIZE,
+    };
+    let (split_word, new_pane) = ask(&mut gui, split, |m| match m {
+        ServerMessage::PaneSplit {
+            request_id: 2,
+            word_id,
+            new_pane,
+            ..
+        } => Some((word_id.clone(), new_pane.pane_id.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(split_word, word);
+    assert!(new_pane.starts_with(&format!("{word}/")), "{new_pane}");
+
+    let rename = ClientMessage::TabRename {
+        request_id: 3,
+        word_id: word.clone(),
+        tab_index,
+        new_name: "work".into(),
+    };
+    let renamed = ask(&mut gui, rename, |m| match m {
+        ServerMessage::Event {
+            event: SessionEventMsg::TabRenamed { word_id, name, .. },
+        } => Some((word_id.clone(), name.clone())),
+        _ => None,
+    })
+    .await;
+    assert_eq!(renamed, (word.clone(), "work".to_string()));
+
+    // The peer's answer to a rename carries no request id: the hub routes
+    // it to the client that asked by order.
+    let rename = ClientMessage::SessionRename {
+        request_id: 4,
+        word_id: word.clone(),
+        new_name: "managed".into(),
+    };
+    let renamed = ask(&mut gui, rename, |m| match m {
+        ServerMessage::SessionRenamed { word_id, new_name } => {
+            Some((word_id.clone(), new_name.clone()))
+        }
+        _ => None,
+    })
+    .await;
+    assert_eq!(renamed, (word.clone(), "managed".to_string()));
+
+    let close = ClientMessage::TabClose {
+        request_id: 5,
+        word_id: word.clone(),
+        tab_index,
+    };
+    let closed = ask(&mut gui, close, |m| match m {
+        ServerMessage::TabClosed {
+            request_id: 5,
+            word_id,
+            ..
+        } => Some(word_id.clone()),
+        _ => None,
+    })
+    .await;
+    assert_eq!(closed, word);
+
+    drop(gui);
+    fed.shutdown().await;
+}
+
+/// Out of process because the history is the real peer's scrollback, and
+/// the answer crosses the real link. Two GUIs view the pane; the one that
+/// asks is answered under its own request id, and the other never sees that
+/// answer (issue #227).
+#[tokio::test]
+async fn a_proxied_panes_history_answers_only_the_client_that_asked() {
+    const MARKER: &str = "FED_HISTORY";
+    let fed = Federation::spawn_pair().await;
+    create_remote_session(&fed, MARKER, &fed.remote.path().join("history.pid")).await;
+    let (mut asker, _peer) = fed.open_peer().await;
+    let mut other = fed.connect_gui().await;
+    let pane = federated_pane(&asker.tx, &mut asker.rx).await;
+    for gui in [&mut asker, &mut other] {
+        let attach = ClientMessage::Attach {
+            pane_id: pane.clone(),
+            last_seqno: None,
+            size: ATTACH_SIZE,
+        };
+        ask(gui, attach, |m| {
+            matches!(m, ServerMessage::TerminalSnapshot { .. }).then_some(())
+        })
+        .await;
+    }
+    let history = |request_id| ClientMessage::FetchHistory {
+        request_id,
+        pane_id: pane.clone(),
+        start_index: 0,
+        count: 10,
+    };
+    let answered = |m: &ServerMessage| match m {
+        ServerMessage::HistoryLines {
+            request_id,
+            pane_id,
+            ..
+        } => Some((*request_id, pane_id.clone())),
+        _ => None,
+    };
+
+    assert_eq!(
+        ask(&mut asker, history(7), answered).await,
+        (7, pane.clone())
+    );
+    // Asked second, the other GUI's first history is its own answer: the
+    // asker's never reached it.
+    assert_eq!(
+        ask(&mut other, history(3), answered).await,
+        (3, pane.clone())
+    );
+
+    drop((asker, other));
+    fed.shutdown().await;
+}

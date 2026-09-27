@@ -58,8 +58,8 @@ does the sampling. Each pane's child pid comes from the pty registry
 
 Federated sessions live on remote daemons (issue #121), so their process trees
 must be fetched live — unlike the *session list*, which the hub caches. The hub
-mirrors the `create_remote_session` request/await pattern:
-`PeerManager::collect_process_overview` fans a `ProcessOverview` request out to
+merges the overview itself (`ProcessOverview` is a *hub* request, not a
+forwarded one): `PeerManager::collect_process_overview` fans a `ProcessOverview` request out to
 every connected peer, registers a oneshot per peer (`pending_overviews`), and
 awaits them concurrently with a short per-peer timeout (a slow/dead peer simply
 contributes nothing that round). The feed loop completes each oneshot when the

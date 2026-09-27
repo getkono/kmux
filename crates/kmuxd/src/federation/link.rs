@@ -316,10 +316,8 @@ pub(super) fn link_down(conn: &Mutex<PeerConnection>) {
         .unwrap_or_else(std::sync::PoisonError::into_inner);
     guard.dead = true;
     guard.client_tx = mpsc::unbounded_channel().0;
-    guard.pending_creates.clear();
     guard.pending_overviews.clear();
-    guard.pending_client_lists.clear();
-    guard.pending_acks.clear();
+    super::forward::fail_in_flight(&mut guard);
 }
 
 /// Retry `conn`'s connector with backoff until it opens a link, reading it
@@ -378,6 +376,7 @@ pub(super) fn relink(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.client_tx = client_tx;
         guard.dead = false;
+        guard.routes = super::routes::Routes::default();
         if let Some(mut old) = guard.ssh_tunnel.take() {
             let _ = old.start_kill();
         }

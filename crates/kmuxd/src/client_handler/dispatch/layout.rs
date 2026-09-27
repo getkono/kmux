@@ -7,32 +7,13 @@
 //! is forwarded upstream under the peer's word; the peer's `LayoutUpdate` comes
 //! back through the federation feed loop to this session's viewers.
 
-use kmux_protocol::messages::{
-    ClientMessage, ErrorCode, LayoutNode, LayoutScheme, TabIndex, WordId,
-};
+use kmux_protocol::messages::{LayoutNode, LayoutScheme, TabIndex, WordId};
 
 use tracing::debug;
 
 use crate::connection::classify_error;
 
 use super::super::SharedClientState;
-
-/// Forward a layout nudge for a federated session to its peer, telling the
-/// requester when the peer link is gone. Returns `false`, forwarding nothing,
-/// when `word_id` is hosted here.
-fn forwarded_to_peer(
-    state: &mut SharedClientState,
-    word_id: &str,
-    build: impl FnOnce(String) -> ClientMessage,
-) -> bool {
-    if !state.app.is_federated_session(word_id) {
-        return false;
-    }
-    if let Err(e) = state.app.forward_federated_session(word_id, build) {
-        state.error(None, ErrorCode::InternalError, e);
-    }
-    true
-}
 
 /// Handle [`ClientMessage::PaneSwap`].
 pub(super) async fn on_pane_swap(
@@ -42,14 +23,6 @@ pub(super) async fn on_pane_swap(
     a: u32,
     b: u32,
 ) {
-    if forwarded_to_peer(state, &word_id, |word_id| ClientMessage::PaneSwap {
-        word_id,
-        tab_index,
-        a,
-        b,
-    }) {
-        return;
-    }
     let result = state.app.swap_panes(&word_id, tab_index, a, b).await;
     answer_layout_change(state, &word_id, tab_index, result);
 }
@@ -62,14 +35,6 @@ pub(super) async fn on_set_layout_ratios(
     path: Vec<u32>,
     ratios: Vec<u16>,
 ) {
-    if forwarded_to_peer(state, &word_id, |word_id| ClientMessage::SetLayoutRatios {
-        word_id,
-        tab_index,
-        path: path.clone(),
-        ratios: ratios.clone(),
-    }) {
-        return;
-    }
     let result = state
         .app
         .set_layout_ratios(&word_id, tab_index, &path, &ratios)
@@ -90,15 +55,6 @@ pub(super) async fn on_apply_layout_scheme(
         debug!(%word_id, tab_index, "ignoring a layout scheme this daemon does not know");
         return;
     }
-    if forwarded_to_peer(state, &word_id, |word_id| {
-        ClientMessage::ApplyLayoutScheme {
-            word_id,
-            tab_index,
-            scheme,
-        }
-    }) {
-        return;
-    }
     let result = state
         .app
         .apply_layout_scheme(&word_id, tab_index, scheme)
@@ -113,13 +69,6 @@ pub(super) async fn on_set_focus(
     tab_index: TabIndex,
     pane_index: u32,
 ) {
-    if forwarded_to_peer(state, &word_id, |word_id| ClientMessage::SetFocus {
-        word_id,
-        tab_index,
-        pane_index,
-    }) {
-        return;
-    }
     let result = state
         .app
         .set_tab_focus(&word_id, tab_index, pane_index)

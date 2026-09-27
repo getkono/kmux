@@ -1,8 +1,9 @@
 //! Feeding one upstream link into the hub: answer and send pings, translate
 //! each frame's IDs from remote to local, and route it — pane content to
-//! that pane's viewers (feeding the mirror), session events to every viewer
-//! under the session, replies to the request waiting for them, and changes
-//! to the peer's sessions into the hub's own listing (issue #208).
+//! that pane's viewers (feeding the mirror), the peer's events to every
+//! client as a local daemon's are, answers to the client that asked (issue
+//! #227), and changes to the peer's sessions into the hub's own listing
+//! (issue #208).
 
 use std::sync::{Arc, Mutex, Weak};
 
@@ -11,9 +12,12 @@ use kmux_protocol::messages::{
 };
 use tokio::sync::mpsc;
 use tokio::time::Instant;
+use tracing::debug;
 
+use super::forward::{answer_routed, answer_unrequested};
 use super::link::{LinkEnd, UPSTREAM_PING_INTERVAL, broadcast_sessions, upstream_silent};
-use super::translate::{msg_pane_id, rewrite_event_to_local, sendable_clients, set_msg_pane_id};
+use super::routes::Requester;
+use super::translate::{msg_pane_id, rewrite_event_to_local, set_msg_pane_id};
 use super::{PeerConnection, lock};
 use crate::app::ServerApp;
 
@@ -31,7 +35,6 @@ pub(super) async fn feed(
         Instant::now() + UPSTREAM_PING_INTERVAL,
         UPSTREAM_PING_INTERVAL,
     );
-    let mut seq = 0u64;
     loop {
         tokio::select! {
             msg = server_rx.recv() => {
@@ -47,8 +50,7 @@ pub(super) async fn feed(
                 if upstream_silent(last_inbound, Instant::now()) {
                     return LinkEnd::Silent;
                 }
-                send_upstream(conn, ClientMessage::Ping { seq });
-                seq += 1;
+                lock(conn).ping();
             }
         }
     }
@@ -62,11 +64,6 @@ pub(super) enum Next {
     Resync,
 }
 
-/// Send `msg` on the link, if it is up.
-fn send_upstream(conn: &Mutex<PeerConnection>, msg: ClientMessage) {
-    let _ = lock(conn).client_tx.send(msg);
-}
-
 /// Route one upstream frame.
 pub(super) fn on_upstream(
     app: &Weak<ServerApp>,
@@ -77,21 +74,16 @@ pub(super) fn on_upstream(
     match msg {
         // Keep the peer's view of us live.
         ServerMessage::Ping { seq } => {
-            send_upstream(conn, ClientMessage::Pong { seq });
+            let _ = lock(conn).client_tx.send(ClientMessage::Pong { seq });
+            Next::Continue
+        }
+        // The peer has answered everything sent before that ping.
+        ServerMessage::Pong { seq } => {
+            lock(conn).routes.ponged(seq);
             Next::Continue
         }
         ServerMessage::ProcessOverviewResult { request_id, panes } => {
             on_process_overview(conn, request_id, &panes);
-            Next::Continue
-        }
-        ServerMessage::ClientListResult {
-            request_id,
-            clients,
-            ..
-        } => {
-            if let Some(tx) = lock(conn).pending_client_lists.remove(&request_id) {
-                let _ = tx.send(sendable_clients(clients));
-            }
             Next::Continue
         }
         // Any session list is the peer's whole truth: an answer to the hub's
@@ -99,7 +91,7 @@ pub(super) fn on_upstream(
         ServerMessage::SessionListResult { sessions, .. } => {
             on_session_list(app, conn, peer_id, sessions)
         }
-        msg => on_reply_or_stream(app, conn, msg),
+        msg => on_reply_or_stream(app, conn, peer_id, msg),
     }
 }
 
@@ -138,13 +130,17 @@ fn on_session_list(
     Next::Resync
 }
 
-/// A reply to a hub-initiated request, or a frame of the peer's stream.
+/// An answer to a forwarded request, or a frame of the peer's stream.
 fn on_reply_or_stream(
     app: &Weak<ServerApp>,
     conn: &Arc<Mutex<PeerConnection>>,
+    peer_id: &PeerId,
     msg: ServerMessage,
 ) -> Next {
-    let Some(msg) = complete_request(conn, msg) else {
+    let Some(msg) = answer_routed(app, conn, peer_id, msg) else {
+        return Next::Continue;
+    };
+    let Some(msg) = answer_unrequested(conn, msg) else {
         return Next::Continue;
     };
     if msg_pane_id(&msg).is_some() {
@@ -152,47 +148,6 @@ fn on_reply_or_stream(
         return Next::Continue;
     }
     on_session_frame(app, conn, msg)
-}
-
-/// Complete the hub request `msg` answers, if one is waiting — `None` then —
-/// or hand `msg` back. `SessionCreated` carries the *remote* entry;
-/// `create_remote_session` (holding `&ServerApp`) draws the local word and
-/// registers it. `ClientKicked`/`SessionClosed`/`TabClosed`/`Error` complete a
-/// pending acknowledgement.
-fn complete_request(conn: &Mutex<PeerConnection>, msg: ServerMessage) -> Option<ServerMessage> {
-    let rid = match &msg {
-        ServerMessage::SessionCreated { request_id, .. }
-        | ServerMessage::ClientKicked { request_id, .. }
-        | ServerMessage::SessionClosed { request_id, .. }
-        | ServerMessage::TabClosed { request_id, .. }
-        | ServerMessage::Error {
-            request_id: Some(request_id),
-            ..
-        } => *request_id,
-        _ => return Some(msg),
-    };
-    // A pending ack (kick, session/tab close) takes priority for its id, then
-    // a pending create.
-    let ack_tx = lock(conn).pending_acks.remove(&rid);
-    if let Some(tx) = ack_tx {
-        let result = match msg {
-            ServerMessage::Error { message, .. } => Err(message),
-            _ => Ok(()),
-        };
-        let _ = tx.send(result);
-        return None;
-    }
-    let create_tx = lock(conn).pending_creates.remove(&rid);
-    let Some(tx) = create_tx else {
-        return Some(msg);
-    };
-    let result = match msg {
-        ServerMessage::SessionCreated { entry, .. } => Ok(entry),
-        ServerMessage::Error { message, .. } => Err(message),
-        other => return Some(other),
-    };
-    let _ = tx.send(result);
-    None
 }
 
 /// A pane-scoped frame: translate the pane ID remote→local, feed the pane's
@@ -205,27 +160,28 @@ fn on_pane_frame(conn: &Mutex<PeerConnection>, mut msg: ServerMessage) {
         return;
     };
     let mut guard = lock(conn);
-    if let Some(local_pane) = guard.to_local_pane(&remote_pane) {
-        set_msg_pane_id(&mut msg, local_pane.clone());
-        if let Some(pane) = guard.panes.get_mut(&local_pane) {
-            pane.apply_to_mirror(&msg);
-            pane.fan_out(&local_pane, &msg);
-        }
+    let Some(local_pane) = guard.to_local_pane(&remote_pane) else {
+        return;
+    };
+    set_msg_pane_id(&mut msg, local_pane.clone());
+    if let Some(pane) = guard.panes.get_mut(&local_pane) {
+        pane.apply_to_mirror(&msg);
+        pane.fan_out(&local_pane, &msg);
     }
 }
 
 /// A session-scoped frame (titles, layout, tab/session lifecycle).
 ///
-/// Translated remote→local and fanned out to every viewer under the session,
-/// on the lanes the local daemon uses (`forward_vt_event`): layout and
-/// lifecycle on the viewers' control lane, so a backed-up pane stream can never
-/// drop one, and a flood-prone bell/title/progress event on the data lane,
-/// dropped when congested (issue #206).
+/// Translated remote→local and broadcast to every client, as a local daemon
+/// broadcasts its own (issue #227), on the lanes the local daemon uses
+/// (`forward_vt_event`): layout and lifecycle on the control lane, a
+/// flood-prone bell/title/progress event on the data lane, dropped when
+/// congested (issue #206).
 ///
 /// It also keeps the hub's listing current (issue #208): a layout update
 /// patches the cached tab, a session the peer closed is closed here too — for
-/// every client, not just its viewers — and a session or tab created, closed
-/// or renamed asks the peer for its list again.
+/// every client — and a session or tab created, closed or renamed asks the
+/// peer for its list again.
 fn on_session_frame(
     app: &Weak<ServerApp>,
     conn: &Mutex<PeerConnection>,
@@ -247,30 +203,33 @@ fn on_session_frame(
                 | SessionEventMsg::TabClosed { .. }
         }
     );
-    let viewers = {
+    let localized = {
         let mut guard = lock(conn);
         match &mut msg {
-            ServerMessage::Event { event } => rewrite_event_to_local(event, &guard.remote_to_local)
-                .map(|local_word| guard.viewers_under_word(&local_word)),
+            ServerMessage::Event { event } => {
+                rewrite_event_to_local(event, &guard.remote_to_local).is_some()
+            }
             ServerMessage::LayoutUpdate {
                 word_id,
                 tab_index,
                 layout,
                 focused_pane,
-            } => guard
-                .remote_to_local
-                .get(word_id.as_str())
-                .cloned()
-                .map(|local_word| {
+            } => match guard.remote_to_local.get(word_id.as_str()).cloned() {
+                Some(local_word) => {
                     guard.cache_layout(&local_word, *tab_index, layout, *focused_pane);
-                    *word_id = local_word.clone();
-                    guard.viewers_under_word(&local_word)
-                }),
-            _ => None,
+                    *word_id = local_word;
+                    true
+                }
+                None => false,
+            },
+            _ => {
+                debug!(?msg, "a frame from the peer the hub has no use for");
+                false
+            }
         }
     };
-    for tx in viewers.unwrap_or_default() {
-        crate::client_handler::forward_vt_event(&tx, msg.clone());
+    if localized && let Some(app) = app.upgrade() {
+        app.broadcast(msg);
     }
     if refresh {
         request_session_list(conn);
@@ -281,14 +240,12 @@ fn on_session_frame(
 /// Ask the peer for its session list; the answer reconciles the hub's.
 fn request_session_list(conn: &Mutex<PeerConnection>) {
     let mut guard = lock(conn);
-    let request_id = guard.next_rid();
-    let _ = guard
-        .client_tx
-        .send(ClientMessage::SessionList { request_id });
+    let request_id = guard.routes.next_id();
+    guard.send(&Requester::Hub, ClientMessage::SessionList { request_id });
 }
 
 /// The peer closed its session `remote_word`: close it here for every client.
-fn on_remote_session_closed(
+pub(super) fn on_remote_session_closed(
     app: &Weak<ServerApp>,
     conn: &Mutex<PeerConnection>,
     remote_word: &str,
@@ -314,6 +271,7 @@ mod tests {
     use tokio::sync::broadcast;
 
     use super::*;
+    use crate::app::Requester;
     use crate::federation::link::testing::{WAIT, listed, next_upstream};
     use crate::federation::sample_remote_entry;
     use crate::fixtures::fixture_app;
@@ -412,13 +370,14 @@ mod tests {
         );
     }
 
-    /// A session's events reach every viewer under it, translated to local
-    /// ids: a rename on the control lane, a bell on the data lane.
+    /// The peer's events reach every client of the hub, as a local daemon's
+    /// reach every connection, under local ids (issue #227): a rename, a
+    /// pane's bell, and a layout change.
     #[tokio::test(start_paused = true)]
-    async fn a_session_event_reaches_its_viewers_under_local_ids() {
+    async fn a_peer_event_is_broadcast_to_every_client_under_local_ids() {
         let app = Arc::new(fixture_app());
+        let mut broadcasts = app.subscribe_vt_events();
         let (_upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
-        let (_data, mut conn) = attach_viewer(&app);
         for event in [
             SessionEventMsg::SessionRenamed {
                 word_id: "fedremote".to_string(),
@@ -430,25 +389,52 @@ mod tests {
         ] {
             peer.send(ServerMessage::Event { event }).unwrap();
         }
-        let mut got = Vec::new();
-        while got.len() < 2 {
-            let msg = tokio::time::timeout(WAIT, conn.recv())
-                .await
-                .expect("the events within the bound")
-                .expect("open");
-            if let ServerMessage::Event { event } = msg {
-                got.push(event);
-            }
-        }
-        assert!(matches!(
-            &got[0],
-            SessionEventMsg::SessionRenamed { word_id, new_name }
-                if word_id == "fedlocal" && new_name == "work"
-        ));
-        assert!(matches!(
-            &got[1],
-            SessionEventMsg::PaneBell { pane_id } if pane_id == "fedlocal/0"
-        ));
+        peer.send(ServerMessage::LayoutUpdate {
+            word_id: "fedremote".to_string(),
+            tab_index: 0,
+            layout: LayoutNode::single(0),
+            focused_pane: 0,
+        })
+        .unwrap();
+        let renamed = broadcast_matching(&mut broadcasts, |m| match m {
+            ServerMessage::Event {
+                event: SessionEventMsg::SessionRenamed { word_id, new_name },
+            } => Some((word_id.clone(), new_name.clone())),
+            _ => None,
+        })
+        .await;
+        assert_eq!(renamed, ("fedlocal".to_string(), "work".to_string()));
+        let bell = broadcast_matching(&mut broadcasts, |m| match m {
+            ServerMessage::Event {
+                event: SessionEventMsg::PaneBell { pane_id },
+            } => Some(pane_id.clone()),
+            _ => None,
+        })
+        .await;
+        assert_eq!(bell, "fedlocal/0");
+        let layout = broadcast_matching(&mut broadcasts, |m| match m {
+            ServerMessage::LayoutUpdate { word_id, .. } => Some(word_id.clone()),
+            _ => None,
+        })
+        .await;
+        assert_eq!(layout, "fedlocal");
+    }
+
+    /// A frame the hub cannot place — an event for a session it does not
+    /// proxy — is broadcast to nobody.
+    #[tokio::test(start_paused = true)]
+    async fn an_event_for_an_unknown_session_is_not_broadcast() {
+        let app = Arc::new(fixture_app());
+        let mut broadcasts = app.subscribe_vt_events();
+        let (_upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
+        peer.send(ServerMessage::Event {
+            event: SessionEventMsg::PaneBell {
+                pane_id: format_pane_id("elsewhere", 0),
+            },
+        })
+        .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(broadcasts.try_recv().is_err());
     }
 
     /// A process overview reply completes its request with local pane ids,
@@ -485,18 +471,28 @@ mod tests {
     }
 
     /// Close `fedlocal` from the hub while the peer answers with its ack and
-    /// its own `SessionClosed` event first, then the ack, when
-    /// `event_first`. Returns every `SessionClosed` word broadcast by then.
-    async fn close_federated(event_first: bool) -> Vec<String> {
+    /// its own `SessionClosed` event — the event first when `event_first`.
+    /// Returns the requester's answer and every `SessionClosed` word
+    /// broadcast by then.
+    async fn close_federated(event_first: bool) -> (ServerMessage, Vec<String>) {
         let app = Arc::new(fixture_app());
         let mut broadcasts = app.subscribe_vt_events();
         let (mut upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
-        let closing = tokio::spawn({
-            let app = Arc::clone(&app);
-            async move { app.close_federated_session("fedlocal").await }
-        });
+        let (ctrl, mut answers) = crate::fixtures::make_outbound();
+        let from = Requester::client(kmux_protocol::messages::ClientId(1), ctrl);
+        app.forward_to_peer(
+            from,
+            ClientMessage::SessionClose {
+                request_id: 40,
+                word_id: "fedlocal".to_string(),
+            },
+        )
+        .expect("forwarded");
         let request_id = next_upstream(&mut upstream, |m| match m {
-            ClientMessage::SessionClose { request_id, .. } => Some(*request_id),
+            ClientMessage::SessionClose {
+                request_id,
+                word_id,
+            } if word_id == "fedremote" => Some(*request_id),
             _ => None,
         })
         .await;
@@ -510,27 +506,24 @@ mod tests {
             word_id: "fedremote".to_string(),
             exit_code: None,
         };
-        // Each frame is taken in whole before the next is sent, so with the
-        // ack first `close_remote_session` itself closes the session.
-        let settle = || tokio::time::sleep(std::time::Duration::from_millis(10));
         if event_first {
             peer.send(event).unwrap();
-            settle().await;
-            assert!(!app.is_federated_session("fedlocal"), "the event closed it");
             peer.send(ack).unwrap();
-            closing.await.unwrap().expect("closed");
         } else {
             peer.send(ack).unwrap();
-            closing.await.unwrap().expect("closed");
-            assert!(!app.is_federated_session("fedlocal"), "the close did");
             peer.send(event).unwrap();
-            settle().await;
         }
+        let answer = tokio::time::timeout(WAIT, answers.recv())
+            .await
+            .expect("the answer within the bound")
+            .expect("open");
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!app.is_federated_session("fedlocal"), "closed on the hub");
         let mut closed = Vec::new();
         while let Ok(msg) = broadcasts.try_recv() {
             closed.extend(closed_word(&msg));
         }
-        closed
+        (answer, closed)
     }
 
     /// Closing a federated session from the hub tells every client once,
@@ -538,8 +531,15 @@ mod tests {
     /// first — the second finds the session already gone (issue #208).
     #[tokio::test(start_paused = true)]
     async fn closing_a_federated_session_tells_every_client_once() {
-        assert_eq!(close_federated(false).await, vec!["fedlocal".to_string()]);
-        assert_eq!(close_federated(true).await, vec!["fedlocal".to_string()]);
+        for event_first in [false, true] {
+            let (answer, closed) = close_federated(event_first).await;
+            assert!(
+                matches!(&answer, ServerMessage::SessionClosed { request_id: 40, word_id, .. }
+                    if word_id == "fedlocal"),
+                "the requester is answered under its own ids: {answer:?}"
+            );
+            assert_eq!(closed, vec!["fedlocal".to_string()]);
+        }
     }
 
     /// A session list is published while no peer's sessions can change, so a
