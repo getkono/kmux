@@ -138,9 +138,7 @@ mod tests {
     use super::super::testing::*;
 
     /// A create or split in an unknown session names the session; a close
-    /// names the pane. Every pane-scoped arm reports `PaneNotFound`: the
-    /// three ways a pane lookup can miss (unparseable id, unknown session,
-    /// unknown index) are deliberately indistinguishable to the client.
+    /// of a pane in an unknown session names the pane.
     #[tokio::test]
     async fn pane_ops_on_an_unknown_target_error_with_the_request_id() {
         assert_all_rejected(vec![

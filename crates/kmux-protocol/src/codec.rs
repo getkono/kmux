@@ -292,8 +292,9 @@ mod tests {
     }
 
     /// Every `ClientMessage` variant survives the wire: what decodes from its
-    /// bytes re-encodes to the same bytes (`ClientMessage` is not
-    /// `PartialEq`). Beyond one sample per variant (`every_client_message`,
+    /// bytes is the message that was sent (compared through `Debug`, as
+    /// `ClientMessage` is not `PartialEq`) and re-encodes to the same bytes.
+    /// Beyond one sample per variant (`every_client_message`,
     /// whose completeness `spec` checks), the extra cases set the optional and
     /// sized fields a dropped field would silently reset to their default.
     #[test]

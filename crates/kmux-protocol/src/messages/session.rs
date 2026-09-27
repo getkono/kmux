@@ -730,8 +730,9 @@ wire_enum!(SessionEventMsg);
 mod tests {
     use super::*;
 
-    /// `value` decodes from its own bytes into something that re-encodes to
-    /// the same bytes: the round-trip check for a type that is not `PartialEq`.
+    /// `value` decodes from its own bytes into itself (compared through
+    /// `Debug`) and re-encodes to the same bytes: the round-trip check for a
+    /// type that is not `PartialEq`.
     fn assert_survives_the_wire<T>(value: &T)
     where
         T: Serialize + serde::de::DeserializeOwned + std::fmt::Debug,
