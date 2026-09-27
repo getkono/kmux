@@ -260,19 +260,25 @@ updated so `announce.rs` can advertise the real port.
 One background Tokio task per bound listener runs `kmux_sys::transport::serve`:
 
 ```
-tokio::spawn(serve(listener, HANDSHAKE_TIMEOUT, on_session)):
+tokio::spawn(serve(listener, HANDSHAKE_TIMEOUT, HandshakeLimits::DAEMON, on_session)):
   loop:
     pending = listener.accept().await       // transport-level accept only
-      Ok(pending) → tokio::spawn:
-                      session = pending.establish(HANDSHAKE_TIMEOUT).await
-                        Ok(session) → tokio::spawn(dispatch_session(session, app))
-                        Err(e)      → warn, drop this connection only
+      Ok(pending) → match admit(pending.source(), pending.needs_address_validation()):
+        Admit(slot) → tokio::spawn:          // slot held until the handshake ends
+                        session = pending.establish(HANDSHAKE_TIMEOUT).await
+                          Ok(session) → tokio::spawn(dispatch_session(session, app))
+                          Err(e)      → warn, drop this connection only
+        Retry       → pending.retry()        // QUIC stateless Retry, under load
+        Refuse      → drop(pending)          // listener or source full: refused now
       Err(Closed) → break
-      Err(other)  → warn + continue
+      Err(other)  → warn, back off 100 ms, continue
 ```
 
 The TLS and QUIC handshakes are part of `establish`, in the connection's own
-task, under `HANDSHAKE_TIMEOUT` (10 s). They used to run inside `accept` on the
+task, under `HANDSHAKE_TIMEOUT` (10 s). At most 64 run at once per listener and
+8 per source; a connection past either bound is refused at once, and under load
+an unvalidated QUIC client is retried first (issue #207; see
+[connection.md](connection.md) for the admission rules). They used to run inside `accept` on the
 loop itself, so one client that connected and never finished its handshake
 blocked every later accept on that listener (issue #206).
 
@@ -310,6 +316,30 @@ request/response per connection:
 | `status`   | port, tcp_port, token, pid, uptime_secs, session_count, endpoints |
 | `stop`     | `{"status":"ok"}` then triggers shutdown                  |
 | `sessions` | full per-session, per-connection snapshot with metrics    |
+
+**Deadline (issue #207).** Each connection runs in its own task under one
+deadline, `CONTROL_DEADLINE` (10 s), from accept to reply written, and its
+request is read through a 64 KiB cap (`MAX_CONTROL_REQUEST`). A local client
+that connects and never sends a request, sends an endless line, or stops
+reading its reply is dropped at the deadline instead of holding a task and a
+file descriptor for the daemon's lifetime.
+
+**Error replies.** A request the daemon does not serve is answered with a typed
+`ControlError` line, `{"error":"<kind>","message":"..."}`, in place of the
+command's reply, wherever one can still be sent (before any of the command's
+reply was written): `malformed` (not a JSON request), `too_large` (cut off at
+the cap), `unknown_command`, `deadline_exceeded` (written without waiting as the
+deadline closes the connection, so a client that is not reading may miss it)
+and `internal`. `kmux-connect` parses a reply as an error first and turns it
+into an `Err` naming the refusal. A daemon that predates error replies closes
+the connection instead, which the client already reads as a failed request, so
+nothing was versioned.
+
+**A cut-off `restart`.** `restart` marks a handoff as running before it
+answers, so a second one is `busy`. If the connection is cut off before the
+handoff is handed to the daemon's main task, the mark is rolled back (the
+`BegunHandoff` guard from `HandoffStatus::begin`), and `handoff` reports it as
+stood down, so a later `restart` is not refused as busy forever.
 
 **Ownership.** A daemon never takes over a control socket another daemon is
 listening on: unlinking a live socket does not stop its daemon, it only makes it
@@ -592,7 +622,10 @@ checks the child once on the spot, so an exit that beat the registration is not
 lost. This replaced a blocking `waitpid` thread per pane, which parked one of
 tokio's 512 blocking threads for each pane's whole life. A child inherited over
 a handoff is not ours to `waitpid`; its channel is fed by a `kill(pid, 0)` poll
-instead.
+instead. Only a *successful* start of the reaper is kept: a start that fails (no
+thread or runtime under memory or thread pressure) fails the spawn that asked for
+it, and the next spawn tries again, so one transient failure no longer disables
+every later pane of a long-running daemon (issue #207).
 
 **Close** (`shutdown::graceful_shutdown`, `PtySession::close[_nowait]`). Pane
 close signals the child's process group, so whatever runs in it goes too — the

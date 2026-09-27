@@ -20,7 +20,7 @@ pub mod receiver;
 pub mod sender;
 mod status;
 
-pub use status::{HandoffStatus, StoodDown};
+pub use status::{BegunHandoff, HandoffStatus, StoodDown};
 
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};

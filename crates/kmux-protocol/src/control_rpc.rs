@@ -108,6 +108,36 @@ pub struct ControlRequest {
     pub command: String,
 }
 
+/// JSON reply to a control request the daemon did not serve (issue #207),
+/// sent in place of the command's own reply wherever the exchange still
+/// allows one: before any of that reply was written. A client parses a line
+/// as this first (no command's reply has an `error` field), and a daemon
+/// that predates it closes the connection instead, which the client already
+/// reads as a failed request.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
+pub struct ControlError {
+    /// What went wrong, for a program to act on.
+    pub error: ControlErrorKind,
+    /// What went wrong, for a person.
+    pub message: String,
+}
+
+/// Why the daemon did not serve a control request.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ControlErrorKind {
+    /// The request was not a JSON control request.
+    Malformed,
+    /// The request line was longer than the daemon reads.
+    TooLarge,
+    /// The daemon does not know the command.
+    UnknownCommand,
+    /// The exchange did not finish within the daemon's deadline.
+    DeadlineExceeded,
+    /// The daemon could not build its reply.
+    Internal,
+}
+
 /// JSON response to the `"status"` control command.
 #[derive(Serialize, Deserialize)]
 pub struct StatusResponse {
@@ -378,6 +408,34 @@ mod tests {
     // daemon that may be *different builds* during an upgrade. These tests pin
     // that wire format: a field rename, a dropped `#[serde(default)]`, or a
     // change to the enum tagging would silently break cross-version control.
+
+    /// The error reply's wire form: a `snake_case` kind beside a message.
+    #[test]
+    fn a_control_error_has_a_fixed_wire_form() {
+        let error = ControlError {
+            error: ControlErrorKind::DeadlineExceeded,
+            message: "too slow".into(),
+        };
+        let json = serde_json::to_string(&error).unwrap();
+        assert_eq!(
+            json,
+            r#"{"error":"deadline_exceeded","message":"too slow"}"#
+        );
+        let back: ControlError = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, error);
+        for (kind, wire) in [
+            (ControlErrorKind::Malformed, r#""malformed""#),
+            (ControlErrorKind::TooLarge, r#""too_large""#),
+            (ControlErrorKind::UnknownCommand, r#""unknown_command""#),
+            (ControlErrorKind::Internal, r#""internal""#),
+        ] {
+            assert_eq!(serde_json::to_string(&kind).unwrap(), wire);
+        }
+        assert!(
+            serde_json::from_str::<ControlError>(r#"{"status":"ok","handoff":true}"#).is_err(),
+            "a command's reply is never read as an error"
+        );
+    }
 
     #[test]
     fn control_request_parses_status_command() {

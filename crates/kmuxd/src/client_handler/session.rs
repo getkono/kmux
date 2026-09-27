@@ -262,7 +262,7 @@ async fn write_batch<W: AsyncWrite + Unpin>(
 
 /// Await one write under `timeout`: a stall is [`CloseReason::WriteTimeout`],
 /// a failure [`CloseReason::WriteFailed`].
-async fn within<T, E>(
+pub(crate) async fn within<T, E>(
     timeout: Duration,
     write: impl Future<Output = Result<T, E>>,
 ) -> Result<T, CloseReason> {
