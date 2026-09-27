@@ -310,7 +310,7 @@ fn on_remote_session_closed(
 mod tests {
     use std::sync::Arc;
 
-    use kmux_protocol::messages::{LayoutNode, SplitDir, TabInfo};
+    use kmux_protocol::messages::{LayoutNode, SplitDir, TabInfo, format_pane_id};
     use tokio::sync::broadcast;
 
     use super::*;
@@ -364,6 +364,120 @@ mod tests {
         );
         assert!(!app.is_federated_session("fedlocal"));
         assert!(app.list_federated_sessions().is_empty());
+    }
+
+    /// A viewer of the proxied pane `fedlocal/0` on the peer
+    /// `install_channel_peer` opened: its data lane and its connection.
+    fn attach_viewer(
+        app: &ServerApp,
+    ) -> (mpsc::Receiver<ServerMessage>, crate::outbound::OutboundRx) {
+        let (data_tx, data_rx) = mpsc::channel(8);
+        let (ctrl_tx, ctrl_rx) = crate::fixtures::make_outbound();
+        let size = kmux_protocol::messages::TermSize {
+            rows: 24,
+            cols: 80,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        assert!(app.federated_attach(
+            &format_pane_id("fedlocal", 0),
+            kmux_protocol::messages::ClientId(1),
+            data_tx,
+            ctrl_tx,
+            size,
+        ));
+        (data_rx, ctrl_rx)
+    }
+
+    /// A pane's frame reaches that pane's viewer under the local pane id.
+    #[tokio::test(start_paused = true)]
+    async fn a_pane_frame_reaches_its_viewer_under_the_local_pane_id() {
+        let app = Arc::new(fixture_app());
+        let (_upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let (mut data, _conn) = attach_viewer(&app);
+        peer.send(ServerMessage::SyncReset {
+            pane_id: format_pane_id("fedremote", 0),
+        })
+        .unwrap();
+        let got = tokio::time::timeout(WAIT, data.recv())
+            .await
+            .expect("the frame within the bound");
+        assert!(
+            matches!(&got, Some(ServerMessage::SyncReset { pane_id }) if *pane_id == "fedlocal/0"),
+            "{got:?}"
+        );
+    }
+
+    /// A session's events reach every viewer under it, translated to local
+    /// ids: a rename on the control lane, a bell on the data lane.
+    #[tokio::test(start_paused = true)]
+    async fn a_session_event_reaches_its_viewers_under_local_ids() {
+        let app = Arc::new(fixture_app());
+        let (_upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let (_data, mut conn) = attach_viewer(&app);
+        for event in [
+            SessionEventMsg::SessionRenamed {
+                word_id: "fedremote".to_string(),
+                new_name: "work".to_string(),
+            },
+            SessionEventMsg::PaneBell {
+                pane_id: format_pane_id("fedremote", 0),
+            },
+        ] {
+            peer.send(ServerMessage::Event { event }).unwrap();
+        }
+        let mut got = Vec::new();
+        while got.len() < 2 {
+            let msg = tokio::time::timeout(WAIT, conn.recv())
+                .await
+                .expect("the events within the bound")
+                .expect("open");
+            if let ServerMessage::Event { event } = msg {
+                got.push(event);
+            }
+        }
+        assert!(matches!(
+            &got[0],
+            SessionEventMsg::SessionRenamed { word_id, new_name }
+                if word_id == "fedlocal" && new_name == "work"
+        ));
+        assert!(matches!(
+            &got[1],
+            SessionEventMsg::PaneBell { pane_id } if pane_id == "fedlocal/0"
+        ));
+    }
+
+    /// A process overview reply completes its request with local pane ids,
+    /// dropping any pane of a session the hub does not know.
+    #[tokio::test(start_paused = true)]
+    async fn a_process_overview_reply_is_localized_for_its_request() {
+        let app = Arc::new(fixture_app());
+        let (_upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        Arc::clone(&app.peer_manager.peers.lock().unwrap()["peer:1"])
+            .lock()
+            .unwrap()
+            .pending_overviews
+            .insert(9, tx);
+        let pane = |pane_id: String| PaneProcesses {
+            pane_id,
+            root_pid: Some(1),
+            processes: Vec::new(),
+        };
+        peer.send(ServerMessage::ProcessOverviewResult {
+            request_id: 9,
+            panes: vec![
+                pane(format_pane_id("fedremote", 0)),
+                pane(format_pane_id("unknown", 0)),
+            ],
+        })
+        .unwrap();
+        let panes = tokio::time::timeout(WAIT, rx)
+            .await
+            .expect("the reply within the bound")
+            .expect("completed");
+        let ids: Vec<_> = panes.into_iter().map(|p| p.pane_id).collect();
+        assert_eq!(ids, vec!["fedlocal/0".to_string()]);
     }
 
     /// A session list is published while no peer's sessions can change, so a
