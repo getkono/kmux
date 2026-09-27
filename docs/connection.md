@@ -459,21 +459,24 @@ unsupported traffic. See
 
 `ConnectionId` is a server-assigned `u64` provided in the first `AuthResult`. It names a client's *registration* on the daemon — its `ClientId` (which its pane attachments and input locks are keyed by), label and identity — and a client presents it again whenever it opens a new channel: a transport swap, or a reconnect (issue #208).
 
-**Resume.** A new channel's `Auth` carries the existing `connection_id`. After the identity proof, `ServerApp::register_client` resumes the registration only if both hold:
+**Daemon runs.** Every successful `AuthResult` also carries `daemon_instance` (`DaemonInstanceId`), drawn at random when a `kmuxd` process starts. Everything a run numbers — connection ids, client ids, pane seqnos — starts over in the next run, and a restarted daemon may reuse a pid, so "the same daemon" means the same instance id. A handoff successor is a new process, and so a new run.
 
+**Resume.** A new channel's `Auth` carries the existing `connection_id` and the run that assigned it (`resume_instance`; the client keeps both, `SessionManager::resume_from`). After the identity proof, `ServerApp::register_client` resumes the registration only if all hold:
+
+- `resume_instance` is this run's instance id (or absent, from a client that predates it) — the same number in another run names someone else's registration, if anyone's;
 - the `connection_id` names a live registration — the daemon still holds the old channel (a transport swap, or a half-open link whose loop has not yet hit its pong deadline); and
 - the verified `machine_id` equals the one the registration was made with. A different machine holding the token takes nothing over.
 
-Otherwise the channel registers a fresh connection with fresh ids. `RegisteredClient::resume` (`app::Resume`) says which — `Resumed`, `UnknownConnection`, `OtherMachine`, or `NotRequested` for a first connection — and the daemon's `client authenticated` log line carries it as `resume=…` with the `generation`. An old channel whose loop has already ended has released its registration, so a reconnect after it is a fresh connection — which costs nothing on screen, because replay is per pane (below).
+Otherwise the channel registers a fresh connection with fresh ids. `RegisteredClient::resume` (`app::Resume`) says which — `Resumed`, `OtherRun`, `UnknownConnection`, `OtherMachine`, or `NotRequested` for a first connection — and the daemon's `client authenticated` log line carries it as `resume=…` with the `generation`. An old channel whose loop has already ended has released its registration, so a reconnect after it is a fresh connection — which costs nothing on screen, because replay is per pane (below).
 
 **Generations.** Each registration carries a generation, bumped by every resume. A channel's loop records the generation it registered with, and when it ends (`client_handler::release_channel`):
 
 1. it detaches only the pane attachments made **through this channel** (`ServerApp::detach_channel`, matched by the channel's control lane) — a pane the resuming channel re-attached under the same `ClientId` is left alone; and
 2. it releases the registration only if its generation is still current (`ServerApp::release_connection`). A superseded channel ending leaves the registration to the channel that resumed it.
 
-**Replay.** Pane streams are not moved by the daemon: a pane stays attached through the channel that attached it, and a new channel re-attaches it. Replay is per pane, so it is the same for a resumed and a fresh connection: a client that re-attaches with `Attach { last_seqno }`, the last seqno it applied, is answered by `compute_replay` from the pane's retained diffs — exactly the missed `TerminalUpdate`s when the buffer still covers `last_seqno` (and the backlog is under the coalescing threshold), otherwise `SyncReset` + a fresh `TerminalSnapshot`.
+**Replay.** Pane streams are not moved by the daemon: a pane stays attached through the channel that attached it, and a new channel re-attaches it. Replay is per pane, so it is the same for a resumed and a fresh connection: a client that re-attaches with `Attach { last_seqno }`, the last seqno it applied, is answered by `compute_replay` from the pane's retained diffs — exactly the missed `TerminalUpdate`s when the buffer still covers `last_seqno` (and the backlog is under the coalescing threshold), otherwise `SyncReset` + a fresh `TerminalSnapshot`. A `last_seqno` past the pane's current seqno was issued by another run and is answered with `SyncReset` too, never with an empty delta that would leave the old run's screen up.
 
-**Transport swap.** When the supervisor promotes a new transport, the resumed channel sends `ChannelReady`, the daemon answers `ChannelSwitched { old_transport }`, and `apply_transport_upgrade` replaces the active sender; the old transport is dropped, and its loop's teardown is the superseded case above.
+**Transport swap.** When the supervisor promotes a new transport, the resumed channel sends `ChannelReady`, the daemon answers `ChannelSwitched { old_transport }`, and `apply_transport_upgrade` replaces the active sender; the old transport is dropped, and its loop's teardown is the superseded case above. A probe the daemon registered afresh (its `AuthResult` names another `connection_id`: the daemon restarted since) fails instead of swapping, since every pane stream is on the old channel.
 
 **Missed server events.** Every connection forwards two server-wide broadcasts (PTY lifecycle events; VT, layout and tab events). A connection that falls behind one is sent an unsolicited `SessionListResult` with `request_id = RESYNC_REQUEST_ID` (`u64::MAX`) — every session with its tabs and layouts — and the forwarder carries on. Every session list — this resync and every answer to `SessionList` (`ServerApp::send_session_list`) — is queued while the session map is read-locked, so a local session created, closed or re-laid-out at the same moment either shows in it or has its own reply and event queued after it. The client treats any session list as the whole truth: sessions it no longer lists are closed as if their `SessionClosed` had arrived, and the viewed tab of a local session is reconciled against its listed layout. A federated session's view is left as shown: the hub's cached entry for it follows the peer's layout updates and re-lists the peer on a tab or session change, but only once that event has crossed the federation link, so it can trail what the peer's own events have already told the client. Federated sessions join every list under the federation membership gate, which each add or remove of a peer's session holds together with its own event, so a list never undoes a federated close either (see [architecture-federation.md](architecture-federation.md)).
 
@@ -626,15 +629,17 @@ in `driver/reconnect.rs`:
    previous failure: `BACKOFF_MIN` (250 ms) doubling to `BACKOFF_MAX`
    (15 s), less up to `BACKOFF_JITTER_CAP_PERMILLE` (20 %) of jitter from a
    per-link seed. Each attempt is a `BootstrapPhase::Resume { attempt }`
-   bootstrap, which re-presents the `connection_id` and shows no
+   bootstrap, which re-presents the `connection_id` (with the run that
+   assigned it) and shows no
    connecting overlay. A failure a retry may get past (the daemon is
    starting, restarting, or not answering) schedules the next attempt, for
    as long as it takes; a **refusal** — the daemon's protocol range or the
    token (`BootstrapTaskResult::Refused`) — ends the retries in
    `Mode::Disconnected`.
 3. **On success** every visible pane is re-attached. If the link reached
-   the **same daemon run** as before (the same pid, which the local
-   daemon's control socket reports; `SessionManager::link_reached_same_daemon`),
+   the **same daemon run** as before (the same `AuthResult.daemon_instance`;
+   `SessionManager::link_reached_same_daemon` — a pid cannot tell, since a
+   restarted daemon may reuse one),
    a pane in sync is re-attached with `Attach { last_seqno }` — the last
    seqno it applied — so the daemon replays exactly what it missed, or
    resets it with a snapshot past its retained diffs (see

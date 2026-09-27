@@ -1,8 +1,9 @@
 use super::category::MessageCategory;
 use super::key::KeyEvent;
 use super::session::{
-    AttentionKind, ClientCapabilities, ClientId, ConnectionId, FrontendKind, LayoutScheme, PaneId,
-    PeerId, PeerTarget, RequestId, SequenceNo, SplitDir, TabIndex, TermSize, WordId,
+    AttentionKind, ClientCapabilities, ClientId, ConnectionId, DaemonInstanceId, FrontendKind,
+    LayoutScheme, PaneId, PeerId, PeerTarget, RequestId, SequenceNo, SplitDir, TabIndex, TermSize,
+    WordId,
 };
 use super::types::ProtocolRange;
 
@@ -32,6 +33,12 @@ pub enum ClientMessage {
         /// `None` for a fresh connection.
         #[serde(default)]
         connection_id: Option<ConnectionId>,
+        /// The daemon run `connection_id` was assigned by (its `AuthResult`'s
+        /// `daemon_instance`). A daemon of another run registers the channel
+        /// afresh instead of resuming. `None` from a client that predates it,
+        /// or when resuming a daemon that did not send one.
+        #[serde(default)]
+        resume_instance: Option<DaemonInstanceId>,
         /// Raw Ed25519 public key (32 bytes) identifying this user@machine. Its
         /// SHA-256 fingerprint is the stable `machine_id`. Verified via the
         /// challenge–response below before the daemon trusts it.
@@ -485,6 +492,7 @@ mod tests {
             protocol_capabilities: protocol_capabilities(),
             capabilities: ClientCapabilities::default(),
             connection_id: Some(ConnectionId(42)),
+            resume_instance: None,
             public_key: Vec::new(),
             hostname: String::new(),
             username: String::new(),
@@ -513,6 +521,7 @@ mod tests {
             client_id: None,
             server_version: None,
             connection_id: Some(ConnectionId(99)),
+            daemon_instance: None,
             compression: None,
             machine_id: None,
             label: None,
@@ -651,6 +660,7 @@ mod tests {
             client_id: None,
             server_version: Some("0.1.0".to_string()),
             connection_id: None,
+            daemon_instance: None,
             compression: None,
             machine_id: None,
             label: None,
@@ -926,6 +936,7 @@ mod tests {
                     protocol_capabilities: protocol_capabilities(),
                     capabilities: ClientCapabilities::default(),
                     connection_id: None,
+                    resume_instance: None,
                     public_key: Vec::new(),
                     hostname: String::new(),
                     username: String::new(),

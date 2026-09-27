@@ -11,8 +11,8 @@ use std::collections::{HashMap, HashSet};
 use std::time::Instant;
 
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientId, ClientInfo, ClientMessage, ClosedSessionEntry, PaneId,
-    PaneProcesses, ProtocolVersion, SequenceNo, SessionEntry, TermSize, WordId,
+    ClientCapabilities, ClientId, ClientInfo, ClientMessage, ClosedSessionEntry, DaemonInstanceId,
+    PaneId, PaneProcesses, ProtocolVersion, SequenceNo, SessionEntry, TermSize, WordId,
 };
 use tokio::sync::mpsc;
 use tracing::warn;
@@ -171,12 +171,13 @@ pub struct SessionManager {
     /// (QUIC ↔ TCP) so the daemon can transfer pane attachments to the new channel.
     pub connection_id: Option<ConnectionId>,
 
-    /// The pid of the daemon the last link reached, when known. A new link
-    /// to the same pid may resume panes from their seqnos; another pid is
-    /// another daemon run, whose seqnos start over (issue #208).
-    daemon_pid: Option<u32>,
-    /// The pid the link before the last one reached.
-    previous_daemon_pid: Option<u32>,
+    /// The daemon run the last link reached (its `AuthResult`'s
+    /// `daemon_instance`), when it said. A new link to the same run may resume
+    /// panes from their seqnos, and resumes this connection's registration;
+    /// another run's seqnos and connection ids start over (issue #208).
+    daemon_instance: Option<DaemonInstanceId>,
+    /// The run the link before the last one reached.
+    previous_daemon_instance: Option<DaemonInstanceId>,
 
     /// The active transport kind (QUIC or TCP).
     pub current_transport: TransportKind,
@@ -261,8 +262,8 @@ impl SessionManager {
             negotiated_protocol: None,
             negotiated_capabilities: Vec::new(),
             connection_id: None,
-            daemon_pid: None,
-            previous_daemon_pid: None,
+            daemon_instance: None,
+            previous_daemon_instance: None,
             current_transport: TransportKind::Quic,
             last_term_size: TermSize::default(),
             connection_state: ConnectionState::Idle,
@@ -722,10 +723,10 @@ mod tests {
         );
     }
 
-    /// A new link to another daemon run (another pid, as after a restart or
-    /// a handoff) — or to one whose pid is unknown — attaches every pane
-    /// afresh: that run's seqnos start over, so an old run's seqno would ask
-    /// for the wrong diffs.
+    /// A new link to another daemon run (another instance id, as after a
+    /// restart or a handoff, whatever its pid) — or to a daemon that sent none
+    /// — attaches every pane afresh: that run's seqnos start over, so an old
+    /// run's seqno would ask for the wrong diffs.
     #[test]
     fn a_new_link_to_another_daemon_run_attaches_every_pane_afresh() {
         for (before, after) in [(Some(7), Some(8)), (Some(7), None), (None, None)] {
@@ -734,7 +735,7 @@ mod tests {
             assert_eq!(
                 attached,
                 vec![("eagle/0".to_string(), None), ("eagle/1".to_string(), None)],
-                "pid {before:?} then {after:?}"
+                "run {before:?} then {after:?}"
             );
             assert!(matches!(
                 mgr.pane_sync.get("eagle/0"),
@@ -743,21 +744,38 @@ mod tests {
         }
     }
 
+    /// A new link asks to resume this connection in the run that assigned
+    /// it, which the daemon checks: an id from another run takes nothing over.
+    #[test]
+    fn a_new_link_resumes_the_connection_in_the_run_that_assigned_it() {
+        use kmux_protocol::messages::{ConnectionId, DaemonInstanceId, ResumeFrom};
+
+        let (_, mgr) = reconnect_to_daemon(Some(7), Some(8));
+        assert_eq!(
+            mgr.resume_from(),
+            Some(ResumeFrom {
+                connection_id: ConnectionId(9),
+                instance: Some(DaemonInstanceId(8)),
+            })
+        );
+        assert_eq!(make_manager().resume_from(), None, "nothing to resume yet");
+    }
+
     /// A manager showing `eagle/0` (in sync, expecting seqno 42) and `eagle/1`
-    /// (awaiting its snapshot) on a link to daemon pid `before`, reconnected
-    /// to pid `after`: the `Attach`es the new link carried, and the manager.
+    /// (awaiting its snapshot) on a link to daemon run `before`, reconnected
+    /// to run `after`: the `Attach`es the new link carried, and the manager.
     fn reconnect_to_daemon(
-        before: Option<u32>,
-        after: Option<u32>,
+        before: Option<u64>,
+        after: Option<u64>,
     ) -> (Vec<(String, Option<SequenceNo>)>, SessionManager) {
-        use kmux_protocol::messages::ConnectionId;
+        use kmux_protocol::messages::{ConnectionId, DaemonInstanceId};
 
         use crate::connection_state::DisconnectReason;
         use crate::pipeline::BootstrapOutcome;
         use crate::transport::TransportKind;
 
         let (mut mgr, _old_rx) = make_connected_manager();
-        mgr.daemon_pid = before;
+        mgr.daemon_instance = before.map(DaemonInstanceId);
         mgr.visible_panes = vec!["eagle/0".to_string(), "eagle/1".to_string()];
         mgr.pane_sync.insert(
             "eagle/0".to_string(),
@@ -783,7 +801,7 @@ mod tests {
             is_local: true,
             ssh_context: None,
             bootstrap_elapsed: std::time::Duration::ZERO,
-            daemon_pid: after,
+            daemon_instance: after.map(DaemonInstanceId),
         });
 
         let mut attached = Vec::new();
@@ -1015,6 +1033,7 @@ mod tests {
             client_id: Some(ClientId(42)),
             server_version: Some("0.1.0".to_string()),
             connection_id: None,
+            daemon_instance: None,
             compression: None,
             machine_id: None,
             label: None,
@@ -1050,6 +1069,7 @@ mod tests {
             client_id: None,
             server_version: None,
             connection_id: None,
+            daemon_instance: None,
             compression: None,
             machine_id: None,
             label: None,
@@ -1087,6 +1107,7 @@ mod tests {
             client_id: None,
             server_version: None,
             connection_id: None,
+            daemon_instance: None,
             compression: None,
             machine_id: None,
             label: None,

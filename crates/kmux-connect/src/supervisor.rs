@@ -21,7 +21,7 @@
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "remote")]
-use kmux_protocol::messages::{ClientCapabilities, ConnectionId, ServerMessage};
+use kmux_protocol::messages::{ClientCapabilities, ConnectionId, ResumeFrom, ServerMessage};
 use kmux_protocol::messages::{ClientMessage, TransportKind};
 use kmux_sys::transport::EndpointAdvert;
 use tokio::sync::mpsc;
@@ -246,8 +246,9 @@ pub struct RttSample {
 pub struct SupervisorParams {
     /// All endpoints the server has advertised.
     pub endpoints: Vec<EndpointAdvert>,
-    /// Session identity for transport resumption.
-    pub connection_id: ConnectionId,
+    /// The registration each probe resumes: this connection's id and the
+    /// daemon run that assigned it.
+    pub resume: ResumeFrom,
     pub token: String,
     pub capabilities: ClientCapabilities,
     pub accept_invalid_certs: bool,
@@ -282,7 +283,7 @@ pub struct SupervisorParams {
 #[cfg(feature = "remote")]
 pub struct TransportSupervisor {
     endpoints: Vec<EndpointHealth>,
-    connection_id: ConnectionId,
+    resume: ResumeFrom,
     token: String,
     capabilities: ClientCapabilities,
     accept_invalid_certs: bool,
@@ -302,7 +303,7 @@ impl TransportSupervisor {
         let endpoints = params.endpoints.iter().map(EndpointHealth::new).collect();
         Self {
             endpoints,
-            connection_id: params.connection_id,
+            resume: params.resume,
             token: params.token,
             capabilities: params.capabilities,
             accept_invalid_certs: params.accept_invalid_certs,
@@ -347,7 +348,7 @@ impl TransportSupervisor {
             kind,
             &address,
             &self.token,
-            self.connection_id,
+            self.resume,
             &self.capabilities,
             self.accept_invalid_certs,
             self.server_tx.clone(),
@@ -491,7 +492,7 @@ impl TransportSupervisor {
                 kind,
                 &address,
                 &self.token,
-                self.connection_id,
+                self.resume,
                 &self.capabilities,
                 self.accept_invalid_certs,
                 self.server_tx.clone(),
@@ -576,6 +577,19 @@ async fn recv_opt<T>(rx: &mut Option<mpsc::UnboundedReceiver<T>>) -> Option<T> {
 
 // ─── probe_transport ─────────────────────────────────────────────────────────
 
+/// Whether a probe's successful `AuthResult` resumed the connection `expected`.
+/// A daemon of another run (restarted since the link was made) registers the
+/// probe afresh under a new id: swapping to it would leave every pane stream
+/// on the old channel, so the probe fails.
+#[cfg(feature = "remote")]
+fn resumed(expected: ConnectionId, got: Option<ConnectionId>) -> Result<(), String> {
+    if got == Some(expected) {
+        Ok(())
+    } else {
+        Err("the daemon did not resume this connection (another daemon run)".to_string())
+    }
+}
+
 /// Spawn a forwarding task that captures the first `AuthResult` arriving on
 /// the new transport's `server_tx`, then forwards every server message
 /// (including the captured `AuthResult`) to `outer_tx`.
@@ -586,6 +600,7 @@ async fn recv_opt<T>(rx: &mut Option<mpsc::UnboundedReceiver<T>>) -> Option<T> {
 /// transport's reader task drops its sender.
 #[cfg(feature = "remote")]
 fn spawn_auth_forwarder(
+    expected: ConnectionId,
     mut intercept_rx: mpsc::UnboundedReceiver<ServerMessage>,
     auth_tx: oneshot::Sender<Result<(), String>>,
     outer_tx: mpsc::UnboundedSender<ServerMessage>,
@@ -601,7 +616,11 @@ fn spawn_auth_forwarder(
             }
             if let (Some(_), ServerMessage::AuthResult { .. }) = (&auth_tx, &msg) {
                 let captured = match &msg {
-                    ServerMessage::AuthResult { success: true, .. } => Ok(()),
+                    ServerMessage::AuthResult {
+                        success: true,
+                        connection_id,
+                        ..
+                    } => resumed(expected, *connection_id),
                     ServerMessage::AuthResult {
                         success: false,
                         reason,
@@ -630,7 +649,7 @@ async fn probe_transport(
     kind: TransportKind,
     address: &str,
     token: &str,
-    connection_id: ConnectionId,
+    resume: ResumeFrom,
     capabilities: &ClientCapabilities,
     accept_invalid_certs: bool,
     server_tx: mpsc::UnboundedSender<ServerMessage>,
@@ -655,7 +674,7 @@ async fn probe_transport(
                     accept_invalid_certs,
                     intercept_tx,
                     capabilities,
-                    Some(connection_id),
+                    Some(resume),
                 )
                 .await)
             }
@@ -670,7 +689,7 @@ async fn probe_transport(
                     token,
                     intercept_tx,
                     capabilities,
-                    Some(connection_id),
+                    Some(resume),
                     accept_invalid_certs,
                 )
                 .await)
@@ -682,7 +701,7 @@ async fn probe_transport(
                     token,
                     intercept_tx,
                     capabilities,
-                    Some(connection_id),
+                    Some(resume),
                 )
                 .await)
             }
@@ -712,7 +731,13 @@ async fn probe_transport(
     // Forward the server stream and answer the identity challenge (issue #146):
     // spawned here because it needs `sender` (client_tx) to reply. Any frames the
     // daemon already sent buffer in `intercept_rx` until this drains them.
-    spawn_auth_forwarder(intercept_rx, auth_tx, server_tx, sender.clone());
+    spawn_auth_forwarder(
+        resume.connection_id,
+        intercept_rx,
+        auth_tx,
+        server_tx,
+        sender.clone(),
+    );
 
     // Wait for the server to confirm authentication on the new channel.
     // Dropping `sender` on Err closes the new transport's writer task, which
@@ -900,7 +925,10 @@ mod tests {
         ];
         let sup = TransportSupervisor::new(SupervisorParams {
             endpoints: adverts,
-            connection_id: ConnectionId(1),
+            resume: ResumeFrom {
+                connection_id: ConnectionId(1),
+                instance: None,
+            },
             token: "tok".into(),
             capabilities: ClientCapabilities::default(),
             accept_invalid_certs: false,
@@ -934,7 +962,10 @@ mod tests {
         ];
         let mut sup = TransportSupervisor::new(SupervisorParams {
             endpoints: adverts,
-            connection_id: ConnectionId(1),
+            resume: ResumeFrom {
+                connection_id: ConnectionId(1),
+                instance: None,
+            },
             token: "tok".into(),
             capabilities: ClientCapabilities::default(),
             accept_invalid_certs: false,
@@ -975,7 +1006,10 @@ mod tests {
         let (up_tx, up_rx) = mpsc::channel(1);
         let sup = TransportSupervisor::new(SupervisorParams {
             endpoints,
-            connection_id: ConnectionId(1),
+            resume: ResumeFrom {
+                connection_id: ConnectionId(1),
+                instance: None,
+            },
             token: "tok".into(),
             capabilities: ClientCapabilities::default(),
             accept_invalid_certs: false,
@@ -1031,8 +1065,12 @@ mod tests {
 
     // ── spawn_auth_intercept ───────────────────────────────────────────────────
 
+    /// The connection the forwarder tests' probe resumes.
+    const PROBED: ConnectionId = ConnectionId(9);
+
     /// Build a successful `AuthResult` for the forwarder tests (issue #146 added
-    /// the identity fields, defaulted to `None` here).
+    /// the identity fields, defaulted to `None` here): the daemon resumed
+    /// [`PROBED`].
     fn ok_auth_result() -> ServerMessage {
         ServerMessage::AuthResult {
             success: true,
@@ -1040,7 +1078,8 @@ mod tests {
             failure: None,
             client_id: None,
             server_version: None,
-            connection_id: None,
+            connection_id: Some(PROBED),
+            daemon_instance: None,
             compression: None,
             machine_id: None,
             label: None,
@@ -1063,7 +1102,7 @@ mod tests {
         let (intercept_tx, intercept_rx) = mpsc::unbounded_channel::<ServerMessage>();
         let (auth_tx, auth_rx) = oneshot::channel::<Result<(), String>>();
         let (client_tx, _client_rx) = mpsc::unbounded_channel::<ClientMessage>();
-        spawn_auth_forwarder(intercept_rx, auth_tx, outer_tx, client_tx);
+        spawn_auth_forwarder(PROBED, intercept_rx, auth_tx, outer_tx, client_tx);
         (intercept_tx, auth_rx, outer_rx)
     }
 
@@ -1095,6 +1134,7 @@ mod tests {
                 client_id: None,
                 server_version: None,
                 connection_id: None,
+                daemon_instance: None,
                 compression: None,
                 machine_id: None,
                 label: None,
@@ -1107,6 +1147,22 @@ mod tests {
         match auth_rx.await {
             Ok(Err(reason)) => assert_eq!(reason, "bad token"),
             other => panic!("expected Err(bad token), got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_probe_the_daemon_registered_afresh_is_refused() {
+        // A daemon restarted since the link was made cannot resume it: it
+        // answers with a new connection id, and the swap must not happen.
+        let (intercept_tx, auth_rx, _outer_rx) = forwarder_under_test();
+        let mut fresh = ok_auth_result();
+        if let ServerMessage::AuthResult { connection_id, .. } = &mut fresh {
+            *connection_id = Some(ConnectionId(1));
+        }
+        intercept_tx.send(fresh).unwrap();
+        match auth_rx.await {
+            Ok(Err(reason)) => assert!(reason.contains("another daemon run"), "{reason}"),
+            other => panic!("expected a refused probe, got {other:?}"),
         }
     }
 

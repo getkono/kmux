@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use kmux_protocol::messages::ClientMessage;
 #[cfg(feature = "remote")]
-use kmux_protocol::messages::{ClientCapabilities, ConnectionId, ServerMessage};
+use kmux_protocol::messages::{ClientCapabilities, ResumeFrom, ServerMessage};
 #[cfg(feature = "remote")]
 use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
 use tokio::sync::mpsc;
@@ -49,7 +49,7 @@ pub async fn connect(
     accept_invalid_certs: bool,
     server_tx: mpsc::UnboundedSender<ServerMessage>,
     capabilities: ClientCapabilities,
-    connection_id: Option<ConnectionId>,
+    resume: Option<ResumeFrom>,
 ) -> ConnectResult {
     let Some(addr) = format!("{host}:{port}")
         .to_socket_addrs()
@@ -86,8 +86,7 @@ pub async fn connect(
 
     // Authenticate immediately
     if let Err(e) =
-        crate::tcp_connect::send_auth_frame(&mut ctrl_send, token, capabilities, connection_id)
-            .await
+        crate::tcp_connect::send_auth_frame(&mut ctrl_send, token, capabilities, resume).await
     {
         return ConnectResult::Failed(e);
     }

@@ -22,7 +22,8 @@ use kmux_connect::connect::ConnectResult;
 use kmux_connect::ssh::{self, RemoteTarget};
 use kmux_connect::tcp_connect::connect_tcp_tls;
 use kmux_protocol::messages::{
-    ClientCapabilities, ClientMessage, PeerId, PeerTarget, ServerMessage, SessionEntry,
+    AuthFailure, ClientCapabilities, ClientMessage, DaemonInstanceId, PeerId, PeerTarget,
+    ServerMessage, SessionEntry, refusal_reason,
 };
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
@@ -55,6 +56,9 @@ pub(crate) struct Upstream {
     pub(crate) client_tx: mpsc::UnboundedSender<ClientMessage>,
     pub(crate) server_rx: mpsc::UnboundedReceiver<ServerMessage>,
     pub(crate) sessions: Vec<SessionEntry>,
+    /// The peer's daemon run, from its `AuthResult` (`None` from a peer that
+    /// predates it).
+    pub(crate) daemon_instance: Option<DaemonInstanceId>,
     /// The SSH `-L` tunnel of an SSH peer, killed if the link is dropped
     /// before it is parked on its connection.
     pub(crate) tunnel: TunnelGuard,
@@ -169,7 +173,10 @@ pub(super) async fn connect_upstream(target: PeerTarget) -> Result<Upstream, Str
     };
 
     // 2–3. Authenticate, then fetch the session list.
-    let sessions = handshake(
+    let Handshake {
+        sessions,
+        daemon_instance,
+    } = handshake(
         &client_tx,
         &mut server_rx,
         kmux_connect::tcp_connect::answer_auth_challenge,
@@ -180,8 +187,40 @@ pub(super) async fn connect_upstream(target: PeerTarget) -> Result<Upstream, Str
         client_tx,
         server_rx,
         sessions,
+        daemon_instance,
         tunnel,
     })
+}
+
+/// What a completed handshake learned about the peer.
+#[derive(Debug)]
+pub(super) struct Handshake {
+    /// The peer's session list.
+    pub(super) sessions: Vec<SessionEntry>,
+    /// The peer's daemon run.
+    pub(super) daemon_instance: Option<DaemonInstanceId>,
+}
+
+/// Why the peer refused the link, for the log and for `PeerError`: the
+/// refusal and, where there is one, what to do about it. A peer refusing the
+/// token is up but no longer the run the token was issued by — a `kmuxd`
+/// issues a new token each time it starts — and nothing the hub holds can
+/// re-open it (see `docs/architecture-federation.md`, "Re-discovering a
+/// restarted peer").
+pub(super) fn refused(reason: Option<String>, failure: Option<AuthFailure>) -> String {
+    let text = refusal_reason(reason, failure);
+    let remedy = match failure {
+        Some(AuthFailure::BadToken) => Some(
+            "the peer issues a new token when it restarts: open it again with the new one \
+             (an SSH peer is re-negotiated and never needs this)",
+        ),
+        Some(other) => other.hint(),
+        None => None,
+    };
+    match remedy {
+        Some(remedy) => format!("peer rejected authentication: {text} ({remedy})"),
+        None => format!("peer rejected authentication: {text}"),
+    }
 }
 
 /// The handshake on an opened link: answer the identity challenge with
@@ -193,8 +232,8 @@ pub(super) async fn handshake(
     client_tx: &mpsc::UnboundedSender<ClientMessage>,
     server_rx: &mut mpsc::UnboundedReceiver<ServerMessage>,
     answer: impl Fn(&mpsc::UnboundedSender<ClientMessage>, &[u8]) -> bool,
-) -> Result<Vec<SessionEntry>, String> {
-    loop {
+) -> Result<Handshake, String> {
+    let daemon_instance = loop {
         match recv_until(server_rx, AUTH_TIMEOUT, |m| {
             matches!(
                 m,
@@ -208,20 +247,20 @@ pub(super) async fn handshake(
                     return Err("failed to answer peer identity challenge".to_string());
                 }
             }
-            Some(ServerMessage::AuthResult { success: true, .. }) => break,
+            Some(ServerMessage::AuthResult {
+                success: true,
+                daemon_instance,
+                ..
+            }) => break daemon_instance,
             Some(ServerMessage::AuthResult {
                 success: false,
                 reason,
+                failure,
                 ..
-            }) => {
-                return Err(format!(
-                    "peer rejected authentication: {}",
-                    reason.unwrap_or_else(|| "unknown reason".to_string())
-                ));
-            }
+            }) => return Err(refused(reason, failure)),
             _ => return Err("peer did not complete authentication in time".to_string()),
         }
-    }
+    };
 
     if client_tx
         .send(ClientMessage::SessionList { request_id: 1 })
@@ -237,7 +276,10 @@ pub(super) async fn handshake(
     else {
         return Err("peer did not return a session list in time".to_string());
     };
-    Ok(sessions)
+    Ok(Handshake {
+        sessions,
+        daemon_instance,
+    })
 }
 
 /// Why a link ended.
@@ -328,8 +370,9 @@ async fn reopen(peer_id: &str, conn: &Mutex<PeerConnection>) -> Upstream {
 }
 
 /// Put `upstream` in the dead link's place: reconcile the peer's sessions,
-/// send on the new link, park its tunnel, and re-attach every proxied pane
-/// (for a snapshot: the peer may be a new daemon run). Returns what to feed,
+/// send on the new link, park its tunnel, and re-attach every proxied pane —
+/// from the seqno its mirror reached when the peer is the same daemon run,
+/// else for a snapshot (a new run's seqnos start over). Returns what to feed,
 /// or `None` when the user closed the peer during the reopen: the new link
 /// is then dropped (its tunnel killed) and nothing is registered for it.
 ///
@@ -345,28 +388,32 @@ pub(super) fn relink(
         client_tx,
         server_rx,
         sessions,
+        daemon_instance,
         mut tunnel,
     } = upstream;
     let _membership = app.peer_manager.membership();
     if !app.peer_manager.is_open(peer_id, conn) {
         return None;
     }
-    {
+    let same_run = {
         let mut guard = conn
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.client_tx = client_tx;
         guard.dead = false;
+        let same_run = daemon_instance.is_some() && daemon_instance == guard.daemon_instance;
+        guard.daemon_instance = daemon_instance;
         if let Some(mut old) = guard.ssh_tunnel.take() {
             let _ = old.start_kill();
         }
         guard.ssh_tunnel = tunnel.disarm();
-    }
+        same_run
+    };
     app.peer_manager
         .reconcile_sessions_gated(app, conn, peer_id, sessions);
     conn.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
-        .reattach_panes();
+        .reattach_panes(same_run);
     Some(server_rx)
 }
 
@@ -384,7 +431,9 @@ pub(crate) mod testing {
 
     use std::time::Duration;
 
-    use kmux_protocol::messages::{ClientMessage, ServerMessage, SessionEventMsg};
+    use kmux_protocol::messages::{
+        ClientMessage, DaemonInstanceId, ServerMessage, SessionEventMsg,
+    };
     use tokio::sync::{broadcast, mpsc};
 
     use super::{Connector, Upstream};
@@ -398,9 +447,19 @@ pub(crate) mod testing {
     );
 
     /// A connector whose every attempt opens a link over channels to a peer
-    /// listing `remote_word`, handing the test the peer's ends of it.
+    /// listing `remote_word`, handing the test the peer's ends of it. The
+    /// peer reports no daemon run, like one that predates it.
     pub(crate) fn channel_connector(
         remote_word: &'static str,
+    ) -> (Connector, mpsc::UnboundedReceiver<PeerEnds>) {
+        channel_connector_in(remote_word, None)
+    }
+
+    /// [`channel_connector`] to a peer reporting daemon run `run` on every
+    /// link.
+    pub(crate) fn channel_connector_in(
+        remote_word: &'static str,
+        run: Option<DaemonInstanceId>,
     ) -> (Connector, mpsc::UnboundedReceiver<PeerEnds>) {
         let (ends_tx, ends_rx) = mpsc::unbounded_channel();
         let connector: Connector = std::sync::Arc::new(move || {
@@ -412,6 +471,7 @@ pub(crate) mod testing {
                     client_tx,
                     server_rx,
                     sessions: vec![sample_remote_entry(remote_word)],
+                    daemon_instance: run,
                     tunnel: TunnelGuard(None),
                 })
             })
@@ -485,7 +545,7 @@ pub(crate) mod testing {
 mod tests {
     use std::sync::Arc;
 
-    use kmux_protocol::messages::{ClientId, TermSize};
+    use kmux_protocol::messages::{ClientId, SequenceNo, TermSize};
 
     use super::testing::*;
     use super::*;
@@ -547,6 +607,92 @@ mod tests {
         assert_eq!(reattached, ("fedremote/0".to_string(), None));
     }
 
+    /// A link re-opened to the same daemon run resumes a pane whose mirror is
+    /// in step from the seqno it reached; one re-opened to another run (the
+    /// peer restarted) asks for a snapshot, since that run's seqnos start over
+    /// (issue #209).
+    #[tokio::test(start_paused = true)]
+    async fn a_relinked_pane_resumes_only_in_the_same_daemon_run() {
+        for (before, after, want) in [
+            (Some(PEER_RUN), Some(PEER_RUN), Some(SequenceNo(5))),
+            (Some(PEER_RUN), Some(DaemonInstanceId(78)), None),
+            (None, None, None),
+        ] {
+            assert_eq!(
+                relinked_attach(before, after).await,
+                ("fedremote/0".to_string(), want),
+                "run {before:?} then {after:?}"
+            );
+        }
+    }
+
+    /// The `Attach` a proxied pane is re-attached with after its link, to a
+    /// peer in run `before`, drops and re-opens to run `after`. The pane's
+    /// mirror was seeded by a snapshot at seqno 5 before the drop.
+    async fn relinked_attach(
+        before: Option<DaemonInstanceId>,
+        after: Option<DaemonInstanceId>,
+    ) -> (String, Option<SequenceNo>) {
+        let app = Arc::new(fixture_app());
+        let (connector, mut opened) = channel_connector_in("fedremote", after);
+        let (mut upstream, peer) = app.peer_manager.install_channel_peer(
+            &app,
+            "peer:1",
+            "fedlocal",
+            "fedremote",
+            connector,
+        );
+        app.peer_manager.peers.lock().unwrap()["peer:1"]
+            .lock()
+            .unwrap()
+            .daemon_instance = before;
+        let (data_tx, mut data_rx) = mpsc::channel(8);
+        assert!(app.federated_attach("fedlocal/0", ClientId(1), data_tx, make_outbound().0, SIZE));
+        next_upstream(&mut upstream, |m| {
+            matches!(m, ClientMessage::Attach { .. }).then_some(())
+        })
+        .await;
+        peer.send(snapshot_frame("fedremote/0", 5)).unwrap();
+        tokio::time::timeout(WAIT, data_rx.recv())
+            .await
+            .expect("the snapshot reaches the viewer")
+            .expect("a frame");
+
+        drop(peer);
+        let (mut upstream, _peer) = tokio::time::timeout(WAIT, opened.recv())
+            .await
+            .expect("re-opened within the bound")
+            .expect("a new link");
+        next_upstream(&mut upstream, |m| match m {
+            ClientMessage::Attach {
+                pane_id,
+                last_seqno,
+                ..
+            } => Some((pane_id.clone(), *last_seqno)),
+            _ => None,
+        })
+        .await
+    }
+
+    /// A peer's snapshot of `pane_id` at `seqno`.
+    fn snapshot_frame(pane_id: &str, seqno: u64) -> ServerMessage {
+        ServerMessage::TerminalSnapshot {
+            pane_id: pane_id.to_string(),
+            snapshot: Arc::new(kmux_protocol::messages::GridSnapshot {
+                rows: SIZE.rows,
+                cols: SIZE.cols,
+                cells: vec![],
+                cursor: kmux_protocol::messages::CursorState::default(),
+                modes: kmux_protocol::messages::TermModes::EMPTY,
+                history_total: 0,
+                scrollback_base: 0,
+                scrollback_tail: vec![],
+            }),
+            seqno: SequenceNo(seqno),
+            sent_at_ms: 0,
+        }
+    }
+
     /// A peer that answers nothing is pinged, then — past the deadline —
     /// called unreachable, though its link never closed.
     #[tokio::test(start_paused = true)]
@@ -588,14 +734,15 @@ mod tests {
         assert!(!listed[0].peer_unreachable);
     }
 
-    fn auth_result(success: bool, reason: Option<&str>) -> ServerMessage {
+    fn auth_result(success: bool, failure: Option<AuthFailure>) -> ServerMessage {
         ServerMessage::AuthResult {
             success,
-            reason: reason.map(str::to_string),
-            failure: None,
+            reason: failure.map(|f| f.to_string()),
+            failure,
             client_id: None,
             server_version: None,
             connection_id: None,
+            daemon_instance: success.then_some(PEER_RUN),
             compression: None,
             machine_id: None,
             label: None,
@@ -605,6 +752,9 @@ mod tests {
         }
     }
 
+    /// The daemon run the scripted peers report.
+    const PEER_RUN: DaemonInstanceId = DaemonInstanceId(77);
+
     /// Run [`handshake`] against the scripted peer `frames`, answering each
     /// challenge with `answers` (and recording its nonce). Returns the
     /// outcome, the nonces answered and what the hub sent the peer.
@@ -612,7 +762,7 @@ mod tests {
         frames: Vec<ServerMessage>,
         answers: bool,
     ) -> (
-        Result<Vec<String>, String>,
+        Result<(Vec<String>, Option<DaemonInstanceId>), String>,
         Vec<Vec<u8>>,
         Vec<ClientMessage>,
     ) {
@@ -627,7 +777,10 @@ mod tests {
             answers
         })
         .await
-        .map(|sessions| sessions.into_iter().map(|e| e.meta.word_id).collect());
+        .map(|done| {
+            let words = done.sessions.into_iter().map(|e| e.meta.word_id).collect();
+            (words, done.daemon_instance)
+        });
         drop(server_tx);
         let mut sent = Vec::new();
         while let Ok(msg) = client_rx.try_recv() {
@@ -652,7 +805,11 @@ mod tests {
             true,
         )
         .await;
-        assert_eq!(result, Ok(vec!["fedremote".to_string()]));
+        assert_eq!(
+            result,
+            Ok((vec!["fedremote".to_string()], Some(PEER_RUN))),
+            "the list, and the run it came from"
+        );
         assert_eq!(nonces, vec![vec![7; 4]]);
         assert!(matches!(
             sent.as_slice(),
@@ -671,11 +828,8 @@ mod tests {
             Err("failed to answer peer identity challenge".to_string())
         );
         let (result, _, sent) =
-            run_handshake(vec![auth_result(false, Some("bad token"))], true).await;
-        assert_eq!(
-            result,
-            Err("peer rejected authentication: bad token".to_string())
-        );
+            run_handshake(vec![auth_result(false, Some(AuthFailure::BadToken))], true).await;
+        assert_eq!(result, Err(refused(None, Some(AuthFailure::BadToken))));
         assert!(sent.is_empty(), "no list asked for");
         let (result, _, _) = run_handshake(vec![auth_result(true, None)], true).await;
         assert_eq!(
@@ -686,6 +840,39 @@ mod tests {
         assert_eq!(
             result,
             Err("peer did not complete authentication in time".to_string())
+        );
+    }
+
+    /// A refused link says why, and what to do about it where anything can
+    /// be done: a rotated token needs the peer opened again with the new one.
+    #[test]
+    fn a_refusal_names_its_remedy() {
+        use kmux_protocol::messages::{PROTOCOL_RANGE, ProtocolVersion};
+
+        let token = refused(None, Some(AuthFailure::BadToken));
+        assert!(
+            token.starts_with("peer rejected authentication: invalid token ("),
+            "{token}"
+        );
+        assert!(token.contains("new token"), "{token}");
+        let mismatch = refused(
+            None,
+            Some(AuthFailure::ProtocolMismatch {
+                client: PROTOCOL_RANGE,
+                daemon: kmux_protocol::messages::ProtocolRange::exact(ProtocolVersion::new(
+                    2, 0, 0,
+                )),
+            }),
+        );
+        assert!(mismatch.contains("ranges overlap"), "{mismatch}");
+        assert_eq!(
+            refused(Some("go away".into()), None),
+            "peer rejected authentication: go away",
+            "an older peer's text, with nothing to add"
+        );
+        assert_eq!(
+            refused(None, Some(AuthFailure::IdentityRejected)),
+            "peer rejected authentication: identity verification failed"
         );
     }
 

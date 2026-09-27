@@ -2,7 +2,7 @@ use std::path::Path;
 #[cfg(feature = "remote")]
 use std::sync::{Arc, Mutex};
 
-use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ConnectionId, ServerMessage};
+use kmux_protocol::messages::{ClientCapabilities, ClientMessage, ResumeFrom, ServerMessage};
 use kmux_protocol::{decode_server, encode_client, read_frame, write_frame};
 #[cfg(feature = "remote")]
 use kmux_sys::tls::{TofuStore, TofuVerifier};
@@ -17,7 +17,8 @@ use crate::connect::ConnectResult;
 /// Encode and write the initial `Auth` frame on a freshly-opened control stream.
 ///
 /// Centralises the auth handshake payload — token + supported protocol range +
-/// named protocol/application capabilities + `connection_id` + this process's identity claim
+/// named protocol/application capabilities + the registration to resume
+/// (`connection_id` + `resume_instance`) + this process's identity claim
 /// (public key + hostname/username, issue #146) — so every transport (UDS / TCP
 /// / TCP+TLS / QUIC) sends a byte-identical frame and a new `Auth` field is wired
 /// in exactly one place. The daemon replies with an `AuthChallenge` the caller
@@ -27,7 +28,7 @@ pub(crate) async fn send_auth_frame<W: AsyncWrite + Unpin>(
     writer: &mut W,
     token: String,
     capabilities: ClientCapabilities,
-    connection_id: Option<ConnectionId>,
+    resume: Option<ResumeFrom>,
 ) -> Result<(), String> {
     let (public_key, hostname, username) = local_identity_claim();
     let auth_bytes = encode_client(&ClientMessage::Auth {
@@ -35,7 +36,8 @@ pub(crate) async fn send_auth_frame<W: AsyncWrite + Unpin>(
         protocol_range: kmux_protocol::messages::PROTOCOL_RANGE,
         protocol_capabilities: kmux_protocol::messages::protocol_capabilities(),
         capabilities,
-        connection_id,
+        connection_id: resume.map(|from| from.connection_id),
+        resume_instance: resume.and_then(|from| from.instance),
         public_key,
         hostname,
         username,
@@ -99,7 +101,7 @@ pub fn answer_auth_challenge(
 /// The server interleaves `ServerMessage` values on the stream; the client
 /// dispatches them by message type (`pane_id` fields handle routing).
 ///
-/// Pass `connection_id = Some(id)` to resume an existing session after a
+/// Pass `resume = Some(..)` to resume an existing session after a
 /// transport switch (e.g. QUIC → TCP fallback).
 #[cfg(feature = "remote")]
 pub async fn connect_tcp(
@@ -108,7 +110,7 @@ pub async fn connect_tcp(
     token: String,
     server_tx: mpsc::UnboundedSender<ServerMessage>,
     capabilities: ClientCapabilities,
-    connection_id: Option<ConnectionId>,
+    resume: Option<ResumeFrom>,
 ) -> ConnectResult {
     let stream = match TcpStream::connect(format!("{host}:{port}")).await {
         Ok(s) => s,
@@ -123,7 +125,7 @@ pub async fn connect_tcp(
     let (mut read_half, mut write_half) = stream.into_split();
 
     // Authenticate immediately.
-    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, connection_id).await {
+    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, resume).await {
         return ConnectResult::Failed(e);
     }
 
@@ -185,7 +187,7 @@ pub async fn connect_tcp_tls(
     token: String,
     server_tx: mpsc::UnboundedSender<ServerMessage>,
     capabilities: ClientCapabilities,
-    connection_id: Option<ConnectionId>,
+    resume: Option<ResumeFrom>,
     accept_invalid: bool,
 ) -> ConnectResult {
     use rustls::pki_types::ServerName;
@@ -225,7 +227,7 @@ pub async fn connect_tcp_tls(
 
     let (mut read_half, mut write_half) = tokio::io::split(tls_stream);
 
-    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, connection_id).await {
+    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, resume).await {
         return ConnectResult::Failed(e);
     }
 
@@ -279,7 +281,7 @@ pub async fn connect_uds(
     token: String,
     server_tx: mpsc::UnboundedSender<ServerMessage>,
     capabilities: ClientCapabilities,
-    connection_id: Option<ConnectionId>,
+    resume: Option<ResumeFrom>,
 ) -> ConnectResult {
     let socket_path = socket_path.as_ref();
 
@@ -295,7 +297,7 @@ pub async fn connect_uds(
 
     let (mut read_half, mut write_half) = tokio::io::split(stream);
 
-    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, connection_id).await {
+    if let Err(e) = send_auth_frame(&mut write_half, token, capabilities, resume).await {
         return ConnectResult::Failed(e);
     }
 

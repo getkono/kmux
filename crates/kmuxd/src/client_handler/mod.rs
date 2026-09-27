@@ -18,7 +18,7 @@ use kmux_protocol::Compressor;
 use kmux_protocol::TransportKind;
 use kmux_protocol::messages::{
     ClientCapabilities, ClientId, ConnectionId, ErrorCode, FrontendKind, ProtocolVersion,
-    ServerMessage,
+    ResumeFrom, ServerMessage,
 };
 use tokio::sync::mpsc;
 use tokio::task::AbortHandle;
@@ -96,8 +96,9 @@ pub struct PendingAuth {
     pub capabilities: ClientCapabilities,
     pub negotiated_protocol: ProtocolVersion,
     pub negotiated_capabilities: Vec<String>,
-    pub connection_id: Option<ConnectionId>,
-    /// Client build identity from `Auth` (protocol 37), carried to
+    /// The registration `Auth` asked to resume, if any.
+    pub resume: Option<ResumeFrom>,
+    /// Client build identity from `Auth`, carried to
     /// `register_client` once the signature is verified.
     pub client_kind: FrontendKind,
     pub client_git_sha: String,

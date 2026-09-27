@@ -36,8 +36,8 @@ use std::time::Duration;
 
 use kmux_client::grid::CellGrid;
 use kmux_protocol::messages::{
-    ClientId, ClientInfo, ClientMessage, PaneProcesses, PeerId, PeerTarget, RequestId, SequenceNo,
-    ServerMessage, SessionEntry, SessionEventMsg, TermSize, epoch_millis,
+    ClientId, ClientInfo, ClientMessage, DaemonInstanceId, PaneProcesses, PeerId, PeerTarget,
+    RequestId, SequenceNo, ServerMessage, SessionEntry, SessionEventMsg, TermSize, epoch_millis,
 };
 use kmux_protocol::{format_pane_id, parse_pane_id};
 
@@ -126,6 +126,10 @@ struct ProxiedPane {
     /// Upstream seqno the mirror reflects; stamped onto minted snapshots so a late
     /// attacher's subsequent diffs line up without a spurious gap.
     last_seqno: SequenceNo,
+    /// Whether the mirror holds the peer's screen as of `last_seqno`: a
+    /// snapshot seeded it, and none has been asked for since. Only then may a
+    /// re-opened link resume the pane from `last_seqno`.
+    in_step: bool,
     /// Effective size (smallest-wins over `viewers`) last sent upstream; lets us
     /// suppress redundant upstream `Resize`s.
     upstream_size: TermSize,
@@ -137,6 +141,7 @@ impl ProxiedPane {
             viewers: HashMap::new(),
             mirror: CellGrid::new(size.rows.max(1) as usize, size.cols.max(1) as usize),
             last_seqno: SequenceNo(0),
+            in_step: false,
             upstream_size: size,
         }
     }
@@ -225,6 +230,7 @@ impl ProxiedPane {
             } => {
                 self.mirror.apply_snapshot((**snapshot).clone());
                 self.last_seqno = *seqno;
+                self.in_step = true;
             }
             ServerMessage::TerminalUpdate { diff, seqno, .. } => {
                 self.mirror.apply_diff((**diff).clone());
@@ -300,6 +306,10 @@ struct PeerConnection {
     /// re-opened (issue #208). Its sessions stay listed, flagged
     /// `peer_unreachable`, and requests for them fail at once.
     dead: bool,
+    /// The peer's daemon run as of the last link (`None` from a peer that
+    /// predates it). A re-opened link that reaches the same run resumes its
+    /// panes from their seqnos; any other gets a snapshot.
+    daemon_instance: Option<DaemonInstanceId>,
     /// How the link is re-opened when it drops. Read afresh on every attempt,
     /// so re-opening an unreachable peer with a new target (a Direct peer's
     /// rotated token) takes effect on the next attempt (issue #208).
@@ -323,26 +333,34 @@ impl PeerConnection {
             pending_acks: HashMap::new(),
             ssh_tunnel: None,
             dead: false,
+            daemon_instance: None,
         }
     }
 
     /// Re-attach every proxied pane still held (those with a viewer, whose
-    /// session the peer still lists) on a re-opened link (issue #208), asking
-    /// for a snapshot: the peer may be a new daemon run, whose seqnos start
-    /// over. The snapshot re-seeds the mirror and is fanned out like any
-    /// frame, so it resyncs every streaming viewer; a paused one catches up
-    /// from the mirror when it resumes and re-attaches.
-    fn reattach_panes(&self) {
-        for (local_pane, pane) in &self.panes {
+    /// session the peer still lists) on a re-opened link (issue #208).
+    ///
+    /// On the `same_run` of the peer, a pane whose mirror is in step resumes
+    /// from its `last_seqno`: the peer replays only what the link missed (or
+    /// answers `SyncReset` and a snapshot when that is too much), and the
+    /// frames continue the seqnos every viewer already has. Otherwise — a new
+    /// run, whose seqnos start over, or a mirror never seeded — it asks for a
+    /// snapshot, which re-seeds the mirror and is fanned out like any frame,
+    /// resyncing every streaming viewer; a paused one catches up from the
+    /// mirror when it resumes and re-attaches.
+    fn reattach_panes(&mut self, same_run: bool) {
+        for (local_pane, pane) in &mut self.panes {
             let Some((local_word, idx)) = parse_pane_id(local_pane) else {
                 continue;
             };
             let Some(remote_word) = self.local_to_remote.get(local_word) else {
                 continue;
             };
+            let last_seqno = (same_run && pane.in_step).then_some(pane.last_seqno);
+            pane.in_step = last_seqno.is_some();
             let _ = self.client_tx.send(ClientMessage::Attach {
                 pane_id: format_pane_id(remote_word, idx),
-                last_seqno: None,
+                last_seqno,
                 size: pane.upstream_size,
             });
         }
@@ -512,6 +530,7 @@ impl PeerManager {
             client_tx,
             server_rx,
             sessions: remote_sessions,
+            daemon_instance,
             mut tunnel,
         } = link::connect_upstream(target.clone()).await?;
 
@@ -520,6 +539,7 @@ impl PeerManager {
         // as long as the link and is killed by `close_peer`.
         let mut conn = PeerConnection::new(client_tx, link::connector_for(target));
         conn.ssh_tunnel = tunnel.disarm();
+        conn.daemon_instance = daemon_instance;
         let mut assigned_words: Vec<String> = Vec::new();
         for entry in remote_sessions {
             let remote_word = entry.meta.word_id.clone();

@@ -5,8 +5,8 @@
 //! the one place in the dispatcher that can decide to hang up.
 
 use kmux_protocol::messages::{
-    AuthFailure, CAPABILITY_FRAME_ZSTD, ClientCapabilities, ClientMessage, Compression,
-    ConnectionId, ErrorCode, FrontendKind, ProtocolRange, ServerMessage, negotiate_capabilities,
+    AuthFailure, CAPABILITY_FRAME_ZSTD, ClientCapabilities, ClientMessage, Compression, ErrorCode,
+    FrontendKind, ProtocolRange, ResumeFrom, ServerMessage, negotiate_capabilities,
 };
 use tracing::{info, warn};
 
@@ -27,6 +27,7 @@ fn auth_failure(failure: AuthFailure) -> ServerMessage {
         client_id: None,
         server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         connection_id: None,
+        daemon_instance: None,
         compression: None,
         machine_id: None,
         label: None,
@@ -53,6 +54,7 @@ pub(super) async fn handle_unauthenticated(
             protocol_capabilities,
             capabilities,
             connection_id,
+            resume_instance,
             public_key,
             hostname,
             username,
@@ -67,7 +69,10 @@ pub(super) async fn handle_unauthenticated(
                 protocol_range,
                 protocol_capabilities,
                 capabilities,
-                connection_id,
+                resume: connection_id.map(|connection_id| ResumeFrom {
+                    connection_id,
+                    instance: resume_instance,
+                }),
                 public_key,
                 hostname,
                 username,
@@ -85,7 +90,7 @@ pub(super) async fn handle_unauthenticated(
     }
 }
 
-/// The twelve fields of [`ClientMessage::Auth`], carried as one value.
+/// The fields of [`ClientMessage::Auth`], carried as one value.
 ///
 /// A struct rather than twelve parameters: they are one message, they are
 /// destructured together, and every one of them ends up in `PendingAuth`
@@ -96,7 +101,9 @@ pub(super) struct AuthRequest {
     pub protocol_range: ProtocolRange,
     pub protocol_capabilities: Vec<String>,
     pub capabilities: ClientCapabilities,
-    pub connection_id: Option<ConnectionId>,
+    /// `Auth`'s `connection_id` and `resume_instance`: the registration to
+    /// resume, if any.
+    pub resume: Option<ResumeFrom>,
     pub public_key: Vec<u8>,
     pub hostname: String,
     pub username: String,
@@ -141,7 +148,7 @@ pub(super) fn on_auth(state: &mut SharedClientState, req: AuthRequest) -> Flow {
         capabilities: req.capabilities,
         negotiated_protocol,
         negotiated_capabilities,
-        connection_id: req.connection_id,
+        resume: req.resume,
         client_kind: req.client_kind,
         client_git_sha: req.client_git_sha,
         client_git_dirty: req.client_git_dirty,
@@ -176,7 +183,7 @@ pub(super) async fn on_auth_proof(state: &mut SharedClientState, signature: Vec<
         .register_client(
             state.transport,
             std::sync::Arc::clone(&state.metrics),
-            pending.connection_id,
+            pending.resume,
             ClientIdentity {
                 machine_id: machine_id.clone(),
                 hostname: pending.hostname,
@@ -215,6 +222,7 @@ pub(super) async fn on_auth_proof(state: &mut SharedClientState, signature: Vec<
         client_id: Some(reg.client_id),
         server_version: Some(env!("CARGO_PKG_VERSION").to_string()),
         connection_id: Some(reg.connection_id),
+        daemon_instance: Some(state.app.instance_id),
         compression: compress.then_some(Compression::Zstd),
         machine_id: Some(machine_id),
         label: Some(reg.label),
@@ -268,7 +276,10 @@ mod tests {
             &mut second,
             &identity,
             protocol_capabilities(),
-            first.connection_id,
+            first.connection_id.map(|connection_id| ResumeFrom {
+                connection_id,
+                instance: Some(app.instance_id),
+            }),
         )
         .await;
 
@@ -277,6 +288,42 @@ mod tests {
         assert_eq!(second.connection_id, first.connection_id);
         assert_eq!(second.client_id, first.client_id);
         assert_eq!(second.pending_swap_from, Some(TransportKind::Tcp));
+    }
+
+    /// A channel presenting a connection id from another daemon run is
+    /// registered afresh, and every successful `AuthResult` names this run.
+    #[tokio::test]
+    async fn a_channel_resuming_another_run_is_registered_afresh() {
+        let app = Arc::new(fixture_app());
+        let identity = kmux_sys::identity::Identity::generate();
+        let (mut first, _c1, _r1) = fixture_client_state(Arc::clone(&app), TransportKind::Tcp);
+        authenticate_as(&mut first, &identity, protocol_capabilities(), None).await;
+        let (mut second, _c2, mut rx) = fixture_client_state(Arc::clone(&app), TransportKind::Quic);
+        authenticate_as(
+            &mut second,
+            &identity,
+            protocol_capabilities(),
+            first.connection_id.map(|connection_id| ResumeFrom {
+                connection_id,
+                instance: Some(DaemonInstanceId(app.instance_id.0 ^ 1)),
+            }),
+        )
+        .await;
+
+        assert_ne!(second.connection_id, first.connection_id);
+        assert_eq!(second.generation, 0);
+        assert_eq!(second.pending_swap_from, None);
+        let result = std::iter::from_fn(|| rx.try_recv().ok())
+            .find(|m| matches!(m, ServerMessage::AuthResult { .. }))
+            .expect("an AuthResult");
+        assert!(matches!(
+            result,
+            ServerMessage::AuthResult {
+                success: true,
+                daemon_instance: Some(run),
+                ..
+            } if run == app.instance_id
+        ));
     }
 
     /// With `mode = always`, a networked transport negotiates zstd: the auth
@@ -377,6 +424,7 @@ mod tests {
                 protocol_capabilities: Vec::new(),
                 capabilities: ClientCapabilities::default(),
                 connection_id: None,
+                resume_instance: None,
                 public_key: Vec::new(),
                 hostname: "host".to_string(),
                 username: "user".to_string(),
@@ -420,6 +468,7 @@ mod tests {
                 protocol_capabilities: protocol_capabilities(),
                 capabilities: ClientCapabilities::default(),
                 connection_id: None,
+                resume_instance: None,
                 public_key: identity.public_key_bytes().to_vec(),
                 hostname: "h".to_string(),
                 username: "u".to_string(),
@@ -481,6 +530,7 @@ mod tests {
             protocol_capabilities: protocol_capabilities(),
             capabilities: ClientCapabilities::default(),
             connection_id: None,
+            resume_instance: None,
             public_key: Vec::new(),
             hostname: "host".to_string(),
             username: "user".to_string(),

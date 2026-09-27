@@ -1,6 +1,8 @@
 use std::time::Instant;
 
-use kmux_protocol::messages::{ClientId, ClientMessage, PeerId, PeerTarget, ServerMessage, WordId};
+use kmux_protocol::messages::{
+    ClientId, ClientMessage, PeerId, PeerTarget, ResumeFrom, ServerMessage, WordId,
+};
 use tokio::sync::mpsc;
 use tracing::info;
 
@@ -32,7 +34,7 @@ impl SessionManager {
         match pipeline::run_bootstrap(
             target,
             self.capabilities.clone(),
-            self.connection_id,
+            self.resume_from(),
             srv_tx,
             observer,
         )
@@ -77,8 +79,8 @@ impl SessionManager {
         );
 
         self.request_session_list();
-        self.previous_daemon_pid = self.daemon_pid;
-        self.daemon_pid = outcome.daemon_pid;
+        self.previous_daemon_instance = self.daemon_instance;
+        self.daemon_instance = outcome.daemon_instance;
         self.resume_visible_panes(self.link_reached_same_daemon());
 
         outcome.ssh_context
@@ -88,7 +90,16 @@ impl SessionManager {
     /// (issue #208): only then do its panes resume from their seqnos, and is
     /// input held during the outage still meant for the same shells.
     pub fn link_reached_same_daemon(&self) -> bool {
-        self.daemon_pid.is_some() && self.daemon_pid == self.previous_daemon_pid
+        self.daemon_instance.is_some() && self.daemon_instance == self.previous_daemon_instance
+    }
+
+    /// The registration a new link asks to resume: this connection's id and
+    /// the daemon run that assigned it. `None` before the first link.
+    pub fn resume_from(&self) -> Option<ResumeFrom> {
+        self.connection_id.map(|connection_id| ResumeFrom {
+            connection_id,
+            instance: self.daemon_instance,
+        })
     }
 
     pub fn set_ws_sender(&mut self, sender: mpsc::UnboundedSender<ClientMessage>) {
