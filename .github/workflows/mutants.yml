@@ -30,7 +30,11 @@ jobs:
       # the `judge` job below, over the merged outcomes.
       fail-fast: false
       matrix:
-        shard: [1, 2, 3, 4, 5, 6, 7, 8]
+        # cargo-mutants numbers shards from 0: `--shard k/n` needs k < n.
+        # These once ran 1-8, so shard 8 refused to start and shard 0 — an
+        # eighth of the mutants — never ran, while the judge read the other
+        # seven as the whole sweep.
+        shard: [0, 1, 2, 3, 4, 5, 6, 7]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -70,7 +74,7 @@ jobs:
         run: mise run mutants -- --shard ${{ matrix.shard }}/8
 
       - uses: actions/upload-artifact@v4
-        if: always()
+        if: always() && steps.complete.outcome == 'success'
         with:
           name: mutants-shard-${{ matrix.shard }}
           path: mutants.out/
@@ -98,6 +102,18 @@ jobs:
       # Every shard directory, in one call: the gate merges them, so a package
       # split across shards is judged on its total rather than eight times on
       # eight partial views.
+      # A shard that never ran uploads nothing, and seven shards merged look
+      # exactly like a sweep of everything — with an eighth of the mutants
+      # missing and every budget too tight by their survivors.
+      - name: Every shard ran
+        id: complete
+        run: |
+          uploaded=$(find shards -mindepth 1 -maxdepth 1 -type d | wc -l)
+          if [ "$uploaded" -ne 8 ]; then
+            echo "::error::$uploaded of 8 shards uploaded results; a partial sweep is not judged"
+            exit 1
+          fi
+
       - name: Believability check and budget comparison
         run: |
           dirs=$(find shards -name outcomes.json -printf '%h\n' | sort)
@@ -109,7 +125,7 @@ jobs:
       # opening a PR keeps the budget a deliberate, reviewed edit — the same
       # rule the lint ratchet follows.
       - name: What the budgets would become
-        if: always()
+        if: always() && steps.complete.outcome == 'success'
         run: |
           dirs=$(find shards -name outcomes.json -printf '%h\n' | sort)
           # shellcheck disable=SC2086

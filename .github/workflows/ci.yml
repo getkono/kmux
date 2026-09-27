@@ -117,12 +117,27 @@ jobs:
   # holds it to zero survivors rather than to the whole-crate budgets. A
   # surviving mutant in code this PR touched means the change is not covered by
   # any assertion.
+  #
+  # Four shards, judged together by `Mutation (diff)` below. Nearly all of a
+  # shard's time is rebuilding the mutated crate once per mutant (a kmuxd
+  # mutant is ~16 s), so the wall clock is the mutant count over the shard
+  # count: a 130-mutant kmuxd change took 36 minutes of the hour on one runner.
+  # `--in-place` mutates this checkout instead of a scratch copy, so the
+  # unmutated baseline builds on the restored `target/` rather than from
+  # nothing — a runner is thrown away afterwards, so nothing is left behind.
   # See docs/testing.md and docs/quality-gates.md.
   mutants:
-    name: Mutation (diff)
+    name: Mutation shard ${{ matrix.shard }}/4
     runs-on: ubuntu-latest
     if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'skip-mutants')
     timeout-minutes: 60
+    strategy:
+      # A shard that fails has not measured its mutants; the judge refuses the
+      # sweep then, so the others may as well finish and say what they found.
+      fail-fast: false
+      matrix:
+        # cargo-mutants numbers shards from 0: `--shard k/n` needs k < n.
+        shard: [0, 1, 2, 3]
     steps:
       - uses: actions/checkout@v4
         with:
@@ -159,22 +174,68 @@ jobs:
           restore-keys: |
             ${{ runner.os }}-zig-
 
-      - name: Mutate the diff
+      - name: Mutate this shard of the diff
         run: |
-          git diff "${{ github.event.pull_request.base.sha }}" > pr.diff
-          mise run mutants -- --in-diff pr.diff
-
-      # The gate's first job is deciding whether to believe the sweep at all —
-      # see xtask/src/mutants.rs for why that is not paranoia.
-      - name: Judge the sweep
-        if: always()
-        run: mise run mutants-gate --diff
+          git diff "${{ github.event.pull_request.base.sha }}" > "$RUNNER_TEMP/pr.diff"
+          mise run mutants -- --in-diff "$RUNNER_TEMP/pr.diff" --shard ${{ matrix.shard }}/4 --in-place
 
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: mutants-diff
-          path: mutants.out*/
+          name: mutants-diff-${{ matrix.shard }}
+          path: mutants.out/
+          if-no-files-found: ignore
+
+  mutants-judge:
+    name: Mutation (diff)
+    needs: mutants
+    runs-on: ubuntu-latest
+    if: always() && github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'skip-mutants')
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install toolchains (mise)
+        uses: jdx/mise-action@v2
+        with:
+          install: true
+          cache: true
+
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: mutants-diff-*
+          path: shards/
+
+      # The gate's first job is deciding whether to believe the sweep at all —
+      # see xtask/src/mutants.rs for why that is not paranoia. Before it, every
+      # shard must have run: a shard that did not leaves nothing behind, and a
+      # merge of the others would read as a clean diff.
+      - name: Judge the sweep
+        run: |
+          if [ "${{ needs.mutants.result }}" != "success" ]; then
+            echo "::error::a mutation shard did not finish (${{ needs.mutants.result }}); its mutants are unmeasured"
+            exit 1
+          fi
+          uploaded=$(find shards -mindepth 1 -maxdepth 1 -type d | wc -l)
+          if [ "$uploaded" -ne 4 ]; then
+            echo "::error::$uploaded of 4 shards uploaded results"
+            exit 1
+          fi
+          dirs=$(find shards -name outcomes.json -printf '%h\n' | sort)
+          if [ -z "$dirs" ]; then
+            # Each shard left NOTHING_IN_SCOPE: every group ran and had
+            # nothing to mutate (a diff that touches no Rust).
+            for shard in shards/*/; do
+              if [ ! -f "$shard/NOTHING_IN_SCOPE" ]; then
+                echo "::error::$shard has neither outcomes nor NOTHING_IN_SCOPE"
+                exit 1
+              fi
+            done
+            echo "mutants-gate: nothing in scope in any shard; passing"
+            exit 0
+          fi
+          echo "merging: $dirs"
+          # shellcheck disable=SC2086
+          cargo run -q -p xtask -- mutants-gate --diff $dirs
 
   # Conventional-commit enforcement (issue #130): lint every commit in the PR via
   # convco — the same `mise run commit-check` the hk pre-push hook runs locally.
