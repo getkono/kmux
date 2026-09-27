@@ -1359,6 +1359,7 @@ mod tests {
                 term_state,
                 PtyWriter::sink().unwrap(),
                 tokio::task::spawn(async {}),
+                crate::engine::hold::channel().0,
                 crate::engine::pty_response_channel().1,
             )),
             program: "/bin/sh".to_string(),

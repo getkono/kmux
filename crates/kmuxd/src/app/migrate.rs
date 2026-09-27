@@ -1,9 +1,12 @@
 //! Server-side support for graceful daemon handoff (issue #35): building the
-//! pane manifest advertised to a successor daemon and quiescing the relay loops
-//! before each live PTY master fd is migrated.
+//! pane manifest advertised to a successor daemon, holding the relay loops for
+//! the final checkpoint (and releasing them on a rollback), and quiescing them
+//! once the handoff has committed.
 //!
 //! The transport and orchestration live in [`crate::handoff`]; see
 //! `docs/daemon-handoff.md` for the full sequence.
+
+use std::time::Duration;
 
 use kmux_protocol::control_rpc::HandoffPaneMeta;
 use kmux_protocol::format_pane_id;
@@ -45,6 +48,43 @@ impl ServerApp {
         out
     }
 
+    /// Park every in-process pane's PTY reader between two reads, for a
+    /// handoff's final checkpoint (issue #207): once this returns `true`, the
+    /// checkpoint holds exactly the output this daemon consumed. Unlike
+    /// [`Self::quiesce_relays`] it can be undone, by
+    /// [`Self::release_relays`], so a handoff that fails afterwards rolls back
+    /// to panes that read again.
+    ///
+    /// Returns `false`, with every reader released again, when one has not
+    /// parked within `timeout`. Worker panes are not held: their worker reads
+    /// the PTY itself.
+    pub async fn hold_relays(&self, timeout: Duration) -> bool {
+        let holds: Vec<_> = {
+            let sessions = self.sessions.read().await;
+            sessions
+                .values()
+                .flat_map(|state| state.panes.values())
+                .filter_map(|relay| relay.engine.hold_reader())
+                .collect()
+        };
+        let deadline = tokio::time::Instant::now() + timeout;
+        for hold in holds {
+            if tokio::time::timeout_at(deadline, hold).await.is_err() {
+                self.release_relays().await;
+                return false;
+            }
+        }
+        true
+    }
+
+    /// Let every reader parked by [`Self::hold_relays`] go on.
+    pub async fn release_relays(&self) {
+        let sessions = self.sessions.read().await;
+        for relay in sessions.values().flat_map(|state| state.panes.values()) {
+            relay.engine.release_reader();
+        }
+    }
+
     /// Abort every pane's relay read task and wait for them to stop.
     ///
     /// After this returns, the outgoing daemon reads no PTY masters, so the
@@ -72,10 +112,69 @@ impl ServerApp {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::time::Duration;
 
     use kmux_protocol::messages::{ClientCapabilities, TermSize};
 
     use super::ServerApp;
+
+    /// Whether the pane's emulator shows `text` anywhere on its grid.
+    async fn grid_shows(app: &ServerApp, pane_id: &str, text: &str) -> bool {
+        let sessions = app.sessions.read().await;
+        let relay = super::super::helpers::get_pane_relay(&sessions, pane_id).expect("the pane");
+        let snapshot = relay.engine.snapshot();
+        let chars: String = snapshot.cells.iter().map(|c| c.c).collect();
+        chars.contains(text)
+    }
+
+    /// While the readers are held, a pane's output waits in the PTY instead
+    /// of reaching its emulator; once released, it is read and shown. A real
+    /// PTY, because what is held is the read of it (R7).
+    #[tokio::test]
+    async fn held_relays_read_nothing_until_released() {
+        let app = crate::fixtures::fixture_app();
+        let size = TermSize {
+            rows: 4,
+            cols: 40,
+            pixel_width: 0,
+            pixel_height: 0,
+        };
+        let entry = app
+            .create_session(
+                None,
+                None,
+                Some("/bin/cat".into()),
+                vec![],
+                size,
+                &ClientCapabilities::default(),
+            )
+            .await
+            .expect("a session");
+        let pane_id = kmux_protocol::format_pane_id(&entry.meta.word_id, 0);
+
+        assert!(app.hold_relays(Duration::from_secs(10)).await, "parked");
+        app.write_input(
+            &pane_id,
+            kmux_protocol::messages::ClientId(1),
+            b"held\n".to_vec(),
+        )
+        .await
+        .expect("queued");
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        assert!(
+            !grid_shows(&app, &pane_id, "held").await,
+            "nothing read while held"
+        );
+
+        app.release_relays().await;
+        tokio::time::timeout(Duration::from_secs(10), async {
+            while !grid_shows(&app, &pane_id, "held").await {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("read once released");
+    }
 
     /// End-to-end (in-process) live migration: a session's PTY child is handed
     /// off to a successor `ServerApp` by transferring its master fd, and the

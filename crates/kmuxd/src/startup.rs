@@ -1,4 +1,5 @@
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use tokio::sync::Notify;
@@ -14,6 +15,7 @@ use kmux_sys::transport::{HANDSHAKE_TIMEOUT, IncomingSession, Listener, SessionT
 
 use crate::app::ServerApp;
 use crate::auth::{generate_token, persist_token};
+use crate::handoff::receiver::Outcome;
 use crate::persist::checkpoint::Checkpointer;
 use crate::term_state;
 use crate::tls;
@@ -64,15 +66,16 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
 
     // When launched as a graceful-restart successor (`--handoff`), pull the
     // predecessor's live PTY fds and adopt its auth token *before* binding any
-    // listeners, so already-connected clients re-auth seamlessly. On any failure
-    // this returns `None` and we fall back to a normal snapshot restore.
+    // listeners, so already-connected clients re-auth seamlessly. Without live
+    // fds we fall back to a normal snapshot restore; and if the predecessor
+    // rolled the handoff back and keeps serving, this daemon must not serve
+    // at all (issue #207).
     let mut handoff_outcome = if handoff {
-        match crate::handoff::receiver::run().await {
-            Ok(outcome) => outcome,
-            Err(e) => {
-                warn!("handoff receive failed: {e}; falling back to snapshot restore");
-                None
-            }
+        let predecessor = predecessor_pid.map(nix::unistd::Pid::from_raw);
+        match crate::handoff::receiver::run(predecessor).await {
+            Outcome::Inherited(inherited) => Some(inherited),
+            Outcome::Restore => None,
+            Outcome::StandDown => return Ok(()),
         }
     } else {
         None
@@ -257,7 +260,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     // Signals a graceful live-PTY handoff (issue #35); `handoff_in_progress`
     // guards against concurrent restart commands.
     let restart = Arc::new(Notify::new());
-    let handoff_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let handoff_in_progress = Arc::new(AtomicBool::new(false));
 
     // Spawn idle-shutdown watcher when configured.
     if cfg.idle_shutdown_secs > 0 {
@@ -347,27 +350,35 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     // Install signal handlers and wait for a shutdown or restart signal.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
 
-    // `true` once a graceful handoff committed: the successor wrote the
-    // checkpoint and owns the live PTYs, so we skip our own shutdown checkpoint.
+    // `true` once a graceful handoff committed: we wrote the final checkpoint
+    // and the successor owns the live PTYs, so we skip our shutdown checkpoint.
     let mut handed_off = false;
+    // A handoff runs as a task of its own, so the signals below are still
+    // serviced while it does (issue #207).
+    let mut in_flight: Option<HandoffInFlight> = None;
     loop {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => { info!("Received SIGINT, shutting down"); break; }
             _ = sigterm.recv() => { info!("Received SIGTERM, shutting down"); break; }
             _ = shutdown.notified() => { info!("Shutdown requested via control socket"); break; }
-            _ = restart.notified() => {
+            _ = restart.notified(), if in_flight.is_none() => {
                 info!("Graceful restart requested; beginning live PTY handoff");
-                match crate::handoff::sender::run(&app, checkpointer.as_ref()).await {
-                    Ok(()) => { handed_off = true; break; }
-                    Err(e) => {
-                        warn!("handoff failed, resuming normal operation: {e}");
-                        // Nothing destructive happened before the commit point —
-                        // clear the guard and keep serving.
-                        handoff_in_progress.store(false, std::sync::atomic::Ordering::SeqCst);
-                    }
+                in_flight = Some(HandoffInFlight::start(&app, checkpointer.clone()));
+            }
+            committed = handoff_finished(&mut in_flight, &app, checkpointer.as_deref()) => {
+                in_flight = None;
+                if committed {
+                    handed_off = true;
+                    break;
                 }
+                warn!("handoff failed, resuming normal operation");
+                handoff_in_progress.store(false, Ordering::SeqCst);
             }
         }
+    }
+    // A shutdown signal mid-handoff stops it; it may have committed already.
+    if let Some(handoff) = in_flight.take() {
+        handed_off = handoff.abandon(&app, checkpointer.as_deref()).await;
     }
 
     // Abort listener tasks.
@@ -423,6 +434,81 @@ async fn checkpoint_loop(app: Arc<ServerApp>, checkpointer: Option<Arc<Checkpoin
     }
 }
 
+/// A graceful handoff in flight (issue #35). It runs as a task of its own
+/// rather than inline in the main loop, so SIGTERM and SIGINT are serviced
+/// while it runs (issue #207).
+struct HandoffInFlight {
+    task: tokio::task::JoinHandle<anyhow::Result<()>>,
+    /// Set by the sender the moment the successor's `Ack` arrives.
+    committed: Arc<AtomicBool>,
+}
+
+impl HandoffInFlight {
+    fn start(app: &Arc<ServerApp>, checkpointer: Option<Arc<Checkpointer>>) -> Self {
+        let committed = Arc::new(AtomicBool::new(false));
+        let task = tokio::spawn(crate::handoff::sender::run(
+            Arc::clone(app),
+            checkpointer,
+            Arc::clone(&committed),
+        ));
+        Self { task, committed }
+    }
+
+    /// Stop the handoff, for a shutdown signal that arrived mid-way. Returns
+    /// whether it had committed.
+    async fn abandon(self, app: &ServerApp, checkpointer: Option<&Checkpointer>) -> bool {
+        self.task.abort();
+        let ended = self.task.await;
+        settle_handoff(ended, &self.committed, app, checkpointer).await
+    }
+}
+
+/// Wait for the handoff in flight to end, and return whether it committed.
+/// Never resolves while there is none.
+async fn handoff_finished(
+    in_flight: &mut Option<HandoffInFlight>,
+    app: &ServerApp,
+    checkpointer: Option<&Checkpointer>,
+) -> bool {
+    let Some(handoff) = in_flight else {
+        return std::future::pending().await;
+    };
+    let ended = (&mut handoff.task).await;
+    settle_handoff(ended, &handoff.committed, app, checkpointer).await
+}
+
+/// Make the daemon consistent with how a handoff ended, whether the sender
+/// finished, failed, panicked or was aborted, and return whether it
+/// committed (the successor takes over, so this daemon exits).
+///
+/// Committed: the successor holds every live fd, so our PTY children are kept
+/// alive through our exit even if the sender never got that far. A handoff
+/// that returned `Ok` without committing was declined, and the successor
+/// restores from our final checkpoint. Anything else leaves this daemon
+/// serving: its readers are released and its checkpoint unsealed, which the
+/// sender's own rollback does too unless it panicked or was aborted.
+async fn settle_handoff(
+    ended: Result<anyhow::Result<()>, tokio::task::JoinError>,
+    committed: &AtomicBool,
+    app: &ServerApp,
+    checkpointer: Option<&Checkpointer>,
+) -> bool {
+    if committed.load(Ordering::SeqCst) {
+        app.manager.set_all_keep_alive(true).await;
+        return true;
+    }
+    match ended {
+        Ok(Ok(())) => return true,
+        Ok(Err(e)) => warn!("handoff rolled back: {e:#}"),
+        Err(e) => warn!("handoff task ended early: {e}"),
+    }
+    app.release_relays().await;
+    if let Some(checkpointer) = checkpointer {
+        checkpointer.unseal();
+    }
+    false
+}
+
 /// Dispatch a newly accepted session to the appropriate transport handler.
 async fn dispatch_session(session: IncomingSession, app: Arc<ServerApp>) {
     use tracing::Instrument;
@@ -460,6 +546,82 @@ async fn dispatch_session(session: IncomingSession, app: Arc<ServerApp>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A handoff in flight that runs `task`, committed or not.
+    fn fixture_handoff(
+        task: impl Future<Output = anyhow::Result<()>> + Send + 'static,
+        committed: bool,
+    ) -> HandoffInFlight {
+        HandoffInFlight {
+            task: tokio::spawn(task),
+            committed: Arc::new(AtomicBool::new(committed)),
+        }
+    }
+
+    /// The main loop learns how a handoff ended: a declined (or committed)
+    /// one hands over, a failed one does not, and with none in flight there
+    /// is nothing to learn.
+    #[tokio::test]
+    async fn a_finished_handoff_reports_whether_it_hands_over() {
+        let app = crate::fixtures::fixture_app();
+        let mut none = None;
+        let waited = tokio::time::timeout(
+            Duration::from_millis(50),
+            handoff_finished(&mut none, &app, None),
+        )
+        .await;
+        assert!(waited.is_err(), "nothing in flight never finishes");
+
+        let mut declined = Some(fixture_handoff(async { Ok(()) }, false));
+        assert!(handoff_finished(&mut declined, &app, None).await);
+        let mut failed = Some(fixture_handoff(
+            async { Err(anyhow::anyhow!("no Ack")) },
+            false,
+        ));
+        assert!(!handoff_finished(&mut failed, &app, None).await);
+    }
+
+    /// A handoff stopped by a shutdown signal counts as handed over only if
+    /// it had already committed.
+    #[tokio::test]
+    async fn an_abandoned_handoff_hands_over_only_if_it_had_committed() {
+        let app = crate::fixtures::fixture_app();
+        let stuck = || std::future::pending::<anyhow::Result<()>>();
+        assert!(fixture_handoff(stuck(), true).abandon(&app, None).await);
+        assert!(!fixture_handoff(stuck(), false).abandon(&app, None).await);
+    }
+
+    /// How a handoff ended decides whether this daemon exits: a commit (even
+    /// one whose sender then failed) or a decline hands over; a failure, a
+    /// panic or an abort before the commit point leaves it serving, with its
+    /// checkpoint accepting writes again.
+    #[tokio::test]
+    async fn settling_a_handoff_hands_over_only_when_committed_or_declined() {
+        let app = crate::fixtures::fixture_app();
+        let tmp = tempfile::tempdir().unwrap();
+        let checkpointer = Checkpointer::new(tmp.path().join("state.bin"));
+        let state = app.checkpoint_state().await;
+        let committed = AtomicBool::new(true);
+        let not_committed = AtomicBool::new(false);
+        let aborted = {
+            let task = tokio::spawn(std::future::pending::<anyhow::Result<()>>());
+            task.abort();
+            task.await
+        };
+
+        let failed = || Ok(Err(anyhow::anyhow!("no Ack")));
+        assert!(settle_handoff(failed(), &committed, &app, Some(&checkpointer)).await);
+        assert!(settle_handoff(Ok(Ok(())), &not_committed, &app, None).await);
+
+        checkpointer.write_final(&state).unwrap();
+        assert!(!settle_handoff(failed(), &not_committed, &app, Some(&checkpointer)).await);
+        assert_eq!(
+            checkpointer.write(&state).unwrap(),
+            crate::persist::checkpoint::Written::Unchanged,
+            "unsealed"
+        );
+        assert!(!settle_handoff(aborted, &not_committed, &app, None).await);
+    }
 
     /// The first checkpoint is written as soon as the loop starts, and reads
     /// back as a daemon state.

@@ -34,20 +34,33 @@ Two earlier primitives were inadequate and have been removed/repurposed:
 
 ```
 client: kmux daemon restart ──restart──▶ O (control socket)
+O: spawn the handoff task (the main loop keeps servicing SIGINT/SIGTERM)
 O: bind handoff.sock ; spawn  N = current_exe + DAEMON_BOOT_ARGS + --handoff
 N: daemonize (no pid file) ; connect handoff.sock
 O ──Hello{version, token, panes}──▶ N
-N: version ok?  ──Accept──▶ O          (else ──Decline──▶ O, N snapshot-restores)
+N: version ok?  ──Accept──▶ O
+     (else ──Decline──▶ O ; O writes its final checkpoint ; ──Released──▶ N ;
+      N snapshot-restores)
 loop over live panes (lock-step):
   O ──PaneFd{pane_id} + master fd (SCM_RIGHTS)──▶ N
   N ──PaneFdAck──▶ O
+O: hold the PTY readers ; write + fsync the final checkpoint (sealed)
 O ──Complete──▶ N
 N ──Ack──▶ O                            ◀── COMMIT POINT
-O: set_all_keep_alive ; quiesce relays ; write checkpoint
+O: set_all_keep_alive ; quiesce relays    (nothing here can fail the handoff)
 O ──Released──▶ N ; O exits (releases listeners, control/data sockets, pid file)
 N: restore_with_handoff(checkpoint, inherited fds) ; bind sockets ; claim pid file ; serve
 client: reconnect (new ports, adopted token) ; re-attach with last_seqno
+
+any failure before the commit point:
+O: release the readers ; unseal the checkpoint ; ──Abort{reason}──▶ N ; keep serving
+N: exit without serving
 ```
+
+Every frame read and write on both sides is bounded by `STEP_TIMEOUT` (30 s,
+issue #207). A peer that stalls mid-handoff used to block the other forever,
+and because O ran the handoff inline in its main `select!`, a stalled successor
+also kept O from servicing SIGTERM.
 
 Key files: `crates/kmuxd/src/handoff/{mod,sender,receiver}.rs` (transport +
 orchestration), `crates/kmuxd/src/app/migrate.rs` (`collect_handoff_panes`,
@@ -67,13 +80,21 @@ the `HandoffMessage` wire format.**
 
 ## Correctness invariants
 
-- **No split reads.** O streams the fds while it is still the sole reader, then —
-  *after* the commit point — calls `quiesce_relays()` (abort + await every relay
-  read task) and only then snapshots. N starts reading strictly later (after
+- **No split reads.** O streams the fds while it is still the sole reader, then
+  parks every in-process relay between two reads (`hold_relays`, a hold that
+  can be released) and only then snapshots. After the commit point it aborts
+  the parked relays (`quiesce_relays`). N starts reading strictly later (after
   `Released`). Output produced in the gap stays buffered in the kernel PTY and is
   drained by N. So no two readers ever race on a master, and no bytes are lost.
-- **Checkpoint after quiesce.** The snapshot N seeds from reflects exactly the
-  bytes O consumed; everything after sits unread in the kernel buffer for N.
+- **Checkpoint before the commit point.** The final checkpoint is written,
+  `fsync`ed and sealed (`Checkpointer::write_final`) before `Complete` is sent,
+  so nothing fallible remains after N's `Ack` (issue #207). It used to be written
+  after the `Ack`, and a failed write there was treated as a rollback although N
+  already held every fd. The snapshot N seeds from reflects exactly the bytes O
+  consumed; everything after sits unread in the kernel buffer for N.
+- **Worker panes are not held.** A `kmux-vt-worker` reads its PTY itself, so it
+  runs on until the commit point, when `quiesce_relays` shuts it down; the output
+  it consumed after the checkpoint is not in N's seed (as before).
 - **Foreign-child exit.** N's inherited children are reparented to init and
   cannot be `waitpid`-ed, so exit is surfaced by the relay loop's PTY-EOF break
   (`session_diff_loop` → `SessionManager::notify_exited` → `PaneExited`), backed
@@ -92,12 +113,31 @@ the `HandoffMessage` wire format.**
 
 ## Fault tolerance & idempotency
 
-- **Commit point = N's `Ack`.** Before it, nothing destructive has happened (O
-  never stopped reading and only sent `dup`s — it keeps its originals), so any
-  failure rolls back: O clears its in-progress flag and resumes serving.
-- **After the commit** N holds every live fd plus the checkpoint, so it completes
-  the takeover even if O dies without sending `Released` (detected via socket EOF
-  / pid death).
+- **Commit point = N's `Ack`.** Before it, nothing irreversible has happened: O
+  only sent `dup`s (it keeps its originals), its readers were *held*, not
+  stopped, and its checkpoint was sealed, not relied on. Any failure — a frame
+  that times out, a bad frame, readers that do not park within 5 s, a
+  checkpoint that cannot be written — rolls back: O releases the readers,
+  unseals the checkpoint, sends `Abort`, clears its in-progress flag and resumes
+  serving. The sender sets a shared `committed` flag the moment the `Ack`
+  arrives.
+- **After the commit** nothing can fail the handoff: keep-alive and stopping the
+  readers are in memory, and a `Released` that cannot be sent is logged. N holds
+  every live fd plus the checkpoint, so it completes the takeover even if O dies
+  without sending `Released`.
+- **Two daemons never serve at once.** N takes over only on O's word
+  (`Released`) or once O is gone. `Abort` makes N exit without serving. When N
+  loses O mid-handoff instead (a timeout, EOF, a bad frame), it closes the socket
+  — so an O still waiting on N fails its step and rolls back — and gives O
+  `PREDECESSOR_EXIT_GRACE` (15 s) to exit: if O is still running, it is serving,
+  and N exits; if O is gone, N restores the snapshot (lost before its `Ack`) or
+  adopts the fds it holds (lost after). N used to fall back to a snapshot restore
+  on any error, binding the sockets while O kept serving.
+- **Signals mid-handoff.** The handoff runs as a task of its own, so O's main
+  loop still services SIGINT and SIGTERM. A shutdown mid-handoff aborts the
+  task: if the `committed` flag is set O sets keep-alive and exits as after a
+  handoff, otherwise it shuts down normally (and N, finding O gone, restores
+  the snapshot).
 - **Concurrent restarts** are refused (`handoff_in_progress` flag → `busy`).
 - **A pane whose child exits mid-handoff** is sent with `has_live_fd = false`
   (respawned from the snapshot) or, if it exits after N inherits it, is marked
@@ -140,7 +180,9 @@ Two mechanics are load-bearing:
   defeat issue #36's "old daemon completely shut-off".
 
 Across a version bump the handoff degrades safely: a `HANDOFF_PROTOCOL_VERSION`
-mismatch → `Decline` → snapshot restore; a `PROTOCOL_VERSION` mismatch is caught
+mismatch → `Decline` → snapshot restore (version 2, issue #207, added `Abort` and
+has N wait for `Released` after a `Decline`; a version-1 O answers a `Decline`
+with `Released` too, and a version-1 N restores without waiting); a `PROTOCOL_VERSION` mismatch is caught
 by the client on reconnect (it surfaces the documented "run `kmux daemon
 restart`" guidance); the on-disk checkpoint is versioned by `STATE_VERSION`.
 

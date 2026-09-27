@@ -12,6 +12,7 @@ use kmux_pty::session::PtyWriter;
 use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
+use super::hold::HoldControl;
 use super::{INPUT_QUEUE_CAPACITY, PaneInput, QueueRejected, rejected};
 use crate::backend::BackendSize;
 use crate::lock::lock_term_state;
@@ -29,6 +30,8 @@ pub struct InProcessEngine {
     input_task: JoinHandle<()>,
     /// Background relay task (`session_diff_loop`) reading the PTY.
     task: JoinHandle<()>,
+    /// Parks and releases that task's reads (a handoff's final checkpoint).
+    hold: HoldControl,
     /// Drains terminal query replies (DSR/DA/…) queued by the pane's event sink
     /// and writes them to `writer`. Aborted on drop.
     response_task: JoinHandle<()>,
@@ -47,9 +50,18 @@ impl InProcessEngine {
         term_state: Arc<Mutex<TermState>>,
         writer: PtyWriter,
         task: JoinHandle<()>,
+        hold: HoldControl,
         response_rx: mpsc::Receiver<Vec<u8>>,
     ) -> Self {
-        Self::with_encoder(pane_id, term_state, writer, task, response_rx, input_bytes)
+        Self::with_encoder(
+            pane_id,
+            term_state,
+            writer,
+            task,
+            hold,
+            response_rx,
+            input_bytes,
+        )
     }
 
     /// [`Self::new`], turning input into PTY bytes with `encode`.
@@ -58,6 +70,7 @@ impl InProcessEngine {
         term_state: Arc<Mutex<TermState>>,
         writer: PtyWriter,
         task: JoinHandle<()>,
+        hold: HoldControl,
         response_rx: mpsc::Receiver<Vec<u8>>,
         encode: Encoder,
     ) -> Self {
@@ -89,6 +102,7 @@ impl InProcessEngine {
             input_tx,
             input_task,
             task,
+            hold,
             response_task,
         }
     }
@@ -127,6 +141,14 @@ impl InProcessEngine {
 
     pub(super) fn enqueue_input(&self, input: PaneInput) -> Result<(), QueueRejected> {
         self.input_tx.try_send(input).map_err(|e| rejected(&e))
+    }
+
+    pub(super) fn hold_reader(&self) -> impl Future<Output = ()> + Send + 'static {
+        self.hold.hold()
+    }
+
+    pub(super) fn release_reader(&self) {
+        self.hold.release();
     }
 
     pub(super) fn abort_relay_task(&mut self) -> JoinHandle<()> {
@@ -258,6 +280,7 @@ mod tests {
             input_tx: mpsc::channel(1).0,
             input_task: tokio::spawn(async {}),
             task: tokio::spawn(async {}),
+            hold: crate::engine::hold::channel().0,
             response_task: tokio::spawn(async {}),
         };
         {
@@ -304,6 +327,7 @@ mod tests {
             fixture_term_state(4, 20),
             writer,
             tokio::spawn(async {}),
+            crate::engine::hold::channel().0,
             crate::engine::pty_response_channel().1,
             panics_on_boom,
         );
@@ -336,6 +360,7 @@ mod tests {
             fixture_term_state(4, 20),
             writer,
             tokio::spawn(async {}),
+            crate::engine::hold::channel().0,
             crate::engine::pty_response_channel().1,
         )
     }

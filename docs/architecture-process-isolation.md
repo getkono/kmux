@@ -189,9 +189,10 @@ data-plane capability or `kmux-worker-protocol` bump (new fields are
 ## Interaction with handoff & federation
 
 - **Handoff** (`crate::handoff`, live daemon upgrade): the daemon still owns
-  every PTY master fd, so the fd-migration path is unchanged. `quiesce_relays`
-  calls `PaneEngine::abort_relay_task`, which for a worker sends `Shutdown`
-  (releasing the worker's dup) before aborting. The successor daemon respawns
+  every PTY master fd, so the fd-migration path is unchanged. A worker pane is
+  not held for the final checkpoint (its worker reads the PTY itself), and after
+  the commit point `quiesce_relays` calls `PaneEngine::abort_relay_task`, which
+  for a worker sends `Shutdown` (releasing the worker's dup) before aborting. The successor daemon respawns
   fresh workers post-restore in whatever isolation mode it is configured for;
   live worker migration across a handoff is intentionally not attempted.
 - **Federation** (`crate::federation`): a proxied remote pane has no local PTY or

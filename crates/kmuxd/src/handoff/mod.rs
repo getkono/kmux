@@ -22,6 +22,7 @@ pub mod sender;
 use std::io;
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
 use std::path::PathBuf;
+use std::time::Duration;
 
 use kmux_protocol::control_rpc::HandoffMessage;
 use nix::sys::socket::{ControlMessage, ControlMessageOwned, MsgFlags, recvmsg, sendmsg};
@@ -156,6 +157,42 @@ pub(crate) async fn read_frame(
             fd = Some(unsafe { OwnedFd::from_raw_fd(raw) });
         }
     }
+}
+
+/// Longest one step of a handoff may take: a frame to arrive or go out
+/// (issue #207). Each side waits for the other at every step, so without a
+/// bound a peer that stalls mid-handoff blocked the other forever. Generous:
+/// the longest step, waiting for `Complete`, covers the predecessor's final
+/// checkpoint write.
+pub(crate) const STEP_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// [`read_frame`] that fails with `TimedOut` after `timeout`.
+pub(crate) async fn read_frame_within(
+    stream: &UnixStream,
+    timeout: Duration,
+) -> io::Result<(HandoffMessage, Option<OwnedFd>)> {
+    tokio::time::timeout(timeout, read_frame(stream))
+        .await
+        .map_err(|_| timed_out("read", timeout))?
+}
+
+/// [`write_frame`] that fails with `TimedOut` after `timeout`.
+pub(crate) async fn write_frame_within(
+    stream: &UnixStream,
+    msg: &HandoffMessage,
+    fd: Option<RawFd>,
+    timeout: Duration,
+) -> io::Result<()> {
+    tokio::time::timeout(timeout, write_frame(stream, msg, fd))
+        .await
+        .map_err(|_| timed_out("write", timeout))?
+}
+
+fn timed_out(what: &str, timeout: Duration) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::TimedOut,
+        format!("handoff: frame {what} timed out after {timeout:?}"),
+    )
 }
 
 /// Removes a Unix socket path on drop (e.g. the handoff socket).

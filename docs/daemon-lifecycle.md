@@ -854,12 +854,15 @@ message is sent).
 `restart` via the control socket takes a **distinct** path (`handoff::sender`):
 the daemon spawns a successor and streams each pane's live PTY master fd to it
 over `handoff.sock` (`SCM_RIGHTS`), so running shells survive the restart.
-Instead of the abort→checkpoint→exit sequence above, the outgoing daemon
-quiesces its relays *after* the successor confirms it holds every fd, writes a
-post-quiesce checkpoint, releases its sockets, and exits; the successor adopts
-the auth token and rebuilds each pane around the inherited fd. On any failure it
-rolls back (or the successor falls back to snapshot restore). Full sequence,
-versioning, and fault-tolerance model: `docs/daemon-handoff.md`.
+Instead of the abort→checkpoint→exit sequence above, the outgoing daemon parks
+its PTY readers and writes its final checkpoint once the successor holds every
+fd, then commits on the successor's `Ack`, stops the readers, releases its
+sockets, and exits; the successor adopts the auth token and rebuilds each pane
+around the inherited fd. The handoff runs as a task of its own, so SIGINT and
+SIGTERM are still serviced while it runs, and every frame is bounded (issue
+#207). On any failure before the commit point it rolls back and tells the
+successor to stand down. Full sequence, versioning, and fault-tolerance model:
+`docs/daemon-handoff.md`.
 
 This is the mechanism behind a **live upgrade** — `mise run upgrade-daemon` installs a
 new `kmuxd` and restarts onto it without dropping shells (issue #36). The upgrade

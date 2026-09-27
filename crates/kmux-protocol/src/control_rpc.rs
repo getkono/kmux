@@ -27,7 +27,10 @@ pub const DAEMON_BOOT_ARGS: &[&str] = &["--daemon", "--bind", "0.0.0.0", "--port
 /// (already versioned) on-disk snapshot restore, which is always safe.
 ///
 /// Bump this on ANY change to the [`HandoffMessage`] wire format.
-pub const HANDOFF_PROTOCOL_VERSION: u32 = 1;
+///
+/// 2 (issue #207): [`HandoffMessage::Abort`], and the successor waits for
+/// `Released` or `Abort` after a `Decline` as it does after its `Ack`.
+pub const HANDOFF_PROTOCOL_VERSION: u32 = 2;
 
 /// JSON request sent to the daemon control socket.
 #[derive(Deserialize)]
@@ -164,20 +167,25 @@ pub enum HandoffMessage {
     },
     /// N → O: N speaks the same handoff version and will pull the live fds.
     Accept,
-    /// N → O: N declines the live transfer (e.g. version mismatch) and will fall
-    /// back to snapshot restore. O lets its children exit normally.
+    /// N → O: N declines the live transfer (e.g. version mismatch). O writes
+    /// its final checkpoint and answers `Released` (N then snapshot-restores
+    /// from it) or `Abort` (O keeps serving, N exits).
     Decline { reason: String },
     /// O → N: one live PTY master fd for `pane_id` follows as ancillary data.
     PaneFd { pane_id: String },
     /// N → O: the preceding [`PaneFd`](Self::PaneFd) was received and adopted.
     /// Keeps fd streaming lock-step so each frame carries exactly one fd.
     PaneFdAck,
-    /// O → N: every live fd has been streamed.
+    /// O → N: every live fd has been streamed, and O's final checkpoint is
+    /// on disk.
     Complete,
-    /// N → O: N has reconstructed all panes and bound its sockets; O may exit.
+    /// N → O: N holds every live fd. Receiving it is O's commit point.
     Ack,
-    /// O → N: O has released its sockets and is exiting (informational).
+    /// O → N: O committed and is releasing its sockets; N takes over.
     Released,
+    /// O → N: O rolled the handoff back before its commit point and keeps
+    /// serving; N must exit without serving (issue #207).
+    Abort { reason: String },
 }
 
 /// JSON response to the `"sessions"` control command.
@@ -449,6 +457,13 @@ mod tests {
             })
             .expect("serialize"),
             r#"{"Decline":{"reason":"version mismatch"}}"#
+        );
+        assert_eq!(
+            serde_json::to_string(&HandoffMessage::Abort {
+                reason: "no Ack".into(),
+            })
+            .expect("serialize"),
+            r#"{"Abort":{"reason":"no Ack"}}"#
         );
 
         // The remaining frames must survive a full round-trip unchanged.

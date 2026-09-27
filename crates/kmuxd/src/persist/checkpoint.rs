@@ -124,6 +124,12 @@ impl Checkpointer {
         self.lock().write_final(&self.path, state)
     }
 
+    /// Accept writes again after a final write, for a handoff that rolled
+    /// back before its commit point and carries on serving.
+    pub fn unseal(&self) {
+        self.lock().sealed = false;
+    }
+
     /// [`Self::write`] on the blocking pool, so the `fsync`s never stall a
     /// runtime thread.
     ///
@@ -304,6 +310,25 @@ mod tests {
 
         assert_eq!(checkpointer.write(&empty_state()).unwrap(), Written::Sealed);
         assert_eq!(read_back(&path).used_words, vec!["eagle"], "sealed");
+    }
+
+    /// Unsealing (a handoff that rolled back) accepts periodic writes again,
+    /// and the final write still counts as the last one written: the same
+    /// state is not written twice.
+    #[test]
+    fn an_unsealed_checkpoint_accepts_writes_again() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("state.bin");
+        let checkpointer = Checkpointer::new(path.clone());
+        checkpointer.write_final(&one_session_state()).unwrap();
+        checkpointer.unseal();
+
+        assert_eq!(
+            checkpointer.write(&one_session_state()).unwrap(),
+            Written::Unchanged
+        );
+        assert_eq!(checkpointer.write(&empty_state()).unwrap(), Written::Wrote);
+        assert!(read_back(&path).used_words.is_empty());
     }
 
     /// A final write that fails leaves the checkpoint unsealed.
