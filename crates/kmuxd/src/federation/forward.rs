@@ -367,29 +367,113 @@ mod tests {
         }
     }
 
-    /// Each forwarded request goes up under the peer's ids and an id of the
-    /// hub's own, and its answer comes back to the sender under the sender's
-    /// id and word (issue #227). One row per shape of answer.
+    /// A request, the peer's answer to it (under a placeholder id), and how
+    /// the sender must see that answer begin.
+    type Row = (ClientMessage, ServerMessage, &'static str);
+
+    /// Forward each row's request as one client, answer it as the peer, and
+    /// check the request went up under the peer's ids and an id of the hub's
+    /// own, and the answer came back under the sender's.
+    async fn round_trip(rows: Vec<Row>) {
+        let mut hub = fixture_hub();
+        let (from, mut answers) = client(1);
+        for (request, mut reply, expected) in rows {
+            let name = format!("{request:?}");
+            hub.app
+                .peer_manager
+                .forward(from.clone(), request)
+                .expect("forwarded");
+            let mut sent = next_request(&mut hub.upstream).await;
+            let text = format!("{sent:?}");
+            assert!(
+                text.contains("fedremote") && !text.contains("fedlocal"),
+                "{name} goes up under the peer's ids: {text}"
+            );
+            assert!(
+                !text.contains("Unknown"),
+                "the hub never sends Unknown: {text}"
+            );
+            let id = hub_id(&mut sent);
+            assert!(id >= 2, "the hub's own id space: {id}");
+            set_reply_request_id(&mut reply, id);
+            hub.peer.send(reply).unwrap();
+            let got = format!("{:?}", answer(&mut answers).await);
+            assert!(got.starts_with(expected), "{name}: {got}");
+        }
+    }
+
+    /// Answers naming a pane come back under the sender's pane id (issue
+    /// #227).
     #[tokio::test(start_paused = true)]
-    async fn a_request_goes_up_under_the_peers_ids_and_its_answer_comes_back() {
+    async fn an_answer_naming_a_pane_comes_back_under_the_senders_ids() {
         let size = TermSize::default();
-        let rows: Vec<(ClientMessage, ServerMessage, &str)> = vec![
-            (
-                ClientMessage::PaneCreate {
-                    request_id: 10,
-                    word_id: "fedlocal".into(),
-                    program: None,
-                    args: vec![],
-                    size,
-                },
-                ServerMessage::PaneCreated {
-                    request_id: 0,
-                    pane_id: "fedremote/1".into(),
-                    session_word_id: "fedremote".into(),
-                    size,
-                },
-                "PaneCreated { request_id: 10, pane_id: \"fedlocal/1\", session_word_id: \"fedlocal\"",
-            ),
+        round_trip(vec![
+        (
+            ClientMessage::PaneCreate {
+                request_id: 10,
+                word_id: "fedlocal".into(),
+                program: None,
+                args: vec![],
+                size,
+            },
+            ServerMessage::PaneCreated {
+                request_id: 0,
+                pane_id: "fedremote/1".into(),
+                session_word_id: "fedremote".into(),
+                size,
+            },
+            "PaneCreated { request_id: 10, pane_id: \"fedlocal/1\", session_word_id: \"fedlocal\"",
+        ),
+        (
+            ClientMessage::PaneClose {
+                request_id: 12,
+                pane_id: "fedlocal/1".into(),
+            },
+            ServerMessage::PaneClosed {
+                request_id: 0,
+                pane_id: "fedremote/1".into(),
+                exit_code: Some(0),
+            },
+            "PaneClosed { request_id: 12, pane_id: \"fedlocal/1\"",
+        ),
+        (
+            ClientMessage::FetchHistory {
+                request_id: 14,
+                pane_id: "fedlocal/0".into(),
+                start_index: 0,
+                count: 5,
+            },
+            ServerMessage::HistoryLines {
+                request_id: 0,
+                pane_id: "fedremote/0".into(),
+                first_index: 0,
+                lines: vec![],
+                history_total: 0,
+                sent_at_ms: 0,
+            },
+            "HistoryLines { request_id: 14, pane_id: \"fedlocal/0\"",
+        ),
+        (
+            ClientMessage::Notify {
+                request_id: 17,
+                pane_id: "fedlocal/0".into(),
+                kind: kmux_protocol::messages::AttentionKind::Unknown,
+                title: String::new(),
+                body: String::new(),
+            },
+            ServerMessage::NotifyAccepted { request_id: 0 },
+            "NotifyAccepted { request_id: 17 }",
+        ),
+        ])
+        .await;
+    }
+
+    /// Answers naming a session come back under the sender's word, and an
+    /// error under the sender's id, with the peer's code (issue #227).
+    #[tokio::test(start_paused = true)]
+    async fn an_answer_naming_a_session_comes_back_under_the_senders_ids() {
+        let size = TermSize::default();
+        round_trip(vec![
             (
                 ClientMessage::TabCreate {
                     request_id: 11,
@@ -406,18 +490,6 @@ mod tests {
                 "TabCreated { request_id: 11, word_id: \"fedlocal\"",
             ),
             (
-                ClientMessage::PaneClose {
-                    request_id: 12,
-                    pane_id: "fedlocal/1".into(),
-                },
-                ServerMessage::PaneClosed {
-                    request_id: 0,
-                    pane_id: "fedremote/1".into(),
-                    exit_code: Some(0),
-                },
-                "PaneClosed { request_id: 12, pane_id: \"fedlocal/1\"",
-            ),
-            (
                 ClientMessage::TabClose {
                     request_id: 13,
                     word_id: "fedlocal".into(),
@@ -429,23 +501,6 @@ mod tests {
                     tab_index: 1,
                 },
                 "TabClosed { request_id: 13, word_id: \"fedlocal\"",
-            ),
-            (
-                ClientMessage::FetchHistory {
-                    request_id: 14,
-                    pane_id: "fedlocal/0".into(),
-                    start_index: 0,
-                    count: 5,
-                },
-                ServerMessage::HistoryLines {
-                    request_id: 0,
-                    pane_id: "fedremote/0".into(),
-                    first_index: 0,
-                    lines: vec![],
-                    history_total: 0,
-                    sent_at_ms: 0,
-                },
-                "HistoryLines { request_id: 14, pane_id: \"fedlocal/0\"",
             ),
             (
                 ClientMessage::ClientList {
@@ -473,17 +528,6 @@ mod tests {
                 "ClientKicked { request_id: 16, word_id: \"fedlocal\"",
             ),
             (
-                ClientMessage::Notify {
-                    request_id: 17,
-                    pane_id: "fedlocal/0".into(),
-                    kind: kmux_protocol::messages::AttentionKind::Unknown,
-                    title: String::new(),
-                    body: String::new(),
-                },
-                ServerMessage::NotifyAccepted { request_id: 0 },
-                "NotifyAccepted { request_id: 17 }",
-            ),
-            (
                 ClientMessage::SessionRename {
                     request_id: 18,
                     word_id: "fedlocal".into(),
@@ -496,32 +540,8 @@ mod tests {
                 },
                 "Error { request_id: Some(18), code: SessionNotFound",
             ),
-        ];
-        let mut hub = fixture_hub();
-        let (from, mut answers) = client(1);
-        for (request, mut reply, expected) in rows {
-            let name = format!("{request:?}");
-            hub.app
-                .peer_manager
-                .forward(from.clone(), request)
-                .expect("forwarded");
-            let mut sent = next_request(&mut hub.upstream).await;
-            let text = format!("{sent:?}");
-            assert!(
-                text.contains("fedremote") && !text.contains("fedlocal"),
-                "{name} goes up under the peer's ids: {text}"
-            );
-            assert!(
-                !text.contains("Unknown"),
-                "the hub never sends Unknown: {text}"
-            );
-            let id = hub_id(&mut sent);
-            assert!(id >= 2, "the hub's own id space: {id}");
-            set_reply_request_id(&mut reply, id);
-            hub.peer.send(reply).unwrap();
-            let got = format!("{:?}", answer(&mut answers).await);
-            assert!(got.starts_with(expected), "{name}: {got}");
-        }
+        ])
+        .await;
     }
 
     /// Answers without a `request_id` go to the client whose message caused

@@ -896,7 +896,12 @@ async fn ask<T>(
     .await
     .ok()
     .flatten();
-    found.unwrap_or_else(|| panic!("no answer to {what} within {E2E_TIMEOUT:?}"))
+    // `assert!` rather than `panic!`: the ratchet counts bare panics.
+    assert!(
+        found.is_some(),
+        "no answer to {what} within {E2E_TIMEOUT:?}"
+    );
+    found.unwrap()
 }
 
 /// Out of process because each request is carried out by the real peer: its
