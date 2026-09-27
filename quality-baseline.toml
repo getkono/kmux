@@ -789,7 +789,7 @@ count = 2
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::significant_drop_tightening"
-count = 51
+count = 50
 
 [[lints]]
 crate = "kmuxd"
