@@ -1,167 +1,134 @@
 # Connection Subsystem
 
-This document is the technical reference for the kmux connection subsystem as implemented across Phases 1–7. It covers the two-phase connection model, all bootstrap strategies, the transport supervisor, the wire format, server configuration, and the decision logic governing transport selection.
+This document is the technical reference for how kmux processes connect: which
+process dials which, over which transport, how a link is supervised, resumed and
+re-established, and how the daemon bounds what a slow or silent peer can cost.
+The protocol those links carry — frames, messages, state machines, timing and
+errors — is specified in [protocol.md](protocol.md), which this document does
+not restate.
 
 > See also [connection-pause.md](connection-pause.md) for bandwidth-saving connection pausing (issue #68): how a paused client stops receiving terminal output and catches up to the final state on resume.
-
-> **Invariant: the GUI never dials a remote.** A GUI (GTK or Swift) always bootstraps to its **local** daemon over UDS (`ResolvedTarget::LocalDaemon`, `AppCore::current_target`), and reconnects to it the same way. A remote host is reached through that daemon's federation: the GUI sends `OpenPeer` and the local `kmuxd` holds the one upstream link to the remote `kmuxd` (SSH-negotiated or direct TCP+TLS) — see [architecture-federation.md](architecture-federation.md). The SSH bootstrap, the direct QUIC/TCP+TLS strategies and the `TransportSupervisor` described below are the mechanism behind a remote link (the hub's federation link, the `remote`-feature CLI paths such as `--dry-run`/`--test`); they are not part of the GUI's own connection.
->
-> Daemon data-plane ports (QUIC, TCP+TLS) are ephemeral — bound on port `0`, the OS assigns them, and they're advertised to the client in the SSH `probe-or-start` response. They never appear on a user-facing CLI surface. The only user-typeable port is the **SSH** port (`host:2222` or `--ssh-port 2222`).
 
 ---
 
 ## Table of Contents
 
-1. [Two-Phase Connection Model](#two-phase-connection-model)
-2. [SessionContext](#sessioncontext)
-3. [EndpointAdvert](#endpointadvert)
-4. [Phase A — Bootstrap](#phase-a--bootstrap)
-   - [Bootstrap Race](#bootstrap-race)
-   - [Strategy 1: UdsLocalBootstrap](#strategy-1-udslocalbootstrap)
-   - [Strategy 2: QuicDirectBootstrap](#strategy-2-quicdirectbootstrap)
-   - [Strategy 3: TlsTcpDirectBootstrap](#strategy-3-tlstcpdirectbootstrap)
-   - [Strategy 4: SshBootstrap](#strategy-4-sshbootstrap)
-5. [Phase B — TransportSupervisor](#phase-b--transportsupervisor)
-   - [UpgradeSignal](#upgradesignal)
-   - [Scorer Formula](#scorer-formula)
-   - [Supervisor Behavior](#supervisor-behavior)
-6. [Supported Transports](#supported-transports)
-   - [Wire Format](#wire-format)
+1. [Architecture: GUI → local daemon → federated peer](#architecture-gui--local-daemon--federated-peer)
+2. [Bootstrap](#bootstrap)
+   - [Local daemon](#local-daemon)
+   - [SSH](#ssh)
+3. [Transport supervision](#transport-supervision)
+4. [Supported Transports](#supported-transports)
    - [Listener Trait](#listener-trait)
    - [UDS Auth and Permissions](#uds-auth-and-permissions)
    - [TLS Trust (TOFU)](#tls-trust-tofu)
-7. [Endpoint URL Scheme](#endpoint-url-scheme)
-8. [Server Configuration](#server-configuration)
-   - [Audience Enum](#audience-enum)
-9. [Server Announcement Flow](#server-announcement-flow)
-10. [probe-or-start JSON Format](#probe-or-start-json-format)
-11. [Protocol Version Gate](#protocol-version-gate)
-12. [ConnectionId and Session Resumption](#connectionid-and-session-resumption)
-13. [Explicit Decision Table](#explicit-decision-table)
-14. [Sequence Diagrams](#sequence-diagrams)
-15. [Per-Connection Metrics](#per-connection-metrics)
-    - [`kmux daemon sessions`](#kmux-daemon-sessions)
-16. [Troubleshooting](#troubleshooting)
-    - [Dry-run diagnostics (`--dry-run`, `--test`)](#dry-run-diagnostics---dry-run---test)
-17. [Daemon Binary Resolution](#daemon-binary-resolution)
-18. [Idle Shutdown](#idle-shutdown)
-19. [Server-Side Flow Control and Deadlines](#server-side-flow-control-and-deadlines)
-20. [Key File Index](#key-file-index)
+5. [Endpoint URL Scheme](#endpoint-url-scheme)
+6. [Server Configuration](#server-configuration)
+7. [probe-or-start and the status reply](#probe-or-start-and-the-status-reply)
+8. [ConnectionId and Session Resumption](#connectionid-and-session-resumption)
+9. [Transport override](#transport-override-issue-69)
+10. [Liveness and Recovery](#liveness-and-recovery)
+11. [Troubleshooting](#troubleshooting)
+12. [Per-Connection Metrics](#per-connection-metrics)
+13. [Daemon Binary Resolution](#daemon-binary-resolution)
+14. [Idle Shutdown](#idle-shutdown)
+15. [Server-Side Flow Control and Deadlines](#server-side-flow-control-and-deadlines)
+16. [Key File Index](#key-file-index)
 
 ---
 
-## Two-Phase Connection Model
+## Architecture: GUI → local daemon → federated peer
 
-A kmux connection has two independent phases:
-
-**Phase A — Bootstrap** (one-shot, small data): Obtain an authenticated `SessionContext` via any reachable path. The goal is to acquire a `SessionContext` as fast and reliably as possible. This phase is short-lived and tolerates any viable path, including SSH tunnels.
-
-**Phase B — Data plane** (long-lived, high-throughput): A live transport chosen and continuously supervised for RTT, connectivity, and reliability. Transports are scored continuously and can be swapped on the fly without user intervention or session loss.
-
-The two phases are deliberately independent. The transport used to bootstrap does not constrain which transport becomes the data plane. A session that bootstrapped over SSH can immediately switch its data plane to QUIC once the supervisor determines QUIC is available and higher-scored.
-
----
-
-## SessionContext
-
-`SessionContext` is the output of Phase A and the input to Phase B. It carries everything needed to begin the data plane and re-authenticate after transport swaps.
-
-**Defined in:** `crates/kmux-protocol/src/transport/bootstrap.rs`
-
-```rust
-pub struct SessionContext {
-    pub token: String,
-    pub connection_id: ConnectionId,
-    pub server_endpoints: Vec<EndpointAdvert>,
-    pub bootstrap_transport: TransportKind,
-    pub send: mpsc::UnboundedSender<ClientMessage>,
-}
+```text
+ GUI (GTK / Swift)            local kmuxd (hub)                  remote kmuxd (peer)
+ ─────────────────            ─────────────────                  ───────────────────
+ FrontendDriver ──UDS──────▶  client_handler ── federation ──▶  client_handler
+   SessionManager              local sessions    link: TCP+TLS     its sessions
+                               proxied sessions  (Direct, or through
+                                                  an SSH -L tunnel)
 ```
 
-| Field | Description |
-|-------|-------------|
-| `token` | Auth token used on all subsequent transport connections |
-| `connection_id` | Server-assigned session identity; preserved across transport swaps |
-| `server_endpoints` | Advertised endpoints filtered by audience for this caller |
-| `bootstrap_transport` | The transport kind that won the bootstrap race |
-| `send` | Active sender on the bootstrap transport (used until a higher-scored transport is promoted) |
+- **A GUI never dials a remote.** A GUI always bootstraps to its **local**
+  daemon over its Unix socket (`ResolvedTarget::LocalDaemon`,
+  `AppCore::current_target`), starting the daemon if it is not running, and
+  reconnects to it the same way.
+- **A remote host is a federated peer of the local daemon.** The GUI sends
+  `OpenPeer`; the local `kmuxd` opens and keeps the one upstream link to the
+  remote `kmuxd` (SSH-negotiated, or direct TCP+TLS) and proxies its sessions,
+  under local session words, to every local client. Losing, re-opening and
+  closing that link is described in
+  [architecture-federation.md](architecture-federation.md).
+- **Remote transports are the federation link's and the CLI's.** The SSH
+  bootstrap, TCP+TLS and QUIC and the `TransportSupervisor` below are the
+  mechanism behind a remote link: the hub's federation link (TCP+TLS), and the
+  `remote`-feature CLI paths (`kmux --dry-run` / `--test` against `user@host`,
+  `kmux daemon logs --server`). They are not part of the GUI's own connection.
+
+Daemon data-plane ports (QUIC, TCP+TLS) are ephemeral — bound on port `0`, the
+OS assigns them, and they are advertised in the SSH `probe-or-start` reply. They
+never appear on a user-facing CLI surface. The only user-typeable port is the
+**SSH** port (`host:2222` or `--ssh-port 2222`).
 
 ---
 
-## EndpointAdvert
+## Bootstrap
 
-Represents one advertised transport endpoint. The supervisor uses these to probe and score candidate transports during Phase B.
+`kmux_connect::pipeline::run_bootstrap` takes a `ResolvedTarget` and returns a
+`BootstrapOutcome` — an authenticated sender, the transport, the
+`connection_id`, and the daemon run it reached (`daemon_instance`). It is the one
+code path the GUI, the `--dry-run` / `--test` diagnostics and the CLI use; each
+step is reported to a `BootstrapObserver`. There is no race between strategies:
+the target decides the path.
 
-**Defined in:** `crates/kmux-protocol/src/transport/bootstrap.rs`
+| `ResolvedTarget` | Path |
+|---|---|
+| `LocalDaemon` | [Local daemon](#local-daemon): ensure it runs, then UDS |
+| `Ssh { target, accept_invalid_certs }` | [SSH](#ssh): `probe-or-start`, an `-L` tunnel, TCP+TLS through it |
 
-```rust
-pub struct EndpointAdvert {
-    pub kind: TransportKind,
-    pub address: String,  // "host:port" for QUIC/TLS-TCP, absolute path for UDS
-}
-```
+Both end the same way: `Auth` → `AuthChallenge` → `AuthProof` → `AuthResult`
+([protocol.md#handshake](protocol.md#handshake)), waiting at most
+`AUTH_REPLY_TIMEOUT` for the result. A refusal becomes
+`BootstrapError::VersionMismatch` (a protocol mismatch, decided on
+`AuthResult.failure`) or `BootstrapError::Auth`; a link that closes before the
+daemon answers is `BootstrapError::Connect`, which a retry may get past.
 
----
+### Local daemon
 
-## Phase A — Bootstrap
+1. Query the control socket (`$XDG_RUNTIME_DIR/kmux/daemon.sock`) for the
+   daemon's status; start it (`kmux_connect::daemon::ensure_daemon`, see
+   [Daemon Binary Resolution](#daemon-binary-resolution)) if nothing answers.
+2. Refuse, before opening the data plane, a daemon whose `protocol_range` does
+   not overlap ours or whose build profile differs (`kmux_protocol::compat`):
+   a debug client never attaches to a release daemon.
+3. Connect to the data socket (`daemon-data.sock`) and authenticate with the
+   token the status reply carried.
 
-Implemented in `crates/kmux-client/src/bootstrap.rs`.
+Debug builds (`cfg(debug_assertions)`) resolve the runtime directory to
+`kmux-debug/` instead of `kmux/`, so a `cargo run` daemon can coexist with an
+installed release daemon ([profile-isolation.md](profile-isolation.md)).
 
-### Bootstrap Race
+### SSH
 
-`bootstrap_race` runs all applicable strategies concurrently using `futures::stream::FuturesUnordered`. The first strategy to return `Ok(SessionContext)` wins; all remaining in-flight strategies are dropped immediately.
+Implemented in `crates/kmux-connect/src/ssh/negotiate.rs`.
 
-Error handling during the race:
-
-| Error | Behaviour |
-|-------|-----------|
-| `BootstrapError::NotAvailable` | Silently skipped; strategy is not applicable for this target |
-| `BootstrapError::VersionMismatch` | Immediately fatal; propagated without trying remaining strategies |
-| Any other error | Recorded with a per-strategy description; remaining strategies continue |
-| All strategies exhausted | `AllFailed(Vec<String>)` with per-strategy failure descriptions |
-
-`VersionMismatch` is never retried. If any strategy detects disjoint semantic
-protocol ranges or a legacy Postcard-only peer, the entire bootstrap halts.
-
-### Strategy 1: UdsLocalBootstrap
-
-- Calls `daemon::ensure_daemon()` to start the local daemon process if it is not already running.
-- Connects to the data socket at `$XDG_RUNTIME_DIR/kmux/daemon-data.sock`. Debug builds (`cfg(debug_assertions)`) resolve this subdirectory to `kmux-debug/` instead, so a `cargo run` daemon can coexist with an installed release daemon on the same machine. Applies to every file under the runtime dir — control socket, data socket, PID, and auth token.
-- Wins in microseconds when the daemon is already running locally.
-- Returns `NotAvailable` when the target is not the local host.
-
-### Strategy 2: QuicDirectBootstrap
-
-- Performs a direct QUIC handshake to `host:port`.
-- Uses the existing `connect::connect()` function.
-- Returns a `SessionContext` with a placeholder `connection_id` that is updated when `AuthResult` arrives.
-- Returns `NotAvailable` when no QUIC endpoint is resolvable for the target.
-
-### Strategy 3: TlsTcpDirectBootstrap
-
-- Performs a direct TLS-over-TCP handshake to `host:port`.
-- Uses `tcp_connect::connect_tcp_tls()`.
-- Useful when UDP is blocked by a firewall or when the QUIC strategy times out first.
-- Returns `NotAvailable` when no TCP+TLS endpoint is resolvable for the target.
-
-### Strategy 4: SshBootstrap
-
-This strategy is the escalation path when direct transports are unreachable or when the target is only reachable via SSH. Implemented in `crates/kmux-client/src/ssh/negotiate.rs`.
-
-1. Run `ssh user@host kmuxd probe-or-start` to obtain a JSON blob (token,
-   endpoints, protocol range, daemon version).
-2. Verify that `protocol_range` overlaps the client's supported range (see
-   [Protocol Version Gate](#protocol-version-gate)). A response containing only
-   the frozen legacy `protocol_version` sentinel is rejected.
+1. Run `ssh user@host kmuxd probe-or-start` to obtain a JSON reply (token,
+   endpoints, protocol range, daemon version; see
+   [probe-or-start](#probe-or-start-and-the-status-reply)).
+2. Verify that `protocol_range` overlaps the client's supported range. A reply
+   carrying only the frozen legacy `protocol_version` sentinel is refused
+   (`SshError::VersionMismatch`).
 3. **Pre-allocate a free local TCP port** by binding `127.0.0.1:0`, capturing the port, and dropping the listener. The kernel-chosen port is then passed verbatim to `-L`.
 4. Spawn `ssh -L <localport>:127.0.0.1:<remoteport> -N user@host` with `-o ExitOnForwardFailure=yes` so the process exits immediately if the remote forward can't be established.
 5. **Verify the tunnel by TCP-connecting to the local port** with exponential-backoff retries (40 ms → 500 ms cap, 15 s deadline). Concurrently watch the ssh child for an early exit; if it dies before the local port becomes connectable, surface the captured stderr.
-6. Connect TLS-TCP to `127.0.0.1:<localport>`. Plaintext is never used inside SSH tunnels.
-7. Send `Auth` with the token and obtain `AuthResult`.
+6. Connect TCP+TLS to `127.0.0.1:<localport>`, pinning the certificate to the *real* remote `host:tcp_port`. Plaintext is never used inside SSH tunnels.
+7. Authenticate with the token from step 1.
+
+A federation hub reaching an `Ssh` peer runs the same negotiation on every
+(re-)open, which is how it finds a restarted peer's new token and ports.
 
 #### Why we don't parse `ssh -v` stderr
 
-Earlier revisions read `debug1: Local forwarding listening on 127.0.0.1 port NNNNN.` out of the tunnel's stderr to learn the local port (the spec used `-L 0:127.0.0.1:<remote>` to let the kernel pick). That parser scanned for the substring `port <digits>` line-by-line — but `ssh -v` emits `debug1: Connecting to <host> [<ip>] port 22.` *before* the forwarding line, so the parser returned `22`. The TUI then TLS-handshook against the local sshd, which produced an opaque "ssh negotiation" error and no log entry on the daemon. Pre-allocating the port and probing TCP for readiness eliminates the entire class of fragile-stderr-scraping bugs.
+Earlier revisions read `debug1: Local forwarding listening on 127.0.0.1 port NNNNN.` out of the tunnel's stderr to learn the local port (the spec used `-L 0:127.0.0.1:<remote>` to let the kernel pick). That parser scanned for the substring `port <digits>` line-by-line — but `ssh -v` emits `debug1: Connecting to <host> [<ip>] port 22.` *before* the forwarding line, so the parser returned `22`. The client then TLS-handshook against the local sshd, which produced an opaque "ssh negotiation" error and no log entry on the daemon. Pre-allocating the port and probing TCP for readiness eliminates the entire class of fragile-stderr-scraping bugs.
 
 #### Stderr capture
 
@@ -183,7 +150,7 @@ The shared `build_ssh_cmd` helper applies these options to every probe and tunne
 
 | Option | Why |
 |--------|-----|
-| `BatchMode=yes` | Fail fast instead of prompting; the kmux client owns no terminal at this point. Auth must be configured via ssh-agent / key files. |
+| `BatchMode=yes` | Fail fast instead of prompting; no terminal is available to prompt on. Auth must be configured via ssh-agent / key files. |
 | `StrictHostKeyChecking=accept-new` | TOFU on first connection, refuse on mismatch. Mirrors the data-plane TOFU model. |
 | `ConnectTimeout=10` | Bound network failures so unreachable hosts surface a clear error instead of hanging. |
 
@@ -198,86 +165,58 @@ Tunnel-only options:
 
 | Phase | Timeout |
 |-------|---------|
-| `kmuxd probe-or-start` (whole invocation) | 20 s |
-| Local-tunnel-port readiness | 15 s |
+| `kmuxd probe-or-start` (whole invocation) | 20 s (`PROBE_TIMEOUT`) |
+| Local-tunnel-port readiness | 15 s (`TUNNEL_READY_TIMEOUT`) |
 
 `kmuxd probe-or-start` itself polls its control socket for up to 10 s waiting for a fresh daemon to come up; the 20 s ssh-side cap leaves room for SSH handshake and authentication.
 
 ---
 
-## Phase B — TransportSupervisor
+## Transport supervision
 
-Implemented in `crates/kmux-client/src/supervisor.rs`. This replaces the former `quic_probe.rs`.
+An SSH-bootstrapped link (the CLI's; the GUI's link is local) runs a
+`TransportSupervisor` (`crates/kmux-connect/src/supervisor.rs`), which probes
+the other transports the daemon advertised (`EndpointAdvert { kind, address }`,
+`crates/kmux-sys/src/transport/mod.rs`) and promotes a better one.
 
-### UpgradeSignal
+A **probe** connects on the candidate transport and authenticates with the
+link's `connection_id` and the daemon run that assigned it; it succeeds only if
+the daemon *resumed* that connection in that run (`probe_verdict`) — a daemon
+restarted since would register the probe afresh, with none of the link's pane
+streams. A successful probe is sent as an `UpgradeSignal { new_kind, sender }`;
+the driver sends `ChannelReady` on the new sender and calls
+`SessionManager::apply_transport_upgrade`, which makes it the live sender and
+drops the old one (the daemon answers `ChannelSwitched`). A refused probe's
+`AuthResult` never reaches the session manager.
 
-```rust
-pub struct UpgradeSignal {
-    pub new_kind: TransportKind,
-    pub sender: mpsc::UnboundedSender<ClientMessage>,
-}
-```
-
-When the supervisor promotes a new transport, it sends an `UpgradeSignal` to `SessionManager`. The `SessionManager.apply_transport_upgrade(sender, kind)` method atomically swaps the active sender and drops the old one.
-
-### Scorer Formula
-
-Every candidate transport is assigned a score at each evaluation cycle. The transport with the highest score becomes the data plane (subject to hysteresis).
+Each candidate is scored every `PROBE_INTERVAL` (30 s):
 
 ```
 score(transport) =
-    locality_bonus(transport)        // +1000 for UDS when target is local
-  + robustness_weight(transport)     // UDS 30, QUIC 20, TLS-TCP 10
-  + server_priority(transport)       // from EndpointAdvert.priority (admin-set)
-  - latency_ms_ewma(transport)       // α=0.2; unknown → 500ms assumed
-  - failure_penalty(transport)       // +100 per recent failure; decays via record_success()
-  - oscillation_penalty(transport)   // +200 if swapped away in last 60s (hysteresis)
+    locality_bonus(transport)        // LOCALITY_BONUS_UDS (1000) for UDS when the target is local
+  + robustness_weight(transport)     // UDS 30, QUIC 20, TCP+TLS 10
+  - latency_ms_ewma(transport)       // α = 0.2; LATENCY_UNKNOWN_MS (500) until measured
+  - failure_penalty(transport)       // FAILURE_PENALTY_PER (100) per failure within FAILURE_WINDOW (300 s)
+  - oscillation_penalty(transport)   // OSCILLATION_PENALTY (200) if swapped away within OSCILLATION_WINDOW (60 s)
 ```
 
-**Constants:**
-
-| Constant | Value |
-|----------|-------|
-| `LOCALITY_BONUS` | 1000 |
-| `OSCILLATION_PENALTY` | 200 |
-| `OSCILLATION_WINDOW` | 60 s |
-| `PROBE_INTERVAL` | 30 s |
-| `UNKNOWN_LATENCY_PENALTY` | 500 |
-
-The locality bonus ensures UDS is overwhelmingly preferred for local targets, even with poor (but measured) RTT on other transports.
-
-### Supervisor Behavior
-
-- Every 30 seconds, the supervisor probes all non-active candidate transports.
-- A successful probe updates the EWMA latency for that transport and may issue an `UpgradeSignal`.
-- RTT is measured at the application layer using `Ping`/`Pong` messages. ICMP is never used.
-- A failing probe adds a failure penalty of 100 to the transport's score. Penalty decays when `record_success()` is called.
-- If the current transport stalls, it is marked `Degraded`, re-scored, and may be swapped. A `warn!` log is emitted.
-- Failed probes use an exponential backoff: 30 s → 60 s → 5 min.
-- The oscillation penalty prevents flapping: a transport swapped away within the last 60 seconds receives a −200 penalty, blocking a return swap even if its raw score would otherwise win.
-- If all candidate transports fail, the session is disconnected and the supervisor enters backoff before retrying.
+RTT is measured with the protocol's own `Ping` / `Pong`, never ICMP. The
+oscillation penalty keeps a transport that was just swapped away from being
+swapped straight back.
 
 ---
 
 ## Supported Transports
 
-Three data transports are supported, all implemented under `crates/kmux-protocol/src/transport/`:
+Three data transports, all implemented under `crates/kmux-sys/src/transport/`:
 
 | Transport | Feature flag | Use case |
 |-----------|-------------|----------|
-| QUIC | `quic` | Preferred on internet/VPN; multiplexed streams, 0-RTT reconnect |
-| TCP+TLS | `tcp-tls` | LAN and UDP-blocked networks; SSH tunnel inner layer |
-| UDS | `uds` | Local same-host IPC; lowest overhead |
+| QUIC | `quic` | Internet/VPN; one unidirectional stream per attached pane |
+| TCP+TLS | `tcp-tls` | LAN, UDP-blocked networks, the inner layer of an SSH tunnel, federation links |
+| UDS | `uds` | Local same-host IPC (the GUI's link); lowest overhead |
 
-### Wire Format
-
-All transports share the same wire format, implemented in `crates/kmux-protocol/src/codec.rs` (formerly `frame.rs`). Each frame is:
-
-```text
-[u32 big-endian length][u8 codec tag][payload…]
-```
-
-The length prefix counts the 1-byte codec tag plus the (possibly compressed) payload. The payload is a named-map MessagePack message; the codec tag is `2 = raw` or `3 = zstd` (per-frame, like HTTP `Content-Encoding`). Tags `0` and `1` are the retired Postcard codecs and are permanently reserved — a current reader rejects them with an upgrade error rather than misreading a positional payload. See [architecture-protocol-versioning.md](architecture-protocol-versioning.md). The frame is **self-describing**, so `read_frame` decompresses purely from the tag with no per-connection state. `read_frame` / `write_frame` (identity) / `write_frame_compressed` are generic over any `AsyncRead + AsyncWrite` pair, making the codec transport-agnostic. Whether the writer compresses is a per-connection policy the daemon decides at auth — see [compression.md](compression.md).
+All three carry the same frames ([protocol.md#frames](protocol.md#frames)).
 
 ### Listener Trait
 
@@ -304,7 +243,7 @@ pub struct IncomingSession {
 }
 ```
 
-`serve(listener, HANDSHAKE_TIMEOUT, HandshakeLimits::DAEMON, on_session)` is the accept loop: it spawns each pending connection's `establish` into that connection's own task, so a peer that stalls mid-handshake delays nobody else, and drops it after `HANDSHAKE_TIMEOUT` (10 s).
+`serve(listener, HANDSHAKE_TIMEOUT, HandshakeLimits::DAEMON, on_session)` is the accept loop: it spawns each pending connection's `establish` into that connection's own task, so a peer that stalls mid-handshake delays nobody else, and drops it after `HANDSHAKE_TIMEOUT` (`kmux_protocol::timing::TRANSPORT_HANDSHAKE_TIMEOUT`, 10 s).
 
 **Handshake admission (issue #207, `crates/kmux-sys/src/transport/admission.rs`).** Every listener binds `0.0.0.0`, so anyone who can reach the port can start a handshake. The accept loop bounds how many run at once: `MAX_PENDING_HANDSHAKES` (64) in all and `MAX_PENDING_HANDSHAKES_PER_SOURCE` (8) from one source, where a source is an IPv4 address or an IPv6 /64. A connection that finds either bound reached is **refused at once**: the TCP socket is closed, the QUIC attempt is answered with a refusal. The loop never waits for a slot, so nothing queues behind a full listener, neither in the kernel's backlog nor in the QUIC endpoint, where each waiting attempt holds its buffered initial packets. One source that opens connections and never finishes them fills its own eight slots and nobody else's; starving real clients takes many distinct sources. A slot is given back when its handshake finishes, fails or times out.
 
@@ -316,11 +255,11 @@ The server dispatches all transports through a single `dispatch_session` → `ru
 
 - The data socket lives at `$XDG_RUNTIME_DIR/kmux/daemon-data.sock`. This is separate from the control socket at `daemon.sock`.
 - The socket is created with mode 0600 via umask, restricting access to the owning user.
-- Authentication still uses a token in the first frame for protocol uniformity. When `allow_peer_cred = true` is set in `kmuxd.toml`, the server also accepts a matching peer UID as sufficient proof.
+- Authentication is the same handshake as on every transport: the token and the identity proof. `kmuxd.toml`'s `[auth] allow_peer_cred` is parsed and logged but not enforced — a matching peer UID is not accepted in lieu of the token.
 
 ### TLS Trust (TOFU)
 
-TLS certificate trust uses a Trust-on-First-Use (TOFU) model implemented in `crates/kmux-protocol/src/tls/tofu.rs`. The trust store lives at `~/.config/kmux/known_hosts.toml`.
+TLS certificate trust uses a Trust-on-First-Use (TOFU) model implemented in `crates/kmux-sys/src/tls/tofu.rs`. The trust store lives at `~/.config/kmux/known_hosts.toml`.
 
 Trust resolution flow:
 
@@ -334,7 +273,7 @@ The `--accept-invalid-certs` flag bypasses all checks. This is intended only for
 
 ## Endpoint URL Scheme
 
-Defined in `crates/kmux-protocol/src/endpoint.rs`:
+Parsed by `kmux_protocol::Endpoint` (`crates/kmux-protocol/src/endpoint.rs`). The GUI and the CLI resolve a user-typed target to an SSH peer or target; the direct forms are for the CLI and for tests:
 
 | Form | Meaning |
 |------|---------|
@@ -350,7 +289,7 @@ Defined in `crates/kmux-protocol/src/endpoint.rs`:
 
 ## Server Configuration
 
-The server configuration file (`kmuxd.toml`) is located at `$XDG_CONFIG_HOME/kmuxd/kmuxd.toml` or `/etc/kmuxd/kmuxd.toml`. The schema and resolution logic are implemented in `crates/kmuxd/src/config.rs`.
+The server configuration file (`kmuxd.toml`) is located at `$XDG_CONFIG_HOME/kmuxd/kmuxd.toml` or `/etc/kmuxd/kmuxd.toml`. The schema and resolution logic are implemented in `crates/kmuxd/src/config.rs` (`deny_unknown_fields`: a typo is an error).
 
 ```toml
 version = 1
@@ -362,16 +301,13 @@ key  = "/etc/kmuxd/key.pem"
 
 [[listen]]
 kind = "quic"           # "quic" | "tcp+tls" | "unix"
-bind = "::"
-port = 8443
+bind = "0.0.0.0"
 enabled = true
 audience = "any"        # "any" | "lan" | "local" | "ssh-only"
-priority = 0
 
 [[listen]]
 kind = "tcp+tls"
 bind = "127.0.0.1"
-port = 8444
 audience = "ssh-only"  # only visible via SSH bootstrap
 
 [[listen]]
@@ -384,16 +320,21 @@ public_host = "prod.example.com"   # substituted in advertised addresses
 
 [auth]
 token_file = "auto"
-allow_peer_cred = true    # UDS: accept peer uid match in lieu of token
 ```
 
-**Default config (when no file is found):** QUIC on `[::]:8443` (audience: any), TCP+TLS on `[::]:8444` (audience: any), UDS auto (audience: local).
+A listener's **port** is not configurable here: every listener binds port `0`
+and the kernel picks, unless `kmuxd` is started by hand with `--port` /
+`--tcp-port` (the daemon lifecycle, a handoff successor included, always starts
+it with `--port 0`). `priority` is parsed but not advertised, so the client's
+scorer never sees it.
+
+**Default config (when no file is found):** QUIC and TCP+TLS on `0.0.0.0` (audience: any), UDS auto (audience: local).
 
 The server is the sole authority on which endpoints are visible to which callers. Clients do not probe or guess; they use what the server announces.
 
 ### Audience Enum
 
-The `audience` field on each listener controls which callers receive that endpoint in their `EndpointAdvert` list. Filtering is implemented in `crates/kmuxd/src/announce.rs`.
+The `audience` field on each listener controls which callers receive that endpoint in their endpoint list. Filtering is implemented in `crates/kmuxd/src/announce.rs`.
 
 | Value | Visible to |
 |-------|------------|
@@ -404,54 +345,41 @@ The `audience` field on each listener controls which callers receive that endpoi
 
 ---
 
-## Server Announcement Flow
+## probe-or-start and the status reply
 
-1. Client connects on any transport and sends `ClientMessage::Auth`.
-2. Server responds with `ServerMessage::AuthResult` containing `success`, `connection_id`, and the filtered endpoint list for this caller.
-3. The daemon control socket (`serve_control_socket` in `crates/kmuxd/src/daemon.rs`) additionally returns a `StatusResponse` JSON blob including `protocol_version`, `kmuxd_version`, `token`, and `endpoints`. This is used by the local UDS bootstrap strategy.
-4. `kmuxd probe-or-start` (used by the SSH bootstrap strategy) returns a similar JSON blob to stdout.
+The daemon's control socket answers `{"command":"status"}` with a
+`StatusResponse` (`kmux_protocol::control_rpc`): the ports, the token, the pid,
+`protocol_range`, the build (`kmuxd_build`, `build_profile`), uptime, session
+count and the endpoint list. A local bootstrap reads it before opening the data
+plane.
 
----
-
-## probe-or-start JSON Format
+`kmuxd probe-or-start` (run over SSH) queries it — starting the daemon first if
+none answers — and prints:
 
 ```json
 {
-  "protocol_version": 13,
-  "kmuxd_version": "0.1.0",
-  "quic_port": 8443,
-  "tcp_port": 8444,
+  "protocol_version": 41,
+  "protocol_range": {"min": {"major": 1, "minor": 0, "patch": 0}, "max": {"major": 1, "minor": 1, "patch": 0}},
+  "kmuxd_version": "0.2.0",
+  "quic_port": 43117,
+  "tcp_port": 38809,
   "token": "...",
   "endpoints": [
-    {"kind": "quic",    "address": "host:8443"},
-    {"kind": "tcp+tls", "address": "host:8444"}
+    {"kind": "QUIC",    "address": "host:43117"},
+    {"kind": "TCP+TLS", "address": "host:38809"}
   ]
 }
 ```
 
-The `endpoints` array reflects the audience-filtered view for an SSH caller — typically including only transports marked `ssh-only` or `any` on the remote server. The client selects the best endpoint from this list to establish the TLS-TCP tunnel.
-
----
-
-## Protocol Version Gate
-
-Every current `StatusResponse` carries a semantic `protocol_range`, defined by
-`MIN_PROTOCOL_VERSION` and `PROTOCOL_VERSION` in
-`crates/kmux-protocol/src/messages/types.rs`.
-
-- The SSH bootstrap (`crates/kmux-connect/src/ssh/negotiate.rs`) reads
-  `protocol_range` from the `probe-or-start` JSON and negotiates the highest
-  version shared with `PROTOCOL_RANGE`.
-- A mismatch produces `SshError::VersionMismatch` → `BootstrapError::VersionMismatch`.
-- `bootstrap_race` propagates `VersionMismatch` immediately without attempting other strategies.
-- The integer `protocol_version = 41` remains a frozen JSON sentinel for legacy
-  consumers. Daemons that omit `protocol_range` are rejected because their
-  Postcard data plane cannot decode current named MessagePack.
-
-The subsequent `Auth` exchange repeats range negotiation and intersects named
-capabilities, which prevents a stale or forged probe response from enabling
-unsupported traffic. See
-[Data-Plane Protocol Versioning](architecture-protocol-versioning.md).
+- `protocol_range` is what a client negotiates against; the integer
+  `protocol_version` is frozen at 41 for JSON consumers of the retired integer
+  scheme, never used to decide compatibility, and a reply carrying only it is
+  refused ([architecture-protocol-versioning.md](architecture-protocol-versioning.md)).
+  The `protocol_range` printed is the probing `kmuxd` binary's own, which is the
+  running daemon's unless the binary on `$PATH` was replaced while it ran.
+- The client tunnels to `tcp_port`; the endpoint list feeds the transport
+  supervisor. The subsequent `Auth` negotiates the range again, so a stale or
+  forged reply cannot enable anything the daemon does not speak.
 
 ---
 
@@ -482,85 +410,14 @@ Otherwise the channel registers a fresh connection with fresh ids. `RegisteredCl
 
 ---
 
-## Explicit Decision Table
+## Transport override (issue #69)
 
-| Situation | Action |
-|-----------|--------|
-| Target is local AND server announces `unix://` | UDS immediately, no race |
-| Target is local AND no `unix://` announced | Race QUIC-loopback ‖ TLS-TCP-loopback |
-| Tier 1 direct all fail AND SSH target known | Escalate to SSH bootstrap (logged) |
-| Tier 1 direct all fail AND no SSH info | Hard-fail `NoViablePath` |
-| Server announces only `tcp+tls://127.0.0.1:N` | Must use SSH bootstrap; data plane = TLS-TCP-over-forward |
-| Protocol ranges are disjoint or legacy-only | Halt with `VersionMismatch { client, server }` — no retry |
-| Remote `kmuxd` not installed (SSH) | Halt with `RemoteNotInstalled` |
-| Remote `kmuxd` installed but off (SSH) | `probe-or-start` starts it; bootstrap continues |
-| ICMP blocked | Irrelevant — RTT measured via `Ping`/`Pong` inside kmux protocol |
-| Current transport stalls | Supervisor marks `Degraded`, re-scores, possibly swaps; emits `warn!` log |
-| `UpgradeProbe` fails | Adds failure penalty; retry after 30s/60s/5min backoff |
-| Hysteresis active (swapped within 60s) | Oscillation penalty; swap refused even if score says upgrade |
-| All candidate transports fail | Session disconnected; supervisor retries in backoff |
-
----
-
-## Sequence Diagrams
-
-### (a) Direct Bootstrap with SSH Fallback
-
-```
-Client                          Server
-  |                               |
-  |--[QUIC handshake]------------>|  (2s budget, concurrent with TLS-TCP attempt)
-  |<--[QUIC refused/timeout]------|
-  |                               |
-  |--[ssh user@host kmuxd probe-or-start]-->
-  |<--[JSON: token, endpoints]------------|
-  |                               |
-  |--[ssh -L 0:127.0.0.1:8444 -N]-->  (tunnel established)
-  |--[TLS-TCP connect 127.0.0.1:{local}]-->|
-  |--[Auth{token, connection_id}]-------->|
-  |<--[AuthResult{success, conn_id}]------|
-  | (Session active over TLS-TCP tunnel)
-```
-
-### (b) SSH Bootstrap Starting a Stopped Daemon
-
-```
-Client          SSH subprocess          Remote kmuxd
-  |                  |                       |
-  |--probe-or-start->|                       |
-  |                  |--stat daemon.sock---->|  (no response)
-  |                  |--spawn kmuxd --daemon->|
-  |                  |--poll control socket-->|  (retry 200ms × 50)
-  |                  |<--{token, ports}-------|
-  |<--JSON-----------|
-```
-
-### (c) Transport Hot-Swap (QUIC to TLS-TCP Downgrade)
-
-```
-Client                          Server
-  | (data plane: QUIC)            |
-  |                               |
-  | Supervisor: QUIC RTT spikes   |
-  | Scorer: TLS-TCP now higher    |
-  |                               |
-  |--[TLS-TCP Auth{conn_id}]----->|  (background, new transport)
-  |<--[AuthResult{success}]-------|
-  |<--[ChannelSwitched]-----------|
-  |                               |
-  | apply_transport_upgrade()     |
-  | (drop old QUIC sender)        |
-  | (data plane: TLS-TCP)         |
-```
-
-### Transport override (issue #69)
-
-Transport selection is normally **auto**: the `TransportSupervisor` periodically scores and hot-swaps to the best transport (above). The user can pin it instead — useful when the heuristic picks badly for a given network.
+Transport selection is normally **auto**: the `TransportSupervisor` periodically scores and hot-swaps to the best transport ([Transport supervision](#transport-supervision)). The user can pin it instead — useful when the heuristic picks badly for a given network.
 
 - **Selection mechanism.** The `/transport [auto|quic|tcp-tls|uds|tcp]` command sets the override (`auto` clears it). Double-clicking the protocol indicator (the header transport button on GTK, the connection badge on macOS) opens the command pre-filled, so the choice is a pick from the completer.
 - **Indicator.** While overridden, the protocol text renders in a distinct style — amber on GTK, an orange tint on macOS — so it's obvious the transport is pinned rather than auto-chosen.
 - **Mechanism.** The choice lives on `SessionManager::transport_override` (the source of truth; it persists across reconnects). It is seeded into each freshly-spawned supervisor (`SupervisorParams::forced`) and pushed live over an `override_rx` channel so a runtime change takes effect at once. When pinned, the supervisor **skips the periodic heuristic entirely** and only ensures the forced transport is active (probing/swapping to it once if needed; a no-op if it is already active or has no advertised endpoint, e.g. UDS on a remote host).
-- **Scope.** This is client-local — no wire-protocol change and no `PROTOCOL_VERSION` bump (it does bump `KMUX_FFI_ABI_VERSION` for the new `FfiConnInfo` field). It only affects connections that run a supervisor (the SSH/remote path); a local UDS connection has no alternative transport to switch to.
+- **Scope.** This is client-local: no message or capability is involved. It only affects connections that run a supervisor (the SSH/remote path); the GUI's local UDS link has no alternative transport to switch to.
 
 ---
 
@@ -573,24 +430,19 @@ observe the same failure modes the user observes.
 
 ### Ping cadence
 
-Both endpoints mirror the same policy (`crates/kmux-client/src/liveness.rs`,
-`crates/kmuxd/src/client_handler/session.rs`):
-
-| Direction | Interval | Timeout |
-|-----------|----------|---------|
-| server → client `Ping` | 5 s | 30 s after the oldest unanswered ping with no inbound frame → close |
-| client → server `Ping` | 5 s | 15 s silence → declare dead |
-
-Both ends reset their timeout on *any* inbound frame (not just `Pong`),
-so a chatty session never spuriously times out. The daemon's side is
-described in [Server-Side Flow Control and Deadlines](#server-side-flow-control-and-deadlines). `client_ping_due` on
-the liveness tracker is sampled every second from the event loop —
-timers are cheap and the loop is already running for rendering.
-Worst-case detection of a hung daemon (kill -STOP, blackholed path) is
-bounded at ~15 s (`kmux_client::liveness::TIMEOUT`); there is no 60 s
-client timer, whatever an older revision of this document said.
+Both ends ping every `PING_INTERVAL` and reset their clock on *any* inbound
+frame, not only a `Pong`: the daemon closes a connection `PONG_DEADLINE` after
+an unanswered ping it wrote, and a client (or a federation hub) calls its link
+dead after `SILENCE_TIMEOUT` of silence. The values and what each bounds are in
+[protocol.md#timing](protocol.md#timing), single-sourced in
+`kmux_protocol::timing`. A client samples `client_ping_due` once a second from
+its event loop, so a hung daemon (kill -STOP, a black-holed path) is noticed
+within about `SILENCE_TIMEOUT`.
 
 ### ConnectionState machine
+
+The states and their transitions are specified, each with the test that pins
+it, in [protocol.md#state-machines](protocol.md#state-machines); in outline:
 
 ```
       ┌─────┐
@@ -602,7 +454,7 @@ client timer, whatever an older revision of this document said.
                               ┌────────────────────┐                     │ Reconnect / Ctrl+Alt+R
                 ┌────────────▶│Connected{transport}│◀── auth ok ─ Handshaking ◀┘
                 │             └────────────────────┘
-                │                       │ server closed / ping timeout (15 s) /
+                │                       │ server closed / SILENCE_TIMEOUT /
                 │ attempt               │ SSH tunnel died
                 │ succeeds              ▼
                 │             ┌────────────────────┐  attempt fails:
@@ -626,9 +478,9 @@ in `driver/reconnect.rs`:
    the UI) is left as it is; the state becomes `Reconnecting { attempt: 1 }`.
 2. **Schedule** (`Reconnect`). Attempt *n* starts
    `kmux_client::backoff::next_delay(n − 1, seed)` after the drop or the
-   previous failure: `BACKOFF_MIN` (250 ms) doubling to `BACKOFF_MAX`
-   (15 s), less up to `BACKOFF_JITTER_CAP_PERMILLE` (20 %) of jitter from a
-   per-link seed. Each attempt is a `BootstrapPhase::Resume { attempt }`
+   previous failure: `BACKOFF_MIN` doubling to `BACKOFF_MAX`, less up to
+   `BACKOFF_JITTER_CAP_PERMILLE` of jitter from a per-link seed
+   ([protocol.md#timing](protocol.md#timing)). Each attempt is a `BootstrapPhase::Resume { attempt }`
    bootstrap, which re-presents the `connection_id` (with the run that
    assigned it) and shows no
    connecting overlay. A failure a retry may get past (the daemon is
@@ -713,13 +565,13 @@ lifecycle.
 
 ## Troubleshooting
 
-All `SshError` variants render with multi-line context (argv, exit, stderr tail). On launch, the TUI also re-prints the bootstrap error to stderr after the alternate-screen overlay tears down — so `kmux user@host` failures are visible after exit without consulting `~/.local/state/kmux/client.log`.
+All `SshError` variants render with multi-line context (argv, exit, stderr tail). In the GUI, a remote host's failure is the federation link's: `OpenPeer` answers `PeerError` with the reason, and a refused re-open names what to do ([architecture-federation.md](architecture-federation.md#re-discovering-a-restarted-peer)).
 
 **Where a dev build logs:** debug builds (`cargo run`, `./kmux`) isolate their state under `kmux-debug/`, so they log to `~/.local/state/**kmux-debug**/client.log` — *not* the release `kmux/client.log`. A GUI error that seems "missing from the client log" is usually being written to the debug file while you watch the release one. Run `kmux debug paths` (with the binary in question) to print the exact resolved client/daemon log, runtime, and state paths plus the `kmuxd` an auto-spawn would launch; `mise run tail-client-log` / `tail-daemon-log` follow *both* profiles' logs at once.
 
 | Symptom | Likely cause | Fix |
 |---------|-------------|-----|
-| `VersionMismatch { client: X, server: Y }` | `kmuxd` and `kmux` versions mismatch | Update both to the same version |
+| `protocol version mismatch: client=X, daemon=Y` (with an upgrade hint) | the two builds' protocol ranges do not overlap | Update the older side until they overlap |
 | `kmuxd not found on remote host` (exit 127) | `kmuxd` not in `$PATH` on remote | Install `kmuxd` on the remote host |
 | `SSH connection failed` with stderr `Permission denied (publickey)` | Key not available to ssh-agent / wrong identity | Add the key to `ssh-agent` or configure `IdentityFile` in `~/.ssh/config` |
 | `SSH connection failed` with stderr `Host key verification failed` | Remote host key changed | Update `~/.ssh/known_hosts` (e.g. `ssh-keygen -R host`) |
@@ -737,8 +589,8 @@ All `SshError` variants render with multi-line context (argv, exit, stderr tail)
 
 When a connection misbehaves, re-run with one of these flags to print a
 step-by-step trace of the bootstrap on stdout and exit. Both flags run the
-*same* [`run_bootstrap`](../crates/kmux-client/src/pipeline.rs) code path
-that the TUI uses — a successful `--dry-run` therefore proves the real
+*same* [`run_bootstrap`](../crates/kmux-connect/src/pipeline.rs) code path
+that the GUI uses — a successful `--dry-run` therefore proves the real
 flow works, and a failure shows exactly which step failed.
 
 | Flag | Behavior |
@@ -753,13 +605,13 @@ Sample output for `kmux --dry-run` against a local daemon:
 kmux dry-run for local-daemon
 [PARSE     ] target=local-daemon (0.00s)
 [DAEMON    ] querying control socket /run/user/1000/kmux/daemon.sock (0.00s)
-[DAEMON    ] already running pid=12345 quic_port=8443 tcp_port=8444 (0.00s)
-[HANDSHAKE ] quic 127.0.0.1:8443 (0.01s)
-[AUTH     ] Auth sent (protocol=13, conn_id=None) (0.02s)
+[DAEMON    ] already running pid=12345 quic_port=43117 tcp_port=38809 (0.00s)
+[HANDSHAKE ] UDS /run/user/1000/kmux/daemon-data.sock (0.01s)
+[AUTH     ] Auth sent (protocol=1.0.0..=1.1.0, conn_id=None) (0.02s)
 [AUTH     ] AuthResult success=true conn_id=42 server_version=0.1.0 (0.03s)
 [PING     ] seq=0; waiting up to 5s (0.03s)
 [PING     ] OK - RTT 0.42 ms (0.03s)
-[RESULT   ] connected via quic; bootstrap 32 ms, ping 0.42 ms (0.03s)
+[RESULT   ] connected via UDS; bootstrap 32 ms, ping 0.42 ms (0.03s)
 ```
 
 The raw `kmuxd probe-or-start` JSON is printed verbatim for SSH targets,
@@ -914,7 +766,7 @@ show every default commented out, so they pin nothing.
 
 ### Debounce rationale
 
-The two-phase connection model has a brief gap between bootstrap and data-plane transport selection, and a client switching transports disconnects before it reconnects. Keep the window well above that gap — tens of seconds at least — so a reconnect flow never races the timer.
+A client reconnecting after a drop, or switching transports, is disconnected for a moment before it is back. Keep the window well above that gap — tens of seconds at least — so a reconnect never races the timer.
 
 ### What survives an idle shutdown
 
@@ -984,9 +836,12 @@ so `PROTOCOL_RANGE` is unchanged.
 
 ### Deadlines
 
+The values are single-sourced in `kmux_protocol::timing` and specified in
+[protocol.md#timing](protocol.md#timing).
+
 | What | Deadline | On expiry |
 |------|----------|-----------|
-| TLS / QUIC handshake | `HANDSHAKE_TIMEOUT` 10 s, in the connection's own task; at most 64 at once per listener and 8 per source, the rest refused at once | connection dropped; other accepts unaffected |
+| TLS / QUIC handshake | `TRANSPORT_HANDSHAKE_TIMEOUT` 10 s, in the connection's own task; at most 64 at once per listener and 8 per source, the rest refused at once | connection dropped; other accepts unaffected |
 | `Auth` + `AuthProof` after connect | `AUTH_DEADLINE` 30 s | `CloseReason::AuthDeadline` |
 | Any inbound frame after the oldest unanswered `Ping` is written | `PONG_DEADLINE` 30 s | `CloseReason::PongDeadline` |
 | Each frame write, each flush | `FRAME_WRITE_TIMEOUT` 30 s | `CloseReason::WriteTimeout` |
@@ -1058,25 +913,29 @@ that floods queries without reading its input has further replies dropped.
 
 | File | Role |
 |------|------|
-| `crates/kmux-protocol/src/transport/bootstrap.rs` | `Bootstrap` trait, `SessionContext`, `EndpointAdvert`, `BootstrapError` |
-| `crates/kmux-sys/src/transport/mod.rs` | `Listener` trait, `PendingSession`, `IncomingSession`, `serve` accept loop |
-| `crates/kmux-protocol/src/transport/quic.rs` | QUIC listener and client helpers |
-| `crates/kmux-protocol/src/transport/tcp_tls.rs` | TLS-TCP listener and client helpers |
-| `crates/kmux-protocol/src/transport/uds.rs` | UDS listener and client helpers |
-| `crates/kmux-protocol/src/tls/tofu.rs` | TOFU certificate pinning |
+| `crates/kmux-protocol/src/codec.rs` | Frames: `read_frame` / `write_frame*`, codec tags, size limits |
+| `crates/kmux-protocol/src/timing.rs` | Every protocol interval and deadline |
+| `crates/kmux-protocol/src/control_rpc.rs` | Control-socket RPC types (`StatusResponse`, `SessionsResponse`, …) and `DAEMON_BOOT_ARGS` |
 | `crates/kmux-protocol/src/endpoint.rs` | `Endpoint` URL parser |
-| `crates/kmux-protocol/src/codec.rs` | `read_frame`/`write_frame` (named MessagePack + length-prefix) |
-| `crates/kmux-protocol/src/control_rpc.rs` | Shared control-socket RPC types (`StatusResponse`, `SessionsResponse`, `ConnectionInfo`, …) |
-| `crates/kmux-client/src/bootstrap.rs` | Bootstrap strategies and `bootstrap_race` |
-| `crates/kmux-client/src/supervisor.rs` | `TransportSupervisor`, `TransportScorer`, `UpgradeSignal` |
-| `crates/kmux-client/src/ssh/negotiate.rs` | SSH `probe-or-start` and tunnel setup |
-| `crates/kmux-client/src/daemon/mod.rs` | Control-socket client helpers (`query_daemon`, `stop_daemon`, `query_daemon_sessions`) |
+| `crates/kmux-sys/src/transport/mod.rs` | `Listener` trait, `PendingSession`, `IncomingSession`, `EndpointAdvert`, `serve` accept loop |
+| `crates/kmux-sys/src/transport/admission.rs` | Handshake admission bounds |
+| `crates/kmux-sys/src/transport/{quic,tcp_tls,uds}.rs` | The three listeners |
+| `crates/kmux-sys/src/tls/tofu.rs` | TOFU certificate pinning |
+| `crates/kmux-connect/src/pipeline.rs` | `run_bootstrap`, `ResolvedTarget`, `BootstrapOutcome`, `BootstrapError` |
+| `crates/kmux-connect/src/{connect,tcp_connect}.rs` | Client connects: QUIC; UDS and TCP+TLS; the `Auth` frame |
+| `crates/kmux-connect/src/supervisor.rs` | `TransportSupervisor`, `TransportScorer`, `UpgradeSignal`, `probe_verdict` |
+| `crates/kmux-connect/src/ssh/negotiate.rs` | SSH `probe-or-start` and tunnel setup |
+| `crates/kmux-connect/src/daemon/` | Control-socket client and the local daemon's lifecycle (`ensure_daemon`, `find_server_binary`) |
+| `crates/kmux-client/src/session_manager/connection.rs` | `connect`, `apply_outcome`, `resume_from`, `link_reached_same_daemon`, `apply_transport_upgrade` |
+| `crates/kmux-client/src/liveness.rs` | Client ping and silence tracking |
+| `crates/kmux-app/src/driver/reconnect.rs` | Automatic reconnect policy, outage input, the banner |
 | `crates/kmuxd/src/config.rs` | `kmuxd.toml` schema and `ServerConfig::resolve()` |
 | `crates/kmuxd/src/announce.rs` | Audience-aware endpoint advertisement |
 | `crates/kmuxd/src/startup.rs` | Listener loop over `ServerConfig.listeners` |
-| `crates/kmuxd/src/app/mod.rs` | `ServerApp`, `ConnectionMetrics`, `snapshot_sessions_with_connections` |
+| `crates/kmuxd/src/app/mod.rs` | `ServerApp`, `register_client` (resume), `ConnectionMetrics`, `snapshot_sessions_with_connections` |
 | `crates/kmuxd/src/daemon.rs` | Control socket server (`serve_control_socket`, status/stop/sessions commands) |
 | `crates/kmuxd/src/client_handler/session.rs` | `run_client_session` (generic over all transports; byte/activity instrumentation; writer with `FRAME_WRITE_TIMEOUT`) |
+| `crates/kmuxd/src/client_handler/dispatch/auth.rs` | The handshake |
 | `crates/kmuxd/src/client_handler/liveness.rs` | Auth and pong deadlines, the per-connection watchdog |
 | `crates/kmuxd/src/outbound.rs` | Bounded outbound queue, control/data lanes, lagged pane-stream resync, close signal |
-| `crates/kmux/src/subcommands/render.rs` | Centralised `tabled`-based table/JSON rendering for all CLI list output |
+| `crates/kmux-app/src/subcommands/render.rs` | Centralised `tabled`-based table/JSON rendering for all CLI list output |
