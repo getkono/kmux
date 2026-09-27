@@ -338,7 +338,11 @@ mod pane_writer_tests {
 
         assert_eq!(written, Ok(()));
         let mut wire = Vec::new();
-        client.read_to_end(&mut wire).await.unwrap();
+        // Bounded: a writer that never finishes the stream must fail, not hang.
+        tokio::time::timeout(Duration::from_secs(5), client.read_to_end(&mut wire))
+            .await
+            .expect("the stream ends")
+            .unwrap();
         let expected = encode_server(&frame()).unwrap();
         assert_eq!(wire.len(), 5 + expected.len(), "one uncompressed frame");
         assert!(wire.ends_with(&expected));
@@ -367,6 +371,11 @@ mod pane_writer_tests {
     #[test]
     fn a_stall_outlasts_the_quic_idle_timeout() {
         assert!(PANE_STREAM_STALL_TIMEOUT > Duration::from_secs(kmux_sys::QUIC_IDLE_TIMEOUT_SECS));
+        assert_eq!(
+            PANE_STREAM_STALL_TIMEOUT,
+            Duration::from_secs(330),
+            "30 s past it"
+        );
     }
 
     /// A stream the client has gone from fails the write at once.
@@ -395,8 +404,9 @@ mod pane_writer_tests {
     // A reset is a QUIC frame; `duplex` has no equivalent, so these run over
     // loopback on the real clock, with a short stall timeout.
 
-    /// A bound on every loopback wait.
-    const WAIT: Duration = Duration::from_secs(10);
+    /// A bound on every loopback wait: loopback takes milliseconds, and a
+    /// mutant that hangs one should fail fast.
+    const WAIT: Duration = Duration::from_secs(5);
 
     /// The stall timeout the loopback tests use.
     const SHORT_STALL: Duration = Duration::from_millis(200);
@@ -489,9 +499,10 @@ mod pane_writer_tests {
         })
         .await
         .expect("the writer ends");
-        feeding
+        tokio::time::timeout(WAIT, feeding)
             .await
-            .expect("the pane queue closes with the writer");
+            .expect("the pane queue closes with the writer")
+            .unwrap();
 
         let mut uni = tokio::time::timeout(WAIT, client_conn.accept_uni())
             .await
@@ -547,5 +558,43 @@ mod pane_writer_tests {
         .await
         .expect("the writer ends");
         assert!(ctrl_rx.try_recv().is_err(), "no resync");
+    }
+
+    /// A QUIC connection is served by a client session: a frame that is not
+    /// a client message is answered with an `InvalidMessage` error.
+    #[tokio::test]
+    async fn handle_with_io_serves_the_connection() {
+        use kmux_protocol::messages::ErrorCode;
+        use kmux_protocol::{decode_server, read_frame, write_frame};
+
+        let (_client, _server, _client_conn, server_conn) = quic_pair().await;
+        let (server, client) = tokio::io::duplex(64 * 1024);
+        let (server_read, server_write) = tokio::io::split(server);
+        let (mut client_read, mut client_write) = tokio::io::split(client);
+        let session = tokio::spawn(handle_with_io(
+            server_read,
+            server_write,
+            server_conn,
+            Arc::new(crate::fixtures::fixture_app()),
+            kmux_protocol::TransportKind::Quic,
+            tracing::Span::none(),
+        ));
+
+        write_frame(&mut client_write, b"not a message")
+            .await
+            .unwrap();
+        let frame = tokio::time::timeout(WAIT, read_frame(&mut client_read))
+            .await
+            .expect("answered in time")
+            .unwrap()
+            .expect("a reply");
+        assert!(matches!(
+            decode_server(&frame).unwrap(),
+            ServerMessage::Error {
+                code: ErrorCode::InvalidMessage,
+                ..
+            }
+        ));
+        session.abort();
     }
 }
