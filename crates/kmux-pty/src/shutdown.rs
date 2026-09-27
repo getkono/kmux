@@ -132,9 +132,17 @@ mod tests {
     /// A shell that exits on the first signal ends the cascade there and
     /// reports how it died. Needs a real child: the status comes from the
     /// kernel (R7).
+    ///
+    /// The child is closed only once it runs. A child still starting has
+    /// every signal blocked, so the `SIGHUP` waits pending; a `SIGTERM`
+    /// landing just after the mask clears then kills it at once on Linux,
+    /// before the pending `SIGHUP` is taken, and the child dies of the second
+    /// signal. That race, not the cascade, is what this test used to fail on.
     #[tokio::test]
     async fn graceful_shutdown_reports_the_signal_that_ended_the_child() {
-        let pty = PtyProcess::spawn(&PtyConfig::new("/bin/sleep").args(["600"])).expect("spawn");
+        let config = PtyConfig::new("/bin/sh").args(["-c", "echo ready; exec sleep 600"]);
+        let mut pty = PtyProcess::spawn(&config).expect("spawn");
+        read_until(&mut pty, "ready").await;
         let status = graceful_shutdown(pty.pid, pty.exit_rx.clone(), Some(DEADLINE)).await;
         assert_eq!(status, ExitStatus::Signal(Signal::SIGHUP as i32));
     }
