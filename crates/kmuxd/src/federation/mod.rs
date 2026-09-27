@@ -507,6 +507,10 @@ impl PeerConnection {
     ///   would release it later; `from` is still answered, as a local daemon
     ///   answers before the detach.
     /// - A release frees the lock when `from` held it.
+    /// - The give-back of a stale grant can reach the peer after it granted
+    ///   the lock again for a client that holds it here: the peer's
+    ///   confirmation of the give-back makes the hub ask for the lock again,
+    ///   and should the peer refuse, the holder here is told it is released.
     fn on_lock_reply(&mut self, from: &Requester, msg: ServerMessage) -> ServerMessage {
         match &msg {
             ServerMessage::InputLockGranted { pane_id } => {
@@ -534,17 +538,68 @@ impl PeerConnection {
                     );
                 }
             }
-            ServerMessage::InputLockReleased { pane_id }
-                if self
-                    .input_locks
-                    .get(pane_id)
-                    .is_some_and(|holder| holder.client_id() == from.client_id()) =>
-            {
-                self.input_locks.remove(pane_id);
-            }
+            ServerMessage::InputLockReleased { pane_id } => self.lock_released(pane_id, from),
+            ServerMessage::InputLockDenied { pane_id, .. } => self.lock_refused(pane_id, from),
             _ => {}
         }
         msg
+    }
+
+    /// The peer released the lock on `local_pane` for `from`. The holder's
+    /// own release frees it here. The hub's own (a stale grant given back)
+    /// may have reached the peer after it granted the lock again for the
+    /// holder here, so the hub asks for it again.
+    fn lock_released(&mut self, local_pane: &str, from: &Requester) {
+        let Some(holder) = self
+            .input_locks
+            .get(local_pane)
+            .and_then(Requester::client_id)
+        else {
+            return;
+        };
+        if from.client_id() == Some(holder) {
+            self.input_locks.remove(local_pane);
+        } else if from.client_id().is_none() {
+            self.relock(local_pane);
+        }
+    }
+
+    /// The peer refused the lock on `local_pane` to the hub asking again for
+    /// the holder here, or to the holder asking again itself: the peer no
+    /// longer holds it for the hub, so the holder here does not either. It
+    /// is told so when the hub asked (it hears the refusal itself otherwise).
+    fn lock_refused(&mut self, local_pane: &str, from: &Requester) {
+        let Some(holder) = self
+            .input_locks
+            .get(local_pane)
+            .and_then(Requester::client_id)
+        else {
+            return;
+        };
+        let hub_asked = from.client_id().is_none();
+        if !(hub_asked || from.client_id() == Some(holder)) {
+            return;
+        }
+        if let Some(holder) = self.input_locks.remove(local_pane)
+            && hub_asked
+        {
+            holder.answer(ServerMessage::InputLockReleased {
+                pane_id: local_pane.to_string(),
+            });
+        }
+    }
+
+    /// Ask the peer again, as the hub, for the lock on `local_pane` a client
+    /// here holds.
+    fn relock(&mut self, local_pane: &str) {
+        if let Some(remote_pane) = self.to_remote_pane(local_pane) {
+            self.send(
+                &Requester::Hub,
+                ClientMessage::RequestInputLock {
+                    pane_id: remote_pane,
+                },
+            );
+        }
     }
 
     /// Give back to the peer every lock `holder` holds on this link, whether
@@ -1063,6 +1118,13 @@ impl PeerManager {
             return false;
         };
         let from = Requester::client(client_id, ctrl_tx.clone());
+        // A client re-attaching on a new channel (a resume) takes its lock
+        // there, so the old channel's end leaves it held.
+        if let Some(holder) = guard.input_locks.get_mut(local_pane_id)
+            && holder.client_id() == Some(client_id)
+        {
+            *holder = from.clone();
+        }
         let mut viewer = Viewer::new(data_tx, ctrl_tx, size);
         if let Some(pane) = guard.panes.get_mut(local_pane_id) {
             // Late viewer: mint from the mirror, register, then reconcile size.

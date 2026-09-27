@@ -305,7 +305,10 @@ A hub is one client to each peer, speaking for all of its own
   others' input with `InputLocked`, and releases the peer's lock when the
   holder detaches, its channel ends or its session closes. The lock belongs
   to a viewer of the pane: a grant for a client that stopped viewing it while
-  it asked is given back to the peer at once. Two requests made while the
+  it asked is given back to the peer at once. Should that give-back reach the
+  peer after it granted the lock again for the holder here, the hub asks for
+  it again. When the peer refuses the hub or the holder, the holder here loses
+  the lock too. A re-attach on a new channel (a resume) takes the lock along. Two requests made while the
   lock was free are both granted by the peer, which sees one client, so the
   hub denies the second, naming the first. A holder the peer names in its own
   `InputLockDenied` — one of the peer's direct clients — is in the peer's

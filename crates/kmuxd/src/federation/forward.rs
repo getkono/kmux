@@ -1114,11 +1114,52 @@ mod tests {
         );
     }
 
-    /// A grant given back for a client that stopped viewing is confirmed to
-    /// the hub alone: the release does not take the lock from the client
-    /// that holds it by then.
+    /// A holder asking again and refused by the peer (a direct client of the
+    /// peer took the lock) no longer holds it here either.
     #[tokio::test(start_paused = true)]
-    async fn giving_back_a_stale_grant_keeps_the_new_holder() {
+    async fn a_holder_the_peer_refuses_no_longer_holds_the_lock() {
+        let mut hub = fixture_hub();
+        let (a, mut a_answers, _a_pane) = viewing_client(&mut hub, 1);
+        let (b, _b_answers, _b_pane) = viewing_client(&mut hub, 2);
+        let pane = "fedlocal/0";
+        hub.app.peer_manager.request_input_lock(&a, pane).unwrap();
+        play_peer(&mut hub);
+        answer(&mut a_answers).await;
+        hub.app.peer_manager.request_input_lock(&a, pane).unwrap();
+        while let Ok(msg) = hub.upstream.try_recv() {
+            if let ClientMessage::Ping { seq } = msg {
+                hub.peer.send(ServerMessage::Pong { seq }).unwrap();
+            }
+        }
+        hub.peer
+            .send(ServerMessage::InputLockDenied {
+                pane_id: "fedremote/0".into(),
+                holder: ClientId(9),
+            })
+            .unwrap();
+        assert!(matches!(
+            answer(&mut a_answers).await,
+            ServerMessage::InputLockDenied { .. }
+        ));
+        hub.app
+            .peer_manager
+            .forward(
+                b,
+                ClientMessage::PtyInput {
+                    pane_id: pane.into(),
+                    data: b"y".to_vec(),
+                },
+            )
+            .expect("the hub no longer holds it for A");
+    }
+
+    /// A grant given back for a client that stopped viewing can reach the
+    /// peer after it granted the lock again for the client holding it here:
+    /// the peer's confirmation makes the hub ask for the lock again, and a
+    /// refusal tells the holder its lock is gone. Meanwhile the holder keeps
+    /// it here (issue #227).
+    #[tokio::test(start_paused = true)]
+    async fn giving_back_a_stale_grant_asks_again_for_the_holder() {
         let mut hub = fixture_hub();
         let (a, mut a_answers, _a_pane) = viewing_client(&mut hub, 1);
         let (b, _b_answers, _b_pane) = viewing_client(&mut hub, 2);
@@ -1133,21 +1174,65 @@ mod tests {
             answer(&mut a_answers).await,
             ServerMessage::InputLockGranted { .. }
         ));
-        // The hub's give-back of C's grant, and the peer's confirmation.
+        // The give-back of C's grant, and the peer's confirmation of it.
+        play_peer(&mut hub);
+        assert!(matches!(
+            next_request(&mut hub.upstream).await,
+            ClientMessage::RequestInputLock { pane_id } if pane_id == "fedremote/0"
+        ));
+        let input = |from: &Requester| {
+            hub.app.peer_manager.forward(
+                from.clone(),
+                ClientMessage::PtyInput {
+                    pane_id: pane.into(),
+                    data: b"x".to_vec(),
+                },
+            )
+        };
+        assert_eq!(input(&b).unwrap_err().code, ErrorCode::InputLocked);
+
+        // A direct client of the peer took the lock in between.
+        hub.peer
+            .send(ServerMessage::InputLockDenied {
+                pane_id: "fedremote/0".into(),
+                holder: ClientId(9),
+            })
+            .unwrap();
+        assert!(matches!(
+            answer(&mut a_answers).await,
+            ServerMessage::InputLockReleased { pane_id } if pane_id == pane
+        ));
+        input(&b).expect("nobody holds it here any more");
+    }
+
+    /// A client that resumes on a new channel and re-attaches keeps its
+    /// lock when the old channel ends, as a local daemon keeps it (#208).
+    #[tokio::test(start_paused = true)]
+    async fn a_resumed_holder_keeps_its_lock_when_the_old_channel_ends() {
+        let mut hub = fixture_hub();
+        let (a, _a_answers, _a_pane) = viewing_client(&mut hub, 1);
+        let (b, _b_answers, _b_pane) = viewing_client(&mut hub, 2);
+        let pane = "fedlocal/0";
+        hub.app.peer_manager.request_input_lock(&a, pane).unwrap();
         play_peer(&mut hub);
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        let input = hub.app.peer_manager.forward(
-            b,
-            ClientMessage::PtyInput {
-                pane_id: pane.into(),
-                data: b"x".to_vec(),
-            },
-        );
-        assert_eq!(
-            input.unwrap_err().code,
-            ErrorCode::InputLocked,
-            "A still holds it"
-        );
+
+        let (resumed, _resumed_answers, _resumed_pane) = viewing_client(&mut hub, 1);
+        if let Requester::Client { ctrl: old, .. } = &a {
+            hub.app.peer_manager.detach_channel(ClientId(1), old);
+        }
+        assert!(hub.upstream.try_recv().is_err(), "nothing is given back");
+        let input = |from: &Requester| {
+            hub.app.peer_manager.forward(
+                from.clone(),
+                ClientMessage::PtyInput {
+                    pane_id: pane.into(),
+                    data: b"x".to_vec(),
+                },
+            )
+        };
+        assert_eq!(input(&b).unwrap_err().code, ErrorCode::InputLocked);
+        input(&resumed).expect("the resumed holder types");
     }
 
     /// A link that drops answers everything still waiting with an error, and

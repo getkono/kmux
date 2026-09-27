@@ -424,9 +424,11 @@ typed error, never answered by a hub that does not host it and never dropped.
   holds the peer's lock for the holder, refuses the others' input, and releases
   the peer's lock when the holder detaches, its channel ends (even after a
   closed pane stream dropped it as a viewer) or its session closes. Two grants
-  the peer gave while the lock was free keep one holder; a grant for a client
-  that stopped viewing the pane is given back at once; a dropped link tells the
-  holder `InputLockReleased`.
+  the peer gave while the lock was free keep one holder. A grant for a client
+  that stopped viewing the pane is given back at once, and asked for again if
+  the give-back overtook a newer holder's grant. A peer's refusal ends the
+  holder's lock here too. A resumed holder's re-attach keeps its lock. A
+  dropped link tells the holder `InputLockReleased`.
 - **Hub parity.** `SetSnapshotMode` reaches proxied viewers (they are sent the
   mirror in place of each frame), and a channel's end detaches its proxied
   viewers (`PeerManager::detach_channel`). The peer's `GridDigest` is checked
