@@ -457,17 +457,25 @@ unsupported traffic. See
 
 ## ConnectionId and Session Resumption
 
-`ConnectionId` is a server-assigned `u64` provided in the first `AuthResult`. It is the stable identity of a session across transport swaps.
+`ConnectionId` is a server-assigned `u64` provided in the first `AuthResult`. It names a client's *registration* on the daemon — its `ClientId` (which its pane attachments and input locks are keyed by), label and identity — and a client presents it again whenever it opens a new channel: a transport swap, or a reconnect (issue #208).
 
-When the supervisor promotes a new transport:
+**Resume.** A new channel's `Auth` carries the existing `connection_id`. After the identity proof, `ServerApp::register_client` resumes the registration only if both hold:
 
-1. The client opens a connection on the new transport.
-2. It sends `ClientMessage::Auth` with the existing `token` and `connection_id`.
-3. The server calls `build_attach_replay` to reconstruct session state and resume the session.
-4. The server responds with `AuthResult { success: true }`.
-5. `apply_transport_upgrade` atomically replaces the active sender; the old transport connection is dropped.
+- the `connection_id` names a live registration — the daemon still holds the old channel (a transport swap, or a half-open link whose loop has not yet hit its pong deadline); and
+- the verified `machine_id` equals the one the registration was made with. A different machine holding the token takes nothing over.
 
-No session state (panes, scrollback, environment) is lost during transport swaps.
+Otherwise the channel registers a fresh connection with fresh ids. `RegisteredClient::resume` (`app::Resume`) says which — `Resumed`, `UnknownConnection`, `OtherMachine`, or `NotRequested` for a first connection — and the daemon's `client authenticated` log line carries it as `resume=…` with the `generation`. An old channel whose loop has already ended has released its registration, so a reconnect after it is a fresh connection — which costs nothing on screen, because replay is per pane (below).
+
+**Generations.** Each registration carries a generation, bumped by every resume. A channel's loop records the generation it registered with, and when it ends (`client_handler::release_channel`):
+
+1. it detaches only the pane attachments made **through this channel** (`ServerApp::detach_channel`, matched by the channel's control lane) — a pane the resuming channel re-attached under the same `ClientId` is left alone; and
+2. it releases the registration only if its generation is still current (`ServerApp::release_connection`). A superseded channel ending leaves the registration to the channel that resumed it.
+
+**Replay.** Pane streams are not moved by the daemon: a pane stays attached through the channel that attached it, and a new channel re-attaches it. Replay is per pane, so it is the same for a resumed and a fresh connection: a client that re-attaches with `Attach { last_seqno }`, the last seqno it applied, is answered by `compute_replay` from the pane's retained diffs — exactly the missed `TerminalUpdate`s when the buffer still covers `last_seqno` (and the backlog is under the coalescing threshold), otherwise `SyncReset` + a fresh `TerminalSnapshot`.
+
+**Transport swap.** When the supervisor promotes a new transport, the resumed channel sends `ChannelReady`, the daemon answers `ChannelSwitched { old_transport }`, and `apply_transport_upgrade` replaces the active sender; the old transport is dropped, and its loop's teardown is the superseded case above.
+
+**Missed server events.** Every connection forwards two server-wide broadcasts (PTY lifecycle events; VT, layout and tab events). A connection that falls behind one is sent an unsolicited `SessionListResult` with `request_id = RESYNC_REQUEST_ID` (`u64::MAX`) — every session with its tabs and layouts — and the forwarder carries on. Every session list — this resync and every answer to `SessionList` (`ServerApp::send_session_list`) — is queued while the session map is read-locked, so a local session created, closed or re-laid-out at the same moment either shows in it or has its own reply and event queued after it. The client treats any session list as the whole truth: sessions it no longer lists are closed as if their `SessionClosed` had arrived, and the viewed tab of a local session is reconciled against its listed layout. A federated session's view is left as shown, because the hub's cached entry for it does not follow the peer's layout and tab changes.
 
 ---
 
@@ -731,7 +739,7 @@ Every connection that completes auth is given an `Arc<ConnectionMetrics>` alloca
 | `last_rtt_ms` | `AtomicU64` | Most recent round-trip time in ms; `u64::MAX` = no measurement yet. |
 | `last_ping_sent` | `Mutex<Option<(u64, Instant)>>` | The `(seq, sent_at)` of the last `Ping` sent, used to match the next `Pong`. |
 
-**Metric continuity across channel switches.** When a client reconnects on a new transport (e.g. the `TransportSupervisor` upgrades UDS → QUIC), `ServerApp::register_client` is called with the existing `ConnectionId`. The daemon finds the existing `ConnectionState`, updates its `transport` label, and returns the *original* `Arc<ConnectionMetrics>` — so `bytes_in`/`bytes_out` keep counting as if the switch never happened. The new `Arc<ConnectionMetrics>` passed by the caller is discarded.
+**Metric continuity across channel switches.** When a client reconnects on a new transport (e.g. the `TransportSupervisor` upgrades UDS → QUIC), `ServerApp::register_client` is called with the existing `ConnectionId`. The daemon finds the existing `ConnectionState`, updates its `transport` label, and keeps the *original* `Arc<ConnectionMetrics>` in the registration, so the listing keeps the counts from before the switch. The new channel counts into its own `Arc`, which the caller passed and the registration does not store: after a switch the listed counters stop advancing (a known gap).
 
 **Where counters accumulate.** `bytes_in` and `msgs_in` are incremented in the `run_client_session` read loop immediately after each `read_frame` returns. `bytes_out` (actual wire bytes), `bytes_out_uncompressed`, and `msgs_out` are incremented in the writer task after each `write_frame_compressed` succeeds (it returns the wire-byte count). `last_activity_ms` is stamped to `epoch_millis()` on every inbound frame. `last_rtt_ms` and `last_pong_ms` are updated in the Pong dispatch branch when the received sequence number matches `last_ping_sent`.
 

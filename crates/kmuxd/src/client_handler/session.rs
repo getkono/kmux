@@ -100,36 +100,65 @@ pub(crate) fn forward_vt_event(out: &OutboundTx, msg: ServerMessage) {
     }
 }
 
+/// Forward one server-wide broadcast to this connection until the daemon
+/// closes it, handing each item to `deliver`.
+///
+/// A lag means this connection missed events, and a missed event may have
+/// been a session or tab created or closed, or a layout change. So the
+/// forwarder does not end or skip ahead silently (issue #208): it sends a
+/// fresh session list — every session with its tabs and layouts — that the
+/// client reconciles against, then carries on.
+async fn forward_broadcast<T: Clone>(
+    mut rx: broadcast::Receiver<T>,
+    app: Arc<ServerApp>,
+    out: OutboundTx,
+    deliver: impl Fn(&OutboundTx, T),
+) {
+    loop {
+        match rx.recv().await {
+            Ok(item) => deliver(&out, item),
+            Err(broadcast::error::RecvError::Lagged(missed)) => {
+                warn!(missed, "server events lagged; resyncing the session list");
+                if app
+                    .send_session_list(&out, kmux_protocol::messages::RESYNC_REQUEST_ID)
+                    .await
+                    .is_err()
+                {
+                    break;
+                }
+            }
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
+}
+
 fn spawn_authenticated_forwarders(
-    app: &ServerApp,
+    app: &Arc<ServerApp>,
     ctrl_tx: OutboundTx,
     metrics: Arc<ConnectionMetrics>,
     conn_span: Span,
 ) -> AuthenticatedTasks {
-    let mut event_rx = app.subscribe_events();
-    let event_tx = ctrl_tx.clone();
     let event_task = tokio::spawn(
-        async move {
-            while let Ok(event) = event_rx.recv().await {
-                let msg = pty_event_to_msg(event);
-                let _ = event_tx.send(ServerMessage::Event { event: msg });
-            }
-        }
+        forward_broadcast(
+            app.subscribe_events(),
+            Arc::clone(app),
+            ctrl_tx.clone(),
+            |out, event| {
+                let _ = out.send(ServerMessage::Event {
+                    event: pty_event_to_msg(event),
+                });
+            },
+        )
         .instrument(conn_span.clone()),
     );
 
-    let mut vt_rx = app.subscribe_vt_events();
-    let vt_tx = ctrl_tx.clone();
     let vt_task = tokio::spawn(
-        async move {
-            loop {
-                match vt_rx.recv().await {
-                    Ok(msg) => forward_vt_event(&vt_tx, msg),
-                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
+        forward_broadcast(
+            app.subscribe_vt_events(),
+            Arc::clone(app),
+            ctrl_tx.clone(),
+            forward_vt_event,
+        )
         .instrument(conn_span.clone()),
     );
 
@@ -274,6 +303,30 @@ pub(crate) async fn within<T, E>(
             Err(CloseReason::WriteTimeout)
         }
     }
+}
+
+/// What an authenticated channel's loop releases as it ends (issue #208): the
+/// pane attachments made through this channel, and the connection's
+/// registration if this channel still holds it. A channel a resume superseded
+/// leaves the registration — and every pane the resuming channel re-attached —
+/// to the channel that took over.
+pub(crate) async fn release_channel(state: &SharedClientState) {
+    let (Some(client_id), Some(conn_id)) = (state.client_id, state.connection_id) else {
+        return;
+    };
+    state.app.detach_channel(client_id, &state.ctrl_tx).await;
+    let released = state
+        .app
+        .release_connection(conn_id, state.generation)
+        .await;
+    // `released = false`: a resume superseded this channel, and the
+    // registration stays with the channel that took over.
+    debug!(
+        conn_id = conn_id.0,
+        generation = state.generation,
+        released,
+        "channel released"
+    );
 }
 
 /// Generic client session handler shared by QUIC and TCP connections.
@@ -422,12 +475,7 @@ pub async fn run_client_session<R, W, A, F>(
     drop(authenticated_tasks);
 
     let log_conn_id = state.connection_id.map(|c| c.0);
-    if let Some(client_id) = state.client_id {
-        app.detach_client_all(client_id).await;
-    }
-    if let Some(conn_id) = state.connection_id {
-        app.unregister_client(conn_id).await;
-    }
+    release_channel(&state).await;
 
     drop(state);
     drop(attacher);
@@ -832,6 +880,65 @@ mod tests {
 
         forward_vt_event(&out, pane_event(SessionEventMsg::PaneClosed { pane_id }));
         assert_eq!(out.len(), 7, "a lifecycle event is control");
+    }
+
+    /// A subscriber that falls behind the server-wide broadcast is sent a
+    /// resync session list and keeps forwarding. Before, a lag ended the
+    /// session-event forwarder for good and the VT one skipped ahead silently.
+    #[tokio::test(start_paused = true)]
+    async fn a_lagged_forwarder_resyncs_the_session_list_and_keeps_running() {
+        use kmux_protocol::messages::RESYNC_REQUEST_ID;
+
+        let app = Arc::new(fixture_app());
+        // One (federated) session, so the resync has something to list.
+        let (_upstream, _peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let (out, mut out_rx) = outbound::channel(OUTBOUND_CAPACITY, close_channel().0);
+        let rx = app.subscribe_vt_events();
+        let renamed = |n: usize| ServerMessage::SessionRenamed {
+            word_id: "eagle".to_string(),
+            new_name: n.to_string(),
+        };
+        // More than the broadcast holds before the forwarder reads any: the
+        // oldest are lost to it.
+        for n in 0..600 {
+            app.broadcast(renamed(n));
+        }
+        let forwarder = tokio::spawn(forward_broadcast(
+            rx,
+            Arc::clone(&app),
+            out,
+            forward_vt_event,
+        ));
+
+        let first = tokio::time::timeout(Duration::from_secs(10), out_rx.recv())
+            .await
+            .expect("the forwarder answers the lag")
+            .expect("the queue is open");
+        let ServerMessage::SessionListResult {
+            request_id,
+            sessions,
+        } = first
+        else {
+            panic!("expected a resync session list, got {first:?}");
+        };
+        assert_eq!(request_id, RESYNC_REQUEST_ID);
+        let listed: Vec<&str> = sessions.iter().map(|e| e.meta.word_id.as_str()).collect();
+        assert_eq!(listed, vec!["fedlocal"]);
+        // The newest events still follow, and so does one sent afterwards.
+        app.broadcast(renamed(600));
+        let mut last = None;
+        while let Ok(Some(msg)) = tokio::time::timeout(Duration::from_secs(10), out_rx.recv()).await
+        {
+            let ServerMessage::SessionRenamed { new_name, .. } = msg else {
+                panic!("expected only renames after the resync, got {msg:?}");
+            };
+            last = Some(new_name);
+            if last.as_deref() == Some("600") {
+                break;
+            }
+        }
+        assert_eq!(last.as_deref(), Some("600"));
+        assert!(!forwarder.is_finished(), "the forwarder is still running");
     }
 
     /// A transport whose every write panics, as a bug in the write path would.

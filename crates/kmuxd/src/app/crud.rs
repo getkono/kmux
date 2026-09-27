@@ -4,8 +4,8 @@ use std::sync::atomic::AtomicU64;
 
 use kmux_protocol::format_pane_id;
 use kmux_protocol::messages::{
-    ClientCapabilities, LayoutNode, PaneId, PaneInfo, PaneProcesses, SessionEntry, SessionMeta,
-    SessionStatus, TermSize, epoch_millis,
+    ClientCapabilities, LayoutNode, PaneId, PaneInfo, PaneProcesses, ServerMessage, SessionEntry,
+    SessionMeta, SessionStatus, TermSize, epoch_millis,
 };
 use kmux_pty::error::{KmuxError, Result};
 
@@ -195,11 +195,45 @@ impl ServerApp {
 
     /// List all active sessions with their pane metadata.
     pub async fn list_sessions(&self) -> Vec<SessionEntry> {
-        let sessions = self.sessions.read().await;
+        Self::sorted_entries(&*self.sessions.read().await)
+    }
+
+    /// The entries of `sessions`, in creation order.
+    fn sorted_entries(
+        sessions: &std::collections::HashMap<kmux_protocol::messages::WordId, SessionState>,
+    ) -> Vec<SessionEntry> {
         let mut entries: Vec<SessionEntry> =
             sessions.values().map(Self::build_session_entry).collect();
         entries.sort_by_key(|e| e.meta.index);
         entries
+    }
+
+    /// Queue on `out` a `SessionListResult` for `request_id` carrying every
+    /// session with its tabs and layouts: the answer to `SessionList`, or —
+    /// with `RESYNC_REQUEST_ID` — what a connection that missed server events
+    /// is sent so it converges (issue #208).
+    ///
+    /// It is queued while the session map is still read-locked. A local
+    /// session created, closed or re-laid-out concurrently therefore either
+    /// shows in the list or changes after it — and its own reply and event,
+    /// queued after the write lock, reach the client after the list — so a
+    /// list taken just before a change cannot arrive after it and undo it.
+    /// That ordering is what lets a client treat every list as the whole
+    /// truth.
+    pub async fn send_session_list(
+        &self,
+        out: &crate::outbound::OutboundTx,
+        request_id: kmux_protocol::messages::RequestId,
+    ) -> std::result::Result<(), crate::outbound::OutboundClosed> {
+        let sessions = self.sessions.read().await;
+        let mut entries = Self::sorted_entries(&sessions);
+        entries.extend(self.list_federated_sessions());
+        let sent = out.send(ServerMessage::SessionListResult {
+            request_id,
+            sessions: entries,
+        });
+        drop(sessions);
+        sent
     }
 
     /// Sample the process tree of every locally-hosted pane (issue #122).

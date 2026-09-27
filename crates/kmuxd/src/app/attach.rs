@@ -264,13 +264,29 @@ impl ServerApp {
         }
     }
 
-    /// Remove a client from all panes they were attached to.
-    pub async fn detach_client_all(&self, client_id: ClientId) {
+    /// Remove `client_id` from every pane it attached to **through the
+    /// channel whose control lane is `ctrl`**, releasing its input locks there.
+    ///
+    /// A channel's loop calls this as it ends. Scoping to the channel is what
+    /// makes a resume safe (issue #208): the client that resumed on a new
+    /// channel keeps its `client_id`, so a pane it re-attached through that
+    /// channel carries the new control lane and is left alone, while a pane
+    /// only the old channel still held is released.
+    pub async fn detach_channel(&self, client_id: ClientId, ctrl: &crate::outbound::OutboundTx) {
         let mut sessions = self.sessions.write().await;
         for state in sessions.values_mut() {
             for (pane_index, relay) in &mut state.panes {
                 let pane_id = format_pane_id(&state.meta.word_id, *pane_index);
-                relay.clients.lock().unwrap().remove(&client_id);
+                {
+                    let mut clients = relay.clients.lock().unwrap();
+                    let ours = clients
+                        .get(&client_id)
+                        .is_some_and(|sender| sender.ctrl_tx.same_channel(ctrl));
+                    if !ours {
+                        continue;
+                    }
+                    clients.remove(&client_id);
+                }
                 relay.recompute_live_capabilities();
                 if relay.input_mode == InputMode::Locked(client_id) {
                     relay.input_mode = InputMode::Open;
