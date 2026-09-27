@@ -89,7 +89,7 @@ These are single-byte sequences handled directly by the VT parser.
 | Byte | Name | Seq | Status | Notes |
 |------|------|-----|--------|-------|
 | `0x00` | NUL | — | **Stable** | Ignored by emulator |
-| `0x07` | BEL | `^G` | **Stable** | Forwarded via `BackendEventSink::on_bell()` |
+| `0x07` | BEL | `^G` | **Stable** | Forwarded via `ControlEvent::Bell` |
 | `0x08` | BS  | `^H` | **Stable** | Moves cursor left |
 | `0x09` | HT  | `^I` | **Stable** | Horizontal tab stop |
 | `0x0A` | LF  | `^J` | **Stable** | Line feed / newline |
@@ -274,17 +274,17 @@ alternative backends.
 
 | Sequence | Name | Status | Notes |
 |----------|------|--------|-------|
-| `OSC 0 … BEL/ST` | Set window title and icon title | **Stable** | Forwarded via `BackendEventSink::on_title()`; tested in `event_sink_receives_title` |
-| `OSC 1 … BEL/ST` | Set icon title | **Stable** | Mapped to `on_title()` (same as OSC 0) |
+| `OSC 0 … BEL/ST` | Set window title and icon title | **Stable** | Forwarded via `ControlEvent::Title`; tested in `event_sink_receives_title` |
+| `OSC 1 … BEL/ST` | Set icon title | **Stable** | Mapped to `ControlEvent::Title` (same as OSC 0) |
 | `OSC 2 … BEL/ST` | Set window title | **Stable** | |
 | `OSC 4 ; c ; spec BEL/ST` | Set/query colour palette entry | **Partial** | Parsed by libghostty-vt; colour changes affect resolved RGB but palette queries are not replied to clients |
 | `OSC 7 … BEL/ST` | Set current working directory | **Unimplemented** | URI not extracted or forwarded |
-| `OSC 8 ; … ; uri BEL/ST` | Hyperlink | **Unimplemented** | `BackendEventSink::on_hyperlink()` seam exists; no forwarding yet |
+| `OSC 8 ; … ; uri BEL/ST` | Hyperlink | **Unimplemented** | `ControlEvent::Hyperlink` seam exists; no forwarding yet |
 | `OSC 10 / 11 BEL/ST` | Query default fg/bg colour | **Partial** | Parsed; query responses not implemented (no back-channel to the application from the emulator) |
-| `OSC 52 ; … BEL/ST` | Clipboard write (set) | **Stable** | `on_osc52_copy()` broadcasts `PaneClipboardCopy` server-wide; the client writes it to the system clipboard, honoring writes from any pane in the session it is viewing (last-in-wins). Clipboard *read* (`OSC 52 ; … ; ?`) is not answered (no client→server clipboard channel) |
+| `OSC 52 ; … BEL/ST` | Clipboard write (set) | **Stable** | `ControlEvent::Osc52Copy` broadcasts `PaneClipboardCopy` server-wide; the client writes it to the system clipboard, honoring writes from any pane in the session it is viewing (last-in-wins). Clipboard *read* (`OSC 52 ; … ; ?`) is not answered (no client→server clipboard channel) |
 | `OSC 133 / 633` | Shell integration / semantic zones | **Not planned** | |
 | `OSC 1337` | iTerm2 inline images | **Unimplemented** | Parsed by libghostty-vt; image data dropped silently (Phase A) |
-| `OSC 9 ; 4 ; state ; pct BEL/ST` | ConEmu / Windows Terminal progress report | **Stable** | `on_progress()` stores the latest state per pane in the relay (carried in the `PaneInfo` snapshot so late clients see it) and broadcasts `PaneProgressChanged`; rendered as a per-pane progress bar (Cairo + Swift). Tested in `event_sink_receives_progress` (issue #125) |
+| `OSC 9 ; 4 ; state ; pct BEL/ST` | ConEmu / Windows Terminal progress report | **Stable** | `ControlEvent::Progress` stores the latest state per pane in the relay (carried in the `PaneInfo` snapshot so late clients see it) and broadcasts `PaneProgressChanged`; rendered as a per-pane progress bar (Cairo + Swift). Tested in `event_sink_receives_progress` (issue #125) |
 | `OSC 9` (bare growl) | iTerm2 / Windows Terminal growl notification | **Not planned** | Only the `9 ; 4` progress sub-command above is handled |
 
 ---
@@ -397,10 +397,10 @@ encoding; the shared encoders live in `crates/kmux-client/src/input.rs`.
 
 | Feature | Status | Notes |
 |---------|--------|-------|
-| Window title (`OSC 0/1/2`) | **Stable** | `BackendEventSink::on_title()` called synchronously inside `advance_bytes`; forwarded via `ServerMessage` (event-bus channel, non-blocking) |
-| Icon title (same sequence, `OSC 1`) | **Stable** | Merged into `on_title()` |
-| Progress report (`OSC 9 ; 4`) | **Stable** | `BackendEventSink::on_progress()` stores per-pane state in the relay (snapshot-tracked across clients) and broadcasts `PaneProgressChanged`; rendered as a per-pane progress bar (issue #125) |
-| BEL (`0x07`) | **Stable** | `BackendEventSink::on_bell()` called; clients can produce audible or visual bell |
+| Window title (`OSC 0/1/2`) | **Stable** | `ControlEvent::Title` called synchronously inside `advance_bytes`; forwarded via `ServerMessage` (event-bus channel, non-blocking) |
+| Icon title (same sequence, `OSC 1`) | **Stable** | Merged into `ControlEvent::Title` |
+| Progress report (`OSC 9 ; 4`) | **Stable** | `ControlEvent::Progress` stores per-pane state in the relay (snapshot-tracked across clients) and broadcasts `PaneProgressChanged`; rendered as a per-pane progress bar (issue #125) |
+| BEL (`0x07`) | **Stable** | `ControlEvent::Bell` called; clients can produce audible or visual bell |
 
 ---
 

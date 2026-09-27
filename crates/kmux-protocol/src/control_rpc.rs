@@ -173,8 +173,15 @@ pub struct StatusResponse {
     /// as a refused handshake because an unknown profile cannot be verified.
     #[serde(default)]
     pub build_profile: Option<BuildProfile>,
+    /// The endpoints announced to a caller of this control socket: the local
+    /// view, which leaves out `ssh-only` listeners.
     #[serde(default)]
     pub endpoints: Vec<EndpointEntry>,
+    /// The endpoints announced to an SSH caller (`any` and `ssh-only`
+    /// listeners, no `local` one), which `kmuxd probe-or-start` hands back
+    /// over SSH. `None` from a daemon that predates the field.
+    #[serde(default)]
+    pub ssh_endpoints: Option<Vec<EndpointEntry>>,
 }
 
 /// An advertised transport endpoint in a `StatusResponse`.
@@ -464,6 +471,10 @@ mod tests {
                 kind: "quic".into(),
                 address: "1.2.3.4:8443".into(),
             }],
+            ssh_endpoints: Some(vec![EndpointEntry {
+                kind: "tcp+tls".into(),
+                address: "1.2.3.4:8444".into(),
+            }]),
         };
 
         let json = serde_json::to_string(&resp).expect("serialize");
@@ -486,6 +497,8 @@ mod tests {
         assert_eq!(back.endpoints.len(), 1);
         assert_eq!(back.endpoints[0].kind, "quic");
         assert_eq!(back.endpoints[0].address, "1.2.3.4:8443");
+        let ssh = back.ssh_endpoints.expect("the SSH view");
+        assert_eq!(ssh[0].address, "1.2.3.4:8444");
     }
 
     #[test]
@@ -504,6 +517,10 @@ mod tests {
         assert_eq!(resp.kmuxd_version, "");
         assert!(resp.build_profile.is_none());
         assert!(resp.endpoints.is_empty());
+        assert!(
+            resp.ssh_endpoints.is_none(),
+            "None marks a daemon without the SSH view"
+        );
     }
 
     #[test]

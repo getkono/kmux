@@ -395,18 +395,7 @@ async fn handle_control_connection(
 /// The `status` command's reply.
 async fn status_response(ctx: &RequestCtx) -> StatusResponse {
     let session_count = ctx.app.list_sessions().await.len();
-    let adverts = build_endpoint_list(
-        &ctx.listeners,
-        BootstrapPath::Uds,
-        ctx.public_host.as_deref(),
-    );
-    let endpoints = adverts
-        .into_iter()
-        .map(|a| EndpointEntry {
-            kind: format!("{}", a.kind),
-            address: a.address,
-        })
-        .collect();
+    let public_host = ctx.public_host.as_deref();
     StatusResponse {
         status: "running".to_string(),
         port: ctx.quic_port,
@@ -420,8 +409,29 @@ async fn status_response(ctx: &RequestCtx) -> StatusResponse {
         kmuxd_version: env!("CARGO_PKG_VERSION").to_string(),
         kmuxd_build: kmux_protocol::buildinfo::fingerprint(),
         build_profile: Some(kmux_protocol::compat::BuildProfile::CURRENT),
-        endpoints,
+        endpoints: endpoint_entries(&ctx.listeners, BootstrapPath::Uds, public_host),
+        ssh_endpoints: Some(endpoint_entries(
+            &ctx.listeners,
+            BootstrapPath::Ssh,
+            public_host,
+        )),
     }
+}
+
+/// The endpoints `listeners` announce to a caller that reached the daemon by
+/// `path`, as the status reply carries them.
+fn endpoint_entries(
+    listeners: &[ListenConfig],
+    path: BootstrapPath,
+    public_host: Option<&str>,
+) -> Vec<EndpointEntry> {
+    build_endpoint_list(listeners, path, public_host)
+        .into_iter()
+        .map(|a| EndpointEntry {
+            kind: format!("{}", a.kind),
+            address: a.address,
+        })
+        .collect()
 }
 
 /// The `restart` command: begin a handoff and wake the daemon to run it, or
@@ -616,8 +626,11 @@ mod tests {
         socket_is_live,
     };
     use crate::app::ServerApp;
+    use crate::config::{Audience, ListenConfig, ListenKind};
     use crate::fixtures::{FIXTURE_TOKEN, fixture_app};
-    use kmux_protocol::control_rpc::{ControlError, ControlErrorKind, StatusResponse};
+    use kmux_protocol::control_rpc::{
+        ControlError, ControlErrorKind, EndpointEntry, StatusResponse,
+    };
 
     /// What a control connection needs to answer, for a daemon with no
     /// sessions.
@@ -631,8 +644,23 @@ mod tests {
             shutdown: Arc::new(Notify::new()),
             restart: Arc::new(Notify::new()),
             handoff: Arc::default(),
-            listeners: vec![],
+            listeners: vec![
+                listener(ListenKind::Quic, 7000, Audience::Any),
+                listener(ListenKind::TcpTls, 7001, Audience::SshOnly),
+            ],
             public_host: None,
+        }
+    }
+
+    fn listener(kind: ListenKind, port: u16, audience: Audience) -> ListenConfig {
+        ListenConfig {
+            kind,
+            bind: "127.0.0.1".into(),
+            port,
+            enabled: true,
+            path: "auto".into(),
+            audience,
+            priority: 0,
         }
     }
 
@@ -744,6 +772,16 @@ mod tests {
         assert_eq!(
             status.protocol_range,
             Some(kmux_protocol::messages::PROTOCOL_RANGE)
+        );
+        // The local view leaves the `ssh-only` listener out; the SSH view,
+        // which `probe-or-start` hands back, carries it (issue #227).
+        let addresses = |entries: &[EndpointEntry]| -> Vec<String> {
+            entries.iter().map(|e| e.address.clone()).collect()
+        };
+        assert_eq!(addresses(&status.endpoints), ["127.0.0.1:7000"]);
+        assert_eq!(
+            addresses(&status.ssh_endpoints.expect("the SSH view")),
+            ["127.0.0.1:7000", "127.0.0.1:7001"]
         );
     }
 

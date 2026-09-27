@@ -412,9 +412,9 @@ async fn probe_or_start() -> anyhow::Result<()> {
             tcp_port: u16,
             token: String,
             pid: u32,
-            /// Daemon-provided endpoint list (Phase 7+); absent in older builds.
+            /// The daemon's SSH view of its endpoints; absent in older builds.
             #[serde(default)]
-            endpoints: Vec<serde_json::Value>,
+            ssh_endpoints: Option<Vec<serde_json::Value>>,
         }
         let resp: Resp = serde_json::from_str(line.trim()).ok()?;
 
@@ -425,18 +425,7 @@ async fn probe_or_start() -> anyhow::Result<()> {
             return None;
         }
 
-        // Build the SSH-filtered endpoint list.
-        // When the daemon includes `endpoints`, filter them for SSH callers (audience = Any | SshOnly).
-        // Older daemons omit `endpoints`; fall back to deriving from raw ports.
-        let endpoints: serde_json::Value = if resp.endpoints.is_empty() {
-            // Fallback: load config and build the list via announce.rs with SSH path.
-            let ssh_endpoints = build_ssh_endpoints(resp.port, resp.tcp_port);
-            serde_json::json!(ssh_endpoints)
-        } else {
-            // Daemon-provided list is already Uds-path-filtered; re-filter for SSH callers.
-            // For now, forward the full list — the audience is not serialized in the response.
-            serde_json::json!(resp.endpoints)
-        };
+        let endpoints = ssh_view(resp.ssh_endpoints, resp.port, resp.tcp_port);
 
         // Build the extended probe-or-start JSON (backward-compatible: adds new fields).
         let json = serde_json::json!({
@@ -478,11 +467,26 @@ async fn probe_or_start() -> anyhow::Result<()> {
     anyhow::bail!("timed out waiting for local kmuxd to start")
 }
 
+/// The endpoints `probe-or-start` hands its SSH caller: the daemon's own SSH
+/// view (`ssh-only` listeners included, `local` ones left out), or — from a
+/// daemon that predates it — one built from the daemon's ports.
+///
+/// The daemon's `endpoints` list is never the answer: it is the local view,
+/// which drops every `ssh-only` listener (issue #227).
+fn ssh_view(
+    ssh_endpoints: Option<Vec<serde_json::Value>>,
+    quic_port: u16,
+    tcp_port: u16,
+) -> serde_json::Value {
+    let endpoints = ssh_endpoints.unwrap_or_else(|| build_ssh_endpoints(quic_port, tcp_port));
+    serde_json::Value::Array(endpoints)
+}
+
 /// Build a fallback endpoint list for SSH callers from raw port numbers.
 ///
-/// Used when the running daemon does not yet support the `endpoints` field in
-/// its control-socket status response. Applies `BootstrapPath::Ssh` audience
-/// filtering so only `Any` and `SshOnly` listeners are included.
+/// Used when the running daemon's status reply carries no `ssh_endpoints`.
+/// Applies `BootstrapPath::Ssh` audience filtering so only `Any` and `SshOnly`
+/// listeners are included.
 fn build_ssh_endpoints(quic_port: u16, tcp_port: u16) -> Vec<serde_json::Value> {
     use announce::{BootstrapPath, build_endpoint_list};
     use config::{Audience, ListenConfig, ListenKind};
@@ -631,7 +635,28 @@ fn generate_instance_id() -> String {
 mod tests {
     use kmux_protocol::control_rpc::HANDOFF_STOOD_DOWN_EXIT_CODE;
 
-    use super::stood_down_exit_code;
+    use super::{ssh_view, stood_down_exit_code};
+
+    /// `probe-or-start` hands back the daemon's SSH view as it is, and builds
+    /// one from the ports — the TCP+TLS listener as `ssh-only` — only for a
+    /// daemon that sends none (issue #227).
+    #[test]
+    fn probe_or_start_prefers_the_daemons_ssh_view() {
+        let daemons = vec![serde_json::json!({"kind": "tcp+tls", "address": "10.0.0.2:7000"})];
+        assert_eq!(
+            ssh_view(Some(daemons.clone()), 5000, 6000),
+            serde_json::Value::Array(daemons)
+        );
+
+        let built = ssh_view(None, 5000, 6000);
+        let addresses: Vec<&str> = built
+            .as_array()
+            .expect("an array")
+            .iter()
+            .filter_map(|e| e["address"].as_str())
+            .collect();
+        assert_eq!(addresses, ["127.0.0.1:5000", "127.0.0.1:6000"]);
+    }
 
     /// Only a successor that stood down exits with its own code; a failure
     /// keeps the usual one.

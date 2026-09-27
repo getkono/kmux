@@ -41,6 +41,11 @@ exclude_globs = [
 exclude_re = [
     'crates/kmuxd/src/main\.rs:.*replace main -> ',
     'crates/kmuxd/src/startup\.rs:.*replace async_main -> ',
+    # `probe_or_start` (and the `query` it nests) reads this profile's real
+    # control socket and starts a daemon when none answers; only a real SSH
+    # bootstrap reaches it. What it decides, `ssh_view`, is unit-tested
+    # (issue #227).
+    'crates/kmuxd/src/main\.rs:.*replace probe_or_start(::query)? -> ',
     # `handoff::sender::run` (and `hand_off`, which it runs with pane creation
     # closed) binds the real handoff socket and spawns a successor daemon;
     # only `handoff_e2e.rs` can call it (issue #207).
