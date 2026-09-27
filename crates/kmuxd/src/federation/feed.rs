@@ -480,6 +480,60 @@ mod tests {
         assert_eq!(ids, vec!["fedlocal/0".to_string()]);
     }
 
+    /// Close `fedlocal` from the hub while the peer answers with its ack and
+    /// its own `SessionClosed` event first, then the ack, when
+    /// `event_first`. Returns every `SessionClosed` word broadcast by then.
+    async fn close_federated(event_first: bool) -> Vec<String> {
+        let app = Arc::new(fixture_app());
+        let mut broadcasts = app.subscribe_vt_events();
+        let (mut upstream, peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let closing = tokio::spawn({
+            let app = Arc::clone(&app);
+            async move { app.close_federated_session("fedlocal").await }
+        });
+        let request_id = next_upstream(&mut upstream, |m| match m {
+            ClientMessage::SessionClose { request_id, .. } => Some(*request_id),
+            _ => None,
+        })
+        .await;
+        let event = ServerMessage::Event {
+            event: SessionEventMsg::SessionClosed {
+                word_id: "fedremote".to_string(),
+            },
+        };
+        let ack = ServerMessage::SessionClosed {
+            request_id,
+            word_id: "fedremote".to_string(),
+            exit_code: None,
+        };
+        let frames = if event_first {
+            [event, ack]
+        } else {
+            [ack, event]
+        };
+        for frame in frames {
+            peer.send(frame).unwrap();
+        }
+        closing.await.unwrap().expect("closed");
+        // Let the feed take in the frame after the ack too.
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(!app.is_federated_session("fedlocal"));
+        let mut closed = Vec::new();
+        while let Ok(msg) = broadcasts.try_recv() {
+            closed.extend(closed_word(&msg));
+        }
+        closed
+    }
+
+    /// Closing a federated session from the hub tells every client once,
+    /// whichever of the peer's ack and its own `SessionClosed` event lands
+    /// first — the second finds the session already gone (issue #208).
+    #[tokio::test(start_paused = true)]
+    async fn closing_a_federated_session_tells_every_client_once() {
+        assert_eq!(close_federated(false).await, vec!["fedlocal".to_string()]);
+        assert_eq!(close_federated(true).await, vec!["fedlocal".to_string()]);
+    }
+
     /// A session list is published while no peer's sessions can change, so a
     /// list taken before a close cannot reach clients after its
     /// `SessionClosed` and bring the session back (issue #208).

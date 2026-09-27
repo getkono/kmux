@@ -586,7 +586,8 @@ impl PeerManager {
     /// the peer just sent (issue #208) — on a re-opened link, or when the
     /// peer's sessions changed. A session the peer still lists keeps its local
     /// word (its entry refreshed); a new one draws a word; one the peer no
-    /// longer lists is closed here, for every client.
+    /// longer lists is closed here, for every client. Nothing, once the user
+    /// has closed the peer.
     fn reconcile_sessions(
         &self,
         app: &ServerApp,
@@ -595,6 +596,20 @@ impl PeerManager {
         listed: Vec<SessionEntry>,
     ) {
         let _membership = self.membership();
+        if self.is_open(peer_id, conn) {
+            self.reconcile_sessions_gated(app, conn, peer_id, listed);
+        }
+    }
+
+    /// [`Self::reconcile_sessions`] for a caller already holding the
+    /// membership gate and knowing the peer is open.
+    fn reconcile_sessions_gated(
+        &self,
+        app: &ServerApp,
+        conn: &Arc<Mutex<PeerConnection>>,
+        peer_id: &str,
+        listed: Vec<SessionEntry>,
+    ) {
         let gone: Vec<String> = {
             let guard = lock(conn);
             guard
@@ -804,10 +819,6 @@ impl PeerManager {
         }
     }
 
-    /// Proxied sessions across all peers (local IDs, peer-decorated names).
-    ///
-    /// The sessions of a peer whose link is down are listed too, flagged
-    /// `peer_unreachable` (issue #208).
     /// Hold the membership gate: no peer's sessions are added or removed
     /// until the guard drops.
     pub(crate) fn membership(&self) -> std::sync::MutexGuard<'_, ()> {
@@ -816,6 +827,22 @@ impl PeerManager {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Whether `conn` is still `peer_id`'s open connection: `close_peer` has
+    /// not removed it. Checked under the membership gate, which `close_peer`
+    /// holds, by anything that would otherwise register words or park a
+    /// tunnel on a closed peer.
+    fn is_open(&self, peer_id: &str, conn: &Arc<Mutex<PeerConnection>>) -> bool {
+        self.peers
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(peer_id)
+            .is_some_and(|open| Arc::ptr_eq(open, conn))
+    }
+
+    /// Proxied sessions across all peers (local IDs, peer-decorated names).
+    ///
+    /// The sessions of a peer whose link is down are listed too, flagged
+    /// `peer_unreachable` (issue #208).
     pub fn list_sessions(&self) -> Vec<SessionEntry> {
         let peers = self.peers.lock().unwrap();
         let mut out = Vec::new();
@@ -946,14 +973,23 @@ impl PeerManager {
     }
 
     /// Close the federated session `local_word` on its owning peer, then drop it
-    /// from this hub: its word leaves the index and returns to the pool, and its
-    /// proxied panes and listing go away. The peer's own `SessionClosed` event
-    /// still reaches this session's viewers through the feed loop.
+    /// from this hub — its word leaves the index and returns to the pool, its
+    /// proxied panes and listing go away — and tell every client it closed.
+    ///
+    /// The drop and the broadcast happen together under the membership gate,
+    /// so no session list can carry the session past its `SessionClosed`
+    /// (issue #208). They happen only while the word still names the session
+    /// that was closed: the peer's own `SessionClosed` event may have got there
+    /// first, and the word may since have been drawn again.
     pub async fn close_remote_session(
         &self,
         app: &ServerApp,
         local_word: &str,
     ) -> Result<(), String> {
+        let conn = self
+            .conn_for_word(local_word)
+            .ok_or_else(|| format!("session {local_word} is not federated"))?;
+        let remote_word = lock(&conn).local_to_remote.get(local_word).cloned();
         self.request_ack(local_word, "session close", |request_id, word_id| {
             ClientMessage::SessionClose {
                 request_id,
@@ -961,7 +997,15 @@ impl PeerManager {
             }
         })
         .await?;
-        self.unregister_session(app, local_word);
+        let _membership = self.membership();
+        if remote_word.is_some()
+            && lock(&conn).local_to_remote.get(local_word) == remote_word.as_ref()
+        {
+            self.unregister_session(app, local_word);
+            app.broadcast_session_event(SessionEventMsg::SessionClosed {
+                word_id: local_word.to_string(),
+            });
+        }
         Ok(())
     }
 

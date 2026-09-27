@@ -257,17 +257,25 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
     re-seeds the mirror and resyncs every streaming viewer (a paused one catches up
     when it resumes), and every client is sent the list.
   - **Ordered lists.** Every add or remove of a peer's session (a reconcile, the
-    peer's `SessionClosed`, `close_peer`, `create_remote_session`'s registration)
+    peer's `SessionClosed`, `close_remote_session`, `close_peer`,
+    `create_remote_session`'s registration)
     holds `PeerManager`'s membership gate together with the broadcast of that change,
     and every session list takes its federated entries (and is queued or broadcast)
     under the same gate, after the local session map's read lock. So a list taken
     before a federated session closed cannot reach a client after its `SessionClosed`
     and bring it back, and a re-list racing a create cannot register one session
-    under two words.
+    under two words. A peer closed while its link was being re-opened stays
+    closed: `relink` and a reconcile check, under the gate, that the connection is
+    still the peer's open one, so no word is drawn and no tunnel parked for it. A
+    dropped link's receiver is dropped at once, so frames do not queue during the
+    reopen (its socket ends on the next frame, or by TCP keepalive).
   - **When a session closes.** Only when the peer reports it closed (its
     `SessionClosed` event, or its session list no longer naming it) — then for every
-    client, not just the session's viewers — or when the user closes the peer
-    (`close_peer` sends each client a `SessionClosed` for every one of its sessions).
+    client, not just the session's viewers — or when the user closes it or its peer
+    (`close_remote_session` for one session, once the peer acks; `close_peer` sends each
+    client a `SessionClosed` for every one of its sessions). Whichever of the peer's
+    ack and its own `SessionClosed` event lands first closes the session; the other
+    finds it gone, so each client is told once.
   - **A current listing.** The hub keeps its cached entries in line with the peer: a
     `LayoutUpdate` patches the cached tab, and a session or tab created, closed or
     renamed on the peer makes the hub ask for the peer's list again; a

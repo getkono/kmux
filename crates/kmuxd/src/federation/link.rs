@@ -252,13 +252,20 @@ async fn run_link(
     loop {
         let end = feed::feed(&app, &conn, &peer_id, &mut server_rx).await;
         warn!(%peer_id, ?end, "federation link down; the peer is unreachable");
+        // Nothing reads the old link any more: drop its receiver, so frames do
+        // not queue up during the reopen and its reader ends on the next one
+        // (a black-holed socket is ended by its TCP keepalive).
+        drop(server_rx);
         link_down(&conn);
         broadcast_sessions(&app).await;
         let upstream = reopen(&peer_id, &conn).await;
         let Some(app_now) = app.upgrade() else {
             return;
         };
-        server_rx = relink(&app_now, &conn, &peer_id, upstream);
+        let Some(relinked) = relink(&app_now, &conn, &peer_id, upstream) else {
+            return;
+        };
+        server_rx = relinked;
         info!(%peer_id, "federation link restored");
         broadcast_sessions(&app).await;
     }
@@ -304,19 +311,28 @@ async fn reopen(peer_id: &str, conn: &Mutex<PeerConnection>) -> Upstream {
 
 /// Put `upstream` in the dead link's place: reconcile the peer's sessions,
 /// send on the new link, park its tunnel, and re-attach every proxied pane
-/// (for a snapshot: the peer may be a new daemon run). Returns what to feed.
+/// (for a snapshot: the peer may be a new daemon run). Returns what to feed,
+/// or `None` when the user closed the peer during the reopen: the new link
+/// is then dropped (its tunnel killed) and nothing is registered for it.
+///
+/// It runs under the membership gate, which `close_peer` also holds, so the
+/// peer cannot be closed between the check and the tunnel being parked.
 pub(super) fn relink(
     app: &ServerApp,
     conn: &Arc<Mutex<PeerConnection>>,
     peer_id: &str,
     upstream: Upstream,
-) -> mpsc::UnboundedReceiver<ServerMessage> {
+) -> Option<mpsc::UnboundedReceiver<ServerMessage>> {
     let Upstream {
         client_tx,
         server_rx,
         sessions,
         mut tunnel,
     } = upstream;
+    let _membership = app.peer_manager.membership();
+    if !app.peer_manager.is_open(peer_id, conn) {
+        return None;
+    }
     {
         let mut guard = conn
             .lock()
@@ -329,11 +345,11 @@ pub(super) fn relink(
         guard.ssh_tunnel = tunnel.disarm();
     }
     app.peer_manager
-        .reconcile_sessions(app, conn, peer_id, sessions);
+        .reconcile_sessions_gated(app, conn, peer_id, sessions);
     conn.lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner)
         .reattach_panes();
-    server_rx
+    Some(server_rx)
 }
 
 /// Send every client the session list again: a peer went unreachable or
@@ -552,6 +568,32 @@ mod tests {
         assert_eq!(seqs, vec![0, 1, 2, 3, 4]);
         let listed = app.list_federated_sessions();
         assert!(!listed[0].peer_unreachable);
+    }
+
+    /// A peer the user closed while its link was being re-opened is not
+    /// relinked, and a session list arriving for it registers nothing: no
+    /// word is drawn, and no tunnel is parked, for a peer that is gone.
+    #[tokio::test(start_paused = true)]
+    async fn a_peer_closed_during_its_reopen_is_left_closed() {
+        let app = Arc::new(fixture_app());
+        let (_upstream, _peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let conn = Arc::clone(&app.peer_manager.peers.lock().unwrap()["peer:1"]);
+        app.close_peer("peer:1");
+
+        let (connector, _opened) = channel_connector("newremote");
+        let upstream = connector().await.expect("opens");
+        assert!(relink(&app, &conn, "peer:1", upstream).is_none());
+        app.peer_manager.reconcile_sessions(
+            &app,
+            &conn,
+            "peer:1",
+            vec![crate::federation::sample_remote_entry("other")],
+        );
+        let guard = crate::federation::lock(&conn);
+        assert!(!guard.remote_to_local.contains_key("other"));
+        assert!(!guard.remote_to_local.contains_key("newremote"));
+        drop(guard);
+        assert!(app.list_federated_sessions().is_empty());
     }
 
     /// A closed peer's link is not re-opened.
