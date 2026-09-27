@@ -14,6 +14,7 @@ use kmux_sys::transport::{HANDSHAKE_TIMEOUT, IncomingSession, Listener, SessionT
 
 use crate::app::ServerApp;
 use crate::auth::{generate_token, persist_token};
+use crate::persist::checkpoint::{Checkpointer, PeriodicCheckpointer};
 use crate::term_state;
 use crate::tls;
 
@@ -166,15 +167,21 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
         Err(e) => warn!("could not determine graveyard path: {e}"),
     }
 
+    // The one writer of the checkpoint file: the periodic loop, the shutdown
+    // path and a graceful handoff all go through it (issue #207).
+    // The final write of a shutdown or handoff consumes it (`None` afterwards).
+    let mut checkpointer = kmux_sys::dirs::session_state_path()
+        .inspect_err(|e| warn!("could not determine checkpoint path: {e}"))
+        .ok()
+        .map(Checkpointer::new);
+
     // Periodic checkpoint task, restarted if it panics (issue #206): without
     // it sessions silently stop being persisted for the daemon's lifetime.
     {
         let persist_app = Arc::clone(&app);
-        let state_path = kmux_sys::dirs::session_state_path()
-            .inspect_err(|e| warn!("could not determine checkpoint path: {e}"))
-            .ok();
+        let periodic = checkpointer.as_ref().map(Checkpointer::periodic);
         tokio::spawn(crate::supervisor::supervise("checkpoint", move || {
-            checkpoint_loop(Arc::clone(&persist_app), state_path.clone())
+            checkpoint_loop(Arc::clone(&persist_app), periodic.clone())
         }));
     }
 
@@ -254,6 +261,9 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     let handoff_in_progress = Arc::new(std::sync::atomic::AtomicBool::new(false));
 
     // Spawn idle-shutdown watcher when configured.
+    if let Some(warning) = cfg.idle_shutdown_warning() {
+        warn!("{warning}");
+    }
     if cfg.idle_shutdown_secs > 0 {
         let idle_secs = cfg.idle_shutdown_secs;
         let mut count_rx = app.conn_count_rx();
@@ -351,7 +361,7 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
             _ = shutdown.notified() => { info!("Shutdown requested via control socket"); break; }
             _ = restart.notified() => {
                 info!("Graceful restart requested; beginning live PTY handoff");
-                match crate::handoff::sender::run(&app).await {
+                match crate::handoff::sender::run(&app, &mut checkpointer).await {
                     Ok(()) => { handed_off = true; break; }
                     Err(e) => {
                         warn!("handoff failed, resuming normal operation: {e}");
@@ -380,18 +390,11 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     // already wrote a fresh (post-quiesce) checkpoint and owns the live PTYs.
     if handed_off {
         info!("handoff committed; successor owns the live sessions");
-    } else {
+    } else if checkpointer.is_some() {
         let shutdown_state = app.checkpoint_state().await;
-        match kmux_sys::dirs::session_state_path() {
-            Ok(path) => {
-                if let Err(e) = crate::persist::checkpoint::write_checkpoint(&shutdown_state, &path)
-                {
-                    warn!("shutdown checkpoint failed: {e}");
-                } else {
-                    info!("session state checkpointed on shutdown");
-                }
-            }
-            Err(e) => warn!("could not determine checkpoint path on shutdown: {e}"),
+        match Checkpointer::write_final_from(&mut checkpointer, shutdown_state).await {
+            Ok(()) => info!("session state checkpointed on shutdown"),
+            Err(e) => warn!("shutdown checkpoint failed: {e}"),
         }
     }
 
@@ -401,18 +404,20 @@ pub async fn async_main(daemon: bool, handoff: bool, cfg: ServerConfig) -> anyho
     Ok(())
 }
 
-/// Checkpoint every session to `state_path` every 30 s, starting at once, and
-/// TTL-sweep the closed-session graveyard, forever. With no path only the
-/// sweep runs. Holds no state between iterations, so the supervisor can
+/// Checkpoint every session through `checkpointer` every 30 s, starting at
+/// once, and TTL-sweep the closed-session graveyard, forever. With no
+/// checkpointer only the sweep runs. The state is gathered on the runtime and
+/// written on the blocking pool, and an unchanged state is not rewritten
+/// (issue #207). Holds no state between iterations, so the supervisor can
 /// restart it after a panic.
-async fn checkpoint_loop(app: Arc<ServerApp>, state_path: Option<std::path::PathBuf>) {
+async fn checkpoint_loop(app: Arc<ServerApp>, checkpointer: Option<PeriodicCheckpointer>) {
     let mut interval = tokio::time::interval(Duration::from_secs(30));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         interval.tick().await;
-        if let Some(path) = &state_path {
+        if let Some(checkpointer) = &checkpointer {
             let state = app.checkpoint_state().await;
-            if let Err(e) = crate::persist::checkpoint::write_checkpoint(&state, path) {
+            if let Err(e) = checkpointer.write_in_background(state).await {
                 warn!("periodic checkpoint failed: {e}");
             }
         }
@@ -467,11 +472,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("sessions.bin");
         let app = Arc::new(crate::fixtures::fixture_app());
-        let task = tokio::spawn(checkpoint_loop(app, Some(path.clone())));
+        let checkpointer = Checkpointer::new(path.clone());
+        let task = tokio::spawn(checkpoint_loop(app, Some(checkpointer.periodic())));
 
         tokio::time::timeout(Duration::from_secs(10), async {
             while !path.exists() {
-                tokio::task::yield_now().await;
+                tokio::time::sleep(Duration::from_millis(10)).await;
             }
         })
         .await

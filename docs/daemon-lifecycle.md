@@ -56,11 +56,12 @@ After this call the process is a daemon with fresh file descriptors.
 
 ## 3. Logging Initialization
 
-Tracing is initialized after daemonization (so the child's fresh fds are used).
+Tracing is initialized after daemonization (so the child's fresh fds are used),
+and after `kmuxd.toml` is read, since the config says how the log rotates.
 
 ```
 Attempt to open $XDG_STATE_HOME/kmux[-debug]/daemon.log (append mode)
-  Success → log to file (via ResilientWriter)
+  Success → log to file (RotatingFile under ResilientWriter)
   Failure → log to stderr
 Log level: RUST_LOG env var, default "kmuxd=info"
 Each run tagged with a random 4-byte instance_id for log correlation
@@ -79,6 +80,47 @@ captures the child's pre-daemonize stdout/stderr in `kmuxd-boot.log`, and
 `kmux daemon restart` prints that log's tail when it times out instead of a bare
 "timed out" with no cause.
 
+### 3.1 Log rotation (issue #207)
+
+Under the `ResilientWriter` is a `RotatingFile` (`log_writer.rs`), so a daemon
+that runs for months does not fill its disk with one log. Once the next event
+would take `daemon.log` past `log_max_size_mib`, the file is renamed to
+`daemon.log.1` (the older ones shift up to `daemon.log.<log_keep_files>`, the
+oldest is dropped) and a new `daemon.log` is started:
+
+```toml
+[daemon]
+log_max_size_mib = 10   # 0 = never roll over
+log_keep_files = 5      # rolled-over files kept beside daemon.log; 0 = none
+```
+
+- **Whole lines only.** `tracing` hands each event to the writer in one write,
+  and rotation only happens between two writes, so a line is never split across
+  files and none is lost at the boundary. The size already on disk counts, so a
+  restarted daemon picks up where its predecessor left off.
+- **A failed rotation loses nothing.** When the rename fails (a full or
+  read-only disk), the daemon keeps appending to the file it has and tries again
+  after another `log_max_size_mib`. `ResilientWriter` still swallows the write
+  errors of a full disk.
+- **Two writers.** During a graceful restart the predecessor and the successor
+  both append to `daemon.log`. Before each write the writer checks the file at
+  the path is still the one it holds (device + inode) and reopens it if not, so
+  whichever process rotates, the other follows at its next line; the same check
+  recovers from an operator deleting the file. The cap is **approximate** while
+  both run: each process counts only its own writes against
+  `log_max_size_mib`, so the file can grow by up to what the other appended
+  before the next rotation (at most about twice the cap for the few seconds a
+  handoff lasts), and both may rotate close together, turning a short file
+  into `daemon.log.1`.
+- **Readers.** `kmux daemon logs` (local, and `--server` through `FetchLogs`)
+  reads the current `daemon.log`. With `-f` the follower
+  (`kmux_sys::log_tail::read_appended`) notices when the file it is reading has
+  been moved aside, drains what the old file received before the move, and
+  continues from the start of the new one. When a spawn fails, the client's
+  error quotes the daemon log written since the spawn began; if the new
+  daemon's first lines rotated it, the part of `daemon.log.1` after the mark is
+  quoted before the new `daemon.log` (`kmux-connect` `daemon_log_since`).
+
 ---
 
 ## 4. Configuration Loading
@@ -91,7 +133,19 @@ captures the child's pre-daemonize stdout/stderr in `kmuxd-boot.log`, and
 4. Built-in defaults (if none found)
 
 On first run with no config file found, a default template is written to
-`$XDG_CONFIG_HOME/kmuxd/kmuxd.toml`.
+`$XDG_CONFIG_HOME/kmuxd/kmuxd.toml`. Every setting in it is commented out and
+shows its built-in default, so the file pins nothing and a later release's new
+default still applies (issue #207). Templates written before that serialized
+every default uncommented; they are not migrated (see §5.7 for the one that
+matters, `idle_shutdown_secs`).
+
+**Older daemons reject newer keys.** Every table is `deny_unknown_fields`, so a
+`kmuxd.toml` that sets a key an older `kmuxd` does not know fails to parse
+there, and that daemon does not start. The `[daemon] log_max_size_mib` and
+`log_keep_files` keys (issue #207) are the current case: downgrading `kmuxd`
+past them, or sharing one `kmuxd.toml` between hosts on different releases,
+needs those lines removed first. This is accepted rather than loosened, since
+ignoring unknown keys would also silently ignore a misspelt one.
 
 `ServerConfig::resolve()` validates the result: at least one enabled listener;
 a TLS `cert` requires a matching `key` (and vice versa). With neither set, the
@@ -113,9 +167,11 @@ enabled  = true
 audience = "any"            # any | local | lan | ssh-only
 
 [daemon]
-idle_shutdown_secs = 30      # 0 = disabled
+idle_shutdown_secs = 0       # seconds with no client before exiting; 0 (default) = never
 closed_session_keep = 20      # retained closed sessions for restore (issue #64)
 closed_session_ttl_days = 7   # drop closed sessions older than this; 0 = no age cap
+log_max_size_mib = 10         # roll daemon.log over at this size; 0 = never (issue #207)
+log_keep_files = 5            # rolled-over daemon.log.N files kept; 0 = none
 
 [advertise]
 public_host = "example.com" # override advertised hostname
@@ -165,12 +221,15 @@ A background Tokio task checkpoints session state every 30 seconds:
 tokio::spawn(supervise("checkpoint", checkpoint_loop)):
   loop:
     interval.tick() // every 30 s, MissedTickBehavior::Skip
-    state = app.checkpoint_state().await
-    write_checkpoint(&state, session_state_path)
+    state = app.checkpoint_state().await          // on the runtime
+    checkpointer.write_in_background(state)       // spawn_blocking; skipped if unchanged
     app.sweep_graveyard()
 ```
 
 Missed ticks are skipped so a slow checkpoint does not cause thundering writes.
+The write itself (serialize, `fsync`, rename, `fsync` the directory) runs on the
+blocking pool, never on a runtime thread, and a state identical to the last one
+written is not written again (issue #207). See §10.2.
 
 The loop runs under `supervisor::supervise` (issue #206). A bare
 `tokio::spawn` that panics just ends, and on a server that never restarts that
@@ -218,6 +277,11 @@ loop itself, so one client that connected and never finished its handshake
 blocked every later accept on that listener (issue #206).
 
 ### 5.7 Idle-Shutdown Watcher (Optional)
+
+Off by default (issue #207). A `kmuxd.toml` template written by an older
+daemon's first run pins `idle_shutdown_secs = 30`; it is not migrated, but
+whenever idle shutdown is on the daemon logs a warning at startup naming the
+timeout and how to turn it off (`ServerConfig::idle_shutdown_warning`).
 
 When `idle_shutdown_secs > 0`:
 
@@ -579,15 +643,47 @@ PersistedDaemonState { version, session_index_counter, sessions, used_words }
 `snapshot_session()` builds one `PersistedSession`; `checkpoint_state()` maps it
 over the live sessions, and the close path (§11b) reuses it for the graveyard.
 
-### 10.2 `write_checkpoint(state, path)`
+### 10.2 `Checkpointer` (`persist/checkpoint.rs`, issue #207)
+
+One `Checkpointer` per daemon is the only writer of the checkpoint file; the
+periodic loop, the shutdown path and a graceful handoff share it, and its lock
+serialises them (they used to race on the same `.bin.tmp`).
 
 ```
 bytes = postcard::to_allocvec(state)
-write bytes → path.with_extension("bin.tmp")
-rename "bin.tmp" → "bin"          // atomic; crash-safe
+write bytes → path.with_extension("bin.tmp"); fsync it
+rename "bin.tmp" → "bin"
+fsync the directory
 ```
 
-The atomic rename ensures a crash during the write never leaves a corrupt file.
+- **Durable.** The rename alone is atomic but not durable: after a power loss it
+  can survive while the data it points at does not, leaving an empty or torn
+  checkpoint. The two `fsync`s close that. Some filesystems refuse to `fsync`
+  a directory. Once the rename has happened the new state is in place, so a
+  refused directory `fsync` does not fail the write (which would rewrite the
+  file every tick): it is logged as a warning once per daemon and the write
+  counts as done.
+- **Skipped when unchanged.** `write` compares the serialized bytes with the last
+  write that *succeeded* (length plus a 64-bit hash) and returns
+  `Written::Unchanged` instead of rewriting an idle daemon's state every 30 s. A
+  failed write records nothing, so the next tick retries.
+- **Off the runtime.** `write_in_background` / `write_final_in_background` run
+  the write on `spawn_blocking`; only `checkpoint_state()` (which reads the
+  sessions under their locks) stays on the runtime.
+- **One final write, by ownership.** `async_main` owns the `Checkpointer`
+  (not `Clone`, held as an `Option`); the periodic loop gets a
+  `PeriodicCheckpointer` handle from `Checkpointer::periodic`, which can only
+  make skippable writes. `write_final_in_background` (shutdown, handoff)
+  takes `self`: it writes even an unchanged state, consumes the checkpointer,
+  so a second final write does not compile, and seals the file, so a periodic
+  `write`
+  landing after a handoff returns `Written::Sealed` instead of replacing the
+  state the successor restores from. A failed final write hands the
+  checkpointer back unsealed (`FinalWriteFailed`); `write_final_from` does
+  this through the `Option` slot, which the handoff sender and the shutdown
+  path share.
+
+No on-disk format changed, so `STATE_VERSION` is unchanged.
 
 ### 10.3 Schema Versioning
 
@@ -770,7 +866,7 @@ Triggered by SIGINT, SIGTERM, or `stop` via the control socket:
 
 ```
 1. Abort all listener accept loop JoinHandles
-2. app.checkpoint_state().await → write_checkpoint (shutdown checkpoint)
+2. app.checkpoint_state().await → Checkpointer::write_final_from (shutdown checkpoint; consumes the checkpointer)
 3. endpoint.close(0u32, b"shutdown") for each QUIC endpoint
 4. async_main returns Ok(())
 5. Process exits; SocketGuard drop removes the control socket and PID file,
@@ -921,7 +1017,7 @@ main()
   │
   └─ SHUTDOWN
       ├─ abort listener tasks
-      ├─ checkpoint_state() + write_checkpoint()
+      ├─ checkpoint_state() + Checkpointer::write_final_from()
       ├─ QUIC endpoint.close()
       └─ exit (SocketGuard removes control socket + PID file if still ours)
 ```
@@ -985,8 +1081,9 @@ if the query fails.
 
 The idle-shutdown watcher fires when no clients are *connected*, regardless of
 whether any sessions contain live activity (e.g. a long-running process).  A
-daemon with no attached clients but running background jobs will shut down
-and lose those jobs.
+daemon with idle shutdown enabled, no attached clients, and running background
+jobs will shut down and lose those jobs. Idle shutdown is off by default
+(issue #207), so this bites only an operator who opted in.
 
 **Fix:** Add an opt-in `idle_shutdown_mode` config key (`connections` vs
 `activity`).  In `activity` mode, also monitor `last_activity_ms` across all
@@ -1035,8 +1132,8 @@ one returned by `register_client`.
 `cleanup_and_start_daemon` sends SIGTERM, sleeps 300 ms, then unconditionally
 removes the PID file before spawning the new daemon.  If the old daemon is
 mid-checkpoint and takes longer than 300 ms to flush, SIGKILL races with the
-atomic rename in `write_checkpoint`, potentially leaving a `.bin.tmp` orphan
-and losing the checkpoint.
+atomic rename in `Checkpointer::write_final_in_background`, potentially leaving a `.bin.tmp`
+orphan and losing the shutdown checkpoint (the previous one survives intact).
 
 **Fix:** After SIGKILL, wait briefly for the process table entry to disappear
 (poll `kill(pid, 0)`) before removing the PID file and spawning the new daemon.

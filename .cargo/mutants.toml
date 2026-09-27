@@ -43,4 +43,8 @@ exclude_globs = ["crates/kmux-ghostty-sys/src/**"]
 # §Known exceptions.
 exclude_re = [
     'crates/kmux-app/src/subcommands/daemon_cmd\.rs:.*replace fetch_remote_logs -> ',
+    # `tail_local_log` only hands stdout to `tail_local_log_to`, which the
+    # unit tests drive with a buffer; its `Ok(())` mutant is observable only
+    # on the process's stdout (issue #207).
+    'crates/kmux-app/src/subcommands/logs\.rs:.*replace tail_local_log -> ',
 ]

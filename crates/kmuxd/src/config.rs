@@ -102,11 +102,12 @@ impl SessionIsolationMode {
 #[serde(deny_unknown_fields)]
 pub struct DaemonConfig {
     /// Exit when no clients have been connected for this many seconds.
-    /// `0` disables idle shutdown (daemon runs until explicitly stopped).
-    ///
-    /// Note: the debounce applies per-transport-disconnect. A 30 s window
-    /// is long enough for clients to reconnect across transport switches.
-    #[serde(default = "default_idle_shutdown_secs")]
+    /// `0` (the default) disables idle shutdown: the daemon runs until it is
+    /// explicitly stopped, so a laptop sleep or a network drop that
+    /// disconnects every client does not end it (issue #207). An idle
+    /// shutdown ends the daemon's shells with it; only the checkpointed
+    /// picture of each pane survives into the next daemon.
+    #[serde(default)]
     pub idle_shutdown_secs: u64,
     /// Pane isolation mode (issue #126). `in-process` (default) keeps the
     /// emulator in the daemon; `process` runs each pane's VT pipeline in an
@@ -121,21 +122,46 @@ pub struct DaemonConfig {
     /// older than this are pruned. `0` disables age-based pruning.
     #[serde(default = "default_closed_session_ttl_days")]
     pub closed_session_ttl_days: u32,
+    /// Roll `daemon.log` over once it reaches this many MiB (issue #207).
+    /// `0` never rolls it over.
+    #[serde(default = "default_log_max_size_mib")]
+    pub log_max_size_mib: u64,
+    /// How many rolled-over logs (`daemon.log.1` … `daemon.log.<n>`) to keep
+    /// beside the current one. `0` keeps none.
+    #[serde(default = "default_log_keep_files")]
+    pub log_keep_files: u32,
 }
 
 impl Default for DaemonConfig {
     fn default() -> Self {
         Self {
-            idle_shutdown_secs: default_idle_shutdown_secs(),
+            idle_shutdown_secs: 0,
             session_isolation: SessionIsolationMode::default(),
             closed_session_keep: default_closed_session_keep(),
             closed_session_ttl_days: default_closed_session_ttl_days(),
+            log_max_size_mib: default_log_max_size_mib(),
+            log_keep_files: default_log_keep_files(),
         }
     }
 }
 
-fn default_idle_shutdown_secs() -> u64 {
-    30
+impl DaemonConfig {
+    /// When the daemon log rolls over, in the writer's terms.
+    pub fn log_rotation(&self) -> crate::log_writer::Rotation {
+        crate::log_writer::Rotation {
+            max_bytes: self.log_max_size_mib.saturating_mul(1024 * 1024),
+            keep: self.log_keep_files,
+        }
+    }
+}
+
+/// Default `daemon.log` size cap, in MiB (issue #207).
+fn default_log_max_size_mib() -> u64 {
+    10
+}
+/// Default number of rolled-over daemon logs kept (issue #207).
+fn default_log_keep_files() -> u32 {
+    5
 }
 
 /// Default count cap for the closed-session graveyard (issue #64).
@@ -453,6 +479,23 @@ impl ServerConfig {
             closed_session_ttl_days: file.daemon.closed_session_ttl_days,
         })
     }
+
+    /// The warning to log at startup when idle shutdown is on, or `None`.
+    ///
+    /// Idle shutdown is off by default since issue #207, but a `kmuxd.toml`
+    /// template written by an older daemon's first run pins
+    /// `idle_shutdown_secs = 30`. Such a file is not migrated; the warning
+    /// makes the setting, and what it costs, visible instead.
+    pub fn idle_shutdown_warning(&self) -> Option<String> {
+        let secs = self.idle_shutdown_secs;
+        (secs > 0).then(|| {
+            format!(
+                "idle shutdown is on: kmuxd exits after {secs}s with no clients connected, \
+                 ending every shell it runs. Set [daemon] idle_shutdown_secs = 0 in kmuxd.toml \
+                 (the default) to keep the daemon running until it is stopped"
+            )
+        })
+    }
 }
 
 // ─── Loading ─────────────────────────────────────────────────────────────────
@@ -505,14 +548,34 @@ fn search_paths() -> Vec<PathBuf> {
 }
 
 /// Write the default config to a path (used on first run to create a template).
+///
+/// Every setting is written commented out, so the file documents the defaults
+/// without pinning them: a later release that changes a default (as issue
+/// #207 did for `idle_shutdown_secs`) still reaches a host whose template was
+/// written by an older daemon.
 pub fn write_default_config(path: &Path) -> anyhow::Result<()> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    let cfg = ConfigFile::default();
-    let toml_str = toml::to_string_pretty(&cfg)?;
-    std::fs::write(path, toml_str)?;
+    std::fs::write(path, default_config_template()?)?;
     Ok(())
+}
+
+/// The first-run `kmuxd.toml`: the built-in defaults, every line commented out.
+fn default_config_template() -> anyhow::Result<String> {
+    let defaults = toml::to_string_pretty(&ConfigFile::default())?;
+    let mut template = String::from(
+        "# kmuxd configuration. Every setting below is commented out and shows its\n\
+         # built-in default; uncomment a line to change it.\n\n",
+    );
+    for line in defaults.lines() {
+        if !line.is_empty() {
+            template.push_str("# ");
+        }
+        template.push_str(line);
+        template.push('\n');
+    }
+    Ok(template)
 }
 
 #[cfg(test)]
@@ -702,6 +765,43 @@ self_signed = true
         assert_eq!(cfg.version, 1);
     }
 
+    /// The first-run template pins nothing: every line is blank or a comment,
+    /// so it parses to the built-in defaults, and it still shows each default
+    /// once uncommented (issue #207).
+    #[test]
+    fn the_default_config_template_shows_the_defaults_commented_out() {
+        let template = default_config_template().unwrap();
+        assert!(
+            template
+                .lines()
+                .all(|line| line.is_empty() || line.starts_with('#')),
+            "{template}"
+        );
+        assert!(
+            template.contains("\n# idle_shutdown_secs = 0\n"),
+            "{template}"
+        );
+        assert!(template.contains("\n# [daemon]\n"), "{template}");
+        assert!(
+            !template.contains("# \n"),
+            "blank lines stay blank: {template}"
+        );
+
+        let parsed: ConfigFile = toml::from_str(&template).unwrap();
+        assert_eq!(parsed.daemon.idle_shutdown_secs, 0);
+
+        // Uncomment everything past the header paragraph.
+        let uncommented: String = template
+            .lines()
+            .skip_while(|line| !line.is_empty())
+            .map(|line| line.strip_prefix("# ").unwrap_or(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let shown: ConfigFile = toml::from_str(&uncommented).unwrap();
+        assert_eq!(shown.daemon.log_max_size_mib, 10);
+        assert_eq!(shown.listen.len(), 3);
+    }
+
     #[test]
     fn daemon_idle_shutdown_parses() {
         let toml = r#"
@@ -717,11 +817,55 @@ idle_shutdown_secs = 60
         assert_eq!(resolved.idle_shutdown_secs, 60);
     }
 
+    /// A long-running daemon does not exit when its last client goes away
+    /// unless told to (issue #207): off both built in and for an empty file.
     #[test]
-    fn daemon_idle_shutdown_default_is_30() {
-        // Only test the ConfigFile default — resolve() requires TLS when QUIC/TCP+TLS are enabled.
-        let cfg = ConfigFile::default();
-        assert_eq!(cfg.daemon.idle_shutdown_secs, 30);
+    fn daemon_idle_shutdown_is_off_by_default() {
+        assert_eq!(ConfigFile::default().daemon.idle_shutdown_secs, 0);
+        let parsed: ConfigFile = toml::from_str("").unwrap();
+        let resolved = ServerConfig::resolve(parsed).unwrap();
+        assert_eq!(resolved.idle_shutdown_secs, 0);
+        assert_eq!(resolved.idle_shutdown_warning(), None);
+    }
+
+    /// An enabled idle shutdown (e.g. the `30` an older first-run template
+    /// pinned) is warned about at startup, naming the timeout and the fix.
+    #[test]
+    fn an_enabled_idle_shutdown_is_warned_about() {
+        let parsed: ConfigFile = toml::from_str("[daemon]\nidle_shutdown_secs = 30\n").unwrap();
+        let resolved = ServerConfig::resolve(parsed).unwrap();
+        let warning = resolved.idle_shutdown_warning().expect("a warning");
+        assert!(warning.contains("after 30s"), "{warning}");
+        assert!(warning.contains("idle_shutdown_secs = 0"), "{warning}");
+
+        let one: ConfigFile = toml::from_str("[daemon]\nidle_shutdown_secs = 1\n").unwrap();
+        assert!(
+            ServerConfig::resolve(one)
+                .unwrap()
+                .idle_shutdown_warning()
+                .is_some()
+        );
+    }
+
+    /// The daemon log is capped by default, and both knobs are read from
+    /// `[daemon]`.
+    #[test]
+    fn log_rotation_defaults_to_ten_mib_times_five_and_parses() {
+        let default = ConfigFile::default().daemon.log_rotation();
+        assert_eq!(default.max_bytes, 10 * 1024 * 1024);
+        assert_eq!(default.keep, 5);
+
+        let cfg: ConfigFile = toml::from_str(
+            r#"
+[daemon]
+log_max_size_mib = 3
+log_keep_files = 2
+"#,
+        )
+        .unwrap();
+        let rotation = cfg.daemon.log_rotation();
+        assert_eq!(rotation.max_bytes, 3 * 1024 * 1024);
+        assert_eq!(rotation.keep, 2);
     }
 
     #[test]
