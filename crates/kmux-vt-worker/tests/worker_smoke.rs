@@ -76,6 +76,9 @@ async fn worker_processes_pty_and_emits_diff() {
     }
     let mut child = cmd.spawn().expect("spawn worker");
     drop(worker_end); // parent no longer needs the worker end
+    // A failed assertion must not leave the worker (or the shell) running: a
+    // starved worker never sees its socket close.
+    let _cleanup = KillOnDrop(vec![child.id().cast_signed(), pid]);
 
     daemon_end.set_nonblocking(true).expect("nonblocking");
     let stream = UnixStream::from_std(daemon_end).expect("tokio stream");
@@ -223,5 +226,20 @@ async fn reap_within(
             return None;
         }
         tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// SIGKILLs these pids when dropped, however the test ends. Killing one
+/// already gone is harmless.
+struct KillOnDrop(Vec<i32>);
+
+impl Drop for KillOnDrop {
+    fn drop(&mut self) {
+        for &pid in &self.0 {
+            let _ = nix::sys::signal::kill(
+                nix::unistd::Pid::from_raw(pid),
+                nix::sys::signal::Signal::SIGKILL,
+            );
+        }
     }
 }

@@ -154,7 +154,9 @@ their screens replayed. Later restarts between version-3 builds keep them.
   after the checkpoint was in neither N's seed nor N's kernel buffer. A worker
   blocked writing input to a child that does not read stdin cannot read the
   `Hold` until that write is done, so it fails the hold (`HOLD`, 5 s) and the
-  handoff rolls back rather than splitting a read.
+  handoff rolls back rather than splitting a read. Input for a held worker
+  waits on the daemon's side until the hold is released, so a held worker is
+  never blocked writing input when the `Release` comes.
 - **Foreign-child exit.** N's inherited children are reparented to init and
   cannot be `waitpid`-ed, so exit is surfaced by the relay loop's PTY-EOF break
   (`session_diff_loop` → `SessionManager::notify_exited` → `PaneExited`), backed

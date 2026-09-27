@@ -208,7 +208,11 @@ data-plane capability or `kmux-worker-protocol` bump (new fields are
   it read, so the daemon-side mirror the checkpoint reads holds exactly what
   the worker consumed; `WorkerRequest::Release` lets it go on after a
   rollback. The ids keep a late answer to a hold that timed out from passing
-  for the next one. After the commit point `quiesce_relays` calls
+  for the next one. Client input for a held worker waits in the daemon's
+  input queue until the release: a held reader can leave the child blocked on
+  output, a child blocked there stops reading stdin, and input sent to the
+  worker then would block its request loop — with the `Release` queued behind
+  it, freezing the pane for good after a rollback. After the commit point `quiesce_relays` calls
   `PaneEngine::abort_relay_task`, which for a worker sends `Shutdown`
   (releasing the worker's dup) before aborting. The successor daemon respawns
   fresh workers post-restore in whatever isolation mode it is configured for;

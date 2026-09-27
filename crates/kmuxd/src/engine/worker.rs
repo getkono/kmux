@@ -108,6 +108,10 @@ pub struct WorkerEngine {
     parked: watch::Receiver<Parked>,
     /// The id of the next hold asked for.
     next_hold: AtomicU64,
+    /// Whether client input waits on the daemon's side (from a hold until
+    /// its release), so a worker whose reader is parked is never blocked
+    /// writing input when the `Release` comes.
+    input_held: watch::Sender<bool>,
 }
 
 /// Where a worker's PTY reader stands, as its event stream says.
@@ -217,24 +221,9 @@ impl WorkerEngine {
         let (req_tx, mut req_rx) = mpsc::unbounded_channel::<WorkerRequest>();
         let (input_tx, mut input_rx) = mpsc::channel::<WorkerRequest>(INPUT_QUEUE_CAPACITY);
 
+        let (input_held, input_hold) = watch::channel(false);
         let writer_task = tokio::spawn(async move {
-            loop {
-                // Control first: a resize or shutdown is not queued behind
-                // input still waiting on the daemon's side. (Once on the
-                // socket, the worker handles requests in order, so one it is
-                // stuck writing to a child that does not read still delays
-                // what follows it.)
-                let req = tokio::select! {
-                    biased;
-                    req = req_rx.recv() => req,
-                    req = input_rx.recv() => req,
-                };
-                let Some(req) = req else { break };
-                if let Err(e) = codec::send_msg(&mut sock_wr, &req).await {
-                    debug!("worker request writer stopping: {e}");
-                    break;
-                }
-            }
+            write_requests(&mut sock_wr, &mut req_rx, &mut input_rx, input_hold).await;
         });
 
         // Capture the worker pid before the `Child` moves into the supervisor.
@@ -257,6 +246,7 @@ impl WorkerEngine {
             writer_task,
             parked,
             next_hold: AtomicU64::new(1),
+            input_held,
         })
     }
 
@@ -339,6 +329,7 @@ impl WorkerEngine {
         let id = self
             .next_hold
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.input_held.send_replace(true);
         let _ = self.req_tx.send(WorkerRequest::Hold { id });
         let mut parked = self.parked.clone();
         async move {
@@ -351,6 +342,7 @@ impl WorkerEngine {
     /// Let a reader parked by [`Self::hold_reader`] go on.
     pub(super) fn release_reader(&self) {
         let _ = self.req_tx.send(WorkerRequest::Release);
+        self.input_held.send_replace(false);
     }
 
     pub(super) fn abort_relay_task(&mut self) -> JoinHandle<()> {
@@ -360,6 +352,43 @@ impl WorkerEngine {
         self.writer_task.abort();
         self.supervisor.abort();
         std::mem::replace(&mut self.supervisor, tokio::spawn(async {}))
+    }
+}
+
+/// Write the worker's requests onto its socket until either queue closes or
+/// a write fails: control requests first, so a resize or shutdown is not
+/// queued behind input still waiting on the daemon's side, and input only
+/// while `input_hold` is false.
+///
+/// Once on the socket the worker handles requests in order, so input it is
+/// stuck writing to a child that does not read delays what follows it. While
+/// a handoff holds the worker's reader that child may be blocked on output
+/// nobody reads, and input sent then would block the worker for good — with
+/// the hold's `Release` stuck behind it (issue #207). So input waits here
+/// until the hold is released.
+async fn write_requests(
+    sock_wr: &mut (impl tokio::io::AsyncWrite + Unpin),
+    req_rx: &mut mpsc::UnboundedReceiver<WorkerRequest>,
+    input_rx: &mut mpsc::Receiver<WorkerRequest>,
+    mut input_hold: watch::Receiver<bool>,
+) {
+    let mut hold_alive = true;
+    loop {
+        let input_open = !*input_hold.borrow_and_update();
+        let req = tokio::select! {
+            biased;
+            req = req_rx.recv() => req,
+            changed = input_hold.changed(), if hold_alive => {
+                hold_alive = changed.is_ok();
+                continue;
+            }
+            req = input_rx.recv(), if input_open => req,
+        };
+        let Some(req) = req else { break };
+        if let Err(e) = codec::send_msg(sock_wr, &req).await {
+            debug!("worker request writer stopping: {e}");
+            break;
+        }
     }
 }
 
@@ -884,6 +913,7 @@ mod tests {
             writer_task: tokio::spawn(async {}),
             parked: watch::channel(Parked::Reading).1,
             next_hold: AtomicU64::new(1),
+            input_held: watch::channel(false).0,
         };
         engine
             .enqueue_input(PaneInput::Bytes(b"b".to_vec()))
@@ -920,6 +950,7 @@ mod tests {
             writer_task: tokio::spawn(async {}),
             parked,
             next_hold: AtomicU64::new(1),
+            input_held: watch::channel(false).0,
         };
         let pending = Duration::from_millis(50);
 
@@ -949,6 +980,51 @@ mod tests {
 
         engine.release_reader();
         assert!(matches!(req_rx.recv().await, Some(WorkerRequest::Release)));
+    }
+
+    /// The next request the worker end reads, within [`GUARD`].
+    async fn next_request(worker: &mut UnixStream) -> Option<WorkerRequest> {
+        tokio::time::timeout(GUARD, codec::recv_msg::<_, WorkerRequest>(worker))
+            .await
+            .unwrap()
+            .unwrap()
+    }
+
+    /// Control requests go out ahead of queued input, and input waits while
+    /// a hold is on — so a held worker is never blocked writing input when
+    /// the hold's `Release` comes — then goes out once it is released.
+    #[tokio::test]
+    async fn input_waits_while_held_and_control_goes_first() {
+        let (daemon, mut worker) = UnixStream::pair().unwrap();
+        let (_daemon_rd, mut sock_wr) = daemon.into_split();
+        let (req_tx, mut req_rx) = mpsc::unbounded_channel();
+        let (input_tx, mut input_rx) = mpsc::channel(4);
+        let (held, input_hold) = watch::channel(true);
+        input_tx
+            .try_send(WorkerRequest::Paste { data: vec![1] })
+            .unwrap();
+        req_tx.send(WorkerRequest::Release).unwrap();
+        let writer = tokio::spawn(async move {
+            write_requests(&mut sock_wr, &mut req_rx, &mut input_rx, input_hold).await;
+        });
+
+        assert!(matches!(
+            next_request(&mut worker).await,
+            Some(WorkerRequest::Release)
+        ));
+        let quiet = tokio::time::timeout(
+            Duration::from_millis(100),
+            codec::recv_msg::<_, WorkerRequest>(&mut worker),
+        )
+        .await;
+        assert!(quiet.is_err(), "input waits while held");
+        held.send_replace(false);
+        assert!(matches!(
+            next_request(&mut worker).await,
+            Some(WorkerRequest::Paste { .. })
+        ));
+        drop((req_tx, input_tx));
+        tokio::time::timeout(GUARD, writer).await.unwrap().unwrap();
     }
 
     /// A stand-in worker process: `sh -c script`, spawned as the daemon
@@ -1161,14 +1237,18 @@ mod tests {
 
         let (daemon, _silent) = UnixStream::pair().unwrap();
         let started = tokio::time::Instant::now();
-        let end = apply_events(
-            daemon,
-            &fixture_mirror(),
-            &fanout,
-            &unanswered(false),
-            &parked,
+        let end = tokio::time::timeout(
+            PONG_DEADLINE * 3,
+            apply_events(
+                daemon,
+                &fixture_mirror(),
+                &fanout,
+                &unanswered(false),
+                &parked,
+            ),
         )
-        .await;
+        .await
+        .expect("a hang is called by the deadline");
         assert_eq!(end, StreamEnd::Hung);
         assert!(started.elapsed() >= PONG_DEADLINE);
 
