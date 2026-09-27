@@ -12,6 +12,12 @@
 # hand-written policy and is carried through verbatim, apart from the toolchain
 # stamp.
 #
+# The [[mutants]] rows are the exception to "tightened by `mise run baseline`":
+# they come from a full weekly mutation sweep, proposed by
+# `mise run mutants-gate --write` over its merged outcomes and committed by
+# hand; `mise run baseline` carries them through unchanged. See
+# docs/testing.md R12.
+#
 # Deliberately NOT ratcheted: clippy::str_to_string, 715 sites. It fires on
 # `.to_string()` for a &str, which is idiomatic and reads better than the
 # `.to_owned()` it asks for; a 715-row budget would be noise standing in front
@@ -886,11 +892,11 @@ missed = 669
 
 [[mutants]]
 crate = "kmux-client"
-missed = 300
+missed = 263
 
 [[mutants]]
 crate = "kmux-connect"
-missed = 149
+missed = 148
 
 [[mutants]]
 crate = "kmux-ffi"
@@ -910,7 +916,7 @@ missed = 37
 
 [[mutants]]
 crate = "kmux-pty"
-missed = 65
+missed = 63
 
 [[mutants]]
 crate = "kmux-render"
@@ -930,4 +936,4 @@ missed = 8
 
 [[mutants]]
 crate = "kmuxd"
-missed = 329
+missed = 320
