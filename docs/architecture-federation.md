@@ -422,7 +422,11 @@ typed error, never answered by a hub that does not host it and never dropped.
 - **Input lock** — *aggregated*. The hub keeps the holder among its own
   clients (`PeerConnection::input_locks`) and denies the others locally. It
   holds the peer's lock for the holder, refuses the others' input, and releases
-  the peer's lock when the holder detaches or its channel ends.
+  the peer's lock when the holder detaches, its channel ends (even after a
+  closed pane stream dropped it as a viewer) or its session closes. Two grants
+  the peer gave while the lock was free keep one holder; a grant for a client
+  that stopped viewing the pane is given back at once; a dropped link tells the
+  holder `InputLockReleased`.
 - **Hub parity.** `SetSnapshotMode` reaches proxied viewers (they are sent the
   mirror in place of each frame), and a channel's end detaches its proxied
   viewers (`PeerManager::detach_channel`). The peer's `GridDigest` is checked

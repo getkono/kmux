@@ -240,6 +240,16 @@ mod tests {
         let (mut state, mut ctrl_rx) = authenticated_client().await;
         let (mut upstream, peer) = state.app.install_channel_peer("fedlocal", "fedremote");
         let pane_id = || "fedlocal/0".to_string();
+        let (data_tx, _data_rx) = tokio::sync::mpsc::channel(8);
+        let client_id = state.client_id.expect("authenticated");
+        assert!(state.app.federated_attach(
+            &pane_id(),
+            client_id,
+            data_tx,
+            state.ctrl_tx.clone(),
+            TermSize::default(),
+        ));
+        while upstream.try_recv().is_ok() {}
 
         let request = ClientMessage::RequestInputLock { pane_id: pane_id() };
         assert!(handle_message(&mut state, request, &NoopAttacher).await);

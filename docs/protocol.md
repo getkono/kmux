@@ -205,7 +205,7 @@ to `ClientMessage::federation`, variant by variant.
 | `SetLayoutRatios` | nothing; as `PaneSwap` | `LayoutUpdate` | yes | — | forwarded |
 | `ApplyLayoutScheme` | nothing; as `PaneSwap`; an `Unknown` scheme is ignored | `LayoutUpdate` | yes | — | forwarded |
 | `SetFocus` | nothing; as `PaneSwap` | `LayoutUpdate` | yes | — | forwarded |
-| `PtyInput` | nothing; `Error PaneNotFound` / `InputLocked` / `InternalError` (queue full) | — | no: bytes are written again | — | forwarded |
+| `PtyInput` | nothing; `Error PaneNotFound` / `InputLocked` / `InternalError` (queue full) | — | no: bytes are written again | — | forwarded, unless another viewer holds the hub's input lock (`InputLocked`) |
 | `PtyKeyBatch` | as `PtyInput` | — | no | — | forwarded, as `PtyInput` |
 | `PtyPaste` | as `PtyInput` | — | no | — | forwarded, as `PtyInput` |
 | `Resize` | nothing; `Error PaneNotFound` | if the pane's smallest-wins size changes: `Event PaneResized` (to everyone, and again to each viewer) and a `TerminalSnapshot` to each viewer | yes | — | aggregated: the peer is sent one smallest-wins size |
@@ -271,7 +271,7 @@ Notes that apply to rows above:
 | `HistoryLines` | reply to `FetchHistory` | control | — | — |
 | `InputLockGranted` | reply to `RequestInputLock` | control | — | — |
 | `InputLockDenied` | reply to `RequestInputLock` | control | names the holder | — |
-| `InputLockReleased` | reply to `ReleaseInputLock` | control | — | — |
+| `InputLockReleased` | reply to `ReleaseInputLock`; pushed by a hub to a proxied pane's lock holder when the peer's link drops | control | the client stops holding the lock | — |
 | `SessionRenamed` | reply to `SessionRename` | control | before its event; handled like it | — |
 | `DirectoryListing` | reply to `ListDirectory` | control | — | — |
 | `PeerOpened` | reply to `OpenPeer` | control | the peer's sessions arrive in the next session list | — |
@@ -303,7 +303,13 @@ A hub is one client to each peer, speaking for all of its own
   its own clients: another holder is answered `InputLockDenied` without asking
   the peer. The hub holds the peer's lock for the local holder, refuses the
   others' input with `InputLocked`, and releases the peer's lock when the
-  holder detaches or its channel ends.
+  holder detaches, its channel ends or its session closes. The lock belongs
+  to a viewer of the pane: a grant for a client that stopped viewing it while
+  it asked is given back to the peer at once. Two requests made while the
+  lock was free are both granted by the peer, which sees one client, so the
+  hub denies the second, naming the first. A holder the peer names in its own
+  `InputLockDenied` — one of the peer's direct clients — is in the peer's
+  numbering.
 - **hub** — about the connection, the hub, or every session. The hub answers
   it and sends the peer nothing. `SetSnapshotMode`, `SetPaused` and
   `SetPaneNoAutoPause` apply to a client's proxied panes as to its local ones.

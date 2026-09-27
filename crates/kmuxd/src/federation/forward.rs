@@ -392,20 +392,7 @@ pub(super) fn answer_unrequested(
     if let Some(local_word) = reply_word(&msg).and_then(|w| guard.remote_to_local.get(w).cloned()) {
         localize_reply(&mut msg, &local_word);
     }
-    match &msg {
-        ServerMessage::InputLockGranted { pane_id } => {
-            guard.input_locks.insert(pane_id.clone(), from.clone());
-        }
-        ServerMessage::InputLockReleased { pane_id }
-            if guard
-                .input_locks
-                .get(pane_id)
-                .is_some_and(|holder| holder.client_id() == from.client_id()) =>
-        {
-            guard.input_locks.remove(pane_id);
-        }
-        _ => {}
-    }
+    let msg = guard.on_lock_reply(&from, msg);
     drop(guard);
     from.answer(msg);
     None
@@ -462,6 +449,44 @@ mod tests {
     fn client(id: u64) -> (Requester, OutboundRx) {
         let (ctrl, rx) = make_outbound();
         (Requester::client(ClientId(id), ctrl), rx)
+    }
+
+    /// Play the peer for everything the hub has sent it so far, in order, as
+    /// a daemon answers one connection: each ping answered, each lock request
+    /// granted, each release confirmed.
+    fn play_peer(hub: &mut Hub) {
+        while let Ok(msg) = hub.upstream.try_recv() {
+            let reply = match msg {
+                ClientMessage::Ping { seq } => ServerMessage::Pong { seq },
+                ClientMessage::RequestInputLock { pane_id } => {
+                    ServerMessage::InputLockGranted { pane_id }
+                }
+                ClientMessage::ReleaseInputLock { pane_id } => {
+                    ServerMessage::InputLockReleased { pane_id }
+                }
+                _ => continue,
+            };
+            hub.peer.send(reply).unwrap();
+        }
+    }
+
+    /// A client of the hub viewing `fedlocal/0`, its control lane, and its
+    /// pane stream; the peer has played what its attach sent.
+    fn viewing_client(
+        hub: &mut Hub,
+        id: u64,
+    ) -> (Requester, OutboundRx, mpsc::Receiver<ServerMessage>) {
+        let (ctrl, rx) = make_outbound();
+        let (data_tx, data_rx) = mpsc::channel(8);
+        assert!(hub.app.federated_attach(
+            "fedlocal/0",
+            ClientId(id),
+            data_tx,
+            ctrl.clone(),
+            TermSize::default(),
+        ));
+        play_peer(hub);
+        (Requester::client(ClientId(id), ctrl), rx, data_rx)
     }
 
     /// The next thing the hub sends the peer that is not a ping.
@@ -939,8 +964,8 @@ mod tests {
     #[tokio::test(start_paused = true)]
     async fn the_hub_arbitrates_the_input_lock_between_its_clients() {
         let mut hub = fixture_hub();
-        let (a, mut a_answers) = client(1);
-        let (b, mut b_answers) = client(2);
+        let (a, mut a_answers, _a_pane) = viewing_client(&mut hub, 1);
+        let (b, mut b_answers, _b_pane) = viewing_client(&mut hub, 2);
         let mgr = &hub.app.peer_manager;
         let pane = "fedlocal/0";
 
@@ -983,6 +1008,21 @@ mod tests {
             next_request(&mut hub.upstream).await,
             ClientMessage::PtyInput { .. }
         ));
+        // Only input is locked: B still reads the pane's history.
+        mgr.forward(
+            b.clone(),
+            ClientMessage::FetchHistory {
+                request_id: 9,
+                pane_id: pane.into(),
+                start_index: 0,
+                count: 1,
+            },
+        )
+        .expect("B reads under A's lock");
+        assert!(matches!(
+            next_request(&mut hub.upstream).await,
+            ClientMessage::FetchHistory { .. }
+        ));
 
         // Only the holder's release goes up; the peer's answer frees it here.
         mgr.release_input_lock(&b, pane).unwrap();
@@ -1008,12 +1048,114 @@ mod tests {
         );
     }
 
+    /// Two requests made while the lock was free are both granted by the
+    /// peer, which sees one client; the hub gives it to the first and denies
+    /// the second. A grant for a client that stopped viewing the pane while
+    /// it asked is given back to the peer at once. And a closed session's
+    /// lock goes with it (issue #227).
+    #[tokio::test(start_paused = true)]
+    async fn the_hub_keeps_one_holder_whatever_the_peer_grants() {
+        let mut hub = fixture_hub();
+        let (a, mut a_answers, _a_pane) = viewing_client(&mut hub, 1);
+        let (b, mut b_answers, _b_pane) = viewing_client(&mut hub, 2);
+        let pane = "fedlocal/0";
+        hub.app.peer_manager.request_input_lock(&a, pane).unwrap();
+        hub.app.peer_manager.request_input_lock(&b, pane).unwrap();
+        play_peer(&mut hub);
+        assert!(matches!(
+            answer(&mut a_answers).await,
+            ServerMessage::InputLockGranted { .. }
+        ));
+        assert!(matches!(
+            answer(&mut b_answers).await,
+            ServerMessage::InputLockDenied {
+                holder: ClientId(1),
+                ..
+            }
+        ));
+
+        // C asks, then stops viewing before the grant comes back.
+        let (c, mut c_answers, _c_pane) = viewing_client(&mut hub, 3);
+        let mgr = &hub.app.peer_manager;
+        mgr.release_input_lock(&a, pane).unwrap();
+        play_peer(&mut hub);
+        assert!(matches!(
+            answer(&mut a_answers).await,
+            ServerMessage::InputLockReleased { .. }
+        ));
+        let mgr = &hub.app.peer_manager;
+        mgr.request_input_lock(&c, pane).unwrap();
+        mgr.detach_viewer(pane, ClientId(3));
+        play_peer(&mut hub);
+        assert!(matches!(
+            answer(&mut c_answers).await,
+            ServerMessage::InputLockGranted { .. }
+        ));
+        assert!(matches!(
+            next_request(&mut hub.upstream).await,
+            ClientMessage::ReleaseInputLock { pane_id } if pane_id == "fedremote/0"
+        ));
+        let conn = Arc::clone(&hub.app.peer_manager.peers.lock().unwrap()["peer:1"]);
+        assert!(lock(&conn).input_locks.is_empty(), "nobody holds it");
+
+        // A closed session's lock goes with it.
+        lock(&conn).input_locks.insert(pane.to_string(), a.clone());
+        hub.peer
+            .send(ServerMessage::Event {
+                event: kmux_protocol::messages::SessionEventMsg::SessionClosed {
+                    word_id: "fedremote".into(),
+                },
+            })
+            .unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        assert!(
+            lock(&conn).input_locks.is_empty(),
+            "closed with its session"
+        );
+    }
+
+    /// A grant given back for a client that stopped viewing is confirmed to
+    /// the hub alone: the release does not take the lock from the client
+    /// that holds it by then.
+    #[tokio::test(start_paused = true)]
+    async fn giving_back_a_stale_grant_keeps_the_new_holder() {
+        let mut hub = fixture_hub();
+        let (a, mut a_answers, _a_pane) = viewing_client(&mut hub, 1);
+        let (b, _b_answers, _b_pane) = viewing_client(&mut hub, 2);
+        let (c, _c_answers, _c_pane) = viewing_client(&mut hub, 3);
+        let pane = "fedlocal/0";
+        let mgr = &hub.app.peer_manager;
+        mgr.request_input_lock(&c, pane).unwrap();
+        mgr.detach_viewer(pane, ClientId(3));
+        mgr.request_input_lock(&a, pane).unwrap();
+        play_peer(&mut hub);
+        assert!(matches!(
+            answer(&mut a_answers).await,
+            ServerMessage::InputLockGranted { .. }
+        ));
+        // The hub's give-back of C's grant, and the peer's confirmation.
+        play_peer(&mut hub);
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        let input = hub.app.peer_manager.forward(
+            b,
+            ClientMessage::PtyInput {
+                pane_id: pane.into(),
+                data: b"x".to_vec(),
+            },
+        );
+        assert_eq!(
+            input.unwrap_err().code,
+            ErrorCode::InputLocked,
+            "A still holds it"
+        );
+    }
+
     /// A link that drops answers everything still waiting with an error, and
     /// tells a lock holder its lock is gone: the answers will never come.
     #[tokio::test(start_paused = true)]
     async fn a_dropped_link_answers_what_was_in_flight() {
         let mut hub = fixture_hub();
-        let (a, mut answers) = client(1);
+        let (a, mut answers, _pane) = viewing_client(&mut hub, 1);
         let mgr = &hub.app.peer_manager;
         mgr.request_input_lock(&a, "fedlocal/0").unwrap();
         next_request(&mut hub.upstream).await;
