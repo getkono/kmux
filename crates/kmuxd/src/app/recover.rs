@@ -324,7 +324,23 @@ mod tests {
         assert!(!log.allow(FaultCause::Crash, start), "crash budget spent");
         assert_eq!(log.stats(start).0, MAX_RESTARTS + MAX_HANG_RESTARTS);
 
+        let mut crashes_only = RestartLog::default();
+        for _ in 0..MAX_RESTARTS {
+            assert!(crashes_only.allow(FaultCause::Crash, start));
+        }
+        assert!(
+            !crashes_only.stats(start).2,
+            "the crash budget alone is spent"
+        );
+
         let crashes_expired = start + RESTART_WINDOW;
+        // A respawn a whole window old no longer counts, for either cause.
+        assert_eq!(
+            log.stats(crashes_expired).0,
+            MAX_HANG_RESTARTS,
+            "crashes expired"
+        );
+        assert_eq!(log.stats(start + HANG_WINDOW).0, 0, "hangs expired too");
         assert!(log.allow(FaultCause::Crash, crashes_expired));
         assert!(
             !log.allow(FaultCause::Hang, crashes_expired),

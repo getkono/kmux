@@ -192,9 +192,16 @@ async fn heartbeat_and_hold(
         data: b"held\n".to_vec(),
     };
     codec::send_msg(wr, &input).await?;
-    let read_while_held =
-        tokio::time::timeout(Duration::from_millis(500), next_event(rd, is_nonempty_diff)).await;
-    assert!(read_while_held.is_err(), "nothing read while held");
+    // Nothing is read while held, and the worker says `Held` once, not
+    // again and again.
+    let read_or_held_again =
+        |ev: &WorkerEvent| is_nonempty_diff(ev) || matches!(ev, WorkerEvent::Held { .. });
+    let while_held = tokio::time::timeout(
+        Duration::from_millis(500),
+        next_event(rd, read_or_held_again),
+    )
+    .await;
+    assert!(while_held.is_err(), "nothing while held: {while_held:?}");
     codec::send_msg(wr, &WorkerRequest::Release).await?;
     assert!(
         next_event(rd, is_nonempty_diff).await.is_some(),
