@@ -155,8 +155,10 @@ jobs:
           install: true
           cache: true
 
+      # Restore only: with `--in-place` this `target/` ends up holding mutant
+      # builds, which are no use to the next job that restores the cache.
       - name: Cache cargo
-        uses: actions/cache@v4
+        uses: actions/cache/restore@v4
         with:
           path: |
             ~/.cargo/registry
@@ -190,7 +192,7 @@ jobs:
     name: Mutation (diff)
     needs: mutants
     runs-on: ubuntu-latest
-    if: always() && github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'skip-mutants')
+    if: "!cancelled() && github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'skip-mutants')"
     steps:
       - uses: actions/checkout@v4
 
