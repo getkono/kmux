@@ -49,6 +49,7 @@ impl ServerApp {
             .close_nowait(pane_id)
             .await
             .map_err(|e| as_pane_error(pane_id, e))?;
+        self.forget_worker_restarts(pane_id);
 
         // Remove the pane and collapse its tab's layout; remove the tab if it
         // becomes empty, and the session if it has no tabs left.

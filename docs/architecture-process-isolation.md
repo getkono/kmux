@@ -75,6 +75,11 @@ fd-carrying handshake is lock-step. After it, both ends split the stream and
 exchange fd-less, length-prefixed postcard frames concurrently, reusing the
 `kmux-protocol` codec.
 
+The worker must answer `Hello` with `Ready` within `READY_TIMEOUT` (10 s, issue
+#207). One that fails the handshake or never answers is killed and reaped on
+the spot, and pane creation falls back to the in-process engine instead of
+hanging.
+
 **The daemon retains the authoritative master fd** (the worker holds a dup).
 This is the load-bearing invariant: when the worker dies, the daemon's fd keeps
 the PTY's file description open, so the shell receives no SIGHUP and survives.
@@ -126,7 +131,35 @@ own executable, else on `PATH`.
 A worker death is just a task seeing its socket EOF — the daemon is structurally
 unaffected. The supervisor reaps the child and inspects its exit status: a clean
 exit (code 0) is the pane-close/handoff path; a signal death (SIGSEGV/SIGABRT)
-or non-zero exit is a **crash**, on which it:
+or non-zero exit is a **crash**.
+
+The supervisor never waits on a worker in a way that can hang the daemon
+(issue #207):
+
+- **Asynchronous reaping.** The worker is a `tokio::process::Child`, waited on
+  with `.await`. It used to be a `std::process::Child` whose blocking `wait()`
+  ran on a runtime thread, which blocked that thread for good when the worker
+  was still alive. A supervisor aborted by a pane close or a handoff drops the
+  `Child` unreaped, and tokio reaps it in the background.
+- **A bad stream kills the worker first.** A frame that fails to read or decode
+  (`StreamEnd::Corrupt`) means the worker is running but its stream cannot be
+  trusted, so it is killed before it is reaped. A worker that closed its stream
+  gets `EXIT_GRACE` (5 s) to exit on its own before it is killed too.
+- **Hang detection.** A worker that has sent nothing for `NO_PROGRESS_DEADLINE`
+  (30 s) while its PTY has output waiting (`StreamEnd::Hung`) is killed. The
+  supervisor keeps a dup of the pane's master and checks it every
+  `LIVENESS_INTERVAL` (5 s) with a zero-timeout `poll`: readable and not at end
+  of file. `FIONREAD` would be the obvious probe, but it reads 0 on a macOS PTY
+  master. A healthy worker drains the PTY and emits a diff for every read, and a
+  quiet PTY gives it nothing to say, so neither trips the check. A worker blocked
+  writing input to a program that has stopped reading stdin still reads that
+  program's output (a separate task on its runtime), so it is not mistaken for a
+  hung one. No protocol message was added, so `WORKER_PROTOCOL_VERSION` is
+  unchanged.
+- **The socket is read by a task of its own** that feeds a bounded channel, so
+  the periodic check never cancels a frame half-read.
+
+A killed worker counts as a crash like any other. On a crash the supervisor:
 
 1. broadcasts `SessionEventMsg::PaneFaulted` to the pane's attached clients
    (PROTOCOL_VERSION 28), and
@@ -136,7 +169,9 @@ or non-zero exit is a **crash**, on which it:
 The respawn task re-adopts the daemon's retained master fd into a fresh worker
 (the shell is still alive), swaps the engine, and resyncs attached clients with a
 snapshot. A crash-loop guard bounds restarts to 3 per pane within 60s; past that
-the pane is left faulted.
+the pane is left faulted. Closing a pane (directly, or with its tab or session)
+drops its entry from the restart log (`forget_worker_restarts`), so the log does
+not grow by one entry for every pane a long-running daemon ever faulted.
 
 ## Observability (`workers` control RPC)
 

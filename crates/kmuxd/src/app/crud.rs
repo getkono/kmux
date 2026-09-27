@@ -156,6 +156,7 @@ impl ServerApp {
 
         for pane_id in &pane_ids {
             let _ = self.manager.close_nowait(pane_id).await;
+            self.forget_worker_restarts(pane_id);
         }
 
         self.sessions.write().await.remove(word_id);

@@ -148,6 +148,7 @@ impl ServerApp {
                 }
             }
             let _ = self.manager.close_nowait(pane_id).await;
+            self.forget_worker_restarts(pane_id);
         }
 
         let session_closed = {
