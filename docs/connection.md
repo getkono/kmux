@@ -345,7 +345,7 @@ The `audience` field on each listener controls which callers receive that endpoi
 | `any` | Always announced to all callers |
 | `local` | Only UDS control-socket clients or loopback peers |
 | `lan` | Only RFC-1918 / link-local peers (10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 169.254.0.0/16) |
-| `ssh-only` | Meant only for SSH `probe-or-start` replies. Today the probe forwards the daemon's own status list, which is built for the local (UDS) view and so omits `ssh-only` endpoints; only for a daemon that sends no list does the probe build the SSH view itself |
+| `ssh-only` | Only SSH `probe-or-start` replies: the status reply carries the SSH view as `ssh_endpoints` beside the local view (`endpoints`), and the probe hands it back; for a daemon that predates the field, the probe builds the SSH view from its ports |
 
 ---
 
@@ -354,11 +354,13 @@ The `audience` field on each listener controls which callers receive that endpoi
 The daemon's control socket answers `{"command":"status"}` with a
 `StatusResponse` (`kmux_protocol::control_rpc`): the ports, the token, the pid,
 `protocol_range`, the build (`kmuxd_build`, `build_profile`), uptime, session
-count and the endpoint list. A local bootstrap reads it before opening the data
-plane.
+count, and the endpoints twice: `endpoints` is the local view (no `ssh-only`
+listener), `ssh_endpoints` the SSH view (no `local` one). A local bootstrap
+reads it before opening the data plane.
 
 `kmuxd probe-or-start` (run over SSH) queries it — starting the daemon first if
-none answers — and prints:
+none answers — and prints, as `endpoints`, the SSH view (built from the ports
+for a daemon whose reply predates `ssh_endpoints`):
 
 ```json
 {

@@ -25,8 +25,8 @@ pub enum BootstrapPath {
     Uds,
     /// SSH `probe-or-start` invocation.
     ///
-    /// Used to include `SshOnly` and `Any` endpoints while excluding `Local`.
-    /// Wired into the `probe-or-start` JSON response in a future phase.
+    /// Includes `SshOnly` and `Any` endpoints and excludes `Local`: the
+    /// status reply's `ssh_endpoints`, which `probe-or-start` hands back.
     Ssh,
     /// Direct network connection (IP address known).
     ///
