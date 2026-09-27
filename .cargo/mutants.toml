@@ -47,4 +47,15 @@ exclude_re = [
     # unit tests drive with a buffer; its `Ok(())` mutant is observable only
     # on the process's stdout (issue #207).
     'crates/kmux-app/src/subcommands/logs\.rs:.*replace tail_local_log -> ',
+    # `run_daemon_command` is the `kmux daemon` dispatcher: each arm talks to
+    # the real daemon of this profile and prints to stdout. `probe_takeover`
+    # is the one probe of the real daemon a restart polls. The restart's
+    # logic is `wait_for_takeover` / `report_takeover` / `stood_down`, unit-
+    # tested with scripted probes (issue #207).
+    'crates/kmux-app/src/subcommands/daemon_cmd\.rs:.*replace run_daemon_command -> ',
+    'crates/kmux-app/src/subcommands/daemon_cmd\.rs:.* in probe_takeover',
+    'crates/kmux-app/src/subcommands/daemon_cmd\.rs:.*replace probe_takeover -> ',
+    # `query_handoff` only resolves this profile's control socket and calls
+    # `query_handoff_at`, which is tested against a stand-in socket.
+    'crates/kmux-connect/src/daemon/mod\.rs:.*replace query_handoff -> ',
 ]

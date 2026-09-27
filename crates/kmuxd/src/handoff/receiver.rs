@@ -164,7 +164,7 @@ async fn pull(
 
 /// Whether `alive` turns false within `grace`, checked every
 /// [`PREDECESSOR_POLL`].
-async fn exits_within(alive: &impl Fn() -> bool, grace: Duration) -> bool {
+pub(crate) async fn exits_within(alive: &impl Fn() -> bool, grace: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + grace;
     while alive() {
         if tokio::time::Instant::now() >= deadline {

@@ -108,16 +108,27 @@ checkpoint and answers `Released` (N restores it) or, if that write fails,
 `Abort`. Two older successor builds do not fit that exactly, and O covers both
 by stopping the successor itself rather than trusting it to stand down:
 
-- A **version-1** N restores and serves right after its `Decline`, without
-  waiting for O's answer. If O then rolls back, it kills that N (by the pid its
-  connection's peer credentials name) after the `Abort`, so two daemons serve
-  only for the moment between N binding its sockets and O's kill.
+- A **version-1** N (the released protocol) restores and serves right after its
+  `Decline`, without waiting for O's answer — so even when O commits, N may read
+  the checkpoint before O's final write and briefly serve beside O until O
+  exits. If O instead rolls back, it kills that N (by the pid its connection's
+  peer credentials name) after the `Abort`, so two daemons serve only for the
+  moment between N binding its sockets and O's kill.
 - A **version-1 or -2** N daemonizes itself, so O's child is only its launcher
   and is gone at once. O knows the real N by its peer credentials once it
   connects, and kills it by that pid on a rollback. One that never connects at
-  all cannot be found and stopped; a version-2 N in that state restores and
-  serves as the pre-#207 code did. Only a downgrade to such a build is exposed;
-  a version-3 N stands down whenever a daemon still answers the control socket.
+  all cannot be found and stopped; a version-1 or -2 N in that state restores
+  and serves as the pre-#207 code did. Only a downgrade to such a build is
+  exposed; a version-3 N stands down whenever a daemon still answers the
+  control socket.
+- A **version-1 O** (the released daemon, upgrading to this build) spawns N
+  without keeping its handle: a version-3 N that stands down stays a zombie of
+  that O until O exits. Harmless, and nothing on the old side can change it.
+
+**Upgrading from a released daemon does not keep shells.** Released daemons
+speak handoff version 1, so the first restart onto this build is declined and
+the successor snapshot-restores: running programs are restarted once, with
+their screens replayed. Later restarts between version-3 builds keep them.
 
 ## Correctness invariants
 
@@ -224,6 +235,11 @@ by stopping the successor itself rather than trusting it to stand down:
   the `handoff` control command reports whether it still runs and, once it has
   rolled back, why. `kmux daemon restart` polls it beside the pid and prints
   `handoff stood down: <why>` as soon as it knows, rather than timing out.
+  When the old daemon is gone and nothing answers for 10 s, it says the daemon
+  stopped during the handoff (a shutdown signal stops both daemons) rather
+  than claiming the old one kept serving. Against a daemon that predates the
+  report (it answers `restart` without a number) it asks nothing more and
+  waits the old 15 s.
 - **A pane whose child exits mid-handoff** is sent with `has_live_fd = false`
   (respawned from the snapshot) or, if it exits after N inherits it, is marked
   `Exited` via the EOF path.
@@ -268,8 +284,9 @@ Across a version bump the handoff degrades safely: a `HANDOFF_PROTOCOL_VERSION`
 mismatch → `Decline` → snapshot restore (version 2, issue #207, added `Abort` and
 has N wait for `Released` after a `Decline`; a version-1 O answers a `Decline`
 with `Released` too, and a version-1 N restores without waiting; version 3 adds
-O's pid to `Hello`, so an upgrade from a version-2 daemon also snapshot-restores
-once — see §Mixed versions); a `PROTOCOL_VERSION` mismatch is caught
+O's pid to `Hello`, so the upgrade from a released, version-1 daemon — like one
+from a version-2 build — snapshot-restores once: shells do not survive that
+restart; see §Mixed versions); a `PROTOCOL_VERSION` mismatch is caught
 by the client on reconnect (it surfaces the documented "run `kmux daemon
 restart`" guidance); the on-disk checkpoint is versioned by `STATE_VERSION`.
 
