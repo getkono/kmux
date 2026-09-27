@@ -2,8 +2,8 @@
 
 Status: **PR3 + PR4 core landed — multiple GUIs share one proxied pane over a
 single upstream link, with smallest-wins sizing and zero-round-trip late attach.
-GUI lean-down (PR5), federation hardening (PR6), and the remaining reconciliation
-facets (pause-union, capability merge, input-lock, session-event forwarding)
+GUI lean-down (PR5), federation hardening (PR6), request parity (issue #227)
+and input-lock arbitration have landed; pause-union and capability merge
 remain.**
 
 ## Goal
@@ -39,11 +39,11 @@ See `docs/architecture-frontend.md` for the client layering this builds on.
     column. It rides `SessionEntry`, **not** the persisted `SessionMeta`, so it
     needs no checkpoint migration.
   - `ClientMessage::SessionCreate.peer: Option<PeerId>` routes creation to a
-    federated peer: the hub's `PeerManager::create_remote_session` forwards the
-    `SessionCreate` upstream, draws a local `WordId` for the returned session, and
-    registers the mapping (the create-time analog of `open_peer`'s adoption). The
-    feed loop completes the request via a `pending_creates` oneshot, since it owns
-    the upstream stream. (This landed under the retired positional Postcard
+    federated peer: the hub forwards the `SessionCreate` upstream on the one
+    forwarding path (see **Request parity** below), and when the peer's
+    `SessionCreated` comes back, draws a local `WordId` for the session and
+    registers the mapping (the create-time analog of `open_peer`'s adoption)
+    before answering the requester. (This landed under the retired positional Postcard
     codec, where adding a field was a wire break and needed a version bump.
     Under the named-map schema a `#[serde(default)]` field is additive — see
     [architecture-protocol-versioning.md](architecture-protocol-versioning.md).)
@@ -54,11 +54,13 @@ See `docs/architecture-frontend.md` for the client layering this builds on.
     fetches the remote `SessionList`, and registers each remote session under a
     **freshly-drawn local `WordId`** (from the same `WordlistSampler` as local sessions,
     so no collisions), holding the bidirectional `remote_word ↔ local_word` map.
-  - **Dispatch branching** (`client_handler/dispatch/`) routes `Attach` / `PtyInput` /
-    `PtyKey*` / `PtyPaste` / `Resize` / `Detach` for a federated pane to the peer (ID
-    translated, forwarded upstream) instead of the local relay; `SessionList` merges the
-    proxied sessions (peer-decorated names). The dispatch layer carries **no `#[cfg]`** —
-    every branch goes through always-compiled `ServerApp` wrappers (`app/peer_api.rs`).
+  - **Dispatch** (`client_handler/dispatch/`): a request for a federated session
+    goes to the peer from one place, `dispatch::federated::route`, before the
+    router's `match` (see **Request parity** below); the aggregated `Attach` /
+    `Resize` / `Detach` and input-lock handlers keep their own federated branch;
+    `SessionList` merges the proxied sessions (peer-decorated names). The dispatch
+    layer carries **no `#[cfg]`** — every branch goes through always-compiled
+    `ServerApp` wrappers (`app/peer_api.rs`).
   - A per-peer **feed loop** drains the upstream `ServerMessage` stream, rewrites each
     frame's pane ID remote→local, and fans pane content out to that pane's local viewers;
     it answers upstream `Ping`s with `Pong`.
@@ -148,11 +150,11 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
 - **PR4 facet — session-event forwarding — landed.** The feed loop now forwards
   session-scoped traffic, not just pane content: `Event { SessionEventMsg }` and
   `LayoutUpdate` have their embedded word/pane ID translated remote→local and are
-  fanned out to every viewer under that word, so a GUI viewing a federated session
-  sees its **title / layout / tab / lifecycle** updates (E2E: an OSC-2 title change on
-  the remote pane arrives as `PaneTitleChanged` for the local pane). `Signal` and
-  `FetchHistory` for a federated pane are forwarded upstream too (the `HistoryLines`
-  reply is pane-scoped, so the feed loop routes it back to the requesting viewer).
+  broadcast to every client of the hub, as a local daemon broadcasts its own
+  (issue #227; before, only the session's viewers got them), so a GUI sees a
+  federated session's **title / layout / tab / lifecycle** updates (E2E: an OSC-2
+  title change on the remote pane arrives as `PaneTitleChanged` for the local
+  pane).
 - **PR4 facet — per-viewer pause (local) — landed.** A paused GUI (issue #68) viewing a
   proxied pane now stops receiving its output: `ServerApp::set_paused` also marks the
   client's federated viewers (`set_federated_paused` → `PeerManager::set_paused`), and
@@ -173,8 +175,8 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
     `Detach` upstream on all-paused and re-`Attach` on first-resume — deferred because
     that resume cost (a fresh upstream snapshot) is a real trade-off vs. keeping the
     mirror warm, and the win only matters under sustained all-paused.
-  - capability union upstream / filter downstream; and input-lock arbitration across
-    local viewers.
+  - capability union upstream / filter downstream. (Input-lock arbitration across
+    local viewers landed with issue #227; see **Request parity**.)
 - **PR5 prerequisite — SSH peer federation — landed.** `open_peer` now serves
   `PeerTarget::Ssh` as well as `Direct`: it negotiates the `-L` tunnel via
   `kmux-connect`'s `ssh::negotiate` and connects over TCP+TLS through it, sharing the
@@ -261,8 +263,8 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
     every client is sent the list. The hub therefore never has to decide whether it
     reached the same run.
   - **Ordered lists.** Every add or remove of a peer's session (a reconcile, the
-    peer's `SessionClosed`, `close_remote_session`, `close_peer`,
-    `create_remote_session`'s registration)
+    peer's `SessionClosed`, the answer to a forwarded `SessionClose`, `close_peer`,
+    a forwarded create's registration)
     holds `PeerManager`'s membership gate together with the broadcast of that change,
     and every session list takes its federated entries (and is queued or broadcast)
     under the same gate, after the local session map's read lock. So a list taken
@@ -276,7 +278,7 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   - **When a session closes.** Only when the peer reports it closed (its
     `SessionClosed` event, or its session list no longer naming it) — then for every
     client, not just the session's viewers — or when the user closes it or its peer
-    (`close_remote_session` for one session, once the peer acks; `close_peer` sends each
+    (a forwarded `SessionClose` for one session, once the peer answers; `close_peer` sends each
     client a `SessionClosed` for every one of its sessions). Whichever of the peer's
     ack and its own `SessionClosed` event lands first closes the session; the other
     finds it gone, so each client is told once.
@@ -310,12 +312,12 @@ map. The GUI sees only local ids and needs no federation awareness beyond issuin
   relay is now identical for PTY-backed and peer-backed panes. (Previously a full
   channel silently dropped the frame, diverging that viewer permanently.)
   **Session events and lifecycle** (titles, layout, tab/session events, and the
-  death-path `SessionClosed`) instead travel over each viewer's **unbounded ctrl**
-  channel (`viewers_under_word`), matching how the local daemon delivers events — so a
-  backed-up pane content stream can never drop a title change, and a viewer that was
-  full at the instant the peer died still receives its `SessionClosed` (otherwise the
-  GUI would hang, as no further frames follow). Content keeps backpressure; events are
-  guaranteed.
+  death-path `SessionClosed`) instead go out on the hub's event broadcast, delivered
+  to each connection on the lanes the local daemon uses — layout and lifecycle on
+  the **unbounded ctrl** lane, a flood-prone bell/title/progress event on the data
+  lane — so a backed-up pane content stream can never drop a layout change or a
+  `SessionClosed` (otherwise the GUI would hang, as no further frames follow).
+  Content keeps backpressure; lifecycle is guaranteed.
 - **PR6 — concurrent-open race — fixed.** `open_peer`'s reuse check and its publish
   straddle the awaiting connect/auth/list, so two GUIs federating the same target at
   once could both connect and both publish, the second overwriting the first and leaking
@@ -384,6 +386,65 @@ link keeps retrying at the capped backoff, and the peer's sessions stay listed
 `peer_unreachable`, so opening the peer again with its new token
 (`OpenPeer` re-targets an unreachable peer, see `open_peer` above) brings them
 back under their own words.
+
+## Request parity (issue #227)
+
+A federated session behaves exactly like a local one: every request a client
+can make of a session is either carried out by the peer or refused with a
+typed error, never answered by a hub that does not host it and never dropped.
+
+- **One table.** `ClientMessage::federation` (`kmux-protocol`) gives every
+  message one disposition — *forwarded*, *aggregated* or *hub* — in one
+  exhaustive `match`, so a new message does not build until it has one.
+  `docs/protocol.md`'s catalogue states it per message in its **Federated**
+  column, and a `spec` test holds the two together over one sample of every
+  variant ([protocol.md](protocol.md#federated-requests)).
+- **One path.** `dispatch::federated::route` sends every forwarded request for
+  a proxied session to `PeerManager::forward` (`federation/forward.rs`). That
+  rewrites the word or pane to the peer's and the `request_id` into the hub's
+  own number space, then sends it up the link. It refuses at once, under the
+  request's own id, what it cannot send: `InternalError` for an unknown or
+  unreachable peer, `SessionNotFound` / `PaneNotFound`, and `InputLocked` for
+  input under another viewer's lock. A close first detaches the closer from
+  what it closes, as locally.
+- **Answers routed per request** (`federation/routes.rs`). An answer with an id
+  goes back through a `Route` to its sender alone, under the sender's id and
+  word. A `SessionCreated` is registered first, and a `SessionClosed` drops
+  the session for every client after the sender has its answer. The peer's own
+  error codes pass through. An answer without an id (`Error`, `SessionRenamed`,
+  the lock replies) goes to the sender of the oldest *run*: the hub groups what
+  it sends by sender and pings the peer when the sender changes, and a peer
+  answers one connection's messages in order, before the `Pong`. Nothing waits
+  on a timer. A dropped link answers every waiting request `InternalError`
+  (`fail_in_flight`). A route the peer answered with nothing (`TabRename`) goes
+  with its run. This depends on the peer answering in order, which a peer that
+  is itself a hub does not, so chained hubs are not supported.
+- **Input lock** — *aggregated*. The hub keeps the holder among its own
+  clients (`PeerConnection::input_locks`) and denies the others locally. It
+  holds the peer's lock for the holder, refuses the others' input, and releases
+  the peer's lock when the holder detaches, its channel ends (even after a
+  closed pane stream dropped it as a viewer) or its session closes. Two grants
+  the peer gave while the lock was free keep one holder. A grant for a client
+  that stopped viewing the pane is given back at once, and asked for again if
+  the give-back overtook a newer holder's grant. A peer's refusal ends the
+  holder's lock here too. A resumed holder's re-attach keeps its lock. A
+  dropped link tells the holder `InputLockReleased`.
+- **Hub parity.** `SetSnapshotMode` reaches proxied viewers (they are sent the
+  mirror in place of each frame), and a channel's end detaches its proxied
+  viewers (`PeerManager::detach_channel`). The peer's `GridDigest` is checked
+  against the mirror, and relayed or answered with a resync
+  ([architecture-verification.md](architecture-verification.md)); so is an
+  upstream `Lagged`.
+
+Not covered: a peer's *closed* sessions (`SessionListClosed`,
+`SessionRestore`) are the hub's own graveyard only (#228).
+
+Tests: `federation::forward` (every shape of answer routed back, answers
+without an id to the right sender, refusals, the create, the lock, a dropped
+link), `federation::routes` (runs, barriers, routes), `federation::feed` (events
+broadcast, digest relay and resync), `dispatch::federated` (the router), and
+the E2E `a_proxied_sessions_tabs_and_panes_are_managed_through_the_hub` and
+`a_proxied_panes_history_answers_only_the_client_that_asked`.
 
 ## Resolved — federation addressing & testability
 

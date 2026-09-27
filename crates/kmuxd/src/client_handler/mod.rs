@@ -4,7 +4,7 @@ mod liveness;
 mod session;
 pub use dispatch::handle_message;
 pub use events::pty_event_to_msg;
-pub(crate) use session::{MAX_WRITE_BATCH, forward_vt_event, within};
+pub(crate) use session::{MAX_WRITE_BATCH, within};
 // The app's resume tests drive a channel's teardown directly.
 #[cfg(test)]
 pub(crate) use session::release_channel;

@@ -2,8 +2,7 @@
 //! much of each pane's stream it wants.
 
 use kmux_protocol::messages::{
-    ClientId, ClientMessage, ErrorCode, PaneId, RequestId, SequenceNo, ServerMessage, TermSize,
-    epoch_millis,
+    ClientId, ErrorCode, PaneId, RequestId, SequenceNo, ServerMessage, TermSize, epoch_millis,
 };
 use tokio::sync::mpsc;
 use tracing::debug;
@@ -13,7 +12,7 @@ use crate::connection::classify_error;
 
 use super::super::{CLIENT_CHANNEL_CAPACITY, PaneAttacher, SharedClientState};
 
-/// Handle [`ClientMessage::Attach`].
+/// Handle [`ClientMessage::Attach`](kmux_protocol::messages::ClientMessage::Attach).
 pub(super) async fn on_attach<A: PaneAttacher>(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -81,7 +80,7 @@ pub(super) async fn on_attach<A: PaneAttacher>(
     }
 }
 
-/// Handle [`ClientMessage::Detach`].
+/// Handle [`ClientMessage::Detach`](kmux_protocol::messages::ClientMessage::Detach).
 pub(super) async fn on_detach(state: &mut SharedClientState, client_id: ClientId, pane_id: PaneId) {
     if let Some(handle) = state.attached.remove(&pane_id) {
         handle.abort();
@@ -90,7 +89,7 @@ pub(super) async fn on_detach(state: &mut SharedClientState, client_id: ClientId
     }
 }
 
-/// Handle [`ClientMessage::SetSnapshotMode`].
+/// Handle [`ClientMessage::SetSnapshotMode`](kmux_protocol::messages::ClientMessage::SetSnapshotMode).
 pub(super) async fn on_set_snapshot_mode(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -100,7 +99,7 @@ pub(super) async fn on_set_snapshot_mode(
     debug!("client {client_id:?} snapshot mode = {enabled}");
 }
 
-/// Handle [`ClientMessage::SetPaused`].
+/// Handle [`ClientMessage::SetPaused`](kmux_protocol::messages::ClientMessage::SetPaused).
 pub(super) async fn on_set_paused(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -111,7 +110,7 @@ pub(super) async fn on_set_paused(
     debug!("client {client_id:?} paused = {paused} (auto = {auto})");
 }
 
-/// Handle [`ClientMessage::SetPaneNoAutoPause`].
+/// Handle [`ClientMessage::SetPaneNoAutoPause`](kmux_protocol::messages::ClientMessage::SetPaneNoAutoPause).
 pub(super) async fn on_set_pane_no_auto_pause(
     state: &mut SharedClientState,
     client_id: ClientId,
@@ -125,7 +124,7 @@ pub(super) async fn on_set_pane_no_auto_pause(
     debug!("client {client_id:?} pane {pane_id} no_auto_pause = {exempt}");
 }
 
-/// Handle [`ClientMessage::FetchHistory`].
+/// Handle [`ClientMessage::FetchHistory`](kmux_protocol::messages::ClientMessage::FetchHistory).
 pub(super) async fn on_fetch_history(
     state: &mut SharedClientState,
     request_id: RequestId,
@@ -133,32 +132,18 @@ pub(super) async fn on_fetch_history(
     start_index: u64,
     count: u32,
 ) {
-    // For a federated pane, forward the request upstream; the remote's
-    // `HistoryLines` reply is pane-scoped, so the feed loop translates it
-    // back to this viewer (matched by `request_id`).
-    if state.app.is_federated_pane(&pane_id) {
-        state
-            .app
-            .forward_peer_message(&pane_id, move |remote| ClientMessage::FetchHistory {
+    match state.app.fetch_history(&pane_id, start_index, count).await {
+        Ok((first_index, lines, history_total)) => {
+            state.send(ServerMessage::HistoryLines {
                 request_id,
-                pane_id: remote,
-                start_index,
-                count,
+                pane_id,
+                first_index,
+                lines,
+                history_total,
+                sent_at_ms: epoch_millis(),
             });
-    } else {
-        match state.app.fetch_history(&pane_id, start_index, count).await {
-            Ok((first_index, lines, history_total)) => {
-                state.send(ServerMessage::HistoryLines {
-                    request_id,
-                    pane_id,
-                    first_index,
-                    lines,
-                    history_total,
-                    sent_at_ms: epoch_millis(),
-                });
-            }
-            Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
         }
+        Err(e) => state.error(Some(request_id), classify_error(&e), e.to_string()),
     }
 }
 

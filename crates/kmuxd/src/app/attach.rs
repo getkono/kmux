@@ -200,6 +200,8 @@ impl ServerApp {
                 }
             }
         }
+        drop(sessions);
+        self.set_federated_snapshot_mode(client_id, enabled);
     }
 
     /// Pause or resume terminal-output delivery for a client across all panes
@@ -306,6 +308,8 @@ impl ServerApp {
                 }
             }
         }
+        drop(sessions);
+        self.detach_federated_channel(client_id, ctrl);
     }
 }
 

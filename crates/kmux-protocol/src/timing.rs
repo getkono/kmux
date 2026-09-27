@@ -74,13 +74,11 @@ pub const PANE_STREAM_STALL_TIMEOUT: Duration =
 /// take, end to end.
 pub const PEER_CONNECT_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// How long a hub waits for its peer's `SessionListResult` or
-/// `ClientListResult`.
+/// How long a hub waits for its peer's `SessionListResult` while opening the
+/// link. A request the hub forwards waits on no timer: the peer answers a
+/// connection's requests in order, so its answer comes before the `Pong` to
+/// the next ping, and a dropped link answers every request still waiting.
 pub const PEER_LIST_TIMEOUT: Duration = Duration::from_secs(10);
-
-/// How long a hub waits for its peer to confirm a request it forwarded: a
-/// session created, closed or a tab closed, a client kicked.
-pub const PEER_CREATE_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// How long a hub waits for its peer's process overview before answering
 /// with its own panes only.

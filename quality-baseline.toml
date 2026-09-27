@@ -764,7 +764,7 @@ count = 9
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::expect_used"
-count = 23
+count = 25
 
 [[lints]]
 crate = "kmuxd"
@@ -789,17 +789,17 @@ count = 2
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::significant_drop_tightening"
-count = 48
+count = 52
 
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::single_match_else"
-count = 4
+count = 2
 
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::struct_excessive_bools"
-count = 1
+count = 2
 
 [[lints]]
 crate = "kmuxd"
@@ -814,7 +814,7 @@ count = 1
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::unwrap_used"
-count = 103
+count = 92
 
 [[lints]]
 crate = "kmuxd"
@@ -874,4 +874,4 @@ count = 1
 
 [[allows]]
 crate = "kmuxd"
-count = 8
+count = 7

@@ -12,12 +12,13 @@
 //! locally-hosted one.
 
 use kmux_protocol::messages::{
-    ClientId, ClientInfo, ClientMessage, PaneProcesses, PeerId, PeerTarget, ServerMessage,
-    SessionEntry, TermSize,
+    ClientId, ClientMessage, ErrorCode, PaneProcesses, PeerId, PeerTarget, RequestId,
+    ServerMessage, SessionEntry, TermSize,
 };
 use tokio::sync::mpsc;
 
 use super::ServerApp;
+use crate::outbound::OutboundTx;
 
 /// The `PeerError` reason for an `OpenPeer` whose target is a kind this
 /// daemon does not know (`PeerTarget::Unknown`, from a newer client).
@@ -67,8 +68,10 @@ impl ServerApp {
 
     /// Whether the session `word_id` is proxied from a federated peer rather than
     /// hosted locally (issue #146). Always `false` without the `federation`
-    /// feature. Session-level analogue of [`ServerApp::is_federated_pane`].
-    pub fn is_federated_session(&self, word_id: &str) -> bool {
+    /// feature. Session-level analogue of [`ServerApp::is_federated_pane`];
+    /// the router asks [`Self::is_forwarded_request`] instead.
+    #[cfg(test)]
+    pub(crate) fn is_federated_session(&self, word_id: &str) -> bool {
         #[cfg(feature = "federation")]
         {
             self.peer_manager.is_federated_session(word_id)
@@ -77,96 +80,6 @@ impl ServerApp {
         {
             let _ = word_id;
             false
-        }
-    }
-
-    /// Forward a [`ClientList`](ClientMessage::ClientList) for the federated
-    /// session `word_id` to the owning peer and return its connections (issue
-    /// #146). Errors when the peer is unknown/unreachable or without the feature.
-    pub async fn list_federated_session_clients(
-        &self,
-        word_id: &str,
-    ) -> Result<Vec<ClientInfo>, String> {
-        #[cfg(feature = "federation")]
-        {
-            self.peer_manager.list_session_clients(word_id).await
-        }
-        #[cfg(not(feature = "federation"))]
-        {
-            let _ = word_id;
-            Err("federation is not supported by this daemon yet".to_string())
-        }
-    }
-
-    /// Forward a [`KickClient`](ClientMessage::KickClient) for the federated
-    /// session `word_id` to the owning peer (issue #146). Errors when the peer is
-    /// unknown/unreachable, the client is not attached there, or without the
-    /// feature.
-    pub async fn kick_federated_client(
-        &self,
-        word_id: &str,
-        client_id: ClientId,
-    ) -> Result<(), String> {
-        #[cfg(feature = "federation")]
-        {
-            self.peer_manager
-                .kick_session_client(word_id, client_id)
-                .await
-        }
-        #[cfg(not(feature = "federation"))]
-        {
-            let _ = (word_id, client_id);
-            Err("federation is not supported by this daemon yet".to_string())
-        }
-    }
-
-    /// Close the federated session `word_id` on its owning peer and drop it from
-    /// this hub's listing. Errors when the peer is unknown/unreachable, refuses
-    /// the close, or without the feature.
-    pub async fn close_federated_session(&self, word_id: &str) -> Result<(), String> {
-        #[cfg(feature = "federation")]
-        {
-            self.peer_manager.close_remote_session(self, word_id).await
-        }
-        #[cfg(not(feature = "federation"))]
-        {
-            let _ = word_id;
-            Err("federation is not supported by this daemon yet".to_string())
-        }
-    }
-
-    /// Close tab `tab_index` of the federated session `word_id` on its owning
-    /// peer. Errors when the peer is unknown/unreachable, refuses the close, or
-    /// without the feature.
-    pub async fn close_federated_tab(&self, word_id: &str, tab_index: u32) -> Result<(), String> {
-        #[cfg(feature = "federation")]
-        {
-            self.peer_manager.close_remote_tab(word_id, tab_index).await
-        }
-        #[cfg(not(feature = "federation"))]
-        {
-            let _ = (word_id, tab_index);
-            Err("federation is not supported by this daemon yet".to_string())
-        }
-    }
-
-    /// Forward a session-scoped message with no request id (a layout nudge) for
-    /// the federated session `word_id` to its owning peer, built from the
-    /// peer's word for it. Errors when the peer link is gone or without the
-    /// feature.
-    pub fn forward_federated_session(
-        &self,
-        word_id: &str,
-        build: impl FnOnce(String) -> ClientMessage,
-    ) -> Result<(), String> {
-        #[cfg(feature = "federation")]
-        {
-            self.peer_manager.forward_session_message(word_id, build)
-        }
-        #[cfg(not(feature = "federation"))]
-        {
-            let _ = (word_id, build);
-            Err("federation is not supported by this daemon yet".to_string())
         }
     }
 
@@ -219,31 +132,6 @@ impl ServerApp {
         #[cfg(not(feature = "federation"))]
         {
             let _ = peer;
-        }
-    }
-
-    /// Create a new session on an already-federated `peer`, returning the
-    /// localized [`SessionEntry`] the hub replies to the requesting client.
-    /// Without the feature this reports a "not supported" error.
-    pub async fn create_remote_session(
-        &self,
-        peer: &str,
-        name: Option<String>,
-        cwd: Option<String>,
-        program: Option<String>,
-        args: Vec<String>,
-        size: TermSize,
-    ) -> Result<SessionEntry, String> {
-        #[cfg(feature = "federation")]
-        {
-            self.peer_manager
-                .create_remote_session(self, peer, name, cwd, program, args, size)
-                .await
-        }
-        #[cfg(not(feature = "federation"))]
-        {
-            let _ = (peer, name, cwd, program, args, size);
-            Err("federation is not supported by this daemon yet".to_string())
         }
     }
 
@@ -331,22 +219,116 @@ impl ServerApp {
         }
     }
 
-    /// If `pane_id` is federated, translate it to its remote pane ID, forward
-    /// `build(remote_pane_id)` to the owning peer, and return `true`. Otherwise
-    /// return `false` and forward nothing (the caller handles it locally).
-    pub fn forward_peer_message(
-        &self,
-        pane_id: &str,
-        build: impl FnOnce(String) -> ClientMessage,
-    ) -> bool {
+    /// Whether `msg` is a request this hub forwards to a peer (see
+    /// [`kmux_protocol::messages::Federation`]): it names a session the hub
+    /// proxies, or asks a peer to create one. Without the feature only the
+    /// latter, which [`Self::forward_to_peer`] then refuses.
+    pub fn is_forwarded_request(&self, msg: &mut ClientMessage) -> bool {
         #[cfg(feature = "federation")]
         {
-            self.peer_manager.forward_message(pane_id, build)
+            self.peer_manager.is_forwarded(msg)
         }
         #[cfg(not(feature = "federation"))]
         {
-            let _ = (pane_id, build);
-            false
+            matches!(
+                msg.federation(),
+                kmux_protocol::messages::Federation::Forward {
+                    target: kmux_protocol::messages::Target::Peer(_),
+                    ..
+                }
+            )
+        }
+    }
+
+    /// Forward the request `msg` from `from` to its peer, whose answer is
+    /// routed back to `from` alone (issue #227). Refused at once when it
+    /// cannot be forwarded, or without the feature.
+    pub fn forward_to_peer(&self, from: Requester, msg: ClientMessage) -> Result<(), Refusal> {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.forward(from, msg)
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = from;
+            let mut msg = msg;
+            let request_id =
+                if let kmux_protocol::messages::Federation::Forward { request_id, .. } =
+                    msg.federation()
+                {
+                    request_id.as_deref().copied()
+                } else {
+                    None
+                };
+            Err(Refusal {
+                request_id,
+                code: ErrorCode::InternalError,
+                message: "federation is not supported by this daemon yet".to_string(),
+            })
+        }
+    }
+
+    /// `RequestInputLock` on the proxied pane `pane_id`: the hub arbitrates
+    /// its own clients and holds the peer's lock for the one holding its own
+    /// (issue #227).
+    pub fn federated_request_input_lock(
+        &self,
+        from: &Requester,
+        pane_id: &str,
+    ) -> Result<(), Refusal> {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.request_input_lock(from, pane_id)
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (from, pane_id);
+            Ok(())
+        }
+    }
+
+    /// `ReleaseInputLock` on the proxied pane `pane_id`: passed on for the
+    /// holder only (issue #227).
+    pub fn federated_release_input_lock(
+        &self,
+        from: &Requester,
+        pane_id: &str,
+    ) -> Result<(), Refusal> {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.release_input_lock(from, pane_id)
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (from, pane_id);
+            Ok(())
+        }
+    }
+
+    /// Snapshot mode for every proxied pane `client_id` views (issue #227).
+    /// Complements [`ServerApp::set_snapshot_mode`]'s local panes.
+    pub fn set_federated_snapshot_mode(&self, client_id: ClientId, enabled: bool) {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.set_snapshot_mode(client_id, enabled);
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (client_id, enabled);
+        }
+    }
+
+    /// Detach `client_id`'s channel `ctrl` from every proxied pane it views
+    /// and release its input locks there (issue #227). Complements
+    /// [`ServerApp::detach_channel`]'s local panes.
+    pub fn detach_federated_channel(&self, client_id: ClientId, ctrl: &OutboundTx) {
+        #[cfg(feature = "federation")]
+        {
+            self.peer_manager.detach_channel(client_id, ctrl);
+        }
+        #[cfg(not(feature = "federation"))]
+        {
+            let _ = (client_id, ctrl);
         }
     }
 
@@ -360,7 +342,7 @@ impl ServerApp {
         pane_id: &str,
         client_id: ClientId,
         data_tx: mpsc::Sender<ServerMessage>,
-        ctrl_tx: crate::outbound::OutboundTx,
+        ctrl_tx: OutboundTx,
         size: TermSize,
     ) -> bool {
         #[cfg(feature = "federation")]
@@ -398,5 +380,83 @@ impl ServerApp {
             return;
         }
         self.detach_from_pane(pane_id, client_id).await;
+    }
+}
+
+/// Who sent a message up the link: a client of this hub, or the hub itself
+/// (a re-attach after a relink, a refresh of the peer's list, a release of a
+/// departed client's input lock). What the peer says to the hub goes nowhere.
+#[derive(Clone)]
+#[cfg_attr(
+    not(feature = "federation"),
+    expect(
+        dead_code,
+        reason = "only the federation subsystem answers a requester"
+    )
+)]
+pub(crate) enum Requester {
+    Hub,
+    Client { id: ClientId, ctrl: OutboundTx },
+}
+
+#[cfg_attr(
+    not(feature = "federation"),
+    expect(
+        dead_code,
+        reason = "only the federation subsystem answers a requester"
+    )
+)]
+impl Requester {
+    /// The client `id`, answered on its control lane `ctrl`.
+    pub(crate) fn client(id: ClientId, ctrl: OutboundTx) -> Self {
+        Self::Client { id, ctrl }
+    }
+
+    /// The client this is, if it is one.
+    pub(crate) fn client_id(&self) -> Option<ClientId> {
+        match self {
+            Self::Hub => None,
+            Self::Client { id, .. } => Some(*id),
+        }
+    }
+
+    /// Whether `self` and `other` are the same sender: the hub, or one
+    /// client over one channel.
+    pub(crate) fn is(&self, other: &Self) -> bool {
+        match (self, other) {
+            (Self::Hub, Self::Hub) => true,
+            (Self::Client { id: a, ctrl: x }, Self::Client { id: b, ctrl: y }) => {
+                a == b && x.same_channel(y)
+            }
+            _ => false,
+        }
+    }
+
+    /// Answer the sender with `msg` on its control lane. The hub answers
+    /// itself nothing.
+    pub(crate) fn answer(&self, msg: ServerMessage) {
+        if let Self::Client { ctrl, .. } = self {
+            let _ = ctrl.send(msg);
+        }
+    }
+}
+
+/// A forwarded request the hub answers itself, at once, with an `Error`.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct Refusal {
+    /// The request's own id, when it has one.
+    pub(crate) request_id: Option<RequestId>,
+    pub(crate) code: ErrorCode,
+    pub(crate) message: String,
+}
+
+impl Refusal {
+    /// The `Error` a client is sent for it.
+    pub(crate) fn into_error(self) -> ServerMessage {
+        ServerMessage::Error {
+            request_id: self.request_id,
+            code: self.code,
+            message: self.message,
+        }
     }
 }

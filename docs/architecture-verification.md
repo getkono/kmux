@@ -75,6 +75,15 @@ resync (`grid.clear()` + re-attach). This turns silent corruption into a detecte
 self-healing, *countable* event — the conformance and e2e suites assert the count
 stays zero.
 
+A federation hub sits between a peer's digest and the viewers of a proxied
+pane (issue #227). It checks the digest against its own mirror at that seqno
+first. One that agrees is relayed to the viewers under the local pane id —
+lossy, never lagging anyone, skipping a paused or snapshot-mode viewer — and
+each viewer checks its own grid as above. One that disagrees means the mirror
+itself is wrong: the hub re-attaches upstream for a snapshot, which re-seeds
+the mirror and resyncs every viewer, and relays nothing, since a viewer
+resyncing off a wrong mirror would only be served the same mistake.
+
 The digest is a backstop for corruption *within* one daemon run. It is not what
 keeps a client from resuming a pane across runs — a restarted daemon numbers its
 seqnos from scratch, so an old run's `last_seqno` could line up with the new

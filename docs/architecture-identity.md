@@ -126,12 +126,13 @@ Each caller still formats its own prose; only the decision is centralized.
 ## Federation
 
 For a session proxied from a federated peer (issue #121), the local hub forwards
-`ClientList` / `KickClient` to the **owning peer** and relays the reply, reusing
-the same request/await-reply plumbing as `create_remote_session`
-(`PeerConnection::pending_client_lists` / `pending_kicks`, completed by the feed
-loop). The peer's labels/ids/machine ids are relayed verbatim — they are
-meaningful on that host, and `machine_id` is globally unique. The dispatch layer
-chooses local vs. forwarded via `ServerApp::is_federated_session`.
+`ClientList` / `KickClient` to the **owning peer** on the one forwarding path
+every session request takes (`federation::forward`, issue #227): under the
+peer's word and an id of the hub's own, with the answer routed back to the
+requester alone, peer error codes included. The peer's labels/ids/machine ids
+are relayed verbatim — they are meaningful on that host, and `machine_id` is
+globally unique. Which requests are forwarded is `ClientMessage::federation`
+(see [protocol.md](protocol.md#federated-requests)).
 
 ## Surfaces
 

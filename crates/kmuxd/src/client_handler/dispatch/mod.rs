@@ -25,6 +25,7 @@
 mod auth;
 mod clients;
 mod diagnostics;
+mod federated;
 mod input;
 mod layout;
 mod pane;
@@ -86,6 +87,12 @@ pub async fn handle_message<A: PaneAttacher>(
 
     let client_id = state.client_id.expect("authenticated without client_id");
 
+    // A request for a session a peer hosts goes to the peer, whatever it is
+    // (`federated::route`); the arms below are the hub's own.
+    let Some(msg) = federated::route(state, client_id, msg).await else {
+        return true;
+    };
+
     match msg {
         ClientMessage::Auth { .. } => {}
 
@@ -101,14 +108,15 @@ pub async fn handle_message<A: PaneAttacher>(
             program,
             args,
             size,
-            peer,
+            // A create naming a peer went to it in `federated::route`.
+            peer: _,
         } => {
             let spawn = Spawn {
                 program,
                 args,
                 size,
             };
-            session::on_session_create(state, request_id, name, cwd, spawn, peer).await;
+            session::on_session_create(state, request_id, name, cwd, spawn).await;
         }
 
         ClientMessage::SessionClose {
