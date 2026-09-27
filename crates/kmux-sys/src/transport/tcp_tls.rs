@@ -64,7 +64,7 @@ impl Listener for TlsTcpListener {
         Box::pin(async move {
             let (stream, remote_addr) = self.inner.accept().await.map_err(AcceptError::Io)?;
             let acceptor = self.acceptor.clone();
-            Ok(PendingSession::new(async move {
+            let pending = PendingSession::new(async move {
                 let tls_stream = acceptor.accept(stream).await.map_err(AcceptError::Io)?;
                 let conn_span = tracing::info_span!(
                     "connection",
@@ -84,7 +84,8 @@ impl Listener for TlsTcpListener {
                     span: conn_span,
                     transport: SessionTransport::TcpTls,
                 })
-            }))
+            });
+            Ok(pending.with_peer(remote_addr))
         })
     }
 }
@@ -209,7 +210,7 @@ mod tests {
         tokio::spawn(serve(
             Box::new(listener),
             std::time::Duration::from_secs(3600),
-            crate::transport::MAX_PENDING_HANDSHAKES,
+            crate::transport::HandshakeLimits::DAEMON,
             Arc::new(move |session: IncomingSession| {
                 let _ = tx.send(session.peer.addr);
             }),

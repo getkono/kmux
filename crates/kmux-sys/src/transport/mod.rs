@@ -41,15 +41,23 @@ pub mod tcp_tls;
 pub mod uds;
 
 #[cfg(feature = "framing")]
+mod admission;
+
+#[cfg(feature = "framing")]
+pub use admission::{
+    HandshakeLimits, HandshakeLimitsError, MAX_PENDING_HANDSHAKES,
+    MAX_PENDING_HANDSHAKES_PER_SOURCE, QUIC_RETRY_ABOVE,
+};
+#[cfg(feature = "framing")]
 pub use listener::{
-    AcceptError, HANDSHAKE_TIMEOUT, IncomingSession, Listener, MAX_PENDING_HANDSHAKES, PeerInfo,
-    PendingSession, SessionTransport, serve,
+    AcceptError, HANDSHAKE_TIMEOUT, IncomingSession, Listener, PeerInfo, PendingSession,
+    SessionTransport, serve,
 };
 
 #[cfg(feature = "framing")]
 mod listener {
     use std::future::Future;
-    use std::net::SocketAddr;
+    use std::net::{IpAddr, SocketAddr};
     use std::pin::Pin;
     use std::sync::Arc;
     use std::time::Duration;
@@ -57,6 +65,8 @@ mod listener {
     use thiserror::Error;
 
     use kmux_protocol::messages::TransportKind;
+
+    use super::admission::{Admission, HandshakeLimits, InFlight};
 
     // ─── PeerInfo ─────────────────────────────────────────────────────────────
 
@@ -153,14 +163,6 @@ mod listener {
     /// that has not finished by then is not going to.
     pub const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 
-    /// Most connections a listener handshakes at once (issue #207). Each
-    /// in-flight handshake is a task, a socket and TLS state; past this many,
-    /// the listener stops accepting until one finishes or times out, and
-    /// further connections wait in the kernel's accept backlog (TCP, UDS) or
-    /// the QUIC endpoint's queue instead of in the daemon's memory. Far above
-    /// what legitimate clients produce, which reconnect a handful at a time.
-    pub const MAX_PENDING_HANDSHAKES: usize = 64;
-
     /// Pause after a failed accept before the next one.
     const ACCEPT_ERROR_BACKOFF: Duration = Duration::from_millis(100);
 
@@ -169,8 +171,23 @@ mod listener {
     /// connection's own task ([`PendingSession::establish`]), never on the
     /// accept loop, where one peer that stops mid-handshake used to block
     /// every later accept on the same listener.
+    ///
+    /// Dropping one refuses the connection: the socket closes, or a QUIC
+    /// client is sent a refusal.
     pub struct PendingSession {
-        handshake: Pin<Box<dyn Future<Output = Result<IncomingSession, AcceptError>> + Send>>,
+        /// Where the connection comes from, when it has an address (not UDS).
+        source: Option<IpAddr>,
+        stage: Stage,
+    }
+
+    /// What is left to do to establish a [`PendingSession`].
+    enum Stage {
+        /// A handshake to run.
+        Handshake(Pin<Box<dyn Future<Output = Result<IncomingSession, AcceptError>> + Send>>),
+        /// A QUIC connection attempt not yet accepted, so it can still be
+        /// retried or refused without the endpoint keeping any state for it.
+        #[cfg(feature = "quic")]
+        Quic(Box<quinn::Incoming>),
     }
 
     impl PendingSession {
@@ -179,13 +196,64 @@ mod listener {
             handshake: impl Future<Output = Result<IncomingSession, AcceptError>> + Send + 'static,
         ) -> Self {
             Self {
-                handshake: Box::pin(handshake),
+                source: None,
+                stage: Stage::Handshake(Box::pin(handshake)),
             }
         }
 
         /// A connection with no handshake to run (UDS, plain TCP).
         pub fn ready(session: IncomingSession) -> Self {
             Self::new(std::future::ready(Ok(session)))
+        }
+
+        /// A QUIC connection attempt, to be accepted by
+        /// [`PendingSession::establish`].
+        #[cfg(feature = "quic")]
+        pub fn quic(incoming: quinn::Incoming) -> Self {
+            Self {
+                source: Some(incoming.remote_address().ip()),
+                stage: Stage::Quic(Box::new(incoming)),
+            }
+        }
+
+        /// The same connection, counted against `peer`'s address by the
+        /// per-source handshake bound.
+        #[must_use]
+        pub fn with_peer(mut self, peer: SocketAddr) -> Self {
+            self.source = Some(peer.ip());
+            self
+        }
+
+        /// The address the connection comes from, if it has one.
+        pub fn source(&self) -> Option<IpAddr> {
+            self.source
+        }
+
+        /// Whether this is a QUIC client that has not proved it can receive
+        /// packets at its source address, and may be asked to.
+        pub fn needs_address_validation(&self) -> bool {
+            match &self.stage {
+                Stage::Handshake(_) => false,
+                #[cfg(feature = "quic")]
+                Stage::Quic(incoming) => {
+                    !incoming.remote_address_validated() && incoming.may_retry()
+                }
+            }
+        }
+
+        /// Ask a QUIC client to prove its address (a stateless Retry); it
+        /// comes back as a new, validated connection attempt. Any other
+        /// connection, or one that may not be retried, is refused.
+        pub fn retry(self) {
+            match self.stage {
+                Stage::Handshake(_) => {}
+                #[cfg(feature = "quic")]
+                Stage::Quic(incoming) => {
+                    if let Err(e) = (*incoming).retry() {
+                        e.into_incoming().refuse();
+                    }
+                }
+            }
         }
 
         /// Run the handshake, giving up after `timeout`.
@@ -195,7 +263,12 @@ mod listener {
         /// [`AcceptError::HandshakeTimeout`] when it takes longer than
         /// `timeout`, or the transport's own error when it fails.
         pub async fn establish(self, timeout: Duration) -> Result<IncomingSession, AcceptError> {
-            tokio::time::timeout(timeout, self.handshake)
+            let handshake = match self.stage {
+                Stage::Handshake(handshake) => handshake,
+                #[cfg(feature = "quic")]
+                Stage::Quic(incoming) => Box::pin(super::quic::establish(*incoming)),
+            };
+            tokio::time::timeout(timeout, handshake)
                 .await
                 .map_err(|_| AcceptError::HandshakeTimeout(timeout))?
         }
@@ -203,7 +276,9 @@ mod listener {
 
     impl std::fmt::Debug for PendingSession {
         fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-            f.debug_struct("PendingSession").finish_non_exhaustive()
+            f.debug_struct("PendingSession")
+                .field("source", &self.source)
+                .finish_non_exhaustive()
         }
     }
 
@@ -226,33 +301,44 @@ mod listener {
     /// Accept connections on `listener` until it closes, completing each
     /// one's handshake in its own task under `handshake_timeout` and handing
     /// the established session to `on_session`. A handshake that fails or
-    /// times out drops that connection only. At most `max_handshakes` run at
-    /// once: with that many in flight, the next accept waits for one of them
-    /// to end.
+    /// times out drops that connection only.
+    ///
+    /// `limits` bounds the handshakes in flight, in all and per source
+    /// (issue #207). A connection past either bound is refused at once: the
+    /// accept loop never waits for a slot, so connections queue neither in
+    /// the daemon nor in the kernel's backlog or the QUIC endpoint behind it.
+    /// Under load a QUIC client with an unproven address is sent a stateless
+    /// Retry before it is counted.
     pub async fn serve(
         mut listener: Box<dyn Listener>,
         handshake_timeout: Duration,
-        max_handshakes: usize,
+        limits: HandshakeLimits,
         on_session: Arc<dyn Fn(IncomingSession) + Send + Sync>,
     ) {
         let kind = listener.kind();
-        let slots = Arc::new(tokio::sync::Semaphore::new(max_handshakes));
+        let in_flight = InFlight::default();
         loop {
-            // The semaphore is never closed, so this only waits.
-            let Ok(slot) = Arc::clone(&slots).acquire_owned().await else {
-                break;
-            };
             match listener.accept().await {
                 Ok(pending) => {
-                    let on_session = Arc::clone(&on_session);
-                    tokio::spawn(async move {
-                        // Held until the handshake ends, either way.
-                        let _slot = slot;
-                        match pending.establish(handshake_timeout).await {
-                            Ok(session) => on_session(session),
-                            Err(e) => tracing::warn!("{kind} handshake failed: {e}"),
+                    let source = pending.source();
+                    match in_flight.admit(&limits, source, pending.needs_address_validation()) {
+                        Admission::Admit(slot) => {
+                            let on_session = Arc::clone(&on_session);
+                            tokio::spawn(async move {
+                                // Held until the handshake ends, either way.
+                                let _slot = slot;
+                                match pending.establish(handshake_timeout).await {
+                                    Ok(session) => on_session(session),
+                                    Err(e) => tracing::warn!("{kind} handshake failed: {e}"),
+                                }
+                            });
                         }
-                    });
+                        Admission::Retry => pending.retry(),
+                        Admission::Refuse(why) => {
+                            tracing::debug!(?source, ?why, "{kind} connection refused");
+                            drop(pending);
+                        }
+                    }
                 }
                 Err(AcceptError::Closed) => break,
                 Err(e) => {
@@ -271,18 +357,17 @@ mod listener {
 
         use super::*;
 
-        /// A listener that plays back `accepts`, then reports itself closed,
-        /// counting the accepts it was asked for.
+        /// A listener that plays back `accepts`, then reports itself closed.
+        /// Each accept yields first, as a real one waits for the next
+        /// connection, so the handshakes spawned so far get to run.
         struct Scripted {
             accepts: VecDeque<Result<PendingSession, AcceptError>>,
-            asked: Arc<std::sync::atomic::AtomicUsize>,
         }
 
         impl Scripted {
             fn new(accepts: impl IntoIterator<Item = Result<PendingSession, AcceptError>>) -> Self {
                 Self {
                     accepts: accepts.into_iter().collect(),
-                    asked: Arc::default(),
                 }
             }
         }
@@ -296,9 +381,11 @@ mod listener {
                 &mut self,
             ) -> Pin<Box<dyn Future<Output = Result<PendingSession, AcceptError>> + Send + '_>>
             {
-                self.asked.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
                 let next = self.accepts.pop_front().unwrap_or(Err(AcceptError::Closed));
-                Box::pin(std::future::ready(next))
+                Box::pin(async move {
+                    tokio::task::yield_now().await;
+                    next
+                })
             }
         }
 
@@ -313,25 +400,56 @@ mod listener {
             }
         }
 
+        /// A connection whose handshake never finishes, and a receiver that
+        /// resolves once the connection has been dropped: refused at once, or
+        /// timed out.
+        fn stalled() -> (PendingSession, tokio::sync::oneshot::Receiver<()>) {
+            let (alive, dropped) = tokio::sync::oneshot::channel::<()>();
+            let pending = PendingSession::new(async move {
+                let _alive = alive;
+                std::future::pending().await
+            });
+            (pending, dropped)
+        }
+
+        fn peer(ip: &str) -> SocketAddr {
+            SocketAddr::new(ip.parse().unwrap(), 4433)
+        }
+
+        /// Whether the connection behind `dropped` has been dropped.
+        fn is_dropped(dropped: &mut tokio::sync::oneshot::Receiver<()>) -> bool {
+            dropped.try_recv() == Err(tokio::sync::oneshot::error::TryRecvError::Closed)
+        }
+
+        async fn serve_scripted(
+            accepts: impl IntoIterator<Item = Result<PendingSession, AcceptError>>,
+            limits: HandshakeLimits,
+        ) -> tokio::sync::mpsc::UnboundedReceiver<TransportKind> {
+            let (tx, served) = tokio::sync::mpsc::unbounded_channel();
+            serve(
+                Box::new(Scripted::new(accepts)),
+                HANDSHAKE_TIMEOUT,
+                limits,
+                Arc::new(move |session: IncomingSession| {
+                    let _ = tx.send(session.kind());
+                }),
+            )
+            .await;
+            served
+        }
+
         /// A failed accept costs one backoff and not the listener: the next
         /// connection is still handed on, and `serve` returns once the
         /// listener closes.
         #[tokio::test(start_paused = true)]
         async fn serve_backs_off_after_a_failed_accept_and_ends_when_the_listener_closes() {
-            let listener = Scripted::new([
-                Err(AcceptError::Io(std::io::Error::other("EMFILE"))),
-                Ok(PendingSession::ready(uds_session())),
-            ]);
-            let (tx, mut served) = tokio::sync::mpsc::unbounded_channel();
             let started = tokio::time::Instant::now();
-
-            serve(
-                Box::new(listener),
-                HANDSHAKE_TIMEOUT,
-                MAX_PENDING_HANDSHAKES,
-                Arc::new(move |session: IncomingSession| {
-                    let _ = tx.send(session.kind());
-                }),
+            let mut served = serve_scripted(
+                [
+                    Err(AcceptError::Io(std::io::Error::other("EMFILE"))),
+                    Ok(PendingSession::ready(uds_session())),
+                ],
+                HandshakeLimits::DAEMON,
             )
             .await;
 
@@ -339,35 +457,90 @@ mod listener {
             assert_eq!(served.recv().await, Some(TransportKind::Uds));
         }
 
-        /// With `max_handshakes` handshakes stalled, the listener accepts
-        /// nothing more until one of them times out and frees its slot
-        /// (issue #207).
+        /// A source with its share of handshakes stalled is refused at once,
+        /// not queued, and another source is still admitted. The stalled ones
+        /// hold their slots until they time out (issue #207).
         #[tokio::test(start_paused = true)]
-        async fn serve_accepts_no_more_than_the_cap_while_handshakes_are_pending() {
-            let stalled = || Ok(PendingSession::new(std::future::pending()));
-            let listener = Scripted::new([stalled(), stalled(), stalled()]);
-            let asked = Arc::clone(&listener.asked);
-            let accepts = move || asked.load(std::sync::atomic::Ordering::SeqCst);
+        async fn a_source_past_its_share_is_refused_at_once_and_others_are_admitted() {
+            let noisy = peer("192.0.2.1");
+            let (a, mut a_dropped) = stalled();
+            let (b, mut b_dropped) = stalled();
+            let (c, mut c_dropped) = stalled();
+            let (other, mut other_dropped) = stalled();
             let started = tokio::time::Instant::now();
-            let serving = tokio::spawn(serve(
-                Box::new(listener),
-                HANDSHAKE_TIMEOUT,
-                2,
-                Arc::new(|_: IncomingSession| {}),
-            ));
 
-            tokio::time::sleep(HANDSHAKE_TIMEOUT / 2).await;
-            assert_eq!(accepts(), 2, "the third accept waits for a slot");
+            serve_scripted(
+                [
+                    Ok(a.with_peer(noisy)),
+                    Ok(b.with_peer(noisy)),
+                    Ok(c.with_peer(noisy)),
+                    Ok(other.with_peer(peer("192.0.2.2"))),
+                ],
+                HandshakeLimits::new(8, 2, 8).unwrap(),
+            )
+            .await;
 
-            serving.await.unwrap();
-            assert!(started.elapsed() >= HANDSHAKE_TIMEOUT);
-            assert_eq!(accepts(), 4, "the rest once the stalled ones timed out");
+            assert_eq!(started.elapsed(), Duration::ZERO, "nothing waited");
+            assert!(is_dropped(&mut c_dropped), "the third from one source");
+            assert!(!is_dropped(&mut a_dropped));
+            assert!(!is_dropped(&mut b_dropped));
+            assert!(!is_dropped(&mut other_dropped), "another source");
+
+            let timed_out = tokio::time::timeout(2 * HANDSHAKE_TIMEOUT, a_dropped).await;
+            assert!(
+                timed_out.expect("bounded").is_err(),
+                "dropped, not answered"
+            );
+            assert!(
+                started.elapsed() >= HANDSHAKE_TIMEOUT,
+                "held until it timed out"
+            );
+        }
+
+        /// Past the listener-wide bound everyone is refused at once, a local
+        /// socket included.
+        #[tokio::test(start_paused = true)]
+        async fn a_full_listener_refuses_at_once() {
+            let (a, mut a_dropped) = stalled();
+            let (b, mut b_dropped) = stalled();
+            serve_scripted(
+                [Ok(a.with_peer(peer("192.0.2.1"))), Ok(b)],
+                HandshakeLimits::new(1, 1, 1).unwrap(),
+            )
+            .await;
+            assert!(!is_dropped(&mut a_dropped));
+            assert!(is_dropped(&mut b_dropped), "refused, not queued");
+        }
+
+        /// A slot is given back when its handshake finishes, so a listener
+        /// allowed one handshake at a time serves connection after connection.
+        /// Only QUIC is ever asked to validate its address: a stream
+        /// connection is never retried, even with a threshold of zero.
+        #[tokio::test(start_paused = true)]
+        async fn finished_handshakes_free_their_slots_and_streams_are_never_retried() {
+            let tls_like = || Ok(PendingSession::ready(uds_session()).with_peer(peer("192.0.2.1")));
+            let mut served = serve_scripted(
+                [tls_like(), tls_like(), tls_like()],
+                HandshakeLimits::new(1, 1, 0).unwrap(),
+            )
+            .await;
+            for _ in 0..3 {
+                let kind = tokio::time::timeout(HANDSHAKE_TIMEOUT, served.recv()).await;
+                assert_eq!(kind.expect("served in turn"), Some(TransportKind::Uds));
+            }
         }
 
         #[test]
-        fn a_pending_session_debugs_without_its_handshake() {
+        fn a_pending_session_carries_its_source_and_debugs_without_its_handshake() {
             let pending = PendingSession::new(std::future::pending());
-            assert_eq!(format!("{pending:?}"), "PendingSession { .. }");
+            assert_eq!(pending.source(), None);
+            assert!(!pending.needs_address_validation());
+            assert_eq!(
+                format!("{pending:?}"),
+                "PendingSession { source: None, .. }"
+            );
+            let pending = pending.with_peer(peer("192.0.2.9"));
+            assert_eq!(pending.source(), Some("192.0.2.9".parse().unwrap()));
         }
     }
 }

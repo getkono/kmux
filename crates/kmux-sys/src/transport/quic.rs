@@ -46,16 +46,20 @@ mod quic_listener {
             let endpoint = self.endpoint.clone();
             Box::pin(async move {
                 let incoming = endpoint.accept().await.ok_or(AcceptError::Closed)?;
-                // The QUIC handshake and the control stream belong to the
-                // connection's own task, like TLS's (issue #206).
-                Ok(PendingSession::new(establish(incoming)))
+                // Not accepted yet: the accept loop decides whether to retry,
+                // refuse or admit it (issue #207). The QUIC handshake and the
+                // control stream belong to the connection's own task, like
+                // TLS's (issue #206).
+                Ok(PendingSession::quic(incoming))
             })
         }
     }
 
     /// Complete an incoming QUIC connection: its handshake, then its
     /// bidirectional control stream.
-    async fn establish(incoming: quinn::Incoming) -> Result<IncomingSession, AcceptError> {
+    pub(in crate::transport) async fn establish(
+        incoming: quinn::Incoming,
+    ) -> Result<IncomingSession, AcceptError> {
         let conn = incoming
             .await
             .map_err(|e| AcceptError::Transport(e.to_string()))?;
@@ -87,6 +91,8 @@ mod quic_listener {
 
 #[cfg(feature = "quic")]
 pub use quic_listener::QuicListener;
+#[cfg(feature = "quic")]
+pub(super) use quic_listener::establish;
 
 #[cfg(test)]
 #[cfg(feature = "quic")]
@@ -184,5 +190,109 @@ mod tests {
         let mut listener = QuicListener::new(server.clone());
         server.close(0u32.into(), b"done");
         assert!(matches!(listener.accept().await, Err(AcceptError::Closed)));
+    }
+
+    /// Start a client connecting to `server` that opens its control stream,
+    /// and return what the attempt came to.
+    fn connect_and_open(
+        server: SocketAddr,
+    ) -> tokio::task::JoinHandle<Result<(quinn::Endpoint, quinn::Connection), String>> {
+        let client = client_endpoint(server);
+        tokio::spawn(async move {
+            let conn = client
+                .connect(server, "localhost")
+                .map_err(|e| e.to_string())?
+                .await
+                .map_err(|e| e.to_string())?;
+            let (mut send, _recv) = conn.open_bi().await.map_err(|e| e.to_string())?;
+            send.write_all(b"hello").await.map_err(|e| e.to_string())?;
+            Ok((client, conn))
+        })
+    }
+
+    /// A first connection attempt has not proved its address; a Retry sends
+    /// the client back with a token, and its second attempt has, and
+    /// establishes (issue #207).
+    #[tokio::test]
+    async fn a_retried_client_comes_back_validated_and_establishes() {
+        let server = server_endpoint();
+        let addr = server.local_addr().unwrap();
+        let mut listener = QuicListener::new(server);
+        let client_side = connect_and_open(addr);
+
+        let first = tokio::time::timeout(WAIT, listener.accept())
+            .await
+            .expect("an attempt arrives")
+            .expect("accept");
+        assert!(first.needs_address_validation(), "not yet validated");
+        assert_eq!(first.source(), Some("127.0.0.1".parse().unwrap()));
+        first.retry();
+
+        let second = tokio::time::timeout(WAIT, listener.accept())
+            .await
+            .expect("the client retries")
+            .expect("accept");
+        assert!(!second.needs_address_validation(), "validated by the retry");
+        tokio::time::timeout(WAIT, second.establish(HANDSHAKE_TIMEOUT))
+            .await
+            .expect("the handshake completes")
+            .expect("establish");
+        let connected = tokio::time::timeout(WAIT, client_side).await;
+        connected
+            .expect("bounded")
+            .expect("client")
+            .expect("connected");
+    }
+
+    /// Dropping an attempt refuses it: the client is told at once rather than
+    /// left to time out (issue #207).
+    #[tokio::test]
+    async fn a_dropped_attempt_is_refused_at_once() {
+        let server = server_endpoint();
+        let addr = server.local_addr().unwrap();
+        let mut listener = QuicListener::new(server);
+        let client_side = connect_and_open(addr);
+
+        let attempt = tokio::time::timeout(WAIT, listener.accept())
+            .await
+            .expect("an attempt arrives")
+            .expect("accept");
+        drop(attempt);
+
+        let refused = tokio::time::timeout(WAIT, client_side)
+            .await
+            .expect("refused well inside the idle timeout")
+            .expect("client");
+        let err = refused.expect_err("the connect fails");
+        assert!(err.contains("refused"), "refused, got: {err}");
+    }
+
+    /// `serve` retries unvalidated QUIC clients when told to (a threshold of
+    /// zero), and a retried client still gets through to `on_session`.
+    #[tokio::test]
+    async fn serve_admits_a_client_after_retrying_it() {
+        use crate::transport::{HandshakeLimits, IncomingSession, serve};
+
+        let server = server_endpoint();
+        let addr = server.local_addr().unwrap();
+        let (tx, mut served) = tokio::sync::mpsc::unbounded_channel();
+        let serving = tokio::spawn(serve(
+            Box::new(QuicListener::new(server)),
+            HANDSHAKE_TIMEOUT,
+            HandshakeLimits::new(4, 4, 0).unwrap(),
+            Arc::new(move |session: IncomingSession| {
+                let _ = tx.send(session.kind());
+            }),
+        ));
+        let client_side = connect_and_open(addr);
+
+        let kind = tokio::time::timeout(WAIT, served.recv()).await;
+        assert_eq!(kind.expect("served"), Some(TransportKind::Quic));
+        let connected = tokio::time::timeout(WAIT, client_side).await;
+        connected
+            .expect("bounded")
+            .expect("client")
+            .expect("connected");
+        serving.abort();
     }
 }
