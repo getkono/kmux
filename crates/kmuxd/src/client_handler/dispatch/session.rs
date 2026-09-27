@@ -111,11 +111,9 @@ pub(super) async fn on_session_list(state: &mut SharedClientState, request_id: R
     // Merge locally-hosted sessions with every open peer's proxied
     // sessions (local IDs, peer-decorated names). Federation off ⇒ the
     // federated list is empty and this is the original behaviour.
-    let mut sessions = state.app.list_sessions().await;
-    sessions.extend(state.app.list_federated_sessions());
     state.send(ServerMessage::SessionListResult {
         request_id,
-        sessions,
+        sessions: state.app.all_sessions().await,
     });
 }
 

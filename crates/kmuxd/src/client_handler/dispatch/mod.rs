@@ -380,6 +380,17 @@ pub(super) mod testing {
         protocol_capabilities: Vec<String>,
     ) {
         let identity = kmux_sys::identity::Identity::generate();
+        authenticate_as(state, &identity, protocol_capabilities, None).await;
+    }
+
+    /// Run the whole handshake as `identity`, resuming `connection_id` if one
+    /// is given.
+    pub(super) async fn authenticate_as(
+        state: &mut SharedClientState,
+        identity: &kmux_sys::identity::Identity,
+        protocol_capabilities: Vec<String>,
+        connection_id: Option<kmux_protocol::messages::ConnectionId>,
+    ) {
         // Step 1: Auth → the daemon stashes a challenge in `state.pending_auth`.
         let ok = handle_message(
             state,
@@ -388,7 +399,7 @@ pub(super) mod testing {
                 protocol_range: PROTOCOL_RANGE,
                 protocol_capabilities,
                 capabilities: ClientCapabilities::default(),
-                connection_id: None,
+                connection_id,
                 public_key: identity.public_key_bytes().to_vec(),
                 hostname: "host".to_string(),
                 username: "user".to_string(),

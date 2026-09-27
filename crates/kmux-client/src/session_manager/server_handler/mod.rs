@@ -1071,6 +1071,160 @@ mod tests {
         assert_eq!(inbound_msgs(&mgr), 1, "the frame is still accounted");
     }
 
+    // ── SessionListResult as a resync (issue #208) ──────────────────────────
+
+    /// A resync list is the whole truth: a session it no longer lists is
+    /// closed here as if its `SessionClosed` had arrived, and the view falls
+    /// back straight to one that survives — never through another that is
+    /// gone too.
+    #[test]
+    fn a_resync_list_closes_sessions_it_no_longer_lists() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        mgr.session_list.push(make_entry("crane"));
+        mgr.session_list.push(make_entry("heron"));
+        drain(&mut rx);
+
+        let events = mgr.handle_server_message(ServerMessage::SessionListResult {
+            request_id: kmux_protocol::messages::RESYNC_REQUEST_ID,
+            sessions: vec![make_entry("heron")],
+        });
+
+        let closed: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                SessionEvent::SessionClosed { word_id } => Some(word_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(closed, vec!["crane", "eagle"], "the viewed session last");
+        assert!(matches!(
+            events.last(),
+            Some(SessionEvent::SessionListReceived)
+        ));
+        let seen = observe(&mgr);
+        assert_eq!(seen.sessions, vec!["heron".to_string()]);
+        assert_eq!(seen.active_session.as_deref(), Some("heron"));
+        assert_eq!(seen.visible_panes, vec!["heron/0".to_string()]);
+        let attached: Vec<String> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|msg| match msg {
+                ClientMessage::Attach { pane_id, .. } => Some(pane_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attached, vec!["heron/0".to_string()]);
+    }
+
+    /// A resync list whose layout for the viewed tab changed (a split this
+    /// client missed) attaches the new pane and shows it, and stays on the
+    /// tab this client views even though the daemon's default tab moved.
+    #[test]
+    fn a_resync_list_reconciles_the_viewed_tab_with_its_layout() {
+        let (mut mgr, mut rx) = manager_on("eagle");
+        drain(&mut rx);
+        let mut split = make_entry("eagle");
+        split.panes.push(pane("eagle", 1));
+        split.panes.push(pane("eagle", 2));
+        split.tabs = vec![
+            tab(
+                0,
+                LayoutNode::Split {
+                    dir: SplitDir::Horizontal,
+                    ratios: vec![500, 500],
+                    children: vec![LayoutNode::single(0), LayoutNode::single(1)],
+                },
+                0,
+            ),
+            tab(1, LayoutNode::single(2), 2),
+        ];
+        split.active_tab = 1;
+
+        mgr.handle_server_message(ServerMessage::SessionListResult {
+            request_id: kmux_protocol::messages::RESYNC_REQUEST_ID,
+            sessions: vec![split],
+        });
+
+        let seen = observe(&mgr);
+        assert_eq!(seen.active_tab, Some(0));
+        assert_eq!(
+            seen.visible_panes,
+            vec!["eagle/0".to_string(), "eagle/1".to_string()]
+        );
+        let attached: Vec<String> = drain(&mut rx)
+            .into_iter()
+            .filter_map(|msg| match msg {
+                ClientMessage::Attach { pane_id, .. } => Some(pane_id),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(attached, vec!["eagle/1".to_string()]);
+    }
+
+    /// A viewed federated session keeps what it shows: the hub's cached
+    /// layout for it may be older than the layout updates this client
+    /// already applied.
+    #[test]
+    fn a_resync_list_leaves_a_viewed_federated_session_as_shown() {
+        let (mut mgr, mut rx) = manager_on("hawk");
+        drain(&mut rx);
+        let mut stale = make_entry("hawk");
+        stale.peer = Some("peer:1".to_string());
+        stale.panes.push(pane("hawk", 1));
+        stale.tabs = vec![tab(0, LayoutNode::single(1), 1)];
+
+        mgr.handle_server_message(ServerMessage::SessionListResult {
+            request_id: kmux_protocol::messages::RESYNC_REQUEST_ID,
+            sessions: vec![stale],
+        });
+
+        assert_eq!(observe(&mgr).visible_panes, vec!["hawk/0".to_string()]);
+        assert!(
+            drain(&mut rx).iter().all(|msg| !matches!(
+                msg,
+                ClientMessage::Attach { .. } | ClientMessage::Detach { .. }
+            )),
+            "nothing is attached or detached"
+        );
+    }
+
+    /// A viewed session showing nothing is selected afresh, which also
+    /// focuses a pane.
+    #[test]
+    fn a_resync_list_reselects_a_viewed_session_showing_nothing() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        mgr.visible_panes.clear();
+        mgr.active_pane = None;
+
+        mgr.handle_server_message(ServerMessage::SessionListResult {
+            request_id: kmux_protocol::messages::RESYNC_REQUEST_ID,
+            sessions: vec![make_entry("eagle")],
+        });
+
+        let seen = observe(&mgr);
+        assert_eq!(seen.visible_panes, vec!["eagle/0".to_string()]);
+        assert_eq!(seen.active_pane.as_deref(), Some("eagle/0"));
+    }
+
+    /// A viewed tab the list no longer has is replaced by the session's
+    /// listed active tab.
+    #[test]
+    fn a_resync_list_without_the_viewed_tab_selects_the_listed_one() {
+        let (mut mgr, _rx) = manager_on("eagle");
+        let mut moved = make_entry("eagle");
+        moved.panes = vec![pane("eagle", 3)];
+        moved.tabs = vec![tab(2, LayoutNode::single(3), 3)];
+        moved.active_tab = 2;
+
+        mgr.handle_server_message(ServerMessage::SessionListResult {
+            request_id: kmux_protocol::messages::RESYNC_REQUEST_ID,
+            sessions: vec![moved],
+        });
+
+        let seen = observe(&mgr);
+        assert_eq!(seen.active_tab, Some(2));
+        assert_eq!(seen.visible_panes, vec!["eagle/3".to_string()]);
+    }
+
     // ── ClosedSessionListResult ─────────────────────────────────────────────
 
     #[test]

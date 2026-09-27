@@ -523,6 +523,11 @@ impl ConnectionMetrics {
 /// Per-connection state tracked by `ServerApp` for channel switching.
 struct ConnectionState {
     client_id: ClientId,
+    /// Bumped by every resume of this connection (issue #208). The loop that
+    /// holds the current value owns the registration; a loop superseded by a
+    /// resume finds its value stale at teardown and leaves the registration,
+    /// and the attachments the new channel made, alone.
+    generation: u64,
     transport: TransportKind,
     metrics: Arc<ConnectionMetrics>,
     /// Cryptographic identity fingerprint (hex SHA-256 of the public key) of the
@@ -571,8 +576,29 @@ pub struct ClientIdentity {
 pub struct RegisteredClient {
     pub client_id: ClientId,
     pub connection_id: ConnectionId,
+    /// The registration generation this channel holds; handed back to
+    /// [`ServerApp::release_connection`] at teardown.
+    pub generation: u64,
     pub previous_transport: Option<TransportKind>,
     pub label: String,
+    /// Whether this channel resumed an existing registration, and if it
+    /// asked to and was refused, why. Logged with the authentication.
+    pub resume: Resume,
+}
+
+/// How a channel's request to resume a registration went (issue #208).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Resume {
+    /// No `connection_id` was presented: a fresh connection.
+    NotRequested,
+    /// The registration was taken over by this channel.
+    Resumed,
+    /// The `connection_id` names no live registration — the old channel's
+    /// loop already ended — so this is a fresh connection.
+    UnknownConnection,
+    /// The registration was made by another machine: refused, and this is a
+    /// fresh connection. A token alone takes nothing over.
+    OtherMachine,
 }
 
 /// Compose a user-readable connection label `username@hostname`, appending a
@@ -845,25 +871,20 @@ impl ServerApp {
         self.conn_count_tx.subscribe()
     }
 
-    /// Register a client connection, returning a `(ClientId, ConnectionId)` pair
-    /// and the `Arc<ConnectionMetrics>` to use for this connection going forward.
+    /// Register a freshly-connected client, or resume an existing connection
+    /// on a new channel (a transport switch, or a reconnect that arrives while
+    /// the old channel's loop is still alive).
     ///
-    /// If `incoming_conn_id` is `Some`, the client is resuming an existing
-    /// connection (channel switch). The transport label is updated and the
-    /// *existing* `Arc<ConnectionMetrics>` is returned so byte counters accumulate
-    /// across transport switches.  `new_metrics` is discarded in that case.
-    /// If `None`, a fresh `ClientId` and `ConnectionId` are assigned and
-    /// `new_metrics` is stored.
-    /// Register a freshly-connected client or resume an existing connection
-    /// after a channel switch.
-    ///
-    /// Returns a [`RegisteredClient`] whose `previous_transport` is `Some(old)`
-    /// when a channel switch is in progress (the caller must remember this and
-    /// send it back in `ChannelSwitched` once the new channel signals
-    /// `ChannelReady`); `None` when this is the first connection for the `conn_id`.
-    /// `identity` is the verified cryptographic identity (issue #146); on a fresh
-    /// connection the daemon assigns a unique user-readable `label` derived from
-    /// it. On resume the existing connection's label/identity are kept.
+    /// A resume needs `incoming_conn_id` to name a live registration **and**
+    /// `identity.machine_id` to equal the one that registration was made with
+    /// (issue #208): a token alone does not let one machine take over another's
+    /// connection and its attachments. A resume bumps the registration's
+    /// generation and returns `previous_transport: Some(old)`, which the caller
+    /// sends back in `ChannelSwitched` once the new channel signals
+    /// `ChannelReady`; the label and identity are kept. Anything else — no id,
+    /// an unknown id, or a different machine — registers a fresh connection
+    /// with fresh ids and a label derived from `identity`, and `new_metrics` is
+    /// stored for it.
     pub async fn register_client(
         &self,
         transport: TransportKind,
@@ -871,21 +892,18 @@ impl ServerApp {
         incoming_conn_id: Option<ConnectionId>,
         identity: ClientIdentity,
     ) -> RegisteredClient {
-        if let Some(conn_id) = incoming_conn_id {
-            // Resume an existing connection (channel switch in progress).
-            let mut conns = self.connections.write().await;
-            if let Some(state) = conns.get_mut(&conn_id.0) {
-                let previous = state.transport;
-                state.transport = transport;
-                return RegisteredClient {
-                    client_id: state.client_id,
-                    connection_id: conn_id,
-                    previous_transport: Some(previous),
-                    label: state.label.clone(),
-                };
+        let resume = match incoming_conn_id {
+            None => Resume::NotRequested,
+            Some(conn_id) => {
+                match self
+                    .resume_connection(conn_id, transport, &identity.machine_id)
+                    .await
+                {
+                    Ok(resumed) => return resumed,
+                    Err(refused) => refused,
+                }
             }
-            // Unknown ConnectionId — treat as a fresh connection.
-        }
+        };
         let client_id = ClientId(self.next_client_id.fetch_add(1, Ordering::Relaxed));
         let conn_id = ConnectionId(self.next_connection_id.fetch_add(1, Ordering::Relaxed));
         let (label, count) = {
@@ -895,6 +913,7 @@ impl ServerApp {
                 conn_id.0,
                 ConnectionState {
                     client_id,
+                    generation: 0,
                     transport,
                     metrics: new_metrics,
                     machine_id: identity.machine_id,
@@ -913,19 +932,60 @@ impl ServerApp {
         RegisteredClient {
             client_id,
             connection_id: conn_id,
+            generation: 0,
             previous_transport: None,
             label,
+            resume,
         }
     }
 
-    /// Remove the connection entry when a client disconnects.
-    pub async fn unregister_client(&self, conn_id: ConnectionId) {
+    /// Take over the registration `conn_id` for a new channel, if it is live
+    /// and was made by `machine_id`. An `Err` says why not; the caller then
+    /// registers a fresh connection.
+    async fn resume_connection(
+        &self,
+        conn_id: ConnectionId,
+        transport: TransportKind,
+        machine_id: &str,
+    ) -> Result<RegisteredClient, Resume> {
+        let mut conns = self.connections.write().await;
+        let state = conns.get_mut(&conn_id.0).ok_or(Resume::UnknownConnection)?;
+        if state.machine_id != machine_id {
+            return Err(Resume::OtherMachine);
+        }
+        let previous = state.transport;
+        state.transport = transport;
+        state.generation += 1;
+        let resumed = RegisteredClient {
+            client_id: state.client_id,
+            connection_id: conn_id,
+            generation: state.generation,
+            previous_transport: Some(previous),
+            label: state.label.clone(),
+            resume: Resume::Resumed,
+        };
+        drop(conns);
+        Ok(resumed)
+    }
+
+    /// End the registration `conn_id` when a channel's loop ends — but only if
+    /// `generation` is still the registration's current one (issue #208).
+    /// Returns whether it was: `false` means a resume superseded this channel,
+    /// and the registration now belongs to the channel that resumed it.
+    pub async fn release_connection(&self, conn_id: ConnectionId, generation: u64) -> bool {
         let count = {
             let mut conns = self.connections.write().await;
+            let current = conns
+                .get(&conn_id.0)
+                .is_some_and(|state| state.generation == generation);
+            if !current {
+                return false;
+            }
             conns.remove(&conn_id.0);
             conns.len()
         };
         let _ = self.conn_count_tx.send(count);
+        true
     }
 
     /// Snapshot all sessions and their attached connections for the `"sessions"`
@@ -1142,11 +1202,11 @@ mod tests {
         rx.changed().await.unwrap();
         assert_eq!(*rx.borrow(), 2);
 
-        app.unregister_client(c1).await;
+        assert!(app.release_connection(c1, 0).await);
         rx.changed().await.unwrap();
         assert_eq!(*rx.borrow(), 1);
 
-        app.unregister_client(c2).await;
+        assert!(app.release_connection(c2, 0).await);
         rx.changed().await.unwrap();
         assert_eq!(*rx.borrow(), 0);
     }
@@ -1303,7 +1363,7 @@ mod tests {
             .register_client(TransportKind::Uds, metrics, None, ClientIdentity::default())
             .await
             .connection_id;
-        app.unregister_client(conn_id).await;
+        assert!(app.release_connection(conn_id, 0).await);
 
         // After unregister, snapshot_sessions_with_connections returns no unattached.
         let snap = app.snapshot_sessions_with_connections().await;
@@ -1711,6 +1771,307 @@ mod tests {
         }
     }
 
+    // ─── Resume (issue #208) ──────────────────────────────────────────────────
+
+    fn machine(machine_id: &str) -> ClientIdentity {
+        ClientIdentity {
+            machine_id: machine_id.to_string(),
+            ..ClientIdentity::default()
+        }
+    }
+
+    /// A channel's state after it registered (or resumed) as `reg`.
+    fn channel_state(
+        app: &Arc<ServerApp>,
+        reg: &super::RegisteredClient,
+    ) -> crate::client_handler::SharedClientState {
+        let (mut state, _comp, _rx) =
+            crate::fixtures::fixture_client_state(Arc::clone(app), TransportKind::Tcp);
+        state.client_id = Some(reg.client_id);
+        state.connection_id = Some(reg.connection_id);
+        state.generation = reg.generation;
+        state
+    }
+
+    /// Attach `eagle/0` for `state`'s client through `state`'s own channel.
+    async fn attach_through(
+        app: &ServerApp,
+        state: &crate::client_handler::SharedClientState,
+        last_seqno: Option<kmux_protocol::messages::SequenceNo>,
+    ) -> AttachResult {
+        let params = AttachParams {
+            ctrl_tx: state.ctrl_tx.clone(),
+            ..attach_params(state.client_id.unwrap(), last_seqno)
+        };
+        app.attach(params).await.unwrap()
+    }
+
+    /// Which channel `client_id` is attached to `eagle/0` through, if any.
+    async fn eagle_attachment(
+        app: &ServerApp,
+        client_id: ClientId,
+    ) -> Option<crate::outbound::OutboundTx> {
+        app.sessions.read().await["eagle"].panes[&0]
+            .clients
+            .lock()
+            .unwrap()
+            .get(&client_id)
+            .map(|sender| sender.ctrl_tx.clone())
+    }
+
+    /// A resume bumps the generation; when the superseded channel's loop ends
+    /// afterwards, the connection stays registered and the pane the new
+    /// channel re-attached stays attached. Before, the old loop's teardown
+    /// detached and unregistered the channel that had just taken over.
+    #[tokio::test]
+    async fn a_superseded_channel_ending_leaves_the_resumed_connection_intact() {
+        let app = Arc::new(app_with_one_pane("eagle").await);
+        let first = app
+            .register_client(
+                TransportKind::Tcp,
+                Arc::new(ConnectionMetrics::new()),
+                None,
+                machine("m-a"),
+            )
+            .await;
+        let old = channel_state(&app, &first);
+        attach_through(&app, &old, None).await;
+
+        let resumed = app
+            .register_client(
+                TransportKind::Quic,
+                Arc::new(ConnectionMetrics::new()),
+                Some(first.connection_id),
+                machine("m-a"),
+            )
+            .await;
+        assert_eq!(first.resume, super::Resume::NotRequested);
+        assert_eq!(
+            (
+                resumed.client_id,
+                resumed.connection_id,
+                resumed.generation,
+                resumed.resume
+            ),
+            (
+                first.client_id,
+                first.connection_id,
+                1,
+                super::Resume::Resumed
+            )
+        );
+        let new = channel_state(&app, &resumed);
+        attach_through(&app, &new, None).await;
+
+        crate::client_handler::release_channel(&old).await;
+        let snap = app.snapshot_sessions_with_connections().await;
+        let listed: Vec<_> = snap.sessions[0]
+            .connections
+            .iter()
+            .map(|c| (c.connection_id, c.transport.clone()))
+            .collect();
+        assert_eq!(listed, vec![(first.connection_id.0, "QUIC".to_string())]);
+        let attached = eagle_attachment(&app, first.client_id).await.unwrap();
+        assert!(
+            attached.same_channel(&new.ctrl_tx),
+            "the new channel's attachment stays"
+        );
+
+        // The current channel ending releases both.
+        crate::client_handler::release_channel(&new).await;
+        let snap = app.snapshot_sessions_with_connections().await;
+        assert!(snap.sessions[0].connections.is_empty());
+        assert!(snap.unattached.is_empty());
+        assert!(eagle_attachment(&app, first.client_id).await.is_none());
+    }
+
+    /// A pane only the superseded channel still held is released when that
+    /// channel ends; the resumed connection is not.
+    #[tokio::test]
+    async fn a_superseded_channel_ending_releases_only_its_own_attachments() {
+        let app = Arc::new(app_with_one_pane("eagle").await);
+        let first = app
+            .register_client(
+                TransportKind::Tcp,
+                Arc::new(ConnectionMetrics::new()),
+                None,
+                machine("m-a"),
+            )
+            .await;
+        let old = channel_state(&app, &first);
+        attach_through(&app, &old, None).await;
+        let resumed = app
+            .register_client(
+                TransportKind::Quic,
+                Arc::new(ConnectionMetrics::new()),
+                Some(first.connection_id),
+                machine("m-a"),
+            )
+            .await;
+
+        crate::client_handler::release_channel(&old).await;
+        assert!(eagle_attachment(&app, first.client_id).await.is_none());
+        assert!(
+            app.release_connection(resumed.connection_id, resumed.generation)
+                .await,
+            "the registration is still the resumed channel's to release"
+        );
+    }
+
+    /// Resuming with another machine's identity takes nothing over: the
+    /// caller gets a fresh connection, and the original keeps its own.
+    #[tokio::test]
+    async fn resume_with_another_machines_identity_registers_a_fresh_connection() {
+        let app = crate::fixtures::fixture_app();
+        let first = app
+            .register_client(
+                TransportKind::Tcp,
+                Arc::new(ConnectionMetrics::new()),
+                None,
+                machine("m-a"),
+            )
+            .await;
+        let other = app
+            .register_client(
+                TransportKind::Tcp,
+                Arc::new(ConnectionMetrics::new()),
+                Some(first.connection_id),
+                machine("m-b"),
+            )
+            .await;
+        assert_ne!(other.client_id, first.client_id);
+        assert_ne!(other.connection_id, first.connection_id);
+        assert_eq!(other.generation, 0);
+        assert!(other.previous_transport.is_none());
+        assert_eq!(other.resume, super::Resume::OtherMachine);
+        assert!(
+            app.release_connection(first.connection_id, first.generation)
+                .await,
+            "the original registration is untouched"
+        );
+    }
+
+    /// Only the generation a registration currently holds releases it.
+    #[tokio::test]
+    async fn release_connection_honours_only_the_current_generation() {
+        let app = crate::fixtures::fixture_app();
+        let first = app
+            .register_client(
+                TransportKind::Tcp,
+                Arc::new(ConnectionMetrics::new()),
+                None,
+                machine("m-a"),
+            )
+            .await;
+        let resumed = app
+            .register_client(
+                TransportKind::Tcp,
+                Arc::new(ConnectionMetrics::new()),
+                Some(first.connection_id),
+                machine("m-a"),
+            )
+            .await;
+        assert!(!app.release_connection(first.connection_id, 0).await);
+        assert!(app.release_connection(first.connection_id, 1).await);
+        assert!(
+            !app.release_connection(resumed.connection_id, 1).await,
+            "a released registration is gone"
+        );
+
+        // A resume after the registration is released is a fresh connection.
+        let late = app
+            .register_client(
+                TransportKind::Tcp,
+                Arc::new(ConnectionMetrics::new()),
+                Some(first.connection_id),
+                machine("m-a"),
+            )
+            .await;
+        assert_eq!(late.resume, super::Resume::UnknownConnection);
+        assert_ne!(late.connection_id, first.connection_id);
+    }
+
+    /// A session list names the local sessions, then every open peer's
+    /// proxied ones — what `SessionList` answers and a lag resync sends.
+    #[tokio::test]
+    async fn all_sessions_lists_local_sessions_then_federated_ones() {
+        let app = app_with_one_pane("eagle").await;
+        let (_upstream, _peer) = app.install_channel_peer("fedlocal", "fedremote");
+        let words = |entries: Vec<kmux_protocol::messages::SessionEntry>| -> Vec<String> {
+            entries.into_iter().map(|e| e.meta.word_id).collect()
+        };
+        assert_eq!(words(app.list_sessions().await), vec!["eagle"]);
+        assert_eq!(words(app.all_sessions().await), vec!["eagle", "fedlocal"]);
+    }
+
+    /// A client that resumes re-attaches each pane with the last seqno it
+    /// applied and is sent exactly what it missed; one whose seqno is older
+    /// than the pane's retained diffs is reset to a fresh snapshot.
+    #[tokio::test]
+    async fn a_resumed_client_is_replayed_from_its_last_seqno() {
+        use kmux_protocol::messages::{SequenceNo, ServerMessage};
+
+        let app = Arc::new(app_with_one_pane("eagle").await);
+        let first = app
+            .register_client(
+                TransportKind::Tcp,
+                Arc::new(ConnectionMetrics::new()),
+                None,
+                machine("m-a"),
+            )
+            .await;
+        attach_through(&app, &channel_state(&app, &first), None).await;
+        // The pane advances past what the client applied (seqno 6)…
+        let sessions = app.sessions.read().await;
+        push_seqnos(&sessions["eagle"].panes[&0], 3..=10);
+        sessions["eagle"].panes[&0]
+            .seqno_counter
+            .store(11, Ordering::Relaxed);
+        drop(sessions);
+        let resumed = app
+            .register_client(
+                TransportKind::Quic,
+                Arc::new(ConnectionMetrics::new()),
+                Some(first.connection_id),
+                machine("m-a"),
+            )
+            .await;
+        let new = channel_state(&app, &resumed);
+
+        // …and the resumed channel is sent exactly the missing diffs.
+        let replay = crate::client_handler::build_attach_replay(
+            attach_through(&app, &new, Some(SequenceNo(6))).await,
+            "eagle/0",
+        );
+        let seqnos: Vec<u64> = replay
+            .iter()
+            .map(|msg| match msg {
+                ServerMessage::TerminalUpdate { seqno, .. } => seqno.0,
+                other => panic!("expected only diffs, got {other:?}"),
+            })
+            .collect();
+        assert_eq!(seqnos, vec![7, 8, 9, 10]);
+
+        // A seqno older than the retained diffs (the oldest is 3) resets.
+        let replay = crate::client_handler::build_attach_replay(
+            attach_through(&app, &new, Some(SequenceNo(1))).await,
+            "eagle/0",
+        );
+        assert!(
+            matches!(
+                replay.as_slice(),
+                [
+                    ServerMessage::SyncReset { .. },
+                    ServerMessage::TerminalSnapshot {
+                        seqno: SequenceNo(10),
+                        ..
+                    }
+                ]
+            ),
+            "{replay:?}"
+        );
+    }
+
     #[tokio::test]
     async fn set_paused_marks_client_across_panes() {
         let app = app_with_one_pane("eagle").await;
@@ -1801,6 +2162,7 @@ mod tests {
         use std::collections::HashMap;
         let mk = |label: &str| super::ConnectionState {
             client_id: ClientId(0),
+            generation: 0,
             transport: TransportKind::Uds,
             metrics: Arc::new(ConnectionMetrics::new()),
             machine_id: String::new(),

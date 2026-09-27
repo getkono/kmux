@@ -4,8 +4,8 @@ use std::sync::atomic::AtomicU64;
 
 use kmux_protocol::format_pane_id;
 use kmux_protocol::messages::{
-    ClientCapabilities, LayoutNode, PaneId, PaneInfo, PaneProcesses, SessionEntry, SessionMeta,
-    SessionStatus, TermSize, epoch_millis,
+    ClientCapabilities, LayoutNode, PaneId, PaneInfo, PaneProcesses, ServerMessage, SessionEntry,
+    SessionMeta, SessionStatus, TermSize, epoch_millis,
 };
 use kmux_pty::error::{KmuxError, Result};
 
@@ -195,11 +195,50 @@ impl ServerApp {
 
     /// List all active sessions with their pane metadata.
     pub async fn list_sessions(&self) -> Vec<SessionEntry> {
-        let sessions = self.sessions.read().await;
+        Self::sorted_entries(&*self.sessions.read().await)
+    }
+
+    /// The entries of `sessions`, in creation order.
+    fn sorted_entries(
+        sessions: &std::collections::HashMap<kmux_protocol::messages::WordId, SessionState>,
+    ) -> Vec<SessionEntry> {
         let mut entries: Vec<SessionEntry> =
             sessions.values().map(Self::build_session_entry).collect();
         entries.sort_by_key(|e| e.meta.index);
         entries
+    }
+
+    /// Every session a client can see: the locally hosted ones, then every
+    /// open peer's proxied ones (local IDs, peer-decorated names). What
+    /// `SessionList` answers.
+    pub async fn all_sessions(&self) -> Vec<SessionEntry> {
+        let mut sessions = self.list_sessions().await;
+        sessions.extend(self.list_federated_sessions());
+        sessions
+    }
+
+    /// Queue on `out` an unsolicited `SessionListResult` (`RESYNC_REQUEST_ID`)
+    /// carrying every session with its tabs and layouts: what a connection
+    /// that missed server events is sent so it converges (issue #208).
+    ///
+    /// It is queued while the session map is still read-locked. A local
+    /// session created or closed concurrently therefore either shows in the
+    /// list or completes after it — and its own reply, queued after the
+    /// write lock, reaches the client after the list — so a list taken just
+    /// before a create cannot arrive after its `SessionCreated` and undo it.
+    pub async fn send_session_list_resync(
+        &self,
+        out: &crate::outbound::OutboundTx,
+    ) -> std::result::Result<(), crate::outbound::OutboundClosed> {
+        let sessions = self.sessions.read().await;
+        let mut entries = Self::sorted_entries(&sessions);
+        entries.extend(self.list_federated_sessions());
+        let sent = out.send(ServerMessage::SessionListResult {
+            request_id: kmux_protocol::messages::RESYNC_REQUEST_ID,
+            sessions: entries,
+        });
+        drop(sessions);
+        sent
     }
 
     /// Sample the process tree of every locally-hosted pane (issue #122).
