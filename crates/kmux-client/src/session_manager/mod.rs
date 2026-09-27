@@ -171,6 +171,13 @@ pub struct SessionManager {
     /// (QUIC ↔ TCP) so the daemon can transfer pane attachments to the new channel.
     pub connection_id: Option<ConnectionId>,
 
+    /// The pid of the daemon the last link reached, when known. A new link
+    /// to the same pid may resume panes from their seqnos; another pid is
+    /// another daemon run, whose seqnos start over (issue #208).
+    daemon_pid: Option<u32>,
+    /// The pid the link before the last one reached.
+    previous_daemon_pid: Option<u32>,
+
     /// The active transport kind (QUIC or TCP).
     pub current_transport: TransportKind,
 
@@ -254,6 +261,8 @@ impl SessionManager {
             negotiated_protocol: None,
             negotiated_capabilities: Vec::new(),
             connection_id: None,
+            daemon_pid: None,
+            previous_daemon_pid: None,
             current_transport: TransportKind::Quic,
             last_term_size: TermSize::default(),
             connection_state: ConnectionState::Idle,
@@ -512,15 +521,16 @@ impl SessionManager {
         });
     }
 
-    /// Re-attach every visible pane on a new link (issue #208). A pane in sync
-    /// resumes from the last seqno it applied, so the daemon replays just what
-    /// it missed (or resets it past its retained diffs); any other pane is
-    /// attached afresh. Nothing is visible on a first connect, so this only
-    /// acts on a reconnect.
-    pub(super) fn resume_visible_panes(&mut self) {
+    /// Re-attach every visible pane on a new link (issue #208). On the same
+    /// daemon run a pane in sync resumes from the last seqno it applied, so
+    /// the daemon replays just what it missed (or resets it past its retained
+    /// diffs); any other pane — and every pane on another daemon run, whose
+    /// seqnos start over — is attached afresh. Nothing is visible on a first
+    /// connect, so this only acts on a reconnect.
+    pub(super) fn resume_visible_panes(&mut self, same_daemon: bool) {
         for pane_id in self.visible_panes.clone() {
             match self.pane_sync.get(&pane_id) {
-                Some(PaneSync::Synced { expected }) => {
+                Some(PaneSync::Synced { expected }) if same_daemon => {
                     let last_seqno = SequenceNo(expected.0.saturating_sub(1));
                     self.attach_with(pane_id, Some(last_seqno));
                 }
@@ -694,6 +704,52 @@ mod tests {
     /// Before, a reconnect re-attached nothing and the panes stayed blank.
     #[test]
     fn a_new_link_resumes_every_visible_pane_from_its_last_seqno() {
+        let (attached, mgr) = reconnect_to_daemon(Some(7), Some(7));
+        assert!(mgr.link_reached_same_daemon());
+        assert_eq!(
+            attached,
+            vec![
+                ("eagle/0".to_string(), Some(SequenceNo(41))),
+                ("eagle/1".to_string(), None),
+            ]
+        );
+        assert!(
+            matches!(
+                mgr.pane_sync.get("eagle/0"),
+                Some(PaneSync::Synced { expected }) if expected.0 == 42
+            ),
+            "a resumed pane stays in sync to take the replayed diffs"
+        );
+    }
+
+    /// A new link to another daemon run (another pid, as after a restart or
+    /// a handoff) — or to one whose pid is unknown — attaches every pane
+    /// afresh: that run's seqnos start over, so an old run's seqno would ask
+    /// for the wrong diffs.
+    #[test]
+    fn a_new_link_to_another_daemon_run_attaches_every_pane_afresh() {
+        for (before, after) in [(Some(7), Some(8)), (Some(7), None), (None, None)] {
+            let (attached, mgr) = reconnect_to_daemon(before, after);
+            assert!(!mgr.link_reached_same_daemon());
+            assert_eq!(
+                attached,
+                vec![("eagle/0".to_string(), None), ("eagle/1".to_string(), None)],
+                "pid {before:?} then {after:?}"
+            );
+            assert!(matches!(
+                mgr.pane_sync.get("eagle/0"),
+                Some(PaneSync::AwaitingSync)
+            ));
+        }
+    }
+
+    /// A manager showing `eagle/0` (in sync, expecting seqno 42) and `eagle/1`
+    /// (awaiting its snapshot) on a link to daemon pid `before`, reconnected
+    /// to pid `after`: the `Attach`es the new link carried, and the manager.
+    fn reconnect_to_daemon(
+        before: Option<u32>,
+        after: Option<u32>,
+    ) -> (Vec<(String, Option<SequenceNo>)>, SessionManager) {
         use kmux_protocol::messages::ConnectionId;
 
         use crate::connection_state::DisconnectReason;
@@ -701,6 +757,7 @@ mod tests {
         use crate::transport::TransportKind;
 
         let (mut mgr, _old_rx) = make_connected_manager();
+        mgr.daemon_pid = before;
         mgr.visible_panes = vec!["eagle/0".to_string(), "eagle/1".to_string()];
         mgr.pane_sync.insert(
             "eagle/0".to_string(),
@@ -726,6 +783,7 @@ mod tests {
             is_local: true,
             ssh_context: None,
             bootstrap_elapsed: std::time::Duration::ZERO,
+            daemon_pid: after,
         });
 
         let mut attached = Vec::new();
@@ -739,20 +797,36 @@ mod tests {
                 attached.push((pane_id, last_seqno));
             }
         }
-        assert_eq!(
-            attached,
-            vec![
-                ("eagle/0".to_string(), Some(SequenceNo(41))),
-                ("eagle/1".to_string(), None),
-            ]
-        );
+        (attached, mgr)
+    }
+
+    /// The input builders address the active pane, and `send_prepared` puts
+    /// a built message on the link as it is (issue #208).
+    #[test]
+    fn input_builders_address_the_active_pane_and_send_prepared_sends_it() {
+        let (mut mgr, mut rx) = make_connected_manager();
+        mgr.active_pane = Some("eagle/0".to_string());
+
+        let keys = mgr.key_batch_message(vec![enter_key()]);
         assert!(
-            matches!(
-                mgr.pane_sync.get("eagle/0"),
-                Some(PaneSync::Synced { expected }) if expected.0 == 42
-            ),
-            "a resumed pane stays in sync to take the replayed diffs"
+            matches!(&keys, Ok(ClientMessage::PtyKeyBatch { pane_id, events }) if pane_id == "eagle/0" && events.len() == 1)
         );
+        assert!(matches!(
+            mgr.paste_message("hi".to_string()),
+            Ok(ClientMessage::PtyPaste { pane_id, data }) if pane_id == "eagle/0" && data == "hi"
+        ));
+        assert!(matches!(
+            mgr.input_message(vec![1]),
+            Ok(ClientMessage::PtyInput { pane_id, data }) if pane_id == "eagle/0" && data == [1]
+        ));
+        assert!(matches!(mgr.key_batch_message(vec![]), Err(true)));
+        assert!(matches!(mgr.paste_message(String::new()), Err(true)));
+
+        mgr.send_prepared(keys.unwrap_or_else(|_| unreachable!("built above")));
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMessage::PtyKeyBatch { pane_id, .. }) if pane_id == "eagle/0"
+        ));
     }
 
     fn make_entry(word_id: &str, cwd: &str) -> SessionEntry {

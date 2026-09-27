@@ -29,6 +29,11 @@ pub const OUTAGE_INPUT_CAPACITY: usize = 256;
 /// dropped, so the notice outlives the outage long enough to be read.
 pub const DROPPED_NOTICE: Duration = Duration::from_secs(8);
 
+/// The oldest held input is delivered at most this long after it was typed.
+/// Past it the whole buffer is dropped (and counted) rather than typed into
+/// a pane whose foreground program may no longer be the one the user saw.
+pub const OUTAGE_INPUT_MAX_AGE: Duration = Duration::from_secs(30);
+
 /// The reconnect schedule of one link.
 #[derive(Debug, Clone)]
 pub struct Reconnect {
@@ -141,6 +146,8 @@ impl Reconnect {
 pub struct OutageInput {
     queued: VecDeque<ClientMessage>,
     keystrokes: usize,
+    /// When the oldest input still held was typed.
+    first_held_at: Option<Instant>,
     dropped: u64,
     dropped_notice_until: Option<Instant>,
 }
@@ -154,14 +161,15 @@ fn keystrokes(msg: &ClientMessage) -> usize {
 }
 
 impl OutageInput {
-    /// Keep `msg` for delivery on reconnect, or count it as dropped when it
-    /// does not fit.
-    pub fn push(&mut self, msg: ClientMessage) {
+    /// Keep `msg`, typed at `now`, for delivery on reconnect, or count it as
+    /// dropped when it does not fit.
+    pub fn push(&mut self, msg: ClientMessage, now: Instant) {
         let weight = keystrokes(&msg);
         if self.keystrokes + weight > OUTAGE_INPUT_CAPACITY {
             self.dropped += weight as u64;
         } else {
             self.keystrokes += weight;
+            self.first_held_at.get_or_insert(now);
             self.queued.push_back(msg);
         }
     }
@@ -182,14 +190,28 @@ impl OutageInput {
         self.dropped_notice_until = None;
     }
 
-    /// Everything kept, oldest first, for sending on reconnect at `now`. What
-    /// the outage dropped stays reported for [`DROPPED_NOTICE`] after it.
-    pub fn flush(&mut self, now: Instant) -> Vec<ClientMessage> {
+    /// The link is back at `now`: everything kept, oldest first, to send. It
+    /// is all dropped (and counted) instead when `deliver` is false — the
+    /// link reached another daemon run, whose shells are not the ones typed
+    /// at — or when the oldest was typed more than [`OUTAGE_INPUT_MAX_AGE`]
+    /// ago. What the outage dropped stays reported for [`DROPPED_NOTICE`].
+    pub fn flush(&mut self, now: Instant, deliver: bool) -> Vec<ClientMessage> {
+        let stale = self
+            .first_held_at
+            .is_some_and(|typed| now.duration_since(typed) > OUTAGE_INPUT_MAX_AGE);
+        let held: Vec<ClientMessage> = self.queued.drain(..).collect();
+        let sent = if deliver && !stale {
+            held
+        } else {
+            self.dropped += self.keystrokes as u64;
+            Vec::new()
+        };
         self.keystrokes = 0;
+        self.first_held_at = None;
         if self.dropped > 0 {
             self.dropped_notice_until = Some(now + DROPPED_NOTICE);
         }
-        self.queued.drain(..).collect()
+        sent
     }
 
     /// Keystrokes dropped by an outage that ended shortly before `now`, while
@@ -410,17 +432,20 @@ mod tests {
     fn outage_input_keeps_up_to_capacity_in_order_and_counts_the_rest() {
         let now = Instant::now();
         let mut input = OutageInput::default();
-        input.push(keys("eagle/0", "ls"));
-        input.push(ClientMessage::PtyPaste {
-            pane_id: "eagle/0".to_string(),
-            data: " -la".to_string(),
-        });
+        input.push(keys("eagle/0", "ls"), now);
+        input.push(
+            ClientMessage::PtyPaste {
+                pane_id: "eagle/0".to_string(),
+                data: " -la".to_string(),
+            },
+            now,
+        );
         let filler = "x".repeat(OUTAGE_INPUT_CAPACITY - 3);
-        input.push(keys("eagle/0", &filler));
+        input.push(keys("eagle/0", &filler), now);
         assert_eq!(input.queued(), OUTAGE_INPUT_CAPACITY);
         assert_eq!(input.dropped(), 0);
 
-        input.push(keys("eagle/0", "\r!"));
+        input.push(keys("eagle/0", "\r!"), now);
         assert_eq!(
             input.dropped(),
             2,
@@ -428,10 +453,41 @@ mod tests {
         );
         assert_eq!(input.queued(), OUTAGE_INPUT_CAPACITY);
 
-        let flushed = input.flush(now);
+        let flushed = input.flush(now, true);
         assert_eq!(typed(&flushed), format!("ls -la{filler}"));
         assert_eq!(input.queued(), 0);
-        assert!(input.flush(now).is_empty(), "a flush empties it");
+        assert!(input.flush(now, true).is_empty(), "a flush empties it");
+    }
+
+    /// Input is not delivered to another daemon run, nor once the oldest of
+    /// it is too old: it is all counted as dropped instead.
+    #[test]
+    fn outage_input_is_dropped_for_another_daemon_run_or_when_too_old() {
+        let t0 = Instant::now();
+        let mut input = OutageInput::default();
+        input.push(keys("eagle/0", "ls"), t0);
+        assert!(input.flush(t0, false).is_empty(), "another daemon run");
+        assert_eq!(input.dropped(), 2);
+        assert_eq!(input.queued(), 0);
+
+        input.begin();
+        input.push(keys("eagle/0", "ls"), t0);
+        input.push(keys("eagle/0", "\r"), t0 + OUTAGE_INPUT_MAX_AGE);
+        assert_eq!(
+            typed(&input.flush(t0 + OUTAGE_INPUT_MAX_AGE, true)),
+            "ls\r",
+            "at the limit it is still delivered"
+        );
+
+        input.push(keys("eagle/0", "ls"), t0);
+        let late = t0 + OUTAGE_INPUT_MAX_AGE + Duration::from_millis(1);
+        assert!(input.flush(late, true).is_empty(), "past it, not");
+        assert_eq!(input.dropped(), 2);
+
+        // The age runs from the oldest input still held.
+        input.begin();
+        input.push(keys("eagle/0", "a"), late);
+        assert_eq!(typed(&input.flush(late, true)), "a");
     }
 
     /// The dropped count is reported for a while after the outage, then reset.
@@ -440,8 +496,8 @@ mod tests {
         let now = Instant::now();
         let mut input = OutageInput::default();
         assert_eq!(input.dropped_notice(now), None);
-        input.push(keys("eagle/0", &"x".repeat(OUTAGE_INPUT_CAPACITY + 3)));
-        input.flush(now);
+        input.push(keys("eagle/0", &"x".repeat(OUTAGE_INPUT_CAPACITY + 3)), now);
+        input.flush(now, true);
 
         assert_eq!(input.dropped_notice(now + DROPPED_NOTICE / 2), Some(259));
         assert_eq!(input.dropped_notice(now + DROPPED_NOTICE), None);
@@ -457,8 +513,8 @@ mod tests {
     fn outage_input_with_nothing_dropped_reports_nothing() {
         let now = Instant::now();
         let mut input = OutageInput::default();
-        input.push(keys("eagle/0", "a"));
-        input.flush(now);
+        input.push(keys("eagle/0", "a"), now);
+        input.flush(now, true);
         assert_eq!(input.dropped_notice(now), None);
     }
 
@@ -479,8 +535,8 @@ mod tests {
         let mut reconnect = Reconnect::new(0);
         reconnect.on_lost(t0);
         let mut input = OutageInput::default();
-        input.push(keys("eagle/0", "ab"));
-        input.push(keys("eagle/0", &"x".repeat(OUTAGE_INPUT_CAPACITY)));
+        input.push(keys("eagle/0", "ab"), t0);
+        input.push(keys("eagle/0", &"x".repeat(OUTAGE_INPUT_CAPACITY)), t0);
 
         let banner = connection_banner(&reconnect, &input, t0).unwrap();
         assert_eq!(
@@ -530,8 +586,8 @@ mod tests {
         let now = Instant::now();
         let reconnect = Reconnect::new(0);
         let mut input = OutageInput::default();
-        input.push(keys("eagle/0", &"x".repeat(OUTAGE_INPUT_CAPACITY + 1)));
-        input.flush(now);
+        input.push(keys("eagle/0", &"x".repeat(OUTAGE_INPUT_CAPACITY + 1)), now);
+        input.flush(now, true);
 
         let banner = connection_banner(&reconnect, &input, now).unwrap();
         assert_eq!(

@@ -5,7 +5,7 @@
 use kmux_client::connection_state::{ConnectionState, DisconnectReason};
 #[cfg(feature = "remote")]
 use kmux_client::pipeline::SshContext;
-use kmux_client::pipeline::{self, BootstrapOutcome, NoopObserver, ResolvedTarget};
+use kmux_client::pipeline::{self, BootstrapError, BootstrapOutcome, NoopObserver, ResolvedTarget};
 use kmux_client::session_manager::SessionEvent;
 #[cfg(feature = "remote")]
 use kmux_client::supervisor::{SupervisorParams, TransportSupervisor, UpgradeSignal};
@@ -43,7 +43,24 @@ pub enum BootstrapPhase {
 /// Result sent from the background bootstrap task to the frontend's run loop.
 pub enum BootstrapTaskResult {
     Success(Box<BootstrapOutcome>),
+    /// It failed in a way a retry may get past (the daemon is starting,
+    /// restarting, or not answering).
     Failed(String),
+    /// The daemon refused this client — its protocol range or the token —
+    /// which retrying does not change (issue #208): automatic reconnect stops.
+    Refused(String),
+}
+
+/// The run loop's view of a finished bootstrap: a refusal is told apart from
+/// a failure a retry may get past.
+pub fn task_result(result: Result<BootstrapOutcome, BootstrapError>) -> BootstrapTaskResult {
+    match result {
+        Ok(outcome) => BootstrapTaskResult::Success(Box::new(outcome)),
+        Err(e @ (BootstrapError::VersionMismatch { .. } | BootstrapError::Auth(_))) => {
+            BootstrapTaskResult::Refused(e.to_string())
+        }
+        Err(e) => BootstrapTaskResult::Failed(e.to_string()),
+    }
 }
 
 /// Map an OSC 52 clipboard-write event to a clipboard effect, applying the
@@ -218,11 +235,17 @@ impl AppCore {
     /// sessions — not the pre-federation local list — drive the picker.
     fn on_peer_opened(&mut self, peer: String) -> Option<KeyResult> {
         info!(%peer, "federated peer opened");
-        self.peer_status.insert(peer, RemoteStatus::Connected);
+        let reopened =
+            self.peer_status.insert(peer, RemoteStatus::Connected) == Some(RemoteStatus::Connected);
         if matches!(self.mode, Mode::Connecting { .. }) {
             self.mode = Mode::Normal;
         }
-        self.did_auto_select = false;
+        // A peer re-federated after an automatic reconnect was already open:
+        // re-running the first-connect auto-select would put the session
+        // picker over the session the user is in (issue #208).
+        if !reopened {
+            self.did_auto_select = false;
+        }
         self.mgr.request_session_list();
         None
     }
@@ -674,14 +697,10 @@ impl AppCore {
                     srv_tx,
                     &NoopObserver,
                 ) => {
-                    let task_result = match result {
-                        Ok(outcome) => BootstrapTaskResult::Success(Box::new(outcome)),
-                        Err(e) => {
-                            warn!("bootstrap failed: {e}");
-                            BootstrapTaskResult::Failed(e.to_string())
-                        }
-                    };
-                    let _ = outcome_tx.send(task_result);
+                    if let Err(e) = &result {
+                        warn!("bootstrap failed: {e}");
+                    }
+                    let _ = outcome_tx.send(task_result(result));
                 }
             }
         });
@@ -999,6 +1018,77 @@ mod tests {
             saw_list,
             "PeerOpened must refresh the federated session list"
         );
+    }
+
+    /// A peer re-federated after a reconnect was already open: its
+    /// `PeerOpened` does not re-arm the first-connect auto-select, which
+    /// would pop the session picker over the session in use (issue #208).
+    #[test]
+    fn a_reopened_peer_does_not_rearm_auto_select() {
+        let mut core = fixture_core();
+        core.peer_status
+            .insert("alice@box".into(), RemoteStatus::Connected);
+        core.did_auto_select = true;
+
+        core.handle_session_events(vec![SessionEvent::PeerOpened {
+            peer: "alice@box".into(),
+        }]);
+
+        assert!(core.did_auto_select);
+        assert_eq!(
+            core.peer_status.get("alice@box"),
+            Some(&RemoteStatus::Connected)
+        );
+    }
+
+    /// The connecting overlay names what is being dialled, and whether it is
+    /// a reconnect.
+    #[test]
+    fn connecting_label_names_the_target_and_the_phase() {
+        use kmux_client::ssh::RemoteTarget;
+        assert_eq!(
+            connecting_label(&ResolvedTarget::LocalDaemon, false),
+            "Connecting to local daemon…"
+        );
+        assert_eq!(
+            connecting_label(&ResolvedTarget::LocalDaemon, true),
+            "Reconnecting to local daemon…"
+        );
+        let ssh = ResolvedTarget::Ssh {
+            target: RemoteTarget {
+                user: Some("alice".into()),
+                host: "box".into(),
+                ssh_port: None,
+            },
+            accept_invalid_certs: false,
+        };
+        assert_eq!(
+            connecting_label(&ssh, true),
+            "Reconnecting via SSH to alice@box…"
+        );
+    }
+
+    /// A refusal (protocol range, token) is told apart from a failure a
+    /// retry may get past, so automatic reconnect stops on it (issue #208).
+    #[test]
+    fn task_result_tells_a_refusal_from_a_failure() {
+        let refused = [
+            BootstrapError::Auth("bad token".into()),
+            BootstrapError::VersionMismatch {
+                client: "1.0.0".into(),
+                server: "2.0.0".into(),
+            },
+        ];
+        for e in refused {
+            assert!(matches!(
+                task_result(Err(e)),
+                BootstrapTaskResult::Refused(_)
+            ));
+        }
+        assert!(matches!(
+            task_result(Err(BootstrapError::DaemonStart("gone".into()))),
+            BootstrapTaskResult::Failed(reason) if reason == "daemon start failed: gone"
+        ));
     }
 
     #[test]

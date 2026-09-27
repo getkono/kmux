@@ -216,6 +216,9 @@ pub struct FrontendDriver {
     reconnect: Reconnect,
     /// Input typed while the link is down, delivered on reconnect.
     outage: OutageInput,
+    /// The banner last shown, so a tick repaints when it changes (a countdown
+    /// second, a notice expiring) and not otherwise.
+    last_banner: Option<ConnectionBanner>,
     /// Optional per-tick frame-trace sink (`KMUX_FRAME_TRACE`).
     trace: Option<ClientTraceSink>,
 }
@@ -271,6 +274,7 @@ impl FrontendDriver {
             trace: ClientTraceSink::from_env(),
             reconnect: Reconnect::new(kmux_client::backoff::jitter_seed()),
             outage: OutageInput::default(),
+            last_banner: None,
         }
     }
 
@@ -312,6 +316,7 @@ impl FrontendDriver {
         }
         dirty |= self.tick_liveness(now);
         dirty |= self.tick_reconnect(now);
+        dirty |= self.refresh_banner(now);
         // Refresh the process overview while it is open (issue #122).
         dirty |= self.tick_process_overview(now);
         // Refresh the connected-clients list while that view is open (issue #146).
@@ -446,6 +451,18 @@ impl FrontendDriver {
         self.core.mgr.begin_reconnect_attempt(1);
     }
 
+    /// Whether the banner changed since the last tick (a countdown second
+    /// passed, an attempt started, a notice expired) — then the frontend,
+    /// which reads the banner when it repaints, must repaint.
+    fn refresh_banner(&mut self, now: Instant) -> bool {
+        let banner = connection_banner(&self.reconnect, &self.outage, now);
+        if banner == self.last_banner {
+            return false;
+        }
+        self.last_banner = banner;
+        true
+    }
+
     /// Start the automatic reconnect attempt that is due at `now`, if any.
     fn tick_reconnect(&mut self, now: Instant) -> bool {
         let Some(attempt) = self.reconnect.take_due(now) else {
@@ -547,94 +564,106 @@ impl FrontendDriver {
                 Err(TryRecvError::Empty) => None,
                 Err(TryRecvError::Disconnected) => Some(Err(())),
             });
+        let Some(outcome) = outcome else {
+            return false;
+        };
+        // The bootstrap is over, whichever way it went.
+        self.core.cancel_tx = None;
+        self.bootstrap_rx = None;
         match outcome {
-            Some(Ok(BootstrapTaskResult::Success(o))) => {
-                self.core.cancel_tx = None;
-                // A later success clears any stashed failure so we don't re-print
-                // a stale error when the user finally quits.
-                self.core.last_exit_error = None;
-                let ssh_ctx = self.core.mgr.apply_outcome(*o);
-                #[cfg(feature = "remote")]
-                if let Some(ctx) = ssh_ctx {
-                    let srv_tx = self
-                        .core
-                        .pending_srv_tx
-                        .take()
-                        .expect("pending_srv_tx set in start_bootstrap");
-                    let upgrade_tx = self.upgrade_tx.clone();
-                    let tunnel_died_tx = self.tunnel_died_tx.clone();
-                    self.core
-                        .launch_ssh_supervisor(ctx, srv_tx, upgrade_tx, tunnel_died_tx);
-                } else {
-                    self.core.pending_srv_tx = None;
-                }
-                // Lean build: the bootstrap is always UDS-local, so `apply_outcome`
-                // returns no SSH context and there is nothing to supervise.
-                #[cfg(not(feature = "remote"))]
-                {
-                    let _ = ssh_ctx;
-                    self.core.pending_srv_tx = None;
-                }
-                self.core.reflect_bootstrap_outcome();
-                // The local link is up; if the user asked for a remote server,
-                // ask the daemon to federate it now (issue #121). Idempotent, so
-                // this also re-federates after a reconnect.
-                self.core.federate_desired_peer();
-                self.bootstrap_rx = None;
-                self.on_link_restored(now);
-                true
-            }
-            Some(Ok(BootstrapTaskResult::Failed(reason))) if self.reconnect.is_active() => {
-                self.core.cancel_tx = None;
+            Ok(BootstrapTaskResult::Success(o)) => self.on_bootstrap_success(*o, now),
+            Ok(BootstrapTaskResult::Failed(reason)) if self.reconnect.is_active() => {
                 self.core.pending_srv_tx = None;
-                self.bootstrap_rx = None;
                 self.reconnect.on_failed(now, reason);
-                true
             }
-            Some(Ok(BootstrapTaskResult::Failed(reason))) => {
-                self.core.cancel_tx = None;
-                self.core.pending_srv_tx = None;
-                // Stash so it survives teardown and is re-printed to stderr; the
-                // disconnect overlay shows the same text in-window.
-                self.core.last_exit_error = Some(reason.clone());
-                self.core
-                    .enter_disconnected(DisconnectReason::BootstrapFailed(reason));
-                self.bootstrap_rx = None;
-                true
+            Ok(BootstrapTaskResult::Failed(reason) | BootstrapTaskResult::Refused(reason)) => {
+                self.on_bootstrap_failure(reason, now);
             }
-            Some(Err(())) if self.reconnect.is_active() => {
-                // An automatic attempt ended without a result: count it failed.
-                self.core.cancel_tx = None;
+            // The channel closed with no result: an automatic attempt counts
+            // as failed; otherwise the bootstrap was cancelled
+            // (`Action::CancelBootstrap` dropped `cancel_tx`).
+            Err(()) if self.reconnect.is_active() => {
                 self.core.pending_srv_tx = None;
-                self.bootstrap_rx = None;
                 self.reconnect
                     .on_failed(now, "reconnect attempt cancelled".to_string());
-                true
             }
-            Some(Err(())) => {
-                // Channel closed with no result → the bootstrap was cancelled
-                // (cancel_tx dropped via Action::CancelBootstrap).
-                self.core.cancel_tx = None;
-                self.core.pending_srv_tx = None;
-                if matches!(self.core.mode, Mode::Connecting { .. }) {
-                    self.core
-                        .enter_disconnected(DisconnectReason::BootstrapFailed(
-                            "cancelled".to_string(),
-                        ));
-                }
-                self.bootstrap_rx = None;
-                true
-            }
-            None => false,
+            Err(()) => self.on_bootstrap_cancelled(),
+        }
+        true
+    }
+
+    /// A bootstrap succeeded: wire up the data plane (and the SSH supervisor),
+    /// re-federate, and end any outage.
+    fn on_bootstrap_success(&mut self, o: kmux_client::pipeline::BootstrapOutcome, now: Instant) {
+        // A later success clears any stashed failure so we don't re-print
+        // a stale error when the user finally quits.
+        self.core.last_exit_error = None;
+        let ssh_ctx = self.core.mgr.apply_outcome(o);
+        #[cfg(feature = "remote")]
+        if let Some(ctx) = ssh_ctx {
+            let srv_tx = self
+                .core
+                .pending_srv_tx
+                .take()
+                .expect("pending_srv_tx set in start_bootstrap");
+            let upgrade_tx = self.upgrade_tx.clone();
+            let tunnel_died_tx = self.tunnel_died_tx.clone();
+            self.core
+                .launch_ssh_supervisor(ctx, srv_tx, upgrade_tx, tunnel_died_tx);
+        } else {
+            self.core.pending_srv_tx = None;
+        }
+        // Lean build: the bootstrap is always UDS-local, so `apply_outcome`
+        // returns no SSH context and there is nothing to supervise.
+        #[cfg(not(feature = "remote"))]
+        {
+            let _ = ssh_ctx;
+            self.core.pending_srv_tx = None;
+        }
+        self.core.reflect_bootstrap_outcome();
+        // The local link is up; if the user asked for a remote server,
+        // ask the daemon to federate it now (issue #121). Idempotent, so
+        // this also re-federates after a reconnect.
+        self.core.federate_desired_peer();
+        self.on_link_restored(now);
+    }
+
+    /// A bootstrap failed for good — a first connect or a manual reconnect
+    /// that failed, or a refusal that ends automatic reconnect: surface it
+    /// behind the disconnected banner.
+    fn on_bootstrap_failure(&mut self, reason: String, now: Instant) {
+        self.core.pending_srv_tx = None;
+        self.end_outage(now, false);
+        // Stash so it survives teardown and is re-printed to stderr; the
+        // disconnect overlay shows the same text in-window.
+        self.core.last_exit_error = Some(reason.clone());
+        self.core
+            .enter_disconnected(DisconnectReason::BootstrapFailed(reason));
+    }
+
+    /// The user cancelled a bootstrap they started.
+    fn on_bootstrap_cancelled(&mut self) {
+        self.core.pending_srv_tx = None;
+        if matches!(self.core.mode, Mode::Connecting { .. }) {
+            self.core
+                .enter_disconnected(DisconnectReason::BootstrapFailed("cancelled".to_string()));
         }
     }
 
-    /// The link is up again at `now`: stop retrying and deliver, in order,
-    /// what was typed while it was down (issue #208). The panes were already
-    /// re-attached from their last seqno by `apply_outcome`.
+    /// The link is up again at `now`: stop retrying and deliver what was
+    /// typed while it was down (issue #208) — if the link reached the same
+    /// daemon run; to another run's shells it is dropped instead. The panes
+    /// were already re-attached by `apply_outcome`.
     fn on_link_restored(&mut self, now: Instant) {
+        let same_daemon = self.core.mgr.link_reached_same_daemon();
+        self.end_outage(now, same_daemon);
+    }
+
+    /// Stop retrying and settle the input held meanwhile: sent in order when
+    /// `deliver`, otherwise dropped (and counted).
+    fn end_outage(&mut self, now: Instant, deliver: bool) {
         self.reconnect.on_connected();
-        for msg in self.outage.flush(now) {
+        for msg in self.outage.flush(now, deliver) {
             self.core.mgr.send_prepared(msg);
         }
     }
@@ -848,7 +877,7 @@ impl FrontendDriver {
             return;
         };
         if self.reconnect.is_active() {
-            self.outage.push(msg);
+            self.outage.push(msg, Instant::now());
             self.core.request_render();
         } else {
             self.core.mgr.send_prepared(msg);
@@ -1079,6 +1108,7 @@ impl FrontendDriver {
             // Seed 0: no jitter, so a test can name every delay.
             reconnect: Reconnect::new(0),
             outage: OutageInput::default(),
+            last_banner: None,
         };
         (driver, srv_tx, bs_tx)
     }
@@ -1115,10 +1145,13 @@ mod tests {
     ) {
         let (mut driver, srv_tx, bs_tx) = FrontendDriver::for_test(fixture_core());
         let (tx, rx) = mpsc::unbounded_channel();
-        driver.core.mgr.set_ws_sender(tx);
+        driver.core.mgr.apply_outcome(link(tx, Some(DAEMON_PID)));
         driver.core.mgr.active_pane = Some("eagle/0".to_string());
         (driver, srv_tx, bs_tx, rx)
     }
+
+    /// The pid of the daemon `live_driver` is linked to.
+    const DAEMON_PID: u32 = 4242;
 
     /// A key typing `c`.
     fn typed(c: char) -> KeyEvent {
@@ -1145,10 +1178,18 @@ mod tests {
 
     /// A successful local bootstrap whose link sends into `tx`.
     fn outcome(tx: mpsc::UnboundedSender<ClientMessage>) -> BootstrapTaskResult {
+        BootstrapTaskResult::Success(Box::new(link(tx, Some(DAEMON_PID))))
+    }
+
+    /// A local link sending into `tx`, to daemon `pid`.
+    fn link(
+        tx: mpsc::UnboundedSender<ClientMessage>,
+        pid: Option<u32>,
+    ) -> kmux_client::pipeline::BootstrapOutcome {
         use kmux_client::pipeline::BootstrapOutcome;
         use kmux_client::transport::TransportKind as Link;
         use kmux_protocol::messages::ConnectionId;
-        BootstrapTaskResult::Success(Box::new(BootstrapOutcome {
+        BootstrapOutcome {
             client_tx: tx,
             transport: Link::Uds,
             host: String::new(),
@@ -1161,7 +1202,8 @@ mod tests {
             is_local: true,
             ssh_context: None,
             bootstrap_elapsed: Duration::ZERO,
-        }))
+            daemon_pid: pid,
+        }
     }
 
     /// A dropped link no longer freezes the UI behind a prompt: the mode is
@@ -1255,6 +1297,125 @@ mod tests {
         );
         let banner = driver.connection_banner().expect("a banner");
         assert!(banner.text.ends_with("— refused"), "{}", banner.text);
+    }
+
+    /// A dropped link whose attempt under way is refused (the protocol range
+    /// or the token) stops retrying: the banner is replaced by the
+    /// disconnected mode, and input held meanwhile is dropped and counted.
+    #[test]
+    fn a_refused_reconnect_attempt_stops_retrying() {
+        let (mut driver, srv_tx, bs_tx, _rx) = live_driver();
+        let t0 = Instant::now();
+        drop(srv_tx);
+        driver.tick_at(t0);
+        driver.send_keys(vec![typed('l')]);
+        driver.reconnect.retry_now(t0);
+        driver.reconnect.take_due(t0);
+
+        bs_tx
+            .send(BootstrapTaskResult::Refused("auth rejected".to_string()))
+            .unwrap();
+        driver.tick_at(t0);
+
+        assert!(!driver.reconnect.is_active());
+        assert!(matches!(driver.mode, Mode::Disconnected { .. }));
+        assert_eq!(driver.outage.dropped(), 1);
+        assert_eq!(driver.last_exit_error.as_deref(), Some("auth rejected"));
+    }
+
+    /// An automatic attempt whose task ends with no result counts as a
+    /// failed attempt; a cancelled manual bootstrap is a disconnect.
+    #[test]
+    fn a_bootstrap_ending_without_a_result_is_a_failed_attempt_or_a_cancel() {
+        let (mut driver, srv_tx, bs_tx, _rx) = live_driver();
+        let t0 = Instant::now();
+        drop(srv_tx);
+        driver.tick_at(t0);
+        driver.reconnect.retry_now(t0);
+        driver.reconnect.take_due(t0);
+        drop(bs_tx);
+        driver.tick_at(t0);
+        assert_eq!(driver.reconnect.attempt(), Some(2));
+        assert_eq!(
+            driver.reconnect.last_error(),
+            Some("reconnect attempt cancelled")
+        );
+
+        let (mut driver, _srv_tx, bs_tx) = FrontendDriver::for_test(fixture_core());
+        driver.mutate(|core| {
+            core.mode = Mode::Connecting {
+                target_display: "x".into(),
+            }
+        });
+        drop(bs_tx);
+        driver.tick_at(Instant::now());
+        assert!(matches!(driver.mode, Mode::Disconnected { .. }));
+        assert!(!driver.reconnect.is_active());
+    }
+
+    /// A live link that goes silent past the liveness timeout is lost and
+    /// retried; one that is merely quiet for a moment is not.
+    #[test]
+    fn a_silent_link_is_lost_at_the_liveness_timeout() {
+        let (mut driver, _srv_tx, _bs_tx, _rx) = live_driver();
+        let t0 = Instant::now();
+        driver.tick_at(t0 + Duration::from_secs(2));
+        assert!(driver.mgr.connection_state().is_live());
+
+        driver.tick_at(t0 + kmux_client::liveness::TIMEOUT + Duration::from_secs(2));
+        assert_eq!(
+            driver.mgr.connection_state(),
+            &ConnectionState::Reconnecting { attempt: 1 }
+        );
+    }
+
+    /// The SSH tunnel dying under a tunnelled link loses it; under another
+    /// transport it changes nothing.
+    #[cfg(feature = "remote")]
+    #[test]
+    fn a_dead_ssh_tunnel_loses_only_a_tunnelled_link() {
+        let (mut driver, _srv_tx, _bs_tx, _rx) = live_driver();
+        driver.tunnel_died_tx.try_send(()).unwrap();
+        driver.tick_at(Instant::now());
+        assert!(driver.mgr.connection_state().is_live(), "a UDS link");
+
+        driver.core.mgr.current_transport = TransportKind::TcpTls;
+        driver.tunnel_died_tx.try_send(()).unwrap();
+        driver.tick_at(Instant::now());
+        assert!(driver.reconnect.is_active());
+    }
+
+    /// The frame is repainted when the banner changes — here, when the
+    /// notice of dropped keystrokes expires — and not while it stays put.
+    #[test]
+    fn the_banner_changing_repaints_the_frame() {
+        let (mut driver, srv_tx, bs_tx, _rx) = live_driver();
+        let t0 = Instant::now();
+        drop(srv_tx);
+        driver.tick_at(t0);
+        driver.send_keys(vec![typed('x'); OUTAGE_INPUT_CAPACITY + 1]);
+        driver.reconnect.retry_now(t0);
+        driver.reconnect.take_due(t0);
+        // What starting the attempt would have done: a fresh server channel.
+        let (_srv_tx, srv_rx) = mpsc::unbounded_channel();
+        driver.srv_rx = srv_rx;
+        let (tx, _new_rx) = mpsc::unbounded_channel();
+        bs_tx.send(outcome(tx)).unwrap();
+        assert!(driver.tick_at(t0).contains(&FrontendEffect::NeedsRender));
+        assert!(driver.connection_banner().is_some(), "the dropped notice");
+
+        assert!(
+            !driver
+                .tick_at(t0 + Duration::from_millis(1))
+                .contains(&FrontendEffect::NeedsRender),
+            "nothing changed"
+        );
+        assert!(
+            driver
+                .tick_at(t0 + DROPPED_NOTICE)
+                .contains(&FrontendEffect::NeedsRender),
+            "the notice expired"
+        );
     }
 
     /// "Reconnect now" while retrying brings the next attempt forward

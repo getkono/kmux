@@ -77,9 +77,18 @@ impl SessionManager {
         );
 
         self.request_session_list();
-        self.resume_visible_panes();
+        self.previous_daemon_pid = self.daemon_pid;
+        self.daemon_pid = outcome.daemon_pid;
+        self.resume_visible_panes(self.link_reached_same_daemon());
 
         outcome.ssh_context
+    }
+
+    /// Whether the last link reached the same daemon run as the one before it
+    /// (issue #208): only then do its panes resume from their seqnos, and is
+    /// input held during the outage still meant for the same shells.
+    pub fn link_reached_same_daemon(&self) -> bool {
+        self.daemon_pid.is_some() && self.daemon_pid == self.previous_daemon_pid
     }
 
     pub fn set_ws_sender(&mut self, sender: mpsc::UnboundedSender<ClientMessage>) {

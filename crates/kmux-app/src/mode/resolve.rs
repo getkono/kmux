@@ -401,6 +401,13 @@ mod tests {
         ] {
             assert_eq!(resolve(&disconnected, &key, none), (None, Action::None));
         }
+        for half_chord in [Modifiers::CTRL, Modifiers::ALT] {
+            assert_eq!(
+                resolve(&disconnected, &Key::Character("r".into()), half_chord),
+                (None, Action::None),
+                "Ctrl+Alt+R takes both modifiers"
+            );
+        }
         assert_eq!(
             resolve(
                 &disconnected,

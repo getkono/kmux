@@ -619,17 +619,30 @@ in `driver/reconnect.rs`:
    (15 s), less up to `BACKOFF_JITTER_CAP_PERMILLE` (20 %) of jitter from a
    per-link seed. Each attempt is a `BootstrapPhase::Resume { attempt }`
    bootstrap, which re-presents the `connection_id` and shows no
-   connecting overlay. Retries never stop on their own.
-3. **On success** every visible pane is re-attached with
-   `Attach { last_seqno }` — the last seqno it applied — so the daemon
-   replays exactly what it missed, or resets it with a snapshot past its
-   retained diffs (see [ConnectionId and Session Resumption](#connectionid-and-session-resumption)).
-   Then the input held during the outage is sent, in order.
+   connecting overlay. A failure a retry may get past (the daemon is
+   starting, restarting, or not answering) schedules the next attempt, for
+   as long as it takes; a **refusal** — the daemon's protocol range or the
+   token (`BootstrapTaskResult::Refused`) — ends the retries in
+   `Mode::Disconnected`.
+3. **On success** every visible pane is re-attached. If the link reached
+   the **same daemon run** as before (the same pid, which the local
+   daemon's control socket reports; `SessionManager::link_reached_same_daemon`),
+   a pane in sync is re-attached with `Attach { last_seqno }` — the last
+   seqno it applied — so the daemon replays exactly what it missed, or
+   resets it with a snapshot past its retained diffs (see
+   [ConnectionId and Session Resumption](#connectionid-and-session-resumption)).
+   A new run (a restart, a handoff) numbers its panes' diffs from scratch,
+   so every pane is then attached afresh. Then the input held during the
+   outage is sent, in order.
 4. **Input during the outage** (`OutageInput`). Keystrokes and pastes
    typed while reconnecting are held — up to `OUTAGE_INPUT_CAPACITY` (256)
    keystrokes, a paste counting as one — and flushed in order on
-   reconnect. What does not fit is dropped and counted. Raw input writes
-   (mouse reports) are not held.
+   reconnect. What does not fit is dropped and counted, and so is the whole
+   buffer when the link reached another daemon run (its shells are not the
+   ones typed at), when the oldest input is more than
+   `OUTAGE_INPUT_MAX_AGE` (30 s) old, or when the retries end in a refusal.
+   Raw input writes (mouse reports) are not held. UI commands issued
+   meanwhile (a split, a new tab) are not held either.
 5. **What the user sees** (`connection_banner`). A banner, rendered by
    GTK's `adw::Banner` and Swift's `ConnectionBanner` (FFI
    `KmuxDriver::connection_banner`): `Reconnecting… attempt n, next try in
@@ -637,17 +650,27 @@ in `driver/reconnect.rs`:
    `UNREACHABLE_AFTER_ATTEMPTS` (5) failures, followed by the queued and
    dropped keystroke counts and the last attempt's error, with a
    **Reconnect now** button. For `DROPPED_NOTICE` (8 s) after the link is
-   back it reports the keystrokes the outage dropped.
+   back it reports the keystrokes the outage dropped. The driver repaints
+   whenever the banner changes (each countdown second, an attempt
+   starting, the notice expiring), so a frontend that reads it on repaint
+   stays current.
 
-**Reconnect now** — the banner button, the header connection button,
-`Ctrl+Alt+R`, the `/reconnect` command — starts the waiting attempt at
-once. With no outage under way it is the manual reconnect: a fresh
-bootstrap behind the connecting overlay.
+**Reconnect now** — the banner button, the header connection button, the
+reconnect accelerator (Ctrl+Shift+R on GTK, ⌘R on macOS), the
+`/reconnect` command — starts the waiting attempt at once. With no outage
+under way it is the manual reconnect: a fresh bootstrap behind the
+connecting overlay. (`Ctrl+Alt+R` is the same action in the kmux-app key
+resolver.)
 
 `Mode::Disconnected` remains for the cases no retry fixes by itself: the
-first connect failed, the handshake was refused, or the user cancelled or
-disconnected. Input to panes is frozen there, `Ctrl+Alt+R` or the
-**Reconnect** button reconnects and `q` quits; no other key does anything.
+first connect failed, the handshake was refused, a manual reconnect
+failed, or the user cancelled or disconnected. Input to panes is frozen
+there; the **Reconnect** button or accelerator reconnects. The `y`/Enter
+confirmation prompt is gone.
+
+A re-federated peer's `PeerOpened` after an automatic reconnect does not
+re-run the first-connect session auto-select, so the session picker does
+not pop over the session in use.
 
 ### "Server is down" case
 
