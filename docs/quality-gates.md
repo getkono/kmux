@@ -215,6 +215,15 @@ that many new survivors through. That is why the diff job needs no baseline and
 cannot go stale — its scope *is* the change under review. It can be skipped with
 a `skip-mutants` label, which is visible on the PR.
 
+The diff runs as four shards (`--shard k/4`, each `--in-place` so its baseline
+builds on the cached `target/`), because rebuilding the mutated crate per
+mutant is nearly all the cost and it divides by the shard count. The check a
+PR shows, `Mutation (diff)`, is the job that merges them and runs the gate —
+after refusing the sweep unless all four shards finished and uploaded results.
+A shard that never ran leaves nothing, and the other three merged would read
+as a clean diff; the weekly sweep's judge counts its eight shards the same way,
+for the same reason.
+
 Scoping flags are forwarded to every crate-group pass and echoed on each `==>`
 line, so a CI log says what was actually swept rather than implying it. A group
 with nothing in scope passes; a group that exits non-zero having written no
