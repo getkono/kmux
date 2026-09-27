@@ -69,7 +69,7 @@ records them per connection (`PendingAuth` → `ClientIdentity` → `ConnectionS
 
 ## Listing & kicking
 
-New wire messages (`PROTOCOL_VERSION` 32):
+Wire messages:
 
 - `ClientList { word_id }` → `ClientListResult { clients: Vec<ClientInfo> }` —
   the connections attached to a session, each with `machine_id`, `label`,
@@ -89,7 +89,7 @@ New wire messages (`PROTOCOL_VERSION` 32):
 attribution/display only.
 
 `ClientInfo` (and so `kmux clients`) also carries each connection's `frontend`
-and `build` (`<sha>[-dirty]`) / `build_profile` (protocol 37), shown as the
+and `build` (`<sha>[-dirty]`) / `build_profile`, shown as the
 **FRONTEND** and **BUILD** columns.
 
 ## Build skew & `kmux client`

@@ -308,8 +308,8 @@ pub async fn query_daemon_sessions_at(socket_path: &Path) -> anyhow::Result<Sess
     control_request_at(socket_path, "sessions").await
 }
 
-/// Query the daemon for every live client connection with its build identity
-/// (protocol 37). Used by `kmux client status` to find the local GUI client's
+/// Query the daemon for every live client connection with its build
+/// identity. Used by `kmux client status` to find the local GUI client's
 /// connection and compare its build against the daemon's.
 pub async fn query_connections() -> anyhow::Result<kmux_protocol::control_rpc::ConnectionsResponse>
 {

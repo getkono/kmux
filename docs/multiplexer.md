@@ -22,7 +22,7 @@ PTY stdout ──bytes──▶ GhosttyBackend (libghostty-vt)
                     ServerMessage::TerminalUpdate ──wire──▶ thin clients
 ```
 
-The backend (`crates/kmuxd/src/backend/ghostty/`) parses raw PTY bytes through
+The backend (`crates/kmux-vt-core/src/backend/ghostty/`) parses raw PTY bytes through
 `libghostty-vt` (accessed via the `kmux-ghostty` safe façade over a kmux-owned
 C ABI in `crates/kmux-ghostty-sys/zig/src/wrapper.zig`), resolves all
 named/indexed colours to RGB, and emits `CellState` structs containing
@@ -332,7 +332,7 @@ The server reports mouse mode state in `TermModes` sent with each diff.
 
 The client uses `modes().mouse_report()` to decide whether scroll events go to
 the PTY or to local scrollback, and `modes().sgr_mouse()` to choose the
-encoding (`crates/kmux/src/app/mouse_handler.rs`).
+encoding; the shared encoders live in `crates/kmux-client/src/input.rs`.
 
 ---
 

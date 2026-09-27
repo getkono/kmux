@@ -53,19 +53,19 @@ pub enum ClientMessage {
         /// per-connection label `username@hostname`.
         #[serde(default)]
         username: String,
-        /// Which frontend opened this connection (CLI vs GUI). (protocol 37)
+        /// Which frontend opened this connection (CLI vs GUI).
         #[serde(default)]
         client_kind: FrontendKind,
-        /// Short git commit the client binary was built from. (protocol 37)
+        /// Short git commit the client binary was built from.
         #[serde(default)]
         client_git_sha: String,
-        /// Whether the client build had uncommitted changes. (protocol 37)
+        /// Whether the client build had uncommitted changes.
         #[serde(default)]
         client_git_dirty: bool,
         /// Cargo profile of the client build (`"debug"`/`"release"`). The daemon
         /// records all three so `kmux clients` / `kmux client status` can detect
         /// a client whose build differs from the daemon's even when the protocol
-        /// version matches. (protocol 37)
+        /// version matches.
         #[serde(default)]
         client_build_profile: String,
     },

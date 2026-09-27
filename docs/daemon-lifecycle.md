@@ -458,33 +458,16 @@ log "connection closed"
 
 ---
 
-## 8. Authentication (`client_handler/dispatch.rs`)
+## 8. Authentication (`client_handler/dispatch/auth.rs`)
 
-The first message on every connection must be `ClientMessage::Auth`.  Any
-other message before auth receives no response and the connection is closed.
-
-```
-Auth { token, protocol_range, protocol_capabilities, capabilities, connection_id }:
-  1. protocol ranges do not overlap (or the client reports only a legacy integer)
-       → AuthResult { success: false, reason: "protocol version mismatch" }
-       → return false (close)
-  2. intersect protocol_capabilities with the daemon's supported set
-  3. !validate_token(token, app.auth_token)   // constant-time compare
-       → AuthResult { success: false, reason: "invalid token" }
-       → return true (keep reading; client may retry)
-  4. Success:
-       (client_id, conn_id, metrics) = app.register_client(transport, metrics, connection_id)
-       state.authenticated = true
-       AuthResult { success: true, client_id, connection_id,
-                    negotiated_protocol, negotiated_capabilities, server_version }
-```
-
-`connection_id` in the `Auth` message supports **channel switching**: passing
-the `ConnectionId` from a previous session causes `register_client` to reuse
-the existing metrics rather than allocating a new `ConnectionId`.
-
-See [Data-Plane Protocol Versioning](architecture-protocol-versioning.md) for
-the permanent schema-evolution and negotiation rules.
+Every connection starts with the four-message handshake — `Auth` →
+`AuthChallenge` → `AuthProof` → `AuthResult` — which checks, in order, protocol
+range overlap, the token, and the client's Ed25519 signature over the nonce,
+then registers the channel (or resumes a registration when `Auth` carries a
+`connection_id`). A refusal is flushed and the connection closed. The normative
+description, including pre-auth behaviour and the auth deadline, is
+[protocol.md § Handshake](protocol.md#handshake); range negotiation is in
+[architecture-protocol-versioning.md](architecture-protocol-versioning.md).
 
 ---
 
@@ -890,17 +873,26 @@ ssh user@host kmuxd probe-or-start
 
 Output JSON (stdout):
 {
-  "protocol_version": 1,
+  "protocol_version": 41,
+  "protocol_range": {
+    "min": { "major": 1, "minor": 0, "patch": 0 },
+    "max": { "major": 1, "minor": 1, "patch": 0 }
+  },
   "kmuxd_version": "0.x.y",
   "quic_port": 8443,
   "tcp_port": 8444,
   "token": "<64-hex-char token>",
   "endpoints": [
-    { "kind": "QUIC",   "address": "host:8443" },
-    { "kind": "TcpTls", "address": "host:8444" }
+    { "kind": "QUIC",    "address": "host:8443" },
+    { "kind": "TCP+TLS", "address": "host:8444" }
   ]
 }
 ```
+
+`protocol_range` is the daemon's supported data-protocol range (see
+[architecture-protocol-versioning.md](architecture-protocol-versioning.md));
+`protocol_version` is a legacy sentinel frozen at 41
+(`LEGACY_PROTOCOL_VERSION`) and is never used for a compatibility decision.
 
 The sequence in `main::probe_or_start()`:
 

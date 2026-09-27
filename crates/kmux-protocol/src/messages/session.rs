@@ -448,16 +448,15 @@ pub struct ClientInfo {
     pub uptime_secs: u64,
     /// True for the connection that issued the list request (shown as "(you)").
     pub is_self: bool,
-    /// Which frontend opened the connection (CLI vs GUI). (protocol 37)
+    /// Which frontend opened the connection (CLI vs GUI).
     #[serde(default)]
     pub frontend: FrontendKind,
     /// Build fingerprint of the client binary, `<sha>[-dirty]` — lets `kmux
     /// clients` / `kmux client status` spot a build that differs from the
-    /// daemon's even when the protocol version matches. (protocol 37)
+    /// daemon's even when the protocol version matches.
     #[serde(default)]
     pub build: String,
     /// Cargo profile the client binary was built with (`"debug"`/`"release"`).
-    /// (protocol 37)
     #[serde(default)]
     pub build_profile: String,
 }

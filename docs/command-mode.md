@@ -74,7 +74,7 @@ Files:
 | `crates/kmux-app/src/cmd/hint.rs` | `build_hints(&AppCore)`: pure ranked dropdown contents |
 | `crates/kmux-app/src/cmd/registry.rs` | `static ALL: &[CommandSpec]` plus the command bodies (`fn(&mut AppCore, …)`) |
 | `crates/kmux-app/src/cmd/exec.rs` | `run(&mut AppCore, buffer)` glue between submit and registry |
-| `crates/kmux-app/src/core/dispatch.rs` | `AppCore::dispatch_action` (the unified action handler) and command-edit arms |
+| `crates/kmux-app/src/core/dispatch/mod.rs` | `AppCore::dispatch_action` (the unified action handler) and command-edit arms |
 | `crates/kmux-gtk/src/imp/` | floating overlay rendering (GTK render leaf) |
 
 The command palette, mode model, and action dispatch are all frontend-agnostic
@@ -85,7 +85,7 @@ only the overlay's rendering stays in the frontend.
 
 A key resolves into an `Action`; applying that `Action` is the single source of
 truth in `AppCore::dispatch_action(action)` (toolkit-agnostic, in
-`kmux-app/src/core/dispatch.rs`). The key path and the command palette both
+`kmux-app/src/core/dispatch/mod.rs`). The key path and the command palette both
 funnel through it: a frontend converts its toolkit key event, calls
 `mode::resolve`, then `core.dispatch_action`; the command palette's
 `CommandSubmit` arm runs `cmd::exec::run`, whose handlers mutate the same

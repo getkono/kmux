@@ -16,18 +16,8 @@ protocol and is **not** compressed.
 
 ## Frame format
 
-Every frame is self-describing:
-
-```text
-[u32 big-endian length][u8 codec tag][payload…]
-```
-
-- `length` counts the codec tag byte plus the payload.
-- `codec tag`: `2` = raw named MessagePack, `3` = zstd-compressed named
-  MessagePack. Tags `0` and `1` are permanently reserved for the retired
-  Postcard codec and produce an explicit upgrade error.
-- Bounds: on-wire `length` ≤ `MAX_FRAME_SIZE` (64 MiB); a zstd frame may not
-  inflate past `MAX_DECOMPRESSED_SIZE` (64 MiB) — a decompression-bomb guard.
+The frame layout, codec tags (`2` raw, `3` zstd) and size bounds are normative
+in [protocol.md § Frames](protocol.md#frames).
 
 Because the tag is per-frame (the HTTP `Content-Encoding`-per-message analogue),
 `read_frame` decompresses purely from the tag with **no per-connection state**.
@@ -63,7 +53,7 @@ Mapped to HTTP:
 | per-message `Content-Encoding` | the per-frame codec tag |
 
 The daemon is authoritative. On successful auth (`kmuxd`'s
-`client_handler/dispatch.rs`) it computes `compression.enabled_for(transport)`,
+`client_handler/dispatch/auth.rs`) it computes `compression.enabled_for(transport)`,
 flips the connection's shared `OutboundCompression` toggle that the writer and
 pane-attacher tasks read, and echoes the choice in `AuthResult.compression`. The
 client uses the response for observability; its `read_frame` handles either
@@ -143,5 +133,5 @@ candidates:
   raw, incompressible falls back to raw, unknown-tag rejection, and a concurrent
   duplex-pipe roundtrip of a mixed message batch.
 - `kmuxd/config.rs`: `enabled_for` matrix (auto/always/never × transports).
-- `kmuxd/client_handler/dispatch.rs`: auth negotiates zstd on a networked
+- `kmuxd/client_handler/dispatch/auth.rs`: auth negotiates zstd on a networked
   transport and leaves UDS uncompressed under `auto`.

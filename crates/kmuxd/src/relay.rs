@@ -283,8 +283,8 @@ pub(crate) fn dispatch_diff_result(
             );
 
             // Scrollback travels out-of-band as `ScrollbackAppend`, referencing
-            // absolute indices derived from `history_total`. In v16 the diff no
-            // longer carries the lines inline; clients reconcile any gap via
+            // absolute indices derived from `history_total`. The diff does not
+            // carry the lines inline; clients reconcile any gap via
             // `FetchHistory`.
             //
             // Ordering: normally the append is sent before the viewport diff.

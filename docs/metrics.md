@@ -44,8 +44,8 @@ categorised).
 | `Scrollback`| `FetchHistory`                                        | `HistoryLines`, `ScrollbackAppend`                                       |
 | `Liveness`  | `Ping`, `Pong`                                        | `Ping`, `Pong`                                                           |
 | `Control`   | Session/pane CRUD, `Attach`/`Detach`, `Resize`, `Signal`, input-lock | Session/pane replies, `Event`, `Error`, input-lock replies |
-| `Sync`      | —                                                     | `Lagged`, `SyncReset`                                                    |
-| `Bootstrap` | `Auth`, `ChannelReady`                                | `AuthResult`, `ChannelSwitched`                                          |
+| `Sync`      | —                                                     | `Lagged`, `SyncReset`, `GridDigest`                                      |
+| `Bootstrap` | `Auth`, `AuthProof`, `ChannelReady`                   | `AuthChallenge`, `AuthResult`, `ChannelSwitched`                         |
 
 ## Instrumentation points
 
@@ -65,7 +65,7 @@ categorised).
 Path: `$XDG_STATE_HOME/kmux/metrics.jsonl`
 (via `kmux_sys::dirs::metrics_log_path()`).
 
-Every 10 seconds (`METRICS_FLUSH_TICK` in `app/event_loop.rs`) the session
+Every 10 seconds (`METRICS_FLUSH_TICK` in `crates/kmux-app/src/driver/mod.rs`) the session
 calls `MetricsStore::flush_sample(conn_id)`, which:
 
 1. Calls `NetworkMetrics::take_deltas_for_active()` — returns one entry per

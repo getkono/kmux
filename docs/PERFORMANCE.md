@@ -7,8 +7,8 @@ optimizations be made safely see [architecture-verification.md](architecture-ver
 
 The local GUI↔daemon path already uses the lowest-overhead options available: a
 **Unix domain socket** (`TransportKind::Uds`, no TLS, OS-enforced 0600), a
-named-map **MessagePack** wire format framed as `[u32 len][u8 codec tag][payload]`,
-and **server-side VT parsing** so only changed cells travel. The remaining work is
+named-map **MessagePack** wire format (framing in
+[protocol.md § Frames](protocol.md#frames)), and **server-side VT parsing** so only changed cells travel. The remaining work is
 mostly CPU/scheduling; the one open format cost is cell-run encoding, below.
 
 ### Open: cell-run encoding overhead
@@ -58,7 +58,7 @@ bump, which is exactly the flexibility
 - **Arc-shared snapshots.** `TerminalSnapshot` carries `Arc<GridSnapshot>`, so
   fanning one snapshot to multiple recipients (multi-GUI, federation,
   force-full-snapshot) is O(1) rather than a deep grid copy.
-- **Grid-digest desync oracle** (PROTOCOL_VERSION 36). Continuous, self-healing
+- **Grid-digest desync oracle**. Continuous, self-healing
   verification that the client's reconstructed grid matches the daemon's
   authoritative grid; see [architecture-verification.md](architecture-verification.md).
 - **Connection pausing** (issue #68) and **transport hot-swap + scoring**

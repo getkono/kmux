@@ -87,7 +87,7 @@ pub fn client_rows(entries: &[(String, Vec<ClientInfo>)]) -> Vec<ClientRow> {
                 .map(ToString::to_string)
                 .collect::<Vec<_>>()
                 .join(",");
-            // Build identity (protocol 37): `<sha>[-dirty] (profile)`. Empty for
+            // Build identity: `<sha>[-dirty] (profile)`. Empty for
             // a client too old to report it (older builds can't connect, so this
             // is mostly a defensive fallback).
             let build = match (c.build.as_str(), c.build_profile.as_str()) {

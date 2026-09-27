@@ -541,7 +541,7 @@ struct ConnectionState {
     /// Daemon-assigned user-readable label `username@hostname[#N]`, unique among
     /// live connections — the unit listed and kicked.
     label: String,
-    /// Client build identity reported in `Auth` (protocol 37): which frontend,
+    /// Client build identity reported in `Auth`: which frontend,
     /// and the client binary's commit + profile. Surfaced by `kmux clients` and
     /// `kmux client status` to spot a client built from a different commit than
     /// the daemon even when the protocol version matches.
@@ -561,13 +561,13 @@ pub struct ClientIdentity {
     pub hostname: String,
     /// Client-reported OS username.
     pub username: String,
-    /// Which frontend opened the connection (CLI vs GUI). (protocol 37)
+    /// Which frontend opened the connection (CLI vs GUI).
     pub client_kind: FrontendKind,
-    /// Short git commit the client binary was built from. (protocol 37)
+    /// Short git commit the client binary was built from.
     pub client_git_sha: String,
-    /// Whether the client build had uncommitted changes. (protocol 37)
+    /// Whether the client build had uncommitted changes.
     pub client_git_dirty: bool,
-    /// Cargo profile of the client build. (protocol 37)
+    /// Cargo profile of the client build.
     pub client_build_profile: String,
 }
 
