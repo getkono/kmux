@@ -21,7 +21,7 @@
 use std::time::{Duration, Instant};
 
 #[cfg(feature = "remote")]
-use kmux_protocol::messages::{ClientCapabilities, ConnectionId, ResumeFrom, ServerMessage};
+use kmux_protocol::messages::{ClientCapabilities, ResumeFrom, ServerMessage};
 use kmux_protocol::messages::{ClientMessage, TransportKind};
 use kmux_sys::transport::EndpointAdvert;
 use tokio::sync::mpsc;
@@ -577,30 +577,56 @@ async fn recv_opt<T>(rx: &mut Option<mpsc::UnboundedReceiver<T>>) -> Option<T> {
 
 // ─── probe_transport ─────────────────────────────────────────────────────────
 
-/// Whether a probe's successful `AuthResult` resumed the connection `expected`.
-/// A daemon of another run (restarted since the link was made) registers the
-/// probe afresh under a new id: swapping to it would leave every pane stream
-/// on the old channel, so the probe fails.
+/// The probe's outcome, when `msg` is the `AuthResult` that ends its
+/// handshake: `Ok` only if the daemon resumed the connection `expected` —
+/// the same connection id, from the same daemon run. A daemon restarted since
+/// the link was made registers the probe afresh (and may hand out the very
+/// same id, its counter having started over, so the run is compared too);
+/// swapping to it would leave every pane stream on the old channel.
 #[cfg(feature = "remote")]
-fn resumed(expected: ConnectionId, got: Option<ConnectionId>) -> Result<(), String> {
-    if got == Some(expected) {
-        Ok(())
-    } else {
-        Err("the daemon did not resume this connection (another daemon run)".to_string())
+fn probe_verdict(expected: ResumeFrom, msg: &ServerMessage) -> Option<Result<(), String>> {
+    let ServerMessage::AuthResult {
+        success,
+        reason,
+        failure,
+        connection_id,
+        daemon_instance,
+        ..
+    } = msg
+    else {
+        return None;
+    };
+    if !*success {
+        return Some(Err(kmux_protocol::messages::refusal_reason(
+            reason.clone(),
+            *failure,
+        )));
     }
+    let same_run = match (expected.instance, *daemon_instance) {
+        (Some(ours), Some(theirs)) => ours == theirs,
+        _ => true,
+    };
+    Some(
+        if same_run && *connection_id == Some(expected.connection_id) {
+            Ok(())
+        } else {
+            Err("the daemon did not resume this connection (another daemon run)".to_string())
+        },
+    )
 }
 
-/// Spawn a forwarding task that captures the first `AuthResult` arriving on
-/// the new transport's `server_tx`, then forwards every server message
-/// (including the captured `AuthResult`) to `outer_tx`.
+/// Spawn a forwarding task that answers the identity challenge, captures the
+/// first `AuthResult` arriving on the new transport's `server_tx` as the
+/// probe's outcome, and forwards every other server message to `outer_tx`.
 ///
-/// Returns the wrapped sender to hand to the connect call and a oneshot
-/// receiver that resolves with the auth outcome (`Ok` on success,
-/// `Err(reason)` on auth failure). The forwarder exits when the underlying
-/// transport's reader task drops its sender.
+/// The `AuthResult` itself is forwarded only when the probe succeeded: a
+/// refused one, or one from a registration the probe will not use, would
+/// otherwise reach the session manager and overwrite (or disconnect) the live
+/// link's identity. The forwarder exits when the underlying transport's reader
+/// task drops its sender.
 #[cfg(feature = "remote")]
 fn spawn_auth_forwarder(
-    expected: ConnectionId,
+    expected: ResumeFrom,
     mut intercept_rx: mpsc::UnboundedReceiver<ServerMessage>,
     auth_tx: oneshot::Sender<Result<(), String>>,
     outer_tx: mpsc::UnboundedSender<ServerMessage>,
@@ -614,22 +640,13 @@ fn spawn_auth_forwarder(
                 crate::tcp_connect::answer_auth_challenge(&client_tx, nonce);
                 continue;
             }
-            if let (Some(_), ServerMessage::AuthResult { .. }) = (&auth_tx, &msg) {
-                let captured = match &msg {
-                    ServerMessage::AuthResult {
-                        success: true,
-                        connection_id,
-                        ..
-                    } => resumed(expected, *connection_id),
-                    ServerMessage::AuthResult {
-                        success: false,
-                        reason,
-                        ..
-                    } => Err(reason.clone().unwrap_or_else(|| "rejected".into())),
-                    _ => unreachable!("matched AuthResult above"),
-                };
-                if let Some(tx) = auth_tx.take() {
-                    let _ = tx.send(captured);
+            if let Some(verdict) = probe_verdict(expected, &msg)
+                && let Some(tx) = auth_tx.take()
+            {
+                let accepted = verdict.is_ok();
+                let _ = tx.send(verdict);
+                if !accepted {
+                    continue;
                 }
             }
             if outer_tx.send(msg).is_err() {
@@ -731,13 +748,7 @@ async fn probe_transport(
     // Forward the server stream and answer the identity challenge (issue #146):
     // spawned here because it needs `sender` (client_tx) to reply. Any frames the
     // daemon already sent buffer in `intercept_rx` until this drains them.
-    spawn_auth_forwarder(
-        resume.connection_id,
-        intercept_rx,
-        auth_tx,
-        server_tx,
-        sender.clone(),
-    );
+    spawn_auth_forwarder(resume, intercept_rx, auth_tx, server_tx, sender.clone());
 
     // Wait for the server to confirm authentication on the new channel.
     // Dropping `sender` on Err closes the new transport's writer task, which
@@ -773,6 +784,7 @@ fn parse_host_port(address: &str) -> Option<(String, u16)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kmux_protocol::messages::ConnectionId;
     use kmux_protocol::messages::TransportKind;
     use kmux_sys::transport::EndpointAdvert;
 
@@ -1065,8 +1077,10 @@ mod tests {
 
     // ── spawn_auth_intercept ───────────────────────────────────────────────────
 
-    /// The connection the forwarder tests' probe resumes.
+    /// The connection the forwarder tests' probe resumes, and its run.
     const PROBED: ConnectionId = ConnectionId(9);
+    const RUN: kmux_protocol::messages::DaemonInstanceId =
+        kmux_protocol::messages::DaemonInstanceId(5);
 
     /// Build a successful `AuthResult` for the forwarder tests (issue #146 added
     /// the identity fields, defaulted to `None` here): the daemon resumed
@@ -1079,7 +1093,7 @@ mod tests {
             client_id: None,
             server_version: None,
             connection_id: Some(PROBED),
-            daemon_instance: None,
+            daemon_instance: Some(RUN),
             compression: None,
             machine_id: None,
             label: None,
@@ -1102,7 +1116,16 @@ mod tests {
         let (intercept_tx, intercept_rx) = mpsc::unbounded_channel::<ServerMessage>();
         let (auth_tx, auth_rx) = oneshot::channel::<Result<(), String>>();
         let (client_tx, _client_rx) = mpsc::unbounded_channel::<ClientMessage>();
-        spawn_auth_forwarder(PROBED, intercept_rx, auth_tx, outer_tx, client_tx);
+        spawn_auth_forwarder(
+            ResumeFrom {
+                connection_id: PROBED,
+                instance: Some(RUN),
+            },
+            intercept_rx,
+            auth_tx,
+            outer_tx,
+            client_tx,
+        );
         (intercept_tx, auth_rx, outer_rx)
     }
 
@@ -1150,20 +1173,56 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_probe_is_accepted_only_for_its_own_connection_in_its_own_run() {
+        use kmux_protocol::messages::DaemonInstanceId;
+        let expected = ResumeFrom {
+            connection_id: PROBED,
+            instance: Some(RUN),
+        };
+        let answer = |id: u64, run: Option<u64>| {
+            let mut msg = ok_auth_result();
+            if let ServerMessage::AuthResult {
+                connection_id,
+                daemon_instance,
+                ..
+            } = &mut msg
+            {
+                *connection_id = Some(ConnectionId(id));
+                *daemon_instance = run.map(DaemonInstanceId);
+            }
+            probe_verdict(expected, &msg)
+        };
+        assert_eq!(answer(9, Some(5)), Some(Ok(())));
+        assert_eq!(answer(9, None), Some(Ok(())), "a daemon that sends no run");
+        for (id, run) in [(1, Some(5)), (9, Some(6))] {
+            assert!(
+                matches!(answer(id, run), Some(Err(e)) if e.contains("another daemon run")),
+                "id {id}, run {run:?}: a fresh registration, even under the same id"
+            );
+        }
+        assert_eq!(
+            probe_verdict(expected, &ServerMessage::Ping { seq: 1 }),
+            None
+        );
+    }
+
+    /// A probe the daemon did not resume is refused, and its `AuthResult` is
+    /// kept from the session manager, whose live link it is not.
     #[tokio::test]
-    async fn a_probe_the_daemon_registered_afresh_is_refused() {
-        // A daemon restarted since the link was made cannot resume it: it
-        // answers with a new connection id, and the swap must not happen.
-        let (intercept_tx, auth_rx, _outer_rx) = forwarder_under_test();
+    async fn a_refused_probe_s_auth_result_is_not_forwarded() {
+        let (intercept_tx, auth_rx, mut outer_rx) = forwarder_under_test();
         let mut fresh = ok_auth_result();
         if let ServerMessage::AuthResult { connection_id, .. } = &mut fresh {
             *connection_id = Some(ConnectionId(1));
         }
         intercept_tx.send(fresh).unwrap();
-        match auth_rx.await {
-            Ok(Err(reason)) => assert!(reason.contains("another daemon run"), "{reason}"),
-            other => panic!("expected a refused probe, got {other:?}"),
-        }
+        intercept_tx.send(ServerMessage::Ping { seq: 3 }).unwrap();
+        assert!(matches!(auth_rx.await, Ok(Err(_))));
+        assert!(matches!(
+            outer_rx.recv().await,
+            Some(ServerMessage::Ping { seq: 3 })
+        ));
     }
 
     #[tokio::test]
