@@ -45,8 +45,7 @@ exclude_re = [
     # control socket and starts a daemon when none answers; only a real SSH
     # bootstrap reaches it. What it decides, `ssh_view`, is unit-tested
     # (issue #227).
-    'crates/kmuxd/src/main\.rs:.*replace probe_or_start -> ',
-    'crates/kmuxd/src/main\.rs:.*replace query -> ',
+    'crates/kmuxd/src/main\.rs:.*replace probe_or_start(::query)? -> ',
     # `handoff::sender::run` (and `hand_off`, which it runs with pane creation
     # closed) binds the real handoff socket and spawns a successor daemon;
     # only `handoff_e2e.rs` can call it (issue #207).
