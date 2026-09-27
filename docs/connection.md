@@ -684,7 +684,10 @@ not pop over the session in use.
 
 The GUI's target is always its local daemon, and a local bootstrap
 auto-starts it (`kmux_connect::daemon::ensure_daemon`), so an automatic attempt also
-restarts a daemon that crashed. A remote host that is down is the
+restarts a daemon that crashed. It restarts one stopped on purpose too: the
+daemon has no way to tell its clients a stop is deliberate, so `kmux daemon
+stop` while a GUI is open is followed by a fresh daemon within a second. To
+stop for good, quit the GUI first (or `kmux client stop`). A remote host that is down is the
 federation link's concern: see
 [architecture-federation.md](architecture-federation.md).
 

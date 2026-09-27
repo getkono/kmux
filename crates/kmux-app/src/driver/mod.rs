@@ -293,41 +293,42 @@ impl FrontendDriver {
     /// [`Self::tick`] at `now`.
     fn tick_at(&mut self, now: Instant) -> Vec<FrontendEffect> {
         let mut effects = Vec::new();
-        let mut dirty = false;
         self.tick_id = self.tick_id.wrapping_add(1);
 
-        if self.detect_palette_change() {
+        let palette_changed = self.detect_palette_change();
+        if palette_changed {
             effects.push(FrontendEffect::PaletteChanged);
-            dirty = true;
         }
-        dirty |= self.apply_settled_resize(now);
-        // Off-UI-thread grid apply (issue #182, §1): load any content the apply
-        // worker republished since last tick, then apply the view effects /
-        // resyncs it reported, before draining (and enqueueing) this tick's
-        // server messages.
-        dirty |= self.core.mgr.refresh_buffers();
-        dirty |= self.core.mgr.drain_apply_notes();
-        dirty |= self.drain_server_messages(&mut effects, now);
-        dirty |= self.poll_bootstrap_outcome(now);
-        #[cfg(feature = "remote")]
-        {
-            dirty |= self.drain_transport_upgrades();
-            dirty |= self.drain_tunnel_deaths(now);
-        }
-        dirty |= self.tick_liveness(now);
-        dirty |= self.tick_reconnect(now);
-        dirty |= self.refresh_banner(now);
-        // Refresh the process overview while it is open (issue #122).
-        dirty |= self.tick_process_overview(now);
-        // Refresh the connected-clients list while that view is open (issue #146).
-        dirty |= self.tick_connected_clients(now);
-        // Auto-pause the connection once the window has been backgrounded long
-        // enough (issue #68).
-        dirty |= self.tick_auto_pause(now);
-        // Fire any soft-close whose 3 s grace window has elapsed (issue #86).
-        dirty |= self.core.fire_due_closes(now);
+        // Each step, in order, reports whether it changed what is shown.
+        let changed = [
+            palette_changed,
+            self.apply_settled_resize(now),
+            // Off-UI-thread grid apply (issue #182, §1): load any content the
+            // apply worker republished since last tick, then apply the view
+            // effects / resyncs it reported, before draining (and enqueueing)
+            // this tick's server messages.
+            self.core.mgr.refresh_buffers(),
+            self.core.mgr.drain_apply_notes(),
+            self.drain_server_messages(&mut effects, now),
+            self.poll_bootstrap_outcome(now),
+            self.drain_remote(now),
+            self.tick_liveness(now),
+            // Automatic reconnect (issue #208).
+            self.tick_reconnect(now),
+            self.refresh_banner(now),
+            // Refresh the process overview while it is open (issue #122).
+            self.tick_process_overview(now),
+            // Refresh the connected-clients list while that view is open (issue #146).
+            self.tick_connected_clients(now),
+            // Auto-pause the connection once the window has been backgrounded
+            // long enough (issue #68).
+            self.tick_auto_pause(now),
+            // Fire any soft-close whose 3 s grace window has elapsed (issue #86).
+            self.core.fire_due_closes(now),
+            self.tick_blink(now),
+        ];
         self.tick_metrics(now);
-        dirty |= self.tick_blink(now);
+        let mut dirty = changed.contains(&true);
 
         if self.core.take_render_request() {
             dirty = true;
@@ -666,6 +667,25 @@ impl FrontendDriver {
         for msg in self.outage.flush(now, deliver) {
             self.core.mgr.send_prepared(msg);
         }
+    }
+
+    /// Apply transport upgrades and react to a dead SSH tunnel: whether either
+    /// changed what is shown.
+    fn drain_remote(&mut self, now: Instant) -> bool {
+        // One body for both builds, so the mutation job (default features)
+        // mutates the code it compiles: a lean (UDS-only) build has no
+        // transport supervisor and no tunnel, and so nothing to drain.
+        #[cfg(feature = "remote")]
+        let changed = [
+            self.drain_transport_upgrades(),
+            self.drain_tunnel_deaths(now),
+        ];
+        #[cfg(not(feature = "remote"))]
+        let changed = {
+            let _ = (&*self, now);
+            [false]
+        };
+        changed.contains(&true)
     }
 
     /// Apply any better-transport signals from the background probe.
@@ -1415,6 +1435,21 @@ mod tests {
                 .tick_at(t0 + DROPPED_NOTICE)
                 .contains(&FrontendEffect::NeedsRender),
             "the notice expired"
+        );
+    }
+
+    /// The banner reports a change once, then nothing until it changes again.
+    #[test]
+    fn refresh_banner_reports_each_change_once() {
+        let (mut driver, _srv_tx, _bs_tx, _rx) = live_driver();
+        let t0 = Instant::now();
+        assert!(!driver.refresh_banner(t0), "no banner, no change");
+        driver.reconnect.on_lost(t0);
+        assert!(driver.refresh_banner(t0), "a banner appeared");
+        assert!(!driver.refresh_banner(t0), "the same banner");
+        assert!(
+            driver.refresh_banner(t0 + Duration::from_secs(1)),
+            "the countdown moved on"
         );
     }
 

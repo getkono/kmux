@@ -827,6 +827,12 @@ mod tests {
             rx.try_recv(),
             Ok(ClientMessage::PtyKeyBatch { pane_id, .. }) if pane_id == "eagle/0"
         ));
+
+        assert!(mgr.send_paste("hi".to_string()), "a paste is accepted");
+        assert!(matches!(
+            rx.try_recv(),
+            Ok(ClientMessage::PtyPaste { data, .. }) if data == "hi"
+        ));
     }
 
     fn make_entry(word_id: &str, cwd: &str) -> SessionEntry {
