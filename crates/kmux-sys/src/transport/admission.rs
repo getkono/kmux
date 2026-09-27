@@ -145,6 +145,7 @@ impl InFlight {
             *from_source += 1;
         }
         counts.total += 1;
+        drop(counts);
         Admission::Admit(Slot {
             in_flight: self.clone(),
             source,
@@ -204,13 +205,10 @@ impl Drop for Slot {
 fn source_key(ip: IpAddr) -> IpAddr {
     match ip {
         IpAddr::V4(_) => ip,
-        IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
-            Some(v4) => IpAddr::V4(v4),
-            None => {
-                let prefix = u128::from(v6) & !u128::from(u64::MAX);
-                IpAddr::V6(Ipv6Addr::from(prefix))
-            }
-        },
+        IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or_else(
+            || IpAddr::V6(Ipv6Addr::from(u128::from(v6) & !u128::from(u64::MAX))),
+            IpAddr::V4,
+        ),
     }
 }
 

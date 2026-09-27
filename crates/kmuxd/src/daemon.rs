@@ -434,16 +434,15 @@ async fn on_restart(ctx: &RequestCtx, reply: &mut Reply) {
         attempt: begun.as_ref().map_or(0, BegunHandoff::attempt),
     };
     reply.send(&response).await;
-    match begun {
-        Some(begun) => {
-            info!("Received restart command, beginning graceful handoff");
-            // Wake the main task; it runs the handoff and reports a
-            // rollback through `ctx.handoff`.
-            ctx.restart.notify_one();
-            begun.hand_over();
-        }
-        None => warn!("restart command ignored: a handoff is already in progress"),
-    }
+    let Some(begun) = begun else {
+        warn!("restart command ignored: a handoff is already in progress");
+        return;
+    };
+    info!("Received restart command, beginning graceful handoff");
+    // Wake the main task; it runs the handoff and reports a rollback through
+    // `ctx.handoff`.
+    ctx.restart.notify_one();
+    begun.hand_over();
 }
 
 /// RAII guard that removes the socket and PID files when dropped.

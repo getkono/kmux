@@ -804,7 +804,7 @@ count = 1
 [[lints]]
 crate = "kmuxd"
 lint = "clippy::too_many_lines"
-count = 10
+count = 9
 
 [[lints]]
 crate = "kmuxd"
