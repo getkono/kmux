@@ -1063,6 +1063,11 @@ mod tests {
         ));
         assert!(!mgr.connected);
         assert!(mgr.ws_sender.is_none());
+        assert_eq!(
+            disconnect_text(&mgr),
+            "auth failed: bad token",
+            "no hint for a bad token, and the reason is not prefixed twice"
+        );
     }
 
     #[test]
@@ -1092,13 +1097,10 @@ mod tests {
         let shown = format!(
             "{failure} | Hint: update kmux and kmuxd until their supported protocol ranges overlap."
         );
-        assert_eq!(
-            disconnect_text(&mgr),
-            format!("auth failed: Auth failed: {shown}")
-        );
+        assert_eq!(disconnect_text(&mgr), format!("auth failed: {shown}"));
         assert!(matches!(
             events.as_slice(),
-            [super::server_handler::SessionEvent::AuthFailed { reason }] if *reason == failure.to_string()
+            [super::server_handler::SessionEvent::AuthFailed { reason }] if *reason == shown
         ));
     }
 

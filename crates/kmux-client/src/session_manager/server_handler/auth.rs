@@ -61,14 +61,14 @@ impl SessionManager {
             warn!(?failure, "Auth failed: {:?}", reason);
             let reason_str = kmux_protocol::messages::refusal_reason(reason, failure);
             let msg = match failure.as_ref().and_then(AuthFailure::hint) {
-                Some(hint) => format!("Auth failed: {reason_str} | {hint}"),
-                None => format!("Auth failed: {reason_str}"),
+                Some(hint) => format!("{reason_str} | {hint}"),
+                None => reason_str,
             };
             self.ws_sender = None;
             self.set_connection_state(crate::connection_state::ConnectionState::Disconnected {
-                reason: crate::connection_state::DisconnectReason::AuthFailed(msg),
+                reason: crate::connection_state::DisconnectReason::AuthFailed(msg.clone()),
             });
-            events.push(SessionEvent::AuthFailed { reason: reason_str });
+            events.push(SessionEvent::AuthFailed { reason: msg });
         }
         events
     }
