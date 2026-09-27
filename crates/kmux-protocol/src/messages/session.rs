@@ -97,6 +97,7 @@ impl FrontendKind {
     /// What to send for this value: itself, or — since `Unknown` is never
     /// sent — `Cli`, which is also what a receiver assumes when the field is
     /// absent.
+    #[must_use]
     pub fn sendable(self) -> Self {
         match self {
             Self::Unknown => Self::Cli,
@@ -326,6 +327,7 @@ wire_enum!(PaneProgressState);
 impl PaneProgressState {
     /// What to send for this value: itself, or — since `Unknown` is never
     /// sent — `Remove`, the state it is shown as.
+    #[must_use]
     pub fn sendable(self) -> Self {
         match self {
             Self::Unknown => Self::Remove,
@@ -360,6 +362,7 @@ wire_enum!(AttentionKind);
 impl AttentionKind {
     /// What to send for this value: itself, or — since `Unknown` is never
     /// sent — `TurnDone`, the plain request for attention it is shown as.
+    #[must_use]
     pub fn sendable(self) -> Self {
         match self {
             Self::Unknown => Self::TurnDone,

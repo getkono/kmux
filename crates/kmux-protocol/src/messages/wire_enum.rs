@@ -316,8 +316,9 @@ mod tests {
 
     #[test]
     fn a_known_unit_variant_sent_as_a_map_decodes() {
-        let bytes = rmp_serde::to_vec_named(&std::collections::BTreeMap::from([("Unit", ())]))
-            .expect("encode");
+        let bytes =
+            rmp_serde::to_vec_named(&std::collections::BTreeMap::from([("Unit", None::<u8>)]))
+                .expect("encode");
         assert_eq!(
             rmp_serde::from_slice::<Current>(&bytes).expect("decode"),
             Current::Unit
